@@ -1,0 +1,69 @@
+#!/bin/sh
+set -eu
+
+project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+usage() {
+    echo "usage: ./minyar [--release] [--incremental] FILE.min [-o PROGRAM]" >&2
+    exit 2
+}
+
+release=0
+incremental=0
+while :; do
+    case "${1-}" in
+        --release) release=1; shift ;;
+        --incremental) incremental=1; shift ;;
+        *) break ;;
+    esac
+done
+
+if [ "$#" -lt 1 ] || [ "$#" -gt 3 ]; then
+    usage
+fi
+case "$1" in --*) usage ;; esac
+
+source_file=$1
+shift
+output_file=$(basename -- "${source_file%.min}")
+
+if [ "$#" -gt 0 ]; then
+    if [ "$#" -ne 2 ] || [ "$1" != "-o" ]; then
+        usage
+    fi
+    output_file=$2
+fi
+
+if [ "$release" -eq 1 ]; then
+    runtime_file=build/minyar-runtime-release.ll
+else
+    runtime_file=build/minyar-runtime.o
+fi
+if [ "$incremental" -eq 1 ]; then
+    make -s -C "$project_dir" build/minyarc-modules build/minyar-module-build "$runtime_file"
+else
+    make -s -C "$project_dir" build/minyarc "$runtime_file"
+fi
+mkdir -p "$project_dir/build/programs"
+llvm_dir=$(mktemp -d "$project_dir/build/programs/invocation.XXXXXXXX")
+trap 'rm -rf -- "$llvm_dir"' 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+llvm_file="$llvm_dir/program.ll"
+
+if [ "$incremental" -eq 1 ]; then
+    "$project_dir/build/minyar-module-build" "$project_dir/build/minyarc-modules" \
+        "$source_file" "$llvm_file" "${MINYAR_MODULE_CACHE:-$project_dir/build/module-cache}"
+else
+    "$project_dir/build/minyarc" "$source_file" "$llvm_file"
+fi
+if [ "$release" -eq 1 ]; then
+    "${MINYAR_CLANG:-clang}" ${MINYAR_CLANG_FLAGS:--O2 -Wno-override-module} -flto \
+        "$llvm_file" "$project_dir/$runtime_file" -o "$output_file"
+else
+    "${MINYAR_CLANG:-clang}" ${MINYAR_CLANG_FLAGS:--O0 -Wno-override-module} \
+        "$llvm_file" "$project_dir/$runtime_file" -o "$output_file"
+fi
+
+echo "built $output_file"

@@ -1,0 +1,841 @@
+// Incremental module frontend; assembled with the normal compiler core.
+function appendModuleField(pieces: List<Text>, value: Text) {
+    pieces.add(Text(value.length))
+    pieces.add("\n")
+    pieces.add(value)
+}
+
+function moduleNatural(value: Text): Integer {
+    if value.length == 0 { return -1 }
+    let result = 0
+    let position = 0
+    let digits = "0123456789"
+    while position < value.length {
+        let digit = 0
+        while digit < 10 && digits[digit] != value[position] { digit = digit + 1 }
+        if digit == 10 || result > 100000000 { return -1 }
+        result = result * 10 + digit
+        position = position + 1
+    }
+    return result
+}
+
+function decodeModuleFields(source: Text): List<Text> {
+    let fields: List<Text> = []
+    let position = 0
+    let valid = true
+    while position < source.length && valid {
+        let start = position
+        while position < source.length && source[position] != '\n' { position = position + 1 }
+        let length = moduleNatural(source.slice(start, position))
+        position = position + 1
+        if length < 0 || position > source.length || length > source.length - position {
+            valid = false
+        } else {
+            fields.add(source.slice(position, position + length))
+            position = position + length
+        }
+    }
+    if !valid {
+        let empty: List<Text> = []
+        return empty
+    }
+    return fields
+}
+
+function readModuleFields(source: Text): List<Text> {
+    let fields = decodeModuleFields(source)
+    if fields.length == 5 && fields[0] == "minyar-local-cache-v1" {
+        fields = decodeModuleFields(fields[4])
+    }
+    if fields.length < 3 || fields[0] != "minyar-module-interface-v4" || (fields.length - 3) % 10 != 0 {
+        let empty: List<Text> = []
+        return empty
+    }
+    return fields
+}
+
+function priorModule(prior: List<Text>, path: Text, role: Text): Integer {
+    let position = 3
+    while position + 9 < prior.length {
+        if prior[position] == path && prior[position + 1] == role {
+            return position
+        }
+        position = position + 10
+    }
+    return -1
+}
+
+// The driver passes validated, open base/delta files. Deltas are always
+// relative to the immutable base, so successive edits never form a chain.
+function overlayModuleFields(base: List<Text>, source: Text, baseIdentity: Text): List<Text> {
+    let delta = decodeModuleFields(source)
+    if delta.length == 5 && delta[0] == "minyar-local-cache-v1" { delta = decodeModuleFields(delta[4]) }
+    if delta.length < 4 || delta[0] != "minyar-module-delta-v2" || delta[1] != baseIdentity || (delta.length - 4) % 10 != 0 { return base }
+    let rows: List<Text> = []
+    rows.add("minyar-module-interface-v4")
+    rows.add(delta[2])
+    let table = delta[3]
+    if table == "" {
+        if delta[2] != base[1] { fail("invalid module delta table") }
+        table = base[2]
+    }
+    rows.add(table)
+    let replacements: List<Text> = []
+    replacements.add("")
+    replacements.add("")
+    replacements.add("")
+    let position = 4
+    while position < delta.length { replacements.add(delta[position])
+        position = position + 1 }
+    let graph = decodeModuleFields(delta[2])
+    if graph.length % 2 != 0 { fail("invalid module delta graph") }
+    position = 0
+    while position < graph.length {
+        let role = "library"
+        if position == 0 { role = "entry" }
+        let saved = priorModule(replacements, graph[position], role)
+        let selected = replacements
+        if saved < 0 { selected = base
+            saved = priorModule(base, graph[position], role) }
+        if saved < 0 { fail("missing module delta row") }
+        let column = 0
+        while column < 10 { rows.add(selected[saved + column])
+            column = column + 1 }
+        position = position + 2
+    }
+    return rows
+}
+
+function encodeModuleFields(fields: List<Text>): Text {
+    let pieces: List<Text> = []
+    let position = 0
+    while position < fields.length { appendModuleField(pieces, fields[position])
+        position = position + 1 }
+    return joinText(pieces)
+}
+
+function writeModuleUpdate(path: Text, next: List<Text>, base: List<Text>, baseIdentity: Text) {
+    if base.length < 3 || baseIdentity == "" { writeTextFile(path, encodeModuleFields(next))
+        return }
+    let delta: List<Text> = []
+    delta.add("minyar-module-delta-v2")
+    delta.add(baseIdentity)
+    delta.add(next[1])
+    if next[1] == base[1] { delta.add("") } else { delta.add(next[2]) }
+    let position = 3
+    let changed = 0
+    while position < next.length {
+        let saved = priorModule(base, next[position], next[position + 1])
+        let different = saved < 0
+        let column = 0
+        while column < 10 && !different {
+            if next[position + column] != base[saved + column] { different = true }
+            column = column + 1
+        }
+        if different {
+            changed = changed + 1
+            column = 0
+            while column < 10 { delta.add(next[position + column])
+                column = column + 1 }
+        }
+        position = position + 10
+    }
+    // Compact when more than half the current graph has changed. Both
+    // publications replace whole files; a stale delta cannot match a new base.
+    if changed * 2 > (next.length - 3) / 10 { writeTextFile(path, encodeModuleFields(next)) } else { writeTextFile(path, encodeModuleFields(delta)) }
+}
+
+function quoteModuleSource(value: Text): Text {
+    let pieces: List<Text> = []
+    pieces.add("\"")
+    let position = 0
+    let start = 0
+    while position < value.length {
+        let replacement = ""
+        let character = value[position]
+        if character == '\\' { replacement = "\\\\" }
+        if character == '"' { replacement = "\\\"" }
+        if character == '\n' { replacement = "\\n" }
+        if character == '\r' { replacement = "\\r" }
+        if character == '\t' { replacement = "\\t" }
+        if replacement != "" {
+            pieces.add(value.slice(start, position))
+            pieces.add(replacement)
+            start = position + 1
+        }
+        position = position + 1
+    }
+    pieces.add(value.slice(start, value.length))
+    pieces.add("\"")
+    return joinText(pieces)
+}
+
+function appendInterfaceTokens(pieces: List<Text>, kinds: List<Integer>, texts: List<Text>, start: Integer, end: Integer, lines: List<Text>, origins: List<Text>) {
+    let position = start
+    while position < end {
+        appendModuleField(origins, lines[position])
+        if kinds[position] == 6 {
+            // A newline after a generic closing '>' is not a lexer token.
+            // Preserve every existing terminator explicitly so the compact
+            // summary keeps exactly one source origin for each token.
+            pieces.add("; ")
+        } else {
+            if kinds[position] == 3 { pieces.add(quoteModuleSource(texts[position])) } else { pieces.add(texts[position]) }
+            pieces.add(" ")
+        }
+        position = position + 1
+    }
+}
+
+// A local integer type index is never persisted. Interfaces use its qualified
+// declaration identity and record layouts, including privately named types.
+function stableInterfaceType(type: Integer, names: List<Text>): Text {
+    if isListType(type) { return "list:" + stableInterfaceType(listElementType(type), names) }
+    if isRecordType(type) { return "record:" + names[type - 1000] }
+    return Text(type)
+}
+
+// Index declarations/import edges once. Interface construction then follows
+// only a module's own declarations, direct imports and reachable record types.
+function moduleOwnerHeads(count: Integer, owners: List<Integer>, next: List<Integer>): List<Integer> {
+    let heads: List<Integer> = []
+    let position = 0
+    while position < count { heads.add(-1)
+        position = position + 1 }
+    position = 0
+    while position < owners.length {
+        let owner = owners[position]
+        next.add(heads[owner])
+        heads[owner] = position
+        position = position + 1
+    }
+    return heads
+}
+
+function markInterfaceType(type: Integer, selected: List<Integer>, pending: List<Integer>, stamp: Integer) {
+    let element = type
+    while isListType(element) { element = listElementType(element) }
+    if isRecordType(element) {
+        let record = element - 1000
+        if selected[record] != stamp {
+            selected[record] = stamp
+            pending.add(record)
+        }
+    }
+}
+
+function sortModuleSymbols(symbols: List<Integer>, names: List<Text>, kinds: List<Integer>) {
+    let start = symbols.length / 2
+    while start > 0 {
+        start = start - 1
+        siftSymbolLookup(symbols, names, kinds, start, symbols.length)
+    }
+    let end = symbols.length
+    while end > 1 {
+        end = end - 1
+        let held = symbols[0]
+        symbols[0] = symbols[end]
+        symbols[end] = held
+        siftSymbolLookup(symbols, names, kinds, 0, end)
+    }
+}
+
+function moduleInterfaceContext(module: Integer, importHeads: List<Integer>, importNext: List<Integer>, importTargets: List<Integer>, declarationHeads: List<Integer>, declarationNext: List<Integer>, declarationSymbols: List<Integer>, declarationPublic: List<Integer>, names: List<Text>, kinds: List<Integer>, returns: List<Integer>, counts: List<Integer>, parameters: List<Text>, types: List<Integer>, selected: List<Integer>, exported: List<Integer>, externalPieces: List<Text>): Text {
+    let stamp = module + 1
+    let pending: List<Integer> = []
+    // First visit local declarations, then each directly imported module.
+    let owner = module
+    let edge = importHeads[module]
+    let visiting = true
+    while visiting {
+        let declaration = declarationHeads[owner]
+        while declaration >= 0 {
+            if owner == module || declarationPublic[declaration] == 1 {
+                let symbol = declarationSymbols[declaration]
+                if owner != module { exported[symbol] = stamp }
+                if selected[symbol] != stamp {
+                    selected[symbol] = stamp
+                    pending.add(symbol)
+                }
+            }
+            declaration = declarationNext[declaration]
+        }
+        if edge < 0 { visiting = false } else {
+            owner = importTargets[edge]
+            edge = importNext[edge]
+        }
+    }
+    let position = 0
+    while position < pending.length {
+        let symbol = pending[position]
+        markInterfaceType(returns[symbol], selected, pending, stamp)
+        let parameter = 0
+        let first = functionParameterOffset(counts, symbol)
+        while parameter < counts[symbol] {
+            markInterfaceType(types[first + parameter], selected, pending, stamp)
+            parameter = parameter + 1
+        }
+        position = position + 1
+    }
+    sortModuleSymbols(pending, names, kinds)
+    let pieces: List<Text> = []
+    position = 0
+    while position < pending.length {
+        let symbol = pending[position]
+        appendModuleField(pieces, names[symbol])
+        let visible = "private-type"
+        if exported[symbol] == stamp { visible = "exported" }
+        appendModuleField(pieces, visible)
+        appendModuleField(pieces, Text(kinds[symbol]))
+        appendModuleField(pieces, stableInterfaceType(returns[symbol], names))
+        appendModuleField(pieces, Text(counts[symbol]))
+        let first = functionParameterOffset(counts, symbol)
+        let parameter = 0
+        while parameter < counts[symbol] {
+            if kinds[symbol] == 2 { appendModuleField(pieces, parameters[first + parameter]) }
+            appendModuleField(pieces, stableInterfaceType(types[first + parameter], names))
+            parameter = parameter + 1
+        }
+        if exported[symbol] == stamp && kinds[symbol] == 1 {
+            externalPieces.add("declare " + llvmType(returns[symbol]) + " @" + names[symbol] + "(")
+            parameter = 0
+            while parameter < counts[symbol] {
+                if parameter > 0 { externalPieces.add(", ") }
+                externalPieces.add(llvmType(types[first + parameter]))
+                parameter = parameter + 1
+            }
+            externalPieces.add(")\n")
+        }
+        position = position + 1
+    }
+    return joinText(pieces)
+}
+
+function loadInterfaceModule(path: Text, isEntry: Boolean, modulePaths: List<Text>, moduleSources: List<Text>, moduleStates: List<Integer>, modulePublic: List<Integer>, moduleTokenStarts: List<Integer>, allTokenKinds: List<Integer>, allTokenTexts: List<Text>, allTokenLines: List<Text>, importOwners: List<Integer>, importAliases: List<Text>, importTargets: List<Integer>, declarationStarts: List<Integer>, declarationEnds: List<Integer>, prior: List<Text>, summaries: List<Text>, topLevels: List<Integer>, cacheRows: List<Integer>, lexerStats: List<Integer>, moduleImports: List<Text>, moduleOrigins: List<Text>): Integer {
+    let canonicalPath = normalizePath(path)
+    let existing = findText(modulePaths, canonicalPath)
+    if existing >= 0 {
+        if moduleStates[existing] == 1 {
+            let cycle = ""
+            let position = 0
+            while position < modulePaths.length {
+                if moduleStates[position] == 1 {
+                    if cycle != "" {
+                        cycle = cycle + " -> "
+                    }
+                    cycle = cycle + modulePaths[position]
+                }
+                position = position + 1
+            }
+            fail("module import cycle: " + cycle + " -> " + canonicalPath)
+        }
+        return existing
+    }
+
+    let module = modulePaths.length
+    modulePaths.add(canonicalPath)
+    let source = readTextFile(canonicalPath)
+    moduleSources.add(source)
+    let role = "library"
+    if isEntry { role = "entry" }
+    let cached = priorModule(prior, canonicalPath, role)
+    cacheRows.add(cached)
+    summaries.add("")
+    topLevels.add(0)
+    moduleImports.add("")
+    moduleOrigins.add("")
+    let origins: List<Text> = []
+    let importPieces: List<Text> = []
+    let summary: List<Text> = []
+    let tokenSource = source
+    moduleStates.add(1)
+    modulePublic.add(0)
+    if cached >= 0 && prior[cached + 2] == source {
+        moduleTokenStarts.add(-1)
+        summaries[module] = prior[cached + 3]
+        topLevels[module] = moduleNatural(prior[cached + 6])
+        if topLevels[module] < 0 || topLevels[module] > 1 { fail("invalid module artifact top-level flag") }
+        moduleImports[module] = prior[cached + 7]
+        moduleOrigins[module] = prior[cached + 8]
+        let imported = decodeModuleFields(moduleImports[module])
+        if imported.length % 2 != 0 { fail("invalid module import table") }
+        let edge = 0
+        while edge < imported.length {
+            let alias = imported[edge]
+            let specifier = imported[edge + 1]
+            if findModuleImport(importOwners, importAliases, module, alias) >= 0 { fail("invalid module import table") }
+            let targetPath = resolveModulePath(canonicalPath, specifier)
+            let target = loadInterfaceModule(targetPath, false, modulePaths, moduleSources, moduleStates, modulePublic, moduleTokenStarts, allTokenKinds, allTokenTexts, allTokenLines, importOwners, importAliases, importTargets, declarationStarts, declarationEnds, prior, summaries, topLevels, cacheRows, lexerStats, moduleImports, moduleOrigins)
+            importOwners.add(module)
+            importAliases.add(alias)
+            importTargets.add(target)
+            edge = edge + 2
+        }
+        moduleStates[module] = 2
+        lexerStats[1] = lexerStats[1] + 1
+        return module
+    }
+    lexerStats[0] = lexerStats[0] + 1
+
+    moduleTokenStarts.add(allTokenKinds.length)
+    tokenize(tokenSource, allTokenKinds, allTokenTexts, allTokenLines)
+    let cursor: List<Integer> = []
+    cursor.add(moduleTokenStarts[module])
+    skipTerminators(allTokenKinds, cursor)
+    while allTokenKinds[cursor[0]] != 0 {
+        let sourceStart = cursor[0]
+        if tokenIs(allTokenKinds, allTokenTexts, cursor, "use") {
+            let importLine = allTokenLines[cursor[0]]
+            cursor[0] = cursor[0] + 1
+            if allTokenKinds[cursor[0]] != 3 {
+                fail(canonicalPath + ":" + importLine + ": use expects a quoted module name")
+            }
+            let specifier = allTokenTexts[cursor[0]]
+            cursor[0] = cursor[0] + 1
+            if !tokenIs(allTokenKinds, allTokenTexts, cursor, "as") {
+                fail(canonicalPath + ":" + importLine + ": use expects 'as' after the module name")
+            }
+            cursor[0] = cursor[0] + 1
+            if allTokenKinds[cursor[0]] != 1 {
+                fail(canonicalPath + ":" + importLine + ": use expects a module alias after 'as'")
+            }
+            let alias = allTokenTexts[cursor[0]]
+            cursor[0] = cursor[0] + 1
+            if findModuleImport(importOwners, importAliases, module, alias) >= 0 {
+                fail(canonicalPath + ":" + importLine + ": module alias '" + alias + "' is already used")
+            }
+            finishStatement(allTokenKinds, allTokenTexts, allTokenLines, cursor)
+            appendModuleField(importPieces, alias)
+            appendModuleField(importPieces, specifier)
+            appendInterfaceTokens(summary, allTokenKinds, allTokenTexts, sourceStart, cursor[0], allTokenLines, origins)
+            summary.add("\n")
+            let targetPath = resolveModulePath(canonicalPath, specifier)
+            let target = loadInterfaceModule(targetPath, false, modulePaths, moduleSources, moduleStates, modulePublic, moduleTokenStarts, allTokenKinds, allTokenTexts, allTokenLines, importOwners, importAliases, importTargets, declarationStarts, declarationEnds, prior, summaries, topLevels, cacheRows, lexerStats, moduleImports, moduleOrigins)
+            importOwners.add(module)
+            importAliases.add(alias)
+            importTargets.add(target)
+        } else {
+            let declarationCursor = cursor[0]
+            let hasPublic = false
+            if tokenIs(allTokenKinds, allTokenTexts, cursor, "public") {
+                hasPublic = true
+                modulePublic[module] = 1
+                declarationCursor = declarationCursor + 1
+            }
+            let marker: List<Integer> = []
+            marker.add(declarationCursor)
+            if tokenIs(allTokenKinds, allTokenTexts, marker, "record") || tokenIs(allTokenKinds, allTokenTexts, marker, "function") {
+                declarationStarts.add(declarationCursor)
+                skipDeclaration(allTokenKinds, allTokenTexts, marker)
+                declarationEnds.add(marker[0])
+                if tokenIs(allTokenKinds, allTokenTexts, cursor, "public") { cursor[0] = cursor[0] + 1 }
+                if tokenIs(allTokenKinds, allTokenTexts, cursor, "function") {
+                    let headerEnd = cursor[0]
+                    while headerEnd < marker[0] && allTokenTexts[headerEnd] != "{" { headerEnd = headerEnd + 1 }
+                    appendInterfaceTokens(summary, allTokenKinds, allTokenTexts, sourceStart, headerEnd, allTokenLines, origins)
+                    summary.add("{ }\n")
+                    appendModuleField(origins, allTokenLines[headerEnd])
+                    appendModuleField(origins, allTokenLines[marker[0] - 1])
+                    appendModuleField(origins, allTokenLines[marker[0] - 1])
+                } else {
+                    appendInterfaceTokens(summary, allTokenKinds, allTokenTexts, sourceStart, marker[0], allTokenLines, origins)
+                    summary.add("\n")
+                    appendModuleField(origins, allTokenLines[marker[0] - 1])
+                }
+                cursor[0] = marker[0]
+            } else {
+                if hasPublic {
+                    fail(canonicalPath + ":" + allTokenLines[cursor[0]] + ": public must describe a function or record declaration")
+                }
+                if !isEntry {
+                    fail(canonicalPath + ":" + allTokenLines[cursor[0]] + ": imported modules may contain declarations but not executable top-level statements")
+                }
+                topLevels[module] = 1
+                declarationStarts.add(-1)
+                skipTopLevelStatement(allTokenKinds, allTokenTexts, cursor)
+            }
+        }
+        skipTerminators(allTokenKinds, cursor)
+    }
+    appendModuleField(origins, allTokenLines[cursor[0]])
+    moduleOrigins[module] = joinText(origins)
+    moduleImports[module] = joinText(importPieces)
+    summaries[module] = joinText(summary)
+    moduleStates[module] = 2
+    return module
+}
+
+function takeModuleNatural(fields: List<Text>, cursor: List<Integer>): Integer {
+    if cursor[0] >= fields.length { fail("invalid compiled module type table") }
+    let value = moduleNatural(fields[cursor[0]])
+    cursor[0] = cursor[0] + 1
+    if value < 0 { fail("invalid compiled module type table") }
+    return value
+}
+
+function takeModuleField(fields: List<Text>, cursor: List<Integer>): Text {
+    if cursor[0] >= fields.length { fail("invalid compiled module type table") }
+    let value = fields[cursor[0]]
+    cursor[0] = cursor[0] + 1
+    return value
+}
+
+function writeModuleTable(names: List<Text>, kinds: List<Integer>, returns: List<Integer>, counts: List<Integer>, parameters: List<Text>, types: List<Integer>, lookup: List<Integer>, declarationOwners: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationPublic: List<Integer>, declarationQualifiedNames: List<Text>, declarationLookup: List<Integer>): Text {
+    let pieces: List<Text> = []
+    appendModuleField(pieces, Text(names.length))
+    let position = 0
+    while position < names.length {
+        appendModuleField(pieces, names[position])
+        appendModuleField(pieces, Text(kinds[position]))
+        appendModuleField(pieces, Text(returns[position]))
+        appendModuleField(pieces, Text(counts[position]))
+        appendModuleField(pieces, Text(counts[names.length + position]))
+        appendModuleField(pieces, Text(lookup[position]))
+        position = position + 1
+    }
+    appendModuleField(pieces, Text(parameters.length))
+    position = 0
+    while position < parameters.length {
+        appendModuleField(pieces, parameters[position])
+        appendModuleField(pieces, Text(types[position]))
+        position = position + 1
+    }
+    appendModuleField(pieces, Text(declarationOwners.length))
+    position = 0
+    while position < declarationOwners.length {
+        appendModuleField(pieces, Text(declarationOwners[position]))
+        appendModuleField(pieces, declarationNames[position])
+        appendModuleField(pieces, Text(declarationKinds[position]))
+        appendModuleField(pieces, Text(declarationPublic[position]))
+        appendModuleField(pieces, declarationQualifiedNames[position])
+        appendModuleField(pieces, Text(declarationLookup[position]))
+        position = position + 1
+    }
+    return joinText(pieces)
+}
+
+function readModuleTable(text: Text, names: List<Text>, kinds: List<Integer>, returns: List<Integer>, counts: List<Integer>, parameters: List<Text>, types: List<Integer>, lookup: List<Integer>, declarationOwners: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationPublic: List<Integer>, declarationQualifiedNames: List<Text>, declarationLookup: List<Integer>) {
+    let fields = decodeModuleFields(text)
+    let cursor: List<Integer> = []
+    cursor.add(0)
+    let total = takeModuleNatural(fields, cursor)
+    if total > fields.length / 6 { fail("invalid compiled module type table") }
+    let offsets: List<Integer> = []
+    let position = 0
+    while position < total {
+        names.add(takeModuleField(fields, cursor))
+        kinds.add(takeModuleNatural(fields, cursor))
+        returns.add(takeModuleNatural(fields, cursor))
+        counts.add(takeModuleNatural(fields, cursor))
+        offsets.add(takeModuleNatural(fields, cursor))
+        let sorted = takeModuleNatural(fields, cursor)
+        if sorted >= total { fail("invalid compiled module type table") }
+        lookup.add(sorted)
+        position = position + 1
+    }
+    position = 0
+    while position < total {
+        counts.add(offsets[position])
+        returns.add(lookup[position])
+        position = position + 1
+    }
+    total = takeModuleNatural(fields, cursor)
+    if total > fields.length / 2 { fail("invalid compiled module type table") }
+    position = 0
+    while position < total {
+        parameters.add(takeModuleField(fields, cursor))
+        types.add(takeModuleNatural(fields, cursor))
+        position = position + 1
+    }
+    total = takeModuleNatural(fields, cursor)
+    if total > fields.length / 6 { fail("invalid compiled module type table") }
+    position = 0
+    while position < total {
+        declarationOwners.add(takeModuleNatural(fields, cursor))
+        declarationNames.add(takeModuleField(fields, cursor))
+        declarationKinds.add(takeModuleNatural(fields, cursor))
+        declarationPublic.add(takeModuleNatural(fields, cursor))
+        declarationQualifiedNames.add(takeModuleField(fields, cursor))
+        let sorted = takeModuleNatural(fields, cursor)
+        if sorted >= total { fail("invalid compiled module type table") }
+        declarationLookup.add(sorted)
+        position = position + 1
+    }
+    if cursor[0] != fields.length { fail("invalid compiled module type table") }
+}
+
+function stableModuleIdentity(path: Text, root: Text): Text {
+    // Artifacts belong to one exact entry path (validated by the driver).
+    // Within that namespace a root-relative path is still injective, while
+    // avoiding the build directory prefix on every LLVM symbol reference.
+    let identity = "absolute:" + path
+    if path.length >= root.length && path.slice(0, root.length) == root {
+        identity = "local:" + path.slice(root.length, path.length)
+    }
+    let pieces: List<Text> = []
+    let position = identity.length
+    while position > 0 {
+        position = position - 1
+        pieces.add(Text(identity[position]))
+    }
+    return escapeLLVMText(joinText(pieces))
+}
+
+function compileModuleEntry(path: Text, inputState: Text, outputState: Text, statsPath: Text): Text {
+    if path.length == 0 || !(path[0] == '/' || (path.length > 2 && path[1] == ':' && pathCharacterIsSeparator(path[2]))) {
+        fail("module state requires an absolute entry path")
+    }
+    let input = readTextFile(inputState)
+    let plan = decodeModuleFields(input)
+    let base: List<Text> = []
+    let baseIdentity = ""
+    let prior = readModuleFields(input)
+    if plan.length == 4 && plan[0] == "minyar-module-plan-v1" {
+        base = readModuleFields(readTextFile(plan[1]))
+        if base.length >= 3 {
+            baseIdentity = plan[3]
+            prior = overlayModuleFields(base, readTextFile(plan[2]), baseIdentity)
+        }
+    }
+    let modulePaths: List<Text> = []
+    let moduleSources: List<Text> = []
+    let moduleStates: List<Integer> = []
+    let modulePublic: List<Integer> = []
+    let moduleTokenStarts: List<Integer> = []
+    let moduleTokenKinds: List<Integer> = []
+    let moduleTokenTexts: List<Text> = []
+    let moduleTokenLines: List<Text> = []
+    let importOwners: List<Integer> = []
+    let importAliases: List<Text> = []
+    let importTargets: List<Integer> = []
+    let declarationStarts: List<Integer> = []
+    let declarationEnds: List<Integer> = []
+    let summaries: List<Text> = []
+    let topLevels: List<Integer> = []
+    let cacheRows: List<Integer> = []
+    let moduleImports: List<Text> = []
+    let moduleOrigins: List<Text> = []
+    let lexerStats: List<Integer> = []
+    lexerStats.add(0)
+    lexerStats.add(0)
+    let entry = loadInterfaceModule(path, true, modulePaths, moduleSources, moduleStates, modulePublic, moduleTokenStarts, moduleTokenKinds, moduleTokenTexts, moduleTokenLines, importOwners, importAliases, importTargets, declarationStarts, declarationEnds, prior, summaries, topLevels, cacheRows, lexerStats, moduleImports, moduleOrigins)
+
+    let identities: List<Text> = []
+    let identityRoot = directoryOfPath(modulePaths[0])
+    if identityRoot != "/" { identityRoot = identityRoot + "/" }
+    let identityIndex = 0
+    while identityIndex < modulePaths.length {
+        identities.add(stableModuleIdentity(modulePaths[identityIndex], identityRoot))
+        identityIndex = identityIndex + 1
+    }
+    let signaturePieces: List<Text> = []
+    let module = 0
+    while module < modulePaths.length {
+        appendModuleField(signaturePieces, modulePaths[module])
+        appendModuleField(signaturePieces, summaries[module])
+        module = module + 1
+    }
+    let signature = joinText(signaturePieces)
+    let tableReused = prior.length >= 3 && prior[1] == signature
+    let declarationOwners: List<Integer> = []
+    let declarationNames: List<Text> = []
+    let declarationKinds: List<Integer> = []
+    let declarationPublic: List<Integer> = []
+    let declarationQualifiedNames: List<Text> = []
+    let declarationLookup: List<Integer> = []
+    let names: List<Text> = []
+    let kinds: List<Integer> = []
+    let returns: List<Integer> = []
+    let counts: List<Integer> = []
+    let parameters: List<Text> = []
+    let types: List<Integer> = []
+    let lookup: List<Integer> = []
+    let table = ""
+    if tableReused {
+        table = prior[2]
+        readModuleTable(table, names, kinds, returns, counts, parameters, types, lookup, declarationOwners, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames, declarationLookup)
+    } else {
+    let summaryKinds: List<Integer> = []
+    let summaryTexts: List<Text> = []
+    let summaryLines: List<Text> = []
+    let summaryStarts: List<Integer> = []
+    module = 0
+    while module < modulePaths.length {
+        summaryStarts.add(summaryKinds.length)
+        tokenize(summaries[module], summaryKinds, summaryTexts, summaryLines)
+        let origins = decodeModuleFields(moduleOrigins[module])
+        if origins.length != summaryKinds.length - summaryStarts[module] { fail("invalid module source locations") }
+        let origin = 0
+        while origin < origins.length {
+            summaryLines[summaryStarts[module] + origin] = origins[origin]
+            origin = origin + 1
+        }
+        collectModuleDeclarations(module, summaryStarts[module], summaryKinds, summaryTexts, summaryLines, declarationOwners, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames, identities)
+        module = module + 1
+    }
+    declarationLookup = buildSymbolLookup(declarationQualifiedNames, declarationKinds)
+    requireUniqueModuleDeclarations(declarationLookup, declarationNames, declarationKinds, declarationQualifiedNames)
+    let tokenKinds: List<Integer> = []
+    let tokenTexts: List<Text> = []
+    let tokenLines: List<Text> = []
+    module = 0
+    while module < modulePaths.length {
+        appendModuleTokens(module, modulePaths[module], summaryStarts[module], summaryKinds, summaryTexts, summaryLines, importOwners, importAliases, importTargets, declarationLookup, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames, tokenKinds, tokenTexts, tokenLines, identities)
+        module = module + 1
+    }
+    addToken(tokenKinds, tokenTexts, tokenLines, 0, "", "end of interfaces")
+
+    let ends: List<Integer> = []
+    let ignoredTopLevel = discoverRecordNames(tokenKinds, tokenTexts, tokenLines, names, kinds, returns, counts, ends)
+    lookup = buildSymbolLookup(names, kinds)
+    requireUniqueSymbols(lookup, names, kinds)
+    let parameterStarts: List<Integer> = []
+    let position = 0
+    while position < names.length {
+        parameterStarts.add(0)
+        position = position + 1
+    }
+    discoverDeclarations(tokenKinds, tokenTexts, tokenLines, names, kinds, returns, lookup, counts, parameters, types, parameterStarts, ends)
+    appendParameterOffsets(counts, parameterStarts)
+    lookup = buildSymbolLookup(names, kinds)
+    requireUniqueSymbols(lookup, names, kinds)
+    position = 0
+    while position < lookup.length {
+        returns.add(lookup[position])
+        position = position + 1
+    }
+        table = writeModuleTable(names, kinds, returns, counts, parameters, types, lookup, declarationOwners, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames, declarationLookup)
+    }
+    let needsInterfaces = !tableReused
+    module = 0
+    while module < cacheRows.length {
+        if cacheRows[module] < 0 { needsInterfaces = true }
+        module = module + 1
+    }
+    let importNext: List<Integer> = []
+    let importHeads: List<Integer> = []
+    let declarationNext: List<Integer> = []
+    let declarationHeads: List<Integer> = []
+    let declarationSymbols: List<Integer> = []
+    let interfaceSelected: List<Integer> = []
+    let interfaceExported: List<Integer> = []
+    if needsInterfaces {
+        importHeads = moduleOwnerHeads(modulePaths.length, importOwners, importNext)
+        declarationHeads = moduleOwnerHeads(modulePaths.length, declarationOwners, declarationNext)
+        let position = 0
+        while position < declarationOwners.length {
+            let symbol = findIndexedSymbol(lookup, names, kinds, declarationQualifiedNames[position], declarationKinds[position])
+            if symbol < 0 { fail("internal error: missing interface symbol") }
+            declarationSymbols.add(symbol)
+            position = position + 1
+        }
+        position = 0
+        while position < names.length {
+            interfaceSelected.add(0)
+            interfaceExported.add(0)
+            position = position + 1
+        }
+    }
+    let mainFunction = findIndexedSymbol(lookup, names, kinds, "main", 1)
+    if topLevels[0] == 1 && mainFunction >= 0 {
+        fail("a program cannot combine top-level statements with function main()")
+    }
+    let output: List<Text> = []
+    addOutput(output, "; Generated by the compiler written in Minyar.\n\n")
+    appendRuntimeDeclarations(output)
+    let nextFields: List<Text> = []
+    nextFields.add("minyar-module-interface-v4")
+    nextFields.add(signature)
+    nextFields.add(table)
+    let bodyStats: List<Integer> = []
+    bodyStats.add(0)
+    bodyStats.add(0)
+    let reused = 0
+    let compiled = 0
+    let dirty = false
+    if !tableReused || prior.length != 3 + modulePaths.length * 10 { dirty = true }
+    module = 0
+    while module < modulePaths.length {
+        let cached = cacheRows[module]
+        let context = ""
+        let externs = ""
+        if tableReused && cached >= 0 {
+            context = prior[cached + 4]
+            externs = prior[cached + 9]
+        } else {
+            let externalPieces: List<Text> = []
+            context = moduleInterfaceContext(module, importHeads, importNext, importTargets, declarationHeads, declarationNext, declarationSymbols, declarationPublic, names, kinds, returns, counts, parameters, types, interfaceSelected, interfaceExported, externalPieces)
+            externs = joinText(externalPieces)
+        }
+        let code = ""
+        if cached >= 0 && prior[cached + 2] == moduleSources[module] && prior[cached + 4] == context {
+            code = prior[cached + 5]
+            reused = reused + 1
+        } else {
+            dirty = true
+            let localKinds: List<Integer> = []
+            let localTexts: List<Text> = []
+            let localLines: List<Text> = []
+            if moduleTokenStarts[module] < 0 {
+                // An unchanged source whose imported interface changed must
+                // go through its original body lexer and checker again.
+                let rawKinds: List<Integer> = []
+                let rawTexts: List<Text> = []
+                let rawLines: List<Text> = []
+                tokenize(moduleSources[module], rawKinds, rawTexts, rawLines)
+                lexerStats[0] = lexerStats[0] + 1
+                appendModuleTokens(module, modulePaths[module], 0, rawKinds, rawTexts, rawLines, importOwners, importAliases, importTargets, declarationLookup, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames, localKinds, localTexts, localLines, identities)
+            } else {
+                appendModuleTokens(module, modulePaths[module], moduleTokenStarts[module], moduleTokenKinds, moduleTokenTexts, moduleTokenLines, importOwners, importAliases, importTargets, declarationLookup, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames, localKinds, localTexts, localLines, identities)
+            }
+            addToken(localKinds, localTexts, localLines, 0, "", "end of module")
+            let pieces: List<Text> = []
+            appendLiteralDeclarations(pieces, localKinds, localTexts, identities[module])
+            compileFunctions(localKinds, localTexts, localLines, names, kinds, returns, counts, parameters, types, pieces, identities[module], bodyStats)
+            if module == 0 && mainFunction < 0 {
+                compileTopLevel(localKinds, localTexts, localLines, names, kinds, returns, counts, parameters, types, pieces, identities[module], bodyStats)
+            }
+            code = joinText(pieces)
+            compiled = compiled + 1
+        }
+        addOutput(output, code)
+        nextFields.add(modulePaths[module])
+        let role = "library"
+        if module == 0 { role = "entry" }
+        nextFields.add(role)
+        nextFields.add(moduleSources[module])
+        nextFields.add(summaries[module])
+        nextFields.add(context)
+        nextFields.add(code)
+        nextFields.add(Text(topLevels[module]))
+        nextFields.add(moduleImports[module])
+        nextFields.add(moduleOrigins[module])
+        nextFields.add(externs)
+        module = module + 1
+    }
+    if dirty { writeModuleUpdate(outputState, nextFields, base, baseIdentity) } else { writeTextFile(outputState, "") }
+    writeTextFile(statsPath, Text(reused) + " " + Text(compiled) + " " + Text(lexerStats[0]) + " " + Text(lexerStats[1]) + " " + Text(bodyStats[0]) + " " + Text(bodyStats[1]) + " " + Text(tableReused) + "\n")
+    return joinText(output)
+}
+
+function main() {
+    if argumentCount() == 0 {
+        print("Minyar compiler bootstrap is ready")
+        print(characterIsLetter('M'))
+        print(characterIsDigit('x'))
+    } else {
+        let llvm = ""
+        if argumentCount() > 2 {
+            if argumentCount() != 6 || argument(2) != "--module-state" {
+                fail("usage: minyarc SOURCE [OUTPUT [--module-state INPUT_STATE OUTPUT_STATE STATS]]")
+            }
+            llvm = compileModuleEntry(argument(0), argument(3), argument(4), argument(5))
+        } else { llvm = compileEntry(argument(0)) }
+        if argumentCount() == 1 {
+            print(llvm)
+        } else {
+            writeTextFile(argument(1), llvm)
+        }
+    }
+}
