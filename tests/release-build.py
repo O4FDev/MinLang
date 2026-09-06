@@ -34,8 +34,10 @@ class ReleaseBuild(unittest.TestCase):
                 args = json.loads(log.read_text())
                 self.assertIn(expected, args)
                 self.assertEqual('-flto' in args, lto)
-                self.assertTrue(any(arg.endswith('minyar-runtime-release.ll' if lto else
-                                                 'minyar-runtime.o') for arg in args))
+                runtime_name = 'runtime.ll' if lto else 'runtime.o'
+                runtime_path = next(Path(arg) for arg in args if Path(arg).name == runtime_name)
+                self.assertTrue(runtime_path.parent.name.startswith('invocation.'))
+                self.assertEqual(runtime_path.parent.parent, ROOT / 'build/programs')
                 self.assertEqual(subprocess.check_output([str(output)], text=True), '42\n')
 
     def test_release_usage_errors(self):

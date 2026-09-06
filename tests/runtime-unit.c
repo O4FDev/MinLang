@@ -92,19 +92,111 @@ int main(void) {
     assert(minyar_text_character_at(unicode, 0) == 0xe9);
     assert(minyar_text_character_at(unicode, 1) == 0x1f642);
     assert(minyar_text_length(unicode) == 2);
+    assert(((RcData *)unicode->character_offsets - 1)->size == 3 * sizeof(uint32_t));
     MinyarText *slice = minyar_text_slice(unicode, 1, 2);
+    assert(slice->backing == unicode);
+    assert(slice->bytes == unicode->bytes + 2);
     minyar_rc_keep(slice);
     minyar_rc_enter(0);
     minyar_rc_step(); /* Caller expression owners survive nested calls. */
     assert(minyar_text_character_at(slice, 0) == 0x1f642);
     minyar_rc_leave();
     minyar_rc_local(0, NULL);
-    assert(rc_object_count == 1);
+    assert(rc_object_count == 2); /* The view retains its flattened backing. */
     minyar_rc_step();
+    empty_heap();
+
+    /* Non-ASCII indexes store one breadcrumb per 64 characters and scan only
+       within that bounded block. Exercise both sides of each boundary. */
+    unsigned char breadcrumb_bytes[261];
+    for (int i = 0; i < 130; i++) {
+        breadcrumb_bytes[i * 2] = 0xc3;
+        breadcrumb_bytes[i * 2 + 1] = 0xa9;
+    }
+    breadcrumb_bytes[260] = 0;
+    MinyarText *breadcrumbs = copy_c_text((const char *)breadcrumb_bytes);
+    assert(minyar_text_length(breadcrumbs) == 130);
+    assert(((RcData *)breadcrumbs->character_offsets - 1)->size == 5 * sizeof(uint32_t));
+    assert(minyar_text_character_at(breadcrumbs, 63) == 0xe9);
+    assert(minyar_text_character_at(breadcrumbs, 64) == 0xe9);
+    assert(minyar_text_character_at(breadcrumbs, 129) == 0xe9);
+    /* A forward scan resumes from the previous character instead of decoding
+       from each breadcrumb again. Each lookup decodes exactly its result. */
+    text_decode_count = 0;
+    for (int i = 0; i < 130; i++)
+        assert(minyar_text_character_at(breadcrumbs, i) == 0xe9);
+    assert(text_decode_count == 130);
+    MinyarText *boundary = minyar_text_slice(breadcrumbs, 63, 65);
+    assert(boundary->byte_length == 4);
+    minyar_rc_release(boundary);
+    minyar_rc_release(breadcrumbs);
+    empty_heap();
+
+    /* Full slices share the value itself; nested views retain the owning root
+       directly and never form an unbounded destruction chain. */
+    MinyarText *root = copy_c_text("abcdef");
+    MinyarText *whole = minyar_text_slice(root, 0, 6);
+    assert(whole == root);
+    assert(((RcObject *)root - 1)->ownership >> 3 == 2);
+    minyar_rc_release(whole);
+    MinyarText *view = minyar_text_slice(root, 1, 5);
+    MinyarText *nested_view = minyar_text_slice(view, 1, 3);
+    assert(view->backing == root && nested_view->backing == root);
+    assert(nested_view->bytes == root->bytes + 2);
+    minyar_rc_release(view);
+    minyar_rc_release(root);
+    MinyarText *expected_view = copy_c_text("cd");
+    assert(minyar_texts_are_equal(nested_view, expected_view));
+    minyar_rc_release(expected_view);
+    minyar_rc_release(nested_view);
+    empty_heap();
+
+    /* Tiny slices of large sources copy instead of retaining an oversized
+       allocation. This is the bounded retention guard for substring views. */
+    unsigned char *large_bytes = new_bytes(8192);
+    memset(large_bytes, 'x', 8192);
+    large_bytes[8192] = 0;
+    MinyarText *large = new_text(large_bytes, 8192, 8192);
+    MinyarText *tiny = minyar_text_slice(large, 0, 1);
+    assert(!tiny->backing && tiny->bytes != large->bytes);
+    minyar_rc_release(large);
+    assert(tiny->bytes[0] == 'x');
+    minyar_rc_release(tiny);
+    empty_heap();
+
+    /* A compiler-proven owned left result grows geometrically in place. A
+       shared left value takes the copying fallback and consumes one owner. */
+    MinyarText *text_chain = copy_c_text("a");
+    MinyarText *suffix = copy_c_text("b");
+    MinyarText *chain_identity = text_chain;
+    for (int i = 0; i < 10000; i++)
+        text_chain = minyar_join_text_take_left(text_chain, suffix);
+    assert(text_chain == chain_identity && text_chain->byte_length == 10001);
+    assert(((RcData *)text_chain->bytes - 1)->size >= (size_t)text_chain->byte_length + 1);
+    assert(((RcData *)text_chain->bytes - 1)->size < ((size_t)text_chain->byte_length + 1) * 2);
+    minyar_rc_release(suffix);
+    minyar_rc_release(text_chain);
+    empty_heap();
+
+    MinyarText *shared_left = copy_c_text("left");
+    MinyarText *shared_alias = shared_left;
+    minyar_rc_retain(shared_alias);
+    MinyarText *shared_right = copy_c_text("right");
+    MinyarText *copied_join = minyar_join_text_take_left(shared_left, shared_right);
+    assert(copied_join != shared_alias);
+    assert(shared_alias->byte_length == 4);
+    assert(copied_join->byte_length == 9);
+    minyar_rc_release(shared_alias);
+    minyar_rc_release(shared_right);
+    minyar_rc_release(copied_join);
     empty_heap();
 
     /* Consuming operations move exactly one owned count, including aliases. */
     MinyarText *owned = copy_c_text("transferred");
+    minyar_rc_local_take(0, owned);
+    assert(((RcObject *)owned - 1)->ownership >> 3 == 1);
+    minyar_rc_local_move(0);
+    assert(rc_frames->locals[0] == NULL);
     minyar_rc_local_take(0, owned);
     assert(((RcObject *)owned - 1)->ownership >> 3 == 1);
     minyar_rc_retain(owned); /* A returned owned alias of the existing local. */
@@ -139,6 +231,37 @@ int main(void) {
     minyar_list_set(children, 0, minyar_list_get(children, 0));
     assert(rc_object_count == 3);
     minyar_rc_release(children);
+    empty_heap();
+
+    /* Replacement can consume a compiler-proven owned value without a
+       retain/drop pair, while releasing exactly the displaced slot owner. */
+    MinyarList *replacements = minyar_list_new();
+    minyar_list_references(replacements);
+    MinyarText *old_value = copy_c_text("old");
+    minyar_list_add_take(replacements, (long long)(intptr_t)old_value);
+    MinyarText *new_value = copy_c_text("new");
+    minyar_list_set_take(replacements, 0, (long long)(intptr_t)new_value);
+    assert(rc_object_count == 2);
+    assert(minyar_list_get(replacements, 0) == (long long)(intptr_t)new_value);
+    assert(((RcObject *)new_value - 1)->ownership >> 3 == 1);
+    minyar_rc_release(replacements);
+    empty_heap();
+
+    MinyarList *original = minyar_list_new();
+    minyar_list_references(original);
+    MinyarText *first = copy_c_text("first");
+    minyar_list_add_take(original, (long long)(intptr_t)first);
+    MinyarText *second = copy_c_text("second");
+    MinyarList *appended = minyar_list_appended(
+        original, (long long)(intptr_t)second, 1, 1);
+    assert(original->length == 1 && appended->length == 2);
+    assert(minyar_list_get(original, 0) == (long long)(intptr_t)first);
+    assert(minyar_list_get(appended, 0) == (long long)(intptr_t)first);
+    assert(minyar_list_get(appended, 1) == (long long)(intptr_t)second);
+    assert(((RcObject *)first - 1)->ownership >> 3 == 2);
+    assert(((RcObject *)second - 1)->ownership >> 3 == 1);
+    minyar_rc_release(original);
+    minyar_rc_release(appended);
     empty_heap();
 
     MinyarList *values = minyar_list_new();

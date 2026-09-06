@@ -39,10 +39,12 @@ static void rc_bounded_save_cursor(RcObject *object, size_t cursor) {
     }
 }
 
-static void rc_bounded_finish_object(RcObject *object, unsigned kind) {
+static void *rc_bounded_finish_object(RcObject *object, unsigned kind) {
+    void *text_backing = NULL;
     if (kind == RC_TEXT) {
         MinyarText *text = (MinyarText *)(object + 1);
-        rc_free_data((void *)text->bytes);
+        text_backing = text->backing;
+        if (!text_backing) rc_free_data((void *)text->bytes);
         rc_free_data(text->character_offsets);
         RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(*text));
     } else if (kind == RC_LIST || kind == RC_REFERENCES || kind == RC_REFERENCES_IMMORTAL) {
@@ -58,6 +60,7 @@ static void rc_bounded_finish_object(RcObject *object, unsigned kind) {
     }
     RC_DEALLOCATE(object);
     RC_ACCOUNT(rc_object_count--);
+    return text_backing;
 }
 
 static unsigned rc_drop(void *value) {
@@ -75,6 +78,10 @@ static unsigned rc_drop(void *value) {
     object->ownership = ownership - 8;
     if (object->ownership >> 3) return 0;
     unsigned kind = object->ownership & 7;
+    if (kind == RC_TEXT) {
+        void *backing = rc_bounded_finish_object(object, kind);
+        return 1 + (backing ? rc_drop(backing) : 0);
+    }
     if (kind == RC_TEXT || kind == RC_LIST || kind == RC_REFERENCES_IMMORTAL ||
         (kind == RC_REFERENCES && !((MinyarList *)(object + 1))->length) ||
         (kind == RC_RECORD && !((MinyarRecord *)(object + 1))->length)) {
@@ -350,9 +357,9 @@ size_t minyar_rc_poll(size_t budget) {
 
 void minyar_rc_release(void *value) {
     unsigned immediate = rc_drop(value);
-    rc_service_pending(MINYAR_RC_POLL_BUDGET - immediate);
+    rc_service_pending(immediate < MINYAR_RC_POLL_BUDGET
+                       ? MINYAR_RC_POLL_BUDGET - immediate : 0);
 #ifdef MINYAR_RC_TESTING
     rc_bounded_last_work += immediate;
 #endif
 }
-

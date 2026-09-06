@@ -15,7 +15,9 @@
 #include <unistd.h>
 
 /* Disposable, process-local build artifacts. Compiler identity is compared
- * byte-for-byte (hex encoded); XXH64 is an accidental-corruption checksum,
+ * byte-for-byte (hex encoded), with a versioned ownership-policy suffix when
+ * enabled. Compiler snapshots still use only the actual executable bytes.
+ * XXH64 is an accidental-corruption checksum,
  * not authentication of artifacts supplied by another party. */
 #define CACHE_LIMIT (64u * 1024u * 1024u)
 typedef struct { unsigned char *data; size_t size; } Bytes;
@@ -133,7 +135,7 @@ static void ensure_directory(const char *path) {
     }
     free(copy);
 }
-static int compiler_run(const char *compiler,const char *entry,const char *output,int input_fd,const char *state,const char *stats,const char *error) {
+static int compiler_run(const char *compiler,const char *entry,const char *output,int input_fd,const char *state,const char *stats,const char *error,const char *budget) {
     if(lseek(input_fd,0,SEEK_SET)<0)stop("cache seek");
     pid_t child=fork();if(child<0)stop("compiler fork");
     if(!child) {
@@ -141,7 +143,7 @@ static int compiler_run(const char *compiler,const char *entry,const char *outpu
         if(dup2(err,STDERR_FILENO)<0)_exit(126);close(err);
         if(fcntl(input_fd,F_SETFD,0)<0)_exit(126);
         char path[64];snprintf(path,sizeof path,"/dev/fd/%d",input_fd);
-        char *const args[]={(char *)compiler,(char *)entry,(char *)output,"--module-state",path,(char *)state,(char *)stats,NULL};
+        char *const args[]={(char *)compiler,(char *)entry,(char *)output,"--module-state",path,(char *)state,(char *)stats,budget?"--bounded-owners":NULL,(char *)budget,NULL};
         execv(compiler,args);perror("module compiler");_exit(127);
     }
     int status;while(waitpid(child,&status,0)<0){if(errno!=EINTR)stop("compiler wait");}
@@ -207,16 +209,45 @@ static void checksum_self_test(void) {
         fputs("module build: checksum self-test failed\n",stderr);exit(1);
     }
 }
+/* Saturate the useful compiler budget, but validate every ASCII digit. The
+ * forwarded spelling is preserved; only the effective owner limit keys code.
+ * K1 emits ordinary code and deliberately shares the ordinary cache. */
+static int owner_limit_for_budget(const char *text,unsigned *limit) {
+    unsigned value=0;
+    if(!*text)return 0;
+    for(const unsigned char *p=(const unsigned char *)text;*p;p++) {
+        if(*p<'0'||*p>'9')return 0;
+        if(value<9) { value=value*10+(*p-'0');if(value>9)value=9; }
+    }
+    if(!value)return 0;
+    *limit=value-1;return 1;
+}
 int main(int argc,char **argv) {
     checksum_self_test();
     if(argc==2&&!strcmp(argv[1],"--checksum-self-test"))return 0;
-    if(argc!=5&&argc!=6){fputs("usage: module-build COMPILER SOURCE LLVM CACHE_DIRECTORY [STATS]\n",stderr);return 2;}
+    int positional=argc;const char *budget=NULL;unsigned owner_limit=0;
+    if(argc>=7&&!strcmp(argv[argc-2],"--bounded-owners")) {
+        budget=argv[argc-1];positional-=2;
+        if(!owner_limit_for_budget(budget,&owner_limit)) {
+            fputs("module build: ownership budget must be a positive ASCII decimal integer\n",stderr);return 2;
+        }
+    }
+    if((positional!=5&&positional!=6)||(positional==6&&!strcmp(argv[5],"--bounded-owners"))) {
+        fputs("usage: module-build COMPILER SOURCE LLVM CACHE_DIRECTORY [STATS] [--bounded-owners BUDGET]\n",stderr);return 2;
+    }
     umask(077);
     char *compiler=realpath(argv[1],NULL);if(!compiler)stop("compiler path");
     Bytes compiler_bytes=read_path(compiler,16u*1024u*1024u);if(!compiler_bytes.data)stop("compiler identity");
     char *compiler_hex=hexadecimal(compiler_bytes);
+    if(owner_limit) {
+        size_t length=strlen(compiler_hex);char *identity=allocate(length+40);
+        snprintf(identity,length+40,"%s:stack-owners-v1:%u",compiler_hex,owner_limit);
+        free(compiler_hex);compiler_hex=identity;
+    }
     char *entry=absolute_source(argv[2]);ensure_directory(argv[4]);
-    char key[40];snprintf(key,sizeof key,"%016" PRIx64 ".cache",artifact_hash((const unsigned char *)entry,strlen(entry)));
+    char key[80];uint64_t entry_hash=artifact_hash((const unsigned char *)entry,strlen(entry));
+    if(owner_limit)snprintf(key,sizeof key,"%016" PRIx64 "-stack-owners-v1-%u.cache",entry_hash,owner_limit);
+    else snprintf(key,sizeof key,"%016" PRIx64 ".cache",entry_hash);
     char *cache=join(argv[4],key);
     size_t cache_length=strlen(cache);char *delta=allocate(cache_length+7);snprintf(delta,cache_length+7,"%s.delta",cache);
     char *work=join(argv[4],"invocation.XXXXXX");if(!mkdtemp(work))stop("invocation directory");
@@ -250,8 +281,8 @@ int main(int argc,char **argv) {
         if(fcntl(base_fd,F_SETFD,0)<0||(delta_fd>=0&&fcntl(delta_fd,F_SETFD,0)<0))stop("cache plan descriptors");
         input_fd=plan_fd;
     }
-    int result=compiler_run(snapshot,entry,output,input_fd,state,stats,error);
-    if(result&&cache_valid)result=compiler_run(snapshot,entry,output,empty_fd,state,stats,error);
+    int result=compiler_run(snapshot,entry,output,input_fd,state,stats,error,budget);
+    if(result&&cache_valid)result=compiler_run(snapshot,entry,output,empty_fd,state,stats,error,budget);
     if(!result) {
         Bytes diagnostic=read_path(stats,4096);struct stat state_stat;
         unsigned long long counters[6];char reused_table[6],extra;
@@ -263,7 +294,7 @@ int main(int argc,char **argv) {
             if(errno!=EXDEV)stop("compiler output publish");
             Bytes llvm=read_path(output,SIZE_MAX-1);if(!llvm.data)stop("compiler output");atomic_bytes(argv[3],llvm);free(llvm.data);
         }
-        if(argc==6)atomic_bytes(argv[5],diagnostic);
+        if(positional==6)atomic_bytes(argv[5],diagnostic);
         free(diagnostic.data);
         Bytes fresh=read_path(state,CACHE_LIMIT);
         if(fresh.data&&fresh.size) {

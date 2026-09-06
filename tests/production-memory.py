@@ -11,6 +11,29 @@ CYCLE_DIAGNOSTIC = 'this List mutation could create a reference cycle'
 
 
 class ProductionMemory(CompilerTestCase):
+    def test_fresh_return_calls_preserve_caller_temporaries(self):
+        # Uncached integers force owned Text allocations. Each left operand
+        # must survive fresh, nested and recursive calls for the right operand.
+        self.executes('''function fresh(n: Integer): Text { return Text(n) }
+function nested(n: Integer): Text { return fresh(n) }
+function recursive(n: Integer, depth: Integer): Text {
+if depth == 0 { return fresh(n) }
+return recursive(n + 1, depth - 1)
+}
+function pair(n: Integer): Text { return fresh(n) + nested(n + 1) }
+function compose(n: Integer): Text { return pair(n) + recursive(n + 2, 4) }
+print(fresh(40011) + fresh(40022))
+print(fresh(50011) + nested(50022))
+print(fresh(60011) + recursive(60022, 4))
+print(pair(70011) + compose(80011))
+let i = 0
+while i < 8 {
+print(fresh(90000 + i) + recursive(91000 + i, 3))
+i = i + 1
+}
+''', '4001140022\n5001150022\n6001160026\n7001170012800118001280017\n'
+             + ''.join(f'{90000 + i}{91003 + i}\n' for i in range(8)))
+
     def test_empty_literal_context_flows_through_nested_calls_and_add(self):
         self.executes('''record Node { children: List<Node> }
 function nodes(values: List<Node>): List<Node> { return values }

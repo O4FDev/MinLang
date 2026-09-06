@@ -78,7 +78,7 @@ if boxes.length > 0 { print(boxes[0].text) }
             with self.subTest(source=source):
                 result, _ = self.compile(source)
                 self.assertEqual(result.returncode, 1)
-                self.assertRegex(result.stderr, rf'(?:line |:){expected_line}:.*missing')
+                self.assertRegex(result.stderr, rf'(?:line |:){expected_line}, column [0-9]+:.*missing')
 
     def test_receiver_survives_mutation_in_index_and_slice_arguments(self):
         self.executes('''record Box { words: List<Text> }

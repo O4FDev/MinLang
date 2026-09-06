@@ -2,48 +2,92 @@
 set -eu
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-
 usage() {
-    echo "usage: ./minyar [--release] [--incremental] FILE.min [-o PROGRAM]" >&2
+    echo "usage: ./minyar [--release] [--incremental] [--memory-profile eager|fixed|lazy|system] [--cleanup-budget 1..1024] [--heap-bytes BYTES] FILE.min [-o PROGRAM]" >&2
     exit 2
+}
+positive_decimal() {
+    case "$1" in ''|*[!0123456789]*) return 1 ;; esac
+    normalized_decimal=$1
+    normalized_decimal=${normalized_decimal#"${normalized_decimal%%[!0]*}"}
+    [ -n "$normalized_decimal" ]
 }
 
 release=0
 incremental=0
+memory_profile=system
+profile_requested=0
+cleanup_budget=32
+budget_requested=0
+heap_bytes=
 while :; do
     case "${1-}" in
         --release) release=1; shift ;;
         --incremental) incremental=1; shift ;;
+        --memory-profile)
+            [ "$#" -ge 2 ] && [ "$profile_requested" -eq 0 ] || usage
+            case "$2" in eager|fixed|lazy|system) memory_profile=$2 ;; *) usage ;; esac
+            profile_requested=1; shift 2 ;;
+        --cleanup-budget)
+            [ "$#" -ge 2 ] && [ "$budget_requested" -eq 0 ] || usage
+            positive_decimal "$2" || usage
+            [ "${#normalized_decimal}" -le 4 ] && [ "$normalized_decimal" -le 1024 ] || usage
+            cleanup_budget=$normalized_decimal; budget_requested=1; shift 2 ;;
+        --heap-bytes)
+            [ "$#" -ge 2 ] && [ -z "$heap_bytes" ] || usage
+            positive_decimal "$2" || usage
+            # Supported 64-bit runtime: the largest power of two below
+            # SIZE_MAX/2 is 2^62. Range-check before shell arithmetic.
+            [ "${#normalized_decimal}" -le 19 ] || usage
+            [ "$normalized_decimal" -ge 4096 ] 2>/dev/null &&
+                [ "$normalized_decimal" -le 4611686018427387904 ] 2>/dev/null || usage
+            [ "$((normalized_decimal & (normalized_decimal - 1)))" -eq 0 ] || usage
+            heap_bytes=$normalized_decimal; shift 2 ;;
         *) break ;;
     esac
 done
-
-if [ "$#" -lt 1 ] || [ "$#" -gt 3 ]; then
-    usage
+if [ "$memory_profile" = eager ] && [ "$budget_requested" -ne 0 ]; then usage; fi
+if [ -n "$heap_bytes" ]; then
+    case "$memory_profile" in fixed|lazy) ;; *) usage ;; esac
 fi
+[ "$#" -ge 1 ] && [ "$#" -le 3 ] || usage
 case "$1" in --*) usage ;; esac
-
 source_file=$1
 shift
 output_file=$(basename -- "${source_file%.min}")
-
 if [ "$#" -gt 0 ]; then
-    if [ "$#" -ne 2 ] || [ "$1" != "-o" ]; then
-        usage
-    fi
+    [ "$#" -eq 2 ] && [ "$1" = -o ] || usage
     output_file=$2
 fi
 
-if [ "$release" -eq 1 ]; then
-    runtime_file=build/minyar-runtime-release.ll
-else
-    runtime_file=build/minyar-runtime.o
-fi
 if [ "$incremental" -eq 1 ]; then
-    make -s -C "$project_dir" build/minyarc-modules build/minyar-module-build "$runtime_file"
+    set -- build/minyarc-modules build/minyar-module-build
 else
-    make -s -C "$project_dir" build/minyarc "$runtime_file"
+    set -- build/minyarc
 fi
+configured_runtime=1
+if [ "$memory_profile" = eager ]; then
+    configured_runtime=0
+    if [ "$release" -eq 1 ]; then runtime_file=build/minyar-runtime-eager-release.ll
+    else runtime_file=build/minyar-runtime-eager.o; fi
+    set -- "$@" "$runtime_file"
+    runtime_file="$project_dir/$runtime_file"
+elif [ "$memory_profile" = system ] && [ "$cleanup_budget" -eq 32 ] &&
+     [ "${MINYAR_CLANG+x}" != x ] && [ "${MINYAR_RUNTIME_FLAGS+x}" != x ]; then
+    configured_runtime=0
+    if [ "$release" -eq 1 ]; then runtime_file=build/minyar-default-runtime-release.ll
+    else runtime_file=build/minyar-default-runtime.o; fi
+    set -- "$@" "$runtime_file"
+    runtime_file="$project_dir/$runtime_file"
+else
+    for header in minyar_runtime.c minyar_rc.h minyar_heap.h minyar_pool.h minyar_bounded_rc.h; do
+        [ -f "$project_dir/runtime/$header" ] || { echo "missing runtime source: $header" >&2; exit 1; }
+    done
+    if [ "$cleanup_budget" -gt 1 ]; then
+        [ -f "$project_dir/runtime/minyar_stack_frames.h" ] || { echo "missing stack ownership runtime" >&2; exit 1; }
+    fi
+fi
+make -s -C "$project_dir" "$@"
 mkdir -p "$project_dir/build/programs"
 llvm_dir=$(mktemp -d "$project_dir/build/programs/invocation.XXXXXXXX")
 trap 'rm -rf -- "$llvm_dir"' 0
@@ -51,19 +95,58 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 llvm_file="$llvm_dir/program.ll"
-
+set --
+if [ "$memory_profile" != eager ]; then set -- --bounded-owners "$cleanup_budget"; fi
 if [ "$incremental" -eq 1 ]; then
     "$project_dir/build/minyar-module-build" "$project_dir/build/minyarc-modules" \
-        "$source_file" "$llvm_file" "${MINYAR_MODULE_CACHE:-$project_dir/build/module-cache}"
+        "$source_file" "$llvm_file" "${MINYAR_MODULE_CACHE:-$project_dir/build/module-cache}" "$@"
 else
-    "$project_dir/build/minyarc" "$source_file" "$llvm_file"
+    "$project_dir/build/minyarc" "$source_file" "$llvm_file" "$@"
+fi
+
+if [ "$configured_runtime" -eq 1 ]; then
+    runtime_source="$llvm_dir/runtime.c"
+    # Configuration follows command-line preprocessing, so -D/-U options in
+    # custom runtime flags cannot change the selected memory policy silently.
+    cat > "$runtime_source" <<'CONFIG'
+#undef MINYAR_COMPILER_ARENA
+#undef MINYAR_SYSTEM_HEAP
+#undef MINYAR_BOUNDED_HEAP
+#undef MINYAR_LAZY_HEAP
+#undef MINYAR_BOUNDED_RC
+#undef MINYAR_RC_POLL_BUDGET
+#undef MINYAR_BOUNDED_HEAP_BYTES
+_Static_assert(sizeof(void *) == 8, "configured memory profiles require a 64-bit target");
+CONFIG
+    case "$memory_profile" in
+        fixed) printf '#define MINYAR_BOUNDED_HEAP 1\n' >> "$runtime_source" ;;
+        lazy) printf '#define MINYAR_BOUNDED_HEAP 1\n#define MINYAR_LAZY_HEAP 1\n' >> "$runtime_source" ;;
+        system) printf '#define MINYAR_SYSTEM_HEAP 1\n' >> "$runtime_source" ;;
+    esac
+    printf '#define MINYAR_RC_POLL_BUDGET %s\n' "$cleanup_budget" >> "$runtime_source"
+    if [ -n "$heap_bytes" ]; then
+        printf '#define MINYAR_BOUNDED_HEAP_BYTES %sULL\n' "$heap_bytes" >> "$runtime_source"
+    fi
+    printf '#include "minyar_runtime.c"\n' >> "$runtime_source"
+    if [ "$cleanup_budget" -gt 1 ]; then
+        printf '#include "minyar_stack_frames.h"\n' >> "$runtime_source"
+    fi
+    if [ "$release" -eq 1 ]; then
+        runtime_file="$llvm_dir/runtime.ll"
+        "${MINYAR_CLANG:-clang}" -iquote "$project_dir/runtime" \
+            ${MINYAR_RUNTIME_FLAGS:--O2 -Wno-override-module} -S -emit-llvm "$runtime_source" -o "$llvm_dir/runtime.raw.ll"
+        sed -E 's/"(target-cpu|target-features|tune-cpu)"="[^"]*" ?//g' "$llvm_dir/runtime.raw.ll" > "$runtime_file"
+    else
+        runtime_file="$llvm_dir/runtime.o"
+        "${MINYAR_CLANG:-clang}" -iquote "$project_dir/runtime" \
+            ${MINYAR_RUNTIME_FLAGS:--O2 -Wno-override-module} -c "$runtime_source" -o "$runtime_file"
+    fi
 fi
 if [ "$release" -eq 1 ]; then
     "${MINYAR_CLANG:-clang}" ${MINYAR_CLANG_FLAGS:--O2 -Wno-override-module} -flto \
-        "$llvm_file" "$project_dir/$runtime_file" -o "$output_file"
+        "$llvm_file" "$runtime_file" -o "$output_file"
 else
     "${MINYAR_CLANG:-clang}" ${MINYAR_CLANG_FLAGS:--O0 -Wno-override-module} \
-        "$llvm_file" "$project_dir/$runtime_file" -o "$output_file"
+        "$llvm_file" "$runtime_file" -o "$output_file"
 fi
-
 echo "built $output_file"

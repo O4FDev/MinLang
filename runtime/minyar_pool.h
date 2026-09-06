@@ -221,6 +221,71 @@ static void minyar_pool_deallocate(void *pointer) {
     pool_insert((PoolLink *)(minyar_pool + offset), order);
     POOL_END();
 }
+typedef struct {
+    unsigned order, wanted;
+    size_t capacity, target, offset;
+} PoolResizePlan;
+
+static PoolResizePlan pool_plan_resize(void *pointer, size_t size) {
+    PoolResizePlan plan;
+    plan.order = pool_allocated_order(pointer);
+    plan.wanted = 0;
+    plan.capacity = pool_block_size(plan.order);
+    plan.target = MINYAR_POOL_MINIMUM;
+    plan.offset = pool_offset(pointer);
+    if (size > MINYAR_POOL_BYTES)
+        minyar_stop("the bounded heap is exhausted (including pending cleanup and fragmentation).");
+    while (plan.target < size) {
+        plan.target <<= 1;
+        plan.wanted++;
+        POOL_STEP();
+    }
+    return plan;
+}
+
+/* Common non-relocating resize state machine. A failed upper-buddy scan
+ * changes no allocation, free list, payload, accounting, or poison state. */
+static void *pool_try_resize_same_base(void *pointer, size_t size, PoolResizePlan plan) {
+#ifndef MINYAR_POOL_ASAN
+    (void)size;
+#endif
+    if (plan.wanted <= plan.order) {
+        /* Split in place even when the heap has no other free block. */
+        POOL_POISON(pointer, plan.capacity);
+        minyar_pool_used -= plan.capacity - plan.target;
+        while (plan.order > plan.wanted) {
+            plan.order--;
+            pool_insert((PoolLink *)((unsigned char *)pointer + pool_block_size(plan.order)), plan.order);
+            POOL_STEP();
+        }
+        minyar_pool_map[plan.offset / MINYAR_POOL_MINIMUM] =
+            (unsigned char)(0x80 | (plan.wanted + 1));
+        POOL_UNPOISON(pointer, size ? size : 1);
+        return pointer;
+    }
+    /* A lower block may grow through free upper buddies. */
+    int can_grow = (plan.offset & (plan.target - 1)) == 0;
+    for (unsigned next = plan.order; can_grow && next < plan.wanted; next++) {
+        size_t buddy = plan.offset + pool_block_size(next);
+        can_grow = minyar_pool_map[buddy / MINYAR_POOL_MINIMUM] == next + 1;
+        POOL_STEP();
+    }
+    if (!can_grow) return NULL;
+    for (unsigned next = plan.order; next < plan.wanted; next++) {
+        pool_remove((PoolLink *)(minyar_pool + plan.offset + pool_block_size(next)), next);
+        POOL_STEP();
+    }
+    minyar_pool_map[plan.offset / MINYAR_POOL_MINIMUM] =
+        (unsigned char)(0x80 | (plan.wanted + 1));
+    minyar_pool_used += plan.target - plan.capacity;
+    if (minyar_pool_used > minyar_pool_high_water) minyar_pool_high_water = minyar_pool_used;
+#ifdef MINYAR_LAZY_HEAP
+    POOL_POISON((unsigned char *)pointer + plan.capacity, plan.target - plan.capacity);
+#endif
+    POOL_UNPOISON(pointer, size);
+    return pointer;
+}
+
 /* Buffer copying and zero initialization take time proportional to byte count. */
 static void *minyar_pool_resize(void *pointer, size_t old_size, size_t size) {
     if (!pointer) return minyar_pool_allocate(size);
@@ -229,47 +294,11 @@ static void *minyar_pool_resize(void *pointer, size_t old_size, size_t size) {
         minyar_stop("this lazy heap allocation exceeds the sanitizer block limit.");
 #endif
     POOL_BEGIN();
-    unsigned order = pool_allocated_order(pointer), wanted = 0;
-    size_t capacity = pool_block_size(order), target = MINYAR_POOL_MINIMUM;
-    if (size > MINYAR_POOL_BYTES) minyar_stop("the bounded heap is exhausted (including pending cleanup and fragmentation).");
-    while (target < size) { target <<= 1; wanted++; POOL_STEP(); }
-    size_t offset = pool_offset(pointer);
-    if (wanted <= order) {
-        /* Split in place even when the heap has no other free block. */
-        POOL_POISON(pointer, capacity);
-        minyar_pool_used -= capacity - target;
-        while (order > wanted) {
-            order--;
-            pool_insert((PoolLink *)((unsigned char *)pointer + pool_block_size(order)), order);
-            POOL_STEP();
-        }
-        minyar_pool_map[offset / MINYAR_POOL_MINIMUM] = (unsigned char)(0x80 | (wanted + 1));
-        POOL_UNPOISON(pointer, size ? size : 1);
+    PoolResizePlan plan = pool_plan_resize(pointer, size);
+    void *same = pool_try_resize_same_base(pointer, size, plan);
+    if (same) {
         POOL_END();
-        return pointer;
-    }
-    /* A lower block may grow through free upper buddies. Validate the whole
-     * path before modifying it; failure preserves the original allocation. */
-    int can_grow = (offset & (target - 1)) == 0;
-    for (unsigned next = order; can_grow && next < wanted; next++) {
-        size_t buddy = offset + pool_block_size(next);
-        can_grow = minyar_pool_map[buddy / MINYAR_POOL_MINIMUM] == next + 1;
-        POOL_STEP();
-    }
-    if (can_grow) {
-        for (unsigned next = order; next < wanted; next++) {
-            pool_remove((PoolLink *)(minyar_pool + offset + pool_block_size(next)), next);
-            POOL_STEP();
-        }
-        minyar_pool_map[offset / MINYAR_POOL_MINIMUM] = (unsigned char)(0x80 | (wanted + 1));
-        minyar_pool_used += target - capacity;
-        if (minyar_pool_used > minyar_pool_high_water) minyar_pool_high_water = minyar_pool_used;
-#ifdef MINYAR_LAZY_HEAP
-        POOL_POISON((unsigned char *)pointer + capacity, target - capacity);
-#endif
-        POOL_UNPOISON(pointer, size);
-        POOL_END();
-        return pointer;
+        return same;
     }
 #ifdef MINYAR_RC_TESTING
     size_t resize_steps = minyar_pool_last_steps;
@@ -280,6 +309,84 @@ static void *minyar_pool_resize(void *pointer, size_t old_size, size_t size) {
     resize_steps += minyar_pool_last_steps;
 #endif
     memcpy(result, pointer, old_size < size ? old_size : size);
+    minyar_pool_deallocate(pointer);
+#ifdef MINYAR_RC_TESTING
+    minyar_pool_last_steps += resize_steps;
+#endif
+    POOL_END();
+    return result;
+}
+
+/* Called only after resize validates an unaligned, growing allocation whose
+ * preserved prefix is empty. A failed full-path scan changes no allocation,
+ * free-list, payload or poison state; resize owns the work-counter scope. */
+static void *minyar_pool_try_grow_lower(size_t offset, unsigned order, unsigned wanted,
+                                      size_t capacity, size_t target, size_t size) {
+#ifndef MINYAR_POOL_ASAN
+    (void)size;
+#endif
+    size_t merged_offset = offset;
+    int can_grow = 1;
+    for (unsigned next = order; can_grow && next < wanted; next++) {
+        size_t buddy = merged_offset ^ pool_block_size(next);
+        can_grow = minyar_pool_map[buddy / MINYAR_POOL_MINIMUM] == next + 1;
+        if (buddy < merged_offset) merged_offset = buddy;
+        POOL_STEP();
+    }
+    if (!can_grow) return NULL;
+    size_t base = offset;
+    for (unsigned next = order; next < wanted; next++) {
+        size_t buddy = base ^ pool_block_size(next);
+        pool_remove((PoolLink *)(minyar_pool + buddy), next);
+        if (buddy < base) base = buddy;
+        POOL_STEP();
+    }
+    minyar_pool_map[offset / MINYAR_POOL_MINIMUM] = 0;
+    void *result = minyar_pool + base;
+    minyar_pool_map[base / MINYAR_POOL_MINIMUM] = (unsigned char)(0x80 | (wanted + 1));
+    minyar_pool_used += target - capacity;
+    if (minyar_pool_used > minyar_pool_high_water) minyar_pool_high_water = minyar_pool_used;
+    /* The old accessible tail can lie beyond the relocated requested prefix. */
+    POOL_POISON(result, target);
+    POOL_UNPOISON(result, size);
+    return result;
+}
+
+/* Dedicated resize for retired frame slot storage: no prior contents must
+ * survive and callers retain no interior aliases. Failure is fatal and keeps
+ * old storage owned until replacement succeeds. Lower merging adds no
+ * allocation or copying. */
+static void *minyar_pool_resize_discard(void *pointer, size_t size) {
+    if (!pointer) return minyar_pool_allocate(size);
+#if defined(MINYAR_LAZY_HEAP) && defined(MINYAR_POOL_ASAN)
+    if (size <= MINYAR_POOL_BYTES && size > MINYAR_LAZY_ASAN_MAX_BLOCK_BYTES)
+        minyar_stop("this lazy heap allocation exceeds the sanitizer block limit.");
+#endif
+    POOL_BEGIN();
+    PoolResizePlan plan = pool_plan_resize(pointer, size);
+    void *same = pool_try_resize_same_base(pointer, size, plan);
+    if (same) {
+        POOL_END();
+        return same;
+    }
+    /* All ordinary in-place paths have already returned. Empty frame slots
+     * may absorb lower buddies; validate the complete path before mutation. */
+    if (plan.offset & (plan.target - 1)) {
+        void *merged = minyar_pool_try_grow_lower(plan.offset, plan.order, plan.wanted,
+                                                  plan.capacity, plan.target, size);
+        if (merged) {
+            POOL_END();
+            return merged;
+        }
+    }
+#ifdef MINYAR_RC_TESTING
+    size_t resize_steps = minyar_pool_last_steps;
+#endif
+    POOL_END();
+    void *result = minyar_pool_allocate(size);
+#ifdef MINYAR_RC_TESTING
+    resize_steps += minyar_pool_last_steps;
+#endif
     minyar_pool_deallocate(pointer);
 #ifdef MINYAR_RC_TESTING
     minyar_pool_last_steps += resize_steps;

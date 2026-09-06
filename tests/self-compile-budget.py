@@ -29,14 +29,15 @@ REFERENCE = ROOT / "build" / "compiler-stage3.ll"
 RUNS = 100
 BATCHES = 3
 
-# Measured on an Apple M-series laptop in September 2026: wall 90th percentile
-# about 6.5 ms, CPU 90th percentile about 4.7 ms, peak resident memory 5.5 MiB
-# and about 30.4 million retired instructions, of which roughly 9.6 million
-# are the cost of starting and ending any process at all.
-MAX_WALL_P90_MS = 8.0
-MAX_CPU_P90_MS = 6.0
-MAX_PEAK_RSS_MIB = 6.0
-MAX_INSTRUCTIONS = 32_000_000
+# Recalibrated on an Apple M-series laptop after line-and-column diagnostics,
+# stack guards, ownership-transfer lowering and the expanded compiler/runtime
+# surface landed. A sparse Unicode index without its sequential cursor measured
+# 25--26 ms CPU; adding the cursor reduced repeated measurements to 14.6--14.9
+# ms. Retain useful shared-host headroom without allowing that regression back.
+MAX_WALL_P90_MS = 25.0
+MAX_CPU_P90_MS = 22.0
+MAX_PEAK_RSS_MIB = 10.0
+MAX_INSTRUCTIONS = 75_000_000
 
 
 def percentile(values: list[float], fraction: float) -> float:

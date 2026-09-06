@@ -1,7 +1,12 @@
 # Automatic ownership in the native runtime
 
 Native programs use non-atomic reference counting with compiler-inserted ownership
-operations. Releasing a value can take time proportional to the graph it destroys.
+operations. Launcher builds use system-backed incremental cleanup with a default
+budget of 32 work units per service batch. Total reclamation work grows with the
+graph, but the default runtime spreads graph traversal across service points.
+The explicit eager profile can perform the entire traversal during a release.
+See [the cleanup contract](bounded-runtime-contract.md) for the work accounting
+and operations outside that budget; it is not a wall-clock deadline.
 
 ## Recursive data and cycle prevention
 
@@ -46,6 +51,12 @@ of type `List<T>` to a value of type `T`. The existing return path in the heap
 would imply a type path from `T` back to `List<T>`, which the checker rejects.
 This argument includes transitive record fields, nested Lists and aliases.
 
+The non-mutating `list.appended(value)` operation copies into a fresh List and
+is permitted for recursive element types. Because the result does not exist
+while its inputs are evaluated, none of them can already point back to it; the
+first-cycle proof therefore still holds. This supports dynamic bottom-up tree
+construction, at linear cost per append, without weakening the mutation rule.
+
 Arbitrary cyclic graphs remain unsupported. Integer identifiers in a List of
 records remain an option; see [`examples/graph.min`](../examples/graph.min).
 Inferred lifetime regions and permissive mutation analysis are not implemented.
@@ -58,7 +69,7 @@ the type encoding must revisit this proof before being added.
   reference. Text literals and bounded runtime caches are explicitly immortal.
   List literals create ordinary managed objects.
 - An owned producer carries a compiler-only token identifying its temporary
-  registration. A local, return, record field, or List append can consume that
+  registration. A local, return, record field, List append, or List replacement can consume that
   token: registration and the matching retain/drop are omitted. Borrowed values
   never carry this token, and the optimization does not imply heap uniqueness.
 - `minyar_rc_keep` adopts other produced references into the current expression.
@@ -76,9 +87,13 @@ the type encoding must revisit this proof before being added.
   heap. Nested function calls have separate expression storage.
 - A reference return transfers its owned result, or retains a borrowed result
   for the caller.
-  `minyar_rc_leave` releases that function's expression and local owners.
+  `minyar_rc_leave` retires that function's expression and local owners; the
+  incremental profiles can complete their reclamation at later service points.
 - Functions using only scalars and borrowed parameters can omit ownership frames. Local stack slots are
-  allocated once at entry. Frame storage is pooled and reused.
+  allocated once at entry. Eligible leaf functions use compiler-provided storage
+  for up to `min(8, K−1)` owner slots when bounded ownership lowering is enabled.
+  Their stack storage never enters a deferred queue or cache. Other ownership
+  frames use pooled heap storage; K1 keeps that ordinary representation.
 
 ## Scalar record replacement
 
@@ -146,17 +161,56 @@ records use captured values.
 Records with reference fields have a byte per field identifying owned references.
 Scalar-only records omit that map. Cleanup releases only initialized reference
 fields, so integer bits are never mistaken for pointers. Container insertion
-retains a borrowed reference or takes an owned one; replacement retains the new
-element before releasing the old one.
+retains a borrowed reference or takes an owned one. Replacement either retains
+the borrowed new element or consumes a compiler-proven owned result, then
+releases the old element.
 
-When a count reaches zero, leaves are freed directly and containers with
-reference fields are processed with an iterative work queue. Wide lists of
-leaf values therefore need no queue entry per element.
-Releasing a deep graph does not recurse on the C stack. A large release can
-still take time proportional to the graph it destroys. The queue and ownership
-frame buffers retain their high-water capacity for reuse. The integer-to-Text
-cache has at most 32,768 entries; Text literals and ASCII Character texts live for
-the process lifetime.
+In incremental profiles, reference-bearing aggregates reaching zero count and
+detached heap ownership storage become queued work. Leaf values can be freed
+immediately without graph traversal. The runtime visits fields and retires tasks in budgeted
+batches, using the dead objects' own storage for queue links and cursors. It
+does not scan the live heap. Total reclamation work remains proportional to
+what is destroyed, and queued storage can remain resident between service
+points. Allocator calls and copying have separate costs outside that budget.
+
+The eager profile frees leaves directly and processes reference containers with
+an iterative queue, avoiding recursive C-stack destruction while still allowing
+a graph-sized release. Its queue/frame buffers can retain their high-water
+capacity. Incremental profiles bound cached ownership-frame bytes separately.
+The integer-to-Text cache has at most 32,768 entries; Text literals and ASCII
+Character texts live for the process lifetime.
+
+Text values are immutable. A full-range slice retains the same Text, and most
+partial slices use a view that retains the source's owning root. Nested slices
+are flattened to that root, keeping destruction depth constant. A slice below
+one eighth of a source larger than 4 KiB is copied instead, preventing a tiny
+token from retaining a large file or argument. Unicode indexes belong to each
+Text header and are built lazily. They store one byte-position breadcrumb per
+64 characters, using 32-bit entries below 4 GiB; an indexed operation decodes
+at most 63 characters from the nearest breadcrumb. Two words at the end of the
+lazy index remember the most recent character position and byte offset.
+Sequential indexing resumes from that cursor and decodes each character once;
+backward and random access falls back to the nearest breadcrumb. Keeping the
+cursor in the index allocation avoids increasing the header cost of ASCII Text.
+
+Binary Text joins normally borrow both operands. A fresh owned left result, or
+the left local in a direct `text = text + piece` replacement, supplies an
+ownership token to the consuming join:
+the runtime reuses a unique owning Text and grows its byte allocation
+geometrically, while shared values and slice views take the immutable copying
+fallback. Thus a direct `a + b + c + ...` expression performs linear aggregate
+copying without changing the value observed through aliases. `joinText` remains
+the preferred single-allocation operation for a dynamically accumulated List.
+For self-replacement, the compiler clears the local owner only after evaluating
+the right operand, so `text = text + text` remains valid. Shared locals still
+take the copying fallback, so aliases continue to observe the original
+immutable value.
+
+Ownership-using functions place a cleanup service point on every loop backedge,
+so a long scalar phase after releasing a graph cannot starve pending retirement.
+The compiler removes these calls from functions that never acquire managed
+owners. This guarantees progress per completed loop iteration, not a wall-clock
+deadline for code that reaches no further runtime or loop service point.
 
 Compiler-arena builds retain storage until process exit and compile away ownership
 hooks. Their short-slice cache can evict an entry without invalidating aliases
@@ -166,8 +220,11 @@ because the underlying arena storage remains alive.
 
 | Target | Coverage |
 | --- | --- |
+| `make check-ownership-policy` | Compiler budget selection, nonleaf fallback, module policy identity and edited delta replay |
+| `make check-stack-ownership` | Independent graph/debt accounting, stack lifetime, native/sanitizer and fallback profiles |
+| `make check-runtime-cache` | Standard runtime reuse, dependency invalidation and custom settings isolation |
 | `make check-ownership` | Native and sanitized reference lifetimes with exact cleanup accounting |
-| `make check-runtime-unit` | Object/byte counts, deep cleanup, alias mutation, and Unicode |
+| `make check-runtime-unit` | Object/byte counts, deep cleanup, alias mutation, Unicode, slice-view roots, retention guard, and geometric Text growth |
 | `make check-memory` | Discarded-text RSS and nested/returned aliases |
 | `make check-adversarial` | Evaluation order, transfers, and control flow |
 | `make check-ownership-mutation` | Detection of injected ownership leaks |

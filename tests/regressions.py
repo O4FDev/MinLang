@@ -18,6 +18,11 @@ CLANG = os.environ.get('MINYAR_TEST_CLANG', 'clang')
 RUNTIME = Path(os.environ.get('MINYAR_TEST_RUNTIME', ROOT / 'build/minyar-runtime.o')).resolve()
 
 LINK_FLAGS = shlex.split(os.environ.get("MINYAR_TEST_LINK_FLAGS", ""))
+# ASan/UBSan compiler processes run at background priority in the full gate.
+# Keep the ordinary hang detector tight, but allow instrumentation and shared
+# host scheduling the same ceiling already used for sanitized linking.
+COMPILE_TIMEOUT = 30 if LINK_FLAGS else 10
+RUN_TIMEOUT = 30 if LINK_FLAGS else 10
 
 class CompilerTestCase(unittest.TestCase):
     def setUp(self):
@@ -31,7 +36,7 @@ class CompilerTestCase(unittest.TestCase):
         path = self.directory / f'case{self.serial}.min'
         path.write_text(source, encoding='utf-8')
         llvm = path.with_suffix('.ll')
-        result = subprocess.run([str(COMPILER), str(path), str(llvm)], capture_output=True, text=True, timeout=10)
+        result = subprocess.run([str(COMPILER), str(path), str(llvm)], capture_output=True, text=True, timeout=COMPILE_TIMEOUT)
         if result.returncode == 0:
             prepare_llvm_for_link(llvm, LINK_FLAGS)
         return result, llvm
@@ -51,12 +56,21 @@ class CompilerTestCase(unittest.TestCase):
                 exe = llvm.with_suffix('.' + optimization[1:])
                 link = subprocess.run([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], capture_output=True, text=True, timeout=30)
                 self.assertEqual(link.returncode, 0, link.stderr)
-                run = subprocess.run([str(exe)], capture_output=True, timeout=10)
+                run = subprocess.run([str(exe)], capture_output=True, timeout=RUN_TIMEOUT)
                 self.assertEqual(run.returncode, status, run.stderr)
                 self.assertEqual(run.stdout, expected.encode('utf-8'))
         return llvm
 
 class Regressions(CompilerTestCase):
+    def test_utf8_byte_order_mark_is_accepted(self):
+        self.executes('\ufeffprint(42)\n', '42\n')
+
+    def test_non_ascii_identifier_has_actionable_diagnostic(self):
+        self.rejects(
+            'let café = 42\nprint(café)\n',
+            "line 1, column 8: names must use ASCII letters, digits, and '_'; found non-ASCII character 'é'",
+        )
+
     def test_field_and_method_selectors_keep_their_receiver_namespace(self):
         (self.directory / 'tree.min').write_text('''public record Node { text: Text }
 public function leaf(): Node { return Node { text: "alive" } }
@@ -71,6 +85,10 @@ let text = "abc"
 print(text.slice(0, 2))
 print(slice(1))
 ''', 'alive\nab\n2\n')
+
+    def test_methods_reject_the_wrong_receiver_kind(self):
+        self.rejects('let text = "value"\ntext.add(1)\n', "2, column 6: this value has no method named 'add'")
+        self.rejects('let values = [1]\nvalues.slice(0)\n', "2, column 8: this value has no method named 'slice'")
 
     def test_unicode_index_does_not_depend_on_length(self):
         self.executes('let text = "é🙂"\nprint(Text(text[0]))\nprint(text.length)\nprint(Text(text[0]))\n', 'é\n2\né\n')
@@ -99,9 +117,49 @@ print(slice(1))
             with self.subTest(encoded=encoded):
                 path = self.directory / 'invalid-utf8.txt'
                 path.write_bytes(encoded)
-                run = subprocess.run([str(exe), str(path)], capture_output=True, timeout=10)
+                run = subprocess.run([str(exe), str(path)], capture_output=True, timeout=RUN_TIMEOUT)
                 self.assertEqual(run.returncode, 1)
                 self.assertIn(b'invalid UTF-8', run.stderr)
+
+    def test_file_io_failures_stop_cleanly(self):
+        read_result, read_llvm = self.compile('print(readTextFile(argument(0)))\n')
+        self.assertEqual(read_result.returncode, 0, read_result.stderr)
+        read_exe = read_llvm.with_suffix('.read')
+        subprocess.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(read_llvm), str(RUNTIME), '-o', str(read_exe)], check=True, capture_output=True, timeout=30)
+        read_directory = subprocess.run([str(read_exe), str(self.directory)], capture_output=True, timeout=RUN_TIMEOUT)
+        self.assertEqual(read_directory.returncode, 1)
+        self.assertTrue(
+            b'could not be read' in read_directory.stderr or b'could not be opened' in read_directory.stderr,
+            read_directory.stderr,
+        )
+
+        write_result, write_llvm = self.compile('writeTextFile(argument(0), "contents")\n')
+        self.assertEqual(write_result.returncode, 0, write_result.stderr)
+        write_exe = write_llvm.with_suffix('.write')
+        subprocess.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(write_llvm), str(RUNTIME), '-o', str(write_exe)], check=True, capture_output=True, timeout=30)
+        write_directory = subprocess.run([str(write_exe), str(self.directory)], capture_output=True, timeout=RUN_TIMEOUT)
+        self.assertEqual(write_directory.returncode, 1)
+        self.assertIn(b'could not be created', write_directory.stderr)
+        missing_parent = self.directory / 'missing' / 'output.txt'
+        write_missing = subprocess.run([str(write_exe), str(missing_parent)], capture_output=True, timeout=RUN_TIMEOUT)
+        self.assertEqual(write_missing.returncode, 1)
+        self.assertIn(b'could not be created', write_missing.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'closing a child descriptor uses POSIX preexec_fn')
+    def test_closed_standard_output_is_reported(self):
+        result, llvm = self.compile('print("unwritten")\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        exe = llvm.with_suffix('.closed-output')
+        subprocess.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], check=True, capture_output=True, timeout=30)
+        executed = subprocess.run(
+            [str(exe)],
+            stdout=None,
+            stderr=subprocess.PIPE,
+            preexec_fn=lambda: os.close(1),
+            timeout=RUN_TIMEOUT,
+        )
+        self.assertEqual(executed.returncode, 1)
+        self.assertEqual(executed.stderr, b'Minyar stopped: standard output could not be written.\n')
 
     def test_integer_boundaries(self):
         self.executes('print(9223372036854775807)\nprint(-9223372036854775808)\nprint(0000042)\n', '9223372036854775807\n-9223372036854775808\n42\n')
@@ -140,7 +198,7 @@ print(slice(1))
         self.assertEqual(result.returncode, 0, result.stderr)
         exe = llvm.with_suffix('.exe')
         subprocess.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], check=True, capture_output=True, timeout=30)
-        run = subprocess.run([str(exe), 'é🙂', str(path)], capture_output=True, timeout=10)
+        run = subprocess.run([str(exe), 'é🙂', str(path)], capture_output=True, timeout=RUN_TIMEOUT)
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(run.stdout, 'é\n🙂\n'.encode('utf-8'))
 

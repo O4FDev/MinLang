@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-correctness:
+    name: Linux correctness and sanitizers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install LLVM test dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang lld make zsh
+      - name: Run isolated correctness matrix
+        run: python3 scripts/check-linux.py --source . --output-dir build/linux-evidence
+      - name: Upload failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-correctness-evidence
+          path: build/linux-evidence
+
+  macos-portable:
+    name: macOS portable suite
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run compiler, runtime, modules, fuzzing, and fixed point
+        run: make LIMITED= SANITIZER_LIMITED= check-portable
+
+  windows-portable:
+    name: Windows portable suite
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            zsh
+            python
+            mingw-w64-ucrt-x86_64-clang
+      - name: Run compiler, runtime, modules, fuzzing, and fixed point
+        shell: msys2 {0}
+        run: make LIMITED= SANITIZER_LIMITED= COMPILER_LTO_FLAGS= CC=clang LLVM_CC=clang check-portable
+      - name: Verify native Windows 64-bit sparse-file sizing
+        shell: pwsh
+        run: |
+          $env:MINYAR_TEST_CLANG = 'C:\msys64\ucrt64\bin\clang.exe'
+          python tests/windows-large-file.py
+
+  coverage-guided-fuzzing:
+    name: AFL++ coverage-guided smoke campaign
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install AFL++ and LLVM
+        run: sudo apt-get update && sudo apt-get install -y afl++ clang lld make zsh
+      - name: Run coverage-guided compiler fuzzing
+        env:
+          MINYAR_AFL_SECONDS: '60'
+        run: make LIMITED= SANITIZER_LIMITED= COMPILER_LTO_FLAGS='-flto -fuse-ld=lld' check-fuzz-coverage
+      - name: Upload fuzzing findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: afl-findings
+          path: build/afl-findings
+
+  coverage:
+    name: Compiler and runtime coverage gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install LLVM coverage tools
+        run: sudo apt-get update && sudo apt-get install -y clang llvm make zsh
+      - name: Measure and enforce coverage
+        run: make LIMITED= SANITIZER_LIMITED= COMPILER_LTO_FLAGS='-flto -fuse-ld=lld' check-coverage
+      - name: Upload coverage evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-evidence
+          path: build/coverage

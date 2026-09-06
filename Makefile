@@ -6,14 +6,19 @@ LLVM_FLAGS ?= -O2 -Wno-override-module
 SANITIZER_FLAGS ?= -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wno-override-module
 COMPILER_RUNTIME_FLAGS ?= -DMINYAR_COMPILER_ARENA
 COMPILER_LTO_FLAGS ?= -flto
+PROGRAM_RUNTIME_FLAGS ?= -DMINYAR_SYSTEM_HEAP=1
 BOUNDED_FLAGS ?= -DMINYAR_BOUNDED_HEAP=1
 RUNTIME_HEADERS = runtime/minyar_heap.h runtime/minyar_rc.h runtime/minyar_pool.h runtime/minyar_bounded_rc.h
 LIMITED ?= zsh scripts/with-limits.sh
 SANITIZER_LIMITED ?= zsh scripts/with-sanitizer-limits.sh
+MIN_COMPILER_EDGE_COVERAGE ?= 79
+MIN_RUNTIME_LINE_COVERAGE ?= 72
+MIN_RUNTIME_BRANCH_COVERAGE ?= 55
+MIN_MUTATION_SCORE ?= 85
 
 .NOTPARALLEL:
 
-.PHONY: all check check-smoke check-regressions check-memory check-runtime-unit check-ownership check-adversarial check-ownership-mutation check-ownership-stress check-budget check-fuzz check-modules check-mutation check-performance check-scaling check-sanitize check-stress doctor emit run clean
+.PHONY: all check check-portable check-smoke check-regressions check-diagnostics check-conformance check-coverage check-memory check-runtime-unit check-ownership check-adversarial check-ownership-mutation check-ownership-stress check-budget check-fuzz check-fuzz-coverage check-stack-overflow check-windows-large-file check-modules check-mutation check-mutation-score check-performance check-scaling check-sanitize check-stress doctor emit run clean
 
 all: build/minyarc
 
@@ -23,13 +28,45 @@ build:
 build/stage0: bootstrap/stage0.c vendor/stb_ds.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@
 
-build/minyar-runtime.o: runtime/minyar_runtime.c $(RUNTIME_HEADERS) | build
-	$(LIMITED) $(LLVM_CC) $(LLVM_FLAGS) -c $< -o $@
+build/minyar-runtime.o: runtime/minyar_runtime.c $(RUNTIME_HEADERS) Makefile | build
+	$(LIMITED) $(LLVM_CC) $(LLVM_FLAGS) $(PROGRAM_RUNTIME_FLAGS) -c $< -o $@
+
+# Reuse the public launcher's standard configuration, including stack owners.
+# Publish complete artifacts atomically when concurrent launchers build them.
+build/minyar-default-runtime.o: runtime/minyar_default_runtime.c runtime/minyar_runtime.c runtime/minyar_stack_frames.h $(RUNTIME_HEADERS) Makefile | build
+	@set -eu; temporary=$$(mktemp "$@.XXXXXXXX"); \
+	trap 'rm -f "$$temporary"' 0; \
+	trap 'exit 1' HUP INT TERM; \
+	$(LIMITED) $(LLVM_CC) $(LLVM_FLAGS) -c $< -o "$$temporary"; \
+	mv -f "$$temporary" "$@"
+
+build/minyar-default-runtime-release.ll: runtime/minyar_default_runtime.c runtime/minyar_runtime.c runtime/minyar_stack_frames.h $(RUNTIME_HEADERS) Makefile | build
+	@set -eu; temporary=$$(mktemp -d "$@.XXXXXXXX"); \
+	trap 'rm -rf "$$temporary"' 0; \
+	trap 'exit 1' HUP INT TERM; \
+	$(LIMITED) $(LLVM_CC) $(LLVM_FLAGS) -S -emit-llvm $< -o "$$temporary/raw.ll"; \
+	sed -E 's/"(target-cpu|target-features|tune-cpu)"="[^"]*" ?//g' "$$temporary/raw.ll" > "$$temporary/runtime.ll"; \
+	mv -f "$$temporary/runtime.ll" "$@"
+
+.PHONY: check-runtime-cache
+check-runtime-cache: build/minyarc
+	$(LIMITED) python3 tests/runtime-cache.py
+
+check: check-runtime-cache
+
+.PHONY: check-ownership-policy check-stack-ownership
+check-ownership-policy: build/minyarc build/minyarc-modules build/minyar-module-build
+	$(LIMITED) python3 tests/ownership-policy.py
+
+check-stack-ownership:
+	$(SANITIZER_LIMITED) python3 tests/stack-ownership.py --clang "$(LLVM_CC)"
+
+check: check-ownership-policy check-stack-ownership
 
 # Ordinary program runtime, including automatic reclamation. Generic target
 # attributes allow its checked hot paths to inline into Minyar's generated IR.
-build/minyar-runtime-release.ll: runtime/minyar_runtime.c $(RUNTIME_HEADERS) | build
-	$(LIMITED) $(LLVM_CC) $(LLVM_FLAGS) -S -emit-llvm $< -o $@.tmp
+build/minyar-runtime-release.ll: runtime/minyar_runtime.c $(RUNTIME_HEADERS) Makefile | build
+	$(LIMITED) $(LLVM_CC) $(LLVM_FLAGS) $(PROGRAM_RUNTIME_FLAGS) -S -emit-llvm $< -o $@.tmp
 	sed -E 's/"(target-cpu|target-features|tune-cpu)"="[^"]*" ?//g' $@.tmp > $@
 	rm -f $@.tmp
 
@@ -164,6 +201,15 @@ doctor:
 check-smoke: build/minyarc build/minyar-runtime.o
 	$(LIMITED) sh tests/smoke.sh
 
+.PHONY: check-memory-contracts check-memory-contracts-harness
+check-memory-contracts: build/minyarc
+	$(LIMITED) python3 tests/memory-contracts.py
+
+check-memory-contracts-harness: build/minyarc
+	$(LIMITED) python3 tests/memory-contracts-harness.py
+
+check: check-memory-contracts-harness
+
 .PHONY: check-release-build check-critical-path check-launcher-isolation
 check: check-launcher-isolation
 
@@ -179,6 +225,16 @@ check-critical-path: build/minyarc
 check-regressions: build/minyarc build/minyar-runtime.o
 	$(LIMITED) python3 tests/regressions.py
 
+check-diagnostics: build/minyarc
+	$(LIMITED) python3 tests/diagnostics.py
+
+check: check-diagnostics
+
+check-conformance: build/minyarc build/minyar-runtime.o
+	$(LIMITED) python3 tests/conformance.py
+
+check: check-conformance
+
 check-memory: build/minyarc build/minyar-runtime.o
 	$(LIMITED) python3 tests/memory.py
 
@@ -188,8 +244,8 @@ build/runtime-unit: tests/runtime-unit.c runtime/minyar_runtime.c $(RUNTIME_HEAD
 check-runtime-unit: build/runtime-unit
 	$(LIMITED) ./build/runtime-unit
 
-build/minyar-runtime-sanitize.o: runtime/minyar_runtime.c $(RUNTIME_HEADERS) | build
-	$(SANITIZER_LIMITED) $(LLVM_CC) $(SANITIZER_FLAGS) -c $< -o $@
+build/minyar-runtime-sanitize.o: runtime/minyar_runtime.c $(RUNTIME_HEADERS) Makefile | build
+	$(SANITIZER_LIMITED) $(LLVM_CC) $(SANITIZER_FLAGS) $(PROGRAM_RUNTIME_FLAGS) -c $< -o $@
 
 build/runtime-unit-sanitize: tests/runtime-unit.c runtime/minyar_runtime.c $(RUNTIME_HEADERS) | build
 	$(SANITIZER_LIMITED) $(LLVM_CC) $(SANITIZER_FLAGS) $< -o $@
@@ -206,8 +262,33 @@ check: check-module-performance
 check-fuzz: build/minyarc build/minyar-runtime.o
 	$(LIMITED) python3 tests/fuzz.py
 
+# Explicit because AFL++ is an optional developer/CI dependency and campaigns
+# are duration-based. MINYAR_AFL_SECONDS controls the bounded run length.
+check-fuzz-coverage: build/minyarc
+	sh scripts/fuzz-afl.sh
+
+check-coverage: build/minyarc build/minyar-runtime.o
+	MINYAR_MIN_COMPILER_EDGE_COVERAGE=$(MIN_COMPILER_EDGE_COVERAGE) \
+	MINYAR_MIN_RUNTIME_LINE_COVERAGE=$(MIN_RUNTIME_LINE_COVERAGE) \
+	MINYAR_MIN_RUNTIME_BRANCH_COVERAGE=$(MIN_RUNTIME_BRANCH_COVERAGE) \
+	python3 scripts/coverage.py
+
+check-stack-overflow: build/minyarc build/minyar-runtime.o
+	$(LIMITED) python3 tests/stack-overflow.py
+
+# Cross-platform per-commit gate. Heavier memory-profile and performance
+# matrices remain in the Linux evidence runner and the full `make check` gate.
+check-windows-large-file:
+	python3 tests/windows-large-file.py
+
+check-portable: check-smoke check-regressions check-diagnostics check-conformance check-runtime-unit check-modules check-fuzz check-stack-overflow check-windows-large-file build/compiler-stage3.ll
+	cmp build/compiler-stage2.ll build/compiler-stage3.ll
+
 check-mutation: build/stage0 build/minyarc build/minyar-runtime.o
 	$(LIMITED) python3 tests/mutation.py
+
+check-mutation-score: build/stage0 build/minyarc build/minyar-compiler-runtime.ll build/minyar-runtime.o
+	MINYAR_MIN_MUTATION_SCORE=$(MIN_MUTATION_SCORE) $(LIMITED) python3 tests/mutation-score.py
 
 check-performance: build/minyarc build/minyar-runtime.o build/compiler-stage3.ll
 	$(LIMITED) python3 tests/performance.py
@@ -271,7 +352,7 @@ emit: build/hello.ll
 run: build/hello
 	./build/hello
 
-check: doctor check-smoke check-release-build check-recursive-data check-compact-ownership check-adversarial check-ownership-mutation check-regressions check-memory check-runtime-unit check-modules check-fuzz check-mutation check-performance check-scaling check-budget check-sanitize check-ownership build/compiler-stage3.ll build/hello build/language-tour build/records build/compiler-bootstrap build/hello-self-hosted build/integer-overflow build/divide-by-zero build/text-and-files build/lists build/newlines build/top-level build/top-level-exit build/list-out-of-bounds build/text-indexing build/text-slice-out-of-bounds
+check: doctor check-smoke check-release-build check-recursive-data check-compact-ownership check-adversarial check-ownership-mutation check-regressions check-memory check-runtime-unit check-modules check-fuzz check-stack-overflow check-mutation check-performance check-scaling check-budget check-sanitize check-ownership build/compiler-stage3.ll build/hello build/language-tour build/records build/compiler-bootstrap build/hello-self-hosted build/integer-overflow build/divide-by-zero build/text-and-files build/lists build/newlines build/top-level build/top-level-exit build/list-out-of-bounds build/text-indexing build/text-slice-out-of-bounds
 	cmp build/compiler-stage2.ll build/compiler-stage3.ll
 	test "$$(./build/hello)" = "hello from LLVM-backed Minyar"
 	test "$$(./build/language-tour | tr '\n' ' ')" = "The answer is 42 3 2 1 "
@@ -315,9 +396,9 @@ check: doctor check-smoke check-release-build check-recursive-data check-compact
 	! ./build/minyarc tests/errors/top-level-statement.min build/invalid.ll 2> build/top-level-return-error.txt
 	grep -q "use exit(status) to finish a top-level program" build/top-level-return-error.txt
 	! ./build/minyarc tests/errors/malformed-expression.min build/invalid.ll 2> build/expression-error.txt
-	grep -q "line 2: expected an expression, found ')'" build/expression-error.txt
+	grep -q "line 2, column 16: expected an expression, found ')'" build/expression-error.txt
 	! ./build/minyarc tests/errors/top-level-malformed-expression.min build/invalid.ll 2> build/top-level-expression-error.txt
-	grep -q "line 1: expected an expression, found ')'" build/top-level-expression-error.txt
+	grep -q "line 1, column 12: expected an expression, found ')'" build/top-level-expression-error.txt
 	! ./build/minyarc tests/errors/duplicate-function.min build/invalid.ll 2> build/duplicate-function-error.txt
 	grep -q "module declares 'duplicate' more than once" build/duplicate-function-error.txt
 	! ./build/minyarc tests/errors/duplicate-record.min build/invalid.ll 2> build/duplicate-record-error.txt
@@ -509,3 +590,12 @@ check-incremental-modules-sanitize: build/minyarc-modules-sanitize build/minyar-
 .PHONY: check-incremental-module-mutation
 check-incremental-module-mutation: build/minyarc-modules build/module-compiler.min
 	$(LIMITED) python3 tests/incremental-module-mutation.py
+
+# Explicit eager opt-out for users who accept graph-sized release work.
+build/minyar-runtime-eager.o: runtime/minyar_runtime.c $(RUNTIME_HEADERS) Makefile | build
+	$(LIMITED) $(LLVM_CC) $(LLVM_FLAGS) -c $< -o $@
+
+build/minyar-runtime-eager-release.ll: runtime/minyar_runtime.c $(RUNTIME_HEADERS) Makefile | build
+	$(LIMITED) $(LLVM_CC) $(LLVM_FLAGS) -S -emit-llvm $< -o $@.tmp
+	sed -E 's/"(target-cpu|target-features|tune-cpu)"="[^"]*" ?//g' $@.tmp > $@
+	rm -f $@.tmp

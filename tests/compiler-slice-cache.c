@@ -40,7 +40,7 @@ int main(void) {
     assert(joined->byte_length == 8 && !memcmp(joined->bytes, "catapult", 8));
     assert(slice->byte_length == 3 && !memcmp(slice->bytes, "cat", 3));
     /* Force an in-place join while a cached slice still denotes its prefix. */
-    MinyarText suffix = {(const unsigned char *)"matic", 5, 5, NULL};
+    MinyarText suffix = {(const unsigned char *)"matic", 5, 5, NULL, NULL};
     MinyarText *dog = copy_c_text("dog");
     MinyarText *prefix = minyar_text_slice(dog, 0, 3);
     MinyarText *extended = minyar_join_text(prefix, &suffix);

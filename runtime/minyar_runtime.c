@@ -1,3 +1,13 @@
+#if !defined(_WIN32) && !defined(_FILE_OFFSET_BITS)
+#define _FILE_OFFSET_BITS 64
+#endif
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
+#endif
+#if defined(_WIN32) && !defined(_WIN32_WINNT)
+/* GetCurrentThreadStackLimits is available from Windows 8 onward. */
+#define _WIN32_WINNT 0x0602
+#endif
 #if defined(MINYAR_LAZY_HEAP) && !defined(MINYAR_COMPILER_ARENA) && defined(__linux__) && !defined(_DEFAULT_SOURCE)
 #define _DEFAULT_SOURCE 1
 #endif
@@ -10,6 +20,12 @@
 #include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <signal.h>
+#ifdef _WIN32
+#include <windows.h>
+#elif defined(__linux__) || defined(__APPLE__)
+#include <pthread.h>
+#endif
 
 /*
  * Every operation the generated code calls is split into a small hot path
@@ -27,11 +43,14 @@
 #define MINYAR_HOT static inline
 #endif
 
-typedef struct {
+typedef struct MinyarText {
     const unsigned char *bytes;
     long long byte_length;
     long long character_length;
-    long long *character_offsets;
+    void *character_offsets;
+    /* Non-null only for a slice view. Views retain one flattened owning Text,
+     * never another view, so destruction has constant reference depth. */
+    struct MinyarText *backing;
 } MinyarText;
 
 typedef struct {
@@ -53,6 +72,86 @@ typedef struct {
 
 static int saved_argument_count;
 static char **saved_argument_values;
+static MINYAR_COLD MINYAR_NORETURN void minyar_stop(const char *message);
+
+/*
+ * Keep language recursion from reaching the guard page. Generated frame sizes
+ * vary after optimisation, so supported targets use the actual thread-stack
+ * bounds and retain enough space to report the failure. The high logical cap
+ * protects the counter; the conservative fallback applies only when stack
+ * bounds are unavailable. Compiler-generated calls are paired on normal
+ * returns; fail() and exit() terminate the process directly.
+ */
+#ifndef MINYAR_MAX_CALL_DEPTH
+#define MINYAR_MAX_CALL_DEPTH 1048576u
+#endif
+#ifndef MINYAR_FALLBACK_CALL_DEPTH
+#define MINYAR_FALLBACK_CALL_DEPTH 32768u
+#endif
+#ifndef MINYAR_STACK_RESERVE_BYTES
+#define MINYAR_STACK_RESERVE_BYTES (128u * 1024u)
+#endif
+static size_t minyar_call_depth;
+static uintptr_t minyar_stack_low, minyar_stack_high;
+static int minyar_stack_bounds_ready;
+
+static void minyar_find_stack_bounds(void) {
+    if (minyar_stack_bounds_ready) return;
+    minyar_stack_bounds_ready = 1;
+#ifdef _WIN32
+    {
+        ULONG_PTR low = 0, high = 0;
+        GetCurrentThreadStackLimits(&low, &high);
+        minyar_stack_low = (uintptr_t)low;
+        minyar_stack_high = (uintptr_t)high;
+    }
+#elif defined(__APPLE__)
+    {
+        void *high = pthread_get_stackaddr_np(pthread_self());
+        size_t size = pthread_get_stacksize_np(pthread_self());
+        minyar_stack_high = (uintptr_t)high;
+        if (size <= minyar_stack_high)
+            minyar_stack_low = minyar_stack_high - size;
+    }
+#elif defined(__linux__)
+    {
+        pthread_attr_t attributes;
+        void *low = NULL;
+        size_t size = 0;
+        if (pthread_getattr_np(pthread_self(), &attributes) == 0) {
+            if (pthread_attr_getstack(&attributes, &low, &size) == 0) {
+                minyar_stack_low = (uintptr_t)low;
+                if (size <= UINTPTR_MAX - minyar_stack_low)
+                    minyar_stack_high = minyar_stack_low + size;
+            }
+            pthread_attr_destroy(&attributes);
+        }
+    }
+#endif
+}
+
+void minyar_stack_enter(void) {
+    unsigned char stack_marker;
+    uintptr_t current = (uintptr_t)&stack_marker;
+    minyar_find_stack_bounds();
+    if (minyar_call_depth >= MINYAR_MAX_CALL_DEPTH ||
+        ((!minyar_stack_low || !minyar_stack_high) &&
+         minyar_call_depth >= MINYAR_FALLBACK_CALL_DEPTH) ||
+        (current >= minyar_stack_low && current < minyar_stack_high &&
+         current - minyar_stack_low <= MINYAR_STACK_RESERVE_BYTES))
+        minyar_stop("the program exceeded the maximum call depth.");
+    minyar_call_depth++;
+}
+
+void minyar_stack_leave(void) {
+    if (minyar_call_depth == 0)
+        minyar_stop("the runtime detected an unbalanced function return.");
+    minyar_call_depth--;
+}
+
+static MINYAR_COLD MINYAR_NORETURN void output_error(void) {
+    minyar_stop("standard output could not be written.");
+}
 
 #ifdef MINYAR_COMPILER_ARENA
 /* Keep interleaved token/output buffers from copying at the same boundaries. */
@@ -180,6 +279,7 @@ MINYAR_HOT MinyarText *new_text(const unsigned char *bytes, long long byte_lengt
     text->byte_length = byte_length;
     text->character_length = character_length;
     text->character_offsets = NULL;
+    text->backing = NULL;
     return text;
 }
 
@@ -352,7 +452,8 @@ long long minyar_list_get(const MinyarList *list, long long position) {
     return list->values[position];
 }
 
-void minyar_list_set(MinyarList *list, long long position, long long value) {
+static void minyar_list_set_owned(MinyarList *list, long long position, long long value,
+                                  int retain_value) {
     if ((unsigned long long)position >= (unsigned long long)list->length)
         list_position_stop(position, list->length);
 #ifndef MINYAR_COMPILER_ARENA
@@ -362,14 +463,44 @@ void minyar_list_set(MinyarList *list, long long position, long long value) {
 #else
     if ((((RcObject *)list - 1)->ownership & 7) == RC_REFERENCES) {
 #endif
-        minyar_rc_retain((void *)(uintptr_t)value);
+        if (retain_value) minyar_rc_retain((void *)(uintptr_t)value);
         long long previous = list->values[position];
         list->values[position] = value;
         minyar_rc_release((void *)(uintptr_t)previous);
         return;
     }
+#else
+    (void)retain_value;
 #endif
     list->values[position] = value;
+}
+
+void minyar_list_set(MinyarList *list, long long position, long long value) {
+    minyar_list_set_owned(list, position, value, 1);
+}
+
+/* The compiler transfers an existing owned reference into this slot. */
+void minyar_list_set_take(MinyarList *list, long long position, long long value) {
+    minyar_list_set_owned(list, position, value, 0);
+}
+
+/* Return a fresh List containing the old elements followed by value. Because
+ * the result did not exist while its inputs were evaluated, this operation
+ * cannot introduce the first ownership cycle. The compiler supplies the
+ * element ownership kind and may transfer the final value's existing owner. */
+MinyarList *minyar_list_appended(const MinyarList *list, long long value,
+                                 long long references, long long take_value) {
+    MinyarList *result = minyar_list_new();
+    if (references) minyar_list_references(result);
+    if (list->length == LLONG_MAX) minyar_stop("this List became too large.");
+    while (result->capacity < list->length + 1) list_grow(result);
+    for (long long position = 0; position < list->length; position++)
+        minyar_list_add(result, list->values[position]);
+    if (take_value)
+        minyar_list_add_take(result, value);
+    else
+        minyar_list_add(result, value);
+    return result;
 }
 
 #ifdef MINYAR_BOUNDED_RC
@@ -475,9 +606,10 @@ static char *text_as_path(const MinyarText *text) {
 }
 
 void minyar_print_text(const MinyarText *text) {
-    fwrite(text->bytes, 1, (size_t)text->byte_length, stdout);
-    putchar('\n');
-    fflush(stdout);
+    if (fwrite(text->bytes, 1, (size_t)text->byte_length, stdout) !=
+            (size_t)text->byte_length ||
+        putchar('\n') == EOF || fflush(stdout) == EOF)
+        output_error();
 }
 
 void minyar_fail(const MinyarText *message) {
@@ -488,7 +620,8 @@ void minyar_fail(const MinyarText *message) {
 }
 
 void minyar_print_integer(long long integer) {
-    printf("%lld\n", integer);
+    if (printf("%lld\n", integer) < 0 || fflush(stdout) == EOF)
+        output_error();
 }
 
 static long long encode_character(int character, unsigned char *bytes);
@@ -496,13 +629,14 @@ static long long encode_character(int character, unsigned char *bytes);
 void minyar_print_character(int character) {
     unsigned char bytes[4];
     long long length = encode_character(character, bytes);
-    fwrite(bytes, 1, (size_t)length, stdout);
-    putchar('\n');
-    fflush(stdout);
+    if (fwrite(bytes, 1, (size_t)length, stdout) != (size_t)length ||
+        putchar('\n') == EOF || fflush(stdout) == EOF)
+        output_error();
 }
 
 void minyar_print_boolean(_Bool boolean) {
-    puts(boolean ? "true" : "false");
+    if (puts(boolean ? "true" : "false") == EOF || fflush(stdout) == EOF)
+        output_error();
 }
 
 /* Names and operators are short; comparing them with overlapping fixed-width
@@ -574,6 +708,49 @@ MinyarText *minyar_join_text(const MinyarText *left, const MinyarText *right) {
     return join_by_copying(left, right);
 }
 
+/* Consume a compiler-proven owned left result. Ordinary borrowed operands use
+ * minyar_join_text and remain immutable. A unique owning Text can reuse its
+ * byte allocation, turning chains such as a + b + c into amortized linear
+ * growth. The fallback still consumes exactly one left ownership count. */
+MinyarText *minyar_join_text_take_left(MinyarText *left, const MinyarText *right) {
+    if (left->byte_length > LLONG_MAX - right->byte_length)
+        join_too_large();
+#ifdef MINYAR_COMPILER_ARENA
+    return minyar_join_text(left, right);
+#else
+    RcObject *object = (RcObject *)left - 1;
+    long long left_length = left->byte_length;
+    long long right_length = right->byte_length;
+    long long length = left_length + right_length;
+    if (object->ownership == (8 | RC_TEXT) && !left->backing) {
+        RcData *data = (RcData *)left->bytes - 1;
+        size_t required = (size_t)length + 1;
+        size_t capacity = data->size;
+        unsigned char *bytes = (unsigned char *)left->bytes;
+        if (required > capacity) {
+            size_t grown = capacity > SIZE_MAX / 2 ? SIZE_MAX : capacity * 2;
+            if (grown < required) grown = required;
+            bytes = rc_reallocate_data(bytes, grown);
+        }
+        const unsigned char *right_bytes = right == left ? bytes : right->bytes;
+        copy_bytes(bytes + left_length, right_bytes, (size_t)right_length);
+        bytes[length] = 0;
+        rc_free_data(left->character_offsets);
+        left->bytes = bytes;
+        left->byte_length = length;
+        if (left->character_length >= 0 && right->character_length >= 0)
+            left->character_length += right->character_length;
+        else
+            left->character_length = -1;
+        left->character_offsets = NULL;
+        return left;
+    }
+    MinyarText *result = join_by_copying(left, right);
+    minyar_rc_release(left);
+    return result;
+#endif
+}
+
 MinyarText *minyar_join_texts(const MinyarList *parts) {
     long long index;
     long long length = 0;
@@ -640,10 +817,34 @@ static unsigned int decode_character(const unsigned char *bytes, long long remai
     return 0;
 }
 
+enum { TEXT_INDEX_STRIDE = 64 };
+
+#ifdef MINYAR_RC_TESTING
+static size_t text_decode_count;
+#endif
+
+static long long text_index_load(const MinyarText *text, long long entry) {
+    if (text->byte_length <= UINT32_MAX)
+        return ((const uint32_t *)text->character_offsets)[entry];
+    return ((const long long *)text->character_offsets)[entry];
+}
+
+static void text_index_store(MinyarText *text, long long entry, long long value) {
+    if (text->byte_length <= UINT32_MAX)
+        ((uint32_t *)text->character_offsets)[entry] = (uint32_t)value;
+    else
+        ((long long *)text->character_offsets)[entry] = value;
+}
+
+static long long text_index_breadcrumbs(const MinyarText *text) {
+    return text->character_length / TEXT_INDEX_STRIDE + 1;
+}
+
 static MINYAR_COLD void build_text_index(MinyarText *text) {
     long long byte = 0;
     long long characters = 0;
-    long long *offsets;
+    void *offsets;
+    size_t offset_size;
     while (text->byte_length - byte >= (long long)sizeof(size_t)) {
         const size_t high_bits = (SIZE_MAX / 255) * 128;
         size_t word;
@@ -667,20 +868,43 @@ static MINYAR_COLD void build_text_index(MinyarText *text) {
         text->character_length = characters;
         return;
     }
-    if ((unsigned long long)characters >= SIZE_MAX / sizeof(*offsets))
+    /* Store one breadcrumb per 64 characters. Indexing scans at most 63 UTF-8
+       characters from that byte position, reducing ordinary index storage
+       from four bytes per character to roughly one sixteenth of a byte. */
+    offset_size = text->byte_length <= UINT32_MAX ? sizeof(uint32_t) : sizeof(long long);
+    if ((unsigned long long)(characters / TEXT_INDEX_STRIDE + 1) >
+        SIZE_MAX / offset_size - 2)
         minyar_stop("this Text is too large to index.");
-    offsets = data_allocate((size_t)(characters + 1) * sizeof(*offsets), sizeof(*offsets));
+    offsets = data_allocate((size_t)(characters / TEXT_INDEX_STRIDE + 3) * offset_size,
+                            offset_size);
     byte = 0;
     characters = 0;
     while (byte < text->byte_length) {
         long long width;
-        offsets[characters++] = byte;
+        if (characters % TEXT_INDEX_STRIDE == 0) {
+            long long entry = characters / TEXT_INDEX_STRIDE;
+            if (offset_size == sizeof(uint32_t))
+                ((uint32_t *)offsets)[entry] = (uint32_t)byte;
+            else
+                ((long long *)offsets)[entry] = byte;
+        }
+        characters++;
         decode_character(text->bytes + byte, text->byte_length - byte, &width);
         byte += width;
     }
-    offsets[characters] = byte;
+    if (characters % TEXT_INDEX_STRIDE == 0) {
+        long long entry = characters / TEXT_INDEX_STRIDE;
+        if (offset_size == sizeof(uint32_t))
+            ((uint32_t *)offsets)[entry] = (uint32_t)byte;
+        else
+            ((long long *)offsets)[entry] = byte;
+    }
     text->character_offsets = offsets;
     text->character_length = characters;
+    /* Two trailing words form a one-entry cursor. Keeping them in the lazy
+       index avoids enlarging every Text header, including ASCII values. */
+    text_index_store(text, text_index_breadcrumbs(text), 0);
+    text_index_store(text, text_index_breadcrumbs(text) + 1, 0);
 }
 
 MINYAR_HOT void ensure_text_index(MinyarText *text) {
@@ -697,10 +921,42 @@ long long minyar_text_byte_length(const MinyarText *text) {
     return text->byte_length;
 }
 
-static MINYAR_COLD int indexed_character_at(const MinyarText *text, long long position) {
-    long long byte = text->character_offsets[position];
+static long long indexed_byte_offset(MinyarText *text, long long position) {
+    long long entry = position / TEXT_INDEX_STRIDE;
+    long long start = entry * TEXT_INDEX_STRIDE;
+    long long byte = text_index_load(text, entry);
+    long long cursor = text_index_breadcrumbs(text);
+    long long cached_position = text_index_load(text, cursor);
+    long long cached_byte = text_index_load(text, cursor + 1);
+    if (cached_position >= start && cached_position <= position) {
+        start = cached_position;
+        byte = cached_byte;
+    }
+    while (start < position) {
+        long long width;
+        decode_character(text->bytes + byte, text->byte_length - byte, &width);
+#ifdef MINYAR_RC_TESTING
+        text_decode_count++;
+#endif
+        byte += width;
+        start++;
+    }
+    text_index_store(text, cursor, position);
+    text_index_store(text, cursor + 1, byte);
+    return byte;
+}
+
+static MINYAR_COLD int indexed_character_at(MinyarText *text, long long position) {
+    long long byte = indexed_byte_offset(text, position);
     long long width;
-    return (int)decode_character(text->bytes + byte, text->byte_length - byte, &width);
+    int character = (int)decode_character(text->bytes + byte,
+                                          text->byte_length - byte, &width);
+#ifdef MINYAR_RC_TESTING
+    text_decode_count++;
+#endif
+    text_index_store(text, text_index_breadcrumbs(text), position + 1);
+    text_index_store(text, text_index_breadcrumbs(text) + 1, byte + width);
+    return character;
 }
 
 static MINYAR_COLD MINYAR_NORETURN void negative_text_position(void) {
@@ -740,8 +996,8 @@ MinyarText *minyar_text_slice(MinyarText *text, long long start, long long end) 
     if (start < 0 || end < start || end > text->character_length)
         slice_outside_text();
     if (text->character_offsets) {
-        first_byte = text->character_offsets[start];
-        last_byte = text->character_offsets[end];
+        first_byte = indexed_byte_offset(text, start);
+        last_byte = indexed_byte_offset(text, end);
     } else {
         first_byte = start;
         last_byte = end;
@@ -775,10 +1031,27 @@ MinyarText *minyar_text_slice(MinyarText *text, long long start, long long end) 
 #else
     {
         long long length = last_byte - first_byte;
-        unsigned char *bytes = new_bytes(length);
-        memcpy(bytes, text->bytes + first_byte, (size_t)length);
-        bytes[length] = 0;
-        return new_text(bytes, length, text->character_offsets ? -1 : length);
+        long long characters = end - start;
+        MinyarText *root = text->backing ? text->backing : text;
+        /* A full slice is the same immutable value. For a tiny portion of a
+         * large allocation, copy so a short-lived token cannot retain the
+         * whole source; otherwise use a zero-copy view. */
+        if (first_byte == 0 && length == text->byte_length) {
+            minyar_rc_retain(text);
+            return text;
+        }
+        if (root->byte_length > 4096 &&
+            (unsigned long long)length * 8 < (unsigned long long)root->byte_length) {
+            unsigned char *bytes = new_bytes(length);
+            memcpy(bytes, text->bytes + first_byte, (size_t)length);
+            bytes[length] = 0;
+            return new_text(bytes, length, length == characters ? characters : -1);
+        }
+        MinyarText *view = new_text(text->bytes + first_byte, length,
+                                    length == characters ? characters : -1);
+        view->backing = root;
+        minyar_rc_retain(root);
+        return view;
     }
 #endif
 }
@@ -878,6 +1151,7 @@ MinyarText *minyar_character_text(int character) {
             text->byte_length = 1;
             text->character_length = 1;
             text->character_offsets = NULL;
+            text->backing = NULL;
         }
         return text;
     }
@@ -891,6 +1165,10 @@ MinyarText *minyar_boolean_text(_Bool boolean) {
 void minyar_initialize_arguments(int count, char **values) {
     saved_argument_count = count;
     saved_argument_values = values;
+#ifdef SIGPIPE
+    /* Turn a closed output pipe into the same checked I/O failure as EBADF. */
+    signal(SIGPIPE, SIG_IGN);
+#endif
 }
 
 long long minyar_argument_count(void) {
@@ -903,10 +1181,27 @@ MinyarText *minyar_argument(long long position) {
     return copy_c_text(saved_argument_values[position + 1]);
 }
 
+static long long text_file_length(FILE *file) {
+#ifdef _WIN32
+    __int64 length;
+    if (_fseeki64(file, 0, SEEK_END) != 0 || (length = _ftelli64(file)) < 0 ||
+        _fseeki64(file, 0, SEEK_SET) != 0)
+#else
+    long length;
+    if (fseek(file, 0, SEEK_END) != 0 || (length = ftell(file)) < 0 ||
+        fseek(file, 0, SEEK_SET) != 0)
+#endif
+        minyar_stop("a requested text file could not be read.");
+    if ((unsigned long long)length > (unsigned long long)LLONG_MAX ||
+        (unsigned long long)length >= (unsigned long long)SIZE_MAX)
+        minyar_stop("a requested text file is too large.");
+    return (long long)length;
+}
+
 MinyarText *minyar_read_text_file(const MinyarText *path_text) {
     char *path = text_as_path(path_text);
     FILE *file = fopen(path, "rb");
-    long length;
+    long long length;
     unsigned char *bytes;
     if (!file) {
         fprintf(stderr, "Minyar stopped: the file '%s' could not be opened.\n", path);
@@ -917,9 +1212,7 @@ MinyarText *minyar_read_text_file(const MinyarText *path_text) {
 #endif
         exit(1);
     }
-    if (fseek(file, 0, SEEK_END) != 0 || (length = ftell(file)) < 0 ||
-        fseek(file, 0, SEEK_SET) != 0)
-        minyar_stop("a requested text file could not be read.");
+    length = text_file_length(file);
     bytes = new_bytes(length);
     if (fread(bytes, 1, (size_t)length, file) != (size_t)length)
         minyar_stop("a requested text file could not be read.");

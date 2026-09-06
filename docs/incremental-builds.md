@@ -38,7 +38,10 @@ Diagnostics retain the original source filenames and line numbers.
 
 ## Identity and publication
 
-Artifacts belong to one canonical entry path and one exact compiler binary.
+Artifacts belong to one canonical entry path, one exact compiler binary and
+one effective ownership policy. The launcher forwards the selected cleanup
+budget. K1 uses ordinary code; other budgets key stack ownership by the useful
+limit `min(8, K−1)`. Both base and delta envelopes must match that policy.
 Source changes with unchanged timestamps are detected. The driver compares
 compiler bytes rather than trusting modification times. Code names are stable
 within the entry's namespace: modules below its directory use relative paths,
@@ -60,7 +63,8 @@ concurrent builds from exposing partially written output or combining different
 base generations. Serialize the initial compiler/runtime bootstrap and builds targeting the same
 output executable. A failed frontend build preserves earlier successful output
 and cache state. A later Clang failure can leave a valid frontend cache, since
-Clang flags and native objects are not cached.
+Clang flags and module native objects are not cached. The configured standard
+runtime is cached separately by its Makefile dependencies.
 
 Publication uses atomic filesystem operations, without durability synchronization.
 An interrupted or crashed process can leave temporary files; partial or missing
@@ -81,5 +85,7 @@ The normal `make check` includes incremental correctness and frontend performanc
 checks. Run the sanitizer target separately to check generated compiler LLVM and
 the native driver.
 
-The incremental driver has been tested on macOS arm64. Linux execution still
-needs validation, and Windows is unsupported.
+The incremental driver has been tested on macOS ARM64 and through ownership
+policy/cache-edit checks on Linux ARM64 and x86-64. The Linux runs used a local
+VM, with x86-64 instruction translation; they establish selected correctness,
+not native deployment performance. Windows is unsupported.

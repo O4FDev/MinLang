@@ -152,7 +152,7 @@ function main() {
     entry.write_text('use "./library.min" as library\nprint(1)\n')
     expected_line=str(bad[:bad.index('public function bad')].count('\n')+1)
     failure=run([COMPILER,entry,warm,'--module-state',prior,next_state,stats],success=False)
-    assert f'{library}:{expected_line}:' in failure.stderr,failure.stderr
+    assert f'{library}:{expected_line}, column ' in failure.stderr,failure.stderr
 
     # Unicode, quotes and separators in paths must remain injective identities.
     odd=directory/'space λ "quote" | part'; odd.mkdir()

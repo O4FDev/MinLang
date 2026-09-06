@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import shlex
 import string
 import subprocess
 import tempfile
@@ -18,6 +19,7 @@ RUNTIME_SOURCE = ROOT / "runtime" / "minyar_runtime.c"
 RUNTIME = ROOT / "build" / "minyar-runtime.o"
 if not RUNTIME.exists():
     RUNTIME = RUNTIME_SOURCE
+LINK_FLAGS = shlex.split(os.environ.get("MINYAR_TEST_LINK_FLAGS", ""))
 
 
 def run(command: list[str], *, timeout: float = 8, cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
@@ -48,7 +50,7 @@ def check_expression_batch(compiler: Path, clang: str, cases: int, temporary: Pa
     if compiled.returncode != 0:
         raise AssertionError(f"valid generated expressions failed:\n{compiled.stderr}")
     linked = run(
-        [clang, "-O0", "-Wno-override-module", str(llvm), str(RUNTIME), "-o", str(executable)],
+        [clang, "-O0", *LINK_FLAGS, "-Wno-override-module", str(llvm), str(RUNTIME), "-o", str(executable)],
         timeout=30,
     )
     if linked.returncode != 0:
@@ -57,6 +59,87 @@ def check_expression_batch(compiler: Path, clang: str, cases: int, temporary: Pa
     expected = "".join(f"{value}\n" for _, value in generated)
     if executed.returncode != 0 or executed.stdout != expected:
         raise AssertionError("generated arithmetic changed meaning between Minyar and native execution")
+
+
+def check_language_surface(compiler: Path, clang: str, cases: int, temporary: Path, seed: int) -> None:
+    """Generate typed programs spanning the ordinary language, not just expressions."""
+    rng = random.Random(seed)
+    source_lines = [
+        "record FuzzPair { left: Integer; right: Integer }",
+        "record FuzzBox { label: Text; values: List<Integer>; pair: FuzzPair }",
+        "function total(values: List<Integer>): Integer {",
+        "    let result = 0",
+        "    let position = 0",
+        "    while position < values.length {",
+        "        result = result + values[position]",
+        "        position = position + 1",
+        "    }",
+        "    return result",
+        "}",
+        "function choose(left: Integer, right: Integer, takeLeft: Boolean): Integer {",
+        "    if takeLeft { return left } else { return right }",
+        "}",
+    ]
+    expected: list[str] = []
+    labels = ["ascii", "éclair", "界", "🙂", "e\u0301"]
+    for index in range(cases):
+        original_values = [rng.randint(-500, 500) for _ in range(rng.randint(1, 6))]
+        replacement = rng.randint(-500, 500)
+        appended = rng.randint(-500, 500)
+        replace_at = rng.randrange(len(original_values))
+        values = list(original_values)
+        values[replace_at] = replacement
+        left, right = rng.randint(-1000, 1000), rng.randint(-1000, 1000)
+        take_left = bool(rng.getrandbits(1))
+        label = rng.choice(labels) + str(index)
+        prefix_length = rng.randrange(len(label) + 1)
+        name = f"values{index}"
+        source_lines.append(f"let {name}: List<Integer> = []")
+        for value in original_values:
+            source_lines.append(f"{name}.add({value})")
+        source_lines.append(f"{name}[{replace_at}] = {replacement}")
+        source_lines.append(f"let pair{index} = FuzzPair {{ left: {left}; right: {right} }}")
+        source_lines.append(
+            f'let box{index} = FuzzBox {{ label: "{label}" + ""; values: {name}; pair: pair{index} }}'
+        )
+        source_lines.append(f"print(total(box{index}.values))")
+        source_lines.append(f"let appended{index} = box{index}.values.appended({appended})")
+        source_lines.append(f"print(total(appended{index}))")
+        source_lines.append(f"print(box{index}.values.length)")
+        source_lines.append(
+            f"print(choose(box{index}.pair.left, box{index}.pair.right, {'true' if take_left else 'false'}))"
+        )
+        source_lines.append(f"print(box{index}.label.slice(0, {prefix_length}))")
+        source_lines.append(f"let pieces{index}: List<Text> = []")
+        midpoint = len(label) // 2
+        source_lines.append(f'pieces{index}.add("{label[:midpoint]}")')
+        source_lines.append(f'pieces{index}.add("{label[midpoint:]}")')
+        source_lines.append(f"print(joinText(pieces{index}) == box{index}.label)")
+        expected.extend(
+            [str(sum(values)), str(sum(values) + appended), str(len(values)),
+             str(left if take_left else right), label[:prefix_length], "true"]
+        )
+
+    source = temporary / "language-surface.min"
+    source.write_text("\n".join(source_lines) + "\n", encoding="utf-8")
+    llvm = temporary / "language-surface.ll"
+    compiled = run([str(compiler), str(source), str(llvm)], timeout=max(20, cases))
+    if compiled.returncode != 0:
+        raise AssertionError(f"valid generated language program failed:\n{compiled.stderr}\n{source.read_text()}")
+    expected_text = "\n".join(expected) + "\n"
+    for optimization in ("-O0", "-O2"):
+        executable = temporary / f"language-surface-{optimization[2:]}"
+        linked = run(
+            [clang, optimization, *LINK_FLAGS, "-Wno-override-module", str(llvm), str(RUNTIME), "-o", str(executable)],
+            timeout=30,
+        )
+        if linked.returncode != 0:
+            raise AssertionError(f"generated language LLVM was rejected at {optimization}:\n{linked.stderr}")
+        executed = run([str(executable)])
+        if executed.returncode != 0 or executed.stdout != expected_text:
+            raise AssertionError(
+                f"generated language program changed meaning at {optimization}:\n{executed.stderr}"
+            )
 
 
 def check_hostile_sources(compiler: Path, cases: int, temporary: Path, timeout: float) -> None:
@@ -118,7 +201,7 @@ def check_generated_module_chain(compiler: Path, clang: str, modules: int, tempo
         raise AssertionError("compiling the same module graph twice was not deterministic")
     executable = temporary / "module-chain-program"
     linked = run(
-        [clang, "-O0", "-Wno-override-module", str(first), str(RUNTIME), "-o", str(executable)],
+        [clang, "-O0", *LINK_FLAGS, "-Wno-override-module", str(first), str(RUNTIME), "-o", str(executable)],
         timeout=30,
     )
     if linked.returncode != 0:
@@ -134,6 +217,7 @@ def main() -> None:
     parser.add_argument("--clang", default=os.environ.get("MINYAR_TEST_CLANG", "clang"))
     parser.add_argument("--cases", type=int, default=int(os.environ.get("MINYAR_FUZZ_CASES", "200")))
     parser.add_argument("--hostile-timeout", type=float, default=2.0)
+    parser.add_argument("--program-cases", type=int, default=None)
     arguments = parser.parse_args()
     compiler = arguments.compiler.resolve()
     with tempfile.TemporaryDirectory(prefix="minyar-fuzz-") as directory:
@@ -145,10 +229,17 @@ def main() -> None:
             check_expression_batch(compiler, arguments.clang, batch_size, temporary, 0x4D494E594152 + batch)
             remaining -= batch_size
             batch += 1
+        program_cases = arguments.program_cases
+        if program_cases is None:
+            program_cases = max(8, min(40, arguments.cases // 5))
+        check_language_surface(compiler, arguments.clang, program_cases, temporary, 0x53555246414345)
         check_hostile_sources(compiler, arguments.cases, temporary, arguments.hostile_timeout)
         check_regression_corpus(compiler, temporary)
         check_generated_module_chain(compiler, arguments.clang, 24, temporary)
-    print(f"deterministic fuzzing passed: {arguments.cases} expressions, {arguments.cases} hostile inputs, 24 modules")
+    print(
+        f"deterministic fuzzing passed: {arguments.cases} expressions, "
+        f"{program_cases} full-language cases, {arguments.cases} hostile inputs, 24 modules"
+    )
 
 
 if __name__ == "__main__":

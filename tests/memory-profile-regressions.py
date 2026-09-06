@@ -19,8 +19,9 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 STANDARD = ('recent-cursors', 'recent-fairness', 'immortal-reference-lists',
-            'scalar-list-hotpath', 'idle-service')
+            'scalar-list-hotpath', 'idle-service', 'dead-frame-growth')
 INDEPENDENT = ('production-live-oracle', 'production-frame-oracle', 'production-idle-service')
+POOL_ONLY = ('dead-frame-growth',)
 VIRTUAL = 'production-virtual-stress'
 PHASES = ('shared', 'frames', 'records', 'temporaries', 'graphs', 'bytes',
           'wrapped-bytes', 'frame-cache')
@@ -181,10 +182,14 @@ def main():
             if profile == 'system' and VIRTUAL in selected:
                 report['skipped'].append({'profile': profile, 'fixture': VIRTUAL,
                     'reason': 'Pool byte/capacity and coalescing assertions require a pool; system uses exact object/byte ownership and allocation-count recovery checks.'})
+            for name in POOL_ONLY:
+                if profile == 'system' and name in selected:
+                    report['skipped'].append({'profile': profile, 'fixture': name,
+                        'reason': 'Buddy-region admission and pool recovery require fixed or lazy allocation.'})
             for budget in budgets:
                 for instrumentation in modes:
                     for name in selected:
-                        if name == VIRTUAL and profile == 'system':
+                        if profile == 'system' and (name == VIRTUAL or name in POOL_ONLY):
                             continue
                         relative = (Path('tests') if name in STANDARD else Path('experiments/memory')) / (name + '.c')
                         label = f'{profile}-k{budget}-{instrumentation}-{name}'

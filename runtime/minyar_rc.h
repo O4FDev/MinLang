@@ -19,6 +19,7 @@ void minyar_rc_keep(void *value) { (void)value; }
 void minyar_rc_borrow(void *value) { (void)value; }
 void minyar_rc_local(long long index, void *value) { (void)index; (void)value; }
 void minyar_rc_local_take(long long index, void *value) { (void)index; (void)value; }
+void minyar_rc_local_move(long long index) { (void)index; }
 void minyar_rc_step(void) {}
 void minyar_rc_retain(void *value) { (void)value; }
 void minyar_rc_release(void *value) { (void)value; }
@@ -175,11 +176,13 @@ static void rc_drop(void *value) {
     object->ownership -= 8;
     if (object->ownership >> 3) return;
     unsigned kind = object->ownership & 7;
+    MinyarText *text_backing = NULL;
     /* Leaves can be destroyed immediately, without recursion or queue space.
      * This matters for wide lists of small records and text fragments. */
     if (kind == RC_TEXT) {
         MinyarText *text = (MinyarText *)(object + 1);
-        rc_free_data((void *)text->bytes);
+        text_backing = text->backing;
+        if (!text_backing) rc_free_data((void *)text->bytes);
         rc_free_data(text->character_offsets);
         RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(*text));
     } else if (kind == RC_LIST) {
@@ -207,6 +210,8 @@ static void rc_drop(void *value) {
     }
     RC_ACCOUNT(rc_object_count--);
     free(object);
+    /* Views point directly at an owning root, never at another view. */
+    if (text_backing) rc_drop(text_backing);
 }
 
 void minyar_rc_release(void *value) {
@@ -269,8 +274,15 @@ void minyar_rc_enter(long long locals) {
     size_t count = (size_t)locals;
     if (count > frame->local_capacity) {
 #ifdef MINYAR_BOUNDED_RC
+#ifdef MINYAR_SYSTEM_HEAP
         void **values = rc_heap_resize(frame->locals, frame->local_capacity * (sizeof(*values) + sizeof(size_t)),
                                           count * (sizeof(*values) + sizeof(size_t)));
+#else
+        /* Cached local values and written indices have finished retirement;
+         * their old contents need not survive. New frames have no old buffer. */
+        void **values = minyar_pool_resize_discard(frame->locals,
+                                          count * (sizeof(*values) + sizeof(size_t)));
+#endif
 #else
         void **values = realloc(frame->locals, count * sizeof(*values));
 #endif
@@ -359,6 +371,18 @@ void minyar_rc_local_take(long long index, void *value) {
     void *previous = rc_frames->locals[index];
     rc_frames->locals[index] = value;
     minyar_rc_release(previous);
+#endif
+}
+
+/* Transfer the local's existing ownership count into an expression without
+ * changing the pointer stored in generated local storage. The next assignment
+ * replaces that storage; the low bit keeps bounded frames' written-slot index. */
+void minyar_rc_local_move(long long index) {
+#ifdef MINYAR_BOUNDED_RC
+    uintptr_t previous = (uintptr_t)rc_frames->locals[index];
+    rc_frames->locals[index] = (void *)(previous & 1);
+#else
+    rc_frames->locals[index] = NULL;
 #endif
 }
 

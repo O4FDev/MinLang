@@ -12,6 +12,10 @@ function characterIsWhitespace(character: Character): Boolean {
     return character == ' ' || character == '\n' || character == '\r' || character == '\t'
 }
 
+function sourceLocation(line: Integer, column: Integer): Text {
+    return Text(line) + ", column " + Text(column)
+}
+
 function addToken(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, kind: Integer, text: Text, line: Text) {
     tokenKinds.add(kind)
     tokenTexts.add(text)
@@ -38,7 +42,13 @@ function lineCanEndStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>):
 function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>) {
     let position = 0
     let line = 1
+    let lineStart = 0
     let length = source.length
+    // UTF-8 permits a leading byte-order mark. Treat it as an encoding marker,
+    // never as an invisible punctuation token in a later diagnostic.
+    if length > 0 && source.slice(0, 1) == "﻿" {
+        position = 1
+    }
 
     while position < length {
         let character = source[position]
@@ -46,9 +56,10 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
         if characterIsWhitespace(character) {
             if character == '\n' {
                 if lineCanEndStatement(tokenKinds, tokenTexts) {
-                    addToken(tokenKinds, tokenTexts, tokenLines, 6, "end of line", Text(line))
+                    addToken(tokenKinds, tokenTexts, tokenLines, 6, "end of line", sourceLocation(line, position - lineStart + 1))
                 }
                 line = line + 1
+                lineStart = position + 1
             }
             position = position + 1
         } else {
@@ -60,46 +71,54 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
             } else {
                 if character == '/' && position + 1 < length && source[position + 1] == '*' {
                     let commentLine = line
+                    let commentColumn = position - lineStart + 1
                     position = position + 2
                     while position + 1 < length && !(source[position] == '*' && source[position + 1] == '/') {
                         if source[position] == '\n' {
                             line = line + 1
+                            lineStart = position + 1
                         }
                         position = position + 1
                     }
                     if position + 1 >= length {
-                        fail("line " + Text(commentLine) + ": block comment is missing its closing */")
+                        fail("line " + sourceLocation(commentLine, commentColumn) + ": block comment is missing its closing */")
                     }
                     position = position + 2
                 } else {
                     if characterIsLetter(character) || character == '_' {
                         let start = position
                         let tokenLine = line
+                        let tokenColumn = position - lineStart + 1
                         while position < length && (characterIsLetter(source[position]) || characterIsDigit(source[position]) || source[position] == '_') {
                             position = position + 1
                         }
                         let name = source.slice(start, position)
-                        addToken(tokenKinds, tokenTexts, tokenLines, 1, name, Text(tokenLine))
+                        addToken(tokenKinds, tokenTexts, tokenLines, 1, name, sourceLocation(tokenLine, tokenColumn))
                     } else {
                         if characterIsDigit(character) {
                             let start = position
                             let tokenLine = line
+                            let tokenColumn = position - lineStart + 1
                             while position < length && characterIsDigit(source[position]) {
                                 position = position + 1
                             }
                             let digits = source.slice(start, position)
-                            addToken(tokenKinds, tokenTexts, tokenLines, 2, digits, Text(tokenLine))
+                            addToken(tokenKinds, tokenTexts, tokenLines, 2, digits, sourceLocation(tokenLine, tokenColumn))
                         } else {
                             if character == '"' {
                                 let tokenLine = line
+                                let tokenColumn = position - lineStart + 1
                                 position = position + 1
                                 let chunkStart = position
                                 while position < length && source[position] != '"' && source[position] != '\\' {
-                                    if source[position] == '\n' { line = line + 1 }
+                                    if source[position] == '\n' {
+                                        line = line + 1
+                                        lineStart = position + 1
+                                    }
                                     position = position + 1
                                 }
                                 if position >= length {
-                                    fail("line " + Text(tokenLine) + ": Text literal is missing its closing quote")
+                                    fail("line " + sourceLocation(tokenLine, tokenColumn) + ": Text literal is missing its closing quote")
                                 }
                                 let text = ""
                                 if position < length && source[position] == '\\' {
@@ -110,7 +129,10 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
                                                 pieces.add(source.slice(chunkStart, position))
                                             }
                                             let escape = source[position + 1]
-                                            if escape == '\n' { line = line + 1 }
+                                            if escape == '\n' {
+                                                line = line + 1
+                                                lineStart = position + 2
+                                            }
                                             if escape == 'n' {
                                                 pieces.add(Text('\n'))
                                             } else {
@@ -127,12 +149,15 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
                                             position = position + 2
                                             chunkStart = position
                                         } else {
-                                            if source[position] == '\n' { line = line + 1 }
+                                            if source[position] == '\n' {
+                                                line = line + 1
+                                                lineStart = position + 1
+                                            }
                                             position = position + 1
                                         }
                                     }
                                     if position >= length {
-                                        fail("line " + Text(tokenLine) + ": Text literal is missing its closing quote")
+                                        fail("line " + sourceLocation(tokenLine, tokenColumn) + ": Text literal is missing its closing quote")
                                     }
                                     if chunkStart < position {
                                         pieces.add(source.slice(chunkStart, position))
@@ -142,19 +167,23 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
                                     text = source.slice(chunkStart, position)
                                 }
                                 position = position + 1
-                                addToken(tokenKinds, tokenTexts, tokenLines, 3, text, Text(tokenLine))
+                                addToken(tokenKinds, tokenTexts, tokenLines, 3, text, sourceLocation(tokenLine, tokenColumn))
                             } else {
+                                if character > '~' {
+                                    fail("line " + Text(line) + ", column " + Text(position - lineStart + 1) + ": names must use ASCII letters, digits, and '_'; found non-ASCII character '" + Text(character) + "'")
+                                }
                                 if character == '\'' {
                                     let tokenLine = line
+                                    let tokenColumn = position - lineStart + 1
                                     position = position + 1
                                     if position >= length {
-                                        fail("line " + Text(tokenLine) + ": Character literal is missing its value and closing quote")
+                                        fail("line " + sourceLocation(tokenLine, tokenColumn) + ": Character literal is missing its value and closing quote")
                                     }
                                     let value = source[position]
                                     if value == '\\' {
                                         position = position + 1
                                         if position >= length {
-                                            fail("line " + Text(tokenLine) + ": Character literal has an unfinished escape")
+                                            fail("line " + sourceLocation(tokenLine, tokenColumn) + ": Character literal has an unfinished escape")
                                         }
                                         let escape = source[position]
                                         if escape == 'n' {
@@ -171,13 +200,16 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
                                             }
                                         }
                                     }
-                                    if source[position] == '\n' { line = line + 1 }
-                                    position = position + 1
-                                    if position >= length || source[position] != '\'' {
-                                        fail("line " + Text(tokenLine) + ": Character literal must contain exactly one character and a closing quote")
+                                    if source[position] == '\n' {
+                                        line = line + 1
+                                        lineStart = position + 1
                                     }
                                     position = position + 1
-                                    addToken(tokenKinds, tokenTexts, tokenLines, 5, Text(value), Text(tokenLine))
+                                    if position >= length || source[position] != '\'' {
+                                        fail("line " + sourceLocation(tokenLine, tokenColumn) + ": Character literal must contain exactly one character and a closing quote")
+                                    }
+                                    position = position + 1
+                                    addToken(tokenKinds, tokenTexts, tokenLines, 5, Text(value), sourceLocation(tokenLine, tokenColumn))
                                 } else {
                                     let punctuation = Text(character)
                                     if position + 1 < length {
@@ -197,7 +229,7 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
                                     if punctuation == ";" {
                                         punctuationKind = 6
                                     }
-                                    addToken(tokenKinds, tokenTexts, tokenLines, punctuationKind, punctuation, Text(line))
+                                    addToken(tokenKinds, tokenTexts, tokenLines, punctuationKind, punctuation, sourceLocation(line, position - lineStart + 1))
                                     position = position + 1
                                 }
                             }
@@ -208,7 +240,7 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
         }
     }
 
-    addToken(tokenKinds, tokenTexts, tokenLines, 0, "", Text(line))
+    addToken(tokenKinds, tokenTexts, tokenLines, 0, "", sourceLocation(line, position - lineStart + 1))
 }
 
 function describeLocation(location: Text): Text {
@@ -413,13 +445,15 @@ function buildSymbolLookup(symbolNames: List<Text>, symbolKinds: List<Integer>):
     return lookup
 }
 
-function requireUniqueSymbols(lookup: List<Integer>, symbolNames: List<Text>, symbolKinds: List<Integer>) {
+function requireUniqueSymbols(lookup: List<Integer>, symbolNames: List<Text>, symbolKinds: List<Integer>, symbolLocations: List<Text>) {
     let position = 1
     while position < lookup.length {
         let previous = lookup[position - 1]
         let current = lookup[position]
         if symbolKinds[previous] == symbolKinds[current] && symbolNames[previous] == symbolNames[current] {
-            fail("module declares '" + readableDeclarationName(symbolNames[current]) + "' more than once")
+            let duplicate = current
+            if previous > current { duplicate = previous }
+            fail(describeLocation(symbolLocations[duplicate]) + ": module declares '" + readableDeclarationName(symbolNames[current]) + "' more than once")
         }
         position = position + 1
     }
@@ -584,7 +618,7 @@ function skipTopLevelStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>
     skipTerminators(tokenKinds, cursor)
 }
 
-function discoverRecordNames(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, symbolNames: List<Text>, symbolKinds: List<Integer>, symbolReturnTypes: List<Integer>, symbolParameterCounts: List<Integer>, declarationEnds: List<Integer>): Boolean {
+function discoverRecordNames(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, symbolNames: List<Text>, symbolKinds: List<Integer>, symbolLocations: List<Text>, symbolReturnTypes: List<Integer>, symbolParameterCounts: List<Integer>, declarationEnds: List<Integer>): Boolean {
     let cursor: List<Integer> = []
     cursor.add(0)
     let topLevelStatements = false
@@ -595,6 +629,7 @@ function discoverRecordNames(tokenKinds: List<Integer>, tokenTexts: List<Text>, 
             let index = symbolNames.length
             symbolNames.add(name)
             symbolKinds.add(2)
+            symbolLocations.add(tokenLines[cursor[0] + 1])
             symbolReturnTypes.add(1000 + index)
             symbolParameterCounts.add(0)
         }
@@ -610,7 +645,7 @@ function discoverRecordNames(tokenKinds: List<Integer>, tokenTexts: List<Text>, 
     return topLevelStatements
 }
 
-function recordScannedDeclarations(tokenKinds: List<Integer>, tokenTexts: List<Text>, scannedStarts: List<Integer>, scannedEnds: List<Integer>, symbolNames: List<Text>, symbolKinds: List<Integer>, symbolReturnTypes: List<Integer>, symbolParameterCounts: List<Integer>, declarationEnds: List<Integer>): Boolean {
+function recordScannedDeclarations(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, scannedStarts: List<Integer>, scannedEnds: List<Integer>, symbolNames: List<Text>, symbolKinds: List<Integer>, symbolLocations: List<Text>, symbolReturnTypes: List<Integer>, symbolParameterCounts: List<Integer>, declarationEnds: List<Integer>): Boolean {
     let topLevelStatements = false
     let scanned = 0
     let declaration = 0
@@ -626,6 +661,7 @@ function recordScannedDeclarations(tokenKinds: List<Integer>, tokenTexts: List<T
                 let index = symbolNames.length
                 symbolNames.add(tokenTexts[start + 1])
                 symbolKinds.add(2)
+                symbolLocations.add(tokenLines[start + 1])
                 symbolReturnTypes.add(1000 + index)
                 symbolParameterCounts.add(0)
             }
@@ -637,7 +673,7 @@ function recordScannedDeclarations(tokenKinds: List<Integer>, tokenTexts: List<T
     return topLevelStatements
 }
 
-function discoverDeclarations(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, symbolNames: List<Text>, symbolKinds: List<Integer>, symbolReturnTypes: List<Integer>, symbolLookup: List<Integer>, symbolParameterCounts: List<Integer>, symbolParameterNames: List<Text>, symbolParameterTypes: List<Integer>, parameterStarts: List<Integer>, declarationEnds: List<Integer>) {
+function discoverDeclarations(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, symbolNames: List<Text>, symbolKinds: List<Integer>, symbolLocations: List<Text>, symbolReturnTypes: List<Integer>, symbolLookup: List<Integer>, symbolParameterCounts: List<Integer>, symbolParameterNames: List<Text>, symbolParameterTypes: List<Integer>, parameterStarts: List<Integer>, declarationEnds: List<Integer>) {
     let cursor: List<Integer> = []
     cursor.add(0)
     let declaration = 0
@@ -664,7 +700,7 @@ function discoverDeclarations(tokenKinds: List<Integer>, tokenTexts: List<Text>,
                     previous = previous + 1
                 }
                 if duplicate {
-                    fail("record '" + symbolNames[record] + "' declares '" + fieldName + "' twice")
+                    fail(describeLocation(tokenLines[cursor[0]]) + ": record '" + symbolNames[record] + "' declares '" + fieldName + "' twice")
                 }
                 symbolParameterNames.add(fieldName)
                 cursor[0] = cursor[0] + 1
@@ -684,6 +720,7 @@ function discoverDeclarations(tokenKinds: List<Integer>, tokenTexts: List<Text>,
                 let functionName = tokenTexts[cursor[0]]
                 symbolNames.add(functionName)
                 symbolKinds.add(1)
+                symbolLocations.add(tokenLines[cursor[0]])
                 parameterStarts.add(symbolParameterNames.length)
                 cursor[0] = cursor[0] + 1
                 expectToken(tokenKinds, tokenTexts, tokenLines, cursor, "(")
@@ -1001,16 +1038,35 @@ function ownResult(output: List<Text>, state: List<Integer>, value: Text, result
 // that exact reference, eliminating temporary registration and a retain/drop
 // pair. Borrowed values never carry this token. No heap uniqueness is assumed.
 function takeResult(output: List<Text>, state: List<Integer>, value: Text, resultType: List<Integer>): Boolean {
-    if isReferenceType(resultType[0]) && resultType.length > 1 && resultType[1] >= 0 {
+    if isReferenceType(resultType[0]) && resultType.length > 1 {
         let owner = resultType[1]
-        if output[owner] == "  call void @minyar_rc_keep(ptr " && output[owner + 1] == value {
-            output[owner] = ""
-            output[owner + 1] = ""
-            output[owner + 2] = ""
+        if takeOwner(output, state, value, owner) {
             resultType[1] = -1
-            state[7] = state[7] - 1
             return true
         }
+    }
+    return false
+}
+
+function takeOwner(output: List<Text>, state: List<Integer>, value: Text, owner: Integer): Boolean {
+    if owner == -1 { return false }
+    if output[owner] == "  ; minyar-owned-local-transfer\n" {
+        // Delay clearing the slot until after the right operand has run. This
+        // preserves expressions such as x = x + x while still handing the
+        // left ownership count to the consuming join.
+        addOutput(output, "  call void @minyar_rc_local_move(i64 ")
+        addOutput(output, output[owner + 1])
+        addOutput(output, ")\n")
+        output[owner] = ""
+        output[owner + 1] = ""
+        return true
+    }
+    if output[owner] == "  call void @minyar_rc_keep(ptr " && output[owner + 1] == value {
+        output[owner] = ""
+        output[owner + 1] = ""
+        output[owner + 2] = ""
+        state[7] = state[7] - 1
+        return true
     }
     return false
 }
@@ -1125,8 +1181,26 @@ function borrowReference(output: List<Text>, state: List<Integer>, value: Text, 
     }
 }
 
+function finishStackOwnership(output: List<Text>, slot: Integer, owners: Integer) {
+    let stackEntry = "  call void @minyar_stack_enter()\n"
+    let prefix = stackEntry + "  call void @minyar_rc_enter(i64 " + Text(owners) + ")\n"
+    let entry = stackEntry + "  %rc.stack.header = alloca [64 x i8], align 8\n"
+    entry = entry + "  %rc.stack.owners = alloca [" + Text(owners * 2) + " x i64], align 8\n"
+    entry = entry + "  call void @minyar_rc_enter_stack_v1(ptr %rc.stack.header, ptr %rc.stack.owners, i64 " + Text(owners) + ")\n"
+    output[slot] = entry + output[slot].slice(prefix.length, output[slot].length)
+    output[slot - 1] = ") noinline {\nentry:\n"
+    let piece = slot + 1
+    while piece < output.length {
+        if output[piece] == "  call void @minyar_rc_leave()\n" {
+            output[piece] = "  call void @minyar_rc_leave_stack_v1(ptr %rc.stack.header)\n"
+        }
+        piece = piece + 1
+    }
+}
+
 function finishFunctionEntry(output: List<Text>, slot: Integer, locals: Integer, parameters: Integer, owners: Integer, references: Boolean) {
     let entry: List<Text> = []
+    entry.add("  call void @minyar_stack_enter()\n")
     if references {
         entry.add("  call void @minyar_rc_enter(i64 ")
         entry.add(Text(owners))
@@ -1150,7 +1224,7 @@ function finishFunctionEntry(output: List<Text>, slot: Integer, locals: Integer,
     output[slot] = joinText(entry)
 }
 
-function emitBinary(output: List<Text>, textState: List<Text>, state: List<Integer>, operator: Text, left: Text, leftType: Integer, right: Text, rightType: Integer, resultType: List<Integer>): Text {
+function emitBinary(output: List<Text>, textState: List<Text>, state: List<Integer>, operator: Text, left: Text, leftType: Integer, leftOwner: Integer, right: Text, rightType: Integer, resultType: List<Integer>): Text {
     if leftType != rightType {
         fail("the two sides of '" + operator + "' have different types")
     }
@@ -1176,9 +1250,15 @@ function emitBinary(output: List<Text>, textState: List<Text>, state: List<Integ
     let result = valueName(textState, temporary)
 
     if operator == "+" && leftType == 2 {
+        let runtimeName = "minyar_join_text"
+        if takeOwner(output, state, left, leftOwner) {
+            runtimeName = "minyar_join_text_take_left"
+        }
         addOutput(output, "  ")
         addOutput(output, result)
-        addOutput(output, " = call ptr @minyar_join_text(ptr ")
+        addOutput(output, " = call ptr @")
+        addOutput(output, runtimeName)
+        addOutput(output, "(ptr ")
         addOutput(output, left)
         addOutput(output, ", ptr ")
         addOutput(output, right)
@@ -1415,9 +1495,13 @@ function parseBinary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLin
         let operator = tokenTexts[state[0]]
         state[0] = state[0] + 1
         let leftType = resultType[0]
+        let leftOwner = -1
+        if resultType.length > 1 {
+            leftOwner = resultType[1]
+        }
         setType(resultType, 0)
         let right = parseBinary(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, resultType, level + 1)
-        left = emitBinary(output, textState, state, operator, left, leftType, right, resultType[0], resultType)
+        left = emitBinary(output, textState, state, operator, left, leftType, leftOwner, right, resultType[0], resultType)
         level = operatorLevel(tokenKinds, tokenTexts, state)
     }
     return left
@@ -1516,12 +1600,13 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                 fail("expected a field or method name after '.'")
             }
             let member = tokenTexts[state[0]]
+            let memberLocation = tokenLines[state[0]]
             state[0] = state[0] + 1
             if tokenIs(tokenKinds, tokenTexts, state, "(") {
                 state[0] = state[0] + 1
                 let argumentType: List<Integer> = []
                 argumentType.add(0)
-                if member == "add" && isListType(receiverType) {
+                if (member == "add" || member == "appended") && isListType(receiverType) {
                     argumentType[0] = listElementType(receiverType)
                 }
                 let argument = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, argumentType)
@@ -1549,8 +1634,38 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                     setType(resultType, 2)
                 } else {
                     expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
+                    if member == "appended" && isListType(receiverType) {
+                        if argumentType[0] != listElementType(receiverType) {
+                            fail("the value appended to a List has the wrong type")
+                        }
+                        let slot = valueAsListSlot(output, textState, state, argument, argumentType[0])
+                        let transfers = takeResult(output, state, argument, argumentType)
+                        let temporary = newTemporary(state)
+                        value = valueName(textState, temporary)
+                        addOutput(output, "  ")
+                        addOutput(output, value)
+                        addOutput(output, " = call ptr @minyar_list_appended(ptr ")
+                        addOutput(output, receiver)
+                        addOutput(output, ", i64 ")
+                        addOutput(output, slot)
+                        addOutput(output, ", i64 ")
+                        if isReferenceType(argumentType[0]) {
+                            addOutput(output, "1")
+                        } else {
+                            addOutput(output, "0")
+                        }
+                        addOutput(output, ", i64 ")
+                        if transfers {
+                            addOutput(output, "1")
+                        } else {
+                            addOutput(output, "0")
+                        }
+                        addOutput(output, ")\n")
+                        ownsResult = true
+                        setType(resultType, receiverType)
+                    } else {
                     if member != "add" || !isListType(resultType[0]) {
-                        fail("only Lists provide the add operation")
+                        fail(describeLocation(memberLocation) + ": this value has no method named '" + member + "'")
                     }
                     if argumentType[0] != listElementType(resultType[0]) {
                         fail("the value added to a List has the wrong type")
@@ -1568,6 +1683,7 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                     addOutput(output, ")\n")
                     value = ""
                     setType(resultType, 5)
+                    }
                 }
             } else {
                 if isRecordType(receiverType) {
@@ -1764,21 +1880,23 @@ function parseRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLin
     }
     while !tokenIs(tokenKinds, tokenTexts, state, "}") {
         let fieldName = tokenTexts[state[0]]
+        let fieldLocation = tokenLines[state[0]]
         state[0] = state[0] + 1
         expectToken(tokenKinds, tokenTexts, tokenLines, state, ":")
         let field = findRecordField(functionParameterCounts, functionParameterNames, 1000 + record, fieldName)
         if field < 0 {
-            fail("record '" + readableDeclarationName(name) + "' has no field named '" + fieldName + "'")
+            fail(describeLocation(fieldLocation) + ": record '" + readableDeclarationName(name) + "' has no field named '" + fieldName + "'")
         }
         let fieldPosition = field - first
         if seen[fieldPosition] {
-            fail("record field '" + fieldName + "' was provided twice")
+            fail(describeLocation(fieldLocation) + ": record field '" + fieldName + "' was provided twice")
         }
         let fieldType: List<Integer> = []
         fieldType.add(functionParameterTypes[field])
+        let valueLocation = tokenLines[state[0]]
         let fieldValue = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, fieldType)
         if fieldType[0] != functionParameterTypes[field] {
-            fail("record field '" + fieldName + "' has the wrong type")
+            fail(describeLocation(valueLocation) + ": record field '" + fieldName + "' has the wrong type")
         }
         let slot = valueAsListSlot(output, textState, state, fieldValue, fieldType[0])
         if scalarValues >= 0 {
@@ -1810,11 +1928,12 @@ function parseRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLin
         }
         skipTerminators(tokenKinds, state)
     }
+    let closingLocation = tokenLines[state[0]]
     expectToken(tokenKinds, tokenTexts, tokenLines, state, "}")
     position = 0
     while position < fieldCount {
         if !seen[position] {
-            fail("record '" + readableDeclarationName(name) + "' is missing field '" + functionParameterNames[first + position] + "'")
+            fail(describeLocation(closingLocation) + ": record '" + readableDeclarationName(name) + "' is missing field '" + functionParameterNames[first + position] + "'")
         }
         position = position + 1
     }
@@ -1923,6 +2042,12 @@ function parseAtom(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                         addOutput(output, "\n")
                     }
                     setType(resultType, localTypes[local])
+                    if id >= 0 && resultType.length > 3 && resultType[2] == id && resultType[3] == tokenIndex {
+                        let owner = output.length
+                        addOutput(output, "  ; minyar-owned-local-transfer\n")
+                        addOutput(output, Text(ownershipSlot(state, id)))
+                        markOwner(resultType, owner)
+                    }
                 }
             }
         }
@@ -2035,7 +2160,8 @@ function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
 
     let value = ""
     if name == "print" {
-        if argumentValues.length != 1 || argumentTypes[0] > 4 {
+        // checkBuiltinArguments has already established the single argument.
+        if argumentTypes[0] > 4 {
             fail("print expects one Integer, Text, Character, or Boolean value")
         }
         let suffix = "text"
@@ -2270,6 +2396,7 @@ function compileStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
             fail(describeLocation(tokenLines[state[0]]) + ": expected a name after let")
         }
         let name = tokenTexts[state[0]]
+        let nameLocation = tokenLines[state[0]]
         state[0] = state[0] + 1
         let declaredType = 0
         if tokenIs(tokenKinds, tokenTexts, state, ":") {
@@ -2295,7 +2422,7 @@ function compileStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
             }
         }
         if declaredType != 0 && declaredType != valueType[0] {
-            fail("the value for '" + name + "' does not match its declared type")
+            fail(describeLocation(nameLocation) + ": the value for '" + name + "' does not match its declared type")
         }
         let type = valueType[0]
         if type == 5 || type == 6 {
@@ -2334,6 +2461,7 @@ function compileStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
                 addOutput(output, ")\n")
             }
             addOutput(output, "  call void @minyar_rc_leave()\n")
+            addOutput(output, "  call void @minyar_stack_leave()\n")
             if textState[1] == "main" {
                 let temporary = newTemporary(state)
                 addOutput(output, "  %value.")
@@ -2410,12 +2538,10 @@ function compileStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
                     addOutput(output, Text(conditionLabel))
                     addOutput(output, ":\n")
                     textState[0] = "while.condition." + Text(conditionLabel)
-                    let conditionEffects = state[7]
                     let conditionType: List<Integer> = []
                     conditionType.add(0)
                     let condition = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, conditionType)
                     requireType(tokenLines, state, conditionType[0], 4, "a while condition must be Boolean")
-                    let conditionReferences = conditionEffects != state[7]
                     addOutput(output, "  br i1 ")
                     addOutput(output, condition)
                     addOutput(output, ", label %while.body.")
@@ -2428,9 +2554,10 @@ function compileStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
                     textState[0] = "while.body." + Text(bodyLabel)
                     let bodyReturns = compileBlock(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, returnType)
                     if !bodyReturns {
-                        if conditionReferences {
-                            addOutput(output, "  call void @minyar_rc_step()\n")
-                        }
+                        /* A long scalar loop must still service cleanup debt
+                           created before it. Scalar-only functions erase this
+                           call in finishFunctionEntry. */
+                        addOutput(output, "  call void @minyar_rc_step()\n")
                         addOutput(output, "  br label %while.condition.")
                         addOutput(output, Text(conditionLabel))
                         addOutput(output, "\n")
@@ -2449,6 +2576,14 @@ function compileStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
                         state[0] = state[0] + 2
                         let valueType: List<Integer> = []
                         valueType.add(localTypes[local])
+                        // For x = x + e, transfer x's local owner into the
+                        // consuming Text join. Runtime uniqueness still guards
+                        // in-place growth; aliases take the copying fallback.
+                        if localTypes[local] == 2 && tokenKinds[state[0]] == 1 && tokenTexts[state[0]] == name && tokenTexts[state[0] + 1] == "+" {
+                            valueType.add(-1)
+                            valueType.add(localIds[local])
+                            valueType.add(state[0])
+                        }
                         let value = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, valueType)
                         if valueType[0] != localTypes[local] {
                             fail("an assignment to '" + name + "' has the wrong type")
@@ -2463,7 +2598,7 @@ function compileStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
                         addOutput(output, "\n")
                     } else {
                         if tokenKinds[state[0]] == 1 && tokenTexts[state[0] + 1] == "." && state[0] + 3 < tokenTexts.length && tokenTexts[state[0] + 3] == "=" {
-                            fail("record fields are immutable; construct a new record instead")
+                            fail(describeLocation(tokenLines[state[0]]) + ": record fields are immutable; construct a new record instead")
                         } else {
                         if tokenKinds[state[0]] == 1 && looksLikeIndexAssignment(tokenKinds, tokenTexts, state) {
                             let name = tokenTexts[state[0]]
@@ -2499,7 +2634,11 @@ function compileStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
                             }
                             checkListMutation(localTypes[local], functionParameterCounts, functionParameterTypes, functionReturnTypes)
                             let slot = valueAsListSlot(output, textState, state, value, valueType[0])
-                            addOutput(output, "  call void @minyar_list_set(ptr ")
+                            if takeResult(output, state, value, valueType) {
+                                addOutput(output, "  call void @minyar_list_set_take(ptr ")
+                            } else {
+                                addOutput(output, "  call void @minyar_list_set(ptr ")
+                            }
                             addOutput(output, collection)
                             addOutput(output, ", i64 ")
                             addOutput(output, position)
@@ -2561,7 +2700,7 @@ function markAssignedParameters(tokenKinds: List<Integer>, tokenTexts: List<Text
     }
 }
 
-function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, output: List<Text>) {
+function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, output: List<Text>, stackOwnerLimit: Integer) {
     let state: List<Integer> = []
     state.add(0)
     state.add(0)
@@ -2622,6 +2761,10 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         state[9] = state[9] + 1
         state[10] = -1
         state[11] = 0
+        // Only parseCall writes a resolved user-function index into this cache.
+        // Reset it per body in bounded mode: -1 at finish proves no user call.
+        // Ordinary mode retains its existing cross-body cache behavior.
+        if stackOwnerLimit > 0 { state[5] = -1 }
         textState[0] = "entry"
         let localNames: List<Text> = []
         let localTypes: List<Integer> = []
@@ -2687,6 +2830,7 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         let returns = compileBlock(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, returnType)
         if !returns {
             addOutput(output, "  call void @minyar_rc_leave()\n")
+            addOutput(output, "  call void @minyar_stack_leave()\n")
             if name == "main" {
                 addOutput(output, "  ret i32 0\n")
             } else {
@@ -2698,6 +2842,9 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
             }
         }
         finishFunctionEntry(output, entrySlot, state[4], parameterNames.length, state[8], state[6] == 1)
+        if stackOwnerLimit > 0 && name != "main" && state[5] == -1 && state[6] == 1 && state[8] >= 1 && state[8] <= stackOwnerLimit {
+            finishStackOwnership(output, entrySlot, state[8])
+        }
         addOutput(output, "}\n\n")
         } else {
             skipTopLevelStatement(tokenKinds, tokenTexts, state)
@@ -2751,15 +2898,17 @@ function compileTopLevel(tokenKinds: List<Integer>, tokenTexts: List<Text>, toke
     }
     if !terminated {
         addOutput(output, "  call void @minyar_rc_leave()\n")
+        addOutput(output, "  call void @minyar_stack_leave()\n")
         addOutput(output, "  ret i32 0\n")
     }
     finishFunctionEntry(output, entrySlot, state[4], 0, state[8], state[6] == 1)
     addOutput(output, "}\n\n")
 }
 
-function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, scannedStarts: List<Integer>, scannedEnds: List<Integer>): Text {
+function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, scannedStarts: List<Integer>, scannedEnds: List<Integer>, stackOwnerLimit: Integer): Text {
     let functionNames: List<Text> = []
     let symbolKinds: List<Integer> = []
+    let symbolLocations: List<Text> = []
     let functionReturnTypes: List<Integer> = []
     let functionParameterCounts: List<Integer> = []
     let functionParameterNames: List<Text> = []
@@ -2767,22 +2916,22 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     let declarationEnds: List<Integer> = []
     let topLevelStatements = false
     if scannedStarts.length > 0 {
-        topLevelStatements = recordScannedDeclarations(tokenKinds, tokenTexts, scannedStarts, scannedEnds, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, declarationEnds)
+        topLevelStatements = recordScannedDeclarations(tokenKinds, tokenTexts, tokenLines, scannedStarts, scannedEnds, functionNames, symbolKinds, symbolLocations, functionReturnTypes, functionParameterCounts, declarationEnds)
     } else {
-        topLevelStatements = discoverRecordNames(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, declarationEnds)
+        topLevelStatements = discoverRecordNames(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, symbolLocations, functionReturnTypes, functionParameterCounts, declarationEnds)
     }
     let symbolLookup = buildSymbolLookup(functionNames, symbolKinds)
-    requireUniqueSymbols(symbolLookup, functionNames, symbolKinds)
+    requireUniqueSymbols(symbolLookup, functionNames, symbolKinds, symbolLocations)
     let parameterStarts: List<Integer> = []
     let recordIndex = 0
     while recordIndex < functionNames.length {
         parameterStarts.add(0)
         recordIndex = recordIndex + 1
     }
-    discoverDeclarations(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, symbolLookup, functionParameterCounts, functionParameterNames, functionParameterTypes, parameterStarts, declarationEnds)
+    discoverDeclarations(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, symbolLocations, functionReturnTypes, symbolLookup, functionParameterCounts, functionParameterNames, functionParameterTypes, parameterStarts, declarationEnds)
     appendParameterOffsets(functionParameterCounts, parameterStarts)
     symbolLookup = buildSymbolLookup(functionNames, symbolKinds)
-    requireUniqueSymbols(symbolLookup, functionNames, symbolKinds)
+    requireUniqueSymbols(symbolLookup, functionNames, symbolKinds, symbolLocations)
     let lookupPosition = 0
     while lookupPosition < symbolLookup.length {
         functionReturnTypes.add(symbolLookup[lookupPosition])
@@ -2805,21 +2954,21 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
             if literal.length == literal.byteLength {
                 addOutput(output, "@.text.")
                 addOutput(output, Text(position))
-                addOutput(output, " = private constant { i64, ptr, i64, i64, ptr } { i64 0, ptr @.text.data.")
+                addOutput(output, " = private constant { i64, ptr, i64, i64, ptr, ptr } { i64 0, ptr @.text.data.")
                 addOutput(output, Text(position))
                 addOutput(output, ", i64 ")
                 addOutput(output, Text(literal.byteLength))
                 addOutput(output, ", i64 ")
                 addOutput(output, Text(literal.byteLength))
-                addOutput(output, ", ptr null }\n")
+                addOutput(output, ", ptr null, ptr null }\n")
             } else {
                 addOutput(output, "@.text.")
                 addOutput(output, Text(position))
-                addOutput(output, " = private global { i64, ptr, i64, i64, ptr } { i64 0, ptr @.text.data.")
+                addOutput(output, " = private global { i64, ptr, i64, i64, ptr, ptr } { i64 0, ptr @.text.data.")
                 addOutput(output, Text(position))
                 addOutput(output, ", i64 ")
                 addOutput(output, Text(literal.byteLength))
-                addOutput(output, ", i64 -1, ptr null }\n")
+                addOutput(output, ", i64 -1, ptr null, ptr null }\n")
             }
         }
         position = position + 1
@@ -2827,11 +2976,14 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
 
     addOutput(output, "\ndeclare void @minyar_rc_enter(i64)\n")
     addOutput(output, "declare void @minyar_rc_leave()\n")
+    addOutput(output, "declare void @minyar_stack_enter()\n")
+    addOutput(output, "declare void @minyar_stack_leave()\n")
     addOutput(output, "declare void @minyar_rc_keep(ptr)\n")
     addOutput(output, "declare void @minyar_rc_borrow(ptr)\n")
     addOutput(output, "declare void @minyar_rc_retain(ptr)\n")
     addOutput(output, "declare void @minyar_rc_local(i64, ptr)\n")
     addOutput(output, "declare void @minyar_rc_local_take(i64, ptr)\n")
+    addOutput(output, "declare void @minyar_rc_local_move(i64)\n")
     addOutput(output, "declare void @minyar_rc_step()\n")
     addOutput(output, "declare void @minyar_print_integer(i64)\n")
     addOutput(output, "declare void @minyar_print_text(ptr)\n")
@@ -2841,6 +2993,7 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     addOutput(output, "declare void @minyar_exit(i64)\n")
     addOutput(output, "declare i1 @minyar_texts_are_equal(ptr, ptr)\n")
     addOutput(output, "declare ptr @minyar_join_text(ptr, ptr)\n")
+    addOutput(output, "declare ptr @minyar_join_text_take_left(ptr, ptr)\n")
     addOutput(output, "declare ptr @minyar_join_texts(ptr)\n")
     addOutput(output, "declare i64 @minyar_text_length(ptr)\n")
     addOutput(output, "declare i64 @minyar_text_byte_length(ptr)\n")
@@ -2861,6 +3014,8 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     addOutput(output, "declare i64 @minyar_list_length(ptr)\n")
     addOutput(output, "declare i64 @minyar_list_get(ptr, i64)\n")
     addOutput(output, "declare void @minyar_list_set(ptr, i64, i64)\n")
+    addOutput(output, "declare void @minyar_list_set_take(ptr, i64, i64)\n")
+    addOutput(output, "declare ptr @minyar_list_appended(ptr, i64, i64, i64)\n")
     addOutput(output, "declare ptr @minyar_record_new(i64)\n")
     addOutput(output, "declare ptr @minyar_record_new_scalar(i64)\n")
     addOutput(output, "declare i64 @minyar_record_get(ptr, i64)\n")
@@ -2875,11 +3030,18 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     addOutput(output, "declare { i64, i1 } @llvm.smul.with.overflow.i64(i64, i64)\n\n")
     let mainFunction = findIndexedSymbol(symbolLookup, functionNames, symbolKinds, "main", 1)
     if topLevelStatements && mainFunction >= 0 {
-        fail("a program cannot combine top-level statements with function main()")
+        fail(describeLocation(symbolLocations[mainFunction]) + ": a program cannot combine top-level statements with function main()")
     }
-    compileFunctions(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, output)
+    compileFunctions(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, output, stackOwnerLimit)
     if mainFunction < 0 {
         compileTopLevel(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, output)
+    }
+    if stackOwnerLimit > 0 {
+        if findIndexedSymbol(symbolLookup, functionNames, symbolKinds, "minyar_rc_enter_stack_v1", 1) >= 0 || findIndexedSymbol(symbolLookup, functionNames, symbolKinds, "minyar_rc_leave_stack_v1", 1) >= 0 {
+            fail("function name is reserved by the bounded ownership runtime")
+        }
+        addOutput(output, "declare void @minyar_rc_enter_stack_v1(ptr, ptr, i64)\n")
+        addOutput(output, "declare void @minyar_rc_leave_stack_v1(ptr)\n")
     }
     return joinText(output)
 }
@@ -2891,7 +3053,7 @@ function compileProgram(source: Text): Text {
     tokenize(source, tokenKinds, tokenTexts, tokenLines)
     let scannedStarts: List<Integer> = []
     let scannedEnds: List<Integer> = []
-    return compileTokens(tokenKinds, tokenTexts, tokenLines, scannedStarts, scannedEnds)
+    return compileTokens(tokenKinds, tokenTexts, tokenLines, scannedStarts, scannedEnds, 0)
 }
 
 function pathCharacterIsSeparator(character: Character): Boolean {
@@ -3150,19 +3312,21 @@ function findIndexedModuleDeclaration(declarationLookup: List<Integer>, declarat
     return findIndexedSymbol(declarationLookup, declarationQualifiedNames, declarationKinds, qualifiedDeclarationName(owner, name), kind)
 }
 
-function requireUniqueModuleDeclarations(declarationLookup: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationQualifiedNames: List<Text>) {
+function requireUniqueModuleDeclarations(declarationLookup: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationQualifiedNames: List<Text>, declarationLocations: List<Text>) {
     let position = 1
     while position < declarationLookup.length {
         let previous = declarationLookup[position - 1]
         let current = declarationLookup[position]
         if declarationKinds[previous] == declarationKinds[current] && declarationQualifiedNames[previous] == declarationQualifiedNames[current] {
-            fail("module declares '" + declarationNames[current] + "' more than once")
+            let duplicate = current
+            if previous > current { duplicate = previous }
+            fail(describeLocation(declarationLocations[duplicate]) + ": module declares '" + declarationNames[current] + "' more than once")
         }
         position = position + 1
     }
 }
 
-function collectModuleDeclarations(module: Integer, tokenStart: Integer, tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, declarationOwners: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationPublic: List<Integer>, declarationQualifiedNames: List<Text>) {
+function collectModuleDeclarations(module: Integer, modulePath: Text, tokenStart: Integer, tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, declarationOwners: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationPublic: List<Integer>, declarationQualifiedNames: List<Text>, declarationLocations: List<Text>) {
     let cursor: List<Integer> = []
     cursor.add(tokenStart)
     skipTerminators(tokenKinds, cursor)
@@ -3189,6 +3353,7 @@ function collectModuleDeclarations(module: Integer, tokenStart: Integer, tokenKi
                 declarationKinds.add(kind)
                 declarationPublic.add(isPublic)
                 declarationQualifiedNames.add(qualifiedDeclarationName(module, name))
+                declarationLocations.add(modulePath + ":" + tokenLines[cursor[0] + 1])
                 skipDeclaration(tokenKinds, tokenTexts, cursor)
             } else {
                 if isPublic == 1 {
@@ -3345,7 +3510,7 @@ function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integ
     addToken(outputKinds, outputTexts, outputLines, 6, "end of module", modulePath + ":" + tokenLines[position])
 }
 
-function compileEntry(path: Text): Text {
+function compileEntry(path: Text, stackOwnerLimit: Integer): Text {
     let modulePaths: List<Text> = []
     let moduleSources: List<Text> = []
     let moduleStates: List<Integer> = []
@@ -3361,7 +3526,7 @@ function compileEntry(path: Text): Text {
     let declarationEnds: List<Integer> = []
     let entry = loadModule(path, true, modulePaths, moduleSources, moduleStates, modulePublic, moduleTokenStarts, moduleTokenKinds, moduleTokenTexts, moduleTokenLines, importOwners, importAliases, importTargets, declarationStarts, declarationEnds)
     if modulePaths.length == 1 && modulePublic[0] == 0 {
-        return compileTokens(moduleTokenKinds, moduleTokenTexts, moduleTokenLines, declarationStarts, declarationEnds)
+        return compileTokens(moduleTokenKinds, moduleTokenTexts, moduleTokenLines, declarationStarts, declarationEnds, stackOwnerLimit)
     }
 
     let declarationOwners: List<Integer> = []
@@ -3369,13 +3534,14 @@ function compileEntry(path: Text): Text {
     let declarationKinds: List<Integer> = []
     let declarationPublic: List<Integer> = []
     let declarationQualifiedNames: List<Text> = []
+    let declarationLocations: List<Text> = []
     let module = 0
     while module < modulePaths.length {
-        collectModuleDeclarations(module, moduleTokenStarts[module], moduleTokenKinds, moduleTokenTexts, moduleTokenLines, declarationOwners, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames)
+        collectModuleDeclarations(module, modulePaths[module], moduleTokenStarts[module], moduleTokenKinds, moduleTokenTexts, moduleTokenLines, declarationOwners, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames, declarationLocations)
         module = module + 1
     }
     let declarationLookup = buildSymbolLookup(declarationQualifiedNames, declarationKinds)
-    requireUniqueModuleDeclarations(declarationLookup, declarationNames, declarationKinds, declarationQualifiedNames)
+    requireUniqueModuleDeclarations(declarationLookup, declarationNames, declarationKinds, declarationQualifiedNames, declarationLocations)
 
     let tokenKinds: List<Integer> = []
     let tokenTexts: List<Text> = []
@@ -3388,7 +3554,25 @@ function compileEntry(path: Text): Text {
     addToken(tokenKinds, tokenTexts, tokenLines, 0, "", "end of program")
     let scannedStarts: List<Integer> = []
     let scannedEnds: List<Integer> = []
-    return compileTokens(tokenKinds, tokenTexts, tokenLines, scannedStarts, scannedEnds)
+    return compileTokens(tokenKinds, tokenTexts, tokenLines, scannedStarts, scannedEnds, stackOwnerLimit)
+}
+
+function ownershipLimitForBudget(text: Text): Integer {
+    let budget = 0
+    let position = 0
+    let digits = "0123456789"
+    while position < text.length {
+        let digit = 0
+        while digit < 10 && text[position] != digits[digit] { digit = digit + 1 }
+        if digit == 10 { fail("cleanup budget must be a positive decimal integer") }
+        if budget < 9 {
+            budget = budget * 10 + digit
+            if budget > 9 { budget = 9 }
+        }
+        position = position + 1
+    }
+    if budget == 0 { fail("cleanup budget must be a positive decimal integer") }
+    return budget - 1
 }
 
 function main() {
@@ -3397,7 +3581,15 @@ function main() {
         print(characterIsLetter('M'))
         print(characterIsDigit('x'))
     } else {
-        let llvm = compileEntry(argument(0))
+        let stackOwnerLimit = 0
+        if argumentCount() > 2 {
+            if (argumentCount() != 3 && argumentCount() != 4) || argument(2) != "--bounded-owners" {
+                fail("usage: compiler SOURCE OUTPUT [--bounded-owners [BUDGET]]")
+            }
+            stackOwnerLimit = 8
+            if argumentCount() == 4 { stackOwnerLimit = ownershipLimitForBudget(argument(3)) }
+        }
+        let llvm = compileEntry(argument(0), stackOwnerLimit)
         if argumentCount() == 1 {
             print(llvm)
         } else {

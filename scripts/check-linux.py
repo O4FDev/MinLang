@@ -20,10 +20,14 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ['build/minyarc', 'build/compiler-stage3.ll', 'build/minyarc-sanitize',
          'build/minyar-runtime.o', 'build/minyar-runtime-sanitize.o', 'build/ownership-runtime.o',
-         'build/runtime-unit', 'build/runtime-unit-sanitize']
-TARGETS = ['check-generated-sanitizer', 'check-sanitized-fixed-point',
+         'build/runtime-unit', 'build/runtime-unit-sanitize',
+         'build/module-compiler-stage3.ll']
+TARGETS = ['check-ownership-policy', 'check-stack-ownership', 'check-runtime-cache',
+           'check-generated-sanitizer', 'check-sanitized-fixed-point',
            'check-smoke', 'check-release-build', 'check-launcher-isolation',
-           'check-modules', 'check-regressions', 'check-binary-expressions', 'check-ownership',
+           'check-modules', 'check-regressions', 'check-diagnostics', 'check-conformance',
+           'check-fuzz', 'check-stack-overflow',
+           'check-mutation', 'check-mutation-score', 'check-binary-expressions', 'check-ownership',
            'check-adversarial', 'check-recursive-data', 'check-scalar-record-storage',
            'check-readonly-parameters', 'check-compact-ownership', 'check-integer-text-cache',
            'check-tokenizer-storage']
@@ -201,6 +205,8 @@ def main():
         check('build', make + BUILD)
         check('compiler-fixed-point', [sys.executable, '-c',
               'from pathlib import Path; assert Path("build/compiler-stage2.ll").read_bytes() == Path("build/compiler-stage3.ll").read_bytes(), "compiler fixed point differs"'])
+        check('module-compiler-fixed-point', [sys.executable, '-c',
+              'from pathlib import Path; assert Path("build/module-compiler-stage2.ll").read_bytes() == Path("build/module-compiler-stage3.ll").read_bytes(), "module compiler fixed point differs"'])
         check('runtime-unit', ['./build/runtime-unit'])
         check('runtime-unit-sanitize', ['./build/runtime-unit-sanitize'])
         for target in TARGETS:

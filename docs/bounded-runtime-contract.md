@@ -1,13 +1,48 @@
 # Incremental reference counting
 
-Minyar normally reclaims values as soon as their last reference is released.
-The optional incremental profiles spread that cleanup across runtime calls.
-Each call has a work budget; elapsed time still depends on the allocator,
-hardware, and operating system.
+Launcher-built programs and the Makefile's ordinary program runtime use
+system-backed incremental reference counting by default, with K32 cleanup
+batches. Graph traversal is spread across runtime calls. K is not a bound on
+total operation time: allocator calls, copying, page faults, I/O and operating
+system scheduling remain outside it. Some operations perform multiple batches.
+The explicit eager profile opts out and can release an entire graph at once.
 
 ## Choosing a profile
 
-Set these flags when compiling the runtime C source:
+Use `./minyar --memory-profile system|fixed|lazy|eager` before the source path.
+`--cleanup-budget N` selects 1–1024 for incremental profiles (default 32).
+`--heap-bytes N` applies only to fixed/lazy pools: ASCII decimal, a power of two
+from 4096 through 2^62 on supported 64-bit targets. That representable range does
+not guarantee the host can allocate or link the requested capacity.
+
+For example:
+
+```sh
+./minyar --release app.min -o app
+./minyar --release --memory-profile fixed --heap-bytes 1048576 --cleanup-budget 32 app.min -o app
+```
+
+A single launcher setting controls both compiler ownership lowering and runtime
+configuration. Eligible leaf functions with at most `min(8, K−1)` owner slots
+use compiler-generated stack storage; K1 retains ordinary ownership frames.
+The optional incremental module cache includes this effective policy in its
+identity. No ownership annotation is required in Minyar source.
+
+`MINYAR_RUNTIME_FLAGS` supplies runtime C flags; `MINYAR_CLANG_FLAGS` supplies
+final link flags. Target, sysroot and sanitizer choices must agree between them.
+Launcher-selected profile, budget and pool capacity override conflicting `-D`
+or `-U` definitions in runtime flags. Custom tools/forced includes are trusted.
+The standard system/K32 runtime is built once and reused; its Makefile targets
+depend on the runtime implementation, headers and build recipe. Other incremental
+profile settings, or an explicitly set `MINYAR_CLANG` or `MINYAR_RUNTIME_FLAGS`,
+compile an incremental runtime inside the invocation's temporary directory.
+The eager profile uses cached Makefile artifacts; its runtime compilation uses
+the Makefile's toolchain flags rather than `MINYAR_RUNTIME_FLAGS`.
+This keeps custom incremental configuration
+isolated while avoiding repeated runtime compilation for ordinary builds.
+When changing Makefile toolchain variables, use a clean build as usual.
+
+For direct runtime C builds, the corresponding flags are:
 
 | Flags | Allocation | Main tradeoff |
 | --- | --- | --- |
@@ -29,7 +64,7 @@ activate incremental cleanup. Combining lazy and system allocation is rejected.
 | `MINYAR_INTEGER_TEXT_CACHE_LIMIT` | 32,768 entries | 0–32,768 |
 
 The pool needs one metadata byte per 32 bytes of capacity. With the default
-settings, startup touches 64 MiB of pool storage and 2 MiB of metadata.
+fixed-pool settings, startup touches 64 MiB of pool storage and 2 MiB of metadata.
 Touching pages does not lock them in physical memory.
 
 Lazy backing reserves separate data and metadata mappings without
@@ -55,8 +90,11 @@ aggregates, and Lists containing only immortal references can be freed
 immediately. Once a List receives a mortal reference, it permanently switches
 to ordinary reference traversal.
 
-Frame exit and statement cleanup detach owner chains without scanning them or
-allocating queue metadata. Temporary owners retire in chunks of eight,
+Ordinary heap-frame exit and statement cleanup detach owner chains without
+scanning them or allocating queue metadata. Stack-frame exit immediately visits
+its written owner slots (at most `min(8, K−1)`), charges those visits to K, and
+uses the remaining budget for queued work. Its stack storage is never queued.
+Temporary owners retire in chunks of eight,
 independently of the frame that created them. Frames index local slots when
 first assigned a non-null value. Cleanup visits that index, including slots
 later cleared; slots that only ever held null need no visit.

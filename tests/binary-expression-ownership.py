@@ -66,6 +66,76 @@ class BinaryExpressionOwnership(CompilerTestCase):
             with self.subTest(case=name):
                 self.rejects(source, diagnostic)
 
+    def test_owned_text_chain_uses_consuming_join(self):
+        result, llvm = self.compile('''function piece(value: Text): Text {
+ return value + "!"
+}
+print((piece("a") + piece("b")) + piece("c"))
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        generated = llvm.read_text()
+        self.assertGreaterEqual(
+            generated.count('call ptr @minyar_join_text_take_left('), 2,
+            'fresh intermediate Text results should be consumed by the next join',
+        )
+        self.executes('''function piece(value: Text): Text { return value + "!" }
+print((piece("a") + piece("b")) + piece("c"))
+''', 'a!b!c!\n')
+
+    def test_text_self_reassignment_moves_the_local_owner(self):
+        result, llvm = self.compile('''let text = Text(0)
+let position = 0
+while position < 4096 {
+ text = text + "abcdefgh"
+ position = position + 1
+}
+let alias = text
+text = text + "!"
+print(alias.length)
+print(text.length)
+let doubled = "ab"
+doubled = doubled + doubled
+print(doubled)
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        generated = llvm.read_text()
+        self.assertEqual(generated.count('call void @minyar_rc_local_move('), 3)
+        self.assertGreaterEqual(generated.count('call ptr @minyar_join_text_take_left('), 3)
+        self.executes('''let text = Text(0)
+let position = 0
+while position < 4096 {
+ text = text + "abcdefgh"
+ position = position + 1
+}
+let alias = text
+text = text + "!"
+print(alias.length)
+print(text.length)
+let doubled = "ab"
+doubled = doubled + doubled
+print(doubled)
+''', '32769\n32770\nabab\n')
+
+    def test_owned_list_replacement_transfers_only_fresh_results(self):
+        result, llvm = self.compile('''function make(value: Text): Text { return value + "!" }
+let values: List<Text> = ["old"]
+values[0] = make("fresh")
+let borrowed = make("borrowed")
+values[0] = borrowed
+print(values[0])
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        generated = llvm.read_text()
+        self.assertEqual(generated.count('call void @minyar_list_set_take('), 1)
+        self.assertEqual(generated.count('call void @minyar_list_set('), 1)
+        self.executes('''function make(value: Text): Text { return value + "!" }
+let values: List<Text> = ["old"]
+values[0] = make("fresh")
+let borrowed = make("borrowed")
+values[0] = borrowed
+print(values[0])
+''', 'borrowed!\n')
+
 
 if __name__ == '__main__':
     unittest.main()

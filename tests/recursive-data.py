@@ -89,6 +89,20 @@ childLists[0] = [leaf, leaf]
 print(alias[0].length)
 ''', '2\n')
 
+    def test_recursive_children_can_be_built_with_fresh_appended_lists(self):
+        self.executes('''record Node { value: Integer; children: List<Node> }
+let children: List<Node> = []
+let i = 1
+while i <= 20 {
+    children = children.appended(Node { value: i; children: [] })
+    i = i + 1
+}
+let root = Node { value: 0; children: children }
+print(root.children.length)
+print(root.children[0].value)
+print(root.children[19].value)
+''', '20\n1\n20\n')
+
     def test_direct_self_cycle_add_and_overwrite_rejected(self):
         declarations = 'record Node { children: List<Node> }\n'
         for body in (

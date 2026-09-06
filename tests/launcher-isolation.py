@@ -29,6 +29,7 @@ class LauncherIsolation(unittest.TestCase):
         (self.project / 'Makefile').write_text(
             '.PHONY: build/minyarc build/minyar-runtime.o build/minyar-runtime-release.ll\n'
             'build/minyarc build/minyar-runtime.o build/minyar-runtime-release.ll:\n\t@:\n')
+        shutil.copytree(ROOT / 'runtime', self.project / 'runtime')
         # Keep this path space-free for the race-only regression on the old launcher.
         wrapper = tempfile.NamedTemporaryFile(prefix='minyar-clang-barrier-', delete=False)
         wrapper.close()
@@ -39,8 +40,15 @@ import json, os, signal, sys, time
 from pathlib import Path
 work = Path(os.environ['LAUNCHER_TEST_WORK'])
 identity = os.environ['LAUNCHER_TEST_ID']
-(work / (identity + '.json')).write_text(json.dumps(sys.argv[1:]))
 mode = os.environ.get('LAUNCHER_TEST_MODE', '')
+# The configured runtime is compiled before linking. Keep the race barrier
+# at the linker, so both generated programs and runtimes exist first.
+if '-c' in sys.argv or '-emit-llvm' in sys.argv:
+    (work / (identity + '-runtime.json')).write_text(json.dumps(sys.argv[1:]))
+    source = next(arg for arg in sys.argv[1:] if arg.endswith('.c'))
+    (work / (identity + '-runtime.c')).write_text(Path(source).read_text())
+    os.execv(os.environ['LAUNCHER_TEST_REAL_CLANG'], ['clang', *sys.argv[1:]])
+(work / (identity + '.json')).write_text(json.dumps(sys.argv[1:]))
 if mode == 'barrier':
     deadline = time.monotonic() + 30
     while not all((work / (name + '.json')).exists() for name in ('first', 'second')):
@@ -89,8 +97,13 @@ os.execv(os.environ['LAUNCHER_TEST_REAL_CLANG'], ['clang', *sys.argv[1:]])
                 args = json.loads((self.work / (identity + '.json')).read_text())
                 self.assertIn('-O1', args)
                 self.assertEqual('-flto' in args, release)
-                runtime = 'minyar-runtime-release.ll' if release else 'minyar-runtime.o'
-                self.assertIn(str(self.project / 'build' / runtime), args)
+                runtime = 'runtime.ll' if release else 'runtime.o'
+                runtime_path = next(Path(arg) for arg in args if Path(arg).name == runtime)
+                self.assertTrue(runtime_path.parent.name.startswith('invocation.'))
+                self.assertEqual(runtime_path.parent.parent, self.project / 'build/programs')
+                config = (self.work / (identity + '-runtime.c')).read_text()
+                self.assertIn('#define MINYAR_SYSTEM_HEAP 1', config)
+                self.assertIn('#define MINYAR_RC_POLL_BUDGET 32', config)
             program_ir = lambda name: next(a for a in json.loads((self.work / name).read_text())
                                          if '/build/programs/' in a and a.endswith('.ll'))
             self.assertNotEqual(program_ir('first.json'), program_ir('second.json'))

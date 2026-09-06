@@ -104,7 +104,20 @@ For a mutation of `List<T>`, the compiler rejects `.add` and indexed replacement
 if `T` can lead back to that same `List<T>` type through fields or nested Lists.
 This prevents cycles even through aliases and helper functions. In the example,
 mutating any `List<Node>` is rejected, including an append that would happen to
-be safe. Constructing a new List and reassigning a local remains allowed.
+be safe. `list.appended(value)` returns a fresh List with the additional value,
+so recursive children can be accumulated safely by reassigning a local:
+
+```minyar
+let children: List<Node> = []
+children = children.appended(leaf)
+let root = Node { value: 2; children: children }
+```
+
+The operation copies the existing elements and is therefore linear in the List
+length; repeated use is quadratic. List literals remain preferable when all
+children are already known. Constructing a new List and reassigning a local
+cannot introduce the first cycle because that new List did not exist while its
+elements were evaluated.
 Unrelated mutable Lists, such as an Integer payload or an external worklist of
 wrappers that Node cannot reach, retain their usual shared behaviour.
 

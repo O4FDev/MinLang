@@ -21,29 +21,34 @@ def must(command):
 
 fixture=Path(__file__).with_suffix('.c')
 def oracle(s):
- rows=[];i=0;line=1;escaped_literals=0
- def put(k,t,l):rows.append((str(k),str(l),t.encode().hex()))
+ rows=[];i=0;line=1;line_start=0;escaped_literals=0
+ def location(position):return f'{line}, column {position-line_start+1}'
+ def put(k,t,where):rows.append((str(k),where,t.encode().hex()))
  while i<len(s):
   c=s[i]
   if c in ' \t\r\n':
    if c=='\n':
-    if rows and int(rows[-1][0]) in [1,2,3,5]:put(6,'end of line',line)
-    line+=1
+    if rows and int(rows[-1][0]) in [1,2,3,5]:put(6,'end of line',location(i))
+    line+=1;line_start=i+1
    i+=1;continue
   if c=='"':
-   startline=line;i+=1;text=[];escaped=False
+   startline=line;startcolumn=i-line_start+1;start=i;i+=1;text=[];escaped=False
    while i<len(s) and s[i]!='"':
     c=s[i]
     if c=='\\' and i+1<len(s):
-     escaped=True;c=s[i+1];line+=c=='\n';text.append({'n':'\n','r':'\r','t':'\t'}.get(c,c));i+=2
-    else:line+=c=='\n';text.append(c);i+=1
-   if i==len(s):return None,f'line {startline}: Text literal is missing its closing quote',0
-   i+=1;escaped_literals+=escaped;put(3,''.join(text),startline);continue
+     escaped=True;c=s[i+1]
+     if c=='\n':line+=1;line_start=i+2
+     text.append({'n':'\n','r':'\r','t':'\t'}.get(c,c));i+=2
+    else:
+     if c=='\n':line+=1;line_start=i+1
+     text.append(c);i+=1
+   if i==len(s):return None,f'line {startline}, column {startcolumn}: Text literal is missing its closing quote',0
+   i+=1;escaped_literals+=escaped;put(3,''.join(text),f'{startline}, column {startcolumn}');continue
   assert c.isascii() and (c.isalpha() or c=='_'),repr(c)
   start=i
   while i<len(s) and s[i].isascii() and (s[i].isalnum() or s[i]=='_'):i+=1
-  put(1,s[start:i],line)
- put(0,'',line);return rows,None,escaped_literals
+  put(1,s[start:i],location(start))
+ put(0,'',location(i));return rows,None,escaped_literals
 cases=[('prefix','\r\nalpha "plain" beta\r\n"é🙂" tail\n'),('nul','head "a\x00b" next\n"\\\x00" end'),('lines','\n\nhead "before\r\n\\\nafter\\nlast" tail\r\nend'),('quote_boundary','"\\\"""next" tail'),('slash_parity','"\\\\" "\\\\\\\"end" next'),('empty','\n"" next "\\q\\é\\🙂"\n'),('long','before "'+'é'*1024+'\\n'+'a'*4096+'" after\n'),('missing_plain','\r\nhead\n"plain\nunterminated'),('missing_escape','\n\n"prefix\\nlast'),('trailing_slash','\nhead\n"abc\\'),('consumed_quote','\n\n"abc\\"')]
 atoms=['a','é','🙂','\n','\r','\t','\\n','\\r','\\t','\\\\','\\"','\\q','\\é','\\🙂','\\\n']
 composed=['',*atoms,*(''.join(parts) for parts in itertools.product(atoms,repeat=2))]
