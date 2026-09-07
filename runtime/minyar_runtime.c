@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <io.h>
 #include <windows.h>
+#include <shellapi.h>
 #elif defined(__linux__) || defined(__APPLE__)
 #include <pthread.h>
 #endif
@@ -74,6 +75,14 @@ typedef struct {
 
 static int saved_argument_count;
 static char **saved_argument_values;
+#ifdef _WIN32
+static wchar_t **saved_windows_argument_values;
+
+static void free_windows_arguments(void) {
+    LocalFree(saved_windows_argument_values);
+    saved_windows_argument_values = NULL;
+}
+#endif
 static MINYAR_COLD MINYAR_NORETURN void minyar_stop(const char *message);
 
 /*
@@ -1169,9 +1178,19 @@ void minyar_initialize_arguments(int count, char **values) {
     saved_argument_values = values;
 #ifdef _WIN32
     /* Text output is UTF-8 with LF newlines on every platform. */
-    if (_setmode(_fileno(stdout), _O_BINARY) == -1 ||
-        _setmode(_fileno(stderr), _O_BINARY) == -1)
-        minyar_stop("standard output could not be configured.");
+    if (_setmode(_fileno(stderr), _O_BINARY) == -1)
+        minyar_stop("standard error could not be configured.");
+    if (_setmode(_fileno(stdout), _O_BINARY) == -1)
+        output_error();
+    /* The CRT's narrow argv uses the active code page, which can lose Unicode.
+     * Retain Windows' UTF-16 arguments and convert to UTF-8 when requested. */
+    if (saved_windows_argument_values)
+        free_windows_arguments();
+    else if (atexit(free_windows_arguments) != 0)
+        minyar_stop("program argument cleanup could not be registered.");
+    saved_windows_argument_values = CommandLineToArgvW(GetCommandLineW(), &saved_argument_count);
+    if (!saved_windows_argument_values)
+        minyar_stop("program arguments could not be read.");
 #endif
 #ifdef SIGPIPE
     /* Turn a closed output pipe into the same checked I/O failure as EBADF. */
@@ -1186,7 +1205,20 @@ long long minyar_argument_count(void) {
 MinyarText *minyar_argument(long long position) {
     if (position < 0 || position >= minyar_argument_count())
         minyar_stop("a program argument position was outside the argument list.");
+#ifdef _WIN32
+    const wchar_t *argument = saved_windows_argument_values[position + 1];
+    int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, argument, -1,
+                                    NULL, 0, NULL, NULL);
+    if (length <= 0)
+        minyar_stop("a program argument contained invalid Unicode.");
+    unsigned char *bytes = new_bytes((long long)length - 1);
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, argument, -1,
+                            (char *)bytes, length, NULL, NULL) != length)
+        minyar_stop("a program argument could not be converted to UTF-8.");
+    return new_text(bytes, (long long)length - 1, -1);
+#else
     return copy_c_text(saved_argument_values[position + 1]);
+#endif
 }
 
 static long long text_file_length(FILE *file) {
