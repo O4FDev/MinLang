@@ -36,7 +36,8 @@ if [ -d "$findings" ]; then
 fi
 export AFL_SKIP_CPUFREQ=1
 export AFL_NO_UI=1
-export ASAN_OPTIONS=abort_on_error=1:detect_leaks=0:symbolize=1
+# AFL++ requires ASan symbolization to be disabled during the campaign.
+export ASAN_OPTIONS=abort_on_error=1:detect_leaks=0:symbolize=0
 "$afl_fuzz" -V "$seconds" -m none -t 5000+ \
     -x "$project_dir/tests/fuzz-corpus/minyar.dict" \
     -i "$project_dir/tests/fuzz-corpus/inputs" -o "$findings" \

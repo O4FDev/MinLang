@@ -1,3 +1,7 @@
+/* The included runtime needs GNU pthread declarations before any libc header. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
+#endif
 #include <alloca.h>
 #include <assert.h>
 #include <stdint.h>
