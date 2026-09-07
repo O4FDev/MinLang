@@ -145,6 +145,19 @@ print(slice(1))
         self.assertEqual(write_missing.returncode, 1)
         self.assertIn(b'could not be created', write_missing.stderr)
 
+    def test_file_read_preserves_first_byte_and_empty_files(self):
+        result, llvm = self.compile('print(readTextFile(argument(0)))\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        exe = llvm.with_suffix('.exe')
+        subprocess.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], check=True, capture_output=True, timeout=30)
+        path = self.directory / 'contents.txt'
+        for contents in (b'', b'A', 'é🙂'.encode('utf-8'), b'first\r\nsecond\n'):
+            with self.subTest(contents=contents):
+                path.write_bytes(contents)
+                run = subprocess.run([str(exe), str(path)], capture_output=True, timeout=RUN_TIMEOUT)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(run.stdout, contents + b'\n')
+
     @unittest.skipIf(os.name == 'nt', 'closing a child descriptor uses POSIX preexec_fn')
     def test_closed_standard_output_is_reported(self):
         result, llvm = self.compile('print("unwritten")\n')
@@ -193,14 +206,16 @@ print(slice(1))
     def test_unicode_files_and_arguments(self):
         path = self.directory / 'unicode.txt'
         path.write_text('é🙂', encoding='utf-8')
-        source = 'let argumentText = argument(0)\nlet fileText = readTextFile(argument(1))\nprint(argumentText[0])\nprint(fileText[1])\n'
+        source = 'let argumentText = argument(0)\nlet fileText = readTextFile(argument(1))\nprint(argumentText)\nprint(argumentText[0])\nprint(fileText[1])\n'
         result, llvm = self.compile(source)
         self.assertEqual(result.returncode, 0, result.stderr)
         exe = llvm.with_suffix('.exe')
         subprocess.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], check=True, capture_output=True, timeout=30)
-        run = subprocess.run([str(exe), 'é🙂', str(path)], capture_output=True, timeout=RUN_TIMEOUT)
-        self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertEqual(run.stdout, 'é\n🙂\n'.encode('utf-8'))
+        for argument in ('é🙂', 'é🙂 with spaces', 'é🙂 "quoted" \\end\\'):
+            with self.subTest(argument=argument):
+                run = subprocess.run([str(exe), argument, str(path)], capture_output=True, timeout=RUN_TIMEOUT)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(run.stdout, f'{argument}\né\n🙂\n'.encode('utf-8'))
 
     def test_invalid_arithmetic_and_ordering(self):
         for operator in ('+', '-', '*', '/', '%'):
