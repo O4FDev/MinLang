@@ -145,6 +145,19 @@ print(slice(1))
         self.assertEqual(write_missing.returncode, 1)
         self.assertIn(b'could not be created', write_missing.stderr)
 
+    def test_file_read_preserves_first_byte_and_empty_files(self):
+        result, llvm = self.compile('print(readTextFile(argument(0)))\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        exe = llvm.with_suffix('.exe')
+        subprocess.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], check=True, capture_output=True, timeout=30)
+        path = self.directory / 'contents.txt'
+        for contents in (b'', b'A', 'é🙂'.encode('utf-8'), b'first\r\nsecond\n'):
+            with self.subTest(contents=contents):
+                path.write_bytes(contents)
+                run = subprocess.run([str(exe), str(path)], capture_output=True, timeout=RUN_TIMEOUT)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(run.stdout, contents + b'\n')
+
     @unittest.skipIf(os.name == 'nt', 'closing a child descriptor uses POSIX preexec_fn')
     def test_closed_standard_output_is_reported(self):
         result, llvm = self.compile('print("unwritten")\n')

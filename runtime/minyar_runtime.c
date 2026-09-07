@@ -22,6 +22,8 @@
 #include <stdint.h>
 #include <signal.h>
 #ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
 #include <windows.h>
 #elif defined(__linux__) || defined(__APPLE__)
 #include <pthread.h>
@@ -1165,6 +1167,12 @@ MinyarText *minyar_boolean_text(_Bool boolean) {
 void minyar_initialize_arguments(int count, char **values) {
     saved_argument_count = count;
     saved_argument_values = values;
+#ifdef _WIN32
+    /* Text output is UTF-8 with LF newlines on every platform. */
+    if (_setmode(_fileno(stdout), _O_BINARY) == -1 ||
+        _setmode(_fileno(stderr), _O_BINARY) == -1)
+        minyar_stop("standard output could not be configured.");
+#endif
 #ifdef SIGPIPE
     /* Turn a closed output pipe into the same checked I/O failure as EBADF. */
     signal(SIGPIPE, SIG_IGN);
@@ -1182,6 +1190,11 @@ MinyarText *minyar_argument(long long position) {
 }
 
 static long long text_file_length(FILE *file) {
+    /* Some filesystems allow seeking directories and report a huge offset.
+     * Check readability before treating that offset as an allocation size.
+     * The seek below restores the first byte and clears EOF for empty files. */
+    if (fgetc(file) == EOF && ferror(file))
+        minyar_stop("a requested text file could not be read.");
 #ifdef _WIN32
     __int64 length;
     if (_fseeki64(file, 0, SEEK_END) != 0 || (length = _ftelli64(file)) < 0 ||
