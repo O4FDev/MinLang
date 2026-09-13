@@ -2,8 +2,8 @@
  * cleanup is drained here solely to distinguish debt from leaked ownership.
  * Explicit language exit/runtime errors do not unwind, so are checked by the
  * invoking test's exit-status oracle instead. Never ship this runtime. */
-#if defined(MINYAR_LAZY_HEAP) && defined(__linux__) && !defined(_DEFAULT_SOURCE)
-#define _DEFAULT_SOURCE 1
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
 #endif
 #include <stdlib.h>
 #include <assert.h>

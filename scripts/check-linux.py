@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ['build/minyarc', 'build/compiler-stage3.ll', 'build/minyarc-sanitize',
@@ -30,7 +31,11 @@ TARGETS = ['check-ownership-policy', 'check-stack-ownership', 'check-runtime-cac
            'check-mutation', 'check-mutation-score', 'check-binary-expressions', 'check-ownership',
            'check-adversarial', 'check-recursive-data', 'check-scalar-record-storage',
            'check-readonly-parameters', 'check-compact-ownership', 'check-integer-text-cache',
-           'check-tokenizer-storage']
+           'check-tokenizer-storage', 'check-temporary-owner-admission',
+           'check-compiler-slice-cache', 'check-memory-contracts-harness',
+           'check-ownership-mutation', 'check-scalar-record-initialization',
+           'check-incremental-modules', 'check-incremental-modules-sanitize',
+           'check-sanitize']
 DIRECTORIES = ('bootstrap', 'src', 'runtime', 'vendor', 'examples', 'tests',
                'experiments', 'scripts', 'tools')
 
@@ -182,6 +187,7 @@ def main():
         report['checks'].append(row)
         save()
         print(label, flush=True)
+        started = time.monotonic()
         with log.open('w') as output:
             output.write('$ ' + shlex.join(command) + '\n')
             output.flush()
@@ -195,9 +201,11 @@ def main():
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
                 row.update(returncode=None, timed_out=True)
+        row['duration_seconds'] = round(time.monotonic() - started, 3)
         save()
         if row['returncode'] != 0:
             raise RuntimeError(label + ' failed; see ' + str(log))
+        print(f"{label}: passed ({row['duration_seconds']:.3f}s)", flush=True)
 
     save()
     try:
@@ -211,9 +219,6 @@ def main():
         check('runtime-unit-sanitize', ['./build/runtime-unit-sanitize'])
         for target in TARGETS:
             check(target, make + [target])
-        if (work / 'tests/scalar-record-initialization.py').is_file():
-            check('scalar-constructor-selection', [sys.executable, 'tests/scalar-record-initialization.py',
-                  '--compiler', 'build/minyarc', '--runtime', 'build/ownership-runtime.o', '--sanitize'])
         check('regressions-sanitize', [sys.executable, 'tests/regressions.py'],
               {'MINYAR_TEST_COMPILER': str(work / 'build/minyarc-sanitize'),
                'MINYAR_TEST_RUNTIME': str(work / 'build/minyar-runtime-sanitize.o'),

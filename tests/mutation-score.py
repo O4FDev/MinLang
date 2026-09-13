@@ -158,7 +158,7 @@ def main() -> int:
 
     viable = [row for row in outcomes if row["outcome"] != "stillborn"]
     killed = [row for row in viable if row["outcome"] == "killed"]
-    score = round(100.0 * len(killed) / len(viable), 2) if viable else 100.0
+    score = round(100.0 * len(killed) / len(viable), 2) if viable else None
     report = {
         "discovered_sites": len(all_sites),
         "selected_sites": len(selected),
@@ -172,6 +172,9 @@ def main() -> int:
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({key: value for key, value in report.items() if key != "outcomes"}, indent=2))
     print(f"mutation evidence: {report_path}")
+    if not viable:
+        print("mutation gate failed: no viable mutants were tested", file=os.sys.stderr)
+        return 1
     if score < arguments.minimum_score:
         print(f"mutation score {score}% is below required {arguments.minimum_score}%", file=os.sys.stderr)
         return 1
