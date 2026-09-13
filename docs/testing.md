@@ -111,6 +111,16 @@ UCRT64. The portable gate includes the byte-identical compiler fixed point,
 feature conformance, exact diagnostic snapshots, deterministic grammar fuzzing,
 and graceful compiler/program stack exhaustion.
 
+The Linux matrix also runs incremental-module correctness natively and with
+sanitizers, temporary-owner admission, compiler slice-cache checks, the memory
+contract harness, ownership mutation checks, and both scalar-constructor modes.
+After correctness passes, `scripts/check-linux-leaks.py` replays the eligible
+runtime fixtures with LeakSanitizer enabled, first verifying that the detector
+rejects a deliberate leak. Compiler arenas remain excluded from leak replay.
+Linux uploads JSON reports and detailed logs on both success and failure;
+each top-level correctness check also prints its result and elapsed time.
+Performance and RSS ceilings remain separate from this hosted-runner matrix.
+
 Linux also runs two independent verification jobs. `make check-coverage`
 measures SanitizerCoverage control-flow edges directly in the self-hosted
 compiler IR and LLVM source coverage for runtime lines and branches. The
@@ -126,6 +136,12 @@ fuzzing, and module tests against each viable mutant. Stillborn mutants are
 excluded rather than counted as killed. The current 16-mutant score is 100%
 (16/16), with an 85% regression floor and a machine-readable
 `build/mutation-score.json`.
+
+A campaign with no viable mutants fails even when the score floor is zero,
+and records a null score rather than a percentage.
+`make check-mutation-score-harness` verifies failed and timed-out mutant builds,
+empty discovery, surviving and killed mutants, and exclusion of stillborn
+mutants. It runs before the real mutation-score campaign.
 
 ## Fuzzing
 

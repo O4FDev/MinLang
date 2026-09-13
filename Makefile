@@ -287,7 +287,11 @@ check-portable: check-smoke check-regressions check-diagnostics check-conformanc
 check-mutation: build/stage0 build/minyarc build/minyar-runtime.o
 	$(LIMITED) python3 tests/mutation.py
 
-check-mutation-score: build/stage0 build/minyarc build/minyar-compiler-runtime.ll build/minyar-runtime.o
+.PHONY: check-mutation-score-harness
+check-mutation-score-harness:
+	python3 tests/mutation-score-harness.py
+
+check-mutation-score: check-mutation-score-harness build/stage0 build/minyarc build/minyar-compiler-runtime.ll build/minyar-runtime.o
 	MINYAR_MIN_MUTATION_SCORE=$(MIN_MUTATION_SCORE) $(LIMITED) python3 tests/mutation-score.py
 
 check-performance: build/minyarc build/minyar-runtime.o build/compiler-stage3.ll
