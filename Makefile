@@ -276,6 +276,10 @@ check-coverage: build/minyarc build/minyar-runtime.o
 check-stack-overflow: build/minyarc build/minyar-runtime.o
 	$(LIMITED) python3 tests/stack-overflow.py
 
+.PHONY: check-stack-overflow-sanitize
+check-stack-overflow-sanitize: runtime/minyar_runtime.c $(RUNTIME_HEADERS)
+	$(SANITIZER_LIMITED) python3 tests/stack-guard-sanitizer.py --clang "$(LLVM_CC)"
+
 # Cross-platform per-commit gate. Heavier memory-profile and performance
 # matrices remain in the Linux evidence runner and the full `make check` gate.
 check-windows-large-file:
@@ -339,7 +343,7 @@ check-sanitized-fixed-point: build/minyarc-sanitize build/compiler-stage3.ll
 	cmp build/compiler-stage2.ll build/compiler-sanitized.ll
 	cmp build/compiler-stage3.ll build/compiler-sanitized.ll
 
-check-sanitize: check-generated-sanitizer check-sanitized-fixed-point build/minyar-runtime.o build/minyar-runtime-sanitize.o build/runtime-unit-sanitize
+check-sanitize: check-generated-sanitizer check-sanitized-fixed-point check-stack-overflow-sanitize build/minyar-runtime.o build/minyar-runtime-sanitize.o build/runtime-unit-sanitize
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize $(SANITIZER_LIMITED) sh tests/run-module-tests.sh
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) python3 tests/fuzz.py --compiler build/minyarc-sanitize --cases 100 --hostile-timeout 15
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/runtime-unit-sanitize

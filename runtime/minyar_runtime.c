@@ -40,10 +40,12 @@
 #define MINYAR_COLD __attribute__((noinline, cold))
 #define MINYAR_NORETURN __attribute__((noreturn))
 #define MINYAR_HOT static inline __attribute__((always_inline))
+#define MINYAR_NO_ADDRESS_SANITIZE __attribute__((no_sanitize_address))
 #else
 #define MINYAR_COLD
 #define MINYAR_NORETURN
 #define MINYAR_HOT static inline
+#define MINYAR_NO_ADDRESS_SANITIZE
 #endif
 
 typedef struct MinyarText {
@@ -141,7 +143,10 @@ static void minyar_find_stack_bounds(void) {
 #endif
 }
 
-void minyar_stack_enter(void) {
+/* ASan's use-after-return mode moves address-taken locals to a fake stack.
+ * Keep this marker on the native stack so the guard can measure its actual
+ * distance from the thread's guard page. */
+MINYAR_NO_ADDRESS_SANITIZE void minyar_stack_enter(void) {
     unsigned char stack_marker;
     uintptr_t current = (uintptr_t)&stack_marker;
     minyar_find_stack_bounds();
