@@ -42,6 +42,7 @@ static FloatBuffer lines, overlay;
 enum { OVERLAY_FLOATS = 9 };
 static float view_projection[16], camera[3], fog_color[3] = {0.6f, 0.75f, 0.95f}, fog_range[2] = {1e6f, 1e6f + 1};
 static int texture_width = 1, texture_height = 1;
+static float light_level = 1.0f;
 static unsigned char key_down[KEY_COUNT], key_pressed[KEY_COUNT];
 static unsigned char button_down[BUTTON_COUNT], button_pressed[BUTTON_COUNT];
 static double mouse_x, mouse_y, mouse_move_x, mouse_move_y, scroll_total;
@@ -130,12 +131,13 @@ static const char *world_fragment_source =
     "uniform sampler2D atlas;\n"
     "uniform vec3 fogColor;\n"
     "uniform vec2 fogRange;\n"
+    "uniform float light;\n"
     "out vec4 result;\n"
     "void main() {\n"
     "    vec4 texel = texture(atlas, fragmentUv);\n"
     "    if (texel.a < 0.5) discard;\n"
     "    float fog = clamp((fragmentDistance - fogRange.x) / (fogRange.y - fogRange.x), 0.0, 1.0);\n"
-    "    result = vec4(mix(texel.rgb * fragmentColor, fogColor, fog), 1.0);\n"
+    "    result = vec4(mix(texel.rgb * fragmentColor * light, fogColor, fog), 1.0);\n"
     "}\n";
 
 static const char *overlay_vertex_source =
@@ -567,6 +569,10 @@ void minyar_graphics_setFog(double red, double green, double blue, double start,
     fog_range[1] = end > start ? (float)end : (float)start + 1.0f;
 }
 
+void minyar_graphics_setLight(double level) {
+    light_level = (float)(level < 0 ? 0 : level);
+}
+
 void minyar_graphics_setTexture(const MinyarBytes *pixels, long long width, long long height) {
     require_window();
     if (width < 1 || height < 1 || width > 8192 || height > 8192 || pixels->byte_length != width * height * 4)
@@ -624,6 +630,7 @@ static void use_world_program(void) {
     glUniform3fv(glGetUniformLocation(world_program, "camera"), 1, camera);
     glUniform3fv(glGetUniformLocation(world_program, "fogColor"), 1, fog_color);
     glUniform2fv(glGetUniformLocation(world_program, "fogRange"), 1, fog_range);
+    glUniform1f(glGetUniformLocation(world_program, "light"), light_level);
     glUniform1i(glGetUniformLocation(world_program, "atlas"), 0);
     glActiveTexture(GL_TEXTURE0);
 }

@@ -4,7 +4,8 @@
 //
 // Mouse to look, WASD to move, Space to jump, Shift to sprint (or descend
 // while flying), F to fly, left click to break, right click to place, 1-9 or
-// the scroll wheel to choose a block, Escape to free the mouse.
+// the scroll wheel to choose a block, T to speed up time, Escape to free the
+// mouse. The game saves every minute and on quitting; --new starts afresh.
 
 use "graphics" as graphics
 use "./blocks.min" as blocks
@@ -12,10 +13,13 @@ use "./terrain.min" as terrain
 use "./meshing.min" as meshing
 use "./physics.min" as physics
 use "./textures.min" as textures
+use "./atmosphere.min" as atmosphere
+use "./save.min" as save
 
 constant REACH = 6.0
 constant MOUSE_SENSITIVITY = 0.0025
 constant CHUNKS_PER_FRAME = 4
+constant AUTOSAVE_SECONDS = 60.0
 
 function axis(positive: Integer, negative: Integer): Float {
     let value = 0.0
@@ -64,11 +68,33 @@ function drawCrosshair() {
     graphics.drawRectangle(cx - 1.0, cy - 9.0, 2.0, 18.0, 1.0, 1.0, 1.0, 0.85)
 }
 
+// ./craft --screenshot image.png [sunrise|noon|sunset|night] saves one early
+// frame of a fresh world and exits.
+let screenshot = ""
+let startTime = 0.08
+let fresh = false
+if argumentCount() >= 2 && argument(0) == "--screenshot" {
+    screenshot = argument(1)
+    fresh = true
+    if argumentCount() == 3 {
+        if argument(2) == "sunrise" { startTime = 0.0 }
+        if argument(2) == "noon" { startTime = 0.25 }
+        if argument(2) == "sunset" { startTime = 0.49 }
+        if argument(2) == "night" { startTime = 0.7 }
+    }
+}
+if argumentCount() == 1 && argument(0) == "--new" {
+    fresh = true
+}
+
 graphics.openWindow(1280, 760, "Minyarcraft")
 graphics.setTexture(textures.build(), textures.ATLAS_SIZE, textures.ATLAS_SIZE)
 
 let world = terrain.create(20260923)
-terrain.generate(world)
+let loaded = !fresh && save.loadWorld(world)
+if !loaded {
+    terrain.generate(world)
+}
 let meshes: List<Integer> = []
 for chunk in 0..world.dirty.length {
     meshes.add(graphics.createMesh())
@@ -76,18 +102,19 @@ for chunk in 0..world.dirty.length {
 let vertices = Bytes()
 remesh(world, meshes, vertices, world.dirty.length)
 
+let sky = atmosphere.create(startTime)
 let player = physics.spawn(world)
+if loaded {
+    save.loadPlayer(player, sky)
+}
 let hotbar = [blocks.GRASS, blocks.DIRT, blocks.STONE, blocks.COBBLESTONE, blocks.PLANKS, blocks.LOG, blocks.LEAVES, blocks.GLASS, blocks.BRICK]
 let selected = 0
 let numberKeys = [graphics.KEY_1, graphics.KEY_2, graphics.KEY_3, graphics.KEY_4, graphics.KEY_5, graphics.KEY_6, graphics.KEY_7, graphics.KEY_8, graphics.KEY_9]
 let frames = 0
 let clock = 0.0
 let frameNumber = 0
-// ./craft --screenshot image.png saves the first frames' view and exits.
-let screenshot = ""
-if argumentCount() == 2 && argument(0) == "--screenshot" {
-    screenshot = argument(1)
-} else {
+let sinceSave = 0.0
+if screenshot == "" {
     graphics.captureMouse(true)
 }
 
@@ -107,6 +134,11 @@ while graphics.nextFrame() {
         graphics.setTitle("Minyarcraft  " + Text(frames) + " fps  x " + Text(Integer(floor(player.x))) + " y " + Text(Integer(floor(player.y))) + " z " + Text(Integer(floor(player.z))) + "  " + blocks.name(hotbar[selected]))
         frames = 0
         clock -= 1.0
+    }
+    sinceSave += seconds
+    if screenshot == "" && sinceSave >= AUTOSAVE_SECONDS {
+        save.store(world, player, sky)
+        sinceSave = 0.0
     }
 
     // Input
@@ -136,6 +168,11 @@ while graphics.nextFrame() {
         player.flying = !player.flying
         player.velocityY = 0.0
     }
+    let timeSpeed = 1.0
+    if graphics.keyDown(graphics.KEY_T) {
+        timeSpeed = 40.0
+    }
+    atmosphere.advance(sky, seconds, timeSpeed)
 
     let forward = axis(graphics.KEY_W, graphics.KEY_S)
     let strafe = axis(graphics.KEY_D, graphics.KEY_A)
@@ -161,19 +198,19 @@ while graphics.nextFrame() {
     remesh(world, meshes, vertices, CHUNKS_PER_FRAME)
 
     // Drawing
-    let skyRed = 0.53
-    let skyGreen = 0.72
-    let skyBlue = 0.98
-    if player.inWater && terrain.get(world, Integer(floor(player.x)), Integer(floor(player.y + physics.EYE_HEIGHT)), Integer(floor(player.z))) == blocks.WATER {
-        skyRed = 0.1
-        skyGreen = 0.25
-        skyBlue = 0.6
-        graphics.setFog(skyRed, skyGreen, skyBlue, 1.0, 14.0)
+    let eyeX = player.x
+    let eyeY = player.y + physics.EYE_HEIGHT
+    let eyeZ = player.z
+    let underwater = terrain.get(world, Integer(floor(eyeX)), Integer(floor(eyeY)), Integer(floor(eyeZ))) == blocks.WATER
+    graphics.clear(sky.red, sky.green, sky.blue)
+    graphics.setCamera(eyeX, eyeY, eyeZ, player.yaw, player.pitch, 75.0)
+    atmosphere.draw(sky, eyeX, eyeY, eyeZ)
+    if underwater {
+        graphics.setFog(0.1 * sky.light, 0.25 * sky.light, 0.6 * sky.light, 1.0, 14.0)
     } else {
-        graphics.setFog(skyRed, skyGreen, skyBlue, 70.0, 130.0)
+        graphics.setFog(sky.red, sky.green, sky.blue, 70.0, 130.0)
     }
-    graphics.clear(skyRed, skyGreen, skyBlue)
-    graphics.setCamera(player.x, player.y + physics.EYE_HEIGHT, player.z, player.yaw, player.pitch, 75.0)
+    graphics.setLight(sky.light)
     for mesh in meshes {
         graphics.drawMesh(mesh)
     }
@@ -185,4 +222,8 @@ while graphics.nextFrame() {
     }
     drawCrosshair()
     drawHotbar(hotbar, selected)
+}
+
+if screenshot == "" {
+    save.store(world, player, sky)
 }

@@ -1,0 +1,169 @@
+// Time of day: the sky colour, how bright the world is, the sun and moon, and
+// clouds drifting overhead.
+
+use "graphics" as graphics
+use "./blocks.min" as blocks
+use "./noise.min" as noise
+
+constant DAY_SECONDS = 600.0
+constant TAU = 6.283185307179586
+constant CLOUD_HEIGHT = 108.0
+constant CLOUD_CELL = 12.0
+constant CLOUD_SPEED = 1.2
+
+// `time` runs from 0 to 1 over a day: 0 is sunrise, 0.25 noon, 0.5 sunset and
+// 0.75 midnight.
+public record Sky {
+    time: Float
+    red: Float
+    green: Float
+    blue: Float
+    light: Float
+    bodies: Integer
+    clouds: Integer
+    cloudDrift: Float
+    cloudTimer: Float
+    vertices: Bytes
+}
+
+public function create(time: Float): Sky {
+    let sky = Sky {
+        time: time
+        red: 0.0
+        green: 0.0
+        blue: 0.0
+        light: 1.0
+        bodies: graphics.createMesh()
+        clouds: graphics.createMesh()
+        cloudDrift: 0.0
+        cloudTimer: 0.0
+        vertices: Bytes()
+    }
+    advance(sky, 0.0, 1.0)
+    buildClouds(sky)
+    return sky
+}
+
+function blend(from: Float, to: Float, amount: Float): Float {
+    return from + (to - from) * amount
+}
+
+// Move time forward; `speed` multiplies how fast the day passes.
+public function advance(sky: Sky, seconds: Float, speed: Float) {
+    sky.time = (sky.time + seconds * speed / DAY_SECONDS) % 1.0
+    let height = sin(sky.time * TAU)
+    let day = clamp(height * 2.5 + 0.35, 0.0, 1.0)
+    sky.light = 0.2 + 0.8 * day
+    let glow = clamp(1.0 - abs(height) * 4.0, 0.0, 1.0) * 0.55
+    sky.red = blend(blend(0.02, 0.53, day), 0.96, glow)
+    sky.green = blend(blend(0.03, 0.72, day), 0.56, glow)
+    sky.blue = blend(blend(0.09, 0.98, day), 0.36, glow)
+    sky.cloudDrift += seconds * CLOUD_SPEED
+    sky.cloudTimer += seconds
+    if sky.cloudTimer > 0.25 {
+        sky.cloudTimer = 0.0
+        buildClouds(sky)
+    }
+}
+
+// A square 400 blocks from the camera toward the unit direction (dx, dy, dz),
+// drawn from both sides.
+function body(vertices: Bytes, cx: Float, cy: Float, cz: Float, dx: Float, dy: Float, dz: Float, size: Float, tile: Integer) {
+    // Right is perpendicular to the direction and the z axis; up completes the frame.
+    let rightLength = sqrt(dy * dy + dx * dx)
+    let rx = dy / rightLength
+    let ry = -dx / rightLength
+    let ux = -dz * ry * size
+    let uy = dz * rx * size
+    let uz = (dx * ry - dy * rx) * size
+    rx *= size
+    ry *= size
+    let x = cx + dx * 400.0
+    let y = cy + dy * 400.0
+    let z = cz + dz * 400.0
+    let u0 = Float(tile % 16) / 16.0
+    let v0 = Float(tile / 16) / 16.0
+    let u1 = u0 + 0.0625
+    let v1 = v0 + 0.0625
+    let ax = x - rx - ux
+    let ay = y - ry - uy
+    let az = z - uz
+    let bx = x + rx - ux
+    let by = y + ry - uy
+    let bz = z - uz
+    let ex = x + rx + ux
+    let ey = y + ry + uy
+    let ez = z + uz
+    let fx = x - rx + ux
+    let fy = y - ry + uy
+    let fz = z + uz
+    graphics.addVertex(vertices, ax, ay, az, u0, v1, 1.0, 1.0, 1.0)
+    graphics.addVertex(vertices, bx, by, bz, u1, v1, 1.0, 1.0, 1.0)
+    graphics.addVertex(vertices, ex, ey, ez, u1, v0, 1.0, 1.0, 1.0)
+    graphics.addVertex(vertices, ax, ay, az, u0, v1, 1.0, 1.0, 1.0)
+    graphics.addVertex(vertices, ex, ey, ez, u1, v0, 1.0, 1.0, 1.0)
+    graphics.addVertex(vertices, fx, fy, fz, u0, v0, 1.0, 1.0, 1.0)
+    graphics.addVertex(vertices, ax, ay, az, u0, v1, 1.0, 1.0, 1.0)
+    graphics.addVertex(vertices, ex, ey, ez, u1, v0, 1.0, 1.0, 1.0)
+    graphics.addVertex(vertices, bx, by, bz, u1, v1, 1.0, 1.0, 1.0)
+    graphics.addVertex(vertices, ax, ay, az, u0, v1, 1.0, 1.0, 1.0)
+    graphics.addVertex(vertices, fx, fy, fz, u0, v0, 1.0, 1.0, 1.0)
+    graphics.addVertex(vertices, ex, ey, ez, u1, v0, 1.0, 1.0, 1.0)
+}
+
+function cloudQuad(vertices: Bytes, x: Float, z: Float, size: Float, shade: Float, u: Float, v: Float) {
+    let x1 = x + size
+    let z1 = z + size
+    let y = CLOUD_HEIGHT
+    graphics.addVertex(vertices, x, y, z, u, v, shade, shade, shade)
+    graphics.addVertex(vertices, x, y, z1, u, v, shade, shade, shade)
+    graphics.addVertex(vertices, x1, y, z1, u, v, shade, shade, shade)
+    graphics.addVertex(vertices, x, y, z, u, v, shade, shade, shade)
+    graphics.addVertex(vertices, x1, y, z1, u, v, shade, shade, shade)
+    graphics.addVertex(vertices, x1, y, z, u, v, shade, shade, shade)
+    let under = shade * 0.8
+    graphics.addVertex(vertices, x, y, z, u, v, under, under, under)
+    graphics.addVertex(vertices, x1, y, z1, u, v, under, under, under)
+    graphics.addVertex(vertices, x, y, z1, u, v, under, under, under)
+    graphics.addVertex(vertices, x, y, z, u, v, under, under, under)
+    graphics.addVertex(vertices, x1, y, z, u, v, under, under, under)
+    graphics.addVertex(vertices, x1, y, z1, u, v, under, under, under)
+}
+
+function buildClouds(sky: Sky) {
+    let vertices = sky.vertices
+    vertices.clear()
+    let shift = Integer(floor(sky.cloudDrift / CLOUD_CELL))
+    let offset = sky.cloudDrift - Float(shift) * CLOUD_CELL
+    let u = Float(blocks.TILE_CLOUD % 16) / 16.0 + 0.03
+    let v = Float(blocks.TILE_CLOUD / 16) / 16.0 + 0.03
+    for cellZ in -20..40 {
+        for cellX in -20..40 {
+            let density = noise.fractalNoise(Float(cellX + shift) / 5.0, Float(cellZ) / 5.0, 31337, 2)
+            if density > 0.58 {
+                cloudQuad(vertices, Float(cellX) * CLOUD_CELL - offset, Float(cellZ) * CLOUD_CELL, CLOUD_CELL, 1.0, u, v)
+            }
+        }
+    }
+    graphics.updateMesh(sky.clouds, vertices)
+}
+
+// Draw the sun, moon, and clouds around a camera, then restore fog for the world.
+public function draw(sky: Sky, x: Float, y: Float, z: Float) {
+    let angle = sky.time * TAU
+    let dx = cos(angle)
+    let dy = sin(angle)
+    let dz = 0.3
+    let length = sqrt(dx * dx + dy * dy + dz * dz)
+    let vertices = sky.vertices
+    vertices.clear()
+    body(vertices, x, y, z, dx / length, dy / length, dz / length, 34.0, blocks.TILE_SUN)
+    body(vertices, x, y, z, -dx / length, -dy / length, -dz / length, 24.0, blocks.TILE_MOON)
+    graphics.updateMesh(sky.bodies, vertices)
+    graphics.setLight(1.0)
+    graphics.setFog(sky.red, sky.green, sky.blue, 5000.0, 6000.0)
+    graphics.drawMesh(sky.bodies)
+    graphics.setLight(sky.light)
+    graphics.setFog(sky.red, sky.green, sky.blue, 160.0, 420.0)
+    graphics.drawMesh(sky.clouds)
+}

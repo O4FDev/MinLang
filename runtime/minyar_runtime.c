@@ -1706,3 +1706,16 @@ void minyar_write_bytes_file(const MinyarText *path_text, const MinyarBytes *con
         (size_t)contents->byte_length || fclose(file) != 0)
         minyar_stop("a requested file could not be written.");
 }
+
+_Bool minyar_file_exists(const MinyarText *path_text) {
+    char *path = text_as_path(path_text);
+    FILE *file = fopen(path, "rb");
+#if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
+    rc_heap_deallocate(path);
+#else
+    free(path);
+#endif
+    if (!file) return 0;
+    fclose(file);
+    return 1;
+}
