@@ -8,9 +8,12 @@ public constant CHUNKS_X = 32
 public constant CHUNKS_Z = 32
 public constant HEIGHT = 80
 public constant SEA_LEVEL = 30
+public constant TORCH_REACH = 8
 
 // Blocks are one byte each, stored in rows of x, then z, then layers of y.
 // A chunk is a 16 by 16 column of the world that is meshed as one piece.
+// `tops` holds the highest opaque block of each column, for sky light, and
+// `torches` the block index of every torch.
 public record World {
     blocks: Bytes
     sizeX: Integer
@@ -18,6 +21,8 @@ public record World {
     height: Integer
     seed: Integer
     dirty: List<Boolean>
+    tops: List<Integer>
+    torches: List<Integer>
 }
 
 public function create(seed: Integer): World {
@@ -27,6 +32,10 @@ public function create(seed: Integer): World {
     for chunk in 0..CHUNKS_X * CHUNKS_Z {
         dirty.add(true)
     }
+    let tops: List<Integer> = []
+    for column in 0..sizeX * sizeZ {
+        tops.add(-1)
+    }
     return World {
         blocks: Bytes(sizeX * sizeZ * HEIGHT)
         sizeX: sizeX
@@ -34,6 +43,8 @@ public function create(seed: Integer): World {
         height: HEIGHT
         seed: seed
         dirty: dirty
+        tops: tops
+        torches: []
     }
 }
 
@@ -48,21 +59,99 @@ public function get(world: World, x: Integer, y: Integer, z: Integer): Integer {
     return world.blocks[(y * world.sizeZ + z) * world.sizeX + x]
 }
 
-// Change a block and mark every chunk whose mesh can show it.
+// Change a block and mark every chunk whose mesh can show it, including
+// meshes whose lighting depends on it.
 public function set(world: World, x: Integer, y: Integer, z: Integer, block: Integer) {
     if !inside(world, x, y, z) {
         return
     }
-    world.blocks[(y * world.sizeZ + z) * world.sizeX + x] = block
-    let chunkX = x / CHUNK_SIZE
-    let chunkZ = z / CHUNK_SIZE
-    markDirty(world, chunkX, chunkZ)
-    let localX = x % CHUNK_SIZE
-    let localZ = z % CHUNK_SIZE
-    if localX == 0 { markDirty(world, chunkX - 1, chunkZ) }
-    if localX == CHUNK_SIZE - 1 { markDirty(world, chunkX + 1, chunkZ) }
-    if localZ == 0 { markDirty(world, chunkX, chunkZ - 1) }
-    if localZ == CHUNK_SIZE - 1 { markDirty(world, chunkX, chunkZ + 1) }
+    let index = (y * world.sizeZ + z) * world.sizeX + x
+    let previous = world.blocks[index]
+    world.blocks[index] = block
+    let reach = 1
+    if previous == blocks.TORCH || block == blocks.TORCH {
+        updateTorches(world, index, block == blocks.TORCH)
+        reach = TORCH_REACH
+    }
+    let oldTop = world.tops[z * world.sizeX + x]
+    updateTop(world, x, z)
+    if world.tops[z * world.sizeX + x] != oldTop && reach < 4 {
+        reach = 4
+    }
+    let lowX = (x - reach) / CHUNK_SIZE
+    let highX = (x + reach) / CHUNK_SIZE
+    let lowZ = (z - reach) / CHUNK_SIZE
+    let highZ = (z + reach) / CHUNK_SIZE
+    if x - reach < 0 { lowX = -1 }
+    if z - reach < 0 { lowZ = -1 }
+    for chunkZ in lowZ..highZ + 1 {
+        for chunkX in lowX..highX + 1 {
+            markDirty(world, chunkX, chunkZ)
+        }
+    }
+}
+
+function updateTorches(world: World, index: Integer, present: Boolean) {
+    if present {
+        world.torches.add(index)
+        return
+    }
+    let kept: List<Integer> = []
+    for torch in world.torches {
+        if torch != index {
+            kept.add(torch)
+        }
+    }
+    world.torches = kept
+}
+
+// Recompute the highest opaque block of one column.
+public function updateTop(world: World, x: Integer, z: Integer) {
+    let y = world.height - 1
+    while y >= 0 && !blocks.isOpaque(world.blocks[(y * world.sizeZ + z) * world.sizeX + x]) {
+        y -= 1
+    }
+    world.tops[z * world.sizeX + x] = y
+}
+
+// Scan the whole world for column tops and torches, after generating or loading.
+public function prepareLighting(world: World) {
+    for z in 0..world.sizeZ {
+        for x in 0..world.sizeX {
+            updateTop(world, x, z)
+        }
+    }
+    let torches: List<Integer> = []
+    let index = 0
+    for block in world.blocks {
+        if block == blocks.TORCH {
+            torches.add(index)
+        }
+        index += 1
+    }
+    world.torches = torches
+}
+
+public function top(world: World, x: Integer, z: Integer): Integer {
+    if x < 0 || z < 0 || x >= world.sizeX || z >= world.sizeZ {
+        return -1
+    }
+    return world.tops[z * world.sizeX + x]
+}
+
+// How much daylight reaches a cell: full under open sky, less beside an
+// opening, and a little everywhere else.
+public function skyLight(world: World, x: Integer, y: Integer, z: Integer): Float {
+    if y > top(world, x, z) {
+        return 1.0
+    }
+    let level = 0.1
+    for distance in 1..4 {
+        if y > top(world, x + distance, z) || y > top(world, x - distance, z) || y > top(world, x, z + distance) || y > top(world, x, z - distance) {
+            return 0.85 - Float(distance) * 0.2
+        }
+    }
+    return level
 }
 
 public function markDirty(world: World, chunkX: Integer, chunkZ: Integer) {

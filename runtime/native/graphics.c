@@ -3,9 +3,11 @@
  * input, and a small OpenGL 3.3 renderer for textured meshes, lines and a 2D
  * overlay. Minyar code reaches these functions through library/graphics.min.
  *
- * Mesh vertices are 32 bytes: position x, y, z, texture u, v and colour
- * r, g, b, each a little-endian Float32. The colour multiplies the texel, so
- * it also carries lighting. Texels with alpha below one half are discarded.
+ * Mesh vertices are 40 bytes: position x, y, z, texture u, v, colour r, g, b,
+ * sky and glow, each a little-endian Float32. A texel is multiplied by the
+ * colour and by sky * light + glow (at most 1), where light is the level set
+ * with setLight; sky light dims at night and glow does not. Texels with alpha
+ * below one half are discarded.
  */
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -22,7 +24,7 @@
 #include <stdint.h>
 #include "../minyar_native.h"
 
-enum { VERTEX_FLOATS = 8, VERTEX_BYTES = VERTEX_FLOATS * 4, KEY_COUNT = GLFW_KEY_LAST + 1, BUTTON_COUNT = 8 };
+enum { VERTEX_FLOATS = 10, VERTEX_BYTES = VERTEX_FLOATS * 4, KEY_COUNT = GLFW_KEY_LAST + 1, BUTTON_COUNT = 8 };
 
 typedef struct {
     GLuint array, buffer;
@@ -121,15 +123,18 @@ static const char *world_vertex_source =
     "layout(location = 0) in vec3 position;\n"
     "layout(location = 1) in vec2 uv;\n"
     "layout(location = 2) in vec3 color;\n"
+    "layout(location = 3) in vec2 lighting;\n"
     "uniform mat4 viewProjection;\n"
     "uniform vec3 camera;\n"
     "out vec2 fragmentUv;\n"
     "out vec3 fragmentColor;\n"
+    "out vec2 fragmentLighting;\n"
     "out float fragmentDistance;\n"
     "void main() {\n"
     "    gl_Position = viewProjection * vec4(position, 1.0);\n"
     "    fragmentUv = uv;\n"
     "    fragmentColor = color;\n"
+    "    fragmentLighting = lighting;\n"
     "    fragmentDistance = length(position - camera);\n"
     "}\n";
 
@@ -137,6 +142,7 @@ static const char *world_fragment_source =
     "#version 330 core\n"
     "in vec2 fragmentUv;\n"
     "in vec3 fragmentColor;\n"
+    "in vec2 fragmentLighting;\n"
     "in float fragmentDistance;\n"
     "uniform sampler2D atlas;\n"
     "uniform vec3 fogColor;\n"
@@ -148,7 +154,8 @@ static const char *world_fragment_source =
     "    vec4 texel = texture(atlas, fragmentUv);\n"
     "    if (texel.a < 0.5) discard;\n"
     "    float fog = clamp((fragmentDistance - fogRange.x) / (fogRange.y - fogRange.x), 0.0, 1.0);\n"
-    "    result = vec4(mix(texel.rgb * fragmentColor * light, fogColor, fog), opacity);\n"
+    "    float brightness = min(fragmentLighting.x * light + fragmentLighting.y, 1.0);\n"
+    "    result = vec4(mix(texel.rgb * fragmentColor * brightness, fogColor, fog), opacity);\n"
     "}\n";
 
 static const char *overlay_vertex_source =
@@ -218,6 +225,8 @@ static void world_layout(void) {
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, VERTEX_BYTES, (void *)12);
     glEnableVertexAttribArray(2);
     glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, VERTEX_BYTES, (void *)20);
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, VERTEX_BYTES, (void *)32);
 }
 
 static GLuint make_texture(const unsigned char *pixels, int width, int height, int mipmaps) {
@@ -631,7 +640,7 @@ long long minyar_graphics_createMesh(void) {
 void minyar_graphics_updateMesh(long long handle, const MinyarBytes *vertices) {
     Mesh *mesh = find_mesh(handle);
     if (vertices->byte_length % VERTEX_BYTES)
-        stop_graphics("mesh vertices are 32 bytes each: x, y, z, u, v, red, green, blue as Float32.");
+        stop_graphics("mesh vertices are 40 bytes each: x, y, z, u, v, red, green, blue, sky, glow as Float32; use graphics.addVertex.");
     glBindBuffer(GL_ARRAY_BUFFER, mesh->buffer);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)vertices->byte_length, vertices->bytes, GL_STATIC_DRAW);
     mesh->count = (GLsizei)(vertices->byte_length / VERTEX_BYTES);
@@ -649,10 +658,10 @@ static void use_world_program(void) {
     glActiveTexture(GL_TEXTURE0);
 }
 
-void minyar_graphics_addVertex(MinyarBytes *vertices, double x, double y, double z, double u, double v,
-                               double red, double green, double blue) {
+static void add_vertex(MinyarBytes *vertices, double x, double y, double z, double u, double v,
+                       double red, double green, double blue, double sky, double glow) {
     float values[VERTEX_FLOATS] = {(float)x, (float)y, (float)z, (float)u, (float)v,
-                                   (float)red, (float)green, (float)blue};
+                                   (float)red, (float)green, (float)blue, (float)sky, (float)glow};
     unsigned char *target = minyar_bytes_extend(vertices, VERTEX_BYTES);
     for (int i = 0; i < VERTEX_FLOATS; i++) {
         uint32_t bits;
@@ -662,6 +671,16 @@ void minyar_graphics_addVertex(MinyarBytes *vertices, double x, double y, double
         target[i * 4 + 2] = (unsigned char)(bits >> 16);
         target[i * 4 + 3] = (unsigned char)(bits >> 24);
     }
+}
+
+void minyar_graphics_addVertex(MinyarBytes *vertices, double x, double y, double z, double u, double v,
+                               double red, double green, double blue) {
+    add_vertex(vertices, x, y, z, u, v, red, green, blue, 1, 0);
+}
+
+void minyar_graphics_addLitVertex(MinyarBytes *vertices, double x, double y, double z, double u, double v,
+                                  double red, double green, double blue, double sky, double glow) {
+    add_vertex(vertices, x, y, z, u, v, red, green, blue, sky, glow);
 }
 
 void minyar_graphics_drawMesh(long long handle) {
@@ -703,12 +722,12 @@ void minyar_graphics_deleteMesh(long long handle) {
 
 void minyar_graphics_drawLine(double x1, double y1, double z1, double x2, double y2, double z2,
                               double red, double green, double blue) {
-    float line[16] = {
-        (float)x1, (float)y1, (float)z1, 0.5f, 0.5f, (float)red, (float)green, (float)blue,
-        (float)x2, (float)y2, (float)z2, 0.5f, 0.5f, (float)red, (float)green, (float)blue,
+    float line[2 * VERTEX_FLOATS] = {
+        (float)x1, (float)y1, (float)z1, 0.5f, 0.5f, (float)red, (float)green, (float)blue, 0, 1,
+        (float)x2, (float)y2, (float)z2, 0.5f, 0.5f, (float)red, (float)green, (float)blue, 0, 1,
     };
     /* Lines are drawn with the camera in effect when the frame finishes. */
-    push(&lines, line, 16);
+    push(&lines, line, 2 * VERTEX_FLOATS);
 }
 
 /* ---------- 2D overlay, in window points with the origin at the top left ---------- */
