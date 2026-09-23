@@ -1719,3 +1719,13 @@ _Bool minyar_file_exists(const MinyarText *path_text) {
     fclose(file);
     return 1;
 }
+
+/* Grow Bytes by `count` zeroed bytes and return where they start, for native
+ * library code that writes packed data directly. */
+unsigned char *minyar_bytes_extend(MinyarBytes *bytes, long long count) {
+    if (count < 0) minyar_stop("Bytes cannot shrink by a negative amount.");
+    bytes_reserve(bytes, count);
+    unsigned char *start = bytes_data(bytes) + bytes->byte_length;
+    bytes->byte_length += count;
+    return start;
+}

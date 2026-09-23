@@ -25,6 +25,8 @@ typedef struct MinyarText {
 typedef MinyarText MinyarBytes;
 
 MinyarBytes *minyar_bytes_new(long long length);
+/* Append `count` zeroed bytes and return a pointer to them. */
+unsigned char *minyar_bytes_extend(MinyarBytes *bytes, long long count);
 
 static inline void minyar_native_stop(const char *message) {
     fprintf(stderr, "Minyar stopped: %s\n", message);

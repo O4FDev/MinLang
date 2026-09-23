@@ -4,8 +4,8 @@
 //
 // Mouse to look, WASD to move, Space to jump, Shift to sprint (or descend
 // while flying), F to fly, left click to break, right click to place, 1-9 or
-// the scroll wheel to choose a block, T to speed up time, Escape to free the
-// mouse. The game saves every minute and on quitting; --new starts afresh.
+// the scroll wheel to choose a block, middle click to pick the aimed block,
+// T to speed up time, Escape to free the mouse. The game saves every minute and on quitting; --new starts afresh.
 
 use "graphics" as graphics
 use "./blocks.min" as blocks
@@ -20,6 +20,7 @@ constant REACH = 6.0
 constant MOUSE_SENSITIVITY = 0.0025
 constant CHUNKS_PER_FRAME = 4
 constant AUTOSAVE_SECONDS = 60.0
+constant DRAW_DISTANCE = 150.0
 
 function axis(positive: Integer, negative: Integer): Float {
     let value = 0.0
@@ -105,7 +106,7 @@ function drawHud(player: physics.Player, sky: atmosphere.Sky, fps: Integer, bloc
         graphics.drawRectangle(0.0, 0.0, width, height, 0.0, 0.0, 0.0, 0.45)
         let title = "Paused"
         graphics.drawText(title, (width - graphics.textWidth(title, 5.0)) / 2.0, height / 2.0 - 60.0, 5.0, 1.0, 1.0, 1.0)
-        let hint = "Click to play\n\nWASD move   Space jump   Shift sprint   F fly\nLeft click break   Right click place   1-9 or scroll choose\nT speed up time   Escape pause"
+        let hint = "Click to play\n\nWASD move   Space jump   Shift sprint   F fly\nLeft click break   Right click place   Middle click pick block\n1-9 or scroll choose   T speed up time   Escape pause"
         graphics.drawText(hint, (width - graphics.textWidth(hint, 2.0)) / 2.0, height / 2.0 + 10.0, 2.0, 0.9, 0.9, 0.9)
     }
 }
@@ -138,6 +139,16 @@ if argumentCount() == 1 && argument(0) == "--new" {
 
 graphics.openWindow(1280, 760, "Minyarcraft")
 graphics.setTexture(textures.build(), textures.ATLAS_SIZE, textures.ATLAS_SIZE)
+// Show a loading screen while the world is prepared. The first call to
+// nextFrame starts a frame; the second presents it.
+for step in 0..2 {
+    graphics.nextFrame()
+    graphics.clear(0.1, 0.12, 0.16)
+    let message = "Building the world..."
+    let size = 3.0
+    graphics.drawText(message, (Float(graphics.windowWidth()) - graphics.textWidth(message, size)) / 2.0, Float(graphics.windowHeight()) / 2.0 - 10.0, size, 1.0, 1.0, 1.0)
+}
+graphics.nextFrame()
 
 let world = terrain.create(20260923)
 let loaded = !fresh && save.loadWorld(world)
@@ -242,14 +253,22 @@ while graphics.nextFrame() {
     // Breaking and placing blocks
     let hit = physics.aim(world, player, REACH)
     if captured && hit.found {
-        if graphics.mousePressed(graphics.MOUSE_LEFT) && blocks.isBreakable(terrain.get(world, hit.x, hit.y, hit.z)) {
+        let aimed = terrain.get(world, hit.x, hit.y, hit.z)
+        if graphics.mousePressed(graphics.MOUSE_MIDDLE) && aimed != blocks.BEDROCK {
+            // Pick block: put the aimed-at block in the selected hotbar slot.
+            hotbar[selected] = aimed
+            nameSeconds = 2.0
+        }
+        if graphics.mousePressed(graphics.MOUSE_LEFT) && blocks.isBreakable(aimed) {
             terrain.set(world, hit.x, hit.y, hit.z, blocks.AIR)
         } else if graphics.mousePressed(graphics.MOUSE_RIGHT) {
             let px = hit.x + hit.normalX
             let py = hit.y + hit.normalY
             let pz = hit.z + hit.normalZ
             let target = terrain.get(world, px, py, pz)
-            if terrain.inside(world, px, py, pz) && (target == blocks.AIR || target == blocks.WATER) && !physics.occupies(player, px, py, pz) {
+            let placeable = target == blocks.AIR || target == blocks.WATER || blocks.isPlant(target)
+            let blocksPlayer = !blocks.isPlant(hotbar[selected]) && physics.occupies(player, px, py, pz)
+            if terrain.inside(world, px, py, pz) && placeable && !blocksPlayer {
                 terrain.set(world, px, py, pz, hotbar[selected])
             }
         }
@@ -270,11 +289,23 @@ while graphics.nextFrame() {
         graphics.setFog(sky.red, sky.green, sky.blue, 70.0, 130.0)
     }
     graphics.setLight(sky.light)
-    for mesh in meshes {
-        graphics.drawMesh(mesh)
+    // Chunks entirely beyond the fog are skipped.
+    let visible: List<Boolean> = []
+    for chunk in 0..meshes.length {
+        let centerX = Float((chunk % terrain.CHUNKS_X) * terrain.CHUNK_SIZE) + 8.0
+        let centerZ = Float((chunk / terrain.CHUNKS_X) * terrain.CHUNK_SIZE) + 8.0
+        let dx = centerX - eyeX
+        let dz = centerZ - eyeZ
+        let near = dx * dx + dz * dz < DRAW_DISTANCE * DRAW_DISTANCE
+        visible.add(near)
+        if near {
+            graphics.drawMesh(meshes[chunk])
+        }
     }
-    for mesh in waterMeshes {
-        graphics.drawTranslucentMesh(mesh, 0.72)
+    for chunk in 0..waterMeshes.length {
+        if visible[chunk] {
+            graphics.drawTranslucentMesh(waterMeshes[chunk], 0.72)
+        }
     }
     if hit.found {
         let x = Float(hit.x)

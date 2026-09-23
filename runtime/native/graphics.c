@@ -18,6 +18,8 @@
 #include <GL/glext.h>
 #endif
 #include <math.h>
+#include <signal.h>
+#include <stdint.h>
 #include "../minyar_native.h"
 
 enum { VERTEX_FLOATS = 8, VERTEX_BYTES = VERTEX_FLOATS * 4, KEY_COUNT = GLFW_KEY_LAST + 1, BUTTON_COUNT = 8 };
@@ -49,6 +51,14 @@ static double mouse_x, mouse_y, mouse_move_x, mouse_move_y, scroll_total;
 static int mouse_known, frame_started;
 static double start_time, previous_time, frame_seconds;
 static int framebuffer_width, framebuffer_height;
+static volatile sig_atomic_t quit_requested;
+
+/* A termination request closes the window like the user would, so programs
+ * can save before exiting. */
+static void on_terminate(int signal_number) {
+    (void)signal_number;
+    quit_requested = 1;
+}
 
 static void use_world_program(void);
 
@@ -274,6 +284,8 @@ void minyar_graphics_openWindow(long long width, long long height, const MinyarT
     char name[256];
     minyar_native_text(title, name, sizeof(name));
     glfwSetErrorCallback(on_error);
+    signal(SIGTERM, on_terminate);
+    signal(SIGINT, on_terminate);
     if (!glfwInit()) stop_graphics("the graphics system could not start.");
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
@@ -483,7 +495,7 @@ bool minyar_graphics_nextFrame(void) {
     previous_time = now;
     glfwGetFramebufferSize(window, &framebuffer_width, &framebuffer_height);
     glViewport(0, 0, framebuffer_width, framebuffer_height);
-    return !glfwWindowShouldClose(window);
+    return !glfwWindowShouldClose(window) && !quit_requested;
 }
 
 void minyar_graphics_closeWindow(void) {
@@ -635,6 +647,21 @@ static void use_world_program(void) {
     glUniform1f(glGetUniformLocation(world_program, "opacity"), 1.0f);
     glUniform1i(glGetUniformLocation(world_program, "atlas"), 0);
     glActiveTexture(GL_TEXTURE0);
+}
+
+void minyar_graphics_addVertex(MinyarBytes *vertices, double x, double y, double z, double u, double v,
+                               double red, double green, double blue) {
+    float values[VERTEX_FLOATS] = {(float)x, (float)y, (float)z, (float)u, (float)v,
+                                   (float)red, (float)green, (float)blue};
+    unsigned char *target = minyar_bytes_extend(vertices, VERTEX_BYTES);
+    for (int i = 0; i < VERTEX_FLOATS; i++) {
+        uint32_t bits;
+        memcpy(&bits, &values[i], 4);
+        target[i * 4] = (unsigned char)bits;
+        target[i * 4 + 1] = (unsigned char)(bits >> 8);
+        target[i * 4 + 2] = (unsigned char)(bits >> 16);
+        target[i * 4 + 3] = (unsigned char)(bits >> 24);
+    }
 }
 
 void minyar_graphics_drawMesh(long long handle) {
