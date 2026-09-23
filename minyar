@@ -101,8 +101,46 @@ if [ "$incremental" -eq 1 ]; then
     "$project_dir/build/minyar-module-build" "$project_dir/build/minyarc-modules" \
         "$source_file" "$llvm_file" "${MINYAR_MODULE_CACHE:-$project_dir/build/module-cache}" "$@"
 else
-    "$project_dir/build/minyarc" "$source_file" "$llvm_file" "$@"
+    "$project_dir/build/minyarc" "$source_file" "$llvm_file" "$@" --library "$project_dir/library"
 fi
+
+# Standard library packages such as graphics are partly implemented in C. The
+# compiler lists the native libraries a program uses; build and link only those.
+native_objects=
+native_flags=
+for native_library in $(sed -n 's/^; minyar-native-library: //p' "$llvm_file" | sort -u); do
+    case "$native_library" in
+        graphics)
+            if pkg-config --exists glfw3 2>/dev/null; then
+                glfw_cflags=$(pkg-config --cflags glfw3)
+                glfw_libs=$(pkg-config --libs glfw3)
+            elif glfw_prefix=$(brew --prefix glfw 2>/dev/null) && [ -d "$glfw_prefix/include" ]; then
+                glfw_cflags="-I$glfw_prefix/include"
+                glfw_libs="-L$glfw_prefix/lib -lglfw"
+            else
+                echo "the graphics package needs GLFW: install it with 'brew install glfw' on macOS or 'sudo apt install libglfw3-dev' on Debian and Ubuntu" >&2
+                exit 1
+            fi
+            native_source="$project_dir/runtime/native/graphics.c"
+            native_object="$project_dir/build/native/graphics.o"
+            if [ ! -f "$native_object" ] || [ "$native_source" -nt "$native_object" ] ||
+               [ "$project_dir/runtime/minyar_native.h" -nt "$native_object" ]; then
+                mkdir -p "$project_dir/build/native"
+                "${MINYAR_CLANG:-clang}" -O2 -c "$native_source" $glfw_cflags -o "$native_object.$$"
+                mv -f "$native_object.$$" "$native_object"
+            fi
+            native_objects="$native_objects $native_object"
+            case "$(uname -s)" in
+                Darwin) native_flags="$native_flags $glfw_libs -framework OpenGL -framework Cocoa -framework IOKit" ;;
+                *) native_flags="$native_flags $glfw_libs -lGL -lm" ;;
+            esac
+            ;;
+        *)
+            echo "the program uses an unknown native library: $native_library" >&2
+            exit 1
+            ;;
+    esac
+done
 
 if [ "$configured_runtime" -eq 1 ]; then
     runtime_source="$llvm_dir/runtime.c"
@@ -144,9 +182,9 @@ CONFIG
 fi
 if [ "$release" -eq 1 ]; then
     "${MINYAR_CLANG:-clang}" ${MINYAR_CLANG_FLAGS:--O2 -Wno-override-module} -flto \
-        "$llvm_file" "$runtime_file" -o "$output_file"
+        "$llvm_file" "$runtime_file" $native_objects $native_flags -o "$output_file"
 else
     "${MINYAR_CLANG:-clang}" ${MINYAR_CLANG_FLAGS:--O0 -Wno-override-module} \
-        "$llvm_file" "$runtime_file" -o "$output_file"
+        "$llvm_file" "$runtime_file" $native_objects $native_flags -o "$output_file"
 fi
 echo "built $output_file"
