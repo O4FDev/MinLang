@@ -2,6 +2,30 @@ function characterIsDigit(character: Character): Boolean {
     return character >= '0' && character <= '9'
 }
 
+function characterIsHexDigit(character: Character): Boolean {
+    return characterIsDigit(character) || (character >= 'a' && character <= 'f') || (character >= 'A' && character <= 'F')
+}
+
+function hexDigitValue(character: Character): Integer {
+    let digits = "0123456789abcdef"
+    let lower = character
+    if character >= 'A' && character <= 'F' {
+        lower = digits[10 + findCharacter("ABCDEF", character)]
+    }
+    return findCharacter(digits, lower)
+}
+
+function findCharacter(text: Text, wanted: Character): Integer {
+    let position = 0
+    while position < text.length {
+        if text[position] == wanted {
+            return position
+        }
+        position = position + 1
+    }
+    return -1
+}
+
 function characterIsLetter(character: Character): Boolean {
     let lowercase = character >= 'a' && character <= 'z'
     let uppercase = character >= 'A' && character <= 'Z'
@@ -27,7 +51,7 @@ function lineCanEndStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>):
     if tokenKinds.length > 0 {
         let last = tokenKinds.length - 1
         let kind = tokenKinds[last]
-        if kind == 1 || kind == 2 || kind == 3 || kind == 5 {
+        if kind == 1 || kind == 2 || kind == 3 || kind == 5 || kind == 7 {
             result = true
         } else {
             if kind == 4 {
@@ -102,8 +126,46 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
                             while position < length && characterIsDigit(source[position]) {
                                 position = position + 1
                             }
+                            let numberKind = 2
+                            let hexValue = -1
+                            if character == '0' && position == start + 1 && position + 1 < length && source[position] == 'x' && characterIsHexDigit(source[position + 1]) {
+                                position = position + 1
+                                hexValue = 0
+                                while position < length && characterIsHexDigit(source[position]) {
+                                    let digit = hexDigitValue(source[position])
+                                    if hexValue > (9223372036854775807 - digit) / 16 {
+                                        fail("line " + sourceLocation(tokenLine, tokenColumn) + ": Integer literal is outside the supported range")
+                                    }
+                                    hexValue = hexValue * 16 + digit
+                                    position = position + 1
+                                }
+                            }
+                            // A Float needs digits on both sides of its point, so
+                            // ranges such as 0..count remain two Integer tokens.
+                            if numberKind == 2 && position + 1 < length && source[position] == '.' && characterIsDigit(source[position + 1]) {
+                                numberKind = 7
+                                position = position + 1
+                                while position < length && characterIsDigit(source[position]) {
+                                    position = position + 1
+                                }
+                                if position < length && (source[position] == 'e' || source[position] == 'E') {
+                                    position = position + 1
+                                    if position < length && (source[position] == '+' || source[position] == '-') {
+                                        position = position + 1
+                                    }
+                                    if position >= length || !characterIsDigit(source[position]) {
+                                        fail("line " + sourceLocation(tokenLine, tokenColumn) + ": a Float exponent needs digits, as in 1.5e3")
+                                    }
+                                    while position < length && characterIsDigit(source[position]) {
+                                        position = position + 1
+                                    }
+                                }
+                            }
                             let digits = source.slice(start, position)
-                            addToken(tokenKinds, tokenTexts, tokenLines, 2, digits, sourceLocation(tokenLine, tokenColumn))
+                            if hexValue >= 0 {
+                                digits = Text(hexValue)
+                            }
+                            addToken(tokenKinds, tokenTexts, tokenLines, numberKind, digits, sourceLocation(tokenLine, tokenColumn))
                         } else {
                             if character == '"' {
                                 let tokenLine = line
@@ -216,9 +278,9 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
                                         let next = source[position + 1]
                                         let doubled = false
                                         if next == '=' {
-                                            doubled = character == '=' || character == '!' || character == '<' || character == '>'
+                                            doubled = character == '=' || character == '!' || character == '<' || character == '>' || character == '+' || character == '-' || character == '*' || character == '/' || character == '%'
                                         } else {
-                                            doubled = (character == '&' && next == '&') || (character == '|' && next == '|')
+                                            doubled = (character == '&' && next == '&') || (character == '|' && next == '|') || (character == '<' && next == '<') || (character == '>' && next == '>') || (character == '.' && next == '.')
                                         }
                                         if doubled {
                                             punctuation = punctuation + Text(next)
@@ -298,7 +360,7 @@ function escapeLLVMText(text: Text): Text {
 
 function tokenIs(tokenKinds: List<Integer>, tokenTexts: List<Text>, cursor: List<Integer>, expected: Text): Boolean {
     let kind = tokenKinds[cursor[0]]
-    return kind != 2 && kind != 3 && kind != 5 && tokenTexts[cursor[0]] == expected
+    return kind != 2 && kind != 3 && kind != 5 && kind != 7 && tokenTexts[cursor[0]] == expected
 }
 
 function expectToken(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, cursor: List<Integer>, expected: Text) {
@@ -340,6 +402,12 @@ function simpleTypeCode(name: Text): Integer {
                 } else {
                     if name == "Nothing" {
                         code = 5
+                    }
+                    if name == "Float" {
+                        code = 7
+                    }
+                    if name == "Bytes" {
+                        code = 8
                     }
                 }
             }
@@ -526,10 +594,23 @@ function takeType(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines:
     let name = tokenTexts[cursor[0]]
     let code = simpleTypeCode(name)
     if name == "List" {
-        cursor[0] = cursor[0] + 1
-        expectToken(tokenKinds, tokenTexts, tokenLines, cursor, "<")
-        code = 100000 + takeValueType(tokenKinds, tokenTexts, tokenLines, cursor, symbolNames, symbolKinds)
-        expectToken(tokenKinds, tokenTexts, tokenLines, cursor, ">")
+        // Take every nested opener first: one '>>' token can close two Lists.
+        let depth = 0
+        while tokenKinds[cursor[0]] == 1 && tokenTexts[cursor[0]] == "List" {
+            cursor[0] = cursor[0] + 1
+            expectToken(tokenKinds, tokenTexts, tokenLines, cursor, "<")
+            depth = depth + 1
+        }
+        code = depth * 100000 + takeValueType(tokenKinds, tokenTexts, tokenLines, cursor, symbolNames, symbolKinds)
+        while depth > 0 {
+            if depth >= 2 && tokenIs(tokenKinds, tokenTexts, cursor, ">>") {
+                cursor[0] = cursor[0] + 1
+                depth = depth - 2
+            } else {
+                expectToken(tokenKinds, tokenTexts, tokenLines, cursor, ">")
+                depth = depth - 1
+            }
+        }
     } else {
         if code == 0 {
             let record = findSymbol(symbolNames, symbolKinds, name, 2)
@@ -718,6 +799,9 @@ function discoverDeclarations(tokenKinds: List<Integer>, tokenTexts: List<Text>,
             if tokenIs(tokenKinds, tokenTexts, cursor, "function") {
                 expectToken(tokenKinds, tokenTexts, tokenLines, cursor, "function")
                 let functionName = tokenTexts[cursor[0]]
+                if isBuiltinName(readableDeclarationName(functionName)) {
+                    fail(describeLocation(tokenLines[cursor[0]]) + ": '" + readableDeclarationName(functionName) + "' is a built-in function; choose another name")
+                }
                 symbolNames.add(functionName)
                 symbolKinds.add(1)
                 symbolLocations.add(tokenLines[cursor[0]])
@@ -812,7 +896,7 @@ function listElementType(type: Integer): Integer {
 }
 
 function isReferenceType(type: Integer): Boolean {
-    return type == 2 || type >= 1000
+    return type == 2 || type == 8 || type >= 1000
 }
 
 function llvmType(type: Integer): Text {
@@ -828,6 +912,9 @@ function llvmType(type: Integer): Text {
             } else {
                 if type == 4 {
                     result = "i1"
+                }
+                if type == 7 {
+                    result = "double"
                 }
             }
         }
@@ -996,15 +1083,48 @@ function valueAsListSlot(output: List<Text>, textState: List<Text>, state: List<
         } else {
             addOutput(output, "  %value.")
             addOutput(output, Text(temporary))
-            addOutput(output, " = zext ")
-            addOutput(output, llvmType(type))
-            addOutput(output, " ")
+            if type == 7 {
+                addOutput(output, " = bitcast double ")
+            } else {
+                addOutput(output, " = zext ")
+                addOutput(output, llvmType(type))
+                addOutput(output, " ")
+            }
             addOutput(output, value)
             addOutput(output, " to i64\n")
         }
         result = valueName(textState, temporary)
     }
     return result
+}
+
+// List elements and record fields are stored in i64 slots. Recover the typed
+// SSA value that valueAsListSlot encoded.
+function slotAsValue(output: List<Text>, textState: List<Text>, state: List<Integer>, raw: Text, type: Integer): Text {
+    if type == 1 {
+        return raw
+    }
+    let value = valueName(textState, newTemporary(state))
+    addOutput(output, "  ")
+    addOutput(output, value)
+    if isReferenceType(type) {
+        addOutput(output, " = inttoptr i64 ")
+        addOutput(output, raw)
+        addOutput(output, " to ptr\n")
+    } else {
+        if type == 7 {
+            addOutput(output, " = bitcast i64 ")
+            addOutput(output, raw)
+            addOutput(output, " to double\n")
+        } else {
+            addOutput(output, " = trunc i64 ")
+            addOutput(output, raw)
+            addOutput(output, " to ")
+            addOutput(output, llvmType(type))
+            addOutput(output, "\n")
+        }
+    }
+    return value
 }
 
 function keepReference(output: List<Text>, state: List<Integer>, value: Text, type: Integer): Integer {
@@ -1134,6 +1254,7 @@ function prepareScalarRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, 
     while tokenKinds[position] != 0 && !done {
         if tokenKinds[position] == 1 && tokenTexts[position] == name {
             if position + 1 >= tokenTexts.length || tokenTexts[position + 1] != "." { return }
+            if position + 3 < tokenTexts.length && tokenKinds[position + 3] == 4 && isAssignmentOperator(tokenTexts[position + 3]) { return }
         }
         if tokenKinds[position] == 4 {
             if tokenTexts[position] == "{" { depth = depth + 1 }
@@ -1224,25 +1345,79 @@ function finishFunctionEntry(output: List<Text>, slot: Integer, locals: Integer,
     output[slot] = joinText(entry)
 }
 
-function emitBinary(output: List<Text>, textState: List<Text>, state: List<Integer>, operator: Text, left: Text, leftType: Integer, leftOwner: Integer, right: Text, rightType: Integer, resultType: List<Integer>): Text {
+function describeType(type: Integer): Text {
+    if type == 1 { return "Integer" }
+    if type == 2 { return "Text" }
+    if type == 3 { return "Character" }
+    if type == 4 { return "Boolean" }
+    if type == 5 || type == 6 { return "Nothing" }
+    if type == 7 { return "Float" }
+    if type == 8 { return "Bytes" }
+    if isListType(type) { return "List<" + describeType(listElementType(type)) + ">" }
+    if isRecordType(type) { return "a record" }
+    return "an unknown type"
+}
+
+function isArithmeticOperator(operator: Text): Boolean {
+    return operator == "+" || operator == "-" || operator == "*" || operator == "/" || operator == "%"
+}
+
+function isBitwiseOperator(operator: Text): Boolean {
+    return operator == "&" || operator == "|" || operator == "^" || operator == "<<" || operator == ">>"
+}
+
+function comparisonCondition(operator: Text, type: Integer): Text {
+    if type == 7 {
+        // Ordered comparisons are false for NaN; != is its exact opposite.
+        if operator == "==" { return "oeq" }
+        if operator == "!=" { return "une" }
+        if operator == "<" { return "olt" }
+        if operator == ">" { return "ogt" }
+        if operator == "<=" { return "ole" }
+        return "oge"
+    }
+    if operator == "==" { return "eq" }
+    if operator == "!=" { return "ne" }
+    if operator == "<" { return "slt" }
+    if operator == ">" { return "sgt" }
+    if operator == "<=" { return "sle" }
+    return "sge"
+}
+
+function emitBinary(output: List<Text>, textState: List<Text>, state: List<Integer>, operator: Text, left: Text, leftType: Integer, leftOwner: Integer, right: Text, rightType: Integer, resultType: List<Integer>, location: Text): Text {
+    let at = describeLocation(location) + ": "
     if leftType != rightType {
-        fail("the two sides of '" + operator + "' have different types")
+        let hint = ""
+        if (leftType == 1 && rightType == 7) || (leftType == 7 && rightType == 1) {
+            hint = "; convert one side with Float(value) or Integer(value)"
+        }
+        fail(at + "the two sides of '" + operator + "' have different types (" + describeType(leftType) + " and " + describeType(rightType) + ")" + hint)
     }
-    if (operator == "==" || operator == "!=") && (isRecordType(leftType) || isListType(leftType)) {
-        fail("records and Lists do not yet support equality")
+    if (operator == "==" || operator == "!=") && (isRecordType(leftType) || isListType(leftType) || leftType == 8) {
+        fail(at + "records, Lists, and Bytes do not yet support equality")
     }
-    if operator == "+" || operator == "-" || operator == "*" || operator == "/" || operator == "%" {
-        if leftType != 1 && !(operator == "+" && leftType == 2) {
-            fail("'" + operator + "' needs Integer operands")
+    if isArithmeticOperator(operator) {
+        if leftType != 1 && leftType != 7 && !(operator == "+" && leftType == 2) {
+            fail(at + "'" + operator + "' needs Integer or Float operands, not " + describeType(leftType))
         }
     } else {
-        if operator == "==" || operator == "!=" {
-            if leftType < 1 || leftType > 4 {
-                fail("equality needs two values")
+        if isBitwiseOperator(operator) {
+            if leftType != 1 {
+                let hint = ""
+                if leftType == 4 && (operator == "&" || operator == "|") {
+                    hint = "; use " + operator + operator + " for Boolean logic"
+                }
+                fail(at + "'" + operator + "' needs Integer operands, not " + describeType(leftType) + hint)
             }
         } else {
-            if leftType != 1 && leftType != 3 {
-                fail("ordered comparison needs Integer or Character operands")
+            if operator == "==" || operator == "!=" {
+                if (leftType < 1 || leftType > 4) && leftType != 7 {
+                    fail(at + "equality needs two values")
+                }
+            } else {
+                if leftType != 1 && leftType != 3 && leftType != 7 {
+                    fail(at + "ordered comparison needs Integer, Float, or Character operands")
+                }
             }
         }
     }
@@ -1284,6 +1459,24 @@ function emitBinary(output: List<Text>, textState: List<Text>, state: List<Integ
             }
             setType(resultType, 4)
         } else {
+            if leftType == 7 && isArithmeticOperator(operator) {
+                // IEEE 754 arithmetic: overflow gives infinity rather than stopping.
+                let instruction = "fadd"
+                if operator == "-" { instruction = "fsub" }
+                if operator == "*" { instruction = "fmul" }
+                if operator == "/" { instruction = "fdiv" }
+                if operator == "%" { instruction = "frem" }
+                addOutput(output, "  ")
+                addOutput(output, result)
+                addOutput(output, " = ")
+                addOutput(output, instruction)
+                addOutput(output, " double ")
+                addOutput(output, left)
+                addOutput(output, ", ")
+                addOutput(output, right)
+                addOutput(output, "\n")
+                setType(resultType, 7)
+            } else {
             if operator == "+" || operator == "-" || operator == "*" {
                 let operation = "sadd"
                 if operator == "-" {
@@ -1337,35 +1530,48 @@ function emitBinary(output: List<Text>, textState: List<Text>, state: List<Integ
                     addOutput(output, "\n")
                     setType(resultType, 1)
                 } else {
-                    let comparison = "eq"
-                    if operator == "!=" {
-                        comparison = "ne"
+                    if isBitwiseOperator(operator) {
+                        let instruction = "and"
+                        if operator == "|" { instruction = "or" }
+                        if operator == "^" { instruction = "xor" }
+                        if operator == "<<" || operator == ">>" {
+                            // Shift counts outside 0..63 have no defined result.
+                            addOutput(output, "  call void @minyar_check_shift(i64 ")
+                            addOutput(output, right)
+                            addOutput(output, ")\n")
+                            instruction = "shl"
+                            if operator == ">>" { instruction = "ashr" }
+                        }
+                        addOutput(output, "  ")
+                        addOutput(output, result)
+                        addOutput(output, " = ")
+                        addOutput(output, instruction)
+                        addOutput(output, " i64 ")
+                        addOutput(output, left)
+                        addOutput(output, ", ")
+                        addOutput(output, right)
+                        addOutput(output, "\n")
+                        setType(resultType, 1)
+                    } else {
+                        addOutput(output, "  ")
+                        addOutput(output, result)
+                        if leftType == 7 {
+                            addOutput(output, " = fcmp ")
+                        } else {
+                            addOutput(output, " = icmp ")
+                        }
+                        addOutput(output, comparisonCondition(operator, leftType))
+                        addOutput(output, " ")
+                        addOutput(output, llvmType(leftType))
+                        addOutput(output, " ")
+                        addOutput(output, left)
+                        addOutput(output, ", ")
+                        addOutput(output, right)
+                        addOutput(output, "\n")
+                        setType(resultType, 4)
                     }
-                    if operator == "<" {
-                        comparison = "slt"
-                    }
-                    if operator == ">" {
-                        comparison = "sgt"
-                    }
-                    if operator == "<=" {
-                        comparison = "sle"
-                    }
-                    if operator == ">=" {
-                        comparison = "sge"
-                    }
-                    addOutput(output, "  ")
-                    addOutput(output, result)
-                    addOutput(output, " = icmp ")
-                    addOutput(output, comparison)
-                    addOutput(output, " ")
-                    addOutput(output, llvmType(leftType))
-                    addOutput(output, " ")
-                    addOutput(output, left)
-                    addOutput(output, ", ")
-                    addOutput(output, right)
-                    addOutput(output, "\n")
-                    setType(resultType, 4)
                 }
+            }
             }
         }
     }
@@ -1469,10 +1675,10 @@ function operatorLevel(tokenKinds: List<Integer>, tokenTexts: List<Text>, state:
     let level = 0
     if tokenKinds[state[0]] == 4 {
         let token = tokenTexts[state[0]]
-        if token == "*" || token == "/" || token == "%" {
+        if token == "*" || token == "/" || token == "%" || token == "<<" || token == ">>" || token == "&" {
             level = 4
         } else {
-            if token == "+" || token == "-" {
+            if token == "+" || token == "-" || token == "|" || token == "^" {
                 level = 3
             } else {
                 if token == "<" || token == ">" || token == "<=" || token == ">=" {
@@ -1493,6 +1699,7 @@ function parseBinary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLin
     let level = operatorLevel(tokenKinds, tokenTexts, state)
     while level >= minimumLevel && level > 0 {
         let operator = tokenTexts[state[0]]
+        let operatorLocation = tokenLines[state[0]]
         state[0] = state[0] + 1
         let leftType = resultType[0]
         let leftOwner = -1
@@ -1501,7 +1708,7 @@ function parseBinary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLin
         }
         setType(resultType, 0)
         let right = parseBinary(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, resultType, level + 1)
-        left = emitBinary(output, textState, state, operator, left, leftType, leftOwner, right, resultType[0], resultType)
+        left = emitBinary(output, textState, state, operator, left, leftType, leftOwner, right, resultType[0], resultType, operatorLocation)
         level = operatorLevel(tokenKinds, tokenTexts, state)
     }
     return left
@@ -1526,9 +1733,64 @@ function checkedIntegerLiteral(digits: Text, negative: Boolean, location: Text):
     return canonical
 }
 
+// LLVM rounds decimal double constants correctly. Reject only literals whose
+// decimal magnitude is beyond every finite Float, which would become infinity.
+function checkedFloatLiteral(literal: Text, location: Text): Text {
+    let position = 0
+    let significant = false
+    let integerDigits = 0
+    while position < literal.length && literal[position] != '.' {
+        if significant || literal[position] != '0' {
+            significant = true
+            integerDigits = integerDigits + 1
+        }
+        position = position + 1
+    }
+    position = position + 1
+    let fractionZeros = 0
+    while position < literal.length && literal[position] != 'e' && literal[position] != 'E' {
+        if !significant {
+            if literal[position] == '0' {
+                fractionZeros = fractionZeros + 1
+            } else {
+                significant = true
+            }
+        }
+        position = position + 1
+    }
+    let exponent = 0
+    let negativeExponent = false
+    if position < literal.length {
+        position = position + 1
+        if literal[position] == '-' || literal[position] == '+' {
+            negativeExponent = literal[position] == '-'
+            position = position + 1
+        }
+        while position < literal.length {
+            if exponent < 100000 {
+                exponent = exponent * 10 + findCharacter("0123456789", literal[position])
+            }
+            position = position + 1
+        }
+    }
+    if negativeExponent {
+        exponent = -exponent
+    }
+    if significant {
+        let order = exponent - fractionZeros - 1
+        if integerDigits > 0 {
+            order = exponent + integerDigits - 1
+        }
+        if order > 308 {
+            fail(describeLocation(location) + ": Float literal is larger than the largest Float")
+        }
+    }
+    return literal
+}
+
 function parseUnary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, resultType: List<Integer>): Text {
     let value = ""
-    if tokenKinds[state[0]] == 4 && (tokenTexts[state[0]] == "!" || tokenTexts[state[0]] == "-") {
+    if tokenKinds[state[0]] == 4 && (tokenTexts[state[0]] == "!" || tokenTexts[state[0]] == "-" || tokenTexts[state[0]] == "~") {
         let operator = tokenTexts[state[0]]
         state[0] = state[0] + 1
         if operator == "-" && tokenKinds[state[0]] == 2 {
@@ -1536,6 +1798,12 @@ function parseUnary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLine
             state[0] = state[0] + 1
             setType(resultType, 1)
             return "-" + digits
+        }
+        if operator == "-" && tokenKinds[state[0]] == 7 {
+            let literal = checkedFloatLiteral(tokenTexts[state[0]], tokenLines[state[0]])
+            state[0] = state[0] + 1
+            setType(resultType, 7)
+            return "-" + literal
         }
         let rightType: List<Integer> = []
         rightType.add(0)
@@ -1551,7 +1819,24 @@ function parseUnary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLine
             addOutput(output, ", true\n")
             setType(resultType, 4)
         } else {
-            requireType(tokenLines, state, rightType[0], 1, "negation needs an Integer")
+        if operator == "~" {
+            requireType(tokenLines, state, rightType[0], 1, "bitwise not needs an Integer")
+            addOutput(output, "  ")
+            addOutput(output, value)
+            addOutput(output, " = xor i64 ")
+            addOutput(output, right)
+            addOutput(output, ", -1\n")
+            setType(resultType, 1)
+        } else {
+        if rightType[0] == 7 {
+            addOutput(output, "  ")
+            addOutput(output, value)
+            addOutput(output, " = fneg double ")
+            addOutput(output, right)
+            addOutput(output, "\n")
+            setType(resultType, 7)
+        } else {
+            requireType(tokenLines, state, rightType[0], 1, "negation needs an Integer or Float")
             addOutput(output, "  %checked.")
             addOutput(output, Text(temporary))
             addOutput(output, " = call { i64, i1 } @llvm.ssub.with.overflow.i64(i64 0, i64 ")
@@ -1571,6 +1856,8 @@ function parseUnary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLine
             addOutput(output, Text(temporary))
             addOutput(output, ")\n")
             setType(resultType, 1)
+        }
+        }
         }
     } else {
         value = parsePrimary(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, resultType)
@@ -1707,26 +1994,7 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                         addOutput(output, ")\n")
                     }
                     scalarValues = -1
-                    value = raw
-                    if fieldType != 1 {
-                        let converted = newTemporary(state)
-                        value = valueName(textState, converted)
-                        if isReferenceType(fieldType) {
-                            addOutput(output, "  ")
-                            addOutput(output, value)
-                            addOutput(output, " = inttoptr i64 ")
-                            addOutput(output, raw)
-                            addOutput(output, " to ptr\n")
-                        } else {
-                            addOutput(output, "  ")
-                            addOutput(output, value)
-                            addOutput(output, " = trunc i64 ")
-                            addOutput(output, raw)
-                            addOutput(output, " to ")
-                            addOutput(output, llvmType(fieldType))
-                            addOutput(output, "\n")
-                        }
-                    }
+                    value = slotAsValue(output, textState, state, raw, fieldType)
                     setType(resultType, fieldType)
                 } else {
                     if receiverType != 2 && !isListType(receiverType) {
@@ -1787,26 +2055,7 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                 addOutput(output, position)
                 addOutput(output, ")\n")
                 let elementType = listElementType(collectionType)
-                value = raw
-                if elementType != 1 {
-                    let converted = newTemporary(state)
-                    value = valueName(textState, converted)
-                    if isReferenceType(elementType) {
-                        addOutput(output, "  ")
-                        addOutput(output, value)
-                        addOutput(output, " = inttoptr i64 ")
-                        addOutput(output, raw)
-                        addOutput(output, " to ptr\n")
-                    } else {
-                        addOutput(output, "  ")
-                        addOutput(output, value)
-                        addOutput(output, " = trunc i64 ")
-                        addOutput(output, raw)
-                        addOutput(output, " to ")
-                        addOutput(output, llvmType(elementType))
-                        addOutput(output, "\n")
-                    }
-                }
+                value = slotAsValue(output, textState, state, raw, elementType)
                 setType(resultType, elementType)
             }
         }
@@ -2057,6 +2306,11 @@ function parseAtom(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
             state[0] = tokenIndex + 1
             setType(resultType, 1)
         } else {
+        if kind == 7 {
+            value = checkedFloatLiteral(token, tokenLines[tokenIndex])
+            state[0] = tokenIndex + 1
+            setType(resultType, 7)
+        } else {
             if kind == 3 {
                 value = "getelementptr (i8, ptr @.text." + Text(tokenIndex) + ", i64 8)"
                 state[0] = tokenIndex + 1
@@ -2087,6 +2341,7 @@ function parseAtom(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                 }
             }
         }
+        }
     }
     return value
 }
@@ -2108,8 +2363,8 @@ function checkBuiltinArguments(name: Text, types: List<Integer>) {
         }
         if count > 0 {
             let type = types[0]
-            if (name == "print" || name == "Text") && (type < 1 || type > 4) {
-                fail(name + " expects one Integer, Text, Character, or Boolean value")
+            if (name == "print" || name == "Text") && (type < 1 || type > 4) && type != 7 {
+                fail(name + " expects one Integer, Float, Text, Character, or Boolean value")
             }
             if (name == "fail" || name == "readTextFile") && type != 2 {
                 fail(name + " expects one Text argument")
@@ -2125,6 +2380,184 @@ function checkBuiltinArguments(name: Text, types: List<Integer>) {
             }
         }
     }
+}
+
+function isNumericBuiltin(name: Text): Boolean {
+    return name == "Float" || name == "Integer" || name == "Character" || isFloatFunction(name) || name == "atan2" || name == "pow" || name == "abs" || name == "min" || name == "max" || name == "clamp" || name == "wrappingAdd" || name == "wrappingSubtract" || name == "wrappingMultiply"
+}
+
+function isFloatFunction(name: Text): Boolean {
+    return name == "sqrt" || name == "sin" || name == "cos" || name == "tan" || name == "asin" || name == "acos" || name == "atan" || name == "exp" || name == "log" || name == "floor" || name == "ceil" || name == "round"
+}
+
+function isBuiltinName(name: Text): Boolean {
+    return isNumericBuiltin(name) || name == "print" || name == "Text" || name == "fail" || name == "exit" || name == "joinText" || name == "argument" || name == "argumentCount" || name == "readTextFile" || name == "writeTextFile"
+}
+
+function requireBuiltinArguments(name: Text, types: List<Integer>, count: Integer, type: Integer) {
+    let matches = types.length == count
+    let position = 0
+    while matches && position < types.length {
+        if types[position] != type {
+            matches = false
+        }
+        position = position + 1
+    }
+    if !matches {
+        let noun = describeType(type)
+        if count == 1 {
+            fail(name + " expects one " + noun + " argument")
+        }
+        fail(name + " expects " + Text(count) + " " + noun + " arguments")
+    }
+}
+
+function emitCall(output: List<Text>, textState: List<Text>, state: List<Integer>, returnType: Integer, callee: Text, values: List<Text>, types: List<Integer>): Text {
+    let value = ""
+    addOutput(output, "  ")
+    if returnType != 5 {
+        value = valueName(textState, newTemporary(state))
+        addOutput(output, value)
+        addOutput(output, " = ")
+    }
+    addOutput(output, "call ")
+    addOutput(output, llvmType(returnType))
+    addOutput(output, " @")
+    addOutput(output, callee)
+    addOutput(output, "(")
+    let position = 0
+    while position < values.length {
+        if position > 0 {
+            addOutput(output, ", ")
+        }
+        addOutput(output, llvmType(types[position]))
+        addOutput(output, " ")
+        addOutput(output, values[position])
+        position = position + 1
+    }
+    addOutput(output, ")\n")
+    return value
+}
+
+function pairOf(first: Text, second: Text): List<Text> {
+    let pair: List<Text> = []
+    pair.add(first)
+    pair.add(second)
+    return pair
+}
+
+function typePairOf(type: Integer): List<Integer> {
+    let pair: List<Integer> = []
+    pair.add(type)
+    pair.add(type)
+    return pair
+}
+
+function emitInstruction(output: List<Text>, textState: List<Text>, state: List<Integer>, instruction: Text): Text {
+    let value = valueName(textState, newTemporary(state))
+    addOutput(output, "  ")
+    addOutput(output, value)
+    addOutput(output, " = ")
+    addOutput(output, instruction)
+    addOutput(output, "\n")
+    return value
+}
+
+// Conversions and arithmetic helpers. Float math follows IEEE 754; Integer
+// helpers keep the checked-overflow rule unless their name says otherwise.
+function emitNumericBuiltin(output: List<Text>, textState: List<Text>, state: List<Integer>, name: Text, values: List<Text>, types: List<Integer>, resultType: List<Integer>): Text {
+    if isFloatFunction(name) {
+        requireBuiltinArguments(name, types, 1, 7)
+        let callee = "llvm." + name + ".f64"
+        if name == "tan" || name == "asin" || name == "acos" || name == "atan" {
+            callee = "minyar_" + name
+        }
+        setType(resultType, 7)
+        return emitCall(output, textState, state, 7, callee, values, types)
+    }
+    if name == "atan2" || name == "pow" {
+        requireBuiltinArguments(name, types, 2, 7)
+        let callee = "llvm.pow.f64"
+        if name == "atan2" {
+            callee = "minyar_atan2"
+        }
+        setType(resultType, 7)
+        return emitCall(output, textState, state, 7, callee, values, types)
+    }
+    if name == "wrappingAdd" || name == "wrappingSubtract" || name == "wrappingMultiply" {
+        requireBuiltinArguments(name, types, 2, 1)
+        let instruction = "add"
+        if name == "wrappingSubtract" { instruction = "sub" }
+        if name == "wrappingMultiply" { instruction = "mul" }
+        setType(resultType, 1)
+        return emitInstruction(output, textState, state, instruction + " i64 " + values[0] + ", " + values[1])
+    }
+    if name == "abs" {
+        if types.length == 1 && types[0] == 7 {
+            setType(resultType, 7)
+            return emitCall(output, textState, state, 7, "llvm.fabs.f64", values, types)
+        }
+        requireBuiltinArguments(name, types, 1, 1)
+        setType(resultType, 1)
+        return emitCall(output, textState, state, 1, "minyar_integer_absolute", values, types)
+    }
+    if name == "min" || name == "max" || name == "clamp" {
+        let count = 2
+        if name == "clamp" { count = 3 }
+        let type = 1
+        if types.length > 0 && types[0] == 7 { type = 7 }
+        if types.length != count || (type != 1 && type != 7) {
+            fail(name + " expects " + Text(count) + " Integer or " + Text(count) + " Float arguments")
+        }
+        requireBuiltinArguments(name, types, count, type)
+        setType(resultType, type)
+        if name == "clamp" {
+            let pairTypes = typePairOf(type)
+            let checkName = "minyar_check_clamp_integer"
+            if type == 7 { checkName = "minyar_check_clamp_float" }
+            emitCall(output, textState, state, 5, checkName, pairOf(values[1], values[2]), pairTypes)
+            let raised = emitMinimumOrMaximum(output, textState, state, "max", type, pairOf(values[0], values[1]), pairTypes)
+            return emitMinimumOrMaximum(output, textState, state, "min", type, pairOf(raised, values[2]), pairTypes)
+        }
+        return emitMinimumOrMaximum(output, textState, state, name, type, values, types)
+    }
+    if name == "Float" {
+        if types.length == 1 && types[0] == 7 {
+            setType(resultType, 7)
+            return values[0]
+        }
+        requireBuiltinArguments(name, types, 1, 1)
+        setType(resultType, 7)
+        return emitInstruction(output, textState, state, "sitofp i64 " + values[0] + " to double")
+    }
+    if name == "Integer" {
+        setType(resultType, 1)
+        if types.length == 1 && types[0] == 1 {
+            return values[0]
+        }
+        if types.length == 1 && types[0] == 3 {
+            return emitInstruction(output, textState, state, "zext i32 " + values[0] + " to i64")
+        }
+        if types.length != 1 || types[0] != 7 {
+            fail("Integer expects one Integer, Float, or Character argument")
+        }
+        return emitCall(output, textState, state, 1, "minyar_float_integer", values, types)
+    }
+    requireBuiltinArguments(name, types, 1, 1)
+    setType(resultType, 3)
+    return emitCall(output, textState, state, 3, "minyar_integer_character", values, types)
+}
+
+function emitMinimumOrMaximum(output: List<Text>, textState: List<Text>, state: List<Integer>, name: Text, type: Integer, values: List<Text>, types: List<Integer>): Text {
+    if type == 7 {
+        let callee = "llvm.minnum.f64"
+        if name == "max" { callee = "llvm.maxnum.f64" }
+        return emitCall(output, textState, state, 7, callee, values, types)
+    }
+    let condition = "slt"
+    if name == "max" { condition = "sgt" }
+    let chooseLeft = emitInstruction(output, textState, state, "icmp " + condition + " i64 " + values[0] + ", " + values[1])
+    return emitInstruction(output, textState, state, "select i1 " + chooseLeft + ", i64 " + values[0] + ", i64 " + values[1])
 }
 
 function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, resultType: List<Integer>): Text {
@@ -2161,12 +2594,15 @@ function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
     let value = ""
     if name == "print" {
         // checkBuiltinArguments has already established the single argument.
-        if argumentTypes[0] > 4 {
-            fail("print expects one Integer, Text, Character, or Boolean value")
+        if argumentTypes[0] > 4 && argumentTypes[0] != 7 {
+            fail("print expects one Integer, Float, Text, Character, or Boolean value")
         }
         let suffix = "text"
         if argumentTypes[0] == 1 {
             suffix = "integer"
+        }
+        if argumentTypes[0] == 7 {
+            suffix = "float"
         }
         if argumentTypes[0] == 3 {
             suffix = "character"
@@ -2208,6 +2644,9 @@ function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                     let suffix = "boolean"
                     if argumentTypes[0] == 1 {
                         suffix = "integer"
+                    }
+                    if argumentTypes[0] == 7 {
+                        suffix = "float"
                     }
                     if argumentTypes[0] == 3 {
                         suffix = "character"
@@ -2270,50 +2709,54 @@ function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                                 addOutput(output, ")\n")
                                 setType(resultType, 5)
                             } else {
-                                let functionIndex = state[5]
-                                if functionIndex < 0 || functionNames[functionIndex] != name {
-                                    functionIndex = findFunction(functionNames, symbolKinds, functionReturnTypes, name)
-                                    state[5] = functionIndex
-                                }
-                                if functionIndex < 0 {
-                                    fail("I can't find a function named '" + readableDeclarationName(name) + "'")
-                                }
-                                if argumentValues.length != functionParameterCounts[functionIndex] {
-                                    fail(readableDeclarationName(name) + " expects " + Text(functionParameterCounts[functionIndex]) + " arguments, but received " + Text(argumentValues.length) + " near " + describeLocation(tokenLines[state[0]]))
-                                }
-                                let parameterOffset = functionParameterOffset(functionParameterCounts, functionIndex)
-                                let argumentIndex = 0
-                                while argumentIndex < argumentValues.length {
-                                    if argumentTypes[argumentIndex] != functionParameterTypes[parameterOffset + argumentIndex] {
-                                        fail(describeLocation(tokenLines[state[0]]) + ": an argument passed to " + readableDeclarationName(name) + " has the wrong type")
+                                if isNumericBuiltin(name) {
+                                    value = emitNumericBuiltin(output, textState, state, name, argumentValues, argumentTypes, resultType)
+                                } else {
+                                    let functionIndex = state[5]
+                                    if functionIndex < 0 || functionNames[functionIndex] != name {
+                                        functionIndex = findFunction(functionNames, symbolKinds, functionReturnTypes, name)
+                                        state[5] = functionIndex
                                     }
-                                    argumentIndex = argumentIndex + 1
-                                }
-                                let returnType = functionReturnTypes[functionIndex]
-                                addOutput(output, "  ")
-                                if returnType != 5 {
-                                    let temporary = newTemporary(state)
-                                    value = valueName(textState, temporary)
-                                    addOutput(output, value)
-                                    addOutput(output, " = ")
-                                }
-                                addOutput(output, "call ")
-                                addOutput(output, llvmType(returnType))
-                                addOutput(output, " @")
-                                addOutput(output, name)
-                                addOutput(output, "(")
-                                argumentIndex = 0
-                                while argumentIndex < argumentValues.length {
-                                    if argumentIndex > 0 {
-                                        addOutput(output, ", ")
+                                    if functionIndex < 0 {
+                                        fail("I can't find a function named '" + readableDeclarationName(name) + "'")
                                     }
-                                    addOutput(output, llvmType(argumentTypes[argumentIndex]))
-                                    addOutput(output, " ")
-                                    addOutput(output, argumentValues[argumentIndex])
-                                    argumentIndex = argumentIndex + 1
+                                    if argumentValues.length != functionParameterCounts[functionIndex] {
+                                        fail(readableDeclarationName(name) + " expects " + Text(functionParameterCounts[functionIndex]) + " arguments, but received " + Text(argumentValues.length) + " near " + describeLocation(tokenLines[state[0]]))
+                                    }
+                                    let parameterOffset = functionParameterOffset(functionParameterCounts, functionIndex)
+                                    let argumentIndex = 0
+                                    while argumentIndex < argumentValues.length {
+                                        if argumentTypes[argumentIndex] != functionParameterTypes[parameterOffset + argumentIndex] {
+                                            fail(describeLocation(tokenLines[state[0]]) + ": an argument passed to " + readableDeclarationName(name) + " has the wrong type")
+                                        }
+                                        argumentIndex = argumentIndex + 1
+                                    }
+                                    let returnType = functionReturnTypes[functionIndex]
+                                    addOutput(output, "  ")
+                                    if returnType != 5 {
+                                        let temporary = newTemporary(state)
+                                        value = valueName(textState, temporary)
+                                        addOutput(output, value)
+                                        addOutput(output, " = ")
+                                    }
+                                    addOutput(output, "call ")
+                                    addOutput(output, llvmType(returnType))
+                                    addOutput(output, " @")
+                                    addOutput(output, name)
+                                    addOutput(output, "(")
+                                    argumentIndex = 0
+                                    while argumentIndex < argumentValues.length {
+                                        if argumentIndex > 0 {
+                                            addOutput(output, ", ")
+                                        }
+                                        addOutput(output, llvmType(argumentTypes[argumentIndex]))
+                                        addOutput(output, " ")
+                                        addOutput(output, argumentValues[argumentIndex])
+                                        argumentIndex = argumentIndex + 1
+                                    }
+                                    addOutput(output, ")\n")
+                                    setType(resultType, returnType)
                                 }
-                                addOutput(output, ")\n")
-                                setType(resultType, returnType)
                             }
                         }
                     }
@@ -2331,27 +2774,465 @@ function nextLocal(state: List<Integer>): Integer {
     return id
 }
 
-function looksLikeIndexAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, state: List<Integer>): Boolean {
-    let position = state[0] + 1
-    let depth = 0
-    let result = false
-    if tokenTexts[position] == "[" {
-        depth = 1
-        position = position + 1
-        while depth > 0 && tokenKinds[position] != 0 {
-            if tokenTexts[position] == "[" {
-                depth = depth + 1
+function isAssignmentOperator(token: Text): Boolean {
+    return token == "=" || token == "+=" || token == "-=" || token == "*=" || token == "/=" || token == "%="
+}
+
+// Find the operator of `name(.field | [position])* op= value`, or -1 when the
+// statement is not an assignment.
+function assignmentOperatorPosition(tokenKinds: List<Integer>, tokenTexts: List<Text>, start: Integer): Integer {
+    if tokenKinds[start] != 1 {
+        return -1
+    }
+    let position = start + 1
+    let searching = true
+    while searching {
+        if tokenKinds[position] == 4 && tokenTexts[position] == "." && tokenKinds[position + 1] == 1 {
+            position = position + 2
+        } else {
+            if tokenKinds[position] == 4 && tokenTexts[position] == "[" {
+                let depth = 1
+                position = position + 1
+                while depth > 0 && tokenKinds[position] != 0 {
+                    if tokenKinds[position] == 4 && tokenTexts[position] == "[" {
+                        depth = depth + 1
+                    }
+                    if tokenKinds[position] == 4 && tokenTexts[position] == "]" {
+                        depth = depth - 1
+                    }
+                    position = position + 1
+                }
+                if depth > 0 {
+                    return -1
+                }
+            } else {
+                searching = false
             }
-            if tokenTexts[position] == "]" {
-                depth = depth - 1
-            }
-            position = position + 1
-        }
-        if depth == 0 {
-            result = tokenTexts[position] == "="
         }
     }
-    return result
+    if tokenKinds[position] == 4 && isAssignmentOperator(tokenTexts[position]) {
+        return position
+    }
+    return -1
+}
+
+function loadLocal(output: List<Text>, textState: List<Text>, state: List<Integer>, id: Integer, type: Integer): Text {
+    if id < 0 {
+        return output[-id - 1]
+    }
+    let value = valueName(textState, newTemporary(state))
+    addOutput(output, "  ")
+    addOutput(output, value)
+    addOutput(output, " = load ")
+    addOutput(output, llvmType(type))
+    addOutput(output, ", ptr %local.")
+    addOutput(output, Text(id))
+    addOutput(output, "\n")
+    return value
+}
+
+function storeLocal(output: List<Text>, id: Integer, type: Integer, value: Text) {
+    addOutput(output, "  store ")
+    addOutput(output, llvmType(type))
+    addOutput(output, " ")
+    addOutput(output, value)
+    addOutput(output, ", ptr %local.")
+    addOutput(output, Text(id))
+    addOutput(output, "\n")
+}
+
+function readRecordField(output: List<Text>, textState: List<Text>, state: List<Integer>, record: Text, field: Integer, type: Integer): Text {
+    let raw = valueName(textState, newTemporary(state))
+    addOutput(output, "  ")
+    addOutput(output, raw)
+    addOutput(output, " = call i64 @minyar_record_get(ptr ")
+    addOutput(output, record)
+    addOutput(output, ", i64 ")
+    addOutput(output, Text(field))
+    addOutput(output, ")\n")
+    return slotAsValue(output, textState, state, raw, type)
+}
+
+function readListElement(output: List<Text>, textState: List<Text>, state: List<Integer>, list: Text, position: Text, type: Integer): Text {
+    let raw = valueName(textState, newTemporary(state))
+    addOutput(output, "  ")
+    addOutput(output, raw)
+    addOutput(output, " = call i64 @minyar_list_get(ptr ")
+    addOutput(output, list)
+    addOutput(output, ", i64 ")
+    addOutput(output, position)
+    addOutput(output, ")\n")
+    return slotAsValue(output, textState, state, raw, type)
+}
+
+// Adding an edge R -> F can close a first cycle only when a value reachable
+// from F can itself be an R. Mirror checkListMutation for record fields.
+function checkFieldMutation(recordType: Integer, fieldType: Integer, counts: List<Integer>, fields: List<Integer>, location: Text) {
+    let recordCount = counts.length / 2
+    let visited: List<Boolean> = []
+    let index = 0
+    while index < recordCount {
+        visited.add(false)
+        index = index + 1
+    }
+    let pending: List<Integer> = []
+    pending.add(fieldType)
+    index = 0
+    while index < pending.length {
+        let type = pending[index]
+        index = index + 1
+        while isListType(type) {
+            type = listElementType(type)
+        }
+        if isRecordType(type) {
+            if type == recordType {
+                fail(describeLocation(location) + ": assigning this field could create a reference cycle; construct a new record instead")
+            }
+            let record = type - 1000
+            if !visited[record] {
+                visited[record] = true
+                let first = functionParameterOffset(counts, record)
+                let field = 0
+                while field < counts[record] {
+                    pending.add(fields[first + field])
+                    field = field + 1
+                }
+            }
+        }
+    }
+}
+
+// Parse the right side of `target op= value`. A compound operator combines the
+// current value with the right side exactly as the binary operator would.
+function assignedValue(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, binary: Text, current: Text, type: Integer, valueType: List<Integer>, location: Text): Text {
+    setType(valueType, type)
+    if binary == "" {
+        return parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, valueType)
+    }
+    let rightType: List<Integer> = []
+    rightType.add(type)
+    let right = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, rightType)
+    setType(valueType, 0)
+    return emitBinary(output, textState, state, binary, current, type, -1, right, rightType[0], valueType, location)
+}
+
+// Assign through a local, record fields, and List positions. Plain `local = v`
+// keeps its dedicated path in compileStatement for Text append ownership.
+function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, operatorPosition: Integer) {
+    let operator = tokenTexts[operatorPosition]
+    let operatorLocation = tokenLines[operatorPosition]
+    let binary = ""
+    if operator != "=" {
+        binary = operator.slice(0, 1)
+    }
+    let name = tokenTexts[state[0]]
+    let local = findLocal(localNames, localLengths, state, name)
+    if local < 0 {
+        fail(describeLocation(tokenLines[state[0]]) + ": I can't find a value named '" + name + "'")
+    }
+    let receiverType = localTypes[local]
+    let receiver = loadLocal(output, textState, state, localIds[local], receiverType)
+    state[0] = state[0] + 1
+    let valueType: List<Integer> = []
+    valueType.add(0)
+    if state[0] == operatorPosition {
+        state[0] = operatorPosition + 1
+        let value = assignedValue(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, binary, receiver, receiverType, valueType, operatorLocation)
+        if valueType[0] != receiverType {
+            fail(describeLocation(operatorLocation) + ": an assignment to '" + name + "' has the wrong type")
+        }
+        assignReference(output, state, localIds[local], value, valueType)
+        storeLocal(output, localIds[local], receiverType, value)
+        return
+    }
+    let done = false
+    while !done {
+        if tokenTexts[state[0]] == "." {
+            let member = tokenTexts[state[0] + 1]
+            let memberLocation = tokenLines[state[0] + 1]
+            state[0] = state[0] + 2
+            if !isRecordType(receiverType) {
+                fail(describeLocation(memberLocation) + ": only record fields can be assigned, and " + describeType(receiverType) + " has no field named '" + member + "'")
+            }
+            let field = findRecordField(functionParameterCounts, functionParameterNames, receiverType, member)
+            if field < 0 {
+                fail(describeLocation(memberLocation) + ": record '" + readableDeclarationName(functionNames[receiverType - 1000]) + "' has no field named '" + member + "'")
+            }
+            let fieldType = functionParameterTypes[field]
+            let fieldIndex = field - functionParameterOffset(functionParameterCounts, receiverType - 1000)
+            if state[0] == operatorPosition {
+                state[0] = operatorPosition + 1
+                if isReferenceType(fieldType) {
+                    checkFieldMutation(receiverType, fieldType, functionParameterCounts, functionParameterTypes, memberLocation)
+                }
+                let current = ""
+                if binary != "" {
+                    current = readRecordField(output, textState, state, receiver, fieldIndex, fieldType)
+                    borrowReference(output, state, current, fieldType)
+                }
+                let value = assignedValue(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, binary, current, fieldType, valueType, operatorLocation)
+                if valueType[0] != fieldType {
+                    fail(describeLocation(operatorLocation) + ": record field '" + member + "' needs " + describeType(fieldType) + ", not " + describeType(valueType[0]))
+                }
+                let slot = valueAsListSlot(output, textState, state, value, fieldType)
+                if isReferenceType(fieldType) {
+                    let transfers = "0"
+                    if takeResult(output, state, value, valueType) {
+                        transfers = "1"
+                    }
+                    addOutput(output, "  call void @minyar_record_replace(ptr ")
+                    addOutput(output, receiver)
+                    addOutput(output, ", i64 ")
+                    addOutput(output, Text(fieldIndex))
+                    addOutput(output, ", i64 ")
+                    addOutput(output, slot)
+                    addOutput(output, ", i64 ")
+                    addOutput(output, transfers)
+                    addOutput(output, ")\n")
+                } else {
+                    addOutput(output, "  call void @minyar_record_set_scalar(ptr ")
+                    addOutput(output, receiver)
+                    addOutput(output, ", i64 ")
+                    addOutput(output, Text(fieldIndex))
+                    addOutput(output, ", i64 ")
+                    addOutput(output, slot)
+                    addOutput(output, ")\n")
+                }
+                done = true
+            } else {
+                receiver = readRecordField(output, textState, state, receiver, fieldIndex, fieldType)
+                receiverType = fieldType
+                borrowReference(output, state, receiver, receiverType)
+            }
+        } else {
+            let bracketLocation = tokenLines[state[0]]
+            state[0] = state[0] + 1
+            let positionType: List<Integer> = []
+            positionType.add(0)
+            let position = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, positionType)
+            expectToken(tokenKinds, tokenTexts, tokenLines, state, "]")
+            requireType(tokenLines, state, positionType[0], 1, "a position must be an Integer")
+            if !isListType(receiverType) && receiverType != 8 {
+                fail(describeLocation(bracketLocation) + ": indexed assignment needs a List or Bytes, not " + describeType(receiverType))
+            }
+            let elementType = 1
+            if isListType(receiverType) {
+                elementType = listElementType(receiverType)
+            }
+            if state[0] == operatorPosition {
+                state[0] = operatorPosition + 1
+                let current = ""
+                if receiverType == 8 {
+                    if binary != "" {
+                        current = emitBytesRead(output, textState, state, receiver, position)
+                    }
+                    let value = assignedValue(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, binary, current, 1, valueType, operatorLocation)
+                    requireType(tokenLines, state, valueType[0], 1, "a byte must be an Integer")
+                    addOutput(output, "  call void @minyar_bytes_set(ptr ")
+                    addOutput(output, receiver)
+                    addOutput(output, ", i64 ")
+                    addOutput(output, position)
+                    addOutput(output, ", i64 ")
+                    addOutput(output, value)
+                    addOutput(output, ")\n")
+                } else {
+                    checkListMutation(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+                    if binary != "" {
+                        current = readListElement(output, textState, state, receiver, position, elementType)
+                        borrowReference(output, state, current, elementType)
+                    }
+                    let value = assignedValue(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, binary, current, elementType, valueType, operatorLocation)
+                    if valueType[0] != elementType {
+                        fail(describeLocation(operatorLocation) + ": an indexed assignment needs " + describeType(elementType) + ", not " + describeType(valueType[0]))
+                    }
+                    let slot = valueAsListSlot(output, textState, state, value, elementType)
+                    if takeResult(output, state, value, valueType) {
+                        addOutput(output, "  call void @minyar_list_set_take(ptr ")
+                    } else {
+                        addOutput(output, "  call void @minyar_list_set(ptr ")
+                    }
+                    addOutput(output, receiver)
+                    addOutput(output, ", i64 ")
+                    addOutput(output, position)
+                    addOutput(output, ", i64 ")
+                    addOutput(output, slot)
+                    addOutput(output, ")\n")
+                }
+                done = true
+            } else {
+                if receiverType == 8 {
+                    fail(describeLocation(bracketLocation) + ": a byte has no fields or positions to assign")
+                }
+                receiver = readListElement(output, textState, state, receiver, position, elementType)
+                receiverType = elementType
+                borrowReference(output, state, receiver, receiverType)
+            }
+        }
+    }
+}
+
+function emitBytesRead(output: List<Text>, textState: List<Text>, state: List<Integer>, bytes: Text, position: Text): Text {
+    let value = valueName(textState, newTemporary(state))
+    addOutput(output, "  ")
+    addOutput(output, value)
+    addOutput(output, " = call i64 @minyar_bytes_get(ptr ")
+    addOutput(output, bytes)
+    addOutput(output, ", i64 ")
+    addOutput(output, position)
+    addOutput(output, ")\n")
+    return value
+}
+
+// Loops push a marker into the lexical scope so break and continue find the
+// innermost loop. Its name cannot be written in source; its type is -1 for
+// while and -2 for for, and its id is the loop's first label.
+function findLoopMarker(localNames: List<Text>, localLengths: List<Integer>, state: List<Integer>): Integer {
+    return findLocal(localNames, localLengths, state, " loop")
+}
+
+function compileLoopJump(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>) {
+    let keyword = tokenTexts[state[0]]
+    let marker = findLoopMarker(localNames, localLengths, state)
+    if marker < 0 {
+        fail(describeLocation(tokenLines[state[0]]) + ": '" + keyword + "' can only be used inside a loop")
+    }
+    state[0] = state[0] + 1
+    let label = localIds[marker]
+    if localTypes[marker] == -1 {
+        if keyword == "continue" {
+            addOutput(output, "  call void @minyar_rc_step()\n")
+            addOutput(output, "  br label %while.condition." + Text(label) + "\n")
+        } else {
+            addOutput(output, "  br label %while.end." + Text(label + 2) + "\n")
+        }
+    } else {
+        if keyword == "continue" {
+            addOutput(output, "  br label %for.step." + Text(label + 2) + "\n")
+        } else {
+            addOutput(output, "  br label %for.end." + Text(label + 3) + "\n")
+        }
+    }
+}
+
+// for name in start..end iterates Integers; for name in collection visits each
+// List element or Text character. Bounds and the collection are evaluated once;
+// the loop variable is a fresh binding for each iteration.
+function compileFor(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, returnType: Integer) {
+    state[0] = state[0] + 1
+    if tokenKinds[state[0]] != 1 {
+        fail(describeLocation(tokenLines[state[0]]) + ": expected a name after for")
+    }
+    let name = tokenTexts[state[0]]
+    state[0] = state[0] + 1
+    expectToken(tokenKinds, tokenTexts, tokenLines, state, "in")
+    let firstLoopLocal = state[3]
+    let sourceLocation = tokenLines[state[0]]
+    let sourceType: List<Integer> = []
+    sourceType.add(0)
+    let source = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, sourceType)
+    let loopLabel = newLabel(state)
+    let bodyLabel = newLabel(state)
+    let stepLabel = newLabel(state)
+    let endLabel = newLabel(state)
+    let counter = nextLocal(state)
+    addLocal(localNames, localTypes, localIds, localLengths, state, " for counter", 1, counter)
+    let limit = nextLocal(state)
+    addLocal(localNames, localTypes, localIds, localLengths, state, " for limit", 1, limit)
+    let collection = -1
+    let elementType = 1
+    if tokenIs(tokenKinds, tokenTexts, state, "..") {
+        requireType(tokenLines, state, sourceType[0], 1, "a range starts with an Integer")
+        state[0] = state[0] + 1
+        let endType: List<Integer> = []
+        endType.add(0)
+        let end = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, endType)
+        requireType(tokenLines, state, endType[0], 1, "a range ends with an Integer")
+        storeLocal(output, counter, 1, source)
+        storeLocal(output, limit, 1, end)
+    } else {
+        if isListType(sourceType[0]) {
+            elementType = listElementType(sourceType[0])
+        } else {
+            if sourceType[0] == 2 {
+                elementType = 3
+            } else {
+                if sourceType[0] == 8 {
+                    elementType = 1
+                } else {
+                    fail(describeLocation(sourceLocation) + ": for needs a range such as 0..count, a List, Text, or Bytes, not " + describeType(sourceType[0]))
+                }
+            }
+        }
+        collection = nextLocal(state)
+        addLocal(localNames, localTypes, localIds, localLengths, state, " for collection", sourceType[0], collection)
+        assignReference(output, state, collection, source, sourceType)
+        storeLocal(output, collection, sourceType[0], source)
+        storeLocal(output, counter, 1, "0")
+    }
+    addOutput(output, "  br label %for.condition." + Text(loopLabel) + "\n\nfor.condition." + Text(loopLabel) + ":\n")
+    textState[0] = "for.condition." + Text(loopLabel)
+    let position = loadLocal(output, textState, state, counter, 1)
+    let bound = ""
+    if collection < 0 {
+        bound = loadLocal(output, textState, state, limit, 1)
+    } else {
+        let items = loadLocal(output, textState, state, collection, sourceType[0])
+        let lengthFunction = "minyar_list_length"
+        if sourceType[0] == 2 {
+            lengthFunction = "minyar_text_length"
+        }
+        if sourceType[0] == 8 {
+            lengthFunction = "minyar_bytes_length"
+        }
+        let arguments: List<Text> = []
+        arguments.add(items)
+        let argumentTypes: List<Integer> = []
+        argumentTypes.add(sourceType[0])
+        bound = emitCall(output, textState, state, 1, lengthFunction, arguments, argumentTypes)
+    }
+    let continuing = emitInstruction(output, textState, state, "icmp slt i64 " + position + ", " + bound)
+    addOutput(output, "  br i1 " + continuing + ", label %for.body." + Text(bodyLabel) + ", label %for.end." + Text(endLabel) + "\n\nfor.body." + Text(bodyLabel) + ":\n")
+    textState[0] = "for.body." + Text(bodyLabel)
+    let element = position
+    if collection >= 0 {
+        let items = loadLocal(output, textState, state, collection, sourceType[0])
+        if isListType(sourceType[0]) {
+            element = readListElement(output, textState, state, items, position, elementType)
+        } else {
+            if sourceType[0] == 8 {
+                element = emitBytesRead(output, textState, state, items, position)
+            } else {
+                element = valueName(textState, newTemporary(state))
+                addOutput(output, "  " + element + " = call i32 @minyar_text_character_at(ptr " + items + ", i64 " + position + ")\n")
+            }
+        }
+    }
+    let variable = nextLocal(state)
+    addLocal(localNames, localTypes, localIds, localLengths, state, name, elementType, variable)
+    let elementResult: List<Integer> = []
+    elementResult.add(elementType)
+    assignReference(output, state, variable, element, elementResult)
+    storeLocal(output, variable, elementType, element)
+    addLocal(localNames, localTypes, localIds, localLengths, state, " loop", -2, loopLabel)
+    let bodyReturns = compileBlock(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, returnType)
+    if !bodyReturns {
+        addOutput(output, "  br label %for.step." + Text(stepLabel) + "\n")
+    }
+    addOutput(output, "\nfor.step." + Text(stepLabel) + ":\n")
+    textState[0] = "for.step." + Text(stepLabel)
+    let current = loadLocal(output, textState, state, counter, 1)
+    // The condition proved current < bound, so this increment cannot overflow.
+    let next = emitInstruction(output, textState, state, "add nsw i64 " + current + ", 1")
+    storeLocal(output, counter, 1, next)
+    addOutput(output, "  call void @minyar_rc_step()\n")
+    addOutput(output, "  br label %for.condition." + Text(loopLabel) + "\n\nfor.end." + Text(endLabel) + ":\n")
+    textState[0] = "for.end." + Text(endLabel)
+    let scoped = firstLoopLocal
+    while scoped < state[3] {
+        rootLocal(output, state, localIds[scoped], "null", localTypes[scoped])
+        scoped = scoped + 1
+    }
+    state[3] = firstLoopLocal
 }
 
 function compileBlock(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, returnType: Integer): Boolean {
@@ -2527,6 +3408,13 @@ function compileStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
                 }
                 returns = thenReturns && hasElse && elseReturns
             } else {
+                if tokenIs(tokenKinds, tokenTexts, state, "for") && tokenKinds[state[0] + 1] == 1 && tokenTexts[state[0] + 2] == "in" {
+                    compileFor(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, returnType)
+                } else {
+                if (tokenIs(tokenKinds, tokenTexts, state, "break") || tokenIs(tokenKinds, tokenTexts, state, "continue")) && (tokenKinds[state[0] + 1] == 6 || tokenTexts[state[0] + 1] == "}") {
+                    compileLoopJump(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output)
+                    returns = true
+                } else {
                 if tokenIs(tokenKinds, tokenTexts, state, "while") {
                     state[0] = state[0] + 1
                     let conditionLabel = newLabel(state)
@@ -2552,7 +3440,10 @@ function compileStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
                     addOutput(output, Text(bodyLabel))
                     addOutput(output, ":\n")
                     textState[0] = "while.body." + Text(bodyLabel)
+                    let markerScope = state[3]
+                    addLocal(localNames, localTypes, localIds, localLengths, state, " loop", -1, conditionLabel)
                     let bodyReturns = compileBlock(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, returnType)
+                    state[3] = markerScope
                     if !bodyReturns {
                         /* A long scalar loop must still service cleanup debt
                            created before it. Scalar-only functions erase this
@@ -2597,54 +3488,9 @@ function compileStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
                         addOutput(output, Text(localIds[local]))
                         addOutput(output, "\n")
                     } else {
-                        if tokenKinds[state[0]] == 1 && tokenTexts[state[0] + 1] == "." && state[0] + 3 < tokenTexts.length && tokenTexts[state[0] + 3] == "=" {
-                            fail(describeLocation(tokenLines[state[0]]) + ": record fields are immutable; construct a new record instead")
-                        } else {
-                        if tokenKinds[state[0]] == 1 && looksLikeIndexAssignment(tokenKinds, tokenTexts, state) {
-                            let name = tokenTexts[state[0]]
-                            let local = findLocal(localNames, localLengths, state, name)
-                            if local < 0 || !isListType(localTypes[local]) {
-                                fail("indexed assignment needs a List")
-                            }
-                            let collection = ""
-                            let id = localIds[local]
-                            if id < 0 {
-                                collection = output[-id - 1]
-                            } else {
-                                let collectionTemporary = newTemporary(state)
-                                collection = valueName(textState, collectionTemporary)
-                                addOutput(output, "  ")
-                                addOutput(output, collection)
-                                addOutput(output, " = load ptr, ptr %local.")
-                                addOutput(output, Text(id))
-                                addOutput(output, "\n")
-                            }
-                            state[0] = state[0] + 2
-                            let positionType: List<Integer> = []
-                            positionType.add(0)
-                            let position = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, positionType)
-                            expectToken(tokenKinds, tokenTexts, tokenLines, state, "]")
-                            requireType(tokenLines, state, positionType[0], 1, "a position must be an Integer")
-                            expectToken(tokenKinds, tokenTexts, tokenLines, state, "=")
-                            let valueType: List<Integer> = []
-                            valueType.add(listElementType(localTypes[local]))
-                            let value = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, valueType)
-                            if valueType[0] != listElementType(localTypes[local]) {
-                                fail("an indexed assignment has the wrong type")
-                            }
-                            checkListMutation(localTypes[local], functionParameterCounts, functionParameterTypes, functionReturnTypes)
-                            let slot = valueAsListSlot(output, textState, state, value, valueType[0])
-                            if takeResult(output, state, value, valueType) {
-                                addOutput(output, "  call void @minyar_list_set_take(ptr ")
-                            } else {
-                                addOutput(output, "  call void @minyar_list_set(ptr ")
-                            }
-                            addOutput(output, collection)
-                            addOutput(output, ", i64 ")
-                            addOutput(output, position)
-                            addOutput(output, ", i64 ")
-                            addOutput(output, slot)
-                            addOutput(output, ")\n")
+                        let assignmentOperator = assignmentOperatorPosition(tokenKinds, tokenTexts, state[0])
+                        if assignmentOperator >= 0 {
+                            compileAssignment(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, assignmentOperator)
                         } else {
                             let ignoredType: List<Integer> = []
                             ignoredType.add(0)
@@ -2653,6 +3499,7 @@ function compileStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
                                 addOutput(output, "  unreachable\n")
                                 returns = true
                             }
+                        }
                         }
                         }
                     }
@@ -2682,7 +3529,7 @@ function markAssignedParameters(tokenKinds: List<Integer>, tokenTexts: List<Text
     let depth = 0
     let done = false
     while tokenKinds[position] != 0 && !done {
-        if tokenKinds[position] == 1 && tokenTexts[position + 1] == "=" {
+        if tokenKinds[position] == 1 && tokenKinds[position + 1] == 4 && isAssignmentOperator(tokenTexts[position + 1]) {
             parameter = 0
             while parameter < count {
                 if tokenTexts[position] == names[parameter] { types[count + parameter] = 1 }
@@ -2991,6 +3838,35 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     addOutput(output, "declare void @minyar_print_boolean(i1)\n")
     addOutput(output, "declare void @minyar_fail(ptr)\n")
     addOutput(output, "declare void @minyar_exit(i64)\n")
+    addOutput(output, "declare void @minyar_print_float(double)\n")
+    addOutput(output, "declare void @minyar_record_replace(ptr, i64, i64, i64)\n")
+    addOutput(output, "declare i64 @minyar_bytes_get(ptr, i64)\n")
+    addOutput(output, "declare void @minyar_bytes_set(ptr, i64, i64)\n")
+    addOutput(output, "declare i64 @minyar_bytes_length(ptr)\n")
+    addOutput(output, "declare ptr @minyar_float_text(double)\n")
+    addOutput(output, "declare i64 @minyar_float_integer(double)\n")
+    addOutput(output, "declare i32 @minyar_integer_character(i64)\n")
+    addOutput(output, "declare i64 @minyar_integer_absolute(i64)\n")
+    addOutput(output, "declare void @minyar_check_clamp_integer(i64, i64)\n")
+    addOutput(output, "declare void @minyar_check_clamp_float(double, double)\n")
+    addOutput(output, "declare void @minyar_check_shift(i64)\n")
+    addOutput(output, "declare double @minyar_tan(double)\n")
+    addOutput(output, "declare double @minyar_asin(double)\n")
+    addOutput(output, "declare double @minyar_acos(double)\n")
+    addOutput(output, "declare double @minyar_atan(double)\n")
+    addOutput(output, "declare double @minyar_atan2(double, double)\n")
+    addOutput(output, "declare double @llvm.sqrt.f64(double)\n")
+    addOutput(output, "declare double @llvm.sin.f64(double)\n")
+    addOutput(output, "declare double @llvm.cos.f64(double)\n")
+    addOutput(output, "declare double @llvm.exp.f64(double)\n")
+    addOutput(output, "declare double @llvm.log.f64(double)\n")
+    addOutput(output, "declare double @llvm.floor.f64(double)\n")
+    addOutput(output, "declare double @llvm.ceil.f64(double)\n")
+    addOutput(output, "declare double @llvm.round.f64(double)\n")
+    addOutput(output, "declare double @llvm.fabs.f64(double)\n")
+    addOutput(output, "declare double @llvm.pow.f64(double, double)\n")
+    addOutput(output, "declare double @llvm.minnum.f64(double, double)\n")
+    addOutput(output, "declare double @llvm.maxnum.f64(double, double)\n")
     addOutput(output, "declare i1 @minyar_texts_are_equal(ptr, ptr)\n")
     addOutput(output, "declare ptr @minyar_join_text(ptr, ptr)\n")
     addOutput(output, "declare ptr @minyar_join_text_take_left(ptr, ptr)\n")
@@ -3482,6 +4358,13 @@ function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integ
                     if token == ">" && genericDepth > 0 {
                         genericDepth = genericDepth - 1
                         if genericDepth == 0 {
+                            typeMode = false
+                        }
+                    }
+                    if token == ">>" && genericDepth > 0 {
+                        genericDepth = genericDepth - 2
+                        if genericDepth <= 0 {
+                            genericDepth = 0
                             typeMode = false
                         }
                     }

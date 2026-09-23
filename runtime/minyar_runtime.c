@@ -21,6 +21,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <signal.h>
+#include <math.h>
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
@@ -596,6 +597,23 @@ void minyar_record_set_take(MinyarRecord *record, long long field, long long val
 void minyar_record_set_reference(MinyarRecord *record, long long field, long long value) {
     minyar_rc_retain((void *)(uintptr_t)value);
     minyar_record_set_take(record, field, value);
+}
+
+/* Replace a reference field of a live record. The compiler has proved that
+ * the new edge cannot close an ownership cycle. */
+void minyar_record_replace(MinyarRecord *record, long long field, long long value,
+                           long long take_value) {
+    if ((unsigned long long)field >= (unsigned long long)record->length)
+        list_position_stop(field, record->length);
+#ifndef MINYAR_COMPILER_ARENA
+    if (!take_value) minyar_rc_retain((void *)(uintptr_t)value);
+    long long previous = record->values[field];
+    record->values[field] = value;
+    minyar_rc_release((void *)(uintptr_t)previous);
+#else
+    (void)take_value;
+    record->values[field] = value;
+#endif
 }
 
 static MinyarText *copy_c_text(const char *source) {
@@ -1315,3 +1333,112 @@ void minyar_check_integer_division(long long left, long long right) {
     if (left == LLONG_MIN && right == -1)
         integer_division_stop("this Integer division is outside the supported range.");
 }
+
+/* Float text uses the shortest decimal digits that read back as the same
+ * value. Plain notation is used for ordinary magnitudes and always keeps a
+ * point, so a printed Float cannot be mistaken for an Integer. */
+static size_t format_float(double value, char *out, size_t capacity) {
+    if (isnan(value)) return (size_t)snprintf(out, capacity, "NaN");
+    if (isinf(value)) return (size_t)snprintf(out, capacity, value < 0 ? "-Infinity" : "Infinity");
+    char scientific[40];
+    int precision = 1;
+    for (; precision < 17; precision++) {
+        snprintf(scientific, sizeof(scientific), "%.*e", precision - 1, value);
+        if (strtod(scientific, NULL) == value) break;
+    }
+    snprintf(scientific, sizeof(scientific), "%.*e", precision - 1, value);
+    char digits[24];
+    size_t digit_count = 0;
+    const char *cursor = scientific;
+    int negative = *cursor == '-';
+    if (negative) cursor++;
+    for (; *cursor && *cursor != 'e'; cursor++)
+        if (*cursor >= '0' && *cursor <= '9') digits[digit_count++] = *cursor;
+    int exponent = atoi(cursor + 1);
+    while (digit_count > 1 && digits[digit_count - 1] == '0') digit_count--;
+    size_t length = 0;
+#define FLOAT_PUT(character) do { if (length + 1 < capacity) out[length] = (character); length++; } while (0)
+    if (negative) FLOAT_PUT('-');
+    if (exponent >= -7 && exponent < 21) {
+        if (exponent < 0) {
+            FLOAT_PUT('0');
+            FLOAT_PUT('.');
+            for (int zero = -1; zero > exponent; zero--) FLOAT_PUT('0');
+            for (size_t i = 0; i < digit_count; i++) FLOAT_PUT(digits[i]);
+        } else {
+            for (int i = 0; i <= exponent; i++) FLOAT_PUT((size_t)i < digit_count ? digits[i] : '0');
+            FLOAT_PUT('.');
+            if ((size_t)exponent + 1 < digit_count)
+                for (size_t i = (size_t)exponent + 1; i < digit_count; i++) FLOAT_PUT(digits[i]);
+            else
+                FLOAT_PUT('0');
+        }
+    } else {
+        FLOAT_PUT(digits[0]);
+        FLOAT_PUT('.');
+        if (digit_count > 1)
+            for (size_t i = 1; i < digit_count; i++) FLOAT_PUT(digits[i]);
+        else
+            FLOAT_PUT('0');
+        char suffix[8];
+        snprintf(suffix, sizeof(suffix), "e%+d", exponent);
+        for (const char *piece = suffix; *piece; piece++) FLOAT_PUT(*piece);
+    }
+#undef FLOAT_PUT
+    out[length < capacity ? length : capacity - 1] = 0;
+    return length;
+}
+
+void minyar_print_float(double value) {
+    char text[48];
+    format_float(value, text, sizeof(text));
+    if (puts(text) == EOF || fflush(stdout) == EOF)
+        output_error();
+}
+
+MinyarText *minyar_float_text(double value) {
+    char text[48];
+    size_t length = format_float(value, text, sizeof(text));
+    unsigned char *bytes = new_bytes((long long)length);
+    memcpy(bytes, text, length + 1);
+    return new_text(bytes, (long long)length, (long long)length);
+}
+
+long long minyar_float_integer(double value) {
+    /* Both bounds are exact powers of two, so the comparison is exact. */
+    if (!(value >= -9223372036854775808.0 && value < 9223372036854775808.0))
+        minyar_stop(isnan(value) ? "NaN cannot be converted to an Integer."
+                                 : "this Float is outside the Integer range.");
+    return (long long)value;
+}
+
+int minyar_integer_character(long long value) {
+    if (value < 0 || value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff))
+        minyar_stop("this Integer is not a Unicode scalar value.");
+    return (int)value;
+}
+
+long long minyar_integer_absolute(long long value) {
+    if (value == LLONG_MIN)
+        minyar_stop("the absolute value of this Integer is outside the supported range.");
+    return value < 0 ? -value : value;
+}
+
+void minyar_check_clamp_integer(long long lower, long long upper) {
+    if (lower > upper) minyar_stop("clamp needs a lower bound that is not above its upper bound.");
+}
+
+void minyar_check_clamp_float(double lower, double upper) {
+    if (!(lower <= upper)) minyar_stop("clamp needs a lower bound that is not above its upper bound.");
+}
+
+void minyar_check_shift(long long count) {
+    if ((unsigned long long)count > 63)
+        minyar_stop("a shift count must be between 0 and 63.");
+}
+
+double minyar_tan(double value) { return tan(value); }
+double minyar_asin(double value) { return asin(value); }
+double minyar_acos(double value) { return acos(value); }
+double minyar_atan(double value) { return atan(value); }
+double minyar_atan2(double y, double x) { return atan2(y, x); }

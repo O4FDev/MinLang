@@ -46,10 +46,19 @@ The acyclicity argument uses the first possible cycle. A new record or List
 literal is unavailable to the source program until its construction finishes;
 each field or element is retained or transferred before evaluating subsequent
 initializers. Construction therefore cannot introduce the first cycle. That
-cycle must instead result from inserting a mutable edge from some List object
-of type `List<T>` to a value of type `T`. The existing return path in the heap
-would imply a type path from `T` back to `List<T>`, which the checker rejects.
-This argument includes transitive record fields, nested Lists and aliases.
+cycle must instead result from inserting a mutable edge: from some List object
+of type `List<T>` to a value of type `T`, or from a record of type `R` to a
+value of a reference field type `F`. The existing return path in the heap would
+imply a type path from `T` back to `List<T>`, or from `F` back to `R`, and the
+checker rejects both. Assigning a reference field whose type can reach its own
+record type fails with:
+
+```text
+assigning this field could create a reference cycle; construct a new record instead
+```
+
+Scalar field assignment adds no heap edge and is always permitted. This
+argument includes transitive record fields, nested Lists and aliases.
 
 The non-mutating `list.appended(value)` operation copies into a fresh List and
 is permitted for recursive element types. Because the result does not exist
@@ -60,8 +69,8 @@ construction, at linear cost per append, without weakening the mutation rule.
 Arbitrary cyclic graphs remain unsupported. Integer identifiers in a List of
 records remain an option; see [`examples/graph.min`](../examples/graph.min).
 Inferred lifetime regions and permissive mutation analysis are not implemented.
-Dynamic types, closures, foreign pointers, mutable record fields or changes to
-the type encoding must revisit this proof before being added.
+Dynamic types, closures, foreign pointers or changes to the type encoding must
+revisit this proof before being added.
 
 ## Compiler/runtime ownership contract
 
@@ -109,8 +118,9 @@ currently keep the managed representation.
 Each initializer is evaluated once in source order. The generated field reads
 use the captured scalar values, so a replaced object needs no allocation,
 reference count or cleanup. Unused records still evaluate their initializers.
-The proof relies on immutable fields and a binding that cannot escape or be
-reassigned: its initializer definitions dominate every permitted use, including
+The proof relies on a binding that cannot escape or be reassigned and whose
+fields are never assigned; any `name.field = value` or compound field
+assignment in scope keeps the managed representation: its initializer definitions dominate every permitted use, including
 uses within nested branches or the current loop iteration. Capturing a value
 does not reread a mutable initializer input later. Any future feature that
 allows whole-object access through another route must revisit this proof.

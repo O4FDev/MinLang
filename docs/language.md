@@ -8,20 +8,78 @@ of its lexical block. Assignment changes its value without changing its type.
 ```minyar
 let attempts = 3
 attempts = attempts - 1
+attempts -= 1
 ```
+
+Compound assignment (`+=`, `-=`, `*=`, `/=`, `%=`) applies the operator to the
+current value and stores the result. It works for locals, record fields and
+List positions, with the same type rules as the operator itself.
 
 ## Numbers and comparisons
 
 `Integer` ranges from -9,223,372,036,854,775,808 to 9,223,372,036,854,775,807.
 Arithmetic overflow and division by zero stop the program with an error.
 Integer literals outside this range are rejected.
-The minimum value is spelled `-9223372036854775808`.
+The minimum value is spelled `-9223372036854775808`. Hexadecimal literals such
+as `0xFF` are also Integers.
+
+`Float` is an IEEE 754 double-precision number. A Float literal has digits on
+both sides of its point, with an optional exponent: `1.0`, `0.25`, `6.02e23`.
+Float arithmetic follows IEEE 754, so dividing by zero gives an infinity rather
+than stopping. Printing a Float always shows a point or exponent, using the
+shortest digits that read back as the same value:
+
+```minyar
+print(0.1 + 0.2)       // 0.30000000000000004
+print(Float(7) / 2.0)  // 3.5
+print(Integer(-7.9))   // -7
+```
+
+Integer and Float never mix implicitly; convert with `Float(integer)` or
+`Integer(float)`. `Integer` truncates toward zero and stops if the Float is NaN
+or outside the Integer range. `Integer(character)` gives a code point and
+`Character(integer)` accepts any Unicode scalar value.
+
+Math functions take Floats: `sqrt`, `sin`, `cos`, `tan`, `asin`, `acos`,
+`atan`, `atan2(y, x)`, `exp`, `log`, `pow(base, exponent)`, `floor`, `ceil`
+and `round` (halves round away from zero). `abs`, `min`, `max` and
+`clamp(value, low, high)` accept Integers or Floats of one type.
+
+Integers also support bitwise `&`, `|`, `^`, `~` and the shifts `<<` and `>>`
+(arithmetic). A shift count outside 0 to 63 stops the program. For hashing and
+random number generators, `wrappingAdd`, `wrappingSubtract` and
+`wrappingMultiply` wrap around instead of stopping on overflow.
+
+Operators bind in this order, tightest first: `*`, `/`, `%`, `<<`, `>>`, `&`;
+then `+`, `-`, `|`, `^`; then `<`, `>`, `<=`, `>=`; then `==`, `!=`; then `&&`
+and finally `||`. So `value & 1 == 0` tests the lowest bit.
 
 There is one equality operator: `==`. It never converts either side. Both sides
 must have the same type, and values compare by meaning—`Text` compares its
-contents. `!=` is its direct opposite. Ordered comparisons accept `Integer` or
-`Character` operands. Arithmetic accepts `Integer` operands; `+` also joins two
-`Text` values. These operators never coerce Boolean values into numbers.
+contents. `!=` is its direct opposite. Ordered comparisons accept `Integer`,
+`Float` or `Character` operands. Arithmetic accepts `Integer` or `Float`
+operands; `+` also joins two `Text` values. These operators never coerce
+Boolean values into numbers. A NaN Float is unequal to everything, itself
+included.
+
+## Loops
+
+`while condition { ... }` repeats while a Boolean holds. `for` visits a range
+of Integers, the elements of a List, or the Characters of a Text:
+
+```minyar
+for position in 0..3 {
+    print(position)    // 0, 1, 2: the end is excluded
+}
+for word in ["Min", "yar"] {
+    print(word)
+}
+```
+
+A range's bounds and a loop's collection are evaluated once. The loop variable
+is a fresh binding for each iteration, so assigning to it does not change which
+value comes next. A List loop rereads the List's length on every iteration.
+`break` leaves the innermost loop and `continue` starts its next iteration.
 
 Conditions accept only `Boolean`.
 
@@ -30,6 +88,7 @@ Conditions accept only `Boolean`.
 The value types are:
 
 - `Integer`: a signed 64-bit whole number.
+- `Float`: an IEEE 754 double-precision number.
 - `Text`: Unicode text, encoded as UTF-8.
 - `Character`: one Unicode scalar value, including non-ASCII literals.
   Printing a Character encodes it as UTF-8.
@@ -159,7 +218,21 @@ people.add(ada)
 print(people[0].name)
 ```
 
-Record fields are immutable after construction. Record equality is not supported.
+A record is a reference value, like a List. Assigning a field changes the one
+shared record, so every alias observes it:
+
+```minyar
+let player = Person { name: "Ada"; age: 36 }
+let same = player
+same.age += 1
+print(player.age) // 37
+```
+
+Assignments can reach through fields and List positions, as in
+`world.chunks[0].blocks[5] = 1`. Scalar fields can always be assigned. A field
+holding a Text, List or record cannot be assigned if its type could lead back
+to the record's own type, because that could create a reference cycle; see the
+[runtime memory contract](runtime-memory.md). Record equality is not supported.
 
 ## Programs and entry points
 

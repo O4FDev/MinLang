@@ -223,10 +223,10 @@ print(slice(1))
                 if operator == '+' and value == '"text"':
                     continue
                 with self.subTest(operator=operator, value=value):
-                    self.rejects(f'print({value} {operator} {value})\n', 'needs Integer operands')
+                    self.rejects(f'print({value} {operator} {value})\n', 'needs Integer or Float operands')
         for value in ('true', '"text"'):
             with self.subTest(value=value):
-                self.rejects(f'print({value} < {value})\n', 'ordered comparison needs Integer or Character operands')
+                self.rejects(f'print({value} < {value})\n', 'ordered comparison needs Integer, Float, or Character operands')
 
     def test_valid_operators(self):
         self.executes('print(7 + 5)\nprint(7 - 5)\nprint(7 * 5)\nprint(7 / 5)\nprint(7 % 5)\nprint(true == false)\nprint("x" == "x")\nprint(\'a\' < \'b\')\nprint("a" + "b")\n', '12\n2\n35\n1\n2\nfalse\ntrue\ntrue\nab\n')
