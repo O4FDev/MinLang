@@ -714,12 +714,18 @@ function discoverRecordNames(tokenKinds: List<Integer>, tokenTexts: List<Text>, 
             symbolReturnTypes.add(1000 + index)
             symbolParameterCounts.add(0)
         }
+        if tokenIs(tokenKinds, tokenTexts, cursor, "constant") {
+            addConstantSymbol(tokenTexts, tokenLines, cursor[0], symbolNames, symbolKinds, symbolLocations, symbolReturnTypes, symbolParameterCounts)
+            skipTopLevelStatement(tokenKinds, tokenTexts, cursor)
+            declarationEnds.add(cursor[0])
+        } else {
         if tokenIs(tokenKinds, tokenTexts, cursor, "record") || tokenIs(tokenKinds, tokenTexts, cursor, "function") {
             skipDeclaration(tokenKinds, tokenTexts, cursor)
             declarationEnds.add(cursor[0])
         } else {
             topLevelStatements = true
             skipTopLevelStatement(tokenKinds, tokenTexts, cursor)
+        }
         }
         skipTerminators(tokenKinds, cursor)
     }
@@ -746,6 +752,9 @@ function recordScannedDeclarations(tokenKinds: List<Integer>, tokenTexts: List<T
                 symbolReturnTypes.add(1000 + index)
                 symbolParameterCounts.add(0)
             }
+            if tokenIs(tokenKinds, tokenTexts, cursor, "constant") {
+                addConstantSymbol(tokenTexts, tokenLines, start, symbolNames, symbolKinds, symbolLocations, symbolReturnTypes, symbolParameterCounts)
+            }
             declarationEnds.add(scannedEnds[declaration])
             declaration = declaration + 1
         }
@@ -754,12 +763,68 @@ function recordScannedDeclarations(tokenKinds: List<Integer>, tokenTexts: List<T
     return topLevelStatements
 }
 
+// Constants are symbols of kind 3. discoverDeclarations fills in the type and
+// stores the literal's token position where functions keep a parameter count.
+function addConstantSymbol(tokenTexts: List<Text>, tokenLines: List<Text>, start: Integer, symbolNames: List<Text>, symbolKinds: List<Integer>, symbolLocations: List<Text>, symbolReturnTypes: List<Integer>, symbolParameterCounts: List<Integer>) {
+    symbolNames.add(tokenTexts[start + 1])
+    symbolKinds.add(3)
+    symbolLocations.add(tokenLines[start + 1])
+    symbolReturnTypes.add(0)
+    symbolParameterCounts.add(0)
+}
+
+// A constant's value is one literal, optionally negated. Its type comes from
+// the literal and must match an optional annotation.
+function takeConstant(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, cursor: List<Integer>, symbolNames: List<Text>, symbolKinds: List<Integer>, symbolLookup: List<Integer>, symbolReturnTypes: List<Integer>, symbolParameterCounts: List<Integer>) {
+    expectToken(tokenKinds, tokenTexts, tokenLines, cursor, "constant")
+    let name = tokenTexts[cursor[0]]
+    let location = tokenLines[cursor[0]]
+    if tokenKinds[cursor[0]] != 1 {
+        fail(describeLocation(location) + ": expected a name after constant")
+    }
+    let constant = findIndexedSymbol(symbolLookup, symbolNames, symbolKinds, name, 3)
+    cursor[0] = cursor[0] + 1
+    let declared = 0
+    if tokenIs(tokenKinds, tokenTexts, cursor, ":") {
+        cursor[0] = cursor[0] + 1
+        declared = takeValueType(tokenKinds, tokenTexts, tokenLines, cursor, symbolNames, symbolKinds)
+    }
+    expectToken(tokenKinds, tokenTexts, tokenLines, cursor, "=")
+    let valueStart = cursor[0]
+    let literal = cursor[0]
+    if tokenIs(tokenKinds, tokenTexts, cursor, "-") {
+        literal = literal + 1
+    }
+    let kind = tokenKinds[literal]
+    let type = 0
+    if kind == 2 { type = 1 }
+    if kind == 7 { type = 7 }
+    if literal == valueStart {
+        if kind == 3 { type = 2 }
+        if kind == 5 { type = 3 }
+        if kind == 1 && (tokenTexts[literal] == "true" || tokenTexts[literal] == "false") { type = 4 }
+    }
+    if type == 0 || (tokenKinds[literal + 1] != 6 && tokenKinds[literal + 1] != 0) {
+        fail(describeLocation(location) + ": a constant needs one literal value, such as 16, -2.5, \"text\", 'c', or true")
+    }
+    if declared != 0 && declared != type {
+        fail(describeLocation(location) + ": the value for constant '" + readableDeclarationName(name) + "' is " + describeType(type) + ", not " + describeType(declared))
+    }
+    symbolReturnTypes[constant] = type
+    symbolParameterCounts[constant] = valueStart
+    cursor[0] = literal + 1
+}
+
 function discoverDeclarations(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, symbolNames: List<Text>, symbolKinds: List<Integer>, symbolLocations: List<Text>, symbolReturnTypes: List<Integer>, symbolLookup: List<Integer>, symbolParameterCounts: List<Integer>, symbolParameterNames: List<Text>, symbolParameterTypes: List<Integer>, parameterStarts: List<Integer>, declarationEnds: List<Integer>) {
     let cursor: List<Integer> = []
     cursor.add(0)
     let declaration = 0
     skipTerminators(tokenKinds, cursor)
     while tokenKinds[cursor[0]] != 0 {
+        if tokenIs(tokenKinds, tokenTexts, cursor, "constant") {
+            declaration = declaration + 1
+            takeConstant(tokenKinds, tokenTexts, tokenLines, cursor, symbolNames, symbolKinds, symbolLookup, symbolReturnTypes, symbolParameterCounts)
+        } else {
         if tokenIs(tokenKinds, tokenTexts, cursor, "record") {
             declaration = declaration + 1
             cursor[0] = cursor[0] + 1
@@ -847,6 +912,7 @@ function discoverDeclarations(tokenKinds: List<Integer>, tokenTexts: List<Text>,
             } else {
                 skipTopLevelStatement(tokenKinds, tokenTexts, cursor)
             }
+        }
         }
         skipTerminators(tokenKinds, cursor)
     }
@@ -2387,9 +2453,19 @@ function parseAtom(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                     value = parseRecord(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, resultType)
                 } else {
                     let local = findLocal(localNames, localLengths, state, token)
+                    let constant = -1
                     if local < 0 {
-                        fail(describeLocation(tokenLines[tokenIndex]) + ": I can't find a value named '" + token + "'")
+                        constant = findCompiledSymbol(functionNames, symbolKinds, functionReturnTypes, token, 3)
+                        if constant < 0 {
+                            fail(describeLocation(tokenLines[tokenIndex]) + ": I can't find a value named '" + readableDeclarationName(token) + "'")
+                        }
                     }
+                    if constant >= 0 {
+                        // Evaluate the declaration's literal in place of the name.
+                        state[0] = functionParameterCounts[constant]
+                        value = parseUnary(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, resultType)
+                        state[0] = tokenIndex + 1
+                    } else {
                     state[0] = tokenIndex + 1
                     let id = localIds[local]
                     if id < 0 {
@@ -2411,6 +2487,7 @@ function parseAtom(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                         addOutput(output, "  ; minyar-owned-local-transfer\n")
                         addOutput(output, Text(ownershipSlot(state, id)))
                         markOwner(resultType, owner)
+                    }
                     }
                 }
             }
@@ -3870,12 +3947,16 @@ function compileTopLevel(tokenKinds: List<Integer>, tokenTexts: List<Text>, toke
         if tokenIs(tokenKinds, tokenTexts, state, "record") || tokenIs(tokenKinds, tokenTexts, state, "function") {
             skipDeclaration(tokenKinds, tokenTexts, state)
         } else {
+            if tokenIs(tokenKinds, tokenTexts, state, "constant") {
+                skipTopLevelStatement(tokenKinds, tokenTexts, state)
+            } else {
             if terminated {
                 textState[0] = "dead." + Text(newLabel(state))
             addOutput(output, "\n" + textState[0] + ":\n")
             }
             terminated = compileStatement(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, 1)
             finishStatement(tokenKinds, tokenTexts, tokenLines, state)
+            }
         }
         skipTerminators(tokenKinds, state)
     }
@@ -4307,6 +4388,12 @@ function loadModule(path: Text, isEntry: Boolean, modulePaths: List<Text>, modul
             }
             let marker: List<Integer> = []
             marker.add(declarationCursor)
+            if tokenIs(allTokenKinds, allTokenTexts, marker, "constant") {
+                declarationStarts.add(declarationCursor)
+                skipTopLevelStatement(allTokenKinds, allTokenTexts, marker)
+                declarationEnds.add(marker[0])
+                cursor[0] = marker[0]
+            } else {
             if tokenIs(allTokenKinds, allTokenTexts, marker, "record") || tokenIs(allTokenKinds, allTokenTexts, marker, "function") {
                 declarationStarts.add(declarationCursor)
                 skipDeclaration(allTokenKinds, allTokenTexts, marker)
@@ -4314,13 +4401,14 @@ function loadModule(path: Text, isEntry: Boolean, modulePaths: List<Text>, modul
                 cursor[0] = marker[0]
             } else {
                 if hasPublic {
-                    fail(canonicalPath + ":" + allTokenLines[cursor[0]] + ": public must describe a function or record declaration")
+                    fail(canonicalPath + ":" + allTokenLines[cursor[0]] + ": public must describe a function, record, or constant declaration")
                 }
                 if !isEntry {
                     fail(canonicalPath + ":" + allTokenLines[cursor[0]] + ": imported modules may contain declarations but not executable top-level statements")
                 }
                 declarationStarts.add(-1)
                 skipTopLevelStatement(allTokenKinds, allTokenTexts, cursor)
+            }
             }
         }
         skipTerminators(allTokenKinds, cursor)
@@ -4387,6 +4475,9 @@ function collectModuleDeclarations(module: Integer, modulePath: Text, tokenStart
             if tokenIs(tokenKinds, tokenTexts, cursor, "record") {
                 kind = 2
             }
+            if tokenIs(tokenKinds, tokenTexts, cursor, "constant") {
+                kind = 3
+            }
             if kind > 0 {
                 let name = tokenTexts[cursor[0] + 1]
                 declarationOwners.add(module)
@@ -4395,10 +4486,14 @@ function collectModuleDeclarations(module: Integer, modulePath: Text, tokenStart
                 declarationPublic.add(isPublic)
                 declarationQualifiedNames.add(qualifiedDeclarationName(module, name))
                 declarationLocations.add(modulePath + ":" + tokenLines[cursor[0] + 1])
-                skipDeclaration(tokenKinds, tokenTexts, cursor)
+                if kind == 3 {
+                    skipTopLevelStatement(tokenKinds, tokenTexts, cursor)
+                } else {
+                    skipDeclaration(tokenKinds, tokenTexts, cursor)
+                }
             } else {
                 if isPublic == 1 {
-                    fail("public must describe a function or record declaration")
+                    fail("public must describe a function, record, or constant declaration")
                 }
                 skipTopLevelStatement(tokenKinds, tokenTexts, cursor)
             }
@@ -4417,6 +4512,9 @@ function importedDeclarationName(module: Integer, alias: Text, name: Text, kind:
         let declarationKind = "record"
         if kind == 1 {
             declarationKind = "function"
+        }
+        if kind == 3 {
+            declarationKind = "constant"
         }
         fail(describeLocation(location) + ": module '" + alias + "' has no " + declarationKind + " named '" + name + "'")
     }
@@ -4476,6 +4574,11 @@ function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integ
                         let wantedKind = 2
                         if position + 3 < tokenKinds.length && tokenTexts[position + 3] == "(" {
                             wantedKind = 1
+                        } else {
+                            let importedConstant = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, importTargets[imported], tokenTexts[position + 2], 3)
+                            if !typeMode && importedConstant >= 0 {
+                                wantedKind = 3
+                            }
                         }
                         rewritten = importedDeclarationName(module, token, tokenTexts[position + 2], wantedKind, modulePath + ":" + tokenLines[position], importOwners, importAliases, importTargets, declarationLookup, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames)
                         addToken(outputKinds, outputTexts, outputLines, 1, rewritten, modulePath + ":" + tokenLines[position])
@@ -4504,6 +4607,14 @@ function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integ
                         }
                         if declarationKind == 0 && typeMode {
                             declarationKind = 2
+                        }
+                        if position > 0 && tokenTexts[position - 1] == "constant" {
+                            declarationKind = 3
+                        }
+                        // Other bare names may use a constant of this module;
+                        // a following ':' names a field or parameter instead.
+                        if declarationKind == 0 && !(position + 1 < tokenKinds.length && tokenTexts[position + 1] == ":") {
+                            declarationKind = 3
                         }
                         if declarationKind > 0 {
                             let declaration = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, module, token, declarationKind)
