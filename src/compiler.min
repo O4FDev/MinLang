@@ -1865,6 +1865,108 @@ function parseUnary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLine
     return value
 }
 
+// Bytes methods map one-to-one onto runtime functions. Typed accessors use a
+// byte offset and little-endian order; `kinds` lists the supported widths.
+function bytesKindSuffix(kind: Text): Text {
+    if kind == "Int16" { return "int16" }
+    if kind == "UInt16" { return "uint16" }
+    if kind == "Int32" { return "int32" }
+    if kind == "UInt32" { return "uint32" }
+    if kind == "Int64" { return "int64" }
+    if kind == "Float32" { return "float32" }
+    if kind == "Float64" { return "float64" }
+    return ""
+}
+
+function parseBytesMethod(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, receiver: Text, member: Text, memberLocation: Text, resultType: List<Integer>): Text {
+    let values: List<Text> = []
+    values.add(receiver)
+    let types: List<Integer> = []
+    types.add(8)
+    while !tokenIs(tokenKinds, tokenTexts, state, ")") {
+        let argumentType: List<Integer> = []
+        argumentType.add(0)
+        values.add(parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, argumentType))
+        types.add(argumentType[0])
+        if tokenIs(tokenKinds, tokenTexts, state, ",") {
+            state[0] = state[0] + 1
+        }
+    }
+    expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
+    let expected: List<Integer> = []
+    expected.add(8)
+    let callee = ""
+    let returnType = 5
+    if member == "add" {
+        callee = "minyar_bytes_add"
+        expected.add(1)
+    }
+    if member == "addBytes" {
+        callee = "minyar_bytes_append"
+        expected.add(8)
+    }
+    if member == "clear" {
+        callee = "minyar_bytes_clear"
+    }
+    if member == "resize" {
+        callee = "minyar_bytes_resize"
+        expected.add(1)
+    }
+    if member == "slice" {
+        callee = "minyar_bytes_slice"
+        expected.add(1)
+        expected.add(1)
+        returnType = 8
+    }
+    if callee == "" && member.length > 3 {
+        let verb = member.slice(0, 3)
+        let suffix = bytesKindSuffix(member.slice(3, member.length))
+        let valueType = 1
+        if member[3] == 'F' {
+            valueType = 7
+        }
+        if suffix != "" && (verb == "add" || verb == "get" || verb == "set") {
+            callee = "minyar_bytes_" + verb + "_" + suffix
+            if verb == "add" {
+                expected.add(valueType)
+            }
+            if verb == "get" {
+                expected.add(1)
+                returnType = valueType
+            }
+            if verb == "set" {
+                expected.add(1)
+                expected.add(valueType)
+            }
+        }
+    }
+    if callee == "" {
+        fail(describeLocation(memberLocation) + ": Bytes has no method named '" + member + "'")
+    }
+    let matches = values.length == expected.length
+    let position = 1
+    while matches && position < values.length {
+        if types[position] != expected[position] {
+            matches = false
+        }
+        position = position + 1
+    }
+    if !matches {
+        let wanted = ""
+        position = 1
+        while position < expected.length {
+            if position > 1 {
+                wanted = wanted + ", "
+            }
+            wanted = wanted + describeType(expected[position])
+            position = position + 1
+        }
+        fail(describeLocation(memberLocation) + ": Bytes." + member + " expects (" + wanted + ")")
+    }
+    setType(resultType, returnType)
+    return emitCall(output, textState, state, returnType, callee, values, types)
+}
+
 function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, resultType: List<Integer>): Text {
     let atom = state[0]
     let scalarValues = -1
@@ -1891,6 +1993,10 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
             state[0] = state[0] + 1
             if tokenIs(tokenKinds, tokenTexts, state, "(") {
                 state[0] = state[0] + 1
+                if receiverType == 8 {
+                    value = parseBytesMethod(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, receiver, member, memberLocation, resultType)
+                    ownsResult = resultType[0] == 8
+                } else {
                 let argumentType: List<Integer> = []
                 argumentType.add(0)
                 if (member == "add" || member == "appended") && isListType(receiverType) {
@@ -1972,6 +2078,7 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                     setType(resultType, 5)
                     }
                 }
+                }
             } else {
                 if isRecordType(receiverType) {
                     let field = findRecordField(functionParameterCounts, functionParameterNames, receiverType, member)
@@ -1997,7 +2104,7 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                     value = slotAsValue(output, textState, state, raw, fieldType)
                     setType(resultType, fieldType)
                 } else {
-                    if receiverType != 2 && !isListType(receiverType) {
+                    if receiverType != 2 && receiverType != 8 && !isListType(receiverType) {
                         fail("this value does not provide a field named '" + member + "'")
                     }
                     if member != "length" && !(receiverType == 2 && member == "byteLength") {
@@ -2010,6 +2117,9 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                         if member == "byteLength" {
                             operation = "text_byte_length"
                         }
+                    }
+                    if receiverType == 8 {
+                        operation = "bytes_length"
                     }
                     value = valueName(textState, temporary)
                     addOutput(output, "  ")
@@ -2043,8 +2153,12 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                 addOutput(output, ")\n")
                 setType(resultType, 3)
             } else {
+                if collectionType == 8 {
+                    value = emitBytesRead(output, textState, state, collection, position)
+                    setType(resultType, 1)
+                } else {
                 if !isListType(collectionType) {
-                    fail("indexing needs Text or a List")
+                    fail("indexing needs Text, a List, or Bytes")
                 }
                 let raw = valueName(textState, temporary)
                 addOutput(output, "  ")
@@ -2057,6 +2171,7 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                 let elementType = listElementType(collectionType)
                 value = slotAsValue(output, textState, state, raw, elementType)
                 setType(resultType, elementType)
+                }
             }
         }
         if ownsResult {
@@ -2383,7 +2498,7 @@ function checkBuiltinArguments(name: Text, types: List<Integer>) {
 }
 
 function isNumericBuiltin(name: Text): Boolean {
-    return name == "Float" || name == "Integer" || name == "Character" || isFloatFunction(name) || name == "atan2" || name == "pow" || name == "abs" || name == "min" || name == "max" || name == "clamp" || name == "wrappingAdd" || name == "wrappingSubtract" || name == "wrappingMultiply"
+    return name == "Bytes" || name == "readBytesFile" || name == "writeBytesFile" || name == "Float" || name == "Integer" || name == "Character" || isFloatFunction(name) || name == "atan2" || name == "pow" || name == "abs" || name == "min" || name == "max" || name == "clamp" || name == "wrappingAdd" || name == "wrappingSubtract" || name == "wrappingMultiply"
 }
 
 function isFloatFunction(name: Text): Boolean {
@@ -2466,6 +2581,27 @@ function emitInstruction(output: List<Text>, textState: List<Text>, state: List<
 // Conversions and arithmetic helpers. Float math follows IEEE 754; Integer
 // helpers keep the checked-overflow rule unless their name says otherwise.
 function emitNumericBuiltin(output: List<Text>, textState: List<Text>, state: List<Integer>, name: Text, values: List<Text>, types: List<Integer>, resultType: List<Integer>): Text {
+    if name == "Bytes" {
+        if types.length == 0 {
+            values.add("0")
+            types.add(1)
+        }
+        requireBuiltinArguments(name, types, 1, 1)
+        setType(resultType, 8)
+        return emitCall(output, textState, state, 8, "minyar_bytes_new", values, types)
+    }
+    if name == "readBytesFile" {
+        requireBuiltinArguments(name, types, 1, 2)
+        setType(resultType, 8)
+        return emitCall(output, textState, state, 8, "minyar_read_bytes_file", values, types)
+    }
+    if name == "writeBytesFile" {
+        if types.length != 2 || types[0] != 2 || types[1] != 8 {
+            fail("writeBytesFile expects a Text path and Bytes")
+        }
+        setType(resultType, 5)
+        return emitCall(output, textState, state, 5, "minyar_write_bytes_file", values, types)
+    }
     if isFloatFunction(name) {
         requireBuiltinArguments(name, types, 1, 7)
         let callee = "llvm." + name + ".f64"
@@ -3843,6 +3979,35 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     addOutput(output, "declare i64 @minyar_bytes_get(ptr, i64)\n")
     addOutput(output, "declare void @minyar_bytes_set(ptr, i64, i64)\n")
     addOutput(output, "declare i64 @minyar_bytes_length(ptr)\n")
+    addOutput(output, "declare ptr @minyar_bytes_new(i64)\n")
+    addOutput(output, "declare void @minyar_bytes_resize(ptr, i64)\n")
+    addOutput(output, "declare void @minyar_bytes_clear(ptr)\n")
+    addOutput(output, "declare void @minyar_bytes_add(ptr, i64)\n")
+    addOutput(output, "declare void @minyar_bytes_append(ptr, ptr)\n")
+    addOutput(output, "declare ptr @minyar_bytes_slice(ptr, i64, i64)\n")
+    addOutput(output, "declare ptr @minyar_read_bytes_file(ptr)\n")
+    addOutput(output, "declare void @minyar_write_bytes_file(ptr, ptr)\n")
+    addOutput(output, "declare void @minyar_bytes_add_int16(ptr, i64)\n")
+    addOutput(output, "declare void @minyar_bytes_set_int16(ptr, i64, i64)\n")
+    addOutput(output, "declare i64 @minyar_bytes_get_int16(ptr, i64)\n")
+    addOutput(output, "declare void @minyar_bytes_add_uint16(ptr, i64)\n")
+    addOutput(output, "declare void @minyar_bytes_set_uint16(ptr, i64, i64)\n")
+    addOutput(output, "declare i64 @minyar_bytes_get_uint16(ptr, i64)\n")
+    addOutput(output, "declare void @minyar_bytes_add_int32(ptr, i64)\n")
+    addOutput(output, "declare void @minyar_bytes_set_int32(ptr, i64, i64)\n")
+    addOutput(output, "declare i64 @minyar_bytes_get_int32(ptr, i64)\n")
+    addOutput(output, "declare void @minyar_bytes_add_uint32(ptr, i64)\n")
+    addOutput(output, "declare void @minyar_bytes_set_uint32(ptr, i64, i64)\n")
+    addOutput(output, "declare i64 @minyar_bytes_get_uint32(ptr, i64)\n")
+    addOutput(output, "declare void @minyar_bytes_add_int64(ptr, i64)\n")
+    addOutput(output, "declare void @minyar_bytes_set_int64(ptr, i64, i64)\n")
+    addOutput(output, "declare i64 @minyar_bytes_get_int64(ptr, i64)\n")
+    addOutput(output, "declare void @minyar_bytes_add_float32(ptr, double)\n")
+    addOutput(output, "declare void @minyar_bytes_set_float32(ptr, i64, double)\n")
+    addOutput(output, "declare double @minyar_bytes_get_float32(ptr, i64)\n")
+    addOutput(output, "declare void @minyar_bytes_add_float64(ptr, double)\n")
+    addOutput(output, "declare void @minyar_bytes_set_float64(ptr, i64, double)\n")
+    addOutput(output, "declare double @minyar_bytes_get_float64(ptr, i64)\n")
     addOutput(output, "declare ptr @minyar_float_text(double)\n")
     addOutput(output, "declare i64 @minyar_float_integer(double)\n")
     addOutput(output, "declare i32 @minyar_integer_character(i64)\n")

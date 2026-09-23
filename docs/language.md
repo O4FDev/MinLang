@@ -89,6 +89,7 @@ The value types are:
 
 - `Integer`: a signed 64-bit whole number.
 - `Float`: an IEEE 754 double-precision number.
+- `Bytes`: a growable sequence of bytes.
 - `Text`: Unicode text, encoded as UTF-8.
 - `Character`: one Unicode scalar value, including non-ASCII literals.
   Printing a Character encodes it as UTF-8.
@@ -142,6 +143,29 @@ A List is a reference value: aliases observe the same additions and indexed
 replacements, including those performed by functions. Mutations that could
 create an ownership cycle are rejected, as described below. Reading or writing
 outside a List's bounds stops with a clear error.
+
+`Bytes` holds packed binary data, such as file contents, compact tables or
+vertex data. `Bytes(length)` makes zero-filled Bytes and `Bytes()` makes empty
+ones. Like a List, Bytes is a shared reference value:
+
+```minyar
+let pixels = Bytes(4)
+pixels[0] = 255          // each position holds an Integer from 0 to 255
+pixels.add(128)          // append one byte
+pixels.addFloat32(1.5)   // append a 32-bit Float
+print(pixels.length)     // 9
+print(pixels.getFloat32(5))
+```
+
+Multi-byte values use little-endian order at any byte offset. For each of
+`Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `Float32` and `Float64` there is
+an `addKind(value)` that appends, a `getKind(offset)` and a
+`setKind(offset, value)`. Integer values outside the kind's range stop the
+program; `Float32` rounds to the nearest 32-bit Float. `addBytes(other)`
+appends other Bytes, `slice(start, end)` copies a range, `resize(length)`
+truncates or zero-extends, and `clear()` empties the Bytes while keeping its
+storage. `readBytesFile(path)` and `writeBytesFile(path, bytes)` transfer files
+unchanged. `for byte in bytes` visits each byte as an Integer.
 
 ## Memory lifetime
 

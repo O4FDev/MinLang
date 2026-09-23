@@ -245,7 +245,7 @@ print(slice(1))
     def test_nonvalues_and_index_types(self):
         self.rejects('let value = print(42)\n', 'Nothing cannot be stored')
         self.rejects('let values: List<Integer> = []\nvalues.add(1)\nvalues[true] = 2\n', 'a position must be an Integer')
-        self.rejects('let value = 42\nprint(value[0])\n', 'indexing needs Text or a List')
+        self.rejects('let value = 42\nprint(value[0])\n', 'indexing needs Text, a List, or Bytes')
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
