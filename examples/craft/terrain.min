@@ -1,0 +1,171 @@
+// The block world: storage, chunk bookkeeping, and terrain generation.
+
+use "./blocks.min" as blocks
+use "./noise.min" as noise
+
+public constant CHUNK_SIZE = 16
+public constant CHUNKS_X = 12
+public constant CHUNKS_Z = 12
+public constant HEIGHT = 80
+public constant SEA_LEVEL = 30
+
+// Blocks are one byte each, stored in rows of x, then z, then layers of y.
+// A chunk is a 16 by 16 column of the world that is meshed as one piece.
+public record World {
+    blocks: Bytes
+    sizeX: Integer
+    sizeZ: Integer
+    height: Integer
+    seed: Integer
+    dirty: List<Boolean>
+}
+
+public function create(seed: Integer): World {
+    let sizeX = CHUNKS_X * CHUNK_SIZE
+    let sizeZ = CHUNKS_Z * CHUNK_SIZE
+    let dirty: List<Boolean> = []
+    for chunk in 0..CHUNKS_X * CHUNKS_Z {
+        dirty.add(true)
+    }
+    return World {
+        blocks: Bytes(sizeX * sizeZ * HEIGHT)
+        sizeX: sizeX
+        sizeZ: sizeZ
+        height: HEIGHT
+        seed: seed
+        dirty: dirty
+    }
+}
+
+public function inside(world: World, x: Integer, y: Integer, z: Integer): Boolean {
+    return x >= 0 && y >= 0 && z >= 0 && x < world.sizeX && y < world.height && z < world.sizeZ
+}
+
+public function get(world: World, x: Integer, y: Integer, z: Integer): Integer {
+    if x < 0 || y < 0 || z < 0 || x >= world.sizeX || y >= world.height || z >= world.sizeZ {
+        return blocks.AIR
+    }
+    return world.blocks[(y * world.sizeZ + z) * world.sizeX + x]
+}
+
+// Change a block and mark every chunk whose mesh can show it.
+public function set(world: World, x: Integer, y: Integer, z: Integer, block: Integer) {
+    if !inside(world, x, y, z) {
+        return
+    }
+    world.blocks[(y * world.sizeZ + z) * world.sizeX + x] = block
+    let chunkX = x / CHUNK_SIZE
+    let chunkZ = z / CHUNK_SIZE
+    markDirty(world, chunkX, chunkZ)
+    let localX = x % CHUNK_SIZE
+    let localZ = z % CHUNK_SIZE
+    if localX == 0 { markDirty(world, chunkX - 1, chunkZ) }
+    if localX == CHUNK_SIZE - 1 { markDirty(world, chunkX + 1, chunkZ) }
+    if localZ == 0 { markDirty(world, chunkX, chunkZ - 1) }
+    if localZ == CHUNK_SIZE - 1 { markDirty(world, chunkX, chunkZ + 1) }
+}
+
+public function markDirty(world: World, chunkX: Integer, chunkZ: Integer) {
+    if chunkX >= 0 && chunkZ >= 0 && chunkX < CHUNKS_X && chunkZ < CHUNKS_Z {
+        world.dirty[chunkZ * CHUNKS_X + chunkX] = true
+    }
+}
+
+// The y of the highest solid block in a column, or -1.
+public function surface(world: World, x: Integer, z: Integer): Integer {
+    let y = world.height - 1
+    while y >= 0 {
+        if blocks.isSolid(get(world, x, y, z)) {
+            return y
+        }
+        y -= 1
+    }
+    return -1
+}
+
+function put(world: World, x: Integer, y: Integer, z: Integer, block: Integer) {
+    if inside(world, x, y, z) {
+        world.blocks[(y * world.sizeZ + z) * world.sizeX + x] = block
+    }
+}
+
+function terrainHeight(world: World, x: Integer, z: Integer): Integer {
+    let fx = Float(x)
+    let fz = Float(z)
+    let continents = noise.fractalNoise(fx / 90.0, fz / 90.0, world.seed, 4)
+    let hills = noise.fractalNoise(fx / 28.0, fz / 28.0, world.seed + 101, 3)
+    let mountains = noise.valueNoise(fx / 60.0, fz / 60.0, world.seed + 202)
+    let lift = 0.0
+    if mountains > 0.6 {
+        lift = (mountains - 0.6) * 70.0
+    }
+    let height = 12.0 + continents * 30.0 + hills * 10.0 + lift
+    return clamp(Integer(height), 2, HEIGHT - 12)
+}
+
+function plantTree(world: World, x: Integer, ground: Integer, z: Integer) {
+    let trunk = 4 + noise.hash(x, z, world.seed + 5) % 3
+    let top = ground + trunk
+    for dy in -2..2 {
+        let radius = 2
+        if dy >= 1 {
+            radius = 1
+        }
+        for dx in -radius..radius + 1 {
+            for dz in -radius..radius + 1 {
+                let corner = (dx == radius || dx == -radius) && (dz == radius || dz == -radius)
+                let skip = corner && noise.hash(x + dx, z + dz, world.seed + dy + 9) % 2 == 0
+                if !skip && get(world, x + dx, top + dy, z + dz) == blocks.AIR {
+                    put(world, x + dx, top + dy, z + dz, blocks.LEAVES)
+                }
+            }
+        }
+    }
+    for y in ground + 1..top {
+        put(world, x, y, z, blocks.LOG)
+    }
+}
+
+public function generate(world: World) {
+    let heights: List<Integer> = []
+    for z in 0..world.sizeZ {
+        for x in 0..world.sizeX {
+            let height = terrainHeight(world, x, z)
+            heights.add(height)
+            let beach = height <= SEA_LEVEL + 1
+            let snowy = height > 52
+            for y in 0..height + 1 {
+                let block = blocks.STONE
+                if y == 0 {
+                    block = blocks.BEDROCK
+                } else if y == height {
+                    if beach {
+                        block = blocks.SAND
+                    } else if snowy {
+                        block = blocks.SNOW
+                    } else {
+                        block = blocks.GRASS
+                    }
+                } else if y > height - 4 && !snowy {
+                    if beach {
+                        block = blocks.SAND
+                    } else {
+                        block = blocks.DIRT
+                    }
+                }
+                put(world, x, y, z, block)
+            }
+            for y in height + 1..SEA_LEVEL + 1 {
+                put(world, x, y, z, blocks.WATER)
+            }
+        }
+    }
+    for z in 3..world.sizeZ - 3 {
+        for x in 3..world.sizeX - 3 {
+            let ground = heights[z * world.sizeX + x]
+            if get(world, x, ground, z) == blocks.GRASS && noise.random(x, z, world.seed + 77) < 0.012 {
+                plantTree(world, x, ground, z)
+            }
+        }
+    }
+}

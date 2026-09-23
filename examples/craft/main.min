@@ -1,0 +1,188 @@
+// Minyarcraft: a small block-building game written in Minyar.
+//
+//   ./minyar --release examples/craft/main.min -o craft && ./craft
+//
+// Mouse to look, WASD to move, Space to jump, Shift to sprint (or descend
+// while flying), F to fly, left click to break, right click to place, 1-9 or
+// the scroll wheel to choose a block, Escape to free the mouse.
+
+use "graphics" as graphics
+use "./blocks.min" as blocks
+use "./terrain.min" as terrain
+use "./meshing.min" as meshing
+use "./physics.min" as physics
+use "./textures.min" as textures
+
+constant REACH = 6.0
+constant MOUSE_SENSITIVITY = 0.0025
+constant CHUNKS_PER_FRAME = 4
+
+function axis(positive: Integer, negative: Integer): Float {
+    let value = 0.0
+    if graphics.keyDown(positive) { value += 1.0 }
+    if graphics.keyDown(negative) { value -= 1.0 }
+    return value
+}
+
+// Remesh up to `limit` chunks that changed, returning how many were rebuilt.
+function remesh(world: terrain.World, meshes: List<Integer>, vertices: Bytes, limit: Integer): Integer {
+    let rebuilt = 0
+    for chunk in 0..world.dirty.length {
+        if rebuilt < limit && world.dirty[chunk] {
+            meshing.buildChunk(world, chunk % terrain.CHUNKS_X, chunk / terrain.CHUNKS_X, vertices)
+            graphics.updateMesh(meshes[chunk], vertices)
+            world.dirty[chunk] = false
+            rebuilt += 1
+        }
+    }
+    return rebuilt
+}
+
+function drawHotbar(hotbar: List<Integer>, selected: Integer) {
+    let slot = 44.0
+    let width = slot * Float(hotbar.length)
+    let left = (Float(graphics.windowWidth()) - width) / 2.0
+    let top = Float(graphics.windowHeight()) - slot - 12.0
+    graphics.drawRectangle(left - 4.0, top - 4.0, width + 8.0, slot + 8.0, 0.0, 0.0, 0.0, 0.45)
+    for index in 0..hotbar.length {
+        let x = left + Float(index) * slot
+        if index == selected {
+            graphics.drawRectangle(x, top, slot, slot, 1.0, 1.0, 1.0, 0.9)
+            graphics.drawRectangle(x + 3.0, top + 3.0, slot - 6.0, slot - 6.0, 0.15, 0.15, 0.15, 1.0)
+        }
+        let tile = blocks.tile(hotbar[index], blocks.FACE_SIDE)
+        let u = textures.tileU(tile)
+        let v = textures.tileV(tile)
+        graphics.drawImage(x + 7.0, top + 7.0, slot - 14.0, slot - 14.0, u, v, u + 0.0625, v + 0.0625)
+    }
+}
+
+function drawCrosshair() {
+    let cx = Float(graphics.windowWidth()) / 2.0
+    let cy = Float(graphics.windowHeight()) / 2.0
+    graphics.drawRectangle(cx - 9.0, cy - 1.0, 18.0, 2.0, 1.0, 1.0, 1.0, 0.85)
+    graphics.drawRectangle(cx - 1.0, cy - 9.0, 2.0, 18.0, 1.0, 1.0, 1.0, 0.85)
+}
+
+graphics.openWindow(1280, 760, "Minyarcraft")
+graphics.setTexture(textures.build(), textures.ATLAS_SIZE, textures.ATLAS_SIZE)
+
+let world = terrain.create(20260923)
+terrain.generate(world)
+let meshes: List<Integer> = []
+for chunk in 0..world.dirty.length {
+    meshes.add(graphics.createMesh())
+}
+let vertices = Bytes()
+remesh(world, meshes, vertices, world.dirty.length)
+
+let player = physics.spawn(world)
+let hotbar = [blocks.GRASS, blocks.DIRT, blocks.STONE, blocks.COBBLESTONE, blocks.PLANKS, blocks.LOG, blocks.LEAVES, blocks.GLASS, blocks.BRICK]
+let selected = 0
+let numberKeys = [graphics.KEY_1, graphics.KEY_2, graphics.KEY_3, graphics.KEY_4, graphics.KEY_5, graphics.KEY_6, graphics.KEY_7, graphics.KEY_8, graphics.KEY_9]
+let frames = 0
+let clock = 0.0
+let frameNumber = 0
+// ./craft --screenshot image.png saves the first frames' view and exits.
+let screenshot = ""
+if argumentCount() == 2 && argument(0) == "--screenshot" {
+    screenshot = argument(1)
+} else {
+    graphics.captureMouse(true)
+}
+
+while graphics.nextFrame() {
+    let seconds = graphics.frameTime()
+    frames += 1
+    frameNumber += 1
+    if screenshot != "" {
+        if frameNumber == 30 {
+            graphics.saveScreenshot(screenshot)
+        } else if frameNumber > 31 {
+            graphics.closeWindow()
+        }
+    }
+    clock += seconds
+    if clock >= 1.0 {
+        graphics.setTitle("Minyarcraft  " + Text(frames) + " fps  x " + Text(Integer(floor(player.x))) + " y " + Text(Integer(floor(player.y))) + " z " + Text(Integer(floor(player.z))) + "  " + blocks.name(hotbar[selected]))
+        frames = 0
+        clock -= 1.0
+    }
+
+    // Input
+    let captured = graphics.mouseCaptured()
+    if graphics.keyPressed(graphics.KEY_ESCAPE) {
+        graphics.captureMouse(false)
+        captured = false
+    } else if !captured && graphics.mousePressed(graphics.MOUSE_LEFT) {
+        graphics.captureMouse(true)
+    }
+    if captured {
+        player.yaw += graphics.mouseMoveX() * MOUSE_SENSITIVITY
+        player.pitch = clamp(player.pitch - graphics.mouseMoveY() * MOUSE_SENSITIVITY, -1.55, 1.55)
+    }
+    for index in 0..numberKeys.length {
+        if graphics.keyPressed(numberKeys[index]) {
+            selected = index
+        }
+    }
+    let scrolled = graphics.scroll()
+    if scrolled < 0.0 {
+        selected = (selected + 1) % hotbar.length
+    } else if scrolled > 0.0 {
+        selected = (selected + hotbar.length - 1) % hotbar.length
+    }
+    if graphics.keyPressed(graphics.KEY_F) {
+        player.flying = !player.flying
+        player.velocityY = 0.0
+    }
+
+    let forward = axis(graphics.KEY_W, graphics.KEY_S)
+    let strafe = axis(graphics.KEY_D, graphics.KEY_A)
+    let jump = graphics.keyDown(graphics.KEY_SPACE)
+    let shift = graphics.keyDown(graphics.KEY_LEFT_SHIFT)
+    physics.update(world, player, seconds, forward, strafe, jump, shift && player.flying, shift && !player.flying)
+
+    // Breaking and placing blocks
+    let hit = physics.aim(world, player, REACH)
+    if captured && hit.found {
+        if graphics.mousePressed(graphics.MOUSE_LEFT) && blocks.isBreakable(terrain.get(world, hit.x, hit.y, hit.z)) {
+            terrain.set(world, hit.x, hit.y, hit.z, blocks.AIR)
+        } else if graphics.mousePressed(graphics.MOUSE_RIGHT) {
+            let px = hit.x + hit.normalX
+            let py = hit.y + hit.normalY
+            let pz = hit.z + hit.normalZ
+            let target = terrain.get(world, px, py, pz)
+            if terrain.inside(world, px, py, pz) && (target == blocks.AIR || target == blocks.WATER) && !physics.occupies(player, px, py, pz) {
+                terrain.set(world, px, py, pz, hotbar[selected])
+            }
+        }
+    }
+    remesh(world, meshes, vertices, CHUNKS_PER_FRAME)
+
+    // Drawing
+    let skyRed = 0.53
+    let skyGreen = 0.72
+    let skyBlue = 0.98
+    if player.inWater && terrain.get(world, Integer(floor(player.x)), Integer(floor(player.y + physics.EYE_HEIGHT)), Integer(floor(player.z))) == blocks.WATER {
+        skyRed = 0.1
+        skyGreen = 0.25
+        skyBlue = 0.6
+        graphics.setFog(skyRed, skyGreen, skyBlue, 1.0, 14.0)
+    } else {
+        graphics.setFog(skyRed, skyGreen, skyBlue, 70.0, 130.0)
+    }
+    graphics.clear(skyRed, skyGreen, skyBlue)
+    graphics.setCamera(player.x, player.y + physics.EYE_HEIGHT, player.z, player.yaw, player.pitch, 75.0)
+    for mesh in meshes {
+        graphics.drawMesh(mesh)
+    }
+    if hit.found {
+        let x = Float(hit.x)
+        let y = Float(hit.y)
+        let z = Float(hit.z)
+        graphics.drawBox(x - 0.002, y - 0.002, z - 0.002, x + 1.002, y + 1.002, z + 1.002, 0.05, 0.05, 0.05)
+    }
+    drawCrosshair()
+    drawHotbar(hotbar, selected)
+}
