@@ -15,6 +15,7 @@ check-conformance`. Rejection wording is indexed separately by
 | Required typed record fields, nested records, and field assignment | `records/program.min`, `loops-and-assignment/program.min` | `tests/errors/record-*.min`, `tests/scalar-record-storage.py` |
 | Float arithmetic, conversions, math functions, hex literals, and bitwise operators | `floats-and-bits/program.min` | `tests/regressions.py` |
 | Bytes storage, typed little-endian access, and binary files | `bytes/program.min` | `tests/regressions.py` |
+| Field assignment that replaces containers mid-statement, aliases, and call-free index reads | `field-assignment-stress/program.min` | AddressSanitizer and all memory profiles |
 | for loops, break, continue, and compound assignment | `loops-and-assignment/program.min` | `tests/errors/record-field-assignment.min` |
 | Top-level order, functions, returns, branches, loops, and explicit main | `programs-and-entry-points/program.min`, `explicit-main/program.min` | `tests/errors/top-level-*.min`, `tests/errors/mixed-entry-points.min`, `tests/regressions.py` |
 | Arguments, file reads/writes, invalid UTF-8, and I/O failures | `explicit-main/program.min` | `tests/regressions.py` |
