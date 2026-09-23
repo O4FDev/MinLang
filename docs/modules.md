@@ -43,8 +43,24 @@ declarations belong to separate module namespaces.
 
 ## Packages
 
-Only local file imports are supported. Names that do not begin with `./` or
-`../` are reserved for packages and currently produce an error.
+Names that do not begin with `./` or `../` are standard library packages,
+bundled with the compiler in [`library/`](../library/):
+
+```minyar
+use "graphics" as graphics
+
+graphics.openWindow(1280, 720, "Hello")
+while graphics.nextFrame() {
+    graphics.clear(0.5, 0.7, 1.0)
+}
+```
+
+`graphics` provides a window, keyboard and mouse input, textured 3D meshes
+with fog and lighting, lines, a 2D overlay with text, and screenshots; its
+module documents each function. Some library functions are implemented in C:
+their body is `native "graphics"`, and `./minyar` builds and links the needed
+C code automatically. Packages from other sources are not yet supported, and
+`--incremental` builds do not resolve packages yet.
 
 ## Scalability and rebuilds
 

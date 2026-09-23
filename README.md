@@ -35,6 +35,23 @@ systematic mutation scoring, and AFL++ campaigns are available through
 `make check-coverage`, `make check-mutation-score`, and
 `make check-fuzz-coverage`.
 
+## Minyarcraft
+
+[`examples/craft`](examples/craft/) is a Minecraft-style block-building game
+written in Minyar: generated terrain with caves, ores, trees and water, a
+day/night cycle with torch lighting, and saving.
+
+```sh
+./minyar --release examples/craft/main.min -o craft
+./craft          # or ./craft --new for a fresh world
+```
+
+Mouse to look, WASD to move, Space to jump, Shift to sprint, F to fly, left
+click to break, right click to place, middle click to pick a block, 1-9 or
+the scroll wheel to choose, T to speed up time, and Escape to pause. It uses
+the standard `graphics` package, which needs GLFW (`brew install glfw` on
+macOS). Programs never write or link C themselves.
+
 ## Documentation
 
 - [Language guide](docs/language.md)

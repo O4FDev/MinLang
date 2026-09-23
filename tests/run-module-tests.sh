@@ -60,6 +60,6 @@ expect_error missing-file tests/modules/errors/missing-file/main.min "does-not-e
 expect_error private-record tests/modules/errors/private-record/main.min "'library.Hidden' is private to its module"
 expect_error missing-as tests/modules/errors/missing-as/main.min "use expects 'as' after the module name"
 expect_error bad-alias tests/modules/errors/bad-alias/main.min "use expects a module alias after 'as'"
-expect_error public-statement tests/modules/errors/public-statement/main.min "public must describe a function or record declaration"
+expect_error public-statement tests/modules/errors/public-statement/main.min "public must describe a function, record, or constant declaration"
 
 echo "module resolution, visibility, identity, cycles, and native linking verified"

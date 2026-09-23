@@ -62,6 +62,21 @@ operands; `+` also joins two `Text` values. These operators never coerce
 Boolean values into numbers. A NaN Float is unequal to everything, itself
 included.
 
+## Constants
+
+`constant` declares a named literal value that every function in the module
+can use. It is a declaration, like a function or record, and `public` exports
+it from a module:
+
+```minyar
+constant CHUNK_SIZE = 16
+constant GRAVITY: Float = -9.81
+constant TITLE = "Minyarcraft"
+```
+
+The value must be one literal, optionally negated: an Integer, Float, Text,
+Character or Boolean. An annotation, if present, must match its type.
+
 ## Loops
 
 `while condition { ... }` repeats while a Boolean holds. `for` visits a range
@@ -275,6 +290,18 @@ if answer == 42 {
     print("Everything is working")
 } else {
     print("Something went wrong")
+}
+```
+
+`if` chains may continue with `else if`:
+
+```minyar
+if score >= 90 {
+    print("A")
+} else if score >= 80 {
+    print("B")
+} else {
+    print("C")
 }
 ```
 
