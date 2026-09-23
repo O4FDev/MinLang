@@ -29,12 +29,13 @@ function axis(positive: Integer, negative: Integer): Float {
 }
 
 // Remesh up to `limit` chunks that changed, returning how many were rebuilt.
-function remesh(world: terrain.World, meshes: List<Integer>, vertices: Bytes, limit: Integer): Integer {
+function remesh(world: terrain.World, meshes: List<Integer>, waterMeshes: List<Integer>, vertices: Bytes, water: Bytes, limit: Integer): Integer {
     let rebuilt = 0
     for chunk in 0..world.dirty.length {
         if rebuilt < limit && world.dirty[chunk] {
-            meshing.buildChunk(world, chunk % terrain.CHUNKS_X, chunk / terrain.CHUNKS_X, vertices)
+            meshing.buildChunk(world, chunk % terrain.CHUNKS_X, chunk / terrain.CHUNKS_X, vertices, water)
             graphics.updateMesh(meshes[chunk], vertices)
+            graphics.updateMesh(waterMeshes[chunk], water)
             world.dirty[chunk] = false
             rebuilt += 1
         }
@@ -58,6 +59,54 @@ function drawHotbar(hotbar: List<Integer>, selected: Integer) {
         let u = textures.tileU(tile)
         let v = textures.tileV(tile)
         graphics.drawImage(x + 7.0, top + 7.0, slot - 14.0, slot - 14.0, u, v, u + 0.0625, v + 0.0625)
+    }
+}
+
+function twoDigits(value: Integer): Text {
+    if value < 10 {
+        return "0" + Text(value)
+    }
+    return Text(value)
+}
+
+// 0 is sunrise at 6:00 and 0.25 is noon.
+function clockText(time: Float): Text {
+    let minutes = Integer(time * 1440.0 + 360.0) % 1440
+    return twoDigits(minutes / 60) + ":" + twoDigits(minutes % 60)
+}
+
+function facing(yaw: Float): Text {
+    let turn = Integer(floor((yaw / 6.283185307179586) * 4.0 + 0.5)) % 4
+    if turn < 0 {
+        turn += 4
+    }
+    if turn == 0 { return "north" }
+    if turn == 1 { return "east" }
+    if turn == 2 { return "south" }
+    return "west"
+}
+
+function drawHud(player: physics.Player, sky: atmosphere.Sky, fps: Integer, blockName: Text, nameSeconds: Float, captured: Boolean) {
+    let status = "Minyarcraft  " + Text(fps) + " fps\n"
+    status += "Position " + Text(Integer(floor(player.x))) + " " + Text(Integer(floor(player.y))) + " " + Text(Integer(floor(player.z))) + "  facing " + facing(player.yaw) + "\n"
+    status += "Time " + clockText(sky.time)
+    if player.flying {
+        status += "  flying"
+    }
+    graphics.drawText(status, 10.0, 10.0, 2.0, 1.0, 1.0, 1.0)
+    let width = Float(graphics.windowWidth())
+    let height = Float(graphics.windowHeight())
+    if nameSeconds > 0.0 {
+        let size = 2.0
+        let nameWidth = graphics.textWidth(blockName, size)
+        graphics.drawText(blockName, (width - nameWidth) / 2.0, height - 90.0, size, 1.0, 1.0, 1.0)
+    }
+    if !captured {
+        graphics.drawRectangle(0.0, 0.0, width, height, 0.0, 0.0, 0.0, 0.45)
+        let title = "Paused"
+        graphics.drawText(title, (width - graphics.textWidth(title, 5.0)) / 2.0, height / 2.0 - 60.0, 5.0, 1.0, 1.0, 1.0)
+        let hint = "Click to play\n\nWASD move   Space jump   Shift sprint   F fly\nLeft click break   Right click place   1-9 or scroll choose\nT speed up time   Escape pause"
+        graphics.drawText(hint, (width - graphics.textWidth(hint, 2.0)) / 2.0, height / 2.0 + 10.0, 2.0, 0.9, 0.9, 0.9)
     }
 }
 
@@ -96,11 +145,14 @@ if !loaded {
     terrain.generate(world)
 }
 let meshes: List<Integer> = []
+let waterMeshes: List<Integer> = []
 for chunk in 0..world.dirty.length {
     meshes.add(graphics.createMesh())
+    waterMeshes.add(graphics.createMesh())
 }
 let vertices = Bytes()
-remesh(world, meshes, vertices, world.dirty.length)
+let water = Bytes()
+remesh(world, meshes, waterMeshes, vertices, water, world.dirty.length)
 
 let sky = atmosphere.create(startTime)
 let player = physics.spawn(world)
@@ -111,6 +163,8 @@ let hotbar = [blocks.GRASS, blocks.DIRT, blocks.STONE, blocks.COBBLESTONE, block
 let selected = 0
 let numberKeys = [graphics.KEY_1, graphics.KEY_2, graphics.KEY_3, graphics.KEY_4, graphics.KEY_5, graphics.KEY_6, graphics.KEY_7, graphics.KEY_8, graphics.KEY_9]
 let frames = 0
+let fps = 0
+let nameSeconds = 2.0
 let clock = 0.0
 let frameNumber = 0
 let sinceSave = 0.0
@@ -131,10 +185,11 @@ while graphics.nextFrame() {
     }
     clock += seconds
     if clock >= 1.0 {
-        graphics.setTitle("Minyarcraft  " + Text(frames) + " fps  x " + Text(Integer(floor(player.x))) + " y " + Text(Integer(floor(player.y))) + " z " + Text(Integer(floor(player.z))) + "  " + blocks.name(hotbar[selected]))
+        fps = frames
         frames = 0
         clock -= 1.0
     }
+    nameSeconds -= seconds
     sinceSave += seconds
     if screenshot == "" && sinceSave >= AUTOSAVE_SECONDS {
         save.store(world, player, sky)
@@ -153,6 +208,7 @@ while graphics.nextFrame() {
         player.yaw += graphics.mouseMoveX() * MOUSE_SENSITIVITY
         player.pitch = clamp(player.pitch - graphics.mouseMoveY() * MOUSE_SENSITIVITY, -1.55, 1.55)
     }
+    let previous = selected
     for index in 0..numberKeys.length {
         if graphics.keyPressed(numberKeys[index]) {
             selected = index
@@ -163,6 +219,9 @@ while graphics.nextFrame() {
         selected = (selected + 1) % hotbar.length
     } else if scrolled > 0.0 {
         selected = (selected + hotbar.length - 1) % hotbar.length
+    }
+    if selected != previous {
+        nameSeconds = 2.0
     }
     if graphics.keyPressed(graphics.KEY_F) {
         player.flying = !player.flying
@@ -195,7 +254,7 @@ while graphics.nextFrame() {
             }
         }
     }
-    remesh(world, meshes, vertices, CHUNKS_PER_FRAME)
+    remesh(world, meshes, waterMeshes, vertices, water, CHUNKS_PER_FRAME)
 
     // Drawing
     let eyeX = player.x
@@ -214,14 +273,20 @@ while graphics.nextFrame() {
     for mesh in meshes {
         graphics.drawMesh(mesh)
     }
+    for mesh in waterMeshes {
+        graphics.drawTranslucentMesh(mesh, 0.72)
+    }
     if hit.found {
         let x = Float(hit.x)
         let y = Float(hit.y)
         let z = Float(hit.z)
         graphics.drawBox(x - 0.002, y - 0.002, z - 0.002, x + 1.002, y + 1.002, z + 1.002, 0.05, 0.05, 0.05)
     }
-    drawCrosshair()
+    if captured || screenshot != "" {
+        drawCrosshair()
+    }
     drawHotbar(hotbar, selected)
+    drawHud(player, sky, fps, blocks.name(hotbar[selected]), nameSeconds, captured || screenshot != "")
 }
 
 if screenshot == "" {
