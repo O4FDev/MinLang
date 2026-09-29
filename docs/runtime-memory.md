@@ -8,69 +8,45 @@ The explicit eager profile can perform the entire traversal during a release.
 See [the cleanup contract](bounded-runtime-contract.md) for the work accounting
 and operations outside that budget; it is not a wall-clock deadline.
 
-## Recursive data and cycle prevention
+## Recursive data and cyclic graphs
 
-Recursive record types are supported, including recursion through nested Lists
-and mutually recursive records. Trees, persistent chains and shared acyclic
-structures can be built with record constructors and List literals; see
-[`examples/recursive-tree.min`](../examples/recursive-tree.min).
+Recursive records, mutually recursive types, and arbitrary cyclic graphs are
+supported. List `.add`, indexed replacement, and reference-field assignment
+retain their shared mutation semantics, including when they create cycles:
 
-The conservative restriction applies to mutation, not declarations. For a
-mutation of `List<T>`, the compiler asks whether `T` can reach that exact
-`List<T>` type by following record fields and List element types. If so, both
-`.add` and indexed replacement are rejected with:
-
-```text
-this List mutation could create a reference cycle; construct a new List instead
+```minyar
+record Node { value: Integer; next: List<Node> }
+let node = Node { value: 42; next: [] }
+node.next.add(node)
+node.next = [node]
+print(node.next[0].value) // 42
 ```
 
-For `record Node { children: List<Node> }`, `List<Node>` therefore supports
-construction, indexing, iteration and sharing, but not `.add` or indexed
-replacement. Even a particular append of a fresh leaf is rejected: proving
-individual mutations safe would require additional ownership analysis. A
-mutable `List<Integer>` payload remains supported. An external `List<Wrapper>`
-where `Wrapper` contains a Node also remains mutable if Node cannot reach
-Wrapper. The check uses exact nested List types: a `List<List<Node>>` worklist
-is mutable when Node only contains `List<Node>` and has no path back to that
-outer List type.
+Reference counting promptly retires acyclic garbage. An incremental snapshot
+tracer reclaims cyclic garbage during execution. It counts internal owning edges
+separately, so ordinary reference counts also identify external owners: locals,
+parameters protected by their callers, temporaries, native owned references,
+and retired ownership frames. No conservative stack scan or user annotation is
+needed. There are no weak references, finalizers, or resurrection callbacks.
 
-Lists keep their shared reference semantics; nothing is implicitly copied,
-frozen or made weak. A function that performs a forbidden mutation is rejected
-even if a caller would pass an apparently safe argument. Module aliases,
-returned references and helper functions cannot evade the check because every
-mutation is checked using its resolved static type. The iterative traversal
-visits each reachable record once, and proven-safe List types are cached for
-that compilation. Scalar and Text element types need no graph traversal.
+The compiler's former cycle rejection analysis now supplies an optimization
+hint. Generated entry points keep tracing dormant until a mutation executes
+whose resolved types permit a return path to its receiver. Construction alone
+cannot create the first cycle, because the new value is unavailable until its
+initializers finish. This hint never rejects a mutation. Once enabled, tracing
+remains enabled for the process. The hint call also services one bounded batch
+before each such mutation, while the receiver and arguments remain owned.
+Native C clients default to conservative
+tracing; the hint ABI is compiler-private and assumes complete Minyar code.
 
-The acyclicity argument uses the first possible cycle. A new record or List
-literal is unavailable to the source program until its construction finishes;
-each field or element is retained or transferred before evaluating subsequent
-initializers. Construction therefore cannot introduce the first cycle. That
-cycle must instead result from inserting a mutable edge: from some List object
-of type `List<T>` to a value of type `T`, or from a record of type `R` to a
-value of a reference field type `F`. The existing return path in the heap would
-imply a type path from `T` back to `List<T>`, or from `F` back to `R`, and the
-checker rejects both. Assigning a reference field whose type can reach its own
-record type fails with:
+The non-mutating `list.appended(value)` still copies into a fresh List, at linear
+cost per append. It is useful for persistent structures, but is no longer
+required for recursive element types. See the [recursive tree
+example](../examples/recursive-tree.min) and the [cycle tests](../tests/cycles/).
 
-```text
-assigning this field could create a reference cycle; construct a new record instead
-```
-
-Scalar field assignment adds no heap edge and is always permitted. This
-argument includes transitive record fields, nested Lists and aliases.
-
-The non-mutating `list.appended(value)` operation copies into a fresh List and
-is permitted for recursive element types. Because the result does not exist
-while its inputs are evaluated, none of them can already point back to it; the
-first-cycle proof therefore still holds. This supports dynamic bottom-up tree
-construction, at linear cost per append, without weakening the mutation rule.
-
-Arbitrary cyclic graphs remain unsupported. Integer identifiers in a List of
-records remain an option; see [`examples/graph.min`](../examples/graph.min).
-Inferred lifetime regions and permissive mutation analysis are not implemented.
-Dynamic types, closures, foreign pointers or changes to the type encoding must
-revisit this proof before being added.
+See [the bounded cleanup contract](bounded-runtime-contract.md) for scheduling
+and accounting, and [the research report](../research/cycles/README.md) for the
+algorithm, invariants, measurements, and limitations.
 
 ## Compiler/runtime ownership contract
 
@@ -92,8 +68,8 @@ revisit this proof before being added.
   parameters protected by caller or ancestor owners; incoming parameter ownership
   slots start null. Assignment establishes a new local owner. `minyar_rc_local_take` transfers an already-owned reference
   into the slot and releases its previous value. Lexical scope exit clears locals.
-- `minyar_rc_step` releases completed expression owners. It does not scan the
-  heap. Nested function calls have separate expression storage.
+- `minyar_rc_step` retires completed expression owners and services a bounded
+  batch, which can include cycle tracing. Nested calls have separate expression storage.
 - A reference return transfers its owned result, or retains a borrowed result
   for the caller.
   `minyar_rc_leave` retires that function's expression and local owners; the
@@ -156,8 +132,10 @@ Readonly identifiers cannot enter scalar-record or ownership-slot metadata.
 
 ## Representation and destruction
 
-A native heap object has an eight-byte private prefix: three kind bits and a
-reference count. A zero count denotes an immortal object. Compiler-generated
+The word immediately before a native heap payload holds three kind bits and a
+reference count. Lists and mixed records also have a 48-byte collector prefix
+on the supported 64-bit ABI; Text and scalar records retain their eight-byte
+header. A zero count denotes an immortal object. Compiler-generated
 Text globals include the same prefix and expose the payload using an LLVM
 constant offset expression. Native calls must never pass an unprefixed object
 to ownership operations.
@@ -178,15 +156,18 @@ releases the old element.
 In incremental profiles, reference-bearing aggregates reaching zero count and
 detached heap ownership storage become queued work. Leaf values can be freed
 immediately without graph traversal. The runtime visits fields and retires tasks in budgeted
-batches, using the dead objects' own storage for queue links and cursors. It
-does not scan the live heap. Total reclamation work remains proportional to
-what is destroyed, and queued storage can remain resident between service
-points. Allocator calls and copying have separate costs outside that budget.
+batches, using the dead objects' own storage for queue links and cursors.
+Cycle tracing also visits live reference aggregates, one root or field per
+unit, over a finite captured cohort. Queued storage and conservative snapshot
+survivors can remain resident between service points. Allocator calls and copying have separate costs outside that budget.
 
 The eager profile frees leaves directly and processes reference containers with
 an iterative queue, avoiding recursive C-stack destruction while still allowing
-a graph-sized release. Its queue/frame buffers can retain their high-water
-capacity. Incremental profiles bound cached ownership-frame bytes separately.
+a graph-sized release. Cycle detection normally advances by 32 units per release or statement/loop
+service in this profile,
+avoiding repeated whole-heap scans during construction; the outermost frame
+exit can finish its remaining cycle work. Its queue/frame buffers can retain
+their high-water capacity. Incremental profiles bound cached ownership-frame bytes separately.
 The integer-to-Text cache has at most 32,768 entries; Text literals and ASCII
 Character texts live for the process lifetime.
 
@@ -230,6 +211,7 @@ because the underlying arena storage remains alive.
 
 | Target | Coverage |
 | --- | --- |
+| `make check-cycles` | Cyclic graphs, independent reachability oracle, dense garbage, small pools, and sanitizer/budget matrix |
 | `make check-ownership-policy` | Compiler budget selection, nonleaf fallback, module policy identity and edited delta replay |
 | `make check-stack-ownership` | Independent graph/debt accounting, stack lifetime, native/sanitizer and fallback profiles |
 | `make check-runtime-cache` | Standard runtime reuse, dependency invalidation and custom settings isolation |
@@ -239,7 +221,7 @@ because the underlying arena storage remains alive.
 | `make check-adversarial` | Evaluation order, transfers, and control flow |
 | `make check-ownership-mutation` | Detection of injected ownership leaks |
 | `make check-ownership-stress` | Generated type graphs and alias programs |
-| `make check-recursive-data` | Construction, traversal, sharing, and mutation rejection |
+| `make check-recursive-data` | Construction, traversal, sharing, and recursive mutation |
 | `make check-scalar-record-storage` | Initializer order, escape analysis, shadowing, and analysis limits |
 | `make check-readonly-parameters` | Mutable fallback, alias lifetimes, and parameter boundaries |
 | `make check-compiler-slice-cache` | Collisions, eviction, Unicode, and surviving aliases |
