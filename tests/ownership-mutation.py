@@ -37,7 +37,7 @@ def main():
         (directory / 'tests').mkdir()
         shutil.copyfile(ROOT / 'tests/runtime-unit.c', directory / 'tests/runtime-unit.c')
         for name, mutation in [('control', None), *mutations.items()]:
-            for filename in ('minyar_rc.h', 'minyar_runtime.c'):
+            for filename in ('minyar_runtime.c', *(p.name for p in (ROOT / 'runtime').glob('*.h'))):
                 text = (ROOT / 'runtime' / filename).read_text()
                 if mutation and mutation[0] == filename:
                     assert text.count(mutation[1]) == 1, (name, 'mutation site changed')

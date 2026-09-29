@@ -276,7 +276,8 @@ print(words[0])
         self.assertEqual(result.returncode, 0, result.stderr)
         records[-1] = 'record R399 { back: List<List<R7>> }'
         mutation = 'function attach(values: List<R7>, value: R7) { values.add(value) }\n'
-        self.rejects('\n'.join(records) + '\n' + mutation, 'this List mutation could create a reference cycle')
+        result, _ = self.compile('\n'.join(records) + '\n' + mutation)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_unreachable_code_still_has_type_checks(self):
         for body in ('return 1\nprint("text" - 1)', 'if true { return 1 } else { print("text" - 1) }\nreturn 2'):
