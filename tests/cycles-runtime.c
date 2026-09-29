@@ -184,7 +184,14 @@ int main(void) {
     minyar_rc_enter(0);
     r = self_loop();
     minyar_rc_keep(r);
+    /* Force actual tracing while r is owned only by the temporary table;
+     * polling an idle collector would not exercise root discovery. */
+    size_t temporary_epoch = rc_cycle_epochs;
+    MinyarRecord *trigger = self_loop();
+    minyar_rc_release(trigger);
     poll_many(4000);
+    assert(rc_cycle_epochs > temporary_epoch);
+    assert(rc_object_count == 1);
     assert(minyar_record_get(r, 0) == slot(r));
     minyar_rc_leave();
     empty();

@@ -19,13 +19,15 @@ def run(command, **kwargs):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--quick', action='store_true')
+    parser.add_argument('--runtime-only', action='store_true',
+                        help='run the native API oracle matrix without recompiling source fixtures')
     args = parser.parse_args()
     directory = ROOT / 'build/cycles-profiles'
     directory.mkdir(parents=True, exist_ok=True)
     runtime = ROOT / 'tests/cycles-runtime.c'
     compiler = ROOT / 'build/minyarc'
     sources = ('graphs', 'churn', 'dense', 'field', 'live-churn')
-    for name in sources:
+    for name in (() if args.runtime_only else sources):
         run([compiler, ROOT / f'tests/cycles/{name}.min', directory / f'{name}.ll'])
         (directory / f'{name}-sanitize.ll').write_text(instrument_address_sanitizer((directory / f'{name}.ll').read_text()))
     profiles = {
@@ -47,6 +49,8 @@ def main():
                 binary = directory / label
                 run([CLANG, *options, '-Wall', '-Wextra', '-Werror', runtime, '-o', binary])
                 print(label + ': ' + run([binary], env=environment), flush=True)
+                if args.runtime_only:
+                    continue
                 # The exact accounting harness drains debt only after program
                 # return. Churn must fit the pool BEFORE reaching that drain.
                 obj = directory / (label + '.o')
@@ -58,7 +62,10 @@ def main():
                     expected = {'field': '', 'churn': '100000', 'dense': '5000',
                                 'live-churn': '1\n100000', 'graphs': '0\n1\n2\n1\n0'}[name]
                     assert run([executable], env=environment) == expected
-    print('cycle profiles: native/sanitizer graph semantics, exact recovery and 100,000-cycle pool reuse')
+    if args.runtime_only:
+        print('cycle runtime profiles: native/sanitizer roots, oracle, exact recovery and bounded work')
+    else:
+        print('cycle profiles: native/sanitizer graph semantics, exact recovery and 100,000-cycle pool reuse')
 
 
 if __name__ == '__main__':
