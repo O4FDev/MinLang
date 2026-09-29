@@ -8,7 +8,7 @@ COMPILER_RUNTIME_FLAGS ?= -DMINYAR_COMPILER_ARENA
 COMPILER_LTO_FLAGS ?= -flto
 PROGRAM_RUNTIME_FLAGS ?= -DMINYAR_SYSTEM_HEAP=1
 BOUNDED_FLAGS ?= -DMINYAR_BOUNDED_HEAP=1
-RUNTIME_HEADERS = runtime/minyar_heap.h runtime/minyar_rc.h runtime/minyar_pool.h runtime/minyar_bounded_rc.h
+RUNTIME_HEADERS = runtime/minyar_cycles.h runtime/minyar_cycles_collect.h runtime/minyar_heap.h runtime/minyar_rc.h runtime/minyar_pool.h runtime/minyar_bounded_rc.h
 LIMITED ?= zsh scripts/with-limits.sh
 SANITIZER_LIMITED ?= zsh scripts/with-sanitizer-limits.sh
 MIN_COMPILER_EDGE_COVERAGE ?= 79
@@ -380,7 +380,7 @@ check: doctor check-smoke check-release-build check-recursive-data check-compact
 	! ./build/minyarc tests/errors/record-wrong-field-type.min build/invalid.ll 2> build/record-type-error.txt
 	grep -q "record field 'age' has the wrong type" build/record-type-error.txt
 	! ./build/minyarc tests/errors/record-field-assignment.min build/invalid.ll 2> build/record-immutable-error.txt
-	grep -q "record fields are immutable" build/record-immutable-error.txt
+	grep -q "record field.*needs" build/record-immutable-error.txt
 	! ./build/integer-overflow > /dev/null 2> build/overflow-error.txt
 	grep -q "Integer calculation is outside" build/overflow-error.txt
 	! ./build/divide-by-zero > /dev/null 2> build/division-error.txt
@@ -617,3 +617,9 @@ check-cycles: build/minyarc build/minyar-runtime.o build/cycles-runtime
 	$(LIMITED) ./build/cycles-runtime
 
 check: check-cycles
+
+.PHONY: check-cycle-profiles
+check-cycle-profiles: build/minyarc
+	$(SANITIZER_LIMITED) python3 tests/cycles-profiles.py
+
+check-cycles: check-cycle-profiles

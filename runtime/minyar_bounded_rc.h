@@ -58,7 +58,7 @@ static void *rc_bounded_finish_object(RcObject *object, unsigned kind) {
         RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(MinyarRecord)
                    + (size_t)record->length * (sizeof(long long) + (kind == RC_RECORD)));
     }
-    RC_DEALLOCATE(object);
+    rc_cycle_free_object(object, kind);
     RC_ACCOUNT(rc_object_count--);
     return text_backing;
 }
@@ -75,12 +75,16 @@ static unsigned rc_drop(void *value) {
         return 1;
     }
     if (!(ownership >> 3)) return 0;
+    rc_cycle_before_drop(object);
     object->ownership = ownership - 8;
-    if (object->ownership >> 3) return 0;
+    if (object->ownership >> 3) { rc_cycle_after_drop(object); return 0; }
+    if (rc_cycle_defer_zero(object)) return 0;
+    if (rc_cycle_value(value)) rc_cycle_unregister(object);
     unsigned kind = object->ownership & 7;
     if (kind == RC_TEXT) {
         void *backing = rc_bounded_finish_object(object, kind);
-        return 1 + (backing ? rc_drop(backing) : 0);
+        if (backing) rc_drop(backing);
+        return 1; /* One leaf owner, including its flattened backing root. */
     }
     if (kind == RC_TEXT || kind == RC_LIST || kind == RC_REFERENCES_IMMORTAL ||
         (kind == RC_REFERENCES && !((MinyarList *)(object + 1))->length) ||
@@ -94,6 +98,11 @@ static unsigned rc_drop(void *value) {
     if (!rc_bounded_recent_tail) rc_bounded_recent_tail = object;
     rc_pending_count++;
     return 0;
+}
+
+static void rc_drop_edge(void *value) {
+    rc_cycle_edge_remove(value);
+    rc_drop(value);
 }
 
 static RcFrame *rc_bounded_frame_head, *rc_bounded_frame_tail;
@@ -124,7 +133,7 @@ static void rc_bounded_old_object_unit(void) {
     if (kind == RC_REFERENCES) {
         MinyarList *list = (MinyarList *)(object + 1);
         if (rc_bounded_cursor < (size_t)list->length) {
-            rc_drop((void *)(uintptr_t)list->values[rc_bounded_cursor++]);
+            rc_drop_edge((void *)(uintptr_t)list->values[rc_bounded_cursor++]);
             return;
         }
     } else if (kind == RC_RECORD) {
@@ -132,7 +141,7 @@ static void rc_bounded_old_object_unit(void) {
         if (rc_bounded_cursor < (size_t)record->length) {
             unsigned char *map = (unsigned char *)(record->values + record->length);
             size_t index = rc_bounded_cursor++;
-            if (map[index] & 1) rc_drop((void *)(uintptr_t)record->values[index]);
+            if (map[index] & 1) rc_drop_edge((void *)(uintptr_t)record->values[index]);
             return;
         }
     }
@@ -153,7 +162,7 @@ static void rc_bounded_recent_object_unit(void) {
         if (cursor < (size_t)list->length) {
             void *child = (void *)(uintptr_t)list->values[cursor];
             rc_bounded_save_cursor(object, cursor + 1);
-            rc_drop(child);
+            rc_drop_edge(child);
             return;
         }
     } else {
@@ -162,7 +171,7 @@ static void rc_bounded_recent_object_unit(void) {
             unsigned char *map = (unsigned char *)(record->values + record->length);
             void *child = (map[cursor] & 1) ? (void *)(uintptr_t)record->values[cursor] : NULL;
             rc_bounded_save_cursor(object, cursor + 1);
-            rc_drop(child);
+            rc_drop_edge(child);
             return;
         }
     }
@@ -238,12 +247,12 @@ static void rc_bounded_chunk_unit(void) {
 size_t minyar_rc_poll(size_t budget) {
     if (budget > MINYAR_RC_POLL_BUDGET) budget = MINYAR_RC_POLL_BUDGET;
     size_t work = 0;
-    if (!rc_bounded_frame_head && !rc_bounded_chunk_head) {
+    if (!rc_bounded_frame_head && !rc_bounded_chunk_head && !rc_cycle_pending) {
         /* Object processing can only enqueue objects. With no frame/chunk
          * tasks, skip repeated three-way selection for this entire poll.
          * Match the general scheduler's next queue after any object work;
          * empty and zero-budget polls leave that state unchanged. */
-        while (work < budget && rc_pending_count) {
+        while (work < budget && rc_pending_count && !rc_cycle_pending) {
             /* With one unvisited unary record, locality makes its field visit
              * and finalization the next two units. There is no competing old
              * task to bypass, and dropping one child creates at most one task.
@@ -278,6 +287,8 @@ size_t minyar_rc_poll(size_t budget) {
                                     /* Live maps contain flags0/1, hence their
                                      * saved cursor is already zero. No queue or
                                      * cursor initialization is needed in transit. */
+                                    rc_cycle_edge_remove(next + 1);
+                                    rc_cycle_unregister(next);
                                     next->ownership = RC_RECORD;
                                     rc_bounded_finish_object(single, RC_RECORD);
                                     work += 2;
@@ -288,7 +299,7 @@ size_t minyar_rc_poll(size_t budget) {
                                     continue;
                                 }
                                 rc_bounded_recent_turn ^= 1;
-                                if (map[0] & 1) rc_drop((void *)(uintptr_t)record->values[0]);
+                                if (map[0] & 1) rc_drop_edge((void *)(uintptr_t)record->values[0]);
                                 rc_bounded_recent_turn ^= 1;
                                 rc_bounded_finish_object(single, RC_RECORD);
                                 rc_pending_count--;
@@ -323,7 +334,7 @@ size_t minyar_rc_poll(size_t budget) {
                     if (child && child->ownership == (8 | RC_SCALAR_RECORD))
                         rc_bounded_finish_object(child, RC_SCALAR_RECORD);
                     else {
-                        rc_drop(value);
+                        rc_drop_edge(value);
                         if (rc_bounded_recent_head) break;
                     }
                 }
@@ -336,16 +347,18 @@ size_t minyar_rc_poll(size_t budget) {
     } else {
         while (work < budget && rc_pending_count) {
             unsigned queue = rc_bounded_next_queue;
-            for (unsigned tries = 0; tries < 3; tries++) {
+            for (unsigned tries = 0; tries < 4; tries++) {
                 if ((queue == 0 && (rc_bounded_active || rc_bounded_head || rc_bounded_recent_head)) ||
                     (queue == 1 && rc_bounded_frame_head) ||
-                    (queue == 2 && rc_bounded_chunk_head)) break;
-                queue = (queue + 1) % 3;
+                    (queue == 2 && rc_bounded_chunk_head) ||
+                    (queue == 3 && rc_cycle_pending)) break;
+                queue = (queue + 1) % 4;
             }
-            rc_bounded_next_queue = (queue + 1) % 3;
+            rc_bounded_next_queue = (queue + 1) % 4;
             if (queue == 0) rc_bounded_object_unit();
             else if (queue == 1) rc_bounded_frame_unit();
-            else rc_bounded_chunk_unit();
+            else if (queue == 2) rc_bounded_chunk_unit();
+            else rc_cycle_unit();
             work++;
         }
     }
