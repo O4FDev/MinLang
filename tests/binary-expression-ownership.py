@@ -48,7 +48,7 @@ print(true || unexpected())
 INVALID = [
  ('neutral_rhs_literal', 'print([1] == [])\n', "the two sides of '==' have different types"),
  ('text_integer_mismatch', 'print("x" + 1)\n', "the two sides of '+' have different types"),
- ('list_equality_unsupported', 'print([1] == [2])\n', 'records and Lists do not yet support equality'),
+ ('list_equality_unsupported', 'print([1] == [2])\n', 'records, Lists, and Bytes do not yet support equality'),
  ('neutral_rhs_binding', 'let values: List<Integer> = []\nprint(values == [])\n', "the two sides of '==' have different types"),
  ('comparison_changes_type', "print(('a' < 'b') == 1)\n", "the two sides of '==' have different types"),
  ('nested_operand_mismatch', 'print((1 + 2) * true)\n', "the two sides of '*' have different types"),
