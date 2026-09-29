@@ -1074,6 +1074,59 @@ function findRecordField(functionParameterCounts: List<Integer>, functionParamet
     return found
 }
 
+// Constructor edges cannot create the first cycle. These type reachability
+// checks enable tracing before a mutation that can; they never reject one.
+function listMutationMayCycle(listType: Integer, counts: List<Integer>, fields: List<Integer>, returnTypes: List<Integer>): Boolean {
+    let base = listElementType(listType)
+    while isListType(base) {
+        base = listElementType(base)
+    }
+    if !isRecordType(base) {
+        return false
+    }
+    let recordCount = counts.length / 2
+    let cached = recordCount * 2
+    while cached < returnTypes.length {
+        if returnTypes[cached] == listType {
+            return false
+        }
+        cached = cached + 1
+    }
+    let visited: List<Boolean> = []
+    let index = 0
+    while index < recordCount {
+        visited.add(false)
+        index = index + 1
+    }
+    let pending: List<Integer> = []
+    pending.add(listElementType(listType))
+    index = 0
+    while index < pending.length {
+        let type = pending[index]
+        index = index + 1
+        while isListType(type) {
+            if type == listType {
+                return true
+            }
+            type = listElementType(type)
+        }
+        if isRecordType(type) {
+            let record = type - 1000
+            if !visited[record] {
+                visited[record] = true
+                let first = functionParameterOffset(counts, record)
+                let field = 0
+                while field < counts[record] {
+                    pending.add(fields[first + field])
+                    field = field + 1
+                }
+            }
+        }
+    }
+    returnTypes.add(listType)
+    return false
+}
+
 function requireType(tokenLines: List<Text>, state: List<Integer>, actual: Integer, expected: Integer, explanation: Text) {
     if actual != expected {
         fail(describeLocation(tokenLines[state[0]]) + ": " + explanation)
@@ -2101,6 +2154,9 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                     if argumentType[0] != listElementType(resultType[0]) {
                         fail("the value added to a List has the wrong type")
                     }
+                    if listMutationMayCycle(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes) {
+                        addOutput(output, "  call void @minyar_rc_enable_cycles()\n")
+                    }
                     let slot = valueAsListSlot(output, textState, state, argument, argumentType[0])
                     if takeResult(output, state, argument, argumentType) {
                         addOutput(output, "  call void @minyar_list_add_take(ptr ")
@@ -3056,6 +3112,45 @@ function readListElement(output: List<Text>, textState: List<Text>, state: List<
     return slotAsValue(output, textState, state, raw, type)
 }
 
+function fieldMutationMayCycle(recordType: Integer, fieldType: Integer, counts: List<Integer>, fields: List<Integer>): Boolean {
+    let base = fieldType
+    while isListType(base) { base = listElementType(base) }
+    if !isRecordType(base) { return false }
+    let recordCount = counts.length / 2
+    let visited: List<Boolean> = []
+    let index = 0
+    while index < recordCount {
+        visited.add(false)
+        index = index + 1
+    }
+    let pending: List<Integer> = []
+    pending.add(fieldType)
+    index = 0
+    while index < pending.length {
+        let type = pending[index]
+        index = index + 1
+        while isListType(type) {
+            type = listElementType(type)
+        }
+        if isRecordType(type) {
+            if type == recordType {
+                return true
+            }
+            let record = type - 1000
+            if !visited[record] {
+                visited[record] = true
+                let first = functionParameterOffset(counts, record)
+                let field = 0
+                while field < counts[record] {
+                    pending.add(fields[first + field])
+                    field = field + 1
+                }
+            }
+        }
+    }
+    return false
+}
+
 // Parse the right side of `target op= value`. A compound operator combines the
 // current value with the right side exactly as the binary operator would.
 function assignedValue(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, binary: Text, current: Text, type: Integer, valueType: List<Integer>, location: Text): Text {
@@ -3116,8 +3211,6 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
             let fieldIndex = field - functionParameterOffset(functionParameterCounts, receiverType - 1000)
             if state[0] == operatorPosition {
                 state[0] = operatorPosition + 1
-                if isReferenceType(fieldType) {
-                }
                 let current = ""
                 if binary != "" {
                     current = readRecordField(output, textState, state, receiver, fieldIndex, fieldType)
@@ -3129,6 +3222,9 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
                 }
                 let slot = valueAsListSlot(output, textState, state, value, fieldType)
                 if isReferenceType(fieldType) {
+                    if fieldMutationMayCycle(receiverType, fieldType, functionParameterCounts, functionParameterTypes) {
+                        addOutput(output, "  call void @minyar_rc_enable_cycles()\n")
+                    }
                     let transfers = "0"
                     if takeResult(output, state, value, valueType) {
                         transfers = "1"
@@ -3196,6 +3292,9 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
                     let value = assignedValue(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, binary, current, elementType, valueType, operatorLocation)
                     if valueType[0] != elementType {
                         fail(describeLocation(operatorLocation) + ": an indexed assignment needs " + describeType(elementType) + ", not " + describeType(valueType[0]))
+                    }
+                    if listMutationMayCycle(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes) {
+                        addOutput(output, "  call void @minyar_rc_enable_cycles()\n")
                     }
                     let slot = valueAsListSlot(output, textState, state, value, elementType)
                     if takeResult(output, state, value, valueType) {
@@ -3912,6 +4011,7 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         let entrySlot = output.length
         addOutput(output, "")
         if name == "main" {
+            addOutput(output, "  call void @minyar_rc_cycle_policy()\n")
             addOutput(output, "  call void @minyar_initialize_arguments(i32 %minyar.argument.count, ptr %minyar.argument.values)\n")
         }
         let parameter = 0
@@ -3986,6 +4086,7 @@ function compileTopLevel(tokenKinds: List<Integer>, tokenTexts: List<Text>, toke
     let localLengths: List<Integer> = []
 
     addOutput(output, "define i32 @main(i32 %minyar.argument.count, ptr %minyar.argument.values) {\nentry:\n")
+    addOutput(output, "  call void @minyar_rc_cycle_policy()\n")
     let entrySlot = output.length
     addOutput(output, "")
     addOutput(output, "  call void @minyar_initialize_arguments(i32 %minyar.argument.count, ptr %minyar.argument.values)\n")
@@ -4094,6 +4195,8 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     addOutput(output, "declare void @minyar_rc_keep(ptr)\n")
     addOutput(output, "declare void @minyar_rc_borrow(ptr)\n")
     addOutput(output, "declare void @minyar_rc_retain(ptr)\n")
+    addOutput(output, "declare void @minyar_rc_cycle_policy()\n")
+    addOutput(output, "declare void @minyar_rc_enable_cycles()\n")
     addOutput(output, "declare void @minyar_rc_local(i64, ptr)\n")
     addOutput(output, "declare void @minyar_rc_local_take(i64, ptr)\n")
     addOutput(output, "declare void @minyar_rc_local_move(i64)\n")

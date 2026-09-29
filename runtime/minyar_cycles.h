@@ -6,7 +6,7 @@
 typedef struct RcCycle {
     struct RcCycle *previous, *next, *gray_previous, *gray_next;
     size_t incoming;
-    unsigned generation : 1, marked : 2, registered : 1, pinned : 1;
+    unsigned generation : 1, marked : 2, registered : 1, pinned : 1, cleared : 1;
 } RcCycle;
 enum { RC_CYCLE_IDLE, RC_CYCLE_ROOTS, RC_CYCLE_MARK, RC_CYCLE_SWEEP };
 static RcCycle *rc_cycle_head, *rc_cycle_cohort, *rc_cycle_cursor;
@@ -14,6 +14,13 @@ static RcCycle *rc_cycle_gray_head, *rc_cycle_gray_tail, *rc_cycle_active;
 static size_t rc_cycle_index, rc_cycle_limit;
 static unsigned rc_cycle_generation, rc_cycle_phase, rc_cycle_requested;
 static unsigned rc_cycle_pending, rc_cycle_inside;
+/* Raw native clients conservatively trace. Generated main opts into complete
+ * compiler mutation hints, before constructing any graph. */
+static unsigned rc_cycle_enabled = 1;
+void minyar_rc_cycle_policy(void) {
+    if (!rc_cycle_head && !rc_cycle_pending) rc_cycle_enabled = 0;
+}
+void minyar_rc_enable_cycles(void) { rc_cycle_enabled = 1; }
 #ifdef MINYAR_RC_TESTING
 static size_t rc_cycle_units, rc_cycle_epochs;
 #endif
@@ -49,7 +56,7 @@ static void rc_cycle_register(RcObject *object) {
     rc_cycle_head = cycle;
 }
 static void rc_cycle_request(void) {
-    if (rc_cycle_inside) return;
+    if (rc_cycle_inside || !rc_cycle_enabled) return;
     rc_cycle_requested = 1;
     if (!rc_cycle_pending) {
         rc_cycle_pending = 1;

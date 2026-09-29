@@ -8,7 +8,9 @@ static long long slot(void *p) { return (long long)(uintptr_t)p; }
 static void poll_many(size_t n) {
 #ifdef MINYAR_BOUNDED_RC
     while (n--) {
+        size_t before = rc_cycle_units;
         size_t work = minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
+        assert(rc_cycle_units - before <= work);
         assert(work <= MINYAR_RC_POLL_BUDGET);
         assert(rc_bounded_last_work <= MINYAR_RC_POLL_BUDGET);
     }

@@ -2,7 +2,7 @@
  * a dead object's header becomes a tagged FIFO link. Its payload is retained
  * until a cursor has processed every field. Only zero-count objects enter the
  * object queue; detached frames and temporary chunks have separate queues.
- * A work unit visits one owner/field or retires one task (up to three frees).
+ * A work unit visits one owner/field or retires one task (up to five frees, including a flattened Text backing).
  * Pool frees have at most log2(heap/minimum-block) merge steps. System
  * allocator calls have no runtime-imposed execution-time bound.
  * Work bounds exclude startup, data copying and OS scheduling/page faults. */
@@ -87,6 +87,7 @@ static unsigned rc_drop(void *value) {
         return 1; /* One leaf owner, including its flattened backing root. */
     }
     if (kind == RC_TEXT || kind == RC_LIST || kind == RC_REFERENCES_IMMORTAL ||
+        (kind == RC_RECORD && rc_cycle_metadata(object)->cleared) ||
         (kind == RC_REFERENCES && !((MinyarList *)(object + 1))->length) ||
         (kind == RC_RECORD && !((MinyarRecord *)(object + 1))->length)) {
         rc_bounded_finish_object(object, kind);
@@ -241,15 +242,16 @@ static void rc_bounded_chunk_unit(void) {
     rc_pending_count--;
 }
 
-/* Round-robin service across three queues: every continuously ready queue
- * receives one unit within three units, including when the poll budget is 1.
- * rc_pending_count includes objects, detached frames and temporary chunks. */
+/* Round-robin service across four queues: every continuously ready queue
+ * receives one unit within four units, including when the poll budget is 1.
+ * rc_pending_count includes objects, detached frames, temporary chunks and
+ * one cycle job. */
 size_t minyar_rc_poll(size_t budget) {
     if (budget > MINYAR_RC_POLL_BUDGET) budget = MINYAR_RC_POLL_BUDGET;
     size_t work = 0;
     if (!rc_bounded_frame_head && !rc_bounded_chunk_head && !rc_cycle_pending) {
         /* Object processing can only enqueue objects. With no frame/chunk
-         * tasks, skip repeated three-way selection for this entire poll.
+         * tasks, skip repeated queue selection for this entire poll.
          * Match the general scheduler's next queue after any object work;
          * empty and zero-budget polls leave that state unchanged. */
         while (work < budget && rc_pending_count && !rc_cycle_pending) {

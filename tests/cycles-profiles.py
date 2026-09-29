@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 from regressions import CLANG, ROOT
+from llvm_sanitizer import instrument_address_sanitizer
 
 
 def run(command, **kwargs):
@@ -23,9 +24,10 @@ def main():
     directory.mkdir(parents=True, exist_ok=True)
     runtime = ROOT / 'tests/cycles-runtime.c'
     compiler = ROOT / 'build/minyarc'
-    sources = ('graphs', 'churn')
+    sources = ('graphs', 'churn', 'dense')
     for name in sources:
         run([compiler, ROOT / f'tests/cycles/{name}.min', directory / f'{name}.ll'])
+        (directory / f'{name}-sanitize.ll').write_text(instrument_address_sanitizer((directory / f'{name}.ll').read_text()))
     profiles = {
         'system': ['-DMINYAR_SYSTEM_HEAP=1'],
         'fixed': ['-DMINYAR_BOUNDED_HEAP=1'],
@@ -51,8 +53,9 @@ def main():
                 run([CLANG, *options, '-c', ROOT / 'tests/memory-contracts-runtime.c', '-o', obj])
                 for name in sources:
                     executable = directory / (label + '-' + name)
-                    run([CLANG, *options, directory / f'{name}.ll', obj, '-o', executable])
-                    expected = '100000' if name == 'churn' else '0\n1\n2\n1\n0'
+                    ir = directory / (name + ('-sanitize' if sanitize else '') + '.ll')
+                    run([CLANG, *options, ir, obj, '-o', executable])
+                    expected = {'churn': '100000', 'dense': '5000', 'graphs': '0\n1\n2\n1\n0'}[name]
                     assert run([executable], env=environment) == expected
     print('cycle profiles: native/sanitizer graph semantics, exact recovery and 100,000-cycle pool reuse')
 

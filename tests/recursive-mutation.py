@@ -17,6 +17,7 @@ from regressions import CLANG, COMPILER, ROOT
 SOURCE = ROOT / 'src/compiler.min'
 RUNTIME = ROOT / 'build/ownership-runtime.o'
 TARGETS = {
+    'cycle-hint': ('cycles.py', 'Cycles.test_list_only_cycle'),
     'literal-owner': ('recursive-data.py',
                       'RecursiveData.test_literal_retains_earlier_projection_before_later_mutation'),
     'context': ('production-memory.py',
@@ -32,6 +33,12 @@ def replace_once(source: str, before: str, after: str, name: str) -> str:
 
 
 def mutate(original: str, name: str) -> str:
+    if name == 'cycle-hint':
+        return replace_once(original,
+            'function listMutationMayCycle(listType: Integer, counts: List<Integer>, '
+            'fields: List<Integer>, returnTypes: List<Integer>): Boolean {',
+            'function listMutationMayCycle(listType: Integer, counts: List<Integer>, '
+            'fields: List<Integer>, returnTypes: List<Integer>): Boolean {\n    return false', name)
     if name == 'literal-owner':
         start = original.index('function parseListLiteral(')
         end = original.index('\nfunction parseAtom(', start)
@@ -95,13 +102,14 @@ def main() -> None:
             result = exercise(control, name)
             if result.returncode != 0:
                 raise AssertionError(f'control {name} failed:\n{result.stdout}\n{result.stderr}')
-        print('control compiler: both targeted contracts pass; native cases pass at O0/O2', flush=True)
+        print('control compiler: all three targeted contracts pass; native cases pass at O0/O2', flush=True)
         for name in TARGETS:
             compiler = build(mutate(original, name), directory, name)
             result = exercise(compiler, name)
             output = result.stdout + result.stderr
             test_name = TARGETS[name][1].split('.')[-1]
             expected = {
+                'cycle-hint': 'rc_object_count == rc_immortal_object_count',
                 'literal-owner': 'AddressSanitizer: heap-use-after-free',
                 'context': 'an argument passed to nodes has the wrong type',
             }[name]
@@ -112,7 +120,7 @@ def main() -> None:
                     f"optimization='{level}'" not in output for level in ('-O0', '-O2')):
                 raise AssertionError(f'{name}: both optimization levels must detect the lifetime fault:\n{output}')
             print(f'{name}: detected by {test_name} ({expected})', flush=True)
-    print('Both recursive compiler mutants detected')
+    print('All three recursive compiler mutants detected')
 
 
 if __name__ == '__main__':

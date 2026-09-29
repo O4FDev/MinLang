@@ -13,6 +13,8 @@
  * Runtime constructors return one owned reference; Text literals and caches are immortal.
  * The compiler's process-lifetime arena compiles ownership operations away. */
 #ifdef MINYAR_COMPILER_ARENA
+void minyar_rc_cycle_policy(void) {}
+void minyar_rc_enable_cycles(void) {}
 void minyar_rc_enter(long long locals) { (void)locals; }
 void minyar_rc_leave(void) {}
 void minyar_rc_keep(void *value) { (void)value; }
@@ -198,12 +200,13 @@ static void rc_drop(void *value) {
         MinyarList *list = (MinyarList *)(object + 1);
         rc_free_data(list->values);
         RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(*list));
-    } else if (kind == RC_SCALAR_RECORD) {
+    } else if (kind == RC_SCALAR_RECORD ||
+               (kind == RC_RECORD && rc_cycle_metadata(object)->cleared)) {
 #ifdef MINYAR_RC_TESTING
         MinyarRecord *record = (MinyarRecord *)(object + 1);
 #endif
         RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(MinyarRecord)
-                               + (size_t)record->length * sizeof(long long));
+                               + (size_t)record->length * (sizeof(long long) + (kind == RC_RECORD)));
     } else {
         if (rc_pending_count == rc_pending_capacity) {
             size_t capacity = rc_pending_capacity ? rc_pending_capacity * 2 : 64;

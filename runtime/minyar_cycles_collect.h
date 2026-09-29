@@ -75,6 +75,13 @@ static void rc_cycle_unit_body(void) {
             }
         } else {
             rc_cycle_active = NULL;
+            /* All outgoing slots were visited and cleared. Avoid revisiting
+             * those null slots when the last incoming owner later retires. */
+            RcObject *object = rc_cycle_object(cycle);
+            cycle->cleared = 1;
+            if ((object->ownership & 7) != RC_RECORD)
+                ((MinyarList *)(object + 1))->length = 0;
+            rc_cycle_unregister(object);
             /* The pin keeps self-edges safe while being severed. Other white
              * nodes remain protected by their ordinary, still counted edges. */
             rc_drop(rc_cycle_object(cycle) + 1);
