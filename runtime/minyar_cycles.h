@@ -20,7 +20,15 @@ static unsigned rc_cycle_enabled = 1;
 void minyar_rc_cycle_policy(void) {
     if (!rc_cycle_head && !rc_cycle_pending) rc_cycle_enabled = 0;
 }
-void minyar_rc_enable_cycles(void) { rc_cycle_enabled = 1; }
+void minyar_rc_enable_cycles(void) {
+    rc_cycle_enabled = 1;
+#ifdef MINYAR_BOUNDED_RC
+    /* A potentially cyclic source mutation is also a service point. It runs
+     * before the store, while the compiler's receiver/argument owners protect
+     * both values, and services exactly one ordinary bounded batch. */
+    rc_service_pending(MINYAR_RC_POLL_BUDGET);
+#endif
+}
 #ifdef MINYAR_RC_TESTING
 static size_t rc_cycle_units, rc_cycle_epochs;
 #endif

@@ -1,5 +1,7 @@
 /* Included after rc_drop and the ordinary cleanup implementation. Every call
- * performs one bounded unit: phase transition, root, queue task, or field.
+ * performs one bounded unit: phase transition, root, survivor, or field.
+ * Constant-size scan setup/completion accompanies the first/last field; a
+ * unit never scans a second slot or starts another container after finishing.
  * New allocations prepend to the registry and cannot extend a captured cohort.
  * List scan limits are captured once; appends cannot extend an active scan. */
 static size_t rc_cycle_length(RcCycle *cycle) {
@@ -37,78 +39,77 @@ static void rc_cycle_unit_body(void) {
     }
     if (rc_cycle_phase == RC_CYCLE_MARK) {
         RcCycle *cycle = rc_cycle_active;
-        if (cycle) {
-            if (rc_cycle_index < rc_cycle_limit) {
-                long long *slot = rc_cycle_slot(cycle, rc_cycle_index++);
-                if (slot) rc_cycle_shade(rc_cycle_value((void *)(uintptr_t)*slot));
-            } else {
-                rc_cycle_active = NULL;
-                cycle->marked = 2;
-                if (cycle->pinned) {
-                    cycle->pinned = 0;
-                    rc_drop(rc_cycle_object(cycle) + 1);
-                }
+        if (!cycle) {
+            cycle = rc_cycle_gray_head;
+            if (!cycle) {
+                rc_cycle_phase = RC_CYCLE_SWEEP;
+                rc_cycle_cursor = rc_cycle_cohort;
+                return;
             }
-            return;
-        }
-        cycle = rc_cycle_gray_head;
-        if (cycle) {
             rc_cycle_gray_remove(cycle);
             rc_cycle_active = cycle;
             rc_cycle_index = 0;
             rc_cycle_limit = rc_cycle_length(cycle);
-        } else {
-            rc_cycle_phase = RC_CYCLE_SWEEP;
-            rc_cycle_cursor = rc_cycle_cohort;
+        }
+        if (rc_cycle_index < rc_cycle_limit) {
+            long long *slot = rc_cycle_slot(cycle, rc_cycle_index++);
+            if (slot) rc_cycle_shade(rc_cycle_value((void *)(uintptr_t)*slot));
+        }
+        if (rc_cycle_index == rc_cycle_limit) {
+            rc_cycle_active = NULL;
+            cycle->marked = 2;
+            if (cycle->pinned) {
+                cycle->pinned = 0;
+                rc_drop(rc_cycle_object(cycle) + 1);
+            }
         }
         return;
     }
     RcCycle *cycle = rc_cycle_active;
-    if (cycle) {
-        if (rc_cycle_index < rc_cycle_limit) {
-            long long *slot = rc_cycle_slot(cycle, rc_cycle_index++);
-            if (slot) {
-                void *child = (void *)(uintptr_t)*slot;
-                *slot = 0;
-                rc_cycle_edge_remove(child);
-                rc_drop(child);
+    if (!cycle) {
+        cycle = rc_cycle_cursor;
+        if (!cycle) {
+            rc_cycle_cohort = NULL;
+            rc_cycle_phase = RC_CYCLE_IDLE;
+            if (!rc_cycle_requested) {
+                rc_cycle_pending = 0;
+#ifdef MINYAR_BOUNDED_RC
+                rc_pending_count--;
+#endif
             }
-        } else {
-            rc_cycle_active = NULL;
-            /* All outgoing slots were visited and cleared. Avoid revisiting
-             * those null slots when the last incoming owner later retires. */
-            RcObject *object = rc_cycle_object(cycle);
-            cycle->cleared = 1;
-            if ((object->ownership & 7) != RC_RECORD)
-                ((MinyarList *)(object + 1))->length = 0;
-            rc_cycle_unregister(object);
-            /* The pin keeps self-edges safe while being severed. Other white
-             * nodes remain protected by their ordinary, still counted edges. */
-            rc_drop(rc_cycle_object(cycle) + 1);
+            return;
         }
-        return;
-    }
-    cycle = rc_cycle_cursor;
-    if (cycle) {
         rc_cycle_cursor = cycle->next;
         unsigned live = cycle->marked;
         cycle->generation = rc_cycle_generation;
         cycle->marked = 0;
-        if (!live) {
-            minyar_rc_retain(rc_cycle_object(cycle) + 1);
-            rc_cycle_active = cycle;
-            rc_cycle_index = 0;
-            rc_cycle_limit = rc_cycle_length(cycle);
-        }
-        return;
+        if (live) return;
+        minyar_rc_retain(rc_cycle_object(cycle) + 1);
+        rc_cycle_active = cycle;
+        rc_cycle_index = 0;
+        rc_cycle_limit = rc_cycle_length(cycle);
     }
-    rc_cycle_cohort = NULL;
-    rc_cycle_phase = RC_CYCLE_IDLE;
-    if (!rc_cycle_requested) {
-        rc_cycle_pending = 0;
-#ifdef MINYAR_BOUNDED_RC
-        rc_pending_count--;
-#endif
+    if (rc_cycle_index < rc_cycle_limit) {
+        long long *slot = rc_cycle_slot(cycle, rc_cycle_index++);
+        if (slot) {
+            void *child = (void *)(uintptr_t)*slot;
+            *slot = 0;
+            rc_cycle_edge_remove(child);
+            rc_drop(child);
+        }
+    }
+    if (rc_cycle_index == rc_cycle_limit) {
+        rc_cycle_active = NULL;
+        /* All outgoing slots were visited and cleared. Avoid revisiting
+         * those null slots when the last incoming owner later retires. */
+        RcObject *object = rc_cycle_object(cycle);
+        cycle->cleared = 1;
+        if ((object->ownership & 7) != RC_RECORD)
+            ((MinyarList *)(object + 1))->length = 0;
+        rc_cycle_unregister(object);
+        /* The pin keeps self-edges safe while being severed. Other white
+         * nodes remain protected by their ordinary, still counted edges. */
+        rc_drop(rc_cycle_object(cycle) + 1);
     }
 }
 static void rc_cycle_unit(void) {

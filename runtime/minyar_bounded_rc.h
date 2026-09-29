@@ -242,16 +242,18 @@ static void rc_bounded_chunk_unit(void) {
     rc_pending_count--;
 }
 
-/* Round-robin service across four queues: every continuously ready queue
- * receives one unit within four units, including when the poll budget is 1.
+/* Round-robin service across four queues: once in the general scheduler,
+ * every continuously ready queue receives one unit within four units, even
+ * with budget 1. A cycle job requested inside an object-only batch can wait
+ * for that bounded batch to return before entering the general scheduler.
  * rc_pending_count includes objects, detached frames, temporary chunks and
  * one cycle job. */
 size_t minyar_rc_poll(size_t budget) {
     if (budget > MINYAR_RC_POLL_BUDGET) budget = MINYAR_RC_POLL_BUDGET;
     size_t work = 0;
     if (!rc_bounded_frame_head && !rc_bounded_chunk_head && !rc_cycle_pending) {
-        /* Object processing can only enqueue objects. With no frame/chunk
-         * tasks, skip repeated queue selection for this entire poll.
+        /* Object processing can enqueue objects or request a cycle job.
+         * With no frame/chunk/cycle tasks, skip repeated queue selection.
          * Match the general scheduler's next queue after any object work;
          * empty and zero-budget polls leave that state unchanged. */
         while (work < budget && rc_pending_count && !rc_cycle_pending) {
