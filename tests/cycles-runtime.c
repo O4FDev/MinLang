@@ -4,6 +4,7 @@
 #include "../runtime/minyar_runtime.c"
 #include <assert.h>
 
+static size_t maximum_poll_work;
 static long long slot(void *p) { return (long long)(uintptr_t)p; }
 static void poll_many(size_t n) {
 #ifdef MINYAR_BOUNDED_RC
@@ -11,6 +12,7 @@ static void poll_many(size_t n) {
         size_t before = rc_cycle_units;
         size_t work = minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
         assert(rc_cycle_units - before <= work);
+        if (work > maximum_poll_work) maximum_poll_work = work;
         assert(work <= MINYAR_RC_POLL_BUDGET);
         assert(rc_bounded_last_work <= MINYAR_RC_POLL_BUDGET);
     }
@@ -29,7 +31,9 @@ static void empty(void) {
     size_t batches = 0;
     while (rc_pending_count) {
         assert(++batches < 2000000);
-        assert(minyar_rc_poll(MINYAR_RC_POLL_BUDGET) > 0);
+        size_t work = minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
+        assert(work > 0);
+        if (work > maximum_poll_work) maximum_poll_work = work;
         assert(rc_bounded_last_work <= MINYAR_RC_POLL_BUDGET);
     }
 #else
@@ -129,8 +133,27 @@ static void growing_list(void) {
 }
 
 int main(void) {
+#ifndef MINYAR_BOUNDED_RC
+    /* Eager cycle work must also advance during scalar loop service points. */
+    minyar_rc_enter(0);
+    MinyarList *loop = minyar_list_new();
+    minyar_list_references(loop);
+    for (size_t i = 0; i < 1000; i++) minyar_list_add(loop, slot(loop));
+    minyar_rc_release(loop);
+    for (size_t i = 0; i < 2000; i++) minyar_rc_step();
+    assert(rc_object_count == 0);
+    minyar_rc_leave();
+#endif
     growing_list();
     graph_oracle();
+    /* Transfer the only external owner into a receiver owned by that same
+     * object: garbage can arise without any ordinary count decrement. */
+    MinyarList *inside = minyar_list_new();
+    minyar_list_references(inside);
+    MinyarRecord *moved = minyar_record_new(1);
+    minyar_record_set_take(moved, 0, slot(inside));
+    minyar_list_add_take(inside, slot(moved));
+    empty();
     MinyarRecord *r = self_loop();
     poll_many(1000);
     assert(minyar_record_get(r, 0) == slot(r));
@@ -182,7 +205,7 @@ int main(void) {
     }
     minyar_rc_release(roots);
     empty();
-    printf("cycles: roots, transfers, oracle, interleavings; units=%zu epochs=%zu", rc_cycle_units, rc_cycle_epochs);
+    printf("cycles: roots, transfers, oracle, interleavings; units=%zu epochs=%zu max-poll=%zu", rc_cycle_units, rc_cycle_epochs, maximum_poll_work);
 #ifdef MINYAR_BOUNDED_HEAP
     printf(" peak-pool=%zu", minyar_pool_high_water);
 #endif

@@ -117,8 +117,8 @@ static void *rc_allocate_object(size_t size, unsigned kind) {
     size_t extra = rc_cycle_storage(kind) ? sizeof(RcCycle) : 0;
     if (size > SIZE_MAX - sizeof(RcObject) - extra) out_of_memory();
     void *allocation = RC_ALLOCATE(extra + sizeof(RcObject) + size);
+    if (!allocation) out_of_memory();
     RcObject *object = (RcObject *)((unsigned char *)allocation + extra);
-    if (!object) out_of_memory();
     object->ownership = 8 | kind;
     if (extra) *rc_cycle_metadata(object) = (RcCycle){0};
     RC_ACCOUNT(rc_object_count++);
@@ -427,6 +427,7 @@ void minyar_rc_step(void) {
 #else
     while (frame->temporary_count)
         minyar_rc_release(frame->temporaries[--frame->temporary_count]);
+    rc_cycle_eager_service(32);
 #endif
 }
 #endif

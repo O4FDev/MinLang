@@ -20,13 +20,16 @@ static void drain(void) {
     }
 }
 int main(void) {
+    /* This fixture proves an acyclic chain; use the compiler-hinted policy
+     * when comparing the ordinary 2N retirement transcript. */
+    minyar_rc_cycle_policy();
     for(int shared=0;shared<=1;shared++) {
         void *root=NULL,*alias=NULL;
         tracked_count=freed_count=completed_units=0;
         for(size_t i=0;i<65;i++) {
             MinyarRecord *r=minyar_record_new(1);
             minyar_record_set_take(r,0,(long long)(uintptr_t)root);
-            tracked[tracked_count++]=(RcObject *)r-1;
+            tracked[tracked_count++]=rc_cycle_metadata((RcObject *)r-1);
             if(shared && i==31){alias=r;minyar_rc_retain(alias);}
             root=r;
         }

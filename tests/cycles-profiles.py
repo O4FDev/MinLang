@@ -24,7 +24,7 @@ def main():
     directory.mkdir(parents=True, exist_ok=True)
     runtime = ROOT / 'tests/cycles-runtime.c'
     compiler = ROOT / 'build/minyarc'
-    sources = ('graphs', 'churn', 'dense')
+    sources = ('graphs', 'churn', 'dense', 'field')
     for name in sources:
         run([compiler, ROOT / f'tests/cycles/{name}.min', directory / f'{name}.ll'])
         (directory / f'{name}-sanitize.ll').write_text(instrument_address_sanitizer((directory / f'{name}.ll').read_text()))
@@ -55,7 +55,7 @@ def main():
                     executable = directory / (label + '-' + name)
                     ir = directory / (name + ('-sanitize' if sanitize else '') + '.ll')
                     run([CLANG, *options, ir, obj, '-o', executable])
-                    expected = {'churn': '100000', 'dense': '5000', 'graphs': '0\n1\n2\n1\n0'}[name]
+                    expected = {'field': '', 'churn': '100000', 'dense': '5000', 'graphs': '0\n1\n2\n1\n0'}[name]
                     assert run([executable], env=environment) == expected
     print('cycle profiles: native/sanitizer graph semantics, exact recovery and 100,000-cycle pool reuse')
 
