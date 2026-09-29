@@ -607,3 +607,13 @@ build/minyar-runtime-eager-release.ll: runtime/minyar_runtime.c $(RUNTIME_HEADER
 	$(LIMITED) $(LLVM_CC) $(LLVM_FLAGS) -S -emit-llvm $< -o $@.tmp
 	sed -E 's/"(target-cpu|target-features|tune-cpu)"="[^"]*" ?//g' $@.tmp > $@
 	rm -f $@.tmp
+
+.PHONY: check-cycles
+build/cycles-runtime: tests/cycles-runtime.c runtime/minyar_runtime.c $(RUNTIME_HEADERS) | build
+	$(LIMITED) $(LLVM_CC) $(CFLAGS) -DMINYAR_SYSTEM_HEAP=1 -DMINYAR_RC_POLL_BUDGET=1 $< -o $@
+
+check-cycles: build/minyarc build/minyar-runtime.o build/cycles-runtime
+	$(LIMITED) python3 tests/cycles.py
+	$(LIMITED) ./build/cycles-runtime
+
+check: check-cycles
