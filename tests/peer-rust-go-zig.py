@@ -476,13 +476,13 @@ print(minimum(-2147483648, 4294967295)); print(maximum(-2147483648, 4294967295))
             ('function foo(): boid {}\n', "line 1, column 17: unknown type 'boid'"),
             ('return 1\n', 'line 1, column 1: use exit(status) to finish a top-level program'),
             ('function a() { b() }\n', "line 1, column 16: I can't find a function named 'b'"),
-            ("print(-'a')\n", 'line 1, column 11: negation needs an Integer'),
+            ("print(-'a')\n", 'line 1, column 11: negation needs an Integer or Float'),
             ('record Value { boolean: Boolean; number: Integer }\nlet value: Boolean = Value { boolean: true; number: 123 }\n', "line 2, column 5: the value for 'value' does not match its declared type"),
             ('record Value { value: Boolean }\nlet value = Value { value: truefalse }\n', "line 2, column 28: I can't find a value named 'truefalse'"),
             ('let A = B\n', "line 1, column 9: I can't find a value named 'B'"),
-            ('let derp = 1234\nprint(derp + "foo")\n', "line 2, column 12: the two sides of '+' have different types"),
+            ('let derp = 1234\nprint(derp + "foo")\n', "line 2, column 12: the two sides of '+' have different types (Integer and Text)"),
             ('function dummy(value: Integer) {}\ndummy([1, 2])\n', 'line 2, column 14: an argument passed to dummy has the wrong type'),
-            ('let cstr = "Hat"\ncstr[0] = \'W\'\n', 'indexed assignment needs a List'),
+            ('let cstr = "Hat"\ncstr[0] = \'W\'\n', 'line 2, column 5: indexed assignment needs a List or Bytes, not Text'),
             ('let x = 0\nx = \x00Q\n', "line 2, column 5: expected an expression, found '\x00'"),
         ]
         for source, diagnostic in cases:

@@ -3714,8 +3714,10 @@ print(ascending); print(divisible); print(boundChecks); return descending'''
 
     def test_equality_continuation_distinguishes_lf_cr_and_crlf(self):
         self.executes('print(1 ==\n1)\nprint(1\r==\r1)\n','true\ntrue\n')
-        self.rejects('print(1\n==\n1)\n','Minyar stopped:')
-        self.rejects('print(1\r\n==\r\n1)\n','Minyar stopped:')
+        # Parentheses now permit line breaks before the operator too.
+        self.executes('print(1\n==\n1)\nprint(1\r\n==\r\n1)\n','true\ntrue\n')
+        self.rejects('let value = 1\n==\n1\n','Minyar stopped:')
+        self.rejects('let value = 1\r\n==\r\n1\n','Minyar stopped:')
 
     def test_independent_record_fields_feed_addition_and_subtraction(self):
         self.executes('''record Value { prop: Integer }
@@ -3967,9 +3969,9 @@ sister(Triple { a: 7,b: 8,c: 9 },1,2)
 ''','0\n1\n1\nfalse\n1\n2\n7\n8\n9\n')
 
     def test_clamped_difference_and_negative_one_cell_comparison_keep_zero_results(self):
-        self.executes('''function clamp(a: Integer): Integer { let chosen = 0; if 0 > a-2 { chosen = 0 } else { chosen = a-2 }; return chosen*8 }
+        self.executes('''function clampedDifference(a: Integer): Integer { let chosen = 0; if 0 > a-2 { chosen = 0 } else { chosen = a-2 }; return chosen*8 }
 function different(state: List<Integer>): Boolean { let value = state[0] != -1; return value }
-print(clamp(0)); print(clamp(1)); print(clamp(2)); print(clamp(3)); let state = [-1]; print(different(state)); state[0] = 0; print(different(state)); state[0] = -1; print(different(state))
+print(clampedDifference(0)); print(clampedDifference(1)); print(clampedDifference(2)); print(clampedDifference(3)); let state = [-1]; print(different(state)); state[0] = 0; print(different(state)); state[0] = -1; print(different(state))
 ''','0\n0\n0\n8\nfalse\ntrue\nfalse\n')
 
     def test_wide_scaled_nine_division_keeps_literal_and_parameter_precision(self):
@@ -5152,7 +5154,7 @@ i = 0; while i<16 { source[i] = i+1; i = i+1 }; let destination = zeros(16); cop
                 line = 'print('+'('*depth+'value'+')'*depth+' + 1)'
                 result,llvm = self.compile('let value = "wrong"\n'+line+'\n')
                 self.assertEqual((result.returncode,result.stdout,result.stderr),
-                    (1,'',f"Minyar stopped: line 2, column {line.index('+')+1}: the two sides of '+' have different types\n"))
+                    (1,'',f"Minyar stopped: line 2, column {line.index('+')+1}: the two sides of '+' have different types (Text and Integer)\n"))
                 self.assertFalse(llvm.exists())
 
     def test_never_entered_inner_return_preserves_all_outer_visits(self):
@@ -5214,7 +5216,7 @@ let values: List<Integer> = []; at = 0; while at<50 { values.add(0); at = at+1 }
 
     def test_joined_mutable_record_slot_keeps_both_branch_stores(self):
         # V8 escape-analysis.js: six calls in source order. Mutable source
-        # properties become List fields; record fields themselves stay immutable.
+        # properties become List fields that preserve shared mutation.
         self.executes('''record Cell { a: List<Integer> }
 function construct(): Cell { return Cell { a: [0] } }
 function joined(mode: Boolean) {
