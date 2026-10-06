@@ -5,6 +5,7 @@ Counters are injected into copied headers. Mutants must compile before a
 runtime failure can count as detection."""
 import argparse,hashlib,json,os,runpy,shutil,subprocess,tempfile
 from pathlib import Path
+from clang_helpers import clang_command
 
 def main():
     here=Path(__file__).resolve().parent
@@ -41,7 +42,7 @@ def main():
             fixture='unary-order.c' if name=='unsafe-shared-mutant' else 'fused-drop-work.c'
             shutil.copy2(here/fixture,directory/'tests'/fixture)
             binary=directory/'test'
-            r=execute(name+'-compile',[args.clang,'-O2','-fsanitize=address,undefined',str(directory/'tests'/fixture),'-o',str(binary)])
+            r=execute(name+'-compile',clang_command([args.clang,'-O2','-fsanitize=address,undefined',str(directory/'tests'/fixture),'-o',str(binary)]))
             assert r.returncode==0,(name,'compile failure is not mutation evidence',r.stderr)
             r=execute(name,[str(binary)])
             if name=='counter-candidate':assert r.returncode==0,r.stderr

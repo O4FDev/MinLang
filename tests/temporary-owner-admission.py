@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from clang_helpers import clang_command
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -44,7 +45,7 @@ def main():
                         flags += ['-DMINYAR_LAZY_HEAP=1']
                     if mode == 'sanitize':
                         flags += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-g']
-                    result = subprocess.run([args.clang, *flags, str(fixture), '-o', str(executable)],
+                    result = subprocess.run(clang_command([args.clang, *flags, str(fixture), '-o', str(executable)]),
                                             capture_output=True, timeout=90)
                     assert result.returncode == 0, result.stderr.decode(errors='replace')
                     for chunk in ('first', 'rollover', 'existing'):
@@ -69,7 +70,7 @@ def main():
                         flags += ['-DMINYAR_LAZY_HEAP=1']
                     if mode == 'sanitize':
                         flags += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-g']
-                    result = subprocess.run([args.clang, *flags, str(idle_fixture), '-o', str(executable)],
+                    result = subprocess.run(clang_command([args.clang, *flags, str(idle_fixture), '-o', str(executable)]),
                                             capture_output=True, timeout=90)
                     assert result.returncode == 0, result.stderr.decode(errors='replace')
                     result = subprocess.run([str(executable)], capture_output=True,

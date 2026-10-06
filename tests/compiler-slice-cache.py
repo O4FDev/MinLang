@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 from regressions import CLANG, ROOT
+from clang_helpers import clang_command
 
 
 def main():
@@ -35,7 +36,7 @@ def main():
                     if sanitized:
                         command += ['-fsanitize=address,undefined']
                     command += [str(directory / 'tests/compiler-slice-cache.c'), '-o', str(exe)]
-                    build = subprocess.run(command, text=True, capture_output=True, timeout=30)
+                    build = subprocess.run(clang_command(command), text=True, capture_output=True, timeout=30)
                     assert build.returncode == 0, build.stderr
                     result = subprocess.run([str(exe)], env=env, text=True, capture_output=True, timeout=10)
                     if mode == 'control':

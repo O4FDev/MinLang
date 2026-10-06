@@ -1,0 +1,69 @@
+--- initial-runner.py
++++ release-runner.py
+@@ -50,16 +50,16 @@
+     args = parser.parse_args()
+     if not args.acquire:
+         parser.error('Acquisition is held unless --acquire is explicitly supplied after coordinator release.')
+-    parent = ROOT/'build/memory-research-list-bulk-cpu'
++    parent = ROOT/'build/memory-research-list-bulk-production-cpu'
+     parent.mkdir(parents=True,exist_ok=True)
+     evidence = Path(tempfile.mkdtemp(prefix='run-',dir=parent))
+     started = time.monotonic()
+     usage_origin = resource.getrusage(resource.RUSAGE_CHILDREN)
+     report = {'status':'running','checks':[],'pairs':[],'pilots':[],'binaries':[],
+               'scope':'Primitive append/checksum/release/drain CPU; debt control includes debt construction; no application/hard-latency claim.',
+-              'host':'Paced system soak and external loaded host; no quiet-window claim.',
++              'host':'System soak completed before this cohort; external loaded host remains; no quiet-window claim. Do not causally compare old accounted versus production ratios.',
+               'limit_scope':'Observed aggregate CPU checks between children, remaining-wall child timeout; last-child overshoot retained as failure.'}
+-    proposal = ROOT/'research/2026-10-memory/runtime-list-bulk-cpu-proposal.json'
++    proposal = ROOT/'research/2026-10-memory/runtime-list-bulk-production-cpu-proposal.json'
+     shutil.copyfile(proposal,evidence/'proposal.json')
+     entry = {str(p):bulk.digest(p) for p in (ROOT/'runtime').glob('minyar_*') if p.is_file()}
+     frozen = {}
+@@ -145,14 +145,36 @@
+                 defines=['-DMINYAR_SYSTEM_HEAP=1'] if profile=='system' else ['-DMINYAR_BOUNDED_HEAP=1','-DMINYAR_BOUNDED_HEAP_BYTES=16777216']
+                 command=['clang','-std=c11','-O2',*defines,'-DMINYAR_RC_POLL_BUDGET=32','-Wall','-Wextra','-Werror',
+                          str(directory/'tests/memory-research-list-bulk-cpu.c')]
++                prefix='configuration-'+variant+'-'+profile
++                macro_row=execute(prefix+'-macros',clang_command([*command,'-E','-dM']),assembly=True)
++                macros=(evidence/macro_row['assembly_file']).read_text()
++                for name in ['MINYAR_RC_TESTING','MINYAR_RESEARCH_COUNT','MINYAR_RESEARCH_TEST_ACCOUNTING',
++                             'NDEBUG','__SANITIZE_ADDRESS__','__SANITIZE_THREAD__']:
++                    assert not re.search(r'^#define '+name+r'\b',macros,re.M),('unexpected macro',name)
++                assert not any(arg.startswith('-fsanitize') or arg.startswith('-flto') for arg in command)
++                probe=directory/'tests/configuration-probe.c'
++                probe.write_text('#if __has_feature(address_sanitizer) || __has_feature(undefined_behavior_sanitizer) || __has_feature(thread_sanitizer)\n#error Unexpected sanitizer\n#endif\n#include "memory-research-list-bulk-cpu.c"\n')
++                execute(prefix+'-feature-check',clang_command([*command[:-1],'-fsyntax-only',str(probe)]))
++                body_row=execute(prefix+'-preprocessed',clang_command([*command,'-E']),assembly=True)
++                body=(evidence/body_row['assembly_file']).read_text()
++                telemetry=['rc_object_count','rc_bytes','rc_bounded_last_work','rc_heap_allocation_count',
++                           'minyar_pool_allocation_count','minyar_pool_last_steps','minyar_pool_max_steps']
++                assert all(not re.search(r'\b'+name+r'\b',body) for name in telemetry)
+                 execute('compile-'+variant+'-'+profile,clang_command([*command,str(checksum),'-o',str(binary)]))
+                 execute('fixture-assembly-'+variant+'-'+profile,clang_command([*command,'-S','-o','-']),assembly=True)
+                 execute('linked-machine-code-'+variant+'-'+profile,['otool','-tvV',str(binary)],assembly=True)
++                symbols_row=execute(prefix+'-linked-symbols',['nm','-a',str(binary)],assembly=True)
++                symbols=(evidence/symbols_row['assembly_file']).read_text()
++                linked=(evidence/('linked-machine-code-'+variant+'-'+profile+'.s')).read_text()
++                assert all(not re.search(r'\b_?'+name+r'\b',symbols+linked) for name in telemetry)
+                 assembly=(evidence/('fixture-assembly-'+variant+'-'+profile+'.s')).read_text()
+                 assert re.search(r'\bbl\s+_research_checksum\b',assembly), 'Opaque checksum call eliminated'
+                 consume=(evidence/('checksum-assembly-'+variant+'.s')).read_text()
+                 assert re.search(r'\b(?:ldr|ldp)\b',consume), 'Checksum has no observable loads'
+-                report['binaries'].append({'path':str(binary.relative_to(evidence)),'sha256':bulk.digest(binary)})
++                report['binaries'].append({'path':str(binary.relative_to(evidence)),'sha256':bulk.digest(binary),
++                    'fixture_sha256':bulk.digest(directory/'tests/memory-research-list-bulk-cpu.c'),
++                    'configuration_prefix':prefix,'testing_and_observers_absent':True,'semantic_asserts_enabled':True,
++                    'sanitizers_and_LTO_disabled':True,'effective_optimization':'-O2'})
+         for p in evidence.rglob('*'):
+             if p.is_file() and p.name not in ['results.json']:
+                 frozen[str(p)]=bulk.digest(p)
+@@ -211,6 +233,8 @@
+         assert all(bulk.digest(Path(p))==value for p,value in frozen.items())
+         assert all(bulk.digest(Path(p))==value for p,value in entry.items())
+         report.update(status='completed-observation',summaries=summaries,criteria_passed=all(r['criterion_passed'] for r in summaries),
++                      worst_adverse_pair_all_cases=max(r['worst_paired_slowdown'] for r in summaries),
++                      mandatory_adverse_pair_review=any(r['worst_paired_slowdown']>0.10 for r in summaries),
+                       frozen_artifacts=frozen,production_entry_hashes=entry,aggregate_child_cpu_seconds=aggregate_cpu(),runner_wall_seconds=time.monotonic()-started)
+     except BaseException as error:
+         report.update(status='failed',failure=repr(error),aggregate_child_cpu_seconds=aggregate_cpu(),runner_wall_seconds=time.monotonic()-started)

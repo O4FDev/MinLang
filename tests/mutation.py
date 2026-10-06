@@ -4,13 +4,15 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from clang_helpers import clang_command
 
 
 ROOT = Path(__file__).resolve().parent.parent
-SOURCE = ROOT / "src" / "compiler.min"
+SOURCE = ROOT / "compiler" / "compiler.min"
 RUNTIME_SOURCE = ROOT / "runtime" / "minyar_runtime.c"
 RUNTIME = ROOT / "build" / "minyar-runtime.o"
 if not RUNTIME.exists():
@@ -57,6 +59,22 @@ def compiler_mutations(temporary: Path) -> None:
             "let symbol = symbolReturnTypes[count + middle]",
             "let symbol = symbolReturnTypes[count]",
         ),
+        "widen-inline-list-get-bounds": (
+            "%get.valid = icmp ult i64 %position, %length\\n",
+            "%get.valid = icmp ule i64 %position, %length\\n",
+        ),
+        "widen-inline-list-set-bounds": (
+            "%set.valid = icmp ult i64 %position, %length\\n",
+            "%set.valid = icmp ule i64 %position, %length\\n",
+        ),
+        "reject-valid-inline-overflow": (
+            "br i1 %overflow, label %bad, label %good\\n",
+            "br i1 %overflow, label %good, label %bad\\n",
+        ),
+        "reject-valid-inline-division": (
+            "%zero = icmp eq i64 %right, 0\\n",
+            "%zero = icmp ne i64 %right, 0\\n",
+        ),
     }
     for name, (before, after) in mutations.items():
         source = replace_once(original, before, after, name)
@@ -67,19 +85,29 @@ def compiler_mutations(temporary: Path) -> None:
         seeded = run([str(STAGE0), str(mutant_source), "-o", str(mutant_llvm)])
         if seeded.returncode != 0:
             raise AssertionError(f"could not build compiler mutant '{name}':\n{seeded.stderr}")
-        linked = run([CLANG, "-O0", "-Wno-override-module", str(mutant_llvm), str(RUNTIME), "-o", str(mutant)])
+        linked = run(clang_command([CLANG, "-O0", "-Wno-override-module", str(mutant_llvm), str(RUNTIME), "-o", str(mutant)]))
         if linked.returncode != 0:
             raise AssertionError(f"could not link compiler mutant '{name}':\n{linked.stderr}")
         environment = os.environ.copy()
         environment["MINYAR_TEST_COMPILER"] = str(mutant)
-        tested = run(["sh", "tests/run-module-tests.sh"], timeout=45, env=environment)
+        # Check emitted guards using valid accesses and the codegen contract;
+        # never execute an invalid access through a deliberately widened guard.
+        if name.startswith("widen-inline-list-"):
+            command = ["python3", "tests/list-access.py",
+                       "ListAccess.test_inline_access_helpers_preserve_checked_fallback"]
+        elif name.startswith("reject-valid-inline-"):
+            command = ["python3", "tests/checked-arithmetic.py",
+                       "CheckedArithmetic.test_checks_are_visible_without_lto"]
+        else:
+            command = ["sh", "tests/run-module-tests.sh"]
+        tested = run(command, timeout=45, env=environment)
         if tested.returncode == 0:
             raise AssertionError(f"compiler mutant survived: {name}")
         print(f"killed compiler mutant: {name}")
 
 
 def runtime_mutations(temporary: Path) -> None:
-    compiler = ROOT / "build" / "minyarc"
+    compiler = Path(os.environ.get("MINYAR_TEST_COMPILER", ROOT / "build" / "minyarc"))
     programs = {
         "list-boundary": ROOT / "tests" / "runtime" / "lists.min",
         "reject-valid-arithmetic": ROOT / "examples" / "language-tour.min",
@@ -87,7 +115,11 @@ def runtime_mutations(temporary: Path) -> None:
         "break-text-equality": ROOT / "examples" / "language-tour.min",
         "reject-valid-text-slice": ROOT / "tests" / "runtime" / "text-indexing.min",
     }
-    runtime_source = RUNTIME_SOURCE.read_text(encoding="utf-8")
+    runtime_files = {
+        "list-boundary": "minyar_collections.h",
+        "reject-valid-arithmetic": "minyar_numbers.h",
+        "reject-valid-division": "minyar_numbers.h",
+    }
     # Mutations reject valid operations: failures must be caught without
     # executing a deliberately broken memory or division safety guard.
     mutations = {
@@ -96,7 +128,10 @@ def runtime_mutations(temporary: Path) -> None:
             "long long minyar_list_get(const MinyarList *list, long long position) {\n    if ((unsigned long long)position >= (unsigned long long)(list->length - 1))",
         ),
         "reject-valid-arithmetic": ("if (overflowed)\n", "if (!overflowed)\n"),
-        "reject-valid-division": ("if (right == 0)\n", "if (right != 0)\n"),
+        "reject-valid-division": (
+            "if (right == 0 || (left == LLONG_MIN && right == -1))",
+            "if (right != 0 || (left == LLONG_MIN && right == -1))",
+        ),
         "break-text-equality": (
             "left->byte_length == right->byte_length",
             "left->byte_length != right->byte_length",
@@ -111,12 +146,29 @@ def runtime_mutations(temporary: Path) -> None:
         compiled = run([str(compiler), str(source), str(llvm)])
         if compiled.returncode != 0:
             raise AssertionError(f"could not prepare runtime mutant '{name}':\n{compiled.stderr}")
+        if name == "list-boundary":
+            # Exercise the C ABI itself. Its valid-access rejection would be
+            # bypassed by emitted fast paths, which have separate mutants above.
+            llvm.write_text(llvm.read_text().replace(
+                "call i64 @.minyar.list.get.checked(", "call i64 @minyar_list_get("))
+        if name in ("reject-valid-arithmetic", "reject-valid-division"):
+            # Keep checking the retained C ABI when generated programs use
+            # LLVM guards instead. Separate compiler mutants check those guards.
+            llvm.write_text(llvm.read_text()
+                .replace("call void @.minyar.integer.overflow.checked(",
+                         "call void @minyar_check_integer_overflow(")
+                .replace("call void @.minyar.integer.division.checked(",
+                         "call void @minyar_check_integer_division("))
         before, after = mutations[name]
+        runtime_name = runtime_files.get(name, "minyar_runtime.c")
+        runtime_source = (RUNTIME_SOURCE.parent / runtime_name).read_text(encoding="utf-8")
         mutated_runtime = replace_once(runtime_source, before, after, name)
-        runtime_file = temporary / f"runtime-{name}.c"
-        executable = temporary / f"runtime-{name}"
-        runtime_file.write_text(mutated_runtime, encoding="utf-8")
-        linked = run([CLANG, "-O0", "-Wno-override-module", str(llvm), str(runtime_file), "-I", str(ROOT / "runtime"), "-o", str(executable)])
+        runtime_directory = temporary / f"runtime-{name}"
+        shutil.copytree(RUNTIME_SOURCE.parent, runtime_directory)
+        runtime_file = runtime_directory / "minyar_runtime.c"
+        executable = temporary / f"runtime-{name}-program"
+        (runtime_directory / runtime_name).write_text(mutated_runtime, encoding="utf-8")
+        linked = run(clang_command([CLANG, "-O0", "-Wno-override-module", str(llvm), str(runtime_file), "-I", str(ROOT / "runtime"), "-o", str(executable)]))
         if linked.returncode != 0:
             raise AssertionError(f"could not link runtime mutant '{name}':\n{linked.stderr}")
         result = run([str(executable)])

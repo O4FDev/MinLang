@@ -12,6 +12,8 @@ spec.loader.exec_module(launcher)
 
 
 class IncrementalLauncher(launcher.LauncherIsolation):
+    launcher_arguments = ('--incremental',)
+
     def setUp(self):
         super().setUp()
         names = ('minyarc-modules', 'minyar-module-build')
@@ -21,15 +23,15 @@ class IncrementalLauncher(launcher.LauncherIsolation):
             stream.write('\n.PHONY: ' + ' '.join('build/' + name for name in names) + '\n')
             stream.write(' '.join('build/' + name for name in names) + ':\n\t@:\n')
 
-    def command(self, *args, **kwargs):
-        command, output = super().command(*args, **kwargs)
-        command.insert(1, '--incremental')
-        return command, output
-
     def assert_clean(self):
         super().assert_clean()
         cache = self.project / 'build/module-cache'
         self.assertEqual(list(cache.glob('invocation.*')), [])
+
+    def test_check_mode_validates_real_modules_without_native_dependencies(self):
+        super().test_check_mode_validates_real_modules_without_native_dependencies()
+        self.assertTrue((self.project / 'build/module-cache').is_dir(),
+                        '--check must exercise the incremental driver')
 
 
 if __name__ == '__main__':

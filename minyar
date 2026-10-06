@@ -3,9 +3,34 @@ set -eu
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 usage() {
-    echo "usage: ./minyar [--release] [--incremental] [--memory-profile eager|fixed|lazy|system] [--cleanup-budget 1..1024] [--heap-bytes BYTES] FILE.min [-o PROGRAM]" >&2
+    echo "usage: ./minyar [--check | --debug | --release] [--incremental] [--memory-profile eager|fixed|lazy|system] [--cleanup-budget 1..1024] [--heap-bytes BYTES] FILE.min [-o PROGRAM]" >&2
     exit 2
 }
+case "${1-}" in
+    --help|-h)
+        cat <<'HELP'
+usage: ./minyar [--check | --debug | --release] [--incremental] [OPTIONS] FILE.min [-o PROGRAM]
+
+Build a native program; the compiler and runtime build on first use.
+  --check                  Check language and modules without native linking
+  --debug                  Disable program optimization (-O0)
+  --release                Optimize across the program and runtime with LTO
+  --incremental            Reuse unchanged local module compilation
+  --memory-profile PROFILE system (default), eager, fixed, or lazy
+  --cleanup-budget N       Reclamation work budget, 1..1024 (default: 32)
+  --heap-bytes N           Power-of-two capacity for fixed/lazy heaps
+  --doctor                 Check Clang, C headers, 64-bit target, opaque IR, and LTO
+  --version                Show the development source/compiler identity
+  --help                   Show this help
+
+Programs are optimized with -O2 by default. MINYAR_CLANG selects Clang;
+LLVM_CC also selects the Make toolchain. MINYAR_CLANG_FLAGS,
+MINYAR_RUNTIME_FLAGS, and MINYAR_NATIVE_FLAGS accept quoted literal arguments.
+HELP
+        exit 0 ;;
+    --version) exec python3 "$project_dir/tools/clang-driver.py" version "$project_dir" ;;
+    --doctor) exec python3 "$project_dir/tools/clang-driver.py" doctor ;;
+esac
 positive_decimal() {
     case "$1" in ''|*[!0123456789]*) return 1 ;; esac
     normalized_decimal=$1
@@ -14,6 +39,9 @@ positive_decimal() {
 }
 
 release=0
+debug=0
+check_only=0
+optimization_requested=0
 incremental=0
 memory_profile=system
 profile_requested=0
@@ -22,7 +50,9 @@ budget_requested=0
 heap_bytes=
 while :; do
     case "${1-}" in
-        --release) release=1; shift ;;
+        --release) [ "$optimization_requested" -eq 0 ] && [ "$check_only" -eq 0 ] || usage; release=1; optimization_requested=1; shift ;;
+        --debug) [ "$optimization_requested" -eq 0 ] && [ "$check_only" -eq 0 ] || usage; debug=1; optimization_requested=1; shift ;;
+        --check) [ "$optimization_requested" -eq 0 ] && [ "$check_only" -eq 0 ] || usage; check_only=1; shift ;;
         --incremental) incremental=1; shift ;;
         --memory-profile)
             [ "$#" -ge 2 ] && [ "$profile_requested" -eq 0 ] || usage
@@ -56,17 +86,32 @@ source_file=$1
 shift
 output_file=$(basename -- "${source_file%.min}")
 if [ "$#" -gt 0 ]; then
-    [ "$#" -eq 2 ] && [ "$1" = -o ] || usage
+    [ "$check_only" -eq 0 ] && [ "$#" -eq 2 ] && [ "$1" = -o ] || usage
     output_file=$2
+fi
+[ -f "$source_file" ] && [ -r "$source_file" ] || {
+    echo "minyar: cannot read source file: $source_file" >&2
+    exit 1
+}
+if [ "$check_only" -eq 0 ] && [ "$source_file" -ef "$output_file" ]; then
+    echo "minyar: refusing to replace the source file; choose a different -o path: $output_file" >&2
+    exit 1
 fi
 
 if [ "$incremental" -eq 1 ]; then
+    case "$(uname -s)" in
+        MSYS*|MINGW*|CYGWIN*)
+            echo "incremental module caching currently needs macOS or Linux; omit --incremental on Windows" >&2
+            exit 1 ;;
+    esac
     set -- build/minyarc-modules build/minyar-module-build
 else
     set -- build/minyarc
 fi
 configured_runtime=1
-if [ "$memory_profile" = eager ]; then
+if [ "$check_only" -eq 1 ]; then
+    configured_runtime=0
+elif [ "$memory_profile" = eager ]; then
     configured_runtime=0
     if [ "$release" -eq 1 ]; then runtime_file=build/minyar-runtime-eager-release.ll
     else runtime_file=build/minyar-runtime-eager.o; fi
@@ -87,7 +132,10 @@ else
         [ -f "$project_dir/runtime/minyar_stack_frames.h" ] || { echo "missing stack ownership runtime" >&2; exit 1; }
     fi
 fi
-make -s -C "$project_dir" "$@"
+command -v python3 >/dev/null 2>&1 || { echo "minyar needs Python 3 for portable toolchain arguments" >&2; exit 1; }
+# Interactive first-use builds keep resource caps and low CPU priority, while
+# avoiding the macOS background scheduling class used by bulk development.
+MINYAR_INTERACTIVE_BOOTSTRAP=1 python3 "$project_dir/tools/clang-driver.py" build "$project_dir" "$@"
 mkdir -p "$project_dir/build/programs"
 llvm_dir=$(mktemp -d "$project_dir/build/programs/invocation.XXXXXXXX")
 trap 'rm -rf -- "$llvm_dir"' 0
@@ -99,48 +147,14 @@ set --
 if [ "$memory_profile" != eager ]; then set -- --bounded-owners "$cleanup_budget"; fi
 if [ "$incremental" -eq 1 ]; then
     "$project_dir/build/minyar-module-build" "$project_dir/build/minyarc-modules" \
-        "$source_file" "$llvm_file" "${MINYAR_MODULE_CACHE:-$project_dir/build/module-cache}" "$@"
+        "$source_file" "$llvm_file" "${MINYAR_MODULE_CACHE:-$project_dir/build/module-cache}" "$@" --library "$project_dir/library"
 else
     "$project_dir/build/minyarc" "$source_file" "$llvm_file" "$@" --library "$project_dir/library"
 fi
-
-# Standard library packages such as graphics are partly implemented in C. The
-# compiler lists the native libraries a program uses; build and link only those.
-native_objects=
-native_flags=
-for native_library in $(sed -n 's/^; minyar-native-library: //p' "$llvm_file" | sort -u); do
-    case "$native_library" in
-        graphics)
-            if pkg-config --exists glfw3 2>/dev/null; then
-                glfw_cflags=$(pkg-config --cflags glfw3)
-                glfw_libs=$(pkg-config --libs glfw3)
-            elif glfw_prefix=$(brew --prefix glfw 2>/dev/null) && [ -d "$glfw_prefix/include" ]; then
-                glfw_cflags="-I$glfw_prefix/include"
-                glfw_libs="-L$glfw_prefix/lib -lglfw"
-            else
-                echo "the graphics package needs GLFW: install it with 'brew install glfw' on macOS or 'sudo apt install libglfw3-dev' on Debian and Ubuntu" >&2
-                exit 1
-            fi
-            native_source="$project_dir/runtime/native/graphics.c"
-            native_object="$project_dir/build/native/graphics.o"
-            if [ ! -f "$native_object" ] || [ "$native_source" -nt "$native_object" ] ||
-               [ "$project_dir/runtime/minyar_native.h" -nt "$native_object" ]; then
-                mkdir -p "$project_dir/build/native"
-                "${MINYAR_CLANG:-clang}" -O2 -c "$native_source" $glfw_cflags -o "$native_object.$$"
-                mv -f "$native_object.$$" "$native_object"
-            fi
-            native_objects="$native_objects $native_object"
-            case "$(uname -s)" in
-                Darwin) native_flags="$native_flags $glfw_libs -framework OpenGL -framework Cocoa -framework IOKit" ;;
-                *) native_flags="$native_flags $glfw_libs -lGL -lm" ;;
-            esac
-            ;;
-        *)
-            echo "the program uses an unknown native library: $native_library" >&2
-            exit 1
-            ;;
-    esac
-done
+if [ "$check_only" -eq 1 ]; then
+    echo "checked $source_file"
+    exit 0
+fi
 
 if [ "$configured_runtime" -eq 1 ]; then
     runtime_source="$llvm_dir/runtime.c"
@@ -171,20 +185,14 @@ CONFIG
     fi
     if [ "$release" -eq 1 ]; then
         runtime_file="$llvm_dir/runtime.ll"
-        "${MINYAR_CLANG:-clang}" -iquote "$project_dir/runtime" \
-            ${MINYAR_RUNTIME_FLAGS:--O2 -Wno-override-module} -S -emit-llvm "$runtime_source" -o "$llvm_dir/runtime.raw.ll"
+        python3 "$project_dir/tools/clang-driver.py" compile -iquote "$project_dir/runtime" \
+            -S -emit-llvm "$runtime_source" -o "$llvm_dir/runtime.raw.ll"
         sed -E 's/"(target-cpu|target-features|tune-cpu)"="[^"]*" ?//g' "$llvm_dir/runtime.raw.ll" > "$runtime_file"
     else
         runtime_file="$llvm_dir/runtime.o"
-        "${MINYAR_CLANG:-clang}" -iquote "$project_dir/runtime" \
-            ${MINYAR_RUNTIME_FLAGS:--O2 -Wno-override-module} -c "$runtime_source" -o "$runtime_file"
+        python3 "$project_dir/tools/clang-driver.py" compile -iquote "$project_dir/runtime" \
+            -c "$runtime_source" -o "$runtime_file"
     fi
 fi
-if [ "$release" -eq 1 ]; then
-    "${MINYAR_CLANG:-clang}" ${MINYAR_CLANG_FLAGS:--O2 -Wno-override-module} -flto \
-        "$llvm_file" "$runtime_file" $native_objects $native_flags -o "$output_file"
-else
-    "${MINYAR_CLANG:-clang}" ${MINYAR_CLANG_FLAGS:--O0 -Wno-override-module} \
-        "$llvm_file" "$runtime_file" $native_objects $native_flags -o "$output_file"
-fi
+python3 "$project_dir/tools/clang-driver.py" link "$project_dir" "$llvm_file" "$runtime_file" "$output_file" "$release" "$debug" "$source_file"
 echo "built $output_file"

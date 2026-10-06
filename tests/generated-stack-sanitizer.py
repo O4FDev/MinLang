@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 from llvm_sanitizer import instrument_address_sanitizer, address_sanitizer_enabled
+from clang_helpers import clang_command
 
 CONTROL = '''define ptr @escaped() noinline {
 entry:
@@ -58,7 +59,7 @@ def main():
             for optimization in ('-O0', '-O2'):
                 binary = evidence / (name + optimization)
                 command = [args.clang, optimization, '-fsanitize=address', '-Wno-override-module', str(ir), '-o', str(binary)]
-                built = subprocess.run(command, capture_output=True, text=True, timeout=60)
+                built = subprocess.run(clang_command(command), capture_output=True, text=True, timeout=60)
                 (evidence / (binary.name + '-compile.log')).write_text(built.stdout + built.stderr)
                 assert built.returncode == 0, built.stderr
                 checked = subprocess.run([str(binary)], capture_output=True, text=True, timeout=30, env=env)

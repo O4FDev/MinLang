@@ -2,6 +2,7 @@
 """Tokenizer decoding, ownership and demand-driven literal scratch storage."""
 from pathlib import Path
 import argparse, itertools, os, re, subprocess, tempfile
+from clang_helpers import clang_command
 ROOT=Path(__file__).resolve().parents[1]
 # This file may also run from an isolated candidate directory.
 parser=argparse.ArgumentParser(description=__doc__)
@@ -11,7 +12,7 @@ parser.add_argument('--source',type=Path)
 parser.add_argument('--clang',default=os.environ.get('MINYAR_TEST_CLANG','clang'))
 args=parser.parse_args();ROOT=args.root.resolve()
 compiler=(args.compiler or Path(os.environ.get('MINYAR_TEST_COMPILER',ROOT/'build/minyarc'))).resolve()
-source=(args.source or ROOT/'src/compiler.min').resolve()
+source=(args.source or ROOT/'compiler/compiler.min').resolve()
 temporary=tempfile.TemporaryDirectory(prefix='minyar-tokenizer-storage-');D=Path(temporary.name)
 environment={**os.environ,'ASAN_OPTIONS':'detect_leaks=0:halt_on_error=1','UBSAN_OPTIONS':'halt_on_error=1:print_stacktrace=0'}
 def run(command):
@@ -52,14 +53,24 @@ def oracle(s):
 cases=[('prefix','\r\nalpha "plain" beta\r\n"é🙂" tail\n'),('nul','head "a\x00b" next\n"\\\x00" end'),('lines','\n\nhead "before\r\n\\\nafter\\nlast" tail\r\nend'),('quote_boundary','"\\\"""next" tail'),('slash_parity','"\\\\" "\\\\\\\"end" next'),('empty','\n"" next "\\q\\é\\🙂"\n'),('long','before "'+'é'*1024+'\\n'+'a'*4096+'" after\n'),('missing_plain','\r\nhead\n"plain\nunterminated'),('missing_escape','\n\n"prefix\\nlast'),('trailing_slash','\nhead\n"abc\\'),('consumed_quote','\n\n"abc\\"')]
 atoms=['a','é','🙂','\n','\r','\t','\\n','\\r','\\t','\\\\','\\"','\\q','\\é','\\🙂','\\\n']
 composed=['',*atoms,*(''.join(parts) for parts in itertools.product(atoms,repeat=2))]
+identifiers=' '.join(('alpha', '_a2', 'Z9_', 'function')[i%4] for i in range(256))
+cases.insert(0,('identifiers',identifiers))
+cases.append(('coordinate_growth',' '.join('value' for _ in range(44000))))
 cases.append(('composed',' '.join('"'+raw+'"' for raw in composed)))
 for name,text in cases:(D/(name+'.min')).write_text(text)
 llvm=D/'compiler.ll';must([compiler,source,llvm]);ir=llvm.read_text()
 ir,n=re.subn(r'^define i32 @main\(','define i32 @compiler_main(',ir,flags=re.M);assert n==1
-match=re.search(r'^define void @tokenize\([^\n]*\) \{\n.*?^\}',ir,re.M|re.S);assert match
+match=re.search(r'^define void @\.minyar\.fn\.tokenize\([^\n]*\) \{\n.*?^\}',ir,re.M|re.S);assert match
 body=match.group();assert body.count('call ptr @minyar_list_new()')==1
 body=body.replace('call ptr @minyar_list_new()','call ptr @probe_tokenizer_list()')
 ir=ir[:match.start()]+body+ir[match.end():]+'\ndeclare ptr @probe_tokenizer_list()\n';llvm.write_text(ir)
+ir,n=re.subn(r'(?m)^(define ptr )@\.minyar\.fn\.sourceLocation\(',r'\1@original_source_location(',ir);assert n==1
+ir=ir.replace('call ptr @.minyar.fn.sourceLocation(', 'call ptr @probe_source_location(')
+ir+='\ndeclare ptr @probe_source_location(i64, i64)\n'
+ir=re.sub(r'(?m)^(  .*call i32 )@minyar_text_character_at\(', r'\1@probe_source_character(', ir)
+ir+='\ndeclare i32 @probe_source_character(ptr, i64)\n'
+ir=re.sub(r'(?m)^(  .*call i64 )@minyar_record_get\(', r'\1@probe_source_map_field(', ir)
+ir+='\ndeclare i64 @probe_source_map_field(ptr, i64)\n';llvm.write_text(ir)
 san=D/'sanitized.ll';must(['python3',ROOT/'tests/llvm_sanitizer.py',llvm,san])
 checks=0
 for profile,extra in [('eager',[]),('system',['-DMINYAR_SYSTEM_HEAP=1'])]:
@@ -68,9 +79,9 @@ for profile,extra in [('eager',[]),('system',['-DMINYAR_SYSTEM_HEAP=1'])]:
    flags=[optimization,*extra];input_ir=llvm
    if mode=='sanitize':flags+=['-fsanitize=address,undefined','-fno-omit-frame-pointer','-g'];input_ir=san
    exe=D/(profile+optimization+mode)
-   must([args.clang,*flags,'-Wno-override-module','-I',ROOT,input_ir,fixture,'-o',exe])
+   must(clang_command([args.clang,*flags,'-Wno-override-module','-I',ROOT,input_ir,fixture,'-o',exe]))
    for name,text in cases:
-    expected,error,lists=oracle(text);r=run([exe,D/(name+'.min')])
+    expected,error,lists=oracle(text);r=run([exe,D/(name+'.min'), *([str(len(text)+256+1)] if name=='identifiers' else [])])
     context=(profile,optimization,mode,name,r.stderr)
     if error:assert r.returncode==1 and error.encode() in r.stderr,context
     else:

@@ -7,6 +7,7 @@ allocation-reverse free order with retained aliases."""
 import argparse, hashlib, json, os
 from pathlib import Path
 import shutil, subprocess, tempfile
+from clang_helpers import clang_command
 
 def without_fusion(s):
     begin=s.index('                            for (;;) {',s.index('/* With one unvisited unary record'))
@@ -62,13 +63,13 @@ def main():
                 for version in ['reference','candidate']:
                     label=f'{mode}-k{budget}-{version}'
                     binary=evidence/label
-                    run(label+'-compile',[args.clang,'-O2',*flags,f'-DMINYAR_RC_POLL_BUDGET={budget}',
-                        str(evidence/version/'tests/pair-transcript.c'),'-o',str(binary)])
+                    run(label+'-compile',clang_command([args.clang,'-O2',*flags,f'-DMINYAR_RC_POLL_BUDGET={budget}',
+                        str(evidence/version/'tests/pair-transcript.c'),'-o',str(binary)]))
                     outputs.append(run(label,[str(binary)]))
                 assert outputs[0]==outputs[1],(mode,budget,'scheduler transcript mismatch')
                 label=f'{mode}-k{budget}-free-order';binary=evidence/label
-                run(label+'-compile',[args.clang,'-O2',*flags,f'-DMINYAR_RC_POLL_BUDGET={budget}',
-                    str(evidence/'candidate/tests/unary-order.c'),'-o',str(binary)])
+                run(label+'-compile',clang_command([args.clang,'-O2',*flags,f'-DMINYAR_RC_POLL_BUDGET={budget}',
+                    str(evidence/'candidate/tests/unary-order.c'),'-o',str(binary)]))
                 run(label,[str(binary)])
                 print(mode,budget,'exact transcript/free order/2N units passed',flush=True)
         report['status']='passed'

@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import tempfile
 from pathlib import Path
+from clang_helpers import clang_command
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,7 +35,7 @@ def main() -> None:
             for optimization in ("-O0", "-O2"):
                 executable = temporary / f"{index}-{optimization[2:]}"
                 link_result = subprocess.run(
-                    [CLANG, optimization, *LINK_FLAGS, "-Wno-override-module", str(llvm), str(RUNTIME), "-o", str(executable)],
+                    clang_command([CLANG, optimization, *LINK_FLAGS, "-Wno-override-module", str(llvm), str(RUNTIME), "-o", str(executable)]),
                     cwd=ROOT,
                     capture_output=True,
                     timeout=30,

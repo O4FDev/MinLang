@@ -1,0 +1,485 @@
+                             Lazy Reference Counting for the Microgrid
+
+     Raphael Poss, Clemens Grelck                       Stephan Herhut                     Sven-Bodo Scholz
+       University of Amsterdam                         Intel Corporation                  Heriot-Watt University
+           Amsterdam, NL                             Santa Clara, CA, USA                    Edinburgh, UK
+       {r.c.poss,c.grelk}@uva.nl                 stephan.a.herhut@intel.com                  s.scholz@hw.ac.uk
+
+
+
+                        Abstract                               the heap management is typically concise. In one way or
+                                                               another memory of a certain size can be requested from the
+   This papers revisits non-deferred reference counting, a     underlying heap manager. Allocation is often implemented
+common technique to ensure that potentially shared large       by simply advancing a high water mark pointer. Only if
+heap objects can be reused safely when they are both input     there is no sufficient memory left, the memory reclamation
+and output to computations. Traditionally, thread-safe ref-    machinery becomes active. It identifies live data structures
+erence counting exploit implicit memory-based communica-       (ojects) and releases dead objects for further allocations.
+tion of counter data and require means to achieve a globally       One disadvantage of deferred garbage collectors is that
+consistent memory state, either using barriers or locks. Ac-   a program cannot determine whether an object is still refer-
+knowledgeing the distributed nature of upcoming many-core      enced elsewhere by just looking at it. This rules out reuse
+chips, we have developed a novel approach that keeps ref-      of input objects for output in languages with single assign-
+erence counters at single physical locations and ships the     ment semantics, a common case in the functional commu-
+counting operations asynchronously to these locations us-      nity. Cases where non-sharing can be proven statically are
+ing hardware primitives, rather than implicitely moving the    rather rare in practice; typically, the question is undecidable
+counter data between threads. Compared to previous meth-       in all but the most simple codes. As a consequence, when-
+ods, our approach does not require full cache coherency.       ever some object is derived from an existing one, leaving
+                                                               potentially large parts untouched, a fresh object must always
+                                                               be allocated in memory and the unchanged parts copied.
+1. Introduction                                                    Although this issue has limited impact in languages with
+                                                               small allocation units (e.g. LISP cells), it becomes more sig-
+   All modern programming languages are in one way or          nificant in languages that manipulate a smaller number of
+another based on the concept of automatic heap manage-         large objects. With arrays for example, any functionally
+ment, i.e. the implicit reclamation of heap memory that is     sound update operation that defines a new array as being
+no longer needed by a running program. The lesson learnt       identical to an existing one with the exception of few re-
+from C/C++ style programming with explicit memory man-         computed elements, becomes intolerably expensive. What
+agement was that the programmer almost inevitably does         would be a constant time operation in an imperative envi-
+it wrong: either memory is reclaimed too early leading to      ronment, becomes linear in the size of the array.
+inconsistent program states or too late resulting in space         This well-known aggregate update problem [10] is one
+leaks that continuously decrease the effectively available     instance where non-deferred garbage collection using ref-
+heap memory during the runtime of a program. Functional        erence counting (RC) is necessary. We use the functional
+languages led this development and have always been us-        array language Single Assignment C (S AC [7]) as an ex-
+ing automatic heap management, but since the advent of         ample. S AC uses non-deferred RC to determine reusability
+Java in the 90s the concept has quickly gained popularity      of arrays (section 2). In this scenario, arrays are equipped
+among imperative and object-oriented programmers alike.        with a reference counter updated throughout the array’s life-
+And the same story continued with the scripting languages      time. Althout the allocator must then also deal with heap
+of the previous decade and today.                              fragmentation, under the assumption of reasonably sized ar-
+   The prevailing deferred garbage collection techniques       rays and few allocations cycles the additional runtime over-
+have been very much refined since the early days (for a        head in space and time is negligible. The key advantage,
+survey see [16]). Nevertheless, common properties have         however, is that the space of argument values can directly
+hardly changed. The interface between the application and      be reused to accommodate result values since the runtime
+system can always query the reference counter and decide           2. S AC as a use case for reference counting
+whether the data is currently referenced elsewhere. This
+feature is intensively used by the S AC memory management             S AC is a functional, side-effect free variant of C: assign-
+subsystem [8] and has proven to be essential to competitive        ment sequences are interpreted as nested let-expressions,
+performance in functional array programming.                       branches as conditional expressions and loops as syntac-
+   Today’s prevalence of many-core processors raises new           tic sugar for tail-end recursive functions; details can be
+issues. Requests to modify a reference counter may come            found in [7]. Despite the radically different underlying
+from concurrent threads. The same applies to queries for           execution model (context-free substitution of expressions
+a counter’s value at any memory reuse opportunity at run-          vs. step-wise manipulation of global state), language con-
+time. In a traditional shared memory system this require           structs adopted from C show exactly the same operational
+cache coherency, fences and mutual exclusion or atom-              behaviour as expected by imperative programmers. This al-
+ics. The corresponding hardware support is unlikely to             lows programmers to choose their favourite interpretation
+scale with increasing core counts on chip. Instead, larger         of S AC code while the compiler exploits side-effect free se-
+core counts will cause the advent of on-chip memory ar-            mantics to better optimize and parallelize evaluation.
+chitectures that are either fully distributed or show differ-
+ent degrees of consistency from the perspectives of individ-
+ual cores. Our target Microgrid architecture, introduced in
+                                                                   2.1. Truly multidimensional arrays
+section 3, illustrates this view.
+   To target these upcoming systems, we propose lazy ref-             S AC provides native support for truly multidimensional
+erence counting, a scalable implementation technique for           and stateless/functional arrays using a shape-generic style
+non-deferred RC on many-core architectures using weaker            of programming (Figure 1). Any S AC expression evaluates
+consistency semantics. Traditional RC in a cache coherent          to an array. Arrays may be passed between functions with-
+system requires to move counter data spatially to the loca-        out restrictions. Array primitives can access either array
+tion where the need to update or query the counter arises.         metadata, e.g. an array’s rank (dim(array)), or individual
+We propose instead to keep the reference counter in the            elements or entire subarrays using the usual square bracket
+same chip location during its lifetime. Then rather than up-       notation: array[idxvec].
+dating the counter itself, a task located spatially elsewhere          i
+sends asynchronously a request to the home location of the                 k
+
+                                                                               7        8        9    dim:     3
+counter. This location in turn sequentialises incoming re-         j
+                                                                           1        2        3        shape:   [2,2,3]
+quests appropriately and performs object reclamation ac-                       10       11       12   data:    [1,2,3,4,5,6,7,8,9,10,11,12]
+cordingly. A key aspect for scalability is that tasks can exe-             4        5        6
+cute asynchronously with the RC operations and do not wait
+for the remote RC operations to complete.                                                             dim:     0
+   As we explain in section 4, the price that we are willing                        42                shape:   []
+to pay for this is that the reference counter state only approx-                                      data:    [42]
+imates the number of actual references. There is a time de-
+lay between the conceptual update of the reference counter                     Figure 1. Multidimensional arrays in S AC.
+from the perspective of the running program and the effec-
+tive update of the counter in its home location. We think
+this is acceptable because we are not interested in tracking       with {(lower_bound1 ≤ idxvec < upper_bound1 ) : exp1 ;
+the exact number of conceptual copies of some object dur-                  ...
+                                                                         (lower_boundn ≤ idxvec < upper_boundn ) : expn ;
+ing runtime, but merely in the question whether or not the         } : genarray(shape, def ault)
+object can be updated destructively. For example, we care
+whether the reference counter is 1 or 2, but whether it is 2 or
+                                                                               Figure 2. Array comprehensions in S AC.
+42 is entirely irrelevant for memory reclamation and reuse.
+   We have specifically developed the proposed technique
+for compiling S AC to the Microgrid many-core architec-
+ture [6]. As we discuss in section 5, the proposed approach        2.2. WITH-loops
+imposes extra requirements on the network routing proto-
+col, highlights issues of over-synchronization in the current         All aggregate array operations are specified using WITH-
+implementation of the Microgrid and guided the design of           loop expressions, a S AC-specific array comprehension
+architectural solutions. This makes our approach also a rare       shown in Figure 2. Here, lower_bound and upper_bound
+example of crosslayer design integration.                          denote expressions that must evaluate to integer vectors of
+equal length. They define a rectangular (generally multidi-         3. Our target: SVP and the Microgrid
+mensional) index set. The identifier idxvec represents el-
+ements of this set, similar to loop variables in FOR-loops.
+                                                                        The System Virtualization Platform (SVP) is a machine
+However, no order is defined on these index sets. An index
+                                                                    model and low-level programming interface for the ex-
+set specification is called a generator and it is associated
+                                                                    ploitation of general-purpose many-core chips with combi-
+with an arbitrary S AC expression. It creates a mapping be-
+                                                                    nations of shared and distributed memories [12].
+tween index vectors and values, in other words an array.
+                                                                        The basic construct for exposing concurrency is bulk cre-
+    Figure 3 shows the example of a WITH-loop that defines          ation of multiple logical threads at once. This declares a
+a 5 × 6 matrix B using two generators and the default el-           concurrent unit of work, called a family, which the platform
+ement. Each element of the lower left 3 × 4 submatrix is            can either execute in parallel, sequentially, or a combina-
+defined as the sum of the two elements of the index vec-            tion of both. A creating thread can then bulk synchronize
+tor. The right 5 × 2 submatrix is “copied” from the existing        on termination of a family. This fork-join pattern captures
+matrix A. The remaining elements, i.e. the upper left 2 × 4         concurrency hierarchically, from software component com-
+submatrix, are implicitly defined by the default element.           position down to inner loops. Although an implementation
+                                                                    may offer more flexibility, SVP encourages forward-only
+B = with { ([3,0] <= iv < [5,4]) : iv [0] + iv [1];                 dataflow compositions so that programs stay deadlock-free
+           ([0,4] <= iv < [5,6]) : A[iv ]; }: genarray( [5,6], 0)   and serialization is always possible.
+                                                                      SVP further separates the declaration of concurrency
+             0         0   0   0   A[0, 4]   A[0, 5]                from its scheduling. When code expresses more concur-
+            0         0   0   0   A[1, 4]   A[1, 5]               rency than is available, processors automatically switch
+         B← 0         0   0   0   A[2, 4]   A[2, 5] 
+                                                    
+            3                                                      from space scheduling to time scheduling at the point when
+                       4   5   6   A[3, 4]   A[3, 5]               all concurrent resources become full. Excess concurrency
+             4         5   6   7   A[4, 4]   A[4, 5]                is automatically removed to prevent overheads. This avoids
+                                                                    granularity mismatches on heterogeneous resources.
+                                                                        Space scheduling is further achieved by binding a collec-
+      Figure 3. Example WITH-loop and result.
+                                                                    tion of processors, called a place, to a family upon its cre-
+                                                                    ation. This can happen at any level, dynamically. Creations
+                                                                    can either propagate the current mapping to the child fami-
+                                                                    lies (“default” place), or restrict to a smaller entity (“local”
+2.3. Memory management
+                                                                    place). This provides an efficient way to control locality
+                                                                    at fine granularities. Creation can also use explicit places
+   We focus here on memory management when compiling                provided at a coarse level by a place allocator which leases
+WITH -loops to executable code. Assuming that the existing
+                                                                    entire clusters to requesting program components [13].
+array A in Figure 3 is of the same shape as B, i.e. 6 × 7
+elements, A is a reuse candidate for B. Whether or not this         3.1. An SVP implementation: the Microgrid
+candiate may actually be reused is only decidable at runtime
+from its associated reference counter.                                 The Microgrid is a many-core chip architecture which
+   If its reference counter is 1, the reference to it is the last   implements the SVP interfaces in hardware [11, 3]. Dedi-
+one, and the memory can be safely updated destructively.            cated circuits next to a RISC pipeline provide bulk creation,
+This saves one loop nesting, the one derived from the second        synchronization and inter-thread communication. This is in
+generator. In case the candidate cannot be reused, the de-          turn controlled by dedicated instructions in the ISA.
+fault code allocates fresh memory to accommodate the new               For work distribution, programs designate either single
+array B and uses three loop nests to initialise all elements        cores or clusters of multiple cores as a place, using a uni-
+from scratch. Finally, A’s counter is decremented. Regard-          form addressing scheme which preserves cache locality at
+less of reuse, B’s counter is set to the number of statically       any cluster size (Figure 4). Within a cluster, bulk creation
+inferred references in the rest of the current code block.          and synchronization use a fast local distribution network,
+   The example makes the benefits of memory reuse ob-               whereas across clusters a narrow mesh delegation network
+vious. Not only does this save a costly invocation of the           is used for remote family control. This is physically sepa-
+memory allocator, but it also allows to skip all code that is       rated from the memory network to avoid interference. The
+merely concerned with copying data from an existing to the          memory network makes caches coherent at family creation
+new array. The interested reader is referred to [8] for a more      and synchronization points only, resulting in weak consis-
+thorough treatment of the subject.                                  tency between sibling threads in a family.
+                                                                  is provided to two or more concurrent function calls. Data
+                                                                  parallelism in WITH-loops is mapped onto wide SVP fam-
+                                                                  ilies. Any multi-level WITH-loop is compiled into multiple
+                                                                  thread programs. When the WITH-loop is reached during
+                                                                  execution, this triggers the creation of a tree of families,
+                                                                  one level per generator dimension. Hints for SVP “default”
+                                                                  and “local” placement are also used to optimize locality of
+                                                                  accesses. When possible, code to reuse or allocate memory
+                                                                  for the result is placed before a top-level family creation.
+
+                                                                  4. Our solution: distributed lazy RC
+      Figure 4. Example 32-core Microgrid tile.
+                                                                      Reference counting in S AC is straightforward and relies
+                                                                  on the usual operations: setrc upon initial allocation, in-
+3.2. Exclusive places for shared state                            crc, decrc (hereafter considered to be incrc with a negative
+                                                                  value) to update the value of a reference counter, and getrc
+    The memory system of the Microgrid chip only provides         to enquire its current value. In traditional shared memory
+bulk concistency at family creation and termination. This         systems, all these operations but the first run potentially
+is efficiently implemented in hardware by flushing pending        concurrently and must be implemented using atomic prim-
+memory stores at family events. However, this comes at the        itives or locks. The low-level requirement are then a cache
+cost of disallowing implicit memory-based communication           protocol and memory locking semantics that ensure that the
+between sibling threads that are unrelated via parent-child       data for the reference counter is globally consistent across
+synchronization, including all manners of reference count-        the entire memory network. This implies non-trivial syn-
+ing and mutual exclusion via memory-based structures.             chronization latencies and interference with computation-
+    For cases where bounded non-determinism is desirable          related memory network traffic.
+in programs, SVP also provides exclusive places. These
+provide the following semantics: all families created at the      4.1   Distributed reference counting
+same exclusive place are scheduled in some sequential or-
+der with regards to each other, i.e. they are guaranteed to run       The key idea in our approach is to ship the individual
+mutually exclusively. To implement this, an exclusive allo-       reference counting operations to a computing resource that
+cate request defines the requirement for sequential schedul-      holds the counter data, using low-latency fine-grained hard-
+ing. When an allocation requests arrives at a core with the       ware primitives, instead of shipping the counter to the com-
+exclusive flag, the hardware create process waits until pre-      puting resource where the RC occurs. The immediate ad-
+vious exclusive work has terminated before satisfying the         vantage in a setting with distributed memory is the reduced
+request. The memory system guarantees that writes per-            bandwidth requirement. Furthermore, by keeping the refer-
+formed at an exclusive place are visible by subsequent fam-       ence counters in a single location, our approach works with
+ilies running at the same place. This way, atomic accesses        weaker consistency systems such as the Microgrid.
+to shared state can be sent to the same exclusive place. This         In a first approach, incrc and getrc are mapped to SVP
+corresponds to the “secretary” concept of [4]; compared to        thread programs. incrc takes the address of a reference
+criticial sections and monitors found in other programming        counter, or a heap object containing a reference counter at
+models, exclusive places have an explicit location on chip.       a predefined offset, and an increment as arguments, and up-
+                                                                  dates the value of the counter. getrc takes the address of a
+3.3. Compiling S AC to the Microgrid                              reference counter as argument and returns its current value.
+                                                                      From a compiler’s perspective these are the same prim-
+    We have implemented a compiler from S AC to the Mi-           itives as used in a non-concurrent setting. The running
+crogrid as previous work [6], which we summarize here.            program, however, now sends requests to a shared pro-
+There are two forms of concurrency in S AC: functional con-       cessing resource instead of performing the RC opera-
+currency in independent expressions and data-parallelism in       tions directly. In SVP this resource is an exclusive place
+WITH -loops. Function calls can be translated to SVP fam-         (cf. subsection 3.2). It sequentialises all incoming RC re-
+ilies of one thread. This way execution of functions can          quests and performs only one RC operation per object at
+be parallel if there are resources available, otherwise they      a time. This further requires preservation of creation or-
+are sequentialized automatically. This can be applied re-         der across the network: RC operations issued by one thread
+cursively. Sharing of arrays happens when the same array          need to be performed in their issue order; also, if one thread
+spawns other threads, all RC operations of the parent thread       messages sent from one resource need to have a consistent
+up to the spawn operation need complete before the RC op-          order, no global state needs to be maintained.
+erations of any child thread are performed. This is to ensure          To support architectures that only provide ordered point-
+that the caller increments are performed before any callee         to-point communication, such as the Microgrid, we have
+decrements of the children are enacted.                            to extend our approach slightly. In this case, ordering is-
+   We further do not require a single exclusive place for all      sues arise when sub-computations sharing a RC place are
+RC operations; we merely require that a single counter is          delegated concurrently to different places. We assume that
+managed by the same exclusive place throughout its life-           threads, once created, do not migrate across places.
+time. This means that each reference counter can be man-               In this context, a caller increments the reference counts
+aged by a different place. The scheme is thus scalable with        of all arguments of a spawned thread before the spawn.
+the number of exclusive places used for RC, up to one per          These RC operations must complete before the spawned
+core on our Microgrid implementation. Furthermore, on the          thread potentially performs decrc. If both threads run on the
+Microgrid this mapping is efficient: using a primitive hash        same place, this is ensured by the local ordering between the
+function, the address of any reference counter can be trans-       threads’ place and the exclusive place used for RC. If, how-
+formed into a valid exclusive place identifier in a way that       ever, the spawned thread is delegated to another place, this
+balances load across the entire grid.                              ordering is no longer guaranteed. In particular, the RC oper-
+                                                                   ations issued by the child thread’s place may be performed
+4.2   Lazy reference counting                                      before those issued by from the parent thread’s place. To
+                                                                   prevent this, we introduce another RC operation, flush. It
+    A further key observation is that for most RC operations,      is implemented by a synchronous request that performs no
+the requesting thread is not interested in the result of the op-   action. Due to the local order, completion of flush implies
+eration. The incrc requests are issued by a thread to create       that all previous RC operations have completed. In partic-
+a conceptual new reference or to release a conceptual ref-         ular, if a flush is issued after incrc, it is safe to delegate a
+erence. As long as either operation is performed eventually        thread after flush completes.
+and thus freeing of the memory prevented or facilitated, it            The absence of a global order affects getrc as well. Its
+does not matter when the operation is actually performed.          result is no longer an accurate representation of the system’s
+    Given that SVP separates initiation of a concurrent ac-        state. Although getrc is synchronous, there may still be sub-
+tivity (through the issuing of a create operation) and the ac-     sequently issued RC operations pending from other places.
+tual execution of the corresponding instructions (when the             This may lead to false negatives, i.e. to situations where
+scheduling of threads eventually happens), we can also is-         a reuse opportunity is missed due to an inaccurate counter
+sue incrc asynchronously and let them execute concurrently         value. However, false positives, i.e. a reuse of an object that
+with the computation until the synchronization required by         is still referenced otherwise, cannot occur. Indeed, if the
+the observation operations. This overlap provides extra la-        counter has been decreased to 1 at any stage of a computa-
+tency hiding. Only at the point of observation, the thread re-     tion, this means that only one thread may hold a reference to
+questing getrc requires synchronization as it needs to decide      the corresponding object. Thus, all pending RC operations
+a potential memory reuse. In short, pending asynchronous           must belong to that thread as otherwise a thread would emit
+requests must complete only before getrc.                          an RC operation on an object it no longer references, which
+    This is what we name lazy reference counting: we can           is impossible. As getrc is performed synchronously by the
+postpone RC operations, from the issuing threads’ perspec-         thread that holds the last reference to the object, all other RC
+tive, until a point of potential reuse is reached. This leads to   operations for that object will complete before getrc com-
+a heap management that is partially deferred, yet provides         pletes. Thus, if the result is 1 then the enquiring thread at the
+low-overhead liveness information. Furthermore, with suf-          point of enquiry is holding the single last reference. Conse-
+ficient hardware resources, we can perform RC concurrently         quently, memory reuse is safe.
+with the program’s execution.                                          This extended scheme requires only a minor adaptation
+                                                                   in compilers. Before delegating a spawned thread to a dif-
+                                                                   ferent execution resource, we now additionally insert flush
+4.3   Partially ordered communication
+                                                                   operations on all array arguments of the thread.
+    Our solution as presented so far requires a global or-
+der for all creation requests. However, this architectural         5. Feedback on the Microgrid design
+requirement has similar costs as requiring a global mem-
+ory consistency. In constrat, local ordering of messages,             We report on the implementation and evaluation of our
+i.e. preservation of order between pairs of processing re-         proposed scheme separately in [9]. Retrospectively, our re-
+sources, is significantly cheaper to implement. As only the        sults have provided feedback to the Microgrid implemen-
+tation. This happened on two levels: a reflection on the                         4. After creation has synchronized, the creating thread
+on-chip network protocol due to the ordering requirements                           can optionally send thread function arguments to the
+from the scheme and optimization strategies to the on-chip                          running child family asynchronously.
+thread spawning processes to remove unnecessary synchro-
+                                                                    Once these steps are completed, the child family is run-
+nization.
+                                                                 ning asynchronously with the parent thread, which may
+                                                                 choose not to synchronize on termination of its child and
+5.1. Partial ordering of network requests
+                                                                 instead detach from it for truly asynchronous completion1 .
+                                                                    In the case where this targets an exclusive place, the ex-
+   As explained in subsection 4.3, the minimal requirement
+                                                                 pected asynchrony is unfortunately prevented. Indeed, ex-
+for our RC scheme is that requests issued from the same
+                                                                 clusivity is implemented by reserving a single family con-
+thread are processed in order, although not necessarily in
+                                                                 text for exclusive delegations on each core. This causes
+order with requests from different threads. As this was not
+                                                                 any allocation to unnecessarily synchronize on the comple-
+guaranteed by the abstract SVP model, we had to look at
+                                                                 tion of all previous exclusive requests. We illustrate this
+the processes involved on chip. When a thread requests the
+                                                                 in Figure 5: 2000 threads are created over 64 cores; each
+remote creation of a family at another place, the following
+                                                                 thread performs a incrc as its first operation. Due to over-
+happens: on the originating core, a request is issued onto
+                                                                 synchronization on allocation, the threads are unnecessarily
+the delegation network, then routed to the target place, then
+                                                                 sequentialized (low pipeline efficiency) up to t≈150kcycles
+at the target core, it is queued for later processing. Local
+                                                                 where all RC operations have been queued. After that point
+ordering must thus be ensured at these three levels.
+                                                                 the threads can run in parallel (high pipeline efficiency) and
+   Both issuing and queueing requests use a single queue so
+                                                                 the RC operations become truly asynchronous. This behav-
+the ordering is trivial. All individual cores are connected to
+                                                                 ior runs counter to the desired laziness of our scheme.
+the delegation network, which has a mesh topology. Here
+the Microgrid implements dimension order routing, which                                  0.9                                                               2000
+also preserves order and satisfies our requirement. In other                             0.8                                                               1800
+                                                                                                                                                           1600
+chips, the work delegation protocol should respect this or-                              0.7
+
+
+
+
+                                                                 efficiency ([0..1])
+                                                                                         0.6                                                               1400
+dering between execution places. The SVP semantics have                                                                                                    1200
+                                                                                                                                                                  #threads
+                                                                                         0.5
+since been refined to provision our ordering requirement.                                0.4
+                                                                                                                                                           1000
+                                                                                                                                                           800
+                                                                                         0.3                                                               600
+5.2. Hardware concurrency optimizations                                                  0.2                                                               400
+                                                                                         0.1                                                               200
+                                                                                          0                                                                0
+   While experimenting with our first implementation, we                                       0   50    100      150     200     250       300   350   400
+discovered that the Microgrid was preventing the expected                                                      time (clock cycles / 1000)
+latency hiding benefit of asynchronous delegations, by re-
+                                                                                                            pipeline efficiency at the worker place
+quiring excess synchronization not expressed in the code.                                           number of queued threads at the exclusive place
+   The issue arises from the phase separation of family cre-
+ation on chip. Any expressed creation implies the following:
+ 1. The creating thread performs the allocate operation,                                 Figure 5. Effect of excess synchronization.
+    provided with a place identifier, which triggers the al-
+    location process. This reserves a family context and at          A first approach to overcome this limitation was to adapt
+    least one thread context on the target place and returns     the architecture by combining the allocate, create and de-
+    a family identifier as result (comprising the address of     tach steps into a single operation which only synchronizes
+    the target). With remote places this causes a network        on the queueing, not on the execution. This is conceptu-
+    roundtrip to allocate.                                       ally possible if the exclusive families do not need configu-
+                                                                 ration, i.e. are single-threaded, because then the family con-
+ 2. Using the family identifier, the creating thread can then    text can be pre-allocated. Then a special detached create
+    configure the family context to define the logical thread    request could be sent, using the family identifier and pro-
+    count. Configuration does not entail synchronization         gram counter as input, that simply queues exclusive cre-
+    and is optional: by default only one thread is created.      ation at that family entry and synchronizes on queueing, fol-
+                                                                 lowed by an asynchronous request to provide the function
+ 3. Once the family is configured, the thread performs
+                                                                 arguments to the created family. Because partial ordering
+    create on a family identifier and an initial program
+                                                                 is guaranteed, the arguments would always arrive after the
+    counter, and completes when the creation process at
+                                                                 create that they pertain to. However, this approach requires
+    the target place has started. With remote places, this
+    also causes a network roundtrip.                                                   1 detach is also an asynchronous request.
+a more complex buffering arrangement that provides non-               While this mechanism was designed independently, our
+FIFO access to arguments. This is because arguments from           RC scheme helped refine the design. Firstly, the mecha-
+different creates may be interleaved in the queue. Hence, an       nism was originally designed so that both indcreate and
+associative FIFO lookup is required based on a per-create          the indexed create process would execute at the issuing core
+tag to avoid deadlocks (any thread on any core can issue cre-      with the resulting allocation/create being delegated if neces-
+ates and arguments out of order). A proper tagging scheme          sary. Instead, the inverse solution where indcreate queues
+would be also complex to design. Finally, a finite argument        remotely is what we need. Also, the use case requires that
+buffer could cause deadlock if it became full with arguments       client threads must be able to synchronize on the queueing,
+unrelated to the first entry in the create buffer. Thus some       so as to receive a guarantee that the RC operation will even-
+form of software-directed deadlock prevention would also           tually be performed before any subsequently queued request
+be required, adding more to the complexity of this solution.       is serviced. This means that an indcreate operation must
+    At this point we observed that the fundamental require-        only synchronize when the remote queueing is acknowl-
+ment for the desired level of asynchrony was the ability to        edged. While we clarified this requirement in the light of
+queue work remotely, at the exclusive place, using a single        reference counting, it is actually a quite general prerequisite
+network message containing all the information required.           to many software locking schemes.
+To achieve this, a seemingly unrelated feature exists on the
+Microgrid: system call gates, originally designed for imple-       6. Related Work
+menting privileged operating system services like resource
+allocation and I/O access. Looking at this mechanism, we               Although we are aware of recent work on using non-
+see that this consists of a combination of two features: an        deferred reference counting in the context of mainstream
+indcreate operation, which takes a service identifier and an       object oriented languages [14], we did not come across
+argument value as input and queues requests remotely, and          any work of non-deferred reference counting in the con-
+an indexed create process at each core, which takes as input       text of distributed memory or weakly coherent shared mem-
+requests from its local queue and processes allocation and         ory multi-cores. However, the underlying principles of our
+creation. This is illustrated in Figure 6: a table in memory       approach, i.e. shipping computation to data and exploiting
+maps service identifiers (SID) to code. The remote identi-         asynchronous communication for latency hiding, have been
+fier given to indcreate contains both the network address          applied to related problems in distributed systems before.
+of the remote core, the SID, and bits to indicate whether to           One example in this setting is the multi kernel paradigm
+detach and/or create exclusively. Each core is configured          adopted by the Barrelfish operating system [1] for many-
+with a base table address in memory, which is then offset by       cores. In Barrelfish, instead of using a single global kernel
+each SID to find a program counter and possible other fam-         and shared state, the operating system is built around com-
+ily configuration data. The extra argument value provided          municating network of kernels. Each computing resource
+to indcreate becomes the index value of the first thread in        is managed by its own kernel and state is replicated using
+the created family. This way clients can provide function ar-      message passing. Similar to our approach, system services
+guments to the service. By assigning reference counter op-         are delegated to responsible cores that hold the correspond-
+erations to entries in the service table of the exclusive place,   ing state instead of communicating the state. The driving
+we obtain the desired asynchrony using the input queue of          force here, like in our approach, is scalability.
+the indirect create process.                                           Similar, but on a significantly larger scale, distributed file
+                                                                   system have to contend with typically large objects (files)
+                     delegation network                            duplicated in storage across several applications (clients).
+                                                                   Usually, metadata and directories are maintained separately
+                        request queue:                             from the data, with tables that keep track of which clients
+                          arg    bits  SID
+                                                                   currently hold a copy of each file. Storage reclamation af-
+                                                         PC
+                                 table lookup
+                                                                   ter path deletion can only occur when the last client has
+           set                                                     dropped its replica of the corresponding file.
+         index                       creation                          The Hadoop distributed file system [2, 15] and the
+                                                  memory           Google File System [5] are particular examples of dis-
+           Create         Allocate               interface         tributed file systems that employ a scheme closely related
+                                                                   to our approach. In both, objects are file data blocks and
+                 ... other core components ...
+                                                                   are distributed across a set of data nodes. Separately to
+                                                                   these, name nodes hold the metadata and reference infor-
+                                                                   mation. When data nodes duplicate data or create new data
+     Figure 6. Indirect create process on chip.                    they must inform the name node of the existence of new
+copies through heartbeat messages. Client applications can          [4] E. W. Dijkstra. Hierarchical ordering of sequential pro-
+enquire through a name node to know how many copies of a                cesses. Acta Informatica, 1(2):115–138, June 1971.
+data block exist. On each name node, heartbeats are handled         [5] S. Ghemawat, H. Gobioff, and S.-T. Leung. The Google file
+in order but asynchronously, except when an application re-             system. SIGOPS Oper. Syst. Rev., 37(5):29–43, 2003.
+                                                                    [6] C. Grelck, S. Herhut, C. Jesshope, C. Joslin, M. Lankamp,
+quests a flush-and-sync of pending heartbeats. This is simi-
+                                                                        S.-B. Scholz, and A. Shafarenko. Compiling the Func-
+lar to the lazy updates, synchronous reads in our scheme.               tional Data-Parallel Language S AC for Microgrids of Self-
+                                                                        Adaptive Virtual Processors. In Proc. 14th Workshop on
+7. Conclusion                                                           Compilers for Parallel Computing (CPC’09), IBM Research
+                                                                        Center, Zürich, Switzerland, 2009.
+    The primary contribution of this paper is a novel lazy,         [7] C. Grelck and S.-B. Scholz. SAC: A functional array lan-
+non-deferred reference counting scheme targeting a many-                guage for efficient multithreaded execution. International
+core architecture with shared memory. To reduce communi-                Journal of Parallel Programming, 34(4):383–427, 2006.
+                                                                    [8] C. Grelck and K. Trojahner. Implicit Memory Management
+cation requirements our scheme ships the reference count-
+                                                                        for SaC. In C. Grelck and F. Huch, editors, Implementa-
+ing operations to a shared processing resource instead of mi-           tion and Application of Functional Languages, 16th Inter-
+grating the counter data to the thread that needs to perform a          national Workshop, IFL’04, pages 335–348. University of
+reference counting operation. As a welcome side effect this             Kiel, Institute of Computer Science and Applied Mathemat-
+allows our scheme to run on systems with weak or no cache               ics, 2004. Technical Report 0408.
+coherency, by ensuring that all updates to the same counter         [9] S. Herhut, C. Joslin, S.-B. Scholz, R. Poss, and C. Grelck.
+are performed by the same processor. To reduce contention               Concurrent non-deferred reference counting on the micro-
+on the shared resource and to enable latency tolerance we               grid: first experiences. In Proc. 22nd international confer-
+queue counter updates asynchronously without synchroniz-                ence on Implementation and application of functional lan-
+ing on their completion: synchronization is only required               guages (IFL’10), pages 185–202. Springer-Verlag, 2011.
+                                                                   [10] P. Hudak and A. Bloss. The aggregate update problem in
+at the point of potential reuse. Finally, we only require only
+                                                                        functional programming systems. In Proc. 12th ACM Sym-
+partial network routing order between requests issued by the            posium on Principles of Programming Languages, pages
+same thread, instead of a global order between all clients of           300–314. ACM, January 1985.
+a reference counter.                                               [11] C. Jesshope. Operating systems in silicon and the dynamic
+    We have implemented this scheme successfully in the                 management of resources in many-core chips. Parallel Pro-
+array programming language S AC. Our implementation                     cessing Letters, 18(2):257–274, 2008.
+targets the SVP programming interface and its many-core            [12] C. Jesshope, M. Hicks, M. Lankamp, R. Poss, and L. Zhang.
+hardware implementation, the Microgrid. Our work has                    Making multi-cores mainstream – from security to scalabil-
+helped refine the Microgrid design and suggested optimiza-              ity. In Advances in Parallel Computing, volume 18. IOS
+                                                                        Press, 2010.
+tions for additional hardware concurrency. This positive
+                                                                   [13] C. Jesshope, J.-M. Philippe, and M. van Tol. An architecture
+feedback on the design of a many-core chip architecture                 and protocol for the management of resources in ubiquitous
+constitutes our secondary contribution.                                 and heterogeneous systems based on the SVP model of con-
+                                                                        currency. In Embedded Computer Systems: Architectures,
+8. Acknowledgements                                                     Modeling, and Simulation, pages 218–228, 2008.
+                                                                   [14] P. G. Joisha.       A principled approach to nondeferred
+   The research was performed at the School of Computer                 reference-counting garbage collection. In Proc. 4th In-
+Science, University of Hertfordshire, UK, and the Institute             ternational Conference on Virtual Execution Environments
+                                                                        (VEE’08), pages 131–140. ACM, 2008.
+for Informatics, University of Amsterdam, NL, under EU
+                                                                   [15] K. Shvachko, H. Kuang, S. Radia, and R. Chansler. The
+research grant FP7/2007/215216 Apple-CORE.                              Hadoop distributed file system. In Proc. 26th Symposium
+                                                                        on Massive Storage Systems and Technologies (MSST’10).
+References                                                              IEEE Press, May 2010.
+                                                                   [16] P. R. Wilson, M. S. Johnstone, M. Neely, and D. Boles. Dy-
+ [1] A. Baumann, P. Barham, P. E. Dagand, T. Harris, R. Isaacs,         namic Storage Allocation: A Survey and Critical Review. In
+     S. Peter, T. Roscoe, A. Schüpbach, and A. Singhania. The           H. Baker, editor, Proc. International Workshop on Memory
+     multikernel: a new OS architecture for scalable multicore          Management (IWMM’95), volume 986 of Lecture Notes in
+     systems. In Proc. 22nd symposium on Operating systems              Computer Science, pages 1–116. Springer-Verlag, 1995.
+     principles (SOSP’09), pages 29–44. ACM, 2009.
+ [2] D. Borthakur. The Hadoop distributed file system: Architec-
+     ture and design. 2007.
+ [3] K. Bousias, L. Guang, C. Jesshope, and M. Lankamp. Im-
+     plementation and Evaluation of a Microthread Architecture.
+     Journal of Systems Architecture, 55(3):149–161, 2009.
+

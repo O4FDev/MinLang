@@ -4,6 +4,7 @@ from pathlib import Path
 import os
 import subprocess
 import tempfile
+from clang_helpers import clang_command
 
 ROOT = Path(__file__).resolve().parents[1]
 DRIVER = Path(os.environ.get('MINYAR_MODULE_DRIVER', ROOT / 'build/minyar-module-build'))
@@ -85,7 +86,7 @@ with tempfile.TemporaryDirectory(prefix='minyar-delta-') as name:
     build()
     base.write_bytes(new_base); delta.write_bytes(new_delta)
     build((9, 0))
-    run(['clang', '-O0', '-Wno-override-module', output, ROOT / 'build/minyar-runtime.o', '-o', d / 'program'])
+    run(clang_command(['clang', '-O0', '-Wno-override-module', output, ROOT / 'build/minyar-runtime.o', '-o', d / 'program']))
     assert run([d / 'program']).stdout == '208\n'
 
 print('module deltas: cumulative/reverted edits, graph changes, corruption and mismatched generations match cold native builds')

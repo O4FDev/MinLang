@@ -1,0 +1,118 @@
+diff --git i/runtime/native/graphics.c w/runtime/native/graphics.c
+index e3abc9c..a882c6c 100644
+--- i/runtime/native/graphics.c
++++ w/runtime/native/graphics.c
+@@ -23,6 +23,7 @@
+ #include <signal.h>
+ #include <stdint.h>
+ #include "../minyar_native.h"
++#include "opengl-functions.h"
+ 
+ enum { VERTEX_FLOATS = 10, VERTEX_BYTES = VERTEX_FLOATS * 4, KEY_COUNT = GLFW_KEY_LAST + 1, BUTTON_COUNT = 8 };
+ 
+@@ -42,10 +43,10 @@ static GLuint world_program, overlay_program, texture, white_texture;
+ static GLuint line_array, line_buffer, overlay_array, overlay_buffer;
+ static Mesh *meshes;
+ static size_t mesh_count, mesh_capacity;
++static size_t mesh_next_slot;
+ static FloatBuffer lines, overlay;
+ enum { OVERLAY_FLOATS = 9 };
+ static float view_projection[16], camera[3], fog_color[3] = {0.6f, 0.75f, 0.95f}, fog_range[2] = {1e6f, 1e6f + 1};
+-static int texture_width = 1, texture_height = 1;
+ static float light_level = 1.0f;
+ static unsigned char key_down[KEY_COUNT], key_pressed[KEY_COUNT];
+ static unsigned char button_down[BUTTON_COUNT], button_pressed[BUTTON_COUNT];
+@@ -304,6 +305,11 @@ void minyar_graphics_openWindow(long long width, long long height, const MinyarT
+     window = glfwCreateWindow((int)width, (int)height, name, NULL, NULL);
+     if (!window) stop_graphics("the window could not be opened.");
+     glfwMakeContextCurrent(window);
++    const char *missing_function = minyar_load_opengl();
++    if (missing_function) {
++        fprintf(stderr, "graphics: unavailable OpenGL function: %s\n", missing_function);
++        stop_graphics("the graphics driver does not support the required OpenGL 3.3 functions.");
++    }
+     glfwSwapInterval(1);
+     glfwSetKeyCallback(window, on_key);
+     glfwSetMouseButtonCallback(window, on_button);
+@@ -384,21 +390,28 @@ static void png_u32(unsigned char *out, unsigned long value) {
+     out[2] = (unsigned char)(value >> 8); out[3] = (unsigned char)value;
+ }
+ 
++static void png_write(FILE *file, const unsigned char *data, size_t length) {
++    if (fwrite(data, 1, length, file) != length)
++        stop_graphics("the screenshot file could not be written.");
++}
++
+ static void png_chunk(FILE *file, const char *type, const unsigned char *data, size_t length) {
+     unsigned char header[8];
+     png_u32(header, (unsigned long)length);
+     memcpy(header + 4, type, 4);
+-    fwrite(header, 1, 8, file);
+-    if (length) fwrite(data, 1, length, file);
++    png_write(file, header, 8);
++    if (length) png_write(file, data, length);
+     unsigned long crc = png_crc(0xffffffffUL, header + 4, 4);
+     crc = png_crc(crc, data, length) ^ 0xffffffffUL;
+     unsigned char tail[4];
+     png_u32(tail, crc);
+-    fwrite(tail, 1, 4, file);
++    png_write(file, tail, 4);
+ }
+ 
+ static void write_screenshot(void) {
+     int width = framebuffer_width, height = framebuffer_height;
++    /* A minimized window may have no pixels. Keep the request for a drawable frame. */
++    if (width < 1 || height < 1) return;
+     size_t row = (size_t)width * 3 + 1, raw_length = row * (size_t)height;
+     unsigned char *pixels = malloc((size_t)width * height * 4), *raw = malloc(raw_length);
+     size_t blocks = raw_length / 65535 + 1;
+@@ -437,11 +450,11 @@ static void write_screenshot(void) {
+     png_u32(header, (unsigned long)width);
+     png_u32(header + 4, (unsigned long)height);
+     header[8] = 8; header[9] = 2; header[10] = 0; header[11] = 0; header[12] = 0;
+-    fwrite(signature, 1, 8, file);
++    png_write(file, signature, 8);
+     png_chunk(file, "IHDR", header, 13);
+     png_chunk(file, "IDAT", compressed, length);
+     png_chunk(file, "IEND", NULL, 0);
+-    fclose(file);
++    if (fclose(file)) stop_graphics("the screenshot file could not be written.");
+     free(pixels); free(raw); free(compressed);
+     screenshot_path[0] = 0;
+ }
+@@ -601,8 +614,6 @@ void minyar_graphics_setTexture(const MinyarBytes *pixels, long long width, long
+         stop_graphics("setTexture needs width * height * 4 bytes of RGBA pixels.");
+     if (texture != white_texture) glDeleteTextures(1, &texture);
+     texture = make_texture(pixels->bytes, (int)width, (int)height, 1);
+-    texture_width = (int)width;
+-    texture_height = (int)height;
+ }
+ 
+ static Mesh *find_mesh(long long handle) {
+@@ -613,7 +624,8 @@ static Mesh *find_mesh(long long handle) {
+ 
+ long long minyar_graphics_createMesh(void) {
+     require_window();
+-    size_t slot = 0;
++    /* Lower slots are occupied; deletion lowers this hint to preserve handle reuse. */
++    size_t slot = mesh_next_slot;
+     while (slot < mesh_count && meshes[slot].used) slot++;
+     if (slot == mesh_count) {
+         if (mesh_count == mesh_capacity) {
+@@ -634,6 +646,7 @@ long long minyar_graphics_createMesh(void) {
+     glBindBuffer(GL_ARRAY_BUFFER, mesh->buffer);
+     world_layout();
+     glBindVertexArray(0);
++    mesh_next_slot = slot + 1;
+     return (long long)slot + 1;
+ }
+ 
+@@ -718,6 +731,8 @@ void minyar_graphics_deleteMesh(long long handle) {
+     glDeleteBuffers(1, &mesh->buffer);
+     glDeleteVertexArrays(1, &mesh->array);
+     mesh->used = 0;
++    size_t slot = (size_t)handle - 1;
++    if (slot < mesh_next_slot) mesh_next_slot = slot;
+ }
+ 
+ void minyar_graphics_drawLine(double x1, double y1, double z1, double x2, double y2, double z2,

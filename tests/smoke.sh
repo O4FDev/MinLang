@@ -6,6 +6,8 @@ set -eu
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 compiler=${MINYAR_TEST_COMPILER:-"$project_dir/build/minyarc"}
 clang_command=${MINYAR_TEST_CLANG:-clang}
+math_library=
+case "$(uname -s)" in Darwin) ;; *) math_library=-lm ;; esac
 runtime="$project_dir/build/minyar-runtime.o"
 if [ ! -f "$runtime" ]; then
     runtime="$project_dir/runtime/minyar_runtime.c"
@@ -29,7 +31,7 @@ fail() {
 }
 
 link() {
-    "$clang_command" -O0 -Wno-override-module "$1" "$runtime" -o "$2"
+    "$clang_command" -O0 -Wno-override-module "$1" "$runtime" $math_library -o "$2"
 }
 
 # 1. The compiler's command line.

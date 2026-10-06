@@ -7,6 +7,7 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
+from clang_helpers import clang_command
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,7 +60,7 @@ def main() -> None:
         compiled = run([str(COMPILER), str(recursive), str(llvm)])
         assert compiled.returncode == 0, compiled.stderr
         executable = temporary / "recursive"
-        linked = run([CLANG, "-O0", "-Wno-override-module", str(llvm), str(RUNTIME), "-o", str(executable)])
+        linked = run(clang_command([CLANG, "-O0", "-Wno-override-module", str(llvm), str(RUNTIME), "-o", str(executable)]))
         assert linked.returncode == 0, linked.stderr
         program_result = run([str(executable)])
         assert program_result.returncode == 1, (

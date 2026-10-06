@@ -7,6 +7,7 @@ import argparse
 import os
 import subprocess
 import tempfile
+from clang_helpers import clang_command
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -27,14 +28,14 @@ def main():
                 if sanitized:
                     command.extend(['-g', '-fsanitize=address,undefined'])
                 command.extend([str(ROOT / 'tests/bounded-runtime.c'), '-o', str(executable)])
-                subprocess.run(command, check=True, timeout=60, env=environment)
+                subprocess.run(clang_command(command), check=True, timeout=60, env=environment)
                 checked = subprocess.run([str(executable)], capture_output=True, text=True,
                                          timeout=120, env=environment)
                 assert checked.returncode == 0, checked.stdout + checked.stderr
                 frame_executable = directory / f'frames-{budget}-{int(sanitized)}'
                 frame_command = command[:-3] + [str(ROOT / 'tests/bounded-frame-retirement.c'),
                                                 '-o', str(frame_executable)]
-                subprocess.run(frame_command, check=True, timeout=60, env=environment)
+                subprocess.run(clang_command(frame_command), check=True, timeout=60, env=environment)
                 frames = subprocess.run([str(frame_executable)], capture_output=True, text=True,
                                         timeout=120, env=environment)
                 assert frames.returncode == 0, frames.stdout + frames.stderr
@@ -57,8 +58,8 @@ def main():
             ('MINYAR_RC_POLL_BUDGET=1025', 'cleanup budget'),
         ):
             checked = subprocess.run(
-                [args.clang, '-std=c11', '-DMINYAR_BOUNDED_HEAP=1', '-D' + definition,
-                 '-fsyntax-only', str(ROOT / 'runtime/minyar_runtime.c')],
+                clang_command([args.clang, '-std=c11', '-DMINYAR_BOUNDED_HEAP=1', '-D' + definition,
+                 '-fsyntax-only', str(ROOT / 'runtime/minyar_runtime.c')]),
                 capture_output=True, text=True, timeout=30, env=environment)
             assert checked.returncode != 0 and expected in checked.stderr, checked.stderr
         print('invalid heap capacities and cleanup budgets rejected at compilation', flush=True)

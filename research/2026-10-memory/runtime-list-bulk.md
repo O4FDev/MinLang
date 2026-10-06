@@ -1,0 +1,237 @@
+# Isolated scalar List prefix bulk copy
+
+**The bounded count/semantic experiment passed; the candidate remains isolated.**
+No production source, capacity policy, allocation or cleanup hook was changed.
+Paired native primitive CPU observations now pass the declared criteria; there
+is no generated final-source or adoption result for this candidate.
+The separate pressure/error and raw-bit follow-ups below now pass.
+[Preregistration](runtime-list-bulk-preregister.json) predates the fixture,
+baseline red and candidate. [Derived results](runtime-list-bulk-results.json)
+retain exact separate cohorts; [durable sources and logs](evidence/runtime-list-bulk/)
+survive `make clean`.
+
+The [pinned peer implementation review](peer-implementation-review.md) suggested
+copying an initialized scalar prefix after trusted reservation. This is an
+original internal experiment, not a Rust source port or a new memory algorithm.
+Minyar's compiler emits `minyar_list_appended` for `.appended(...)`; the previous
+generated List fixture exercises that API. No `.appended` application call site
+was found in the inspected compiler/examples source search, and no application
+hot-path or prevalence claim is made.
+
+## Source condition and patch
+
+The baseline is the **already guarded** production reservation implementation,
+not the earlier geometric/unconditional candidates. The isolated
+[exact patch](evidence/runtime-list-bulk/run-cdthtzns/candidate.patch) captures
+`!references && !rc_pending_count` after the common header, before reservation.
+Any pending object/frame/chunk task keeps the full previous copy loop even if
+reservation subsequently drains it. References also keep that loop, including
+mortal, null and immortal elements. The original tail add/take remains unchanged.
+
+After unchanged successful reservation, the fresh scalar destination has capacity
+at least `n+1` and cannot overlap the protected source. The existing capacity and
+header-inclusive size checks establish representability of `n*sizeof(long long)`.
+The candidate copies that initialized prefix only when `n>0`, then publishes
+length `n`. Zero length skips copying because source backing may be NULL.
+The valid typed scalar, single-mutator, non-reentrant contract ensures no callback
+observes intermediate result lengths. It gains no `restrict`, metadata, service,
+layout or recovery policy. Invalid fabricated native headers are not certified.
+
+## Red and paired controls
+
+The first [adapter cohort](evidence/runtime-list-bulk/run-uy7vxriu/results.json)
+failed to compile: the Darwin SDK had already defined a fortified `memcpy`
+macro. No fixture ran there. The [recorded correction](runtime-list-bulk-adapter-correction.json)
+undefines that macro before local observer interposition, without changing the
+oracle or thresholds.
+
+The [first successful baseline](evidence/runtime-list-bulk/run-034ic9tc/results.json)
+then reproduces the declared work red at `n=2`: three observed scalar append
+entries and no bulk copy fail the one-copy/one-tail requirement with exit 70,
+**after semantic checks and exact recovery**. This is a missing count target,
+not a runtime correctness defect. Its full semantic cohort passed before the
+candidate was written.
+
+| Configuration | Baseline / candidate durable run | Full observations per variant |
+| --- | --- | ---: |
+| system/K32/O2 | `run-034ic9tc` / `run-cdthtzns` | 34 |
+| fixed2MiB/K1/O2 | `run-bqxj0dp4` / `run-fuml9dih` | 34 |
+| system/K32/native C ASan+UBSan/O1 | `run-yj8cm18v` / `run-5olg8n6r` | 34 |
+
+These are six builds/six full executions of 34 control shapes, plus three expected
+baseline count reds and three candidate target passes. They are not 204 distinct
+tests or ports. No generated LLVM was compiled, and LSan is disabled. The first
+system pair uses the saved pre-format fixture; the later pairs use its pinned
+ClangFormat 23.1.2 formatting. Executed fixture and runner versions remain
+separately archived rather than relabeled as one final-source matrix.
+
+Lengths are 0,1,2,3,7,15,31,32,1023,1024,4095,4096,8193 with both tail flags.
+Every source/result slot is checked against independently initialized signed
+endpoints, Boolean/Character/Float slot words and varying unsigned bit patterns.
+A retained source alias remains unchanged after dropping the producer root.
+The reference controls contain mortal/null/immortal members and a tail aliasing
+an existing member, with exact retain/take counts and surviving bytes. Object,
+frame and temporary-chunk debt must remain after common header service; all
+retain the previous loop. Capacity uses a separate mathematical policy oracle.
+
+| Idle scalar length | Baseline append entries, retained tail | Candidate append entries | Candidate prefix-copy bytes |
+| --- | ---: | ---: | ---: |
+| 0 | 1 | 1 | 0 |
+| 2 | 3 | 1 | 16 |
+| 1,024 | 1,025 | 1 | 8,192 |
+| 8,193 | 8,194 | 1 | 65,544 |
+
+The source-level observer counts entry executions even when the optimizer inlines
+calls. Copy bytes are still linear; scalar element data is still written. This
+does not establish fewer machine instructions, memory traffic or CPU cost.
+The independent earlier performance audit confirms its own baseline binary
+retained the scalar loop, not that this new candidate is faster. Tiny inputs and
+already-optimized copies remain important prospective timing controls.
+
+For every pair, ordered managed object/data/resize **request-entry** events,
+helper events and all observed public poll offer/work/pending transitions match.
+Nested helper/public work is not added twice. Capacity, retain/take, post-operation
+objects/requested bytes and exact drained recovery also match. Debt/reference
+rows, including their copy observer fields, are completely equal. Scalar idle
+rows differ only in prefix append/copy work. This fixture does not log underlying
+libc allocation addresses, continuous charged/RSS peaks or every possible public
+poll input; it records all polls occurring in these controls.
+
+Each case drains pending tasks and separately disposes cached frames, with zero
+object/requested/tracked heap allocation or fixed-pool used bytes. Native commands
+have CPU 30s/file 32MiB/30s timeout, Darwin taskpolicy memory pressure 128MiB and a
+completed-process RSS check at 128MiB. The largest saved native peak is 11,272,192
+bytes. This is not continuous RSS enforcement or a latency experiment; the paced
+system soak remained active. Compile processes use the established normal-QoS
+outer limits.
+
+## Pressure, errors and exact bit transport
+
+[Follow-up results](runtime-list-bulk-followup-results.json) keep two separate
+cohorts. The [initial pressure premise failure](evidence/runtime-list-bulk-pressure/run-ckca0e7f/results.json)
+occurred on the K32 chunk baseline: cleanup freed 1,152 bytes, so all eight small
+requests were admitted. Its expected-refusal assertion failed; this was not a
+runtime correctness red. [Revision 2](runtime-list-bulk-pressure-preregister.json)
+retains those eight simultaneous requests and adds a terminal 65,536-byte request
+that cannot fit alongside the live Lists. No resource or semantic threshold was
+relaxed.
+
+The [completed pressure cohort](evidence/runtime-list-bulk-pressure/run-pnvtxa03/results.json)
+has 12 finite-pool builds and 36 executions: object, frame and temporary-chunk
+debt at fixed64KiB/K1 and K32/O2, plus K1/native C ASan+UBSan/O1. Each also runs
+after explicit complete debt drain, exercising bulk eligibility with the same
+setup. After construction and after each retained raw request, pairs compare
+complete pool-map bytes, all ordered free nodes and normalized previous/next
+links, current charge, initialized List headers/backing sizes/values, scheduler
+fields and active/cached frame descriptors. All nine response offsets and states
+match, including actual admissions and refusals. Uninitialized spare/raw payload
+and stale cached-local contents are excluded; telemetry is recorded separately.
+Every original content and final recovery assertion remains in place.
+
+Four further system/K32 builds (O2 and native C ASan+UBSan/O1, both variants)
+execute 12 fatal controls: result-header OOM, result-data OOM and append length
+LLONG_MAX. Exact diagnostics and observed allocation/service entry order match.
+These terminating processes establish no fatal-path recovery or leak guarantee.
+Managed request/helper/all-public-poll traces match throughout; debt rows match
+fully and drained scalar rows differ only in prefix work counts. The largest
+completed RSS in this cohort is 9,568,256 bytes under the unchanged 128MiB check.
+
+[Six supplemental builds/executions](evidence/runtime-list-bulk-bits/run-0c8xwdbg/results.json)
+use the basic system/K32/O2, fixed2MiB/K1/O2 and system/K32/native C sanitizer/O1
+pairs. Ten explicit binary64 slot words cover both signed zeros, positive and
+negative minimum subnormals, infinities, quiet NaN payloads and signaling NaN
+payloads using only integer/memcpy transport. Source/result mutations remain
+independent and a retained source owner survives producer release. Empty scalar
+storage with non-NULL backing and empty/immortal/null reference controls recover
+exactly. These are supplemental native controls, not additional generated tests
+or Float arithmetic/NaN behavior claims.
+
+The supplemental preregistration pinned its pre-format bytes; executions use
+ClangFormat23.1.2 output. The [separate provenance reconciliation](runtime-list-bulk-bits-provenance-reconciliation.json)
+recovers the exact original hash from the retained author patch and reproduces
+the executed bytes with the pinned formatter. Original preregistration and the
+independent review's earlier checkpoint remain unchanged.
+
+## Paired primitive CPU observation
+
+[The final acquisition](evidence/runtime-list-bulk-cpu/run-ws0ma9zu/results.json)
+retains 203 baseline calibration attempts and 192 randomized adjacent pairs
+(384 fresh measured children) across system/K32 and fixed16MiB/K32. Every row,
+input/order, source/object/binary hash, compiler assembly and linked machine-code
+listing is archived. [Derived estimates](runtime-list-bulk-cpu-results.json) and
+[all-pair figure](runtime-list-bulk-timing.svg) retain pointwise paired-resampling
+intervals and the small/fallback controls; [PDF](runtime-list-bulk-timing.pdf)
+and [PNG](runtime-list-bulk-timing.png) exports are available.
+
+| Idle length | System baseline/candidate ratio, pointwise 95% interval | Fixed ratio, interval |
+| --- | --- | --- |
+| 1,024 | 2.3939 [2.3336, 2.4326] | 2.4329 [2.4153, 2.4494] |
+| 8,193 | 2.3272 [2.3158, 2.3383] | 2.4373 [2.3938, 2.4656] |
+
+All numerical decision criteria pass. The intended accounting-free build requirement was not met; this cohort is not fully protocol compliant. The system empty control retains a geometric ratio
+of 0.98412 (about 1.61% candidate CPU increase), interval [0.96161,1.00685], median
+0.99752 and worst paired slowdown 7.814%. Its interval spans parity and permits
+roughly 4% mean slowdown: passing the declared point-estimate control gate is not
+a confidence guarantee that regression is below 3%. Fixed empty is 1.00205;
+debt/reference controls have geometric ratios about 1.002–1.006. Every control's
+geometric/median ratio is at least 0.97 and worst slowdown at most 10%.
+
+The measured `CLOCK_PROCESS_CPUTIME_ID` interval contains append, an opaque
+separately compiled full-value checksum, result release and quiescent drain;
+the debt fallback also constructs/detaches its debt record inside that interval.
+Source setup, final complete-value/mutation/recovery probe and stdout occur
+outside it. This clock differs from earlier Text process-wide measurements.
+Full checksums prevent dead-store elimination and dilute isolated copying cost;
+saved assembly/machine code retain value-reading and copy work. LTO, sanitizers
+and source-entry/copy/request/poll research observers are disabled. **The fixture
+defines `MINYAR_RC_TESTING=1`: managed allocation/ownership and last-work test
+telemetry remains.** The [accounting-scope correction](runtime-list-bulk-test-accounting-correction.json)
+preserves all original records. These ratios describe a test-accounted native
+primitive; production-config timing is not yet established. The [independent timing audit](runtime-scalar-bulk-performance-audit.md) approves only this test-accounted numerical evidence. They are not application
+prevalence, isolated memcpy, compiler speed, general latency or HFT evidence.
+The paced system soak and external host load remained present; there is no
+quiet-host or independent-host replication claim.
+
+Two earlier cohorts stopped correctly before acquiring any pair:
+[revision2](evidence/runtime-list-bulk-cpu/run-63_142as/results.json) retained 14
+baseline attempts when the empty system case hit 1,048,576 repeats at 0.065675s;
+[revision3](evidence/runtime-list-bulk-cpu/run-pt288kkw/results.json) retained 113
+attempts when fixed empty hit 4,194,304 repeats at 0.112742s. Both were below the
+0.12s pilot target, not runtime or performance defects. Separately authorized,
+preserved data-informed amendments set revision4's final ceiling 8,388,608; target,
+overshoot limits, per-child/aggregate caps and decision criteria stayed unchanged.
+No further increase was permitted. Every pilot remains in its original cohort.
+Final child CPU was 70.904679s and runner wall 81.983267s, below 180s/600s. CPU
+enforcement was between children, with remaining-wall child timeout and retained
+overshoot failure policy; it is not continuous aggregate enforcement.
+
+## Current disposition
+
+Exact-patch source review, separately qualified test-accounted timing, independent
+production-config evidence review, revised all-slot caller checks and focused
+combined-source gates are complete. The coordinator released exact joint
+application, and [d919/3b final-source results](runtime-joint-final-results.json)
+passed. [Dedicated final-source endurance](runtime-joint-endurance.md) is running;
+terminal independent/coordinator acceptance remains pending. The two earlier
+c4/01ae long cohorts exclude this patch. No new capacity/service policy or broad
+integration result is inferred.
+
+The [independent source review](runtime-scalar-bulk-review.md) conditionally
+approves the exact isolated patch under its typed/protected-source and ordinary
+nonallocating-copy premises. The [CPU proposal](runtime-list-bulk-cpu-proposal.md)
+and prepared opt-in runner have now acquired the explicitly scoped rows above.
+The scalar CPU audit retains its test-accounted qualification; the [joint final-source preregistration](runtime-joint-adoption-preregister.md) has now executed its scoped focused gates. The untimed eligibility/full-value-consumer calibration
+passed32 one-iteration cases across four instrumented native builds; this verifies
+the planned fixture, not its speed.
+
+Reproduce the basic pair with serial calls to
+`python3 tests/memory-research-list-bulk.py`, then `--candidate --compare-baseline`
+using the new baseline result. `--profile fixed --budget 1` selects the fixed pair;
+`--sanitize` selects native C instrumentation. Installed Darwin Clang/SDK and the
+repository helper are external prerequisites. Local successful binaries/dSYM were
+hashed before selective removal; retained JSON, patches and source snapshots are
+not deleted.
+
+## Separate production-configuration result
+
+[Testing-disabled configuration validation](runtime-list-bulk-production-validation.md) and [the separately acquired production CPU cohort](runtime-list-bulk-production-cpu.md) now pass their declared scoped gates. The new cohort retains 204 pilots and 192 pairs; it does not replace the preserved test-accounted cohort or establish a causal difference between them. The project soak had stopped; external load remained. Fixed empty and reference controls retain roughly1% adverse CPU ratios. Independent production evidence review and combined final-source gates have passed. The exact patch is applied under the joint release; final endurance and terminal acceptance remain pending.

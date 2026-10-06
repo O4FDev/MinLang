@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from regressions import CLANG, COMPILER, ROOT, RUNTIME, LINK_FLAGS
+from clang_helpers import clang_command
 
 MARKER = 'scalar proof attempt'
 
@@ -16,7 +17,7 @@ class ScalarLookaheadBudget(unittest.TestCase):
         cls.temporary = tempfile.TemporaryDirectory(prefix='minyar-lookahead-proof-')
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.directory = Path(cls.temporary.name)
-        source = (COMPILER.parent.parent / 'src/compiler.min').read_text()
+        source = (COMPILER.parent.parent / 'compiler/compiler.min').read_text()
         begin = source.index('function prepareScalarRecord(')
         end = source.index('\nfunction rootLocal(', begin)
         helper = source[begin:end]
@@ -30,8 +31,8 @@ class ScalarLookaheadBudget(unittest.TestCase):
         compile_result = subprocess.run([str(COMPILER), str(path), str(llvm)], capture_output=True, text=True, timeout=30)
         assert compile_result.returncode == 0, compile_result.stderr
         cls.compiler = cls.directory / 'instrumented'
-        link = subprocess.run([CLANG, '-O1', '-DMINYAR_COMPILER_ARENA', '-Wno-override-module',
-            str(llvm), str(ROOT / 'runtime/minyar_runtime.c'), '-o', str(cls.compiler)], capture_output=True, text=True, timeout=60)
+        link = subprocess.run(clang_command([CLANG, '-O1', '-DMINYAR_COMPILER_ARENA', '-Wno-override-module',
+            str(llvm), str(ROOT / 'runtime/minyar_runtime.c'), '-o', str(cls.compiler)]), capture_output=True, text=True, timeout=60)
         assert link.returncode == 0, link.stderr
 
     def program(self, fields=1, count=128, functions=1, promoted=0):
@@ -59,7 +60,7 @@ class ScalarLookaheadBudget(unittest.TestCase):
         self.assertEqual(result.stdout.splitlines(), [MARKER] * expected_attempts)
         for opt in ('-O0', '-O2'):
             exe = path.with_suffix('.' + opt[1:])
-            link = subprocess.run([CLANG, opt, *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], capture_output=True, text=True, timeout=30)
+            link = subprocess.run(clang_command([CLANG, opt, *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)]), capture_output=True, text=True, timeout=30)
             self.assertEqual(link.returncode, 0, link.stderr)
             run = subprocess.run([str(exe)], capture_output=True, text=True, timeout=10)
             self.assertEqual(run.returncode, 0, run.stderr)

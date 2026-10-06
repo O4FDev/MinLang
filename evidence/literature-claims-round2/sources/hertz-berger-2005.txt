@@ -1,0 +1,1000 @@
+                 Quantifying the Performance of
+        Garbage Collection vs. Explicit Memory Management
+
+                                                           ∗
+                                Matthew Hertz                                                        Emery D. Berger
+                          Computer Science Department                                           Dept. of Computer Science
+                               Canisius College                                             University of Massachusetts Amherst
+                              Buffalo, NY 14208                                                      Amherst, MA 01003
+                       matthew.hertz@canisius.edu                                                 emery@cs.umass.edu
+
+ABSTRACT                                                                             physical memory is scarce, paging causes garbage collection to run
+Garbage collection yields numerous software engineering benefits,                    an order of magnitude slower than explicit memory management.
+but its quantitative impact on performance remains elusive. One
+can compare the cost of conservative garbage collection to explicit                  Categories and Subject Descriptors
+memory management in C/C++ programs by linking in an appro-                          D.3.3 [Programming Languages]: Dynamic storage management;
+priate collector. This kind of direct comparison is not possible for                 D.3.4 [Processors]: Memory management (garbage collection)
+languages designed for garbage collection (e.g., Java), because pro-
+grams in these languages naturally do not contain calls to free.                     General Terms
+Thus, the actual gap between the time and space performance of                       Experimentation, Measurement, Performance
+explicit memory management and precise, copying garbage collec-
+tion remains unknown.                                                                Keywords
+   We introduce a novel experimental methodology that lets us quan-                  oracular memory management, garbage collection, explicit mem-
+tify the performance of precise garbage collection versus explicit                   ory management, performance analysis, throughput, paging
+memory management. Our system allows us to treat unaltered Java
+programs as if they used explicit memory management by relying                       1. Introduction
+on oracles to insert calls to free. These oracles are generated                      Garbage collection, or automatic memory management, provides
+from profile information gathered in earlier application runs. By                    significant software engineering benefits over explicit memory man-
+executing inside an architecturally-detailed simulator, this “oracu-                 agement. For example, garbage collection frees programmers from
+lar” memory manager eliminates the effects of consulting an oracle                   the burden of memory management, eliminates most memory leaks,
+while measuring the costs of calling malloc and free. We eval-                       and improves modularity, while preventing accidental memory over-
+uate two different oracles: a liveness-based oracle that aggressively                writes (“dangling pointers”) [50, 59]. Because of these advantages,
+frees objects immediately after their last use, and a reachability-                  garbage collection has been incorporated as a feature of a number
+based oracle that conservatively frees objects just after they are last              of mainstream programming languages.
+reachable. These oracles span the range of possible placement of                        Garbage collection can improve the productivity of program-
+explicit deallocation calls.                                                         mers [48], but its impact on performance is difficult to quantify.
+   We compare explicit memory management to both copying and                         Previous researchers have measured the runtime performance and
+non-copying garbage collectors across a range of benchmarks us-                      space impact of conservative, non-copying garbage collection in C
+ing the oracular memory manager, and present real (non-simulated)                    and C++ programs [19, 62]. For these programs, comparing the
+runs that lend further validity to our results. These results quantify               performance of explicit memory management to conservative gar-
+the time-space tradeoff of garbage collection: with five times as                    bage collection is a matter of linking in a library like the Boehm-
+much memory, an Appel-style generational collector with a non-                       Demers-Weiser collector [14]. Unfortunately, measuring the per-
+copying mature space matches the performance of reachability-                        formance trade-off in languages designed for garbage collection
+based explicit memory management. With only three times as much                      is not so straightforward. Because programs written in these lan-
+memory, the collector runs on average 17% slower than explicit                       guages do not explicitly deallocate objects, one cannot simply re-
+memory management. However, with only twice as much memory,                          place garbage collection with an explicit memory manager. Extra-
+garbage collection degrades performance by nearly 70%. When                          polating the results of studies with conservative collectors is impos-
+                                                                                     sible because precise, relocating garbage collectors (suitable only
+∗Work performed at the University of Massachusetts Amherst.                          for garbage-collected languages) consistently outperform conserv-
+                                                                                     ative, non-relocating garbage collectors [10, 12].
+                                                                                        It is possible to measure the costs of garbage collection activity
+                                                                                     (e.g., tracing and copying) [10, 20, 30, 36, 56] but it is impossi-
+Permission to make digital or hard copies of all or part of this work for            ble to subtract garbage collection’s effect on mutator performance.
+personal or classroom use is granted without fee provided that copies are            Garbage collection alters application behavior both by visiting and
+not made or distributed for profit or commercial advantage and that copies           reorganizing memory. It also degrades locality, especially when
+bear this notice and the full citation on the first page. To copy otherwise, to      physical memory is scarce [61]. Subtracting the costs of garbage
+republish, to post on servers or to redistribute to lists, requires prior specific   collection also ignores the improved locality that explicit memory
+permission and/or a fee.
+OOPSLA’05, October 16–20, 2005, San Diego, California, USA.                          managers can provide by immediately recycling just-freed mem-
+Copyright 2005 ACM 1-59593-031-0/05/0010 ..$5.00                                     ory [53, 55, 57, 58]. For all these reasons, the costs of precise,
+     (a) Step one: collection and derivation of death records.                 (b) Step two: execution with explicit memory management.
+
+                                         Figure 1: The oracular memory management framework.
+
+
+copying garbage collection versus explicit memory management               memory is scarce.
+have never been quantified.                                                   The remainder of this paper is organized as follows: Section 2
+                                                                           presents the oracular memory management framework in detail,
+Contributions                                                              and Section 3 discusses its implications and limitations. Sections 4
+In this paper, we conduct an empirical comparison of garbage col-          and 5 present experimental methodology and results comparing ex-
+lection to explicit memory management in Java. To enable this              plicit memory management to a range of different garbage collec-
+comparison, we develop an “oracular” memory manager. This mem-             tors. Section 6 addresses related work, Section 7 discusses future
+ory manager relies on an oracle that indicates when the system             directions, and Section 8 concludes.
+should deallocate objects (i.e., by calling free on them). During          2. Oracular Memory Management
+a profiling run, the system gathers object lifetimes and generates a
+                                                                           Figure 1 presents an overview of the oracular memory management
+program heap trace that is later processed to generate the oracles.
+                                                                           framework. As Figure 1(a) shows, it first executes the Java pro-
+We use two different oracles that span the range of possible explicit
+                                                                           gram to calculate object lifetimes and generate the program heap
+deallocation calls. The lifetime-based oracle is the most aggressive:
+                                                                           trace. The system processes the program heap trace uses the Mer-
+it uses object lifetimes to instruct the memory manager to free ob-
+                                                                           lin algorithm to compute object reachability times and generate
+jects after their last use — the earliest time they can safely be freed.
+                                                                           the reachability-based oracle. The lifetime-based oracle comes di-
+The reachability-based oracle is the most conservative: it reclaims
+                                                                           rectly from the lifetimes computed during the profiling run. Using
+objects at the last moment a program could call free (i.e., when
+                                                                           these oracles, the oracular memory manager executes the program
+they become unreachable). The reachability-based oracle relies on
+                                                                           as shown in Figure 1(b), allocating objects using calls to malloc
+precise object reachability information obtained by processing the
+                                                                           and invoking free on objects when directed by the oracle (see
+program heap traces with the Merlin algorithm [33, 34]. We discuss
+                                                                           Figure 2). Because trace generation takes place inside the simu-
+these two approaches in detail in Section 3.
+                                                                           lator and oracle generation happens off-line, the system measures
+   We find that an on-line version of the reachability-based oracle
+                                                                           only the costs of allocation and deallocation.
+interferes with mutator locality and increases runtime from 2%–
+                                                                              Below we describe these steps in detail and discuss our solutions
+33%. We eliminate this problem by executing the oracular memory
+                                                                           to the challenges of generating our oracles, detecting memory allo-
+manager inside an extended version of Dynamic SimpleScalar, an
+                                                                           cation operations, and inserting explicit deallocation calls without
+architecturally-detailed simulator [15, 39]. This approach allows
+                                                                           distorting program execution. We discuss the implications and lim-
+us to measure the cost of Java execution and memory management
+                                                                           itations of our approach in Section 3.
+operations while excluding disruptions caused by consulting the
+oracle. We believe this framework is of independent interest for           2.1 Step One: Data Collection and Processing
+studying memory management policies.                                       For its Java platform, the oracular memory manager uses an ex-
+   We use this framework to measure the impact of garbage collec-          tended version of Jikes RVM version 2.3.2 configured to produce
+tion versus explicit memory management on runtime performance,             PowerPC Linux code [2, 3]. Jikes is a widely-used research plat-
+space consumption, and page-level locality. We perform these mea-          form written almost entirely in Java. A key advantage of Jikes and
+surements across a range of benchmarks, garbage collectors (in-
+cluding copying and non-copying collectors), and explicit memory
+managers.                                                                                     can be explicitly freed
+
+   We find that GenMS, an Appel-style generational collector us-                                 freed by
+ing a mark-sweep mature space, provides runtime performance that               live              lifetime-based oracle                 dead
+matches that provided by the best explicit memory manager when                 reachable                     freed by         unreachable
+                                                                                            reachability-based oracle
+given five times as much memory, occasionally outperforming it by
+up to 9%. With three times as much memory, its performance lags                                                          can be collected
+so that it performs an average of 17% slower. Garbage collection
+performance degrades further at smaller heap sizes, ultimately run-        Figure 2: Object lifetime. The lifetime-based oracle frees ob-
+ning an average of 70% slower. Explicit memory management also             jects after their last use (the earliest safe point), while the
+exhibits better memory utilization and page-level locality, gener-         reachability-based oracle frees them after they become un-
+ally requiring half or fewer pages to run with the same number of          reachable (the last possible moment an explicit memory man-
+page faults and running orders-of-magnitude faster when physical           ager could free them).
+its accompanying Memory Management Toolkit (MMTk) is that it                A key difficulty is capturing all the information required by the
+allows us to use a number of garbage collection algorithms [11].         Merlin algorithm without affecting program execution. We need
+The oracular memory manager executes inside Dynamic Simple-              to execute the same code during step one (trace collection) as we
+Scalar (DSS) [39], an extension of the SimpleScalar superscalar          do during step two (simulation). Otherwise, memory allocation
+architectural simulator [15] that permits the use of dynamically-        and object lifetimes will be different, as the compiler will generate
+generated code.                                                          differently-sized chunks of code. However, there is a significant
+                                                                         amount of information that the Merlin algorithm requires, includ-
+Repeatable Runs                                                          ing all object allocations, intra-heap pointer updates, and program
+Because the oracular memory manager uses allocation order to             roots whenever an object could be freed. It is not possible to obtain
+identify objects, we must ensure that the sequence of allocations        this information from the normal optimized code.
+is identical from run to run. We take a number of steps in Jikes            Replacing normal opcodes with illegal ones is at the heart of
+RVM and the simulator to ensure repeatable runs. We use the              our approach for non-intrusively generating the needed heap traces.
+“fast” configuration of Jikes RVM, which optimizes as much of            The new opcodes uniquely identify key events such as when new
+the system as possible and compiles it into a prebuilt virtual ma-       objects are allocated. When the simulator encounters such an op-
+chine. Jikes RVM uses timer-based sampling at runtime to optimize        code, it outputs a record into the trace. It then executes the illegal
+methods once they reach a certain “hotness” level. To eliminate          opcode exactly like its legal variant.
+this considerable source of nondeterminism, we use a pseudoadap-            To enable the generation of these illegal opcodes, we extend
+tive methodology [38, 49], which optimizes only “hot” methods,           Jikes RVM’s compiler intermediate representations. Jikes RVM in-
+as determined from the mean of 5 runs. We also employ deter-             cludes nodes in its IRs to differentiate between method calls within
+ministic thread switching, which switches threads based upon the         the VM and calls to the host system, minimizing the modifications
+number of methods executed rather than at regular time intervals.        needed to support different OS calling conventions. We build upon
+Finally, we modify DSS to update the simulated OS time and reg-          these by adding a set of nodes to represent calls to malloc. This
+ister clocks deterministically. Rather than use cycle or instruction     extension allows the compiler to treat object allocations like any
+counts, which will change when we add calls to free, our modi-           other function call, while emitting an illegal opcode instead of the
+fications advance these clocks a fixed amount at each system call.       usual branch instruction. We also modify Jikes RVM to replace
+These changes ensure that all runs are perfectly repeatable.             intra-heap reference stores with illegal instructions. These opcodes
+Tracing for the Liveness-Based Oracle                                    allow us to detect events needed for heap tracing without inserting
+                                                                         code that would distort instruction cache behavior.
+During a profiling run, the simulator calculates object lifetimes and
+generates program heap traces for later use. The simulator obtains       2.2 Step Two: Simulating Explicit Memory Management
+per-object lifetime information by recording the location of every       Before each allocation, the simulator consults the oracle to deter-
+allocated object. At each memory access, the simulator then looks        mine if any objects should be freed. When freeing an object, it
+up the object being used and updates its latest lifetime (in alloca-     saves the function parameter (the size request for malloc) and
+tion time). Unfortunately, this does not capture every use of an         jumps to free instead, but sets the return address so that execution
+object. For example, testing for equality is a use of both argu-         returns to the malloc call rather than the following instruction.
+ment objects, but Java’s equality operation compares addresses and       The simulator repeats this cycle until there are no objects left to be
+does not examine memory locations. To capture these object uses,         reclaimed, and then allocation and program execution continues as
+we also mark all root-referenced objects as being in use. This ex-       normal. Both malloc and free are invoked via method calls.
+tended definition potentially overestimates object lifetimes slightly,   When these functions are implemented outside of the VM, they are
+but eliminates the risk of freeing an object too early.                  called using the Jikes foreign function interface (VM SysCall);
+   The system also preserves objects that we feel a programmer           we discuss the impact of this in Section 3.2.
+could not reasonably free. For instance, while our system can de-
+tect the last use of code and type information, these objects are not    2.3 Validation: Live Oracular Memory Management
+something that a developer would be able to deallocate in a real         In addition to the simulation-based framework described above,
+program. Similarly, our system will not free objects used to opti-       we implemented a “live” version of the oracular memory manager
+mize class loading. These optimizations include objects mapping          which uses the reachability-based oracle but actually runs on a real
+class member, string names, and type information in class files to       machine. Like the simulation-based oracular memory manager, the
+their Jikes internal representation. Other objects that a programmer     live oracle executes Java programs, but uses the actual instructions
+would not free and we therefore preserve enable lazy method com-         in place of the illegal ones. This live oracular memory manager
+pilation and reduce the time spent scanning jar files. At the end of     uses the object lifetime information and a buffer recording where
+the profiling run, the system preserves all of these objects and those   objects are allocated to fill a special “oracle buffer” containing the
+to which these objects refer by extending their lifetime to the end      addresses of the objects to be freed. To determine the program’s
+of the program.                                                          running time, we measure the total execution time and then sub-
+                                                                         tract the time spent checking if objects should be freed and time
+Tracing for the Reachability-Based Oracle                                spent refilling the buffer containing the addresses of the objects to
+To generate the reachability-based oracle, we compute object reach-      free.
+ability information efficiently and precisely using the Merlin algo-        To measure the distortion introduced by the oracle, we compare
+rithm [33, 34]. Our off-line implementation of the Merlin algo-          the cost of running garbage collection as usual to running with a
+rithm operates by analyzing a program heap trace. During this            null oracle. The null oracle loads the buffers in the same way as
+trace processing, the Merlin algorithm updates a timestamp asso-         the real oracular memory manager, but otherwise execution pro-
+ciated with an object whenever it might become unreachable, e.g.,        ceeds normally (it does not actually free any objects). We found
+when a pointer to it is overwritten. Once the entire trace has been      that the distortion introduced is unacceptably large and erratic. For
+processed, it generates “death records”, a list ordered by allocation    example, with the GenMS collector, the 228 jack benchmark with
+time that indicates which objects become unreachable at that time.       the null oracle reports a 12% to 33% increase in runtime versus
+running with no oracle. By contrast, the null oracle slows the same      3.2 malloc Overhead
+collector down by at most 3% when running the 213 javac bench-           When using allocators implemented in C, the oracular memory
+mark. Other collectors also show distortions from the null oracle,       manager invokes allocation and deallocation functions through the
+but without any obvious or predictable patterns. We attribute these      Jikes VM SysCall foreign function call interface. While not free,
+distortions to pollution of both the L1 and L2 caches induced by         these calls do not incur as much overhead as JNI invocations. Their
+processing the oracle buffers.                                           total cost is just 11 instructions: six loads and stores, three register-
+   While the live oracular memory manager is too noisy to be re-         to-register moves, one load-immediate, and one jump. This cost
+liable for precise measurements, its results lend credence to the        is similar to that of invoking memory operations in C and C++,
+simulation-based approach. As Figure 5 shows, the live version           where malloc and free are functions defined in an external li-
+closely mirrors the trends of the reachability oracle simulation re-     brary (e.g., libc.so).
+sults.                                                                      We also examine an allocator which implements malloc and
+3. Discussion                                                            free within the Jikes RVM. In this case, the oracular memory
+In the preceding sections, we have focused on the methodology we         manager uses the normal Jikes RVM method call interface rather
+employ, which strives to eliminate measurement noise and distor-         than the VM SysCall interface. Because we still need to deter-
+tion. Here we discuss some of the key assumptions of our approach        mine when an allocation occurs and, where appropriate, insert calls
+and address possible concerns. These include invoking free on            to free, we still cannot inline the allocation fast path. While this
+unreachable and dead objects, the cost of using foreign function         may prevent some potential optimizations, we are not aware of any
+calls for memory operations, the effect of multithreaded environ-        explicitly-managed programming language that implements mem-
+ments, unmeasured costs of explicit memory management, the role          ory operations without function call overhead.
+of custom memory allocators, and the effects of memory managers
+on program structure. While our methodology may appear to hurt           3.3 Multithreaded versus Single-threaded
+explicit memory management (i.e., making garbage collection look         In the experiments we present here, we assume a single-processor
+better), we argue that the differences are negligible.                   environment and disable atomic operations both for Jikes RVM and
+                                                                         for the Lea allocator. In a multithreaded environment, most thread-
+3.1 Reachability versus Liveness                                         safe memory allocators also require at least one atomic operation
+The oracular memory manager analyzes explicit memory manage-             for every call to malloc and free: a test-and-set operation for
+ment performance using two very different oracles. The liveness-         lock-based allocators, or a compare-and-swap operation for non-
+based oracle deallocates objects aggressively, invoking free at the      blocking allocators [46]. These atomic operations are very costly
+first possible opportunity it can safely do so. The reachability ora-    on some architectures. For example, on the Pentium 4, the cost
+cle instead frees objects at the last possible moment in the program     of the atomic CMPXCHG operation (compare-and-swap) is around
+execution, since calls to free require a reachable pointer as a pa-      124 cycles. Because garbage collection can amortize the cost of
+rameter.                                                                 atomic operations by performing batch allocations and dealloca-
+   As described in Section 2.1, the liveness-based oracle preserves      tions, Boehm observes that it can be much faster than explicit mem-
+some objects beyond their last use. The liveness-based oracle also       ory allocation [13].
+frees some objects that the reachability oracle does not. The num-          However, the issue of multithreaded versus single-threaded en-
+ber of objects involved is small: only pseudoJBB at 3.8% and             vironments is orthogonal to the comparison of garbage collectors
+ 201 compress at 4.4% free more than 0.8% more objects. The              and explicit memory managers, because explicit memory alloca-
+liveness-based oracle makes these additional calls to free only for      tors can also avoid atomic operations for most memory operations.
+objects that do not become unreachable but which plausibly could         In particular, a recent version of Hoard [6] (version 3.2) main-
+be deallocated by a knowledgeable programmer.                            tains thread-local freelists, and generally uses atomic operations
+   Real program behavior is likely to fall between these two ex-         only when flushing or refilling them. Use of these thread-local
+tremes. We would expect few programmers to reclaim objects im-           freelists is cheap, normally through a register reserved for access-
+mediately after their last use, and similarly, we would not expect       ing thread-local variables. On architectures lacking such support,
+them to wait until the very last point objects are reachable before      Hoard places the freelists at the start of each thread stack (aligned
+freeing them. These two oracles thus bracket the range of explicit       on 1MB boundaries), and accesses them by bitmasking a stack vari-
+memory management options.                                               able.
+   We show in Section 5.1 that the gap between these two oracles
+is small. Both oracles provide similar runtime performance, while        3.4 Smart Pointers
+the liveness oracle reduces heap footprints by at most 15% over          Explicit memory management can have other performance costs.
+the reachability oracle. These results generally coincide with pre-      For example, C++ programs might manage object ownership by
+vious studies of both C and Java programs. Hirzel et al. compare         using smart pointers. These templated classes transparently im-
+liveness to reachability on a benchmark suite including seven C ap-      plement reference counting, which would add expense to every
+plications [37]. For these, they find that when using an aggressive,     pointer update. For example, on the gc-bench benchmark, the per-
+interprocedural liveness analysis, they find a significant gap for two   formance of the Boost “intrusive pointer” that embeds reference-
+of their benchmarks, reducing average object lifetime by 11% for         counting within an existing class is up to twice as slow as the
+gzip (in allocation time) and 21% for yacr2); for the others, the        Boehm-Demers-Weiser collector. 1
+gap remains below 2%. In a study including five of the benchmarks           However, smart pointers do not appear to be in widespread use.
+we examine here, Shaham et al. measure the average impact of in-         We searched for programs using the standard auto ptr class or
+serting null assignments in Java code, simulating nearly-perfect         the Boost library’s shared ptr [16] on the open-source web site
+placement of explicit deallocation calls [51]. They report an av-        sourceforge.net and found only two large programs that use
+erage difference in space consumption of 15% over deallocating           them. We attribute this lack of use both to their cost, since C++
+objects when they become unreachable.
+                                                                         1 Richard Jones, personal communication.
+                        Benchmark statistics                                                        Garbage collectors
+   Benchmark             Total Alloc Max Reach            Alloc/Max           MarkSweep        non-relocating, non-copying single-generation
+    201 compress        125,334,848 13,682,720                  9.16          GenCopy             two generations with copying mature space
+    202 jess            313,221,144    8,695,360               36.02          SemiSpace                          two-space single-generation
+    205 raytrace        151,529,148 10,631,656                 14.25          GenMS           two generations with non-copying mature space
+    209 db               92,545,592 15,889,492                  5.82          CopyMS                      nursery with whole-heap collection
+    213 javac           261,659,784 16,085,920                 16.27                                    Allocators
+    228 jack            351,633,288    8,873,460               39.63          Lea               combined quicklists and approximate best-fit
+   ipsixql              214,494,468    8,996,136               23.84          MSExplicit           MMTk’s MarkSweep with explicit freeing
+   pseudoJBB            277,407,804 32,831,740                  8.45
+                                                                             Table 2: Memory managers examined in this paper. Section 4
+Table 1: Memory usage statistics for our benchmark suite. To-                presents a more detailed description of the allocators and col-
+tal allocation and maximum reachable are given in bytes. Al-                 lectors.
+loc/max denotes the ratio of total allocation to maximum reach-
+able, and is a measure of allocation-intensiveness.
+                                                                             fixed-workload variant of the SPECjbb benchmark [17]. pseudo-
+programmers tend to be particularly conscious of expensive opera-            JBB executes a fixed number of transactions (70,000), which sim-
+tions, and to their inflexibility. For example, the same smart pointer       plifies performance comparisons.
+class cannot be used to manage scalars and arrays, because C++ ar-              For each benchmark, we run each garbage collector with heap
+rays require a different syntax for deletion (delete []).                    sizes ranging from the smallest in which they complete to four
+   Instead, C and C++ programmers generally use one of the fol-              times larger. For our simulated runs, we use the memory and proces-
+lowing conventions: a function caller either allocates objects that it       sor configuration of a PowerPC G5 processor [1], and assume a 2
+then passes to its callee, or the callee allocates objects that it returns   GHz clock. We use a 4K page size, as in Linux and Windows.
+to its caller (as in strncpy). These conventions impose little to            Table 3 presents the exact architectural parameters.
+no performance overhead in optimized code.                                      Rather than relying on reported heap usage, we compare actual
+   Nonetheless, some patterns of memory usage are inherently dif-            heap footprints by examining each run’s maximum number of heap
+ficult to manage with malloc and free. For example, the al-                  pages in use. Pages are “in use” only if they have been allocated
+location patterns of parsers makes managing individual objects an            from the kernel and touched. We do not include unused pages,
+unacceptably-difficult burden. In these situations, C and C++ pro-           such as allocated but untouched pages or pages that have been un-
+grammers often resort to custom memory allocators.                           mapped, since they are not assigned physical memory. Counting
+                                                                             pages in use ensures the proper accounting of all memory usage,
+3.5 Custom Allocation                                                        including metadata space, which is occasionally underreported.
+Many explicitly-managed programs use custom allocators rather                   For the oracular memory management experiments, we use both
+than general-purpose allocators both to simplify and to accelerate           the Lea (GNU libc, “DLmalloc”) allocator [44] and a variant of the
+memory management. In particular, Berger et al. show that region-            MMTk MarkSweep collector. The Lea allocator is an approximate
+style allocation is both useful for a variety of workloads and can be        best-fit allocator that provides both high speed and low memory
+much faster than general-purpose allocation, but that they gener-            consumption. It forms the basis of the memory allocator included
+ally consume much more space than needed [8]. Exploring custom               in the GNU C library [28]. The version used here (2.7.2) is a hy-
+allocation policies like regions is beyond the scope of this paper.          brid allocator with different behavior based on object size, although
+                                                                             objects of different sizes may be adjacent in memory. Small ob-
+3.6 Program Structure                                                        jects (less than 64 bytes) are allocated using exact-size quicklists
+The programs we examine here were written for a garbage-collected            (one linked list of freed objects for each multiple of 8 bytes). The
+environment. Had they been written in a language with explicit               Lea allocator coalesces objects in these lists (combining adjacent
+memory management, they might have been written differently.                 free objects) in response to several conditions, such as requests for
+Unfortunately, we do not see any way to quantify this effect. It             medium-sized objects. Medium objects are managed with imme-
+would be possible (though onerous) to attempt to measure it by               diate coalescing and splitting of the memory on the quicklists and
+manually rewriting the benchmark applications to use explicit deal-          approximates best-fit. Large objects are allocated and freed us-
+location, but we would somehow have to factor out the impact of              ing mmap. The Lea allocator is the best overall allocator (in terms
+individual programmer style.                                                 of the combination of speed and memory usage) of which we are
+   Despite the apparent difference in program structure that one             aware [40].
+might expect, we observe that it is common for Java programs to                 While the Lea allocator is an excellent point of comparison, it
+assign null to objects that are no longer in use. In this sense,             differs significantly from the garbage collectors we examine here.
+programming in a garbage-collected environment is at least occa-             Perhaps most importantly, it is written in C and not Java. In order
+sionally analogous to explicit memory management. In particular,             to isolate the impact of explicit memory management, we added in-
+explicit nulling of pointers resembles the use of delete in C++,             dividual object freeing to MMTk’s MarkSweep collector and large
+which then can trigger a chain of class-specific object destructors.         object manager (“Treadmill”). Each block of memory maintains
+                                                                             its own stack of free slots and reuses the slot that has been most
+4. Experimental Methodology                                                  recently freed. This “allocator” is labelled as MSExplicit in the
+To quantify the performance of garbage collection versus explicit            graphs.
+memory management, we compare the performance of eight bench-                   Table 2 lists the garbage collectors we examine here, all of which
+marks across a variety of garbage collectors. Table 1 presents our           are high-throughput “stop-the-world” collectors. These include a
+benchmarks. We include most of the SPECjvm98 benchmarks [18].                non-copying collector (MarkSweep [45]), two pure copying collec-
+ipsixql is a persistent XML database system, and pseudoJBB is a              tors (SemiSpace [25], and GenCopy [5]) and two hybrid collectors
+                                                              Relative Simulated Cycles by Relative Heap Footprint             the reachability oracle. Points in the graph represent the heap foot-
+                                                4.5
+                                                                                                     Lea w/ Reachability       print (the x-axis) and runtime (y-axis) for the garbage collection
+                                                                                                        Lea w/ Liveness
+                                                                                                                GenMS          algorithm relative to the explicit memory manager. For readabil-
+
+
+
+
+  Geometric Mean of Relative Simulated Cycles
+                                                 4                                                            GenCopy
+                                                                                                               CopyMS
+                                                                                                             MarkSweep
+                                                                                                                               ity, we do not include individual graphs for two of the benchmarks,
+                                                3.5                                                          SemiSpace          201 compress and 205 raytrace. Table 4 summarizes the re-
+                                                                                                                               sults for the relative performance of GenMS, the best-performing
+                                                 3                                                                             garbage collector.
+                                                                                                                                  These graphs compactly summarize these results and present the
+                                                2.5
+                                                                                                                               time-space tradeoff involved in using garbage collection. Because
+                                                 2
+                                                                                                                               we present pages actually touched rather than the requested heap
+                                                                                                                               size, they occasionally exhibit a “zig-zag” effect that can be sur-
+                                                1.5                                                                            prising. As heap size increases, the number of heap pages normally
+                                                                                                                               also increases, but an increase in heap size can sometimes reduce
+                                                 1                                                                             the number of heap pages visited. For example, because of frag-
+                                                      1   2          3           4           5            6          7     8
+                                                                  Geometric Mean of Relative Heap Footprint
+                                                                                                                               mentation or alignment restrictions, a larger heap size may cause
+                                                                                                                               objects to straddle two pages. This effect tends to be most pro-
+Figure 3: Geometric mean of garbage collector performance                                                                      nounced for MarkSweep, which cannot reduce fragmentation by
+relative to the Lea allocator using the reachability oracle.                                                                   compacting the heap.
+                                                                                                                                  As the graphs show, the garbage collectors exhibit similar trends.
+                                                                                                                               Initially, in small heaps, the cost of frequent garbage collection
+(GenMS and CopyMS). The generational collectors (the collector                                                                 dominates runtime. As heap sizes grow, the number of full-heap
+names starting with “Gen”) use an Appel-style variable-sized nurs-                                                             garbage collections correspondingly decreases. Eventually, total
+ery [5]: the nursery shrinks as survivors fill the heap. We use the                                                            execution time asymptotically approaches a fixed value. For GenMS,
+versions of these collectors included with the MMTk memory man-                                                                this value is somewhat lower than the cost of explicit memory man-
+agement toolkit; the descriptions below are adapted from Black-                                                                agement. At its largest heap size, GenMS equals the performance
+burn et al. [11].                                                                                                              of the Lea allocator. Its best relative performance on each bench-
+                                                                                                                               mark ranges from 10% faster for ipsixql to 26% slower for 209 db,
+MarkSweep: MarkSweep organizes the heap into blocks divided                                                                    a benchmark that is unusually sensitive to locality effects.
+    into fixed-size chunks, which it manages with freelists. Mark-                                                                The performance gap between the collectors is lowest for bench-
+    Sweep traces and marks the reachable objects, and lazily                                                                   marks with low allocation intensity (the ratio of total bytes allo-
+    finds free slots during allocation.                                                                                        cated over maximum reachable bytes). For these benchmarks, Mark-
+                                                                                                                               Sweep tends to provide the best performance, especially at smaller
+SemiSpace: SemiSpace uses bump pointer allocation and has two                                                                  heap multiples. Unlike the other collectors, MarkSweep does not
+     copy spaces. It allocates into one, and when this space fills,                                                            need a copy reserve, and so makes more effective use of the heap.
+     it copies reachable objects into the other space and swaps                                                                As allocation intensity grows, the generational garbage collectors
+     them.                                                                                                                     generally exhibit better performance, although MarkSweep pro-
+                                                                                                                               vides the best performance for ipsixql until the heap size multi-
+GenCopy: GenCopy uses bump pointer allocation. It is a clas-
+                                                                                                                               ple becomes quite large (over 6x). The two generational collec-
+    sic Appel-style generational collector [5]. It allocates into a
+                                                                                                                               tors (GenMS and GenCopy) exhibit similar performance trends, al-
+    young (nursery) copy space and promotes survivors into an
+                                                                                                                               though GenMS is normally faster. GenMS’s MarkSweep mature
+    old SemiSpace. Its write barrier records pointers from old
+                                                                                                                               space also makes it more space-efficient than GenCopy’s mature
+    to nursery objects. GenCopy collects when the nursery is
+                                                                                                                               space, which is managed by SemiSpace.
+    full, and reduces the nursery size by the size of the survivors.
+                                                                                                                                  The shape of the garbage collection curves confirms analytical
+    When the old space is full, it collects the entire heap.
+                                                                                                                               models that predict the performance of garbage collection to be in-
+GenMS: This hybrid generational collector is like GenCopy ex-                                                                  versely proportional to heap size [4; 41, p.35]. Note that the cost of
+    cept that it uses a MarkSweep old space.                                                                                   explicit memory management does not depend on heap size, and
+                                                                                                                               is linear in the number of objects allocated. While this inverse
+CopyMS: CopyMS is a non-generational collector (i.e., without                                                                  proportionality relationship holds for MarkSweep and SemiSpace,
+    write barriers) that uses bump pointer allocation to allocate                                                              we find that, on average, GenMS runs in time inversely propor-
+    into a copy space. When this space fills, CopyMS performs a                                                                tional to the square of the heap size. In particular, the function
+    whole-heap collection and copies survivors to a MarkSweep                                                                  execution time factor = a/(b − heap size factor2 ) + c characterizes
+    old space.                                                                                                                 the trend for GenMS, where the execution time factor is perfor-
+                                                                                                                               mance dilation with respect to Lea, and heap size factor is the
+5. Experimental Results                                                                                                        multiple of the minimum required heap size. With the parameters
+In this section, we explore the impact of garbage collection and ex-                                                           a = −0.246, b = 0.59, and c = 0.942, the curve is an excellent fit.
+plicit memory management on total execution time, memory con-                                                                  Visually, the curves are indistinguishable, and the rms (root mean
+sumption, and page-level locality.                                                                                             square) error of the fit is just 0.0024, where 0 is a perfect fit. We
+5.1 Runtime and Memory Consumption                                                                                             find a similar result for GenCopy, whose rms error is just 0.0067
+                                                                                                                               (a = −0.297, b = 0.784, c = 1.031). As far as we know, such
+Figure 3 presents the geometric mean of garbage collection perfor-
+                                                                                                                               inverse quadratic behavior has not previously been noted. We do
+mance relative to the Lea allocator using the reachability oracle.
+                                                                                                                               not yet have an explanatory model, but conjecture that this behav-
+We present runtime versus space results for individual benchmarks
+                                                                                                                               ior arises because the survival rate from nursery collections is also
+across all garbage collectors in Figure 4 . Each graph within this
+                                                                                                                               inversely proportional to heap size.
+figure compares the garbage collectors and the Lea allocator using
+                                                      Simulated Cycles for SPEC DB                                                                                  Simulated Cycles for pseudoJBB
+                                       4.5                                                                                                           4.5
+                                                                                    Lea w/ Reachability                                                                                              Lea w/ Reachability
+                                                                                       Lea w/ Liveness                                                                                                  Lea w/ Liveness
+                                                                                               GenMS                                                                                                            GenMS
+                                        4                                                    GenCopy                                                  4                                                       GenCopy
+                                                                                              CopyMS                                                                                                           CopyMS
+
+
+
+
+ Relative Number of Simulated Cycles                                                                           Relative Number of Simulated Cycles
+                                                                                           MarkSweep                                                                                                        MarkSweep
+                                       3.5                                                 SemiSpace                                                 3.5                                                    SemiSpace
+
+
+                                        3                                                                                                             3
+
+
+                                       2.5                                                                                                           2.5
+
+
+                                        2                                                                                                             2
+
+
+                                       1.5                                                                                                           1.5
+
+
+                                        1                                                                                                             1
+
+                                             2   4               6             8                10        12                                               2   4               6             8                   10        12
+                                                        Relative Memory Footprint                                                                                     Relative Memory Footprint
+
+                                                     (a) 209 db (5.82)                                                                                         (b) pseudoJBB (8.45)
+
+                                                     Simulated Cycles for SPEC Javac                                                                                  Simulated Cycles for Ipsixql
+                                       4.5                                                                                                           4.5
+                                                                                    Lea w/ Reachability                                                                                              Lea w/ Reachability
+                                                                                       Lea w/ Liveness                                                                                                  Lea w/ Liveness
+                                                                                               GenMS                                                                                                            GenMS
+                                        4                                                    GenCopy                                                  4                                                       GenCopy
+                                                                                              CopyMS                                                                                                           CopyMS
+
+
+
+
+ Relative Number of Simulated Cycles                                                                           Relative Number of Simulated Cycles
+                                                                                           MarkSweep                                                                                                        MarkSweep
+                                       3.5                                                 SemiSpace                                                 3.5                                                    SemiSpace
+
+
+                                        3                                                                                                             3
+
+
+                                       2.5                                                                                                           2.5
+
+
+                                        2                                                                                                             2
+
+
+                                       1.5                                                                                                           1.5
+
+
+                                        1                                                                                                             1
+
+                                             2   4               6             8                10        12                                               2   4               6             8                   10        12
+                                                        Relative Memory Footprint                                                                                     Relative Memory Footprint
+
+                                                 (c) 213 javac (16.27)                                                                                             (d) ipsixql (23.84)
+
+                                                     Simulated Cycles for SPEC JESS                                                                                 Simulated Cycles for SPEC Jack
+                                       4.5                                                                                                           4.5
+                                                                                    Lea w/ Reachability                                                                                              Lea w/ Reachability
+                                                                                       Lea w/ Liveness                                                                                                  Lea w/ Liveness
+                                                                                               GenMS                                                                                                            GenMS
+                                        4                                                    GenCopy                                                  4                                                       GenCopy
+                                                                                              CopyMS                                                                                                           CopyMS
+
+
+
+
+ Relative Number of Simulated Cycles                                                                           Relative Number of Simulated Cycles
+                                                                                           MarkSweep                                                                                                        MarkSweep
+                                       3.5                                                 SemiSpace                                                 3.5                                                    SemiSpace
+
+
+                                        3                                                                                                             3
+
+
+                                       2.5                                                                                                           2.5
+
+
+                                        2                                                                                                             2
+
+
+                                       1.5                                                                                                           1.5
+
+
+                                        1                                                                                                             1
+
+                                             2   4               6             8                10        12                                               2   4               6             8                   10        12
+                                                        Relative Memory Footprint                                                                                     Relative Memory Footprint
+
+                                                 (e) 202 jess (36.02)                                                                                          (f) 228 jack (39.63)
+
+Figure 4: Runtime of garbage collectors versus the Lea allocator using the reachability oracle. The x-axis gives the maximum
+number of heap pages visited – the “zigzag” effect is primarily caused by fragmentation (see Section 5.1). The graphs are presented
+in increasing allocation intensity (alloc/max, given in parentheses); lower graphs are more allocation-intensive.
+                                   Simulated PowerPC G5 system                 Actual PowerPC G4 system
+                   L1, I-cache     64K, direct-mapped, 3 cycle latency         32K, 8-way associative, 3 cycle latency
+                   L1, D-cache     32K, 2-way associative, 3 cycle latency     32K, 8-way associative, 3 cycle latency
+                   L2 (unified)    512K, 8-way associative, 11 cycle latency   256K, 8-way associative, 8 cycle latency
+                   L3 (off-chip)   N/A                                         2048K, 8-way associative, 15 cycle latency
+                                   all caches have 128 byte lines              all caches have 32 byte lines
+                   RAM             270 cycles (135ns)                          95 cycles (95ns)
+
+Table 3: The memory timing parameters for the simulation-based and “live” experimental frameworks (see Section 2.3). The simu-
+lator is based upon a 2GHz PowerPC G5 microprocessor, while the actual system uses a 1GHz PowerPC G4 microprocessor.
+
+
+                                    GenMS                                   With the exception of 209 db, the two allocators are roughly
+                 vs. Lea w/ Reachability  vs. Lea w/ Liveness            comparable in performance, confirming the good performance char-
+ Heap size       Footprint    Runtime    Footprint Runtime               acteristics both of the generated Java code and of the MMTk in-
+   1.00            210%         169%       253%        167%              frastructure. Figure 4(f) is especially revealing: in this case, the
+   1.25            252%         130%       304%        128%              runtime performance of MSExplicit is just 3% greater than that of
+   1.50            288%         117%       347%        115%              Lea, but MarkSweep, using the same allocation infrastructure, runs
+   1.75            347%         110%       417%        109%              from over 300% to 50% slower. These experiments demonstrate
+   2.00            361%         108%       435%        106%              that the performance differences between explicit memory man-
+   2.25            406%         106%       488%        104%              agement and garbage collection are due to garbage collection itself
+   2.50            419%         104%       505%        102%              and not to underlying differences in allocator infrastructure.
+   2.75            461%         103%       554%        102%
+   3.00            476%         102%       573%        100%              Comparing Simulation to the Live Oracle
+   3.25            498%         101%       600%        100%              We also compare the runtime performance of the various garbage
+   3.50            509%         100%       612%         99%              collectors with the live oracle described in Section 2.3. For these
+   3.75            537%         101%       646%        100%              experiments, we use a PowerPC G4 with 512MB of RAM running
+   4.00            555%         100%       668%         99%              Linux in single-user mode and report the mean value of 5 runs. The
+                                                                         architectural details of our experimental machine can be found in
+Table 4: Geometric mean of memory footprints and runtimes                Table 3.
+for GenMS versus Lea. The heap sizes are multiples of the min-              A comparison of the results of our live oracle experiments and
+imum amount required to run with GenMS.                                  simulations appears in Figure 5. These graphs compare the geomet-
+                                                                         ric means of executing all but three of the benchmarks. Because of
+                                MSExplicit vs. GenMS                     the memory demands of the heap trace generation process and dif-
+                        w/ Reachability          w/ Liveness             ficulties in duplicating time-based operating system calls, we are
+ Benchmark           Footprint Runtime Footprint Runtime                 currently unable to run pseudoJBB, ipsixql, and 205 raytrace
+  201 compress         162%       106%         251%       101%           with the live oracle.
+  202 jess             154%       104%         165%       103%              Despite their different environments, the live and simulated orac-
+  205 raytrace         131%       102%         147%       100%           ular memory managers achieve strikingly similar results. Differ-
+  209 db               112%       118%         118%        96%           ences between the graphs could be accounted for by the G4’s L3
+  213 javac            133%        95%         124%        93%           cache and smaller main memory latency compared to our simula-
+  228 jack             158%       103%         168%       105%           tor. While the null oracle adds too much noise to our data to justify
+ ipsixql               149%       100%         163%        97%           its use over the simulator, the similarity of the results is strong evi-
+ pseudoJBB             112%       106%         116%        87%           dence for the validity of the simulation runs.
+ Geo. Mean             138%       104%         152%        98%
+                                                                         Comparing the Liveness and Reachability Oracles
+Table 5: Memory footprints and runtimes for MSExplicit ver-              We compare the effect of using the liveness and reachability-based
+sus Lea. In this table, we present results comparing results             oracles in Figure 6. This graph presents the average relative ex-
+when run with similar oracles.                                           ecution time and space consumption of allocators using both the
+                                                                         liveness and reachability-based oracles. As usual, all values are
+                                                                         normalized to the Lea allocator with the reachability-based ora-
+   Finally, Table 5 compares the footprints and runtimes of MSEx-        cle. The x-axis shows relative execution time; note the compressed
+plicit (explicit memory management based on the MMTk Mark-               scale, ranging from just 0.98 to 1.04. The y-axis shows the relative
+Sweep implementation) and the Lea allocator when both use the            heap footprint, and here the scale ranges from 0.8 to 1.7. The sum-
+same oracle. MSExplicit is substantially less memory-efficient than      mary and individual runtime graphs (Figures 3 and 4) also include
+Lea, requiring between 38% and 52% more space. However, the              a datapoint for the Lea allocator with the liveness oracle.
+results for runtime performance are similar. With the reachability          We find that the choice of oracle has little impact either on ex-
+oracle, MSExplicit runs an average of 4% slower than Lea; with the       ecution time. We expected the liveness-based oracle to improve
+liveness-based oracle, it runs 2% faster. The worst-case for MSEx-       performance by enhancing cache locality, since it recycles objects
+plicit is for the locality-sensitive 209 db, where its segregated size   as soon as possible. However, this recycling has at best a mixed ef-
+classes cause it to run 18% slower when using the reachability or-       fect on runtime, degrading performance by 1% for the Lea allocator
+acle. On the other hand, it runs 5% faster than Lea for 213 javac        while improving it by up to 5% for MSExplicit.
+with the reachability oracle, because this benchmark stresses raw           When the liveness-based oracle does improve runtime perfor-
+allocation speed.                                                        mance, it does so by reducing the number of L1 data cache misses.
+                                                                                       Geometric Mean of Relative Execution Time                                                                          Geometric Mean of Relative Simulated Cycles
+                                                        4.5                                                                                                                               4.5
+                                                                                                                               Lea w/Reachability                                                                                            Lea w/Reachability
+                                                                                                                                         GenMS                                                                                                         GenMS
+                                                                                                                                       GenCopy                                                                                                       GenCopy
+                                                         4                                                                              CopyMS                                             4                                                          CopyMS
+                                                                                                                                     MarkSweep                                                                                                     MarkSweep
+                                                                                                                                     SemiSpace                                                                                                     SemiSpace
+                                                        3.5                                                                                                                               3.5
+
+
+
+
+ Relative Execution Time                                                                                                                                      Relative Simulated Cycles
+                                                         3                                                                                                                                 3
+
+
+                                                        2.5                                                                                                                               2.5
+
+
+                                                         2                                                                                                                                 2
+
+
+                                                        1.5                                                                                                                               1.5
+
+
+                                                         1                                                                                                                                 1
+                                                              1             2            3          4            5          6                   7         8                                     1   2        3          4            5          6           7     8
+                                                                                       Geometric Mean of Relative Heap Footprint                                                                           Geometric Mean of Relative Heap Footprint
+
+                                                                                       (a) Live oracular results                                                                                        (b) Simulated oracular results
+
+Figure 5: Comparison of the “live” to the simulated oracular memory manager: geometric mean of execution time relative to Lea
+across identical sets of benchmarks.
+
+
+                                                                        Geometric Mean of Simulated Cycles by Relative Number of Heap Pages                                          improve its heap footprint, all other benchmarks see their space
+                                                                                                                                                                                     consumption reduced by at least 10%.
+                                                        1.04
+
+
+
+
+          Geometric Mean of Relative Simulated Cycles
+                                                                                                                                                                                     5.2 Page-level locality
+                                                                                                                                                                                     For virtual memory systems, page-level locality can be more im-
+                                                        1.02
+                                                                                                                                                                                     portant for performance than total memory consumption. We present
+                                                                                                                                                                                     the results of our page-level locality experiments in the form of
+                                                              1                                                                                                                      augmented miss curves [52, 61]. Assuming that the virtual mem-
+                                                                                                                                                                                     ory manager observes an LRU discipline, these graphs show the
+                                                                                                                                                                                     time taken (y-axis) for different number of pages allocated to the
+                                                        0.98
+                                                                                                                                                                                     process (the x-axis). Note that the y-axis is log-scale. We assume a
+                                                                                                                                                                                     fixed 5 millisecond page fault service time.
+                                                                                                                         Lea w/Reachability
+                                                        0.96                                                                 Lea w/Liveness
+                                                                                                                    MSExplicit w/Reachability
+                                                                                                                                                                                        Figure 7 presents the total execution times for the Lea alloca-
+                                                                                                                      MSExplicit w/Liveness                                          tor, MSExplicit, and each garbage collector across all benchmarks.
+                                                                  0.8    0.9       1        1.1      1.2      1.3        1.4       1.5      1.6     1.7
+                                                                                                                                                                                     For each garbage collector, the fastest-performing heap size was
+                                                                                       Geometric Mean of Relative Heap Footprint
+                                                                                                                                                                                     selected.
+                                                                                                                                                                                        These graphs show that, for reasonable ranges of available mem-
+Figure 6: Geometric mean of explicit memory managers rela-
+                                                                                                                                                                                     ory (but not enough to hold the entire application), both explicit
+tive to the Lea allocator using the reachability oracle. While
+                                                                                                                                                                                     memory managers substantially outperform all of the garbage col-
+using the liveness oracle reduces the mean heap footprint sub-
+                                                                                                                                                                                     lectors. For instance, pseudoJBB running with 63MB of available
+stantially, the choice of oracle has little effect on mean execution
+                                                                                                                                                                                     memory and the Lea allocator completes in 25 seconds. With the
+time.
+                                                                                                                                                                                     same amount of available memory and using GenMS, it takes more
+                                                                                                                                                                                     than ten times longer to complete (255 seconds). We see similar
+                                                                                                                                                                                     trends across the benchmark suite. The most pronounced case is
+Figure 4(d) shows that ipsixql with the liveness-based oracle exe-                                                                                                                    213 javac: at 36MB with the Lea allocator, total execution time
+cutes 18% faster than with the reachability oracle. This improve-                                                                                                                    is 14 seconds, while with GenMS, total execution time is 211 sec-
+ment is due to a halving of the L1 data cache miss rate. On the other                                                                                                                onds, over a 15-fold increase.
+hand, the liveness-based oracle significantly degrades cache local-                                                                                                                     The culprit here is garbage collection activity, which visits far
+ity in two other benchmarks, 209 db and pseudoJBB, causing                                                                                                                           more pages than the application itself [61]. As allocation intensity
+them to execute 23% and 13% slower, respectively. While 209 db                                                                                                                       increases, the number of major garbage collections also increases.
+is notoriously susceptible to cache effects, the pseudoJBB result                                                                                                                    Since each garbage collection is likely to visit pages that have been
+is surprising. In this case, using the lifetime-based oracle results in                                                                                                              evicted, the performance gap between the garbage collectors and
+poor object placement, increasing the L2 cache miss rate by nearly                                                                                                                   explicit memory managers grows as the number of major collec-
+50%. However, these benchmarks are outliers. Figure 3 shows                                                                                                                          tions increases.
+that, on average, the Lea allocator with the liveness-based oracle
+runs only 1% slower than with the reachability oracle.                                                                                                                               6. Related Work
+   The liveness-based oracle has a more pronounced impact on space                                                                                                                   Previous comparisons of garbage collection to explicit memory man-
+consumption, reducing heap footprints by up to 15%. Using the                                                                                                                        agement have generally taken place in the context of conservative,
+liveness-based oracle reduces Lea’s average heap footprint by 17%                                                                                                                    non-relocating garbage collectors and C and C++. In his thesis,
+and MSExplicit’s by 12%. While 201 compress’s reliance on                                                                                                                            Detlefs compares the performance of garbage collection to explicit
+several large objects limits how much the liveness-based oracle can                                                                                                                  memory management for three C++ programs [19, p.47]. He finds
+                                                                 Estimated Time by Available Memory for DB                                                                              Estimated Time by Available Memory for pseudoJBB
+                                          1e+06                                                                                                                       1e+06
+                                                                                                 Lea w/Reachability                                                                                                          Lea w/Reachability
+                                                                                                     Lea w/Liveness                                                                                                              Lea w/Liveness
+                                                                                            MSExplicit w/Reachability                                                                                                   MSExplicit w/Reachability
+                                                                                              MSExplicit w/Liveness                                                                                                       MSExplicit w/Liveness
+
+
+
+
+ Estimated Time Needed in Seconds (log)                                                                                      Estimated Time Needed in Seconds (log)
+                                          100000                                                             GenMS                                                    100000                                                             GenMS
+                                                                                                           GenCopy                                                                                                                     GenCopy
+                                                                                                            CopyMS                                                                                                                      CopyMS
+                                                                                                         SemiSpace                                                                                                                   SemiSpace
+                                          10000                                                          MarkSweep                                                    10000                                                          MarkSweep
+
+
+
+                                           1000                                                                                                                        1000
+
+
+
+                                            100                                                                                                                         100
+
+
+
+                                             10                                                                                                                          10
+
+
+
+                                              1                                                                                                                           1
+                                                   0   10   20        30     40       50      60      70       80       90                                                     0   10   20        30      40       50      60     70       80       90
+                                                                           Available Memory (MB)                                                                                                        Available Memory (MB)
+
+                                                                        (a) 209 db                                                                                                               (b) pseudoJBB
+
+                                                             Estimated Time by Available Memory for Javac                                                                                 Estimated Time by Available Memory for Ipsixql
+                                          1e+06                                                                                                                       1e+06
+                                                                                                 Lea w/Reachability                                                                                                          Lea w/Reachability
+                                                                                                     Lea w/Liveness                                                                                                              Lea w/Liveness
+                                                                                            MSExplicit w/Reachability                                                                                                   MSExplicit w/Reachability
+                                                                                              MSExplicit w/Liveness                                                                                                       MSExplicit w/Liveness
+
+
+
+
+ Estimated Time Needed in Seconds (log)                                                                                      Estimated Time Needed in Seconds (log)
+                                          100000                                                             GenMS                                                    100000                                                             GenMS
+                                                                                                           GenCopy                                                                                                                     GenCopy
+                                                                                                            CopyMS                                                                                                                      CopyMS
+                                                                                                         SemiSpace                                                                                                                   SemiSpace
+                                          10000                                                          MarkSweep                                                    10000                                                          MarkSweep
+
+
+
+                                           1000                                                                                                                        1000
+
+
+
+                                            100                                                                                                                         100
+
+
+
+                                             10                                                                                                                          10
+
+
+
+                                              1                                                                                                                           1
+                                                   0   10   20        30     40       50      60      70       80       90                                                     0   10   20        30      40       50      60     70       80       90
+                                                                           Available Memory (MB)                                                                                                        Available Memory (MB)
+
+                                                                      (c) 213 javac                                                                                                                    (d) ipsixql
+
+                                                                 Estimated Time by Available Memory for Jess                                                                                 Estimated Time by Available Memory for Jack
+                                          1e+06                                                                                                                       1e+06
+                                                                                                 Lea w/Reachability                                                                                                          Lea w/Reachability
+                                                                                                     Lea w/Liveness                                                                                                              Lea w/Liveness
+                                                                                            MSExplicit w/Reachability                                                                                                   MSExplicit w/Reachability
+                                                                                              MSExplicit w/Liveness                                                                                                       MSExplicit w/Liveness
+
+
+
+
+ Estimated Time Needed in Seconds (log)                                                                                      Estimated Time Needed in Seconds (log)
+                                          100000                                                             GenMS                                                    100000                                                             GenMS
+                                                                                                           GenCopy                                                                                                                     GenCopy
+                                                                                                            CopyMS                                                                                                                      CopyMS
+                                                                                                         SemiSpace                                                                                                                   SemiSpace
+                                          10000                                                          MarkSweep                                                    10000                                                          MarkSweep
+
+
+
+                                           1000                                                                                                                        1000
+
+
+
+                                            100                                                                                                                         100
+
+
+
+                                             10                                                                                                                          10
+
+
+
+                                              1                                                                                                                           1
+                                                   0   10   20        30      40      50      60      70       80       90                                                     0   10   20        30      40      50      60      70       80       90
+                                                                           Available Memory (MB)                                                                                                        Available Memory (MB)
+
+                                                                      (e) 202 jess                                                                                                                 (f) 228 jack
+
+Figure 7: Estimated time for six of the benchmarks, including page fault service time (note that the y-axis is log-scale). The graphs
+are presented in increasing allocation intensity.
+that garbage collection generally resulted in poorer performance         7. Future Work
+(from 2% to 28% overhead), but also that the garbage-collected           This paper addresses only individual object management, where all
+version of cfront performs 10% faster than a version modified to         objects are allocated with malloc and freed with free. How-
+use general-purpose memory allocation exclusively. However, the          ever, custom allocation schemes like regions can dramatically im-
+garbage-collected version still runs 16% slower than the original        prove the performance of applications using explicit memory man-
+version of cfront using its custom memory allocators. Zorn com-          agement [9, 31]. Regions are also increasingly popular as an al-
+pares conservative garbage collection to explicit memory manage-         ternative or complement to garbage collection [26, 27, 29, 54]. In
+ment in the context of C programs [62]. He finds that the Boehm-         future work, we plan to use our framework to examine the impact
+Demers-Weiser collector [14] is occasionally faster than explicit        of the use of regions and a hybrid allocator, reaps [9], as compared
+memory allocation, but that the memory consumed by the BDW               to garbage collection.
+collector is almost always higher than that consumed by explicit            The Lea allocator we use here places 8-byte object headers prior
+memory managers, ranging from 21% less to 228% more. Hicks et            to each allocated object. These headers can increase space con-
+al. also find that programs written in Cyclone (a type-safe variant of   sumption and impair cache-level locality [24]. We plan to evalu-
+C) and linked with the BDW collector can require much more mem-          ate memory allocators like PHKmalloc [42] and Vam [24] that use
+ory than those using pure explicit memory management [35]. They          BiBoP-style (big bag of pages) allocation and so avoid per-object
+also find that conservative garbage collection provides throughput       headers. We intend to compare the virtual memory performance
+equal to explicit memory management for most of their bench-             of explicit memory management with the bookmarking collector,
+marks, but that one benchmark showed a significant performance           which is specifically designed to avoid paging [32].
+improvement with explicit memory management. While these stud-              Finally, this paper examines only stop-the-world, non-incremental,
+ies examine conservative garbage collectors running within C and         non-concurrent garbage collectors. While these generally provide
+C++ programs, we focus on the performance of code written from           the highest throughput, they also exhibit the largest pause times.
+the outset to use garbage collection.                                    We would like to explore the effect on pause times of various gar-
+   Perhaps the closest work to that presented here is by Blackburn       bage collectors relative to explicit memory managers, which also
+et al., who measure a similar range of garbage collectors and bench-     exhibit pauses. For example, the Lea allocator normally allocates
+marks in the Jikes RVM and the Memory Management Toolkit                 objects in a few cycles, but occasionally empties and coalesces its
+(MMTk) [10]. They conclude that generational garbage collection          quicklists. It also does a linear best-fit search for large objects. 2
+achieves locality benefits that make it faster than freelist-style al-   To our knowledge, pauses caused by explicit memory manage-
+location. To approximate explicit memory management, they mea-           ment have never been measured or compared to garbage collection
+sure the mutator time of execution with the MMTk mark-sweep              pauses.
+garbage collector, and show that this exceeds the total execution
+time with generational collectors. This approach does not account        8. Conclusion
+for either cache pollution caused by garbage collection or the ben-      This paper presents a tracing and simulation-based experimental
+eficial locality effects that explicit memory managers achieve by        methodology that executes unaltered Java programs as if they used
+promptly recycling allocated objects. In addition, the MMTk mark-        explicit memory management. We use this framework to compare
+sweep collector segregates objects by size and thus disrupts alloca-     the time-space performance of a range of garbage collectors to ex-
+tion order. The Lea allocator we use here maintains segregated free      plicit memory management with the Lea memory allocator. Com-
+lists but allows objects of different sizes to be adjacent in memory.    paring runtime, space consumption, and virtual memory footprints
+Preserving allocation order is especially important for Java, since it   over a range of benchmarks, we show that the runtime performance
+approximates the locality effects of object inlining [21, 22, 23].       of the best-performing garbage collector is competitive with ex-
+   Numerous studies have sought to quantify the overhead of gar-         plicit memory management when given enough memory. In par-
+bage collection and explicit memory management on application            ticular, when garbage collection has five times as much memory
+performance [7, 9, 40, 43, 62]. Steele observes garbage collec-          as required, its runtime performance matches or slightly exceeds
+tion overheads in LISP accounting for around 30% of application          that of explicit memory management. However, garbage collec-
+runtime [30]. Ungar measures the cost of generational scavenging         tion’s performance degrades substantially when it must use smaller
+in Berkeley Smalltalk, and finds that it accounts for just 2.5% of       heaps. With three times as much memory, it runs 17% slower on
+CPU time [56]. However, this measurement excludes the impact             average, and with twice as much memory, it runs 70% slower. Gar-
+of garbage collection on the memory system. Using trace-driven           bage collection also is more susceptible to paging when physical
+simulations of eight SML/NJ benchmarks, Diwan et al. conclude            memory is scarce. In such conditions, all of the garbage collectors
+that generational garbage collection accounts for 19% to 46% of          we examine here suffer order-of-magnitude performance penalties
+application runtime (measured as cycles per instruction) [20].           relative to explicit memory management.
+   Using a uniform cost model for memory accesses, Appel presents           We believe these results will be helpful both to practitioners and
+an analysis that shows that given enough space, garbage collection       researchers. For practitioners, these results can guide their choice
+can be faster than explicit memory management [4] (see Miller for        of using explicitly-managed languages like C and C++, or garbage-
+a rebuttal of this claim with respect to stack allocation of activa-     collected languages like Java or C#. As long as their applications
+tion frames [47]). He observes that the frequency of collections is      will be running on systems equipped with more than three times
+inverse to the heap size, while the cost of collection is essentially    as much RAM as required, then garbage collection is a reasonable
+constant (a function of the maximum reachable size). Increasing          choice. However, if these systems will have less RAM or if the app-
+the size of the heap therefore reduces the cost of garbage collection.   lication will be competing with other processes for physical mem-
+Wilson argues that this conclusion is unlikely to hold for modern        ory, then practitioners should expect garbage collection to exact a
+machines because of their deep memory hierarchies [60]. Our re-          substantial performance cost. This cost will be more pronounced
+sults on such a system support Appel’s analysis, although we find        for systems whose performance depends on maximizing the use of
+that an Appel-style collector runs inversely proportionally to the       2 A newer version of the Lea allocator (2.8.2) uses tries to reduce the cost
+square of heap size.
+                                                                         of this search.
+memory, such as in-memory databases and search engines.                     Conference on Measurement and Modeling of Computer
+  For researchers, these results should help guide their develop-           Systems, June 2004.
+ment of memory management algorithms. This study identifies gar-       [11] S. M. Blackburn, P. Cheng, and K. S. McKinley. Oil and
+bage collection’s key weaknesses as its poor performance in tight           Water? High Performance Garbage Collection in Java with
+heaps and in settings where physical memory is scarce. On the               MMTk. In ICSE 2004, 26th International Conference on
+other hand, in very large heaps, garbage collection is already com-         Software Engineering, page to appear, May 2004.
+petitive with or slightly better than explicit memory management.      [12] S. M. Blackburn and K. S. McKinley. Ulterior reference
+9. Acknowledgments                                                          counting: Fast garbage collection without a long wait. In
+Thanks to Steve Blackburn, Hans Boehm, Sam Guyer, Martin Hirzel,            OOPSLA 2003 ACM Conference on Object-Oriented
+Richard Jones, Scott Kaplan, Doug Lea, Kathryn McKinley, Yannis             Programming, Systems, Languages and Applications, Oct.
+Smaragdakis, Trevor Strohman, and to the anonymous reviewers                2003.
+for their helpful comments on drafts of this paper.                    [13] H.-J. Boehm. Reducing garbage collector cache misses. In
+   This material is based upon work supported by the National Sci-          T. Hosking, editor, ISMM 2000 Proceedings of the Second
+ence Foundation under Award CNS-0347339 and CISE Research                   International Symposium on Memory Management, volume
+Infrastructure Grant EIA-0303609. Any opinions, findings, and               36(1) of ACM SIGPLAN Notices, Minneapolis, MN, Oct.
+conclusions or recommendations expressed in this material are those         2000. ACM Press.
+of the author(s) and do not necessarily reflect the views of the Na-   [14] H.-J. Boehm and M. Weiser. Garbage collection in an
+tional Science Foundation.                                                  uncooperative environment. Software: Practice and
+                                                                            Experience, 18(9):807–820, Sept. 1988.
+10.   References
+                                                                       [15] D. Burger, T. M. Austin, and S. Bennett. Evaluating future
+ [1] Hardware — G5 Performance Programming, Dec. 2003.                      microprocessors: The SimpleScalar tool set. Computer
+     Available at http://developer.apple.com/                               Sciences Technical Report CS-TR-1996-1308, University of
+     hardware/ve/g5.html.                                                   Wisconsin-Madison, Madison, WI, 1996.
+ [2] B. Alpern, C. R. Attanasio, J. J. Barton, M. G. Burke,            [16] G. Colvin, B. Dawes, and D. Adler. C++ Boost Smart
+     P. Cheng, J.-D. Choi, A. Cocchi, S. J. Fink, D. Grove,                 Pointers, Oct. 2004. Available at http://www.boost.
+     M. Hind, S. F. Hummel, D. Lieber, V. Litvinov, M. F.                   org/libs/smart_ptr/smart_ptr.htm.
+     Mergen, T. Ngo, V. Sarkar, M. J. Serrano, J. C. Shepherd,         [17] S. P. E. Corporation. Specjbb2000. Available at http://
+     S. E. Smith, V. C. Sreedhar, H. Srinivasan, and J. Whaley.             www.spec.org/jbb2000/docs/userguide.html.
+     The Jalepeño virtual machine. IBM Systems Journal, 39(1),        [18] S. P. E. Corporation. Specjvm98 documentation, Mar. 1999.
+     Feb. 2000.                                                        [19] D. L. Detlefs. Concurrent garbage collection for C++. In
+ [3] B. Alpern, C. R. Attanasio, J. J. Barton, A. Cocchi, S. F.             P. Lee, editor, Topics in Advanced Language Implementation.
+     Hummel, D. Lieber, T. Ngo, M. Mergen, J. C. Shepherd, and              MIT Press, 1991.
+     S. Smith. Implementing Jalepeño in Java. In Proceedings of       [20] A. Diwan, D. Tarditi, and E. Moss. Memory system
+     SIGPLAN 1999 Conference on Object-Oriented                             performance of programs with intensive heap allocation.
+     Programming, Languages, & Applications, volume 34(10) of               ACM Trans. Comput. Syst., 13(3):244–273, Aug. 1995.
+     ACM SIGPLAN Notices, pages 314–324, Denver, CO, Oct.              [21] J. Dolby. Automatic inline allocation of objects. In
+     1999. ACM Press.                                                       Proceedings of SIGPLAN’97 Conference on Programming
+ [4] A. W. Appel. Garbage collection can be faster than stack               Languages Design and Implementation, ACM SIGPLAN
+     allocation. Information Processing Letters, 25(4):275–279,             Notices, Las Vegas, Nevada, June 1997. ACM Press.
+     1987.                                                             [22] J. Dolby and Chien. An evaluation of object inline allocation
+ [5] A. W. Appel. Allocation without locking. Software Practice             techniques. In OOPSLA’98 ACM Conference on
+     and Experience, 19(7), 1989. Short Communication.                      Object-Oriented Systems, Languages and Applications,
+ [6] E. D. Beger. The hoard memory allocator. Available at                  ACM SIGPLAN Notices, Vancouver, Oct. 1998. ACM Press.
+     http://www.hoard.org.                                             [23] J. Dolby and Chien. An automatic object inlining and its
+ [7] E. D. Berger, B. G. Zorn, and K. S. McKinley. Composing                evaluation. In Proceedings of SIGPLAN 2000 Conference on
+     high-performance memory allocators. In Proceedings of the              Programming Languages Design and Implementation, ACM
+     2001 ACM SIGPLAN Conference on Programming                             SIGPLAN Notices, pages 345–357, Vancouver, June 2000.
+     Language Design and Implementation (PLDI), Snowbird,                   ACM Press.
+     Utah, June 2001.                                                  [24] Y. Feng and E. D. Berger. A locality-improving dynamic
+ [8] E. D. Berger, B. G. Zorn, and K. S. McKinley. Reconsidering            memory allocator. In Proceedings of the ACM SIGPLAN
+     custom memory allocation. In OOPSLA’02 ACM Conference                  2005 Workshop on Memory System Performance (MSP),
+     on Object-Oriented Systems, Languages and Applications,                Chicago, Illinois, June 2005.
+     ACM SIGPLAN Notices, Seattle, WA, Nov. 2002. ACM                  [25] R. R. Fenichel and J. C. Yochelson. A LISP
+     Press.                                                                 garbage-collector for virtual-memory computer systems.
+ [9] E. D. Berger, B. G. Zorn, and K. S. McKinley. Reconsidering            Commun. ACM, 12(11):611–612, Nov. 1969.
+     custom memory allocation. In Proceedings of the Conference        [26] D. Gay and A. Aiken. Memory management with explicit
+     on Object-Oriented Programming: Systems, Languages, and                regions. In Proceedings of the 1998 ACM SIGPLAN
+     Applications (OOPSLA) 2002, Seattle, Washington, Nov.                  Conference on Programming Language Design and
+     2002.                                                                  Implementation (PLDI), pages 313 – 323, Montreal, Canada,
+[10] S. M. Blackburn, P. Cheng, and K. S. McKinley. Myths and               June 1998.
+     reality: The performance impact of garbage collection. In         [27] D. Gay and A. Aiken. Language support for regions. In
+     SIGMETRICS - Performance 2004, Joint International
+     Proceedings of the 2001 ACM SIGPLAN Conference on                    Automatic Dynamic Memory Management. Wiley,
+     Programming Language Design and Implementation (PLDI),               Chichester, July 1996.
+     pages 70 – 80, Snowbird, Utah, June 2001.                       [42] P.-H. Kamp. Malloc(3) revisited.
+[28] W. Gloger. Dynamic memory allocator implementations in               http://phk.freebsd.dk/pubs/malloc.pdf.
+     linux system libraries. Available at                            [43] D. G. Korn and K.-P. Vo. In search of a better malloc. In
+     http://www.dent.med.uni-muenchen.de/                                 USENIX Conference Proceedings, Summer 1985, pages
+     ˜wmglo/malloc-slides.html.                                           489–506, Portland, OR, 1985.
+[29] D. Grossman, G. Morrisett, T. Jim, M. Hicks, Y. Wang, and       [44] D. Lea. A memory allocator, 1998. Available at
+     J. Cheney. Region-based memory management in cyclone. In             http://g.oswego.edu/dl/html/malloc.html.
+     Proceedings of the 2002 ACM SIGPLAN Conference on               [45] J. McCarthy. Recursive functions of symbolic expressions
+     Programming Language Design and Implementation (PLDI),               and their computation by machine. Communications of the
+     pages 282–293, Berlin, Germany, June 2002.                           ACM, 3:184–195, 1960.
+[30] J. Guy L Steele. Multiprocessing compactifying garbage          [46] M. Michael. Scalable lock-free dynamic memory allocation.
+     collection. Communications of the ACM, 18(9):495–508,                In Proceedings of SIGPLAN 2004 Conference on
+     1975.                                                                Programming Languages Design and Implementation, ACM
+[31] D. R. Hanson. Fast allocation and deallocation of memory             SIGPLAN Notices, Washington, DC, June 2004. ACM Press.
+     based on object lifetimes. In Software Practice &               [47] J. S. Miller and G. J. Rozas. Garbage collection is fast, but a
+     Experience, volume 20(1), pages 5–12. Wiley, Jan. 1990.              stack is faster. Technical Report AIM-1462, MIT AI
+[32] M. Hertz and E. D. Berger. Garbage collection without                Laboratory, Mar. 1994.
+     paging. In Proceedings of the 2005 ACM SIGPLAN                  [48] G. Phipps. Comparing observed bug and productivity rates
+     Conference on Programming Language Design and                        for java and c++. Software Practice & Experience,
+     Implementation (PLDI), pages 143–153, June 2005.                     29(4):345–358, 1999.
+[33] M. Hertz, S. M. Blackburn, J. E. B. Moss, K. S. McKinley,       [49] N. Sachindran, J. E. B. Moss, and E. D. Berger. MC2 :
+     and D. Stefanović. Error-free garbage collection traces: How        High-performance garbage collection for
+     to cheat and not get caught. In Proceedings of the                   memory-constrained environments. In Proceedings of the
+     International Conference on Measurement and Modeling of              ACM Conference on Object-Oriented Systems, Languages
+     Computer Systems (SIGMETRICS 2002), pages 140–151,                   and Applications, Vancouver, BC, Canada, Oct. 2004.
+     Marina Del Ray, CA, June 2002.                                  [50] P. Savola. Lbnl traceroute heap corruption vulnerability.
+[34] M. Hertz, N. Immerman, and J. E. B. Moss. Framework for              Available at
+     analyzing garbage collection. In Foundations of Information          http://www.securityfocus.com/bid/1739.
+     Technology in the Era of Network and Mobile Computing:          [51] R. Shaham, E. Kolodner, and M. Sagiv. Estimating the
+     IFIP 17th World Computer Congress - TC1 Stream (TCS                  impact of liveness information on space consumption in
+     2002), pages 230–241, Montreal, Canada, Aug. 2002.                   Java. In D. Detlefs, editor, ISMM’02 Proceedings of the
+     Kluwer.                                                              Third International Symposium on Memory Management,
+[35] M. Hicks, G. Morrisett, D. Grossman, and T. Jim.                     ACM SIGPLAN Notices, pages 64–75, Berlin, June 2002.
+     Experience with safe manual memory-management in                     ACM Press.
+     Cyclone. In A. Diwan, editor, ISMM’04 Proceedings of the        [52] Y. Smaragdakis, S. F. Kaplan, and P. R. Wilson. The EELRU
+     Third International Symposium on Memory Management,                  adaptive replacement algorithm. Performance Evaluation,
+     ACM SIGPLAN Notices, Vancouver, Oct. 2004. ACM Press.                53(2):93–123, July 2003.
+[36] M. W. Hicks, J. T. Moore, and S. M. Nettles. The measured       [53] D. Sugalski. Squawks of the parrot: What the heck is:
+     cost of copying garbage collection mechanisms. In                    Garbage collection, June 2003. Available at http://www.
+     Proceedings of the ACM SIGPLAN Conference on                         sidhe.org/˜dan/blog/archives/000200.html.
+     Functional Programming, pages 292–305. ACM, June 1997.          [54] M. Tofte and J.-P. Talpin. Region-based memory
+[37] M. Hirzel, A. Diwan, and T. Hosking. On the usefulness of            management. Information and Computation,
+     liveness for garbage collection and leak detection. In J. L.         132(2):109–176, 1997.
+     Knudsen, editor, Proceedings of 15th European Conference        [55] L. Torvalds. Re: Faster compilation speed, 2002. Available at
+     on Object-Oriented Programming, ECOOP 2001, volume                   http://gcc.gnu.org/ml/gcc/2002-08/
+     2072 of Springer-Verlag, Budapest, June 2001.                        msg00544.html.
+     Springer-Verlag.
+                                                                     [56] D. Ungar. Generation scavenging: A non-disruptive high
+[38] X. Huang, S. M. Blackburn, K. S. McKinley, J. E. B. Moss,            performance storage reclamation algorithm. In Proceedings
+     Z. Wang, and P. Cheng. The garbage collection advantage:             of the ACM SIGSOFT/SIGPLAN Software Engineering
+     Improving program locality. In Proceeding of the ACM                 Symposium on Practical Software Development
+     Conference on Object-Oriented Systems, Languages and                 Environments, pages 157–167, Pittsburgh, Pennsylvania,
+     Applications, Vancouver, BC, Canada, Oct. 2004.                      Apr. 1984. ACM SIGPLAN Notices 19, 5 (May 1984).
+[39] X. Huang, J. E. B. Moss, K. S. Mckinley, S. Blackburn, and      [57] B. Venners. Inside the Java Virtual Machine. McGraw-Hill
+     D. Burger. Dynamic SimpleScalar: Simulating Java virtual             Osborne Media, Jan. 2000.
+     machines. Technical Report TR-03-03, University of Texas
+                                                                     [58] Wikipedia. Comparison of Java to C++, 2004. Available at
+     at Austin, Feb. 2003.
+                                                                          http://en.wikipedia.org/wiki/Comparison_
+[40] M. S. Johnstone and P. R. Wilson. The memory                         of_Java_to_Cplusplus.
+     fragmentation problem: Solved? In International Symposium
+                                                                     [59] P. R. Wilson. Uniprocessor garbage collection techniques. In
+     on Memory Management, Vancouver, B.C., Canada, 1998.
+                                                                          Y. Bekkers and J. Cohen, editors, Proceedings of
+[41] R. E. Jones and R. Lins. Garbage Collection: Algorithms for
+     International Workshop on Memory Management, volume
+     637 of Lecture Notes in Computer Science, St Malo, France,
+     16–18 Sept. 1992. Springer-Verlag.
+[60] P. R. Wilson, M. S. Lam, and T. G. Moher. Caching
+     considerations for generational garbage collection. In
+     Conference Record of the 1992 ACM Symposium on Lisp and
+     Functional Programming, pages 32–42, San Francisco, CA,
+     June 1992. ACM Press.
+[61] T. Yang, M. Hertz, E. D. Berger, S. F. Kaplan, and J. E. B.
+     Moss. Automatic heap sizing: Taking real memory into
+     account. In Proceedings of the 2004 ACM SIGPLAN
+     International Symposium on Memory Management, Nov.
+     2004.
+[62] B. G. Zorn. The measured cost of conservative garbage
+     collection. Software Practice and Experience,
+     23(7):733–756, 1993.
+

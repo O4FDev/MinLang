@@ -1,0 +1,834 @@
+                                                                                       Counting Immutable Beans
+                                                                    Reference Counting Optimized for Purely Functional Programming
+
+                                                                     Sebastian Ullrich                                               Leonardo de Moura
+                                                            Karlsruhe Institute of Technology                                          Microsoft Research
+                                                                        Germany                                                              USA
+                                                                sebastian.ullrich@kit.edu                                           leonardo@microsoft.com
+                                        ABSTRACT                                                                   counts every time a reference is created or destroyed can signif-
+                                        Most functional languages rely on some kind of garbage collection          icantly impact performance because they not only take time but
+                                        for automatic memory management. They usually eschew reference             also affect cache performance, especially in a multi-threaded pro-
+
+
+
+
+arXiv:1908.05647v3 [cs.PL] 5 Mar 2020
+                                        counting in favor of a tracing garbage collector, which has less           gram [Choi et al. 2018]. Second, reference counting cannot collect
+                                        bookkeeping overhead at runtime. On the other hand, having an              circular [McBeth 1963] or self-referential structures. Finally, in most
+                                        exact reference count of each value can enable optimizations such          reference counting implementations, pause times are deterministic
+                                        as destructive updates. We explore these optimization opportunities        but may still be unbounded [Boehm 2004].
+                                        in the context of an eager, purely functional programming language.            In this paper, we investigate whether reference counting is a
+                                        We propose a new mechanism for efficiently reclaiming memory               competitive memory management technique for purely functional
+                                        used by nonshared values, reducing stress on the global memory             languages, and explore optimizations for reusing memory, perform-
+                                        allocator. We describe an approach for minimizing the number of            ing destructive updates, and for minimizing the number of reference
+                                        reference counts updates using borrowed references and a heuristic         count increments and decrements. The former optimizations in par-
+                                        for automatically inferring borrow annotations. We implemented             ticular are beneficial for purely functional languages that otherwise
+                                        all these techniques in a new compiler for an eager and purely             can only perform functional updates. When performing functional
+                                        functional programming language with support for multi-threading.          updates, objects often die just before the creation of an object of
+                                        Our preliminary experimental results demonstrate our approach is           the same kind. We observe a similar phenomenon when we in-
+                                        competitive and often outperforms state-of-the-art compilers.              sert a new element into a pure functional data structure such as
+                                                                                                                   binary trees, when we use map to apply a given function to the
+                                        CCS CONCEPTS                                                               elements of a list or tree, when a compiler applies optimizations
+                                                                                                                   by transforming abstract syntax trees, or when a proof assistant
+                                        • Software and its engineering → Runtime environments;
+                                                                                                                   rewrites formulas. We call it the resurrection hypothesis: many ob-
+                                        Garbage collection.
+                                                                                                                   jects die just before the creation of an object of the same kind.
+                                                                                                                   Our new optimization takes advantage of this hypothesis, and en-
+                                        KEYWORDS                                                                   ables pure code to perform destructive updates in all scenarios
+                                        purely functional programming, reference counting, Lean                    described above when objects are not shared. We implemented all
+                                        ACM Reference Format:                                                      the ideas reported here in the new runtime and compiler for the
+                                        Sebastian Ullrich and Leonardo de Moura. 2020. Counting Immutable Beans:   Lean programming language [de Moura et al. 2015]. We also report
+                                        Reference Counting Optimized for Purely Functional Programming. In         preliminary experimental results that demonstrate our new com-
+                                        Proceedings of International Symposium on Implementation and Application   piler produces competitive code that often outperforms the code
+                                        of Functional Languages (IFL’19). ACM, New York, NY, USA, 12 pages.        generated by high-performance compilers such as ocamlopt and
+                                                                                                                   GHC (Section 8).
+                                        1    INTRODUCTION                                                              Lean implements a version of the Calculus of Inductive Con-
+                                        Although reference counting [Collins 1960] (RC) is one of the old-         structions [Coquand and Huet 1988; Coquand and Paulin 1990],
+                                        est memory management techniques in computer science, it is not            and it has mainly been used as a proof assistant so far. Lean has
+                                        considered a serious garbage collection technique in the functional        a metaprogramming framework for writing proof and code au-
+                                        programming community, and there is plenty of evidence it is in            tomation, where users can extend Lean using Lean itself [Ebner
+                                        general inferior to tracing garbage collection algorithms. Indeed,         et al. 2017]. Improving the performance of Lean metaprograms was
+                                        high-performance compilers such as ocamlopt and GHC use tracing            the primary motivation for the work reported here, but one can
+                                        garbage collectors. Nonetheless, implementations of several popu-          apply the techniques reported here to general-purpose functional
+                                        lar programming languages, e.g., Swift, Objective-C, Python, and           programming languages.
+                                        Perl, use reference counting as a memory management technique.                 We describe our approach as a series of refinements starting from
+                                        Reference counting is often praised for its simplicity, but many dis-      λ pure , a simple intermediate representation for eager and purely
+                                        advantages are frequently reported in the literature [Jones and Lins       functional languages (Section 3). We remark that in Lean and λ pure ,
+                                        1996; Wilson 1992]. First, incrementing and decrementing reference         it is not possible to create cyclic data structures. Thus, one of the
+                                                                                                                   main criticisms against reference counting does not apply. From
+                                        IFL’19, September 2019, Singapore                                          λ pure , we obtain λ RC by adding explicit instructions for increment-
+                                        2020. ACM ISBN 978-x-xxxx-xxxx-x/YY/MM. . . $15.00                         ing (inc) and decrementing (dec) reference counts, and reusing
+IFL’19, September 2019, Singapore                                                                         Sebastian Ullrich and Leonardo de Moura
+
+
+memory (Section 4). The inspiration for explicit RC instructions       them exactly once. Now we contrast that with a function that only
+comes from the Swift compiler, as does the notion of borrowed refer-   inspects its argument: the function isNil xs returns true if the list
+ences. In contrast to standard (or owned) references, of which there   xs is empty and false otherwise. If the argument xs is taken as an
+should be exactly as many as the object’s reference counter implies,   owned reference, our compiler generates the following code
+borrowed references do not update the reference counter but are
+                                                                         isNil xs = case xs of
+assumed to be kept alive by a surrounding owned reference, further
+                                                                           (Nil → dec xs ; ret true)
+minimizing the number of inc and dec instructions in generated
+code.                                                                      (Cons → dec xs ; ret false)
+   We present a simple compiler from λ pure to λ RC , discussing       We need the dec instructions because a function must consume
+heuristics for inserting destructive updates, borrow annotations,      all arguments taken as owned references. One may notice that
+and inc/dec instructions (Section 5). Finally, we show that our        decrementing xs immediately after we inspect its constructor tag
+approach is compatible with existing techniques for performing         is wasteful. Now assume that instead of taking the ownership of
+destructive updates on array and string values, and propose a sim-     an RC token, we could borrow it from the caller. Then, the callee
+ple and efficient approach for thread-safe reference counting (Sec-    would not need to consume the token using an explicit dec oper-
+tion 7).                                                               ation. Moreover, the caller would be responsible for keeping the
+   Contributions. We present a reference counting scheme optimized     borrowed value alive. This is the essence of borrowed references: a
+for and used by the next version of the Lean programming language.     borrowed reference does not actually keep the referenced value
+     • We describe how to reuse allocations in both user code and      alive, but instead asserts that the value is kept alive by another,
+       language primitives, and give a formal reference-counting       owned reference. Thus, when xs is a borrowed reference, we com-
+       semantics that can express this reuse.                          pile isNil into our IR as
+     • We describe the optimization of using borrowed references.        isNil xs = case xs of (Nil → ret true) (Cons → ret false)
+     • We define a compiler that implements all these steps. The
+       compiler is implemented in Lean itself and the source code         As a less trivial example, we now consider the function hasNone
+       is available.                                                   xs that, given a list of optional values, returns true if xs contains a
+     • We give a simple but effective scheme for avoiding atomic       None value. This function is often defined in a functional language
+       reference count updates in multi-threaded programs.             as
+     • We compare the new Lean compiler incorporating these              hasNone [] = false
+       ideas with other compilers for functional languages and           hasNone (None : xs) = true
+       show its competitiveness.                                         hasNone (Some x : xs) = hasNone xs
+
+2    EXAMPLES                                                          Similarly to isNil, hasNone only inspects its argument. Thus if xs is
+                                                                       taken as a borrowed reference, our compiler produces the following
+In reference counting, each heap-allocated value contains a refer-     RC-free IR code for it
+ence count. We view this counter as a collection of tokens. The
+inc instruction creates a new token and dec consumes it. When a          hasNone xs = case xs of
+function takes an argument as an owned reference, it is responsible        (Nil → ret false)
+for consuming one of its tokens. The function may consume the              (Cons → let h = projhead xs ; case h of
+owned reference not only by using the dec instruction, but also by           (None → ret true)
+storing it in a newly allocated heap value, returning it, or passing         (Some → let t = projtail xs ; let r = hasNone t ; ret r))
+it to another function that takes an owned reference. We illustrate
+                                                                       Note that our case operation does not introduce binders. Instead,
+our intermediate representation (IR) and the use of owned and
+                                                                       we use explicit instructions proji for accessing the head and tail of
+borrowed references with a series of small examples.
+                                                                       the Cons cell. We use suggestive names for cases and fields in these
+    The identity function id does not require any RC operation when
+                                                                       initial examples, but will later use indices instead. Our borrowed
+it takes its argument as an owned reference.
+                                                                       inference heuristic discussed in Section 5 correctly tags xs as a
+id x = ret x                                                           borrowed parameter.
+As another example, consider the function mkPairOf that takes x            When using owned references, we know at run time whether
+and returns the pair (x, x).                                           a value is shared or not simply by checking its reference counter.
+                                                                       We observed we could leverage this information and minimize the
+mkPairOf x = inc x ; let p = Pair x x ; ret p                          amount of allocated and freed memory for constructor values such
+It requires an inc instruction because two tokens for x are con-       as a list Cons value. Thus, we have added two additional instructions
+sumed (we will also say that “x is consumed” twice). The function      to our IR: let y = reset x and let z = (reuse y in ctori w). The
+fst takes two arguments x and y, and returns x, and uses a dec         two instructions are used together; if x is a shared value, then y is
+instruction for consuming the unused y.                                set to a special reference , and the reuse instruction just allocates
+                                                                       a new constructor value ctori w. If x is not shared, then reset
+fst x y = dec y ; ret x
+                                                                       decrements the reference counters of the components of x, and y
+The examples above suggest that we do not need any RC opera-           is set to x. Then, reuse reuses the memory cell used by x to store
+tion when we take arguments as owned references and consume            the constructor value ctori w. We illustrate these two instructions
+Counting Immutable Beans                                                                                                    IFL’19, September 2019, Singapore
+
+
+with the IR code for the list map function generated by our compiler      3      THE PURE IR
+as shown in Section 5. The code uses our actual, positional encoding      Our source language λ pure is a simple untyped functional interme-
+of cases, constructors, and fields as described in the next section.      diate representation (IR) in the style of A-normal form [Flanagan
+                                                                          et al. 1993]. It captures the relevant features of the actual IR we
+  map f xs = case xs of
+                                                                          have implemented and avoids unnecessary complexity that would
+   (ret xs)
+                                                                          only distract the reader from the ideas proposed here.
+   (let x = proj1 xs ; inc x ; let s = proj2 xs ; inc s ;
+    let w = reset xs ;                                                        w, x, y, z ∈ Var
+    let y = f x ; let ys = map f s ;                                                   c ∈ Const
+    let r = (reuse w in ctor2 y ys) ; ret r)                                           e ∈ Expr        ::= c y | pap c y | x y | ctori y | proji x
+
+We remark that if the list referenced by xs is not shared, the code                   F ∈ FnBody ::= ret x | let x = e; F | case x of F
+above does not allocate any memory. Moreover, if xs is a nonshared                     f ∈ Fn          ::= λ y. F
+list of list of integers, then map (map inc) xs will not allocate any                  δ ∈ Program = Const ⇀ Fn
+memory either. This example also demonstrates it is not a good
+                                                                          All arguments of function applications are variables. The applied
+idea, in general, to fuse reset and reuse into a single instruction: if
+                                                                          function is a constant c, with partial applications marked with
+we removed the let w = reset xs instruction and directly used xs
+                                                                          the keyword pap, a variable x, the i-th constructor of an erased
+in reuse, then when we execute the recursive application map f s,
+                                                                          datatype, or the special function proji , which returns the i-th
+the reference counter for s would be greater than 1 even if the
+                                                                          argument of a constructor application. Function bodies always end
+reference counter for xs was 1. We would have a reference from
+                                                                          with evaluating and returning a variable. They can be chained with
+xs and another from s, and memory reuse would not occur in the
+                                                                          (non-recursive) let statements and branch using case statements,
+recursive applications. Note that removing the inc s instruction is
+                                                                          which evaluate to their i-th arm given an application of ctori . As
+incorrect when xs is a shared value. Although the reset and reuse
+                                                                          further detailed in Section 5.3, we consider tail calls to be of the form
+instructions can in general be used for reusing memory between
+                                                                          let r = c x; ret r . A program is a partial map from constant names
+two otherwise unrelated values, in examples like map where the
+                                                                          to their implementations. The body of a constant’s implementation
+reused value has a close semantic connection to the reusing value,
+                                                                          may refer back to the constant, which we use to represent recursion,
+we will use common functional vocabulary and say that the list is
+                                                                          and analogously mutual recursion. In examples, we use f x = F as
+being destructively updated (up to the first shared cell).
+                                                                          syntax sugar for δ (f ) = λ x . F .
+    As another example, a zipper is a technique for traversing and
+                                                                             As an intermediate representation, we can and should impose
+efficiently updating data structures, and it is particularly useful
+                                                                          restrictions on the structure of λ pure to simplify working with it.
+for purely functional languages. For example, the list zipper is a
+                                                                          We assume that
+pair of lists, and it allows one to move forward and backward, and
+to update the current position. The goForward function is often                • all constructor applications are fully applied by eta-expanding
+defined as                                                                       them.
+                                                                               • no constant applications are over-applied by splitting them
+   goForward ([], bs) = ([], bs)                                                 into two applications where necessary.
+   goForward (x : xs, bs) = (xs, x : bs)                                       • all variable applications take only one argument, again by
+                                                                                 splitting them where necessary. While this simplification
+In most functional programming languages, the second equation                    can introduce additional allocations of intermediary partial
+allocates a new pair and Cons value. The functions map and goFor-                applications, it greatly simplifies the presentation of our op-
+ward both satisfy our resurrection hypothesis. Moreover, the result              erational semantics. All presented program transformations
+of a goForward application is often fed into another goForward or                can be readily extended to a system with n-ary variable ap-
+goBackward application. Even if the initial value was shared, ev-                plications, which are handled analogously to n-ary constant
+ery subsequent application takes a nonshared pair, and memory                    applications.
+allocations are avoided by the code produced by our compiler.                  • every function abstraction has been lambda-lifted to a top-
+                                                                                 level constant c.
+   goForward p = case p of
+                                                                               • trivial bindings let x = y have been eliminated through
+     (let xs = proj1 p ; inc xs ;                                                copy propagation.
+      case xs of                                                               • all dead let bindings have been removed.
+        (ret p)                                                                • all parameter and let names of a function are mutually
+        (let bs = proj2 p ; inc bs ;                                             distinct. Thus we do not have to worry about name capture.
+         let c1 = reset p ;                                                  In the actual IR we have implemented1 , we also have instruc-
+         let x = proj1 xs ; inc x ; xs' = proj2 xs ; inc xs' ;            tions for storing and accessing unboxed data in constructor values,
+         let c2 = reset xs ;                                              boxing and unboxing machine integers and scalar values, and cre-
+         let bs' = (reuse c2 in ctor2 x bs) ;                             ating literals of primitive types such as strings and numbers. Our
+         let r = (reuse c1 in ctor1 xs' bs') ; ret r))                    1 https://github.com/leanprover/lean4/blob/IFL19/library/init/lean/compiler/ir/basic.
+                                                                          lean
+IFL’19, September 2019, Singapore                                                                                                       Sebastian Ullrich and Leonardo de Moura
+
+
+IR also supports join points similar to the ones used in the Haskell                            Const-App-Full
+Core language [Maurer et al. 2017]. Join points are local function                              δ (c) = λ yc . F         l = ρ(y)          [yc 7→ l] ⊢ ⟨F , σ ⟩ ⇓ ⟨l ′, σ ′ ⟩
+declarations that are never partially applied (i.e., they never occur                                                    ρ ⊢ ⟨c y, σ ⟩ ⇓ ⟨l ′, σ ′ ⟩
+in pap instructions), and are always tail-called. The actual IR has
+                                                                                                Const-App-Part
+support for defining join points, and a jmp instruction for invoking
+                                                                                                δ (c) = λ yc . F        l = ρ(y)           | l |<| yc |       l ′ < dom(σ )
+them.
+                                                                                                          ρ ⊢ ⟨pap c y, σ ⟩ ⇓ ⟨l ′, σ [l ′ 7→ (pap c l, 1)]⟩
+4    SYNTAX AND SEMANTICS OF THE                                                               Var-App-Full
+     REFERENCE-COUNTED IR                                                                                  σ (ρ(x)) = (pap c l, _)      δ (c) = λ yc . F
+                                                                                               ly = ρ(y)       [yc 7→ l ly ] ⊢ ⟨F , dec(ρ(x), inc(l, σ ))⟩ ⇓ ⟨l ′, σ ′ ⟩
+The target language λ RC is an extension of λ pure :
+                                                                                                                         ρ ⊢ ⟨x y, σ ⟩ ⇓ ⟨l ′, σ ′ ⟩
+          e ∈ Expr        ::= . . . | reset x | reuse x in ctori y                         Var-App-Part
+          F ∈ FnBody ::= . . . | inc x; F | dec x; F                                                                    σ (ρ(x)) = (pap c l, _)
+                                                                                              δ (c) = λ yc . F        ly = ρ(y)      | l ly |<| yc |             l ′ < dom(σ )
+We use the subscripts pure or RC (e.g., Expr pure or Expr RC ) to refer
+to the base or extended syntax, respectively, where otherwise am-                                ρ ⊢ ⟨x y, σ ⟩ ⇓ ⟨l ′, dec(ρ(x), inc(l, σ ))[l ′ 7→ (pap c l ly , 1)]⟩
+biguous. The new expressions reset and reuse work together to                                            Ctor-App
+reuse memory used to store constructor values, and, as discussed                                                      l = ρ(y)          l ′ < dom(σ )
+in Section 2, simulate destructive updates in constructor values.                                        ρ ⊢ ⟨ctori y, σ ⟩ ⇓ ⟨l ′, σ [l ′ 7→ (ctori l, 1)]⟩
+   We define the semantics of λ RC (Figures 1 and 2) using a big-step                            Proj                                           Return
+relation ρ ⊢ ⟨F , σ ⟩ ⇓ ⟨l, σ ′ ⟩ that maps the body F and a mutable                             σ (ρ(x)) = (ctorj l, _)             l ′ = li             ρ(x) = l
+heap σ under a context ρ to a location and the resulting heap. The                                                               ′
+context ρ maps variables to locations. A heap σ is a mapping from                                     ρ ⊢ ⟨proji x, σ ⟩ ⇓ ⟨l , σ ⟩              ρ ⊢ ⟨ret x, σ ⟩ ⇓ ⟨l, σ ⟩
+locations to pairs of values and reference counters. A value is a                                  Let
+constructor value or a partially-applied constant. The reference                                    ρ ⊢ ⟨e, σ ⟩ ⇓ ⟨l, σ ′ ⟩          ρ[x 7→ l] ⊢ ⟨F , σ ′ ⟩ ⇓ ⟨l ′, σ ′′ ⟩
+counters of live values should always be positive; dead values are                                                 ρ ⊢ ⟨let x = e; F , σ ⟩ ⇓ ⟨l ′, σ ′′ ⟩
+removed from the heap map.                                                                              Case
+                                                                                                        σ (ρ(x)) = (ctori l, _)             ρ ⊢ ⟨Fi , σ ⟩ ⇓ ⟨l ′, σ ′ ⟩
+                       l ∈ Loc
+                                                                                                                   ρ ⊢ ⟨case x of F , σ ⟩ ⇓ ⟨l ′, σ ′ ⟩
+                      ρ ∈ Ctxt       = Var ⇀ Loc
+                      σ ∈ Heap = Loc ⇀ Value × N+
+                                                                                                        Figure 1: λ RC semantics: the λ pure fragment
+                      v ∈ Value ::= ctori l | pap c l
+
+When applying a variable, we have to be careful to increment the                          5      A COMPILER FROM λ pure TO λ RC
+partial application arguments when copying them out of the pap                            Following the actual implementation of our compiler, we will dis-
+cell, and to decrement the cell afterwards.2 We cannot do so via                          cuss a compiler from λ pure to λ RC in three steps:
+explicit reference counting instructions because the number of
+                                                                                             (1) Inserting reset/reuse pairs (Section 5.1)
+arguments in a pap cell is not known statically.
+                                                                                             (2) Inferring borrowed parameters (Section 5.2)
+   Decrementing a unique reference removes the value from the
+                                                                                             (3) Inserting inc/dec instructions (Section 5.3)
+heap and recursively decrements its components. reset, when used
+on a unique reference, eagerly decrements the components of the                              The first two steps are optional for obtaining correct λ RC pro-
+referenced value, replaces them with ,3 and returns the location of                       grams.
+the now-invalid cell. This value is intended to be used only by reuse
+or dec. The former reuses it for a new constructor cell, asserting                        5.1      Inserting destructive update operations
+that its size is compatible with the old cell. The latter frees the cell,                 In this subsection, we will discuss a heuristics-based implementa-
+ignoring the replaced children.                                                           tion of a function
+   If reset is used on a shared, non-reusable reference, it behaves                                                     δ reuse : Const → FnRC
+like dec and returns , which instructs reuse to behave like ctor.
+                                                                                          that inserts reset/reuse instructions. Given let z = reset x, we
+Note that we cannot simply return the reference in both cases and
+                                                                                          remark that, in every control path, z may appear at most once, and
+do another uniqueness check in reuse because other code between
+                                                                                          in one of the following two instructions: let y = reuse z ctori w,
+the two expressions may have altered its reference count.
+                                                                                          or dec z. We use dec z for control paths where z cannot be reused.
+                                                                                          We implement the function δ reuse as
+2 If the pap reference is unique, the two steps can be coalesced so that the arguments
+do not have to be touched.                                                                                 δ reuse (c) = λ y. R(F ) where δ (c) = λ y. F
+3 which can be represented by any unused pointer value such as the null pointer in a
+real implementation. In our actual implementation, we avoid this memory write by          The function R(F ) (Fig. 3) uses a simple heuristic for replacing
+introducing a del instruction that behaves like dec but ignores the constructor fields.   ctori y expressions occurring in F with reuse w in ctori y where
+Counting Immutable Beans                                                                                                      IFL’19, September 2019, Singapore
+
+
+  Inc                                       Dec
+                                                                                    R : FnBody pure → FnBody RC
+  ρ ⊢ ⟨F , inc(ρ(x), σ )⟩ ⇓ ⟨l ′, σ ′ ⟩ ρ ⊢ ⟨F , dec(ρ(x), σ )⟩ ⇓ ⟨l ′, σ ′ ⟩
+                                                                                    R(let x = e; F ) = let x = e; R(F )
+    ρ ⊢ ⟨inc x; F , σ ⟩ ⇓ ⟨l ′, σ ′ ⟩           ρ ⊢ ⟨dec x; F , σ ⟩ ⇓ ⟨l ′, σ ′ ⟩
+                                                                                    R(ret x) = ret x
+           inc(l, σ ) = σ [l 7→ (v, i + 1)]       if σ (l) = (v, i)
+                                                                                    R(case x of F ) = case x of D(x, ni , R(Fi ))
+        inc(l l ′, σ ) = inc(l ′, inc(l, σ ))
+                                                                                       where ni = #fields of x in i-th branch
+                         
+                         
+                          σ                  if l =
+                                              if σ (l) = (v, i), i > 1
+                         
+                         σ [l 7→ (v, i − 1)]
+                         
+          dec(l, σ ) =
+                         
+                                                                                    D : Var × N × FnBody RC → FnBody RC
+                        dec(l ′, σ [l 7→ ⊥]) if σ (l) = (pap c l ′, 1)
+                                                                                    D(z, n, case x of F ) = case x of D(z, n, F )
+                       
+                       
+                        dec(l ′, σ [l 7→ ⊥]) if σ (l) = (ctor l ′, 1)
+                       
+                                                                 i
+                                                                                    D(z, n, ret x) = ret x
+                       
+        dec(l l ′, σ ) = dec(l ′, dec(l, σ ))
+                                                                                    D(z, n, let x = e; F ) = let x = e; D(z, n, F )
+         Reset-Uniq                                                                    if z ∈ e or z ∈ F
+                       ρ(x) = l         σ (l) = (ctori l ′, 1)                      D(z, n, F ) = let w = reset z; S(w, n, F )
+                                                           ′
+         ρ ⊢ ⟨reset x, σ ⟩ ⇓ ⟨l, dec(l ′, σ [l 7→ (ctori |l | , 1)])⟩                  otherwise, if S(w, n, F ) , F for a fresh w
+                     Reset-Shared                                                   D(z, n, F ) = F otherwise
+                     ρ(x) = l         σ (l) = (_, i)            i,1
+                       ρ ⊢ ⟨reset x, σ ⟩ ⇓ ⟨ , dec(l, σ )⟩
+        Reuse-Uniq
+                                                                                    S : Var × N × FnBody RC → FnBody RC
+            ρ(x) = l         σ (l) = (ctorj       |y |
+                                                         , 1)    ρ(y) = l ′′        S(w, n, let x = ctori y; F ) = let x = reuse w in ctori y; F
+        ρ ⊢ ⟨reuse x in ctori y, σ ⟩ ⇓ ⟨l, σ [l 7→ (ctori l ′′, 1)]⟩                   if | y |= n
+                  Reuse-Shared                                                      S(w, n, let x = e; F ) = let x = e; S(w, n, F ) otherwise
+                  ρ(x) =           ρ ⊢ ⟨ctori y, σ ⟩ ⇓ ⟨l ′, σ ′ ⟩                  S(w, n, ret x) = ret x
+                   ρ ⊢ ⟨reuse x in ctori y, σ ⟩ ⇓ ⟨l ′, σ ′ ⟩
+                                                                                    S(w, n, case x of F ) = case x of S(w, n, F )
+                       Figure 2: λ RC semantics cont.
+                                                                                                   Figure 3: Inserting reset/reuse pairs
+w is a fresh variable introduced by R as the result of a new reset
+operation. For each arm Fi in a case x of F operation, the function
+R requires the arity n of the corresponding matched constructor.
+In the actual implementation, we store this information for each                    constructor calls with two parameters. Indeed, such a call can be
+arm when we compile our typed frontend language into λ pure . The                   found in the let-binding for r . Thus, function D successfully inserts
+auxiliary functions D and S implement the dead variable search and                  the appropriate instructions, and we obtain the function described
+substitution steps respectively. For each case operation, R attempts                in Section 2. Now, consider the list swap function that swaps the
+to insert reset/reuse instructions for the variable matched by                      first two elements of a list. It is often defined as
+the case. This is done using D in each arm of the case. Function
+D(z, n, F ) takes as parameters the variable z to reuse and the arity n
+of the matched constructor. D proceeds to the first location where z                  swap [] = []
+is dead, i.e. not used in the remaining function body, and then uses                  swap [x] = [x]
+S to attempt to find and substitute a matching constructor ctori y                    swap (x : y : zs) = y : x : zs
+instruction with a reuse w in ctori y in the remaining code. If no
+matching constructor instruction can be found, D does not modify                    In λ pure , this function is encoded as
+the function body.
+   As an example, consider the map function for lists
+                                                                                      swap xs = case xs of
+  map f xs = case xs of                                                                  (ret xs)
+   (ret xs)                                                                              (let t1 = proj2 xs ; case t1 of
+   (let x = proj1 xs ; let s : = proj2 xs ;                                                (ret xs)
+    let y = f x ; let ys = map f s ;                                                       (let h1 = proj1 xs ;
+    let r = ctor2 y ys ; ret r)                                                             let h2 = proj1 t1 ; let t2 = proj2 t1 ;
+Applying R to the body of map , we have D looking for opportuni-                            let r1 = ctor2 h1 t2 ; let r2 = ctor2 h2 r1 ; ret r2 ))
+ties to reset/reuse xs in both case arms. Since xs is unused after
+let s = proj2 xs, S is applied to the rest of the function, looking for             By applying R to swap, we obtain
+IFL’19, September 2019, Singapore                                                                                  Sebastian Ullrich and Leonardo de Moura
+
+
+  swap xs = case xs of                                                   collectO : FnBody RC → 2Vars
+    (ret xs)                                                             collectO (let z = ctori x ; F) = collectO (F )
+    (let t1 = proj2 xs ; case t1 of                                      collectO (let z = reset x ; F) = collectO (F ) ∪ {x }
+      (ret xs)                                                           collectO (let z = reuse x in ctori x ; F) = collectO (F )
+      (let h1 = proj1 xs ; let w1 = reset xs ;                           collectO (let z = c x ; F) = collectO (F ) ∪ {x i ∈ x | β(c)i = O}
+       let h2 = proj1 t1 ; let t2 = proj2 t1 ;                           collectO (let z = x y ; F) = collectO (F ) ∪ {x, y}
+       let w2 = reset t1 ; let r1 = reuse w2 in ctor2 h1 t2 ;            collectO (let z = pap c O x; F ) = collectO (F ) ∪ {x }
+       let r2 = reuse w1 in ctor2 h2 r1 ; ret r2 ))                      collectO (let z = proji x ; F) = collectO (F ) ∪ {x } if z ∈ collectO (F )
+                                                                         collectO (let z = proji x ; F) = collectO (F ) if z < collectO (F )
+Similarly to the map function, the code generated for the function
+                                                                         collectO (ret x) = ∅
+swap will not allocate any memory when the list value is not shared.                                Ð
+This example demonstrates that our heuristic procedure can avoid         collectO (case x of F ) = F ∈F collectO (Fi )
+                                                                                                           i
+memory allocations even in functions containing many nested case
+instructions. The example also makes it clear that we could further      Figure 4: Collecting variables that should not be marked as
+optimize our λ RC by adding additional instructions. For example,        borrowed
+we can add an instruction that combines reset and reuse into a
+single instruction and is used in situations where reuse occurs
+immediately after the corresponding reset instruction such as in         recursive, we do not know which parameters are owned, yet. Thus,
+the example above where we have let w 2 = reset t 1 ; let r 1 =          given δ (c) = λy. b, we infer the value of β(c) by starting with the
+reuse w 2 in ctor2 h 1 t 2 ,                                             approximation β(c) = Bn , then we compute S = collectO (b), update
+                                                                         β(c)i := O if yi ∈ S, and repeat the process until we reach a fix
+5.2     Inferring borrowing signatures                                   point and no further updates are performed on β(c). The procedure
+We now consider the problem of inferring borrowing signatures, i.e.      described here does not consider mutually recursive definitions,
+a mapping β : Const ⇀ {O, B}∗ , which for every function should          but this is a simple extension where we process a block of mutually
+return a list describing each parameter of the function as either        recursive functions simultaneously. By applying our heuristic to
+Owned or Borrowed. Borrow annotations can be provided manually           the hasNone function described before, we obtain β(hasNone) = B.
+by users (which is always safe), but we have two motivations for         That is, in an application hasNone xs, xs is taken as a borrowed
+inferring them: avoiding the burden of annotations, and making           reference.
+our IR a convenient target for other systems (e.g., Coq, Idris, and
+Agda) that do not have borrow annotations.                               5.3     Inserting reference counting operations
+   If a function f takes a parameter x as a borrowed reference, then     Given any well-formed definition of β and δ β , we finally give a
+at runtime x may be a shared value even when its reference counter       procedure for correctly inserting inc and dec instructions.4
+is 1. Thus, we must never mark x as borrowed if it is used by a
+let y = reset x instruction. We also assume that each β(c) has           δ RC (c) : Const → FnRC
+the same length as the corresponding parameter list in δ (c).            δ RC (c) = λ y. O− (y, C(F , βl ))        where δ β (c) = λ y. F ,
+   Partially applying constants with borrowed parameters is also                                                            βl = [y 7→ β(c), . . . 7→ O]
+problematic because, in general, we cannot statically assert that
+the resulting value will not escape the current function and thus        The map βl : Var → {O, B} keeps track of the borrow status of
+the scope of borrowed references. Therefore we extend δ reuse to         each local variable. For simplicity, we default all missing entries to
+the program δ β by defining a trivial wrapper constant c O := c          O.
+(we will assume that this name is fresh) for any such constant              In general, variables should be incremented prior to being used
+c, set β(c O ) := O, and replace any occurrence of pap c y with          in an owned context that consumes an RC token. Variables used
+pap c O y. The compiler step given in the next subsection will, as       in any other (borrowed) context do not need to be incremented.
+part of the general transformation, insert the necessary inc and         Owned references should be decremented after their last use. We
+dec instructions into c O to convert between the two signatures.         use the following two helper functions to conditionally add RC
+   Our heuristic is based on the fact that when we mark a parameter      instructions (Fig. 5) in these contexts:
+as borrowed, we reduce the number of RC operations needed, but                 • Ox+ prepares x for usage in an owned context by increment-
+we also prevent reset and reuse as well as primitive operations                  ing it. The increment can be omitted on the last use of an
+from reusing memory cells. Our heuristic collects which parameters               owned variable, with V representing the set of live variables
+and variables should be owned. We say a parameter x should be                    after the use.
+owned if x or one of its projections is used in a reset, or is passed
+                                                                                  Ox+ (V , F , βl ) = F                   if βl (x) = O ∧ x < V
+to a function that takes an owned reference. The latter condition is
+a heuristic and is not required for correctness. We use it because the            Ox+ (V , F , βl ) = inc x; F            otherwise
+function taking an owned reference may try to reuse its memory cell.     4 We will tersely say that a variable x “is incremented/decremented” when an inc/dec
+A formal definition is given in Fig. 4. Many refinements are possible,   operation is applied to it, i.e. the RC of the referenced object is incremented/decre-
+and we discuss one of them in the next section. Note that if a call is   mented at runtime.
+Counting Immutable Beans                                                                                                     IFL’19, September 2019, Singapore
+
+
+C : FnBody RC × (Var → {O, B}) → FnBody RC                                            (1) Consuming the same argument multiple times
+C (ret x, βl ) = Ox+ (∅, ret x, βl )                                                   β(c) := O O
+C (case x of F , βl ) = case x of O− (y, C(F , βl ), βl )                                βl := [y 7→ O]
+                         where {y} = FV(case x of F )                               C(let z = c y y; ret z)
+C (let y = proji x ; F, βl ) = let y = proji x ; inc y ; Ox− (C(F , βl ), βl )
+                                                                                            = C app (y y, O O, let z = c y y; C(ret z))
+                                 if βl (x) = O
+C (let y = proji x ; F, βl ) = let y = proji x ; C (F, βl [y 7→ B])                         = C app (y y, O O, let z = c y y; ret z)
+                                 if βl (x) = B                                              = O+
+                                                                                               y ({y, z}, C app (y, O, let z = c y y; ret z))
+C (let y = reset x ; F, βl ) = let y = reset x ; C (F, βl )                                 = O+           +
+                                                                                               y ({y, z}, Oy ({z}, C app ([], [], let z = c y y; ret z)))
+C (let z = c y ; F, βl ) = C app (y, β(c), let z = c y; C(F , βl ), βl )
+                                                                                            = O+           +
+                                                                                               y ({y, z}, Oy ({z}, let z = c y y; ret z))
+C (let z = pap c y ; F, βl ) = C app (y, β(c), let z = pap c y; C(F , βl ), βl )
+C (let z = x y ; F, βl ) = C app (x y, O O, let z = x y; C(F , βl ), βl )                   = O+
+                                                                                               y ({y, z}, let z = c y y; ret z)
+
+C (let z = ctori y ; F, βl ) = C app (y, O, let z = ctori y; C(F , βl ), βl )               = inc y; let z = c y y; ret z
+C (let z = reuse x in ctori y ; F, βl ) =                                                 Because y is dead after the call, it needs to be incremented
+   C app (y, O, let z = reuse x in ctori y; C(F , βl ), βl )                              only once, moving its last token to c instead.
+                                                                                      (2) Borrowing and consuming the same argument
+C app : Var ∗ × {O, B}∗ × FnBody RC × (Var → {O, B}) → FnBody RC                        β(c) := B O
+C app (y y ′, O b, let z = e; F , βl ) =                                                  βl := [y 7→ O]
+        Oy+ (y ′ ∪ FV(F ), C app (y ′, b, let z = e; F , βl ), βl )                  C(let z = c y y; ret z)
+C app (y y ′, B b, let z = e; F , βl ) =                                                     = C app (y y, B O, let z = c y y; C(ret z))
+        C app (y ′, b, let z = e; Oy− (F , βl ), βl )                                        = C app (y y, B O, let z = c y y; ret z)
+C app ([], _, let z = e; F , βl ) = let z = e; F
+                                                                                             = C app (y, O, let z = c y y; O−
+                                                                                                                            y (ret z))
+                                                                                             = C app (y, O, let z = c y y; dec y; ret z)
+              Figure 5: Inserting inc/dec instructions
+                                                                                             = O+
+                                                                                                y ({y, z}, C app ([], [], let z = c y y; dec y; ret z))
+                                                                                             = O+
+                                                                                                y ({y, z}, let z = c y y; dec y; ret z)
+                                                                                             = inc y; let z = c y y; dec y; ret z
+                                                                                         Even though the owned parameter comes after the borrowed
+                                                                                         parameter, the presence of y in the dec instruction emitted
+     • Ox− decrements x if it is both owned and dead. O− (x, F , βl )                    when handling the first parameter makes sure we do not
+       decrements multiple variables, which may be needed at the                         accidentally move ownership when handling the second
+       start of a function or case branch.                                               parameter, but copy y by emitting an inc instruction.
+
+                                                                                   Preserving tail calls
+              Ox− (F , βl ) = dec x; F           if βl (x) = O ∧ x < FV(F )        A tail call let r = c x; ret r is an application followed by a ret
+                                                                                   instruction. Recursive tail calls are implemented using gotos in our
+              Ox− (F , βl ) = F                 otherwise
+                                                                                   compiler backend. Thus, it is highly desirable to preserve them
+              O− (x x ′, F , βl ) = O− (x ′, Ox− (F , βl ), βl )                   as we transform λ pure into λ RC . However, the previous example
+              O− ([], F , βl ) = F                                                 shows that our function for inserting reference counting instruc-
+                                                                                   tions may insert dec instructions after a constant application, and
+                                                                                   consequently, destroy tail calls. A dec instruction is inserted after
+                                                                                   a constant application let r = c x if β(c)i = B and βl (x i ) = O
+Applications are handled separately, recursing over the arguments                  for some x i ∈ x. That is, function c takes the i-th parameter as
+and parameter borrow annotations in parallel (in the case of partial               a borrowed reference, but the actual argument is owned. As an
+applications, the former list may be shorter); for partial, variable               example, consider the following function in λ pure .
+and constructor applications, the latter default to O.                               f x = case x of
+                                                                                        (let r = proj1 ; ret r)
+                                                                                        (let y1 = ctor1 ; let y2 = ctor1 y1 ; let r = f y2 ; ret r)
+Examples
+                                                                                   The compiler from λ pure to λ RC , infers β(f ) = B, and produces
+We demonstrate the behavior of the compiler on two application
+special cases. The value of βl is constant in these examples and left                f x = case x of
+implicit in applications.                                                                (let r = proj1 x ; inc r ; ret r)
+IFL’19, September 2019, Singapore                                                                                Sebastian Ullrich and Leonardo de Moura
+
+
+      (let y1 = ctor1 ; let y2 ctor1 y1 ;                                   (insert a x) contains only nonshared values, we still have to allo-
+       let r = f y2 ; dec y2 ; ret r)                                       cate one constructor value. We can avoid this unnecessary mem-
+                                                                            ory allocation by inlining balance1 . After inlining, the input value
+which does not preserve the tail call let r = f y2 ; ret r . We
+                                                                            (T B a y b) is reused in the balance1 code. The final generated code
+addressed this issue in our real implementation by refining our
+                                                                            now contains a single constructor application that is not guarded
+borrowing inference heuristic, marking β(c)i = O whenever c
+                                                                            by a reuse, the one for the equation:
+occurs in a tail call let r = c x; ret r where βl (x i ) = O. This
+small modification guarantees that tail calls are preserved by our          insert E x = T R E x E
+compiler, and the following λ RC code is produced for f instead
+                                                                            The generated code now has the property that if the input tree
+    f x = case x of                                                         is not shared, then only a single new node is allocated. More-
+       (let r = proj1 x ; inc r ; dec x ; ret r)                            over, even if the input tree is shared we have observed a positive
+       (dec x ; let y1 = ctor1 ; let y2 = ctor1 y1 ;                        performance impact using reset and reuse. The recursive call
+        let r = f y2 ; ret r)                                               (insert a x) always returns a nonshared node even if x is shared.
+                                                                            Thus, balance1 y b (insert a x) always reuses at least one memory
+6    OPTIMIZING FUNCTIONAL DATA                                             cell at runtime.
+                                                                               There is another way to avoid the unnecessary memory alloca-
+     STRUCTURES FOR reset/reuse                                             tion that does not rely on inlining. We can chain the T constructor
+In the previous section, we have shown how to automatically insert          value from insert to balance1 . We accomplish this by rewriting
+reset and reuse instructions that minimize the number of mem-               balance1 and insert as follows
+ory allocations at execution time. We now discuss techniques we
+have been using for taking advantage of this transformation when            balance1 (T _ _ v t) (T _ (T R l x r1 ) y r2 ) = T R (T B l x r1 ) y (T B r2 v t)
+writing functional code. Two fundamental questions when using               balance1 (T _ _ v t) (T _ l1 y (T R l2 x r)) = T R (T B l1 y l2 ) x (T B r v t)
+this optimization are: Does a reuse instruction now guard my con-           balance1 (T _ _ v t) (T _ l y r) = T B (T R l y r) v t
+structor applications? Given a let y = reset x instruction, how             insert (T B a y b) x = balance1 (T B E y b) (insert a x) if x < y and a is red
+often is x not shared at runtime? We address the first question using
+a simple static analyzer that when invoked by a developer, checks           Now, the input value (T B a y b) is reused to create value (T B E y b)
+whether reuse instructions are guarding constructor applications            which is passed to balance1 . Note that we have replaced a with E to
+in a particular function. This kind of analyzer is straightforward to       make sure the recursive application (insert a x) may also perform
+implement in Lean since our IR is a Lean inductive datatype. This           destructive updates if a is not shared. This simple modification
+kind of analyzer is in the same spirit of the inspection-testing pack-      guarantees that balance1 does not allocate memory when the input
+age available for GHC [Breitner 2018]. We cope with the second              trees are not shared.
+question using runtime instrumentation. For each let y = reset x
+instruction, we can optionally emit two counters that track how             7 RUNTIME IMPLEMENTATION
+often x is shared or not. We have found these two simple techniques
+quite useful when optimizing our own code. Here, we report one
+                                                                            7.1 Values
+instance that produced a significant performance improvement.               In our runtime, every value starts with a header containing two
+                                                                            tags. The first tag specifies the value kind: ctor, pap, array, string,
+Red-black trees                                                             num, thunk, or task. The second tag specifies whether the value is
+                                                                            single-threaded, multi-threaded, or persistent. We will describe how
+Red-black trees are implemented in the Lean standard library and
+                                                                            this kind is used to implement thread safe reference counting in
+are often used to write proof automation. For the purposes of this
+                                                                            the next subsection. The kinds ctor and pap are used to implement
+section, it is sufficient to have an abstract description of this kind
+                                                                            the corresponding values used in the formal semantics of λ pure and
+of tree, and one of the re-balancing functions used by the insertion
+                                                                            λ RC . The kinds array, string, and thunk are self explanatory. The
+function.
+                                                                            kind num is for arbitrary precision numbers implemented using the
+Color = R | B                                                               GNU multiple precision library (GMP). The task value is described
+Tree a = E | T Color (Tree a) a (Tree a)                                    in the next subsection.
+balance1 v t (T _ (T R l x r1 ) y r2 ) = T R (T B l x r1 ) y (T B r2 v t)      Values tagged as single- or multi-threaded also contain a refer-
+balance1 v t (T _ l1 y (T R l2 x r)) = T R (T B l1 y l2 ) x (T B r v t)     ence counter. This counter is stored in front of the standard value
+balance1 v t (T _ l y r) = T B (T R l y r) v t                              header. We will primarily focus on the layout of ctor values here
+                                                                            because it is the most relevant one for the ideas presented in this
+insert (T B a y b) x = balance1 y b (insert a x) if x < y and a is red
+                                                                            paper. A ctori value header also includes the constructor index i,
+...
+                                                                            the number of pointers to other values and/or boxed values, and
+Note that the first two balance1 equations create three T construc-         the number of bytes used to store scalar unboxed values such as
+tor values, but the patterns on the left-hand side use only two T           machine integers and enumeration types. In a 64-bit machine, the
+constructors. Thus, the generated IR for balance1 contains T con-           ctor value header is 16 bytes long, twice the size of the header
+structor applications that are not guarded by reuse, and this fact          used in OCaml to implement the corresponding kind of value. After
+can be detected at compilation time. Note that even if the result of        the header, we store all pointers to other values and boxed values,
+Counting Immutable Beans                                                                                                      IFL’19, September 2019, Singapore
+
+
+and then all unboxed values. Thus, in a 64 bit machine, our run-            single thread and a multi-threaded one by one or more threads.
+time uses 32 bytes to implement a List Cons value: 16 bytes for the         If a value is tagged as single-threaded, we do not use any mem-
+header, and 16 bytes for storing the list head and tail. The unboxed        ory fence for incrementing or decrementing its reference counter.
+value support has restrictions similar to the ones found in GHC.            Persistent values are never deallocated and do not even need a ref-
+For example, to pass an unboxed value to a polymorphic function             erence counter. We use persistent values to implement values that
+we must first box it.                                                       are created at program initialization time and remain alive until
+   Our runtime has built-in support for array and string operations.        program termination. Our runtime enforces the following invariant:
+Strings are just a special case of arrays where the elements are            from persistent values, we can only reach other persistent values,
+characters. We perform destructive updates when the array is not            and from multi-threaded values, we can only reach persistent or
+shared. For example, given the array write primitive                        multi-threaded values. There are no constraints on the kind of value
+Array.write : Array α → Nat → α → Array α                                   that can be reached from a single-threaded value. By default, val-
+                                                                            ues are single-threaded, and our runtime provides a markMT(o)
+the function application Array.write a i v will destructively update        procedure that tags all single-threaded values reachable from o as
+and return the array a if it is not shared. This is a well known            multi-threaded. This procedure is used to implement Task.mk f and
+optimization for systems based on reference counting [Jones and             Task.bind x f. We use markMT(f ) and markMT(x) to ensure that all
+Lins 1996], nonetheless we mention it here because it is relevant           values reachable from these values are tagged as multi-threaded
+for many applications. Moreover, destructive array updates and our          before we create a new task, that is, while they are still accessible
+reset/reuse technique complement each other. As an example, if              from only one thread. Our invariant ensures that markMT does
+we have a nonshared list of integer arrays xs, map (Array.map inc) xs       not need to visit values reachable from a value already tagged as
+destructively updates the list and all arrays. In the experimental          multi-threaded. Thus values are visited at most once by markMT
+section we demonstrate that our pure quick sort is as efficient as          during program execution. Note that task creation is not a constant
+the quick sort using destructive updates in OCaml, and the quick            time operation in our approach because it is proportional to the
+sort using the primitive ST monad in Haskell.                               number of single-threaded values reachable from x and f . This does
+                                                                            not seem to be a problem in practice, but if it becomes an issue we
+7.2    Thread safety                                                        can provide a primitive asMT д that ensures that all values allocated
+We use the following basic task management primitives to develop            when executing д are immediately tagged as multi-threaded. Users
+the Lean frontend.                                                          would then use this flag in code that creates the values reachable
+                                                                            by Task.mk f and Task.bind x f.
+Task.mk : (Unit → α) → Task α
+                                                                               The reference counting operations perform an extra operation
+Task.bind : Task α → (α → Task β) → Task β
+                                                                            to test the value tag and decide whether a memory fence is needed
+Task.get : Task α → α                                                       or not. This additional test does not require any synchronization
+The function Task.mk converts a closure into a task value and               because the tag is only modified before a value is shared with other
+executes it in a separate thread, Task.bind t f creates a task value        execution threads. In the experimental section, we demonstrate
+that waits for t to finish and produce result a, and then starts f a        that this simple approach significantly boosts performance. This
+and waits for it to finish. Finally, Task.get t waits for t to finish and   is not surprising because the additional test is much cheaper than
+returns the value produced by it. These primitives are part of the          memory fences on modern hardware. The approach above can be
+Lean runtime, implemented in C++, and are available to regular              adapted to more complex libraries for writing multi-threaded code.
+users.                                                                      We just need to identify which functions may send values to other
+   The standard way of implementing thread safe reference count-            execution threads, and use markMT.
+ing uses memory fences [Schling 2011]. The reference counters are
+incremented using an atomic fetch and add operation with a relaxed          8    EXPERIMENTAL EVALUATION
+memory order. The relaxed memory order can be used because new              We have implemented the RC optimizations described in the pre-
+references to a value can only be formed from an existing reference,        vious sections in the new compiler for the Lean programming
+and passing an existing reference from one thread to another must           language. We have implemented all optimizations in Lean, and they
+already provide any required synchronization. When decrementing             are available online 5 . At the time of writing, the compiler supports
+a reference counter, it is important to enforce that any decrements         only one backend where we emit C code. We are currently work-
+of the counter from other threads are visible before checking if the        ing on an LLVM backend for our compiler. To test the efficiency
+object should be deleted. The standard way of achieving this effect         of the compiler and RC optimizations, we have devised a number
+uses a release operation after dropping a reference, and an acquire         of benchmarks6 that aim to replicate common tasks performed in
+operation before the deletion check. This approach has been used            compilers and proof assistants. All timings are arithmetic means of
+in the previous version of the Lean compiler, and we have observed          50 runs as reported by the temci benchmarking tool [Bechberger
+that the memory fences have a significant performance impact even           2016], executed on a PC with an i7-3770 Intel CPU and 16 GB RAM
+when only one thread is being executed. This is quite unfortunate           running Ubuntu 18.04, using Clang 9.0.0 for compiling the Lean
+because most values are only touched by a single execution thread.          runtime library as well as the C code emitted by the Lean compiler.
+   We have addressed this performance problem in our runtime
+by tagging values as single-threaded, multi-threaded, or persistent.        5 https://github.com/leanprover/lean4/tree/master/library/init/lean/compiler/ir
+
+As the name suggests, a single-threaded value is accessed by a              6 https://github.com/leanprover/lean4/tree/IFL19/tests/bench
+IFL’19, September 2019, Singapore                                                                               Sebastian Ullrich and Leonardo de Moura
+
+
+                                base     -reuse    -borrow     -ST           rbmap, and unionfind. The borrowed inference heuristic provides
+                                                                             significant speedups in benchmarks binarytrees and deriv.
+            binarytrees         1.0 ˜0    0.9 ˜8      1.1 ˜4   1.22˜
+                                                                                 We have also directly translated some of these programs to
+            deriv               1.00˜     1.00        1.16˜    1.42
+                                                                             other statically typed, functional languages: Haskell, OCaml, and
+            const_fold          1.00      1.64        0.90     1.23
+                                                                             Standard ML (Fig. 7). For the latter we selected the compilers ML-
+            parser              1.00      1.00        1.0 ˜0   1.68
+                                                                             ton [Weeks 2006], which performs whole program optimization and
+            qsort               1.00      1.00        1.00     1.13
+                                                                             can switch between multiple GC schemes at runtime, and MLKit,
+            rbmap               1.00˜     3.23        1.07˜    1.71
+                                                                             which combines Region Inference and garbage collection [Hallen-
+              rbmap_10          1.49      3.62        1.52     2.43
+                                                                             berg et al. 2002]. While not primarily a functional language, we have
+              rbmap_1           4.7 ˜2    5.42        4.47     8.02
+                                                                             also included Swift as a popular statically typed language using ref-
+            unionfind           1.0 ˜0    1.4 ˜1      1.0 ˜0   2.31
+                                                                             erence counting. For binarytrees, we have used the original files
+            geom. mean          1.24      1.74        1.27˜    1.89          and compiler flags from the fastest Benchmark Game implementa-
+                                                                             tions. For Swift, we used the second-fastest, safe implementation,
+Figure 6: Lean variant benchmarks, normalized by the base                    which is much more comparable to the other versions than the
+run time (rbmap for rbmap_*). Digits whose order of magni-                   fastest one completely depending on unsafe code. The Benchmark
+tude is no larger than that of twice the standard deviation                  Game does not include an SML version. For qsort, the Lean code
+are marked by squiggly lines.                                                is pure and relies on the fact that array updates are destructive if
+                                                                             the array is not shared. The Swift code behaves similarly because
+                                                                             Swift arrays are copy-on-write. All other versions use destructive
+     • deriv and const_fold implement differentiation and con-               updates, using the ST monad in the case of Haskell.
+       stant folding, respectively, as examples of symbolic term                 While the absolute runtimes in Fig. 7 are influenced by many
+       manipulation where big expressions are constructed and                factors other than the implementation of garbage collection that
+       transformed. We claim they reflect operations frequently              make direct comparisons difficult, the results still signify that both
+       performed by proof automation procedures used in theorem              our garbage collection and the overall runtime and compiler imple-
+       provers.                                                              mentation are very competitive. We initially conjectured the good
+     • rbmap stress tests the red-black tree implementation from             performance was a result of reduced cache misses due to reusing al-
+       the Lean standard library. The benchmarks rbmap_10 and                locations and a lack of GC tracing. However, the results demonstrate
+       rbmap_1 are two variants where we perform updates on                  this is not the case. The only benchmark where the code gener-
+       shared trees.                                                         ated by our compiler produces significantly fewer cache misses
+     • parser is the new parser we are developing for the next               is rbmap. Note that Lean is 5x as fast as OCaml on const_fold
+       version of Lean. It is written purely in Lean (approximately          even though it triggers more cache misses per second. The results
+       2000 lines of code).                                                  suggest that Lean code is often faster in the benchmarks where the
+     • qsort it is the basic quicksort algorithm for sorting arrays.         code generated by other compilers spends a significant amount of
+     • binarytrees is taken from the Computer Languages Bench-               time performing GC. Using const_fold as an example again, Lean
+       marks Game7 . This benchmark is a simple adaption of Hans             spends only 17% of the runtime deallocating memory, while OCaml
+       Boehm’s GCBench benchmark8 . The Lean version is a trans-             spends 90% in the GC. This comparison is not entirely precise since
+       lation of the fastest, parallelized Haskell solution, using Task      it does not include the amount of time Lean spends updating refer-
+       in place of the Haskell parallel API.                                 ence counts, but it seems to be the most plausible explanation for
+     • unionfind implements the union-find algorithm which is                the difference in performance. The results for qsort are surprising,
+       frequently used to implement decision procedures in auto-             the Lean and Swift implementations outperforms all destructive
+       mated reasoning. We use arrays to store the find table, and           ones but MLton. We remark that MLton and Swift have a clear ad-
+       thread the state using a state monad transformer                      vantage since they use arrays of unboxed machine integers, while
+                                                                             Lean and the other compilers use boxed values. We did not find
+   We have tested the impact of each optimization by selectively             a way to disable this optimization in MLton or Swift to confirm
+disabling it and comparing the resulting runtime with the base               our conjecture. We believe this benchmark demonstrates that our
+runtime (Fig. 6):                                                            compiler allows programmers to write efficient pure code that uses
+     • -reuse disables the insertion of reset/reuse operations               arrays and hashtables. For rbmap, Lean is much faster than all other
+     • -borrow disables borrow inference, assuming that all param-           systems except for OCaml. We imagined this would only be the case
+       eters are owned. Note that the compiler must still honor              when the tree was not shared. Then we devised the two variants
+       borrow annotations on builtins, which are unaffected.                 rbmap_10 and rbmap_1 which save the current tree in a list after ev-
+     • -ST uses atomic RC operations for all values                          ery tenth or every insertion, respectively. The idea is to simulate the
+   The results show that the new reset and reuse instructions                behavior of a backtracking search where we store a copy of the state
+significantly improve performance in the benchmarks const_fold,              before each case-split. As expected, Lean’s performance decreases
+                                                                             on these two variants since the tree is now a shared value, and the
+7 https://benchmarksgame-team.pages.debian.net/benchmarksgame/performance/   time spent deallocating objects increases substantially. However,
+binarytrees.html                                                             Lean still outperforms all systems but MLton on rbmap_1. In all
+8 http://hboehm.info/gc/gc_bench/                                            other systems but MLton and Swift, the time spent on GC increases
+Counting Immutable Beans                                                                                                         IFL’19, September 2019, Singapore
+
+
+                            Lean 4              GHC 8.8.3         ocamlopt 4.10           MLton 20180207                 MLKit 4.4.2               Swift 5.1.1
+                   Time       Del    CM   Time       GC     CM   Time    GC     CM       Time       GC      CM        Time     GC     CM      Time      GC       CM
+ binarytrees        1.00˜    38%      8    3.3˜ 8˜   74%    13   1.31˜     —      17        —         —       —          —        —    —       5.35˜    59%      10
+ deriv              1.00˜    22˜ %   12    2.23      43%     6   1.51    78%       6      0.98     21%        18       4.22    59%     20      3.73˜    42%       6
+ const_fold         1.00     1 ˜3%   18    2.73      59%     7   5.11    90%       5      1.15     29%        30       4.59˜   64%     14      6.3 ˜0   49%      11
+ qsort              1.00     1 ˜0%    0    1.76       1%     0   1.37    34%       0      0.54      0˜ %       0       3.17     ˜0%     0      0.6 ˜4    0˜ %     0
+ rbmap              1.00˜     ˜3%     3    2.44      36%     5   1.03˜   32%       5      3.25     30%        32       6.49    60%     10      8.0 ˜8   59%       1
+   rbmap_10         1.49     13˜ %   11    3.88      58%     7   1.91˜   59%       9      3.48     29%        32       9.34    72%     16      8.67˜    55%       3
+   rbmap_1          4.72˜    28%     22   14.66      87%     8   9.20    89%      13      4.43     37%        30      15.50    84%     32     12.7 ˜6   48%      14
+
+Figure 7: Cross-language benchmarks. The measurements include wall clock time (normalized by the Lean base run time), GC
+time (in percent, as reported by the respective compiler), and last-level cache misses (CM, in million per second, as reported
+by perf stat). For Swift, we measure time spent in inc, dec, and deallocation runtime functions as GC time using perf. For
+Lean, the former are always inlined, so we can only measure object deletion time.
+
+
+considerably. Finally, we point out that MLton spends significantly            let alone more complex functions such as the red black tree re-
+less time on GC than the other languages using a tracing GC in                 balancing function balance1 .
+general.                                                                           While not a purely functional language, the Swift programming
+                                                                               language9 has directly influenced many parts of our work. To the
+                                                                               best of our knowledge, Swift was the first non-research language to
+                                                                               use an intermediate representation with explicit RC instructions, as
+9    RELATED WORK                                                              well as the idea of (safely) avoiding RC operations via “borrowed”
+The idea of representing RC operations as explicit instructions so             parameters (which are called “+0” or “guaranteed” in Swift), in its
+as to optimize them via static analysis is described as early as Barth         implementation. While Swift’s primitives may also elide copies
+[1977]. Schulte [1994] describes a system with many features similar           when given a unique reference, no speculative destructive updates
+to ours. In general, Schulte’s language is much simpler than ours,             are introduced for user-defined types, but this may not be as impor-
+with a single list type as the only non-primitive type, and no higher-         tant for an impure language as it is for Lean. Parameters default to
+order functions. He does not give a formal dynamic semantics for his           borrowed in Swift, but the compiler may locally change the calling
+system. He gives an algorithm for inserting RC instructions that, like         convention inside individual modules.
+ours, has an on-the-fly optimization for omitting inc instructions if              Baker [1994] describes optimizing reference counting by use of
+a variable is already dead and would immediately be decremented                two pointer kinds, a standard one and a deferred increment pointer
+afterwards. Schulte briefly discusses how RC operations can be                 kind. The latter kind can be copied freely without adding RC opera-
+minimized by treating some parameters as “nondestructive” in                   tions, but must be converted into the standard kind by incrementing
+the sense of our borrowed references. In contrast to our inference             it before storing it in an object or returning it. The two kinds are
+of borrow annotations, Schulte proposes to create one copy of a                distinguished at runtime by pointer tagging. Our borrowed ref-
+function for each possible destructive/nondestructive combination              erences can be viewed as a static refinement of this idea. Baker
+of parameters (i.e. exponential in the number of (non-primitive)               then describes an extended version of deferred-increment he calls
+parameters) and to select an appropriate version for each call site            anchored pointers that store the stack level (i.e. the lifetime) of the
+of the function. Our approach never duplicates code.                           standard pointer they have been created from. Anchored pointers
+   Introducing destructive updates into pure programs has tradi-               do not have to be converted to the standard kind if returned from a
+tionally focused on primitive operations like array updates [Hudak             stack frame above this level. In order to statically approximate this
+and Bloss 1985], particularly in the functional array languages                extended system, we would need to extend our type system with
+Sisal [McGraw et al. 1983] and SaC [Scholz 1994]. Grelck and Tro-              support for some kind of lifetime annotations on return types as
+jahner [2004] propose an alloc_or_reuse instruction for SaC that               featured in Cyclone [Jim et al. 2002] and Rust [Matsakis and Klock
+can select one of multiple array candidates for reuse, but do not de-          2014].
+scribe heuristics for when to use the instruction. Férey and Shankar               Ungar et al. [2017] optimize Swift’s reference counting scheme
+[2016] describe how functional update operations explicit in the               by using a single bit to tag objects possibly shared between multiple
+source language can be turned into destructive updates using the               threads, much like our approach. However, because of mutability,
+reference counter. In contrast, Schulte [1994] presents a “reusage”            every single store operation must be intercepted to (recursively) tag
+optimization that has an effect similar to the one obtained with               objects before becoming reachable from an already tagged object.
+our reset/reuse instructions. In particular, it is independent of              Choi et al. [2018] remove the need for tagging by extending every
+a specific surface-level update syntax. However, his optimization              object header with the ID of the thread T that allocated the value,
+(transformation T 14) is more restrictive and is only applicable to            and two reference counters: a shared one that requires atomic
+a branch of a case x if x is dead at the beginning of the branch.
+His optimization cannot handle the simple swap described earlier,              9 https://developer.apple.com/swift/
+IFL’19, September 2019, Singapore                                                                                                     Sebastian Ullrich and Leonardo de Moura
+
+
+operations, and another one that is only updated by T . Thanks                                Lang. 1, ICFP (Sept. 2017). https://doi.org/10.1145/3110278
+to immutability, we can make use of the simpler scheme without                            Gaspard Férey and Natarajan Shankar. 2016. Code Generation Using a Formal Model
+                                                                                              of Reference Counting. In Proceedings of the 8th International Symposium on NASA
+introducing store barriers during normal code generation. Object                              Formal Methods - Volume 9690 (NFM 2016). Springer-Verlag New York, Inc., New
+tagging instead only has to be done in threading primitives.                                  York, NY, USA, 150–165. https://doi.org/10.1007/978-3-319-40648-0_12
+                                                                                          Cormac Flanagan, Amr Sabry, Bruce F. Duba, and Matthias Felleisen. 1993. The
+                                                                                              Essence of Compiling with Continuations. In Proceedings of the ACM SIGPLAN 1993
+10     CONCLUSION                                                                             Conference on Programming Language Design and Implementation (PLDI ’93). ACM,
+                                                                                              New York, NY, USA, 237–247. https://doi.org/10.1145/155090.155113
+We have explored reference counting as a memory management                                Clemens Grelck and Kai Trojahner. 2004. Implicit memory management for SAC. In Im-
+technique in the context of an eager and pure functional program-                             plementation and Application of Functional Languages, 16th International Workshop,
+                                                                                              IFL, Vol. 4. 335–348.
+ming language. Our preliminary experimental results are encour-                           Niels Hallenberg, Martin Elsman, and Mads Tofte. 2002. Combining Region Inference
+aging and show our approach is competitive with state-of-the-art                              and Garbage Collection. In ACM SIGPLAN Conference on Programming Language
+compilers for functional languages and often outperform them. Our                             Design and Implementation (PLDI’02). ACM Press. Berlin, Germany.
+                                                                                          Paul Hudak and Adrienne Bloss. 1985. The Aggregate Update Problem in Functional
+resurrection hypothesis suggests there are many opportunities for                             Programming Systems. In Proceedings of the 12th ACM SIGACT-SIGPLAN Symposium
+reusing memory and performing destructive updates in functional                               on Principles of Programming Languages (POPL ’85). ACM, New York, NY, USA,
+programs. We have also explored optimizations for reducing the                                300–314. https://doi.org/10.1145/318593.318660
+                                                                                          Trevor Jim, J Gregory Morrisett, Dan Grossman, Michael W Hicks, James Cheney, and
+number of reference counting updates, and proposed a simple and                               Yanling Wang. 2002. Cyclone: A Safe Dialect of C. In USENIX Annual Technical
+efficient technique for implementing thread safe reference counting.                          Conference, General Track. 275–288.
+                                                                                          Richard Jones and Rafael D Lins. 1996. Garbage Collection: Algorithms for Automatic
+   We barely scratched the surface of the design space, and there                             Dynamic Memory Management. Wiley.
+are many possible optimizations and extensions to explore. We                             Nicholas D. Matsakis and Felix S. Klock, II. 2014. The Rust Language. In Proceedings of
+hope our λ pure will be useful in the future as a target representa-                          the 2014 ACM SIGAda Annual Conference on High Integrity Language Technology
+                                                                                              (HILT ’14). ACM, New York, NY, USA, 103–104. https://doi.org/10.1145/2663171.
+tion for other purely functional languages (e.g., Coq, Idris, Agda,                           2663188
+and Matita). We believe our approach can be extended to program-                          Luke Maurer, Paul Downen, Zena M. Ariola, and Simon Peyton Jones. 2017. Compiling
+ming languages that support cyclic data structures because it is                              Without Continuations. In Proceedings of the 38th ACM SIGPLAN Conference on
+                                                                                              Programming Language Design and Implementation (PLDI 2017). ACM, New York,
+orthogonal to traditional cycle-handling techniques. Finally, we are                          NY, USA, 482–494. https://doi.org/10.1145/3062341.3062380
+working on a formal correctness proof of the compiler described in                        J. Harold McBeth. 1963. Letters to the Editor: On the Reference Counter Method.
+                                                                                              Commun. ACM 6, 9 (Sept. 1963), 575–. https://doi.org/10.1145/367593.367649
+this paper, using a type system based on intuitionistic linear logic                      James McGraw, Stephen Skedzielewski, Stephen Allan, D Grit, R Oldehoeft, J Glauert, I
+to model owned and borrowed references.                                                       Dobes, and P Hohensee. 1983. SISAL: streams and iteration in a single-assignment lan-
+                                                                                              guage. Language reference manual, Version 1. Technical Report. Lawrence Livermore
+                                                                                              National Lab., CA (USA).
+ACKNOWLEDGMENTS                                                                           Boris Schling. 2011. The Boost C++ Libraries. XML Press.
+                                                                                          Sven-Bodo Scholz. 1994. Single Assignment C - Functional Programming Using Imper-
+We are very grateful to Thomas Ball, Johannes Bechberger, Chris-                              ative Style. In In John Glauert (Ed.): Proceedings of the 6th International Workshop
+tiano Braga, Sebastian Graf, Simon Peyton Jones, Daan Leijen,                                 on the Implementation of Functional Languages. University of East Anglia.
+Tahina Ramananandro, Nikhil Swamy, Max Wagner and the anony-                              Wolfram Schulte. 1994. Deriving Residual Reference Count Garbage Collectors. In
+                                                                                              Proceedings of the 6th International Symposium on Programming Language Im-
+mous reviewers for extensive comments, corrections and advice.                                plementation and Logic Programming (PLILP ’94). Springer-Verlag, London, UK,
+                                                                                              102–116.
+                                                                                          David Ungar, David Grove, and Hubertus Franke. 2017. Dynamic Atomicity: Optimizing
+REFERENCES                                                                                    Swift Memory Management. In Proceedings of the 13th ACM SIGPLAN International
+Henry G. Baker. 1994. Minimizing Reference Count Updating with Deferred and                   Symposium on on Dynamic Languages (DLS 2017). ACM, New York, NY, USA, 15–26.
+    Anchored Pointers for Functional Data Structures. SIGPLAN Not. 29, 9 (Sept. 1994),        https://doi.org/10.1145/3133841.3133843
+    38–43. https://doi.org/10.1145/185009.185016                                          Stephen Weeks. 2006. Whole-program Compilation in MLton. In Proceedings of the
+Jeffrey M. Barth. 1977. Shifting Garbage Collection Overhead to Compile Time. Com-            2006 Workshop on ML (ML ’06). ACM, New York, NY, USA, 1–1. https://doi.org/10.
+    mun. ACM 20, 7 (July 1977), 513–518. https://doi.org/10.1145/359636.359713                1145/1159876.1159877
+Johannes Bechberger. 2016. Besser Benchmarken. https://pp.ipd.kit.edu/publication.        Paul R. Wilson. 1992. Uniprocessor garbage collection techniques. In Memory Manage-
+    php?id=bechberger16bachelorarbeit https://github.com/parttimenerd/temci.                  ment, Yves Bekkers and Jacques Cohen (Eds.). Springer Berlin Heidelberg, Berlin,
+Hans-J. Boehm. 2004. The Space Cost of Lazy Reference Counting. In Proceedings of the         Heidelberg, 1–42.
+    31st ACM SIGPLAN-SIGACT Symposium on Principles of Programming Languages
+    (POPL ’04). ACM, New York, NY, USA, 210–219. https://doi.org/10.1145/964001.
+    964019
+Joachim Breitner. 2018. A promise checked is a promise kept: Inspection Testing. arXiv
+    preprint arXiv:1803.07130 (2018).
+Jiho Choi, Thomas Shull, and Josep Torrellas. 2018. Biased Reference Counting: Mini-
+    mizing Atomic Operations in Garbage Collection. In Proceedings of the 27th Interna-
+    tional Conference on Parallel Architectures and Compilation Techniques (PACT ’18).
+    ACM, New York, NY, USA, Article 35, 12 pages. https://doi.org/10.1145/3243176.
+    3243195
+George E. Collins. 1960. A Method for Overlapping and Erasure of Lists. Commun.
+    ACM 3, 12 (Dec. 1960), 655–657. https://doi.org/10.1145/367487.367501
+Thierry Coquand and Gérard Huet. 1988. The Calculus of Constructions. Inform. and
+    Comput. 76, 2-3 (1988), 95–120.
+Thierry Coquand and Christine Paulin. 1990. Inductively Defined Types. In COLOG-88
+    (Tallinn, 1988). Lecture Notes in Comput. Sci., Vol. 417. Springer, Berlin, 50–66.
+Leonardo de Moura, Soonho Kong, Jeremy Avigad, Floris van Doorn, and Jakob von
+    Raumer. 2015. The Lean Theorem Prover (System Description). In Automated
+    Deduction - CADE-25 - 25th International Conference on Automated Deduction, 2015,
+    Proceedings. 378–388.
+Gabriel Ebner, Sebastian Ullrich, Jared Roesch, Jeremy Avigad, and Leonardo de Moura.
+    2017. A Metaprogramming Framework for Formal Verification. Proc. ACM Program.
+

@@ -13,10 +13,12 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import statistics
 import subprocess
 import tempfile
 import time
+from clang_helpers import clang_command
 try:
     import resource
 except ImportError:
@@ -88,7 +90,7 @@ def main():
     compiler_bytes = compiler.read_bytes()
     report = {'platform': platform.platform(), 'machine': platform.machine(),
               'compiler_sha256': hashlib.sha256(compiler_bytes).hexdigest(),
-              'workspace_source_sha256': hashlib.sha256((ROOT/'src/compiler.min').read_bytes()).hexdigest(),
+              'workspace_source_sha256': hashlib.sha256((ROOT/'compiler/compiler.min').read_bytes()).hexdigest(),
               'method': __doc__, 'config': {k: str(v) if isinstance(v, Path) else v for k,v in vars(args).items()},
               'results': [], 'scaling': []}
     with tempfile.TemporaryDirectory(prefix='minyar-module-perf-') as name:
@@ -109,7 +111,11 @@ def main():
                 # Check deduplication even for the large shared graph. Running
                 # that graph would recursively repeat calls exponentially.
                 timed([compiler, entry, llvm])
-                definitions = [line for line in llvm.read_text().splitlines() if line.startswith('define ')]
+                symbols = re.findall(r'^define [^@\n]*@([^\s(]+)\(', llvm.read_text(), re.M)
+                # Runtime fast paths are emitted once in their private namespace.
+                # Count source functions separately, but reject duplicate helpers too.
+                assert len(symbols) == len(set(symbols)), (shape, count, 'duplicate LLVM definition')
+                definitions = [name for name in symbols if name == 'main' or name.strip('"').startswith('.minyar.fn.')]
                 assert len(definitions) == count * (args.functions + 1) + 1, (shape, count, len(definitions))
                 for scenario in ('unchanged', 'entry-edit', 'dependency-edit', 'interface-edit'):
                     entry.write_text(original)
@@ -143,7 +149,7 @@ def main():
             llvm = entry.with_suffix('.ll')
             program = entry.with_suffix('.exe')
             timed([compiler, entry, llvm])
-            timed([args.clang, '-O0', '-Wno-override-module', llvm, runtime, '-o', program])
+            timed(clang_command([args.clang, '-O0', '-Wno-override-module', llvm, runtime, '-o', program]))
             assert subprocess.check_output([str(program)], text=True, timeout=30) == expected
     for shape in args.shapes:
         rows = sorted((r for r in report['results'] if r['shape'] == shape and r['scenario'] == 'unchanged'), key=lambda r:r['modules'])

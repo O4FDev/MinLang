@@ -22,7 +22,7 @@ except ImportError:  # Windows
 
 ROOT = Path(__file__).resolve().parent.parent
 COMPILER = ROOT / "build" / "minyarc"
-SOURCE = ROOT / "src" / "compiler.min"
+SOURCE = ROOT / "compiler" / "compiler.min"
 OUTPUT = ROOT / "build" / "self-compile-budget.ll"
 REFERENCE = ROOT / "build" / "compiler-stage3.ll"
 
@@ -57,6 +57,8 @@ def retired_instructions() -> int | None:
     for _ in range(5):
         result = subprocess.run(["/usr/bin/time", "-l", str(COMPILER), str(SOURCE), str(OUTPUT)],
                                 text=True, capture_output=True)
+        if result.returncode != 0:
+            raise SystemExit(f"self-compile failed during instruction measurement:\n{result.stderr}")
         match = re.search(r"(\d+)\s+instructions retired", result.stderr)
         if not match:
             return None

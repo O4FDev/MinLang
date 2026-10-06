@@ -19,6 +19,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+from clang_helpers import clang_command
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILES = {
@@ -160,7 +161,7 @@ def main():
         environment.update(MINYAR_TEST_COMPILER=str(compiler), MINYAR_TEST_CLANG=clang)
         report['environment'] = {key: value for key, value in environment.items()
                                  if key.startswith(('MINYAR_', 'ASAN_', 'UBSAN_'))}
-        report['clang_version'] = execute('clang-version', [clang, '--version'], environment)
+        report['clang_version'] = execute('clang-version', clang_command([clang, '--version']), environment)
         report['compiler_banner'] = execute('compiler-version', [compiler], environment)
         for profile in profiles:
             budgets = [32] if profile == 'eager' else report['budgets']
@@ -170,8 +171,8 @@ def main():
                     flags = ['-O2'] if mode == 'native' else ['-O1', '-g', '-fsanitize=address,undefined']
                     backend = [*PROFILES[profile], f'-DMINYAR_RC_POLL_BUDGET={budget}']
                     runtime = stage / 'build/minyar-runtime.o'
-                    execute(label + '-runtime', [clang, '-std=c11', *flags, *backend, '-c',
-                            stage / 'tests/memory-contracts-runtime.c', '-o', runtime], environment)
+                    execute(label + '-runtime', clang_command([clang, '-std=c11', *flags, *backend, '-c',
+                            stage / 'tests/memory-contracts-runtime.c', '-o', runtime]), environment)
                     link_flags = [] if mode == 'native' else ['-fsanitize=address,undefined']
                     selected_env = {**environment, 'MINYAR_TEST_RUNTIME': str(runtime),
                                     'MINYAR_TEST_LINK_FLAGS': shlex.join(link_flags)}
@@ -199,8 +200,8 @@ def main():
                     if args.level != 'smoke':
                         if profile == 'eager':
                             unit = evidence / 'artifacts' / label / 'runtime-unit'
-                            execute(label + '-unit-build', [clang, '-std=c11', *flags,
-                                    stage / 'tests/runtime-unit.c', '-o', unit], environment)
+                            execute(label + '-unit-build', clang_command([clang, '-std=c11', *flags,
+                                    stage / 'tests/runtime-unit.c', '-o', unit]), environment)
                             execute(label + '-unit-model', [unit], environment)
                         scripts = LANGUAGE + (('regressions.py', 'adversarial.py') if args.level == 'extended' else ())
                         for script in scripts:

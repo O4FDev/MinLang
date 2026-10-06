@@ -42,12 +42,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path)
     args = parser.parse_args()
-    core = adapt((ROOT / 'src/compiler.min').read_text(),
-                 (ROOT / 'src/module-compiler-adapter.patch').read_text())
+    core = adapt((ROOT / 'compiler/compiler.min').read_text(),
+                 (ROOT / 'compiler/module-compiler-adapter.patch').read_text())
     matches = list(re.finditer(r'^function main\(', core, re.MULTILINE))
     if len(matches) != 1 or re.search(r'^function ', core[matches[0].end():], re.MULTILINE):
         raise SystemExit('compiler main must be its one final function')
-    frontend = (ROOT / 'src/module-compiler.min').read_text()
+    frontend = (ROOT / 'compiler/module-compiler.min').read_text()
     assembled = core[:matches[0].start()] + '\n' + frontend
     names = re.findall(r'^function (\w+)\(', assembled, re.MULTILINE)
     if len(names) != len(set(names)):

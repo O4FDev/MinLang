@@ -5,6 +5,7 @@ import subprocess
 import sys
 import unittest
 from regressions import CompilerTestCase, CLANG, RUNTIME, LINK_FLAGS
+from clang_helpers import clang_command
 
 class Memory(CompilerTestCase):
     def test_discarded_text_is_reclaimed(self):
@@ -14,7 +15,7 @@ class Memory(CompilerTestCase):
         for optimization in ('-O0', '-O2'):
             with self.subTest(optimization=optimization):
                 exe = llvm.with_suffix('.' + optimization[1:])
-                subprocess.run([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], check=True, capture_output=True, timeout=30)
+                subprocess.run(clang_command([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)]), check=True, capture_output=True, timeout=30)
                 # Measure only the program in a fresh parent; the linker must not
                 # contaminate RUSAGE_CHILDREN's maximum resident set size.
                 measurement = subprocess.run([sys.executable, '-c', 'import json,resource,subprocess,sys; p=subprocess.run([sys.argv[1]],capture_output=True); print(json.dumps([p.returncode,p.stdout.decode(),resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss]))', str(exe)], text=True, capture_output=True, check=True, timeout=30)

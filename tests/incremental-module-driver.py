@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from clang_helpers import clang_command
 
 ROOT=Path(__file__).resolve().parents[1]
 DRIVER=Path(os.environ.get('MINYAR_MODULE_DRIVER',ROOT/'build/minyar-module-build')).resolve()
@@ -39,7 +40,7 @@ with tempfile.TemporaryDirectory(prefix='minyar-native-cache-') as name:
     assert build()==(2,0,0,2,0,0),'mtime changed compiler identity'
     before=library.stat();library.write_text(library.read_text().replace('40','41'));os.utime(library,ns=(before.st_atime_ns,before.st_mtime_ns))
     assert build()==(1,1,1,1,1,0)
-    run(['clang','-O0','-Wno-override-module',output,ROOT/'build/minyar-runtime.o','-o',temp/'program'])
+    run(clang_command(['clang','-O0','-Wno-override-module',output,ROOT/'build/minyar-runtime.o','-o',temp/'program']))
     assert run([temp/'program']).stdout=='43\n'
 
     good=cache_file.read_bytes()
@@ -51,7 +52,7 @@ with tempfile.TemporaryDirectory(prefix='minyar-native-cache-') as name:
     # Valid outer checksums must not turn malformed compiler metadata into
     # reusable state. The compiler rejects it and the driver retries cold.
     checksum=temp/'checksum'
-    run(['clang','-std=c11','-O2',ROOT/'tests/module-cache-checksum.c','-o',checksum])
+    run(clang_command(['clang','-std=c11','-O2',ROOT/'tests/module-cache-checksum.c','-o',checksum]))
     def unpack(text):
         fields=[]
         while text:
@@ -105,7 +106,7 @@ with tempfile.TemporaryDirectory(prefix='minyar-native-cache-') as name:
     # A distinct compiler binary changes cache identity even though it
     # implements the same language and emits equivalent output.
     alternative=temp/'compiler-O1'
-    run(['clang','-O1','-Wno-override-module','-flto',ROOT/'build/module-compiler-stage2.ll',ROOT/'build/minyar-compiler-runtime.ll','-o',alternative])
+    run(clang_command(['clang','-O1','-Wno-override-module','-flto',ROOT/'build/module-compiler-stage2.ll',ROOT/'build/minyar-compiler-runtime.ll','-o',alternative]))
     assert alternative.read_bytes()!=compiler.read_bytes()
     assert build(tool=alternative)==(0,2,2,0,1,1)
     assert build(tool=alternative)==(2,0,0,2,0,0)
@@ -126,7 +127,7 @@ with tempfile.TemporaryDirectory(prefix='minyar-native-cache-') as name:
     run([DRIVER,compiler,odd_source,odd_output,odd_cache,odd_stats])
     run([DRIVER,compiler,odd_source,odd_output,odd_cache,odd_stats])
     assert tuple(map(int,odd_stats.read_text().split()[:6]))==(1,0,0,1,0,0)
-    run(['clang','-O0','-Wno-override-module',odd_output,ROOT/'build/minyar-runtime.o','-o',odd/'program'])
+    run(clang_command(['clang','-O0','-Wno-override-module',odd_output,ROOT/'build/minyar-runtime.o','-o',odd/'program']))
     assert run([odd/'program']).stdout=='héllo λ\n'
 
 print('native module driver: identity, same-time source edits, corruption, failure atomicity, overlapping builds and Unicode paths verified')

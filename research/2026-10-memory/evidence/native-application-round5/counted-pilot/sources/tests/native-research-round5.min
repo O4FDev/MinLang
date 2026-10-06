@@ -1,0 +1,197 @@
+// Headless calls to the actual save and movement modules; no graphics calls.
+use "../examples/craft/save.min" as save
+use "../examples/craft/terrain.min" as terrain
+use "../examples/craft/physics.min" as physics
+use "../examples/craft/atmosphere.min" as atmosphere
+
+function begin() { native "round5" }
+
+function world(): terrain.World {
+    let dirty: List<Boolean> = []
+    for i in 0..1024 { dirty.add(false) }
+    let tops: List<Integer> = []
+    for i in 0..64 { tops.add(-1) }
+    return terrain.World {
+        blocks: Bytes(512)
+        sizeX: 8
+        sizeZ: 8
+        height: 8
+        seed: 123
+        dirty: dirty
+        tops: tops
+        torches: []
+    }
+}
+
+function player(): physics.Player {
+    return physics.Player {
+        halfWidth: 0.3
+        height: 1.8
+        x: 4.5
+        y: 2.0
+        z: 4.5
+        velocityX: 0.0
+        velocityY: 0.0
+        velocityZ: 0.0
+        yaw: 0.0
+        pitch: 0.0
+        onGround: false
+        flying: false
+        inWater: false
+    }
+}
+
+function sky(): atmosphere.Sky {
+    return atmosphere.Sky {
+        time: 0.125
+        red: 0.11
+        green: 0.22
+        blue: 0.33
+        light: 0.44
+        bodies: 0
+        clouds: 0
+        cloudDrift: 0.0
+        cloudTimer: 0.0
+        vertices: Bytes()
+    }
+}
+
+function flag(out: Bytes, value: Boolean) {
+    if value { out.add(1) } else { out.add(0) }
+}
+
+function state(out: Bytes, p: physics.Player) {
+    out.addFloat64(p.x)
+    out.addFloat64(p.y)
+    out.addFloat64(p.z)
+    out.addFloat64(p.velocityX)
+    out.addFloat64(p.velocityY)
+    out.addFloat64(p.velocityZ)
+    out.addFloat64(p.yaw)
+    out.addFloat64(p.pitch)
+    out.addFloat64(p.halfWidth)
+    out.addFloat64(p.height)
+    flag(out, p.onGround)
+    flag(out, p.flying)
+    flag(out, p.inWater)
+}
+
+function saveCase(mode: Text) {
+    let w = world()
+    let p = player()
+    let s = sky()
+    for i in 0..512 { w.blocks[i] = 255 }
+    w.tops[0] = 6
+    w.dirty[17] = true
+    w.torches.add(123)
+    p.velocityX = 17.0
+    p.velocityY = -4.0
+    p.velocityZ = 3.0
+    p.onGround = true
+    p.inWater = true
+    if mode == "store" || mode == "store-false" {
+        for i in 0..512 { w.blocks[i] = (i * 17 + 3) % 22 }
+        p.x = -12.5
+        p.y = 63.25
+        p.z = 0.125
+        p.yaw = -1.75
+        p.pitch = 0.375
+        p.flying = mode == "store"
+        s.time = 0.875
+        save.store(w, p, s)
+    } else {
+        // A live caller alias must survive replacement of the world's Bytes.
+        let original = w.blocks
+        let loaded = save.loadWorld(w)
+        save.loadPlayer(p, s)
+        writeBytesFile("loaded-world.bin", w.blocks)
+        writeBytesFile("old-world-alias.bin", original)
+        let out = Bytes()
+        flag(out, loaded)
+        state(out, p)
+        out.addFloat64(s.time)
+        out.addFloat64(s.red)
+        out.addFloat64(s.green)
+        out.addFloat64(s.blue)
+        out.addFloat64(s.light)
+        out.addInt64(w.tops[0])
+        flag(out, w.dirty[17])
+        out.addInt64(w.torches.length)
+        out.addInt64(w.torches[0])
+        writeBytesFile("loaded-state.bin", out)
+    }
+}
+
+function movementCase(index: Integer, out: Bytes) {
+    let w = world()
+    let p = player()
+    let seconds = 0.1
+    let forward = 0.0
+    let strafe = 0.0
+    let jump = false
+    let descend = false
+    let sprint = false
+    if index == 0 { forward = 1.0 }
+    if index == 1 { forward = 1.0; strafe = 1.0 }
+    if index == 2 { strafe = 1.0; sprint = true }
+    if index >= 3 && index <= 5 {
+        w.blocks[(2 * 8 + 4) * 8 + 4] = 7
+        forward = 1.0
+        if index == 4 { p.velocityY = -8.0 }
+        if index == 5 { jump = true }
+    }
+    if index == 6 || index == 7 {
+        p.flying = true
+        strafe = 1.0
+        jump = true
+        if index == 7 { descend = true }
+    }
+    if index == 8 || index == 9 {
+        for i in 0..64 { w.blocks[i] = 3 }
+        p.y = 1.0
+        if index == 9 { p.onGround = true; jump = true }
+    }
+    if index == 10 || index == 11 {
+        let x = 5
+        strafe = 1.0
+        if index == 11 { x = 3; strafe = -1.0 }
+        for z in 0..8 { for y in 0..8 { w.blocks[(y * 8 + z) * 8 + x] = 3 } }
+        p.flying = true
+        seconds = 0.5
+    }
+    if index == 12 {
+        for i in 256..320 { w.blocks[i] = 3 }
+        p.flying = true
+        jump = true
+    }
+    if index == 13 { p.y = -21.0; p.velocityY = -6.0; seconds = 0.0 }
+    if index == 14 { p.velocityY = -100.0; seconds = 0.0 }
+    if index == 15 {
+        // Chest-only water detection and flying speed precedence.
+        w.blocks[(3 * 8 + 4) * 8 + 4] = 7
+        p.flying = true
+        sprint = true
+        forward = 1.0
+    }
+    physics.update(w, p, seconds, forward, strafe, jump, descend, sprint)
+    state(out, p)
+}
+
+begin()
+let mode = argument(0)
+if mode == "physics" {
+    let out = Bytes()
+    for index in 0..16 { movementCase(index, out) }
+    let w = world()
+    let p = player()
+    for block in 0..22 {
+        w.blocks[(2 * 8 + 4) * 8 + 4] = block
+        flag(out, physics.collides(w, p, 4.5, 2.0, 4.5))
+    }
+    flag(out, physics.occupies(p, 4, 2, 4))
+    flag(out, physics.occupies(p, 5, 2, 4))
+    flag(out, physics.occupies(p, 4, 4, 4))
+    writeBytesFile("physics.bin", out)
+} else {
+    saveCase(mode)
+}
