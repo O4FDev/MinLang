@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-from clang_helpers import clang_command
+from clang_helpers import clang_command, windows_host
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -19,7 +19,7 @@ def main():
     args = parser.parse_args()
     profiles = {'eager': [], 'arena': ['-DMINYAR_COMPILER_ARENA'],
                 'system': ['-DMINYAR_SYSTEM_HEAP=1'], 'fixed': ['-DMINYAR_BOUNDED_HEAP=1']}
-    if os.name != 'nt':
+    if not windows_host():
         profiles['lazy'] = ['-DMINYAR_BOUNDED_HEAP=1', '-DMINYAR_LAZY_HEAP=1']
     errors = {'overflow': 'this Integer calculation is outside the supported range.',
               'zero': 'an Integer cannot be divided by zero.',

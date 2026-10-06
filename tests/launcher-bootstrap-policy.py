@@ -17,11 +17,13 @@ import sys
 import tempfile
 import unittest
 
+from clang_helpers import windows_host
+
 ROOT = Path(__file__).resolve().parents[1]
 ZSH = shutil.which("zsh")
 
 
-@unittest.skipUnless(ZSH and os.name != "nt", "POSIX launcher and zsh limits required")
+@unittest.skipUnless(ZSH and not windows_host(), "POSIX launcher and zsh limits required")
 class BootstrapScheduling(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="minyar bootstrap policy ")
