@@ -185,7 +185,7 @@ static uint32_t float32_bits(double value) {
 static double float32_value(uint32_t bits) {
     float narrowed;
     memcpy(&narrowed, &bits, sizeof(narrowed));
-    return narrowed;
+    return (double)narrowed;
 }
 
 void minyar_bytes_add_float32(MinyarBytes *bytes, double value) {
