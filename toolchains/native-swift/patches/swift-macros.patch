@@ -1,0 +1,487 @@
+diff --git i/lib/AST/InlinableText.cpp w/lib/AST/InlinableText.cpp
+index ccd8df1c..81ae622b 100644
+--- i/lib/AST/InlinableText.cpp
++++ w/lib/AST/InlinableText.cpp
+@@ -31,7 +31,7 @@ using namespace swift;
+ #pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
+ extern "C" BridgedStringRef
+ swift_ASTGen_extractInlinableText(BridgedASTContext ctx,
+-                                  BridgedStringRef sourceText);
++                                  BridgedStringRef sourceText, bool minyarSyntax);
+ #pragma clang diagnostic pop
+ #else
+ /// Appends the textual contents of the provided source range, stripping
+@@ -145,7 +145,10 @@ StringRef swift::extractInlinableText(ASTContext &ctx, ASTNode node,
+       Lexer::getCharSourceRangeFromSourceRange(
+         sourceMgr, node.getSourceRange());
+   StringRef sourceText = sourceMgr.extractText(sourceTextRange);
+-  auto resultText = swift_ASTGen_extractInlinableText(ctx, sourceText);
++  unsigned bufferID = sourceMgr.findBufferContainingLoc(node.getStartLoc());
++  bool minyarSyntax = sourceMgr.getIdentifierForBuffer(bufferID).ends_with(".min");
++  auto resultText = swift_ASTGen_extractInlinableText(ctx, sourceText,
++                                                    minyarSyntax);
+ 
+   scratch.clear();
+   scratch.insert(scratch.begin(),
+diff --git i/lib/ASTGen/Sources/ASTGen/ASTGen.swift w/lib/ASTGen/Sources/ASTGen/ASTGen.swift
+index f0a04bb1..a33ffa17 100644
+--- i/lib/ASTGen/Sources/ASTGen/ASTGen.swift
++++ w/lib/ASTGen/Sources/ASTGen/ASTGen.swift
+@@ -34,6 +34,7 @@ struct ASTGenVisitor {
+   let diagnosticEngine: BridgedDiagnosticEngine
+ 
+   let base: UnsafeBufferPointer<UInt8>
++  let originalPosition: (AbsolutePosition) -> AbsolutePosition
+ 
+   @Boxed private(set) var declContext: BridgedDeclContext
+ 
+@@ -48,10 +49,12 @@ struct ASTGenVisitor {
+     sourceBuffer: UnsafeBufferPointer<UInt8>,
+     declContext: BridgedDeclContext,
+     astContext: BridgedASTContext,
+-    configuredRegions: ConfiguredRegions
++    configuredRegions: ConfiguredRegions,
++    originalPosition: @escaping (AbsolutePosition) -> AbsolutePosition = { $0 }
+   ) {
+     self.diagnosticEngine = diagnosticEngine
+     self.base = sourceBuffer
++    self.originalPosition = originalPosition
+     self.declContext = declContext
+     self.ctx = astContext
+     self.configuredRegions = configuredRegions
+@@ -205,7 +208,7 @@ extension ASTGenVisitor {
+   /// source buffer.
+   @inline(__always)
+   func generateSourceLoc(_ node: some SyntaxProtocol) -> BridgedSourceLoc {
+-    BridgedSourceLoc(at: node.positionAfterSkippingLeadingTrivia, in: self.base)
++    BridgedSourceLoc(at: originalPosition(node.positionAfterSkippingLeadingTrivia), in: self.base)
+   }
+ 
+   /// Obtains the start location of the node excluding leading trivia in the
+@@ -293,8 +296,8 @@ extension ASTGenVisitor {
+   @inline(__always)
+   func generateCharSourceRange(start: AbsolutePosition, length: SourceLength) -> BridgedCharSourceRange {
+     BridgedCharSourceRange(
+-      start: BridgedSourceLoc(at: start, in: self.base),
+-      byteLength: UInt32(length.utf8Length)
++      start: BridgedSourceLoc(at: originalPosition(start), in: self.base),
++      byteLength: UInt32(originalPosition(start + length).utf8Offset - originalPosition(start).utf8Offset)
+     )
+   }
+ 
+@@ -302,8 +305,9 @@ extension ASTGenVisitor {
+   @inline(__always)
+   func extractRawText(_ node: some SyntaxProtocol) -> SyntaxText {
+     SyntaxText(
+-      baseAddress: self.base.baseAddress! + node.positionAfterSkippingLeadingTrivia.utf8Offset,
+-      count: node.trimmedLength.utf8Length
++      baseAddress: self.base.baseAddress! + originalPosition(node.positionAfterSkippingLeadingTrivia).utf8Offset,
++      count: originalPosition(node.endPositionBeforeTrailingTrivia).utf8Offset
++        - originalPosition(node.positionAfterSkippingLeadingTrivia).utf8Offset
+     )
+   }
+ }
+@@ -480,7 +484,8 @@ public func buildTopLevelASTNodes(
+     sourceBuffer: sourceFile.pointee.buffer,
+     declContext: dc,
+     astContext: ctx,
+-    configuredRegions: sourceFile.pointee.configuredRegions(astContext: ctx)
++    configuredRegions: sourceFile.pointee.configuredRegions(astContext: ctx),
++    originalPosition: sourceFile.pointee.originalPosition
+   )
+ 
+   switch sourceFile.pointee.syntax.as(SyntaxEnum.self) {
+diff --git i/lib/ASTGen/Sources/ASTGen/CompilerBuildConfiguration.swift w/lib/ASTGen/Sources/ASTGen/CompilerBuildConfiguration.swift
+index 6eae1e83..23931a1b 100644
+--- i/lib/ASTGen/Sources/ASTGen/CompilerBuildConfiguration.swift
++++ w/lib/ASTGen/Sources/ASTGen/CompilerBuildConfiguration.swift
+@@ -13,7 +13,7 @@
+ import ASTBridging
+ import SwiftDiagnostics
+ @_spi(Compiler) import SwiftIfConfig
+-@_spi(ExperimentalLanguageFeatures) import SwiftParser
++@_spi(ExperimentalLanguageFeatures) @_spi(Minyar) import SwiftParser
+ @_spi(ExperimentalLanguageFeatures) import SwiftSyntax
+ 
+ /// A build configuration that uses the compiler's ASTContext to answer
+@@ -21,10 +21,13 @@ import SwiftDiagnostics
+ struct CompilerBuildConfiguration: BuildConfiguration {
+   let ctx: BridgedASTContext
+   let sourceBuffer: UnsafeBufferPointer<UInt8>
++  let originalPosition: (AbsolutePosition) -> AbsolutePosition
+ 
+-  init(ctx: BridgedASTContext, sourceBuffer: UnsafeBufferPointer<UInt8>) {
++  init(ctx: BridgedASTContext, sourceBuffer: UnsafeBufferPointer<UInt8>,
++       originalPosition: @escaping (AbsolutePosition) -> AbsolutePosition = { $0 }) {
+     self.ctx = ctx
+     self.sourceBuffer = sourceBuffer
++    self.originalPosition = originalPosition
+   }
+ 
+   func isCustomConditionSet(name: String) throws -> Bool {
+@@ -75,7 +78,7 @@ struct CompilerBuildConfiguration: BuildConfiguration {
+         ctx.canImport(
+           importPath: bridgedImportPathStr,
+           location: BridgedSourceLoc(
+-            at: importPath.first!.0.position,
++            at: originalPosition(importPath.first!.0.position),
+             in: sourceBuffer
+           ),
+           versionKind: cVersionKind,
+@@ -188,7 +191,8 @@ extension ExportedSourceFile {
+ 
+     let configuration = CompilerBuildConfiguration(
+       ctx: astContext,
+-      sourceBuffer: buffer
++      sourceBuffer: buffer,
++      originalPosition: originalPosition
+     )
+ 
+     let regions = syntax.configuredRegions(in: configuration)
+@@ -518,19 +522,27 @@ public func evaluatePoundIfCondition(
+ @_cdecl("swift_ASTGen_extractInlinableText")
+ public func extractInlinableText(
+   astContext: BridgedASTContext,
+-  sourceText: BridgedStringRef
++  sourceText: BridgedStringRef,
++  minyarSyntax: Bool
+ ) -> BridgedStringRef {
+   let textBuffer = UnsafeBufferPointer<UInt8>(start: sourceText.data, count: sourceText.count)
++  var features = Parser.ExperimentalFeatures(from: astContext)
++  if minyarSyntax { features.insert(.minyarSyntax) }
+   var parser = Parser(
+     textBuffer,
+     swiftVersion: Parser.SwiftVersion(from: astContext),
+-    experimentalFeatures: Parser.ExperimentalFeatures(from: astContext)
++    experimentalFeatures: features
+   )
+   let syntax = SourceFileSyntax.parse(from: &parser)
+ 
++  let sourceMap = minyarSyntax ? parser.minyarSourceMap(for: syntax) : nil
+   let configuration = CompilerBuildConfiguration(
+     ctx: astContext,
+-    sourceBuffer: textBuffer
++    sourceBuffer: textBuffer,
++    originalPosition: { position in
++      AbsolutePosition(utf8Offset: sourceMap?.sourceOffset(forSyntaxOffset: position.utf8Offset)
++        ?? position.utf8Offset)
++    }
+   )
+ 
+   // Remove any inactive #if regions.
+diff --git i/lib/ASTGen/Sources/ASTGen/Diagnostics.swift w/lib/ASTGen/Sources/ASTGen/Diagnostics.swift
+index ff78907d..67458ac4 100644
+--- i/lib/ASTGen/Sources/ASTGen/Diagnostics.swift
++++ w/lib/ASTGen/Sources/ASTGen/Diagnostics.swift
+@@ -31,7 +31,8 @@ extension ASTGenVisitor {
+       diagnosticEngine: self.diagnosticEngine,
+       sourceFileBuffer: self.base,
+       diagnostic: diagnostic,
+-      diagnosticSeverity: diagnostic.diagMessage.severity
++      diagnosticSeverity: diagnostic.diagMessage.severity,
++      mapPosition: originalPosition
+     )
+   }
+ 
+diff --git i/lib/ASTGen/Sources/ASTGen/DiagnosticsBridge.swift w/lib/ASTGen/Sources/ASTGen/DiagnosticsBridge.swift
+index 5f0eab41..29ebbe20 100644
+--- i/lib/ASTGen/Sources/ASTGen/DiagnosticsBridge.swift
++++ w/lib/ASTGen/Sources/ASTGen/DiagnosticsBridge.swift
+@@ -13,6 +13,7 @@
+ import ASTBridging
+ import BasicBridging
+ import SwiftDiagnostics
++@_spi(ExperimentalLanguageFeatures) import SwiftParser
+ import SwiftSyntax
+ 
+ fileprivate struct PerFrontendDiagnosticState {
+@@ -28,13 +29,14 @@ fileprivate func emitDiagnosticParts(
+   position: AbsolutePosition,
+   offset: Int,
+   highlights: [Syntax] = [],
+-  edits: [SourceEdit] = []
++  edits: [SourceEdit] = [],
++  mapPosition: (AbsolutePosition) -> AbsolutePosition = { $0 }
+ ) {
+   // Map severity
+   let bridgedSeverity = severity.bridged
+ 
+   func bridgedSourceLoc(at position: AbsolutePosition) -> BridgedSourceLoc {
+-    return BridgedSourceLoc(at: position.advanced(by: offset), in: sourceFileBuffer)
++    return BridgedSourceLoc(at: mapPosition(position.advanced(by: offset)), in: sourceFileBuffer)
+   }
+ 
+   // Emit the diagnostic
+@@ -78,7 +80,8 @@ public func emitDiagnostic(
+   sourceFileBufferOffset: Int = 0,
+   diagnostic: Diagnostic,
+   diagnosticSeverity: DiagnosticSeverity,
+-  messageSuffix: String? = nil
++  messageSuffix: String? = nil,
++  mapPosition: (AbsolutePosition) -> AbsolutePosition = { $0 }
+ ) {
+   // Emit the main diagnostic
+   emitDiagnosticParts(
+@@ -88,7 +91,8 @@ public func emitDiagnostic(
+     severity: diagnosticSeverity,
+     position: diagnostic.position,
+     offset: sourceFileBufferOffset,
+-    highlights: diagnostic.highlights
++    highlights: diagnostic.highlights,
++    mapPosition: mapPosition
+   )
+ 
+   // Emit Fix-Its.
+@@ -101,7 +105,8 @@ public func emitDiagnostic(
+       severity: .note,
+       position: diagnostic.position,
+       offset: sourceFileBufferOffset,
+-      edits: fixIt.edits
++      edits: fixIt.edits,
++      mapPosition: mapPosition
+     )
+   }
+ 
+@@ -114,7 +119,8 @@ public func emitDiagnostic(
+       message: note.message,
+       severity: .note,
+       position: note.position,
+-      offset: sourceFileBufferOffset
++      offset: sourceFileBufferOffset,
++      mapPosition: mapPosition
+     )
+   }
+ }
+@@ -130,6 +136,40 @@ extension DiagnosticSeverity {
+   }
+ }
+ 
++/// Diagnostic rendering needs a lossless tree of the original bytes, rather
++/// than the canonical Swift spellings sent to macro plugins. Parser recovery
++/// retains unfamiliar Minyar tokens; this tree is used only for presentation.
++struct DiagnosticSourceFile {
++  let buffer: UnsafeBufferPointer<UInt8>
++  let syntax: Syntax
++  let sourceLocationConverter: SourceLocationConverter
++
++  init(_ source: ExportedSourceFile) {
++    buffer = source.buffer
++    if source.minyarSourceMap != nil {
++      var features = source.parserFeatures
++      features.remove(.minyarSyntax)
++      var parser = Parser(buffer, swiftVersion: source.parserSwiftVersion,
++                          experimentalFeatures: features)
++      syntax = Syntax(SourceFileSyntax.parse(from: &parser))
++      assert(syntax.syntaxTextBytes.elementsEqual(buffer))
++      sourceLocationConverter = SourceLocationConverter(fileName: source.fileName, tree: syntax)
++    } else {
++      syntax = source.syntax
++      sourceLocationConverter = source.sourceLocationConverter
++    }
++  }
++
++  func position(of location: BridgedSourceLoc) -> AbsolutePosition? {
++    guard let address = location.getOpaquePointerValue(), let base = buffer.baseAddress else {
++      return nil
++    }
++    let offset = address - UnsafeRawPointer(base)
++    guard offset >= 0, offset <= buffer.count else { return nil }
++    return AbsolutePosition(utf8Offset: offset)
++  }
++}
++
+ struct QueuedDiagnostics {
+   var grouped: GroupedDiagnostics = GroupedDiagnostics()
+ 
+@@ -138,7 +178,7 @@ struct QueuedDiagnostics {
+   var sourceFileIDs: [Int: UnsafeMutablePointer<GroupedDiagnostics.SourceFileID>] = [:]
+ 
+   /// The known source files
+-  var sourceFiles: [ExportedSourceFile] = []
++  var sourceFiles: [DiagnosticSourceFile] = []
+ }
+ 
+ /// Create a grouped diagnostics structure in which we can add osou
+@@ -221,14 +261,14 @@ public func addQueuedSourceFile(
+   )
+ 
+   // Add the source file.
+-  let sourceFile = sourceFilePtr.assumingMemoryBound(to: ExportedSourceFile.self)
++  let sourceFile = DiagnosticSourceFile(sourceFilePtr.assumingMemoryBound(to: ExportedSourceFile.self).pointee)
+   let sourceFileID = queuedDiagnostics.pointee.grouped.addSourceFile(
+-    tree: sourceFile.pointee.syntax,
+-    sourceLocationConverter: sourceFile.pointee.sourceLocationConverter,
++    tree: sourceFile.syntax,
++    sourceLocationConverter: sourceFile.sourceLocationConverter,
+     displayName: displayName,
+     parent: parent
+   )
+-  queuedDiagnostics.pointee.sourceFiles.append(sourceFile.pointee)
++  queuedDiagnostics.pointee.sourceFiles.append(sourceFile)
+ 
+   // Record the buffer ID.
+   let allocatedSourceFileID = UnsafeMutablePointer<GroupedDiagnostics.SourceFileID>.allocate(capacity: 1)
+diff --git i/lib/ASTGen/Sources/ASTGen/SourceFile.swift w/lib/ASTGen/Sources/ASTGen/SourceFile.swift
+index 060e29c4..939cd767 100644
+--- i/lib/ASTGen/Sources/ASTGen/SourceFile.swift
++++ w/lib/ASTGen/Sources/ASTGen/SourceFile.swift
+@@ -13,7 +13,7 @@
+ import ASTBridging
+ import SwiftDiagnostics
+ import SwiftIfConfig
+-@_spi(ExperimentalLanguageFeatures) import SwiftParser
++@_spi(ExperimentalLanguageFeatures) @_spi(Minyar) import SwiftParser
+ import SwiftParserDiagnostics
+ @_spi(Compiler) import SwiftSyntax
+ 
+@@ -33,6 +33,21 @@ public struct ExportedSourceFile {
+   /// The syntax tree for the complete source file.
+   public let syntax: Syntax
+ 
++  /// Present only for original Minyar buffers. Macro expansions remain Swift.
++  let minyarSourceMap: MinyarSourceMap?
++  let parserFeatures: Parser.ExperimentalFeatures
++  let parserSwiftVersion: Parser.SwiftVersion?
++
++  public func originalPosition(_ position: AbsolutePosition) -> AbsolutePosition {
++    AbsolutePosition(utf8Offset: minyarSourceMap?.sourceOffset(forSyntaxOffset: position.utf8Offset)
++      ?? position.utf8Offset)
++  }
++
++  public func syntaxPosition(_ position: AbsolutePosition) -> AbsolutePosition {
++    AbsolutePosition(utf8Offset: minyarSourceMap?.syntaxOffset(forSourceOffset: position.utf8Offset)
++      ?? position.utf8Offset)
++  }
++
+   /// A source location converter to convert `AbsolutePosition`s in `syntax` to line/column locations.
+   ///
+   /// Cached so we don't need to re-build the line table every time we need to convert a position.
+@@ -48,13 +63,13 @@ public struct ExportedSourceFile {
+     guard let opaqueValue = location.getOpaquePointerValue() else {
+       return nil
+     }
+-    return AbsolutePosition(utf8Offset: opaqueValue - sourceFileBaseAddress)
++    return syntaxPosition(AbsolutePosition(utf8Offset: opaqueValue - sourceFileBaseAddress))
+   }
+ 
+   /// Retrieve a bridged source location for the given absolute position in
+   /// this source file.
+   public func sourceLoc(at position: AbsolutePosition) -> BridgedSourceLoc {
+-    BridgedSourceLoc(at: position, in: buffer)
++    BridgedSourceLoc(at: originalPosition(position), in: buffer)
+   }
+ }
+ 
+@@ -109,10 +124,17 @@ public func parseSourceFile(
+   let dc = declContextPtr.map { BridgedDeclContext(raw: $0) }
+   let ctx = dc?.astContext
+ 
++  let isMinyar: Bool
++  switch kind {
++  case .none: isMinyar = String(bridged: filename).hasSuffix(".min")
++  default: isMinyar = false
++  }
++  var features = Parser.ExperimentalFeatures(from: ctx)
++  if isMinyar { features.insert(.minyarSyntax) }
+   var parser = Parser(
+     buffer,
+     swiftVersion: Parser.SwiftVersion(from: ctx),
+-    experimentalFeatures: Parser.ExperimentalFeatures(from: ctx)
++    experimentalFeatures: features
+   )
+ 
+   let parsed: Syntax
+@@ -167,6 +189,9 @@ public func parseSourceFile(
+       moduleName: moduleName,
+       fileName: fileName,
+       syntax: parsed,
++      minyarSourceMap: isMinyar ? parser.minyarSourceMap(for: parsed) : nil,
++      parserFeatures: features,
++      parserSwiftVersion: Parser.SwiftVersion(from: ctx),
+       sourceLocationConverter: SourceLocationConverter(fileName: fileName, tree: parsed)
+     )
+   )
+@@ -192,6 +217,13 @@ public func roundTripCheck(
+ ) -> CInt {
+   sourceFilePtr.withMemoryRebound(to: ExportedSourceFile.self, capacity: 1) { sourceFile in
+     let sf = sourceFile.pointee
++    if sf.minyarSourceMap != nil {
++      // Canonical macro syntax has different spellings. Check that parsing the
++      // unchanged original buffer produces the same canonical syntax tree.
++      var parser = Parser(sf.buffer, swiftVersion: sf.parserSwiftVersion, experimentalFeatures: sf.parserFeatures)
++      let reparsed = SourceFileSyntax.parse(from: &parser)
++      return sf.syntax.syntaxTextBytes == reparsed.syntaxTextBytes ? 0 : 1
++    }
+     return sf.syntax.syntaxTextBytes.elementsEqual(sf.buffer) ? 0 : 1
+   }
+ }
+@@ -239,7 +271,8 @@ public func emitParserDiagnostics(
+         diagnosticEngine: diagnosticEngine,
+         sourceFileBuffer: sourceFile.pointee.buffer,
+         diagnostic: diag,
+-        diagnosticSeverity: diagnosticSeverity
++        diagnosticSeverity: diagnosticSeverity,
++        mapPosition: sourceFile.pointee.originalPosition
+       )
+       anyDiags = true
+     }
+@@ -269,7 +302,7 @@ func findToken(
+ 
+   // Find the token at that offset.
+   let sf = sourceFilePtr.pointee.syntax
+-  guard let token = sf.token(at: AbsolutePosition(utf8Offset: offset)) else {
++  guard let token = sf.token(at: sourceFilePtr.pointee.syntaxPosition(AbsolutePosition(utf8Offset: offset))) else {
+     print("couldn't find token at offset \(offset)")
+     return nil
+   }
+@@ -359,11 +392,11 @@ func getVirtualFiles(
+   _ = cArrayBuf.initialize(
+     from: virtualFiles.lazy.map({ virtualFile in
+       BridgedVirtualFile(
+-        StartPosition: virtualFile.startPosition.utf8Offset,
+-        EndPosition: virtualFile.endPosition.utf8Offset,
++        StartPosition: sourceFilePtr.pointee.originalPosition(virtualFile.startPosition).utf8Offset,
++        EndPosition: sourceFilePtr.pointee.originalPosition(virtualFile.endPosition).utf8Offset,
+         Name: allocateBridgedString(virtualFile.fileName),
+         LineOffset: virtualFile.lineOffset,
+-        NamePosition: virtualFile.fileNamePosition.utf8Offset
++        NamePosition: sourceFilePtr.pointee.originalPosition(virtualFile.fileNamePosition).utf8Offset
+       )
+     })
+   )
+diff --git i/lib/ASTGen/Sources/MacroEvaluation/PluginHost.swift w/lib/ASTGen/Sources/MacroEvaluation/PluginHost.swift
+index 5e134f64..4937b84f 100644
+--- i/lib/ASTGen/Sources/MacroEvaluation/PluginHost.swift
++++ w/lib/ASTGen/Sources/MacroEvaluation/PluginHost.swift
+@@ -340,15 +340,11 @@ class PluginDiagnosticsEngine {
+       return nil
+     }
+ 
+-    // Compute the resulting address.
+-    guard let bufferBaseAddress = exportedSourceFile.pointee.buffer.baseAddress else {
++    // Plugins report offsets in the canonical syntax sent to them.
++    guard offset >= 0, offset <= exportedSourceFile.pointee.syntax.totalLength.utf8Length else {
+       return nil
+     }
+-    // Ensure 'offset' is within the buffer.
+-    guard offset <= exportedSourceFile.pointee.buffer.count else {
+-      return nil
+-    }
+-    return BridgedSourceLoc(raw: bufferBaseAddress).advanced(by: offset)
++    return exportedSourceFile.pointee.sourceLoc(at: AbsolutePosition(utf8Offset: offset))
+   }
+ 
+   /// C++ source location from a position value from a plugin.
+diff --git i/lib/ASTGen/Sources/MacroEvaluation/SourceManager.swift w/lib/ASTGen/Sources/MacroEvaluation/SourceManager.swift
+index 390607f7..24dd5e84 100644
+--- i/lib/ASTGen/Sources/MacroEvaluation/SourceManager.swift
++++ w/lib/ASTGen/Sources/MacroEvaluation/SourceManager.swift
+@@ -116,7 +116,7 @@ extension SourceManager {
+     let nodeOffset = SourceLength(utf8Length: position.utf8Offset - node.position.utf8Offset)
+     let realPosition = rootPosition + nodeOffset
+ 
+-    return BridgedSourceLoc(at: realPosition, in: exportedSourceFile.pointee.buffer)
++    return exportedSourceFile.pointee.sourceLoc(at: realPosition)
+   }
+ }
+ 

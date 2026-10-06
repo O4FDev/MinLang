@@ -353,6 +353,15 @@ static MinyarText *copy_c_text(const char *source) {
     return new_text(bytes, (long long)length, -1);
 }
 
+MinyarText *minyar_native_copy_text(const unsigned char *source, long long length) {
+    if (length < 0 || (!source && length != 0))
+        minyar_stop("a native Text buffer is invalid.");
+    unsigned char *bytes = new_bytes(length);
+    if (length) memcpy(bytes, source, (size_t)length);
+    bytes[length] = 0;
+    return new_text(bytes, length, -1);
+}
+
 static char *text_as_path(const MinyarText *text) {
     char *path;
     if (memchr(text->bytes, 0, (size_t)text->byte_length))

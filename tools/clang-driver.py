@@ -258,9 +258,18 @@ def main():
             if line.startswith('; minyar-native-library: '):
                 libraries.add(line.removeprefix('; minyar-native-library: ').strip())
     for library in sorted(libraries):
-        if library != 'graphics':
+        if library == 'graphics':
+            native += graphics(project, clang, link_flags)
+        elif library == 'macos':
+            if platform.system() != 'Darwin':
+                raise ValueError('the macos package requires macOS and the Apple command-line tools')
+            native_object = Path(llvm).parent / 'macos.o'
+            run([clang, *flags('MINYAR_NATIVE_FLAGS', shlex.join(link_flags)),
+                 '-fobjc-arc', '-fmodules', '-c', str(project / 'runtime/native/macos.m'),
+                 '-o', str(native_object)])
+            native += [str(native_object), '-framework', 'AppKit']
+        else:
             raise ValueError(f'the program uses an unknown native library: {library}')
-        native += graphics(project, clang, link_flags)
     lto = lto_flags(clang, link_flags) if release == '1' else []
     math_libraries = [] if platform.system() == 'Darwin' else ['-lm']
     publish_executable([clang, *link_flags, *lto, llvm, runtime, *native, *math_libraries], output, source)

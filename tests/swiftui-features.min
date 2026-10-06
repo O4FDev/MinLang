@@ -1,0 +1,106 @@
+use "Observation"
+use "Synchronization"
+
+@Observable @MainActor
+final class ObservedValue {
+    let value = 0
+}
+
+final class ObservationFlag: Sendable {
+    constant value = Mutex(false)
+}
+
+record Ticket: ~Copyable {
+    constant value: Int
+}
+
+function inspect(value: borrowing Ticket): Int { value.value }
+
+function packCount<each T>(values: repeat each T): Int {
+    let count = 0
+    for _ in repeat each values { count += 1 }
+    return count
+}
+
+protocol Container {
+    associatedtype Element
+    function get(): Element
+}
+
+record Box<T>: Container {
+    constant value: T
+    function get(): T { value }
+    function map<U>(transform: (T) -> U): Box<U> {
+        Box<U>(value: transform(value))
+    }
+}
+
+enum Outcome<T> {
+    case value(T)
+    case missing
+}
+
+enum Failure: Error { case expected }
+
+function checked(_ fail: Bool) throws(Failure) -> Int {
+    if fail { throw .expected }
+    return 42
+}
+
+actor Counter {
+    private let value = 0
+    function increment(): Int {
+        value += 1
+        return value
+    }
+}
+
+final class Lifetime {
+    constant value = 9
+}
+
+@main
+record FeatureChecks {
+    static function main() async {
+        constant model = ObservedValue()
+        constant signal = ObservationFlag()
+        withObservationTracking {
+            _ = model.value
+        } onChange: {
+            signal.value.withLock { $0 = true }
+        }
+        model.value = 42
+        precondition(signal.value.withLock { $0 })
+
+        constant ticket = Ticket(value: 42)
+        precondition(inspect(ticket) == 42)
+        precondition(packCount(1, "two", true) == 3)
+
+        constant box = Box(value: 6).map({ $0 * 7 })
+        precondition(box.get() == 42)
+        constant outcome = Outcome.value(box.get())
+        switch outcome {
+        case .value(constant answer): precondition(answer == 42)
+        case .missing: preconditionFailure("missing generic payload")
+        }
+        do {
+            _ = try checked(true)
+            preconditionFailure("typed throw was lost")
+        } catch { precondition(error == .expected) }
+
+        let held: Lifetime? = Lifetime()
+        weak let observed = held
+        let callback: (() -> Int)? = { [object = held!] in object.value }
+        held = nil
+        precondition(observed != nil && callback!() == 9)
+        callback = nil
+        precondition(observed == nil)
+
+        constant counter = Counter()
+        async constant first = counter.increment()
+        async constant second = counter.increment()
+        constant results = await [first, second].sorted()
+        precondition(results == [1, 2])
+        print("native generics, typed errors, ARC, closures and actors passed")
+    }
+}

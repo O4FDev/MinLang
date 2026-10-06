@@ -2,16 +2,31 @@
 set -eu
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# The experimental native target has a separate type system and compiler
+# driver. Dispatch before building or linking the portable Minyar runtime.
+if [ "${1-}" = --backend ]; then
+    [ "$#" -ge 2 ] || { echo '--backend requires llvm, swift or native' >&2; exit 2; }
+    case "$2" in
+        swift) shift 2; exec "${MINYAR_PYTHON:-/usr/bin/python3}" "$project_dir/scripts/native-swift.py" "$@" ;;
+        native) shift 2; exec "${MINYAR_PYTHON:-/usr/bin/python3}" "$project_dir/scripts/native-frontend.py" "$@" ;;
+        llvm) shift 2 ;;
+        *) echo "unknown backend: $2" >&2; exit 2 ;;
+    esac
+fi
 usage() {
-    echo "usage: ./minyar [--check | --debug | --release] [--incremental] [--memory-profile eager|fixed|lazy|system] [--cleanup-budget 1..1024] [--heap-bytes BYTES] FILE.min [-o PROGRAM]" >&2
+    echo "usage: ./minyar [--backend llvm|swift|native] [--app] [--bundle-id ID] [--check | --debug | --release] [--incremental] [--memory-profile eager|fixed|lazy|system] [--cleanup-budget 1..1024] [--heap-bytes BYTES] FILE.min [-o PROGRAM]" >&2
+    echo "native SwiftUI options: ./minyar --backend swift --help" >&2
     exit 2
 }
 case "${1-}" in
     --help|-h)
         cat <<'HELP'
-usage: ./minyar [--check | --debug | --release] [--incremental] [OPTIONS] FILE.min [-o PROGRAM]
+usage: ./minyar [--backend llvm|swift|native] [--check | --debug | --release] [--incremental] [OPTIONS] FILE.min [-o PROGRAM]
 
 Build a native program; the compiler and runtime build on first use.
+  --backend BACKEND        llvm (default), swift, or experimental native frontend
+  --app                    Package a macOS application bundle
+  --bundle-id ID           Bundle identifier for --app
   --check                  Check language and modules without native linking
   --debug                  Disable program optimization (-O0)
   --release                Optimize across the program and runtime with LTO
@@ -43,6 +58,9 @@ debug=0
 check_only=0
 optimization_requested=0
 incremental=0
+app=0
+bundle_id=org.minyar.application
+bundle_id_requested=0
 memory_profile=system
 profile_requested=0
 cleanup_budget=32
@@ -53,6 +71,10 @@ while :; do
         --release) [ "$optimization_requested" -eq 0 ] && [ "$check_only" -eq 0 ] || usage; release=1; optimization_requested=1; shift ;;
         --debug) [ "$optimization_requested" -eq 0 ] && [ "$check_only" -eq 0 ] || usage; debug=1; optimization_requested=1; shift ;;
         --check) [ "$optimization_requested" -eq 0 ] && [ "$check_only" -eq 0 ] || usage; check_only=1; shift ;;
+        --app) app=1; shift ;;
+        --bundle-id)
+            [ "$#" -ge 2 ] && [ "$bundle_id_requested" -eq 0 ] || usage
+            bundle_id=$2; bundle_id_requested=1; shift 2 ;;
         --incremental) incremental=1; shift ;;
         --memory-profile)
             [ "$#" -ge 2 ] && [ "$profile_requested" -eq 0 ] || usage
@@ -96,6 +118,14 @@ fi
 if [ "$check_only" -eq 0 ] && [ "$source_file" -ef "$output_file" ]; then
     echo "minyar: refusing to replace the source file; choose a different -o path: $output_file" >&2
     exit 1
+fi
+
+if [ "$app" -eq 1 ]; then
+    [ "$check_only" -eq 0 ] || usage
+    [ "$(uname -s)" = Darwin ] || { echo "macOS app bundles require macOS" >&2; exit 1; }
+    case "$output_file" in *.app) ;; *) output_file="$output_file.app" ;; esac
+elif [ "$bundle_id_requested" -eq 1 ]; then
+    usage
 fi
 
 if [ "$incremental" -eq 1 ]; then
@@ -194,5 +224,10 @@ CONFIG
             -c "$runtime_source" -o "$runtime_file"
     fi
 fi
-python3 "$project_dir/tools/clang-driver.py" link "$project_dir" "$llvm_file" "$runtime_file" "$output_file" "$release" "$debug" "$source_file"
+binary_file=$output_file
+if [ "$app" -eq 1 ]; then binary_file="$llvm_dir/application"; fi
+python3 "$project_dir/tools/clang-driver.py" link "$project_dir" "$llvm_file" "$runtime_file" "$binary_file" "$release" "$debug" "$source_file"
+if [ "$app" -eq 1 ]; then
+    "${MINYAR_PYTHON:-python3}" "$project_dir/scripts/macos-app.py" --binary "$binary_file" --output "$output_file" --identifier "$bundle_id"
+fi
 echo "built $output_file"
