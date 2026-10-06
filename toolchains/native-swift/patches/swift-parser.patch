@@ -1,0 +1,267 @@
+--- a/lib/Basic/FileTypes.cpp
++++ b/lib/Basic/FileTypes.cpp
+@@ -51,6 +51,7 @@
+     return TY_INVALID;
+   assert(Ext.front() == '.' && "not a file extension");
+   return llvm::StringSwitch<file_types::ID>(Ext.drop_front())
++      .Case("min", TY_Swift)
+ #define TYPE(NAME, ID, EXTENSION, FLAGS) \
+            .Case(EXTENSION, TY_##ID)
+ #include "swift/Basic/FileTypes.def"
+--- a/include/swift/Parse/Lexer.h
++++ b/include/swift/Parse/Lexer.h
+@@ -79,6 +79,9 @@
+   const LangOptions &LangOpts;
+   const SourceManager &SourceMgr;
+   const unsigned BufferID;
++
++  /// Minyar syntax applies only to original .min source buffers.
++  const bool MinyarSyntax;
+ 
+   /// A queue of diagnostics to emit when a token is consumed. We want to queue
+   /// them, as the parser may backtrack and re-lex a token.
+@@ -262,6 +265,7 @@
+   }
+ 
+   unsigned getBufferID() const { return BufferID; }
++  bool isMinyarSyntax() const { return MinyarSyntax; }
+ 
+   /// peekNextToken - Return the next token to be returned by Lex without
+   /// actually lexing it.
+--- a/lib/Parse/Lexer.cpp
++++ b/lib/Parse/Lexer.cpp
+@@ -171,6 +171,8 @@
+              HashbangMode HashbangAllowed,
+              CommentRetentionMode RetainComments)
+     : LangOpts(LangOpts), SourceMgr(SourceMgr), BufferID(BufferID),
++      MinyarSyntax(LexMode != LexerMode::SIL &&
++                   SourceMgr.getIdentifierForBuffer(BufferID).ends_with(".min")),
+       LexMode(LexMode),
+       IsHashbangAllowed(HashbangAllowed == HashbangMode::Allowed),
+       RetainComments(RetainComments) {
+@@ -742,8 +744,19 @@
+   // Lex [a-zA-Z_$0-9[[:XID_Continue:]]]*
+   while (advanceIfValidContinuationOfIdentifier(CurPtr, BufferEnd));
+ 
+-  tok Kind = kindOfIdentifier(StringRef(TokStart, CurPtr-TokStart),
+-                              LexMode == LexerMode::SIL);
++  StringRef spelling(TokStart, CurPtr - TokStart);
++  tok Kind = kindOfIdentifier(spelling, LexMode == LexerMode::SIL);
++  if (MinyarSyntax) {
++    // Preserve token bytes and source locations; only the grammatical kind
++    // changes. Escaped identifiers and literal contents use separate paths.
++    Kind = llvm::StringSwitch<tok>(spelling)
++               .Case("function", tok::kw_func)
++               .Case("record", tok::kw_struct)
++               .Case("constant", tok::kw_let)
++               .Case("let", tok::kw_var)
++               .Case("use", tok::kw_import)
++               .Default(Kind);
++  }
+   return formToken(Kind, TokStart);
+ }
+ 
+--- a/include/swift/Parse/Parser.h
++++ b/include/swift/Parse/Parser.h
+@@ -1576,6 +1576,8 @@
+     Operator,
+     /// A function.
+     Function,
++    /// A Minyar function with unlabelled parameters by default.
++    MinyarFunction,
+     /// An initializer.
+     Initializer,
+     /// A closure.
+@@ -1637,7 +1639,8 @@
+                                       SourceLoc &throws,
+                                       bool &rethrows,
+                                       TypeRepr *&thrownType,
+-                                      TypeRepr *&retType);
++                                      TypeRepr *&retType,
++                                      bool minyarFunction = false);
+ 
+   /// Parse 'async' and 'throws', if present, putting the locations of the
+   /// keywords into the \c SourceLoc parameters.
+--- a/lib/Parse/ParseDecl.cpp
++++ b/lib/Parse/ParseDecl.cpp
+@@ -6556,6 +6556,7 @@
+ /// \endverbatim
+ ParserResult<ImportDecl> Parser::parseDeclImport(ParseDeclOptions Flags,
+                                                  DeclAttributes &Attributes) {
++  const bool minyarImport = L->isMinyarSyntax() && Tok.getText() == "use";
+   SourceLoc ImportLoc = consumeToken(tok::kw_import);
+   DebuggerContextChange DCC (*this);
+ 
+@@ -6601,6 +6602,28 @@
+   }
+ 
+   ImportPath::Builder importPath;
++  if (minyarImport && Tok.is(tok::string_literal)) {
++    // Imports are native module declarations, not calls through an FFI layer.
++    // Only plain, uninterpolated module names are accepted here.
++    StringRef text = Tok.getText();
++    if (text.size() < 3 || text.front() != '"' || text.back() != '"') {
++      diagnose(Tok, diag::expected_identifier_in_decl, "import");
++      return nullptr;
++    }
++    SmallVector<StringRef, 4> components;
++    text.drop_front().drop_back().split(components, '.');
++    unsigned offset = 1;
++    for (StringRef component : components) {
++      if (!Lexer::isIdentifier(component)) {
++        diagnose(Tok, diag::expected_identifier_in_decl, "import");
++        return nullptr;
++      }
++      importPath.push_back(Context.getIdentifier(component),
++                           Tok.getLoc().getAdvancedLoc(offset));
++      offset += component.size() + 1;
++    }
++    consumeToken();
++  } else {
+   bool HasNext;
+   do {
+     if (Tok.is(tok::code_complete)) {
+@@ -6622,6 +6645,7 @@
+     }
+     HasNext = consumeIf(tok::period);
+   } while (HasNext);
++  }
+ 
+   if (Tok.is(tok::code_complete)) {
+     // We omit the code completion token if it immediately follows the module
+@@ -8866,6 +8890,8 @@
+     }
+   }
+ 
++  const bool minyarFunction = HasFuncKeyword && L->isMinyarSyntax() &&
++                              Tok.getText() == "function";
+   ParserStatus Status;
+   SourceLoc FuncLoc =
+       HasFuncKeyword ? consumeToken(tok::kw_func) : Tok.getLoc();
+@@ -8942,7 +8968,7 @@
+                                    DefaultArgs,
+                                    asyncLoc, reasync,
+                                    throwsLoc, rethrows, thrownTy,
+-                                   FuncRetTy);
++                                   FuncRetTy, minyarFunction);
+   if (Status.hasCodeCompletion() && !CodeCompletionCallbacks) {
+     // Trigger delayed parsing, no need to continue.
+     return Status;
+--- a/lib/Parse/ParsePattern.cpp
++++ b/lib/Parse/ParsePattern.cpp
+@@ -52,6 +52,7 @@
+   Diag<> diagID = { DiagID() };
+   switch (paramContext) {
+   case Parser::ParameterContextKind::Function:
++  case Parser::ParameterContextKind::MinyarFunction:
+   case Parser::ParameterContextKind::Operator:
+   case Parser::ParameterContextKind::Initializer:
+   case Parser::ParameterContextKind::EnumElement:
+@@ -639,6 +640,7 @@
+     // context.
+     bool isKeywordArgumentByDefault;
+     switch (paramContext) {
++    case Parser::ParameterContextKind::MinyarFunction:
+     case Parser::ParameterContextKind::Closure:
+     case Parser::ParameterContextKind::Subscript:
+     case Parser::ParameterContextKind::Operator:
+@@ -685,6 +687,7 @@
+ 
+     assert ((!param.DefaultArg ||
+              paramContext == Parser::ParameterContextKind::Function ||
++             paramContext == Parser::ParameterContextKind::MinyarFunction ||
+              paramContext == Parser::ParameterContextKind::Operator ||
+              paramContext == Parser::ParameterContextKind::Initializer ||
+              paramContext == Parser::ParameterContextKind::EnumElement ||
+@@ -711,6 +714,7 @@
+     Diag<> diagID;
+     switch (paramContext) {
+     case ParameterContextKind::Function:
++    case ParameterContextKind::MinyarFunction:
+     case ParameterContextKind::Operator:
+       diagID = diag::func_decl_without_paren;
+       break;
+@@ -806,7 +810,8 @@
+                                SourceLoc &throwsLoc,
+                                bool &rethrows,
+                                TypeRepr *&thrownType,
+-                               TypeRepr *&retType) {
++                               TypeRepr *&retType,
++                               bool minyarFunction) {
+   SmallVector<Identifier, 4> NamePieces;
+   ParserStatus Status;
+ 
+@@ -814,7 +819,9 @@
+       SimpleName.isOperator()
+           ? ParameterContextKind::Operator
+           : (SimpleName.isConstructor() ? ParameterContextKind::Initializer
+-                                        : ParameterContextKind::Function);
++                                        : (minyarFunction
++                                               ? ParameterContextKind::MinyarFunction
++                                               : ParameterContextKind::Function));
+   Status |= parseFunctionArguments(NamePieces, bodyParams, paramContext,
+                                    defaultArgs);
+   FullName = DeclName(Context, SimpleName, NamePieces);
+@@ -831,9 +838,10 @@
+   SourceLoc arrowLoc;
+   if (Tok.isAny(tok::arrow, tok::colon)) {
+     if (!consumeIf(tok::arrow, arrowLoc)) {
+-      // FixIt ':' to '->'.
+-      diagnose(Tok, diag::func_decl_expected_arrow)
+-          .fixItReplace(Tok.getLoc(), " -> ");
++      // A colon is the native Minyar function return annotation.
++      if (!minyarFunction)
++        diagnose(Tok, diag::func_decl_expected_arrow)
++            .fixItReplace(Tok.getLoc(), " -> ");
+       arrowLoc = consumeToken(tok::colon);
+     }
+ 
+--- a/lib/Frontend/Frontend.cpp
++++ b/lib/Frontend/Frontend.cpp
+@@ -1374,7 +1374,8 @@
+   auto MainInputIter =
+       std::find_if(Inputs.begin(), Inputs.end(), [](const InputFile &input) {
+         return input.getType() == file_types::TY_Swift &&
+-               llvm::sys::path::filename(input.getFileName()) == "main.swift";
++               (llvm::sys::path::filename(input.getFileName()) == "main.swift" ||
++           llvm::sys::path::filename(input.getFileName()) == "main.min");
+       });
+ 
+   std::optional<unsigned> MainBufferID = std::nullopt;
+diff --git i/lib/Parse/ParseStmt.cpp w/lib/Parse/ParseStmt.cpp
+index 45d0f591..e4c29154 100644
+--- i/lib/Parse/ParseStmt.cpp
++++ w/lib/Parse/ParseStmt.cpp
+@@ -1623,6 +1623,14 @@ Parser::parseStmtConditionElement(SmallVectorImpl<StmtConditionElement> &result,
+       .fixItInsert(Tok.getLoc(), BindingKindStr.str()+" ");
+   }
+ 
++  // Keep the original spelling for diagnostics, but interpret binding
++  // mutability using the source dialect, as the lexer does for other patterns.
++  StringRef semanticBindingKind = BindingKindStr;
++  if (L->isMinyarSyntax()) {
++    if (BindingKindStr == "constant") semanticBindingKind = "let";
++    else if (BindingKindStr == "let") semanticBindingKind = "var";
++  }
++
+   // We're parsing a conditional binding.
+   assert(CurDeclContext->isLocalContext() &&
+           "conditional binding in non-local context?!");
+@@ -1648,7 +1656,7 @@ Parser::parseStmtConditionElement(SmallVectorImpl<StmtConditionElement> &result,
+ 
+     consumeToken(tok::kw_case);
+ 
+-    auto newPatternBindingState = PatternBindingState::get(BindingKindStr)
++    auto newPatternBindingState = PatternBindingState::get(semanticBindingKind)
+       .value_or(PatternBindingState(PatternBindingState::InVar));
+     BindingKindStr = "case";
+     
+@@ -1678,7 +1686,7 @@ Parser::parseStmtConditionElement(SmallVectorImpl<StmtConditionElement> &result,
+   } else {
+     // Otherwise, this is an implicit optional binding "if let".
+     ThePattern = parseMatchingPatternAsBinding(
+-        PatternBindingState::get(BindingKindStr)
++        PatternBindingState::get(semanticBindingKind)
+             .value_or(PatternBindingState(PatternBindingState::InVar)),
+         IntroducerLoc,
+         /*isExprBasic*/ true);
