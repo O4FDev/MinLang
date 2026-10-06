@@ -89,7 +89,9 @@ typedef struct {
 #endif
 
 static int saved_argument_count;
+#ifndef _WIN32
 static char **saved_argument_values;
+#endif
 #ifdef _WIN32
 static wchar_t **saved_windows_argument_values;
 
@@ -995,8 +997,10 @@ MinyarText *minyar_boolean_text(_Bool boolean) {
 
 void minyar_initialize_arguments(int count, char **values) {
     saved_argument_count = count;
+#ifndef _WIN32
     saved_argument_values = values;
-#ifdef _WIN32
+#else
+    (void)values;
     /* Text output is UTF-8 with LF newlines on every platform. */
     if (_setmode(_fileno(stderr), _O_BINARY) == -1)
         minyar_stop("standard error could not be configured.");
@@ -1063,9 +1067,36 @@ static long long text_file_length(FILE *file) {
     return (long long)length;
 }
 
+/* Language paths are UTF-8 on every platform. All callers use binary modes. */
+static FILE *open_text_path(const char *path, const char *mode) {
+#ifdef _WIN32
+    int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
+    if (length <= 0)
+        minyar_stop("a file path contained invalid UTF-8.");
+#if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
+    wchar_t *wide = rc_heap_allocate((size_t)length * sizeof(wchar_t));
+#else
+    wchar_t *wide = malloc((size_t)length * sizeof(wchar_t));
+#endif
+    if (!wide)
+        out_of_memory();
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, length) != length)
+        minyar_stop("a file path could not be converted to UTF-16.");
+    FILE *file = _wfopen(wide, mode[0] == 'w' ? L"wb" : L"rb");
+#if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
+    rc_heap_deallocate(wide);
+#else
+    free(wide);
+#endif
+    return file;
+#else
+    return fopen(path, mode);
+#endif
+}
+
 MinyarText *minyar_read_text_file(const MinyarText *path_text) {
     char *path = text_as_path(path_text);
-    FILE *file = fopen(path, "rb");
+    FILE *file = open_text_path(path, "rb");
     long long length;
     unsigned char *bytes;
     if (!file) {
@@ -1093,7 +1124,7 @@ MinyarText *minyar_read_text_file(const MinyarText *path_text) {
 
 void minyar_write_text_file(const MinyarText *path_text, const MinyarText *contents) {
     char *path = text_as_path(path_text);
-    FILE *file = fopen(path, "wb");
+    FILE *file = open_text_path(path, "wb");
 #if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
     rc_heap_deallocate(path);
 #else

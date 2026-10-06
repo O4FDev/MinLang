@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 import subprocess
 import unittest
-from clang_helpers import clang_command
+from clang_helpers import clang_command, native_path
 from llvm_sanitizer import prepare_llvm_for_link
 from regressions import CompilerTestCase, COMPILER, CLANG, RUNTIME, ROOT, LINK_FLAGS
 
@@ -140,7 +140,7 @@ __attribute__((destructor)) static void report(void) {
         library = self.directory / 'unicode é🙂.min'
         library.write_text('\ufeffpublic function answer(): Integer {\n    let text = "é🙂"\n    return text + 2\n}\n')
         self.rejects('use "./unicode é🙂.min" as lib\nprint(lib.answer())\n',
-                     f'{library}:3, column 17: the two sides of')
+                     f'{native_path(library)}:3, column 17: the two sides of')
 
     def test_cold_warm_and_changed_import_diagnostics_match_direct_compilation(self):
         library = self.directory / 'library.min'
@@ -162,8 +162,8 @@ __attribute__((destructor)) static void report(void) {
         # An unchanged import uses sparse persisted origins during interface
         # reconstruction, while a changed body gets original source positions.
         cases = [
-            ('public function answer(): Integer { return 42 }\n', 'use "./library.min" as lib\nprint(lib.missing())\n', f'{entry}:2, column 7'),
-            ('public function answer(): Integer {\n    return "é🙂" + 2\n}\n', 'use "./library.min" as lib\nprint(lib.answer())\n', f'{library}:2, column 17'),
+            ('public function answer(): Integer { return 42 }\n', 'use "./library.min" as lib\nprint(lib.missing())\n', f'{native_path(entry)}:2, column 7'),
+            ('public function answer(): Integer {\n    return "é🙂" + 2\n}\n', 'use "./library.min" as lib\nprint(lib.answer())\n', f'{native_path(library)}:2, column 17'),
         ]
         for body, main, location in cases:
             library.write_text(body); entry.write_text(main)
@@ -173,7 +173,7 @@ __attribute__((destructor)) static void report(void) {
             self.assertEqual(cached.returncode, 1, cached.stderr)
             self.assertEqual(cached.stderr, direct.stderr)
             self.assertIn(location, direct.stderr)
-            self.assertEqual(direct.stderr.count(str(library)), int(location.startswith(str(library))))
+            self.assertEqual(direct.stderr.count(native_path(library)), int(location.startswith(native_path(library))))
 
 
 if __name__ == '__main__':

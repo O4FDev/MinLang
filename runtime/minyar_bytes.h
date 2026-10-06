@@ -245,7 +245,7 @@ void minyar_bytes_append(MinyarBytes *bytes, const MinyarBytes *other) {
 
 MinyarBytes *minyar_read_bytes_file(const MinyarText *path_text) {
     char *path = text_as_path(path_text);
-    FILE *file = fopen(path, "rb");
+    FILE *file = open_text_path(path, "rb");
     if (!file) {
         fprintf(stderr, "Minyar stopped: the file '%s' could not be opened.\n", path);
         exit(1);
@@ -265,7 +265,7 @@ MinyarBytes *minyar_read_bytes_file(const MinyarText *path_text) {
 
 void minyar_write_bytes_file(const MinyarText *path_text, const MinyarBytes *contents) {
     char *path = text_as_path(path_text);
-    FILE *file = fopen(path, "wb");
+    FILE *file = open_text_path(path, "wb");
 #if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
     rc_heap_deallocate(path);
 #else
@@ -281,7 +281,7 @@ void minyar_write_bytes_file(const MinyarText *path_text, const MinyarBytes *con
 
 _Bool minyar_file_exists(const MinyarText *path_text) {
     char *path = text_as_path(path_text);
-    FILE *file = fopen(path, "rb");
+    FILE *file = open_text_path(path, "rb");
 #if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
     rc_heap_deallocate(path);
 #else

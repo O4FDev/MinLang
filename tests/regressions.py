@@ -287,7 +287,7 @@ let values = nested(); print(values[0]); print(values[1])
                 self.rejects(source, 'Nothing cannot be used as a value type')
 
     def test_unicode_files_and_arguments(self):
-        path = self.directory / 'unicode.txt'
+        path = self.directory / 'unicode é🙂.txt'
         path.write_text('é🙂', encoding='utf-8')
         source = 'let argumentText = argument(0)\nlet fileText = readTextFile(argument(1))\nprint(argumentText)\nprint(argumentText[0])\nprint(fileText[1])\n'
         result, llvm = self.compile(source)
@@ -299,6 +299,29 @@ let values = nested(); print(values[0]); print(values[1])
                 run = self.evidence.run([str(exe), argument, str(path)], capture_output=True, timeout=RUN_TIMEOUT)
                 self.assertEqual(run.returncode, 0, run.stderr)
                 self.assertEqual(run.stdout, f'{argument}\né\n🙂\n'.encode('utf-8'))
+
+    def test_unicode_paths_support_text_and_binary_file_operations(self):
+        text_path = self.directory / 'text é🙂.txt'
+        bytes_path = self.directory / 'bytes é🙂.bin'
+        self.executes('''let textPath = argument(0)
+let bytesPath = argument(1)
+print(fileExists(textPath))
+writeTextFile(textPath, "é🙂")
+print(fileExists(textPath))
+print(readTextFile(textPath))
+let bytes = Bytes(3)
+bytes[0] = 0
+bytes[1] = 255
+bytes[2] = 42
+writeBytesFile(bytesPath, bytes)
+print(fileExists(bytesPath))
+let read = readBytesFile(bytesPath)
+print(read[0])
+print(read[1])
+print(read[2])
+''', 'false\ntrue\né🙂\ntrue\n0\n255\n42\n',
+            arguments=(str(text_path), str(bytes_path)),
+            file_outputs=((text_path, 'é🙂'.encode('utf-8')), (bytes_path, bytes([0, 255, 42]))))
 
     def test_invalid_arithmetic_and_ordering(self):
         for operator in ('+', '-', '*', '/', '%'):

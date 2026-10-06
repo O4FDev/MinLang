@@ -1,5 +1,7 @@
 """Platform libraries for direct Clang invocations in standalone test scripts."""
+import os
 import platform
+import subprocess
 
 
 def windows_host():
@@ -17,3 +19,11 @@ def clang_command(arguments):
         arguments = [argument for argument in arguments if argument != '-lm']
         arguments.append('-lm')
     return arguments
+
+
+def native_path(path):
+    # MSYS translates command arguments to native paths before launching Clang
+    # and Minyar; diagnostics use that same spelling.
+    if platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
+        return subprocess.check_output(['cygpath', '-m', str(path)], text=True).strip()
+    return str(path).replace('\\', '/') if os.name == 'nt' else str(path)

@@ -1,5 +1,9 @@
 PEER_SUITES ?= tests/peer-regressions.py tests/peer-cpp-java-js.py tests/peer-rust-go-zig.py tests/peer-python-swift-ruby-lua.py
-PEER_DRIVER_ARTIFACTS = build/minyarc build/minyarc-modules build/minyar-module-build build/minyar-default-runtime.o
+PEER_DRIVER_ARTIFACTS = build/minyarc build/minyarc-modules build/minyar-default-runtime.o
+# Only the extended Rust/Go/Zig suite exercises the POSIX incremental driver.
+ifneq ($(filter tests/peer-rust-go-zig.py,$(PEER_SUITES)),)
+PEER_DRIVER_ARTIFACTS += build/minyar-module-build
+endif
 
 .PHONY: check-stateful-lists check-stateful-lists-sanitize check-runtime-size-guards check-compiler-allocation-faults check-peer-ownership check-peer-sanitize check-peer-audit-harness check-evidence-harness check-peer-manifest check-peer-regressions check-peer-optimizations check-allocation-faults check-codegen check-reduction-harness
 

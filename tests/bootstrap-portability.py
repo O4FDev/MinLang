@@ -5,11 +5,12 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from clang_helpers import windows_host
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
-@unittest.skipIf(os.name == 'nt', 'UBSan bootstrap probe requires a Unix toolchain')
+@unittest.skipIf(windows_host(), 'UBSan bootstrap probe requires a Unix toolchain')
 class BootstrapPortability(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

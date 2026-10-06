@@ -4,7 +4,7 @@
 Sources and semantic differences: docs/research/peer-tests-{cpp,javascript-java,
 rust-go-zig,python-swift,ruby-lua}.md. No upstream fixture code is copied.
 """
-from clang_helpers import clang_command
+from clang_helpers import clang_command, native_path
 import os
 import json
 import random
@@ -654,8 +654,8 @@ while index < text.length { print(text[index]); index = index + 1 }
                            'print(left == right)', 'print(right == left)',
                            'print(left != right)', 'print(right != left)',
                            'compareCompositions(left, right)',
-                           f'compareCompositions(readTextFile({literal(str(left_path))}), '
-                           f'readTextFile({literal(str(right_path))}))']
+                           f'compareCompositions(readTextFile({literal(native_path(left_path))}), '
+                           f'readTextFile({literal(native_path(right_path))}))']
                 expected += ([str(case['expected']).lower()] * 2 +
                              [str(not case['expected']).lower()] * 2) * 3
             source += ['}', f'case{index}()']

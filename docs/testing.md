@@ -323,7 +323,9 @@ isolated correctness/sanitizer evidence harness, macOS runs the portable
 compiler/runtime/module suite, and Windows runs that portable suite under
 UCRT64. The portable gate includes the byte-identical compiler fixed point,
 feature conformance, exact diagnostic snapshots, deterministic grammar fuzzing,
-and graceful compiler/program stack exhaustion.
+and graceful compiler/program stack exhaustion. Windows selects the portable
+`peer-regressions.py` suite; the extended peer suites include POSIX-only allocator
+and incremental-driver probes and run in the Linux matrix and macOS gate.
 
 The Linux matrix also runs incremental-module correctness natively and with
 sanitizers, temporary-owner admission, compiler slice-cache checks, the memory
