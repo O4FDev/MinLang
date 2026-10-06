@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from test_evidence import Evidence
 import hashlib
 import json
 import os
@@ -30,27 +31,40 @@ INTERNAL_FAILURES = ("List position", "Text position", "record position", "Segme
                      "AddressSanitizer", "UndefinedBehaviorSanitizer", "runtime error:")
 
 
+EVIDENCE = None
+
 def run(command: list[str], *, timeout: float = 8, cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
     started = time.monotonic()
-    process = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               start_new_session=os.name != "nt")
     timed_out = False
-    try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True)
-            process.kill()
-        else:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        stdout, stderr = process.communicate(timeout=10)
-    result = subprocess.CompletedProcess(command, process.returncode,
-                                         stdout.decode("utf-8", errors="backslashreplace"),
-                                         stderr.decode("utf-8", errors="backslashreplace"))
+    if EVIDENCE is not None:
+        try:
+            raw = EVIDENCE.run(command, cwd=cwd, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            timed_out = True
+            raw = subprocess.CompletedProcess(command, -1, error.output or b'', error.stderr or b'')
+        result = subprocess.CompletedProcess(command, raw.returncode,
+            raw.stdout.decode("utf-8", errors="backslashreplace"),
+            raw.stderr.decode("utf-8", errors="backslashreplace"))
+    else:
+        process = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   start_new_session=os.name != "nt")
+        timed_out = False
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True)
+                process.kill()
+            else:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            stdout, stderr = process.communicate(timeout=10)
+        result = subprocess.CompletedProcess(command, process.returncode,
+                                             stdout.decode("utf-8", errors="backslashreplace"),
+                                             stderr.decode("utf-8", errors="backslashreplace"))
     COMMANDS.append({"command": command, "cwd": str(cwd), "timeout_seconds": timeout,
                      "elapsed_seconds": round(time.monotonic() - started, 3),
                      "status": result.returncode, "timed_out": timed_out,
@@ -99,6 +113,10 @@ def check_expression_batch(compiler: Path, clang: str, cases: int, temporary: Pa
 
 
 def execute_llvm(clang: str, llvm: Path, expected: str) -> None:
+    if EVIDENCE is not None:
+        EVIDENCE.controls.setdefault("execution_oracles", {})[str(llvm.relative_to(EVIDENCE.path))] = {
+            "stdout": expected, "stderr": "", "status": 0,
+        }
     for optimization in ("-O0", "-O2"):
         executable = llvm.with_name(f"{llvm.stem}-{optimization[2:]}")
         linked = run([clang, optimization, *LINK_FLAGS, "-Wno-override-module", str(llvm),
@@ -336,6 +354,7 @@ def check_generated_module_chain(compiler: Path, clang: str, modules: int, tempo
 
 
 def main() -> int:
+    global EVIDENCE
     parser = argparse.ArgumentParser()
     parser.add_argument("--compiler", type=Path, default=DEFAULT_COMPILER)
     parser.add_argument("--clang", default=os.environ.get("MINYAR_TEST_CLANG", "clang"))
@@ -352,6 +371,11 @@ def main() -> int:
     compiler = arguments.compiler.resolve()
     arguments.output_dir.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix="campaign-", dir=arguments.output_dir.resolve()))
+    EVIDENCE = Evidence("fuzz", inputs=(compiler, RUNTIME),
+                        controls={"arguments": {k: str(v) if isinstance(v, Path) else v
+                                                for k, v in vars(arguments).items()}})
+    EVIDENCE.path.rmdir()
+    EVIDENCE.path = temporary
     COMMANDS.clear()
     program_cases = arguments.program_cases
     if program_cases is None:
@@ -381,6 +405,9 @@ def main() -> int:
         report.update(status="failed", failure=f"{type(error).__name__}: {error}")
         print(report["failure"], file=os.sys.stderr)
     finally:
+        if report.get("status") == "failed":
+            EVIDENCE.close(failed=True)
+        EVIDENCE = None
         (temporary / "results.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(f"fuzz evidence: {temporary}", flush=True)
     if report["status"] != "passed":

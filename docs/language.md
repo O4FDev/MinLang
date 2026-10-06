@@ -129,6 +129,13 @@ and an invalid range stops with a descriptive bounds error.
 Use `argumentCount()` and `argument(position)` for command-line arguments,
 and `readTextFile(path)` and `writeTextFile(path, contents)` for text files.
 
+File-backed Text preserves the file's bytes, including malformed UTF-8.
+`text.byteLength` counts those bytes, and `writeTextFile` writes them unchanged.
+Character operations (`length`, indexing, and `slice`) validate the entire
+Text as UTF-8 before returning a result. Malformed input stops the program;
+even an ASCII index or slice cannot bypass an invalid byte elsewhere in the
+same Text.
+
 `joinText(parts)` joins a `List<Text>` into one Text value.
 
 `List<T>` holds values of type `T`:
@@ -275,6 +282,7 @@ Assignments can reach through fields and List positions, as in
 holding a Text, List or record cannot be assigned if its type could lead back
 to the record's own type, because that could create a reference cycle; see the
 [runtime memory contract](runtime-memory.md). Record equality is not supported.
+The receiver, index and assigned value are evaluated once, in that order.
 
 ## Programs and entry points
 
@@ -318,12 +326,17 @@ be called from language code; put shared work in a separate function. An importe
 module function named `main` is an ordinary function and remains callable.
 
 Functions with a value return type must return a value on every reachable path.
-A path ending in `fail(...)` or `exit(...)` is also terminal. Functions returning
+A path ending in `fail(...)`, `exit(...)`, or a literal `while true` loop is
+also terminal. A literal-true loop has no fallthrough path. Functions returning
 `Nothing` can use a bare `return`. `Nothing` is a return type, not a value that
 can be stored in bindings, fields, Lists, or parameters.
 
 Built-in operations validate their argument count and types, just like user
 functions. Extra arguments are errors.
+
+User function names occupy a separate linker namespace from the runtime and
+system libraries. Names such as `malloc` or `minyar_list_new` are ordinary user
+function names; they cannot replace the runtime implementation.
 
 Local modules use an explicit namespace and expose declarations with `public`:
 
@@ -338,7 +351,9 @@ Imported modules cannot contain executable top-level statements. Imports are
 resolved relative to the importing file, declarations are private unless
 marked `public`, and cycles are rejected. See [modules](modules.md).
 
-A statement ends at the end of its line. A line ends a statement when its last
+A statement ends at the end of its line, using LF or CRLF. A bare CR is whitespace,
+not a line boundary. The end of the source file also ends
+the final complete statement, without requiring a trailing newline. A line ends a statement when its last
 token could end one: a name, a literal, `)`, `]`, or `}`. A line that ends with
 an operator, a comma, or an opening bracket continues onto the next line, so
 long expressions can be wrapped after the operator:

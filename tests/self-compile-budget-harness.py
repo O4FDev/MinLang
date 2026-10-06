@@ -3,6 +3,7 @@
 import importlib.util
 from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
@@ -13,6 +14,27 @@ spec.loader.exec_module(budget)
 
 
 class BudgetHarness(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        self.expected = b'; fixed-point compiler\n'
+        reference = root / 'reference.ll'
+        reference.write_bytes(self.expected)
+        for name, value in (('REFERENCE', reference), ('OUTPUT', root / 'output.ll')):
+            patch = mock.patch.object(budget, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def counter_runs(self, measurements):
+        remaining = iter(measurements)
+        def run(*args, **kwargs):
+            result = next(remaining)
+            if result.returncode == 0:
+                budget.OUTPUT.write_bytes(self.expected)
+            return result
+        return run
+
     def test_failed_counter_run_cannot_win_the_instruction_budget(self):
         success = subprocess.CompletedProcess([], 0, '', '100000000 instructions retired\n')
         failure = subprocess.CompletedProcess([], 1, '',
@@ -23,7 +45,7 @@ class BudgetHarness(unittest.TestCase):
             with self.subTest(failed_at=failed_at), \
                  mock.patch.object(budget.sys, 'platform', 'darwin'), \
                  mock.patch.object(budget.Path, 'exists', return_value=True), \
-                 mock.patch.object(budget.subprocess, 'run', side_effect=measurements):
+                 mock.patch.object(budget.subprocess, 'run', side_effect=self.counter_runs(measurements)):
                 with self.assertRaisesRegex(SystemExit, 'incomplete compilation'):
                     budget.retired_instructions()
 
@@ -32,7 +54,7 @@ class BudgetHarness(unittest.TestCase):
             f'{count} instructions retired\n') for count in (91, 87, 93, 89, 90)]
         with mock.patch.object(budget.sys, 'platform', 'darwin'), \
              mock.patch.object(budget.Path, 'exists', return_value=True), \
-             mock.patch.object(budget.subprocess, 'run', side_effect=measurements):
+             mock.patch.object(budget.subprocess, 'run', side_effect=self.counter_runs(measurements)):
             self.assertEqual(budget.retired_instructions(), 87)
 
 

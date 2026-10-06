@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 from clang_helpers import clang_command
 from llvm_sanitizer import address_sanitizer_enabled, prepare_llvm_for_link
+from test_evidence import Evidence
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPILER = Path(os.environ.get('MINYAR_TEST_COMPILER', ROOT / 'build/minyarc-modules'))
@@ -19,8 +20,10 @@ LTO_LINK_FLAGS = ['-fuse-ld=lld'] if platform.system() == 'Linux' and shutil.whi
 
 
 def run(command):
-    result = subprocess.run(list(map(str, command)), capture_output=True, text=True, timeout=60)
+    result = evidence.run(list(map(str, command)), capture_output=True, text=True, timeout=60,
+                          phase='module-artifact')
     assert result.returncode == 0, result.stderr
+    assert not result.stderr, result.stderr
     return result
 
 
@@ -125,26 +128,28 @@ def check_artifacts(directory, llvm, saved, expected, label):
     prelude = runtime_prelude(llvm.read_text())
     for helper in ('get.checked', 'set.scalar.checked', 'length'):
         assert '@.minyar.list.' + helper in prelude
-    objects = []
-    modules = []
-    for index, row in enumerate(range(3, len(saved), 10)):
-        module = directory / f'{label}-{index}.ll'
-        obj = module.with_suffix('.o')
-        module.write_text(prelude + saved[row + 9] + '\n' + saved[row + 5])
-        modules.append(module)
-        prepare_llvm_for_link(module, LINK_FLAGS)
-        run(clang_command([CLANG, '-O0', *LINK_FLAGS, '-Wno-override-module', '-c', module, '-o', obj]))
-        objects.append(obj)
-    binary = directory / f'{label}-program'
-    run(clang_command([CLANG, *LINK_FLAGS, *objects, RUNTIME, '-o', binary]))
-    assert run([binary]).stdout == expected
+    for optimization in ('-O0', '-O2'):
+        objects = []
+        modules = []
+        for index, row in enumerate(range(3, len(saved), 10)):
+            module = directory / f'{label}-{index}.ll'
+            obj = module.with_suffix('.o')
+            module.write_text(prelude + saved[row + 9] + '\n' + saved[row + 5])
+            modules.append(module)
+            prepare_llvm_for_link(module, LINK_FLAGS)
+            run(clang_command([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module', '-c', module, '-o', obj]))
+            objects.append(obj)
+        binary = directory / f'{label}-program'
+        run(clang_command([CLANG, *LINK_FLAGS, *objects, RUNTIME, '-o', binary]))
+        assert run([binary]).stdout == expected
     # Independently compiled modules must also link with full-program LTO.
     link_lto_modules(modules, binary)
     assert run([binary]).stdout == expected
 
 
-with tempfile.TemporaryDirectory(prefix='minyar-artifacts-') as name:
-    d = Path(name)
+with Evidence('module-artifacts', inputs=(COMPILER, __file__, ROOT / 'build/minyar-runtime.o',
+              *sorted((ROOT / 'tests/modules').rglob('*.min')))) as evidence:
+    d = evidence.path
     check_lto_sanitizer(d)
     empty = d / 'empty'; empty.write_text('')
     indexed = d / 'indexed'; indexed.mkdir()
@@ -185,6 +190,37 @@ print(characters[0])
              [('basic', 'Hello, Ada\n42\nAda\n'), ('diamond', '42\n'), ('explicit-main', '42\n'), ('windows-path', '42\n')]]
     cases.append((indexed / 'main.min', '120\n'))
     cases.append((lists / 'main.min', '1.5\n2\n42\ntrue\n🙂\n'))
+    aliases = d / 'aliases'; aliases.mkdir()
+    (aliases / 'worker.min').write_text('''public function reload(write: List<Integer>, read: List<Integer>): Integer {
+write[0] = 1
+read[0] = 2
+return write[0]
+}
+public function loop(write: List<Integer>, read: List<Integer>, forward: Boolean): Integer {
+let index = 0
+let total = 0
+while index < 3 {
+if forward { write[0] = index + 1; read[0] = index + 10 } else { read[0] = index + 1; write[0] = index + 10 }
+total = total + write[0]
+index = index + 1
+}
+return total
+}
+''')
+    source = ['use "./worker.min" as worker']
+    expected = []
+    for shared in (False, True):
+        for forward in (False, True):
+            source += ['let first = [0]', 'let second = first' if shared else 'let second = [0]',
+                       'print(worker.reload(first, second))', 'print(first[0])', 'print(second[0])',
+                       'print(worker.loop(first, second, ' + str(forward).lower() + '))',
+                       'print(first[0])', 'print(second[0])']
+            expected += [2 if shared else 1, 2 if shared else 1, 2]
+            expected += [33 if shared or not forward else 6,
+                         12 if shared or not forward else 3,
+                         12 if shared or forward else 3]
+    (aliases / 'main.min').write_text('\n'.join(source) + '\n')
+    cases.append((aliases / 'main.min', ''.join(str(value) + '\n' for value in expected)))
     for entry, expected in cases:
         llvm = d / 'combined.ll'; state = d / 'state'
         run([COMPILER, entry, llvm, '--module-state', empty, state, d / 'stats'])

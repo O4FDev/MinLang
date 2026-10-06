@@ -85,8 +85,9 @@ check-stack-overflow: build/minyarc build/minyar-runtime.o
 	$(LIMITED) python3 tests/stack-overflow.py
 
 .PHONY: check-stack-overflow-sanitize
-check-stack-overflow-sanitize: runtime/minyar_runtime.c $(RUNTIME_HEADERS)
+check-stack-overflow-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o runtime/minyar_runtime.c $(RUNTIME_HEADERS)
 	$(SANITIZER_LIMITED) python3 tests/stack-guard-sanitizer.py --clang "$(LLVM_CC)"
+	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/stack-overflow.py
 
 # Cross-platform per-commit gate. Heavier memory-profile and performance
 # matrices remain in the Linux evidence runner and the full `make check` gate.

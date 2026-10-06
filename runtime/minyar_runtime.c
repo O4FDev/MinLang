@@ -55,9 +55,13 @@ typedef struct MinyarText {
     long long byte_length;
     long long character_length;
     void *character_offsets;
+    /* Arena Text keeps only the common LLVM literal prefix: all byte owners
+     * survive until process exit, so it does not need a retained backing. */
+#ifndef MINYAR_COMPILER_ARENA
     /* Non-null only for a slice view. Views retain one flattened owning Text,
      * never another view, so destruction has constant reference depth. */
     struct MinyarText *backing;
+#endif
 } MinyarText;
 
 typedef struct {
@@ -308,7 +312,9 @@ MINYAR_HOT MinyarText *new_text(const unsigned char *bytes, long long byte_lengt
     text->byte_length = byte_length;
     text->character_length = character_length;
     text->character_offsets = NULL;
+#ifndef MINYAR_COMPILER_ARENA
     text->backing = NULL;
+#endif
     return text;
 }
 
@@ -602,17 +608,17 @@ enum { TEXT_INDEX_STRIDE = 64 };
 static size_t text_decode_count;
 #endif
 
-static long long text_index_load(const MinyarText *text, long long entry) {
-    if (text->byte_length <= UINT32_MAX)
+static uint64_t text_index_load(const MinyarText *text, long long entry) {
+    if (text->byte_length <= (UINT32_MAX >> 1))
         return ((const uint32_t *)text->character_offsets)[entry];
-    return ((const long long *)text->character_offsets)[entry];
+    return ((const uint64_t *)text->character_offsets)[entry];
 }
 
-static void text_index_store(MinyarText *text, long long entry, long long value) {
-    if (text->byte_length <= UINT32_MAX)
+static void text_index_store(MinyarText *text, long long entry, uint64_t value) {
+    if (text->byte_length <= (UINT32_MAX >> 1))
         ((uint32_t *)text->character_offsets)[entry] = (uint32_t)value;
     else
-        ((long long *)text->character_offsets)[entry] = value;
+        ((uint64_t *)text->character_offsets)[entry] = value;
 }
 
 static long long text_index_breadcrumbs(const MinyarText *text) {
@@ -624,63 +630,79 @@ static MINYAR_COLD void build_text_index(MinyarText *text) {
     long long characters = 0;
     void *offsets;
     size_t offset_size;
-    while (text->byte_length - byte >= (long long)sizeof(size_t)) {
-        const size_t high_bits = (SIZE_MAX / 255) * 128;
-        size_t word;
-        memcpy(&word, text->bytes + byte, sizeof(word));
-        if (word & high_bits)
-            break;
-        byte += (long long)sizeof(word);
-        characters += (long long)sizeof(word);
-    }
-    while (byte < text->byte_length && text->bytes[byte] < 0x80) {
-        byte++;
-        characters++;
-    }
     while (byte < text->byte_length) {
-        long long width;
-        decode_character(text->bytes + byte, text->byte_length - byte, &width);
-        byte += width;
-        characters++;
+        long long ascii_start = byte;
+        while (text->byte_length - byte >= (long long)sizeof(size_t)) {
+            const size_t high_bits = (SIZE_MAX / 255) * 128;
+            size_t word;
+            memcpy(&word, text->bytes + byte, sizeof(word));
+            if (word & high_bits) break;
+            byte += (long long)sizeof(word);
+        }
+        while (byte < text->byte_length && text->bytes[byte] < 0x80) byte++;
+        characters += byte - ascii_start;
+        if (byte < text->byte_length) {
+            long long width;
+            decode_character(text->bytes + byte, text->byte_length - byte, &width);
+            byte += width;
+            characters++;
+        }
     }
     if (characters == text->byte_length) {
         text->character_length = characters;
         return;
     }
-    /* Store one breadcrumb per 64 characters. Indexing scans at most 63 UTF-8
-       characters from that byte position, reducing ordinary index storage
-       from four bytes per character to roughly one sixteenth of a byte. */
-    offset_size = text->byte_length <= UINT32_MAX ? sizeof(uint32_t) : sizeof(long long);
-    if ((unsigned long long)(characters / TEXT_INDEX_STRIDE + 1) > SIZE_MAX / offset_size - 2)
+    /* Store one breadcrumb per 64 characters. Each unsigned entry holds a
+       byte offset shifted left by one, plus a low-bit flag for an ASCII-only
+       block. Mixed blocks scan at most 63 UTF-8 characters; ASCII blocks use
+       direct byte offsets. The tag leaves 31 bits in ordinary four-byte
+       entries; larger Text values use 64-bit entries through LLONG_MAX. */
+    offset_size = text->byte_length <= (UINT32_MAX >> 1) ? sizeof(uint32_t) : sizeof(long long);
+    if ((unsigned long long)(characters / TEXT_INDEX_STRIDE + 1) >
+        SIZE_MAX / offset_size - 2)
         minyar_stop("this Text is too large to index.");
     offsets =
         data_allocate((size_t)(characters / TEXT_INDEX_STRIDE + 3) * offset_size, offset_size);
     byte = 0;
     characters = 0;
+    long long entry = 0, block_byte = 0;
     while (byte < text->byte_length) {
         long long width;
-        if (characters % TEXT_INDEX_STRIDE == 0) {
-            long long entry = characters / TEXT_INDEX_STRIDE;
-            if (offset_size == sizeof(uint32_t))
-                ((uint32_t *)offsets)[entry] = (uint32_t)byte;
-            else
-                ((long long *)offsets)[entry] = byte;
+        size_t ascii_word = SIZE_MAX;
+        if (TEXT_INDEX_STRIDE - characters % TEXT_INDEX_STRIDE >= (long long)sizeof(size_t) &&
+            text->byte_length - byte >= (long long)sizeof(size_t))
+            memcpy(&ascii_word, text->bytes + byte, sizeof(ascii_word));
+        if (!(ascii_word & ((SIZE_MAX / 255) * 128))) {
+            byte += (long long)sizeof(ascii_word);
+            characters += (long long)sizeof(ascii_word);
+        } else {
+            decode_character(text->bytes + byte, text->byte_length - byte, &width);
+            byte += width;
+            characters++;
         }
-        characters++;
-        decode_character(text->bytes + byte, text->byte_length - byte, &width);
-        byte += width;
+        if (characters % TEXT_INDEX_STRIDE == 0) {
+            uint64_t word = ((uint64_t)block_byte << 1) |
+                            (byte - block_byte == TEXT_INDEX_STRIDE);
+            if (offset_size == sizeof(uint32_t))
+                ((uint32_t *)offsets)[entry] = (uint32_t)word;
+            else
+                ((uint64_t *)offsets)[entry] = word;
+            entry++;
+            block_byte = byte;
+        }
     }
-    if (characters % TEXT_INDEX_STRIDE == 0) {
-        long long entry = characters / TEXT_INDEX_STRIDE;
-        if (offset_size == sizeof(uint32_t))
-            ((uint32_t *)offsets)[entry] = (uint32_t)byte;
-        else
-            ((long long *)offsets)[entry] = byte;
-    }
+    /* A final partial block, or the empty endpoint block at an exact stride. */
+    uint64_t word = ((uint64_t)block_byte << 1) |
+                    (byte - block_byte == characters % TEXT_INDEX_STRIDE);
+    if (offset_size == sizeof(uint32_t))
+        ((uint32_t *)offsets)[entry] = (uint32_t)word;
+    else
+        ((uint64_t *)offsets)[entry] = word;
     text->character_offsets = offsets;
     text->character_length = characters;
-    /* Two trailing words form a one-entry cursor. Keeping them in the lazy
-       index avoids enlarging every Text header, including ASCII values. */
+    /* Two trailing words form a one-entry cursor and store raw, untagged
+       character and byte positions. Keeping them in the lazy index avoids
+       enlarging every Text header, including ASCII values. */
     text_index_store(text, text_index_breadcrumbs(text), 0);
     text_index_store(text, text_index_breadcrumbs(text) + 1, 0);
 }
@@ -699,10 +721,18 @@ long long minyar_text_byte_length(const MinyarText *text) {
     return text->byte_length;
 }
 
+/* A low-bit tag records that a fully validated sparse block is ASCII. */
+MINYAR_HOT long long ascii_block_offset(const MinyarText *text, long long position) {
+    uint64_t word = text_index_load(text, position / TEXT_INDEX_STRIDE);
+    return word & 1 ? (long long)(word >> 1) + position % TEXT_INDEX_STRIDE : -1;
+}
+
 static long long indexed_byte_offset(MinyarText *text, long long position) {
+    long long ascii_byte = ascii_block_offset(text, position);
+    if (ascii_byte >= 0) return ascii_byte;
     long long entry = position / TEXT_INDEX_STRIDE;
     long long start = entry * TEXT_INDEX_STRIDE;
-    long long byte = text_index_load(text, entry);
+    long long byte = (long long)(text_index_load(text, entry) >> 1);
     long long cursor = text_index_breadcrumbs(text);
     long long cached_position = text_index_load(text, cursor);
     long long cached_byte = text_index_load(text, cursor + 1);
@@ -772,8 +802,11 @@ int minyar_text_character_at(MinyarText *text, long long position) {
     if (text->character_length < 0 ||
         (unsigned long long)position >= (unsigned long long)text->character_length)
         return character_at_slowly(text, position);
-    if (text->character_offsets)
+    if (text->character_offsets) {
+        long long byte = ascii_block_offset(text, position);
+        if (byte >= 0) return text->bytes[byte];
         return indexed_character_at(text, position);
+    }
     return text->bytes[position];
 }
 
@@ -947,7 +980,9 @@ MinyarText *minyar_character_text(int character) {
             text->byte_length = 1;
             text->character_length = 1;
             text->character_offsets = NULL;
+#ifndef MINYAR_COMPILER_ARENA
             text->backing = NULL;
+#endif
         }
         return text;
     }

@@ -1,0 +1,7 @@
+# Batch300f — ruby
+
+Fully read 169 files: 168 test_body, 1 historical_guarded_test_body. These counts describe checked-in source bodies read, not upstream executions or completed implementations.
+
+Reviewed 168 current standalone bodies plus one historical Ruby<1.9 guarded body. Complete BasicObject, Enumerable, Enumerator arithmetic/chain/product/lazy, Fiber scheduler and Kernel source tests were read, including 447-line require_relative. Example and assertion rows retain specific absent-API reasons. Inline shared definitions and finite flag bindings in method-reflection/removal files were individually enumerated; imported shared bodies remain pending. The source-relative import, many-function imported module and missing-file diagnostic adaptations already exist in local module suites, so no duplicate implementation was proposed. Absolute imports, runtime exception fields, mutable loaded-feature registry and suffix search are incompatible with documented Minyar module policy.
+
+Across this batch: 300 current standalone test files (32 Python +100 Swift +168 Ruby), one historical guarded Ruby body and one Python finite inherited data profile; 302 fully read files in total. Source consistency checking is separate from proof of reading. Global discovery and case enumeration remain pending for Python, Swift and Ruby. No production/test files or central implementation ledger edited by this agent.

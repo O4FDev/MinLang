@@ -77,9 +77,27 @@ MINYAR_HOT void list_resize(MinyarList *list, long long capacity) {
  * buffers or retaining them in a compiler arena. */
 static MINYAR_COLD void list_reserve(MinyarList *list, long long minimum) {
     long long capacity = list->capacity;
+    if (minimum < 0 || capacity < 0)
+        minyar_stop("this List became too large.");
+    if (capacity >= minimum)
+        return;
     while (capacity < minimum)
         capacity = list_next_capacity(capacity);
     list_resize(list, capacity);
+}
+
+/* Compiler-only scalar literal path. The source is immutable, non-overlapping
+ * i64 data; every evaluation still owns a fresh mutable backing allocation. */
+void minyar_list_append_scalars(MinyarList *list, const long long *values, long long count) {
+    if (count < 0 || list->length < 0 || count > LLONG_MAX - list->length ||
+        (unsigned long long)(list->length + count) > SIZE_MAX / sizeof(*values))
+        minyar_stop("this List became too large.");
+    if (!count)
+        return;
+    long long length = list->length + count;
+    list_reserve(list, length);
+    memcpy(list->values + list->length, values, (size_t)count * sizeof(*values));
+    list->length = length;
 }
 
 static MINYAR_COLD void list_grow(MinyarList *list) {

@@ -82,6 +82,97 @@ static void borrowed_frame_model(void) {
     empty_heap();
 }
 
+/* Full UTF-8 indexes can contain entirely ASCII sparse blocks. Independent
+ * scalar/byte tables exercise both index widths and every boundary without
+ * using the runtime decoder to construct expected values. */
+static void mixed_ascii_index_blocks(void) {
+    const int lengths[] = {1, 63, 64, 65, 127, 128, 129, 191, 192, 193, 257};
+    const int positions[] = {0, 1, 62, 63, 64, 65, 126, 127, 128, 191, 192, 256};
+    const unsigned char encodings[][4] = {{0xc3, 0xa9}, {0xe2, 0x82, 0xac}, {0xf0, 0x9f, 0x99, 0x82}};
+    const int widths[] = {2, 3, 4}, scalars[] = {0xe9, 0x20ac, 0x1f642};
+    for (size_t n = 0; n < sizeof(lengths) / sizeof(*lengths); ++n) {
+        int length = lengths[n];
+        for (size_t p = 0; p < sizeof(positions) / sizeof(*positions); ++p) {
+            int special = positions[p];
+            if (special >= length) continue;
+            for (int encoding = 0; encoding < 3; ++encoding) {
+                unsigned char *bytes = new_bytes(length + widths[encoding] - 1);
+                long long offsets[258];
+                int expected[257];
+                long long count = 0;
+                for (int i = 0; i < length; ++i) {
+                    offsets[i] = count;
+                    expected[i] = i == special ? scalars[encoding] : i % 128;
+                    if (i == special) {
+                        memcpy(bytes + count, encodings[encoding], (size_t)widths[encoding]);
+                        count += widths[encoding];
+                    } else bytes[count++] = (unsigned char)expected[i];
+                }
+                offsets[length] = count;
+                bytes[count] = 0;
+                MinyarText *text = new_text(bytes, count, -1);
+                assert(minyar_text_length(text) == length && text->character_offsets);
+                /* Reverse then forward queries repeatedly cross cached mixed
+                 * blocks, complete ASCII blocks and their shorter final tail. */
+                for (int direction = 0; direction < 2; ++direction) {
+                    for (int step = 0; step <= length; ++step) {
+                        int i = direction ? step : length - step;
+                        int first = i / TEXT_INDEX_STRIDE * TEXT_INDEX_STRIDE;
+                        int last = first + TEXT_INDEX_STRIDE;
+                        if (last > length) last = length;
+                        int ascii = special < first || special >= last;
+                        size_t before = text_decode_count;
+                        assert(indexed_byte_offset(text, i) == offsets[i]);
+                        if (ascii) assert(text_decode_count == before);
+                        if (i < length) {
+                            before = text_decode_count;
+                            assert(minyar_text_character_at(text, i) == expected[i]);
+                            if (ascii) assert(text_decode_count == before);
+                        }
+                    }
+                }
+                const int starts[] = {0, 1, 63, 64, 65, 127, 128, length};
+                for (size_t s = 0; s < sizeof(starts) / sizeof(*starts); ++s) {
+                    int first = starts[s];
+                    if (first > length) continue;
+                    MinyarText *slice = minyar_text_slice(text, first, length);
+                    assert(slice->byte_length == count - offsets[first]);
+                    assert(memcmp(slice->bytes, bytes + offsets[first], (size_t)slice->byte_length) == 0);
+                    assert(minyar_text_length(slice) == length - first);
+                    minyar_rc_release(slice);
+                }
+                minyar_rc_release(text);
+                empty_heap();
+            }
+        }
+    }
+    /* Synthetic tables isolate offset arithmetic without claiming enormous
+     * allocated UTF-8 texts. No payload byte is dereferenced. The final full
+     * block and position==length must not read the following cursor as a
+     * breadcrumb; wide byte + absolute position would overflow before subtract. */
+    const long long narrow_limit = UINT32_MAX >> 1;
+    uint32_t narrow[5] = {0};
+    MinyarText small_index = {NULL, narrow_limit, 128, narrow, NULL};
+    text_index_store(&small_index, 1, ((uint64_t)(narrow_limit - 64) << 1) | 1);
+    text_index_store(&small_index, 2, ((uint64_t)narrow_limit << 1) | 1);
+    assert(narrow[2] == UINT32_MAX);
+    assert(indexed_byte_offset(&small_index, 64) == narrow_limit - 64);
+    assert(indexed_byte_offset(&small_index, 127) == narrow_limit - 1);
+    assert(indexed_byte_offset(&small_index, 128) == narrow_limit);
+    const long long wide_limits[] = {narrow_limit + 1, LLONG_MAX};
+    for (size_t i = 0; i < sizeof(wide_limits) / sizeof(*wide_limits); ++i) {
+        long long limit = wide_limits[i];
+        uint64_t wide[5] = {0};
+        MinyarText wide_index = {NULL, limit, 128, wide, NULL};
+        text_index_store(&wide_index, 1, ((uint64_t)(limit - 64) << 1) | 1);
+        text_index_store(&wide_index, 2, ((uint64_t)limit << 1) | 1);
+        assert(wide[2] == ((uint64_t)limit << 1) + 1);
+        assert(indexed_byte_offset(&wide_index, 64) == limit - 64);
+        assert(indexed_byte_offset(&wide_index, 127) == limit - 1);
+        assert(indexed_byte_offset(&wide_index, 128) == limit);
+    }
+}
+
 int main(void) {
     minyar_rc_release(NULL);
     minyar_rc_enter(3);
@@ -131,6 +222,7 @@ int main(void) {
     minyar_rc_release(boundary);
     minyar_rc_release(breadcrumbs);
     empty_heap();
+    mixed_ascii_index_blocks();
 
     /* Model lexer lookahead and backtracking across one- through four-byte
        characters. Nearby backwards/repeated accesses must stay linear too. */
@@ -362,6 +454,67 @@ int main(void) {
         MinyarText *character = minyar_character_text(scalars[i]);
         assert(minyar_text_character_at(character, 0) == scalars[i]);
         assert(minyar_text_length(character) == 1);
+        minyar_rc_release(character);
+    }
+    empty_heap();
+
+    /* Control and two-byte scalar vectors from the Ruby peer audit. */
+    const struct { int scalar; int length; unsigned char bytes[2]; } small_scalars[] = {
+        {1, 1, {0x01}}, {8, 1, {0x08}}, {15, 1, {0x0f}},
+        {24, 1, {0x18}}, {31, 1, {0x1f}},
+        {129, 2, {0xc2, 0x81}}, {255, 2, {0xc3, 0xbf}},
+    };
+    for (size_t i = 0; i < sizeof(small_scalars) / sizeof(*small_scalars); i++) {
+        MinyarText *character = minyar_character_text(small_scalars[i].scalar);
+        assert(character->byte_length == small_scalars[i].length);
+        assert(memcmp(character->bytes, small_scalars[i].bytes, small_scalars[i].length) == 0);
+        assert(minyar_text_length(character) == 1);
+        assert(minyar_text_character_at(character, 0) == small_scalars[i].scalar);
+        minyar_rc_release(character);
+    }
+    empty_heap();
+
+    /* Every supplementary-plane endpoint, with independent UTF-8 byte oracles. */
+    const struct { int scalar; unsigned char bytes[4]; } plane_edges[] = {
+        {0x10000, {0xf0, 0x90, 0x80, 0x80}},
+        {0x1ffff, {0xf0, 0x9f, 0xbf, 0xbf}},
+        {0x20000, {0xf0, 0xa0, 0x80, 0x80}},
+        {0x2ffff, {0xf0, 0xaf, 0xbf, 0xbf}},
+        {0x30000, {0xf0, 0xb0, 0x80, 0x80}},
+        {0x3ffff, {0xf0, 0xbf, 0xbf, 0xbf}},
+        {0x40000, {0xf1, 0x80, 0x80, 0x80}},
+        {0x4ffff, {0xf1, 0x8f, 0xbf, 0xbf}},
+        {0x50000, {0xf1, 0x90, 0x80, 0x80}},
+        {0x5ffff, {0xf1, 0x9f, 0xbf, 0xbf}},
+        {0x60000, {0xf1, 0xa0, 0x80, 0x80}},
+        {0x6ffff, {0xf1, 0xaf, 0xbf, 0xbf}},
+        {0x70000, {0xf1, 0xb0, 0x80, 0x80}},
+        {0x7ffff, {0xf1, 0xbf, 0xbf, 0xbf}},
+        {0x80000, {0xf2, 0x80, 0x80, 0x80}},
+        {0x8ffff, {0xf2, 0x8f, 0xbf, 0xbf}},
+        {0x90000, {0xf2, 0x90, 0x80, 0x80}},
+        {0x9ffff, {0xf2, 0x9f, 0xbf, 0xbf}},
+        {0xa0000, {0xf2, 0xa0, 0x80, 0x80}},
+        {0xaffff, {0xf2, 0xaf, 0xbf, 0xbf}},
+        {0xb0000, {0xf2, 0xb0, 0x80, 0x80}},
+        {0xbffff, {0xf2, 0xbf, 0xbf, 0xbf}},
+        {0xc0000, {0xf3, 0x80, 0x80, 0x80}},
+        {0xcffff, {0xf3, 0x8f, 0xbf, 0xbf}},
+        {0xd0000, {0xf3, 0x90, 0x80, 0x80}},
+        {0xdffff, {0xf3, 0x9f, 0xbf, 0xbf}},
+        {0xe0000, {0xf3, 0xa0, 0x80, 0x80}},
+        {0xeffff, {0xf3, 0xaf, 0xbf, 0xbf}},
+        {0xf0000, {0xf3, 0xb0, 0x80, 0x80}},
+        {0xfffff, {0xf3, 0xbf, 0xbf, 0xbf}},
+        {0x100000, {0xf4, 0x80, 0x80, 0x80}},
+        {0x10ffff, {0xf4, 0x8f, 0xbf, 0xbf}},
+    };
+    for (size_t i = 0; i < sizeof(plane_edges) / sizeof(*plane_edges); i++) {
+        MinyarText *character = minyar_character_text(plane_edges[i].scalar);
+        assert(character->byte_length == 4);
+        assert(memcmp(character->bytes, plane_edges[i].bytes, 4) == 0);
+        assert(minyar_text_length(character) == 1);
+        assert(minyar_text_character_at(character, 0) == plane_edges[i].scalar);
         minyar_rc_release(character);
     }
     empty_heap();

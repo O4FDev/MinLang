@@ -35,7 +35,7 @@ TARGETS = ['check-toolchain-stamp', 'check-toolchain-portability', 'check-cold-b
            'check-generated-sanitizer', 'check-sanitized-fixed-point',
            'check-smoke', 'check-release-build', 'check-launcher-isolation',
            'check-modules', 'check-regressions', 'check-diagnostics', 'check-conformance',
-           'check-fuzz', 'check-stack-overflow',
+           'check-fuzz', 'check-stack-overflow', 'check-statement-nesting',
            'check-mutation', 'check-mutation-score', 'check-binary-expressions', 'check-ownership',
            'check-adversarial', 'check-recursive-data', 'check-scalar-record-storage',
            'check-readonly-parameters', 'check-compact-ownership', 'check-integer-text-cache',
@@ -44,7 +44,7 @@ TARGETS = ['check-toolchain-stamp', 'check-toolchain-portability', 'check-cold-b
            'check-ownership-mutation', 'check-scalar-record-initialization',
            'check-incremental-modules', 'check-incremental-modules-sanitize',
            'check-sanitize']
-DIRECTORIES = ('bootstrap', 'compiler', 'runtime', 'library', 'vendor', 'examples', 'tests', 'build-support',
+DIRECTORIES = ('bootstrap', 'compiler', 'runtime', 'library', 'vendor', 'examples', 'tests', 'build-support', 'docs',
                'experiments', 'scripts', 'tools')
 
 
@@ -67,7 +67,8 @@ def main():
                 'tests/integer-text-cache.c', 'tests/integer-text-cache.py',
                 'tests/tokenizer-storage.c', 'tests/tokenizer-storage.py',
                 'tests/recent-cursors.c', 'tests/memory-profile-regressions.py',
-                'experiments/memory/critical-path-study.py']
+                'experiments/memory/critical-path-study.py',
+                'docs/research/exhaustive/implementations.jsonl']
     missing = [name for name in required if not (source / name).is_file()]
     plan = {'source': str(source), 'build_targets': BUILD,
             'correctness_targets': TARGETS,
