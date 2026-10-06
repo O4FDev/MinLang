@@ -140,7 +140,7 @@ class Evidence:
                'stdin': stdin_record,
                'executable': executable, 'executable_sha256': tool_hash, 'empty_environment': env == {},
                'environment': {k: v for k, v in effective_env.items()
-                               if k.startswith('MINYAR_') or k in ('ASAN_OPTIONS', 'UBSAN_OPTIONS')
+                               if k.startswith('MINYAR_') or k in ('ASAN_OPTIONS', 'UBSAN_OPTIONS', 'MSYS2_ARG_CONV_EXCL')
                                or (env is not None and os.environ.get(k) != v)},
                'removed_environment': sorted(set(os.environ) - set(effective_env)) if env else [],
                'timed_out': False}

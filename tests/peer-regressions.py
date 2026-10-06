@@ -12,6 +12,7 @@ import stat
 import sys
 import shlex
 import unittest
+from unittest.mock import patch
 
 from regressions import CompilerTestCase, CLANG, COMPILER, ROOT
 from test_evidence import digest
@@ -735,10 +736,12 @@ while index < text.length { print(text[index]); index = index + 1 }
         variants = ('-O0', '-O2', '-O3', '-Os') if os.environ.get('MINYAR_TEST_EXTENDED_OPT') == '1' else ('-O0', '-O2')
         for optimization in variants:
             for arguments, stdout, stderr in cases:
-                with self.subTest(optimization=optimization, arguments=arguments):
-                    # These are operator/data arguments, not paths. MSYS would
-                    # otherwise rewrite the division operator '/' to its root.
-                    environment = dict(os.environ, MSYS2_ARG_CONV_EXCL='*')
+                # MSYS reads this policy from the spawning process, before
+                # applying the child's environment. Keep compilation outside
+                # this context so its path arguments still get translated.
+                with self.subTest(optimization=optimization, arguments=arguments), \
+                     patch.dict(os.environ, MSYS2_ARG_CONV_EXCL='*'):
+                    environment = dict(os.environ)
                     result = self.evidence.run([llvm.with_suffix('.' + optimization[1:]), *arguments],
                                                env=environment, timeout=10, phase='execute-integer-matrix')
                     self.assertEqual((result.returncode, result.stdout, result.stderr),
