@@ -736,7 +736,11 @@ while index < text.length { print(text[index]); index = index + 1 }
         for optimization in variants:
             for arguments, stdout, stderr in cases:
                 with self.subTest(optimization=optimization, arguments=arguments):
-                    result = self.evidence.run([llvm.with_suffix('.' + optimization[1:]), *arguments], timeout=10, phase='execute-integer-matrix')
+                    # These are operator/data arguments, not paths. MSYS would
+                    # otherwise rewrite the division operator '/' to its root.
+                    environment = dict(os.environ, MSYS2_ARG_CONV_EXCL='*')
+                    result = self.evidence.run([llvm.with_suffix('.' + optimization[1:]), *arguments],
+                                               env=environment, timeout=10, phase='execute-integer-matrix')
                     self.assertEqual((result.returncode, result.stdout, result.stderr),
                                      (int(bool(stderr)), stdout.encode(), stderr.encode()))
 
