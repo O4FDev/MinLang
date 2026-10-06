@@ -44,7 +44,7 @@ print(holder[0][0])
         source += 'print(boundary(' + ', '.join(str(i) for i in range(64)) + '))\n'
         result, llvm = self.compile(source)
         self.assertEqual(result.returncode, 0, result.stderr)
-        body = re.search(r'^define[^\n]*@boundary\([^\n]*\)[^{]*\{(.*?)^}', llvm.read_text(), re.M | re.S)
+        body = re.search(r'^define[^\n]*@\.minyar\.user\.boundary\([^\n]*\)[^{]*\{(.*?)^}', llvm.read_text(), re.M | re.S)
         self.assertIsNotNone(body)
         self.assertNotIn('%local.', body[1])
         self.executes(source, '633100\n')

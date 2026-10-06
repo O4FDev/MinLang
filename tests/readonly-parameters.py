@@ -9,7 +9,7 @@ class ReadonlyParameters(CompilerTestCase):
     def function_body(self, source, name):
         result, llvm = self.compile(source)
         self.assertEqual(result.returncode, 0, result.stderr)
-        match = re.search(r'^define [^\n]*@' + name + r'\([^\n]*\)[^\n{]*\{\n(.*?)^}', llvm.read_text(), re.M | re.S)
+        match = re.search(r'^define [^\n]*@\.minyar\.user\.' + name + r'\([^\n]*\)[^\n{]*\{\n(.*?)^}', llvm.read_text(), re.M | re.S)
         self.assertIsNotNone(match, name)
         return match[1]
 

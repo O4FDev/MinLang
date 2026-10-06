@@ -12,7 +12,7 @@ class CompactOwnership(CompilerTestCase):
     def frame(self, source, name):
         result, llvm = self.compile(source)
         self.assertEqual(result.returncode, 0, result.stderr)
-        match = re.search(r'define [^\n]*@' + re.escape(name) + r'\([^\n]*\)[^\n{]*\{\n(.*?)\n\}', llvm.read_text(), re.S)
+        match = re.search(r'define [^\n]*@\.minyar\.user\.' + re.escape(name) + r'\([^\n]*\)[^\n{]*\{\n(.*?)\n\}', llvm.read_text(), re.S)
         self.assertIsNotNone(match, name)
         body = match[1]
         entry = re.search(r'call void @minyar_rc_enter\(i64 (\d+)\)', body)
