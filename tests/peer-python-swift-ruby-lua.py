@@ -31,13 +31,13 @@ DECIMAL_RADIX_TAIL = tuple(sign + radix + '_' for sign in ('', '-', '+')
                    for radix in ('0x', '0o', '0b', '0d'))
 
 def decimal_literal_diagnostic(token):
-    """Current decimal-only grammar in the exact print(token) context.
+    """Decimal and hexadecimal grammar in the exact print(token) context.
 
     '+' has no unary production. A bare '-' lacks its expression. Identifiers
-    following an optional decimal prefix remain whole unknown names. These
+    following an optional numeric prefix remain whole unknown names. These
     finite tokens cannot contain a second sign or other punctuation.
     """
-    assert not re.fullmatch(r'-?[0-9]+', token)
+    assert not re.fullmatch(r'-?(?:0[xX][0-9a-fA-F]+|[0-9]+)', token)
     if not token:
         return 'print expects 1 arguments, but received 0'
     if token.startswith('+'):
@@ -45,8 +45,9 @@ def decimal_literal_diagnostic(token):
     if token == '-':
         return "line 1, column 8: expected an expression, found ')'"
     offset = 1 if token.startswith('-') else 0
-    while offset < len(token) and '0' <= token[offset] <= '9':
-        offset += 1
+    number = re.match(r'-?(?:0[xX][0-9a-fA-F]+|[0-9]+)', token)
+    if number:
+        offset = number.end()
     name = token[offset:]
     assert re.fullmatch(r'[a-zA-Z_][a-zA-Z_0-9]*', name)
     return f"line 1, column {7+offset}: I can't find a value named '{name}'"
@@ -56,11 +57,11 @@ def decimal_literal_cells():
         for size in range(4):
             for digits in itertools.product(DECIMAL_ALPHABET, repeat=size):
                 token = prefix + ''.join(digits)
-                accept = re.fullmatch(r'-?[0-9]+', token) is not None
+                accept = re.fullmatch(r'-?(?:0[xX][0-9a-fA-F]+|[0-9]+)', token) is not None
                 yield {'cohort': 'ruby-product', 'prefix': prefix, 'size': size,
                        'digits': list(digits), 'token': token,
                        'source_skips': token == '',
-                       'expected_value': int(token) if accept else None,
+                       'expected_value': int(token, 16 if 'x' in token.lower() else 10) if accept else None,
                        'diagnostic': None if accept else decimal_literal_diagnostic(token)}
     for token in DECIMAL_EXPLICIT_DECIMAL:
         yield {'cohort': 'python-explicit-decimal', 'token': token,
@@ -588,7 +589,7 @@ while index < marks.length { print(marks[index]); index = index + 1 }
                 with self.subTest(cohort=cell['cohort'], token=token):
                     self.rejects_exact_diagnostic(f'print({token})\n', cell['diagnostic'])
                 rejected += 1
-        self.assertEqual((len(accepted), rejected), (78, 1041))
+        self.assertEqual((len(accepted), rejected), (162, 957))
         self.executes(''.join(f'print({token})\n' for token, _ in accepted),
                       ''.join(f'{value}\n' for _, value in accepted))
 
@@ -1258,7 +1259,7 @@ let i = 0; while i < values.length { if values[i] != i { fail("literal position"
                             message = "I can't find a value named 'missing'"
                         else:
                             line, column = 2 + first, 4
-                            message = "the two sides of '+' have different types"
+                            message = "the two sides of '+' have different types (Integer and Text)"
                         result, llvm = self.compile(source)
                         self.assertEqual((result.returncode, result.stdout, result.stderr),
                                          (1, '', f'Minyar stopped: line {line}, column {column}: {message}\n'))
@@ -1552,7 +1553,7 @@ print("done")
 
 
     def test_negating_text_rejects_before_llvm(self):
-        self.rejects('print(-"a")\n', 'line 1, column 11: negation needs an Integer')
+        self.rejects('print(-"a")\n', 'line 1, column 11: negation needs an Integer or Float')
 
 
     def test_incomplete_function_three_newline_placements(self):
@@ -1568,10 +1569,11 @@ print("done")
                   '0o8', '0o1_', '0o', '0x1_', '0x')
         for token in tokens:
             with self.subTest(token=token):
-                # Minyar has decimal Integer literals only. Retain all exact
-                # rejected inputs without importing Python invalid-digit text.
+                # Binary/octal prefixes and digit separators remain unsupported.
+                # The hexadecimal prefix consumes 0x1 before the invalid '_'.
+                column, name = (10, '_') if token == '0x1_' else (8, token[1:])
                 self.rejects_exact_diagnostic(f'print({token})\n',
-                             f"line 1, column 8: I can't find a value named '{token[1:]}'")
+                             f"line 1, column {column}: I can't find a value named '{name}'")
 
 
     def test_exact_prefix_removal_values(self):
@@ -1766,16 +1768,16 @@ print(relativeSlice(a, true, -4, true, -3))
         # These source cells require SyntaxError and no warning, rather than
         # the neighboring successful compile plus warning/filter protocol.
         # Keep the complete original expression, including0or x's final x.
-        for expression in ('0xfand x', '0xfspam', '0o7spam', '0b1spam',
-                           '9spam', '0or x', '0spam'):
+        for expression, column, name in (
+            ('0xfand x', 11, 'nd'), ('0xfspam', 10, 'spam'),
+            ('0o7spam', 8, 'o7spam'), ('0b1spam', 8, 'b1spam'),
+            ('9spam', 8, 'spam'), ('0or x', 8, 'or'), ('0spam', 8, 'spam'),
+        ):
             with self.subTest(expression=expression):
-                tail = re.fullmatch(r'[0-9]+([a-zA-Z_][a-zA-Z_0-9]*)(?: x)?', expression)
-                self.assertIsNotNone(tail)
-                # The decimal scanner consumes one initial digit in every
-                # spelling. All following ASCII letters/digits remain one
-                # unknown name, including the unsupported radix prefix.
+                # Hexadecimal literals consume valid hex digits before the
+                # unknown name; binary and octal prefixes remain unsupported.
                 self.rejects_exact_diagnostic(f'print({expression})\n',
-                                   f"line 1, column 8: I can't find a value named '{tail.group(1)}'")
+                                   f"line 1, column {column}: I can't find a value named '{name}'")
 
 
     def test_fraction_slash_is_rejected_after_all_eight_numeric_spellings(self):

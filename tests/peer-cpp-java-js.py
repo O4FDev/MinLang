@@ -2011,17 +2011,17 @@ return 0
             for n, separator in enumerate(separators, 1):
                 expression = (left+separator if left else '') + operator + separator + right
                 source = 'print('+expression+')\n'
-                valid = n in (1, 4, 7) or (not left and n == 6)
+                valid = n in (1, 4, 6, 7)
                 if valid:
                     accepted.append(source); expected.append(answer)
                 else:
                     rejected.append((operator, n, source))
-            # A newline AFTER a binary operator continues; CRLF BEFORE it does not.
+            # Parentheses permit LF and CRLF on either side of an operator.
             if left:
                 accepted.append(f'print({left} {operator}\n{right})\n'); expected.append(answer)
-                rejected.append((operator, 'crlf', f'print({left}\r\n{operator}\r\n{right})\n'))
-        self.assertEqual(len(accepted), 32)
-        self.assertEqual(len(rejected), 62)
+                accepted.append(f'print({left}\r\n{operator}\r\n{right})\n'); expected.append(answer)
+        self.assertEqual(len(accepted), 46)
+        self.assertEqual(len(rejected), 48)
         self.executes(''.join(accepted), '\n'.join(expected)+'\n')
         for index, (operator, case, source) in enumerate(rejected):
             with self.subTest(operator=operator, case=case):
@@ -3567,12 +3567,12 @@ print("ready")
         for index,(operator,left,right,result) in enumerate(vectors):
             source += [f'let y{index} = {left}; let z{index} = {right}',f'let x{index} =\ny{index} {operator}\nz{index}\nprint(x{index})',f'print(y{index} {operator}\nz{index})']
             expected += [result,result]
-            # The rejected boundary is the LF after 'let' (column4) or
-            # after 'print(y' (column8), independently of the next operator.
+            # A declaration name cannot cross an LF; expressions inside
+            # parentheses can cross it on either side of the operator.
             rejects_boundary(f'let y = {left}; let z = {right}\nlet\nx\n=\ny\n{operator}\nz\n',
                              2, 4, 'expected a name after let')
-            rejects_boundary(f'let y = {left}; let z = {right}\nprint(y\n{operator}\nz)\n',
-                             2, 8, "expected an expression, found 'end of line'")
+            source.append(f'print(y{index}\n{operator}\nz{index})')
+            expected.append(result)
         source += ['let last =\n1\nprint(last)'];expected += ['1']
         rejects_boundary('let\nx\n=\n1\nprint(x)\n', 1, 4, 'expected a name after let')
         self.executes('\n'.join(source),'\n'.join(expected)+'\n')

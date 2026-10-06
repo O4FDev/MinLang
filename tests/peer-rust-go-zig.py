@@ -1448,7 +1448,7 @@ while i < alias.length { print(alias[i]); print(outer.child.values[i]); i = i + 
         self.executes(source, 'IR\n258\n258\n' + ''.join(value + '\n' + value + '\n' for value in values))
         prefix = 'record Box { values: List<Text> }\nlet box = Box { values: ["text"] }\n'
         for source, diagnostic in [
-            (prefix + 'box.values[0] = 1\n', 'an indexed assignment has the wrong type'),
+            (prefix + 'box.values[0] = 1\n', 'an indexed assignment needs Text, not Integer'),
             (prefix + 'box.values[true] = "text"\n', 'a position must be an Integer'),
             ('record Box { value: Integer }\nlet box = Box { value: 1 }\nbox.value[0] = 2\n', 'indexed assignment needs a List'),
             ('record Node { children: List<Node> }\nlet empty: List<Node> = []\nlet node = Node { children: empty }\nnode.children[0] = node\n',
@@ -1899,7 +1899,7 @@ print(buffer[0]); print(buffer[1]); print(buffer[2])
         self.evidence.inputs[str(ROOT / 'minyar')] = digest(ROOT / 'minyar')
         env = {**os.environ, 'PATH': str(tools) + os.pathsep + os.environ['PATH']}
         for name, source, diagnostic in [
-            ('empty', 'use "" as empty\n', "Minyar stopped: package module '' is not available yet; local modules begin with './' or '../'\n"),
+            ('empty', 'use "" as empty\n', f"Minyar stopped: the file '{ROOT / 'library/.min'}' could not be opened.\n"),
             ('nul', 'use "./rgz-valid.min\0suffix" as valid\nprint(valid.get())\n', 'Minyar stopped: a file path cannot contain a zero byte.\n'),
         ]:
             path = self.directory / ('rgz-driver-' + name + '.min')
