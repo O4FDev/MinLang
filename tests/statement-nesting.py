@@ -212,13 +212,15 @@ print(stop())
 print("wrong")
 ''', 'before failure\n',1,'Minyar stopped: nested failure\n')
 
-diagnostic('else_after_newline_is_not_attached','''
-function f() {
-if true {}
-else {}
+success('else_after_newline_attaches_to_if','''
+function f(flag: Boolean) {
+if flag { print("then") }
+else { print("else") }
 }
-''',token='else',explanation="'else' belongs on the same line as the closing brace of its if")
-diagnostic('else_after_semicolon_is_not_attached','function f() { if true {}; else {} }\n',token='else',explanation="'else' belongs on the same line as the closing brace of its if")
+f(true)
+f(false)
+''', 'then\nelse\n')
+diagnostic('else_after_semicolon_is_not_attached','function f() { if true {}; else {} }\n',token='else',explanation="'else' needs a preceding if branch")
 diagnostic('nested_statement_needs_terminator','function f() { if true {} print(2) }\n',token='print',explanation="unexpected 'print'; start the next statement on a new line")
 diagnostic('while_cannot_consume_else','function f() { while false {} else {} }\n',token='else',explanation="unexpected 'else'; start the next statement on a new line")
 diagnostic('then_local_not_visible_in_else','''
