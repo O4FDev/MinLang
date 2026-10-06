@@ -4,6 +4,7 @@
 Scope and source identities: peer-pyswru-vectors.json and the exhaustive ledger.
 Python/Ruby runtime reflection, Swift graphemes and Zig JSON parsing are excluded.
 """
+from clang_helpers import clang_command
 import json
 import math
 import os
@@ -909,8 +910,8 @@ print(alias[299])
         for path in [probe,ROOT/'runtime/minyar_runtime.c',*sorted((ROOT/'runtime').glob('*.h'))]:
             self.evidence.inputs[str(path.resolve())] = digest(path)
         runtime = self.directory/'write-failure-runtime.o'
-        build = self.evidence.run([CLANG,'-std=c11','-O2',*LINK_FLAGS,
-                                   '-DMINYAR_SYSTEM_HEAP=1','-c',probe,'-o',runtime],
+        build = self.evidence.run(clang_command([CLANG,'-std=c11','-O2',*LINK_FLAGS,
+                                   '-DMINYAR_SYSTEM_HEAP=1','-c',probe,'-o',runtime]),
                                   timeout=60,phase='compile-write-failure-runtime')
         self.assertEqual(build.returncode,0,build.stderr)
         result,llvm = self.compile('let text = readTextFile(argument(0))\n'
@@ -921,8 +922,8 @@ print(alias[299])
         error = b'Minyar stopped: a requested text file could not be written.\n'
         for optimization in self.variants():
             exe = llvm.with_suffix('.'+optimization[1:])
-            link = self.evidence.run([CLANG,optimization,*LINK_FLAGS,'-Wno-override-module',
-                                      llvm,runtime,'-o',exe],timeout=30,phase='link-write-failure')
+            link = self.evidence.run(clang_command([CLANG,optimization,*LINK_FLAGS,'-Wno-override-module',
+                                      llvm,runtime,'-o',exe]),timeout=30,phase='link-write-failure')
             self.assertEqual(link.returncode,0,link.stderr)
             # Four bytes reach stdio's close/flush path; the long payload exceeds
             # buffering. Both branches use real files and independently checked bytes.
@@ -998,14 +999,14 @@ print(alias[299])
                            f'-DMINYAR_INTEGER_TEXT_CACHE_LIMIT={cache}',f'-DEXPECTED_CACHE_LIMIT={cache}',
                            f'-DMINYAR_RC_POLL_BUDGET={budget}']
                     if profile=='lazy':flags+=['-DMINYAR_LAZY_HEAP=1']
-                    build=self.evidence.run([CLANG,'-std=c11','-O2',*LINK_FLAGS,*flags,probe,'-o',exe],timeout=60,phase='compile-capacity-probe')
+                    build=self.evidence.run(clang_command([CLANG,'-std=c11','-O2',*LINK_FLAGS,*flags,probe,'-o',exe]),timeout=60,phase='compile-capacity-probe')
                     self.assertEqual(build.returncode,0,build.stderr)
                     run=self.evidence.run([exe],timeout=30,phase='execute-capacity-probe')
                     self.assertEqual((run.returncode,run.stdout,run.stderr),
                                      (0,f'cache limit {cache}: values, aliases and retained storage passed\n'.encode(),b''))
         exe=self.directory/'system-defaults'
-        build=self.evidence.run([CLANG,'-std=c11','-O2',*LINK_FLAGS,'-DMINYAR_SYSTEM_HEAP=1',
-                                 '-DEXPECTED_CACHE_LIMIT=32768',probe,'-o',exe],timeout=60,phase='compile-default-probe')
+        build=self.evidence.run(clang_command([CLANG,'-std=c11','-O2',*LINK_FLAGS,'-DMINYAR_SYSTEM_HEAP=1',
+                                 '-DEXPECTED_CACHE_LIMIT=32768',probe,'-o',exe]),timeout=60,phase='compile-default-probe')
         self.assertEqual(build.returncode,0,build.stderr)
         run=self.evidence.run([exe],timeout=30,phase='execute-default-probe')
         self.assertEqual((run.returncode,run.stdout,run.stderr),
@@ -1037,7 +1038,7 @@ print(alias[299])
                                'int c; while ((c=fgetc(in)) != EOF) { if (fputc(c,out)==EOF) return 4; }\n'
                                'if (ferror(in) || fclose(in) || fclose(out)) return 5;\n'
                                'return 0; }\n')
-        fake_build=self.evidence.run([CLANG,'-std=c11',fake_source,'-o',fake],timeout=30,phase='build-incompatible-compiler')
+        fake_build=self.evidence.run(clang_command([CLANG,'-std=c11',fake_source,'-o',fake]),timeout=30,phase='build-incompatible-compiler')
         self.assertEqual(fake_build.returncode,0,fake_build.stderr)
         copied=self.directory/'wrong-copy.ll'
         control=self.evidence.run([fake,'ignored.min',copied],timeout=RUN_TIMEOUT,phase='verify-incompatible-compiler')
@@ -1046,7 +1047,7 @@ print(alias[299])
         empty=self.directory/'wrong-runtime.c'
         empty.write_text('int peer_wrong_runtime_abi_marker;\n')
         wrong_runtime=empty.with_suffix('.o')
-        build=self.evidence.run([CLANG,'-c',*LINK_FLAGS,empty,'-o',wrong_runtime],timeout=30,phase='build-incompatible-runtime')
+        build=self.evidence.run(clang_command([CLANG,'-c',*LINK_FLAGS,empty,'-o',wrong_runtime]),timeout=30,phase='build-incompatible-runtime')
         self.assertEqual(build.returncode,0,build.stderr)
         target='PeerPythonSwiftRubyLua.test_iterative_fibonacci_uses_previous_pair'
         for kind,compiler,runtime in (('compiler',fake,RUNTIME),('runtime',COMPILER,wrong_runtime)):
@@ -1183,8 +1184,8 @@ let i = 0; while i < values.length { if values[i] != i { fail("literal position"
                 executable = llvm.with_suffix('.' + optimization[1:])
                 # Retain a bounded stress-case allowance for this exact large
                 # upstream literal; its count must not shrink to fit a backend.
-                link = self.evidence.run([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module', llvm,
-                                          RUNTIME, '-o', executable], timeout=180, phase='link-large-literal')
+                link = self.evidence.run(clang_command([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module', llvm,
+                                          RUNTIME, '-o', executable]), timeout=180, phase='link-large-literal')
                 self.assertEqual(link.returncode, 0, link.stderr)
                 result = self.evidence.run([executable], timeout=30, phase='execute-large-literal')
                 self.assertEqual((result.returncode, result.stdout, result.stderr), (0, expected, b''))
@@ -1319,9 +1320,9 @@ let i = 0; while i < values.length { if values[i] != i { fail("literal position"
             for optimization in self.variants():
                 with self.subTest(initialization=initialization, optimization=optimization):
                     executable = self.directory / f'runtime-{initialization}-{optimization[1:]}'
-                    compiled = self.evidence.run([CLANG, '-std=c11', optimization, '-UNDEBUG', *LINK_FLAGS,
+                    compiled = self.evidence.run(clang_command([CLANG, '-std=c11', optimization, '-UNDEBUG', *LINK_FLAGS,
                                                   '-ftrivial-auto-var-init=' + initialization,
-                                                  probe, '-o', executable], timeout=60, phase='compile-runtime-probe')
+                                                  probe, '-o', executable]), timeout=60, phase='compile-runtime-probe')
                     self.assertEqual(compiled.returncode, 0, compiled.stderr)
                     for case, stdout in expected.items():
                         result = self.evidence.run([executable, case], timeout=30, phase='execute-runtime-probe')
@@ -1339,8 +1340,8 @@ let i = 0; while i < values.length { if values[i] != i { fail("literal position"
         for profile, flags in [('default', []), ('system', ['-DMINYAR_SYSTEM_HEAP=1']),
                                ('bounded', ['-DMINYAR_BOUNDED_HEAP=1']), ('compiler', ['-DMINYAR_COMPILER_ARENA=1'])]:
             with self.subTest(profile=profile):
-                command = [CLANG, '-std=c11', '-O2', *warnings, *LINK_FLAGS, *flags,
-                           '-c', source, '-o', self.directory / f'{profile}.o']
+                command = clang_command([CLANG, '-std=c11', '-O2', *warnings, *LINK_FLAGS, *flags,
+                           '-c', source, '-o', self.directory / f'{profile}.o'])
                 result = self.evidence.run(command, timeout=60, phase='compile-strict-warnings')
                 self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b'', b''))
                 configurations.update(flag[1:] for flag in command if flag in ('-O0', '-O1', '-O2', '-O3', '-Os'))
@@ -1641,8 +1642,8 @@ observe("Ç∂éƒg")
         for optimization in self.variants():
             with self.subTest(optimization=optimization):
                 executable = self.directory / ('codepoints.' + optimization[1:])
-                command = [CLANG, '-std=c11', optimization, *LINK_FLAGS, '-Wall', '-Wextra', '-Werror',
-                           fixture, RUNTIME, '-o', executable]
+                command = clang_command([CLANG, '-std=c11', optimization, *LINK_FLAGS, '-Wall', '-Wextra', '-Werror',
+                           fixture, RUNTIME, '-o', executable])
                 result = self.evidence.run(command, timeout=30, phase='link-c-runtime-probe')
                 self.assertEqual(result.returncode, 0, result.stderr)
                 result = self.evidence.run([executable, 'abc'], timeout=RUN_TIMEOUT, phase='execute')
@@ -1928,8 +1929,8 @@ return value.slice(first, last)
         fixture = ROOT / 'tests/peer-pyswru-unicode-runtime.c'
         self.evidence.inputs[str(fixture.resolve())] = digest(fixture)
         executable = self.directory / ('unicode-probe.' + optimization[1:])
-        result = self.evidence.run([CLANG, '-std=c11', optimization, *LINK_FLAGS,
-            '-Wall', '-Wextra', '-Werror', fixture, RUNTIME, '-o', executable],
+        result = self.evidence.run(clang_command([CLANG, '-std=c11', optimization, *LINK_FLAGS,
+            '-Wall', '-Wextra', '-Werror', fixture, RUNTIME, '-o', executable]),
             timeout=30, phase='link-c-runtime-probe')
         self.assertEqual(result.returncode, 0, result.stderr)
         return executable

@@ -4,6 +4,7 @@
 Sources and semantic differences: docs/research/peer-tests-{cpp,javascript-java,
 rust-go-zig,python-swift,ruby-lua}.md. No upstream fixture code is copied.
 """
+from clang_helpers import clang_command
 import os
 import json
 import random
@@ -2043,8 +2044,8 @@ print(change(values, values))
             compiled, llvm = self.compile(source)
             self.assertEqual(compiled.returncode, 0, compiled.stderr)
             executable = llvm.with_suffix('.lto')
-            linked = self.evidence.run([CLANG, '-O2', *flags, '-DMINYAR_SYSTEM_HEAP=1',
-                                       '-Wno-override-module', llvm, ROOT / 'runtime/minyar_runtime.c', '-o', executable],
+            linked = self.evidence.run(clang_command([CLANG, '-O2', *flags, '-DMINYAR_SYSTEM_HEAP=1',
+                                       '-Wno-override-module', llvm, ROOT / 'runtime/minyar_runtime.c', '-o', executable]),
                                       phase='link-lto', timeout=60)
             self.assertEqual(linked.returncode, 0, linked.stderr)
             result = self.evidence.run([executable], phase='execute-lto', timeout=10)

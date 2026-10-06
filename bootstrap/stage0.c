@@ -1450,7 +1450,8 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
                                  : arguments[0].type == TYPE_BOOLEAN   ? "boolean"
                                                                        : "text";
             fprintf(output, "  call void @minyar_print_%s(%s %s)\n", suffix,
-                    llvm_type(arguments[0].type), arguments[0].name);
+                    arguments[0].type == TYPE_BOOLEAN ? "i1 zeroext" : llvm_type(arguments[0].type),
+                    arguments[0].name);
             arrfree(arguments);
             return make_value(TYPE_NOTHING, "");
         }
@@ -1471,7 +1472,8 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
                                                            : "boolean";
             temporary = new_temporary(emitter);
             fprintf(output, "  %%value.%d = call ptr @minyar_%s_text(%s %s)\n", temporary, suffix,
-                    llvm_type(arguments[0].type), arguments[0].name);
+                    arguments[0].type == TYPE_BOOLEAN ? "i1 zeroext" : llvm_type(arguments[0].type),
+                    arguments[0].name);
             arrfree(arguments);
             return make_value(TYPE_TEXT, "%%value.%d", temporary);
         }
@@ -1504,7 +1506,8 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
             temporary = new_temporary(emitter);
             fprintf(output, "  %%value.%d = call ptr @minyar_%s(%s %s)\n", temporary,
                     strcmp(expression->text, "argument") == 0 ? "argument" : "read_text_file",
-                    llvm_type(arguments[0].type), arguments[0].name);
+                    arguments[0].type == TYPE_BOOLEAN ? "i1 zeroext" : llvm_type(arguments[0].type),
+                    arguments[0].name);
             arrfree(arguments);
             return make_value(TYPE_TEXT, "%%value.%d", temporary);
         }
@@ -1666,7 +1669,8 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
         if ((expression->operator == TOKEN_EQUAL_EQUAL ||
              expression->operator == TOKEN_NOT_EQUAL) &&
             left.type == TYPE_TEXT) {
-            fprintf(output, "  %%value.%d = call i1 @minyar_texts_are_equal(ptr %s, ptr %s)\n",
+            fprintf(output,
+                    "  %%value.%d = call zeroext i1 @minyar_texts_are_equal(ptr %s, ptr %s)\n",
                     temporary, left.name, right.name);
             if (expression->operator == TOKEN_NOT_EQUAL) {
                 int opposite = new_temporary(emitter);
@@ -1864,9 +1868,9 @@ static void emit_program(FILE *output, Program *program) {
     fputs("\ndeclare void @minyar_print_integer(i64)\n"
           "declare void @minyar_print_text(ptr)\n"
           "declare void @minyar_print_character(i32)\n"
-          "declare void @minyar_print_boolean(i1)\n"
+          "declare void @minyar_print_boolean(i1 zeroext)\n"
           "declare void @minyar_fail(ptr)\n"
-          "declare i1 @minyar_texts_are_equal(ptr, ptr)\n"
+          "declare zeroext i1 @minyar_texts_are_equal(ptr, ptr)\n"
           "declare ptr @minyar_join_text(ptr, ptr)\n"
           "declare ptr @minyar_join_texts(ptr)\n"
           "declare i64 @minyar_text_length(ptr)\n"
@@ -1876,7 +1880,7 @@ static void emit_program(FILE *output, Program *program) {
           "declare ptr @minyar_integer_text(i64)\n"
           "declare ptr @minyar_character_text(i32)\n"
           "declare i32 @minyar_integer_character(i64)\n"
-          "declare ptr @minyar_boolean_text(i1)\n"
+          "declare ptr @minyar_boolean_text(i1 zeroext)\n"
           "declare void @minyar_initialize_arguments(i32, ptr)\n"
           "declare i64 @minyar_argument_count()\n"
           "declare ptr @minyar_argument(i64)\n"
@@ -1891,7 +1895,7 @@ static void emit_program(FILE *output, Program *program) {
           "declare i64 @minyar_record_get(ptr, i64)\n"
           "declare void @minyar_record_set(ptr, i64, i64)\n"
           "declare void @minyar_record_set_reference(ptr, i64, i64)\n"
-          "declare void @minyar_check_integer_overflow(i1)\n"
+          "declare void @minyar_check_integer_overflow(i1 zeroext)\n"
           "declare void @minyar_check_integer_division(i64, i64)\n"
           "declare void @minyar_fail_integer_overflow() cold noreturn\n"
           "declare void @minyar_fail_integer_division(i64) cold noreturn\n"

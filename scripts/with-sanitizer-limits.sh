@@ -13,10 +13,16 @@ ulimit -t "$cpu_seconds"
 ulimit -f "$file_blocks"
 
 if [ -x /usr/sbin/taskpolicy ]; then
-    if [ "${MINYAR_INTERACTIVE_BOOTSTRAP:-0}" = 1 ]; then
-        exec /usr/sbin/taskpolicy -m "$memory_mib" nice -n "$priority" "$@"
+    # Older macOS releases support scheduling policy but lack the memory cap.
+    # Probe separately so an unsupported option cannot prevent the command.
+    memory_policy=()
+    if /usr/sbin/taskpolicy -m "$memory_mib" /usr/bin/true 2>/dev/null; then
+        memory_policy=(-m "$memory_mib")
     fi
-    exec /usr/sbin/taskpolicy -b -c background -m "$memory_mib" nice -n "$priority" "$@"
+    if [ "${MINYAR_INTERACTIVE_BOOTSTRAP:-0}" = 1 ]; then
+        exec /usr/sbin/taskpolicy "${memory_policy[@]}" nice -n "$priority" "$@"
+    fi
+    exec /usr/sbin/taskpolicy -b -c background "${memory_policy[@]}" nice -n "$priority" "$@"
 fi
 if command -v nice >/dev/null 2>&1; then
     exec nice -n "$priority" "$@"

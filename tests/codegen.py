@@ -4,6 +4,7 @@
 This target requires opt and FileCheck: missing tools are failures, not skips.
 Set MINYAR_LLVM_BIN for a versioned LLVM installation outside PATH.
 """
+from clang_helpers import clang_command
 import json
 import os
 from pathlib import Path
@@ -35,7 +36,7 @@ def main():
         versions = {name: run([binary, '--version'], 'capability', check=True).stdout.decode()
                     for name, binary in (('opt', opt), ('FileCheck', check), ('clang', clang))}
         runtime = evidence.path / 'runtime.o'
-        run([clang, '-O2', '-c', ROOT / 'runtime/minyar_default_runtime.c', '-o', runtime], 'runtime-build', check=True)
+        run(clang_command([clang, '-O2', '-c', ROOT / 'runtime/minyar_default_runtime.c', '-o', runtime]), 'runtime-build', check=True)
         rows = []
         for source in sources:
             llvm = evidence.path / (source.stem + '.ll')
@@ -45,7 +46,7 @@ def main():
             expected = evidence.reference_output(source.with_suffix('.stdout'))
             for optimization in ('-O0', '-O2'):
                 executable = evidence.path / (source.stem + optimization)
-                run([clang, optimization, '-Wno-override-module', llvm, runtime, '-o', executable], 'link', check=True)
+                run(clang_command([clang, optimization, '-Wno-override-module', llvm, runtime, '-o', executable]), 'link', check=True)
                 result = run([executable], 'execute')
                 assert result.returncode == 0 and result.stdout == expected and not result.stderr, result
             rows.append({'case': source.stem, 'variants': ['O0', 'O2'], 'verified': True, 'checked': True,

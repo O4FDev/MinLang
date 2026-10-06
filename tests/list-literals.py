@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Constant List lowering: value semantics, effects, diagnostics and module identity."""
+from clang_helpers import clang_command
 import os
 from pathlib import Path
 import re
@@ -134,7 +135,7 @@ print(second.make()[0])
             prepare_llvm_for_link(llvm, LINK_FLAGS)
             for opt in ('-O0', '-O2'):
                 exe = llvm.with_suffix('.' + opt[1:])
-                result = self.evidence.run([CLANG, opt, *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], capture_output=True, timeout=30, phase='link')
+                result = self.evidence.run(clang_command([CLANG, opt, *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)]), capture_output=True, timeout=30, phase='link')
                 self.assertEqual(result.returncode, 0, result.stderr)
                 result = self.evidence.run([str(exe)], capture_output=True, timeout=30, phase='execute')
                 self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b'99\n1\n4\n', b''))

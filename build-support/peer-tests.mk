@@ -48,7 +48,7 @@ check: check-scalar-cleanup-probes
 check-peer-manifest: check-peer-audit check-suite-catalogue
 	python3 tests/peer-manifest.py
 
-check-evidence-harness:
+check-evidence-harness: build/minyarc build/minyar-runtime.o
 	python3 tests/evidence-harness.py
 
 .PHONY: check-performance-metrics

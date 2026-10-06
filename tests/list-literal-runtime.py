@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Bulk scalar List runtime semantics, size guards and allocation-failure checks."""
+from clang_helpers import clang_command
 import argparse
 import json
 import os
@@ -51,8 +52,8 @@ def run_campaign(args):
             for optimization in optimizations:
                 for profile, defines in PROFILES.items():
                     executable = evidence.path / (mode + '-' + optimization[1:] + '-' + profile)
-                    built = evidence.run([args.clang, '-std=c11', optimization, *flags, *defines,
-                                          '-DMINYAR_BOUNDED_HEAP_BYTES=33554432', source, '-o', executable],
+                    built = evidence.run(clang_command([args.clang, '-std=c11', optimization, *flags, *defines,
+                                          '-DMINYAR_BOUNDED_HEAP_BYTES=33554432', source, '-o', executable]),
                                          timeout=30, phase='compile-link-' + profile)
                     assert built.returncode == 0, built.stderr
                     checked(executable, 'normal', expected_stdout=b'copies-prefixes-capacities-ok\n')

@@ -161,8 +161,8 @@ print(slice(1))
             self.assertEqual(result.returncode, 0, result.stderr)
             for optimization in ('-O0', '-O2'):
                 exe = llvm.with_suffix('.' + optimization[1:])
-                self.evidence.run([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module',
-                                   llvm, RUNTIME, '-o', exe], check=True, timeout=30, phase='link')
+                self.evidence.run(clang_command([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module',
+                                   llvm, RUNTIME, '-o', exe]), check=True, timeout=30, phase='link')
                 for prefix in prefixes:
                     valid = prefix + '🙂'
                     path.write_bytes(valid.encode('utf-8'))

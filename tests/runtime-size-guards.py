@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Check List capacity arithmetic before allocation or payload access."""
+from clang_helpers import clang_command
 import argparse
 import json
 import os
@@ -40,9 +41,9 @@ def main():
                    'UBSAN_OPTIONS': 'halt_on_error=1:print_stacktrace=1'}
             for profile in profiles:
                 executable = evidence.path / f'{mode}-{profile}'
-                evidence.run([os.environ.get('CLANG', 'clang'), '-std=c11', '-O1', '-g',
+                evidence.run(clang_command([os.environ.get('CLANG', 'clang'), '-std=c11', '-O1', '-g',
                               '-Wall', '-Wextra', '-Werror', *flags, *PROFILES[profile],
-                              ROOT / 'tests/runtime-size-guards.c', '-o', executable],
+                              ROOT / 'tests/runtime-size-guards.c', '-o', executable]),
                              timeout=60, check=True, phase='compile-size-guards')
                 normal = evidence.run([executable], env=env, timeout=15, phase='execute-normal-growth')
                 assert (normal.returncode, normal.stdout, normal.stderr) == (0, b'', b''), normal
@@ -57,10 +58,10 @@ def main():
                        'aliased_integer_and_text_growth': 257, 'all_prior_elements_checked_after_each_append': True}
                 if profile in ('bounded', 'lazy'):
                     finite = evidence.path / f'{mode}-{profile}-finite'
-                    evidence.run([os.environ.get('CLANG', 'clang'), '-std=c11', '-O1', '-g',
+                    evidence.run(clang_command([os.environ.get('CLANG', 'clang'), '-std=c11', '-O1', '-g',
                                   '-Wall', '-Wextra', '-Werror', *flags, *PROFILES[profile],
                                   '-DMINYAR_BOUNDED_HEAP_BYTES=16384', ROOT / 'tests/runtime-size-guards.c',
-                                  '-o', finite], timeout=60, check=True, phase='compile-finite-growth')
+                                  '-o', finite]), timeout=60, check=True, phase='compile-finite-growth')
                     result = evidence.run([finite, 'exhaust'], env=env, timeout=15, phase='execute-finite-growth')
                     assert result.returncode == 1 and result.stderr == (
                         b'Minyar stopped: the bounded heap is exhausted (including pending cleanup and fragmentation).\n'), result

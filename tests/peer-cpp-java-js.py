@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Original Minyar adaptations of individually reviewed GCC and OpenJDK cases."""
+from clang_helpers import clang_command
 import os
 import unittest
 from regressions import CompilerTestCase
@@ -4840,8 +4841,8 @@ i = 0; while i<48 { print(palette[i]); i = i+1 }
         llvm = self.executes('\n'.join(source),output)
         if os.environ.get('MINYAR_TEST_EXTENDED_OPT') == '1':
             executable = llvm.with_suffix('.lto')
-            linked = self.evidence.run([CLANG,'-O2',*shlex.split(os.environ.get('MINYAR_TEST_LTO_FLAGS','-flto')),
-                '-DMINYAR_SYSTEM_HEAP=1','-Wno-override-module',llvm,ROOT/'runtime/minyar_runtime.c','-o',executable],timeout=60,phase='link-lto')
+            linked = self.evidence.run(clang_command([CLANG,'-O2',*shlex.split(os.environ.get('MINYAR_TEST_LTO_FLAGS','-flto')),
+                '-DMINYAR_SYSTEM_HEAP=1','-Wno-override-module',llvm,ROOT/'runtime/minyar_runtime.c','-o',executable]),timeout=60,phase='link-lto')
             self.assertEqual(linked.returncode,0,linked.stderr)
             actual = self.evidence.run([executable],timeout=10,phase='execute-lto')
             self.assertEqual((actual.returncode,actual.stdout,actual.stderr),(0,output.encode(),b''))

@@ -7,6 +7,7 @@ its nested control structure and all nine successful queries are preserved.
 Upstream: v8/v8, revision 7dce5a4a324258ba51b2a6f5dee7a1fa18c7671d,
 test/mjsunit/compiler/conditional-chain.js, final 50,000-branch cohort.
 """
+from clang_helpers import clang_command
 import os
 import re
 from textwrap import dedent
@@ -347,9 +348,9 @@ class StatementNesting(CompilerTestCase):
         # Parse the entire emitted module through the portable LLVM frontend
         # without LLVM's optimizer pipeline or native nested-loop code generation.
         parsed = self.directory / 'nested-while-parsed.ll'
-        result = self.evidence.run([CLANG, '-O0', '-S', '-emit-llvm', '-Xclang', '-disable-llvm-passes',
+        result = self.evidence.run(clang_command([CLANG, '-O0', '-S', '-emit-llvm', '-Xclang', '-disable-llvm-passes',
                                     '-Wno-override-module',
-                                    llvm, '-o', parsed], timeout=30, phase='parse-llvm')
+                                    llvm, '-o', parsed]), timeout=30, phase='parse-llvm')
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b'', b''))
         self.assertTrue(parsed.is_file())
 
@@ -486,8 +487,8 @@ class StatementNesting(CompilerTestCase):
         for opt in optimizations:
             with self.subTest(optimization=opt):
                 exe = llvm.with_suffix('.' + opt[1:])
-                result = self.evidence.run([CLANG, opt, *LINK_FLAGS, '-Wno-override-module',
-                                            llvm, RUNTIME, '-o', exe], timeout=180, phase='link')
+                result = self.evidence.run(clang_command([CLANG, opt, *LINK_FLAGS, '-Wno-override-module',
+                                            llvm, RUNTIME, '-o', exe]), timeout=180, phase='link')
                 self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b'', b''))
                 result = self.evidence.run([exe], timeout=30, phase='execute')
                 self.assertEqual((result.returncode, result.stdout, result.stderr), (0, expected.encode(), b''))

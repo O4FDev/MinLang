@@ -4,6 +4,7 @@
 Each ordinal executes in a fresh process. Fatal OOM does not promise unwinding;
 successful executions use the existing final-drain ownership invariant.
 """
+from clang_helpers import clang_command
 import argparse
 import hashlib
 import json
@@ -157,8 +158,8 @@ def campaign(args):
                                 'MINYAR_FAULT_CORRUPT_ARENA', 'MINYAR_FAIL_BYTES')}
             env.update(ASAN_OPTIONS='detect_leaks=0', UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1')
             probe = evidence.path / ('probe-' + mode)
-            run([args.clang, '-std=c11', '-O1', '-g', *flags, '-DMINYAR_FAULT_SELF_TEST',
-                 ROOT / 'tests/allocation-fault-runtime.c', '-o', probe], check=True)
+            run(clang_command([args.clang, '-std=c11', '-O1', '-g', *flags, '-DMINYAR_FAULT_SELF_TEST',
+                 ROOT / 'tests/allocation-fault-runtime.c', '-o', probe]), check=True)
             for label, extra, status, fired, moved in (
                 ('normal', {}, 0, 0, 2),
                 ('allocate', {'MINYAR_FAIL_ALLOCATION': '1'}, 91, 1, 0),
@@ -211,9 +212,9 @@ def campaign(args):
             compiler_object = None
             if args.scope == 'compiler':
                 arena_probe = evidence.path / ('arena-probe-' + mode)
-                run([args.clang, '-std=c11', '-O1', '-g', *flags, '-DMINYAR_COMPILER_ARENA',
+                run(clang_command([args.clang, '-std=c11', '-O1', '-g', *flags, '-DMINYAR_COMPILER_ARENA',
                      '-DMINYAR_FAULT_ARENA_SELF_TEST', ROOT / 'tests/allocation-fault-runtime.c',
-                     '-o', arena_probe], check=True)
+                     '-o', arena_probe]), check=True)
                 result, report = execute(arena_probe, f'arena-probe-{mode}-normal', env)
                 assert (result.returncode, result.stdout, result.stderr) == (0, b'', b''), (result, report)
                 assert report['allocations'] == 8 and report['fired'] == report['fatal_exit'] == 0, report
@@ -226,20 +227,20 @@ def campaign(args):
                 compiler_llvm.write_bytes(args.compiler_ir.read_bytes())
                 prepare_llvm_for_link(compiler_llvm, flags)
                 compiler_object = compiler_llvm.with_suffix('.o')
-                run([args.clang, '-O2', '-g', *flags, '-Wno-override-module', '-c',
-                     compiler_llvm, '-o', compiler_object], check=True)
+                run(clang_command([args.clang, '-O2', '-g', *flags, '-Wno-override-module', '-c',
+                     compiler_llvm, '-o', compiler_object]), check=True)
             profiles = [('system', 1), ('system', 32)]
             if args.scope == 'compiler':
                 profiles.append(('arena', 0))
             for profile, budget in profiles:
                 runtime = evidence.path / f'runtime-{mode}-{profile}-{budget}.o'
                 profile_flags = ['-DMINYAR_COMPILER_ARENA'] if profile == 'arena' else [f'-DMINYAR_RC_POLL_BUDGET={budget}']
-                run([args.clang, '-std=c11', '-O1', '-g', *flags,
+                run(clang_command([args.clang, '-std=c11', '-O1', '-g', *flags,
                      *profile_flags, '-c',
-                     ROOT / 'tests/allocation-fault-runtime.c', '-o', runtime], check=True)
+                     ROOT / 'tests/allocation-fault-runtime.c', '-o', runtime]), check=True)
                 if args.scope == 'compiler':
                     fault_compiler = runtime.with_suffix('.compiler')
-                    run([args.clang, '-O2', *flags, compiler_object, runtime, '-o', fault_compiler], check=True)
+                    run(clang_command([args.clang, '-O2', *flags, compiler_object, runtime, '-o', fault_compiler]), check=True)
                     for name, (source, expected) in COMPILER_CASES.items():
                         label = f'compiler-{name}-{mode}-{profile}-k{budget}'
                         path = evidence.path / (label + '.min')
@@ -254,8 +255,8 @@ def campaign(args):
                         assert baseline['resizes'] == baseline['moved'], baseline
                         assert llvm.read_bytes() == reference.read_bytes(), 'Instrumented compiler changed emitted LLVM'
                         program = path.with_suffix('.program')
-                        run([args.clang, '-O2', '-Wno-override-module', llvm,
-                             ROOT / 'build/minyar-runtime.o', '-o', program], check=True)
+                        run(clang_command([args.clang, '-O2', '-Wno-override-module', llvm,
+                             ROOT / 'build/minyar-runtime.o', '-o', program]), check=True)
                         executed = run([program], env=env)
                         assert (executed.returncode, executed.stdout, executed.stderr) == (0, expected, b''), executed
                         for counter, variable in (('allocations', 'MINYAR_FAIL_ALLOCATION'), ('resizes', 'MINYAR_FAIL_RESIZE')):
@@ -286,7 +287,7 @@ def campaign(args):
                     path.write_text(source)
                     run([compiler, path, llvm], check=True)
                     prepare_llvm_for_link(llvm, flags)
-                    run([args.clang, '-O2', '-g', *flags, '-Wno-override-module', llvm, runtime, '-o', executable], check=True)
+                    run(clang_command([args.clang, '-O2', '-g', *flags, '-Wno-override-module', llvm, runtime, '-o', executable]), check=True)
                     result, baseline = execute(executable, label + '-baseline', env)
                     assert result.returncode == 0 and result.stdout == expected and not result.stderr, (result, baseline)
                     assert baseline['fired'] == 0 and baseline['allocations'] > 0 and baseline['fatal_exit'] == 0, baseline

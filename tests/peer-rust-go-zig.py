@@ -5,6 +5,7 @@ Source keys and semantic differences are in docs/research/exhaustive/implementat
 and the validated rgz-implementation-round3.jsonl handoff in that directory.
 No upstream harness or implementation code is copied.
 """
+from clang_helpers import clang_command
 import json
 import os
 import sys
@@ -730,8 +731,8 @@ while index < log10Widths.length { compare(log10Widths[index], 10); index = inde
             for profile, flags in profiles:
                 with self.subTest(optimization=optimization, profile=profile):
                     executable = self.directory / ('data-resize-' + profile + optimization)
-                    linked = self.evidence.run([CLANG, '-std=c11', optimization, *LINK_FLAGS, *flags,
-                                                '-DMINYAR_BOUNDED_HEAP_BYTES=1048576', fixture, '-o', executable],
+                    linked = self.evidence.run(clang_command([CLANG, '-std=c11', optimization, *LINK_FLAGS, *flags,
+                                                '-DMINYAR_BOUNDED_HEAP_BYTES=1048576', fixture, '-o', executable]),
                                                timeout=30, phase='link-data-allocator')
                     self.assertEqual(linked.returncode, 0, linked.stderr)
                     run = self.evidence.run([executable], timeout=30, phase='execute-data-allocator')
@@ -747,8 +748,8 @@ while index < log10Widths.length { compare(log10Widths[index], 10); index = inde
         for optimization in variants:
             with self.subTest(optimization=optimization):
                 executable = llvm.with_suffix('.' + optimization[1:])
-                linked = self.evidence.run([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module',
-                                            '-Wl,-z,text', llvm, RUNTIME, '-o', executable],
+                linked = self.evidence.run(clang_command([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module',
+                                            '-Wl,-z,text', llvm, RUNTIME, '-o', executable]),
                                            timeout=30, phase='link-elf-z-text')
                 self.assertEqual(linked.returncode, 0, linked.stderr)
                 run = self.evidence.run([executable], timeout=30, phase='execute-elf-z-text')
@@ -1668,8 +1669,8 @@ print(root.children[0].children.length)
         for optimization in variants:
             with self.subTest(optimization=optimization):
                 executable = llvm.with_suffix('.' + optimization[1:])
-                linked = self.evidence.run([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module',
-                                            llvm, RUNTIME, '-o', executable], timeout=30,
+                linked = self.evidence.run(clang_command([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module',
+                                            llvm, RUNTIME, '-o', executable]), timeout=30,
                                            phase='link-wide-record-build')
                 self.assertEqual(linked.returncode, 0, linked.stderr)
                 self.assertTrue(executable.is_file())
@@ -1917,7 +1918,7 @@ print(buffer[0]); print(buffer[1]); print(buffer[2])
         variants = ('-O0', '-O2', '-O3', '-Os') if os.environ.get('MINYAR_TEST_EXTENDED_OPT') == '1' else ('-O0', '-O2')
         for optimization in variants:
             exe = self.directory / ('guarded-end-' + optimization[1:])
-            linked = self.evidence.run([CLANG, '-std=c11', optimization, *LINK_FLAGS, fixture, RUNTIME, '-o', exe], timeout=30, phase='link-guarded-end')
+            linked = self.evidence.run(clang_command([CLANG, '-std=c11', optimization, *LINK_FLAGS, fixture, RUNTIME, '-o', exe]), timeout=30, phase='link-guarded-end')
             self.assertEqual(linked.returncode, 0, linked.stderr)
             for kind, diagnostic in [('list', 'List position 1 is outside its length of 1.'), ('text', 'a Text position was outside the Text.')]:
                 for count in (2, 4, 8):
@@ -1952,7 +1953,7 @@ print(first[0]); print(second[0])
         expected = [40, 40, *[n for n in range(1, 41) for _ in range(2)], 3, 4, 99, 3]
         for optimization in variants:
             exe = self.directory / ('allocator-' + optimization[1:])
-            linked = self.evidence.run([CLANG, '-std=c11', optimization, *LINK_FLAGS, fixture, '-o', exe], timeout=30, phase='link-allocator-probe')
+            linked = self.evidence.run(clang_command([CLANG, '-std=c11', optimization, *LINK_FLAGS, fixture, '-o', exe]), timeout=30, phase='link-allocator-probe')
             self.assertEqual(linked.returncode, 0, linked.stderr)
             for mode, extra, allocations, resizes, moved, fired in [
                 ('allocate', {'MINYAR_FAIL_ALLOCATION': '3'}, 3, 0, 0, 1),
@@ -1970,9 +1971,9 @@ print(first[0]); print(second[0])
             # Disable its optional frame cache so the final raw-byte accounting
             # observes complete reclamation, including the finished owner frame.
             executable = self.directory / ('moving-list-' + optimization[1:])
-            linked = self.evidence.run([CLANG, '-std=c11', optimization, *LINK_FLAGS, '-Wno-override-module',
+            linked = self.evidence.run(clang_command([CLANG, '-std=c11', optimization, *LINK_FLAGS, '-Wno-override-module',
                                         '-DMINYAR_FRAME_CACHE_BYTES=0',
-                                        llvm, ROOT / 'tests/allocation-fault-runtime.c', '-o', executable],
+                                        llvm, ROOT / 'tests/allocation-fault-runtime.c', '-o', executable]),
                                        timeout=30, phase='link-forced-moving-list')
             self.assertEqual(linked.returncode, 0, linked.stderr)
             report_path = self.directory / ('moving-list-' + optimization[1:] + '.json')
@@ -1995,7 +1996,7 @@ print(first[0]); print(second[0])
         variants = ('-O0', '-O2', '-O3', '-Os') if os.environ.get('MINYAR_TEST_EXTENDED_OPT') == '1' else ('-O0', '-O2')
         for optimization in variants:
             executable=llvm.with_suffix('.'+optimization[1:])
-            result=self.evidence.run([CLANG,optimization,*LINK_FLAGS,'-Wno-override-module',llvm,RUNTIME,'-o',executable],timeout=30,phase='link')
+            result=self.evidence.run(clang_command([CLANG,optimization,*LINK_FLAGS,'-Wno-override-module',llvm,RUNTIME,'-o',executable]),timeout=30,phase='link')
             self.assertEqual(result.returncode,0,result.stderr)
             output.unlink(missing_ok=True)
             run=self.evidence.run([executable,*arguments],timeout=RUN_TIMEOUT,phase='execute')
@@ -2611,9 +2612,9 @@ tupleWrites(); referencedCounters([0,1,2]); referencedCounters([0,1,2])
         for optimization in variants:
             object_file=self.directory/('unicode-'+optimization[1:]+'.o')
             executable=self.directory/('unicode-'+optimization[1:])
-            compile_result=self.evidence.run([CLANG,'-std=c11',optimization,*LINK_FLAGS,'-Wall','-Wextra','-Werror','-c',fixture,'-o',object_file],timeout=30,phase='compile-c-runtime-probe')
+            compile_result=self.evidence.run(clang_command([CLANG,'-std=c11',optimization,*LINK_FLAGS,'-Wall','-Wextra','-Werror','-c',fixture,'-o',object_file]),timeout=30,phase='compile-c-runtime-probe')
             self.assertEqual(compile_result.returncode,0,compile_result.stderr)
-            linked=self.evidence.run([CLANG,optimization,*LINK_FLAGS,object_file,RUNTIME,'-o',executable],timeout=30,phase='link')
+            linked=self.evidence.run(clang_command([CLANG,optimization,*LINK_FLAGS,object_file,RUNTIME,'-o',executable]),timeout=30,phase='link')
             self.assertEqual(linked.returncode,0,linked.stderr)
             coverage['processes_attempted'][optimization]=0
             coverage['processes_passing_exact_oracle'][optimization]=0

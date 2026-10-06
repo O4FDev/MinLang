@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Run previously unconnected scalar cleanup probes with assertions enabled."""
+from clang_helpers import clang_command
 import json
 import os
 from pathlib import Path
@@ -28,9 +29,9 @@ def main():
             for budget in (1, 32, 1024):
                 for name, expected in PROBES.items():
                     binary = evidence.path / f'{name}-{mode}-{budget}'
-                    evidence.run([os.environ.get('CLANG', 'clang'), '-std=c11', '-O2', '-g',
+                    evidence.run(clang_command([os.environ.get('CLANG', 'clang'), '-std=c11', '-O2', '-g',
                                   '-UNDEBUG', *flags, f'-DMINYAR_RC_POLL_BUDGET={budget}',
-                                  ROOT / f'tests/{name}.c', '-o', binary],
+                                  ROOT / f'tests/{name}.c', '-o', binary]),
                                  timeout=60, check=True, phase='compile-cleanup-probe')
                     result = evidence.run([binary], env=env, timeout=30, phase='execute-cleanup-probe')
                     assert result.returncode == 0 and result.stderr == b'', result

@@ -32,6 +32,8 @@ class BootstrapScheduling(unittest.TestCase):
         policy.write_text("#!" + sys.executable + "\n" + """import json,os,sys
 from pathlib import Path
 args=sys.argv[1:]
+if os.environ.get('POLICY_NO_MEMORY') == '1' and '-m' in args:
+    sys.exit(64)
 Path(os.environ['POLICY_LOG']).write_text(json.dumps(args))
 while args and args[0].startswith('-'):
     option=args.pop(0)
@@ -99,6 +101,18 @@ os.execvp(args[0],args)
                     capture_output=True, text=True, timeout=10)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(self.log.exists(), "policy must not run after a cap failure")
+
+    def test_older_taskpolicy_keeps_scheduling_cpu_and_file_limits(self):
+        for name in self.wrappers:
+            for interactive in ('0', '1'):
+                with self.subTest(wrapper=name, interactive=interactive):
+                    args, limits = self.invoke(name, POLICY_NO_MEMORY='1',
+                                              MINYAR_INTERACTIVE_BOOTSTRAP=interactive)
+                    self.assertNotIn('-m', args)
+                    self.assertEqual('-b' in args, interactive == '0')
+                    self.assertEqual(limits['cpu'][0], 240)
+                    self.assertLessEqual(limits['file'][0], 262144 * 1024)
+                    self.assertGreaterEqual(limits['priority'], 15)
 
     def test_public_launcher_scopes_context_to_bootstrap(self):
         project = self.work / "project with spaces"
