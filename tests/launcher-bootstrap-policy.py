@@ -79,7 +79,7 @@ os.execvp(args[0],args)
                 self.assertNotIn("background", args)
                 self.assertEqual(limits["cpu"][0], 240)
                 self.assertLessEqual(limits["file"][0], 262144 * 1024)
-                self.assertGreaterEqual(limits["priority"], 15)
+                self.assertGreaterEqual(limits["priority"], min(19, os.getpriority(os.PRIO_PROCESS, 0) + 15))
 
     def test_foreground_context_retains_custom_caps(self):
         for name in self.wrappers:
@@ -112,7 +112,7 @@ os.execvp(args[0],args)
                     self.assertEqual('-b' in args, interactive == '0')
                     self.assertEqual(limits['cpu'][0], 240)
                     self.assertLessEqual(limits['file'][0], 262144 * 1024)
-                    self.assertGreaterEqual(limits['priority'], 15)
+                    self.assertGreaterEqual(limits['priority'], min(19, os.getpriority(os.PRIO_PROCESS, 0) + 15))
 
     def test_public_launcher_scopes_context_to_bootstrap(self):
         project = self.work / "project with spaces"

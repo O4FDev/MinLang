@@ -25,8 +25,10 @@ print("unrelated suffix")
         # Controlled mismatch: the undesired 42 result must survive reduction.
         # Removing either function or call invalidates typing or loses the bug.
         oracle.write_text('import subprocess,sys\nfrom pathlib import Path\n'
+                         f'sys.path.insert(0, {str(ROOT / "tests")!r})\n'
+                         'from clang_helpers import clang_command\n'
                          'llvm=Path(sys.argv[1]); binary=llvm.with_suffix(".exe")\n'
-                         f'linked=subprocess.run([{clang!r},"-O0","-Wno-override-module",str(llvm),{str(runtime)!r},"-o",str(binary)],capture_output=True)\n'
+                         f'linked=subprocess.run(clang_command([{clang!r},"-O0","-Wno-override-module",str(llvm),{str(runtime)!r},"-o",str(binary)]),capture_output=True)\n'
                          'if linked.returncode: raise SystemExit(2)\n'
                          'result=subprocess.run([str(binary)],capture_output=True)\n'
                          'raise SystemExit(0 if result.returncode==0 and b"42\\n" in result.stdout and not result.stderr else 1)\n')

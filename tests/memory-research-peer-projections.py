@@ -228,11 +228,17 @@ print(state[0])'''])
             half_minimum = Decimal(2) ** -1075
             self.assertLess(Decimal('2.4703282292062327e-324'), half_minimum)
             self.assertGreater(Decimal('2.4703282292062328e-324'), half_minimum)
+            exact_tie = format(half_minimum, 'e')
+            just_above = format(half_minimum + Decimal('1e-1100'), 'e')
         literals = ['2.4703282292062327e-324', '2.4703282292062328e-324',
                     '-2.4703282292062327e-324', '-2.4703282292062328e-324',
                     '0.0e123', '-0.0e123']
         expected_bits = [0, 1, -9223372036854775808, -9223372036854775807,
                          0, -9223372036854775808]
+        literals.extend([exact_tie, '-' + exact_tie, just_above, '-' + just_above,
+                         '1.0e-10000', '-1.0e-10000'])
+        expected_bits.extend([0, -9223372036854775808, 1, -9223372036854775807,
+                              0, -9223372036854775808])
         source = [f'function value{index}(): Float {{ return {literal} }}'
                   for index, literal in enumerate(literals)]
         source.append('let bytes = Bytes()')

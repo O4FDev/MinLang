@@ -179,7 +179,7 @@ print(work(41))
                     self.run_tool([COMPILER, source, llvm, '--bounded-owners', '9'])
                 generated = llvm.read_text()
                 for name in ('minyar_rc_enter_stack_v1', 'minyar_rc_leave_stack_v1'):
-                    user_name = (r'@"minyar\.module\|' + name + r'\|[^"\n]+"'
+                    user_name = (r'@"\.minyar\.fn\.minyar\.module\|' + name + r'\|[^"\n]+"'
                                  if modules else r'@\.minyar\.fn\.' + name)
                     self.assertRegex(generated, r'define [^\n]* ' + user_name + r'\(')
                     self.assertRegex(generated, r'call [^\n]* ' + user_name + r'\(')
