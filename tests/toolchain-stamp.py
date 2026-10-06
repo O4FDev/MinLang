@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,12 +16,12 @@ class ToolchainStamp(unittest.TestCase):
     def test_identity_flags_and_replaced_binary(self):
         with tempfile.TemporaryDirectory(prefix="minyar toolchain ") as temporary:
             work = Path(temporary)
-            first = work / "first compiler"
-            second = work / "second compiler"
-            first.write_text("fixture compiler one")
-            second.write_text("fixture compiler two")
-            first.chmod(0o700)
-            second.chmod(0o700)
+            first = work / "first compiler.exe"
+            second = work / "second compiler.exe"
+            # MSYS checks executable contents as well as permission bits. The
+            # stamp only reads metadata, so use portable native image fixtures.
+            shutil.copy2(sys.executable, first)
+            shutil.copy2(sys.executable, second)
             stamp = work / "stamp.json"
             environment = {**os.environ, "CC": str(first), "LLVM_CC": str(first)}
 
@@ -43,7 +44,8 @@ class ToolchainStamp(unittest.TestCase):
             environment["LLVM_FLAGS"] = "-O3 -g"
             flags = probe()
             self.assertNotEqual(flags[0], changed[0])
-            second.write_text("replacement compiler, same executable path")
+            with second.open("ab") as stream:
+                stream.write(b"replacement compiler, same executable path")
             self.assertNotEqual(probe()[0], flags[0])
             self.assertEqual(json.loads(stamp.read_text())["flags"]["LLVM_FLAGS"], "-O3 -g")
 
