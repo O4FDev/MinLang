@@ -11,6 +11,8 @@ import resource
 import subprocess
 import tempfile
 
+from clang_helpers import clang_command
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -44,8 +46,8 @@ def main():
                     text = text.replace(mutation[1], mutation[2])
                 (directory / 'runtime' / filename).write_text(text)
             executable = directory / 'unit'
-            subprocess.run([os.environ.get('MINYAR_TEST_CLANG', 'clang'), '-std=c11', '-O2',
-                            str(directory / 'tests/runtime-unit.c'), '-o', str(executable)],
+            subprocess.run(clang_command([os.environ.get('MINYAR_TEST_CLANG', 'clang'), '-std=c11', '-O2',
+                            str(directory / 'tests/runtime-unit.c'), '-o', str(executable)]),
                            check=True, capture_output=True, timeout=30)
             result = subprocess.run([str(executable)], capture_output=True, timeout=15)
             if mutation:

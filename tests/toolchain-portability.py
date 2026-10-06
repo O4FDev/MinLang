@@ -204,7 +204,10 @@ Path(os.environ['TEST_MAKE_LOG']).write_text(json.dumps({name: os.environ.get(na
                 create(alias)
             except OSError:
                 continue  # Native Windows may disallow creating symlinks.
-            aliases.append(alias)
+            # MSYS can emulate symlink creation by copying the file. A copy
+            # is a valid separate output, so only exercise real file aliases.
+            if alias.samefile(self.source):
+                aliases.append(alias)
         original = self.source.read_bytes()
         for alias in aliases:
             with self.subTest(alias=alias):
