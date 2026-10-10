@@ -17,6 +17,7 @@ heavily loaded machine; the load average was 30-76 throughout.
 | 5 | `record.text = record.text + piece` copied the whole Text each time (quadratic) | in-place append when the record holds the only other reference | 80,000 appends 4.11G | 79.8M | 51x (and linear) |
 | 6 | Compiling multi-module programs spent 27% of its time comparing symbol names character by character | symbol tables ordered by length, then from the last character | OS kernel compile 485M; Minyarcraft 109M; Atacama 80.5M | 342M; 71.4M; 58.1M | -28% to -35% |
 | 7 | `json.parse` built every string from a parts list, a slice and a join | one slice when a string has no escapes | 20 parses of a 143 KB history response 1.22G | 0.95G | -22% |
+| 8 | Every macOS app build recompiled the Objective-C bridges (`macos.m` 0.46 s, `http.m` 0.12 s) | content-keyed object cache, already used for `graphics.c`, now for every native bridge | Atacama default build 0.93-1.11 s; release app 1.86-2.41 s | 0.48 s; 1.39-1.46 s | about 2x |
 
 ### 1. Long lists rebuilt as stacks of views
 
@@ -257,7 +258,32 @@ string, a tab escape, an escaped backslash at the end, and two unterminated
 strings. A separate program covering quote, `\u00e9` and surrogate-pair
 escapes printed the same output as the v2 base. Atacama's `make test` passes.
 
-### 8. Two competing `http` packages
+### 8. Native bridges were recompiled on every build
+
+**Problem.** Profiling an Atacama build after a one-line change: `--check` takes
+0.23 s and the front end about 0.02 s, but a default build took about 1 s. The
+driver compiled `runtime/native/macos.m` (0.46 s) and `http.m` (0.12 s) into a
+fresh temporary directory on every link, so every macOS app paid about 0.6 s
+for code that had not changed.
+
+**Fix.** `tools/clang-driver.py` already cached `graphics.c` by content. That
+cache is now `native_object`, keyed by the source, every runtime header, the
+compiler's identity and version, and the flags, and it serves `graphics`,
+`macos`, `http` and `net`. The compiler identity is computed once per link.
+
+| Atacama build (wall time) | Before | After (cache warm) |
+| --- | ---: | ---: |
+| `./minyar src/main.min` | 0.93 s, 1.11 s | 0.48 s, 0.48 s |
+| `./minyar --release --app ...` | 2.41 s, 1.86 s | 1.39 s, 1.46 s |
+
+**Test.** `tests/native-object-cache.py` (`check-native-cache`, part of
+`check` and `check-portable`) builds a native object twice and requires the
+second build to reuse it without recompiling. Changing a runtime header, the
+source or the flags must each produce a new object, and no temporary files
+may be left behind. `tests/native-graphics.py` and a Minyarcraft build still
+pass.
+
+### 9. Two competing `http` packages
 
 Not a speed fix, but one of the limits the brief named. appkit's NSURLSession
 `http` and minyar-os's portable socket/TLS `http` both arrived in v2 under the
