@@ -9,6 +9,7 @@ from clang_helpers import clang_command, native_path, windows_host
 from pathlib import Path
 
 WORKER_RUNTIME = Path(os.environ.get('MINYAR_WORKER_RUNTIME', ROOT / 'build/minyar-default-runtime.o'))
+WORKER_LINK_FLAGS = ['-ladvapi32'] if windows_host() else []
 
 
 class IsolatedWorkers(CompilerTestCase):
@@ -35,7 +36,7 @@ class IsolatedWorkers(CompilerTestCase):
         executable = llvm.with_suffix('.exe')
         linked = self.evidence.run(clang_command([CLANG, '-O2', *LINK_FLAGS,
             '-Wno-override-module', str(llvm), str(WORKER_RUNTIME),
-            str(ROOT / 'runtime/native/workers.c'), '-o', str(executable)]),
+            str(ROOT / 'runtime/native/workers.c'), *WORKER_LINK_FLAGS, '-o', str(executable)]),
             capture_output=True, text=True, timeout=30, phase='link-isolated-worker')
         self.assertEqual(linked.returncode, 0, linked.stderr)
         run = self.evidence.run([str(executable)], capture_output=True,
@@ -169,7 +170,7 @@ workers.reply(status)
         executable = llvm.with_suffix('.exe')
         linked = self.evidence.run(clang_command([CLANG, '-O2', *LINK_FLAGS,
             '-Wno-override-module', str(llvm), str(WORKER_RUNTIME),
-            str(ROOT / 'runtime/native/workers.c'), '-o', str(executable)]),
+            str(ROOT / 'runtime/native/workers.c'), *WORKER_LINK_FLAGS, '-o', str(executable)]),
             capture_output=True, text=True, timeout=30, phase='link-worker-parser')
         self.assertEqual(linked.returncode, 0, linked.stderr)
         packet = struct.pack('<I', 3) + b'a\x00\xff'
