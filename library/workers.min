@@ -1,0 +1,75 @@
+// Managed concurrency through private process heaps and copied messages.
+// Windows reports recoverable unavailable until overlapped pipes are added.
+// Worker stdout is reserved for the framed protocol; use reply(), not print().
+use "errors" as errors
+public record Worker { private handle: Integer }
+public record WorkerResult { private value: Worker; private error: errors.Error }
+public function ok(result: WorkerResult): Boolean { return !errors.isError(result.error) }
+public function error(result: WorkerResult): errors.Error { return result.error }
+public function value(result: WorkerResult): Worker {
+    if !ok(result) { fail("cannot read a failed WorkerResult") }
+    return result.value
+}
+public function supported(): Boolean { native "workers" }
+public function isWorker(): Boolean {
+    return argumentCount() > 0 && argument(0) == "--minyar-worker"
+}
+public function mode(): Text {
+    if !isWorker() || argumentCount() < 2 { fail("worker mode requires a worker process") }
+    return argument(1)
+}
+function operationError(result: Bytes): errors.Error {
+    if result.length < 8 { fail("invalid native worker result") }
+    let code = errors.systemCode()
+    if result.getUInt32(0) == 1 { code = errors.wouldBlockCode() }
+    if !supported() { code = errors.unavailableCode() }
+    return errors.make(code, result.getUInt32(4), "worker operation failed")
+}
+function spawnResult(result: Bytes): WorkerResult {
+    if result.length != 16 { fail("invalid native worker spawn result") }
+    let worker = Worker { handle: 0 }
+    if result.getUInt32(0) != 0 { return WorkerResult { value: worker; error: operationError(result) } }
+    worker.handle = result.getInt64(8)
+    return WorkerResult { value: worker; error: errors.none() }
+}
+public function spawn(executable: Text, mode: Text): WorkerResult { return spawnResult(spawnNative(executable, mode)) }
+public function spawnSelf(mode: Text): WorkerResult { return spawnResult(spawnSelfNative(mode)) }
+function countResult(result: Bytes): errors.IntegerResult {
+    if result.length != 16 { fail("invalid native worker count result") }
+    if result.getUInt32(0) != 0 { return errors.integerFailure(operationError(result)) }
+    return errors.integer(result.getInt64(8))
+}
+// Success means this complete copied frame was accepted into the bounded
+// queue. receive() also pumps pending sends. Would-block accepts nothing.
+public function send(worker: Worker, message: Bytes): errors.IntegerResult { return countResult(sendNative(worker.handle, message)) }
+function messageResult(result: Bytes): errors.BytesResult {
+    if result.length < 8 { fail("invalid native worker message result") }
+    let status = result.getUInt32(0)
+    if status == 0 { return errors.bytes(result.slice(8, result.length)) }
+    if status == 1 { return errors.wouldBlock(result.getUInt32(4)) }
+    if status == 2 { return errors.endOfStream() }
+    return errors.bytesFailure(operationError(result))
+}
+// timeout -1 waits, zero polls. Empty messages are success; clean process
+// output closure is EOF, and incomplete/malformed frames are failures.
+public function receive(worker: Worker, timeoutMs: Integer): errors.BytesResult { return messageResult(receiveNative(worker.handle, timeoutMs)) }
+public function close(worker: Worker): errors.BooleanResult {
+    let result = countResult(closeNative(worker.handle))
+    if !errors.integerOk(result) { return errors.booleanFailure(errors.integerError(result)) }
+    return errors.boolean(true)
+}
+public function readMessage(): errors.BytesResult {
+    if !isWorker() { fail("readMessage requires a worker process") }
+    return messageResult(readMessageNative())
+}
+public function reply(message: Bytes): errors.IntegerResult {
+    if !isWorker() { fail("reply requires a worker process") }
+    return countResult(replyNative(message))
+}
+function spawnNative(executable: Text, mode: Text): Bytes { native "workers" }
+function spawnSelfNative(mode: Text): Bytes { native "workers" }
+function sendNative(handle: Integer, message: Bytes): Bytes { native "workers" }
+function receiveNative(handle: Integer, timeoutMs: Integer): Bytes { native "workers" }
+function closeNative(handle: Integer): Bytes { native "workers" }
+function readMessageNative(): Bytes { native "workers" }
+function replyNative(message: Bytes): Bytes { native "workers" }

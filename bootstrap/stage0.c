@@ -1051,6 +1051,14 @@ static Type check_expression(Program *program, Function *function, Expression *e
             require_type(expression->arguments[0], left, TYPE_TEXT, "a failure explanation");
             return expression->type = TYPE_NOTHING;
         }
+        if (strcmp(expression->text, "exit") == 0) {
+            if (arrlen(expression->arguments) != 1)
+                fail_at(expression->line, expression->column,
+                        "exit expects exactly one Integer status");
+            left = check_expression(program, function, expression->arguments[0]);
+            require_type(expression->arguments[0], left, TYPE_INTEGER, "an exit status");
+            return expression->type = TYPE_NOTHING;
+        }
         if (strcmp(expression->text, "Text") == 0) {
             if (arrlen(expression->arguments) != 1)
                 fail_at(expression->line, expression->column,
@@ -1464,6 +1472,11 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
         }
         if (strcmp(expression->text, "fail") == 0) {
             fprintf(output, "  call void @minyar_fail(ptr %s)\n", arguments[0].name);
+            arrfree(arguments);
+            return make_value(TYPE_NOTHING, "");
+        }
+        if (strcmp(expression->text, "exit") == 0) {
+            fprintf(output, "  call void @minyar_exit(i64 %s)\n", arguments[0].name);
             arrfree(arguments);
             return make_value(TYPE_NOTHING, "");
         }
@@ -1885,6 +1898,7 @@ static void emit_program(FILE *output, Program *program) {
           "declare void @minyar_print_character(i32)\n"
           "declare void @minyar_print_boolean(i1 zeroext)\n"
           "declare void @minyar_fail(ptr)\n"
+          "declare void @minyar_exit(i64)\n"
           "declare zeroext i1 @minyar_texts_are_equal(ptr, ptr)\n"
           "declare ptr @minyar_join_text(ptr, ptr)\n"
           "declare ptr @minyar_join_texts(ptr)\n"
