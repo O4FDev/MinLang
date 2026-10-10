@@ -473,6 +473,50 @@ cycle hint, so tracing never activates. The compiler's +1% is its own extra
 work deciding which entry points to emit (`typeMayCycle` at each borrow,
 local and List site); there are no traced objects at run time.
 
+### Merge with v2 (a836412)
+
+`1739954` merges v2 at `a836412` (pushed v2 plus the Minyarcraft frame,
+call-tree check and streamed-text work) into this branch, on the new branch
+`port/astra-cycles-v2`; `port/astra-cycles` is unchanged. Two files
+conflicted:
+
+- **`build-support/checks.mk`:** both sets of targets are kept.
+- **`x = x.appended(e)` (v2 change 12):** v2 moves x's owner into
+  `minyar_list_appended_take`, which grows a List in place when nothing else
+  holds it. v2's entry points never see traced objects, so traced element
+  types now call `minyar_list_appended_take_traced` (`3b4ef80`): a unique
+  List stores through `list_store_traced`, which records the new edge, and
+  a shared one is copied by `minyar_list_appended_traced` and released. The
+  first resolution kept the traced copy without consuming the owner marker,
+  which left the marker's slot number in the IR; JSON programs failed to
+  link, so it was replaced before any measurement.
+
+`tests/cycles/appended.min` (in `check-cycle-profiles`) builds Trees with
+in-place appends, through aliases, a parameter, a field receiver and Lists
+whose in-place append closes a cycle. It must print the same totals and
+recover every object under the system, fixed, lazy and eager profiles at K1
+and K32, natively and under ASan/UBSan. A mutant whose in-place path stores
+without recording the edge fails it (the leaked cycle trips the exit
+contract); the fix passes all 14 configurations.
+
+Costs against v2 at `a836412`, retired instructions, `./minyar --release`
+on both sides:
+
+| Workload | v2 | This branch | Change | Peak memory v2 / this branch |
+| --- | ---: | ---: | ---: | --- |
+| Atacama history parse, 500 runs x 20 (`benchmarks/json`, 3 runs) | 808.7-813.8 M | 862.1-885.0 M | +6% to +9% | 2.77-2.87 / 3.02-3.11 MB footprint |
+| History parse, 5,000 runs x 2 (1 run) | 731.9 M | 779.0 M | +6.4% | 15.1 / 17.5 MB footprint |
+| `craft --benchmark build` (3 runs) | 9,850-9,926 M | 9,869-9,893 M | within noise | 604-610 / 604-625 MB footprint |
+| Compiler on v2's `compiler.min` (3 runs) | 71.9-73.3 M | 72.4-73.1 M | within noise | 9.16-9.18 / 9.29-9.31 MB footprint |
+| `acyclic.min` (5 runs, median) | 195.4 M | 220.3 M | +12.8% | 1.97 / 2.29 MB RSS |
+| One 100,000-record chain (5 runs, median) | 94.9 M | 109.5 M | +15.3% | 12.6 / 19.1 MB RSS |
+
+The earlier JSON figure, +29% (1.22 G against 1.57 G), was measured before
+v2's changes 7 and 12. Both sides then grew `json.Value` lists by copying,
+and the traced copy re-adds every element through the traced store. With
+in-place appends on both sides, the difference is +6% to +9%. What remains
+for self-referential types is the dormant bookkeeping described above.
+
 ### Validation status
 
 Final command outcomes are recorded in [validation.md](validation.md). The
