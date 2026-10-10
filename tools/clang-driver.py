@@ -305,6 +305,13 @@ def main():
                 raise ValueError('the windows package requires Windows and its native UI')
             native += [native_object(project, clang, base, 'windows.c', native_flags),
                        '-luser32', '-lgdi32', '-lshell32']
+        elif library == 'schannel':
+            if not (platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN'))):
+                raise ValueError('the schannel package requires Windows and its TLS provider')
+            native += [native_object(project, clang, base, 'schannel.c', native_flags),
+                       '-lsecur32', '-lcrypt32', '-lbcrypt', '-lncrypt', '-lws2_32']
+            if 'tlsverify' not in libraries:
+                native += [native_object(project, clang, base, 'tlsverify.c', native_flags)]
         elif library == 'wincert':
             if not (platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN'))):
                 raise ValueError('the wincert package requires Windows and its certificate store')

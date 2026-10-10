@@ -1,0 +1,84 @@
+use "net" as net
+use "schannel" as tls
+use "wincert" as certificates
+use "errors" as errors
+
+function reject(error: errors.Error): Integer {
+    print("TLS error " + Text(errors.code(error)) + " native " + Text(errors.nativeCode(error)))
+    return 1
+}
+function flush(session: tls.Session, connection: Integer): Boolean {
+    let pending = tls.takeOutgoing(session)
+    if !errors.bytesOk(pending) { return false }
+    let bytes = errors.bytesValue(pending)
+    return net.send(connection,bytes) == bytes.length
+}
+function main(): Integer {
+    let port = 0
+    for digit in argument(0) { port = port * 10 + Integer(digit) - 48 }
+    let roots: List<Bytes> = []
+    if argument(2) != "" { roots.add(readBytesFile(argument(2))) }
+    let created = tls.client(argument(1))
+    if roots.length != 0 {
+        if tls.clientOk(created) { tls.close(tls.clientValue(created)) }
+        created = tls.clientWithTrust(argument(1),roots)
+    }
+    // Dispose the preceding client before selecting an explicit identity.
+    if argumentCount() > 3 && argument(3) != "" {
+        if tls.clientOk(created) { tls.close(tls.clientValue(created)) }
+        let lookup = certificates.findIdentity(argument(3),"My",false)
+        if !certificates.found(lookup) { return reject(certificates.lookupError(lookup)) }
+        created = tls.clientWithIdentity(argument(1),roots,certificates.value(lookup))
+    }
+    if !tls.clientOk(created) { return reject(tls.clientError(created)) }
+    let session = tls.clientValue(created)
+    let connection = net.connect("127.0.0.1",port)
+    if connection < 0 { tls.close(session); print("connect failed"); return 2 }
+    let deadline = net.monotonicMilliseconds() + 10000
+    let sent = false
+    let plaintext = Bytes()
+    let failure = errors.none()
+    while !errors.isError(failure) {
+        let state = tls.state(session)
+        if !errors.integerOk(state) { failure = errors.integerError(state); break }
+        if errors.integerValue(state) == tls.open() && !sent {
+            let written = tls.write(session,Bytes("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"))
+            if !errors.integerOk(written) { failure = errors.integerError(written); break }
+            sent = true
+        }
+        if !flush(session,connection) { failure = errors.make(7,0,"transport send failed"); break }
+        let ready = tls.takeIncoming(session)
+        if !errors.bytesOk(ready) { failure = errors.bytesError(ready); break }
+        plaintext.addBytes(errors.bytesValue(ready))
+        if errors.integerValue(state) == tls.peerClosed() {
+            let ended = tls.endInput(session)
+            if !errors.integerOk(ended) { failure = errors.integerError(ended); break }
+            tls.shutdown(session)
+            flush(session,connection)
+            break
+        }
+        let remaining = deadline - net.monotonicMilliseconds()
+        if remaining <= 0 || !net.ready(connection,remaining) { failure = errors.make(3,0,"transport deadline"); break }
+        let arrived = net.receive(connection,65536)
+        if arrived.length == 0 {
+            let ended = tls.endInput(session)
+            if !errors.integerOk(ended) { failure = errors.integerError(ended) }
+            break
+        }
+        if argumentCount() > 4 && argument(4) == "fragment" {
+            for position in 0..arrived.length {
+                let received = tls.receive(session,arrived.slice(position,position+1))
+                if !errors.integerOk(received) { failure = errors.integerError(received); break }
+            }
+        } else {
+            let received = tls.receive(session,arrived)
+            if !errors.integerOk(received) { failure = errors.integerError(received) }
+        }
+    }
+    net.close(connection)
+    tls.close(session)
+    if errors.isError(failure) { return reject(failure) }
+    if !sent { print("TLS never opened"); return 1 }
+    print(Text(plaintext))
+    return 0
+}
