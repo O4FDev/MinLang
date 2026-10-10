@@ -414,6 +414,10 @@ MinyarList *minyar_list_appended_traced(const MinyarList *list, long long value,
                                         long long take_value) {
     return minyar_list_appended(list, value, references, take_value);
 }
+MinyarList *minyar_list_appended_take_traced(MinyarList *list, long long value, long long references,
+                                             long long take_value) {
+    return minyar_list_appended(list, value, references, take_value);
+}
 void minyar_record_set_traced(MinyarRecord *record, long long field, long long value) {
     minyar_record_set(record, field, value);
 }
@@ -507,6 +511,20 @@ MinyarList *minyar_list_appended_traced(const MinyarList *list, long long value,
     for (long long position = 0; position < list->length; position++)
         minyar_list_add_traced(result, list->values[position]);
     list_store_traced(result, value, !take_value);
+    return result;
+}
+
+/* As minyar_list_appended_take for traced element types: the caller hands
+ * over its count on `list`, so a List no one else holds grows in place,
+ * recording the new edge like minyar_list_add_traced. */
+MinyarList *minyar_list_appended_take_traced(MinyarList *list, long long value, long long references,
+                                             long long take_value) {
+    if ((((RcObject *)list - 1)->ownership >> 3) == 1) {
+        list_store_traced(list, value, !take_value);
+        return list;
+    }
+    MinyarList *result = minyar_list_appended_traced(list, value, references, take_value);
+    minyar_rc_release(list);
     return result;
 }
 
