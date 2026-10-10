@@ -70,8 +70,27 @@ a DER public certificate and opaque persistent signer metadata. Security
 framework performs signatures without exporting private keys; see
 [TLS authentication](tls.md).
 
+The macOS `http.startWithIdentity(method, url, headers, body, signer,
+intermediates)` uses NSURLSession's OS TLS with that signer. Supply the opaque
+`keychain.signingReference(identity)` and public DER intermediates (excluding
+the leaf); use `[]` for a directly signed identity. Apple creates its
+[client-certificate credential](https://developer.apple.com/documentation/foundation/urlcredential/init(identity:certificates:persistence:))
+from the native SecIdentity. Each identity request has its own ephemeral
+session so authenticated connections and client credentials are never shared
+with unrelated requests. Challenges must match the original HTTPS host and
+port. Cross-origin redirects and repeated credential failures are rejected.
+Server trust always uses
+[default OS handling](https://developer.apple.com/documentation/foundation/urlsession/authchallengedisposition/performdefaulthandling).
+An inaccessible key becomes a completed request with a readable error.
+
 Run `tests/desktop-native.py`, `tests/macos-services.py` and
 `tests/keychain-native.py` on macOS CI. Native and ASan/UBSan executions are
 mandatory there. The tests do not certify production notification delivery or
 login registration for an unsigned application; those depend on the final
 application bundle and distribution credentials.
+
+The Keychain gate additionally drives an independent OpenSSL TLS 1.3 server
+requiring the actual device certificate. On GitHub's disposable macOS runner
+only, it first rejects the server's unknown issuer, then installs one freshly
+generated root for the successful exchange and removes that exact root in a
+mandatory cleanup. The trust-installation path refuses developer workstations.

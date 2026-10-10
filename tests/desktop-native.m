@@ -73,8 +73,12 @@ int main(void) { @autoreleasepool {
     fake.deferred=YES;
     id=result(minyar_desktop_notifyRaw(&title,&body));
     assert(result(minyar_desktop_notificationStatusRaw(id))==0);
-    __weak DesktopNotice *notice=desktop_notices[@(id)];
-    assert(result(minyar_desktop_notificationCloseRaw(id))==1);
+    __weak DesktopNotice *notice;
+    @autoreleasepool {
+        notice=desktop_notices[@(id)];
+        assert(result(minyar_desktop_notificationCloseRaw(id))==1);
+    }
+    assert(!notice);
     @autoreleasepool { fake.authorization(YES,nil); fake.authorization=nil; }
     assert(!notice && fake.sent==1);
     b=minyar_desktop_notificationStatusRaw(id); assert(code(b)==4); minyar_rc_release(b);

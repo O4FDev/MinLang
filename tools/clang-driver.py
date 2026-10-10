@@ -297,7 +297,7 @@ def main():
             if platform.system() != 'Darwin':
                 raise ValueError('the http package currently requires macOS and the Apple command-line tools')
             native += [native_object(project, clang, base, 'http.m', [*native_flags, '-fobjc-arc', '-fmodules']),
-                       '-framework', 'AppKit']
+                       '-framework', 'AppKit', '-framework', 'Security']
         elif library in ('machine', 'machine_arm64'):
             pass  # Compiler intrinsics: the code is already inline in the program.
         elif library == 'net':
@@ -329,7 +329,8 @@ def main():
             else:
                 native += [native_object(project, clang, base, 'desktop.c', native_flags)]
                 if platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
-                    native += ['-luser32', '-lshell32', '-ladvapi32', '-lole32', '-loleaut32', '-liphlpapi']
+                    native += ['-luser32', '-lshell32', '-ladvapi32', '-lole32', '-loleaut32', '-liphlpapi',
+                               '-luuid', '-lws2_32', '-lbcrypt']
         else:
             raise ValueError(f'the program uses an unknown native library: {library}')
     lto = lto_flags(clang, link_flags) if release == '1' else []

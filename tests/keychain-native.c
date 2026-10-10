@@ -11,6 +11,9 @@ extern MinyarBytes *minyar_tlsverify_sign(const MinyarBytes *, long long, const 
 extern bool minyar_tlsverify_signature(const MinyarBytes *, long long, const MinyarBytes *,
                                        const MinyarBytes *);
 extern void minyar_rc_release(void *);
+#ifdef MINYAR_TEST_HTTP
+extern void minyar_test_http_identity(const MinyarBytes *);
+#endif
 static MinyarText literal(const char *s) {
     return (MinyarText){(const unsigned char *)s, (long long)strlen(s), -1, NULL, NULL};
 }
@@ -52,6 +55,9 @@ int main(int argc, char **argv) {
     MinyarBytes cert = {found->bytes + 16, cert_size, 0, NULL, NULL};
     MinyarBytes key = {found->bytes + 16 + cert_size, ref_size, 0, NULL, NULL};
     assert(ref_size > 12 && !memcmp(key.bytes, "MNI1", 4));
+#ifdef MINYAR_TEST_HTTP
+    minyar_test_http_identity(&key);
+#endif
     MinyarBytes message = {(const unsigned char *)"transcript\0binary", 17, 0, NULL, NULL};
     MinyarBytes *signature = minyar_tlsverify_sign(&key, 0x0804, &message);
     assert(signature->byte_length > 0 &&

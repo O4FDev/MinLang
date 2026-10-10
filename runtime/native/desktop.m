@@ -160,6 +160,7 @@ MinyarBytes *minyar_desktop_setLaunchAtLoginRaw(bool enabled) { @autoreleasepool
 @property(nonatomic) uint32_t error;
 @property(nonatomic) NSInteger nativeCode;
 @property(nonatomic,copy) NSString *identifier;
+@property(nonatomic,copy) NSString *title,body;
 @end
 @implementation DesktopNotice
 @end
@@ -190,28 +191,39 @@ MinyarBytes *minyar_desktop_notifyRaw(const MinyarText *title, const MinyarText 
     if (!desktop_notices) desktop_notices=[NSMutableDictionary new];
     if (desktop_notices.count>=256 || desktop_notice_id==LLONG_MAX) return desktop_scalar(9,0,0);
     DesktopNotice *notice=[DesktopNotice new]; long long handle=desktop_notice_id++;
+    notice.title=t; notice.body=b;
     notice.identifier=[NSString stringWithFormat:@"%@.minyar.%lld",bundle,handle]; desktop_notices[@(handle)]=notice;
     id<DesktopNotificationCenter> center=desktop_center();
+    __weak id<DesktopNotificationCenter> weakCenter=center;
+    __weak DesktopNotice *weakNotice=notice;
     void (^submit)(BOOL,NSError *)=^(BOOL granted,NSError *error) {
-        @synchronized(notice) {
-            if (notice.closed) return;
-            if (!granted || error) { desktop_notice_finish(notice,8,error.code); return; }
-            UNMutableNotificationContent *content=[UNMutableNotificationContent new]; content.title=t; content.body=b;
-            UNNotificationRequest *request=[UNNotificationRequest requestWithIdentifier:notice.identifier content:content trigger:nil];
-            [center addNotificationRequest:request withCompletionHandler:^(NSError *failure) {
+        DesktopNotice *active=weakNotice;
+        id<DesktopNotificationCenter> provider=weakCenter;
+        if (!active || !provider) return;
+        @synchronized(active) {
+            if (active.closed) return;
+            if (!granted || error) { desktop_notice_finish(active,8,error.code); return; }
+            UNMutableNotificationContent *content=[UNMutableNotificationContent new]; content.title=active.title; content.body=active.body;
+            NSString *identifier=active.identifier;
+            UNNotificationRequest *request=[UNNotificationRequest requestWithIdentifier:identifier content:content trigger:nil];
+            [provider addNotificationRequest:request withCompletionHandler:^(NSError *failure) {
+                DesktopNotice *completed=weakNotice;
                 BOOL closed;
-                @synchronized(notice) { closed=notice.closed; }
+                @synchronized(completed) { closed=!completed || completed.closed; }
                 if (closed) {
-                    [center removePendingNotificationRequestsWithIdentifiers:@[notice.identifier]];
-                    [center removeDeliveredNotificationsWithIdentifiers:@[notice.identifier]];
-                } else desktop_notice_finish(notice,failure?7:0,failure.code);
+                    id<DesktopNotificationCenter> completionProvider=weakCenter;
+                    [completionProvider removePendingNotificationRequestsWithIdentifiers:@[identifier]];
+                    [completionProvider removeDeliveredNotificationsWithIdentifiers:@[identifier]];
+                } else desktop_notice_finish(completed,failure?7:0,failure.code);
             }];
         }
     };
     [center getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *settings) {
-        @synchronized(notice) { if (notice.closed) return; }
+        DesktopNotice *active=weakNotice;
+        if (!active) return;
+        @synchronized(active) { if (active.closed) return; }
         if (settings.authorizationStatus==UNAuthorizationStatusNotDetermined)
-            [center requestAuthorizationWithOptions:UNAuthorizationOptionAlert|UNAuthorizationOptionSound completionHandler:submit];
+            [weakCenter requestAuthorizationWithOptions:UNAuthorizationOptionAlert|UNAuthorizationOptionSound completionHandler:submit];
         else submit(settings.authorizationStatus!=UNAuthorizationStatusDenied,nil);
     }];
     return desktop_scalar(0,0,handle);

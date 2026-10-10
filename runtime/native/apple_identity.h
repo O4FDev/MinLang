@@ -47,7 +47,7 @@ static inline void identity_no_ui(CFMutableDictionaryRef query) {
     CFDictionarySetValue(query, kSecUseAuthenticationUI, kSecUseAuthenticationUIFail);
 }
 #pragma clang diagnostic pop
-static inline SecKeyRef identity_private_key(const MinyarBytes *encoded) {
+static inline SecIdentityRef identity_value(const MinyarBytes *encoded) {
     if (encoded->byte_length < 12 || encoded->byte_length > 8204 ||
         memcmp(encoded->bytes, "MNI1", 4))
         return NULL;
@@ -77,9 +77,9 @@ static inline SecKeyRef identity_private_key(const MinyarBytes *encoded) {
         status = errSecAllocate;
     if (!status)
         status = SecItemCopyMatching(query, &item);
-    SecKeyRef key = NULL;
+    SecIdentityRef identity = NULL;
     if (!status && item && CFGetTypeID(item) == SecIdentityGetTypeID())
-        SecIdentityCopyPrivateKey((SecIdentityRef)item, &key);
+        identity = (SecIdentityRef)CFRetain(item);
     if (item)
         CFRelease(item);
     if (reference)
@@ -87,6 +87,15 @@ static inline SecKeyRef identity_private_key(const MinyarBytes *encoded) {
     if (match)
         CFRelease(match);
     CFRelease(query);
+    return identity;
+}
+static inline SecKeyRef identity_private_key(const MinyarBytes *encoded) {
+    SecIdentityRef identity = identity_value(encoded);
+    if (!identity)
+        return NULL;
+    SecKeyRef key = NULL;
+    SecIdentityCopyPrivateKey(identity, &key);
+    CFRelease(identity);
     return key;
 }
 #endif
