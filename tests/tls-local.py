@@ -14,9 +14,23 @@ import subprocess
 import sys
 import tempfile
 import threading
+from clang_helpers import windows_host
 
 ROOT = Path(__file__).resolve().parents[1]
 BODY = 'Minyar spoke authenticated TLS 1.3: ' + 'é' * 3 + ' ' + 'x' * 40000
+
+
+def openssl_config_path(path):
+    value = Path(path).as_posix()
+    # MSYS converts command arguments, not paths embedded in config files.
+    if windows_host() and os.name != 'nt':
+        cygpath = shutil.which('cygpath')
+        if not cygpath:
+            raise RuntimeError('native Windows OpenSSL fixtures require cygpath')
+        value = subprocess.check_output([cygpath, '-m', value], text=True, timeout=10).rstrip('\r\n')
+    if '\n' in value or '\r' in value or '\0' in value:
+        raise ValueError('OpenSSL fixture path contains a line break or NUL')
+    return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$') + '"'
 
 
 def openssl(*args):
@@ -73,11 +87,11 @@ class Certificates:
         config.write_text(f'''[ca]
 default_ca=issuer
 [issuer]
-database={index.as_posix()}
-serial={serial.as_posix()}
-new_certs_dir={self.directory.as_posix()}
-certificate={self.path(issuer, 'pem').as_posix()}
-private_key={self.path(issuer, 'key').as_posix()}
+database={openssl_config_path(index)}
+serial={openssl_config_path(serial)}
+new_certs_dir={openssl_config_path(self.directory)}
+certificate={openssl_config_path(self.path(issuer, 'pem'))}
+private_key={openssl_config_path(self.path(issuer, 'key'))}
 default_md=sha256
 default_days=2
 policy=policy
