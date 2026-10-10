@@ -142,7 +142,7 @@ Path(os.environ['TEST_MAKE_LOG']).write_text(json.dumps({name: os.environ.get(na
         self.write_executable(linker, 'pass\n')
         environment = self.bootstrap_environment()
         self.assertEqual(shlex.split(environment['COMPILER_LTO_FLAGS']),
-                         ['-flto', '-fuse-ld=' + str(linker.resolve()), '-Wl,--threads=1'])
+                         ['-flto=thin', '-fuse-ld=' + str(linker.resolve()), '-Wl,--threads=1'])
         self.assertEqual(environment['LIMITED'], self.env['LIMITED'])
 
     def test_bootstrap_preserves_explicit_limits_lto_and_linker_threads(self):
@@ -154,7 +154,7 @@ Path(os.environ['TEST_MAKE_LOG']).write_text(json.dumps({name: os.environ.get(na
         self.assertEqual(environment['MINYAR_MAX_MEMORY_MIB'], '384')
         self.assertEqual(environment['MINYAR_MAX_CPU_SECONDS'], '90')
         environment = self.bootstrap_environment({'LLVM_FLAGS': '-O2 -fuse-ld=lld -Wl,--threads=2'})
-        self.assertEqual(shlex.split(environment['COMPILER_LTO_FLAGS']), ['-flto'])
+        self.assertEqual(shlex.split(environment['COMPILER_LTO_FLAGS']), ['-flto=thin'])
         self.assertEqual(environment['LLVM_FLAGS'], '-O2 -fuse-ld=lld -Wl,--threads=2')
 
     def test_elf_thread_option_stays_out_of_apple_and_windows_bootstrap(self):
