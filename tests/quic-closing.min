@@ -1,0 +1,38 @@
+use "quic" as quic
+use "errors" as errors
+use "quicrecovery" as recovery
+function transfer(c: quic.Connection,s: quic.Connection,now: Integer) {
+    for packet in quic.poll(c,now) { quic.receive(s,packet,now) }
+    for packet in quic.poll(s,now) { quic.receive(c,packet,now) }
+}
+function main(): Integer {
+    let root=readBytesFile(argument(0));let cert=readBytesFile(argument(1));let key=readBytesFile(argument(2));let client=readBytesFile(argument(3));let clientKey=readBytesFile(argument(4))
+    let c=quic.client("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey)
+    let s=quic.server(randomBytes(80),"minyar-test",c.originalDestination,[cert],key,[root],true);let now=0
+    while now<10000 && (c.state != quic.ESTABLISHED || s.state != quic.ESTABLISHED) { transfer(c,s,now);now+=10 }
+    if c.state != quic.ESTABLISHED || s.state != quic.ESTABLISHED { return 1 }
+    let duration=3*recovery.pto(c.congestion,true)
+    if !errors.booleanOk(quic.close(c,42,Bytes("done"))) { return 2 }
+    let first=quic.poll(c,now)
+    if first.length != 1 || !c.closing || quic.release(c) || quic.nextTimer(c) != now+duration { return 3 }
+    // The first close is lost. Only an authenticated peer packet may trigger
+    // a bounded response; forged ciphertext cannot amplify traffic.
+    for index in 0..100 { quic.receive(c,randomBytes(100),now+1) }
+    if quic.poll(c,now+1).length != 0 { return 4 }
+    let responseAt=now+max(1,duration/3/16)+1
+    quic.ping(s)
+    let probe=quic.poll(s,responseAt)
+    for packet in probe { quic.receive(c,packet,responseAt) }
+    let reply=quic.poll(c,responseAt)
+    if reply.length != 1 { return 5 }
+    for packet in reply { quic.receive(s,packet,responseAt) }
+    if s.state != quic.CLOSED || !s.draining || quic.release(s) || quic.poll(s,responseAt).length != 0 { return 6 }
+    let deadline=quic.nextTimer(s)
+    if deadline<responseAt+3*recovery.pto(s.congestion,true) { return 7 }
+    for packet in reply { quic.receive(s,packet,responseAt+1) }
+    if quic.poll(s,responseAt+1).length != 0 || quic.nextTimer(s) != deadline { return 8 }
+    quic.poll(c,now+duration);quic.poll(s,deadline)
+    if c.closing || s.draining || quic.nextTimer(c) != -1 || quic.nextTimer(s) != -1 || !quic.release(c) || !quic.release(s) { return 9 }
+    print("QUIC closing: lost close recovery, authenticated bounded response, three-PTO silent draining and deferred release passed")
+    return 0
+}

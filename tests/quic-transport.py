@@ -13,7 +13,7 @@ fixtures = importlib.util.module_from_spec(spec); spec.loader.exec_module(fixtur
 
 
 def main():
-    parser = argparse.ArgumentParser(); parser.add_argument('--sanitize', action='store_true'); modes = parser.add_mutually_exclusive_group(); modes.add_argument('--key-update', action='store_true'); modes.add_argument('--migration', action='store_true'); modes.add_argument('--server-protocol', action='store_true'); modes.add_argument('--resumption', action='store_true'); modes.add_argument('--quic-resumption', action='store_true'); modes.add_argument('--early', action='store_true'); modes.add_argument('--fallback', action='store_true'); modes.add_argument('--congestion',action='store_true'); modes.add_argument('--stream-control',action='store_true'); modes.add_argument('--stream-churn',action='store_true'); options = parser.parse_args()
+    parser = argparse.ArgumentParser(); parser.add_argument('--sanitize', action='store_true'); modes = parser.add_mutually_exclusive_group(); modes.add_argument('--key-update', action='store_true'); modes.add_argument('--migration', action='store_true'); modes.add_argument('--server-protocol', action='store_true'); modes.add_argument('--resumption', action='store_true'); modes.add_argument('--quic-resumption', action='store_true'); modes.add_argument('--early', action='store_true'); modes.add_argument('--fallback', action='store_true'); modes.add_argument('--congestion',action='store_true'); modes.add_argument('--stream-control',action='store_true'); modes.add_argument('--stream-churn',action='store_true'); modes.add_argument('--closing',action='store_true'); options = parser.parse_args()
     if options.sanitize:
         for name in ('MINYAR_CLANG_FLAGS', 'MINYAR_NATIVE_FLAGS', 'MINYAR_RUNTIME_FLAGS'):
             os.environ[name] = '-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wno-override-module'
@@ -28,6 +28,7 @@ def main():
         if options.congestion: name = 'tests/quic-congestion.min'
         if options.stream_control: name='tests/quic-stream-control.min'
         if options.stream_churn: name='tests/quic-stream-churn.min'
+        if options.closing: name='tests/quic-closing.min'
         binary = Path(directory) / 'transport.exe'; fixtures.compile_program(ROOT / name, binary)
         result = subprocess.run([str(binary), str(ca.path('root', 'der')), str(ca.path('server', 'der')), str(ca.path('server', 'pk8')),
                                  str(ca.path('client', 'der')), str(ca.path('client', 'pk8'))], capture_output=True, text=True, timeout=120)
