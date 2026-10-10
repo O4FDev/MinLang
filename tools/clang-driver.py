@@ -370,7 +370,9 @@ def main():
                        for name in ('update.c', 'update_ed25519.c')]
         elif library == 'workers':
             native += [native_object(project, clang, base, 'workers.c', native_flags)]
-            if platform.system() != 'Windows':
+            if platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
+                native += ['-ladvapi32']
+            else:
                 native += ['-pthread']
         elif library == 'callbackruntime':
             # This bounded service entry is supplied by the opt-in engine.
