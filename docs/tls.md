@@ -27,6 +27,16 @@ The hosted trust providers are:
   `SSL_CERT_DIR` overrides apply. Build dependencies are `libssl-dev` and a
   provisioned OS CA bundle, normally `ca-certificates` on Debian/Ubuntu.
 
+Windows imports of PKCS#8 EC signing keys can report an ECDH algorithm name,
+as handled by [.NET's ECDsaCng implementation](https://github.com/microsoft/referencesource/blob/main/System.Core/System/Security/Cryptography/ECDsaCng.cs).
+The provider accepts that label only for P-256/SHA-256, P-384/SHA-384 or
+P-521/SHA-512. Generic EC algorithm names additionally require the exact
+`ECCCurveName` property, with the [NIST names used by Microsoft's CNG bindings](https://github.com/microsoft/go-crypto-winnative/blob/main/internal/bcrypt/bcrypt_windows.go).
+Another curve of the same size cannot substitute for the selected TLS scheme.
+The Windows native fixture checks this matrix, imports independent OpenSSL
+PKCS#8 keys, signs and verifies every supported curve, and rejects secp256k1,
+wrong schemes and changed messages/signatures before the mTLS cases run.
+
 The chain supplied by the peer can provide intermediates; it cannot create
 trust anchors. Validation disables network fetching. This implementation
 does not currently fetch missing intermediates or perform online OCSP/CRL

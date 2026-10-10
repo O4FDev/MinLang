@@ -212,6 +212,18 @@ def main():
         fixtures.leaf('p521', 'root', ec='P-521')
         fixtures.leaf('p384-device', 'root', usage='clientAuth', ec='P-384')
         fixtures.leaf('p521-device', 'root', usage='clientAuth', ec='P-521')
+        if windows_host():
+            fixtures.leaf('non-nist-device', 'root', usage='clientAuth', ec='secp256k1')
+            signing = Path(temporary) / 'windows-signing.exe'
+            subprocess.run([os.environ.get('MINYAR_TEST_CLANG', 'clang'), '-std=c11',
+                '-DMINYAR_SYSTEM_HEAP=1', '-Wall', '-Wextra', '-Werror', '-O2',
+                ROOT / 'tests/tls-windows-signing.c', ROOT / 'runtime/minyar_runtime.c',
+                '-lcrypt32', '-lncrypt', '-lbcrypt', '-lws2_32', '-o', signing],
+                check=True, timeout=60)
+            command = [signing]
+            for identity in ['ec-device', 'p384-device', 'p521-device', 'non-nist-device']:
+                command.extend([fixtures.path(identity, 'pk8'), fixtures.path(identity, 'der')])
+            subprocess.run(command, check=True, timeout=30)
         fixtures.leaf('unknown-critical', 'root', extra='1.2.3.4=critical,DER:05:00')
         fixtures.leaf('constrained-intermediate', 'root', ca=True,
                       extra='nameConstraints=critical,permitted;DNS:.example.test')

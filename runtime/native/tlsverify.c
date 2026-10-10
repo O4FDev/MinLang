@@ -550,12 +550,38 @@ static bool windows_digest(const MinyarBytes *content, LPCWSTR algorithm, DWORD 
     return valid;
 }
 
-static bool windows_scheme(LPCWSTR algorithm, DWORD bits, long long scheme) {
+static bool windows_scheme(LPCWSTR algorithm, DWORD bits, long long scheme, LPCWSTR curve) {
     if (!wcscmp(algorithm, BCRYPT_RSA_ALGORITHM) && bits >= 2048)
         return scheme == 0x0804 || scheme == 0x0805 || scheme == 0x0806;
-    return (!wcscmp(algorithm, BCRYPT_ECDSA_P256_ALGORITHM) && bits == 256 && scheme == 0x0403) ||
-           (!wcscmp(algorithm, BCRYPT_ECDSA_P384_ALGORITHM) && bits == 384 && scheme == 0x0503) ||
-           (!wcscmp(algorithm, BCRYPT_ECDSA_P521_ALGORITHM) && bits == 521 && scheme == 0x0603);
+    LPCWSTR signing = NULL, agreement = NULL, named = NULL;
+    if (bits == 256 && scheme == 0x0403) {
+        signing = BCRYPT_ECDSA_P256_ALGORITHM;
+        agreement = BCRYPT_ECDH_P256_ALGORITHM;
+        named = L"nistP256";
+    } else if (bits == 384 && scheme == 0x0503) {
+        signing = BCRYPT_ECDSA_P384_ALGORITHM;
+        agreement = BCRYPT_ECDH_P384_ALGORITHM;
+        named = L"nistP384";
+    } else if (bits == 521 && scheme == 0x0603) {
+        signing = BCRYPT_ECDSA_P521_ALGORITHM;
+        agreement = BCRYPT_ECDH_P521_ALGORITHM;
+        named = L"nistP521";
+    }
+    if (!named)
+        return false;
+    /* CNG can import an EC signing key under its ECDH algorithm identifier,
+     * as also supported by .NET ECDsaCng. A generic EC identifier and bit
+     * length alone cannot distinguish NIST curves from e.g. secp256k1. */
+    if (!wcscmp(algorithm, signing) || !wcscmp(algorithm, agreement))
+        return true;
+    /* Generic Windows 10 identifiers are absent from older MinGW headers. */
+    return (!wcscmp(algorithm, L"ECDSA") || !wcscmp(algorithm, L"ECDH")) && curve &&
+           !wcscmp(curve, named);
+}
+
+static bool windows_property_string(LPCWSTR text, DWORD written, size_t capacity) {
+    return written >= sizeof(wchar_t) && written <= capacity && written % sizeof(wchar_t) == 0 &&
+           text[written / sizeof(wchar_t) - 1] == 0;
 }
 
 static bool windows_ec_signature(const MinyarBytes *encoded, size_t width, unsigned char raw[132]) {
@@ -596,15 +622,24 @@ bool minyar_tlsverify_signature(const MinyarBytes *certificate, long long scheme
     bool valid =
         cert && CryptImportPublicKeyInfoEx2(X509_ASN_ENCODING,
                                             &cert->pCertInfo->SubjectPublicKeyInfo, 0, NULL, &key);
-    wchar_t algorithm[64] = {0};
+    wchar_t algorithm[64] = {0}, curve[64] = {0};
     DWORD bits = 0, written = 0, hash_size = 0;
     LPCWSTR hash_algorithm = windows_hash(scheme, &hash_size);
     if (valid)
         valid = BCryptGetProperty(key, BCRYPT_ALGORITHM_NAME, (PUCHAR)algorithm, sizeof(algorithm),
                                   &written, 0) == 0 &&
+                windows_property_string(algorithm, written, sizeof(algorithm)) &&
                 BCryptGetProperty(key, BCRYPT_KEY_LENGTH, (PUCHAR)&bits, sizeof(bits), &written,
                                   0) == 0 &&
-                windows_scheme(algorithm, bits, scheme) && hash_algorithm;
+                written == sizeof(bits);
+    if (valid) {
+        /* This Windows 10 property is missing from some MinGW SDK headers. */
+        if (BCryptGetProperty(key, L"ECCCurveName", (PUCHAR)curve, sizeof(curve), &written, 0) !=
+                0 ||
+            !windows_property_string(curve, written, sizeof(curve)))
+            curve[0] = 0;
+        valid = windows_scheme(algorithm, bits, scheme, curve) && hash_algorithm;
+    }
     unsigned char digest[64], raw[132];
     if (valid)
         valid = windows_digest(content, hash_algorithm, hash_size, digest);
@@ -667,15 +702,23 @@ MinyarBytes *minyar_tlsverify_sign(const MinyarBytes *private_key, long long sch
         NCryptImportKey(provider, 0, NCRYPT_PKCS8_PRIVATE_KEY_BLOB, NULL, &key,
                         (PBYTE)private_key->bytes, (DWORD)private_key->byte_length,
                         NCRYPT_SILENT_FLAG) == ERROR_SUCCESS;
-    wchar_t algorithm[64] = {0};
+    wchar_t algorithm[64] = {0}, curve[64] = {0};
     DWORD bits = 0, written = 0, hash_size = 0;
     LPCWSTR hash_algorithm = windows_hash(scheme, &hash_size);
     if (valid)
         valid = NCryptGetProperty(key, NCRYPT_ALGORITHM_PROPERTY, (PBYTE)algorithm,
                                   sizeof(algorithm), &written, 0) == ERROR_SUCCESS &&
+                windows_property_string(algorithm, written, sizeof(algorithm)) &&
                 NCryptGetProperty(key, NCRYPT_LENGTH_PROPERTY, (PBYTE)&bits, sizeof(bits), &written,
                                   0) == ERROR_SUCCESS &&
-                windows_scheme(algorithm, bits, scheme) && hash_algorithm;
+                written == sizeof(bits);
+    if (valid) {
+        if (NCryptGetProperty(key, L"ECCCurveName", (PBYTE)curve, sizeof(curve), &written, 0) !=
+                ERROR_SUCCESS ||
+            !windows_property_string(curve, written, sizeof(curve)))
+            curve[0] = 0;
+        valid = windows_scheme(algorithm, bits, scheme, curve) && hash_algorithm;
+    }
     unsigned char digest[64];
     if (valid)
         valid = windows_digest(content, hash_algorithm, hash_size, digest);
