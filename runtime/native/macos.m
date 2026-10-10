@@ -1152,7 +1152,9 @@ static void styleListLabel(NSTextField *label, MNListStyle *style, NSString *tex
     cell.buttonEdge.constant = -e.right; cell.textEdge.constant = -e.right;
     BOOL button = self.buttonImage != nil;
     cell.button.hidden = !button;
-    cell.buttonEdge.active = button; cell.textEdge.active = !button;
+    // Deactivate before activating, so the two trailing edges never conflict.
+    if (button) { cell.textEdge.active = NO; cell.buttonEdge.active = YES; }
+    else { cell.buttonEdge.active = NO; cell.textEdge.active = YES; }
     MNListRow *r = self.shown[(NSUInteger)row];
     styleListLabel(cell.top, self.styles[0], r.top);
     styleListLabel(cell.middle, self.styles[1], r.middle);
