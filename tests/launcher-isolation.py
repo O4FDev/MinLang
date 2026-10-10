@@ -100,7 +100,7 @@ os.execv(os.environ['LAUNCHER_TEST_REAL_CLANG'], ['clang', *sys.argv[1:]])
                 self.assertEqual(subprocess.check_output([str(output)], text=True), f'{value}\n')
                 args = json.loads((self.work / (identity + '.json')).read_text())
                 self.assertIn('-O1', args)
-                self.assertEqual('-flto' in args, release)
+                self.assertEqual(any(arg.startswith('-flto') for arg in args), release)
                 runtime = 'runtime.ll' if release else 'runtime.o'
                 runtime_path = next(Path(arg) for arg in args if Path(arg).name == runtime)
                 self.assertTrue(runtime_path.parent.name.startswith('invocation.'))
