@@ -335,19 +335,38 @@ merged into v2 but not pushed; the suite run on it was stopped.
 
 ## Not merged: Astra cycle collection
 
-The bake-off winner was ported onto v2 on branch `port/astra-cycles`
-(`b9702e9`, `f819fbb`). Measured on v2, it costs programs that never form a
-cycle:
+The bake-off winner was ported onto v2 on branch `port/astra-cycles`. A
+subagent then spent three rounds cutting its cost, and the branch now includes
+all of tonight's work (`ebb02ba`). The base below is v2 at the time of each
+measurement.
 
-| Workload | v2 | Astra port | Change |
+| Workload | v2 | First port | Final port |
 | --- | ---: | ---: | ---: |
-| Compiler self-compile (arena) | 87.9M | 88.1M | +0.2% |
-| Compiler, system runtime | 361.5M | 397.6M | +10.0% |
-| 20 x 5,000 chain (`acyclic.min`) | 193.3M | 227.1M | +17.5% |
-| 100,000-record linked chain | 168.3M | 201.6M | +19.8% |
-| 100,000 `List<Point>.add` | 46.6M | 57.3M | +23.1% |
+| Compiler on the system runtime | 364.5M | 397.6M (+10%) | 363.6M (~0%) |
+| 100,000 `List<Point>.add` | 46.5M | 57.3M (+23%) | 46.6M (+0.2%) |
+| 20 x 5,000 chain (`acyclic.min`) | 193.3M | 227.1M (+17.5%) | 218.3M (+12.9%) |
+| 100,000-record linked chain | 168.2M | 201.6M (+19.8%) | 189.9M (+12.9%) |
+| Peak memory, linked chain | 12.1 MiB | 21.3 MiB | 18.2 MiB |
 
-Peak memory rose 63-76% on record-heavy programs (chain: 12.1 → 21.3 MiB),
-from a 48-byte header on every List and every record that holds a reference.
-Because of the rule "do not land regressions", it waits for a decision; see
-MORNING.md.
+On the real programs, measured on the final port:
+
+- Minyarcraft is +0.06% and the compiler self-compile +1.0%. Atacama
+  streaming is within noise (14.36-14.73G against 14.34-14.36G).
+- `json.Value` holds `items: List<Value>`, so it counts as a type that can
+  form a cycle. Parsing Atacama's 500-run history response 20 times went from
+  1.22G to 1.57G instructions (+29%), and peak memory rose from 3.0 to
+  3.4 MiB.
+
+What it costs, in the subagent's analysis (`research/cycles/README.md` on the
+branch):
+
+- Objects of self-referential types carry a 32-byte header and keep exact
+  registry and incoming-edge counts, because the first cycle-forming
+  mutation can close a cycle through objects built earlier.
+- Once tracing is on, collection scans the global set of traced objects:
+  about 37,000 instructions per add in a tree-mutation benchmark.
+
+Since the rule tonight was not to land regressions, it stays on its branch.
+If it is merged, telling the compiler that `json.Value` can never form a
+cycle (it is built bottom-up) would remove the JSON cost, but that needs a
+language-level "acyclic" annotation.
