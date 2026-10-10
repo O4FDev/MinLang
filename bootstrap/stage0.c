@@ -1510,8 +1510,8 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
         }
         if (strcmp(expression->text, "fileExists") == 0) {
             temporary = new_temporary(emitter);
-            fprintf(output, "  %%value.%d = call zeroext i1 @minyar_file_exists(ptr %s)\n", temporary,
-                    arguments[0].name);
+            fprintf(output, "  %%value.%d = call zeroext i1 @minyar_file_exists(ptr %s)\n",
+                    temporary, arguments[0].name);
             arrfree(arguments);
             return make_value(TYPE_BOOLEAN, "%%value.%d", temporary);
         }

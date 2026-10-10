@@ -99,8 +99,12 @@ print(doubled)
 ''')
         self.assertEqual(result.returncode, 0, result.stderr)
         generated = llvm.read_text()
-        self.assertEqual(generated.count('call void @minyar_rc_local_move('), 3)
-        self.assertGreaterEqual(generated.count('call ptr @minyar_join_text_take_left('), 3)
+        # The two joins with a literal RHS move the exact local owner. Reading
+        # the same local on the RHS (doubled + doubled) keeps both operands live
+        # and deliberately uses the ordinary join instead.
+        self.assertEqual(generated.count('call void @minyar_rc_local_move_owner('), 2)
+        self.assertEqual(generated.count('call ptr @minyar_join_text_take_left('), 2)
+        self.assertEqual(generated.count('call ptr @minyar_join_text('), 1)
         self.executes('''let text = Text(0)
 let position = 0
 while position < 4096 {
@@ -135,6 +139,33 @@ let borrowed = make("borrowed")
 values[0] = borrowed
 print(values[0])
 ''', 'borrowed!\n')
+
+    def test_aliases_survive_replacement_and_self_reads_at_varied_text_sizes(self):
+        # Exercise immutable aliases at growth boundaries while the RHS
+        # replaces the collection's owner.
+        sources = ['''function overwrite(values: List<Text>, replacement: Text): Text {
+ let prior = values[0]
+ values[0] = replacement
+ return prior
+}
+''']
+        expected = []
+        for size in (1, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256, 1024):
+            prior = 'x' * size + '!'
+            replacement = 'new' + str(size)
+            sources.append(f'''if true {{
+ let values: List<Text> = ["{'x' * size}" + "!"]
+ let alias = values[0]
+ let joined = values[0] + overwrite(values, "new" + Text({size}))
+ print(joined)
+ print(alias)
+ values[0] = values[0] + values[0]
+ print(values[0])
+ print(alias)
+}}
+''')
+            expected.extend((prior + prior, prior, replacement + replacement, prior))
+        self.executes(''.join(sources), '\n'.join(expected) + '\n')
 
 
 if __name__ == '__main__':

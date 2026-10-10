@@ -117,6 +117,19 @@ static void work_bounds(void) {
     minyar_rc_release(bytes);
 }
 
+static void secure_random_lengths(void) {
+    /* CPython URandomTests checks exact lengths including zero. Exercise the
+     * same contract with each runtime allocation/ownership profile. */
+    const long long lengths[] = {0, 1, 16, 17, 255, 256, 1024};
+    for (size_t i = 0; i < sizeof(lengths) / sizeof(*lengths); i++) {
+        MinyarBytes *bytes = minyar_random_bytes(lengths[i]);
+        assert(bytes->byte_length == lengths[i]);
+        assert(bytes->character_length == lengths[i]);
+        assert(bytes->bytes[lengths[i]] == 0);
+        minyar_rc_release(bytes);
+    }
+}
+
 static void measure(void) {
     /* Equivalent steady-state refill work before/after; setup is not timed. */
     MinyarBytes *bytes = minyar_bytes_new(1024 * 1024);
@@ -140,6 +153,7 @@ int main(int argc, char **argv) {
     }
     model();
     work_bounds();
+    secure_random_lengths();
     puts("Bytes model and work bounds passed");
     return 0;
 }
