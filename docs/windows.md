@@ -6,16 +6,25 @@ containers, controls, menu items and tray icons use generation-checked integer
 IDs. Destroying a window invalidates its children and removes their pending
 events. An invalid handle or wrong UI thread is a programmer error.
 
-The core API provides windows, rows, columns, padding, labels, buttons, text
-fields, checkboxes, fonts, window menus, tray menus and taskbar accessory mode.
+The core API provides windows, rows, columns, padding, labels, buttons, password
+and text fields, multiline editors, read-only text views, checkboxes, sliders,
+separators, explicit sizes, enablement, fonts, window menus, tray menus and
+taskbar accessory mode.
 Text is checked UTF-8 and converted through the Unicode Windows APIs.
 Programmatic text changes do not enqueue user edits. `nextEvent(seconds)` waits
-with `MsgWaitForMultipleObjectsEx`; `NONE` means timeout, while `QUIT` is delivered
+with `MsgWaitForMultipleObjectsEx`; `NONE` means no UI event was dispatched, while `QUIT` is delivered
 once before the loop returns false. Actions, edits, close, resize and text-field
 Return use the same event constants as the macOS bridge. Edit events carry
 copied native text; OS callbacks retain no managed Minyar values. Dispatch is
 bounded to 256 Windows messages per iteration, and duplicate pending text edits
 are coalesced. Windows dialog keyboard navigation handles Tab between controls.
+Multiline controls normalize Windows CRLF to LF when returning text. `appendText`
+preserves the selection and suppresses programmatic CHANGE events. Text views
+have a scrolling viewport; `size` sets it explicitly, and zero removes a dimension
+constraint. Sliders require finite increasing ranges and values within them, and
+map the range onto one million native trackbar intervals. Endpoints are exact.
+The [native trackbar contract](https://learn.microsoft.com/en-us/windows/win32/controls/trackbar-controls)
+provides user-driven CHANGE events.
 
 `windows.shareNetworkLoop(loop)` connects an `eventloop` reactor to this same
 UI thread. After every `nextEvent` call, consume `eventloop.wait(loop, 0, maximum)`
@@ -41,7 +50,13 @@ The implementation follows Microsoft's [Winsock event semantics](https://learn.m
 and [GUI wait contract](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-msgwaitformultipleobjectsex).
 
 Windows menu bars belong to a window, so `menu(window, title)` takes the owning
-window. `menuItem` currently requires an empty shortcut string. Tray items use
+window. Menu shortcuts are scoped to that window: `q` means Ctrl+Q; explicit
+Ctrl/Shift/Alt combinations, F1 through F24 and named keys such as Enter are
+supported. Duplicate combinations are programmer errors. Tray menus have no
+focused window, so their shortcuts must be empty. Destroyed and disabled items
+cannot dispatch an accelerator action; IDs are never reused. The message pump
+uses [Windows accelerator translation](https://learn.microsoft.com/en-us/windows/win32/learnwin32/accelerator-tables)
+before dialog navigation and text-field submission. Tray items use
 the application icon; the symbol argument is reserved. Tray notifications use
 full 32-bit native IDs and generation-checked public handles; keyboard activation
 is enabled. Explorer restart recreates registered icons. `accessory(true)` hides
@@ -62,7 +77,8 @@ The shared `desktop.min` API supplies these Windows services:
 
 Missing OS capabilities and rejected notification input are recoverable error
 values. The Linux backend reports unavailable using the same fixed envelopes.
-Advanced macOS-equivalent controls and menu accelerators remain subsequent work.
+The Windows bridge still needs the macOS bridge's richer list, custom drawing,
+theme, constraint and file-dialog APIs for complete UI parity.
 
 ## Persistent notifications and actions
 
@@ -186,6 +202,11 @@ accepted-child event isolation, idle timeout settling, timer cancellation and
 stale reactor generations. Instrumented `WSAPoll` calls prove the GUI wait
 does not poll sockets periodically. Compiled Minyar adapter contracts run in
 debug and release.
+The control fixture additionally verifies native password/multiline/read-only
+styles, Unicode append and line endings, explicit sizing, disabled actions,
+trackbar range/endpoints/notifications, accelerator translation and cancellation
+after destruction. Invalid sizes, nonfinite or out-of-range slider values, wrong
+control kinds, and malformed or duplicate shortcuts must stop with diagnostics.
 
 The notification fixture invokes the real COM activation object from another
 thread and parses real WinRT XML. It covers foreign owners/actions, duplicate

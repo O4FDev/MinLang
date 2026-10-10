@@ -2,11 +2,28 @@
 #include "../minyar_native.h"
 #include <windows.h>
 #include <shellapi.h>
+#include <commctrl.h>
 #include <math.h>
 #include <stdint.h>
 
 /* The UI owns only native memory. Generation checked IDs never expose pointers. */
-enum { WINDOW = 1, COLUMN, ROW, LABEL, BUTTON, FIELD, CHECKBOX, MENU, MENUITEM, TRAY };
+enum {
+    WINDOW = 1,
+    COLUMN,
+    ROW,
+    LABEL,
+    BUTTON,
+    FIELD,
+    CHECKBOX,
+    SECURE,
+    EDITOR,
+    TEXTVIEW,
+    SLIDER,
+    SEPARATOR,
+    MENU,
+    MENUITEM,
+    TRAY
+};
 typedef struct Widget {
     uint32_t generation;
     int kind, padding, spacing, width, height, suppress;
@@ -15,6 +32,10 @@ typedef struct Widget {
     HFONT font;
     HMENU menu, bar;
     UINT tray_id;
+    double minimum, maximum;
+    HACCEL accelerators;
+    ACCEL accelerator;
+    bool disabled;
 } Widget;
 typedef struct Event {
     int type;
@@ -31,6 +52,7 @@ static bool quitting, delivered_quit;
 static bool accessory;
 static HWND tray_window;
 static UINT next_tray = 1, taskbar_created;
+static unsigned next_command = 1;
 static const wchar_t window_class[] = L"MinyarWindowV1";
 #ifdef MINYAR_APP_EVENT_LOOP
 extern bool minyar_net_appLoopWindowsValid(long long);
@@ -154,6 +176,29 @@ static int scaled(Widget *w, int value) {
         ReleaseDC(root(w)->handle, dc);
     return MulDiv(value, dpi, 96);
 }
+static bool editable(const Widget *w) {
+    return w->kind == FIELD || w->kind == SECURE || w->kind == EDITOR;
+}
+static wchar_t *edit_text(Widget *w, const MinyarText *value) {
+    wchar_t *text = wide(value);
+    if (w->kind != EDITOR && w->kind != TEXTVIEW)
+        return text;
+    size_t length = wcslen(text), extra = 0;
+    for (size_t i = 0; i < length; i++)
+        if (text[i] == L'\n' && (!i || text[i - 1] != L'\r'))
+            extra++;
+    wchar_t *out = calloc(length + extra + 1, sizeof(*out));
+    if (!out)
+        fail("windows: allocation failed");
+    size_t at = 0;
+    for (size_t i = 0; i < length; i++) {
+        if (text[i] == L'\n' && (!i || text[i - 1] != L'\r'))
+            out[at++] = L'\r';
+        out[at++] = text[i];
+    }
+    free(text);
+    return out;
+}
 static void measure(Widget *w, int *width, int *height) {
     if (w->kind == COLUMN || w->kind == ROW) {
         int x = 0, y = 0, count = 0;
@@ -181,6 +226,18 @@ static void measure(Widget *w, int *width, int *height) {
         }
         *width = x + 2 * scaled(w, w->padding);
         *height = y + 2 * scaled(w, w->padding);
+        if (w->width)
+            *width = scaled(w, w->width);
+        if (w->height)
+            *height = scaled(w, w->height);
+        return;
+    }
+    if (w->kind == EDITOR || w->kind == TEXTVIEW || w->kind == SLIDER || w->kind == SEPARATOR) {
+        *width = scaled(w, w->width ? w->width : 200);
+        *height = scaled(w, w->height              ? w->height
+                            : w->kind == SEPARATOR ? 2
+                            : w->kind == SLIDER    ? 28
+                                                   : 100);
         return;
     }
     wchar_t *text = read_text(w->handle);
@@ -191,12 +248,16 @@ static void measure(Widget *w, int *width, int *height) {
     SelectObject(dc, old);
     ReleaseDC(w->handle, dc);
     free(text);
-    int extra = w->kind == FIELD ? 24 : (w->kind == LABEL ? 0 : 32);
+    int extra = editable(w) ? 24 : (w->kind == LABEL ? 0 : 32);
     *width = size.cx + scaled(w, extra);
     *height = size.cy + scaled(w, w->kind == LABEL ? 4 : 14);
-    int minimum = scaled(w, w->kind == FIELD ? 120 : 40);
+    int minimum = scaled(w, editable(w) ? 120 : 40);
     if (*width < minimum)
         *width = minimum;
+    if (w->width)
+        *width = scaled(w, w->width);
+    if (w->height)
+        *height = scaled(w, w->height);
 }
 static void arrange(Widget *w, int x, int y, int width, int height) {
     if (w->handle && w->kind != WINDOW) {
@@ -218,7 +279,7 @@ static void arrange(Widget *w, int x, int y, int width, int height) {
             arrange(c, x, y, cw, ch);
             x += cw + spacing;
         } else {
-            arrange(c, x, y, width > 0 ? width : 0, ch);
+            arrange(c, x, y, c->width ? cw : width > 0 ? width : 0, ch);
             y += ch + spacing;
         }
     }
@@ -228,6 +289,38 @@ static void layout(Widget *w) {
     RECT area;
     if (GetClientRect(w->handle, &area))
         arrange(w, 0, 0, area.right, area.bottom);
+}
+static void rebuild_accelerators(Widget *window) {
+    unsigned count = 0;
+    for (size_t i = 0; i < capacity; i++)
+        if (widgets[i].kind == MENUITEM && widgets[i].accelerator.cmd &&
+            root(widgets + i) == window)
+            count++;
+    ACCEL *bindings = count ? calloc(count, sizeof(*bindings)) : NULL;
+    if (count && !bindings)
+        fail("windows: allocation failed");
+    unsigned at = 0;
+    for (size_t i = 0; i < capacity; i++)
+        if (widgets[i].kind == MENUITEM && widgets[i].accelerator.cmd &&
+            root(widgets + i) == window)
+            bindings[at++] = widgets[i].accelerator;
+    HACCEL table = count ? CreateAcceleratorTableW(bindings, (int)count) : NULL;
+    free(bindings);
+    if (count && !table)
+        fail("windows: unable to create accelerators");
+    if (window->accelerators)
+        DestroyAcceleratorTable(window->accelerators);
+    window->accelerators = table;
+}
+static bool translate_accelerator(MSG *message) {
+    if (message->message != WM_KEYDOWN && message->message != WM_SYSKEYDOWN)
+        return false;
+    for (size_t i = 0; i < capacity; i++)
+        if (widgets[i].kind == WINDOW && widgets[i].accelerators &&
+            (message->hwnd == widgets[i].handle || IsChild(widgets[i].handle, message->hwnd)) &&
+            TranslateAcceleratorW(widgets[i].handle, widgets[i].accelerators, message))
+            return true;
+    return false;
 }
 static LRESULT CALLBACK procedure(HWND handle, UINT message, WPARAM wp, LPARAM lp) {
     long long value = (long long)GetWindowLongPtrW(handle, GWLP_USERDATA);
@@ -241,19 +334,33 @@ static LRESULT CALLBACK procedure(HWND handle, UINT message, WPARAM wp, LPARAM l
         if (child) {
             Widget *c = get(child);
             int code = HIWORD(wp);
-            if (!c->suppress && c->kind == FIELD && code == EN_CHANGE)
+            if (!c->suppress && !c->disabled && editable(c) && code == EN_CHANGE)
                 enqueue(2, child, read_text(c->handle));
-            else if (!c->suppress && (c->kind == BUTTON || c->kind == CHECKBOX) &&
+            else if (!c->suppress && !c->disabled && (c->kind == BUTTON || c->kind == CHECKBOX) &&
                      code == BN_CLICKED)
                 enqueue(1, child, NULL);
         }
         return 0;
     }
+    if (message == WM_COMMAND && !lp && HIWORD(wp) == 1 && w) {
+        for (size_t i = 0; i < capacity; i++)
+            if (widgets[i].kind == MENUITEM && widgets[i].accelerator.cmd == LOWORD(wp) &&
+                !widgets[i].disabled && root(widgets + i) == w)
+                enqueue(1, id(widgets + i), NULL);
+        return 0;
+    }
+    if ((message == WM_HSCROLL || message == WM_VSCROLL) && lp) {
+        long long child = (long long)GetWindowLongPtrW((HWND)lp, GWLP_USERDATA);
+        if (child && get(child)->kind == SLIDER && !get(child)->suppress && !get(child)->disabled)
+            enqueue(2, child, NULL);
+        return 0;
+    }
     if (message == WM_MENUCOMMAND) {
         MENUITEMINFOW item = {0};
         item.cbSize = sizeof(item);
-        item.fMask = MIIM_DATA;
-        if (GetMenuItemInfoW((HMENU)lp, (UINT)wp, TRUE, &item) && item.dwItemData)
+        item.fMask = MIIM_DATA | MIIM_STATE;
+        if (GetMenuItemInfoW((HMENU)lp, (UINT)wp, TRUE, &item) && item.dwItemData &&
+            !(item.fState & MFS_DISABLED))
             enqueue(1, (long long)item.dwItemData, NULL);
         return 0;
     }
@@ -352,6 +459,9 @@ void minyar_windows_initialize(const MinyarText *name) {
     if (owner)
         return;
     owner = GetCurrentThreadId();
+    INITCOMMONCONTROLSEX common = {sizeof(common), ICC_BAR_CLASSES};
+    if (!InitCommonControlsEx(&common))
+        fail("windows: unable to initialize common controls");
     WNDCLASSEXW wc = {0};
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = procedure;
@@ -397,15 +507,27 @@ long long minyar_windows_row(long long parent, long long spacing) {
 static long long control(int kind, long long parent, const MinyarText *title, bool checked) {
     long long value = create(kind, parent);
     Widget *w = get(value);
-    wchar_t *text = wide(title);
-    const wchar_t *class_name = kind == FIELD ? L"EDIT" : kind == LABEL ? L"STATIC" : L"BUTTON";
-    DWORD style =
-        WS_CHILD | WS_VISIBLE |
-        (kind == FIELD   ? ES_AUTOHSCROLL | WS_TABSTOP
-         : kind == LABEL ? SS_LEFT
-                         : WS_TABSTOP | (kind == CHECKBOX ? BS_AUTOCHECKBOX : BS_PUSHBUTTON));
-    w->handle = CreateWindowExW(kind == FIELD ? WS_EX_CLIENTEDGE : 0, class_name, text, style, 0, 0,
-                                1, 1, root(w)->handle, NULL, GetModuleHandleW(NULL), NULL);
+    wchar_t *text = edit_text(w, title);
+    bool edit = editable(w) || kind == TEXTVIEW;
+    const wchar_t *class_name = kind == SLIDER                       ? TRACKBAR_CLASSW
+                                : edit                               ? L"EDIT"
+                                : kind == LABEL || kind == SEPARATOR ? L"STATIC"
+                                                                     : L"BUTTON";
+    DWORD style = WS_CHILD | WS_VISIBLE;
+    if (kind == SLIDER)
+        style |= TBS_HORZ | TBS_NOTICKS | WS_TABSTOP;
+    else if (kind == EDITOR || kind == TEXTVIEW)
+        style |= ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP |
+                 (kind == TEXTVIEW ? ES_READONLY : ES_WANTRETURN);
+    else if (edit)
+        style |= ES_AUTOHSCROLL | WS_TABSTOP | (kind == SECURE ? ES_PASSWORD : 0);
+    else if (kind == LABEL || kind == SEPARATOR)
+        style |= kind == SEPARATOR ? SS_ETCHEDHORZ : SS_LEFT;
+    else
+        style |= WS_TABSTOP | (kind == CHECKBOX ? BS_AUTOCHECKBOX : BS_PUSHBUTTON);
+    w->handle =
+        CreateWindowExW(edit && kind != TEXTVIEW ? WS_EX_CLIENTEDGE : 0, class_name, text, style, 0,
+                        0, 1, 1, root(w)->handle, NULL, GetModuleHandleW(NULL), NULL);
     free(text);
     if (!w->handle)
         fail("windows: unable to create control");
@@ -415,6 +537,120 @@ static long long control(int kind, long long parent, const MinyarText *title, bo
         SendMessageW(w->handle, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
     layout(w);
     return value;
+}
+static const MinyarText empty_text = {.bytes = (const unsigned char *)""};
+long long minyar_windows_secureField(long long parent) {
+    return control(SECURE, parent, &empty_text, false);
+}
+long long minyar_windows_textEditor(long long parent, const MinyarText *text) {
+    return control(EDITOR, parent, text, false);
+}
+long long minyar_windows_textView(long long parent, const MinyarText *text) {
+    return control(TEXTVIEW, parent, text, false);
+}
+long long minyar_windows_separator(long long parent) {
+    return control(SEPARATOR, parent, &empty_text, false);
+}
+long long minyar_windows_slider(long long parent, double minimum, double maximum, double value) {
+    if (!isfinite(minimum) || !isfinite(maximum) || minimum >= maximum ||
+        !isfinite(maximum - minimum) || !isfinite(value) || value < minimum || value > maximum)
+        fail("windows: invalid slider range or value");
+    long long handle = control(SLIDER, parent, &empty_text, false);
+    Widget *w = get(handle);
+    w->minimum = minimum;
+    w->maximum = maximum;
+    SendMessageW(w->handle, TBM_SETRANGEMIN, FALSE, 0);
+    SendMessageW(w->handle, TBM_SETRANGEMAX, FALSE, 1000000);
+    SendMessageW(w->handle, TBM_SETPOS, TRUE,
+                 (LPARAM)llround((value - minimum) / (maximum - minimum) * 1000000));
+    return handle;
+}
+void minyar_windows_size(long long handle, long long width, long long height) {
+    thread();
+    if (width < 0 || height < 0 || width > 32768 || height > 32768)
+        fail("windows: invalid explicit size");
+    Widget *w = get(handle);
+    if (w->kind >= MENU || w->kind == WINDOW)
+        fail("windows: size requires a view");
+    w->width = (int)width;
+    w->height = (int)height;
+    layout(w);
+}
+double minyar_windows_value(long long handle) {
+    thread();
+    Widget *w = get(handle);
+    if (w->kind != SLIDER)
+        fail("windows: handle is not a slider");
+    long long position = SendMessageW(w->handle, TBM_GETPOS, 0, 0);
+    return position == 0 ? w->minimum
+           : position == 1000000
+               ? w->maximum
+               : w->minimum + (w->maximum - w->minimum) * (double)position / 1000000;
+}
+void minyar_windows_setValue(long long handle, double value) {
+    thread();
+    Widget *w = get(handle);
+    if (w->kind != SLIDER)
+        fail("windows: handle is not a slider");
+    if (!isfinite(value) || value < w->minimum || value > w->maximum)
+        fail("windows: slider value is outside its range");
+    w->suppress++;
+    SendMessageW(w->handle, TBM_SETPOS, TRUE,
+                 (LPARAM)llround((value - w->minimum) / (w->maximum - w->minimum) * 1000000));
+    w->suppress--;
+}
+void minyar_windows_appendText(long long handle, const MinyarText *text) {
+    thread();
+    Widget *w = get(handle);
+    if (w->kind != EDITOR && w->kind != TEXTVIEW)
+        fail("windows: appendText requires a multiline text control");
+    wchar_t *value = edit_text(w, text);
+    DWORD first = 0, last = 0;
+    SendMessageW(w->handle, EM_GETSEL, (WPARAM)&first, (LPARAM)&last);
+    w->suppress++;
+    SendMessageW(w->handle, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+    SendMessageW(w->handle, EM_REPLACESEL, FALSE, (LPARAM)value);
+    SendMessageW(w->handle, EM_SETSEL, first, last);
+    w->suppress--;
+    free(value);
+}
+void minyar_windows_enabled(long long handle, bool enabled) {
+    thread();
+    Widget *w = get(handle);
+    w->disabled = !enabled;
+    if (w->kind == COLUMN || w->kind == ROW) {
+        for (long long child = w->first; child; child = get(child)->next)
+            minyar_windows_enabled(child, enabled);
+    } else if (w->kind > WINDOW && w->kind < MENU) {
+        EnableWindow(w->handle, enabled);
+    } else if (w->kind == MENUITEM) {
+        HMENU menu = get(w->parent)->menu;
+        for (int i = 0; i < GetMenuItemCount(menu); i++) {
+            MENUITEMINFOW item = {0};
+            item.cbSize = sizeof(item);
+            item.fMask = MIIM_DATA;
+            if (GetMenuItemInfoW(menu, (UINT)i, TRUE, &item) &&
+                item.dwItemData == (ULONG_PTR)handle)
+                EnableMenuItem(menu, (UINT)i, MF_BYPOSITION | (enabled ? MF_ENABLED : MF_DISABLED));
+        }
+    } else
+        fail("windows: enabled requires a control or menu item");
+}
+static long long window_dimension(long long handle, bool horizontal) {
+    thread();
+    Widget *w = get(handle);
+    if (w->kind != WINDOW)
+        fail("windows: handle is not a window");
+    RECT area;
+    if (!GetClientRect(w->handle, &area))
+        fail("windows: unable to read window size");
+    return MulDiv(horizontal ? area.right : area.bottom, 96, scaled(w, 96));
+}
+long long minyar_windows_width(long long handle) {
+    return window_dimension(handle, true);
+}
+long long minyar_windows_height(long long handle) {
+    return window_dimension(handle, false);
 }
 long long minyar_windows_label(long long parent, const MinyarText *text) {
     return control(LABEL, parent, text, false);
@@ -441,7 +677,7 @@ void minyar_windows_setText(long long value, const MinyarText *text) {
     Widget *w = get(value);
     if (!w->handle)
         fail("windows: container has no text");
-    wchar_t *s = wide(text);
+    wchar_t *s = edit_text(w, text);
     w->suppress++;
     SetWindowTextW(w->handle, s);
     w->suppress--;
@@ -454,6 +690,13 @@ MinyarText *minyar_windows_text(long long value) {
     if (!w->handle)
         fail("windows: container has no text");
     wchar_t *s = read_text(w->handle);
+    if (w->kind == EDITOR || w->kind == TEXTVIEW) {
+        size_t write = 0;
+        for (size_t read = 0; s[read]; read++)
+            if (s[read] != L'\r' || s[read + 1] != L'\n')
+                s[write++] = s[read];
+        s[write] = 0;
+    }
     MinyarText *out = narrow(s);
     free(s);
     return out;
@@ -573,11 +816,14 @@ static void destroy(long long value) {
     }
     if (w->font)
         DeleteObject(w->font);
+    if (w->accelerators)
+        DestroyAcceleratorTable(w->accelerators);
     w->kind = 0;
 }
 void minyar_windows_destroy(long long value) {
     thread();
     Widget *w = get(value);
+    long long window = id(root(w));
     if (w->parent) {
         Widget *p = get(w->parent);
         long long previous = 0;
@@ -591,6 +837,8 @@ void minyar_windows_destroy(long long value) {
             p->last = previous;
     }
     destroy(value);
+    if (window != value && get(window)->kind == WINDOW)
+        rebuild_accelerators(get(window));
 }
 void minyar_windows_quit(void) {
     thread();
@@ -626,22 +874,95 @@ long long minyar_windows_menu(long long window, const MinyarText *title) {
     DrawMenuBar(parent->handle);
     return value;
 }
+static ACCEL parse_accelerator(const MinyarText *raw) {
+    ACCEL accelerator = {0};
+    if (!raw->byte_length)
+        return accelerator;
+    if (raw->byte_length < 0 || raw->byte_length > 64)
+        fail("windows: invalid menu shortcut");
+    wchar_t *text = wide(raw);
+    if (wcslen(text) > 64)
+        fail("windows: invalid menu shortcut");
+    wchar_t *key = text;
+    wchar_t *plus;
+    BYTE flags = FVIRTKEY;
+    bool modifier = false;
+    while ((plus = wcschr(key, L'+'))) {
+        *plus = 0;
+        BYTE flag = !_wcsicmp(key, L"Ctrl")    ? FCONTROL
+                    : !_wcsicmp(key, L"Shift") ? FSHIFT
+                    : !_wcsicmp(key, L"Alt")   ? FALT
+                                               : 0;
+        if (!flag || (flags & flag))
+            fail("windows: invalid menu shortcut");
+        flags |= flag;
+        modifier = true;
+        key = plus + 1;
+    }
+    WORD virtual_key = 0;
+    if (key[0] && !key[1] &&
+        ((key[0] >= L'a' && key[0] <= L'z') || (key[0] >= L'A' && key[0] <= L'Z') ||
+         (key[0] >= L'0' && key[0] <= L'9'))) {
+        virtual_key = key[0] >= L'a' && key[0] <= L'z' ? key[0] - L'a' + L'A' : key[0];
+        if (!modifier)
+            flags |= FCONTROL;
+    } else if ((key[0] == L'F' || key[0] == L'f') && key[1]) {
+        wchar_t *end;
+        long number = wcstol(key + 1, &end, 10);
+        if (*end || number < 1 || number > 24)
+            fail("windows: invalid menu shortcut");
+        virtual_key = (WORD)(VK_F1 + number - 1);
+    } else {
+        struct {
+            const wchar_t *name;
+            WORD key;
+        } named[] = {{L"Enter", VK_RETURN}, {L"Escape", VK_ESCAPE}, {L"Space", VK_SPACE},
+                     {L"Tab", VK_TAB},      {L"Delete", VK_DELETE}, {L"Backspace", VK_BACK},
+                     {L"Home", VK_HOME},    {L"End", VK_END},       {L"Left", VK_LEFT},
+                     {L"Right", VK_RIGHT},  {L"Up", VK_UP},         {L"Down", VK_DOWN}};
+        for (size_t i = 0; i < sizeof(named) / sizeof(named[0]); i++)
+            if (!_wcsicmp(key, named[i].name))
+                virtual_key = named[i].key;
+    }
+    free(text);
+    if (!virtual_key)
+        fail("windows: invalid menu shortcut");
+    accelerator.fVirt = flags;
+    accelerator.key = virtual_key;
+    return accelerator;
+}
 long long minyar_windows_menuItem(long long menu, const MinyarText *title, const MinyarText *key) {
     thread();
     if (get(menu)->kind != MENU)
         fail("windows: handle is not a menu");
-    if (key->byte_length)
-        fail("windows: menu shortcuts require an explicit accelerator binding");
+    ACCEL accelerator = parse_accelerator(key);
+    Widget *window = root(get(menu));
+    if (accelerator.key && window->kind != WINDOW)
+        fail("windows: menu shortcuts require a window");
+    for (size_t i = 0; i < capacity; i++)
+        if (accelerator.key && widgets[i].kind == MENUITEM && root(widgets + i) == window &&
+            widgets[i].accelerator.key == accelerator.key &&
+            widgets[i].accelerator.fVirt == accelerator.fVirt)
+            fail("windows: duplicate menu shortcut");
+    if (accelerator.key && next_command > 65535)
+        fail("windows: accelerator command space exhausted");
+    if (accelerator.key)
+        accelerator.cmd = (WORD)next_command++;
     long long value = create(MENUITEM, menu);
     wchar_t *text = wide(title);
     MENUITEMINFOW item = {0};
     item.cbSize = sizeof(item);
-    item.fMask = MIIM_STRING | MIIM_DATA;
+    item.fMask = MIIM_STRING | MIIM_DATA | MIIM_ID;
     item.dwTypeData = text;
     item.dwItemData = (ULONG_PTR)value;
+    item.wID = accelerator.cmd;
     if (!InsertMenuItemW(get(menu)->menu, (UINT)-1, TRUE, &item))
         fail("windows: unable to append menu item");
     free(text);
+    get(value)->accelerator = accelerator;
+    window = root(get(value));
+    if (accelerator.key)
+        rebuild_accelerators(window);
     return value;
 }
 void minyar_windows_menuSeparator(long long menu) {
@@ -794,9 +1115,12 @@ bool minyar_windows_nextEvent(double seconds) {
                 return true;
             if (message.message == WM_QUIT)
                 minyar_windows_quit();
-            else if (message.message == WM_KEYDOWN && message.wParam == VK_RETURN) {
+            else if (translate_accelerator(&message)) {
+                // TranslateAccelerator synchronously queued its native action.
+            } else if (message.message == WM_KEYDOWN && message.wParam == VK_RETURN) {
                 long long value = (long long)GetWindowLongPtrW(GetFocus(), GWLP_USERDATA);
-                if (value && get(value)->kind == FIELD)
+                if (value && !get(value)->disabled &&
+                    (get(value)->kind == FIELD || get(value)->kind == SECURE))
                     enqueue(6, value, read_text(get(value)->handle));
                 else {
                     TranslateMessage(&message);
@@ -877,5 +1201,9 @@ HWND minyar_windows_testHandle(long long value) {
 HMENU minyar_windows_testMenu(long long value) {
     thread();
     return get(value)->menu;
+}
+HACCEL minyar_windows_testAccelerators(long long value) {
+    thread();
+    return get(value)->accelerators;
 }
 #endif
