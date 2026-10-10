@@ -16,6 +16,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 from cycle_runtime import engine_source
+sys.path.insert(0, str(ROOT / 'tests'))
+from clang_helpers import windows_host
 
 
 def run(command, **kwargs):
@@ -38,14 +40,16 @@ def main():
                 'fixed': ['-DMINYAR_BOUNDED_HEAP=1'],
                 'lazy': ['-DMINYAR_BOUNDED_HEAP=1', '-DMINYAR_LAZY_HEAP=1'],
                 'eager': []}
-    if platform.system() == 'Windows':
+    if windows_host():
         profiles.pop('lazy')
     for profile, flags in profiles.items():
         budgets = (32,) if profile == 'eager' else ((1, 32) if args.quick else (1, 2, 7, 32, 1024))
         for budget in budgets:
-            for sanitize in (False, True):
+            # MinGW has no sanitizer runtime; native Windows still exercises
+            # every supported heap/budget/seed and exact independent oracle.
+            for sanitize in ((False,) if windows_host() else (False, True)):
                 label = profile + '-k' + str(budget) + ('-sanitize' if sanitize else '-native')
-                binary = output / label
+                binary = output / (label + ('.exe' if windows_host() else ''))
                 options = (['-O1', '-g', '-fsanitize=address,undefined', '-fno-omit-frame-pointer']
                            if sanitize else ['-O2'])
                 options += ['-std=c11', '-Wall', '-Wextra', '-Werror', '-iquote', str(ROOT / 'runtime'),

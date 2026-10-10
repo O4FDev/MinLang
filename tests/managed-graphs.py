@@ -11,7 +11,7 @@ from pathlib import Path
 import unittest
 
 from regressions import CompilerTestCase, COMPILER, ROOT, CLANG, LINK_FLAGS
-from clang_helpers import clang_command
+from clang_helpers import clang_command, windows_host
 from llvm_sanitizer import prepare_llvm_for_link, address_sanitizer_enabled
 import sys
 sys.path.insert(0, str(ROOT / 'tools'))
@@ -55,7 +55,7 @@ class ManagedGraphs(CompilerTestCase):
         self.assertEqual(compiled.returncode, 0, compiled.stderr)
         for optimization in optimizations:
             with self.subTest(optimization=optimization):
-                executable = llvm.with_suffix('.' + optimization[1:])
+                executable = llvm.with_suffix('.' + optimization[1:] + ('.exe' if windows_host() else ''))
                 linked = self.evidence.run(clang_command([CLANG, optimization, *LINK_FLAGS,
                             '-Wno-override-module', str(llvm), str(runtime),
                             '-o', str(executable)]), capture_output=True, text=True,

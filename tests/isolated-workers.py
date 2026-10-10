@@ -4,7 +4,7 @@ import unittest
 import struct
 import os
 from regressions import CompilerTestCase, ROOT, CLANG, LINK_FLAGS
-from clang_helpers import clang_command
+from clang_helpers import clang_command, windows_host
 from pathlib import Path
 
 WORKER_RUNTIME = Path(os.environ.get('MINYAR_WORKER_RUNTIME', ROOT / 'build/minyar-default-runtime.o'))
@@ -14,7 +14,7 @@ class IsolatedWorkers(CompilerTestCase):
     compiler_arguments = ('--library', str(ROOT / 'library'))
 
     def worker_program(self, source, expected):
-        if os.name == 'nt': self.skipTest('Windows process workers report recoverable unavailable')
+        if windows_host(): self.skipTest('Windows process workers report recoverable unavailable')
         result, llvm = self.compile(source)
         self.assertEqual(result.returncode, 0, result.stderr)
         executable = llvm.with_suffix('.exe')
@@ -117,7 +117,7 @@ if workers.isWorker() {
 ''', '1\n3\n0\n1\nfalse\nfalse\n')
 
     def test_backpressure_accepts_no_partial_frame_and_close_releases_queue(self):
-        if os.name == 'nt': self.skipTest('Windows process workers report recoverable unavailable')
+        if windows_host(): self.skipTest('Windows process workers report recoverable unavailable')
         waiting = self.directory / 'waiting.c'
         waiting.write_text('#include <unistd.h>\nint main(void) { for (;;) pause(); }\n')
         child = waiting.with_suffix('.exe')
@@ -138,7 +138,7 @@ print(errors.booleanValue(workers.close(worker)))
 ''', 'true\ntrue\nfalse\ntrue\n1\ntrue\n')
 
     def test_every_truncated_frame_prefix_and_oversized_header(self):
-        if os.name == 'nt': self.skipTest('Windows process workers report recoverable unavailable')
+        if windows_host(): self.skipTest('Windows process workers report recoverable unavailable')
         source = '''use "workers" as workers
 use "errors" as errors
 let result = workers.readMessage()
@@ -164,7 +164,7 @@ workers.reply(status)
                 self.assertEqual(run.returncode, 0, run.stderr)
                 self.assertEqual(run.stdout, struct.pack('<I', 1) + bytes((status,)))
 
-    @unittest.skipUnless(os.name == 'nt', 'Windows unavailable backend contract')
+    @unittest.skipUnless(windows_host(), 'Windows unavailable backend contract')
     def test_windows_unavailable_is_a_value(self):
         compiled, llvm = self.compile('''use "workers" as workers
 use "errors" as errors

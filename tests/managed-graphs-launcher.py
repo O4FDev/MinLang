@@ -9,6 +9,7 @@ import os
 import shutil
 import unittest
 from regressions import CompilerTestCase, ROOT, CLANG
+from clang_helpers import windows_host
 
 
 SOURCE = '''use "eventcallbacks" as callbacks
@@ -39,7 +40,7 @@ class ManagedGraphLauncher(CompilerTestCase):
     def launcher(self, source, options, *, execute=True):
         self.serial += 1
         path = self.directory / f'program-{self.serial}.min'
-        output = self.directory / (f'program-{self.serial}' + ('.exe' if os.name == 'nt' else ''))
+        output = self.directory / (f'program-{self.serial}' + ('.exe' if windows_host() else ''))
         path.write_text(source)
         environment = os.environ.copy()
         # Use the tested LLVM without forcing the configurable-runtime path.
@@ -79,11 +80,11 @@ class ManagedGraphLauncher(CompilerTestCase):
             ('--memory-profile', 'eager'),
         ))
 
-    @unittest.skipIf(os.name == 'nt', 'existing lazy heap uses POSIX mmap')
+    @unittest.skipIf(windows_host(), 'existing lazy heap uses POSIX mmap')
     def test_debug_and_release_preserve_lazy_heap_policy(self):
         self.check_profiles((('--memory-profile', 'lazy', '--cleanup-budget', '1', '--heap-bytes', '1048576'),))
 
-    @unittest.skipIf(os.name == 'nt', 'incremental launcher requires macOS/Linux')
+    @unittest.skipIf(windows_host(), 'incremental launcher requires macOS/Linux')
     def test_incremental_driver_preserves_parsed_fallback_and_check_mode(self):
         self.launcher(SOURCE, ('--incremental', '--debug'))
         self.launcher(SOURCE, ('--incremental', '--check'), execute=False)

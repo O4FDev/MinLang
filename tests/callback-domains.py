@@ -8,6 +8,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 from cycle_runtime import engine_source
+sys.path.insert(0, str(ROOT / 'tests'))
+from clang_helpers import windows_host
 
 
 def main():
@@ -15,12 +17,13 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     (ROOT / 'build/managed-graphs-engine.c').write_text(engine_source(ROOT))
     clang = os.environ.get('MINYAR_TEST_CLANG', 'clang')
-    for sanitize in (False, True):
-        binary = output / ('sanitize' if sanitize else 'native')
+    # MinGW lacks the ASan/UBSan runtime; Linux/macOS retain both checks.
+    for sanitize in ((False,) if windows_host() else (False, True)):
+        binary = output / (('sanitize' if sanitize else 'native') + ('.exe' if windows_host() else ''))
         flags = ['-O1', '-g', '-fsanitize=address,undefined', '-fno-omit-frame-pointer'] if sanitize else ['-O2']
         command = [clang, *flags, '-std=c11', '-Wall', '-Wextra', '-Werror', '-DMINYAR_SYSTEM_HEAP=1',
             '-iquote', str(ROOT / 'runtime'), str(ROOT / 'tests/callback-domains.c'), '-o', str(binary)]
-        if os.name != 'nt': command += ['-pthread', '-lm']
+        if not windows_host(): command += ['-pthread', '-lm']
         compiled = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=30)
         if compiled.returncode: raise AssertionError(compiled.stdout + compiled.stderr)
         for mode in ('', 'callback', 'environment'):

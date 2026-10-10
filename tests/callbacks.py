@@ -11,7 +11,7 @@ import importlib.util
 import os
 import subprocess
 from regressions import CompilerTestCase, ROOT, CLANG, LINK_FLAGS
-from clang_helpers import clang_command
+from clang_helpers import clang_command, windows_host
 from llvm_sanitizer import prepare_llvm_for_link, address_sanitizer_enabled
 import sys
 sys.path.insert(0, str(ROOT / 'tools'))
@@ -48,10 +48,12 @@ class Callbacks(CompilerTestCase):
         self.assertEqual(compiled.returncode, 0, compiled.stderr)
         for optimization in optimizations:
             with self.subTest(optimization=optimization):
-                executable = llvm.with_suffix('.' + optimization[1:])
+                executable = llvm.with_suffix('.' + optimization[1:] + ('.exe' if windows_host() else ''))
+                native_sources = getattr(self, 'native_sources', ())
+                native_flags = ['-lws2_32'] if windows_host() and native_sources else []
                 linked = self.evidence.run(clang_command([CLANG, optimization, *LINK_FLAGS,
                     '-Wno-override-module', str(llvm), str(runtime),
-                    *getattr(self, 'native_sources', ()), '-o', str(executable)]),
+                    *native_sources, *native_flags, '-o', str(executable)]),
                     capture_output=True, text=True, timeout=30, phase='link-callback-ownership')
                 self.assertEqual(linked.returncode, 0, linked.stderr)
                 run = self.evidence.run([str(executable)], capture_output=True, timeout=30,
@@ -59,6 +61,26 @@ class Callbacks(CompilerTestCase):
                 self.assertEqual(run.returncode, 0, run.stderr)
                 self.assertEqual(run.stdout, expected.encode())
                 self.assertEqual(run.stderr, b'')
+
+    def test_native_loop_borrow_has_stable_identity_and_rejects_closed_dispatcher(self):
+        self.native_sources = (str(ROOT / 'runtime/native/net.c'),)
+        self.executes('''use "eventcallbacks" as callbacks
+use "eventloop" as eventloop
+use "errors" as errors
+let dispatcher = callbacks.value(callbacks.create())
+let first = callbacks.nativeLoop(dispatcher)
+let second = callbacks.nativeLoop(dispatcher)
+print(errors.integerOk(first))
+print(errors.integerValue(first) == errors.integerValue(second))
+let ready = eventloop.timer(errors.integerValue(first), 0, 0, 7)
+print(errors.integerOk(ready))
+print(eventloop.events(eventloop.wait(errors.integerValue(first), 0, 8)).length)
+print(errors.booleanOk(callbacks.close(dispatcher)))
+let closed = callbacks.nativeLoop(dispatcher)
+print(errors.integerOk(closed))
+print(errors.code(errors.integerError(closed)) == errors.closedCode())
+print(errors.integerOk(first))
+''', 'true\ntrue\ntrue\n1\ntrue\nfalse\ntrue\ntrue\n')
 
     def test_scalar_and_reference_captures_escape_creator(self):
         self.executes('''record Box { value: Integer }

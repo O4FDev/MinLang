@@ -99,6 +99,12 @@ analysis includes callback/environment edges before selecting traced stores.
 
 `eventcallbacks` layers callbacks on the existing `eventloop` batch module.
 Ordinary batch-loop users do not import callable types or select the extension.
+`eventcallbacks.nativeLoop(dispatcher)` returns an `errors.IntegerResult` with
+a borrowed native loop identity while the dispatcher is open. This lets an
+AppKit observer share its wait source; callbacks still run through
+`dispatch(dispatcher, 0, maxEvents)` on the owner thread. Detach platform
+observers before closing the dispatcher, and do not close the borrowed loop or
+change its registrations. A closed dispatcher returns a recoverable error.
 Dispatch uses direct slot tokens and native registration identities to reject
 stale events. Cancellation releases captures; one-shot timers retire before
 calling their callback; callbacks selected into a returned batch stay alive
