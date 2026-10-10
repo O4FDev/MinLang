@@ -24,6 +24,12 @@ This saves `build/performance-baseline.json`. Later runs fail when measurements
 exceed the configured tolerance. Compare runs on the same host with the same
 build configuration.
 
+The [cycle-collection study](../research/cycles/README.md#measurements-and-findings)
+compares retired instructions with the pre-collector revision, including arena
+and system-runtime self-compilation, acyclic workloads, and cyclic pool reuse.
+It preserves raw samples and reproduction commands, and records the absolute
+budget gate's failure on both that baseline and this branch.
+
 ## Absolute compiler budget
 
 `check-budget` enforces fixed ceilings on self-compilation wall time, CPU time,

@@ -18,8 +18,7 @@ from clang_helpers import clang_command
 SOURCE = ROOT / 'compiler/compiler.min'
 RUNTIME = ROOT / 'build/ownership-runtime.o'
 TARGETS = {
-    'cycle': ('recursive-data.py',
-              'RecursiveData.test_direct_self_cycle_add_and_overwrite_rejected'),
+    'cycle-hint': ('cycles.py', 'Cycles.test_list_only_cycle'),
     'literal-owner': ('recursive-data.py',
                       'RecursiveData.test_literal_retains_earlier_projection_before_later_mutation'),
     'context': ('production-memory.py',
@@ -35,12 +34,12 @@ def replace_once(source: str, before: str, after: str, name: str) -> str:
 
 
 def mutate(original: str, name: str) -> str:
-    if name == 'cycle':
+    if name == 'cycle-hint':
         return replace_once(original,
-            'function checkListMutation(listType: Integer, counts: List<Integer>, '
-            'fields: List<Integer>, returnTypes: List<Integer>) {',
-            'function checkListMutation(listType: Integer, counts: List<Integer>, '
-            'fields: List<Integer>, returnTypes: List<Integer>) {\n    return', name)
+            'function listMutationMayCycle(listType: Integer, counts: List<Integer>, '
+            'fields: List<Integer>, returnTypes: List<Integer>): Boolean {',
+            'function listMutationMayCycle(listType: Integer, counts: List<Integer>, '
+            'fields: List<Integer>, returnTypes: List<Integer>): Boolean {\n    return false', name)
     if name == 'literal-owner':
         start = original.index('function parseListLiteral(')
         end = original.index('\nfunction parseAtom(', start)
@@ -111,7 +110,7 @@ def main() -> None:
             output = result.stdout + result.stderr
             test_name = TARGETS[name][1].split('.')[-1]
             expected = {
-                'cycle': 'AssertionError: 0 != 1',
+                'cycle-hint': 'rc_object_count == rc_immortal_object_count',
                 'literal-owner': 'AddressSanitizer: heap-use-after-free',
                 'context': 'an argument passed to nodes has the wrong type',
             }[name]

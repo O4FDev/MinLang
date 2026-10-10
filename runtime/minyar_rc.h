@@ -7,12 +7,14 @@
 #if (defined(MINYAR_SYSTEM_HEAP) || defined(MINYAR_BOUNDED_HEAP)) && !defined(MINYAR_COMPILER_ARENA)
 #define MINYAR_BOUNDED_RC 1
 #endif
-/* Compiler-inserted reference counting. There is no heap tracing or cycle
- * collector. Potentially cyclic List mutations are rejected before codegen.
+/* Compiler-inserted reference counting. An incremental snapshot tracer
+ * reclaims cyclic garbage; ordinary acyclic destruction remains count-driven.
  * Counts belong to locals, expression temporaries and typed container slots.
  * Runtime constructors return one owned reference; Text literals and caches are immortal.
  * The compiler's process-lifetime arena compiles ownership operations away. */
 #ifdef MINYAR_COMPILER_ARENA
+void minyar_rc_cycle_policy(void) {}
+void minyar_rc_enable_cycles(void) {}
 void minyar_rc_enter(long long locals) { (void)locals; }
 void minyar_rc_leave(void) {}
 void minyar_rc_keep(void *value) { (void)value; }
@@ -106,16 +108,21 @@ static inline size_t rc_service_pending(size_t budget) {
 #define RC_DEALLOCATE(pointer) free(pointer)
 #endif
 
+#include "minyar_cycles.h"
+
 static void *rc_allocate_object(size_t size, unsigned kind) {
 #ifdef MINYAR_BOUNDED_RC
     rc_service_pending(MINYAR_RC_POLL_BUDGET);
 #endif
-    if (size > SIZE_MAX - sizeof(RcObject)) out_of_memory();
-    RcObject *object = RC_ALLOCATE(sizeof(*object) + size);
-    if (!object) out_of_memory();
+    size_t extra = rc_cycle_storage(kind) ? sizeof(RcCycle) : 0;
+    if (size > SIZE_MAX - sizeof(RcObject) - extra) out_of_memory();
+    void *allocation = RC_ALLOCATE(extra + sizeof(RcObject) + size);
+    if (!allocation) out_of_memory();
+    RcObject *object = (RcObject *)((unsigned char *)allocation + extra);
     object->ownership = 8 | kind;
+    if (extra) *rc_cycle_metadata(object) = (RcCycle){0};
     RC_ACCOUNT(rc_object_count++);
-    RC_ACCOUNT(rc_bytes += sizeof(*object) + size);
+    RC_ACCOUNT(rc_bytes += extra + sizeof(*object) + size);
     return object + 1;
 }
 
@@ -164,6 +171,7 @@ void minyar_rc_retain(void *value) {
     if (object->ownership > SIZE_MAX - 8)
         minyar_stop("this value has too many references.");
     object->ownership += 8;
+    rc_cycle_shade(rc_cycle_value(value));
 }
 
 #ifdef MINYAR_BOUNDED_RC
@@ -173,8 +181,11 @@ static void rc_drop(void *value) {
     if (!value) return;
     RcObject *object = (RcObject *)value - 1;
     if (!(object->ownership >> 3)) return;
+    rc_cycle_before_drop(object);
     object->ownership -= 8;
-    if (object->ownership >> 3) return;
+    if (object->ownership >> 3) { rc_cycle_after_drop(object); return; }
+    if (rc_cycle_defer_zero(object)) return;
+    if (rc_cycle_value(value)) rc_cycle_unregister(object);
     unsigned kind = object->ownership & 7;
     MinyarText *text_backing = NULL;
     /* Leaves can be destroyed immediately, without recursion or queue space.
@@ -189,12 +200,13 @@ static void rc_drop(void *value) {
         MinyarList *list = (MinyarList *)(object + 1);
         rc_free_data(list->values);
         RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(*list));
-    } else if (kind == RC_SCALAR_RECORD) {
+    } else if (kind == RC_SCALAR_RECORD ||
+               (kind == RC_RECORD && rc_cycle_metadata(object)->cleared)) {
 #ifdef MINYAR_RC_TESTING
         MinyarRecord *record = (MinyarRecord *)(object + 1);
 #endif
         RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(MinyarRecord)
-                               + (size_t)record->length * sizeof(long long));
+                               + (size_t)record->length * (sizeof(long long) + (kind == RC_RECORD)));
     } else {
         if (rc_pending_count == rc_pending_capacity) {
             size_t capacity = rc_pending_capacity ? rc_pending_capacity * 2 : 64;
@@ -209,7 +221,7 @@ static void rc_drop(void *value) {
         return;
     }
     RC_ACCOUNT(rc_object_count--);
-    free(object);
+    rc_cycle_free_object(object, kind);
     /* Views point directly at an owning root, never at another view. */
     if (text_backing) rc_drop(text_backing);
 }
@@ -222,24 +234,34 @@ void minyar_rc_release(void *value) {
         unsigned kind = object->ownership & 7;
         if (kind == RC_REFERENCES) {
             MinyarList *list = (MinyarList *)(object + 1);
-            for (long long i = 0; i < list->length; i++)
-                rc_drop((void *)(uintptr_t)list->values[i]);
+            for (long long i = 0; i < list->length; i++) {
+                void *child = (void *)(uintptr_t)list->values[i];
+                rc_cycle_edge_remove(child);
+                rc_drop(child);
+            }
             rc_free_data(list->values);
             RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(*list));
         } else {
             MinyarRecord *record = (MinyarRecord *)(object + 1);
             unsigned char *references = (unsigned char *)(record->values + record->length);
             for (long long i = 0; i < record->length; i++)
-                if (references[i]) rc_drop((void *)(uintptr_t)record->values[i]);
+                if (references[i]) {
+                    void *child = (void *)(uintptr_t)record->values[i];
+                    rc_cycle_edge_remove(child);
+                    rc_drop(child);
+                }
             RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(*record)
                                    + (size_t)record->length * (sizeof(long long) + 1));
         }
         RC_ACCOUNT(rc_object_count--);
-        free(object);
+        rc_cycle_free_object(object, kind);
     }
+    rc_cycle_eager_service(value ? 32 : SIZE_MAX);
 }
 
 #endif
+
+#include "minyar_cycles_collect.h"
 
 void minyar_rc_step(void);
 void minyar_rc_enter(long long locals) {
@@ -321,6 +343,7 @@ void minyar_rc_leave(void) {
     rc_frames = frame->previous;
     frame->previous = rc_free_frames;
     rc_free_frames = frame;
+    if (!rc_frames) rc_cycle_eager_service(SIZE_MAX);
 #endif
 }
 
@@ -404,6 +427,7 @@ void minyar_rc_step(void) {
 #else
     while (frame->temporary_count)
         minyar_rc_release(frame->temporaries[--frame->temporary_count]);
+    rc_cycle_eager_service(32);
 #endif
 }
 #endif

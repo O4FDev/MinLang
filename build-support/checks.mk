@@ -186,7 +186,7 @@ check-examples: build/stage0 build/minyarc build/compiler-stage3.ll build/hello 
 	! ./build/minyarc tests/errors/record-wrong-field-type.min build/invalid.ll 2> build/record-type-error.txt
 	grep -q "record field 'age' has the wrong type" build/record-type-error.txt
 	! ./build/minyarc tests/errors/record-field-assignment.min build/invalid.ll 2> build/record-immutable-error.txt
-	grep -q "assigning this field could create a reference cycle" build/record-immutable-error.txt
+	grep -q "record field.*needs" build/record-immutable-error.txt
 	! ./build/integer-overflow > /dev/null 2> build/overflow-error.txt
 	grep -q "Integer calculation is outside" build/overflow-error.txt
 	! ./build/divide-by-zero > /dev/null 2> build/division-error.txt
@@ -550,3 +550,17 @@ check-sanitize: check-peer-semantics-sanitize check-memory-regressions-sanitize
 check-tls: build/minyarc
 	$(LIMITED) python3 tests/tls-local.py
 check: check-tls
+
+.PHONY: check-cycles check-cycle-profiles
+build/cycles-runtime: tests/cycles-runtime.c runtime/minyar_runtime.c $(RUNTIME_HEADERS) | build
+	$(LIMITED) $(LLVM_CC) $(CFLAGS) -DMINYAR_SYSTEM_HEAP=1 -DMINYAR_RC_POLL_BUDGET=1 $< -o $@
+
+check-cycles: build/minyarc build/minyar-runtime.o build/cycles-runtime
+	$(LIMITED) python3 tests/cycles.py
+	$(LIMITED) ./build/cycles-runtime
+
+check-cycle-profiles: build/minyarc
+	$(SANITIZER_LIMITED) python3 tests/cycles-profiles.py
+
+check-cycles: check-cycle-profiles
+check: check-cycles

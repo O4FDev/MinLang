@@ -162,8 +162,8 @@ an annotation. Literal elements are evaluated from left to right; a comma
 separates elements, and a trailing comma is allowed.
 
 A List is a reference value: aliases observe the same additions and indexed
-replacements, including those performed by functions. Mutations that could
-create an ownership cycle are rejected, as described below. Reading or writing
+replacements, including those performed by functions. Mutations may create
+reference cycles; cyclic garbage is reclaimed automatically. Reading or writing
 outside a List's bounds stops with a clear error.
 
 `Bytes` holds packed binary data, such as file contents, compact tables or
@@ -209,49 +209,36 @@ generator: `arc4random_buf` on macOS and the BSDs, `getrandom` on Linux,
 ## Memory lifetime
 
 Text, List, and record values are reclaimed automatically through reference
-counting. Expression temporaries are released between statements; locals retain
-their values until reassignment or scope exit. Aliases keep shared values alive.
+counting and incremental cycle collection. Expression temporaries are released
+between statements; locals retain values until reassignment or scope exit.
+Aliases keep shared values alive, including references in cyclic graphs.
 
-Recursive records and acyclic recursive values are supported. Their structural
-Lists are built with literals rather than later mutation:
+Recursive and mutually recursive records support ordinary shared mutation:
 
 ```minyar
 record Node { value: Integer; children: List<Node> }
 let leaf = Node { value: 1; children: [] }
-let root = Node { value: 2; children: [leaf, leaf] }
+let root = Node { value: 2; children: [leaf] }
+leaf.children.add(root)
+root.children[0] = root
+root.children = [leaf, root]
 print(root.children[0].value) // 1
 ```
 
-For a mutation of `List<T>`, the compiler rejects `.add` and indexed replacement
-if `T` can lead back to that same `List<T>` type through fields or nested Lists.
-This prevents cycles even through aliases and helper functions. In the example,
-mutating any `List<Node>` is rejected, including an append that would happen to
-be safe. `list.appended(value)` returns a fresh List with the additional value,
-so recursive children can be accumulated safely by reassigning a local:
+Lists and record fields own their referenced values. A cycle remains alive while
+reachable from a local, parameter, expression temporary, or another live object;
+it is reclaimed after those owners disappear and cleanup advances. Programs do
+not need weak annotations or explicit collection calls.
 
-```minyar
-let children: List<Node> = []
-children = children.appended(leaf)
-let root = Node { value: 2; children: children }
-```
+`list.appended(value)` returns a fresh List containing the existing elements and
+the added value. This is a linear-time copy; repeated use is quadratic. Use
+`.add` when shared in-place mutation is intended, including for recursive Lists.
 
-The operation copies the existing elements and is therefore linear in the List
-length; repeated use is quadratic. List literals remain preferable when all
-children are already known. Constructing a new List and reassigning a local
-cannot introduce the first cycle because that new List did not exist while its
-elements were evaluated.
-Unrelated mutable Lists, such as an Integer payload or an external worklist of
-wrappers that Node cannot reach, retain their usual shared behaviour.
-
-Arbitrary cyclic graphs require another representation, such as Integer identifiers;
-see the [graph example](../examples/graph.min). The [recursive tree
-example](../examples/recursive-tree.min) demonstrates recursive construction
-and traversal. The [runtime memory contract](runtime-memory.md) explains the
-mutation rule and its acyclicity argument.
-
-Freeing a large graph can take time proportional to its size. See
-[runtime profiles](bounded-runtime-contract.md) for incremental cleanup and
-finite-heap options.
+Large graphs take total cleanup work proportional to the edges examined. The
+default runtime spreads both destruction and cycle tracing over bounded service
+batches. See [runtime profiles](bounded-runtime-contract.md) for work accounting
+and finite-heap options, and [automatic ownership](runtime-memory.md) for the
+compiler/runtime contract.
 
 ## Records
 
@@ -292,10 +279,9 @@ print(player.age) // 37
 ```
 
 Assignments can reach through fields and List positions, as in
-`world.chunks[0].blocks[5] = 1`. Scalar fields can always be assigned. A field
-holding a Text, List or record cannot be assigned if its type could lead back
-to the record's own type, because that could create a reference cycle; see the
-[runtime memory contract](runtime-memory.md). Record equality is not supported.
+`world.chunks[0].blocks[5] = 1`. Scalar and reference fields can be assigned
+values of their declared types, including references back to the same graph.
+See the [runtime memory contract](runtime-memory.md). Record equality is not supported.
 The receiver, index and assigned value are evaluated once, in that order.
 
 A field marked `private` can be read, assigned and initialized only by code in

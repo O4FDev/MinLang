@@ -129,15 +129,19 @@ void minyar_list_add(MinyarList *list, long long value) {
         return;
     }
     kind = list_store_kind(list, value, kind);
-    if (kind == RC_REFERENCES)
+    if (kind == RC_REFERENCES) {
         minyar_rc_retain((void *)(uintptr_t)value);
+        rc_cycle_edge_add(list, (void *)(uintptr_t)value);
+    }
     list->values[list->length++] = value;
     if (rc_pending_count)
         minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
 #else
 #ifndef MINYAR_COMPILER_ARENA
-    if ((((RcObject *)list - 1)->ownership & 7) == RC_REFERENCES)
+    if ((((RcObject *)list - 1)->ownership & 7) == RC_REFERENCES) {
         minyar_rc_retain((void *)(uintptr_t)value);
+        rc_cycle_edge_add(list, (void *)(uintptr_t)value);
+    }
 #endif
     list->values[list->length++] = value;
 #endif
@@ -154,6 +158,10 @@ void minyar_list_add_take(MinyarList *list, long long value) {
         return;
     }
     kind = list_store_kind(list, value, kind);
+#endif
+#ifndef MINYAR_COMPILER_ARENA
+    if ((((RcObject *)list - 1)->ownership & 7) == RC_REFERENCES)
+        rc_cycle_edge_add(list, (void *)(uintptr_t)value);
 #endif
     list->values[list->length++] = value;
 #if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
@@ -193,6 +201,8 @@ static void minyar_list_set_owned(MinyarList *list, long long position, long lon
         if (retain_value)
             minyar_rc_retain((void *)(uintptr_t)value);
         long long previous = list->values[position];
+        rc_cycle_edge_add(list, (void *)(uintptr_t)value);
+        rc_cycle_edge_remove((void *)(uintptr_t)previous);
         list->values[position] = value;
         minyar_rc_release((void *)(uintptr_t)previous);
         return;
@@ -214,7 +224,7 @@ void minyar_list_set_take(MinyarList *list, long long position, long long value)
 
 /* Return a fresh List containing the old elements followed by value. Because
  * the result did not exist while its inputs were evaluated, this operation
- * cannot introduce the first ownership cycle. The compiler supplies the
+ * cannot introduce the first ownership cycle, so it never enables tracing. The compiler supplies the
  * element ownership kind and may transfer the final value's existing owner. */
 MinyarList *minyar_list_appended(const MinyarList *list, long long value, long long references,
                                  long long take_value) {
@@ -320,6 +330,7 @@ void minyar_record_set_take(MinyarRecord *record, long long field, long long val
 #ifndef MINYAR_COMPILER_ARENA
     unsigned char *references = (unsigned char *)(record->values + record->length);
     references[field] = 1;
+    rc_cycle_edge_add(record, (void *)(uintptr_t)value);
 #endif
     minyar_record_set(record, field, value);
 }
@@ -329,8 +340,7 @@ void minyar_record_set_reference(MinyarRecord *record, long long field, long lon
     minyar_record_set_take(record, field, value);
 }
 
-/* Replace a reference field of a live record. The compiler has proved that
- * the new edge cannot close an ownership cycle. */
+/* Replace an owning edge, preserving the collector snapshot before the poll. */
 void minyar_record_replace(MinyarRecord *record, long long field, long long value,
                            long long take_value) {
     if ((unsigned long long)field >= (unsigned long long)record->length)
@@ -339,6 +349,8 @@ void minyar_record_replace(MinyarRecord *record, long long field, long long valu
     if (!take_value)
         minyar_rc_retain((void *)(uintptr_t)value);
     long long previous = record->values[field];
+    rc_cycle_edge_add(record, (void *)(uintptr_t)value);
+    rc_cycle_edge_remove((void *)(uintptr_t)previous);
     record->values[field] = value;
     minyar_rc_release((void *)(uintptr_t)previous);
 #else

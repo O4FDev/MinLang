@@ -28,10 +28,10 @@ executable, and output paths cannot replace the input source.
 and `--doctor` checks the native toolchain with a real LLVM/LTO link. See
 [native toolchains](docs/toolchain.md) for platform setup and compiler selection.
 
-Programs use automatic, system-backed incremental reference counting by default.
-Large ownership graphs are reclaimed in budgeted batches, with no tracing
-collector and no required memory-management syntax. The default cleanup budget
-is 32 work units. Allocator calls, I/O and total operation time remain outside
+Programs use automatic, system-backed incremental reference counting with cycle
+collection by default. Large ownership graphs and cyclic garbage are reclaimed
+in budgeted batches, with no required memory-management syntax. The default
+cleanup budget is 32 work units. Allocator calls, I/O and total operation time remain outside
 that bound; this is not a hard-latency guarantee.
 
 `--memory-profile fixed` and `--memory-profile lazy` select optional finite pools.

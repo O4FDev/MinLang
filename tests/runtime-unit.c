@@ -4,6 +4,9 @@
 #include <assert.h>
 
 static void empty_heap(void) {
+    /* Conservative native tracing can pin a zero-count gray aggregate until
+     * its scan finishes. Discharge that debt before checking for actual leaks. */
+    minyar_rc_release(NULL);
     assert(rc_object_count == 0);
     assert(rc_bytes == 0);
 }

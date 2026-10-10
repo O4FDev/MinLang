@@ -1,4 +1,4 @@
-# Incremental reference counting
+# Incremental ownership and cycle collection
 
 Launcher-built programs and the Makefile's ordinary program runtime use
 system-backed incremental reference counting by default, with K32 cleanup
@@ -77,9 +77,10 @@ with allocation size; never-allocated virtual holes are not all poisoned.
 
 ## What happens to a released value
 
-The compiler inserts ownership operations automatically. Immutable record
-fields and restrictions on recursive List mutation prevent ownership cycles.
-The runtime uses no tracing, background collector, or user finalizers. Its
+The compiler inserts ownership operations automatically. Lists and reference
+fields may form arbitrary cycles. A snapshot tracer supplements reference
+counting; it runs at the same service points, without a background thread or
+user finalizers. Its
 reference counts are single-threaded: managed objects cannot be shared across
 native threads through this ownership mechanism.
 
@@ -113,8 +114,18 @@ Let **K** be `MINYAR_RC_POLL_BUDGET`.
 `minyar_rc_poll(budget)` performs at most `min(budget, K)` queued work units
 and returns the number performed. One unit visits an object field or a
 frame/temporary owner, or finalizes a task. Releasing a visited owner may also
-free one leaf, requiring at most three backing frees. Cleanup never recursively
-walks the object graph. Queue selection examines at most three queues.
+free one leaf, including a Text view
+and its flattened backing root, requiring at most five backing frees. Cleanup never recursively
+walks the object graph. Queue selection examines at most four queues. A cycle
+unit examines one root count, survivor, or field, or changes phase. Scan setup
+and completion accompany the first and last field; empty scans use one unit.
+A final cycle field can free its child and finish its cleared container, at
+most seven backing frees altogether. It never starts a second container or
+visits a second field within that unit. None walks a
+variable-length chain of objects. Constant-time barriers shade at most one
+object per ownership/edge update; shading never scans that object. Barriers
+inside a service unit are included in that unit, just as count updates are.
+Mutator barriers add fixed bookkeeping to normal retain/store/drop operations.
 
 The limits for individual runtime operations are:
 
@@ -126,6 +137,7 @@ The limits for individual runtime operations are:
 | Local assignment or indexed replacement in an ordinary reference List | K total immediate and queued units |
 | Reference List append | K after storing the value; growth can service another K beforehand |
 | Mixed-record field write | K after storing the value |
+| Compiler hook before a potentially cyclic mutation | K queued units before the store |
 | Temporary keep or borrow | K, or 2K when creating a new owner chunk |
 | Scalar List write, immortal-only List write, or scalar record setter | No release or poll |
 | Null or immortal temporary keep | No poll |
@@ -144,16 +156,20 @@ all operations along its critical path and validation on the target system.
 
 ## Scheduling and batching
 
-Objects, frames, and temporary chunks receive round-robin service. Within the
+Objects, frames, temporary chunks, and a ready cycle job receive round-robin
+service. Without a cycle job the existing object batching paths remain available. Within the
 object queue, service alternates between recent work and an older captured
 batch. New arrivals cannot join that batch. Once it is exhausted, the recent
 stack becomes the next batch in constant bookkeeping work. Each captured task
 therefore has finitely many predecessors; finite acyclic data is eventually
 reclaimed if polling continues.
 
-When all three queues and both object classes stay ready, the active older
-object advances within six queued work units. An object behind it must first
-wait for its predecessors, so the six-unit bound does not apply to every object.
+When all four queues and both object classes stay ready, the active older
+object advances within eight queued work units. An object behind it must first
+wait for its predecessors, so the eight-unit bound does not apply to every object.
+A cycle request raised inside an object-only batch can first wait for the
+remainder of that batch (at most K units). Following polls use the general
+scheduler, where the ready cycle job advances within four units.
 
 Suspended cursors occupy dead List capacity fields or the upper bits of dead
 record reference-map bytes. Reference flags remain intact. Cursor encoding
@@ -180,6 +196,36 @@ Batching reduces scheduler overhead under specific conditions:
 These paths require non-reentrant runtime and allocator hooks. Intermediate
 pending ownership remains local to the poll; batching neither raises K nor
 delays a competing queue.
+
+## Incremental cycle work
+
+The collector counts incoming aggregate edges separately from total ownership.
+The difference identifies external roots, including temporaries and ownership
+storage awaiting retirement. Only aggregates that have held other aggregates
+enter its intrusive registry; scalar records and Text do not need tracing.
+
+A collection captures the existing registry in constant time. New registrations
+prepend outside that cohort. Root testing, gray-queue processing, and sweeping
+all use persistent cursors. A List scan captures its length once, so later
+appends cannot extend an active scan. New roots, deleted edges, and ownership
+transfers preserve the snapshot through constant-time shading. An object that
+reaches zero while gray keeps a collector pin until its scan finishes. No
+mutation restarts a collection or invalidates previously charged work.
+
+Sweeping clears one unreachable outgoing slot per unit. A pin protects the
+active object from its own self-edges; other objects retain their ordinary
+counts until their incoming edges are removed. Fully cleared objects skip a
+second traversal of their empty slots during reference-count retirement.
+Survivors reset their generation bit individually, within charged units; there
+is no epoch-counter overflow reset or full-heap clearing pass.
+
+The compiler enables tracing only when execution reaches a mutation whose types
+could close a cycle. The former restrictions therefore avoid unnecessary scans
+without rejecting source programs. After enabling, candidate releases can scan
+live aggregates as well as garbage. Each execution of that compiler hook also
+provides one bounded service batch before the store. An epoch is finite, but floating garbage
+can survive until a later epoch. Progress requires continued service points.
+See [the proof sketch and measurements](../research/cycles/README.md).
 
 ## Pool allocation and exhaustion
 
@@ -234,13 +280,18 @@ reclamation must add one to their harness.
 
 ## Platforms and checks
 
-The tested ABI uses an eight-byte ownership header and a 64-bit target.
-Correctness checks have run on macOS arm64 and Ubuntu 24.04/glibc with Clang 18
-on Linux aarch64 and x86_64. Linux runs used OrbStack on Apple Silicon, with
+The tested ABI uses an eight-byte ownership word and a 64-bit target. Lists
+and mixed records also reserve 48 bytes of collector metadata; this increases
+rounded pool charges (a unary mixed record now occupies 128 bytes). Scalar
+records and Text keep their existing layout.
+The cycle collector's new checks have run on macOS arm64. Earlier runtime
+checks also ran on Ubuntu 24.04/glibc with Clang 18 on Linux aarch64 and x86_64.
+Linux runs used OrbStack on Apple Silicon, with
 x86_64 emulation. Native Linux performance, embedded-libc integration, Windows,
 and 32-bit microcontroller ports remain unverified. See [Linux testing](../experiments/linux/README.md).
 
 ```sh
+make check-cycles             # Cycles, roots, bounded units, pools, ASan/UBSan
 make check-bounded            # Finite pool and source ownership
 make check-memory-profiles    # System, fixed, and lazy profiles
 make check-integer-text-cache # Values, aliases, and cache storage

@@ -29,14 +29,15 @@ static void assert_backend_empty(void) {
 #endif
 }
 
-/* Records are immutable in Minyar; their runtime setters initialize fields.
- * This fixture explicitly balances replaced ownership to explore a larger DAG
- * state space than source construction alone, without assuming setter mutation. */
+/* Sparse native construction and replacement use their distinct owning APIs.
+ * Reusing an initialization setter for replacement would lose incoming-edge
+ * accounting, even when the old ordinary ownership count is balanced. */
 static void replace_edge(MinyarRecord *record, size_t slot, MinyarRecord *value) {
-    minyar_rc_retain(value);
-    void *old = (void *)(uintptr_t)record->values[slot];
-    minyar_record_set_take(record, (long long)slot, (long long)(uintptr_t)value);
-    minyar_rc_release(old);
+    unsigned char *map = (unsigned char *)(record->values + record->length);
+    if (map[slot] & 1)
+        minyar_record_replace(record, (long long)slot, (long long)(uintptr_t)value, 0);
+    else
+        minyar_record_set_reference(record, (long long)slot, (long long)(uintptr_t)value);
 }
 
 static size_t entry(RcObject *object) {
@@ -86,6 +87,13 @@ static void verify(MinyarRecord **roots) {
         pending++;
     }
     pending += PRODUCTION_EXTRA_OWNER_SCAN();
+    pending += rc_cycle_pending;
+    /* Collector pins are real physical owners, just like retired-frame slots.
+     * Reconstruct them independently of the runtime's ordinary count. */
+    for (RcCycle *c = rc_cycle_gray_head; c; c = c->gray_next)
+        if (c->pinned) entries[entry(rc_cycle_object(c))].expected++;
+    if (rc_cycle_active && (rc_cycle_active->pinned || rc_cycle_phase == RC_CYCLE_SWEEP))
+        entries[entry(rc_cycle_object(rc_cycle_active))].expected++;
     assert(pending == rc_pending_count);
     for (size_t i = 0; i < ROOTS; i++) if (roots[i])
         entries[entry((RcObject *)roots[i] - 1)].expected++;

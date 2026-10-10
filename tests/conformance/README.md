@@ -11,7 +11,7 @@ check-conformance`. Rejection wording is indexed separately by
 | 64-bit arithmetic, comparisons, Boolean-only conditions, and evaluation | `numbers-and-comparisons/program.min` | `tests/errors/integer-too-large.min`, `tests/runtime/integer-overflow.min`, `tests/runtime/divide-by-zero.min`, `tests/adversarial.py` |
 | Unicode Text, Character, indexing, slicing, conversions, and joining | `text-and-lists/program.min` | `tests/regressions.py`, `tests/runtime/text-slice-out-of-bounds.min`, `tests/integer-text-cache.py` |
 | List literals, inference, aliases, append, replacement, and bounds | `text-and-lists/program.min` | `tests/runtime/lists.min`, `tests/runtime/list-out-of-bounds.min`, `tests/ownership.py` |
-| Automatic lifetime, aliases, recursive acyclic values, fresh-List recursive construction, and cycle rejection | `memory-lifetime/program.min` | `tests/recursive-data.py`, `tests/production-memory.py`, `tests/ownership-mutation.py` |
+| Automatic lifetime, aliases, recursive acyclic values, fresh-List recursive construction, and cyclic graphs | `memory-lifetime/program.min` | `tests/recursive-data.py`, `tests/production-memory.py`, `tests/ownership-mutation.py` |
 | Required typed record fields, nested records, and field assignment | `records/program.min`, `loops-and-assignment/program.min` | `tests/errors/record-*.min`, `tests/scalar-record-storage.py` |
 | Float arithmetic, conversions, math functions, hex literals, and bitwise operators | `floats-and-bits/program.min` | `tests/regressions.py` |
 | Bytes storage, typed little-endian access, and binary files | `bytes/program.min` | `tests/regressions.py` |

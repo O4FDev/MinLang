@@ -7,7 +7,6 @@ import unittest
 from regressions import CompilerTestCase
 
 
-CYCLE_DIAGNOSTIC = 'this List mutation could create a reference cycle'
 
 
 class ProductionMemory(CompilerTestCase):
@@ -150,18 +149,18 @@ print(survivor.text)
 print(root.text)
 ''', 'survivor!\nnew root!\n')
 
-    def test_module_aliases_cannot_hide_cycle_write(self):
+    def test_module_aliases_allow_cycle_write(self):
         (self.directory / 'node.min').write_text('''public record Node { children: List<Node> }
 public function empty(): Node { return Node { children: [] } }
 ''')
         (self.directory / 'nested').mkdir()
         for write in ('children.add(node)', 'children[0] = node'):
             with self.subTest(write=write):
-                self.rejects('''use "./node.min" as a
+                self.executes('''use "./node.min" as a
 use "./nested/../node.min" as b
 let children: List<a.Node> = [a.empty()]
 let node = b.Node { children: children }
-''' + write + '\n', CYCLE_DIAGNOSTIC)
+''' + write + '\n', '')
 
     def test_module_identity_keeps_unrelated_outer_list_mutable(self):
         (self.directory / 'tree.min').write_text('''public record Node { children: List<Node>; text: Text }
@@ -180,23 +179,23 @@ print(saved.text)
 print(values[0].tree.text)
 ''', 'one\ntwo\n')
 
-    def test_nested_list_write_inside_helper_cannot_hide_cycle(self):
+    def test_nested_list_write_inside_helper_allows_cycle(self):
         declarations = '''record Node { layers: List<List<Node>> }
 function attach(target: List<Node>, node: Node) { target.add(node) }
 '''
-        self.rejects(declarations + '''let inner: List<Node> = []
+        self.executes(declarations + '''let inner: List<Node> = []
 let layers: List<List<Node>> = [inner]
 let node = Node { layers: layers }
 attach(inner, node)
-''', CYCLE_DIAGNOSTIC)
+''', '')
 
-    def test_empty_recursive_lists_are_not_mutable_through_return_alias(self):
-        self.rejects('''record Node { children: List<Node> }
+    def test_empty_recursive_lists_are_mutable_through_return_alias(self):
+        self.executes('''record Node { children: List<Node> }
 function identity(values: List<Node>): List<Node> { return values }
 let values: List<Node> = []
 let node = Node { children: values }
 identity(values).add(node)
-''', CYCLE_DIAGNOSTIC)
+''', '')
 
 
 if __name__ == '__main__':

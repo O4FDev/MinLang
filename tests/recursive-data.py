@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Recursive construction with type-proven acyclic mutable edges.
+"""Recursive construction and arbitrary mutable reference edges.
 
 Run natively and with MINYAR_TEST_RUNTIME pointing at the exact-accounting
 sanitizer runtime. Every executable case runs at both O0 and O2.
@@ -7,8 +7,6 @@ sanitizer runtime. Every executable case runs at both O0 and O2.
 import random
 import unittest
 from regressions import CompilerTestCase
-
-DIAGNOSTIC = 'this List mutation could create a reference cycle'
 
 
 class RecursiveData(CompilerTestCase):
@@ -103,7 +101,7 @@ print(root.children[0].value)
 print(root.children[19].value)
 ''', '20\n1\n20\n')
 
-    def test_direct_self_cycle_add_and_overwrite_rejected(self):
+    def test_direct_self_cycle_add_and_overwrite(self):
         declarations = 'record Node { children: List<Node> }\n'
         for body in (
             'let children: List<Node> = []\nlet node = Node { children: children }\nchildren.add(node)',
@@ -112,34 +110,34 @@ print(root.children[19].value)
             'function replace(children: List<Node>, node: Node) { children[0] = node }',
         ):
             with self.subTest(body=body):
-                self.rejects(declarations + body + '\n', DIAGNOSTIC)
+                self.executes(declarations + body + '\n', '')
 
-    def test_alias_return_and_record_projection_cannot_bypass_rejection(self):
+    def test_alias_return_and_record_projection_allow_cycles(self):
         declarations = '''record Node { children: List<Node> }
 function children(node: Node): List<Node> { return node.children }
 '''
         for expression in ('alias.add(node)', 'children(node).add(node)', 'node.children.add(node)'):
-            self.rejects(declarations + '''let items: List<Node> = []
+            self.executes(declarations + '''let items: List<Node> = []
 let node = Node { children: items }
 let alias = items
-''' + expression + '\n', DIAGNOSTIC)
+''' + expression + '\n', '')
 
-    def test_nested_list_edges_both_rejected(self):
+    def test_nested_list_edges_both_allowed(self):
         declarations = 'record Node { groups: List<List<Node>> }\n'
         for body in (
             'function inner(items: List<Node>, node: Node) { items.add(node) }',
             'function outer(groups: List<List<Node>>, items: List<Node>) { groups.add(items) }',
             'function overwrite(groups: List<List<Node>>, items: List<Node>) { groups[0] = items }',
         ):
-            self.rejects(declarations + body + '\n', DIAGNOSTIC)
+            self.executes(declarations + body + '\n', '')
 
-    def test_mutual_cycle_through_different_mutable_type_is_rejected(self):
-        self.rejects('''record A { links: List<B> }
+    def test_mutual_cycle_through_different_mutable_type_is_allowed(self):
+        self.executes('''record A { links: List<B> }
 record B { back: A }
 function attach(links: List<B>, owner: A) {
     links.add(B { back: owner })
 }
-''', DIAGNOSTIC)
+''', '')
 
     def test_recursive_declarations_without_values_are_legal(self):
         result, _ = self.compile('record Loop { next: Loop }\nrecord Tree { children: List<Tree> }\n')
@@ -209,9 +207,8 @@ let multiline: List<List<Integer>> = [
 print(multiline[1][1])
 ''', '0\n2\n')
 
-    def test_type_edge_mutations_against_independent_reachability_model(self):
-        # Independent transitive closure over explicit record AND List types;
-        # compiler uses an iterative worklist and strips nested List layers.
+    def test_generated_recursive_type_mutations_compile(self):
+        # Nested and mutually recursive type graphs all allow mutation.
         for seed in range(32):
             rng = random.Random(seed)
             count = 5
@@ -226,30 +223,13 @@ print(multiline[1][1])
                 f'record R{i} {{ ' + '; '.join(f'f{k}: {type_name(j, depth)}'
                 for k, (j, depth) in enumerate(row)) + ' }'
                 for i, row in enumerate(edges)) + '\n'
-            names = [(i, depth) for i in range(count) for depth in range(3)]
-            reach = {(a, b) for a in names for b in names if a == b}
-            for i, row in enumerate(edges):
-                for j, depth in row:
-                    reach.add(((i, 0), (j, depth)))
-                for depth in (1, 2):
-                    reach.add(((i, depth), (i, depth - 1)))
-            for middle in names:
-                for start in names:
-                    for end in names:
-                        if (start, middle) in reach and (middle, end) in reach:
-                            reach.add((start, end))
             for node, depth in [(seed % count, 1), ((seed + 1) % count, 2)]:
-                cyclic = ((node, depth - 1), (node, depth)) in reach
                 for mutation in ('items.add(value)', 'items[0] = value'):
                     source = declarations + (f'function mutate(items: {type_name(node, depth)}, '
                         f'value: {type_name(node, depth - 1)}) {{ {mutation} }}\n')
                     with self.subTest(seed=seed, node=node, depth=depth, mutation=mutation):
                         result, _ = self.compile(source)
-                        if cyclic:
-                            self.assertEqual(result.returncode, 1, result.stderr)
-                            self.assertIn(DIAGNOSTIC, result.stderr)
-                        else:
-                            self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == '__main__':

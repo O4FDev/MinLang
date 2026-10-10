@@ -1452,11 +1452,12 @@ while i < alias.length { print(alias[i]); print(outer.child.values[i]); i = i + 
             (prefix + 'box.values[0] = 1\n', 'an indexed assignment needs Text, not Integer'),
             (prefix + 'box.values[true] = "text"\n', 'a position must be an Integer'),
             ('record Box { value: Integer }\nlet box = Box { value: 1 }\nbox.value[0] = 2\n', 'indexed assignment needs a List'),
-            ('record Node { children: List<Node> }\nlet empty: List<Node> = []\nlet node = Node { children: empty }\nnode.children[0] = node\n',
-             'this List mutation could create a reference cycle; construct a new List instead'),
         ]:
             with self.subTest(source=source):
                 self.rejects(source, diagnostic)
+        # A self-referential indexed replacement is accepted; cycle collection reclaims it.
+        self.executes('record Node { children: List<Node> }\nlet empty: List<Node> = []\nlet node = Node { children: empty }\n'
+                      'node.children.add(node)\nnode.children[0] = node\nprint(node.children.length)\n', '1\n')
 
     def test_mutual_recursion_accumulates_fibonacci_leaves(self):
         source = ''
