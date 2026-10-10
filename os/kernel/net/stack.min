@@ -1,0 +1,749 @@
+// A small TCP/IP stack: Ethernet, ARP, IPv4, ICMP echo, UDP, a DHCP client,
+// a DNS resolver and TCP client connections with retransmission.
+//
+// Everything runs from `poll`, called once per frame: it drains received
+// frames, answers ARP and pings, advances DHCP, and retransmits TCP data
+// that has not been acknowledged.
+use "./e1000.min" as e1000
+use "../../shared/interrupts.min" as interrupts
+
+public constant CLOSED = 0
+public constant CONNECTING = 1
+public constant OPEN = 2
+public constant CLOSING = 3
+public constant FINISHED = 4
+public constant FAILED = 5
+
+constant ETHERNET_IPV4 = 0x0800
+constant ETHERNET_ARP = 0x0806
+constant PROTOCOL_ICMP = 1
+constant PROTOCOL_TCP = 6
+constant PROTOCOL_UDP = 17
+constant TCP_FIN = 1
+constant TCP_SYN = 2
+constant TCP_RST = 4
+constant TCP_PSH = 8
+constant TCP_ACK = 16
+constant MSS = 1400
+constant WINDOW = 65535
+
+public record Connection {
+    id: Integer
+    state: Integer
+    remoteIp: Integer
+    remotePort: Integer
+    localPort: Integer
+    // Sequence numbers: the first unacknowledged byte, and the next to receive.
+    sendUnacked: Integer
+    receiveNext: Integer
+    // Bytes from sendUnacked onwards that are not yet acknowledged; `sent` of
+    // them have been transmitted.
+    outgoing: Bytes
+    sent: Integer
+    peerWindow: Integer
+    incoming: Bytes
+    lastSend: Integer
+    retries: Integer
+    finReceived: Boolean
+    finQueued: Boolean
+    finSent: Boolean
+    error: Text
+    opened: Integer
+}
+
+public record Network {
+    adapter: e1000.Adapter
+    ip: Integer
+    mask: Integer
+    gateway: Integer
+    dns: Integer
+    configured: Boolean
+    dhcpState: Integer
+    dhcpTransaction: Integer
+    dhcpServer: Integer
+    dhcpOffer: Integer
+    dhcpSent: Integer
+    dhcpTries: Integer
+    started: Integer
+    arpAddresses: List<Integer>
+    arpMacs: List<Bytes>
+    arpAsked: List<Integer>
+    waitingFor: List<Integer>
+    waiting: List<Bytes>
+    connections: List<Connection>
+    nextConnection: Integer
+    nextPort: Integer
+    dnsNames: List<Text>
+    dnsIds: List<Integer>
+    dnsAnswers: List<Integer>
+    pings: Integer
+    log: List<Text>
+}
+
+// ----- Byte helpers -----
+
+public function put16(data: Bytes, offset: Integer, value: Integer) {
+    data[offset] = (value >> 8) & 255
+    data[offset + 1] = value & 255
+}
+
+public function put32(data: Bytes, offset: Integer, value: Integer) {
+    put16(data, offset, (value >> 16) & 0xFFFF)
+    put16(data, offset + 2, value & 0xFFFF)
+}
+
+public function get16(data: Bytes, offset: Integer): Integer {
+    return (data[offset] << 8) | data[offset + 1]
+}
+
+public function get32(data: Bytes, offset: Integer): Integer {
+    return (get16(data, offset) << 16) | get16(data, offset + 2)
+}
+
+public function ipText(ip: Integer): Text {
+    return Text((ip >> 24) & 255) + "." + Text((ip >> 16) & 255) + "." + Text((ip >> 8) & 255) + "." + Text(ip & 255)
+}
+
+// Parse dotted-quad text, or return -1.
+public function parseIp(text: Text): Integer {
+    let value = 0
+    let part = 0
+    let parts = 0
+    let digits = 0
+    for character in text {
+        if character == '.' {
+            if digits == 0 || part > 255 { return -1 }
+            value = (value << 8) | part
+            part = 0
+            digits = 0
+            parts += 1
+        } else {
+            if character < '0' || character > '9' { return -1 }
+            part = part * 10 + Integer(character) - 48
+            digits += 1
+        }
+    }
+    if digits == 0 || part > 255 || parts != 3 { return -1 }
+    return (value << 8) | part
+}
+
+function checksum(data: Bytes, start: Integer, length: Integer, initial: Integer): Integer {
+    let sum = initial
+    let index = 0
+    while index + 1 < length {
+        sum += (data[start + index] << 8) | data[start + index + 1]
+        index += 2
+    }
+    if index < length {
+        sum += data[start + index] << 8
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16)
+    }
+    return (~sum) & 0xFFFF
+}
+
+function sequenceAfter(a: Integer, b: Integer): Boolean {
+    let difference = (a - b) & 0xFFFFFFFF
+    return difference != 0 && difference < 0x80000000
+}
+
+function note(network: Network, line: Text) {
+    print("net: " + line)
+    network.log.add(line)
+}
+
+// ----- Start -----
+
+public function create(adapter: e1000.Adapter): Network {
+    let network = Network {
+        adapter: adapter; ip: 0; mask: 0; gateway: 0; dns: 0; configured: false
+        dhcpState: 0; dhcpTransaction: 0x4D494E59; dhcpServer: 0; dhcpOffer: 0; dhcpSent: -100000; dhcpTries: 0
+        started: interrupts.milliseconds()
+        arpAddresses: []; arpMacs: []; arpAsked: []; waitingFor: []; waiting: []
+        connections: []; nextConnection: 1; nextPort: 49152 + interrupts.milliseconds() % 4000
+        dnsNames: []; dnsIds: []; dnsAnswers: []; pings: 0; log: []
+    }
+    return network
+}
+
+public function present(network: Network): Boolean {
+    return network.adapter.present
+}
+
+public function summary(network: Network): List<Text> {
+    let lines: List<Text> = []
+    if !network.adapter.present {
+        lines.add("Network: no adapter")
+        return lines
+    }
+    lines.add("Adapter: Intel e1000, MAC " + e1000.macText(network.adapter.mac))
+    if network.configured {
+        lines.add("Address: " + ipText(network.ip) + "  gateway " + ipText(network.gateway) + "  DNS " + ipText(network.dns))
+    } else {
+        lines.add("Address: waiting for DHCP")
+    }
+    lines.add("Frames: " + Text(network.adapter.sent) + " sent, " + Text(network.adapter.received) + " received")
+    return lines
+}
+
+// ----- Ethernet and ARP -----
+
+function sendFrame(network: Network, destination: Bytes, type: Integer, payload: Bytes) {
+    let frame = Bytes(14)
+    for index in 0..6 {
+        frame[index] = destination[index]
+        frame[6 + index] = network.adapter.mac[index]
+    }
+    put16(frame, 12, type)
+    frame.addBytes(payload)
+    // Pad to the 60-byte minimum.
+    if frame.length < 60 { frame.resize(60) }
+    e1000.send(network.adapter, frame)
+}
+
+function broadcast(): Bytes {
+    let mac = Bytes(6)
+    for index in 0..6 { mac[index] = 255 }
+    return mac
+}
+
+function arpPacket(network: Network, operation: Integer, targetMac: Bytes, targetIp: Integer): Bytes {
+    let packet = Bytes(28)
+    put16(packet, 0, 1)
+    put16(packet, 2, ETHERNET_IPV4)
+    packet[4] = 6
+    packet[5] = 4
+    put16(packet, 6, operation)
+    for index in 0..6 {
+        packet[8 + index] = network.adapter.mac[index]
+        packet[18 + index] = targetMac[index]
+    }
+    put32(packet, 14, network.ip)
+    put32(packet, 24, targetIp)
+    return packet
+}
+
+function lookupMac(network: Network, ip: Integer): Integer {
+    for index in 0..network.arpAddresses.length {
+        if network.arpAddresses[index] == ip { return index }
+    }
+    return -1
+}
+
+function handleArp(network: Network, frame: Bytes) {
+    if frame.length < 42 { return }
+    let operation = get16(frame, 20)
+    let senderMac = frame.slice(22, 28)
+    let senderIp = get32(frame, 28)
+    let targetIp = get32(frame, 38)
+    let known = lookupMac(network, senderIp)
+    if known >= 0 {
+        network.arpMacs[known] = senderMac
+    } else {
+        network.arpAddresses.add(senderIp)
+        network.arpMacs.add(senderMac)
+    }
+    if operation == 1 && network.configured && targetIp == network.ip {
+        sendFrame(network, senderMac, ETHERNET_ARP, arpPacket(network, 2, senderMac, senderIp))
+    }
+    // Send anything that was waiting for this address.
+    let stillFor: List<Integer> = []
+    let still: List<Bytes> = []
+    for index in 0..network.waiting.length {
+        if network.waitingFor[index] == senderIp {
+            sendFrame(network, senderMac, ETHERNET_IPV4, network.waiting[index])
+        } else {
+            stillFor.add(network.waitingFor[index])
+            still.add(network.waiting[index])
+        }
+    }
+    network.waitingFor = stillFor
+    network.waiting = still
+}
+
+// ----- IPv4 -----
+
+function sendIp(network: Network, destination: Integer, protocol: Integer, payload: Bytes) {
+    let packet = Bytes(20)
+    packet[0] = 0x45
+    put16(packet, 2, 20 + payload.length)
+    put16(packet, 4, network.adapter.sent & 0xFFFF)
+    put16(packet, 6, 0x4000)
+    packet[8] = 64
+    packet[9] = protocol
+    put32(packet, 12, network.ip)
+    put32(packet, 16, destination)
+    put16(packet, 10, checksum(packet, 0, 20, 0))
+    packet.addBytes(payload)
+    if destination == 0xFFFFFFFF {
+        sendFrame(network, broadcast(), ETHERNET_IPV4, packet)
+        return
+    }
+    let hop = destination
+    if (destination & network.mask) != (network.ip & network.mask) {
+        hop = network.gateway
+    }
+    let known = lookupMac(network, hop)
+    if known >= 0 {
+        sendFrame(network, network.arpMacs[known], ETHERNET_IPV4, packet)
+        return
+    }
+    network.waitingFor.add(hop)
+    network.waiting.add(packet)
+    sendFrame(network, broadcast(), ETHERNET_ARP, arpPacket(network, 1, Bytes(6), hop))
+}
+
+function handleIp(network: Network, frame: Bytes) {
+    if frame.length < 34 { return }
+    let headerLength = (frame[14] & 15) * 4
+    let total = get16(frame, 16)
+    let protocol = frame[23]
+    let source = get32(frame, 26)
+    let destination = get32(frame, 30)
+    let start = 14 + headerLength
+    let end = min(14 + total, frame.length)
+    if end <= start { return }
+    if network.configured && destination != network.ip && destination != 0xFFFFFFFF {
+        return
+    }
+    let payload = frame.slice(start, end)
+    if protocol == PROTOCOL_ICMP { handleIcmp(network, source, payload) }
+    if protocol == PROTOCOL_UDP { handleUdp(network, source, payload) }
+    if protocol == PROTOCOL_TCP { handleTcp(network, source, payload) }
+}
+
+// ----- ICMP -----
+
+function handleIcmp(network: Network, source: Integer, packet: Bytes) {
+    if packet.length < 8 { return }
+    if packet[0] == 8 {
+        let reply = packet.slice(0, packet.length)
+        reply[0] = 0
+        put16(reply, 2, 0)
+        put16(reply, 2, checksum(reply, 0, reply.length, 0))
+        sendIp(network, source, PROTOCOL_ICMP, reply)
+    }
+    if packet[0] == 0 {
+        network.pings += 1
+    }
+}
+
+public function ping(network: Network, destination: Integer) {
+    let packet = Bytes(16)
+    packet[0] = 8
+    put16(packet, 4, 0x4D59)
+    put16(packet, 6, network.pings)
+    put16(packet, 2, checksum(packet, 0, 16, 0))
+    sendIp(network, destination, PROTOCOL_ICMP, packet)
+}
+
+// ----- UDP, DHCP and DNS -----
+
+function sendUdp(network: Network, destination: Integer, sourcePort: Integer, destinationPort: Integer, payload: Bytes) {
+    let packet = Bytes(8)
+    put16(packet, 0, sourcePort)
+    put16(packet, 2, destinationPort)
+    put16(packet, 4, 8 + payload.length)
+    packet.addBytes(payload)
+    sendIp(network, destination, PROTOCOL_UDP, packet)
+}
+
+function handleUdp(network: Network, source: Integer, packet: Bytes) {
+    if packet.length < 8 { return }
+    let destinationPort = get16(packet, 2)
+    let payload = packet.slice(8, min(get16(packet, 4), packet.length))
+    if destinationPort == 68 { handleDhcp(network, payload) }
+    if destinationPort == 5353 { handleDns(network, payload) }
+}
+
+function dhcpMessage(network: Network, kind: Integer): Bytes {
+    let message = Bytes(240)
+    message[0] = 1
+    message[1] = 1
+    message[2] = 6
+    put32(message, 4, network.dhcpTransaction)
+    put16(message, 10, 0x8000)
+    for index in 0..6 { message[28 + index] = network.adapter.mac[index] }
+    put32(message, 236, 0x63825363)
+    message.add(53)
+    message.add(1)
+    message.add(kind)
+    if kind == 3 {
+        message.add(50)
+        message.add(4)
+        let requested = Bytes(4)
+        put32(requested, 0, network.dhcpOffer)
+        message.addBytes(requested)
+        message.add(54)
+        message.add(4)
+        let server = Bytes(4)
+        put32(server, 0, network.dhcpServer)
+        message.addBytes(server)
+    }
+    message.add(55)
+    message.add(3)
+    message.add(1)
+    message.add(3)
+    message.add(6)
+    message.add(255)
+    return message
+}
+
+function handleDhcp(network: Network, message: Bytes) {
+    if message.length < 244 || get32(message, 4) != network.dhcpTransaction { return }
+    let offered = get32(message, 16)
+    let kind = 0
+    let mask = 0xFFFFFF00
+    let router = 0
+    let dns = 0
+    let server = 0
+    let at = 240
+    while at + 1 < message.length && message[at] != 255 {
+        let option = message[at]
+        if option == 0 {
+            at += 1
+        } else {
+            let length = message[at + 1]
+            let value = at + 2
+            if option == 53 { kind = message[value] }
+            if option == 1 && length >= 4 { mask = get32(message, value) }
+            if option == 3 && length >= 4 { router = get32(message, value) }
+            if option == 6 && length >= 4 { dns = get32(message, value) }
+            if option == 54 && length >= 4 { server = get32(message, value) }
+            at = value + length
+        }
+    }
+    if kind == 2 && network.dhcpState == 1 {
+        network.dhcpOffer = offered
+        network.dhcpServer = server
+        network.dhcpState = 2
+        note(network, "DHCP offer " + ipText(offered) + " from " + ipText(server))
+        sendUdp(network, 0xFFFFFFFF, 68, 67, dhcpMessage(network, 3))
+    }
+    if kind == 5 && network.dhcpState == 2 {
+        network.ip = offered
+        network.mask = mask
+        network.gateway = router
+        network.dns = dns
+        network.configured = true
+        network.dhcpState = 3
+        note(network, "DHCP lease " + ipText(offered) + ", gateway " + ipText(router) + ", DNS " + ipText(dns))
+    }
+}
+
+// Ask DNS for the IPv4 address of `name`. Poll `resolved` for the answer.
+public function resolve(network: Network, name: Text) {
+    let id = (network.dnsIds.length + 1) * 7919 & 0xFFFF
+    network.dnsNames.add(name)
+    network.dnsIds.add(id)
+    network.dnsAnswers.add(-1)
+    let query = Bytes(12)
+    put16(query, 0, id)
+    put16(query, 2, 0x0100)
+    put16(query, 4, 1)
+    let label = Bytes()
+    for character in name {
+        if character == '.' {
+            query.add(label.length)
+            query.addBytes(label)
+            label = Bytes()
+        } else {
+            label.add(Integer(character))
+        }
+    }
+    query.add(label.length)
+    query.addBytes(label)
+    query.add(0)
+    let tail = Bytes(4)
+    put16(tail, 0, 1)
+    put16(tail, 2, 1)
+    query.addBytes(tail)
+    sendUdp(network, network.dns, 5353, 53, query)
+}
+
+// The address found for `name`: -1 while waiting, 0 if not found.
+public function resolved(network: Network, name: Text): Integer {
+    for index in 0..network.dnsNames.length {
+        if network.dnsNames[index] == name {
+            return network.dnsAnswers[index]
+        }
+    }
+    return -1
+}
+
+function handleDns(network: Network, message: Bytes) {
+    if message.length < 12 { return }
+    let id = get16(message, 0)
+    let answers = get16(message, 6)
+    let at = 12
+    // Skip the question.
+    while at < message.length && message[at] != 0 {
+        if (message[at] & 0xC0) == 0xC0 {
+            at += 1
+            break
+        }
+        at += message[at] + 1
+    }
+    at += 5
+    let address = 0
+    for answer in 0..answers {
+        if at + 12 > message.length { break }
+        if (message[at] & 0xC0) == 0xC0 {
+            at += 2
+        } else {
+            while at < message.length && message[at] != 0 { at += message[at] + 1 }
+            at += 1
+        }
+        let type = get16(message, at)
+        let length = get16(message, at + 8)
+        if type == 1 && length == 4 && address == 0 {
+            address = get32(message, at + 10)
+        }
+        at += 10 + length
+    }
+    for index in 0..network.dnsIds.length {
+        if network.dnsIds[index] == id {
+            network.dnsAnswers[index] = address
+        }
+    }
+}
+
+// ----- TCP -----
+
+function sendSegment(network: Network, connection: Connection, flags: Integer, sequence: Integer, payload: Bytes) {
+    let segment = Bytes(20)
+    put16(segment, 0, connection.localPort)
+    put16(segment, 2, connection.remotePort)
+    put32(segment, 4, sequence & 0xFFFFFFFF)
+    put32(segment, 8, connection.receiveNext & 0xFFFFFFFF)
+    segment[12] = 5 << 4
+    segment[13] = flags
+    put16(segment, 14, WINDOW)
+    if (flags & TCP_SYN) != 0 {
+        // Announce our maximum segment size.
+        segment[12] = 6 << 4
+        segment.add(2)
+        segment.add(4)
+        segment.add((MSS >> 8) & 255)
+        segment.add(MSS & 255)
+    }
+    segment.addBytes(payload)
+    let pseudo = ((network.ip >> 16) & 0xFFFF) + (network.ip & 0xFFFF) + ((connection.remoteIp >> 16) & 0xFFFF) + (connection.remoteIp & 0xFFFF) + PROTOCOL_TCP + segment.length
+    put16(segment, 16, checksum(segment, 0, segment.length, pseudo))
+    sendIp(network, connection.remoteIp, PROTOCOL_TCP, segment)
+    connection.lastSend = interrupts.milliseconds()
+}
+
+// A connection that does not exist yet, for records that need one.
+public function placeholder(): Connection {
+    return Connection {
+        id: 0; state: CLOSED; remoteIp: 0; remotePort: 0; localPort: 0; sendUnacked: 0; receiveNext: 0
+        outgoing: Bytes(); sent: 0; peerWindow: 0; incoming: Bytes(); lastSend: 0; retries: 0
+        finReceived: false; finQueued: false; finSent: false; error: ""; opened: 0
+    }
+}
+
+// Open a connection. Poll the returned connection's state.
+public function connect(network: Network, ip: Integer, port: Integer): Connection {
+    let connection = Connection {
+        id: network.nextConnection; state: CONNECTING; remoteIp: ip; remotePort: port; localPort: network.nextPort
+        sendUnacked: (interrupts.milliseconds() * 2654435761) & 0x7FFFFFFF; receiveNext: 0
+        outgoing: Bytes(); sent: 0; peerWindow: 8192; incoming: Bytes(); lastSend: 0; retries: 0
+        finReceived: false; finQueued: false; finSent: false; error: ""; opened: interrupts.milliseconds()
+    }
+    network.nextConnection += 1
+    network.nextPort += 1
+    if network.nextPort > 65000 { network.nextPort = 49152 }
+    network.connections.add(connection)
+    sendSegment(network, connection, TCP_SYN, connection.sendUnacked, Bytes())
+    return connection
+}
+
+public function write(network: Network, connection: Connection, data: Bytes) {
+    connection.outgoing.addBytes(data)
+    pump(network, connection)
+}
+
+public function close(network: Network, connection: Connection) {
+    if connection.state == OPEN || connection.state == CONNECTING {
+        connection.finQueued = true
+        pump(network, connection)
+    }
+}
+
+public function abort(network: Network, connection: Connection) {
+    if connection.state == OPEN || connection.state == CONNECTING || connection.state == CLOSING {
+        sendSegment(network, connection, TCP_RST | TCP_ACK, connection.sendUnacked + connection.sent, Bytes())
+    }
+    connection.state = FAILED
+    connection.error = "the connection was cancelled"
+}
+
+// Transmit whatever the peer's window allows.
+function pump(network: Network, connection: Connection) {
+    if connection.state != OPEN { return }
+    while connection.sent < connection.outgoing.length && connection.sent < connection.peerWindow {
+        let size = min(MSS, connection.outgoing.length - connection.sent)
+        let payload = connection.outgoing.slice(connection.sent, connection.sent + size)
+        sendSegment(network, connection, TCP_ACK | TCP_PSH, connection.sendUnacked + connection.sent, payload)
+        connection.sent += size
+    }
+    if connection.finQueued && !connection.finSent && connection.sent == connection.outgoing.length {
+        sendSegment(network, connection, TCP_FIN | TCP_ACK, connection.sendUnacked + connection.sent, Bytes())
+        connection.finSent = true
+    }
+}
+
+function findConnection(network: Network, source: Integer, sourcePort: Integer, destinationPort: Integer): Integer {
+    for index in 0..network.connections.length {
+        let connection = network.connections[index]
+        if connection.remoteIp == source && connection.remotePort == sourcePort && connection.localPort == destinationPort {
+            return index
+        }
+    }
+    return -1
+}
+
+function handleTcp(network: Network, source: Integer, segment: Bytes) {
+    if segment.length < 20 { return }
+    let sourcePort = get16(segment, 0)
+    let destinationPort = get16(segment, 2)
+    let sequence = get32(segment, 4)
+    let acknowledgment = get32(segment, 8)
+    let offset = (segment[12] >> 4) * 4
+    let flags = segment[13]
+    let window = get16(segment, 14)
+    let index = findConnection(network, source, sourcePort, destinationPort)
+    if index < 0 { return }
+    let connection = network.connections[index]
+    if (flags & TCP_RST) != 0 {
+        if connection.state != FINISHED {
+            connection.state = FAILED
+            connection.error = "the server reset the connection"
+        }
+        return
+    }
+    connection.peerWindow = max(window, 1)
+    if connection.state == CONNECTING {
+        if (flags & TCP_SYN) != 0 && (flags & TCP_ACK) != 0 && acknowledgment == ((connection.sendUnacked + 1) & 0xFFFFFFFF) {
+            connection.sendUnacked = acknowledgment
+            connection.receiveNext = (sequence + 1) & 0xFFFFFFFF
+            connection.state = OPEN
+            connection.retries = 0
+            sendSegment(network, connection, TCP_ACK, connection.sendUnacked, Bytes())
+            pump(network, connection)
+        }
+        return
+    }
+    if (flags & TCP_ACK) != 0 {
+        let advanced = (acknowledgment - connection.sendUnacked) & 0xFFFFFFFF
+        let finExtra = 0
+        if connection.finSent { finExtra = 1 }
+        if advanced > 0 && advanced <= connection.sent + finExtra {
+            let dataAcknowledged = min(advanced, connection.sent)
+            connection.outgoing = connection.outgoing.slice(dataAcknowledged, connection.outgoing.length)
+            connection.sent -= dataAcknowledged
+            connection.sendUnacked = acknowledgment
+            connection.retries = 0
+        }
+    }
+    let payload = segment.slice(min(offset, segment.length), segment.length)
+    let reply = false
+    if payload.length > 0 {
+        if sequence == connection.receiveNext {
+            connection.incoming.addBytes(payload)
+            connection.receiveNext = (connection.receiveNext + payload.length) & 0xFFFFFFFF
+        }
+        reply = true
+    }
+    if (flags & TCP_FIN) != 0 && ((sequence + payload.length) & 0xFFFFFFFF) == connection.receiveNext {
+        connection.receiveNext = (connection.receiveNext + 1) & 0xFFFFFFFF
+        connection.finReceived = true
+        connection.finQueued = true
+        reply = true
+    }
+    if reply {
+        sendSegment(network, connection, TCP_ACK, connection.sendUnacked + connection.sent, Bytes())
+    }
+    pump(network, connection)
+    if connection.finReceived && connection.finSent {
+        connection.state = FINISHED
+    } else {
+        if connection.finReceived {
+            connection.state = CLOSING
+        }
+    }
+}
+
+function retransmit(network: Network, now: Integer) {
+    for connection in network.connections {
+        let waiting = now - connection.lastSend
+        let limit = 600 * (connection.retries + 1)
+        if connection.state == CONNECTING && waiting > limit {
+            if connection.retries >= 5 {
+                connection.state = FAILED
+                connection.error = "no answer from " + ipText(connection.remoteIp) + ":" + Text(connection.remotePort)
+            } else {
+                connection.retries += 1
+                sendSegment(network, connection, TCP_SYN, connection.sendUnacked, Bytes())
+            }
+        }
+        if connection.state == OPEN && connection.sent > 0 && waiting > limit {
+            if connection.retries >= 6 {
+                connection.state = FAILED
+                connection.error = "the server stopped acknowledging data"
+            } else {
+                // Go back and resend everything unacknowledged.
+                connection.retries += 1
+                connection.sent = 0
+                pump(network, connection)
+            }
+        }
+    }
+}
+
+// ----- Polling -----
+
+public function poll(network: Network) {
+    if !network.adapter.present { return }
+    let now = interrupts.milliseconds()
+    let budget = 128
+    while budget > 0 {
+        let frame = e1000.receive(network.adapter)
+        if frame.length == 0 { break }
+        if frame.length >= 14 {
+            let type = get16(frame, 12)
+            if type == ETHERNET_ARP { handleArp(network, frame) }
+            if type == ETHERNET_IPV4 { handleIp(network, frame) }
+        }
+        budget -= 1
+    }
+    if !network.configured {
+        if now - network.dhcpSent > 1500 {
+            if network.dhcpTries >= 4 {
+                // QEMU's user network always uses these addresses.
+                network.ip = parseIp("10.0.2.15")
+                network.mask = 0xFFFFFF00
+                network.gateway = parseIp("10.0.2.2")
+                network.dns = parseIp("10.0.2.3")
+                network.configured = true
+                note(network, "DHCP did not answer; using 10.0.2.15")
+            } else {
+                network.dhcpState = 1
+                network.dhcpTries += 1
+                network.dhcpSent = now
+                sendUdp(network, 0xFFFFFFFF, 68, 67, dhcpMessage(network, 1))
+            }
+        }
+    }
+    retransmit(network, now)
+    // Forget finished connections nobody is holding.
+    let live: List<Connection> = []
+    for connection in network.connections {
+        if (connection.state != FINISHED && connection.state != FAILED) || now - connection.opened < 30000 {
+            live.add(connection)
+        }
+    }
+    network.connections = live
+}

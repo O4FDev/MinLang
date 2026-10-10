@@ -1,0 +1,216 @@
+// Virtio over PCI (the "modern" interface of virtio 1.x), the way QEMU and
+// other virtual machines present disks, input devices and entropy sources.
+// Drivers for those build on this: os/shared/virtio/block.min, input.min and
+// entropy.min.
+//
+// A virtio device is a PCI function with vendor 0x1AF4 and device 0x1040 plus
+// its type. Its registers are found through vendor capabilities in PCI
+// configuration space: a common configuration block (features, status,
+// queues), a notification area and the device's own configuration. Requests
+// travel through virtqueues in ordinary memory: a table of buffer
+// descriptors, an "available" ring of chains the driver offers, and a "used"
+// ring of chains the device has finished. Interrupts are not used; drivers
+// poll the used ring.
+use "machine" as machine
+use "device" as device
+use "../pci.min" as pci
+
+public constant BLOCK = 2
+public constant ENTROPY = 4
+public constant INPUT = 18
+
+// Descriptor flags: another descriptor follows; the device writes this buffer.
+public constant NEXT = 1
+public constant WRITE = 2
+
+constant ACKNOWLEDGE = 1
+constant DRIVER = 2
+constant DRIVER_OK = 4
+constant FEATURES_OK = 8
+
+public record Device {
+    private common: device.Registers
+    private notifyBase: Integer
+    private notifyMultiplier: Integer
+    private configuration: device.Registers
+}
+
+public record Queue {
+    // How many descriptors the queue has.
+    size: Integer
+    private index: Integer
+    private notifyAddress: device.Register16
+    private descriptors: device.Memory
+    private available: device.Memory
+    private used: device.Memory
+    private offered: Integer
+    private collected: Integer
+    // The length the device reported for the last chain `collect` returned.
+    length: Integer
+}
+
+// Every virtio device of `type` among the PCI devices.
+public function find(devices: List<pci.Device>, type: Integer): List<pci.Device> {
+    let found: List<pci.Device> = []
+    for card in devices {
+        if card.vendor == 0x1AF4 && card.device == 0x1040 + type {
+            found.add(card)
+        }
+    }
+    return found
+}
+
+// The registers a virtio capability locates: `length` bytes at an offset into one of the BARs.
+function capabilityWindow(card: pci.Device, at: Integer): device.Registers {
+    let bar = pci.read8(card, at + 4)
+    let offset = pci.read32(card, at + 8)
+    let length = pci.read32(card, at + 12)
+    return device.registers(pci.memoryBar(card, bar) + offset, max(length, 4))
+}
+
+// Reset the device and agree on the virtio 1 feature set; then set up its
+// queues with `openQueue` and call `ready`.
+public function open(card: pci.Device): Device {
+    pci.enable(card)
+    if (pci.read16(card, 0x06) & 0x10) == 0 {
+        fail("virtio device " + Text(card.device) + " has no capabilities")
+    }
+    let common = device.registers(4096, 4096)
+    let configuration = device.registers(4096, 4096)
+    let notifyBase = 0
+    let notifyMultiplier = 0
+    let found = 0
+    let at = pci.read8(card, 0x34) & 0xFC
+    let guard = 0
+    while at != 0 && guard < 48 {
+        if pci.read8(card, at) == 0x09 {
+            let kind = pci.read8(card, at + 3)
+            if kind == 1 {
+                common = capabilityWindow(card, at)
+                found = found | 1
+            } else if kind == 2 {
+                notifyBase = pci.memoryBar(card, pci.read8(card, at + 4)) + pci.read32(card, at + 8)
+                notifyMultiplier = pci.read32(card, at + 16)
+                found = found | 2
+            } else if kind == 4 {
+                configuration = capabilityWindow(card, at)
+            }
+        }
+        at = pci.read8(card, at + 1) & 0xFC
+        guard += 1
+    }
+    if (found & 3) != 3 {
+        fail("virtio device " + Text(card.device) + " lacks its common or notification registers")
+    }
+    let opened = Device { common: common; notifyBase: notifyBase; notifyMultiplier: notifyMultiplier; configuration: configuration }
+    device.writeAt8(common, 0x14, 0)
+    let spins = 0
+    while device.readAt8(common, 0x14) != 0 && spins < 1000000 {
+        spins += 1
+    }
+    device.writeAt8(common, 0x14, ACKNOWLEDGE | DRIVER)
+    // Feature bit 32, VERSION_1, is the only one used.
+    device.writeAt32(common, 0x00, 1)
+    if (device.readAt32(common, 0x04) & 1) == 0 {
+        fail("virtio device " + Text(card.device) + " does not offer virtio 1")
+    }
+    device.writeAt32(common, 0x08, 0)
+    device.writeAt32(common, 0x0C, 0)
+    device.writeAt32(common, 0x08, 1)
+    device.writeAt32(common, 0x0C, 1)
+    device.writeAt8(common, 0x14, ACKNOWLEDGE | DRIVER | FEATURES_OK)
+    if (device.readAt8(common, 0x14) & FEATURES_OK) == 0 {
+        fail("virtio device " + Text(card.device) + " refused the virtio 1 features")
+    }
+    return opened
+}
+
+// The device's own configuration block, such as a disk's capacity.
+public function configuration(opened: Device): device.Registers {
+    return opened.configuration
+}
+
+function writeAddress(common: device.Registers, offset: Integer, address: Integer) {
+    device.writeAt32(common, offset, address & 0xFFFFFFFF)
+    device.writeAt32(common, offset + 4, address >> 32)
+}
+
+// Set up queue `index` with at most `size` descriptors (a power of two).
+public function openQueue(opened: Device, index: Integer, size: Integer): Queue {
+    let common = opened.common
+    device.writeAt16(common, 0x16, index)
+    let count = min(device.readAt16(common, 0x18), size)
+    if count == 0 {
+        fail("virtio queue " + Text(index) + " does not exist")
+    }
+    device.writeAt16(common, 0x18, count)
+    let descriptors = device.allocate(count * 16, 16)
+    let available = device.allocate(6 + count * 2, 2)
+    let used = device.allocate(6 + count * 8, 4)
+    writeAddress(common, 0x20, device.addressOf(descriptors, 0))
+    writeAddress(common, 0x28, device.addressOf(available, 0))
+    writeAddress(common, 0x30, device.addressOf(used, 0))
+    let notifyAddress = opened.notifyBase + device.readAt16(common, 0x1E) * opened.notifyMultiplier
+    device.writeAt16(common, 0x1C, 1)
+    return Queue {
+        size: count; index: index; notifyAddress: device.register16(device.registers(notifyAddress, 2), 0)
+        descriptors: descriptors; available: available; used: used; offered: 0; collected: 0; length: 0
+    }
+}
+
+// Tell the device the driver is ready, once every queue is set up.
+public function ready(opened: Device) {
+    device.writeAt8(opened.common, 0x14, ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK)
+}
+
+// Fill descriptor `slot`: a buffer at a physical address, with NEXT and WRITE
+// flags and the following descriptor when NEXT is set.
+public function describe(queue: Queue, slot: Integer, address: Integer, length: Integer, flags: Integer, next: Integer) {
+    let at = slot * 16
+    device.store64(queue.descriptors, at, address)
+    device.store32(queue.descriptors, at + 8, length)
+    device.store16(queue.descriptors, at + 12, flags)
+    device.store16(queue.descriptors, at + 14, next)
+}
+
+// Offer the chain starting at descriptor `head` to the device, without telling it yet.
+public function offer(queue: Queue, head: Integer) {
+    device.store16(queue.available, 4 + (queue.offered % queue.size) * 2, head)
+    machine.fence()
+    queue.offered = (queue.offered + 1) & 0xFFFF
+    device.store16(queue.available, 2, queue.offered)
+}
+
+// Tell the device that chains have been offered.
+public function notify(queue: Queue) {
+    machine.fence()
+    device.write16(queue.notifyAddress, queue.index)
+}
+
+// The head of the next chain the device has finished, or -1 if none is
+// waiting; its length is then in queue.length.
+public function collect(queue: Queue): Integer {
+    machine.fence()
+    if device.load16(queue.used, 2) == queue.collected {
+        return -1
+    }
+    let at = 4 + (queue.collected % queue.size) * 8
+    let head = device.load32(queue.used, at)
+    queue.length = device.load32(queue.used, at + 4)
+    queue.collected = (queue.collected + 1) & 0xFFFF
+    return head
+}
+
+// Offer one chain, notify, and wait for the device to finish it.
+public function complete(queue: Queue, head: Integer) {
+    offer(queue, head)
+    notify(queue)
+    let spins = 0
+    while collect(queue) < 0 {
+        machine.pause()
+        spins += 1
+        if spins > 100000000 {
+            fail("a virtio device did not answer")
+        }
+    }
+}

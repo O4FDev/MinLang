@@ -1,0 +1,75 @@
+// The primary ATA controller in PIO mode: enough to read the boot disk.
+use "device" as device
+
+constant BUSY = 0x80
+constant READY_FOR_DATA = 0x08
+constant ERROR = 0x01
+
+record Channel {
+    data: device.Port16
+    sectorCount: device.Port8
+    lbaLow: device.Port8
+    lbaMid: device.Port8
+    lbaHigh: device.Port8
+    drive: device.Port8
+    // Reads report status; writes issue commands.
+    command: device.Port8
+    alternateStatus: device.Port8
+}
+
+function primary(): Channel {
+    return Channel {
+        data: device.port16(0x1F0); sectorCount: device.port8(0x1F2)
+        lbaLow: device.port8(0x1F3); lbaMid: device.port8(0x1F4); lbaHigh: device.port8(0x1F5)
+        drive: device.port8(0x1F6); command: device.port8(0x1F7); alternateStatus: device.port8(0x3F6)
+    }
+}
+
+function waitWhileBusy(channel: Channel): Integer {
+    let status = device.in8(channel.command)
+    let spins = 0
+    while (status & BUSY) != 0 && spins < 10000000 {
+        status = device.in8(channel.command)
+        spins += 1
+    }
+    return status
+}
+
+// Read `count` sectors (at most 256) starting at `sector` onto the end of `into`.
+public function read(sector: Integer, count: Integer, into: Bytes) {
+    if count <= 0 { return }
+    let channel = primary()
+    waitWhileBusy(channel)
+    device.out8(channel.drive, 0xE0 | ((sector >> 24) & 0x0F))
+    device.out8(channel.sectorCount, count & 0xFF)
+    device.out8(channel.lbaLow, sector & 0xFF)
+    device.out8(channel.lbaMid, (sector >> 8) & 0xFF)
+    device.out8(channel.lbaHigh, (sector >> 16) & 0xFF)
+    device.out8(channel.command, 0x20)
+    let start = into.length
+    into.resize(start + count * 512)
+    for index in 0..count {
+        // The status register is valid 400 ns after the command.
+        for settle in 0..4 { device.in8(channel.alternateStatus) }
+        let status = waitWhileBusy(channel)
+        while (status & (READY_FOR_DATA | ERROR)) == 0 {
+            status = device.in8(channel.command)
+        }
+        if (status & ERROR) != 0 {
+            fail("the disk reported an error reading sector " + Text(sector + index))
+        }
+        device.inBlock16(channel.data, into, start + index * 512, 256)
+    }
+}
+
+// Read any number of sectors, 128 at a time.
+public function readMany(sector: Integer, count: Integer): Bytes {
+    let result = Bytes()
+    let done = 0
+    while done < count {
+        let chunk = min(128, count - done)
+        read(sector + done, chunk, result)
+        done += chunk
+    }
+    return result
+}

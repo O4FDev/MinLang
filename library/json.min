@@ -1,0 +1,302 @@
+// JSON: parsing into a tree of values, reading members, and writing text.
+// Import it with `use "json" as json`.
+//
+// Values are built bottom-up, because a record that contains a list of its
+// own kind may only be given lists that are complete when it is created.
+
+public constant NULL = 0
+public constant BOOLEAN = 1
+public constant NUMBER = 2
+public constant STRING = 3
+public constant ARRAY = 4
+public constant OBJECT = 5
+public constant INVALID = 6
+
+public record Value {
+    kind: Integer
+    text: Text
+    number: Float
+    truth: Boolean
+    // Array elements, or object members whose names are in `keys`.
+    items: List<Value>
+    keys: List<Text>
+}
+
+record Cursor {
+    text: Text
+    position: Integer
+    error: Text
+}
+
+function leaf(kind: Integer, text: Text, number: Float, truth: Boolean): Value {
+    return Value { kind: kind; text: text; number: number; truth: truth; items: []; keys: [] }
+}
+
+public function parse(source: Text): Value {
+    let cursor = Cursor { text: source; position: 0; error: "" }
+    let value = parseValue(cursor, 0)
+    skipSpace(cursor)
+    if cursor.error != "" {
+        return leaf(INVALID, cursor.error, 0.0, false)
+    }
+    return value
+}
+
+function skipSpace(cursor: Cursor) {
+    while cursor.position < cursor.text.length {
+        let c = cursor.text[cursor.position]
+        if c != ' ' && c != '\n' && c != '\r' && c != '\t' { return }
+        cursor.position += 1
+    }
+}
+
+function failure(cursor: Cursor, message: Text): Value {
+    if cursor.error == "" {
+        cursor.error = message + " at character " + Text(cursor.position)
+    }
+    cursor.position = cursor.text.length
+    return leaf(INVALID, cursor.error, 0.0, false)
+}
+
+function literal(cursor: Cursor, word: Text): Boolean {
+    let end = cursor.position + word.length
+    if end > cursor.text.length || cursor.text.slice(cursor.position, end) != word { return false }
+    cursor.position = end
+    return true
+}
+
+function parseValue(cursor: Cursor, depth: Integer): Value {
+    skipSpace(cursor)
+    if depth > 64 { return failure(cursor, "nesting too deep") }
+    if cursor.position >= cursor.text.length { return failure(cursor, "unexpected end") }
+    let c = cursor.text[cursor.position]
+    if c == '{' { return parseObject(cursor, depth) }
+    if c == '[' { return parseArray(cursor, depth) }
+    if c == '"' { return leaf(STRING, parseString(cursor), 0.0, false) }
+    if literal(cursor, "true") { return leaf(BOOLEAN, "true", 0.0, true) }
+    if literal(cursor, "false") { return leaf(BOOLEAN, "false", 0.0, false) }
+    if literal(cursor, "null") { return leaf(NULL, "null", 0.0, false) }
+    return parseNumber(cursor)
+}
+
+function parseObject(cursor: Cursor, depth: Integer): Value {
+    cursor.position += 1
+    let keys: List<Text> = []
+    let items: List<Value> = []
+    skipSpace(cursor)
+    if cursor.position < cursor.text.length && cursor.text[cursor.position] == '}' {
+        cursor.position += 1
+        return Value { kind: OBJECT; text: ""; number: 0.0; truth: false; items: items; keys: keys }
+    }
+    while cursor.error == "" {
+        skipSpace(cursor)
+        if cursor.position >= cursor.text.length || cursor.text[cursor.position] != '"' {
+            return failure(cursor, "expected a member name")
+        }
+        keys.add(parseString(cursor))
+        skipSpace(cursor)
+        if cursor.position >= cursor.text.length || cursor.text[cursor.position] != ':' {
+            return failure(cursor, "expected ':'")
+        }
+        cursor.position += 1
+        items = items.appended(parseValue(cursor, depth + 1))
+        skipSpace(cursor)
+        if cursor.position >= cursor.text.length { return failure(cursor, "unfinished object") }
+        let c = cursor.text[cursor.position]
+        cursor.position += 1
+        if c == '}' {
+            return Value { kind: OBJECT; text: ""; number: 0.0; truth: false; items: items; keys: keys }
+        }
+        if c != ',' { return failure(cursor, "expected ',' or '}'") }
+    }
+    return failure(cursor, "invalid object")
+}
+
+function parseArray(cursor: Cursor, depth: Integer): Value {
+    cursor.position += 1
+    let items: List<Value> = []
+    skipSpace(cursor)
+    if cursor.position < cursor.text.length && cursor.text[cursor.position] == ']' {
+        cursor.position += 1
+        return Value { kind: ARRAY; text: ""; number: 0.0; truth: false; items: items; keys: [] }
+    }
+    while cursor.error == "" {
+        items = items.appended(parseValue(cursor, depth + 1))
+        skipSpace(cursor)
+        if cursor.position >= cursor.text.length { return failure(cursor, "unfinished array") }
+        let c = cursor.text[cursor.position]
+        cursor.position += 1
+        if c == ']' {
+            return Value { kind: ARRAY; text: ""; number: 0.0; truth: false; items: items; keys: [] }
+        }
+        if c != ',' { return failure(cursor, "expected ',' or ']'") }
+    }
+    return failure(cursor, "invalid array")
+}
+
+function hexDigit(c: Character): Integer {
+    if c >= '0' && c <= '9' { return Integer(c) - 48 }
+    if c >= 'a' && c <= 'f' { return Integer(c) - 87 }
+    if c >= 'A' && c <= 'F' { return Integer(c) - 55 }
+    return -1
+}
+
+function parseString(cursor: Cursor): Text {
+    cursor.position += 1
+    let parts: List<Text> = []
+    let start = cursor.position
+    let text = cursor.text
+    while cursor.position < text.length {
+        let c = text[cursor.position]
+        if c == '"' {
+            parts.add(text.slice(start, cursor.position))
+            cursor.position += 1
+            return joinText(parts)
+        }
+        if c == '\\' {
+            parts.add(text.slice(start, cursor.position))
+            cursor.position += 1
+            if cursor.position >= text.length { break }
+            let e = text[cursor.position]
+            cursor.position += 1
+            if e == 'n' { parts.add("\n") }
+            if e == 't' { parts.add("\t") }
+            if e == 'r' { parts.add("\r") }
+            if e == 'b' || e == 'f' { parts.add(" ") }
+            if e == '"' || e == '\\' || e == '/' { parts.add(Text(e)) }
+            if e == 'u' && cursor.position + 4 <= text.length {
+                let code = 0
+                for index in 0..4 {
+                    code = code * 16 + max(hexDigit(text[cursor.position + index]), 0)
+                }
+                cursor.position += 4
+                // Combine a surrogate pair.
+                if code >= 0xD800 && code < 0xDC00 && cursor.position + 6 <= text.length && text[cursor.position] == '\\' && text[cursor.position + 1] == 'u' {
+                    let low = 0
+                    for index in 0..4 {
+                        low = low * 16 + max(hexDigit(text[cursor.position + 2 + index]), 0)
+                    }
+                    if low >= 0xDC00 && low < 0xE000 {
+                        code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+                        cursor.position += 6
+                    }
+                }
+                if code >= 0xD800 && code < 0xE000 { code = 0xFFFD }
+                parts.add(Text(Character(code)))
+            }
+            start = cursor.position
+        } else {
+            cursor.position += 1
+        }
+    }
+    failure(cursor, "unfinished string")
+    return joinText(parts)
+}
+
+function parseNumber(cursor: Cursor): Value {
+    let text = cursor.text
+    let start = cursor.position
+    let negative = false
+    if cursor.position < text.length && text[cursor.position] == '-' {
+        negative = true
+        cursor.position += 1
+    }
+    let value = 0.0
+    let digits = 0
+    while cursor.position < text.length && text[cursor.position] >= '0' && text[cursor.position] <= '9' {
+        value = value * 10.0 + Float(Integer(text[cursor.position]) - 48)
+        cursor.position += 1
+        digits += 1
+    }
+    if cursor.position < text.length && text[cursor.position] == '.' {
+        cursor.position += 1
+        let scale = 0.1
+        while cursor.position < text.length && text[cursor.position] >= '0' && text[cursor.position] <= '9' {
+            value += Float(Integer(text[cursor.position]) - 48) * scale
+            scale = scale / 10.0
+            cursor.position += 1
+            digits += 1
+        }
+    }
+    if cursor.position < text.length && (text[cursor.position] == 'e' || text[cursor.position] == 'E') {
+        cursor.position += 1
+        let sign = 1.0
+        if cursor.position < text.length && (text[cursor.position] == '-' || text[cursor.position] == '+') {
+            if text[cursor.position] == '-' { sign = -1.0 }
+            cursor.position += 1
+        }
+        let exponent = 0.0
+        while cursor.position < text.length && text[cursor.position] >= '0' && text[cursor.position] <= '9' {
+            exponent = exponent * 10.0 + Float(Integer(text[cursor.position]) - 48)
+            cursor.position += 1
+        }
+        value = value * pow(10.0, sign * exponent)
+    }
+    if digits == 0 { return failure(cursor, "unexpected character") }
+    if negative { value = -value }
+    return leaf(NUMBER, text.slice(start, cursor.position), value, false)
+}
+
+// ----- Access -----
+
+public function member(value: Value, name: Text): Value {
+    if value.kind == OBJECT {
+        for index in 0..value.keys.length {
+            if value.keys[index] == name {
+                return value.items[index]
+            }
+        }
+    }
+    return leaf(NULL, "", 0.0, false)
+}
+
+public function string(value: Value, name: Text): Text {
+    let found = member(value, name)
+    if found.kind == STRING { return found.text }
+    if found.kind == NUMBER || found.kind == BOOLEAN { return found.text }
+    return ""
+}
+
+// A JSON string literal for `text`.
+public function quote(text: Text): Text {
+    let parts: List<Text> = ["\""]
+    for c in text {
+        if c == '"' { parts.add("\\\"") } else {
+            if c == '\\' { parts.add("\\\\") } else {
+                if c == '\n' { parts.add("\\n") } else {
+                    if Integer(c) < 32 { parts.add(" ") } else { parts.add(Text(c)) }
+                }
+            }
+        }
+    }
+    parts.add("\"")
+    return joinText(parts)
+}
+
+// Indented JSON text, for showing a response to people.
+public function pretty(value: Value, indent: Text): Text {
+    if value.kind == STRING { return quote(value.text) }
+    if value.kind == OBJECT {
+        if value.items.length == 0 { return "{}" }
+        let parts: List<Text> = ["{\n"]
+        for index in 0..value.items.length {
+            parts.add(indent + "  " + quote(value.keys[index]) + ": " + pretty(value.items[index], indent + "  "))
+            if index + 1 < value.items.length { parts.add(",") }
+            parts.add("\n")
+        }
+        parts.add(indent + "}")
+        return joinText(parts)
+    }
+    if value.kind == ARRAY {
+        if value.items.length == 0 { return "[]" }
+        let parts: List<Text> = ["[\n"]
+        for index in 0..value.items.length {
+            parts.add(indent + "  " + pretty(value.items[index], indent + "  "))
+            if index + 1 < value.items.length { parts.add(",") }
+            parts.add("\n")
+        }
+        parts.add(indent + "]")
+        return joinText(parts)
+    }
+    return value.text
+}

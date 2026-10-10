@@ -1,0 +1,91 @@
+// The Bochs/QEMU display adapter (PCI 1234:1111): the PC's standard VGA and
+// the Arm board's bochs-display. Any resolution, 32-bit pixels, and a linear
+// framebuffer at the address in its first base address register.
+//
+// Its mode registers are the Bochs "dispi" interface, sixteen bits each, at
+// offset 0x500 of the memory BAR 2 that both adapters provide. Older PC VGA
+// adapters without that BAR are reached through I/O ports 0x1CE and 0x1CF.
+use "arch" as arch
+use "device" as device
+use "./pci.min" as pci
+
+record Adapter {
+    // The memory-mapped registers, when the adapter has them.
+    mapped: Boolean
+    registers: device.Registers
+}
+
+function setRegister(adapter: Adapter, index: Integer, value: Integer) {
+    if adapter.mapped {
+        device.writeAt16(adapter.registers, 0x500 + index * 2, value)
+    } else {
+        device.out16(device.port16(0x01CE), index)
+        device.out16(device.port16(0x01CF), value)
+    }
+}
+
+function register(adapter: Adapter, index: Integer): Integer {
+    if adapter.mapped {
+        return device.readAt16(adapter.registers, 0x500 + index * 2)
+    }
+    device.out16(device.port16(0x01CE), index)
+    return device.in16(device.port16(0x01CF))
+}
+
+// The framebuffer: its address (0 when there is no adapter) and the bytes
+// from one row to the next.
+public record Mode {
+    address: Integer
+    stride: Integer
+}
+
+// Bytes of framebuffer for a frame are made a multiple of 16 KiB by padding
+// each row: QEMU with Apple's hypervisor tracks writes to it in 16 KiB host
+// pages and stops if a display's frame ends inside one.
+function paddedWidth(width: Integer, height: Integer): Integer {
+    let padded = width
+    while (padded * 4 * height) % 16384 != 0 && padded < width * 2 {
+        padded += 1
+    }
+    if (padded * 4 * height) % 16384 != 0 { return width }
+    return padded
+}
+
+// Switch to width × height × 32 bits.
+public function start(devices: List<pci.Device>, width: Integer, height: Integer): Mode {
+    let none = Mode { address: 0; stride: width * 4 }
+    let index = pci.find(devices, 0x1234, 0x1111)
+    if index < 0 {
+        return none
+    }
+    let card = devices[index]
+    pci.enable(card)
+    let mapped = pci.memoryBar(card, 2) != 0
+    if !mapped && !arch.LEGACY_PC {
+        return none
+    }
+    let window = device.registers(4096, 4096)
+    if mapped {
+        window = pci.registers(card, 2, 0x1000)
+    }
+    let adapter = Adapter { mapped: mapped; registers: window }
+    if register(adapter, 0) < 0xB0C0 {
+        return none
+    }
+    let rowWidth = paddedWidth(width, height)
+    setRegister(adapter, 4, 0)
+    setRegister(adapter, 1, width)
+    setRegister(adapter, 2, height)
+    setRegister(adapter, 3, 32)
+    setRegister(adapter, 4, 0x41)
+    // Enabling resets the virtual size to the visible one on the PC's VGA, so
+    // the padded row width is set afterwards.
+    setRegister(adapter, 6, rowWidth)
+    setRegister(adapter, 7, height)
+    setRegister(adapter, 8, 0)
+    setRegister(adapter, 9, 0)
+    if register(adapter, 6) != rowWidth {
+        return Mode { address: pci.memoryBar(card, 0); stride: width * 4 }
+    }
+    return Mode { address: pci.memoryBar(card, 0); stride: rowWidth * 4 }
+}

@@ -1,0 +1,282 @@
+// HTTP/1.1 requests over the TCP stack, for http:// and https:// servers.
+//
+// A request moves through its states as `poll` is called each frame: it
+// resolves the host name, connects, runs the TLS handshake for https, sends
+// the request and parses the response once it is complete.
+use "tls" as tls
+use "./stack.min" as stack
+use "../../shared/interrupts.min" as interrupts
+
+public constant RESOLVING = -1
+public constant WAITING = 0
+public constant CONNECTED = 1
+public constant SENT = 2
+public constant DONE = 3
+public constant FAILED = 4
+
+public record Request {
+    connection: stack.Connection
+    session: tls.Session
+    secure: Boolean
+    state: Integer
+    payload: Bytes
+    plain: Bytes
+    status: Integer
+    reason: Text
+    headers: List<Text>
+    body: Bytes
+    error: Text
+    started: Integer
+    connectedAt: Integer
+    finished: Integer
+    host: Text
+    port: Integer
+}
+
+// ----- UTF-8 -----
+
+public function encode(text: Text): Bytes {
+    return Bytes(text)
+}
+
+public function decode(bytes: Bytes, start: Integer, end: Integer): Text {
+    return Text(bytes.slice(start, end))
+}
+
+// ----- Requests -----
+
+// Start a request to `host` (a name or dotted address) on `port`. With
+// `secure` the exchange runs over TLS 1.3.
+public function start(network: stack.Network, host: Text, port: Integer, secure: Boolean, method: Text, path: Text, headers: List<Text>, body: Text): Request {
+    let content = Bytes(body)
+    let lines: List<Text> = []
+    lines.add(method + " " + path + " HTTP/1.1\r\n")
+    lines.add("Host: " + host + "\r\n")
+    lines.add("User-Agent: MinyarOS/1.0 (Minyar OS research build)\r\n")
+    lines.add("Accept: application/json\r\n")
+    lines.add("Connection: close\r\n")
+    for header in headers {
+        lines.add(header + "\r\n")
+    }
+    if body != "" {
+        lines.add("Content-Length: " + Text(content.length) + "\r\n")
+    }
+    lines.add("\r\n")
+    let payload = Bytes(joinText(lines))
+    payload.addBytes(content)
+    let session = tls.none()
+    if secure { session = tls.client(host, randomBytes(64)) }
+    let request = Request {
+        connection: stack.placeholder(); session: session; secure: secure
+        state: RESOLVING; payload: payload; plain: Bytes(); status: 0; reason: ""; headers: []; body: Bytes(); error: ""
+        started: interrupts.milliseconds(); connectedAt: 0; finished: 0; host: host; port: port
+    }
+    let ip = stack.parseIp(host)
+    if ip >= 0 {
+        connect(network, request, ip)
+    } else {
+        if stack.resolved(network, host) < 0 {
+            stack.resolve(network, host)
+        }
+    }
+    return request
+}
+
+function connect(network: stack.Network, request: Request, ip: Integer) {
+    request.connection = stack.connect(network, ip, request.port)
+    request.state = WAITING
+}
+
+public function cancel(network: stack.Network, request: Request) {
+    stack.abort(network, request.connection)
+    request.state = FAILED
+    request.error = "cancelled"
+    request.finished = interrupts.milliseconds()
+}
+
+function finish(request: Request, state: Integer, error: Text) {
+    request.state = state
+    request.error = error
+    request.finished = interrupts.milliseconds()
+}
+
+// Advance the request; returns its state.
+public function poll(network: stack.Network, request: Request): Integer {
+    if request.state == DONE || request.state == FAILED { return request.state }
+    if interrupts.milliseconds() - request.started > 30000 {
+        cancel(network, request)
+        request.error = "the request timed out after 30 seconds"
+        return request.state
+    }
+    if request.state == RESOLVING {
+        let ip = stack.resolved(network, request.host)
+        if ip == 0 {
+            finish(request, FAILED, "could not find " + request.host)
+        }
+        if ip > 0 {
+            connect(network, request, ip)
+        }
+        return request.state
+    }
+    let connection = request.connection
+    if request.state == WAITING && connection.state == stack.OPEN {
+        request.state = CONNECTED
+        request.connectedAt = interrupts.milliseconds()
+        if request.secure {
+            stack.write(network, connection, tls.takeOutgoing(request.session))
+        } else {
+            stack.write(network, connection, request.payload)
+            request.state = SENT
+        }
+    }
+    if connection.state == stack.FAILED {
+        finish(request, FAILED, connection.error)
+        return request.state
+    }
+    // Everything the server has sent so far, decrypted for https.
+    if request.secure && request.state >= CONNECTED && connection.incoming.length > 0 {
+        let arrived = connection.incoming
+        connection.incoming = Bytes()
+        tls.receive(request.session, arrived)
+        request.plain.addBytes(tls.takeIncoming(request.session))
+        let reply = tls.takeOutgoing(request.session)
+        if reply.length > 0 { stack.write(network, connection, reply) }
+        if request.session.state == tls.FAILED {
+            finish(request, FAILED, "TLS: " + request.session.error)
+            return request.state
+        }
+    }
+    if request.state == CONNECTED && request.secure && tls.established(request.session) {
+        tls.send(request.session, request.payload)
+        stack.write(network, connection, tls.takeOutgoing(request.session))
+        request.state = SENT
+    }
+    if request.state == SENT {
+        let data = connection.incoming
+        if request.secure { data = request.plain }
+        let closed = connection.finReceived || request.secure && request.session.state == tls.CLOSED
+        if parse(request, data, closed) {
+            finish(request, DONE, "")
+            stack.close(network, connection)
+        } else {
+            if closed || connection.state == stack.FINISHED {
+                finish(request, FAILED, "the server closed the connection before answering")
+            }
+        }
+    }
+    return request.state
+}
+
+function headerEnd(data: Bytes): Integer {
+    let index = 0
+    while index + 3 < data.length {
+        if data[index] == 13 && data[index + 1] == 10 && data[index + 2] == 13 && data[index + 3] == 10 {
+            return index
+        }
+        index += 1
+    }
+    return -1
+}
+
+function lowerText(text: Text): Text {
+    let parts: List<Text> = []
+    for character in text {
+        if character >= 'A' && character <= 'Z' {
+            parts.add(Text(Character(Integer(character) + 32)))
+        } else {
+            parts.add(Text(character))
+        }
+    }
+    return joinText(parts)
+}
+
+public function header(request: Request, name: Text): Text {
+    let wanted = lowerText(name) + ":"
+    for line in request.headers {
+        if line.length >= wanted.length && lowerText(line.slice(0, wanted.length)) == wanted {
+            let value = line.slice(wanted.length, line.length)
+            while value.length > 0 && value[0] == ' ' {
+                value = value.slice(1, value.length)
+            }
+            return value
+        }
+    }
+    return ""
+}
+
+// Parse a complete response from `data`. Returns false if more is needed.
+function parse(request: Request, data: Bytes, closed: Boolean): Boolean {
+    let end = headerEnd(data)
+    if end < 0 { return false }
+    let head = decode(data, 0, end)
+    let lines: List<Text> = []
+    let start = 0
+    for position in 0..head.length {
+        if head[position] == '\n' {
+            let stop = position
+            if stop > start && head[stop - 1] == '\r' { stop -= 1 }
+            lines.add(head.slice(start, stop))
+            start = position + 1
+        }
+    }
+    lines.add(head.slice(start, head.length))
+    let statusLine = lines[0]
+    if statusLine.length >= 12 {
+        request.status = Integer(statusLine[9]) * 100 + Integer(statusLine[10]) * 10 + Integer(statusLine[11]) - 48 * 111
+        request.reason = statusLine.slice(min(13, statusLine.length), statusLine.length)
+    }
+    let headers: List<Text> = []
+    for index in 1..lines.length { headers.add(lines[index]) }
+    request.headers = headers
+    let bodyStart = end + 4
+    let length = header(request, "Content-Length")
+    if length != "" {
+        let expected = 0
+        for character in length {
+            if character >= '0' && character <= '9' {
+                expected = expected * 10 + Integer(character) - 48
+            }
+        }
+        if data.length - bodyStart < expected { return false }
+        request.body = data.slice(bodyStart, bodyStart + expected)
+        return true
+    }
+    if lowerText(header(request, "Transfer-Encoding")) == "chunked" {
+        return unchunk(request, data, bodyStart)
+    }
+    if !closed { return false }
+    request.body = data.slice(bodyStart, data.length)
+    return true
+}
+
+function unchunk(request: Request, data: Bytes, start: Integer): Boolean {
+    let body = Bytes()
+    let at = start
+    while true {
+        let size = 0
+        let digits = 0
+        while at < data.length && data[at] != 13 {
+            let c = data[at]
+            let value = -1
+            if c >= 48 && c <= 57 { value = c - 48 }
+            if c >= 97 && c <= 102 { value = c - 87 }
+            if c >= 65 && c <= 70 { value = c - 55 }
+            if value >= 0 && digits >= 0 {
+                size = size * 16 + value
+                digits += 1
+            } else {
+                digits = -1
+            }
+            at += 1
+        }
+        if at + 1 >= data.length { return false }
+        at += 2
+        if size == 0 {
+            request.body = body
+            return true
+        }
+        if at + size + 2 > data.length { return false }
+        body.addBytes(data.slice(at, at + size))
+        at += size + 2
+    }
+}

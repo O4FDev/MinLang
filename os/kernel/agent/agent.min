@@ -1,0 +1,742 @@
+// The agent behind the conversation.
+//
+// Requests about moving run the moving-day task from the reference recording:
+// the agent reads a ranked list of movers, visits their sites, builds a
+// spreadsheet and phones each company. Everything else is sent to Atacama,
+// the 30M-parameter language model, over this machine's own TCP/IP stack.
+use "../ui/state.min" as state
+use "../ui/conversation.min" as conversation
+use "../ui/panel.min" as panel
+use "../ui/desktop.min" as desktop
+use "../ui/app.min" as app
+use "../ui/text.min" as text
+use "../net/stack.min" as stack
+use "../net/http.min" as http
+use "json" as json
+
+constant IDLE = 0
+constant MOVING = 1
+constant ATACAMA = 2
+
+public record Settings {
+    host: Text
+    port: Integer
+    key: Text
+}
+
+public record Agent {
+    mode: Integer
+    phase: Integer
+    phaseStart: Float
+    pausedAt: Float
+    question: Text
+    reply: Integer
+    steps: Integer
+    task: Integer
+    results: Integer
+    call: Integer
+    outcome: Integer
+    settings: Settings
+    requests: List<http.Request>
+    attempts: Integer
+    answer: Text
+    health: Text
+    healthChecked: Boolean
+    taskStarted: Float
+    docked: Boolean
+    failed: Boolean
+}
+
+public function create(settings: Settings): Agent {
+    return Agent {
+        mode: IDLE; phase: 0; phaseStart: 0.0; pausedAt: -1.0; question: ""
+        reply: -1; steps: -1; task: -1; results: -1; call: -1; outcome: 0
+        settings: settings; requests: []; attempts: 0; answer: ""; health: ""; healthChecked: false
+        taskStarted: -1.0; docked: false; failed: false
+    }
+}
+
+function lower(character: Character): Character {
+    if character >= 'A' && character <= 'Z' { return Character(Integer(character) + 32) }
+    return character
+}
+
+function mentions(textValue: Text, word: Text): Boolean {
+    let last = textValue.length - word.length
+    for start in 0..(last + 1) {
+        let matches = true
+        for index in 0..word.length {
+            if matches && lower(textValue[start + index]) != word[index] {
+                matches = false
+            }
+        }
+        if matches { return true }
+    }
+    return false
+}
+
+public function busy(agent: Agent): Boolean {
+    return agent.mode != IDLE
+}
+
+// A new message from the composer.
+public function receive(desktopState: app.Desktop, agent: Agent, message: Text) {
+    let application = desktopState.app
+    if agent.mode != IDLE {
+        app.showToast(application, "The agent is still working on the last request", 860, 900)
+        return
+    }
+    let user = state.newBlock(state.USER, message, application.now)
+    conversation.add(application, user)
+    agent.question = message
+    agent.phase = 0
+    agent.phaseStart = application.now
+    agent.pausedAt = -1.0
+    agent.requests = []
+    agent.attempts = 0
+    agent.failed = false
+    agent.answer = ""
+    agent.steps = -1
+    agent.task = -1
+    application.panel.articleTitle = ""
+    if mentions(message, "mov") || mentions(message, "demo") {
+        agent.mode = MOVING
+    } else {
+        agent.mode = ATACAMA
+    }
+}
+
+// ----- Shared steps -----
+
+function block(application: state.App, index: Integer): state.Block {
+    return application.blocks[index]
+}
+
+function addReply(application: state.App, value: Text, style: Text, rate: Float): Integer {
+    let reply = state.newBlock(state.REPLY, value, application.now)
+    reply.detail = style
+    reply.rate = rate
+    return conversation.add(application, reply)
+}
+
+function startTask(application: state.App, agent: Agent, title: Text, first: Text) {
+    let steps = state.newBlock(state.STEPS, title, application.now)
+    steps.items.add(first)
+    agent.steps = conversation.add(application, steps)
+    let task = state.newBlock(state.TASK, title, application.now)
+    task.detail = first
+    agent.task = conversation.add(application, task)
+    panel.show(application, title)
+    panel.setStatus(application, first)
+    panel.setPage(application, state.PAGE_BLANK)
+    agent.taskStarted = application.now
+    agent.docked = false
+}
+
+// A second after the task window appears, the conversation moves aside for it.
+function dockSoon(application: state.App, agent: Agent) {
+    if !agent.docked && agent.taskStarted > 0.0 && application.now - agent.taskStarted > 1.0 {
+        agent.docked = true
+        state.retarget(application.column, 138.0, application.now, 0.6)
+    }
+}
+
+// The working glow rises as the agent starts using the computer.
+function glowOn(application: state.App) {
+    state.retarget(application.glow, 1.0, application.now, 1.2)
+}
+
+// Finish the last step and start a new one.
+function nextStep(application: state.App, agent: Agent, finished: Text, next: Text) {
+    let steps = block(application, agent.steps)
+    if steps.items.length > 0 {
+        steps.items[steps.items.length - 1] = finished
+    }
+    if next != "" {
+        steps.items.add(next)
+        steps.since = application.now
+        setStatus(application, agent, next)
+    }
+    state.touch(steps)
+    conversation.layout(application)
+}
+
+function setStatus(application: state.App, agent: Agent, status: Text) {
+    let task = block(application, agent.task)
+    task.detail = status
+    task.since = application.now
+    panel.setStatus(application, status)
+    conversation.invalidateBlock(application, task)
+}
+
+// Fold the opening reply and the steps into one summary line, mark the task
+// done and turn off the working glow.
+function complete(application: state.App, agent: Agent, summary: Text) {
+    let blocks: List<state.Block> = []
+    let steps = block(application, agent.steps)
+    steps.done = true
+    for index in 0..application.blocks.length {
+        let current = application.blocks[index]
+        if index == agent.steps {
+            let folded = state.newBlock(state.SUMMARY, summary, application.now - 1.0)
+            folded.items = steps.items
+            folded.expanded = false
+            folded.shownTop = current.shownTop
+            blocks.add(folded)
+        } else {
+            if index != agent.reply {
+                blocks.add(current)
+            }
+        }
+    }
+    let task = block(application, agent.task)
+    task.done = true
+    state.touch(task)
+    application.blocks = blocks
+    panel.finish(application)
+    state.retarget(application.glow, 0.0, application.now, 0.9)
+    conversation.layout(application)
+    agent.mode = IDLE
+}
+
+function removeLast(application: state.App) {
+    let blocks: List<state.Block> = []
+    for index in 0..(application.blocks.length - 1) {
+        blocks.add(application.blocks[index])
+    }
+    application.blocks = blocks
+    conversation.layout(application)
+}
+
+// ----- Controls in the conversation and the task window -----
+
+public function control(desktopState: app.Desktop, agent: Agent, action: Integer) {
+    let application = desktopState.app
+    if action < 0 {
+        let control = -1 - action
+        if control == panel.CONTROL_EXPAND { panel.toggleMaximized(application) }
+        if control == panel.CONTROL_PAUSE { togglePause(application, agent) }
+        return
+    }
+    let index = action / 16
+    let what = action % 16
+    if index >= application.blocks.length { return }
+    let target = application.blocks[index]
+    if what == conversation.CONTROL_TOGGLE {
+        target.expanded = !target.expanded
+        conversation.layout(application)
+    }
+    if what == conversation.CONTROL_EXPAND { panel.toggleMaximized(application) }
+    if what == conversation.CONTROL_ORIGIN || what == conversation.CONTROL_LINK {
+        if application.panel.visible {
+            if what == conversation.CONTROL_LINK && agent.mode == IDLE && target.kind == state.SHEET {
+                panel.setPage(application, state.PAGE_SHEET)
+            }
+            if what == conversation.CONTROL_LINK && agent.mode == IDLE && target.kind == state.SOURCES {
+                panel.setPage(application, state.PAGE_ARTICLE_LIVE)
+            }
+            if application.panel.maximized.to < 0.5 { panel.toggleMaximized(application) }
+        }
+    }
+    if what == conversation.CONTROL_HANG_UP { hangUp(application, agent) }
+    if what == conversation.CONTROL_COPY {
+        application.clipboard = target.text
+        app.showToast(application, "Copied to the clipboard", application.input.x, application.input.y - 44)
+    }
+}
+
+function togglePause(application: state.App, agent: Agent) {
+    let current = application.panel
+    current.paused = !current.paused
+    if current.paused {
+        agent.pausedAt = application.now
+    } else {
+        if agent.pausedAt >= 0.0 {
+            agent.phaseStart += application.now - agent.pausedAt
+        }
+        agent.pausedAt = -1.0
+    }
+    panel.invalidate(application)
+}
+
+function hangUp(application: state.App, agent: Agent) {
+    if agent.mode == MOVING && agent.phase >= 17 && agent.phase <= 21 {
+        agent.outcome = 1
+        // End this call now; the timeline moves on to the next company.
+        agent.phaseStart = application.now - 100.0
+    }
+    if agent.mode == ATACAMA && agent.requests.length > 0 {
+        agent.outcome = 1
+    }
+}
+
+// ----- Each frame -----
+
+public function update(desktopState: app.Desktop, agent: Agent, network: stack.Network) {
+    let application = desktopState.app
+    for action in desktopState.actions {
+        control(desktopState, agent, action)
+    }
+    desktopState.actions = []
+    for message in desktopState.outbox {
+        receive(desktopState, agent, message)
+    }
+    desktopState.outbox = []
+    if !agent.healthChecked && network.configured {
+        checkHealth(agent, network)
+    }
+    pollHealth(application, agent, network)
+    if agent.pausedAt >= 0.0 { return }
+    dockSoon(application, agent)
+    if agent.mode == MOVING { moving(application, agent) }
+    if agent.mode == ATACAMA {
+        atacama(application, agent, network)
+        readArticle(application, agent, network)
+        answerAtacama(application, agent, network)
+    }
+}
+
+// ----- The moving-day task -----
+
+function duration(phase: Integer): Float {
+    if phase == 0 { return 0.7 }
+    if phase == 1 { return 1.8 }
+    if phase == 2 { return 2.4 }
+    if phase == 3 { return 3.0 }
+    if phase >= 4 && phase <= 8 { return 2.4 }
+    if phase == 9 { return 1.2 }
+    if phase >= 10 && phase <= 14 { return 0.55 }
+    if phase == 15 || phase == 16 { return 0.9 }
+    if phase >= 17 && phase <= 21 { return 3.6 }
+    if phase == 22 { return 0.9 }
+    if phase == 23 { return 2.8 }
+    if phase == 24 { return 3.6 }
+    return 1.0
+}
+
+constant SHEET_NAMES = "Jay's Small Moves|One Big Man & One Big Truck|Pure Moving Company|Shannon Moving & Storage|NorthStar Moving Company"
+constant SHEET_PHONES = "(415) 999-6795|(415) 821-9697|(415) 919-6497|(415) 866-4424|(415) 635-3844"
+constant CALL_NAMES = "Shannon Moving & Storage|Jay's Small Moves|Pure Moving Company|NorthStar Moving Company|One Big Man & One Big Truck"
+constant CALL_RESULTS = "$495 · Friday, 10am · 2 movers + truck|No answer|No availability Friday|$420 · Friday, 9am · 2 movers + truck|No answer"
+constant CALL_SHEET_ROWS = "3|0|2|4|1"
+constant CALL_OUTCOMES = "Quote received|No answer|Unavailable|Quote received|No answer"
+constant CALL_QUOTES = "495|||420|"
+constant CALL_DETAILS = "Friday, 10am · 2 movers + truck|No answer|No availability Friday|Friday, 9am · 2 movers + truck|No answer"
+
+function split(value: Text): List<Text> {
+    let parts: List<Text> = []
+    let start = 0
+    for index in 0..value.length {
+        if value[index] == '|' {
+            parts.add(value.slice(start, index))
+            start = index + 1
+        }
+    }
+    parts.add(value.slice(start, value.length))
+    return parts
+}
+
+function moving(application: state.App, agent: Agent) {
+    while application.now - agent.phaseStart >= duration(agent.phase) && agent.mode == MOVING {
+        agent.phaseStart += duration(agent.phase)
+        if agent.phaseStart < application.now - 2.0 { agent.phaseStart = application.now }
+        agent.phase += 1
+        enterMoving(application, agent, agent.phase)
+    }
+}
+
+function enterMoving(application: state.App, agent: Agent, phase: Integer) {
+    let current = application.panel
+    if phase == 1 {
+        agent.reply = addReply(application, "I’ll look up movers for Friday and collect their phone numbers in Google Sheets.", "bullet", 52.0)
+    }
+    if phase == 2 {
+        startTask(application, agent, "Find movers for Friday", "Opening sfgate.com")
+    }
+    if phase == 3 {
+        glowOn(application)
+        panel.setPage(application, state.PAGE_ARTICLE)
+        nextStep(application, agent, "Opened sfgate.com", "Reading page content")
+    }
+    if phase == 4 { panel.setPage(application, state.PAGE_PURE) }
+    if phase == 5 { panel.setPage(application, state.PAGE_JAYS) }
+    if phase == 6 { panel.setPage(application, state.PAGE_SHANNON) }
+    if phase == 7 { panel.setPage(application, state.PAGE_BIGMAN) }
+    if phase == 8 { panel.setPage(application, state.PAGE_NORTHSTAR) }
+    if phase == 9 {
+        nextStep(application, agent, "Read page content", "Opening docs.google.com")
+        current.sheetNames = split(SHEET_NAMES)
+        current.sheetPhones = split(SHEET_PHONES)
+        current.sheetOutcomes = ["Not called", "Not called", "Not called", "Not called", "Not called"]
+        current.sheetQuotes = ["", "", "", "", ""]
+        current.sheetDetails = ["", "", "", "", ""]
+        current.sheetRows = 0
+        panel.setPage(application, state.PAGE_SHEET)
+    }
+    if phase >= 10 && phase <= 14 {
+        current.sheetRows = phase - 9
+        panel.touch(application)
+    }
+    if phase == 15 {
+        nextStep(application, agent, "Opened docs.google.com", "")
+        let finishedSteps = block(application, agent.steps)
+        finishedSteps.done = true
+        state.touch(finishedSteps)
+        setStatus(application, agent, "Opened docs.google.com")
+        addReply(application, "Here is a shortlist of Friday’s moving quotes:", "", 60.0)
+    }
+    if phase == 16 {
+        let sheet = state.newBlock(state.SHEET, "Moving quotes", application.now)
+        sheet.detail = "5 movers · phone numbers and call results"
+        conversation.add(application, sheet)
+    }
+    if phase >= 17 && phase <= 22 {
+        let callIndex = phase - 17
+        if phase == 17 {
+            agent.results = conversation.add(application, state.newBlock(state.RESULTS, "", application.now))
+            let call = state.newBlock(state.CALL, "Calling 5 vendors...", application.now)
+            call.items = split(CALL_NAMES)
+            call.count = 5
+            agent.call = conversation.add(application, call)
+        } else {
+            recordCall(application, agent, callIndex - 1)
+        }
+        if phase < 22 {
+            let call = block(application, agent.call)
+            call.index = callIndex
+            call.since = application.now
+            agent.outcome = 0
+            conversation.invalidateBlock(application, call)
+        } else {
+            removeLast(application)
+            let note = state.newBlock(state.NOTE, "5 calls complete · 2 quotes", application.now)
+            conversation.add(application, note)
+        }
+    }
+    if phase == 23 {
+        addReply(application, "I called all 5 movers and added the results to Google Sheets. 2 companies didn’t answer, and 1 has no availability Friday. Nothing is booked yet.", "", 58.0)
+    }
+    if phase == 24 {
+        addReply(application, "I recommend NorthStar Moving Company: $420 — Friday, 9am · 2 movers + truck. It costs $75 less than Shannon Moving & Storage ($495 — Friday, 10am · 2 movers + truck). Want me to book it?", "copy", 58.0)
+    }
+    if phase == 25 {
+        complete(application, agent, "Opened sfgate.com, read page content, and opened docs.google.com")
+    }
+}
+
+function recordCall(application: state.App, agent: Agent, index: Integer) {
+    let names = split(CALL_NAMES)
+    let results = split(CALL_RESULTS)
+    let rows = split(CALL_SHEET_ROWS)
+    let outcomes = split(CALL_OUTCOMES)
+    let quotes = split(CALL_QUOTES)
+    let details = split(CALL_DETAILS)
+    let table = block(application, agent.results)
+    table.items.add(names[index])
+    let result = results[index]
+    let strong = 0
+    if result[0] == '$' { strong = 1 }
+    let row = Integer(rows[index][0]) - 48
+    let current = application.panel
+    if agent.outcome == 1 {
+        result = "Call ended"
+        strong = 0
+        current.sheetOutcomes[row] = "Hung up"
+        current.sheetDetails[row] = "Call ended early"
+    } else {
+        current.sheetOutcomes[row] = outcomes[index]
+        current.sheetQuotes[row] = quotes[index]
+        current.sheetDetails[row] = details[index]
+    }
+    table.values.add(result)
+    table.flags.add(strong)
+    state.touch(table)
+    panel.touch(application)
+    conversation.layout(application)
+}
+
+// ----- Atacama -----
+
+function endpoint(agent: Agent): Text {
+    return agent.settings.host + ":" + Text(agent.settings.port)
+}
+
+// Research a question: search Wikipedia over HTTPS, open and read the best
+// article, ask Atacama over HTTP, and answer with both.
+//
+// Phases: 0 announce, 1 start the task and search, 2 wait for the search,
+// 3 wait for the article, 4 read it, 5 wait for Atacama, 6 answered.
+constant WIKIPEDIA = "en.wikipedia.org"
+
+function atacama(application: state.App, agent: Agent, network: stack.Network) {
+    let elapsed = application.now - agent.phaseStart
+    if agent.phase == 0 && elapsed > 0.5 {
+        agent.reply = addReply(application, "I’ll look this up on Wikipedia, then ask Atacama, the 30M-parameter model at " + endpoint(agent) + ".", "bullet", 52.0)
+        advance(application, agent)
+        return
+    }
+    if agent.phase == 1 && elapsed > 1.6 {
+        if !network.configured {
+            if agent.steps < 0 {
+                startTask(application, agent, "Research the question", "Waiting for the network")
+            }
+            if elapsed > 14.0 { failAtacama(application, agent, "the network never came up") }
+            return
+        }
+        if agent.steps < 0 {
+            startTask(application, agent, "Research the question", "Searching " + WIKIPEDIA)
+        } else {
+            nextStep(application, agent, "Network ready at " + stack.ipText(network.ip), "Searching " + WIKIPEDIA)
+        }
+        let current = application.panel
+        current.articleHost = WIKIPEDIA
+        current.searchResults = []
+        panel.setPage(application, state.PAGE_SEARCH)
+        glowOn(application)
+        let path = "/w/rest.php/v1/search/page?q=" + encodeQuery(agent.question) + "&limit=3"
+        agent.requests = [http.start(network, WIKIPEDIA, 443, true, "GET", path, [], "")]
+        advance(application, agent)
+        return
+    }
+    if agent.requests.length == 0 { return }
+    let request = agent.requests[0]
+    if agent.outcome == 1 && request.state != http.DONE && request.state != http.FAILED {
+        http.cancel(network, request)
+        request.error = "you hung up before Atacama answered"
+    }
+    let status = http.poll(network, request)
+    if agent.phase == 2 && status >= http.DONE {
+        let found = json.parse(http.decode(request.body, 0, request.body.length))
+        let pages = json.member(found, "pages")
+        if status == http.FAILED || pages.kind != json.ARRAY || pages.items.length == 0 {
+            let reason = "found nothing"
+            if status == http.FAILED { reason = request.error }
+            nextStep(application, agent, "Wikipedia search " + reason, "Asking Atacama")
+            askAtacama(application, agent, network)
+            return
+        }
+        let results: List<Text> = []
+        for page in pages.items {
+            results.add(json.string(page, "title"))
+            results.add(plainText(json.string(page, "excerpt")))
+        }
+        application.panel.searchResults = results
+        panel.touch(application)
+        let best = pages.items[0]
+        agent.answer = json.string(best, "title")
+        nextStep(application, agent, "Searched " + WIKIPEDIA + " for “" + text.fit(application.type.step, agent.question, 260.0) + "”", "Opening " + agent.answer)
+        let path = "/api/rest_v1/page/summary/" + encodeQuery(json.string(best, "key"))
+        agent.requests = [http.start(network, WIKIPEDIA, 443, true, "GET", path, [], "")]
+        advance(application, agent)
+        return
+    }
+    if agent.phase == 3 && status >= http.DONE {
+        let article = json.parse(http.decode(request.body, 0, request.body.length))
+        if status == http.FAILED || json.string(article, "extract") == "" {
+            nextStep(application, agent, "Could not open " + agent.answer, "Asking Atacama")
+            askAtacama(application, agent, network)
+            return
+        }
+        let current = application.panel
+        current.articleTitle = json.string(article, "title")
+        current.articleDescription = json.string(article, "description")
+        current.articleText = json.string(article, "extract")
+        panel.setPage(application, state.PAGE_ARTICLE_LIVE)
+        nextStep(application, agent, "Opened " + current.articleTitle, "Reading page content")
+        agent.requests = []
+        advance(application, agent)
+        return
+    }
+}
+
+// The reading pause between opening the article and asking Atacama.
+function readArticle(application: state.App, agent: Agent, network: stack.Network) {
+    if agent.mode == ATACAMA && agent.phase == 4 && agent.requests.length == 0 && application.now - agent.phaseStart > 2.4 {
+        nextStep(application, agent, "Read " + application.panel.articleTitle, "Asking Atacama")
+        askAtacama(application, agent, network)
+    }
+}
+
+function askAtacama(application: state.App, agent: Agent, network: stack.Network) {
+    let question = agent.question.slice(0, min(agent.question.length, 300))
+    let body = "{\"question\": " + json.quote(question) + "}"
+    let headers = ["Content-Type: application/json", "Authorization: Bearer " + agent.settings.key]
+    agent.requests = [http.start(network, agent.settings.host, agent.settings.port, false, "POST", "/ask", headers, body)]
+    agent.attempts += 1
+    setStatus(application, agent, "Waiting for Atacama")
+    let current = application.panel
+    current.request = "POST /ask HTTP/1.1 · Host: " + endpoint(agent) + " · Authorization: Bearer •••• · " + json.quote(question)
+    current.response = ""
+    let call = state.newBlock(state.CALL, "Calling Atacama...", application.now)
+    call.items = ["Atacama 30M · POST /ask"]
+    call.count = 1
+    agent.call = conversation.add(application, call)
+    agent.outcome = 0
+    agent.phase = 5
+    agent.phaseStart = application.now
+}
+
+function answerAtacama(application: state.App, agent: Agent, network: stack.Network) {
+    if agent.mode != ATACAMA || agent.phase != 5 || agent.requests.length == 0 { return }
+    let request = agent.requests[0]
+    if agent.outcome == 1 && request.state != http.DONE && request.state != http.FAILED {
+        http.cancel(network, request)
+        request.error = "you hung up before Atacama answered"
+    }
+    let status = http.poll(network, request)
+    if status == http.FAILED {
+        removeLast(application)
+        failAtacama(application, agent, request.error)
+        return
+    }
+    if status != http.DONE { return }
+    let seconds = Float(request.finished - request.started) / 1000.0
+    let body = http.decode(request.body, 0, request.body.length)
+    removeLast(application)
+    if request.status == 429 && agent.attempts < 4 {
+        // Atacama answers one question at a time; try again.
+        askAtacama(application, agent, network)
+        return
+    }
+    let parsed = json.parse(body)
+    let current = application.panel
+    current.response = "HTTP " + Text(request.status) + " " + request.reason + " in " + Text(Integer(seconds * 1000.0)) + " ms · " + json.pretty(parsed, "")
+    if current.articleTitle == "" {
+        panel.setPage(application, state.PAGE_ATACAMA)
+    }
+    if request.status != 200 {
+        let detail = json.string(parsed, "detail")
+        if detail == "" { detail = request.reason }
+        failAtacama(application, agent, "it answered " + Text(request.status) + ": " + detail)
+        return
+    }
+    nextStep(application, agent, "Atacama answered in " + Text(Integer(seconds * 1000.0)) + " ms", "")
+    let finishedSteps = block(application, agent.steps)
+    finishedSteps.done = true
+    state.touch(finishedSteps)
+    setStatus(application, agent, "Read the answer")
+    let answer = json.string(parsed, "answer")
+    if answer == "" { answer = "Atacama returned an empty answer." }
+    if current.articleTitle != "" {
+        addReply(application, "Atacama says: " + answer, "", 46.0)
+        addReply(application, "Wikipedia’s article on " + current.articleTitle + " says: " + firstSentences(current.articleText, 2), "copy", 60.0)
+        let card = state.newBlock(state.SOURCES, current.articleTitle + " — Wikipedia", application.now)
+        card.detail = WIKIPEDIA + " · " + current.articleDescription
+        conversation.add(application, card)
+    } else {
+        addReply(application, answer, "copy", 46.0)
+    }
+    agent.phase = 6
+    agent.phaseStart = application.now
+    agent.requests = []
+}
+
+function firstSentences(value: Text, count: Integer): Text {
+    let found = 0
+    for position in 0..value.length {
+        if value[position] == '.' && (position + 1 == value.length || value[position + 1] == ' ') {
+            found += 1
+            if found == count {
+                return value.slice(0, position + 1)
+            }
+        }
+    }
+    return value
+}
+
+// Search excerpts arrive as HTML fragments; keep their text.
+function plainText(html: Text): Text {
+    let parts: List<Text> = []
+    let inTag = false
+    for character in html {
+        if character == '<' { inTag = true }
+        if !inTag { parts.add(Text(character)) }
+        if character == '>' { inTag = false }
+    }
+    return joinText(parts)
+}
+
+function encodeQuery(value: Text): Text {
+    let parts: List<Text> = []
+    let digits = "0123456789ABCDEF"
+    for byte in Bytes(value) {
+        let keep = byte >= 48 && byte <= 57 || byte >= 65 && byte <= 90 || byte >= 97 && byte <= 122 || byte == 45 || byte == 95 || byte == 46
+        if keep {
+            parts.add(Text(Character(byte)))
+        } else {
+            parts.add("%" + Text(digits[byte >> 4]) + Text(digits[byte & 15]))
+        }
+    }
+    return joinText(parts)
+}
+
+function advance(application: state.App, agent: Agent) {
+    agent.phase += 1
+    agent.phaseStart = application.now
+}
+
+function failAtacama(application: state.App, agent: Agent, reason: Text) {
+    agent.requests = []
+    agent.failed = true
+    if agent.task >= 0 && agent.task < application.blocks.length {
+        let task = block(application, agent.task)
+        task.values = ["Couldn’t reach Atacama"]
+        state.touch(task)
+    }
+    if agent.steps >= 0 && agent.steps < application.blocks.length {
+        nextStep(application, agent, "Could not reach Atacama", "")
+        let finishedSteps = block(application, agent.steps)
+        finishedSteps.done = true
+        state.touch(finishedSteps)
+        setStatus(application, agent, "Stopped")
+    }
+    addReply(application, "I couldn’t get an answer from Atacama at " + endpoint(agent) + ": " + reason + ". Start the local server with ~/.cache/atacama-local/start.sh and ask again.", "copy", 60.0)
+    agent.phase = 6
+    agent.phaseStart = application.now
+}
+
+// After the answer has streamed in, wrap the task up.
+public function settle(desktopState: app.Desktop, agent: Agent) {
+    let application = desktopState.app
+    if agent.mode == ATACAMA && agent.phase == 6 {
+        let last = application.blocks[application.blocks.length - 1]
+        if last.kind == state.SOURCES {
+            last = application.blocks[application.blocks.length - 2]
+        }
+        let streaming = Float(last.text.length) / max(last.rate, 1.0)
+        if application.now - last.born > streaming + 0.6 {
+            let summary = "Searched Wikipedia, read " + application.panel.articleTitle + ", and asked Atacama"
+            if application.panel.articleTitle == "" { summary = "Asked Atacama at " + endpoint(agent) }
+            if agent.failed { summary = "Tried " + endpoint(agent) + ", but Atacama didn’t answer" }
+            complete(application, agent, summary)
+        }
+    }
+}
+
+// ----- Health -----
+
+function checkHealth(agent: Agent, network: stack.Network) {
+    agent.healthChecked = true
+    let ip = stack.parseIp(agent.settings.host)
+    if ip < 0 { return }
+    agent.health = "checking"
+    let request = http.start(network, agent.settings.host, agent.settings.port, false, "GET", "/health", [], "")
+    agent.requests = [request]
+}
+
+function pollHealth(application: state.App, agent: Agent, network: stack.Network) {
+    if agent.health != "checking" || agent.requests.length == 0 || agent.mode != IDLE { return }
+    let request = agent.requests[0]
+    let status = http.poll(network, request)
+    if status == http.DONE {
+        let parsed = json.parse(http.decode(request.body, 0, request.body.length))
+        let parameters = json.member(parsed, "parameters")
+        let millions = Integer(parameters.number / 100000.0)
+        agent.health = json.string(parsed, "checkpoint") + " · " + Text(millions / 10) + "." + Text(millions % 10) + "M parameters"
+        agent.requests = []
+    }
+    if status == http.FAILED {
+        agent.health = "not reachable (" + request.error + ")"
+        agent.requests = []
+    }
+}

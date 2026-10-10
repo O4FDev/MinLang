@@ -1,0 +1,609 @@
+// The conversation: messages, replies and the agent's task blocks, laid out
+// in one column that scrolls above the composer.
+use "../../shared/graphics/canvas.min" as canvas
+use "../../shared/graphics/font.min" as font
+use "../../shared/graphics/raster.min" as raster
+use "./state.min" as state
+use "./theme.min" as theme
+use "./icons.min" as icons
+use "./text.min" as text
+
+// Where the first block starts, and where the visible area ends.
+public constant CONTENT_TOP = 57
+public constant VIEW_BOTTOM = 940
+
+// Controls inside blocks.
+public constant CONTROL_TOGGLE = 1
+public constant CONTROL_EXPAND = 2
+public constant CONTROL_ORIGIN = 3
+public constant CONTROL_LINK = 4
+public constant CONTROL_HANG_UP = 5
+public constant CONTROL_COPY = 6
+
+constant LINE = 27
+constant USER_LINE = 26
+constant STEP_SPACING = 32
+constant ROW = 42
+constant CALL_HEIGHT = 154
+constant WAVE = 0xA4CDF6
+constant WAVE_STRONG = 0x6AAEF0
+
+// ----- Building -----
+
+public function add(app: state.App, block: state.Block): Integer {
+    app.blocks.add(block)
+    layout(app)
+    return app.blocks.length - 1
+}
+
+public function columnLeft(app: state.App): Integer {
+    return Integer(state.value(app.column, app.now))
+}
+
+function gapBefore(previous: Integer, kind: Integer): Integer {
+    if previous == 0 { return 0 }
+    if previous == state.USER { return 56 }
+    if kind == state.STEPS { return 22 }
+    if kind == state.TASK { return 20 }
+    if kind == state.SHEET || kind == state.SOURCES { return 17 }
+    if kind == state.CALL { return 19 }
+    if kind == state.RESULTS {
+        if previous == state.CALL { return 8 }
+        return 20
+    }
+    if kind == state.NOTE { return 15 }
+    if kind == state.SUMMARY { return 0 }
+    if previous == state.NOTE { return 24 }
+    if previous == state.REPLY && kind == state.REPLY { return 22 }
+    if previous == state.TASK { return 25 }
+    if previous == state.SUMMARY { return 18 }
+    return 22
+}
+
+function wrapWidth(block: state.Block): Integer {
+    if block.kind == state.USER { return theme.COLUMN_WIDTH - 90 }
+    return theme.TABLE_WIDTH
+}
+
+function heightOf(app: state.App, block: state.Block): Integer {
+    let kind = block.kind
+    if kind == state.USER || kind == state.REPLY {
+        if block.wrapped != wrapWidth(block) {
+            block.lines = text.wrap(app.type.body, block.text, Float(wrapWidth(block)))
+            block.wrapped = wrapWidth(block)
+        }
+        if kind == state.USER {
+            return 56 + USER_LINE * (block.lines.length - 1)
+        }
+        // A finished answer keeps room below it for its copy button.
+        if block.detail == "copy" {
+            return LINE * (block.lines.length - 1) + 19 + 42
+        }
+        return LINE * (block.lines.length - 1) + 19
+    }
+    if kind == state.STEPS {
+        if !block.expanded { return 42 }
+        return 47 + STEP_SPACING * (block.items.length - 1) + 30
+    }
+    if kind == state.TASK { return 87 }
+    if kind == state.SHEET || kind == state.SOURCES { return 63 }
+    if kind == state.CALL { return CALL_HEIGHT }
+    if kind == state.RESULTS { return ROW * block.items.length }
+    if kind == state.NOTE { return 16 }
+    if kind == state.SUMMARY {
+        if block.expanded { return 20 + STEP_SPACING * block.items.length }
+        return 12
+    }
+    return 20
+}
+
+public function layout(app: state.App) {
+    let y = 0
+    let previous = 0
+    for block in app.blocks {
+        // A table with no rows yet takes no space at all.
+        let empty = block.kind == state.RESULTS && block.items.length == 0
+        if !empty {
+            y += gapBefore(previous, block.kind)
+        }
+        block.top = y
+        block.height = heightOf(app, block)
+        if block.shownTop < 0.0 {
+            block.shownTop = Float(y)
+        }
+        y += block.height
+        if !empty {
+            previous = block.kind
+        }
+    }
+    app.contentHeight = y + 16
+    // Keep the newest content in view, and never scroll past the end when
+    // content shrinks (for example when the agent's steps fold away).
+    let room = Float(VIEW_BOTTOM - CONTENT_TOP)
+    let target = max(Float(app.contentHeight) - room, 0.0)
+    app.scrollTarget = target
+    invalidateView(app)
+}
+
+public function invalidateView(app: state.App) {
+    state.invalidate(app, 100, 0, 1060, theme.COMPOSER_TOP)
+}
+
+public function scrollBy(app: state.App, amount: Float) {
+    let room = Float(VIEW_BOTTOM - CONTENT_TOP)
+    let limit = max(Float(app.contentHeight) - room, 0.0)
+    app.scrollTarget = clamp(app.scrollTarget + amount, 0.0, limit)
+}
+
+function screenTop(app: state.App, block: state.Block): Integer {
+    return CONTENT_TOP + Integer(block.shownTop - app.scroll)
+}
+
+function blockRect(app: state.App, block: state.Block): List<Integer> {
+    let left = columnLeft(app)
+    return [left - 10, screenTop(app, block) - 6, theme.COLUMN_WIDTH + 20, block.height + 12]
+}
+
+public function invalidateBlock(app: state.App, block: state.Block) {
+    let rect = blockRect(app, block)
+    state.invalidate(app, rect[0], rect[1], rect[2], rect[3])
+}
+
+// ----- Animation -----
+
+public function animate(app: state.App) {
+    let moving = false
+    for block in app.blocks {
+        let delta = Float(block.top) - block.shownTop
+        if abs(delta) > 0.4 {
+            block.shownTop += delta * 0.22
+            moving = true
+        } else {
+            if delta != 0.0 {
+                block.shownTop = Float(block.top)
+                moving = true
+            }
+        }
+        let age = app.now - block.born
+        if age < 0.4 {
+            invalidateBlock(app, block)
+        }
+        if (block.kind == state.REPLY || block.kind == state.USER) && block.rate > 0.0 {
+            if Float(block.text.length) / block.rate > app.previous - block.born {
+                invalidateBlock(app, block)
+            }
+        }
+        if block.kind == state.STEPS && !block.done || block.kind == state.TASK && !block.done || block.kind == state.CALL && !block.done {
+            invalidateLive(app, block)
+        }
+    }
+    let scrollDelta = app.scrollTarget - app.scroll
+    if abs(scrollDelta) > 0.5 {
+        app.scroll += scrollDelta * 0.25
+        moving = true
+    } else {
+        if scrollDelta != 0.0 {
+            app.scroll = app.scrollTarget
+            moving = true
+        }
+    }
+    if moving {
+        invalidateView(app)
+    }
+}
+
+// Redraw only the animated part of a working block.
+function invalidateLive(app: state.App, block: state.Block) {
+    let left = columnLeft(app) + theme.CONTENT_INDENT
+    let top = screenTop(app, block)
+    if block.kind == state.STEPS && block.expanded && block.items.length > 0 {
+        let row = top + 47 + STEP_SPACING * (block.items.length - 1)
+        state.invalidate(app, left + 30, row - 14, 600, 28)
+    }
+    if block.kind == state.TASK {
+        state.invalidate(app, left, top + 40, theme.CARD_WIDTH, 47)
+    }
+    if block.kind == state.CALL {
+        state.invalidate(app, left + 300, top + 55, 250, 90)
+        state.invalidate(app, left + 13, top + 55, 260, 86)
+    }
+}
+
+// ----- Controls -----
+
+// The control under a point, as block index * 16 + control, or -1.
+public function controlAt(app: state.App, x: Integer, y: Integer): Integer {
+    if y >= theme.COMPOSER_TOP { return -1 }
+    let left = columnLeft(app) + theme.CONTENT_INDENT
+    for index in 0..app.blocks.length {
+        let block = app.blocks[index]
+        let top = screenTop(app, block)
+        if block.kind == state.STEPS && state.inside(x, y, left - 4, top, 260, 26) {
+            return index * 16 + CONTROL_TOGGLE
+        }
+        if block.kind == state.SUMMARY && state.inside(x, y, left - 4, top, 620, 30) {
+            return index * 16 + CONTROL_TOGGLE
+        }
+        if block.kind == state.TASK {
+            if state.inside(x, y, left + theme.CARD_WIDTH - 32, top + 4, 30, 32) {
+                return index * 16 + CONTROL_EXPAND
+            }
+            if block.done && state.inside(x, y, left + theme.CARD_WIDTH - 140, top + 46, 136, 36) {
+                return index * 16 + CONTROL_ORIGIN
+            }
+        }
+        if (block.kind == state.SHEET || block.kind == state.SOURCES) && state.inside(x, y, left + theme.CARD_WIDTH - 140, top + 30, 136, 28) {
+            return index * 16 + CONTROL_LINK
+        }
+        if block.kind == state.CALL && !block.done && state.inside(x, y, left + 13 + 458, top + 55 + 21, 42, 42) {
+            return index * 16 + CONTROL_HANG_UP
+        }
+        if block.kind == state.REPLY && block.detail == "copy" && state.inside(x, y, left + 890, top + block.height - 30, 24, 24) {
+            return index * 16 + CONTROL_COPY
+        }
+    }
+    return -1
+}
+
+// ----- Drawing -----
+
+constant PAD = 8
+
+// The key a block's cached rendering was made for: its contents' version,
+// its height and, for streamed text, whether it has finished appearing.
+function cacheKey(app: state.App, block: state.Block): Integer {
+    let complete = 0
+    if revealed(app, block) >= block.text.length { complete = 1 }
+    return (block.version * 4096 + block.height) * 2 + complete
+}
+
+// Render the block's static parts into its own canvas.
+function refreshCache(app: state.App, block: state.Block) {
+    let key = cacheKey(app, block)
+    if block.cachedKey == key { return }
+    let width = theme.COLUMN_WIDTH + PAD * 2
+    let height = block.height + PAD * 2
+    if block.cache.width != width || block.cache.height != height {
+        block.cache = canvas.create(width, height)
+    }
+    canvas.resetClip(block.cache)
+    canvas.fill(block.cache, 0, 0, width, height, theme.BACKGROUND)
+    let screen = app.back
+    app.back = block.cache
+    app.layer = 1
+    drawBlock(app, block, PAD, PAD)
+    app.layer = 0
+    app.back = screen
+    canvas.clearDirty(block.cache)
+    block.cachedKey = key
+}
+
+public function draw(app: state.App) {
+    let back = app.back
+    let saved = canvas.saveClip(back)
+    canvas.intersectClip(back, 0, 0, back.width, theme.COMPOSER_TOP)
+    let left = columnLeft(app)
+    for index in 0..app.blocks.length {
+        let block = app.blocks[index]
+        let top = screenTop(app, block)
+        // Blocks far outside the view give their cached rendering back.
+        if (top > theme.COMPOSER_TOP + 2000 || top + block.height < -2000) && block.cache.width > 1 {
+            block.cache = canvas.create(1, 1)
+            block.cachedKey = -1
+        }
+        if top < theme.COMPOSER_TOP && top + block.height + 40 > 0 && state.visible(app, left - PAD, top - PAD, theme.COLUMN_WIDTH + PAD * 2, block.height + PAD * 2) {
+            refreshCache(app, block)
+            canvas.blit(back, block.cache, 0, 0, block.cache.width, block.cache.height, left - PAD, top - PAD)
+            app.layer = 2
+            drawBlock(app, block, left, top)
+            app.layer = 0
+            // Newly added blocks fade in by washing them with the background.
+            let age = app.now - block.born
+            if age < 0.4 && block.kind != state.REPLY {
+                let wash = Integer((1.0 - state.ease(age / 0.4)) * 255.0)
+                canvas.blend(back, left - 4, top - 4, theme.COLUMN_WIDTH + 8, block.height + 8, theme.BACKGROUND, wash)
+                // Whatever the frame rate, draw once more after the fade.
+                invalidateBlock(app, block)
+            }
+        }
+    }
+    canvas.restoreClip(back, saved)
+}
+
+function drawBlock(app: state.App, block: state.Block, left: Integer, top: Integer) {
+    let kind = block.kind
+    // Blocks without animated parts are entirely in their cache.
+    if !state.drawStatic(app) && (kind == state.USER || kind == state.SHEET || kind == state.SOURCES || kind == state.RESULTS || kind == state.NOTE || kind == state.SUMMARY) {
+        return
+    }
+    if kind == state.USER { drawUser(app, block, left, top) }
+    if kind == state.REPLY { drawReply(app, block, left, top) }
+    if kind == state.STEPS { drawSteps(app, block, left, top) }
+    if kind == state.TASK { drawTask(app, block, left, top) }
+    if kind == state.SHEET || kind == state.SOURCES { drawSheet(app, block, left, top) }
+    if kind == state.CALL { drawCall(app, block, left, top) }
+    if kind == state.RESULTS { drawResults(app, block, left, top) }
+    if kind == state.NOTE {
+        font.draw(app.back, app.type.small, block.text, Float(left + theme.CONTENT_INDENT + 1), Float(top + 12), theme.MUTED, 255)
+    }
+    if kind == state.SUMMARY { drawSummary(app, block, left, top) }
+}
+
+function revealed(app: state.App, block: state.Block): Integer {
+    if block.rate <= 0.0 { return block.text.length }
+    return Integer((app.now - block.born) * block.rate)
+}
+
+function drawUser(app: state.App, block: state.Block, left: Integer, top: Integer) {
+    let back = app.back
+    canvas.fill(back, left, top, theme.COLUMN_WIDTH, block.height, theme.BUBBLE)
+    icons.draw(back, app.icons, icons.CHEVRON_RIGHT, left + 22, top + 21, 0x333333, 255)
+    let y = Float(top + 35)
+    for line in block.lines {
+        font.draw(back, app.type.body, line, Float(left + theme.CONTENT_INDENT), y, 0x3C3C3C, 255)
+        y += Float(USER_LINE)
+    }
+}
+
+function drawReply(app: state.App, block: state.Block, left: Integer, top: Integer) {
+    let back = app.back
+    let x = Float(left + theme.CONTENT_INDENT)
+    // Text that is still streaming in is drawn live; finished text is cached.
+    let streaming = revealed(app, block) < block.text.length
+    if streaming != state.drawLive(app) && !(state.drawLive(app) && state.drawStatic(app)) {
+        return
+    }
+    if block.detail == "bullet" || block.detail == "bullet-done" {
+        let color = theme.ACCENT_BAR
+        if block.detail == "bullet-done" { color = theme.SUCCESS }
+        canvas.fill(back, left + 21, top + 1, 9, 9, color)
+    }
+    let remaining = revealed(app, block)
+    let y = Float(top + 14)
+    for line in block.lines {
+        if remaining > 0 {
+            text.drawPrefix(back, app.type.body, line, remaining, x, y, theme.INK, 255)
+        }
+        remaining -= line.length + 1
+        y += Float(LINE)
+    }
+    if block.detail == "copy" && revealed(app, block) >= block.text.length {
+        let color = 0x777777
+        if block.hover == CONTROL_COPY { color = 0x333333 }
+        icons.draw(back, app.icons, icons.COPY, left + theme.CONTENT_INDENT + 893, top + block.height - 24, color, 255)
+    }
+}
+
+function drawSteps(app: state.App, block: state.Block, left: Integer, top: Integer) {
+    let back = app.back
+    let x = left + theme.CONTENT_INDENT
+    if !state.drawStatic(app) {
+        // Only the step in progress animates.
+        if block.expanded && !block.done && block.items.length > 0 {
+            let last = block.items.length - 1
+            drawShimmer(app, block.items[last], Float(x + 63), Float(top + 47 + STEP_SPACING * last + 5), app.type.step, 0x8A8A8A, 0xC8C8C8, block.since)
+        }
+        return
+    }
+    icons.draw(back, app.icons, icons.LAPTOP, x + 5, top + 6, 0x666666, 255)
+    let end = font.draw(back, app.type.body, block.text, Float(x + 36), Float(top + 18), 0x333333, 255)
+    if block.expanded {
+        icons.draw(back, app.icons, icons.CHEVRON_UP, Integer(end) + 13, top + 9, 0x888888, 255)
+        for index in 0..block.items.length {
+            let center = top + 47 + STEP_SPACING * index
+            icons.draw(back, app.icons, icons.LAPTOP, x + 37, center - 6, 0x8A8A8A, 255)
+            let label = block.items[index]
+            let live = index == block.items.length - 1 && !block.done
+            if live {
+                if state.drawLive(app) {
+                    drawShimmer(app, label, Float(x + 63), Float(center + 5), app.type.step, 0x8A8A8A, 0xC8C8C8, block.since)
+                }
+            } else {
+                font.draw(back, app.type.step, label, Float(x + 63), Float(center + 5), 0x8A8A8A, 255)
+            }
+        }
+        let rule = top + 47 + STEP_SPACING * (block.items.length - 1) + 29
+        canvas.fill(back, x, rule, theme.TABLE_WIDTH, 1, theme.RULE)
+    } else {
+        icons.draw(back, app.icons, icons.CHEVRON_DOWN, Integer(end) + 13, top + 11, 0x888888, 255)
+    }
+}
+
+// Status text that is being worked on: dark up to a sweep that crosses the
+// text every 1.6 seconds, pale after it.
+function drawShimmer(app: state.App, label: Text, x: Float, baseline: Float, face: font.Face, dark: Integer, pale: Integer, since: Float) {
+    let width = font.measure(face, label)
+    let cycle = 1.6
+    let phase = (app.now - since) / cycle
+    let fraction = phase - floor(phase)
+    let split = x + (width + 60.0) * state.ease(fraction * 1.25) - 20.0
+    text.drawSplit(app.back, face, label, x, baseline, dark, pale, split, 26.0, 255)
+}
+
+function drawTask(app: state.App, block: state.Block, left: Integer, top: Integer) {
+    let back = app.back
+    let x = left + theme.CONTENT_INDENT
+    if !state.drawStatic(app) {
+        if !block.done {
+            drawShimmer(app, block.detail, Float(x + 37), Float(top + 67), app.type.status, theme.INK, 0xA9A9A9, block.since)
+        }
+        return
+    }
+    let color = theme.ACCENT
+    if block.done { color = theme.SUCCESS }
+    canvas.fill(back, x, top, theme.CARD_WIDTH, 40, color)
+    font.draw(back, app.type.title, block.text, Float(x + 10), Float(top + 26), theme.WHITE, 255)
+    icons.draw(back, app.icons, icons.EXPAND, x + theme.CARD_WIDTH - 25, top + 14, theme.WHITE, 255)
+    canvas.fill(back, x, top + 40, theme.CARD_WIDTH, 47, theme.CARD)
+    canvas.frame(back, x, top + 40, theme.CARD_WIDTH, 47, 1, theme.CARD_BORDER, 255)
+    canvas.fill(back, x, top + 40, theme.CARD_WIDTH, 1, theme.CARD_BORDER)
+    if block.done {
+        let outcome = "Done"
+        if block.values.length > 0 { outcome = block.values[0] }
+        font.draw(back, app.type.status, outcome, Float(x + 11), Float(top + 70), theme.INK, 255)
+        drawLink(app, "See origin", x + theme.CARD_WIDTH - 10, top + 69, 0x555555, block.hover == CONTROL_ORIGIN)
+    } else {
+        icons.draw(back, app.icons, icons.MONITOR, x + 12, top + 54, theme.ACCENT, 255)
+        if state.drawLive(app) {
+            drawShimmer(app, block.detail, Float(x + 37), Float(top + 67), app.type.status, theme.INK, 0xA9A9A9, block.since)
+        }
+    }
+}
+
+// "[ ↗ label ]", right-aligned at `right`.
+function drawLink(app: state.App, label: Text, right: Integer, baseline: Integer, color: Integer, hovered: Boolean) {
+    let back = app.back
+    let face = app.type.row
+    let close = font.measure(face, "]")
+    let width = font.measure(face, label)
+    let x = Float(right) - close
+    font.draw(back, face, "]", x, Float(baseline), color, 255)
+    x -= width + 6.0
+    font.draw(back, face, label, x, Float(baseline), color, 255)
+    if hovered {
+        canvas.fill(back, Integer(x), baseline + 3, Integer(width), 1, color)
+    }
+    icons.draw(back, app.icons, icons.LINK, Integer(x) - 19, baseline - 12, color, 255)
+    font.draw(back, face, "[", x - 31.0 - font.measure(face, "["), Float(baseline), color, 255)
+}
+
+function drawSheet(app: state.App, block: state.Block, left: Integer, top: Integer) {
+    let back = app.back
+    let x = left + theme.CONTENT_INDENT
+    canvas.fill(back, x, top, theme.CARD_WIDTH, 63, theme.CARD)
+    canvas.frame(back, x, top, theme.CARD_WIDTH, 63, 1, theme.CARD_BORDER, 255)
+    let icon = icons.TABLE
+    if block.kind == state.SOURCES { icon = icons.LIBRARY }
+    icons.draw(back, app.icons, icon, x + 16, top + 17, 0x444444, 255)
+    font.draw(back, app.type.body, block.text, Float(x + 47), Float(top + 28), theme.TEXT, 255)
+    let label = "View Sheets"
+    if block.kind == state.SOURCES { label = "View sources" }
+    let room = Float(theme.CARD_WIDTH - 47 - 30) - font.measure(app.type.row, label) - 40.0
+    font.draw(back, app.type.small, text.fit(app.type.small, block.detail, room), Float(x + 47), Float(top + 47), theme.MUTED, 255)
+    drawLink(app, label, x + theme.CARD_WIDTH - 14, top + 46, theme.LINK, block.hover == CONTROL_LINK)
+}
+
+function drawResults(app: state.App, block: state.Block, left: Integer, top: Integer) {
+    let back = app.back
+    let x = left + theme.CONTENT_INDENT
+    for index in 0..block.items.length {
+        let row = top + ROW * index
+        if state.visible(app, x, row, theme.TABLE_WIDTH, ROW) {
+            font.draw(back, app.type.row, block.items[index], Float(x), Float(row + 26), theme.TEXT, 255)
+            let value = block.values[index]
+            let strong = block.flags[index] == 1
+            let face = app.type.row
+            let color = theme.MUTED
+            if strong {
+                face = app.type.rowMedium
+                color = theme.INK
+            }
+            let width = font.measure(face, value)
+            font.draw(back, face, value, Float(x + theme.TABLE_WIDTH) - width, Float(row + 26), color, 255)
+            canvas.fill(back, x, row + ROW - 1, theme.TABLE_WIDTH, 1, theme.RULE)
+        }
+    }
+}
+
+function drawSummary(app: state.App, block: state.Block, left: Integer, top: Integer) {
+    let back = app.back
+    let x = left + theme.CONTENT_INDENT
+    canvas.fill(back, left + 21, top + 1, 9, 9, theme.SUCCESS)
+    icons.draw(back, app.icons, icons.LAPTOP, x + 9, top - 1, 0x777777, 255)
+    let end = font.draw(back, app.type.step, block.text, Float(x + 28), Float(top + 11), 0x777777, 255)
+    if block.expanded {
+        icons.draw(back, app.icons, icons.CHEVRON_UP, Integer(end) + 12, top + 2, 0x888888, 255)
+        for index in 0..block.items.length {
+            let center = top + 34 + STEP_SPACING * index
+            icons.draw(back, app.icons, icons.LAPTOP, x + 37, center - 6, 0x8A8A8A, 255)
+            font.draw(back, app.type.step, block.items[index], Float(x + 63), Float(center + 5), 0x8A8A8A, 255)
+        }
+    } else {
+        icons.draw(back, app.icons, icons.CHEVRON_DOWN, Integer(end) + 12, top + 4, 0x888888, 255)
+    }
+}
+
+function drawCall(app: state.App, block: state.Block, left: Integer, top: Integer) {
+    let back = app.back
+    let x = left + theme.CONTENT_INDENT
+    let inner = x + 13
+    let innerTop = top + 55
+    if state.drawStatic(app) {
+        canvas.fill(back, x, top, theme.CARD_WIDTH, CALL_HEIGHT, 0xF6F6F6)
+        canvas.frame(back, x, top, theme.CARD_WIDTH, CALL_HEIGHT, 1, theme.CARD_BORDER, 255)
+        // The phone badge.
+        drawRounded(app, x + 12, top + 12, 28, 28, 5.0, 0xDCDCDC)
+        drawRounded(app, x + 13, top + 13, 26, 26, 4.0, 0xF1F1F1)
+        icons.draw(back, app.icons, icons.PHONE, x + 18, top + 18, 0x444444, 255)
+        font.draw(back, app.type.body, block.text, Float(x + 50), Float(top + 32), theme.TEXT, 255)
+        // The current call.
+        canvas.fill(back, inner, innerTop, 518, 86, 0xFDFDFD)
+        canvas.frame(back, inner, innerTop, 518, 86, 1, 0xEEEEEE, 255)
+        let hang = theme.DANGER
+        if block.hover == CONTROL_HANG_UP { hang = 0xCC3A06 }
+        canvas.fill(back, inner + 458, innerTop + 21, 42, 42, hang)
+        icons.draw(back, app.icons, icons.HANG_UP, inner + 468, innerTop + 32, theme.WHITE, 255)
+    }
+    if !state.drawLive(app) { return }
+    // Which call, who is on the line, for how long, and their voice.
+    let total = "/" + Text(block.count)
+    let current = Text(min(block.index + 1, block.count))
+    let totalWidth = font.measure(app.type.row, total)
+    let currentWidth = font.measure(app.type.row, current)
+    let right = Float(x + theme.CARD_WIDTH - 12)
+    font.draw(back, app.type.row, total, right - totalWidth, Float(top + 32), 0x666666, 255)
+    font.draw(back, app.type.row, current, right - totalWidth - currentWidth, Float(top + 32), theme.ACCENT, 255)
+    if block.items.length > 0 {
+        let name = block.items[min(block.index, block.items.length - 1)]
+        font.draw(back, app.type.body, name, Float(inner + 20), Float(innerTop + 37), theme.INK, 255)
+        let elapsed = Integer(max(app.now - block.since, 0.0))
+        let clock = Text(elapsed / 60) + ":" + pad(elapsed % 60)
+        if block.detail != "" { clock = block.detail }
+        font.draw(back, app.type.row, clock, Float(inner + 20), Float(innerTop + 60), theme.MUTED, 255)
+    }
+    drawWave(app, inner + 304, innerTop + 43, block.since, block.done)
+}
+
+function pad(value: Integer): Text {
+    if value < 10 { return "0" + Text(value) }
+    return Text(value)
+}
+
+// A voice waveform: 24 bars whose heights follow layered sine noise.
+function drawWave(app: state.App, x: Integer, center: Integer, since: Float, quiet: Boolean) {
+    let back = app.back
+    let t = app.now - since
+    for bar in 0..24 {
+        let f = Float(bar)
+        let envelope = 0.5 + 0.5 * sin(f * 0.55 + 1.3)
+        let motion = 0.55 + 0.45 * sin(t * 6.3 + f * 1.1) * sin(t * 2.9 + f * 0.47 + 2.0)
+        let height = Integer(5.0 + 40.0 * envelope * motion)
+        if quiet { height = 3 }
+        if bar % 7 == 4 { height = min(height, 6) }
+        let color = WAVE
+        if height > 32 { color = WAVE_STRONG }
+        canvas.fill(back, x + Integer(f * 5.6), center - height / 2, 2, height, color)
+    }
+}
+
+function drawRounded(app: state.App, x: Integer, y: Integer, width: Integer, height: Integer, radius: Float, color: Integer) {
+    let path = raster.newPath()
+    raster.roundedRectangle(path, 0.0, 0.0, Float(width), Float(height), radius)
+    let coverage = raster.rasterize(path, 0.0, 0.0, width, height)
+    canvas.mask(app.back, x, y, width, height, coverage, color, 255)
+}
+
+// Track which control is hovered so it can be highlighted.
+public function hover(app: state.App, x: Integer, y: Integer) {
+    let control = controlAt(app, x, y)
+    for index in 0..app.blocks.length {
+        let block = app.blocks[index]
+        let wanted = -1
+        if control >= 0 && control / 16 == index { wanted = control % 16 }
+        if block.hover != wanted {
+            block.hover = wanted
+            state.touch(block)
+            invalidateBlock(app, block)
+        }
+    }
+}

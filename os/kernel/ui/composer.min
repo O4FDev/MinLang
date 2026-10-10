@@ -1,0 +1,188 @@
+// The message composer docked at the bottom of the conversation column.
+use "../../shared/graphics/canvas.min" as canvas
+use "../../shared/graphics/font.min" as font
+use "../input/devices.min" as devices
+use "./state.min" as state
+use "./theme.min" as theme
+use "./icons.min" as icons
+
+constant PLACEHOLDER = "Talk about anything"
+constant SEND_ACTIVE = 0x0C96F6
+constant SEND_SIZE = 37
+constant TEXT_INSET = 64
+
+public record Frame {
+    left: Integer
+    top: Integer
+    width: Integer
+}
+
+// The composer follows the column: 1002 wide when centered, 982 when docked.
+public function frame(app: state.App): Frame {
+    let column = state.value(app.column, app.now)
+    let dock = clamp((Float(theme.COLUMN_CENTERED_LEFT) - column) / Float(theme.COLUMN_CENTERED_LEFT - theme.COLUMN_DOCKED_LEFT), 0.0, 1.0)
+    let left = Integer(column - 11.0 + 10.0 * dock)
+    let width = Integer(1002.0 - 20.0 * dock)
+    return Frame { left: left; top: theme.COMPOSER_TOP; width: width }
+}
+
+public function sendX(box: Frame): Integer {
+    return box.left + box.width - 27 - SEND_SIZE
+}
+
+public function sendY(box: Frame): Integer {
+    return box.top + 54
+}
+
+public function textLeft(box: Frame): Integer {
+    return box.left + TEXT_INSET
+}
+
+public function textRight(box: Frame): Integer {
+    return sendX(box) - 24
+}
+
+public function invalidate(app: state.App) {
+    let box = frame(app)
+    state.invalidate(app, box.left - 2, box.top - 2, box.width + 4, app.back.height - box.top + 2)
+}
+
+public function invalidateLine(app: state.App) {
+    let box = frame(app)
+    state.invalidate(app, box.left + 20, box.top + 12, box.width - 40, 40)
+}
+
+public function onSend(app: state.App, x: Integer, y: Integer): Boolean {
+    let box = frame(app)
+    return state.inside(x, y, sendX(box), sendY(box), SEND_SIZE, SEND_SIZE)
+}
+
+public function onText(app: state.App, x: Integer, y: Integer): Boolean {
+    let box = frame(app)
+    return state.inside(x, y, box.left, box.top, box.width, 50)
+}
+
+public function draw(app: state.App) {
+    let box = frame(app)
+    let back = app.back
+    if !state.visible(app, box.left, box.top, box.width, back.height - box.top) { return }
+    canvas.fill(back, box.left, box.top, box.width, back.height - box.top, theme.COMPOSER)
+    let composer = app.composer
+    let baseline = Float(box.top + 38)
+    icons.draw(back, app.icons, icons.CHEVRON_RIGHT, box.left + 36, box.top + 25, 0x333333, 255)
+    let left = textLeft(box)
+    let right = textRight(box)
+    let saved = canvas.saveClip(back)
+    canvas.intersectClip(back, left - 2, box.top, right - left + 2, 60)
+    let caretX = Float(left)
+    if composer.text == "" {
+        font.draw(back, app.type.body, PLACEHOLDER, Float(left), baseline, 0xB5B5B5, 255)
+    } else {
+        let before = font.measure(app.type.body, composer.text.slice(0, composer.caret))
+        // Scroll so the caret stays inside the field.
+        let room = Float(right - left - 8)
+        if before - composer.scroll > room { composer.scroll = before - room }
+        if before - composer.scroll < 0.0 { composer.scroll = max(before - 40.0, 0.0) }
+        font.draw(back, app.type.body, composer.text, Float(left) - composer.scroll, baseline, theme.INK, 255)
+        caretX = Float(left) + before - composer.scroll
+    }
+    // Blink at about 1 Hz, solid while typing.
+    let since = app.now - composer.edited
+    let on = since < 0.6 || Integer(since * 1.9) % 2 == 0
+    if composer.focused && on {
+        canvas.fill(back, Integer(caretX), box.top + 21, 2, 23, 0x111111)
+    }
+    canvas.restoreClip(back, saved)
+
+    icons.draw(back, app.icons, icons.PLUS, box.left + 62, box.top + 66, 0x333333, 255)
+    icons.draw(back, app.icons, icons.MICROPHONE, box.left + 108, box.top + 63, 0x333333, 255)
+    let sx = sendX(box)
+    let sy = sendY(box)
+    canvas.fill(back, sx, sy, SEND_SIZE, SEND_SIZE, 0xDDDDDD)
+    if composer.text != "" {
+        canvas.fill(back, sx + 2, sy + 2, SEND_SIZE - 4, SEND_SIZE - 4, SEND_ACTIVE)
+        icons.draw(back, app.icons, icons.SEND, sx + 10, sy + 9, 0xFFFFFF, 255)
+    } else {
+        canvas.fill(back, sx + 2, sy + 2, SEND_SIZE - 4, SEND_SIZE - 4, 0xFDFDFD)
+        icons.draw(back, app.icons, icons.SEND, sx + 10, sy + 9, 0xB0B0B0, 255)
+    }
+}
+
+// Apply typed keys. Returns true when the message should be sent.
+public function type(app: state.App, event: devices.KeyEvent): Boolean {
+    let composer = app.composer
+    let text = composer.text
+    let caret = composer.caret
+    if event.key == devices.KEY_CHARACTER {
+        composer.text = text.slice(0, caret) + Text(event.character) + text.slice(caret, text.length)
+        composer.caret = caret + 1
+    }
+    if event.key == devices.KEY_BACKSPACE && caret > 0 {
+        let start = caret - 1
+        if event.control {
+            start = wordStart(text, caret)
+        }
+        composer.text = text.slice(0, start) + text.slice(caret, text.length)
+        composer.caret = start
+    }
+    if event.key == devices.KEY_DELETE && caret < text.length {
+        composer.text = text.slice(0, caret) + text.slice(caret + 1, text.length)
+    }
+    if event.key == devices.KEY_LEFT && caret > 0 {
+        composer.caret = caret - 1
+        if event.control { composer.caret = wordStart(text, caret) }
+    }
+    if event.key == devices.KEY_RIGHT && caret < text.length {
+        composer.caret = caret + 1
+    }
+    if event.key == devices.KEY_HOME { composer.caret = 0 }
+    if event.key == devices.KEY_END { composer.caret = text.length }
+    if event.key == devices.KEY_ESCAPE {
+        composer.text = ""
+        composer.caret = 0
+    }
+    composer.edited = app.now
+    invalidateLine(app)
+    if composer.text == "" || text == "" {
+        invalidate(app)
+    }
+    return event.key == devices.KEY_ENTER && composer.text != ""
+}
+
+function wordStart(text: Text, caret: Integer): Integer {
+    let position = caret
+    while position > 0 && text[position - 1] == ' ' { position -= 1 }
+    while position > 0 && text[position - 1] != ' ' { position -= 1 }
+    return position
+}
+
+// Place the caret at a clicked x position.
+public function click(app: state.App, x: Integer) {
+    let box = frame(app)
+    let composer = app.composer
+    let target = Float(x - textLeft(box)) + composer.scroll
+    let best = 0
+    let bestDistance = 1000000.0
+    for position in 0..(composer.text.length + 1) {
+        let width = font.measure(app.type.body, composer.text.slice(0, position))
+        let distance = abs(width - target)
+        if distance < bestDistance {
+            bestDistance = distance
+            best = position
+        }
+    }
+    composer.caret = best
+    composer.edited = app.now
+    composer.focused = true
+    invalidateLine(app)
+}
+
+public function take(app: state.App): Text {
+    let text = app.composer.text
+    app.composer.text = ""
+    app.composer.caret = 0
+    app.composer.scroll = 0.0
+    app.composer.edited = app.now
+    invalidate(app)
+    return text
+}

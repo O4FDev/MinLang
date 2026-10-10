@@ -1,0 +1,293 @@
+// Anti-aliased filling of outlines made of lines and quadratic curves.
+//
+// Each line adds the signed area it covers in every pixel of its rows to an
+// accumulation buffer; a running sum along each row then gives every pixel's
+// exact coverage. Outlines wound in opposite directions cancel, which is how
+// TrueType draws the holes in letters such as "o".
+
+use "machine" as machine
+
+public record Path {
+    // Line segments as x0, y0, x1, y1, in pixels with y pointing down.
+    lines: List<Float>
+    startX: Float
+    startY: Float
+    x: Float
+    y: Float
+    open: Boolean
+}
+
+public function newPath(): Path {
+    return Path { lines: []; startX: 0.0; startY: 0.0; x: 0.0; y: 0.0; open: false }
+}
+
+public function moveTo(path: Path, x: Float, y: Float) {
+    close(path)
+    path.startX = x
+    path.startY = y
+    path.x = x
+    path.y = y
+    path.open = true
+}
+
+public function lineTo(path: Path, x: Float, y: Float) {
+    if x != path.x || y != path.y {
+        path.lines.add(path.x)
+        path.lines.add(path.y)
+        path.lines.add(x)
+        path.lines.add(y)
+    }
+    path.x = x
+    path.y = y
+}
+
+// A quadratic Bézier curve, flattened to lines within a tenth of a pixel.
+public function quadTo(path: Path, controlX: Float, controlY: Float, x: Float, y: Float) {
+    let deviationX = path.x - 2.0 * controlX + x
+    let deviationY = path.y - 2.0 * controlY + y
+    let deviation = sqrt(deviationX * deviationX + deviationY * deviationY)
+    let steps = Integer(ceil(sqrt(deviation / 0.8)))
+    if steps < 1 { steps = 1 }
+    if steps > 32 { steps = 32 }
+    let fromX = path.x
+    let fromY = path.y
+    for step in 1..(steps + 1) {
+        let t = Float(step) / Float(steps)
+        let u = 1.0 - t
+        lineTo(path, u * u * fromX + 2.0 * u * t * controlX + t * t * x, u * u * fromY + 2.0 * u * t * controlY + t * t * y)
+    }
+}
+
+// A cubic Bézier curve, flattened by uniform subdivision.
+public function cubicTo(path: Path, x1: Float, y1: Float, x2: Float, y2: Float, x: Float, y: Float) {
+    let length = sqrt((x1 - path.x) * (x1 - path.x) + (y1 - path.y) * (y1 - path.y)) + sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1)) + sqrt((x - x2) * (x - x2) + (y - y2) * (y - y2))
+    let steps = clamp(Integer(length / 2.0) + 2, 2, 48)
+    let fromX = path.x
+    let fromY = path.y
+    for step in 1..(steps + 1) {
+        let t = Float(step) / Float(steps)
+        let u = 1.0 - t
+        let a = u * u * u
+        let b = 3.0 * u * u * t
+        let c = 3.0 * u * t * t
+        let d = t * t * t
+        lineTo(path, a * fromX + b * x1 + c * x2 + d * x, a * fromY + b * y1 + c * y2 + d * y)
+    }
+}
+
+public function close(path: Path) {
+    if path.open {
+        lineTo(path, path.startX, path.startY)
+        path.open = false
+    }
+}
+
+// Common shapes, wound clockwise on screen.
+public function rectangle(path: Path, x: Float, y: Float, width: Float, height: Float) {
+    moveTo(path, x, y)
+    lineTo(path, x + width, y)
+    lineTo(path, x + width, y + height)
+    lineTo(path, x, y + height)
+    close(path)
+}
+
+public function ellipse(path: Path, centerX: Float, centerY: Float, radiusX: Float, radiusY: Float) {
+    let steps = clamp(Integer(max(radiusX, radiusY) * 2.0) + 8, 12, 96)
+    moveTo(path, centerX + radiusX, centerY)
+    for step in 1..steps {
+        let angle = 6.283185307179586 * Float(step) / Float(steps)
+        lineTo(path, centerX + radiusX * cos(angle), centerY + radiusY * sin(angle))
+    }
+    close(path)
+}
+
+public function roundedRectangle(path: Path, x: Float, y: Float, width: Float, height: Float, radius: Float) {
+    let r = min(radius, min(width, height) / 2.0)
+    if r <= 0.0 {
+        rectangle(path, x, y, width, height)
+        return
+    }
+    let k = 0.5522847498 * r
+    moveTo(path, x + r, y)
+    lineTo(path, x + width - r, y)
+    cubicTo(path, x + width - r + k, y, x + width, y + r - k, x + width, y + r)
+    lineTo(path, x + width, y + height - r)
+    cubicTo(path, x + width, y + height - r + k, x + width - r + k, y + height, x + width - r, y + height)
+    lineTo(path, x + r, y + height)
+    cubicTo(path, x + r - k, y + height, x, y + height - r + k, x, y + height - r)
+    lineTo(path, x, y + r)
+    cubicTo(path, x, y + r - k, x + r - k, y, x + r, y)
+    close(path)
+}
+
+// A stroke of `width` pixels along a polyline given as x, y pairs, made of
+// one quadrilateral per segment plus round joins. All pieces wind the same
+// way, so overlaps simply stay covered.
+public function stroke(path: Path, points: List<Float>, width: Float, closed: Boolean) {
+    let count = points.length / 2
+    if count < 2 { return }
+    let half = width / 2.0
+    let segments = count - 1
+    if closed { segments = count }
+    for index in 0..segments {
+        let next = (index + 1) % count
+        let x0 = points[index * 2]
+        let y0 = points[index * 2 + 1]
+        let x1 = points[next * 2]
+        let y1 = points[next * 2 + 1]
+        let dx = x1 - x0
+        let dy = y1 - y0
+        let length = sqrt(dx * dx + dy * dy)
+        if length > 0.0001 {
+            let nx = -dy / length * half
+            let ny = dx / length * half
+            moveTo(path, x0 + nx, y0 + ny)
+            lineTo(path, x0 - nx, y0 - ny)
+            lineTo(path, x1 - nx, y1 - ny)
+            lineTo(path, x1 + nx, y1 + ny)
+            close(path)
+            if index > 0 || closed {
+                // Round join: a disc at the shared vertex.
+                disc(path, x0, y0, half)
+            }
+        }
+    }
+}
+
+// A disc wound the same way as the stroke's quadrilaterals (positive area),
+// so the two add up instead of cancelling.
+function disc(path: Path, x: Float, y: Float, radius: Float) {
+    let steps = clamp(Integer(radius * 4.0) + 6, 8, 24)
+    moveTo(path, x + radius, y)
+    for step in 1..steps {
+        let angle = 6.283185307179586 * Float(step) / Float(steps)
+        lineTo(path, x + radius * cos(angle), y + radius * sin(angle))
+    }
+    close(path)
+}
+
+// Coverage of `path`, translated by (-left, -top), in a width × height mask of
+// bytes from 0 to 255. The signed areas accumulate in 32-bit floats.
+public function rasterize(path: Path, left: Float, top: Float, width: Integer, height: Integer): Bytes {
+    close(path)
+    let stride = width + 2
+    let area = Bytes((stride * height + 2) * 4)
+    let lines = path.lines
+    let count = lines.length / 4
+    for index in 0..count {
+        let base = index * 4
+        accumulate(area, stride, height, lines[base] - left, lines[base + 1] - top, lines[base + 2] - left, lines[base + 3] - top)
+    }
+    let coverage = Bytes(width * height)
+    let from = machine.address(area)
+    let to = machine.address(coverage)
+    for row in 0..height {
+        machine.coverage(from + row * stride * 4, to + row * width, width)
+    }
+    return coverage
+}
+
+function add(area: Bytes, index: Integer, amount: Float) {
+    let offset = index * 4
+    area.setFloat32(offset, area.getFloat32(offset) + amount)
+}
+
+// Add one line's signed area to the buffer, row by row.
+function accumulate(area: Bytes, stride: Integer, height: Integer, ax: Float, ay: Float, bx: Float, by: Float) {
+    if abs(ay - by) <= 0.000001 { return }
+    let direction = 1.0
+    let x0 = ax
+    let y0 = ay
+    let x1 = bx
+    let y1 = by
+    if ay > by {
+        direction = -1.0
+        x0 = bx
+        y0 = by
+        x1 = ax
+        y1 = ay
+    }
+    let slope = (x1 - x0) / (y1 - y0)
+    let x = x0
+    if y0 < 0.0 {
+        x -= y0 * slope
+    }
+    let first = max(Integer(floor(y0)), 0)
+    let last = min(Integer(ceil(y1)), height)
+    let limit = Float(stride - 1)
+    for row in first..last {
+        let rowStart = row * stride
+        let dy = min(Float(row + 1), y1) - max(Float(row), y0)
+        let next = x + slope * dy
+        let d = dy * direction
+        let left = clamp(min(x, next), 0.0, limit - 1.0)
+        let right = clamp(max(x, next), 0.0, limit - 1.0)
+        let leftFloor = floor(left)
+        let leftIndex = Integer(leftFloor)
+        let rightCeil = ceil(right)
+        let rightIndex = Integer(rightCeil)
+        if rightIndex <= leftIndex + 1 {
+            let middle = 0.5 * (left + right) - leftFloor
+            add(area, rowStart + leftIndex, d - d * middle)
+            add(area, rowStart + leftIndex + 1, d * middle)
+        } else {
+            let inverse = 1.0 / (right - left)
+            let leftFraction = left - leftFloor
+            let a0 = 0.5 * inverse * (1.0 - leftFraction) * (1.0 - leftFraction)
+            let rightFraction = right - rightCeil + 1.0
+            let am = 0.5 * inverse * rightFraction * rightFraction
+            add(area, rowStart + leftIndex, d * a0)
+            if rightIndex == leftIndex + 2 {
+                add(area, rowStart + leftIndex + 1, d * (1.0 - a0 - am))
+            } else {
+                let a1 = inverse * (1.5 - leftFraction)
+                add(area, rowStart + leftIndex + 1, d * (a1 - a0))
+                for column in (leftIndex + 2)..(rightIndex - 1) {
+                    add(area, rowStart + column, d * inverse)
+                }
+                let a2 = a1 + Float(rightIndex - leftIndex - 3) * inverse
+                add(area, rowStart + rightIndex - 1, d * (1.0 - a2 - am))
+            }
+            add(area, rowStart + rightIndex, d * am)
+        }
+        x = next
+    }
+}
+
+// The outline of a rounded rectangle as x, y pairs, for stroking.
+public function roundedRectanglePoints(x: Float, y: Float, width: Float, height: Float, radius: Float): List<Float> {
+    let r = min(radius, min(width, height) / 2.0)
+    let values: List<Float> = []
+    let centersX = [x + width - r, x + width - r, x + r, x + r]
+    let centersY = [y + r, y + height - r, y + height - r, y + r]
+    for corner in 0..4 {
+        let start = -1.5707963 + Float(corner) * 1.5707963
+        for step in 0..7 {
+            let angle = start + 1.5707963 * Float(step) / 6.0
+            values.add(centersX[corner] + r * cos(angle))
+            values.add(centersY[corner] + r * sin(angle))
+        }
+    }
+    return values
+}
+
+// The path's bounding box as left, top, right, bottom.
+public function bounds(path: Path): List<Float> {
+    let lines = path.lines
+    if lines.length == 0 { return [0.0, 0.0, 0.0, 0.0] }
+    let left = lines[0]
+    let top = lines[1]
+    let right = left
+    let bottom = top
+    let index = 0
+    while index < lines.length {
+        let x = lines[index]
+        let y = lines[index + 1]
+        if x < left { left = x }
+        if x > right { right = x }
+        if y < top { top = y }
+        if y > bottom { bottom = y }
+        index += 2
+    }
+    return [left, top, right, bottom]
+}

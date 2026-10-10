@@ -1,0 +1,245 @@
+// The x86-64 PC as QEMU emulates it: what generic code reaches through
+// `use "arch" as arch`, as Linux's generic code reaches arch/x86. The build
+// puts this directory first on the package path; os/arch/arm64/arch.min has
+// the same constants, records and functions for 64-bit Arm.
+//
+// Here: the interrupt descriptor table, the legacy interrupt controllers and
+// interval timer, clock calibration against the HPET, starting and waking the
+// other processors through the local APIC, and PCI configuration access
+// through ports 0xCF8 and 0xCFC.
+use "machine" as machine
+use "device" as device
+
+public constant NAME = "x86_64"
+
+// The TSC schedules active frames. A 250 Hz PIT is enough to wake an idle
+// desktop within 4 ms without 1,000 emulated interrupt deliveries per second.
+public constant TIMER_HZ = 250
+// Interrupt numbers, for machine.interruptCount.
+public constant TIMER = 32
+public constant KEYBOARD = 33
+public constant MOUSE = 44
+
+// The PC's legacy devices exist: the PS/2 controller, the ATA disk and the
+// VMware/QEMU pointer port.
+public constant LEGACY_PC = true
+
+// randomBytes() uses the processor's RDRAND instruction directly.
+public constant NEEDS_ENTROPY = false
+
+// Firmware (SeaBIOS) has already given every PCI device its addresses.
+public constant ASSIGN_PCI = false
+public constant PCI_PREFETCH_START = 0
+public constant PCI_PREFETCH_END = 0
+public constant PCI_MEMORY_START = 0
+public constant PCI_MEMORY_END = 0
+
+constant APIC = 0xFEE00000
+constant APIC_SPURIOUS = 0xF0
+constant APIC_COMMAND_LOW = 0x300
+constant APIC_COMMAND_HIGH = 0x310
+constant WAKE_VECTOR = 48
+constant TRAMPOLINE = 0x8000
+constant STACK_SIZE = 65536
+// The part of the processors' shared block (os/shared/parallel.min) that
+// belongs to the architecture: where the interrupt table is.
+constant TABLE = 48
+constant TABLE_LIMIT = 56
+
+// ----- Interrupts -----
+
+// The processor reads the descriptor table for as long as interrupts run, so
+// keep this value alive: releasing it releases the table.
+public record Interrupts {
+    private table: device.Memory
+}
+
+function setGate(table: device.Memory, vector: Integer, handler: Integer) {
+    let entry = vector * 16
+    device.store16(table, entry, handler & 0xFFFF)
+    device.store16(table, entry + 2, 0x08)
+    device.store8(table, entry + 4, 0)
+    device.store8(table, entry + 5, 0x8E)
+    device.store16(table, entry + 6, (handler >> 16) & 0xFFFF)
+    device.store32(table, entry + 8, (handler >> 32) & 0xFFFFFFFF)
+    device.store32(table, entry + 12, 0)
+}
+
+// Install handlers for the processor exceptions and the sixteen legacy
+// interrupt lines (remapped to vectors 32-47), start the timer at TIMER_HZ, and
+// unmask the timer, keyboard and mouse lines.
+public function startInterrupts(): Interrupts {
+    let table = device.allocate(256 * 16, 16)
+    for vector in 0..49 {
+        setGate(table, vector, machine.interruptHandler(vector))
+    }
+    machine.loadInterruptTable(device.addressOf(table, 0), device.size(table) - 1)
+
+    // Remap the two 8259 controllers so their lines land on vectors 32-47.
+    let primaryCommand = device.port8(0x20)
+    let primaryData = device.port8(0x21)
+    let secondaryCommand = device.port8(0xA0)
+    let secondaryData = device.port8(0xA1)
+    device.out8(primaryCommand, 0x11)
+    device.out8(secondaryCommand, 0x11)
+    device.out8(primaryData, 32)
+    device.out8(secondaryData, 40)
+    device.out8(primaryData, 4)
+    device.out8(secondaryData, 2)
+    device.out8(primaryData, 1)
+    device.out8(secondaryData, 1)
+    // Unmask the timer (0), keyboard (1), cascade (2) and mouse (12).
+    device.out8(primaryData, 0xF8)
+    device.out8(secondaryData, 0xEF)
+
+    // Channel 0, rate generator, 1193182 Hz / divisor.
+    let divisor = 1193182 / TIMER_HZ
+    let timerChannel = device.port8(0x40)
+    device.out8(device.port8(0x43), 0x34)
+    device.out8(timerChannel, divisor & 0xFF)
+    device.out8(timerChannel, (divisor >> 8) & 0xFF)
+    machine.enableInterrupts()
+    return Interrupts { table: table }
+}
+
+function waitTicks(ticks: Integer) {
+    let end = machine.interruptCount(TIMER) + ticks
+    while machine.interruptCount(TIMER) < end {
+        machine.waitForInterrupt()
+    }
+}
+
+// TSC ticks per millisecond, measured against QEMU PC's HPET main counter,
+// not delivered PIT interrupts: the latter coalesce when the host is busy,
+// slowing animations and making an apparent 125 FPS substantially less in
+// wall time. The PIT is the fallback for machines without the standard HPET.
+public function measureClock(): Integer {
+    let hpet = device.registers(0xFED00000, 0x400)
+    let counter = device.register64(hpet, 0xF0)
+    let period = device.readAt32(hpet, 4)
+    let ticks = 0
+    if period > 0 && period <= 100000000 && (device.readAt32(hpet, 0) & 0x2000) != 0 {
+        let configuration = device.readAt64(hpet, 0x10)
+        device.writeAt64(hpet, 0x10, configuration | 1)
+        let start = device.read64(counter)
+        let tsc = machine.timestamp()
+        let end = start
+        let guard = 0
+        while end - start < 50000000000000 / period && guard < 1000000 {
+            end = device.read64(counter)
+            guard += 1
+        }
+        let elapsed = machine.timestamp() - tsc
+        device.writeAt64(hpet, 0x10, configuration)
+        if end > start && guard < 1000000 {
+            ticks = elapsed * 1000000 / ((end - start) * period / 1000000)
+        }
+    }
+    if ticks <= 0 {
+        let start = machine.interruptCount(TIMER)
+        let tsc = machine.timestamp()
+        waitTicks((50 * TIMER_HZ + 999) / 1000)
+        ticks = max((machine.timestamp() - tsc) / max((machine.interruptCount(TIMER) - start) * 1000 / TIMER_HZ, 1), 1)
+        print("clock: PIT fallback; wall-clock rate may drift under host load")
+    } else {
+        print("clock: HPET-calibrated TSC " + Text(ticks) + " ticks/ms")
+    }
+    return ticks
+}
+
+// ----- Other processors -----
+
+// Memory the other processors use for as long as they run.
+public record Launch {
+    // How many processors were started, or -1 if they were all woken at once
+    // and only their arrival can tell.
+    started: Integer
+    private stacks: device.Memory
+}
+
+function apicWaitForDelivery(commandLow: device.Register32) {
+    let spins = 0
+    while (device.read32(commandLow) & 0x1000) != 0 && spins < 1000000 {
+        machine.pause()
+        spins += 1
+    }
+}
+
+// Send an inter-processor interrupt to every other processor.
+function broadcast(apic: device.Registers, command: Integer) {
+    let commandLow = device.register32(apic, APIC_COMMAND_LOW)
+    device.writeAt32(apic, APIC_COMMAND_HIGH, 0)
+    device.write32(commandLow, command)
+    apicWaitForDelivery(commandLow)
+}
+
+// Start every other processor at the parallel function `worker(number,
+// shared)`. The boot code's trampoline is copied to 0x8000 and each processor
+// is sent INIT and start-up IPIs; there it enters 64-bit mode, claims a
+// number and a stack, and calls `worker`.
+public function startProcessors(interrupts: Interrupts, shared: device.Memory, worker: Integer): Launch {
+    device.store64(shared, TABLE, device.addressOf(interrupts.table, 0))
+    device.store64(shared, TABLE_LIMIT, device.size(interrupts.table) - 1)
+    let apic = device.registers(APIC, 0x400)
+    device.setBits32(device.register32(apic, APIC_SPURIOUS), 0x1FF, true)
+
+    // Room for up to 15 more processors.
+    let stacks = device.allocate(STACK_SIZE * 15, 16)
+    let start = machine.symbol(0)
+    let end = machine.symbol(1)
+    let trampoline = device.physical(TRAMPOLINE, end - start)
+    device.copy(trampoline, 0, device.physical(start, end - start), 0, end - start)
+    device.store64(trampoline, 0x200, 0)
+    device.store64(trampoline, 0x208, device.addressOf(stacks, 0))
+    device.store64(trampoline, 0x210, STACK_SIZE)
+    device.store64(trampoline, 0x218, worker)
+    device.store64(trampoline, 0x220, device.addressOf(shared, 0))
+    machine.fence()
+
+    // INIT, then two start-up IPIs pointing at page 8 (0x8000), to all others.
+    broadcast(apic, 0x000C4500)
+    waitTicks(3)
+    for attempt in 0..2 {
+        broadcast(apic, 0x000C4600 | (TRAMPOLINE >> 12))
+        waitTicks(1)
+    }
+    return Launch { started: -1; stacks: stacks }
+}
+
+// What each other processor does first: load the interrupt table and enable
+// its local APIC, so wake-up IPIs reach it.
+public parallel function enterProcessor(shared: Integer) {
+    machine.loadInterruptTable(machine.read64(shared + TABLE), machine.read64(shared + TABLE_LIMIT))
+    machine.write32(APIC + APIC_SPURIOUS, machine.read32(APIC + APIC_SPURIOUS) | 0x1FF)
+}
+
+// A fixed-vector IPI to every processor but this one.
+public function wakeProcessors() {
+    machine.write32(APIC + APIC_COMMAND_HIGH, 0)
+    machine.write32(APIC + APIC_COMMAND_LOW, 0x000C0000 | WAKE_VECTOR)
+}
+
+// ----- PCI configuration space -----
+
+public record PciConfig {
+    private address: device.Port32
+    private data: device.Port32
+}
+
+public function pciConfig(): PciConfig {
+    return PciConfig { address: device.port32(0xCF8); data: device.port32(0xCFC) }
+}
+
+function configAddress(bus: Integer, slot: Integer, function: Integer, offset: Integer): Integer {
+    return 0x80000000 | (bus << 16) | (slot << 11) | (function << 8) | (offset & 0xFC)
+}
+
+public function pciRead32(config: PciConfig, bus: Integer, slot: Integer, function: Integer, offset: Integer): Integer {
+    device.out32(config.address, configAddress(bus, slot, function, offset))
+    return device.in32(config.data)
+}
+
+public function pciWrite32(config: PciConfig, bus: Integer, slot: Integer, function: Integer, offset: Integer, value: Integer) {
+    device.out32(config.address, configAddress(bus, slot, function, offset))
+    device.out32(config.data, value)
+}

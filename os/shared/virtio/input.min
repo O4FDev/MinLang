@@ -1,0 +1,62 @@
+// Virtio input devices: the Arm board's keyboard and tablet. Each delivers
+// Linux input events (type, code, value) into buffers the driver keeps
+// offered; os/kernel/input/devices.min turns them into key presses and
+// pointer movement.
+use "device" as device
+use "../pci.min" as pci
+use "./virtio.min" as virtio
+
+public constant SYNCHRONIZE = 0
+public constant KEY = 1
+public constant RELATIVE = 2
+public constant ABSOLUTE = 3
+
+constant BUFFERS = 64
+
+public record Events {
+    private opened: virtio.Device
+    private events: virtio.Queue
+    private buffer: device.Memory
+}
+
+public record Event {
+    kind: Integer
+    code: Integer
+    value: Integer
+}
+
+// Every virtio input device, with all its event buffers offered.
+public function openAll(devices: List<pci.Device>): List<Events> {
+    let all: List<Events> = []
+    for card in virtio.find(devices, virtio.INPUT) {
+        let opened = virtio.open(card)
+        let events = virtio.openQueue(opened, 0, BUFFERS)
+        virtio.ready(opened)
+        let buffer = device.allocate(events.size * 8, 8)
+        for slot in 0..events.size {
+            virtio.describe(events, slot, device.addressOf(buffer, slot * 8), 8, virtio.WRITE, 0)
+            virtio.offer(events, slot)
+        }
+        virtio.notify(events)
+        all.add(Events { opened: opened; events: events; buffer: buffer })
+    }
+    return all
+}
+
+// The events waiting since the last call, oldest first.
+public function take(source: Events): List<Event> {
+    let taken: List<Event> = []
+    let head = virtio.collect(source.events)
+    while head >= 0 {
+        let at = head * 8
+        let value = device.load32(source.buffer, at + 4)
+        if value >= 0x80000000 { value -= 0x100000000 }
+        taken.add(Event { kind: device.load16(source.buffer, at); code: device.load16(source.buffer, at + 2); value: value })
+        virtio.offer(source.events, head)
+        head = virtio.collect(source.events)
+    }
+    if taken.length > 0 {
+        virtio.notify(source.events)
+    }
+    return taken
+}

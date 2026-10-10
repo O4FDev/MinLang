@@ -1,0 +1,178 @@
+// The Intel 82540EM (e1000) network adapter that QEMU emulates: registers
+// through memory-mapped I/O, frames through DMA rings of descriptors.
+use "device" as device
+use "../../shared/pci.min" as pci
+
+constant CONTROL = 0x0000
+constant STATUS = 0x0008
+constant INTERRUPT_MASK_CLEAR = 0x00D8
+constant RECEIVE_CONTROL = 0x0100
+constant TRANSMIT_CONTROL = 0x0400
+constant TRANSMIT_GAP = 0x0410
+constant RECEIVE_BASE_LOW = 0x2800
+constant RECEIVE_BASE_HIGH = 0x2804
+constant RECEIVE_LENGTH = 0x2808
+constant RECEIVE_HEAD = 0x2810
+constant RECEIVE_TAIL = 0x2818
+constant TRANSMIT_BASE_LOW = 0x3800
+constant TRANSMIT_BASE_HIGH = 0x3804
+constant TRANSMIT_LENGTH = 0x3808
+constant TRANSMIT_HEAD = 0x3810
+constant TRANSMIT_TAIL = 0x3818
+constant MULTICAST_TABLE = 0x5200
+constant RECEIVE_ADDRESS_LOW = 0x5400
+constant RECEIVE_ADDRESS_HIGH = 0x5404
+
+constant RECEIVE_COUNT = 64
+constant TRANSMIT_COUNT = 32
+constant BUFFER = 2048
+// The adapter decodes 128 KiB of registers.
+constant REGISTER_BYTES = 0x20000
+
+public record Adapter {
+    present: Boolean
+    registers: device.Registers
+    receiveTail: device.Register32
+    transmitTail: device.Register32
+    // DMA memory: 16-byte descriptors in two rings, and one buffer per descriptor.
+    receiveRing: device.Memory
+    transmitRing: device.Memory
+    receiveBuffers: device.Memory
+    transmitBuffers: device.Memory
+    receiveNext: Integer
+    transmitNext: Integer
+    mac: Bytes
+    sent: Integer
+    received: Integer
+}
+
+function read(adapter: Adapter, register: Integer): Integer {
+    return device.readAt32(adapter.registers, register)
+}
+
+function write(adapter: Adapter, register: Integer, value: Integer) {
+    device.writeAt32(adapter.registers, register, value)
+}
+
+public function absent(): Adapter {
+    let none = device.allocate(16, 16)
+    let window = device.registers(4096, 4096)
+    return Adapter {
+        present: false; registers: window; receiveTail: device.register32(window, 0); transmitTail: device.register32(window, 0)
+        receiveRing: none; transmitRing: none; receiveBuffers: none; transmitBuffers: none
+        receiveNext: 0; transmitNext: 0; mac: Bytes(6); sent: 0; received: 0
+    }
+}
+
+public function start(devices: List<pci.Device>): Adapter {
+    let index = pci.find(devices, 0x8086, 0x100E)
+    if index < 0 {
+        print("net: no e1000 adapter")
+        return absent()
+    }
+    let card = devices[index]
+    pci.enable(card)
+    let memory = device.allocate(4096 + (RECEIVE_COUNT + TRANSMIT_COUNT) * BUFFER, 4096)
+    let window = pci.registers(card, 0, REGISTER_BYTES)
+    let adapter = Adapter {
+        present: true; registers: window
+        receiveTail: device.register32(window, RECEIVE_TAIL); transmitTail: device.register32(window, TRANSMIT_TAIL)
+        receiveRing: device.view(memory, 0, RECEIVE_COUNT * 16)
+        transmitRing: device.view(memory, RECEIVE_COUNT * 16, TRANSMIT_COUNT * 16)
+        receiveBuffers: device.view(memory, 4096, RECEIVE_COUNT * BUFFER)
+        transmitBuffers: device.view(memory, 4096 + RECEIVE_COUNT * BUFFER, TRANSMIT_COUNT * BUFFER)
+        receiveNext: 0; transmitNext: 0; mac: Bytes(6); sent: 0; received: 0
+    }
+    // Reset, then bring the link up with automatic speed detection.
+    write(adapter, CONTROL, read(adapter, CONTROL) | (1 << 26))
+    for spin in 0..100000 {
+        if (read(adapter, CONTROL) & (1 << 26)) == 0 { break }
+    }
+    write(adapter, INTERRUPT_MASK_CLEAR, 0xFFFFFFFF)
+    write(adapter, CONTROL, (read(adapter, CONTROL) | (1 << 6) | (1 << 5)) & ~(1 << 3) & ~(1 << 31))
+    let low = read(adapter, RECEIVE_ADDRESS_LOW)
+    let high = read(adapter, RECEIVE_ADDRESS_HIGH)
+    for byte in 0..4 {
+        adapter.mac[byte] = (low >> (byte * 8)) & 255
+    }
+    adapter.mac[4] = high & 255
+    adapter.mac[5] = (high >> 8) & 255
+    for entry in 0..128 {
+        write(adapter, MULTICAST_TABLE + entry * 4, 0)
+    }
+    // Receive ring: every descriptor owns one buffer.
+    for slot in 0..RECEIVE_COUNT {
+        device.store64(adapter.receiveRing, slot * 16, device.addressOf(adapter.receiveBuffers, slot * BUFFER))
+        device.store64(adapter.receiveRing, slot * 16 + 8, 0)
+    }
+    let receiveRing = device.addressOf(adapter.receiveRing, 0)
+    write(adapter, RECEIVE_BASE_LOW, receiveRing & 0xFFFFFFFF)
+    write(adapter, RECEIVE_BASE_HIGH, receiveRing >> 32)
+    write(adapter, RECEIVE_LENGTH, RECEIVE_COUNT * 16)
+    write(adapter, RECEIVE_HEAD, 0)
+    write(adapter, RECEIVE_TAIL, RECEIVE_COUNT - 1)
+    // Enable, accept broadcast, 2048-byte buffers, strip the CRC.
+    write(adapter, RECEIVE_CONTROL, (1 << 1) | (1 << 15) | (1 << 26))
+    for slot in 0..TRANSMIT_COUNT {
+        device.store64(adapter.transmitRing, slot * 16, device.addressOf(adapter.transmitBuffers, slot * BUFFER))
+        // Mark every slot done so the first pass can use it.
+        device.store64(adapter.transmitRing, slot * 16 + 8, 1 << 32)
+    }
+    let transmitRing = device.addressOf(adapter.transmitRing, 0)
+    write(adapter, TRANSMIT_BASE_LOW, transmitRing & 0xFFFFFFFF)
+    write(adapter, TRANSMIT_BASE_HIGH, transmitRing >> 32)
+    write(adapter, TRANSMIT_LENGTH, TRANSMIT_COUNT * 16)
+    write(adapter, TRANSMIT_HEAD, 0)
+    write(adapter, TRANSMIT_TAIL, 0)
+    write(adapter, TRANSMIT_GAP, 10 | (8 << 10) | (6 << 20))
+    write(adapter, TRANSMIT_CONTROL, (1 << 1) | (1 << 3) | (15 << 4) | (64 << 12))
+    print("net: e1000 at " + Text(device.base(window)) + ", MAC " + macText(adapter.mac) + ", link " + Text((read(adapter, STATUS) >> 1) & 1))
+    return adapter
+}
+
+public function macText(mac: Bytes): Text {
+    let parts: List<Text> = []
+    let digits = "0123456789abcdef"
+    for index in 0..6 {
+        if index > 0 { parts.add(":") }
+        parts.add(Text(digits[mac[index] >> 4]))
+        parts.add(Text(digits[mac[index] & 15]))
+    }
+    return joinText(parts)
+}
+
+// Queue a frame for transmission. Returns false if the ring is full.
+public function send(adapter: Adapter, frame: Bytes): Boolean {
+    if !adapter.present { return false }
+    let slot = adapter.transmitNext
+    let descriptor = slot * 16
+    if (device.load8(adapter.transmitRing, descriptor + 12) & 1) == 0 {
+        return false
+    }
+    let length = min(frame.length, BUFFER)
+    device.write(adapter.transmitBuffers, slot * BUFFER, frame, 0, length)
+    // Length, then command: end of packet, insert checksum, report status.
+    device.store64(adapter.transmitRing, descriptor + 8, length | ((1 | 2 | 8) << 24))
+    adapter.transmitNext = (slot + 1) % TRANSMIT_COUNT
+    device.write32(adapter.transmitTail, adapter.transmitNext)
+    adapter.sent += 1
+    return true
+}
+
+// The next received frame, or empty Bytes if none is waiting.
+public function receive(adapter: Adapter): Bytes {
+    if !adapter.present { return Bytes() }
+    let slot = adapter.receiveNext
+    let descriptor = slot * 16
+    let status = device.load8(adapter.receiveRing, descriptor + 12)
+    if (status & 1) == 0 {
+        return Bytes()
+    }
+    let length = device.load16(adapter.receiveRing, descriptor + 8)
+    let frame = device.read(adapter.receiveBuffers, slot * BUFFER, min(length, BUFFER))
+    device.store64(adapter.receiveRing, descriptor + 8, 0)
+    device.write32(adapter.receiveTail, slot)
+    adapter.receiveNext = (slot + 1) % RECEIVE_COUNT
+    adapter.received += 1
+    return frame
+}

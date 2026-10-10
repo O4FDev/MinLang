@@ -1,0 +1,74 @@
+// The other processors.
+//
+// The architecture starts them (os/arch/*/arch.min): each runs `worker`, a
+// parallel function that sleeps until a wake-up interrupt announces work,
+// then claims items from a shared counter until none are left.
+// `parallelFor` runs a parallel function over a range of items on every
+// processor, the boot processor included.
+use "machine" as machine
+use "device" as device
+use "arch" as arch
+use "../../shared/interrupts.min" as interrupts
+use "../../shared/parallel.min" as parallel
+
+public record Processors {
+    count: Integer
+    // The address of `shared`, which parallel functions take as an Integer.
+    block: Integer
+    // Memory the other processors use for as long as they run.
+    private shared: device.Memory
+    private launch: arch.Launch
+}
+
+// Interrupts that arrive while a processor is waiting only wake it; all the
+// state it needs is in the shared block.
+parallel function worker(number: Integer, shared: Integer) {
+    arch.enterProcessor(shared)
+    machine.atomicAdd(shared + parallel.ONLINE, 1)
+    let seen = machine.read64(shared + parallel.GENERATION)
+    while true {
+        machine.disableInterrupts()
+        let generation = machine.read64(shared + parallel.GENERATION)
+        if generation == seen {
+            // Enabling interrupts and halting is one step: a wake-up that
+            // arrives after the check still ends the halt.
+            machine.waitForInterrupt()
+        } else {
+            seen = generation
+            // Join, then look: either the boot processor sees us joined before
+            // it closes the job, or we see it closed and stay out.
+            machine.atomicAdd(shared + parallel.JOINED, 1)
+            machine.fence()
+            if machine.read64(shared + parallel.OPEN) == 1 {
+                parallel.work(shared)
+            }
+            machine.atomicAdd(shared + parallel.JOINED, -1)
+        }
+    }
+}
+
+public function start(table: arch.Interrupts): Processors {
+    let shared = device.allocate(4096, 64)
+    let launch = arch.startProcessors(table, shared, parallelEntry(worker))
+    // Give them time to reach the worker loop: all that were started, or,
+    // when the architecture cannot say how many, until the count settles.
+    let waited = 0
+    let online = 0
+    while waited < 200 {
+        interrupts.sleep(10)
+        waited += 10
+        let now = device.load64(shared, parallel.ONLINE)
+        if launch.started >= 0 && now >= launch.started { break }
+        if launch.started < 0 && now == online && now > 0 && waited >= 60 { break }
+        online = now
+    }
+    let count = 1 + min(device.load64(shared, parallel.ONLINE), 15)
+    print("processors: " + Text(count) + " online")
+    return Processors { count: count; block: device.addressOf(shared, 0); shared: shared; launch: launch }
+}
+
+// Run the parallel function `entry` once for every item in 0..count, spread
+// over all processors, and return when every item is done.
+public function parallelFor(processors: Processors, entry: Integer, count: Integer, arguments: Integer) {
+    parallel.run(processors.block, processors.count, entry, count, arguments)
+}

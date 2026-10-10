@@ -1086,6 +1086,13 @@ static Type check_expression(Program *program, Function *function, Expression *e
             require_type(expression->arguments[0], left, TYPE_LIST_TEXT, "the Text pieces to join");
             return expression->type = TYPE_TEXT;
         }
+        if (strcmp(expression->text, "fileExists") == 0) {
+            if (arrlen(expression->arguments) != 1)
+                fail_at(expression->line, expression->column, "fileExists expects one file path");
+            left = check_expression(program, function, expression->arguments[0]);
+            require_type(expression->arguments[0], left, TYPE_TEXT, "a file path");
+            return expression->type = TYPE_BOOLEAN;
+        }
         if (strcmp(expression->text, "readTextFile") == 0) {
             if (arrlen(expression->arguments) != 1)
                 fail_at(expression->line, expression->column, "readTextFile expects one file path");
@@ -1501,6 +1508,13 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
             arrfree(arguments);
             return make_value(TYPE_TEXT, "%%value.%d", temporary);
         }
+        if (strcmp(expression->text, "fileExists") == 0) {
+            temporary = new_temporary(emitter);
+            fprintf(output, "  %%value.%d = call zeroext i1 @minyar_file_exists(ptr %s)\n", temporary,
+                    arguments[0].name);
+            arrfree(arguments);
+            return make_value(TYPE_BOOLEAN, "%%value.%d", temporary);
+        }
         if (strcmp(expression->text, "readTextFile") == 0 ||
             strcmp(expression->text, "argument") == 0) {
             temporary = new_temporary(emitter);
@@ -1885,6 +1899,7 @@ static void emit_program(FILE *output, Program *program) {
           "declare i64 @minyar_argument_count()\n"
           "declare ptr @minyar_argument(i64)\n"
           "declare ptr @minyar_read_text_file(ptr)\n"
+          "declare zeroext i1 @minyar_file_exists(ptr)\n"
           "declare void @minyar_write_text_file(ptr, ptr)\n"
           "declare ptr @minyar_list_new()\n"
           "declare void @minyar_list_add(ptr, i64)\n"

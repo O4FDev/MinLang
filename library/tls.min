@@ -1,0 +1,409 @@
+// A TLS 1.3 client (RFC 8446) with X25519 and ChaCha20-Poly1305.
+// Import it with `use "tls" as tls`.
+//
+// A Session is a state machine that never touches the network itself: give
+// it the bytes that arrive with `receive`, send whatever `takeOutgoing`
+// returns, and read decrypted data with `takeIncoming`. That lets the hosted
+// `http` package and Minyar OS's own TCP/IP stack share it.
+//
+// The session encrypts and checks the integrity of everything, and verifies
+// the server's Finished message, but it does not validate the server's
+// certificate: it protects against eavesdropping, not against an active
+// attacker impersonating the server.
+use "crypto" as crypto
+
+public constant STARTING = 0
+public constant HELLO_SENT = 1
+public constant HANDSHAKE = 2
+public constant ESTABLISHED = 3
+public constant CLOSED = 4
+public constant FAILED = 5
+
+constant CHACHA20_POLY1305 = 0x1303
+constant X25519 = 0x001d
+
+public record Session {
+    host: Text
+    state: Integer
+    error: Text
+    privateKey: Bytes
+    random: Bytes
+    transcript: Bytes
+    received: Bytes
+    handshake: Bytes
+    outgoing: Bytes
+    incoming: Bytes
+    handshakeSecret: Bytes
+    clientSecret: Bytes
+    serverSecret: Bytes
+    readKey: Bytes
+    readIv: Bytes
+    readSequence: Integer
+    writeKey: Bytes
+    writeIv: Bytes
+    writeSequence: Integer
+}
+
+// ----- Encoding helpers -----
+
+function add16(data: Bytes, value: Integer) {
+    data.add((value >> 8) & 255)
+    data.add(value & 255)
+}
+
+function add24(data: Bytes, value: Integer) {
+    data.add((value >> 16) & 255)
+    add16(data, value)
+}
+
+function get16(data: Bytes, at: Integer): Integer {
+    return (data[at] << 8) | data[at + 1]
+}
+
+function get24(data: Bytes, at: Integer): Integer {
+    return (data[at] << 16) | get16(data, at + 1)
+}
+
+function extension(type: Integer, body: Bytes): Bytes {
+    let result = Bytes()
+    add16(result, type)
+    add16(result, body.length)
+    result.addBytes(body)
+    return result
+}
+
+function abandon(session: Session, message: Text) {
+    if session.state != FAILED {
+        session.state = FAILED
+        session.error = message
+    }
+}
+
+// ----- Starting -----
+
+// A session that is never used, for connections without TLS.
+public function none(): Session {
+    return Session {
+        host: ""; state: CLOSED; error: ""; privateKey: Bytes(); random: Bytes()
+        transcript: Bytes(); received: Bytes(); handshake: Bytes(); outgoing: Bytes(); incoming: Bytes()
+        handshakeSecret: Bytes(); clientSecret: Bytes(); serverSecret: Bytes()
+        readKey: Bytes(); readIv: Bytes(); readSequence: 0; writeKey: Bytes(); writeIv: Bytes(); writeSequence: 0
+    }
+}
+
+// A session for `host`. `entropy` must be at least 64 unpredictable bytes,
+// for example from randomBytes(64).
+public function client(host: Text, entropy: Bytes): Session {
+    let session = Session {
+        host: host; state: STARTING; error: ""; privateKey: entropy.slice(0, 32); random: entropy.slice(32, 64)
+        transcript: Bytes(); received: Bytes(); handshake: Bytes(); outgoing: Bytes(); incoming: Bytes()
+        handshakeSecret: Bytes(); clientSecret: Bytes(); serverSecret: Bytes()
+        readKey: Bytes(); readIv: Bytes(); readSequence: 0; writeKey: Bytes(); writeIv: Bytes(); writeSequence: 0
+    }
+    sendHello(session)
+    return session
+}
+
+function sendHello(session: Session) {
+    let body = Bytes()
+    add16(body, 0x0303)
+    body.addBytes(session.random)
+    // A legacy session ID keeps middleboxes that expect TLS 1.2 happy.
+    body.add(32)
+    body.addBytes(crypto.sha256(session.random))
+    add16(body, 2)
+    add16(body, CHACHA20_POLY1305)
+    body.add(1)
+    body.add(0)
+    let extensions = Bytes()
+    let name = Bytes(session.host)
+    let serverName = Bytes()
+    add16(serverName, name.length + 3)
+    serverName.add(0)
+    add16(serverName, name.length)
+    serverName.addBytes(name)
+    extensions.addBytes(extension(0, serverName))
+    let groups = Bytes()
+    add16(groups, 2)
+    add16(groups, X25519)
+    extensions.addBytes(extension(10, groups))
+    let algorithms = Bytes()
+    let schemes = [0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601, 0x0807]
+    add16(algorithms, schemes.length * 2)
+    for scheme in schemes { add16(algorithms, scheme) }
+    extensions.addBytes(extension(13, algorithms))
+    let protocols = Bytes()
+    let http = Bytes("http/1.1")
+    add16(protocols, http.length + 1)
+    protocols.add(http.length)
+    protocols.addBytes(http)
+    extensions.addBytes(extension(16, protocols))
+    let versions = Bytes()
+    versions.add(2)
+    add16(versions, 0x0304)
+    extensions.addBytes(extension(43, versions))
+    let share = Bytes()
+    let publicKey = crypto.x25519Public(session.privateKey)
+    add16(share, publicKey.length + 4)
+    add16(share, X25519)
+    add16(share, publicKey.length)
+    share.addBytes(publicKey)
+    extensions.addBytes(extension(51, share))
+    add16(body, extensions.length)
+    body.addBytes(extensions)
+    let message = Bytes()
+    message.add(1)
+    add24(message, body.length)
+    message.addBytes(body)
+    session.transcript.addBytes(message)
+    let hello = Bytes()
+    hello.add(22)
+    add16(hello, 0x0301)
+    add16(hello, message.length)
+    hello.addBytes(message)
+    session.outgoing.addBytes(hello)
+    session.state = HELLO_SENT
+}
+
+// ----- Records -----
+
+function nonce(iv: Bytes, sequence: Integer): Bytes {
+    let result = iv.slice(0, 12)
+    for index in 0..8 {
+        result[11 - index] = result[11 - index] ^ ((sequence >> (index * 8)) & 255)
+    }
+    return result
+}
+
+function encrypt(session: Session, type: Integer, content: Bytes) {
+    let offset = 0
+    while offset < content.length || content.length == 0 {
+        let size = min(content.length - offset, 16384)
+        let inner = content.slice(offset, offset + size)
+        inner.add(type)
+        let header = Bytes()
+        header.add(23)
+        add16(header, 0x0303)
+        add16(header, inner.length + 16)
+        let sealed = crypto.seal(session.writeKey, nonce(session.writeIv, session.writeSequence), header, inner)
+        session.writeSequence += 1
+        session.outgoing.addBytes(header)
+        session.outgoing.addBytes(sealed)
+        offset += size
+        if content.length == 0 { return }
+    }
+}
+
+// Give the session bytes that arrived from the server.
+public function receive(session: Session, data: Bytes) {
+    session.received.addBytes(data)
+    while session.state != FAILED && session.received.length >= 5 {
+        let length = get16(session.received, 3)
+        if session.received.length < 5 + length { return }
+        let header = session.received.slice(0, 5)
+        let body = session.received.slice(5, 5 + length)
+        session.received = session.received.slice(5 + length, session.received.length)
+        readRecord(session, header, body)
+    }
+}
+
+function readRecord(session: Session, header: Bytes, body: Bytes) {
+    let type = header[0]
+    if type == 20 { return }
+    if type == 21 {
+        alert(session, body)
+        return
+    }
+    if type == 22 && session.state == HELLO_SENT {
+        session.handshake.addBytes(body)
+        handshakeMessages(session)
+        return
+    }
+    if type != 23 || session.readKey.length == 0 {
+        abandon(session, "unexpected record type " + Text(type))
+        return
+    }
+    let opened = crypto.open(session.readKey, nonce(session.readIv, session.readSequence), header, body)
+    session.readSequence += 1
+    if !opened.valid {
+        abandon(session, "a record failed its integrity check")
+        return
+    }
+    let plain = opened.plaintext
+    let end = plain.length
+    while end > 0 && plain[end - 1] == 0 { end -= 1 }
+    if end == 0 {
+        abandon(session, "a record had no content type")
+        return
+    }
+    let inner = plain[end - 1]
+    let content = plain.slice(0, end - 1)
+    if inner == 22 {
+        session.handshake.addBytes(content)
+        handshakeMessages(session)
+    }
+    if inner == 23 {
+        session.incoming.addBytes(content)
+    }
+    if inner == 21 {
+        alert(session, content)
+    }
+}
+
+function alert(session: Session, body: Bytes) {
+    if body.length >= 2 && body[1] == 0 {
+        if session.state != FAILED { session.state = CLOSED }
+        return
+    }
+    let code = 0
+    if body.length >= 2 { code = body[1] }
+    abandon(session, "the server sent alert " + Text(code))
+}
+
+// ----- Handshake -----
+
+function handshakeMessages(session: Session) {
+    while session.state != FAILED && session.handshake.length >= 4 {
+        let length = get24(session.handshake, 1)
+        if session.handshake.length < 4 + length { return }
+        let message = session.handshake.slice(0, 4 + length)
+        session.handshake = session.handshake.slice(4 + length, session.handshake.length)
+        let type = message[0]
+        if type == 2 {
+            serverHello(session, message)
+        } else {
+            if type == 20 {
+                serverFinished(session, message)
+            } else {
+                if type == 4 && session.state == ESTABLISHED {
+                    // A session ticket for resumption, which this client does not use.
+                } else {
+                    session.transcript.addBytes(message)
+                }
+            }
+        }
+    }
+}
+
+function serverHello(session: Session, message: Bytes) {
+    let at = 4 + 2
+    let random = message.slice(at, at + 32)
+    if crypto.hex(random) == "cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c" {
+        abandon(session, "the server does not support X25519 key exchange")
+        return
+    }
+    at += 32
+    at += 1 + message[at]
+    let suite = get16(message, at)
+    at += 3
+    if suite != CHACHA20_POLY1305 {
+        abandon(session, "the server chose an unsupported cipher suite")
+        return
+    }
+    let extensionsEnd = at + 2 + get16(message, at)
+    at += 2
+    let serverKey = Bytes()
+    let version = 0
+    while at + 4 <= extensionsEnd {
+        let type = get16(message, at)
+        let size = get16(message, at + 2)
+        let data = at + 4
+        if type == 51 && get16(message, data) == X25519 {
+            serverKey = message.slice(data + 4, data + 4 + get16(message, data + 2))
+        }
+        if type == 43 {
+            version = get16(message, data)
+        }
+        at = data + size
+    }
+    if version != 0x0304 || serverKey.length != 32 {
+        abandon(session, "the server does not speak TLS 1.3")
+        return
+    }
+    session.transcript.addBytes(message)
+    let shared = crypto.x25519(session.privateKey, serverKey)
+    let zeros = Bytes(32)
+    let early = crypto.hkdfExtract(Bytes(), zeros)
+    let derived = crypto.expandLabel(early, "derived", crypto.sha256(Bytes()), 32)
+    session.handshakeSecret = crypto.hkdfExtract(derived, shared)
+    let hash = crypto.sha256(session.transcript)
+    session.clientSecret = crypto.expandLabel(session.handshakeSecret, "c hs traffic", hash, 32)
+    session.serverSecret = crypto.expandLabel(session.handshakeSecret, "s hs traffic", hash, 32)
+    session.readKey = crypto.expandLabel(session.serverSecret, "key", Bytes(), 32)
+    session.readIv = crypto.expandLabel(session.serverSecret, "iv", Bytes(), 12)
+    session.readSequence = 0
+    session.writeKey = crypto.expandLabel(session.clientSecret, "key", Bytes(), 32)
+    session.writeIv = crypto.expandLabel(session.clientSecret, "iv", Bytes(), 12)
+    session.writeSequence = 0
+    session.state = HANDSHAKE
+}
+
+function serverFinished(session: Session, message: Bytes) {
+    if session.state != HANDSHAKE {
+        abandon(session, "an unexpected Finished message arrived")
+        return
+    }
+    let finishedKey = crypto.expandLabel(session.serverSecret, "finished", Bytes(), 32)
+    let expected = crypto.hmac(finishedKey, crypto.sha256(session.transcript))
+    if crypto.hex(expected) != crypto.hex(message.slice(4, message.length)) {
+        abandon(session, "the server's Finished message did not verify")
+        return
+    }
+    session.transcript.addBytes(message)
+    let derived = crypto.expandLabel(session.handshakeSecret, "derived", crypto.sha256(Bytes()), 32)
+    let master = crypto.hkdfExtract(derived, Bytes(32))
+    let hash = crypto.sha256(session.transcript)
+    let clientApplication = crypto.expandLabel(master, "c ap traffic", hash, 32)
+    let serverApplication = crypto.expandLabel(master, "s ap traffic", hash, 32)
+    // Our Finished, still under the handshake keys.
+    let clientKey = crypto.expandLabel(session.clientSecret, "finished", Bytes(), 32)
+    let verify = crypto.hmac(clientKey, hash)
+    let finished = Bytes()
+    finished.add(20)
+    add24(finished, verify.length)
+    finished.addBytes(verify)
+    // A change-cipher-spec record first, for middlebox compatibility.
+    session.outgoing.addBytes(crypto.fromHex("140303000101"))
+    encrypt(session, 22, finished)
+    session.readKey = crypto.expandLabel(serverApplication, "key", Bytes(), 32)
+    session.readIv = crypto.expandLabel(serverApplication, "iv", Bytes(), 12)
+    session.readSequence = 0
+    session.writeKey = crypto.expandLabel(clientApplication, "key", Bytes(), 32)
+    session.writeIv = crypto.expandLabel(clientApplication, "iv", Bytes(), 12)
+    session.writeSequence = 0
+    session.state = ESTABLISHED
+}
+
+// ----- Application data -----
+
+public function send(session: Session, data: Bytes) {
+    if session.state != ESTABLISHED {
+        abandon(session, "data was sent before the handshake finished")
+        return
+    }
+    encrypt(session, 23, data)
+}
+
+// Tell the server we are done.
+public function close(session: Session) {
+    if session.state == ESTABLISHED {
+        encrypt(session, 21, crypto.fromHex("0100"))
+        session.state = CLOSED
+    }
+}
+
+public function takeOutgoing(session: Session): Bytes {
+    let data = session.outgoing
+    session.outgoing = Bytes()
+    return data
+}
+
+public function takeIncoming(session: Session): Bytes {
+    let data = session.incoming
+    session.incoming = Bytes()
+    return data
+}
+
+public function established(session: Session): Boolean {
+    return session.state == ESTABLISHED
+}

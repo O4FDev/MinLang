@@ -1,0 +1,63 @@
+// A virtio block device: the Arm board's disk. One request at a time, each
+// a chain of three buffers: a header naming the operation and first sector,
+// the data, and a status byte the device writes.
+use "device" as device
+use "../pci.min" as pci
+use "./virtio.min" as virtio
+
+constant SECTOR = 512
+// Sectors per request: the data buffer is 64 KiB.
+constant BATCH = 128
+constant DATA = 4096
+constant STATUS = 16
+
+public record Drive {
+    private opened: virtio.Device
+    private requests: virtio.Queue
+    // The header at 0, the status byte at STATUS, the data from DATA.
+    private request: device.Memory
+    // The disk's size in sectors.
+    sectors: Integer
+}
+
+public function present(devices: List<pci.Device>): Boolean {
+    return virtio.find(devices, virtio.BLOCK).length > 0
+}
+
+public function open(devices: List<pci.Device>): Drive {
+    let cards = virtio.find(devices, virtio.BLOCK)
+    if cards.length == 0 {
+        fail("no virtio disk was found")
+    }
+    let opened = virtio.open(cards[0])
+    let requests = virtio.openQueue(opened, 0, 4)
+    virtio.ready(opened)
+    let request = device.allocate(DATA + BATCH * SECTOR, 4096)
+    let base = device.addressOf(request, 0)
+    virtio.describe(requests, 0, base, 16, virtio.NEXT, 1)
+    virtio.describe(requests, 2, base + STATUS, 1, virtio.WRITE, 0)
+    let capacity = device.readAt32(virtio.configuration(opened), 0) | (device.readAt32(virtio.configuration(opened), 4) << 32)
+    return Drive { opened: opened; requests: requests; request: request; sectors: capacity }
+}
+
+// Read `count` sectors from `sector`.
+public function read(drive: Drive, sector: Integer, count: Integer): Bytes {
+    let result = Bytes()
+    let done = 0
+    while done < count {
+        let chunk = min(BATCH, count - done)
+        device.store32(drive.request, 0, 0)
+        device.store32(drive.request, 4, 0)
+        device.store64(drive.request, 8, sector + done)
+        device.store8(drive.request, STATUS, 0xFF)
+        virtio.describe(drive.requests, 1, device.addressOf(drive.request, DATA), chunk * SECTOR, virtio.NEXT | virtio.WRITE, 2)
+        virtio.complete(drive.requests, 0)
+        let status = device.load8(drive.request, STATUS)
+        if status != 0 {
+            fail("the disk reported error " + Text(status) + " reading sector " + Text(sector + done))
+        }
+        result.addBytes(device.read(drive.request, DATA, chunk * SECTOR))
+        done += chunk
+    }
+    return result
+}

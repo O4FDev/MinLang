@@ -1,0 +1,154 @@
+// PCI: finding devices, reading their configuration space and their base
+// address registers (BARs). The architecture provides configuration access
+// (ports 0xCF8/0xCFC on the PC, the memory-mapped ECAM on Arm) and says
+// whether firmware has already given devices their addresses.
+use "arch" as arch
+use "device" as hardware
+
+public record Device {
+    bus: Integer
+    slot: Integer
+    function: Integer
+    vendor: Integer
+    device: Integer
+    classCode: Integer
+    private config: arch.PciConfig
+}
+
+public function read32(device: Device, offset: Integer): Integer {
+    return arch.pciRead32(device.config, device.bus, device.slot, device.function, offset)
+}
+
+public function write32(device: Device, offset: Integer, value: Integer) {
+    arch.pciWrite32(device.config, device.bus, device.slot, device.function, offset, value)
+}
+
+public function read16(device: Device, offset: Integer): Integer {
+    return (read32(device, offset) >> ((offset & 2) * 8)) & 0xFFFF
+}
+
+public function read8(device: Device, offset: Integer): Integer {
+    return (read32(device, offset) >> ((offset & 3) * 8)) & 0xFF
+}
+
+// The `size` bytes of registers a memory base address register decodes.
+public function registers(device: Device, index: Integer, size: Integer): hardware.Registers {
+    return hardware.registers(memoryBar(device, index), size)
+}
+
+// The memory address a base address register decodes, ignoring its flag bits.
+public function memoryBar(device: Device, index: Integer): Integer {
+    let low = read32(device, 0x10 + index * 4)
+    let base = low & 0xFFFFFFF0
+    if (low & 6) == 4 {
+        base = base | (read32(device, 0x14 + index * 4) << 32)
+    }
+    return base
+}
+
+// The I/O port base of an I/O-space base address register.
+public function portBar(device: Device, index: Integer): Integer {
+    return read32(device, 0x10 + index * 4) & 0xFFFC
+}
+
+// Let the device answer memory and I/O accesses and master the bus for DMA.
+public function enable(device: Device) {
+    let command = read32(device, 0x04)
+    write32(device, 0x04, (command & 0xFFFF) | 0x07)
+}
+
+// Every function present on bus 0..255, discovered by brute force.
+public function scan(): List<Device> {
+    let devices: List<Device> = []
+    let config = arch.pciConfig()
+    for bus in 0..256 {
+        for slot in 0..32 {
+            for function in 0..8 {
+                let probe = Device { bus: bus; slot: slot; function: function; vendor: 0; device: 0; classCode: 0; config: config }
+                let identity = read32(probe, 0)
+                let vendor = identity & 0xFFFF
+                if vendor != 0xFFFF {
+                    probe.vendor = vendor
+                    probe.device = (identity >> 16) & 0xFFFF
+                    probe.classCode = (read32(probe, 0x08) >> 8) & 0xFFFFFF
+                    devices.add(probe)
+                } else {
+                    if function == 0 {
+                        break
+                    }
+                }
+            }
+        }
+    }
+    return devices
+}
+
+public function find(devices: List<Device>, vendor: Integer, device: Integer): Integer {
+    for index in 0..devices.length {
+        if devices[index].vendor == vendor && devices[index].device == device {
+            return index
+        }
+    }
+    return -1
+}
+
+// Give every memory BAR an address when no firmware has (arch.ASSIGN_PCI), as
+// Linux does on boards booted without PCI firmware. Each BAR is sized by
+// writing all ones and reading back which address bits it decodes, then
+// placed at the next aligned address. A display's prefetchable BARs, its
+// framebuffer, go in the architecture's prefetchable window, which it maps so
+// pixel code may access it freely; everything else is ordinary device memory.
+public function assignAddresses(devices: List<Device>) {
+    if !arch.ASSIGN_PCI { return }
+    let prefetchable = arch.PCI_PREFETCH_START
+    let memory = arch.PCI_MEMORY_START
+    for card in devices {
+        let index = 0
+        while index < 6 {
+            let offset = 0x10 + index * 4
+            let original = read32(card, offset)
+            let wide = (original & 7) == 4
+            if (original & 1) != 0 {
+                index += 1
+                continue
+            }
+            write32(card, offset, 0xFFFFFFFF)
+            let mask = read32(card, offset) & 0xFFFFFFF0
+            // The decoded bits as a 64-bit mask: its negation is the size.
+            let high = 0xFFFFFFFF
+            if wide {
+                write32(card, offset + 4, 0xFFFFFFFF)
+                high = read32(card, offset + 4)
+            }
+            mask = mask | wrappingMultiply(high, 0x100000000)
+            if (mask & 0xFFFFFFFF) == 0 {
+                write32(card, offset, original)
+                index += 1
+                continue
+            }
+            let size = 0 - mask
+            let display = (card.classCode >> 16) == 0x03 && (original & 8) != 0
+            let base = 0
+            if display {
+                base = (prefetchable + size - 1) / size * size
+                prefetchable = base + size
+                if prefetchable > arch.PCI_PREFETCH_END {
+                    fail("PCI " + Text(card.bus) + ":" + Text(card.slot) + " needs " + Text(size) + " bytes more than the framebuffer window holds")
+                }
+            } else {
+                base = (memory + size - 1) / size * size
+                memory = base + size
+                if memory > arch.PCI_MEMORY_END {
+                    fail("PCI " + Text(card.bus) + ":" + Text(card.slot) + " needs " + Text(size) + " bytes more than the device window holds")
+                }
+            }
+            write32(card, offset, base & 0xFFFFFFFF)
+            if wide {
+                write32(card, offset + 4, base >> 32)
+                index += 2
+            } else {
+                index += 1
+            }
+        }
+    }
+}

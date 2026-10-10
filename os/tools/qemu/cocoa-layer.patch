@@ -1,0 +1,246 @@
+--- a/meson.build
++++ b/meson.build
+@@ -1221,7 +1221,7 @@
+ endif
+ 
+ cocoa = dependency('appleframeworks',
+-                   modules: ['Cocoa', 'CoreVideo', 'QuartzCore'],
++                   modules: ['Cocoa', 'CoreVideo', 'QuartzCore', 'IOSurface'],
+                    required: get_option('cocoa'))
+ 
+ vmnet = dependency('appleframeworks', modules: 'vmnet', required: get_option('vmnet'))
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -25,6 +25,8 @@
+ #include "qemu/osdep.h"
+ 
+ #import <Cocoa/Cocoa.h>
++#import <IOSurface/IOSurface.h>
++#import <CoreVideo/CoreVideo.h>
+ #import <QuartzCore/QuartzCore.h>
+ #include <crt_externs.h>
+ 
+@@ -191,12 +193,15 @@
+     CFMachPortRef eventsTap;
+     CGColorSpaceRef colorspace;
+     CALayer *cursorLayer;
++    IOSurfaceRef surfaces[3];
++    IOSurfaceRef shownSurface;
+     QEMUCursor *cursor;
+     int mouseX;
+     int mouseY;
+     bool mouseOn;
+ }
+ - (void) switchSurface:(pixman_image_t *)image;
++- (void) updateFilters;
+ - (void) grabMouse;
+ - (void) ungrabMouse;
+ - (void) setFullGrab:(id)sender;
+@@ -252,6 +257,11 @@
+         [self setClipsToBounds:YES];
+ #endif
+         [self setWantsLayer:YES];
++        [self setLayerContentsRedrawPolicy:NSViewLayerContentsRedrawOnSetNeedsDisplay];
++        [[self layer] setContentsGravity:kCAGravityResize];
++        [[self layer] setOpaque:YES];
++        [[self layer] setBackgroundColor:CGColorGetConstantColor(kCGColorBlack)];
++        [self updateFilters];
+         cursorLayer = [[CALayer alloc] init];
+         [cursorLayer setAnchorPoint:CGPointMake(0, 1)];
+         [cursorLayer setAutoresizingMask:kCALayerMaxXMargin |
+@@ -277,6 +287,11 @@
+     CGColorSpaceRelease(colorspace);
+     [cursorLayer release];
+     cursor_unref(cursor);
++    for (int i = 0; i < ARRAY_SIZE(surfaces); i++) {
++        if (surfaces[i]) {
++            CFRelease(surfaces[i]);
++        }
++    }
+     [super dealloc];
+ }
+ 
+@@ -386,66 +401,112 @@
+     CGImageRelease(image);
+ }
+ 
+-- (void) drawRect:(NSRect) rect
++- (void) updateFilters
+ {
+-    COCOA_DEBUG("QemuCocoaView: drawRect\n");
++    NSString *filter = zoom_interpolation == kCGInterpolationNone ?
++                       kCAFilterNearest : kCAFilterLinear;
+ 
+-    // get CoreGraphic context
+-    CGContextRef viewContextRef = [[NSGraphicsContext currentContext] CGContext];
++    [[self layer] setMagnificationFilter:filter];
++    [[self layer] setMinificationFilter:filter];
++}
+ 
+-    CGContextSetInterpolationQuality (viewContextRef, zoom_interpolation);
+-    CGContextSetShouldAntialias (viewContextRef, NO);
++- (BOOL) wantsUpdateLayer
++{
++    return YES;
++}
+ 
+-    // draw screen bitmap directly to Core Graphics context
+-    if (!pixman_image) {
+-        // Draw request before any guest device has set up a framebuffer:
+-        // just draw an opaque black rectangle
+-        CGContextSetRGBFillColor(viewContextRef, 0, 0, 0, 1.0);
+-        CGContextFillRect(viewContextRef, NSRectToCGRect(rect));
+-    } else {
+-        int w = pixman_image_get_width(pixman_image);
+-        int h = pixman_image_get_height(pixman_image);
+-        int bitsPerPixel = PIXMAN_FORMAT_BPP(pixman_image_get_format(pixman_image));
+-        int stride = pixman_image_get_stride(pixman_image);
+-        CGDataProviderRef dataProviderRef = CGDataProviderCreateWithData(
+-            NULL,
+-            pixman_image_get_data(pixman_image),
+-            stride * h,
+-            NULL
+-        );
+-        CGImageRef imageRef = CGImageCreate(
+-            w, //width
+-            h, //height
+-            DIV_ROUND_UP(bitsPerPixel, 8) * 2, //bitsPerComponent
+-            bitsPerPixel, //bitsPerPixel
+-            stride, //bytesPerRow
+-            colorspace, //colorspace
+-            kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst, //bitmapInfo
+-            dataProviderRef, //provider
+-            NULL, //decode
+-            0, //interpolate
+-            kCGRenderingIntentDefault //intent
+-        );
+-        // selective drawing code (draws only dirty rectangles) (OS X >= 10.4)
+-        const NSRect *rectList;
+-        NSInteger rectCount;
+-        int i;
+-        CGImageRef clipImageRef;
+-        CGRect clipRect;
+-
+-        [self getRectsBeingDrawn:&rectList count:&rectCount];
+-        for (i = 0; i < rectCount; i++) {
+-            clipRect = rectList[i];
+-            clipRect.origin.y = (float)h - (clipRect.origin.y + clipRect.size.height);
+-            clipImageRef = CGImageCreateWithImageInRect(
+-                                                        imageRef,
+-                                                        clipRect
+-                                                        );
+-            CGContextDrawImage (viewContextRef, cgrect(rectList[i]), clipImageRef);
+-            CGImageRelease (clipImageRef);
++/*
++ * A surface for the next frame that the window server is not showing, sized
++ * for the framebuffer. NULL if all of them are still in use.
++ */
++- (IOSurfaceRef) freeSurfaceWidth:(int)w height:(int)h
++{
++    for (int i = 0; i < ARRAY_SIZE(surfaces); i++) {
++        IOSurfaceRef surface = surfaces[i];
++        if (surface && (IOSurfaceGetWidth(surface) != w ||
++                        IOSurfaceGetHeight(surface) != h)) {
++            if (surface == shownSurface) {
++                shownSurface = NULL;
++            }
++            CFRelease(surface);
++            surface = surfaces[i] = NULL;
+         }
+-        CGImageRelease (imageRef);
+-        CGDataProviderRelease(dataProviderRef);
++        if (!surface) {
++            NSDictionary *properties = @{
++                (id)kIOSurfaceWidth: @(w),
++                (id)kIOSurfaceHeight: @(h),
++                (id)kIOSurfaceBytesPerElement: @4,
++                (id)kIOSurfacePixelFormat: @(kCVPixelFormatType_32BGRA),
++            };
++            surface = surfaces[i] = IOSurfaceCreate((CFDictionaryRef)properties);
++            if (!surface) {
++                continue;
++            }
++            CFPropertyListRef space = CGColorSpaceCopyPropertyList(colorspace);
++            IOSurfaceSetValue(surface, kIOSurfaceColorSpace, space);
++            CFRelease(space);
++        }
++        if (surface != shownSurface && !IOSurfaceIsInUse(surface)) {
++            return surface;
++        }
++    }
++    return NULL;
++}
++
++/*
++ * Hand the framebuffer to Core Animation as the layer's contents instead of
++ * drawing it with Core Graphics. drawRect: made the CPU convert every dirty
++ * pixel into the window's backing store, which is half-float on wide-gamut
++ * displays: a full 1080p frame took tens of milliseconds of the main thread,
++ * stalling input and later frames. An IOSurface goes to the window server,
++ * which composites and colour matches it on the GPU and keeps it while the
++ * window is hidden, so nothing has to be redrawn when it is shown again.
++ * Each frame is copied to a surface the window server is not reading, so the
++ * guest writing its framebuffer never tears what is on screen.
++ */
++- (void) updateLayer
++{
++    COCOA_DEBUG("QemuCocoaView: updateLayer\n");
++
++    if (!pixman_image ||
++        PIXMAN_FORMAT_BPP(pixman_image_get_format(pixman_image)) != 32) {
++        // No guest framebuffer yet: show the layer's black background
++        [[self layer] setContents:nil];
++        shownSurface = NULL;
++        return;
++    }
++
++    int w = pixman_image_get_width(pixman_image);
++    int h = pixman_image_get_height(pixman_image);
++    IOSurfaceRef surface = [self freeSurfaceWidth:w height:h];
++    if (!surface) {
++        // Every surface is on screen: draw into the shown one in place
++        surface = shownSurface;
++        if (!surface) {
++            return;
++        }
++    }
++
++    const uint8_t *source = (const uint8_t *)pixman_image_get_data(pixman_image);
++    int sourceStride = pixman_image_get_stride(pixman_image);
++    IOSurfaceLock(surface, 0, NULL);
++    uint8_t *target = IOSurfaceGetBaseAddress(surface);
++    size_t targetStride = IOSurfaceGetBytesPerRow(surface);
++    for (int y = 0; y < h; y++) {
++        const uint32_t *from = (const uint32_t *)(source + (size_t)y * sourceStride);
++        uint32_t *to = (uint32_t *)(target + y * targetStride);
++        // The framebuffer's top byte is padding; the surface's is alpha
++        for (int x = 0; x < w; x++) {
++            to[x] = from[x] | 0xff000000;
++        }
++    }
++    IOSurfaceUnlock(surface, 0, NULL);
++
++    if (surface == shownSurface) {
++        [[self layer] setContentsChanged];
++    } else {
++        [[self layer] setContents:(id)surface];
++        shownSurface = surface;
+     }
+ }
+ 
+@@ -1370,6 +1431,7 @@
+         zoom_interpolation = kCGInterpolationNone;
+         [sender setState: NSControlStateValueOff];
+     }
++    [cocoaView updateFilters];
+ }
+ 
+ /* Displays the console on the screen */
+@@ -2003,6 +2065,7 @@
+ 
+     if (opts->u.cocoa.has_zoom_interpolation && opts->u.cocoa.zoom_interpolation) {
+         zoom_interpolation = kCGInterpolationLow;
++        [cocoaView updateFilters];
+     }
+ 
+     create_initial_menus();

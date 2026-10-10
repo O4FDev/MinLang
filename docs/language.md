@@ -192,6 +192,20 @@ Discarded storage is not a secure erase; it remains private and is initialized
 before a later resize or native extension exposes it. `readBytesFile(path)` and `writeBytesFile(path, bytes)` transfer files
 unchanged. `for byte in bytes` visits each byte as an Integer.
 
+`Bytes(text)` is a Text's UTF-8 encoding and `Text(bytes)` reads Bytes as UTF-8
+text. Like file contents, the bytes are kept exactly; they are validated as
+UTF-8 when a character operation first needs them:
+
+```minyar
+let wire = Bytes("héllo")   // 6 bytes
+print(Text(wire).length)     // 5
+```
+
+`randomBytes(count)` returns Bytes from the platform's cryptographically secure
+generator: `arc4random_buf` on macOS and the BSDs, `getrandom` on Linux,
+`BCryptGenRandom` on Windows and the processor's `RDRAND` instruction in
+[freestanding programs](freestanding.md).
+
 ## Memory lifetime
 
 Text, List, and record values are reclaimed automatically through reference
@@ -283,6 +297,59 @@ holding a Text, List or record cannot be assigned if its type could lead back
 to the record's own type, because that could create a reference cycle; see the
 [runtime memory contract](runtime-memory.md). Record equality is not supported.
 The receiver, index and assigned value are evaluated once, in that order.
+
+A field marked `private` can be read, assigned and initialized only by code in
+the module that declares the record. Other modules can still name the record
+type, pass it around and use its other fields, but they cannot create one with
+a record literal; they get one from the declaring module's functions instead:
+
+```minyar
+public record Account {
+    owner: Text
+    private balance: Integer
+}
+
+public function open(owner: Text): Account {
+    return Account { owner: owner; balance: 0 }
+}
+
+public function balance(account: Account): Integer {
+    return account.balance
+}
+```
+
+Elsewhere, `account.owner` works but `account.balance` and
+`Account { ... }` are compile errors. A field may itself be named `private`.
+
+## Parallel functions
+
+A `parallel function` may run on several processors at once. The runtime's
+ownership tracking is single-threaded, so a parallel function stays outside it:
+its parameters, locals and results are `Integer`, `Float`, `Boolean` or
+`Character`, and it calls only other parallel functions, `machine` intrinsics
+and the built-in arithmetic and mathematics. The compiler checks this and
+compiles the function with no call-depth or ownership frame.
+
+```minyar
+use "machine" as machine
+
+parallel function square(index: Integer, results: Integer) {
+    machine.store64(results + index * 8, index * index)
+}
+
+let results = Bytes(64)
+let entry = parallelEntry(square)
+for index in 0..8 {
+    machine.callEntry(entry, index, machine.address(results))
+}
+```
+
+`parallelEntry(name)` is the address of a parallel function, which a scheduler
+can start on other processors; `machine.callEntry(entry, first, second)` calls a
+parallel function taking two Integers through that address, and
+`machine.atomicAdd` coordinates processors through shared memory. Ordinary
+functions can call parallel functions directly. Minyar OS uses them to spread
+per-pixel work over every processor; see [freestanding programs](freestanding.md).
 
 ## Programs and entry points
 

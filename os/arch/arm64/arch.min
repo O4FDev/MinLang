@@ -1,0 +1,161 @@
+// QEMU's Arm `virt` board: what generic code reaches through
+// `use "arch" as arch`, the counterpart of os/arch/x86_64/arch.min with the
+// same constants, records and functions.
+//
+// Here: the GICv3 interrupt controller, the architectural timer as a steady
+// tick, starting other processors through PSCI firmware calls and waking them
+// with software-generated interrupts, and PCI configuration access through
+// the memory-mapped ECAM. The addresses are the virt board's, as its device
+// tree gives them.
+use "machine" as machine
+use "device" as device
+
+public constant NAME = "arm64"
+
+public constant TIMER_HZ = 250
+// Interrupt numbers, for machine.interruptCount: the virtual timer's private
+// interrupt. The board has no PS/2 controller, so no keyboard or mouse lines.
+public constant TIMER = 27
+public constant KEYBOARD = -1
+public constant MOUSE = -1
+
+// No PC legacy devices: input, disk and entropy are virtio devices on PCI.
+public constant LEGACY_PC = false
+
+// randomBytes() draws on a pool the kernel fills from a virtio entropy
+// device: Arm processors such as Apple's M1 have no random instruction.
+public constant NEEDS_ENTROPY = true
+
+// Nothing assigns PCI addresses before the kernel runs, so generic code does
+// (pci.assignAddresses). os/arch/arm64/head.S maps the prefetchable window,
+// where framebuffers go, as non-cacheable memory and the rest as device memory.
+public constant ASSIGN_PCI = true
+public constant PCI_PREFETCH_START = 0x10000000
+public constant PCI_PREFETCH_END = 0x18000000
+public constant PCI_MEMORY_START = 0x18000000
+public constant PCI_MEMORY_END = 0x3EFF0000
+
+constant DISTRIBUTOR = 0x08000000
+constant REDISTRIBUTORS = 0x080A0000
+constant REDISTRIBUTOR_STRIDE = 0x20000
+constant ECAM = 0x4010000000
+constant MAX_PROCESSORS = 8
+constant STACK_SIZE = 65536
+// Machine symbols published by head.S.
+constant SECONDARY_ENTRY = 0
+constant START_TIMER = 4
+constant WAKE_OTHERS = 5
+// PSCI 1.0 through HVC.
+constant PSCI_CPU_ON = 0xC4000003
+
+// ----- Interrupts -----
+
+public record Interrupts {
+    private distributor: device.Registers
+}
+
+// Wake one processor's redistributor and route its software interrupts and
+// the timer's private interrupt to it, as group 1 interrupts (IRQs).
+function startRedistributor(frame: Integer) {
+    let control = device.registers(frame, 0x10000)
+    device.writeAt32(control, 0x14, device.readAt32(control, 0x14) & ~2)
+    let spins = 0
+    while (device.readAt32(control, 0x14) & 4) != 0 && spins < 1000000 {
+        spins += 1
+    }
+    let interrupts = device.registers(frame + 0x10000, 0x10000)
+    device.writeAt32(interrupts, 0x80, 0xFFFFFFFF)
+    device.writeAt8(interrupts, 0x400, 0x80)
+    device.writeAt8(interrupts, 0x400 + TIMER, 0x80)
+    device.writeAt32(interrupts, 0x100, 1 | (1 << TIMER))
+}
+
+// Enable the distributor and every processor's redistributor, then make the
+// virtual timer interrupt TIMER_HZ times a second.
+public function startInterrupts(): Interrupts {
+    let distributor = device.registers(DISTRIBUTOR, 0x10000)
+    // Affinity routing, group 1 enabled.
+    device.writeAt32(distributor, 0, 0x12)
+    let spins = 0
+    while (device.readAt32(distributor, 0) & 0x80000000) != 0 && spins < 1000000 {
+        spins += 1
+    }
+    for processor in 0..MAX_PROCESSORS {
+        let frame = REDISTRIBUTORS + processor * REDISTRIBUTOR_STRIDE
+        startRedistributor(frame)
+        // GICR_TYPER.Last marks the final redistributor.
+        if (device.readAt32(device.registers(frame, 0x10000), 8) & 0x10) != 0 { break }
+    }
+    machine.callEntry(machine.symbol(START_TIMER), machine.timerFrequency() / TIMER_HZ, 0)
+    machine.enableInterrupts()
+    return Interrupts { distributor: distributor }
+}
+
+// Counter ticks per millisecond: the architectural counter's frequency is
+// fixed and published, so nothing needs measuring.
+public function measureClock(): Integer {
+    let ticks = machine.timerFrequency() / 1000
+    print("clock: Arm generic timer " + Text(ticks) + " ticks/ms")
+    return ticks
+}
+
+// ----- Other processors -----
+
+public record Launch {
+    // How many processors were started.
+    started: Integer
+    private contexts: device.Memory
+    private stacks: device.Memory
+}
+
+// Start every other processor at the parallel function `worker(number,
+// shared)`: PSCI CPU_ON enters head.S's minyar_secondary_entry with a context
+// holding its stack, the function and its arguments.
+public function startProcessors(interrupts: Interrupts, shared: device.Memory, worker: Integer): Launch {
+    let contexts = device.allocate(MAX_PROCESSORS * 32, 64)
+    let stacks = device.allocate(MAX_PROCESSORS * STACK_SIZE, 16)
+    let started = 0
+    for number in 1..MAX_PROCESSORS {
+        let context = number * 32
+        device.store64(contexts, context, device.addressOf(stacks, 0) + (number + 1) * STACK_SIZE)
+        device.store64(contexts, context + 8, worker)
+        device.store64(contexts, context + 16, number)
+        device.store64(contexts, context + 24, device.addressOf(shared, 0))
+        machine.fence()
+        let result = machine.firmwareCall(PSCI_CPU_ON, number, machine.symbol(SECONDARY_ENTRY), device.addressOf(contexts, context))
+        if result != 0 { break }
+        started += 1
+    }
+    return Launch { started: started; contexts: contexts; stacks: stacks }
+}
+
+// Nothing to do: head.S has already enabled this processor's GIC interface.
+public parallel function enterProcessor(shared: Integer) {
+}
+
+// Software interrupt 0 to every processor but this one.
+public function wakeProcessors() {
+    machine.callEntry(machine.symbol(WAKE_OTHERS), 0, 0)
+}
+
+// ----- PCI configuration space -----
+
+public record PciConfig {
+    private ecam: device.Registers
+}
+
+public function pciConfig(): PciConfig {
+    return PciConfig { ecam: device.registers(ECAM, 0x10000000) }
+}
+
+function configOffset(bus: Integer, slot: Integer, function: Integer, offset: Integer): Integer {
+    return (bus << 20) | (slot << 15) | (function << 12) | (offset & 0xFFC)
+}
+
+public function pciRead32(config: PciConfig, bus: Integer, slot: Integer, function: Integer, offset: Integer): Integer {
+    return device.readAt32(config.ecam, configOffset(bus, slot, function, offset))
+}
+
+public function pciWrite32(config: PciConfig, bus: Integer, slot: Integer, function: Integer, offset: Integer, value: Integer) {
+    device.writeAt32(config.ecam, configOffset(bus, slot, function, offset), value)
+}
