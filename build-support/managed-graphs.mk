@@ -18,7 +18,14 @@ check-managed-graphs-profiles:
 check-callback-domains:
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/callback-domains.py
 
-check-managed-graphs-launcher: build/minyarc build/minyarc-callbacks build/minyarc-modules build/minyar-module-build
+# Incremental fallback uses the POSIX-only module build driver; the native
+# Windows launcher still exercises debug/release profiles and callbacks.
+MANAGED_GRAPH_LAUNCHER_ARTIFACTS = build/minyarc build/minyarc-callbacks
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+MANAGED_GRAPH_LAUNCHER_ARTIFACTS += build/minyarc-modules build/minyar-module-build
+endif
+
+check-managed-graphs-launcher: $(MANAGED_GRAPH_LAUNCHER_ARTIFACTS)
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/managed-graphs-launcher.py
 
 check-isolated-workers: build/minyarc build/minyar-default-runtime.o

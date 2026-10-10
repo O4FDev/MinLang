@@ -59,7 +59,7 @@ check-runtime-unit: build/runtime-unit
 	$(LIMITED) ./build/runtime-unit
 
 check-modules: build/minyarc build/minyar-runtime.o
-	$(LIMITED) sh tests/run-module-tests.sh
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) sh tests/run-module-tests.sh
 
 .PHONY: check-json-parser check-json-parser-sanitize
 check-json-parser: build/minyarc
@@ -617,3 +617,29 @@ check-native-bytes: build/minyar-runtime.o | build
 
 check: check-native-bytes
 check-portable: check-native-bytes
+
+
+.PHONY: check-module-test-driver check-build-wiring
+check-module-test-driver: build/minyarc build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/module-test-driver.py
+
+check-build-wiring:
+	python3 tests/build-wiring.py
+
+check check-portable: check-module-test-driver check-build-wiring
+
+.PHONY: check-tls-validity check-tls-validity-sanitize check-tls-resumption-expiry check-tls-resumption-expiry-sanitize
+check-tls-validity: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/tls-validity.py
+
+check-tls-validity-sanitize: build/minyarc
+	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/tls-validity.py --sanitize
+
+check-tls-resumption-expiry: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/tls-resumption-expiry.py
+
+check-tls-resumption-expiry-sanitize: build/minyarc
+	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/tls-resumption-expiry.py --sanitize
+
+check-tls: check-tls-validity check-tls-resumption-expiry
+check-tls-sanitize: check-tls-validity-sanitize check-tls-resumption-expiry-sanitize

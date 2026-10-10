@@ -4,10 +4,17 @@ set -eu
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 compiler=${MINYAR_TEST_COMPILER:-"$project_dir/build/minyarc"}
 clang_command=${MINYAR_TEST_CLANG:-clang}
-math_library=
-case "$(uname -s)" in Darwin) ;; *) math_library=-lm ;; esac
 build_dir="$project_dir/build/module-tests"
 mkdir -p "$build_dir"
+
+link_module() {
+    optimization=$1
+    llvm=$2
+    executable=$3
+    MINYAR_CLANG="$clang_command" MINYAR_CLANG_FLAGS="$optimization -Wno-override-module" \
+        python3 "$project_dir/tools/clang-driver.py" link "$project_dir" "$llvm" \
+        "$project_dir/build/minyar-runtime.o" "$executable" 0
+}
 
 compile_and_run() {
     name=$1
@@ -16,7 +23,7 @@ compile_and_run() {
     llvm="$build_dir/$name.ll"
     executable="$build_dir/$name"
     "$compiler" "$project_dir/$source" "$llvm"
-    "$clang_command" -O0 -Wno-override-module "$llvm" "$project_dir/build/minyar-runtime.o" $math_library -o "$executable"
+    link_module -O0 "$llvm" "$executable"
     actual=$("$executable")
     if [ "$actual" != "$expected" ]; then
         echo "module test '$name' produced unexpected output" >&2
@@ -34,7 +41,7 @@ compile_and_run_with_library() {
     llvm="$build_dir/$name.ll"
     executable="$build_dir/$name"
     "$compiler" "$project_dir/$source" "$llvm" --library "$project_dir/library"
-    "$clang_command" -O1 -Wno-override-module "$llvm" "$project_dir/build/minyar-runtime.o" $math_library -o "$executable"
+    link_module -O1 "$llvm" "$executable"
     actual=$("$executable")
     if [ "$actual" != "$expected" ]; then
         echo "module test '$name' produced unexpected output" >&2
@@ -117,7 +124,7 @@ compile_and_run private-fields tests/modules/private-fields/main.min "crate 43 t
 # --library may be repeated: the first directory with a package wins.
 "$compiler" "$project_dir/tests/modules/search-path/main.min" "$build_dir/search-path.ll" \
     --library "$project_dir/tests/modules/search-path/first" --library "$project_dir/tests/modules/search-path/second"
-"$clang_command" -O0 -Wno-override-module "$build_dir/search-path.ll" "$project_dir/build/minyar-runtime.o" $math_library -o "$build_dir/search-path"
+link_module -O0 "$build_dir/search-path.ll" "$build_dir/search-path"
 if [ "$("$build_dir/search-path")" != "first farewell" ]; then
     echo "module test 'search-path' did not prefer the first package directory" >&2
     exit 1

@@ -31,13 +31,17 @@ TARGETS = ['check-linux-snapshot', 'check-toolchain-stamp', 'check-toolchain-por
            'check-compiler-hardening', 'check-linkage', 'check-source-map', 'check-symbol-order', 'check-list-access',
            'check-checked-arithmetic', 'check-checked-scalars',
            'check-runtime-bytes', 'check-runtime-traps', 'check-runtime-numeric',
-           'check-errors-values', 'check-net', 'check-net-loop', 'check-tls-sanitize', 'check-json-parser-sanitize',
+           'check-errors-values', 'check-net', 'check-net-loop', 'check-tls-sanitize',
+           'check-http2-churn', 'check-http2-churn-sanitize',
+           'check-peer-grpc-churn', 'check-peer-grpc-churn-sanitize',
+           'check-peer-grpc-retire', 'check-peer-grpc-retire-sanitize',
+           'check-peer-edge', 'check-peer-edge-sanitize', 'check-json-parser-sanitize',
            'check-feature-dispatch', 'check-managed-graphs', 'check-managed-graphs-launcher',
            'check-callbacks', 'check-callback-domains', 'check-isolated-workers',
            'check-ownership-policy', 'check-stack-ownership', 'check-runtime-cache',
            'check-generated-sanitizer', 'check-sanitized-fixed-point',
            'check-smoke', 'check-release-build', 'check-launcher-isolation',
-           'check-modules', 'check-regressions', 'check-diagnostics', 'check-conformance',
+           'check-build-wiring', 'check-module-test-driver', 'check-modules', 'check-regressions', 'check-diagnostics', 'check-conformance',
            'check-fuzz', 'check-stack-overflow', 'check-statement-nesting',
            'check-mutation', 'check-mutation-score', 'check-binary-expressions', 'check-ownership',
            'check-adversarial', 'check-recursive-data', 'check-scalar-record-storage',
@@ -184,7 +188,7 @@ def main():
                UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1',
                CC='clang', CXX='clang++', CLANG='clang', MINYAR_TEST_CLANG='clang',
                LIMITED='', SANITIZER_LIMITED='')
-    make = [tools['make'], 'LIMITED=', 'SANITIZER_LIMITED=', 'CC=clang', 'LLVM_CC=clang',
+    make = [tools['make'], '-j2', 'LIMITED=', 'SANITIZER_LIMITED=', 'CC=clang', 'LLVM_CC=clang',
             'COMPILER_LTO_FLAGS=-flto -fuse-ld=lld']
 
     def check(label, command, extra_env=None):
