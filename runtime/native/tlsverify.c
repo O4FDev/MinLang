@@ -14,6 +14,7 @@
 #include "windows_identity.h"
 #else
 #include <arpa/inet.h>
+#include <sys/time.h>
 #endif
 
 #define MAX_CHAIN 16
@@ -215,13 +216,13 @@ static SecCertificateRef apple_certificate(CertBytes bytes) {
     return certificate;
 }
 
-MinyarText *minyar_tlsverify_chain(const MinyarText *host, const MinyarBytes *chain,
-                                   const MinyarBytes *anchors) {
+static MinyarText *verify_chain(const MinyarText *host, const MinyarBytes *chain,
+                                const MinyarBytes *anchors, bool server_peer) {
     CertBytes peers[MAX_CHAIN], roots[MAX_CHAIN];
     int peer_count = unpack_chain(chain, peers), root_count = unpack_chain(anchors, roots);
-    char name[254];
-    if (peer_count <= 0 || root_count < 0 || !hostname(host, name) ||
-        !certificate_hostname(peers[0], name))
+    char name[254] = {0};
+    if (peer_count <= 0 || root_count < 0 ||
+        (server_peer && (!hostname(host, name) || !certificate_hostname(peers[0], name))))
         return error_text("invalid certificate chain or hostname");
     CFMutableArrayRef certificates = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
     CFMutableArrayRef trusted = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
@@ -244,8 +245,9 @@ MinyarText *minyar_tlsverify_chain(const MinyarText *host, const MinyarBytes *ch
         CFArrayAppendValue(trusted, certificate);
         CFRelease(certificate);
     }
-    CFStringRef server = CFStringCreateWithCString(NULL, name, kCFStringEncodingASCII);
-    SecPolicyRef policy = server ? SecPolicyCreateSSL(true, server) : NULL;
+    CFStringRef server = server_peer ? CFStringCreateWithCString(NULL, name, kCFStringEncodingASCII) : NULL;
+    SecPolicyRef policy = server_peer ? (server ? SecPolicyCreateSSL(true, server) : NULL)
+                                      : SecPolicyCreateSSL(false, NULL);
     SecTrustRef trust = NULL;
     if (!policy || !valid ||
         SecTrustCreateWithCertificates(certificates, policy, &trust) != errSecSuccess)
@@ -444,13 +446,13 @@ MinyarBytes *minyar_tlsverify_sign(const MinyarBytes *private_key, long long sch
 
 #elif defined(_WIN32)
 
-MinyarText *minyar_tlsverify_chain(const MinyarText *host, const MinyarBytes *chain,
-                                   const MinyarBytes *anchors) {
+static MinyarText *verify_chain(const MinyarText *host, const MinyarBytes *chain,
+                                const MinyarBytes *anchors, bool server_peer) {
     CertBytes peers[MAX_CHAIN], roots[MAX_CHAIN];
     int peer_count = unpack_chain(chain, peers), root_count = unpack_chain(anchors, roots);
-    char name[254];
-    if (peer_count <= 0 || root_count < 0 || !hostname(host, name) ||
-        !certificate_hostname(peers[0], name))
+    char name[254] = {0};
+    if (peer_count <= 0 || root_count < 0 ||
+        (server_peer && (!hostname(host, name) || !certificate_hostname(peers[0], name))))
         return error_text("invalid certificate chain or hostname");
     HCERTSTORE peer_store =
         CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
@@ -481,7 +483,7 @@ MinyarText *minyar_tlsverify_chain(const MinyarText *host, const MinyarBytes *ch
     }
     CERT_CHAIN_PARA parameters = {0};
     parameters.cbSize = sizeof(parameters);
-    LPSTR usage[] = {szOID_PKIX_KP_SERVER_AUTH};
+    LPSTR usage[] = {server_peer ? szOID_PKIX_KP_SERVER_AUTH : szOID_PKIX_KP_CLIENT_AUTH};
     parameters.RequestedUsage.dwType = USAGE_MATCH_TYPE_AND;
     parameters.RequestedUsage.Usage.cUsageIdentifier = 1;
     parameters.RequestedUsage.Usage.rgpszUsageIdentifier = usage;
@@ -498,8 +500,8 @@ MinyarText *minyar_tlsverify_chain(const MinyarText *host, const MinyarBytes *ch
         server[i] = (wchar_t)(unsigned char)name[i];
     SSL_EXTRA_CERT_CHAIN_POLICY_PARA ssl_policy = {0};
     ssl_policy.cbSize = sizeof(ssl_policy);
-    ssl_policy.dwAuthType = AUTHTYPE_SERVER;
-    ssl_policy.pwszServerName = server;
+    ssl_policy.dwAuthType = server_peer ? AUTHTYPE_SERVER : AUTHTYPE_CLIENT;
+    ssl_policy.pwszServerName = server_peer ? server : NULL;
     CERT_CHAIN_POLICY_PARA policy = {0};
     policy.cbSize = sizeof(policy);
     policy.pvExtraPolicyPara = &ssl_policy;
@@ -778,13 +780,13 @@ static X509 *unix_certificate(CertBytes bytes) {
     return certificate;
 }
 
-MinyarText *minyar_tlsverify_chain(const MinyarText *host, const MinyarBytes *chain,
-                                   const MinyarBytes *anchors) {
+static MinyarText *verify_chain(const MinyarText *host, const MinyarBytes *chain,
+                                const MinyarBytes *anchors, bool server_peer) {
     CertBytes peers[MAX_CHAIN], roots[MAX_CHAIN];
     int peer_count = unpack_chain(chain, peers), root_count = unpack_chain(anchors, roots);
-    char name[254];
-    if (peer_count <= 0 || root_count < 0 || !hostname(host, name) ||
-        !certificate_hostname(peers[0], name))
+    char name[254] = {0};
+    if (peer_count <= 0 || root_count < 0 ||
+        (server_peer && (!hostname(host, name) || !certificate_hostname(peers[0], name))))
         return error_text("invalid certificate chain or hostname");
     X509_STORE *store = X509_STORE_new();
     X509_STORE_CTX *context = X509_STORE_CTX_new();
@@ -815,10 +817,10 @@ MinyarText *minyar_tlsverify_chain(const MinyarText *host, const MinyarBytes *ch
                                                        X509_CHECK_FLAG_NEVER_CHECK_SUBJECT);
         X509_VERIFY_PARAM_set_flags(parameter, X509_V_FLAG_X509_STRICT | X509_V_FLAG_TRUSTED_FIRST);
         unsigned char ip[16];
-        valid = X509_VERIFY_PARAM_set_purpose(parameter, X509_PURPOSE_SSL_SERVER) == 1;
-        if (valid && (inet_pton(AF_INET, name, ip) == 1 || inet_pton(AF_INET6, name, ip) == 1))
+        valid = X509_VERIFY_PARAM_set_purpose(parameter, server_peer ? X509_PURPOSE_SSL_SERVER : X509_PURPOSE_SSL_CLIENT) == 1;
+        if (valid && server_peer && (inet_pton(AF_INET, name, ip) == 1 || inet_pton(AF_INET6, name, ip) == 1))
             valid = X509_VERIFY_PARAM_set1_ip_asc(parameter, name) == 1;
-        else if (valid)
+        else if (valid && server_peer)
             valid = X509_VERIFY_PARAM_set1_host(parameter, name, 0) == 1;
     }
     if (valid)
@@ -918,3 +920,27 @@ MinyarBytes *minyar_tlsverify_sign(const MinyarBytes *private_key, long long sch
     return result;
 }
 #endif
+
+MinyarText *minyar_tlsverify_chain(const MinyarText *host, const MinyarBytes *chain, const MinyarBytes *anchors) {
+    return verify_chain(host, chain, anchors, true);
+}
+MinyarText *minyar_tlsverify_clientChain(const MinyarBytes *chain, const MinyarBytes *anchors) {
+    return verify_chain(NULL, chain, anchors, false);
+}
+
+/* Tickets need wall time across connections; transport timers remain monotonic. */
+long long minyar_tlsverify_currentTimeMilliseconds(void) {
+#ifdef _WIN32
+    FILETIME filetime;
+    GetSystemTimeAsFileTime(&filetime);
+    ULARGE_INTEGER ticks;
+    ticks.LowPart = filetime.dwLowDateTime;
+    ticks.HighPart = filetime.dwHighDateTime;
+    if (ticks.QuadPart < UINT64_C(116444736000000000)) return 0;
+    return (long long)((ticks.QuadPart - UINT64_C(116444736000000000)) / 10000);
+#else
+    struct timeval time;
+    if (gettimeofday(&time, NULL) != 0 || time.tv_sec < 0 || (uint64_t)time.tv_sec > INT64_MAX / 1000) return 0;
+    return (long long)time.tv_sec * 1000 + time.tv_usec / 1000;
+#endif
+}

@@ -1,0 +1,48 @@
+use "quic" as quic
+use "quiccrypto" as protection
+use "crypto" as crypto
+use "errors" as errors
+
+function drive(c: quic.Connection, s: quic.Connection, now: Integer) {
+    for packet in quic.poll(c, now) { quic.receive(s, packet, now) }
+    for packet in quic.poll(s, now) { quic.receive(c, packet, now) }
+}
+function main(): Integer {
+    let root = readBytesFile(argument(0)); let server = readBytesFile(argument(1)); let serverKey = readBytesFile(argument(2))
+    let client = readBytesFile(argument(3)); let clientKey = readBytesFile(argument(4))
+    let c = quic.client("localhost", randomBytes(80), "minyar-test", [root], [client], clientKey)
+    let s = quic.server(randomBytes(80), "minyar-test", c.originalDestination, [server], serverKey, [root], true)
+    if errors.booleanOk(quic.updateKeys(c)) { return 1 }
+    let now = 0
+    while now < 10000 && (!c.confirmed || !s.confirmed) { drive(c, s, now); now += 10 }
+    let id = errors.integerValue(quic.openStream(c, false))
+    quic.writeStream(c, id, Bytes("first"), false)
+    for count in 0..20 { drive(c, s, now); now += 10 }
+    if Text(errors.bytesValue(quic.readStream(s, id))) != "first" { return 2 }
+    // Retain an old packet in the network while newer keys are installed.
+    quic.writeStream(c, id, Bytes("old"), false)
+    let delayed = quic.poll(c, now)
+    let originalHP = crypto.hex(c.spaces[2].write.hp)
+    if !errors.booleanOk(quic.updateKeys(c)) { return 3 }
+    if errors.booleanOk(quic.updateKeys(c)) || originalHP != crypto.hex(c.spaces[2].write.hp) { return 4 }
+    quic.writeStream(c, id, Bytes("new"), false)
+    for packet in quic.poll(c, now) { quic.receive(s, packet, now) }
+    for packet in delayed { quic.receive(s, packet, now) }
+    if s.state != quic.ESTABLISHED || Text(errors.bytesValue(quic.readStream(s, id))) != "oldnew" { return 5 }
+    for count in 0..100 { drive(c, s, now); now += 10 }
+    let oldKeys = s.spaces[2].read
+    if !errors.booleanOk(quic.updateKeys(c)) { return 6 }
+    quic.writeStream(c, id, Bytes("phase zero again"), false)
+    for count in 0..20 { drive(c, s, now); now += 10 }
+    if s.state != quic.ESTABLISHED || Text(errors.bytesValue(quic.readStream(s, id))) != "phase zero again" { return 7 }
+    // Old-key ciphertext cannot advance the authenticated packet number.
+    let largest = s.spaces[2].largest
+    let header = Bytes(); header.add(0x47); header.addBytes(s.local)
+    let number = s.spaces[2].largest + 1
+    for index in 0..4 { header.add((number >> ((3 - index) * 8)) & 255) }
+    let forged = protection.protect(oldKeys, header, header.length - 4, number, crypto.fromHex("0100000000"))
+    quic.receive(s, errors.bytesValue(forged), now)
+    if s.state != quic.ESTABLISHED || s.spaces[2].largest != largest { return 8 }
+    print("QUIC key updates: handshake/ACK gating, unchanged HP, phase wrap, old-key reordering and PN monotonicity passed")
+    return 0
+}

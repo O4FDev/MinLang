@@ -1,0 +1,65 @@
+use "quic" as quic
+use "net" as net
+use "eventloop" as loop
+use "errors" as errors
+
+function main(): Integer {
+    let port = 0
+    for digit in argument(0) { port = port * 10 + Integer(digit) - 48 }
+    let socket = net.udp("127.0.0.1", 0)
+    if socket < 0 || !net.udpConnect(socket, "127.0.0.1", port) { return 1 }
+    let connection = quic.client("localhost", randomBytes(80), "minyar-test", [readBytesFile(argument(1))], [readBytesFile(argument(2))], readBytesFile(argument(3)))
+    let eventLoop = errors.integerValue(loop.create())
+    loop.watch(eventLoop, socket, loop.readableInterest(), 0)
+    let migrate = argumentCount() > 4 && argument(4) == "migration"
+    let second = -1; let probed = false
+    if migrate {
+        second = net.udp("127.0.0.1", 0)
+        if second < 0 || !net.udpConnect(second, "127.0.0.1", port) { return 6 }
+        loop.watch(eventLoop, second, loop.readableInterest(), 7)
+    }
+    let started = net.monotonicMilliseconds(); let now = 0
+    let sent = false; let received = Bytes(); let id = 0
+    let message = Bytes("Minyar authenticated Quinn QUIC")
+    while now < 10000 {
+        now = net.monotonicMilliseconds() - started
+        if migrate && connection.confirmed && !probed {
+            if !errors.booleanOk(quic.probePath(connection, 7, now)) { return 7 }
+            probed = true
+        }
+        if connection.state == quic.ESTABLISHED && !sent && (!migrate || connection.activePath == 7) {
+            id = errors.integerValue(quic.openStream(connection, false))
+            if !errors.integerOk(quic.writeStream(connection, id, message, true)) { return 2 }
+            sent = true
+        }
+        if sent {
+            let data = quic.readStream(connection, id)
+            if errors.bytesOk(data) { received.addBytes(errors.bytesValue(data)) }
+            if received.length == message.length { quic.close(connection, 0, Bytes("done")) }
+        }
+        for packet in quic.pollDatagrams(connection, now) {
+            let output = socket; if packet.pathId == 7 { output = second }
+            net.write(output, packet.data)
+        }
+        if connection.state == quic.CLOSED { break }
+        if connection.state == quic.FAILED { print(connection.error); return 3 }
+        let timeout = min(1000, max(0, quic.nextTimer(connection) - now))
+        let events = loop.wait(eventLoop, timeout, 16)
+        if errors.isError(loop.batchError(events)) { return 4 }
+        now = net.monotonicMilliseconds() - started
+        for event in loop.events(events) {
+            let input = socket; if event.token == 7 { input = second }
+            let packets = net.receiveDatagrams(input, 32, 65535)
+            if net.datagramBatchOk(packets) {
+                for packet in net.datagrams(packets) {
+                    let data = net.datagramData(packet)
+                    if errors.bytesOk(data) { quic.receivePath(connection, errors.bytesValue(data), event.token, now) }
+                }
+            }
+        }
+    }
+    loop.close(eventLoop); net.close(socket); if second >= 0 { net.close(second) }
+    if Text(received) != Text(message) { print("QUIC client timeout"); return 5 }
+    print("Minyar to Quinn/rustls: authenticated UDP echo passed")
+    return 0
+}
