@@ -3,6 +3,7 @@
  * get only the checked API. Link against the real Minyar runtime. */
 #include "../runtime/native/macos.m"
 #include <assert.h>
+#include <ApplicationServices/ApplicationServices.h>
 extern void minyar_rc_release(void *value);
 static MinyarText literal(const char *s) { return (MinyarText){(const unsigned char *)s, (long long)strlen(s), -1, NULL, NULL}; }
 static void equals(MinyarText *value, const char *expected) {
@@ -30,6 +31,58 @@ static void verifyRelease(void) {
     }
     assert(!weakView && !weakWindow);
 }
+/* Layout, styling and input behavior added for full applications. */
+static void verifyApplicationViews(void) {
+    MinyarText title = literal("Views"), empty = literal(""), plus = literal("plus"), system = literal("");
+    MinyarText mark = literal("M 50,8 Q 70,58 98,92 L 50,64 L 2,92 Q 30,58 50,8 Z"), long_text = literal("abcdefgh");
+    long long w = minyar_macos_window(&title,600,400);
+    minyar_macos_transparentTitlebar(w,52);
+    long long root = minyar_macos_column(w,0);
+    long long header = minyar_macos_row(root,0); minyar_macos_draggable(header); minyar_macos_fill(header); minyar_macos_size(header,0,52);
+    minyar_macos_spacer(header);
+    long long scroll = minyar_macos_scroll(root); minyar_macos_fill(scroll); minyar_macos_grow(scroll);
+    minyar_macos_align(scroll,MNCenter);
+    long long page = minyar_macos_column(scroll,4); minyar_macos_fill(page); minyar_macos_maximumSize(page,300,0);
+    minyar_macos_gravity(page,MNCenter);
+    long long label = minyar_macos_label(page,&title); minyar_macos_lines(label,0); minyar_macos_fill(label);
+    long long color = minyar_macos_color(0x111111,0xeeeeee,1);
+    minyar_macos_background(page,color); minyar_macos_border(page,1,color); minyar_macos_cornerRadius(page,4);
+    minyar_macos_font(label,&system,14,500); minyar_macos_textColor(label,color);
+    minyar_macos_lineHeight(label,1.5); minyar_macos_letterSpacing(label,0.5);
+    long long button = minyar_macos_plainButton(page,&title); minyar_macos_symbol(button,&plus,12);
+    minyar_macos_hover(button,color,color); minyar_macos_insets(button,4,8,4,8);
+    long long shape = minyar_macos_shape(page,&mark,100,100); minyar_macos_size(shape,20,20);
+    long long row = minyar_macos_row(page,0); minyar_macos_clickable(row); minyar_macos_label(row,&title);
+    long long notes = minyar_macos_textEditor(root,&empty); minyar_macos_plain(notes); minyar_macos_fill(notes);
+    minyar_macos_autoHeight(notes,40,120); minyar_macos_submitOnEnter(notes); minyar_macos_maxLength(notes,5);
+    long long field = minyar_macos_textField(root,&empty); minyar_macos_placeholder(field,&title);
+    minyar_macos_show(w);
+    NSWindow *window = object(w,NSWindow.class); [window layoutIfNeeded];
+    // Content never pulls the window to its own fitting size, and capped views stay capped.
+    assert(minyar_macos_width(w) == 600);
+    assert(NSWidth([object(page,NSView.class) frame]) == 300);
+    assert(NSHeight([object(notes,NSView.class) frame]) == 40);
+    NSTextView *text = editor(entry(notes).object);
+    [text insertText:@"abcdefgh" replacementRange:NSMakeRange(0,0)];
+    assert(text.string.length == 5);
+    [text.delegate textView:text doCommandBySelector:@selector(insertNewline:)];
+    assert(receive(MNSubmit,notes)); equals(minyar_macos_eventText(),"abcde");
+    minyar_macos_setText(notes,&long_text); equals(minyar_macos_text(notes),"abcdefgh");
+    NSTextField *input = object(field,NSTextField.class); [input sendAction:input.action to:input.target];
+    assert(receive(MNSubmit,field));
+    assert([object(row,NSView.class) accessibilityPerformPress]); assert(receive(MNAction,row));
+    minyar_macos_enabled(row,false); assert(![object(row,NSView.class) accessibilityPerformPress]);
+    minyar_macos_appearance(2); assert(!minyar_macos_isDark());
+    minyar_macos_appearance(1); assert(minyar_macos_isDark());
+    minyar_macos_appearance(0);
+    // Clearing a container ends its descendants' handles but not its own.
+    minyar_macos_clear(page);
+    assert(handles[@(label)] == nil && handles[@(button)] == nil && handles[@(row)] == nil && handles[@(page)] != nil);
+    minyar_macos_remove(page); assert(handles[@(page)] == nil);
+    window = nil; text = nil; input = nil;
+    minyar_macos_destroy(w);
+    assert(handles[@(color)] != nil);
+}
 int main(int argc, char **argv) { @autoreleasepool {
     MinyarText title = literal("Native contract"), unicode = literal("é 🙂 漢字"), empty = literal("");
     if (argc > 1 && !strcmp(argv[1],"uninitialized")) { minyar_macos_window(&title,100,100); return 99; }
@@ -39,6 +92,10 @@ int main(int argc, char **argv) { @autoreleasepool {
         [NSThread sleepForTimeInterval:2]; return 99;
     }
     verifyRelease();
+    if (argc > 1 && !strcmp(argv[1],"hover")) { long long v = minyar_macos_window(&title,100,100); minyar_macos_hover(minyar_macos_label(minyar_macos_column(v,0),&title),0,0); return 99; }
+    if (argc > 1 && !strcmp(argv[1],"shape")) { MinyarText bad = literal("M 1 2 X"); long long v = minyar_macos_window(&title,100,100); minyar_macos_shape(minyar_macos_column(v,0),&bad,10,10); return 99; }
+    if (argc > 1 && !strcmp(argv[1],"color")) { minyar_macos_color(0x1000000,0,1); return 99; }
+    verifyApplicationViews();
     long long w = minyar_macos_window(&title,640,480);
     long long root = minyar_macos_column(w,8); minyar_macos_padding(root,10);
     long long field = minyar_macos_textField(root,&unicode);
@@ -71,6 +128,30 @@ int main(int argc, char **argv) { @autoreleasepool {
     minyar_macos_show(w);
     [object(button,NSButton.class) performClick:nil];
     assert(receive(MNAction,button));
+    // An accessibility action (as from VoiceOver) arrives while nextEvent
+    // waits for input; it must end the wait at once rather than at the timeout.
+    // Needs the test to be trusted for accessibility, as automation tools are.
+    if (AXIsProcessTrusted()) {
+        while (minyar_macos_nextEvent(0) && minyar_macos_eventType() != MNNone) {}
+        NSButton *pressed = object(button,NSButton.class);
+        NSRect frame = [pressed.window convertRectToScreen:[pressed convertRect:pressed.bounds toView:nil]];
+        CGPoint point = CGPointMake(NSMidX(frame), NSHeight(NSScreen.screens.firstObject.frame) - NSMidY(frame));
+        pid_t self = getpid();
+        [NSThread detachNewThreadWithBlock:^{
+            [NSThread sleepForTimeInterval:0.2];
+            AXUIElementRef application = AXUIElementCreateApplication(self), element = NULL;
+            if (AXUIElementCopyElementAtPosition(application, point.x, point.y, &element) == kAXErrorSuccess) {
+                AXUIElementPerformAction(element, kAXPressAction);
+                CFRelease(element);
+            }
+            CFRelease(application);
+        }];
+        double waited = CACurrentMediaTime();
+        assert(minyar_macos_nextEvent(10));
+        assert(minyar_macos_eventType() == MNAction && minyar_macos_eventSource() == button);
+        assert(CACurrentMediaTime() - waited < 3);
+        pressed = nil;
+    }
     [object(check,NSButton.class) performClick:nil];
     assert(receive(MNAction,check)); assert(minyar_macos_checked(check));
     minyar_macos_setChecked(check,false); assert(!minyar_macos_checked(check));
@@ -99,7 +180,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     // Drain AppKit's autoreleased notifications before checking release.
     minyar_macos_destroy(second);
     minyar_macos_quit(); assert(receive(MNQuit,0)); assert(!minyar_macos_nextEvent(0));
-    assert(handles.count == 2); // Only the application-scoped menu and item remain.
+    assert(handles.count == 3); // Only the application-scoped menu, item and color remain.
     puts("native AppKit actions, delegates, Unicode, windows, menus and lifecycle verified");
     return 0;
 } }

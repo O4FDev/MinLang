@@ -26,6 +26,24 @@ compile_and_run() {
     fi
 }
 
+# Like compile_and_run, for programs that use the standard library packages.
+compile_and_run_with_library() {
+    name=$1
+    source=$2
+    expected=$3
+    llvm="$build_dir/$name.ll"
+    executable="$build_dir/$name"
+    "$compiler" "$project_dir/$source" "$llvm" --library "$project_dir/library"
+    "$clang_command" -O1 -Wno-override-module "$llvm" "$project_dir/build/minyar-runtime.o" $math_library -o "$executable"
+    actual=$("$executable")
+    if [ "$actual" != "$expected" ]; then
+        echo "module test '$name' produced unexpected output" >&2
+        echo "expected: $expected" >&2
+        echo "actual:   $actual" >&2
+        exit 1
+    fi
+}
+
 expect_error() {
     name=$1
     source=$2
@@ -49,6 +67,15 @@ Ada"
 compile_and_run diamond tests/modules/diamond/main.min "42"
 compile_and_run explicit-main tests/modules/explicit-main/main.min "42"
 compile_and_run windows-path tests/modules/windows-path/main.min "42"
+compile_and_run character-literals tests/modules/character-literals/main.min "4"
+compile_and_run_with_library json tests/packages/json.min "atacama
+1
+Berlin Wall
+0.25
+true
+café \"quoted\"
+\"line\\nbreak\"
+true"
 
 expect_error private tests/modules/errors/private/main.min "'library.secret' is private to its module"
 expect_error missing-member tests/modules/errors/missing-member/main.min "module 'library' has no function named 'missing'"

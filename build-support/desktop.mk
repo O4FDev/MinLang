@@ -3,6 +3,11 @@
 check-macos: build/minyarc build/minyar-default-runtime.o
 	python3 tests/macos.py
 
+# HTTP requests through NSURLSession against a local server.
+.PHONY: check-http
+check-http: build/minyarc build/minyar-default-runtime.o
+	$${MINYAR_PYTHON:-python3} tests/http-package.py
+
 .PHONY: check-swiftui
 check-swiftui:
 	$${MINYAR_PYTHON:-/usr/bin/python3} tests/swiftui.py
