@@ -124,6 +124,12 @@ static MINYAR_COLD MINYAR_NORETURN void minyar_stop(const char *message);
 static size_t minyar_call_depth;
 static uintptr_t minyar_stack_low, minyar_stack_high;
 static int minyar_stack_bounds_ready;
+/* The frequent guard compares the stack position with one limit and the
+ * depth with one cap; only a call that might fail takes the full check. The
+ * first call finds the bounds: the highest limit sends it there. Without
+ * bounds the limit is zero and the fallback depth applies instead. */
+static uintptr_t minyar_stack_limit = UINTPTR_MAX;
+static size_t minyar_call_depth_cap = MINYAR_MAX_CALL_DEPTH;
 
 /* Keep first-use platform queries out of the frequent guard. This also lets
  * LTO inline the check without importing pthread setup into every caller. */
@@ -161,20 +167,32 @@ static MINYAR_COLD void minyar_find_stack_bounds(void) {
 #endif
 }
 
-/* ASan's use-after-return mode moves address-taken locals to a fake stack.
- * Keep this marker on the native stack so the guard can measure its actual
- * distance from the thread's guard page. */
-MINYAR_NO_ADDRESS_SANITIZE void minyar_stack_enter(void) {
-    unsigned char stack_marker;
-    uintptr_t current = (uintptr_t)&stack_marker;
-    if (!minyar_stack_bounds_ready)
+static MINYAR_COLD void minyar_check_stack(uintptr_t current) {
+    if (!minyar_stack_bounds_ready) {
         minyar_find_stack_bounds();
+        if (minyar_stack_low && minyar_stack_high) {
+            minyar_stack_limit = minyar_stack_low + MINYAR_STACK_RESERVE_BYTES;
+        } else {
+            minyar_stack_limit = 0;
+            minyar_call_depth_cap = MINYAR_FALLBACK_CALL_DEPTH;
+        }
+    }
     if (minyar_call_depth >= MINYAR_MAX_CALL_DEPTH ||
         ((!minyar_stack_low || !minyar_stack_high) &&
          minyar_call_depth >= MINYAR_FALLBACK_CALL_DEPTH) ||
         (current >= minyar_stack_low && current < minyar_stack_high &&
          current - minyar_stack_low <= MINYAR_STACK_RESERVE_BYTES))
         minyar_stop("the program exceeded the maximum call depth.");
+}
+
+/* ASan's use-after-return mode moves address-taken locals to a fake stack.
+ * Keep this marker on the native stack so the guard can measure its actual
+ * distance from the thread's guard page. */
+MINYAR_NO_ADDRESS_SANITIZE void minyar_stack_enter(void) {
+    unsigned char stack_marker;
+    uintptr_t current = (uintptr_t)&stack_marker;
+    if (current <= minyar_stack_limit || minyar_call_depth >= minyar_call_depth_cap)
+        minyar_check_stack(current);
     minyar_call_depth++;
 }
 
