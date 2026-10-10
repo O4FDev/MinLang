@@ -298,6 +298,16 @@ def main():
                 raise ValueError('the http package currently requires macOS and the Apple command-line tools')
             native += [native_object(project, clang, base, 'http.m', [*native_flags, '-fobjc-arc', '-fmodules']),
                        '-framework', 'AppKit', '-framework', 'Security']
+        elif library == 'windows':
+            if not (platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN'))):
+                raise ValueError('the windows package requires Windows and its native UI')
+            native += [native_object(project, clang, base, 'windows.c', native_flags),
+                       '-luser32', '-lgdi32', '-lshell32']
+        elif library == 'wincert':
+            if not (platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN'))):
+                raise ValueError('the wincert package requires Windows and its certificate store')
+            native += [native_object(project, clang, base, 'wincert.c', native_flags),
+                       '-lcrypt32', '-lbcrypt', '-lncrypt']
         elif library in ('machine', 'machine_arm64'):
             pass  # Compiler intrinsics: the code is already inline in the program.
         elif library == 'net':
