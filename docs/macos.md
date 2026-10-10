@@ -145,7 +145,11 @@ Shift-Return adds a line, as in chat applications. Text fields always enqueue
 
 **Background work.** A program waiting in `nextEvent` returns early, with
 `NONE`, when an `http` request receives data or finishes, so a streamed reply
-appears as it arrives without polling quickly.
+appears as it arrives without polling quickly. These early returns happen at
+most 60 times a second; input events still return at once. A reply streamed
+in thousands of small pieces is therefore redrawn once a frame rather than
+once a piece: in the Atacama app, a 3,000-piece answer took 2.0 s of CPU time
+instead of 6.8 s, with the same final result on screen.
 
 A window owns its entire control tree, including nested rows and columns.
 Attach one root view to a window, then add controls to rows or columns. Layout

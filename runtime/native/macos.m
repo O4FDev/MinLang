@@ -12,6 +12,9 @@ enum { MNStart = 1, MNCenter = 2, MNEnd = 3 };
 /* Other native packages (such as http) post an application-defined event with
  * this subtype when background work progresses, ending a nextEvent wait early. */
 enum { MNWakeSubtype = 0x4D59 };
+/* Background wake-ups end a nextEvent wait at most this often (60 Hz). */
+static const NSTimeInterval MNWakeInterval = 1.0 / 60;
+static NSTimeInterval lastWake;
 
 @interface MNHandle : NSObject
 @property(nonatomic, strong) id object;
@@ -221,6 +224,7 @@ static void clearList(id list);
 static NSMutableArray *pendingLists;
 static void reloadLists(void);
 static void enableList(id list, BOOL value);
+static void insetList(id list, NSEdgeInsets insets);
 /* Content hugging, including a stack's own hugging of its arranged views. */
 static void hug(NSView *v, NSLayoutPriority priority, NSLayoutConstraintOrientation orientation) {
     if ([v contentHuggingPriorityForOrientation:orientation] > priority) [v setContentHuggingPriority:priority forOrientation:orientation];
@@ -857,18 +861,29 @@ bool minyar_macos_nextEvent(double timeout) { @autoreleasepool {
     current = nil;
     reloadLists();
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    BOOL woken = NO;
     // Always pump at least one native event, even while Minyar events are pending.
     // This keeps menus, window drawing and text input responsive under load.
     do {
         waiting = !events.count && !quitting;
         NSEvent *e = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:(events.count || quitting ? NSDate.distantPast : deadline) inMode:NSDefaultRunLoopMode dequeue:YES];
         waiting = NO;
-        // Background work finished: return now so the program can look at it.
-        if (e.type == NSEventTypeApplicationDefined && e.subtype == MNWakeSubtype) break;
+        // Background work progressed: return so the program can look at it, but
+        // at most once a display frame. A stream that arrives in many small
+        // chunks is then drawn at the display rate, not once per chunk; input
+        // events are still delivered at once.
+        if (e.type == NSEventTypeApplicationDefined && e.subtype == MNWakeSubtype) {
+            NSTimeInterval now = NSProcessInfo.processInfo.systemUptime, frame = lastWake + MNWakeInterval;
+            if (now >= frame) { lastWake = now; break; }
+            if (deadline.timeIntervalSinceNow > frame - now) deadline = [NSDate dateWithTimeIntervalSinceNow:frame - now];
+            woken = YES;
+            continue;
+        }
         if (e) [NSApp sendEvent:e];
         [NSApp updateWindows];
         if (!e) break;
     } while (!events.count && !quitting && deadline.timeIntervalSinceNow > 0);
+    if (woken) lastWake = NSProcessInfo.processInfo.systemUptime;
     if (events.count) { current = events.firstObject; [events removeObjectAtIndex:0]; return true; }
     return !quitting;
 } }
@@ -965,7 +980,8 @@ void minyar_macos_insets(long long handle, long long top, long long left, long l
     NSEdgeInsets insets = NSEdgeInsetsMake(top, left, bottom, right);
     if (container(v)) { container(v).edgeInsets = insets; refill(container(v)); return; }
     if ([v isKindOfClass:MNButton.class]) { [v setInsets:insets]; [v invalidateIntrinsicContentSize]; return; }
-    minyar_native_stop("macos.insets requires a row, column, scroll view, or button.");
+    if ([v isKindOfClass:NSClassFromString(@"MNList")]) { insetList(v, insets); return; }
+    minyar_native_stop("macos.insets requires a row, column, scroll view, list, or button.");
 } }
 void minyar_macos_align(long long handle, long long alignment) { @autoreleasepool {
     NSStackView *s = container(entry(handle).object);
@@ -1035,6 +1051,7 @@ void minyar_macos_remove(long long handle) { @autoreleasepool {
 @property(nonatomic, strong) NSTextField *top, *middle, *bottom;
 @property(nonatomic, strong) NSButton *button;
 @property(nonatomic, strong) NSStackView *text;
+@property(nonatomic, strong) NSLayoutConstraint *leadingEdge, *topEdge, *bottomEdge, *trailingEdge;
 @end
 @implementation MNListCell
 @end
@@ -1110,18 +1127,19 @@ static void styleListLabel(NSTextField *label, MNListStyle *style, NSString *tex
         cell.button = [NSButton buttonWithTitle:@"" target:self action:@selector(rowButton:)];
         cell.button.bordered = NO; cell.button.translatesAutoresizingMaskIntoConstraints = NO;
         [cell addSubview:cell.button];
-        NSEdgeInsets e = self.insets;
-        [NSLayoutConstraint activateConstraints:@[
-            [cell.text.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor constant:e.left],
-            [cell.text.topAnchor constraintEqualToAnchor:cell.topAnchor constant:e.top],
-            [cell.text.bottomAnchor constraintEqualToAnchor:cell.bottomAnchor constant:-e.bottom],
+        cell.leadingEdge = [cell.text.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor];
+        cell.topEdge = [cell.text.topAnchor constraintEqualToAnchor:cell.topAnchor];
+        cell.bottomEdge = [cell.text.bottomAnchor constraintEqualToAnchor:cell.bottomAnchor];
+        cell.trailingEdge = [cell.button.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor];
+        [NSLayoutConstraint activateConstraints:@[cell.leadingEdge, cell.topEdge, cell.bottomEdge, cell.trailingEdge,
             [cell.button.leadingAnchor constraintEqualToAnchor:cell.text.trailingAnchor constant:15],
-            [cell.button.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor constant:-e.right],
             [cell.button.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor],
             [cell.button.widthAnchor constraintEqualToConstant:34], [cell.button.heightAnchor constraintEqualToConstant:34]]];
         for (NSTextField *label in @[cell.top, cell.middle, cell.bottom])
             [label.widthAnchor constraintEqualToAnchor:cell.text.widthAnchor].active = YES;
     }
+    NSEdgeInsets e = self.insets;
+    cell.leadingEdge.constant = e.left; cell.topEdge.constant = e.top; cell.bottomEdge.constant = -e.bottom; cell.trailingEdge.constant = -e.right;
     MNListRow *r = self.rows[(NSUInteger)row];
     styleListLabel(cell.top, self.styles[0], r.top);
     styleListLabel(cell.middle, self.styles[1], r.middle);
@@ -1229,6 +1247,9 @@ void minyar_macos_rowButton(long long handle, const MinyarText *symbol, const Mi
 } }
 static void clearList(id value) {
     MNList *l = value; [l.rows removeAllObjects]; l.clickedRow = -1; [l scheduleReload];
+}
+static void insetList(id value, NSEdgeInsets insets) {
+    MNList *l = value; l.insets = insets; [l scheduleReload];
 }
 static void enableList(id value, BOOL enabled) {
     MNList *l = value; if (l.table.isEnabled == enabled) return;
