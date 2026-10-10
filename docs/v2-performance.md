@@ -16,6 +16,7 @@ heavily loaded machine; the load average was 30-76 throughout.
 | 4 | `record.field[i] = v` retained, registered and released the field on every store | no borrow when the rest of the statement makes no call | Minyarcraft 25.6G | 17.3G | -32% |
 | 5 | `record.text = record.text + piece` copied the whole Text each time (quadratic) | in-place append when the record holds the only other reference | 80,000 appends 4.11G | 79.8M | 51x (and linear) |
 | 6 | Compiling multi-module programs spent 27% of its time comparing symbol names character by character | symbol tables ordered by length, then from the last character | OS kernel compile 485M; Minyarcraft 109M; Atacama 80.5M | 342M; 71.4M; 58.1M | -28% to -35% |
+| 7 | `json.parse` built every string from a parts list, a slice and a join | one slice when a string has no escapes | 20 parses of a 143 KB history response 1.22G | 0.95G | -22% |
 
 ### 1. Long lists rebuilt as stacks of views
 
@@ -227,7 +228,31 @@ is byte-identical for all five programs.
 the duplicate-declaration diagnostics), `check-diagnostics` and
 `check-regressions` pass.
 
-### 7. Two competing `http` packages
+### 7. JSON strings were assembled from parts
+
+**Problem.** The `json` package (used by Atacama for history and streaming,
+and by Minyar-OS) parsed about 420 instructions per byte. While measuring the
+Astra port on a real payload (Atacama's 500-run history response, 143 KB) I
+profiled it with `xctrace`: allocation, free and deferred-cleanup work
+dominated, much of it from `parseString`, which allocated a parts list, a
+slice and a joined copy for every string, even strings with no escapes.
+
+**Fix.** Scan for the closing quote first; if no backslash comes before it,
+return one slice of the source. Strings with escapes take the existing path.
+
+| 20 parses of the history response | Before | After |
+| --- | ---: | ---: |
+| Retired instructions (3 runs) | 1.216G, 1.223G, 1.213G | 0.954G, 0.955G, 0.940G |
+
+Most of what remains is the incremental release of the previous round's
+trees, which the benchmark throws away each time.
+
+**Test.** `tests/packages/json.min` now covers a plain string, an empty
+string, a tab escape, an escaped backslash at the end, and two unterminated
+strings. A separate program covering quote, `\u00e9` and surrogate-pair
+escapes printed the same output as the v2 base. Atacama's `make test` passes.
+
+### 8. Two competing `http` packages
 
 Not a speed fix, but one of the limits the brief named. appkit's NSURLSession
 `http` and minyar-os's portable socket/TLS `http` both arrived in v2 under the
