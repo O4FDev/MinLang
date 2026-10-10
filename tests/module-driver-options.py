@@ -54,8 +54,17 @@ Path(sys.argv[start + 3]).write_text('0 0 0 0 0 0 false\\n')
             self.assertEqual(args[args.index('--library') + 1], str(self.library))
             self.assertEqual(args[args.index('--bounded-owners') + 1], '32')
 
+    def test_library_directories_keep_their_order(self):
+        first, second = self.work / 'first', self.work / 'second'
+        first.mkdir(exist_ok=True)
+        second.mkdir(exist_ok=True)
+        result, args = self.invoke(['--library', str(first), '--bounded-owners', '32', '--library', str(second)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        libraries = [args[i + 1] for i, value in enumerate(args) if value == '--library']
+        self.assertEqual(libraries, [str(first), str(second)])
+
     def test_duplicate_or_missing_options_do_not_run_compiler(self):
-        for options in (['--library'], ['--library', str(self.library)] * 2,
+        for options in (['--library'], ['--library', str(self.library)] * 9,
                         ['--bounded-owners', '32'] * 2, ['--unknown', 'value']):
             result, args = self.invoke(options)
             self.assertEqual(result.returncode, 2, result.stderr)
