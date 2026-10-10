@@ -362,6 +362,42 @@ Variant builds (runtime copies with selected hooks stubbed) attribute the rest:
   candidate-buffer collector (Bacon and Rajan) would avoid the registry but
   is a different algorithm.
 
+### Separate entry points for traced types
+
+`31cb952` and `6219948` make every path an untraced object can reach compile
+to v2's code. The compiler calls `*_traced` entry points (`minyar_rc_local_traced`,
+`minyar_rc_borrow_traced`, `minyar_rc_retain_traced`, `minyar_list_add_traced`,
+`minyar_list_set_traced`, `minyar_list_appended_traced`,
+`minyar_record_set_take_traced`, `minyar_record_replace_traced`, ...) only when
+the value, element or field type may be `RC_TRACED` (`typeMayCycle`). The v2
+entry points are restored verbatim, so they inline as before. In the bounded
+runtime, `rc_drop` dispatches traced objects to `rc_drop_traced` after its
+immortality test, and dead traced objects get their own field visit and
+finish. The four-queue scheduler (`rc_bounded_poll_body(budget, 1)`) runs only
+after the first traced allocation; until then, `rc_bounded_poll_work` is v2's
+three-queue scheduler.
+
+Variant builds of the system-runtime compiler showed where the remaining 6%
+came from: with v2's `minyar_bounded_rc.h` it ran at 359 M. A per-unit
+`!rc_cycle_pending` test and the four-way rotation cost about 10 M; the
+`rc_drop` kind test costs about 5 M (three instructions per drop). The
+scheduler is now gated per poll, and only the per-drop test remains.
+
+Medians of seven runs (system compiler) or five (others), same session:
+
+| Workload | v2 | Port | Previous (`3aa1fa5`) | Now | Now vs v2 | Peak RSS v2 / now |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Compiler using system runtime | 363.4 M | 397.9 M | 384.6 M | 365.1 M | +0.5% | 11.7 / 11.8 MiB |
+| 100,000 `List<Point>.add` | 46.5 M | 57.3 M | 48.9 M | 46.8 M | +0.7% | 7.30 / 7.30 MiB |
+| `acyclic.min` (20 x 5,000 chain) | 193.1 M | 227.1 M | 221.6 M | 228.4 M | +18.3% | 1.88 / 2.16 MiB |
+| 100,000-record chain | 168.1 M | 203.0 M | 184.0 M | 191.1 M | +13.7% | 12.1 / 18.2 MiB |
+
+Programs without self-referential types are now within 1% of v2. The
+self-referential chains got slower than in `3aa1fa5` because their
+operations now call out-of-line traced entry points. Inlining those entry
+points is the next lever for them. Marking the traced paths `cold` cost
+another 9 M on `acyclic.min` and was replaced with plain `noinline`/`inline`.
+
 ### Validation status
 
 Final command outcomes are recorded in [validation.md](validation.md). The
