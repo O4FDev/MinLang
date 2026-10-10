@@ -26,6 +26,8 @@ largest are 1 (10x), 5 (51x on long Texts), 2 (4x), 8 (2x builds) and 4 (-32%).
 | 12 | Lists of a self-referential record (such as `json.Value`) could only grow by copying: `items = items.appended(v)` was quadratic | `x = x.appended(e)` moves x's owner into the append, and a List with no other owner grows in place | 500-run history, 20 parses: 1.115G; 5,000 runs, 2 parses: 3.06G | 0.836G; 0.756G | -25%; 4.0x (linear) |
 | 13 | Minyarcraft frames: each of the 276 chunk draws a frame (plus water) looked up and re-sent seven uniforms, and each water draw toggled blending, so the GL driver kept revalidating its state | uniform locations cached at link time; uniforms, program, texture, opacity and blending changed only when they differ | 15.7M instructions per idle frame | 8.05M | -49% per frame |
 | 14 | The call-depth guard in every non-leaf function was about 20 instructions, and meshing inlines dozens of small guarded functions per block | the guard's common path is two comparisons; the exact checks moved to a cold path | world build 15.65G; one block edit 28.7M | 14.19G; 25.8M | -9.3%; -10% |
+| 15 | Small functions that only call unchecked functions still paid the call-depth check (Minyarcraft's meshing helpers) | two levels of such functions above the leaves drop their check | `--benchmark build` 13.66G; `edit` 33.35G | 9.86G; 25.40G | -28%; -24% |
+| 16 | Release builds used full LTO | ThinLTO for `--release` and for the compiler | Minyarcraft 15.73-15.81G; JSON 0.834G; self-compile 71.95M | 14.90-14.94G; 0.806G; 70.55M | -5.5%; -3%; -2% |
 
 ### 1. Long lists rebuilt as stacks of views
 
@@ -663,6 +665,77 @@ so the change touches both compilers and the patch. The height table also has
 to be private to each `compileFunctions` call, so that an incrementally cached
 module never depends on another module's bodies.
 
+### 15. Call trees that cannot recurse kept their checks
+
+**Problem.** Change 3 removed the call-depth check from leaves. After change
+14 the check is two comparisons, but Minyarcraft's meshing still calls dozens
+of small functions per block (`showFace`, `occludes`, `quad`) that only call
+leaves. The Minyarcraft subagent removed every check from the emitted IR as an
+upper bound (unsafe, measurement only), and the world build fell by a third.
+Its simulation of the rule below gave -24%.
+
+**Fix.** A function whose every call goes to a function without a check cannot
+recurse: each of those calls returns without calling back. So after all
+functions are compiled, `dropTreeGuards` also removes the check from two
+levels of small functions above the leaves. A function qualifies when:
+- it is within the leaf limits on locals, temporaries and labels, is not
+  `main`, parallel or a machine intrinsic, and has no stack ownership frame;
+- it makes at most 16 user calls (the bound keeps the analysis cheap);
+- every callee is a leaf, or (for the second level) a first-level function.
+The callees are read back from the emitted calls. A function whose recognised
+calls number fewer than the parser counted keeps its check, so an unexpected
+call form can only cost speed. Recursion, direct or mutual, never qualifies.
+At most three frames of about 18 KiB run below the caller's check, inside the
+128 KiB reserve it left (`MINYAR_STACK_RESERVE_BYTES`).
+
+| Workload (3 runs each) | Before | After |
+| --- | ---: | ---: |
+| Minyarcraft `--benchmark build` | 13.68G, 13.65G, 13.66G | 9.86G, 9.86G, 9.87G |
+| Minyarcraft `--benchmark edit` | 33.34G, 33.35G, 33.36G | 25.40G, 25.40G, 25.40G |
+| Compiler self-compile (5 runs) | 70.14-70.78M | 71.22-71.37M |
+
+The saved `edit` frames are byte-identical. Minyarcraft keeps 31 checked
+functions, down from 67. The compiler keeps 54, down from 109 before
+tonight. The analysis costs the self-compile about 1% net. A first version that
+looked up every call in every candidate cost 5%; the 16-call bound removed
+most of that. Another version dropped the checks of functions marked as never
+qualifying. The guard count fell further than it should have, which is how I
+noticed. The test below now covers it.
+
+**Tests.** `tests/stack-overflow.py` now requires:
+- no check in a function that calls only an imported leaf, or in one that
+  calls it and a local leaf;
+- a check in a third level, in two mutually recursive functions, and in a
+  small function whose callee is large;
+- the clean stop at the deepest recursion, with the leaf still running there.
+
+The fixed point holds. `check-stack-overflow`, `check-stack-overflow-sanitize`,
+`check-stack-limits`, `check-regressions`, `check-modules`, `check-codegen`
+and `check-budget` (71.7M) pass.
+
+### 16. Release builds used full LTO
+
+**Problem and evidence.** `--release` linked the program and the runtime with
+`-flto`. While trying a ThinLTO cache to speed up release links, the binaries
+built with `-flto=thin` turned out to run faster, consistently.
+
+| Workload (3 runs each) | Full LTO | ThinLTO |
+| --- | ---: | ---: |
+| Minyarcraft `--screenshot noon` | 15.81G, 15.73G | 14.92G, 14.90G, 14.94G |
+| `history-parse`, 500 runs, 20 parses | 0.835G, 0.834G, 0.834G | 0.807G, 0.832G, 0.806G |
+| Compiler self-compile (5 runs) | 71.95-72.79M | 70.55-71.99M |
+
+The link takes as long (about 1 s for Minyarcraft) and the binary is 10%
+larger (180,504 to 198,200 bytes). The cache made an unchanged relink 0.3 s, but
+after a change to the program it took as long as before, so it was not kept.
+
+**Fix.** `tools/clang-driver.py` links release programs with `-flto=thin`, and
+the Makefile builds the compiler with it (`COMPILER_LTO_FLAGS`). CI on Linux
+sets its own LTO flags and is unaffected.
+
+**Tests.** `tests/release-build.py` and `tests/launcher-isolation.py` accept
+any `-flto` form. Both pass, as does `check-budget`.
+
 ## Gates
 
 `make check-budget` (the compiler's self-compile budget) was already failing
@@ -674,9 +747,9 @@ before tonight. It passes after change 11:
 | after change 3 | 80.7M | 10.8 MiB |
 | after change 11 | 72.7M | 9.2 MiB |
 
-## A bug introduced and fixed tonight
+## Bugs introduced or found, and fixed, tonight
 
-The clean-up after review moved leaf detection onto a new parser-state slot,
+**Ownership slot collision.** The clean-up after review moved leaf detection onto a new parser-state slot,
 index 14. That slot was already the base of the ownership-slot map
 (`ownershipSlot` stores entries from index 14). When a body's call count
 happened to equal its generation number, a binding got ownership slot -1, an
@@ -685,6 +758,28 @@ the time; ASan showed a heap-buffer-overflow in `minyar_rc_local_take`. The
 map now starts at index 15. `tests/regressions.py` has a deterministic case,
 which fails on the broken build and passes now. The broken commit had been
 merged into v2 but not pushed; the suite run on it was stopped.
+
+**Call-depth fallback cap.** A review of change 11 found that my first guard
+ignored `MINYAR_MAX_CALL_DEPTH` when the fallback depth was larger, which
+`tests/stack-limits.py` checks. Fixed; the guard kept is change 14's.
+
+**Growing a value in place that someone else still holds.** A review of
+change 12 found two ways that `x = x + e` (Text, since 6 October) and
+`x = x.appended(e)` (change 12) could change a value that someone else still
+held:
+- On a parameter before its first assignment, the local owns nothing, so the
+  caller's only count passed the uniqueness test. The callee grew and then
+  freed the caller's value: the caller's Text printed empty, with a
+  use-after-free under ASan.
+- When x was read again later in the statement (`t = t + "!" + t`), the later
+  read saw the change: `abcd!abcd!` instead of `abcd!abcd`.
+
+The move now gives the consumer a new count when the local owns nothing
+(`minyar_rc_local_move_owner`). The transfer is skipped when the name is read
+again in the statement (member names and field labels don't count).
+`tests/regressions.py`
+`test_consuming_self_assignment_respects_parameters_and_later_reads` fails on
+v2 and passes now.
 
 ## Tried and reverted
 
