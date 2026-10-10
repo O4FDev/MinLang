@@ -46,7 +46,7 @@ public record Connection {
     congestion: recovery.State; flight: Integer; receivedBytes: Integer; sentBytes: Integer
     addressValidated: Boolean; confirmed: Boolean; lastActivity: Integer; now: Integer
     earlyWrite: protection.Keys; earlyRead: protection.Keys; earlyRejected: Boolean; earlyStreams: List<Integer>; earlyData: Integer; earlyPackets: Integer
-    closing: Boolean
+    closing: Boolean; draining: Boolean; closeUntil: Integer; closeResponseAt: Integer; closeInterval: Integer; closeAttempts: Integer; closeFrame: Bytes; closeLevel: Integer
     paceCredit: Float; paceAt: Integer; paceNext: Integer
     ackExponent: Integer; idleTimeout: Integer; failedAuthentication: Integer
     activePath: Integer; incomingPath: Integer; paths: List<Path>; outgoingPaths: List<Integer>; peerDisabledMigration: Boolean
@@ -98,7 +98,7 @@ function create(entropy: Bytes, original: Bytes, client: Boolean): Connection {
         congestion: recovery.create(1200); flight: 0; receivedBytes: 0; sentBytes: 0
         addressValidated: client; confirmed: false; lastActivity: -1; now: -1
         earlyWrite: protection.traffic(1, 0, Bytes()); earlyRead: protection.traffic(1, 0, Bytes()); earlyRejected: false; earlyStreams: []; earlyData: 0; earlyPackets: 0
-        closing: false
+        closing: false; draining: false; closeUntil: -1; closeResponseAt: -1; closeInterval: 0; closeAttempts: 0; closeFrame: Bytes(); closeLevel: 0
         paceCredit: 12000.0; paceAt: -1; paceNext: -1
         ackExponent: 3; idleTimeout: 45000; failedAuthentication: 0
         activePath: 0; incomingPath: 0; paths: [Path { id: 0; validated: client; eligible: true; challenge: Bytes(); deadline: -1; attempts: 0; received: 0; sent: 0 }]; outgoingPaths: []; peerDisabledMigration: false
@@ -160,7 +160,21 @@ function terminate(connection: Connection, code: Integer, message: Text) {
     let close = Bytes(); add(close, 28); add(close, max(0, code)); add(close, 0)
     let reason = Bytes(message); if reason.length > 256 { reason.resize(256) }
     add(close, reason.length); close.addBytes(reason)
-    connection.pending.add(Pending { level: level; payload: close; probe: false; path: -1 }); connection.closing = true
+    beginClosing(connection,level,close)
+}
+function beginClosing(connection: Connection, level: Integer, frame: Bytes) {
+    connection.closing = true; connection.draining = false; connection.closeUntil = -1; connection.closeResponseAt = -1
+    connection.closeInterval = recovery.pto(connection.congestion,connection.confirmed); connection.closeAttempts = 0; connection.closeFrame = frame; connection.closeLevel = level
+    connection.pending = [Pending { level: level; payload: frame; probe: false; path: -1 }]; connection.flight = 0
+    for space in connection.spaces { space.sent = []; space.ack = false }
+    for path in connection.paths { path.challenge = Bytes(); path.deadline = -1 }
+}
+function beginDraining(connection: Connection, code: Integer) {
+    connection.state = CLOSED; connection.code = code; connection.closing = false; connection.draining = true
+    connection.closeUntil = max(connection.closeUntil,connection.now + 3 * recovery.pto(connection.congestion,connection.confirmed))
+    connection.pending = []; connection.flight = 0; connection.streams = []; connection.closeFrame = Bytes()
+    for space in connection.spaces { space.sent = []; space.ack = false }
+    for path in connection.paths { path.challenge = Bytes(); path.deadline = -1 }
 }
 function enqueue(connection: Connection, level: Integer, payload: Bytes, probe: Boolean) {
     enqueuePath(connection, level, payload, probe, -1)
@@ -502,8 +516,7 @@ function processFrame(connection: Connection, level: Integer, frame: wire.Frame)
             }
         }
     } else if frame.type == 28 || frame.type == 29 {
-        connection.state = CLOSED; connection.code = frame.value; connection.pending = []; connection.flight = 0
-        for pending in connection.spaces { pending.sent = []; pending.ack = false }
+        beginDraining(connection,frame.value)
     } else if frame.type == 30 { connection.confirmed = true; discard(connection, 1) }
     else if frame.type == 24 {
         let id = frame.data.slice(0, frame.data.length - 16); let token = frame.data.slice(frame.data.length - 16, frame.data.length)
@@ -533,14 +546,14 @@ function processFrame(connection: Connection, level: Integer, frame: wire.Frame)
 }
 public function receive(connection: Connection, datagram: Bytes, now: Integer) { receivePath(connection, datagram, connection.activePath, now) }
 public function receivePath(connection: Connection, datagram: Bytes, pathId: Integer, now: Integer) {
-    if connection.state == FAILED || connection.state == CLOSED || now < 0 || now < connection.now || datagram.length > 65535 || pathId < 0 { return }
+    if connection.draining || ((connection.state == FAILED || connection.state == CLOSED) && !connection.closing) || now < 0 || now < connection.now || datagram.length > 65535 || pathId < 0 { return }
     if connection.now < 0 { connection.lastActivity = now }
     connection.now = now
     connection.incomingPath = pathId
     let at = 0
     let countedPath = false
     connection.receivedBytes += datagram.length
-    while at < datagram.length && connection.state != FAILED && connection.state != CLOSED {
+    while at < datagram.length && ((connection.state != FAILED && connection.state != CLOSED) || connection.closing) {
         let header = wire.header(datagram, at, connection.local.length)
         if !header.valid { return }
         if header.kind == wire.VERSION_NEGOTIATION || header.kind == wire.RETRY { return }
@@ -553,7 +566,7 @@ public function receivePath(connection: Connection, datagram: Bytes, pathId: Int
         let space = connection.spaces[level]
         let early = header.kind == wire.ZERO_RTT
         if early && (connection.clientRole || !connection.serverTLS.earlyAccepted || connection.earlyRead.key.length == 0) { at = header.end; continue }
-        if !space.active || (!early && (space.read.key.length == 0 || (level == 2 && connection.state != ESTABLISHED))) { at = header.end; continue }
+        if !space.active || (!early && (space.read.key.length == 0 || (level == 2 && connection.state != ESTABLISHED && !connection.closing))) { at = header.end; continue }
         let input = datagram.slice(at, header.end); let selected = space.read; let generation = space.readGeneration
         if early { selected = connection.earlyRead }
         if level == 2 && !early {
@@ -573,6 +586,17 @@ public function receivePath(connection: Connection, datagram: Bytes, pathId: Int
             if connection.failedAuthentication >= limit { terminate(connection, 15, "QUIC AEAD integrity usage limit reached"); return }
             if errors.message(packet.error) == "nonzero authenticated reserved bits" { terminate(connection, 10, "nonzero authenticated reserved bits") }
             continue
+        }
+        if connection.closing {
+            let frames = wire.frames(packet.payload)
+            if !frames.valid { return }
+            for frame in frames.frames { if frame.type == 28 || frame.type == 29 { beginDraining(connection,frame.value); return } }
+            let pathAt = pathIndex(connection,pathId)
+            if pathAt >= 0 && pathId == connection.activePath && now >= connection.closeResponseAt && connection.pending.length == 0 {
+                connection.paths[pathAt].received += datagram.length
+                connection.pending.add(Pending { level: connection.closeLevel; payload: connection.closeFrame; probe: false; path: pathId })
+            }
+            return
         }
         if level == 2 && !early {
             if ((packet.header[0] >> 2) & 1) != (generation & 1) || (generation < space.readGeneration && packet.number >= space.readFirst) ||
@@ -648,9 +672,17 @@ function packetHeader(connection: Connection, level: Integer, length: Integer, n
 public function poll(connection: Connection, now: Integer): List<Bytes> {
     let outgoing: List<Bytes> = []
     connection.outgoingPaths = []
-    if ((connection.state == FAILED || connection.state == CLOSED) && !connection.closing) || now < 0 || now < connection.now { return outgoing }
+    if ((connection.state == FAILED || connection.state == CLOSED) && !connection.closing && !connection.draining) || now < 0 || now < connection.now { return outgoing }
     if connection.now < 0 { connection.lastActivity = now }
     connection.now = now
+    if connection.closing && connection.closeUntil < 0 { connection.closeUntil = now + 3 * connection.closeInterval }
+    if connection.closing || connection.draining {
+        if now >= connection.closeUntil {
+            connection.closing = false; connection.draining = false; connection.pending = []; connection.closeFrame = Bytes()
+            if connection.state != FAILED { connection.state = CLOSED }; return outgoing
+        }
+        if connection.draining { return outgoing }
+    }
     if connection.state == ESTABLISHED { reclaimStreams(connection) }
     for path in connection.paths {
         if path.challenge.length == 8 && path.deadline >= 0 && now >= path.deadline {
@@ -741,6 +773,10 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
         let encrypted = protection.protect(keys, header, header.length - 4, space.next, payload)
         if !errors.bytesOk(encrypted) { terminate(connection, 1, errors.message(errors.bytesError(encrypted))); return [] }
         outgoing.add(errors.bytesValue(encrypted)); connection.outgoingPaths.add(route); connection.sentBytes += size; path.sent += size
+        if connection.closing {
+            connection.closeResponseAt = now + max(1,connection.closeInterval / 16) * (1 << min(12,connection.closeAttempts))
+            connection.closeAttempts += 1
+        }
         if ackEliciting {
             connection.paceCredit = max(0.0,connection.paceCredit - Float(size))
             if space.sent.length >= 4096 { terminate(connection, 1, "QUIC outstanding packet limit exceeded"); return [] }
@@ -753,7 +789,6 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
         if connection.clientRole && level == 1 { discard(connection, 0) }
     }
     connection.pending = unsent
-    if connection.closing && unsent.length == 0 { connection.closing = false; if connection.state != FAILED { connection.state = CLOSED } }
     return outgoing
 }
 function advanceWrite(connection: Connection, space: Space) {
@@ -775,6 +810,7 @@ public function ping(connection: Connection): errors.BooleanResult {
     return errors.boolean(connection.state == ESTABLISHED)
 }
 public function nextTimer(connection: Connection): Integer {
+    if connection.closing || connection.draining { if connection.closeUntil < 0 { return max(0,connection.now) }; return connection.closeUntil }
     if connection.state == FAILED || connection.state == CLOSED { return -1 }
     if connection.now < 0 { return 0 }
     let deadline = connection.lastActivity + connection.idleTimeout
@@ -922,12 +958,12 @@ public function close(connection: Connection, code: Integer, reason: Bytes): err
     if connection.state != ESTABLISHED { terminate(connection, code, Text(reason)); return errors.boolean(true) }
     connection.pending = []
     let frame = Bytes(); add(frame, 29); add(frame, code); add(frame, reason.length); frame.addBytes(reason)
-    enqueue(connection, 2, frame, false); connection.closing = true
+    connection.state = CLOSED; beginClosing(connection,2,frame)
     return errors.boolean(true)
 }
 // Release buffers and secrets after the caller finishes closing packets.
 public function release(connection: Connection): Boolean {
-    if (connection.state != CLOSED && connection.state != FAILED) || connection.closing { return false }
+    if (connection.state != CLOSED && connection.state != FAILED) || connection.closing || connection.draining { return false }
     connection.clientTLS = tls.none(); connection.serverTLS = tlsserver.none()
     connection.spaces = []; connection.pending = []; connection.streams = []; connection.remoteIds = []
     connection.closedStreams = []
