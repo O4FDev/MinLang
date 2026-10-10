@@ -1,7 +1,12 @@
 /* Single-threaded snapshot cycle collector. See research/cycles/README.md.
- * RC remains authoritative: incoming counts describe aggregate slots only;
- * count - incoming includes locals, temporaries, C owners and retired frames.
- * Metadata precedes the ordinary eight-byte header of Lists/mixed records.
+ * RC remains authoritative: incoming counts describe traced aggregate slots
+ * only; count - incoming includes locals, temporaries, C owners, retired
+ * frames and slots of untraced aggregates.
+ * Only RC_TRACED objects carry metadata, before their eight-byte header. The
+ * compiler allocates them for List and record types that can reach
+ * themselves; every other object keeps the untraced layout and no barrier
+ * touches it. An untraced aggregate cannot lie on a cycle, so treating its
+ * slots as external owners is complete as well as safe.
  * No tracing queue, barrier, or registry operation allocates or scans. */
 /* The gray queue is singly linked: only its head is ever removed. A gray
  * object cannot be unregistered, because a zero count during roots/mark pins
@@ -10,7 +15,8 @@
  * eight-byte slots that fit in the address space; 58 bits cover 2^61 bytes. */
 typedef struct RcCycle {
     struct RcCycle *previous, *next, *gray_next;
-    size_t generation : 1, marked : 2, registered : 1, pinned : 1, cleared : 1, incoming : 58;
+    size_t generation : 1, marked : 2, registered : 1, pinned : 1, cleared : 1, record : 1,
+        incoming : 57;
 } RcCycle;
 _Static_assert(sizeof(RcCycle) == 32, "cycle metadata must stay four words");
 enum { RC_CYCLE_IDLE, RC_CYCLE_ROOTS, RC_CYCLE_MARK, RC_CYCLE_SWEEP };
@@ -44,23 +50,25 @@ static void rc_cycle_unit(void);
 #ifndef MINYAR_BOUNDED_RC
 static void rc_cycle_eager_service(size_t budget);
 #endif
-static inline int rc_cycle_storage(unsigned kind) {
-    return kind == RC_LIST || kind == RC_REFERENCES ||
-           kind == RC_REFERENCES_IMMORTAL || kind == RC_RECORD;
-}
-static RcCycle *rc_cycle_metadata(RcObject *object) {
+static inline RcCycle *rc_cycle_metadata(RcObject *object) {
     return (RcCycle *)object - 1;
+}
+/* The layout kind of any object: a traced List behaves as RC_REFERENCES and a
+ * traced record as RC_RECORD. Dead bounded objects keep their low kind bits. */
+static inline unsigned rc_kind(RcObject *object) {
+    unsigned kind = object->ownership & 7;
+    if (kind != RC_TRACED) return kind;
+    return rc_cycle_metadata(object)->record ? RC_RECORD : RC_REFERENCES;
+}
+static inline int rc_traced(RcObject *object) {
+    return (object->ownership & 7) == RC_TRACED;
 }
 static RcObject *rc_cycle_object(RcCycle *cycle) {
     return (RcObject *)(cycle + 1);
 }
 static inline RcCycle *rc_cycle_value(void *value) {
-    if (!value) return NULL;
-    RcObject *object = (RcObject *)value - 1;
-    unsigned kind = object->ownership & 7;
-    if (kind != RC_RECORD && kind != RC_REFERENCES && kind != RC_REFERENCES_IMMORTAL)
-        return NULL;
-    return rc_cycle_metadata(object);
+    if (!value || !rc_traced((RcObject *)value - 1)) return NULL;
+    return rc_cycle_metadata((RcObject *)value - 1);
 }
 static void rc_cycle_register(RcCycle *cycle) {
     cycle->registered = 1;
@@ -160,9 +168,13 @@ static inline void rc_cycle_edge_remove(void *value) {
     rc_cycle_shade(cycle);
     cycle->incoming--;
 }
-static void rc_cycle_free_object(RcObject *object, unsigned kind) {
-    if (rc_cycle_storage(kind)) {
+static void rc_cycle_free_object(RcObject *object) {
+    if (rc_traced(object)) {
         RC_ACCOUNT(rc_bytes -= sizeof(RcCycle));
         RC_DEALLOCATE(rc_cycle_metadata(object));
     } else RC_DEALLOCATE(object);
+}
+/* Remove a dead parent's slot. Only traced parents counted it as incoming. */
+static inline void rc_cycle_drop_slot(int traced, void *value) {
+    if (traced) rc_cycle_edge_remove(value);
 }

@@ -1,7 +1,7 @@
 /* Allocation oracle and runtime graph/alias tests for the finite-heap profile. */
 #define MINYAR_BOUNDED_HEAP 1
 #ifndef MINYAR_BOUNDED_HEAP_BYTES
-#define MINYAR_BOUNDED_HEAP_BYTES (16u * 1024u * 1024u)
+#define MINYAR_BOUNDED_HEAP_BYTES (8u * 1024u * 1024u)
 #endif
 #define MINYAR_RC_TESTING 1
 #include "../runtime/minyar_runtime.c"

@@ -17,8 +17,9 @@ static unsigned rc_bounded_recent_turn;
  * reference flag and store seven cursor bits each. The loop executes at most
  * ceil(sizeof(size_t)*CHAR_BIT/7) iterations, independent of graph size. */
 static size_t rc_bounded_saved_cursor(RcObject *object) {
-    if ((object->ownership & 7) == RC_TEXT) return 0;
-    if ((object->ownership & 7) == RC_REFERENCES)
+    unsigned kind = rc_kind(object);
+    if (kind == RC_TEXT) return 0;
+    if (kind == RC_REFERENCES)
         return (size_t)((MinyarList *)(object + 1))->capacity;
     MinyarRecord *record = (MinyarRecord *)(object + 1);
     unsigned char *map = (unsigned char *)(record->values + record->length);
@@ -29,8 +30,9 @@ static size_t rc_bounded_saved_cursor(RcObject *object) {
 }
 
 static void rc_bounded_save_cursor(RcObject *object, size_t cursor) {
-    if ((object->ownership & 7) == RC_TEXT) return;
-    if ((object->ownership & 7) == RC_REFERENCES) {
+    unsigned kind = rc_kind(object);
+    if (kind == RC_TEXT) return;
+    if (kind == RC_REFERENCES) {
         ((MinyarList *)(object + 1))->capacity = (long long)cursor;
         return;
     }
@@ -61,7 +63,7 @@ static void *rc_bounded_finish_object(RcObject *object, unsigned kind) {
         RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(MinyarRecord)
                    + (size_t)record->length * (sizeof(long long) + (kind == RC_RECORD)));
     }
-    rc_cycle_free_object(object, kind);
+    rc_cycle_free_object(object);
     RC_ACCOUNT(rc_object_count--);
     return text_backing;
 }
@@ -86,12 +88,18 @@ static unsigned rc_drop(void *value) {
         return 1;
     }
     if (!(ownership >> 3)) return 0;
-    rc_cycle_before_drop(object);
-    object->ownership = ownership - 8;
-    if (object->ownership >> 3) { rc_cycle_after_drop(object); return 0; }
-    if (rc_cycle_defer_zero(object)) return 0;
-    if (rc_cycle_value(value)) rc_cycle_unregister(object);
-    unsigned kind = object->ownership & 7;
+    /* Untraced objects take exactly the ordinary count path. */
+    if ((ownership & 7) == RC_TRACED) {
+        rc_cycle_before_drop(object);
+        object->ownership = ownership - 8;
+        if (object->ownership >> 3) { rc_cycle_after_drop(object); return 0; }
+        if (rc_cycle_defer_zero(object)) return 0;
+        rc_cycle_unregister(object);
+    } else {
+        object->ownership = ownership - 8;
+        if (object->ownership >> 3) return 0;
+    }
+    unsigned kind = rc_kind(object);
     if (kind == RC_TEXT) {
         void *backing = rc_bounded_finish_object(object, kind);
         /* A view owns a direct reference to an owning Text, never another
@@ -108,7 +116,7 @@ static unsigned rc_drop(void *value) {
         return 1;
     }
     if (kind == RC_LIST || kind == RC_REFERENCES_IMMORTAL ||
-        (kind == RC_RECORD && rc_cycle_metadata(object)->cleared) ||
+        (rc_traced(object) && rc_cycle_metadata(object)->cleared) ||
         (kind == RC_REFERENCES && !((MinyarList *)(object + 1))->length) ||
         (kind == RC_RECORD && !((MinyarRecord *)(object + 1))->length)) {
         rc_bounded_finish_object(object, kind);
@@ -118,8 +126,8 @@ static unsigned rc_drop(void *value) {
     return 0;
 }
 
-static void rc_drop_edge(void *value) {
-    rc_cycle_edge_remove(value);
+static void rc_drop_slot(int traced, void *value) {
+    rc_cycle_drop_slot(traced, value);
     rc_drop(value);
 }
 
@@ -147,11 +155,12 @@ static void rc_bounded_old_object_unit(void) {
         rc_bounded_cursor = rc_bounded_saved_cursor(rc_bounded_active);
     }
     RcObject *object = rc_bounded_active;
-    unsigned kind = object->ownership & 7;
+    unsigned kind = rc_kind(object);
+    int traced = rc_traced(object);
     if (kind == RC_REFERENCES) {
         MinyarList *list = (MinyarList *)(object + 1);
         if (rc_bounded_cursor < (size_t)list->length) {
-            rc_drop_edge((void *)(uintptr_t)list->values[rc_bounded_cursor++]);
+            rc_drop_slot(traced, (void *)(uintptr_t)list->values[rc_bounded_cursor++]);
             return;
         }
     } else if (kind == RC_RECORD) {
@@ -159,7 +168,7 @@ static void rc_bounded_old_object_unit(void) {
         if (rc_bounded_cursor < (size_t)record->length) {
             unsigned char *map = (unsigned char *)(record->values + record->length);
             size_t index = rc_bounded_cursor++;
-            if (map[index] & 1) rc_drop_edge((void *)(uintptr_t)record->values[index]);
+            if (map[index] & 1) rc_drop_slot(traced, (void *)(uintptr_t)record->values[index]);
             return;
         }
     }
@@ -173,14 +182,15 @@ static void rc_bounded_old_object_unit(void) {
  * recursion or an auxiliary allocation. */
 static void rc_bounded_recent_object_unit(void) {
     RcObject *object = rc_bounded_recent_head;
-    unsigned kind = object->ownership & 7;
+    unsigned kind = rc_kind(object);
+    int traced = rc_traced(object);
     size_t cursor = rc_bounded_saved_cursor(object);
     if (kind == RC_REFERENCES) {
         MinyarList *list = (MinyarList *)(object + 1);
         if (cursor < (size_t)list->length) {
             void *child = (void *)(uintptr_t)list->values[cursor];
             rc_bounded_save_cursor(object, cursor + 1);
-            rc_drop_edge(child);
+            rc_drop_slot(traced, child);
             return;
         }
     } else if (kind == RC_RECORD) {
@@ -189,7 +199,7 @@ static void rc_bounded_recent_object_unit(void) {
             unsigned char *map = (unsigned char *)(record->values + record->length);
             void *child = (map[cursor] & 1) ? (void *)(uintptr_t)record->values[cursor] : NULL;
             rc_bounded_save_cursor(object, cursor + 1);
-            rc_drop_edge(child);
+            rc_drop_slot(traced, child);
             return;
         }
     }
@@ -218,7 +228,7 @@ static void rc_bounded_object_unit(void) {
          * object unit captures the recent stack and services its head, so
          * recent progress is delayed by at most one object unit here. */
         RcObject *active = rc_bounded_active;
-        if (!rc_bounded_head && active && (active->ownership & 7) == RC_RECORD &&
+        if (!rc_bounded_head && active && rc_kind(active) == RC_RECORD &&
             ((MinyarRecord *)(active + 1))->length == 1 && rc_bounded_cursor == 1)
             rc_bounded_old_object_unit();
         else rc_bounded_recent_object_unit();
@@ -308,8 +318,6 @@ static MINYAR_COLD size_t rc_bounded_poll_work(size_t budget) {
                                     /* Live maps contain flags0/1, hence their
                                      * saved cursor is already zero. No queue or
                                      * cursor initialization is needed in transit. */
-                                    rc_cycle_edge_remove(next + 1);
-                                    rc_cycle_unregister(next);
                                     next->ownership = RC_RECORD;
                                     rc_bounded_finish_object(single, RC_RECORD);
                                     work += 2;
@@ -320,7 +328,7 @@ static MINYAR_COLD size_t rc_bounded_poll_work(size_t budget) {
                                     continue;
                                 }
                                 rc_bounded_recent_turn ^= 1;
-                                if (map[0] & 1) rc_drop_edge((void *)(uintptr_t)record->values[0]);
+                                if (map[0] & 1) rc_drop((void *)(uintptr_t)record->values[0]);
                                 rc_bounded_recent_turn ^= 1;
                                 rc_bounded_finish_object(single, RC_RECORD);
                                 rc_pending_count--;
@@ -355,7 +363,7 @@ static MINYAR_COLD size_t rc_bounded_poll_work(size_t budget) {
                     if (child && child->ownership == (8 | RC_SCALAR_RECORD))
                         rc_bounded_finish_object(child, RC_SCALAR_RECORD);
                     else {
-                        rc_drop_edge(value);
+                        rc_drop(value);
                         if (rc_bounded_recent_head) break;
                     }
                 }

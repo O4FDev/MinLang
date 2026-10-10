@@ -2738,7 +2738,11 @@ function parseRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLin
         if scalar {
             output.add(" = call ptr @minyar_record_new_scalar(i64 ")
         } else {
-            output.add(" = call ptr @minyar_record_new(i64 ")
+            if recordMayCycle(1000 + record, functionParameterCounts, functionParameterTypes) {
+                output.add(" = call ptr @minyar_record_new_traced(i64 ")
+            } else {
+                output.add(" = call ptr @minyar_record_new(i64 ")
+            }
         }
         output.add(Text(fieldCount))
         output.add(")\n")
@@ -3161,12 +3165,17 @@ function parseListLiteral(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
     let value = valueName(textState, temporary)
     output.add("  ")
     output.add(value)
+    let constructor = output.length
     output.add(" = call ptr @minyar_list_new()\n")
     let references = false
     if isReferenceType(elementType) {
-        output.add("  call void @minyar_list_references(ptr ")
-        output.add(value)
-        output.add(")\n")
+        if listMutationMayCycle(100000 + elementType, functionParameterCounts, functionParameterTypes, functionReturnTypes) {
+            output[constructor] = " = call ptr @minyar_list_new_traced()\n"
+        } else {
+            output.add("  call void @minyar_list_references(ptr ")
+            output.add(value)
+            output.add(")\n")
+        }
         references = true
     }
     skipTerminators(tokenKinds, state)
@@ -3191,9 +3200,13 @@ function parseListLiteral(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
             fail("all values in a List literal must have the same type")
         }
         if isReferenceType(elementType) && !references {
-            output.add("  call void @minyar_list_references(ptr ")
-            output.add(value)
-            output.add(")\n")
+            if listMutationMayCycle(100000 + elementType, functionParameterCounts, functionParameterTypes, functionReturnTypes) {
+                output[constructor] = " = call ptr @minyar_list_new_traced()\n"
+            } else {
+                output.add("  call void @minyar_list_references(ptr ")
+                output.add(value)
+                output.add(")\n")
+            }
             references = true
         }
         let slot = valueAsListSlot(output, textState, state, item, elementType)
@@ -3950,6 +3963,21 @@ function fieldMutationMayCycle(recordType: Integer, fieldType: Integer, counts: 
                 }
             }
         }
+    }
+    return false
+}
+
+// Only a record type that can reach itself through its fields can lie on a
+// heap cycle. Such records, like Lists for which listMutationMayCycle holds,
+// are allocated with cycle-tracing metadata; every other aggregate omits it.
+function recordMayCycle(recordType: Integer, counts: List<Integer>, fields: List<Integer>): Boolean {
+    let first = functionParameterOffset(counts, recordType - 1000)
+    let field = 0
+    while field < counts[recordType - 1000] {
+        if fieldMutationMayCycle(recordType, fields[first + field], counts, fields) {
+            return true
+        }
+        field = field + 1
     }
     return false
 }
@@ -4839,9 +4867,19 @@ function compileAtomicStatement(tokenKinds: List<Integer>, tokenTexts: List<Text
             }
             valueType[0] = declaredType
             if isReferenceType(listElementType(declaredType)) {
-                output.add("  call void @minyar_list_references(ptr ")
-                output.add(value)
-                output.add(")\n")
+                // The empty literal's constructor precedes this point in the
+                // same function; give a cycle-capable List its traced layout.
+                let constructor = output.length - 1
+                while constructor > 0 && !(output[constructor] == " = call ptr @minyar_list_new()\n" && output[constructor - 1] == value) {
+                    constructor = constructor - 1
+                }
+                if constructor > 0 && listMutationMayCycle(declaredType, functionParameterCounts, functionParameterTypes, functionReturnTypes) {
+                    output[constructor] = " = call ptr @minyar_list_new_traced()\n"
+                } else {
+                    output.add("  call void @minyar_list_references(ptr ")
+                    output.add(value)
+                    output.add(")\n")
+                }
             }
         }
         if declaredType != 0 && declaredType != valueType[0] {
@@ -5446,6 +5484,7 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     output.add("declare ptr @minyar_read_text_file(ptr)\n")
     output.add("declare void @minyar_write_text_file(ptr, ptr)\n")
     output.add("declare ptr @minyar_list_new()\n")
+    output.add("declare ptr @minyar_list_new_traced()\n")
     output.add("declare void @minyar_list_references(ptr)\n")
     output.add("declare void @minyar_list_add(ptr, i64)\n")
     output.add("declare void @minyar_list_append_scalars(ptr, ptr, i64)\n")
@@ -5456,6 +5495,7 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     output.add("declare void @minyar_list_set_take(ptr, i64, i64)\n")
     output.add("declare ptr @minyar_list_appended(ptr, i64, i64, i64)\n")
     output.add("declare ptr @minyar_record_new(i64)\n")
+    output.add("declare ptr @minyar_record_new_traced(i64)\n")
     output.add("declare ptr @minyar_record_new_scalar(i64)\n")
     output.add("declare i64 @minyar_record_get(ptr, i64)\n")
     output.add("declare void @minyar_record_set(ptr, i64, i64)\n")

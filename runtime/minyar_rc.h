@@ -26,7 +26,9 @@ void minyar_rc_step(void) {}
 void minyar_rc_retain(void *value) { (void)value; }
 void minyar_rc_release(void *value) { (void)value; }
 #else
-enum { RC_TEXT = 1, RC_LIST = 2, RC_REFERENCES = 3, RC_RECORD = 4, RC_SCALAR_RECORD = 5, RC_REFERENCES_IMMORTAL = 6 };
+/* RC_TRACED marks a List or record with cycle metadata; see minyar_cycles.h. */
+enum { RC_TEXT = 1, RC_LIST = 2, RC_REFERENCES = 3, RC_RECORD = 4, RC_SCALAR_RECORD = 5, RC_REFERENCES_IMMORTAL = 6,
+       RC_TRACED = 7 };
 typedef struct { size_t ownership; } RcObject;
 typedef struct { size_t size; } RcData;
 _Static_assert(sizeof(RcObject) == 8, "LLVM literal ownership header must match");
@@ -114,7 +116,7 @@ static void *rc_allocate_object(size_t size, unsigned kind) {
 #ifdef MINYAR_BOUNDED_RC
     rc_service_pending(MINYAR_RC_POLL_BUDGET);
 #endif
-    size_t extra = rc_cycle_storage(kind) ? sizeof(RcCycle) : 0;
+    size_t extra = kind == RC_TRACED ? sizeof(RcCycle) : 0;
     if (size > SIZE_MAX - sizeof(RcObject) - extra) out_of_memory();
     void *allocation = RC_ALLOCATE(extra + sizeof(RcObject) + size);
     if (!allocation) out_of_memory();
@@ -171,7 +173,7 @@ void minyar_rc_retain(void *value) {
     if (object->ownership > SIZE_MAX - 8)
         minyar_stop("this value has too many references.");
     object->ownership += 8;
-    if (rc_cycle_shading) rc_cycle_shade_value(value);
+    if (rc_traced(object) && rc_cycle_shading) rc_cycle_shade_value(value);
 }
 
 #ifdef MINYAR_BOUNDED_RC
@@ -181,12 +183,18 @@ static void rc_drop(void *value) {
     if (!value) return;
     RcObject *object = (RcObject *)value - 1;
     if (!(object->ownership >> 3)) return;
-    rc_cycle_before_drop(object);
-    object->ownership -= 8;
-    if (object->ownership >> 3) { rc_cycle_after_drop(object); return; }
-    if (rc_cycle_defer_zero(object)) return;
-    if (rc_cycle_value(value)) rc_cycle_unregister(object);
-    unsigned kind = object->ownership & 7;
+    /* Untraced objects take exactly the ordinary count path. */
+    if (rc_traced(object)) {
+        rc_cycle_before_drop(object);
+        object->ownership -= 8;
+        if (object->ownership >> 3) { rc_cycle_after_drop(object); return; }
+        if (rc_cycle_defer_zero(object)) return;
+        rc_cycle_unregister(object);
+    } else {
+        object->ownership -= 8;
+        if (object->ownership >> 3) return;
+    }
+    unsigned kind = rc_kind(object);
     MinyarText *text_backing = NULL;
     /* Leaves can be destroyed immediately, without recursion or queue space.
      * This matters for wide lists of small records and text fragments. */
@@ -201,7 +209,7 @@ static void rc_drop(void *value) {
         rc_free_data(list->values);
         RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(*list));
     } else if (kind == RC_SCALAR_RECORD ||
-               (kind == RC_RECORD && rc_cycle_metadata(object)->cleared)) {
+               (kind == RC_RECORD && rc_traced(object) && rc_cycle_metadata(object)->cleared)) {
 #ifdef MINYAR_RC_TESTING
         MinyarRecord *record = (MinyarRecord *)(object + 1);
 #endif
@@ -221,7 +229,7 @@ static void rc_drop(void *value) {
         return;
     }
     RC_ACCOUNT(rc_object_count--);
-    rc_cycle_free_object(object, kind);
+    rc_cycle_free_object(object);
     /* Views point directly at an owning root, never at another view. */
     if (text_backing) rc_drop(text_backing);
 }
@@ -231,12 +239,13 @@ void minyar_rc_release(void *value) {
     /* Iterative destruction: releasing a deep graph never recurses in C. */
     while (rc_pending_count) {
         RcObject *object = rc_pending[--rc_pending_count];
-        unsigned kind = object->ownership & 7;
+        unsigned kind = rc_kind(object);
+        int traced = rc_traced(object);
         if (kind == RC_REFERENCES) {
             MinyarList *list = (MinyarList *)(object + 1);
             for (long long i = 0; i < list->length; i++) {
                 void *child = (void *)(uintptr_t)list->values[i];
-                rc_cycle_edge_remove(child);
+                rc_cycle_drop_slot(traced, child);
                 rc_drop(child);
             }
             rc_free_data(list->values);
@@ -247,14 +256,14 @@ void minyar_rc_release(void *value) {
             for (long long i = 0; i < record->length; i++)
                 if (references[i]) {
                     void *child = (void *)(uintptr_t)record->values[i];
-                    rc_cycle_edge_remove(child);
+                    rc_cycle_drop_slot(traced, child);
                     rc_drop(child);
                 }
             RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(*record)
                                    + (size_t)record->length * (sizeof(long long) + 1));
         }
         RC_ACCOUNT(rc_object_count--);
-        rc_cycle_free_object(object, kind);
+        rc_cycle_free_object(object);
     }
     rc_cycle_eager_service(value ? 32 : SIZE_MAX);
 }

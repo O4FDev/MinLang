@@ -14,7 +14,7 @@ def without_fusion(s):
     end=s.index('\n                            continue;',begin)
     assert s[begin:end].count('work += 2;')==2
     canonical="""                            rc_bounded_recent_turn ^= 1;
-                            if (map[0] & 1) rc_drop_edge((void *)(uintptr_t)record->values[0]);
+                            if (map[0] & 1) rc_drop((void *)(uintptr_t)record->values[0]);
                             rc_bounded_recent_turn ^= 1;
                             rc_bounded_finish_object(single, RC_RECORD);
                             rc_pending_count--;

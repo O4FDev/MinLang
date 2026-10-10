@@ -6,13 +6,13 @@
  * List scan limits are captured once; appends cannot extend an active scan. */
 static size_t rc_cycle_length(RcCycle *cycle) {
     RcObject *object = rc_cycle_object(cycle);
-    if ((object->ownership & 7) == RC_RECORD)
+    if (cycle->record)
         return (size_t)((MinyarRecord *)(object + 1))->length;
     return (size_t)((MinyarList *)(object + 1))->length;
 }
 static long long *rc_cycle_slot(RcCycle *cycle, size_t index) {
     RcObject *object = rc_cycle_object(cycle);
-    if ((object->ownership & 7) == RC_RECORD) {
+    if (cycle->record) {
         MinyarRecord *record = (MinyarRecord *)(object + 1);
         unsigned char *map = (unsigned char *)(record->values + record->length);
         return (map[index] & 1) ? &record->values[index] : NULL;
@@ -106,7 +106,7 @@ static void rc_cycle_unit_body(void) {
          * those null slots when the last incoming owner later retires. */
         RcObject *object = rc_cycle_object(cycle);
         cycle->cleared = 1;
-        if ((object->ownership & 7) != RC_RECORD)
+        if (!cycle->record)
             ((MinyarList *)(object + 1))->length = 0;
         rc_cycle_unregister(object);
         /* The pin keeps self-edges safe while being severed. Other white

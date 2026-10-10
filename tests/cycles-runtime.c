@@ -22,7 +22,7 @@ static void poll_many(size_t n) {
 #endif
 }
 static MinyarRecord *self_loop(void) {
-    MinyarRecord *r = minyar_record_new(1);
+    MinyarRecord *r = minyar_record_new_traced(1);
     minyar_record_set_reference(r, 0, slot(r));
     return r;
 }
@@ -53,7 +53,7 @@ static void graph_oracle(void) {
         MinyarRecord *nodes[N];
         int edges[N][F], roots[N];
         for (int i = 0; i < N; i++) {
-            nodes[i] = minyar_record_new(F + 1);
+            nodes[i] = minyar_record_new_traced(F + 1);
             minyar_record_set(nodes[i], F, i);
             roots[i] = 1;
             for (int f = 0; f < F; f++) {
@@ -102,7 +102,7 @@ static void graph_oracle(void) {
 }
 
 static void growing_list(void) {
-    MinyarList *list = minyar_list_new();
+    MinyarList *list = minyar_list_new_traced();
     minyar_list_references(list);
     size_t before = rc_cycle_epochs;
     for (size_t i = 0; i < 1024; i++) {
@@ -116,7 +116,7 @@ static void growing_list(void) {
     minyar_rc_release(list);
     empty();
     /* A List itself can also be a cycle in the native owning-slot API. */
-    list = minyar_list_new();
+    list = minyar_list_new_traced();
     minyar_list_references(list);
     minyar_list_add(list, slot(list));
     minyar_rc_release(list);
@@ -136,7 +136,7 @@ int main(void) {
 #ifndef MINYAR_BOUNDED_RC
     /* Eager cycle work must also advance during scalar loop service points. */
     minyar_rc_enter(0);
-    MinyarList *loop = minyar_list_new();
+    MinyarList *loop = minyar_list_new_traced();
     minyar_list_references(loop);
     for (size_t i = 0; i < 1000; i++) minyar_list_add(loop, slot(loop));
     minyar_rc_release(loop);
@@ -148,9 +148,9 @@ int main(void) {
     graph_oracle();
     /* Transfer the only external owner into a receiver owned by that same
      * object: garbage can arise without any ordinary count decrement. */
-    MinyarList *inside = minyar_list_new();
+    MinyarList *inside = minyar_list_new_traced();
     minyar_list_references(inside);
-    MinyarRecord *moved = minyar_record_new(1);
+    MinyarRecord *moved = minyar_record_new_traced(1);
     minyar_record_set_take(moved, 0, slot(inside));
     minyar_list_add_take(inside, slot(moved));
     empty();
@@ -168,9 +168,9 @@ int main(void) {
     }
     empty();
     /* A long ring needs many batches, then becomes garbage mid-collection. */
-    MinyarRecord *first = minyar_record_new(1), *last = first;
+    MinyarRecord *first = minyar_record_new_traced(1), *last = first;
     for (size_t i = 1; i < 1000; i++) {
-        MinyarRecord *next = minyar_record_new(1);
+        MinyarRecord *next = minyar_record_new_traced(1);
         minyar_record_set_reference(last, 0, slot(next));
         if (last != first) minyar_rc_release(last);
         last = next;
@@ -196,7 +196,7 @@ int main(void) {
     minyar_rc_leave();
     empty();
     /* Take transfers and repeated root/edge changes during collection. */
-    MinyarList *roots = minyar_list_new();
+    MinyarList *roots = minyar_list_new_traced();
     minyar_list_references(roots);
     r = self_loop();
     minyar_list_add_take(roots, slot(r));
