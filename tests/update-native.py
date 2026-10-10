@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from clang_helpers import windows_host
 
 ROOT=Path(__file__).resolve().parents[1]
 
@@ -14,7 +15,7 @@ def main():
         root=Path(directory)
         for sanitize in ([False] if os.name=='nt' else [False,True]):
             binary=root/('probe-sanitize' if sanitize else 'probe')
-            if os.name=='nt': binary=binary.with_suffix('.exe')
+            if windows_host(): binary=binary.with_suffix('.exe')
             flags=['-O1','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer'] if sanitize else ['-O2']
             command=[clang,'-std=c11','-D_GNU_SOURCE','-DMINYAR_SYSTEM_HEAP=1','-DMINYAR_UPDATE_TEST_HOOK=1',
                 '-Wall','-Wextra','-Werror',*flags,*[str(ROOT/path) for path in ['tests/update-native.c',
@@ -31,7 +32,7 @@ def main():
                 expected=b'new' if point=='state-after-replace' else b'old'
                 recovered=subprocess.check_output([str(binary),str(target),'reopen'],env=env,timeout=30)
                 assert recovered==expected,(point,recovered)
-                suffix='.exe' if os.name=='nt' else '.bin'
+                suffix='.exe' if windows_host() else '.bin'
                 assert (target/'versions'/('a'*64+suffix)).read_bytes()==b'old'
         print('All publication transitions survive abrupt exit; OS releases updater locks')
 
