@@ -435,6 +435,44 @@ hashing on every barrier. The chain's +50% peak memory is the 32-byte
 prefix moving the Node record (34 bytes) and its List (32 bytes) into
 larger allocator size classes: 48 to 80 and 32 to 64 bytes.
 
+### Merge with perf/macos-list (c986a76)
+
+`ebb02ba` merges `perf/macos-list` into this branch. Two compiler hunks
+conflicted:
+
+- **`name.field = name.field + rest`:** the branch rewrites this as an
+  append. The removed v2 `checkFieldMutation` rejection stays removed.
+  `minyar_record_append_text` falls back to the plain `minyar_record_replace`.
+  That is correct for traced records, because the value is Text, which is
+  never traced and gets no incoming count.
+- **Borrow-free `record.field[i] = v`:** the elision is kept for untraced
+  Lists. A cycle-capable List keeps its `minyar_rc_borrow_traced`, because
+  the cycle hint before the store is a service point. This is conservative
+  and costs nothing for ordinary programs.
+
+Leaf detection counts only user calls (`state[14]`), so traced runtime calls
+do not affect it. No parser-state slots were added; acyclic-type caches use
+the existing `returnTypes` tail. A new `tests/cycles.py` case drives both
+paths on cycle-capable types. Built as a source program, the same loop
+(20,000 two-node cycles with field appends and indexed stores) prints the
+expected result in a 1 MiB fixed pool at K1 and K32.
+
+Consumers, compared with the `perf/macos-list` build (`./minyar --release`,
+retired instructions):
+
+| Consumer | Traced calls in IR | perf/macos-list | Merged | Change |
+| --- | ---: | ---: | ---: | ---: |
+| Compiler arena self-compile (same input, min of 5) | 0 | 79.9 M | 80.7 M | +1.0% |
+| `craft --screenshot ... noon` (median of 3) | 0 | 17,286 M | 17,297 M | +0.06% |
+| `os/kernel/main.min` | 50 (`json.Value`) | not run | | |
+| Atacama desktop app | 51 (`json.Value`) | not run | | |
+
+`json.Value` (`items: List<Value>`) is cycle-capable, so JSON parsing in the
+kernel and Atacama pays the dormant bookkeeping. Neither program emits a
+cycle hint, so tracing never activates. The compiler's +1% is its own extra
+work deciding which entry points to emit (`typeMayCycle` at each borrow,
+local and List site); there are no traced objects at run time.
+
 ### Validation status
 
 Final command outcomes are recorded in [validation.md](validation.md). The
