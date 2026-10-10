@@ -5,7 +5,7 @@ import struct
 import os
 import json
 from regressions import CompilerTestCase, ROOT, CLANG, LINK_FLAGS
-from clang_helpers import clang_command, windows_host, native_path
+from clang_helpers import clang_command, native_path
 from pathlib import Path
 
 WORKER_RUNTIME = Path(os.environ.get('MINYAR_WORKER_RUNTIME', ROOT / 'build/minyar-default-runtime.o'))
@@ -117,7 +117,7 @@ if workers.isWorker() {
 ''', '1\n3\n0\n1\nfalse\nfalse\n')
 
     def test_backpressure_accepts_no_partial_frame_and_close_releases_queue(self):
-        waiting = self.directory / 'waiting.c'
+        waiting = self.directory / 'waiting worker é.c'
         waiting.write_text('#ifdef _WIN32\n#include <windows.h>\nint main(void) { Sleep(INFINITE); }\n'
                            '#else\n#include <unistd.h>\nint main(void) { for (;;) pause(); }\n#endif\n')
         child = waiting.with_suffix('.exe')
@@ -126,7 +126,7 @@ if workers.isWorker() {
         self.assertEqual(compiled.returncode, 0, compiled.stderr)
         self.worker_program(f'''use "workers" as workers
 use "errors" as errors
-let worker = workers.value(workers.spawn({json.dumps(native_path(child))}, "blocked"))
+let worker = workers.value(workers.spawn({json.dumps(native_path(child), ensure_ascii=False)}, "blocked"))
 let message = Bytes(16777216)
 print(errors.integerOk(workers.send(worker, message)))
 print(errors.integerOk(workers.send(worker, message)))
@@ -188,6 +188,40 @@ if workers.isWorker() {{
     workers.close(worker)
 }}
 ''', '1\n')
+
+    def test_pending_reads_survive_registry_growth_and_frames_remain_separate(self):
+        self.worker_program('''use "workers" as workers
+use "errors" as errors
+if workers.isWorker() {
+    let first = workers.readMessage()
+    let second = workers.readMessage()
+    workers.reply(errors.bytesValue(first))
+    workers.reply(errors.bytesValue(second))
+} else {
+    let pool: List<workers.Worker> = []
+    for index in 0..12 {
+        let worker = workers.value(workers.spawnSelf("pending"))
+        pool.add(worker)
+        if errors.bytesStatus(workers.receive(worker, 0)) != errors.wouldBlockStatus() { fail("poll did not wait") }
+    }
+    for index in 0..12 {
+        let message = Bytes(1)
+        message[0] = index
+        workers.send(pool[index], message)
+        message[0] = index + 100
+        workers.send(pool[index], message)
+        message[0] = 255
+    }
+    for index in 0..12 {
+        let first = workers.receive(pool[index], 2000)
+        let second = workers.receive(pool[index], 2000)
+        if errors.bytesValue(first)[0] != index || errors.bytesValue(second)[0] != index + 100 { fail("copied frame changed") }
+        if errors.bytesStatus(workers.receive(pool[index], 2000)) != errors.endOfStreamStatus() { fail("other child inherited the pipe") }
+        if !errors.booleanOk(workers.close(pool[index])) { fail("close failed") }
+    }
+    print("stable")
+}
+''', 'stable\n')
 
 
 if __name__ == '__main__':
