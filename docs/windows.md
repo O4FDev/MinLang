@@ -74,9 +74,34 @@ contract. No private-key export function is used. Hardware protection depends
 on the certificate's configured key provider; this API does not turn a software
 key into a TPM key.
 
-This identity integrates with Minyar's TLS implementation. The separate
-SChannel transport and its client-certificate API are not included in this
-core bridge slice.
+This identity integrates with Minyar's TLS implementation and the `schannel`
+package. `schannel.client(host)` uses OS trust roots and SChannel's certificate
+validation. `clientWithTrust(host, roots)` requires a nonempty bounded list of
+DER roots. `clientWithIdentity(host, roots, identity)` presents the selected
+Windows certificate and signs inside its CNG provider; an empty roots list in
+that function uses OS roots. Implicit selection of other client identities is
+disabled. The explicit-root path additionally checks the complete chain,
+hostname, SAN, validity and certificate constraints before exposing plaintext.
+
+The SChannel session is driven by bytes rather than owning a socket. Drain
+`takeOutgoing`, deliver those bytes through TCP, feed received ciphertext to
+`receive`, and drain authenticated `takeIncoming` bytes. The same API supports
+non-blocking sockets and partial records. Call `endInput` on transport EOF: a
+missing authenticated TLS `close_notify` returns a truncation error. `shutdown`
+queues our close notification; drain it before closing the TCP connection.
+`close` always releases native credentials, contexts, keys and buffers, even
+after an error. Copies of a closed session return a recoverable closed error.
+Each session belongs to the thread that created the provider. TLS 1.2 and 1.3
+are supported; older TLS and TLS 1.2 renegotiation are disabled. Queue limits
+are one MiB each, and `write` returns would-block before consuming data when
+its outgoing queue is full.
+
+SChannel encrypts TLS records over TCP. QUIC uses Minyar's own TLS handshake
+driver and opaque CNG signing references because QUIC carries TLS handshake
+messages without the TLS record layer. The API follows Microsoft's
+[credential configuration](https://learn.microsoft.com/en-us/windows/win32/api/schannel/ns-schannel-sch_credentials),
+[post-handshake processing](https://learn.microsoft.com/en-us/windows/win32/secauthn/decryptmessage--schannel),
+and [shutdown contract](https://learn.microsoft.com/en-us/windows/win32/secauthn/shutting-down-an-schannel-connection).
 
 ## Correctness gate
 
@@ -89,3 +114,12 @@ contracts in debug and release. Login tests redirect all writes to a separate
 per-process test registry key; OS trust roots are never changed. Explorer tray
 lifetime is checked when the Windows test session has a taskbar. The local
 Windows 11 desktop VM is required for that check in headless CI environments.
+
+`python3 tests/schannel.py` is a separate mandatory Windows CI gate. It tests
+native state/buffer/lifetime contracts and compiled Minyar results in debug
+and release. An independent OpenSSL peer exercises TLS 1.2/1.3, RSA/ECDSA,
+IP names, intermediate chains, one-byte record fragments, bad names, invalid
+dates/EKU/critical extensions, unknown CAs, required/absent/untrusted client
+identities and truncation after authenticated data. Mutual TLS uses a generated
+nonexportable Windows KSP key, exports only its public certificate and removes
+both test objects after the peer exits. OS trust stores are never changed.
