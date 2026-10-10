@@ -3,8 +3,9 @@
 import unittest
 import struct
 import os
+import json
 from regressions import CompilerTestCase, ROOT, CLANG, LINK_FLAGS
-from clang_helpers import clang_command, windows_host
+from clang_helpers import clang_command, windows_host, native_path
 from pathlib import Path
 
 WORKER_RUNTIME = Path(os.environ.get('MINYAR_WORKER_RUNTIME', ROOT / 'build/minyar-default-runtime.o'))
@@ -14,7 +15,6 @@ class IsolatedWorkers(CompilerTestCase):
     compiler_arguments = ('--library', str(ROOT / 'library'))
 
     def worker_program(self, source, expected):
-        if windows_host(): self.skipTest('Windows process workers report recoverable unavailable')
         result, llvm = self.compile(source)
         self.assertEqual(result.returncode, 0, result.stderr)
         executable = llvm.with_suffix('.exe')
@@ -117,16 +117,16 @@ if workers.isWorker() {
 ''', '1\n3\n0\n1\nfalse\nfalse\n')
 
     def test_backpressure_accepts_no_partial_frame_and_close_releases_queue(self):
-        if windows_host(): self.skipTest('Windows process workers report recoverable unavailable')
         waiting = self.directory / 'waiting.c'
-        waiting.write_text('#include <unistd.h>\nint main(void) { for (;;) pause(); }\n')
+        waiting.write_text('#ifdef _WIN32\n#include <windows.h>\nint main(void) { Sleep(INFINITE); }\n'
+                           '#else\n#include <unistd.h>\nint main(void) { for (;;) pause(); }\n#endif\n')
         child = waiting.with_suffix('.exe')
         compiled = self.evidence.run([CLANG, '-std=c11', '-O2', str(waiting), '-o', str(child)],
             capture_output=True, text=True, timeout=30, phase='compile-idle-worker')
         self.assertEqual(compiled.returncode, 0, compiled.stderr)
         self.worker_program(f'''use "workers" as workers
 use "errors" as errors
-let worker = workers.value(workers.spawn("{child}", "blocked"))
+let worker = workers.value(workers.spawn({json.dumps(native_path(child))}, "blocked"))
 let message = Bytes(16777216)
 print(errors.integerOk(workers.send(worker, message)))
 print(errors.integerOk(workers.send(worker, message)))
@@ -138,7 +138,6 @@ print(errors.booleanValue(workers.close(worker)))
 ''', 'true\ntrue\nfalse\ntrue\n1\ntrue\n')
 
     def test_every_truncated_frame_prefix_and_oversized_header(self):
-        if windows_host(): self.skipTest('Windows process workers report recoverable unavailable')
         source = '''use "workers" as workers
 use "errors" as errors
 let result = workers.readMessage()
@@ -164,25 +163,31 @@ workers.reply(status)
                 self.assertEqual(run.returncode, 0, run.stderr)
                 self.assertEqual(run.stdout, struct.pack('<I', 1) + bytes((status,)))
 
-    @unittest.skipUnless(windows_host(), 'Windows unavailable backend contract')
-    def test_windows_unavailable_is_a_value(self):
-        compiled, llvm = self.compile('''use "workers" as workers
+    def test_supported_backend_and_spawn_failure_are_values(self):
+        self.worker_program('''use "workers" as workers
 use "errors" as errors
 print(workers.supported())
-let result = workers.spawnSelf("unavailable")
+let result = workers.spawn("/path/that/does/not/exist", "unavailable")
 print(workers.ok(result))
 print(errors.isError(workers.error(result)))
-''')
-        self.assertEqual(compiled.returncode, 0, compiled.stderr)
-        executable = llvm.with_suffix('.exe')
-        linked = self.evidence.run(clang_command([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module',
-            str(llvm), str(WORKER_RUNTIME), str(ROOT / 'runtime/native/workers.c'), '-o', str(executable)]),
-            capture_output=True, text=True, timeout=30, phase='link-unavailable-worker')
-        self.assertEqual(linked.returncode, 0, linked.stderr)
-        run = self.evidence.run([str(executable)], capture_output=True, timeout=10, phase='execute-unavailable-worker')
-        self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertEqual(run.stdout, b'false\nfalse\ntrue\n')
-        self.assertEqual(run.stderr, b'')
+''', 'true\nfalse\ntrue\n')
+
+    def test_mode_arguments_preserve_empty_unicode_quotes_and_backslashes(self):
+        for mode in ('', 'two words', 'é🙂 device', 'a"b', 'trailing\\', '\\"quoted\\"'):
+            with self.subTest(mode=mode):
+                literal = json.dumps(mode, ensure_ascii=False)
+                self.worker_program(f'''use "workers" as workers
+use "errors" as errors
+if workers.isWorker() {{
+    let response = Bytes(1)
+    if workers.mode() == {literal} {{ response[0] = 1 }}
+    workers.reply(response)
+}} else {{
+    let worker = workers.value(workers.spawnSelf({literal}))
+    print(errors.bytesValue(workers.receive(worker, 2000))[0])
+    workers.close(worker)
+}}
+''', '1\n')
 
 
 if __name__ == '__main__':
