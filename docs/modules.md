@@ -70,7 +70,8 @@ AppKit desktop applications and needs no third-party library. On macOS,
 `./minyar` searches [`library/platform/macos`](../library/platform/macos/http.min)
 before `library`, so `use "http"` there gets an `http` with the same
 `Response`, `get`, `post` and `request` that goes through NSURLSession: it
-validates certificates and can also stream (`start`, `read`, `finished`).
+validates certificates, follows redirects, decodes chunked bodies, and can
+also stream (`start`, `read`, `finished`). The portable one does none of those.
 `./minyar --library library` picks the portable one on macOS too.
 [`json`](../library/json.min) parses and quotes JSON in Minyar itself. Some library functions are implemented
 in C or Objective-C: their body is, for example, `native "graphics"` or

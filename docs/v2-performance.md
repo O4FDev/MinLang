@@ -93,8 +93,10 @@ return at once. Programs need no change.
 
 The final window screenshots are byte-identical (same MD5).
 
-**Test.** `verifyWakeThrottle` posts 200 wake-ups over 0.2 s and requires
-between 3 and 40 returns. A mutant with the interval set to 0 fails it.
+**Test.** `verifyWakeThrottle` posts 200 wake-ups 1 ms apart from another
+thread and requires at least one return, and at most one per frame (60 a
+second) for as long as the posting takes, plus 10. A mutant with the interval
+set to 0 fails it.
 
 ### 3. Call-depth frames blocked inlining of leaf functions
 
@@ -111,11 +113,12 @@ meshing and 30 frames): `meshing.showFace` 270 samples, `terrain.get` 267,
 guard's prologue and epilogue around eight instructions of real work.
 
 **Fix.** A function whose body calls no Minyar function, and has at most 256
-locals, gets no call-depth frame. It cannot deepen recursion, and its frame
-fits in the 128 KiB reserve that its caller's check keeps
+locals, 1,024 temporaries and 1,024 labels, gets no call-depth frame. It
+cannot deepen recursion, and its frame (about 18 KiB at most, even
+unoptimized) fits in the 128 KiB reserve that its caller's check keeps
 (`MINYAR_STACK_RESERVE_BYTES`). This is the same reasoning as Go's `NOSPLIT`
-leaf functions. Calls are recognised from the emitted pieces (" @.minyar.fn."
-or a quoted module name), so the check costs nothing measurable.
+leaf functions. The parser counts the user calls it emits in each body (parser
+state slot 14), so the check costs nothing measurable.
 
 | Workload | Before | After | Change |
 | --- | ---: | ---: | ---: |
@@ -148,8 +151,16 @@ was `record_get`, `rc_borrow`, the arithmetic, `bytes_set` and `rc_step`.
 **Fix.** When the target is `record.field[...]` and the rest of the statement
 (the remaining target path and the value) contains no call, no code can run
 between reading the field and storing into it, so the borrow is omitted. The
-tokenizer only ends a statement outside brackets and after a complete line,
-so the scan cannot stop inside a multi-line expression.
+tokenizer emits no line ends inside round and square brackets, but a record
+literal's braces may span lines, so the scan ends the statement at a line end
+only outside braces.
+
+The first version missed that case. The review workflow found it: in
+`board.cells[0] = Cell {⏎ first: 1⏎ value: replace(board) }`, the line end after
+`first: 1` stopped the scan before the call. The borrow was dropped, and ASan
+reported a heap-use-after-free when `replace` swapped the List. The scan now
+tracks braces, and `tests/codegen/owned-join.min` (`storeLiteral`) requires
+the borrow there; that check fails on the earlier compiler.
 
 | Workload | Before | After | Change |
 | --- | ---: | ---: | ---: |
@@ -215,8 +226,9 @@ each comparison walked the shared prefix of module-qualified names
 **Fix.** The table needs a consistent total order, not alphabetical order, so
 `compareSymbolName` orders by length and then from the last character. Equal
 names still sort together, which the duplicate-declaration check relies on.
-The two other `compareText` callers (integer-literal range checks) keep the
-lexicographic comparison.
+The two other `compareText` callers keep the lexicographic comparison: the
+integer-literal range check and the integer dispatch lowering's ordering
+check.
 
 | Front-end compile (retired instructions) | v2 | Now | Change |
 | --- | ---: | ---: | ---: |
@@ -226,7 +238,8 @@ lexicographic comparison.
 | Atacama | 80.5M | 58.1M | -28% |
 | The compiler itself (one file) | 89.9M | 80.9M | -10% (mostly change 3) |
 
-These figures include changes 3 and 6. For change 6 alone, the generated IR
+These figures include change 3, which alone cut the compiler self-compile by
+about 10% and the other programs' compiles by 7-9%. For change 6 alone, the generated IR
 is byte-identical for all five programs.
 
 **Tests.** Byte-identical output is the main check. `check-modules` (including
@@ -432,20 +445,21 @@ merged into v2 but not pushed; the suite run on it was stopped.
   clang: about 0.4 s for a default build, and about 1 s more for `--release`
   LTO.
 
-- **Compile times.** Front-end compile of real programs, in retired
-  instructions: the compiler itself (6,159 lines) 92M; Minyarcraft 110M;
-  the Minyar-OS kernel 495M; Atacama 81M. End-to-end `./minyar` builds,
-  including clang, take 0.8 s (Minyarcraft) to 2.6 s (Atacama `--release`).
-  The OS kernel costs about 5x more per line than the compiler; that is the
-  next thing to look at if compile time ever matters.
+- **Compile times.** Before tonight, front-end compiles of real programs cost
+  92M instructions (the compiler itself, 6,159 lines), 110M (Minyarcraft),
+  495M (the Minyar-OS kernel) and 81M (Atacama). End-to-end `./minyar` builds,
+  including clang, took 0.8 s (Minyarcraft) to 2.6 s (Atacama `--release`).
+  The kernel cost about 5x more per line than the compiler, which led to
+  change 6. After changes 3, 6 and 8, see the tables in those sections.
 - **Minyar-OS** boots to the desktop in 632 ms under QEMU TCG. Its own frame
   profiler reports an average frame work of 0.2-2.3 ms against an 8 ms budget.
 
 ## Not merged: Astra cycle collection
 
 The bake-off winner was ported onto v2 on branch `port/astra-cycles`. A
-subagent then spent three rounds cutting its cost, and the branch now includes
-all of tonight's work (`ebb02ba`). The base below is v2 at the time of each
+subagent then spent three rounds cutting its cost, and the branch includes
+tonight's work up to `c986a76` (merged as `ebb02ba`); the later JSON, native
+cache, graphics and correctness commits are not on it. The base below is v2 at the time of each
 measurement.
 
 | Workload | v2 | First port | Final port |

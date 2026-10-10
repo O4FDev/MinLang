@@ -179,14 +179,14 @@ allocations. Desktop operations do not have bounded execution time.
 
 `nextEvent(timeout)` dispatches AppKit input, updates windows and selects one
 queued Minyar event. A timeout between 0 and 60 seconds returns true with `NONE`
-when no application event arrived, or as soon as an `http` request makes
-progress. Zero polls without waiting. Normally use `0.1` to `0.5` to avoid
+when no application event arrived, or when an `http` request makes progress
+(at most 60 times a second; see Background work). Zero polls without waiting. Normally use `0.1` to `0.5` to avoid
 busy-waiting while keeping application work responsive.
 
 | Kind | Source | Text |
 | --- | --- | --- |
 | `NONE` | 0 | empty |
-| `ACTION` | button, checkbox, menu item, or clickable row or column | empty |
+| `ACTION` | button, checkbox, menu item, clickable row or column, or a `list` row or row button (`clickedRow`, `clickedButton`) | empty |
 | `CHANGE` | text field, editor, or slider | text snapshot for editors; empty for sliders |
 | `SUBMIT` | text field, or editor using `submitOnEnter` | text snapshot |
 | `CLOSED` | window | empty |
