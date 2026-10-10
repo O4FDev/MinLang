@@ -23,6 +23,7 @@ largest are 1 (10x), 5 (51x on long Texts), 2 (4x), 8 (2x builds) and 4 (-32%).
 | 8 | Every macOS app build recompiled the Objective-C bridges (`macos.m` 0.46 s, `http.m` 0.12 s) | content-keyed object cache, already used for `graphics.c`, now for every native bridge | Atacama default build 0.93-1.11 s; release app 1.86-2.41 s | 0.48 s; 1.39-1.46 s | about 2x |
 | 9 | Minyarcraft's GPU vertex buffers dominated its memory (40-byte float vertices, six per quad) | 32-byte vertices (Float16 colour and light) and `graphics.updateQuads` (four vertices per quad, shared indices) | peak RSS 602 MB, footprint 892 MB, 17.30G instructions | 419 MB, 697-725 MB, 16.44G | -30% RSS, -5% instructions |
 | 11 | The compiler missed its self-compile budget: Text comparisons with literals were calls, and the 1.9 MB output was joined before being written | Inline length check for Text equality; `writeTextFile(path, List<Text>)`; a shorter call-depth guard | self-compile 80.40M instructions, 10.81 MiB; Minyarcraft 16.44G | 72.18M, 9.23 MiB; 15.74G | -10% and -15% (budget met); -4.3% |
+| 12 | Lists of a self-referential record (such as `json.Value`) could only grow by copying: `items = items.appended(v)` was quadratic | `x = x.appended(e)` moves x's owner into the append, and a List with no other owner grows in place | 500-run history, 20 parses: 1.115G; 5,000 runs, 2 parses: 3.06G | 0.836G; 0.756G | -25%; 4.0x (linear) |
 
 ### 1. Long lists rebuilt as stacks of views
 
@@ -464,6 +465,52 @@ in QEMU (612 ms).
   `writeTextFile("x", [1, 2])`.
 - `check-regressions`, `check-modules`, `check-codegen`, `check-stack-overflow`
   (with and without sanitizers), `check-examples` and `check-budget` pass.
+
+### 12. Lists of a self-referential record grew quadratically
+
+**Problem.** The language rejects `items.add(v)` when the List's element type
+can contain itself, because the mutation could close an ownership cycle ("this
+List mutation could create a reference cycle; construct a new List instead").
+Such Lists must be built with `items = items.appended(v)`, which copies the
+whole List, retaining every element, on each append. `json.parse` builds every
+array and object this way, because `json.Value` holds `items: List<Value>`.
+So parsing Atacama's history (one array of runs) was quadratic in its length.
+
+**Evidence.** `benchmarks/json/history-parse.min` parses the history response
+that Atacama's stub server sends (`benchmarks/json/history.py`) and reads each
+run's fields the way `src/api.min` does. A CPU Profiler trace put
+`minyar_list_appended` at 17% inclusive, under `parseString`'s caller, and
+much of the deferred cleanup (54%) released the copies. Ten times the runs
+cost 27 times the instructions.
+
+**Fix.** When the right side of `x = x.appended(e)` starts with the target
+local, the compiler moves x's owner into the call (the same transfer that
+`x = x + text` already used for Text). It does this after evaluating `e`,
+so `e` can still read x. The new runtime entry `minyar_list_appended_take`
+appends in place when that moved owner was the List's only one, and otherwise
+copies and releases it. A List with no other owner is not held by any record
+or List, so `e` cannot reach it: appending in place cannot form a cycle, and
+nothing can observe the change. An alias, a `for` loop over the List (which
+holds its own reference), or a List stored in a record all keep the copying
+path.
+
+| `history-parse` (3 runs each) | v2 | Now |
+| --- | ---: | ---: |
+| 500 runs (143 KB), 20 parses | 1.114G, 1.117G, 1.115G | 0.837G, 0.836G, 0.836G |
+| 5,000 runs (1.4 MB), 2 parses | 3.069G, 3.063G, 3.038G | 0.757G, 0.756G, 0.755G |
+
+Per parse, 500 runs went from 55.7M to 41.8M instructions, and 5,000 runs from
+1,530M to 378M. Ten times the runs now cost nine times as much, where they cost
+27 times before. Both versions print the same counts.
+
+**Tests.**
+- `tests/codegen/owned-join.min` FileChecks that `x = x.appended(e)` emits
+  `minyar_rc_local_move` and `minyar_list_appended_take`; this fails on the v2
+  compiler. Its output (run at O0 and O2) checks that an alias keeps the List
+  it saw, that a `for` loop iterates only the List it started with, and that
+  `x = x.appended(x[0])` reads x before consuming it.
+- The same program printed the same output under the system, eager, fixed and
+  lazy memory profiles and `--release`, and ran clean under ASan and UBSan.
 
 ## Gates
 
