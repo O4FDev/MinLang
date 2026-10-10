@@ -18,3 +18,37 @@ let strings = json.parse("{\"plain\": \"abc\", \"empty\": \"\", \"tab\": \"a\\tb
 print(json.string(strings, "plain") + "|" + Text(json.string(strings, "empty").length) + "|" + json.string(strings, "tab") + "|" + json.string(strings, "end"))
 print(json.parse("\"open").kind == json.INVALID)
 print(json.parse("\"open\\").kind == json.INVALID)
+
+// Network metadata cannot accept a valid prefix followed by another value.
+for source in ["{}null", "[]{}", "true false", "1 2", "null trailing", "\"x\" 0",
+               "01", "-01", "1.", "1e", "1e+", "1e-", ".1", "-.1",
+               "\"\\x\"", "\"\\q\"", "\"\\u12x4\"", "\"\\u123\""] {
+    if json.parse(source).kind != json.INVALID { fail("accepted malformed JSON: " + source) }
+}
+for code in 0..32 {
+    let control = Text(Character(code))
+    if json.parse("\"raw" + control + "\"").kind != json.INVALID { fail("accepted raw JSON string control") }
+}
+let escapedControls = json.parse("\"\\b\\f\"")
+if escapedControls.text != Text(Character(8)) + Text(Character(12)) { fail("JSON control escape changed data") }
+for source in ["0", "-0", "10", "-12.5", "1e0", "1E+2", "1e-2", " \n[true, false, null]\t\r"] {
+    if json.parse(source).kind == json.INVALID { fail("rejected valid JSON: " + source) }
+}
+
+// Network bytes must be validated before converting them into Text: invalid
+// UTF-8 is a recoverable parse error, rather than a runtime conversion trap.
+for wire in [Bytes(1), Bytes(2), Bytes(3), Bytes(4)] {
+    wire[0] = 255
+    if json.parseBytes(wire, 1024).kind != json.INVALID { fail("accepted invalid UTF-8") }
+}
+if json.parseBytes(Bytes("{\"é🙂\": true}"), 1024).kind != json.OBJECT { fail("rejected valid UTF-8") }
+if json.parseBytes(Bytes("null"), 3).kind != json.INVALID { fail("ignored JSON byte limit") }
+if json.parseBytes(Bytes("null"), 0).kind != json.INVALID { fail("accepted invalid JSON byte limit") }
+
+// Authentication metadata opts into unique decoded names, including nested
+// objects. Ordinary JSON keeps its existing duplicate-name policy.
+for source in ["{\"a\":1,\"a\":2}", "{\"a\":1,\"\\u0061\":2}",
+               "{\"outer\":[{\"x\":1,\"x\":2}]}"] {
+    if json.parseUnique(source).kind != json.INVALID { fail("accepted ambiguous JSON metadata") }
+}
+if json.parseUnique("{\"a\":1,\"nested\":{\"a\":2}}").kind != json.OBJECT { fail("rejected distinct JSON objects") }

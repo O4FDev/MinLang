@@ -31,7 +31,7 @@ TARGETS = ['check-toolchain-stamp', 'check-toolchain-portability', 'check-cold-b
            'check-compiler-hardening', 'check-linkage', 'check-source-map', 'check-symbol-order', 'check-list-access',
            'check-checked-arithmetic', 'check-checked-scalars',
            'check-runtime-bytes', 'check-runtime-traps', 'check-runtime-numeric',
-           'check-errors-values', 'check-net', 'check-net-loop', 'check-tls-sanitize',
+           'check-errors-values', 'check-net', 'check-net-loop', 'check-tls-sanitize', 'check-json-parser-sanitize',
            'check-ownership-policy', 'check-stack-ownership', 'check-runtime-cache',
            'check-generated-sanitizer', 'check-sanitized-fixed-point',
            'check-smoke', 'check-release-build', 'check-launcher-isolation',
