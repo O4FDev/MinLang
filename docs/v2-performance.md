@@ -1,12 +1,15 @@
 # v2 performance work (2026-10-10)
 
-What limits real Minyar programs, ranked by measured gain. Each entry gives
-the problem, the evidence, the fix and the before/after numbers. Instruction
-counts are retired instructions of the application process (`proc_pid_rusage`
-or `/usr/bin/time -l`). They are steadier than wall time on this shared,
-heavily loaded machine; the load average was 30-76 throughout.
+What limited the real Minyar programs (the Atacama desktop app, Minyarcraft,
+Minyar-OS and the compiler itself), found by profiling them, in the order the
+fixes were made. Each entry gives the problem, the evidence, the fix, the
+before/after numbers and the test. Instruction counts are retired
+instructions of the application process (`proc_pid_rusage` or
+`/usr/bin/time -l`). They are steadier than wall time on this shared, heavily
+loaded machine; the load average was 30-76 throughout. By size of gain, the
+largest are 1 (10x), 5 (51x on long Texts), 2 (4x), 8 (2x builds) and 4 (-32%).
 
-## Ranked results
+## Results
 
 | # | Problem | Fix | Before | After | Gain |
 | --- | --- | --- | --- | --- | --- |
@@ -18,6 +21,7 @@ heavily loaded machine; the load average was 30-76 throughout.
 | 6 | Compiling multi-module programs spent 27% of its time comparing symbol names character by character | symbol tables ordered by length, then from the last character | OS kernel compile 485M; Minyarcraft 109M; Atacama 80.5M | 342M; 71.4M; 58.1M | -28% to -35% |
 | 7 | `json.parse` built every string from a parts list, a slice and a join | one slice when a string has no escapes | 20 parses of a 143 KB history response 1.22G | 0.95G | -22% |
 | 8 | Every macOS app build recompiled the Objective-C bridges (`macos.m` 0.46 s, `http.m` 0.12 s) | content-keyed object cache, already used for `graphics.c`, now for every native bridge | Atacama default build 0.93-1.11 s; release app 1.86-2.41 s | 0.48 s; 1.39-1.46 s | about 2x |
+| 9 | Minyarcraft's GPU vertex buffers dominated its memory (40-byte float vertices, six per quad) | 32-byte vertices (Float16 colour and light) and `graphics.updateQuads` (four vertices per quad, shared indices) | peak RSS 602 MB, footprint 892 MB, 17.30G instructions | 419 MB, 697-725 MB, 16.44G | -30% RSS, -5% instructions |
 
 ### 1. Long lists rebuilt as stacks of views
 
@@ -89,8 +93,10 @@ return at once. Programs need no change.
 
 The final window screenshots are byte-identical (same MD5).
 
-**Test.** `verifyWakeThrottle` posts 200 wake-ups over 0.2 s and requires
-between 3 and 40 returns. A mutant with the interval set to 0 fails it.
+**Test.** `verifyWakeThrottle` posts 200 wake-ups 1 ms apart from another
+thread and requires at least one return, and at most one per frame (60 a
+second) for as long as the posting takes, plus 10. A mutant with the interval
+set to 0 fails it.
 
 ### 3. Call-depth frames blocked inlining of leaf functions
 
@@ -107,11 +113,12 @@ meshing and 30 frames): `meshing.showFace` 270 samples, `terrain.get` 267,
 guard's prologue and epilogue around eight instructions of real work.
 
 **Fix.** A function whose body calls no Minyar function, and has at most 256
-locals, gets no call-depth frame. It cannot deepen recursion, and its frame
-fits in the 128 KiB reserve that its caller's check keeps
+locals, 1,024 temporaries and 1,024 labels, gets no call-depth frame. It
+cannot deepen recursion, and its frame (about 18 KiB at most, even
+unoptimized) fits in the 128 KiB reserve that its caller's check keeps
 (`MINYAR_STACK_RESERVE_BYTES`). This is the same reasoning as Go's `NOSPLIT`
-leaf functions. Calls are recognised from the emitted pieces (" @.minyar.fn."
-or a quoted module name), so the check costs nothing measurable.
+leaf functions. The parser counts the user calls it emits in each body (parser
+state slot 14), so the check costs nothing measurable.
 
 | Workload | Before | After | Change |
 | --- | ---: | ---: | ---: |
@@ -144,8 +151,16 @@ was `record_get`, `rc_borrow`, the arithmetic, `bytes_set` and `rc_step`.
 **Fix.** When the target is `record.field[...]` and the rest of the statement
 (the remaining target path and the value) contains no call, no code can run
 between reading the field and storing into it, so the borrow is omitted. The
-tokenizer only ends a statement outside brackets and after a complete line,
-so the scan cannot stop inside a multi-line expression.
+tokenizer emits no line ends inside round and square brackets, but a record
+literal's braces may span lines, so the scan ends the statement at a line end
+only outside braces.
+
+The first version missed that case. The review workflow found it: in
+`board.cells[0] = Cell {⏎ first: 1⏎ value: replace(board) }`, the line end after
+`first: 1` stopped the scan before the call. The borrow was dropped, and ASan
+reported a heap-use-after-free when `replace` swapped the List. The scan now
+tracks braces, and `tests/codegen/owned-join.min` (`storeLiteral`) requires
+the borrow there; that check fails on the earlier compiler.
 
 | Workload | Before | After | Change |
 | --- | ---: | ---: | ---: |
@@ -211,8 +226,9 @@ each comparison walked the shared prefix of module-qualified names
 **Fix.** The table needs a consistent total order, not alphabetical order, so
 `compareSymbolName` orders by length and then from the last character. Equal
 names still sort together, which the duplicate-declaration check relies on.
-The two other `compareText` callers (integer-literal range checks) keep the
-lexicographic comparison.
+The two other `compareText` callers keep the lexicographic comparison: the
+integer-literal range check and the integer dispatch lowering's ordering
+check.
 
 | Front-end compile (retired instructions) | v2 | Now | Change |
 | --- | ---: | ---: | ---: |
@@ -222,7 +238,8 @@ lexicographic comparison.
 | Atacama | 80.5M | 58.1M | -28% |
 | The compiler itself (one file) | 89.9M | 80.9M | -10% (mostly change 3) |
 
-These figures include changes 3 and 6. For change 6 alone, the generated IR
+These figures include change 3, which alone cut the compiler self-compile by
+about 10% and the other programs' compiles by 7-9%. For change 6 alone, the generated IR
 is byte-identical for all five programs.
 
 **Tests.** Byte-identical output is the main check. `check-modules` (including
@@ -283,7 +300,63 @@ source or the flags must each produce a new object, and no temporary files
 may be left behind. `tests/native-graphics.py` and a Minyarcraft build still
 pass.
 
-### 9. Two competing `http` packages
+### 9. Mesh vertices were 40 bytes of Float32
+
+**Problem.** `craft --screenshot` peaks at about 600 MB of RSS and an 892 MB
+memory footprint. The world itself is 21 MB of blocks, so most of the rest is
+the 1,024 chunk meshes uploaded with `glBufferData`. Each vertex was ten
+Float32 values, and each quad is six vertices.
+
+**Fix.** Mesh vertices are 32 bytes. Position and texture coordinates stay
+Float32, so atlases up to 8192 px keep exact texel positions. Colour, sky and
+glow become Float16, which still holds values above 1 and is far finer than
+8-bit display. Lines keep their ten-Float32 layout. The conversion uses the
+processor's half-precision conversion where the compiler has `_Float16`; a
+portable round-to-nearest-even routine (`runtime/native/half-float.h`) is the
+fallback. Indexed quads (four vertices instead of six) would save more, but
+they would change the `graphics` API, so they are left for later.
+
+| `craft --screenshot noon` (3 runs) | Before | After |
+| --- | ---: | ---: |
+| Peak RSS | 602, 603, 602 MB | 447, 450, 523 MB |
+| Peak memory footprint | 892, 892, 897 MB | 815, 815, 844 MB |
+| Retired instructions | 17.31G, 17.29G, 17.30G | 17.24G, 17.22G, 17.21G |
+
+A first version that converted in software everywhere cost +6% instructions
+(18.33G), which is why the hardware path is used where available.
+
+**Quads.** Every chunk face is a quad, but meshes were plain triangle lists,
+six vertices per quad. `graphics.updateQuads(mesh, vertices)` takes four
+vertices per quad, a b c d, and draws a b c and a c d through one shared
+index buffer that grows to the largest quad mesh. Minyarcraft's `quad()`
+emits four vertices: starting at b instead of a picks the other diagonal, as
+its ambient-occlusion split needs. The sky meshes stay triangles.
+
+| `craft --screenshot noon` (3 runs) | 40-byte triangles | 32-byte triangles | 32-byte quads |
+| --- | ---: | ---: | ---: |
+| Peak RSS | 602-603 MB | 447-523 MB | 419 MB (all 3 runs) |
+| Peak memory footprint | 892-897 MB | 815-844 MB | 697-725 MB |
+| Retired instructions | 17.29-17.31G | 17.21-17.24G | 16.43-16.45G |
+
+`tests/graphics-render.py` (`check-graphics-render`, macOS desktop) renders
+the fixed scene twice as triangles and once as quads. It requires the two
+triangle renders to be identical and the quad render to be identical to
+them, and an incomplete quad must stop with "four vertices per quad".
+
+**Tests.**
+- `benchmarks/desktop/render-check.min` draws a fixed scene with a range of
+  colours, sky and glow; two runs of one build give identical PNGs. Against
+  the 40-byte build, the largest difference in any colour channel is 1/255,
+  on 0.4% of bytes, from half-precision rounding. The Minyarcraft screenshot
+  looks the same, selection lines included.
+- `tests/half-float.c` (`check-half-float`, part of `check` and
+  `check-portable`) compares the software conversion with `_Float16` for one
+  float32 bit pattern in 13 and every exactly representable half. Run with
+  `all`, it checks all 2^32 values; they all match. A mutant without
+  ties-to-even fails with 2,363 mismatches.
+- `tests/native-graphics.py` passes.
+
+### 10. Two competing `http` packages
 
 Not a speed fix, but one of the limits the brief named. appkit's NSURLSession
 `http` and minyar-os's portable socket/TLS `http` both arrived in v2 under the
@@ -348,6 +421,15 @@ merged into v2 but not pushed; the suite run on it was stopped.
   10.55 MB peak footprint (the compiler's arena dominates). That is within
   noise, so it was reverted.
 
+## Measured and not pursued
+
+- **Record field bounds checks.** `minyar_record_get` checks the field index
+  on every read, although the compiler always emits a valid one. Removing the
+  check in a variant build took Minyarcraft from 17.30G to 16.69G
+  instructions (-3.6%). It stays: it is part of the runtime's hardening and
+  turns a compiler or layout mismatch into a clean stop instead of memory
+  corruption.
+
 ## Measured and not a bottleneck
 
 - **Atacama start-up.** Launch, session check, loading and parsing 500 runs,
@@ -363,20 +445,21 @@ merged into v2 but not pushed; the suite run on it was stopped.
   clang: about 0.4 s for a default build, and about 1 s more for `--release`
   LTO.
 
-- **Compile times.** Front-end compile of real programs, in retired
-  instructions: the compiler itself (6,159 lines) 92M; Minyarcraft 110M;
-  the Minyar-OS kernel 495M; Atacama 81M. End-to-end `./minyar` builds,
-  including clang, take 0.8 s (Minyarcraft) to 2.6 s (Atacama `--release`).
-  The OS kernel costs about 5x more per line than the compiler; that is the
-  next thing to look at if compile time ever matters.
+- **Compile times.** Before tonight, front-end compiles of real programs cost
+  92M instructions (the compiler itself, 6,159 lines), 110M (Minyarcraft),
+  495M (the Minyar-OS kernel) and 81M (Atacama). End-to-end `./minyar` builds,
+  including clang, took 0.8 s (Minyarcraft) to 2.6 s (Atacama `--release`).
+  The kernel cost about 5x more per line than the compiler, which led to
+  change 6. After changes 3, 6 and 8, see the tables in those sections.
 - **Minyar-OS** boots to the desktop in 632 ms under QEMU TCG. Its own frame
   profiler reports an average frame work of 0.2-2.3 ms against an 8 ms budget.
 
 ## Not merged: Astra cycle collection
 
 The bake-off winner was ported onto v2 on branch `port/astra-cycles`. A
-subagent then spent three rounds cutting its cost, and the branch now includes
-all of tonight's work (`ebb02ba`). The base below is v2 at the time of each
+subagent then spent three rounds cutting its cost, and the branch includes
+tonight's work up to `c986a76` (merged as `ebb02ba`); the later JSON, native
+cache, graphics and correctness commits are not on it. The base below is v2 at the time of each
 measurement.
 
 | Workload | v2 | First port | Final port |

@@ -557,3 +557,11 @@ check-native-cache:
 
 check: check-native-cache
 check-portable: check-native-cache
+
+.PHONY: check-half-float
+check-half-float: | build
+	$(LIMITED) "$(LLVM_CC)" -O2 -Wall -Wextra -Werror tests/half-float.c -o build/half-float
+	$(LIMITED) ./build/half-float
+
+check: check-half-float
+check-portable: check-half-float

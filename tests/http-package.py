@@ -77,6 +77,7 @@ true
 200 application/x-ndjson café done true
 true cancelled
 0 true
+0 only http:// and https:// URLs are supported: localhost:8080/health
 '''
 assert result.returncode == 0 and result.stdout == expected, (result.stdout, result.stderr)
 print('http requests, headers, Unicode bodies, streaming, cancellation and failures verified')
