@@ -82,4 +82,22 @@ with tempfile.TemporaryDirectory(prefix='minyar-packaging-') as directory:
     result = package(identifier='org.minyar.updated'); assert result.returncode == 0,result.stderr
     assert plistlib.loads((app/'Contents/Info.plist').read_bytes())['CFBundleIdentifier'] == 'org.minyar.updated'
     subprocess.run(['codesign','--verify','--strict',str(app)],check=True)
-print('macOS bundle replacement, signing failure, locks, symlinks and Unicode metadata verified')
+    # Icons and resources are copied into the bundle and covered by its signature.
+    icon = temp/'Icon.icns'
+    subprocess.run(['sips','-s','format','icns','/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/GenericApplicationIcon.icns',
+                    '--out',str(icon)],check=True,capture_output=True)
+    resources = temp/'resources'; (resources/'fonts').mkdir(parents=True); (resources/'fonts/Note.txt').write_text('bundled é')
+    def package_with(*extra):
+        return subprocess.run([sys.executable,str(ROOT/'scripts/macos-app.py'),'--binary',str(binary),'--output',str(app),
+                               '--identifier','org.minyar.resources',*extra],text=True,capture_output=True,timeout=30)
+    result = package_with('--icon',str(icon),'--resources',str(resources)); assert result.returncode == 0,result.stderr
+    assert plistlib.loads((app/'Contents/Info.plist').read_bytes())['CFBundleIconFile'] == 'Icon.icns'
+    assert (app/'Contents/Resources/Icon.icns').read_bytes() == icon.read_bytes()
+    assert (app/'Contents/Resources/fonts/Note.txt').read_text() == 'bundled é'
+    subprocess.run(['codesign','--verify','--strict',str(app)],check=True)
+    (temp/'icon.png').write_bytes(b'png')
+    result = package_with('--icon',str(temp/'icon.png')); assert result.returncode != 0 and '.icns' in result.stderr
+    (resources/'Icon.icns').write_bytes(b'clash')
+    result = package_with('--icon',str(icon),'--resources',str(resources)); assert result.returncode != 0 and 'would replace' in result.stderr
+    assert (app/'Contents/Resources/fonts/Note.txt').read_text() == 'bundled é'
+print('macOS bundle replacement, signing failure, locks, symlinks, icons, resources and Unicode metadata verified')

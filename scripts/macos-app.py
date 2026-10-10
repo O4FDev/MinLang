@@ -10,13 +10,23 @@ import subprocess
 import tempfile
 
 
-def package(binary, output, identifier):
+def package(binary, output, identifier, icon=None, resources=None):
     output = Path(os.path.abspath(output))
     if output.suffix != '.app' or not output.stem:
         raise ValueError('application output must have a name ending in .app')
     if not re.fullmatch(r'[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+', identifier):
         raise ValueError('bundle ID must be a dotted identifier using letters, digits, and hyphens')
     binary = Path(binary).resolve(strict=True)
+    if icon is not None:
+        icon = Path(icon).resolve(strict=True)
+        if icon.suffix != '.icns' or not icon.is_file():
+            raise ValueError('the application icon must be an .icns file')
+    if resources is not None:
+        resources = Path(resources).resolve(strict=True)
+        if not resources.is_dir():
+            raise ValueError('application resources must be a directory')
+        if (resources / '.minyar-app').exists() or (icon is not None and (resources / icon.name).exists()):
+            raise ValueError('application resources would replace a file the packager writes')
     load_commands = subprocess.run(['otool', '-l', str(binary)], check=True,
                                    text=True, capture_output=True).stdout
     versions = re.findall(r'^\s*minos (\d+(?:\.\d+)*)\s*$', load_commands, re.MULTILINE)
@@ -46,6 +56,9 @@ def package(binary, output, identifier):
             executable = contents / 'MacOS' / 'application'
             shutil.copyfile(binary, executable)
             executable.chmod(0o755)
+            if resources is not None:
+                # Follow symlinks so the bundle is self-contained.
+                shutil.copytree(resources, contents / 'Resources', symlinks=False, dirs_exist_ok=True)
             info = {
                 'CFBundleDevelopmentRegion': 'en',
                 'CFBundleExecutable': 'application',
@@ -60,6 +73,9 @@ def package(binary, output, identifier):
                 'NSHighResolutionCapable': True,
                 'NSPrincipalClass': 'NSApplication',
             }
+            if icon is not None:
+                shutil.copyfile(icon, contents / 'Resources' / icon.name)
+                info['CFBundleIconFile'] = icon.name
             (contents / 'Info.plist').write_bytes(plistlib.dumps(info))
             (contents / 'Resources/.minyar-app').write_text('Minyar generated application bundle v1\n')
             subprocess.run(['codesign', '--force', '--sign', '-', str(stage)], check=True,
@@ -91,9 +107,11 @@ def main():
     parser.add_argument('--binary', required=True)
     parser.add_argument('--output', required=True)
     parser.add_argument('--identifier', required=True)
+    parser.add_argument('--icon')
+    parser.add_argument('--resources')
     args = parser.parse_args()
     try:
-        package(args.binary, args.output, args.identifier)
+        package(args.binary, args.output, args.identifier, args.icon, args.resources)
     except (ValueError, OSError, subprocess.CalledProcessError) as error:
         detail = getattr(error, 'stderr', '') or ''
         if isinstance(detail, bytes):

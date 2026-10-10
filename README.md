@@ -71,9 +71,10 @@ Build the AppKit notes example, with native text editing, menus and file dialogs
 open "build/Minyar Notes.app"
 ```
 
-The `macos` package provides windows, layout, controls and an event loop directly
-in Minyar. See the [macOS guide](docs/macos.md) for APIs, ownership, packaging,
-and the Swift-to-AppKit ABI investigation.
+The `macos` package provides windows, layout, styling, controls and an event loop
+directly in Minyar, and the `http` and `json` packages talk to web services. See
+the [macOS guide](docs/macos.md) for APIs, ownership, packaging (including
+`--icon` and `--resources`), and the Swift-to-AppKit ABI investigation.
 
 An experimental native SwiftUI compiler frontend is also available. First build
 the pinned compiler using the [native frontend guide](docs/native-frontend.md), then:

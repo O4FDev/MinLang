@@ -24,9 +24,11 @@ the same source builds a directly executable desktop program. `--app` appends
 `.app` to the output name if needed, creates `Contents/MacOS/application` and
 `Info.plist`, and applies and verifies an ad-hoc signature for local execution.
 Use your own `--bundle-id` for each application; the default is
-`org.minyar.application`. It is not a Developer ID distribution or notarization
-workflow. Icons, entitlements, universal binaries and App Store packaging are
-not supplied yet.
+`org.minyar.application`. `--icon FILE.icns` sets the application icon and
+`--resources DIR` copies a directory's contents into `Contents/Resources`, for
+example fonts that the application registers with `registerFont`. It is not a
+Developer ID distribution or notarization workflow. Entitlements, universal
+binaries and App Store packaging are not supplied yet.
 
 Existing Minyar-generated bundles can be rebuilt. The packager constructs and
 signs a complete replacement before moving the old bundle aside, and restores
@@ -81,13 +83,57 @@ are process-local; do not serialize them or share them between processes.
 | --- | --- | --- |
 | Application | `initialize`, `nextEvent`, `quit` | NSApplication and its delegate |
 | Windows | `window`, `show`, `close`, `destroy`, `width`, `height` | NSWindow |
-| Layout | `column`, `row`, `padding`, `size` | NSStackView, NSLayoutConstraint |
-| Controls | `label`, `button`, `textField`, `textEditor`, `checkbox`, `slider`, `separator` | NSTextField, NSButton, NSTextView/NSScrollView, NSSlider, NSBox |
-| Properties | `text`, `setText`, `enabled`, `checked`, `setChecked`, `value`, `setValue` | AppKit properties |
-| Menus | `menu`, `menuItem` | NSMenu, NSMenuItem, target/action |
+| Windows | `minimumSize`, `transparentTitlebar`, `autosave`, `capture` | NSWindow, frame autosave |
+| Layout | `column`, `row`, `scroll`, `view`, `spacer`, `padding`, `insets`, `size`, `minimumSize`, `maximumSize`, `fill`, `grow`, `align`, `gravity`, `spaceAfter`, `hidden`, `clear`, `remove`, `scrollToTop` | NSStackView, NSScrollView, NSLayoutConstraint |
+| Controls | `label`, `button`, `plainButton`, `link`, `textField`, `secureField`, `textEditor`, `checkbox`, `slider`, `separator`, `spinner`, `shape` | NSTextField, NSButton, NSSecureTextField, NSTextView/NSScrollView, NSSlider, NSBox, NSProgressIndicator, NSBezierPath |
+| Properties | `text`, `setText`, `enabled`, `checked`, `setChecked`, `value`, `setValue`, `placeholder`, `maxLength`, `focus`, `selectable`, `tooltip`, `accessibilityLabel` | AppKit properties |
+| Text input | `plain`, `autoHeight`, `submitOnEnter` | NSTextView delegate |
+| Styling | `color`, `background`, `border`, `cornerRadius`, `focusBorder`, `textColor`, `hover`, `font`, `letterSpacing`, `lineHeight`, `lines`, `textAlign`, `symbol` | Dynamic NSColor, CALayer, NSFont/CoreText, SF Symbols |
+| Interaction | `clickable`, `draggable` | Tracking areas, window dragging, accessibility press |
+| Menus | `menu`, `menuItem`, `menuSeparator` | NSMenu, NSMenuItem, target/action |
 | Events | `eventType`, `eventSource`, `eventText` | Queued delegate and target/action events |
-| System UI | `openFile`, `saveFile`, `alert` | NSOpenPanel, NSSavePanel, NSAlert |
+| System UI | `openFile`, `saveFile`, `alert`, `confirm`, `aboutText`, `showAbout`, `openURL` | NSOpenPanel, NSSavePanel, NSAlert, About panel, NSWorkspace |
+| Application | `appearance`, `isDark`, `setting`, `setSetting`, `resource`, `registerFont`, `seconds` | NSAppearance, NSUserDefaults, NSBundle, CTFontManager |
 | Clipboard | `clipboardText`, `setClipboardText` | NSPasteboard |
+
+## Building full applications
+
+The Atacama desktop client, a separate project, is a complete application built
+with these functions: a header in a transparent title bar, a scrolling playground,
+a sidebar, forms, menus and streamed network responses from the
+[`http`](../library/http.min) package.
+
+**Layout.** Rows and columns are stack views. `fill` stretches a view across
+its parent (rows: down; columns: across) inside the parent's insets, `grow`
+gives a view the room left along its parent, and `spacer` adds an empty view
+that grows. `maximumSize` caps a filled view, so `align(column, mac.CENTER)`
+and a capped, filled child give a centered column of readable width. Views
+added to a stack join its START area; `gravity(view, mac.CENTER)` moves one to
+the middle, which centers it vertically in a `scroll` view whose content is
+shorter than the window. `hidden` views take no space, so pages can share one
+scroll view and be switched by hiding the others. Content never resizes its
+window: windows keep the size given to `window`, `autosave` or the person.
+
+**Styling.** `color(dark, light, opacity)` makes a color that follows the
+application's appearance, so `appearance(mac.DARK)` or `appearance(mac.LIGHT)`
+restyles every view without further calls. Fonts are families such as one in a
+bundled file registered with `registerFont(resource("fonts/Name.ttf"))`;
+variable fonts use the requested weight exactly. Labels wrap with
+`lines(label, 0)` and truncate with `lines(label, 1)`.
+
+**Rebuilding content.** Lists such as search results are rebuilt with `clear`
+followed by new children. `clear` and `remove` end the handles of everything
+they remove; keep the new handles to recognise their events.
+
+**Text input.** `plain` removes an input's own bezel so a styled container can
+draw it; `focusBorder` on the container shows focus. Editors can size to their
+text with `autoHeight`, and `submitOnEnter` turns Return into `SUBMIT` while
+Shift-Return adds a line, as in chat applications. Text fields always enqueue
+`SUBMIT` on Return.
+
+**Background work.** A program waiting in `nextEvent` returns early, with
+`NONE`, when an `http` request receives data or finishes, so a streamed reply
+appears as it arrives without polling quickly.
 
 A window owns its entire control tree, including nested rows and columns.
 Attach one root view to a window, then add controls to rows or columns. Layout
@@ -117,14 +163,16 @@ allocations. Desktop operations do not have bounded execution time.
 
 `nextEvent(timeout)` dispatches AppKit input, updates windows and selects one
 queued Minyar event. A timeout between 0 and 60 seconds returns true with `NONE`
-when no application event arrived. Zero polls without waiting. Normally use
-`0.1` to avoid busy-waiting while keeping application work responsive.
+when no application event arrived, or as soon as an `http` request makes
+progress. Zero polls without waiting. Normally use `0.1` to `0.5` to avoid
+busy-waiting while keeping application work responsive.
 
 | Kind | Source | Text |
 | --- | --- | --- |
 | `NONE` | 0 | empty |
-| `ACTION` | button, checkbox, or menu item | empty |
+| `ACTION` | button, checkbox, menu item, or clickable row or column | empty |
 | `CHANGE` | text field, editor, or slider | text snapshot for editors; empty for sliders |
+| `SUBMIT` | text field, or editor using `submitOnEnter` | text snapshot |
 | `CLOSED` | window | empty |
 | `RESIZED` | window | empty |
 | `QUIT` | 0 | empty |
@@ -145,7 +193,9 @@ when its window closes. Quit cancellation and asynchronous sheet dialogs are
 not implemented. File dialogs and alerts are modal; an empty path means Cancel.
 The application must handle file I/O errors according to Minyar's existing file
 API behavior. A standard Edit menu supplies cut/copy/paste, select-all and
-undo/redo through AppKit's responder chain.
+undo/redo through AppKit's responder chain. `initialize` also installs the
+application menu (About, Hide and Quit) and a Window menu; `menu` places
+"File" first, "Help" last and other menus before Window.
 
 ## Deriving the bridge from Swift
 
@@ -190,10 +240,16 @@ and [event dispatch](https://developer.apple.com/documentation/appkit/nsapplicat
 
 Run `make check-macos` in a logged-in macOS desktop session. The suite verifies
 Swift selector lowering, actual native target/action and delegate delivery,
-multiple windows, destroyed handles, wrong object types, main-thread checks,
+multiple windows, application views (content that never resizes its window,
+capped columns, auto-sizing editors, Return to submit, length limits,
+clickable rows, appearances and clearing content), destroyed handles, wrong object types, main-thread checks,
 Unicode round trips, event snapshots, native sanitizer execution, Minyar scalar
 ABI and Text ownership, debug/release builds, all memory profiles, signed app
 bundles, and preservation of existing outputs on packaging failures.
+
+`make check-http` runs the `http` package against a local server: status and
+headers, Unicode bodies, a character split between streamed packets,
+cancellation and connection failures.
 
 `check-macos` is separate from portable/headless gates because it opens native
 windows. The Swift probe requires `swiftc` for verification only; application

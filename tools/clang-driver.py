@@ -268,6 +268,14 @@ def main():
                  '-fobjc-arc', '-fmodules', '-c', str(project / 'runtime/native/macos.m'),
                  '-o', str(native_object)])
             native += [str(native_object), '-framework', 'AppKit']
+        elif library == 'http':
+            if platform.system() != 'Darwin':
+                raise ValueError('the http package currently requires macOS and the Apple command-line tools')
+            native_object = Path(llvm).parent / 'http.o'
+            run([clang, *flags('MINYAR_NATIVE_FLAGS', shlex.join(link_flags)),
+                 '-fobjc-arc', '-fmodules', '-c', str(project / 'runtime/native/http.m'),
+                 '-o', str(native_object)])
+            native += [str(native_object), '-framework', 'AppKit']
         else:
             raise ValueError(f'the program uses an unknown native library: {library}')
     lto = lto_flags(clang, link_flags) if release == '1' else []
