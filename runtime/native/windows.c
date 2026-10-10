@@ -608,7 +608,10 @@ void minyar_windows_appendText(long long handle, const MinyarText *text) {
     DWORD first = 0, last = 0;
     SendMessageW(w->handle, EM_GETSEL, (WPARAM)&first, (LPARAM)&last);
     w->suppress++;
-    SendMessageW(w->handle, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+    /* A negative start only clears selection at its existing caret. Select the
+     * actual UTF-16 end so appending never inserts before the current text. */
+    int end = GetWindowTextLengthW(w->handle);
+    SendMessageW(w->handle, EM_SETSEL, (WPARAM)end, (LPARAM)end);
     SendMessageW(w->handle, EM_REPLACESEL, FALSE, (LPARAM)value);
     SendMessageW(w->handle, EM_SETSEL, first, last);
     w->suppress--;
