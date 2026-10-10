@@ -117,13 +117,17 @@ if workers.isWorker() {
 ''', '1\n3\n0\n1\nfalse\nfalse\n')
 
     def test_backpressure_accepts_no_partial_frame_and_close_releases_queue(self):
-        waiting = self.directory / 'waiting worker é.c'
+        # MinGW's driver can corrupt non-ASCII intermediate object filenames.
+        # Compile an ASCII fixture, then test the actual Unicode executable path.
+        waiting = self.directory / 'waiting-worker.c'
         waiting.write_text('#ifdef _WIN32\n#include <windows.h>\nint main(void) { Sleep(INFINITE); }\n'
                            '#else\n#include <unistd.h>\nint main(void) { for (;;) pause(); }\n#endif\n')
-        child = waiting.with_suffix('.exe')
-        compiled = self.evidence.run([CLANG, '-std=c11', '-O2', str(waiting), '-o', str(child)],
+        built = waiting.with_suffix('.exe')
+        compiled = self.evidence.run([CLANG, '-std=c11', '-O2', str(waiting), '-o', str(built)],
             capture_output=True, text=True, timeout=30, phase='compile-idle-worker')
         self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        child = self.directory / 'waiting worker é.exe'
+        built.rename(child)
         self.worker_program(f'''use "workers" as workers
 use "errors" as errors
 let worker = workers.value(workers.spawn({json.dumps(native_path(child), ensure_ascii=False)}, "blocked"))

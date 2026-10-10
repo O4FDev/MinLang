@@ -39,7 +39,7 @@ check-isolated-workers-sanitize: build/minyarc-sanitize build/minyar-default-run
 # The pre-existing type-reachability oracles now require parsed feature
 # dispatch for cyclic cases; all acyclic and invalid-type cases are retained.
 check-recursive-data check-bounded check-ownership check-adversarial check-peer-regressions check-peer-optimizations check-peer-sanitize check-peer-ownership: build/minyarc-callbacks
-check-recursive-data check-bounded check-peer-sanitize check-sanitize: build/minyarc-callbacks-sanitize
+check-recursive-data check-bounded check-peer-sanitize check-peer-ownership check-sanitize: build/minyarc-callbacks-sanitize
 
 check-portable check: check-feature-dispatch check-managed-graphs check-managed-graphs-launcher check-callbacks check-callback-domains check-isolated-workers
 check-sanitize: check-managed-graphs-sanitize check-callbacks-sanitize check-managed-graphs-profiles check-isolated-workers-sanitize
