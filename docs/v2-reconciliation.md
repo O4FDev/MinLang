@@ -99,10 +99,14 @@ cycles within a bounded amount of work.
   it retired 15.46G instructions, against Astra's 2.85G and the baseline's
   2.51G.
 
-**Astra is ported into v2.** The compiler moved from `src/` to `compiler/` and
-the runtime was rewritten after the bake-off, so the port was done by hand, not
-with `git merge`. The result is recorded as a merge of `2905dcc`. The
-measurements taken after the port are in v2-performance.md.
+**Astra is ported, but not merged into v2.** The compiler moved from `src/`
+to `compiler/` and the runtime was rewritten after the bake-off, so the port
+was done by hand on branch `port/astra-cycles` (recorded as a merge of
+`2905dcc`). On v2 it made programs that never form a cycle slower: up to +23%
+instructions and +76% peak memory at first. After two rounds of work (cycle
+metadata only for types that can reach themselves, and a smaller header) the
+remaining cost is in v2-performance.md. Merging means accepting that cost in
+exchange for supporting cyclic data, so it is left as a decision.
 
 **Left out:**
 - `bakeoff/sol-cycles`, for the broken work bound and the 3.8-12x cost on
