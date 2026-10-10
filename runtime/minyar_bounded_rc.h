@@ -43,7 +43,7 @@ static void rc_bounded_save_cursor(RcObject *object, size_t cursor) {
 }
 
 /* A dead RC_TRACED object frees from its cycle metadata. */
-static MINYAR_COLD void rc_bounded_finish_traced(RcObject *object) {
+static inline void rc_bounded_finish_traced(RcObject *object) {
     RcCycle *cycle = rc_cycle_metadata(object);
     if (cycle->record) {
 #ifdef MINYAR_RC_TESTING
@@ -99,7 +99,7 @@ static void rc_bounded_enqueue(RcObject *object) {
 
 /* Count drop of an RC_TRACED object: the same work as rc_drop, plus the
  * collector's snapshot barriers, gray pinning and registry removal. */
-static MINYAR_COLD unsigned rc_drop_traced(RcObject *object) {
+static inline unsigned rc_drop_traced(RcObject *object) {
     rc_cycle_before_drop(object);
     object->ownership -= 8;
     if (object->ownership >> 3) { rc_cycle_after_drop(object); return 0; }
@@ -159,7 +159,7 @@ static unsigned rc_drop(void *value) {
 /* Visit field `cursor` of a dead RC_TRACED object as one unit, removing its
  * incoming edge first; returns 0 once every field was visited. A recent task
  * saves its cursor before the drop, exactly as the untraced paths do. */
-static MINYAR_COLD int rc_bounded_traced_visit(RcObject *object, size_t cursor, int recent) {
+static MINYAR_NOINLINE int rc_bounded_traced_visit(RcObject *object, size_t cursor, int recent) {
     RcCycle *cycle = rc_cycle_metadata(object);
     void *child;
     if (cycle->record) {
@@ -449,7 +449,7 @@ static inline __attribute__((always_inline)) size_t rc_bounded_poll_body(size_t 
     return work;
 }
 
-static MINYAR_COLD size_t rc_bounded_poll_traced(size_t budget) {
+static MINYAR_NOINLINE size_t rc_bounded_poll_traced(size_t budget) {
     return rc_bounded_poll_body(budget, 1);
 }
 

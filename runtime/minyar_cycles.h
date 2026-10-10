@@ -48,7 +48,7 @@ void minyar_rc_enable_cycles(void) {
 #ifdef MINYAR_RC_TESTING
 static size_t rc_cycle_units, rc_cycle_epochs;
 #endif
-static MINYAR_COLD void rc_cycle_unit(void);
+static MINYAR_NOINLINE void rc_cycle_unit(void);
 #ifndef MINYAR_BOUNDED_RC
 static void rc_cycle_eager_service(size_t budget);
 #endif

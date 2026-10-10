@@ -114,7 +114,7 @@ static void rc_cycle_unit_body(void) {
         rc_drop(rc_cycle_object(cycle) + 1);
     }
 }
-static MINYAR_COLD void rc_cycle_unit(void) {
+static MINYAR_NOINLINE void rc_cycle_unit(void) {
     rc_cycle_inside = 1;
     rc_cycle_unit_body();
     rc_cycle_inside = 0;
