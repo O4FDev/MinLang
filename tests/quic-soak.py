@@ -95,10 +95,11 @@ def main():
     parser.add_argument('--server-only', action='store_true', help='independent peer runs on another remote host')
     parser.add_argument('--front-address', default='127.0.0.1')
     parser.add_argument('--fixtures', type=Path, help='retain disposable test certificates for the remote peer')
+    parser.add_argument('--setup-grace-seconds', type=int, default=0, help='bounded staggered handshake setup allowance')
     options = parser.parse_args()
     if platform.system() != 'Linux' or os.environ.get('MINYAR_REMOTE_LOAD') != '1':
         parser.error('sustained load requires remote Linux execution with MINYAR_REMOTE_LOAD=1')
-    if options.duration < 1 or not 1 <= options.peers <= 1024 or options.interval_ms < 1 or not 0 <= options.loss < 1 or not 0 <= options.reorder < 1:
+    if options.duration < 1 or not 1 <= options.peers <= 16384 or options.interval_ms < 1 or not 0 <= options.loss < 1 or not 0 <= options.reorder < 1 or not 0 <= options.setup_grace_seconds <= 1800:
         parser.error('invalid soak duration, peer count, heartbeat interval or fault rates')
     if options.server_only and options.fixtures is None:
         parser.error('--server-only requires --fixtures')
@@ -109,7 +110,7 @@ def main():
             options.fixtures.mkdir(parents=True, exist_ok=True); directory = str(options.fixtures)
         ca = fixtures.Certificates(directory); ca.root('root'); ca.leaf('server', 'root'); ca.leaf('client', 'root', usage='clientAuth')
         binary = Path(directory) / 'soak-server'; fixtures.compile_program(ROOT / 'tests/quic-soak-server.min', binary)
-        server = subprocess.Popen([str(binary), str(ca.path('server', 'der')), str(ca.path('server', 'pk8')), str(ca.path('root', 'der')), str((options.duration + 15) * 1000), str(options.peers + 16)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        server = subprocess.Popen([str(binary), str(ca.path('server', 'der')), str(ca.path('server', 'pk8')), str(ca.path('root', 'der')), str((options.duration + options.setup_grace_seconds + 15) * 1000), str(options.peers + 16)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         proxy = None; client = None
         try:
             ready = ready_line(server); assert ready.startswith('READY '), ready
@@ -119,7 +120,7 @@ def main():
             else:
                 client = subprocess.Popen([str(ROOT / 'build/interop-quinn/debug/minyar-quinn-interop'), str(proxy.front.getsockname()[1]), str(ca.path('root', 'der')), str(ca.path('client', 'der')), str(ca.path('client', 'pk8')), str(options.duration), str(options.peers), str(options.interval_ms)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             started = time.monotonic(); samples = []
-            deadline = started + options.duration + 60
+            deadline = started + options.duration + options.setup_grace_seconds + 60
             configuration = vars(options) | {'report': str(options.report), 'fixtures': str(options.fixtures) if options.fixtures else None}
             versions = {}
             for command in ('openssl', 'clang-23', 'rustc', 'cargo'):
@@ -147,7 +148,7 @@ def main():
             report.update({'client_status': client.returncode if client else None, 'server_status': server.returncode, 'client_stdout': stdout, 'client_stderr': stderr,
                            'server_stdout': server_stdout, 'server_stderr': server_stderr, 'faults': {'dropped': proxy.dropped, 'reordered': proxy.delayed, 'forwarded': proxy.forwarded}})
             options.report.write_text(json.dumps(report, indent=2) + '\n')
-            assert server.returncode == 0 and (client is None or client.returncode == 0), report
+            assert server.returncode == 0 and (client is None or client.returncode == 0), {key:report[key] for key in ('server_status','client_status','server_stdout','server_stderr','client_stdout','client_stderr')}
             print(stdout, end=''); print(server_stdout, end='')
         finally:
             if proxy: proxy.close()

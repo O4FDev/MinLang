@@ -1,5 +1,5 @@
 //! Independent Quinn/rustls client; application sends one bounded echo stream.
-use std::{env, fs, sync::Arc, time::Duration};
+use std::{env, fs, sync::{Arc, atomic::{AtomicUsize,Ordering}}, time::Duration};
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
@@ -52,12 +52,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let duration: u64 = args[5].parse()?;
         let peers: usize = args[6].parse()?;
         let interval: u64 = args[7].parse()?;
+        if peers==0 || peers>16384 || interval==0 { return Err("invalid bounded scale configuration".into()); }
+        let setup_delay: u64 = env::var("MINYAR_QUINN_SETUP_DELAY_MS").unwrap_or_else(|_| "0".into()).parse()?;
+        if setup_delay>10000 { return Err("setup delay exceeds bound".into()); }
+        let authenticated=Arc::new(AtomicUsize::new(0));
         let mut clients = tokio::task::JoinSet::new();
         for id in 0..peers {
             let endpoint = endpoint.clone();
             let remote = remote_address(&args[1])?;
+            let authenticated=authenticated.clone();
             clients.spawn(async move {
-                let connection = endpoint.connect(remote, "localhost")?.await?;
+                let connection = tokio::time::timeout(Duration::from_secs(20),endpoint.connect(remote, "localhost")?).await??;
+                let count=authenticated.fetch_add(1,Ordering::SeqCst)+1;
+                if count==1 || count%1000==0 || count==peers { println!("AUTHENTICATED {count}"); }
                 let (mut send, mut receive) = connection.open_bi().await?;
                 let started = tokio::time::Instant::now();
                 let mut echoes = 0u64;
@@ -76,6 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 connection.close(0u32.into(), b"soak complete");
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(echoes)
             });
+            if setup_delay>0 { tokio::time::sleep(Duration::from_millis(setup_delay)).await; }
         }
         let mut total = 0u64;
         while let Some(result) = clients.join_next().await {
