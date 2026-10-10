@@ -432,6 +432,9 @@ static BOOL gapped(NSButtonCell *cell) {
 - (void)mouseExited:(NSEvent *)event { (void)event; hover(self, NO); }
 - (void)resetCursorRects { if (self.url) [self addCursorRect:self.bounds cursor:NSCursor.pointingHandCursor]; }
 - (void)viewDidChangeEffectiveAppearance { [super viewDidChangeEffectiveAppearance]; styleView(self); }
+// A button that moves, such as one below text that grows, is asked to draw
+// the area it left, outside its bounds, where nothing it draws can show.
+- (void)drawRect:(NSRect)dirty { if (NSIntersectsRect(dirty, self.bounds)) [super drawRect:dirty]; }
 @end
 @interface MNLabel : NSTextField
 @end

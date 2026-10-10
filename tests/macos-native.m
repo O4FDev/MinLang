@@ -3,6 +3,7 @@
  * get only the checked API. Link against the real Minyar runtime. */
 #include "../runtime/native/macos.m"
 #include <assert.h>
+#include <objc/runtime.h>
 #include <ApplicationServices/ApplicationServices.h>
 extern void minyar_rc_release(void *value);
 static MinyarText literal(const char *s) { return (MinyarText){(const unsigned char *)s, (long long)strlen(s), -1, NULL, NULL}; }
@@ -217,6 +218,39 @@ static void verifyTextView(void) {
     view = nil; window = nil;
     minyar_macos_destroy(w);
 }
+/* A button pushed down by growing text is not drawn again for the area it
+ * left, but is still drawn when it changes. */
+static int buttonDraws;
+static IMP drawButton;
+static void countButtonDraws(id self, SEL _cmd, NSRect frame, NSView *view) {
+    ++buttonDraws; ((void (*)(id, SEL, NSRect, NSView *))drawButton)(self, _cmd, frame, view);
+}
+static void verifyMovingButton(void) {
+    MinyarText title = literal("Moving button"), copy = literal("Copy"), copied = literal("Copied"), symbol = literal("doc.on.doc"),
+        line = literal("plateau in south america covering ");
+    Method draw = class_getInstanceMethod(NSButtonCell.class, @selector(drawWithFrame:inView:));
+    drawButton = method_getImplementation(draw);
+    class_replaceMethod(MNButtonCell.class, @selector(drawWithFrame:inView:), (IMP)countButtonDraws, method_getTypeEncoding(draw));
+    long long w = minyar_macos_window(&title,500,400);
+    long long root = minyar_macos_column(w,0);
+    long long scroll = minyar_macos_scroll(root); minyar_macos_fill(scroll); minyar_macos_grow(scroll);
+    long long page = minyar_macos_column(scroll,0); minyar_macos_fill(page);
+    long long t = minyar_macos_textView(page,&line); minyar_macos_fill(t);
+    long long b = minyar_macos_plainButton(page,&copy); minyar_macos_symbol(b,&symbol,12);
+    minyar_macos_show(w);
+    drain();
+    NSView *button = entry(b).object;
+    CGFloat top = NSMinY([button convertRect:button.bounds toView:nil]);
+    buttonDraws = 0;
+    for (int i = 0; i < 40; ++i) { minyar_macos_appendText(t,&line); for (int k = 0; k < 3; ++k) minyar_macos_nextEvent(0.005); }
+    [button.window layoutIfNeeded];
+    assert(fabs(NSMinY([button convertRect:button.bounds toView:nil]) - top) > 100);
+    assert(buttonDraws == 0);
+    minyar_macos_setText(b,&copied); drain(); [button.window displayIfNeeded];
+    assert(buttonDraws > 0);
+    button = nil;
+    minyar_macos_destroy(w);
+}
 /* Background progress (as from http) wakes nextEvent at most once a frame. */
 static void verifyWakeThrottle(void) {
     drain();
@@ -282,6 +316,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     }
     verifyList();
     verifyTextView();
+    verifyMovingButton();
     verifyWakeThrottle();
     equals(minyar_macos_text(field),"é 🙂 漢字");
     equals(minyar_macos_text(edit),"é 🙂 漢字");
