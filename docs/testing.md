@@ -534,6 +534,14 @@ program must run; compiler or program exhaustion must exit with
 `Minyar stopped: the program exceeded the maximum call depth.` rather than a
 signal.
 
+A function that calls no Minyar function (a leaf of at most 256 locals) has no
+check of its own: it cannot deepen recursion, and its frame fits in the
+128 KiB reserve its caller's check left. Without the check, LLVM can inline
+small accessors. `check-stack-overflow` requires that a leaf has no guard,
+that callers of local and imported functions keep theirs, and that a leaf
+doing Text work at the deepest allowed frame still finishes before the clean
+overflow stop.
+
 Both native and sanitized compilers are covered. The sanitizer build instruments
 the self-hosted second-stage LLVM, preserving its runtime call-depth guards.
 The bootstrap emitter does not emit those guards and is not the sanitizer build

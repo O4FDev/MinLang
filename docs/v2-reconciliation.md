@@ -74,10 +74,14 @@ ten files:
   - minyar-os's version is portable HTTP/1.1 in Minyar over `net` and `tls`.
     It blocks, does not validate certificates and has no chunked decoding.
 
-  For the merge, appkit's file stays `http`, and minyar-os's file became
-  `library/http1.min`. `examples/fetch` and `examples/atacama` (the only users of
-  the portable version) now `use "http1" as http`. Unifying the two behind one
-  API is tracked in [v2-performance.md](v2-performance.md).
+  Both are kept as one package with two backends, chosen by the package
+  search path in the same way `library/arch/arm64` replaces `machine`.
+  minyar-os's portable client is `library/http.min`, and appkit's NSURLSession
+  client is `library/platform/macos/http.min`, which `./minyar` searches first
+  on macOS. Programs write `use "http"` everywhere. `./minyar --library library`
+  selects the portable client on macOS, which `tests/tls-local.py` does. Only
+  the macOS backend can stream: packages cannot hold state, so a portable
+  `start` would need a request record instead of an integer handle.
 
 ## The cycle-collection bake-off
 

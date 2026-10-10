@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch from a local TLS 1.3 server with the Minyar `http` and `tls` packages.
+"""Fetch from a local TLS 1.3 server with the portable Minyar `http` and `tls` packages.
 
 A throwaway self-signed certificate is generated with the openssl command; the
 Minyar client offers only TLS_CHACHA20_POLY1305_SHA256 with X25519, so this
@@ -46,7 +46,10 @@ def main():
         port = server.server_address[1]
         threading.Thread(target=server.serve_forever, daemon=True).start()
         program = os.path.join(ROOT, 'build', 'tls-fetch')
-        subprocess.run([os.path.join(ROOT, 'minyar'), os.path.join(ROOT, 'examples/fetch/main.min'), '-o', program],
+        # The portable http package (net + tls), also on macOS, where ./minyar
+        # would otherwise choose the NSURLSession one.
+        subprocess.run([os.path.join(ROOT, 'minyar'), '--library', os.path.join(ROOT, 'library'),
+                        os.path.join(ROOT, 'examples/fetch/main.min'), '-o', program],
                        check=True, capture_output=True)
         result = subprocess.run([program, f'https://localhost:{port}/'], capture_output=True, text=True, timeout=60)
         server.shutdown()

@@ -55,8 +55,8 @@ while graphics.nextFrame() {
 }
 ```
 
-`json` parses and writes JSON, `net` opens TCP connections and `http1` makes
-HTTP/1.1 requests over them on any platform, for `https://` URLs through `tls`, a TLS 1.3
+`json` parses and writes JSON, `net` opens TCP connections and `http` makes
+HTTP/1.1 requests over them, for `https://` URLs through `tls`, a TLS 1.3
 client built on `crypto` (SHA-256, HMAC, HKDF, ChaCha20-Poly1305, X25519). The
 TLS client encrypts and verifies the handshake but does not validate
 certificates. [`examples/atacama`](../examples/atacama/main.min) and
@@ -67,16 +67,18 @@ and DMA memory on top of it.
 with fog and lighting, lines, a 2D overlay with text, and screenshots; its
 module documents each function. The [`macos`](macos.md) package provides native
 AppKit desktop applications and needs no third-party library. On macOS,
-[`http`](../library/http.min) makes HTTP and HTTPS requests through
-NSURLSession, including streamed responses and validated certificates, and [`json`](../library/json.min)
-parses and quotes JSON in Minyar itself. Some library functions are implemented
+`./minyar` searches [`library/platform/macos`](../library/platform/macos/http.min)
+before `library`, so `use "http"` there gets an `http` with the same
+`Response`, `get`, `post` and `request` that goes through NSURLSession: it
+validates certificates and can also stream (`start`, `read`, `finished`).
+`./minyar --library library` picks the portable one on macOS too.
+[`json`](../library/json.min) parses and quotes JSON in Minyar itself. Some library functions are implemented
 in C or Objective-C: their body is, for example, `native "graphics"` or
 `native "macos"`, and `./minyar` builds and links the needed native code
-automatically. Packages from other sources are not yet supported, and
-`--incremental` builds do not resolve packages yet.
+automatically. Packages from other sources are not yet supported.
 
 The compiler finds packages through `--library DIRECTORY`, which may be given
-more than once; each directory is searched in order and the first with the
+more than once (`./minyar` accepts it too, ahead of its standard directories); each directory is searched in order and the first with the
 package wins. A build for another processor or platform can so replace one
 package without copying the rest: Minyar OS's Arm build lists
 `library/arch/arm64`, whose `machine.min` holds the Arm intrinsics, before

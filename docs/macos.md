@@ -89,6 +89,7 @@ are process-local; do not serialize them or share them between processes.
 | Properties | `text`, `setText`, `enabled`, `checked`, `setChecked`, `value`, `setValue`, `placeholder`, `maxLength`, `focus`, `selectable`, `tooltip`, `accessibilityLabel` | AppKit properties |
 | Text input | `plain`, `autoHeight`, `submitOnEnter` | NSTextView delegate |
 | Styling | `color`, `background`, `border`, `cornerRadius`, `focusBorder`, `textColor`, `hover`, `font`, `letterSpacing`, `lineHeight`, `lines`, `textAlign`, `symbol` | Dynamic NSColor, CALayer, NSFont/CoreText, SF Symbols |
+| Lists | `list`, `addRow`, `rowCount`, `listLine`, `listColors`, `rowButton`, `clickedRow`, `clickedButton` | View-based NSTableView with reused cells |
 | Interaction | `clickable`, `draggable` | Tracking areas, window dragging, accessibility press |
 | Menus | `menu`, `menuItem`, `menuSeparator` | NSMenu, NSMenuItem, target/action |
 | Events | `eventType`, `eventSource`, `eventText` | Queued delegate and target/action events |
@@ -121,9 +122,20 @@ bundled file registered with `registerFont(resource("fonts/Name.ttf"))`;
 variable fonts use the requested weight exactly. Labels wrap with
 `lines(label, 0)` and truncate with `lines(label, 1)`.
 
-**Rebuilding content.** Lists such as search results are rebuilt with `clear`
+**Rebuilding content.** Small groups of views are rebuilt with `clear`
 followed by new children. `clear` and `remove` end the handles of everything
 they remove; keep the new handles to recognise their events.
+
+**Long lists.** A stack of views costs Auto Layout time for every row, and a
+rebuild grows faster than the row count: on a 2026 MacBook, rebuilding 200
+history rows of three labels and a button took about 1 s, and 800 rows took
+10 s. `list` holds rows as text and builds views only for the rows on screen,
+so `clear` plus `addRow` for 5,000 rows takes as long as for 50 (about 0.1 s,
+mostly laying out the visible rows). Each row has a top, middle and bottom
+line, styled for the whole list with `listLine`, and an optional trailing
+`rowButton`. A click delivers `ACTION` from the list; `clickedRow` and
+`clickedButton` say where. `benchmarks/desktop/history-rows.min` and
+`history-list.min` measure both.
 
 **Text input.** `plain` removes an input's own bezel so a styled container can
 draw it; `focusBorder` on the container shows focus. Editors can size to their
@@ -133,7 +145,11 @@ Shift-Return adds a line, as in chat applications. Text fields always enqueue
 
 **Background work.** A program waiting in `nextEvent` returns early, with
 `NONE`, when an `http` request receives data or finishes, so a streamed reply
-appears as it arrives without polling quickly.
+appears as it arrives without polling quickly. These early returns happen at
+most 60 times a second; input events still return at once. A reply streamed
+in thousands of small pieces is therefore redrawn once a frame rather than
+once a piece: in the Atacama app, a 3,000-piece answer took 2.0 s of CPU time
+instead of 6.8 s, with the same final result on screen.
 
 A window owns its entire control tree, including nested rows and columns.
 Attach one root view to a window, then add controls to rows or columns. Layout

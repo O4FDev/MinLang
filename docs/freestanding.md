@@ -80,7 +80,8 @@ device.store64(ring, slot * 16, device.addressOf(buffers, slot * 2048))
 sub-range, `copy`, `fill` and `write` for bulk transfers, and `inBlock16` for a
 block from a port such as a disk sector. A location is checked once when it is
 made; later accesses cost the instruction and one field load. Accesses are
-volatile. Ordinary calls carry Minyar's call-depth and ownership frames, so a
+volatile. Ordinary calls carry Minyar's call-depth and ownership frames (a
+function that calls no other Minyar function has no call-depth frame), so a
 loop over thousands of values should use a block transfer instead.
 
 Every driver in Minyar OS (PCI, display, ATA, keyboard and mouse, interrupt
