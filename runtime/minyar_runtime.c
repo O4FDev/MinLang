@@ -122,6 +122,8 @@ static MINYAR_COLD MINYAR_NORETURN void minyar_stop(const char *message);
 static size_t minyar_call_depth;
 static uintptr_t minyar_stack_low, minyar_stack_high;
 static int minyar_stack_bounds_ready;
+/* The depth at which minyar_stack_enter takes its exact path. */
+static size_t minyar_depth_limit;
 
 /* Keep first-use platform queries out of the frequent guard. This also lets
  * LTO inline the check without importing pthread setup into every caller. */
@@ -157,14 +159,15 @@ static MINYAR_COLD void minyar_find_stack_bounds(void) {
         }
     }
 #endif
+    minyar_depth_limit = MINYAR_MAX_CALL_DEPTH;
+    if ((!minyar_stack_low || !minyar_stack_high) && MINYAR_FALLBACK_CALL_DEPTH < minyar_depth_limit)
+        minyar_depth_limit = MINYAR_FALLBACK_CALL_DEPTH;
 }
 
-/* ASan's use-after-return mode moves address-taken locals to a fake stack.
- * Keep this marker on the native stack so the guard can measure its actual
- * distance from the thread's guard page. */
-MINYAR_NO_ADDRESS_SANITIZE void minyar_stack_enter(void) {
-    unsigned char stack_marker;
-    uintptr_t current = (uintptr_t)&stack_marker;
+/* The exact checks, taken only when the fast check in minyar_stack_enter
+ * fails: on the first call (the depth limit starts at zero, which also finds
+ * the stack bounds), at the depth limit, or within the stack reserve. */
+static MINYAR_COLD void minyar_stack_enter_slow(uintptr_t current) {
     if (!minyar_stack_bounds_ready)
         minyar_find_stack_bounds();
     if (minyar_call_depth >= MINYAR_MAX_CALL_DEPTH ||
@@ -173,6 +176,24 @@ MINYAR_NO_ADDRESS_SANITIZE void minyar_stack_enter(void) {
         (current >= minyar_stack_low && current < minyar_stack_high &&
          current - minyar_stack_low <= MINYAR_STACK_RESERVE_BYTES))
         minyar_stop("the program exceeded the maximum call depth.");
+}
+
+/* ASan's use-after-return mode moves address-taken locals to a fake stack.
+ * Keep this marker on the native stack so the guard can measure its actual
+ * distance from the thread's guard page.
+ *
+ * Every call that is not a leaf runs this check, so its common path is two
+ * comparisons that cover every stopping case of the exact checks: the depth
+ * limit is the lowest applicable cap, and the unsigned distance from the low
+ * end is at most the reserve for every address inside the reserve (addresses
+ * below the stack wrap to huge values). With unknown bounds the low end is
+ * zero, so only the depth limit applies. */
+MINYAR_NO_ADDRESS_SANITIZE void minyar_stack_enter(void) {
+    unsigned char stack_marker;
+    uintptr_t current = (uintptr_t)&stack_marker;
+    if (__builtin_expect(minyar_call_depth >= minyar_depth_limit ||
+                         current - minyar_stack_low <= MINYAR_STACK_RESERVE_BYTES, 0))
+        minyar_stack_enter_slow(current);
     minyar_call_depth++;
 }
 

@@ -35,4 +35,18 @@ with tempfile.TemporaryDirectory(prefix='minyar-stack-limits-') as temporary:
                     assert result.stdout == '', result.stdout
                     assert result.stderr == (MESSAGE if expected else ''), result.stderr
                     cases += 1
-    print(f'stack limits: {cases} exact boundaries across native/fallback and O0/O2 passed')
+    # Every non-leaf call runs minyar_stack_enter, so its common path must stay
+    # two comparisons (depth limit, distance from the stack's low end); the
+    # exact checks and the first-use bounds query live in the cold slow path.
+    llvm = work / 'stack-enter.ll'
+    command = clang_command([CLANG, '-O2', '-S', '-emit-llvm', ROOT / 'tests/stack-limits.c', '-o', llvm])
+    result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    text = llvm.read_text()
+    start = text.index('@minyar_stack_enter()')
+    body = text[start:text.index('\n}\n', start)]
+    assert body.count(' icmp ') == 2, body
+    for name in ('@minyar_stack_bounds_ready', '@minyar_stack_high', '@minyar_find_stack_bounds'):
+        assert name not in body, (name, body)
+    print(f'stack limits: {cases} exact boundaries across native/fallback and O0/O2 passed; '
+          'the guard common path is two comparisons')
