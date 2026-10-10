@@ -24,6 +24,7 @@ public record Path {
     deadline: Integer; attempts: Integer; received: Integer; sent: Integer
 }
 record ConnectionId { sequence: Integer; id: Bytes; token: Bytes }
+public record ClosedStreams { kind: Integer; first: Integer; last: Integer }
 record Space {
     read: protection.Keys; write: protection.Keys; next: Integer; largest: Integer; largestAck: Integer
     ranges: List<wire.Range>; ack: Boolean; sent: List<Sent>; active: Boolean; probe: Integer
@@ -39,6 +40,7 @@ public record Connection {
     remoteIds: List<ConnectionId>; retirePrior: Integer
     clientTLS: tls.Session; serverTLS: tlsserver.Session; spaces: List<Space>; pending: List<Pending>
     streams: List<stream.Stream>; nextBidi: Integer; nextUni: Integer
+    closedStreams: List<ClosedStreams>; incomingBidi: Integer; incomingUni: Integer; receiveBidi: Integer; receiveUni: Integer
     peerMaxData: Integer; peerBidi: Integer; peerUni: Integer; peerBidiLocal: Integer; peerBidiRemote: Integer; peerUniData: Integer
     sentData: Integer; receivedData: Integer; receiveMaxData: Integer; parametersChecked: Boolean
     congestion: recovery.State; flight: Integer; receivedBytes: Integer; sentBytes: Integer
@@ -90,6 +92,7 @@ function create(entropy: Bytes, original: Bytes, client: Boolean): Connection {
         originalDestination: destination; local: local; remote: destination; peerSource: Bytes(); peerKnown: false
         remoteIds: []; retirePrior: 0
         clientTLS: tls.none(); serverTLS: tlsserver.none(); spaces: spaces; pending: []; streams: []; nextBidi: role; nextUni: role + 2
+        closedStreams: []; incomingBidi: 0; incomingUni: 0; receiveBidi: 16; receiveUni: 16
         peerMaxData: 0; peerBidi: 0; peerUni: 0; peerBidiLocal: 0; peerBidiRemote: 0; peerUniData: 0
         sentData: 0; receivedData: 0; receiveMaxData: 262144; parametersChecked: false
         congestion: recovery.create(1200); flight: 0; receivedBytes: 0; sentBytes: 0
@@ -307,6 +310,17 @@ function processAck(connection: Connection, space: Space, frame: wire.Frame) {
         let acknowledged = false
         for range in frame.ranges { if sent.number >= range.first && sent.number <= range.last { acknowledged = true } }
         if acknowledged {
+            let frames = wire.frames(sent.payload)
+            for item in frames.frames {
+                if (item.type >= 8 && item.type <= 15) || item.type == 4 {
+                    let index = streamIndex(connection,item.stream)
+                    if index >= 0 {
+                        let output = connection.streams[index]
+                        if item.type == 4 { output.resetAcknowledged = true }
+                        else if !stream.acknowledgeSend(output,item.offset,item.data.length,item.fin) { terminate(connection,1,"stream acknowledgement ranges exceed buffer bound"); return }
+                    }
+                }
+            }
             connection.flight = max(0, connection.flight - sent.bytes)
             if sent.number == frame.value {
                 let delay = 0
@@ -337,16 +351,96 @@ function localInitiated(connection: Connection, id: Integer): Boolean {
     if connection.clientRole { role = 0 }
     return (id & 1) == role
 }
+function streamRetired(connection: Connection, id: Integer): Boolean {
+    for range in connection.closedStreams { if range.kind == (id & 3) && id / 4 >= range.first && id / 4 <= range.last { return true } }
+    return false
+}
+function retireStream(connection: Connection, id: Integer) {
+    let kind = id & 3; let first = id / 4; let last = first
+    let merged: List<ClosedStreams> = []
+    for range in connection.closedStreams {
+        if range.kind == kind && range.first <= last + 1 && first <= range.last + 1 { first = min(first,range.first); last = max(last,range.last) }
+        else { merged.add(range) }
+    }
+    let remaining: List<ClosedStreams> = []
+    for range in merged {
+        if range.kind == kind && range.first <= last + 1 && first <= range.last + 1 { first = min(first,range.first); last = max(last,range.last) }
+        else { remaining.add(range) }
+    }
+    remaining.add(ClosedStreams { kind: kind; first: first; last: last }); connection.closedStreams = remaining
+    if remaining.length > 256 { terminate(connection,1,"closed stream range bound exceeded") }
+    if !localInitiated(connection,id) {
+        let update = Bytes()
+        if (id & 2) != 0 { connection.receiveUni += 1; add(update,19); add(update,connection.receiveUni) }
+        else { connection.receiveBidi += 1; add(update,18); add(update,connection.receiveBidi) }
+        enqueue(connection,2,update,false)
+    }
+}
+function reclaimStreams(connection: Connection) {
+    let remaining: List<stream.Stream> = []
+    for input in connection.streams {
+        let sendDone = (input.sendReset && input.resetAcknowledged) || (input.sendClosed && input.finalAcknowledged && input.sendAcknowledged == input.sendOffset)
+        let receiveDone = input.final >= 0 && input.receiveObserved && (input.reset || (stream.finished(input) && input.incoming.length == 0))
+        if (input.id & 2) != 0 { if localInitiated(connection,input.id) { receiveDone = true } else { sendDone = true } }
+        if sendDone && receiveDone { retireStream(connection,input.id) }
+        else { remaining.add(input) }
+    }
+    connection.streams = remaining
+}
 function incomingStream(connection: Connection, id: Integer): Integer {
     if localInitiated(connection, id) && (id & 2) != 0 { terminate(connection, 5, "peer sent on a send-only stream"); return -1 }
     let index = streamIndex(connection, id)
     if index >= 0 { return index }
+    if streamRetired(connection,id) { return -2 }
     if localInitiated(connection, id) { terminate(connection, 5, "peer referenced an unopened local stream"); return -1 }
-    if id / 4 >= 16 || connection.streams.length >= 128 { terminate(connection, 4, "peer exceeded its stream count limit"); return -1 }
+    let limit = connection.receiveBidi; let next = connection.incomingBidi
+    if (id & 2) != 0 { limit = connection.receiveUni; next = connection.incomingUni }
+    if id / 4 >= limit || id / 4 + 1 - next > 128 - connection.streams.length { terminate(connection, 4, "peer exceeded its stream count limit"); return -1 }
     let sendLimit = connection.peerBidiLocal
     if (id & 2) != 0 { sendLimit = 0 }
-    connection.streams.add(stream.create(id, 65536, sendLimit))
+    // RFC9000 opening a stream also opens every lower ID of the same type.
+    for number in next..(id / 4 + 1) { connection.streams.add(stream.create(number * 4 + (id & 3),65536,sendLimit)) }
+    if (id & 2) != 0 { connection.incomingUni = id / 4 + 1 } else { connection.incomingBidi = id / 4 + 1 }
     return connection.streams.length - 1
+}
+function incomingSendStream(connection: Connection, id: Integer): Integer {
+    if !localInitiated(connection,id) && (id & 2) != 0 { terminate(connection,5,"peer referenced a receive-only stream"); return -1 }
+    let index = streamIndex(connection,id)
+    if index >= 0 { return index }
+    if streamRetired(connection,id) { return -2 }
+    if localInitiated(connection,id) { terminate(connection,5,"peer referenced an unopened local stream"); return -1 }
+    return incomingStream(connection,id)
+}
+function consumeDiscard(connection: Connection, input: stream.Stream) {
+    let credit = input.highest - input.consumed
+    input.incoming = Bytes(); input.segments = []; input.consumed = input.highest
+    if credit > 0 {
+        connection.receiveMaxData += credit
+        let update = Bytes(); add(update,16); add(update,connection.receiveMaxData); enqueue(connection,2,update,false)
+    }
+}
+function resetSend(connection: Connection, output: stream.Stream, code: Integer) {
+    if output.sendReset { return }
+    output.sendReset = true; output.sendResetCode = code; output.sendClosed = true
+    let remaining: List<Pending> = []
+    for pending in connection.pending {
+        let frames = wire.frames(pending.payload); let discardData = false
+        for frame in frames.frames { if frame.type >= 8 && frame.type <= 15 && frame.stream == output.id { discardData = true } }
+        if !discardData { remaining.add(pending) }
+    }
+    connection.pending = remaining
+    let frame = Bytes(); add(frame,4); add(frame,output.id); add(frame,code); add(frame,output.sendOffset); enqueue(connection,2,frame,false)
+}
+function retryPayload(connection: Connection, payload: Bytes): Boolean {
+    let frames = wire.frames(payload)
+    for frame in frames.frames {
+        if frame.type >= 8 && frame.type <= 15 {
+            let index = streamIndex(connection,frame.stream)
+            if streamRetired(connection,frame.stream) { return false }
+            if index >= 0 && (connection.streams[index].sendReset || (frame.offset + frame.data.length <= connection.streams[index].sendAcknowledged && (!frame.fin || connection.streams[index].finalAcknowledged))) { return false }
+        }
+    }
+    return true
 }
 function processFrame(connection: Connection, level: Integer, frame: wire.Frame) {
     let space = connection.spaces[level]
@@ -359,21 +453,37 @@ function processFrame(connection: Connection, level: Integer, frame: wire.Frame)
             else { tlsserver.receiveHandshake(connection.serverTLS, data, level) }
             synchronize(connection)
         }
+    } else if frame.type == 4 {
+        let index = incomingStream(connection,frame.stream)
+        if index < 0 { return }
+        let input = connection.streams[index]
+        if frame.offset < input.highest || (input.final >= 0 && frame.offset != input.final) { terminate(connection,6,"inconsistent reset final stream size"); return }
+        let additional = frame.offset - input.highest
+        if frame.offset > input.receiveLimit || additional > connection.receiveMaxData - connection.receivedData { terminate(connection,3,"reset final size exceeds flow control"); return }
+        connection.receivedData += additional; input.highest = frame.offset; input.final = frame.offset; input.delivered = frame.offset
+        if !input.reset { input.resetCode = frame.value }
+        input.reset = true; consumeDiscard(connection,input)
+    } else if frame.type == 5 {
+        let index = incomingSendStream(connection,frame.stream)
+        if index >= 0 { resetSend(connection,connection.streams[index],frame.value) }
     } else if frame.type >= 8 && frame.type <= 15 {
         let index = incomingStream(connection, frame.stream)
         if index < 0 { return }
         let input = connection.streams[index]
         let end = frame.offset + frame.data.length
         let additional = max(0, end - input.highest)
+        if end > input.receiveLimit { terminate(connection,3,"stream flow control limit exceeded"); return }
         if additional > connection.receiveMaxData - connection.receivedData { terminate(connection, 3, "connection flow control limit exceeded"); return }
         if !stream.insert(input, frame.offset, frame.data, frame.fin) { terminate(connection, 6, input.error); return }
         connection.receivedData += additional
+        if input.reset { consumeDiscard(connection,input) }
     } else if frame.type == 16 { connection.peerMaxData = max(connection.peerMaxData, frame.value) }
     else if frame.type == 17 {
-        let index = streamIndex(connection, frame.stream)
+        let index = incomingSendStream(connection, frame.stream)
         if index >= 0 { connection.streams[index].sendLimit = max(connection.streams[index].sendLimit, frame.value) }
     } else if frame.type == 18 { connection.peerBidi = max(connection.peerBidi, frame.value) }
     else if frame.type == 19 { connection.peerUni = max(connection.peerUni, frame.value) }
+    else if frame.type == 21 { incomingStream(connection,frame.stream) }
     else if frame.type == 26 {
         let response = Bytes(); add(response, 27); response.addBytes(frame.data); enqueuePath(connection, 2, response, false, connection.incomingPath)
     } else if frame.type == 27 {
@@ -417,7 +527,7 @@ function processFrame(connection: Connection, level: Integer, frame: wire.Frame)
         connection.remoteIds = active
     }
     else if frame.type == 7 { /* Session tickets/tokens are not retained. */ }
-    else if frame.type == 4 || frame.type == 5 || frame.type == 25 {
+    else if frame.type == 25 {
         terminate(connection, 10, "this QUIC control-frame feature is not implemented")
     }
 }
@@ -541,6 +651,7 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
     if ((connection.state == FAILED || connection.state == CLOSED) && !connection.closing) || now < 0 || now < connection.now { return outgoing }
     if connection.now < 0 { connection.lastActivity = now }
     connection.now = now
+    if connection.state == ESTABLISHED { reclaimStreams(connection) }
     for path in connection.paths {
         if path.challenge.length == 8 && path.deadline >= 0 && now >= path.deadline {
             if path.attempts < 3 { challengePath(connection, path) }
@@ -564,12 +675,14 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
         for sent in space.sent {
             if recovery.isLost(connection.congestion, sent.number, space.largestAck, sent.time, now) {
                 connection.flight = max(0, connection.flight - sent.bytes)
-                recovery.lost(connection.congestion, now, sent.time); enqueuePath(connection, sent.level, sent.payload, false, sent.path)
+                recovery.lost(connection.congestion, now, sent.time)
+                if retryPayload(connection,sent.payload) { enqueuePath(connection, sent.level, sent.payload, false, sent.path) }
             } else { remaining.add(sent) }
         }
         space.sent = remaining
         if remaining.length > 0 && space.probe >= 0 && now >= space.probe {
-            enqueuePath(connection, remaining[0].level, remaining[0].payload, true, remaining[0].path)
+            if retryPayload(connection,remaining[0].payload) { enqueuePath(connection, remaining[0].level, remaining[0].payload, true, remaining[0].path) }
+            else { enqueuePath(connection,remaining[0].level,crypto.fromHex("01"),true,remaining[0].path) }
             connection.congestion.probes += 1; space.probe = now + recovery.pto(connection.congestion, connection.confirmed)
         }
         if space.ack && space.write.key.length > 0 && (level != 2 || connection.state == ESTABLISHED) { enqueuePath(connection, level, ackFrame(space), false, space.ackPath); space.ack = false }
@@ -746,6 +859,7 @@ function write(connection: Connection, id: Integer, data: Bytes, fin: Boolean, e
     let index = streamIndex(connection, id)
     if (!early && connection.state != ESTABLISHED) || index < 0 { return errors.integerFailure(errors.make(errors.closedCode(), 0, "QUIC stream is unavailable")) }
     let output = connection.streams[index]
+    if output.sendReset { return errors.integerFailure(errors.make(streamResetCode(),output.sendResetCode,"QUIC stream sending was reset")) }
     if output.sendClosed || (!localInitiated(connection, id) && (id & 2) != 0) { return errors.integerFailure(errors.make(errors.closedCode(), 0, "QUIC stream is send-closed")) }
     let count = min(data.length, min(output.sendLimit - output.sendOffset, connection.peerMaxData - connection.sentData))
     let retained = connection.pending.length
@@ -768,17 +882,38 @@ function write(connection: Connection, id: Integer, data: Bytes, fin: Boolean, e
 public function readStream(connection: Connection, id: Integer): errors.BytesResult {
     if connection.earlyRejected && contains(connection.earlyStreams, id) { return errors.bytesFailure(errors.make(earlyRejectedCode(), 0, "QUIC early stream was rejected; explicit retry required")) }
     let index = streamIndex(connection, id)
-    if index < 0 { return errors.wouldBlock(0) }
+    if index < 0 { if streamRetired(connection,id) { return errors.endOfStream() }; return errors.wouldBlock(0) }
     let input = connection.streams[index]
+    if input.reset { input.receiveObserved = true; return errors.bytesFailure(errors.make(streamResetCode(),input.resetCode,"QUIC stream receiving was reset")) }
     let result = stream.take(input)
     if result.length > 0 {
         input.receiveLimit += result.length; connection.receiveMaxData += result.length
+        input.consumed += result.length
         let update = Bytes(); add(update, 17); add(update, id); add(update, input.receiveLimit); add(update, 16); add(update, connection.receiveMaxData)
         enqueue(connection, 2, update, false)
         return errors.bytes(result)
     }
-    if stream.finished(input) { return errors.endOfStream() }
+    if stream.finished(input) { input.receiveObserved = true; return errors.endOfStream() }
     return errors.wouldBlock(0)
+}
+public function streamResetCode(): Integer { return 1003 }
+public function resetStream(connection: Connection, id: Integer, code: Integer): errors.BooleanResult {
+    if code < 0 || code > wire.MAX_VARINT { return errors.booleanFailure(errors.make(errors.invalidDataCode(),0,"invalid stream application error")) }
+    let index = streamIndex(connection,id)
+    if connection.state != ESTABLISHED || index < 0 || (!localInitiated(connection,id) && (id & 2) != 0) { return errors.booleanFailure(errors.make(errors.closedCode(),0,"stream sending is unavailable")) }
+    resetSend(connection,connection.streams[index],code)
+    return errors.boolean(true)
+}
+public function stopSending(connection: Connection, id: Integer, code: Integer): errors.BooleanResult {
+    if code < 0 || code > wire.MAX_VARINT { return errors.booleanFailure(errors.make(errors.invalidDataCode(),0,"invalid stream application error")) }
+    let index = streamIndex(connection,id)
+    if connection.state != ESTABLISHED || index < 0 || (localInitiated(connection,id) && (id & 2) != 0) { return errors.booleanFailure(errors.make(errors.closedCode(),0,"stream receiving is unavailable")) }
+    let input = connection.streams[index]
+    if !input.reset {
+        input.reset = true; input.resetCode = code; consumeDiscard(connection,input)
+        if input.final < 0 { let frame = Bytes(); add(frame,5); add(frame,id); add(frame,code); enqueue(connection,2,frame,false) }
+    }
+    return errors.boolean(true)
 }
 
 public function close(connection: Connection, code: Integer, reason: Bytes): errors.BooleanResult {
@@ -795,6 +930,7 @@ public function release(connection: Connection): Boolean {
     if (connection.state != CLOSED && connection.state != FAILED) || connection.closing { return false }
     connection.clientTLS = tls.none(); connection.serverTLS = tlsserver.none()
     connection.spaces = []; connection.pending = []; connection.streams = []; connection.remoteIds = []
+    connection.closedStreams = []
     connection.paths = []; connection.outgoingPaths = []; connection.earlyStreams = []
     connection.earlyWrite = protection.traffic(1,0,Bytes()); connection.earlyRead = protection.traffic(1,0,Bytes())
     connection.originalDestination = Bytes(); connection.local = Bytes(); connection.remote = Bytes(); connection.peerSource = Bytes()
