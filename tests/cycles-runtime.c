@@ -23,7 +23,7 @@ static void poll_many(size_t n) {
 }
 static MinyarRecord *self_loop(void) {
     MinyarRecord *r = minyar_record_new_traced(1);
-    minyar_record_set_reference(r, 0, slot(r));
+    minyar_record_set_reference_traced(r, 0, slot(r));
     return r;
 }
 static void empty(void) {
@@ -54,11 +54,11 @@ static void graph_oracle(void) {
         int edges[N][F], roots[N];
         for (int i = 0; i < N; i++) {
             nodes[i] = minyar_record_new_traced(F + 1);
-            minyar_record_set(nodes[i], F, i);
+            minyar_record_set_traced(nodes[i], F, i);
             roots[i] = 1;
             for (int f = 0; f < F; f++) {
                 edges[i][f] = -1;
-                minyar_record_set_take(nodes[i], f, 0);
+                minyar_record_set_take_traced(nodes[i], f, 0);
             }
         }
         for (unsigned step = 0; step < 2000; step++) {
@@ -88,11 +88,11 @@ static void graph_oracle(void) {
                 if (roots[a]) { roots[a] = 0; minyar_rc_release(nodes[a]); }
                 break;
             case 1:
-                if (!roots[a]) { minyar_rc_retain(nodes[a]); roots[a] = 1; }
+                if (!roots[a]) { minyar_rc_retain_traced(nodes[a]); roots[a] = 1; }
                 break;
             default:
                 edges[a][f] = b;
-                minyar_record_replace(nodes[a], f, slot(nodes[b]), 0);
+                minyar_record_replace_traced(nodes[a], f, slot(nodes[b]), 0);
             }
             poll_many(1);
         }
@@ -107,7 +107,7 @@ static void growing_list(void) {
     size_t before = rc_cycle_epochs;
     for (size_t i = 0; i < 1024; i++) {
         MinyarRecord *node = self_loop();
-        minyar_list_add(list, slot(node));
+        minyar_list_add_traced(list, slot(node));
         minyar_rc_release(node);
         poll_many(2);
         assert(minyar_record_get((MinyarRecord *)(uintptr_t)minyar_list_get(list, i), 0) == slot(node));
@@ -118,7 +118,7 @@ static void growing_list(void) {
     /* A List itself can also be a cycle in the native owning-slot API. */
     list = minyar_list_new_traced();
     minyar_list_references(list);
-    minyar_list_add(list, slot(list));
+    minyar_list_add_traced(list, slot(list));
     minyar_rc_release(list);
     empty();
     /* K1 must include the constant-depth Text-view backing destruction. */
@@ -138,7 +138,7 @@ int main(void) {
     minyar_rc_enter(0);
     MinyarList *loop = minyar_list_new_traced();
     minyar_list_references(loop);
-    for (size_t i = 0; i < 1000; i++) minyar_list_add(loop, slot(loop));
+    for (size_t i = 0; i < 1000; i++) minyar_list_add_traced(loop, slot(loop));
     minyar_rc_release(loop);
     for (size_t i = 0; i < 2000; i++) minyar_rc_step();
     assert(rc_object_count == 0);
@@ -151,8 +151,8 @@ int main(void) {
     MinyarList *inside = minyar_list_new_traced();
     minyar_list_references(inside);
     MinyarRecord *moved = minyar_record_new_traced(1);
-    minyar_record_set_take(moved, 0, slot(inside));
-    minyar_list_add_take(inside, slot(moved));
+    minyar_record_set_take_traced(moved, 0, slot(inside));
+    minyar_list_add_take_traced(inside, slot(moved));
     empty();
     MinyarRecord *r = self_loop();
     poll_many(1000);
@@ -171,11 +171,11 @@ int main(void) {
     MinyarRecord *first = minyar_record_new_traced(1), *last = first;
     for (size_t i = 1; i < 1000; i++) {
         MinyarRecord *next = minyar_record_new_traced(1);
-        minyar_record_set_reference(last, 0, slot(next));
+        minyar_record_set_reference_traced(last, 0, slot(next));
         if (last != first) minyar_rc_release(last);
         last = next;
     }
-    minyar_record_set_reference(last, 0, slot(first));
+    minyar_record_set_reference_traced(last, 0, slot(first));
     minyar_rc_release(last);
     poll_many(1);
     minyar_rc_release(first);
@@ -199,13 +199,13 @@ int main(void) {
     MinyarList *roots = minyar_list_new_traced();
     minyar_list_references(roots);
     r = self_loop();
-    minyar_list_add_take(roots, slot(r));
+    minyar_list_add_take_traced(roots, slot(r));
     for (size_t i = 0; i < 4000; i++) {
-        minyar_rc_retain(r);
-        minyar_list_set(roots, 0, 0);
+        minyar_rc_retain_traced(r);
+        minyar_list_set_traced(roots, 0, 0);
         poll_many(1);
         assert(minyar_record_get(r, 0) == slot(r));
-        minyar_list_set_take(roots, 0, slot(r));
+        minyar_list_set_take_traced(roots, 0, slot(r));
         poll_many(1);
         MinyarRecord *dead = self_loop();
         minyar_rc_release(dead);

@@ -1670,12 +1670,19 @@ function prepareScalarRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, 
     state[10] = state[4]
 }
 
-function rootLocal(output: List<Text>, state: List<Integer>, id: Integer, value: Text, type: Integer) {
+// traced: the value's static type may lie on a cycle (typeMayCycle). Such
+// values use runtime entry points that keep the cycle tracer's barriers;
+// all others call v2's entry points unchanged.
+function rootLocal(output: List<Text>, state: List<Integer>, id: Integer, value: Text, type: Integer, traced: Boolean) {
     if isReferenceType(type) {
         let owner = ownershipSlot(state, id)
         if owner < 0 { return }
         state[6] = 1
-        output.add("  call void @minyar_rc_local(i64 ")
+        if traced {
+            output.add("  call void @minyar_rc_local_traced(i64 ")
+        } else {
+            output.add("  call void @minyar_rc_local(i64 ")
+        }
         output.add(Text(owner))
         output.add(", ptr ")
         output.add(value)
@@ -1683,7 +1690,7 @@ function rootLocal(output: List<Text>, state: List<Integer>, id: Integer, value:
     }
 }
 
-function assignReference(output: List<Text>, state: List<Integer>, id: Integer, value: Text, resultType: List<Integer>) {
+function assignReference(output: List<Text>, state: List<Integer>, id: Integer, value: Text, resultType: List<Integer>, traced: Boolean) {
     if takeResult(output, state, value, resultType) {
         state[6] = 1
         output.add("  call void @minyar_rc_local_take(i64 ")
@@ -1692,14 +1699,18 @@ function assignReference(output: List<Text>, state: List<Integer>, id: Integer, 
         output.add(value)
         output.add(")\n")
     } else {
-        rootLocal(output, state, id, value, resultType[0])
+        rootLocal(output, state, id, value, resultType[0], traced)
     }
 }
-function borrowReference(output: List<Text>, state: List<Integer>, value: Text, type: Integer) {
+function borrowReference(output: List<Text>, state: List<Integer>, value: Text, type: Integer, traced: Boolean) {
     if isReferenceType(type) {
         state[6] = 1
         state[7] = state[7] + 1
-        output.add("  call void @minyar_rc_borrow(ptr ")
+        if traced {
+            output.add("  call void @minyar_rc_borrow_traced(ptr ")
+        } else {
+            output.add("  call void @minyar_rc_borrow(ptr ")
+        }
         output.add(value)
         output.add(")\n")
     }
@@ -2527,7 +2538,11 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                         value = valueName(textState, temporary)
                         output.add("  ")
                         output.add(value)
-                        output.add(" = call ptr @minyar_list_appended(ptr ")
+                        if typeMayCycle(argumentType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes) {
+                            output.add(" = call ptr @minyar_list_appended_traced(ptr ")
+                        } else {
+                            output.add(" = call ptr @minyar_list_appended(ptr ")
+                        }
                         output.add(receiver)
                         output.add(", i64 ")
                         output.add(slot)
@@ -2557,10 +2572,14 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                         output.add("  call void @minyar_rc_enable_cycles()\n")
                     }
                     let slot = valueAsListSlot(output, textState, state, argument, argumentType[0])
+                    let traced = ""
+                    if typeMayCycle(argumentType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes) {
+                        traced = "_traced"
+                    }
                     if takeResult(output, state, argument, argumentType) {
-                        output.add("  call void @minyar_list_add_take(ptr ")
+                        output.add("  call void @minyar_list_add_take" + traced + "(ptr ")
                     } else {
-                        output.add("  call void @minyar_list_add(ptr ")
+                        output.add("  call void @minyar_list_add" + traced + "(ptr ")
                     }
                     output.add(value)
                     output.add(", i64 ")
@@ -2679,7 +2698,7 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
             // calls and indexed expressions can, so keep those receivers alive.
             let fieldRead = tokenIs(tokenKinds, tokenTexts, state, ".") && state[0] + 2 < tokenTexts.length && tokenTexts[state[0] + 2] != "("
             if !fieldRead && !indexWithoutCalls(tokenKinds, tokenTexts, state[0]) {
-                borrowReference(output, state, value, resultType[0])
+                borrowReference(output, state, value, resultType[0], typeMayCycle(resultType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes))
             }
         }
     }
@@ -2738,7 +2757,7 @@ function parseRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLin
         if scalar {
             output.add(" = call ptr @minyar_record_new_scalar(i64 ")
         } else {
-            if recordMayCycle(1000 + record, functionParameterCounts, functionParameterTypes) {
+            if typeMayCycle(1000 + record, functionParameterCounts, functionParameterTypes, functionReturnTypes) {
                 output.add(" = call ptr @minyar_record_new_traced(i64 ")
             } else {
                 output.add(" = call ptr @minyar_record_new(i64 ")
@@ -2778,17 +2797,21 @@ function parseRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLin
         if scalarValues >= 0 {
             output[scalarValues + fieldPosition * 3 + 1] = slot
         } else {
+        let traced = ""
+        if !scalar && (typeMayCycle(1000 + record, functionParameterCounts, functionParameterTypes, functionReturnTypes) || typeMayCycle(fieldType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes)) {
+            traced = "_traced"
+        }
         if isReferenceType(fieldType[0]) {
             if takeResult(output, state, fieldValue, fieldType) {
-                output.add("  call void @minyar_record_set_take(ptr ")
+                output.add("  call void @minyar_record_set_take" + traced + "(ptr ")
             } else {
-                output.add("  call void @minyar_record_set_reference(ptr ")
+                output.add("  call void @minyar_record_set_reference" + traced + "(ptr ")
             }
         } else {
             if scalar {
                 output.add("  call void @minyar_record_set_scalar(ptr ")
             } else {
-                output.add("  call void @minyar_record_set(ptr ")
+                output.add("  call void @minyar_record_set" + traced + "(ptr ")
             }
         }
         output.add(value)
@@ -2916,7 +2939,7 @@ function compileStatementSequence(tokenKinds: List<Integer>, tokenTexts: List<Te
                     if !returns {
                         let local = firstScopedLocal
                         while local < state[3] {
-                            rootLocal(output, state, localIds[local], "null", localTypes[local])
+                            rootLocal(output, state, localIds[local], "null", localTypes[local], false)
                             local = local + 1
                         }
                     }
@@ -3210,10 +3233,14 @@ function parseListLiteral(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
             references = true
         }
         let slot = valueAsListSlot(output, textState, state, item, elementType)
+        let traced = ""
+        if typeMayCycle(elementType, functionParameterCounts, functionParameterTypes, functionReturnTypes) {
+            traced = "_traced"
+        }
         if takeResult(output, state, item, itemType) {
-            output.add("  call void @minyar_list_add_take(ptr ")
+            output.add("  call void @minyar_list_add_take" + traced + "(ptr ")
         } else {
-            output.add("  call void @minyar_list_add(ptr ")
+            output.add("  call void @minyar_list_add" + traced + "(ptr ")
         }
         output.add(value)
         output.add(", i64 ")
@@ -3982,6 +4009,31 @@ function recordMayCycle(recordType: Integer, counts: List<Integer>, fields: List
     return false
 }
 
+// Whether values of this static type are RC_TRACED objects. A traced List's
+// element type is itself traced, so element-type checks also cover traced
+// List owners. Acyclic record types join listMutationMayCycle's cache of
+// acyclic List types in the tail of returnTypes; type ids do not overlap.
+function typeMayCycle(type: Integer, counts: List<Integer>, fields: List<Integer>, returnTypes: List<Integer>): Boolean {
+    if isListType(type) {
+        return listMutationMayCycle(type, counts, fields, returnTypes)
+    }
+    if !isRecordType(type) {
+        return false
+    }
+    let cached = (counts.length / 2) * 2
+    while cached < returnTypes.length {
+        if returnTypes[cached] == type {
+            return false
+        }
+        cached = cached + 1
+    }
+    if recordMayCycle(type, counts, fields) {
+        return true
+    }
+    returnTypes.add(type)
+    return false
+}
+
 // Parse the right side of `target op= value`. A compound operator combines the
 // current value with the right side exactly as the binary operator would.
 function assignedValue(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, binary: Text, current: Text, type: Integer, valueType: List<Integer>, location: Integer): Text {
@@ -4021,7 +4073,7 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
         if valueType[0] != receiverType {
             fail(describeLocation(tokenLocation(tokenLines, operatorLocation)) + ": an assignment to '" + name + "' has the wrong type")
         }
-        assignReference(output, state, localIds[local], value, valueType)
+        assignReference(output, state, localIds[local], value, valueType, typeMayCycle(valueType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes))
         storeLocal(output, localIds[local], receiverType, value)
         return
     }
@@ -4046,7 +4098,7 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
                 let current = ""
                 if binary != "" {
                     current = readRecordField(output, textState, state, receiver, fieldIndex, fieldType)
-                    borrowReference(output, state, current, fieldType)
+                    borrowReference(output, state, current, fieldType, typeMayCycle(fieldType, functionParameterCounts, functionParameterTypes, functionReturnTypes))
                 }
                 let value = assignedValue(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, binary, current, fieldType, valueType, operatorLocation)
                 if valueType[0] != fieldType {
@@ -4061,7 +4113,11 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
                     if takeResult(output, state, value, valueType) {
                         transfers = "1"
                     }
-                    output.add("  call void @minyar_record_replace(ptr ")
+                    if typeMayCycle(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes) || typeMayCycle(fieldType, functionParameterCounts, functionParameterTypes, functionReturnTypes) {
+                        output.add("  call void @minyar_record_replace_traced(ptr ")
+                    } else {
+                        output.add("  call void @minyar_record_replace(ptr ")
+                    }
                     output.add(receiver)
                     output.add(", i64 ")
                     output.add(Text(fieldIndex))
@@ -4083,7 +4139,7 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
             } else {
                 receiver = readRecordField(output, textState, state, receiver, fieldIndex, fieldType)
                 receiverType = fieldType
-                borrowReference(output, state, receiver, receiverType)
+                borrowReference(output, state, receiver, receiverType, typeMayCycle(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes))
             }
         } else {
             let bracketLocation = state[0]
@@ -4119,7 +4175,7 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
                 } else {
                     if binary != "" {
                         current = readListElement(output, textState, state, receiver, position, elementType)
-                        borrowReference(output, state, current, elementType)
+                        borrowReference(output, state, current, elementType, typeMayCycle(elementType, functionParameterCounts, functionParameterTypes, functionReturnTypes))
                     }
                     let value = assignedValue(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, binary, current, elementType, valueType, operatorLocation)
                     if valueType[0] != elementType {
@@ -4129,11 +4185,15 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
                         output.add("  call void @minyar_rc_enable_cycles()\n")
                     }
                     let slot = valueAsListSlot(output, textState, state, value, elementType)
+                    let traced = ""
+                    if typeMayCycle(elementType, functionParameterCounts, functionParameterTypes, functionReturnTypes) {
+                        traced = "_traced"
+                    }
                     if takeResult(output, state, value, valueType) {
-                        output.add("  call void @minyar_list_set_take(ptr ")
+                        output.add("  call void @minyar_list_set_take" + traced + "(ptr ")
                     } else {
                         if isReferenceType(elementType) {
-                            output.add("  call void @minyar_list_set(ptr ")
+                            output.add("  call void @minyar_list_set" + traced + "(ptr ")
                         } else {
                             output.add("  call void @.minyar.list.set.scalar.checked(ptr ")
                         }
@@ -4152,7 +4212,7 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
                 }
                 receiver = readListElement(output, textState, state, receiver, position, elementType)
                 receiverType = elementType
-                borrowReference(output, state, receiver, receiverType)
+                borrowReference(output, state, receiver, receiverType, typeMayCycle(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes))
             }
         }
     }
@@ -4253,7 +4313,7 @@ function compileFor(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLine
         }
         collection = nextLocal(state)
         addLocal(localNames, localTypes, localIds, localLengths, state, " for collection", sourceType[0], collection)
-        assignReference(output, state, collection, source, sourceType)
+        assignReference(output, state, collection, source, sourceType, typeMayCycle(sourceType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes))
         storeLocal(output, collection, sourceType[0], source)
         storeLocal(output, counter, 1, "0")
     }
@@ -4299,7 +4359,7 @@ function compileFor(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLine
     addLocal(localNames, localTypes, localIds, localLengths, state, name, elementType, variable)
     let elementResult: List<Integer> = []
     elementResult.add(elementType)
-    assignReference(output, state, variable, element, elementResult)
+    assignReference(output, state, variable, element, elementResult, typeMayCycle(elementResult[0], functionParameterCounts, functionParameterTypes, functionReturnTypes))
     storeLocal(output, variable, elementType, element)
     addLocal(localNames, localTypes, localIds, localLengths, state, " loop", -2, loopLabel)
     let bodyReturns = compileBlock(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
@@ -4317,7 +4377,7 @@ function compileFor(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLine
     textState[0] = "for.end." + Text(endLabel)
     let scoped = firstLoopLocal
     while scoped < state[3] {
-        rootLocal(output, state, localIds[scoped], "null", localTypes[scoped])
+        rootLocal(output, state, localIds[scoped], "null", localTypes[scoped], false)
         scoped = scoped + 1
     }
     state[3] = firstLoopLocal
@@ -4891,7 +4951,7 @@ function compileAtomicStatement(tokenKinds: List<Integer>, tokenTexts: List<Text
         }
         let id = nextLocal(state)
         addLocal(localNames, localTypes, localIds, localLengths, state, name, type, id)
-        assignReference(output, state, id, value, valueType)
+        assignReference(output, state, id, value, valueType, typeMayCycle(valueType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes))
         output.add("  store ")
         output.add(llvmType(type))
         output.add(" ")
@@ -4917,7 +4977,11 @@ function compileAtomicStatement(tokenKinds: List<Integer>, tokenTexts: List<Text
                 fail("a returned value has the wrong type")
             }
             if isReferenceType(valueType[0]) && !takeResult(output, state, value, valueType) {
-                output.add("  call void @minyar_rc_retain(ptr ")
+                if typeMayCycle(valueType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes) {
+                    output.add("  call void @minyar_rc_retain_traced(ptr ")
+                } else {
+                    output.add("  call void @minyar_rc_retain(ptr ")
+                }
                 output.add(value)
                 output.add(")\n")
             }
@@ -4972,7 +5036,7 @@ function compileAtomicStatement(tokenKinds: List<Integer>, tokenTexts: List<Text
                         if valueType[0] != localTypes[local] {
                             fail("an assignment to '" + name + "' has the wrong type")
                         }
-                        assignReference(output, state, localIds[local], value, valueType)
+                        assignReference(output, state, localIds[local], value, valueType, typeMayCycle(valueType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes))
                         output.add("  store ")
                         output.add(llvmType(valueType[0]))
                         output.add(" ")
@@ -5393,6 +5457,9 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     output.add("declare void @minyar_rc_keep(ptr)\n")
     output.add("declare void @minyar_rc_borrow(ptr)\n")
     output.add("declare void @minyar_rc_retain(ptr)\n")
+    output.add("declare void @minyar_rc_retain_traced(ptr)\n")
+    output.add("declare void @minyar_rc_local_traced(i64, ptr)\n")
+    output.add("declare void @minyar_rc_borrow_traced(ptr)\n")
     output.add("declare void @minyar_rc_cycle_policy()\n")
     output.add("declare void @minyar_rc_enable_cycles()\n")
     output.add("declare void @minyar_rc_local(i64, ptr)\n")
@@ -5494,6 +5561,15 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     output.add("declare void @minyar_list_set(ptr, i64, i64)\n")
     output.add("declare void @minyar_list_set_take(ptr, i64, i64)\n")
     output.add("declare ptr @minyar_list_appended(ptr, i64, i64, i64)\n")
+    output.add("declare ptr @minyar_list_appended_traced(ptr, i64, i64, i64)\n")
+    output.add("declare void @minyar_list_add_traced(ptr, i64)\n")
+    output.add("declare void @minyar_list_add_take_traced(ptr, i64)\n")
+    output.add("declare void @minyar_list_set_traced(ptr, i64, i64)\n")
+    output.add("declare void @minyar_list_set_take_traced(ptr, i64, i64)\n")
+    output.add("declare void @minyar_record_set_traced(ptr, i64, i64)\n")
+    output.add("declare void @minyar_record_set_take_traced(ptr, i64, i64)\n")
+    output.add("declare void @minyar_record_set_reference_traced(ptr, i64, i64)\n")
+    output.add("declare void @minyar_record_replace_traced(ptr, i64, i64, i64)\n")
     output.add("declare ptr @minyar_record_new(i64)\n")
     output.add("declare ptr @minyar_record_new_traced(i64)\n")
     output.add("declare ptr @minyar_record_new_scalar(i64)\n")

@@ -24,6 +24,9 @@ void minyar_rc_local_take(long long index, void *value) { (void)index; (void)val
 void minyar_rc_local_move(long long index) { (void)index; }
 void minyar_rc_step(void) {}
 void minyar_rc_retain(void *value) { (void)value; }
+void minyar_rc_retain_traced(void *value) { (void)value; }
+void minyar_rc_local_traced(long long index, void *value) { (void)index; (void)value; }
+void minyar_rc_borrow_traced(void *value) { (void)value; }
 void minyar_rc_release(void *value) { (void)value; }
 #else
 /* RC_TRACED marks a List or record with cycle metadata; see minyar_cycles.h. */
@@ -116,15 +119,30 @@ static void *rc_allocate_object(size_t size, unsigned kind) {
 #ifdef MINYAR_BOUNDED_RC
     rc_service_pending(MINYAR_RC_POLL_BUDGET);
 #endif
-    size_t extra = kind == RC_TRACED ? sizeof(RcCycle) : 0;
-    if (size > SIZE_MAX - sizeof(RcObject) - extra) out_of_memory();
-    void *allocation = RC_ALLOCATE(extra + sizeof(RcObject) + size);
-    if (!allocation) out_of_memory();
-    RcObject *object = (RcObject *)((unsigned char *)allocation + extra);
+    if (size > SIZE_MAX - sizeof(RcObject)) out_of_memory();
+    RcObject *object = RC_ALLOCATE(sizeof(*object) + size);
+    if (!object) out_of_memory();
     object->ownership = 8 | kind;
-    if (extra) *rc_cycle_metadata(object) = (RcCycle){0};
     RC_ACCOUNT(rc_object_count++);
-    RC_ACCOUNT(rc_bytes += extra + sizeof(*object) + size);
+    RC_ACCOUNT(rc_bytes += sizeof(*object) + size);
+    return object + 1;
+}
+
+/* A traced List (record = 0) or record (1): cycle metadata precedes the header. */
+static void *rc_allocate_traced(size_t size, unsigned record) {
+#ifdef MINYAR_BOUNDED_RC
+    rc_service_pending(MINYAR_RC_POLL_BUDGET);
+#endif
+    if (size > SIZE_MAX - sizeof(RcObject) - sizeof(RcCycle)) out_of_memory();
+    RcCycle *cycle = RC_ALLOCATE(sizeof(*cycle) + sizeof(RcObject) + size);
+    if (!cycle) out_of_memory();
+    *cycle = (RcCycle){0};
+    cycle->record = record;
+    rc_cycle_present = 1;
+    RcObject *object = rc_cycle_object(cycle);
+    object->ownership = 8 | RC_TRACED;
+    RC_ACCOUNT(rc_object_count++);
+    RC_ACCOUNT(rc_bytes += sizeof(*cycle) + sizeof(*object) + size);
     return object + 1;
 }
 
@@ -173,7 +191,13 @@ void minyar_rc_retain(void *value) {
     if (object->ownership > SIZE_MAX - 8)
         minyar_stop("this value has too many references.");
     object->ownership += 8;
-    if (rc_traced(object) && rc_cycle_shading) rc_cycle_shade_value(value);
+}
+
+/* Retain a value whose static type can lie on a cycle: acquiring a traced
+ * object while marking shades it. Other values use minyar_rc_retain. */
+void minyar_rc_retain_traced(void *value) {
+    minyar_rc_retain(value);
+    if (value && rc_traced((RcObject *)value - 1) && rc_cycle_shading) rc_cycle_shade_value(value);
 }
 
 #ifdef MINYAR_BOUNDED_RC
@@ -425,6 +449,16 @@ void minyar_rc_local(long long index, void *value) {
 
 void minyar_rc_borrow(void *value) {
     minyar_rc_retain(value);
+    minyar_rc_keep(value);
+}
+
+void minyar_rc_local_traced(long long index, void *value) {
+    minyar_rc_retain_traced(value);
+    minyar_rc_local_take(index, value);
+}
+
+void minyar_rc_borrow_traced(void *value) {
+    minyar_rc_retain_traced(value);
     minyar_rc_keep(value);
 }
 

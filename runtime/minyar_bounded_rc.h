@@ -17,9 +17,8 @@ static unsigned rc_bounded_recent_turn;
  * reference flag and store seven cursor bits each. The loop executes at most
  * ceil(sizeof(size_t)*CHAR_BIT/7) iterations, independent of graph size. */
 static size_t rc_bounded_saved_cursor(RcObject *object) {
-    unsigned kind = rc_kind(object);
-    if (kind == RC_TEXT) return 0;
-    if (kind == RC_REFERENCES)
+    if ((object->ownership & 7) == RC_TEXT) return 0;
+    if ((object->ownership & 7) == RC_REFERENCES || rc_kind(object) == RC_REFERENCES)
         return (size_t)((MinyarList *)(object + 1))->capacity;
     MinyarRecord *record = (MinyarRecord *)(object + 1);
     unsigned char *map = (unsigned char *)(record->values + record->length);
@@ -30,9 +29,8 @@ static size_t rc_bounded_saved_cursor(RcObject *object) {
 }
 
 static void rc_bounded_save_cursor(RcObject *object, size_t cursor) {
-    unsigned kind = rc_kind(object);
-    if (kind == RC_TEXT) return;
-    if (kind == RC_REFERENCES) {
+    if ((object->ownership & 7) == RC_TEXT) return;
+    if ((object->ownership & 7) == RC_REFERENCES || rc_kind(object) == RC_REFERENCES) {
         ((MinyarList *)(object + 1))->capacity = (long long)cursor;
         return;
     }
@@ -44,7 +42,30 @@ static void rc_bounded_save_cursor(RcObject *object, size_t cursor) {
     }
 }
 
+/* A dead RC_TRACED object frees from its cycle metadata. */
+static MINYAR_COLD void rc_bounded_finish_traced(RcObject *object) {
+    RcCycle *cycle = rc_cycle_metadata(object);
+    if (cycle->record) {
+#ifdef MINYAR_RC_TESTING
+        MinyarRecord *record = (MinyarRecord *)(object + 1);
+#endif
+        RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(MinyarRecord)
+                   + (size_t)record->length * (sizeof(long long) + 1));
+    } else {
+        MinyarList *list = (MinyarList *)(object + 1);
+        rc_free_data(list->values);
+        RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(*list));
+    }
+    RC_ACCOUNT(rc_bytes -= sizeof(RcCycle));
+    RC_DEALLOCATE(cycle);
+    RC_ACCOUNT(rc_object_count--);
+}
+
 static void *rc_bounded_finish_object(RcObject *object, unsigned kind) {
+    if (kind == RC_TRACED) {
+        rc_bounded_finish_traced(object);
+        return NULL;
+    }
     void *text_backing = NULL;
     if (kind == RC_TEXT) {
         MinyarText *text = (MinyarText *)(object + 1);
@@ -63,7 +84,7 @@ static void *rc_bounded_finish_object(RcObject *object, unsigned kind) {
         RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(MinyarRecord)
                    + (size_t)record->length * (sizeof(long long) + (kind == RC_RECORD)));
     }
-    rc_cycle_free_object(object);
+    RC_DEALLOCATE(object);
     RC_ACCOUNT(rc_object_count--);
     return text_backing;
 }
@@ -74,6 +95,24 @@ static void rc_bounded_enqueue(RcObject *object) {
     rc_bounded_recent_head = object;
     if (!rc_bounded_recent_tail) rc_bounded_recent_tail = object;
     rc_pending_count++;
+}
+
+/* Count drop of an RC_TRACED object: the same work as rc_drop, plus the
+ * collector's snapshot barriers, gray pinning and registry removal. */
+static MINYAR_COLD unsigned rc_drop_traced(RcObject *object) {
+    rc_cycle_before_drop(object);
+    object->ownership -= 8;
+    if (object->ownership >> 3) { rc_cycle_after_drop(object); return 0; }
+    if (rc_cycle_defer_zero(object)) return 0;
+    rc_cycle_unregister(object);
+    RcCycle *cycle = rc_cycle_metadata(object);
+    if (cycle->cleared || !(cycle->record ? ((MinyarRecord *)(object + 1))->length
+                                          : ((MinyarList *)(object + 1))->length)) {
+        rc_bounded_finish_traced(object);
+        return 1;
+    }
+    rc_bounded_enqueue(object);
+    return 0;
 }
 
 static unsigned rc_drop(void *value) {
@@ -88,18 +127,10 @@ static unsigned rc_drop(void *value) {
         return 1;
     }
     if (!(ownership >> 3)) return 0;
-    /* Untraced objects take exactly the ordinary count path. */
-    if ((ownership & 7) == RC_TRACED) {
-        rc_cycle_before_drop(object);
-        object->ownership = ownership - 8;
-        if (object->ownership >> 3) { rc_cycle_after_drop(object); return 0; }
-        if (rc_cycle_defer_zero(object)) return 0;
-        rc_cycle_unregister(object);
-    } else {
-        object->ownership = ownership - 8;
-        if (object->ownership >> 3) return 0;
-    }
-    unsigned kind = rc_kind(object);
+    if ((ownership & 7) == RC_TRACED) return rc_drop_traced(object);
+    object->ownership = ownership - 8;
+    if (object->ownership >> 3) return 0;
+    unsigned kind = object->ownership & 7;
     if (kind == RC_TEXT) {
         void *backing = rc_bounded_finish_object(object, kind);
         /* A view owns a direct reference to an owning Text, never another
@@ -116,7 +147,6 @@ static unsigned rc_drop(void *value) {
         return 1;
     }
     if (kind == RC_LIST || kind == RC_REFERENCES_IMMORTAL ||
-        (rc_traced(object) && rc_cycle_metadata(object)->cleared) ||
         (kind == RC_REFERENCES && !((MinyarList *)(object + 1))->length) ||
         (kind == RC_RECORD && !((MinyarRecord *)(object + 1))->length)) {
         rc_bounded_finish_object(object, kind);
@@ -126,9 +156,27 @@ static unsigned rc_drop(void *value) {
     return 0;
 }
 
-static void rc_drop_slot(int traced, void *value) {
-    rc_cycle_drop_slot(traced, value);
-    rc_drop(value);
+/* Visit field `cursor` of a dead RC_TRACED object as one unit, removing its
+ * incoming edge first; returns 0 once every field was visited. A recent task
+ * saves its cursor before the drop, exactly as the untraced paths do. */
+static MINYAR_COLD int rc_bounded_traced_visit(RcObject *object, size_t cursor, int recent) {
+    RcCycle *cycle = rc_cycle_metadata(object);
+    void *child;
+    if (cycle->record) {
+        MinyarRecord *record = (MinyarRecord *)(object + 1);
+        if (cursor >= (size_t)record->length) return 0;
+        unsigned char *map = (unsigned char *)(record->values + record->length);
+        child = (map[cursor] & 1) ? (void *)(uintptr_t)record->values[cursor] : NULL;
+    } else {
+        MinyarList *list = (MinyarList *)(object + 1);
+        if (cursor >= (size_t)list->length) return 0;
+        child = (void *)(uintptr_t)list->values[cursor];
+    }
+    if (recent) rc_bounded_save_cursor(object, cursor + 1);
+    else rc_bounded_cursor = cursor + 1;
+    rc_cycle_edge_remove(child);
+    rc_drop(child);
+    return 1;
 }
 
 static RcFrame *rc_bounded_frame_head, *rc_bounded_frame_tail;
@@ -155,12 +203,11 @@ static void rc_bounded_old_object_unit(void) {
         rc_bounded_cursor = rc_bounded_saved_cursor(rc_bounded_active);
     }
     RcObject *object = rc_bounded_active;
-    unsigned kind = rc_kind(object);
-    int traced = rc_traced(object);
+    unsigned kind = object->ownership & 7;
     if (kind == RC_REFERENCES) {
         MinyarList *list = (MinyarList *)(object + 1);
         if (rc_bounded_cursor < (size_t)list->length) {
-            rc_drop_slot(traced, (void *)(uintptr_t)list->values[rc_bounded_cursor++]);
+            rc_drop((void *)(uintptr_t)list->values[rc_bounded_cursor++]);
             return;
         }
     } else if (kind == RC_RECORD) {
@@ -168,9 +215,11 @@ static void rc_bounded_old_object_unit(void) {
         if (rc_bounded_cursor < (size_t)record->length) {
             unsigned char *map = (unsigned char *)(record->values + record->length);
             size_t index = rc_bounded_cursor++;
-            if (map[index] & 1) rc_drop_slot(traced, (void *)(uintptr_t)record->values[index]);
+            if (map[index] & 1) rc_drop((void *)(uintptr_t)record->values[index]);
             return;
         }
+    } else if (kind == RC_TRACED && rc_bounded_traced_visit(object, rc_bounded_cursor, 0)) {
+        return;
     }
     rc_bounded_finish_object(object, kind);
     rc_pending_count--;
@@ -182,15 +231,14 @@ static void rc_bounded_old_object_unit(void) {
  * recursion or an auxiliary allocation. */
 static void rc_bounded_recent_object_unit(void) {
     RcObject *object = rc_bounded_recent_head;
-    unsigned kind = rc_kind(object);
-    int traced = rc_traced(object);
+    unsigned kind = object->ownership & 7;
     size_t cursor = rc_bounded_saved_cursor(object);
     if (kind == RC_REFERENCES) {
         MinyarList *list = (MinyarList *)(object + 1);
         if (cursor < (size_t)list->length) {
             void *child = (void *)(uintptr_t)list->values[cursor];
             rc_bounded_save_cursor(object, cursor + 1);
-            rc_drop_slot(traced, child);
+            rc_drop(child);
             return;
         }
     } else if (kind == RC_RECORD) {
@@ -199,9 +247,11 @@ static void rc_bounded_recent_object_unit(void) {
             unsigned char *map = (unsigned char *)(record->values + record->length);
             void *child = (map[cursor] & 1) ? (void *)(uintptr_t)record->values[cursor] : NULL;
             rc_bounded_save_cursor(object, cursor + 1);
-            rc_drop_slot(traced, child);
+            rc_drop(child);
             return;
         }
+    } else if (kind == RC_TRACED && rc_bounded_traced_visit(object, cursor, 1)) {
+        return;
     }
     rc_bounded_recent_head = (RcObject *)(uintptr_t)(object->ownership & ~(size_t)7);
     if (!rc_bounded_recent_head) rc_bounded_recent_tail = NULL;
@@ -228,7 +278,7 @@ static void rc_bounded_object_unit(void) {
          * object unit captures the recent stack and services its head, so
          * recent progress is delayed by at most one object unit here. */
         RcObject *active = rc_bounded_active;
-        if (!rc_bounded_head && active && rc_kind(active) == RC_RECORD &&
+        if (!rc_bounded_head && active && (active->ownership & 7) == RC_RECORD &&
             ((MinyarRecord *)(active + 1))->length == 1 && rc_bounded_cursor == 1)
             rc_bounded_old_object_unit();
         else rc_bounded_recent_object_unit();
@@ -269,21 +319,22 @@ static void rc_bounded_chunk_unit(void) {
     rc_pending_count--;
 }
 
-/* Round-robin service across four queues: once in the general scheduler,
- * every continuously ready queue receives one unit within four units, even
- * with budget 1. A cycle job requested inside an object-only batch can wait
- * for that bounded batch to return before entering the general scheduler.
- * rc_pending_count includes objects, detached frames, temporary chunks and
- * one cycle job. */
-static MINYAR_COLD size_t rc_bounded_poll_work(size_t budget) {
+/* Round-robin service across three queues, or four once the program has
+ * allocated an RC_TRACED object (cycles != 0, a compile-time constant in each
+ * instantiation below). Every continuously ready queue receives one unit
+ * within three (four) units in the general scheduler, even with budget 1. A
+ * cycle job requested inside an object-only batch can wait for that bounded
+ * batch to return before entering the general scheduler. rc_pending_count
+ * includes objects, detached frames, temporary chunks and one cycle job. */
+static inline __attribute__((always_inline)) size_t rc_bounded_poll_body(size_t budget, const int cycles) {
     if (budget > MINYAR_RC_POLL_BUDGET) budget = MINYAR_RC_POLL_BUDGET;
     size_t work = 0;
-    if (!rc_bounded_frame_head && !rc_bounded_chunk_head && !rc_cycle_pending) {
+    if (!rc_bounded_frame_head && !rc_bounded_chunk_head && !(cycles && rc_cycle_pending)) {
         /* Object processing can enqueue objects or request a cycle job.
          * With no frame/chunk/cycle tasks, skip repeated queue selection.
          * Match the general scheduler's next queue after any object work;
          * empty and zero-budget polls leave that state unchanged. */
-        while (work < budget && rc_pending_count && !rc_cycle_pending) {
+        while (work < budget && rc_pending_count && !(cycles && rc_cycle_pending)) {
             /* With one unvisited unary record, locality makes its field visit
              * and finalization the next two units. There is no competing old
              * task to bypass, and dropping one child creates at most one task.
@@ -376,14 +427,15 @@ static MINYAR_COLD size_t rc_bounded_poll_work(size_t budget) {
     } else {
         while (work < budget && rc_pending_count) {
             unsigned queue = rc_bounded_next_queue;
-            for (unsigned tries = 0; tries < 4; tries++) {
+            const unsigned queues = cycles ? 4 : 3;
+            for (unsigned tries = 0; tries < queues; tries++) {
                 if ((queue == 0 && (rc_bounded_active || rc_bounded_head || rc_bounded_recent_head)) ||
                     (queue == 1 && rc_bounded_frame_head) ||
                     (queue == 2 && rc_bounded_chunk_head) ||
-                    (queue == 3 && rc_cycle_pending)) break;
-                queue = (queue + 1) % 4;
+                    (cycles && queue == 3 && rc_cycle_pending)) break;
+                queue = (queue + 1) % queues;
             }
-            rc_bounded_next_queue = (queue + 1) % 4;
+            rc_bounded_next_queue = (queue + 1) % queues;
             if (queue == 0) rc_bounded_object_unit();
             else if (queue == 1) rc_bounded_frame_unit();
             else if (queue == 2) rc_bounded_chunk_unit();
@@ -395,6 +447,16 @@ static MINYAR_COLD size_t rc_bounded_poll_work(size_t budget) {
     rc_bounded_last_work = work;
 #endif
     return work;
+}
+
+static MINYAR_COLD size_t rc_bounded_poll_traced(size_t budget) {
+    return rc_bounded_poll_body(budget, 1);
+}
+
+/* Programs that never allocate an RC_TRACED object keep v2's scheduler. */
+static MINYAR_COLD size_t rc_bounded_poll_work(size_t budget) {
+    if (rc_cycle_present) return rc_bounded_poll_traced(budget);
+    return rc_bounded_poll_body(budget, 0);
 }
 
 /* Every queue holds pending work, so with nothing pending a poll does no work

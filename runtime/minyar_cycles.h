@@ -28,6 +28,8 @@ static unsigned rc_cycle_pending, rc_cycle_inside;
 /* Nonzero exactly in the roots and mark phases, when barriers shade. Hot
  * ownership paths test this one global before touching any object metadata. */
 static unsigned rc_cycle_shading;
+/* Set by the first RC_TRACED allocation; until then no cycle job can exist. */
+static unsigned rc_cycle_present;
 /* Raw native clients conservatively trace. Generated main opts into complete
  * compiler mutation hints, before constructing any graph. */
 static unsigned rc_cycle_enabled = 1;
@@ -46,7 +48,7 @@ void minyar_rc_enable_cycles(void) {
 #ifdef MINYAR_RC_TESTING
 static size_t rc_cycle_units, rc_cycle_epochs;
 #endif
-static void rc_cycle_unit(void);
+static MINYAR_COLD void rc_cycle_unit(void);
 #ifndef MINYAR_BOUNDED_RC
 static void rc_cycle_eager_service(size_t budget);
 #endif
@@ -168,6 +170,8 @@ static inline void rc_cycle_edge_remove(void *value) {
     rc_cycle_shade(cycle);
     cycle->incoming--;
 }
+#ifndef MINYAR_BOUNDED_RC
+/* Eager profile helpers; the bounded profile has separate traced paths. */
 static void rc_cycle_free_object(RcObject *object) {
     if (rc_traced(object)) {
         RC_ACCOUNT(rc_bytes -= sizeof(RcCycle));
@@ -178,3 +182,4 @@ static void rc_cycle_free_object(RcObject *object) {
 static inline void rc_cycle_drop_slot(int traced, void *value) {
     if (traced) rc_cycle_edge_remove(value);
 }
+#endif

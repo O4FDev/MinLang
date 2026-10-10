@@ -15,7 +15,7 @@ MinyarList *minyar_list_new_traced(void) {
 #ifdef MINYAR_COMPILER_ARENA
     return minyar_list_new();
 #else
-    MinyarList *list = rc_allocate_object(sizeof(*list), RC_TRACED);
+    MinyarList *list = rc_allocate_traced(sizeof(*list), 0);
     list->values = NULL;
     list->length = 0;
     list->capacity = 0;
@@ -146,20 +146,15 @@ void minyar_list_add(MinyarList *list, long long value) {
         return;
     }
     kind = list_store_kind(list, value, kind);
-    if (kind == RC_REFERENCES || kind == RC_TRACED) {
+    if (kind == RC_REFERENCES)
         minyar_rc_retain((void *)(uintptr_t)value);
-        if (kind == RC_TRACED) rc_cycle_edge_add(list, (void *)(uintptr_t)value);
-    }
     list->values[list->length++] = value;
     if (rc_pending_count)
         minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
 #else
 #ifndef MINYAR_COMPILER_ARENA
-    unsigned kind = ((RcObject *)list - 1)->ownership & 7;
-    if (kind == RC_REFERENCES || kind == RC_TRACED) {
+    if ((((RcObject *)list - 1)->ownership & 7) == RC_REFERENCES)
         minyar_rc_retain((void *)(uintptr_t)value);
-        if (kind == RC_TRACED) rc_cycle_edge_add(list, (void *)(uintptr_t)value);
-    }
 #endif
     list->values[list->length++] = value;
 #endif
@@ -176,11 +171,6 @@ void minyar_list_add_take(MinyarList *list, long long value) {
         return;
     }
     kind = list_store_kind(list, value, kind);
-    if (kind == RC_TRACED)
-        rc_cycle_edge_add(list, (void *)(uintptr_t)value);
-#elif !defined(MINYAR_COMPILER_ARENA)
-    if ((((RcObject *)list - 1)->ownership & 7) == RC_TRACED)
-        rc_cycle_edge_add(list, (void *)(uintptr_t)value);
 #endif
     list->values[list->length++] = value;
 #if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
@@ -213,17 +203,13 @@ static void minyar_list_set_owned(MinyarList *list, long long position, long lon
 #ifndef MINYAR_COMPILER_ARENA
 #ifdef MINYAR_BOUNDED_RC
     unsigned kind = list_store_kind(list, value, ((RcObject *)list - 1)->ownership & 7);
+    if (kind == RC_REFERENCES) {
 #else
-    unsigned kind = ((RcObject *)list - 1)->ownership & 7;
+    if ((((RcObject *)list - 1)->ownership & 7) == RC_REFERENCES) {
 #endif
-    if (kind == RC_REFERENCES || kind == RC_TRACED) {
         if (retain_value)
             minyar_rc_retain((void *)(uintptr_t)value);
         long long previous = list->values[position];
-        if (kind == RC_TRACED) {
-            rc_cycle_edge_add(list, (void *)(uintptr_t)value);
-            rc_cycle_edge_remove((void *)(uintptr_t)previous);
-        }
         list->values[position] = value;
         minyar_rc_release((void *)(uintptr_t)previous);
         return;
@@ -245,17 +231,11 @@ void minyar_list_set_take(MinyarList *list, long long position, long long value)
 
 /* Return a fresh List containing the old elements followed by value. Because
  * the result did not exist while its inputs were evaluated, this operation
- * cannot introduce the first ownership cycle, so it never enables tracing. The compiler supplies the
+ * cannot introduce the first ownership cycle. The compiler supplies the
  * element ownership kind and may transfer the final value's existing owner. */
 MinyarList *minyar_list_appended(const MinyarList *list, long long value, long long references,
                                  long long take_value) {
-#ifdef MINYAR_COMPILER_ARENA
     MinyarList *result = minyar_list_new();
-#else
-    /* The result has the operand's static type, hence its traced layout. */
-    MinyarList *result = (((RcObject *)list - 1)->ownership & 7) == RC_TRACED
-                             ? minyar_list_new_traced() : minyar_list_new();
-#endif
     if (references)
         minyar_list_references(result);
     if (list->length == LLONG_MAX)
@@ -310,10 +290,10 @@ MinyarRecord *record_allocate(long long field_count, int references) {
     if ((unsigned long long)field_count >
         (SIZE_MAX - sizeof(RcObject) - sizeof(*record)) / field_size)
         out_of_memory();
-    record = rc_allocate_object(sizeof(*record) + (size_t)field_count * field_size,
-                                references == 2 ? RC_TRACED : references ? RC_RECORD : RC_SCALAR_RECORD);
-    if (references == 2)
-        rc_cycle_metadata((RcObject *)record - 1)->record = 1;
+    record = references == 2
+                 ? rc_allocate_traced(sizeof(*record) + (size_t)field_count * field_size, 1)
+                 : rc_allocate_object(sizeof(*record) + (size_t)field_count * field_size,
+                                      references ? RC_RECORD : RC_SCALAR_RECORD);
     memset(record->values, 0, (size_t)field_count * field_size);
 #endif
     record->length = field_count;
@@ -353,8 +333,7 @@ void minyar_record_set(MinyarRecord *record, long long field, long long value) {
         list_position_stop(field, record->length);
     record->values[field] = value;
 #if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
-    unsigned kind = ((RcObject *)record - 1)->ownership & 7;
-    if (kind == RC_RECORD || kind == RC_TRACED)
+    if ((((RcObject *)record - 1)->ownership & 7) == RC_RECORD)
         minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
 #endif
 }
@@ -365,8 +344,6 @@ void minyar_record_set_take(MinyarRecord *record, long long field, long long val
 #ifndef MINYAR_COMPILER_ARENA
     unsigned char *references = (unsigned char *)(record->values + record->length);
     references[field] = 1;
-    if ((((RcObject *)record - 1)->ownership & 7) == RC_TRACED)
-        rc_cycle_edge_add(record, (void *)(uintptr_t)value);
 #endif
     minyar_record_set(record, field, value);
 }
@@ -376,7 +353,8 @@ void minyar_record_set_reference(MinyarRecord *record, long long field, long lon
     minyar_record_set_take(record, field, value);
 }
 
-/* Replace an owning edge, preserving the collector snapshot before the poll. */
+/* Replace a reference field of a live record. The compiler has proved that
+ * the new edge cannot close an ownership cycle. */
 void minyar_record_replace(MinyarRecord *record, long long field, long long value,
                            long long take_value) {
     if ((unsigned long long)field >= (unsigned long long)record->length)
@@ -385,10 +363,6 @@ void minyar_record_replace(MinyarRecord *record, long long field, long long valu
     if (!take_value)
         minyar_rc_retain((void *)(uintptr_t)value);
     long long previous = record->values[field];
-    if ((((RcObject *)record - 1)->ownership & 7) == RC_TRACED) {
-        rc_cycle_edge_add(record, (void *)(uintptr_t)value);
-        rc_cycle_edge_remove((void *)(uintptr_t)previous);
-    }
     record->values[field] = value;
     minyar_rc_release((void *)(uintptr_t)previous);
 #else
@@ -396,3 +370,161 @@ void minyar_record_replace(MinyarRecord *record, long long field, long long valu
     record->values[field] = value;
 #endif
 }
+
+/* Entry points for Lists and records whose element or field type can lie on a
+ * heap cycle (see minyar_cycles.h). The compiler selects them from static
+ * types; the entry points above are v2's and never see RC_TRACED objects or
+ * values, so they keep their exact code and inlining. These handle every
+ * kind dynamically: an untraced List of traced values still shades a value
+ * it retains, and only traced owners count incoming slots. */
+#ifdef MINYAR_COMPILER_ARENA
+void minyar_list_add_traced(MinyarList *list, long long value) { minyar_list_add(list, value); }
+void minyar_list_add_take_traced(MinyarList *list, long long value) { minyar_list_add_take(list, value); }
+void minyar_list_set_traced(MinyarList *list, long long position, long long value) {
+    minyar_list_set(list, position, value);
+}
+void minyar_list_set_take_traced(MinyarList *list, long long position, long long value) {
+    minyar_list_set_take(list, position, value);
+}
+MinyarList *minyar_list_appended_traced(const MinyarList *list, long long value, long long references,
+                                        long long take_value) {
+    return minyar_list_appended(list, value, references, take_value);
+}
+void minyar_record_set_traced(MinyarRecord *record, long long field, long long value) {
+    minyar_record_set(record, field, value);
+}
+void minyar_record_set_take_traced(MinyarRecord *record, long long field, long long value) {
+    minyar_record_set_take(record, field, value);
+}
+void minyar_record_set_reference_traced(MinyarRecord *record, long long field, long long value) {
+    minyar_record_set_reference(record, field, value);
+}
+void minyar_record_replace_traced(MinyarRecord *record, long long field, long long value,
+                                  long long take_value) {
+    minyar_record_replace(record, field, value, take_value);
+}
+#else
+static void list_store_traced(MinyarList *list, long long value, int retain_value) {
+    if (list->length == list->capacity)
+        list_grow(list);
+    unsigned kind = ((RcObject *)list - 1)->ownership & 7;
+#ifdef MINYAR_BOUNDED_RC
+    kind = list_store_kind(list, value, kind);
+#endif
+    if (kind == RC_REFERENCES || kind == RC_TRACED) {
+        if (retain_value)
+            minyar_rc_retain_traced((void *)(uintptr_t)value);
+        if (kind == RC_TRACED)
+            rc_cycle_edge_add(list, (void *)(uintptr_t)value);
+    }
+    list->values[list->length++] = value;
+#ifdef MINYAR_BOUNDED_RC
+    if (rc_pending_count)
+        minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
+#endif
+}
+
+void minyar_list_add_traced(MinyarList *list, long long value) {
+    list_store_traced(list, value, 1);
+}
+
+void minyar_list_add_take_traced(MinyarList *list, long long value) {
+    list_store_traced(list, value, 0);
+}
+
+static void list_replace_traced(MinyarList *list, long long position, long long value,
+                                int retain_value) {
+    if ((unsigned long long)position >= (unsigned long long)list->length)
+        list_position_stop(position, list->length);
+    unsigned kind = ((RcObject *)list - 1)->ownership & 7;
+#ifdef MINYAR_BOUNDED_RC
+    kind = list_store_kind(list, value, kind);
+#endif
+    if (kind == RC_REFERENCES || kind == RC_TRACED) {
+        if (retain_value)
+            minyar_rc_retain_traced((void *)(uintptr_t)value);
+        long long previous = list->values[position];
+        if (kind == RC_TRACED) {
+            rc_cycle_edge_add(list, (void *)(uintptr_t)value);
+            rc_cycle_edge_remove((void *)(uintptr_t)previous);
+        }
+        list->values[position] = value;
+        minyar_rc_release((void *)(uintptr_t)previous);
+        return;
+    }
+    list->values[position] = value;
+}
+
+void minyar_list_set_traced(MinyarList *list, long long position, long long value) {
+    list_replace_traced(list, position, value, 1);
+}
+
+void minyar_list_set_take_traced(MinyarList *list, long long position, long long value) {
+    list_replace_traced(list, position, value, 0);
+}
+
+/* As minyar_list_appended; the result has the operand's static type, hence
+ * its traced or untraced layout. */
+MinyarList *minyar_list_appended_traced(const MinyarList *list, long long value, long long references,
+                                        long long take_value) {
+    MinyarList *result = (((RcObject *)list - 1)->ownership & 7) == RC_TRACED
+                             ? minyar_list_new_traced() : minyar_list_new();
+    if (references)
+        minyar_list_references(result);
+    if (list->length == LLONG_MAX)
+        minyar_stop("this List became too large.");
+#ifdef MINYAR_BOUNDED_RC
+    if (rc_pending_count) {
+        while (result->capacity < list->length + 1)
+            list_grow(result);
+    } else
+#endif
+        list_reserve(result, list->length + 1);
+    for (long long position = 0; position < list->length; position++)
+        minyar_list_add_traced(result, list->values[position]);
+    list_store_traced(result, value, !take_value);
+    return result;
+}
+
+void minyar_record_set_traced(MinyarRecord *record, long long field, long long value) {
+    if ((unsigned long long)field >= (unsigned long long)record->length)
+        list_position_stop(field, record->length);
+    record->values[field] = value;
+#ifdef MINYAR_BOUNDED_RC
+    unsigned kind = ((RcObject *)record - 1)->ownership & 7;
+    if (kind == RC_RECORD || kind == RC_TRACED)
+        minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
+#endif
+}
+
+void minyar_record_set_take_traced(MinyarRecord *record, long long field, long long value) {
+    if ((unsigned long long)field >= (unsigned long long)record->length)
+        list_position_stop(field, record->length);
+    unsigned char *references = (unsigned char *)(record->values + record->length);
+    references[field] = 1;
+    if ((((RcObject *)record - 1)->ownership & 7) == RC_TRACED)
+        rc_cycle_edge_add(record, (void *)(uintptr_t)value);
+    minyar_record_set_traced(record, field, value);
+}
+
+void minyar_record_set_reference_traced(MinyarRecord *record, long long field, long long value) {
+    minyar_rc_retain_traced((void *)(uintptr_t)value);
+    minyar_record_set_take_traced(record, field, value);
+}
+
+/* Replace an owning edge, preserving the collector snapshot before the poll. */
+void minyar_record_replace_traced(MinyarRecord *record, long long field, long long value,
+                                  long long take_value) {
+    if ((unsigned long long)field >= (unsigned long long)record->length)
+        list_position_stop(field, record->length);
+    if (!take_value)
+        minyar_rc_retain_traced((void *)(uintptr_t)value);
+    long long previous = record->values[field];
+    if ((((RcObject *)record - 1)->ownership & 7) == RC_TRACED) {
+        rc_cycle_edge_add(record, (void *)(uintptr_t)value);
+        rc_cycle_edge_remove((void *)(uintptr_t)previous);
+    }
+    record->values[field] = value;
+    minyar_rc_release((void *)(uintptr_t)previous);
+}
+#endif
