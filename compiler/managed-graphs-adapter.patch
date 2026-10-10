@@ -1,0 +1,458 @@
+--- a/compiler/compiler.min
++++ b/compiler/compiler.min
+@@ -1469,7 +1469,8 @@
+         index = index + 1
+         while isListType(type) {
+             if type == listType {
+-                fail("this List mutation could create a reference cycle; construct a new List instead")
++                activateCycleType(returnTypes, listType, counts.length)
++                return
+             }
+             type = listElementType(type)
+         }
+@@ -1487,6 +1488,169 @@
+         }
+     }
+     returnTypes.add(listType)
++}
++
++// The existing positive tail entries cache safe mutation types. Negative
++// entries describe deferred cycle fixups: -2, -(piece+1), -(typeA+1),
++// -(typeB+1); and activation roots: -3, -(type+1). Payloads are negative too,
++// so they cannot accidentally satisfy the existing positive cache lookup.
++// Constructors emitted before a later mutation are patched only after every
++// typed body has been checked. No activation leaves every LLVM byte intact.
++function activateCycleType(returnTypes: List<Integer>, type: Integer, start: Integer) {
++    let position = start
++    while position + 1 < returnTypes.length {
++        if returnTypes[position] == -3 {
++            if returnTypes[position + 1] == -1 - type { return }
++            position = position + 2
++        } else {
++            if returnTypes[position] == -2 { position = position + 4 } else { position = position + 1 }
++        }
++    }
++    returnTypes.add(-3)
++    returnTypes.add(-1 - type)
++}
++
++function cycleTypeReaches(from: Integer, target: Integer, counts: List<Integer>, fields: List<Integer>): Boolean {
++    if from == target { return true }
++    if !isListType(from) && !isRecordType(from) { return false }
++    let visited: List<Boolean> = []
++    let position = 0
++    while position < counts.length / 2 { visited.add(false)
++        position = position + 1 }
++    let pending: List<Integer> = []
++    pending.add(from)
++    position = 0
++    while position < pending.length {
++        let type = pending[position]
++        position = position + 1
++        while isListType(type) {
++            if type == target { return true }
++            type = listElementType(type)
++        }
++        if type == target { return true }
++        if isRecordType(type) && !visited[type - 1000] {
++            let record = type - 1000
++            visited[record] = true
++            let field = 0
++            let first = functionParameterOffset(counts, record)
++            while field < counts[record] {
++                pending.add(fields[first + field])
++                field = field + 1
++            }
++        }
++    }
++    return false
++}
++
++function possibleCycleType(type: Integer, counts: List<Integer>, fields: List<Integer>, returnTypes: List<Integer>): Boolean {
++    let base = type
++    while isListType(base) { base = listElementType(base) }
++    if !isRecordType(base) { return false }
++    let position = counts.length
++    while position < returnTypes.length {
++        if returnTypes[position] == type { return false }
++        position = position + 1
++    }
++    let starts: List<Integer> = []
++    if isListType(type) {
++        starts.add(listElementType(type))
++    } else {
++        let record = type - 1000
++        let first = functionParameterOffset(counts, record)
++        position = 0
++        while position < counts[record] { starts.add(fields[first + position])
++            position = position + 1 }
++    }
++    position = 0
++    while position < starts.length {
++        if cycleTypeReaches(starts[position], type, counts, fields) { return true }
++        position = position + 1
++    }
++    returnTypes.add(type)
++    return false
++}
++
++function noteCycleFixup(output: List<Text>, returnTypes: List<Integer>, counts: List<Integer>, fields: List<Integer>, piece: Integer, typeA: Integer, typeB: Integer) {
++    // Most compiler/runtime values are scalar, Text, Bytes, or Lists of those.
++    // They cannot form a cycle and need no graph query or fixup allocation.
++    let baseA = typeA
++    let baseB = typeB
++    while isListType(baseA) { baseA = listElementType(baseA) }
++    while isListType(baseB) { baseB = listElementType(baseB) }
++    if !isRecordType(baseA) && !isRecordType(baseB) { return }
++    if possibleCycleType(typeA, counts, fields, returnTypes) || possibleCycleType(typeB, counts, fields, returnTypes) {
++        returnTypes.add(-2)
++        returnTypes.add(-1 - piece)
++        returnTypes.add(-1 - typeA)
++        returnTypes.add(-1 - typeB)
++    }
++}
++
++function cycleTypeActive(type: Integer, returnTypes: List<Integer>, counts: List<Integer>, fields: List<Integer>): Boolean {
++    if !isListType(type) && !isRecordType(type) { return false }
++    let position = counts.length
++    while position + 1 < returnTypes.length {
++        if returnTypes[position] == -3 {
++            let root = -1 - returnTypes[position + 1]
++            if cycleTypeReaches(root, type, counts, fields) && cycleTypeReaches(type, root, counts, fields) { return true }
++            position = position + 2
++        } else {
++            if returnTypes[position] == -2 { position = position + 4 } else { position = position + 1 }
++        }
++    }
++    return false
++}
++
++function finishCycleFixups(output: List<Text>, returnTypes: List<Integer>, counts: List<Integer>, fields: List<Integer>) {
++    let position = counts.length
++    let enabled = false
++    while position + 1 < returnTypes.length {
++        if returnTypes[position] == -3 {
++            enabled = true
++            position = position + 2
++        } else {
++            if returnTypes[position] == -2 { position = position + 4 } else { position = position + 1 }
++        }
++    }
++    if !enabled { return }
++    position = counts.length
++    while position + 3 < returnTypes.length {
++        if returnTypes[position] == -2 {
++            let piece = -1 - returnTypes[position + 1]
++            let typeA = -1 - returnTypes[position + 2]
++            let typeB = -1 - returnTypes[position + 3]
++            if cycleTypeActive(typeA, returnTypes, counts, fields) || cycleTypeActive(typeB, returnTypes, counts, fields) {
++                let text = output[piece]
++                let end = 0
++                while end < text.byteLength && text[end] != '(' { end = end + 1 }
++                if end < text.byteLength {
++                    output[piece] = text.slice(0, end) + "_traced" + text.slice(end, text.byteLength)
++                } else {
++                    if text != "" { output[piece] = text + "_traced" }
++                }
++            }
++            position = position + 4
++        } else {
++            if returnTypes[position] == -3 { position = position + 2 } else { position = position + 1 }
++        }
++    }
++    output.add("; minyar-cycle-runtime: 1\n")
++    output.add("declare void @minyar_rc_retain_traced(ptr)\n")
++    output.add("declare void @minyar_rc_local_traced(i64, ptr)\n")
++    output.add("declare void @minyar_rc_borrow_traced(ptr)\n")
++    output.add("declare void @minyar_rc_enable_cycles()\n")
++    output.add("declare ptr @minyar_list_new_traced()\n")
++    output.add("declare ptr @minyar_list_appended_traced(ptr, i64, i64, i64)\n")
++    output.add("declare ptr @minyar_list_appended_take_traced(ptr, i64, i64, i64)\n")
++    output.add("declare void @minyar_list_add_traced(ptr, i64)\n")
++    output.add("declare void @minyar_list_add_take_traced(ptr, i64)\n")
++    output.add("declare void @minyar_list_set_traced(ptr, i64, i64)\n")
++    output.add("declare void @minyar_list_set_take_traced(ptr, i64, i64)\n")
++    output.add("declare ptr @minyar_record_new_traced(i64)\n")
++    output.add("declare void @minyar_record_set_traced(ptr, i64, i64)\n")
++    output.add("declare void @minyar_record_set_take_traced(ptr, i64, i64)\n")
++    output.add("declare void @minyar_record_set_reference_traced(ptr, i64, i64)\n")
++    output.add("declare void @minyar_record_replace_traced(ptr, i64, i64, i64)\n")
+ }
+-
++
+ function requireType(tokenLines: SourceMap, state: List<Integer>, actual: Integer, expected: Integer, explanation: Text) {
+@@ -1711,7 +1875,7 @@
+     }
+ }
+-
++
+-function assignReference(output: List<Text>, state: List<Integer>, id: Integer, value: Text, resultType: List<Integer>) {
++function assignReference(output: List<Text>, state: List<Integer>, id: Integer, value: Text, resultType: List<Integer>, counts: List<Integer>, fields: List<Integer>, returnTypes: List<Integer>) {
+     if takeResult(output, state, value, resultType) {
+         state[6] = 1
+         output.add("  call void @minyar_rc_local_take(i64 ")
+@@ -1720,13 +1884,16 @@
+         output.add(value)
+         output.add(")\n")
+     } else {
++        let piece = output.length
+         rootLocal(output, state, id, value, resultType[0])
+-    }
+-}
+-function borrowReference(output: List<Text>, state: List<Integer>, value: Text, type: Integer) {
++        if piece < output.length { noteCycleFixup(output, returnTypes, counts, fields, piece, resultType[0], 0) }
++    }
++}
++function borrowReference(output: List<Text>, state: List<Integer>, value: Text, type: Integer, counts: List<Integer>, fields: List<Integer>, returnTypes: List<Integer>) {
+     if isReferenceType(type) {
+         state[6] = 1
+         state[7] = state[7] + 1
++        noteCycleFixup(output, returnTypes, counts, fields, output.length, type, 0)
+         output.add("  call void @minyar_rc_borrow(ptr ")
+         output.add(value)
+         output.add(")\n")
+@@ -2625,6 +2792,7 @@
+                         output.add("  ")
+                         output.add(value)
+                         output.add(" = call ptr @")
++                        noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, receiverType, argumentType[0])
+                         output.add(runtimeName)
+                         output.add("(ptr ")
+                         output.add(receiver)
+@@ -2653,7 +2821,11 @@
+                         fail("the value added to a List has the wrong type")
+                     }
+                     checkListMutation(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
++                    if possibleCycleType(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes) {
++                        output.add("  call void @minyar_rc_enable_cycles()\n")
++                    }
+                     let slot = valueAsListSlot(output, textState, state, argument, argumentType[0])
++                    noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, receiverType, argumentType[0])
+                     if takeResult(output, state, argument, argumentType) {
+                         output.add("  call void @minyar_list_add_take(ptr ")
+                     } else {
+@@ -2776,7 +2948,7 @@
+             // calls and indexed expressions can, so keep those receivers alive.
+             let fieldRead = tokenIs(tokenKinds, tokenTexts, state, ".") && state[0] + 2 < tokenTexts.length && tokenTexts[state[0] + 2] != "("
+             if !fieldRead && !indexWithoutCalls(tokenKinds, tokenTexts, state[0]) {
+-                borrowReference(output, state, value, resultType[0])
++                borrowReference(output, state, value, resultType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes)
+             }
+         }
+     }
+@@ -2835,6 +3007,7 @@
+         if scalar {
+             output.add(" = call ptr @minyar_record_new_scalar(i64 ")
+         } else {
++            noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, 1000 + record, 0)
+             output.add(" = call ptr @minyar_record_new(i64 ")
+         }
+         output.add(Text(fieldCount))
+@@ -2871,6 +3044,7 @@
+         if scalarValues >= 0 {
+             output[scalarValues + fieldPosition * 3 + 1] = slot
+         } else {
++        noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, 1000 + record, fieldType[0])
+         if isReferenceType(fieldType[0]) {
+             if takeResult(output, state, fieldValue, fieldType) {
+                 output.add("  call void @minyar_record_set_take(ptr ")
+@@ -3258,9 +3432,11 @@
+     let value = valueName(textState, temporary)
+     output.add("  ")
+     output.add(value)
++    let constructor = output.length
+     output.add(" = call ptr @minyar_list_new()\n")
+     let references = false
+     if isReferenceType(elementType) {
++        noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, constructor, 100000 + elementType, 0)
+         output.add("  call void @minyar_list_references(ptr ")
+         output.add(value)
+         output.add(")\n")
+@@ -3288,12 +3464,14 @@
+             fail("all values in a List literal must have the same type")
+         }
+         if isReferenceType(elementType) && !references {
++            noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, constructor, 100000 + elementType, 0)
+             output.add("  call void @minyar_list_references(ptr ")
+             output.add(value)
+             output.add(")\n")
+             references = true
+         }
+         let slot = valueAsListSlot(output, textState, state, item, elementType)
++        noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, 100000 + elementType, elementType)
+         if takeResult(output, state, item, itemType) {
+             output.add("  call void @minyar_list_add_take(ptr ")
+         } else {
+@@ -3320,6 +3498,7 @@
+     let kind = tokenKinds[tokenIndex]
+     let token = tokenTexts[tokenIndex]
+     let value = ""
++
+-
++
+     if kind == 1 {
+         if token == "true" || token == "false" {
+@@ -4014,7 +4193,7 @@
+-
++
+ // Adding an edge R -> F can close a first cycle only when a value reachable
+ // from F can itself be an R. Mirror checkListMutation for record fields.
+-function checkFieldMutation(recordType: Integer, fieldType: Integer, counts: List<Integer>, fields: List<Integer>, locations: SourceMap, location: Integer) {
++function checkFieldMutation(recordType: Integer, fieldType: Integer, counts: List<Integer>, fields: List<Integer>, locations: SourceMap, location: Integer, returnTypes: List<Integer>) {
+     let recordCount = counts.length / 2
+     let visited: List<Boolean> = []
+     let index = 0
+@@ -4033,7 +4212,8 @@
+         }
+         if isRecordType(type) {
+             if type == recordType {
+-                fail(describeLocation(tokenLocation(locations, location)) + ": assigning this field could create a reference cycle; construct a new record instead")
++                activateCycleType(returnTypes, recordType, counts.length)
++                return
+             }
+             let record = type - 1000
+             if !visited[record] {
+@@ -4089,7 +4269,7 @@
+         if valueType[0] != receiverType {
+             fail(describeLocation(tokenLocation(tokenLines, operatorLocation)) + ": an assignment to '" + name + "' has the wrong type")
+         }
+-        assignReference(output, state, localIds[local], value, valueType)
++        assignReference(output, state, localIds[local], value, valueType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+         storeLocal(output, localIds[local], receiverType, value)
+         return
+     }
+@@ -4118,12 +4298,12 @@
+                     state[0] = next + 4
+                 }
+                 if isReferenceType(fieldType) {
+-                    checkFieldMutation(receiverType, fieldType, functionParameterCounts, functionParameterTypes, tokenLines, memberLocation)
++                    checkFieldMutation(receiverType, fieldType, functionParameterCounts, functionParameterTypes, tokenLines, memberLocation, functionReturnTypes)
+                 }
+                 let current = ""
+                 if binary != "" {
+                     current = readRecordField(output, textState, state, receiver, fieldIndex, fieldType)
+-                    borrowReference(output, state, current, fieldType)
++                    borrowReference(output, state, current, fieldType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+                 }
+                 let value = ""
+                 if binary == "+" && fieldType == 2 {
+@@ -4155,10 +4335,14 @@
+                 }
+                 let slot = valueAsListSlot(output, textState, state, value, fieldType)
+                 if isReferenceType(fieldType) {
++                    if possibleCycleType(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes) && cycleTypeReaches(fieldType, receiverType, functionParameterCounts, functionParameterTypes) {
++                        output.add("  call void @minyar_rc_enable_cycles()\n")
++                    }
+                     let transfers = "0"
+                     if takeResult(output, state, value, valueType) {
+                         transfers = "1"
+                     }
++                    noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, receiverType, fieldType)
+                     output.add("  call void @minyar_record_replace(ptr ")
+                     output.add(receiver)
+                     output.add(", i64 ")
+@@ -4184,8 +4368,8 @@
+                 // `record.field[position] = value` with no call in the rest of
+                 // the statement: nothing can replace the field before the
+                 // store, so it needs no borrow (as for reads, see parsePrimary).
+-                if !(tokenTexts[state[0]] == "[" && statementWithoutCalls(tokenKinds, tokenTexts, state[0])) {
+-                    borrowReference(output, state, receiver, receiverType)
++                if possibleCycleType(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes) || !(tokenTexts[state[0]] == "[" && statementWithoutCalls(tokenKinds, tokenTexts, state[0])) {
++                    borrowReference(output, state, receiver, receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+                 }
+             }
+         } else {
+@@ -4223,13 +4407,17 @@
+                     checkListMutation(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+                     if binary != "" {
+                         current = readListElement(output, textState, state, receiver, position, elementType)
+-                        borrowReference(output, state, current, elementType)
++                        borrowReference(output, state, current, elementType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+                     }
+                     let value = assignedValue(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, binary, current, elementType, valueType, operatorLocation)
+                     if valueType[0] != elementType {
+                         fail(describeLocation(tokenLocation(tokenLines, operatorLocation)) + ": an indexed assignment needs " + describeType(elementType) + ", not " + describeType(valueType[0]))
+                     }
++                    if possibleCycleType(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes) {
++                        output.add("  call void @minyar_rc_enable_cycles()\n")
++                    }
+                     let slot = valueAsListSlot(output, textState, state, value, elementType)
++                    noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, receiverType, elementType)
+                     if takeResult(output, state, value, valueType) {
+                         output.add("  call void @minyar_list_set_take(ptr ")
+                     } else {
+@@ -4253,7 +4441,7 @@
+                 }
+                 receiver = readListElement(output, textState, state, receiver, position, elementType)
+                 receiverType = elementType
+-                borrowReference(output, state, receiver, receiverType)
++                borrowReference(output, state, receiver, receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+             }
+         }
+     }
+@@ -4354,7 +4542,7 @@
+         }
+         collection = nextLocal(state)
+         addLocal(localNames, localTypes, localIds, localLengths, state, " for collection", sourceType[0], collection)
+-        assignReference(output, state, collection, source, sourceType)
++        assignReference(output, state, collection, source, sourceType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+         storeLocal(output, collection, sourceType[0], source)
+         storeLocal(output, counter, 1, "0")
+     }
+@@ -4400,7 +4588,7 @@
+     addLocal(localNames, localTypes, localIds, localLengths, state, name, elementType, variable)
+     let elementResult: List<Integer> = []
+     elementResult.add(elementType)
+-    assignReference(output, state, variable, element, elementResult)
++    assignReference(output, state, variable, element, elementResult, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+     storeLocal(output, variable, elementType, element)
+     addLocal(localNames, localTypes, localIds, localLengths, state, " loop", -2, loopLabel)
+     let bodyReturns = compileBlock(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
+@@ -5077,6 +5265,13 @@
+             }
+             valueType[0] = declaredType
+             if isReferenceType(listElementType(declaredType)) {
++                let constructor = output.length - 1
++                while constructor > 0 && !(output[constructor] == " = call ptr @minyar_list_new()\n" && output[constructor - 1] == value) {
++                    constructor = constructor - 1
++                }
++                if constructor > 0 {
++                    noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, constructor, declaredType, 0)
++                }
+                 output.add("  call void @minyar_list_references(ptr ")
+                 output.add(value)
+                 output.add(")\n")
+@@ -5091,7 +5286,7 @@
+         }
+         let id = nextLocal(state)
+         addLocal(localNames, localTypes, localIds, localLengths, state, name, type, id)
+-        assignReference(output, state, id, value, valueType)
++        assignReference(output, state, id, value, valueType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+         output.add("  store ")
+         output.add(llvmType(type))
+         output.add(" ")
+@@ -5117,6 +5312,7 @@
+                 fail("a returned value has the wrong type")
+             }
+             if isReferenceType(valueType[0]) && !takeResult(output, state, value, valueType) {
++                noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, valueType[0], 0)
+                 output.add("  call void @minyar_rc_retain(ptr ")
+                 output.add(value)
+                 output.add(")\n")
+@@ -5174,7 +5370,7 @@
+                         if valueType[0] != localTypes[local] {
+                             fail("an assignment to '" + name + "' has the wrong type")
+                         }
+-                        assignReference(output, state, localIds[local], value, valueType)
++                        assignReference(output, state, localIds[local], value, valueType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+                         output.add("  store ")
+                         output.add(llvmType(valueType[0]))
+                         output.add(" ")
+@@ -5750,6 +5946,7 @@
+         compileTopLevel(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, output, globals)
+     }
+     checkParallelCalls(globals)
++    finishCycleFixups(output, functionReturnTypes, functionParameterCounts, functionParameterTypes)
+     if stackOwnerLimit > 0 {
+         output.add("declare void @minyar_rc_enter_stack_v1(ptr, ptr, i64)\n")
+         output.add("declare void @minyar_rc_leave_stack_v1(ptr)\n")

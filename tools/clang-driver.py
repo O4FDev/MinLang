@@ -96,6 +96,31 @@ def native_object(project, clang, base, name, compile_flags):
     return str(output)
 
 
+def cycle_runtime_object(project, clang, runtime, release, link_flags):
+    from cycle_runtime import configured_source
+    source = configured_source(project, runtime)
+    options = flags('MINYAR_RUNTIME_FLAGS', '-O2 -Wno-override-module')
+    if release == '1':
+        options += lto_flags(clang, link_flags)[:1]
+    identity = clang_identity(clang)
+    identity.update(json.dumps(options).encode() + source.encode())
+    for header in sorted((project / 'runtime').rglob('*.h')):
+        identity.update(str(header.relative_to(project)).encode() + header.read_bytes())
+    directory = project / 'build/native'
+    directory.mkdir(parents=True, exist_ok=True)
+    output = directory / ('cycle-runtime-' + identity.hexdigest() + '.o')
+    if not output.is_file():
+        with tempfile.TemporaryDirectory(prefix='cycle-runtime-', dir=directory) as temporary:
+            temporary = Path(temporary)
+            configured = temporary / 'runtime.c'
+            configured.write_text(source)
+            staged = temporary / 'runtime.o'
+            run([clang, *options, '-iquote', str(project / 'runtime'),
+                 '-c', str(configured), '-o', str(staged)])
+            os.replace(staged, output)
+    return str(output)
+
+
 def graphics(project, clang, base, native_flags):
     cflags, libraries = glfw_flags()
     output = native_object(project, clang, base, 'graphics.c', [*native_flags, *cflags])
@@ -270,10 +295,17 @@ def main():
                        else ('-O0 -g -Wno-override-module' if debug else '-O2 -Wno-override-module'))
     native = []
     libraries = set()
+    cycles = False
     with Path(llvm).open() as stream:
         for line in stream:
             if line.startswith('; minyar-native-library: '):
-                libraries.add(line.removeprefix('; minyar-native-library: ').strip())
+                library = line.removeprefix('; minyar-native-library: ').strip()
+                libraries.add(library)
+                if library == 'callbackruntime': cycles = True
+            if line in ('; minyar-cycle-runtime: 1\n', '; minyar-callback-runtime: 1\n'):
+                cycles = True
+    if cycles:
+        runtime = cycle_runtime_object(project, clang, runtime, release, link_flags)
     native_flags = flags('MINYAR_NATIVE_FLAGS', shlex.join(link_flags))
     base = clang_identity(clang) if libraries - {'machine', 'machine_arm64'} else None
     for library in sorted(libraries):
@@ -295,6 +327,13 @@ def main():
             native += [native_object(project, clang, base, 'net.c', native_flags)]
             if platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
                 native += ['-lws2_32']
+        elif library == 'workers':
+            native += [native_object(project, clang, base, 'workers.c', native_flags)]
+            if platform.system() != 'Windows':
+                native += ['-pthread']
+        elif library == 'callbackruntime':
+            # This bounded service entry is supplied by the opt-in engine.
+            pass
         elif library == 'tlsverify':
             native += [native_object(project, clang, base, 'tlsverify.c', native_flags)]
             if platform.system() == 'Darwin':

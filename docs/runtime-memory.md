@@ -10,6 +10,15 @@ and operations outside that budget; it is not a wall-clock deadline.
 
 ## Recursive data and cycle prevention
 
+The following proof describes ordinary untraced allocation. The isolated
+managed-graphs candidate adds a parsed optional frontend for cycle-capable
+mutation and typed closures; those programs use a separate traced runtime and
+exact hidden capture edges. They do not use this no-cycles proof. See
+[the candidate's ownership and execution-domain contract](managed-graphs.md).
+The ordinary compiler's cycle checks request that frontend with status 86
+instead of emitting an unsafe edge. Programs that require no such feature
+retain the original LLVM and runtime allocation representation.
+
 Recursive record types are supported, including recursion through nested Lists
 and mutually recursive records. Trees, persistent chains and shared acyclic
 structures can be built with record constructors and List literals; see

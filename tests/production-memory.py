@@ -9,8 +9,16 @@ from regressions import CompilerTestCase
 
 CYCLE_DIAGNOSTIC = 'this List mutation could create a reference cycle'
 
+from feature_compiler import accepts_managed_graph
+
 
 class ProductionMemory(CompilerTestCase):
+    def rejects(self, source, diagnostic):
+        if diagnostic == CYCLE_DIAGNOSTIC:
+            accepts_managed_graph(self, source)
+        else:
+            super().rejects(source, diagnostic)
+
     def test_fresh_return_calls_preserve_caller_temporaries(self):
         # Uncached integers force owned Text allocations. Each left operand
         # must survive fresh, nested and recursive calls for the right operand.

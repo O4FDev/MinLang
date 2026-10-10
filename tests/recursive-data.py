@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Recursive construction with type-proven acyclic mutable edges.
+"""Recursive construction and independently classified cyclic mutable edges.
 
 Run natively and with MINYAR_TEST_RUNTIME pointing at the exact-accounting
 sanitizer runtime. Every executable case runs at both O0 and O2.
@@ -10,8 +10,16 @@ from regressions import CompilerTestCase
 
 DIAGNOSTIC = 'this List mutation could create a reference cycle'
 
+from feature_compiler import accepts_managed_graph
+
 
 class RecursiveData(CompilerTestCase):
+    def rejects(self, source, diagnostic):
+        if diagnostic == DIAGNOSTIC:
+            accepts_managed_graph(self, source)
+        else:
+            super().rejects(source, diagnostic)
+
     def test_tree_construction_recursion_and_shared_subtrees(self):
         self.executes('''record Node { value: Integer; children: List<Node> }
 function tree(depth: Integer): Node {
@@ -103,7 +111,7 @@ print(root.children[0].value)
 print(root.children[19].value)
 ''', '20\n1\n20\n')
 
-    def test_direct_self_cycle_add_and_overwrite_rejected(self):
+    def test_direct_self_cycle_add_and_overwrite_use_collector(self):
         declarations = 'record Node { children: List<Node> }\n'
         for body in (
             'let children: List<Node> = []\nlet node = Node { children: children }\nchildren.add(node)',
@@ -114,7 +122,7 @@ print(root.children[19].value)
             with self.subTest(body=body):
                 self.rejects(declarations + body + '\n', DIAGNOSTIC)
 
-    def test_alias_return_and_record_projection_cannot_bypass_rejection(self):
+    def test_alias_return_and_record_projection_select_collector(self):
         declarations = '''record Node { children: List<Node> }
 function children(node: Node): List<Node> { return node.children }
 '''
@@ -124,7 +132,7 @@ let node = Node { children: items }
 let alias = items
 ''' + expression + '\n', DIAGNOSTIC)
 
-    def test_nested_list_edges_both_rejected(self):
+    def test_nested_list_edges_select_collector(self):
         declarations = 'record Node { groups: List<List<Node>> }\n'
         for body in (
             'function inner(items: List<Node>, node: Node) { items.add(node) }',
@@ -133,7 +141,7 @@ let alias = items
         ):
             self.rejects(declarations + body + '\n', DIAGNOSTIC)
 
-    def test_mutual_cycle_through_different_mutable_type_is_rejected(self):
+    def test_mutual_cycle_through_different_mutable_type_selects_collector(self):
         self.rejects('''record A { links: List<B> }
 record B { back: A }
 function attach(links: List<B>, owner: A) {
@@ -246,8 +254,8 @@ print(multiline[1][1])
                     with self.subTest(seed=seed, node=node, depth=depth, mutation=mutation):
                         result, _ = self.compile(source)
                         if cyclic:
-                            self.assertEqual(result.returncode, 1, result.stderr)
-                            self.assertIn(DIAGNOSTIC, result.stderr)
+                            self.assertEqual(result.returncode, 86, result.stderr)
+                            accepts_managed_graph(self, source)
                         else:
                             self.assertEqual(result.returncode, 0, result.stderr)
 

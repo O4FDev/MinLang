@@ -1453,10 +1453,14 @@ while i < alias.length { print(alias[i]); print(outer.child.values[i]); i = i + 
             (prefix + 'box.values[true] = "text"\n', 'a position must be an Integer'),
             ('record Box { value: Integer }\nlet box = Box { value: 1 }\nbox.value[0] = 2\n', 'indexed assignment needs a List'),
             ('record Node { children: List<Node> }\nlet empty: List<Node> = []\nlet node = Node { children: empty }\nnode.children[0] = node\n',
-             'this List mutation could create a reference cycle; construct a new List instead'),
+             'List position 0'),
         ]:
             with self.subTest(source=source):
-                self.rejects(source, diagnostic)
+                if diagnostic == 'List position 0':
+                    from feature_compiler import accepts_managed_graph
+                    accepts_managed_graph(self, source)
+                else:
+                    self.rejects(source, diagnostic)
 
     def test_mutual_recursion_accumulates_fibonacci_leaves(self):
         source = ''

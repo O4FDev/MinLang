@@ -1,0 +1,495 @@
+// The optional frontend shares the ordinary parser and ownership emitter.
+// Signature and environment symbols are private to this compilation. Their
+// graph fields describe owned edges; signature arguments are not graph edges.
+record CallbackTokens { kinds: List<Integer>; texts: List<Text>; lines: SourceMap }
+
+function callbackTypePositions(kinds: List<Integer>, texts: List<Text>): List<Boolean> {
+    let positions: List<Boolean> = []
+    for kind in kinds { positions.add(false) }
+    let position = 0
+    while position < kinds.length && kinds[position] != 0 {
+        // Only declarations and typed headers introduce type syntax. Values
+        // named List/Callback can still participate in ordinary comparisons.
+        if kinds[position] == 1 && texts[position] == "function" {
+            let cursor = position + 1
+            while kinds[cursor] != 0 && texts[cursor] != "{" {
+                positions[cursor] = true
+                cursor = cursor + 1
+            }
+        }
+        if kinds[position] == 1 && texts[position] == "record" {
+            let cursor = position + 1
+            while kinds[cursor] != 0 && texts[cursor] != "{" { cursor = cursor + 1 }
+            if texts[cursor] == "{" {
+                cursor = cursor + 1
+                while kinds[cursor] != 0 && texts[cursor] != "}" {
+                    positions[cursor] = true
+                    cursor = cursor + 1
+                }
+            }
+        }
+        if kinds[position] == 1 && texts[position] == "let" && position + 2 < kinds.length && texts[position + 2] == ":" {
+            let cursor = position + 3
+            while kinds[cursor] != 0 && kinds[cursor] != 6 && texts[cursor] != "=" {
+                positions[cursor] = true
+                cursor = cursor + 1
+            }
+        }
+        position = position + 1
+    }
+    return positions
+}
+
+function normalizeCallbackTokens(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, starts: List<Integer>, ends: List<Integer>): CallbackTokens {
+    let outputKinds: List<Integer> = []
+    let outputTexts: List<Text> = []
+    let outputLines = newSourceMap()
+    let mapping: List<Integer> = []
+    let typePositions = callbackTypePositions(kinds, texts)
+    let depth = 0
+    let position = 0
+    while position < kinds.length {
+        mapping.add(outputKinds.length)
+        let text = texts[position]
+        let origin = sourcePath(outputLines, tokenPath(lines, position))
+        if !typePositions[position] { depth = 0 }
+        if kinds[position] == 4 && text == "<" && position > 0 && typePositions[position] && (depth > 0 || texts[position - 1] == "List" || texts[position - 1] == "Callback") { depth = depth + 1 }
+        if kinds[position] == 4 && text == ">>" && depth >= 2 {
+            copyModuleToken(outputKinds, outputTexts, outputLines, 4, ">", lines, position, origin)
+            copyModuleToken(outputKinds, outputTexts, outputLines, 4, ">", lines, position, origin)
+            depth = depth - 2
+        } else {
+            copyModuleToken(outputKinds, outputTexts, outputLines, kinds[position], text, lines, position, origin)
+            if kinds[position] == 4 && text == ">" && depth > 0 { depth = depth - 1 }
+        }
+        position = position + 1
+    }
+    mapping.add(outputKinds.length)
+    position = 0
+    while position < starts.length {
+        if starts[position] >= 0 { starts[position] = mapping[starts[position]] }
+        position = position + 1
+    }
+    position = 0
+    while position < ends.length {
+        ends[position] = mapping[ends[position]]
+        position = position + 1
+    }
+    return CallbackTokens { kinds: outputKinds; texts: outputTexts; lines: outputLines }
+}
+
+function callbackSignatureName(types: List<Integer>): Text {
+    let name = "#Callback"
+    let position = 0
+    while position < types.length {
+        name = name + ":" + Text(types[position])
+        position = position + 1
+    }
+    return name
+}
+
+function callbackSignatureTypes(name: Text): List<Integer> {
+    let types: List<Integer> = []
+    let position = 0
+    while position < name.length && name[position] != ':' { position = position + 1 }
+    while position < name.length {
+        position = position + 1
+        let value = 0
+        while position < name.length && name[position] != ':' {
+            let digit = findCharacter("0123456789", name[position])
+            if digit < 0 { fail("invalid private callback signature") }
+            value = value * 10 + digit
+            position = position + 1
+        }
+        types.add(value)
+    }
+    return types
+}
+
+function isCallbackType(type: Integer, names: List<Text>): Boolean {
+    if !isRecordType(type) { return false }
+    let name = names[type - 1000]
+    return name.length > 10 && name.slice(0, 10) == "#Callback:"
+}
+
+function takeCallbackType(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, cursor: List<Integer>, names: List<Text>, symbols: List<Integer>, create: Boolean): Integer {
+    cursor[0] = cursor[0] + 1
+    expectToken(kinds, texts, lines, cursor, "<")
+    let types: List<Integer> = []
+    types.add(takeType(kinds, texts, lines, cursor, names, symbols))
+    while tokenIs(kinds, texts, cursor, ",") {
+        cursor[0] = cursor[0] + 1
+        types.add(takeType(kinds, texts, lines, cursor, names, symbols))
+    }
+    expectToken(kinds, texts, lines, cursor, ">")
+    let parameter = 0
+    while parameter + 1 < types.length {
+        if types[parameter] == 5 { fail("Nothing cannot be a callback parameter") }
+        parameter = parameter + 1
+    }
+    let name = callbackSignatureName(types)
+    let record = findSymbol(names, symbols, name, 4)
+    if record < 0 && create {
+        record = names.length
+        names.add(name)
+        symbols.add(4)
+    }
+    if record < 0 { fail("unregistered callback signature") }
+    return 1000 + record
+}
+
+function registerCallbackType(types: List<Integer>, names: List<Text>, kinds: List<Integer>): Integer {
+    let name = callbackSignatureName(types)
+    let record = findSymbol(names, kinds, name, 4)
+    if record < 0 {
+        record = names.length
+        names.add(name)
+        kinds.add(4)
+    }
+    return 1000 + record
+}
+
+function takeCallbackHeader(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, cursor: List<Integer>, names: List<Text>, symbols: List<Integer>, parameters: List<Text>, types: List<Integer>): Integer {
+    expectToken(kinds, texts, lines, cursor, "function")
+    expectToken(kinds, texts, lines, cursor, "(")
+    while !tokenIs(kinds, texts, cursor, ")") {
+        if kinds[cursor[0]] != 1 { fail("expected a callback parameter name") }
+        let name = texts[cursor[0]]
+        if findText(parameters, name) >= 0 { fail("duplicate callback parameter '" + name + "'") }
+        parameters.add(name)
+        cursor[0] = cursor[0] + 1
+        expectToken(kinds, texts, lines, cursor, ":")
+        types.add(takeValueType(kinds, texts, lines, cursor, names, symbols))
+        if tokenIs(kinds, texts, cursor, ",") { cursor[0] = cursor[0] + 1 }
+    }
+    expectToken(kinds, texts, lines, cursor, ")")
+    let result = 5
+    if tokenIs(kinds, texts, cursor, ":") {
+        cursor[0] = cursor[0] + 1
+        result = takeType(kinds, texts, lines, cursor, names, symbols)
+    }
+    if !tokenIs(kinds, texts, cursor, "{") { fail("callback is missing its body") }
+    types.add(result)
+    return registerCallbackType(types, names, symbols)
+}
+
+function prepareCallbackSymbols(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, names: List<Text>, symbols: List<Integer>, locations: List<Text>, returns: List<Integer>, counts: List<Integer>) {
+    let position = 0
+    let typePositions = callbackTypePositions(kinds, texts)
+    // Register nested signature syntax from the inside out. All user record
+    // names already exist, including records declared after a signature.
+    position = kinds.length - 2
+    while position >= 0 {
+        if kinds[position] == 1 && typePositions[position] && texts[position] == "Callback" && texts[position + 1] == "<" {
+            let cursor: List<Integer> = [position]
+            takeCallbackType(kinds, texts, lines, cursor, names, symbols, true)
+        }
+        position = position - 1
+    }
+    position = kinds.length - 2
+    while position >= 0 {
+        if kinds[position] == 1 && texts[position] == "function" && texts[position + 1] == "(" {
+            let cursor: List<Integer> = [position]
+            let parameters: List<Text> = []
+            let types: List<Integer> = []
+            let signature = takeCallbackHeader(kinds, texts, lines, cursor, names, symbols, parameters, types)
+            names.add("#Environment:" + Text(position) + ":" + Text(signature))
+            symbols.add(4)
+        }
+        position = position - 1
+    }
+    while counts.length < names.length {
+        counts.add(0)
+        returns.add(0)
+        locations.add("private callback environment")
+    }
+}
+
+function callbackEnvironment(names: List<Text>, position: Integer): Integer {
+    let prefix = "#Environment:" + Text(position) + ":"
+    let index = 0
+    while index < names.length {
+        let name = names[index]
+        if name.length > prefix.length && name.slice(0, prefix.length) == prefix { return index }
+        index = index + 1
+    }
+    fail("missing callback environment")
+    return -1
+}
+
+function callbackBodyEnd(kinds: List<Integer>, texts: List<Text>, start: Integer): Integer {
+    let position = start + 1
+    let depth = 1
+    while depth > 0 && kinds[position] != 0 {
+        if texts[position] == "{" && kinds[position] == 4 { depth = depth + 1 }
+        if texts[position] == "}" && kinds[position] == 4 { depth = depth - 1 }
+        position = position + 1
+    }
+    if depth != 0 { fail("callback body is missing its closing brace") }
+    return position
+}
+
+function callbackReadsName(kinds: List<Integer>, texts: List<Text>, start: Integer, end: Integer, name: Text): Boolean {
+    let position = start + 1
+    let shadows: List<Integer> = []
+    let depth = 0
+    let shadow = false
+    while position < end {
+        if texts[position] == "function" && texts[position + 1] == "(" {
+            let header = position + 2
+            let parameterShadows = false
+            let round = 1
+            while header < end && round > 0 {
+                if texts[header] == "(" { round = round + 1 }
+                if texts[header] == ")" { round = round - 1 }
+                if texts[header] == name && texts[header + 1] == ":" { parameterShadows = true }
+                header = header + 1
+            }
+            while header < end && texts[header] != "{" { header = header + 1 }
+            if header >= end { fail("nested callback is missing its body") }
+            if parameterShadows { position = callbackBodyEnd(kinds, texts, header) } else { position = header }
+            if position >= end { return false }
+        }
+        if texts[position] == "{" {
+            while shadows.length <= depth { shadows.add(0) }
+            shadows[depth] = 0
+            if shadow { shadows[depth] = 1 }
+            depth = depth + 1
+        }
+        if texts[position] == "}" && depth > 0 {
+            depth = depth - 1
+            shadow = shadows[depth] == 1
+        }
+        if texts[position] == "let" && texts[position + 1] == name {
+            // The initializer still reads the outer binding. The new binding
+            // shadows it from the next statement within this lexical scope.
+            let cursor = position + 2
+            while cursor < end && kinds[cursor] != 6 { cursor = cursor + 1 }
+            let read = position + 2
+            while read < cursor {
+                if !shadow && texts[read] == name && texts[read - 1] != "." && texts[read + 1] != ":" { return true }
+                read = read + 1
+            }
+            shadow = true
+            position = cursor
+        } else {
+            if !shadow && kinds[position] == 1 && texts[position] == name && texts[position - 1] != "." && texts[position + 1] != ":" { return true }
+        }
+        position = position + 1
+    }
+    return false
+}
+
+function addCallbackEdge(counts: List<Integer>, fields: List<Integer>, fieldNames: List<Text>, record: Integer, type: Integer) {
+    let first = functionParameterOffset(counts, record)
+    let offset = fields.length
+    let position = 0
+    while position < counts[record] {
+        fields.add(fields[first + position])
+        fieldNames.add("private callback edge")
+        position = position + 1
+    }
+    fields.add(type)
+    fieldNames.add("private callback edge")
+    counts[record] = counts[record] + 1
+    counts[counts.length / 2 + record] = offset
+}
+
+function parseClosure(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
+    let start = state[0]
+    let parameters: List<Text> = []
+    let types: List<Integer> = []
+    let signature = takeCallbackHeader(tokenKinds, tokenTexts, tokenLines, state, functionNames, symbolKinds, parameters, types)
+    let environment = callbackEnvironment(functionNames, start)
+    let end = callbackBodyEnd(tokenKinds, tokenTexts, state[0])
+    let captured: List<Integer> = []
+    let local = 0
+    while local < state[3] {
+        if localTypes[local] > 0 && findLocal(localNames, localLengths, state, localNames[local]) == local && findText(parameters, localNames[local]) < 0 && callbackReadsName(tokenKinds, tokenTexts, state[0], end, localNames[local]) {
+            captured.add(local)
+        }
+        local = local + 1
+    }
+    functionParameterCounts[environment] = captured.length + 1
+    functionParameterCounts[functionParameterCounts.length / 2 + environment] = functionParameterTypes.length
+    functionParameterNames.add("#owner")
+    functionParameterTypes.add(1)
+    let capture = 0
+    while capture < captured.length {
+        local = captured[capture]
+        functionParameterNames.add(localNames[local])
+        functionParameterTypes.add(localTypes[local])
+        capture = capture + 1
+    }
+    addCallbackEdge(functionParameterCounts, functionParameterTypes, functionParameterNames, signature - 1000, 1000 + environment)
+    let env = valueName(textState, newTemporary(state))
+    noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, 1000 + environment, 0)
+    output.add("  " + env + " = call ptr @minyar_record_new(i64 " + Text(captured.length + 1) + ")\n")
+    keepReference(output, state, env, 1000 + environment)
+    let environmentDomain = valueName(textState, newTemporary(state))
+    output.add("  " + environmentDomain + " = call i64 @minyar_callback_domain()\n")
+    output.add("  call void @minyar_record_set(ptr " + env + ", i64 0, i64 " + environmentDomain + ")\n")
+    capture = 0
+    while capture < captured.length {
+        local = captured[capture]
+        let value = loadLocal(output, textState, state, localIds[local], localTypes[local])
+        let slot = valueAsListSlot(output, textState, state, value, localTypes[local])
+        noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, 1000 + environment, localTypes[local])
+        let setter = "minyar_record_set"
+        if isReferenceType(localTypes[local]) { setter = "minyar_record_set_reference" }
+        output.add("  call void @" + setter + "(ptr " + env + ", i64 " + Text(capture + 1) + ", i64 " + slot + ")\n")
+        capture = capture + 1
+    }
+    let callback = valueName(textState, newTemporary(state))
+    noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, signature, 0)
+    output.add("  " + callback + " = call ptr @minyar_record_new(i64 3)\n")
+    let owner = keepReference(output, state, callback, signature)
+    let code = valueAsListSlot(output, textState, state, "@.minyar.closure." + Text(start), 8)
+    output.add("  call void @minyar_record_set(ptr " + callback + ", i64 0, i64 " + code + ")\n")
+    let envSlot = valueAsListSlot(output, textState, state, env, 1000 + environment)
+    noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, signature, 1000 + environment)
+    output.add("  call void @minyar_record_set_reference(ptr " + callback + ", i64 1, i64 " + envSlot + ")\n")
+    let domain = valueName(textState, newTemporary(state))
+    output.add("  " + domain + " = call i64 @minyar_callback_domain()\n")
+    output.add("  call void @minyar_record_set(ptr " + callback + ", i64 2, i64 " + domain + ")\n")
+    globals.add("; minyar-closure-body: " + Text(start) + "\n")
+    state[0] = end
+    setType(resultType, signature)
+    markOwner(resultType, owner)
+    return callback
+}
+
+function parseCallbackCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, callback: Text, callbackType: Integer): Text {
+    let signature = callbackSignatureTypes(functionNames[callbackType - 1000])
+    let count = signature.length - 1
+    state[0] = state[0] + 1
+    expectToken(tokenKinds, tokenTexts, tokenLines, state, "(")
+    // Protect the selected receiver before arbitrary argument expressions
+    // can replace a local or remove it from an aliased container.
+    output.add("  call void @minyar_callback_check(ptr " + callback + ")\n")
+    borrowReference(output, state, callback, callbackType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+    let values: List<Text> = []
+    while !tokenIs(tokenKinds, tokenTexts, state, ")") {
+        if values.length >= count { fail("callback expects " + Text(count) + " arguments") }
+        let argumentType: List<Integer> = [signature[values.length]]
+        let value = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, argumentType)
+        if argumentType[0] != signature[values.length] { fail("callback argument has the wrong type") }
+        if isReferenceType(argumentType[0]) { borrowReference(output, state, value, argumentType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes) }
+        values.add(value)
+        if tokenIs(tokenKinds, tokenTexts, state, ",") { state[0] = state[0] + 1 }
+    }
+    expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
+    if values.length != count { fail("callback expects " + Text(count) + " arguments") }
+    let code = readRecordField(output, textState, state, callback, 0, 8)
+    let env = readRecordField(output, textState, state, callback, 1, 8)
+    let value = ""
+    let result = signature[count]
+    output.add("  ")
+    if result != 5 {
+        value = valueName(textState, newTemporary(state))
+        output.add(value + " = ")
+    }
+    output.add("call " + llvmType(result) + " " + code + "(ptr " + env)
+    let parameter = 0
+    while parameter < count {
+        output.add(", " + llvmType(signature[parameter]) + " " + values[parameter])
+        parameter = parameter + 1
+    }
+    output.add(")\n")
+    state[14] = state[14] + 1
+    setType(resultType, result)
+    return value
+}
+
+function compileClosureBodies(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, output: List<Text>, globals: List<Text>) {
+    let marker = 0
+    let emitted = false
+    while marker < globals.length {
+        let prefix = "; minyar-closure-body: "
+        let text = globals[marker]
+        marker = marker + 1
+        if text.length > prefix.length && text.slice(0, prefix.length) == prefix {
+            emitted = true
+            let start = 0
+            let digit = prefix.length
+            while digit + 1 < text.length {
+                start = start * 10 + findCharacter("0123456789", text[digit])
+                digit = digit + 1
+            }
+            let state: List<Integer> = [start, 0, 0, 0, 0, -1, 0, 0, 0, 1, -1, 0, -1, 0, 0]
+            let parameters: List<Text> = []
+            let parameterTypes: List<Integer> = []
+            let signature = takeCallbackHeader(tokenKinds, tokenTexts, tokenLines, state, functionNames, symbolKinds, parameters, parameterTypes)
+            let result = parameterTypes[parameters.length]
+            let environment = callbackEnvironment(functionNames, start)
+            let textState: List<Text> = ["entry", "callback"]
+            let localNames: List<Text> = []
+            let localTypes: List<Integer> = []
+            let localIds: List<Integer> = []
+            let localLengths: List<Integer> = []
+            output.add("define " + llvmType(result) + " @.minyar.closure." + Text(start) + "(ptr %environment")
+            let parameter = 0
+            while parameter < parameters.length {
+                output.add(", " + llvmType(parameterTypes[parameter]) + " %argument." + Text(parameter))
+                parameter = parameter + 1
+            }
+            output.add(") {\nentry:\n")
+            // Check the domain before either the stack guard or RC frames.
+            output.add("  call void @minyar_callback_check_environment(ptr %environment)\n")
+            let entry = output.length
+            output.add("")
+            let first = functionParameterOffset(functionParameterCounts, environment)
+            let capture = 1
+            while capture < functionParameterCounts[environment] {
+                let type = functionParameterTypes[first + capture]
+                let value = readRecordField(output, textState, state, "%environment", capture, type)
+                output.add("; capture ")
+                let id = -output.length - 1
+                output.add(value)
+                output.add("\n")
+                addLocal(localNames, localTypes, localIds, localLengths, state, functionParameterNames[first + capture], type, id)
+                capture = capture + 1
+            }
+            parameter = 0
+            while parameter < parameters.length {
+                let id = state[4]
+                state[4] = state[4] + 1
+                output.add("  %local." + Text(id) + " = alloca " + llvmType(parameterTypes[parameter]) + "\n")
+                output.add("  store " + llvmType(parameterTypes[parameter]) + " %argument." + Text(parameter) + ", ptr %local." + Text(id) + "\n")
+                addLocal(localNames, localTypes, localIds, localLengths, state, parameters[parameter], parameterTypes[parameter], id)
+                parameter = parameter + 1
+            }
+            let returns = compileBlock(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, result)
+            if !returns {
+                if result != 5 { fail("callback must return a value on every path") }
+                output.add("  call void @minyar_rc_leave()\n")
+                output.add("  call void @minyar_stack_leave()\n")
+                output.add("  ret void\n")
+            }
+            finishFunctionEntry(output, entry, state[4], parameters.length, state[8], state[6] == 1)
+            output.add("}\n\n")
+        }
+    }
+    if emitted {
+        output.add("; minyar-callback-runtime: 1\n")
+        output.add("declare i64 @minyar_callback_domain()\n")
+        output.add("declare void @minyar_callback_check(ptr)\n")
+        output.add("declare void @minyar_callback_check_environment(ptr)\n")
+    }
+}
+
+function finishCallbackGraph(returns: List<Integer>, counts: List<Integer>, fields: List<Integer>) {
+    let position = counts.length
+    while position + 1 < returns.length {
+        if returns[position] == -3 {
+            let type = -1 - returns[position + 1]
+            if !possibleCycleType(type, counts, fields, returns) {
+                returns[position] = -4
+                returns[position + 1] = -4
+            }
+            position = position + 2
+        } else {
+            if returns[position] == -2 { position = position + 4 } else { position = position + 1 }
+        }
+    }
+}

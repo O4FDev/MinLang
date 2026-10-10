@@ -1,0 +1,153 @@
+// Callback dispatch is opt-in. The existing eventloop batch API retains its
+// ordinary compiler/runtime path. All callbacks run on their creating domain.
+use "eventloop" as eventloop
+use "errors" as errors
+
+record Subscription {
+    handle: Integer
+    registration: Integer
+    token: Integer
+    callback: Callback<eventloop.Event, Nothing>
+    active: Boolean
+    once: Boolean
+    emitted: Boolean
+}
+public record Dispatcher {
+    private loop: Integer
+    private subscriptions: List<Subscription>
+    private free: List<Integer>
+    private freeLength: Integer
+    private generation: Integer
+    private closed: Boolean
+    private dispatching: Boolean
+}
+public record DispatcherResult { private value: Dispatcher; private error: errors.Error }
+public function ok(result: DispatcherResult): Boolean { return !errors.isError(result.error) }
+public function error(result: DispatcherResult): errors.Error { return result.error }
+public function value(result: DispatcherResult): Dispatcher {
+    if !ok(result) { fail("cannot read a failed DispatcherResult") }
+    return result.value
+}
+function blank(): Callback<eventloop.Event, Nothing> {
+    return function(event: eventloop.Event) {}
+}
+function service(): Boolean { native "callbackruntime" }
+function inactive(): Subscription {
+    return Subscription { handle: 0; registration: 0; token: 0; callback: blank(); active: false; once: false; emitted: false }
+}
+public function create(): DispatcherResult {
+    let created = eventloop.create()
+    let dispatcher = Dispatcher { loop: 0; subscriptions: []; free: []; freeLength: 0; generation: 0; closed: true; dispatching: false }
+    if !errors.integerOk(created) { return DispatcherResult { value: dispatcher; error: errors.integerError(created) } }
+    dispatcher.loop = errors.integerValue(created)
+    dispatcher.closed = false
+    return DispatcherResult { value: dispatcher; error: errors.none() }
+}
+function availableSlot(dispatcher: Dispatcher): Integer {
+    if dispatcher.freeLength > 0 {
+        dispatcher.freeLength = dispatcher.freeLength - 1
+        return dispatcher.free[dispatcher.freeLength]
+    }
+    dispatcher.subscriptions.add(inactive())
+    return dispatcher.subscriptions.length - 1
+}
+function recycleSlot(dispatcher: Dispatcher, slot: Integer) {
+    dispatcher.subscriptions[slot] = inactive()
+    if dispatcher.freeLength < dispatcher.free.length {
+        dispatcher.free[dispatcher.freeLength] = slot
+    } else {
+        dispatcher.free.add(slot)
+    }
+    dispatcher.freeLength = dispatcher.freeLength + 1
+}
+function install(dispatcher: Dispatcher, slot: Integer, registration: Integer, token: Integer, callback: Callback<eventloop.Event, Nothing>, once: Boolean): Integer {
+    if dispatcher.generation >= 2147483646 || slot >= 4294967294 { fail("callback registration identity exhausted") }
+    dispatcher.generation = dispatcher.generation + 1
+    let handle = dispatcher.generation * 4294967296 + slot + 1
+    dispatcher.subscriptions[slot] = Subscription { handle: handle; registration: registration; token: token; callback: callback; active: true; once: once; emitted: false }
+    return handle
+}
+public function watch(dispatcher: Dispatcher, socket: Integer, interest: Integer, token: Integer, callback: Callback<eventloop.Event, Nothing>): errors.IntegerResult {
+    if dispatcher.closed { return errors.integerFailure(errors.make(errors.closedCode(), 0, "dispatcher is closed")) }
+    let slot = availableSlot(dispatcher)
+    let watched = eventloop.watch(dispatcher.loop, socket, interest, slot + 1)
+    if !errors.integerOk(watched) { recycleSlot(dispatcher, slot); return watched }
+    return errors.integer(install(dispatcher, slot, errors.integerValue(watched), token, callback, false))
+}
+public function timer(dispatcher: Dispatcher, delayMs: Integer, periodMs: Integer, token: Integer, callback: Callback<eventloop.Event, Nothing>): errors.IntegerResult {
+    if dispatcher.closed { return errors.integerFailure(errors.make(errors.closedCode(), 0, "dispatcher is closed")) }
+    let slot = availableSlot(dispatcher)
+    let timed = eventloop.timer(dispatcher.loop, delayMs, periodMs, slot + 1)
+    if !errors.integerOk(timed) { recycleSlot(dispatcher, slot); return timed }
+    return errors.integer(install(dispatcher, slot, errors.integerValue(timed), token, callback, periodMs == 0))
+}
+public function cancel(dispatcher: Dispatcher, handle: Integer): errors.BooleanResult {
+    let slot = handle % 4294967296 - 1
+    if dispatcher.closed || handle <= 0 || slot < 0 || slot >= dispatcher.subscriptions.length {
+        return errors.booleanFailure(errors.make(errors.cancelledCode(), 0, "stale callback registration"))
+    }
+    let subscription = dispatcher.subscriptions[slot]
+    if !subscription.active || subscription.handle != handle {
+        return errors.booleanFailure(errors.make(errors.cancelledCode(), 0, "stale callback registration"))
+    }
+    // The native batch has already retired an emitted one-shot timer.
+    // Its callback can still be cancelled before delivery in this batch.
+    if !subscription.emitted {
+        let removed = eventloop.remove(dispatcher.loop, subscription.registration)
+        if !errors.booleanOk(removed) { return removed }
+    }
+    recycleSlot(dispatcher, slot)
+    return errors.boolean(true)
+}
+// Returns the number actually called. Cancellation/replacement during an
+// earlier callback suppresses stale events later in the same owned batch.
+public function dispatch(dispatcher: Dispatcher, timeoutMs: Integer, maxEvents: Integer): errors.IntegerResult {
+    if dispatcher.closed { return errors.integerFailure(errors.make(errors.closedCode(), 0, "dispatcher is closed")) }
+    if dispatcher.dispatching { fail("a dispatcher cannot recursively dispatch") }
+    // Let the caller advance another bounded batch while old graph debt
+    // remains. Readiness still polls fairly; after cleanup the loop sleeps.
+    let waitMs = timeoutMs
+    if timeoutMs >= -1 && timeoutMs <= 2147483647 && service() { waitMs = 0 }
+    let batch = eventloop.wait(dispatcher.loop, waitMs, maxEvents)
+    let failure = eventloop.batchError(batch)
+    if errors.isError(failure) { return errors.integerFailure(failure) }
+    dispatcher.dispatching = true
+    for event in eventloop.events(batch) {
+        let slot = event.token - 1
+        if slot >= 0 && slot < dispatcher.subscriptions.length {
+            let subscription = dispatcher.subscriptions[slot]
+            if subscription.active && subscription.once && subscription.registration == event.registration {
+                subscription.emitted = true
+            }
+        }
+    }
+    let called = 0
+    for event in eventloop.events(batch) {
+        let slot = event.token - 1
+        if !dispatcher.closed && slot >= 0 && slot < dispatcher.subscriptions.length {
+            let subscription = dispatcher.subscriptions[slot]
+            if subscription.active && subscription.registration == event.registration {
+                // The selected callback owns its environment throughout the
+                // call even if it cancels itself or closes this dispatcher.
+                let callback = subscription.callback
+                if subscription.once { recycleSlot(dispatcher, slot) }
+                callback(eventloop.Event { registration: subscription.handle; token: subscription.token; flags: event.flags; nativeCode: event.nativeCode; kind: event.kind })
+                called = called + 1
+            }
+        }
+    }
+    dispatcher.dispatching = false
+    return errors.integer(called)
+}
+public function close(dispatcher: Dispatcher): errors.BooleanResult {
+    if dispatcher.closed { return errors.booleanFailure(errors.make(errors.closedCode(), 0, "dispatcher is closed")) }
+    let closed = eventloop.close(dispatcher.loop)
+    if !errors.booleanOk(closed) { return closed }
+    dispatcher.closed = true
+    let slot = 0
+    while slot < dispatcher.subscriptions.length {
+        dispatcher.subscriptions[slot] = inactive()
+        slot = slot + 1
+    }
+    return errors.boolean(true)
+}
