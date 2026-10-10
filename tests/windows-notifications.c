@@ -21,6 +21,7 @@ extern void minyar_winnotify_testCreated(long long, ULONGLONG),
 extern MinyarBytes *minyar_winnotify_stopRaw(void);
 extern MinyarBytes *minyar_winnotify_cancelTokenRaw(const MinyarText *);
 extern bool minyar_windows_nextEvent(double);
+extern void minyar_windows_initialize(const MinyarText *);
 typedef struct Invocation {
     CLSID clsid;
     wchar_t app[64], argument[100];
@@ -71,6 +72,7 @@ int main(void) {
     failure(minyar_winnotify_nextActionRaw(), 9);
     MinyarText *title = minyar_native_copy_text((const unsigned char *)"<title> & \"日本語\"", 21);
     MinyarText *body = minyar_native_copy_text((const unsigned char *)"body", 4);
+    minyar_windows_initialize(title);
     MinyarBytes *actions = minyar_bytes_new(0);
     failure(minyar_winnotify_showRaw(title, body, actions), 9);
     wchar_t app[64];
