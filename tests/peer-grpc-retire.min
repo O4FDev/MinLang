@@ -1,0 +1,33 @@
+use "peergrpc" as grpc
+use "errors" as errors
+let server = grpc.create(); grpc.transportTick(server, 1000)
+if argument(2) == "trap" { grpc.closedStreamID(grpc.closed(server)); fail("absent closed notification did not trap") }
+grpc.receive(server, readBytesFile(argument(0)))
+let open = grpc.requests(server, 1000000)
+if !grpc.openOk(open) { fail("independent open rejected") }
+let id = grpc.openStreamID(open)
+if !errors.isWouldBlock(errors.booleanError(grpc.release(server, id))) { fail("active call retired") }
+grpc.sendStatus(server, id, "ok")
+grpc.write(server, id, Bytes("queued forwarding bytes"))
+if argument(2) == "deadline" {
+    grpc.tick(server, 1000500)
+} else if argument(2) == "cancel" {
+    grpc.receive(server, readBytesFile(argument(3)))
+    grpc.requests(server, 1000000)
+} else { grpc.closeStream(server, id, 0, "") }
+let closed = grpc.closed(server)
+if !grpc.closedOk(closed) || grpc.closedStreamID(closed) != id { fail("closed notification missing stream identity") }
+let cause = grpc.closedCause(closed)
+if argument(2) == "deadline" && errors.code(cause) != errors.timedOutCode() { fail("deadline notification lost typed cause") }
+if argument(2) == "cancel" && errors.code(cause) != errors.cancelledCode() { fail("cancellation notification lost typed cause") }
+if argument(2) == "normal" && errors.isError(cause) { fail("normal close has failure cause") }
+if grpc.closedOk(grpc.closed(server)) { fail("closed notification repeated") }
+if grpc.activeStreamIDs(server).length != 0 { fail("ended call still active") }
+if argument(2) != "cancel" && !errors.isWouldBlock(errors.booleanError(grpc.release(server, id))) { fail("undrained trailers retired") }
+let bytes = grpc.takeOutgoing(server, 1)
+if argument(2) != "cancel" && !errors.isWouldBlock(errors.booleanError(grpc.release(server, id))) { fail("partially drained trailers retired") }
+bytes.addBytes(grpc.takeOutgoing(server, 1048576))
+if !errors.booleanOk(grpc.release(server, id)) { fail("drained closed call did not retire") }
+if grpc.retainedCalls(server) != 0 || grpc.retainedTransportStreams(server) != 0 { fail("retired records remain") }
+writeBytesFile(argument(1), bytes)
+print("RETIRED")
