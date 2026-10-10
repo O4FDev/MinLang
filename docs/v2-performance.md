@@ -18,7 +18,7 @@ heavily loaded machine; the load average was 30-76 throughout.
 | 6 | Compiling multi-module programs spent 27% of its time comparing symbol names character by character | symbol tables ordered by length, then from the last character | OS kernel compile 485M; Minyarcraft 109M; Atacama 80.5M | 342M; 71.4M; 58.1M | -28% to -35% |
 | 7 | `json.parse` built every string from a parts list, a slice and a join | one slice when a string has no escapes | 20 parses of a 143 KB history response 1.22G | 0.95G | -22% |
 | 8 | Every macOS app build recompiled the Objective-C bridges (`macos.m` 0.46 s, `http.m` 0.12 s) | content-keyed object cache, already used for `graphics.c`, now for every native bridge | Atacama default build 0.93-1.11 s; release app 1.86-2.41 s | 0.48 s; 1.39-1.46 s | about 2x |
-| 9 | Minyarcraft's GPU vertex buffers dominated its memory (40-byte float vertices) | mesh vertices packed to 32 bytes: Float32 position and UV, Float16 colour and light | peak RSS 602 MB, footprint 892 MB | 447-523 MB, 815-844 MB | -13% to -26% RSS |
+| 9 | Minyarcraft's GPU vertex buffers dominated its memory (40-byte float vertices, six per quad) | 32-byte vertices (Float16 colour and light) and `graphics.updateQuads` (four vertices per quad, shared indices) | peak RSS 602 MB, footprint 892 MB, 17.30G instructions | 419 MB, 697-725 MB, 16.44G | -30% RSS, -5% instructions |
 
 ### 1. Long lists rebuilt as stacks of views
 
@@ -308,6 +308,24 @@ they would change the `graphics` API, so they are left for later.
 
 A first version that converted in software everywhere cost +6% instructions
 (18.33G), which is why the hardware path is used where available.
+
+**Quads.** Every chunk face is a quad, but meshes were plain triangle lists,
+six vertices per quad. `graphics.updateQuads(mesh, vertices)` takes four
+vertices per quad, a b c d, and draws a b c and a c d through one shared
+index buffer that grows to the largest quad mesh. Minyarcraft's `quad()`
+emits four vertices: starting at b instead of a picks the other diagonal, as
+its ambient-occlusion split needs. The sky meshes stay triangles.
+
+| `craft --screenshot noon` (3 runs) | 40-byte triangles | 32-byte triangles | 32-byte quads |
+| --- | ---: | ---: | ---: |
+| Peak RSS | 602-603 MB | 447-523 MB | 419 MB (all 3 runs) |
+| Peak memory footprint | 892-897 MB | 815-844 MB | 697-725 MB |
+| Retired instructions | 17.29-17.31G | 17.21-17.24G | 16.43-16.45G |
+
+`tests/graphics-render.py` (`check-graphics-render`, macOS desktop) renders
+the fixed scene twice as triangles and once as quads. It requires the two
+triangle renders to be identical and the quad render to be identical to
+them, and an incomplete quad must stop with "four vertices per quad".
 
 **Tests.**
 - `benchmarks/desktop/render-check.min` draws a fixed scene with a range of

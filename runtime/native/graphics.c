@@ -37,7 +37,7 @@ enum { VERTEX_FLOATS = 10, VERTEX_BYTES = 32, KEY_COUNT = GLFW_KEY_LAST + 1, BUT
 typedef struct {
     GLuint array, buffer;
     GLsizei count;
-    int used;
+    int used, quads;
 } Mesh;
 
 typedef struct {
@@ -48,6 +48,10 @@ typedef struct {
 static GLFWwindow *window;
 static GLuint world_program, overlay_program, texture, white_texture;
 static GLuint line_array, line_buffer, overlay_array, overlay_buffer;
+/* Shared triangle indices for quad meshes: quad q is (4q, 4q+1, 4q+2) and
+ * (4q, 4q+2, 4q+3). It grows to the largest quad mesh drawn so far. */
+static GLuint quad_indices;
+static size_t quad_index_capacity;
 static Mesh *meshes;
 static size_t mesh_count, mesh_capacity;
 static size_t mesh_next_slot;
@@ -675,6 +679,52 @@ long long minyar_graphics_createMesh(void) {
     return (long long)slot + 1;
 }
 
+/* Make the shared quad index buffer cover `quads` quads, bound to the current
+ * vertex array (each array remembers its element buffer). */
+static void bind_quad_indices(size_t quads) {
+    if (!quad_indices) glGenBuffers(1, &quad_indices);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, quad_indices);
+    if (quads <= quad_index_capacity) return;
+    if (quads > (size_t)INT32_MAX / 6) stop_graphics("a quad mesh can have at most 357913941 quads.");
+    size_t capacity = quad_index_capacity ? quad_index_capacity : 1024;
+    while (capacity < quads) capacity *= 2;
+    if (capacity > (size_t)INT32_MAX / 6) capacity = (size_t)INT32_MAX / 6;
+    uint32_t *indices = malloc(capacity * 6 * sizeof(uint32_t));
+    if (!indices) stop_graphics("the computer ran out of memory.");
+    for (size_t q = 0; q < capacity; q++) {
+        uint32_t first = (uint32_t)(q * 4);
+        uint32_t *six = indices + q * 6;
+        six[0] = first; six[1] = first + 1; six[2] = first + 2;
+        six[3] = first; six[4] = first + 2; six[5] = first + 3;
+    }
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(capacity * 6 * sizeof(uint32_t)), indices, GL_STATIC_DRAW);
+    free(indices);
+    quad_index_capacity = capacity;
+}
+
+/* Vertices in groups of four, a b c d, each drawn as triangles a b c and
+ * a c d: two thirds of the vertices that updateMesh needs for the same quads. */
+void minyar_graphics_updateQuads(long long handle, const MinyarBytes *vertices) {
+    Mesh *mesh = find_mesh(handle);
+    if (vertices->byte_length % (4 * VERTEX_BYTES))
+        stop_graphics("updateQuads needs four vertices per quad; build them with graphics.addVertex.");
+    size_t quads = (size_t)(vertices->byte_length / (4 * VERTEX_BYTES));
+    glBindVertexArray(mesh->array);
+    bind_quad_indices(quads);
+    glBindBuffer(GL_ARRAY_BUFFER, mesh->buffer);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)vertices->byte_length, vertices->bytes, GL_STATIC_DRAW);
+    glBindVertexArray(0);
+    mesh->count = (GLsizei)(quads * 6);
+    mesh->quads = 1;
+}
+
+static void draw_mesh_triangles(const Mesh *mesh) {
+    glBindVertexArray(mesh->array);
+    if (mesh->quads) glDrawElements(GL_TRIANGLES, mesh->count, GL_UNSIGNED_INT, (void *)0);
+    else glDrawArrays(GL_TRIANGLES, 0, mesh->count);
+    glBindVertexArray(0);
+}
+
 void minyar_graphics_updateMesh(long long handle, const MinyarBytes *vertices) {
     Mesh *mesh = find_mesh(handle);
     if (vertices->byte_length % VERTEX_BYTES)
@@ -682,6 +732,7 @@ void minyar_graphics_updateMesh(long long handle, const MinyarBytes *vertices) {
     glBindBuffer(GL_ARRAY_BUFFER, mesh->buffer);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)vertices->byte_length, vertices->bytes, GL_STATIC_DRAW);
     mesh->count = (GLsizei)(vertices->byte_length / VERTEX_BYTES);
+    mesh->quads = 0;
 }
 
 static void use_world_program(void) {
@@ -746,9 +797,7 @@ void minyar_graphics_drawMesh(long long handle) {
     if (!mesh->count) return;
     use_world_program();
     glBindTexture(GL_TEXTURE_2D, texture);
-    glBindVertexArray(mesh->array);
-    glDrawArrays(GL_TRIANGLES, 0, mesh->count);
-    glBindVertexArray(0);
+    draw_mesh_triangles(mesh);
 }
 
 /* Draw a mesh partly see-through, after the opaque scene. It does not hide
@@ -763,9 +812,7 @@ void minyar_graphics_drawTranslucentMesh(long long handle, double opacity) {
     glDepthMask(GL_FALSE);
     glDisable(GL_CULL_FACE);
     glBindTexture(GL_TEXTURE_2D, texture);
-    glBindVertexArray(mesh->array);
-    glDrawArrays(GL_TRIANGLES, 0, mesh->count);
-    glBindVertexArray(0);
+    draw_mesh_triangles(mesh);
     glEnable(GL_CULL_FACE);
     glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);

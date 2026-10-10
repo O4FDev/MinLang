@@ -64,7 +64,7 @@ certificates. [`examples/atacama`](../examples/atacama/main.min) and
 access to the hardware, and `device` gives them typed, checked registers, ports
 and DMA memory on top of it.
 `graphics` provides a window, keyboard and mouse input, textured 3D meshes
-with fog and lighting, lines, a 2D overlay with text, and screenshots; its
+(triangles, or quads with `updateQuads`) with fog and lighting, lines, a 2D overlay with text, and screenshots; its
 module documents each function. The [`macos`](macos.md) package provides native
 AppKit desktop applications and needs no third-party library. On macOS,
 `./minyar` searches [`library/platform/macos`](../library/platform/macos/http.min)
