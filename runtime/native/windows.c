@@ -32,6 +32,39 @@ static bool accessory;
 static HWND tray_window;
 static UINT next_tray = 1, taskbar_created;
 static const wchar_t window_class[] = L"MinyarWindowV1";
+#ifdef MINYAR_APP_EVENT_LOOP
+extern bool minyar_net_appLoopWindowsValid(long long);
+extern void *minyar_net_appLoopWindowsAttach(long long, int *);
+extern void minyar_net_appLoopWindowsDetach(long long);
+extern bool minyar_net_appLoopObserve(long long, void (*)(long long, unsigned));
+extern uint64_t minyar_net_appLoopDeadline(long long);
+static long long app_loop;
+static HANDLE app_wake;
+static bool app_armed;
+static void unshare_loop(void) {
+    if (app_loop)
+        minyar_net_appLoopWindowsDetach(app_loop);
+    minyar_net_appLoopObserve(0, NULL);
+    app_loop = 0;
+    app_wake = NULL;
+    app_armed = false;
+}
+static void loop_changed(long long loop, unsigned reason) {
+    if (loop != app_loop)
+        return;
+    if (reason == 2)
+        unshare_loop();
+    else
+        app_armed = true;
+}
+#endif
+static MinyarBytes *shared_result(unsigned error, int native, long long value) {
+    MinyarBytes *result = minyar_bytes_new(16);
+    memcpy((void *)result->bytes, &error, 4);
+    memcpy((void *)(result->bytes + 4), &native, 4);
+    memcpy((void *)(result->bytes + 8), &value, 8);
+    return result;
+}
 
 static void fail(const char *message) {
     minyar_native_stop(message);
@@ -706,6 +739,41 @@ void minyar_windows_statusRemove(long long tray) {
         fail("windows: handle is not a tray icon");
     minyar_windows_destroy(tray);
 }
+MinyarBytes *minyar_windows_shareNetworkLoopRaw(long long loop) {
+    thread();
+#ifdef MINYAR_APP_EVENT_LOOP
+    if (!minyar_net_appLoopWindowsValid(loop))
+        return shared_result(6, ERROR_INVALID_HANDLE, 0);
+    if (loop == app_loop)
+        return shared_result(0, 0, loop);
+    unshare_loop();
+    int code = 0;
+    HANDLE event = minyar_net_appLoopWindowsAttach(loop, &code);
+    if (!event)
+        return shared_result(7, code, 0);
+    app_loop = loop;
+    app_wake = event;
+    app_armed = true;
+    if (!minyar_net_appLoopObserve(loop, loop_changed)) {
+        unshare_loop();
+        return shared_result(6, ERROR_INVALID_HANDLE, 0);
+    }
+    return shared_result(0, 0, loop);
+#else
+    (void)loop;
+    return shared_result(9, ERROR_NOT_SUPPORTED, 0);
+#endif
+}
+MinyarBytes *minyar_windows_unshareNetworkLoopRaw(void) {
+    thread();
+#ifdef MINYAR_APP_EVENT_LOOP
+    bool attached = app_loop != 0;
+    unshare_loop();
+    return shared_result(0, 0, attached);
+#else
+    return shared_result(9, ERROR_NOT_SUPPORTED, 0);
+#endif
+}
 bool minyar_windows_nextEvent(double seconds) {
     thread();
     if (!isfinite(seconds) || seconds < 0 || seconds > 86400)
@@ -760,10 +828,27 @@ bool minyar_windows_nextEvent(double seconds) {
             return true;
         }
         ULONGLONG elapsed = GetTickCount64() - start;
+#ifdef MINYAR_APP_EVENT_LOOP
+        HANDLE wake = app_armed ? app_wake : NULL;
+        uint64_t timer = app_loop && app_armed ? minyar_net_appLoopDeadline(app_loop) : UINT64_MAX;
+        uint64_t now = GetTickCount64();
+        if (wake && (WaitForSingleObject(wake, 0) == WAIT_OBJECT_0 || timer <= now)) {
+            app_armed = false;
+            return true;
+        }
+#endif
         if (elapsed >= duration)
             return true;
-        DWORD status = MsgWaitForMultipleObjectsEx(0, NULL, duration - (DWORD)elapsed, QS_ALLINPUT,
-                                                   MWMO_INPUTAVAILABLE);
+        DWORD delay = duration - (DWORD)elapsed;
+#ifdef MINYAR_APP_EVENT_LOOP
+        if (timer != UINT64_MAX && timer - now < delay)
+            delay = (DWORD)(timer - now);
+        DWORD status = MsgWaitForMultipleObjectsEx(wake ? 1 : 0, wake ? &wake : NULL, delay,
+                                                   QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+#else
+        DWORD status =
+            MsgWaitForMultipleObjectsEx(0, NULL, delay, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+#endif
         if (status == WAIT_FAILED)
             fail("windows: event wait failed");
     }

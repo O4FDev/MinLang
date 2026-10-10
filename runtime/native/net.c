@@ -208,6 +208,15 @@ long long minyar_net_accept(long long listener) {
         remember_code("accept", socket_error());
         return -1;
     }
+#if defined(_WIN32) && defined(MINYAR_APP_EVENT_LOOP)
+    /* Accepted sockets inherit the listener's WSAEventSelect association.
+     * Detach that borrowed event before the listener can be unregistered. */
+    if (WSAEventSelect(result, NULL, 0)) {
+        remember_code("accept event configuration", socket_error());
+        close_socket(result);
+        return -1;
+    }
+#endif
     if (!configure(result, true)) {
         remember_code("accept configuration", socket_error());
         close_socket(result);

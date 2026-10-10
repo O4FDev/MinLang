@@ -28,6 +28,8 @@ def main():
              ['user32', 'shell32', 'advapi32', 'ole32', 'oleaut32', 'iphlpapi', 'uuid', 'ws2_32', 'bcrypt']),
             ('windows-native', ['-DMINYAR_WINDOWS_TEST=1'], ['windows.c'],
              ['user32', 'gdi32', 'shell32']),
+            ('windows-loop', ['-DMINYAR_WINDOWS_TEST=1', '-DMINYAR_APP_EVENT_LOOP=1'], ['windows.c'],
+             ['user32', 'gdi32', 'shell32', 'ws2_32']),
         ]
         for name, defines, providers, libraries in fixtures:
             executable = temp/(name+'.exe')
@@ -47,6 +49,11 @@ def main():
                            check=True, timeout=120)
             result = subprocess.run([executable], check=True, capture_output=True, text=True, timeout=30)
             assert result.stdout == 'Windows native package contracts verified\n', result
+            shared = temp/('shared-'+mode[2:]+'.exe')
+            subprocess.run([ROOT/'minyar', mode, ROOT/'tests/windows-loop.min', '-o', shared],
+                           check=True, timeout=120)
+            result = subprocess.run([shared], check=True, capture_output=True, text=True, timeout=30)
+            assert result.stdout == 'Windows shared reactor Minyar contracts verified\n', result
 
 
 if __name__ == '__main__':
