@@ -323,7 +323,7 @@ static int compiler_run(const char *compiler, const char *entry, const char *out
         char path[64];
         snprintf(path, sizeof path, "/dev/fd/%d", input_fd);
         char *args[10 + 2 * MAX_LIBRARIES] = {(char *)compiler, (char *)entry, (char *)output,
-                                              "--module-state",  path,          (char *)state,
+                                              "--module-state", path,          (char *)state,
                                               (char *)stats};
         size_t argc = 7;
         if (budget) {
@@ -623,11 +623,11 @@ int main(int argc, char **argv) {
             stop("cache plan descriptors");
         input_fd = plan_fd;
     }
-    int result =
-        compiler_run(snapshot, entry, output, input_fd, state, stats, error, budget, libraries, library_count);
+    int result = compiler_run(snapshot, entry, output, input_fd, state, stats, error, budget,
+                              libraries, library_count);
     if (result && cache_valid)
-        result =
-            compiler_run(snapshot, entry, output, empty_fd, state, stats, error, budget, libraries, library_count);
+        result = compiler_run(snapshot, entry, output, empty_fd, state, stats, error, budget,
+                              libraries, library_count);
     if (!result) {
         Bytes diagnostic = read_path(stats, 4096);
         struct stat state_stat;
