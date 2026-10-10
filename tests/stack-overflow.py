@@ -112,11 +112,14 @@ def main() -> None:
             "    return text.length\n"
             "}\n"
             "function caller(value: Integer): Integer { return helpers.twice(value) }\n"
+            # More temporaries than a leaf may have: its frame could outgrow
+            # the reserve unoptimized, so it keeps its own check.
+            "function large(value: Integer): Integer { return " + " + ".join(["value * 3"] * 600) + " }\n"
             "function descend(depth: Integer): Integer {\n"
             "    if depth == 0 { return leaf(7) }\n"
             "    return leaf(depth) - leaf(depth) + descend(depth - 1)\n"
             "}\n"
-            f"print(descend({safe_depth}) + caller(1))\n"
+            f"print(descend({safe_depth}) + caller(1) + large(0))\n"
             "print(descend(100000000))\n",
             encoding="utf-8",
         )
@@ -133,6 +136,7 @@ def main() -> None:
         assert "@minyar_stack_enter" not in body("leaf") and "@minyar_stack_leave" not in body("leaf"), body("leaf")
         assert body("descend").count("call void @minyar_stack_enter()") == 1, body("descend")
         assert body("caller").count("call void @minyar_stack_enter()") == 1, body("caller")
+        assert body("large").count("call void @minyar_stack_enter()") == 1, "a large leaf keeps its check"
         prepare_llvm_for_link(leaves_llvm, LINK_FLAGS)
         leaves_executable = temporary / "leaves"
         linked = run(clang_command([CLANG, "-O0", *LINK_FLAGS, "-Wno-override-module", str(leaves_llvm), str(RUNTIME),

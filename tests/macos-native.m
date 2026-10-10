@@ -95,49 +95,67 @@ static void verifyList(void) {
     minyar_macos_rowButton(l,&trash,&remove,color); minyar_macos_insets(l,18,0,18,0);
     for (int i = 0; i < 5000; ++i) minyar_macos_addRow(l,&date,&prompt,i == 1 ? &empty : &preview);
     assert(minyar_macos_rowCount(l) == 5000 && minyar_macos_clickedRow(l) == -1);
+    NSTableView *table = list(l).table;
+    // The table sees rows only when nextEvent reloads it, never half-built ones.
+    assert(table.numberOfRows == 0);
     minyar_macos_show(w);
     while (minyar_macos_nextEvent(0) && minyar_macos_eventType() != MNNone) {}
-    NSTableView *table = list(l).table;
     assert(table.numberOfRows == 5000);
     // Only rows on screen have views.
     __block NSInteger realized = 0;
     [table enumerateAvailableRowViewsUsingBlock:^(NSTableRowView *view, NSInteger row) { (void)view; (void)row; ++realized; }];
     assert(realized > 0 && realized < 100);
     MNListCell *cell = [table viewAtColumn:0 row:1 makeIfNecessary:YES];
+    MNListCell *other = [table viewAtColumn:0 row:3 makeIfNecessary:YES];
     assert([cell.top.stringValue isEqualToString:@"10 Oct"] && [cell.middle.stringValue isEqualToString:@"Where is the Atacama?"]);
-    assert(cell.bottom.hidden && !cell.button.hidden);
-    assert(cell.topEdge.constant == 18 && cell.leadingEdge.constant == 0 && cell.trailingEdge.constant == 0);
+    assert(cell.bottom.hidden && !cell.button.hidden && cell.buttonEdge.active && !cell.textEdge.active);
+    assert(cell.topEdge.constant == 18 && cell.leadingEdge.constant == 0 && cell.buttonEdge.constant == 0);
     assert([cell.button.toolTip isEqualToString:@"Delete Where is the Atacama?"]);
-    [cell.button performClick:nil];
+    // Clicks queued before the program looks each keep their own row.
+    [cell.button performClick:nil]; [other.button performClick:nil];
     assert(receive(MNAction,l)); assert(minyar_macos_clickedRow(l) == 1 && minyar_macos_clickedButton(l));
+    assert(receive(MNAction,l)); assert(minyar_macos_clickedRow(l) == 3 && minyar_macos_clickedButton(l));
     // A disabled list delivers no clicks.
     minyar_macos_enabled(l,false); [cell.button performClick:nil];
     assert(!receive(MNAction,l)); minyar_macos_enabled(l,true);
-    minyar_macos_clear(l); assert(minyar_macos_rowCount(l) == 0 && minyar_macos_clickedRow(l) == -1);
-    while (minyar_macos_nextEvent(0) && minyar_macos_eventType() != MNNone) {}
+    // clear ends the rows and any clicks on them that are still queued.
+    [cell.button performClick:nil];
+    minyar_macos_clear(l); assert(minyar_macos_rowCount(l) == 0);
+    assert(!receive(MNAction,l)); assert(minyar_macos_clickedRow(l) == -1);
     assert(table.numberOfRows == 0);
-    table = nil; cell = nil;
+    // Without a row button the text runs to the inset.
+    minyar_macos_rowButton(l,&empty,&empty,0); minyar_macos_addRow(l,&date,&prompt,&preview);
+    while (minyar_macos_nextEvent(0) && minyar_macos_eventType() != MNNone) {}
+    cell = [table viewAtColumn:0 row:0 makeIfNecessary:YES];
+    assert(cell.button.hidden && !cell.buttonEdge.active && cell.textEdge.active);
+    table = nil; cell = nil; other = nil;
     minyar_macos_destroy(w);
 }
 /* Background progress (as from http) wakes nextEvent at most once a frame. */
 static void verifyWakeThrottle(void) {
     while (minyar_macos_nextEvent(0) && minyar_macos_eventType() != MNNone) {}
+    dispatch_semaphore_t posted = dispatch_semaphore_create(0);
+    __block double sending = 0;
     [NSThread detachNewThreadWithBlock:^{
+        double start = CACurrentMediaTime();
         for (int i = 0; i < 200; ++i) {
             [NSApp postEvent:[NSEvent otherEventWithType:NSEventTypeApplicationDefined location:NSZeroPoint modifierFlags:0
                 timestamp:0 windowNumber:0 context:nil subtype:MNWakeSubtype data1:0 data2:0] atStart:NO];
             [NSThread sleepForTimeInterval:0.001];
         }
+        sending = CACurrentMediaTime() - start;
+        dispatch_semaphore_signal(posted);
     }];
     int returns = 0;
-    double start = CACurrentMediaTime();
-    while (CACurrentMediaTime() - start < 0.4) {
-        double before = CACurrentMediaTime();
-        assert(minyar_macos_nextEvent(1));
-        if (CACurrentMediaTime() - before < 0.9) ++returns;
+    while (dispatch_semaphore_wait(posted, DISPATCH_TIME_NOW)) {
+        assert(minyar_macos_nextEvent(0.05));
+        ++returns;
     }
-    // About 0.25 s of wake-ups at 60 Hz; unthrottled this would be near 200.
-    assert(returns >= 3 && returns <= 40);
+    while (minyar_macos_nextEvent(0) && minyar_macos_eventType() != MNNone) {}
+    // At most one return a frame while the wake-ups arrive (plus 0.05 s
+    // timeouts, and slack); unthrottled this would be near 200.
+    assert(returns >= 1 && returns <= (int)(sending * 60) + 10);
+    assert(returns < 150);
 }
 int main(int argc, char **argv) { @autoreleasepool {
     MinyarText title = literal("Native contract"), unicode = literal("é 🙂 漢字"), empty = literal("");
@@ -152,8 +170,6 @@ int main(int argc, char **argv) { @autoreleasepool {
     if (argc > 1 && !strcmp(argv[1],"shape")) { MinyarText bad = literal("M 1 2 X"); long long v = minyar_macos_window(&title,100,100); minyar_macos_shape(minyar_macos_column(v,0),&bad,10,10); return 99; }
     if (argc > 1 && !strcmp(argv[1],"color")) { minyar_macos_color(0x1000000,0,1); return 99; }
     verifyApplicationViews();
-    verifyList();
-    verifyWakeThrottle();
     long long w = minyar_macos_window(&title,640,480);
     long long root = minyar_macos_column(w,8); minyar_macos_padding(root,10);
     long long field = minyar_macos_textField(root,&unicode);
@@ -177,6 +193,8 @@ int main(int argc, char **argv) { @autoreleasepool {
         if (!strcmp(argv[1],"list-type")) minyar_macos_addRow(button,&title,&title,&title);
         return 99;
     }
+    verifyList();
+    verifyWakeThrottle();
     equals(minyar_macos_text(field),"é 🙂 漢字");
     equals(minyar_macos_text(edit),"é 🙂 漢字");
     // Embedded NUL must survive both bridging directions.

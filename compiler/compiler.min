@@ -4683,32 +4683,21 @@ function finishParallelFunction(output: List<Text>, globals: List<Text>, entrySl
     }
 }
 
-// A function that calls no Minyar function cannot deepen recursion, and its
-// frame (at most 256 locals) fits in the reserve that its caller's call-depth
-// check left (MINYAR_STACK_RESERVE_BYTES), so it needs no call-depth frame of
-// its own. Without one, LLVM can inline small accessors into their callers.
-// User-function calls emit their target as its own piece: " @.minyar.fn."
-// before a plain name, or " @" before a quoted module-qualified name. Runtime
-// calls use " @" before an unquoted runtime name.
+// A function that calls no Minyar function (state[5] stayed -1) cannot deepen
+// recursion. With at most 256 locals and 1,024 temporaries its frame stays
+// within about 18 KiB even unoptimized, which fits in the 128 KiB reserve its
+// caller's call-depth check left (MINYAR_STACK_RESERVE_BYTES), so it needs no
+// call-depth frame of its own. Without one, LLVM can inline small accessors.
+// Its returns emit the leave call as a whole piece (dispatch lowering, which
+// embeds it in a larger piece, needs 4,096 labels and is excluded above).
 function finishLeafFunction(output: List<Text>, entrySlot: Integer, bodySlot: Integer) {
-    let piece = bodySlot
-    while piece < output.length {
-        let text = output[piece]
-        if text == " @.minyar.fn." {
-            return
-        }
-        if text == " @" && piece + 1 < output.length && output[piece + 1].byteLength > 0 && output[piece + 1][0] == '"' {
-            return
-        }
-        piece = piece + 1
-    }
     let enter = "  call void @minyar_stack_enter()\n"
     let entry = output[entrySlot]
     if entry.length < enter.length || entry.slice(0, enter.length) != enter {
         return
     }
     output[entrySlot] = entry.slice(enter.length, entry.length)
-    piece = bodySlot
+    let piece = bodySlot
     while piece < output.length {
         if output[piece] == "  call void @minyar_stack_leave()\n" {
             output[piece] = ""
@@ -5101,9 +5090,8 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         state[11] = 0
         state[13] = 0
         // Only parseCall writes a resolved user-function index into this cache.
-        // Reset it per body in bounded mode: -1 at finish proves no user call.
-        // Ordinary mode retains its existing cross-body cache behavior.
-        if stackOwnerLimit > 0 { state[5] = -1 }
+        // Reset it per body: -1 at finish proves the body made no user call.
+        state[5] = -1
         textState[0] = "entry"
         let localNames: List<Text> = []
         let localTypes: List<Integer> = []
@@ -5209,7 +5197,7 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         }
         if stackOwnerLimit > 0 && name != "main" && state[5] == -1 && state[6] == 1 && state[8] >= 1 && state[8] <= stackOwnerLimit {
             finishStackOwnership(output, entrySlot, state[8])
-        } else if !parallel && !machineIntrinsic && name != "main" && state[2] < 4096 && state[4] <= 256 {
+        } else if !parallel && !machineIntrinsic && name != "main" && state[5] == -1 && state[4] <= 256 && state[1] <= 1024 && state[2] <= 1024 {
             finishLeafFunction(output, entrySlot, bodySlot)
         }
         output.add("}\n\n")
