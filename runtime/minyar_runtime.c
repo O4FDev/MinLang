@@ -42,11 +42,13 @@
 #define MINYAR_COLD __attribute__((noinline, cold))
 #define MINYAR_NORETURN __attribute__((noreturn))
 #define MINYAR_HOT static inline __attribute__((always_inline))
+#define MINYAR_INLINE_ENTRY __attribute__((always_inline))
 #define MINYAR_NO_ADDRESS_SANITIZE __attribute__((no_sanitize_address))
 #else
 #define MINYAR_COLD
 #define MINYAR_NORETURN
 #define MINYAR_HOT static inline
+#define MINYAR_INLINE_ENTRY
 #define MINYAR_NO_ADDRESS_SANITIZE
 #endif
 
@@ -452,9 +454,13 @@ MINYAR_HOT int bytes_are_equal(const unsigned char *left, const unsigned char *r
     return length == 0 || left[0] == right[0];
 }
 
-_Bool minyar_texts_are_equal(const MinyarText *left, const MinyarText *right) {
-    if (left == right)
-        return 1;
+/* Generated code compares a Text with a literal all the time. Inlining the
+ * length check lets link-time optimization fold the literal's length and
+ * bytes, so a run of comparisons with one Text shares its loads and most
+ * unequal comparisons cost a compare and a branch. There is no identity
+ * shortcut: a Text is rarely compared with itself, and the pointer test
+ * would keep every comparison from sharing those loads. */
+MINYAR_INLINE_ENTRY _Bool minyar_texts_are_equal(const MinyarText *left, const MinyarText *right) {
     return left->byte_length == right->byte_length &&
            bytes_are_equal(left->bytes, right->bytes, (size_t)left->byte_length);
 }
