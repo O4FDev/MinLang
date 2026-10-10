@@ -20,6 +20,7 @@ FILES = (
     "runtime/native/apple_identity.h", "runtime/native/keychain.c", "tests/keychain-native.c",
     "runtime/native/windows_identity.h", "runtime/native/wincert.c", "runtime/native/windows.c",
     "tests/windows-certificate.c", "tests/windows-desktop.c", "tests/windows-native.c",
+    "runtime/native/net_app_windows.h", "tests/windows-loop.c",
     "runtime/native/schannel.c", "tests/schannel-native.c", "tests/schannel-identity.c",
     "runtime/native/desktop.c", "tests/net-soak.c",
     "tests/net-native.c", "tests/net-batch.c", "tests/net-loop.c",
