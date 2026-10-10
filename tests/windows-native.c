@@ -1,6 +1,8 @@
 /* Win32 controls and message routing, not mocks. Run inside Windows VM/CI. */
 #include "../runtime/minyar_native.h"
 #include <windows.h>
+#include <commctrl.h>
+#include <math.h>
 #include <assert.h>
 extern void minyar_windows_initialize(const MinyarText *);
 extern long long minyar_windows_window(const MinyarText *, long long, long long);
@@ -10,6 +12,17 @@ extern long long minyar_windows_label(long long, const MinyarText *);
 extern long long minyar_windows_button(long long, const MinyarText *);
 extern long long minyar_windows_textField(long long, const MinyarText *);
 extern long long minyar_windows_checkbox(long long, const MinyarText *, bool);
+extern long long minyar_windows_secureField(long long), minyar_windows_separator(long long);
+extern long long minyar_windows_textEditor(long long, const MinyarText *),
+    minyar_windows_textView(long long, const MinyarText *);
+extern long long minyar_windows_slider(long long, double, double, double);
+extern void minyar_windows_size(long long, long long, long long),
+    minyar_windows_enabled(long long, bool),
+    minyar_windows_appendText(long long, const MinyarText *),
+    minyar_windows_setValue(long long, double);
+extern double minyar_windows_value(long long);
+extern long long minyar_windows_width(long long), minyar_windows_height(long long);
+extern HACCEL minyar_windows_testAccelerators(long long);
 extern void minyar_windows_padding(long long, long long);
 extern void minyar_windows_setText(long long, const MinyarText *);
 extern MinyarText *minyar_windows_text(long long);
@@ -52,6 +65,12 @@ int main(int argc, char **argv) {
     long long button = minyar_windows_button(row, name),
               field = minyar_windows_textField(row, unicode);
     long long check = minyar_windows_checkbox(column, name, true);
+    if (argc > 1 && !strcmp(argv[1], "nan"))
+        minyar_windows_slider(column, 0, 1, NAN);
+    if (argc > 1 && !strcmp(argv[1], "wrong-slider"))
+        minyar_windows_value(field);
+    if (argc > 1 && !strcmp(argv[1], "invalid-size"))
+        minyar_windows_size(label, -1, 20);
     assert(minyar_windows_checked(check));
     minyar_windows_setChecked(check, false);
     assert(!minyar_windows_checked(check));
@@ -71,12 +90,87 @@ int main(int argc, char **argv) {
     GetWindowRect(minyar_windows_testHandle(button), &left);
     GetWindowRect(minyar_windows_testHandle(field), &right);
     assert(right.left >= left.right && right.top == left.top);
+    long long secure = minyar_windows_secureField(column);
+    assert(GetWindowLongPtrW(minyar_windows_testHandle(secure), GWL_STYLE) & ES_PASSWORD);
+    minyar_windows_setText(secure, unicode);
+    equal(minyar_windows_text(secure), "日本語 é 😀");
+    MinyarText *multiline = text("line one\n日本語"), *suffix = text("\n😀");
+    long long editor = minyar_windows_textEditor(column, multiline),
+              view = minyar_windows_textView(column, multiline);
+    assert(GetWindowLongPtrW(minyar_windows_testHandle(editor), GWL_STYLE) & ES_MULTILINE);
+    assert(GetWindowLongPtrW(minyar_windows_testHandle(view), GWL_STYLE) & ES_READONLY);
+    minyar_windows_appendText(editor, suffix);
+    minyar_windows_appendText(view, suffix);
+    equal(minyar_windows_text(editor), "line one\n日本語\n😀");
+    equal(minyar_windows_text(view), "line one\n日本語\n😀");
+    minyar_windows_enabled(editor, false);
+    assert(!IsWindowEnabled(minyar_windows_testHandle(editor)));
+    minyar_windows_enabled(editor, true);
+    assert(IsWindowEnabled(minyar_windows_testHandle(editor)));
+    minyar_windows_size(editor, 120, 80);
+    GetWindowRect(minyar_windows_testHandle(editor), &left);
+    assert(left.right > left.left && left.bottom > left.top);
+    minyar_windows_enabled(button, false);
+    SendMessageW(minyar_windows_testHandle(button), BM_CLICK, 0, 0);
+    assert(minyar_windows_nextEvent(0) && minyar_windows_eventType() == 0);
+    minyar_windows_enabled(button, true);
+    long long slider = minyar_windows_slider(column, -0.25, 0.75, 0.25);
+    assert(fabs(minyar_windows_value(slider) - 0.25) < 0.000002);
+    if (argc > 1 && !strcmp(argv[1], "value-range"))
+        minyar_windows_setValue(slider, 100);
+    minyar_windows_setValue(slider, 0.75);
+    assert(minyar_windows_value(slider) == 0.75);
+    minyar_windows_setValue(slider, -0.25);
+    assert(minyar_windows_value(slider) == -0.25);
+    SendMessageW(minyar_windows_testHandle(slider), TBM_SETPOS, TRUE, 500000);
+    SendMessageW(minyar_windows_testHandle(window), WM_HSCROLL, TB_THUMBTRACK,
+                 (LPARAM)minyar_windows_testHandle(slider));
+    assert(minyar_windows_nextEvent(0) && minyar_windows_eventType() == 2 &&
+           minyar_windows_eventSource() == slider);
+    assert(fabs(minyar_windows_value(slider) - 0.25) < 0.000002);
+    long long separator = minyar_windows_separator(column);
+    assert(minyar_windows_testHandle(separator));
+    assert(minyar_windows_width(window) > 0 && minyar_windows_height(window) > 0);
+    minyar_rc_release(multiline);
+    minyar_rc_release(suffix);
     assert(minyar_windows_accessory(true));
     assert(GetWindowLongPtrW(minyar_windows_testHandle(window), GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
     assert(minyar_windows_accessory(false));
     assert(!(GetWindowLongPtrW(minyar_windows_testHandle(window), GWL_EXSTYLE) & WS_EX_TOOLWINDOW));
     MinyarText *empty = text("");
     long long menu = minyar_windows_menu(window, name);
+    MinyarText *shortcut = text("Ctrl+Shift+Q");
+    if (argc > 1 && !strcmp(argv[1], "invalid-shortcut")) {
+        MinyarText *invalid = text("Ctrl+Ctrl+Q");
+        minyar_windows_menuItem(menu, name, invalid);
+    }
+    long long accelerated = minyar_windows_menuItem(menu, name, shortcut);
+    if (argc > 1 && !strcmp(argv[1], "duplicate-shortcut"))
+        minyar_windows_menuItem(menu, name, shortcut);
+    ACCEL binding;
+    assert(CopyAcceleratorTableW(minyar_windows_testAccelerators(window), &binding, 1) == 1);
+    assert(binding.key == 'Q' && binding.fVirt == (FVIRTKEY | FCONTROL | FSHIFT));
+    SendMessageW(minyar_windows_testHandle(window), WM_COMMAND, MAKEWPARAM(binding.cmd, 1), 0);
+    assert(minyar_windows_nextEvent(0) && minyar_windows_eventType() == 1 &&
+           minyar_windows_eventSource() == accelerated);
+    minyar_windows_enabled(accelerated, false);
+    SendMessageW(minyar_windows_testHandle(window), WM_COMMAND, MAKEWPARAM(binding.cmd, 1), 0);
+    assert(minyar_windows_nextEvent(0) && minyar_windows_eventType() == 0);
+    minyar_windows_enabled(accelerated, true);
+    // Native translation itself is exercised through the real message pump;
+    // bare F6 avoids mutating global modifier-key state in the test session.
+    MinyarText *function_key = text("F6");
+    long long translated = minyar_windows_menuItem(menu, name, function_key);
+    PostMessageW(minyar_windows_testHandle(field), WM_KEYDOWN, VK_F6, 0);
+    assert(minyar_windows_nextEvent(0) && minyar_windows_eventType() == 1 &&
+           minyar_windows_eventSource() == translated);
+    minyar_windows_destroy(translated);
+    minyar_rc_release(function_key);
+    minyar_windows_destroy(accelerated);
+    assert(!minyar_windows_testAccelerators(window));
+    SendMessageW(minyar_windows_testHandle(window), WM_COMMAND, MAKEWPARAM(binding.cmd, 1), 0);
+    assert(minyar_windows_nextEvent(0) && minyar_windows_eventType() == 0);
+    minyar_rc_release(shortcut);
     long long action = minyar_windows_menuItem(menu, unicode, empty);
     minyar_windows_menuSeparator(menu);
     SendMessageW(minyar_windows_testHandle(window), WM_MENUCOMMAND, 0,
