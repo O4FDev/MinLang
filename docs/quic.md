@@ -127,12 +127,24 @@ unsupported versions. Client version negotiation and Retry transitions are not
 yet implemented. Resumption and opt-in 0-RTT are experimental and have independent
 peer tests, but their sustained fault-soak evidence is still outstanding.
 
-RESET_STREAM, STOP_SENDING, and locally issued connection-ID retirement remain
-unsupported control operations. Finished streams are retained up to a bounded
-128-record connection limit; the initial peer stream limit is 16 per type.
-Yamux also retains at most 128 stream records and bounds connection buffers to
-1 MiB. Long-lived applications should reuse streams; stream-record reclamation
-and arbitrary stream churn still need implementation and measurement.
+`resetStream` and `stopSending` cancel one stream direction without terminating
+the connection. A failed read/write has `streamResetCode()` (1003), with the
+peer's application error in `errors.nativeCode`, including error zero.
+RESET final size still consumes flow credit and must match any received FIN.
+Opening a higher peer ID implicitly creates the lower IDs of its type.
+Streams are reclaimed at `poll` after both directions finish: sending needs
+all data plus FIN acknowledged, or RESET acknowledged; receiving needs final
+size plus the application observing EOF/reset. Call `readStream` to observe
+completion even after receiving the last data bytes. Closed IDs are retained
+as at most 256 ranges; old frames cannot reopen them. Once reclaimed, reads
+return EOF and writes return closed. Final-size checking for already reclaimed
+streams is omitted as permitted by RFC 9000 section 4.5. At most 128 active stream
+records remain, and MAX_STREAMS credit is replenished on peer-stream closure.
+The sanitizer churn test completes 2000 mixed bidirectional/unidirectional
+streams with at most two retained records. This is a bounded functional test,
+not hours-long churn or a memory benchmark. Locally issued connection-ID
+retirement remains unsupported. Yamux still retains at most 128 stream records
+and bounds connection buffers to 1 MiB; its stream reclamation is outstanding.
 Persistent-congestion and idle CUBIC helpers exist, but full integration,
 ECN, and BBR remain outstanding. Closing currently sends a bounded
 close packet; the full three-PTO closing/draining state is unfinished.
