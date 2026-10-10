@@ -3,7 +3,12 @@
 `library/quic.min` implements a socket-independent QUIC v1 client and server in
 Minyar. It uses our `tls.min` / `tlsserver.min` TLS 1.3 handshake over ordered
 CRYPTO frames. It does not wrap an upstream QUIC or TLS transport. The native
-providers supply AES, certificate trust, and asymmetric signatures.
+providers supply AES, X25519, ChaCha20/Poly1305, certificate trust, and
+asymmetric signatures. X25519 and ChaCha/Poly1305 use the same pinned,
+unmodified Monocypher 4.0.3 source as the updater; see `vendor/README.md`.
+TLS Finished and ticket binder comparisons use its fixed-size constant-time
+comparisons. Low-order X25519 inputs fail before key derivation. The upstream
+2020 audit assessed an earlier version, and is not a security audit of Minyar.
 
 This is still an experimental transport. The complete requested QUIC standard,
 deployment interoperability matrix and production capacity measurements have

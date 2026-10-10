@@ -74,7 +74,7 @@ def native_object(project, clang, base, name, compile_flags):
     # Includes native ABI helpers and platform headers. Content keys prevent
     # stale artifacts after restores which preserve old timestamps.
     dependencies = [source, *sorted((project / 'runtime').rglob('*.h'))]
-    if name.startswith('update'):
+    if name.startswith(('securecrypto', 'update')):
         dependencies += sorted((project / 'vendor/monocypher').glob('*'))
     identity = base.copy()
     identity.update(json.dumps([name, compile_flags]).encode())
@@ -373,6 +373,9 @@ def main():
                 native += ['-lbcrypt']
             elif platform.system() != 'Darwin':
                 native += ['-lcrypto']
+        elif library == 'securecrypto':
+            native += [native_object(project, clang, base, name, native_flags)
+                       for name in ('securecrypto.c', 'update_monocypher.c')]
         elif library == 'tlsverify':
             native += [native_object(project, clang, base, 'tlsverify.c', native_flags)]
             if platform.system() == 'Darwin':
