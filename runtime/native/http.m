@@ -122,6 +122,10 @@ long long minyar_http_begin(const MinyarText *method, const MinyarText *url, con
     if (!session) {
         NSURLSessionConfiguration *configuration = NSURLSessionConfiguration.defaultSessionConfiguration;
         configuration.timeoutIntervalForRequest = 60;
+        // No local cache, as with the portable backend. CFNetwork otherwise
+        // keeps every chunk of a response for the cache, joining the pieces
+        // again for each chunk, so a long stream costs quadratic time.
+        configuration.URLCache = nil;
         NSOperationQueue *queue = [NSOperationQueue new]; queue.maxConcurrentOperationCount = 1;
         session = [NSURLSession sessionWithConfiguration:configuration delegate:[MHDelegate new] delegateQueue:queue];
         requests = [NSMutableDictionary new];
