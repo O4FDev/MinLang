@@ -56,15 +56,58 @@ The shared `desktop.min` API supplies these Windows services:
 - Current-user launch-at-login registration for the current executable. The
   quoted command and registration name identify that executable exactly. An
   existing foreign registration is denied rather than overwritten or removed.
-- Quiet-time-respecting, silent shell banner notifications. IDs must be closed
-  by their owner. Status 1 means the OS accepted the notification, not that it
-  was displayed. On Windows 11 these banners are transient, as documented by
-  [Microsoft's Shell notification API](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shell_notifyiconw).
+- Persistent Action Center notifications, after explicit Windows app registration
+  and initialization described below. Status 1 means the OS accepted a notification,
+  not that it was displayed. Disabled OS notification settings return denied.
 
 Missing OS capabilities and rejected notification input are recoverable error
 values. The Linux backend reports unavailable using the same fixed envelopes.
-Persistent Action Center toasts, advanced macOS-equivalent controls, menu
-accelerators and a unified Windows socket/GUI wait remain subsequent work.
+Advanced macOS-equivalent controls and menu accelerators remain subsequent work.
+
+## Persistent notifications and actions
+
+`winnotify.register(appId, displayName)` creates owned current-user COM,
+AppUserModelId and Start Menu entries for the current executable. Use a stable
+installation path and unique ASCII app identity. Existing foreign entries are
+denied. Call `winnotify.initialize(appId)` on the owning thread on every launch,
+including a COM relaunch with `--minyar-toast-activate appId`. Registration alone
+does not initialize callbacks. `desktop.notify` shares this initialized provider;
+without initialization it returns unavailable.
+
+```minyar
+use "winnotify" as notice
+use "errors" as errors
+let initialized = notice.initialize("com.example.Agent")
+if errors.integerOk(initialized) {
+    let actions: List<notice.Action> = [notice.action("open","Open agent")]
+    let sent = notice.notify("Agent connected","Your device is online.",actions)
+    if errors.integerOk(sent) {
+        let token = notice.token(errors.integerValue(sent))
+        // Persist tokenValue(token) if cancellation is needed after a relaunch.
+    }
+}
+```
+
+Poll the typed `nextAction()` result after `windows.nextEvent`: would-block means
+the queue is empty. Native COM callbacks wake the GUI pump and retain no Minyar
+values. Each action carries a random 32-character notification token and an
+allowlisted action ID. The default body click has action ID `default`. Foreign
+app identities, unknown actions, duplicate clicks, expired registrations and
+callbacks after cancellation are rejected. Accepted actions are consumed once;
+a crash between native queue insertion and application consumption can lose an
+action, so this is not a durable message queue.
+
+At most five unique actions are accepted, with bounded UTF-8 labels and escaped
+XML. The native queue holds at most 256 actions. At most 1,024 live registrations
+persist across restarts, and registrations expire after seven days. Expired
+entries and their scoped Action Center records are pruned on initialization and
+new delivery. `close(id)` cancels a current native handle; `cancelToken(token)`
+also removes a notification after relaunch. `stop()` releases callbacks and
+native state while preserving notifications and registration. `unregister()`
+clears owned notifications and removes owned installation entries.
+
+The implementation uses Windows' [desktop COM activation contract](https://learn.microsoft.com/en-us/previous-versions/windows/desktop/win32_tile_badge_notif/respond-to-toast-activations)
+and [scoped notification history removal](https://learn.microsoft.com/en-us/uwp/api/windows.ui.notifications.toastnotificationhistory.remove).
 
 ## Certificate-store private keys
 
@@ -143,6 +186,13 @@ accepted-child event isolation, idle timeout settling, timer cancellation and
 stale reactor generations. Instrumented `WSAPoll` calls prove the GUI wait
 does not poll sockets periodically. Compiled Minyar adapter contracts run in
 debug and release.
+
+The notification fixture invokes the real COM activation object from another
+thread and parses real WinRT XML. It covers foreign owners/actions, duplicate
+clicks, late callbacks, queued-click cancellation, stale handles, expired
+registrations, persistent limits across restart and cancellation by token. OS
+policy may deny visible banners; XML, COM and persistence contracts remain
+mandatory in that case. Debug and release exercise the typed Minyar API too.
 
 `python3 tests/schannel.py` is a separate mandatory Windows CI gate. It tests
 native state/buffer/lifetime contracts and compiled Minyar results in debug

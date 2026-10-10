@@ -788,6 +788,10 @@ bool minyar_windows_nextEvent(double seconds) {
         MSG message;
         unsigned dispatched = 0;
         while (dispatched++ < 256 && PeekMessageW(&message, NULL, 0, 0, PM_REMOVE)) {
+            // The COM activator stores only native data and wakes this owner.
+            // The caller consumes the typed winnotify.nextAction() result.
+            if (message.message == WM_APP + 0x249 && !message.hwnd)
+                return false;
             if (message.message == WM_QUIT)
                 minyar_windows_quit();
             else if (message.message == WM_KEYDOWN && message.wParam == VK_RETURN) {
