@@ -11,7 +11,7 @@ import re
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-EXTENSIONS = {'.py', '.c', '.h', '.sh'}
+EXTENSIONS = {'.py', '.c', '.h', '.m', '.sh'}
 ROLES = {'suite', 'support', 'fixture', 'manual', 'ungated'}
 
 
@@ -88,6 +88,10 @@ def controls():
         extra.write_text('pass\n')
         reject(data)  # Actual newly created source, not a simulated set mutation.
         extra.unlink()
+        objc = root / 'tests/new-native-fixture.m'
+        objc.write_text('int main(void) { return 0; }\n')
+        reject(data)
+        objc.unlink()
         mutant = copy.deepcopy(data)
         mutant['sources'].append(mutant['sources'][0])
         reject(mutant)
