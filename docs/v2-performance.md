@@ -7,8 +7,9 @@ before/after numbers and the test. Instruction counts are retired
 instructions of the application process (`proc_pid_rusage` or
 `/usr/bin/time -l`). They are steadier than wall time on this shared, heavily
 loaded machine; the load average was 30-76 throughout. By size of gain, the
-largest are 1 (10x), 5 (51x on long Texts), 11 (10x on a long streamed
-answer), 2 (4x), 8 (2x builds) and 4 (-32%).
+largest are 1 (10x), 5 (51x on long Texts), 17 (10x on a long streamed
+answer), 12 (4x on long lists), 2 (4x), 8 (2x builds), 4 (-32%) and 15
+(-28%).
 
 ## Results
 
