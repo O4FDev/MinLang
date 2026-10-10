@@ -7,7 +7,8 @@ before/after numbers and the test. Instruction counts are retired
 instructions of the application process (`proc_pid_rusage` or
 `/usr/bin/time -l`). They are steadier than wall time on this shared, heavily
 loaded machine; the load average was 30-76 throughout. By size of gain, the
-largest are 1 (10x), 5 (51x on long Texts), 2 (4x), 8 (2x builds) and 4 (-32%).
+largest are 1 (10x), 5 (51x on long Texts), 11 (9x on a long streamed
+answer), 2 (4x), 8 (2x builds) and 4 (-32%).
 
 ## Results
 
@@ -22,6 +23,7 @@ largest are 1 (10x), 5 (51x on long Texts), 2 (4x), 8 (2x builds) and 4 (-32%).
 | 7 | `json.parse` built every string from a parts list, a slice and a join | one slice when a string has no escapes | 20 parses of a 143 KB history response 1.22G | 0.95G | -22% |
 | 8 | Every macOS app build recompiled the Objective-C bridges (`macos.m` 0.46 s, `http.m` 0.12 s) | content-keyed object cache, already used for `graphics.c`, now for every native bridge | Atacama default build 0.93-1.11 s; release app 1.86-2.41 s | 0.48 s; 1.39-1.46 s | about 2x |
 | 9 | Minyarcraft's GPU vertex buffers dominated its memory (40-byte float vertices, six per quad) | 32-byte vertices (Float16 colour and light) and `graphics.updateQuads` (four vertices per quad, shared indices) | peak RSS 602 MB, footprint 892 MB, 17.30G instructions | 419 MB, 697-725 MB, 16.44G | -30% RSS, -5% instructions |
+| 11 | Atacama streaming: the answer label measured, typeset and drew all of its text every frame | `macos.textView` and `appendText` (TextKit 1), no text checking in read-only text, no URL cache in `http` | 12,000-delta answer 123.0G instructions, 14.0-14.2 s CPU; 3,000 deltas 14.3-15.0G | 13.2-14.4G, 4.2-5.4 s CPU; 4.0G | 8.9x; 3.6x |
 
 ### 1. Long lists rebuilt as stacks of views
 
@@ -389,6 +391,132 @@ Packages cannot hold state ("imported modules contain declarations only"),
 so a portable `start`/`read` would need a request record instead of an
 integer handle. That is the remaining gap if streaming is ever needed outside
 macOS.
+
+### 11. Streamed answers were laid out again in full every frame
+
+**Problem.** After change 2, Atacama still set the whole answer on its
+NSTextField label once a frame while a run streamed. A label keeps no layout
+between changes: each `setText` measures all of the text again for Auto Layout
+(`intrinsicContentSize` → `boundingRectWithSize`), then typesets and draws
+it again. Each frame cost more as the answer grew, so a stream's total grew
+with the square of its length.
+
+**Evidence.** Retired instructions of the app for the stream scenario (3 runs
+each, load average 9-32), by answer length:
+
+| Deltas (answer size) | Before |
+| ---: | ---: |
+| 0 | 0.63G, 0.52G, 0.52G |
+| 3,000 (15.8 KB) | 14.42G, 14.34G, 15.05G |
+| 12,000 (63.3 KB) | 122.99G, 122.15G, 124.58G |
+
+Four times the length cost 8.5 times as much. An `xctrace` Time Profiler run
+of the 3,000-delta stream had 358 on-CPU samples: 259 on the main thread, of
+which 130 were drawing the label's text (`__NSStringDrawingEngine`), 52 were
+measuring it (`-[NSTextField intrinsicContentSize]`) and 20 were drawing
+buttons; the other 98 were on network threads.
+
+**Fix.** Three parts, each found by profiling after the one before.
+
+1. `macos.textView(parent, text)` is read-only, selectable text that wraps to
+   its width and grows to fit, built on a TextKit 1 layout manager, and
+   `macos.appendText(handle, text)` adds to the end of its text storage (or a
+   `textEditor`'s). The layout of the earlier text is kept, so an append lays
+   out only the last line and the new text, and a selection survives it.
+   Atacama's answer is now a textView. While a run streams, `render` records
+   how many characters the view shows and appends only the rest. Any other
+   change (a new run, a saved run, the placeholder) sets the whole text, as
+   before. With only this part, a 12,000-delta stream cost 31.29-32.29G.
+2. The profile of that build (12,000 deltas, 5,305 samples) had 557 samples
+   in AppKit's text checking: after every edit the layout manager re-applies
+   the selection, and `NSTextCheckingController` (spelling marks, correction
+   bubbles and candidates) asks the view for the text around it three times.
+   With a one-paragraph answer, that is the whole answer, copied every frame
+   (`-[NSBigMutableString getCharacters:range:]`, 181 samples of self time).
+   Turning the checking settings off did not stop it. Read-only text has
+   nothing to check, so the textView now answers
+   `annotatedSubstringForProposedRange:actualRange:` with nothing. In a
+   window, through the bridge, 200 frames of 10 appended words then cost
+   537-540M instructions at every length from 4,000 to 12,000 words, against
+   972M growing to 2,207M before.
+3. The same profile had 857 samples on network threads in CFNetwork's
+   `conCatData`: the default NSURLSession configuration keeps a response for
+   its URL cache, and each received chunk rebuilt the list of all earlier
+   chunks (`dispatch_data_create_concat`, then disposing of the old list), so
+   12,000 chunks cost quadratic time. The `http` package now has no URL cache,
+   like the portable backend. Atacama always wants fresh answers and
+   history, and the cache had been writing responses to disk (`sample` of
+   the old build shows `_CFURLCacheFSWriteCachedResponseToFS`). The cache
+   cost 0.45G at 3,000 deltas and 8.6G at 12,000: 19 times as much for 4
+   times the length.
+
+Each step, measured with the app built at that step (3 runs each):
+
+| Build | 3,000 deltas | 12,000 deltas |
+| --- | ---: | ---: |
+| Before: label | 14.42G, 14.34G, 15.05G | 122.99G, 122.15G, 124.58G |
+| 1: textView and appendText | 6.06G, 6.28G, 5.97G | 31.76G, 31.29G, 32.29G |
+| 2: and no text checking | 4.48G, 4.46G, 4.45G | 22.26G, 22.83G, 22.33G |
+| 3: and no URL cache (final) | 4.04G, 3.97G, 4.02G | 14.44G, 13.71G, 13.19G |
+
+The step 1 runs at 3,000 deltas may have overlapped native GUI tests I was
+running at the time; the others ran alone.
+
+After all three, the main thread's on-CPU samples per 5 seconds stayed flat
+while a 12,000-delta answer streamed (428, 449, 443, 445, 422), so the cost
+of a frame no longer grows with the answer.
+
+| Deltas | Before | After (3 runs) | Change |
+| ---: | ---: | ---: | ---: |
+| 0 | 0.63G, 0.52G, 0.52G | 0.60G, 0.52G, 0.52G | none |
+| 3,000 | 14.42G, 14.34G, 15.05G (2.15-2.31 s CPU) | 4.04G, 3.97G, 4.02G (1.33-1.49 s) | 3.6x |
+| 12,000 | 122.99G, 122.15G, 124.58G (14.04-14.19 s CPU) | 14.44G, 13.71G, 13.19G (4.20-5.45 s) | 8.9x |
+
+Four times the length now costs 3.4 times as much (3.8 times without the
+0.52G that the scenario costs with no answer), about linear, where it cost
+8.5 times as much before.
+
+**Layout.** The final text is the same: the answer's accessibility value
+after the stream is byte-identical before and after (5,283, 15,836 and 63,336
+bytes for 1,000, 3,000 and 12,000 deltas), and equals the stub server's text.
+For a 1,000-delta answer the screenshots are identical at the top of the
+answer, and at its end differ only in the blinking caret
+(`docs/v2-evidence/atacama-stream-1000-before.png` and `-after.png`).
+
+For 3,000 and 12,000 deltas the line breaks differ, and the old label cut off
+its last line: at 3,000 deltas its answer visibly ends "...the atacama desert
+is a", while the text ends "...is a plateau in south america covering a
+strip", which the textView shows (`atacama-stream-3000-end-before.png` and
+`-after.png`, and the same for 12,000). The cause is the label. A test window
+with the same styling showed it laying out the same words with slightly wider
+spacing once its text passed somewhere between 8,441 and 10,557 characters
+(1,600 words matched the textView exactly; 2,000 words did not), so its
+wrapping changed in the middle of a stream, and (it appears) the height it
+measured no longer fitted what it drew. The textView keeps the wrapping that the label has for shorter
+text, and shows all of it. The text is still selectable and copies as plain
+text.
+
+What is left in the profile is constant per frame: Core Animation commits
+(1,182 of 2,423 main-thread samples), much of it redrawing buttons
+(388), the incremental layout of new text (303) and Atacama's render
+(381, mostly the append). The buttons are redrawn every frame although they
+do not change. Skipping `enabled` calls that change nothing did not stop it,
+so that change was not kept.
+
+**Tests.** `tests/macos-native.m` `verifyTextView` appends 2,000 times to a
+textView in a scroll view. Each append must produce exactly one text-storage
+edit, of the appended characters only, and text laid out before an append
+must stay laid out. The content, the selection, the height (grows to fit,
+rewraps when the window narrows, shrinks after `setText`), attributes on
+appended text, alignment, `selectable`, plain-text copy, appending to an
+editor, and the absence of text for text checking are checked too. A misuse
+diagnostic covers `appendText` on a label (`append-type`). Three mutants fail
+it: an append that sets the whole string again, one that invalidates all
+layout, and the view without the text-checking override. `tests/http.min`
+fetches a response marked cacheable for ten minutes twice and requires two
+different answers; with the URL cache left on, the second came from the
+cache. `check-macos` (with and without ASan/UBSan), `check-modules`,
+`check-http` and Atacama's `make test` pass.
 
 ## Gates
 
