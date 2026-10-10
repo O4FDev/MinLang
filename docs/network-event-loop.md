@@ -14,7 +14,12 @@ UDP batch of at most 64 packets. `net.receiveDatagrams` preserves each packet's
 boundaries, numeric source address, port and truncation status. Linux uses
 `sendmmsg` and `recvmmsg`; other hosts use nonblocking socket calls. Every batch
 is bounded, and the entire send encoding is checked before transmitting its
-first packet. UDP GSO/GRO and unconnected batch send are not implemented yet.
+first packet. `net.sendDatagramTo(socket, source, port, data)` replies to a
+numeric IPv4/IPv6 peer without connecting the UDP socket or performing DNS.
+It returns an owned `IntegerResult`, preserves empty datagrams and validates
+the complete address/packet before I/O. UDP GSO/GRO and unconnected batch send
+are not implemented yet. `net.monotonicMilliseconds()` supports absolute
+operation deadlines across multiple reads.
 
 ```minyar
 use "eventloop" as loop
