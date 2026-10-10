@@ -6,6 +6,10 @@ ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('interop',ROOT/'tests/quic-interop.py');interop=importlib.util.module_from_spec(spec);spec.loader.exec_module(interop)
 def main():
     if platform.system()!='Linux' or os.geteuid()!=0 or os.environ.get('MINYAR_REMOTE_LOAD')!='1':raise RuntimeError('remote admin correctness test required')
+    environment=interop.runner_environment(Path('/home/minyar/lab/quic-runner-tmp'))
+    assert environment['SERVER'] and environment['CLIENT']
+    for name in ('CERTS','SERVER_WWW','CLIENT_WWW','SERVER_DOWNLOADS','CLIENT_DOWNLOADS','SERVER_LOGS','CLIENT_LOGS'):
+        assert environment[name]=='/home/minyar/lab/quic-runner-tmp'
     for mode in ('host','bridge'):
         try:interop.network_namespace({'State':{'Pid':os.getpid()},'HostConfig':{'NetworkMode':mode}})
         except RuntimeError:pass
