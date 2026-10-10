@@ -1,0 +1,41 @@
+use "net" as net
+use "eventloop" as loop
+use "errors" as errors
+
+let selector = errors.integerValue(loop.create())
+let listener = net.listen("127.0.0.1",0,16)
+if listener < 0 { fail("listener") }
+let port = net.localPort(listener)
+let started = net.connectStart("127.0.0.1",port)
+if !errors.integerOk(started) { fail("connect start") }
+let client = errors.integerValue(started)
+let watched = errors.integerValue(loop.watch(selector,client,loop.readWriteInterest(),1))
+let ready = loop.wait(selector,1000,16)
+if errors.isError(loop.batchError(ready)) || loop.events(ready).length == 0 { fail("connect readiness") }
+if !errors.booleanOk(net.connectFinish(client)) { fail("connect finish") }
+let accepted = net.accept(listener)
+if accepted < 0 { fail("accepted") }
+let payload = Bytes("asynchronous connection")
+if errors.integerValue(net.write(client,payload)) != payload.length || !net.ready(accepted,1000) { fail("write after connect") }
+if Text(errors.bytesValue(net.read(accepted,4096))) != Text(payload) { fail("read after connect") }
+loop.remove(selector,watched); net.close(client)
+if !net.ready(accepted,1000) || errors.bytesStatus(net.read(accepted,4096)) != errors.endOfStreamStatus() { fail("TCP EOF") }
+net.close(accepted); net.close(listener)
+
+// Numeric addresses avoid invoking synchronous DNS on an event-loop owner.
+for address in ["localhost","","127.0.0.1x","127.0.0.1\u{0}suffix"] {
+    if errors.integerOk(net.connectStart(address,port)) { fail("invalid numeric address accepted") }
+}
+if errors.integerOk(net.connectStart("127.0.0.1",0)) || errors.integerOk(net.connectStart("127.0.0.1",65536)) { fail("invalid port") }
+if errors.booleanOk(net.connectFinish(-1)) { fail("invalid socket accepted") }
+let refused = net.connectStart("127.0.0.1",port)
+if errors.integerOk(refused) {
+    let socket = errors.integerValue(refused)
+    let registration = errors.integerValue(loop.watch(selector,socket,loop.readWriteInterest(),2))
+    let event = loop.wait(selector,1000,16)
+    if errors.isError(loop.batchError(event)) || loop.events(event).length == 0 { fail("refusal readiness") }
+    if errors.booleanOk(net.connectFinish(socket)) { fail("refusal accepted") }
+    loop.remove(selector,registration); net.close(socket)
+}
+loop.close(selector)
+print("nonblocking connect and recoverable refusal verified")
