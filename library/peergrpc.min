@@ -1,0 +1,290 @@
+// Native Hearth bidi gRPC mapping over the Minyar HTTP/2 server.
+use "http2" as h2
+use "errors" as errors
+record Cursor { bytes: Bytes; at: Integer; bad: Boolean }
+record Call {
+    id: Integer; buffer: Bytes; data: Bytes; opened: Boolean; notified: Boolean
+    token: Bytes; exit: Text; connection: Text; deadline: Integer; due: Integer; monoDue: Integer
+    timeout: Integer; acceptedWall: Integer; acceptedMono: Integer; status: Boolean; accepted: Boolean; ended: Boolean
+    error: errors.Error
+}
+public record Server { private transport: h2.Server; private calls: List<Call>; private held: Integer; private mono: Integer }
+public record OpenResult {
+    private error: errors.Error; private stream: Integer; private token: Bytes; private exit: Text
+    private connection: Text; private deadline: Integer; private due: Integer; private monoDue: Integer
+}
+constant LIMIT = 1048576
+constant MAX_MESSAGE = 65540
+public function path(): Text { return "/hearth.peer.v1.PeerGateway/Dial" }
+function problem(code: Integer, message: Text): errors.Error { return errors.make(code, 0, message) }
+function failure(code: Integer, message: Text): errors.BooleanResult { return errors.booleanFailure(problem(code, message)) }
+function rejected(error: errors.Error): OpenResult { return OpenResult { error: error; stream: 0; token: Bytes(); exit: ""; connection: ""; deadline: 0; due: 0; monoDue: 0 } }
+public function create(): Server { return Server { transport: h2.create(); calls: []; held: 0; mono: -1 } }
+public function receive(server: Server, bytes: Bytes): errors.BooleanResult { return h2.receive(server.transport, bytes) }
+public function takeOutgoing(server: Server, maximum: Integer): Bytes { return h2.takeOutgoing(server.transport, maximum) }
+public function connectionError(server: Server): errors.Error { return h2.connectionError(server.transport) }
+public function finish(server: Server): errors.BooleanResult { return h2.finish(server.transport) }
+public function bufferedBytes(server: Server): Integer { return server.held }
+function position(server: Server, id: Integer): Integer { for i in 0..server.calls.length { if server.calls[i].id == id { return i } }; return -1 }
+function varint(cursor: Cursor): Integer {
+    let value = 0; let shift = 0
+    for index in 0..9 {
+        if cursor.at >= cursor.bytes.length { cursor.bad = true; return 0 }
+        let byte = cursor.bytes[cursor.at]; cursor.at = cursor.at + 1
+        value = value | ((byte & 127) << shift)
+        if (byte & 128) == 0 { return value }
+        shift = shift + 7
+    }
+    cursor.bad = true; return 0
+}
+function blob(cursor: Cursor): Bytes {
+    let size = varint(cursor)
+    if cursor.bad || size > cursor.bytes.length - cursor.at { cursor.bad = true; return Bytes() }
+    let result = cursor.bytes.slice(cursor.at, cursor.at + size); cursor.at = cursor.at + size; return result
+}
+function identifier(bytes: Bytes): Boolean {
+    if bytes.length < 1 || bytes.length > 128 { return false }
+    for byte in bytes { if !((byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 45 || byte == 95 || byte == 46) { return false } }
+    return true
+}
+function token(bytes: Bytes): Boolean {
+    if bytes.length < 1 || bytes.length > 8192 { return false }
+    for byte in bytes { if !((byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 45 || byte == 95 || byte == 46) { return false } }
+    return true
+}
+function timeoutMillis(text: Text): Integer {
+    if text == "" { return 9223372036854775807 }
+    if text.length < 2 || text.length > 9 { return -1 }
+    let number = 0
+    for i in 0..(text.length - 1) { let c = text[i]; if c < '0' || c > '9' { return -1 }; number = number * 10 + Integer(c) - 48 }
+    let unit = text[text.length - 1]
+    if unit == 'H' { return number * 3600000 }
+    if unit == 'M' { return number * 60000 }
+    if unit == 'S' { return number * 1000 }
+    if unit == 'm' { return number }
+    // Round submillisecond durations up, never to zero; ticks retain ms precision.
+    if unit == 'u' { return (number + 999) / 1000 }
+    if unit == 'n' { return (number + 999999) / 1000000 }
+    return -1
+}
+function percent(message: Text): Text {
+    let result = ""; let digits = "0123456789ABCDEF"
+    for byte in Bytes(message) {
+        if byte >= 32 && byte <= 126 && byte != 37 { result = result + Text(Character(byte)) }
+        else { result = result + "%" + Text(digits[(byte >> 4) & 15]) + Text(digits[byte & 15]) }
+    }
+    return result
+}
+function begin(server: Server, call: Call): errors.BooleanResult {
+    return h2.respond(server.transport, call.id, [h2.Header { name: ":status"; value: "200" }, h2.Header { name: "content-type"; value: "application/grpc" }, h2.Header { name: "grpc-encoding"; value: "identity" }], false)
+}
+function terminate(server: Server, call: Call, code: Integer, message: Text): errors.BooleanResult {
+    if call.ended { return errors.boolean(true) }
+    if !call.status { let result = begin(server, call); if !errors.booleanOk(result) { return result }; call.status = true }
+    let result = h2.closeStream(server.transport, call.id, [h2.Header { name: "grpc-status"; value: Text(code) }, h2.Header { name: "grpc-message"; value: percent(message) }])
+    if errors.booleanOk(result) { call.ended = true }
+    return result
+}
+function abandon(server: Server, call: Call, message: Text): errors.BooleanResult {
+    call.error = problem(errors.protocolCode(), message)
+    server.held = server.held - call.buffer.length - call.data.length; call.buffer = Bytes(); call.data = Bytes()
+    let result = terminate(server, call, 13, message)
+    if !errors.booleanOk(result) && !errors.isWouldBlock(errors.booleanError(result)) { call.ended = true }
+    return errors.booleanFailure(call.error)
+}
+function openMessage(server: Server, call: Call, bytes: Bytes): Boolean {
+    if bytes.length > 16384 { return false }
+    let outer = Cursor { bytes: bytes; at: 0; bad: false }
+    if varint(outer) != 10 { return false }; let nested = blob(outer)
+    if outer.bad || outer.at != bytes.length { return false }
+    let cursor = Cursor { bytes: nested; at: 0; bad: false }; let seen = 0
+    while cursor.at < nested.length && !cursor.bad {
+        let tag = varint(cursor)
+        if tag == 10 {
+            if (seen & 1) != 0 { return false }; seen = seen | 1; call.token = blob(cursor)
+        } else if tag == 18 {
+            if (seen & 2) != 0 { return false }; seen = seen | 2; let value = blob(cursor); if !identifier(value) { return false }; call.exit = Text(value)
+        } else if tag == 26 {
+            if (seen & 4) != 0 { return false }; seen = seen | 4; let value = blob(cursor); if !identifier(value) { return false }; call.connection = Text(value)
+        } else if tag == 32 {
+            if (seen & 8) != 0 { return false }; seen = seen | 8; call.deadline = varint(cursor)
+        } else { return false }
+    }
+    if cursor.bad || seen != 15 || !token(call.token) || call.deadline < 1 || call.deadline > 9223372036854775 { return false }
+    let absolute = call.deadline * 1000
+    if absolute <= call.acceptedWall { return false }
+    let remaining = min(absolute - call.acceptedWall, call.timeout)
+    if remaining <= 0 || remaining > 9223372036854775807 - call.acceptedWall { return false }
+    call.due = call.acceptedWall + remaining
+    if call.acceptedMono >= 0 && remaining <= 9223372036854775807 - call.acceptedMono { call.monoDue = call.acceptedMono + remaining }
+    call.opened = true; return true
+}
+function drain(server: Server, call: Call): errors.BooleanResult {
+    if errors.isError(call.error) { return errors.booleanFailure(call.error) }
+    if call.ended { return errors.boolean(true) }
+    let reading = true
+    while reading {
+        let capacity = LIMIT - server.held
+        if capacity == 0 { return failure(errors.wouldBlockCode(), "gRPC receive queues full") }
+        let result = h2.read(server.transport, call.id, min(capacity, 16384))
+        if errors.bytesStatus(result) == errors.wouldBlockStatus() { reading = false }
+        else if errors.bytesStatus(result) == errors.endOfStreamStatus() {
+            if call.buffer.length != 0 || !call.opened { return abandon(server, call, "truncated gRPC request message") }
+            reading = false
+        } else if !errors.bytesOk(result) {
+            call.error = errors.bytesError(result); server.held = server.held - call.buffer.length - call.data.length
+            call.buffer = Bytes(); call.data = Bytes(); call.ended = true; return errors.booleanFailure(call.error)
+        } else {
+            let bytes = errors.bytesValue(result); call.buffer.addBytes(bytes); server.held = server.held + bytes.length
+        }
+        while call.buffer.length >= 5 {
+            let bytes = call.buffer
+            let size = (bytes[1] << 24) | (bytes[2] << 16) | (bytes[3] << 8) | bytes[4]
+            if bytes[0] != 0 || size > MAX_MESSAGE || (!call.opened && size > 16384) { return abandon(server, call, "unsupported compression or gRPC message limit") }
+            if size > bytes.length - 5 { break }
+            let body = bytes.slice(5, 5 + size); call.buffer = bytes.slice(5 + size, bytes.length)
+            server.held = server.held - size - 5
+            if !call.opened {
+                if !openMessage(server, call, body) { return abandon(server, call, "invalid protobuf gRPC open") }
+            } else {
+                let cursor = Cursor { bytes: body; at: 0; bad: false }
+                if varint(cursor) != 18 { return abandon(server, call, "gRPC open repeated or invalid data variant") }
+                let data = blob(cursor)
+                if cursor.bad || cursor.at != body.length || data.length > 65536 { return abandon(server, call, "invalid protobuf data message") }
+                call.data.addBytes(data); server.held = server.held + data.length
+            }
+        }
+    }
+    return errors.boolean(true)
+}
+function acceptHeaders(server: Server, nowMillis: Integer) {
+    let request = h2.requests(server.transport)
+    while h2.requestOk(request) {
+        let fields = h2.headers(request); let timeout = timeoutMillis(h2.headerValue(fields, "grpc-timeout"))
+        let call = Call { id: h2.streamID(request); buffer: Bytes(); data: Bytes(); opened: false; notified: false
+            token: Bytes(); exit: ""; connection: ""; deadline: 0; due: 0; monoDue: 0; timeout: timeout
+            acceptedWall: nowMillis; acceptedMono: server.mono; status: false; accepted: false; ended: false; error: errors.none() }
+        if timeout >= 0 && timeout < 9223372036854775807 - nowMillis { call.due = nowMillis + timeout }
+        if server.mono >= 0 && timeout >= 0 && timeout < 9223372036854775807 - server.mono { call.monoDue = server.mono + timeout }
+        let kept: List<Call> = []
+        for old in server.calls { if !(old.ended && old.buffer.length == 0 && old.data.length == 0) { kept.add(old) } }; server.calls = kept
+        server.calls.add(call)
+        let duplicate = false; let names: List<Text> = []
+        for field in fields {
+            if field.name == "grpc-timeout" || field.name == "content-type" || field.name == "grpc-encoding" || field.name == "te" {
+                for old in names { if field.name == old { duplicate = true } }; names.add(field.name)
+            }
+        }
+        let content = h2.headerValue(fields, "content-type"); let encoding = h2.headerValue(fields, "grpc-encoding")
+        if server.calls.length > 64 || duplicate || timeout < 0 || h2.headerValue(fields, ":method") != "POST" || h2.headerValue(fields, ":path") != path() || !(content == "application/grpc" || content == "application/grpc+proto") || h2.headerValue(fields, "te") != "trailers" || (encoding != "" && encoding != "identity") {
+            abandon(server, call, "invalid gRPC request headers")
+        }
+        request = h2.requests(server.transport)
+    }
+}
+public function requests(server: Server, nowMillis: Integer): OpenResult {
+    if nowMillis < 0 || nowMillis > 9223372036854775807 { return rejected(problem(errors.invalidDataCode(), "invalid Unix millisecond clock")) }
+    acceptHeaders(server, nowMillis)
+    for call in server.calls {
+        if !call.ended && call.due > 0 && nowMillis >= call.due { expire(server, call) }
+        if !call.ended { drain(server, call) }
+        if !call.ended && call.due > 0 && nowMillis >= call.due { expire(server, call) }
+        if !call.notified && errors.isError(call.error) { call.notified = true; return rejected(call.error) }
+        if call.opened && !call.notified { call.notified = true; return OpenResult { error: errors.none(); stream: call.id; token: call.token.slice(0, call.token.length); exit: call.exit; connection: call.connection; deadline: call.deadline; due: call.due; monoDue: call.monoDue } }
+    }
+    if errors.isError(h2.connectionError(server.transport)) { return rejected(h2.connectionError(server.transport)) }
+    return rejected(problem(errors.wouldBlockCode(), "no gRPC open"))
+}
+public function openOk(value: OpenResult): Boolean { return !errors.isError(value.error) }
+public function openError(value: OpenResult): errors.Error { return value.error }
+function requireOpen(value: OpenResult) { if !openOk(value) { fail("cannot read rejected gRPC open") } }
+public function openStreamID(value: OpenResult): Integer { requireOpen(value); return value.stream }
+public function openGrantBytes(value: OpenResult): Bytes { requireOpen(value); return value.token.slice(0, value.token.length) }
+public function openExitID(value: OpenResult): Text { requireOpen(value); return value.exit }
+public function openConnID(value: OpenResult): Text { requireOpen(value); return value.connection }
+public function openDeadlineSeconds(value: OpenResult): Integer { requireOpen(value); return value.deadline }
+public function openDeadlineMilliseconds(value: OpenResult): Integer { requireOpen(value); return value.due }
+public function openMonotonicDeadlineMillis(value: OpenResult): Integer { requireOpen(value); return value.monoDue }
+function addVarint(bytes: Bytes, value: Integer) { let remaining = value; while remaining >= 128 { bytes.add((remaining & 127) | 128); remaining = remaining >> 7 }; bytes.add(remaining) }
+function message(bytes: Bytes): Bytes {
+    let result = Bytes(); result.add(0); for i in 0..4 { result.add((bytes.length >> ((3 - i) * 8)) & 255) }; result.addBytes(bytes); return result
+}
+public function sendStatus(server: Server, id: Integer, status: Text): errors.BooleanResult {
+    let at = position(server, id); if at < 0 { return failure(errors.closedCode(), "unknown gRPC call") }; let call = server.calls[at]
+    if errors.isError(call.error) { return errors.booleanFailure(call.error) }
+    if !call.opened || call.status || call.ended { return failure(errors.protocolCode(), "gRPC first status already sent or open missing") }
+    let value = 0
+    if status == "ok" { value = 1 } else if status == "grant_invalid" { value = 2 } else if status == "exit_offline" { value = 3 } else if status == "policy_denied" { value = 4 }
+    if value == 0 { return failure(errors.invalidDataCode(), "unknown Hearth dial status") }
+    if h2.bufferedOutput(server.transport) > LIMIT - 8192 { return failure(errors.wouldBlockCode(), "gRPC first status output full") }
+    let started = begin(server, call); if !errors.booleanOk(started) { return started }
+    let body = Bytes(); body.add(8); body.add(value); let result = h2.write(server.transport, id, message(body))
+    if errors.booleanOk(result) {
+        call.status = true; call.accepted = value == 1
+        if value != 1 {
+            server.held = server.held - call.buffer.length - call.data.length; call.buffer = Bytes(); call.data = Bytes()
+            return terminate(server, call, 0, "")
+        }
+    }
+    return result
+}
+public function read(server: Server, id: Integer, maximum: Integer): errors.BytesResult {
+    if maximum < 1 { fail("gRPC read maximum must be positive") }
+    let at = position(server, id); if at < 0 { return errors.bytesFailure(problem(errors.closedCode(), "unknown gRPC call")) }; let call = server.calls[at]
+    if errors.isError(call.error) { return errors.bytesFailure(call.error) }
+    if !call.opened || !call.accepted { return errors.bytesFailure(problem(errors.protocolCode(), "gRPC relay status not accepted")) }
+    drain(server, call)
+    if errors.isError(call.error) { return errors.bytesFailure(call.error) }
+    if call.data.length == 0 {
+        if call.ended { return errors.endOfStream() }
+        let result = h2.read(server.transport, id, 1)
+        if errors.bytesStatus(result) == errors.endOfStreamStatus() { return errors.endOfStream() }
+        if errors.bytesOk(result) { let bytes = errors.bytesValue(result); call.buffer.addBytes(bytes); server.held = server.held + bytes.length }
+        return errors.wouldBlock(0)
+    }
+    let end = min(maximum, call.data.length); let bytes = call.data.slice(0, end); call.data = call.data.slice(end, call.data.length); server.held = server.held - end
+    return errors.bytes(bytes)
+}
+public function write(server: Server, id: Integer, bytes: Bytes): errors.BooleanResult {
+    let at = position(server, id); if at < 0 { return failure(errors.closedCode(), "unknown gRPC call") }; let call = server.calls[at]
+    if errors.isError(call.error) { return errors.booleanFailure(call.error) }
+    if !call.accepted || call.ended { return failure(errors.protocolCode(), "gRPC relay status not accepted or call ended") }
+    if bytes.length > 65536 { return failure(errors.invalidDataCode(), "gRPC data chunk exceeds 64KiB") }
+    let body = Bytes(); body.add(18); addVarint(body, bytes.length); body.addBytes(bytes)
+    return h2.write(server.transport, id, message(body))
+}
+public function closeStream(server: Server, id: Integer, code: Integer, message: Text): errors.BooleanResult {
+    let at = position(server, id); if at < 0 { return failure(errors.closedCode(), "unknown gRPC call") }
+    if code < 0 || code > 16 || Bytes(message).length > 1024 { return failure(errors.invalidDataCode(), "invalid gRPC final status") }
+    if code == 0 && !server.calls[at].status { return failure(errors.protocolCode(), "successful gRPC close requires first dial status") }
+    return terminate(server, server.calls[at], code, message)
+}
+function expire(server: Server, call: Call) {
+    if call.ended { return }
+    let result = terminate(server, call, 4, "deadline exceeded")
+    if errors.booleanOk(result) {
+        call.error = problem(errors.timedOutCode(), "gRPC deadline exceeded")
+        server.held = server.held - call.buffer.length - call.data.length; call.buffer = Bytes(); call.data = Bytes()
+    }
+}
+public function tick(server: Server, nowMillis: Integer): errors.BooleanResult {
+    if nowMillis < 0 { return failure(errors.invalidDataCode(), "invalid Unix millisecond clock") }
+    for call in server.calls { if !call.ended && call.due > 0 && nowMillis >= call.due { expire(server, call) } }
+    return errors.boolean(true)
+}
+public function transportTick(server: Server, monotonicMillis: Integer): errors.BooleanResult {
+    if monotonicMillis < server.mono { return failure(errors.invalidDataCode(), "monotonic clock moved backward") }
+    server.mono = monotonicMillis
+    for call in server.calls { if !call.ended && call.monoDue > 0 && monotonicMillis >= call.monoDue { expire(server, call) } }
+    return h2.tick(server.transport, monotonicMillis)
+}
+public function nextDeadlineMillis(server: Server): Integer {
+    let deadline = 0
+    for call in server.calls { if !call.ended && call.due > 0 && (deadline == 0 || call.due < deadline) { deadline = call.due } }
+    return deadline
+}
+public function nextTransportDeadlineMillis(server: Server): Integer {
+    let deadline = h2.nextDeadlineMillis(server.transport)
+    for call in server.calls { if !call.ended && call.monoDue > 0 && (deadline == 0 || call.monoDue < deadline) { deadline = call.monoDue } }
+    return deadline
+}
