@@ -1,27 +1,28 @@
 # Overnight progress (2026-10-10)
 
 Brief: ~/overnight/briefs/minyar-lang.md. Status beacon: ~/overnight/status/minyar-lang.log.
+Suite logs: /tmp/v2logs (summary.log; round1/round2 hold earlier runs).
 
 Worktrees:
-- ~/Projects/Minyar-Lang-v2: branch `v2` (the reconciliation; suites run here, logs in /tmp/v2logs)
-- ~/Projects/Minyar-Lang-list: branch `perf/macos-list` (Phase 2 work, to merge into v2)
-- ~/Projects/Minyar-Lang-astra: branch `port/astra-cycles` (Astra port; NOT merged, user decision)
-- ~/Projects/Atacama-desktop-app: now a git repo; branch `v2-list` uses mac.list; tests/profile/ has the stub server and driver
+- ~/Projects/Minyar-Lang-v2: branch `v2` (pushed at b8e0ca1; perf work merged locally since)
+- ~/Projects/Minyar-Lang-list: branch `perf/macos-list` (Phase 2 work; merged into v2)
+- ~/Projects/Minyar-Lang-astra: branch `port/astra-cycles` (NOT merged; decision for the user)
+- ~/Projects/Atacama-desktop-app: git repo (new); branch `v2-list`; builds against ../Minyar-Lang-v2
 
 ## Done
-- All dirty worktrees snapshotted; docs/v2-reconciliation.md
-- v2 = 0be01e7 + appkit + minyar-os; check-portable and check-modules green on v2
-- perf/macos-list: macos.list (Atacama history 10.2x), 60 Hz wake throttle (streaming 4.3x),
-  leaf functions skip the call-depth guard (Minyarcraft -20%, compiler -10%), unified http
-- docs/v2-performance.md (ranked, with numbers)
-- Minyar-OS boots in QEMU (desktop ready 632 ms); Minyarcraft builds
+- Snapshots of all dirty worktrees; docs/v2-reconciliation.md; v2 green on all suites and pushed (b8e0ca1)
+- Phase 2 (docs/v2-performance.md): macos.list, 60 Hz wake throttle, leaf frames, indexed-store
+  borrow, Text field append, symbol ordering, unified http, review and simplify passes
+- Bug from the simplify pass (state slot 14 vs ownership map) found by check-modules and fixed,
+  with a deterministic regression test
 
 ## In flight
-- v2 suites: check-http, check-tls, check-macos, check-ownership, check-peer-semantics, check-peer-sanitize
+- Full suites on merged v2 (summary in /tmp/v2logs/summary.log), then push v2 again
+- Astra agent: inlining traced fast paths (port/astra-cycles)
 
 ## Next
-1. When v2 suites are green: push v2
-2. Merge perf/macos-list into v2; rerun check-portable, check-macos, check-http, stack overflow; push
-3. Point Atacama's Makefile at ../Minyar-Lang-v2
+1. Push v2 when green
+2. Atacama on v2: make, make test, driver numbers, screenshots
+3. Minyar-OS on v2: boot in QEMU and compare frame profiler against b8e0ca1
 4. MORNING.md + html_render summary (by 10:45)
-5. More profiling if time: Astra overhead, OS kernel compile cost
+5. Decide what to say about Astra (merge recommendation)
