@@ -145,8 +145,14 @@ streams with at most two retained records. This is a bounded functional test,
 not hours-long churn or a memory benchmark. Locally issued connection-ID
 retirement remains unsupported. Yamux still retains at most 128 stream records
 and bounds connection buffers to 1 MiB; its stream reclamation is outstanding.
-Persistent-congestion and idle CUBIC helpers exist, but full integration,
-ECN, and BBR remain outstanding. Local close/error enters a three-PTO closing
+Persistent congestion uses bounded send-order history across all packet-number
+spaces. It collapses CUBIC to two datagrams only after an uninterrupted loss
+interval longer than three base PTOs, with an RTT sample predating those sends;
+an intervening ACK breaks the interval. Metadata shares the existing sent
+record, and acknowledged/lost records release their retained payloads. The
+RFC9002 example and its two false-positive adversaries pass sanitizers. CUBIC's
+epoch excludes application idle time. ECN and BBR remain outstanding.
+Local close/error enters a three-PTO closing
 period; authenticated packets can trigger close responses with exponential
 backoff. A received close enters a three-PTO draining period, which sends no
 packets. Public state becomes CLOSED/FAILED immediately, but socket adapters
