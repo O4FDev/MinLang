@@ -98,9 +98,12 @@ static RcCycle *rc_cycle_gray_pop(void) {
 }
 static void rc_cycle_unlink(RcCycle *cycle) {
     cycle->registered = 0;
-    if (rc_cycle_cohort == cycle) rc_cycle_cohort = cycle->next;
-    if (rc_cycle_cursor == cycle) rc_cycle_cursor = cycle->next;
-    if (rc_cycle_active == cycle) rc_cycle_active = NULL;
+    /* Collector cursors are all null between epochs. */
+    if (rc_cycle_phase != RC_CYCLE_IDLE) {
+        if (rc_cycle_cohort == cycle) rc_cycle_cohort = cycle->next;
+        if (rc_cycle_cursor == cycle) rc_cycle_cursor = cycle->next;
+        if (rc_cycle_active == cycle) rc_cycle_active = NULL;
+    }
     if (cycle->previous) cycle->previous->next = cycle->next;
     else rc_cycle_head = cycle->next;
     if (cycle->next) cycle->next->previous = cycle->previous;

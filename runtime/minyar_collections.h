@@ -497,7 +497,10 @@ void minyar_record_set_traced(MinyarRecord *record, long long field, long long v
 #endif
 }
 
-void minyar_record_set_take_traced(MinyarRecord *record, long long field, long long value) {
+/* Inlined into generated record construction: one owner-kind test, then the
+ * out-of-line incoming-count update only for a traced child. */
+__attribute__((always_inline)) void minyar_record_set_take_traced(MinyarRecord *record, long long field,
+                                                                         long long value) {
     if ((unsigned long long)field >= (unsigned long long)record->length)
         list_position_stop(field, record->length);
     unsigned char *references = (unsigned char *)(record->values + record->length);

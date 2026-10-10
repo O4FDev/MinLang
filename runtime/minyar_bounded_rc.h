@@ -159,7 +159,7 @@ static unsigned rc_drop(void *value) {
 /* Visit field `cursor` of a dead RC_TRACED object as one unit, removing its
  * incoming edge first; returns 0 once every field was visited. A recent task
  * saves its cursor before the drop, exactly as the untraced paths do. */
-static MINYAR_NOINLINE int rc_bounded_traced_visit(RcObject *object, size_t cursor, int recent) {
+static inline int rc_bounded_traced_visit(RcObject *object, size_t cursor, int recent) {
     RcCycle *cycle = rc_cycle_metadata(object);
     void *child;
     if (cycle->record) {
