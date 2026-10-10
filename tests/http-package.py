@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
+    counted = 0
 
     def log_message(self, *args):
         pass
@@ -41,6 +42,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
                 time.sleep(0.15)
             self.wfile.write(b'0\r\n\r\n')
+        elif self.path == '/counted':
+            # Cacheable for ten minutes, and different every time.
+            Handler.counted += 1
+            data = str(Handler.counted).encode()
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(data)))
+            self.send_header('Cache-Control', 'public, max-age=600')
+            self.end_headers()
+            self.wfile.write(data)
         elif self.path == '/slow':
             time.sleep(2)
             self.send(200, 'late')
@@ -78,6 +88,7 @@ true
 true cancelled
 0 true
 0 only http:// and https:// URLs are supported: localhost:8080/health
+1 2
 '''
 assert result.returncode == 0 and result.stdout == expected, (result.stdout, result.stderr)
-print('http requests, headers, Unicode bodies, streaming, cancellation and failures verified')
+print('http requests, headers, Unicode bodies, streaming, cancellation, failures and no caching verified')

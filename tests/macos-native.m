@@ -3,6 +3,7 @@
  * get only the checked API. Link against the real Minyar runtime. */
 #include "../runtime/native/macos.m"
 #include <assert.h>
+#include <objc/runtime.h>
 #include <ApplicationServices/ApplicationServices.h>
 extern void minyar_rc_release(void *value);
 static MinyarText literal(const char *s) { return (MinyarText){(const unsigned char *)s, (long long)strlen(s), -1, NULL, NULL}; }
@@ -135,6 +136,121 @@ static void verifyList(void) {
     table = nil; cell = nil; other = nil;
     minyar_macos_destroy(w);
 }
+/* A textView grows by appending: each append edits only the new characters,
+ * keeps the layout of the text before it, and keeps the selection. */
+static void verifyTextView(void) {
+    MinyarText title = literal("Text view"), start = literal("é 🙂 "), word = literal("plateau "), empty = literal(""),
+        system = literal(""), shorter = literal("short");
+    long long w = minyar_macos_window(&title,500,400);
+    long long root = minyar_macos_column(w,0);
+    long long scroll = minyar_macos_scroll(root); minyar_macos_fill(scroll); minyar_macos_grow(scroll);
+    long long page = minyar_macos_column(scroll,0); minyar_macos_fill(page);
+    long long t = minyar_macos_textView(page,&start); minyar_macos_fill(t);
+    minyar_macos_font(t,&system,16,400); minyar_macos_lineHeight(t,1.5);
+    minyar_macos_textColor(t,minyar_macos_color(0x111111,0xeeeeee,1));
+    minyar_macos_show(w);
+    drain();
+    MNTextBlock *view = entry(t).object;
+    NSWindow *window = view.window; [window layoutIfNeeded];
+    CGFloat oneLine = NSHeight(view.frame);
+    assert(oneLine >= 24 && oneLine < 48 && view.isSelectable && !view.isEditable);
+    // Record every edit the text storage processes.
+    __block NSRange edited = NSMakeRange(NSNotFound, 0);
+    __block NSInteger edits = 0, change = 0;
+    id observer = [NSNotificationCenter.defaultCenter addObserverForName:NSTextStorageDidProcessEditingNotification
+        object:view.textStorage queue:nil usingBlock:^(NSNotification *note) {
+            NSTextStorage *storage = note.object; ++edits; edited = storage.editedRange; change = storage.changeInLength;
+        }];
+    NSMutableString *expected = [NSMutableString stringWithString:@"é 🙂 "];
+    view.selectedRange = NSMakeRange(0,1);
+    for (int i = 0; i < 2000; ++i) {
+        NSUInteger before = view.textStorage.length;
+        minyar_macos_appendText(t,&word); [expected appendString:@"plateau "];
+        // Exactly one edit, of the appended characters only.
+        assert(edits == i + 1 && edited.location == before && edited.length == 8 && change == 8);
+        if (i % 500 == 499) {
+            [window layoutIfNeeded];
+            NSLayoutManager *layout = view.layoutManager;
+            NSUInteger laid = layout.firstUnlaidCharacterIndex;
+            minyar_macos_appendText(t,&word); [expected appendString:@"plateau "]; ++i;
+            // Text laid out before the append keeps its layout (a replaced
+            // string would start again from 0), except the last line.
+            assert(laid == view.textStorage.length - 8 && layout.firstUnlaidCharacterIndex > laid / 2);
+        }
+    }
+    [NSNotificationCenter.defaultCenter removeObserver:observer];
+    MinyarText *content = minyar_macos_text(t);
+    equals(content, expected.UTF8String);
+    assert(NSEqualRanges(view.selectedRange, NSMakeRange(0,1)));
+    // The text offers nothing to spell checking and correction, which would
+    // otherwise copy the paragraph around the selection after every append.
+    NSRange checked;
+    assert(![(id<NSTextCheckingClient>)view annotatedSubstringForProposedRange:NSMakeRange(0,view.textStorage.length) actualRange:&checked]);
+    // A selection copies as plain text (a private pasteboard leaves the clipboard alone).
+    NSPasteboard *board = [NSPasteboard pasteboardWithUniqueName];
+    view.selectedRange = NSMakeRange(0,4);
+    assert([view writeSelectionToPasteboard:board types:view.writablePasteboardTypes]);
+    assert([[board stringForType:NSPasteboardTypeString] isEqualToString:@"é 🙂"]);
+    [board releaseGlobally];
+    // The view grows to fit its text, inside the scroll view.
+    [window layoutIfNeeded];
+    CGFloat tall = NSHeight(view.frame);
+    assert(tall > 100 * oneLine && fabs(tall - view.intrinsicContentSize.height) < 1);
+    // Fonts and other attributes apply to appended text too.
+    NSDictionary *a = [view.textStorage attributesAtIndex:view.textStorage.length - 1 effectiveRange:NULL];
+    assert([a[NSFontAttributeName] pointSize] == 16 && [a[NSParagraphStyleAttributeName] minimumLineHeight] == 24);
+    // A narrower window rewraps it taller.
+    [window setContentSize:NSMakeSize(300,400)]; [window layoutIfNeeded];
+    assert(NSHeight(view.frame) > tall * 1.3);
+    // setText replaces everything; empty appends change nothing.
+    minyar_macos_setText(t,&shorter); minyar_macos_appendText(t,&empty);
+    equals(minyar_macos_text(t),"short");
+    [window layoutIfNeeded]; assert(NSHeight(view.frame) == oneLine);
+    minyar_macos_appendText(t,&start); equals(minyar_macos_text(t),"shorté 🙂 ");
+    minyar_macos_selectable(t,false); assert(!view.isSelectable);
+    // Alignment survives restyling and applies to appended text.
+    minyar_macos_textAlign(t,MNCenter); minyar_macos_lineHeight(t,1.6); minyar_macos_appendText(t,&word);
+    a = [view.textStorage attributesAtIndex:view.textStorage.length - 1 effectiveRange:NULL];
+    assert([a[NSParagraphStyleAttributeName] alignment] == NSTextAlignmentCenter);
+    // Editors append too.
+    long long notes = minyar_macos_textEditor(root,&start);
+    minyar_macos_appendText(notes,&word); equals(minyar_macos_text(notes),"é 🙂 plateau ");
+    view = nil; window = nil;
+    minyar_macos_destroy(w);
+}
+/* A button pushed down by growing text is not drawn again for the area it
+ * left, but is still drawn when it changes. */
+static int buttonDraws;
+static IMP drawButton;
+static void countButtonDraws(id self, SEL _cmd, NSRect frame, NSView *view) {
+    ++buttonDraws; ((void (*)(id, SEL, NSRect, NSView *))drawButton)(self, _cmd, frame, view);
+}
+static void verifyMovingButton(void) {
+    MinyarText title = literal("Moving button"), copy = literal("Copy"), copied = literal("Copied"), symbol = literal("doc.on.doc"),
+        line = literal("plateau in south america covering ");
+    Method draw = class_getInstanceMethod(NSButtonCell.class, @selector(drawWithFrame:inView:));
+    drawButton = method_getImplementation(draw);
+    class_replaceMethod(MNButtonCell.class, @selector(drawWithFrame:inView:), (IMP)countButtonDraws, method_getTypeEncoding(draw));
+    long long w = minyar_macos_window(&title,500,400);
+    long long root = minyar_macos_column(w,0);
+    long long scroll = minyar_macos_scroll(root); minyar_macos_fill(scroll); minyar_macos_grow(scroll);
+    long long page = minyar_macos_column(scroll,0); minyar_macos_fill(page);
+    long long t = minyar_macos_textView(page,&line); minyar_macos_fill(t);
+    long long b = minyar_macos_plainButton(page,&copy); minyar_macos_symbol(b,&symbol,12);
+    minyar_macos_show(w);
+    drain();
+    NSView *button = entry(b).object;
+    CGFloat top = NSMinY([button convertRect:button.bounds toView:nil]);
+    buttonDraws = 0;
+    for (int i = 0; i < 40; ++i) { minyar_macos_appendText(t,&line); for (int k = 0; k < 3; ++k) minyar_macos_nextEvent(0.005); }
+    [button.window layoutIfNeeded];
+    assert(fabs(NSMinY([button convertRect:button.bounds toView:nil]) - top) > 100);
+    assert(buttonDraws == 0);
+    minyar_macos_setText(b,&copied); drain(); [button.window displayIfNeeded];
+    assert(buttonDraws > 0);
+    button = nil;
+    minyar_macos_destroy(w);
+}
 /* Background progress (as from http) wakes nextEvent at most once a frame. */
 static void verifyWakeThrottle(void) {
     drain();
@@ -195,9 +311,12 @@ int main(int argc, char **argv) { @autoreleasepool {
         if (!strcmp(argv[1],"dimension")) minyar_macos_window(&title,-1,100);
         if (!strcmp(argv[1],"list-line")) minyar_macos_listLine(minyar_macos_list(root),3,&empty,12,400,0,1);
         if (!strcmp(argv[1],"list-type")) minyar_macos_addRow(button,&title,&title,&title);
+        if (!strcmp(argv[1],"append-type")) minyar_macos_appendText(minyar_macos_label(root,&title),&title);
         return 99;
     }
     verifyList();
+    verifyTextView();
+    verifyMovingButton();
     verifyWakeThrottle();
     equals(minyar_macos_text(field),"é 🙂 漢字");
     equals(minyar_macos_text(edit),"é 🙂 漢字");
@@ -262,7 +381,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     // Drain AppKit's autoreleased notifications before checking release.
     minyar_macos_destroy(second);
     minyar_macos_quit(); assert(receive(MNQuit,0)); assert(!minyar_macos_nextEvent(0));
-    assert(handles.count == 4); // Only the application-scoped menu, item and two colors remain.
+    assert(handles.count == 5); // Only the application-scoped menu, item and three colors remain.
     puts("native AppKit actions, delegates, Unicode, windows, menus and lifecycle verified");
     return 0;
 } }
