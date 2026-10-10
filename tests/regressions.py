@@ -374,6 +374,46 @@ print(written.byteLength)
         self.assertEqual(run.returncode, 1)
         self.assertIn(b'could not be created', run.stderr)
 
+    def test_consuming_self_assignment_respects_parameters_and_later_reads(self):
+        # x = x + e and x = x.appended(e) move x's owner into the join or
+        # append, which may then grow in place. A parameter before its first
+        # assignment owns nothing (its caller's count must stay intact), and
+        # a later read of x in the same statement must see the old value.
+        self.executes('''function growText(t: Text): Integer {
+    t = t + "zz"
+    return t.length
+}
+function growList(xs: List<Integer>): Integer {
+    xs = xs.appended(99)
+    return xs.length
+}
+function growInLoop(xs: List<Integer>): Integer {
+    let count = 0
+    while count < 3 {
+        xs = xs.appended(count)
+        count = count + 1
+    }
+    return xs.length
+}
+// Joined, not literal: literals are immortal and never grow in place.
+let text = "ab" + "cd"
+print(growText(text))
+print(text)
+let numbers = [1, 2, 3]
+print(growList(numbers))
+print(numbers.length)
+print(numbers[0])
+print(growInLoop(numbers))
+print(numbers.length)
+print(growList([4, 5]))
+let repeated = "a" + "b"
+repeated = repeated + "!" + repeated
+print(repeated)
+let values = [10, 20]
+values = values.appended(1).appended(values.length)
+print(values[3])
+''', '6\nabcd\n4\n3\n1\n6\n3\n3\nab!ab\n2\n')
+
     def test_invalid_arithmetic_and_ordering(self):
         for operator in ('+', '-', '*', '/', '%'):
             for value in ('true', "'a'", '"text"'):
