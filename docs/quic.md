@@ -146,8 +146,14 @@ not hours-long churn or a memory benchmark. Locally issued connection-ID
 retirement remains unsupported. Yamux still retains at most 128 stream records
 and bounds connection buffers to 1 MiB; its stream reclamation is outstanding.
 Persistent-congestion and idle CUBIC helpers exist, but full integration,
-ECN, and BBR remain outstanding. Closing currently sends a bounded
-close packet; the full three-PTO closing/draining state is unfinished.
+ECN, and BBR remain outstanding. Local close/error enters a three-PTO closing
+period; authenticated packets can trigger close responses with exponential
+backoff. A received close enters a three-PTO draining period, which sends no
+packets. Public state becomes CLOSED/FAILED immediately, but socket adapters
+must keep routing the CID and calling `poll`/`nextTimer` while `closing` or
+`draining` is true. `release` refuses both periods. Idle expiry remains silent
+and can release immediately. The closing test drops the first close, rejects
+forged triggers, recovers on a real peer packet, and verifies deferred release.
 
 The macOS AES provider uses CommonCrypto's CPU-dispatched AES block primitive
 and our scalar GHASH. Linux uses OpenSSL EVP and Windows uses BCrypt GCM/ECB;
