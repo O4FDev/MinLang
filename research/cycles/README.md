@@ -398,6 +398,43 @@ operations now call out-of-line traced entry points. Inlining those entry
 points is the next lever for them. Marking the traced paths `cold` cost
 another 9 M on `acyclic.min` and was replaced with plain `noinline`/`inline`.
 
+### Self-referential types while tracing is dormant
+
+`1b7bfa3` targets the cost that remains for cycle-capable types. A profile of
+a long `acyclic.min` run put most of it in destruction rather than in the
+generated code. Generated code already inlines the traced entry points
+except `minyar_record_set_take_traced`, which is now forced inline. Inlining
+the traced dead-object field visit saved 8 M on `acyclic.min`, and skipping
+collector-cursor repair in registry removal between epochs saved 1.7 M. Two
+attempts did not help and were reverted: letting dead traced Lists use the
+batched slot run, and marking traced paths `cold`.
+
+Medians of seven runs, same session:
+
+| Workload | v2 | Previous (`6219948`) | Now | Now vs v2 | Peak RSS v2 / now |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Compiler using system runtime | 364.5 M | 365.1 M | 363.6 M | -0.2% (within noise) | 11.7 / 11.8 MiB |
+| 100,000 `List<Point>.add` | 46.5 M | 46.8 M | 46.6 M | +0.2% | 7.30 / 7.30 MiB |
+| `acyclic.min` (20 x 5,000 chain) | 193.3 M | 228.4 M | 218.3 M | +12.9% | 1.86 / 2.20 MiB |
+| 100,000-record chain | 168.2 M | 191.1 M | 189.9 M | +12.9% | 12.1 / 18.2 MiB |
+
+What remains for self-referential types is the dormant bookkeeping described
+above: about 7 M instructions of metadata allocation, and registration,
+incoming counts and registry removal on every traced object and slot. There
+is no global-flag-only fast path for them. The first potentially cyclic
+mutation can close a cycle through objects built while tracing was dormant,
+so their registry entries and counts must already be exact.
+
+A side table allocated when tracing first activates was considered and not
+implemented. Activation would then need the registry and incoming counts of
+every live traced object, which means enumerating them (the registry is the
+only enumeration) and counting their slots while the mutator runs. That is
+the unbounded or position-tracking census rejected above. A side table
+allocated eagerly would cost at least the same 32 bytes per object, plus
+hashing on every barrier. The chain's +50% peak memory is the 32-byte
+prefix moving the Node record (34 bytes) and its List (32 bytes) into
+larger allocator size classes: 48 to 80 and 32 to 64 bytes.
+
 ### Validation status
 
 Final command outcomes are recorded in [validation.md](validation.md). The
