@@ -284,7 +284,7 @@ def main():
             if line.startswith('; minyar-native-library: '):
                 libraries.add(line.removeprefix('; minyar-native-library: ').strip())
     native_flags = flags('MINYAR_NATIVE_FLAGS', shlex.join(link_flags))
-    if {'macos', 'net'} <= libraries:
+    if {'macos', 'net'} <= libraries or {'windows', 'net'} <= libraries:
         native_flags = [*native_flags, '-DMINYAR_APP_EVENT_LOOP=1']
     base = clang_identity(clang) if libraries - {'machine', 'machine_arm64'} else None
     for library in sorted(libraries):
