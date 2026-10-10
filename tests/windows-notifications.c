@@ -21,6 +21,7 @@ extern void minyar_winnotify_testCreated(long long, ULONGLONG),
 extern MinyarBytes *minyar_winnotify_stopRaw(void);
 extern MinyarBytes *minyar_winnotify_cancelTokenRaw(const MinyarText *);
 extern bool minyar_windows_nextEvent(double);
+extern long long minyar_windows_eventType(void);
 extern void minyar_windows_initialize(const MinyarText *);
 typedef struct Invocation {
     CLSID clsid;
@@ -121,7 +122,8 @@ int main(void) {
     assert(WaitForSingleObject(worker, 5000) == WAIT_OBJECT_0);
     CloseHandle(worker);
     assert(SUCCEEDED(invocation.result));
-    assert(!minyar_windows_nextEvent(0)); // COM callback wakes the shared native GUI pump.
+    // A notification wakes the owner without quitting its ordinary event loop.
+    assert(minyar_windows_nextEvent(0) && minyar_windows_eventType() == 0);
     assert(FAILED(minyar_winnotify_testActivate(app, argument, 0)));
     MinyarBytes *event = minyar_winnotify_nextActionRaw();
     assert(!error(event) && event->byte_length == 53);
