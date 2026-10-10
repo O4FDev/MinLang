@@ -18,6 +18,10 @@ static BOOL receive(long long kind, long long source) {
     }
     return NO;
 }
+/* Handle everything already queued. */
+static void drain(void) {
+    while (minyar_macos_nextEvent(0) && minyar_macos_eventType() != MNNone) {}
+}
 static void verifyRelease(void) {
     __weak NSView *weakView;
     __weak NSWindow *weakWindow;
@@ -83,6 +87,80 @@ static void verifyApplicationViews(void) {
     minyar_macos_destroy(w);
     assert(handles[@(color)] != nil);
 }
+/* Lists keep rows as text and build views only for visible rows. */
+static void verifyList(void) {
+    MinyarText title = literal("List"), date = literal("10 Oct"), prompt = literal("Where is the Atacama?"), preview = literal("Chile"),
+        empty = literal(""), trash = literal("trash"), remove = literal("Delete"), system = literal("");
+    long long w = minyar_macos_window(&title,400,300);
+    long long root = minyar_macos_column(w,0);
+    long long l = minyar_macos_list(root); minyar_macos_fill(l); minyar_macos_grow(l);
+    long long color = minyar_macos_color(0x222222,0xdddddd,1);
+    minyar_macos_listLine(l,1,&system,14,450,color,0); minyar_macos_listColors(l,color,color);
+    minyar_macos_rowButton(l,&trash,&remove,color); minyar_macos_insets(l,18,0,18,0);
+    for (int i = 0; i < 5000; ++i) minyar_macos_addRow(l,&date,&prompt,i == 1 ? &empty : &preview);
+    assert(minyar_macos_rowCount(l) == 5000 && minyar_macos_clickedRow(l) == -1);
+    NSTableView *table = list(l).table;
+    // The table sees rows only when nextEvent reloads it, never half-built ones.
+    assert(table.numberOfRows == 0);
+    minyar_macos_show(w);
+    drain();
+    assert(table.numberOfRows == 5000);
+    // Only rows on screen have views.
+    __block NSInteger realized = 0;
+    [table enumerateAvailableRowViewsUsingBlock:^(NSTableRowView *view, NSInteger row) { (void)view; (void)row; ++realized; }];
+    assert(realized > 0 && realized < 100);
+    MNListCell *cell = [table viewAtColumn:0 row:1 makeIfNecessary:YES];
+    MNListCell *other = [table viewAtColumn:0 row:3 makeIfNecessary:YES];
+    assert([cell.top.stringValue isEqualToString:@"10 Oct"] && [cell.middle.stringValue isEqualToString:@"Where is the Atacama?"]);
+    assert(cell.bottom.hidden && !cell.button.hidden && cell.buttonEdge.active && !cell.textEdge.active);
+    assert(cell.topEdge.constant == 18 && cell.leadingEdge.constant == 0 && cell.buttonEdge.constant == 0);
+    assert([cell.button.toolTip isEqualToString:@"Delete Where is the Atacama?"]);
+    // Clicks queued before the program looks each keep their own row.
+    [cell.button performClick:nil]; [other.button performClick:nil];
+    assert(receive(MNAction,l)); assert(minyar_macos_clickedRow(l) == 1 && minyar_macos_clickedButton(l));
+    assert(receive(MNAction,l)); assert(minyar_macos_clickedRow(l) == 3 && minyar_macos_clickedButton(l));
+    // A disabled list delivers no clicks.
+    minyar_macos_enabled(l,false); [cell.button performClick:nil];
+    assert(!receive(MNAction,l)); minyar_macos_enabled(l,true);
+    // clear ends the rows and any clicks on them that are still queued.
+    [cell.button performClick:nil];
+    minyar_macos_clear(l); assert(minyar_macos_rowCount(l) == 0);
+    assert(!receive(MNAction,l)); assert(minyar_macos_clickedRow(l) == -1);
+    assert(table.numberOfRows == 0);
+    // Without a row button the text runs to the inset.
+    minyar_macos_rowButton(l,&empty,&empty,0); minyar_macos_addRow(l,&date,&prompt,&preview);
+    drain();
+    cell = [table viewAtColumn:0 row:0 makeIfNecessary:YES];
+    assert(cell.button.hidden && !cell.buttonEdge.active && cell.textEdge.active);
+    table = nil; cell = nil; other = nil;
+    minyar_macos_destroy(w);
+}
+/* Background progress (as from http) wakes nextEvent at most once a frame. */
+static void verifyWakeThrottle(void) {
+    drain();
+    dispatch_semaphore_t posted = dispatch_semaphore_create(0);
+    __block double sending = 0;
+    [NSThread detachNewThreadWithBlock:^{
+        double start = CACurrentMediaTime();
+        for (int i = 0; i < 200; ++i) {
+            [NSApp postEvent:[NSEvent otherEventWithType:NSEventTypeApplicationDefined location:NSZeroPoint modifierFlags:0
+                timestamp:0 windowNumber:0 context:nil subtype:MNWakeSubtype data1:0 data2:0] atStart:NO];
+            [NSThread sleepForTimeInterval:0.001];
+        }
+        sending = CACurrentMediaTime() - start;
+        dispatch_semaphore_signal(posted);
+    }];
+    int returns = 0;
+    while (dispatch_semaphore_wait(posted, DISPATCH_TIME_NOW)) {
+        assert(minyar_macos_nextEvent(0.05));
+        ++returns;
+    }
+    drain();
+    // At most one return a frame while the wake-ups arrive (plus 0.05 s
+    // timeouts, and slack); unthrottled this would be near 200.
+    assert(returns >= 1 && returns <= (int)(sending * 60) + 10);
+    assert(returns < 150);
+}
 int main(int argc, char **argv) { @autoreleasepool {
     MinyarText title = literal("Native contract"), unicode = literal("é 🙂 漢字"), empty = literal("");
     if (argc > 1 && !strcmp(argv[1],"uninitialized")) { minyar_macos_window(&title,100,100); return 99; }
@@ -115,8 +193,12 @@ int main(int argc, char **argv) { @autoreleasepool {
         if (!strcmp(argv[1],"duplicate-init")) minyar_macos_initialize(&title);
         if (!strcmp(argv[1],"overflow")) for (int i = 0; i < 4097; ++i) enqueue(MNAction,button,@"");
         if (!strcmp(argv[1],"dimension")) minyar_macos_window(&title,-1,100);
+        if (!strcmp(argv[1],"list-line")) minyar_macos_listLine(minyar_macos_list(root),3,&empty,12,400,0,1);
+        if (!strcmp(argv[1],"list-type")) minyar_macos_addRow(button,&title,&title,&title);
         return 99;
     }
+    verifyList();
+    verifyWakeThrottle();
     equals(minyar_macos_text(field),"é 🙂 漢字");
     equals(minyar_macos_text(edit),"é 🙂 漢字");
     // Embedded NUL must survive both bridging directions.
@@ -132,7 +214,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     // waits for input; it must end the wait at once rather than at the timeout.
     // Needs the test to be trusted for accessibility, as automation tools are.
     if (AXIsProcessTrusted()) {
-        while (minyar_macos_nextEvent(0) && minyar_macos_eventType() != MNNone) {}
+        drain();
         NSButton *pressed = object(button,NSButton.class);
         NSRect frame = [pressed.window convertRectToScreen:[pressed convertRect:pressed.bounds toView:nil]];
         CGPoint point = CGPointMake(NSMidX(frame), NSHeight(NSScreen.screens.firstObject.frame) - NSMidY(frame));
@@ -180,7 +262,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     // Drain AppKit's autoreleased notifications before checking release.
     minyar_macos_destroy(second);
     minyar_macos_quit(); assert(receive(MNQuit,0)); assert(!minyar_macos_nextEvent(0));
-    assert(handles.count == 3); // Only the application-scoped menu, item and color remain.
+    assert(handles.count == 4); // Only the application-scoped menu, item and two colors remain.
     puts("native AppKit actions, delegates, Unicode, windows, menus and lifecycle verified");
     return 0;
 } }

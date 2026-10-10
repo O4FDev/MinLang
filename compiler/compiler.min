@@ -612,8 +612,32 @@ function compareText(left: Text, right: Text): Integer {
     return 0
 }
 
+// Symbol tables need only a consistent total order, not alphabetical order.
+// Qualified names share long prefixes ("minyar_module_12_..."), so ordering by
+// length and then from the last character settles almost every comparison in
+// a step or two, where compareText walks the shared prefix.
+function compareSymbolName(left: Text, right: Text): Integer {
+    if left.byteLength != right.byteLength {
+        if left.byteLength < right.byteLength { return -1 }
+        return 1
+    }
+    let position = left.length
+    if position != right.length {
+        if position < right.length { return -1 }
+        return 1
+    }
+    while position > 0 {
+        position = position - 1
+        if left[position] != right[position] {
+            if left[position] < right[position] { return -1 }
+            return 1
+        }
+    }
+    return 0
+}
+
 function compareSymbol(symbolNames: List<Text>, symbolKinds: List<Integer>, left: Integer, right: Integer): Integer {
-    let order = compareText(symbolNames[left], symbolNames[right])
+    let order = compareSymbolName(symbolNames[left], symbolNames[right])
     if order == 0 {
         if symbolKinds[left] < symbolKinds[right] {
             order = -1
@@ -693,7 +717,7 @@ function findIndexedSymbol(lookup: List<Integer>, symbolNames: List<Text>, symbo
     while low < high {
         let middle = low + (high - low) / 2
         let symbol = lookup[middle]
-        let order = compareText(symbolNames[symbol], name)
+        let order = compareSymbolName(symbolNames[symbol], name)
         if order == 0 {
             if symbolKinds[symbol] < kind {
                 order = -1
@@ -725,7 +749,7 @@ function findCompiledSymbol(symbolNames: List<Text>, symbolKinds: List<Integer>,
     while low < high {
         let middle = low + (high - low) / 2
         let symbol = symbolReturnTypes[count + middle]
-        let order = compareText(symbolNames[symbol], name)
+        let order = compareSymbolName(symbolNames[symbol], name)
         if order == 0 {
             if symbolKinds[symbol] < kind {
                 order = -1
@@ -1596,9 +1620,10 @@ function takeOwner(output: List<Text>, state: List<Integer>, value: Text, owner:
 // LLVM local identifiers and runtime ownership slots are independent. Only
 // bindings that acquire an owner need a slot. Generation tags reuse the map
 // between functions without clearing its high-water capacity each time.
-// The first 14 entries hold compiler state, including reachability at index 13.
+// The first 15 entries hold compiler state, including reachability at index 13
+// and the body's user-call count at index 14.
 function ownershipSlot(state: List<Integer>, id: Integer): Integer {
-    let entry = 14 + id * 2
+    let entry = 15 + id * 2
     while state.length <= entry + 1 {
         state.add(-1)
     }
@@ -1615,7 +1640,7 @@ function ownershipSlot(state: List<Integer>, id: Integer): Integer {
 // expression tokens identify editable output pieces elsewhere in this emitter.
 function scalarRecordValues(state: List<Integer>, id: Integer): Integer {
     if id < 0 { return -1 }
-    let entry = 14 + id * 2
+    let entry = 15 + id * 2
     if entry + 1 < state.length && state[entry] == state[9] && state[entry + 1] < -1 {
         return -2 - state[entry + 1]
     }
@@ -1623,7 +1648,7 @@ function scalarRecordValues(state: List<Integer>, id: Integer): Integer {
 }
 
 function markScalarRecord(state: List<Integer>, id: Integer, values: Integer) {
-    let entry = 14 + id * 2
+    let entry = 15 + id * 2
     while state.length <= entry + 1 { state.add(-1) }
     state[entry] = state[9]
     state[entry + 1] = -2 - values
@@ -2440,6 +2465,25 @@ function parseBytesMethod(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
     return emitCall(output, textState, state, returnType, callee, values, types)
 }
 
+// Whether the token at `cursor` is a name followed by `(`: a call.
+function callAt(tokenKinds: List<Integer>, tokenTexts: List<Text>, cursor: Integer): Boolean {
+    return tokenKinds[cursor] == 1 && tokenKinds[cursor + 1] == 4 && tokenTexts[cursor + 1] == "("
+}
+
+// Whether the tokens from `position` to the end of the statement make no call.
+// The tokenizer ends a statement only outside brackets and after a complete
+// line, so the scan cannot stop inside a multi-line expression.
+function statementWithoutCalls(tokenKinds: List<Integer>, tokenTexts: List<Text>, position: Integer): Boolean {
+    let cursor = position
+    while tokenKinds[cursor] != 0 && tokenKinds[cursor] != 6 {
+        if callAt(tokenKinds, tokenTexts, cursor) {
+            return false
+        }
+        cursor = cursor + 1
+    }
+    return true
+}
+
 // Whether the tokens at `position` are `[ ... ]` with no call inside, so
 // evaluating the position cannot run code that replaces the indexed value.
 function indexWithoutCalls(tokenKinds: List<Integer>, tokenTexts: List<Text>, position: Integer): Boolean {
@@ -2449,7 +2493,7 @@ function indexWithoutCalls(tokenKinds: List<Integer>, tokenTexts: List<Text>, po
     let depth = 0
     let cursor = position
     while tokenKinds[cursor] != 0 {
-        if tokenKinds[cursor] == 1 && tokenKinds[cursor + 1] == 4 && tokenTexts[cursor + 1] == "(" {
+        if callAt(tokenKinds, tokenTexts, cursor) {
             return false
         }
         if tokenKinds[cursor] == 4 {
@@ -3819,6 +3863,7 @@ function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                                         output.add(value)
                                         output.add(" = ")
                                     }
+                                    state[14] = state[14] + 1
                                     output.add("call ")
                                     output.add(llvmType(returnType))
                                     if name == "main" || name[0] == '"' {
@@ -4057,7 +4102,8 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
     if operator != "=" {
         binary = operator.slice(0, 1)
     }
-    let name = tokenTexts[state[0]]
+    let start = state[0]
+    let name = tokenTexts[start]
     let local = findLocal(localNames, localLengths, state, name)
     if local < 0 {
         fail(describeLocation(tokenLocation(tokenLines, state[0])) + ": I can't find a value named '" + name + "'")
@@ -4095,12 +4141,42 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
             let fieldIndex = field - functionParameterOffset(functionParameterCounts, receiverType - 1000)
             if state[0] == operatorPosition {
                 state[0] = operatorPosition + 1
+                // `name.field = name.field + more` appends, exactly like `+=`.
+                let next = state[0]
+                if binary == "" && fieldType == 2 && operatorPosition == start + 3 && tokenKinds[next] == 1 && tokenTexts[next] == name && tokenTexts[next + 1] == "." && tokenTexts[next + 2] == member && tokenTexts[next + 3] == "+" {
+                    binary = "+"
+                    state[0] = next + 4
+                }
                 let current = ""
                 if binary != "" {
                     current = readRecordField(output, textState, state, receiver, fieldIndex, fieldType)
                     borrowReference(output, state, current, fieldType, typeMayCycle(fieldType, functionParameterCounts, functionParameterTypes, functionReturnTypes))
                 }
-                let value = assignedValue(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, binary, current, fieldType, valueType, operatorLocation)
+                let value = ""
+                if binary == "+" && fieldType == 2 {
+                    // Appending to a Text field grows it in place when the
+                    // record holds the only other reference, so building a
+                    // Text in a field is linear rather than quadratic.
+                    let rightType: List<Integer> = []
+                    rightType.add(2)
+                    let right = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, rightType)
+                    if rightType[0] == 2 {
+                        output.add("  call void @minyar_record_append_text(ptr ")
+                        output.add(receiver)
+                        output.add(", i64 ")
+                        output.add(Text(fieldIndex))
+                        output.add(", ptr ")
+                        output.add(current)
+                        output.add(", ptr ")
+                        output.add(right)
+                        output.add(")\n")
+                        return
+                    }
+                    setType(valueType, 0)
+                    value = emitBinary(output, textState, state, binary, current, fieldType, -1, right, rightType[0], valueType, tokenLines, operatorLocation)
+                } else {
+                    value = assignedValue(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, binary, current, fieldType, valueType, operatorLocation)
+                }
                 if valueType[0] != fieldType {
                     fail(describeLocation(tokenLocation(tokenLines, operatorLocation)) + ": record field '" + member + "' needs " + describeType(fieldType) + ", not " + describeType(valueType[0]))
                 }
@@ -4139,7 +4215,16 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
             } else {
                 receiver = readRecordField(output, textState, state, receiver, fieldIndex, fieldType)
                 receiverType = fieldType
-                borrowReference(output, state, receiver, receiverType, typeMayCycle(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes))
+                // `record.field[position] = value` with no call in the rest of
+                // the statement: nothing can replace the field before the
+                // store, so it needs no borrow (as for reads, see parsePrimary).
+                // A cycle-capable List keeps its borrow: the cycle hint before
+                // the store is a service point, and the borrow keeps the List
+                // an explicit root across it.
+                let traced = typeMayCycle(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+                if traced || !(tokenTexts[state[0]] == "[" && statementWithoutCalls(tokenKinds, tokenTexts, state[0])) {
+                    borrowReference(output, state, receiver, receiverType, traced)
+                }
             }
         } else {
             let bracketLocation = state[0]
@@ -4747,16 +4832,12 @@ function finishParallelFunction(output: List<Text>, globals: List<Text>, entrySl
     if references {
         fail("parallel function '" + readableDeclarationName(name) + "' may use only Integer, Float, Boolean and Character values")
     }
-    let entry = output[entrySlot]
-    let enter = "  call void @minyar_stack_enter()\n"
-    if entry.length >= enter.length && entry.slice(0, enter.length) == enter {
-        output[entrySlot] = entry.slice(enter.length, entry.length)
-    }
+    dropCallDepthFrame(output, entrySlot, bodySlot)
     let body: List<Text> = []
     let piece = bodySlot
     while piece < output.length {
         let text = output[piece]
-        if text == "  call void @minyar_stack_leave()\n" || text == "  call void @minyar_rc_leave()\n" || text == "  call void @minyar_rc_step()\n" {
+        if text == "  call void @minyar_rc_leave()\n" || text == "  call void @minyar_rc_step()\n" {
             output[piece] = ""
         } else {
             body.add(text)
@@ -4781,6 +4862,22 @@ function finishParallelFunction(output: List<Text>, globals: List<Text>, entrySl
             globals.add("; minyar-parallel-call: " + name + "|" + text.slice(position + 12, end) + "\n")
         }
         position = position + 1
+    }
+}
+
+// Remove the call-depth check from a function's entry and every return.
+function dropCallDepthFrame(output: List<Text>, entrySlot: Integer, bodySlot: Integer) {
+    let enter = "  call void @minyar_stack_enter()\n"
+    let entry = output[entrySlot]
+    if entry.length >= enter.length && entry.slice(0, enter.length) == enter {
+        output[entrySlot] = entry.slice(enter.length, entry.length)
+    }
+    let piece = bodySlot
+    while piece < output.length {
+        if output[piece] == "  call void @minyar_stack_leave()\n" {
+            output[piece] = ""
+        }
+        piece = piece + 1
     }
 }
 
@@ -5120,6 +5217,8 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
     state.add(0)
     state.add(-1)
     state.add(0)
+    // 14: user-function calls emitted in the current body (leaf detection).
+    state.add(0)
     let hasNative = false
     let textState: List<Text> = []
     textState.add("entry")
@@ -5185,6 +5284,7 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         // Reset it per body in bounded mode: -1 at finish proves no user call.
         // Ordinary mode retains its existing cross-body cache behavior.
         if stackOwnerLimit > 0 { state[5] = -1 }
+        state[14] = 0
         textState[0] = "entry"
         let localNames: List<Text> = []
         let localTypes: List<Integer> = []
@@ -5291,6 +5391,14 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         }
         if stackOwnerLimit > 0 && name != "main" && state[5] == -1 && state[6] == 1 && state[8] >= 1 && state[8] <= stackOwnerLimit {
             finishStackOwnership(output, entrySlot, state[8])
+        } else if !parallel && !machineIntrinsic && name != "main" && state[14] == 0 && state[4] <= 256 && state[1] <= 1024 && state[2] <= 1024 {
+            // A leaf (no user call, state[14]) cannot deepen recursion. With at
+            // most 256 locals and 1,024 temporaries its frame stays within
+            // about 18 KiB even unoptimized, inside the 128 KiB reserve its
+            // caller's check left (MINYAR_STACK_RESERVE_BYTES). Without the
+            // check, LLVM can inline small accessors. Dispatch lowering, which
+            // embeds a stack leave in a larger piece, needs 4,096 labels.
+            dropCallDepthFrame(output, entrySlot, bodySlot)
         }
         output.add("}\n\n")
         } else {
@@ -5317,6 +5425,7 @@ function compileTopLevel(tokenKinds: List<Integer>, tokenTexts: List<Text>, toke
     state.add(-1)
     state.add(0)
     state.add(-1)
+    state.add(0)
     state.add(0)
     let textState: List<Text> = []
     textState.add("entry")
@@ -5474,6 +5583,7 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     output.add("declare void @minyar_exit(i64)\n")
     output.add("declare void @minyar_print_float(double)\n")
     output.add("declare void @minyar_record_replace(ptr, i64, i64, i64)\n")
+    output.add("declare void @minyar_record_append_text(ptr, i64, ptr, ptr)\n")
     output.add("declare i64 @minyar_bytes_get(ptr, i64)\n")
     output.add("declare void @minyar_bytes_set(ptr, i64, i64)\n")
     output.add("declare i64 @minyar_bytes_length(ptr)\n")

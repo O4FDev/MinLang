@@ -50,7 +50,10 @@ os.execvp(args[0],args)
                 "/usr/sbin/taskpolicy", shlex.quote(str(policy))))
             self.wrappers[name] = wrapper
         self.environment = dict(os.environ, POLICY_LOG=str(self.log))
-        self.environment.pop("MINYAR_INTERACTIVE_BOOTSTRAP", None)
+        # The wrappers read these; a caller's own settings must not leak in.
+        for name in ("MINYAR_INTERACTIVE_BOOTSTRAP", "MINYAR_NICE_PRIORITY", "MINYAR_MAX_CPU_SECONDS",
+                     "MINYAR_MAX_MEMORY_MIB", "MINYAR_MAX_FILE_BLOCKS"):
+            self.environment.pop(name, None)
         self.payload = self.work / "payload with spaces.py"
         self.payload.write_text("import json,os,resource\nprint(json.dumps({"
                                 "'cpu':resource.getrlimit(resource.RLIMIT_CPU),"

@@ -12,6 +12,9 @@ enum { MNStart = 1, MNCenter = 2, MNEnd = 3 };
 /* Other native packages (such as http) post an application-defined event with
  * this subtype when background work progresses, ending a nextEvent wait early. */
 enum { MNWakeSubtype = 0x4D59 };
+/* Background wake-ups end a nextEvent wait at most this often (60 Hz). */
+static const NSTimeInterval MNWakeInterval = 1.0 / 60;
+static NSTimeInterval lastWake;
 
 @interface MNHandle : NSObject
 @property(nonatomic, strong) id object;
@@ -36,7 +39,8 @@ enum { MNWakeSubtype = 0x4D59 };
 - (instancetype)init { if ((self = [super init])) _lines = -1; return self; }
 @end
 @interface MNEvent : NSObject
-@property(nonatomic) long long kind, source;
+@property(nonatomic) long long kind, source, row;
+@property(nonatomic) BOOL button;
 @property(nonatomic, copy) NSString *text;
 @end
 @implementation MNEvent
@@ -116,8 +120,19 @@ static void enqueue(long long kind, long long source, NSString *text) {
         last.text = text ?: @""; return;
     }
     if (events.count >= 4096) minyar_native_stop("macos event queue is full; consume events with nextEvent.");
-    MNEvent *e = [MNEvent new]; e.kind = kind; e.source = source; e.text = text ?: @"";
+    MNEvent *e = [MNEvent new]; e.kind = kind; e.source = source; e.text = text ?: @""; e.row = -1;
     [events addObject:e];
+}
+/* A click on a list row, or on its button. */
+static void enqueueRow(long long source, long long row, BOOL button) {
+    enqueue(MNAction, source, @"");
+    MNEvent *e = events.lastObject; e.row = row; e.button = button;
+}
+/* Drop queued events that match, such as those from objects that just ended. */
+static void dropEvents(BOOL (^matches)(MNEvent *e)) {
+    [events removeObjectsAtIndexes:[events indexesOfObjectsPassingTest:^BOOL(MNEvent *e, NSUInteger i, BOOL *stop) {
+        (void)i; (void)stop; return matches(e);
+    }]];
 }
 static void requestQuit(void) {
     if (!quitting) { quitting = YES; enqueue(MNQuit, 0, @""); }
@@ -157,6 +172,18 @@ static NSDictionary *textAttributes(MNHandle *h, NSFont *fallback, NSTextAlignme
     a[NSParagraphStyleAttributeName] = p;
     return a;
 }
+/* lines(label, 1) truncates with "…"; 0 wraps to the width; n wraps up to n lines. */
+static void wrapLabel(NSTextField *f, long long lines) {
+    if (lines == 1) {
+        f.maximumNumberOfLines = 1; f.cell.wraps = NO; f.cell.scrollable = NO; f.cell.truncatesLastVisibleLine = YES;
+        f.lineBreakMode = NSLineBreakByTruncatingTail;
+        [f setContentCompressionResistancePriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
+    } else {
+        f.maximumNumberOfLines = (NSInteger)lines; f.cell.wraps = YES; f.cell.scrollable = NO;
+        f.lineBreakMode = NSLineBreakByWordWrapping;
+        [f setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    }
+}
 static void applyText(MNHandle *h) {
     id o = h.object;
     NSColor *color = textColorOf(h);
@@ -169,15 +196,7 @@ static void applyText(MNHandle *h) {
         NSTextField *f = o;
         if (h.font) f.font = h.font;
         if (color) f.textColor = color;
-        if (h.lines == 1) {
-            f.maximumNumberOfLines = 1; f.cell.wraps = NO; f.cell.scrollable = NO; f.cell.truncatesLastVisibleLine = YES;
-            f.lineBreakMode = NSLineBreakByTruncatingTail;
-            [f setContentCompressionResistancePriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
-        } else if (h.lines >= 0) {
-            f.maximumNumberOfLines = (NSInteger)h.lines; f.cell.wraps = YES; f.cell.scrollable = NO;
-            f.lineBreakMode = NSLineBreakByWordWrapping;
-            [f setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
-        }
+        if (h.lines >= 0) wrapLabel(f, h.lines);
         // Editable fields keep plain values; their editor uses font and textColor.
         if (!f.isEditable) {
             f.allowsEditingTextAttributes = f.isSelectable;
@@ -216,6 +235,35 @@ static void restyle(MNHandle *h) {
     if ([o isKindOfClass:NSClassFromString(@"MNShape")]) v.needsDisplay = YES;
 }
 static void applyFill(MNHandle *h);
+static NSFont *resolveFont(NSString *name, double size, double weight);
+@interface MNListRow : NSObject
+@property(nonatomic, copy) NSString *top, *middle, *bottom;
+@end
+@interface MNListStyle : NSObject
+@property(nonatomic, strong) NSFont *font;
+@property(nonatomic, strong) NSColor *color;
+@property(nonatomic) long long lines;
+@end
+@interface MNList : NSScrollView <NSTableViewDataSource, NSTableViewDelegate>
+@property(nonatomic, strong) NSTableView *table;
+@property(nonatomic, strong) NSMutableArray<MNListRow *> *rows;
+@property(nonatomic, copy) NSArray<MNListRow *> *shown;
+@property(nonatomic, strong) NSArray<MNListStyle *> *styles;
+@property(nonatomic, strong) NSImage *buttonImage;
+@property(nonatomic, copy) NSString *buttonTip;
+@property(nonatomic, strong) NSColor *buttonColor, *hoverBackground, *separator;
+@property(nonatomic) NSEdgeInsets insets;
+- (void)clearRows;
+- (void)enableRows:(BOOL)enabled;
+- (void)insetRows:(NSEdgeInsets)insets;
+@end
+static NSMutableSet<MNList *> *pendingLists;
+static void reloadLists(void);
+static void checkFont(double size, double weight);
+static void checkLines(long long count);
+static NSImage *symbolImage(NSString *name, double size);
+/* Controls and rows drawn while disabled. */
+static const CGFloat MNDisabledAlpha = 0.45;
 /* Content hugging, including a stack's own hugging of its arranged views. */
 static void hug(NSView *v, NSLayoutPriority priority, NSLayoutConstraintOrientation orientation) {
     if ([v contentHuggingPriorityForOrientation:orientation] > priority) [v setContentHuggingPriority:priority forOrientation:orientation];
@@ -622,10 +670,7 @@ static void forget(NSView *root, BOOL includeRoot) {
     }
     for (NSNumber *key in gone) [numbers removeObjectForKey:handles[key].object];
     [handles removeObjectsForKeys:gone];
-    NSIndexSet *stale = [events indexesOfObjectsPassingTest:^BOOL(MNEvent *e, NSUInteger i, BOOL *stop) {
-        (void)i; (void)stop; return e.source != 0 && handles[@(e.source)] == nil;
-    }];
-    [events removeObjectsAtIndexes:stale];
+    dropEvents(^BOOL(MNEvent *e) { return e.source != 0 && handles[@(e.source)] == nil; });
 }
 static void replaceMinimum(MNHandle *h, NSView *v, long long width, long long height) {
     h.minimumWidth.active = NO; h.minimumHeight.active = NO; h.minimumWidth = nil; h.minimumHeight = nil;
@@ -706,10 +751,7 @@ void minyar_macos_destroy(long long handle) { @autoreleasepool {
     [numbers removeObjectForKey:w];
     [handles removeObjectForKey:@(handle)];
     // No future events may refer to destroyed objects. The current event remains a snapshot.
-    NSIndexSet *stale = [events indexesOfObjectsPassingTest:^BOOL(MNEvent *e, NSUInteger i, BOOL *stop) {
-        (void)i; (void)stop; return e.source != 0 && handles[@(e.source)] == nil;
-    }];
-    [events removeObjectsAtIndexes:stale];
+    dropEvents(^BOOL(MNEvent *e) { return e.source != 0 && handles[@(e.source)] == nil; });
 } }
 static long long stack(long long parent, long long spacing, NSUserInterfaceLayoutOrientation orientation) {
     ready(); dimension(spacing); MNStack *s = [MNStack new]; s.orientation = orientation; s.spacing = spacing;
@@ -794,10 +836,11 @@ void minyar_macos_setText(long long handle, const MinyarText *text) { @autorelea
 void minyar_macos_enabled(long long handle, bool value) { @autoreleasepool {
     MNHandle *h = entry(handle); id v = h.object;
     if ([v isKindOfClass:MNStack.class]) {
-        MNStack *s = v; s.disabled = !value; s.alphaValue = value ? 1 : 0.45;
+        MNStack *s = v; s.disabled = !value; s.alphaValue = value ? 1 : MNDisabledAlpha;
         if (!value && h.hovering) { h.hovering = NO; restyle(h); }
         return;
     }
+    if ([v isKindOfClass:MNList.class]) { [(MNList *)v enableRows:value]; return; }
     if (editor(v)) {
         editor(v).editable = value; editor(v).textColor = value ? (textColorOf(h) ?: NSColor.textColor) : NSColor.disabledControlTextColor;
         return;
@@ -805,7 +848,7 @@ void minyar_macos_enabled(long long handle, bool value) { @autoreleasepool {
     if (![v isKindOfClass:NSControl.class] && ![v isKindOfClass:NSMenuItem.class]) minyar_native_stop("macos.enabled requires a control, editor, or menu item.");
     [v setEnabled:value];
     if ([v isKindOfClass:MNButton.class] && ![v isBordered]) {
-        [v setAlphaValue:value ? 1 : 0.45];
+        [v setAlphaValue:value ? 1 : MNDisabledAlpha];
         if (!value && h.hovering) { h.hovering = NO; restyle(h); }
     }
 } }
@@ -849,19 +892,31 @@ void minyar_macos_menuSeparator(long long menu) { @autoreleasepool {
 bool minyar_macos_nextEvent(double timeout) { @autoreleasepool {
     ready(); if (!isfinite(timeout) || timeout < 0 || timeout > 60) minyar_native_stop("macos event timeout must be between 0 and 60 seconds.");
     current = nil;
+    reloadLists();
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    BOOL woken = NO;
     // Always pump at least one native event, even while Minyar events are pending.
     // This keeps menus, window drawing and text input responsive under load.
     do {
         waiting = !events.count && !quitting;
         NSEvent *e = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:(events.count || quitting ? NSDate.distantPast : deadline) inMode:NSDefaultRunLoopMode dequeue:YES];
         waiting = NO;
-        // Background work finished: return now so the program can look at it.
-        if (e.type == NSEventTypeApplicationDefined && e.subtype == MNWakeSubtype) break;
+        // Background work progressed: return so the program can look at it, but
+        // at most once a display frame. A stream that arrives in many small
+        // chunks is then drawn at the display rate, not once per chunk; input
+        // events are still delivered at once.
+        if (e.type == NSEventTypeApplicationDefined && e.subtype == MNWakeSubtype) {
+            NSTimeInterval now = NSProcessInfo.processInfo.systemUptime, frame = lastWake + MNWakeInterval;
+            woken = YES;
+            if (now >= frame) break;
+            if (deadline.timeIntervalSinceNow > frame - now) deadline = [NSDate dateWithTimeIntervalSinceNow:frame - now];
+            continue;
+        }
         if (e) [NSApp sendEvent:e];
         [NSApp updateWindows];
         if (!e) break;
     } while (!events.count && !quitting && deadline.timeIntervalSinceNow > 0);
+    if (woken) lastWake = NSProcessInfo.processInfo.systemUptime;
     if (events.count) { current = events.firstObject; [events removeObjectAtIndex:0]; return true; }
     return !quitting;
 } }
@@ -958,7 +1013,8 @@ void minyar_macos_insets(long long handle, long long top, long long left, long l
     NSEdgeInsets insets = NSEdgeInsetsMake(top, left, bottom, right);
     if (container(v)) { container(v).edgeInsets = insets; refill(container(v)); return; }
     if ([v isKindOfClass:MNButton.class]) { [v setInsets:insets]; [v invalidateIntrinsicContentSize]; return; }
-    minyar_native_stop("macos.insets requires a row, column, scroll view, or button.");
+    if ([v isKindOfClass:MNList.class]) { [(MNList *)v insetRows:insets]; return; }
+    minyar_native_stop("macos.insets requires a row, column, scroll view, list, or button.");
 } }
 void minyar_macos_align(long long handle, long long alignment) { @autoreleasepool {
     NSStackView *s = container(entry(handle).object);
@@ -991,7 +1047,9 @@ void minyar_macos_hidden(long long handle, bool hidden) { @autoreleasepool {
     if (hidden && h.hovering) { h.hovering = NO; restyle(h); }
 } }
 void minyar_macos_clear(long long handle) { @autoreleasepool {
-    NSStackView *s = container(entry(handle).object);
+    id o = entry(handle).object;
+    if ([o isKindOfClass:MNList.class]) { [(MNList *)o clearRows]; return; }
+    NSStackView *s = container(o);
     if (!s) minyar_native_stop("macos.clear requires a row, column, or scroll view.");
     forget(s, NO);
     for (NSView *child in [s.views copy]) [s removeView:child];
@@ -1004,6 +1062,197 @@ void minyar_macos_remove(long long handle) { @autoreleasepool {
     forget(v, YES);
     [v removeFromSuperview];
 } }
+
+/* ----- Lists -----
+ * A list keeps its rows as text and lets NSTableView build views only for the
+ * rows on screen, reusing them while scrolling. Rebuilding a list of any length
+ * costs one string copy per line instead of a stack of laid-out views per row.
+ * The table shows a snapshot of the rows taken when nextEvent reloads it, so
+ * AppKit never sees rows that the program is still changing. */
+
+@implementation MNListRow
+@end
+@implementation MNListStyle
+@end
+@interface MNListCell : NSTableCellView
+@property(nonatomic, strong) NSTextField *top, *middle, *bottom;
+@property(nonatomic, strong) NSButton *button;
+@property(nonatomic, strong) NSLayoutConstraint *leadingEdge, *topEdge, *bottomEdge, *buttonEdge, *textEdge;
+@end
+@implementation MNListCell
+@end
+@interface MNListRowView : NSTableRowView
+@property(nonatomic, strong) NSColor *hoverBackground, *separator;
+@property(nonatomic) BOOL hovering;
+@end
+@implementation MNListRowView
+- (void)mouseEntered:(NSEvent *)event { (void)event; self.hovering = YES; self.needsDisplay = YES; }
+- (void)mouseExited:(NSEvent *)event { (void)event; self.hovering = NO; self.needsDisplay = YES; }
+- (void)prepareForReuse { [super prepareForReuse]; self.hovering = NO; }
+- (void)drawBackgroundInRect:(NSRect)dirtyRect {
+    (void)dirtyRect;
+    NSTableView *table = (NSTableView *)self.superview;
+    BOOL enabled = ![table isKindOfClass:NSTableView.class] || table.isEnabled;
+    if (self.hovering && self.hoverBackground && enabled) { [self.hoverBackground setFill]; NSRectFill(self.bounds); }
+    if (self.separator) { [self.separator setFill]; NSRectFill(NSMakeRect(0, NSHeight(self.bounds) - 1, NSWidth(self.bounds), 1)); }
+}
+- (void)drawSelectionInRect:(NSRect)dirtyRect { (void)dirtyRect; }
+@end
+
+@implementation MNList
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)table { (void)table; return (NSInteger)self.shown.count; }
+- (NSTableRowView *)tableView:(NSTableView *)table rowViewForRow:(NSInteger)row {
+    (void)row;
+    MNListRowView *view = [table makeViewWithIdentifier:@"MNListRowView" owner:self];
+    if (!view) { view = [MNListRowView new]; view.identifier = @"MNListRowView"; track(view); }
+    view.hoverBackground = self.hoverBackground; view.separator = self.separator;
+    return view;
+}
+static NSTextField *listLabel(void) {
+    NSTextField *label = [NSTextField labelWithString:@""];
+    label.selectable = NO; label.translatesAutoresizingMaskIntoConstraints = NO;
+    [label setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    return label;
+}
+static void styleListLabel(NSTextField *label, MNListStyle *style, NSString *text) {
+    label.hidden = text.length == 0;
+    if (style.font) label.font = style.font;
+    label.textColor = style.color ?: NSColor.labelColor;
+    wrapLabel(label, style.lines);
+    label.stringValue = text;
+}
+- (NSView *)tableView:(NSTableView *)table viewForTableColumn:(NSTableColumn *)column row:(NSInteger)row {
+    (void)column;
+    MNListCell *cell = [table makeViewWithIdentifier:@"MNListCell" owner:self];
+    if (!cell) {
+        cell = [MNListCell new]; cell.identifier = @"MNListCell";
+        cell.top = listLabel(); cell.middle = listLabel(); cell.bottom = listLabel();
+        NSStackView *text = [NSStackView stackViewWithViews:@[cell.top, cell.middle, cell.bottom]];
+        text.orientation = NSUserInterfaceLayoutOrientationVertical; text.alignment = NSLayoutAttributeLeading;
+        text.spacing = 6; text.detachesHiddenViews = YES; text.translatesAutoresizingMaskIntoConstraints = NO;
+        [cell addSubview:text];
+        cell.button = [NSButton buttonWithTitle:@"" target:self action:@selector(rowButton:)];
+        cell.button.bordered = NO; cell.button.imagePosition = NSImageOnly; cell.button.translatesAutoresizingMaskIntoConstraints = NO;
+        [cell addSubview:cell.button];
+        cell.leadingEdge = [text.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor];
+        cell.topEdge = [text.topAnchor constraintEqualToAnchor:cell.topAnchor];
+        cell.bottomEdge = [text.bottomAnchor constraintEqualToAnchor:cell.bottomAnchor];
+        // With a button the text ends 15 points before it; without, at the inset.
+        cell.buttonEdge = [cell.button.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor];
+        cell.textEdge = [text.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor];
+        [NSLayoutConstraint activateConstraints:@[cell.leadingEdge, cell.topEdge, cell.bottomEdge,
+            [cell.button.leadingAnchor constraintEqualToAnchor:text.trailingAnchor constant:15],
+            [cell.button.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor],
+            [cell.button.widthAnchor constraintEqualToConstant:34], [cell.button.heightAnchor constraintEqualToConstant:34]]];
+        for (NSTextField *label in @[cell.top, cell.middle, cell.bottom])
+            [label.widthAnchor constraintEqualToAnchor:text.widthAnchor].active = YES;
+    }
+    NSEdgeInsets e = self.insets;
+    cell.leadingEdge.constant = e.left; cell.topEdge.constant = e.top; cell.bottomEdge.constant = -e.bottom;
+    cell.buttonEdge.constant = -e.right; cell.textEdge.constant = -e.right;
+    BOOL button = self.buttonImage != nil;
+    cell.button.hidden = !button;
+    cell.buttonEdge.active = button; cell.textEdge.active = !button;
+    MNListRow *r = self.shown[(NSUInteger)row];
+    styleListLabel(cell.top, self.styles[0], r.top);
+    styleListLabel(cell.middle, self.styles[1], r.middle);
+    styleListLabel(cell.bottom, self.styles[2], r.bottom);
+    if (button) {
+        cell.button.image = self.buttonImage;
+        cell.button.toolTip = self.buttonTip.length ? [NSString stringWithFormat:@"%@ %@", self.buttonTip, r.middle.length ? r.middle : r.top] : nil;
+        cell.button.accessibilityLabel = cell.button.toolTip;
+        cell.button.contentTintColor = self.buttonColor;
+        cell.button.enabled = table.isEnabled;
+    }
+    return cell;
+}
+/* Each click carries its own row, so queued clicks report the rows clicked. */
+- (void)rowClicked:(id)sender {
+    (void)sender;
+    NSInteger row = self.table.clickedRow;
+    if (row >= 0 && self.table.isEnabled) enqueueRow(identifier(self), row, NO);
+}
+- (void)rowButton:(NSButton *)sender {
+    NSInteger row = [self.table rowForView:sender];
+    if (row >= 0 && self.table.isEnabled) enqueueRow(identifier(self), row, YES);
+}
+// Adding rows only records text; nextEvent reloads each changed list once.
+- (void)scheduleReload {
+    if (!pendingLists) pendingLists = [NSMutableSet new];
+    [pendingLists addObject:self];
+}
+- (void)reload {
+    self.shown = [self.rows copy];
+    [self.table reloadData];
+}
+/* clear ends the rows, and with them any clicks on them still queued. */
+- (void)clearRows {
+    [self.rows removeAllObjects]; [self scheduleReload];
+    long long source = identifier(self);
+    dropEvents(^BOOL(MNEvent *e) { return e.source == source; });
+}
+- (void)insetRows:(NSEdgeInsets)insets { self.insets = insets; [self scheduleReload]; }
+- (void)enableRows:(BOOL)enabled {
+    if (self.table.isEnabled == enabled) return;
+    self.table.enabled = enabled; self.alphaValue = enabled ? 1 : MNDisabledAlpha; [self scheduleReload];
+}
+@end
+
+static void reloadLists(void) {
+    NSSet<MNList *> *lists = pendingLists; pendingLists = nil;
+    for (MNList *l in lists) [l reload];
+}
+static MNList *list(long long handle) { return object(handle, MNList.class); }
+long long minyar_macos_list(long long parent) { @autoreleasepool {
+    ready();
+    MNList *l = [MNList new];
+    l.drawsBackground = NO; l.borderType = NSNoBorder; l.hasVerticalScroller = YES; l.autohidesScrollers = YES;
+    l.rows = [NSMutableArray new]; l.shown = @[];
+    NSMutableArray *styles = [NSMutableArray new];
+    for (int i = 0; i < 3; ++i) { MNListStyle *style = [MNListStyle new]; style.lines = i == 1 ? 0 : 1; [styles addObject:style]; }
+    l.styles = styles;
+    l.insets = NSEdgeInsetsMake(15, 18, 15, 18);
+    NSTableView *t = [NSTableView new];
+    NSTableColumn *column = [[NSTableColumn alloc] initWithIdentifier:@"row"];
+    column.resizingMask = NSTableColumnAutoresizingMask;
+    [t addTableColumn:column];
+    t.headerView = nil; t.backgroundColor = NSColor.clearColor; t.style = NSTableViewStylePlain;
+    t.intercellSpacing = NSZeroSize; t.usesAutomaticRowHeights = YES; t.columnAutoresizingStyle = NSTableViewUniformColumnAutoresizingStyle;
+    t.selectionHighlightStyle = NSTableViewSelectionHighlightStyleNone; t.gridStyleMask = NSTableViewGridNone;
+    t.dataSource = l; t.delegate = l; t.target = l; t.action = @selector(rowClicked:);
+    l.documentView = t; l.table = t;
+    l.contentView.drawsBackground = NO;
+    return append(parent, l);
+} }
+void minyar_macos_addRow(long long handle, const MinyarText *top, const MinyarText *middle, const MinyarText *bottom) { @autoreleasepool {
+    MNList *l = list(handle);
+    if (l.rows.count >= 10000000) minyar_native_stop("macos lists hold at most 10000000 rows.");
+    MNListRow *r = [MNListRow new]; r.top = string(top); r.middle = string(middle); r.bottom = string(bottom);
+    [l.rows addObject:r];
+    [l scheduleReload];
+} }
+long long minyar_macos_rowCount(long long handle) { @autoreleasepool { return (long long)list(handle).rows.count; } }
+void minyar_macos_listLine(long long handle, long long line, const MinyarText *family, double size, double weight, long long textColor, long long lines) { @autoreleasepool {
+    MNList *l = list(handle);
+    if (line < 0 || line > 2) minyar_native_stop("macos list lines are 0 (top), 1 (middle) and 2 (bottom).");
+    checkFont(size, weight); checkLines(lines);
+    MNListStyle *style = l.styles[(NSUInteger)line];
+    style.font = resolveFont(string(family), size, weight); style.color = color(textColor); style.lines = lines;
+    [l scheduleReload];
+} }
+void minyar_macos_listColors(long long handle, long long hoverBackground, long long separator) { @autoreleasepool {
+    MNList *l = list(handle); l.hoverBackground = color(hoverBackground); l.separator = color(separator);
+    [l scheduleReload];
+} }
+void minyar_macos_rowButton(long long handle, const MinyarText *symbol, const MinyarText *tooltip, long long tint) { @autoreleasepool {
+    MNList *l = list(handle); NSString *name = string(symbol);
+    l.buttonImage = name.length ? symbolImage(name, 15) : nil;
+    l.buttonTip = string(tooltip); l.buttonColor = color(tint);
+    [l scheduleReload];
+} }
+static BOOL fromList(long long handle) { list(handle); return current && current.source == handle && current.row >= 0; }
+long long minyar_macos_clickedRow(long long handle) { @autoreleasepool { return fromList(handle) ? current.row : -1; } }
+bool minyar_macos_clickedButton(long long handle) { @autoreleasepool { return fromList(handle) && current.button; } }
 
 /* ----- Styling ----- */
 
@@ -1049,9 +1298,18 @@ void minyar_macos_hover(long long handle, long long foreground, long long fill) 
 } }
 void minyar_macos_font(long long handle, const MinyarText *family, double size, double weight) { @autoreleasepool {
     MNHandle *h = entry(handle);
+    checkFont(size, weight);
+    h.font = resolveFont(string(family), size, weight);
+    h.styledText = YES; restyle(h);
+} }
+static void checkFont(double size, double weight) {
     if (!isfinite(size) || size < 1 || size > 1000 || !isfinite(weight) || weight < 1 || weight > 1000)
         minyar_native_stop("macos fonts need a size from 1 to 1000 points and a weight from 1 to 1000.");
-    NSString *name = string(family);
+}
+static void checkLines(long long count) {
+    if (count < 0 || count > 100000) minyar_native_stop("macos label lines must be between 0 and 100000.");
+}
+static NSFont *resolveFont(NSString *name, double size, double weight) {
     NSFont *font = nil;
     if (name.length) {
         NSFontDescriptor *d = [NSFontDescriptor fontDescriptorWithFontAttributes:@{NSFontFamilyAttribute: name}];
@@ -1068,9 +1326,8 @@ void minyar_macos_font(long long handle, const MinyarText *family, double size, 
             font = [NSFont fontWithDescriptor:[d fontDescriptorByAddingAttributes:style] size:size] ?: font;
         }
     }
-    h.font = font ?: [NSFont systemFontOfSize:size weight:fontWeight(weight)];
-    h.styledText = YES; restyle(h);
-} }
+    return font ?: [NSFont systemFontOfSize:size weight:fontWeight(weight)];
+}
 void minyar_macos_letterSpacing(long long handle, double points) { @autoreleasepool {
     if (!isfinite(points) || fabs(points) > 100) minyar_native_stop("macos letter spacing must be between -100 and 100 points.");
     MNHandle *h = entry(handle); h.kerning = points; h.styledText = YES; restyle(h);
@@ -1082,7 +1339,7 @@ void minyar_macos_lineHeight(long long handle, double multiple) { @autoreleasepo
 void minyar_macos_lines(long long handle, long long count) { @autoreleasepool {
     MNHandle *h = entry(handle);
     if (![h.object isKindOfClass:NSTextField.class] || [h.object isEditable]) minyar_native_stop("macos.lines requires a label.");
-    if (count < 0 || count > 100000) minyar_native_stop("macos label lines must be between 0 and 100000.");
+    checkLines(count);
     h.lines = count; h.styledText = YES; restyle(h);
 } }
 void minyar_macos_selectable(long long handle, bool value) { @autoreleasepool {
@@ -1123,12 +1380,15 @@ long long minyar_macos_link(long long parent, const MinyarText *title, const Min
     MNButton *b = entry(h).object; b.url = u; b.toolTip = u.absoluteString;
     return h;
 } }
+static NSImage *symbolImage(NSString *name, double size) {
+    NSImage *image = [NSImage imageWithSystemSymbolName:name accessibilityDescription:nil];
+    if (!image) minyar_native_stop("macos could not find that SF Symbol.");
+    return [image imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:size weight:NSFontWeightRegular]];
+}
 void minyar_macos_symbol(long long handle, const MinyarText *name, double size) { @autoreleasepool {
     NSButton *b = object(handle, NSButton.class);
     if (!isfinite(size) || size < 1 || size > 1000) minyar_native_stop("macos symbol sizes must be between 1 and 1000 points.");
-    NSImage *image = [NSImage imageWithSystemSymbolName:string(name) accessibilityDescription:nil];
-    if (!image) minyar_native_stop("macos could not find that SF Symbol.");
-    b.image = [image imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:size weight:NSFontWeightRegular]];
+    b.image = symbolImage(string(name), size);
     b.imagePosition = b.title.length ? NSImageLeading : NSImageOnly;
     MNHandle *h = entry(handle); if (h.foreground) b.contentTintColor = textColorOf(h);
 } }

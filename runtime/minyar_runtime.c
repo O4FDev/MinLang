@@ -496,6 +496,38 @@ MinyarText *minyar_join_text(const MinyarText *left, const MinyarText *right) {
     return join_by_copying(left, right);
 }
 
+#ifndef MINYAR_COMPILER_ARENA
+/* Grow a Text that no one else can observe, doubling its byte capacity. */
+static void append_in_place(MinyarText *left, const MinyarText *right) {
+    long long left_length = left->byte_length;
+    long long right_length = right->byte_length;
+    long long length = left_length + right_length;
+    RcData *data = (RcData *)left->bytes - 1;
+    size_t required = (size_t)length + 1;
+    size_t capacity = data->size;
+    unsigned char *bytes = (unsigned char *)left->bytes;
+    if (required > capacity) {
+        size_t grown = capacity > SIZE_MAX / 2 ? SIZE_MAX : capacity * 2;
+        if (grown < required)
+            grown = required;
+        bytes = rc_reallocate_data(bytes, grown);
+    }
+    const unsigned char *right_bytes = right == left ? bytes : right->bytes;
+    copy_bytes(bytes + left_length, right_bytes, (size_t)right_length);
+    bytes[length] = 0;
+    rc_free_data(left->character_offsets);
+    left->bytes = bytes;
+    left->byte_length = length;
+    /* With no index, a known count denotes ASCII. Unicode operands need
+     * a fresh lazy index after joining, even if their old counts are known. */
+    if (left->character_length == left_length && right->character_length == right_length)
+        left->character_length = length;
+    else
+        left->character_length = -1;
+    left->character_offsets = NULL;
+}
+#endif
+
 /* Consume a compiler-proven owned left result. Ordinary borrowed operands use
  * minyar_join_text and remain immutable. A unique owning Text can reuse its
  * byte allocation, turning chains such as a + b + c into amortized linear
@@ -506,40 +538,34 @@ MinyarText *minyar_join_text_take_left(MinyarText *left, const MinyarText *right
 #ifdef MINYAR_COMPILER_ARENA
     return minyar_join_text(left, right);
 #else
-    RcObject *object = (RcObject *)left - 1;
-    long long left_length = left->byte_length;
-    long long right_length = right->byte_length;
-    long long length = left_length + right_length;
-    if (object->ownership == (8 | RC_TEXT) && !left->backing) {
-        RcData *data = (RcData *)left->bytes - 1;
-        size_t required = (size_t)length + 1;
-        size_t capacity = data->size;
-        unsigned char *bytes = (unsigned char *)left->bytes;
-        if (required > capacity) {
-            size_t grown = capacity > SIZE_MAX / 2 ? SIZE_MAX : capacity * 2;
-            if (grown < required)
-                grown = required;
-            bytes = rc_reallocate_data(bytes, grown);
-        }
-        const unsigned char *right_bytes = right == left ? bytes : right->bytes;
-        copy_bytes(bytes + left_length, right_bytes, (size_t)right_length);
-        bytes[length] = 0;
-        rc_free_data(left->character_offsets);
-        left->bytes = bytes;
-        left->byte_length = length;
-        /* With no index, a known count denotes ASCII. Unicode operands need
-         * a fresh lazy index after joining, even if their old counts are known. */
-        if (left->character_length == left_length && right->character_length == right_length)
-            left->character_length = length;
-        else
-            left->character_length = -1;
-        left->character_offsets = NULL;
+    if (((RcObject *)left - 1)->ownership == (8 | RC_TEXT) && !left->backing) {
+        append_in_place(left, right);
         return left;
     }
     MinyarText *result = join_by_copying(left, right);
     minyar_rc_release(left);
     return result;
 #endif
+}
+
+/* record.field = record.field + right, after the compiler borrowed the
+ * field's Text as `current`. When the field still holds `current` and the
+ * record and that borrow are its only owners, nobody can observe the Text
+ * change, so it grows in place and building Text in a field stays linear.
+ * Otherwise this is the ordinary join followed by a field replacement. */
+void minyar_record_append_text(MinyarRecord *record, long long field, MinyarText *current, const MinyarText *right) {
+    if ((unsigned long long)field >= (unsigned long long)record->length)
+        list_position_stop(field, record->length);
+    if (current->byte_length > LLONG_MAX - right->byte_length)
+        join_too_large();
+#ifndef MINYAR_COMPILER_ARENA
+    if ((MinyarText *)(intptr_t)record->values[field] == current &&
+        ((RcObject *)current - 1)->ownership == (16 | RC_TEXT) && !current->backing) {
+        append_in_place(current, right);
+        return;
+    }
+#endif
+    minyar_record_replace(record, field, (long long)(intptr_t)minyar_join_text(current, right), 1);
 }
 
 MinyarText *minyar_join_texts(const MinyarList *parts) {

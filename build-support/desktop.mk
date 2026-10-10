@@ -1,7 +1,7 @@
 # Native GUI integration needs a logged-in macOS desktop session.
 .PHONY: check-macos
 check-macos: build/minyarc build/minyar-default-runtime.o
-	python3 tests/macos.py
+	$${MINYAR_PYTHON:-/usr/bin/python3} tests/macos.py
 
 # HTTP requests through NSURLSession against a local server.
 .PHONY: check-http
