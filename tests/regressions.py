@@ -87,6 +87,17 @@ class CompilerTestCase(unittest.TestCase):
         return llvm
 
 class Regressions(CompilerTestCase):
+    def test_calls_before_a_binding_do_not_shift_ownership_slots(self):
+        # A per-body call count once shared a slot with the ownership map:
+        # one call in the first binding gave it slot -1, an out-of-bounds store.
+        source = ('record Box {\n    label: Text\n}\n'
+                  'function make(label: Text): Box { return Box { label: label } }\n'
+                  'let box = make("box")\nlet other = make("other")\nprint(box.label + " " + other.label)\n')
+        result, llvm = self.compile(source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('@minyar_rc_local_take(i64 -', llvm.read_text())
+        self.executes(source, 'box other\n')
+
     def test_utf8_byte_order_mark_is_accepted(self):
         self.executes('\ufeffprint(42)\n', '42\n')
 
