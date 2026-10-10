@@ -12,6 +12,7 @@ heavily loaded machine; the load average was 30-76 throughout.
 | --- | --- | --- | --- | --- | --- |
 | 1 | Atacama history: every search keystroke rebuilt a stack of views per row | `macos.list`, a virtualized NSTableView | 112.6G instructions, 11.4 s CPU | 11.0G, 1.8 s CPU | 10.2x |
 | 2 | Atacama streaming: each network chunk re-laid out the whole answer | background wake-ups capped at 60 Hz in `macos.nextEvent` | 60.5G instructions, 6.8 s CPU | 14.0G, 2.0 s CPU | 4.3x |
+| 3 | Every function, even a one-line accessor, called the runtime's call-depth guard, so LLVM never inlined hot leaves | leaf functions carry no call-depth frame | Minyarcraft world build 32.1G instructions; compiler self-compile 91M | 25.6G; 81M | -20%; -11% |
 
 ### 1. Long lists rebuilt as stacks of views
 
@@ -85,6 +86,42 @@ The final window screenshots are byte-identical (same MD5).
 
 **Test.** `verifyWakeThrottle` posts 200 wake-ups over 0.2 s and requires
 between 3 and 40 returns. A mutant with the interval set to 0 fails it.
+
+### 3. Call-depth frames blocked inlining of leaf functions
+
+**Problem.** Every generated function began with `minyar_stack_enter()` and
+ended with `minyar_stack_leave()`, the guard that turns runaway recursion into
+a clean error instead of a crash. Minyarcraft's hottest function,
+`terrain.get` (a bounds check and a Bytes load), paid a counter update and a
+stack-range check per call, and the opaque runtime calls kept LLVM from
+inlining it into the meshing loops.
+
+**Evidence.** `sample` of `craft --screenshot` (world generation, lighting,
+meshing and 30 frames): `meshing.showFace` 270 samples, `terrain.get` 267,
+`remesh` 123, `occludes` 72. The disassembly of `terrain.get` showed the
+guard's prologue and epilogue around eight instructions of real work.
+
+**Fix.** A function whose body calls no Minyar function, and has at most 256
+locals, gets no call-depth frame. It cannot deepen recursion, and its frame
+fits in the 128 KiB reserve that its caller's check keeps
+(`MINYAR_STACK_RESERVE_BYTES`). This is the same reasoning as Go's `NOSPLIT`
+leaf functions. Calls are recognised from the emitted pieces (" @.minyar.fn."
+or a quoted module name), so the check costs nothing measurable.
+
+| Workload | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Minyarcraft `--screenshot noon` (3 runs each) | 32.84G, 32.13G, 32.10G | 25.57G, 25.60G, 25.58G | -20.3% |
+| Compiler self-compile (front end) | 92M, 89M | 81M, 82M | -10% |
+| Minyarcraft front-end compile | 109M | 99M | -9% |
+| Minyar-OS kernel front-end compile | 497M | 462M | -7% |
+
+The self-hosting fixed point holds (stage 3 equals stage 2).
+
+**Test.** `tests/stack-overflow.py` now compiles a program with a Text-building
+leaf, a caller of a local function and a caller of an imported one. It
+requires that the leaf has no guard and both callers keep theirs, and that the
+leaf still runs at the deepest allowed frame before the clean overflow stop.
+The test fails on the previous compiler.
 
 ## Measured and not a bottleneck
 

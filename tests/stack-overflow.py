@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -96,6 +97,49 @@ def main() -> None:
         )
         assert program_result.stdout == f"{safe_depth}\n", program_result.stdout
         assert program_result.stderr == MESSAGE, program_result.stderr
+
+        # Functions that call no Minyar function carry no call-depth check of
+        # their own (so LLVM can inline them); they run in the reserve the
+        # caller's check left. A leaf doing runtime Text work at the deepest
+        # allowed frame must still finish, and the overflow still stops cleanly.
+        leaves = temporary / "leaves.min"
+        (temporary / "helpers.min").write_text(
+            "public function twice(value: Integer): Integer { return value * 2 }\n", encoding="utf-8")
+        leaves.write_text(
+            'use "./helpers.min" as helpers\n'
+            "function leaf(value: Integer): Integer {\n"
+            '    let text = "value " + Text(value) + " " + Text(value * 3)\n'
+            "    return text.length\n"
+            "}\n"
+            "function caller(value: Integer): Integer { return helpers.twice(value) }\n"
+            "function descend(depth: Integer): Integer {\n"
+            "    if depth == 0 { return leaf(7) }\n"
+            "    return leaf(depth) - leaf(depth) + descend(depth - 1)\n"
+            "}\n"
+            f"print(descend({safe_depth}) + caller(1))\n"
+            "print(descend(100000000))\n",
+            encoding="utf-8",
+        )
+        leaves_llvm = temporary / "leaves.ll"
+        compiled = run([str(COMPILER), str(leaves), str(leaves_llvm)])
+        assert compiled.returncode == 0, compiled.stderr
+        ir = leaves_llvm.read_text()
+
+        def body(name: str) -> str:
+            found = re.search(r"^define [^\n]*@\.minyar\.fn\.(?:minyar_module_\d+_)?" + name + r"\(.*?^\}", ir, re.M | re.S)
+            assert found, name
+            return found.group(0)
+
+        assert "@minyar_stack_enter" not in body("leaf") and "@minyar_stack_leave" not in body("leaf"), body("leaf")
+        assert body("descend").count("call void @minyar_stack_enter()") == 1, body("descend")
+        assert body("caller").count("call void @minyar_stack_enter()") == 1, body("caller")
+        prepare_llvm_for_link(leaves_llvm, LINK_FLAGS)
+        leaves_executable = temporary / "leaves"
+        linked = run(clang_command([CLANG, "-O0", *LINK_FLAGS, "-Wno-override-module", str(leaves_llvm), str(RUNTIME),
+                                    "-o", str(leaves_executable)]))
+        assert linked.returncode == 0, linked.stderr
+        leaves_result = run([str(leaves_executable)])
+        assert (leaves_result.returncode, leaves_result.stdout, leaves_result.stderr) == (1, "12\n", MESSAGE), leaves_result
 
     print("compiler and generated-program stack overflows stop cleanly")
 

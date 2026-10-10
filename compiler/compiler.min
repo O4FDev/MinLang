@@ -4683,6 +4683,40 @@ function finishParallelFunction(output: List<Text>, globals: List<Text>, entrySl
     }
 }
 
+// A function that calls no Minyar function cannot deepen recursion, and its
+// frame (at most 256 locals) fits in the reserve that its caller's call-depth
+// check left (MINYAR_STACK_RESERVE_BYTES), so it needs no call-depth frame of
+// its own. Without one, LLVM can inline small accessors into their callers.
+// User-function calls emit their target as its own piece: " @.minyar.fn."
+// before a plain name, or " @" before a quoted module-qualified name. Runtime
+// calls use " @" before an unquoted runtime name.
+function finishLeafFunction(output: List<Text>, entrySlot: Integer, bodySlot: Integer) {
+    let piece = bodySlot
+    while piece < output.length {
+        let text = output[piece]
+        if text == " @.minyar.fn." {
+            return
+        }
+        if text == " @" && piece + 1 < output.length && output[piece + 1].byteLength > 0 && output[piece + 1][0] == '"' {
+            return
+        }
+        piece = piece + 1
+    }
+    let enter = "  call void @minyar_stack_enter()\n"
+    let entry = output[entrySlot]
+    if entry.length < enter.length || entry.slice(0, enter.length) != enter {
+        return
+    }
+    output[entrySlot] = entry.slice(enter.length, entry.length)
+    piece = bodySlot
+    while piece < output.length {
+        if output[piece] == "  call void @minyar_stack_leave()\n" {
+            output[piece] = ""
+        }
+        piece = piece + 1
+    }
+}
+
 // Runtime functions that are safe on any processor: failures that stop the
 // machine, and pure mathematics.
 function parallelRuntimeAllowed(callee: Text): Boolean {
@@ -5175,6 +5209,8 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         }
         if stackOwnerLimit > 0 && name != "main" && state[5] == -1 && state[6] == 1 && state[8] >= 1 && state[8] <= stackOwnerLimit {
             finishStackOwnership(output, entrySlot, state[8])
+        } else if !parallel && !machineIntrinsic && name != "main" && state[2] < 4096 && state[4] <= 256 {
+            finishLeafFunction(output, entrySlot, bodySlot)
         }
         output.add("}\n\n")
         } else {
