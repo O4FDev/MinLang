@@ -57,9 +57,11 @@ while graphics.nextFrame() {
 
 `graphics` provides a window, keyboard and mouse input, textured 3D meshes
 with fog and lighting, lines, a 2D overlay with text, and screenshots; its
-module documents each function. Some library functions are implemented in C:
-their body is `native "graphics"`, and `./minyar` builds and links the needed
-C code automatically. Packages from other sources are not yet supported, and
+module documents each function. The [`macos`](macos.md) package provides native
+AppKit desktop applications and needs no third-party library. Some library
+functions are implemented in C or Objective-C: their body is, for example,
+`native "graphics"` or `native "macos"`, and `./minyar` builds and links the
+needed native code automatically. Packages from other sources are not yet supported, and
 `--incremental` builds do not resolve packages yet.
 
 ## Scalability and rebuilds

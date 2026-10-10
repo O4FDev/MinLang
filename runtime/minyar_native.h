@@ -25,6 +25,8 @@ typedef struct MinyarText {
 typedef MinyarText MinyarBytes;
 
 MinyarBytes *minyar_bytes_new(long long length);
+/* Copy a UTF-8 buffer into an owned Text, preserving embedded zero bytes. */
+MinyarText *minyar_native_copy_text(const unsigned char *bytes, long long length);
 /* Append `count` zeroed bytes and return a pointer to them. */
 unsigned char *minyar_bytes_extend(MinyarBytes *bytes, long long count);
 

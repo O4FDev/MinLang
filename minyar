@@ -2,8 +2,20 @@
 set -eu
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# The experimental native target has a separate type system and compiler
+# driver. Dispatch before building or linking the portable Minyar runtime.
+if [ "${1-}" = --backend ]; then
+    [ "$#" -ge 2 ] || { echo '--backend requires llvm, swift or native' >&2; exit 2; }
+    case "$2" in
+        swift) shift 2; exec "${MINYAR_PYTHON:-/usr/bin/python3}" "$project_dir/scripts/native-swift.py" "$@" ;;
+        native) shift 2; exec "${MINYAR_PYTHON:-/usr/bin/python3}" "$project_dir/scripts/native-frontend.py" "$@" ;;
+        llvm) shift 2 ;;
+        *) echo "unknown backend: $2" >&2; exit 2 ;;
+    esac
+fi
 usage() {
-    echo "usage: ./minyar [--release] [--incremental] [--memory-profile eager|fixed|lazy|system] [--cleanup-budget 1..1024] [--heap-bytes BYTES] FILE.min [-o PROGRAM]" >&2
+    echo "usage: ./minyar [--backend llvm|swift|native] [--release] [--incremental] [--app] [--bundle-id ID] [--memory-profile eager|fixed|lazy|system] [--cleanup-budget 1..1024] [--heap-bytes BYTES] FILE.min [-o PROGRAM]" >&2
+    echo "native SwiftUI options: ./minyar --backend swift --help" >&2
     exit 2
 }
 positive_decimal() {
@@ -15,6 +27,9 @@ positive_decimal() {
 
 release=0
 incremental=0
+app=0
+bundle_id=org.minyar.application
+bundle_id_requested=0
 memory_profile=system
 profile_requested=0
 cleanup_budget=32
@@ -23,6 +38,10 @@ heap_bytes=
 while :; do
     case "${1-}" in
         --release) release=1; shift ;;
+        --app) app=1; shift ;;
+        --bundle-id)
+            [ "$#" -ge 2 ] && [ "$bundle_id_requested" -eq 0 ] || usage
+            bundle_id=$2; bundle_id_requested=1; shift 2 ;;
         --incremental) incremental=1; shift ;;
         --memory-profile)
             [ "$#" -ge 2 ] && [ "$profile_requested" -eq 0 ] || usage
@@ -58,6 +77,13 @@ output_file=$(basename -- "${source_file%.min}")
 if [ "$#" -gt 0 ]; then
     [ "$#" -eq 2 ] && [ "$1" = -o ] || usage
     output_file=$2
+fi
+
+if [ "$app" -eq 1 ]; then
+    [ "$(uname -s)" = Darwin ] || { echo "macOS app bundles require macOS" >&2; exit 1; }
+    case "$output_file" in *.app) ;; *) output_file="$output_file.app" ;; esac
+elif [ "$bundle_id_requested" -eq 1 ]; then
+    usage
 fi
 
 if [ "$incremental" -eq 1 ]; then
@@ -106,10 +132,18 @@ fi
 
 # Standard library packages such as graphics are partly implemented in C. The
 # compiler lists the native libraries a program uses; build and link only those.
-native_objects=
+set --
 native_flags=
 for native_library in $(sed -n 's/^; minyar-native-library: //p' "$llvm_file" | sort -u); do
     case "$native_library" in
+        macos)
+            [ "$(uname -s)" = Darwin ] || { echo "the macos package requires macOS and the Apple command-line tools" >&2; exit 1; }
+            native_object="$llvm_dir/macos.o"
+            "${MINYAR_CLANG:-clang}" ${MINYAR_CLANG_FLAGS:--O2} -fobjc-arc -fmodules \
+                -c "$project_dir/runtime/native/macos.m" -o "$native_object"
+            set -- "$@" "$native_object"
+            native_flags="$native_flags -framework AppKit"
+            ;;
         graphics)
             if pkg-config --exists glfw3 2>/dev/null; then
                 glfw_cflags=$(pkg-config --cflags glfw3)
@@ -129,7 +163,7 @@ for native_library in $(sed -n 's/^; minyar-native-library: //p' "$llvm_file" | 
                 "${MINYAR_CLANG:-clang}" -O2 -c "$native_source" $glfw_cflags -o "$native_object.$$"
                 mv -f "$native_object.$$" "$native_object"
             fi
-            native_objects="$native_objects $native_object"
+            set -- "$@" "$native_object"
             case "$(uname -s)" in
                 Darwin) native_flags="$native_flags $glfw_libs -framework OpenGL -framework Cocoa -framework IOKit" ;;
                 *) native_flags="$native_flags $glfw_libs -lGL -lm" ;;
@@ -180,11 +214,16 @@ CONFIG
             ${MINYAR_RUNTIME_FLAGS:--O2 -Wno-override-module} -c "$runtime_source" -o "$runtime_file"
     fi
 fi
+binary_file=$output_file
+if [ "$app" -eq 1 ]; then binary_file="$llvm_dir/application"; fi
 if [ "$release" -eq 1 ]; then
     "${MINYAR_CLANG:-clang}" ${MINYAR_CLANG_FLAGS:--O2 -Wno-override-module} -flto \
-        "$llvm_file" "$runtime_file" $native_objects $native_flags -o "$output_file"
+        "$llvm_file" "$runtime_file" "$@" $native_flags -o "$binary_file"
 else
     "${MINYAR_CLANG:-clang}" ${MINYAR_CLANG_FLAGS:--O0 -Wno-override-module} \
-        "$llvm_file" "$runtime_file" $native_objects $native_flags -o "$output_file"
+        "$llvm_file" "$runtime_file" "$@" $native_flags -o "$binary_file"
+fi
+if [ "$app" -eq 1 ]; then
+    "${MINYAR_PYTHON:-python3}" "$project_dir/scripts/macos-app.py" --binary "$binary_file" --output "$output_file" --identifier "$bundle_id"
 fi
 echo "built $output_file"

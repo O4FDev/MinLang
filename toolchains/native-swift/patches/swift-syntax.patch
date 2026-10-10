@@ -1,0 +1,443 @@
+--- a/Sources/SwiftParser/Lexer/Lexeme.swift
++++ b/Sources/SwiftParser/Lexer/Lexeme.swift
+@@ -49,6 +49,8 @@
+ 
+     @_spi(Testing)
+     public var rawTokenKind: RawTokenKind
++
++    var minyarSyntax = false
+ 
+     @_spi(Testing)
+     public var flags: Lexeme.Flags
+--- a/Sources/SwiftParser/Lexer/LexemeSequence.swift
++++ b/Sources/SwiftParser/Lexer/LexemeSequence.swift
+@@ -24,6 +24,7 @@
+     fileprivate let sourceBufferStart: Lexer.Cursor
+     fileprivate var cursor: Lexer.Cursor
+     fileprivate var nextToken: Lexer.Lexeme
++    var minyarSyntax = false
+     /// If the lexer has more than one state on its state stack, it will
+     /// allocate a new memory region in this allocator to represent the
+     /// additional states on its stack. This is more efficient than paying the
+@@ -80,7 +81,7 @@
+         )
+       }
+       self.recordNextTokenInLookaheadTracker()
+-      return self.nextToken
++      return self.nextToken.classifiedForMinyar(minyarSyntax)
+     }
+ 
+     /// Get the offset of the leading trivia start of `token` relative to `sourceBufferStart`.
+@@ -120,7 +121,7 @@
+ 
+     func peek() -> Lexer.Lexeme {
+       self.recordNextTokenInLookaheadTracker()
+-      return self.nextToken
++      return self.nextToken.classifiedForMinyar(minyarSyntax)
+     }
+ 
+     /// Force the lexer to perform a state transition, re-lexing `currentToken`
+--- a/Sources/SwiftParser/Parser.swift
++++ b/Sources/SwiftParser/Parser.swift
+@@ -126,6 +126,8 @@
+ 
+   /// The experimental features that have been enabled.
+   let experimentalFeatures: ExperimentalFeatures
++  var minyarOrigins: [RawSyntax.ID: MinyarTokenOrigin] = [:]
++  let minyarSourceBuffer: UnsafeBufferPointer<UInt8>
+ 
+   /// A default maximum nesting level that is used if the client didn't
+   /// explicitly specify one. Debug builds of the parser consume a lot more stack
+@@ -235,12 +237,14 @@
+       input = self.arena.internSourceBuffer(input)
+     }
+ 
++    self.minyarSourceBuffer = input
+     self.maximumNestingLevel = maximumNestingLevel ?? Self.defaultMaximumNestingLevel
+     self.swiftVersion = swiftVersion ?? Self.defaultSwiftVersion
+     self.experimentalFeatures = experimentalFeatures
+     self.lookaheadTrackerOwner = LookaheadTrackerOwner()
+ 
+     self.lexemes = Lexer.tokenize(input, lookaheadTracker: lookaheadTrackerOwner.lookaheadTracker)
++    self.lexemes.minyarSyntax = experimentalFeatures.contains(.minyarSyntax)
+     self.currentToken = self.lexemes.advance()
+     if let parseTransition {
+       self.parseLookup = IncrementalParseLookup(transition: parseTransition)
+@@ -382,14 +386,7 @@
+   mutating func consumeAnyTokenWithoutAdjustingNestingLevel() -> RawTokenSyntax {
+     let tok = self.currentToken
+     self.currentToken = self.lexemes.advance()
+-    return RawTokenSyntax(
+-      kind: tok.rawTokenKind,
+-      wholeText: tok.wholeText,
+-      textRange: tok.textRange,
+-      presence: .present,
+-      tokenDiagnostic: tok.diagnostic,
+-      arena: arena
+-    )
++    return minyarToken(tok)
+   }
+ 
+   private mutating func adjustNestingLevel(for tokenKind: RawTokenKind) {
+@@ -811,6 +808,12 @@
+       arena: self.arena
+     )
+ 
++    if experimentalFeatures.contains(.minyarSyntax) {
++      let start = lexemes.offsetToStart(current)
++      minyarOrigins[tok.raw.id] = MinyarTokenOrigin(wholeStart: start,
++        textStart: start + current.leadingTriviaByteLength,
++        textEnd: start + endIndex, wholeEnd: start + endIndex)
++    }
+     self.adjustNestingLevel(for: tokenKind)
+ 
+     self.currentToken = self.lexemes.resetForSplit(
+--- a/Sources/SwiftParser/TokenSpec.swift
++++ b/Sources/SwiftParser/TokenSpec.swift
+@@ -34,7 +34,7 @@
+     self.rawTokenKind = lexeme.rawTokenKind
+     switch lexeme.rawTokenKind {
+     case .keyword, .identifier:
+-      keyword = Keyword(lexeme.tokenText)
++      keyword = lexeme.keyword
+     default:
+       keyword = nil
+     }
+@@ -137,7 +137,7 @@
+   static func ~= (kind: TokenSpec, lexeme: Lexer.Lexeme) -> Bool {
+     return kind.matches(
+       rawTokenKind: lexeme.rawTokenKind,
+-      keyword: Keyword(lexeme.tokenText),
++      keyword: lexeme.keyword,
+       atStartOfLine: lexeme.isAtStartOfLine
+     )
+   }
+--- a/Sources/SwiftParser/TokenPrecedence.swift
++++ b/Sources/SwiftParser/TokenPrecedence.swift
+@@ -112,7 +112,7 @@
+ 
+   init(_ lexeme: Lexer.Lexeme) {
+     if lexeme.rawTokenKind == .keyword {
+-      self.init(Keyword(lexeme.tokenText)!)
++      self.init(lexeme.keyword!)
+     } else {
+       self.init(nonKeyword: lexeme.rawTokenKind)
+     }
+--- a/Sources/SwiftParser/Statements.swift
++++ b/Sources/SwiftParser/Statements.swift
+@@ -941,7 +941,7 @@
+ 
+     case .keyword:
+       // Some lexer-classified keywords can start expressions.
+-      switch Keyword(next.tokenText) {
++      switch next.keyword {
+       case .Any, .Self, .self, .super, .`init`, .true, .false, .nil:
+         return true
+       case .repeat, .try:
+--- a/Sources/SwiftParser/Declarations.swift
++++ b/Sources/SwiftParser/Declarations.swift
+@@ -427,9 +427,10 @@
+     _ attrs: DeclAttributes,
+     _ handle: RecoveryConsumptionHandle
+   ) -> RawImportDeclSyntax {
++    let minyarImport = experimentalFeatures.contains(.minyarSyntax) && currentToken.tokenText == "use"
+     let (unexpectedBeforeImportKeyword, importKeyword) = self.eat(handle)
+     let kind = self.parseImportKind()
+-    let path = self.parseImportPath()
++    let path = minyarImport && at(.stringQuote) ? self.parseMinyarImportPath() : self.parseImportPath()
+     return RawImportDeclSyntax(
+       attributes: attrs.attributes,
+       modifiers: attrs.modifiers,
+@@ -1283,6 +1284,7 @@
+     _ attrs: DeclAttributes,
+     _ handle: RecoveryConsumptionHandle
+   ) -> RawFunctionDeclSyntax {
++    let minyarFunction = experimentalFeatures.contains(.minyarSyntax) && currentToken.tokenText == "function"
+     let (unexpectedBeforeFuncKeyword, funcKeyword) = self.eat(handle)
+     let unexpectedBeforeIdentifier: RawUnexpectedNodesSyntax?
+     let unexpectedAfterIdentifier: RawUnexpectedNodesSyntax?
+@@ -1316,7 +1318,7 @@
+       genericParams = nil
+     }
+ 
+-    let signature = self.parseFunctionSignature()
++    let signature = self.parseFunctionSignature(minyar: minyarFunction)
+ 
+     let generics: RawGenericWhereClauseSyntax?
+     if self.at(.keyword(.where)) {
+@@ -1342,9 +1344,9 @@
+     )
+   }
+ 
+-  mutating func parseFunctionSignature() -> RawFunctionSignatureSyntax {
++  mutating func parseFunctionSignature(minyar: Bool = false) -> RawFunctionSignatureSyntax {
+     let parameterClause = self.parseParameterClause(RawFunctionParameterClauseSyntax.self) { parser in
+-      parser.parseFunctionParameter()
++      parser.parseFunctionParameter(minyar: minyar)
+     }
+ 
+     var effectSpecifiers = self.parseFunctionEffectSpecifiers()
+@@ -1353,6 +1355,11 @@
+ 
+     /// Only allow recovery to the arrow with exprKeyword precedence so we only
+     /// skip over misplaced identifiers and don't e.g. recover to an arrow in a 'where' clause.
++    if minyar && at(.colon) {
++      // Reuse the complete Swift return-clause grammar, including effects and
++      // named opaque result types, with the Minyar separator spelling.
++      currentToken.rawTokenKind = .arrow
++    }
+     if self.canRecoverTo(TokenSpec(.arrow, recoveryPrecedence: .exprKeyword)) != nil {
+       returnClause = self.parseFunctionReturnClause(
+         effectSpecifiers: &effectSpecifiers,
+--- a/Sources/SwiftParser/Parameters.swift
++++ b/Sources/SwiftParser/Parameters.swift
+@@ -90,7 +90,7 @@
+     )
+   }
+ 
+-  mutating func parseFunctionParameter() -> RawFunctionParameterSyntax {
++  mutating func parseFunctionParameter(minyar: Bool = false) -> RawFunctionParameterSyntax {
+     let attrs = self.parseAttributeList()
+ 
+     let modifiers = parseParameterModifiers(isClosure: false)
+@@ -173,6 +173,13 @@
+       }
+     }
+ 
++    if minyar, let name = names.firstName, names.secondName == nil {
++      names = ParameterNames(
++        unexpectedBeforeFirstName: names.unexpectedBeforeFirstName,
++        firstName: minyarArgumentWildcard(before: name),
++        unexpectedBeforeSecondName: names.unexpectedBeforeSecondName,
++        secondName: name)
++    }
+     return RawFunctionParameterSyntax(
+       attributes: attrs,
+       modifiers: modifiers,
+--- a/Sources/SwiftParser/CMakeLists.txt
++++ b/Sources/SwiftParser/CMakeLists.txt
+@@ -21,6 +21,7 @@
+   Lookahead.swift
+   LoopProgressCondition.swift
+   Modifiers.swift
++  MinyarSyntax.swift
+   Names.swift
+   Nominals.swift
+   Parameters.swift
+--- /dev/null
++++ b/Sources/SwiftParser/MinyarSyntax.swift
+@@ -0,0 +1,214 @@
++// Native Minyar syntax and source coordinates for the compiler's syntax tree.
++// This adapter is used at compile time, including by Swift macro plugins.
++@_spi(RawSyntax) public import SwiftSyntax
++
++extension Parser.ExperimentalFeatures {
++  public static let minyarSyntax = Self(rawValue: 1 << 31)
++}
++
++struct MinyarTokenOrigin {
++  let wholeStart: Int
++  let textStart: Int
++  let textEnd: Int
++  let wholeEnd: Int
++}
++
++@_spi(Minyar)
++public struct MinyarSourceMap: Sendable {
++  struct Segment: Sendable {
++    let syntaxStart: Int
++    let syntaxEnd: Int
++    let sourceStart: Int
++    let sourceEnd: Int
++  }
++  let segments: [Segment]
++  let inverse: [Segment]
++
++  init(_ segments: [Segment]) {
++    self.segments = segments.sorted { $0.syntaxStart < $1.syntaxStart }
++    self.inverse = segments.sorted {
++      ($0.sourceStart, $0.syntaxStart) < ($1.sourceStart, $1.syntaxStart)
++    }
++  }
++
++  public func sourceOffset(forSyntaxOffset offset: Int) -> Int {
++    var lower = 0
++    var upper = segments.count
++    while lower < upper {
++      let middle = (lower + upper) / 2
++      if segments[middle].syntaxStart <= offset { lower = middle + 1 }
++      else { upper = middle }
++    }
++    guard lower > 0 else { return offset }
++    let entry = segments[lower - 1]
++    return entry.sourceStart + min(max(0, offset - entry.syntaxStart), entry.sourceEnd - entry.sourceStart)
++  }
++
++  public func syntaxOffset(forSourceOffset offset: Int) -> Int {
++    var lower = 0
++    var upper = inverse.count
++    while lower < upper {
++      let middle = (lower + upper) / 2
++      if inverse[middle].sourceStart <= offset { lower = middle + 1 }
++      else { upper = middle }
++    }
++    guard lower > 0 else { return offset }
++    let entry = inverse[lower - 1]
++    return entry.syntaxStart + min(max(0, offset - entry.sourceStart), entry.syntaxEnd - entry.syntaxStart)
++  }
++}
++
++extension Lexer.Lexeme {
++  var minyarKeyword: Keyword? {
++    guard minyarSyntax, rawTokenKind == .keyword || rawTokenKind == .identifier else { return nil }
++    switch tokenText {
++    case "function": return .func
++    case "record": return .struct
++    case "constant": return .let
++    case "let": return .var
++    case "use": return .import
++    default: return nil
++    }
++  }
++
++  var keyword: Keyword? { minyarKeyword ?? Keyword(tokenText) }
++
++  func classifiedForMinyar(_ enabled: Bool) -> Self {
++    guard enabled else { return self }
++    var result = self
++    result.minyarSyntax = true
++    if result.minyarKeyword != nil { result.rawTokenKind = .keyword }
++    return result
++  }
++}
++
++extension Parser {
++  mutating func recordMinyarOrigin(_ result: RawTokenSyntax, lexeme: Lexer.Lexeme) {
++    guard experimentalFeatures.contains(.minyarSyntax) else { return }
++    let start = lexemes.offsetToStart(lexeme)
++    minyarOrigins[result.raw.id] = MinyarTokenOrigin(
++      wholeStart: start,
++      textStart: start + lexeme.leadingTriviaByteLength,
++      textEnd: start + lexeme.leadingTriviaByteLength + lexeme.textByteLength,
++      wholeEnd: start + lexeme.byteLength
++    )
++  }
++
++  mutating func minyarToken(_ lexeme: Lexer.Lexeme) -> RawTokenSyntax {
++    let replacement: SyntaxText?
++    if lexeme.rawTokenKind == .keyword {
++      replacement = lexeme.minyarKeyword?.defaultText
++    } else if lexeme.minyarSyntax && lexeme.rawTokenKind == .arrow && lexeme.tokenText == ":" {
++      replacement = "->"
++    } else {
++      replacement = nil
++    }
++    let whole: SyntaxText
++    let textRange: Range<Int>
++    if let replacement {
++      let leading = String(syntaxText: SyntaxText(rebasing: lexeme.wholeText[..<lexeme.textRange.lowerBound]))
++      let trailing = String(syntaxText: SyntaxText(rebasing: lexeme.wholeText[lexeme.textRange.upperBound...]))
++      whole = arena.intern(leading + String(syntaxText: replacement) + trailing)
++      textRange = lexeme.textRange.lowerBound..<(lexeme.textRange.lowerBound + replacement.count)
++    } else {
++      whole = lexeme.wholeText
++      textRange = lexeme.textRange
++    }
++    let result = RawTokenSyntax(kind: lexeme.rawTokenKind, wholeText: whole,
++      textRange: textRange, presence: .present, tokenDiagnostic: lexeme.diagnostic, arena: arena)
++    recordMinyarOrigin(result, lexeme: lexeme)
++    return result
++  }
++
++  mutating func minyarArgumentWildcard(before name: RawTokenSyntax) -> RawTokenSyntax {
++    let token = RawTokenSyntax(kind: .wildcard, text: "_", trailingTriviaPieces: [.spaces(1)],
++                              presence: .present, arena: arena)
++    if let origin = minyarOrigins[name.raw.id] {
++      minyarOrigins[token.raw.id] = MinyarTokenOrigin(wholeStart: origin.wholeStart,
++        textStart: origin.wholeStart, textEnd: origin.wholeStart, wholeEnd: origin.wholeStart)
++    }
++    return token
++  }
++
++  private func minyarOrigin(for token: TokenSyntax) -> MinyarTokenOrigin? {
++    if let origin = minyarOrigins[token.raw.id] { return origin }
++    // Multiline literal parsing moves indentation into trivia and rebuilds
++    // tokens. Their text still references the original arena-owned buffer.
++    guard token.presence == .present,
++          let view = token.raw.tokenView,
++          let address = view.rawText.baseAddress,
++          let base = minyarSourceBuffer.baseAddress,
++          address >= base, address <= base + minyarSourceBuffer.count,
++          view.rawText.count <= (base + minyarSourceBuffer.count) - address else { return nil }
++    let start = address - base
++    let end = start + view.rawText.count
++    let wholeStart = start - view.leadingTriviaByteLength
++    let wholeEnd = end + view.trailingTriviaByteLength
++    guard wholeStart >= 0, wholeEnd <= minyarSourceBuffer.count else { return nil }
++    return MinyarTokenOrigin(wholeStart: wholeStart, textStart: start,
++                             textEnd: end, wholeEnd: wholeEnd)
++  }
++
++  @_spi(Minyar)
++  public func minyarSourceMap(for syntax: some SyntaxProtocol) -> MinyarSourceMap {
++    var entries: [MinyarSourceMap.Segment] = []
++    for token in syntax.tokens(viewMode: .all) {
++      guard let origin = minyarOrigin(for: token) else { continue }
++      entries.append(.init(syntaxStart: token.position.utf8Offset,
++        syntaxEnd: token.positionAfterSkippingLeadingTrivia.utf8Offset,
++        sourceStart: origin.wholeStart, sourceEnd: origin.textStart))
++      entries.append(.init(syntaxStart: token.positionAfterSkippingLeadingTrivia.utf8Offset,
++        syntaxEnd: token.endPositionBeforeTrailingTrivia.utf8Offset,
++        sourceStart: origin.textStart, sourceEnd: origin.textEnd))
++      entries.append(.init(syntaxStart: token.endPositionBeforeTrailingTrivia.utf8Offset,
++        syntaxEnd: token.endPosition.utf8Offset,
++        sourceStart: origin.textEnd, sourceEnd: origin.wholeEnd))
++    }
++    return MinyarSourceMap(entries)
++  }
++
++  mutating func parseMinyarImportPath() -> RawImportPathComponentListSyntax {
++    let literal = parseStringLiteral()
++    func invalidPath() -> RawImportPathComponentListSyntax {
++      let component = RawImportPathComponentSyntax(
++        RawUnexpectedNodesSyntax([literal], arena: arena),
++        name: RawTokenSyntax(missing: .identifier, arena: arena),
++        trailingPeriod: nil, arena: arena)
++      return RawImportPathComponentListSyntax(elements: [component], arena: arena)
++    }
++    guard !literal.hasError, literal.segments.elements.count == 1,
++          let segment = literal.segments.elements.first?.as(RawStringSegmentSyntax.self) else {
++      return invalidPath()
++    }
++    let text = String(syntaxText: segment.content.tokenText)
++    let parts = text.split(separator: ".", omittingEmptySubsequences: false)
++    guard parts.allSatisfy({ part in
++      guard let first = part.unicodeScalars.first,
++            first.isValidIdentifierStartCodePoint else { return false }
++      return part.unicodeScalars.dropFirst().allSatisfy { $0.isValidIdentifierContinuationCodePoint }
++    }) else { return invalidPath() }
++    var elements: [RawImportPathComponentSyntax] = []
++    let sourceOrigin = minyarOrigins[segment.content.raw.id]
++    var offset = 0
++    for (index, part) in parts.enumerated() {
++      let last = index == parts.count - 1
++      let name = RawTokenSyntax(kind: .identifier, text: arena.intern(String(part)),
++        leadingTriviaPieces: index == 0 ? literal.openingQuote.leadingTriviaPieces : [],
++        trailingTriviaPieces: last ? literal.closingQuote.trailingTriviaPieces : [],
++        presence: .present, arena: arena)
++      let period: RawTokenSyntax? = last ? nil : RawTokenSyntax(kind: .period, text: ".", presence: .present, arena: arena)
++      if let origin = sourceOrigin {
++        let start = origin.textStart + offset
++        minyarOrigins[name.raw.id] = MinyarTokenOrigin(wholeStart: start,
++          textStart: start, textEnd: start + part.utf8.count, wholeEnd: start + part.utf8.count)
++        if let period {
++          let at = start + part.utf8.count
++          minyarOrigins[period.raw.id] = MinyarTokenOrigin(wholeStart: at, textStart: at, textEnd: at + 1, wholeEnd: at + 1)
++        }
++      }
++      elements.append(RawImportPathComponentSyntax(name: name, trailingPeriod: period, arena: arena))
++      offset += part.utf8.count + 1
++    }
++    return RawImportPathComponentListSyntax(elements: elements, arena: arena)
++  }
++}

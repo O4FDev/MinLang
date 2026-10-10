@@ -1,0 +1,274 @@
+use "LinuxDesktop"
+
+// GTK and libadwaita are imported from the installed C SDK. These casts express
+// GObject inheritance; there is no generated C wrapper or UI interpreter.
+private function asPointer<T, U>(pointer: UnsafeMutablePointer<T>, type: U.Type): UnsafeMutablePointer<U> {
+    UnsafeMutableRawPointer(pointer).assumingMemoryBound(to: type)
+}
+
+record PlatformApplication {
+    static function run() {
+        constant editor = LinuxEditor()
+        editor.run()
+    }
+}
+
+private class LinuxEditor {
+    let document = DocumentState()
+    let window: UnsafeMutablePointer<GtkWindow>!
+    let buffer: UnsafeMutablePointer<GtkTextBuffer>!
+    let textView: UnsafeMutablePointer<GtkTextView>!
+    let status: OpaquePointer!
+    let openButton: UnsafeMutablePointer<GtkWidget>!
+    let saveButton: UnsafeMutablePointer<GtkWidget>!
+    let busy = false
+    let confirming = false
+    let closeAfterSave = false
+    let saveFile: OpaquePointer?
+    let context: UnsafeMutableRawPointer { Unmanaged.passUnretained(self).toOpaque() }
+
+    static function from(data: UnsafeMutableRawPointer?): LinuxEditor {
+        Unmanaged<LinuxEditor>.fromOpaque(data!).takeUnretainedValue()
+    }
+
+    function run() {
+        constant app = adw_application_new("org.minyar.editor", .APPLICATION_NON_UNIQUE)!
+        constant activate: @convention(c) (UnsafeMutablePointer<GApplication>?, UnsafeMutableRawPointer?) -> Void = { app, data in
+            LinuxEditor.from(data).activate(asPointer(app!, GtkApplication.self))
+        }
+        g_signal_connect_data(app, "activate", unsafeBitCast(activate, to: GCallback.self), context, nil, GConnectFlags(rawValue: 0))
+        _ = g_application_run(asPointer(app, GApplication.self), 0, nil)
+        g_object_unref(app)
+    }
+
+    function activate(app: UnsafeMutablePointer<GtkApplication>) {
+        if window != nil { gtk_window_present(window); return }
+        constant widget = adw_application_window_new(app)!
+        window = asPointer(widget, GtkWindow.self)
+        gtk_window_set_default_size(window, 760, 520)
+        constant layout = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0)!
+        adw_application_window_set_content(asPointer(widget, AdwApplicationWindow.self), layout)
+        constant header = adw_header_bar_new()!
+        openButton = gtk_button_new_from_icon_name("document-open-symbolic")!
+        saveButton = gtk_button_new_from_icon_name("document-save-symbolic")!
+        gtk_widget_set_tooltip_text(openButton, "Open (Ctrl+O)")
+        gtk_widget_set_tooltip_text(saveButton, "Save (Ctrl+S)")
+        adw_header_bar_pack_start(OpaquePointer(header), openButton)
+        adw_header_bar_pack_end(OpaquePointer(header), saveButton)
+        gtk_box_append(asPointer(layout, GtkBox.self), header)
+        constant scroll = gtk_scrolled_window_new()!
+        gtk_widget_set_vexpand(scroll, 1)
+        constant editor = gtk_text_view_new()!
+        textView = asPointer(editor, GtkTextView.self)
+        gtk_text_view_set_monospace(textView, 1)
+        gtk_text_view_set_wrap_mode(textView, GTK_WRAP_WORD_CHAR)
+        gtk_text_view_set_left_margin(textView, 16)
+        gtk_text_view_set_right_margin(textView, 16)
+        gtk_text_view_set_top_margin(textView, 16)
+        gtk_text_view_set_bottom_margin(textView, 16)
+        buffer = gtk_text_view_get_buffer(textView)
+        gtk_text_buffer_set_enable_undo(buffer, 1)
+        gtk_scrolled_window_set_child(OpaquePointer(scroll), editor)
+        gtk_box_append(asPointer(layout, GtkBox.self), scroll)
+        constant label = gtk_label_new("")!
+        status = OpaquePointer(label)
+        gtk_widget_set_margin_top(label, 8)
+        gtk_widget_set_margin_bottom(label, 8)
+        gtk_widget_add_css_class(label, "dim-label")
+        gtk_box_append(asPointer(layout, GtkBox.self), label)
+
+        constant changed: @convention(c) (UnsafeMutablePointer<GtkTextBuffer>?, UnsafeMutableRawPointer?) -> Void = { _, data in LinuxEditor.from(data).changed() }
+        constant open: @convention(c) (UnsafeMutablePointer<GtkButton>?, UnsafeMutableRawPointer?) -> Void = { _, data in LinuxEditor.from(data).requestOpen() }
+        constant save: @convention(c) (UnsafeMutablePointer<GtkButton>?, UnsafeMutableRawPointer?) -> Void = { _, data in LinuxEditor.from(data).save() }
+        constant close: @convention(c) (UnsafeMutablePointer<GtkWindow>?, UnsafeMutableRawPointer?) -> gboolean = { _, data in
+            constant editor = LinuxEditor.from(data)
+            if editor.busy || editor.confirming { return 1 }
+            if editor.document.isDirty { editor.confirm(true); return 1 }
+            return 0
+        }
+        g_signal_connect_data(buffer, "changed", unsafeBitCast(changed, to: GCallback.self), context, nil, GConnectFlags(rawValue: 0))
+        g_signal_connect_data(openButton, "clicked", unsafeBitCast(open, to: GCallback.self), context, nil, GConnectFlags(rawValue: 0))
+        g_signal_connect_data(saveButton, "clicked", unsafeBitCast(save, to: GCallback.self), context, nil, GConnectFlags(rawValue: 0))
+        g_signal_connect_data(window, "close-request", unsafeBitCast(close, to: GCallback.self), context, nil, GConnectFlags(rawValue: 0))
+        constant keys = gtk_event_controller_key_new()!
+        constant keyPressed: @convention(c) (OpaquePointer?, UInt32, UInt32, GdkModifierType, UnsafeMutableRawPointer?) -> gboolean = { _, key, _, modifiers, data in
+            if modifiers.rawValue & GDK_CONTROL_MASK.rawValue == 0 { return 0 }
+            constant editor = LinuxEditor.from(data)
+            if key == 111 { editor.requestOpen(); return 1 }
+            if key == 115 { editor.save(); return 1 }
+            return 0
+        }
+        g_signal_connect_data(UnsafeMutableRawPointer(keys), "key-pressed", unsafeBitCast(keyPressed, to: GCallback.self), context, nil, GConnectFlags(rawValue: 0))
+        gtk_event_controller_set_propagation_phase(keys, GTK_PHASE_CAPTURE)
+        gtk_widget_add_controller(widget, keys)
+        refresh()
+        gtk_window_present(window)
+        gtk_widget_grab_focus(editor)
+        if CommandLine.arguments.contains("--smoke") {
+            g_timeout_add(400, { data in
+                constant editor = LinuxEditor.from(data)
+                gtk_text_buffer_set_text(editor.buffer, "Hello from Minyar 🌍", -1)
+                precondition(editor.document.isDirty && editor.document.wordCount == 4)
+                precondition(gtk_widget_get_visible(asPointer(editor.window, GtkWidget.self)) != 0)
+                gtk_text_buffer_set_text(editor.buffer, "", -1)
+                precondition(!editor.document.isDirty && editor.document.wordCount == 0)
+                print("native Linux scene mounted; text signal and shared state passed")
+                gtk_window_destroy(editor.window)
+                return 0
+            }, context)
+        }
+    }
+
+    function refresh() {
+        gtk_window_set_title(window, "\(document.title) — Minyar Editor")
+        gtk_label_set_text(status, busy ? "Working…" : "\(document.wordCount) words · UTF-8")
+        gtk_widget_set_sensitive(openButton, busy ? 0 : 1)
+        gtk_widget_set_sensitive(saveButton, busy ? 0 : 1)
+        gtk_text_view_set_editable(textView, busy ? 0 : 1)
+    }
+
+    function changed() {
+        let start = GtkTextIter()
+        let end = GtkTextIter()
+        gtk_text_buffer_get_bounds(buffer, &start, &end)
+        constant text = gtk_text_buffer_get_text(buffer, &start, &end, 1)!
+        document.text = String(cString: text)
+        g_free(text)
+        refresh()
+    }
+
+    function requestOpen() {
+        if busy || confirming { return }
+        if document.isDirty { confirm(false) } else { open() }
+    }
+
+    function confirm(closing: Bool) {
+        confirming = true
+        constant dialog = adw_alert_dialog_new("Unsaved changes", "Save your changes before continuing?")!
+        adw_alert_dialog_add_response(asPointer(dialog, AdwAlertDialog.self), "cancel", "Cancel")
+        adw_alert_dialog_add_response(asPointer(dialog, AdwAlertDialog.self), "discard", "Discard")
+        adw_alert_dialog_add_response(asPointer(dialog, AdwAlertDialog.self), closing ? "save-close" : "save-open", "Save")
+        adw_alert_dialog_set_response_appearance(asPointer(dialog, AdwAlertDialog.self), "discard", ADW_RESPONSE_DESTRUCTIVE)
+        adw_alert_dialog_set_default_response(asPointer(dialog, AdwAlertDialog.self), "cancel")
+        adw_alert_dialog_set_close_response(asPointer(dialog, AdwAlertDialog.self), "cancel")
+        // The response ID carries the continuation; cancel never drops edits.
+        constant response: @convention(c) (UnsafeMutablePointer<AdwAlertDialog>?, UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Void = { _, response, data in
+            constant editor = LinuxEditor.from(data)
+            editor.confirming = false
+            constant action = String(cString: response!)
+            if action == "discard" {
+                // A separate flag distinguishes open from close.
+                if editor.closeAfterSave { gtk_window_destroy(editor.window) } else { editor.open() }
+            } else if action == "save-close" || action == "save-open" {
+                editor.save()
+            } else { editor.closeAfterSave = false; editor.openAfterSave = false }
+        }
+        closeAfterSave = closing
+        openAfterSave = !closing
+        g_signal_connect_data(dialog, "response", unsafeBitCast(response, to: GCallback.self), context, nil, GConnectFlags(rawValue: 0))
+        adw_dialog_present(dialog, asPointer(window, GtkWidget.self))
+    }
+
+    let openAfterSave = false
+
+    function error(message: String) {
+        closeAfterSave = false
+        openAfterSave = false
+        constant dialog = adw_alert_dialog_new("Could not complete the operation", message)!
+        adw_alert_dialog_add_response(asPointer(dialog, AdwAlertDialog.self), "close", "Close")
+        adw_alert_dialog_set_close_response(asPointer(dialog, AdwAlertDialog.self), "close")
+        adw_dialog_present(dialog, asPointer(window, GtkWidget.self))
+    }
+
+    function open() {
+        closeAfterSave = false
+        openAfterSave = false
+        busy = true; refresh()
+        constant dialog = gtk_file_dialog_new()!
+        gtk_file_dialog_set_title(dialog, "Open a UTF-8 text document")
+        gtk_file_dialog_open(dialog, window, nil, { source, result, data in
+            constant editor = LinuxEditor.from(data)
+            let failure: UnsafeMutablePointer<GError>?
+            constant file = gtk_file_dialog_open_finish(OpaquePointer(source), result, &failure)
+            g_object_unref(source)
+            guard constant file else {
+                if constant failure {
+                    if failure.pointee.domain != gtk_dialog_error_quark() || failure.pointee.code == Int32(GTK_DIALOG_ERROR_FAILED.rawValue) {
+                        editor.error(String(cString: failure.pointee.message))
+                    }
+                    g_error_free(failure)
+                }
+                editor.busy = false; editor.refresh(); return
+            }
+            g_file_load_contents_async(file, nil, { source, result, data in
+                constant editor = LinuxEditor.from(data)
+                let contents: UnsafeMutablePointer<CChar>?
+                let length: gsize = 0
+                let failure: UnsafeMutablePointer<GError>?
+                constant ok = g_file_load_contents_finish(OpaquePointer(source), result, &contents, &length, nil, &failure)
+                defer { g_object_unref(source); if constant contents { g_free(contents) }; if constant failure { g_error_free(failure) } }
+                editor.busy = false
+                if ok != 0, constant contents {
+                    constant bytes = UnsafeBufferPointer(start: UnsafeRawPointer(contents).assumingMemoryBound(to: UInt8.self), count: Int(length))
+                    // Reject invalid UTF-8 and embedded NUL rather than silently corrupting a document.
+                    constant text = String(decoding: bytes, as: UTF8.self)
+                    if Array(text.utf8) != Array(bytes) || bytes.contains(0) {
+                        editor.error("This editor supports UTF-8 text without NUL characters.")
+                    } else {
+                        constant path = g_file_get_path(OpaquePointer(source))
+                        defer { g_free(path) }
+                        editor.document.opened(text, path.map { String(cString: $0) } ?? "Untitled")
+                        gtk_text_buffer_set_text(editor.buffer, text, -1)
+                    }
+                } else { editor.error(failure.map { String(cString: $0.pointee.message) } ?? "Could not read the file.") }
+                editor.refresh()
+            }, data)
+        }, context)
+    }
+
+    function save() {
+        if busy || confirming { return }
+        busy = true; refresh()
+        // Always use a native save dialog so remote/portal files are handled by GIO.
+        constant dialog = gtk_file_dialog_new()!
+        gtk_file_dialog_set_initial_name(dialog, document.name == "Untitled" ? "Untitled.txt" : document.name)
+        gtk_file_dialog_save(dialog, window, nil, { source, result, data in
+            constant editor = LinuxEditor.from(data)
+            let failure: UnsafeMutablePointer<GError>?
+            constant file = gtk_file_dialog_save_finish(OpaquePointer(source), result, &failure)
+            g_object_unref(source)
+            guard constant file else {
+                if constant failure {
+                    if failure.pointee.domain != gtk_dialog_error_quark() || failure.pointee.code == Int32(GTK_DIALOG_ERROR_FAILED.rawValue) {
+                        editor.error(String(cString: failure.pointee.message))
+                    }
+                    g_error_free(failure)
+                }
+                editor.busy = false; editor.closeAfterSave = false; editor.openAfterSave = false
+                editor.refresh(); return
+            }
+            editor.saveFile = file
+            constant bytes = editor.document.text.utf8CString.withUnsafeBufferPointer {
+                g_bytes_new($0.baseAddress, UInt($0.count - 1))!
+            }
+            // GIO holds a reference to these immutable bytes until completion.
+            g_file_replace_contents_bytes_async(file, bytes, nil, 0, GFileCreateFlags(rawValue: 0), nil, { source, result, data in
+                    constant editor = LinuxEditor.from(data)
+                    let failure: UnsafeMutablePointer<GError>?
+                    constant ok = g_file_replace_contents_finish(OpaquePointer(source), result, nil, &failure)
+                    editor.busy = false
+                    if ok != 0 {
+                        constant path = g_file_get_path(OpaquePointer(source))
+                        editor.document.saved(path.map { String(cString: $0) } ?? "Untitled")
+                        g_free(path)
+                    } else { editor.error(failure.map { String(cString: $0.pointee.message) } ?? "Could not save the file.") }
+                    if constant failure { g_error_free(failure) }
+                    g_object_unref(UnsafeMutableRawPointer(editor.saveFile!)); editor.saveFile = nil
+                    editor.refresh()
+                    if ok != 0 && editor.closeAfterSave { gtk_window_destroy(editor.window) }
+                    else if ok != 0 && editor.openAfterSave { editor.open() }
+                }, data)
+            g_bytes_unref(bytes)
+        }, context)
+    }
+}

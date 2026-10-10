@@ -52,6 +52,62 @@ the scroll wheel to choose, T to speed up time, and Escape to pause. It uses
 the standard `graphics` package, which needs GLFW (`brew install glfw` on
 macOS). Programs never write or link C themselves.
 
+## Native macOS apps
+
+Build the AppKit notes example, with native text editing, menus and file dialogs:
+
+```sh
+./minyar --app --bundle-id org.example.notes examples/macos/main.min -o "build/Minyar Notes.app"
+open "build/Minyar Notes.app"
+```
+
+The `macos` package provides windows, layout, controls and an event loop directly
+in Minyar. See the [macOS guide](docs/macos.md) for APIs, ownership, packaging,
+and the Swift-to-AppKit ABI investigation.
+
+An experimental native SwiftUI compiler frontend is also available. First build
+the pinned compiler using the [native frontend guide](docs/native-frontend.md), then:
+
+```sh
+./minyar --backend native --release --app examples/swiftui/main.min -o "build/Minyar Native SwiftUI.app"
+open "build/Minyar Native SwiftUI.app"
+```
+
+It parses original `.min` files inside a compiler fork and reuses Swift's semantic
+analysis, optimizer, and ABI without generating intermediary Swift source or
+adding a Minyar UI runtime. Native acceptance tests cover
+SwiftUI scenes, macros, module imports, and a differential LLVM comparison.
+It is **not full Minyar/Swift parity**. The older `--backend swift` source prototype
+remains available with the installed Xcode compiler. See the
+[SwiftUI compiler guide](docs/swiftui.md) for tested features, code-generation
+comparison, language differences and the remaining frontend work.
+
+For an app split into plain `.min` files, use `app.min` at the project root and
+pass the directory. Components are available automatically across the app;
+optional `.mac.min` files replace shared implementations for macOS:
+
+```sh
+./minyar --backend native --release examples/native-counter -o "build/Project Counter.app"
+open "build/Project Counter.app"
+```
+
+## Native Linux desktop apps
+
+The native frontend also has an experimental GTK 4/libadwaita target. Build the
+compiler inside Fedora using the [Linux desktop guide](docs/linux-desktop.md), then:
+
+```sh
+./minyar --backend native --release --pkg-config libadwaita-1 \
+  examples/native-editor -o build/minyar-editor
+./build/minyar-editor
+```
+
+The editor shares `app.min` and its document model with macOS, selecting
+`PlatformApplication.linux.min` or `PlatformApplication.mac.min` for the native
+UI. Linux SDK calls use the system C ABI. Shared declarative UI syntax, ergonomic
+ownership-aware bindings, Flatpak packaging and Mac-to-Linux cross-compilation
+remain unfinished.
+
 ## Documentation
 
 - [Language guide](docs/language.md)
