@@ -16,6 +16,8 @@ heavily loaded machine; the load average was 30-76 throughout.
 | 4 | `record.field[i] = v` retained, registered and released the field on every store | no borrow when the rest of the statement makes no call | Minyarcraft 25.6G | 17.3G | -32% |
 | 5 | `record.text = record.text + piece` copied the whole Text each time (quadratic) | in-place append when the record holds the only other reference | 80,000 appends 4.11G | 79.8M | 51x (and linear) |
 | 6 | Compiling multi-module programs spent 27% of its time comparing symbol names character by character | symbol tables ordered by length, then from the last character | OS kernel compile 485M; Minyarcraft 109M; Atacama 80.5M | 342M; 71.4M; 58.1M | -28% to -35% |
+| 7 | `json.parse` built every string from a parts list, a slice and a join | one slice when a string has no escapes | 20 parses of a 143 KB history response 1.22G | 0.95G | -22% |
+| 8 | Every macOS app build recompiled the Objective-C bridges (`macos.m` 0.46 s, `http.m` 0.12 s) | content-keyed object cache, already used for `graphics.c`, now for every native bridge | Atacama default build 0.93-1.11 s; release app 1.86-2.41 s | 0.48 s; 1.39-1.46 s | about 2x |
 
 ### 1. Long lists rebuilt as stacks of views
 
@@ -225,9 +227,63 @@ is byte-identical for all five programs.
 
 **Tests.** Byte-identical output is the main check. `check-modules` (including
 the duplicate-declaration diagnostics), `check-diagnostics` and
-`check-regressions` pass.
+`check-regressions` pass. `tests/symbol-order.py` (`check-symbol-order`)
+pinned `compareSymbol` to alphabetical order. Its oracle now uses the new
+order (UTF-8 length, character count, characters from the end, kind). It
+still checks reflexivity, antisymmetry, transitivity, equal names comparing
+equal, and the lookup permutation, and it fails on the previous compiler.
+`compareText` is still checked against alphabetical order.
 
-### 7. Two competing `http` packages
+### 7. JSON strings were assembled from parts
+
+**Problem.** The `json` package (used by Atacama for history and streaming,
+and by Minyar-OS) parsed about 420 instructions per byte. While measuring the
+Astra port on a real payload (Atacama's 500-run history response, 143 KB) I
+profiled it with `xctrace`: allocation, free and deferred-cleanup work
+dominated, much of it from `parseString`, which allocated a parts list, a
+slice and a joined copy for every string, even strings with no escapes.
+
+**Fix.** Scan for the closing quote first; if no backslash comes before it,
+return one slice of the source. Strings with escapes take the existing path.
+
+| 20 parses of the history response | Before | After |
+| --- | ---: | ---: |
+| Retired instructions (3 runs) | 1.216G, 1.223G, 1.213G | 0.954G, 0.955G, 0.940G |
+
+Most of what remains is the incremental release of the previous round's
+trees, which the benchmark throws away each time.
+
+**Test.** `tests/packages/json.min` now covers a plain string, an empty
+string, a tab escape, an escaped backslash at the end, and two unterminated
+strings. A separate program covering quote, `\u00e9` and surrogate-pair
+escapes printed the same output as the v2 base. Atacama's `make test` passes.
+
+### 8. Native bridges were recompiled on every build
+
+**Problem.** Profiling an Atacama build after a one-line change: `--check` takes
+0.23 s and the front end about 0.02 s, but a default build took about 1 s. The
+driver compiled `runtime/native/macos.m` (0.46 s) and `http.m` (0.12 s) into a
+fresh temporary directory on every link, so every macOS app paid about 0.6 s
+for code that had not changed.
+
+**Fix.** `tools/clang-driver.py` already cached `graphics.c` by content. That
+cache is now `native_object`, keyed by the source, every runtime header, the
+compiler's identity and version, and the flags, and it serves `graphics`,
+`macos`, `http` and `net`. The compiler identity is computed once per link.
+
+| Atacama build (wall time) | Before | After (cache warm) |
+| --- | ---: | ---: |
+| `./minyar src/main.min` | 0.93 s, 1.11 s | 0.48 s, 0.48 s |
+| `./minyar --release --app ...` | 2.41 s, 1.86 s | 1.39 s, 1.46 s |
+
+**Test.** `tests/native-object-cache.py` (`check-native-cache`, part of
+`check` and `check-portable`) builds a native object twice and requires the
+second build to reuse it without recompiling. Changing a runtime header, the
+source or the flags must each produce a new object, and no temporary files
+may be left behind. `tests/native-graphics.py` and a Minyarcraft build still
+pass.
+
+### 9. Two competing `http` packages
 
 Not a speed fix, but one of the limits the brief named. appkit's NSURLSession
 `http` and minyar-os's portable socket/TLS `http` both arrived in v2 under the
@@ -294,6 +350,19 @@ merged into v2 but not pushed; the suite run on it was stopped.
 
 ## Measured and not a bottleneck
 
+- **Atacama start-up.** Launch, session check, loading and parsing 500 runs,
+  and the first render: about 2.04G instructions and 0.31 s of CPU, the same
+  before and after tonight's changes. AppKit set-up dominates, and the
+  history parse is about 3% of it. The driver's `startup` scenario measures
+  this.
+- **Typing in Atacama.** 300 keystrokes, 20 ms apart: 2.8G instructions and
+  0.61 s of CPU, about 2 ms per key. The main thread waits in `nextEvent` 95%
+  of the time, and the rest is AppKit's key handling, not the app's re-render.
+- **Atacama build after a one-line change.** The front end takes about 0.02 s,
+  so an incremental front end would not help. What is left after change 8 is
+  clang: about 0.4 s for a default build, and about 1 s more for `--release`
+  LTO.
+
 - **Compile times.** Front-end compile of real programs, in retired
   instructions: the compiler itself (6,159 lines) 92M; Minyarcraft 110M;
   the Minyar-OS kernel 495M; Atacama 81M. End-to-end `./minyar` builds,
@@ -305,19 +374,38 @@ merged into v2 but not pushed; the suite run on it was stopped.
 
 ## Not merged: Astra cycle collection
 
-The bake-off winner was ported onto v2 on branch `port/astra-cycles`
-(`b9702e9`, `f819fbb`). Measured on v2, it costs programs that never form a
-cycle:
+The bake-off winner was ported onto v2 on branch `port/astra-cycles`. A
+subagent then spent three rounds cutting its cost, and the branch now includes
+all of tonight's work (`ebb02ba`). The base below is v2 at the time of each
+measurement.
 
-| Workload | v2 | Astra port | Change |
+| Workload | v2 | First port | Final port |
 | --- | ---: | ---: | ---: |
-| Compiler self-compile (arena) | 87.9M | 88.1M | +0.2% |
-| Compiler, system runtime | 361.5M | 397.6M | +10.0% |
-| 20 x 5,000 chain (`acyclic.min`) | 193.3M | 227.1M | +17.5% |
-| 100,000-record linked chain | 168.3M | 201.6M | +19.8% |
-| 100,000 `List<Point>.add` | 46.6M | 57.3M | +23.1% |
+| Compiler on the system runtime | 364.5M | 397.6M (+10%) | 363.6M (~0%) |
+| 100,000 `List<Point>.add` | 46.5M | 57.3M (+23%) | 46.6M (+0.2%) |
+| 20 x 5,000 chain (`acyclic.min`) | 193.3M | 227.1M (+17.5%) | 218.3M (+12.9%) |
+| 100,000-record linked chain | 168.2M | 201.6M (+19.8%) | 189.9M (+12.9%) |
+| Peak memory, linked chain | 12.1 MiB | 21.3 MiB | 18.2 MiB |
 
-Peak memory rose 63-76% on record-heavy programs (chain: 12.1 → 21.3 MiB),
-from a 48-byte header on every List and every record that holds a reference.
-Because of the rule "do not land regressions", it waits for a decision; see
-MORNING.md.
+On the real programs, measured on the final port:
+
+- Minyarcraft is +0.06% and the compiler self-compile +1.0%. Atacama
+  streaming is within noise (14.36-14.73G against 14.34-14.36G).
+- `json.Value` holds `items: List<Value>`, so it counts as a type that can
+  form a cycle. Parsing Atacama's 500-run history response 20 times went from
+  1.22G to 1.57G instructions (+29%), and peak memory rose from 3.0 to
+  3.4 MiB.
+
+What it costs, in the subagent's analysis (`research/cycles/README.md` on the
+branch):
+
+- Objects of self-referential types carry a 32-byte header and keep exact
+  registry and incoming-edge counts, because the first cycle-forming
+  mutation can close a cycle through objects built earlier.
+- Once tracing is on, collection scans the global set of traced objects:
+  about 37,000 instructions per add in a tree-mutation benchmark.
+
+Since the rule tonight was not to land regressions, it stays on its branch.
+If it is merged, telling the compiler that `json.Value` can never form a
+cycle (it is built bottom-up) would remove the JSON cost, but that needs a
+language-level "acyclic" annotation.

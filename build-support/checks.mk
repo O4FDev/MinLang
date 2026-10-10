@@ -550,3 +550,10 @@ check-sanitize: check-peer-semantics-sanitize check-memory-regressions-sanitize
 check-tls: build/minyarc
 	$(LIMITED) python3 tests/tls-local.py
 check: check-tls
+
+.PHONY: check-native-cache
+check-native-cache:
+	$(LIMITED) python3 tests/native-object-cache.py
+
+check: check-native-cache
+check-portable: check-native-cache

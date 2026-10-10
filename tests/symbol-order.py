@@ -19,14 +19,21 @@ def text_literal(value):
     return json.dumps(value, ensure_ascii=False)
 
 
+def symbol_order(key):
+    # compareSymbol needs a consistent total order, not alphabetical order:
+    # UTF-8 length, then character count, then characters from the end, then kind.
+    name, kind = key
+    return (len(name.encode('utf-8')), len(name), name[::-1], kind)
+
+
 class SymbolOrder(CompilerTestCase):
-    def assert_total_order(self, matrix, keys, comparator):
+    def assert_total_order(self, matrix, keys, comparator, order=lambda key: key):
         for left, key in enumerate(keys):
             self.assertEqual(matrix[left][left], 0,
                              f'{comparator} reflexivity failed at entry {left}: {key!r}')
             for right, other in enumerate(keys):
                 actual = matrix[left][right]
-                expected = (key > other) - (key < other)
+                expected = (order(key) > order(other)) - (order(key) < order(other))
                 self.assertEqual(actual, expected,
                                  f'{comparator} independent order for {key!r} and {other!r}')
                 self.assertEqual(actual, -matrix[right][left],
@@ -107,13 +114,13 @@ function main() {
                 symbol_matrix = [output[start + row * symbol_count:start + (row + 1) * symbol_count]
                                  for row in range(symbol_count)]
                 self.assert_total_order(text_matrix, TEXTS, 'compareText')
-                self.assert_total_order(symbol_matrix, symbol_keys, 'compareSymbol')
+                self.assert_total_order(symbol_matrix, symbol_keys, 'compareSymbol', symbol_order)
                 start += symbol_count ** 2
                 self.assertEqual(output[start], symbol_count)
                 lookup = output[start + 1:]
                 self.assertEqual(sorted(lookup), list(range(symbol_count)),
                                  'lookup must contain each input entry exactly once')
-                self.assertEqual([symbol_keys[index] for index in lookup], sorted(symbol_keys),
+                self.assertEqual([symbol_keys[index] for index in lookup], sorted(symbol_keys, key=symbol_order),
                                  'lookup must order names first, then kinds, without assuming stable ties')
 
 

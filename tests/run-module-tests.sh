@@ -77,7 +77,10 @@ café \"quoted\"
 \"line\\nbreak\"
 true
 6
-5"
+5
+abc|0|a	b|x\\
+true
+true"
 compile_and_run_with_library crypto tests/packages/crypto.min "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7
