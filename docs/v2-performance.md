@@ -22,6 +22,7 @@ largest are 1 (10x), 5 (51x on long Texts), 2 (4x), 8 (2x builds) and 4 (-32%).
 | 7 | `json.parse` built every string from a parts list, a slice and a join | one slice when a string has no escapes | 20 parses of a 143 KB history response 1.22G | 0.95G | -22% |
 | 8 | Every macOS app build recompiled the Objective-C bridges (`macos.m` 0.46 s, `http.m` 0.12 s) | content-keyed object cache, already used for `graphics.c`, now for every native bridge | Atacama default build 0.93-1.11 s; release app 1.86-2.41 s | 0.48 s; 1.39-1.46 s | about 2x |
 | 9 | Minyarcraft's GPU vertex buffers dominated its memory (40-byte float vertices, six per quad) | 32-byte vertices (Float16 colour and light) and `graphics.updateQuads` (four vertices per quad, shared indices) | peak RSS 602 MB, footprint 892 MB, 17.30G instructions | 419 MB, 697-725 MB, 16.44G | -30% RSS, -5% instructions |
+| 11 | The compiler missed its self-compile budget: Text comparisons with literals were calls, and the 1.9 MB output was joined before being written | Inline length check for Text equality; `writeTextFile(path, List<Text>)`; a shorter call-depth guard | self-compile 80.40M instructions, 10.81 MiB; Minyarcraft 16.44G | 72.18M, 9.23 MiB; 15.74G | -10% and -15% (budget met); -4.3% |
 
 ### 1. Long lists rebuilt as stacks of views
 
@@ -390,21 +391,90 @@ so a portable `start`/`read` would need a request record instead of an
 integer handle. That is the remaining gap if streaming is ever needed outside
 macOS.
 
+### 11. The compiler's self-compile budget
+
+**Problem.** `make check-budget` limits the compiler compiling itself to 75M
+retired instructions and 10 MiB of peak memory. It had failed all night (80.4M,
+10.8 MiB). About 9M of any process here is fixed: a C program that returns at
+once retires 9.07M instructions on this macOS.
+
+**Evidence.**
+- An instrumented runtime that reads `proc_pid_rusage` around the final join
+  showed `joinText(output)` costing 8.4M instructions: 199,228 pieces making
+  1.9 MB, about 42 instructions a piece, plus faulting in a fresh 1.9 MB
+  buffer that existed only to be written to the file.
+- Arena statistics at exit: Text data 2.46 MiB, of which 1.81 MiB was that
+  joined module.
+- A cycle-sampling profile (`xctrace` CPU Profiler) put the expression parser
+  (`parseExpression`, `parseAnd`, `parseUnary`, `parseAtom`, `operatorLevel`)
+  and `minyar_texts_are_equal` near the top. Every `token == "*"` was a call.
+  Even inlined, each comparison first tested whether both sides were the same
+  object, which stopped LLVM from sharing the length and byte loads across a
+  run of comparisons. `operatorLevel` makes up to 16 of them per operand.
+
+**Fix.**
+- `minyar_texts_are_equal` is an always-inline runtime entry with no identity
+  shortcut. With link-time optimisation, comparing a Text with a literal is
+  now a length compare and a load of one to a few bytes; `token == "&&"` is a
+  single two-byte compare. Equality means the same as before.
+- `writeTextFile(path, contents)` also accepts a `List<Text>` (in the compiler
+  and the C bootstrap compiler). It writes what `joinText(contents)` would,
+  through a 256 KiB buffer, without building the joined Text. The compiler
+  returns its module as pieces, and `main` writes them. Programs with globals
+  still join them into one leading piece, as before.
+- The call-depth guard checks the stack position against one precomputed
+  limit and the depth against one cap. The full original check runs only on
+  the first call, or when a call might fail.
+
+| Self-compile (best of 5-7 runs) | Instructions | Peak RSS |
+| --- | ---: | ---: |
+| v2 | 80.40M | 10.81 MiB |
+| + inline Text equality | 77.97M | 10.80 MiB |
+| + `writeTextFile` with pieces | 76.84M | 9.25 MiB |
+| + shorter call-depth guard | 76.06M | 9.27 MiB |
+| + no identity shortcut in Text equality | 71.76M | 9.23 MiB |
+| Final, rebuilt to its fixed point (7 runs) | 72.18-72.54M | 9.23-9.27 MiB |
+
+`make check-budget` now passes: 72.73M instructions and 9.2 MiB, with 90th
+percentile CPU 8.53 ms against a 22 ms limit.
+
+The runtime changes help every program built with link-time optimisation:
+
+| Workload (3 runs each) | v2 | Now |
+| --- | ---: | ---: |
+| Minyarcraft `--screenshot noon` | 16.44G, 16.44G, 16.43G | 15.74G, 15.74G, 15.74G |
+| Minyarcraft front-end compile | 73.3M, 68.7M, 67.1M | 66.2M, 63.8M, 61.9M |
+| Atacama front-end compile | 25.0M, 23.6M, 23.4M | 23.0M, 22.8M, 23.0M |
+
+The Minyarcraft screenshots look the same. Two runs of one build already differ
+in a few pixels, so they can't be compared byte for byte. Minyar-OS, whose
+freestanding runtime includes the same file, builds and reaches its desktop
+in QEMU (612 ms).
+
+**Tests.**
+- The bootstrap is itself a test of the new `writeTextFile`: stage 0
+  (C) compiles the compiler, which writes its own output in pieces, and
+  stage 2 equals stage 3.
+- `tests/regressions.py` `test_write_text_file_writes_list_pieces_without_joining`
+  writes 120,004 pieces through the buffer, including a 350,000-byte piece
+  larger than the buffer, Unicode and an empty piece. It compares the file
+  with Python's expected bytes and with `joinText`, at O0 and O2. It also
+  checks that the call is `minyar_write_text_parts` and that an unwritable
+  path stops with "could not be created". `test_builtin_types` now rejects
+  `writeTextFile("x", [1, 2])`.
+- `check-regressions`, `check-modules`, `check-codegen`, `check-stack-overflow`
+  (with and without sanitizers), `check-examples` and `check-budget` pass.
+
 ## Gates
 
 `make check-budget` (the compiler's self-compile budget) was already failing
-before tonight. The leaf-function change narrowed the gap but did not close
-it:
+before tonight. It passes after change 11:
 
 | | Instructions (limit 75.0M) | Peak memory (limit 10.0 MiB) |
 | --- | ---: | ---: |
-| v2 before | about 91M | 10.8 MiB |
-| v2 after | 80.7M | 10.8 MiB |
-
-A Time Profiler trace of 300 self-compiles (`xctrace`, all processes) puts
-`minyar_join_texts` at 14% self time, dyld start-up at about 20%, and the rest
-spread across `compileFunctions`, `parseAtom`, `tokenIs` and `findLocal`, which
-are already tuned.
+| v2 at the start of the night | about 91M | 10.8 MiB |
+| after change 3 | 80.7M | 10.8 MiB |
+| after change 11 | 72.7M | 9.2 MiB |
 
 ## A bug introduced and fixed tonight
 
@@ -419,6 +489,21 @@ which fails on the broken build and passes now. The broken commit had been
 merged into v2 but not pushed; the suite run on it was stopped.
 
 ## Tried and reverted
+
+- **Writing the compiler's pieces through a 32 KiB buffer.** The copy loop
+  costs 2.1M instructions, but the 58 file writes it made cost more than one
+  1.9 MB write (79.1-80.5M against 78.7M in total). Each write call costs tens
+  of thousands of instructions in the file system. A 256 KiB buffer (8 writes)
+  gets the gain while adding only 0.25 MiB at peak.
+- **Large compiler Lists in `malloc`/`realloc` instead of the arena.** The
+  three token Lists grow in step, so each growth copies the List and leaves
+  about 1 MB of old copies in the arena. Moving them to `realloc` raised peak
+  RSS by 1 MiB (11.8 MiB) for no instruction gain, so the arena stays.
+- **`inlinehint` on leaf functions.** No measurable change (76.1-76.7M against
+  76.1-76.5M).
+- **Joining the globals into slot 0 of the output.** Nothing to gain for the
+  self-compile, which has no globals. Change 11 covers it for programs that
+  do.
 
 - **Joining the compiler's output once.** `compileTokens` returned
   `joinText(globals) + joinText(output)`, copying the 1.8 MB module twice.
