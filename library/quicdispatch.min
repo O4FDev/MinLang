@@ -1,0 +1,137 @@
+// One-owner bounded CID routing and indexed timers. No connection objects or
+// endpoint authentication are stored here; the caller owns those lifetimes.
+use "errors" as errors
+record Entry { key: Bytes; value: Integer; next: Integer; live: Boolean }
+public record Table {
+    valid: Boolean; count: Integer; maximum: Integer; key0: Integer; key1: Integer
+    heads: List<Integer>; entries: List<Entry>; freeHead: Integer
+}
+function invalid(message: Text): errors.BooleanResult { return errors.booleanFailure(errors.make(errors.invalidDataCode(), 0, message)) }
+public function table(maximum: Integer, buckets: Integer, salt: Bytes): Table {
+    let result = Table { valid: false; count: 0; maximum: maximum; key0: 0; key1: 0; heads: []; entries: []; freeHead: -1 }
+    if maximum < 1 || maximum > 131072 || buckets < 1 || buckets > 262144 || (buckets & (buckets - 1)) != 0 || salt.length != 16 { return result }
+    result.key0 = little(salt, 0); result.key1 = little(salt, 8)
+    for index in 0..buckets { result.heads.add(-1) }
+    result.valid = true; return result
+}
+record Sip { v0: Integer; v1: Integer; v2: Integer; v3: Integer }
+function little(data: Bytes, at: Integer): Integer {
+    let value = 0; for index in 0..8 { value = value | (data[at + index] << (index * 8)) }; return value
+}
+function modularAdd(first: Integer, second: Integer): Integer {
+    let low = (first & 0xffffffff) + (second & 0xffffffff)
+    let high = (((first >> 32) & 0xffffffff) + ((second >> 32) & 0xffffffff) + (low >> 32)) & 0xffffffff
+    return (high << 32) | (low & 0xffffffff)
+}
+function rotate(value: Integer, bits: Integer): Integer { return (value << bits) | ((value >> (64 - bits)) & ((1 << bits) - 1)) }
+function sipRound(state: Sip) {
+    state.v0 = modularAdd(state.v0, state.v1); state.v1 = rotate(state.v1, 13); state.v1 = state.v1 ^ state.v0; state.v0 = rotate(state.v0, 32)
+    state.v2 = modularAdd(state.v2, state.v3); state.v3 = rotate(state.v3, 16); state.v3 = state.v3 ^ state.v2
+    state.v0 = modularAdd(state.v0, state.v3); state.v3 = rotate(state.v3, 21); state.v3 = state.v3 ^ state.v0
+    state.v2 = modularAdd(state.v2, state.v1); state.v1 = rotate(state.v1, 17); state.v1 = state.v1 ^ state.v2; state.v2 = rotate(state.v2, 32)
+}
+// SipHash-2-4 hides bucket selection from peers with attacker-chosen Initial
+// CIDs. Numeric output is a 64-bit bit pattern in Minyar's signed Integer.
+public function keyHash(table: Table, data: Bytes): Integer {
+    if !table.valid || data.length > 65535 { return 0 }
+    let state = Sip { v0: 0x736f6d6570736575 ^ table.key0; v1: 0x646f72616e646f6d ^ table.key1; v2: 0x6c7967656e657261 ^ table.key0; v3: 0x7465646279746573 ^ table.key1 }
+    let at = 0
+    while at + 8 <= data.length {
+        let value = little(data, at); state.v3 = state.v3 ^ value; sipRound(state); sipRound(state); state.v0 = state.v0 ^ value; at += 8
+    }
+    let final = (data.length & 255) << 56
+    for index in 0..data.length - at { final = final | (data[at + index] << (index * 8)) }
+    state.v3 = state.v3 ^ final; sipRound(state); sipRound(state); state.v0 = state.v0 ^ final; state.v2 = state.v2 ^ 255
+    for index in 0..4 { sipRound(state) }
+    return state.v0 ^ state.v1 ^ state.v2 ^ state.v3
+}
+function bucket(table: Table, key: Bytes): Integer { return keyHash(table, key) & (table.heads.length - 1) }
+function equal(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+public function lookup(table: Table, key: Bytes): Integer {
+    if !table.valid || key.length < 1 || key.length > 20 { return -1 }
+    let at = table.heads[bucket(table, key)]
+    while at >= 0 { let entry = table.entries[at]; if equal(entry.key, key) { return entry.value }; at = entry.next }
+    return -1
+}
+public function insert(table: Table, key: Bytes, value: Integer): errors.BooleanResult {
+    if !table.valid || key.length < 1 || key.length > 20 || value < 0 { return invalid("invalid CID routing entry") }
+    let head = bucket(table, key); let at = table.heads[head]
+    while at >= 0 {
+        let entry = table.entries[at]
+        if equal(entry.key, key) { if entry.value != value { return invalid("CID already routes to another connection") }; return errors.boolean(true) }
+        at = entry.next
+    }
+    if table.count >= table.maximum { return errors.booleanFailure(errors.make(errors.wouldBlockCode(), 0, "CID routing table is full")) }
+    at = table.freeHead
+    if at >= 0 { table.freeHead = table.entries[at].next }
+    else { at = table.entries.length; table.entries.add(Entry { key: Bytes(); value: -1; next: -1; live: false }) }
+    // Copy the public CID; later caller mutation cannot rebind the table key.
+    table.entries[at] = Entry { key: key.slice(0, key.length); value: value; next: table.heads[head]; live: true }
+    table.heads[head] = at; table.count += 1; return errors.boolean(true)
+}
+public function remove(table: Table, key: Bytes): Boolean {
+    if !table.valid || key.length < 1 || key.length > 20 { return false }
+    let head = bucket(table, key); let at = table.heads[head]; let previous = -1
+    while at >= 0 {
+        let entry = table.entries[at]
+        if equal(entry.key, key) {
+            if previous < 0 { table.heads[head] = entry.next } else { table.entries[previous].next = entry.next }
+            table.entries[at] = Entry { key: Bytes(); value: -1; next: table.freeHead; live: false }
+            table.freeHead = at; table.count -= 1; return true
+        }
+        previous = at; at = entry.next
+    }
+    return false
+}
+record Timer { id: Integer; deadline: Integer }
+public record Timers { valid: Boolean; count: Integer; positions: List<Integer>; nodes: List<Timer> }
+public function timers(maximum: Integer): Timers {
+    let heap = Timers { valid: false; count: 0; positions: []; nodes: [] }
+    if maximum < 1 || maximum > 65536 { return heap }
+    for index in 0..maximum { heap.positions.add(-1); heap.nodes.add(Timer { id: -1; deadline: 0 }) }
+    heap.valid = true; return heap
+}
+function before(left: Timer, right: Timer): Boolean { return left.deadline < right.deadline || (left.deadline == right.deadline && left.id < right.id) }
+function swap(heap: Timers, first: Integer, second: Integer) {
+    let temporary = heap.nodes[first]; heap.nodes[first] = heap.nodes[second]; heap.nodes[second] = temporary
+    heap.positions[heap.nodes[first].id] = first; heap.positions[heap.nodes[second].id] = second
+}
+function up(heap: Timers, position: Integer): Integer {
+    let at = position
+    while at > 0 { let parent = (at - 1) / 2; if !before(heap.nodes[at], heap.nodes[parent]) { break }; swap(heap, at, parent); at = parent }
+    return at
+}
+function down(heap: Timers, position: Integer) {
+    let at = position
+    while at * 2 + 1 < heap.count {
+        let child = at * 2 + 1
+        if child + 1 < heap.count && before(heap.nodes[child + 1], heap.nodes[child]) { child += 1 }
+        if !before(heap.nodes[child], heap.nodes[at]) { break }
+        swap(heap, at, child); at = child
+    }
+}
+public function schedule(heap: Timers, id: Integer, deadline: Integer): errors.BooleanResult {
+    if !heap.valid || id < 0 || id >= heap.positions.length || deadline < 0 || deadline > 0x3fffffffffffffff { return invalid("invalid indexed timer") }
+    let at = heap.positions[id]
+    if at < 0 { at = heap.count; heap.count += 1; heap.nodes[at] = Timer { id: id; deadline: deadline }; heap.positions[id] = at }
+    else { heap.nodes[at].deadline = deadline }
+    down(heap, up(heap, at)); return errors.boolean(true)
+}
+public function cancel(heap: Timers, id: Integer): Boolean {
+    if !heap.valid || id < 0 || id >= heap.positions.length || heap.positions[id] < 0 { return false }
+    let at = heap.positions[id]; heap.positions[id] = -1; heap.count -= 1
+    if at != heap.count {
+        heap.nodes[at] = heap.nodes[heap.count]; heap.positions[heap.nodes[at].id] = at
+        heap.nodes[heap.count] = Timer { id: -1; deadline: 0 }; down(heap, up(heap, at))
+    } else { heap.nodes[at] = Timer { id: -1; deadline: 0 } }
+    return true
+}
+public function nextDeadline(heap: Timers): Integer { if !heap.valid || heap.count == 0 { return -1 }; return heap.nodes[0].deadline }
+public function takeDue(heap: Timers, now: Integer): Integer {
+    if !heap.valid || heap.count == 0 || now < heap.nodes[0].deadline { return -1 }
+    let id = heap.nodes[0].id; cancel(heap, id); return id
+}

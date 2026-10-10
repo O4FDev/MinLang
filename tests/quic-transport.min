@@ -1,0 +1,77 @@
+use "quic" as quic
+use "errors" as errors
+use "crypto" as crypto
+
+function main(): Integer {
+    let root = readBytesFile(argument(0)); let server = readBytesFile(argument(1)); let serverKey = readBytesFile(argument(2))
+    let client = readBytesFile(argument(3)); let clientKey = readBytesFile(argument(4))
+    for scenario in 0..5 {
+        let c = quic.client("localhost", randomBytes(80), "minyar-test", [root], [client], clientKey)
+        let s = quic.server(randomBytes(80), "minyar-test", c.originalDestination, [server], serverKey, [root], true)
+        let now = 0; let dropped = false
+        while now < 20000 && (c.state != quic.ESTABLISHED || s.state != quic.ESTABLISHED) {
+            let outbound = quic.poll(c, now)
+            for packet in outbound {
+                if scenario == 1 && !dropped { dropped = true }
+                else { quic.receive(s, packet, now); if scenario == 3 { quic.receive(s, packet, now) } }
+            }
+            let reply = quic.poll(s, now)
+            if scenario == 2 && !dropped && reply.length > 0 { dropped = true }
+            else {
+                if scenario == 4 {
+                    let index = reply.length
+                    while index > 0 { index -= 1; quic.receive(c, reply[index], now) }
+                } else { for packet in reply { quic.receive(c, packet, now) } }
+            }
+            if c.state == quic.FAILED || s.state == quic.FAILED { print(c.error); print(s.error); return 1 }
+            now += 10
+        }
+        if c.state != quic.ESTABLISHED || s.state != quic.ESTABLISHED || !s.serverTLS.authenticated { print("handshake timeout scenario " + Text(scenario)); return 2 }
+        let opened = quic.openStream(c, false)
+        if !errors.integerOk(opened) { return 3 }
+        let id = errors.integerValue(opened)
+        let data = Bytes(12000)
+        for index in 0..data.length { data[index] = index & 255 }
+        let written = quic.writeStream(c, id, data, true)
+        if !errors.integerOk(written) || errors.integerValue(written) != data.length { return 4 }
+        dropped = false
+        let received = Bytes()
+        while now < 40000 && received.length < data.length {
+            let packets = quic.poll(c, now)
+            let index = packets.length
+            while index > 0 {
+                index -= 1
+                if scenario > 0 && !dropped { dropped = true }
+                else { quic.receive(s, packets[index], now) }
+            }
+            for packet in quic.poll(s, now) { quic.receive(c, packet, now) }
+            let read = quic.readStream(s, id)
+            if errors.bytesOk(read) { received.addBytes(errors.bytesValue(read)) }
+            now += 10
+        }
+        if crypto.hex(received) != crypto.hex(data) { print("stream lost data"); return 5 }
+        let echo = quic.writeStream(s, id, received, true)
+        if !errors.integerOk(echo) { return 6 }
+        let got = Bytes()
+        while now < 60000 && got.length < data.length {
+            for packet in quic.poll(s, now) { quic.receive(c, packet, now) }
+            for packet in quic.poll(c, now) { quic.receive(s, packet, now) }
+            let read = quic.readStream(c, id)
+            if errors.bytesOk(read) { got.addBytes(errors.bytesValue(read)) }
+            now += 10
+        }
+        if crypto.hex(got) != crypto.hex(data) { return 7 }
+        // Forged packets cannot mutate authenticated stream delivery.
+        for seed in 0..1000 { let bad = randomBytes(seed % 1400); quic.receive(c, bad, now); quic.receive(s, bad, now) }
+        if c.state == quic.FAILED || s.state == quic.FAILED { return 8 }
+        print("QUIC authenticated streams scenario " + Text(scenario) + " passed")
+    }
+    let idle = quic.client("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey)
+    if quic.release(idle) { return 9 }
+    quic.poll(idle,0)
+    if quic.poll(idle,45000).length != 0 || idle.state != quic.CLOSED || quic.nextTimer(idle) != -1 { return 10 }
+    if !quic.release(idle) || idle.spaces.length != 0 || errors.booleanOk(quic.updateKeys(idle)) { return 11 }
+    if quic.poll(idle,50000).length != 0 { return 12 }; quic.receive(idle,Bytes(1200),50000)
+    print("QUIC lifecycle: silent idle expiry, live release rejection and closed-state reuse guards passed")
+    return 0
+}

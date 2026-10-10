@@ -1,0 +1,36 @@
+use "quic" as quic
+use "tlstickets" as tickets
+use "errors" as errors
+use "transport" as transport
+
+function drive(c: quic.Connection, s: quic.Connection, now: Integer) {
+    for packet in quic.poll(c, now) { quic.receive(s, packet, now) }
+    for packet in quic.poll(s, now) { quic.receive(c, packet, now) }
+}
+function main(): Integer {
+    let root = readBytesFile(argument(0)); let identity = readBytesFile(argument(1)); let key = readBytesFile(argument(2))
+    let client = readBytesFile(argument(3)); let clientKey = readBytesFile(argument(4))
+    let store = tickets.store(randomBytes(16), 3600)
+    let ticket = tickets.emptyClient()
+    for resumed in 0..2 {
+        let c = quic.clientResumed("localhost", randomBytes(80), "minyar-test", [root], [client], clientKey, ticket)
+        let s = quic.serverWithTickets(randomBytes(80), "minyar-test", c.originalDestination, [identity], key, [root], true, store)
+        let now = 0
+        for count in 0..100 { drive(c, s, now); now += 10 }
+        if c.state != quic.ESTABLISHED || s.state != quic.ESTABLISHED || c.clientTLS.resumed != (resumed == 1) || s.serverTLS.resumed != (resumed == 1) { print(c.error); print(s.error); return 1 }
+        if !s.serverTLS.authenticated || s.serverTLS.peerCertificate.length == 0 { return 2 }
+        let clientView = transport.client("localhost", randomBytes(80), "minyar-test", [root], [client], clientKey)
+        clientView.udp = c; clientView.state = transport.QUIC_READY
+        let serverView = transport.serverQUIC(randomBytes(80), "minyar-test", c.originalDestination, [identity], key, [root], true)
+        serverView.udp = s; serverView.state = transport.QUIC_READY
+        if Text(errors.bytesValue(transport.peerCertificate(clientView))) != Text(identity) || Text(errors.bytesValue(transport.peerCertificate(serverView))) != Text(client) { return 5 }
+        ticket = quic.takeTicket(c)
+        if !ticket.valid { return 3 }
+        let id = errors.integerValue(quic.openStream(c, false))
+        quic.writeStream(c, id, Bytes("resumed stream"), true)
+        for count in 0..20 { drive(c, s, now); now += 10 }
+        if Text(errors.bytesValue(quic.readStream(s, id))) != "resumed stream" { return 4 }
+    }
+    print("QUIC resumption: fresh and PSK-DHE connections, retained mTLS device identity and authenticated streams passed")
+    return 0
+}

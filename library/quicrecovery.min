@@ -1,0 +1,92 @@
+// RFC 9002 RTT, loss thresholds and probe timeout. RFC 9438 CUBIC in bytes.
+// Caller provides a monotonic millisecond clock; no scheduler or socket calls.
+public record State {
+    mtu: Integer; window: Integer; threshold: Integer; recoveryStart: Integer
+    latest: Integer; minimum: Integer; smoothed: Integer; variance: Integer; measured: Boolean
+    maxAckDelay: Integer; probes: Integer; epoch: Integer; maximum: Float; prior: Float; estimate: Float; k: Float
+}
+public function create(mtu: Integer): State {
+    let size = max(1200, min(mtu, 65527))
+    return State {
+        mtu: size; window: min(10 * size, max(2 * size, 14720)); threshold: 0x3fffffffffffffff; recoveryStart: -1
+        latest: 333; minimum: 0x3fffffffffffffff; smoothed: 333; variance: 166; measured: false
+        maxAckDelay: 25; probes: 0; epoch: -1; maximum: 0.0; prior: 0.0; estimate: 0.0; k: 0.0
+    }
+}
+public function sample(state: State, elapsed: Integer, delay: Integer, confirmed: Boolean) {
+    if elapsed < 0 { return }
+    state.latest = max(1, elapsed)
+    state.minimum = min(state.minimum, state.latest)
+    if !state.measured {
+        state.smoothed = state.latest; state.variance = state.latest / 2; state.measured = true; return
+    }
+    let adjusted = state.latest
+    if confirmed {
+        let permitted = max(0, min(delay, state.maxAckDelay))
+        if state.latest >= state.minimum + permitted { adjusted -= permitted }
+    }
+    let difference = state.smoothed - adjusted
+    if difference < 0 { difference = -difference }
+    state.variance = (3 * state.variance + difference) / 4
+    state.smoothed = (7 * state.smoothed + adjusted) / 8
+}
+public function pto(state: State, confirmed: Boolean): Integer {
+    let duration = 999
+    if state.measured { duration = state.smoothed + max(4 * state.variance, 1) }
+    if confirmed { duration += state.maxAckDelay }
+    // Keep time arithmetic bounded even when an unreachable peer never ACKs.
+    return min(60000, duration * (1 << min(state.probes, 16)))
+}
+public function isLost(state: State, number: Integer, largestAck: Integer, sent: Integer, now: Integer): Boolean {
+    if number > largestAck { return false }
+    let delay = lossDelay(state)
+    return largestAck - number >= 3 || now - sent >= delay
+}
+public function lossDelay(state: State): Integer { return max(1,(9 * max(state.latest,state.smoothed) + 7) / 8) }
+function cubeRoot(value: Float): Float {
+    if value <= 0.0 { return 0.0 }
+    let guess = max(1.0, value)
+    for index in 0..32 { guess = (2.0 * guess + value / (guess * guess)) / 3.0 }
+    return guess
+}
+public function lost(state: State, now: Integer, sent: Integer) {
+    if sent <= state.recoveryStart { return }
+    state.recoveryStart = now
+    let packets = Float(state.window) / Float(state.mtu)
+    if packets < state.maximum { state.maximum = packets * 0.85 }
+    else { state.maximum = packets }
+    state.prior = packets
+    state.window = max(2 * state.mtu, state.window * 7 / 10)
+    state.threshold = state.window; state.epoch = -1
+}
+public function persistentCongestion(state: State) {
+    state.window = 2 * state.mtu; state.epoch = -1
+}
+public function persistentDuration(state: State): Integer {
+    // RFC9002 section7.6: include max ACK delay for every packet space,
+    // and never apply the PTO's exponential backoff to this duration.
+    return 3 * (state.smoothed + max(4 * state.variance,1) + state.maxAckDelay)
+}
+public function acknowledged(state: State, bytes: Integer, now: Integer, sent: Integer) {
+    if bytes <= 0 || sent <= state.recoveryStart { return }
+    state.probes = 0
+    if state.window < state.threshold { state.window += bytes; return }
+    let packets = Float(state.window) / Float(state.mtu)
+    if state.epoch < 0 {
+        state.epoch = now; state.estimate = packets
+        state.k = cubeRoot(max(0.0, (state.maximum - packets) / 0.4))
+    }
+    let time = Float(now - state.epoch + state.smoothed) / 1000.0
+    let delta = time - state.k
+    let target = 0.4 * delta * delta * delta + state.maximum
+    target = min(max(target, packets), packets * 1.5)
+    let acknowledged = Float(bytes) / Float(state.mtu)
+    let alpha = 0.5294117647058824
+    if state.estimate >= state.prior { alpha = 1.0 }
+    state.estimate += alpha * acknowledged / packets
+    let cubic = packets + (target - packets) * acknowledged / packets
+    state.window = max(state.window, Integer(max(cubic, state.estimate) * Float(state.mtu)))
+}
+public function idle(state: State, elapsed: Integer) {
+    if elapsed > 0 && state.epoch >= 0 { state.epoch += elapsed }
+}

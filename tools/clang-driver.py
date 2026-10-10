@@ -74,7 +74,7 @@ def native_object(project, clang, base, name, compile_flags):
     # Includes native ABI helpers and platform headers. Content keys prevent
     # stale artifacts after restores which preserve old timestamps.
     dependencies = [source, *sorted((project / 'runtime').rglob('*.h'))]
-    if name.startswith('update'):
+    if name.startswith(('securecrypto', 'update')):
         dependencies += sorted((project / 'vendor/monocypher').glob('*'))
     identity = base.copy()
     identity.update(json.dumps([name, compile_flags]).encode())
@@ -319,6 +319,8 @@ def main():
     if {'macos', 'net'} <= libraries or {'windows', 'net'} <= libraries:
         native_flags = [*native_flags, '-DMINYAR_APP_EVENT_LOOP=1']
     base = clang_identity(clang) if libraries - {'machine', 'machine_arm64'} else None
+    if libraries & {'securecrypto', 'update'}:
+        native += [native_object(project, clang, base, 'update_monocypher.c', native_flags)]
     for library in sorted(libraries):
         if library == 'graphics':
             native += graphics(project, clang, base, native_flags)
@@ -357,7 +359,7 @@ def main():
                 native += ['-lws2_32']
         elif library == 'update':
             native += [native_object(project, clang, base, name, native_flags)
-                       for name in ('update.c', 'update_monocypher.c', 'update_ed25519.c')]
+                       for name in ('update.c', 'update_ed25519.c')]
         elif library == 'workers':
             native += [native_object(project, clang, base, 'workers.c', native_flags)]
             if platform.system() != 'Windows':
@@ -365,6 +367,16 @@ def main():
         elif library == 'callbackruntime':
             # This bounded service entry is supplied by the opt-in engine.
             pass
+        elif library == 'quicinteropio':
+            native += [native_object(project, clang, base, 'quicinteropio.c', native_flags)]
+        elif library == 'aes':
+            native += [native_object(project, clang, base, 'aes.c', native_flags)]
+            if platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
+                native += ['-lbcrypt']
+            elif platform.system() != 'Darwin':
+                native += ['-lcrypto']
+        elif library == 'securecrypto':
+            native += [native_object(project, clang, base, 'securecrypto.c', native_flags)]
         elif library == 'tlsverify':
             native += [native_object(project, clang, base, 'tlsverify.c', native_flags)]
             if platform.system() == 'Darwin':

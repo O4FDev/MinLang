@@ -13,6 +13,8 @@
 // without TLS records, for a future QUIC transport implementation.
 use "crypto" as crypto
 use "tlsverify" as trust
+use "aes" as aes
+use "tlstickets" as tickets
 
 public constant STARTING = 0
 public constant HELLO_SENT = 1
@@ -25,9 +27,11 @@ public constant HANDSHAKE_KEYS = 1
 public constant APPLICATION_KEYS = 2
 
 constant CHACHA20_POLY1305 = 0x1303
+constant AES128_GCM = 0x1301
 constant X25519 = 0x001d
 
 public record Session {
+    cipherSuite: Integer
     host: Text
     state: Integer
     error: Text
@@ -63,6 +67,12 @@ public record Session {
     incomingLevel: Integer
     clientApplication: Bytes
     serverApplication: Bytes
+    earlyOffered: Boolean; earlyAccepted: Boolean; clientEarlySecret: Bytes
+    resumed: Boolean
+    ticket: tickets.Client
+    savedTickets: List<tickets.Client>
+    verifiedChain: Bytes
+    resumptionMaster: Bytes
 }
 
 // ----- Encoding helpers -----
@@ -107,6 +117,9 @@ function abandon(session: Session, message: Text) {
         session.certificate = Bytes()
         session.clientChain = Bytes()
         session.anchors = Bytes()
+        session.clientEarlySecret = Bytes(); session.resumptionMaster = Bytes(); session.ticket = tickets.emptyClient(); session.savedTickets = []
+        session.handshakeSecret = Bytes(); session.clientSecret = Bytes(); session.serverSecret = Bytes()
+        session.readKey = Bytes(); session.writeKey = Bytes(); session.clientApplication = Bytes(); session.serverApplication = Bytes()
     }
 }
 
@@ -115,6 +128,7 @@ function abandon(session: Session, message: Text) {
 // A session that is never used, for connections without TLS.
 public function none(): Session {
     return Session {
+        cipherSuite: CHACHA20_POLY1305
         host: ""; state: CLOSED; error: ""; privateKey: Bytes(); random: Bytes()
         transcript: Bytes(); received: Bytes(); handshake: Bytes(); outgoing: Bytes(); incoming: Bytes()
         handshakeSecret: Bytes(); clientSecret: Bytes(); serverSecret: Bytes()
@@ -123,6 +137,8 @@ public function none(): Session {
         certificateRequested: false; authenticated: false; stage: 0; protocol: ""; transportParameters: Bytes()
         peerTransportParameters: Bytes(); quic: false; outgoingLevel: INITIAL_KEYS; incomingLevel: INITIAL_KEYS
         clientApplication: Bytes(); serverApplication: Bytes()
+        earlyOffered: false; earlyAccepted: false; clientEarlySecret: Bytes()
+        resumed: false; ticket: tickets.emptyClient(); savedTickets: []; verifiedChain: Bytes(); resumptionMaster: Bytes()
     }
 }
 
@@ -146,8 +162,40 @@ public function clientWithIdentity(host: Text, entropy: Bytes, roots: List<Bytes
 // QUIC supplies ordered CRYPTO stream bytes at each encryption level, handles
 // packet protection itself, and consumes clientSecret/serverSecret followed
 // by clientApplication/serverApplication. This is not a QUIC transport.
+public function clientWithProtocol(host: Text, entropy: Bytes, protocol: Text, roots: List<Bytes>, certificates: List<Bytes>, privateKey: Bytes): Session {
+    return configured(host, entropy, roots, certificates, privateKey, protocol, false, Bytes())
+}
 public function quicClient(host: Text, entropy: Bytes, protocol: Text, parameters: Bytes, roots: List<Bytes>, certificates: List<Bytes>, privateKey: Bytes): Session {
     return configured(host, entropy, roots, certificates, privateKey, protocol, true, parameters)
+}
+public function quicClientResumed(host: Text, entropy: Bytes, protocol: Text, parameters: Bytes, roots: List<Bytes>, certificates: List<Bytes>, privateKey: Bytes, ticket: tickets.Client): Session {
+    let session = configured(host, entropy, roots, certificates, privateKey, protocol, true, parameters)
+    offerTicket(session, ticket)
+    return session
+}
+public function quicClientEarly(host: Text, entropy: Bytes, protocol: Text, parameters: Bytes, roots: List<Bytes>, certificates: List<Bytes>, privateKey: Bytes, ticket: tickets.Client): Session {
+    let session = quicClientResumed(host, entropy, protocol, parameters, roots, certificates, privateKey, ticket)
+    if session.ticket.valid && ticket.earlyLimit == 0xffffffff && tickets.profile(ticket.parameters).length == 64 {
+        session.earlyOffered = true; session.outgoing = Bytes(); session.transcript = Bytes(); sendHello(session)
+    }
+    return session
+}
+public function clientResumed(host: Text, entropy: Bytes, roots: List<Bytes>, certificates: List<Bytes>, privateKey: Bytes, ticket: tickets.Client): Session {
+    let session = configured(host, entropy, roots, certificates, privateKey, "http/1.1", false, Bytes())
+    offerTicket(session, ticket)
+    return session
+}
+function offerTicket(session: Session, ticket: tickets.Client) {
+    let now = trust.currentTimeMilliseconds()
+    if session.state == FAILED || !ticket.valid || now < ticket.issued || now >= ticket.expires || ticket.host != session.host || ticket.protocol != session.protocol ||
+       ticket.psk.length != 32 || ticket.ticket.length < 1 || ticket.ticket.length > 65500 || ticket.certificateChain.length == 0 ||
+       trust.chain(session.host, ticket.certificateChain, session.anchors) != "" { return }
+    session.ticket = ticket; session.outgoing = Bytes(); session.transcript = Bytes(); sendHello(session)
+}
+public function takeTicket(session: Session): tickets.Client {
+    if session.savedTickets.length == 0 { return tickets.emptyClient() }
+    let result = session.savedTickets[session.savedTickets.length - 1]; session.savedTickets = []
+    return result
 }
 
 function certificateEntries(certificates: List<Bytes>): Bytes {
@@ -195,7 +243,8 @@ function sendHello(session: Session) {
         body.add(32)
         body.addBytes(crypto.sha256(session.random))
     }
-    add16(body, 2)
+    add16(body, 4)
+    add16(body, AES128_GCM)
     add16(body, CHACHA20_POLY1305)
     body.add(1)
     body.add(0)
@@ -241,12 +290,28 @@ function sendHello(session: Session) {
     share.addBytes(publicKey)
     extensions.addBytes(extension(51, share))
     if session.quic { extensions.addBytes(extension(57, session.transportParameters)) }
+    extensions.addBytes(extension(45, crypto.fromHex("0101")))
+    if session.earlyOffered { extensions.addBytes(extension(42, Bytes())) }
+    if session.ticket.valid {
+        let identities = Bytes(); add16(identities, session.ticket.ticket.length); identities.addBytes(session.ticket.ticket)
+        let age = (max(0, trust.currentTimeMilliseconds() - session.ticket.issued) + session.ticket.ageAdd) & 0xffffffff
+        for index in 0..4 { identities.add((age >> ((3 - index) * 8)) & 255) }
+        let offered = Bytes(); add16(offered, identities.length); offered.addBytes(identities); add16(offered, 33); offered.add(32); offered.addBytes(Bytes(32))
+        extensions.addBytes(extension(41, offered))
+    }
     add16(body, extensions.length)
     body.addBytes(extensions)
     let message = Bytes()
     message.add(1)
     add24(message, body.length)
     message.addBytes(body)
+    if session.ticket.valid {
+        let binder = tickets.binder(session.ticket.psk, crypto.sha256(message.slice(0, message.length - 35)))
+        for index in 0..32 { message[message.length - 32 + index] = binder[index] }
+    }
+    if session.earlyOffered {
+        session.clientEarlySecret = crypto.expandLabel(crypto.hkdfExtract(Bytes(), session.ticket.psk), "c e traffic", crypto.sha256(message), 32)
+    }
     session.transcript.addBytes(message)
     if session.quic {
         session.outgoing.addBytes(message)
@@ -272,6 +337,21 @@ function nonce(iv: Bytes, sequence: Integer): Bytes {
     return result
 }
 
+function keySize(session: Session): Integer {
+    if session.cipherSuite == AES128_GCM { return 16 }
+    return 32
+}
+function recordSeal(session: Session, iv: Bytes, header: Bytes, plaintext: Bytes): Bytes {
+    if session.cipherSuite == AES128_GCM { return aes.encrypt(session.writeKey, iv, header, plaintext) }
+    return crypto.seal(session.writeKey, iv, header, plaintext)
+}
+function recordOpen(session: Session, iv: Bytes, header: Bytes, ciphertext: Bytes): crypto.Opened {
+    if session.cipherSuite != AES128_GCM { return crypto.open(session.readKey, iv, header, ciphertext) }
+    let result = aes.decrypt(session.readKey, iv, header, ciphertext)
+    if result.length == 0 { return crypto.Opened { valid: false; plaintext: Bytes() } }
+    return crypto.Opened { valid: true; plaintext: result.slice(1, result.length) }
+}
+
 function encrypt(session: Session, type: Integer, content: Bytes) {
     let offset = 0
     while offset < content.length || content.length == 0 {
@@ -282,7 +362,8 @@ function encrypt(session: Session, type: Integer, content: Bytes) {
         header.add(23)
         add16(header, 0x0303)
         add16(header, inner.length + 16)
-        let sealed = crypto.seal(session.writeKey, nonce(session.writeIv, session.writeSequence), header, inner)
+        let sealed = recordSeal(session, nonce(session.writeIv, session.writeSequence), header, inner)
+        if sealed.length != inner.length + 16 { abandon(session, "TLS cipher provider failed"); return }
         session.writeSequence += 1
         session.outgoing.addBytes(header)
         session.outgoing.addBytes(sealed)
@@ -342,7 +423,7 @@ function readRecord(session: Session, header: Bytes, body: Bytes) {
         abandon(session, "unexpected record type " + Text(type))
         return
     }
-    let opened = crypto.open(session.readKey, nonce(session.readIv, session.readSequence), header, body)
+    let opened = recordOpen(session, nonce(session.readIv, session.readSequence), header, body)
     session.readSequence += 1
     if !opened.valid {
         abandon(session, "a record failed its integrity check")
@@ -407,7 +488,9 @@ function handshakeMessages(session: Session) {
         let message = session.handshake.slice(0, 4 + length)
         session.handshake = session.handshake.slice(4 + length, session.handshake.length)
         let type = message[0]
-        if session.quic && ((type == 2 && session.incomingLevel != INITIAL_KEYS) || (type != 2 && session.incomingLevel != HANDSHAKE_KEYS)) {
+        if session.quic && ((type == 2 && session.incomingLevel != INITIAL_KEYS) ||
+           (type == 4 && session.incomingLevel != APPLICATION_KEYS) ||
+           (type != 2 && type != 4 && session.incomingLevel != HANDSHAKE_KEYS)) {
             abandon(session, "TLS handshake arrived at the wrong QUIC encryption level")
             return
         }
@@ -421,14 +504,42 @@ function handshakeMessages(session: Session) {
             serverCertificate(session, message)
         } else if type == 15 && session.stage == 4 {
             certificateVerify(session, message)
-        } else if type == 20 && session.stage == 5 {
+        } else if type == 20 && (session.stage == 5 || (session.resumed && (session.stage == 2 || session.stage == 3))) {
             serverFinished(session, message)
-        } else if type == 4 && session.state == ESTABLISHED && !session.quic {
-            // Resumption is not enabled; ignore the ticket without trusting it.
+        } else if type == 4 && session.state == ESTABLISHED {
+            newSessionTicket(session, message)
         } else {
             abandon(session, "unexpected or out-of-order TLS handshake message")
         }
     }
+}
+
+function newSessionTicket(session: Session, message: Bytes) {
+    if message.length < 17 { abandon(session, "malformed NewSessionTicket"); return }
+    let at = 13 + message[12]
+    if at + 2 > message.length { abandon(session, "truncated ticket nonce"); return }
+    let nonce = message.slice(13, at)
+    let length = get16(message, at); at += 2
+    if length == 0 || length > message.length - at - 2 { abandon(session, "truncated or empty session ticket"); return }
+    let ticket = message.slice(at, at + length); at += length
+    if get16(message, at) != message.length - at - 2 { abandon(session, "malformed ticket extensions"); return }; at += 2
+    let seen: List<Integer> = []; let earlyLimit = 0
+    while at + 4 <= message.length {
+        let type = get16(message, at); let size = get16(message, at + 2); at += 4
+        if size > message.length - at || contains(seen, type) || (type == 42 && size != 4) { abandon(session, "invalid ticket extension"); return }
+        if type == 42 { for index in 0..4 { earlyLimit = (earlyLimit << 8) | message[at + index] } }
+        seen.add(type); at += size
+    }
+    if at != message.length { abandon(session, "truncated ticket extension"); return }
+    let lifetime = 0; let ageAdd = 0
+    for index in 0..4 { lifetime = (lifetime << 8) | message[4 + index]; ageAdd = (ageAdd << 8) | message[8 + index] }
+    let now = trust.currentTimeMilliseconds()
+    if lifetime < 1 || lifetime > 604800 || session.resumptionMaster.length != 32 || session.verifiedChain.length == 0 || ticket.length > 65500 || now < 1 { return }
+    if session.savedTickets.length >= 2 { session.savedTickets = [] }
+    session.savedTickets.add(tickets.Client {
+        valid: true; ticket: ticket; psk: crypto.expandLabel(session.resumptionMaster, "resumption", nonce, 32); suite: session.cipherSuite; earlyLimit: earlyLimit
+        host: session.host; protocol: session.protocol; issued: now; expires: now + lifetime * 1000; ageAdd: ageAdd; certificateChain: session.verifiedChain; parameters: session.peerTransportParameters
+    })
 }
 
 function serverHello(session: Session, message: Bytes) {
@@ -459,10 +570,11 @@ function serverHello(session: Session, message: Bytes) {
         return
     }
     at += 3
-    if suite != CHACHA20_POLY1305 {
+    if suite != CHACHA20_POLY1305 && suite != AES128_GCM {
         abandon(session, "the server chose an unsupported cipher suite")
         return
     }
+    session.cipherSuite = suite
     let extensionsEnd = at + 2 + get16(message, at)
     if extensionsEnd != message.length {
         abandon(session, "malformed ServerHello extensions")
@@ -487,7 +599,11 @@ function serverHello(session: Session, message: Bytes) {
         if type == 43 && size == 2 {
             version = get16(message, data)
         }
-        if type != 43 && type != 51 {
+        if type == 41 {
+            if !session.ticket.valid || size != 2 || get16(message, data) != 0 { abandon(session, "unsolicited or invalid server PSK selection"); return }
+            session.resumed = true; session.authenticated = true; session.verifiedChain = session.ticket.certificateChain
+        }
+        if type != 43 && type != 51 && type != 41 {
             abandon(session, "unsolicited ServerHello extension")
             return
         }
@@ -499,21 +615,23 @@ function serverHello(session: Session, message: Bytes) {
     }
     session.transcript.addBytes(message)
     let shared = crypto.x25519(session.privateKey, serverKey)
-    if equal(shared, Bytes(32)) {
+    if shared.length != 32 || equal(shared, Bytes(32)) {
         abandon(session, "invalid all-zero X25519 shared secret")
         return
     }
     let zeros = Bytes(32)
-    let early = crypto.hkdfExtract(Bytes(), zeros)
+    let psk = zeros
+    if session.resumed { psk = session.ticket.psk }
+    let early = crypto.hkdfExtract(Bytes(), psk)
     let derived = crypto.expandLabel(early, "derived", crypto.sha256(Bytes()), 32)
     session.handshakeSecret = crypto.hkdfExtract(derived, shared)
     let hash = crypto.sha256(session.transcript)
     session.clientSecret = crypto.expandLabel(session.handshakeSecret, "c hs traffic", hash, 32)
     session.serverSecret = crypto.expandLabel(session.handshakeSecret, "s hs traffic", hash, 32)
-    session.readKey = crypto.expandLabel(session.serverSecret, "key", Bytes(), 32)
+    session.readKey = crypto.expandLabel(session.serverSecret, "key", Bytes(), keySize(session))
     session.readIv = crypto.expandLabel(session.serverSecret, "iv", Bytes(), 12)
     session.readSequence = 0
-    session.writeKey = crypto.expandLabel(session.clientSecret, "key", Bytes(), 32)
+    session.writeKey = crypto.expandLabel(session.clientSecret, "key", Bytes(), keySize(session))
     session.writeIv = crypto.expandLabel(session.clientSecret, "iv", Bytes(), 12)
     session.writeSequence = 0
     session.state = HANDSHAKE
@@ -526,12 +644,7 @@ function contains(values: List<Integer>, value: Integer): Boolean {
 }
 
 // Compare the complete fixed-size value without early byte exits.
-function equal(left: Bytes, right: Bytes): Boolean {
-    if left.length != right.length { return false }
-    let difference = 0
-    for index in 0..left.length { difference = difference | (left[index] ^ right[index]) }
-    return difference == 0
-}
+function equal(left: Bytes, right: Bytes): Boolean { return crypto.constantTimeEqual(left, right) }
 
 function encryptedExtensions(session: Session, message: Bytes) {
     if message.length < 6 || get16(message, 4) != message.length - 6 {
@@ -560,6 +673,9 @@ function encryptedExtensions(session: Session, message: Bytes) {
         } else if type == 57 && session.quic {
             session.peerTransportParameters = message.slice(data, data + size)
             parameters = true
+        } else if type == 42 {
+            if size != 0 || !session.earlyOffered || !session.resumed || session.cipherSuite != session.ticket.suite { abandon(session, "unsolicited or incompatible early-data acceptance"); return }
+            session.earlyAccepted = true
         } else if type != 0 && type != 10 {
             abandon(session, "unsolicited encrypted extension")
             return
@@ -577,6 +693,9 @@ function encryptedExtensions(session: Session, message: Bytes) {
     if at != message.length || (session.quic && (!selectedProtocol || !parameters)) {
         abandon(session, "incomplete encrypted extensions or missing QUIC negotiation")
         return
+    }
+    if session.earlyAccepted && !tickets.permitsEarly(tickets.profile(session.ticket.parameters), tickets.profile(session.peerTransportParameters)) {
+        abandon(session, "server reduced remembered 0-RTT transport limits"); return
     }
     session.transcript.addBytes(message)
     session.stage = 2
@@ -663,6 +782,7 @@ function serverCertificate(session: Session, message: Bytes) {
         abandon(session, failure)
         return
     }
+    if message.length - 8 <= 32768 { session.verifiedChain = message.slice(8, message.length) }
     session.transcript.addBytes(message)
     session.stage = 4
 }
@@ -757,6 +877,7 @@ function serverFinished(session: Session, message: Bytes) {
     finished.addBytes(verify)
     flight.addBytes(finished)
     session.transcript.addBytes(finished)
+    session.resumptionMaster = crypto.expandLabel(master, "res master", crypto.sha256(session.transcript), 32)
     // A change-cipher-spec record first, for middlebox compatibility.
     if session.quic {
         session.outgoingLevel = HANDSHAKE_KEYS
@@ -765,10 +886,10 @@ function serverFinished(session: Session, message: Bytes) {
         session.outgoing.addBytes(crypto.fromHex("140303000101"))
         encrypt(session, 22, flight)
     }
-    session.readKey = crypto.expandLabel(session.serverApplication, "key", Bytes(), 32)
+    session.readKey = crypto.expandLabel(session.serverApplication, "key", Bytes(), keySize(session))
     session.readIv = crypto.expandLabel(session.serverApplication, "iv", Bytes(), 12)
     session.readSequence = 0
-    session.writeKey = crypto.expandLabel(session.clientApplication, "key", Bytes(), 32)
+    session.writeKey = crypto.expandLabel(session.clientApplication, "key", Bytes(), keySize(session))
     session.writeIv = crypto.expandLabel(session.clientApplication, "iv", Bytes(), 12)
     session.writeSequence = 0
     session.state = ESTABLISHED
@@ -794,7 +915,7 @@ function serverFinished(session: Session, message: Bytes) {
 // handshake message must stay at its original encryption level.
 public function receiveHandshake(session: Session, data: Bytes, level: Integer) {
     if session.state == FAILED || session.state == CLOSED { return }
-    if !session.quic || (level != INITIAL_KEYS && level != HANDSHAKE_KEYS) ||
+    if !session.quic || (level != INITIAL_KEYS && level != HANDSHAKE_KEYS && !(level == APPLICATION_KEYS && session.state == ESTABLISHED)) ||
        (session.handshake.length > 0 && session.incomingLevel != level) ||
        data.length > 1048576 || session.handshake.length + data.length > 1048576 {
         abandon(session, "invalid QUIC TLS input level or buffer size")

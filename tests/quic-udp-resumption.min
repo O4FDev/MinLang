@@ -1,0 +1,53 @@
+use "quic" as quic
+use "tlstickets" as tickets
+use "net" as net
+use "eventloop" as loop
+use "errors" as errors
+
+function main(): Integer {
+    let port = 0; for digit in argument(0) { port = port * 10 + Integer(digit) - 48 }
+    let socket = net.udp("127.0.0.1", 0)
+    if socket < 0 || !net.udpConnect(socket, "127.0.0.1", port) { return 1 }
+    let eventLoop = errors.integerValue(loop.create()); loop.watch(eventLoop, socket, loop.readableInterest(), 0)
+    let ticket = tickets.emptyClient()
+    for iteration in 0..2 {
+        let connection = quic.clientResumed("localhost", randomBytes(80), "minyar-test", [readBytesFile(argument(1))], [readBytesFile(argument(2))], readBytesFile(argument(3)), ticket)
+        if iteration == 1 && argumentCount() > 4 && argument(4) == "early" {
+            connection = quic.clientEarly("localhost", randomBytes(80), "minyar-test", [readBytesFile(argument(1))], [readBytesFile(argument(2))], readBytesFile(argument(3)), ticket)
+        }
+        let started = net.monotonicMilliseconds(); let now = 0; let sent = false; let received = Bytes(); let id = 0
+        let message = Bytes("Minyar authenticated Quinn QUIC")
+        if iteration == 1 && argumentCount() > 4 && argument(4) == "early" {
+            id = errors.integerValue(quic.openEarlyStream(connection, false)); quic.writeEarlyStream(connection, id, message, true); sent = true
+        }
+        while now < 10000 {
+            now = net.monotonicMilliseconds() - started
+            if connection.state == quic.ESTABLISHED && !sent {
+                if connection.clientTLS.resumed != (iteration == 1) { print("peer did not resume"); return 2 }
+                id = errors.integerValue(quic.openStream(connection, false)); quic.writeStream(connection, id, message, true); sent = true
+            }
+            if sent {
+                let data = quic.readStream(connection, id)
+                if errors.bytesOk(data) { received.addBytes(errors.bytesValue(data)) }
+                if received.length == message.length && connection.clientTLS.savedTickets.length > 0 { ticket = quic.takeTicket(connection); quic.close(connection, 0, Bytes("done")) }
+            }
+            for packet in quic.poll(connection, now) { net.write(socket, packet) }
+            if connection.state == quic.CLOSED { break }
+            if connection.state == quic.FAILED { print(connection.error); return 3 }
+            let batch = loop.wait(eventLoop, min(100, max(0, quic.nextTimer(connection) - now)), 16)
+            if errors.isError(loop.batchError(batch)) { return 4 }
+            now = net.monotonicMilliseconds() - started
+            for event in loop.events(batch) {
+                let packets = net.receiveDatagrams(socket, 32, 65535)
+                if net.datagramBatchOk(packets) { for packet in net.datagrams(packets) { let data = net.datagramData(packet); if errors.bytesOk(data) { quic.receive(connection, errors.bytesValue(data), now) } } }
+            }
+        }
+        if iteration == 1 && argumentCount() > 4 && argument(4) == "early" && !connection.clientTLS.earlyAccepted { print("peer rejected early data"); return 6 }
+        if received.length != message.length || !ticket.valid {
+            print("resumption timeout iteration=" + Text(iteration) + " received=" + Text(received.length) + " state=" + Text(connection.state) + " tickets=" + Text(connection.clientTLS.savedTickets.length) + " chain=" + Text(connection.clientTLS.verifiedChain.length) + " master=" + Text(connection.clientTLS.resumptionMaster.length)); return 5
+        }
+    }
+    loop.close(eventLoop); net.close(socket)
+    print("Minyar to Quinn/rustls: authenticated PSK-DHE resumption passed")
+    return 0
+}

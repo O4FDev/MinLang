@@ -1,0 +1,112 @@
+// HTTP/0.9 files for the official interop runner, with fixture-only NSS logs.
+use "quic" as quic
+use "quicwire" as wire
+use "crypto" as crypto
+use "net" as net
+use "errors" as errors
+use "eventloop" as loop
+use "quicinteropio" as file
+use "tlstickets" as tickets
+record Transfer { id: Integer; request: Bytes; handle: Integer; size: Integer; sent: Integer; pending: Bytes; done: Boolean }
+record Peer { connection: quic.Connection; addresses: List<Text>; ports: List<Integer>; transfers: List<Transfer>; logged: Boolean }
+function logKeys(peer: Peer, path: Text) {
+    let session = peer.connection.serverTLS
+    if peer.logged || session.clientApplication.length != 32 || session.transcript.length < 38 { return }
+    let random = crypto.hex(session.transcript.slice(6, 38))
+    file.append(path, "CLIENT_HANDSHAKE_TRAFFIC_SECRET " + random + " " + crypto.hex(session.clientSecret) + "\nSERVER_HANDSHAKE_TRAFFIC_SECRET " + random + " " + crypto.hex(session.serverSecret) + "\nCLIENT_TRAFFIC_SECRET_0 " + random + " " + crypto.hex(session.clientApplication) + "\nSERVER_TRAFFIC_SECRET_0 " + random + " " + crypto.hex(session.serverApplication) + "\n")
+    peer.logged = true
+}
+function ended(request: Bytes): Boolean { return request.length >= 2 && request[request.length - 2] == 13 && request[request.length - 1] == 10 }
+function requested(request: Bytes): Text {
+    let text = Text(request)
+    if request.length > 4096 || crypto.hex(request.slice(0, 5)) != "474554202f" || !ended(request) { return "" }
+    let name = text.slice(5, text.length - 2)
+    if name.length < 1 || name.length > 255 { return "" }
+    for character in name { if !(character >= 'a' && character <= 'z') && !(character >= 'A' && character <= 'Z') && !(character >= '0' && character <= '9') && character != '-' && character != '_' { return "" } }
+    return name
+}
+function main(): Integer {
+    let key = readBytesFile(argument(0)); let root = readBytesFile(argument(1)); let keyLog = argument(2); let directory = argument(3)
+    let identity: List<Bytes> = []; for index in 5..argumentCount() { identity.add(readBytesFile(argument(index))) }
+    let socket = net.udp("0.0.0.0", 443); if socket < 0 { print("QNS bind failed"); return 1 }
+    let eventLoop = errors.integerValue(loop.create()); loop.watch(eventLoop, socket, loop.readableInterest(), 0)
+    let store = tickets.store(randomBytes(16), 3600)
+    if argument(4) == "zerortt" { tickets.allowEarlyData(store, 0xffffffff) }
+    let peers: List<Peer> = []; let started = net.monotonicMilliseconds(); let now = 0
+    print("QNS server ready")
+    while now < 90000 {
+        now = net.monotonicMilliseconds() - started; let timeout = 1000; let active: List<Peer> = []
+        for peer in peers {
+            let connection = peer.connection
+            if connection.state == quic.ESTABLISHED || connection.serverTLS.earlyAccepted {
+                for stream in connection.streams {
+                    let index = -1; for at in 0..peer.transfers.length { if peer.transfers[at].id == stream.id { index = at } }
+                    if index < 0 {
+                        if peer.transfers.length >= 128 { return 2 }
+                        peer.transfers.add(Transfer { id: stream.id; request: Bytes(); handle: -1; size: 0; sent: 0; pending: Bytes(); done: false }); index = peer.transfers.length - 1
+                    }
+                    let transfer = peer.transfers[index]
+                    if !transfer.done {
+                        if transfer.handle < 0 {
+                            let read = quic.readStream(connection, stream.id)
+                            if errors.bytesOk(read) { transfer.request.addBytes(errors.bytesValue(read)) }
+                            if transfer.request.length > 4096 { print("invalid request"); return 3 }
+                            if ended(transfer.request) {
+                                let name = requested(transfer.request)
+                                if name == "" { print("invalid path"); return 4 }
+                                transfer.handle = file.openRead(directory + "/" + name); transfer.size = file.size(transfer.handle)
+                                if transfer.handle < 0 || transfer.size < 0 || transfer.size > 67108864 { print("file unavailable"); return 5 }
+                            }
+                        }
+                        if transfer.handle > 0 && connection.state == quic.ESTABLISHED {
+                            if transfer.pending.length == 0 && transfer.sent < transfer.size { transfer.pending = file.read(transfer.handle, min(16384, transfer.size - transfer.sent)) }
+                            if transfer.pending.length == 0 && transfer.sent < transfer.size { return 6 }
+                            let final = transfer.sent + transfer.pending.length == transfer.size
+                            let written = quic.writeStream(connection, stream.id, transfer.pending, final)
+                            if errors.integerOk(written) {
+                                transfer.sent += transfer.pending.length; transfer.pending = Bytes()
+                                if final { transfer.done = true; file.close(transfer.handle) }
+                            }
+                        }
+                    }
+                }
+            }
+            for packet in quic.pollDatagrams(connection, now) {
+                if packet.pathId < peer.addresses.length { net.sendDatagramTo(socket, peer.addresses[packet.pathId], peer.ports[packet.pathId], packet.data) }
+            }
+            if connection.state == quic.FAILED { print("FAILED " + connection.error) }
+            if (connection.state != quic.FAILED && connection.state != quic.CLOSED) || connection.closing || connection.draining { timeout = min(timeout, max(0, quic.nextTimer(connection) - now)); active.add(peer) }
+            else { for transfer in peer.transfers { if transfer.handle > 0 && !transfer.done { file.close(transfer.handle) } } }
+        }
+        peers = active
+        let batch = loop.wait(eventLoop, timeout, 64); if errors.isError(loop.batchError(batch)) { return 7 }
+        now = net.monotonicMilliseconds() - started
+        for event in loop.events(batch) {
+            let packets = net.receiveDatagrams(socket, 64, 65535)
+            if net.datagramBatchOk(packets) { for packet in net.datagrams(packets) {
+                let data = net.datagramData(packet)
+                if errors.bytesOk(data) {
+                    let bytes = errors.bytesValue(data); let header = wire.header(bytes, 0, 8); let index = -1
+                    if !header.valid {
+                        let response = wire.negotiateVersion(bytes)
+                        if errors.bytesOk(response) { net.sendDatagramTo(socket, net.datagramSource(packet), net.datagramPort(packet), errors.bytesValue(response)) }
+                    }
+                    if header.valid {
+                        for at in 0..peers.length { if crypto.hex(header.destination) == crypto.hex(peers[at].connection.local) || crypto.hex(header.destination) == crypto.hex(peers[at].connection.originalDestination) { index = at } }
+                        if index < 0 && header.kind == wire.INITIAL && bytes.length >= 1200 && peers.length < 64 {
+                            let connection = quic.serverWithTickets(randomBytes(80), "hq-interop", header.destination, identity, key, [root], false, store)
+                            peers.add(Peer { connection: connection; addresses: [net.datagramSource(packet)]; ports: [net.datagramPort(packet)]; transfers: []; logged: false }); index = peers.length - 1
+                        }
+                        if index >= 0 {
+                            let peer = peers[index]; let route = -1
+                            for at in 0..peer.addresses.length { if peer.addresses[at] == net.datagramSource(packet) && peer.ports[at] == net.datagramPort(packet) { route = at } }
+                            if route < 0 && peer.addresses.length < 8 { peer.addresses.add(net.datagramSource(packet)); peer.ports.add(net.datagramPort(packet)); route = peer.addresses.length - 1 }
+                            if route >= 0 { quic.receivePath(peer.connection, bytes, route, now); logKeys(peer, keyLog) }
+                        }
+                    }
+                }
+            } }
+        }
+    }
+    return 0
+}

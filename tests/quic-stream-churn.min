@@ -1,0 +1,43 @@
+use "quic" as quic
+use "errors" as errors
+use "crypto" as crypto
+use "quiccrypto" as protection
+use "quicwire" as wire
+function transfer(c: quic.Connection,s: quic.Connection,now: Integer) {
+    for packet in quic.poll(c,now) { quic.receive(s,packet,now) }
+    for packet in quic.poll(s,now) { quic.receive(c,packet,now) }
+}
+function main(): Integer {
+    let root=readBytesFile(argument(0));let cert=readBytesFile(argument(1));let key=readBytesFile(argument(2));let client=readBytesFile(argument(3));let clientKey=readBytesFile(argument(4))
+    let c=quic.client("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey)
+    let s=quic.server(randomBytes(80),"minyar-test",c.originalDestination,[cert],key,[root],true);let now=0
+    while now<10000 && (c.state != quic.ESTABLISHED || s.state != quic.ESTABLISHED) { transfer(c,s,now);now+=10 }
+    if c.state != quic.ESTABLISHED || s.state != quic.ESTABLISHED { return 1 }
+    for cycle in 0..2000 {
+        let opened=quic.openStream(c,(cycle&1)==0)
+        if !errors.integerOk(opened) { print("stream churn stalled at " + Text(cycle));return 2 }
+        let id=errors.integerValue(opened)
+        if !errors.integerOk(quic.writeStream(c,id,Bytes("x"),true)) { return 3 }
+        let received=false;let echoed=false;let ended=false;let serverEnded=false
+        for round in 0..100 {
+            transfer(c,s,now);now+=1
+            let read=quic.readStream(s,id)
+            if errors.bytesStatus(read)==errors.successStatus() { if crypto.hex(errors.bytesValue(read)) != "78" { print("bad read " + Text(cycle) + " " + Text(id) + " " + crypto.hex(errors.bytesValue(read)));return 4 };received=true }
+            else if errors.bytesStatus(read)==errors.endOfStreamStatus() { serverEnded=true }
+            if received && !echoed {
+                if (cycle&1)!=0 { if !errors.integerOk(quic.writeStream(s,id,Bytes("x"),true)) { return 5 } }
+                echoed=true
+            }
+            if (cycle&1)!=0 {
+                let reply=quic.readStream(c,id)
+                if errors.bytesStatus(reply)==errors.successStatus() { if crypto.hex(errors.bytesValue(reply)) != "78" { return 6 } }
+                else if errors.bytesStatus(reply)==errors.endOfStreamStatus() { ended=true }
+            } else { ended=true }
+        }
+        if !received || !ended || !serverEnded { return 7 }
+        if c.streams.length>2 || s.streams.length>2 || c.closedStreams.length>8 || s.closedStreams.length>8 { return 8 }
+        if c.state != quic.ESTABLISHED || s.state != quic.ESTABLISHED { print(c.error);print(s.error);return 9 }
+    }
+    print("QUIC churn: 2000 mixed-direction streams reclaimed, cumulative credit replenished, closed IDs retained as bounded ranges")
+    return 0
+}

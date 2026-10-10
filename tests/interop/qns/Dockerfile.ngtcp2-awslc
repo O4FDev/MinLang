@@ -1,0 +1,26 @@
+# Independent test peer only. Same ngtcp2 source as the official failing image,
+# using ngtcp2's documented AWS-LC/BoringSSL adapter. Nothing links into Minyar.
+FROM ubuntu:24.04 AS build
+ARG NGTCP2_REV=b9fc4d55ce6035a4cc76dc456ced6371e98f9214
+ARG NGHTTP3_REV=d29ceea176cebc1f41c9d818c3b1825143d3f813
+ARG AWSLC_REV=f6acf748df0ea6157d55e640730b38d21a7751cd
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates clang-19 libstdc++-14-dev cmake ninja-build make autoconf automake autotools-dev libtool pkg-config libev-dev python3 && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+RUN git init aws-lc && cd aws-lc && git remote add origin https://github.com/aws/aws-lc.git && git fetch --depth 1 origin ${AWSLC_REV} && git checkout --detach FETCH_HEAD && cmake -B build -GNinja -DDISABLE_GO=ON -DBUILD_TESTING=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 && cmake --build build --target ssl crypto -j 3
+RUN git init nghttp3 && cd nghttp3 && git remote add origin https://github.com/ngtcp2/nghttp3.git && git fetch --depth 1 origin ${NGHTTP3_REV} && git checkout --detach FETCH_HEAD && git submodule update --init --depth 1 && autoreconf -i && ./configure --enable-lib-only --disable-dependency-tracking CC=clang-19 CXX=clang++-19 && make -j 3 && make install
+RUN git init ngtcp2 && cd ngtcp2 && git remote add origin https://github.com/ngtcp2/ngtcp2.git && git fetch --depth 1 origin ${NGTCP2_REV} && git checkout --detach FETCH_HEAD && git submodule update --init --depth 1 && autoreconf -i && ./configure --with-boringssl --disable-dependency-tracking CC=clang-19 CXX=clang++-19 BORINGSSL_CFLAGS="-I/src/aws-lc/include" BORINGSSL_LIBS="-L/src/aws-lc/build/ssl -lssl -L/src/aws-lc/build/crypto -lcrypto" PKG_CONFIG_PATH=/usr/local/lib/pkgconfig LDFLAGS="-static-libstdc++ -static-libgcc" LIBTOOL_LDFLAGS="-static-libtool-libs" && make -j 3
+COPY ngtcp2-hq-build.py /src/ngtcp2-hq-build.py
+RUN python3 /src/ngtcp2-hq-build.py && cd ngtcp2 && autoreconf -i && ./config.status --recheck && ./config.status && make -C examples -j 3 bsslhqclient bsslhqserver
+FROM ubuntu:24.04
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libev4 ca-certificates netcat-openbsd bash && rm -rf /var/lib/apt/lists/* && mkdir -p /logs/qlog /downloads && chown -R 65534:65534 /logs /downloads
+COPY --from=build /src/ngtcp2/examples/bsslclient /usr/local/bin/wsslclient
+COPY --from=build /src/ngtcp2/examples/bsslserver /usr/local/bin/wsslserver
+COPY --from=build /src/ngtcp2/examples/bsslhqclient /usr/local/bin/wsslhqclient
+COPY --from=build /src/ngtcp2/examples/bsslhqserver /usr/local/bin/wsslhqserver
+COPY --from=build /src/ngtcp2/interop/run_endpoint.sh /run_endpoint.sh
+COPY peer-entrypoint.sh /minyar-peer-entrypoint.sh
+COPY setup-noop.sh /setup.sh
+COPY --from=martenseemann/quic-network-simulator-endpoint:latest /wait-for-it.sh /wait-for-it.sh
+RUN chmod 755 /run_endpoint.sh /minyar-peer-entrypoint.sh /setup.sh /wait-for-it.sh
+USER 65534:65534
+ENTRYPOINT ["/minyar-peer-entrypoint.sh"]

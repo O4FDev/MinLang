@@ -1,0 +1,43 @@
+use "quic" as quic
+use "errors" as errors
+record Delivery { packet: Bytes; due: Integer }
+function main(): Integer {
+    let root=readBytesFile(argument(0)); let server=readBytesFile(argument(1)); let key=readBytesFile(argument(2)); let identity=readBytesFile(argument(3)); let clientKey=readBytesFile(argument(4))
+    let c=quic.client("localhost",randomBytes(80),"minyar-test",[root],[identity],clientKey)
+    let s=quic.server(randomBytes(80),"minyar-test",c.originalDestination,[server],key,[root],true)
+    let now=0
+    while now<10000 && (c.state != quic.ESTABLISHED || s.state != quic.ESTABLISHED) {
+        for packet in quic.poll(c,now) { quic.receive(s,packet,now) }
+        for packet in quic.poll(s,now) { quic.receive(c,packet,now) }; now += 1
+    }
+    if c.state != quic.ESTABLISHED || s.state != quic.ESTABLISHED { return 1 }
+    let burstId=errors.integerValue(quic.openStream(c,false))
+    if !errors.integerOk(quic.writeStream(c,burstId,Bytes(16000),true)) { return 6 }
+    let burst=quic.poll(c,now)
+    if burst.length>3 { print("confirmed sender emitted an unpaced burst"); return 7 }
+    for packet in burst { quic.receive(s,packet,now) }
+    let id=errors.integerValue(quic.openStream(s,false)); let target=8*1024*1024; let sent=0; let received=0; let drops=0; let blocked=0; let serial=0
+    let link: List<Delivery> = []
+    while now<180000 && received<target {
+        let chunk=Bytes(min(16384,target-sent)); let written=quic.writeStream(s,id,chunk,sent+chunk.length == target)
+        if sent<target && errors.integerOk(written) { sent += chunk.length }
+        else if sent<target { blocked += 1; if errors.code(errors.integerError(written)) != errors.wouldBlockCode() { return 2 } }
+        for packet in quic.poll(s,now) {
+            serial += 1
+            if link.length<25 && serial%47 != 0 { link.add(Delivery { packet:packet; due:now+15 }) } else { drops += 1 }
+        }
+        let pending: List<Delivery> = []; let delivered=false
+        for packet in link {
+            if !delivered && packet.due <= now { quic.receive(c,packet.packet,now); delivered=true }
+            else { pending.add(packet) }
+        }; link=pending
+        for packet in quic.poll(c,now) { quic.receive(s,packet,now) }
+        let input=quic.readStream(c,id)
+        if errors.bytesOk(input) { received += errors.bytesValue(input).length }
+        if c.state == quic.FAILED || s.state == quic.FAILED { print(c.error); print(s.error); return 3 }
+        if s.pending.length>4096 { return 4 }; now += 1
+    }
+    if received != target || drops<1 || blocked<1 { print(Text(received)+" drops "+Text(drops)+" blocked "+Text(blocked)); return 5 }
+    print("QUIC recovery: 8 MiB over a 25-packet delayed/lossy link, bounded backpressure and retransmission passed")
+    return 0
+}

@@ -108,6 +108,8 @@ authorityKeyIdentifier=keyid,issuer
             start, end = now - timedelta(days=2), now - timedelta(days=1)
         if validity == 'future':
             start, end = now + timedelta(days=1), now + timedelta(days=2)
+        if isinstance(validity, tuple):
+            start, end = validity
         openssl('ca', '-batch', '-notext', '-config', config, '-startdate', start.strftime('%y%m%d%H%M%SZ'),
                 '-enddate', end.strftime('%y%m%d%H%M%SZ'), '-in', self.path(name, 'csr'), '-out', self.path(name, 'pem'))
         self.der(name)

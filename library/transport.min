@@ -1,0 +1,236 @@
+// QUIC-first transport with authenticated TLS/yamux TCP fallback. The caller
+// owns sockets; TCP_NEEDED requests a new TCP connection and startTCP().
+// A switch retires stream handles. Arbitrary application data is never replayed.
+use "quic" as quic
+use "tls" as tls
+use "tlsserver" as tlsserver
+use "yamux" as yamux
+use "errors" as errors
+public constant QUIC_TRYING = 0
+public constant QUIC_READY = 1
+public constant TCP_NEEDED = 2
+public constant TLS_HANDSHAKE = 3
+public constant TCP_READY = 4
+public constant CLOSED = 5
+public constant FAILED = 6
+public record Connection {
+    state: Integer; error: Text; code: Integer; closing: Boolean; generation: Integer; clientRole: Boolean
+    udp: quic.Connection; clientTLS: tls.Session; serverTLS: tlsserver.Session; mux: yamux.Session
+    host: Text; protocol: Text; roots: List<Bytes>; identity: List<Bytes>; key: Bytes
+    now: Integer; started: Integer; lastProbe: Integer; initialTimeout: Integer; probeInterval: Integer; outageTimeout: Integer
+}
+function configured(udp: quic.Connection, client: Boolean, host: Text, protocol: Text, roots: List<Bytes>, identity: List<Bytes>, key: Bytes): Connection {
+    return Connection { state: QUIC_TRYING; error: ""; code: 0; closing: false; generation: 0; clientRole: client
+        udp: udp; clientTLS: tls.none(); serverTLS: tlsserver.none(); mux: yamux.create(client)
+        host: host; protocol: protocol; roots: roots; identity: identity; key: key
+        now: -1; started: -1; lastProbe: -1; initialTimeout: 3000; probeInterval: 15000; outageTimeout: 45000 }
+}
+public function client(host: Text, entropy: Bytes, protocol: Text, roots: List<Bytes>, identity: List<Bytes>, key: Bytes): Connection {
+    return configured(quic.client(host, entropy, protocol, roots, identity, key), true, host, protocol, roots, identity, key)
+}
+public function serverQUIC(entropy: Bytes, protocol: Text, original: Bytes, identity: List<Bytes>, key: Bytes, roots: List<Bytes>, requireClient: Boolean): Connection {
+    return configured(quic.server(entropy, protocol, original, identity, key, roots, requireClient), false, "", protocol, roots, identity, key)
+}
+public function serverTCP(entropy: Bytes, protocol: Text, identity: List<Bytes>, key: Bytes, roots: List<Bytes>, requireClient: Boolean, now: Integer): Connection {
+    let connection = configured(quic.server(randomBytes(80), protocol, randomBytes(8), identity, key, roots, requireClient), false, "", protocol, roots, identity, key)
+    connection.state = TLS_HANDSHAKE; connection.started = now; connection.now = now
+    connection.serverTLS = tlsserver.server(entropy, protocol + ".yamux/1", identity, key, roots, requireClient)
+    return connection
+}
+public function timeouts(connection: Connection, initial: Integer, probe: Integer, outage: Integer): errors.BooleanResult {
+    if initial < 1 || initial > 60000 || probe < 1 || outage <= probe || outage > 3600000 {
+        return errors.booleanFailure(errors.make(errors.invalidDataCode(), 0, "invalid transport timeouts"))
+    }
+    connection.initialTimeout = initial; connection.probeInterval = probe; connection.outageTimeout = outage
+    return errors.boolean(true)
+}
+function failConnection(connection: Connection, code: Integer, error: Text) {
+    connection.state = FAILED; connection.code = code; connection.error = error
+    connection.mux = yamux.create(connection.clientRole); connection.key = Bytes(); connection.identity = []; connection.roots = []
+}
+function fallback(connection: Connection) {
+    if !connection.clientRole || (connection.state != QUIC_TRYING && connection.state != QUIC_READY) { return }
+    if connection.generation >= 0x1fffffff { failConnection(connection, errors.unavailableCode(), "transport generation exhausted"); return }
+    connection.generation += 1; connection.state = TCP_NEEDED; connection.started = connection.now
+    // Abandon all QUIC queues, keys and stream buffers by releasing the instance.
+    connection.udp = quic.client("retired.invalid", Bytes(), "retired", [], [], Bytes())
+}
+public function udpUnavailable(connection: Connection) { fallback(connection) }
+public function startTCP(connection: Connection, entropy: Bytes, now: Integer): errors.BooleanResult {
+    if connection.state != TCP_NEEDED || now < connection.now {
+        return errors.booleanFailure(errors.make(errors.unavailableCode(), 0, "transport is not awaiting a TCP connection"))
+    }
+    connection.now = now; connection.started = now; connection.state = TLS_HANDSHAKE
+    connection.clientTLS = tls.clientWithProtocol(connection.host, entropy, connection.protocol + ".yamux/1", connection.roots, connection.identity, connection.key)
+    connection.mux = yamux.create(true)
+    return errors.boolean(true)
+}
+function syncUDP(connection: Connection) {
+    if connection.udp.state == quic.ESTABLISHED { connection.state = QUIC_READY }
+    else if connection.udp.state == quic.FAILED {
+        // Authentication/protocol failures are surfaced, not masked by fallback.
+        if connection.udp.code != 0 { failConnection(connection, errors.protocolCode(), connection.udp.error) }
+        else if connection.clientRole { fallback(connection) }
+        else { failConnection(connection, errors.timedOutCode(), connection.udp.error) }
+    } else if connection.udp.state == quic.CLOSED { connection.state = CLOSED }
+}
+function syncTCP(connection: Connection) {
+    let input = Bytes(); let established = false
+    if connection.clientRole {
+        if connection.clientTLS.state == tls.FAILED { failConnection(connection, errors.certificateCode(), connection.clientTLS.error); return }
+        if connection.clientTLS.state == tls.CLOSED { connection.state = CLOSED; yamux.endInput(connection.mux); return }
+        established = connection.clientTLS.state == tls.ESTABLISHED
+        if established { input = tls.takeIncoming(connection.clientTLS) }
+    } else {
+        if connection.serverTLS.state == tlsserver.FAILED { failConnection(connection, errors.certificateCode(), connection.serverTLS.error); return }
+        if connection.serverTLS.state == tlsserver.CLOSED { connection.state = CLOSED; yamux.endInput(connection.mux); return }
+        established = connection.serverTLS.state == tlsserver.ESTABLISHED
+        if established { input = tlsserver.takeIncoming(connection.serverTLS) }
+    }
+    if established { connection.state = TCP_READY; yamux.receive(connection.mux, input) }
+    if connection.mux.state == yamux.FAILED { failConnection(connection, errors.protocolCode(), connection.mux.error) }
+}
+public function tick(connection: Connection, now: Integer) {
+    if now < 0 || now < connection.now || connection.state == FAILED || connection.state == CLOSED { return }
+    if connection.started < 0 { connection.started = now; connection.lastProbe = now }
+    connection.now = now
+    if connection.state == QUIC_TRYING || connection.state == QUIC_READY {
+        syncUDP(connection)
+        if !connection.clientRole { return }
+        if connection.state == QUIC_TRYING && now - connection.started >= connection.initialTimeout { fallback(connection) }
+        if connection.state == QUIC_READY {
+            if now - connection.udp.lastActivity >= connection.outageTimeout { fallback(connection) }
+            else if now - max(connection.lastProbe, connection.udp.lastActivity) >= connection.probeInterval {
+                quic.ping(connection.udp); connection.lastProbe = now
+            }
+        }
+    } else if connection.state == TLS_HANDSHAKE && now - connection.started >= connection.initialTimeout {
+        failConnection(connection, errors.timedOutCode(), "TCP TLS handshake timed out")
+    }
+}
+public function receiveUDP(connection: Connection, packet: Bytes, pathId: Integer, now: Integer) {
+    if (connection.state == CLOSED || connection.state == FAILED) && (connection.udp.closing || connection.udp.draining) { quic.receivePath(connection.udp,packet,pathId,now); return }
+    if (connection.state != QUIC_TRYING && connection.state != QUIC_READY) || now < 0 || now < connection.now { return }
+    if connection.started < 0 { connection.started = now; connection.lastProbe = now }
+    connection.now = now; quic.receivePath(connection.udp, packet, pathId, now); syncUDP(connection)
+}
+public function pollUDP(connection: Connection, now: Integer): List<quic.Datagram> {
+    if (connection.state == CLOSED || connection.state == FAILED) && (connection.udp.closing || connection.udp.draining) { return quic.pollDatagrams(connection.udp,now) }
+    tick(connection, now)
+    if connection.state != QUIC_TRYING && connection.state != QUIC_READY { let empty: List<quic.Datagram> = []; return empty }
+    let packets = quic.pollDatagrams(connection.udp, now); syncUDP(connection); return packets
+}
+public function receiveTCP(connection: Connection, data: Bytes, now: Integer) {
+    if (connection.state != TLS_HANDSHAKE && connection.state != TCP_READY) || now < connection.now { return }
+    connection.now = now
+    if connection.clientRole { tls.receive(connection.clientTLS, data) } else { tlsserver.receive(connection.serverTLS, data) }
+    syncTCP(connection)
+}
+public function pollTCP(connection: Connection, now: Integer): Bytes {
+    if connection.closing && connection.state == TCP_READY {
+        let final = Bytes()
+        if connection.clientRole { final = tls.takeOutgoing(connection.clientTLS) } else { final = tlsserver.takeOutgoing(connection.serverTLS) }
+        connection.state = CLOSED; connection.closing = false
+        return final
+    }
+    tick(connection, now)
+    if connection.state != TLS_HANDSHAKE && connection.state != TCP_READY { return Bytes() }
+    syncTCP(connection)
+    if connection.state == TCP_READY {
+        let application = yamux.takeOutgoing(connection.mux)
+        if application.length > 0 {
+            if connection.clientRole { tls.send(connection.clientTLS, application) } else { tlsserver.send(connection.serverTLS, application) }
+        }
+    }
+    if connection.clientRole { return tls.takeOutgoing(connection.clientTLS) }
+    return tlsserver.takeOutgoing(connection.serverTLS)
+}
+public function endTCPInput(connection: Connection) {
+    if connection.clientRole { tls.endInput(connection.clientTLS) } else { tlsserver.endInput(connection.serverTLS) }; syncTCP(connection)
+}
+public function nextTimer(connection: Connection): Integer {
+    if (connection.state == CLOSED || connection.state == FAILED) && (connection.udp.closing || connection.udp.draining) { return quic.nextTimer(connection.udp) }
+    if connection.started < 0 { return 0 }
+    if connection.state == QUIC_TRYING { return min(quic.nextTimer(connection.udp), connection.started + connection.initialTimeout) }
+    if connection.state == QUIC_READY {
+        if !connection.clientRole { return quic.nextTimer(connection.udp) }
+        return min(quic.nextTimer(connection.udp), max(connection.lastProbe, connection.udp.lastActivity) + connection.probeInterval)
+    }
+    if connection.state == TLS_HANDSHAKE { return connection.started + connection.initialTimeout }
+    return -1
+}
+public function retryRequiredCode(): Integer { return 1002 }
+// This getter deliberately rejects the handshake and reconnecting states.
+// Cached identities on resumed sessions have been revalidated by TLS before
+// ESTABLISHED; unauthenticated Certificate messages are never exposed here.
+public function peerCertificate(connection: Connection): errors.BytesResult {
+    let leaf = Bytes(); let chain = Bytes(); let authenticated = false
+    if connection.state == QUIC_READY {
+        if connection.clientRole {
+            authenticated = connection.udp.clientTLS.authenticated
+            leaf = connection.udp.clientTLS.certificate
+            chain = connection.udp.clientTLS.verifiedChain
+        } else { authenticated = connection.udp.serverTLS.authenticated; leaf = connection.udp.serverTLS.peerCertificate }
+    } else if connection.state == TCP_READY {
+        if connection.clientRole {
+            authenticated = connection.clientTLS.authenticated; leaf = connection.clientTLS.certificate
+            chain = connection.clientTLS.verifiedChain
+        } else { authenticated = connection.serverTLS.authenticated; leaf = connection.serverTLS.peerCertificate }
+    } else {
+        if connection.state == FAILED { return errors.bytesFailure(errors.make(connection.code, 0, connection.error)) }
+        return errors.bytesFailure(errors.make(errors.wouldBlockCode(), 0, "transport authentication incomplete"))
+    }
+    if leaf.length == 0 && chain.length >= 5 {
+        let size = (chain[0] << 16) | (chain[1] << 8) | chain[2]
+        if size > 0 && size <= chain.length - 5 { leaf = chain.slice(3, 3 + size) }
+    }
+    if !authenticated || leaf.length == 0 {
+        return errors.bytesFailure(errors.make(errors.certificateCode(), 0, "peer has no authenticated certificate"))
+    }
+    return errors.bytes(leaf)
+}
+function stale(connection: Connection, handle: Integer): Boolean { return handle >= 0 && (handle >> 32) != connection.generation }
+function handle(connection: Connection, id: Integer): Integer { return (connection.generation << 32) | id }
+public function openStream(connection: Connection): errors.IntegerResult {
+    let result = errors.integerFailure(errors.make(errors.wouldBlockCode(), 0, "transport authentication incomplete"))
+    if connection.state == QUIC_READY { result = quic.openStream(connection.udp, false) }
+    if connection.state == TCP_READY { result = yamux.open(connection.mux) }
+    if !errors.integerOk(result) { return result }
+    let id = errors.integerValue(result)
+    if id > 0xffffffff { return errors.integerFailure(errors.make(errors.unavailableCode(), 0, "transport stream handle exhausted")) }
+    return errors.integer(handle(connection, id))
+}
+public function streamIds(connection: Connection): List<Integer> {
+    let ids: List<Integer> = []
+    if connection.state == QUIC_READY { for stream in connection.udp.streams { ids.add(handle(connection, stream.id)) } }
+    if connection.state == TCP_READY { for stream in connection.mux.streams { ids.add(handle(connection, stream.id)) } }
+    return ids
+}
+public function write(connection: Connection, id: Integer, data: Bytes, fin: Boolean): errors.IntegerResult {
+    if stale(connection, id) { return errors.integerFailure(errors.make(retryRequiredCode(), 0, "connection changed; explicit application retry required")) }
+    if id < 0 { return errors.integerFailure(errors.make(errors.invalidDataCode(), 0, "invalid transport stream handle")) }
+    if connection.state == QUIC_READY { return quic.writeStream(connection.udp, id & 0xffffffff, data, fin) }
+    if connection.state == TCP_READY { return yamux.write(connection.mux, id & 0xffffffff, data, fin) }
+    if connection.state == FAILED { return errors.integerFailure(errors.make(connection.code, 0, connection.error)) }
+    if connection.state == CLOSED { return errors.integerFailure(errors.make(errors.closedCode(), 0, "transport is closed")) }
+    return errors.integerFailure(errors.make(errors.wouldBlockCode(), 0, "transport is reconnecting"))
+}
+public function read(connection: Connection, id: Integer): errors.BytesResult {
+    if stale(connection, id) { return errors.bytesFailure(errors.make(retryRequiredCode(), 0, "connection changed; explicit application retry required")) }
+    if id < 0 { return errors.bytesFailure(errors.make(errors.invalidDataCode(), 0, "invalid transport stream handle")) }
+    if connection.state == QUIC_READY { return quic.readStream(connection.udp, id & 0xffffffff) }
+    if connection.state == TCP_READY { return yamux.read(connection.mux, id & 0xffffffff) }
+    if connection.state == FAILED { return errors.bytesFailure(errors.make(connection.code, 0, connection.error)) }
+    if connection.state == CLOSED { return errors.endOfStream() }
+    return errors.wouldBlock(0)
+}
+public function close(connection: Connection) {
+    if connection.state == QUIC_READY { quic.close(connection.udp, 0, Bytes("done")); connection.closing = true }
+    if connection.state == TCP_READY {
+        connection.closing = true
+        yamux.close(connection.mux)
+        let bytes = yamux.takeOutgoing(connection.mux)
+        if connection.clientRole { tls.send(connection.clientTLS, bytes); tls.close(connection.clientTLS) }
+        else { tlsserver.send(connection.serverTLS, bytes); tlsserver.close(connection.serverTLS) }
+    }
+}
