@@ -36,6 +36,8 @@ transport; it requires the caller to open the replacement socket.
   and preserved streams. Native socket/address mapping remains caller-owned.
 - Server anti-amplification before address validation, protocol and application
   connection-close frames, bounded packet/parser queues, and idle timers.
+- Client Retry processing and stateless server Retry tokens bound to the exact
+  peer address, connection IDs, version and a bounded validity interval.
 - TLS PSK-DHE resumption, authenticated encrypted tickets, current trust and
   certificate-expiry revalidation, and opt-in replay-safe QUIC 0-RTT.
 - A bounded yamux v0 multiplexer over authenticated TLS/TCP, automatic QUIC
@@ -72,6 +74,15 @@ its certificate chain, PKCS8 or supported opaque identity key, trust roots, and
 whether a client certificate is mandatory. `readStream` distinguishes data,
 EOF, would-block, and failure. `updateKeys` returns would-block until the
 handshake, current-phase ACK, and reordering conditions permit an update.
+
+`quicretry.store` takes a fresh random 16-byte server key and a token lifetime
+of at most two minutes. `reply` creates a Retry without allocating connection
+state; `validateInitial` authenticates a returned Initial token against exact
+address bytes and connection IDs. Only its private, validated result can be
+passed to `quic.serverAfterRetry`. Route that connection using
+`initialDestination`, because the original destination ID remains bound in
+transport parameters while Initial protection uses the Retry source ID.
+Rotate the token key before its bounded issuance budget is exhausted.
 
 The caller owns socket readiness, datagram source addresses, scheduling, and
 per-peer dispatch. Connection instances have one owner; sharing a mutable
@@ -123,8 +134,14 @@ caller to local sockets and exact peer addresses. `probePath` initiates client
 validation; a second unvalidated candidate is refused. Server-initiated active
 migration and preferred-address migration are not implemented. Version 2 crypto/parser vectors pass, while live constructors
 currently use version 1. The server can emit stateless version negotiation for
-unsupported versions. Client version negotiation and Retry transitions are not
-yet implemented. Resumption and opt-in 0-RTT are experimental and have independent
+unsupported versions. The v1-only client follows RFC 9000 section 6.2: it
+abandons an eligible version-negotiation response containing no v1, allowing
+TCP fallback, and ignores responses after Retry/authentication, with wrong
+connection IDs, or listing v1. Live v2 and compatible version negotiation are
+not implemented. Retry preserves packet numbers and the exact ClientHello,
+accepts only one correctly authenticated Retry, and verifies the server's
+authenticated Retry-source transport parameter. Resumption and opt-in 0-RTT
+are experimental and have independent
 peer tests, but their sustained fault-soak evidence is still outstanding.
 
 `resetStream` and `stopSending` cancel one stream direction without terminating
@@ -151,7 +168,17 @@ interval longer than three base PTOs, with an RTT sample predating those sends;
 an intervening ACK breaks the interval. Metadata shares the existing sent
 record, and acknowledged/lost records release their retained payloads. The
 RFC9002 example and its two false-positive adversaries pass sanitizers. CUBIC's
-epoch excludes application idle time. ECN and BBR remain outstanding.
+epoch excludes application idle time; a paced sending backlog is still active.
+RTT sampling uses the largest newly acknowledged packet's send time even when
+that packet was ACK-only, provided the ACK also acknowledges new eliciting
+data. ACK-only send timestamps are capped at 4096; an ACK older than retained
+metadata cannot contribute a sample. Duplicate ACKs do not sample again.
+ECN remains outstanding. BBR is exploratory: Google's BBRv3 and QUIC BBRv2
+implementations require delivery-rate and minimum-RTT models, app-limited
+sampling and probe states, rather than a different CUBIC window formula.
+The [IETF BBR draft](https://datatracker.ietf.org/doc/draft-ietf-ccwg-bbr/)
+targets Experimental status. BBR implementation and comparative remote loss,
+fairness and bottleneck tests remain future work; CUBIC is the current policy.
 Local close/error enters a three-PTO closing
 period; authenticated packets can trigger close responses with exponential
 backoff. A received close enters a three-PTO draining period, which sends no
@@ -187,6 +214,8 @@ python3 tests/quic-transport.py --server-protocol --sanitize
 python3 tests/quic-transport.py --quic-resumption --sanitize
 python3 tests/quic-transport.py --early --sanitize
 python3 tests/quic-transport.py --fallback --sanitize
+python3 tests/quic-transport.py --retry --sanitize
+python3 tests/quic-transport.py --rtt --sanitize
 python3 tests/tls-resumption-expiry.py --sanitize
 python3 tests/transport-go.py --sanitize
 python3 tests/quic-quinn.py

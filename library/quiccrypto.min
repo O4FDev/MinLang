@@ -203,6 +203,27 @@ public function unprotect(keys: Keys, packet: Bytes, offset: Integer, largest: I
     return Packet { valid: true; number: number; header: header; payload: errors.bytesValue(opened); error: errors.none() }
 }
 
+public function retryTag(version: Integer, header: Bytes, original: Bytes): Bytes {
+    if header.length < 7 || original.length > 20 { return Bytes() }
+    let key = crypto.fromHex("be0c690b9f66575a1d766b54e368c84e")
+    let nonce = crypto.fromHex("461599d35d632bf2239825bb")
+    if version == VERSION_2 { key = crypto.fromHex("8fb4b01b56ac48e260fbcbcead7ccc92"); nonce = crypto.fromHex("d86969bc2d7c6d9990efb04a") }
+    else if version != VERSION_1 { return Bytes() }
+    let aad = Bytes(); aad.add(original.length); aad.addBytes(original); aad.addBytes(header)
+    return aes.encrypt(key,nonce,aad,Bytes())
+}
+public function retryPacket(version: Integer, destination: Bytes, source: Bytes, token: Bytes, original: Bytes): errors.BytesResult {
+    if (version != VERSION_1 && version != VERSION_2) || destination.length > 20 || source.length < 1 || source.length > 20 || original.length < 1 || original.length > 20 || token.length < 1 || token.length > 1024 {
+        return errors.bytesFailure(errors.make(errors.invalidDataCode(),0,"invalid Retry fields"))
+    }
+    let result = Bytes(); let first = 0xf0
+    if version == VERSION_2 { first = 0xc0 }
+    result.add(first); for index in 0..4 { result.add((version >> ((3-index)*8)) & 255) }
+    result.add(destination.length); result.addBytes(destination); result.add(source.length); result.addBytes(source); result.addBytes(token)
+    let tag = retryTag(version,result,original)
+    if tag.length != 16 { return errors.bytesFailure(errors.make(errors.unavailableCode(),0,"Retry integrity provider failed")) }
+    result.addBytes(tag); return errors.bytes(result)
+}
 public function retryValid(version: Integer, packet: Bytes, original: Bytes): Boolean {
     if packet.length < 24 || packet.length > 65535 || original.length > 20 { return false }
     if (packet[0] & 192) != 192 { return false }
@@ -214,14 +235,7 @@ public function retryValid(version: Integer, packet: Bytes, original: Bytes): Bo
     if packet[5] > 20 || at >= packet.length - 16 { return false }
     let length = packet[at]
     if length > 20 || at + 1 + length >= packet.length - 16 { return false }
-    let key = crypto.fromHex("be0c690b9f66575a1d766b54e368c84e")
-    let nonce = crypto.fromHex("461599d35d632bf2239825bb")
-    if version == VERSION_2 {
-        key = crypto.fromHex("8fb4b01b56ac48e260fbcbcead7ccc92")
-        nonce = crypto.fromHex("d86969bc2d7c6d9990efb04a")
-    }
-    let aad = Bytes(); aad.add(original.length); aad.addBytes(original); aad.addBytes(packet.slice(0, packet.length - 16))
-    let tag = aes.encrypt(key, nonce, aad, Bytes())
+    let tag = retryTag(version,packet.slice(0,packet.length-16),original)
     if tag.length != 16 { return false }
     let different = 0
     for index in 0..16 { different = different | (tag[index] ^ packet[packet.length - 16 + index]) }

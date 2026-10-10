@@ -7,6 +7,13 @@ import argparse, json, os, platform, re, subprocess, sys, time
 from pathlib import Path
 
 def command(args, **kwargs):return subprocess.run(args,check=True,**kwargs)
+def runner_environment(temporary):
+    # Compose v2 validates mounts even for `down`. Upstream's per-case cleanup
+    # inherits no inline variables from the earlier `up` command; safe defaults
+    # let it actually remove the old simulator/network between test cases.
+    defaults={name:str(temporary) for name in ('CERTS','SERVER_WWW','CLIENT_WWW','SERVER_DOWNLOADS','CLIENT_DOWNLOADS','SERVER_LOGS','CLIENT_LOGS')}
+    defaults.update(SERVER='minyar-interop:development',CLIENT='minyar-interop:development',REQUESTS_SERVER='',REQUESTS_CLIENT='')
+    return dict(os.environ,**defaults,TMPDIR=str(temporary),PYTHONUNBUFFERED='1')
 def network_namespace(data):
     # Pin the namespace itself: Docker's PID can exit and be reused between
     # inspect and nsenter. Never configure the host namespace, even on a race.
@@ -69,7 +76,7 @@ def main():
     compose=runner/'docker-compose.yml'; original=compose.read_text(); original=original.replace('    cap_add:\n      - NET_ADMIN\n    ulimits:', '    ulimits:');compose.write_text(original)
     image_tags={'quiche':'minyar-quiche:lab','ngtcp2':os.environ.get('MINYAR_NGTCP2_IMAGE','minyar-ngtcp2:lab'),'msquic':'minyar-msquic:lab'}
     replacements=','.join(f'{name}={image}' for name,image in image_tags.items())
-    environment=dict(os.environ,TMPDIR=str(temporary),PYTHONUNBUFFERED='1')
+    environment=runner_environment(temporary)
     logs=artifacts/'runner.log'
     selected=','.join(sorted(set((options.servers+','+options.clients).split(','))))
     invocation=[sys.executable,str(runner/'run.py'),'-s',options.servers,'-c',options.clients,'-i',options.must_include,'-t',options.tests,'-r',replacements,'-j',str(artifacts/'matrix.json'),'-l',str(artifacts/'logs'),'-n',selected]

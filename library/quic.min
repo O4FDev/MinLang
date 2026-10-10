@@ -11,6 +11,7 @@ use "quicstream" as stream
 use "quicrecovery" as recovery
 use "errors" as errors
 use "tlstickets" as tickets
+use "quicretry" as retry
 
 public constant STARTING = 0
 public constant ESTABLISHED = 1
@@ -24,9 +25,11 @@ public record Path {
     deadline: Integer; attempts: Integer; received: Integer; sent: Integer
 }
 record ConnectionId { sequence: Integer; id: Bytes; token: Bytes }
+record SentTime { number: Integer; time: Integer }
 public record ClosedStreams { kind: Integer; first: Integer; last: Integer }
 record Space {
     read: protection.Keys; write: protection.Keys; next: Integer; largest: Integer; largestAck: Integer
+    ackTimes: List<SentTime>
     ranges: List<wire.Range>; ack: Boolean; sent: List<Sent>; active: Boolean; probe: Integer
     receivedCrypto: stream.Stream; sendCrypto: Integer
     nextRead: protection.Keys; previousRead: protection.Keys; previousUntil: Integer
@@ -37,6 +40,7 @@ record Space {
 public record Connection {
     state: Integer; error: Text; code: Integer; clientRole: Boolean; version: Integer
     originalDestination: Bytes; local: Bytes; remote: Bytes; peerSource: Bytes; peerKnown: Boolean
+    initialDestination: Bytes; initialHandshake: Bytes; retryAccepted: Boolean; retrySource: Bytes; retryToken: Bytes
     remoteIds: List<ConnectionId>; retirePrior: Integer
     clientTLS: tls.Session; serverTLS: tlsserver.Session; spaces: List<Space>; pending: List<Pending>
     streams: List<stream.Stream>; nextBidi: Integer; nextUni: Integer
@@ -79,6 +83,7 @@ function create(entropy: Bytes, original: Bytes, client: Boolean): Connection {
         if level == 0 { read = protection.initial(1, destination, client); write = protection.initial(1, destination, !client) }
         spaces.add(Space {
             read: read; write: write; next: 0; largest: -1; largestAck: -1; ranges: []; ack: false; sent: []; active: true; probe: -1
+            ackTimes: []
             receivedCrypto: stream.create(level, 1048576, 1048576); sendCrypto: 0
             nextRead: protection.traffic(1, 0, Bytes()); previousRead: protection.traffic(1, 0, Bytes()); previousUntil: -1
             readGeneration: 0; writeGeneration: 0; readFirst: 0; writeFirst: 0; writePackets: 0
@@ -91,6 +96,7 @@ function create(entropy: Bytes, original: Bytes, client: Boolean): Connection {
     let result = Connection {
         state: STARTING; error: ""; code: 0; clientRole: client; version: 1
         originalDestination: destination; local: local; remote: destination; peerSource: Bytes(); peerKnown: false
+        initialDestination: destination; initialHandshake: Bytes(); retryAccepted: false; retrySource: Bytes(); retryToken: Bytes()
         remoteIds: []; retirePrior: 0
         clientTLS: tls.none(); serverTLS: tlsserver.none(); spaces: spaces; pending: []; streams: []; nextBidi: role; nextUni: role + 2
         closedStreams: []; incomingBidi: 0; incomingUni: 0; receiveBidi: 16; receiveUni: 16
@@ -121,6 +127,16 @@ public function server(entropy: Bytes, protocol: Text, original: Bytes, identity
     connection.serverTLS = tlsserver.quicServer(entropy, protocol, parameters(connection.local, original, true), identity, key, roots, requireClient)
     synchronize(connection)
     return connection
+}
+public function serverAfterRetry(entropy: Bytes, protocol: Text, validated: retry.Opened, identity: List<Bytes>, key: Bytes, roots: List<Bytes>, requireClient: Boolean): Connection {
+    let connection = create(entropy,retry.source(validated),false)
+    if !retry.valid(validated) || retry.version(validated) != 1 { terminate(connection,11,"invalid validated Retry context"); return connection }
+    connection.originalDestination = retry.original(validated); connection.retrySource = retry.source(validated); connection.retryAccepted = true; connection.addressValidated = true
+    connection.paths[0].validated = true
+    let transport = parameters(connection.local,connection.originalDestination,true)
+    add(transport,16); add(transport,connection.retrySource.length); transport.addBytes(connection.retrySource)
+    connection.serverTLS = tlsserver.quicServer(entropy,protocol,transport,identity,key,roots,requireClient)
+    synchronize(connection); return connection
 }
 public function clientResumed(host: Text, entropy: Bytes, protocol: Text, roots: List<Bytes>, identity: List<Bytes>, key: Bytes, ticket: tickets.Client): Connection {
     let connection = create(entropy, Bytes(), true)
@@ -186,13 +202,19 @@ function enqueue(connection: Connection, level: Integer, payload: Bytes, probe: 
 }
 function enqueuePath(connection: Connection, level: Integer, payload: Bytes, probe: Boolean, path: Integer) {
     if connection.pending.length >= 4096 { terminate(connection, 1, "QUIC send queue exceeds bounded packet count"); return }
+    if connection.emptySince >= 0 && payload.length > 0 && payload[0] != 0 && payload[0] != 2 && payload[0] != 3 && payload[0] != 28 && payload[0] != 29 {
+        recovery.idle(connection.congestion,max(0,connection.now - connection.emptySince)); connection.emptySince = -1
+    }
     connection.pending.add(Pending { level: level; payload: payload; probe: probe; path: path })
 }
 function cryptoData(connection: Connection, level: Integer, data: Bytes) {
+    if connection.clientRole && level == 0 && data.length > 0 && connection.initialHandshake.length == 0 { connection.initialHandshake = data.slice(0,data.length) }
     let space = connection.spaces[level]
     let at = 0
     while at < data.length {
-        let count = min(1000, data.length - at)
+        let capacity = 1000
+        if level == 0 && connection.clientRole { capacity = min(capacity,1100 - connection.retryToken.length) }
+        let count = min(capacity, data.length - at)
         let frame = Bytes(); add(frame, 6); add(frame, space.sendCrypto); add(frame, count); frame.addBytes(data.slice(at, at + count))
         enqueue(connection, level, frame, false)
         space.sendCrypto += count; at += count
@@ -229,12 +251,16 @@ function peerParameters(connection: Connection, bytes: Bytes) {
     let parsed = wire.parameters(bytes, connection.clientRole)
     if !parsed.valid { terminate(connection, 8, errors.message(parsed.error)); return }
     let original = !connection.clientRole
-    let source = false
+    let source = false; let retryBound = !connection.retryAccepted
     for parameter in parsed.parameters {
         let id = parameter.id
         if id == 0 { original = equal(parameter.value, connection.originalDestination) }
         if id == 15 { source = equal(parameter.value, connection.peerSource) }
-        if id == 16 || id == 13 { terminate(connection, 8, "Retry/preferred address parameters are unsupported for this connection"); return }
+        if id == 16 {
+            if !connection.retryAccepted || !equal(parameter.value,connection.retrySource) { terminate(connection,8,"Retry source connection ID is not bound"); return }
+            retryBound = true
+        }
+        if id == 13 { terminate(connection,8,"preferred address migration is unsupported"); return }
         if id == 4 { connection.peerMaxData = parameter.integer }
         if id == 5 { connection.peerBidiLocal = parameter.integer }
         if id == 6 { connection.peerBidiRemote = parameter.integer }
@@ -246,7 +272,8 @@ function peerParameters(connection: Connection, bytes: Bytes) {
         if id == 1 && parameter.integer > 0 { connection.idleTimeout = min(connection.idleTimeout, parameter.integer) }
         if id == 12 { connection.peerDisabledMigration = true }
     }
-    if !original || !source { terminate(connection, 8, "transport parameters do not bind the observed connection IDs"); return }
+    if !connection.clientRole { retryBound = true }
+    if !original || !source || !retryBound { terminate(connection, 8, "transport parameters do not bind the observed connection IDs"); return }
     connection.parametersChecked = true
 }
 function synchronize(connection: Connection) {
@@ -324,6 +351,25 @@ function ackFrame(space: Space): Bytes {
 }
 function processAck(connection: Connection, space: Space, frame: wire.Frame) {
     if frame.value >= space.next { terminate(connection, 10, "peer acknowledged an unsent packet"); return }
+    let sampleAt = -1; let eliciting = false
+    for sent in space.sent {
+        for range in frame.ranges {
+            if sent.number >= range.first && sent.number <= range.last { eliciting = true; if sent.number == frame.value { sampleAt = sent.time } }
+        }
+    }
+    let retainedTimes: List<SentTime> = []
+    for time in space.ackTimes {
+        if time.number == frame.value { sampleAt = time.time }
+        if time.number > max(space.largestAck,frame.value) { retainedTimes.add(time) }
+    }
+    space.ackTimes = retainedTimes
+    // The largest newly ACKed packet can be ACK-only. RFC9002 still requires
+    // its send time when another newly ACKed packet was ack-eliciting.
+    if eliciting && sampleAt >= 0 && frame.value > space.largestAck {
+        let delay = 0
+        if frame.values.length > 0 { delay = min(frame.values[0], connection.congestion.maxAckDelay * 1000) * (1 << connection.ackExponent) / 1000 }
+        recovery.sample(connection.congestion,connection.now - sampleAt,delay,connection.confirmed)
+    }
     let remaining: List<Sent> = []
     for sent in space.sent {
         let acknowledged = false
@@ -341,18 +387,13 @@ function processAck(connection: Connection, space: Space, frame: wire.Frame) {
                 }
             }
             connection.flight = max(0, connection.flight - sent.bytes)
-            if sent.number == frame.value {
-                let delay = 0
-                if frame.values.length > 0 { delay = min(frame.values[0], connection.congestion.maxAckDelay * 1000) * (1 << connection.ackExponent) / 1000 }
-                recovery.sample(connection.congestion, connection.now - sent.time, delay, connection.confirmed)
-            }
             recovery.acknowledged(connection.congestion, sent.bytes, connection.now, sent.time)
             connection.congestion.probes = 0
             sent.status = 1; sent.payload = Bytes()
         } else { remaining.add(sent) }
     }
     space.sent = remaining; space.largestAck = max(space.largestAck, frame.value)
-    if connection.flight == 0 && connection.emptySince < 0 { connection.emptySince = connection.now }
+    if connection.flight == 0 && connection.pending.length == 0 && connection.emptySince < 0 { connection.emptySince = connection.now }
     space.probe = -1
     if remaining.length > 0 { space.probe = connection.now + recovery.pto(connection.congestion, connection.confirmed) }
 }
@@ -361,7 +402,7 @@ function discard(connection: Connection, level: Integer) {
     if !space.active { return }
     space.active = false; space.ack = false
     for sent in space.sent { connection.flight = max(0, connection.flight - sent.bytes); sent.status = 3; sent.payload = Bytes() }
-    space.sent = []; space.read = protection.traffic(1, 0, Bytes()); space.write = space.read
+    space.sent = []; space.ackTimes = []; space.read = protection.traffic(1, 0, Bytes()); space.write = space.read
 }
 function streamIndex(connection: Connection, id: Integer): Integer {
     for index in 0..connection.streams.length { if connection.streams[index].id == id { return index } }
@@ -569,6 +610,34 @@ function processFrame(connection: Connection, level: Integer, frame: wire.Frame)
     }
 }
 public function receive(connection: Connection, datagram: Bytes, now: Integer) { receivePath(connection, datagram, connection.activePath, now) }
+function retryClient(connection: Connection, packet: Bytes, header: wire.Header) {
+    if !connection.clientRole || connection.state != STARTING || connection.peerKnown || connection.retryAccepted || header.version != connection.version || header.token.length > 1024 ||
+       !equal(header.destination,connection.local) || equal(header.source,connection.originalDestination) || !protection.retryValid(connection.version,packet,connection.originalDestination) { return }
+    let retained: List<Pending> = []
+    for pending in connection.pending { if pending.level != 0 { retained.add(pending) } }
+    for sent in connection.spaces[2].sent { if sent.level == 3 { retained.add(Pending { level: 3; payload: sent.payload; probe: false; path: sent.path }); sent.status = 3; sent.payload = Bytes() } }
+    connection.spaces[2].sent = []; connection.spaces[2].probe = -1; connection.pending = retained
+    let space = connection.spaces[0]
+    for sent in space.sent { sent.status = 3; sent.payload = Bytes() }
+    space.sent = []; space.probe = -1; space.read = protection.initial(connection.version,header.source,true); space.write = protection.initial(connection.version,header.source,false)
+    space.sendCrypto = 0; space.writePackets = 0
+    connection.remote = header.source; connection.initialDestination = header.source; connection.retrySource = header.source; connection.retryToken = header.token; connection.retryAccepted = true
+    connection.congestion = recovery.create(1200); connection.flight = 0; connection.paceCredit = 12000.0; connection.paceAt = -1
+    connection.receivedBytes = 0; connection.sentBytes = 0; connection.lastActivity = connection.now
+    cryptoData(connection,0,connection.initialHandshake)
+}
+function negotiateClient(connection: Connection, header: wire.Header) {
+    if !connection.clientRole || connection.state != STARTING || connection.peerKnown || connection.retryAccepted || !equal(header.destination,connection.local) || !equal(header.source,connection.originalDestination) { return }
+    for at in 0..(header.token.length / 4) {
+        let version = 0; for index in 0..4 { version = (version << 8) | header.token[at*4+index] }
+        if version == connection.version { return }
+    }
+    // RFC9000 section6.2 v1-only policy: abandon rather than make an
+    // unauthenticated multi-version downgrade decision. Transport can retry TCP.
+    connection.state = FAILED; connection.code = 0; connection.error = "QUIC version negotiation has no supported version; explicit TCP retry required"
+    connection.pending = []; connection.history = []; connection.flight = 0
+    for space in connection.spaces { space.sent = []; space.ack = false }
+}
 public function receivePath(connection: Connection, datagram: Bytes, pathId: Integer, now: Integer) {
     if connection.draining || ((connection.state == FAILED || connection.state == CLOSED) && !connection.closing) || now < 0 || now < connection.now || datagram.length > 65535 || pathId < 0 { return }
     if connection.now < 0 { connection.lastActivity = now }
@@ -580,9 +649,10 @@ public function receivePath(connection: Connection, datagram: Bytes, pathId: Int
     while at < datagram.length && ((connection.state != FAILED && connection.state != CLOSED) || connection.closing) {
         let header = wire.header(datagram, at, connection.local.length)
         if !header.valid { return }
-        if header.kind == wire.VERSION_NEGOTIATION || header.kind == wire.RETRY { return }
+        if header.kind == wire.VERSION_NEGOTIATION { negotiateClient(connection,header); return }
+        if header.kind == wire.RETRY { retryClient(connection,datagram.slice(at,header.end),header); return }
         if header.kind != wire.ONE_RTT && header.version != connection.version { return }
-        if !equal(header.destination, connection.local) && !((header.kind == wire.INITIAL || header.kind == wire.ZERO_RTT) && !connection.clientRole && equal(header.destination, connection.originalDestination)) { return }
+        if !equal(header.destination, connection.local) && !((header.kind == wire.INITIAL || header.kind == wire.ZERO_RTT) && !connection.clientRole && equal(header.destination, connection.initialDestination)) { return }
         if !connection.clientRole && header.kind == wire.INITIAL && datagram.length < 1200 { return }
         let level = 2
         if header.kind == wire.INITIAL { level = 0 }
@@ -636,6 +706,7 @@ public function receivePath(connection: Connection, datagram: Bytes, pathId: Int
             if connection.peerKnown && !equal(header.source, connection.peerSource) { terminate(connection, 10, "peer changed initial source connection ID"); return }
             if !connection.peerKnown {
                 connection.peerKnown = true; connection.peerSource = header.source; connection.remote = header.source
+                connection.initialHandshake = Bytes()
                 connection.remoteIds.add(ConnectionId { sequence: 0; id: header.source; token: Bytes() })
             }
         }
@@ -687,7 +758,10 @@ function packetHeader(connection: Connection, level: Integer, length: Integer, n
         header.add(first)
         for index in 0..4 { header.add((connection.version >> ((3 - index) * 8)) & 255) }
         header.add(connection.remote.length); header.addBytes(connection.remote); header.add(connection.local.length); header.addBytes(connection.local)
-        if level == 0 { add(header, 0) }
+        if level == 0 {
+            if connection.clientRole { add(header,connection.retryToken.length); header.addBytes(connection.retryToken) }
+            else { add(header,0) }
+        }
         add(header, length + 20)
     }
     for index in 0..4 { header.add((number >> ((3 - index) * 8)) & 255) }
@@ -813,13 +887,22 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
             space.sent.add(sent); connection.history.add(sent)
             connection.flight += size
             if space.probe < 0 { space.probe = now + recovery.pto(connection.congestion, connection.confirmed) }
+        } else {
+            // ACK-only packets are not in flight and do not arm PTO. Bound
+            // timestamp retention; normal ACK progress releases this list.
+            if space.ackTimes.length >= 4096 {
+                let retained: List<SentTime> = []
+                for index in 1..space.ackTimes.length { retained.add(space.ackTimes[index]) }
+                space.ackTimes = retained
+            }
+            space.ackTimes.add(SentTime { number: space.next; time: now })
         }
         space.next += 1; if level == 3 { connection.earlyPackets += 1 } else { space.writePackets += 1 }
         for frame in parsed.frames { if level == 2 && (frame.type == 2 || frame.type == 3) && frame.value >= space.readFirst { space.readAcknowledged = true } }
         if connection.clientRole && level == 1 { discard(connection, 0) }
     }
     connection.pending = unsent
-    if connection.flight == 0 && connection.emptySince < 0 { connection.emptySince = now }
+    if connection.flight == 0 && connection.pending.length == 0 && connection.emptySince < 0 { connection.emptySince = now }
     return outgoing
 }
 function advanceWrite(connection: Connection, space: Space) {
@@ -1001,5 +1084,6 @@ public function release(connection: Connection): Boolean {
     connection.paths = []; connection.outgoingPaths = []; connection.earlyStreams = []
     connection.earlyWrite = protection.traffic(1,0,Bytes()); connection.earlyRead = protection.traffic(1,0,Bytes())
     connection.originalDestination = Bytes(); connection.local = Bytes(); connection.remote = Bytes(); connection.peerSource = Bytes()
+    connection.initialDestination = Bytes(); connection.initialHandshake = Bytes(); connection.retrySource = Bytes(); connection.retryToken = Bytes()
     return true
 }

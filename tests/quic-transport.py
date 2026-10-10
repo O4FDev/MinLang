@@ -15,7 +15,7 @@ fixtures = importlib.util.module_from_spec(spec); spec.loader.exec_module(fixtur
 def main():
     parser = argparse.ArgumentParser(); parser.add_argument('--sanitize', action='store_true')
     modes = parser.add_mutually_exclusive_group()
-    for mode in ('key-update','migration','server-protocol','resumption','quic-resumption','early','fallback','congestion','stream-control','stream-churn','closing','persistent'):
+    for mode in ('key-update','migration','server-protocol','resumption','quic-resumption','early','fallback','congestion','stream-control','stream-churn','closing','persistent','retry','rtt'):
         modes.add_argument('--'+mode,action='store_true')
     options = parser.parse_args()
     if options.sanitize:
@@ -34,6 +34,8 @@ def main():
         if options.stream_churn: name='tests/quic-stream-churn.min'
         if options.closing: name='tests/quic-closing.min'
         if options.persistent: name='tests/quic-persistent.min'
+        if options.retry: name='tests/quic-retry.min'
+        if options.rtt: name='tests/quic-rtt.min'
         binary = Path(directory) / 'transport.exe'; fixtures.compile_program(ROOT / name, binary)
         result = subprocess.run([str(binary), str(ca.path('root', 'der')), str(ca.path('server', 'der')), str(ca.path('server', 'pk8')),
                                  str(ca.path('client', 'der')), str(ca.path('client', 'pk8'))], capture_output=True, text=True, timeout=120)
