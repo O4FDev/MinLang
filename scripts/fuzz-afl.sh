@@ -9,6 +9,7 @@ findings=${MINYAR_AFL_FINDINGS:-$project_dir/build/afl-findings}
 target_dir=$project_dir/build/afl
 target=$target_dir/minyarc-afl
 candidate=$target_dir/candidate.ll
+sanitized_ir=$target_dir/compiler-sanitize.ll
 
 command -v "$afl_cc" >/dev/null 2>&1 || {
     echo "AFL++ compiler '$afl_cc' is required (set AFL_CC to override)." >&2
@@ -23,12 +24,18 @@ case "$seconds" in ''|*[!0-9]*) echo "MINYAR_AFL_SECONDS must be a positive inte
 
 mkdir -p "$target_dir" "$project_dir/build"
 make -s -C "$project_dir" LLVM_CC="${MINYAR_TEST_CLANG:-clang}" build/compiler-stage2.ll
+python3 "$project_dir/tests/llvm_sanitizer.py" \
+    "$project_dir/build/compiler-stage2.ll" "$sanitized_ir"
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) set -- ;;
+    *) set -- -lm ;;
+esac
 
 # AFL++'s LLVM mode instruments the already self-hosted compiler IR as well as
 # its arena runtime. Sanitizers make memory/undefined-behaviour findings fatal.
 AFL_QUIET=1 AFL_USE_ASAN=1 AFL_USE_UBSAN=1 "$afl_cc" \
     -O1 -g -Wno-override-module -DMINYAR_COMPILER_ARENA \
-    "$project_dir/build/compiler-stage2.ll" "$project_dir/runtime/minyar_runtime.c" \
+    "$sanitized_ir" "$project_dir/runtime/minyar_runtime.c" "$@" \
     -o "$target"
 
 if [ -d "$findings" ]; then
@@ -43,6 +50,12 @@ export ASAN_OPTIONS=abort_on_error=1:detect_leaks=0:symbolize=0
     -i "$project_dir/tests/fuzz-corpus/inputs" -o "$findings" \
     -- "$target" @@ "$candidate"
 
+stats=$findings/default/fuzzer_stats
+[ -s "$stats" ] || { echo "AFL++ campaign produced no fuzzer stats: $stats" >&2; exit 1; }
+executions=$(awk -F: '$1 ~ /^[[:space:]]*execs_done[[:space:]]*$/ { gsub(/[[:space:]]/, "", $2); print $2 }' "$stats")
+case "$executions" in ''|*[!0-9]*) echo "AFL++ stats have no valid execution count." >&2; exit 1 ;; esac
+[ "$executions" -gt 0 ] || { echo "AFL++ campaign completed with zero executions." >&2; exit 1; }
+
 failures=0
 for category in crashes hangs; do
     directory=$findings/default/$category
@@ -55,4 +68,4 @@ for category in crashes hangs; do
     done
 done
 [ "$failures" -eq 0 ] || exit 1
-echo "AFL++ coverage-guided campaign completed without crashes or hangs ($seconds seconds)."
+echo "AFL++ coverage-guided campaign completed without crashes or hangs ($seconds seconds; $executions executions)."

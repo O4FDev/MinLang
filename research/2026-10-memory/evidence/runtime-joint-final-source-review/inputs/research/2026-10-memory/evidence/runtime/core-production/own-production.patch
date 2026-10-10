@@ -1,0 +1,123 @@
+--- a/runtime/minyar_collections.h
++++ b/runtime/minyar_collections.h
+@@ -26,25 +26,29 @@
+ #endif
+ }
+ 
+-static MINYAR_COLD void list_grow(MinyarList *list) {
+-    if (list->capacity < 0)
++MINYAR_HOT long long list_next_capacity(long long current) {
++    if (current < 0)
+         minyar_stop("this List became too large.");
+ #if defined(MINYAR_BOUNDED_HEAP) && !defined(MINYAR_COMPILER_ARENA)
+     /* Leave room for RcData inside each power-of-two backing block. A capacity
+        of 2^n entries plus a header would waste almost half the finite pool. */
+     _Static_assert(sizeof(RcData) == sizeof(long long), "bounded List header layout");
+-    if (list->capacity > (LLONG_MAX - 1) / 2)
+-        minyar_stop("this List became too large.");
+-    long long capacity = list->capacity == 0 ? 3 : list->capacity * 2 + 1;
++    if (current > (LLONG_MAX - 1) / 2)
++        minyar_stop("this List became too large.");
++    long long capacity = current == 0 ? 3 : current * 2 + 1;
+ #else
+     /* Most Lists stay tiny, so they start small; large ones grow fast enough
+        that the copies made before they settle in the large-list arena stay
+        a fraction of their final size. */
+-    long long factor = list->capacity >= LARGE_LIST_CAPACITY ? 4 : 2;
+-    if (list->capacity > LLONG_MAX / factor)
+-        minyar_stop("this List became too large.");
+-    long long capacity = list->capacity == 0 ? 2 : list->capacity * factor;
+-#endif
++    long long factor = current >= LARGE_LIST_CAPACITY ? 4 : 2;
++    if (current > LLONG_MAX / factor)
++        minyar_stop("this List became too large.");
++    long long capacity = current == 0 ? 2 : current * factor;
++#endif
++    return capacity;
++}
++
++MINYAR_HOT void list_resize(MinyarList *list, long long capacity) {
+     long long *values;
+     if (capacity < list->capacity || (unsigned long long)capacity > SIZE_MAX / sizeof(*values))
+         minyar_stop("this List became too large.");
+@@ -66,6 +70,20 @@
+ #endif
+     list->values = values;
+     list->capacity = capacity;
++}
++
++/* Plan the existing geometric policy before touching storage. Known-length
++ * construction needs one reservation, without copying empty intermediate
++ * buffers or retaining them in a compiler arena. */
++static MINYAR_COLD void list_reserve(MinyarList *list, long long minimum) {
++    long long capacity = list->capacity;
++    while (capacity < minimum)
++        capacity = list_next_capacity(capacity);
++    list_resize(list, capacity);
++}
++
++static MINYAR_COLD void list_grow(MinyarList *list) {
++    list_resize(list, list_next_capacity(list->capacity));
+ }
+ 
+ #if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
+@@ -187,8 +205,15 @@
+         minyar_list_references(result);
+     if (list->length == LLONG_MAX)
+         minyar_stop("this List became too large.");
+-    while (result->capacity < list->length + 1)
+-        list_grow(result);
++#ifdef MINYAR_BOUNDED_RC
++    /* Intermediate growth services pending retirement. Keep that schedule
++     * under debt: its releases can admit a final buffer in a tight pool. */
++    if (rc_pending_count) {
++        while (result->capacity < list->length + 1)
++            list_grow(result);
++    } else
++#endif
++        list_reserve(result, list->length + 1);
+     for (long long position = 0; position < list->length; position++)
+         minyar_list_add(result, list->values[position]);
+     if (take_value)
+--- a/runtime/minyar_runtime.c
++++ b/runtime/minyar_runtime.c
+@@ -452,7 +452,11 @@
+     copy_bytes(bytes, left->bytes, (size_t)left->byte_length);
+     copy_bytes(bytes + left->byte_length, right->bytes, (size_t)right->byte_length);
+     bytes[length] = 0;
+-    return new_text(bytes, length, -1);
++    long long characters =
++        left->character_length == left->byte_length && right->character_length == right->byte_length
++            ? length
++            : -1;
++    return new_text(bytes, length, characters);
+ }
+ 
+ MinyarText *minyar_join_text(const MinyarText *left, const MinyarText *right) {
+@@ -504,8 +508,10 @@
+         rc_free_data(left->character_offsets);
+         left->bytes = bytes;
+         left->byte_length = length;
+-        if (left->character_length >= 0 && right->character_length >= 0)
+-            left->character_length += right->character_length;
++        /* With no index, a known count denotes ASCII. Unicode operands need
++         * a fresh lazy index after joining, even if their old counts are known. */
++        if (left->character_length == left_length && right->character_length == right_length)
++            left->character_length = length;
+         else
+             left->character_length = -1;
+         left->character_offsets = NULL;
+--- a/runtime/minyar_bounded_rc.h
++++ b/runtime/minyar_bounded_rc.h
+@@ -1,7 +1,8 @@
+ /* Finite-heap profile: no allocation in the pending queue:
+- * a dead object's header becomes a tagged FIFO link. Its payload is retained
+- * until a cursor has processed every field. Only zero-count objects enter the
+- * object queue; detached frames and temporary chunks have separate queues.
++ * a dead object's header becomes a tagged recent-stack or captured-batch link.
++ * Its payload is retained until a cursor has processed every field. Only
++ * zero-count objects enter the object queue; detached frames and temporary
++ * chunks have separate queues.
+  * A work unit visits one owner/field or retires one task (up to three frees).
+  * Pool frees have at most log2(heap/minimum-block) merge steps. System
+  * allocator calls have no runtime-imposed execution-time bound.

@@ -13,8 +13,9 @@ import sys
 import tempfile
 
 from regressions import CLANG, COMPILER, ROOT
+from clang_helpers import clang_command
 
-SOURCE = ROOT / 'src/compiler.min'
+SOURCE = ROOT / 'compiler/compiler.min'
 RUNTIME = ROOT / 'build/ownership-runtime.o'
 TARGETS = {
     'cycle': ('recursive-data.py',
@@ -44,8 +45,8 @@ def mutate(original: str, name: str) -> str:
         start = original.index('function parseListLiteral(')
         end = original.index('\nfunction parseAtom(', start)
         body = replace_once(original[start:end],
-            'addOutput(output, "  call void @minyar_list_add(ptr ")',
-            'addOutput(output, "  call void @minyar_list_add_take(ptr ")', name)
+            'output.add("  call void @minyar_list_add(ptr ")',
+            'output.add("  call void @minyar_list_add_take(ptr ")', name)
         # Borrowed elements now incorrectly transfer an owner they do not own.
         # The earlier projection loses its only actual owner at rc_step, so the
         # existing later-mutation test must detect a genuine dangling element.
@@ -71,9 +72,9 @@ def build(source: str, directory: Path, name: str) -> Path:
     result = run([str(COMPILER), str(path), str(llvm)])
     if result.returncode != 0 or not llvm.exists():
         raise AssertionError(f'{name}: mutant compiler did not compile:\n{result.stderr}')
-    result = run([CLANG, '-O1', '-DMINYAR_COMPILER_ARENA',
+    result = run(clang_command([CLANG, '-O1', '-DMINYAR_COMPILER_ARENA',
                   '-Wno-override-module', str(llvm),
-                  str(ROOT / 'runtime/minyar_runtime.c'), '-o', str(executable)])
+                  str(ROOT / 'runtime/minyar_runtime.c'), '-o', str(executable)]))
     if result.returncode != 0:
         raise AssertionError(f'{name}: mutant compiler did not link:\n{result.stderr}')
     return executable

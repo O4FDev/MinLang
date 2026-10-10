@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from clang_helpers import clang_command
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -33,7 +34,7 @@ def main():
                     if sanitize:
                         command += ['-fsanitize=address,undefined']
                     command += [str(ROOT / 'tests/integer-text-cache.c'), '-o', str(executable)]
-                    built = subprocess.run(command, capture_output=True, text=True, timeout=60)
+                    built = subprocess.run(clang_command(command), capture_output=True, text=True, timeout=60)
                     assert built.returncode == 0, (command, built.stderr)
                     result = subprocess.run([str(executable)], capture_output=True,
                                             text=True, env=env, timeout=30)
@@ -50,23 +51,23 @@ def main():
                 if sanitize:
                     command += ['-fsanitize=address,undefined']
                 command += [str(ROOT / 'tests/integer-text-cache.c'), '-o', str(executable)]
-                built = subprocess.run(command, capture_output=True, text=True, timeout=60)
+                built = subprocess.run(clang_command(command), capture_output=True, text=True, timeout=60)
                 assert built.returncode == 0, built.stderr
                 result = subprocess.run([str(executable)], capture_output=True,
                                         text=True, env=env, timeout=30)
                 assert result.returncode == 0, (command, result.stderr)
         print('Zero-cache conversion also passed with 4 KiB fixed and lazy pools.')
         for limit in (-1, 32769):
-            result = subprocess.run([args.clang, '-std=c11',
+            result = subprocess.run(clang_command([args.clang, '-std=c11',
                                      f'-DMINYAR_INTEGER_TEXT_CACHE_LIMIT={limit}', '-c',
                                      str(ROOT / 'runtime/minyar_runtime.c'),
-                                     '-o', str(directory / f'invalid-{limit}.o')],
+                                     '-o', str(directory / f'invalid-{limit}.o')]),
                                     capture_output=True, text=True, timeout=60)
             assert result.returncode != 0 and 'static assertion failed' in result.stderr
             assert 'Integer Text cache limit must be between' in result.stderr
         zero = directory / 'zero.o'
-        subprocess.run([args.clang, '-O2', '-DMINYAR_INTEGER_TEXT_CACHE_LIMIT=0', '-c',
-                        str(ROOT / 'runtime/minyar_runtime.c'), '-o', str(zero)],
+        subprocess.run(clang_command([args.clang, '-O2', '-DMINYAR_INTEGER_TEXT_CACHE_LIMIT=0', '-c',
+                        str(ROOT / 'runtime/minyar_runtime.c'), '-o', str(zero)]),
                        check=True, capture_output=True, timeout=60)
         symbols = subprocess.run(['nm', str(zero)], check=True, capture_output=True,
                                  text=True, timeout=30).stdout

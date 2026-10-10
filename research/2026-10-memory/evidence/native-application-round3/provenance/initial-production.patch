@@ -1,0 +1,1334 @@
+diff --git i/examples/craft/atmosphere.min w/examples/craft/atmosphere.min
+index 2ca06b8..baf68d8 100644
+--- i/examples/craft/atmosphere.min
++++ w/examples/craft/atmosphere.min
+@@ -10,6 +10,9 @@ constant TAU = 6.283185307179586
+ constant CLOUD_HEIGHT = 108.0
+ constant CLOUD_CELL = 12.0
+ constant CLOUD_SPEED = 1.2
++constant CLOUD_THICKNESS = 4.0
++// The cloud grid covers 60 by 60 cells, from 20 cells before the origin.
++constant CLOUD_CELLS = 60
+ 
+ // `time` runs from 0 to 1 over a day: 0 is sunrise, 0.25 noon, 0.5 sunset and
+ // 0.75 midnight.
+@@ -67,36 +70,37 @@ public function advance(sky: Sky, seconds: Float, speed: Float) {
+ }
+ 
+ // A square 400 blocks from the camera toward the unit direction (dx, dy, dz),
+-// drawn from both sides.
++// drawn from both sides, with its edges level with the horizon as seen from
++// the camera. `size` is half its width. Only the middle 12 pixels of the tile
++// are used, so edges never sample the neighbouring tile.
+ function body(vertices: Bytes, cx: Float, cy: Float, cz: Float, dx: Float, dy: Float, dz: Float, size: Float, tile: Integer) {
+-    // Right is perpendicular to the direction and the z axis; up completes the frame.
+-    let rightLength = sqrt(dy * dy + dx * dx)
+-    let rx = dy / rightLength
+-    let ry = -dx / rightLength
+-    let ux = -dz * ry * size
+-    let uy = dz * rx * size
+-    let uz = (dx * ry - dy * rx) * size
+-    rx *= size
+-    ry *= size
++    // Right is level and perpendicular to the direction; up completes the frame.
++    let rightLength = sqrt(dx * dx + dz * dz)
++    let rx = -dz / rightLength * size
++    let rz = dx / rightLength * size
++    let ux = -dy * dx / rightLength * size
++    let uy = rightLength * size
++    let uz = -dy * dz / rightLength * size
+     let x = cx + dx * 400.0
+     let y = cy + dy * 400.0
+     let z = cz + dz * 400.0
+-    let u0 = Float(tile % 16) / 16.0
+-    let v0 = Float(tile / 16) / 16.0
+-    let u1 = u0 + 0.0625
+-    let v1 = v0 + 0.0625
++    let margin = 2.0 / 256.0
++    let u0 = Float(tile % 16) / 16.0 + margin
++    let v0 = Float(tile / 16) / 16.0 + margin
++    let u1 = u0 + 0.0625 - 2.0 * margin
++    let v1 = v0 + 0.0625 - 2.0 * margin
+     let ax = x - rx - ux
+-    let ay = y - ry - uy
+-    let az = z - uz
++    let ay = y - uy
++    let az = z - rz - uz
+     let bx = x + rx - ux
+-    let by = y + ry - uy
+-    let bz = z - uz
++    let by = y - uy
++    let bz = z + rz - uz
+     let ex = x + rx + ux
+-    let ey = y + ry + uy
+-    let ez = z + uz
++    let ey = y + uy
++    let ez = z + rz + uz
+     let fx = x - rx + ux
+-    let fy = y - ry + uy
+-    let fz = z + uz
++    let fy = y + uy
++    let fz = z - rz + uz
+     graphics.addVertex(vertices, ax, ay, az, u0, v1, 1.0, 1.0, 1.0)
+     graphics.addVertex(vertices, bx, by, bz, u1, v1, 1.0, 1.0, 1.0)
+     graphics.addVertex(vertices, ex, ey, ez, u1, v0, 1.0, 1.0, 1.0)
+@@ -111,25 +115,63 @@ function body(vertices: Bytes, cx: Float, cy: Float, cz: Float, dx: Float, dy: F
+     graphics.addVertex(vertices, ex, ey, ez, u1, v0, 1.0, 1.0, 1.0)
+ }
+ 
+-function cloudQuad(vertices: Bytes, x: Float, z: Float, size: Float, shade: Float, u: Float, v: Float) {
+-    let x1 = x + size
+-    let z1 = z + size
+-    let y = CLOUD_HEIGHT
+-    graphics.addVertex(vertices, x, y, z, u, v, shade, shade, shade)
+-    graphics.addVertex(vertices, x, y, z1, u, v, shade, shade, shade)
+-    graphics.addVertex(vertices, x1, y, z1, u, v, shade, shade, shade)
+-    graphics.addVertex(vertices, x, y, z, u, v, shade, shade, shade)
+-    graphics.addVertex(vertices, x1, y, z1, u, v, shade, shade, shade)
+-    graphics.addVertex(vertices, x1, y, z, u, v, shade, shade, shade)
+-    let under = shade * 0.8
+-    graphics.addVertex(vertices, x, y, z, u, v, under, under, under)
+-    graphics.addVertex(vertices, x1, y, z1, u, v, under, under, under)
+-    graphics.addVertex(vertices, x, y, z1, u, v, under, under, under)
+-    graphics.addVertex(vertices, x, y, z, u, v, under, under, under)
+-    graphics.addVertex(vertices, x1, y, z, u, v, under, under, under)
+-    graphics.addVertex(vertices, x1, y, z1, u, v, under, under, under)
++// A soft round glow 410 blocks from the camera toward the unit direction
++// (dx, dy, dz), behind a sun or moon. Its colour runs from `strength` of the
++// way from the sky toward (red, green, blue) in the middle to exactly the sky
++// colour at the rim, so it fades out without an edge.
++function halo(sky: Sky, vertices: Bytes, cx: Float, cy: Float, cz: Float, dx: Float, dy: Float, dz: Float, radius: Float, red: Float, green: Float, blue: Float, strength: Float) {
++    let rightLength = sqrt(dx * dx + dz * dz)
++    let rx = -dz / rightLength
++    let rz = dx / rightLength
++    let ux = -dy * dx / rightLength
++    let uy = rightLength
++    let uz = -dy * dz / rightLength
++    let x = cx + dx * 410.0
++    let y = cy + dy * 410.0
++    let z = cz + dz * 410.0
++    let u = Float(blocks.TILE_CLOUD % 16) / 16.0 + 0.03
++    let v = Float(blocks.TILE_CLOUD / 16) / 16.0 + 0.03
++    let middleRed = blend(sky.red, red, strength)
++    let middleGreen = blend(sky.green, green, strength)
++    let middleBlue = blend(sky.blue, blue, strength)
++    let segments = 24
++    for segment in 0..segments {
++        let a = Float(segment) * TAU / Float(segments)
++        let b = Float(segment + 1) * TAU / Float(segments)
++        let ax = x + (rx * cos(a) + ux * sin(a)) * radius
++        let ay = y + uy * sin(a) * radius
++        let az = z + (rz * cos(a) + uz * sin(a)) * radius
++        let bx = x + (rx * cos(b) + ux * sin(b)) * radius
++        let by = y + uy * sin(b) * radius
++        let bz = z + (rz * cos(b) + uz * sin(b)) * radius
++        graphics.addVertex(vertices, x, y, z, u, v, middleRed, middleGreen, middleBlue)
++        graphics.addVertex(vertices, ax, ay, az, u, v, sky.red, sky.green, sky.blue)
++        graphics.addVertex(vertices, bx, by, bz, u, v, sky.red, sky.green, sky.blue)
++        graphics.addVertex(vertices, x, y, z, u, v, middleRed, middleGreen, middleBlue)
++        graphics.addVertex(vertices, bx, by, bz, u, v, sky.red, sky.green, sky.blue)
++        graphics.addVertex(vertices, ax, ay, az, u, v, sky.red, sky.green, sky.blue)
++    }
+ }
+ 
++function cloudFace(vertices: Bytes, ax: Float, ay: Float, az: Float, bx: Float, by: Float, bz: Float, cx: Float, cy: Float, cz: Float, dx: Float, dy: Float, dz: Float, shade: Float, u: Float, v: Float) {
++    graphics.addVertex(vertices, ax, ay, az, u, v, shade, shade, shade)
++    graphics.addVertex(vertices, bx, by, bz, u, v, shade, shade, shade)
++    graphics.addVertex(vertices, cx, cy, cz, u, v, shade, shade, shade)
++    graphics.addVertex(vertices, ax, ay, az, u, v, shade, shade, shade)
++    graphics.addVertex(vertices, cx, cy, cz, u, v, shade, shade, shade)
++    graphics.addVertex(vertices, dx, dy, dz, u, v, shade, shade, shade)
++}
++
++// Whether a cloud fills a cell of the grid built in buildClouds.
++function cloudAt(filled: List<Boolean>, cellX: Integer, cellZ: Integer): Boolean {
++    if cellX < 0 || cellZ < 0 || cellX >= CLOUD_CELLS || cellZ >= CLOUD_CELLS {
++        return false
++    }
++    return filled[cellZ * CLOUD_CELLS + cellX]
++}
++
++// Clouds are slabs with sides, shaded like blocks, where neighbouring cells
++// merge into one shape.
+ function buildClouds(sky: Sky) {
+     let vertices = sky.vertices
+     vertices.clear()
+@@ -137,18 +179,46 @@ function buildClouds(sky: Sky) {
+     let offset = sky.cloudDrift - Float(shift) * CLOUD_CELL
+     let u = Float(blocks.TILE_CLOUD % 16) / 16.0 + 0.03
+     let v = Float(blocks.TILE_CLOUD / 16) / 16.0 + 0.03
+-    for cellZ in -20..40 {
+-        for cellX in -20..40 {
+-            let density = noise.fractalNoise(Float(cellX + shift) / 5.0, Float(cellZ) / 5.0, 31337, 2)
+-            if density > 0.58 {
+-                cloudQuad(vertices, Float(cellX) * CLOUD_CELL - offset, Float(cellZ) * CLOUD_CELL, CLOUD_CELL, 1.0, u, v)
++    // Small ragged clumps, about twice as wide east to west as north to south.
++    let filled: List<Boolean> = []
++    for cellZ in 0..CLOUD_CELLS {
++        for cellX in 0..CLOUD_CELLS {
++            let density = noise.fractalNoise(Float(cellX - 20 + shift) / 3.5, Float(cellZ - 20) / 1.8, 31337, 3)
++            filled.add(density > 0.6)
++        }
++    }
++    let y0 = CLOUD_HEIGHT
++    let y1 = CLOUD_HEIGHT + CLOUD_THICKNESS
++    for cellZ in 0..CLOUD_CELLS {
++        for cellX in 0..CLOUD_CELLS {
++            if filled[cellZ * CLOUD_CELLS + cellX] {
++                // Neighbouring cells compute shared edges the same way, so
++                // they meet exactly, without cracks.
++                let x0 = Float(cellX - 20) * CLOUD_CELL - offset
++                let z0 = Float(cellZ - 20) * CLOUD_CELL
++                let x1 = Float(cellX - 19) * CLOUD_CELL - offset
++                let z1 = Float(cellZ - 19) * CLOUD_CELL
++                cloudFace(vertices, x0, y1, z0, x0, y1, z1, x1, y1, z1, x1, y1, z0, 1.0, u, v)
++                cloudFace(vertices, x0, y0, z0, x1, y0, z0, x1, y0, z1, x0, y0, z1, 0.72, u, v)
++                if !cloudAt(filled, cellX + 1, cellZ) {
++                    cloudFace(vertices, x1, y0, z0, x1, y1, z0, x1, y1, z1, x1, y0, z1, 0.88, u, v)
++                }
++                if !cloudAt(filled, cellX - 1, cellZ) {
++                    cloudFace(vertices, x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, 0.88, u, v)
++                }
++                if !cloudAt(filled, cellX, cellZ + 1) {
++                    cloudFace(vertices, x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1, 0.8, u, v)
++                }
++                if !cloudAt(filled, cellX, cellZ - 1) {
++                    cloudFace(vertices, x0, y0, z0, x0, y1, z0, x1, y1, z0, x1, y0, z0, 0.8, u, v)
++                }
+             }
+         }
+     }
+     graphics.updateMesh(sky.clouds, vertices)
+ }
+ 
+-// Draw the sun, moon, and clouds around a camera, then restore fog for the world.
++// Draw the sun and moon, with their glows, around a camera before anything else.
+ public function draw(sky: Sky, x: Float, y: Float, z: Float) {
+     let angle = sky.time * TAU
+     let dx = cos(angle)
+@@ -157,12 +227,19 @@ public function draw(sky: Sky, x: Float, y: Float, z: Float) {
+     let length = sqrt(dx * dx + dy * dy + dz * dz)
+     let vertices = sky.vertices
+     vertices.clear()
+-    body(vertices, x, y, z, dx / length, dy / length, dz / length, 34.0, blocks.TILE_SUN)
+-    body(vertices, x, y, z, -dx / length, -dy / length, -dz / length, 24.0, blocks.TILE_MOON)
++    halo(sky, vertices, x, y, z, dx / length, dy / length, dz / length, 120.0, 1.0, 0.95, 0.7, 0.28)
++    halo(sky, vertices, x, y, z, -dx / length, -dy / length, -dz / length, 80.0, 0.8, 0.85, 1.0, 0.14)
++    body(vertices, x, y, z, dx / length, dy / length, dz / length, 45.0, blocks.TILE_SUN)
++    body(vertices, x, y, z, -dx / length, -dy / length, -dz / length, 30.0, blocks.TILE_MOON)
+     graphics.updateMesh(sky.bodies, vertices)
+     graphics.setLight(1.0)
+     graphics.setFog(sky.red, sky.green, sky.blue, 5000.0, 6000.0)
+     graphics.drawMesh(sky.bodies)
++}
++
++// Draw the clouds as solid shapes, so only their nearest faces show. This
++// changes the fog, which the caller restores for anything drawn afterwards.
++public function drawClouds(sky: Sky) {
+     graphics.setLight(sky.light)
+     graphics.setFog(sky.red, sky.green, sky.blue, 160.0, 420.0)
+     graphics.drawMesh(sky.clouds)
+diff --git i/examples/craft/blocks.min w/examples/craft/blocks.min
+index 52f3f80..c3454d2 100644
+--- i/examples/craft/blocks.min
++++ w/examples/craft/blocks.min
+@@ -59,7 +59,8 @@ public constant FACE_TOP = 0
+ public constant FACE_BOTTOM = 1
+ public constant FACE_SIDE = 2
+ 
+-// Plants, and torches, are drawn as two crossed pictures rather than a cube.
++// Plants are drawn as two crossed pictures and torches as a thin stick, rather
++// than as cubes.
+ public function isPlant(block: Integer): Boolean {
+     return block == TALL_GRASS || block == RED_FLOWER || block == YELLOW_FLOWER || block == TORCH
+ }
+diff --git i/examples/craft/main.min w/examples/craft/main.min
+index 9f8ede0..e225217 100644
+--- i/examples/craft/main.min
++++ w/examples/craft/main.min
+@@ -56,10 +56,9 @@ function drawHotbar(hotbar: List<Integer>, selected: Integer) {
+             graphics.drawRectangle(x, top, slot, slot, 1.0, 1.0, 1.0, 0.9)
+             graphics.drawRectangle(x + 3.0, top + 3.0, slot - 6.0, slot - 6.0, 0.15, 0.15, 0.15, 1.0)
+         }
+-        let tile = blocks.tile(hotbar[index], blocks.FACE_SIDE)
+-        let u = textures.tileU(tile)
+-        let v = textures.tileV(tile)
+-        graphics.drawImage(x + 7.0, top + 7.0, slot - 14.0, slot - 14.0, u, v, u + 0.0625, v + 0.0625)
++        let u = textures.iconU(hotbar[index])
++        let v = textures.iconV(hotbar[index])
++        graphics.drawImage(x + 5.0, top + 5.0, slot - 10.0, slot - 10.0, u, v, u + textures.ICON_SIZE, v + textures.ICON_SIZE)
+     }
+ }
+ 
+@@ -284,11 +283,19 @@ while graphics.nextFrame() {
+     graphics.clear(sky.red, sky.green, sky.blue)
+     graphics.setCamera(eyeX, eyeY, eyeZ, player.yaw, player.pitch, 75.0)
+     atmosphere.draw(sky, eyeX, eyeY, eyeZ)
++    let fogRed = sky.red
++    let fogGreen = sky.green
++    let fogBlue = sky.blue
++    let fogStart = 70.0
++    let fogEnd = 130.0
+     if underwater {
+-        graphics.setFog(0.1 * sky.light, 0.25 * sky.light, 0.6 * sky.light, 1.0, 14.0)
+-    } else {
+-        graphics.setFog(sky.red, sky.green, sky.blue, 70.0, 130.0)
++        fogRed = 0.1 * sky.light
++        fogGreen = 0.25 * sky.light
++        fogBlue = 0.6 * sky.light
++        fogStart = 1.0
++        fogEnd = 14.0
+     }
++    graphics.setFog(fogRed, fogGreen, fogBlue, fogStart, fogEnd)
+     graphics.setLight(sky.light)
+     // Chunks entirely beyond the fog are skipped.
+     let visible: List<Boolean> = []
+@@ -303,6 +310,10 @@ while graphics.nextFrame() {
+             graphics.drawMesh(meshes[chunk])
+         }
+     }
++    if !underwater {
++        atmosphere.drawClouds(sky)
++        graphics.setFog(fogRed, fogGreen, fogBlue, fogStart, fogEnd)
++    }
+     for chunk in 0..waterMeshes.length {
+         if visible[chunk] {
+             graphics.drawTranslucentMesh(waterMeshes[chunk], 0.72)
+diff --git i/examples/craft/meshing.min w/examples/craft/meshing.min
+index 832d880..a9f63dc 100644
+--- i/examples/craft/meshing.min
++++ w/examples/craft/meshing.min
+@@ -4,6 +4,7 @@
+ use "graphics" as graphics
+ use "./blocks.min" as blocks
+ use "./terrain.min" as terrain
++use "./noise.min" as noise
+ 
+ constant TILE_SIZE = 0.0625
+ constant INSET = 0.0005
+@@ -46,22 +47,23 @@ function ambient(world: terrain.World, x: Integer, y: Integer, z: Integer, ax: I
+ 
+ // Emit two triangles for the quad a, b, c, d, given counter-clockwise from the
+ // front, each corner with its own brightness. The split runs along the brighter
+-// diagonal so occlusion shading interpolates evenly.
+-function quad(vertices: Bytes, ax: Float, ay: Float, az: Float, au: Float, av: Float, bx: Float, by: Float, bz: Float, bu: Float, bv: Float, cx: Float, cy: Float, cz: Float, cu: Float, cv: Float, dx: Float, dy: Float, dz: Float, du: Float, dv: Float, sa: Float, sb: Float, sc: Float, sd: Float, sky: Float, glow: Float) {
++// diagonal so occlusion shading interpolates evenly. `red` and `blue` scale
++// those channels to tint the texture.
++function quad(vertices: Bytes, ax: Float, ay: Float, az: Float, au: Float, av: Float, bx: Float, by: Float, bz: Float, bu: Float, bv: Float, cx: Float, cy: Float, cz: Float, cu: Float, cv: Float, dx: Float, dy: Float, dz: Float, du: Float, dv: Float, sa: Float, sb: Float, sc: Float, sd: Float, sky: Float, glow: Float, red: Float, blue: Float) {
+     if sa + sc >= sb + sd {
+-        graphics.addLitVertex(vertices, ax, ay, az, au, av, sa, sa, sa, sky, glow)
+-        graphics.addLitVertex(vertices, bx, by, bz, bu, bv, sb, sb, sb, sky, glow)
+-        graphics.addLitVertex(vertices, cx, cy, cz, cu, cv, sc, sc, sc, sky, glow)
+-        graphics.addLitVertex(vertices, ax, ay, az, au, av, sa, sa, sa, sky, glow)
+-        graphics.addLitVertex(vertices, cx, cy, cz, cu, cv, sc, sc, sc, sky, glow)
+-        graphics.addLitVertex(vertices, dx, dy, dz, du, dv, sd, sd, sd, sky, glow)
++        graphics.addLitVertex(vertices, ax, ay, az, au, av, sa * red, sa, sa * blue, sky, glow)
++        graphics.addLitVertex(vertices, bx, by, bz, bu, bv, sb * red, sb, sb * blue, sky, glow)
++        graphics.addLitVertex(vertices, cx, cy, cz, cu, cv, sc * red, sc, sc * blue, sky, glow)
++        graphics.addLitVertex(vertices, ax, ay, az, au, av, sa * red, sa, sa * blue, sky, glow)
++        graphics.addLitVertex(vertices, cx, cy, cz, cu, cv, sc * red, sc, sc * blue, sky, glow)
++        graphics.addLitVertex(vertices, dx, dy, dz, du, dv, sd * red, sd, sd * blue, sky, glow)
+     } else {
+-        graphics.addLitVertex(vertices, bx, by, bz, bu, bv, sb, sb, sb, sky, glow)
+-        graphics.addLitVertex(vertices, cx, cy, cz, cu, cv, sc, sc, sc, sky, glow)
+-        graphics.addLitVertex(vertices, dx, dy, dz, du, dv, sd, sd, sd, sky, glow)
+-        graphics.addLitVertex(vertices, bx, by, bz, bu, bv, sb, sb, sb, sky, glow)
+-        graphics.addLitVertex(vertices, dx, dy, dz, du, dv, sd, sd, sd, sky, glow)
+-        graphics.addLitVertex(vertices, ax, ay, az, au, av, sa, sa, sa, sky, glow)
++        graphics.addLitVertex(vertices, bx, by, bz, bu, bv, sb * red, sb, sb * blue, sky, glow)
++        graphics.addLitVertex(vertices, cx, cy, cz, cu, cv, sc * red, sc, sc * blue, sky, glow)
++        graphics.addLitVertex(vertices, dx, dy, dz, du, dv, sd * red, sd, sd * blue, sky, glow)
++        graphics.addLitVertex(vertices, bx, by, bz, bu, bv, sb * red, sb, sb * blue, sky, glow)
++        graphics.addLitVertex(vertices, dx, dy, dz, du, dv, sd * red, sd, sd * blue, sky, glow)
++        graphics.addLitVertex(vertices, ax, ay, az, au, av, sa * red, sa, sa * blue, sky, glow)
+     }
+ }
+ 
+@@ -82,6 +84,12 @@ function glowAt(world: terrain.World, torches: List<Integer>, x: Integer, y: Int
+     return glow
+ }
+ 
++// Grass and leaves drift gently between lush and dry greens across the world,
++// so wide fields do not look like one repeated tile. Returns 0 to 1.
++function dryness(x: Integer, z: Integer): Float {
++    return noise.valueNoise(Float(x) / 40.0, Float(z) / 40.0, 555)
++}
++
+ // direction: 0 up, 1 down, 2 east (+x), 3 west (-x), 4 south (+z), 5 north (-z)
+ function face(world: terrain.World, torches: List<Integer>, vertices: Bytes, bx: Integer, by: Integer, bz: Integer, direction: Integer, tile: Integer, top: Float) {
+     let frontX = bx
+@@ -98,6 +106,13 @@ function face(world: terrain.World, torches: List<Integer>, vertices: Bytes, bx:
+     if torches.length > 0 {
+         glow = glowAt(world, torches, frontX, frontY, frontZ)
+     }
++    let red = 1.0
++    let blue = 1.0
++    if tile == blocks.TILE_GRASS_TOP || tile == blocks.TILE_LEAVES {
++        let dry = dryness(bx, bz)
++        red = 0.88 + dry * 0.24
++        blue = 1.06 - dry * 0.14
++    }
+     let x = Float(bx)
+     let y = Float(by)
+     let z = Float(bz)
+@@ -114,7 +129,7 @@ function face(world: terrain.World, torches: List<Integer>, vertices: Bytes, bx:
+         let sb = ambient(world, bx, py, bz, -1, 0, 0, 0, 0, 1)
+         let sc = ambient(world, bx, py, bz, 1, 0, 0, 0, 0, 1)
+         let sd = ambient(world, bx, py, bz, 1, 0, 0, 0, 0, -1)
+-        quad(vertices, x, y1, z, u0, v0, x, y1, z1, u0, v1, x1, y1, z1, u1, v1, x1, y1, z, u1, v0, sa, sb, sc, sd, sky, glow)
++        quad(vertices, x, y1, z, u0, v0, x, y1, z1, u0, v1, x1, y1, z1, u1, v1, x1, y1, z, u1, v0, sa, sb, sc, sd, sky, glow, red, blue)
+     } else if direction == 1 {
+         let py = by - 1
+         let shade = 0.5
+@@ -122,7 +137,7 @@ function face(world: terrain.World, torches: List<Integer>, vertices: Bytes, bx:
+         let sb = shade * ambient(world, bx, py, bz, 1, 0, 0, 0, 0, -1)
+         let sc = shade * ambient(world, bx, py, bz, 1, 0, 0, 0, 0, 1)
+         let sd = shade * ambient(world, bx, py, bz, -1, 0, 0, 0, 0, 1)
+-        quad(vertices, x, y, z, u0, v0, x1, y, z, u1, v0, x1, y, z1, u1, v1, x, y, z1, u0, v1, sa, sb, sc, sd, sky, glow)
++        quad(vertices, x, y, z, u0, v0, x1, y, z, u1, v0, x1, y, z1, u1, v1, x, y, z1, u0, v1, sa, sb, sc, sd, sky, glow, red, blue)
+     } else if direction == 2 {
+         let px = bx + 1
+         let shade = 0.8
+@@ -130,7 +145,7 @@ function face(world: terrain.World, torches: List<Integer>, vertices: Bytes, bx:
+         let sb = shade * ambient(world, px, by, bz, 0, 1, 0, 0, 0, -1)
+         let sc = shade * ambient(world, px, by, bz, 0, 1, 0, 0, 0, 1)
+         let sd = shade * ambient(world, px, by, bz, 0, -1, 0, 0, 0, 1)
+-        quad(vertices, x1, y, z, u1, v1, x1, y1, z, u1, v0, x1, y1, z1, u0, v0, x1, y, z1, u0, v1, sa, sb, sc, sd, sky, glow)
++        quad(vertices, x1, y, z, u1, v1, x1, y1, z, u1, v0, x1, y1, z1, u0, v0, x1, y, z1, u0, v1, sa, sb, sc, sd, sky, glow, red, blue)
+     } else if direction == 3 {
+         let px = bx - 1
+         let shade = 0.8
+@@ -138,7 +153,7 @@ function face(world: terrain.World, torches: List<Integer>, vertices: Bytes, bx:
+         let sb = shade * ambient(world, px, by, bz, 0, -1, 0, 0, 0, 1)
+         let sc = shade * ambient(world, px, by, bz, 0, 1, 0, 0, 0, 1)
+         let sd = shade * ambient(world, px, by, bz, 0, 1, 0, 0, 0, -1)
+-        quad(vertices, x, y, z, u0, v1, x, y, z1, u1, v1, x, y1, z1, u1, v0, x, y1, z, u0, v0, sa, sb, sc, sd, sky, glow)
++        quad(vertices, x, y, z, u0, v1, x, y, z1, u1, v1, x, y1, z1, u1, v0, x, y1, z, u0, v0, sa, sb, sc, sd, sky, glow, red, blue)
+     } else if direction == 4 {
+         let pz = bz + 1
+         let shade = 0.65
+@@ -146,7 +161,7 @@ function face(world: terrain.World, torches: List<Integer>, vertices: Bytes, bx:
+         let sb = shade * ambient(world, bx, by, pz, 1, 0, 0, 0, -1, 0)
+         let sc = shade * ambient(world, bx, by, pz, 1, 0, 0, 0, 1, 0)
+         let sd = shade * ambient(world, bx, by, pz, -1, 0, 0, 0, 1, 0)
+-        quad(vertices, x, y, z1, u0, v1, x1, y, z1, u1, v1, x1, y1, z1, u1, v0, x, y1, z1, u0, v0, sa, sb, sc, sd, sky, glow)
++        quad(vertices, x, y, z1, u0, v1, x1, y, z1, u1, v1, x1, y1, z1, u1, v0, x, y1, z1, u0, v0, sa, sb, sc, sd, sky, glow, red, blue)
+     } else {
+         let pz = bz - 1
+         let shade = 0.65
+@@ -154,33 +169,61 @@ function face(world: terrain.World, torches: List<Integer>, vertices: Bytes, bx:
+         let sb = shade * ambient(world, bx, by, pz, -1, 0, 0, 0, 1, 0)
+         let sc = shade * ambient(world, bx, by, pz, 1, 0, 0, 0, 1, 0)
+         let sd = shade * ambient(world, bx, by, pz, 1, 0, 0, 0, -1, 0)
+-        quad(vertices, x, y, z, u1, v1, x, y1, z, u1, v0, x1, y1, z, u0, v0, x1, y, z, u0, v1, sa, sb, sc, sd, sky, glow)
++        quad(vertices, x, y, z, u1, v1, x, y1, z, u1, v0, x1, y1, z, u0, v0, x1, y, z, u0, v1, sa, sb, sc, sd, sky, glow, red, blue)
+     }
+ }
+ 
+-// Two crossed squares through the block, each visible from both sides.
+-function plant(world: terrain.World, torches: List<Integer>, vertices: Bytes, bx: Integer, by: Integer, bz: Integer, tile: Integer, block: Integer) {
++// Two crossed squares through the block, each visible from both sides, nudged
++// off centre so rows of plants look less regular.
++function plant(world: terrain.World, torches: List<Integer>, vertices: Bytes, bx: Integer, by: Integer, bz: Integer, tile: Integer) {
+     let sky = terrain.skyLight(world, bx, by, bz)
+-    let glow = 1.0
+-    if block != blocks.TORCH {
+-        glow = 0.0
+-        if torches.length > 0 {
+-            glow = glowAt(world, torches, bx, by, bz)
+-        }
++    let glow = 0.0
++    if torches.length > 0 {
++        glow = glowAt(world, torches, bx, by, bz)
+     }
+-    let x = Float(bx)
++    let red = 1.0
++    let blue = 1.0
++    if tile == blocks.TILE_TALL_GRASS {
++        let dry = dryness(bx, bz)
++        red = 0.88 + dry * 0.24
++        blue = 1.06 - dry * 0.14
++    }
++    let x = Float(bx) + (noise.random(bx, bz, 71) - 0.5) * 0.24
+     let y = Float(by)
+-    let z = Float(bz)
++    let z = Float(bz) + (noise.random(bx, bz, 72) - 0.5) * 0.24
+     let u0 = Float(tile % 16) * TILE_SIZE + INSET
+     let v0 = Float(tile / 16) * TILE_SIZE + INSET
+     let u1 = u0 + TILE_SIZE - 2.0 * INSET
+     let v1 = v0 + TILE_SIZE - 2.0 * INSET
+-    let a = 0.15
+-    let b = 0.85
+-    quad(vertices, x + a, y, z + a, u0, v1, x + b, y, z + b, u1, v1, x + b, y + 1.0, z + b, u1, v0, x + a, y + 1.0, z + a, u0, v0, 0.9, 0.9, 0.9, 0.9, sky, glow)
+-    quad(vertices, x + b, y, z + b, u0, v1, x + a, y, z + a, u1, v1, x + a, y + 1.0, z + a, u1, v0, x + b, y + 1.0, z + b, u0, v0, 0.9, 0.9, 0.9, 0.9, sky, glow)
+-    quad(vertices, x + a, y, z + b, u0, v1, x + b, y, z + a, u1, v1, x + b, y + 1.0, z + a, u1, v0, x + a, y + 1.0, z + b, u0, v0, 0.9, 0.9, 0.9, 0.9, sky, glow)
+-    quad(vertices, x + b, y, z + a, u0, v1, x + a, y, z + b, u1, v1, x + a, y + 1.0, z + b, u1, v0, x + b, y + 1.0, z + a, u0, v0, 0.9, 0.9, 0.9, 0.9, sky, glow)
++    let a = 0.05
++    let b = 0.95
++    quad(vertices, x + a, y, z + a, u0, v1, x + b, y, z + b, u1, v1, x + b, y + 1.0, z + b, u1, v0, x + a, y + 1.0, z + a, u0, v0, 0.9, 0.9, 0.9, 0.9, sky, glow, red, blue)
++    quad(vertices, x + b, y, z + b, u0, v1, x + a, y, z + a, u1, v1, x + a, y + 1.0, z + a, u1, v0, x + b, y + 1.0, z + b, u0, v0, 0.9, 0.9, 0.9, 0.9, sky, glow, red, blue)
++    quad(vertices, x + a, y, z + b, u0, v1, x + b, y, z + a, u1, v1, x + b, y + 1.0, z + a, u1, v0, x + a, y + 1.0, z + b, u0, v0, 0.9, 0.9, 0.9, 0.9, sky, glow, red, blue)
++    quad(vertices, x + b, y, z + a, u0, v1, x + a, y, z + b, u1, v1, x + a, y + 1.0, z + b, u1, v0, x + b, y + 1.0, z + a, u0, v0, 0.9, 0.9, 0.9, 0.9, sky, glow, red, blue)
++}
++
++// A torch is a stick two pixels square and ten tall, textured from the middle
++// column of its tile, with the flame on top. It is always fully lit.
++function torch(vertices: Bytes, bx: Integer, by: Integer, bz: Integer, tile: Integer) {
++    let pixel = 1.0 / 16.0
++    let x0 = Float(bx) + 7.0 * pixel
++    let x1 = x0 + 2.0 * pixel
++    let z0 = Float(bz) + 7.0 * pixel
++    let z1 = z0 + 2.0 * pixel
++    let y0 = Float(by)
++    let y1 = y0 + 10.0 * pixel
++    let texel = TILE_SIZE / 16.0
++    let u0 = Float(tile % 16) * TILE_SIZE + 7.0 * texel + INSET
++    let u1 = u0 + 2.0 * texel - 2.0 * INSET
++    let v0 = Float(tile / 16) * TILE_SIZE + 6.0 * texel + INSET
++    let v1 = Float(tile / 16) * TILE_SIZE + TILE_SIZE - INSET
++    let flame = v0 + 2.0 * texel - 2.0 * INSET
++    quad(vertices, x0, y1, z0, u0, v0, x0, y1, z1, u0, flame, x1, y1, z1, u1, flame, x1, y1, z0, u1, v0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
++    quad(vertices, x1, y0, z0, u1, v1, x1, y1, z0, u1, v0, x1, y1, z1, u0, v0, x1, y0, z1, u0, v1, 0.8, 0.8, 0.8, 0.8, 1.0, 1.0, 1.0, 1.0)
++    quad(vertices, x0, y0, z0, u0, v1, x0, y0, z1, u1, v1, x0, y1, z1, u1, v0, x0, y1, z0, u0, v0, 0.8, 0.8, 0.8, 0.8, 1.0, 1.0, 1.0, 1.0)
++    quad(vertices, x0, y0, z1, u0, v1, x1, y0, z1, u1, v1, x1, y1, z1, u1, v0, x0, y1, z1, u0, v0, 0.65, 0.65, 0.65, 0.65, 1.0, 1.0, 1.0, 1.0)
++    quad(vertices, x0, y0, z0, u1, v1, x0, y1, z0, u1, v0, x1, y1, z0, u0, v0, x1, y0, z0, u0, v1, 0.65, 0.65, 0.65, 0.65, 1.0, 1.0, 1.0, 1.0)
+ }
+ 
+ // Rebuild one chunk: water goes to `water`, drawn see-through after
+@@ -205,8 +248,10 @@ public function buildChunk(world: terrain.World, chunkX: Integer, chunkZ: Intege
+         for z in startZ..startZ + terrain.CHUNK_SIZE {
+             for x in startX..startX + terrain.CHUNK_SIZE {
+                 let block = world.blocks[(y * world.sizeZ + z) * world.sizeX + x]
+-                if blocks.isPlant(block) {
+-                    plant(world, torches, solid, x, y, z, blocks.tile(block, blocks.FACE_SIDE), block)
++                if block == blocks.TORCH {
++                    torch(solid, x, y, z, blocks.TILE_TORCH)
++                } else if blocks.isPlant(block) {
++                    plant(world, torches, solid, x, y, z, blocks.tile(block, blocks.FACE_SIDE))
+                 } else if block != blocks.AIR {
+                     let vertices = solid
+                     if block == blocks.WATER {
+diff --git i/examples/craft/terrain.min w/examples/craft/terrain.min
+index f5dc27d..4bc85f9 100644
+--- i/examples/craft/terrain.min
++++ w/examples/craft/terrain.min
+@@ -67,6 +67,10 @@ public function set(world: World, x: Integer, y: Integer, z: Integer, block: Int
+     }
+     let index = (y * world.sizeZ + z) * world.sizeX + x
+     let previous = world.blocks[index]
++    // A repeated placement must not add another torch or invalidate unchanged lighting.
++    if previous == block {
++        return
++    }
+     world.blocks[index] = block
+     let reach = 1
+     if previous == blocks.TORCH || block == blocks.TORCH {
+@@ -332,14 +336,20 @@ public function generate(world: World) {
+             let ground = heights[z * world.sizeX + x]
+             if get(world, x, ground, z) == blocks.GRASS && get(world, x, ground + 1, z) == blocks.AIR {
+                 let roll = noise.random(x, z, world.seed + 77)
++                // Grass grows thickly in meadows and only here and there elsewhere.
++                let meadow = noise.valueNoise(Float(x) / 18.0, Float(z) / 18.0, world.seed + 88) > 0.6
++                let grass = 0.024
++                if meadow {
++                    grass = 0.2
++                }
+                 if roll < 0.012 {
+                     plantTree(world, x, ground, z)
+-                } else if roll < 0.13 {
+-                    put(world, x, ground + 1, z, blocks.TALL_GRASS)
+-                } else if roll < 0.137 {
++                } else if roll < 0.016 {
+                     put(world, x, ground + 1, z, blocks.RED_FLOWER)
+-                } else if roll < 0.144 {
++                } else if roll < 0.02 {
+                     put(world, x, ground + 1, z, blocks.YELLOW_FLOWER)
++                } else if roll < 0.02 + grass {
++                    put(world, x, ground + 1, z, blocks.TALL_GRASS)
+                 }
+             }
+         }
+diff --git i/examples/craft/textures.min w/examples/craft/textures.min
+index 656d377..30558a6 100644
+--- i/examples/craft/textures.min
++++ w/examples/craft/textures.min
+@@ -1,9 +1,16 @@
+-// A 256 by 256 texture atlas of 16 by 16 pixel tiles, drawn with code.
++// A 256 by 256 texture atlas drawn with code: 16 by 16 pixel block tiles in
++// the top rows, and 32 by 32 pixel isometric block icons for the hotbar below.
++// Like classic block-game art, each tile uses a small palette of flat colours,
++// ordered dark to light, with noise choosing a colour for every pixel.
+ 
+ use "./blocks.min" as blocks
+ use "./noise.min" as noise
+ 
+ public constant ATLAS_SIZE = 256
++// The width of an icon in texture coordinates. Icons sit eight to a row from
++// pixel row ICON_TOP, one for each block kind.
++public constant ICON_SIZE = 0.125
++constant ICON_TOP = 64
+ 
+ function put(pixels: Bytes, tile: Integer, px: Integer, py: Integer, red: Integer, green: Integer, blue: Integer, alpha: Integer) {
+     let x = (tile % 16) * 16 + px
+@@ -15,190 +22,494 @@ function put(pixels: Bytes, tile: Integer, px: Integer, py: Integer, red: Intege
+     pixels[index + 3] = alpha
+ }
+ 
+-// A per-pixel random amount from -range to range.
+-function jitter(tile: Integer, px: Integer, py: Integer, range: Integer): Integer {
+-    return noise.hash(tile * 16 + px, py, 4242) % (range * 2 + 1) - range
++function clear(pixels: Bytes, tile: Integer, px: Integer, py: Integer) {
++    put(pixels, tile, px, py, 0, 0, 0, 0)
+ }
+ 
+-// Base colour varied per pixel, as most natural blocks are.
+-function speckle(pixels: Bytes, tile: Integer, px: Integer, py: Integer, red: Integer, green: Integer, blue: Integer, range: Integer) {
+-    let j = jitter(tile, px, py, range)
+-    put(pixels, tile, px, py, red + j, green + j, blue + j, 255)
++// Put an opaque colour written as 0xRRGGBB.
++function paint(pixels: Bytes, tile: Integer, px: Integer, py: Integer, colour: Integer) {
++    put(pixels, tile, px, py, colour >> 16, (colour >> 8) & 255, colour & 255, 255)
++}
++
++// The first colour whose limit is above `value`, or the last colour.
++function pick(value: Float, colours: List<Integer>, limits: List<Float>): Integer {
++    for index in 0..limits.length {
++        if value < limits[index] {
++            return colours[index]
++        }
++    }
++    return colours[colours.length - 1]
++}
++
++// A random Float from 0 up to 1 for one pixel of one tile.
++function grain(tile: Integer, px: Integer, py: Integer, seed: Integer): Float {
++    return noise.random(tile * 16 + px, py, seed)
++}
++
++function wrap(value: Integer, period: Integer): Integer {
++    return (value % period + period) % period
++}
++
++// Smooth noise from 0 to 1 that repeats every tile, so textures meet without
++// seams. There are `cellsX` lattice cells across the tile and `cellsY` down it.
++function tiled(px: Integer, py: Integer, cellsX: Integer, cellsY: Integer, seed: Integer): Float {
++    let x = (Float(px) + 0.5) * Float(cellsX) / 16.0
++    let y = (Float(py) + 0.5) * Float(cellsY) / 16.0
++    let x0 = floor(x)
++    let y0 = floor(y)
++    let ix = Integer(x0)
++    let iy = Integer(y0)
++    let fx = x - x0
++    let fy = y - y0
++    fx = fx * fx * (3.0 - 2.0 * fx)
++    fy = fy * fy * (3.0 - 2.0 * fy)
++    let a = noise.random(wrap(ix, cellsX), wrap(iy, cellsY), seed)
++    let b = noise.random(wrap(ix + 1, cellsX), wrap(iy, cellsY), seed)
++    let c = noise.random(wrap(ix, cellsX), wrap(iy + 1, cellsY), seed)
++    let d = noise.random(wrap(ix + 1, cellsX), wrap(iy + 1, cellsY), seed)
++    let near = a + (b - a) * fx
++    let far = c + (d - c) * fx
++    return near + (far - near) * fy
++}
++
++// The nearest of a jittered grid of points scattered over a repeating tile,
++// for stones and cells. `dx` and `dy` run from the point to the pixel.
++record Cell {
++    index: Integer
++    nearest: Float
++    second: Float
++    dx: Float
++    dy: Float
++}
++
++function cell(px: Integer, py: Integer, grid: Integer, seed: Integer): Cell {
++    let result = Cell {
++        index: 0
++        nearest: 99.0
++        second: 99.0
++        dx: 0.0
++        dy: 0.0
++    }
++    let spacing = 16.0 / Float(grid)
++    for index in 0..grid * grid {
++        let pointX = (Float(index % grid) + 0.2 + 0.6 * noise.random(index, 1, seed)) * spacing
++        let pointY = (Float(index / grid) + 0.2 + 0.6 * noise.random(index, 2, seed)) * spacing
++        let dx = Float(px) + 0.5 - pointX
++        let dy = Float(py) + 0.5 - pointY
++        if dx > 8.0 { dx -= 16.0 } else if dx < -8.0 { dx += 16.0 }
++        if dy > 8.0 { dy -= 16.0 } else if dy < -8.0 { dy += 16.0 }
++        let distance = sqrt(dx * dx + dy * dy)
++        if distance < result.nearest {
++            result.second = result.nearest
++            result.nearest = distance
++            result.index = index
++            result.dx = dx
++            result.dy = dy
++        } else if distance < result.second {
++            result.second = distance
++        }
++    }
++    return result
++}
++
++// Grass is fine grey noise, a different shade in every pixel, tinted a
++// plains green.
++function grass(pixels: Bytes, tile: Integer, px: Integer, py: Integer) {
++    let grey = 147.0 + (grain(tile, px, py, 61) + grain(tile, px, py, 62) - 1.0) * 44.0
++    put(pixels, tile, px, py, Integer(grey * 0.569), Integer(grey * 0.741), Integer(grey * 0.349), 255)
++}
++
++// Dirt is even, fine noise: mostly mid brown with lighter and darker flecks,
++// and the odd grey pebble.
++function dirt(pixels: Bytes, tile: Integer, px: Integer, py: Integer) {
++    if noise.hash(px, py, 73) % 34 == 0 {
++        paint(pixels, tile, px, py, pick(noise.random(px, py, 74), [0x6C6C6C, 0x878787], [0.5]))
++        return
++    }
++    paint(pixels, tile, px, py, pick(noise.random(px, py, 71), [0x593D29, 0x79553A, 0x966C4A, 0xB9855C], [0.13, 0.56, 0.84]))
++}
++
++function snow(pixels: Bytes, tile: Integer, px: Integer, py: Integer) {
++    paint(pixels, tile, px, py, pick(grain(tile, px, py, 131), [0xF0FDFD, 0xF7FEFE, 0xFFFFFF], [0.24, 0.54]))
++}
++
++// Stone has short horizontal streaks of lighter and darker grey. It looks the
++// same wherever it appears, including around ore.
++function stone(pixels: Bytes, tile: Integer, px: Integer, py: Integer) {
++    let value = tiled(px, py, 4, 16, 37) * 0.65 + noise.random(px, py, 38) * 0.35
++    paint(pixels, tile, px, py, pick(value, [0x686868, 0x747474, 0x7F7F7F, 0x8F8F8F], [0.28, 0.42, 0.66]))
++}
++
++// Whether ore covers a pixel: -1 if not, else 0 for a highlight, 1 for the
++// body, and 2 for the shaded far side of a blob.
++function ore(tile: Integer, px: Integer, py: Integer): Integer {
++    if px < 0 || py < 0 || px > 15 || py > 15 {
++        return -1
++    }
++    let clusters = 6
++    if tile == blocks.TILE_COAL_ORE {
++        clusters = 7
++    } else if tile == blocks.TILE_DIAMOND_ORE {
++        clusters = 5
++    }
++    for cluster in 0..clusters {
++        let dx = px - (2 + noise.hash(cluster, 1, tile * 31) % 11)
++        let dy = py - (2 + noise.hash(cluster, 2, tile * 31) % 11)
++        // A small core, two by two with one corner sometimes missing, and
++        // the odd pixel beside it.
++        let core = dx >= 0 && dx <= 1 && dy >= 0 && dy <= 1 && !(dx == 1 && dy == 1 && noise.hash(cluster, 3, tile) % 2 == 0)
++        let extra = dx >= -1 && dx <= 2 && dy >= -1 && dy <= 2 && noise.hash(px, py, tile * 7 + cluster) % 7 == 0
++        if core || extra {
++            if dx + dy <= 0 {
++                return 0
++            } else if dx + dy >= 2 {
++                return 2
++            }
++            return 1
++        }
++    }
++    return -1
++}
++
++// Ore blobs have a highlight, a body, a shaded side, and a dark edge below and
++// to the right.
++function drawOre(pixels: Bytes, tile: Integer, px: Integer, py: Integer) {
++    let colours = [0x393C36, 0x2E2E2E, 0x252525, 0x5C5C5C]
++    if tile == blocks.TILE_IRON_ORE {
++        colours = [0xE2C0AA, 0xD8AF93, 0xAF8E77, 0x887455]
++    } else if tile == blocks.TILE_GOLD_ORE {
++        colours = [0xFFFFB5, 0xFCEE4B, 0xEB9D0E, 0x9C7020]
++    } else if tile == blocks.TILE_DIAMOND_ORE {
++        colours = [0xD5FFF6, 0x77E7D1, 0x1ED0D6, 0x239698]
++    }
++    let part = ore(tile, px, py)
++    if part >= 0 {
++        paint(pixels, tile, px, py, colours[part])
++    } else if ore(tile, px - 1, py) >= 0 || ore(tile, px, py - 1) >= 0 {
++        paint(pixels, tile, px, py, colours[3])
++    } else {
++        stone(pixels, tile, px, py)
++    }
+ }
+ 
+ function drawTile(pixels: Bytes, tile: Integer, px: Integer, py: Integer) {
+-    let j = jitter(tile, px, py, 12)
++    let random = grain(tile, px, py, 7)
+     if tile == blocks.TILE_GRASS_TOP {
+-        speckle(pixels, tile, px, py, 96, 158, 58, 16)
++        grass(pixels, tile, px, py)
+     } else if tile == blocks.TILE_GRASS_SIDE || tile == blocks.TILE_SNOW_SIDE {
+-        let edge = 3 + noise.hash(px, tile, 17) % 3
+-        if py < edge {
+-            if tile == blocks.TILE_GRASS_SIDE {
+-                speckle(pixels, tile, px, py, 96, 158, 58, 16)
+-            } else {
+-                speckle(pixels, tile, px, py, 236, 244, 250, 6)
+-            }
++        // A ragged fringe hanging a few pixels over the dirt.
++        let fringe = 2 + noise.hash(px, tile, 17) % 2
++        if noise.hash(px, tile, 19) % 4 == 0 {
++            fringe += 1 + noise.hash(px, tile, 20) % 2
++        }
++        if py == fringe && random < 0.7 {
++            // Dirt just under the fringe lies in its shadow.
++            paint(pixels, tile, px, py, 0x593D29)
++        } else if py >= fringe {
++            dirt(pixels, tile, px, py)
++        } else if tile == blocks.TILE_GRASS_SIDE {
++            grass(pixels, tile, px, py)
+         } else {
+-            speckle(pixels, tile, px, py, 134, 96, 67, 14)
++            snow(pixels, tile, px, py)
+         }
+     } else if tile == blocks.TILE_DIRT {
+-        speckle(pixels, tile, px, py, 134, 96, 67, 14)
++        dirt(pixels, tile, px, py)
+     } else if tile == blocks.TILE_STONE {
+-        let spot = noise.hash(px / 3, py / 2, tile + 31) % 5 == 0
+-        if spot {
+-            speckle(pixels, tile, px, py, 104, 104, 104, 8)
+-        } else {
+-            speckle(pixels, tile, px, py, 128, 128, 128, 10)
+-        }
++        stone(pixels, tile, px, py)
+     } else if tile == blocks.TILE_SAND {
+-        speckle(pixels, tile, px, py, 220, 208, 160, 10)
++        paint(pixels, tile, px, py, pick(random, [0xD1BA8A, 0xD5C496, 0xDACFA3, 0xE3DBB0, 0xE7E4BB, 0xEDEBCB], [0.04, 0.3, 0.72, 0.95, 0.98]))
+     } else if tile == blocks.TILE_LOG_SIDE {
+-        let stripe = (px + noise.hash(py / 4, tile, 3) % 2) % 4 == 0
+-        if stripe {
+-            speckle(pixels, tile, px, py, 76, 58, 34, 6)
+-        } else {
+-            speckle(pixels, tile, px, py, 104, 82, 50, 8)
+-        }
++        // Bark in broken vertical streaks: each column varies slowly downward
++        // on its own, with one lattice cell across so columns do not blend.
++        let value = tiled(0, py, 1, 3, 92 + px) * 0.8 + random * 0.2
++        paint(pixels, tile, px, py, pick(value, [0x382B18, 0x4C3D26, 0x5F4A2B, 0x745A36, 0x917142, 0x987849], [0.2, 0.32, 0.44, 0.74, 0.9]))
+     } else if tile == blocks.TILE_LOG_TOP {
+-        let dx = px * 2 - 15
+-        let dy = py * 2 - 15
+-        let ring = Integer(sqrt(Float(dx * dx + dy * dy))) / 3
+-        if px == 0 || py == 0 || px == 15 || py == 15 {
+-            speckle(pixels, tile, px, py, 104, 82, 50, 8)
+-        } else if ring % 2 == 0 {
+-            speckle(pixels, tile, px, py, 176, 144, 92, 6)
++        // Square growth rings inside a ring of bark.
++        let ring = Integer(max(abs(Float(px) - 7.5), abs(Float(py) - 7.5)))
++        if ring == 7 {
++            paint(pixels, tile, px, py, pick(random, [0x4C3D26, 0x5F4A2B, 0x745A36], [0.3, 0.75]))
++        } else if random < 0.12 {
++            paint(pixels, tile, px, py, pick(random * 8.0, [0x9F844D, 0xC29D62], [0.5]))
+         } else {
+-            speckle(pixels, tile, px, py, 146, 116, 70, 6)
++            let rings = [0xAF8F55, 0x967441, 0xB8945F, 0xAF8F55, 0x9F844D, 0xAF8F55, 0xB8945F]
++            paint(pixels, tile, px, py, rings[ring])
+         }
+     } else if tile == blocks.TILE_LEAVES {
+-        if noise.hash(px, py, 911) % 5 == 0 {
+-            put(pixels, tile, px, py, 0, 0, 0, 0)
++        let clump = tiled(px, py, 4, 4, 101)
++        if noise.random(px, py, 103) < 0.55 && clump < 0.5 {
++            clear(pixels, tile, px, py)
+         } else {
+-            speckle(pixels, tile, px, py, 58, 118, 42, 22)
++            paint(pixels, tile, px, py, pick(clump * 0.5 + random * 0.5, [0x304313, 0x374E15, 0x46661C, 0x567E22], [0.3, 0.5, 0.74]))
+         }
+     } else if tile == blocks.TILE_WATER {
+-        let wave = (px + py * 2 + noise.hash(py, 0, 5) % 3) % 8 < 2
+-        if wave {
+-            put(pixels, tile, px, py, 70 + j, 120 + j, 220, 255)
+-        } else {
+-            put(pixels, tile, px, py, 44 + j, 88 + j, 200, 255)
+-        }
++        // Calm water: long horizontal ripples with a few bright glints.
++        let value = tiled(px, py, 2, 8, 111) * 0.7 + random * 0.3
++        paint(pixels, tile, px, py, pick(value, [0x284C93, 0x2A509B, 0x2F59AD, 0x3461BC, 0x3F76E4], [0.45, 0.72, 0.84, 0.92]))
+     } else if tile == blocks.TILE_PLANKS {
+-        let seam = py % 4 == 3 || (px == (py / 4) * 5 % 16 && py % 4 != 3)
+-        if seam {
+-            speckle(pixels, tile, px, py, 118, 90, 52, 4)
++        // Four boards with dark seams, grain along them, and staggered joints.
++        let board = py / 4
++        let row = py % 4
++        let joint = (board * 7 + 3) % 16
++        if row == 3 {
++            paint(pixels, tile, px, py, 0x67502C)
++        } else if px == joint {
++            paint(pixels, tile, px, py, 0x7E6237)
++        } else if tiled(px, py, 2, 16, 123) > 0.78 {
++            paint(pixels, tile, px, py, 0x967441)
+         } else {
+-            speckle(pixels, tile, px, py, 168, 134, 82, 8)
++            let value = tiled(px, py, 4, 16, 121) * 0.6 + random * 0.4
++            if row == 0 {
++                value += 0.15
++            }
++            paint(pixels, tile, px, py, pick(value, [0x9F844D, 0xAF8F55, 0xB8945F, 0xC29D62], [0.35, 0.58, 0.8]))
+         }
+     } else if tile == blocks.TILE_COBBLESTONE {
+-        let cell = noise.hash(px / 4 + (py / 4) * 7, py / 4, 55) % 4
+-        let edge = px % 4 == 0 || py % 4 == 0
+-        if edge {
+-            speckle(pixels, tile, px, py, 84, 84, 84, 6)
++        // Rounded stones lit from the top left, set in dark mortar.
++        let stoneCell = cell(px, py, 3, 141)
++        let gap = stoneCell.second - stoneCell.nearest
++        if gap < 1.1 {
++            paint(pixels, tile, px, py, pick(random, [0x525252, 0x616161], [0.3]))
+         } else {
+-            let base = 112 + cell * 10
+-            speckle(pixels, tile, px, py, base, base, base, 8)
++            let lit = -(stoneCell.dx + stoneCell.dy) * 0.25 + random * 0.5
++            if gap < 2.0 {
++                lit -= 0.5
++            }
++            paint(pixels, tile, px, py, pick(lit, [0x6E6E6E, 0x888888, 0xA6A6A6, 0xB5B5B5], [-0.3, 0.45, 0.8]))
+         }
+     } else if tile == blocks.TILE_GLASS {
+-        let border = px == 0 || py == 0 || px == 15 || py == 15
+-        let glint = (px == py + 3 && px > 4 && px < 9) || (px == py + 4 && px > 5 && px < 10)
+-        if border || glint {
+-            put(pixels, tile, px, py, 210, 232, 240, 255)
++        // A pale frame with a glint in two corners.
++        let glint = (px + py == 6 && px >= 2 && px <= 4) || (px + py == 25 && px >= 12 && px <= 13)
++        if px == 0 || py == 0 {
++            paint(pixels, tile, px, py, 0xD0EAE9)
++        } else if px == 15 || py == 15 {
++            paint(pixels, tile, px, py, pick(random, [0x8BC1CD, 0xA8D0D9], [0.6]))
++        } else if glint {
++            paint(pixels, tile, px, py, 0xD0EAE9)
+         } else {
+-            put(pixels, tile, px, py, 0, 0, 0, 0)
++            clear(pixels, tile, px, py)
+         }
+     } else if tile == blocks.TILE_BEDROCK {
+-        if noise.hash(px, py, 77) % 3 == 0 {
+-            speckle(pixels, tile, px, py, 40, 40, 40, 10)
+-        } else {
+-            speckle(pixels, tile, px, py, 84, 84, 84, 16)
+-        }
++        let value = tiled(px, py, 8, 8, 151) * 0.6 + random * 0.4
++        paint(pixels, tile, px, py, pick(value, [0x222222, 0x333333, 0x575757, 0x636363, 0x979797], [0.22, 0.48, 0.6, 0.7]))
+     } else if tile == blocks.TILE_BRICK {
++        // Bricks lit along their top, darker along their bottom, in pale mortar.
+         let row = py / 4
+-        let mortar = py % 4 == 3 || (px + (row % 2) * 4) % 8 == 7
+-        if mortar {
+-            speckle(pixels, tile, px, py, 196, 190, 178, 6)
++        let rowPixel = py % 4
++        let column = (px + (row % 2) * 4) % 8
++        if rowPixel == 3 {
++            paint(pixels, tile, px, py, pick(random, [0x8B6E67, 0xA2867D, 0xA9948D], [0.25, 0.8]))
++        } else if column == 7 {
++            paint(pixels, tile, px, py, pick(random, [0x8B6E67, 0xA2867D], [0.7]))
++        } else if rowPixel == 0 {
++            paint(pixels, tile, px, py, pick(random, [0x9B5643, 0xB1624D, 0xC66851], [0.2, 0.75]))
++        } else if rowPixel == 1 {
++            paint(pixels, tile, px, py, pick(random, [0x8F503F, 0x9B5643, 0xB1624D], [0.3, 0.85]))
+         } else {
+-            speckle(pixels, tile, px, py, 150, 64, 48, 12)
++            paint(pixels, tile, px, py, pick(random, [0x733F31, 0x7C4536, 0x8F503F], [0.3, 0.75]))
+         }
+     } else if tile == blocks.TILE_SNOW {
+-        speckle(pixels, tile, px, py, 236, 244, 250, 6)
++        snow(pixels, tile, px, py)
+     } else if tile == blocks.TILE_SUN {
+-        let edge = px < 2 || py < 2 || px > 13 || py > 13
+-        if edge {
+-            put(pixels, tile, px, py, 255, 236, 140, 255)
++        // A square sun: a gold edge, a pale ring, and a white-hot middle. The
++        // corners stay see-through; its glow is drawn separately.
++        let ring = Integer(max(abs(Float(px) - 7.5), abs(Float(py) - 7.5)))
++        if ring < 2 {
++            paint(pixels, tile, px, py, 0xFFFFD9)
++        } else if ring < 3 {
++            paint(pixels, tile, px, py, 0xFFFFAA)
++        } else if ring < 4 {
++            paint(pixels, tile, px, py, 0xFFD54A)
+         } else {
+-            put(pixels, tile, px, py, 255, 252, 214, 255)
++            clear(pixels, tile, px, py)
+         }
+     } else if tile == blocks.TILE_MOON {
+-        let crater = noise.hash(px / 3, py / 3, 12) % 4 == 0
+-        if crater {
+-            put(pixels, tile, px, py, 176, 180, 196, 255)
++        // A square moon, pale toward the top left, with dark seas along its
++        // right and bottom edges.
++        if px >= 4 && px <= 11 && py >= 4 && py <= 11 {
++            if px >= 10 || py >= 10 {
++                paint(pixels, tile, px, py, pick(random, [0x50545E, 0x5F636E, 0x74788A], [0.35, 0.75]))
++            } else {
++                paint(pixels, tile, px, py, pick(random, [0x9094A0, 0xAFB3C0, 0xD9DCE6], [0.2, 0.5]))
++            }
+         } else {
+-            put(pixels, tile, px, py, 222, 226, 238, 255)
++            clear(pixels, tile, px, py)
+         }
+     } else if tile == blocks.TILE_CLOUD {
+         put(pixels, tile, px, py, 255, 255, 255, 255)
+     } else if tile == blocks.TILE_TALL_GRASS {
+-        // Blades of varied height rising from the bottom edge.
+-        let bladeTop = 4 + noise.hash(px, 0, 301) % 9
+-        let blade = px % 3 != 1 || noise.hash(px, 1, 302) % 2 == 0
+-        if blade && py >= bladeTop && px > 0 && px < 15 {
+-            speckle(pixels, tile, px, py, 84 + (15 - py) * 2, 150 + (15 - py) * 2, 52, 14)
+-        } else {
+-            put(pixels, tile, px, py, 0, 0, 0, 0)
+-        }
+-    } else if tile == blocks.TILE_RED_FLOWER || tile == blocks.TILE_YELLOW_FLOWER {
+-        let dx = px - 7
+-        let dy = py - 5
+-        let petal = dx * dx + dy * dy <= 6
+-        let stem = (px == 7 || px == 8) && py > 6
+-        let leaf = py == 11 && (px == 5 || px == 6 || px == 9 || px == 10)
+-        if petal {
+-            if dx * dx + dy * dy <= 1 {
+-                put(pixels, tile, px, py, 250, 214, 60, 255)
+-            } else if tile == blocks.TILE_RED_FLOWER {
+-                speckle(pixels, tile, px, py, 214, 40, 36, 12)
+-            } else {
+-                speckle(pixels, tile, px, py, 248, 222, 52, 10)
++        // Thin blades of varied height, some leaning, rising from a dense
++        // tangle along the bottom; darker toward the ground.
++        let found = py >= 12 && random >= 0.15
++        for blade in 0..16 {
++            let height = 3 + noise.hash(blade, 2, 301) % 11
++            let lean = noise.hash(blade, 3, 301) % 3 - 1
++            if noise.hash(blade, 1, 301) % 4 != 0 && py >= 16 - height && px == blade + lean * (15 - py) / 4 {
++                found = true
+             }
+-        } else if stem || leaf {
+-            speckle(pixels, tile, px, py, 64, 140, 48, 10)
++        }
++        if found {
++            let value = random * 0.45 + Float(15 - py) / 14.0 * 0.55
++            paint(pixels, tile, px, py, pick(value, [0x3D5025, 0x435829, 0x4A5F2D, 0x526B32, 0x5A7637, 0x688740], [0.18, 0.32, 0.48, 0.64, 0.8]))
+         } else {
+-            put(pixels, tile, px, py, 0, 0, 0, 0)
++            clear(pixels, tile, px, py)
++        }
++    } else if tile == blocks.TILE_RED_FLOWER {
++        // A short poppy: a red bloom lit from the top left on a thin stem with
++        // two leaves near the ground.
++        let head = (py == 5 && (px == 7 || px == 8)) || (py == 6 && px >= 5 && px <= 9) || (py == 7 && px >= 5 && px <= 10) || (py == 8 && px >= 5 && px <= 9) || (py == 9 && px >= 6 && px <= 8)
++        let leaf = (py == 12 && (px == 5 || px == 10)) || (py == 13 && (px == 6 || px == 9))
++        if head {
++            let side = (px - 7) + (py - 7)
++            if px == 7 && py == 7 {
++                paint(pixels, tile, px, py, 0x742303)
++            } else if side < 0 {
++                paint(pixels, tile, px, py, 0xED302C)
++            } else if side < 2 {
++                paint(pixels, tile, px, py, 0xBF2529)
++            } else {
++                paint(pixels, tile, px, py, 0x9B221A)
++            }
++        } else if px == 7 && py > 9 {
++            paint(pixels, tile, px, py, pick(Float(py), [0x2B702A, 0x265A25, 0x204626], [12.5, 14.5]))
++        } else if (px == 8 && py == 14) || leaf {
++            paint(pixels, tile, px, py, pick(random, [0x204626, 0x2B702A, 0x4A8F28], [0.3, 0.7]))
++        } else {
++            clear(pixels, tile, px, py)
++        }
++    } else if tile == blocks.TILE_YELLOW_FLOWER {
++        // A short dandelion: a round yellow head low on a stem, leaves below.
++        let hx = abs(px - 7)
++        let hy = abs(py - 9)
++        let head = hx + hy <= 2 || (hx <= 2 && hy <= 1 && px != 5)
++        let leaf = (py == 12 && (px == 5 || px == 6)) || (py == 13 && px >= 8 && px <= 10) || (py == 14 && px == 6)
++        if head {
++            let side = (px - 7) + (py - 9)
++            if px == 7 && py == 9 {
++                paint(pixels, tile, px, py, 0xF19D25)
++            } else if side < 0 {
++                paint(pixels, tile, px, py, 0xFFEC4F)
++            } else if side < 3 {
++                paint(pixels, tile, px, py, 0xFED639)
++            } else {
++                paint(pixels, tile, px, py, 0xF19D25)
++            }
++        } else if px == 7 && py > 11 {
++            paint(pixels, tile, px, py, 0x177C04)
++        } else if leaf {
++            paint(pixels, tile, px, py, pick(random, [0x177C04, 0x4A8F28, 0x55AB2D], [0.35, 0.7]))
++        } else {
++            clear(pixels, tile, px, py)
+         }
+     } else if tile == blocks.TILE_TORCH {
+-        let stick = (px == 7 || px == 8) && py >= 6
+-        let flame = px >= 6 && px <= 9 && py >= 2 && py <= 5
+-        if flame {
+-            if py <= 3 {
+-                put(pixels, tile, px, py, 255, 240, 150, 255)
++        // The 3D torch is the two-pixel column from row 6 down, lit on the
++        // left, with a two by two flame on top.
++        if px == 7 && py == 6 {
++            paint(pixels, tile, px, py, 0xFFD800)
++        } else if px == 8 && py == 6 {
++            paint(pixels, tile, px, py, 0xFF8F00)
++        } else if px == 7 && py == 7 {
++            paint(pixels, tile, px, py, 0xFFFF97)
++        } else if px == 8 && py == 7 {
++            paint(pixels, tile, px, py, 0xFFFFFF)
++        } else if px == 7 && py > 7 {
++            paint(pixels, tile, px, py, pick(random, [0x957546, 0x9F7F50], [0.5]))
++        } else if px == 8 && py > 7 {
++            if py == 15 {
++                paint(pixels, tile, px, py, 0x423522)
+             } else {
+-                put(pixels, tile, px, py, 255, 170, 40, 255)
++                paint(pixels, tile, px, py, pick(random, [0x55452E, 0x6D5736], [0.5]))
+             }
+-        } else if stick {
+-            speckle(pixels, tile, px, py, 120, 90, 50, 8)
+         } else {
+-            put(pixels, tile, px, py, 0, 0, 0, 0)
++            clear(pixels, tile, px, py)
+         }
+     } else if tile >= blocks.TILE_COAL_ORE && tile <= blocks.TILE_DIAMOND_ORE {
+-        let fleck = noise.hash(px / 2, py / 2, tile * 13) % 6 == 0 && px > 1 && py > 1 && px < 14 && py < 14
+-        if !fleck {
+-            speckle(pixels, tile, px, py, 128, 128, 128, 10)
+-        } else if tile == blocks.TILE_COAL_ORE {
+-            speckle(pixels, tile, px, py, 34, 34, 34, 8)
+-        } else if tile == blocks.TILE_IRON_ORE {
+-            speckle(pixels, tile, px, py, 216, 176, 146, 10)
+-        } else if tile == blocks.TILE_GOLD_ORE {
+-            speckle(pixels, tile, px, py, 250, 218, 64, 10)
+-        } else {
+-            speckle(pixels, tile, px, py, 96, 226, 222, 10)
+-        }
++        drawOre(pixels, tile, px, py)
+     } else {
+         put(pixels, tile, px, py, 255, 0, 255, 255)
+     }
+ }
+ 
++// Read one channel of a tile's texel.
++function texel(pixels: Bytes, tile: Integer, px: Integer, py: Integer, channel: Integer): Integer {
++    let x = (tile % 16) * 16 + clamp(px, 0, 15)
++    let y = (tile / 16) * 16 + clamp(py, 0, 15)
++    return pixels[(y * ATLAS_SIZE + x) * 4 + channel]
++}
++
++// Draw a block's icon: plants as their picture, everything else as a cube seen
++// from above, with the top, left, and right faces lit differently. Each pixel
++// averages four samples so the cube's edges are smooth.
++function drawIcon(pixels: Bytes, block: Integer) {
++    let left = (block % 8) * 32
++    let top = ICON_TOP + (block / 8) * 32
++    for iy in 0..32 {
++        for ix in 0..32 {
++            let red = 0.0
++            let green = 0.0
++            let blue = 0.0
++            let covered = 0
++            for sample in 0..4 {
++                let x = Float(ix) + 0.25 + Float(sample % 2) * 0.5
++                let y = Float(iy) + 0.25 + Float(sample / 2) * 0.5
++                let tile = -1
++                let u = 0.0
++                let v = 0.0
++                let light = 1.0
++                if blocks.isPlant(block) {
++                    tile = blocks.tile(block, blocks.FACE_SIDE)
++                    u = x / 2.0
++                    v = y / 2.0
++                } else {
++                    // The top face is a diamond from (16, 1) spanning to
++                    // (2, 8) and (30, 8); the sides hang 16 pixels below it.
++                    let a = ((x - 16.0) / 14.0 + (y - 1.0) / 7.0) / 2.0
++                    let b = ((y - 1.0) / 7.0 - (x - 16.0) / 14.0) / 2.0
++                    if a >= 0.0 && a < 1.0 && b >= 0.0 && b < 1.0 {
++                        tile = blocks.tile(block, blocks.FACE_TOP)
++                        u = a * 16.0
++                        v = b * 16.0
++                    } else if x < 16.0 {
++                        a = (x - 2.0) / 14.0
++                        b = (y - 8.0 - 7.0 * a) / 16.0
++                        if a >= 0.0 && b >= 0.0 && b < 1.0 {
++                            tile = blocks.tile(block, blocks.FACE_SIDE)
++                            u = a * 16.0
++                            v = b * 16.0
++                            light = 0.8
++                        }
++                    } else {
++                        a = (x - 16.0) / 14.0
++                        b = (y - 15.0 + 7.0 * a) / 16.0
++                        if a < 1.0 && b >= 0.0 && b < 1.0 {
++                            tile = blocks.tile(block, blocks.FACE_SIDE)
++                            u = a * 16.0
++                            v = b * 16.0
++                            light = 0.62
++                        }
++                    }
++                }
++                if tile >= 0 {
++                    let tu = Integer(u)
++                    let tv = Integer(v)
++                    if texel(pixels, tile, tu, tv, 3) > 127 {
++                        red += Float(texel(pixels, tile, tu, tv, 0)) * light
++                        green += Float(texel(pixels, tile, tu, tv, 1)) * light
++                        blue += Float(texel(pixels, tile, tu, tv, 2)) * light
++                        covered += 1
++                    }
++                }
++            }
++            if covered > 0 {
++                let index = ((top + iy) * ATLAS_SIZE + left + ix) * 4
++                pixels[index] = Integer(red / Float(covered))
++                pixels[index + 1] = Integer(green / Float(covered))
++                pixels[index + 2] = Integer(blue / Float(covered))
++                pixels[index + 3] = covered * 255 / 4
++            }
++        }
++    }
++}
++
+ public function build(): Bytes {
+     let pixels = Bytes(ATLAS_SIZE * ATLAS_SIZE * 4)
+     for tile in 0..blocks.TILE_COUNT {
+@@ -208,14 +519,17 @@ public function build(): Bytes {
+             }
+         }
+     }
++    for block in 1..blocks.BLOCK_COUNT {
++        drawIcon(pixels, block)
++    }
+     return pixels
+ }
+ 
+-// Atlas coordinates of a tile, for drawing block icons.
+-public function tileU(tile: Integer): Float {
+-    return Float(tile % 16) / 16.0
++// The top left corner of a block's icon in texture coordinates.
++public function iconU(block: Integer): Float {
++    return Float(block % 8) * ICON_SIZE
+ }
+ 
+-public function tileV(tile: Integer): Float {
+-    return Float(tile / 16) / 16.0
++public function iconV(block: Integer): Float {
++    return Float(ICON_TOP + (block / 8) * 32) / Float(ATLAS_SIZE)
+ }
+diff --git i/runtime/native/graphics.c w/runtime/native/graphics.c
+index e3abc9c..a882c6c 100644
+--- i/runtime/native/graphics.c
++++ w/runtime/native/graphics.c
+@@ -23,6 +23,7 @@
+ #include <signal.h>
+ #include <stdint.h>
+ #include "../minyar_native.h"
++#include "opengl-functions.h"
+ 
+ enum { VERTEX_FLOATS = 10, VERTEX_BYTES = VERTEX_FLOATS * 4, KEY_COUNT = GLFW_KEY_LAST + 1, BUTTON_COUNT = 8 };
+ 
+@@ -42,10 +43,10 @@ static GLuint world_program, overlay_program, texture, white_texture;
+ static GLuint line_array, line_buffer, overlay_array, overlay_buffer;
+ static Mesh *meshes;
+ static size_t mesh_count, mesh_capacity;
++static size_t mesh_next_slot;
+ static FloatBuffer lines, overlay;
+ enum { OVERLAY_FLOATS = 9 };
+ static float view_projection[16], camera[3], fog_color[3] = {0.6f, 0.75f, 0.95f}, fog_range[2] = {1e6f, 1e6f + 1};
+-static int texture_width = 1, texture_height = 1;
+ static float light_level = 1.0f;
+ static unsigned char key_down[KEY_COUNT], key_pressed[KEY_COUNT];
+ static unsigned char button_down[BUTTON_COUNT], button_pressed[BUTTON_COUNT];
+@@ -304,6 +305,11 @@ void minyar_graphics_openWindow(long long width, long long height, const MinyarT
+     window = glfwCreateWindow((int)width, (int)height, name, NULL, NULL);
+     if (!window) stop_graphics("the window could not be opened.");
+     glfwMakeContextCurrent(window);
++    const char *missing_function = minyar_load_opengl();
++    if (missing_function) {
++        fprintf(stderr, "graphics: unavailable OpenGL function: %s\n", missing_function);
++        stop_graphics("the graphics driver does not support the required OpenGL 3.3 functions.");
++    }
+     glfwSwapInterval(1);
+     glfwSetKeyCallback(window, on_key);
+     glfwSetMouseButtonCallback(window, on_button);
+@@ -384,21 +390,28 @@ static void png_u32(unsigned char *out, unsigned long value) {
+     out[2] = (unsigned char)(value >> 8); out[3] = (unsigned char)value;
+ }
+ 
++static void png_write(FILE *file, const unsigned char *data, size_t length) {
++    if (fwrite(data, 1, length, file) != length)
++        stop_graphics("the screenshot file could not be written.");
++}
++
+ static void png_chunk(FILE *file, const char *type, const unsigned char *data, size_t length) {
+     unsigned char header[8];
+     png_u32(header, (unsigned long)length);
+     memcpy(header + 4, type, 4);
+-    fwrite(header, 1, 8, file);
+-    if (length) fwrite(data, 1, length, file);
++    png_write(file, header, 8);
++    if (length) png_write(file, data, length);
+     unsigned long crc = png_crc(0xffffffffUL, header + 4, 4);
+     crc = png_crc(crc, data, length) ^ 0xffffffffUL;
+     unsigned char tail[4];
+     png_u32(tail, crc);
+-    fwrite(tail, 1, 4, file);
++    png_write(file, tail, 4);
+ }
+ 
+ static void write_screenshot(void) {
+     int width = framebuffer_width, height = framebuffer_height;
++    /* A minimized window may have no pixels. Keep the request for a drawable frame. */
++    if (width < 1 || height < 1) return;
+     size_t row = (size_t)width * 3 + 1, raw_length = row * (size_t)height;
+     unsigned char *pixels = malloc((size_t)width * height * 4), *raw = malloc(raw_length);
+     size_t blocks = raw_length / 65535 + 1;
+@@ -437,11 +450,11 @@ static void write_screenshot(void) {
+     png_u32(header, (unsigned long)width);
+     png_u32(header + 4, (unsigned long)height);
+     header[8] = 8; header[9] = 2; header[10] = 0; header[11] = 0; header[12] = 0;
+-    fwrite(signature, 1, 8, file);
++    png_write(file, signature, 8);
+     png_chunk(file, "IHDR", header, 13);
+     png_chunk(file, "IDAT", compressed, length);
+     png_chunk(file, "IEND", NULL, 0);
+-    fclose(file);
++    if (fclose(file)) stop_graphics("the screenshot file could not be written.");
+     free(pixels); free(raw); free(compressed);
+     screenshot_path[0] = 0;
+ }
+@@ -601,8 +614,6 @@ void minyar_graphics_setTexture(const MinyarBytes *pixels, long long width, long
+         stop_graphics("setTexture needs width * height * 4 bytes of RGBA pixels.");
+     if (texture != white_texture) glDeleteTextures(1, &texture);
+     texture = make_texture(pixels->bytes, (int)width, (int)height, 1);
+-    texture_width = (int)width;
+-    texture_height = (int)height;
+ }
+ 
+ static Mesh *find_mesh(long long handle) {
+@@ -613,7 +624,8 @@ static Mesh *find_mesh(long long handle) {
+ 
+ long long minyar_graphics_createMesh(void) {
+     require_window();
+-    size_t slot = 0;
++    /* Lower slots are occupied; deletion lowers this hint to preserve handle reuse. */
++    size_t slot = mesh_next_slot;
+     while (slot < mesh_count && meshes[slot].used) slot++;
+     if (slot == mesh_count) {
+         if (mesh_count == mesh_capacity) {
+@@ -634,6 +646,7 @@ long long minyar_graphics_createMesh(void) {
+     glBindBuffer(GL_ARRAY_BUFFER, mesh->buffer);
+     world_layout();
+     glBindVertexArray(0);
++    mesh_next_slot = slot + 1;
+     return (long long)slot + 1;
+ }
+ 
+@@ -718,6 +731,8 @@ void minyar_graphics_deleteMesh(long long handle) {
+     glDeleteBuffers(1, &mesh->buffer);
+     glDeleteVertexArrays(1, &mesh->array);
+     mesh->used = 0;
++    size_t slot = (size_t)handle - 1;
++    if (slot < mesh_next_slot) mesh_next_slot = slot;
+ }
+ 
+ void minyar_graphics_drawLine(double x1, double y1, double z1, double x2, double y2, double z2,

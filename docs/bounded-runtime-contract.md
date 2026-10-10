@@ -90,6 +90,11 @@ aggregates, and Lists containing only immortal references can be freed
 immediately. Once a List receives a mortal reference, it permanently switches
 to ordinary reference traversal.
 
+Destroying a Text view frees its own header/index and drops its reference to
+the owning Text. If that drop makes the owner unreachable, the owner joins the
+object queue as a fieldless task. Its destruction consumes a separate work
+unit, so even a K=1 release cannot destroy both objects in one call.
+
 Ordinary heap-frame exit and statement cleanup detach owner chains without
 scanning them or allocating queue metadata. Stack-frame exit immediately visits
 its written owner slots (at most `min(8, K−1)`), charges those visits to K, and

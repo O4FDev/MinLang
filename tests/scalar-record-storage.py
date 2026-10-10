@@ -4,10 +4,11 @@ import re
 import subprocess
 import unittest
 from regressions import CLANG, ROOT, CompilerTestCase
+from clang_helpers import clang_command
 
 
 def body_of(llvm, name):
-    match = re.search(r'^define\b[^\n]*@' + re.escape(name) + r'\([^\n]*\)[^{]*\{(.*?)^}', llvm, re.M | re.S)
+    match = re.search(r'^define\b[^\n]*@' + re.escape('.minyar.fn.' + name) + r'\([^\n]*\)[^{]*\{(.*?)^}', llvm, re.M | re.S)
     if not match:
         raise AssertionError(f'missing function {name}')
     return match[1]
@@ -26,8 +27,8 @@ class ScalarRecordStorage(CompilerTestCase):
         self.assertNotIn('@minyar_rc_', body)
         self.assertEqual(body.count('; scalar record '), 1)
         optimized = llvm.with_suffix('.optimized.ll')
-        result = subprocess.run([CLANG, '-O2', '-S', '-emit-llvm', '-Wno-override-module',
-            str(llvm), '-o', str(optimized)], capture_output=True, text=True, timeout=30)
+        result = subprocess.run(clang_command([CLANG, '-O2', '-S', '-emit-llvm', '-Wno-override-module',
+            str(llvm), '-o', str(optimized)]), capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         hot = body_of(optimized.read_text(), 'criticalRecords')
         self.assertNotIn('alloca ', hot)

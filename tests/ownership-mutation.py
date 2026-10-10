@@ -22,11 +22,11 @@ def main():
             'void minyar_rc_local_take(long long index, void *value) {\n    minyar_rc_retain(value);\n'),
         'local replacement forgets previous owner': ('minyar_rc.h',
             '    minyar_rc_release(previous);', '    (void)previous;'),
-        'list retains transferred ownership': ('minyar_runtime.c',
+        'list retains transferred ownership': ('minyar_collections.h',
             'void minyar_list_add_take(MinyarList *list, long long value) {',
             'void minyar_list_add_take(MinyarList *list, long long value) {\n'
             '    minyar_rc_retain((void *)(intptr_t)value);'),
-        'record retains transferred ownership': ('minyar_runtime.c',
+        'record retains transferred ownership': ('minyar_collections.h',
             'void minyar_record_set_take(MinyarRecord *record, long long field, long long value) {',
             'void minyar_record_set_take(MinyarRecord *record, long long field, long long value) {\n'
             '    minyar_rc_retain((void *)(intptr_t)value);'),
@@ -37,7 +37,7 @@ def main():
         (directory / 'tests').mkdir()
         shutil.copyfile(ROOT / 'tests/runtime-unit.c', directory / 'tests/runtime-unit.c')
         for name, mutation in [('control', None), *mutations.items()]:
-            for filename in ('minyar_rc.h', 'minyar_runtime.c'):
+            for filename in ('minyar_runtime.c', *(path.name for path in (ROOT / 'runtime').glob('*.h'))):
                 text = (ROOT / 'runtime' / filename).read_text()
                 if mutation and mutation[0] == filename:
                     assert text.count(mutation[1]) == 1, (name, 'mutation site changed')

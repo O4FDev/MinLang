@@ -32,7 +32,8 @@ enum {
     TYPE_LIST_INTEGER = 101,
     TYPE_LIST_TEXT,
     TYPE_LIST_CHARACTER,
-    TYPE_LIST_BOOLEAN
+    TYPE_LIST_BOOLEAN,
+    TYPE_RECORD_START = 1000
 };
 
 typedef int Type;
@@ -53,7 +54,8 @@ typedef enum {
     EXPRESSION_MEMBER,
     EXPRESSION_INDEX,
     EXPRESSION_LIST,
-    EXPRESSION_METHOD_CALL
+    EXPRESSION_METHOD_CALL,
+    EXPRESSION_RECORD
 } ExpressionKind;
 
 typedef enum {
@@ -72,6 +74,11 @@ typedef struct {
     int line;
     int column;
 } Parameter;
+
+typedef struct {
+    char *name;
+    Parameter *fields;
+} Record;
 
 typedef struct {
     char *name;
@@ -94,6 +101,7 @@ struct Expression {
     Expression *left;
     Expression *right;
     Expression **arguments;
+    char **field_names;
 };
 
 struct Statement {
@@ -124,6 +132,7 @@ struct Function {
 typedef struct {
     Function *functions;
     Expression **text_literals;
+    Record *records;
 } Program;
 
 typedef struct {
@@ -139,6 +148,8 @@ typedef struct {
     const char *cursor;
     int line;
     int column;
+    int round_depth;
+    int square_depth;
 } Lexer;
 
 typedef struct {
@@ -150,6 +161,7 @@ typedef struct {
 typedef struct {
     FILE *output;
     Function *function;
+    Program *program;
     int next_temporary;
     int next_label;
     char current_block[64];
@@ -186,7 +198,8 @@ static void *allocate(size_t size) {
 
 static char *copy_text(const char *start, size_t length) {
     char *text = allocate(length + 1);
-    memcpy(text, start, length);
+    if (length)
+        memcpy(text, start, length);
     return text;
 }
 
@@ -224,8 +237,7 @@ static void skip_horizontal_space_and_comments(Lexer *lexer) {
             int column = lexer->column;
             take(lexer);
             take(lexer);
-            while (peek(lexer) &&
-                   !(lexer->cursor[0] == '*' && lexer->cursor[1] == '/'))
+            while (peek(lexer) && !(lexer->cursor[0] == '*' && lexer->cursor[1] == '/'))
                 take(lexer);
             if (!peek(lexer))
                 fail_at(line, column, "this block comment is never closed");
@@ -240,13 +252,20 @@ static void skip_horizontal_space_and_comments(Lexer *lexer) {
 static int escaped_character(Lexer *lexer, int line, int column) {
     int c = take(lexer);
     switch (c) {
-    case '0': return '\0';
-    case 'n': return '\n';
-    case 'r': return '\r';
-    case 't': return '\t';
-    case '\\': return '\\';
-    case '"': return '"';
-    case '\'': return '\'';
+    case '0':
+        return '\0';
+    case 'n':
+        return '\n';
+    case 'r':
+        return '\r';
+    case 't':
+        return '\t';
+    case '\\':
+        return '\\';
+    case '"':
+        return '"';
+    case '\'':
+        return '\'';
     default:
         fail_at(line, column, "I don't recognise the escape sequence \\%c", c);
         return 0;
@@ -258,7 +277,12 @@ static Token next_token(Lexer *lexer) {
     const char *start;
     char *text = NULL;
 
-    skip_horizontal_space_and_comments(lexer);
+    do {
+        skip_horizontal_space_and_comments(lexer);
+        if (peek(lexer) != '\n' || (!lexer->round_depth && !lexer->square_depth))
+            break;
+        take(lexer);
+    } while (1);
     token.line = lexer->line;
     token.column = lexer->column;
 
@@ -272,15 +296,14 @@ static Token next_token(Lexer *lexer) {
         return token;
     }
 
-    if ((peek(lexer) >= 'a' && peek(lexer) <= 'z') ||
-        (peek(lexer) >= 'A' && peek(lexer) <= 'Z') || peek(lexer) == '_') {
+    if ((peek(lexer) >= 'a' && peek(lexer) <= 'z') || (peek(lexer) >= 'A' && peek(lexer) <= 'Z') ||
+        peek(lexer) == '_') {
         start = lexer->cursor;
         do {
             take(lexer);
         } while ((peek(lexer) >= 'a' && peek(lexer) <= 'z') ||
                  (peek(lexer) >= 'A' && peek(lexer) <= 'Z') ||
-                 (peek(lexer) >= '0' && peek(lexer) <= '9') ||
-                 peek(lexer) == '_');
+                 (peek(lexer) >= '0' && peek(lexer) <= '9') || peek(lexer) == '_');
         token.kind = TOKEN_NAME;
         token.text = copy_text(start, (size_t)(lexer->cursor - start));
         return token;
@@ -293,7 +316,8 @@ static Token next_token(Lexer *lexer) {
             if (token.integer > (LLONG_MAX - digit) / 10)
                 fail_at(token.line, token.column,
                         "this Integer is larger than Minyar currently supports");
-            token.integer = token.integer * 10 + take(lexer) - '0';
+            take(lexer);
+            token.integer = token.integer * 10 + digit;
         }
         return token;
     }
@@ -324,14 +348,12 @@ static Token next_token(Lexer *lexer) {
         int character;
         take(lexer);
         if (!peek(lexer) || peek(lexer) == '\n' || peek(lexer) == '\'')
-            fail_at(token.line, token.column,
-                    "a character literal contains exactly one character");
+            fail_at(token.line, token.column, "a character literal contains exactly one character");
         character = take(lexer);
         if (character == '\\')
             character = escaped_character(lexer, token.line, token.column);
         if (peek(lexer) != '\'')
-            fail_at(token.line, token.column,
-                    "a character literal contains exactly one character");
+            fail_at(token.line, token.column, "a character literal contains exactly one character");
         take(lexer);
         token.kind = TOKEN_CHARACTER;
         token.integer = character;
@@ -339,31 +361,56 @@ static Token next_token(Lexer *lexer) {
     }
 
     if (lexer->cursor[0] == '=' && lexer->cursor[1] == '=') {
-        take(lexer); take(lexer); token.kind = TOKEN_EQUAL_EQUAL; return token;
+        take(lexer);
+        take(lexer);
+        token.kind = TOKEN_EQUAL_EQUAL;
+        return token;
     }
     if (lexer->cursor[0] == '!' && lexer->cursor[1] == '=') {
-        take(lexer); take(lexer); token.kind = TOKEN_NOT_EQUAL; return token;
+        take(lexer);
+        take(lexer);
+        token.kind = TOKEN_NOT_EQUAL;
+        return token;
     }
     if (lexer->cursor[0] == '<' && lexer->cursor[1] == '=') {
-        take(lexer); take(lexer); token.kind = TOKEN_LESS_EQUAL; return token;
+        take(lexer);
+        take(lexer);
+        token.kind = TOKEN_LESS_EQUAL;
+        return token;
     }
     if (lexer->cursor[0] == '>' && lexer->cursor[1] == '=') {
-        take(lexer); take(lexer); token.kind = TOKEN_GREATER_EQUAL; return token;
+        take(lexer);
+        take(lexer);
+        token.kind = TOKEN_GREATER_EQUAL;
+        return token;
     }
     if (lexer->cursor[0] == '&' && lexer->cursor[1] == '&') {
-        take(lexer); take(lexer); token.kind = TOKEN_AND; return token;
+        take(lexer);
+        take(lexer);
+        token.kind = TOKEN_AND;
+        return token;
     }
     if (lexer->cursor[0] == '|' && lexer->cursor[1] == '|') {
-        take(lexer); take(lexer); token.kind = TOKEN_OR; return token;
+        take(lexer);
+        take(lexer);
+        token.kind = TOKEN_OR;
+        return token;
     }
 
     if (strchr("(){}[]:,.;+-*/%=!<>", peek(lexer))) {
         token.kind = take(lexer);
+        if (token.kind == '(')
+            lexer->round_depth++;
+        if (token.kind == ')' && lexer->round_depth)
+            lexer->round_depth--;
+        if (token.kind == '[')
+            lexer->square_depth++;
+        if (token.kind == ']' && lexer->square_depth)
+            lexer->square_depth--;
         return token;
     }
 
-    fail_at(token.line, token.column,
-            "I don't recognise the character '%c'", peek(lexer));
+    fail_at(token.line, token.column, "I don't recognise the character '%c'", peek(lexer));
     return token;
 }
 
@@ -378,8 +425,7 @@ static void advance(Parser *parser) {
 }
 
 static int word_is(Parser *parser, const char *word) {
-    return parser->token.kind == TOKEN_NAME &&
-           strcmp(parser->token.text, word) == 0;
+    return parser->token.kind == TOKEN_NAME && strcmp(parser->token.text, word) == 0;
 }
 
 static void skip_separators(Parser *parser) {
@@ -389,27 +435,31 @@ static void skip_separators(Parser *parser) {
 
 static void expect(Parser *parser, int kind, const char *description) {
     if (parser->token.kind != kind)
-        fail_at(parser->token.line, parser->token.column,
-                "I expected %s here", description);
+        fail_at(parser->token.line, parser->token.column, "I expected %s here", description);
     advance(parser);
 }
 
 static void expect_word(Parser *parser, const char *word) {
     if (!word_is(parser, word))
-        fail_at(parser->token.line, parser->token.column,
-                "I expected '%s' here", word);
+        fail_at(parser->token.line, parser->token.column, "I expected '%s' here", word);
     advance(parser);
 }
 
 static char *take_name(Parser *parser, const char *description) {
     char *name;
     if (parser->token.kind != TOKEN_NAME)
-        fail_at(parser->token.line, parser->token.column,
-                "I expected %s here", description);
+        fail_at(parser->token.line, parser->token.column, "I expected %s here", description);
     name = parser->token.text;
     parser->token.text = NULL;
     advance(parser);
     return name;
+}
+
+static int find_record(Program *program, const char *name) {
+    for (int index = 0; index < arrlen(program->records); index++)
+        if (strcmp(program->records[index].name, name) == 0)
+            return index;
+    return -1;
 }
 
 static Type parse_type(Parser *parser) {
@@ -433,10 +483,15 @@ static Type parse_type(Parser *parser) {
                     "lists currently contain Integer, Text, Character, or Boolean values");
         expect(parser, '>', "a closing '>' after the list's element type");
         return TYPE_LIST_INTEGER + type - TYPE_INTEGER;
+    } else {
+        int record = parser->token.kind == TOKEN_NAME
+                         ? find_record(&parser->program, parser->token.text)
+                         : -1;
+        if (record < 0)
+            fail_at(parser->token.line, parser->token.column,
+                    "I expected a type such as Integer, Text, Character, or Boolean");
+        type = TYPE_RECORD_START + record;
     }
-    else
-        fail_at(parser->token.line, parser->token.column,
-                "I expected a type such as Integer, Text, Character, or Boolean");
     advance(parser);
     return type;
 }
@@ -496,6 +551,29 @@ static Expression *parse_atom(Parser *parser) {
     if (parser->token.kind == TOKEN_NAME) {
         expression = new_expression(parser, EXPRESSION_NAME);
         expression->text = take_name(parser, "a name");
+        int record = find_record(&parser->program, expression->text);
+        if (record >= 0 && parser->token.kind == '{') {
+            expression->kind = EXPRESSION_RECORD;
+            expression->type = TYPE_RECORD_START + record;
+            advance(parser);
+            skip_separators(parser);
+            while (parser->token.kind != '}') {
+                char *field = take_name(parser, "a record field name");
+                expect(parser, ':', "a ':' before a record field value");
+                Expression *value = parse_expression(parser);
+                arrput(expression->field_names, field);
+                arrput(expression->arguments, value);
+                if (parser->token.kind == ',')
+                    advance(parser);
+                else if (parser->token.kind != '}' && parser->token.kind != TOKEN_NEWLINE &&
+                         parser->token.kind != ';')
+                    fail_at(parser->token.line, parser->token.column,
+                            "record fields need a comma or newline");
+                skip_separators(parser);
+            }
+            advance(parser);
+            return expression;
+        }
         if (parser->token.kind == '(') {
             Expression *call = allocate(sizeof(*call));
             *call = *expression;
@@ -527,8 +605,7 @@ static Expression *parse_atom(Parser *parser) {
         expect(parser, ']', "a closing bracket for this empty list");
         return expression;
     }
-    fail_at(parser->token.line, parser->token.column,
-            "I expected a value or expression here");
+    fail_at(parser->token.line, parser->token.column, "I expected a value or expression here");
     return NULL;
 }
 
@@ -580,9 +657,8 @@ static Expression *parse_unary(Parser *parser) {
     return parse_primary(parser);
 }
 
-static Expression *parse_binary(Parser *parser,
-                                Expression *(*next)(Parser *),
-                                const int *operators, size_t count) {
+static Expression *parse_binary(Parser *parser, Expression *(*next)(Parser *), const int *operators,
+                                size_t count) {
     Expression *left = next(parser);
     size_t index;
     for (;;) {
@@ -614,8 +690,7 @@ static Expression *parse_sum(Parser *parser) {
 }
 
 static Expression *parse_comparison(Parser *parser) {
-    static const int operators[] = {'<', '>', TOKEN_LESS_EQUAL,
-                                    TOKEN_GREATER_EQUAL};
+    static const int operators[] = {'<', '>', TOKEN_LESS_EQUAL, TOKEN_GREATER_EQUAL};
     return parse_binary(parser, parse_sum, operators, 4);
 }
 
@@ -642,8 +717,7 @@ static void finish_simple_statement(Parser *parser) {
         return;
     }
     if (parser->token.kind != '}')
-        fail_at(parser->token.line, parser->token.column,
-                "start the next statement on a new line");
+        fail_at(parser->token.line, parser->token.column, "start the next statement on a new line");
 }
 
 static Statement *parse_block(Parser *parser);
@@ -683,7 +757,10 @@ static Statement parse_statement(Parser *parser) {
         skip_separators(parser);
         if (word_is(parser, "else")) {
             advance(parser);
-            statement.else_body = parse_block(parser);
+            if (word_is(parser, "if"))
+                arrput(statement.else_body, parse_statement(parser));
+            else
+                statement.else_body = parse_block(parser);
         }
         return statement;
     }
@@ -722,8 +799,7 @@ static Statement *parse_block(Parser *parser) {
     skip_separators(parser);
     while (parser->token.kind != '}') {
         if (parser->token.kind == TOKEN_EOF)
-            fail_at(parser->token.line, parser->token.column,
-                    "this block needs a closing brace");
+            fail_at(parser->token.line, parser->token.column, "this block needs a closing brace");
         arrput(statements, parse_statement(parser));
         skip_separators(parser);
     }
@@ -766,6 +842,47 @@ static Function parse_function(Parser *parser) {
     return function;
 }
 
+static void parse_record(Parser *parser) {
+    expect_word(parser, "record");
+    Record record = {0};
+    record.name = take_name(parser, "a record name");
+    if (find_record(&parser->program, record.name) >= 0)
+        fail_at(parser->token.line, parser->token.column, "record '%s' is declared more than once",
+                record.name);
+    if (!strcmp(record.name, "Integer") || !strcmp(record.name, "Text") ||
+        !strcmp(record.name, "Character") || !strcmp(record.name, "Boolean") ||
+        !strcmp(record.name, "Nothing") || !strcmp(record.name, "List"))
+        fail_at(parser->token.line, parser->token.column,
+                "a record cannot replace a built-in type");
+    int index = (int)arrlen(parser->program.records);
+    arrput(parser->program.records, record);
+    expect(parser, '{', "an opening brace for record fields");
+    skip_separators(parser);
+    while (parser->token.kind != '}') {
+        Parameter field = {0};
+        field.line = parser->token.line;
+        field.column = parser->token.column;
+        field.name = take_name(parser, "a record field name");
+        for (int previous = 0; previous < arrlen(parser->program.records[index].fields); previous++)
+            if (!strcmp(parser->program.records[index].fields[previous].name, field.name))
+                fail_at(field.line, field.column, "record field '%s' is declared more than once",
+                        field.name);
+        expect(parser, ':', "a ':' before a record field type");
+        field.type = parse_type(parser);
+        if (field.type == TYPE_NOTHING)
+            fail_at(field.line, field.column, "record fields cannot contain Nothing");
+        arrput(parser->program.records[index].fields, field);
+        if (parser->token.kind == ',')
+            advance(parser);
+        else if (parser->token.kind != '}' && parser->token.kind != TOKEN_NEWLINE &&
+                 parser->token.kind != ';')
+            fail_at(parser->token.line, parser->token.column,
+                    "record fields need a comma or newline");
+        skip_separators(parser);
+    }
+    advance(parser);
+}
+
 static Program parse_program(char *source) {
     Parser parser = {0};
     parser.lexer.cursor = source;
@@ -774,6 +891,11 @@ static Program parse_program(char *source) {
     parser.token = next_token(&parser.lexer);
     skip_separators(&parser);
     while (parser.token.kind != TOKEN_EOF) {
+        if (word_is(&parser, "record")) {
+            parse_record(&parser);
+            skip_separators(&parser);
+            continue;
+        }
         if (!word_is(&parser, "function"))
             fail_at(parser.token.line, parser.token.column,
                     "a Minyar file contains function declarations here");
@@ -786,31 +908,48 @@ static Program parse_program(char *source) {
 
 static const char *type_name(Type type) {
     switch (type) {
-    case TYPE_INTEGER: return "Integer";
-    case TYPE_TEXT: return "Text";
-    case TYPE_CHARACTER: return "Character";
-    case TYPE_BOOLEAN: return "Boolean";
-    case TYPE_NOTHING: return "Nothing";
-    case TYPE_LIST_INTEGER: return "List<Integer>";
-    case TYPE_LIST_TEXT: return "List<Text>";
-    case TYPE_LIST_CHARACTER: return "List<Character>";
-    case TYPE_LIST_BOOLEAN: return "List<Boolean>";
-    default: return "an unknown type";
+    case TYPE_INTEGER:
+        return "Integer";
+    case TYPE_TEXT:
+        return "Text";
+    case TYPE_CHARACTER:
+        return "Character";
+    case TYPE_BOOLEAN:
+        return "Boolean";
+    case TYPE_NOTHING:
+        return "Nothing";
+    case TYPE_LIST_INTEGER:
+        return "List<Integer>";
+    case TYPE_LIST_TEXT:
+        return "List<Text>";
+    case TYPE_LIST_CHARACTER:
+        return "List<Character>";
+    case TYPE_LIST_BOOLEAN:
+        return "List<Boolean>";
+    default:
+        return type >= TYPE_RECORD_START ? "a record" : "an unknown type";
     }
 }
 
 static const char *llvm_type(Type type) {
     switch (type) {
-    case TYPE_INTEGER: return "i64";
-    case TYPE_TEXT: return "ptr";
-    case TYPE_CHARACTER: return "i32";
-    case TYPE_BOOLEAN: return "i1";
-    case TYPE_NOTHING: return "void";
+    case TYPE_INTEGER:
+        return "i64";
+    case TYPE_TEXT:
+        return "ptr";
+    case TYPE_CHARACTER:
+        return "i32";
+    case TYPE_BOOLEAN:
+        return "i1";
+    case TYPE_NOTHING:
+        return "void";
     case TYPE_LIST_INTEGER:
     case TYPE_LIST_TEXT:
     case TYPE_LIST_CHARACTER:
-    case TYPE_LIST_BOOLEAN: return "ptr";
-    default: return "void";
+    case TYPE_LIST_BOOLEAN:
+        return "ptr";
+    default:
+        return type >= TYPE_RECORD_START ? "ptr" : "void";
     }
 }
 
@@ -825,14 +964,12 @@ static Function *find_function(Program *program, const char *name) {
 static int find_local(Function *function, const char *name) {
     int index;
     for (index = (int)arrlen(function->locals) - 1; index >= 0; index--)
-        if (function->locals[index].active &&
-            strcmp(function->locals[index].name, name) == 0)
+        if (function->locals[index].active && strcmp(function->locals[index].name, name) == 0)
             return index;
     return -1;
 }
 
-static int add_local(Function *function, const char *name, Type type,
-                     int line, int column) {
+static int add_local(Function *function, const char *name, Type type, int line, int column) {
     Local local;
     if (find_local(function, name) >= 0)
         fail_at(line, column, "'%s' already has a meaning in this function", name);
@@ -843,16 +980,14 @@ static int add_local(Function *function, const char *name, Type type,
     return (int)arrlen(function->locals) - 1;
 }
 
-static void require_type(Expression *expression, Type actual, Type expected,
-                         const char *context) {
+static void require_type(Expression *expression, Type actual, Type expected, const char *context) {
     if (actual != expected)
         fail_at(expression->line, expression->column,
-                "%s needs %s, but this expression produces %s",
-                context, type_name(expected), type_name(actual));
+                "%s needs %s, but this expression produces %s", context, type_name(expected),
+                type_name(actual));
 }
 
-static Type check_expression(Program *program, Function *function,
-                             Expression *expression) {
+static Type check_expression(Program *program, Function *function, Expression *expression) {
     Type left;
     Type right;
     size_t index;
@@ -869,18 +1004,43 @@ static Type check_expression(Program *program, Function *function,
     case EXPRESSION_NAME:
         expression->local_index = find_local(function, expression->text);
         if (expression->local_index < 0)
-            fail_at(expression->line, expression->column,
-                    "I can't find a value named '%s'", expression->text);
+            fail_at(expression->line, expression->column, "I can't find a value named '%s'",
+                    expression->text);
         return expression->type = function->locals[expression->local_index].type;
+    case EXPRESSION_RECORD: {
+        Record *record = &program->records[expression->type - TYPE_RECORD_START];
+        for (index = 0; index < (size_t)arrlen(expression->arguments); index++) {
+            int field = -1;
+            for (int candidate = 0; candidate < arrlen(record->fields); candidate++)
+                if (!strcmp(record->fields[candidate].name, expression->field_names[index]))
+                    field = candidate;
+            if (field < 0)
+                fail_at(expression->line, expression->column,
+                        "record '%s' does not have a field named '%s'", record->name,
+                        expression->field_names[index]);
+            for (size_t previous = 0; previous < index; previous++)
+                if (!strcmp(expression->field_names[previous], expression->field_names[index]))
+                    fail_at(expression->line, expression->column,
+                            "record field '%s' is provided more than once",
+                            expression->field_names[index]);
+            left = check_expression(program, function, expression->arguments[index]);
+            if (left != record->fields[field].type)
+                fail_at(expression->line, expression->column,
+                        "record field '%s' receives a different type",
+                        expression->field_names[index]);
+        }
+        if (arrlen(expression->arguments) != arrlen(record->fields))
+            fail_at(expression->line, expression->column, "record '%s' is missing field values",
+                    record->name);
+        return expression->type;
+    }
     case EXPRESSION_CALL:
         if (strcmp(expression->text, "print") == 0) {
             if (arrlen(expression->arguments) != 1)
-                fail_at(expression->line, expression->column,
-                        "print expects exactly one value");
+                fail_at(expression->line, expression->column, "print expects exactly one value");
             left = check_expression(program, function, expression->arguments[0]);
             if (left == TYPE_NOTHING)
-                fail_at(expression->line, expression->column,
-                        "print needs a value to display");
+                fail_at(expression->line, expression->column, "print needs a value to display");
             return expression->type = TYPE_NOTHING;
         }
         if (strcmp(expression->text, "fail") == 0) {
@@ -888,8 +1048,7 @@ static Type check_expression(Program *program, Function *function,
                 fail_at(expression->line, expression->column,
                         "fail expects exactly one Text explanation");
             left = check_expression(program, function, expression->arguments[0]);
-            require_type(expression->arguments[0], left, TYPE_TEXT,
-                         "a failure explanation");
+            require_type(expression->arguments[0], left, TYPE_TEXT, "a failure explanation");
             return expression->type = TYPE_NOTHING;
         }
         if (strcmp(expression->text, "Text") == 0) {
@@ -902,19 +1061,34 @@ static Type check_expression(Program *program, Function *function,
                         "Nothing cannot be converted to Text");
             return expression->type = TYPE_TEXT;
         }
-        if (strcmp(expression->text, "joinText") == 0) {
+        if (strcmp(expression->text, "Character") == 0) {
             if (arrlen(expression->arguments) != 1)
                 fail_at(expression->line, expression->column,
-                        "joinText expects one List<Text>");
+                        "Character expects exactly one Integer code point");
             left = check_expression(program, function, expression->arguments[0]);
-            require_type(expression->arguments[0], left, TYPE_LIST_TEXT,
-                         "the Text pieces to join");
+            require_type(expression->arguments[0], left, TYPE_INTEGER, "a Character code point");
+            return expression->type = TYPE_CHARACTER;
+        }
+        if (strcmp(expression->text, "Integer") == 0) {
+            if (arrlen(expression->arguments) != 1)
+                fail_at(expression->line, expression->column,
+                        "Integer expects exactly one Integer or Character value");
+            left = check_expression(program, function, expression->arguments[0]);
+            if (left != TYPE_INTEGER && left != TYPE_CHARACTER)
+                fail_at(expression->line, expression->column,
+                        "Integer expects an Integer or Character value");
+            return expression->type = TYPE_INTEGER;
+        }
+        if (strcmp(expression->text, "joinText") == 0) {
+            if (arrlen(expression->arguments) != 1)
+                fail_at(expression->line, expression->column, "joinText expects one List<Text>");
+            left = check_expression(program, function, expression->arguments[0]);
+            require_type(expression->arguments[0], left, TYPE_LIST_TEXT, "the Text pieces to join");
             return expression->type = TYPE_TEXT;
         }
         if (strcmp(expression->text, "readTextFile") == 0) {
             if (arrlen(expression->arguments) != 1)
-                fail_at(expression->line, expression->column,
-                        "readTextFile expects one file path");
+                fail_at(expression->line, expression->column, "readTextFile expects one file path");
             left = check_expression(program, function, expression->arguments[0]);
             require_type(expression->arguments[0], left, TYPE_TEXT, "a file path");
             return expression->type = TYPE_TEXT;
@@ -938,27 +1112,27 @@ static Type check_expression(Program *program, Function *function,
         }
         if (strcmp(expression->text, "argument") == 0) {
             if (arrlen(expression->arguments) != 1)
-                fail_at(expression->line, expression->column,
-                        "argument expects one position");
+                fail_at(expression->line, expression->column, "argument expects one position");
             left = check_expression(program, function, expression->arguments[0]);
-            require_type(expression->arguments[0], left, TYPE_INTEGER,
-                         "an argument position");
+            require_type(expression->arguments[0], left, TYPE_INTEGER, "an argument position");
             return expression->type = TYPE_TEXT;
         }
         expression->function = find_function(program, expression->text);
         if (!expression->function)
+            fail_at(expression->line, expression->column, "I can't find a function named '%s'",
+                    expression->text);
+        if (strcmp(expression->text, "main") == 0)
             fail_at(expression->line, expression->column,
-                    "I can't find a function named '%s'", expression->text);
+                    "the executable entry main cannot be called; use a separate function for "
+                    "shared work");
         if (arrlen(expression->arguments) != arrlen(expression->function->parameters))
             fail_at(expression->line, expression->column,
-                    "%s expects %td arguments, but this call provides %td",
-                    expression->text, arrlen(expression->function->parameters),
-                    arrlen(expression->arguments));
+                    "%s expects %td arguments, but this call provides %td", expression->text,
+                    arrlen(expression->function->parameters), arrlen(expression->arguments));
         for (index = 0; index < (size_t)arrlen(expression->arguments); index++) {
             left = check_expression(program, function, expression->arguments[index]);
             require_type(expression->arguments[index], left,
-                         expression->function->parameters[index].type,
-                         "this function argument");
+                         expression->function->parameters[index].type, "this function argument");
         }
         return expression->type = expression->function->return_type;
     case EXPRESSION_UNARY:
@@ -974,18 +1148,15 @@ static Type check_expression(Program *program, Function *function,
         right = check_expression(program, function, expression->right);
         if (left != right)
             fail_at(expression->line, expression->column,
-                    "these two sides have different types: %s and %s",
-                    type_name(left), type_name(right));
-        if (expression->operator == TOKEN_EQUAL_EQUAL ||
-            expression->operator == TOKEN_NOT_EQUAL) {
+                    "these two sides have different types: %s and %s", type_name(left),
+                    type_name(right));
+        if (expression->operator == TOKEN_EQUAL_EQUAL || expression->operator == TOKEN_NOT_EQUAL) {
             if (left == TYPE_NOTHING)
-                fail_at(expression->line, expression->column,
-                        "Nothing cannot be compared");
+                fail_at(expression->line, expression->column, "Nothing cannot be compared");
             return expression->type = TYPE_BOOLEAN;
         }
         if (expression->operator == TOKEN_AND || expression->operator == TOKEN_OR) {
-            require_type(expression->left, left, TYPE_BOOLEAN,
-                         "a logical operation");
+            require_type(expression->left, left, TYPE_BOOLEAN, "a logical operation");
             return expression->type = TYPE_BOOLEAN;
         }
         if (expression->operator == '<' || expression->operator == '>' ||
@@ -1003,14 +1174,22 @@ static Type check_expression(Program *program, Function *function,
         return expression->type = TYPE_INTEGER;
     case EXPRESSION_MEMBER:
         left = check_expression(program, function, expression->left);
+        if (left >= TYPE_RECORD_START) {
+            Record *record = &program->records[left - TYPE_RECORD_START];
+            for (int field = 0; field < arrlen(record->fields); field++)
+                if (!strcmp(record->fields[field].name, expression->text)) {
+                    expression->integer = field;
+                    return expression->type = record->fields[field].type;
+                }
+            fail_at(expression->line, expression->column,
+                    "record '%s' does not have a field named '%s'", record->name, expression->text);
+        }
         if (left == TYPE_TEXT && strcmp(expression->text, "byteLength") == 0)
             return expression->type = TYPE_INTEGER;
-        if ((left == TYPE_TEXT ||
-             (left >= TYPE_LIST_INTEGER && left <= TYPE_LIST_BOOLEAN)) &&
+        if ((left == TYPE_TEXT || (left >= TYPE_LIST_INTEGER && left <= TYPE_LIST_BOOLEAN)) &&
             strcmp(expression->text, "length") == 0)
             return expression->type = TYPE_INTEGER;
-        fail_at(expression->line, expression->column,
-                "%s does not have a property named '%s'",
+        fail_at(expression->line, expression->column, "%s does not have a property named '%s'",
                 type_name(left), expression->text);
         return TYPE_UNKNOWN;
     case EXPRESSION_INDEX:
@@ -1021,8 +1200,8 @@ static Type check_expression(Program *program, Function *function,
             return expression->type = TYPE_CHARACTER;
         if (left >= TYPE_LIST_INTEGER && left <= TYPE_LIST_BOOLEAN)
             return expression->type = TYPE_INTEGER + left - TYPE_LIST_INTEGER;
-        fail_at(expression->line, expression->column,
-                "%s values cannot be accessed by position", type_name(left));
+        fail_at(expression->line, expression->column, "%s values cannot be accessed by position",
+                type_name(left));
         return TYPE_UNKNOWN;
     case EXPRESSION_LIST:
         if (expression->type == TYPE_UNKNOWN)
@@ -1046,18 +1225,15 @@ static Type check_expression(Program *program, Function *function,
             return expression->type = TYPE_TEXT;
         }
         if (left < TYPE_LIST_INTEGER || left > TYPE_LIST_BOOLEAN)
-            fail_at(expression->line, expression->column,
-                    "%s does not provide the '%s' operation",
+            fail_at(expression->line, expression->column, "%s does not provide the '%s' operation",
                     type_name(left), expression->text);
         if (strcmp(expression->text, "add") != 0)
             fail_at(expression->line, expression->column,
                     "lists do not provide an operation named '%s'", expression->text);
         if (arrlen(expression->arguments) != 1)
-            fail_at(expression->line, expression->column,
-                    "list.add expects exactly one value");
+            fail_at(expression->line, expression->column, "list.add expects exactly one value");
         right = check_expression(program, function, expression->arguments[0]);
-        require_type(expression->arguments[0], right,
-                     TYPE_INTEGER + left - TYPE_LIST_INTEGER,
+        require_type(expression->arguments[0], right, TYPE_INTEGER + left - TYPE_LIST_INTEGER,
                      "the value added to this list");
         return expression->type = TYPE_NOTHING;
     }
@@ -1074,14 +1250,13 @@ static int statement_guarantees_return(Statement *statement) {
             return 0;
         then_last = &arrlast(statement->then_body);
         else_last = &arrlast(statement->else_body);
-        return statement_guarantees_return(then_last) &&
-               statement_guarantees_return(else_last);
+        return statement_guarantees_return(then_last) && statement_guarantees_return(else_last);
     }
     return 0;
 }
 
-static void check_statements(Program *program, Function *function,
-                             Statement *statements, int creates_scope) {
+static void check_statements(Program *program, Function *function, Statement *statements,
+                             int creates_scope) {
     size_t index;
     size_t first_scoped_local = (size_t)arrlen(function->locals);
     int returned = 0;
@@ -1099,26 +1274,24 @@ static void check_statements(Program *program, Function *function,
                 statement->expression->type = statement->declared_type;
             type = check_expression(program, function, statement->expression);
             if (type == TYPE_NOTHING)
-                fail_at(statement->line, statement->column,
-                        "a let declaration needs a value");
+                fail_at(statement->line, statement->column, "a let declaration needs a value");
             if (statement->declared_type && statement->declared_type != type)
                 fail_at(statement->line, statement->column,
                         "'%s' was declared as %s but receives %s", statement->name,
                         type_name(statement->declared_type), type_name(type));
             statement->declared_type = type;
-            statement->local_index = add_local(function, statement->name, type,
-                                               statement->line, statement->column);
+            statement->local_index =
+                add_local(function, statement->name, type, statement->line, statement->column);
             break;
         case STATEMENT_ASSIGN:
             statement->local_index = find_local(function, statement->name);
             if (statement->local_index < 0)
-                fail_at(statement->line, statement->column,
-                        "I can't find a value named '%s'", statement->name);
+                fail_at(statement->line, statement->column, "I can't find a value named '%s'",
+                        statement->name);
             type = check_expression(program, function, statement->expression);
             if (type != function->locals[statement->local_index].type)
-                fail_at(statement->line, statement->column,
-                        "'%s' cannot change from %s to %s", statement->name,
-                        type_name(function->locals[statement->local_index].type),
+                fail_at(statement->line, statement->column, "'%s' cannot change from %s to %s",
+                        statement->name, type_name(function->locals[statement->local_index].type),
                         type_name(type));
             break;
         case STATEMENT_INDEX_ASSIGN: {
@@ -1129,8 +1302,7 @@ static void check_statements(Program *program, Function *function,
                         "only List positions can receive a new value");
             type = check_expression(program, function, statement->expression);
             if (type != target)
-                fail_at(statement->line, statement->column,
-                        "this List contains %s, not %s",
+                fail_at(statement->line, statement->column, "this List contains %s, not %s",
                         type_name(target), type_name(type));
             break;
         }
@@ -1142,29 +1314,25 @@ static void check_statements(Program *program, Function *function,
                        ? check_expression(program, function, statement->expression)
                        : TYPE_NOTHING;
             if (type != function->return_type)
-                fail_at(statement->line, statement->column,
-                        "this function returns %s, not %s",
+                fail_at(statement->line, statement->column, "this function returns %s, not %s",
                         type_name(function->return_type), type_name(type));
             break;
         case STATEMENT_IF:
             type = check_expression(program, function, statement->expression);
-            require_type(statement->expression, type, TYPE_BOOLEAN,
-                         "an if condition");
+            require_type(statement->expression, type, TYPE_BOOLEAN, "an if condition");
             check_statements(program, function, statement->then_body, 1);
             check_statements(program, function, statement->else_body, 1);
             break;
         case STATEMENT_WHILE:
             type = check_expression(program, function, statement->expression);
-            require_type(statement->expression, type, TYPE_BOOLEAN,
-                         "a while condition");
+            require_type(statement->expression, type, TYPE_BOOLEAN, "a while condition");
             check_statements(program, function, statement->body, 1);
             break;
         }
         returned = statement_guarantees_return(statement);
     }
     if (creates_scope)
-        for (index = first_scoped_local;
-             index < (size_t)arrlen(function->locals); index++)
+        for (index = first_scoped_local; index < (size_t)arrlen(function->locals); index++)
             function->locals[index].active = 0;
 }
 
@@ -1173,31 +1341,26 @@ static void check_program(Program *program) {
     size_t parameter_index;
     if (!find_function(program, "main"))
         fail_at(1, 1, "every program needs a function named 'main'");
-    for (function_index = 0;
-         function_index < (size_t)arrlen(program->functions); function_index++) {
+    for (function_index = 0; function_index < (size_t)arrlen(program->functions);
+         function_index++) {
         Function *function = &program->functions[function_index];
         size_t other;
         for (other = 0; other < function_index; other++)
             if (strcmp(program->functions[other].name, function->name) == 0)
-                fail_at(function->line, function->column,
-                        "there is already a function named '%s'", function->name);
+                fail_at(function->line, function->column, "there is already a function named '%s'",
+                        function->name);
         if (strcmp(function->name, "main") == 0 && arrlen(function->parameters))
-            fail_at(function->line, function->column,
-                    "main does not take parameters yet");
-        for (parameter_index = 0;
-             parameter_index < (size_t)arrlen(function->parameters);
+            fail_at(function->line, function->column, "main does not take parameters yet");
+        for (parameter_index = 0; parameter_index < (size_t)arrlen(function->parameters);
              parameter_index++) {
             Parameter *parameter = &function->parameters[parameter_index];
-            add_local(function, parameter->name, parameter->type,
-                      parameter->line, parameter->column);
+            add_local(function, parameter->name, parameter->type, parameter->line,
+                      parameter->column);
         }
         check_statements(program, function, function->body, 0);
-        if (function->return_type != TYPE_NOTHING &&
-            strcmp(function->name, "main") != 0 &&
-            (!arrlen(function->body) ||
-             !statement_guarantees_return(&arrlast(function->body))))
-            fail_at(function->line, function->column,
-                    "'%s' promises to return %s on every path",
+        if (function->return_type != TYPE_NOTHING && strcmp(function->name, "main") != 0 &&
+            (!arrlen(function->body) || !statement_guarantees_return(&arrlast(function->body))))
+            fail_at(function->line, function->column, "'%s' promises to return %s on every path",
                     function->name, type_name(function->return_type));
     }
 }
@@ -1244,7 +1407,8 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
     case EXPRESSION_INTEGER:
         return make_value(TYPE_INTEGER, "%lld", expression->integer);
     case EXPRESSION_TEXT:
-        return make_value(TYPE_TEXT, "getelementptr (i8, ptr @.text.%d, i64 8)", expression->string_index);
+        return make_value(TYPE_TEXT, "getelementptr (i8, ptr @.text.%d, i64 8)",
+                          expression->string_index);
     case EXPRESSION_CHARACTER:
         return make_value(TYPE_CHARACTER, "%lld", expression->integer);
     case EXPRESSION_BOOLEAN:
@@ -1254,14 +1418,37 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
         fprintf(output, "  %%value.%d = load %s, ptr %%local.%d\n", temporary,
                 llvm_type(expression->type), expression->local_index);
         return make_value(expression->type, "%%value.%d", temporary);
+    case EXPRESSION_RECORD: {
+        Record *record = &emitter->program->records[expression->type - TYPE_RECORD_START];
+        int object = new_temporary(emitter);
+        fprintf(output, "  %%value.%d = call ptr @minyar_record_new(i64 %td)\n", object,
+                arrlen(record->fields));
+        for (index = 0; index < (size_t)arrlen(expression->arguments); index++) {
+            right = emit_expression(emitter, expression->arguments[index]);
+            int field = 0;
+            while (strcmp(record->fields[field].name, expression->field_names[index]))
+                field++;
+            int reference = !strcmp(llvm_type(right.type), "ptr");
+            if (right.type != TYPE_INTEGER) {
+                temporary = new_temporary(emitter);
+                fprintf(output, "  %%value.%d = %s %s %s to i64\n", temporary,
+                        reference ? "ptrtoint" : "zext", llvm_type(right.type), right.name);
+                right = make_value(TYPE_INTEGER, "%%value.%d", temporary);
+            }
+            fprintf(output, "  call void @minyar_record_set%s(ptr %%value.%d, i64 %d, i64 %s)\n",
+                    reference ? "_reference" : "", object, field, right.name);
+        }
+        return make_value(expression->type, "%%value.%d", object);
+    }
     case EXPRESSION_CALL: {
         Value *arguments = NULL;
         for (index = 0; index < (size_t)arrlen(expression->arguments); index++)
             arrput(arguments, emit_expression(emitter, expression->arguments[index]));
         if (strcmp(expression->text, "print") == 0) {
-            const char *suffix = arguments[0].type == TYPE_INTEGER ? "integer" :
-                                 arguments[0].type == TYPE_CHARACTER ? "character" :
-                                 arguments[0].type == TYPE_BOOLEAN ? "boolean" : "text";
+            const char *suffix = arguments[0].type == TYPE_INTEGER     ? "integer"
+                                 : arguments[0].type == TYPE_CHARACTER ? "character"
+                                 : arguments[0].type == TYPE_BOOLEAN   ? "boolean"
+                                                                       : "text";
             fprintf(output, "  call void @minyar_print_%s(%s %s)\n", suffix,
                     llvm_type(arguments[0].type), arguments[0].name);
             arrfree(arguments);
@@ -1279,26 +1466,43 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
                 arrfree(arguments);
                 return result;
             }
-            suffix = arguments[0].type == TYPE_INTEGER ? "integer" :
-                     arguments[0].type == TYPE_CHARACTER ? "character" : "boolean";
+            suffix = arguments[0].type == TYPE_INTEGER     ? "integer"
+                     : arguments[0].type == TYPE_CHARACTER ? "character"
+                                                           : "boolean";
             temporary = new_temporary(emitter);
-            fprintf(output, "  %%value.%d = call ptr @minyar_%s_text(%s %s)\n",
-                    temporary, suffix, llvm_type(arguments[0].type), arguments[0].name);
+            fprintf(output, "  %%value.%d = call ptr @minyar_%s_text(%s %s)\n", temporary, suffix,
+                    llvm_type(arguments[0].type), arguments[0].name);
             arrfree(arguments);
             return make_value(TYPE_TEXT, "%%value.%d", temporary);
         }
+        if (strcmp(expression->text, "Character") == 0) {
+            temporary = new_temporary(emitter);
+            fprintf(output, "  %%value.%d = call i32 @.minyar.character.checked(i64 %s)\n",
+                    temporary, arguments[0].name);
+            arrfree(arguments);
+            return make_value(TYPE_CHARACTER, "%%value.%d", temporary);
+        }
+        if (strcmp(expression->text, "Integer") == 0) {
+            Value value = arguments[0];
+            if (value.type == TYPE_CHARACTER) {
+                temporary = new_temporary(emitter);
+                fprintf(output, "  %%value.%d = zext i32 %s to i64\n", temporary, value.name);
+                value = make_value(TYPE_INTEGER, "%%value.%d", temporary);
+            }
+            arrfree(arguments);
+            return value;
+        }
         if (strcmp(expression->text, "joinText") == 0) {
             temporary = new_temporary(emitter);
-            fprintf(output, "  %%value.%d = call ptr @minyar_join_texts(ptr %s)\n",
-                    temporary, arguments[0].name);
+            fprintf(output, "  %%value.%d = call ptr @minyar_join_texts(ptr %s)\n", temporary,
+                    arguments[0].name);
             arrfree(arguments);
             return make_value(TYPE_TEXT, "%%value.%d", temporary);
         }
         if (strcmp(expression->text, "readTextFile") == 0 ||
             strcmp(expression->text, "argument") == 0) {
             temporary = new_temporary(emitter);
-            fprintf(output, "  %%value.%d = call ptr @minyar_%s(%s %s)\n",
-                    temporary,
+            fprintf(output, "  %%value.%d = call ptr @minyar_%s(%s %s)\n", temporary,
                     strcmp(expression->text, "argument") == 0 ? "argument" : "read_text_file",
                     llvm_type(arguments[0].type), arguments[0].name);
             arrfree(arguments);
@@ -1321,12 +1525,12 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
             fprintf(output, "  %%value.%d = ", temporary);
         else
             fputs("  ", output);
-        fprintf(output, "call %s @%s(", llvm_type(expression->type), expression->text);
+        fprintf(output, "call %s @%s%s(", llvm_type(expression->type),
+                strcmp(expression->text, "main") == 0 ? "" : ".minyar.fn.", expression->text);
         for (index = 0; index < (size_t)arrlen(arguments); index++) {
             if (index)
                 fputs(", ", output);
-            fprintf(output, "%s %s", llvm_type(arguments[index].type),
-                    arguments[index].name);
+            fprintf(output, "%s %s", llvm_type(arguments[index].type), arguments[index].name);
         }
         fputs(")\n", output);
         arrfree(arguments);
@@ -1339,57 +1543,61 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
         if (expression->operator == '!')
             fprintf(output, "  %%value.%d = xor i1 %s, true\n", temporary, right.name);
         else {
-            fprintf(output,
-                    "  %%checked.%d = call { i64, i1 } @llvm.ssub.with.overflow.i64(i64 0, i64 %s)\n",
-                    temporary, right.name);
-            fprintf(output,
-                    "  %%value.%d = extractvalue { i64, i1 } %%checked.%d, 0\n",
+            fprintf(
+                output,
+                "  %%checked.%d = call { i64, i1 } @llvm.ssub.with.overflow.i64(i64 0, i64 %s)\n",
+                temporary, right.name);
+            fprintf(output, "  %%value.%d = extractvalue { i64, i1 } %%checked.%d, 0\n", temporary,
+                    temporary);
+            fprintf(output, "  %%overflow.%d = extractvalue { i64, i1 } %%checked.%d, 1\n",
                     temporary, temporary);
-            fprintf(output,
-                    "  %%overflow.%d = extractvalue { i64, i1 } %%checked.%d, 1\n",
-                    temporary, temporary);
-            fprintf(output,
-                    "  call void @minyar_check_integer_overflow(i1 %%overflow.%d)\n",
+            fprintf(output, "  call void @.minyar.integer.overflow.checked(i1 %%overflow.%d)\n",
                     temporary);
         }
         return make_value(expression->type, "%%value.%d", temporary);
     case EXPRESSION_MEMBER:
         left = emit_expression(emitter, expression->left);
         temporary = new_temporary(emitter);
-        if (expression->left->type == TYPE_TEXT &&
-            strcmp(expression->text, "byteLength") == 0)
-            fprintf(output, "  %%value.%d = call i64 @minyar_text_byte_length(ptr %s)\n",
-                    temporary, left.name);
-        else
-            fprintf(output, "  %%value.%d = call i64 @minyar_%s_length(ptr %s)\n",
-                    temporary,
-                    expression->left->type == TYPE_TEXT ? "text" : "list",
+        if (expression->left->type >= TYPE_RECORD_START) {
+            int raw = temporary;
+            fprintf(output, "  %%value.%d = call i64 @minyar_record_get(ptr %s, i64 %lld)\n", raw,
+                    left.name, expression->integer);
+            if (expression->type == TYPE_INTEGER)
+                return make_value(TYPE_INTEGER, "%%value.%d", raw);
+            temporary = new_temporary(emitter);
+            fprintf(output, "  %%value.%d = %s i64 %%value.%d to %s\n", temporary,
+                    !strcmp(llvm_type(expression->type), "ptr") ? "inttoptr" : "trunc", raw,
+                    llvm_type(expression->type));
+            return make_value(expression->type, "%%value.%d", temporary);
+        }
+        if (expression->left->type == TYPE_TEXT && strcmp(expression->text, "byteLength") == 0)
+            fprintf(output, "  %%value.%d = call i64 @minyar_text_byte_length(ptr %s)\n", temporary,
                     left.name);
+        else
+            fprintf(output, "  %%value.%d = call i64 @minyar_%s_length(ptr %s)\n", temporary,
+                    expression->left->type == TYPE_TEXT ? "text" : "list", left.name);
         return make_value(TYPE_INTEGER, "%%value.%d", temporary);
     case EXPRESSION_INDEX:
         left = emit_expression(emitter, expression->left);
         right = emit_expression(emitter, expression->right);
         temporary = new_temporary(emitter);
         if (expression->left->type == TYPE_TEXT) {
-            fprintf(output,
-                    "  %%value.%d = call i32 @minyar_text_character_at(ptr %s, i64 %s)\n",
+            fprintf(output, "  %%value.%d = call i32 @minyar_text_character_at(ptr %s, i64 %s)\n",
                     temporary, left.name, right.name);
             return make_value(TYPE_CHARACTER, "%%value.%d", temporary);
         } else {
             int raw = temporary;
             Type element = expression->type;
-            fprintf(output,
-                    "  %%value.%d = call i64 @minyar_list_get(ptr %s, i64 %s)\n",
-                    raw, left.name, right.name);
+            fprintf(output, "  %%value.%d = call i64 @minyar_list_get(ptr %s, i64 %s)\n", raw,
+                    left.name, right.name);
             if (element == TYPE_INTEGER)
                 return make_value(TYPE_INTEGER, "%%value.%d", raw);
             temporary = new_temporary(emitter);
             if (element == TYPE_TEXT)
-                fprintf(output, "  %%value.%d = inttoptr i64 %%value.%d to ptr\n",
-                        temporary, raw);
+                fprintf(output, "  %%value.%d = inttoptr i64 %%value.%d to ptr\n", temporary, raw);
             else
-                fprintf(output, "  %%value.%d = trunc i64 %%value.%d to %s\n",
-                        temporary, raw, llvm_type(element));
+                fprintf(output, "  %%value.%d = trunc i64 %%value.%d to %s\n", temporary, raw,
+                        llvm_type(element));
             return make_value(element, "%%value.%d", temporary);
         }
     case EXPRESSION_LIST:
@@ -1403,8 +1611,7 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
             right = emit_expression(emitter, expression->arguments[0]);
             end = emit_expression(emitter, expression->arguments[1]);
             temporary = new_temporary(emitter);
-            fprintf(output,
-                    "  %%value.%d = call ptr @minyar_text_slice(ptr %s, i64 %s, i64 %s)\n",
+            fprintf(output, "  %%value.%d = call ptr @minyar_text_slice(ptr %s, i64 %s, i64 %s)\n",
                     temporary, left.name, right.name, end.name);
             return make_value(TYPE_TEXT, "%%value.%d", temporary);
         }
@@ -1412,15 +1619,13 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
         if (right.type != TYPE_INTEGER) {
             temporary = new_temporary(emitter);
             if (right.type == TYPE_TEXT)
-                fprintf(output, "  %%value.%d = ptrtoint ptr %s to i64\n",
-                        temporary, right.name);
+                fprintf(output, "  %%value.%d = ptrtoint ptr %s to i64\n", temporary, right.name);
             else
                 fprintf(output, "  %%value.%d = zext %s %s to i64\n", temporary,
                         llvm_type(right.type), right.name);
             right = make_value(TYPE_INTEGER, "%%value.%d", temporary);
         }
-        fprintf(output, "  call void @minyar_list_add(ptr %s, i64 %s)\n",
-                left.name, right.name);
+        fprintf(output, "  call void @minyar_list_add(ptr %s, i64 %s)\n", left.name, right.name);
         return make_value(TYPE_NOTHING, "");
     case EXPRESSION_BINARY:
         left = emit_expression(emitter, expression->left);
@@ -1431,27 +1636,24 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
             char right_block[64];
             snprintf(left_block, sizeof(left_block), "%s", emitter->current_block);
             if (expression->operator == TOKEN_AND)
-                fprintf(output,
-                        "  br i1 %s, label %%logical.right.%d, label %%logical.end.%d\n",
+                fprintf(output, "  br i1 %s, label %%logical.right.%d, label %%logical.end.%d\n",
                         left.name, right_label, end_label);
             else
-                fprintf(output,
-                        "  br i1 %s, label %%logical.end.%d, label %%logical.right.%d\n",
+                fprintf(output, "  br i1 %s, label %%logical.end.%d, label %%logical.right.%d\n",
                         left.name, end_label, right_label);
             fprintf(output, "\nlogical.right.%d:\n", right_label);
-            snprintf(emitter->current_block, sizeof(emitter->current_block),
-                     "logical.right.%d", right_label);
+            snprintf(emitter->current_block, sizeof(emitter->current_block), "logical.right.%d",
+                     right_label);
             right = emit_expression(emitter, expression->right);
             snprintf(right_block, sizeof(right_block), "%s", emitter->current_block);
             fprintf(output, "  br label %%logical.end.%d\n", end_label);
             fprintf(output, "\nlogical.end.%d:\n", end_label);
-            snprintf(emitter->current_block, sizeof(emitter->current_block),
-                     "logical.end.%d", end_label);
+            snprintf(emitter->current_block, sizeof(emitter->current_block), "logical.end.%d",
+                     end_label);
             temporary = new_temporary(emitter);
-            fprintf(output, "  %%value.%d = phi i1 [ %s, %%%s ], [ %s, %%%s ]\n",
-                    temporary,
-                    expression->operator == TOKEN_AND ? "false" : "true",
-                    left_block, right.name, right_block);
+            fprintf(output, "  %%value.%d = phi i1 [ %s, %%%s ], [ %s, %%%s ]\n", temporary,
+                    expression->operator == TOKEN_AND ? "false" : "true", left_block, right.name,
+                    right_block);
             return make_value(TYPE_BOOLEAN, "%%value.%d", temporary);
         }
         right = emit_expression(emitter, expression->right);
@@ -1462,14 +1664,13 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
             return make_value(TYPE_TEXT, "%%value.%d", temporary);
         }
         if ((expression->operator == TOKEN_EQUAL_EQUAL ||
-             expression->operator == TOKEN_NOT_EQUAL) && left.type == TYPE_TEXT) {
-            fprintf(output,
-                    "  %%value.%d = call i1 @minyar_texts_are_equal(ptr %s, ptr %s)\n",
+             expression->operator == TOKEN_NOT_EQUAL) &&
+            left.type == TYPE_TEXT) {
+            fprintf(output, "  %%value.%d = call i1 @minyar_texts_are_equal(ptr %s, ptr %s)\n",
                     temporary, left.name, right.name);
             if (expression->operator == TOKEN_NOT_EQUAL) {
                 int opposite = new_temporary(emitter);
-                fprintf(output, "  %%value.%d = xor i1 %%value.%d, true\n",
-                        opposite, temporary);
+                fprintf(output, "  %%value.%d = xor i1 %%value.%d, true\n", opposite, temporary);
                 temporary = opposite;
             }
             return make_value(TYPE_BOOLEAN, "%%value.%d", temporary);
@@ -1478,41 +1679,52 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
         case '+':
         case '-':
         case '*': {
-            const char *operation = expression->operator == '+' ? "sadd" :
-                                    expression->operator == '-' ? "ssub" : "smul";
-            fprintf(output,
-                    "  %%checked.%d = call { i64, i1 } @llvm.%s.with.overflow.i64(i64 %s, i64 %s)\n",
-                    temporary, operation, left.name, right.name);
-            fprintf(output,
-                    "  %%value.%d = extractvalue { i64, i1 } %%checked.%d, 0\n",
+            const char *operation = expression->operator == '+'   ? "sadd"
+                                    : expression->operator == '-' ? "ssub"
+                                                                  : "smul";
+            fprintf(
+                output,
+                "  %%checked.%d = call { i64, i1 } @llvm.%s.with.overflow.i64(i64 %s, i64 %s)\n",
+                temporary, operation, left.name, right.name);
+            fprintf(output, "  %%value.%d = extractvalue { i64, i1 } %%checked.%d, 0\n", temporary,
+                    temporary);
+            fprintf(output, "  %%overflow.%d = extractvalue { i64, i1 } %%checked.%d, 1\n",
                     temporary, temporary);
-            fprintf(output,
-                    "  %%overflow.%d = extractvalue { i64, i1 } %%checked.%d, 1\n",
-                    temporary, temporary);
-            fprintf(output,
-                    "  call void @minyar_check_integer_overflow(i1 %%overflow.%d)\n",
+            fprintf(output, "  call void @.minyar.integer.overflow.checked(i1 %%overflow.%d)\n",
                     temporary);
             break;
         }
         case '/':
         case '%':
-            fprintf(output,
-                    "  call void @minyar_check_integer_division(i64 %s, i64 %s)\n",
+            fprintf(output, "  call void @.minyar.integer.division.checked(i64 %s, i64 %s)\n",
                     left.name, right.name);
             fprintf(output, "  %%value.%d = %s i64 %s, %s\n", temporary,
-                    expression->operator == '/' ? "sdiv" : "srem",
+                    expression->operator == '/' ? "sdiv" : "srem", left.name, right.name);
+            break;
+        case '<':
+            fprintf(output, "  %%value.%d = icmp slt %s %s, %s\n", temporary, llvm_type(left.type),
                     left.name, right.name);
             break;
-        case '<': fprintf(output, "  %%value.%d = icmp slt %s %s, %s\n", temporary, llvm_type(left.type), left.name, right.name); break;
-        case '>': fprintf(output, "  %%value.%d = icmp sgt %s %s, %s\n", temporary, llvm_type(left.type), left.name, right.name); break;
-        case TOKEN_LESS_EQUAL: fprintf(output, "  %%value.%d = icmp sle %s %s, %s\n", temporary, llvm_type(left.type), left.name, right.name); break;
-        case TOKEN_GREATER_EQUAL: fprintf(output, "  %%value.%d = icmp sge %s %s, %s\n", temporary, llvm_type(left.type), left.name, right.name); break;
+        case '>':
+            fprintf(output, "  %%value.%d = icmp sgt %s %s, %s\n", temporary, llvm_type(left.type),
+                    left.name, right.name);
+            break;
+        case TOKEN_LESS_EQUAL:
+            fprintf(output, "  %%value.%d = icmp sle %s %s, %s\n", temporary, llvm_type(left.type),
+                    left.name, right.name);
+            break;
+        case TOKEN_GREATER_EQUAL:
+            fprintf(output, "  %%value.%d = icmp sge %s %s, %s\n", temporary, llvm_type(left.type),
+                    left.name, right.name);
+            break;
         case TOKEN_EQUAL_EQUAL:
-            fprintf(output, "  %%value.%d = icmp eq %s %s, %s\n", temporary,
-                    llvm_type(left.type), left.name, right.name); break;
+            fprintf(output, "  %%value.%d = icmp eq %s %s, %s\n", temporary, llvm_type(left.type),
+                    left.name, right.name);
+            break;
         case TOKEN_NOT_EQUAL:
-            fprintf(output, "  %%value.%d = icmp ne %s %s, %s\n", temporary,
-                    llvm_type(left.type), left.name, right.name); break;
+            fprintf(output, "  %%value.%d = icmp ne %s %s, %s\n", temporary, llvm_type(left.type),
+                    left.name, right.name);
+            break;
         }
         return make_value(expression->type, "%%value.%d", temporary);
     }
@@ -1534,8 +1746,8 @@ static int emit_statement(Emitter *emitter, Statement *statement) {
     case STATEMENT_LET:
     case STATEMENT_ASSIGN:
         value = emit_expression(emitter, statement->expression);
-        fprintf(output, "  store %s %s, ptr %%local.%d\n", llvm_type(value.type),
-                value.name, statement->local_index);
+        fprintf(output, "  store %s %s, ptr %%local.%d\n", llvm_type(value.type), value.name,
+                statement->local_index);
         return 0;
     case STATEMENT_INDEX_ASSIGN: {
         Value list = emit_expression(emitter, statement->target->left);
@@ -1544,15 +1756,14 @@ static int emit_statement(Emitter *emitter, Statement *statement) {
         if (value.type != TYPE_INTEGER) {
             int converted = new_temporary(emitter);
             if (value.type == TYPE_TEXT)
-                fprintf(output, "  %%value.%d = ptrtoint ptr %s to i64\n",
-                        converted, value.name);
+                fprintf(output, "  %%value.%d = ptrtoint ptr %s to i64\n", converted, value.name);
             else
                 fprintf(output, "  %%value.%d = zext %s %s to i64\n", converted,
                         llvm_type(value.type), value.name);
             value = make_value(TYPE_INTEGER, "%%value.%d", converted);
         }
-        fprintf(output, "  call void @minyar_list_set(ptr %s, i64 %s, i64 %s)\n",
-                list.name, position.name, value.name);
+        fprintf(output, "  call void @minyar_list_set(ptr %s, i64 %s, i64 %s)\n", list.name,
+                position.name, value.name);
         return 0;
     }
     case STATEMENT_EXPRESSION:
@@ -1565,8 +1776,7 @@ static int emit_statement(Emitter *emitter, Statement *statement) {
             value = emit_expression(emitter, statement->expression);
             if (strcmp(emitter->function->name, "main") == 0) {
                 int temporary = new_temporary(emitter);
-                fprintf(output, "  %%value.%d = trunc i64 %s to i32\n", temporary,
-                        value.name);
+                fprintf(output, "  %%value.%d = trunc i64 %s to i32\n", temporary, value.name);
                 fprintf(output, "  ret i32 %%value.%d\n", temporary);
             } else {
                 fprintf(output, "  ret %s %s\n", llvm_type(value.type), value.name);
@@ -1578,29 +1788,27 @@ static int emit_statement(Emitter *emitter, Statement *statement) {
         then_label = new_label(emitter);
         else_label = new_label(emitter);
         end_label = new_label(emitter);
-        fprintf(output, "  br i1 %s, label %%if.then.%d, label %%%s.%d\n",
-                value.name, then_label,
+        fprintf(output, "  br i1 %s, label %%if.then.%d, label %%%s.%d\n", value.name, then_label,
                 statement->else_body ? "if.else" : "if.end",
                 statement->else_body ? else_label : end_label);
         fprintf(output, "\nif.then.%d:\n", then_label);
-        snprintf(emitter->current_block, sizeof(emitter->current_block),
-                 "if.then.%d", then_label);
+        snprintf(emitter->current_block, sizeof(emitter->current_block), "if.then.%d", then_label);
         then_returns = emit_statements(emitter, statement->then_body);
         if (!then_returns)
             fprintf(output, "  br label %%if.end.%d\n", end_label);
         else_returns = 0;
         if (statement->else_body) {
             fprintf(output, "\nif.else.%d:\n", else_label);
-            snprintf(emitter->current_block, sizeof(emitter->current_block),
-                     "if.else.%d", else_label);
+            snprintf(emitter->current_block, sizeof(emitter->current_block), "if.else.%d",
+                     else_label);
             else_returns = emit_statements(emitter, statement->else_body);
             if (!else_returns)
                 fprintf(output, "  br label %%if.end.%d\n", end_label);
         }
         if (!(then_returns && statement->else_body && else_returns)) {
             fprintf(output, "\nif.end.%d:\n", end_label);
-            snprintf(emitter->current_block, sizeof(emitter->current_block),
-                     "if.end.%d", end_label);
+            snprintf(emitter->current_block, sizeof(emitter->current_block), "if.end.%d",
+                     end_label);
         }
         return then_returns && statement->else_body && else_returns;
     case STATEMENT_WHILE:
@@ -1609,19 +1817,18 @@ static int emit_statement(Emitter *emitter, Statement *statement) {
         end_label = new_label(emitter);
         fprintf(output, "  br label %%while.condition.%d\n", then_label);
         fprintf(output, "\nwhile.condition.%d:\n", then_label);
-        snprintf(emitter->current_block, sizeof(emitter->current_block),
-                 "while.condition.%d", then_label);
+        snprintf(emitter->current_block, sizeof(emitter->current_block), "while.condition.%d",
+                 then_label);
         value = emit_expression(emitter, statement->expression);
-        fprintf(output, "  br i1 %s, label %%while.body.%d, label %%while.end.%d\n",
-                value.name, else_label, end_label);
+        fprintf(output, "  br i1 %s, label %%while.body.%d, label %%while.end.%d\n", value.name,
+                else_label, end_label);
         fprintf(output, "\nwhile.body.%d:\n", else_label);
-        snprintf(emitter->current_block, sizeof(emitter->current_block),
-                 "while.body.%d", else_label);
+        snprintf(emitter->current_block, sizeof(emitter->current_block), "while.body.%d",
+                 else_label);
         if (!emit_statements(emitter, statement->body))
             fprintf(output, "  br label %%while.condition.%d\n", then_label);
         fprintf(output, "\nwhile.end.%d:\n", end_label);
-        snprintf(emitter->current_block, sizeof(emitter->current_block),
-                 "while.end.%d", end_label);
+        snprintf(emitter->current_block, sizeof(emitter->current_block), "while.end.%d", end_label);
         return 0;
     }
     return 0;
@@ -1640,16 +1847,18 @@ static void emit_program(FILE *output, Program *program) {
     size_t parameter_index;
     Emitter emitter = {0};
     emitter.output = output;
+    emitter.program = program;
 
     fputs("; Generated by Minyar's temporary stage-zero compiler.\n\n", output);
     for (index = 0; index < (size_t)arrlen(program->text_literals); index++) {
         Expression *text = program->text_literals[index];
-        fprintf(output, "@.text.data.%zu = private unnamed_addr constant [%zu x i8] c",
-                index, text->text_length + 1);
+        fprintf(output, "@.text.data.%zu = private unnamed_addr constant [%zu x i8] c", index,
+                text->text_length + 1);
         emit_llvm_text(output, text->text, text->text_length);
         fputc('\n', output);
         fprintf(output,
-                "@.text.%zu = private global { i64, ptr, i64, i64, ptr } { i64 0, ptr @.text.data.%zu, i64 %zu, i64 -1, ptr null }\n",
+                "@.text.%zu = private global { i64, ptr, i64, i64, ptr } { i64 0, ptr "
+                "@.text.data.%zu, i64 %zu, i64 -1, ptr null }\n",
                 index, index, text->text_length);
     }
     fputs("\ndeclare void @minyar_print_integer(i64)\n"
@@ -1666,6 +1875,7 @@ static void emit_program(FILE *output, Program *program) {
           "declare ptr @minyar_text_slice(ptr, i64, i64)\n"
           "declare ptr @minyar_integer_text(i64)\n"
           "declare ptr @minyar_character_text(i32)\n"
+          "declare i32 @minyar_integer_character(i64)\n"
           "declare ptr @minyar_boolean_text(i1)\n"
           "declare void @minyar_initialize_arguments(i32, ptr)\n"
           "declare i64 @minyar_argument_count()\n"
@@ -1677,49 +1887,96 @@ static void emit_program(FILE *output, Program *program) {
           "declare i64 @minyar_list_length(ptr)\n"
           "declare i64 @minyar_list_get(ptr, i64)\n"
           "declare void @minyar_list_set(ptr, i64, i64)\n"
+          "declare ptr @minyar_record_new(i64)\n"
+          "declare i64 @minyar_record_get(ptr, i64)\n"
+          "declare void @minyar_record_set(ptr, i64, i64)\n"
+          "declare void @minyar_record_set_reference(ptr, i64, i64)\n"
           "declare void @minyar_check_integer_overflow(i1)\n"
           "declare void @minyar_check_integer_division(i64, i64)\n"
+          "declare void @minyar_fail_integer_overflow() cold noreturn\n"
+          "declare void @minyar_fail_integer_division(i64) cold noreturn\n"
           "declare { i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)\n"
           "declare { i64, i1 } @llvm.ssub.with.overflow.i64(i64, i64)\n"
           "declare { i64, i1 } @llvm.smul.with.overflow.i64(i64, i64)\n\n",
           output);
+    fputs("define internal void @.minyar.integer.overflow.checked(i1 %overflow) alwaysinline {\n"
+          "entry:\n"
+          "  br i1 %overflow, label %bad, label %good\n"
+          "bad:\n"
+          "  call void @minyar_fail_integer_overflow()\n"
+          "  unreachable\n"
+          "good:\n"
+          "  ret void\n"
+          "}\n"
+          "define internal void @.minyar.integer.division.checked(i64 %left, i64 %right) "
+          "alwaysinline {\n"
+          "entry:\n"
+          "  %zero = icmp eq i64 %right, 0\n"
+          "  %minimum = icmp eq i64 %left, -9223372036854775808\n"
+          "  %negative.one = icmp eq i64 %right, -1\n"
+          "  %overflow = and i1 %minimum, %negative.one\n"
+          "  %invalid = or i1 %zero, %overflow\n"
+          "  br i1 %invalid, label %bad, label %good\n"
+          "bad:\n"
+          "  call void @minyar_fail_integer_division(i64 %right)\n"
+          "  unreachable\n"
+          "good:\n"
+          "  ret void\n"
+          "}\n\n",
+          output);
+
+    fputs("define internal i32 @.minyar.character.checked(i64 %value) alwaysinline {\n"
+          "entry:\n"
+          "  %range = icmp ult i64 %value, 1114112\n"
+          "  %below = icmp ult i64 %value, 55296\n"
+          "  %above = icmp ugt i64 %value, 57343\n"
+          "  %scalar = or i1 %below, %above\n"
+          "  %valid = and i1 %range, %scalar\n"
+          "  br i1 %valid, label %good, label %bad\n"
+          "bad:\n"
+          "  %fallback = call i32 @minyar_integer_character(i64 %value)\n"
+          "  ret i32 %fallback\n"
+          "good:\n"
+          "  %result = trunc i64 %value to i32\n"
+          "  ret i32 %result\n"
+          "}\n",
+          output);
 
     for (index = 0; index < (size_t)arrlen(program->functions); index++) {
         Function *function = &program->functions[index];
-        Type emitted_return = strcmp(function->name, "main") == 0
-                                ? TYPE_UNKNOWN : function->return_type;
+        Type emitted_return =
+            strcmp(function->name, "main") == 0 ? TYPE_UNKNOWN : function->return_type;
         emitter.function = function;
         emitter.next_temporary = 0;
         emitter.next_label = 0;
         snprintf(emitter.current_block, sizeof(emitter.current_block), "entry");
-        fprintf(output, "define %s @%s(", emitted_return == TYPE_UNKNOWN
-                ? "i32" : llvm_type(emitted_return), function->name);
+        fprintf(output, "define %s @%s%s(",
+                emitted_return == TYPE_UNKNOWN ? "i32" : llvm_type(emitted_return),
+                strcmp(function->name, "main") == 0 ? "" : ".minyar.fn.", function->name);
         if (strcmp(function->name, "main") == 0) {
             fputs("i32 %minyar.argument.count, ptr %minyar.argument.values", output);
-        } else for (parameter_index = 0;
-                    parameter_index < (size_t)arrlen(function->parameters);
-                    parameter_index++) {
-            if (parameter_index)
-                fputs(", ", output);
-            fprintf(output, "%s %%argument.%zu",
-                    llvm_type(function->parameters[parameter_index].type),
-                    parameter_index);
-        }
+        } else
+            for (parameter_index = 0; parameter_index < (size_t)arrlen(function->parameters);
+                 parameter_index++) {
+                if (parameter_index)
+                    fputs(", ", output);
+                fprintf(output, "%s %%argument.%zu",
+                        llvm_type(function->parameters[parameter_index].type), parameter_index);
+            }
         fputs(") {\nentry:\n", output);
         if (strcmp(function->name, "main") == 0)
-            fputs("  call void @minyar_initialize_arguments(i32 %minyar.argument.count, ptr %minyar.argument.values)\n",
+            fputs("  call void @minyar_initialize_arguments(i32 %minyar.argument.count, ptr "
+                  "%minyar.argument.values)\n",
                   output);
-        for (parameter_index = 0;
-             parameter_index < (size_t)arrlen(function->locals);
+        for (parameter_index = 0; parameter_index < (size_t)arrlen(function->locals);
              parameter_index++)
             fprintf(output, "  %%local.%zu = alloca %s\n", parameter_index,
                     llvm_type(function->locals[parameter_index].type));
-        for (parameter_index = 0;
-             parameter_index < (size_t)arrlen(function->parameters);
+        for (parameter_index = 0; parameter_index < (size_t)arrlen(function->parameters);
              parameter_index++)
             fprintf(output, "  store %s %%argument.%zu, ptr %%local.%zu\n",
-                    llvm_type(function->parameters[parameter_index].type),
-                    parameter_index, parameter_index);
+                    llvm_type(function->parameters[parameter_index].type), parameter_index,
+                    parameter_index);
         if (!emit_statements(&emitter, function->body)) {
             if (strcmp(function->name, "main") == 0)
                 fputs("  ret i32 0\n", output);

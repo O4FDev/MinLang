@@ -1,0 +1,419 @@
+--- compiler/compiler.min
++++ compiler/module-compiler-core.min
+@@ -1181,6 +1181,12 @@
+ }
+ 
+ function readableDeclarationName(name: Text): Text {
++    let stable = "\".minyar.fn.minyar.module|"
++    if name.length > stable.length && name.slice(0, stable.length) == stable {
++        let position = stable.length
++        while position < name.length && name[position] != '|' { position = position + 1 }
++        return name.slice(stable.length, position)
++    }
+     let prefix = "minyar_module_"
+     let matches = name.length > prefix.length
+     let position = 0
+@@ -1247,9 +1253,9 @@
+ }
+ 
+ function valueName(textState: List<Text>, temporary: Integer): Text {
+-    let slot = temporary + 2
++    let slot = temporary + 3
+     while textState.length <= slot {
+-        textState.add("%value." + Text(textState.length - 2))
++        textState.add("%value." + Text(textState.length - 3))
+     }
+     return textState[slot]
+ }
+@@ -2841,7 +2847,11 @@
+             setType(resultType, 7)
+         } else {
+             if kind == 3 {
+-                value = "getelementptr (i8, ptr @.text." + Text(tokenIndex) + ", i64 8)"
++                if textState[2] == "" {
++                    value = "getelementptr (i8, ptr @.text." + Text(tokenIndex) + ", i64 8)"
++                } else {
++                    value = "getelementptr (i8, ptr @" + literalName(textState[2], tokenIndex, false) + ", i64 8)"
++                }
+                 state[0] = tokenIndex + 1
+                 setType(resultType, 2)
+             } else {
+@@ -4260,7 +4270,17 @@
+     }
+ }
+ 
+-function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, output: List<Text>, stackOwnerLimit: Integer): Boolean {
++function literalName(prefix: Text, index: Integer, data: Boolean): Text {
++    if prefix == "" {
++        if data { return ".text.data." + Text(index) }
++        return ".text." + Text(index)
++    }
++    let kind = "value"
++    if data { kind = "data" }
++    return "\"minyar.literal|" + prefix + "|" + kind + "|" + Text(index) + "\""
++}
++
++function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, output: List<Text>, stackOwnerLimit: Integer, literalPrefix: Text, bodyStats: List<Integer>): Boolean {
+     let state: List<Integer> = []
+     state.add(0)
+     state.add(0)
+@@ -4279,6 +4299,7 @@
+     let textState: List<Text> = []
+     textState.add("entry")
+     textState.add("")
++    textState.add(literalPrefix)
+ 
+     skipTerminators(tokenKinds, state)
+     while tokenKinds[state[0]] != 0 {
+@@ -4399,6 +4420,7 @@
+             }
+             parameter = parameter + 1
+         }
++        if bodyStats.length > 0 { bodyStats[0] = bodyStats[0] + 1 }
+         let returns = compileBlock(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, returnType)
+         if !returns {
+             output.add("  call void @minyar_rc_leave()\n")
+@@ -4427,7 +4449,7 @@
+     return hasNative
+ }
+ 
+-function compileTopLevel(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, output: List<Text>) {
++function compileTopLevel(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, output: List<Text>, literalPrefix: Text, bodyStats: List<Integer>) {
+     let state: List<Integer> = []
+     state.add(0)
+     state.add(0)
+@@ -4445,6 +4467,7 @@
+     let textState: List<Text> = []
+     textState.add("entry")
+     textState.add("top level")
++    textState.add(literalPrefix)
+     let localNames: List<Text> = []
+     let localTypes: List<Integer> = []
+     let localIds: List<Integer> = []
+@@ -4456,6 +4479,7 @@
+     output.add("  call void @minyar_initialize_arguments(i32 %minyar.argument.count, ptr %minyar.argument.values)\n")
+ 
+     skipTerminators(tokenKinds, state)
++    if bodyStats.length > 0 { bodyStats[1] = bodyStats[1] + 1 }
+     let terminated = false
+     while tokenKinds[state[0]] != 0 {
+         if tokenIs(tokenKinds, tokenTexts, state, "record") || tokenIs(tokenKinds, tokenTexts, state, "function") {
+@@ -4483,75 +4507,7 @@
+     output.add("}\n\n")
+ }
+ 
+-function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, scannedStarts: List<Integer>, scannedEnds: List<Integer>, stackOwnerLimit: Integer): Text {
+-    let functionNames: List<Text> = []
+-    let symbolKinds: List<Integer> = []
+-    let symbolLocations: List<Text> = []
+-    let functionReturnTypes: List<Integer> = []
+-    let functionParameterCounts: List<Integer> = []
+-    let functionParameterNames: List<Text> = []
+-    let functionParameterTypes: List<Integer> = []
+-    let declarationEnds: List<Integer> = []
+-    let topLevelStatements = false
+-    if scannedStarts.length > 0 {
+-        topLevelStatements = recordScannedDeclarations(tokenKinds, tokenTexts, tokenLines, scannedStarts, scannedEnds, functionNames, symbolKinds, symbolLocations, functionReturnTypes, functionParameterCounts, declarationEnds)
+-    } else {
+-        topLevelStatements = discoverRecordNames(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, symbolLocations, functionReturnTypes, functionParameterCounts, declarationEnds)
+-    }
+-    let symbolLookup = buildSymbolLookup(functionNames, symbolKinds)
+-    requireUniqueSymbols(symbolLookup, functionNames, symbolKinds, symbolLocations)
+-    let parameterStarts: List<Integer> = []
+-    let recordIndex = 0
+-    while recordIndex < functionNames.length {
+-        parameterStarts.add(0)
+-        recordIndex = recordIndex + 1
+-    }
+-    discoverDeclarations(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, symbolLocations, functionReturnTypes, symbolLookup, functionParameterCounts, functionParameterNames, functionParameterTypes, parameterStarts, declarationEnds)
+-    appendParameterOffsets(functionParameterCounts, parameterStarts)
+-    symbolLookup = buildSymbolLookup(functionNames, symbolKinds)
+-    requireUniqueSymbols(symbolLookup, functionNames, symbolKinds, symbolLocations)
+-    let lookupPosition = 0
+-    while lookupPosition < symbolLookup.length {
+-        functionReturnTypes.add(symbolLookup[lookupPosition])
+-        lookupPosition = lookupPosition + 1
+-    }
+-
+-    let output: List<Text> = []
+-    output.add("; Generated by the compiler written in Minyar.\n\n")
+-    let position = 0
+-    while position < tokenKinds.length {
+-        if tokenKinds[position] == 3 || tokenKinds[position] == 5 {
+-            let literal = tokenTexts[position]
+-            output.add("@.text.data.")
+-            output.add(Text(position))
+-            output.add(" = private unnamed_addr constant [")
+-            output.add(Text(literal.byteLength + 1))
+-            output.add(" x i8] c\"")
+-            output.add(escapeLLVMText(literal))
+-            output.add("\\00\"\n")
+-            if literal.length == literal.byteLength {
+-                output.add("@.text.")
+-                output.add(Text(position))
+-                output.add(" = private constant { i64, ptr, i64, i64, ptr, ptr } { i64 0, ptr @.text.data.")
+-                output.add(Text(position))
+-                output.add(", i64 ")
+-                output.add(Text(literal.byteLength))
+-                output.add(", i64 ")
+-                output.add(Text(literal.byteLength))
+-                output.add(", ptr null, ptr null }\n")
+-            } else {
+-                output.add("@.text.")
+-                output.add(Text(position))
+-                output.add(" = private global { i64, ptr, i64, i64, ptr, ptr } { i64 0, ptr @.text.data.")
+-                output.add(Text(position))
+-                output.add(", i64 ")
+-                output.add(Text(literal.byteLength))
+-                output.add(", i64 -1, ptr null, ptr null }\n")
+-            }
+-        }
+-        position = position + 1
+-    }
+-
++function appendRuntimeDeclarations(output: List<Text>) {
+     output.add("\ndeclare void @minyar_rc_enter(i64)\n")
+     output.add("declare void @minyar_rc_leave()\n")
+     output.add("declare void @minyar_stack_enter()\n")
+@@ -4668,13 +4624,106 @@
+     output.add("declare { i64, i1 } @llvm.ssub.with.overflow.i64(i64, i64)\n")
+     output.add("declare { i64, i1 } @llvm.smul.with.overflow.i64(i64, i64)\n\n")
+     appendRuntimeHelpers(output)
++}
++
++function appendLiteralDeclarations(output: List<Text>, tokenKinds: List<Integer>, tokenTexts: List<Text>, prefix: Text) {
++    let dataHead = "@.text.data."
++    let valueHead = "@.text."
++    let tail = ""
++    if prefix != "" {
++        dataHead = "@\"minyar.literal|" + prefix + "|data|"
++        valueHead = "@\"minyar.literal|" + prefix + "|value|"
++        tail = "\""
++    }
++    let position = 0
++    while position < tokenKinds.length {
++        if tokenKinds[position] == 3 || tokenKinds[position] == 5 {
++            let literal = tokenTexts[position]
++            output.add(dataHead)
++            output.add(Text(position))
++            if tail != "" { output.add(tail) }
++            output.add(" = private unnamed_addr constant [")
++            output.add(Text(literal.byteLength + 1))
++            output.add(" x i8] c\"")
++            output.add(escapeLLVMText(literal))
++            output.add("\\00\"\n")
++            if literal.length == literal.byteLength {
++                output.add(valueHead)
++                output.add(Text(position))
++                if tail != "" { output.add(tail) }
++                output.add(" = private constant { i64, ptr, i64, i64, ptr, ptr } { i64 0, ptr ")
++                output.add(dataHead)
++                output.add(Text(position))
++                if tail != "" { output.add(tail) }
++                output.add(", i64 ")
++                output.add(Text(literal.byteLength))
++                output.add(", i64 ")
++                output.add(Text(literal.byteLength))
++                output.add(", ptr null, ptr null }\n")
++            } else {
++                output.add(valueHead)
++                output.add(Text(position))
++                if tail != "" { output.add(tail) }
++                output.add(" = private global { i64, ptr, i64, i64, ptr, ptr } { i64 0, ptr ")
++                output.add(dataHead)
++                output.add(Text(position))
++                if tail != "" { output.add(tail) }
++                output.add(", i64 ")
++                output.add(Text(literal.byteLength))
++                output.add(", i64 -1, ptr null, ptr null }\n")
++            }
++        }
++        position = position + 1
++    }
++
++}
++
++function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, scannedStarts: List<Integer>, scannedEnds: List<Integer>, stackOwnerLimit: Integer): Text {
++    let functionNames: List<Text> = []
++    let symbolKinds: List<Integer> = []
++    let symbolLocations: List<Text> = []
++    let functionReturnTypes: List<Integer> = []
++    let functionParameterCounts: List<Integer> = []
++    let functionParameterNames: List<Text> = []
++    let functionParameterTypes: List<Integer> = []
++    let declarationEnds: List<Integer> = []
++    let topLevelStatements = false
++    if scannedStarts.length > 0 {
++        topLevelStatements = recordScannedDeclarations(tokenKinds, tokenTexts, tokenLines, scannedStarts, scannedEnds, functionNames, symbolKinds, symbolLocations, functionReturnTypes, functionParameterCounts, declarationEnds)
++    } else {
++        topLevelStatements = discoverRecordNames(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, symbolLocations, functionReturnTypes, functionParameterCounts, declarationEnds)
++    }
++    let symbolLookup = buildSymbolLookup(functionNames, symbolKinds)
++    requireUniqueSymbols(symbolLookup, functionNames, symbolKinds, symbolLocations)
++    let parameterStarts: List<Integer> = []
++    let recordIndex = 0
++    while recordIndex < functionNames.length {
++        parameterStarts.add(0)
++        recordIndex = recordIndex + 1
++    }
++    discoverDeclarations(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, symbolLocations, functionReturnTypes, symbolLookup, functionParameterCounts, functionParameterNames, functionParameterTypes, parameterStarts, declarationEnds)
++    appendParameterOffsets(functionParameterCounts, parameterStarts)
++    symbolLookup = buildSymbolLookup(functionNames, symbolKinds)
++    requireUniqueSymbols(symbolLookup, functionNames, symbolKinds, symbolLocations)
++    let lookupPosition = 0
++    while lookupPosition < symbolLookup.length {
++        functionReturnTypes.add(symbolLookup[lookupPosition])
++        lookupPosition = lookupPosition + 1
++    }
++
++    let output: List<Text> = []
++    output.add("; Generated by the compiler written in Minyar.\n\n")
++    appendLiteralDeclarations(output, tokenKinds, tokenTexts, "")
++
++    appendRuntimeDeclarations(output)
++    let noStats: List<Integer> = []
+     let mainFunction = findIndexedSymbol(symbolLookup, functionNames, symbolKinds, "main", 1)
+     if topLevelStatements && mainFunction >= 0 {
+         fail(describeLocation(symbolLocations[mainFunction]) + ": a program cannot combine top-level statements with function main()")
+     }
+-    let hasNative = compileFunctions(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, output, stackOwnerLimit)
++    let hasNative = compileFunctions(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, output, stackOwnerLimit, "", noStats)
+     if mainFunction < 0 {
+-        compileTopLevel(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, output)
++        compileTopLevel(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, output, "", noStats)
+     }
+     if stackOwnerLimit > 0 {
+         output.add("declare void @minyar_rc_enter_stack_v1(ptr, ptr, i64)\n")
+@@ -4951,8 +5000,12 @@
+     return module
+ }
+ 
+-function qualifiedDeclarationName(module: Integer, name: Text): Text {
++// Fields are compiler-owned UTF-8 Text values with character-count prefixes.
++function qualifiedDeclarationName(module: Integer, name: Text, identities: List<Text>): Text {
+     let qualified = "minyar_module_" + Text(module) + "_" + name
++    if identities.length > 0 {
++        qualified = "\".minyar.fn.minyar.module|" + name + "|" + identities[module] + "\""
++    }
+     if module == 0 && name == "main" {
+         qualified = "main"
+     }
+@@ -4971,8 +5024,8 @@
+     return found
+ }
+ 
+-function findIndexedModuleDeclaration(declarationLookup: List<Integer>, declarationQualifiedNames: List<Text>, declarationKinds: List<Integer>, owner: Integer, name: Text, kind: Integer): Integer {
+-    return findIndexedSymbol(declarationLookup, declarationQualifiedNames, declarationKinds, qualifiedDeclarationName(owner, name), kind)
++function findIndexedModuleDeclaration(declarationLookup: List<Integer>, declarationQualifiedNames: List<Text>, declarationKinds: List<Integer>, owner: Integer, name: Text, kind: Integer, identities: List<Text>): Integer {
++    return findIndexedSymbol(declarationLookup, declarationQualifiedNames, declarationKinds, qualifiedDeclarationName(owner, name, identities), kind)
+ }
+ 
+ function requireUniqueModuleDeclarations(declarationLookup: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationQualifiedNames: List<Text>, declarationLocations: List<Text>) {
+@@ -4989,7 +5042,7 @@
+     }
+ }
+ 
+-function collectModuleDeclarations(module: Integer, modulePath: Text, tokenStart: Integer, tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, declarationOwners: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationPublic: List<Integer>, declarationQualifiedNames: List<Text>, declarationLocations: List<Text>) {
++function collectModuleDeclarations(module: Integer, modulePath: Text, tokenStart: Integer, tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, declarationOwners: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationPublic: List<Integer>, declarationQualifiedNames: List<Text>, declarationLocations: List<Text>, identities: List<Text>) {
+     let cursor: List<Integer> = []
+     cursor.add(tokenStart)
+     skipTerminators(tokenKinds, cursor)
+@@ -5018,7 +5071,7 @@
+                 declarationNames.add(name)
+                 declarationKinds.add(kind)
+                 declarationPublic.add(isPublic)
+-                declarationQualifiedNames.add(qualifiedDeclarationName(module, name))
++                declarationQualifiedNames.add(qualifiedDeclarationName(module, name, identities))
+                 declarationLocations.add(modulePath + ":" + tokenLocation(tokenLines, cursor[0] + 1))
+                 if kind == 3 {
+                     skipTopLevelStatement(tokenKinds, tokenTexts, cursor)
+@@ -5036,12 +5089,12 @@
+     }
+ }
+ 
+-function importedDeclarationName(module: Integer, alias: Text, name: Text, kind: Integer, modulePath: Text, tokenLines: SourceMap, location: Integer, importOwners: List<Integer>, importAliases: List<Text>, importTargets: List<Integer>, declarationLookup: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationPublic: List<Integer>, declarationQualifiedNames: List<Text>): Text {
++function importedDeclarationName(module: Integer, alias: Text, name: Text, kind: Integer, modulePath: Text, tokenLines: SourceMap, location: Integer, importOwners: List<Integer>, importAliases: List<Text>, importTargets: List<Integer>, declarationLookup: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationPublic: List<Integer>, declarationQualifiedNames: List<Text>, identities: List<Text>): Text {
+     let imported = findModuleImport(importOwners, importAliases, module, alias)
+     if imported < 0 {
+         fail(describeLocation(modulePath + ":" + tokenLocation(tokenLines, location)) + ": I can't find an imported module named '" + alias + "'")
+     }
+-    let declaration = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, importTargets[imported], name, kind)
++    let declaration = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, importTargets[imported], name, kind, identities)
+     if declaration < 0 {
+         let declarationKind = "record"
+         if kind == 1 {
+@@ -5058,7 +5111,7 @@
+     return declarationQualifiedNames[declaration]
+ }
+ 
+-function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integer, tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, importOwners: List<Integer>, importAliases: List<Text>, importTargets: List<Integer>, declarationLookup: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationPublic: List<Integer>, declarationQualifiedNames: List<Text>, outputKinds: List<Integer>, outputTexts: List<Text>, outputLines: SourceMap) {
++function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integer, tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, importOwners: List<Integer>, importAliases: List<Text>, importTargets: List<Integer>, declarationLookup: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationPublic: List<Integer>, declarationQualifiedNames: List<Text>, outputKinds: List<Integer>, outputTexts: List<Text>, outputLines: SourceMap, identities: List<Text>) {
+     let origin = sourcePath(outputLines, modulePath)
+     let position = tokenStart
+     let declarationMode = 0
+@@ -5110,12 +5163,12 @@
+                         if position + 3 < tokenKinds.length && tokenTexts[position + 3] == "(" {
+                             wantedKind = 1
+                         } else {
+-                            let importedConstant = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, importTargets[imported], tokenTexts[position + 2], 3)
++                            let importedConstant = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, importTargets[imported], tokenTexts[position + 2], 3, identities)
+                             if !typeMode && importedConstant >= 0 {
+                                 wantedKind = 3
+                             }
+                         }
+-                        rewritten = importedDeclarationName(module, token, tokenTexts[position + 2], wantedKind, modulePath, tokenLines, position, importOwners, importAliases, importTargets, declarationLookup, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames)
++                        rewritten = importedDeclarationName(module, token, tokenTexts[position + 2], wantedKind, modulePath, tokenLines, position, importOwners, importAliases, importTargets, declarationLookup, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames, identities)
+                         copyModuleToken(outputKinds, outputTexts, outputLines, 1, rewritten, tokenLines, position, origin)
+                         position = position + 3
+                         if typeMode && genericDepth == 0 {
+@@ -5159,13 +5212,13 @@
+                         }
+                         // `NAME {` is a record literal unless NAME is a constant, as in `if x == NAME {`.
+                         if declarationKind == 2 && !typeMode && !(position > 0 && tokenTexts[position - 1] == "record") {
+-                            let blockConstant = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, module, token, 3)
++                            let blockConstant = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, module, token, 3, identities)
+                             if blockConstant >= 0 {
+                                 declarationKind = 3
+                             }
+                         }
+                         if declarationKind > 0 {
+-                            let declaration = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, module, token, declarationKind)
++                            let declaration = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, module, token, declarationKind, identities)
+                             if declaration >= 0 {
+                                 rewritten = declarationQualifiedNames[declaration]
+                             }
+@@ -5222,6 +5275,7 @@
+ }
+ 
+ function compileEntryWithLibrary(path: Text, stackOwnerLimit: Integer, library: Text): Text {
++    let identities: List<Text> = []
+     let modulePaths: List<Text> = []
+     let moduleSources: List<Text> = []
+     let moduleStates: List<Integer> = []
+@@ -5248,7 +5302,7 @@
+     let declarationLocations: List<Text> = []
+     let module = 0
+     while module < modulePaths.length {
+-        collectModuleDeclarations(module, modulePaths[module], moduleTokenStarts[module], moduleTokenKinds, moduleTokenTexts, moduleTokenLines, declarationOwners, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames, declarationLocations)
++        collectModuleDeclarations(module, modulePaths[module], moduleTokenStarts[module], moduleTokenKinds, moduleTokenTexts, moduleTokenLines, declarationOwners, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames, declarationLocations, identities)
+         module = module + 1
+     }
+     let declarationLookup = buildSymbolLookup(declarationQualifiedNames, declarationKinds)
+@@ -5259,7 +5313,7 @@
+     let tokenLines = newSourceMap()
+     module = 0
+     while module < modulePaths.length {
+-        appendModuleTokens(module, modulePaths[module], moduleTokenStarts[module], moduleTokenKinds, moduleTokenTexts, moduleTokenLines, importOwners, importAliases, importTargets, declarationLookup, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames, tokenKinds, tokenTexts, tokenLines)
++        appendModuleTokens(module, modulePaths[module], moduleTokenStarts[module], moduleTokenKinds, moduleTokenTexts, moduleTokenLines, importOwners, importAliases, importTargets, declarationLookup, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames, tokenKinds, tokenTexts, tokenLines, identities)
+         module = module + 1
+     }
+     addEndToken(tokenKinds, tokenTexts, tokenLines, "end of program")
+@@ -5286,6 +5340,8 @@
+     return budget - 1
+ }
+ 
++// Reversing the complete path is collision-free and keeps common directory
++// prefixes out of hot symbol comparisons. Escaping happens once per module.
+ function main() {
+     if argumentCount() == 0 {
+         print("Minyar compiler bootstrap is ready")

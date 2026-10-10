@@ -4,7 +4,7 @@ A small, statically typed language that compiles to native code through LLVM.
 
 ## Get started
 
-Requires Clang, a C compiler, Make, Python 3, zsh, and system C development
+Requires Clang, a C compiler, Make, Python 3.9+, zsh, and system C development
 headers. The compiler and runtime build on first use.
 
 ```sh
@@ -12,11 +12,21 @@ headers. The compiler and runtime build on first use.
 ./hello
 ```
 
-Add `--release` for optimized builds:
+Normal builds optimize generated code. Add `--release` for whole-program
+optimization with the runtime, or `--debug` for unoptimized code:
 
 ```sh
 ./minyar --release examples/hello.min -o hello
+./minyar --check examples/hello.min
 ```
+
+`--check` validates the language and imported modules without linking native
+dependencies or producing a program. Failed builds preserve the previous
+executable, and output paths cannot replace the input source.
+
+`./minyar --help` lists options, `--version` identifies the development sources,
+and `--doctor` checks the native toolchain with a real LLVM/LTO link. See
+[native toolchains](docs/toolchain.md) for platform setup and compiler selection.
 
 Programs use automatic, system-backed incremental reference counting by default.
 Large ownership graphs are reclaimed in budgeted batches, with no tracing
@@ -54,12 +64,15 @@ macOS). Programs never write or link C themselves.
 
 ## Documentation
 
-- [Language guide](docs/language.md)
+- [Language guide](docs/language.md) and [syntax review](docs/syntax-review.md)
+- [Architecture and coding standards](docs/architecture.md)
+- [Native toolchains and LLVM audit](docs/toolchain.md)
+- [October language hardening review](docs/hardening-report.md)
 - [Modules](docs/modules.md) and [incremental builds](docs/incremental-builds.md)
 - [Examples](examples/)
 - [Runtime ownership](docs/runtime-memory.md) and [runtime profiles](docs/bounded-runtime-contract.md)
 - [Performance testing](docs/performance.md)
-- [Shared memory tests](docs/testing.md)
+- [Testing strategy](docs/testing.md)
 - [Linux testing](experiments/linux/README.md)
 
 ## A note from the developer 

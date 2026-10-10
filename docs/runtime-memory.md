@@ -203,6 +203,10 @@ Sequential indexing resumes from that cursor and decodes each character once;
 backward and random access falls back to the nearest breadcrumb. Keeping the
 cursor in the index allocation avoids increasing the header cost of ASCII Text.
 
+In incremental profiles, destroying a view consumes one work unit. A backing
+root made unreachable by that destruction is queued for a separate work unit;
+it can remain allocated after the release when its poll budget is exhausted.
+
 Binary Text joins normally borrow both operands. A fresh owned left result, or
 the left local in a direct `text = text + piece` replacement, supplies an
 ownership token to the consuming join:

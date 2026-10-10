@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import unittest
 from llvm_sanitizer import prepare_llvm_for_link
+from clang_helpers import clang_command
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPILER = Path(os.environ.get('MINYAR_TEST_COMPILER', ROOT / 'build/minyarc')).resolve()
@@ -36,7 +37,9 @@ class CompilerTestCase(unittest.TestCase):
         path = self.directory / f'case{self.serial}.min'
         path.write_text(source, encoding='utf-8')
         llvm = path.with_suffix('.ll')
-        result = subprocess.run([str(COMPILER), str(path), str(llvm)], capture_output=True, text=True, timeout=COMPILE_TIMEOUT)
+        result = subprocess.run([str(COMPILER), str(path), str(llvm),
+                                 *getattr(self, 'compiler_arguments', ())],
+                                capture_output=True, text=True, timeout=COMPILE_TIMEOUT)
         if result.returncode == 0:
             prepare_llvm_for_link(llvm, LINK_FLAGS)
         return result, llvm
@@ -54,7 +57,7 @@ class CompilerTestCase(unittest.TestCase):
         for optimization in ('-O0', '-O2'):
             with self.subTest(optimization=optimization):
                 exe = llvm.with_suffix('.' + optimization[1:])
-                link = subprocess.run([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], capture_output=True, text=True, timeout=30)
+                link = subprocess.run(clang_command([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)]), capture_output=True, text=True, timeout=30)
                 self.assertEqual(link.returncode, 0, link.stderr)
                 run = subprocess.run([str(exe)], capture_output=True, timeout=RUN_TIMEOUT)
                 self.assertEqual(run.returncode, status, run.stderr)
@@ -112,7 +115,7 @@ print(slice(1))
         result, llvm = self.compile('let text = readTextFile(argument(0))\nprint(text.length)\n')
         self.assertEqual(result.returncode, 0, result.stderr)
         exe = llvm.with_suffix('.exe')
-        subprocess.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], check=True, capture_output=True, timeout=30)
+        subprocess.run(clang_command([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)]), check=True, capture_output=True, timeout=30)
         for encoded in (b'\xc0\xaf', b'\xed\xa0\x80', b'\xf4\x90\x80\x80', b'\xe2\x82'):
             with self.subTest(encoded=encoded):
                 path = self.directory / 'invalid-utf8.txt'
@@ -125,7 +128,7 @@ print(slice(1))
         read_result, read_llvm = self.compile('print(readTextFile(argument(0)))\n')
         self.assertEqual(read_result.returncode, 0, read_result.stderr)
         read_exe = read_llvm.with_suffix('.read')
-        subprocess.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(read_llvm), str(RUNTIME), '-o', str(read_exe)], check=True, capture_output=True, timeout=30)
+        subprocess.run(clang_command([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(read_llvm), str(RUNTIME), '-o', str(read_exe)]), check=True, capture_output=True, timeout=30)
         read_directory = subprocess.run([str(read_exe), str(self.directory)], capture_output=True, timeout=RUN_TIMEOUT)
         self.assertEqual(read_directory.returncode, 1)
         self.assertTrue(
@@ -136,7 +139,7 @@ print(slice(1))
         write_result, write_llvm = self.compile('writeTextFile(argument(0), "contents")\n')
         self.assertEqual(write_result.returncode, 0, write_result.stderr)
         write_exe = write_llvm.with_suffix('.write')
-        subprocess.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(write_llvm), str(RUNTIME), '-o', str(write_exe)], check=True, capture_output=True, timeout=30)
+        subprocess.run(clang_command([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(write_llvm), str(RUNTIME), '-o', str(write_exe)]), check=True, capture_output=True, timeout=30)
         write_directory = subprocess.run([str(write_exe), str(self.directory)], capture_output=True, timeout=RUN_TIMEOUT)
         self.assertEqual(write_directory.returncode, 1)
         self.assertIn(b'could not be created', write_directory.stderr)
@@ -149,7 +152,7 @@ print(slice(1))
         result, llvm = self.compile('print(readTextFile(argument(0)))\n')
         self.assertEqual(result.returncode, 0, result.stderr)
         exe = llvm.with_suffix('.exe')
-        subprocess.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], check=True, capture_output=True, timeout=30)
+        subprocess.run(clang_command([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)]), check=True, capture_output=True, timeout=30)
         path = self.directory / 'contents.txt'
         for contents in (b'', b'A', 'é🙂'.encode('utf-8'), b'first\r\nsecond\n'):
             with self.subTest(contents=contents):
@@ -163,7 +166,7 @@ print(slice(1))
         result, llvm = self.compile('print("unwritten")\n')
         self.assertEqual(result.returncode, 0, result.stderr)
         exe = llvm.with_suffix('.closed-output')
-        subprocess.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], check=True, capture_output=True, timeout=30)
+        subprocess.run(clang_command([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)]), check=True, capture_output=True, timeout=30)
         executed = subprocess.run(
             [str(exe)],
             stdout=None,
@@ -210,7 +213,7 @@ print(slice(1))
         result, llvm = self.compile(source)
         self.assertEqual(result.returncode, 0, result.stderr)
         exe = llvm.with_suffix('.exe')
-        subprocess.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], check=True, capture_output=True, timeout=30)
+        subprocess.run(clang_command([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)]), check=True, capture_output=True, timeout=30)
         for argument in ('é🙂', 'é🙂 with spaces', 'é🙂 "quoted" \\end\\'):
             with self.subTest(argument=argument):
                 run = subprocess.run([str(exe), argument, str(path)], capture_output=True, timeout=RUN_TIMEOUT)

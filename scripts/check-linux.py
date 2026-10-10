@@ -23,7 +23,15 @@ BUILD = ['build/minyarc', 'build/compiler-stage3.ll', 'build/minyarc-sanitize',
          'build/minyar-runtime.o', 'build/minyar-runtime-sanitize.o', 'build/ownership-runtime.o',
          'build/runtime-unit', 'build/runtime-unit-sanitize',
          'build/module-compiler-stage3.ll']
-TARGETS = ['check-ownership-policy', 'check-stack-ownership', 'check-runtime-cache',
+TARGETS = ['check-toolchain-stamp', 'check-toolchain-portability', 'check-cold-bootstrap',
+           'check-bootstrap-policy', 'check-peer-semantics', 'check-memory-regressions',
+           'check-bootstrap-portability', 'check-bootstrap-records',
+           'check-measurement-stats', 'check-budget-harness', 'check-stack-limits',
+           'check-scalar-study-harness',
+           'check-compiler-hardening', 'check-linkage', 'check-source-map', 'check-symbol-order', 'check-list-access',
+           'check-checked-arithmetic', 'check-checked-scalars',
+           'check-runtime-bytes', 'check-runtime-traps', 'check-runtime-numeric',
+           'check-ownership-policy', 'check-stack-ownership', 'check-runtime-cache',
            'check-generated-sanitizer', 'check-sanitized-fixed-point',
            'check-smoke', 'check-release-build', 'check-launcher-isolation',
            'check-modules', 'check-regressions', 'check-diagnostics', 'check-conformance',
@@ -36,7 +44,7 @@ TARGETS = ['check-ownership-policy', 'check-stack-ownership', 'check-runtime-cac
            'check-ownership-mutation', 'check-scalar-record-initialization',
            'check-incremental-modules', 'check-incremental-modules-sanitize',
            'check-sanitize']
-DIRECTORIES = ('bootstrap', 'src', 'runtime', 'vendor', 'examples', 'tests',
+DIRECTORIES = ('bootstrap', 'compiler', 'runtime', 'library', 'vendor', 'examples', 'tests', 'build-support',
                'experiments', 'scripts', 'tools')
 
 
@@ -150,7 +158,7 @@ def main():
         wrapper.write_text('#!' + sys.executable + '\nimport os,sys\n'
                            'args=sys.argv[1:]\n'
                            'if not any(x in args for x in ("-c","-S","-E","-fsyntax-only","--version","-v")):\n'
-                           '    args=["-fuse-ld=lld",*args]\n'
+                           '    args=["-fuse-ld=lld",*args,"-lm"]\n'
                            'os.execv(' + repr(tools[name]) + ',[' + repr(tools[name]) + ',*args])\n')
         wrapper.chmod(0o755)
     env = dict(os.environ)
@@ -230,6 +238,9 @@ def main():
         check('critical-path-correctness', [sys.executable, 'experiments/memory/critical-path-study.py',
               '--compiler', str(work / 'build/minyarc'), '--cc', 'clang', '--cxx', 'clang++',
               '--output', str(evidence / 'critical-path.json')])
+        check('scalar-path-correctness', [sys.executable, 'experiments/memory/checked-scalars-study.py',
+              '--compiler', str(work / 'build/minyarc'), '--cc', 'clang', '--cxx', 'clang++',
+              '--output', str(evidence / 'scalar-path.json')])
         report['status'] = 'passed'
     except (OSError, RuntimeError) as error:
         report.update(status='failed', error=str(error))

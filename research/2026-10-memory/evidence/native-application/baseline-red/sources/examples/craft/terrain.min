@@ -1,0 +1,353 @@
+// The block world: storage, chunk bookkeeping, and terrain generation.
+
+use "./blocks.min" as blocks
+use "./noise.min" as noise
+
+public constant CHUNK_SIZE = 16
+public constant CHUNKS_X = 32
+public constant CHUNKS_Z = 32
+public constant HEIGHT = 80
+public constant SEA_LEVEL = 30
+public constant TORCH_REACH = 8
+
+// Blocks are one byte each, stored in rows of x, then z, then layers of y.
+// A chunk is a 16 by 16 column of the world that is meshed as one piece.
+// `tops` holds the highest opaque block of each column, for sky light, and
+// `torches` the block index of every torch.
+public record World {
+    blocks: Bytes
+    sizeX: Integer
+    sizeZ: Integer
+    height: Integer
+    seed: Integer
+    dirty: List<Boolean>
+    tops: List<Integer>
+    torches: List<Integer>
+}
+
+public function create(seed: Integer): World {
+    let sizeX = CHUNKS_X * CHUNK_SIZE
+    let sizeZ = CHUNKS_Z * CHUNK_SIZE
+    let dirty: List<Boolean> = []
+    for chunk in 0..CHUNKS_X * CHUNKS_Z {
+        dirty.add(true)
+    }
+    let tops: List<Integer> = []
+    for column in 0..sizeX * sizeZ {
+        tops.add(-1)
+    }
+    return World {
+        blocks: Bytes(sizeX * sizeZ * HEIGHT)
+        sizeX: sizeX
+        sizeZ: sizeZ
+        height: HEIGHT
+        seed: seed
+        dirty: dirty
+        tops: tops
+        torches: []
+    }
+}
+
+public function inside(world: World, x: Integer, y: Integer, z: Integer): Boolean {
+    return x >= 0 && y >= 0 && z >= 0 && x < world.sizeX && y < world.height && z < world.sizeZ
+}
+
+public function get(world: World, x: Integer, y: Integer, z: Integer): Integer {
+    if x < 0 || y < 0 || z < 0 || x >= world.sizeX || y >= world.height || z >= world.sizeZ {
+        return blocks.AIR
+    }
+    return world.blocks[(y * world.sizeZ + z) * world.sizeX + x]
+}
+
+// Change a block and mark every chunk whose mesh can show it, including
+// meshes whose lighting depends on it.
+public function set(world: World, x: Integer, y: Integer, z: Integer, block: Integer) {
+    if !inside(world, x, y, z) {
+        return
+    }
+    let index = (y * world.sizeZ + z) * world.sizeX + x
+    let previous = world.blocks[index]
+    world.blocks[index] = block
+    let reach = 1
+    if previous == blocks.TORCH || block == blocks.TORCH {
+        updateTorches(world, index, block == blocks.TORCH)
+        reach = TORCH_REACH
+    }
+    let oldTop = world.tops[z * world.sizeX + x]
+    updateTop(world, x, z)
+    if world.tops[z * world.sizeX + x] != oldTop && reach < 4 {
+        reach = 4
+    }
+    let lowX = (x - reach) / CHUNK_SIZE
+    let highX = (x + reach) / CHUNK_SIZE
+    let lowZ = (z - reach) / CHUNK_SIZE
+    let highZ = (z + reach) / CHUNK_SIZE
+    if x - reach < 0 { lowX = -1 }
+    if z - reach < 0 { lowZ = -1 }
+    for chunkZ in lowZ..highZ + 1 {
+        for chunkX in lowX..highX + 1 {
+            markDirty(world, chunkX, chunkZ)
+        }
+    }
+}
+
+function updateTorches(world: World, index: Integer, present: Boolean) {
+    if present {
+        world.torches.add(index)
+        return
+    }
+    let kept: List<Integer> = []
+    for torch in world.torches {
+        if torch != index {
+            kept.add(torch)
+        }
+    }
+    world.torches = kept
+}
+
+// Recompute the highest opaque block of one column.
+public function updateTop(world: World, x: Integer, z: Integer) {
+    let y = world.height - 1
+    while y >= 0 && !blocks.isOpaque(world.blocks[(y * world.sizeZ + z) * world.sizeX + x]) {
+        y -= 1
+    }
+    world.tops[z * world.sizeX + x] = y
+}
+
+// Scan the whole world for column tops and torches, after generating or loading.
+public function prepareLighting(world: World) {
+    for z in 0..world.sizeZ {
+        for x in 0..world.sizeX {
+            updateTop(world, x, z)
+        }
+    }
+    let torches: List<Integer> = []
+    let index = 0
+    for block in world.blocks {
+        if block == blocks.TORCH {
+            torches.add(index)
+        }
+        index += 1
+    }
+    world.torches = torches
+}
+
+public function top(world: World, x: Integer, z: Integer): Integer {
+    if x < 0 || z < 0 || x >= world.sizeX || z >= world.sizeZ {
+        return -1
+    }
+    return world.tops[z * world.sizeX + x]
+}
+
+// How much daylight reaches a cell: full under open sky, less beside an
+// opening, and a little everywhere else.
+public function skyLight(world: World, x: Integer, y: Integer, z: Integer): Float {
+    if y > top(world, x, z) {
+        return 1.0
+    }
+    let level = 0.1
+    for distance in 1..4 {
+        if y > top(world, x + distance, z) || y > top(world, x - distance, z) || y > top(world, x, z + distance) || y > top(world, x, z - distance) {
+            return 0.85 - Float(distance) * 0.2
+        }
+    }
+    return level
+}
+
+public function markDirty(world: World, chunkX: Integer, chunkZ: Integer) {
+    if chunkX >= 0 && chunkZ >= 0 && chunkX < CHUNKS_X && chunkZ < CHUNKS_Z {
+        world.dirty[chunkZ * CHUNKS_X + chunkX] = true
+    }
+}
+
+// The y of the highest solid block in a column, or -1.
+public function surface(world: World, x: Integer, z: Integer): Integer {
+    let y = world.height - 1
+    while y >= 0 {
+        if blocks.isSolid(get(world, x, y, z)) {
+            return y
+        }
+        y -= 1
+    }
+    return -1
+}
+
+function put(world: World, x: Integer, y: Integer, z: Integer, block: Integer) {
+    if inside(world, x, y, z) {
+        world.blocks[(y * world.sizeZ + z) * world.sizeX + x] = block
+    }
+}
+
+function terrainHeight(world: World, x: Integer, z: Integer): Integer {
+    let fx = Float(x)
+    let fz = Float(z)
+    let continents = noise.fractalNoise(fx / 90.0, fz / 90.0, world.seed, 4)
+    let hills = noise.fractalNoise(fx / 28.0, fz / 28.0, world.seed + 101, 3)
+    let mountains = noise.valueNoise(fx / 60.0, fz / 60.0, world.seed + 202)
+    let lift = 0.0
+    if mountains > 0.6 {
+        lift = (mountains - 0.6) * 70.0
+    }
+    let height = 12.0 + continents * 30.0 + hills * 10.0 + lift
+    return clamp(Integer(height), 2, HEIGHT - 12)
+}
+
+function plantTree(world: World, x: Integer, ground: Integer, z: Integer) {
+    let trunk = 4 + noise.hash(x, z, world.seed + 5) % 3
+    let top = ground + trunk
+    for dy in -2..2 {
+        let radius = 2
+        if dy >= 1 {
+            radius = 1
+        }
+        for dx in -radius..radius + 1 {
+            for dz in -radius..radius + 1 {
+                let corner = (dx == radius || dx == -radius) && (dz == radius || dz == -radius)
+                let skip = corner && noise.hash(x + dx, z + dz, world.seed + dy + 9) % 2 == 0
+                if !skip && get(world, x + dx, top + dy, z + dz) == blocks.AIR {
+                    put(world, x + dx, top + dy, z + dz, blocks.LEAVES)
+                }
+            }
+        }
+    }
+    for y in ground + 1..top {
+        put(world, x, y, z, blocks.LOG)
+    }
+}
+
+// A tunnel that wanders from a random start, carving spheres as it goes.
+function carveTunnel(world: World, index: Integer) {
+    let seed = world.seed + 1000 + index * 17
+    let x = noise.random(index, 1, seed) * Float(world.sizeX)
+    let z = noise.random(index, 2, seed) * Float(world.sizeZ)
+    let y = 6.0 + noise.random(index, 3, seed) * 40.0
+    let yaw = noise.random(index, 4, seed) * 6.283185307179586
+    let pitch = (noise.random(index, 5, seed) - 0.5) * 0.6
+    let length = 60 + noise.hash(index, 6, seed) % 90
+    for step in 0..length {
+        let radius = 1.4 + sin(Float(step) * 0.15) * 0.6 + noise.random(step, index, seed) * 0.8
+        let reach = Integer(ceil(radius))
+        let cx = Integer(floor(x))
+        let cy = Integer(floor(y))
+        let cz = Integer(floor(z))
+        for dy in -reach..reach + 1 {
+            for dz in -reach..reach + 1 {
+                for dx in -reach..reach + 1 {
+                    let distance = Float(dx * dx + dy * dy + dz * dz)
+                    if distance <= radius * radius {
+                        let block = get(world, cx + dx, cy + dy, cz + dz)
+                        // Keep the sea floor, beaches, and bedrock intact.
+                        if block == blocks.STONE || block == blocks.DIRT || block == blocks.GRASS || block == blocks.SNOW {
+                            if cy + dy > 0 && get(world, cx + dx, cy + dy + 1, cz + dz) != blocks.WATER {
+                                put(world, cx + dx, cy + dy, cz + dz, blocks.AIR)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        yaw += (noise.random(step, index * 3, seed) - 0.5) * 0.5
+        pitch = clamp(pitch + (noise.random(step, index * 5, seed) - 0.5) * 0.3, -0.6, 0.6)
+        x += sin(yaw) * cos(pitch)
+        y += sin(pitch)
+        z += cos(yaw) * cos(pitch)
+        if y < 4.0 {
+            pitch = abs(pitch)
+        }
+    }
+}
+
+// A small cluster of ore, replacing only stone.
+function placeVein(world: World, index: Integer, ore: Integer, maximumY: Integer, size: Integer) {
+    let seed = world.seed + ore * 7717
+    let x = noise.hash(index, 1, seed) % world.sizeX
+    let z = noise.hash(index, 2, seed) % world.sizeZ
+    let y = 1 + noise.hash(index, 3, seed) % maximumY
+    for step in 0..size {
+        if get(world, x, y, z) == blocks.STONE {
+            put(world, x, y, z, ore)
+        }
+        let direction = noise.hash(index, step + 10, seed) % 6
+        if direction == 0 { x += 1 }
+        if direction == 1 { x -= 1 }
+        if direction == 2 { y += 1 }
+        if direction == 3 { y -= 1 }
+        if direction == 4 { z += 1 }
+        if direction == 5 { z -= 1 }
+    }
+}
+
+public function generate(world: World) {
+    let heights: List<Integer> = []
+    for z in 0..world.sizeZ {
+        for x in 0..world.sizeX {
+            let height = terrainHeight(world, x, z)
+            heights.add(height)
+            let beach = height <= SEA_LEVEL + 1
+            let snowy = height > 52
+            for y in 0..height + 1 {
+                let block = blocks.STONE
+                if y == 0 {
+                    block = blocks.BEDROCK
+                } else if y == height {
+                    if beach {
+                        block = blocks.SAND
+                    } else if snowy {
+                        block = blocks.SNOW
+                    } else {
+                        block = blocks.GRASS
+                    }
+                } else if y > height - 4 && !snowy {
+                    if beach {
+                        block = blocks.SAND
+                    } else {
+                        block = blocks.DIRT
+                    }
+                }
+                put(world, x, y, z, block)
+            }
+            for y in height + 1..SEA_LEVEL + 1 {
+                put(world, x, y, z, blocks.WATER)
+            }
+        }
+    }
+    let area = world.sizeX * world.sizeZ
+    for vein in 0..area / 90 {
+        placeVein(world, vein, blocks.COAL_ORE, 60, 8)
+    }
+    for vein in 0..area / 180 {
+        placeVein(world, vein, blocks.IRON_ORE, 40, 6)
+    }
+    for vein in 0..area / 900 {
+        placeVein(world, vein, blocks.GOLD_ORE, 24, 5)
+    }
+    for vein in 0..area / 2200 {
+        placeVein(world, vein, blocks.DIAMOND_ORE, 14, 4)
+    }
+    for tunnel in 0..area / 1400 {
+        carveTunnel(world, tunnel)
+    }
+    for z in 3..world.sizeZ - 3 {
+        for x in 3..world.sizeX - 3 {
+            let ground = heights[z * world.sizeX + x]
+            if get(world, x, ground, z) == blocks.GRASS && get(world, x, ground + 1, z) == blocks.AIR {
+                let roll = noise.random(x, z, world.seed + 77)
+                // Grass grows thickly in meadows and only here and there elsewhere.
+                let meadow = noise.valueNoise(Float(x) / 18.0, Float(z) / 18.0, world.seed + 88) > 0.6
+                let grass = 0.024
+                if meadow {
+                    grass = 0.2
+                }
+                if roll < 0.012 {
+                    plantTree(world, x, ground, z)
+                } else if roll < 0.016 {
+                    put(world, x, ground + 1, z, blocks.RED_FLOWER)
+                } else if roll < 0.02 {
+                    put(world, x, ground + 1, z, blocks.YELLOW_FLOWER)
+                } else if roll < 0.02 + grass {
+                    put(world, x, ground + 1, z, blocks.TALL_GRASS)
+                }
+            }
+        }
+    }
+}

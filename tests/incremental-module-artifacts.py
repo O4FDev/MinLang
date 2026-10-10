@@ -2,11 +2,20 @@
 """Compile cached module fragments independently, then link and execute them."""
 from pathlib import Path
 import os
+import platform
+import shlex
+import shutil
 import subprocess
 import tempfile
+from clang_helpers import clang_command
+from llvm_sanitizer import address_sanitizer_enabled, prepare_llvm_for_link
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPILER = Path(os.environ.get('MINYAR_TEST_COMPILER', ROOT / 'build/minyarc-modules'))
+CLANG = os.environ.get('MINYAR_TEST_CLANG', 'clang')
+RUNTIME = Path(os.environ.get('MINYAR_TEST_RUNTIME', ROOT / 'build/minyar-runtime.o'))
+LINK_FLAGS = shlex.split(os.environ.get('MINYAR_TEST_LINK_FLAGS', ''))
+LTO_LINK_FLAGS = ['-fuse-ld=lld'] if platform.system() == 'Linux' and shutil.which('ld.lld') else []
 
 
 def run(command):
@@ -24,22 +33,163 @@ def fields(source):
     return result
 
 
+def pack(values):
+    return ''.join(str(len(value)) + '\n' + value for value in values)
+
+
+def runtime_prelude(source):
+    """Cached bodies share declarations and reserved compiler helper definitions.
+
+    Preserve complete LLVM function boundaries. Literal globals and language
+    functions belong to individual cached bodies and must stay out of this part.
+    """
+    lines = source.splitlines(keepends=True)
+    pieces = []
+    position = 0
+    while position < len(lines):
+        line = lines[position]
+        if line.startswith('declare '):
+            pieces.append(line)
+        elif line.startswith('define internal ') and '@.minyar.' in line:
+            pieces.append(line)
+            position += 1
+            while position < len(lines) and lines[position].strip() != '}':
+                assert not lines[position].startswith('define '), 'incomplete compiler helper'
+                pieces.append(lines[position])
+                position += 1
+            assert position < len(lines), 'unterminated compiler helper'
+            pieces.append(lines[position])
+        position += 1
+    return ''.join(pieces) + '\n'
+
+
+def overlay(base, delta, identity):
+    assert delta[:2] == ['minyar-module-delta-v3', identity]
+    rows = {base[row]: base[row:row + 10] for row in range(3, len(base), 10)}
+    rows.update({delta[row]: delta[row:row + 10] for row in range(4, len(delta), 10)})
+    result = ['minyar-module-interface-v5', delta[2], delta[3] or base[2]]
+    for path in fields(delta[2])[::2]:
+        result += rows[path]
+    return result
+
+
+def link_lto_modules(modules, binary):
+    bitcode = []
+    for module in modules:
+        bc = module.with_suffix('.bc')
+        # LLVM input otherwise runs ASan while producing bitcode, then again
+        # during LTO. Keep its function attributes and instrument only at link.
+        run(clang_command([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', '-flto',
+                           '-Xclang', '-disable-llvm-passes', '-c', module, '-o', bc]))
+        bitcode.append(bc)
+    linked = run(clang_command([CLANG, '-O2', *LINK_FLAGS, *LTO_LINK_FLAGS, '-flto',
+                                *bitcode, RUNTIME, '-o', binary]))
+    assert 'Redundant instrumentation detected' not in linked.stderr, linked.stderr
+
+
+def check_lto_sanitizer(directory):
+    if not address_sanitizer_enabled(LINK_FLAGS):
+        return
+    # A cross-module volatile load proves the final LTO pipeline instruments
+    # generated LLVM, rather than just supplying the sanitizer runtime.
+    reader = directory / 'asan-reader.ll'
+    reader.write_text('''define i8 @artifact_probe(ptr %memory, i64 %index) noinline {
+entry:
+  %address = getelementptr i8, ptr %memory, i64 %index
+  %value = load volatile i8, ptr %address
+  ret i8 %value
+}
+''')
+    entry = directory / 'asan-entry.ll'
+    entry.write_text('''declare ptr @malloc(i64)
+declare void @free(ptr)
+declare i8 @artifact_probe(ptr, i64)
+define i32 @main() {
+entry:
+  %memory = call ptr @malloc(i64 8)
+  %value = call i8 @artifact_probe(ptr %memory, i64 8)
+  call void @free(ptr %memory)
+  ret i32 0
+}
+''')
+    for module in (reader, entry):
+        prepare_llvm_for_link(module, LINK_FLAGS)
+    binary = directory / 'asan-probe'
+    link_lto_modules((reader, entry), binary)
+    result = subprocess.run([binary], capture_output=True, text=True, timeout=60)
+    assert result.returncode != 0 and 'AddressSanitizer: heap-buffer-overflow' in result.stderr, \
+        'LTO-generated load was not checked by ASan: ' + result.stderr
+
+
+def check_artifacts(directory, llvm, saved, expected, label):
+    prelude = runtime_prelude(llvm.read_text())
+    for helper in ('get.checked', 'set.scalar.checked', 'length'):
+        assert '@.minyar.list.' + helper in prelude
+    objects = []
+    modules = []
+    for index, row in enumerate(range(3, len(saved), 10)):
+        module = directory / f'{label}-{index}.ll'
+        obj = module.with_suffix('.o')
+        module.write_text(prelude + saved[row + 9] + '\n' + saved[row + 5])
+        modules.append(module)
+        prepare_llvm_for_link(module, LINK_FLAGS)
+        run(clang_command([CLANG, '-O0', *LINK_FLAGS, '-Wno-override-module', '-c', module, '-o', obj]))
+        objects.append(obj)
+    binary = directory / f'{label}-program'
+    run(clang_command([CLANG, *LINK_FLAGS, *objects, RUNTIME, '-o', binary]))
+    assert run([binary]).stdout == expected
+    # Independently compiled modules must also link with full-program LTO.
+    link_lto_modules(modules, binary)
+    assert run([binary]).stdout == expected
+
+
 with tempfile.TemporaryDirectory(prefix='minyar-artifacts-') as name:
     d = Path(name)
+    check_lto_sanitizer(d)
     empty = d / 'empty'; empty.write_text('')
     indexed = d / 'indexed'; indexed.mkdir()
     (indexed / 'leaf.min').write_text('public record Value { value: Integer }\npublic function make(): Value { return Value { value: 40 } }\n')
     (indexed / 'bridge.min').write_text('use "./leaf.min" as leaf\npublic function get(): leaf.Value { return leaf.make() }\n')
     (indexed / 'middle.min').write_text('use "./bridge.min" as bridge\npublic function answer(): Integer { return bridge.get().value }\n')
     (indexed / 'main.min').write_text('use "./leaf.min" as first\nuse "./leaf.min" as second\nuse "./middle.min" as middle\nprint(first.make().value + second.make().value + middle.answer())\n')
+    lists = d / 'lists'; lists.mkdir()
+    leaf = lists / 'leaf.min'
+    leaf_source = '''public function floatValue(values: List<Float>): Float {
+values[0] += 0.5
+return values[0]
+}
+public function grow(values: List<Integer>): Integer { values.add(9); return values.length }
+public function textValue(values: List<Text>): Text { values[0] = Text(42); return values[0] }
+'''
+    leaf.write_text(leaf_source)
+    (lists / 'bridge.min').write_text('''use "./leaf.min" as leaf
+public function report() {
+let floats = [1.0]
+print(leaf.floatValue(floats))
+let integers = [1]
+print(leaf.grow(integers))
+let words = [Text(7)]
+print(leaf.textValue(words))
+}
+''')
+    (lists / 'main.min').write_text('''use "./bridge.min" as bridge
+bridge.report()
+let flags = [false]
+flags[0] = true
+print(flags[0])
+let characters = ['a']
+characters[0] = '🙂'
+print(characters[0])
+''')
     cases = [(ROOT / f'tests/modules/{case}/main.min', expected) for case, expected in
              [('basic', 'Hello, Ada\n42\nAda\n'), ('diamond', '42\n'), ('explicit-main', '42\n'), ('windows-path', '42\n')]]
     cases.append((indexed / 'main.min', '120\n'))
+    cases.append((lists / 'main.min', '1.5\n2\n42\ntrue\n🙂\n'))
     for entry, expected in cases:
         llvm = d / 'combined.ll'; state = d / 'state'
         run([COMPILER, entry, llvm, '--module-state', empty, state, d / 'stats'])
         saved = fields(state.read_text())
-        assert saved[0] == 'minyar-module-interface-v4'
+        assert saved[0] == 'minyar-module-interface-v5'
         if entry.parent == indexed:
             # Aliases must not duplicate modules/prototypes. A type exported to
             # one consumer must remain private in another consumer's closure.
@@ -62,23 +212,30 @@ with tempfile.TemporaryDirectory(prefix='minyar-artifacts-') as name:
             run([COMPILER, entry, d / 'warm.ll', '--module-state', state, d / 'next', d / 'stats'])
             assert (d / 'warm.ll').read_bytes() == llvm.read_bytes()
             assert (d / 'stats').read_text().split()[:6] == ['4', '0', '0', '4', '0', '0']
-        runtime = '\n'.join(line for line in llvm.read_text().splitlines() if line.startswith('declare ')) + '\n'
-        objects = []
-        for index, row in enumerate(range(3, len(saved), 10)):
-            module = d / f'{index}.ll'; obj = d / f'{index}.o'
-            module.write_text(runtime + saved[row + 9] + '\n' + saved[row + 5])
-            run(['clang', '-O0', '-Wno-override-module', '-c', module, '-o', obj])
-            objects.append(obj)
-        binary = d / 'program'
-        run(['clang', *objects, ROOT / 'build/minyar-runtime.o', '-o', binary])
-        assert run([binary]).stdout == expected
-        # LLVM modules remain valid under full-program LTO as well.
-        bitcode = []
-        for index in range(len(objects)):
-            bc = d / f'{index}.bc'
-            run(['clang', '-O2', '-Wno-override-module', '-flto', '-c', d / f'{index}.ll', '-o', bc])
-            bitcode.append(bc)
-        run(['clang', '-flto', *bitcode, ROOT / 'build/minyar-runtime.o', '-o', binary])
-        assert run([binary]).stdout == expected
+        check_artifacts(d, llvm, saved, expected, 'cold')
+        if entry.parent == lists:
+            warm = d / 'warm.ll'
+            run([COMPILER, entry, warm, '--module-state', state, d / 'next', d / 'stats'])
+            assert warm.read_bytes() == llvm.read_bytes()
+            assert (d / 'next').read_bytes() == b''
+            assert (d / 'stats').read_text().split()[:6] == ['3', '0', '0', '3', '0', '0']
+            check_artifacts(d, warm, saved, expected, 'warm')
+            # A real base/delta plan recompiles one module and keeps the other
+            # two fragments. Independently link both the edit and its replay.
+            delta = d / 'delta'; delta.write_text('')
+            plan = d / 'plan'
+            identity = 'artifact-base-generation'
+            plan.write_text(pack(['minyar-module-plan-v1', str(state), str(delta), identity]))
+            leaf.write_text(leaf_source.replace('+= 0.5', '+= 1.5'))
+            edited = d / 'edited.ll'
+            run([COMPILER, entry, edited, '--module-state', plan, delta, d / 'stats'])
+            assert (d / 'stats').read_text().split()[:2] == ['2', '1']
+            updated = overlay(saved, fields(delta.read_text()), identity)
+            expected = expected.replace('1.5\n', '2.5\n')
+            check_artifacts(d, edited, updated, expected, 'delta')
+            run([COMPILER, entry, warm, '--module-state', plan, d / 'next', d / 'stats'])
+            assert warm.read_bytes() == edited.read_bytes()
+            assert (d / 'stats').read_text().split()[:6] == ['3', '0', '0', '3', '0', '0']
+            check_artifacts(d, warm, updated, expected, 'delta-replay')
 
 print('module artifacts: independent LLVM object compilation, native linking and LTO preserve fixture behavior')

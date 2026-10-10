@@ -24,7 +24,7 @@ class ReleaseBuild(unittest.TestCase):
             env = dict(os.environ, LIMITED='', SANITIZER_LIMITED='', MINYAR_CLANG=str(shim),
                        MINYAR_RELEASE_ARGUMENT_LOG=str(log))
             env.pop('MINYAR_CLANG_FLAGS', None)
-            for flags, expected, lto in [([], '-O0', False), (['--release'], '-O2', True),
+            for flags, expected, lto in [([], '-O2', False), (['--release'], '-O2', True),
                                          (['--release'], '-O1', True)]:
                 if expected == '-O1':
                     env['MINYAR_CLANG_FLAGS'] = '-O1 -Wno-override-module'

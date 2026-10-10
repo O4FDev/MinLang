@@ -179,7 +179,10 @@ an `addKind(value)` that appends, a `getKind(offset)` and a
 program; `Float32` rounds to the nearest 32-bit Float. `addBytes(other)`
 appends other Bytes, `slice(start, end)` copies a range, `resize(length)`
 truncates or zero-extends, and `clear()` empties the Bytes while keeping its
-storage. `readBytesFile(path)` and `writeBytesFile(path, bytes)` transfer files
+storage. Clearing and shrinking take constant time; growing initializes only the
+newly exposed range, plus any allocation/copy needed for capacity growth.
+Discarded storage is not a secure erase; it remains private and is initialized
+before a later resize or native extension exposes it. `readBytesFile(path)` and `writeBytesFile(path, bytes)` transfer files
 unchanged. `for byte in bytes` visits each byte as an Integer.
 
 ## Memory lifetime
@@ -310,7 +313,9 @@ end uses zero.
 An explicit `function main()` is also supported. It accepts no declared
 parameters and has an `Integer` return type; use `argument()` to read process
 arguments. A file cannot mix this form with executable top-level statements
-because that would create two entry points.
+because that would create two entry points. The executable entry `main` cannot
+be called from language code; put shared work in a separate function. An imported
+module function named `main` is an ordinary function and remains callable.
 
 Functions with a value return type must return a value on every reachable path.
 A path ending in `fail(...)` or `exit(...)` is also terminal. Functions returning
@@ -347,6 +352,24 @@ let joined = add(
 )
 ```
 
-The closing `)` of a wrapped call needs a trailing comma before it, and `else`
-belongs on the same line as the `}` that precedes it. A semicolon ends a
-statement early when two statements share a line; it is never required.
+Inside parentheses and square brackets, newlines are whitespace. A wrapped
+call or List can therefore close on its own line without a trailing comma.
+`else` and `else if` may begin on the following line, including after comments.
+A semicolon ends a statement early when two statements share a line; it is
+never required.
+
+```minyar
+let values = [
+    20,
+    22
+]
+print(
+    values[0] + values[1]
+)
+if values.length == 0 {
+    print("empty")
+}
+else {
+    print("ready")
+}
+```

@@ -14,6 +14,8 @@ import unittest
 
 from bounded_process import run
 
+from clang_helpers import clang_command
+
 ROOT = Path(__file__).resolve().parents[1]
 CLANG = 'clang'
 MODES = ('native', 'sanitize')
@@ -57,7 +59,7 @@ class StackOwnership(unittest.TestCase):
             command += ['-DMINYAR_COMPILER_ARENA=1']
         if mode == 'sanitize':
             command += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
-        self.command([*command, ROOT / 'tests' / fixture, '-o', binary])
+        self.command(clang_command([*command, ROOT / 'tests' / fixture, '-o', binary]))
         # Structural mode also runs all semantic checks and asserts stack
         # admission where eligible, including zero allocation on idle entry.
         output = self.command([binary, *(['require-stack'] if bounded else [])])

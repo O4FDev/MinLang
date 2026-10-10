@@ -8,7 +8,8 @@
 /* GetCurrentThreadStackLimits is available from Windows 8 onward. */
 #define _WIN32_WINNT 0x0602
 #endif
-#if defined(MINYAR_LAZY_HEAP) && !defined(MINYAR_COMPILER_ARENA) && defined(__linux__) && !defined(_DEFAULT_SOURCE)
+#if defined(MINYAR_LAZY_HEAP) && !defined(MINYAR_COMPILER_ARENA) && defined(__linux__) &&          \
+    !defined(_DEFAULT_SOURCE)
 #define _DEFAULT_SOURCE 1
 #endif
 #if defined(MINYAR_LAZY_HEAP) && !defined(MINYAR_COMPILER_ARENA) && defined(_WIN32)
@@ -65,6 +66,13 @@ typedef struct {
     long long capacity;
 } MinyarList;
 
+/* Checked LLVM List helpers load this public layout directly. */
+_Static_assert(sizeof(void *) == 8 && sizeof(long long) == 8,
+               "generated List helpers require 64-bit pointers and slots");
+_Static_assert(offsetof(MinyarList, values) == 0 && offsetof(MinyarList, length) == 8 &&
+                   offsetof(MinyarList, capacity) == 16 && sizeof(MinyarList) == 24,
+               "generated List helpers must match the runtime List layout");
+
 #ifdef MINYAR_COMPILER_ARENA
 typedef MinyarList MinyarRecord;
 #else
@@ -109,8 +117,9 @@ static size_t minyar_call_depth;
 static uintptr_t minyar_stack_low, minyar_stack_high;
 static int minyar_stack_bounds_ready;
 
-static void minyar_find_stack_bounds(void) {
-    if (minyar_stack_bounds_ready) return;
+/* Keep first-use platform queries out of the frequent guard. This also lets
+ * LTO inline the check without importing pthread setup into every caller. */
+static MINYAR_COLD void minyar_find_stack_bounds(void) {
     minyar_stack_bounds_ready = 1;
 #ifdef _WIN32
     {
@@ -150,7 +159,8 @@ static void minyar_find_stack_bounds(void) {
 MINYAR_NO_ADDRESS_SANITIZE void minyar_stack_enter(void) {
     unsigned char stack_marker;
     uintptr_t current = (uintptr_t)&stack_marker;
-    minyar_find_stack_bounds();
+    if (!minyar_stack_bounds_ready)
+        minyar_find_stack_bounds();
     if (minyar_call_depth >= MINYAR_MAX_CALL_DEPTH ||
         ((!minyar_stack_low || !minyar_stack_high) &&
          minyar_call_depth >= MINYAR_FALLBACK_CALL_DEPTH) ||
@@ -248,7 +258,8 @@ MINYAR_HOT void *arena_allocate(MinyarArena *arena, size_t size, size_t alignmen
 }
 
 /* Extends the newest allocation in place when it ends at the arena top. */
-MINYAR_HOT int arena_extend(MinyarArena *arena, const void *pointer, size_t old_size, size_t extra) {
+MINYAR_HOT int arena_extend(MinyarArena *arena, const void *pointer, size_t old_size,
+                            size_t extra) {
     MinyarArenaBlock *block = arena->block;
     if (!block || extra > block->capacity - block->used)
         return 0;
@@ -290,7 +301,8 @@ void minyar_exit(long long status) {
     exit((int)status);
 }
 
-MINYAR_HOT MinyarText *new_text(const unsigned char *bytes, long long byte_length, long long character_length) {
+MINYAR_HOT MinyarText *new_text(const unsigned char *bytes, long long byte_length,
+                                long long character_length) {
     MinyarText *text = object_allocate(sizeof(*text), 1);
     text->bytes = bytes;
     text->byte_length = byte_length;
@@ -332,289 +344,7 @@ MINYAR_HOT unsigned char *new_bytes(long long length) {
     return data_allocate((size_t)length + 1, 1);
 }
 
-MinyarList *minyar_list_new(void) {
-    MinyarList *list = object_allocate(sizeof(*list), 2);
-    list->values = NULL;
-    list->length = 0;
-    list->capacity = 0;
-    return list;
-}
-
-/* Called once, while an inferred empty List is still empty. */
-void minyar_list_references(MinyarList *list) {
-#ifndef MINYAR_COMPILER_ARENA
-    RcObject *object = (RcObject *)list - 1;
-    #ifdef MINYAR_BOUNDED_RC
-    unsigned kind = object->ownership & 7;
-    if (kind == RC_REFERENCES || kind == RC_REFERENCES_IMMORTAL) return;
-    object->ownership = (object->ownership & ~(size_t)7) |
-                        (list->length ? RC_REFERENCES : RC_REFERENCES_IMMORTAL);
-#else
-    object->ownership = (object->ownership & ~(size_t)7) | RC_REFERENCES;
-#endif
-#else
-    (void)list;
-#endif
-}
-
-static MINYAR_COLD void list_grow(MinyarList *list) {
-#if defined(MINYAR_BOUNDED_HEAP) && !defined(MINYAR_COMPILER_ARENA)
-    /* Leave room for RcData inside each power-of-two backing block. A capacity
-       of 2^n entries plus a header would waste almost half the finite pool. */
-    _Static_assert(sizeof(RcData) == sizeof(long long), "bounded List header layout");
-    if (list->capacity > (LLONG_MAX - 1) / 2)
-        minyar_stop("this List became too large.");
-    long long capacity = list->capacity == 0 ? 3 : list->capacity * 2 + 1;
-#else
-    /* Most Lists stay tiny, so they start small; large ones grow fast enough
-       that the copies made before they settle in the large-list arena stay
-       a fraction of their final size. */
-    long long capacity = list->capacity == 0 ? 2
-                       : list->capacity >= LARGE_LIST_CAPACITY ? list->capacity * 4
-                       : list->capacity * 2;
-#endif
-    long long *values;
-    if (capacity < list->capacity ||
-        (unsigned long long)capacity > SIZE_MAX / sizeof(*values))
-        minyar_stop("this List became too large.");
-#ifdef MINYAR_COMPILER_ARENA
-    if (list->values && list_arena_for(list->capacity) == list_arena_for(capacity) &&
-        arena_extend(list_arena_for(capacity), list->values, (size_t)list->capacity * sizeof(*values),
-                     (size_t)(capacity - list->capacity) * sizeof(*values))) {
-        list->capacity = capacity;
-        return;
-    }
-    values = list_allocate(capacity, (size_t)capacity * sizeof(*values));
-    if (list->values)
-        memcpy(values, list->values, (size_t)list->length * sizeof(*values));
-#else
-    values = rc_reallocate_data(list->values, (size_t)capacity * sizeof(*values));
-    if (!values)
-        out_of_memory();
-#endif
-    list->values = values;
-    list->capacity = capacity;
-}
-
-#if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
-/* The first mortal member permanently promotes an immortal-only List. Service
- * during preceding appends still pays potential scan work if promotion happens
- * later; when no work is pending this is only one cheap count test. */
-static inline unsigned list_store_kind(MinyarList *list, long long value, unsigned kind) {
-    RcObject *object = (RcObject *)list - 1;
-    if (kind == RC_REFERENCES_IMMORTAL && value &&
-        (((RcObject *)(uintptr_t)value - 1)->ownership >> 3)) {
-        object->ownership = (object->ownership & ~(size_t)7) | RC_REFERENCES;
-        kind = RC_REFERENCES;
-    }
-    return kind;
-}
-#endif
-
-void minyar_list_add(MinyarList *list, long long value) {
-    if (list->length == list->capacity)
-        list_grow(list);
-#if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
-    unsigned kind = ((RcObject *)list - 1)->ownership & 7;
-    if (kind == RC_LIST) {
-        list->values[list->length++] = value;
-        return;
-    }
-    kind = list_store_kind(list, value, kind);
-    if (kind == RC_REFERENCES) minyar_rc_retain((void *)(uintptr_t)value);
-    list->values[list->length++] = value;
-    if (rc_pending_count) minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
-#else
-#ifndef MINYAR_COMPILER_ARENA
-    if ((((RcObject *)list - 1)->ownership & 7) == RC_REFERENCES)
-        minyar_rc_retain((void *)(uintptr_t)value);
-#endif
-    list->values[list->length++] = value;
-#endif
-}
-
-/* The compiler transfers an existing owned reference into this new slot. */
-void minyar_list_add_take(MinyarList *list, long long value) {
-    if (list->length == list->capacity)
-        list_grow(list);
-#if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
-    unsigned kind = ((RcObject *)list - 1)->ownership & 7;
-    if (kind == RC_LIST) {
-        list->values[list->length++] = value;
-        return;
-    }
-    kind = list_store_kind(list, value, kind);
-#endif
-    list->values[list->length++] = value;
-#if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
-    if (rc_pending_count) minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
-#endif
-}
-
-long long minyar_list_length(const MinyarList *list) {
-    return list->length;
-}
-
-static MINYAR_COLD MINYAR_NORETURN void list_position_stop(long long position, long long length) {
-    char message[128];
-    snprintf(message, sizeof(message),
-             "List position %lld is outside its length of %lld.",
-             position, length);
-    minyar_stop(message);
-}
-
-long long minyar_list_get(const MinyarList *list, long long position) {
-    if ((unsigned long long)position >= (unsigned long long)list->length)
-        list_position_stop(position, list->length);
-    return list->values[position];
-}
-
-static void minyar_list_set_owned(MinyarList *list, long long position, long long value,
-                                  int retain_value) {
-    if ((unsigned long long)position >= (unsigned long long)list->length)
-        list_position_stop(position, list->length);
-#ifndef MINYAR_COMPILER_ARENA
-#ifdef MINYAR_BOUNDED_RC
-    unsigned kind = list_store_kind(list, value, ((RcObject *)list - 1)->ownership & 7);
-    if (kind == RC_REFERENCES) {
-#else
-    if ((((RcObject *)list - 1)->ownership & 7) == RC_REFERENCES) {
-#endif
-        if (retain_value) minyar_rc_retain((void *)(uintptr_t)value);
-        long long previous = list->values[position];
-        list->values[position] = value;
-        minyar_rc_release((void *)(uintptr_t)previous);
-        return;
-    }
-#else
-    (void)retain_value;
-#endif
-    list->values[position] = value;
-}
-
-void minyar_list_set(MinyarList *list, long long position, long long value) {
-    minyar_list_set_owned(list, position, value, 1);
-}
-
-/* The compiler transfers an existing owned reference into this slot. */
-void minyar_list_set_take(MinyarList *list, long long position, long long value) {
-    minyar_list_set_owned(list, position, value, 0);
-}
-
-/* Return a fresh List containing the old elements followed by value. Because
- * the result did not exist while its inputs were evaluated, this operation
- * cannot introduce the first ownership cycle. The compiler supplies the
- * element ownership kind and may transfer the final value's existing owner. */
-MinyarList *minyar_list_appended(const MinyarList *list, long long value,
-                                 long long references, long long take_value) {
-    MinyarList *result = minyar_list_new();
-    if (references) minyar_list_references(result);
-    if (list->length == LLONG_MAX) minyar_stop("this List became too large.");
-    while (result->capacity < list->length + 1) list_grow(result);
-    for (long long position = 0; position < list->length; position++)
-        minyar_list_add(result, list->values[position]);
-    if (take_value)
-        minyar_list_add_take(result, value);
-    else
-        minyar_list_add(result, value);
-    return result;
-}
-
-#ifdef MINYAR_BOUNDED_RC
-MINYAR_HOT
-#else
-static
-#endif
-MinyarRecord *record_allocate(long long field_count, int references) {
-    MinyarRecord *record;
-    if (field_count < 0 ||
-        (unsigned long long)field_count > SIZE_MAX / sizeof(long long))
-        minyar_stop("this record has too many fields.");
-#ifdef MINYAR_COMPILER_ARENA
-    (void)references;
-    record = minyar_list_new();
-    if (field_count > 0) {
-        record->values = list_allocate(field_count, (size_t)field_count * sizeof(*record->values));
-        memset(record->values, 0, (size_t)field_count * sizeof(*record->values));
-    }
-#else
-    size_t field_size = sizeof(long long) + (references ? 1 : 0);
-    if ((unsigned long long)field_count >
-        (SIZE_MAX - sizeof(RcObject) - sizeof(*record)) / field_size)
-        out_of_memory();
-    record = rc_allocate_object(sizeof(*record) + (size_t)field_count * field_size,
-                                references ? RC_RECORD : RC_SCALAR_RECORD);
-    memset(record->values, 0, (size_t)field_count * field_size);
-#endif
-    record->length = field_count;
-#ifdef MINYAR_COMPILER_ARENA
-    record->capacity = field_count;
-#endif
-    return record;
-}
-
-MinyarRecord *minyar_record_new(long long field_count) {
-    return record_allocate(field_count, 1);
-}
-
-MinyarRecord *minyar_record_new_scalar(long long field_count) {
-    return record_allocate(field_count, 0);
-}
-
-long long minyar_record_get(const MinyarRecord *record, long long field) {
-    if ((unsigned long long)field >= (unsigned long long)record->length)
-        list_position_stop(field, record->length);
-    return record->values[field];
-}
-
-/* Compiler-selected entry point for scalar-only record fields. */
-void minyar_record_set_scalar(MinyarRecord *record, long long field, long long value) {
-    if ((unsigned long long)field >= (unsigned long long)record->length)
-        list_position_stop(field, record->length);
-    record->values[field] = value;
-}
-
-void minyar_record_set(MinyarRecord *record, long long field, long long value) {
-    if ((unsigned long long)field >= (unsigned long long)record->length)
-        list_position_stop(field, record->length);
-    record->values[field] = value;
-#if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
-    if ((((RcObject *)record - 1)->ownership & 7) == RC_RECORD)
-        minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
-#endif
-}
-
-void minyar_record_set_take(MinyarRecord *record, long long field, long long value) {
-    if ((unsigned long long)field >= (unsigned long long)record->length)
-        list_position_stop(field, record->length);
-#ifndef MINYAR_COMPILER_ARENA
-    unsigned char *references = (unsigned char *)(record->values + record->length);
-    references[field] = 1;
-#endif
-    minyar_record_set(record, field, value);
-}
-
-void minyar_record_set_reference(MinyarRecord *record, long long field, long long value) {
-    minyar_rc_retain((void *)(uintptr_t)value);
-    minyar_record_set_take(record, field, value);
-}
-
-/* Replace a reference field of a live record. The compiler has proved that
- * the new edge cannot close an ownership cycle. */
-void minyar_record_replace(MinyarRecord *record, long long field, long long value,
-                           long long take_value) {
-    if ((unsigned long long)field >= (unsigned long long)record->length)
-        list_position_stop(field, record->length);
-#ifndef MINYAR_COMPILER_ARENA
-    if (!take_value) minyar_rc_retain((void *)(uintptr_t)value);
-    long long previous = record->values[field];
-    record->values[field] = value;
-    minyar_rc_release((void *)(uintptr_t)previous);
-#else
-    (void)take_value;
-    record->values[field] = value;
-#endif
-}
+#include "minyar_collections.h"
 
 static MinyarText *copy_c_text(const char *source) {
     size_t length = strlen(source);
@@ -640,8 +370,7 @@ static char *text_as_path(const MinyarText *text) {
 }
 
 void minyar_print_text(const MinyarText *text) {
-    if (fwrite(text->bytes, 1, (size_t)text->byte_length, stdout) !=
-            (size_t)text->byte_length ||
+    if (fwrite(text->bytes, 1, (size_t)text->byte_length, stdout) != (size_t)text->byte_length ||
         putchar('\n') == EOF || fflush(stdout) == EOF)
         output_error();
 }
@@ -663,8 +392,8 @@ static long long encode_character(int character, unsigned char *bytes);
 void minyar_print_character(int character) {
     unsigned char bytes[4];
     long long length = encode_character(character, bytes);
-    if (fwrite(bytes, 1, (size_t)length, stdout) != (size_t)length ||
-        putchar('\n') == EOF || fflush(stdout) == EOF)
+    if (fwrite(bytes, 1, (size_t)length, stdout) != (size_t)length || putchar('\n') == EOF ||
+        fflush(stdout) == EOF)
         output_error();
 }
 
@@ -675,7 +404,8 @@ void minyar_print_boolean(_Bool boolean) {
 
 /* Names and operators are short; comparing them with overlapping fixed-width
    loads avoids a library call and never reads past either Text. */
-MINYAR_HOT int bytes_are_equal(const unsigned char *left, const unsigned char *right, size_t length) {
+MINYAR_HOT int bytes_are_equal(const unsigned char *left, const unsigned char *right,
+                               size_t length) {
     if (length > 16)
         return memcmp(left, right, length) == 0;
     if (length >= 8) {
@@ -722,7 +452,11 @@ static MinyarText *join_by_copying(const MinyarText *left, const MinyarText *rig
     copy_bytes(bytes, left->bytes, (size_t)left->byte_length);
     copy_bytes(bytes + left->byte_length, right->bytes, (size_t)right->byte_length);
     bytes[length] = 0;
-    return new_text(bytes, length, -1);
+    long long characters =
+        left->character_length == left->byte_length && right->character_length == right->byte_length
+            ? length
+            : -1;
+    return new_text(bytes, length, characters);
 }
 
 MinyarText *minyar_join_text(const MinyarText *left, const MinyarText *right) {
@@ -731,7 +465,8 @@ MinyarText *minyar_join_text(const MinyarText *left, const MinyarText *right) {
 #ifdef MINYAR_COMPILER_ARENA
     /* Growing the left Text in place keeps a chain of joins linear. Its
        bytes stay untouched; only the terminator beyond them is overwritten. */
-    if (arena_extend(&data_arena, left->bytes, (size_t)left->byte_length + 1, (size_t)right->byte_length)) {
+    if (arena_extend(&data_arena, left->bytes, (size_t)left->byte_length + 1,
+                     (size_t)right->byte_length)) {
         unsigned char *bytes = (unsigned char *)left->bytes;
         long long length = left->byte_length + right->byte_length;
         copy_bytes(bytes + left->byte_length, right->bytes, (size_t)right->byte_length);
@@ -763,7 +498,8 @@ MinyarText *minyar_join_text_take_left(MinyarText *left, const MinyarText *right
         unsigned char *bytes = (unsigned char *)left->bytes;
         if (required > capacity) {
             size_t grown = capacity > SIZE_MAX / 2 ? SIZE_MAX : capacity * 2;
-            if (grown < required) grown = required;
+            if (grown < required)
+                grown = required;
             bytes = rc_reallocate_data(bytes, grown);
         }
         const unsigned char *right_bytes = right == left ? bytes : right->bytes;
@@ -772,8 +508,10 @@ MinyarText *minyar_join_text_take_left(MinyarText *left, const MinyarText *right
         rc_free_data(left->character_offsets);
         left->bytes = bytes;
         left->byte_length = length;
-        if (left->character_length >= 0 && right->character_length >= 0)
-            left->character_length += right->character_length;
+        /* With no index, a known count denotes ASCII. Unicode operands need
+         * a fresh lazy index after joining, even if their old counts are known. */
+        if (left->character_length == left_length && right->character_length == right_length)
+            left->character_length = length;
         else
             left->character_length = -1;
         left->character_offsets = NULL;
@@ -789,6 +527,7 @@ MinyarText *minyar_join_texts(const MinyarList *parts) {
     long long index;
     long long length = 0;
     long long offset = 0;
+    _Bool certified_ascii = 1;
     unsigned char *bytes;
 
     for (index = 0; index < parts->length; index++) {
@@ -796,6 +535,8 @@ MinyarText *minyar_join_texts(const MinyarList *parts) {
         if (part->byte_length > LLONG_MAX - length)
             join_too_large();
         length += part->byte_length;
+        if (part->character_length != part->byte_length)
+            certified_ascii = 0;
     }
     bytes = new_bytes(length);
     for (index = 0; index < parts->length; index++) {
@@ -804,7 +545,7 @@ MinyarText *minyar_join_texts(const MinyarList *parts) {
         offset += part->byte_length;
     }
     bytes[length] = 0;
-    return new_text(bytes, length, -1);
+    return new_text(bytes, length, certified_ascii ? length : -1);
 }
 
 static MINYAR_COLD MINYAR_NORETURN void invalid_utf8(void) {
@@ -825,27 +566,22 @@ static unsigned int decode_character(const unsigned char *bytes, long long remai
         *width = 1;
         return first;
     }
-    if (first >= 0xc2 && first <= 0xdf && remaining >= 2 &&
-        (bytes[1] & 0xc0) == 0x80) {
+    if (first >= 0xc2 && first <= 0xdf && remaining >= 2 && (bytes[1] & 0xc0) == 0x80) {
         *width = 2;
         return ((first & 0x1f) << 6) | (bytes[1] & 0x3f);
     }
-    if ((first & 0xf0) == 0xe0 && remaining >= 3 &&
-        (bytes[1] & 0xc0) == 0x80 && (bytes[2] & 0xc0) == 0x80 &&
-        (first != 0xe0 || bytes[1] >= 0xa0) &&
+    if ((first & 0xf0) == 0xe0 && remaining >= 3 && (bytes[1] & 0xc0) == 0x80 &&
+        (bytes[2] & 0xc0) == 0x80 && (first != 0xe0 || bytes[1] >= 0xa0) &&
         (first != 0xed || bytes[1] < 0xa0)) {
         *width = 3;
-        return ((first & 0x0f) << 12) | ((bytes[1] & 0x3f) << 6) |
-               (bytes[2] & 0x3f);
+        return ((first & 0x0f) << 12) | ((bytes[1] & 0x3f) << 6) | (bytes[2] & 0x3f);
     }
-    if (first >= 0xf0 && first <= 0xf4 && remaining >= 4 &&
-        (bytes[1] & 0xc0) == 0x80 && (bytes[2] & 0xc0) == 0x80 &&
-        (bytes[3] & 0xc0) == 0x80 &&
-        (first != 0xf0 || bytes[1] >= 0x90) &&
-        (first != 0xf4 || bytes[1] < 0x90)) {
+    if (first >= 0xf0 && first <= 0xf4 && remaining >= 4 && (bytes[1] & 0xc0) == 0x80 &&
+        (bytes[2] & 0xc0) == 0x80 && (bytes[3] & 0xc0) == 0x80 &&
+        (first != 0xf0 || bytes[1] >= 0x90) && (first != 0xf4 || bytes[1] < 0x90)) {
         *width = 4;
-        return ((first & 0x07) << 18) | ((bytes[1] & 0x3f) << 12) |
-               ((bytes[2] & 0x3f) << 6) | (bytes[3] & 0x3f);
+        return ((first & 0x07) << 18) | ((bytes[1] & 0x3f) << 12) | ((bytes[2] & 0x3f) << 6) |
+               (bytes[3] & 0x3f);
     }
     invalid_utf8();
     return 0;
@@ -906,11 +642,10 @@ static MINYAR_COLD void build_text_index(MinyarText *text) {
        characters from that byte position, reducing ordinary index storage
        from four bytes per character to roughly one sixteenth of a byte. */
     offset_size = text->byte_length <= UINT32_MAX ? sizeof(uint32_t) : sizeof(long long);
-    if ((unsigned long long)(characters / TEXT_INDEX_STRIDE + 1) >
-        SIZE_MAX / offset_size - 2)
+    if ((unsigned long long)(characters / TEXT_INDEX_STRIDE + 1) > SIZE_MAX / offset_size - 2)
         minyar_stop("this Text is too large to index.");
-    offsets = data_allocate((size_t)(characters / TEXT_INDEX_STRIDE + 3) * offset_size,
-                            offset_size);
+    offsets =
+        data_allocate((size_t)(characters / TEXT_INDEX_STRIDE + 3) * offset_size, offset_size);
     byte = 0;
     characters = 0;
     while (byte < text->byte_length) {
@@ -965,6 +700,21 @@ static long long indexed_byte_offset(MinyarText *text, long long position) {
     if (cached_position >= start && cached_position <= position) {
         start = cached_position;
         byte = cached_byte;
+    } else if (cached_position > position && cached_position - position <= position - start) {
+        /* The index was built only after validating UTF-8. Walking backwards
+           to leading bytes is safe and avoids rescanning a whole breadcrumb
+           when parsers repeat a lookup or briefly look behind their cursor. */
+        start = cached_position;
+        byte = cached_byte;
+        while (start > position) {
+            do {
+                byte--;
+            } while ((text->bytes[byte] & 0xc0) == 0x80);
+            start--;
+#ifdef MINYAR_RC_TESTING
+            text_decode_count++;
+#endif
+        }
     }
     while (start < position) {
         long long width;
@@ -983,8 +733,7 @@ static long long indexed_byte_offset(MinyarText *text, long long position) {
 static MINYAR_COLD int indexed_character_at(MinyarText *text, long long position) {
     long long byte = indexed_byte_offset(text, position);
     long long width;
-    int character = (int)decode_character(text->bytes + byte,
-                                          text->byte_length - byte, &width);
+    int character = (int)decode_character(text->bytes + byte, text->byte_length - byte, &width);
 #ifdef MINYAR_RC_TESTING
     text_decode_count++;
 #endif
@@ -1049,8 +798,9 @@ MinyarText *minyar_text_slice(MinyarText *text, long long start, long long end) 
         long long length = last_byte - first_byte;
         const unsigned char *bytes = text->bytes + first_byte;
         if (length > 0 && length <= SLICE_CACHE_BYTES) {
-            unsigned hash = (unsigned)length * 37u + (unsigned)bytes[0] * 101u
-                + (unsigned)bytes[length / 2] * 257u + (unsigned)bytes[length - 1] * 65537u;
+            unsigned hash = (unsigned)length * 37u + (unsigned)bytes[0] * 101u +
+                            (unsigned)bytes[length / 2] * 257u +
+                            (unsigned)bytes[length - 1] * 65537u;
             unsigned slot = (hash ^ (hash >> 10)) & (SLICE_CACHE_SIZE - 1);
             MinyarText *cached = slice_cache[slot];
             if (cached && cached->byte_length == length &&
@@ -1081,8 +831,8 @@ MinyarText *minyar_text_slice(MinyarText *text, long long start, long long end) 
             bytes[length] = 0;
             return new_text(bytes, length, length == characters ? characters : -1);
         }
-        MinyarText *view = new_text(text->bytes + first_byte, length,
-                                    length == characters ? characters : -1);
+        MinyarText *view =
+            new_text(text->bytes + first_byte, length, length == characters ? characters : -1);
         view->backing = root;
         minyar_rc_retain(root);
         return view;
@@ -1094,7 +844,8 @@ static MINYAR_COLD MinyarText *format_integer_text(long long integer) {
     char buffer[32];
     char *end = buffer + sizeof(buffer);
     char *cursor = end;
-    unsigned long long magnitude = integer < 0 ? 0 - (unsigned long long)integer : (unsigned long long)integer;
+    unsigned long long magnitude =
+        integer < 0 ? 0 - (unsigned long long)integer : (unsigned long long)integer;
     do {
         *--cursor = (char)('0' + magnitude % 10);
         magnitude /= 10;
@@ -1136,8 +887,7 @@ MinyarText *minyar_integer_text(long long integer) {
 
 static long long encode_character(int character, unsigned char *bytes) {
     long long length;
-    if (character < 0 || character > 0x10ffff ||
-        (character >= 0xd800 && character <= 0xdfff))
+    if (character < 0 || character > 0x10ffff || (character >= 0xd800 && character <= 0xdfff))
         minyar_stop("this Character is not valid Unicode.");
     if (character < 0x80) {
         bytes[0] = (unsigned char)character;
@@ -1175,7 +925,10 @@ static MINYAR_COLD MinyarText *encode_character_text(int character) {
 }
 
 MinyarText *minyar_character_text(int character) {
-    static struct { size_t ownership; MinyarText text; } ascii_texts[128];
+    static struct {
+        size_t ownership;
+        MinyarText text;
+    } ascii_texts[128];
     static unsigned char ascii_bytes[128][2];
     if ((unsigned int)character < 128) {
         MinyarText *text = &ascii_texts[character].text;
@@ -1230,13 +983,13 @@ MinyarText *minyar_argument(long long position) {
         minyar_stop("a program argument position was outside the argument list.");
 #ifdef _WIN32
     const wchar_t *argument = saved_windows_argument_values[position + 1];
-    int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, argument, -1,
-                                    NULL, 0, NULL, NULL);
+    int length =
+        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, argument, -1, NULL, 0, NULL, NULL);
     if (length <= 0)
         minyar_stop("a program argument contained invalid Unicode.");
     unsigned char *bytes = new_bytes((long long)length - 1);
-    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, argument, -1,
-                            (char *)bytes, length, NULL, NULL) != length)
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, argument, -1, (char *)bytes, length,
+                            NULL, NULL) != length)
         minyar_stop("a program argument could not be converted to UTF-8.");
     return new_text(bytes, (long long)length - 1, -1);
 #else
@@ -1305,427 +1058,11 @@ void minyar_write_text_file(const MinyarText *path_text, const MinyarText *conte
     if (!file)
         minyar_stop("a requested text file could not be created.");
     if (fwrite(contents->bytes, 1, (size_t)contents->byte_length, file) !=
-        (size_t)contents->byte_length || fclose(file) != 0)
+            (size_t)contents->byte_length ||
+        fclose(file) != 0)
         minyar_stop("a requested text file could not be written.");
 }
 
-static MINYAR_COLD MINYAR_NORETURN void integer_overflow_stop(void) {
-    fputs("Minyar stopped: this Integer calculation is outside the supported range.\n",
-          stderr);
-    exit(1);
-}
+#include "minyar_numbers.h"
 
-void minyar_check_integer_overflow(_Bool overflowed) {
-    if (overflowed)
-        integer_overflow_stop();
-}
-
-static MINYAR_COLD MINYAR_NORETURN void integer_division_stop(const char *message) {
-    fputs("Minyar stopped: ", stderr);
-    fputs(message, stderr);
-    fputc('\n', stderr);
-    exit(1);
-}
-
-void minyar_check_integer_division(long long left, long long right) {
-    if (right == 0)
-        integer_division_stop("an Integer cannot be divided by zero.");
-    if (left == LLONG_MIN && right == -1)
-        integer_division_stop("this Integer division is outside the supported range.");
-}
-
-/* Float text uses the shortest decimal digits that read back as the same
- * value. Plain notation is used for ordinary magnitudes and always keeps a
- * point, so a printed Float cannot be mistaken for an Integer. */
-static size_t format_float(double value, char *out, size_t capacity) {
-    if (isnan(value)) return (size_t)snprintf(out, capacity, "NaN");
-    if (isinf(value)) return (size_t)snprintf(out, capacity, value < 0 ? "-Infinity" : "Infinity");
-    char scientific[40];
-    int precision = 1;
-    for (; precision < 17; precision++) {
-        snprintf(scientific, sizeof(scientific), "%.*e", precision - 1, value);
-        if (strtod(scientific, NULL) == value) break;
-    }
-    snprintf(scientific, sizeof(scientific), "%.*e", precision - 1, value);
-    char digits[24];
-    size_t digit_count = 0;
-    const char *cursor = scientific;
-    int negative = *cursor == '-';
-    if (negative) cursor++;
-    for (; *cursor && *cursor != 'e'; cursor++)
-        if (*cursor >= '0' && *cursor <= '9') digits[digit_count++] = *cursor;
-    int exponent = atoi(cursor + 1);
-    while (digit_count > 1 && digits[digit_count - 1] == '0') digit_count--;
-    size_t length = 0;
-#define FLOAT_PUT(character) do { if (length + 1 < capacity) out[length] = (character); length++; } while (0)
-    if (negative) FLOAT_PUT('-');
-    if (exponent >= -7 && exponent < 21) {
-        if (exponent < 0) {
-            FLOAT_PUT('0');
-            FLOAT_PUT('.');
-            for (int zero = -1; zero > exponent; zero--) FLOAT_PUT('0');
-            for (size_t i = 0; i < digit_count; i++) FLOAT_PUT(digits[i]);
-        } else {
-            for (int i = 0; i <= exponent; i++) FLOAT_PUT((size_t)i < digit_count ? digits[i] : '0');
-            FLOAT_PUT('.');
-            if ((size_t)exponent + 1 < digit_count)
-                for (size_t i = (size_t)exponent + 1; i < digit_count; i++) FLOAT_PUT(digits[i]);
-            else
-                FLOAT_PUT('0');
-        }
-    } else {
-        FLOAT_PUT(digits[0]);
-        FLOAT_PUT('.');
-        if (digit_count > 1)
-            for (size_t i = 1; i < digit_count; i++) FLOAT_PUT(digits[i]);
-        else
-            FLOAT_PUT('0');
-        char suffix[8];
-        snprintf(suffix, sizeof(suffix), "e%+d", exponent);
-        for (const char *piece = suffix; *piece; piece++) FLOAT_PUT(*piece);
-    }
-#undef FLOAT_PUT
-    out[length < capacity ? length : capacity - 1] = 0;
-    return length;
-}
-
-void minyar_print_float(double value) {
-    char text[48];
-    format_float(value, text, sizeof(text));
-    if (puts(text) == EOF || fflush(stdout) == EOF)
-        output_error();
-}
-
-MinyarText *minyar_float_text(double value) {
-    char text[48];
-    size_t length = format_float(value, text, sizeof(text));
-    unsigned char *bytes = new_bytes((long long)length);
-    memcpy(bytes, text, length + 1);
-    return new_text(bytes, (long long)length, (long long)length);
-}
-
-long long minyar_float_integer(double value) {
-    /* Both bounds are exact powers of two, so the comparison is exact. */
-    if (!(value >= -9223372036854775808.0 && value < 9223372036854775808.0))
-        minyar_stop(isnan(value) ? "NaN cannot be converted to an Integer."
-                                 : "this Float is outside the Integer range.");
-    return (long long)value;
-}
-
-int minyar_integer_character(long long value) {
-    if (value < 0 || value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff))
-        minyar_stop("this Integer is not a Unicode scalar value.");
-    return (int)value;
-}
-
-long long minyar_integer_absolute(long long value) {
-    if (value == LLONG_MIN)
-        minyar_stop("the absolute value of this Integer is outside the supported range.");
-    return value < 0 ? -value : value;
-}
-
-void minyar_check_clamp_integer(long long lower, long long upper) {
-    if (lower > upper) minyar_stop("clamp needs a lower bound that is not above its upper bound.");
-}
-
-void minyar_check_clamp_float(double lower, double upper) {
-    if (!(lower <= upper)) minyar_stop("clamp needs a lower bound that is not above its upper bound.");
-}
-
-void minyar_check_shift(long long count) {
-    if ((unsigned long long)count > 63)
-        minyar_stop("a shift count must be between 0 and 63.");
-}
-
-double minyar_tan(double value) { return tan(value); }
-double minyar_asin(double value) { return asin(value); }
-double minyar_acos(double value) { return acos(value); }
-double minyar_atan(double value) { return atan(value); }
-double minyar_atan2(double y, double x) { return atan2(y, x); }
-
-/*
- * Bytes are packed, growable buffers. They reuse the leaf Text object, so every
- * ownership profile releases them exactly like Text: `bytes` points at
- * capacity + 1 zeroed bytes, byte_length is the length, and character_length
- * holds the capacity. The compiler keeps Bytes and Text distinct types.
- * Multi-byte accessors are little-endian at any byte offset.
- */
-typedef MinyarText MinyarBytes;
-
-static MINYAR_COLD MINYAR_NORETURN void bytes_position_stop(long long position, long long size,
-                                                             long long length) {
-    char message[160];
-    if (size == 1)
-        snprintf(message, sizeof(message),
-                 "Bytes position %lld is outside its length of %lld.", position, length);
-    else
-        snprintf(message, sizeof(message),
-                 "a %lld-byte value at position %lld does not fit in Bytes of length %lld.",
-                 size, position, length);
-    minyar_stop(message);
-}
-
-static MINYAR_COLD MINYAR_NORETURN void bytes_value_stop(long long value, const char *kind) {
-    char message[160];
-    snprintf(message, sizeof(message), "%lld does not fit in %s.", value, kind);
-    minyar_stop(message);
-}
-
-static unsigned char *bytes_data(const MinyarBytes *bytes) {
-    return (unsigned char *)bytes->bytes;
-}
-
-static void bytes_check(const MinyarBytes *bytes, long long position, long long size) {
-    if (position < 0 || position > bytes->byte_length - size)
-        bytes_position_stop(position, size, bytes->byte_length);
-}
-
-MinyarBytes *minyar_bytes_new(long long length) {
-    if (length < 0) minyar_stop("Bytes cannot have a negative length.");
-    if ((unsigned long long)length >= SIZE_MAX / 2) minyar_stop("these Bytes are too large.");
-    unsigned char *data = new_bytes(length);
-    memset(data, 0, (size_t)length + 1);
-    return new_text(data, length, length);
-}
-
-long long minyar_bytes_length(const MinyarBytes *bytes) {
-    return bytes->byte_length;
-}
-
-static void bytes_reserve(MinyarBytes *bytes, long long extra) {
-    long long capacity = bytes->character_length;
-    if (extra > LLONG_MAX / 4 - bytes->byte_length) minyar_stop("these Bytes are too large.");
-    long long needed = bytes->byte_length + extra;
-    if (needed <= capacity) return;
-    long long grown = capacity < 16 ? 16 : capacity * 2;
-    if (grown < needed) grown = needed;
-    if ((unsigned long long)grown >= SIZE_MAX / 2) minyar_stop("these Bytes are too large.");
-#ifdef MINYAR_COMPILER_ARENA
-    unsigned char *data = data_allocate((size_t)grown + 1, 1);
-    memcpy(data, bytes->bytes, (size_t)bytes->byte_length);
-#else
-    unsigned char *data = rc_reallocate_data(bytes_data(bytes), (size_t)grown + 1);
-#endif
-    memset(data + bytes->byte_length, 0, (size_t)(grown - bytes->byte_length) + 1);
-    bytes->bytes = data;
-    bytes->character_length = grown;
-}
-
-void minyar_bytes_resize(MinyarBytes *bytes, long long length) {
-    if (length < 0) minyar_stop("Bytes cannot have a negative length.");
-    if (length > bytes->byte_length) {
-        bytes_reserve(bytes, length - bytes->byte_length);
-    } else {
-        memset(bytes_data(bytes) + length, 0, (size_t)(bytes->byte_length - length));
-    }
-    bytes->byte_length = length;
-}
-
-void minyar_bytes_clear(MinyarBytes *bytes) {
-    minyar_bytes_resize(bytes, 0);
-}
-
-long long minyar_bytes_get(const MinyarBytes *bytes, long long position) {
-    if ((unsigned long long)position >= (unsigned long long)bytes->byte_length)
-        bytes_position_stop(position, 1, bytes->byte_length);
-    return bytes->bytes[position];
-}
-
-void minyar_bytes_set(MinyarBytes *bytes, long long position, long long value) {
-    if ((unsigned long long)position >= (unsigned long long)bytes->byte_length)
-        bytes_position_stop(position, 1, bytes->byte_length);
-    if ((unsigned long long)value > 255) bytes_value_stop(value, "a byte (0 to 255)");
-    bytes_data(bytes)[position] = (unsigned char)value;
-}
-
-static void bytes_store(unsigned char *target, unsigned long long value, int size) {
-    for (int i = 0; i < size; i++) target[i] = (unsigned char)(value >> (8 * i));
-}
-
-static unsigned long long bytes_load(const unsigned char *source, int size) {
-    unsigned long long value = 0;
-    for (int i = 0; i < size; i++) value |= (unsigned long long)source[i] << (8 * i);
-    return value;
-}
-
-static void bytes_check_integer(long long value, int size, int is_signed) {
-    static const char *const kinds[2][5] = {
-        {"", "", "an unsigned 16-bit Integer", "", "an unsigned 32-bit Integer"},
-        {"", "", "a signed 16-bit Integer", "", "a signed 32-bit Integer"},
-    };
-    long long bits = 8LL * size;
-    if (is_signed) {
-        if (value < -(1LL << (bits - 1)) || value >= (1LL << (bits - 1)))
-            bytes_value_stop(value, kinds[1][size]);
-    } else if (value < 0 || value >= (1LL << bits)) {
-        bytes_value_stop(value, kinds[0][size]);
-    }
-}
-
-#define MINYAR_BYTES_INTEGER(Name, size, is_signed, cast)                                   \
-    void minyar_bytes_add_##Name(MinyarBytes *bytes, long long value) {                   \
-        bytes_check_integer(value, size, is_signed);                                       \
-        bytes_reserve(bytes, size);                                                        \
-        bytes_store(bytes_data(bytes) + bytes->byte_length, (unsigned long long)value, size); \
-        bytes->byte_length += size;                                                        \
-    }                                                                                      \
-    void minyar_bytes_set_##Name(MinyarBytes *bytes, long long position, long long value) { \
-        bytes_check(bytes, position, size);                                                \
-        bytes_check_integer(value, size, is_signed);                                       \
-        bytes_store(bytes_data(bytes) + position, (unsigned long long)value, size);        \
-    }                                                                                      \
-    long long minyar_bytes_get_##Name(const MinyarBytes *bytes, long long position) {      \
-        bytes_check(bytes, position, size);                                                \
-        return (long long)(cast)bytes_load(bytes->bytes + position, size);                 \
-    }
-MINYAR_BYTES_INTEGER(int16, 2, 1, int16_t)
-MINYAR_BYTES_INTEGER(uint16, 2, 0, uint16_t)
-MINYAR_BYTES_INTEGER(int32, 4, 1, int32_t)
-MINYAR_BYTES_INTEGER(uint32, 4, 0, uint32_t)
-#undef MINYAR_BYTES_INTEGER
-
-void minyar_bytes_add_int64(MinyarBytes *bytes, long long value) {
-    bytes_reserve(bytes, 8);
-    bytes_store(bytes_data(bytes) + bytes->byte_length, (unsigned long long)value, 8);
-    bytes->byte_length += 8;
-}
-void minyar_bytes_set_int64(MinyarBytes *bytes, long long position, long long value) {
-    bytes_check(bytes, position, 8);
-    bytes_store(bytes_data(bytes) + position, (unsigned long long)value, 8);
-}
-long long minyar_bytes_get_int64(const MinyarBytes *bytes, long long position) {
-    bytes_check(bytes, position, 8);
-    return (long long)bytes_load(bytes->bytes + position, 8);
-}
-
-void minyar_bytes_add(MinyarBytes *bytes, long long value) {
-    if ((unsigned long long)value > 255) bytes_value_stop(value, "a byte (0 to 255)");
-    bytes_reserve(bytes, 1);
-    bytes_data(bytes)[bytes->byte_length++] = (unsigned char)value;
-}
-
-static uint32_t float32_bits(double value) {
-    float narrowed = (float)value;
-    uint32_t bits;
-    memcpy(&bits, &narrowed, sizeof(bits));
-    return bits;
-}
-
-static double float32_value(uint32_t bits) {
-    float narrowed;
-    memcpy(&narrowed, &bits, sizeof(narrowed));
-    return narrowed;
-}
-
-void minyar_bytes_add_float32(MinyarBytes *bytes, double value) {
-    bytes_reserve(bytes, 4);
-    bytes_store(bytes_data(bytes) + bytes->byte_length, float32_bits(value), 4);
-    bytes->byte_length += 4;
-}
-void minyar_bytes_set_float32(MinyarBytes *bytes, long long position, double value) {
-    bytes_check(bytes, position, 4);
-    bytes_store(bytes_data(bytes) + position, float32_bits(value), 4);
-}
-double minyar_bytes_get_float32(const MinyarBytes *bytes, long long position) {
-    bytes_check(bytes, position, 4);
-    return float32_value((uint32_t)bytes_load(bytes->bytes + position, 4));
-}
-
-void minyar_bytes_add_float64(MinyarBytes *bytes, double value) {
-    uint64_t bits;
-    memcpy(&bits, &value, sizeof(bits));
-    bytes_reserve(bytes, 8);
-    bytes_store(bytes_data(bytes) + bytes->byte_length, bits, 8);
-    bytes->byte_length += 8;
-}
-void minyar_bytes_set_float64(MinyarBytes *bytes, long long position, double value) {
-    uint64_t bits;
-    memcpy(&bits, &value, sizeof(bits));
-    bytes_check(bytes, position, 8);
-    bytes_store(bytes_data(bytes) + position, bits, 8);
-}
-double minyar_bytes_get_float64(const MinyarBytes *bytes, long long position) {
-    bytes_check(bytes, position, 8);
-    uint64_t bits = bytes_load(bytes->bytes + position, 8);
-    double value;
-    memcpy(&value, &bits, sizeof(value));
-    return value;
-}
-
-MinyarBytes *minyar_bytes_slice(const MinyarBytes *bytes, long long start, long long end) {
-    if (start < 0 || end < start || end > bytes->byte_length) {
-        char message[160];
-        snprintf(message, sizeof(message),
-                 "Bytes range %lld to %lld is outside its length of %lld.",
-                 start, end, bytes->byte_length);
-        minyar_stop(message);
-    }
-    MinyarBytes *result = minyar_bytes_new(end - start);
-    memcpy(bytes_data(result), bytes->bytes + start, (size_t)(end - start));
-    return result;
-}
-
-void minyar_bytes_append(MinyarBytes *bytes, const MinyarBytes *other) {
-    long long length = other->byte_length;
-    bytes_reserve(bytes, length);
-    memmove(bytes_data(bytes) + bytes->byte_length, other->bytes, (size_t)length);
-    bytes->byte_length += length;
-}
-
-MinyarBytes *minyar_read_bytes_file(const MinyarText *path_text) {
-    char *path = text_as_path(path_text);
-    FILE *file = fopen(path, "rb");
-    if (!file) {
-        fprintf(stderr, "Minyar stopped: the file '%s' could not be opened.\n", path);
-        exit(1);
-    }
-#if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
-    rc_heap_deallocate(path);
-#else
-    free(path);
-#endif
-    long long length = text_file_length(file);
-    MinyarBytes *bytes = minyar_bytes_new(length);
-    if (fread(bytes_data(bytes), 1, (size_t)length, file) != (size_t)length)
-        minyar_stop("a requested file could not be read.");
-    fclose(file);
-    return bytes;
-}
-
-void minyar_write_bytes_file(const MinyarText *path_text, const MinyarBytes *contents) {
-    char *path = text_as_path(path_text);
-    FILE *file = fopen(path, "wb");
-#if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
-    rc_heap_deallocate(path);
-#else
-    free(path);
-#endif
-    if (!file)
-        minyar_stop("a requested file could not be created.");
-    if (fwrite(contents->bytes, 1, (size_t)contents->byte_length, file) !=
-        (size_t)contents->byte_length || fclose(file) != 0)
-        minyar_stop("a requested file could not be written.");
-}
-
-_Bool minyar_file_exists(const MinyarText *path_text) {
-    char *path = text_as_path(path_text);
-    FILE *file = fopen(path, "rb");
-#if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
-    rc_heap_deallocate(path);
-#else
-    free(path);
-#endif
-    if (!file) return 0;
-    fclose(file);
-    return 1;
-}
-
-/* Grow Bytes by `count` zeroed bytes and return where they start, for native
- * library code that writes packed data directly. */
-unsigned char *minyar_bytes_extend(MinyarBytes *bytes, long long count) {
-    if (count < 0) minyar_stop("Bytes cannot shrink by a negative amount.");
-    bytes_reserve(bytes, count);
-    unsigned char *start = bytes_data(bytes) + bytes->byte_length;
-    bytes->byte_length += count;
-    return start;
-}
+#include "minyar_bytes.h"

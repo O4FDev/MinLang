@@ -3,6 +3,7 @@
 import argparse, os, re, subprocess, tempfile
 from pathlib import Path
 from llvm_sanitizer import prepare_llvm_for_link
+from clang_helpers import clang_command
 CASES = [
 ('scalar', '''record Value { x: Integer; flag: Boolean; letter: Character }
 function make(n: Integer): Value { return Value { letter: 'z'; flag: true; x: n } }
@@ -48,7 +49,7 @@ def main():
    if args.sanitize: prepare_llvm_for_link(ir, ['-fsanitize=address'])
    for opt in ['-O0','-O2']:
     exe=path.with_suffix("." + opt[1:]);flags=['-g','-fsanitize=address,undefined'] if args.sanitize else []
-    result=subprocess.run([args.clang,opt,*flags,'-Wno-override-module',str(ir),str(args.runtime.resolve()),'-o',str(exe)],capture_output=True,text=True,timeout=60)
+    result=subprocess.run(clang_command([args.clang,opt,*flags,'-Wno-override-module',str(ir),str(args.runtime.resolve()),'-o',str(exe)]),capture_output=True,text=True,timeout=60)
     assert result.returncode==0,(name,result.stderr)
     result=subprocess.run([str(exe)],capture_output=True,text=True,timeout=15,env=env)
     assert result.returncode==0 and result.stdout==expected,(name,result.stdout,result.stderr,expected)

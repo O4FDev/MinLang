@@ -4,6 +4,7 @@ from pathlib import Path
 import os
 import subprocess
 import tempfile
+from clang_helpers import clang_command
 
 ROOT=Path(__file__).resolve().parents[1]
 COMPILER=Path(os.environ.get('MINYAR_TEST_COMPILER',ROOT/'build/minyarc-modules')).resolve()
@@ -35,11 +36,11 @@ with tempfile.TemporaryDirectory(prefix='minyar-module-interface-') as temp:
         if counts is not None: assert measured==counts,(entry,measured,counts)
         if expected is not None:
             binary=directory/'program'
-            run(['clang','-O0','-Wno-override-module',warm,ROOT/'build/minyar-runtime.o','-o',binary])
+            run(clang_command(['clang','-O0','-Wno-override-module',warm,ROOT/'build/minyar-runtime.o','-o',binary]))
             assert run([binary]).stdout==expected
             # Also compare native behavior with the unmodified production path.
             run([BASE,entry,directory/'base.ll'])
-            run(['clang','-O0','-Wno-override-module',directory/'base.ll',ROOT/'build/minyar-runtime.o','-o',directory/'base'])
+            run(clang_command(['clang','-O0','-Wno-override-module',directory/'base.ll',ROOT/'build/minyar-runtime.o','-o',directory/'base']))
             assert run([directory/'base']).stdout==expected
         return measured,table_reused
 

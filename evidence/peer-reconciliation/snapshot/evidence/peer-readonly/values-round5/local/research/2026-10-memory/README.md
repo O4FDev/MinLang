@@ -1,0 +1,143 @@
+# October memory and compiler campaign
+
+Started UTC **2026-10-03 23:54:29**. The user requested at least seven hours of
+active work; the earliest completion is **2026-10-04 06:54:29 UTC**. All engineering
+agents use GPT-6.1 Sol with high reasoning. Elapsed time alone is not evidence of
+coverage or an achieved optimization.
+
+## Ownership
+
+| Area | Owner | Working boundary |
+| --- | --- | --- |
+| Coordination, campaign acceptance | Root | Schedules measurements; protects existing work. |
+| Runtime allocation and memory engineering | `memory_engineering` | Runtime C/private fragments, focused memory tests. |
+| Primary literature and claims | `literature` | Paper review and source-grounded assessment. |
+| Compiler profiling and peer tests | `peer_profiling` | `profiling*`, `peers*`, peer research tools/tests; compiler changes require an agreed file boundary. |
+
+No commits are authorized in this campaign. Existing changes are preserved.
+The initial tracked binary diff and source-file hash manifest are retained at
+`/var/folders/kp/v_5qvc9n6vb8gb8htz3yqwzm0000gn/T/minyar-october-baseline-s7giml8w`.
+This snapshot includes untracked file hashes, not their contents; it is a
+comparison aid rather than a complete backup.
+
+## Evidence index
+
+| Record | Meaning |
+| --- | --- |
+| `profiling-initial.log` | Exact initial gate command, build output, times and exit status. |
+| `profiling.md` | Subsystem map, baseline, reproducible measurements and acceptance criteria. |
+| `peers-expanded-pending-inventory.json` | Complete immediate Git tree inventories for 1,560 LLVM InstCombine and 1,996 Lean run entries; source review remains explicitly pending per path. |
+| `peers-review-ledger.json` | Deduplicated paths with exact review extent and cross-references; scenario counts remain per-manifest and bounded pending paths stay explicit. |
+| `peers.json` / `peers.md` | Pinned bounded inventories and explicit semantic dispositions. |
+| `peer-nim-koka-lean.json` | Separate additional ownership-oriented per-unit review and original adaptations. |
+| `profiling-coverage.md` | Measured/unmeasured subsystem ledger, limitations and next experiments. |
+| `profiling-full-gate.log` / `profiling-full-gate-sources.json` | Interrupted background gate and explicit mixed-version provenance. |
+| `profiling-normal-qos.json` | Temporary scheduling wrapper retaining resource safety limits. |
+| `profiling-full-gate-normal.json` / `.log` / `-disposition.json` | Source-frozen normal-QoS full gate: one cold-bootstrap timeout; exact command history and known Unicode gap. |
+| `profiling-reachability-expanded-final-red.json` / `profiling-reachability-bootstrap.json` | Red-first literal-true reachability repair, independent review, and matching bootstrap fixed points. |
+| `profiling-bootstrap-policy-red.json` / `profiling-cold-bootstrap-final-evidence.json` | Scoped public-bootstrap scheduling repair, retained limits, and actual default cold-launcher validation. |
+| `profiling-integrated-focused.json` / `.log` | Maintained peer, runtime-memory and launcher-policy gate integration; focused snapshots and exact commands. |
+| `profiling-coverage-run.json` / `profiling-coverage-final.json` / `profiling-coverage-matched.json` | Preserved coverage infrastructure failures and the matching-toolchain restart; no denominator or threshold exclusions. |
+| `profiling-coverage-toolchain.md` / `profiling-coverage-result.json` | Actual LLVM22 pipeline portability repair, exact denominators and explicit eager/configuration scope. |
+| `peer-swift-statement-directory.json` / `.md` | Complete recursive statement directory: 25 files source-read with 273 authored function/scenario groups; grouped assertions are not counted as ports. |
+| `profiling-afl-tooling.json` | Official AFL++ v5.03c source pinned by full commit and archive checksum; isolated build and actual fuzz campaign remain pending. |
+| `profiling-reachability-mutations-plan.json` | Six exact source-anchor CFG mutations; execution status remains separate from planning. |
+| `peer-rust-expression-directory.json` / `.md` | Complete immediate pinned Rust expression directory, individual dispositions and explicit overlap with the initial inventory. |
+| `runtime-list-reservation.md` | Production guarded reservation optimization; initial allocation red, rejected unconditional admission variant, exact final focused snapshots and paired measurements. |
+| `runtime-unicode-join.md` | Production correctness repair for indexed consuming Text joins; original native/generated red and independently reviewed final profile checks. |
+| `runtime-deferred-reuse.md` | Discovered deferred-owner reuse cost; early-service variants remain isolated experiments, with live aliases and retained capacity as controls. |
+| `runtime-bytes-rounding.md` | Rejected isolated capacity-slack candidate; late cleanup debt changed allocation admission, so production Bytes policy remains unchanged. |
+| `runtime-profiling-map.md` | Runtime subsystem evidence and explicit unmeasured paths; measured samples do not imply exhaustive coverage. |
+| `runtime-retirement-experiments.md` | Proposed/test-only accounting and retirement work; each experiment retains its own scope and tested snapshot, without a broad all-clear. |
+| [Read-only Go/Zig round 2](peer-readonly-go-zig-round2.md) / [ledger](peer-readonly-go-zig-round2.json) | 32 authored comparison groups; proposals remain separately scoped from execution. |
+| [Read-only Go/Zig round 3](peer-readonly-go-zig-round3.md) / [ledger](peer-readonly-go-zig-round3.json) | 66 additional groups, with the Zig array remainder completed and prefix overlap excluded. |
+| [Read-only strings round 4](peer-readonly-strings-round4.md) / [ledger](peer-readonly-strings-round4.json) | 120 authored groups in five complete selected files; runtime projections remain pending in that ledger. |
+| [Original runtime peer projections](runtime-peer-projections.md) | Three new Minyar tests inspired by specific round 2/3 entries; 18 isolated native/generated executions, including ASan. |
+| [Queue-empty List fragmentation probe](runtime-list-fragmentation.md) | Source-hashed bounded histories found no observed placement/admission difference; cleanup-hook preservation and universal allocator equivalence remain separate claims. |
+| [Native/application round 2](native-application-round2-report.md) / [index](native-application-round2-index.json) | Separate staging-allocation/error and application oracles; O2 sustained cohort passed, sanitizer cohort in progress at this update. |
+
+Inventory discovery, source retrieval, semantic reading, executable adaptation,
+and passing validation are different stages. Counts in this campaign distinguish
+them. Peer tests outside the selected inventory remain unreviewed.
+
+Measurements run serially on this 16 GiB host. Agents reserve expensive builds
+and timing windows with the coordinator; native micro-fixtures may run together
+only when they do not contaminate measurements. Correctness precedes performance
+comparisons. A change must retain independent expected values, exact relevant
+diagnostics, ownership contracts, optimization-level checks and bootstrap
+fixed-point behavior.
+
+## Runtime engineering update
+
+The accepted [ASCII metadata change](runtime-ascii-metadata.md) preserves certified
+counts through borrowed Text copies. The generated known-ASCII workload has a
+CPU baseline/candidate ratio of 2.392; the byte-length-only control is about 0.9%
+slower. [Guarded List reservation](runtime-list-reservation.md) retains its append
+benefit and a roughly 1.6% fixed-pool ordinary-growth slowdown. These are workload
+tradeoffs, not general latency guarantees.
+
+[ASCII paired-ratio figure](runtime-ascii-timing.svg) and
+[List paired-ratio figure](runtime-list-timing.svg) show every observed pair and
+bootstrap intervals; PDF/PNG exports accompany them. The
+[durable runtime bundle](evidence/runtime/README.md) and
+[source/result index](evidence/runtime/index.json) preserve 40 selected result
+files plus source versions after `make clean`, including rejected candidates,
+counterexamples, incomplete host-starved attempts and the corrected 64-check
+C-only reporting mistake. The exact final Text `--language` matrix separately
+passed 107 asserted checks: 21 C configurations, 21 generated executions and
+21 expected UTF-8 traps. Whole campaign validation remains independently scoped.
+
+
+## Current execution and durable evidence
+
+Core runtime production sources are frozen at the exact formatted Text runtime
+hash recorded in the final 107-check Text matrix. Runtime engineering continues
+isolated experiments and the approved two-hour fixed/K1 payload soak; the long
+run is still in progress, so it has no final pass status. Its
+[preregistered limits and oracle](runtime-soak.md) and
+[durable active results](evidence/runtime-soak/run-h2hs4wqq/results.json) keep
+pilot/red calibration separate from the long cohort. The
+[equal-credit experiment](runtime-retirement-experiments.md) is rejected as a
+default policy after a finite-pool admission counterexample, despite measured
+reuse and allocation-count benefits. No production cleanup schedule changed.
+
+The compiler/peer integration lane stopped after repeated service-side
+restrictions. The literature execution lane also stopped after preserving its
+completed cohorts. Optional follow-on tooling and shapes are unexecuted. The
+[native ownership-model report](literature-native-model-completed.md),
+[root-level native-model index](../../evidence/native-model/index.json) and
+[root-level literature archive](../../evidence/literature/README.md) preserve
+completed sources, seeds, journals and limitations. The completed model cohorts
+contain 1,206,002 configuration-weighted public-operation executions and 214,660
+constructed/destroyed generations; these are bounded C ABI observations.
+
+The distinct native/application lane's
+[report](native-application-report.txt),
+[evidence index](native-application-index.json) and
+[independent static review](runtime-native-independent-review.md) cover its
+terrain and headless renderer changes. The final expanded snapshot records 504
+contracts in 12 configurations. That scope includes successful PNG staging,
+all nine write-error sites and close-error checks, not PNG malloc-failure
+injection or actual GPU/display execution; subsequent work has its own result.
+
+Earlier coverage and the broad full gate retain their recorded source snapshots.
+Coverage preceded the final ASCII metadata change. The earlier full gate also
+preceded later production changes and had a cold-bootstrap timeout, separately
+repaired in focused checks. Neither record establishes complete full-suite or
+coverage validation of all final production sources. The blocked final
+integration lane is reported as unavailable; focused final runtime matrices,
+completed ownership cohorts and application gates retain their exact independent
+scope rather than being promoted to a whole-repository all-clear.
+
+
+[Additional baseline API counts](runtime-api-count-probes.md) measure view
+threshold/fan-out retention and Boolean formatting; ten actual generated token
+workloads complement native controls. These observations make no policy change
+or timing claim. Reproducibility corrections remain explicit in
+[the runtime checklist](runtime-reproducibility.md).
+
+
+The [accepted core patch inventory](runtime-core-patch-inventory.md) separates
+this campaign's own changes from the initial dirty runtime and reconstructs its
+exact final hashes. A [native size-guard audit](runtime-guard-order.md) fills a
+managed failure-order gap under pending debt, with no production change.

@@ -1,0 +1,2343 @@
+    Automatic Space Bound Analysis for Functional Programs with
+                       Garbage Collection
+                                          Yue Niu and Jan Hoffmann
+                             Carnegie Mellon University, Pittsburgh, PA, United States
+                                          {yuen,jhoffmann}@cs.cmu.edu
+
+                                                       Abstract
+          This article introduces a novel system for deriving upper bounds on the heap-space requirements
+      of functional programs with garbage collection. The space cost model is based on a perfect garbage
+      collector that immediately deallocates memory cells when they become unreachable. Heap-space bounds
+      are derived using type-based automatic amortized resource analysis (AARA), a template-based technique
+      that efficiently reduces bound inference to linear programming. The first technical contribution of the
+      work is a new operational cost semantics that models a perfect garbage collector. The second technical
+      contribution is an extension of AARA to take into account automatic deallocation. A key observation
+      is that deallocation of a perfect collector can be modeled with destructive pattern matching if data
+      structures are used in a linear way. However, the analysis uses destructive pattern matching to accurately
+      model deallocation even if data is shared. The soundness of the extended AARA with respect to the
+      new cost semantics is proven in two parts via an intermediate linear cost semantics. The analysis
+      and the cost semantics have been implemented as an extension to Resource Aware ML (RaML). An
+      experimental evaluation shows that the system is able to derive tight symbolic heap-space bounds for
+      common algorithms. Often the bounds are asymptotic improvements over bounds that RaML derives
+      without taking into account garbage collection.
+
+
+1     Introduction
+The memory footprint of a program is an important performance metric that determines if a program can be
+safely executed on a given system. Ideally, developers should describe or approximate the memory footprint
+of programs as functions of the inputs. However, such memory bounds are often difficult to derive and to
+prove sound. To assist programmers with deriving memory bounds, the programming language community
+has developed automatic and semi-automatic analysis techniques [24, 12, 2]. These systems are often special
+cases of more general resource bound analyses that are based on abstract interpretation [18, 7, 37], recurrence
+solving [16, 1, 14, 28], type systems [27, 22, 29, 43, 42, 15], program logics [5, 10, 9, 35], proof assistants [33, 11],
+and term rewriting [6, 34, 17].
+    This article introduces a novel type system for automatically deriving upper bounds on the heap-space
+requirements of functional programs with garbage collection (GC). Due to the challenges of modeling and
+predicting garbage collection, most existing techniques for automating and guiding the derivation of bounds
+on the heap memory requirements assume manual memory management or simply ignore deallocation in
+the analysis [24, 26, 36, 13, 12, 2]. As a result, the derived bounds are not accurate when the underlying
+system employs garbage collection. The only exceptions we are aware of are the works by Albert et al. [3, 4],
+Braberman et al. [8], and Unnikrishnan et al. [40, 39]. They analyze the heap-space usage of programs with
+GC in two steps. First, they make the deallocation of GC explicit; for example with a static analysis for
+estimating object lifetimes [4] or with a program translation [39]. Second, they extract and solve recurrence
+relations to derive a bound. The difference of our work is that our technique is based on a type system,
+which is proved sound with respect to a formal cost semantics. Advantages of a type-based approach include
+natural compositionality and the use of type derivations as certificates for resource bounds.
+    We model the (highwater mark) memory usage based on a perfect garbage collector that immediately
+deallocates memory cells when they become unreachable. The bounds that are derived with respect to this
+cost model are not only a good theoretical measure of the heap-space consumption of the program but also
+have practical relevance. Consider a function f : A → B and assume we derived a bound bf : JAK → N. In
+an execution of f (a), we can then keep track of the memory usage and start the garbage collector whenever
+the bound bf (a) is reached. It is then guaranteed that the evaluation will succeed using bf (a) heap-memory
+cells.1 To improve performance, we could trigger GC more often (to compactify the heap) or allow memory
+use of more than bf (a) cells (to amortize the cost of garbage collection).
+    The first technical contribution of the work is a new operational cost semantics that models a perfect
+garbage collector. The cost semantics is a big-step (or natural) semantics that keeps track of the reachable
+memory cells in the style of Spoonhower et al. [38] and Minamide [30]. Operationally, this cost is the high-
+water mark on the heap usage, or the maximum number of cells used in the mutable store during evaluation.
+If we traverse the evaluation tree in preorder and view each node as a “step” of the computation, then a
+cell is used in the current node if it is reachable from the reminder of the computation. Our formalization
+of reachability is identical to the concept that garbage collectors implement to decide if a cell can be freed
+during evaluation. For simplicity, we assume that evaluation of the cons node allocates one fresh heap cell
+and that all other operations do not allocate heap cells. However, the semantics can be instantiated with
+more realistic cost metrics. A difference to existing formulations of cost semantics with GC [31, 38, 30] is
+that we update the highwater mark when reachability changes at inner nodes of the derivation of the evalu-
+ation judgement instead of at leaves. Moreover, we use a freelist, which represents named cells available for
+evaluation. This alternative formulation is equivalent to the existing semantics and mainly motivated by the
+soundness proof of our type system for bound analysis. However, the cost semantics is a natural approach
+and different enough from its predecessors [38, 30] to be of interest in its own right.
+    Our second technical contribution is the type system for deriving bounds on the heap-space for programs
+with perfect GC. The type system is an extension of type-based automatic amortized resource analysis
+(AARA) [24, 27, 41, 21, 22, 32]. AARA is a template-based technique that introduces potential functions
+to efficiently and automatically reduce bound inference to linear programming. Existing type systems based
+on AARA can derive bounds on the highwater mark of the heap usage for programs with manual dealloca-
+tion [27], but can only derive a bound on the number of total heap allocations for programs with GC [22].
+This is usually a gross over-approximation of the actual memory requirement. Our extension is based on
+the observation that deallocation of a perfect collector can be modeled with destructive pattern matching
+(deallocating the matched cell) if data structures are used in a linear way. In the type system, we extend this
+observation to non-linear programs and use destructive pattern matching to accurately model deallocation
+even if data is shared.
+    The third technical contribution is to prove the soundness of the extended AARA with respect to the
+GC-based cost semantics. The proof is non-trivial and proceeds in two parts: First, we prove the soundness
+of the type system with respect to a semantics that copies data structures if they are shared. Second, we
+prove for all programs that our GC semantics uses less memory than this copying semantics. While the proofs
+are relatively standard, many details—like relating program states of the two semantics in the simulation
+proof—are quite involved. Briefly, we have to provide and maintain a mapping γ from the heap used in the
+GC semantics Hgc to subsets of the heap used in the copying semantics Hcopy such that the image of Hgc
+under γ forms a partition on the second heap. The intuition is that given a cell l ∈ Hgc , there must be
+multiple cells γ(l) ∈ Hcopy that were allocated during sharing, and thus “morally the same” as l.
+    The analysis and the cost semantics have been implemented as an extension to Resource Aware ML
+(RaML) [21, 22]. RaML is an implementation of AARA for a subset of OCaml that can derive multivariate
+polynomial bounds. However, we restrict the technical development in this paper to a simple first-order
+language with tuples and lists. The proofs and ideas carry over to the more complex case of RaML.2
+An experimental evaluation shows that the system is able to derive tight symbolic heap-space bounds for
+common algorithms. Our results suggest that our new analysis provides asymptotic bound improvements to
+several classes of commonly used functions and programming patterns. We examine the reasons for these
+improvements and design decisions throughout the system.
+
+
+
+
+   1 We are not considering memory fragmentation, which can be avoided using a copying collector.
+   2 An exception are function closures that we discuss in the Section 7.
+BTypes     τ ::=                              Exp   e ::=
+           nat                   nat                var(x)                       x
+           unit                  unit               nat[n]                       n
+           bool                  bool               unit                         ()
+           prod(τ1 ; τ2 )        τ1 × τ2            T                            T
+           list(τ )              L(τ )              F                            F
+                                                    if(x; e1 ; e2 )              if x then e1 else e2
+FTypes     ρ ::=                                    ap(f ; x)                    f (x)
+           arr(τ1 ; τ2 )         τ1 → τ2            tpl(x1 ; x2 )                hx1 , x2 i
+                                                    matchP (x1 , x2 .e1 )        match p {(x1 ; x2 ) ,→ e1 }
+    Val    v ::=                                    nil                          []
+           val(n)                n                  cons(x1 ; x2 )               x1 :: x2
+           val(T)                T                  matchL {l}(e1 ; x, xs.e2 )   match l {nil ,→ e1 | cons(x; xs) ,→ e2 }
+           val(F)                F                  let(e1 ; x : τ.e2 )          let x = e1 in e2
+           val(Null)             Null               share(x; x1 , x2 .e)         share x as x1 , x2 in e
+           val(l)                l
+           val(pair(v1 ; v2 ))   hv1 , v2 i
+
+                                 Figure 1: Simple Types, Values, and Expressions
+
+
+2     Setting the Stage
+In the technical part of the paper, we focus our attention to a first-order, strictly evaluated functional
+language. One can think of this language as a simple subset of OCaml or SML. The only recursive data type
+in the language is the list type. However, our work extends to the expected algebraic data types definable
+in RaML. Being first order, the language does not allow arbitrary local functional definitions. Instead, all
+functions are defined at the top level and are mutually recursive by default. The types of these functions
+form a signature for the program, and the semantics and typing judgments will be indexed by this signature.
+Thus, the function types of the language can be expressed as arrows between zero-order (base) types. Types
+are formally defined in Figure 1. Like in all grammars, we provide the abstract (left) and concrete (right)
+syntax for every type former [19]. A signature Σ : Var → FTypes is a map from variables to first-order types.
+A program P is a Σ indexed map from Var to pairs (yf , ef )f ∈Σ , where Σ(yf ) = τ → τ 0 , and Σ; yf : τ ` ef : τ 0
+(the type system is discussed in Section 4). We write P : Σ to mean P is a program with signature Σ.
+    To simplify the presentation, the expressions of our language (see Figure 1) are in let normal form (also
+A normal form). The one nonstandard construct is share x as x1 , x2 in e, which we will explain in more
+detail in the following sections. We introduce two distinct notions of linearity, one on the syntactic level, and
+one on the semantic level. Syntactic linearity is linearity in expression variables, while semantic linearity is
+linearity in locations (defined below). We say that a semantics is linear if it respects semantic linearity.
+    In line with previous works on space cost semantics [38, 30], we employ a heap, which persistently binds
+locations to values (normalized terms). As usual, we derive the cost of a (terminating) program from the
+number of heap locations used during execution, which in our case is the maximum difference between the
+sizes of the initial and final freelist. We let Loc be an infinite set of names for addressing the heap. For the
+rest of the paper, we use the following: Stack , {V | V : Var → Val} and Heap , {H | H : Loc → Val} for
+the set of stacks and heaps respectively.
+
+Reachability Before we define the rules for the cost semantics, we relate the heap locations to values with
+the 3-place reachability relation reach(H, v, L) on Heap × Val × ℘(Loc), where ℘ is the powermultiset. This
+is read as “under heap H, the value v reaches the multiset of locations L”. Write L = reachH (v) to indicate
+this is a functional relation justified by the (valid) mode (+, +, −). We say that the reachable set of v is L.
+
+          A = reachH (v1 )  B = reachH (v2 )                  A = reachH (H(l))               v ∈ N ∪ {T, F, Null}
+               A ] B = reachH (hv1 , v2 i)                   {l} ] A = reachH (l)               ∅ = reachH (v)
+In the rules, ] is multiset union. L is a multiset because we need to keep track of the number of ways a
+location might be reached in order to prove soundness. However, the cost semantics can be read by truncating
+any multiset to a set. Furthermore, we will sometimes mix multiset and set operations as the situation calls
+for. For example, we will write l ∈ S for a multiset S if S(l) ≥ 1. Complete definitions and notations can be
+found in the appendix.
+    The notion of reachability naturally lifts to expressions and contexts:
+                               ]
+              reachH (V ) =          reachH (V (x))               locsV,H (e) = reachH (V F V (e) )
+                            x∈dom(V )
+
+
+Where F V : Exp → P(Var) denotes the set of free-variables of expressions as usual.
+
+Towards the Garbage Collection Cost Semantics Now we are ready to give a first attempt to modeling
+the cost semantics for a tracing garbage collector. Before we present our new semantics, we explain an existing
+cost semantics we experimented with [30]. Judgements have the form V, H, R ` e ⇓s v, H 0 , which can be
+read as follows. Under stack V ∈ Stack, heap H ∈ Heap, and continuation set R ⊆ Loc, e evaluates to v and
+H 0 using s heap locations. The idea is that R keeps track of the set of locations necessary to complete the
+evaluation after e is evaluated (hence the name continuation). For example, we have the let rule:
+
+                 V, H, R ] locsV,H (x.e2 ) ` e1 ⇓s1 v1 , H1     V [x 7→ v1 ], H, R ` e2 ⇓s2 v2 , H2
+                                 V, H, R ` let(e1 ; x : τ.e2 ) ⇓max s1 ,s2 v2 , H2
+
+    Notice that to evaluate e1 , we have to extend the continuation R with locations in e2 , which will be used
+after e1 is evaluated. The total space used is the max of the component, indicating that locations used for
+e1 can be reused for e2 . This is clear when we look at the variable rule:
+
+                                                      V (x) = v
+                                        V, H, R ` x ⇓|dom(R]reachH (v))| v, H
+
+It states that evaluating a variable x requires the locations reachable from x as well as the continuation set
+R. While this way of counting heap locations does model a tracing garbage collector, it is not compatible
+with the existing type systems for amortized analysis. In these systems, such as RaML, the type rules count
+the heap locations as data is created, i.e. at each data constructor. Thus looking up a variable incurs no
+cost, since it was accounted for during creation. On the other hand, the cost of indexing a variable in the
+semantics includes the cost of the entire continuation set, which is potentially unbounded. This mismatch
+between the dynamics and statics of language prevents us from proving the soundness of the analysis. We
+give a new cost semantics that is 1) compatible with the type system and 2) also a more concrete model of
+a garbage collector since costs are realized with explicit locations.
+
+
+3    Garbage Collection Cost Semantics
+In this section, we present our novel cost semantics by combining freelist semantics from [25] with the cost
+semantics for modeling perfect GC [30] that we discussed in the previous section. The resulting semantics,
+called Egc , is well suited for proving the soundness of the novel type-based bound analysis.
+    The garbage collection cost semantics Egc is defined by a collection of judgement of the form
+
+                                                C `P :Σ e ⇓ v, H 0 , F 0
+
+    Where C ∈ Stack × Heap × ℘(Loc) × P(Loc) is a configuration usually written with variables V, H, R, F .
+Because the signature Σ for the mapping of function names to first-order functions does not change during
+evaluation, we drop the subscript P : Σ from `P :Σ when the context of evaluation is clear. Given a configu-
+ration C = (V, H, R, F ), the evaluation judgment states that under stack V , heap H, continuation (multi)set
+R, freelist F , and program P with signature Σ, the expression e evaluates to value v, and engenders a new
+heap H 0 and freelist F 0 . In comparison with the attempt from the previous section, the key ingredient we
+added is the freelist, which serves as the set of available locations. Similar to the predicate reach, We call
+R a (multi)set since the fact that it’s a multiset is only useful during the soundness proof. For evaluation,
+it is convenient to just view R as a set. Define a computation as a pair (C, e) of a configuration C and an
+expression e. Next, we give some coherence conditions to a configuration. For a configuration (V, H, R, F ),
+denote the garbage w.r.t. a set of locations L as collect(R, L, H, F ) = {l ∈ H | l ∈
+                                                                                    / F ∪ R ∪ L}.
+Definition 1. A configuration (V, H, R, F ) is well-formed if
+  1. dom(H) ⊆ reachH (V ) ∪ R ∪ F
+  2. reachH (V ) ∪ R ⊆ dom(H) \ F
+  3. collect(R, reachH (V ), H, F ) = ∅
+   Furthermore, this condition is invariant under evaluation:
+Lemma 1. Given a well-formed context (V, H, R, F ) and V, H, R, F ` e ⇓ v, H 0 , F 0 , we have dom(H 0 ) ⊆
+reachH 0 (v) ∪ R ∪ F 0 , reachH 0 (v) ∪ R ⊆ dom(H 0 ) \ F 0 , and collect(R, reachH 0 (v), H 0 , F 0 ) = ∅.
+    The well-formed conditions ensure the stack and continuation sets are within the active region of the
+heap H \ F , and that the active region of the heap does not contain garbage – all garbage locations are
+already in the freelist. From now on, all configurations are implicitly assumed to be coherent in the sense
+defined above.
+    The semantics Egc is designed to model the heap usage of a program running with a tracing counting
+garbage collector: whenever a heap cell becomes unreachable from the root set, it becomes collected and
+added to the freelist as available for reallocation. As before, the continuation set R represents the set of
+locations required to compute the continuation excluding the current expression. We define the root set as
+the union of the locations in the continuation set R and the locations in the current expression e.
+    The inference rules for the semantics are given in Figure 2. For example, the rule F:CondT states that,
+to evaluate a conditional, look in the stack for the value of the branching boolean. In the case it is true, we
+proceed to evaluate the first branch. Furthermore, we collect cells in the heap that are not reachable from
+the root set (R ∪ locsV 0 ,H (e1 )) or already in the current free-list F , and add them (g) to the available cells
+for evaluating e1 .
+    Another example is the rule F:Let for let expressions: to evaluate the expressions let(e1 ; x:τ.e2 ), we
+evaluate the first expression with the corresponding restricted stack V1 and an expanded continuation set
+R0 . The extra locations come from the free variables of e2 (not including the bound variable x), which we
+cannot collect during the evaluation of e1 . Next, we restrict the extended stack to only free variables of e2 ,
+and evaluate e2 with this stack and the original continuation set R. The other rules are similar.
+    Note that in contrast to the semantics in the previous section, evaluating a variable does not incur any
+cost. This ensures that we will be able prove the soundness of the type system. Also, since we don’t allow
+local function definitions, we do not create closures during evaluation. Also note that we restrict the domain
+of the stack to the appropriate variables during evaluation. This is only to facilitate the proof of the linearity
+of the copying semantics introduced later, and not necessary for the implementation.
+    For example, we can implement the append and appTwice function, which has variable sharing. First,
+we analyze the heap usage of append under Egc . We case on the first component of the input. In case it’s
+nil, we just return l2, and there are no allocations or deallocations. In case it’s cons of x and xs, we need
+to allocate one heap location for the cons cell binding x and the recursive result, for which we can use the
+just matched-on cell. Again, the net overhead is zero. Thus, the total space overhead of append is zero.
+    For appTwice, we first share the list l as l1 and l2. In the first let, the locations in l2 are added to the
+continuation set, which prevents the first call to append from destructing l1. Thus size of l1 new locations
+are allocated from the freelist to construct l1’. The second call has no net increase in heap allocations since
+l2 can be destructed along the way. The return value is a pair which is stack-allocated and doesn’t require
+a heap allocation. Thus, the total space overhead for appTwice is size of the input list l.
+             V1 = V F V (e1 )           R0 = R ∪ locsV,H (lam(x : τ.e2 ))     V1 , H, R0 , F ` e1 ⇓ v1 , H1 , F1
+V2 = (V [x 7→ v1 ]) F V (e2 )         g = {l ∈ H1 | l ∈
+                                                       / F1 ∪ R ∪ locsV2 ,H1 (e2 )}     V2 , H1 , R, F1 ∪ g ` e2 ⇓ v2 , H2 , F2
+                                                                                                                                     (F:Let)
+                                           V, H, R, F ` let(e1 ; x : τ.e2 ) ⇓ v2 , H2 , F2
+
+                                         V (x) = T         V 0 = V F V (e1 )
+                   g = {l ∈ H | l ∈
+                                  / F ∪ R ∪ locsV 0 ,H (e1 )}     V 0 , H, R, F ∪ g ` e1 ⇓ v, H 0 , F 0
+                                                                                                               (F:CondT)
+                                            V, H, R, F ` if(x; e1 ; e2 ) ⇓ v, H 0 , F 0
+
+                                  V (x) = F         V 0 = V F V (e2 )
+            g = {l ∈ H | l ∈
+                           / F ∪ R ∪ locsV 0 ,H (e2 )}     V 0 , H, R, F ∪ g ` e2 ⇓ v, H 0 , F 0
+                                                                                                         (F:CondF)
+                                      V, H, R, F ` if(x; e1 ; e2 ) ⇓ v, H 0 , F 0
+
+                                             V (x) = v 0   P (f ) = (yf , ef )
+V 0 = ([yf 7→ v 0 ]) F V (ef )       g = {l ∈ H | l ∈
+                                                     / F ∪ R ∪ locsV,H (ef )}             V 0 H, R, F ∪ g ` ef ⇓ v, H 0 , F 0
+                                                                                                                                (F:App)
+                                             V, H, R, F ` ap(f ; x) ⇓ v, H 0 , F 0
+
+                                                            v = hV (x1 ), V (x2 )i        l∈F        H 0 = H{l 7→ v}
+                                             (F:Nil)                                                                   (F:Cons)
+V, H, R, F ` nil ⇓ val(Null), H, F                               V, H, R, F ` cons(x1 ; x2 ) ⇓ l, H 0 , F \ {l}
+
+                                                       V (x) = Null
+      V 0 = V F V (e1 )          g = {l ∈ H | l ∈
+                                                 / F ∪ R ∪ locsV 0 ,H (e1 )}         V 0 , H, R, F ∪ g ` e1 ⇓ v, H 0 , F 0
+                                                                                                                             (F:MatNil)
+                                     V, H, R, F ` matchL {x}(e1 ; xh , xt .e2 ) ⇓ v, H 0 , F 0
+
+                                                              V (x) = v
+                                                                                    (F:Var)
+                                                     V, H, R, F ` x ⇓ v, H, F
+
+              V (x) = l     H(l) = hvh , vt i    V 0 = (V [xh 7→ vh , xt 7→ vt ]) F V (e2 )
+           g = {l ∈ H | l ∈
+                          / F ∪ R ∪ locsV 0 ,H (e2 )}    V 0 , H, R, F ∪ g ` e2 ⇓ v, H 0 , F 0
+                                                                                                        (F:MatCons)
+                            V, H, R, F ` matchL {x}(e1 ; xh , xt .e2 ) ⇓ v, H 0 , F 0
+
+                                 V (x) = v 0    V 0 = (V [x1 7→ v 0 , x2 7→ v 0 ]) F V (e)
+                     g = {l ∈ H | l ∈
+                                    / F ∪ R ∪ locsV 0 ,H (e)}    V 0 , H, R, F ∪ g ` e ⇓ v, H 0 , F 0
+                                                                                                              (F:Share)
+                                         V, H, R, F ` share(x; x1 , x2 .e) ⇓ v, H 0 , F 0
+
+
+                                    Figure 2: Cost Semantics for Perfect Garbage Collection
+
+
+    From this, we see that the minimum size for the initial freelist to successively evaluate a call to appTwice
+is exactly the length of the input. In general, we define the cost of a closed program to be the minimum size
+of the initial freelist that guarantees successful evaluation, which is equivalent to the cost annotation in the
+previous cost semantics introduced in Section 2.
+
+
+4     Automatic Amortized Heap-Space Analysis with GC
+Automatic Amortized Resource Analysis (AARA) The idea of AARA [24, 27, 21, 22] is to automate
+the potential method of amortized analysis using a type system. Types introduce potential functions that
+map data structures of the given type to non-negative numbers. The type rules ensure that there is always
+sufficient potential to cover the evaluation cost of the next step and the potential of the next program state.
+    To illustrate the idea, we informally explain the linear potential method for the functions in Figure 3.
+We will use the allocation/heap metric which simply counts the number of cons constructor calls during the
+evaluation.3 With this metric, the cost of evaluating append(l1,l2) is m, where m is the number of cons
+                                                                                                     0/0
+constructors in l1, and the resource annotated type of append is L1 (int) × L0 (int) −−→ L0 (int). This type
+says that to type append(l1,l2), we need l1 to have 1 potential per element, l2 to have 0 per element, and
+the result will be a list with 0 potential per element. Additionally, the function uses 0 constant potential,
+and leaves 0 constant potential after evaluating. This translates to a bound which states that the number of
+allocations append makes is bounded by 1 times size of the first list. For appTwice(l), the cost under the
+heap metric is 2m, where m is the number of cons constructors in l. This is because we have to share the
+input list across two calls of append, which each requires lists with unit potential per element. For example,
+if l : L2 (int), then l1 and l2 both get 1 potential per element so that l1 : L1 (int), l2 : L1 (int), which
+covers the cost of the next 2 calls to append, and the resulting pair of lists both have 0 potential per element.
+    More generally, we can give the following types to append and appTwice:
+
+                                                  r/r 0
+                append : Lp (int) × Lq (int) −−→ Ls (int), where p ≥ s + 1, q ≥ s and r ≥ r0
+                                        q/q 0
+                appTwice : Lp (int) −−→ Lr (int) × Ls (int), where p ≥ r + s + 2 and q ≥ q 0
+
+    Notice that the constant potentials r and q are uncon-
+strained since the functions don’t use any potential in the base let rec append (l1, l2) =
+cases. With AARA, the type system keeps track of this col-         match l1 with
+lection of constraints on resource annotations and passes them     | [] -> l2
+to an off-the-shelf LP-solver which finds the minimum solu-        | x::xs -> x::(append (xs, l2))
+tion. This is then translated to concrete resource bounds like
+the ones we derived by hand. It has been shown that this let appTwice l =
+technique can be extended to polynomial potential functions,         share l as l1,l2 in
+user-defined data types, and higher-order functions while still      let l1’ = append (l1, []) in
+relying on linear constraint solving [21, 22].                       let l2’ = append (l2, []) in
+                                                                     (l1’,l2’)
+Linear Potential Functions Before giving the type rules, Figure 3: Functions append and appTwice
+we need to formalize linear potential as explained above. Since
+potential is associated with the structure of a value and not
+the particular heap locations, it is helpful to introduce a mapping from heap values to semantic values
+of a type. First, we give a denotational semantics for (define the structures of) the first-order types:
+
+     JunitK = {val(Null)}                           JA1 × A2 K = JA1 K × JA2 K
+     JboolK = {val(T), val(F)}                             nil ∈ JL(A)K
+       JnatK = N                                     cons(a; l) ∈ JL(A)K if a ∈ JAK and l ∈ JL(A)K
+
+The meaning of each type is the least set such that the above holds. As usual, we write [a1 , ..., an ] for
+cons(a1 ; , ..., cons(an ; nil)).
+    In Figure 4 we give the judgements relating heap values to semantic values, in the form H  v 7→ a : A ,
+which can be read as follows: Under heap H, heap value v defines the semantic value a ∈ JAK. Given a
+stack V , we write H  V : Γ if dom(V ) ⊆ dom(Γ) and for every x 7→ v ∈ V , H  V (x) 7→ a : Γ(x) for some
+a ∈ JAK.
+    We introduce linear potential for structures corresponding to the base types. The definition of linear
+potential is standard [20]. Below is the grammar for resource-annotated types:
+
+             BTypes     A    ::=                                 FTypes                   ρ   ::=
+                                                                                                           p/q
+                        ...                                                   arr(A1 ; A2 ; p; q) A1 −−→ A2
+                        listp (A) Lp (A)
+   3 This is in contrast to the highwater mark for the GC semantics E
+                                                                        gc that is targeted by our new analysis.
+                       n∈Z
+                                    (V:ConstI)                                                               (V:ConstI)
+            H  val(n) 7→ n : nat                                  H  val(Null) 7→ val(Null) : unit
+
+                         A ∈ BType
+                                                       (V:Nil)                                                    (V:True)
+            H  val(Null) 7→ val(Null) : L(A)                                 H  val(T) 7→ val(T) : bool
+
+                                                                   H  v1 7→ a1 : A1          H  v2 7→ a2 : A2
+                                        (V:False)                                                                    (V:Pair)
+          H  val(F) 7→ val(F) : bool                                  H  hv1 , v2 i 7→ ha1 , a2 i : A1 × A2
+
+             l ∈ Loc     H(l) = hvh , vt i        H  vh 7→ a1 : A          H  vt 7→ [a2 , . . . , an ] : L(A)
+                                                                                                                  (V:Cons)
+                                             H  l 7→ [a1 , . . . , an ] : L(A)
+
+
+                                Figure 4: Mapping Locations to Semantic Values
+
+
+The intended meaning is that a list of Lp (A) has p units of potential per cons cell, and a function of type
+   p/q
+A −−→ B takes constant potential p to run and q is the constant potential left afterwards.
+   With linear potential, each component of a structure is associated with a constant amount of potential.
+Given a structure a in a heap H, where H  v 7→ a : A, we define its potential ΦH (a : A) by recursion on A:
+
+          ΦH (v : A) = 0                                                                     if A ∈ {unit, bool, nat}
+          ΦH (hv1 , v2 i : A1 × A2 ) = ΦH (v1 : A1 ) + ΦH (v2 : A2 )
+          ΦH (l : Lp (A)) = p + ΦH (vh : A) + ΦH (vT : Lp (A))                                        if H(l) = hvh , vh i
+
+Write ΦV,H (Γ) for Σx∈dom(V ) ΦH (V (x) : Γ(x)).
+Now define A g A1 , A2 , n as the sharing relation for resource-annotated types:
+
+                Lp (A) gn Lq (A1 ), Lr (A2 )                               if p = q + r + n and A gn A1 , A2
+                          n
+                A × B g A1 × B1 , A2 × B2                                   if A gn A1 , A2 and B gn B1 , B2
+                A gn A, A                                                            if A ∈ {unit, bool, nat}
+
+The sharing relation captures the amount of potential needed to copy a type A where each cons node in any
+structure in JAK has a copying overhead n.
+
+                                                                                              q
+Type Rules The type system FOgc consists of rules of the form Σ; Γ q0 e : A , read as under signature
+Σ : Var → FTypes, typing environment Γ : Var → BTypes, e has type A starting with q units of constant
+potential and ending with q 0 units.
+    Our type system is based on the one of classic linear AARA [24]. We give a review of the rules in Figure 5.
+Since we are interested in the number of heap locations, there is an implicit side condition in all rules which
+ensures all constants are assumed to be nonnegative.
+    For example, L:Cons states that to add an element to a list with p potential per element, we need p + 1
+units of constant potential: p to maintain the potential of the list, and 1 for allocating the cons cell. L:MatL
+states that matching on a list with type Lp (A), we need to type the nil case with the same constant potentials,
+and we need to type the cons case with an additional p units of constant potential, since we get the spill of p
+from the definition of linear potential. As the last example, we look at L:Share, which states that to share a
+variable x of type A, we need to split the potential between A1 and A2 , and type the rest of the expression
+with the two new variables x1 : A1 , x2 : A2 .
+
+New Rules The new type system for programs with garbage collection replaces the rules L:MatL and
+L:Share. The observation is that if we ensure that locations are used linearly, we can use destructive pattern
+                                                                    q/q 0                                         q                      q
+                                          Σ(f ) = A −
+                                                    −−→B                                               Σ; Γ q0 et : B              Σ; Γ q0 ef : B
+          q          (L:Var)                                q                       (L:Fun)                               q                                (L:Cond)
+ Σ; x : B q x : B                      Σ; x : A q0 f (x) : B                                      Σ; Γ, x : bool q0 if x then et else ef : B
+
+                                                                                                                                   q
+                                                                                                  Σ; Γ, x1 : A1 , x2 : A2 q0 e : B
+                          q                                     (L:Pair)                                         q                                     (L:MatP)
+  Σ; x1 : A1 , x2 : A2 q hx1 , x2 i : A1 × A2                                           Σ; Γ, x : (A1 , A2 ) q0 match x {(x1 ; x2 ) ,→ e} : B
+
+                 q                   (L:Nil)                                                           q+p+1                                    (L:Cons)
+           Σ; ∅ q nil : Lp (A)                                              Σ; xh : A, xt : Lp (A)       q            cons(xh ; xt ) : Lp (A)
+
+                                          q                                                            q+p
+                                  Σ; Γ q0 e1 : B                       Σ; Γ, xh : A, xt : Lp (A)        q0
+                                                                                                                 e2 : B
+                                          p             q                                                                      (L:MatL)
+                              Σ; Γ, x : L (A) q0 match x {nil ,→ e1 | cons(xh ; xt ) ,→ e2 } : B
+
+                                                                q                                            q                                  p
+   A g A1 , A2           Σ; Γ, x1 : A1 , x2 : A2 q0 e : B                                         Σ; Γ1 p e1 : A                Σ; Γ2 , x : A q0 e2 : B
+                     q                                                        (L:Share)                                   q                                (L:Let)
+      Σ; Γ, x : A q0 share x as x1 , x2 in e : B                                                       Σ; Γ1 , Γ2 q0 let(e1 ; x : τ.e2 ) : B
+
+
+                                              Figure 5: Type Rules of Classic AARA [24]
+
+
+matching to model local garbage collection by returning the potential associated with the constructor location
+(notice the extra +1 in the second premise):
+                                      q                                                             q+p+1
+                                Σ; Γ q0 e1 : B                      Σ; Γ, xh : A, xt : Lp (A)          q0
+                                                                                                                 e2 : B
+                                          p         q                                                                         (L:MatLD)
+                          Σ; Γ, x : L (A) q0 match x {nil ,→ e1 | cons(xh ; xt ) ,→ e2 } : B
+
+    This is validated by the fact (Lemma 10) that in the auxiliary copying semantics (introduced in later),
+once a cons-cell is matched on, there can be no live references from the root set to it, and thus we are justified
+in restituting the potential to type the subexpression e2 .
+    However, the rule L:MatLD is not sound for programs with aliasing of data. We address this issue by
+replacing the rule L:Share with the rule L:ShareCopy:
+                                                                                                   q
+                                  A g1 A1 , A2                        Σ; Γ, x1 : A1 , x2 : A2 q0 e : B
+                                                                q                                                (L:ShareCopy)
+                                      Σ; Γ, x : A q0 share x as x1 , x2 in e : B
+
+    To share a variabe of type A, we need to split the potential between two new annotated types A1 and A2
+as usual. In addition, we have to pay an “overhead” of 1 for every cons node in any structure in JAK. The
+idea is that we treat data as if it is actually copied. This is sound w.r.t. the copying semantics because the
+size of the domain of the reachable set of a value v is exactly the linear potential of v : A with all resource
+annotations set to 1.
+    For example, Figure 6 contains derivations for append and appTwice. Here, A is short for int and
+                                              q/q
+Σ = [append 7→ Lp (A) × Lp (A) −−→ Lp (A)] is the program signature.
+   From these derivations, we get the improved space overhead bound to append and appTwice:
+                                                                            r/r 0
+                 append : Lp (int) × Lq (int) −−→ Ls (int), where p ≥ s, q ≥ s, and r ≥ r0
+                                                        q/q 0
+                 appTwice : Lp (int) −−→ Lr (int) × Ls (int), where p ≥ r + s + 1 and q ≥ q 0
+
+Cost Metrics In previous versions of AARA [27, 21], the typing judgment and cost semantics are
+parametrized by a cost metric m : res const → Q, which assigns a constant cost to each step in the se-
+mantics. Recall the heap metric introduced above; formally, this is the function k 7→ 1k=kcons . We instantiate
+                                          q/q
+       Σ(append) = Lp (A) × Lp (A) −−→ Lp (A)
+                             q+p+1
+                                                                 L:App                                   q+p+1
+                                                                                                                                 L:Cons
+Σ; l2 : Lp (A), xs : Lp (A) q+p+1 append(xs, l2) : Lp (A)                     Σ; x : A, r : Lp (A)         q   x :: r : Lp (A)
+                                                             q+p+1
+                                                                                                                                          L:Let
+                        Σ; l2 : Lp (A), x : A, xs : Lp (A)     q   let (append(xs, l2); r.x :: r) : Lp (A)
+                                                                      ··
+                                                                       ··
+                q               L:Var                                   ··
+ Σ; l2 : Lp (A) q l2 : Lp (A)                                            ··
+                                                q                                                                                         L:MatL
+                    Σ; l1 : Lp (A), l2 : Lp (A) q matchL {l1}(l2; x, xs.let (append(xs, l2); r.x :: r)) : Lp (A)
+
+
+                                                          q                                 L:Pair
+                           Σ; l10 : Lr (A), l20 : Ls (A) q hl10 , l20 i : Lr (A) × Ls (A)
+                                                               ··
+                                                                ··                      hl2, []i : Ls (A) × Ls (A)
+                                                                 ··                                             q/q
+                                                                  ··          Σ(append) = Ls (A) × Ls (A) −−→ Ls (A)
+                                                                   ··                                q                   L:Fun
+                                                                    ·           Σ; l2 : Ls (A) q append(l2, []) : Ls (A)
+                                                                                            q                              L:Let
+                                                              Σ; l2 : Ls (A), l10 : Lr (A) q e0 : Lr (A) × Ls (A)
+                                                                                              ··
+                                                                                               ··
+             r        r                          r          r         q/q  r                    ··
+ hl1, []i : L (A) × L (A) Σ(append) = L (A) × L (A) −−→ L (A)
+                                                                                  L:Fun          ··
+                           r       q                    r                                         ··
+                  Σ; l1 : L (A) q append(l1, []) : L (A)
+                                                        q                                                                                  L:Let
+                        Σ; l1 : Lr (A), l2 : Ls (A) q let (append(l1, []); l10 .e0 ) : Lr (A) × Ls (A)
+                                                                ··
+Lr+s+1 (A) g1 Lr (A), Ls (A)                                     ·
+                                   q                                                                                        L:ShareCopy
+              Σ; l : Lr+s+1 (A) q share(l; l1, l2. let (append(l1, []); l10 .e0 )) : Lr (A) × Ls (A)
+
+Figure 6: Type derivations for the functions append and appTwice. In the derivation for appTwice we write
+e0 for let (append(l2, []); l20 .hl10 , l20 i).
+
+
+the previous type system with this metric (which only accounts for heap allocations), resulting in a concrete
+type system RaMLheap . We give a full evaluation of the improvements of FOgc over RaMLheap in Section 7.
+Although we defined the constructor to cost 1 heap location (as shown in L:Cons and L:MatLD), it can be
+any constant as long as the introduction and elimination rules agree on the constant. Thus we can extend
+the type system to accurately track constructors which vary in size depending on the argument.
+
+Type Inference One of the benefits of AARA is efficient type inference using off-the-shelve LP solvers [24],
+even for non-linear potential functions [21, 22]. The new rules do not complicate inference and previous
+techniques still apply. In a nutshell, inference is performed in three steps: First, perform a standard Hindley-
+Milner type inference for the base types. Then, annotate the type derivation with (yet unknown) variables
+for the potential annotations and collect linear constraints that are derived from the type rules. Finally,
+solve the constraints with an LP solver and minimize the potential annotations of the inputs. Details can
+be found in previous work [24, 22].
+
+
+5     Soundness of FOgc
+We seek to prove the following theorem.
+                                                                q
+Theorem 2 (Soundness). Let H  V :Γ, Σ; Γ q0 e : B, and V, H `Eoper e ⇓ v, H 0 . Then for all configurations
+W, Y, F, R, if V, H ∼ W, Y and |F | ≥ ΦV,H (Γ) + q, there exists a value w, and a freelist F 0 such that
+                                                                                                     0
+                                        W, Y, R, F `Egc e ⇓ w, Y 0 , F 0          and      v ∼H
+                                                                                              Y0 w .
+
+    Here, Eoper is a standard big-step semantics, with judgments of the form V, H ` e ⇓ v, H 0 derived from
+                                                                     0
+Egc , V, H ∼ W, Y is context equivalence, and v ∼H
+                                                 Y 0 w is value equivalence (these are defined below). The
+theorem states that, given a terminating expression and a freelist that is sufficiently large (as predicated by
+the type derivation), a run with Egc will normalize to an equivalent value.
+    To facilitate the proof, we define an intermediate semantics Ecopy which is semantically linear. The proof
+has two stages: First, we show Ecopy over-approximates Egc , meaning that any computation that succeeds
+with Egc will succeed with an equally-sized or smaller freelist with Egc . Then we show FOgc is sound with
+respect to Ecopy , and thus by the previous step sound with respect to Egc .
+    As mentioned above, we introduce a big step semantics Eoper that does not use freelists or account for
+garbage collection. We use it to characterize expressions that normalize to values when initialized with a
+sufficient freelist. This technique has also been employed in earlier work on AARA [25]. In the judgment
+V, H ` e ⇓ v, H 0 , the “freelist” is the whole ambient set of locations Loc, thus we never run out of locations
+during evaluation. This introduces a problem for value and context equivalence: when comparing evaluation
+results between a run with Ecopy and Eoper , the return values might not be syntactically equal. Consider the
+following expression e = let = [4] in [5]. Let Loc = N, the natural numbers. Consider the evaluation
+∅, ∅, ∅, {1} `Ecopy e ⇓ v1 , H1 , F1 . First, 1 is allocated and mapped to [4]. Then, since the first subexpression
+[4] is not used afterwards, we collect 1, and reuse it and map again to [5]. Thus v1 = 1. In an evaluation
+∅, ∅, ∅, {1} `Eoper e ⇓ v2 , H2 , F2 , we also first map 1 to [4], but then allocate a new location, say 2, and map it
+to [5], and v2 = 2. Due to the difference in allocation strategies and the fact that both are nondeterministic,
+we need a more robust notion of equality for values. Luckily, the structures from the denotational semantics
+(defined in Section 4) does the job. In both runs, the return value maps to the semantic value [5]. Thus
+we use semantical equality as the basis for value and context equivalence:
+Definition 2 (Value Equivalence). Two values v1 , v2 are equivalent (with the presupposition that they are
+well-formed w.r.t. heaps H1 , H2 ), iff H1  v1 7→ a : A and H2  v2 7→ a : A. Write value equivalence as
+v 1 ∼H
+     H 2 v2 .
+       1
+
+
+
+Definition 3 (Context Equivalence). Two contexts (V1 , H1 ), (V2 , H2 ) are equivalent iff dom(V1 ) = dom(V2 )
+and for all x ∈ dom(V1 ), V1 (x) ∼H
+                                  H2 V2 (x). Write context equivalence as (V2 , H2 ) ∼ (V2 , H2 )
+                                    1
+
+
+
+   Stated simply, two contexts are equivalent when they have the same domain and equal variables bind
+equal semantic values.
+
+Linear Garbage Collection Cost Semantics To establish the soundness of the type system, we need
+an intermediary semantics Ecopy , which is semantically linear. As mentioned in Section 2, this means that
+locations are treated linearly, that is, no location can be used twice in a program. Variable sharing is achieved
+via copying: the shared value is created by allocating a fresh set of locations from the freelist and copying
+the locations of the original value one by one. This is also sometimes referred to as deep copying. Let
+copy(H, L, v, H 0 , v 0 ) be a 5-place relation on Heap × P(Loc) × Val × Heap × Val. Similar to reachability, we
+write this as H 0 , v = copy(H, L, v) to signify the intended mode for this predicate: (+, +, +, −, −).
+                      v ∈ {n, T, F, Null}                     l0 ∈ L        H 0 , v = copy(H, L \ {l0 }, H(l))
+                     H, v = copy(H, L, v)                             H 0 {l0 7→ v}, l0 = copy(H, L, l)
+
+                                      L1 t L2 ⊆ L       |L1 | = |dom(reachH (v1 )|
+                 |L2 | = |dom(reachH (v2 )|   H1 , v10 = copy(H, L1 , v1 )  H2 , v20 = copy(H1 , L2 , v2 )
+                                             H2 , hv10 , v20 i = copy(H, L, hv1 , v2 i)
+
+   Primitives require no cells to copy; a location value is copied recursively; a pair of values is copied
+sequentially, and the total number of cells required is the size of the reachable set of the value. Now,
+consider Egc with the share rule F:Share replaced with the following rule.
+
+                                              V (x) = v 0
+                                     0
+  L⊆F     |L| = |dom(reachH (v ))|      H , v = copy(H, L, v 0 )
+                                                0   00
+                                                                       V 0 = (V [x1 7→ v 0 , x2 7→ v 00 ]) F V (e)
+     F0 = F \ L                    / F 0 ∪ R ∪ locsV 0 ,H (e)}
+                    g = {l ∈ H | l ∈                             V 0 , H 0 , R, F 0 ∪ g ` e ⇓ v, H 00 , F 00
+                                                                                                                      (E:Share)
+                                V, H, R, F ` share x as x1 , x2 in e ⇓ v, H 00 , F 00
+   To share a variable, we first copy the shared value. The number of cells required is equal to the size of
+the reachable set from the value. This copying sharing semantics is what justifies the analysis to restitute
+the potential when matching on a cons node, since even if the node was shared, we had to pay for the cost by
+copying the node when sharing the original value. Next, we restrict the stack to the appropriate variables.
+Lastly, any locations not reachable from the current subexpression e are collected. This is for the case when
+a variable is shared but not used later.
+   Recall that a computation is a pair (C, e) consisting of a configuration C = (V, H, R, F ) and an expression
+e. Since the cost semantics can only preserve the linearity of a computation, we restrict our attention
+to computations that are linear initially, and show that Ecopy respects the linearity of any initially linear
+computation. This motivates the following definitions:
+Definition 4. (Linear context) Given a context (V, H), let x, y ∈ dom(V ), x 6= y, and rx = reachH (V (x)),
+ry = reachH (V (y)). It is linear given that set(rx ), set(ry ), and rx ∩ ry = ∅.
+    Where set(S) means S a proper set (∀x, S(x) ≤ 1). Denote this by linearCtxt(V, H). Whenever
+linearCtxt(V, H) holds, there is at most one path from a variable on the stack V to any location in H.
+Now we can formalize our intuition for linear computations:
+Definition 5 (Linear computation). Given a configuration C = (V, H, R, F ) and an expression e, we say the
+5-tuple (C, e) is a computation; it is a linear computation given that dom(V ) = F V (e), linearCtxt(V, H), and
+disjoint({R, F, locsV,H (e)}). And we write linearComp(V, H, R, F, e) (equivalently linearComp(C, e)) to denote
+this fact.
+   Intuitively, we expect that any terminating compuation with Ecopy has a corresponding run with Egc that
+can be instantiated with an equally-sized or smaller freelist. Although this seems quite straightforward to
+prove, a complete characterization of the relationship between the space allocations of two runs with each
+semantics is necessary. To demonstrate the difficulties involved, consider the following proof attempt:
+Attempt 1. Let C2 = (V, H, R, F ) be a configuration and (C2 , e) be a linear computation. Given that
+C2 `Ecopy e ⇓ v, H 0 , F 0 , for all configurations C1 = (W, Y, R, M ) such that W, Y ∼ V, H and |M | = |F |, there
+exists a triple (w, Y 0 , M 0 ) ∈ Val × Heap × Loc such that
+                                                              0
+             C1 `Egc e ⇓ w, Y 0 , M 0         and         v ∼H
+                                                             Y0 w          and          |M 0 | ≥ |F 0 | .
+   We proceed with induction on the derivation of the judgment in Ecopy . Almost every case goes through,
+save for E:Let. First, we get W1 , Y ∼ V1 , H and we have the following from induction on the first premise:
+       W1 , Y, R0 , M `Egc e ⇓ w1 , Y1 , M1         and       v1 ∼H
+                                                                  Y1 w1
+                                                                    1
+                                                                                  and            |M1 | ≥ |F1 |
+To instantiate the induction hypothesis on the second premise, we need to show that, among other things,
+|M1 ∪ j| ≥ |F1 ∪ g|, where j is the set of collected locations in the Egc judgment. We cannot show this
+precisely because g might contain more cells then j due to the linearity of Ecopy , thus preventing a piecewise
+comparison. But of course |j| is always less than |g|, since Egc doesn’t copy to share values! This shows that
+there is a mismatch between the induction hypothesis and the relationship between the sizes of the respective
+freelists and the garbage sets. Specifically, we need to know exactly how much larger M1 is compared to F1
+at any given step.
+    Having a sense of what is missing, we formulate the criteria which characterize the required equivalence
+between two configurations, which we call copy extension.
+Definition 6. A configuration C2 = (V2 , H2 , R2 , F2 ) is a copy extension of another configuration C1 =
+(V1 , H1 , R1 , F1 ) iff
+  1. V1 , H1 ∼ V2 , H2
+  2. There is a proper partition γ : dom(H1 ) \ F1 → P(dom(H2 ) \ F2 ) such that for all l ∈ dom(γ),
+     |γ(l)| = reachH1 (V1 )(l) + R1 (l)
+  3. For all l ∈ dom(γ), x ∈ dom(V1 ), sequence of directions P which is valid w.r.t.                    V1 (x),
+     |reachH2 (V2 (x; P )) ∩ γ(l)| = reachH1 (V1 (x; P ))(l).
+  4. For all l ∈ dom(γ), |γ(l) ∩ R2 | = R1 (l)
+                                            S
+  5. |F1 | = |F2 | + | (γ)|, where (γ) = P ∈ec(γ) P \ {rep(P )}
+Write this as C1  C2 .
+    The intention is that C2 is a configuration for an evaluation using Ecopy , and C1 a configuration for Egc .
+The first condition is the straightforward context equivalence. The second condition requires the existence
+of a mapping γ that tells us given a location in H1 \ F1 , which locations in H2 \ F2 are shared instances.
+    For example, consider the expression share x as x1 , x2 in e and assume the stack is [x 7→ 1], and
+the heap equals [1 7→ h0, Nulli], i.e. x is the list [0]. In an evaluation with Egc , the stack becomes
+[x1 7→ 1, x2 7→ 1], and the heap does not change. With Ecopy , we allocate a new location in the heap:
+[1 7→ h0, Nulli, 2 7→ h0, Nulli], and the stack changes accordingly: [x1 7→ 1, x2 7→ 2]. Now γ would map 1 to
+{1, 2}, since both are shared instances of the former.
+    Thus, the image of γ is a collection of disjoint subsets whose union is dom(H2 ) \ F2 , and each location
+in dom(H2 ) \ F2 belongs to a unique class whose preimage is the unique representative in dom(H1 ) \ F1 .
+Furthermore, we noticed it is crucial to include the fact that the size of γ(l) must be the sum of the number
+of references from the stack and the continuation set. Furthermore, we also require each subset γ(l) (also
+referred to as class) to be nonempty (this is the proper partition condition).
+    While γ gives us a relation between the active regions of two respective heaps, we still need to know
+exactly how variables on the stack factor in this relationship. Let l ∈ H1 . Specifically, we need to know that
+the number of references to l from every subvalue in V1 is equal to the size of the corresponding part of the
+class γ(l). First, we need to access subvalues of a value using directions:
+Definition 7. Let Dir be the set {L,R,N}, denoting left, right, and next respectively. We define the function
+getH : (1 ⊕ Val) × Dir → 1 ⊕ Val which indexes values via directions:
+           getH (Just(hv1 , v2 i), L) =     Just(v1 )             getH (Just(l), N) =   Just(H(l))
+           getH (Just(hv1 , v2 i), R) =     Just(v2 )             getH ( , )        =   N one
+Let P ∈ S(Dir), where S(X) denotes the set of sequence with elements from X. We define f indH :
+(1 ⊕ Val) × S(Dir) → 1 ⊕ Val extending getH to sequences of directions:
+                                  f indH (v, D :: P ) = f indH (getH (v, D), P )
+                                          f indH (v, []) = v
+Call P valid w.r.t. a value v if f indH (v, P ) = Just(v 0 ) for some v 0 . Given a valid sequence P w.r.t.
+V (x), write VH (x; P ) for f romJust(f indH (V (x), P )) and reachH (V (x; P )) for reachH (VH (x; P )). A map
+mV : X → S(dir) is a subvalue map given that X ⊆ dom(V ) and each x ∈ X is mapped to a sequence
+P
+U which is valid w.r.t. V (x). Given a subvalue map mV , define its action as reachP athV,H (X, m) =
+  x∈X reachH (V (x; m(x))).
+
+    With this, the third condition gives us a more fine grained restriction: for any subvalue in V1 , the number
+of references from it to l is equal to the size of the intersection of the reachable set of the corresponding
+subvalue in V2 with the appropriate class γ(l) .
+    The next condition simply states that the continuation sets
+                                                              P respect γ. Lastly, we have that F1 is greater
+than F2 , with the overhead (γ) being exactly the sum           l∈γ |γ(l)| − 1. Here ec(γ) is the image of γ:
+{γ(l) | l ∈ dom(γ)}. Since each class γ(l) is non-empty, we use rep(l) to choose an arbitrary element from
+the class.
+    Below are some expected properties of a copy extension:
+Lemma 3. Let V1 , H1 ∼ V2 , H2 . Then for all x ∈ dom(V1 ) and sequence of directions P , Either
+f indH1 (V1 (x), P ) = f indH2 (V2 (x), P ) = N one or f indH1 (V1 (x), P ) = v1 , f indH2 (V2 (x), P ) = v2 and
+v 1 ∼H
+     H2 v2
+      1
+Lemma 4. Let V2 , H2 , R2 , F2 `copy e ⇓ v, H 0 , F 0 , and V1 , H1 , R1 , F1  V2 , H2 , R2 , F2 , where γ is the partition
+satisfying the copy extension property. Then for all l ∈ dom(γ) and subvalue map mV : X → S(dir),
+γ(l) ⊆ collect(R2 , reachP athV2 ,H2 (X, m), H2 , F2 ) iff l ∈ collect(R1 , reachP athV1 ,H1 (X, m), H1 , F1 ).
+   Now we can state the key lemma:
+Lemma 5. Let (C2 , e) = (V, H, R, F, e) be a linear computation. Given that C2 `Ecopy e ⇓ v, H 0 , F 0 , for
+all configurations C1 such that C1  C2 , there exists a triple (w, Y 0 , M 0 ) ∈ Val × Heap × Loc and γ 0 :
+dom(Y 0 ) \ M 0 → P(dom(H 0 ) \ F 0 ) s.t.
+   1. C1 `Egc e ⇓ w, Y 0 , M 0
+             0
+   2. v ∼H
+         Y0 w
+
+   3. γ 0 is a proper partition, and for all l ∈ dom(γ 0 ), |γ 0 (l)| = |reachY1 (w1 )(l)| + S(l)
+   4. For all l ∈ dom(γ 0 ) and P ∈ S(Dir) that is valid w.r.t.                v, |reachH 0 (f indH 0 (v; P )) ∩ γ 0 (l)| =
+      reachY 0 (f indY 0 (w; P ))(l)
+   5. For all l ∈ dom(γ 0 ), γ 0 (l) ∩ R = γ(l) ∩ R
+   6. |M 0 | = |F 0 | + |    (γ 0 )|
+Proof. Induction on the evaluation judgment `Ecopy . We illustrate the ideas with the case CondT:
+                                                    V (x) = T
+        V 0 = V F V (e1 )   g = {l ∈ H | l ∈
+                                            / F ∪ R ∪ locsV 0 ,H (e1 )}     V 0 , H, R, F ∪ g ` e1 ⇓ v, H 0 , F 0
+Case:
+                                      V, H, R, F ` if(x; e1 ; e2 ) ⇓ v, H , F 0
+                                                                         0
+
+Let W, Y, S, M be a configuration such that W, Y, S, M  V, H, R, F . Define W 0 = W dom(V 0 ) and j = {l ∈
+     / M ∪ S ∪ locsW,Y (e1 )}. To instantiate the induction hypothesis, we need to show that W 0 , Y, S, M ∪ j 
+Y |l ∈
+  0
+V , H, R, F ∪ g, giving us 5 obligations:
+
+                 (1)   W 0, Y ∼ V 0, H
+                 (2)   Give a proper partition γ 0 : dom(Y ) \ (M ∪ j) → P(dom(H) \ (F ∪ g))
+                 (3)   For all l ∈ dom(γ 0 ), x ∈ dom(W 0 ), P ∈ S(Dir) a valid sequence w.r.t. W 0 (x),
+                 |reachH (V 0 (x; P )) ∩ γ 0 (l)| = reachY (W 0 (x; P ))(l)
+                 (4)   For all l ∈ S, |γ 0 (l) ∩ R| = S(l)
+                 (5)   |M ∪ j| = |F ∪ g| + |      (γ 0 )|
+
+(1) is satisfied since W, Y ∼ V, H. For (2), we take γ 0 (l) = γ dom(Y )\(M ∪j) (l) \ g. First, we show that γ 0
+is a partition. Let l, l0 ∈ dom(Y ) \ (M ∪ j) be two arbitrary locations. Then γ 0 (l) ∩ γ 0 (l0 ) = ∅ since γ is a
+partition. Now Consider the image of γ 0 :
+
+                                       γ 0 (dom(Y ) \ (M ∪ j)) = γ(dom(Y ) \ (M ∪ j)) \ g
+                                                 [              [
+                                        = ((            γ(l)) \   γ(l)) \ g
+                                           l∈dom(Y )\M             l∈j
+                                                             [
+                                       = ((dom(H) \ F ) \          γ(l)) \ g                            (γ is a partition)
+                                                             l∈j
+                                                                                            S
+                                       = (dom(H) \ F ) \ g                                 ( l∈j γ(l) ⊆ g by Lemma 4)
+                                       = dom(H) \ (F ∪ g)
+
+Hence γ 0 is a partition. Next we need to show it is proper, or that every class is nonempty. Let l ∈
+dom(Y ) \ (M ∪ j) be any location. Since γ 0 (l) = γ(l) \ g, it suffices to show that the class γ(l) is not all
+collected. For the sake of contradiction, assume γ(l) ⊆ g. But then l ∈ j by Lemma 4, and we have a
+contradiction since we assumed l ∈   / j. Lastly, |γ 0 (l)| = reachY (W 0 )(l) + S(l) follows from the definition of g
+and the second and third condition of copy extension. Conditions (3) and (4) follow similarly.
+    Lastly, we need to show that the overhead is preserved: |M | + |j| = |F | + |g| + | (γ 0 )|. By assumption,
+|M | = |F | + | (γ)|, so it suffices to show |j| + | (γ)| = |g| + | (γ 0 )|. Since g and the image of γ 0 are
+disjoint, it suffices to define a bijection f : j ⊕ (γ) → g t (γ 0 ). First, we separate the classes ec(γ) into
+those that are completely collected intoSg and those that are only partially     S     collected: C1 = {γ(l) | l ∈ j}
+and C2 = ec(γ) \ C1 . Further, let D1 = S      C∈C1 C   \ {rep(C)}   and D  2 =    C∈C2 C \ {rep(C)}. Then we have
+  (γ) = D1 t D2 and by       Lemma   4, g =  (  C∈C1   C)   t L for some  L.  Therefore,   we need to find
+                                                                                                         S a bijection
+f : j ⊕ (D1 t D2 ) → ( C∈C1 C) t L t (γ 0 ). It suffices to find the bijections f1 : j ⊕ D1 → C∈C1 C and
+                          S
+f2 : D2 → L t (γ 0 ). First, we define f1 :
+                                                    (
+                                                        rep(γ(l)) x = (inl, l)
+                                           f1 (x) =
+                                                        l           x = (inr, l)
+
+Note that f1 simply maps the set of representatives into theirS   respective classes and is the identity on the
+rest of the class. Thus f1 is a bijection, and |j| + |D1 | = | C∈C1 C|. Next, note that
+
+                         |C2 | = |ec(γ) \ {γ(l) | l ∈ j}| = |ec(γ dom(Y )\(M ∪j) )| = |ec(γ 0 )|
+
+Which means that C2 has the same number of classes as γ 0 (even though the actual classes might be different).
+Since both γ and γ 0 are proper partitions, we can keep class representatives for each class when defining the
+bijection:
+
+                             |D2 | = |L t (γ 0 )|
+                                       [                                      [
+                              ⇐⇒ |        C \ {rep(C)}| = |L t                          C \ {rep(C)}|
+                                      C∈C2                                 C∈ec(γ 0 )
+                                       [                    [
+                              ⇐⇒ |           C| = |L t                C|
+                                      C∈C2               C∈ec(γ 0 )
+                                                    S
+In fact, the latter two sets are equal. Let l ∈ C∈C    S 2 C. If l is collected into g, l must be in L since it
+                                                                                                              Sis not from
+a class in C1 . If l is not collected, it remains in C∈ec(γ 0 ) C. For the other direction, let l ∈ L t C∈ec(γ 0 ) C.
+                                                                                            S
+If l ∈ L, then it is in a class that was not completely collected,   S which means l ∈ C∈C2 C. Otherwise, l is in
+a class that is disjoint from g, which means again that l ∈ C∈C2 C. Hence f2 is simply the identity.
+     Finally, we have the copy extension W 0 , Y, S, F ∪ j  V 0 , H, R, F ∪ g. Now we instantiate the induction
+hypothesis to obtain the triple (w, Y 0 , M 0 ) and new partition γ 00 with the expected properties. Applying the
+rule F:CondT to the evaluation W 0 , Y, S, F ∪j ` e1 ⇓ w, Y 0 , M 0 given by the first property from induction, we
+get W, Y, S, F ` if(x; e1 ; e2 ) ⇓ w, Y 0 , M 0 , which inherits the required conditions (2) - (6) from induction.
+    Thus, we have shown that we can execute a computation using Egc given that the computation suceeded
+in a run with Ecopy , which means that Ecopy is an over approximation of Egc .
+
+Soundness of FOgc For the second part of the proof, we show FOgc is sound w.r.t. Ecopy . Below are
+selected lemmas used in the soundness theorem:
+Definition 8 (Stability). Given heaps H, H 0 , a set of locations is stable if ∀l ∈ R. H(l) = H 0 (l). Denote
+this by stable(R, H, H 0 ).
+Lemma 6. Let H  v 7→ a : A. For all sets of locations R, if reachH (v) ⊆ R and stable(R, H, H 0 ), then
+H 0  v 7→ a : A and reachH (v) = reachH 0 (v).
+Lemma 7 (Stability of copying). Let H 0 , v 0 = copy(H, L, v). For all l ∈ H, if l ∈
+                                                                                   / L, then H(l) = H 0 (l).
+                    0
+Further, reachH 0 (v ) ⊆ L.
+Lemma 8 (Copy is copy). Let H 0 , v 0 = copy(H, L, v). If H  v 7→ a : A, then H 0  v 0 7→ a : A.
+Lemma 9. Let A gn A1 , A2 , H  v : A, v ∼H             H
+                                          H v1 , and v ∼H v2 . Then ΦH (v : A) = ΦH (v1 : A1 ) + ΦH (v2 :
+A2 ) + n · |dom(reachH (v))|
+Lemma 10 (Linearity of Ecopy ). Let C be a configuration, C `Ecopy e ⇓ v, H 0 , F 0 , and Σ; Γ ` e : B. Given
+that linearComp(C, e), we have that set(reachH 0 (v)) and disjoint({R, F 0 , reachH 0 (v)}).
+                                                              q
+Theorem 11 (Soundness). let Ho  Vo : Γ, Σ; Γ q0 e : B, Vo , Ho ` e ⇓ vo , Ho0 . Then ∀C ∈ Q+ and
+configuration (V, H, R, F ) s.t.
+    1. Vo , Ho ∼ V, H
+    2. linearComp(V, H, R, F, e)
+    3. |F | ≥ ΦV,H (Γ) + q + C
+then there exists a triple (v, H 0 , F 0 ), and a freelist F 0 s.t.
+    1. V, H, R, F `Ecopy e ⇓ v, H 0 , F 0
+            H0
+    2. vo ∼Ho0 v
+    3. |F 0 | ≥ ΦH 0 (v : B) + q 0 + C
+    In other words, given a terminating expression (verified by succeeding with the run using Eoper ) and given
+a freelist that is sufficiently large (as predicated by the type derivation), a run with Ecopy will normalize to an
+equivalent value, and the resulting freelist will be sufficiently large (as predicated by the type derivation).
+
+
+6      Implementation and Evaluation
+Implementation We have implemented the novel cost semantics and the type system in Resource Aware
+ML (RaML). The implementation covers full RaML, including user-defined data types, higher-order func-
+tions, and polynomial potential functions. However, there is no destructive match for function closures and
+analyzing the heap-space usage of closures still amounts to counting allocations only. The main changes
+that where necessary have been in the rules for sharing and pattern matching as described earlier. We also
+needed to change some elaboration passes that were no longer cost preserving with the GC cost model.
+    The garbage collection cost semantics is implemented as an alternative evaluation module inside RaML.
+As mentioned before, RaML leverages the syntax of OCaml programs. First, we take the OCaml type
+checked abstract syntax tree and perform a series of transformations. The evaluation modules operate
+on the resulting RaML syntax tree. In the gc evaluation module, evaluate has the following signature:
+ evaluate : (’a, unit) Expressions.expression -> int -> ((’a value * ’a heap * Int.Set.t) option)
+
+    Here, the second argument int specifies the size of the initial freelist. The result is an option triple of
+the return value, heap, and freelist; None is returned in case the freelist was not sufficient for the evaluation.
+Whereas the normal evaluation boxes every value (everything evaluates to a location), the gc module follows
+the cost semantics and only boxes data constructors. The rationale is that the size for other values can be
+computed statically and thus stack allocated. One difference between the cost semantics and its implementa-
+tion is that while in the language presented here list is the only data type, our implementation supports user
+defined data types. The extension is straightforward except the treatment of the nil constructor, or generally
+“empty” constructors that have arity zero. For simplicity of presentation, we evaluate all nil constructors
+to the same null value in the cost semantics. This is natural for lists because all nil constructors are the
+same, and every list has at most one nil node. However, for custom data types that have more than one
+kind of empty constructor, it is not possible to map every constructor to the same null value. Thus, the
+implementation treats all constructors uniformly, so each empty constructor also costs one heap location.
+    As mentioned before, all functions used in a program are declared in a global mutually recursive block, and
+we do not account for the constant space overhead for this block in the cost semantics. In order to implement
+this global function block, we allow closure creation during program evaluation. However, we allocate all
+closures from a separate freelist into a separate heap. This ensures that data constructors are allocated from
+the correct freelist and no space overhead is created by allocating closures for function declarations.
+
+Evaluation We evaluated our new analysis                function        type
+on a number of functions. Table 1 contains a            quicksort       [’a ->’a ->bool; ’a list] ->’a list
+representative compilation. It shows the type           mergesort       [[’a; ’a] ->bool; ’a list] ->’a list
+signature for each function. Table 2 presents           ocamlsort       [[’a; ’a] ->bool; ’a list] ->’a list
+the test data that showcase the difference be-          selection sort int list ->int list
+tween RaMLheap , the previous RaML type sys-            eratosthenes    int list ->int list
+tem instantiated with the heap metric (the old          dfs             [btree; int] ->btree option
+analysis which only counts heap allocations),           bfs             [btree; int] ->btree option
+and FOgc , which includes deallocations and             transpose       ’a list list ->’a list list
+                                                        map it          [’a ->’b; ’a list list] ->’b list list * ’b list list
+copying cost for sharing. For each type system,
+                                                        pairs           ’a list ->(’a * ’a) list
+we show the heap space bound computed by
+RaML, the number of constraints generated,                         Table 1: Signature of Test Functions
+and the time elapsed during analysis. The last
+column gives the expression for the exact heap high watermark derived by hand and verified by running the
+cost semantics.
+    Except for bfs and dfs, all functions in the table take a principal argument of type list. The variables in
+the table refer to this argument (for example, the type of the principal argument of quicksort is ’a list). In
+general, M refers to the number of cons constructors of the principal argument (or the number of outer cons
+nodes in case of nested lists); L refers to the maximum number of cons nodes of the inner lists.
+    For the sorting functions, aside from mergesort, the new analysis using the gc metric derived asymptot-
+ically better bounds when compared to the heap metric. Furthermore, all bounds are exact with respect
+to the cost semantics. In regards to mergesort, the analysis was not able to derive a tight bound due to
+the limitations of AARA in deriving logarithmic bounds. A particularly nice result is that for quicksort,
+we derive that the space usage is exactly 0, which justifies its use as a zero space-overhead (or “in place”)
+sorting algorithm.
+    Next, we have have the graph search algorithms operating on a binary tree. Again, the gc metric was able
+to derive exact space overheads, while the heap metric derived linear bounds for both. For transpose, the gc
+metric derived an asymptotically better bound, but was not able to derive the exact overhead. We implement
+matrices as lists-of-lists in row-major order. The transpose function is implemented tail-recursively, with the
+accumulator starting as the empty list. When “flipping” the first row r of the input and appending this to
+the accumulator, we need to create |r| many new nil and cons constructors to store the row as a column.
+While this overhead only occurs once, RaML is unable to infer this from the source code, and thus the cost
+is repeated over the entire input matrix, resulting in the linear bound (w.r.t. the size of the matrix). This
+artifact is unrelated to the new extension; it is a limitation due to the implementation of RaML.
+    The last two functions demonstrate how the gc metric performs when there is variable sharing. map it
+maps the input function across each list in the principal argument twice, returning a tuple of nested lists.
+The gc metric dictates that every outer data constructor in the principal argument needs to be copied, and
+thus gives the linear bound M + 1. In this case, the bound is exact. The function “pairs” takes a list
+and outputs all pairs of the input list which are ordered ascending in input position. For example, pairs
+[1;2;3;4] = [(1,2);(1,3);(1,4);(2,3);(2.4);(3,4)]. For pairs, the gc metric derived a bound that is asymptotically
+the same as the heap metric, but with better constants. An exact bound could not be derived because the
+deallocation potential from the pattern match in the definition of pairs is wasted since the matched body
+could already be typed with zero cost. However, this deallocation is used as usual in the cost semantics.
+Thus the slack in the bound totals to the size of the input.
+                 RaMLheap                                        FOgc
+function         computed bound             constraints   time   computed bound     constraints   time   optimal
+quicksort        1.00 + 3.50M + 1.50M 2     8515          0.52   0                  8519          0.48   0
+mergesort        1.00 − 4.67M + 6.33M 2     9572          0.64   −0.50M + 0.50M 2   9578          0.58   blog(M )c
+ocamlsort        7.50 + 5.50M + 1.00M 2     8565          0.51   1.00 + 1.00M       8573          0.50   M +1
+selection sort   2.00 + 3.00M + 1.00M 2     639           0.06   0                  642           0.05   0
+eratosthenes     1.00 + 1.50M + 0.50M 2     515           0.06   0                  517           0.04   0
+dfs              3.00 + 2.00M               5481          0.90   2                  5483          0.36   2
+bfs              5.00 + 10.00M              24737         4.15   4                  24742         1.62   4
+transpose        1.00 + 3.50LM + 0.50LM 2   10680         0.50   1.00 + 2.00LM      10684         0.50   max (0, 2L − 1)
+map it           2.00 + 2.00LM + 4.00M      30699         1.58   1.00M + 1.00       30703         1.57   M+1
+pairs            1.00 + 1.00M 2             10214         0.60   0.50M + 0.50M 2    10217         0.64   0.5M 2 − 1.5M + 2
+
+
+                                  Table 2: Automatic Bound Analysis with RaML
+
+
+7      Conclusion and Future Work
+In this article, we introduced a novel operational cost semantics that models a perfect tracing garbage
+collector and an extension to AARA that is sound with respect to the new semantics. We implemented
+the new semantics and analysis as modules in RaML and found through experimental testing that the
+extended AARA was able to derive asymptotically better bounds for several commonly used functions and
+programming patterns; often, the bounds are optimal with respect to the cost semantics.
+    One direction for future work is using the cost free metric cf to model global garbage collection. In cf,
+all resource constants, including constructor nodes, are set to 0. A cost-free typing judgment then captures
+how an expression manipulates the structures in the context into the structure induced by its type. Using
+this fact, we could express the maximum space usage in the sequential composition let(e1 ; x : τ.e2 ) by
+analyzing e1 twice—once with the cost-free metric and once with the regular metric—and assign potential
+to x using the result type in the cost-free typing. In prior work [23], the authors have successfully employed
+this cost-free metric to analyze parallel programs. Here, the difficulty is showing the simultaneous soundness
+of both destructive pattern matching and the cost-free composition. Another complication is the choice
+between local variable sharing and global context sharing. We leave the exploration of this area to future
+work.
+    Another direction for future work are function closures. The current treatment in our implementation
+is unsatisfactory since there is no equivalent to the destructive pattern match for closures. As a result,
+the GC metric in RaML only accounts for allocation of closures, which is not an improvement over the
+existing implementation. Ideally, we would like to account for deallocation at function applications and
+treat closures similar to other data structures in sharing. However, the size of closures cannot be determined
+easily statically and closures can not capture potential and are currently shared freely in RaML. As a result,
+the techniques we developed here do not directly carry over to closures.
+    Finally, we are interested in exploring if our work can be used to improve the efficiency of garbage
+collection in languages like OCaml. A guaranteed upper bound on the heap space can be used in different
+ways to control the frequency of the collections and the total memory that is requested from the operating
+system.
+
+
+Acknowledgments
+This article is based on research supported by the United States Air Force under DARPA AA Contract
+FA8750-18-C-0092 and DARPA STAC Contract FA8750-15-C-0082, and by the National Science Founda-
+tion under SaTC Award 1801369 and SHF Award 1812876. Yue Niu has been supported by Carnegie
+Mellon’s Undergraduate Research Office through a Summer Undergraduate Research Fellowship (SURF).
+Any opinions, findings, and conclusions contained in this document are those of the authors and do not
+necessarily reflect the views of the sponsoring organizations.
+References
+ [1] Elvira Albert, Jesús Correas Fernández, and Guillermo Román-Dı́ez. Non-cumulative Resource Analysis. In Tools
+     and Algorithms for the Construction and Analysis of Systems - 21st International Conference, (TACAS’15), 2015.
+ [2] Elvira Albert, Samir Genaim, and Miguel Gomez-Zamalloa. Heap space analysis for java bytecode. In Proceedings
+     of the 6th International Symposium on Memory Management (ISMM’07), 2007.
+ [3] Elvira Albert, Samir Genaim, and Miguel Gómez-Zamalloa Gil. Live Heap Space Analysis for Languages with
+     Garbage Collection. In Proceedings of the 2009 International Symposium on Memory Management (ISMM’09),
+     2009.
+ [4] Elvira Albert, Samir Genaim, and Miguel Gómez-Zamalloa. Heap space analysis for garbage collected languages.
+     Science of Computer Programming, 78(9):1427 – 1448, 2013.
+ [5] Robert Atkey. Amortised Resource Analysis with Separation Logic. In 19th Euro. Symp. on Prog. (ESOP’10),
+     2010.
+ [6] Martin Avanzini and Georg Moser. A Combination Framework for Complexity. In 24th International Conference
+     on Rewriting Techniques and Applications (RTA’13), 2013.
+ [7] Régis Blanc, Thomas A. Henzinger, Thibaud Hottelier, and Laura Kovács. ABC: Algebraic Bound Computation
+     for Loops. In Logic for Prog., AI., and Reasoning - 16th Int. Conf. (LPAR’10), 2010.
+ [8] Vı́ctor A. Braberman, Federico Fernández, Diego Garbervetsky, and Sergio Yovine. Parametric prediction of
+     heap memory requirements. In 7th Int. Symp. on Memory Management (ISMM’08), pages 141–150, 2008.
+ [9] Quentin Carbonneaux, Jan Hoffmann, Thomas Reps, and Zhong Shao. Automated Resource Analysis with Coq
+     Proof Objects. In 29th International Conference on Computer-Aided Verification (CAV’17), 2017.
+[10] Quentin Carbonneaux, Jan Hoffmann, and Zhong Shao. Compositional Certified Resource Bounds. In 36th
+     Conference on Programming Language Design and Implementation (PLDI’15), 2015. Artifact submitted and
+     approved.
+[11] Arthur Charguéraud and François Pottier. Machine-Checked Verification of the Correctness and Amortized
+     Complexity of an Efficient Union-Find Implementation. In Interactive Theorem Proving - 6th International
+     Conference (ITP’15), 2015.
+[12] Wei-Ngan Chin, Huu Hai Nguyen, Corneliu Popeea, and Shengchao Qin. Analysing Memory Resource Bounds
+     for Low-level Programs. In Proceedings of the 7th International Symposium on Memory Management (ISMM’08),
+     2008.
+[13] Wei-Ngan Chin, Huu Hai Nguyen, Shengchao Qin, and Martin Rinard. Memory Usage Verification for OO
+     Programs. In Proceedings of the 12th International Conference on Static Analysis (SAS’05), 2005.
+[14] Norman Danner, Daniel R. Licata, and Ramyaa Ramyaa. Denotational Cost Semantics for Functional Languages
+     with Inductive Types. In 29th Int. Conf. on Functional Programming (ICFP’15), 2012.
+[15] Ankush Das, Jan Hoffmann, and Frank Pfenning. Parallel complexity analysis with temporal session types. In
+     23rd International Conference on Functional Programming (ICFP’18), 2018. Conditionally accepted.
+[16] Antonio Flores-Montoya and Reiner Hähnle. Resource Analysis of Complex Programs with Cost Equations. In
+     Programming Languages and Systems - 12th Asian Symposiu (APLAS’14), 2014.
+[17] Florian Frohn, M. Naaf, Jera Hensel, Marc Brockschmidt, and Jürgen Giesl. Lower Runtime Bounds for Integer
+     Programs. In Automated Reasoning - 8th International Joint Conference (IJCAR’16), 2016.
+[18] Sumit Gulwani, Krishna K. Mehra, and Trishul M. Chilimbi. SPEED: Precise and Efficient Static Estimation
+     of Program Computational Complexity. In 36th ACM Symp. on Principles of Prog. Langs. (POPL’09), 2009.
+[19] Robert Harper. Practical Foundations for Programming Languages. Cambridge University Press, 2016.
+[20] Jan Hoffmann. Types with Potential: Polynomial Resource Bounds via Automatic Amortized Analysis. PhD
+     thesis, Ludwig-Maximilians-Universität München, 2011.
+[21] Jan Hoffmann, Klaus Aehlig, and Martin Hofmann. Multivariate Amortized Resource Analysis. In 38th Sympo-
+     sium on Principles of Programming Languages (POPL’11), 2011.
+[22] Jan Hoffmann, Ankush Das, and Shu-Chun Weng. Towards Automatic Resource Bound Analysis for OCaml. In
+     44th Symposium on Principles of Programming Languages (POPL’17), 2017.
+[23] Jan Hoffmann and Zhong Shao. Automatic static cost analysis for parallel programs. In Proceedings of the 24th
+     European Symposium on Programming on Programming Languages and Systems - Volume 9032, pages 132–157,
+     New York, NY, USA, 2015. Springer-Verlag New York, Inc.
+[24] Martin Hofmann and Steffen Jost. Static Prediction of Heap Space Usage for First-Order Functional Programs.
+     In 30th ACM Symp. on Principles of Prog. Langs. (POPL’03), 2003.
+[25] Martin Hofmann and Steffen Jost. Static prediction of heap space usage for first-order functional programs. In
+     Proceedings of the 30th ACM SIGPLAN-SIGACT Symposium on Principles of Programming Languages, POPL
+     ’03, pages 185–197, New York, NY, USA, 2003. ACM.
+[26] Martin Hofmann and Steffen Jost. Type-Based Amortised Heap-Space Analysis. In 15th Euro. Symp. on Prog.
+     (ESOP’06), 2006.
+[27] Steffen Jost, Kevin Hammond, Hans-Wolfgang Loidl, and Martin Hofmann. Static Determination of Quantitative
+     Resource Usage for Higher-Order Programs. In 37th ACM Symp. on Principles of Prog. Langs. (POPL’10), 2010.
+[28] Zachary Kincaid, Jason Breck, Ashkan Forouhi Boroujeni, and Thomas Reps. Compositional recurrence analysis
+     revisited. In Conference on Programming Language Design and Implementation (PLDI’17), 2017.
+[29] Ugo Dal Lago and Marco Gaboardi. Linear Dependent Types and Relative Completeness. In 26th IEEE Symp.
+     on Logic in Computer Science (LICS’11), 2011.
+[30] Yasuhiko Minamide. Space-profiling semantics of the call-by-value lambda calculus and the CPS transformation.
+     Electr. Notes Theor. Comput. Sci., 26:105–120, 1999.
+[31] Greg Morrisett, Matthias Felleisen, and Robert Harper. Abstract models of memory management. In Proceedings
+     of the Seventh International Conference on Functional Programming Languages and Computer Architecture
+     (FPCA’95), 1995.
+[32] Van Chan Ngo, Mario Dehesa-Azuara, Matthew Fredrikson, and Jan Hoffmann. Verifying and Synthesizing
+     Constant-Resource Implementations with Types. In 38th IEEE Symposium on Security and Privacy (S&P ’17),
+     2017.
+[33] Tobias Nipkow. Amortized Complexity Verified. In Interactive Theorem Proving - 6th International Conference
+     (ITP’15), 2015.
+[34] Lars Noschinski, Fabian Emmes, and Jürgen Giesl. Analyzing Innermost Runtime Complexity of Term Rewriting
+     by Dependency Pairs. J. Autom. Reasoning, 51(1):27–56, 2013.
+[35] Ivan Radiček, Gilles Barthe, Marco Gaboardi, Deepak Garg, and Florian Zuleger. Monadic Refinements for
+     Relational Cost Analysis. Proc. ACM Program. Lang., 2(POPL), 2017.
+[36] Hugo R. Simões, Pedro B. Vasconcelos, Mário Florido, Steffen Jost, and Kevin Hammond. Automatic Amortised
+     Analysis of Dynamic Memory Allocation for Lazy Functional Programs. In 17th Int. Conf. on Funct. Prog.
+     (ICFP’12), 2012.
+[37] Moritz Sinn, Florian Zuleger, and Helmut Veith. A Simple and Scalable Approach to Bound Analysis and
+     Amortized Complexity Analysis. In Computer Aided Verification - 26th Int. Conf. (CAV’14), 2014.
+[38] Daniel Spoonhower, Guy E. Blelloch, Robert Harper, and Phillip B. Gibbons. Space profiling for parallel
+     functional programs. In Proceedings of the 13th ACM SIGPLAN International Conference on Functional Pro-
+     gramming, ICFP ’08, pages 253–264, New York, NY, USA, 2008. ACM.
+[39] Leena Unnikrishnan and Scott D. Stoller. Parametric Heap Usage Analysis for Functional Programs. In Pro-
+     ceedings of the 2009 International Symposium on Memory Management (ISMM ’09), 2009.
+[40] Leena Unnikrishnan, Scott D. Stoller, and Yanhong A. Liu. Optimized Live Heap Bound Analysis. In Verification,
+     Model Checking, and Abstract Interpretation, 4th International Conference (VMCAI’03), pages 70–85, 2003.
+[41] Pedro B. Vasconcelos, Steffen Jost, Mário Florido, and Kevin Hammond. Type-Based Allocation Analysis for
+     Co-recursion in Lazy Functional Languages. In 24th European Symposium on Programming (ESOP’15), 2015.
+[42] P. Wang, D. Wang, and A. Chlipala. TiML: A Functional Language for Practical Complexity Analysis with
+     Invariants. In Object-Oriented Prog., Syst., Lang., and Applications (OOPSLA’17), 2017.
+[43] Ezgi Çiçek, Gilles Barthe, Marco Gaboardi, Deepak Garg, and Jan Hoffmann. Relational Cost Analysis. In 44th
+     Symposium on Principles of Programming Languages (POPL’17), 2017.
+
+
+
+A     Notation
+For a finite mapping f : A → B, we write dom for the defined values of f . Sometimes we shorten x ∈ dom(f )
+to x ∈ f . We write f [x 7→ y] for the extension of f where x is mapped to y, with the constraint that
+x∈/ dom(f ).
+     Given possibly non-disjoint sets A, B, let the disjoint union be A⊕B defined by {(inl, a) | a ∈ A}∪{(inr, b) |
+b ∈ B}.
+     Let a multiset be a function S : A → N, i.e. a map of the multiplicity of each element in the domain.
+Write x ∈ S iff S(x) ≥ 1. If for all s ∈ S, µ(s) = 1, then S is a property set, and we denote this by set(S).
+Addtionally, A ] B denotes counting union of sets where (A ] B)(s) = A(s) + B(s), similarly, (A ∩ B)(s) =
+min A(s), B(s). Furthermore, A ∪ B denotes the usual union where (A ∪ B)(s) = max (A(s), B(s)). For
+the union of disjoint multi-sets A and B, we write A t B to emphasize the disjointness. For a collection of
+pairwise disjoint multi-sets C, i.e. ∀X, Y ∈ C. X ∩ Y = ∅, we write disjoint(C).                    (
+                                                                                                      1 if x ∈ A
+     In the rest of the paper, we sometimes treat a set A sets as multiset A : A → N via x 7→
+                                                                                                      0 o.w.
+when convenient. For instance, if an operation defined on multisets is used on sets and multisets, the set is
+thus promoted.
+     Given a set A, let P(A) be the powerset of A. Given a multiset A, let ℘(A) be the power multiset of A,
+i.e. the set of all submultisets of A.
+     For a partition f : A → P(B), we write the set of equivalence classes as ec(f ) = {f (x) | x ∈ A} = f (A),
+i.e. the image of f on its domain A. Furthermore, a partition is proper if for any x ∈ A, f (x) 6= ∅.
+     Given a proper partition f : A → P(B), for every a ∈ A, we can choose an arbitrary b ∈ f (a) to be the
+representative for that part; call this rep(a).
+
+
+B       Linearity of Copy Semantics
+In the soundness proof of FOgc , we used an important lemma: that Ecopy is semantically linear, i.e. locations
+are used linearly. To see why, consider the second premise in the rule L:MatLD. In addition to the p units of
+potential justified by the definition of linear potential, we get 1 unit from deallocating the cons cell itself. This
+is only sound if in the corresponding rule in Ecopy a location was actually collected. Consider the evaluation
+in question:
+
+                    V (x) = l     H(l) = hvh , vt i     V 00 = (V [xh 7→ vh , xt 7→ vt ]) F V (e2 )
+                 g = {l ∈ H | l ∈
+                                / F ∪ R ∪ locsV 00 ,H (e2 )}    V 00 , H, R, F ∪ g ` e2 ⇓ v, H 0 , F 0
+                                                                                                       (S1 )
+                       V, H, R, F ` match x {nil ,→ e1 | cons(xh ; xt ) ,→ e2 } ⇓ v, H 0 , F 0
+     If all the variables in V was mapped to values with disjoint reachable sets, then we see that l is only in
+the reachable set of x (assuming that well-typed expressions don’t have duplicate occurences of variables,
+i.e. x ∈/ F V (e1 ) ∪ F V (e2 ). Then it follows that l ∈ g given that locations in V , R, and F are also all disjoint,
+and this is what we needed to justify the rule L:MatL. Thus we have to show that Ecopy preserves the linearity
+invariant: given a linear computation, the evaluation result is also linear.
+     First, we characterize semantically linear contexts:
+Definition 9. (Linear context) Given a context (V, H), let x, y ∈ dom(V ), x 6= y, and rx = reachH (V (x)),
+ry = reachH (V (y)). It is linear given that:
+
+    1. set(rx ), set(ry )
+    2. rx ∩ ry = ∅
+Denote this by linearCtxt(V, H).
+    Whenever linearCtxt(V, H) holds, visually, one can think of the stack as a collection of disjoint, directed
+trees with locations as nodes; consequently, there is at most one path from a variable on the stack V to any
+location in H. Now we can formalize our intuition for linear computations:
+Definition 10 (Linear computation). Given a configuration C = (V, H, R, F ) and an expression e, we say
+the 5-tuple (C, e) is a computation; it is a linear computation given the following:
+  1. dom(V ) = F V (e)
+  2. linearCtxt(V, H)
+  3. disjoint({R, F, locsV,H (e)})
+And we write linearComp(V, H, R, F, e) to denote this fact.
+
+   Given a semantically linear computation (one with no sharing between the underlying locations), the
+resulting value is linear (expressed by item 1. and 2. below):
+Lemma 12 (Linearity of Ecopy ). For all stacks V and heaps H, let V, H, R, F ` e ⇓ v, H 0 , F 0 and Σ; Γ ` e : B.
+Then given that linearComp(V, H, R, F, e), we have the follwoing:
+
+  1. set(reachH 0 (v))
+  2. disjoint({R, F 0 , reachH 0 (v)}), and
+  3. stable(R, H, H 0 )
+
+    Where stable is a predicate on P(Loc) × Heap × Heap, defined below. The premises of this lemma is a
+subset of the premises of the soundness theorem. Thus, we could have merged the proof of this lemma directly
+into the soundness proof. However, we think this makes the presentation clearer; furthermore, the linearity
+of Ecopy is an interesting in itself, regardless of the accompanying type system. Some auxiliary lemmas:
+    Define † : Lp (A) 7→ L(A) as the map that erases resource annotations. This gives a simplified jugdment
+Σ† ; Γ† ` e : B † used in proofs where the resource annotations are not necessary.
+                          q
+Lemma 13. If Σ; Γ q0 e : B, then Σ† ; Γ† ` e : B † .
+
+Proof. Induction on the typing judgement.
+
+   Define F V ? : Exp → ℘(Var), the multiset of free variables of expressions, as the usual F V inductively
+over the structure of e. This version of F V reflects the multiplicity of variable occurences.
+                          q
+Lemma 14. If Σ; Γ q0 e : B, then set(F V ? (e)) and dom(Γ) = F V (e).
+
+Proof. Induction on the typing judgement.
+Definition 11 (Stability). Given heaps H, H 0 , a set of locations is stable if ∀l ∈ R. H(l) = H 0 (l). Denote
+this by stable(R, H, H 0 ).
+Lemma 15. Let H  v 7→ a : A. For all sets of locations R, if reachH (v) ⊆ R and stable(R, H, H 0 ), then
+H 0  v 7→ a : A and reachH (v) = reachH 0 (v).
+Proof. Induction on the structure of H  v 7→ a : A.
+                                                                                                            0
+                                                               S
+Corollary 16. Let H  V : Γ. For all sets of locations R, if       x∈V reachH (V (x)) ⊆ R and stable(R, H, H ),
+then H 0  V : Γ.
+Proof. Follows from Lemma 6.
+Lemma 17 (stability of copying). Let H 0 , v 0 = copy(H, L, v). For all l ∈ H, if l ∈
+                                                                                    / L, then H(l) = H 0 (l).
+                    0
+Further, reachH 0 (v ) ⊆ L.
+
+Lemma 18 (copy is copy). Let H 0 , v 0 = copy(H, L, v). If H  v 7→ a : A, then H 0  v 0 7→ a : A.
+Lemma 19. Let A gn A1 , A2 , H  v1 : A1 , H  v2 : A2 , and H  v : A. Then ΦH (v : A) = ΦH (v1 :
+A1 ) + ΦH (v2 : A2 ) + n · |dom(reachH (v))|
+Lemma 20. Let H  V : Γ, Σ; Γ ` e : A, and V, H ` e ⇓ v, H 0 . Then H 0  v : A.
+   Now the proof for linearity of Ecopy :
+Proof. Nested induction on the evaluation judgement and the typing judgement.
+
+
+Case 1: E:Var
+
+                Suppose H  V : Γ, dom(V ) = F V (e), linearCtxt(V, H), disjoint({R, F, locsV,H (e)})
+                set(reachH (v))                                                                    (linearCtxt(V, H))
+                disjoint({R, F, reachH (v)})                                           (disjoint({R, F, locsV,H (e)}))
+                linearCtxt(V, H)                                                                                (Sp.)
+                stable(R, H, H 0 )                                                                         (H = H 0 )
+
+Case 2: E:Const* Due to similarity, we show only for E:ConstI
+
+                Suppose H  V : Γ, dom(V ) = F V (e), linearCtxt(V, H), disjoint({R, F, locsV,H (e)})
+                set(reaachH (v))                                                                    (reachH (v) = ∅)
+                disjoint({R, F, ∅})                                                                  (disjoint(R, F ))
+                linearCtxt(V, H)                                                                                (Sp.)
+                stable(R, H, H 0 )                                                                         (H = H 0 )
+
+Case 4: E:App
+Case 5: E:CondT Similar to E:MatNil
+Case 6: E:CondF Similar to E:CondT
+
+Case 7: E:Let
+
+                V, H, R, F ` let(e1 ; x : τ.e2 ) ⇓ v2 , H2 , F2                                                (case)
+                         0
+                V1 , H, R , F ` e1 ⇓ v1 , H1 , F1                                                               (ad.)
+                Σ; Γ1 , Γ2 ` let(e1 ; x : τ.e2 ) : B                                                           (case)
+                Σ; Γ1 ` e1 : A                                                                                  (ad.)
+                Suppose H  V : Γ, dom(V ) = F V (e), linearCtxt(V, H), disjoint({R, F, locsV,H (e)})
+                H  V1 : Γ1                                                         (def of W.D.E and Lemma 14)
+                By IH, we have invariant on the first premise
+                NTS (1) - (3) to instantiate invariant on the first premise
+                (1)   dom(V1 ) = F V (e1 )                                                                (def of V1 )
+                (2)   linearCtxt(V1 , H)                                             (linearCtxt(V, H) and V1 ⊆ V )
+                                  0
+                (3)   disjoint(R , F, locsV,H (e1 ))
+                F ∩ R0 = ∅                          (F ∩ locsV,H (e) = ∅ and locsV2 ,H (lam(x : τ.e2 )) ⊆ locsV,H (e))
+                F V (e1 ) ∩ F V (lam(x : τ.e2 )) = ∅                                                    (Lemma 14)
+                locsV,H (e1 ) ∩ locsV2 ,H (lam(x : τ.e2 )) = ∅                                     (linearCtxt(V, H))
+                R0 ∩ locsV,H (e1 ) = ∅                                                    (disjoint({R, locsV,H (e)}))
+                F ∩ locsV,H (e1 ) = ∅                                                                           (Sp.)
+                                            0
+                Thus we have disjoint(R , F, locsV,H (e1 ))
+By IH,
+1.(1) set(reachH1 (v1 ))
+1.(2) disjoint({R0 , F1 , reachH1 (v1 )})
+1.(3) stable(R0 , H, H1 )
+V20 , H1 , R, F1 ∪ g ` e2 ⇓ v2 , H2 , F2                                                       (ad.)
+Σ; Γ2 , x : A ` e2 : B                                                                         (ad.)
+H1  V20 : (Γ2 , x : A)                                                               (Lemma ??)
+By IH, we have invariant on the second premise
+NTS (1) - (3) to instantiate invariant on the second premise
+(1)   dom(V20 ) = F V (e2 )                                                             (def of V20 )
+(2)   linearCtxt(V20 , H1 )
+Let x1 , x2 ∈ V 20 , x1 6= x2 be arb.
+case: x1 6= x, x2 6= x
+  reachH (V20 (x1 )) ⊆ R0                          (reachH (V20 (x1 )) ⊆ locsV20 ,H (lam(x : τ.e2 )))
+  reachH (V20 (x2 )) ⊆ R0                          (reachH (V20 (x2 )) ⊆ locsV20 ,H (lam(x : τ.e2 )))
+  reachH (V20 (x1 )) = reachH1 (V20 (x1 )), reachH (V20 (x2 )) = reachH1 (V20 (x2 ))
+                                                                 (stable(R0 , H, H1 ) and Lemma 6)
+  reachH1 (V20 (x1 )) = reachH (V (x1 )), reachH1 (V20 (x2 )) = reachH (V (x2 ))
+                                                                (stable(R0 , H, H1 ) and Lemma 6)
+  linearCtxt(V20 , H1 )                                                         (linearCtxt(V, H))
+case: x1 = x, x2 6= x
+  reachH1 (V20 (x1 )) = reachH1 (v1 )                                                   (def of V20 )
+  reachH1 (V20 (x2 )) ⊆ R0                                                        (same as above)
+  set(reachH1 (v1 ))                                                                       (IH 1.1)
+  reachH1 (V20 (x2 )) = reachH (V (x2 ))                                          (same as above)
+  set(reachH1 (V20 (x2 )))                                                      (linearCtxt(V, H))
+  reachH1 (V20 (x1 )) ∩ reachH1 (V20 (x2 )) = ∅                     (disjoint({R0 , reachH1 (v1 )}))
+Thus we have linearCtxt(V20 , H1 )
+(3)   disjoint({R, F1 ∪ g, locsV20 ,H1 (e2 )})
+R ∩ F1 = ∅                                            (disjoint({R0 , F1 }) from 1.2 and R ⊆ R0 )
+R ∩ (F1 ∪ g) = ∅                                                                          (def of g)
+NTS (F1 ∪ g) ∩ locsV20 ,H1 (e2 ) = ∅
+Let l ∈ locsV20 ,H1 (e2 ) be arb.
+l ∈ reachH1 (V20 (x0 )) for some x0 ∈ V20
+case: x0 6= x
+  reachH (V2 (x0 )) = reachH1 (V20 (x0 ))                                         (same as above)
+  reachH1 (V20 (x0 )) ⊆ R0                                                              (def of R0 )
+  reachH1 (V20 (x0 )) ∩ F1 = ∅                                      (disjoint({R0 , F1 }) from 1.2)
+      0
+case: x = x
+  reachH1 (V20 (x0 )) = reachH1 (v1 )                                                   (def of V20 )
+  reachH1 (V20 (x0 )) ∩ F1 = ∅                           (disjoint({F1 , reachH1 (v1 )}) from 1.2)
+              reachH1 (V20 (x0 )) ⊆ locsV20 ,H1 (e2 )                                                 (def of locsV,H )
+              reachH1 (V20 (x0 )) ∩ g = ∅                                                                   (def of g)
+              Thus reachH1 (V20 (x0 )) ∩ (F1 ∪ g) = ∅
+              NTS R ∩ locsV20 ,H1 (e2 ) = ∅
+              Let l ∈ locsV20 ,H1 (e2 ) be arb.
+              l ∈ reachH1 (V20 (x0 )) for some x0 ∈ V20
+              case: x0 6= x
+                  reachH (V2 (x0 )) = reachH1 (V20 (x0 ))                                            (same as above)
+                  l ∈ locsV,H (e)                                                                     (def of locsV,H )
+                  l∈
+                   /R                                                            (disjoint({R, locsV,H (e)}) from 0.3)
+              case: x0 = x
+                  reachH1 (V20 (x0 )) = reachH1 (v1 )                                                      (def of V20 )
+                  reachH1 (V20 (x0 )) ∩ R = ∅                    (disjoint({R0 , reachH1 (v1 )}) from 1.2 and R ⊆ R0 )
+              Thus reachH1 (V20 (x0 )) ∩ R = ∅
+              Hence we have (3)        disjoint(R, F1 ∪ g, locsV20 ,H1 (e2 ))
+              By instantiating the invariant on the second premise , we have
+              2.(1) set(reachH2 (v2 ))
+              2.(2) disjoint({R, F2 , reachH2 (v2 )})
+              2.(3) stable(R, H1 , H2 )
+              Lastly, showing (1) - (3) holds for the original case :
+              (1)    set(reachH2 (v2 ))                                                                      (By 2.1)
+              (2)    disjoint({R, F2 , reachH2 (v2 )})                                                       (By 2.2)
+              (3)    stable(R, H1 , H2 )
+              Let l ∈ R be arb.
+              H(l) = H1 (l)                                                              (stable(R0 , H, H1 ) from 1.3)
+              H1 (l) = H2 (l)                                                           (stable(R, H1 , H2 ) from 2.3)
+              H(l) = H2 (l)
+              Hence stable(R, H, H2 )
+
+
+
+Case 8: E:Pair Similar to E:Var
+Case 9: E:MatP Similar to E:MatCons
+Case 10: E:Nil Similar to E:Const*
+
+Case 11: E:Cons
+
+            V, H, R, F ` e ⇓ l, H 00 , F 0                                                                      (case)
+            Suppose H  V : Γ, dom(V ) = F V (e), linearCtxt(V, H), disjoint({R, F, locsV,H (e)})
+            NTS (1) - (3) holds after evaluation
+            (1)   set(reachH 00 (l))
+            stable({locsV,H (e)}, H, H 00 )             (disjoint({F, locsV,H (e)}) and copy only updates l ∈ L ⊆ F )
+            reachH (V (xi )) = reachH 00 (V (xi ))                 (reachH (V (xi )) ⊆ locsV,H (e) and 6 for i = 1, 2)
+              reachH 00 (l) = {l} ∪ reachH 00 (V (x1 )) ∪ reachH 00 (V (x2 ))                                  (def of reachH )
+              set(reachH 00 (l))                                                        (l ∈
+                                                                                           / locsV,H (e) and linearCtxt(V, H))
+              (2)         disjoint({R, F 0 , reachH 00 (l)})
+              R ∩ F0 = ∅                                                                       (F 0 ⊆ F and disjoint({R, F }))
+              R ∩ reachH 00 (l) = ∅                                                     (l ∈ F and disjoint({R, locsV,H (e)}))
+                0
+              F ∩ reachH 00 (l) = ∅                                                   (F 0 ⊆ F and disjoint({F, locsV,H (e)}))
+                                                           0
+              Thus we have (2)             disjoint({R, F , reachH 00 (l)})
+                                           00
+              (3)         stable(R, H, H )                             (since copy only updates l ∈ L ⊆ F and F ∩ R = ∅)
+
+
+Case 12: E:MatNil
+
+        Suppose H  V : Γ, dom(V ) = F V (e), linearCtxt(V, H), disjoint({R, F, locsV,H (e)})
+        Σ; Γ0 ` e1 : B                                                                                                      (ad.)
+        V 0 , H, R, F ∪ g ` e1 ⇓ v, H 0 , F 0                                                                               (ad.)
+                     0        0
+        HV :Γ                                                                                                  (def of W.D.E)
+        By IH, we have invariant on the premise
+        NTS (1) - (3) to instantiate invariant on the premise
+        (1)     dom(V 0 ) = F V (e1 )                                                                                (def of V 0 )
+                                     0
+        (2)     linearCtxt(V , H)                                                              (linearCtxt(V, H) and V 0 ⊆ V )
+        (3)     disjoint({R, F, locsV 0 ,H (e1 )})             (disjoint({R, F, locsV,H (e)}) and locsV 0 ,H (e1 ) ⊆ locsV,H (e))
+        Instantiating invariant on premise ,
+        (1)     set(reachH 0 (v))
+        (2)     disjoint({R, F1 , reachH 0 (v)})
+        (3)     stable(R, H, H 0 )
+
+Case 13: E:MatCons
+
+                    V (x) = l                                                                                               (ad.)
+                    H(l) = hvh , vt i                                                                                       (ad.)
+                    Γ = Γ0 , x : L(A)                                                                                       (ad.)
+                    Σ; Γ0 , xh : A, xt : L(A) ` e2 : B                                                                      (ad.)
+                         00                                    0
+                    V , H, R, F ∪ g ` e2 ⇓ v2 , H2 , F                                                                      (ad.)
+                    Suppose H  V : Γ, dom(V ) = F V (e), linearCtxt(V, H), disjoint({F, R, locsV,H (e)})
+                    H  V (x) : L(A)                                                                            (def of W.D.E)
+                    H  vh : A, H  vt : L(A)
+                    H  V 00 : Γ0 , xh : A, xt : L(A)                                                           (def of W.D.E)
+                    By IH, we have invariant on the premise
+                    NTS (1) - (3) to instantiate invariant on the premise
+                    (1)       dom(V 00 ) = F V (e2 )                                                                (def of V 00 )
+                    (2) linearCtxt(V 00 , H)
+                    Let x1 , x2 ∈ V 00 , x1 6= x2 , rx1 = reachH (V 00 (x1 )), rx2 = reachH (V 00 (x2 ))
+                    case: x1 ∈
+                             / {xh , xt }, x2 ∈
+                                              / {xh , xt }
+                         (1), (2) from linearCtxt(V, H)
+case: x1 = xh , x2 ∈
+                   / {xh , xt }
+  set(rx1 )                                     (since set(reachH (V (x))) from linearCtxt(V, H))
+  set(rx2 )                                                                (since linearCtxt(V, H))
+  x2 ∈ F V (e)                                                                         (def of F V )
+  reachH (V (x)) ∩ rx2 = ∅                                    (def of reach and linearCtxt(V, H))
+  hence rx1 ∩ rx2 = ∅
+case: x1 = xh , x2 = xt
+  set(rx1 ) since set(reachH (V (x))) from linearCtxt(V, H)
+  set(rx2 ) since set(reachH (V (x))) from linearCtxt(V, H)
+  rx1 ∩ rx2 = ∅                                                                (set(reachH (V (x)))
+case: otherwise
+  similar to the above
+Thus we have linearCtxt(V 00 , H)
+(3) disjoint({R, F ∪ g, locsV 00 ,H (e2 )})
+(F ∪ g) ∩ R = ∅                                                (since F ∩ R = ∅ and by def of g)
+NTS R ∩ locsV 00 ,H (e2 ) = ∅
+Let l0 ∈ locsV 00 ,H (e2 ) be arb.
+case: l0 ∈ reachH (V 00 (x0 )) for some x0 ∈ F V (e2 ) where x0 ∈
+                                                                / {xh , xt }
+  x0 ∈ V                                                                               (def of V 00 )
+  l0 ∈ reachH (V (x0 ))
+  x0 ∈ F V (e)                                                                         (def of F V )
+  l0 ∈ locsV,H (e)                                                                 (def of locsV,H )
+  l0 ∈
+     /R                                                              (disjoint({R, F, locsV,H (e)}))
+         0                     00
+case: l ∈ reachH (V (xh ))
+  l0 ∈ reachH (vh )
+  l0 ∈ reachH (V (x))                                                               (def of reach)
+   0
+  l ∈ locsV,H (e)                                                                  (def of locsV,H )
+   0
+  l ∈
+    /R                                                         (since disjoint({F, R, locsV,H (e)}))
+         0                     00
+case: l ∈ reachH (V (xt ))
+  similar to above
+Hence R ∩ locsV 00 ,H (e2 ) = ∅
+F ∩ locsV 00 ,H (e2 ) = ∅                                                       (Similar to above)
+g ∩ locs V 00 ,H   (e2 ) = ∅                                                            (def. of g)
+(F ∪ g) ∩ locsV 00 ,H (e2 ) = ∅
+Thus disjoint({R, F ∪ g, locsV 00 ,H (e2 )})
+Instantiating invariant on the premise,
+(1)    set(reachH 0 (v))
+(2)    disjoint({R, F 0 , reachH 0 (v)})
+(3)    stable(R, H, H 0 )
+Case 13: E:Share
+
+       e = share x as x1 , x2 in e0                                                                                      (case)
+       Suppose H  V : Γ, dom(V ) = F V (e), linearCtxt(V, H), disjoint({R, F, locsV,H (e)})                      (def. of wfc)
+                                0           00
+       Let V2 = (V [x1 7→ v , x2 7→ v ]) F V (e0 )
+       We show the subsequent computation is also well-formed to invocate the IH:
+       (1)   dom(V2 ) = F V (e0 )                                                           (dom(V ) = F V (e) and def of F V )
+                                        0           00
+       (2)   linearCtxt((V [x1 7→ v , x2 7→ v ]) F V (e0 ) , H)
+          Let x0 7→ v 000 ∈ V 0 [x1 7→ v 0 ].STS reachH 0 (v 000 ) ∩ reachH 0 (v 00 ) = ∅
+          reachH 0 (v 00 ) ⊆ L ⊆ F                                                                         (definition of copy)
+          reachH 0 (v 000 ) ⊆ locsV 0 [x1 7→v0 ],H 0 (e0 ) ⊆ locsV,H (e)                                        (By Lemma 7)
+          but since F ∩ locsV,H (e) = ∅, we have the result.                                        (linearComp(V, H, R, F, e))
+                                                   0
+       (3) disjoint({R, F \ L, locsV2 ,H 0 (e )})
+          Disjointedness involving F follows from assumption. Last one follows since locsV2 ,H 0 (e0 ) ⊆ locsV,H (e) ∪ L
+       By IH:
+       (1) set(reachH 00 (v))
+       (2) disjoint({R, F 0 , reachH 00 (v)})
+       (3) stable(R, H 0 , H 00 )
+       STS stable(R, H, H 0 ), which follows from L ∩ R = ∅ and Lemma 7
+
+
+
+
+C       Soundness
+                                                                    q
+Theorem 21 (Soundness). let Ho  Vo : Γ, Σ; Γ q0 e : B, Vo , Ho ` e ⇓ vo , Ho0 . Then ∀C ∈ Q+ and
+configuration V, H, R, F s.t.
+
+    1. Vo , Ho ∼ V, H
+    2. dom(V ) = F V (e)
+    3. linearCtxt(V, H)
+    4. disjoint({R, F, locsV,H (e)})
+
+    5. |F | ≥ ΦV,H (Γ) + q + C
+then there exists a triple (v, H 0 , F 0 ), and a freelist F 0 s.t.
+    1. V, H, R, F ` e ⇓ v, H 0 , F 0
+             H0
+    2. vo ∼Ho0 v
+    3. |F 0 | ≥ ΦH 0 (v : B) + q 0 + C
+Call this the existence clause.
+
+Proof. Nested induction on the evaluation judgement and the typing judgement.
+Case 1: E:Var
+     Vo , Ho ` x ⇓ Vo (x), Ho                                                                                     (case)
+                q
+     Σ; x : B   q   x:B                                                                                           (case)
+                    +
+     Let C ∈ Q , well-formed configuration V, H, R, F s.t. Vo , Ho ∼ V, H and |F | ≥ ΦV,H (x : B) + q + C
+     NTS the conclusions for the existence clause:
+     (1) V, H, R, F ` e ⇓ V (x), H, F                                                                            (E:Var)
+     (2) Vo (x) ∼H
+                 H V (x)
+                   o
+                                                                                                           (assumption)
+     (3) And we have F ≥ ΦV,H (x : B) + q + C
+        = ΦH (V (x) : B) + q + C                                                                        (definition of Φ)
+
+
+Case 2: E:Const* Similar to E:Var
+Case 4: E:App
+     Vo , Ho ` f (x) ⇓ vo , Ho0                                                                                   (case)
+     Vo (x) = vo0                                                                                        (admissibility)
+     Let P (f ) = (yf , ef )
+     [yf 7→ vo0 ], Ho ` ef ⇓ vo , Ho0                                                                    (admissibility)
+                q
+     Σ; x : A q0 f (x) : B                                                                                        (case)
+                          0
+                    q/q
+     Σ(f ) = A −−→ B                                                                                     (admissibility)
+                    +
+     Let C ∈ Q , well-formed configuration V, H, R, F s.t. Vo , Ho ∼ V, H and |F | ≥ ΦV,H (x : A) + q + C
+                    q
+     Σ; yf : A q0 ef : B
+     Let V (x) = v 0 , g = collect(R, locsV,H (ef ), H, F )
+     By IH on [yf 7→ v 0 ], H, R, F ∪ g, have the existence clause. NTS the following conditions:
+     (1) [yf 7→ vo0 ], Ho ∼ [yf 7→ v 0 ], H                                                    (vo0 ∼H   0
+                                                                                                     H v by assumption)
+                                                                                                       o
+
+
+     (2) - (4) Have by assumption
+     (5) NTS |F ∪ g| ≥ Φ[yf 7→v0 ],H (x : A) + q + C
+       STS |F | ≥ Φ[yf 7→v0 ],H (yf : A) + q + C
+       |F | ≥ ΦV,H (x : A) + q + C
+        = ΦH (v 0 : A) + q + C
+        = Φ[yf 7→v0 ],H (yf : A) + q + C
+     Applying the existence clause and E:App, we’re done.
+
+Case 5: E:CondT
+                                   Γ = Γ0 , x : bool                                                               (ad.)
+                                                  0
+                                   HV :Γ                                                                (def of W.F.E)
+                                        0   q
+                                   Σ; Γ     q0
+                                                 et : B                                                            (ad.)
+                                   V, H, R, F ∪ g ` et ⇓ v, H 0 , F 0                                              (ad.)
+                                                      0                                   0
+                                   |F ∪ g| − |F | ≤ ΦV,H (Γ) + q − (Φ     H0   (v : B) + q )                        (IH)
+                                   |F | − |F 0 | ≤ ΦV,H (Γ) + q − (ΦH 0 (v : B) + q 0 )
+Case 6: E:CondF Similar to E:CondT
+Case 7: E:Let
+    Vo , Ho ` e ⇓ vo00 , Ho00                                                                           (case)
+    Vo0 = Vo dom(F V (e1 )                                                                              (ad.)
+    Vo0 , Ho ` e1 ⇓ vo0 , Ho0                                                                            (ad.)
+           q
+    Σ; Γ q0 let(e1 ; x : τ.e2 ) : B                                                                     (case)
+    Γ = Γ1 , Γ2                                                                                          (ad.)
+          q
+    Σ; Γ1 p e1 : A                                                                                       (ad.)
+    H  Vo0 : Γ1                                                                                    (def of )
+               +
+    Let C ∈ Q , well-formed configuration V, H, R, F s.t. Vo , Ho ∼ V, H and |F | ≥ ΦV,H (Γ) + q + C
+    NTF v2 , H2 , F2 s.t.
+       1.V, H, R, F ` e ⇓ v2 , H2 , F2 and
+                H 00
+       2.vo00 ∼Ho2 v2
+       3.|F2 | ≥ ΦH2 (v2 : B) + q 0 + C
+    Let R0 = R ∪ locsV,H (F V (e2 ) \ {x})
+    disjoint({R0 , F, locsV,H (e1 )})                                          (Similar to case in Lemma 10)
+    Let V1 = V dom(F V (e1 )
+    Instantiate IH with C = C + ΦV2 ,H (Γ2 ), V = V1 , H = H, F = F, R = R0
+        we get existence clause on the first premise
+    NTS (1) - (4) to instantiate existence clause on the first premise:
+    (1) Vo0 , Ho ∼ V1 , H                                                                        (assumption)
+    (2) - (4)Same as in 10
+    (4) |F | ≥ ΦV1 ,H (Γ1 ) + q + C + ΦV,H (Γ2 )
+                                             (|F | ≥ ΦV,H (Γ) + q + C and ΦV,H (Γ) ≥ ΦV1 ,H (Γ1 ) + ΦV,H (Γ2 ))
+    Instantiating existence clause on the first premise , we get v1 , H1 , F1 s.t.
+       Fact 1. V1 , H, R0 , F ` e1 ⇓ v1 , H1 , F1
+                        H0
+       Fact 2. vo0 ∼Ho1 v1
+       Fact 3. |F1 | ≥ ΦH1 (v1 : A) + p + C + ΦV2 ,H1 (Γ2 )
+    For the second premise:
+    Vo00 = (Vo [x 7→ vo0 ]) F V (e2 )                                                                   (ad.)
+    Vo00 , Ho0 ` e2 ⇓ vo00 , Ho00                                                                        (ad.)
+                    p
+    Σ; Γ2 , x : A q0 e2 : B                                                                              (ad.)
+    H1  vo0 : A                                                                       (By Lemma 6 and ??)
+    H1  V2 : Γ2 , x : A                                                                            (def of )
+    Let V2 = (V [x 7→ v1 ]) F V (e2 )
+    Let g = {l ∈ H1 | l ∈
+                        / F1 ∪ R ∪ locsV2 ,H1 (e2 )}
+    Instantiate IH with C = C, V = V2 , H = H1 , F = F1 ∪ g, R = R, we get existence clause on the second premise
+    NTS (1) - (4) to instantiate existence clause on the second premise:
+    (1) Vo00 , Ho0 ∼ V2 , H1                                                         (assumption and Fact 2.)
+    (2) - (4) Same as Lemma 10
+     (5) |F1 ∪ g| ≥ ΦV2 ,H1 (Γ2 , x : A) + p + C
+        STS |F1 | ≥ ΦV2 ,H1 (Γ2 , x : A) + p + C
+        Have |F1 | ≥ ΦV2 , H1 (Γ2 ) + ΦH1 (v1 : A) + p + C                                                 (By Fact 3.)
+     Instantiate the existence clause on the second premise and apply E:Let and we’re done
+
+
+
+Case 8: E:Pair Similar to E:Const*
+Case 9: E:MatP Similar to E:MatCons
+Case 10: E:Nil Similar to E:Const*
+Case 11: E:Cons
+
+                           Vo , Ho ` cons(x1 ; x2 ) ⇓ lo , Ho0                                                   (case)
+                           Ho0 (lo ) = hVo (x1 ), Vo (x2 )i                                              (admissibility)
+                                                            q+p+1
+                           Σ; x1 : A, x2 : Lp (A)             q   cons(x1 ; x2 ) : Lp (A)
+                           Let C ∈ Q+ , well-formed configuration V, H, R, F s.t.
+                                Vo , Ho ∼ V, H and |F | ≥ ΦV,H (x1 : A, x2 : Lp (A)) + (q + p + 1) + C
+                           Let v = hV (x1 ), V (x2 )i, l ∈ F, H 0 = H{l 7→ v}, F 0 = F \ {l}
+                           (1) V, H, R, F ` cons(x1 ; x2 ) ⇓ l, H 0 , F 0                                     (E:Cons)
+                                        Ho0
+                           (2) lo ∼     H0    l                                                           (assumption)
+                                    0                   p
+                           (3 |F | ≥ Φ        H0   (l : L (A)) + q + C
+                                |F | ≥ ΦV,H (x1 : A, x2 : Lp (A)) + (p + q + 1) + C
+                                = ΦH 0 (l : Lp (A)) + q + 1 + C
+                                |F 0 | = |F | − 1 ≥ ΦH 0 (l : Lp (A)) + q + C
+
+
+
+Case 12: E:MatNil Similar to E:Cond*
+Case 13: E:MatCons
+
+     Vo (x) = lo                                                                                                  (ad.)
+     Ho (lo ) = hvo0 , vo00 i                                                                                     (ad.)
+            0        p
+     Γ = Γ , x : L (A)                                                                                            (ad.)
+          0                     p       q+p+1
+     Σ; Γ , xh : A, xt : L (A)       q0
+                                            e2 : B                                                                (ad.)
+     Vo0 = (Vo [xh 7→ vo0 , xt 7→ vo00 ]) F V (e2 )                                                              (ad.)
+     Vo0 , Ho ` e2 ⇓ vo , H 0                                                                                     (ad.)
+                    p
+     H  V (x) : L (A)                                                                                        (def of )
+     H  vh : A, H  vt : Lp (A)                                                                     (Inversion on )
+     H  Vo0 : Γ0 , xh : A, xt : Lp (A)                                                                  (def of W.D.E)
+                +
+     Let C ∈ Q , well-formed configuration V, H, R, F s.t. Vo , Ho ∼ V, H and |F | ≥ ΦV,H (Γ) + q + C
+     NTF v, H 0 , F 0 s.t.
+        1.V, H, R, F ` e ⇓ v, H 0 , F 0 and
+                 H0
+        2.vo ∼Ho0 v
+      2.|F 0 | ≥ ΦH 0 (v : B) + q 0 + C
+    Let V (x) = l
+    H(l) = hvh , vt i                                                                   (lo ∼H
+                                                                                             H l by assumption)
+                                                                                               o
+
+
+    Let V 0 = (V [xh 7→ vh , xt 7→ vt ]) F V (e2 )
+    Let g = {l ∈ H | l ∈
+                       / F ∪ R ∪ locsV 0 ,H (e2 )}
+    NTS g nonempty, in particular, that l ∈ g
+      l∈
+       / F ∪R                                                    (l ∈ locsV,H (e) and disjoint({R, F, locsV,H (e)}))
+      AFSOC l ∈ locs      V 0 ,H   (e2 )
+      Then l ∈ reachH (V 0 (x0 )) for some x0 ∈ dom(V 0 )
+    case x0 ∈ {xh , xt } :
+      WLOG let x0 = xh
+      But then reachH (V (x))(l) ≥ 2 and set(reach( V (x))) doesn’t hold
+    case x0 ∈
+            / {xh , xt } :
+      x0 ∈ dom(V )
+      x = x0                                                            (l ∈ reachH (V (x)) and linearCtxt(V, H))
+                                           0
+    Contradiction, x ∈
+                     / domv(V )
+      l∈
+       / locsV 00 ,H (e2 )
+    Hence l ∈ g
+    By IH with C 0 = C, V = V 0 , H = H, R = R, F1 = F ∪ g we have the existence clause. NTS the following:
+    (1) Vo0 , Ho ∼ V 0 , H                                                                           (assumption)
+    (2) - (4) Same as Lemma 10
+    (5) |F1 | ≥ ΦV 0 ,H (Γ0 , xh : A, xt : Lp (A)) + q + p + 1 + C :
+      |F1 | = |F ∪ g|
+       = |F | + |g|                                                                             (F and g disjoint)
+       ≥ ΦV,H (Γ) + q + C + |g|                                                                      (assumption)
+                    0                      p
+       = ΦV,H (Γ , xh : A, xt : L (A)) + q + p + C + |g|                                          (definition of Φ)
+                    0                      p
+       = ΦV,H (Γ , xh : A, xt : L (A)) + q + p + 1 + C                                               (g nonempty)
+                                               0   0
+      By existence clause have v, H , F s.t.
+      Fact 1 .V 0 , H, R, F ∪ g ` e2 ⇓ v, H 0 , F 0
+      Fact 2 .|F 0 | ≥ ΦH 0 (v : B) + q 0 + C
+    Apply E:MatCons and we’re done
+
+Case 14: E:Share
+
+    Vo , Ho ` share x as x1 , x2 in e0 ⇓ vo , Ho0                                                            (case)
+    Vo (x) = vo0                                                                                              (ad.)
+    Vo0 = (Vo [x1 7→ vo0 , x2 7→ vo0 ]) F V (e0 )
+    Vo0 , Ho ` e0 ⇓ vo , Ho0                                                                                   (ad)
+                  q
+    Σ; Γ, x : A q0 share x as x1 , x2 in e0 : B                                                              (case)
+    A g A1 , A2 , 1                                                                                           (ad.)
+                              q      0
+    Σ; Γ, x1 : A1 , x2 : A2 q0 e : B                                                                          (ad.)
+                +
+    Let C ∈ Q , well-formed configuration V, H, R, F s.t. Vo , Ho ∼ V, H and |F | ≥ ΦV,H (Γ, x : A) + q + C
+         NTF v, H 00 , F 00 s.t.
+           1.V, H, R, F ` e ⇓ v, H 00 , F 00 and
+                   H0
+           2.vo ∼Ho00 v
+           3.|F 00 | ≥ ΦH 00 (v : B) + q 0 + C
+         Let V (x) = v 0 , L ⊆ F, |L| = |dom(reachH (v 0 ))|, H 0 , v 00 = copy(H, L, v 0 ), V 0 = (V [x1 7→ v 0 , x2 7→ v 00 ]) F V (e)
+           F 0 = F \ L, g = {l ∈ H | l ∈
+                                       / F 0 ∪ R ∪ locsV 0 ,H 0 (e)}
+         By IH with C, V 0 , H 0 , R, F 0 ∪ g, have the existence clause. NTS the following:
+         (1) Vo0 , Ho ∼ V 0 , H 0                                                             (By Lemma 7 and assumption)
+         (2) - (4) same as lemma 10
+         (5) |F 0 ∪ g| ≥ ΦV 0 ,H 0 (Γ, x1 : A1 , x2 : A2 ) + q + C
+         STS |(F \ L) ∪ g| ≥ ΦV 0 ,H 0 (Γ, x1 : A1 , x2 : A2 ) + q + C
+             ⇐⇒ (|F | − |L|) + |g| ≥ ΦV 0 ,H 0 (Γ) + ΦV 0 ,H 0 (x1 : A1 ) + ΦV 0 ,H 0 (x2 : A2 ) + q + C
+           STS |F | ≥ ΦV 0 ,H 0 (Γ) + ΦV 0 ,H 0 (x1 : A1 ) + ΦV 0 ,H 0 (x2 : A2 ) + |L| + q + C
+             ⇐⇒ |F | ≥ ΦV 0 ,H 0 (Γ) + ΦV,H (x : A) + q + C                                                       (By Lemma 9)
+             ⇐⇒ |F | ≥ ΦV,H (Γ, x : A) + q + C                                                                    (By Lemma 7)
+         Instantiate the existence clause and apply E:Share, and we’re done
+
+
+
+
+D         Ecopy over-approximates Egc
+Definition 12. A configuration (V, H, R, F ) is well-formed if
+
+      1. dom(H) ⊆ reachH (V ) ∪ R ∪ F
+      2. reachH (V ) ∪ R ⊆ dom(H) \ F
+      3. collect(R, reachH (V ), H, F ) = ∅
+  For a context (V, H, R, F ), denote the garbage w.r.t. a set of locations L as collect(R, L, H 0 , F 0 ) = {l ∈
+  0
+    / F 0 ∪ R ∪ L}.
+H |l∈
+Lemma 22. Given a well-formed context (V, H, R, F ) and V, H, R, F ` e ⇓ v, H 0 , F 0 , dom(H 0 ) ⊆
+reachH (v) ∪ R ∪ F 0 , reachH (v) ∪ R ⊆ dom(H 0 ) \ F 0 and collect(R, reach0H (v), H 0 , F 0 ) = ∅.
+      Now consider two well-formed configurations C1 = (V1 , H1 , R1 , F1 ), C2 = (V2 , H2 , R2 , F2 ).
+
+    A mapping f : A → P(B)    S    is a partition on B the image of A forms a disjoint union of B (e.g.
+∀x, y ∈ A, f (x) ∩ f (y) = ∅ ∧ f (A) = B). Furthermore, a partition is proper if for any x ∈ A, f (x) 6= ∅.
+Given a proper partition f , we can choose an arbitrary b ∈ f (a) to be the representation for that part; call
+this singlet set {b} rep(a).
+
+    A simple corollary is the fact that if V2 , H2 Uis a linear context (e.g. linearCtxt(V2 , H2 ) holds), then
+|γ(l)| = |(reachH1 (V1 ))(l)|, where reachH1 (V1 ) = x∈dom(V ) reachH1 (x). In general for a multiset S, when
+this holds, we say that γ is a counting partition for S.
+
+     For a partition f : A → P(B), we write the set of equivalence classes as ec(f ) = {f (x) | x ∈ A} = f (A),
+i.e. the image of f on its domain A.
+Definition 13. Let dir be the set {L,R,N}, denoting left, right, and next respectively. We can index values
+via directions:
+
+                                         getH (Just(hv1 , v2 i, L)) = Just(v1 )
+                                        getH (Just(hv1 , v2 i, R)) = Just(v2 )
+                                           getH (Just(hv1 , v2 i),) = N one
+                                                getH (Just(l), N) = Just(H(l))
+                                                getH (Just(l), ) = N one
+                                                        getH (r, ) = r
+
+Let P be a sequence of directions. Extend get to sequence of directions:
+
+                                      f indH (v, D :: P ) = f indH (getH (v, D), P )
+                                           f indH (v, []) = v
+
+Call P valid w.r.t. a value v if f indH (v, P ) = Just(v 0 ) for some v 0 . Write VH (x; P ) for f romJust(f indH (V (x), P ))
+given a valid sequence P w.r.t. V (x), and reachH (V (x; P )) for reachH (VH (x; P )).        U Given a map m : X →
+S(dir) from varibles to valid sequences of directions, Define reachP athV,H (X, m) = x∈X reachH (V (x; m(x))).
+Lemma 23. Let V1 , H1 ∼ V2 , H2 . Then for all x ∈ dom(V1 ) and sequence of directions P , Either
+f indH1 (V1 (x), P ) = f indH2 (V2 (x), P ) = N one or f indH1 (V1 (x), P ) = v1 , f indH2 (V2 (x), P ) = v2 and
+v 1 ∼H
+     H 2 v2
+       1
+
+
+
+Proof. Induction on length of P and then H ` v 7→ a : A.
+Definition 14. A configuration C2 = (V2 , H2 , R2 , F2 ) is a copy extension of another configuration C1 =
+(V1 , H1 , R1 , F1 ) iff
+   1. V1 , H1 ∼ V2 , H2
+   2. There is a proper partition γ : dom(H1 ) \ F1 → P(dom(H2 ) \ F2 ) such that for all l ∈ dom(γ),
+      |γ(l)| = reachH1 (V1 )(l) + R1 (l)
+   3. for all l ∈ dom(γ), x ∈ dom(V1 ), valid sequence of directions P w.r.t. V1 (x), |reachH2 (V2 (x; P ))∩γ(l)| =
+      reachH1 (V1 (x; P ))(l).
+   4. for all l ∈ dom(γ), |γ(l) ∩ R2 | = R1 (l)
+                                              S
+   5. |F1 | = |F2 | + | (γ)|, where (γ) = P ∈ec(γ) C \ rep(C)
+Write this as C1  C2 .
+   Note that  is reflexive. Now the key lemma:
+Lemma 24. Let (C2 , e) be a linear computation. Given that C2 `copy e ⇓ v, H 0 , F 0 , for all well-formed
+configurations C1 such that C1  C2 , there is exists a triple (w, Y 0 , M 0 ) ∈ Val × Heap × Loc and γ 0 : dom(Y 0 ) \
+M 0 → P(dom(H 0 ) \ F 0 ) s.t.
+   1. C1 `free e ⇓ w, Y 0 , M 0
+            0
+   2. v ∼H
+         Y0 w
+
+   3. γ 0 is a proper partition, such that for all l ∈ dom(γ 0 ), |γ 0 (l)| = reachY1 (w1 )(l) + S(l)
+   4. For all P valid w.r.t. v, |reachH 0 (f indH 0 (v; P )) ∩ γ 0 (l)| = reachY 0 (f indY 0 (w; P ))(l)
+   5. l ∈ dom(γ 0 ), γ 0 (l) ∩ R = γ(l) ∩ R
+   6. |M 0 | = |F 0 | + |   (γ 0 )|
+Lemma 25. Let V2 , H2 , R2 , F2 `copy e ⇓ v, H 0 , F 0 , and V1 , H1 , R1 , F1  V2 , H2 , R2 , F2 because (−, γ, η, −, −).
+Then the following hold: for all l ∈ dom(H1 ) \ F1 , X ⊆ dom(V ), m : X → S(dir), l ∈ dom(γ), γ(l) ⊆
+collect(R2 , C2 , reachP athV2 ,H2 (X, m), H2 , F2 ) iff l ∈ collect(R1 , reachP athV1 ,H1 (X, m), H1 , F1 ).
+Proof. =⇒
+
+                  γ(l) ∩ (F2 ∪ R2 ∪ reachP athV2 ,H2 (X, m)) = ∅                                    (definition of clean)
+                  NTS l ∈
+                        / F1 ∪ R1 ∪ reachH1 (X)
+                  (1) l ∈
+                        / F1                                                                               (assumption)
+                  (2) l ∈
+                        / R1
+                     Know γ(l) ∩ R2 = ∅
+                     |γ(l) ∩ R2 | = R1 (l) = 0                                                       (condition 4. of )
+                     l∈
+                      / R1
+                  (3) l ∈
+                        / reachP athV1 ,H1 (X, m)
+                     Know γ(l) ∩ reachP athV2 ,H2 (X, m) = ∅
+                     Let x ∈ X
+                     γ(l) ∩ reachH2 (V2 (x; m(x))) = ∅
+                     |γ(l) ∩ reachH2 (V2 (x; m(x)))| = reachH1 (V1 (x; m(x)))(l)                     (condition 3. of )
+                     reachH1 (V1 (x; m(x)))(l) = 0
+                     reachP athV1 ,H1 (X, m)(l) = 0
+                     l∈
+                      / reachP athV1 ,H1 (X, m)
+                     Thus, l ∈ collect(R1 , reachP athV1 ,H1 (X, m), H1 , F1 )
+
+⇐=
+
+                  l∈
+                   / (F1 ∪ R1 ∪ reachP athV1 ,H1 (X, m))
+                  NTS γ(l) ∩ (F2 ∪ R2 ∪ reachP athV2 ,H2 (X, m)) = ∅
+                  (1) γ(l) ∩ F2 = ∅                                                                        (assumption)
+                  (2) γ(l) ∩ R2 = ∅
+                     |γ(l) ∩ R2 | = R1 (l)                                                           (condition 4. of )
+                      =0                                                                                   (assumption)
+                     γ(l) ∩ R2 = ∅
+                  (3) γ(l) ∩ reachP athV2 ,H2 (X, m) = ∅
+                    Let x ∈ X
+                     |γ(l) ∩ reachH2 (V2 (x; m(x)))| = reachH1 (V1 (x; m(x)))(l)                     (condition 3. of )
+                      =0                                                                                   (assumption)
+                     γ(l) ∩ reachH2 (V2 (x; m(x))) = ∅
+                     γ(l) ∩ reachP athV2 ,H2 (X, m) = ∅
+                     γ(l) ∩ (F2 ∪ R2 ∪ reachP athV2 ,H2 (X, m)) = ∅
+                     γ(l) ∈ collect(R2 , reachP athV2 ,H2 (X, m), H2 , F2 )
+
+
+
+Lemma 26. Given a proper partition γ : dom(Y ) \ M → P(dom(H) \ F ), equivalent values v ∼H
+                                                                                          Y w, and
+the following:
+  1. L ⊆ F
+  2. |L| = |dom(reachH (v))|
+  3. H 0 , v 0 = copy(H, L, v)
+  4. F 0 = F \ L
+
+there is a proper partition γ 0 : dom(Y )\M → P(dom(H)\F 0 ) s.t. |γ 0 (l)| = |γ(l)|+reachY (w)(l), |reachH (v)∩
+γ 0 (l)| = |reachH (v 0 ) ∩ γ 0 (l)| = |reachH (v) ∩ γ(l)|.
+Proof. Induction on copy.
+   Now the proving Ecopy over approximates Egc :
+
+Proof. Induction on the evaluation judgement.
+
+
+Case 1: E:Var Trivial
+Case 2: E:Const* Trivival
+
+Case 4: E:App Similar to E:CondT
+Case 5: E:CondT
+
+     V, H, R, F `Ecopy if(x; e1 ; e2 ) ⇓ v, H 0 , F 0                                                        (case)
+     Let W, Y, S, M  V, H, R, F
+     Let W 0 = W dom(V 0 )
+     Let j = {l ∈ Y |l ∈
+                       / M ∪ S ∪ locsW,Y (e1 )}
+     NTS W 0 , Y, S, M ∪ j  V 0 , H, R, F ∪ g
+     (1)    W 0, Y ∼ V 0, H                                                                         (W, Y ∼ V, H)
+                                             0
+     (2)    NTF a proper partition γ : dom(Y ) \ (M t j) → P(dom(H) \ (F ∪ g))
+        Let γ 0 (l) = γ dom(Y )\(M tj) (l) \ g
+        First, show γ 0 is a partition
+        Let l, l0 ∈ dom(Y ) \ (M t j)
+        γ 0 (l) ∩ γ 0 (l0 ) = ∅                                                                     (γ is partition)
+        γ 0 (dom(Y ) \ (M t j)) = γ(dom(Y ) \ (M t j)) \ g
+                 G              G
+         =(              γ(l) \   γ(l)) \ g
+             l∈dom(Y )\M          l∈j
+                                  G
+         = ((dom(H) \ F ) \ (           γ(l))) \ g                                                  (γ is partition)
+                                  l∈j
+                                                                                       F
+         = (dom(H) \ F ) \ g                                                       (       l∈j γ(l) ⊆ g by lemma 4)
+         = dom(H) \ (F t g)
+        Hence γ 0 is a partition
+        γ 0 is also proper:
+        Let l ∈ dom(Y ) \ (M t j)
+        γ 0 (l) = γ(l) \ g
+        AFSOC γ(l) ⊆ g
+        l∈j                                                                                         (By Lemma 4)
+  Contradiction since assumed l ∈
+                                /j
+  Now, NTS |γ 0 (l)| = reachY (W 0 )(l) + S(l)
+  Let l ∈ dom(γ 0 )
+  γ 0 (l) = γ(l) \ g                                                                                      (definition)
+      0
+  |γ (l)| = |γ(l)| − |γ(l) ∩ g|
+   = reachY (W )(l) + S(l) − |γ(l) ∩ g|
+  g = reachH (V dom(V )\F V (e1 ) )
+  |γ(l) ∩ g| = reachY (W dom(W )\F V (e1 ) )(l)                                                   (condition 3. of )
+               0
+  Thus, |γ (l)| = reachY (W )(l) + S(l) − reachY (W dom(W )\F V (e1 ) )(l)
+   = reachY (W F V (e1 ) )(l) + S(l)
+   = reachY (W 0 )(l) + S(l)
+(3) Let l ∈ dom(γ 0 ), x ∈ dom(W 0 ), P valid sequence w.r.t. W 0 (x). NTS
+|reachH (V 0 (x; P )) ∩ γ 0 (l)| = reachY (W 0 (x; P ))(l)
+  STS |reachH (V 0 (x; P )) ∩ (γ(l) \ g)| = reachY (W 0 (x; P ))(l)
+  g ∩ reachH (V 0 (x; P )) = ∅                                                                        (definition of g)
+                   0                                       0
+  |reachH (V (x; P )) ∩ (γ(l) \ g)| = |(reachH (V (x; P )) \ g) ∩ γ(l)|
+   = |reachH (V 0 (x; P )) ∩ γ(l)|
+   = |reachH (V (x; P )) ∩ γ(l)|
+   = reachY (W (x; P ))(l)                                                                         (condition 3. of )
+                       0
+   = reachY (W (x; P ))(l)
+(4)       S ⊆ dom(Y ) \ (M ∪ j) since S ∩ j = ∅
+  Let l ∈ S. NTS |γ 0 (l) ∩ R| = S(l)
+  STS |(γ(l) \ g) ∩ R| = S(l)
+  (γ(l) \ g) ∩ R = γ(l) ∩ (R \ g)
+   = γ(l) ∩ R                                                                                             (g ∩ R = ∅)
+  |γ(l) ∩ R| = S(l)                                                                                (condition 4. of )
+(5)       NTS |M ∪ j| = |F ∪ g| + |       (γ 0 )|
+  STS |M | + |j| = |F | + |g| + |         (γ 0 )|
+  By assumption , |M | = |F | + |             (γ)|
+  STS |j| + | (γ)| = |g| + | (γ 0 )|
+  NTF a bijection f : j ⊕ (γ) → g t (γ 0 )
+                           G
+  First, we know that g = ( γ(l)) t L for some L                                                               (By 4)
+                                    l∈j
+
+  Let C1 = {γ(l) | l ∈ j}, C2 = ec(γ) \ C1
+                     G                   G
+  Clearly,   (γ) =       C \ rep(C) t      C \ rep(C)
+                             C∈C1                C∈C2
+                   G                           G
+  Let D1 =                 C \ rep(C), D2 =          C \ rep(C)
+                   C∈C1                       C∈C2
+                                                                  G
+  We define the bijection f by parts: f1 : j ⊕ D1 →                      C, f2 : D2 → L t (γ 0 )
+                                                                  C∈C2
+           (
+            rep(γ(l)) x = (inl, l)
+  f1 (x) =
+            l         x = (inr, l)
+                                                       G
+  Clearly, f1 is a bijection, and |j| + |D1 | = |             C|
+                                                       C∈C1
+
+  To avoid the problem of maintaining a single representative for a class (which might be collected),
+  note the following:
+  |C2 | = |ec(γ) \ {γ(l) | l ∈ j}|
+  = |ec(γ dom(Y )\(M tj) )|
+  = |ec(γ 0 )|
+Meaning that C2 has the same number of classes as γ 0 (note these classes might be different)
+Since both γ, γ 0 are proper partitions we have the following:
+                           G                      G                        G                G
+|D2 | = |L t (γ 0 )| iff |   C \ rep(C)| = |L t          C \ rep(C)| iff |   C| = |L t                C|
+                                   C∈C2                 C∈ec(γ 0 )     C∈C2              C∈ec(γ 0 )
+
+  In fact, the latter two sets are equal:
+            G
+  let l0 ∈      C
+               C∈C2
+   0
+  l ∈H \F                                                                           (Def. of partition)
+  case l ∈ g
+         G
+    l0 ∈
+       /   γ(l)                                                                               (Def. of C2 )
+           l∈j
+
+       l0 ∈ L                                                                                   (Def. of g)
+                      G
+       l0 ∈ L t                C
+                  C∈ec(γ 0 )
+
+  case l0 ∈
+          /g
+       l0 ∈ H \ (F t g)
+       Exists C ∈ ec(γ 0 ) s.t. l0 ∈ C                                              (Def. of partition)
+              G
+       l0 ∈        C
+           C∈ec(γ 0 )
+                      G
+       l0 ∈ L t                C
+                  C∈ec(γ 0 )
+                                             G
+  For the other direction, let l0 ∈ L t                C
+                                          C∈ec(γ 0 )
+
+  case l0 ∈ L
+       l0 ∈ H \ F                                                                              (Def. of L)
+                                      0
+       Exists C ∈ ec(γ) s.t. l ∈ C                                                  (Def. of partition)
+             G
+       l0 ∈       C
+           C∈ec(γ)
+                      G
+           0
+  case l ∈                    C
+                 C∈ec(γ 0 )
+
+       l0 ∈ H \ (F t g)                                                             (Def. of partition)
+       l0 ∈ H \ F
+       Exists C ∈ ec(γ) s.t. l0 ∈ C                                                 (Def. of partition)
+             G
+       l0 ∈       C
+           C∈ec(γ)
+      Hence we show that |D2 | = |L t (γ 0 )|, and together with the previous equality, |j| + |             (γ)| = |g| + |   (γ 0 )|
+    Thus we have W 0 , Y, S, F ∪ j  V 0 , H, R, F ∪ g
+    V 0 , H, R, F ∪ g `copy e1 ⇓ v, H 0 , F 0                                                                   (case)
+                          0                               0       0   00
+    By IH on (V , H, R, F ∪ g), we have (w, Y , M , γ ) such that
+    (1) W 0 , Y, S, M ∪ j `Egc e1 ⇓ w, Y 0 , M 0
+                  0
+    (2) v ∼H
+           Y0 w
+    (3) γ 0 is a proper partition, and |γ 00 (l)| = reachY 0 (w)(l) + R(l)
+    (4)     γ 00 (l) ∩ R = γ 0 (l) ∩ R
+      γ 0 (l) ∩ R = (γ(l) \ g) ∩ R = γ(l) ∩ R
+    (5)     |M 0 | = |F 0 | + |        (γ 00 )|
+    Apply F:CondT to (1), we are done.
+
+Case 6: E:CondF Similar to E:CondT
+Case 7: E:Let
+
+          V, H, R, F `Ecopy let(e1 ; x : τ.e2 ) ⇓ v2 , H2 , F2                                                  (case)
+          W, Y, S, M  V, H, R, F                                                                       (assumption)
+                      0       Ecopy
+          V1 , H, R , F `             e1 ⇓ v1 , H1 , F1                                                (admissibility)
+                                             0
+          Let W1 = W F V (e1 ) , S = S ] locsW,Y (lam(x : τ.e2 ))
+          NTS W1 , Y, S 0 , M  V1 , H, R0 , F
+          (1)   W1 , Y ∼ V1 , H                                                                    (condition 1. of )
+          (2)a. γ is a proper partition                                                            (condition 2. of )
+                                                      0       0
+          (2).b NTS |γ(l)| = reachY (W )(l) + S (l)
+            |γ(l)| = reachY (W )(l) + S(l)                                                         (condition 2. of )
+             = reachY (W 0 )(l) + reachY (W F V (e2 )\{x} )(l) + S(l)
+             = reachY (W 0 )(l) + S 0 (l)
+          (3) Let. l ∈ dom(γ), x ∈ dom(W 0 ), P valid sequence of directions. Have
+            |reachH (V 0 (x; P )) ∩ γ(l) = reachY (W 0 (x; P ))(l)                                 (condition 3. of )
+          (4).a NTS S 0 ⊆ dom(Y ) \ M
+            S ⊆ dom(Y ) \ M                                                                        (condition 4. of )
+            locsW,Y (lam(x : τ.e2 )) ⊆ reachY (W ) ⊆ dom(Y ) \ M                           (well-formed configuration)
+            S 0 ⊆ dom(Y ) \ M
+          (4).b Let l ∈ S 0 . NTS |γ(l) ∩ R0 | = S 0 (l)
+            STS |γ(l) ∩ (R ∪ reachH (F V (e2 ) \ {x})| = S(l) + reachY (F V (e2 ) \ {x})(l)
+            STS |(γ(l) ∩ R) ∪ (γ(l) ∩ reachH (V (F V (e2 ) \ {x})))| = S(l) + reachY (W (F V (e2 ) \ {x}))(l)
+            STS |(γ(l) ∩ R)| + |γ(l) ∩ reachH (V (F V (e2 ) \ {x}))| = S(l) + reachY (W (F V (e2 ) \ {x}))(l)
+                                                                           (R ∩ reachH (V (F V (e2 ) \ {x})) = ∅)
+            STS |γ(l) ∩ reachH (V (F V (e2 ) \ {x}))| = reachY (W (F V (e2 ) \ {x}))(l)      (condition 4. of )
+                             [                                  ]
+            STS |γ(l) ∩              reachH (V (x0 ))| = (              reachY (W (x0 )))(l)
+                              x0 ∈F V (e2 )\{x}                        x0 ∈F V (e2 )\{x}
+
+            Let x0 ∈ F V (e2 ) \ {x}
+            |γ(l) ∩ reachH (V (x0 ))| = reachY (W (x0 ))(l)                                        (condition 3. of )
+(5)   Have |M | = |F | + |       (γ)|                                                       (condition 5. of )
+By IH on first premise, there is (w1 , Y1 , M1 ) and γ1 s.t.
+Fact 1.W 0 , Y, S 0 , M `Egc e ⇓ w1 , Y1 , M1
+Fact 2.v ∼H
+          Y1 w
+            1
+
+
+Fact 3.γ1 is a proper partition, such that for all l ∈ dom(γ1 ),
+  |γ1 (l)| = |reachY1 (w1 )(l)| + S(l)
+Fact 4.For all P, |reachH1 (f indH1 (v1 ; P )) ∩ γ1 (l)| = reachY1 (f indY1 (w1 ; P ))(l)
+Fact 5.γ1 (l) ∩ R0 = γ(l) ∩ R0 and S 0 ⊆ dom(Y1 ) \ M1
+Fact 6.|M1 | = |F1 | + |      (γ1 )|
+V2 , H1 , R, F1 ∪ g ` e2 ⇓ v2 , H2 , F2                                                         (admissibility)
+Let W2 = (W [x 7→ w1 ]) F V (e2 ) , j = {l ∈ H1 | l ∈
+                                                     / M1 ∪ S ∪ locsW2 ,Y1 (e2 )}
+NTS W2 , Y1 , S, M1 ∪ j  V2 , H1 , R, F1 ∪ g
+(1)   W2 , Y1 ∼ V2 , H1                                                       (condition 1. of  and Fact 1)
+(2)   Let γ2 : dom(Y1 ) \ (M1 ∪ j) → P(dom(H1 ) \ (F1 ∪ g)) be defined by γ2 (l) = γ1 (l) \ g
+  NTS |γ2 (l)| = reachY1 (W2 )(l) + S(l)
+  STS |γ1 (l)| = |γ1 (l) ∩ g| + reachY1 (W2 )(l) + S(l)
+  case x ∈ F V (e2 ) :
+      g = collect(R0 , v1 , H1 , F1 )
+      =∅                                                                                               (By 22)
+                                        0
+      |γ1 (l)| = reachY1 (w1 )(l) + S (l)                                                             (Fact 3)
+      = reachY1 (w1 )(l) + reachY (W F V (e2 )\{x} )(l) + S(l)
+      = reachY1 (W2 )(l) + S(l)
+  case x ∈
+         / F V (e2 ) :
+      g = collect(R0 , v1 , H1 , F1 ) t reachH1 (v1 )
+      = reachH1 (v1 )                                                                                  (By 22)
+      |γ1 (l) ∩ g| = reachY1 (w1 )                                                                    (Fact 3)
+      STS |γ1 (l)| = reachY1 (w1 )(l) + reachY1 (W2 )(l) + S(l)
+      = reachY1 (w1 )(l) + S 0 (l)                                                                    (Fact 3)
+      = reachY1 (w1 )(l) + reachY (W F V (e2 )\{x} )(l) + S(l)
+      = reachY1 (w1 )(l) + reachY1 (W F V (e2 )\{x} )(l) + S(l)                                        (By 6)
+      = reachY1 (W2 )(l) + S(l)
+(3)   Let l ∈ dom(γ2 ), x0 ∈ dom(W2 ), P valid sequence w.r.t. W2 (x0 ). NTS
+|reachH1 (V2 (x0 ; P )) ∩ γ2 (l)| = reachY1 (W2 (x0 ; P ))(l)
+  case x0 = x :
+      |reachH1 (V2 (x0 ; P )) ∩ γ2 (l)| = reachY1 (W2 (x0 ; P ))(l)                                   (Fact 4)
+           0
+  case x 6= x :
+      |reachH1 (V2 (x0 ; P )) ∩ γ(l)| = reachY1 (W2 (x0 ; P ))(l)           (stability and condition 3. of )
+      |reachH1 (V2 (x0 ; P )) ∩ γ1 (l)| = reachY1 (W2 (x0 ; P ))(l)   (reachH1 (V2 (x0 ; P )) ⊆ R0 and Fact 5.)
+      |reachH1 (V2 (x0 ; P )) ∩ γ2 (l)| = reachY1 (W2 (x0 ; P ))(l)                               (g ∩ R0 = ∅)
+(4).a NTS S ⊆ dom(Y1 ) \ (M1 ∪ j)
+  S 0 ⊆ dom(Y1 ) \ M1                                                                                 (Fact 5.)
+           S ⊆ dom(Y1 ) \ M1
+           S∩j =∅
+        S ⊆ dom(Y1 ) \ (M1 ∪ j)
+        (4).b Let l ∈ S. NTS |γ2 (l) ∩ R| = S(l)
+           |γ2 (l) ∩ R| = |(γ1 (l) \ g) ∩ R|
+            = |γ1 (l) ∩ R|                                                                                  (g ∩ R = ∅)
+            = |γ(l) ∩ R|                                                                                       (Fact 5.)
+           = S(l)                                                                                    (condition 4. of )
+        (5) NTS |M1 t j| = |F1 t g| + (γ2 )
+           Exactly the same as in E:CondT
+        Thus W2 , Y1 , S, M1 ∪ j  V2 , H1 , R, F1 ∪ g
+        By IH on the second premise, we have (w2 , Y2 , M2 ) and γ3 s.t.
+        Fact 1’.W2 , Y1 , S, M1 ∪ j `Egc e2 ⇓ w2 , Y2 , M2
+        Fact 2’.v2 ∼H
+                    Y2 w2
+                      2
+
+
+        Fact 3’.γ3 is a proper partition, such that for all l ∈ dom(γ3 ),
+           |γ3 (l)| = |reachY2 (w2 )(l)| + S(l) + |γ3 (l)|
+        Fact 4’.For all P, |reachH2 (f indH2 (v2 ; P )) ∩ γ3 (l)| = reachY2 (f indY2 (w2 ; P ))(l)
+        Fact 5’.γ3 (l) ∩ R = γ2 (l) ∩ R and S ⊆ dom(Y2 ) \ M2
+           γ2 (l) ∩ R = γ1 (l) ∩ R                                                                          (g ∩ R = ∅)
+            = γ(l) ∩ R                                                                   (Fact 5. from first premise)
+        Fact 6’.|M2 | = |F2 | + |    (γ3 )|
+        Apply F:Let to (1), we are done.
+
+Case 8: E:Pair Similar to E:Const*
+
+Case 9: E:MatP Similar to E:CondT
+Case 10: E:Nil Similar to E:Const*
+Case 11: E:Cons
+
+     V, H, R, F ` cons(x1 ; x2 ) ⇓ l, H 0 , F \ {l}                                                               (case)
+     W, Y, S, M  V, H, R, F                                                                              (assumption)
+     Let w = hW (x1 ), W (x2 )i
+     Let m ∈ M, Y 0 = Y {m 7→ w}
+     (1) V, H, R, F ` cons(x1 ; x2 ) ⇓ m, Y 0 , M \ {m}                                                        (F:Cons)
+     (2) v ∼H
+            Y w                                                                                           (assumption)
+     (3) Let γ 0 : dom(Y 0 ) \ M 0 → P(dom(H 0 ) \ F 0 ) be defined by γ 0 (l0 ) = γ[m 7→ {l}](l0 )
+       γ 0 is a proper partition                                                    (γ proper and l ∈
+                                                                                                    / dom(H) \ F )
+               0   0                    0       0
+       NTS |γ (l )| = reachY 0 (m)(l ) + S(l )
+       STS |γ[m 7→ {l}](l0 )| = reachY 0 (m)(l0 ) + S(l0 )
+     case l0 = m :
+       |γ[m 7→ {l}](l0 )| = |{l}| = 1
+       reachY 0 (m)(l0 ) + S(l0 ) = 1 + reachY 0 (w1 )(m) + reachY 0 (w2 )(m) + S(l0 )
+       = 1 + S(m)                                                                                   (M ∩ reachY (W ) = ∅)
+       =1                                                                                                     (M ∩ S = ∅)
+    case l0 6= m :
+      |γ[m 7→ {l}](l0 )| = |γ(l0 )| = reachH (W )(l0 ) + S(l0 )                                         (condition 2. of )
+                               0                     0         0
+       = reachH 0 (w1 )(l ) + reachH 0 (w2 )(l ) + S(l )
+       = {m 7→ 1}(l0 ) + reachH 0 (w1 )(l0 ) + reachH 0 (w2 )(l0 ) + S(l0 )
+       = reachH 0 (m)(l0 ) + S(l0 )
+    (4) Let l ∈ dom(γ 0 ), P be a valid path w.r.t. l. NTS |reachH 0 (f indH 0 (l; P )) ∩ γ 0 (l0 )| = reachY 0 (f indY 0 (m; P ))(l0 )
+    case P = []
+      |reachH 0 (f indH 0 (l; P )) ∩ γ 0 (l0 )| = |reachH 0 (l) ∩ γ 0 (l0 )|
+       = |({l} ∪ reachH 0 (v1 ) ∪ reachH 0 (v2 )) ∩ γ 0 (l0 )|
+       = |{l} ∩ γ(l0 )| + |reachH 0 (v1 ) ∩ γ 0 (l0 )| + |reachH 0 (v2 ) ∩ γ 0 (l0 )|
+       = 1l0 =m + reachY 0 (w1 )(l0 ) + reachY 0 (w2 )(l0 )                                             (condition 3. of )
+                           0
+       = reach (m)(l )
+                  Y0
+       = reachY 0 (f indY 0 (m; P ))(l0 )
+    case P = N :: P 0
+      |reachH 0 (f indH 0 (l; N :: P 0 )) ∩ γ 0 (l0 )| = |reachH 0 (hv1 , v2 i) ∩ γ 0 (l0 )|
+       = reachY 0 (f indY 0 (m; P ))(l0 )                                                                (similar to above)
+    (5) NTS S ⊆ dom(γ 0 )                                                        (condition 4. of  and dom(γ) ⊆ dom(γ 0 ))
+      Let l0 ∈ dom(γ 0 ). NTS γ(l0 ) ∩ R = γ(l) ∩ R
+      STS γ[m 7→ {l}](l0 ) ∩ R = γ(l0 ) ∩ R
+    case l0 = m :
+      γ[m 7→ {l}](m) ∩ R = {l} ∩ R
+       =∅                                                                                       (well-formed configuration)
+             0
+       = γ(l ) ∩ R                                                                              (well-formed configuration)
+    case l0 6= m :
+      γ[m 7→ {l}](m) ∩ R = γ(l0 ) ∩ R
+    (6) NTS |M 0 | = |F 0 | +       (γ 0 )
+      |M 0 | = |M | − 1
+      |F 0 | = |F | − 1
+         (γ 0 ) = (γ[m 7→ {l}])
+         [
+       =      C ∈ ec(γ 0 )C \ (rep(C))
+                         [
+       = ({l} \ {l}) ∪ C ∈ ec(γ)C \ (rep(C))
+         [
+       =      C ∈ ec(γ)C \ (rep(C))
+         [
+       =      C ∈ ec(γ)C \ (rep(C))
+       =    (γ)
+      STS |M | − 1 = |F | − 1 +              (γ)
+      Have |M | = |F | + (γ)                                                                            (condition 5. of )
+
+Case 12: E:MatNil Similar to E:Cond*
+Case 13: E:MatCons
+
+    V, H, R, F `Ecopy match x {nil ,→ e1 | cons(xh ; xt ) ,→ e2 } ⇓ v, H 0 , F 0                                  (case)
+    W, Y, S, M  V, H, R, F                                                                               (assumption)
+      0                                     0   0
+    V , H, R, F ∪ g ` e2 ⇓ v, H , F                                                                      (admissibility)
+                    0
+    Let W = W dom(V 0 )
+    Let j = {l ∈ Y |l ∈
+                      / M ∪ S ∪ locsW 0 ,Y (e2 )}
+    NTS W 0 , Y, S, M ∪ j  V 0 , H, R, F ∪ g
+    Let γ 0 : dom(Y ) \ (M t j) → P(dom(H) \ (F t g)) be defined by γ 0 (l) = γ(l) \ g
+    (1) W 0 , Y ∼ V 0 , H                                                                        (similar to E:CondT)
+    Let W (x) = m
+    H(m) = hwh , wt i, vh ∼H          H
+                           Y wh , vt ∼Y wt                                                                            ((1))
+            0
+    (2) γ (l) is a proper partition .                                                            (similar to E:CondT)
+                        0           0
+      Let l ∈ dom(γ )
+      Now, NTS |γ 0 (l0 )| = reachY (W 0 )(l) + S(l0 )
+      Consider |γ(l0 ) ∩ reachH (V (x))|
+          = |γ(l0 ) ∩ {l}| + |γ(l0 ) ∩ reachH (vh )| + |γ(l0 ) ∩ reachH (vt )|
+          = reachY (W (x))(l0 )                                                                     (condition 3. of )
+                                                                0
+          = ({m 7→ 1} ] reachY (wh ) ] reachY (wt ))(l )
+          = {m 7→ 1}(l0 ) + reachY (wh )(l0 ) + reachY (wt )(l0 )
+      Note |γ(l0 ) ∩ reachH (vh )| = |γ(l0 ) ∩ reachH (V (x; [N, L]))|
+          = reachY (W (x; [N, L]))(l0 )
+          = reachY (wh )(l0 )
+      Similarly, |γ(l0 ) ∩ reachH (vh )| = reachY (wh )(l0 )
+      Thus |γ(l0 ) ∩ {l}| = {m 7→ 1}(l0 ) = 1l0 =m
+      Back to the NTS:
+      γ 0 (l0 ) = γ(l0 ) \ g                                                                                (definition)
+      |γ 0 (l0 )| = |γ(l0 )| − |γ(l0 ) ∩ g|
+       = reachY (W )(l0 ) + S(l0 ) − |γ(l0 ) ∩ g|
+    case {xh , xt } ⊆ F V (e2 ) :
+      g = {l} ∪ reachH (V dom(V )\(F V (e2 )∪{x}) )                                           (definition of g and 10)
+                0                       0               0
+      |γ(l ) ∩ g| = |(γ(l ) ∩ {l}) ∪ (γ(l ) ∩ reachH (V dom(V )\(F V (e2 )∪{x}) ))|
+                                                                                                    (condition 3. of )
+      Thus, |γ (l )| = reachY (W )(l ) + S(l ) − (1l0 =m + reachY (W dom(W )\(F V (e2 )∪{x}) )(l0 ))
+                            0   0                   0       0
+
+          = reachY (W F V (e2 )∪{x} )(l0 ) + S(l0 ) − 1l0 =m
+          = reachY (W F V (e2 ) )(l0 ) + reachY (m)(l0 ) + reachY (wh )(l0 ) + reachY (wt )(l0 ) + S(l0 ) − 1l0 =m
+          = reachY (W F V (e2 ) )(l0 ) + reachY (wh )(l0 ) + reachY (wt )(l0 ) + S(l0 )
+          = reachY (W 0 )(l0 ) + S(l0 )
+    case xh ∈ F V (e2 ), xt ∈
+                            / F V (e2 ) :
+      g = {l} ∪ reachH (V dom(V )\(F V (e2 )∪{x}) ) ∪ reachH (vt )                            (definition of g and 10)
+      |γ(l0 ) ∩ g| = |γ(l0 ) ∩ {l}| + |γ(l0 ) ∩ reachH (V dom(V )\(F V (e2 )∪{x}) )| + |γ(l0 ) ∩ reachH (vt )|               =
+                                                                                                     (condition 3. of )
+       = 1l0 =m + reachH (V dom(V )\(F V (e2 )∪{x}) )(l0 ) + reachY (wt )(l0 )                  (condition 3. of )
+      Thus, |γ (l )| = reachY (W )(l ) + S(l ) − (1l0 =m + reachY (W dom(W )\(F V (e2 )∪{x}) )(l0 ) + reachY (wt )(l))
+                 0       0                 0            0
+
+       = reachY (W F V (e2 ) )(l0 ) + reachY (m)(l0 ) + reachY (wh )(l0 ) + reachY (wt )(l0 ) + S(l0 ) − 1l0 =m − reachY (wt )(l))
+       = reachY (W F V (e2 ) )(l0 ) + reachY (wh )(l0 ) + S(l0 )
+       = reachY (W 0 )(l0 ) + S(l0 )
+    case xt ∈ F V (e2 ), xh ∈
+                            / F V (e2 ) and {xh , xt } ∩ F V (e2 ) = ∅ : symmetric to above
+    (3) Let l0 ∈ dom(γ 0 ), x0 ∈ dom(W 0 ), P valid sequence w.r.t. W 0 (x0 ). NTS
+      |reachH (V 0 (x0 ; P )) ∩ γ 0 (l0 )| = reachY (W 0 (x0 ; P ))(l0 )
+    case x0 ∈
+            / {xh , xt } :
+      |reachH (V 0 (x0 ; P )) ∩ γ 0 (l0 )| = |reachH (V 0 (x0 ; P )) ∩ (γ(l0 ) \ g)|
+       = |reachH (V 0 (x0 ; P )) ∩ γ(l0 )|                                                 (g ∩ reachH (V 0 (x)) = ∅)
+       = reachY (W 0 (x; P ))(l0 )
+       = reachY (W (x; P ))(l0 )
+    case x0 = xh :
+      |reachH (V 0 (x0 ; P )) ∩ γ 0 (l0 )| = |reachH (f indH (vh , P )) ∩ γ 0 (l0 )|
+      |reachH (f indH (vh , P )) ∩ (γ(l0 ) \ g)|
+      |reachH (f indH (vh , P )) ∩ γ(l0 )|                                                    (g ∩ reachH (V 0 ) = ∅)
+                                                            0
+       = |reachH (f indH (l, N :: L :: P )) ∩ γ(l )|
+       = |reachH (V (x, N :: L :: P )) ∩ γ(l0 )|
+       = reachY (W (x, N :: L :: P ))(l0 )                                                       (condition 3. of )
+                                                    0
+       = reachY (f indH (m, N :: L :: P ))(l )
+       = reachY (f indH (vh , P ))(l0 )
+       = reachY (W 0 (xh ; P ))(l0 )
+    (4) Similar to E:CondT
+    (5) Similar to E:CondT
+    Apply IH and F:MatCons and we’re done
+
+Case 14: E:Share
+          V, H, R, F `Ecopy share x as x1 , x2 in e ⇓ v, H 00 , F 0                                            (case)
+          W, Y, S, M  V, H, R, F                                                                      (assumption)
+             0       0       0                 00   0
+          V , H , R, F t g ` e ⇓ v, H , F                                                             (admissibility)
+          Let W (x) = w0
+          v 0 ∼YH w0                                                                             (condition 1 of. )
+                         0             0            0
+          Let W = (W [x1 7→ w , x2 7→ w ]) F V (e)
+          Let j = {l ∈ Y |l ∈
+                            / M ∪ S ∪ locsW 0 ,Y (e)}
+          NTS W 0 , Y, S, M ∪ j  V 0 , H, R, F ∪ g
+          Let γ 0 : dom(Y ) \ (M t j) → P(dom(H) \ (F t g)) be defined by γ 0 (l) = γ(l) \ g
+          (1) W 0 , Y ∼ V 0 , H                                                               (Similar to E:CondT)
+                                               0                                0      0
+          (2) Have proper partition γ : dom(Y ) \ M → dom(H ) \ F                                            (By 26)
+             Let j = {l ∈ H | l ∈
+                                / M ∪ S ∪ locs                  W 0 ,Y   (e)}
+             Let γ 00 (l) : dom(Y ) \ (M ∪ j) → dom(H 0 ) \ (F 0 ∪ g) by defined by γ 00 (l) = γ 0 (l) \ g
+             γ 00 is a proper partition                                                       (Similar to E:CondT)
+  Let l ∈ dom(γ 00 )
+  Now, NTS |γ 00 (l)| = reachY (W 0 )(l) + S(l0 )
+  γ 00 (l) = γ 0 (l) \ g                                                                 (definition)
+    00           0         0
+  |γ (l)| = |γ (l)| − |γ (l) ∩ g|
+   = |γ(l)| + 1l∈reachY (w0 ) − |γ 0 (l) ∩ g|
+   = reachY (W )(l) + S(l) + reachY (w0 )(l) − |γ 0 (l) ∩ g|
+case {x1 , x2 } ⊆ F V (e) :
+  g = collect(R, reachH (V ), H, F ) = ∅                                  (well-formed configuration)
+    00                                              0
+  |γ (l)| = reachY (W )(l) + S(l) + reachY (w )(l)                                           (By 26)
+                     0
+   = reachY (W )(l) + S(l)
+case x1 ∈ F V (e), x2 ∈
+                      / F V (e) :
+  g = collect(R, reachH (V ), H, F ) ∪ reach0H (v 0 ) = reachH 0 (v 0 )   (well-formed configuration)
+  |γ (l)| = reachY (W )(l) + S(l) + reachY (w )(l) − |γ (l) ∩ reachH 0 (v 0 )|
+    00                                              0        0
+
+   = reachY (W )(l) + S(l) + reachY (w0 )(l) − |γ(l) ∩ reachH (v 0 )|                        (By 26)
+   = reachY (W )(l) + S(l) + reachY (w0 )(l) − reachY (w0 )(l)                    (condition 3. of )
+   = reachY (W )(l) + S(l)
+   = reachY (W 0 )(l) + S(l)
+case x2 ∈ F V (e), x1 ∈
+                      / F V (e) and {x1 , x2 } ∩ F V (e) = ∅ : symmetric to above
+(3) - (5) Similar to E:MatCons
+Applying the IH then F:Share, and we’re done.
+

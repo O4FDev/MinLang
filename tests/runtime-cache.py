@@ -27,6 +27,9 @@ class RuntimeCache(unittest.TestCase):
         for name in ('minyar', 'Makefile'):
             shutil.copy2(SNAPSHOT / name, self.project / name)
         shutil.copytree(ROOT / 'runtime', self.project / 'runtime')
+        shutil.copytree(ROOT / 'tools', self.project / 'tools')
+        for directory in ('scripts', 'build-support'):
+            shutil.copytree(ROOT / directory, self.project / directory)
         shutil.copy2(ROOT / 'build/minyarc', self.project / 'build/minyarc')
         tools = self.work / 'tools'
         tools.mkdir()
@@ -39,6 +42,7 @@ class RuntimeCache(unittest.TestCase):
         self.assertIsNotNone(real_clang)
         self.clang_log = self.work / 'clang.jsonl'
         clang = tools / 'clang'
+        self.clang_wrapper = clang
         clang.write_text('#!' + sys.executable + '\n' +
                          'import json, os, sys\n' +
                          'with open(os.environ["CACHE_TEST_CLANG_LOG"], "a") as log:\n' +
@@ -101,6 +105,18 @@ class RuntimeCache(unittest.TestCase):
         self.assertNotEqual(self.signature(target)[0], before[0])
         self.assertTrue(any('-c' in call for call in calls), 'header edit must compile a fresh runtime')
         self.assertIn(str(target), calls[-1])
+
+    def test_backend_path_and_flags_invalidate_cached_runtime(self):
+        target = self.project / 'build/minyar-default-runtime.o'
+        self.launch()
+        original = self.signature(target)
+        selected = {'LLVM_CC': str(self.clang_wrapper), 'LLVM_FLAGS': '-O1 -Wno-override-module'}
+        calls = self.launch(extra_env=selected)
+        self.assertNotEqual(self.signature(target)[0], original[0])
+        self.assertTrue(any('-c' in call and '-O1' in call for call in calls))
+        updated = self.signature(target)
+        self.launch(extra_env=selected)
+        self.assertEqual(self.signature(target), updated)
 
     def test_custom_runtime_flags_use_invocation_storage(self):
         target = self.project / 'build/minyar-default-runtime.o'

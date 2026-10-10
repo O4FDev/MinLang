@@ -6,13 +6,14 @@ import subprocess
 import sys
 import unittest
 from regressions import CLANG, COMPILER, ROOT, CompilerTestCase
+from clang_helpers import clang_command
 
 
 class CompactOwnership(CompilerTestCase):
     def frame(self, source, name):
         result, llvm = self.compile(source)
         self.assertEqual(result.returncode, 0, result.stderr)
-        match = re.search(r'define [^\n]*@' + re.escape(name) + r'\([^\n]*\)[^\n{]*\{\n(.*?)\n\}', llvm.read_text(), re.S)
+        match = re.search(r'define [^\n]*@' + re.escape('.minyar.fn.' + name) + r'\([^\n]*\)[^\n{]*\{\n(.*?)\n\}', llvm.read_text(), re.S)
         self.assertIsNotNone(match, name)
         body = match[1]
         entry = re.search(r'call void @minyar_rc_enter\(i64 (\d+)\)', body)
@@ -133,7 +134,7 @@ print(pair())
 
     def test_collision_mutant_fails_with_real_use_after_free(self):
         source_root = COMPILER.parent.parent
-        source = (source_root / 'src/compiler.min').read_text()
+        source = (source_root / 'compiler/compiler.min').read_text()
         site = 'return state[entry + 1]'
         self.assertEqual(source.count(site), 1, 'ownership mapper mutation site changed')
         source = source.replace(site, 'return 0', 1)
@@ -144,8 +145,8 @@ print(pair())
         generated = subprocess.run([str(COMPILER), str(path), str(llvm)],
             capture_output=True, text=True, timeout=30)
         self.assertEqual(generated.returncode, 0, generated.stderr)
-        linked = subprocess.run([CLANG, '-O1', '-Wno-override-module', str(llvm),
-            str(source_root / 'build/minyar-compiler-runtime.ll'), '-o', str(mutant)],
+        linked = subprocess.run(clang_command([CLANG, '-O1', '-Wno-override-module', str(llvm),
+            str(source_root / 'build/minyar-compiler-runtime.ll'), '-o', str(mutant)]),
             capture_output=True, text=True, timeout=60)
         self.assertEqual(linked.returncode, 0, linked.stderr)
         environment = os.environ.copy()

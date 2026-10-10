@@ -16,6 +16,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from clang_helpers import clang_command
 
 ROOT = Path(__file__).resolve().parents[1]
 STANDARD = ('recent-cursors', 'recent-fairness', 'immortal-reference-lists',
@@ -121,6 +122,7 @@ def main():
     print(f'Evidence retained at {evidence}', flush=True)
     try:
         source(Path(__file__).resolve(), Path('tests/memory-profile-regressions.py'))
+        source(Path(__file__).with_name('clang_helpers.py'), Path('tests/clang_helpers.py'))
         report['snapshot_replay'] = [sys.executable, str(evidence / 'originals/tests/memory-profile-regressions.py'),
             '--runtime-source', str(evidence / 'originals/runtime/minyar_runtime.c'),
             '--fixture-dir', str(evidence / 'originals/tests'), '--suite', args.suite,
@@ -151,7 +153,7 @@ def main():
         environment = {**os.environ, 'ASAN_OPTIONS': 'detect_leaks=0:abort_on_error=1',
                        'UBSAN_OPTIONS': 'halt_on_error=1:print_stacktrace=1'}
         report['environment'] = {name: environment[name] for name in ('ASAN_OPTIONS', 'UBSAN_OPTIONS')}
-        version = execute('compiler-version', [args.clang, '--version'], args.compile_timeout, environment)
+        version = execute('compiler-version', clang_command([args.clang, '--version']), args.compile_timeout, environment)
         report['clang_version'] = version.splitlines()[0] if version.strip() else '(no version stdout)'
         for profile in profiles:
             stage = evidence / 'profiles' / profile
@@ -198,7 +200,7 @@ def main():
                         flags = ['-O2'] if instrumentation == 'native' else ['-O1', '-g', '-fsanitize=address,undefined']
                         command = [args.clang, '-std=c11', *flags, *backend,
                                    f'-DMINYAR_RC_POLL_BUDGET={budget}', str(stage / relative), '-o', str(binary)]
-                        execute(label + '-compile', command, args.compile_timeout, environment)
+                        execute(label + '-compile', clang_command(command), args.compile_timeout, environment)
                         phases = PHASES if name == VIRTUAL else (None,)
                         for phase in phases:
                             execute(label + ('-' + phase if phase else ''),

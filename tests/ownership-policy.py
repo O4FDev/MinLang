@@ -5,16 +5,18 @@ Uses prebuilt project tools; all generated sources, states, and native artifacts
 are temporary. Direct module replay deliberately bypasses driver cold retries.
 """
 from pathlib import Path
+import os
 import re
 import shlex
 import subprocess
 import tempfile
 import unittest
+from clang_helpers import clang_command
 
 ROOT = Path(__file__).resolve().parents[1]
-COMPILER = ROOT / 'build/minyarc'
-MODULE_COMPILER = ROOT / 'build/minyarc-modules'
-DRIVER = ROOT / 'build/minyar-module-build'
+COMPILER = Path(os.environ.get('MINYAR_TEST_COMPILER', ROOT / 'build/minyarc'))
+MODULE_COMPILER = Path(os.environ.get('MINYAR_TEST_MODULE_COMPILER', ROOT / 'build/minyarc-modules'))
+DRIVER = Path(os.environ.get('MINYAR_MODULE_DRIVER', ROOT / 'build/minyar-module-build'))
 BUDGETS = ('1', '2', '8', '9', '32')
 INVALID = ('', '0', '000', '-1', '+1', '2x', '9x', '1.0', '１２')
 
@@ -53,32 +55,32 @@ class OwnershipPolicy(unittest.TestCase):
             wrapper.write_text('#include "minyar_runtime.c"\n' +
                                ('#include "minyar_stack_frames.h"\n' if budget != '1' else ''))
             runtime = wrapper.with_suffix('.o')
-            self.run_tool(['clang', '-O1', '-DMINYAR_SYSTEM_HEAP=1',
+            self.run_tool(clang_command(['clang', '-O1', '-DMINYAR_SYSTEM_HEAP=1',
                            '-DMINYAR_RC_POLL_BUDGET=' + budget, '-iquote', ROOT / 'runtime',
-                           '-c', wrapper, '-o', runtime])
+                           '-c', wrapper, '-o', runtime]))
             self.runtime_objects[budget] = runtime
         binary = llvm.with_suffix('.program')
-        self.run_tool(['clang', '-O1', '-Wno-override-module', llvm,
-                       self.runtime_objects[budget], '-o', binary])
+        self.run_tool(clang_command(['clang', '-O1', '-Wno-override-module', llvm,
+                       self.runtime_objects[budget], '-o', binary]))
         result = self.run_tool([binary])
         self.assertEqual((result.stdout, result.stderr), (expected, ''))
 
     def selected(self, llvm, budget, modules=False):
-        pattern = (r'^define .*? @"minyar.module\|(owners\d+)\|[^\n]+ noinline \{'
-                   if modules else r'^define .*? @(owners\d+)\([^\n]*\) noinline \{')
+        pattern = (r'^define .*? @"\.minyar\.fn\.minyar.module\|(owners\d+)\|[^\n]+ noinline \{'
+                   if modules else r'^define .*? @\.minyar\.fn\.(owners\d+)\([^\n]*\) noinline \{')
         actual = set(re.findall(pattern, llvm.read_text(), re.M))
         limit = 0 if budget is None else min(8, int(budget) - 1)
         self.assertEqual(actual, {f'owners{n}' for n in range(1, limit + 1)})
         for function in actual:
-            body_pattern = (r'^define [^\n]* @"minyar.module\|' + function + r'\|[^\n]+ noinline \{\n.*?^\}'
-                            if modules else r'^define [^\n]* @' + function + r'\([^\n]*\) noinline \{\n.*?^\}')
+            body_pattern = (r'^define [^\n]* @"\.minyar\.fn\.minyar.module\|' + function + r'\|[^\n]+ noinline \{\n.*?^\}'
+                            if modules else r'^define [^\n]* @\.minyar\.fn\.' + function + r'\([^\n]*\) noinline \{\n.*?^\}')
             body = re.search(body_pattern, llvm.read_text(), re.M | re.S)
             self.assertIsNotNone(body)
             self.assertEqual(body.group(0).count('call void @minyar_stack_enter()'), 1)
             self.assertEqual(body.group(0).count('call void @minyar_rc_enter_stack_v1('), 1)
             self.assertNotIn('call void @minyar_rc_enter(i64', body.group(0),
                              'stack ownership must replace, not duplicate, the heap frame')
-        caller_name = r'@"minyar.module\|caller\|[^"\n]+"' if modules else r'@caller'
+        caller_name = r'@"\.minyar\.fn\.minyar.module\|caller\|[^"\n]+"' if modules else r'@\.minyar\.fn\.caller'
         caller = re.search(r'^define [^\n]* ' + caller_name +
                            r'\([^\n]*\)[^\n]*\{\n.*?^\}', llvm.read_text(), re.M | re.S)
         self.assertIsNotNone(caller, 'calling fixture must be emitted')
@@ -133,8 +135,8 @@ print(scalar(3))
         llvm = self.work / 'loop-service.ll'
         self.run_tool([COMPILER, source, llvm])
         generated = llvm.read_text()
-        owned = re.search(r'^define [^\n]* @owned\([^\n]*\)[^\n]*\{\n.*?^\}', generated, re.M | re.S)
-        scalar = re.search(r'^define [^\n]* @scalar\([^\n]*\)[^\n]*\{\n.*?^\}', generated, re.M | re.S)
+        owned = re.search(r'^define [^\n]* @\.minyar\.fn\.owned\([^\n]*\)[^\n]*\{\n.*?^\}', generated, re.M | re.S)
+        scalar = re.search(r'^define [^\n]* @\.minyar\.fn\.scalar\([^\n]*\)[^\n]*\{\n.*?^\}', generated, re.M | re.S)
         self.assertIsNotNone(owned)
         self.assertIsNotNone(scalar)
         self.assertIn('@minyar_rc_step()', owned.group(0))
@@ -199,7 +201,7 @@ print(scalar(3))
                 library.write_text(original.replace('Text(n)', 'Text(n + 1)'))
                 plan.write_text(pack(['minyar-module-plan-v1', str(base), str(empty), 'opaque-test-base-identity']))
                 edited = direct('edit', plan, delta, [1, 1])
-                self.assertTrue(delta.read_text().startswith(pack(['minyar-module-delta-v2'])))
+                self.assertTrue(delta.read_text().startswith(pack(['minyar-module-delta-v3'])))
                 plan.write_text(pack(['minyar-module-plan-v1', str(base), str(delta), 'opaque-test-base-identity']))
                 replayed = direct('warm', plan, warm, [2, 0])
                 self.assertEqual(edited.read_bytes(), replayed.read_bytes())

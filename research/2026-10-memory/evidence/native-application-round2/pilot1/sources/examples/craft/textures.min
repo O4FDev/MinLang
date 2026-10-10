@@ -1,0 +1,535 @@
+// A 256 by 256 texture atlas drawn with code: 16 by 16 pixel block tiles in
+// the top rows, and 32 by 32 pixel isometric block icons for the hotbar below.
+// Like classic block-game art, each tile uses a small palette of flat colours,
+// ordered dark to light, with noise choosing a colour for every pixel.
+
+use "./blocks.min" as blocks
+use "./noise.min" as noise
+
+public constant ATLAS_SIZE = 256
+// The width of an icon in texture coordinates. Icons sit eight to a row from
+// pixel row ICON_TOP, one for each block kind.
+public constant ICON_SIZE = 0.125
+constant ICON_TOP = 64
+
+function put(pixels: Bytes, tile: Integer, px: Integer, py: Integer, red: Integer, green: Integer, blue: Integer, alpha: Integer) {
+    let x = (tile % 16) * 16 + px
+    let y = (tile / 16) * 16 + py
+    let index = (y * ATLAS_SIZE + x) * 4
+    pixels[index] = clamp(red, 0, 255)
+    pixels[index + 1] = clamp(green, 0, 255)
+    pixels[index + 2] = clamp(blue, 0, 255)
+    pixels[index + 3] = alpha
+}
+
+function clear(pixels: Bytes, tile: Integer, px: Integer, py: Integer) {
+    put(pixels, tile, px, py, 0, 0, 0, 0)
+}
+
+// Put an opaque colour written as 0xRRGGBB.
+function paint(pixels: Bytes, tile: Integer, px: Integer, py: Integer, colour: Integer) {
+    put(pixels, tile, px, py, colour >> 16, (colour >> 8) & 255, colour & 255, 255)
+}
+
+// The first colour whose limit is above `value`, or the last colour.
+function pick(value: Float, colours: List<Integer>, limits: List<Float>): Integer {
+    for index in 0..limits.length {
+        if value < limits[index] {
+            return colours[index]
+        }
+    }
+    return colours[colours.length - 1]
+}
+
+// A random Float from 0 up to 1 for one pixel of one tile.
+function grain(tile: Integer, px: Integer, py: Integer, seed: Integer): Float {
+    return noise.random(tile * 16 + px, py, seed)
+}
+
+function wrap(value: Integer, period: Integer): Integer {
+    return (value % period + period) % period
+}
+
+// Smooth noise from 0 to 1 that repeats every tile, so textures meet without
+// seams. There are `cellsX` lattice cells across the tile and `cellsY` down it.
+function tiled(px: Integer, py: Integer, cellsX: Integer, cellsY: Integer, seed: Integer): Float {
+    let x = (Float(px) + 0.5) * Float(cellsX) / 16.0
+    let y = (Float(py) + 0.5) * Float(cellsY) / 16.0
+    let x0 = floor(x)
+    let y0 = floor(y)
+    let ix = Integer(x0)
+    let iy = Integer(y0)
+    let fx = x - x0
+    let fy = y - y0
+    fx = fx * fx * (3.0 - 2.0 * fx)
+    fy = fy * fy * (3.0 - 2.0 * fy)
+    let a = noise.random(wrap(ix, cellsX), wrap(iy, cellsY), seed)
+    let b = noise.random(wrap(ix + 1, cellsX), wrap(iy, cellsY), seed)
+    let c = noise.random(wrap(ix, cellsX), wrap(iy + 1, cellsY), seed)
+    let d = noise.random(wrap(ix + 1, cellsX), wrap(iy + 1, cellsY), seed)
+    let near = a + (b - a) * fx
+    let far = c + (d - c) * fx
+    return near + (far - near) * fy
+}
+
+// The nearest of a jittered grid of points scattered over a repeating tile,
+// for stones and cells. `dx` and `dy` run from the point to the pixel.
+record Cell {
+    index: Integer
+    nearest: Float
+    second: Float
+    dx: Float
+    dy: Float
+}
+
+function cell(px: Integer, py: Integer, grid: Integer, seed: Integer): Cell {
+    let result = Cell {
+        index: 0
+        nearest: 99.0
+        second: 99.0
+        dx: 0.0
+        dy: 0.0
+    }
+    let spacing = 16.0 / Float(grid)
+    for index in 0..grid * grid {
+        let pointX = (Float(index % grid) + 0.2 + 0.6 * noise.random(index, 1, seed)) * spacing
+        let pointY = (Float(index / grid) + 0.2 + 0.6 * noise.random(index, 2, seed)) * spacing
+        let dx = Float(px) + 0.5 - pointX
+        let dy = Float(py) + 0.5 - pointY
+        if dx > 8.0 { dx -= 16.0 } else if dx < -8.0 { dx += 16.0 }
+        if dy > 8.0 { dy -= 16.0 } else if dy < -8.0 { dy += 16.0 }
+        let distance = sqrt(dx * dx + dy * dy)
+        if distance < result.nearest {
+            result.second = result.nearest
+            result.nearest = distance
+            result.index = index
+            result.dx = dx
+            result.dy = dy
+        } else if distance < result.second {
+            result.second = distance
+        }
+    }
+    return result
+}
+
+// Grass is fine grey noise, a different shade in every pixel, tinted a
+// plains green.
+function grass(pixels: Bytes, tile: Integer, px: Integer, py: Integer) {
+    let grey = 147.0 + (grain(tile, px, py, 61) + grain(tile, px, py, 62) - 1.0) * 44.0
+    put(pixels, tile, px, py, Integer(grey * 0.569), Integer(grey * 0.741), Integer(grey * 0.349), 255)
+}
+
+// Dirt is even, fine noise: mostly mid brown with lighter and darker flecks,
+// and the odd grey pebble.
+function dirt(pixels: Bytes, tile: Integer, px: Integer, py: Integer) {
+    if noise.hash(px, py, 73) % 34 == 0 {
+        paint(pixels, tile, px, py, pick(noise.random(px, py, 74), [0x6C6C6C, 0x878787], [0.5]))
+        return
+    }
+    paint(pixels, tile, px, py, pick(noise.random(px, py, 71), [0x593D29, 0x79553A, 0x966C4A, 0xB9855C], [0.13, 0.56, 0.84]))
+}
+
+function snow(pixels: Bytes, tile: Integer, px: Integer, py: Integer) {
+    paint(pixels, tile, px, py, pick(grain(tile, px, py, 131), [0xF0FDFD, 0xF7FEFE, 0xFFFFFF], [0.24, 0.54]))
+}
+
+// Stone has short horizontal streaks of lighter and darker grey. It looks the
+// same wherever it appears, including around ore.
+function stone(pixels: Bytes, tile: Integer, px: Integer, py: Integer) {
+    let value = tiled(px, py, 4, 16, 37) * 0.65 + noise.random(px, py, 38) * 0.35
+    paint(pixels, tile, px, py, pick(value, [0x686868, 0x747474, 0x7F7F7F, 0x8F8F8F], [0.28, 0.42, 0.66]))
+}
+
+// Whether ore covers a pixel: -1 if not, else 0 for a highlight, 1 for the
+// body, and 2 for the shaded far side of a blob.
+function ore(tile: Integer, px: Integer, py: Integer): Integer {
+    if px < 0 || py < 0 || px > 15 || py > 15 {
+        return -1
+    }
+    let clusters = 6
+    if tile == blocks.TILE_COAL_ORE {
+        clusters = 7
+    } else if tile == blocks.TILE_DIAMOND_ORE {
+        clusters = 5
+    }
+    for cluster in 0..clusters {
+        let dx = px - (2 + noise.hash(cluster, 1, tile * 31) % 11)
+        let dy = py - (2 + noise.hash(cluster, 2, tile * 31) % 11)
+        // A small core, two by two with one corner sometimes missing, and
+        // the odd pixel beside it.
+        let core = dx >= 0 && dx <= 1 && dy >= 0 && dy <= 1 && !(dx == 1 && dy == 1 && noise.hash(cluster, 3, tile) % 2 == 0)
+        let extra = dx >= -1 && dx <= 2 && dy >= -1 && dy <= 2 && noise.hash(px, py, tile * 7 + cluster) % 7 == 0
+        if core || extra {
+            if dx + dy <= 0 {
+                return 0
+            } else if dx + dy >= 2 {
+                return 2
+            }
+            return 1
+        }
+    }
+    return -1
+}
+
+// Ore blobs have a highlight, a body, a shaded side, and a dark edge below and
+// to the right.
+function drawOre(pixels: Bytes, tile: Integer, px: Integer, py: Integer) {
+    let colours = [0x393C36, 0x2E2E2E, 0x252525, 0x5C5C5C]
+    if tile == blocks.TILE_IRON_ORE {
+        colours = [0xE2C0AA, 0xD8AF93, 0xAF8E77, 0x887455]
+    } else if tile == blocks.TILE_GOLD_ORE {
+        colours = [0xFFFFB5, 0xFCEE4B, 0xEB9D0E, 0x9C7020]
+    } else if tile == blocks.TILE_DIAMOND_ORE {
+        colours = [0xD5FFF6, 0x77E7D1, 0x1ED0D6, 0x239698]
+    }
+    let part = ore(tile, px, py)
+    if part >= 0 {
+        paint(pixels, tile, px, py, colours[part])
+    } else if ore(tile, px - 1, py) >= 0 || ore(tile, px, py - 1) >= 0 {
+        paint(pixels, tile, px, py, colours[3])
+    } else {
+        stone(pixels, tile, px, py)
+    }
+}
+
+function drawTile(pixels: Bytes, tile: Integer, px: Integer, py: Integer) {
+    let random = grain(tile, px, py, 7)
+    if tile == blocks.TILE_GRASS_TOP {
+        grass(pixels, tile, px, py)
+    } else if tile == blocks.TILE_GRASS_SIDE || tile == blocks.TILE_SNOW_SIDE {
+        // A ragged fringe hanging a few pixels over the dirt.
+        let fringe = 2 + noise.hash(px, tile, 17) % 2
+        if noise.hash(px, tile, 19) % 4 == 0 {
+            fringe += 1 + noise.hash(px, tile, 20) % 2
+        }
+        if py == fringe && random < 0.7 {
+            // Dirt just under the fringe lies in its shadow.
+            paint(pixels, tile, px, py, 0x593D29)
+        } else if py >= fringe {
+            dirt(pixels, tile, px, py)
+        } else if tile == blocks.TILE_GRASS_SIDE {
+            grass(pixels, tile, px, py)
+        } else {
+            snow(pixels, tile, px, py)
+        }
+    } else if tile == blocks.TILE_DIRT {
+        dirt(pixels, tile, px, py)
+    } else if tile == blocks.TILE_STONE {
+        stone(pixels, tile, px, py)
+    } else if tile == blocks.TILE_SAND {
+        paint(pixels, tile, px, py, pick(random, [0xD1BA8A, 0xD5C496, 0xDACFA3, 0xE3DBB0, 0xE7E4BB, 0xEDEBCB], [0.04, 0.3, 0.72, 0.95, 0.98]))
+    } else if tile == blocks.TILE_LOG_SIDE {
+        // Bark in broken vertical streaks: each column varies slowly downward
+        // on its own, with one lattice cell across so columns do not blend.
+        let value = tiled(0, py, 1, 3, 92 + px) * 0.8 + random * 0.2
+        paint(pixels, tile, px, py, pick(value, [0x382B18, 0x4C3D26, 0x5F4A2B, 0x745A36, 0x917142, 0x987849], [0.2, 0.32, 0.44, 0.74, 0.9]))
+    } else if tile == blocks.TILE_LOG_TOP {
+        // Square growth rings inside a ring of bark.
+        let ring = Integer(max(abs(Float(px) - 7.5), abs(Float(py) - 7.5)))
+        if ring == 7 {
+            paint(pixels, tile, px, py, pick(random, [0x4C3D26, 0x5F4A2B, 0x745A36], [0.3, 0.75]))
+        } else if random < 0.12 {
+            paint(pixels, tile, px, py, pick(random * 8.0, [0x9F844D, 0xC29D62], [0.5]))
+        } else {
+            let rings = [0xAF8F55, 0x967441, 0xB8945F, 0xAF8F55, 0x9F844D, 0xAF8F55, 0xB8945F]
+            paint(pixels, tile, px, py, rings[ring])
+        }
+    } else if tile == blocks.TILE_LEAVES {
+        let clump = tiled(px, py, 4, 4, 101)
+        if noise.random(px, py, 103) < 0.55 && clump < 0.5 {
+            clear(pixels, tile, px, py)
+        } else {
+            paint(pixels, tile, px, py, pick(clump * 0.5 + random * 0.5, [0x304313, 0x374E15, 0x46661C, 0x567E22], [0.3, 0.5, 0.74]))
+        }
+    } else if tile == blocks.TILE_WATER {
+        // Calm water: long horizontal ripples with a few bright glints.
+        let value = tiled(px, py, 2, 8, 111) * 0.7 + random * 0.3
+        paint(pixels, tile, px, py, pick(value, [0x284C93, 0x2A509B, 0x2F59AD, 0x3461BC, 0x3F76E4], [0.45, 0.72, 0.84, 0.92]))
+    } else if tile == blocks.TILE_PLANKS {
+        // Four boards with dark seams, grain along them, and staggered joints.
+        let board = py / 4
+        let row = py % 4
+        let joint = (board * 7 + 3) % 16
+        if row == 3 {
+            paint(pixels, tile, px, py, 0x67502C)
+        } else if px == joint {
+            paint(pixels, tile, px, py, 0x7E6237)
+        } else if tiled(px, py, 2, 16, 123) > 0.78 {
+            paint(pixels, tile, px, py, 0x967441)
+        } else {
+            let value = tiled(px, py, 4, 16, 121) * 0.6 + random * 0.4
+            if row == 0 {
+                value += 0.15
+            }
+            paint(pixels, tile, px, py, pick(value, [0x9F844D, 0xAF8F55, 0xB8945F, 0xC29D62], [0.35, 0.58, 0.8]))
+        }
+    } else if tile == blocks.TILE_COBBLESTONE {
+        // Rounded stones lit from the top left, set in dark mortar.
+        let stoneCell = cell(px, py, 3, 141)
+        let gap = stoneCell.second - stoneCell.nearest
+        if gap < 1.1 {
+            paint(pixels, tile, px, py, pick(random, [0x525252, 0x616161], [0.3]))
+        } else {
+            let lit = -(stoneCell.dx + stoneCell.dy) * 0.25 + random * 0.5
+            if gap < 2.0 {
+                lit -= 0.5
+            }
+            paint(pixels, tile, px, py, pick(lit, [0x6E6E6E, 0x888888, 0xA6A6A6, 0xB5B5B5], [-0.3, 0.45, 0.8]))
+        }
+    } else if tile == blocks.TILE_GLASS {
+        // A pale frame with a glint in two corners.
+        let glint = (px + py == 6 && px >= 2 && px <= 4) || (px + py == 25 && px >= 12 && px <= 13)
+        if px == 0 || py == 0 {
+            paint(pixels, tile, px, py, 0xD0EAE9)
+        } else if px == 15 || py == 15 {
+            paint(pixels, tile, px, py, pick(random, [0x8BC1CD, 0xA8D0D9], [0.6]))
+        } else if glint {
+            paint(pixels, tile, px, py, 0xD0EAE9)
+        } else {
+            clear(pixels, tile, px, py)
+        }
+    } else if tile == blocks.TILE_BEDROCK {
+        let value = tiled(px, py, 8, 8, 151) * 0.6 + random * 0.4
+        paint(pixels, tile, px, py, pick(value, [0x222222, 0x333333, 0x575757, 0x636363, 0x979797], [0.22, 0.48, 0.6, 0.7]))
+    } else if tile == blocks.TILE_BRICK {
+        // Bricks lit along their top, darker along their bottom, in pale mortar.
+        let row = py / 4
+        let rowPixel = py % 4
+        let column = (px + (row % 2) * 4) % 8
+        if rowPixel == 3 {
+            paint(pixels, tile, px, py, pick(random, [0x8B6E67, 0xA2867D, 0xA9948D], [0.25, 0.8]))
+        } else if column == 7 {
+            paint(pixels, tile, px, py, pick(random, [0x8B6E67, 0xA2867D], [0.7]))
+        } else if rowPixel == 0 {
+            paint(pixels, tile, px, py, pick(random, [0x9B5643, 0xB1624D, 0xC66851], [0.2, 0.75]))
+        } else if rowPixel == 1 {
+            paint(pixels, tile, px, py, pick(random, [0x8F503F, 0x9B5643, 0xB1624D], [0.3, 0.85]))
+        } else {
+            paint(pixels, tile, px, py, pick(random, [0x733F31, 0x7C4536, 0x8F503F], [0.3, 0.75]))
+        }
+    } else if tile == blocks.TILE_SNOW {
+        snow(pixels, tile, px, py)
+    } else if tile == blocks.TILE_SUN {
+        // A square sun: a gold edge, a pale ring, and a white-hot middle. The
+        // corners stay see-through; its glow is drawn separately.
+        let ring = Integer(max(abs(Float(px) - 7.5), abs(Float(py) - 7.5)))
+        if ring < 2 {
+            paint(pixels, tile, px, py, 0xFFFFD9)
+        } else if ring < 3 {
+            paint(pixels, tile, px, py, 0xFFFFAA)
+        } else if ring < 4 {
+            paint(pixels, tile, px, py, 0xFFD54A)
+        } else {
+            clear(pixels, tile, px, py)
+        }
+    } else if tile == blocks.TILE_MOON {
+        // A square moon, pale toward the top left, with dark seas along its
+        // right and bottom edges.
+        if px >= 4 && px <= 11 && py >= 4 && py <= 11 {
+            if px >= 10 || py >= 10 {
+                paint(pixels, tile, px, py, pick(random, [0x50545E, 0x5F636E, 0x74788A], [0.35, 0.75]))
+            } else {
+                paint(pixels, tile, px, py, pick(random, [0x9094A0, 0xAFB3C0, 0xD9DCE6], [0.2, 0.5]))
+            }
+        } else {
+            clear(pixels, tile, px, py)
+        }
+    } else if tile == blocks.TILE_CLOUD {
+        put(pixels, tile, px, py, 255, 255, 255, 255)
+    } else if tile == blocks.TILE_TALL_GRASS {
+        // Thin blades of varied height, some leaning, rising from a dense
+        // tangle along the bottom; darker toward the ground.
+        let found = py >= 12 && random >= 0.15
+        for blade in 0..16 {
+            let height = 3 + noise.hash(blade, 2, 301) % 11
+            let lean = noise.hash(blade, 3, 301) % 3 - 1
+            if noise.hash(blade, 1, 301) % 4 != 0 && py >= 16 - height && px == blade + lean * (15 - py) / 4 {
+                found = true
+            }
+        }
+        if found {
+            let value = random * 0.45 + Float(15 - py) / 14.0 * 0.55
+            paint(pixels, tile, px, py, pick(value, [0x3D5025, 0x435829, 0x4A5F2D, 0x526B32, 0x5A7637, 0x688740], [0.18, 0.32, 0.48, 0.64, 0.8]))
+        } else {
+            clear(pixels, tile, px, py)
+        }
+    } else if tile == blocks.TILE_RED_FLOWER {
+        // A short poppy: a red bloom lit from the top left on a thin stem with
+        // two leaves near the ground.
+        let head = (py == 5 && (px == 7 || px == 8)) || (py == 6 && px >= 5 && px <= 9) || (py == 7 && px >= 5 && px <= 10) || (py == 8 && px >= 5 && px <= 9) || (py == 9 && px >= 6 && px <= 8)
+        let leaf = (py == 12 && (px == 5 || px == 10)) || (py == 13 && (px == 6 || px == 9))
+        if head {
+            let side = (px - 7) + (py - 7)
+            if px == 7 && py == 7 {
+                paint(pixels, tile, px, py, 0x742303)
+            } else if side < 0 {
+                paint(pixels, tile, px, py, 0xED302C)
+            } else if side < 2 {
+                paint(pixels, tile, px, py, 0xBF2529)
+            } else {
+                paint(pixels, tile, px, py, 0x9B221A)
+            }
+        } else if px == 7 && py > 9 {
+            paint(pixels, tile, px, py, pick(Float(py), [0x2B702A, 0x265A25, 0x204626], [12.5, 14.5]))
+        } else if (px == 8 && py == 14) || leaf {
+            paint(pixels, tile, px, py, pick(random, [0x204626, 0x2B702A, 0x4A8F28], [0.3, 0.7]))
+        } else {
+            clear(pixels, tile, px, py)
+        }
+    } else if tile == blocks.TILE_YELLOW_FLOWER {
+        // A short dandelion: a round yellow head low on a stem, leaves below.
+        let hx = abs(px - 7)
+        let hy = abs(py - 9)
+        let head = hx + hy <= 2 || (hx <= 2 && hy <= 1 && px != 5)
+        let leaf = (py == 12 && (px == 5 || px == 6)) || (py == 13 && px >= 8 && px <= 10) || (py == 14 && px == 6)
+        if head {
+            let side = (px - 7) + (py - 9)
+            if px == 7 && py == 9 {
+                paint(pixels, tile, px, py, 0xF19D25)
+            } else if side < 0 {
+                paint(pixels, tile, px, py, 0xFFEC4F)
+            } else if side < 3 {
+                paint(pixels, tile, px, py, 0xFED639)
+            } else {
+                paint(pixels, tile, px, py, 0xF19D25)
+            }
+        } else if px == 7 && py > 11 {
+            paint(pixels, tile, px, py, 0x177C04)
+        } else if leaf {
+            paint(pixels, tile, px, py, pick(random, [0x177C04, 0x4A8F28, 0x55AB2D], [0.35, 0.7]))
+        } else {
+            clear(pixels, tile, px, py)
+        }
+    } else if tile == blocks.TILE_TORCH {
+        // The 3D torch is the two-pixel column from row 6 down, lit on the
+        // left, with a two by two flame on top.
+        if px == 7 && py == 6 {
+            paint(pixels, tile, px, py, 0xFFD800)
+        } else if px == 8 && py == 6 {
+            paint(pixels, tile, px, py, 0xFF8F00)
+        } else if px == 7 && py == 7 {
+            paint(pixels, tile, px, py, 0xFFFF97)
+        } else if px == 8 && py == 7 {
+            paint(pixels, tile, px, py, 0xFFFFFF)
+        } else if px == 7 && py > 7 {
+            paint(pixels, tile, px, py, pick(random, [0x957546, 0x9F7F50], [0.5]))
+        } else if px == 8 && py > 7 {
+            if py == 15 {
+                paint(pixels, tile, px, py, 0x423522)
+            } else {
+                paint(pixels, tile, px, py, pick(random, [0x55452E, 0x6D5736], [0.5]))
+            }
+        } else {
+            clear(pixels, tile, px, py)
+        }
+    } else if tile >= blocks.TILE_COAL_ORE && tile <= blocks.TILE_DIAMOND_ORE {
+        drawOre(pixels, tile, px, py)
+    } else {
+        put(pixels, tile, px, py, 255, 0, 255, 255)
+    }
+}
+
+// Read one channel of a tile's texel.
+function texel(pixels: Bytes, tile: Integer, px: Integer, py: Integer, channel: Integer): Integer {
+    let x = (tile % 16) * 16 + clamp(px, 0, 15)
+    let y = (tile / 16) * 16 + clamp(py, 0, 15)
+    return pixels[(y * ATLAS_SIZE + x) * 4 + channel]
+}
+
+// Draw a block's icon: plants as their picture, everything else as a cube seen
+// from above, with the top, left, and right faces lit differently. Each pixel
+// averages four samples so the cube's edges are smooth.
+function drawIcon(pixels: Bytes, block: Integer) {
+    let left = (block % 8) * 32
+    let top = ICON_TOP + (block / 8) * 32
+    for iy in 0..32 {
+        for ix in 0..32 {
+            let red = 0.0
+            let green = 0.0
+            let blue = 0.0
+            let covered = 0
+            for sample in 0..4 {
+                let x = Float(ix) + 0.25 + Float(sample % 2) * 0.5
+                let y = Float(iy) + 0.25 + Float(sample / 2) * 0.5
+                let tile = -1
+                let u = 0.0
+                let v = 0.0
+                let light = 1.0
+                if blocks.isPlant(block) {
+                    tile = blocks.tile(block, blocks.FACE_SIDE)
+                    u = x / 2.0
+                    v = y / 2.0
+                } else {
+                    // The top face is a diamond from (16, 1) spanning to
+                    // (2, 8) and (30, 8); the sides hang 16 pixels below it.
+                    let a = ((x - 16.0) / 14.0 + (y - 1.0) / 7.0) / 2.0
+                    let b = ((y - 1.0) / 7.0 - (x - 16.0) / 14.0) / 2.0
+                    if a >= 0.0 && a < 1.0 && b >= 0.0 && b < 1.0 {
+                        tile = blocks.tile(block, blocks.FACE_TOP)
+                        u = a * 16.0
+                        v = b * 16.0
+                    } else if x < 16.0 {
+                        a = (x - 2.0) / 14.0
+                        b = (y - 8.0 - 7.0 * a) / 16.0
+                        if a >= 0.0 && b >= 0.0 && b < 1.0 {
+                            tile = blocks.tile(block, blocks.FACE_SIDE)
+                            u = a * 16.0
+                            v = b * 16.0
+                            light = 0.8
+                        }
+                    } else {
+                        a = (x - 16.0) / 14.0
+                        b = (y - 15.0 + 7.0 * a) / 16.0
+                        if a < 1.0 && b >= 0.0 && b < 1.0 {
+                            tile = blocks.tile(block, blocks.FACE_SIDE)
+                            u = a * 16.0
+                            v = b * 16.0
+                            light = 0.62
+                        }
+                    }
+                }
+                if tile >= 0 {
+                    let tu = Integer(u)
+                    let tv = Integer(v)
+                    if texel(pixels, tile, tu, tv, 3) > 127 {
+                        red += Float(texel(pixels, tile, tu, tv, 0)) * light
+                        green += Float(texel(pixels, tile, tu, tv, 1)) * light
+                        blue += Float(texel(pixels, tile, tu, tv, 2)) * light
+                        covered += 1
+                    }
+                }
+            }
+            if covered > 0 {
+                let index = ((top + iy) * ATLAS_SIZE + left + ix) * 4
+                pixels[index] = Integer(red / Float(covered))
+                pixels[index + 1] = Integer(green / Float(covered))
+                pixels[index + 2] = Integer(blue / Float(covered))
+                pixels[index + 3] = covered * 255 / 4
+            }
+        }
+    }
+}
+
+public function build(): Bytes {
+    let pixels = Bytes(ATLAS_SIZE * ATLAS_SIZE * 4)
+    for tile in 0..blocks.TILE_COUNT {
+        for py in 0..16 {
+            for px in 0..16 {
+                drawTile(pixels, tile, px, py)
+            }
+        }
+    }
+    for block in 1..blocks.BLOCK_COUNT {
+        drawIcon(pixels, block)
+    }
+    return pixels
+}
+
+// The top left corner of a block's icon in texture coordinates.
+public function iconU(block: Integer): Float {
+    return Float(block % 8) * ICON_SIZE
+}
+
+public function iconV(block: Integer): Float {
+    return Float(ICON_TOP + (block / 8) * 32) / Float(ATLAS_SIZE)
+}

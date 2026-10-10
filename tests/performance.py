@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+from clang_helpers import clang_command
 
 try:
     import resource
@@ -29,7 +30,7 @@ except ImportError:  # Windows
 
 ROOT = Path(__file__).resolve().parent.parent
 COMPILER = ROOT / "build" / "minyarc"
-SOURCE = ROOT / "src" / "compiler.min"
+SOURCE = ROOT / "compiler" / "compiler.min"
 OUTPUT = ROOT / "build" / "compiler-performance-check.ll"
 REFERENCE = ROOT / "build" / "compiler-stage3.ll"
 RUNTIME = ROOT / "build" / "minyar-runtime.o"
@@ -76,7 +77,7 @@ def best_of(command: list[str], repeats: int = REPEATS, timeout: float = 60) -> 
 
 
 def link(clang: str, llvm: Path, executable: Path) -> None:
-    linked = run([clang, "-O0", "-Wno-override-module", str(llvm), str(RUNTIME), "-o", str(executable)])
+    linked = run(clang_command([clang, "-O0", "-Wno-override-module", str(llvm), str(RUNTIME), "-o", str(executable)]))
     if linked.returncode != 0:
         raise SystemExit(f"could not link {llvm.name}:\n{linked.stderr}")
 

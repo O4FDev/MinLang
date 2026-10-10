@@ -132,6 +132,33 @@ int main(void) {
     minyar_rc_release(breadcrumbs);
     empty_heap();
 
+    /* Model lexer lookahead and backtracking across one- through four-byte
+       characters. Nearby backwards/repeated accesses must stay linear too. */
+    const char mixed_unit[] = "aé€🙂";
+    const int mixed_expected[] = {'a', 0xe9, 0x20ac, 0x1f642};
+    char mixed_bytes[651];
+    for (int i = 0; i < 65; i++)
+        memcpy(mixed_bytes + i * 10, mixed_unit, 10);
+    mixed_bytes[650] = 0;
+    MinyarText *mixed_index = copy_c_text(mixed_bytes);
+    assert(minyar_text_length(mixed_index) == 260);
+    text_decode_count = 0;
+    for (int i = 0; i < 258; i++) {
+        for (int look = 0; look < 3; look++) {
+            assert(minyar_text_character_at(mixed_index, i + look) == mixed_expected[(i + look) % 4]);
+            assert(minyar_text_character_at(mixed_index, i) == mixed_expected[i % 4]);
+        }
+    }
+    assert(text_decode_count <= 258 * 16);
+    /* Warm the end cursor, then cross every sparse-index boundary in reverse. */
+    assert(minyar_text_character_at(mixed_index, 259) == 0x1f642);
+    text_decode_count = 0;
+    for (int i = 259; i >= 0; i--)
+        assert(minyar_text_character_at(mixed_index, i) == mixed_expected[i % 4]);
+    assert(text_decode_count <= 260 * 3);
+    minyar_rc_release(mixed_index);
+    empty_heap();
+
     /* Full slices share the value itself; nested views retain the owning root
        directly and never form an unbounded destruction chain. */
     MinyarText *root = copy_c_text("abcdef");

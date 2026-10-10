@@ -4,6 +4,8 @@ set -eu
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 compiler=${MINYAR_TEST_COMPILER:-"$project_dir/build/minyarc"}
 clang_command=${MINYAR_TEST_CLANG:-clang}
+math_library=
+case "$(uname -s)" in Darwin) ;; *) math_library=-lm ;; esac
 build_dir="$project_dir/build/module-tests"
 mkdir -p "$build_dir"
 
@@ -14,8 +16,8 @@ compile_and_run() {
     llvm="$build_dir/$name.ll"
     executable="$build_dir/$name"
     "$compiler" "$project_dir/$source" "$llvm"
-    "$clang_command" -O0 -Wno-override-module "$llvm" "$project_dir/build/minyar-runtime.o" -o "$executable"
-    actual=$($executable)
+    "$clang_command" -O0 -Wno-override-module "$llvm" "$project_dir/build/minyar-runtime.o" $math_library -o "$executable"
+    actual=$("$executable")
     if [ "$actual" != "$expected" ]; then
         echo "module test '$name' produced unexpected output" >&2
         echo "expected: $expected" >&2

@@ -28,24 +28,37 @@ build configuration.
 
 `check-budget` enforces fixed ceilings on self-compilation wall time, CPU time,
 peak memory, and retired instructions. The ceilings in
-[`tests/self-compile-budget.py`](../tests/self-compile-budget.py) were calibrated
-on an Apple M-series laptop. They were reset after full token columns, stack
-guards, ownership-transfer lowering, and the expanded compiler/runtime surface
-changed the measured workload. Before the sequential Unicode cursor, isolated
-runs retired 67.6--69.8 million instructions, peaked at 9.3 MiB, and measured a
-25--26 ms CPU 90th percentile. The cursor reduced two repeated CPU measurements
-to 14.6--14.9 ms. Current ceilings are 75 million instructions, 10 MiB, 22 ms
-CPU and 25 ms wall time.
-For comparison, a clean build of the preceding repository revision retired
-38.0 million instructions on the same host, already above the former 32 million
-ceiling. This is an explicit baseline change, not a claim that the added work
-is free; the fixed ceilings continue to fail subsequent regressions.
+[`tests/self-compile-budget.py`](../tests/self-compile-budget.py) remain
+75 million instructions, 10 MiB, 22 ms CPU, and 25 ms wall time. They were
+calibrated against an earlier, smaller compiler on an Apple M-series laptop.
+They are regression targets, not a statement that the current branch passes.
+
+The October hardening review reconstructs the starting compiler and runtime
+instead of comparing against old documentation. That branch already exceeded
+the instruction and memory limits. Typed source positions defer diagnostic
+formatting, lexer reads reuse known characters, and direct buffer writes remove
+trivial wrappers. Cold stack-bound initialization and checked LLVM success paths
+reduce runtime work while retaining the error and ownership contracts.
+
+The latest 50-sample compiler campaign measures 72.347 million median retired
+instructions and 9.281 MiB maximum RSS. On each compiler's own source, CPU falls
+from 17.733 ms to 7.275 ms; identical-original-source results are recorded
+separately. The independent 3×100-run budget gate also passes: 9.16 ms wall p90, 7.65 ms
+CPU p90, 9.3 MiB maximum RSS, and 71.88 million instructions. Its original
+ceilings and batch method are unchanged. See the
+[hardening report](hardening-report.md) for current evidence.
 
 The budget test runs outside the development limiter because background
 priority changes absolute timings. It takes the 90th percentile across batches;
 shared-host load can still affect results. Most other checks run under
 `scripts/with-limits.sh`, with background priority and CPU, memory, and output
 limits. Avoid parallel test jobs when comparing timings.
+
+The public launcher's first-use bootstrap keeps those resource caps and low CPU
+priority, but does not add the macOS background scheduling class. This prevents
+an interactive cold build from starving behind unrelated background indexing
+or backups. Bulk development checks and fuzz campaigns retain their background
+policy; bootstrap invoked by an already throttled parent inherits that context.
 
 ## Known release-build cost
 
@@ -84,3 +97,31 @@ native compilation and linking.
 Memory measurements report maximum child-process RSS, rather than the sum of
 simultaneous parent and child memory. See [incremental builds](incremental-builds.md)
 for cache behavior and platform limits.
+
+## Comparing generated code with C++
+
+`experiments/memory/critical-path-study.py` checks arithmetic, indexed List work,
+and record access against independent Python results and equivalent checked C++.
+Use `--measure --count 5000000 --samples 31 --output results.json` for a local
+comparison after correctness passes. Keep the machine idle during measurement.
+One explicit warm-up pair precedes the retained samples; execution order then
+alternates between languages. Setup and complete teardown are outside the
+timed function and remain subject to separate correctness and allocation checks.
+
+The report retains every measured observation, each language's median CPU time,
+and the median of adjacent Minyar/C++ CPU ratios. These two ways of summarizing
+ratios can differ when host conditions change, so both remain visible. Ratios
+below one favor Minyar. A deterministic 95% percentile bootstrap resamples
+complete pairs; its seed, sample count, full range, and method accompany the
+interval. The interval assumes independent pairs and cannot account for an
+unobserved workload or sustained host drift. It is evidence, not a timing gate
+that can be made green by discarding inconvenient samples.
+
+The October final default-build measurements close the earlier arithmetic,
+record, and indexed-List CPU gaps on the maintained workloads. The scalar study
+adds shifts, Unicode scalar conversion, Float-to-Integer and abs/clamp; the
+[hardening report](hardening-report.md) retains ratios and confidence intervals.
+System-allocation LTO List work still has a measured 1.02% CPU gap and more
+retired instructions. Its disassembly identifies memory-effect/alias information
+as remaining work; faster default CPU measurements do not establish lower
+instruction counts. Preserve this distinction when reporting results.

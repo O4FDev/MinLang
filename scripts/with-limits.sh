@@ -18,6 +18,9 @@ if ! ulimit -f "$file_blocks" 2>/dev/null; then
 fi
 
 if [ -x /usr/sbin/taskpolicy ]; then
+    if [ "${MINYAR_INTERACTIVE_BOOTSTRAP:-0}" = 1 ]; then
+        exec /usr/sbin/taskpolicy -m "$memory_mib" nice -n "$priority" "$@"
+    fi
     exec /usr/sbin/taskpolicy -b -c background -m "$memory_mib" nice -n "$priority" "$@"
 fi
 if command -v nice >/dev/null 2>&1; then

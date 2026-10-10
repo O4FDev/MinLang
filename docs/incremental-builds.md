@@ -20,8 +20,16 @@ or an interchange format for downloads. Individual artifacts are capped at
 
 ## What is reused
 
-Every build reads the reachable source files and compares their complete
-contents. An unchanged module loads its saved imports and checked code without
+Graphs containing constants, native function bodies, or standard-library
+package imports currently use the ordinary full frontend. They compile with the
+same behavior as a direct build, including after constant values or imports
+change, but publish no new incremental module state. Removing those constructs
+restores ordinary cache reuse. This conservative fallback prevents stale
+constant values and missing native declarations while value-bearing interfaces
+are designed.
+
+For cacheable graphs, every build reads the reachable source files and compares
+their complete contents. An unchanged module loads its saved imports and checked code without
 lexing, parsing, type checking, or generating its function bodies again.
 
 A body-only edit normally recompiles that module. Its callers can retain their
@@ -29,6 +37,15 @@ checked code if their imported interfaces still match. An interface includes
 function signatures, public visibility, record field names/order/types, and
 private or recursive record types reachable through those signatures. Relevant
 interface changes invalidate consumers; unrelated modules remain reusable.
+
+Cached function bodies require the compiler's common LLVM prelude when assembled
+as independent objects. That prelude includes runtime declarations and internal
+helper definitions. The artifact test verifies ordinary object linking and LTO
+for cold, warm, and edited caches; declarations alone are not a complete prelude.
+
+Interface schema v5 and delta schema v3 encode the current language linkage ABI.
+Older cache versions rebuild automatically. This prevents bodies compiled with
+raw C symbol names from being mixed with the isolated language namespace.
 
 An exact graph-interface match also reuses the compiler's checked declaration
 and type tables. Interface changes rebuild those tables. Consequently, interface
@@ -60,11 +77,15 @@ for remotely supplied files. Invalid state falls back to a clean frontend build.
 Compiler images are published under immutable names and verified against the
 requested compiler bytes. Per-invocation files and atomic replacement prevent
 concurrent builds from exposing partially written output or combining different
-base generations. Serialize the initial compiler/runtime bootstrap and builds targeting the same
-output executable. A failed frontend build preserves earlier successful output
+base generations. The launcher serializes the shared compiler/runtime bootstrap
+with a project-local operating-system lock. Direct concurrent Make invocations
+and builds targeting the same output executable still require coordination.
+A failed frontend build preserves earlier successful output
 and cache state. A later Clang failure can leave a valid frontend cache, since
 Clang flags and module native objects are not cached. The configured standard
-runtime is cached separately by its Makefile dependencies.
+runtime is cached separately by its source/build dependencies and selected
+compiler identity and flags. Native package artifacts also include the compiler,
+flags, and runtime ABI headers in their content key.
 
 Publication uses atomic filesystem operations, without durability synchronization.
 An interrupted or crashed process can leave temporary files; partial or missing

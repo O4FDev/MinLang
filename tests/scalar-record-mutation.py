@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 from regressions import CLANG, COMPILER, ROOT
 from llvm_sanitizer import prepare_llvm_for_link
+from clang_helpers import clang_command
 
 CASES = {
     'capture': ('''record Pair { x: Integer; y: Integer }
@@ -57,7 +58,7 @@ def checked(args, purpose):
 def main():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     source_root = COMPILER.parent.parent
-    source = (source_root / 'src/compiler.min').read_text()
+    source = (source_root / 'compiler/compiler.min').read_text()
     changes = {
         'capture': ('raw = output[scalarValues + (field - first) * 3 + 1]',
                     'raw = output[scalarValues + 1]'),
@@ -78,8 +79,8 @@ def main():
             path.write_text(source.replace(before, after, 1))
             checked([COMPILER, path, path.with_suffix('.ll')], f'{name} compiler build')
             exe = directory / name
-            checked([CLANG, '-O1', '-DMINYAR_COMPILER_ARENA', '-Wno-override-module',
-                     path.with_suffix('.ll'), ROOT / 'runtime/minyar_runtime.c', '-o', exe],
+            checked(clang_command([CLANG, '-O1', '-DMINYAR_COMPILER_ARENA', '-Wno-override-module',
+                     path.with_suffix('.ll'), ROOT / 'runtime/minyar_runtime.c', '-o', exe]),
                     f'{name} compiler link')
             compilers[name] = exe
         for name, (program, expected) in CASES.items():
@@ -91,9 +92,9 @@ def main():
                 prepare_llvm_for_link(llvm, ['-fsanitize=address'])
                 for optimization in ('-O0', '-O2'):
                     exe = directory / f'{name}-{mode}-{optimization[1:]}'
-                    checked([CLANG, optimization, '-fsanitize=address,undefined',
+                    checked(clang_command([CLANG, optimization, '-fsanitize=address,undefined',
                              '-Wno-override-module', llvm, ROOT / 'build/ownership-runtime.o',
-                             '-o', exe], f'{name}/{mode} program link')
+                             '-o', exe]), f'{name}/{mode} program link')
                     result = run([exe], env)
                     if mode == 'control':
                         assert result.returncode == 0 and result.stdout == expected, result

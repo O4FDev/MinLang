@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import tempfile
+from clang_helpers import clang_command
 ROOT = Path(__file__).resolve().parents[1]
 
 def main():
@@ -21,9 +22,9 @@ def main():
             for sanitized in (False, True):
                 exe = directory / f'capacity-{size}-{int(sanitized)}'
                 flags = ['-fsanitize=address,undefined'] if sanitized else []
-                subprocess.run([args.clang, '-std=c11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
+                subprocess.run(clang_command([args.clang, '-std=c11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
                                 *flags, f'-DMINYAR_BOUNDED_HEAP_BYTES={size}ULL',
-                                str(ROOT / 'tests/lazy-heap.c'), '-o', str(exe)], check=True, timeout=60)
+                                str(ROOT / 'tests/lazy-heap.c'), '-o', str(exe)]), check=True, timeout=60)
                 result = subprocess.run([str(exe)],capture_output=True,text=True,timeout=60,env=env)
                 assert result.returncode == 0, result.stdout + result.stderr
                 records.append({'capacity':size,'sanitized':sanitized,'output':result.stdout.strip()})
@@ -35,9 +36,9 @@ def main():
             for sanitized in (False,True):
                 exe = directory / f'failure-{failed_mapping}-{int(sanitized)}'
                 flags = ['-fsanitize=address,undefined'] if sanitized else []
-                subprocess.run([args.clang,'-std=c11','-O1','-g','-Wall','-Wextra','-Werror',*flags,
+                subprocess.run(clang_command([args.clang,'-std=c11','-O1','-g','-Wall','-Wextra','-Werror',*flags,
                                 f'-DFAIL_MAPPING={failed_mapping}',str(ROOT/'tests/lazy-mmap-failure.c'),
-                                '-o',str(exe)],check=True,timeout=60)
+                                '-o',str(exe)]),check=True,timeout=60)
                 result = subprocess.run([str(exe)],capture_output=True,text=True,timeout=30,env=env)
                 assert result.returncode == 1, result.stderr
                 assert 'injected mapping failure rolled back correctly' in result.stderr, result.stderr

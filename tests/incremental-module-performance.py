@@ -10,6 +10,7 @@ import shutil
 import statistics
 import subprocess
 import tempfile
+from clang_helpers import clang_command
 
 ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('graphs',ROOT/'tests/module-performance.py')
@@ -36,7 +37,7 @@ def main():
             shutil.copy2(source,temp/label)
         shutil.copy2(ROOT/'build/minyar-runtime.o', temp/'runtime.o')
         report['artifacts']['runtime']=hashlib.sha256((temp/'runtime.o').read_bytes()).hexdigest()
-        report['clang']=subprocess.run(['clang','--version'],capture_output=True,text=True,check=True).stdout
+        report['clang']=subprocess.run(clang_command(['clang','--version']),capture_output=True,text=True,check=True).stdout
         for shape in args.shapes:
             for count in args.sizes:
                 d=temp/f'{shape}-{count}'
@@ -63,7 +64,7 @@ def main():
                         for label in order:
                             result=graphs.timed(driver if label=='driver' else production)
                             if args.link:
-                                linked=graphs.timed(['clang','-O0','-Wno-override-module',d/('cached.ll' if label=='driver' else 'production.ll'),temp/'runtime.o','-o',d/(label+'-program')])
+                                linked=graphs.timed(clang_command(['clang','-O0','-Wno-override-module',d/('cached.ll' if label=='driver' else 'production.ll'),temp/'runtime.o','-o',d/(label+'-program')]))
                                 result['frontend_ms']={metric:result[metric] for metric in ('cpu_ms','wall_ms')}
                                 result['link_ms']=linked
                                 for metric in ('cpu_ms','wall_ms'):result[metric]+=linked[metric]

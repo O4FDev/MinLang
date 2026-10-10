@@ -14,10 +14,14 @@ import random
 import re
 import statistics
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = ROOT / 'experiments/memory'
+sys.path.insert(0, str(ROOT / 'tests'))
+from llvm_sanitizer import prepare_llvm_for_link
+from measurement_stats import paired_cpu_ratio_summary
 
 
 def oracle(kind, count, seed):
@@ -46,6 +50,7 @@ def main():
     assert 3 <= args.samples <= 101 and 0 < args.count <= 100000000
     work = Path(tempfile.mkdtemp(prefix='minyar-critical-path-'))
     commands = []
+    native_normalizations = []
     print(work, flush=True)
 
     def run(command, label, env=None):
@@ -66,12 +71,13 @@ def main():
     if not args.measure:
         required.append('criticalRecords')
     for name in required:
-        body = re.search(rf'^define [^\n]* @{name}\(.*?^}}', source_ir, re.M | re.S)
+        body = re.search(rf'^define [^\n]* @{re.escape(".minyar.fn." + name)}\(.*?^}}', source_ir, re.M | re.S)
         assert body and '@minyar_rc_' not in body.group(), name
     source_ir, count = re.subn(r'(@)main(\()', r'\1fixtureMain\2', source_ir)
     assert count == 1
     ir.write_text(source_ir)
-    configurations = ([('eager', '-O2', False, False), ('eager-lto', '-O2', False, True),
+    configurations = ([('system', '-O2', False, False), ('system-lto', '-O2', False, True),
+                       ('eager', '-O2', False, False), ('eager-lto', '-O2', False, True),
                        ('bounded-lto', '-O2', True, True)] if args.measure else
                       [('eager-o0', '-O0', False, False), ('eager-o2', '-O2', False, False),
                        ('bounded-o2', '-O2', True, False),
@@ -83,7 +89,14 @@ def main():
         sanitize = name.endswith('sanitize')
         if sanitize:
             flags += ['-g', '-fsanitize=address,undefined', '-fno-omit-frame-pointer']
+        link_ir = ir
+        if sanitize:
+            link_ir = work / f'{name}-fixture.ll'
+            link_ir.write_text(ir.read_text())
+            prepare_llvm_for_link(link_ir, flags)
         defines = ['-DMINYAR_BOUNDED_HEAP=1'] if bounded else []
+        if name.startswith('system'):
+            defines += ['-DMINYAR_SYSTEM_HEAP=1']
         if not args.measure:
             defines += ['-DMINYAR_CRITICAL_ACCOUNTING=1']
         driver, cpp = work / f'{name}-driver.o', work / f'{name}-cpp.o'
@@ -95,31 +108,49 @@ def main():
                 ll = dest.with_suffix('.ll')
                 run([compiler, *flags, *defines, '-S', '-emit-llvm', src, '-o', ll],
                     f'{name}-{src.stem}-ir')
-                ll.write_text(re.sub(r'"(?:target-cpu|target-features|tune-cpu)"="[^"]*" ?', '',
-                                     ll.read_text()))
+                before = ll.read_text()
+                before_path = ll.with_suffix('.before-normalization.ll')
+                before_path.write_text(before)
+                native_ir = re.sub(r'"(?:target-cpu|target-features|tune-cpu)"="[^"]*" ?', '', before)
+                # C asm aliases suppress target mangling (LLVM \01). Canonical
+                # names let LTO resolve them to the unchanged language IR.
+                alias_pattern = r'@"\\01_?(\.minyar\.fn\.([A-Za-z0-9_]+))"'
+                aliases = re.findall(alias_pattern, native_ir)
+                expected_aliases = {'criticalArithmetic', 'criticalBook', 'criticalRecords'} if src.suffix == '.c' else set()
+                assert {name for _, name in aliases} == expected_aliases, (src, aliases)
+                native_ir, replaced = re.subn(alias_pattern, r'@\1', native_ir)
+                assert replaced == len(aliases)
+                ll.write_text(native_ir)
+                native_normalizations.append({'before': str(before_path), 'after': str(ll),
+                    'before_sha256': hashlib.sha256(before.encode()).hexdigest(),
+                    'after_sha256': hashlib.sha256(native_ir.encode()).hexdigest(),
+                    'alias_replacements': replaced, 'alias_names': sorted(expected_aliases),
+                    'method': 'Remove generic target attributes and canonicalize only C asm language aliases for LLVM LTO resolution.'})
                 run([compiler, *flags, '-flto', '-c', ll, '-o', dest], f'{name}-{src.stem}-object')
         else:
             run([args.cc, *flags, *defines, '-c', HERE / 'critical-path-driver.c', '-o', driver],
                 f'{name}-driver')
             run([args.cxx, *flags, '-c', HERE / 'critical-path-cpp.cpp', '-o', cpp], f'{name}-cpp')
         executable = work / name
-        run([args.cxx, *flags, *(['-flto'] if lto else []), ir, driver, cpp, '-o', executable],
+        run([args.cxx, *flags, *(['-flto'] if lto else []), link_ir, driver, cpp, '-o', executable],
             f'{name}-link')
         executables[name] = executable
     env = dict(os.environ, ASAN_OPTIONS='detect_leaks=0')
-    sources = ['src/compiler.min', 'runtime/minyar_runtime.c', 'runtime/minyar_rc.h',
-               'runtime/minyar_bounded_rc.h', 'runtime/minyar_pool.h',
+    sources = ['compiler/compiler.min', 'runtime/minyar_runtime.c',
+               *(str(path.relative_to(ROOT)) for path in sorted((ROOT / 'runtime').glob('*.h'))),
                'experiments/memory/critical-path.min', 'experiments/memory/critical-path-driver.c',
-               'experiments/memory/critical-path-cpp.cpp', 'experiments/memory/critical-path-study.py']
+               'experiments/memory/critical-path-cpp.cpp', 'experiments/memory/critical-path-study.py',
+               'experiments/memory/measurement_stats.py', 'tests/llvm_symbols.h']
     result = {'directory': str(work), 'mode': 'measurement' if args.measure else 'correctness',
               'compiler_executable': str(args.compiler.resolve()),
               'compiler_sha256': hashlib.sha256(args.compiler.read_bytes()).hexdigest(),
               'source_sha256': {p: hashlib.sha256((ROOT / p).read_bytes()).hexdigest() for p in sources},
-              'commands': commands, 'configurations': {},
+              'commands': commands, 'native_ir_normalizations': native_normalizations, 'configurations': {},
               'limitations': ['Only the function is timed; setup and full teardown are outside timing.',
                               'A 257-entry prepared integer List is not a complete trading system.',
                               'No OS isolation, hard deadline, physical memory residency or embedded ABI is proved.',
-                              'C++ arithmetic and indexing retain corresponding overflow/bounds checks.']}
+                              'C++ arithmetic and indexing retain corresponding overflow/bounds checks.',
+                              'Bootstrap intervals resample observed pairs as independent; host trends require separate analysis.']}
     if args.measure:
         seed = 271828
         expected = {kind: oracle(kind, args.count, seed) for kind in ('arithmetic', 'book', 'records')}
@@ -127,6 +158,7 @@ def main():
             entries = result['configurations'][name] = {}
             for kind in ('arithmetic', 'book', 'records'):
                 samples = {'cpp': [], 'minyar': []}
+                warmup = {}
                 for i in range(args.samples + 1):
                     for language in (('cpp', 'minyar') if i % 2 else ('minyar', 'cpp')):
                         p = run([executable, language, kind, args.count, seed],
@@ -135,9 +167,15 @@ def main():
                         assert (row['result'], row['values']) == expected[kind]
                         if i:
                             samples[language].append(row)
-                entries[kind] = {'samples': samples, 'median_cpu_ns': {
+                        else:
+                            warmup[language] = row
+                paired_ratio = paired_cpu_ratio_summary(
+                    [row['cpu_ns'] for row in samples['minyar']],
+                    [row['cpu_ns'] for row in samples['cpp']])
+                paired_ratio.update(numerator='minyar', denominator='cpp')
+                entries[kind] = {'samples': samples, 'warmup_samples': warmup, 'median_cpu_ns': {
                     language: statistics.median(row['cpu_ns'] for row in rows)
-                    for language, rows in samples.items()}}
+                    for language, rows in samples.items()}, 'paired_cpu_ratio': paired_ratio}
                 print(name, kind, entries[kind]['median_cpu_ns'], flush=True)
     else:
         rng = random.Random(9102026)

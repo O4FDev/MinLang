@@ -17,15 +17,18 @@
 static size_t critical_system_operations;
 static int critical_active;
 static void *checked_malloc(size_t n) {
-    if (critical_active) critical_system_operations++;
+    if (critical_active)
+        critical_system_operations++;
     return malloc(n);
 }
 static void *checked_realloc(void *p, size_t n) {
-    if (critical_active) critical_system_operations++;
+    if (critical_active)
+        critical_system_operations++;
     return realloc(p, n);
 }
 static void checked_free(void *p) {
-    if (critical_active && p) critical_system_operations++;
+    if (critical_active && p)
+        critical_system_operations++;
     free(p);
 }
 #define malloc checked_malloc
@@ -43,9 +46,13 @@ static void checked_free(void *p) {
 #undef free
 #endif
 
-extern long long criticalArithmetic(long long, long long);
-extern long long criticalBook(MinyarList *, long long, long long);
-extern long long criticalRecords(long long, long long);
+#include "../../tests/llvm_symbols.h"
+
+extern long long criticalArithmetic(long long, long long)
+    MINYAR_TEST_LANGUAGE_SYMBOL(criticalArithmetic);
+extern long long criticalBook(MinyarList *, long long, long long)
+    MINYAR_TEST_LANGUAGE_SYMBOL(criticalBook);
+extern long long criticalRecords(long long, long long) MINYAR_TEST_LANGUAGE_SYMBOL(criticalRecords);
 extern long long cppArithmetic(long long, long long);
 extern long long cppBook(MinyarList *, long long, long long);
 extern long long cppRecords(long long, long long);
@@ -65,9 +72,11 @@ int main(int argc, char **argv) {
     int arithmetic = !strcmp(argv[2], "arithmetic"), book_path = !strcmp(argv[2], "book");
     assert(arithmetic || book_path || !strcmp(argv[2], "records"));
     MinyarList *book = minyar_list_new();
-    for (int i = 0; i < 257; i++) minyar_list_add(book, i);
+    for (int i = 0; i < 257; i++)
+        minyar_list_add(book, i);
 #ifdef MINYAR_BOUNDED_HEAP
-    while (rc_pending_count) minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
+    while (rc_pending_count)
+        minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
 #endif
 #ifdef MINYAR_CRITICAL_ACCOUNTING
     size_t objects_before = rc_object_count, bytes_before = rc_bytes;
@@ -78,9 +87,12 @@ int main(int argc, char **argv) {
 #endif
     uint64_t cpu_start = ticks(CLOCK_THREAD_CPUTIME_ID), wall_start = ticks(CLOCK_MONOTONIC);
     long long result;
-    if (arithmetic) result = cpp ? cppArithmetic(count, seed) : criticalArithmetic(count, seed);
-    else if (book_path) result = cpp ? cppBook(book, count, seed) : criticalBook(book, count, seed);
-    else result = cpp ? cppRecords(count, seed) : criticalRecords(count, seed);
+    if (arithmetic)
+        result = cpp ? cppArithmetic(count, seed) : criticalArithmetic(count, seed);
+    else if (book_path)
+        result = cpp ? cppBook(book, count, seed) : criticalBook(book, count, seed);
+    else
+        result = cpp ? cppRecords(count, seed) : criticalRecords(count, seed);
     uint64_t wall = ticks(CLOCK_MONOTONIC) - wall_start;
     uint64_t cpu = ticks(CLOCK_THREAD_CPUTIME_ID) - cpu_start;
     size_t system_operations = 0, pool_allocations = 0;
@@ -106,13 +118,15 @@ int main(int argc, char **argv) {
 #endif
     printf("{\"result\":%lld,\"wall_ns\":%llu,\"cpu_ns\":%llu,"
            "\"system_operations\":%zu,\"pool_allocations\":%zu,\"values\":[",
-           result, (unsigned long long)wall, (unsigned long long)cpu,
-           system_operations, pool_allocations);
-    for (int i = 0; i < 257; i++) printf("%s%lld", i ? "," : "", book->values[i]);
+           result, (unsigned long long)wall, (unsigned long long)cpu, system_operations,
+           pool_allocations);
+    for (int i = 0; i < 257; i++)
+        printf("%s%lld", i ? "," : "", book->values[i]);
     puts("]}");
     minyar_rc_release(book);
 #ifdef MINYAR_BOUNDED_HEAP
-    while (rc_pending_count) minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
+    while (rc_pending_count)
+        minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
 #endif
 #ifdef MINYAR_CRITICAL_ACCOUNTING
     assert(!rc_object_count && !rc_bytes);

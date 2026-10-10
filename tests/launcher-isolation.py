@@ -16,6 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class LauncherIsolation(unittest.TestCase):
+    launcher_arguments = ()
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix='minyar launcher isolation ')
         self.addCleanup(temporary.cleanup)
@@ -30,6 +32,7 @@ class LauncherIsolation(unittest.TestCase):
             '.PHONY: build/minyarc build/minyar-runtime.o build/minyar-runtime-release.ll\n'
             'build/minyarc build/minyar-runtime.o build/minyar-runtime-release.ll:\n\t@:\n')
         shutil.copytree(ROOT / 'runtime', self.project / 'runtime')
+        shutil.copytree(ROOT / 'tools', self.project / 'tools')
         # Keep this path space-free for the race-only regression on the old launcher.
         wrapper = tempfile.NamedTemporaryFile(prefix='minyar-clang-barrier-', delete=False)
         wrapper.close()
@@ -74,7 +77,8 @@ os.execv(os.environ['LAUNCHER_TEST_REAL_CLANG'], ['clang', *sys.argv[1:]])
         source = directory / 'same source name.min'
         source.write_text(text)
         output = directory / 'output with spaces'
-        return [str(self.project / 'minyar'), *(['--release'] if release else []),
+        return [str(self.project / 'minyar'), *self.launcher_arguments,
+                *(['--release'] if release else []),
                 str(source), '-o', str(output)], output
 
     def assert_clean(self):
@@ -152,6 +156,28 @@ os.execv(os.environ['LAUNCHER_TEST_REAL_CLANG'], ['clang', *sys.argv[1:]])
                 self.assertEqual(result.returncode, status, result.stderr)
                 self.assertFalse(output.exists())
                 self.assert_clean()
+
+    def test_check_mode_validates_real_modules_without_native_dependencies(self):
+        shutil.copytree(ROOT / 'library', self.project / 'library')
+        source = self.work / 'source without extension'
+        original = 'use "graphics" as graphics\nuse "./answer.min" as answer\nprint(answer.value())\n'
+        source.write_text(original)
+        (self.work / 'answer.min').write_text('public function value(): Integer { return 42 }\n')
+        for text, status in ((original, 0), (original + 'print(missingName)\n', 1)):
+            source.write_text(text)
+            result = subprocess.run([str(self.project / 'minyar'), *self.launcher_arguments,
+                                     '--check', str(source)],
+                                    cwd=self.work, env=dict(self.env, LAUNCHER_TEST_ID='check'),
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+            self.assertEqual(source.read_text(), text)
+            if status:
+                self.assertIn("can't find a value", result.stderr)
+            else:
+                self.assertIn('checked ', result.stdout)
+            self.assertFalse((self.work / 'check.json').exists())
+            self.assertFalse((self.work / 'check-runtime.json').exists())
+            self.assert_clean()
 
 
 if __name__ == '__main__':

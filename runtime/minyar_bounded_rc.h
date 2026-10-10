@@ -1,7 +1,8 @@
 /* Finite-heap profile: no allocation in the pending queue:
- * a dead object's header becomes a tagged FIFO link. Its payload is retained
- * until a cursor has processed every field. Only zero-count objects enter the
- * object queue; detached frames and temporary chunks have separate queues.
+ * a dead object's header becomes a tagged recent-stack or captured-batch link.
+ * Its payload is retained until a cursor has processed every field. Only
+ * zero-count objects enter the object queue; detached frames and temporary
+ * chunks have separate queues.
  * A work unit visits one owner/field or retires one task (up to three frees).
  * Pool frees have at most log2(heap/minimum-block) merge steps. System
  * allocator calls have no runtime-imposed execution-time bound.
@@ -16,6 +17,7 @@ static unsigned rc_bounded_recent_turn;
  * reference flag and store seven cursor bits each. The loop executes at most
  * ceil(sizeof(size_t)*CHAR_BIT/7) iterations, independent of graph size. */
 static size_t rc_bounded_saved_cursor(RcObject *object) {
+    if ((object->ownership & 7) == RC_TEXT) return 0;
     if ((object->ownership & 7) == RC_REFERENCES)
         return (size_t)((MinyarList *)(object + 1))->capacity;
     MinyarRecord *record = (MinyarRecord *)(object + 1);
@@ -27,6 +29,7 @@ static size_t rc_bounded_saved_cursor(RcObject *object) {
 }
 
 static void rc_bounded_save_cursor(RcObject *object, size_t cursor) {
+    if ((object->ownership & 7) == RC_TEXT) return;
     if ((object->ownership & 7) == RC_REFERENCES) {
         ((MinyarList *)(object + 1))->capacity = (long long)cursor;
         return;
@@ -63,6 +66,14 @@ static void *rc_bounded_finish_object(RcObject *object, unsigned kind) {
     return text_backing;
 }
 
+static void rc_bounded_enqueue(RcObject *object) {
+    rc_bounded_save_cursor(object, 0);
+    object->ownership |= (size_t)(uintptr_t)rc_bounded_recent_head;
+    rc_bounded_recent_head = object;
+    if (!rc_bounded_recent_tail) rc_bounded_recent_tail = object;
+    rc_pending_count++;
+}
+
 static unsigned rc_drop(void *value) {
     if (!value) return 0;
     RcObject *object = (RcObject *)value - 1;
@@ -80,19 +91,26 @@ static unsigned rc_drop(void *value) {
     unsigned kind = object->ownership & 7;
     if (kind == RC_TEXT) {
         void *backing = rc_bounded_finish_object(object, kind);
-        return 1 + (backing ? rc_drop(backing) : 0);
+        /* A view owns a direct reference to an owning Text, never another
+         * view. Its destruction already costs one unit. Decrement the root
+         * without destroying a second object in that unit; a newly dead root
+         * becomes a fieldless task in the existing object queue. */
+        if (backing) {
+            RcObject *root = (RcObject *)backing - 1;
+            if (root->ownership >> 3) {
+                root->ownership -= 8;
+                if (!(root->ownership >> 3)) rc_bounded_enqueue(root);
+            }
+        }
+        return 1;
     }
-    if (kind == RC_TEXT || kind == RC_LIST || kind == RC_REFERENCES_IMMORTAL ||
+    if (kind == RC_LIST || kind == RC_REFERENCES_IMMORTAL ||
         (kind == RC_REFERENCES && !((MinyarList *)(object + 1))->length) ||
         (kind == RC_RECORD && !((MinyarRecord *)(object + 1))->length)) {
         rc_bounded_finish_object(object, kind);
         return 1;
     }
-    rc_bounded_save_cursor(object, 0);
-    object->ownership |= (size_t)(uintptr_t)rc_bounded_recent_head;
-    rc_bounded_recent_head = object;
-    if (!rc_bounded_recent_tail) rc_bounded_recent_tail = object;
-    rc_pending_count++;
+    rc_bounded_enqueue(object);
     return 0;
 }
 
@@ -156,7 +174,7 @@ static void rc_bounded_recent_object_unit(void) {
             rc_drop(child);
             return;
         }
-    } else {
+    } else if (kind == RC_RECORD) {
         MinyarRecord *record = (MinyarRecord *)(object + 1);
         if (cursor < (size_t)record->length) {
             unsigned char *map = (unsigned char *)(record->values + record->length);
