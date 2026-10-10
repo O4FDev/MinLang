@@ -251,6 +251,30 @@ MinyarList *minyar_list_appended(const MinyarList *list, long long value, long l
     return result;
 }
 
+/* list = list.appended(value), after the compiler moved the local's owner
+ * into this call. When that was the List's only owner, no record or other
+ * List refers to it, so value cannot reach it: appending in place cannot form
+ * a cycle, and nothing can observe the change. Building a List of a
+ * self-referential record type, which must use appended, is then linear.
+ * Otherwise this is the copying append, and the moved owner is released. */
+MinyarList *minyar_list_appended_take(MinyarList *list, long long value, long long references,
+                                      long long take_value) {
+#ifdef MINYAR_COMPILER_ARENA
+    return minyar_list_appended(list, value, references, take_value);
+#else
+    if ((((RcObject *)list - 1)->ownership >> 3) == 1) {
+        if (take_value)
+            minyar_list_add_take(list, value);
+        else
+            minyar_list_add(list, value);
+        return list;
+    }
+    MinyarList *result = minyar_list_appended(list, value, references, take_value);
+    minyar_rc_release(list);
+    return result;
+#endif
+}
+
 #ifdef MINYAR_BOUNDED_RC
 MINYAR_HOT
 #else
