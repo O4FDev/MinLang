@@ -15,6 +15,7 @@ heavily loaded machine; the load average was 30-76 throughout.
 | 3 | Every function, even a one-line accessor, called the runtime's call-depth guard, so LLVM never inlined hot leaves | leaf functions carry no call-depth frame | Minyarcraft world build 32.1G instructions; compiler self-compile 91M | 25.6G; 81M | -20%; -11% |
 | 4 | `record.field[i] = v` retained, registered and released the field on every store | no borrow when the rest of the statement makes no call | Minyarcraft 25.6G | 17.3G | -32% |
 | 5 | `record.text = record.text + piece` copied the whole Text each time (quadratic) | in-place append when the record holds the only other reference | 80,000 appends 4.11G | 79.8M | 51x (and linear) |
+| 6 | Compiling multi-module programs spent 27% of its time comparing symbol names character by character | symbol tables ordered by length, then from the last character | OS kernel compile 485M; Minyarcraft 109M; Atacama 80.5M | 342M; 71.4M; 58.1M | -28% to -35% |
 
 ### 1. Long lists rebuilt as stacks of views
 
@@ -194,7 +195,39 @@ first, nested fields and List elements. It printed the same output as the v2
 compiler under the system, eager, fixed and lazy memory profiles, `--release`
 and `--debug`.
 
-### 6. Two competing `http` packages
+### 6. Symbol lookups dominated multi-module compiles
+
+**Problem.** Compiling the Minyar-OS kernel cost about 5x more instructions
+per line than the compiler compiling itself.
+
+**Evidence.** An `xctrace` Time Profiler run over 60 kernel compiles put
+`compareText` at 271 of 1,013 samples (27%). The symbol table is heap-sorted
+and binary-searched, so the number of comparisons was already O(n log n), but
+each comparison walked the shared prefix of module-qualified names
+(`minyar_module_12_...`) through checked Text indexing.
+
+**Fix.** The table needs a consistent total order, not alphabetical order, so
+`compareSymbolName` orders by length and then from the last character. Equal
+names still sort together, which the duplicate-declaration check relies on.
+The two other `compareText` callers (integer-literal range checks) keep the
+lexicographic comparison.
+
+| Front-end compile (retired instructions) | v2 | Now | Change |
+| --- | ---: | ---: | ---: |
+| Minyar-OS kernel | 485.2M | 341.5M | -30% |
+| Minyar-OS loader | 132.2M | 92.3M | -30% |
+| Minyarcraft | 109.3M | 71.4M | -35% |
+| Atacama | 80.5M | 58.1M | -28% |
+| The compiler itself (one file) | 89.9M | 80.9M | -10% (mostly change 3) |
+
+These figures include changes 3 and 6. For change 6 alone, the generated IR
+is byte-identical for all five programs.
+
+**Tests.** Byte-identical output is the main check. `check-modules` (including
+the duplicate-declaration diagnostics), `check-diagnostics` and
+`check-regressions` pass.
+
+### 7. Two competing `http` packages
 
 Not a speed fix, but one of the limits the brief named. appkit's NSURLSession
 `http` and minyar-os's portable socket/TLS `http` both arrived in v2 under the
@@ -237,6 +270,18 @@ A Time Profiler trace of 300 self-compiles (`xctrace`, all processes) puts
 `minyar_join_texts` at 14% self time, dyld start-up at about 20%, and the rest
 spread across `compileFunctions`, `parseAtom`, `tokenIs` and `findLocal`, which
 are already tuned.
+
+## A bug introduced and fixed tonight
+
+The clean-up after review moved leaf detection onto a new parser-state slot,
+index 14. That slot was already the base of the ownership-slot map
+(`ownershipSlot` stores entries from index 14). When a body's call count
+happened to equal its generation number, a binding got ownership slot -1, an
+out-of-bounds store. The module test `private-fields` crashed about 30% of
+the time; ASan showed a heap-buffer-overflow in `minyar_rc_local_take`. The
+map now starts at index 15. `tests/regressions.py` has a deterministic case,
+which fails on the broken build and passes now. The broken commit had been
+merged into v2 but not pushed; the suite run on it was stopped.
 
 ## Tried and reverted
 
