@@ -17,6 +17,7 @@ heavily loaded machine; the load average was 30-76 throughout.
 | 5 | `record.text = record.text + piece` copied the whole Text each time (quadratic) | in-place append when the record holds the only other reference | 80,000 appends 4.11G | 79.8M | 51x (and linear) |
 | 6 | Compiling multi-module programs spent 27% of its time comparing symbol names character by character | symbol tables ordered by length, then from the last character | OS kernel compile 485M; Minyarcraft 109M; Atacama 80.5M | 342M; 71.4M; 58.1M | -28% to -35% |
 | 7 | `json.parse` built every string from a parts list, a slice and a join | one slice when a string has no escapes | 20 parses of a 143 KB history response 1.22G | 0.95G | -22% |
+| 9 | Minyarcraft's GPU vertex buffers dominated its memory (40-byte float vertices) | mesh vertices packed to 32 bytes: Float32 position and UV, Float16 colour and light | peak RSS 602 MB, footprint 892 MB | 447-523 MB, 815-844 MB | -13% to -26% RSS |
 | 8 | Every macOS app build recompiled the Objective-C bridges (`macos.m` 0.46 s, `http.m` 0.12 s) | content-keyed object cache, already used for `graphics.c`, now for every native bridge | Atacama default build 0.93-1.11 s; release app 1.86-2.41 s | 0.48 s; 1.39-1.46 s | about 2x |
 
 ### 1. Long lists rebuilt as stacks of views
@@ -283,7 +284,45 @@ source or the flags must each produce a new object, and no temporary files
 may be left behind. `tests/native-graphics.py` and a Minyarcraft build still
 pass.
 
-### 9. Two competing `http` packages
+### 9. Mesh vertices were 40 bytes of Float32
+
+**Problem.** `craft --screenshot` peaks at about 600 MB of RSS and an 892 MB
+memory footprint. The world itself is 21 MB of blocks, so most of the rest is
+the 1,024 chunk meshes uploaded with `glBufferData`. Each vertex was ten
+Float32 values, and each quad is six vertices.
+
+**Fix.** Mesh vertices are 32 bytes. Position and texture coordinates stay
+Float32, so atlases up to 8192 px keep exact texel positions. Colour, sky and
+glow become Float16, which still holds values above 1 and is far finer than
+8-bit display. Lines keep their ten-Float32 layout. The conversion uses the
+processor's half-precision conversion where the compiler has `_Float16`; a
+portable round-to-nearest-even routine (`runtime/native/half-float.h`) is the
+fallback. Indexed quads (four vertices instead of six) would save more, but
+they would change the `graphics` API, so they are left for later.
+
+| `craft --screenshot noon` (3 runs) | Before | After |
+| --- | ---: | ---: |
+| Peak RSS | 602, 603, 602 MB | 447, 450, 523 MB |
+| Peak memory footprint | 892, 892, 897 MB | 815, 815, 844 MB |
+| Retired instructions | 17.31G, 17.29G, 17.30G | 17.24G, 17.22G, 17.21G |
+
+A first version that converted in software everywhere cost +6% instructions
+(18.33G), which is why the hardware path is used where available.
+
+**Tests.**
+- `benchmarks/desktop/render-check.min` draws a fixed scene with a range of
+  colours, sky and glow; two runs of one build give identical PNGs. Against
+  the 40-byte build, the largest difference in any colour channel is 1/255,
+  on 0.4% of bytes, from half-precision rounding. The Minyarcraft screenshot
+  looks the same, selection lines included.
+- `tests/half-float.c` (`check-half-float`, part of `check` and
+  `check-portable`) compares the software conversion with `_Float16` for one
+  float32 bit pattern in 13 and every exactly representable half. Run with
+  `all`, it checks all 2^32 values; they all match. A mutant without
+  ties-to-even fails with 2,363 mismatches.
+- `tests/native-graphics.py` passes.
+
+### 10. Two competing `http` packages
 
 Not a speed fix, but one of the limits the brief named. appkit's NSURLSession
 `http` and minyar-os's portable socket/TLS `http` both arrived in v2 under the

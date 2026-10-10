@@ -3,8 +3,11 @@
  * input, and a small OpenGL 3.3 renderer for textured meshes, lines and a 2D
  * overlay. Minyar code reaches these functions through library/graphics.min.
  *
- * Mesh vertices are 40 bytes: position x, y, z, texture u, v, colour r, g, b,
- * sky and glow, each a little-endian Float32. A texel is multiplied by the
+ * Mesh vertices are 32 bytes: position x, y, z and texture u, v as
+ * little-endian Float32, then colour r, g, b, two bytes of padding, and sky
+ * and glow as little-endian Float16 (half precision, ample for 8-bit display
+ * and able to hold values above 1). Lines keep ten Float32 values per vertex.
+ * A texel is multiplied by the
  * colour and by sky * light + glow (at most 1), where light is the level set
  * with setLight; sky light dims at night and glow does not. Texels with alpha
  * below one half are discarded.
@@ -24,8 +27,12 @@
 #include <stdint.h>
 #include "../minyar_native.h"
 #include "opengl-functions.h"
+#include "half-float.h"
+#ifndef GL_HALF_FLOAT
+#define GL_HALF_FLOAT 0x140B
+#endif
 
-enum { VERTEX_FLOATS = 10, VERTEX_BYTES = VERTEX_FLOATS * 4, KEY_COUNT = GLFW_KEY_LAST + 1, BUTTON_COUNT = 8 };
+enum { VERTEX_FLOATS = 10, VERTEX_BYTES = 32, KEY_COUNT = GLFW_KEY_LAST + 1, BUTTON_COUNT = 8 };
 
 typedef struct {
     GLuint array, buffer;
@@ -219,15 +226,29 @@ static GLuint link_program(const char *vertex_source, const char *fragment_sourc
     return program;
 }
 
-static void world_layout(void) {
+/* Meshes: packed 32-byte vertices (see the top of this file). */
+static void mesh_layout(void) {
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, VERTEX_BYTES, (void *)0);
     glEnableVertexAttribArray(1);
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, VERTEX_BYTES, (void *)12);
     glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, VERTEX_BYTES, (void *)20);
+    glVertexAttribPointer(2, 3, GL_HALF_FLOAT, GL_FALSE, VERTEX_BYTES, (void *)20);
     glEnableVertexAttribArray(3);
-    glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, VERTEX_BYTES, (void *)32);
+    glVertexAttribPointer(3, 2, GL_HALF_FLOAT, GL_FALSE, VERTEX_BYTES, (void *)28);
+}
+
+/* Lines: ten Float32 values per vertex, streamed once a frame. */
+static void line_layout(void) {
+    const GLsizei stride = VERTEX_FLOATS * 4;
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, (void *)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, stride, (void *)12);
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, stride, (void *)20);
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, stride, (void *)32);
 }
 
 static GLuint make_texture(const unsigned char *pixels, int width, int height, int mipmaps) {
@@ -327,7 +348,7 @@ void minyar_graphics_openWindow(long long width, long long height, const MinyarT
     glGenBuffers(1, &line_buffer);
     glBindVertexArray(line_array);
     glBindBuffer(GL_ARRAY_BUFFER, line_buffer);
-    world_layout();
+    line_layout();
 
     glGenVertexArrays(1, &overlay_array);
     glGenBuffers(1, &overlay_buffer);
@@ -648,7 +669,7 @@ long long minyar_graphics_createMesh(void) {
     glGenBuffers(1, &mesh->buffer);
     glBindVertexArray(mesh->array);
     glBindBuffer(GL_ARRAY_BUFFER, mesh->buffer);
-    world_layout();
+    mesh_layout();
     glBindVertexArray(0);
     mesh_next_slot = slot + 1;
     return (long long)slot + 1;
@@ -657,7 +678,7 @@ long long minyar_graphics_createMesh(void) {
 void minyar_graphics_updateMesh(long long handle, const MinyarBytes *vertices) {
     Mesh *mesh = find_mesh(handle);
     if (vertices->byte_length % VERTEX_BYTES)
-        stop_graphics("mesh vertices are 40 bytes each: x, y, z, u, v, red, green, blue, sky, glow as Float32; use graphics.addVertex.");
+        stop_graphics("mesh vertices are 32 bytes each (x, y, z, u, v as Float32; red, green, blue, padding, sky, glow as Float16); use graphics.addVertex.");
     glBindBuffer(GL_ARRAY_BUFFER, mesh->buffer);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)vertices->byte_length, vertices->bytes, GL_STATIC_DRAW);
     mesh->count = (GLsizei)(vertices->byte_length / VERTEX_BYTES);
@@ -675,19 +696,39 @@ static void use_world_program(void) {
     glActiveTexture(GL_TEXTURE0);
 }
 
+static void put_float(unsigned char *target, float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, 4);
+    for (int i = 0; i < 4; i++) target[i] = (unsigned char)(bits >> (8 * i));
+}
+
+static void put_half(unsigned char *target, double value) {
+#ifdef __FLT16_MAX__
+    /* One instruction on processors with half-precision conversion. */
+    _Float16 half = (_Float16)(float)value;
+    uint16_t bits;
+    memcpy(&bits, &half, 2);
+#else
+    uint16_t bits = minyar_half_float((float)value);
+#endif
+    target[0] = (unsigned char)bits;
+    target[1] = (unsigned char)(bits >> 8);
+}
+
 static void add_vertex(MinyarBytes *vertices, double x, double y, double z, double u, double v,
                        double red, double green, double blue, double sky, double glow) {
-    float values[VERTEX_FLOATS] = {(float)x, (float)y, (float)z, (float)u, (float)v,
-                                   (float)red, (float)green, (float)blue, (float)sky, (float)glow};
     unsigned char *target = minyar_bytes_extend(vertices, VERTEX_BYTES);
-    for (int i = 0; i < VERTEX_FLOATS; i++) {
-        uint32_t bits;
-        memcpy(&bits, &values[i], 4);
-        target[i * 4] = (unsigned char)bits;
-        target[i * 4 + 1] = (unsigned char)(bits >> 8);
-        target[i * 4 + 2] = (unsigned char)(bits >> 16);
-        target[i * 4 + 3] = (unsigned char)(bits >> 24);
-    }
+    put_float(target, (float)x);
+    put_float(target + 4, (float)y);
+    put_float(target + 8, (float)z);
+    put_float(target + 12, (float)u);
+    put_float(target + 16, (float)v);
+    put_half(target + 20, red);
+    put_half(target + 22, green);
+    put_half(target + 24, blue);
+    target[26] = target[27] = 0;
+    put_half(target + 28, sky);
+    put_half(target + 30, glow);
 }
 
 void minyar_graphics_addVertex(MinyarBytes *vertices, double x, double y, double z, double u, double v,
