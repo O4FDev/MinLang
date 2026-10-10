@@ -45,8 +45,19 @@ TARGETS = ['check-toolchain-stamp', 'check-toolchain-portability', 'check-cold-b
            'check-ownership-mutation', 'check-scalar-record-initialization',
            'check-incremental-modules', 'check-incremental-modules-sanitize',
            'check-sanitize']
-DIRECTORIES = ('bootstrap', 'compiler', 'runtime', 'library', 'vendor', 'examples', 'tests', 'build-support', 'docs',
+DIRECTORIES = ('.github', 'bootstrap', 'compiler', 'runtime', 'library', 'vendor', 'examples', 'tests', 'build-support', 'docs',
                'experiments', 'scripts', 'tools')
+
+
+def snapshot_sources(source, work):
+    """Copy the correctness inputs without host binaries or repository state."""
+    for name in DIRECTORIES:
+        shutil.copytree(source / name, work / name,
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+    for name in ('Makefile', 'minyar'):
+        shutil.copy2(source / name, work / name)
+    return {str(path.relative_to(work)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(work.rglob('*')) if path.is_file()}
 
 
 def main():
@@ -62,7 +73,7 @@ def main():
     source = (a.resume.resolve() / 'source') if a.resume else a.source.resolve()
     if a.timeout < 1:
         p.error('timeout must be positive')
-    required = ['Makefile', 'minyar', 'runtime/minyar_heap.h',
+    required = ['Makefile', 'minyar', '.github/workflows/ci.yml', 'runtime/minyar_heap.h',
                 'tests/generated-stack-sanitizer.py', 'tests/llvm_sanitizer.py',
                 'tests/binary-expression-ownership.py',
                 'tests/integer-text-cache.c', 'tests/integer-text-cache.py',
@@ -130,14 +141,7 @@ def main():
                   'invocation': sys.argv, 'tools': tools, 'source_sha256': {}, 'checks': [],
                   'scope': 'Correctness on the recorded Linux host/toolchain. No performance or deadline certification.'}
         # Copy source only: never inherit host binaries, generated IR or .git state.
-        for name in DIRECTORIES:
-            shutil.copytree(source / name, work / name,
-                            ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
-        for name in ('Makefile', 'minyar'):
-            shutil.copy2(source / name, work / name)
-        for path in sorted(work.rglob('*')):
-            if path.is_file():
-                report['source_sha256'][str(path.relative_to(work))] = hashlib.sha256(path.read_bytes()).hexdigest()
+        report['source_sha256'] = snapshot_sources(source, work)
     runner_bytes = Path(__file__).read_bytes()
     runner_hash = hashlib.sha256(runner_bytes).hexdigest()
     runner_history = evidence / 'runners'
