@@ -264,6 +264,86 @@ static void result_status(MinyarBytes *b, unsigned status, int code) {
     put32((unsigned char *)b->bytes, status);
     put32((unsigned char *)b->bytes + 4, (uint32_t)code);
 }
+static MinyarBytes *connect_result(unsigned status, int code, long long value) {
+    MinyarBytes *result = minyar_bytes_new(16);
+    result_status(result, status, code);
+    for (unsigned i = 0; i < 8; i++)
+        ((unsigned char *)result->bytes)[8 + i] = (unsigned char)((uint64_t)value >> (8 * i));
+    return result;
+}
+/* Literal-address connect never invokes DNS or waits for a remote peer. */
+MinyarBytes *minyar_net_connectStartResult(const MinyarText *host, long long port) {
+    if (!initialize() || port <= 0 || port > 65535 || host->byte_length <= 0 ||
+        host->byte_length >= 256 || memchr(host->bytes, 0, (size_t)host->byte_length))
+        return connect_result(NET_FAILURE, BAD_ARGUMENT, -1);
+    char name[256], service[16];
+    memcpy(name, host->bytes, (size_t)host->byte_length);
+    name[host->byte_length] = 0;
+    snprintf(service, sizeof(service), "%lld", port);
+    struct addrinfo hints = {0}, *found = NULL;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
+    int resolved = getaddrinfo(name, service, &hints, &found);
+    if (resolved)
+        return connect_result(NET_FAILURE, resolved, -1);
+    int code = BAD_ARGUMENT;
+    socket_t handle = BAD_SOCKET;
+    for (struct addrinfo *option = found; option; option = option->ai_next) {
+        socket_t candidate = socket(option->ai_family, option->ai_socktype, option->ai_protocol);
+        if (candidate == BAD_SOCKET) {
+            code = socket_error();
+            continue;
+        }
+        if (!configure(candidate, true)) {
+            code = socket_error();
+            close_socket(candidate);
+            continue;
+        }
+        int status = connect(candidate, option->ai_addr, (socklen_t)option->ai_addrlen);
+        code = status ? socket_error() : 0;
+        bool pending = would_block(code) || interrupted(code);
+#ifndef _WIN32
+        pending = pending || code == EINPROGRESS || code == EALREADY;
+#endif
+        if (!status || pending) {
+            handle = candidate;
+            break;
+        }
+        close_socket(candidate);
+    }
+    freeaddrinfo(found);
+    if (handle == BAD_SOCKET)
+        return connect_result(NET_FAILURE, code, -1);
+    return connect_result(NET_OK, 0, (long long)handle);
+}
+MinyarBytes *minyar_net_connectFinishResult(long long connection) {
+    if (!valid_socket(connection))
+        return connect_result(NET_FAILURE, BAD_ARGUMENT, 0);
+#ifdef _WIN32
+    WSAPOLLFD entry = {(socket_t)connection, POLLOUT, 0};
+    int ready = WSAPoll(&entry, 1, 0);
+    int blocked = WSAEWOULDBLOCK;
+#else
+    struct pollfd entry = {(int)connection, POLLOUT, 0};
+    int ready = poll(&entry, 1, 0);
+    int blocked = EAGAIN;
+#endif
+    if (ready < 0)
+        return connect_result(NET_FAILURE, socket_error(), 0);
+    if (!ready)
+        return connect_result(NET_WOULD_BLOCK, blocked, 0);
+    if (entry.revents & POLLNVAL)
+        return connect_result(NET_FAILURE, BAD_ARGUMENT, 0);
+    int code = 0;
+    socklen_t length = sizeof(code);
+    if (getsockopt((socket_t)connection, SOL_SOCKET, SO_ERROR, (void *)&code, &length))
+        return connect_result(NET_FAILURE, socket_error(), 0);
+    if (code)
+        return connect_result(NET_FAILURE, code, 0);
+    if (!(entry.revents & POLLOUT))
+        return connect_result(NET_WOULD_BLOCK, blocked, 0);
+    return connect_result(NET_OK, 0, 1);
+}
 MinyarBytes *minyar_net_readResult(long long connection, long long limit, bool datagram) {
     MinyarBytes *result = minyar_bytes_new(8);
     last_error[0] = 0;
