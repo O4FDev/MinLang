@@ -131,18 +131,78 @@ static wchar_t *worker_quote(wchar_t *out, const wchar_t *value) {
     *out++ = L'"';
     return out;
 }
+typedef struct WorkerSecurity {
+    SECURITY_DESCRIPTOR descriptor;
+    TOKEN_USER *user;
+    ACL *acl;
+} WorkerSecurity;
+static void worker_security_clear(WorkerSecurity *security) {
+    free(security->user);
+    free(security->acl);
+}
+/* The default named-pipe DACL grants Everyone/Anonymous read access. Use the
+ * creating account explicitly, including as owner when elevated token defaults
+ * would otherwise name the Administrators group. No local broad reader gets
+ * access to a copied message, even if it guesses this pipe's name. */
+static DWORD worker_security(WorkerSecurity *security) {
+    memset(security, 0, sizeof(*security));
+    HANDLE token = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return GetLastError();
+    DWORD size = 0, code = 0;
+    if (GetTokenInformation(token, TokenUser, NULL, 0, &size) ||
+        GetLastError() != ERROR_INSUFFICIENT_BUFFER || size < sizeof(TOKEN_USER) || size > 1024)
+        code = ERROR_INVALID_DATA;
+    if (!code) {
+        security->user = malloc(size);
+        if (!security->user)
+            code = ERROR_NOT_ENOUGH_MEMORY;
+        else if (!GetTokenInformation(token, TokenUser, security->user, size, &size))
+            code = GetLastError();
+    }
+    CloseHandle(token);
+    if (!code && !IsValidSid(security->user->User.Sid))
+        code = ERROR_INVALID_SID;
+    if (!code) {
+        DWORD length = sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD) +
+                       GetLengthSid(security->user->User.Sid);
+        security->acl = malloc(length);
+        if (!security->acl)
+            code = ERROR_NOT_ENOUGH_MEMORY;
+        else if (!InitializeAcl(security->acl, length, ACL_REVISION) ||
+                 !AddAccessAllowedAce(security->acl, ACL_REVISION, FILE_ALL_ACCESS,
+                                      security->user->User.Sid) ||
+                 !InitializeSecurityDescriptor(&security->descriptor,
+                                               SECURITY_DESCRIPTOR_REVISION) ||
+                 !SetSecurityDescriptorOwner(&security->descriptor, security->user->User.Sid,
+                                             FALSE) ||
+                 !SetSecurityDescriptorDacl(&security->descriptor, TRUE, security->acl, FALSE))
+            code = GetLastError();
+    }
+    return code;
+}
 static DWORD worker_pipe(HANDLE *parent, HANDLE *child, int input) {
     wchar_t name[128];
     swprintf(name, sizeof(name) / sizeof(*name), L"\\\\.\\pipe\\minyar-worker-%lu-%llu",
              (unsigned long)GetCurrentProcessId(), (unsigned long long)++worker_pipe_identity);
+    WorkerSecurity private_security;
+    DWORD code = worker_security(&private_security);
+    if (code) {
+        worker_security_clear(&private_security);
+        return code;
+    }
+    SECURITY_ATTRIBUTES server_security = {sizeof(server_security), &private_security.descriptor,
+                                           FALSE};
     HANDLE server = CreateNamedPipeW(name,
                                      (input ? PIPE_ACCESS_OUTBOUND : PIPE_ACCESS_INBOUND) |
                                          FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
                                      PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT |
                                          PIPE_REJECT_REMOTE_CLIENTS,
-                                     1, 65536, 65536, 0, NULL);
+                                     1, 65536, 65536, 0, &server_security);
+    code = server == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+    worker_security_clear(&private_security);
     if (server == INVALID_HANDLE_VALUE)
-        return GetLastError();
+        return code;
     SECURITY_ATTRIBUTES security = {sizeof(security), NULL, TRUE};
     HANDLE client = CreateFileW(name, input ? GENERIC_READ : GENERIC_WRITE, 0, &security,
                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -153,7 +213,7 @@ static DWORD worker_pipe(HANDLE *parent, HANDLE *child, int input) {
     }
     OVERLAPPED connected = {0};
     connected.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-    DWORD code = connected.hEvent ? 0 : GetLastError();
+    code = connected.hEvent ? 0 : GetLastError();
     if (!code && !ConnectNamedPipe(server, &connected)) {
         code = GetLastError();
         if (code == ERROR_PIPE_CONNECTED)

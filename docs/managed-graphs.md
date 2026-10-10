@@ -140,13 +140,26 @@ migration and isolated literal/lazy-index handling, rather than atomic counts
 alone. The Windows backend uses stable per-worker `OVERLAPPED` state, bounded
 copied frame queues, UTF-16 `CreateProcessW` arguments, an explicit inherited
 handle list, and kill-on-close jobs. Registry growth never moves pending I/O
-state or buffers. Parent waits block on I/O completion events; child pipe ends
+state or buffers. Its named-pipe ACL grants only the creating account, rather
+than the default Everyone/Anonymous read grants described by Microsoft's
+[pipe security contract](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights).
+This separates managed heaps and channel ownership; executable workers still
+have their user's normal OS permissions and are not an untrusted-code sandbox.
+Parent waits block on I/O completion events; child pipe ends
 remain synchronous. Startup creates the process suspended, assigns its private
 job, then resumes it. Close cancels pending operations before releasing their
 buffers, terminates the worker, and waits for process cleanup. These choices
 follow Microsoft's [overlapped I/O](https://learn.microsoft.com/en-us/windows/win32/ipc/synchronous-and-overlapped-pipe-i-o)
 and [restricted handle inheritance](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute)
 contracts. Arguments use the documented [quote and backslash rules](https://learn.microsoft.com/en-us/cpp/c-language/parsing-c-command-line-arguments).
+
+The native Windows worker fixture checks real pipe ACLs, unrelated inheritable
+handle exclusion, cancellation with both a read and a write pending, malformed
+coordinator-side output, chunk boundaries and exact handle release. It requires
+descendants to terminate on close and on abrupt coordinator exit, including
+when ordinary `atexit` cleanup is bypassed. These subprocess isolation controls
+also follow the adversarial handle-lifetime approach in
+[CPython's subprocess tests](https://github.com/python/cpython/blob/main/Lib/test/test_subprocess.py).
 
 Short TDD checks cover escaping scalar/reference captures, hidden closure
 cycles, indirect reference arguments/results, nested callbacks/recursion,
