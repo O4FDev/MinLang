@@ -163,10 +163,17 @@ def lto_flags(clang, link_flags):
     # Linux's default GNU linker needs an optional LLVMgold plugin for LTO.
     # Prefer the toolchain's lld when available unless the user chose a linker.
     if platform.system() != 'Darwin' and not any(a.startswith(('-fuse-ld=', '--ld-path=')) for a in link_flags):
-        sibling = Path(shutil.which(clang) or clang).resolve().parent / 'ld.lld'
-        if sibling.is_file():
-            lto += ['-fuse-ld=' + str(sibling)]
-        elif shutil.which('ld.lld'):
+        system = platform.system()
+        windows = system == 'Windows' or system.startswith(('MSYS', 'MINGW', 'CYGWIN'))
+        names = ('ld.lld.exe', 'ld.lld') if windows else ('ld.lld',)
+        directory = Path(shutil.which(clang) or clang).resolve().parent
+        sibling = next((directory / name for name in names if (directory / name).is_file()), None)
+        if sibling is not None:
+            # MinGW checks the flavor literally before accepting bitcode.
+            # An absolute -fuse-ld path selects lld but disables that support;
+            # keep the flavor and executable location as separate arguments.
+            lto += ['-fuse-ld=lld', '--ld-path=' + str(sibling)] if windows else ['-fuse-ld=' + str(sibling)]
+        elif any(shutil.which(name) for name in names):
             lto += ['-fuse-ld=lld']
     return lto
 
@@ -293,8 +300,16 @@ def main():
             pass  # Compiler intrinsics: the code is already inline in the program.
         elif library == 'net':
             native += [native_object(project, clang, base, 'net.c', native_flags)]
-            if platform.system() == 'Windows':
+            if platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
                 native += ['-lws2_32']
+        elif library == 'tlsverify':
+            native += [native_object(project, clang, base, 'tlsverify.c', native_flags)]
+            if platform.system() == 'Darwin':
+                native += ['-framework', 'Security', '-framework', 'CoreFoundation']
+            elif platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
+                native += ['-lcrypt32', '-lbcrypt', '-lncrypt', '-lws2_32']
+            else:
+                native += ['-lcrypto']
         else:
             raise ValueError(f'the program uses an unknown native library: {library}')
     lto = lto_flags(clang, link_flags) if release == '1' else []

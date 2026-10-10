@@ -11,6 +11,9 @@ VERSION = "23.1.2"
 FILES = (
     "bootstrap/stage0.c", "tools/module-build.c",
     "runtime/minyar_bytes.h", "runtime/minyar_collections.h", "runtime/minyar_numbers.h",
+    "runtime/native/net.c", "runtime/native/net_datagrams.h", "runtime/native/net_loop.h",
+    "runtime/native/tlsverify.c", "tests/tls-windows-signing.c",
+    "tests/net-native.c", "tests/net-batch.c", "tests/net-loop.c",
     "tests/runtime-bytes.c", "tests/runtime-traps.c",
     "tests/llvm_symbols.h",
     "tests/stack-limits.c", "experiments/memory/checked-scalars-driver.c",
