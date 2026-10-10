@@ -226,7 +226,12 @@ is byte-identical for all five programs.
 
 **Tests.** Byte-identical output is the main check. `check-modules` (including
 the duplicate-declaration diagnostics), `check-diagnostics` and
-`check-regressions` pass.
+`check-regressions` pass. `tests/symbol-order.py` (`check-symbol-order`)
+pinned `compareSymbol` to alphabetical order. Its oracle now uses the new
+order (UTF-8 length, character count, characters from the end, kind). It
+still checks reflexivity, antisymmetry, transitivity, equal names comparing
+equal, and the lookup permutation, and it fails on the previous compiler.
+`compareText` is still checked against alphabetical order.
 
 ### 7. JSON strings were assembled from parts
 
