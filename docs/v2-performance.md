@@ -1060,6 +1060,13 @@ v2 and passes now.
   instructions and about 15 s of CPU for one delete over 500 runs, the same
   before and after change 19. It measures the driver's search more than the
   app, but VoiceOver walking a long list would pay the same.
+- **Non-ASCII streamed answers.** An in-place Text append (change 5) drops
+  a non-ASCII Text's character index, so each frame's `answer.length` and
+  `slice` in Atacama rebuild it over the whole answer. With an em dash, a
+  curly apostrophe and an ellipsis among the stub's words, a 12,000-delta
+  answer cost 11.24G instructions against 10.79G for ASCII (+4%, one run
+  each), because the rebuild reads ASCII eight bytes at a time. Extending
+  the index on append instead would remove that.
 - **Typing in Atacama.** 300 keystrokes, 20 ms apart: 2.8G instructions and
   0.61 s of CPU, about 2 ms per key. The main thread waits in `nextEvent` 95%
   of the time, and the rest is AppKit's key handling, not the app's re-render.
