@@ -45,28 +45,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                               PrivatePkcs8KeyDer::from(fs::read(&args[4])?).into())?;
     crypto.alpn_protocols = vec![b"minyar-test".to_vec()];
     crypto.enable_early_data = env::var_os("MINYAR_QUINN_EARLY").is_some();
-    let config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
+    let mut config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
+    let mut transport=quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(Duration::from_secs(15)));config.transport_config(Arc::new(transport));
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
     endpoint.set_default_client_config(config);
     if args.len() > 7 {
         let duration: u64 = args[5].parse()?;
         let peers: usize = args[6].parse()?;
         let interval: u64 = args[7].parse()?;
-        if peers==0 || peers>16384 || interval==0 { return Err("invalid bounded scale configuration".into()); }
+        if peers==0 || peers>16384 || interval==0 || duration==0 { return Err("invalid bounded scale configuration".into()); }
         let setup_delay: u64 = env::var("MINYAR_QUINN_SETUP_DELAY_MS").unwrap_or_else(|_| "0".into()).parse()?;
         if setup_delay>10000 { return Err("setup delay exceeds bound".into()); }
         let authenticated=Arc::new(AtomicUsize::new(0));
+        let barrier=Arc::new(tokio::sync::Barrier::new(peers));
         let mut clients = tokio::task::JoinSet::new();
         for id in 0..peers {
             let endpoint = endpoint.clone();
             let remote = remote_address(&args[1])?;
             let authenticated=authenticated.clone();
+            let barrier=barrier.clone();
             clients.spawn(async move {
                 let connection = tokio::time::timeout(Duration::from_secs(20),endpoint.connect(remote, "localhost")?).await??;
                 let count=authenticated.fetch_add(1,Ordering::SeqCst)+1;
                 if count==1 || count%1000==0 || count==peers { println!("AUTHENTICATED {count}"); }
                 let (mut send, mut receive) = connection.open_bi().await?;
+                tokio::time::timeout(Duration::from_secs(600),barrier.wait()).await?;
                 let started = tokio::time::Instant::now();
+                // Authentication completes before the common two-hour window.
+                // Spread first heartbeats across the interval rather than
+                // releasing ten thousand writes in a single scheduler burst.
+                tokio::time::sleep(Duration::from_millis((id as u64*7919)%interval)).await;
                 let mut echoes = 0u64;
                 while started.elapsed() < Duration::from_secs(duration) {
                     let mut message = [0u8; 64];
