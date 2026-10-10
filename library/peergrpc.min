@@ -6,6 +6,7 @@ record Call {
     id: Integer; buffer: Bytes; data: Bytes; opened: Boolean; notified: Boolean
     token: Bytes; exit: Text; connection: Text; deadline: Integer; due: Integer; monoDue: Integer
     timeout: Integer; acceptedWall: Integer; acceptedMono: Integer; status: Boolean; accepted: Boolean; ended: Boolean
+    explicitTimeout: Boolean; deadlineActive: Boolean
     error: errors.Error
 }
 public record Server { private transport: h2.Server; private calls: List<Call>; private held: Integer; private mono: Integer }
@@ -15,7 +16,7 @@ public record OpenResult {
 }
 constant LIMIT = 1048576
 constant MAX_MESSAGE = 65540
-public function path(): Text { return "/hearth.peer.v1.PeerGateway/Dial" }
+public function path(): Text { return "/PeerEdgeDial/OpenExitStream" }
 function problem(code: Integer, message: Text): errors.Error { return errors.make(code, 0, message) }
 function failure(code: Integer, message: Text): errors.BooleanResult { return errors.booleanFailure(problem(code, message)) }
 function rejected(error: errors.Error): OpenResult { return OpenResult { error: error; stream: 0; token: Bytes(); exit: ""; connection: ""; deadline: 0; due: 0; monoDue: 0 } }
@@ -53,7 +54,7 @@ function token(bytes: Bytes): Boolean {
     return true
 }
 function timeoutMillis(text: Text): Integer {
-    if text == "" { return 9223372036854775807 }
+    if text == "" { return 10000 }
     if text.length < 2 || text.length > 9 { return -1 }
     let number = 0
     for i in 0..(text.length - 1) { let c = text[i]; if c < '0' || c > '9' { return -1 }; number = number * 10 + Integer(c) - 48 }
@@ -106,16 +107,13 @@ function openMessage(server: Server, call: Call, bytes: Bytes): Boolean {
             if (seen & 2) != 0 { return false }; seen = seen | 2; let value = blob(cursor); if !identifier(value) { return false }; call.exit = Text(value)
         } else if tag == 26 {
             if (seen & 4) != 0 { return false }; seen = seen | 4; let value = blob(cursor); if !identifier(value) { return false }; call.connection = Text(value)
-        } else if tag == 32 {
-            if (seen & 8) != 0 { return false }; seen = seen | 8; call.deadline = varint(cursor)
         } else { return false }
     }
-    if cursor.bad || seen != 15 || !token(call.token) || call.deadline < 1 || call.deadline > 9223372036854775 { return false }
-    let absolute = call.deadline * 1000
-    if absolute <= call.acceptedWall { return false }
-    let remaining = min(absolute - call.acceptedWall, call.timeout)
+    if cursor.bad || seen != 7 || !token(call.token) { return false }
+    let remaining = call.timeout
     if remaining <= 0 || remaining > 9223372036854775807 - call.acceptedWall { return false }
     call.due = call.acceptedWall + remaining
+    call.deadline = call.due / 1000; if call.due % 1000 != 0 { call.deadline = call.deadline + 1 }
     if call.acceptedMono >= 0 && remaining <= 9223372036854775807 - call.acceptedMono { call.monoDue = call.acceptedMono + remaining }
     call.opened = true; return true
 }
@@ -136,6 +134,7 @@ function drain(server: Server, call: Call): errors.BooleanResult {
             call.buffer = Bytes(); call.data = Bytes(); call.ended = true; return errors.booleanFailure(call.error)
         } else {
             let bytes = errors.bytesValue(result); call.buffer.addBytes(bytes); server.held = server.held + bytes.length
+            if call.opened && !call.accepted && bytes.length > 0 { return abandon(server, call, "client DATA arrived before status OK") }
         }
         while call.buffer.length >= 5 {
             let bytes = call.buffer
@@ -146,9 +145,11 @@ function drain(server: Server, call: Call): errors.BooleanResult {
             server.held = server.held - size - 5
             if !call.opened {
                 if !openMessage(server, call, body) { return abandon(server, call, "invalid protobuf gRPC open") }
+                if call.buffer.length > 0 { return abandon(server, call, "client DATA arrived before status OK") }
             } else {
+                if !call.accepted { return abandon(server, call, "client DATA arrived before status OK") }
                 let cursor = Cursor { bytes: body; at: 0; bad: false }
-                if varint(cursor) != 18 { return abandon(server, call, "gRPC open repeated or invalid data variant") }
+                if varint(cursor) != 26 { return abandon(server, call, "gRPC open/status repeated or invalid data variant") }
                 let data = blob(cursor)
                 if cursor.bad || cursor.at != body.length || data.length > 65536 { return abandon(server, call, "invalid protobuf data message") }
                 call.data.addBytes(data); server.held = server.held + data.length
@@ -163,7 +164,8 @@ function acceptHeaders(server: Server, nowMillis: Integer) {
         let fields = h2.headers(request); let timeout = timeoutMillis(h2.headerValue(fields, "grpc-timeout"))
         let call = Call { id: h2.streamID(request); buffer: Bytes(); data: Bytes(); opened: false; notified: false
             token: Bytes(); exit: ""; connection: ""; deadline: 0; due: 0; monoDue: 0; timeout: timeout
-            acceptedWall: nowMillis; acceptedMono: server.mono; status: false; accepted: false; ended: false; error: errors.none() }
+            acceptedWall: nowMillis; acceptedMono: server.mono; status: false; accepted: false; ended: false; error: errors.none()
+            explicitTimeout: h2.headerValue(fields, "grpc-timeout") != ""; deadlineActive: true }
         if timeout >= 0 && timeout < 9223372036854775807 - nowMillis { call.due = nowMillis + timeout }
         if server.mono >= 0 && timeout >= 0 && timeout < 9223372036854775807 - server.mono { call.monoDue = server.mono + timeout }
         let kept: List<Call> = []
@@ -186,9 +188,9 @@ public function requests(server: Server, nowMillis: Integer): OpenResult {
     if nowMillis < 0 || nowMillis > 9223372036854775807 { return rejected(problem(errors.invalidDataCode(), "invalid Unix millisecond clock")) }
     acceptHeaders(server, nowMillis)
     for call in server.calls {
-        if !call.ended && call.due > 0 && nowMillis >= call.due { expire(server, call) }
+        if call.deadlineActive && !call.ended && call.due > 0 && nowMillis >= call.due { expire(server, call) }
         if !call.ended { drain(server, call) }
-        if !call.ended && call.due > 0 && nowMillis >= call.due { expire(server, call) }
+        if call.deadlineActive && !call.ended && call.due > 0 && nowMillis >= call.due { expire(server, call) }
         if !call.notified && errors.isError(call.error) { call.notified = true; return rejected(call.error) }
         if call.opened && !call.notified { call.notified = true; return OpenResult { error: errors.none(); stream: call.id; token: call.token.slice(0, call.token.length); exit: call.exit; connection: call.connection; deadline: call.deadline; due: call.due; monoDue: call.monoDue } }
     }
@@ -210,18 +212,25 @@ function message(bytes: Bytes): Bytes {
     let result = Bytes(); result.add(0); for i in 0..4 { result.add((bytes.length >> ((3 - i) * 8)) & 255) }; result.addBytes(bytes); return result
 }
 public function sendStatus(server: Server, id: Integer, status: Text): errors.BooleanResult {
+    return sendStatusDetail(server, id, status, "")
+}
+public function sendStatusDetail(server: Server, id: Integer, status: Text, detail: Text): errors.BooleanResult {
     let at = position(server, id); if at < 0 { return failure(errors.closedCode(), "unknown gRPC call") }; let call = server.calls[at]
     if errors.isError(call.error) { return errors.booleanFailure(call.error) }
     if !call.opened || call.status || call.ended { return failure(errors.protocolCode(), "gRPC first status already sent or open missing") }
-    let value = 0
-    if status == "ok" { value = 1 } else if status == "grant_invalid" { value = 2 } else if status == "exit_offline" { value = 3 } else if status == "policy_denied" { value = 4 }
-    if value == 0 { return failure(errors.invalidDataCode(), "unknown Hearth dial status") }
+    let value = -1
+    if status == "ok" { value = 0 } else if status == "grant_invalid" { value = 1 } else if status == "exit_offline" { value = 2 } else if status == "policy_denied" { value = 3 } else if status == "concurrency_full" { value = 4 }
+    if value < 0 || Bytes(detail).length > 1024 { return failure(errors.invalidDataCode(), "unknown Hearth dial status or excessive detail") }
     if h2.bufferedOutput(server.transport) > LIMIT - 8192 { return failure(errors.wouldBlockCode(), "gRPC first status output full") }
     let started = begin(server, call); if !errors.booleanOk(started) { return started }
-    let body = Bytes(); body.add(8); body.add(value); let result = h2.write(server.transport, id, message(body))
+    let nested = Bytes(); if value != 0 { nested.add(8); nested.add(value) }
+    if detail != "" { let bytes = Bytes(detail); nested.add(18); addVarint(nested, bytes.length); nested.addBytes(bytes) }
+    let body = Bytes(); body.add(18); addVarint(body, nested.length); body.addBytes(nested)
+    let result = h2.write(server.transport, id, message(body))
     if errors.booleanOk(result) {
-        call.status = true; call.accepted = value == 1
-        if value != 1 {
+        call.status = true; call.accepted = value == 0
+        if value == 0 && !call.explicitTimeout { call.deadlineActive = false }
+        if value != 0 {
             server.held = server.held - call.buffer.length - call.data.length; call.buffer = Bytes(); call.data = Bytes()
             return terminate(server, call, 0, "")
         }
@@ -250,7 +259,7 @@ public function write(server: Server, id: Integer, bytes: Bytes): errors.Boolean
     if errors.isError(call.error) { return errors.booleanFailure(call.error) }
     if !call.accepted || call.ended { return failure(errors.protocolCode(), "gRPC relay status not accepted or call ended") }
     if bytes.length > 65536 { return failure(errors.invalidDataCode(), "gRPC data chunk exceeds 64KiB") }
-    let body = Bytes(); body.add(18); addVarint(body, bytes.length); body.addBytes(bytes)
+    let body = Bytes(); body.add(26); addVarint(body, bytes.length); body.addBytes(bytes)
     return h2.write(server.transport, id, message(body))
 }
 public function closeStream(server: Server, id: Integer, code: Integer, message: Text): errors.BooleanResult {
@@ -269,22 +278,22 @@ function expire(server: Server, call: Call) {
 }
 public function tick(server: Server, nowMillis: Integer): errors.BooleanResult {
     if nowMillis < 0 { return failure(errors.invalidDataCode(), "invalid Unix millisecond clock") }
-    for call in server.calls { if !call.ended && call.due > 0 && nowMillis >= call.due { expire(server, call) } }
+    for call in server.calls { if call.deadlineActive && !call.ended && call.due > 0 && nowMillis >= call.due { expire(server, call) } }
     return errors.boolean(true)
 }
 public function transportTick(server: Server, monotonicMillis: Integer): errors.BooleanResult {
     if monotonicMillis < server.mono { return failure(errors.invalidDataCode(), "monotonic clock moved backward") }
     server.mono = monotonicMillis
-    for call in server.calls { if !call.ended && call.monoDue > 0 && monotonicMillis >= call.monoDue { expire(server, call) } }
+    for call in server.calls { if call.deadlineActive && !call.ended && call.monoDue > 0 && monotonicMillis >= call.monoDue { expire(server, call) } }
     return h2.tick(server.transport, monotonicMillis)
 }
 public function nextDeadlineMillis(server: Server): Integer {
     let deadline = 0
-    for call in server.calls { if !call.ended && call.due > 0 && (deadline == 0 || call.due < deadline) { deadline = call.due } }
+    for call in server.calls { if call.deadlineActive && !call.ended && call.due > 0 && (deadline == 0 || call.due < deadline) { deadline = call.due } }
     return deadline
 }
 public function nextTransportDeadlineMillis(server: Server): Integer {
     let deadline = h2.nextDeadlineMillis(server.transport)
-    for call in server.calls { if !call.ended && call.monoDue > 0 && (deadline == 0 || call.monoDue < deadline) { deadline = call.monoDue } }
+    for call in server.calls { if call.deadlineActive && !call.ended && call.monoDue > 0 && (deadline == 0 || call.monoDue < deadline) { deadline = call.monoDue } }
     return deadline
 }
