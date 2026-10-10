@@ -3,17 +3,25 @@
  * count - incoming includes locals, temporaries, C owners and retired frames.
  * Metadata precedes the ordinary eight-byte header of Lists/mixed records.
  * No tracing queue, barrier, or registry operation allocates or scans. */
+/* The gray queue is singly linked: only its head is ever removed. A gray
+ * object cannot be unregistered, because a zero count during roots/mark pins
+ * it (rc_cycle_defer_zero) and the queue is empty outside those phases.
+ * incoming counts owning aggregate slots, so it never exceeds the number of
+ * eight-byte slots that fit in the address space; 58 bits cover 2^61 bytes. */
 typedef struct RcCycle {
-    struct RcCycle *previous, *next, *gray_previous, *gray_next;
-    size_t incoming;
-    unsigned generation : 1, marked : 2, registered : 1, pinned : 1, cleared : 1;
+    struct RcCycle *previous, *next, *gray_next;
+    size_t generation : 1, marked : 2, registered : 1, pinned : 1, cleared : 1, incoming : 58;
 } RcCycle;
+_Static_assert(sizeof(RcCycle) == 32, "cycle metadata must stay four words");
 enum { RC_CYCLE_IDLE, RC_CYCLE_ROOTS, RC_CYCLE_MARK, RC_CYCLE_SWEEP };
 static RcCycle *rc_cycle_head, *rc_cycle_cohort, *rc_cycle_cursor;
 static RcCycle *rc_cycle_gray_head, *rc_cycle_gray_tail, *rc_cycle_active;
 static size_t rc_cycle_index, rc_cycle_limit;
 static unsigned rc_cycle_generation, rc_cycle_phase, rc_cycle_requested;
 static unsigned rc_cycle_pending, rc_cycle_inside;
+/* Nonzero exactly in the roots and mark phases, when barriers shade. Hot
+ * ownership paths test this one global before touching any object metadata. */
+static unsigned rc_cycle_shading;
 /* Raw native clients conservatively trace. Generated main opts into complete
  * compiler mutation hints, before constructing any graph. */
 static unsigned rc_cycle_enabled = 1;
@@ -36,7 +44,7 @@ static void rc_cycle_unit(void);
 #ifndef MINYAR_BOUNDED_RC
 static void rc_cycle_eager_service(size_t budget);
 #endif
-static int rc_cycle_storage(unsigned kind) {
+static inline int rc_cycle_storage(unsigned kind) {
     return kind == RC_LIST || kind == RC_REFERENCES ||
            kind == RC_REFERENCES_IMMORTAL || kind == RC_RECORD;
 }
@@ -46,7 +54,7 @@ static RcCycle *rc_cycle_metadata(RcObject *object) {
 static RcObject *rc_cycle_object(RcCycle *cycle) {
     return (RcObject *)(cycle + 1);
 }
-static RcCycle *rc_cycle_value(void *value) {
+static inline RcCycle *rc_cycle_value(void *value) {
     if (!value) return NULL;
     RcObject *object = (RcObject *)value - 1;
     unsigned kind = object->ownership & 7;
@@ -54,17 +62,15 @@ static RcCycle *rc_cycle_value(void *value) {
         return NULL;
     return rc_cycle_metadata(object);
 }
-static void rc_cycle_register(RcObject *object) {
-    RcCycle *cycle = rc_cycle_metadata(object);
-    if (cycle->registered) return;
+static void rc_cycle_register(RcCycle *cycle) {
     cycle->registered = 1;
     cycle->generation = rc_cycle_generation;
     cycle->next = rc_cycle_head;
     if (rc_cycle_head) rc_cycle_head->previous = cycle;
     rc_cycle_head = cycle;
 }
-static void rc_cycle_request(void) {
-    if (rc_cycle_inside || !rc_cycle_enabled) return;
+static MINYAR_COLD void rc_cycle_request(void) {
+    if (rc_cycle_inside) return;
     rc_cycle_requested = 1;
     if (!rc_cycle_pending) {
         rc_cycle_pending = 1;
@@ -73,71 +79,82 @@ static void rc_cycle_request(void) {
 #endif
     }
 }
-static void rc_cycle_gray_remove(RcCycle *cycle) {
-    if (cycle->gray_previous) cycle->gray_previous->gray_next = cycle->gray_next;
-    else if (rc_cycle_gray_head == cycle) rc_cycle_gray_head = cycle->gray_next;
-    if (cycle->gray_next) cycle->gray_next->gray_previous = cycle->gray_previous;
-    else if (rc_cycle_gray_tail == cycle) rc_cycle_gray_tail = cycle->gray_previous;
-    cycle->gray_previous = cycle->gray_next = NULL;
+static RcCycle *rc_cycle_gray_pop(void) {
+    RcCycle *cycle = rc_cycle_gray_head;
+    rc_cycle_gray_head = cycle->gray_next;
+    if (!rc_cycle_gray_head) rc_cycle_gray_tail = NULL;
+    cycle->gray_next = NULL;
+    return cycle;
 }
-static void rc_cycle_unregister(RcObject *object) {
-    RcCycle *cycle = rc_cycle_metadata(object);
-    if (!cycle->registered) return;
+static void rc_cycle_unlink(RcCycle *cycle) {
     cycle->registered = 0;
     if (rc_cycle_cohort == cycle) rc_cycle_cohort = cycle->next;
     if (rc_cycle_cursor == cycle) rc_cycle_cursor = cycle->next;
     if (rc_cycle_active == cycle) rc_cycle_active = NULL;
-    rc_cycle_gray_remove(cycle);
     if (cycle->previous) cycle->previous->next = cycle->next;
     else rc_cycle_head = cycle->next;
     if (cycle->next) cycle->next->previous = cycle->previous;
 }
-static void rc_cycle_shade(RcCycle *cycle) {
-    if (!cycle || !cycle->registered || (rc_cycle_phase != RC_CYCLE_ROOTS && rc_cycle_phase != RC_CYCLE_MARK) ||
-        cycle->generation == rc_cycle_generation || cycle->marked) return;
+static inline void rc_cycle_unregister(RcObject *object) {
+    RcCycle *cycle = rc_cycle_metadata(object);
+    if (cycle->registered) rc_cycle_unlink(cycle);
+}
+static MINYAR_COLD void rc_cycle_shade_slow(RcCycle *cycle) {
+    if (!cycle || !cycle->registered || cycle->generation == rc_cycle_generation || cycle->marked) return;
     cycle->marked = 1;
-    cycle->gray_previous = rc_cycle_gray_tail;
     cycle->gray_next = NULL;
     if (rc_cycle_gray_tail) rc_cycle_gray_tail->gray_next = cycle;
     else rc_cycle_gray_head = cycle;
     rc_cycle_gray_tail = cycle;
 }
+static inline void rc_cycle_shade(RcCycle *cycle) {
+    if (rc_cycle_shading) rc_cycle_shade_slow(cycle);
+}
+/* Hot ownership paths only test a global flag inline; keeping their bodies
+ * small lets link-time optimization still inline them into generated code. */
+static MINYAR_COLD void rc_cycle_shade_value(void *value) {
+    rc_cycle_shade_slow(rc_cycle_value(value));
+}
 /* A count decrement may remove a root. A take-store removes an external
  * owner without decrementing its total count. Both must preserve the snapshot. */
-static void rc_cycle_before_drop(RcObject *object) {
-    unsigned kind = object->ownership & 7;
-    if (kind == RC_RECORD || kind == RC_REFERENCES || kind == RC_REFERENCES_IMMORTAL)
-        rc_cycle_shade(rc_cycle_metadata(object));
+static inline void rc_cycle_before_drop(RcObject *object) {
+    if (rc_cycle_shading) rc_cycle_shade_value(object + 1);
 }
 /* A gray object still carries snapshot edges. If its real count reaches zero,
  * keep one collector pin until its bounded scan finishes. Dropping it from the
  * gray queue now would silently discard an arbitrary number of snapshot edges. */
-static int rc_cycle_defer_zero(RcObject *object) {
+static MINYAR_COLD int rc_cycle_pin_gray(RcObject *object) {
     RcCycle *cycle = rc_cycle_value(object + 1);
-    if (!cycle || !cycle->registered || cycle->marked != 1 ||
-        (rc_cycle_phase != RC_CYCLE_ROOTS && rc_cycle_phase != RC_CYCLE_MARK)) return 0;
+    if (!cycle || !cycle->registered || cycle->marked != 1) return 0;
     cycle->pinned = 1;
     object->ownership += 8;
     return 1;
 }
-static void rc_cycle_after_drop(RcObject *object) {
-    unsigned kind = object->ownership & 7;
-    if (kind == RC_RECORD || kind == RC_REFERENCES || kind == RC_REFERENCES_IMMORTAL) {
-        RcCycle *cycle = rc_cycle_metadata(object);
-        if (cycle->registered && (object->ownership >> 3) == cycle->incoming) rc_cycle_request();
-    }
+static inline int rc_cycle_defer_zero(RcObject *object) {
+    return rc_cycle_shading && rc_cycle_pin_gray(object);
 }
-static void rc_cycle_edge_add(void *owner, void *value) {
-    RcCycle *cycle = rc_cycle_value(value);
-    if (!cycle) return;
-    rc_cycle_register((RcObject *)owner - 1);
+static MINYAR_COLD void rc_cycle_check_external(RcObject *object) {
+    RcCycle *cycle = rc_cycle_value(object + 1);
+    if (cycle && cycle->registered && (object->ownership >> 3) == cycle->incoming) rc_cycle_request();
+}
+/* While tracing is dormant no cycle can exist, so no request is needed. */
+static inline void rc_cycle_after_drop(RcObject *object) {
+    if (rc_cycle_enabled) rc_cycle_check_external(object);
+}
+static MINYAR_NOINLINE void rc_cycle_add_incoming(RcObject *parent, RcCycle *cycle) {
+    RcCycle *source = rc_cycle_metadata(parent);
+    if (!source->registered) rc_cycle_register(source);
     rc_cycle_shade(cycle);
     cycle->incoming++;
-    RcObject *parent = (RcObject *)owner - 1;
-    if (cycle->registered && (rc_cycle_object(cycle)->ownership >> 3) == cycle->incoming &&
-        (parent->ownership >> 3) == rc_cycle_metadata(parent)->incoming) rc_cycle_request();
+    if (rc_cycle_enabled && cycle->registered &&
+        (rc_cycle_object(cycle)->ownership >> 3) == cycle->incoming &&
+        (parent->ownership >> 3) == source->incoming) rc_cycle_request();
 }
-static void rc_cycle_edge_remove(void *value) {
+static inline void rc_cycle_edge_add(void *owner, void *value) {
+    RcCycle *cycle = rc_cycle_value(value);
+    if (cycle) rc_cycle_add_incoming((RcObject *)owner - 1, cycle);
+}
+static inline void rc_cycle_edge_remove(void *value) {
     RcCycle *cycle = rc_cycle_value(value);
     if (!cycle) return;
     rc_cycle_shade(cycle);

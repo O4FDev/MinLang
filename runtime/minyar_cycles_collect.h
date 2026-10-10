@@ -26,6 +26,7 @@ static void rc_cycle_unit_body(void) {
         rc_cycle_generation ^= 1;
         rc_cycle_cohort = rc_cycle_cursor = rc_cycle_head;
         rc_cycle_phase = RC_CYCLE_ROOTS;
+        rc_cycle_shading = 1;
         RC_ACCOUNT(rc_cycle_epochs++);
         return;
     }
@@ -43,10 +44,11 @@ static void rc_cycle_unit_body(void) {
             cycle = rc_cycle_gray_head;
             if (!cycle) {
                 rc_cycle_phase = RC_CYCLE_SWEEP;
+                rc_cycle_shading = 0;
                 rc_cycle_cursor = rc_cycle_cohort;
                 return;
             }
-            rc_cycle_gray_remove(cycle);
+            rc_cycle_gray_pop();
             rc_cycle_active = cycle;
             rc_cycle_index = 0;
             rc_cycle_limit = rc_cycle_length(cycle);

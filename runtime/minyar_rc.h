@@ -171,7 +171,7 @@ void minyar_rc_retain(void *value) {
     if (object->ownership > SIZE_MAX - 8)
         minyar_stop("this value has too many references.");
     object->ownership += 8;
-    rc_cycle_shade(rc_cycle_value(value));
+    if (rc_cycle_shading) rc_cycle_shade_value(value);
 }
 
 #ifdef MINYAR_BOUNDED_RC

@@ -40,11 +40,13 @@
  */
 #if defined(__GNUC__) || defined(__clang__)
 #define MINYAR_COLD __attribute__((noinline, cold))
+#define MINYAR_NOINLINE __attribute__((noinline))
 #define MINYAR_NORETURN __attribute__((noreturn))
 #define MINYAR_HOT static inline __attribute__((always_inline))
 #define MINYAR_NO_ADDRESS_SANITIZE __attribute__((no_sanitize_address))
 #else
 #define MINYAR_COLD
+#define MINYAR_NOINLINE
 #define MINYAR_NORETURN
 #define MINYAR_HOT static inline
 #define MINYAR_NO_ADDRESS_SANITIZE
