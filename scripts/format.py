@@ -12,6 +12,7 @@ FILES = (
     "bootstrap/stage0.c", "tools/module-build.c",
     "runtime/minyar_bytes.h", "runtime/minyar_collections.h", "runtime/minyar_numbers.h",
     "runtime/native/net.c", "runtime/native/net_datagrams.h", "runtime/native/net_loop.h",
+    "runtime/native/app_net_loop.h",
     "runtime/native/tlsverify.c", "tests/tls-windows-signing.c",
     "runtime/native/update.c", "runtime/native/update_monocypher.c", "runtime/native/update_ed25519.c",
     "tests/update-native.c", "tests/update-sign.c",

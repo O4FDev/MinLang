@@ -1,4 +1,5 @@
 /* Actual kqueue readiness and timers in the AppKit main run loop. */
+#define MINYAR_MACOS_NETWORK_TEST 1
 #include "../runtime/native/macos.m"
 #include <assert.h>
 #include <errno.h>
@@ -40,6 +41,9 @@ int main(void) { @autoreleasepool {
         assert(write(sockets[1],"x",1)==1);
         assert(minyar_macos_nextEvent(.5));
         assert(mn_network_wake_pending);
+        unsigned wakes=mn_network_wake_count;
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode,.03,false);
+        assert(mn_network_wake_count==wakes);
         MinyarBytes *ready=minyar_net_loopWait(loop,0,16);
         assert(ready->byte_length==40 && network_word(ready->bytes+16)==111);
         minyar_rc_release(ready);
@@ -59,6 +63,10 @@ int main(void) { @autoreleasepool {
         assert(ready->byte_length==40 && network_word(ready->bytes+16)==222);
         minyar_rc_release(ready); assert(!mn_network_wake_pending);
         network_drain_events();
+        assert(minyar_macos_nextEvent(.025)); assert(!mn_network_wake_pending);
+        /* Cancelling an attached timer must remove its CF wake deadline. */
+        timer=network_value(minyar_net_loopTimer(loop,1000,0,333));
+        network_status(minyar_net_loopRemove(loop,timer),0);
         assert(minyar_macos_nextEvent(.025)); assert(!mn_network_wake_pending);
         /* Closing detaches before kqueue FD reuse; an old ID cannot attach
          * to a different loop allocated in the same registry slot. */

@@ -92,6 +92,48 @@ static NetLoop *net_loop_find(long long handle) {
     NetLoopSlot *slot = &net_loop_slots[low - 1];
     return slot->generation == (uint32_t)(value >> 32) ? slot->loop : NULL;
 }
+#ifdef MINYAR_APP_EVENT_LOOP
+/* Optional desktop adapter: no extra fields or instructions in ordinary
+ * network objects. Only the owner thread may attach or invoke this observer. */
+static long long net_app_handle;
+static void (*net_app_observer)(long long, unsigned);
+int minyar_net_appLoopDescriptor(long long handle) {
+    NetLoop *loop = net_loop_find(handle);
+#ifdef _WIN32
+    (void)loop;
+    return -1;
+#else
+    return loop ? loop->selector : -1;
+#endif
+}
+uint64_t minyar_net_appLoopNow(void) {
+    return net_loop_now();
+}
+uint64_t minyar_net_appLoopDeadline(long long handle) {
+    NetLoop *loop = net_loop_find(handle);
+    if (!loop || !loop->timer_count)
+        return UINT64_MAX;
+    return loop->entries[loop->timers[0]].deadline;
+}
+bool minyar_net_appLoopObserve(long long handle, void (*observer)(long long, unsigned)) {
+    if (observer && !net_loop_find(handle))
+        return false;
+    net_app_handle = observer ? handle : 0;
+    net_app_observer = observer;
+    return true;
+}
+static void net_app_changed(long long handle, unsigned reason) {
+    if (net_app_observer && handle == net_app_handle)
+        net_app_observer(handle, reason);
+}
+#define NET_APP_CHANGED(handle) net_app_changed(handle, 0)
+#define NET_APP_POLLED(handle) net_app_changed(handle, 1)
+#define NET_APP_CLOSING(handle) net_app_changed(handle, 2)
+#else
+#define NET_APP_CHANGED(handle) ((void)0)
+#define NET_APP_POLLED(handle) ((void)0)
+#define NET_APP_CLOSING(handle) ((void)0)
+#endif
 static NetLoopEntry *net_loop_entry(NetLoop *loop, long long handle, uint32_t *index) {
     uint64_t value = (uint64_t)handle;
     uint32_t low = (uint32_t)value;
@@ -422,6 +464,7 @@ MinyarBytes *minyar_net_loopWatch(long long handle, long long connection, long l
         return net_loop_result(code, -1);
     }
     net_loop_hash_insert(loop, socket, index);
+    NET_APP_CHANGED(handle);
     return net_loop_result(0, (long long)net_loop_handle(index, entry->generation));
 }
 MinyarBytes *minyar_net_loopUpdate(long long handle, long long registration, long long interest,
@@ -440,6 +483,7 @@ MinyarBytes *minyar_net_loopUpdate(long long handle, long long registration, lon
     }
     entry->interest = (unsigned)interest;
     entry->token = token;
+    NET_APP_CHANGED(handle);
     return net_loop_result(0, 1);
 }
 MinyarBytes *minyar_net_loopRemove(long long handle, long long registration) {
@@ -462,6 +506,7 @@ MinyarBytes *minyar_net_loopRemove(long long handle, long long registration) {
         }
     }
     net_loop_retire_entry(loop, index);
+    NET_APP_CHANGED(handle);
     return net_loop_result(0, 1);
 }
 MinyarBytes *minyar_net_loopTimer(long long handle, long long delay, long long period,
@@ -495,6 +540,7 @@ MinyarBytes *minyar_net_loopTimer(long long handle, long long delay, long long p
     entry->heap_index = loop->timer_count;
     loop->timers[loop->timer_count++] = index;
     net_loop_heap_up(loop, entry->heap_index);
+    NET_APP_CHANGED(handle);
     return net_loop_result(0, (long long)net_loop_handle(index, entry->generation));
 }
 static void net_loop_event(MinyarBytes *result, uint64_t identity, long long token, unsigned flags,
@@ -678,6 +724,7 @@ MinyarBytes *minyar_net_loopWait(long long handle, long long milliseconds, long 
         if (code && !interrupted(code)) {
             result->byte_length = 8;
             result_status(result, NET_FAILURE, code);
+            NET_APP_POLLED(handle);
             return result;
         }
         size_t emitted = (size_t)(result->byte_length - 8) / 32;
@@ -685,10 +732,13 @@ MinyarBytes *minyar_net_loopWait(long long handle, long long milliseconds, long 
             emitted += net_loop_emit_timers(loop, result, limit - emitted, net_loop_now());
         if (emitted) {
             loop->timer_turn ^= 1;
+            NET_APP_POLLED(handle);
             return result;
         }
-        if (net_loop_now() >= deadline)
+        if (net_loop_now() >= deadline) {
+            NET_APP_POLLED(handle);
             return result;
+        }
         /* Interrupted waits retain the absolute deadline. Readiness containing
          * only stale registrations also cannot extend the caller's timeout. */
     }
@@ -697,6 +747,7 @@ MinyarBytes *minyar_net_loopClose(long long handle) {
     NetLoop *loop = net_loop_find(handle);
     if (!loop)
         return net_loop_result(net_loop_bad_handle(), 0);
+    NET_APP_CLOSING(handle);
 #ifndef _WIN32
     if (close(loop->selector))
         return net_loop_result(errno, 0);

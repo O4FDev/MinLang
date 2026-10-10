@@ -26,3 +26,27 @@ with tempfile.TemporaryDirectory(prefix='macos-network-', dir=ROOT/'build') as d
                         '-framework', 'AppKit', '-o', executable], check=True)
         subprocess.run([executable], check=True, timeout=30,
                        env=dict(os.environ, ASAN_OPTIONS='detect_leaks=0', UBSAN_OPTIONS='halt_on_error=1'))
+    # The public launcher must select matching desktop/reactor cache variants;
+    # direct native tests alone cannot detect a missing compile-time adapter.
+    source = temp/'contract.min'
+    source.write_text('''use "macos" as macos
+use "eventloop" as loop
+use "errors" as errors
+macos.initialize("shared loop contract")
+macos.accessory(true)
+let reactor = errors.integerValue(loop.create())
+let shared = macos.shareNetworkLoop(reactor)
+print(errors.integerOk(shared))
+let timer = errors.integerValue(loop.timer(reactor, 10, 0, 77))
+macos.nextEvent(0.5)
+let batch = loop.wait(reactor, 0, 16)
+print(!errors.isError(loop.batchError(batch)))
+print(loop.events(batch).length == 1)
+print(loop.events(batch)[0].token == 77)
+print(errors.booleanOk(loop.close(reactor)))
+''')
+    for mode in ['--debug', '--release']:
+        executable = temp/('contract-'+mode[2:])
+        subprocess.run([ROOT/'minyar', mode, source, '-o', executable], check=True, timeout=120)
+        result = subprocess.run([executable], check=True, capture_output=True, text=True, timeout=15)
+        assert result.stdout == 'true\ntrue\ntrue\ntrue\ntrue\n', result

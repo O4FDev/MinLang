@@ -43,6 +43,50 @@ static MinyarText loop_literal(const char *s) {
     MinyarText value = {(const unsigned char *)s, (long long)strlen(s), 0, NULL, NULL};
     return value;
 }
+#ifdef MINYAR_APP_EVENT_LOOP
+static unsigned app_changes, app_polls, app_closes;
+static long long app_expected;
+static void app_observer(long long handle, unsigned reason) {
+    assert(handle == app_expected && minyar_net_appLoopDescriptor(handle) >= 0);
+    if (reason == 2) {
+        /* Detach before the selector closes. A consumer never owns the FD. */
+        assert(fcntl(minyar_net_appLoopDescriptor(handle), F_GETFD) >= 0);
+        app_closes++;
+        assert(minyar_net_appLoopObserve(0, NULL));
+    } else if (reason == 1)
+        app_polls++;
+    else
+        app_changes++;
+}
+static void app_observer_contract(void) {
+    long long loop = result_handle(minyar_net_loopCreate());
+    long long other = result_handle(minyar_net_loopCreate());
+    app_expected = loop;
+    assert(minyar_net_appLoopObserve(loop, app_observer));
+    assert(!minyar_net_appLoopObserve(-1, app_observer));
+    long long timer = result_handle(minyar_net_loopTimer(loop, 100000, 0, 1));
+    assert(app_changes == 1 && minyar_net_appLoopDeadline(loop) > minyar_net_appLoopNow());
+    (void)result_handle(minyar_net_loopTimer(other, 0, 0, 2));
+    assert(app_changes == 1);
+    operation_ok(minyar_net_loopRemove(loop, timer));
+    assert(app_changes == 2 && minyar_net_appLoopDeadline(loop) == UINT64_MAX);
+    (void)result_handle(minyar_net_loopTimer(loop, 0, 0, 3));
+    MinyarBytes *events = minyar_net_loopWait(loop, 0, 16);
+    assert(event_count(events) == 1 && loop_wide(events, 16) == 3);
+    minyar_rc_release(events);
+    assert(app_polls == 1 && minyar_net_appLoopDeadline(loop) == UINT64_MAX);
+    operation_ok(minyar_net_loopClose(loop));
+    assert(app_closes == 1 && minyar_net_appLoopDescriptor(loop) < 0);
+    long long replacement = result_handle(minyar_net_loopCreate());
+    assert(replacement != loop && !minyar_net_appLoopObserve(loop, app_observer));
+    app_expected = replacement;
+    assert(minyar_net_appLoopObserve(replacement, app_observer));
+    operation_ok(minyar_net_loopClose(other));
+    assert(app_closes == 1);
+    operation_ok(minyar_net_loopClose(replacement));
+    assert(app_closes == 2);
+}
+#endif
 
 static void timers_and_stale_handles(void) {
     long long loop = result_handle(minyar_net_loopCreate());
@@ -284,6 +328,9 @@ static void idle_blocking_and_interrupted_deadline(void) {
 }
 
 int main(void) {
+#ifdef MINYAR_APP_EVENT_LOOP
+    app_observer_contract();
+#endif
     timers_and_stale_handles();
     failed_poll_preserves_due_timers();
     socket_interest_and_ownership();

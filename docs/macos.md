@@ -266,6 +266,25 @@ and [event dispatch](https://developer.apple.com/documentation/appkit/nsapplicat
 
 ## Verification
 
+`macos.shareNetworkLoop(handle)` attaches an `eventloop` reactor to the AppKit
+main run loop. It returns an `errors.IntegerResult`; a closed or stale handle
+is a recoverable failure. Initialize AppKit first. After `macos.nextEvent`, call
+`eventloop.wait(handle, 0, maximum)` or `eventcallbacks.poll` with timeout zero
+and dispatch callbacks on the main thread. `nextEvent` can return with `NONE`
+because network readiness or a timer woke it.
+
+The adapter monitors the reactor's kqueue descriptor with Apple's
+[CFFileDescriptor](https://developer.apple.com/documentation/corefoundation/cffiledescriptor)
+and schedules the earliest monotonic timer with a reusable
+[CFRunLoopTimer](https://developer.apple.com/documentation/corefoundation/cfrunlooptimersetnextfiredate(_:_:)).
+Readiness wakes are one-shot until the owner polls; an application that pauses
+network dispatch cannot accumulate wake events or spin. No managed reference
+or callback crosses a thread. Attaching another loop replaces the previous
+attachment. `unshareNetworkLoop` detaches without closing any socket; closing
+the attached reactor detaches before its descriptor is reused. The compiler
+selects this adapter only when both `macos` and `net` native packages are used.
+Ordinary network builds retain their original layout and instructions.
+
 Run `make check-macos` in a logged-in macOS desktop session. The suite verifies
 Swift selector lowering, actual native target/action and delegate delivery,
 multiple windows, application views (content that never resizes its window,

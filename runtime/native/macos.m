@@ -1009,6 +1009,7 @@ void minyar_macos_statusRemove(long long handle) { @autoreleasepool {
     [handles removeObjectForKey:@(handle)];
     dropEvents(^BOOL(MNEvent *event) { return event.source != 0 && !handles[@(event.source)]; });
 } }
+#include "app_net_loop.h"
 bool minyar_macos_nextEvent(double timeout) { @autoreleasepool {
     ready(); if (!isfinite(timeout) || timeout < 0 || timeout > 60) minyar_native_stop("macos event timeout must be between 0 and 60 seconds.");
     current = nil;
