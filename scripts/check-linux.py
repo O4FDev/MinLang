@@ -23,7 +23,7 @@ BUILD = ['build/minyarc', 'build/compiler-stage3.ll', 'build/minyarc-sanitize',
          'build/minyar-runtime.o', 'build/minyar-runtime-sanitize.o', 'build/ownership-runtime.o',
          'build/runtime-unit', 'build/runtime-unit-sanitize',
          'build/module-compiler-stage3.ll']
-TARGETS = ['check-toolchain-stamp', 'check-toolchain-portability', 'check-cold-bootstrap',
+TARGETS = ['check-linux-snapshot', 'check-toolchain-stamp', 'check-toolchain-portability', 'check-cold-bootstrap',
            'check-bootstrap-policy', 'check-peer-semantics', 'check-memory-regressions',
            'check-bootstrap-portability', 'check-bootstrap-records',
            'check-measurement-stats', 'check-budget-harness', 'check-stack-limits',
@@ -48,7 +48,16 @@ TARGETS = ['check-toolchain-stamp', 'check-toolchain-portability', 'check-cold-b
            'check-incremental-modules', 'check-incremental-modules-sanitize',
            'check-sanitize']
 DIRECTORIES = ('bootstrap', 'compiler', 'runtime', 'library', 'vendor', 'examples', 'tests', 'build-support', 'docs',
-               'experiments', 'scripts', 'tools')
+               'experiments', 'scripts', 'tools', '.github')
+
+
+def copy_source_snapshot(source, work):
+    """Copy declared sources without inheriting generated or host artifacts."""
+    for name in DIRECTORIES:
+        shutil.copytree(source / name, work / name,
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+    for name in ('Makefile', 'minyar'):
+        shutil.copy2(source / name, work / name)
 
 
 def main():
@@ -132,11 +141,7 @@ def main():
                   'invocation': sys.argv, 'tools': tools, 'source_sha256': {}, 'checks': [],
                   'scope': 'Correctness on the recorded Linux host/toolchain. No performance or deadline certification.'}
         # Copy source only: never inherit host binaries, generated IR or .git state.
-        for name in DIRECTORIES:
-            shutil.copytree(source / name, work / name,
-                            ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
-        for name in ('Makefile', 'minyar'):
-            shutil.copy2(source / name, work / name)
+        copy_source_snapshot(source, work)
         for path in sorted(work.rglob('*')):
             if path.is_file():
                 report['source_sha256'][str(path.relative_to(work))] = hashlib.sha256(path.read_bytes()).hexdigest()
