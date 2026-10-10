@@ -537,9 +537,14 @@ static bool windows_digest(const MinyarBytes *content, LPCWSTR algorithm, DWORD 
     if (content->byte_length < 0 || content->byte_length > UINT32_MAX)
         return false;
     BCRYPT_ALG_HANDLE handle = NULL;
-    bool valid = BCryptOpenAlgorithmProvider(&handle, algorithm, NULL, 0) == 0 &&
-                 BCryptHash(handle, NULL, 0, (PUCHAR)content->bytes, (ULONG)content->byte_length,
-                            out, size) == 0;
+    BCRYPT_HASH_HANDLE hash = NULL;
+    bool valid =
+        BCryptOpenAlgorithmProvider(&handle, algorithm, NULL, 0) == 0 &&
+        BCryptCreateHash(handle, &hash, NULL, 0, NULL, 0, 0) == 0 &&
+        BCryptHashData(hash, (PUCHAR)content->bytes, (ULONG)content->byte_length, 0) == 0 &&
+        BCryptFinishHash(hash, out, size, 0) == 0;
+    if (hash)
+        BCryptDestroyHash(hash);
     if (handle)
         BCryptCloseAlgorithmProvider(handle, 0);
     return valid;
