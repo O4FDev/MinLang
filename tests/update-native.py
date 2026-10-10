@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from clang_helpers import windows_host
 
 ROOT=Path(__file__).resolve().parents[1]
 
@@ -14,14 +15,20 @@ def main():
         root=Path(directory)
         for sanitize in ([False] if os.name=='nt' else [False,True]):
             binary=root/('probe-sanitize' if sanitize else 'probe')
-            if os.name=='nt': binary=binary.with_suffix('.exe')
+            if windows_host(): binary=binary.with_suffix('.exe')
             flags=['-O1','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer'] if sanitize else ['-O2']
-            command=[clang,'-std=c11','-D_GNU_SOURCE','-DMINYAR_SYSTEM_HEAP=1','-DMINYAR_UPDATE_TEST_HOOK=1',
+            compiler=os.environ.get('MINYAR_SANITIZER_CLANG',clang) if sanitize else clang
+            if sanitize and windows_host(): flags.append('-fuse-ld=lld')
+            command=[compiler,'-std=c11','-D_GNU_SOURCE','-DMINYAR_SYSTEM_HEAP=1','-DMINYAR_UPDATE_TEST_HOOK=1',
                 '-Wall','-Wextra','-Werror',*flags,*[str(ROOT/path) for path in ['tests/update-native.c',
                 'runtime/native/update.c','runtime/native/update_monocypher.c','runtime/native/update_ed25519.c',
                 'runtime/minyar_runtime.c']],'-lm','-o',str(binary)]
             subprocess.run(command,check=True)
             env=dict(os.environ,ASAN_OPTIONS='detect_leaks=1' if sys.platform.startswith('linux') else 'detect_leaks=0')
+            if sanitize and windows_host():
+                # MSYS2's CLANG64 toolchain provides the Windows ASan DLL;
+                # UCRT64 clang is backed by GCC and has no sanitizer runtime.
+                env['PATH']=str(Path(compiler).resolve().parent)+os.pathsep+env.get('PATH','')
             installed=root/('state-sanitize' if sanitize else 'state');installed.mkdir(mode=0o700)
             subprocess.run([str(binary),str(installed)],env=env,check=True,timeout=30)
             for point in ['artifact-before-replace','artifact-after-replace','state-before-replace','state-after-replace']:
@@ -31,7 +38,7 @@ def main():
                 expected=b'new' if point=='state-after-replace' else b'old'
                 recovered=subprocess.check_output([str(binary),str(target),'reopen'],env=env,timeout=30)
                 assert recovered==expected,(point,recovered)
-                suffix='.exe' if os.name=='nt' else '.bin'
+                suffix='.exe' if windows_host() else '.bin'
                 assert (target/'versions'/('a'*64+suffix)).read_bytes()==b'old'
         print('All publication transitions survive abrupt exit; OS releases updater locks')
 

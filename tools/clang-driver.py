@@ -316,7 +316,7 @@ def main():
     if cycles:
         runtime = cycle_runtime_object(project, clang, runtime, release, link_flags)
     native_flags = flags('MINYAR_NATIVE_FLAGS', shlex.join(link_flags))
-    if {'macos', 'net'} <= libraries:
+    if {'macos', 'net'} <= libraries or {'windows', 'net'} <= libraries:
         native_flags = [*native_flags, '-DMINYAR_APP_EVENT_LOOP=1']
     base = clang_identity(clang) if libraries - {'machine', 'machine_arm64'} else None
     if libraries & {'securecrypto', 'update'}:

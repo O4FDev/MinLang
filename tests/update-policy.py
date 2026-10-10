@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from clang_helpers import windows_host
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -21,11 +22,11 @@ class UpdatePolicy(unittest.TestCase):
         cls.temp = tempfile.TemporaryDirectory(prefix='minyar-update-policy-')
         cls.directory = Path(cls.temp.name)
         clang = os.environ.get('MINYAR_TEST_CLANG', 'clang')
-        cls.signer = cls.directory / ('signer.exe' if os.name == 'nt' else 'signer')
+        cls.signer = cls.directory / ('signer.exe' if windows_host() else 'signer')
         subprocess.run([clang, '-O2', str(ROOT/'tests/update-sign.c'),
             str(ROOT/'vendor/monocypher/monocypher.c'), str(ROOT/'vendor/monocypher/monocypher-ed25519.c'),
             '-o', str(cls.signer)], check=True)
-        cls.driver = cls.directory / ('driver.exe' if os.name == 'nt' else 'driver')
+        cls.driver = cls.directory / ('driver.exe' if windows_host() else 'driver')
         env = dict(os.environ, LIMITED='', SANITIZER_LIMITED='')
         subprocess.run([str(ROOT/'minyar'), '--library', str(ROOT/'library'), str(ROOT/'tests/update-driver.min'),
             '-o', str(cls.driver)], env=env, check=True, capture_output=True, text=True)
@@ -37,7 +38,7 @@ class UpdatePolicy(unittest.TestCase):
     def setUp(self):
         self.artifact = b'fixture executable\x00\xffbinary'
         self.digest = hashlib.sha256(self.artifact).hexdigest()
-        target={'Darwin':'macos','Windows':'windows','Linux':'linux'}[platform.system()]+'-'+('arm64' if platform.machine().lower() in ('arm64','aarch64') else 'x86_64')
+        target=('windows' if windows_host() else {'Darwin':'macos','Linux':'linux'}[platform.system()])+'-'+('arm64' if platform.machine().lower() in ('arm64','aarch64') else 'x86_64')
         self.fields = ['MINYAR-UPDATE-1', 'org.tolum.peer', target, 'stable', '1', '1.1.0',
             '1799999990', '1800003600', '100', f'https://updates.example/releases/{self.digest}/agent',
             self.digest, str(len(self.artifact))]
@@ -120,7 +121,7 @@ class UpdatePolicy(unittest.TestCase):
         self.assertTrue((root/'state').is_file())
         self.assertFalse((root/'versions').exists())
         self.assertEqual(self.invoke(root=root)[0], ['true','true'])
-        suffix='.exe' if os.name=='nt' else '.bin'
+        suffix='.exe' if windows_host() else '.bin'
         self.assertEqual((root/'versions'/ (self.digest+suffix)).read_bytes(), self.artifact)
         self.assertEqual(self.invoke(root=root)[0], ['true','false'])
         fields=self.fields.copy(); fields[4]='2'; fields[5]='1.0.0'
