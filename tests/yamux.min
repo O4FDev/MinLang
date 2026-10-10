@@ -1,0 +1,47 @@
+use "yamux" as mux
+use "errors" as errors
+use "crypto" as crypto
+function main(): Integer {
+    let client = mux.create(true); let server = mux.create(false)
+    let ids: List<Integer> = []
+    for index in 0..16 {
+        let id = errors.integerValue(mux.open(client)); ids.add(id)
+        if id != index * 2 + 1 { return 1 }
+        mux.write(client, id, Bytes("request " + Text(index)), true)
+    }
+    let wire = mux.takeOutgoing(client)
+    for byte in wire { let fragment = Bytes(); fragment.add(byte); mux.receive(server, fragment) }
+    for id in ids {
+        let data = mux.read(server, id)
+        if !errors.bytesOk(data) { return 2 }
+        mux.write(server, id, errors.bytesValue(data), true)
+    }
+    mux.receive(client, mux.takeOutgoing(server))
+    for index in 0..ids.length {
+        if Text(errors.bytesValue(mux.read(client, ids[index]))) != "request " + Text(index) || errors.bytesStatus(mux.read(client, ids[index])) != errors.endOfStreamStatus() { return 3 }
+    }
+    let bounded = mux.create(true); let remote = mux.create(false)
+    let id = errors.integerValue(mux.open(bounded)); mux.receive(remote, mux.takeOutgoing(bounded))
+    if !errors.integerOk(mux.write(bounded, id, Bytes(262144), false)) || errors.integerOk(mux.write(bounded, id, Bytes("over credit"), false)) { return 4 }
+    mux.receive(remote, mux.takeOutgoing(bounded)); mux.read(remote, id); mux.receive(bounded, mux.takeOutgoing(remote))
+    if !errors.integerOk(mux.write(bounded, id, Bytes("credit restored"), false)) { return 5 }
+    // Reject huge advertised data lengths after the header, without allocation.
+    let malicious = mux.create(false)
+    mux.receive(malicious, crypto.fromHex("00000001000000017fffffff"))
+    if malicious.state != mux.FAILED { return 6 }
+    let wrongRole = mux.create(false)
+    mux.receive(wrongRole, crypto.fromHex("000100010000000200000000"))
+    if wrongRole.state != mux.FAILED { return 7 }
+    let duplicate = mux.create(false)
+    let syn = crypto.fromHex("000100010000000100000000")
+    mux.receive(duplicate, syn); mux.receive(duplicate, syn)
+    if duplicate.state != mux.FAILED { return 8 }
+    let random = 12345
+    for trial in 0..2000 {
+        let session = mux.create(false); let packet = Bytes()
+        for count in 0..trial % 64 { random = (random * 1103515245 + 12345) & 0x7fffffff; packet.add(random & 255) }
+        mux.receive(session, packet); mux.endInput(session)
+    }
+    print("yamux: fragmented multiplexing, half-close, flow-credit restoration, bounds, role checks and 2,000 parser mutations passed")
+    return 0
+}

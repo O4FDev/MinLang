@@ -1,0 +1,58 @@
+use "crypto" as crypto
+use "quiccrypto" as quic
+use "errors" as errors
+
+function number(text: Text): Integer {
+    let value = 0
+    for digit in text { value = value * 10 + Integer(digit) - 48 }
+    return value
+}
+
+function main(): Integer {
+    let mode = argument(0)
+    let version = number(argument(1))
+    let client = quic.initial(version, crypto.fromHex("8394c8f03e515708"), false)
+    let server = quic.initial(version, crypto.fromHex("8394c8f03e515708"), true)
+    let keys = client
+    if mode == "server" { keys = server }
+    if mode == "chacha" {
+        keys = quic.traffic(version, quic.CHACHA20_POLY1305,
+            crypto.fromHex("9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b"))
+    }
+    if mode == "keys" {
+        print(crypto.hex(client.secret)); print(crypto.hex(client.key)); print(crypto.hex(client.iv)); print(crypto.hex(client.hp))
+        print(crypto.hex(server.secret)); print(crypto.hex(server.key)); print(crypto.hex(server.iv)); print(crypto.hex(server.hp))
+        return 0
+    }
+    if mode == "retry" {
+        print(quic.retryValid(version, crypto.fromHex(argument(2)), crypto.fromHex(argument(3))))
+        return 0
+    }
+    if mode == "open" {
+        let result = quic.unprotect(keys, crypto.fromHex(argument(2)), number(argument(3)), number(argument(4)))
+        if !result.valid { print("rejected"); return 0 }
+        print(result.number); print(crypto.hex(result.header)); print(crypto.hex(result.payload))
+        return 0
+    }
+    let header = crypto.fromHex(argument(2))
+    let payload = crypto.fromHex(argument(3))
+    let pn = number(argument(4))
+    let offset = number(argument(5))
+    let sealed = quic.protect(keys, header, offset, pn, payload)
+    if !errors.bytesOk(sealed) { print(errors.message(errors.bytesError(sealed))); return 1 }
+    let packet = errors.bytesValue(sealed)
+    print(crypto.hex(packet))
+    let opened = quic.unprotect(keys, packet, offset, pn - 1)
+    if !opened.valid { print("could not authenticate packet"); return 2 }
+    if crypto.hex(opened.header) != crypto.hex(header) || crypto.hex(opened.payload) != crypto.hex(payload) || opened.number != pn { return 3 }
+    // No ciphertext, tag or authenticated header bit may be silently accepted.
+    for index in 0..packet.length {
+        let bad = packet.slice(0, packet.length)
+        bad[index] = bad[index] ^ 1
+        if quic.unprotect(keys, bad, offset, pn - 1).valid { print("accepted tamper " + Text(index)); return 4 }
+    }
+    for length in 0..packet.length {
+        if quic.unprotect(keys, packet.slice(0, length), offset, pn - 1).valid { print("accepted truncation"); return 5 }
+    }
+    return 0
+}

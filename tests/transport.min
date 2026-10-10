@@ -1,0 +1,66 @@
+use "transport" as transport
+use "quic" as quic
+use "errors" as errors
+function exchange(c: transport.Connection, s: transport.Connection, now: Integer) {
+    for packet in transport.pollUDP(c, now) { transport.receiveUDP(s, packet.data, packet.pathId, now) }
+    for packet in transport.pollUDP(s, now) { transport.receiveUDP(c, packet.data, packet.pathId, now) }
+}
+function tcp(c: transport.Connection, s: transport.Connection, now: Integer) {
+    transport.receiveTCP(s, transport.pollTCP(c, now), now)
+    transport.receiveTCP(c, transport.pollTCP(s, now), now)
+}
+function main(): Integer {
+    let root = readBytesFile(argument(0)); let identity = readBytesFile(argument(1)); let key = readBytesFile(argument(2))
+    let client = readBytesFile(argument(3)); let clientKey = readBytesFile(argument(4))
+    let absolute = transport.client("localhost", randomBytes(80), "minyar-test", [root], [client], clientKey)
+    let firstPackets = transport.pollUDP(absolute, 100000000)
+    if firstPackets.length == 0 || absolute.state != transport.QUIC_TRYING { return 13 }
+    let serverClock = transport.serverQUIC(randomBytes(80), "minyar-test", absolute.udp.originalDestination, [identity], key, [root], true)
+    for packet in firstPackets { transport.receiveUDP(serverClock, packet.data, packet.pathId, 100000000) }
+    for count in 0..50 { exchange(absolute, serverClock, 100000000 + count * 10) }
+    if absolute.state != transport.QUIC_READY || serverClock.state != transport.QUIC_READY { return 14 }
+    if transport.nextTimer(serverClock) < 100001000 { return 15 }
+    for mode in 0..2 {
+        let c = transport.client("localhost", randomBytes(80), "minyar-test", [root], [client], clientKey)
+        transport.timeouts(c, 500, 500, 2000)
+        let s = transport.serverQUIC(randomBytes(80), "minyar-test", c.udp.originalDestination, [identity], key, [root], true)
+        if errors.bytesOk(transport.peerCertificate(c)) || errors.bytesOk(transport.peerCertificate(s)) { return 9 }
+        let retired = -1
+        if mode == 1 {
+            for count in 0..50 { exchange(c, s, count * 10) }
+            if c.state != transport.QUIC_READY || s.state != transport.QUIC_READY { return 1 }
+            if Text(errors.bytesValue(transport.peerCertificate(c))) != Text(identity) || Text(errors.bytesValue(transport.peerCertificate(s))) != Text(client) { return 10 }
+            retired = errors.integerValue(transport.openStream(c))
+            transport.write(c, retired, Bytes("must not replay"), false)
+        }
+        // Stop forwarding UDP permanently: no exception or process failure.
+        for count in 50..300 { transport.pollUDP(c, count * 10) }
+        if c.state != transport.TCP_NEEDED || c.generation != 1 { return 2 }
+        if errors.bytesOk(transport.peerCertificate(c)) { return 11 }
+        if mode == 1 && errors.code(errors.bytesError(transport.read(c, retired))) != transport.retryRequiredCode() { return 3 }
+        transport.startTCP(c, randomBytes(64), 3000)
+        let fallback = transport.serverTCP(randomBytes(64), "minyar-test", [identity], key, [root], true, 3000)
+        for count in 300..350 { tcp(c, fallback, count * 10) }
+        if c.state != transport.TCP_READY || fallback.state != transport.TCP_READY || !fallback.serverTLS.authenticated || fallback.mux.streams.length != 0 { print(c.error); print(fallback.error); return 4 }
+        if Text(errors.bytesValue(transport.peerCertificate(c))) != Text(identity) || Text(errors.bytesValue(transport.peerCertificate(fallback))) != Text(client) { return 12 }
+        if mode == 1 && errors.integerOk(transport.write(c, retired, Bytes("stale handle"), false)) { return 5 }
+        let handles: List<Integer> = []
+        for index in 0..16 {
+            let id = errors.integerValue(transport.openStream(c)); handles.add(id)
+            transport.write(c, id, Bytes("explicit retry " + Text(index)), true)
+        }
+        for count in 350..360 { tcp(c, fallback, count * 10) }
+        for id in transport.streamIds(fallback) {
+            let received = transport.read(fallback, id)
+            if errors.bytesOk(received) { transport.write(fallback, id, errors.bytesValue(received), true) }
+        }
+        for count in 360..370 { tcp(c, fallback, count * 10) }
+        for index in 0..handles.length { if Text(errors.bytesValue(transport.read(c, handles[index]))) != "explicit retry " + Text(index) { return 6 } }
+        transport.close(c); let ending = transport.pollTCP(c, 3700)
+        if ending.length == 0 || c.state != transport.CLOSED { return 7 }
+        transport.receiveTCP(fallback, ending, 3700); transport.endTCPInput(fallback)
+        if fallback.state != transport.CLOSED { print(fallback.error); return 8 }
+    }
+    print("transport: blocked UDP before/mid-session, fresh TCP mTLS, generation retirement, explicit retry and 16 multiplexed streams passed")
+    return 0
+}
