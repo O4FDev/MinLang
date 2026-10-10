@@ -31,6 +31,7 @@ answer), 12 (4x on long lists), 2 (4x), 8 (2x builds), 4 (-32%) and 15
 | 15 | Small functions that only call unchecked functions still paid the call-depth check (Minyarcraft's meshing helpers) | two levels of such functions above the leaves drop their check | `--benchmark build` 13.66G; `edit` 33.35G | 9.86G; 25.40G | -28%; -24% |
 | 16 | Release builds used full LTO | ThinLTO for `--release` and for the compiler | Minyarcraft 15.73-15.81G; JSON 0.834G; self-compile 71.95M | 14.90-14.94G; 0.806G; 70.55M | -5.5%; -3%; -2% |
 | 17 | Atacama streaming: the answer label measured, typeset and drew all of its text every frame | `macos.textView` and `appendText` (TextKit 1), no text checking in read-only text, no URL cache in `http`, buttons skip drawing outside their bounds | 12,000-delta answer 123.0G instructions, 14.0-14.2 s CPU; 3,000 deltas 14.3-15.0G | 11.8-12.3G, 3.3-4.1 s CPU; 3.5-3.7G | 10.2x; 4.0x |
+| 18 | Minyarcraft's mesh writer called into the runtime for each 32-byte vertex, which zeroed the bytes before they were written | `minyar_native_bytes_append`, an inline append in the native header that writes in place while capacity lasts | `--benchmark build` 9.85-9.87G; `edit` 25.06-25.20G | 9.53-9.54G; 24.24-24.26G | -3.3%; -3.5% |
 
 ### 1. Long lists rebuilt as stacks of views
 
@@ -880,6 +881,42 @@ different answers; with the URL cache left on, the second came from the
 cache. `check-macos` (with and without ASan/UBSan), `check-modules`,
 `check-http` and Atacama's `make test` pass.
 
+### 18. Each mesh vertex was a call into the runtime
+
+**Problem.** A profile of the world build on final v2 (`--benchmark build`,
+587 samples) has 46 samples in writing vertices: 25 in
+`minyar_graphics_addLitVertex` itself, 13 in `minyar_bytes_extend` and 8 in
+the `memset` it calls. `graphics.c` is a native object outside the program's
+LTO, so every vertex was a call into the runtime that reserved and zeroed 32
+bytes, which `add_vertex` then overwrote in full.
+
+**Fix.** `runtime/minyar_native.h` has `minyar_native_bytes_append(bytes,
+count)`, for native writers that fill every byte they append. Bytes keep
+their capacity in `character_length` (as `minyar_bytes.h` documents), so
+while it lasts the append is a comparison and an addition, inline, with no
+zeroing. Beyond it, or for a negative count, it calls `minyar_bytes_extend`,
+which grows or stops as before. `add_vertex` uses it.
+
+| 3 runs each | Before | After |
+| --- | ---: | ---: |
+| `craft --benchmark build` | 9.871G, 9.852G, 9.851G | 9.540G, 9.532G, 9.541G |
+| `craft --benchmark edit` (2 runs) | 25.06G, 25.20G | 24.24G, 24.26G |
+
+**Tests.** `tests/native-bytes.c` (`check-native-bytes`, part of `check` and
+`check-portable`) links the header against the program runtime. Appends
+within capacity must not move the storage, appends beyond it must keep the
+earlier contents, a cleared Bytes must refill in place, 65,536 bytes of
+random appends must match a model (also clean under ASan and UBSan), and a
+negative count must stop with the runtime's message. A program that writes
+lit and plain vertices in three rounds, across growths and two clears,
+ending with 5,108 vertices (163,456 bytes), produces byte-identical output
+built from v2 and from this change.
+`check-graphics-render`, `tests/native-graphics.py` and
+`tests/native-object-cache.py` pass. The opt-in research probe
+`tests/native-research-graphics.c` counts calls to `minyar_bytes_extend`
+per vertex; it already expected the 40-byte vertices of before change 9, and
+is not a maintained gate, so it is unchanged.
+
 ## Gates
 
 `make check-budget` (the compiler's self-compile budget) was already failing
@@ -988,6 +1025,10 @@ v2 and passes now.
   change 6. After changes 3, 6 and 8, see the tables in those sections.
 - **Minyar-OS** boots to the desktop in 632 ms under QEMU TCG. Its own frame
   profiler reports an average frame work of 0.2-2.3 ms against an 8 ms budget.
+  At the end of the night, one boot of each on the loaded machine: the start
+  of the night reached the desktop in 488 ms with 0.66-1.03 ms of average
+  frame work, final v2 in 628 ms with 0.55-0.59 ms. Under TCG that is within
+  noise either way.
 
 ## Not merged: Astra cycle collection
 

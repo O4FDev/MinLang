@@ -565,3 +565,13 @@ check-half-float: | build
 
 check: check-half-float
 check-portable: check-half-float
+
+# The native header's inline Bytes append, linked with the program runtime.
+.PHONY: check-native-bytes
+check-native-bytes: build/minyar-runtime.o | build
+	$(LIMITED) "$(LLVM_CC)" -std=c11 -O2 -Wall -Wextra -Werror tests/native-bytes.c build/minyar-runtime.o -lm -o build/native-bytes
+	$(LIMITED) ./build/native-bytes
+	$(LIMITED) ./build/native-bytes negative 2>&1 | grep -q "Bytes cannot shrink by a negative amount"
+
+check: check-native-bytes
+check-portable: check-native-bytes
