@@ -23,7 +23,7 @@ BUILD = ['build/minyarc', 'build/compiler-stage3.ll', 'build/minyarc-sanitize',
          'build/minyar-runtime.o', 'build/minyar-runtime-sanitize.o', 'build/ownership-runtime.o',
          'build/runtime-unit', 'build/runtime-unit-sanitize',
          'build/module-compiler-stage3.ll']
-TARGETS = ['check-toolchain-stamp', 'check-toolchain-portability', 'check-cold-bootstrap',
+TARGETS = ['check-linux-snapshot', 'check-toolchain-stamp', 'check-toolchain-portability', 'check-cold-bootstrap',
            'check-bootstrap-policy', 'check-peer-semantics', 'check-memory-regressions',
            'check-bootstrap-portability', 'check-bootstrap-records',
            'check-measurement-stats', 'check-budget-harness', 'check-stack-limits',
@@ -32,6 +32,8 @@ TARGETS = ['check-toolchain-stamp', 'check-toolchain-portability', 'check-cold-b
            'check-checked-arithmetic', 'check-checked-scalars',
            'check-runtime-bytes', 'check-runtime-traps', 'check-runtime-numeric',
            'check-errors-values', 'check-net', 'check-net-loop', 'check-tls-sanitize', 'check-json-parser-sanitize',
+           'check-feature-dispatch', 'check-managed-graphs', 'check-managed-graphs-launcher',
+           'check-callbacks', 'check-callback-domains', 'check-isolated-workers',
            'check-ownership-policy', 'check-stack-ownership', 'check-runtime-cache',
            'check-generated-sanitizer', 'check-sanitized-fixed-point',
            'check-smoke', 'check-release-build', 'check-launcher-isolation',
@@ -49,13 +51,19 @@ DIRECTORIES = ('.github', 'bootstrap', 'compiler', 'runtime', 'library', 'vendor
                'experiments', 'scripts', 'tools')
 
 
-def snapshot_sources(source, work):
-    """Copy the correctness inputs without host binaries or repository state."""
+def copy_source_snapshot(source, work):
+    """Copy declared sources without inheriting generated or host artifacts."""
     for name in DIRECTORIES:
         shutil.copytree(source / name, work / name,
                         ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
     for name in ('Makefile', 'minyar'):
         shutil.copy2(source / name, work / name)
+
+
+
+def snapshot_sources(source, work):
+    """Copy the correctness inputs without host binaries or repository state."""
+    copy_source_snapshot(source, work)
     return {str(path.relative_to(work)): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in sorted(work.rglob('*')) if path.is_file()}
 

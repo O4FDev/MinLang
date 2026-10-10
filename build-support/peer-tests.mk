@@ -43,6 +43,12 @@ check-peer-audit-complete: check-peer-audit
 check-suite-catalogue:
 	python3 tests/suite-catalogue.py
 
+.PHONY: check-linux-snapshot
+check-linux-snapshot:
+	python3 tests/linux-snapshot.py
+
+check check-portable: check-linux-snapshot
+
 .PHONY: check-scalar-cleanup-probes
 check-scalar-cleanup-probes:
 	$(SANITIZER_LIMITED) python3 tests/scalar-cleanup-probes.py

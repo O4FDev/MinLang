@@ -108,6 +108,53 @@ jobs:
       - name: Check real kqueue readiness, AppKit wakes and timers
         run: python3 tests/macos-network.py
 
+  macos-ordinary-performance:
+    name: macOS ordinary compiler and runtime budgets
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Build the ordinary fixed-point compiler
+        run: |
+          make LIMITED= SANITIZER_LIMITED= build/minyarc build/compiler-stage3.ll build/minyar-runtime.o
+          cmp build/compiler-stage2.ll build/compiler-stage3.ll
+      - name: Record native platform and PMU availability
+        run: |
+          mkdir -p build/performance-evidence
+          uname -a | tee build/performance-evidence/platform.txt
+          clang --version | tee build/performance-evidence/compiler.txt
+          sysctl -n machdep.cpu.brand_string | tee build/performance-evidence/cpu.txt
+          /usr/bin/time -l true 2> build/performance-evidence/pmu.txt
+          cat build/performance-evidence/pmu.txt
+      - name: Enforce unchanged supported self-compilation ceilings
+        run: |
+          set -o pipefail
+          make LIMITED= SANITIZER_LIMITED= check-budget | tee build/performance-evidence/self-compile-budget.txt
+          if grep -q 'instructions retired:' build/performance-evidence/self-compile-budget.txt; then
+            grep 'instructions retired:' build/performance-evidence/self-compile-budget.txt >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '**Retired instructions unavailable:** this runner does not expose the counter. The unchanged 75-million-instruction limit is not measured by this job; see the explicit PMU probe evidence.' | tee -a "$GITHUB_STEP_SUMMARY" build/performance-evidence/instructions-unavailable.txt
+          fi
+      - name: Enforce ordinary runtime and compiler performance checks
+        if: success() || failure()
+        run: |
+          set -o pipefail
+          make LIMITED= SANITIZER_LIMITED= check-performance | tee build/performance-evidence/performance.txt
+      - name: Upload platform and unchanged-gate evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-ordinary-performance-evidence
+          if-no-files-found: error
+          path: |
+            build/performance-evidence
+            build/performance.json
+
   windows-portable:
     name: Windows portable suite
     runs-on: windows-2025
@@ -154,6 +201,10 @@ jobs:
       - name: Check native SChannel TLS and nonexportable client certificates
         shell: msys2 {0}
         run: python3 tests/schannel.py
+      - name: Check native Windows collector oracles and execution domains
+        if: success() || failure()
+        shell: msys2 {0}
+        run: make LIMITED= SANITIZER_LIMITED= COMPILER_LTO_FLAGS= CC=clang LLVM_CC=clang check-managed-graphs-profiles check-callback-domains check-callbacks
       - name: Upload generated fuzz evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -198,6 +249,42 @@ jobs:
         with:
           name: afl-findings
           path: build/afl-findings.tar.gz
+
+  windows-isolated-workers:
+    name: Windows managed graphs callbacks and copied workers
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - name: Enable checkout of long evidence paths
+        shell: pwsh
+        run: git config --system core.longpaths true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            diffutils
+            zsh
+            python
+            mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-lld
+      - name: Run real process isolation and framing failure cases
+        shell: msys2 {0}
+        run: make LIMITED= SANITIZER_LIMITED= COMPILER_LTO_FLAGS= CC=clang LLVM_CC=clang check-isolated-workers
+      - name: Check native collector reachability and callback ownership
+        if: success() || failure()
+        shell: msys2 {0}
+        run: make LIMITED= SANITIZER_LIMITED= COMPILER_LTO_FLAGS= CC=clang LLVM_CC=clang check-managed-graphs check-managed-graphs-profiles check-callback-domains check-callbacks
+      - name: Upload retained failures
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-isolated-workers-evidence
+          path: build/test-evidence
 
   coverage:
     name: Compiler and runtime coverage gates
