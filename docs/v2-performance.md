@@ -17,8 +17,8 @@ heavily loaded machine; the load average was 30-76 throughout.
 | 5 | `record.text = record.text + piece` copied the whole Text each time (quadratic) | in-place append when the record holds the only other reference | 80,000 appends 4.11G | 79.8M | 51x (and linear) |
 | 6 | Compiling multi-module programs spent 27% of its time comparing symbol names character by character | symbol tables ordered by length, then from the last character | OS kernel compile 485M; Minyarcraft 109M; Atacama 80.5M | 342M; 71.4M; 58.1M | -28% to -35% |
 | 7 | `json.parse` built every string from a parts list, a slice and a join | one slice when a string has no escapes | 20 parses of a 143 KB history response 1.22G | 0.95G | -22% |
-| 9 | Minyarcraft's GPU vertex buffers dominated its memory (40-byte float vertices) | mesh vertices packed to 32 bytes: Float32 position and UV, Float16 colour and light | peak RSS 602 MB, footprint 892 MB | 447-523 MB, 815-844 MB | -13% to -26% RSS |
 | 8 | Every macOS app build recompiled the Objective-C bridges (`macos.m` 0.46 s, `http.m` 0.12 s) | content-keyed object cache, already used for `graphics.c`, now for every native bridge | Atacama default build 0.93-1.11 s; release app 1.86-2.41 s | 0.48 s; 1.39-1.46 s | about 2x |
+| 9 | Minyarcraft's GPU vertex buffers dominated its memory (40-byte float vertices) | mesh vertices packed to 32 bytes: Float32 position and UV, Float16 colour and light | peak RSS 602 MB, footprint 892 MB | 447-523 MB, 815-844 MB | -13% to -26% RSS |
 
 ### 1. Long lists rebuilt as stacks of views
 
