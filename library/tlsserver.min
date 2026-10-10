@@ -19,7 +19,7 @@ constant CHACHA20_POLY1305 = 0x1303
 public record Session {
     state: Integer; stage: Integer; error: Text; cipherSuite: Integer
     quic: Boolean; requireClient: Boolean; authenticated: Boolean
-    protocol: Text; transportParameters: Bytes; peerTransportParameters: Bytes
+    protocol: Text; transportParameters: Bytes; peerTransportParameters: Bytes; identityExpires: Integer
     privateKey: Bytes; random: Bytes; identity: Bytes; identityKey: Bytes; anchors: Bytes
     transcript: Bytes; received: Bytes; handshake: Bytes; incomingLevel: Integer
     outgoing: Bytes; initialOutgoing: Bytes; handshakeOutgoing: Bytes; incoming: Bytes
@@ -89,7 +89,7 @@ function create(entropy: Bytes, protocol: Text, parameters: Bytes, identity: Lis
     let session = Session {
         state: STARTING; stage: 0; error: ""; cipherSuite: AES128_GCM
         quic: quic; requireClient: requireClient; authenticated: false
-        protocol: protocol; transportParameters: parameters; peerTransportParameters: Bytes()
+        protocol: protocol; transportParameters: parameters; peerTransportParameters: Bytes(); identityExpires: 0
         privateKey: Bytes(); random: Bytes(); identity: pack(identity); identityKey: privateKey; anchors: pack(roots)
         transcript: Bytes(); received: Bytes(); handshake: Bytes(); incomingLevel: INITIAL_KEYS
         outgoing: Bytes(); initialOutgoing: Bytes(); handshakeOutgoing: Bytes(); incoming: Bytes()
@@ -230,11 +230,12 @@ function clientHello(session: Session, hello: Bytes) {
         abandon(session, "unsupported TLS version, ALPN, key share or QUIC parameters"); return
     }
     if session.earlyOffered && psk.length == 0 { abandon(session, "early data requires a PSK"); return }
+    session.identityExpires=trust.currentCertificateExpiry(session.identity)
     if psk.length > 0 {
         if !pskMode { abandon(session, "PSK offered without DHE mode"); return }
         let now = trust.currentTimeMilliseconds()
         let opened = tickets.open(session.ticketStore, psk, session.protocol, session.serverName, session.identityHash, now)
-        if opened.valid {
+        if opened.valid && session.identityExpires > now {
             if !equal(tickets.binder(opened.psk, crypto.sha256(hello.slice(0, binderEnd))), binder) { abandon(session, "TLS PSK binder did not verify"); return }
             let age = (ticketAge - opened.ageAdd) & 0xffffffff
             let difference = age - (now - opened.issued); if difference < 0 { difference = -difference }
@@ -364,10 +365,13 @@ function issueTicket(session: Session) {
     let psk = crypto.expandLabel(session.resumptionMaster, "resumption", nonce, 32)
     let profile = Bytes(); let earlyLimit = 0
     if session.quic { profile = tickets.profile(session.transportParameters); if profile.length == 64 { earlyLimit = session.ticketStore.earlyLimit } }
-    let issued = tickets.issueProfile(session.ticketStore, psk, session.cipherSuite, session.protocol, session.serverName, session.identityHash, session.verifiedClientChain, trust.currentTimeMilliseconds(), earlyLimit, profile)
+    let now=trust.currentTimeMilliseconds();let expires=session.identityExpires
+    if session.requireClient { expires=min(expires,trust.currentCertificateExpiry(session.verifiedClientChain)) }
+    let issued = tickets.issueProfileUntil(session.ticketStore, psk, session.cipherSuite, session.protocol, session.serverName, session.identityHash, session.verifiedClientChain, now, earlyLimit, profile, expires)
     if !issued.valid { return }
     let body = Bytes()
-    for index in 0..4 { body.add((session.ticketStore.lifetime >> ((3 - index) * 8)) & 255) }
+    let lifetime=max(0,(issued.expires-now)/1000)
+    for index in 0..4 { body.add((lifetime >> ((3 - index) * 8)) & 255) }
     for index in 0..4 { body.add((issued.ageAdd >> ((3 - index) * 8)) & 255) }
     body.add(nonce.length); body.addBytes(nonce); add16(body, issued.ticket.length); body.addBytes(issued.ticket)
     let extensions = Bytes()

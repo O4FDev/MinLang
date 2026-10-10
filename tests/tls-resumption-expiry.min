@@ -20,11 +20,29 @@ function main(): Integer {
     exchange(c, s)
     if c.state != tls.ESTABLISHED || s.state != server.ESTABLISHED { print(c.error); print(s.error); return 1 }
     let ticket = tls.takeTicket(c)
-    if !ticket.valid { return 2 }
+    if !ticket.valid { print("no current identity ticket");return 2 }
     let expires = 0; for digit in argument(6) { expires = expires * 10 + Integer(digit) - 48 }
+    let opened=tickets.open(store,ticket.ticket,"minyar-test","localhost",s.identityHash,trust.currentTimeMilliseconds())
+    if !opened.valid || opened.expires > expires { print("ticket outlives authenticated identity");return 8 }
+    if argument(5)=="server" {
+        // Simulate a still-authentic legacy ticket whose TTL was not capped.
+        // A current server must reject it even if its AES envelope is valid.
+        let legacy=tickets.issue(store,ticket.psk,ticket.suite,"minyar-test","localhost",s.identityHash,s.verifiedClientChain,trust.currentTimeMilliseconds(),ticket.earlyLimit)
+        if !legacy.valid { return 9 }
+        ticket.ticket=legacy.ticket;ticket.ageAdd=legacy.ageAdd;ticket.expires=legacy.expires;ticket.issued=trust.currentTimeMilliseconds()
+    }
+    // A peer can construct its valid binder while the certificate is current
+    // and deliver that ClientHello after the server's own certificate expires.
+    let paused=tls.quicClientResumed("localhost",randomBytes(64),"minyar-test",Bytes(),[root],[device],deviceKey,ticket)
+    let pausedHello=tls.takeOutgoing(paused)
     let eventLoop = errors.integerValue(loop.create())
     while trust.currentTimeMilliseconds() <= expires + 1000 { loop.wait(eventLoop, 100, 1) }
     loop.close(eventLoop)
+    if argument(5)=="server" {
+        let expiredServer=server.quicServerWithTickets(randomBytes(64),"minyar-test",Bytes(),[identity],key,[root],true,store)
+        server.receiveHandshake(expiredServer,pausedHello,0)
+        if expiredServer.resumed || expiredServer.authenticated { print("expired server identity accepted delayed PSK ClientHello");return 7 }
+    }
     let resumed = tls.quicClientResumed("localhost", randomBytes(64), "minyar-test", Bytes(), [root], [device], deviceKey, ticket)
     let accepted = server.quicServerWithTickets(randomBytes(64), "minyar-test", Bytes(), [identity], key, [root], true, store)
     if argument(5) == "server" && resumed.ticket.valid { return 3 }

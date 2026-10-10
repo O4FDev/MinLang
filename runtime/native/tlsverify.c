@@ -952,3 +952,66 @@ long long minyar_tlsverify_currentTimeMilliseconds(void) {
     return (long long)time.tv_sec * 1000 + time.tv_usec / 1000;
 #endif
 }
+
+/* RFC5280 section4.1.2.5: strict calendar bounds and seconds in UTC/Zulu.
+ * This extracts time policy only. It never replaces platform trust or signature
+ * validation. Gregorian arithmetic is bounded to ASN.1's four-digit years. */
+static bool certificate_time(unsigned char tag, Der date, long long *milliseconds) {
+    size_t year_digits = tag == 0x17 ? 2 : tag == 0x18 ? 4 : 0;
+    if (!year_digits || date.length != year_digits + 11 || date.data[date.length - 1] != 'Z')
+        return false;
+    int fields[6] = {0};
+    size_t at = 0;
+    for (size_t field = 0; field < 6; field++) {
+        size_t width = field ? 2 : year_digits;
+        for (size_t digit = 0; digit < width; digit++, at++) {
+            if (date.data[at] < '0' || date.data[at] > '9') return false;
+            fields[field] = fields[field] * 10 + date.data[at] - '0';
+        }
+    }
+    int year = fields[0];
+    if (year_digits == 2) year += year >= 50 ? 1900 : 2000;
+    int month = fields[1], day = fields[2];
+    bool leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    static const int lengths[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    static const int elapsed[] = {0,31,59,90,120,151,181,212,243,273,304,334};
+    if (year < 1 || month < 1 || month > 12 || day < 1 ||
+        day > lengths[month - 1] + (month == 2 && leap) ||
+        fields[3] > 23 || fields[4] > 59 || fields[5] > 59) return false;
+    int prior = year - 1;
+    long long days = (long long)(year - 1970) * 365 + prior / 4 - prior / 100 + prior / 400 - 477;
+    days += elapsed[month - 1] + day - 1 + (month > 2 && leap);
+    *milliseconds = ((days * 24 + fields[3]) * 3600 + fields[4] * 60 + fields[5]) * 1000;
+    return true;
+}
+
+static long long certificate_expiry(CertBytes bytes, long long now) {
+    Der input = bytes, outer, tbs, field, validity;
+    unsigned char tag;
+    if (!der_next(&input,&tag,&outer) || tag != 0x30 || input.length ||
+        !der_next(&outer,&tag,&tbs) || tag != 0x30) return 0;
+    if (tbs.length && tbs.data[0] == 0xa0 && !der_next(&tbs,&tag,&field)) return 0;
+    static const unsigned char expected[] = {2,0x30,0x30,0x30};
+    for (size_t i = 0; i < sizeof(expected); i++) {
+        if (!der_next(&tbs,&tag,&field) || tag != expected[i]) return 0;
+    }
+    validity = field;
+    long long before, after;
+    if (!der_next(&validity,&tag,&field) || !certificate_time(tag,field,&before) ||
+        !der_next(&validity,&tag,&field) || !certificate_time(tag,field,&after) || validity.length ||
+        before > now || after <= now || before >= after) return 0;
+    return after;
+}
+
+long long minyar_tlsverify_currentCertificateExpiry(const MinyarBytes *chain) {
+    CertBytes certificates[MAX_CHAIN];
+    int count = unpack_chain(chain,certificates);
+    long long now = minyar_tlsverify_currentTimeMilliseconds(), expires = INT64_MAX;
+    if (count < 1 || now < 1) return 0;
+    for (int i = 0; i < count; i++) {
+        long long bound = certificate_expiry(certificates[i],now);
+        if (!bound) return 0;
+        if (bound < expires) expires = bound;
+    }
+    return expires;
+}

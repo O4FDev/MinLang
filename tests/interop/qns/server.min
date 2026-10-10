@@ -10,6 +10,18 @@ use "tlstickets" as tickets
 use "quicretry" as retry
 record Transfer { id: Integer; request: Bytes; handle: Integer; size: Integer; sent: Integer; pending: Bytes; done: Boolean }
 record Peer { connection: quic.Connection; addresses: List<Text>; ports: List<Integer>; transfers: List<Transfer>; logged: Boolean }
+function httpPolicy(connection: quic.Connection) {
+    // The independent early-data case sends forty concurrent tiny requests.
+    // Keep the production default separate and the fixture below its 128
+    // active-record bound. The authenticated ticket remembers this policy.
+    connection.receiveBidi=64
+    let parameters=wire.parameters(connection.serverTLS.transportParameters,true);let changed=Bytes()
+    for parameter in parameters.parameters {
+        let value=parameter.value;if parameter.id==8 { value=errors.bytesValue(wire.encode(64)) }
+        changed.addBytes(errors.bytesValue(wire.encode(parameter.id)));changed.addBytes(errors.bytesValue(wire.encode(value.length)));changed.addBytes(value)
+    }
+    connection.serverTLS.transportParameters=changed
+}
 function logKeys(peer: Peer, path: Text) {
     let session = peer.connection.serverTLS
     if peer.logged || session.clientApplication.length != 32 || session.transcript.length < 38 { return }
@@ -48,6 +60,10 @@ function main(): Integer {
                         peer.transfers.add(Transfer { id: stream.id; request: Bytes(); handle: -1; size: 0; sent: 0; pending: Bytes(); done: false }); index = peer.transfers.length - 1
                     }
                     let transfer = peer.transfers[index]
+                    if transfer.handle >= 0 {
+                        let completion=quic.readStream(connection,stream.id)
+                        if errors.bytesOk(completion) && errors.bytesValue(completion).length>0 { print("unexpected request body");return 3 }
+                    }
                     if !transfer.done {
                         if transfer.handle < 0 {
                             let read = quic.readStream(connection, stream.id)
@@ -76,6 +92,12 @@ function main(): Integer {
             for packet in quic.pollDatagrams(connection, now) {
                 if packet.pathId < peer.addresses.length { net.sendDatagramTo(socket, peer.addresses[packet.pathId], peer.ports[packet.pathId], packet.data) }
             }
+            let retained: List<Transfer> = []
+            for transfer in peer.transfers {
+                let present=false;for stream in connection.streams { if stream.id==transfer.id { present=true } }
+                if present || !transfer.done { retained.add(transfer) }
+            }
+            peer.transfers=retained
             if connection.state == quic.FAILED { print("FAILED " + connection.error) }
             if (connection.state != quic.FAILED && connection.state != quic.CLOSED) || connection.closing || connection.draining { timeout = min(timeout, max(0, quic.nextTimer(connection) - now)); active.add(peer) }
             else { for transfer in peer.transfers { if transfer.handle > 0 && !transfer.done { file.close(transfer.handle) } } }
@@ -107,9 +129,11 @@ function main(): Integer {
                                 let validated=retry.validateInitial(retries,bytes,address,now)
                                 if !retry.valid(validated) { continue }
                                 let connection=quic.serverAfterRetry(randomBytes(80),"hq-interop",validated,identity,key,[root],false)
+                                httpPolicy(connection)
                                 peers.add(Peer { connection: connection; addresses: [net.datagramSource(packet)]; ports: [net.datagramPort(packet)]; transfers: []; logged: false })
                             } else {
                                 let connection = quic.serverWithTickets(randomBytes(80), "hq-interop", header.destination, identity, key, [root], false, store)
+                                httpPolicy(connection)
                                 peers.add(Peer { connection: connection; addresses: [net.datagramSource(packet)]; ports: [net.datagramPort(packet)]; transfers: []; logged: false })
                             }
                             index = peers.length - 1
