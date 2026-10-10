@@ -1,0 +1,76 @@
+// Single-peer integration fixture; peer-edge owns multi-peer routing.
+use "quic" as quic
+use "quicwire" as wire
+use "net" as net
+use "eventloop" as loop
+use "errors" as errors
+
+record Endpoint { address: Text; port: Integer }
+
+function main(): Integer {
+    let socket = net.udp("127.0.0.1", 0)
+    if socket < 0 { return 1 }
+    print("READY " + Text(net.localPort(socket)))
+    let created = loop.create()
+    if !errors.integerOk(created) { return 2 }
+    let eventLoop = errors.integerValue(created)
+    loop.watch(eventLoop, socket, loop.readableInterest(), 0)
+    loop.timer(eventLoop, 10, 10, 1)
+    let started = net.monotonicMilliseconds()
+    let now = 0
+    let connection = quic.server(randomBytes(80), "minyar-test", Bytes("unused"), [readBytesFile(argument(0))], readBytesFile(argument(1)), [readBytesFile(argument(2))], true)
+    let initialized = false; let echoed = false
+    let endpoints: List<Endpoint> = []
+    while now < 15000 {
+        let batch = loop.wait(eventLoop, -1, 16)
+        if errors.isError(loop.batchError(batch)) { return 3 }
+        for event in loop.events(batch) {
+            now = net.monotonicMilliseconds() - started
+            if loop.isTimer(event) { /* The clock drives recovery, not a tick count. */ }
+            else {
+                let packets = net.receiveDatagrams(socket, 32, 65535)
+                if net.datagramBatchOk(packets) {
+                    for packet in net.datagrams(packets) {
+                        let received = net.datagramData(packet)
+                        if errors.bytesOk(received) {
+                            let data = errors.bytesValue(received)
+                            if !initialized {
+                                let header = wire.header(data, 0, 8)
+                                if header.valid && header.kind == wire.INITIAL {
+                                    connection = quic.server(randomBytes(80), "minyar-test", header.destination, [readBytesFile(argument(0))], readBytesFile(argument(1)), [readBytesFile(argument(2))], true)
+                                    initialized = true
+                                }
+                            }
+                            if initialized {
+                                let path = -1
+                                for index in 0..endpoints.length { if endpoints[index].address == net.datagramSource(packet) && endpoints[index].port == net.datagramPort(packet) { path = index } }
+                                if path < 0 && endpoints.length < 8 { path = endpoints.length; endpoints.add(Endpoint { address: net.datagramSource(packet); port: net.datagramPort(packet) }) }
+                                if path >= 0 { quic.receivePath(connection, data, path, now) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if connection.state == quic.FAILED { print("FAILED " + connection.error); net.close(socket); loop.close(eventLoop); return 5 }
+        if initialized {
+            if connection.state == quic.ESTABLISHED && !echoed {
+                let got = quic.readStream(connection, 0)
+                if errors.bytesOk(got) && errors.bytesValue(got).length > 0 {
+                    let sent = quic.writeStream(connection, 0, errors.bytesValue(got), true)
+                    if !errors.integerOk(sent) { return 6 }
+                    echoed = true
+                }
+            }
+            for packet in quic.pollDatagrams(connection, now) {
+                let destination = endpoints[packet.pathId]
+                net.sendDatagramTo(socket, destination.address, destination.port, packet.data)
+            }
+            if connection.state == quic.CLOSED { break }
+        }
+    }
+    net.close(socket); loop.close(eventLoop)
+    if !echoed { print("timeout"); return 7 }
+    print("QUIC UDP authenticated echo passed")
+    return 0
+}

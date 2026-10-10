@@ -11,8 +11,10 @@
 #include <wincrypt.h>
 #include <bcrypt.h>
 #include <ncrypt.h>
+#include "windows_identity.h"
 #else
 #include <arpa/inet.h>
+#include <sys/time.h>
 #endif
 
 #define MAX_CHAIN 16
@@ -204,6 +206,7 @@ static bool certificate_hostname(CertBytes certificate, const char *host) {
 #ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
 #include <Security/Security.h>
+#include "apple_identity.h"
 
 static SecCertificateRef apple_certificate(CertBytes bytes) {
     CFDataRef data = CFDataCreate(NULL, bytes.data, (CFIndex)bytes.length);
@@ -213,13 +216,13 @@ static SecCertificateRef apple_certificate(CertBytes bytes) {
     return certificate;
 }
 
-MinyarText *minyar_tlsverify_chain(const MinyarText *host, const MinyarBytes *chain,
-                                   const MinyarBytes *anchors) {
+static MinyarText *verify_chain(const MinyarText *host, const MinyarBytes *chain,
+                                const MinyarBytes *anchors, bool server_peer) {
     CertBytes peers[MAX_CHAIN], roots[MAX_CHAIN];
     int peer_count = unpack_chain(chain, peers), root_count = unpack_chain(anchors, roots);
-    char name[254];
-    if (peer_count <= 0 || root_count < 0 || !hostname(host, name) ||
-        !certificate_hostname(peers[0], name))
+    char name[254] = {0};
+    if (peer_count <= 0 || root_count < 0 ||
+        (server_peer && (!hostname(host, name) || !certificate_hostname(peers[0], name))))
         return error_text("invalid certificate chain or hostname");
     CFMutableArrayRef certificates = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
     CFMutableArrayRef trusted = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
@@ -242,8 +245,9 @@ MinyarText *minyar_tlsverify_chain(const MinyarText *host, const MinyarBytes *ch
         CFArrayAppendValue(trusted, certificate);
         CFRelease(certificate);
     }
-    CFStringRef server = CFStringCreateWithCString(NULL, name, kCFStringEncodingASCII);
-    SecPolicyRef policy = server ? SecPolicyCreateSSL(true, server) : NULL;
+    CFStringRef server = server_peer ? CFStringCreateWithCString(NULL, name, kCFStringEncodingASCII) : NULL;
+    SecPolicyRef policy = server_peer ? (server ? SecPolicyCreateSSL(true, server) : NULL)
+                                      : SecPolicyCreateSSL(false, NULL);
     SecTrustRef trust = NULL;
     if (!policy || !valid ||
         SecTrustCreateWithCertificates(certificates, policy, &trust) != errSecSuccess)
@@ -399,16 +403,19 @@ bool minyar_tlsverify_signature(const MinyarBytes *certificate, long long scheme
 MinyarBytes *minyar_tlsverify_sign(const MinyarBytes *private_key, long long scheme,
                                    const MinyarBytes *content) {
     MinyarBytes *result = minyar_bytes_new(0);
+    bool reference = private_key->byte_length >= 4 && !memcmp(private_key->bytes, "MNI1", 4);
     if (private_key->byte_length <= 0 || private_key->byte_length > MAX_CERT_BYTES ||
-        !exact_der(private_key->bytes, (size_t)private_key->byte_length))
+        (!reference && !exact_der(private_key->bytes, (size_t)private_key->byte_length)))
         return result;
-    CFDataRef encoded = CFDataCreate(NULL, private_key->bytes, private_key->byte_length);
+    CFDataRef encoded =
+        reference ? NULL : CFDataCreate(NULL, private_key->bytes, private_key->byte_length);
     SecExternalFormat format = kSecFormatUnknown;
     SecExternalItemType type = kSecItemTypePrivateKey;
     CFArrayRef items = NULL;
     OSStatus status =
         encoded ? SecItemImport(encoded, NULL, &format, &type, 0, NULL, NULL, &items) : errSecParam;
-    SecKeyRef key = status == errSecSuccess && items && CFArrayGetCount(items) == 1 &&
+    SecKeyRef key = reference ? identity_private_key(private_key)
+                    : status == errSecSuccess && items && CFArrayGetCount(items) == 1 &&
                             CFGetTypeID(CFArrayGetValueAtIndex(items, 0)) == SecKeyGetTypeID()
                         ? (SecKeyRef)CFArrayGetValueAtIndex(items, 0)
                         : NULL;
@@ -432,18 +439,20 @@ MinyarBytes *minyar_tlsverify_sign(const MinyarBytes *private_key, long long sch
         CFRelease(fallback);
     if (encoded)
         CFRelease(encoded);
+    if (reference && key)
+        CFRelease(key);
     return result;
 }
 
 #elif defined(_WIN32)
 
-MinyarText *minyar_tlsverify_chain(const MinyarText *host, const MinyarBytes *chain,
-                                   const MinyarBytes *anchors) {
+static MinyarText *verify_chain(const MinyarText *host, const MinyarBytes *chain,
+                                const MinyarBytes *anchors, bool server_peer) {
     CertBytes peers[MAX_CHAIN], roots[MAX_CHAIN];
     int peer_count = unpack_chain(chain, peers), root_count = unpack_chain(anchors, roots);
-    char name[254];
-    if (peer_count <= 0 || root_count < 0 || !hostname(host, name) ||
-        !certificate_hostname(peers[0], name))
+    char name[254] = {0};
+    if (peer_count <= 0 || root_count < 0 ||
+        (server_peer && (!hostname(host, name) || !certificate_hostname(peers[0], name))))
         return error_text("invalid certificate chain or hostname");
     HCERTSTORE peer_store =
         CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
@@ -474,7 +483,7 @@ MinyarText *minyar_tlsverify_chain(const MinyarText *host, const MinyarBytes *ch
     }
     CERT_CHAIN_PARA parameters = {0};
     parameters.cbSize = sizeof(parameters);
-    LPSTR usage[] = {szOID_PKIX_KP_SERVER_AUTH};
+    LPSTR usage[] = {server_peer ? szOID_PKIX_KP_SERVER_AUTH : szOID_PKIX_KP_CLIENT_AUTH};
     parameters.RequestedUsage.dwType = USAGE_MATCH_TYPE_AND;
     parameters.RequestedUsage.Usage.cUsageIdentifier = 1;
     parameters.RequestedUsage.Usage.rgpszUsageIdentifier = usage;
@@ -491,8 +500,8 @@ MinyarText *minyar_tlsverify_chain(const MinyarText *host, const MinyarBytes *ch
         server[i] = (wchar_t)(unsigned char)name[i];
     SSL_EXTRA_CERT_CHAIN_POLICY_PARA ssl_policy = {0};
     ssl_policy.cbSize = sizeof(ssl_policy);
-    ssl_policy.dwAuthType = AUTHTYPE_SERVER;
-    ssl_policy.pwszServerName = server;
+    ssl_policy.dwAuthType = server_peer ? AUTHTYPE_SERVER : AUTHTYPE_CLIENT;
+    ssl_policy.pwszServerName = server_peer ? server : NULL;
     CERT_CHAIN_POLICY_PARA policy = {0};
     policy.cbSize = sizeof(policy);
     policy.pvExtraPolicyPara = &ssl_policy;
@@ -537,20 +546,51 @@ static bool windows_digest(const MinyarBytes *content, LPCWSTR algorithm, DWORD 
     if (content->byte_length < 0 || content->byte_length > UINT32_MAX)
         return false;
     BCRYPT_ALG_HANDLE handle = NULL;
-    bool valid = BCryptOpenAlgorithmProvider(&handle, algorithm, NULL, 0) == 0 &&
-                 BCryptHash(handle, NULL, 0, (PUCHAR)content->bytes, (ULONG)content->byte_length,
-                            out, size) == 0;
+    BCRYPT_HASH_HANDLE hash = NULL;
+    bool valid =
+        BCryptOpenAlgorithmProvider(&handle, algorithm, NULL, 0) == 0 &&
+        BCryptCreateHash(handle, &hash, NULL, 0, NULL, 0, 0) == 0 &&
+        BCryptHashData(hash, (PUCHAR)content->bytes, (ULONG)content->byte_length, 0) == 0 &&
+        BCryptFinishHash(hash, out, size, 0) == 0;
+    if (hash)
+        BCryptDestroyHash(hash);
     if (handle)
         BCryptCloseAlgorithmProvider(handle, 0);
     return valid;
 }
 
-static bool windows_scheme(LPCWSTR algorithm, DWORD bits, long long scheme) {
+static bool windows_scheme(LPCWSTR algorithm, DWORD bits, long long scheme, LPCWSTR curve) {
     if (!wcscmp(algorithm, BCRYPT_RSA_ALGORITHM) && bits >= 2048)
         return scheme == 0x0804 || scheme == 0x0805 || scheme == 0x0806;
-    return (!wcscmp(algorithm, BCRYPT_ECDSA_P256_ALGORITHM) && bits == 256 && scheme == 0x0403) ||
-           (!wcscmp(algorithm, BCRYPT_ECDSA_P384_ALGORITHM) && bits == 384 && scheme == 0x0503) ||
-           (!wcscmp(algorithm, BCRYPT_ECDSA_P521_ALGORITHM) && bits == 521 && scheme == 0x0603);
+    LPCWSTR signing = NULL, agreement = NULL, named = NULL;
+    if (bits == 256 && scheme == 0x0403) {
+        signing = BCRYPT_ECDSA_P256_ALGORITHM;
+        agreement = BCRYPT_ECDH_P256_ALGORITHM;
+        named = L"nistP256";
+    } else if (bits == 384 && scheme == 0x0503) {
+        signing = BCRYPT_ECDSA_P384_ALGORITHM;
+        agreement = BCRYPT_ECDH_P384_ALGORITHM;
+        named = L"nistP384";
+    } else if (bits == 521 && scheme == 0x0603) {
+        signing = BCRYPT_ECDSA_P521_ALGORITHM;
+        agreement = BCRYPT_ECDH_P521_ALGORITHM;
+        named = L"nistP521";
+    }
+    if (!named)
+        return false;
+    /* CNG can import an EC signing key under its ECDH algorithm identifier,
+     * as also supported by .NET ECDsaCng. A generic EC identifier and bit
+     * length alone cannot distinguish NIST curves from e.g. secp256k1. */
+    if (!wcscmp(algorithm, signing) || !wcscmp(algorithm, agreement))
+        return true;
+    /* Generic Windows 10 identifiers are absent from older MinGW headers. */
+    return (!wcscmp(algorithm, L"ECDSA") || !wcscmp(algorithm, L"ECDH")) && curve &&
+           !wcscmp(curve, named);
+}
+
+static bool windows_property_string(LPCWSTR text, DWORD written, size_t capacity) {
+    return written >= sizeof(wchar_t) && written <= capacity && written % sizeof(wchar_t) == 0 &&
+           text[written / sizeof(wchar_t) - 1] == 0;
 }
 
 static bool windows_ec_signature(const MinyarBytes *encoded, size_t width, unsigned char raw[132]) {
@@ -591,15 +631,24 @@ bool minyar_tlsverify_signature(const MinyarBytes *certificate, long long scheme
     bool valid =
         cert && CryptImportPublicKeyInfoEx2(X509_ASN_ENCODING,
                                             &cert->pCertInfo->SubjectPublicKeyInfo, 0, NULL, &key);
-    wchar_t algorithm[64] = {0};
+    wchar_t algorithm[64] = {0}, curve[64] = {0};
     DWORD bits = 0, written = 0, hash_size = 0;
     LPCWSTR hash_algorithm = windows_hash(scheme, &hash_size);
     if (valid)
         valid = BCryptGetProperty(key, BCRYPT_ALGORITHM_NAME, (PUCHAR)algorithm, sizeof(algorithm),
                                   &written, 0) == 0 &&
+                windows_property_string(algorithm, written, sizeof(algorithm)) &&
                 BCryptGetProperty(key, BCRYPT_KEY_LENGTH, (PUCHAR)&bits, sizeof(bits), &written,
                                   0) == 0 &&
-                windows_scheme(algorithm, bits, scheme) && hash_algorithm;
+                written == sizeof(bits);
+    if (valid) {
+        /* This Windows 10 property is missing from some MinGW SDK headers. */
+        if (BCryptGetProperty(key, L"ECCCurveName", (PUCHAR)curve, sizeof(curve), &written, 0) !=
+                0 ||
+            !windows_property_string(curve, written, sizeof(curve)))
+            curve[0] = 0;
+        valid = windows_scheme(algorithm, bits, scheme, curve) && hash_algorithm;
+    }
     unsigned char digest[64], raw[132];
     if (valid)
         valid = windows_digest(content, hash_algorithm, hash_size, digest);
@@ -652,31 +701,46 @@ static void append_ec_der(MinyarBytes *out, const unsigned char *raw, size_t len
 MinyarBytes *minyar_tlsverify_sign(const MinyarBytes *private_key, long long scheme,
                                    const MinyarBytes *content) {
     MinyarBytes *result = minyar_bytes_new(0);
+    bool opaque = private_key->byte_length >= 4 && !memcmp(private_key->bytes, "MWI1", 4);
     if (private_key->byte_length <= 0 || private_key->byte_length > MAX_CERT_BYTES ||
-        !exact_der(private_key->bytes, (size_t)private_key->byte_length))
+        (!opaque && !exact_der(private_key->bytes, (size_t)private_key->byte_length)))
         return result;
     NCRYPT_PROV_HANDLE provider = 0;
     NCRYPT_KEY_HANDLE key = 0;
-    bool valid =
-        NCryptOpenStorageProvider(&provider, MS_KEY_STORAGE_PROVIDER, 0) == ERROR_SUCCESS &&
-        NCryptImportKey(provider, 0, NCRYPT_PKCS8_PRIVATE_KEY_BLOB, NULL, &key,
-                        (PBYTE)private_key->bytes, (DWORD)private_key->byte_length,
-                        NCRYPT_SILENT_FLAG) == ERROR_SUCCESS;
-    wchar_t algorithm[64] = {0};
+    WinIdentityKey identity = {0};
+    bool valid;
+    if (opaque) {
+        valid = win_identity_acquire(&identity, private_key);
+        key = identity.key;
+    } else {
+        valid = NCryptOpenStorageProvider(&provider, MS_KEY_STORAGE_PROVIDER, 0) == ERROR_SUCCESS &&
+                NCryptImportKey(provider, 0, NCRYPT_PKCS8_PRIVATE_KEY_BLOB, NULL, &key,
+                                (PBYTE)private_key->bytes, (DWORD)private_key->byte_length,
+                                NCRYPT_SILENT_FLAG) == ERROR_SUCCESS;
+    }
+    wchar_t algorithm[64] = {0}, curve[64] = {0};
     DWORD bits = 0, written = 0, hash_size = 0;
     LPCWSTR hash_algorithm = windows_hash(scheme, &hash_size);
     if (valid)
         valid = NCryptGetProperty(key, NCRYPT_ALGORITHM_PROPERTY, (PBYTE)algorithm,
                                   sizeof(algorithm), &written, 0) == ERROR_SUCCESS &&
+                windows_property_string(algorithm, written, sizeof(algorithm)) &&
                 NCryptGetProperty(key, NCRYPT_LENGTH_PROPERTY, (PBYTE)&bits, sizeof(bits), &written,
                                   0) == ERROR_SUCCESS &&
-                windows_scheme(algorithm, bits, scheme) && hash_algorithm;
+                written == sizeof(bits);
+    if (valid) {
+        if (NCryptGetProperty(key, L"ECCCurveName", (PBYTE)curve, sizeof(curve), &written, 0) !=
+                ERROR_SUCCESS ||
+            !windows_property_string(curve, written, sizeof(curve)))
+            curve[0] = 0;
+        valid = windows_scheme(algorithm, bits, scheme, curve) && hash_algorithm;
+    }
     unsigned char digest[64];
     if (valid)
         valid = windows_digest(content, hash_algorithm, hash_size, digest);
     bool rsa = scheme >= 0x0804 && scheme <= 0x0806;
     BCRYPT_PSS_PADDING_INFO padding = {hash_algorithm, hash_size};
-    DWORD flags = rsa ? NCRYPT_PAD_PSS_FLAG : 0, size = 0;
+    DWORD flags = NCRYPT_SILENT_FLAG | (rsa ? NCRYPT_PAD_PSS_FLAG : 0), size = 0;
     if (valid)
         valid = NCryptSignHash(key, rsa ? &padding : NULL, digest, hash_size, NULL, 0, &size,
                                flags) == ERROR_SUCCESS;
@@ -689,7 +753,9 @@ MinyarBytes *minyar_tlsverify_sign(const MinyarBytes *private_key, long long sch
             append_ec_der(result, signature, written);
     }
     free(signature);
-    if (key)
+    if (opaque)
+        win_identity_release(&identity);
+    else if (key)
         NCryptFreeObject(key);
     if (provider)
         NCryptFreeObject(provider);
@@ -714,13 +780,13 @@ static X509 *unix_certificate(CertBytes bytes) {
     return certificate;
 }
 
-MinyarText *minyar_tlsverify_chain(const MinyarText *host, const MinyarBytes *chain,
-                                   const MinyarBytes *anchors) {
+static MinyarText *verify_chain(const MinyarText *host, const MinyarBytes *chain,
+                                const MinyarBytes *anchors, bool server_peer) {
     CertBytes peers[MAX_CHAIN], roots[MAX_CHAIN];
     int peer_count = unpack_chain(chain, peers), root_count = unpack_chain(anchors, roots);
-    char name[254];
-    if (peer_count <= 0 || root_count < 0 || !hostname(host, name) ||
-        !certificate_hostname(peers[0], name))
+    char name[254] = {0};
+    if (peer_count <= 0 || root_count < 0 ||
+        (server_peer && (!hostname(host, name) || !certificate_hostname(peers[0], name))))
         return error_text("invalid certificate chain or hostname");
     X509_STORE *store = X509_STORE_new();
     X509_STORE_CTX *context = X509_STORE_CTX_new();
@@ -751,10 +817,10 @@ MinyarText *minyar_tlsverify_chain(const MinyarText *host, const MinyarBytes *ch
                                                        X509_CHECK_FLAG_NEVER_CHECK_SUBJECT);
         X509_VERIFY_PARAM_set_flags(parameter, X509_V_FLAG_X509_STRICT | X509_V_FLAG_TRUSTED_FIRST);
         unsigned char ip[16];
-        valid = X509_VERIFY_PARAM_set_purpose(parameter, X509_PURPOSE_SSL_SERVER) == 1;
-        if (valid && (inet_pton(AF_INET, name, ip) == 1 || inet_pton(AF_INET6, name, ip) == 1))
+        valid = X509_VERIFY_PARAM_set_purpose(parameter, server_peer ? X509_PURPOSE_SSL_SERVER : X509_PURPOSE_SSL_CLIENT) == 1;
+        if (valid && server_peer && (inet_pton(AF_INET, name, ip) == 1 || inet_pton(AF_INET6, name, ip) == 1))
             valid = X509_VERIFY_PARAM_set1_ip_asc(parameter, name) == 1;
-        else if (valid)
+        else if (valid && server_peer)
             valid = X509_VERIFY_PARAM_set1_host(parameter, name, 0) == 1;
     }
     if (valid)
@@ -854,3 +920,27 @@ MinyarBytes *minyar_tlsverify_sign(const MinyarBytes *private_key, long long sch
     return result;
 }
 #endif
+
+MinyarText *minyar_tlsverify_chain(const MinyarText *host, const MinyarBytes *chain, const MinyarBytes *anchors) {
+    return verify_chain(host, chain, anchors, true);
+}
+MinyarText *minyar_tlsverify_clientChain(const MinyarBytes *chain, const MinyarBytes *anchors) {
+    return verify_chain(NULL, chain, anchors, false);
+}
+
+/* Tickets need wall time across connections; transport timers remain monotonic. */
+long long minyar_tlsverify_currentTimeMilliseconds(void) {
+#ifdef _WIN32
+    FILETIME filetime;
+    GetSystemTimeAsFileTime(&filetime);
+    ULARGE_INTEGER ticks;
+    ticks.LowPart = filetime.dwLowDateTime;
+    ticks.HighPart = filetime.dwHighDateTime;
+    if (ticks.QuadPart < UINT64_C(116444736000000000)) return 0;
+    return (long long)((ticks.QuadPart - UINT64_C(116444736000000000)) / 10000);
+#else
+    struct timeval time;
+    if (gettimeofday(&time, NULL) != 0 || time.tv_sec < 0 || (uint64_t)time.tv_sec > INT64_MAX / 1000) return 0;
+    return (long long)time.tv_sec * 1000 + time.tv_usec / 1000;
+#endif
+}

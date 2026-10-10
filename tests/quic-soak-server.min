@@ -1,0 +1,85 @@
+// Remote load fixture: routes many clients by CID without a socket per client.
+use "quic" as quic
+use "quicwire" as wire
+use "crypto" as crypto
+use "net" as net
+use "eventloop" as loop
+use "errors" as errors
+use "tlstickets" as tickets
+
+record Peer { connection: quic.Connection; address: Text; port: Integer; reported: Boolean }
+function number(text: Text): Integer { let value = 0; for digit in text { value = value * 10 + Integer(digit) - 48 }; return value }
+function main(): Integer {
+    let socket = net.udp("127.0.0.1", 0)
+    if socket < 0 { return 1 }
+    print("READY " + Text(net.localPort(socket)))
+    let eventLoop = errors.integerValue(loop.create())
+    loop.watch(eventLoop, socket, loop.readableInterest(), 0)
+    let identity = readBytesFile(argument(0)); let key = readBytesFile(argument(1)); let root = readBytesFile(argument(2))
+    let duration = number(argument(3)); let maximum = number(argument(4))
+    let peers: List<Peer> = []; let echoes = 0; let accepted = 0; let failures = 0
+    let issueTickets = argumentCount() > 5 && (argument(5) == "tickets" || argument(5) == "early")
+    let store = tickets.store(randomBytes(16), 3600); let resumed = 0
+    if argumentCount() > 5 && argument(5) == "early" { tickets.allowEarlyData(store, 0xffffffff) }
+    let started = net.monotonicMilliseconds(); let now = 0
+    while now < duration {
+        now = net.monotonicMilliseconds() - started
+        let timeout = min(5000, max(0, duration - now))
+        let active: List<Peer> = []
+        for peer in peers {
+            let connection = peer.connection
+            if connection.state == quic.ESTABLISHED {
+                if !peer.reported { peer.reported = true; if connection.serverTLS.resumed { resumed += 1 } }
+                for input in connection.streams {
+                    let data = quic.readStream(connection, input.id)
+                    if errors.bytesOk(data) && errors.bytesValue(data).length > 0 {
+                        let final = input.final >= 0 && input.delivered == input.final
+                        let result = quic.writeStream(connection, input.id, errors.bytesValue(data), final)
+                        if !errors.integerOk(result) { print("write credit exhausted"); return 2 }
+                        echoes += 1
+                    }
+                }
+            }
+            for packet in quic.poll(connection, now) { net.sendDatagramTo(socket, peer.address, peer.port, packet) }
+            if connection.state == quic.FAILED { failures += 1; print("FAILED " + connection.error) }
+            else if connection.state != quic.CLOSED {
+                timeout = min(timeout, max(0, quic.nextTimer(connection) - now)); active.add(peer)
+            }
+        }
+        peers = active
+        let batch = loop.wait(eventLoop, timeout, 64)
+        if errors.isError(loop.batchError(batch)) { return 3 }
+        now = net.monotonicMilliseconds() - started
+        for event in loop.events(batch) {
+            let packets = net.receiveDatagrams(socket, 64, 1500)
+            if net.datagramBatchOk(packets) {
+                for packet in net.datagrams(packets) {
+                    let received = net.datagramData(packet)
+                    if errors.bytesOk(received) {
+                        let data = errors.bytesValue(received); let header = wire.header(data, 0, 8)
+                        if header.valid {
+                            let index = -1
+                            for at in 0..peers.length {
+                                let connection = peers[at].connection
+                                if crypto.hex(header.destination) == crypto.hex(connection.local) || crypto.hex(header.destination) == crypto.hex(connection.originalDestination) { index = at }
+                            }
+                            if index < 0 && header.kind == wire.INITIAL && data.length >= 1200 && peers.length < maximum {
+                                let connection = quic.server(randomBytes(80), "minyar-test", header.destination, [identity], key, [root], true)
+                                if issueTickets { connection = quic.serverWithTickets(randomBytes(80), "minyar-test", header.destination, [identity], key, [root], true, store) }
+                                peers.add(Peer { connection: connection; address: net.datagramSource(packet); port: net.datagramPort(packet); reported: false }); index = peers.length - 1; accepted += 1
+                            }
+                            if index >= 0 && peers[index].address == net.datagramSource(packet) && peers[index].port == net.datagramPort(packet) {
+                                quic.receive(peers[index].connection, data, now)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    loop.close(eventLoop); net.close(socket)
+    print("RESULT " + Text(accepted) + " " + Text(echoes) + " " + Text(failures))
+    if issueTickets { print("RESUMED " + Text(resumed)) }
+    if failures > 0 { return 4 }
+    return 0
+}

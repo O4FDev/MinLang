@@ -295,6 +295,14 @@ def main():
             native += [native_object(project, clang, base, 'net.c', native_flags)]
             if platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
                 native += ['-lws2_32']
+        elif library == 'quicinteropio':
+            native += [native_object(project, clang, base, 'quicinteropio.c', native_flags)]
+        elif library == 'aes':
+            native += [native_object(project, clang, base, 'aes.c', native_flags)]
+            if platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
+                native += ['-lbcrypt']
+            elif platform.system() != 'Darwin':
+                native += ['-lcrypto']
         elif library == 'tlsverify':
             native += [native_object(project, clang, base, 'tlsverify.c', native_flags)]
             if platform.system() == 'Darwin':

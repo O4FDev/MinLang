@@ -1,0 +1,35 @@
+use "tls" as tls
+use "tlsserver" as server
+
+function length(message: Bytes, at: Integer): Integer { return (message[at + 1] << 16) | (message[at + 2] << 8) | message[at + 3] }
+function main(): Integer {
+    let root = readBytesFile(argument(0)); let identity = readBytesFile(argument(1)); let key = readBytesFile(argument(2))
+    let client = readBytesFile(argument(3)); let clientKey = readBytesFile(argument(4))
+    for mode in 0..8 {
+        let c = tls.quicClient("localhost", randomBytes(64), "minyar-test", Bytes(), [root], [client], clientKey)
+        let s = server.quicServer(randomBytes(64), "minyar-test", Bytes(), [identity], key, [root], true)
+        server.receiveHandshake(s, tls.takeOutgoing(c), 0)
+        tls.receiveHandshake(c, server.takeInitial(s), 0)
+        tls.receiveHandshake(c, server.takeHandshake(s), 1)
+        if c.state != tls.ESTABLISHED || s.state != server.HANDSHAKE { return 1 }
+        let flight = tls.takeOutgoing(c)
+        let certificateEnd = 4 + length(flight, 0)
+        let verifyEnd = certificateEnd + 4 + length(flight, certificateEnd)
+        if mode == 1 { flight[verifyEnd - 1] = flight[verifyEnd - 1] ^ 1 }
+        if mode == 2 { flight[flight.length - 1] = flight[flight.length - 1] ^ 1 }
+        if mode == 3 { let replaced = flight.slice(0, certificateEnd); replaced.addBytes(flight.slice(verifyEnd, flight.length)); flight = replaced }
+        if mode == 4 { flight = flight.slice(verifyEnd, flight.length) }
+        if mode == 5 { flight[certificateEnd + 7] = flight[certificateEnd + 7] ^ 1 }
+        if mode == 6 { flight = flight.slice(0, flight.length - 1) }
+        if mode == 7 { server.receiveHandshake(s, flight, 0) }
+        else { server.receiveHandshake(s, flight, 1) }
+        if mode == 6 { server.endInput(s) }
+        if mode == 0 {
+            if s.state != server.ESTABLISHED || !s.authenticated { return 2 }
+            server.endInput(s)
+            if s.state != server.ESTABLISHED { return 3 }
+        } else if s.state != server.FAILED { print("server accepted adversarial flight " + Text(mode)); return 4 }
+    }
+    print("TLS server adversarial proof: forged CertificateVerify/Finished, skipped messages, wrong level and truncated handshake rejected")
+    return 0
+}
