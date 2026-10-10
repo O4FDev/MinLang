@@ -838,7 +838,7 @@ static void put_half(unsigned char *target, double value) {
 
 static void add_vertex(MinyarBytes *vertices, double x, double y, double z, double u, double v,
                        double red, double green, double blue, double sky, double glow) {
-    unsigned char *target = minyar_bytes_extend(vertices, VERTEX_BYTES);
+    unsigned char *target = minyar_native_bytes_append(vertices, VERTEX_BYTES);
     put_float(target, (float)x);
     put_float(target + 4, (float)y);
     put_float(target + 8, (float)z);

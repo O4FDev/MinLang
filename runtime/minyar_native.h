@@ -30,6 +30,19 @@ MinyarText *minyar_native_copy_text(const unsigned char *bytes, long long length
 /* Append `count` zeroed bytes and return a pointer to them. */
 unsigned char *minyar_bytes_extend(MinyarBytes *bytes, long long count);
 
+/* Append `count` bytes that the caller then writes in full, and return a
+ * pointer to them. Bytes keep their capacity in character_length, so while it
+ * lasts this needs no call and no zeroing; beyond it, it grows through
+ * minyar_bytes_extend. For hot native writers such as mesh vertices. */
+static inline unsigned char *minyar_native_bytes_append(MinyarBytes *bytes, long long count) {
+    if (count >= 0 && bytes->character_length - bytes->byte_length >= count) {
+        unsigned char *start = (unsigned char *)bytes->bytes + bytes->byte_length;
+        bytes->byte_length += count;
+        return start;
+    }
+    return minyar_bytes_extend(bytes, count);
+}
+
 static inline void minyar_native_stop(const char *message) {
     fprintf(stderr, "Minyar stopped: %s\n", message);
     exit(1);

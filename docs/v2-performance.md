@@ -31,6 +31,8 @@ answer), 12 (4x on long lists), 2 (4x), 8 (2x builds), 4 (-32%) and 15
 | 15 | Small functions that only call unchecked functions still paid the call-depth check (Minyarcraft's meshing helpers) | two levels of such functions above the leaves drop their check | `--benchmark build` 13.66G; `edit` 33.35G | 9.86G; 25.40G | -28%; -24% |
 | 16 | Release builds used full LTO | ThinLTO for `--release` and for the compiler | Minyarcraft 15.73-15.81G; JSON 0.834G; self-compile 71.95M | 14.90-14.94G; 0.806G; 70.55M | -5.5%; -3%; -2% |
 | 17 | Atacama streaming: the answer label measured, typeset and drew all of its text every frame | `macos.textView` and `appendText` (TextKit 1), no text checking in read-only text, no URL cache in `http`, buttons skip drawing outside their bounds | 12,000-delta answer 123.0G instructions, 14.0-14.2 s CPU; 3,000 deltas 14.3-15.0G | 11.8-12.3G, 3.3-4.1 s CPU; 3.5-3.7G | 10.2x; 4.0x |
+| 18 | Minyarcraft's mesh writer called into the runtime for each 32-byte vertex, which zeroed the bytes before they were written | `minyar_native_bytes_append`, an inline append in the native header that writes in place while capacity lasts | `--benchmark build` 9.85-9.87G; `edit` 25.06-25.20G | 9.53-9.54G; 24.24-24.26G | -3.3%; -3.5% |
+| 19 | Atacama history: each search keystroke built every visible list cell again, buttons included, because `reloadData` discards the cells on screen instead of queueing them for reuse | a list keeps the cells it had on screen and hands them back on reload | search over 500 runs 10.38-10.39G instructions, 1.69-1.74 s CPU | 6.35-6.36G, 0.89-0.94 s | -39% |
 
 ### 1. Long lists rebuilt as stacks of views
 
@@ -880,6 +882,86 @@ different answers; with the URL cache left on, the second came from the
 cache. `check-macos` (with and without ASan/UBSan), `check-modules`,
 `check-http` and Atacama's `make test` pass.
 
+### 18. Each mesh vertex was a call into the runtime
+
+**Problem.** A profile of the world build on final v2 (`--benchmark build`,
+587 samples) has 46 samples in writing vertices: 25 in
+`minyar_graphics_addLitVertex` itself, 13 in `minyar_bytes_extend` and 8 in
+the `memset` it calls. `graphics.c` is a native object outside the program's
+LTO, so every vertex was a call into the runtime that reserved and zeroed 32
+bytes, which `add_vertex` then overwrote in full.
+
+**Fix.** `runtime/minyar_native.h` has `minyar_native_bytes_append(bytes,
+count)`, for native writers that fill every byte they append. Bytes keep
+their capacity in `character_length` (as `minyar_bytes.h` documents), so
+while it lasts the append is a comparison and an addition, inline, with no
+zeroing. Beyond it, or for a negative count, it calls `minyar_bytes_extend`,
+which grows or stops as before. `add_vertex` uses it.
+
+| 3 runs each | Before | After |
+| --- | ---: | ---: |
+| `craft --benchmark build` | 9.871G, 9.852G, 9.851G | 9.540G, 9.532G, 9.541G |
+| `craft --benchmark edit` (2 runs) | 25.06G, 25.20G | 24.24G, 24.26G |
+
+**Tests.** `tests/native-bytes.c` (`check-native-bytes`, part of `check` and
+`check-portable`) links the header against the program runtime. Appends
+within capacity must not move the storage, appends beyond it must keep the
+earlier contents, a cleared Bytes must refill in place, 65,536 bytes of
+random appends must match a model (also clean under ASan and UBSan), and a
+negative count must stop with the runtime's message. A program that writes
+lit and plain vertices in three rounds, across growths and two clears,
+ending with 5,108 vertices (163,456 bytes), produces byte-identical output
+built from v2 and from this change.
+`check-graphics-render`, `tests/native-graphics.py` and
+`tests/native-object-cache.py` pass. The opt-in research probe
+`tests/native-research-graphics.c` counts calls to `minyar_bytes_extend`
+per vertex; it already expected the 40-byte vertices of before change 9, and
+is not a maintained gate, so it is unchanged.
+
+### 19. A refilled list built its visible rows from scratch
+
+**Problem.** With change 1, a History search costs 10.4G instructions for 20
+keystrokes, about 90 ms of CPU per key. A Time Profiler run of the search
+(1,706 samples on the app's main thread) has 993 in `-[NSTableView layout]`.
+Of those, 455 are in `-[MNList tableView:viewForTableColumn:row:]`, 321 of
+them creating row buttons (`+[NSButton buttonWithTitle:target:action:]`),
+and 310 are in `_updateKeyViewLoopForRowView:` for the new rows. MNList
+already asks for reusable cells (`makeViewWithIdentifier:owner:`), but a
+counter in a build of Atacama showed 420 cells created for 420 requests:
+none was ever reused. A harness on the real bridge showed why. Scrolling
+reuses cells (48 requests, 1 new cell), but `reloadData`, which every
+refill ends with, drops the cells on screen without queueing them, and the
+reuse queue is empty afterwards.
+
+**Fix.** Before `reloadData`, `-[MNList reload]` takes the cells on screen
+out of their rows and keeps them. When the table asks for a cell and its
+queue is empty, it gets one of those. Every request already configured a
+cell completely (text, fonts, colours, hidden lines, button and
+constraints), so a kept cell is the same as a new one. Row views are not
+kept: handing the old row views back made one row lose its cell in the test
+below, because the table still tracks them until its next layout.
+
+| History search, 500 runs (3 runs each) | Before | After |
+| --- | ---: | ---: |
+| Retired instructions | 10.39G, 10.39G, 10.38G | 6.35G, 6.36G, 6.36G |
+| CPU | 1.736 s, 1.710 s, 1.686 s | 0.893 s, 0.942 s, 0.937 s |
+
+The screenshot of the filtered list is byte-identical before and after.
+Keeping the row views too measured 5.16G; that is the 1.2G left on the
+table, for a design that does not lose cells.
+
+**Tests.** `tests/macos-native.m` `verifyList` refills a list and requires
+every cell on screen to be one that was on screen before. Each must sit in
+its own row view, show its new row's text and hidden lines, and keep its
+button. A click on a reused row's button must report the new row. Without
+the fix it fails at `reused == shown`. A separate harness refilled 500
+rows ten times, with wrapped rows of two heights: every visible row showed
+its own text, row heights matched each cell's fitting height, no view
+appeared twice, and 30 cells were created for 300 requests. `check-macos`
+(including its ASan/UBSan build), Atacama's `make check` and `make test`,
+and the driver's `delete` scenario (the first row's trash button deletes
+it) pass.
+
 ## Gates
 
 `make check-budget` (the compiler's self-compile budget) was already failing
@@ -964,6 +1046,26 @@ v2 and passes now.
   `alwaysinline` in the emitted IR took the world build from 15.65G to 14.87G
   (-5%) and an `edit` run from 42.29G to 40.47G. Change 12 and the frameless
   call trees described there address the larger cost around it.
+- **The graphics bridge inside ThinLTO.** Native bridges are compiled to
+  machine code, so `add_vertex` cannot be inlined into Minyarcraft's
+  meshing. Compiling `graphics.c` with `-flto=thin` (`MINYAR_NATIVE_FLAGS`)
+  changed nothing: its target attributes block inlining into Minyar IR, as
+  they did for the runtime. With those attributes stripped, as the runtime's
+  IR is, `minyar_graphics_addLitVertex` was inlined away and
+  `craft --benchmark build` went from 9.52-9.54G to 9.46-9.47G (-0.8%, 3
+  runs each). After change 18 that is too small for a second native build
+  path.
+- **The default memory profile for allocation-heavy code.** A sample of
+  the JSON history benchmark (2,000 parses) puts about 35% of its time in
+  `malloc`/`free` and about 26% in bounded reclamation (`rc_bounded_poll_work`,
+  the object units and `rc_drop`); `parseString` itself is 14%. By memory
+  profile (`./minyar --release --memory-profile ...`, 500 runs x 20, 3 runs
+  each): `system`, the default, 805.3-805.6M instructions; `lazy`
+  603.0-604.7M (-25%); `eager` 465.4-468.3M (-42%), with peak footprints
+  within 2.65-2.97 MB for all three. Minyarcraft's world build barely
+  differs (`system` 9.54-9.64G, `lazy` 9.51G, `eager` 9.36G). The default
+  trades throughput for bounded pauses, which is a decision for the memory
+  research rather than a fix for tonight.
 
 ## Measured and not a bottleneck
 
@@ -972,6 +1074,19 @@ v2 and passes now.
   before and after tonight's changes. AppKit set-up dominates, and the
   history parse is about 3% of it. The driver's `startup` scenario measures
   this.
+- **Accessibility clients on long lists.** The driver's `delete` scenario
+  finds the first row's trash button by walking the accessibility tree,
+  which makes the table realize a view for every row: 94.6-103.8G
+  instructions and about 15 s of CPU for one delete over 500 runs, the same
+  before and after change 19. It measures the driver's search more than the
+  app, but VoiceOver walking a long list would pay the same.
+- **Non-ASCII streamed answers.** An in-place Text append (change 5) drops
+  a non-ASCII Text's character index, so each frame's `answer.length` and
+  `slice` in Atacama rebuild it over the whole answer. With an em dash, a
+  curly apostrophe and an ellipsis among the stub's words, a 12,000-delta
+  answer cost 11.24G instructions against 10.79G for ASCII (+4%, one run
+  each), because the rebuild reads ASCII eight bytes at a time. Extending
+  the index on append instead would remove that.
 - **Typing in Atacama.** 300 keystrokes, 20 ms apart: 2.8G instructions and
   0.61 s of CPU, about 2 ms per key. The main thread waits in `nextEvent` 95%
   of the time, and the rest is AppKit's key handling, not the app's re-render.
@@ -988,6 +1103,10 @@ v2 and passes now.
   change 6. After changes 3, 6 and 8, see the tables in those sections.
 - **Minyar-OS** boots to the desktop in 632 ms under QEMU TCG. Its own frame
   profiler reports an average frame work of 0.2-2.3 ms against an 8 ms budget.
+  At the end of the night, one boot of each on the loaded machine: the start
+  of the night reached the desktop in 488 ms with 0.66-1.03 ms of average
+  frame work, final v2 in 628 ms with 0.55-0.59 ms. Under TCG that is within
+  noise either way.
 
 ## Not merged: Astra cycle collection
 
