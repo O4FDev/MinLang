@@ -26,7 +26,7 @@ def main():
     directory.mkdir(parents=True, exist_ok=True)
     runtime = ROOT / 'tests/cycles-runtime.c'
     compiler = ROOT / 'build/minyarc'
-    sources = ('graphs', 'churn', 'dense', 'field', 'live-churn')
+    sources = ('graphs', 'churn', 'dense', 'field', 'live-churn', 'appended')
     for name in (() if args.runtime_only else sources):
         run([compiler, ROOT / f'tests/cycles/{name}.min', directory / f'{name}.ll'])
         (directory / f'{name}-sanitize.ll').write_text(instrument_address_sanitizer((directory / f'{name}.ll').read_text()))
@@ -60,7 +60,8 @@ def main():
                     ir = directory / (name + ('-sanitize' if sanitize else '') + '.ll')
                     run([CLANG, *options, ir, obj, '-o', executable])
                     expected = {'field': '', 'churn': '100000', 'dense': '5000',
-                                'live-churn': '1\n100000', 'graphs': '0\n1\n2\n1\n0'}[name]
+                                'live-churn': '1\n100000', 'graphs': '0\n1\n2\n1\n0',
+                                'appended': '16800\n800'}[name]
                     assert run([executable], env=environment) == expected
     if args.runtime_only:
         print('cycle runtime profiles: native/sanitizer roots, oracle, exact recovery and bounded work')
