@@ -547,10 +547,14 @@ check-portable check: check-peer-semantics check-memory-regressions check-bootst
 check-sanitize: check-peer-semantics-sanitize check-memory-regressions-sanitize
 
 # TLS 1.3 against a local OpenSSL server, through the hosted http, tls, crypto and net packages.
-.PHONY: check-tls
+.PHONY: check-tls check-tls-sanitize
 check-tls: build/minyarc
-	$(LIMITED) python3 tests/tls-local.py
-check: check-tls
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/tls-local.py
+
+check-tls-sanitize: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/tls-local.py --sanitize
+
+check check-portable: check-tls
 
 .PHONY: check-native-cache
 check-native-cache:
