@@ -401,7 +401,7 @@ output.write_bytes(b'complete executable')
             return read_bytes(path)
 
         with patch.dict(os.environ, self.env), patch.object(Path, 'read_bytes', bounded_read):
-            driver.graphics(self.project, str(self.clang), ['-O2'])
+            driver.graphics(self.project, str(self.clang), driver.clang_identity(str(self.clang)), ['-O2'])
 
     def test_graphics_cache_tracks_compiler_replacement_with_preserved_mtime(self):
         base = {'TEST_GRAPHICS': '1'}

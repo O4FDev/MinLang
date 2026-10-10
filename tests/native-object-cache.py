@@ -3,6 +3,7 @@
 import importlib.util
 import os
 from pathlib import Path
+import re
 import tempfile
 import unittest
 
@@ -45,8 +46,11 @@ class NativeObjectCache(unittest.TestCase):
         self.assertEqual(len({first, header, source, flags}), 4)
         for path in (first, header, source, flags):
             self.assertTrue(path.is_file())
-        self.assertEqual([p for p in (self.project / 'build/native').iterdir() if not p.name.endswith('.o')], [],
-                         'temporary objects must not be left behind')
+        # Temporaries are named bridge-<random>.o; finished objects carry the
+        # 64-digit content key, so anything else was left behind.
+        leftovers = [p.name for p in (self.project / 'build/native').iterdir()
+                     if not re.fullmatch(r'bridge-[0-9a-f]{64}\.o', p.name)]
+        self.assertEqual(leftovers, [], 'temporary objects must not be left behind')
 
 
 if __name__ == '__main__':
