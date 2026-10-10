@@ -1,0 +1,60 @@
+// Stateless, short-lived address/CID validation before allocating a connection.
+// The caller supplies a canonical numeric IP:port byte string and monotonic
+// milliseconds from the same clock at issue and validation. No private keys
+// or TLS state are retained per unauthenticated client.
+use "aes" as aes
+use "crypto" as crypto
+use "errors" as errors
+use "quicwire" as wire
+use "quiccrypto" as protection
+public record Store { private key: Bytes; private lifetime: Integer; private issued: Integer }
+public record Opened { private valid: Boolean; private version: Integer; private original: Bytes; private source: Bytes }
+record Cursor { data: Bytes; at: Integer; bad: Boolean }
+function empty(): Opened { return Opened { valid: false; version: 0; original: Bytes(); source: Bytes() } }
+function take(cursor: Cursor,count: Integer): Bytes {
+    if count < 0 || count > cursor.data.length-cursor.at { cursor.bad=true;return Bytes() }
+    let result=cursor.data.slice(cursor.at,cursor.at+count);cursor.at+=count;return result
+}
+function number(cursor: Cursor): Integer {
+    let value=wire.varint(cursor.data,cursor.at)
+    if !value.valid { cursor.bad=true;return 0 };cursor.at=value.end;return value.value
+}
+function add(data: Bytes,value: Integer) { data.addBytes(errors.bytesValue(wire.encode(value))) }
+function field(data: Bytes,value: Bytes) { add(data,value.length);data.addBytes(value) }
+public function store(key: Bytes,lifetimeMilliseconds: Integer): Store {
+    let retained=Bytes();if key.length==16 && lifetimeMilliseconds>=1 && lifetimeMilliseconds<=120000 { retained=key.slice(0,key.length) }
+    return Store { key: retained; lifetime: lifetimeMilliseconds; issued: 0 }
+}
+public function valid(value: Opened): Boolean { return value.valid }
+public function version(value: Opened): Integer { return value.version }
+public function original(value: Opened): Bytes { return value.original.slice(0,value.original.length) }
+public function source(value: Opened): Bytes { return value.source.slice(0,value.source.length) }
+public function reply(store: Store,initial: Bytes,address: Bytes,source: Bytes,now: Integer): errors.BytesResult {
+    let header=wire.header(initial,0,8)
+    if store.key.length != 16 || store.issued >= (1 << 23) || now<0 || now>wire.MAX_VARINT || address.length<1 || address.length>256 || initial.length<1200 || !header.valid || header.kind != wire.INITIAL || header.token.length>0 || source.length<1 || source.length>20 || crypto.constantTimeEqual(source,header.destination) {
+        return errors.bytesFailure(errors.make(errors.invalidDataCode(),0,"invalid stateless Retry request"))
+    }
+    let body=Bytes();add(body,header.version);add(body,now);field(body,address);field(body,header.destination);field(body,source);field(body,header.source)
+    let nonce=randomBytes(12);let token=Bytes("MQR1");token.addBytes(nonce)
+    let ciphertext=aes.encrypt(store.key,nonce,Bytes("MQR1"),body)
+    if ciphertext.length != body.length+16 { return errors.bytesFailure(errors.make(errors.unavailableCode(),0,"Retry token provider failed")) }
+    token.addBytes(ciphertext);store.issued+=1
+    return protection.retryPacket(header.version,header.source,source,token,header.destination)
+}
+public function validate(store: Store,token: Bytes,address: Bytes,destination: Bytes,client: Bytes,now: Integer): Opened {
+    if store.key.length != 16 || now<0 || token.length<32 || token.length>512 || address.length<1 || address.length>256 || destination.length<1 || destination.length>20 || client.length>20 || !crypto.constantTimeEqual(token.slice(0,4),Bytes("MQR1")) { return empty() }
+    let plaintext=aes.decrypt(store.key,token.slice(4,16),Bytes("MQR1"),token.slice(16,token.length))
+    if plaintext.length<1 || plaintext[0] != 1 { return empty() }
+    let cursor=Cursor { data: plaintext.slice(1,plaintext.length); at: 0; bad: false }
+    let version=number(cursor);let issued=number(cursor)
+    let boundAddress=take(cursor,number(cursor));let original=take(cursor,number(cursor));let source=take(cursor,number(cursor));let boundClient=take(cursor,number(cursor))
+    if cursor.bad || cursor.at != cursor.data.length || (version != 1 && version != protection.VERSION_2) || issued>now || now-issued>store.lifetime || original.length<1 || original.length>20 || !crypto.constantTimeEqual(boundAddress,address) || !crypto.constantTimeEqual(source,destination) || !crypto.constantTimeEqual(boundClient,client) { return empty() }
+    return Opened { valid: true; version: version; original: original; source: source }
+}
+public function validateInitial(store: Store,initial: Bytes,address: Bytes,now: Integer): Opened {
+    let header=wire.header(initial,0,8)
+    if initial.length<1200 || !header.valid || header.kind != wire.INITIAL { return empty() }
+    let opened=validate(store,header.token,address,header.destination,header.source,now)
+    if !opened.valid || opened.version != header.version { return empty() }
+    return opened
+}

@@ -1,0 +1,37 @@
+use "quic" as quic
+use "errors" as errors
+use "quiccrypto" as protection
+use "quicwire" as wire
+use "quicrecovery" as recovery
+function number(data: Bytes,value: Integer) { data.addBytes(errors.bytesValue(wire.encode(value))) }
+function inject(sender: quic.Connection,receiver: quic.Connection,frame: Bytes,now: Integer) {
+    let space=sender.spaces[2];let header=Bytes();header.add(0x43);header.addBytes(sender.remote)
+    for index in 0..4 { header.add((space.next>>((3-index)*8))&255) }
+    let packet=errors.bytesValue(protection.protect(space.write,header,header.length-4,space.next,frame));space.next+=1
+    quic.receive(receiver,packet,now)
+}
+function main(): Integer {
+    let root=readBytesFile(argument(0));let cert=readBytesFile(argument(1));let key=readBytesFile(argument(2));let client=readBytesFile(argument(3));let clientKey=readBytesFile(argument(4))
+    let c=quic.client("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey)
+    let s=quic.server(randomBytes(80),"minyar-test",c.originalDestination,[cert],key,[root],true);let now=0
+    while now<10000 && (c.state != quic.ESTABLISHED || s.state != quic.ESTABLISHED) {
+        for packet in quic.poll(c,now) { quic.receive(s,packet,now) }
+        for packet in quic.poll(s,now) { quic.receive(c,packet,now) };now+=10
+    }
+    c.congestion=recovery.create(1200)
+    let first=c.spaces[2].next;quic.ping(c);quic.poll(c,1000)
+    let ping=Bytes();ping.add(1);inject(s,c,ping,1005);quic.poll(c,1005)
+    let last=c.spaces[2].next-1
+    if last<=first { return 1 }
+    let ack=Bytes();ack.add(2);number(ack,last);number(ack,0);number(ack,0);number(ack,last-first)
+    inject(s,c,ack,1105)
+    if !c.congestion.measured || c.congestion.latest != 100 { print("RTT " + Text(c.congestion.measured) + " " + Text(c.congestion.latest));return 2 }
+    let duplicate=ack.slice(0,ack.length);inject(s,c,duplicate,1205)
+    if c.congestion.latest != 100 { return 3 }
+    c.now=2000;c.emptySince=-1;c.congestion.epoch=2000;c.congestion.smoothed=1000;c.paceCredit=0.0;c.paceAt=2000
+    let id=errors.integerValue(quic.openStream(c,false));quic.writeStream(c,id,Bytes(2000),false)
+    quic.poll(c,2001);quic.poll(c,2100)
+    if c.congestion.epoch != 2000 { print("paced backlog treated as idle " + Text(c.congestion.epoch));return 4 }
+    print("QUIC RTT: largest newly acknowledged ACK-only packet supplies the sample; duplicate ACK does not resample")
+    return 0
+}

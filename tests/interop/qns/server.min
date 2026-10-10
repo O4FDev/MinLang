@@ -7,6 +7,7 @@ use "errors" as errors
 use "eventloop" as loop
 use "quicinteropio" as file
 use "tlstickets" as tickets
+use "quicretry" as retry
 record Transfer { id: Integer; request: Bytes; handle: Integer; size: Integer; sent: Integer; pending: Bytes; done: Boolean }
 record Peer { connection: quic.Connection; addresses: List<Text>; ports: List<Integer>; transfers: List<Transfer>; logged: Boolean }
 function logKeys(peer: Peer, path: Text) {
@@ -31,6 +32,7 @@ function main(): Integer {
     let socket = net.udp("0.0.0.0", 443); if socket < 0 { print("QNS bind failed"); return 1 }
     let eventLoop = errors.integerValue(loop.create()); loop.watch(eventLoop, socket, loop.readableInterest(), 0)
     let store = tickets.store(randomBytes(16), 3600)
+    let retries = retry.store(randomBytes(16),30000)
     if argument(4) == "zerortt" { tickets.allowEarlyData(store, 0xffffffff) }
     let peers: List<Peer> = []; let started = net.monotonicMilliseconds(); let now = 0
     print("QNS server ready")
@@ -87,15 +89,30 @@ function main(): Integer {
                 let data = net.datagramData(packet)
                 if errors.bytesOk(data) {
                     let bytes = errors.bytesValue(data); let header = wire.header(bytes, 0, 8); let index = -1
-                    if !header.valid {
+                    if !header.valid || (header.kind != wire.ONE_RTT && header.version != 1) {
                         let response = wire.negotiateVersion(bytes)
                         if errors.bytesOk(response) { net.sendDatagramTo(socket, net.datagramSource(packet), net.datagramPort(packet), errors.bytesValue(response)) }
+                        continue
                     }
                     if header.valid {
-                        for at in 0..peers.length { if crypto.hex(header.destination) == crypto.hex(peers[at].connection.local) || crypto.hex(header.destination) == crypto.hex(peers[at].connection.originalDestination) { index = at } }
+                        for at in 0..peers.length { if crypto.hex(header.destination) == crypto.hex(peers[at].connection.local) || crypto.hex(header.destination) == crypto.hex(peers[at].connection.initialDestination) { index = at } }
                         if index < 0 && header.kind == wire.INITIAL && bytes.length >= 1200 && peers.length < 64 {
-                            let connection = quic.serverWithTickets(randomBytes(80), "hq-interop", header.destination, identity, key, [root], false, store)
-                            peers.add(Peer { connection: connection; addresses: [net.datagramSource(packet)]; ports: [net.datagramPort(packet)]; transfers: []; logged: false }); index = peers.length - 1
+                            if argument(4)=="retry" {
+                                let address=Bytes(net.datagramSource(packet)+"#"+Text(net.datagramPort(packet)))
+                                if header.token.length==0 {
+                                    let response=retry.reply(retries,bytes,address,randomBytes(8),now)
+                                    if errors.bytesOk(response) { net.sendDatagramTo(socket,net.datagramSource(packet),net.datagramPort(packet),errors.bytesValue(response)) }
+                                    continue
+                                }
+                                let validated=retry.validateInitial(retries,bytes,address,now)
+                                if !retry.valid(validated) { continue }
+                                let connection=quic.serverAfterRetry(randomBytes(80),"hq-interop",validated,identity,key,[root],false)
+                                peers.add(Peer { connection: connection; addresses: [net.datagramSource(packet)]; ports: [net.datagramPort(packet)]; transfers: []; logged: false })
+                            } else {
+                                let connection = quic.serverWithTickets(randomBytes(80), "hq-interop", header.destination, identity, key, [root], false, store)
+                                peers.add(Peer { connection: connection; addresses: [net.datagramSource(packet)]; ports: [net.datagramPort(packet)]; transfers: []; logged: false })
+                            }
+                            index = peers.length - 1
                         }
                         if index >= 0 {
                             let peer = peers[index]; let route = -1

@@ -48,6 +48,7 @@ def main():
             actual = run(binary, 'chacha', version, fixture['chacha_header'], '01', 654360564, 1)
             assert actual == [fixture['chacha_packet']], f'RFC {rfc} ChaCha mismatch'
             assert run(binary, 'retry', version, fixture['retry'], fixture['dcid']) == ['true']
+            assert run(binary, 'retry-tag', version, fixture['retry'], fixture['dcid']) == [fixture['retry'][-32:]]
             assert run(binary, 'retry', version, fixture['retry'], '8394c8f03e515709') == ['false']
             bad = bytes.fromhex(fixture['retry'])
             for index in range(len(bad)):

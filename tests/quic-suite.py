@@ -6,7 +6,7 @@ ROOT=Path(__file__).resolve().parents[1]
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--artifacts',type=Path,required=True);parser.add_argument('--yamux-peer',type=Path);parser.add_argument('--state-only',action='store_true');options=parser.parse_args()
     commands=[['securecrypto.py'],['quic-crypto.py'],['quic-wire.py'],['quic-dispatch.py'],['tls-server.py']]
-    commands += [['quic-transport.py',*([mode] if mode else [])] for mode in ('','--key-update','--migration','--server-protocol','--resumption','--quic-resumption','--early','--fallback','--congestion','--stream-control','--stream-churn','--closing','--persistent')]
+    commands += [['quic-transport.py',*([mode] if mode else [])] for mode in ('','--key-update','--migration','--server-protocol','--resumption','--quic-resumption','--early','--fallback','--congestion','--stream-control','--stream-churn','--closing','--persistent','--retry','--rtt')]
     commands += [['tls-resumption-expiry.py']]
     if options.yamux_peer:commands += [['transport-go.py','--peer-binary',str(options.yamux_peer.resolve())]]
     results=[];options.artifacts.mkdir(parents=True,exist_ok=True)
