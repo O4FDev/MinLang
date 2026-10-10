@@ -240,6 +240,22 @@ static void loop_signal(int number) {
     signal_count++;
 }
 #endif
+static double process_cpu_seconds(void) {
+#ifdef _WIN32
+    /* Microsoft's clock() measures elapsed wall time. Keep the CPU ceiling
+     * unchanged and measure actual kernel+user time via GetProcessTimes. */
+    FILETIME created, exited, kernel, user;
+    assert(GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user));
+    ULARGE_INTEGER k, u;
+    k.LowPart = kernel.dwLowDateTime;
+    k.HighPart = kernel.dwHighDateTime;
+    u.LowPart = user.dwLowDateTime;
+    u.HighPart = user.dwHighDateTime;
+    return ((double)k.QuadPart + (double)u.QuadPart) / 10000000.0;
+#else
+    return (double)clock() / CLOCKS_PER_SEC;
+#endif
+}
 static void idle_blocking_and_interrupted_deadline(void) {
     long long loop = result_handle(minyar_net_loopCreate());
 #ifndef _WIN32
@@ -251,10 +267,10 @@ static void idle_blocking_and_interrupted_deadline(void) {
     assert(setitimer(ITIMER_REAL, &alarm, NULL) == 0);
 #endif
     uint64_t before = net_loop_now();
-    clock_t cpu = clock();
+    double cpu = process_cpu_seconds();
     MinyarBytes *b = minyar_net_loopWait(loop, 100, 8);
     uint64_t elapsed = net_loop_now() - before;
-    double cpu_seconds = (double)(clock() - cpu) / CLOCKS_PER_SEC;
+    double cpu_seconds = process_cpu_seconds() - cpu;
 #ifndef _WIN32
     assert(setitimer(ITIMER_REAL, &zero, NULL) == 0);
     assert(sigaction(SIGALRM, &previous, NULL) == 0);
