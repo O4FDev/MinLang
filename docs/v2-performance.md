@@ -22,6 +22,8 @@ largest are 1 (10x), 5 (51x on long Texts), 2 (4x), 8 (2x builds) and 4 (-32%).
 | 7 | `json.parse` built every string from a parts list, a slice and a join | one slice when a string has no escapes | 20 parses of a 143 KB history response 1.22G | 0.95G | -22% |
 | 8 | Every macOS app build recompiled the Objective-C bridges (`macos.m` 0.46 s, `http.m` 0.12 s) | content-keyed object cache, already used for `graphics.c`, now for every native bridge | Atacama default build 0.93-1.11 s; release app 1.86-2.41 s | 0.48 s; 1.39-1.46 s | about 2x |
 | 9 | Minyarcraft's GPU vertex buffers dominated its memory (40-byte float vertices, six per quad) | 32-byte vertices (Float16 colour and light) and `graphics.updateQuads` (four vertices per quad, shared indices) | peak RSS 602 MB, footprint 892 MB, 17.30G instructions | 419 MB, 697-725 MB, 16.44G | -30% RSS, -5% instructions |
+| 11 | Minyarcraft frames: each of the 276 chunk draws a frame (plus water) looked up and re-sent seven uniforms, and each water draw toggled blending, so the GL driver kept revalidating its state | uniform locations cached at link time; uniforms, program, texture, opacity and blending changed only when they differ | 15.7M instructions per idle frame | 8.05M | -49% per frame |
+| 12 | The call-depth guard in every non-leaf function was about 20 instructions, and meshing inlines dozens of small guarded functions per block | the guard's common path is two comparisons; the exact checks moved to a cold path | world build 15.65G; one block edit 28.7M | 14.19G; 25.8M | -9.3%; -10% |
 
 ### 1. Long lists rebuilt as stacks of views
 
@@ -390,6 +392,153 @@ so a portable `start`/`read` would need a request record instead of an
 integer handle. That is the remaining gap if streaming is ever needed outside
 macOS.
 
+### 11. Every chunk draw re-sent the frame's uniforms
+
+Sections 3, 4 and 9 measured `--screenshot`, which is almost all world build.
+Play is different: the world is built once, then every frame draws, and every
+block edit updates its column's sky light and re-meshes the chunks around it.
+
+**Measuring play.** `./craft --benchmark build|idle|walk|edit [image.png]`
+builds a fresh world at noon, plays 600 scripted frames with a fixed 1/60 s
+step, saves the last frame if asked and exits without saving the world. `idle`
+stands still, `walk` flies forward while turning, and `edit` breaks the top
+block of a column in a 16 by 16 patch in front of the player, then fills the
+hole with planks on the next frame. Each edit changes the column's top, so it
+marks the chunks within 4 blocks dirty, about 2.1 chunk rebuilds per edit.
+`build` stops after two frames, so subtracting it gives the cost of play; the
+per-frame figures below divide that by 600. Because the time step is fixed,
+the saved frames are byte-identical between runs and between builds; every
+image in this section and the next has the same MD5 as the original build's.
+
+| Original build (instructions, 3 runs) | Total | Per frame or edit |
+| --- | ---: | ---: |
+| `build` | 15.66G, 15.68G, 15.63G | |
+| `idle` | 25.12G, 25.06G, 25.04G | 15.7M per frame |
+| `walk` (1 run) | 25.09G | about the same as `idle`: the world is fixed, so walking loads nothing |
+| `edit` | 42.22G, 42.25G, 42.26G | 28.6M per edit on top of the frame |
+
+**Evidence.** An `xctrace` Time Profiler run of `idle` (2,390 samples, about a
+quarter of them start-up and the world build): `minyar_graphics_drawMesh` 567
+inclusive samples, `drawTranslucentMesh` 190, `use_world_program` 227 and
+`glGetUniformLocation` 136, against 440 for presenting the frame (`nextFrame`,
+mostly `CGLFlushDrawable`). Minyar code per frame (sky, clouds, HUD text) was
+small. The game draws every chunk within 150 blocks (276 meshes at the spawn),
+plus the water meshes of those that have water, and each draw called
+`use_world_program`: seven `glGetUniformLocation` string lookups, seven
+uniform uploads and a texture bind. Each water mesh also enabled blending,
+turned off depth writes and culling, and turned them back on. Under the draw
+calls, Apple's OpenGL driver spent its time revalidating state
+(`gldUpdateDispatch` 202 inclusive samples, `buildPipelineStateDescriptor` and
+`updateUniformBindings` among the self samples).
+
+**Fix.** `runtime/native/graphics.c` looks up the uniform locations once when
+it links the programs. `setCamera`, `setFog` and `setLight` mark the world
+uniforms stale, and the next draw uploads them once. The program, texture and
+opacity are set only when they change. Translucent state stays on across
+consecutive translucent meshes and is switched off before the next opaque
+mesh, line batch, overlay or `clear` (depth writes must be on for the depth
+buffer to clear). Programs need no change.
+
+| `--benchmark` (instructions, 3 runs) | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| `idle` | 25.12G, 25.06G, 25.04G | 20.44G, 20.50G, 20.45G | 15.7M to 8.05M per frame (-49%) |
+| `build` | 15.66G, 15.68G, 15.63G | 15.63G, 15.63G, 15.62G | none |
+
+The `idle` and `edit` images are byte-identical before and after. Leaving each
+mesh's vertex array bound after drawing, instead of unbinding it, saved a
+further 0.1M per frame in one run (20.39G against 20.44G), within noise, so
+the unbind stays. A profile after the fix has `drawMesh` at 259 of 2,084
+samples and no uniform lookups; presenting the frame (474) is now the largest
+part of a frame. The game still draws the chunks behind the camera too; culling
+them is a game change and was not tried.
+
+**Tests.** `benchmarks/desktop/render-states.min` draws, in one frame, a
+square at light 0.25, one at light 1.0, one under full red fog, a translucent
+square at opacity 0.5, then a back-facing square, a near green square and a
+far blue square over the same pixels, and an overlay rectangle.
+`tests/graphics-render.py` (`check-graphics-render`) reads the PNG back and
+requires each colour within 3 of the expected value: 64 grey, white, red, the
+half blend, the clear colour (the back face is culled) and green (depth is
+written after translucency). It passes on the old and new library. Two mutants
+fail it: without the stale mark in `setLight` the second square is 64 grey,
+and without switching translucency off before an opaque draw the back face
+shows. `tests/native-graphics.py` passes.
+
+### 12. The call-depth guard cost a third of meshing
+
+**Problem.** After change 11, an edit costs about three and a half idle
+frames, almost all of it in `meshing.buildChunk`. Per edit the game rebuilds
+about two chunks (16 by 16 by 80 blocks each), about 13M instructions per
+chunk, or 650 per block.
+
+**Evidence.** In a profile of `edit` (3,237 samples), `buildChunk` has 741
+self samples and `terrain.get` 448. Annotating `buildChunk`'s machine code
+with the sampled addresses spreads the samples thinly, with recurring hot
+spots on the inlined call-depth guard: the ready flag, the stack bounds
+(`ldp`), the depth comparisons and the counter store. Change 3 removed the
+guard from leaf functions, but `showFace` (which calls `isOpaque`),
+`occludes`, `ambient`, `quad` and the other small helpers each call something,
+so each keeps its guard, and LLVM inlines all of them into the per-block loop
+with their guards. As a bound, deleting every `minyar_stack_enter`/`leave`
+call from the emitted IR (unsafe, measurement only) took the world build from
+15.65G to 10.54G instructions (-33%).
+
+**Fix.** `minyar_stack_enter` is now two comparisons and an increment:
+
+    if (depth >= depth_limit || current - stack_low <= RESERVE) slow(current)
+    depth++
+
+The depth limit starts at zero, so the first call takes the slow path, which
+finds the stack bounds and sets the limit to the lowest cap that applies (the
+logical maximum, or the fallback when the bounds are unknown). The unsigned
+distance from the stack's low end is at most the reserve for every address
+inside the reserve, and addresses below the stack wrap to huge values. So the
+fast check catches every case the exact checks stop on, and the slow path
+repeats the exact checks unchanged. With unknown bounds the low end is zero,
+and only the depth limit applies. `minyar_stack_leave` is unchanged.
+
+| Instructions (3 runs unless noted) | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| `--benchmark build` | 15.74G, 15.63G, 15.65G | 14.19G, 14.19G, 14.19G | -9.3% |
+| `--benchmark edit` | 37.71G, 37.67G, 37.71G | 34.46G, 34.48G, 34.42G | 28.7M to 25.8M per edit (-10%) |
+| `--benchmark idle` | 20.44G, 20.50G, 20.45G | 18.93G, 18.99G, 18.92G | 8.05M to 7.93M per frame |
+| Compiler self-compile (8 runs, alternating) | 80.5M-84.5M (median 81.2M) | 79.2M-83.0M (median 80.0M) | about -1.5% |
+
+The compiler's output is unchanged (stage 2 is byte-identical to before, and
+stage 3 equals stage 2), and its self-compile gets slightly cheaper, not
+dearer. With both changes, `--screenshot noon` went from 16.44G, 16.42G,
+16.42G to 14.72G, 14.73G, 14.72G (-10.4%), with peak RSS 398 MB either way, a
+whole edit frame from about 44M to 34M instructions, and `walk` from 25.09G to
+18.92G (one run each, identical images).
+
+**Tests.** `tests/stack-limits.py` (`check-stack-limits`) still checks the
+exact depth boundaries with known and unknown bounds, at O0 and O2, including
+a fallback larger than the maximum. It now also compiles the runtime and
+requires `minyar_stack_enter` to contain exactly two comparisons and no
+reference to the ready flag, the stack's high end or the bounds query; the old
+runtime has seven comparisons and fails. `check-stack-overflow`,
+`check-stack-overflow-sanitize`, `check-codegen`, `check-ownership` and
+`check-portable` (which includes `check-regressions`, `check-modules` and the
+stage 2 and 3 comparison) pass.
+
+**What is left.** Most of the guard's cost is still there: 14.19G against the
+10.54G bound (measured before this change). A function that calls only
+functions without a guard, at most a few levels deep, cannot recurse either,
+so it could drop its guard as leaves do. Simulating that on Minyarcraft's IR
+(a function loses its guard when every callee was emitted earlier without one,
+at most two levels deep) drops 29 guards, including `showFace`, `occludes`,
+`quad` and `torch`, and takes the world build from 14.17G to 10.78G (-24%);
+three levels gives 10.60G. A chain of three frameless frames (heights 2, 1 and
+0) below a guarded caller uses at most about 54 KiB of the 128 KiB reserve,
+even with the 18 KiB worst-case frames of change 3. It is not done here
+because the compiler has no per-function table that the call emitter can read:
+`functionParameterCounts` already carries a second section found by halving
+its length, the module compiler rebuilds that table when it reads a cached
+one, and `compiler/module-compiler-adapter.patch` rewrites `compileFunctions`,
+so the change touches both compilers and the patch. The height table also has
+to be private to each `compileFunctions` call, so that an incrementally cached
+module never depends on another module's bodies.
+
 ## Gates
 
 `make check-budget` (the compiler's self-compile budget) was already failing
@@ -427,6 +576,9 @@ merged into v2 but not pushed; the suite run on it was stopped.
   10.55 MB peak footprint (the compiler's arena dominates). That is within
   noise, so it was reverted.
 
+- **Leaving vertex arrays bound after drawing.** See change 11: 20.39G
+  against 20.44G for 600 idle frames, one run each, within noise.
+
 ## Measured and not pursued
 
 - **Record field bounds checks.** `minyar_record_get` checks the field index
@@ -435,6 +587,10 @@ merged into v2 but not pushed; the suite run on it was stopped.
   instructions (-3.6%). It stays: it is part of the runtime's hardening and
   turns a compiler or layout mismatch into a clean stop instead of memory
   corruption.
+- **Forcing `terrain.get` inline.** Before change 12, marking it
+  `alwaysinline` in the emitted IR took the world build from 15.65G to 14.87G
+  (-5%) and an `edit` run from 42.29G to 40.47G. Change 12 and the frameless
+  call trees described there address the larger cost around it.
 
 ## Measured and not a bottleneck
 
