@@ -3,15 +3,17 @@
 from pathlib import Path
 import os
 import subprocess
-import tempfile
+from test_evidence import Evidence
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPILER = Path(os.environ.get('MINYAR_TEST_COMPILER', ROOT / 'build/minyarc-modules'))
 
 
 def run(command):
-    result = subprocess.run(list(map(str, command)), capture_output=True, text=True, timeout=60)
+    result = evidence.run(list(map(str, command)), capture_output=True, text=True, timeout=60,
+                          phase='module-artifact')
     assert result.returncode == 0, result.stderr
+    assert not result.stderr, result.stderr
     return result
 
 
@@ -24,8 +26,9 @@ def fields(source):
     return result
 
 
-with tempfile.TemporaryDirectory(prefix='minyar-artifacts-') as name:
-    d = Path(name)
+with Evidence('module-artifacts', inputs=(COMPILER, __file__, ROOT / 'build/minyar-runtime.o',
+              *sorted((ROOT / 'tests/modules').rglob('*.min')))) as evidence:
+    d = evidence.path
     empty = d / 'empty'; empty.write_text('')
     indexed = d / 'indexed'; indexed.mkdir()
     (indexed / 'leaf.min').write_text('public record Value { value: Integer }\npublic function make(): Value { return Value { value: 40 } }\n')
@@ -35,6 +38,37 @@ with tempfile.TemporaryDirectory(prefix='minyar-artifacts-') as name:
     cases = [(ROOT / f'tests/modules/{case}/main.min', expected) for case, expected in
              [('basic', 'Hello, Ada\n42\nAda\n'), ('diamond', '42\n'), ('explicit-main', '42\n'), ('windows-path', '42\n')]]
     cases.append((indexed / 'main.min', '120\n'))
+    aliases = d / 'aliases'; aliases.mkdir()
+    (aliases / 'worker.min').write_text('''public function reload(write: List<Integer>, read: List<Integer>): Integer {
+write[0] = 1
+read[0] = 2
+return write[0]
+}
+public function loop(write: List<Integer>, read: List<Integer>, forward: Boolean): Integer {
+let index = 0
+let total = 0
+while index < 3 {
+if forward { write[0] = index + 1; read[0] = index + 10 } else { read[0] = index + 1; write[0] = index + 10 }
+total = total + write[0]
+index = index + 1
+}
+return total
+}
+''')
+    source = ['use "./worker.min" as worker']
+    expected = []
+    for shared in (False, True):
+        for forward in (False, True):
+            source += ['let first = [0]', 'let second = first' if shared else 'let second = [0]',
+                       'print(worker.reload(first, second))', 'print(first[0])', 'print(second[0])',
+                       'print(worker.loop(first, second, ' + str(forward).lower() + '))',
+                       'print(first[0])', 'print(second[0])']
+            expected += [2 if shared else 1, 2 if shared else 1, 2]
+            expected += [33 if shared or not forward else 6,
+                         12 if shared or not forward else 3,
+                         12 if shared or forward else 3]
+    (aliases / 'main.min').write_text('\n'.join(source) + '\n')
+    cases.append((aliases / 'main.min', ''.join(str(value) + '\n' for value in expected)))
     for entry, expected in cases:
         llvm = d / 'combined.ll'; state = d / 'state'
         run([COMPILER, entry, llvm, '--module-state', empty, state, d / 'stats'])
@@ -63,15 +97,16 @@ with tempfile.TemporaryDirectory(prefix='minyar-artifacts-') as name:
             assert (d / 'warm.ll').read_bytes() == llvm.read_bytes()
             assert (d / 'stats').read_text().split()[:6] == ['4', '0', '0', '4', '0', '0']
         runtime = '\n'.join(line for line in llvm.read_text().splitlines() if line.startswith('declare ')) + '\n'
-        objects = []
-        for index, row in enumerate(range(3, len(saved), 10)):
-            module = d / f'{index}.ll'; obj = d / f'{index}.o'
-            module.write_text(runtime + saved[row + 9] + '\n' + saved[row + 5])
-            run(['clang', '-O0', '-Wno-override-module', '-c', module, '-o', obj])
-            objects.append(obj)
         binary = d / 'program'
-        run(['clang', *objects, ROOT / 'build/minyar-runtime.o', '-o', binary])
-        assert run([binary]).stdout == expected
+        for optimization in ('-O0', '-O2'):
+            objects = []
+            for index, row in enumerate(range(3, len(saved), 10)):
+                module = d / f'{index}.ll'; obj = d / f'{index}.o'
+                module.write_text(runtime + saved[row + 9] + '\n' + saved[row + 5])
+                run(['clang', optimization, '-Wno-override-module', '-c', module, '-o', obj])
+                objects.append(obj)
+            run(['clang', *objects, ROOT / 'build/minyar-runtime.o', '-o', binary])
+            assert run([binary]).stdout == expected
         # LLVM modules remain valid under full-program LTO as well.
         bitcode = []
         for index in range(len(objects)):

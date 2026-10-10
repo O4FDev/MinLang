@@ -1,0 +1,3 @@
+# Discovery status
+
+Source discovery remains incomplete. Added all tools and SwiftCompilerSources after finding omitted tools/swift-inspect/Tests plusSwiftPM.testTarget in Package.swift and embeddedSIL/Optimizer Test.swift utilities. Read swift-inspect twoactualtestfiles, bothregistrationfiles andPackage.swift. Explicitlegacy XCTestManifest lists onlyswiftInspectTests; sourcepresence is not executionproof forLinuxTests. SwiftCompilerSources utilities and other tools embeddedtests pending. Remaining stdlib/public, lib, Runtimes, bindings, docs generatorhooks still need source-level reconciliation.

@@ -211,6 +211,7 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
                                     position = position + 1
                                     addToken(tokenKinds, tokenTexts, tokenLines, 5, Text(value), sourceLocation(tokenLine, tokenColumn))
                                 } else {
+                                    let punctuationColumn = position - lineStart + 1
                                     let punctuation = Text(character)
                                     if position + 1 < length {
                                         let next = source[position + 1]
@@ -229,7 +230,7 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
                                     if punctuation == ";" {
                                         punctuationKind = 6
                                     }
-                                    addToken(tokenKinds, tokenTexts, tokenLines, punctuationKind, punctuation, sourceLocation(line, position - lineStart + 1))
+                                    addToken(tokenKinds, tokenTexts, tokenLines, punctuationKind, punctuation, sourceLocation(line, punctuationColumn))
                                     position = position + 1
                                 }
                             }
@@ -318,7 +319,7 @@ function finishStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, toke
     if tokenKinds[cursor[0]] == 6 {
         skipTerminators(tokenKinds, cursor)
     } else {
-        if !tokenIs(tokenKinds, tokenTexts, cursor, "}") {
+        if tokenKinds[cursor[0]] != 0 && !tokenIs(tokenKinds, tokenTexts, cursor, "}") {
             fail(describeLocation(tokenLines[cursor[0]]) + ": unexpected '" + tokenTexts[cursor[0]] + "'; start the next statement on a new line")
         }
     }
@@ -682,6 +683,9 @@ function discoverDeclarations(tokenKinds: List<Integer>, tokenTexts: List<Text>,
         if tokenIs(tokenKinds, tokenTexts, cursor, "record") {
             declaration = declaration + 1
             cursor[0] = cursor[0] + 1
+            if tokenKinds[cursor[0]] != 1 {
+                fail(describeLocation(tokenLines[cursor[0]]) + ": expected a name after record")
+            }
             let record = findIndexedSymbol(symbolLookup, symbolNames, symbolKinds, tokenTexts[cursor[0]], 2)
             cursor[0] = cursor[0] + 1
             expectToken(tokenKinds, tokenTexts, tokenLines, cursor, "{")
@@ -690,6 +694,9 @@ function discoverDeclarations(tokenKinds: List<Integer>, tokenTexts: List<Text>,
             let first = symbolParameterNames.length
             parameterStarts[record] = first
             while !tokenIs(tokenKinds, tokenTexts, cursor, "}") {
+                if tokenKinds[cursor[0]] != 1 {
+                    fail(describeLocation(tokenLines[cursor[0]]) + ": expected a record field name")
+                }
                 let fieldName = tokenTexts[cursor[0]]
                 let previous = 0
                 let duplicate = false
@@ -717,6 +724,9 @@ function discoverDeclarations(tokenKinds: List<Integer>, tokenTexts: List<Text>,
         } else {
             if tokenIs(tokenKinds, tokenTexts, cursor, "function") {
                 expectToken(tokenKinds, tokenTexts, tokenLines, cursor, "function")
+                if tokenKinds[cursor[0]] != 1 {
+                    fail(describeLocation(tokenLines[cursor[0]]) + ": expected a name after function")
+                }
                 let functionName = tokenTexts[cursor[0]]
                 symbolNames.add(functionName)
                 symbolKinds.add(1)
@@ -726,8 +736,20 @@ function discoverDeclarations(tokenKinds: List<Integer>, tokenTexts: List<Text>,
                 expectToken(tokenKinds, tokenTexts, tokenLines, cursor, "(")
 
                 let parameterCount = 0
+                let firstParameter = symbolParameterNames.length
                 while !tokenIs(tokenKinds, tokenTexts, cursor, ")") {
-                    symbolParameterNames.add(tokenTexts[cursor[0]])
+                    if tokenKinds[cursor[0]] != 1 {
+                        fail(describeLocation(tokenLines[cursor[0]]) + ": expected a parameter name")
+                    }
+                    let parameterName = tokenTexts[cursor[0]]
+                    let previous = firstParameter
+                    while previous < symbolParameterNames.length {
+                        if symbolParameterNames[previous] == parameterName {
+                            fail(describeLocation(tokenLines[cursor[0]]) + ": function '" + readableDeclarationName(functionName) + "' declares parameter '" + parameterName + "' twice")
+                        }
+                        previous = previous + 1
+                    }
+                    symbolParameterNames.add(parameterName)
                     cursor[0] = cursor[0] + 1
                     expectToken(tokenKinds, tokenTexts, tokenLines, cursor, ":")
                     symbolParameterTypes.add(takeValueType(tokenKinds, tokenTexts, tokenLines, cursor, symbolNames, symbolKinds))
@@ -1224,25 +1246,25 @@ function finishFunctionEntry(output: List<Text>, slot: Integer, locals: Integer,
     output[slot] = joinText(entry)
 }
 
-function emitBinary(output: List<Text>, textState: List<Text>, state: List<Integer>, operator: Text, left: Text, leftType: Integer, leftOwner: Integer, right: Text, rightType: Integer, resultType: List<Integer>): Text {
+function emitBinary(output: List<Text>, textState: List<Text>, state: List<Integer>, operator: Text, location: Text, left: Text, leftType: Integer, leftOwner: Integer, right: Text, rightType: Integer, resultType: List<Integer>): Text {
     if leftType != rightType {
-        fail("the two sides of '" + operator + "' have different types")
+        fail(describeLocation(location) + ": " + "the two sides of '" + operator + "' have different types")
     }
     if (operator == "==" || operator == "!=") && (isRecordType(leftType) || isListType(leftType)) {
-        fail("records and Lists do not yet support equality")
+        fail(describeLocation(location) + ": " + "records and Lists do not yet support equality")
     }
     if operator == "+" || operator == "-" || operator == "*" || operator == "/" || operator == "%" {
         if leftType != 1 && !(operator == "+" && leftType == 2) {
-            fail("'" + operator + "' needs Integer operands")
+            fail(describeLocation(location) + ": " + "'" + operator + "' needs Integer operands")
         }
     } else {
         if operator == "==" || operator == "!=" {
             if leftType < 1 || leftType > 4 {
-                fail("equality needs two values")
+                fail(describeLocation(location) + ": " + "equality needs two values")
             }
         } else {
             if leftType != 1 && leftType != 3 {
-                fail("ordered comparison needs Integer or Character operands")
+                fail(describeLocation(location) + ": " + "ordered comparison needs Integer or Character operands")
             }
         }
     }
@@ -1373,8 +1395,8 @@ function emitBinary(output: List<Text>, textState: List<Text>, state: List<Integ
     return result
 }
 
-function parseExpression(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, resultType: List<Integer>): Text {
-    let left = parseAnd(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, resultType)
+function parseExpression(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
+    let left = parseAnd(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
     while tokenKinds[state[0]] == 4 && (tokenTexts[state[0]] == "||") {
         state[0] = state[0] + 1
         requireType(tokenLines, state, resultType[0], 4, "the left side of || must be Boolean")
@@ -1394,7 +1416,7 @@ function parseExpression(tokenKinds: List<Integer>, tokenTexts: List<Text>, toke
         textState[0] = "logical.right." + Text(rightLabel)
         let rightType: List<Integer> = []
         rightType.add(0)
-        let right = parseAnd(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, rightType)
+        let right = parseAnd(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, rightType)
         requireType(tokenLines, state, rightType[0], 4, "the right side of || must be Boolean")
         let rightBlock = textState[0]
         addOutput(output, "  br label %logical.end.")
@@ -1419,8 +1441,8 @@ function parseExpression(tokenKinds: List<Integer>, tokenTexts: List<Text>, toke
     return left
 }
 
-function parseAnd(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, resultType: List<Integer>): Text {
-    let left = parseBinary(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, resultType, 1)
+function parseAnd(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
+    let left = parseBinary(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType, 1)
     while tokenKinds[state[0]] == 4 && (tokenTexts[state[0]] == "&&") {
         state[0] = state[0] + 1
         requireType(tokenLines, state, resultType[0], 4, "the left side of && must be Boolean")
@@ -1440,7 +1462,7 @@ function parseAnd(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines:
         textState[0] = "logical.right." + Text(rightLabel)
         let rightType: List<Integer> = []
         rightType.add(0)
-        let right = parseBinary(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, rightType, 1)
+        let right = parseBinary(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, rightType, 1)
         requireType(tokenLines, state, rightType[0], 4, "the right side of && must be Boolean")
         let rightBlock = textState[0]
         addOutput(output, "  br label %logical.end.")
@@ -1488,11 +1510,12 @@ function operatorLevel(tokenKinds: List<Integer>, tokenTexts: List<Text>, state:
     return level
 }
 
-function parseBinary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, resultType: List<Integer>, minimumLevel: Integer): Text {
-    let left = parseUnary(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, resultType)
+function parseBinary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, minimumLevel: Integer): Text {
+    let left = parseUnary(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
     let level = operatorLevel(tokenKinds, tokenTexts, state)
     while level >= minimumLevel && level > 0 {
         let operator = tokenTexts[state[0]]
+        let operatorLocation = tokenLines[state[0]]
         state[0] = state[0] + 1
         let leftType = resultType[0]
         let leftOwner = -1
@@ -1500,8 +1523,8 @@ function parseBinary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLin
             leftOwner = resultType[1]
         }
         setType(resultType, 0)
-        let right = parseBinary(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, resultType, level + 1)
-        left = emitBinary(output, textState, state, operator, left, leftType, leftOwner, right, resultType[0], resultType)
+        let right = parseBinary(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType, level + 1)
+        left = emitBinary(output, textState, state, operator, operatorLocation, left, leftType, leftOwner, right, resultType[0], resultType)
         level = operatorLevel(tokenKinds, tokenTexts, state)
     }
     return left
@@ -1526,7 +1549,7 @@ function checkedIntegerLiteral(digits: Text, negative: Boolean, location: Text):
     return canonical
 }
 
-function parseUnary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, resultType: List<Integer>): Text {
+function parseUnary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
     let value = ""
     if tokenKinds[state[0]] == 4 && (tokenTexts[state[0]] == "!" || tokenTexts[state[0]] == "-") {
         let operator = tokenTexts[state[0]]
@@ -1539,7 +1562,7 @@ function parseUnary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLine
         }
         let rightType: List<Integer> = []
         rightType.add(0)
-        let right = parseUnary(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, rightType)
+        let right = parseUnary(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, rightType)
         let temporary = newTemporary(state)
         value = valueName(textState, temporary)
         if operator == "!" {
@@ -1573,15 +1596,15 @@ function parseUnary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLine
             setType(resultType, 1)
         }
     } else {
-        value = parsePrimary(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, resultType)
+        value = parsePrimary(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType, false)
     }
     return value
 }
 
-function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, resultType: List<Integer>): Text {
+function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, stopBeforeIndex: Boolean): Text {
     let atom = state[0]
     let scalarValues = -1
-    let value = parseAtom(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, resultType)
+    let value = parseAtom(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
     if isRecordType(resultType[0]) && tokenKinds[atom] == 1 && atom + 1 < tokenTexts.length && tokenTexts[atom + 1] == "." {
         let local = findLocal(localNames, localLengths, state, tokenTexts[atom])
         if local >= 0 { scalarValues = scalarRecordValues(state, localIds[local]) }
@@ -1590,7 +1613,7 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
         ownResult(output, state, value, resultType)
     }
 
-    while tokenKinds[state[0]] == 4 && (tokenTexts[state[0]] == "." || tokenTexts[state[0]] == "[") {
+    while tokenKinds[state[0]] == 4 && (tokenTexts[state[0]] == "." || (!stopBeforeIndex && tokenTexts[state[0]] == "[")) {
         let ownsResult = false
         if tokenTexts[state[0]] == "." {
             let receiver = value
@@ -1609,13 +1632,13 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                 if (member == "add" || member == "appended") && isListType(receiverType) {
                     argumentType[0] = listElementType(receiverType)
                 }
-                let argument = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, argumentType)
+                let argument = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, argumentType)
                 if receiverType == 2 && member == "slice" {
                     ownsResult = true
                     expectToken(tokenKinds, tokenTexts, tokenLines, state, ",")
                     let endType: List<Integer> = []
                     endType.add(0)
-                    let end = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, endType)
+                    let end = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, endType)
                     expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
                     if argumentType[0] != 1 || endType[0] != 1 {
                         fail("Text.slice positions must be Integers")
@@ -1760,7 +1783,7 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
             state[0] = state[0] + 1
             let positionType: List<Integer> = []
             positionType.add(0)
-            let position = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, positionType)
+            let position = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, positionType)
             expectToken(tokenKinds, tokenTexts, tokenLines, state, "]")
             requireType(tokenLines, state, positionType[0], 1, "a position must be an Integer")
             let temporary = newTemporary(state)
@@ -1823,7 +1846,7 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
     return value
 }
 
-function parseRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, resultType: List<Integer>): Text {
+function parseRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
     let name = tokenTexts[state[0]]
     let record = findCompiledSymbol(functionNames, symbolKinds, functionReturnTypes, name, 2)
     if record < 0 {
@@ -1894,7 +1917,7 @@ function parseRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLin
         let fieldType: List<Integer> = []
         fieldType.add(functionParameterTypes[field])
         let valueLocation = tokenLines[state[0]]
-        let fieldValue = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, fieldType)
+        let fieldValue = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, fieldType)
         if fieldType[0] != functionParameterTypes[field] {
             fail(describeLocation(valueLocation) + ": record field '" + fieldName + "' has the wrong type")
         }
@@ -1942,7 +1965,54 @@ function parseRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLin
     return value
 }
 
-function parseListLiteral(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, resultType: List<Integer>): Text {
+// Only complete, side-effect-free Integer items can enter a constant run.
+// Looking ahead must not emit a later expression before this run is appended.
+function integerListItemEnd(tokenKinds: List<Integer>, tokenTexts: List<Text>, position: Integer): Integer {
+    if tokenKinds[position] == 4 && tokenTexts[position] == "-" { position = position + 1 }
+    if tokenKinds[position] != 2 { return 0 }
+    position = position + 1
+    while tokenKinds[position] == 6 { position = position + 1 }
+    if tokenKinds[position] == 4 && (tokenTexts[position] == "," || tokenTexts[position] == "]") { return position }
+    return 0
+}
+
+function appendIntegerListRun(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, value: Text) {
+    let first = state[0]
+    let constants: List<Text> = []
+    let end = integerListItemEnd(tokenKinds, tokenTexts, state[0])
+    while end > 0 {
+        let negative = tokenKinds[state[0]] == 4
+        if negative { state[0] = state[0] + 1 }
+        let digits = checkedIntegerLiteral(tokenTexts[state[0]], negative, tokenLines[state[0]])
+        if negative { digits = "-" + digits }
+        constants.add(digits)
+        state[0] = end
+        end = 0
+        if tokenTexts[state[0]] == "," {
+            let next = state[0] + 1
+            while tokenKinds[next] == 6 { next = next + 1 }
+            end = integerListItemEnd(tokenKinds, tokenTexts, next)
+            if end > 0 { state[0] = next }
+        }
+    }
+    if constants.length == 1 {
+        addOutput(output, "  call void @minyar_list_add(ptr " + value + ", i64 " + constants[0] + ")\n")
+    } else {
+        let name = "@.list." + Text(first)
+        addOutput(globals, name + " = private unnamed_addr constant [" + Text(constants.length) + " x i64] [")
+        let position = 0
+        while position < constants.length {
+            if position > 0 { addOutput(globals, ", ") }
+            addOutput(globals, "i64 ")
+            addOutput(globals, constants[position])
+            position = position + 1
+        }
+        addOutput(globals, "], align 8\n")
+        addOutput(output, "  call void @minyar_list_append_scalars(ptr " + value + ", ptr " + name + ", i64 " + Text(constants.length) + ")\n")
+    }
+}
+
+function parseListLiteral(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
     state[0] = state[0] + 1
     let elementType = 0
     if isListType(resultType[0]) {
@@ -1962,9 +2032,13 @@ function parseListLiteral(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
     }
     skipTerminators(tokenKinds, state)
     while !tokenIs(tokenKinds, tokenTexts, state, "]") {
+        if (elementType == 0 || elementType == 1) && integerListItemEnd(tokenKinds, tokenTexts, state[0]) > 0 {
+            elementType = 1
+            appendIntegerListRun(tokenKinds, tokenTexts, tokenLines, state, textState, output, globals, value)
+        } else {
         let itemType: List<Integer> = []
         itemType.add(elementType)
-        let item = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, itemType)
+        let item = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, itemType)
         if itemType[0] == 5 || itemType[0] == 6 {
             fail("Nothing cannot be stored in a List")
         }
@@ -1993,6 +2067,7 @@ function parseListLiteral(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         addOutput(output, ", i64 ")
         addOutput(output, slot)
         addOutput(output, ")\n")
+        }
         skipTerminators(tokenKinds, state)
         if !tokenIs(tokenKinds, tokenTexts, state, "]") {
             expectToken(tokenKinds, tokenTexts, tokenLines, state, ",")
@@ -2004,7 +2079,7 @@ function parseListLiteral(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
     return value
 }
 
-function parseAtom(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, resultType: List<Integer>): Text {
+function parseAtom(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
     let tokenIndex = state[0]
     let kind = tokenKinds[tokenIndex]
     let token = tokenTexts[tokenIndex]
@@ -2017,10 +2092,10 @@ function parseAtom(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
             setType(resultType, 4)
         } else {
             if tokenTexts[tokenIndex + 1] == "(" {
-                value = parseCall(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, resultType)
+                value = parseCall(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
             } else {
                 if tokenKinds[tokenIndex + 1] == 4 && tokenTexts[tokenIndex + 1] == "{" && findCompiledSymbol(functionNames, symbolKinds, functionReturnTypes, token, 2) >= 0 {
-                    value = parseRecord(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, resultType)
+                    value = parseRecord(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
                 } else {
                     let local = findLocal(localNames, localLengths, state, token)
                     if local < 0 {
@@ -2075,11 +2150,11 @@ function parseAtom(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                 } else {
                     if token == "(" {
                         state[0] = tokenIndex + 1
-                        value = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, resultType)
+                        value = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
                         expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
                     } else {
                         if token == "[" {
-                            value = parseListLiteral(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, resultType)
+                            value = parseListLiteral(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
                         } else {
                             fail(describeLocation(tokenLines[tokenIndex]) + ": expected an expression, found '" + token + "'")
                         }
@@ -2127,8 +2202,18 @@ function checkBuiltinArguments(name: Text, types: List<Integer>) {
     }
 }
 
-function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, resultType: List<Integer>): Text {
+// Source identifiers cannot contain a dot. Keep their linker namespace
+// separate from every C/runtime symbol; stable quoted module names already
+// have their own namespace. Only the executable entry keeps the C name main.
+function llvmFunctionName(name: Text): Text {
+    if name == "main" { return name }
+    if name[0] == '\"' { return name }
+    return ".minyar.user." + name
+}
+
+function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
     let name = tokenTexts[state[0]]
+    let callLocation = tokenLines[state[0]]
     state[0] = state[0] + 1
     expectToken(tokenKinds, tokenTexts, tokenLines, state, "(")
     let argumentValues: List<Text> = []
@@ -2149,7 +2234,7 @@ function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                 argumentType[0] = 100002
             }
         }
-        argumentValues.add(parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, argumentType))
+        argumentValues.add(parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, argumentType))
         argumentTypes.add(argumentType[0])
         if tokenIs(tokenKinds, tokenTexts, state, ",") {
             state[0] = state[0] + 1
@@ -2276,7 +2361,7 @@ function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                                     state[5] = functionIndex
                                 }
                                 if functionIndex < 0 {
-                                    fail("I can't find a function named '" + readableDeclarationName(name) + "'")
+                                    fail(describeLocation(callLocation) + ": I can't find a function named '" + readableDeclarationName(name) + "'")
                                 }
                                 if argumentValues.length != functionParameterCounts[functionIndex] {
                                     fail(readableDeclarationName(name) + " expects " + Text(functionParameterCounts[functionIndex]) + " arguments, but received " + Text(argumentValues.length) + " near " + describeLocation(tokenLines[state[0]]))
@@ -2300,7 +2385,7 @@ function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                                 addOutput(output, "call ")
                                 addOutput(output, llvmType(returnType))
                                 addOutput(output, " @")
-                                addOutput(output, name)
+                                addOutput(output, llvmFunctionName(name))
                                 addOutput(output, "(")
                                 argumentIndex = 0
                                 while argumentIndex < argumentValues.length {
@@ -2333,16 +2418,19 @@ function nextLocal(state: List<Integer>): Integer {
 
 function looksLikeIndexAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, state: List<Integer>): Boolean {
     let position = state[0] + 1
+    while tokenTexts[position] == "." && position + 2 < tokenTexts.length && tokenKinds[position + 1] == 1 {
+        position = position + 2
+    }
     let depth = 0
     let result = false
     if tokenTexts[position] == "[" {
         depth = 1
         position = position + 1
         while depth > 0 && tokenKinds[position] != 0 {
-            if tokenTexts[position] == "[" {
+            if tokenKinds[position] == 4 && tokenTexts[position] == "[" {
                 depth = depth + 1
             }
-            if tokenTexts[position] == "]" {
+            if tokenKinds[position] == 4 && tokenTexts[position] == "]" {
                 depth = depth - 1
             }
             position = position + 1
@@ -2354,37 +2442,7 @@ function looksLikeIndexAssignment(tokenKinds: List<Integer>, tokenTexts: List<Te
     return result
 }
 
-function compileBlock(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, returnType: Integer): Boolean {
-    expectToken(tokenKinds, tokenTexts, tokenLines, state, "{")
-    skipTerminators(tokenKinds, state)
-    let firstScopedLocal = state[3]
-    let returns = false
-    let terminated = false
-    while !tokenIs(tokenKinds, tokenTexts, state, "}") {
-        if terminated {
-            textState[0] = "dead." + Text(newLabel(state))
-            addOutput(output, "\n" + textState[0] + ":\n")
-        }
-        terminated = compileStatement(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, returnType)
-        returns = returns || terminated
-        finishStatement(tokenKinds, tokenTexts, tokenLines, state)
-    }
-    if returns && !terminated {
-        addOutput(output, "  unreachable\n")
-    }
-    expectToken(tokenKinds, tokenTexts, tokenLines, state, "}")
-    if !returns {
-        let local = firstScopedLocal
-        while local < state[3] {
-            rootLocal(output, state, localIds[local], "null", localTypes[local])
-            local = local + 1
-        }
-    }
-    state[3] = firstScopedLocal
-    return returns
-}
-
-function compileStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, returnType: Integer): Boolean {
+function compileAtomicStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, returnType: Integer): Boolean {
     let returns = false
     let referenceEffects = state[7]
     if tokenIs(tokenKinds, tokenTexts, state, "else") {
@@ -2409,7 +2467,7 @@ function compileStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         }
         let valueType: List<Integer> = []
         valueType.add(declaredType)
-        let value = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, valueType)
+        let value = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, valueType)
         if valueType[0] == 100000 {
             if !isListType(declaredType) {
                 fail("an empty List needs a type, such as List<Text>")
@@ -2448,7 +2506,7 @@ function compileStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
             valueType.add(returnType)
             let value = ""
             if tokenKinds[state[0]] != 6 && !tokenIs(tokenKinds, tokenTexts, state, "}") {
-                value = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, valueType)
+                value = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, valueType)
             } else {
                 setType(valueType, 5)
             }
@@ -2481,181 +2539,83 @@ function compileStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
             }
             returns = true
         } else {
-            if tokenIs(tokenKinds, tokenTexts, state, "if") {
-                state[0] = state[0] + 1
-                let conditionType: List<Integer> = []
-                conditionType.add(0)
-                let condition = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, conditionType)
-                requireType(tokenLines, state, conditionType[0], 4, "an if condition must be Boolean")
-                let thenLabel = newLabel(state)
-                let elseLabel = newLabel(state)
-                let endLabel = newLabel(state)
-                let branchSlot = output.length
-                addOutput(output, "")
-                textState[0] = "if.then." + Text(thenLabel)
-                let thenReturns = compileBlock(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, returnType)
-                if !thenReturns {
-                    addOutput(output, "  br label %if.end.")
-                    addOutput(output, Text(endLabel))
-                    addOutput(output, "\n")
+            if tokenKinds[state[0]] == 1 && tokenTexts[state[0] + 1] == "=" {
+                let name = tokenTexts[state[0]]
+                let local = findLocal(localNames, localLengths, state, name)
+                if local < 0 {
+                    fail("I can't find a value named '" + name + "'")
                 }
-                let hasElse = tokenIs(tokenKinds, tokenTexts, state, "else")
-                let falseTarget = "if.end." + Text(endLabel)
-                if hasElse {
-                    falseTarget = "if.else." + Text(elseLabel)
+                state[0] = state[0] + 2
+                let valueType: List<Integer> = []
+                valueType.add(localTypes[local])
+                // For x = x + e, transfer x's local owner into the
+                // consuming Text join. Runtime uniqueness still guards
+                // in-place growth; aliases take the copying fallback.
+                if localTypes[local] == 2 && tokenKinds[state[0]] == 1 && tokenTexts[state[0]] == name && tokenTexts[state[0] + 1] == "+" {
+                    valueType.add(-1)
+                    valueType.add(localIds[local])
+                    valueType.add(state[0])
                 }
-                output[branchSlot] = "  br i1 " + condition + ", label %if.then." + Text(thenLabel) + ", label %" + falseTarget + "\n\nif.then." + Text(thenLabel) + ":\n"
-                let elseReturns = false
-                if hasElse {
-                    state[0] = state[0] + 1
-                    addOutput(output, "\nif.else.")
-                    addOutput(output, Text(elseLabel))
-                    addOutput(output, ":\n")
-                    textState[0] = "if.else." + Text(elseLabel)
-                    elseReturns = compileBlock(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, returnType)
-                    if !elseReturns {
-                        addOutput(output, "  br label %if.end.")
-                        addOutput(output, Text(endLabel))
-                        addOutput(output, "\n")
-                    }
+                let value = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, valueType)
+                if valueType[0] != localTypes[local] {
+                    fail("an assignment to '" + name + "' has the wrong type")
                 }
-                if !(thenReturns && hasElse && elseReturns) {
-                    addOutput(output, "\nif.end.")
-                    addOutput(output, Text(endLabel))
-                    addOutput(output, ":\n")
-                    textState[0] = "if.end." + Text(endLabel)
-                }
-                returns = thenReturns && hasElse && elseReturns
+                assignReference(output, state, localIds[local], value, valueType)
+                addOutput(output, "  store ")
+                addOutput(output, llvmType(valueType[0]))
+                addOutput(output, " ")
+                addOutput(output, value)
+                addOutput(output, ", ptr %local.")
+                addOutput(output, Text(localIds[local]))
+                addOutput(output, "\n")
             } else {
-                if tokenIs(tokenKinds, tokenTexts, state, "while") {
-                    state[0] = state[0] + 1
-                    let conditionLabel = newLabel(state)
-                    let bodyLabel = newLabel(state)
-                    let endLabel = newLabel(state)
-                    addOutput(output, "  br label %while.condition.")
-                    addOutput(output, Text(conditionLabel))
-                    addOutput(output, "\n\nwhile.condition.")
-                    addOutput(output, Text(conditionLabel))
-                    addOutput(output, ":\n")
-                    textState[0] = "while.condition." + Text(conditionLabel)
-                    let conditionType: List<Integer> = []
-                    conditionType.add(0)
-                    let condition = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, conditionType)
-                    requireType(tokenLines, state, conditionType[0], 4, "a while condition must be Boolean")
-                    addOutput(output, "  br i1 ")
-                    addOutput(output, condition)
-                    addOutput(output, ", label %while.body.")
-                    addOutput(output, Text(bodyLabel))
-                    addOutput(output, ", label %while.end.")
-                    addOutput(output, Text(endLabel))
-                    addOutput(output, "\n\nwhile.body.")
-                    addOutput(output, Text(bodyLabel))
-                    addOutput(output, ":\n")
-                    textState[0] = "while.body." + Text(bodyLabel)
-                    let bodyReturns = compileBlock(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, returnType)
-                    if !bodyReturns {
-                        /* A long scalar loop must still service cleanup debt
-                           created before it. Scalar-only functions erase this
-                           call in finishFunctionEntry. */
-                        addOutput(output, "  call void @minyar_rc_step()\n")
-                        addOutput(output, "  br label %while.condition.")
-                        addOutput(output, Text(conditionLabel))
-                        addOutput(output, "\n")
-                    }
-                    addOutput(output, "\nwhile.end.")
-                    addOutput(output, Text(endLabel))
-                    addOutput(output, ":\n")
-                    textState[0] = "while.end." + Text(endLabel)
+                if tokenKinds[state[0]] == 1 && tokenTexts[state[0] + 1] == "." && state[0] + 3 < tokenTexts.length && tokenTexts[state[0] + 3] == "=" {
+                    fail(describeLocation(tokenLines[state[0]]) + ": record fields are immutable; construct a new record instead")
                 } else {
-                    if tokenKinds[state[0]] == 1 && tokenTexts[state[0] + 1] == "=" {
-                        let name = tokenTexts[state[0]]
-                        let local = findLocal(localNames, localLengths, state, name)
-                        if local < 0 {
-                            fail("I can't find a value named '" + name + "'")
-                        }
-                        state[0] = state[0] + 2
-                        let valueType: List<Integer> = []
-                        valueType.add(localTypes[local])
-                        // For x = x + e, transfer x's local owner into the
-                        // consuming Text join. Runtime uniqueness still guards
-                        // in-place growth; aliases take the copying fallback.
-                        if localTypes[local] == 2 && tokenKinds[state[0]] == 1 && tokenTexts[state[0]] == name && tokenTexts[state[0] + 1] == "+" {
-                            valueType.add(-1)
-                            valueType.add(localIds[local])
-                            valueType.add(state[0])
-                        }
-                        let value = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, valueType)
-                        if valueType[0] != localTypes[local] {
-                            fail("an assignment to '" + name + "' has the wrong type")
-                        }
-                        assignReference(output, state, localIds[local], value, valueType)
-                        addOutput(output, "  store ")
-                        addOutput(output, llvmType(valueType[0]))
-                        addOutput(output, " ")
-                        addOutput(output, value)
-                        addOutput(output, ", ptr %local.")
-                        addOutput(output, Text(localIds[local]))
-                        addOutput(output, "\n")
-                    } else {
-                        if tokenKinds[state[0]] == 1 && tokenTexts[state[0] + 1] == "." && state[0] + 3 < tokenTexts.length && tokenTexts[state[0] + 3] == "=" {
-                            fail(describeLocation(tokenLines[state[0]]) + ": record fields are immutable; construct a new record instead")
-                        } else {
-                        if tokenKinds[state[0]] == 1 && looksLikeIndexAssignment(tokenKinds, tokenTexts, state) {
-                            let name = tokenTexts[state[0]]
-                            let local = findLocal(localNames, localLengths, state, name)
-                            if local < 0 || !isListType(localTypes[local]) {
-                                fail("indexed assignment needs a List")
-                            }
-                            let collection = ""
-                            let id = localIds[local]
-                            if id < 0 {
-                                collection = output[-id - 1]
-                            } else {
-                                let collectionTemporary = newTemporary(state)
-                                collection = valueName(textState, collectionTemporary)
-                                addOutput(output, "  ")
-                                addOutput(output, collection)
-                                addOutput(output, " = load ptr, ptr %local.")
-                                addOutput(output, Text(id))
-                                addOutput(output, "\n")
-                            }
-                            state[0] = state[0] + 2
-                            let positionType: List<Integer> = []
-                            positionType.add(0)
-                            let position = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, positionType)
-                            expectToken(tokenKinds, tokenTexts, tokenLines, state, "]")
-                            requireType(tokenLines, state, positionType[0], 1, "a position must be an Integer")
-                            expectToken(tokenKinds, tokenTexts, tokenLines, state, "=")
-                            let valueType: List<Integer> = []
-                            valueType.add(listElementType(localTypes[local]))
-                            let value = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, valueType)
-                            if valueType[0] != listElementType(localTypes[local]) {
-                                fail("an indexed assignment has the wrong type")
-                            }
-                            checkListMutation(localTypes[local], functionParameterCounts, functionParameterTypes, functionReturnTypes)
-                            let slot = valueAsListSlot(output, textState, state, value, valueType[0])
-                            if takeResult(output, state, value, valueType) {
-                                addOutput(output, "  call void @minyar_list_set_take(ptr ")
-                            } else {
-                                addOutput(output, "  call void @minyar_list_set(ptr ")
-                            }
-                            addOutput(output, collection)
-                            addOutput(output, ", i64 ")
-                            addOutput(output, position)
-                            addOutput(output, ", i64 ")
-                            addOutput(output, slot)
-                            addOutput(output, ")\n")
-                        } else {
-                            let ignoredType: List<Integer> = []
-                            ignoredType.add(0)
-                            let ignored = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, ignoredType)
-                            if ignoredType[0] == 6 {
-                                addOutput(output, "  unreachable\n")
-                                returns = true
-                            }
-                        }
-                        }
+                if tokenKinds[state[0]] == 1 && looksLikeIndexAssignment(tokenKinds, tokenTexts, state) {
+                    let collectionType: List<Integer> = []
+                    collectionType.add(0)
+                    // Parse the receiver once. A List held in an immutable
+                    // record field still permits mutation of its elements.
+                    let collection = parsePrimary(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, collectionType, true)
+                    if !isListType(collectionType[0]) {
+                        fail("indexed assignment needs a List")
                     }
+                    expectToken(tokenKinds, tokenTexts, tokenLines, state, "[")
+                    let positionType: List<Integer> = []
+                    positionType.add(0)
+                    let position = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, positionType)
+                    expectToken(tokenKinds, tokenTexts, tokenLines, state, "]")
+                    requireType(tokenLines, state, positionType[0], 1, "a position must be an Integer")
+                    expectToken(tokenKinds, tokenTexts, tokenLines, state, "=")
+                    let valueType: List<Integer> = []
+                    valueType.add(listElementType(collectionType[0]))
+                    let value = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, valueType)
+                    if valueType[0] != listElementType(collectionType[0]) {
+                        fail("an indexed assignment has the wrong type")
+                    }
+                    checkListMutation(collectionType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes)
+                    let slot = valueAsListSlot(output, textState, state, value, valueType[0])
+                    if takeResult(output, state, value, valueType) {
+                        addOutput(output, "  call void @minyar_list_set_take(ptr ")
+                    } else {
+                        addOutput(output, "  call void @minyar_list_set(ptr ")
+                    }
+                    addOutput(output, collection)
+                    addOutput(output, ", i64 ")
+                    addOutput(output, position)
+                    addOutput(output, ", i64 ")
+                    addOutput(output, slot)
+                    addOutput(output, ")\n")
+                } else {
+                    let ignoredType: List<Integer> = []
+                    ignoredType.add(0)
+                    let ignored = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, ignoredType)
+                    if ignoredType[0] == 6 {
+                        addOutput(output, "  unreachable\n")
+                        returns = true
+                    }
+                }
                 }
             }
         }
@@ -2664,6 +2624,236 @@ function compileStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         addOutput(output, "  call void @minyar_rc_step()\n")
     }
     return returns
+}
+
+// A statement continuation has seven Integer slots. Slot 0 is its kind:
+// 1 = block, 2 = after if-then, 3 = after if-else, 4 = after while-body.
+// A block stores first local / any return / previous termination in 1..3.
+// An if stores reference effects / then label / else label / end label /
+// branch output slot / then termination in 1..6. A while uses the same
+// reference-effects, condition-label, end-label and literal-true slots.
+// Conditions awaiting a then-body are retained in a parallel Text stack.
+// Capacity is reused at the high-water mark; no language call stack grows
+// with statement nesting. Expression parsing retains its own depth guard.
+function prepareStatementFrame(frames: List<Integer>, conditions: List<Text>, depth: Integer, kind: Integer) {
+    let frame = depth * 7
+    while frames.length < frame + 7 { frames.add(0) }
+    while conditions.length <= depth { conditions.add("") }
+    frames[frame] = kind
+}
+
+function compileStatementSequence(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, returnType: Integer, startsBlock: Boolean): Boolean {
+    let frames: List<Integer> = []
+    let conditions: List<Text> = []
+    let depth = 0
+    // Mode 0 enters a block; 1 reads its next statement; 2 resumes its
+    // caller with the just-completed statement/block's termination result.
+    let mode = 1
+    if startsBlock { mode = 0 }
+    let returns = false
+    let done = false
+    while !done {
+        if mode == 0 {
+            expectToken(tokenKinds, tokenTexts, tokenLines, state, "{")
+            skipTerminators(tokenKinds, state)
+            prepareStatementFrame(frames, conditions, depth, 1)
+            let frame = depth * 7
+            frames[frame + 1] = state[3]
+            frames[frame + 2] = 0
+            frames[frame + 3] = 0
+            depth = depth + 1
+            mode = 1
+        } else {
+            if mode == 1 {
+                let inBlock = false
+                let frame = 0
+                if depth > 0 {
+                    frame = (depth - 1) * 7
+                    inBlock = frames[frame] == 1
+                }
+                if inBlock && tokenIs(tokenKinds, tokenTexts, state, "}") {
+                    returns = frames[frame + 2] != 0
+                    if returns && frames[frame + 3] == 0 { addOutput(output, "  unreachable\n") }
+                    expectToken(tokenKinds, tokenTexts, tokenLines, state, "}")
+                    let firstScopedLocal = frames[frame + 1]
+                    if !returns {
+                        let local = firstScopedLocal
+                        while local < state[3] {
+                            rootLocal(output, state, localIds[local], "null", localTypes[local])
+                            local = local + 1
+                        }
+                    }
+                    state[3] = firstScopedLocal
+                    depth = depth - 1
+                    mode = 2
+                } else {
+                    if inBlock && frames[frame + 3] != 0 {
+                        textState[0] = "dead." + Text(newLabel(state))
+                        addOutput(output, "\n" + textState[0] + ":\n")
+                    }
+                    if tokenIs(tokenKinds, tokenTexts, state, "if") {
+                        let referenceEffects = state[7]
+                        state[0] = state[0] + 1
+                        let conditionType: List<Integer> = []
+                        conditionType.add(0)
+                        let condition = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, conditionType)
+                        requireType(tokenLines, state, conditionType[0], 4, "an if condition must be Boolean")
+                        let thenLabel = newLabel(state)
+                        let elseLabel = newLabel(state)
+                        let endLabel = newLabel(state)
+                        let branchSlot = output.length
+                        addOutput(output, "")
+                        textState[0] = "if.then." + Text(thenLabel)
+                        prepareStatementFrame(frames, conditions, depth, 2)
+                        frame = depth * 7
+                        frames[frame + 1] = referenceEffects
+                        frames[frame + 2] = thenLabel
+                        frames[frame + 3] = elseLabel
+                        frames[frame + 4] = endLabel
+                        frames[frame + 5] = branchSlot
+                        conditions[depth] = condition
+                        depth = depth + 1
+                        mode = 0
+                    } else {
+                        if tokenIs(tokenKinds, tokenTexts, state, "while") {
+                            let referenceEffects = state[7]
+                            state[0] = state[0] + 1
+                            let conditionLabel = newLabel(state)
+                            let bodyLabel = newLabel(state)
+                            let endLabel = newLabel(state)
+                            addOutput(output, "  br label %while.condition.")
+                            addOutput(output, Text(conditionLabel))
+                            addOutput(output, "\n\nwhile.condition.")
+                            addOutput(output, Text(conditionLabel))
+                            addOutput(output, ":\n")
+                            textState[0] = "while.condition." + Text(conditionLabel)
+                            let conditionType: List<Integer> = []
+                            conditionType.add(0)
+                            let condition = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, conditionType)
+                            requireType(tokenLines, state, conditionType[0], 4, "a while condition must be Boolean")
+                            addOutput(output, "  br i1 ")
+                            addOutput(output, condition)
+                            addOutput(output, ", label %while.body.")
+                            addOutput(output, Text(bodyLabel))
+                            addOutput(output, ", label %while.end.")
+                            addOutput(output, Text(endLabel))
+                            addOutput(output, "\n\nwhile.body.")
+                            addOutput(output, Text(bodyLabel))
+                            addOutput(output, ":\n")
+                            textState[0] = "while.body." + Text(bodyLabel)
+                            prepareStatementFrame(frames, conditions, depth, 4)
+                            frame = depth * 7
+                            frames[frame + 1] = referenceEffects
+                            frames[frame + 2] = conditionLabel
+                            frames[frame + 4] = endLabel
+                            frames[frame + 6] = 0
+                            if condition == "true" { frames[frame + 6] = 1 }
+                            depth = depth + 1
+                            mode = 0
+                        } else {
+                            returns = compileAtomicStatement(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
+                            mode = 2
+                        }
+                    }
+                }
+            } else {
+                if depth == 0 {
+                    done = true
+                } else {
+                    let frame = (depth - 1) * 7
+                    let kind = frames[frame]
+                    if kind == 1 {
+                        frames[frame + 3] = 0
+                        if returns {
+                            frames[frame + 2] = 1
+                            frames[frame + 3] = 1
+                        }
+                        finishStatement(tokenKinds, tokenTexts, tokenLines, state)
+                        mode = 1
+                    } else {
+                        let endLabel = frames[frame + 4]
+                        let referenceEffects = frames[frame + 1]
+                        let statementComplete = true
+                        if kind == 2 {
+                            if !returns {
+                                addOutput(output, "  br label %if.end.")
+                                addOutput(output, Text(endLabel))
+                                addOutput(output, "\n")
+                            }
+                            let hasElse = tokenIs(tokenKinds, tokenTexts, state, "else")
+                            let thenLabel = frames[frame + 2]
+                            let elseLabel = frames[frame + 3]
+                            let falseTarget = "if.end." + Text(endLabel)
+                            if hasElse { falseTarget = "if.else." + Text(elseLabel) }
+                            output[frames[frame + 5]] = "  br i1 " + conditions[depth - 1] + ", label %if.then." + Text(thenLabel) + ", label %" + falseTarget + "\n\nif.then." + Text(thenLabel) + ":\n"
+                            conditions[depth - 1] = ""
+                            if hasElse {
+                                frames[frame] = 3
+                                frames[frame + 6] = 0
+                                if returns { frames[frame + 6] = 1 }
+                                state[0] = state[0] + 1
+                                addOutput(output, "\nif.else.")
+                                addOutput(output, Text(elseLabel))
+                                addOutput(output, ":\n")
+                                textState[0] = "if.else." + Text(elseLabel)
+                                statementComplete = false
+                                mode = 0
+                            } else {
+                                returns = false
+                            }
+                        } else {
+                            if kind == 3 {
+                                if !returns {
+                                    addOutput(output, "  br label %if.end.")
+                                    addOutput(output, Text(endLabel))
+                                    addOutput(output, "\n")
+                                }
+                                returns = returns && frames[frame + 6] != 0
+                            } else {
+                                if !returns {
+                                    // Scalar loops must service preceding cleanup debt.
+                                    // Scalar-only functions erase this call later.
+                                    addOutput(output, "  call void @minyar_rc_step()\n")
+                                    addOutput(output, "  br label %while.condition.")
+                                    addOutput(output, Text(frames[frame + 2]))
+                                    addOutput(output, "\n")
+                                }
+                                addOutput(output, "\nwhile.end.")
+                                addOutput(output, Text(endLabel))
+                                addOutput(output, ":\n")
+                                textState[0] = "while.end." + Text(endLabel)
+                                // No break exists: literal true never falls through.
+                                returns = frames[frame + 6] != 0
+                                if returns { addOutput(output, "  unreachable\n") }
+                            }
+                        }
+                        if statementComplete {
+                            if kind != 4 && !returns {
+                                addOutput(output, "\nif.end.")
+                                addOutput(output, Text(endLabel))
+                                addOutput(output, ":\n")
+                                textState[0] = "if.end." + Text(endLabel)
+                            }
+                            if !returns && state[7] != referenceEffects { addOutput(output, "  call void @minyar_rc_step()\n") }
+                            depth = depth - 1
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return returns
+}
+
+function compileBlock(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, returnType: Integer): Boolean {
+    return compileStatementSequence(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType, true)
+}
+
+function compileStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, returnType: Integer): Boolean {
+    if tokenIs(tokenKinds, tokenTexts, state, "if") || tokenIs(tokenKinds, tokenTexts, state, "while") {
+        return compileStatementSequence(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType, false)
+    }
+    return compileAtomicStatement(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
 }
 
 // Parameter bindings that are never assigned retain their incoming SSA value.
@@ -2700,7 +2890,78 @@ function markAssignedParameters(tokenKinds: List<Integer>, tokenTexts: List<Text
     }
 }
 
-function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, output: List<Text>, stackOwnerLimit: Integer) {
+// Recognize a complete pure selector only after normal compilation has checked
+// every nested statement. Canonical decimal ordering proves unique cases without
+// a hash table or overflow-prone subtraction. Everything outside this narrow
+// Integer-parameter/literal-return grammar keeps its original control flow.
+function lowerIntegerDispatch(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, start: Integer, end: Integer, parameter: Text, output: List<Text>, globals: List<Text>, bodySlot: Integer, table: Text): Boolean {
+    let cursor: List<Integer> = []
+    cursor.add(start + 1)
+    let cases: List<Text> = []
+    let results: List<Text> = []
+    skipTerminators(tokenKinds, cursor)
+    while cursor[0] < end && tokenIs(tokenKinds, tokenTexts, cursor, "if") {
+        let position = cursor[0]
+        if position + 5 >= end { return false }
+        if tokenKinds[position + 1] != 1 || tokenTexts[position + 1] != parameter || tokenTexts[position + 2] != "==" || tokenKinds[position + 3] != 2 || tokenTexts[position + 4] != "{" { return false }
+        let value = checkedIntegerLiteral(tokenTexts[position + 3], false, tokenLines[position + 3])
+        if cases.length > 0 {
+            let prior = cases[cases.length - 1]
+            if prior.length > value.length || (prior.length == value.length && compareText(prior, value) >= 0) { return false }
+        }
+        cursor[0] = position + 5
+        skipTerminators(tokenKinds, cursor)
+        position = cursor[0]
+        if position + 2 >= end || tokenTexts[position] != "return" || tokenKinds[position + 1] != 2 { return false }
+        let result = checkedIntegerLiteral(tokenTexts[position + 1], false, tokenLines[position + 1])
+        cursor[0] = position + 2
+        skipTerminators(tokenKinds, cursor)
+        position = cursor[0]
+        if position + 2 >= end || tokenTexts[position] != "}" || tokenTexts[position + 1] != "else" || tokenTexts[position + 2] != "{" { return false }
+        cursor[0] = position + 3
+        skipTerminators(tokenKinds, cursor)
+        cases.add(value)
+        results.add(result)
+    }
+    let position = cursor[0]
+    if cases.length == 0 || position + 2 >= end || tokenTexts[position] != "return" || tokenKinds[position + 1] != 2 { return false }
+    let fallback = checkedIntegerLiteral(tokenTexts[position + 1], false, tokenLines[position + 1])
+    cursor[0] = position + 2
+    skipTerminators(tokenKinds, cursor)
+    let closing = 0
+    while closing <= cases.length {
+        if cursor[0] >= end || !tokenIs(tokenKinds, tokenTexts, cursor, "}") { return false }
+        cursor[0] = cursor[0] + 1
+        // The outer function's closing brace ends this exact body span.
+        if closing < cases.length { skipTerminators(tokenKinds, cursor) }
+        closing = closing + 1
+    }
+    if cursor[0] != end { return false }
+    // A sorted constant table avoids both quadratic CFG simplification and
+    // giant return PHIs. Normal compilation above has already checked every
+    // branch. Binary search only reorders pure comparisons of one stable value.
+    position = bodySlot
+    while position < output.length {
+        output[position] = ""
+        position = position + 1
+    }
+    let count = Text(cases.length)
+    addOutput(globals, table + " = private unnamed_addr constant [" + count + " x { i64, i64 }] [\n")
+    position = 0
+    while position < cases.length {
+        if position > 0 { addOutput(globals, ",\n") }
+        addOutput(globals, "  { i64, i64 } { i64 " + cases[position] + ", i64 " + results[position] + " }")
+        position = position + 1
+    }
+    addOutput(globals, "\n]\n")
+    addOutput(output, "  br label %dispatch.search\n\ndispatch.search:\n  %dispatch.low = phi i64 [ 0, %entry ], [ %dispatch.next, %dispatch.upper ], [ %dispatch.low, %dispatch.lower ]\n  %dispatch.high = phi i64 [ " + count + ", %entry ], [ %dispatch.high, %dispatch.upper ], [ %dispatch.mid, %dispatch.lower ]\n  %dispatch.more = icmp ult i64 %dispatch.low, %dispatch.high\n  br i1 %dispatch.more, label %dispatch.probe, label %dispatch.default\n")
+    addOutput(output, "\ndispatch.probe:\n  %dispatch.span = sub i64 %dispatch.high, %dispatch.low\n  %dispatch.half = lshr i64 %dispatch.span, 1\n  %dispatch.mid = add i64 %dispatch.low, %dispatch.half\n  %dispatch.key.ptr = getelementptr [" + count + " x { i64, i64 }], ptr " + table + ", i64 0, i64 %dispatch.mid, i32 0\n  %dispatch.key = load i64, ptr %dispatch.key.ptr\n  %dispatch.match = icmp eq i64 %argument.0, %dispatch.key\n  br i1 %dispatch.match, label %dispatch.found, label %dispatch.compare\n")
+    addOutput(output, "\ndispatch.compare:\n  %dispatch.less = icmp slt i64 %argument.0, %dispatch.key\n  br i1 %dispatch.less, label %dispatch.lower, label %dispatch.upper\n\ndispatch.lower:\n  br label %dispatch.search\n\ndispatch.upper:\n  %dispatch.next = add i64 %dispatch.mid, 1\n  br label %dispatch.search\n")
+    addOutput(output, "\ndispatch.found:\n  %dispatch.result.ptr = getelementptr [" + count + " x { i64, i64 }], ptr " + table + ", i64 0, i64 %dispatch.mid, i32 1\n  %dispatch.result = load i64, ptr %dispatch.result.ptr\n  call void @minyar_stack_leave()\n  ret i64 %dispatch.result\n\ndispatch.default:\n  call void @minyar_stack_leave()\n  ret i64 " + fallback + "\n")
+    return true
+}
+
+function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, output: List<Text>, globals: List<Text>, stackOwnerLimit: Integer) {
     let state: List<Integer> = []
     state.add(0)
     state.add(0)
@@ -2778,7 +3039,7 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         addOutput(output, "define ")
         addOutput(output, emittedReturn)
         addOutput(output, " @")
-        addOutput(output, name)
+        addOutput(output, llvmFunctionName(name))
         addOutput(output, "(")
         if name == "main" {
             addOutput(output, "i32 %minyar.argument.count, ptr %minyar.argument.values")
@@ -2799,6 +3060,7 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
                 parameter = parameter + 1
             }
         }
+        let definitionTailSlot = output.length
         addOutput(output, ") {\nentry:\n")
         let entrySlot = output.length
         addOutput(output, "")
@@ -2827,7 +3089,9 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
             }
             parameter = parameter + 1
         }
-        let returns = compileBlock(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, returnType)
+        let bodyStart = state[0]
+        let bodySlot = output.length
+        let returns = compileBlock(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
         if !returns {
             addOutput(output, "  call void @minyar_rc_leave()\n")
             addOutput(output, "  call void @minyar_stack_leave()\n")
@@ -2839,6 +3103,15 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
                 } else {
                     fail("function '" + readableDeclarationName(name) + "' must return a value on every path")
                 }
+            }
+        }
+        // A label budget bounds LLVM's constant-call cloning cost. It counts
+        // reserved labels too; ordinary functions remain inline-eligible.
+        if state[2] >= 4096 {
+            output[definitionTailSlot] = ") noinline {\nentry:\n"
+            if returnType == 1 && parameterNames.length == 1 && parameterTypes[0] == 1 && parameterTypes[1] < 0 {
+                let dispatchTable = "@.dispatch." + Text(bodyStart)
+                lowerIntegerDispatch(tokenKinds, tokenTexts, tokenLines, bodyStart, state[0], parameterNames[0], output, globals, bodySlot, dispatchTable)
             }
         }
         finishFunctionEntry(output, entrySlot, state[4], parameterNames.length, state[8], state[6] == 1)
@@ -2854,7 +3127,7 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
     }
 }
 
-function compileTopLevel(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, output: List<Text>) {
+function compileTopLevel(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, output: List<Text>, globals: List<Text>) {
     let state: List<Integer> = []
     state.add(0)
     state.add(0)
@@ -2891,7 +3164,7 @@ function compileTopLevel(tokenKinds: List<Integer>, tokenTexts: List<Text>, toke
                 textState[0] = "dead." + Text(newLabel(state))
             addOutput(output, "\n" + textState[0] + ":\n")
             }
-            terminated = compileStatement(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, 1)
+            terminated = compileStatement(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, 1)
             finishStatement(tokenKinds, tokenTexts, tokenLines, state)
         }
         skipTerminators(tokenKinds, state)
@@ -2939,6 +3212,7 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     }
 
     let output: List<Text> = []
+    let globals: List<Text> = []
     addOutput(output, "; Generated by the compiler written in Minyar.\n\n")
     let position = 0
     while position < tokenKinds.length {
@@ -3010,6 +3284,7 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     addOutput(output, "declare ptr @minyar_list_new()\n")
     addOutput(output, "declare void @minyar_list_references(ptr)\n")
     addOutput(output, "declare void @minyar_list_add(ptr, i64)\n")
+    addOutput(output, "declare void @minyar_list_append_scalars(ptr, ptr, i64)\n")
     addOutput(output, "declare void @minyar_list_add_take(ptr, i64)\n")
     addOutput(output, "declare i64 @minyar_list_length(ptr)\n")
     addOutput(output, "declare i64 @minyar_list_get(ptr, i64)\n")
@@ -3032,18 +3307,15 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     if topLevelStatements && mainFunction >= 0 {
         fail(describeLocation(symbolLocations[mainFunction]) + ": a program cannot combine top-level statements with function main()")
     }
-    compileFunctions(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, output, stackOwnerLimit)
+    compileFunctions(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, output, globals, stackOwnerLimit)
     if mainFunction < 0 {
-        compileTopLevel(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, output)
+        compileTopLevel(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, output, globals)
     }
     if stackOwnerLimit > 0 {
-        if findIndexedSymbol(symbolLookup, functionNames, symbolKinds, "minyar_rc_enter_stack_v1", 1) >= 0 || findIndexedSymbol(symbolLookup, functionNames, symbolKinds, "minyar_rc_leave_stack_v1", 1) >= 0 {
-            fail("function name is reserved by the bounded ownership runtime")
-        }
         addOutput(output, "declare void @minyar_rc_enter_stack_v1(ptr, ptr, i64)\n")
         addOutput(output, "declare void @minyar_rc_leave_stack_v1(ptr)\n")
     }
-    return joinText(output)
+    return joinText(globals) + joinText(output)
 }
 
 function compileProgram(source: Text): Text {

@@ -7,7 +7,7 @@ from regressions import CLANG, ROOT, CompilerTestCase
 
 
 def body_of(llvm, name):
-    match = re.search(r'^define\b[^\n]*@' + re.escape(name) + r'\([^\n]*\)[^{]*\{(.*?)^}', llvm, re.M | re.S)
+    match = re.search(r'^define\b[^\n]*@\.minyar\.user\.' + re.escape(name) + r'\([^\n]*\)[^{]*\{(.*?)^}', llvm, re.M | re.S)
     if not match:
         raise AssertionError(f'missing function {name}')
     return match[1]

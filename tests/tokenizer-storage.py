@@ -56,10 +56,15 @@ cases.append(('composed',' '.join('"'+raw+'"' for raw in composed)))
 for name,text in cases:(D/(name+'.min')).write_text(text)
 llvm=D/'compiler.ll';must([compiler,source,llvm]);ir=llvm.read_text()
 ir,n=re.subn(r'^define i32 @main\(','define i32 @compiler_main(',ir,flags=re.M);assert n==1
-match=re.search(r'^define void @tokenize\([^\n]*\) \{\n.*?^\}',ir,re.M|re.S);assert match
+match=re.search(r'^define void @\.minyar\.user\.tokenize\([^\n]*\) \{\n.*?^\}',ir,re.M|re.S);assert match
 body=match.group();assert body.count('call ptr @minyar_list_new()')==1
 body=body.replace('call ptr @minyar_list_new()','call ptr @probe_tokenizer_list()')
-ir=ir[:match.start()]+body+ir[match.end():]+'\ndeclare ptr @probe_tokenizer_list()\n';llvm.write_text(ir)
+# This probe intentionally exposes one compiler function to its C fixture.
+# An LLVM alias preserves the portable C ABI while user source names remain
+# separate from runtime and system linker symbols.
+ir=ir[:match.start()]+body+ir[match.end():]+'\ndeclare ptr @probe_tokenizer_list()\n'
+ir+='@tokenize = alias void (ptr, ptr, ptr, ptr), ptr @.minyar.user.tokenize\n'
+llvm.write_text(ir)
 san=D/'sanitized.ll';must(['python3',ROOT/'tests/llvm_sanitizer.py',llvm,san])
 checks=0
 for profile,extra in [('eager',[]),('system',['-DMINYAR_SYSTEM_HEAP=1'])]:

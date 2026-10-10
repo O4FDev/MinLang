@@ -49,14 +49,30 @@ def compile_once() -> subprocess.CompletedProcess[str]:
     return subprocess.run([str(COMPILER), str(SOURCE), str(OUTPUT)], text=True, capture_output=True)
 
 
+def validate_compile_output(result: subprocess.CompletedProcess[str], expected: bytes,
+                            phase: str = "self-compile") -> None:
+    if result.returncode != 0:
+        raise SystemExit(f"{phase} failed with status {result.returncode}:\n{result.stderr}")
+    if not OUTPUT.is_file():
+        raise SystemExit(f"{phase} produced no LLVM output")
+    if OUTPUT.read_bytes() != expected:
+        raise SystemExit(f"{phase} output differs from the fixed-point compiler")
+
+
 def retired_instructions() -> int | None:
     """Ask /usr/bin/time -l for the retired instruction count (macOS only)."""
     if sys.platform != "darwin" or not Path("/usr/bin/time").exists():
         return None
+    if not REFERENCE.is_file():
+        raise SystemExit("profiled self-compile requires the fixed-point compiler reference")
+    expected = REFERENCE.read_bytes()
     best = None
     for _ in range(5):
+        # A stale valid file must not disguise a failed/no-output invocation.
+        OUTPUT.unlink(missing_ok=True)
         result = subprocess.run(["/usr/bin/time", "-l", str(COMPILER), str(SOURCE), str(OUTPUT)],
                                 text=True, capture_output=True)
+        validate_compile_output(result, expected, "profiled self-compile")
         match = re.search(r"(\d+)\s+instructions retired", result.stderr)
         if not match:
             return None
@@ -69,11 +85,12 @@ def main() -> None:
     if not COMPILER.exists():
         raise SystemExit(f"build {COMPILER.relative_to(ROOT)} first (make build/minyarc)")
 
+    if not REFERENCE.is_file():
+        raise SystemExit("self-compile requires the fixed-point compiler reference")
+    expected = REFERENCE.read_bytes()
+    OUTPUT.unlink(missing_ok=True)
     warm_up = compile_once()
-    if warm_up.returncode != 0:
-        raise SystemExit(f"self-compile failed:\n{warm_up.stderr}")
-    if REFERENCE.exists() and OUTPUT.read_bytes() != REFERENCE.read_bytes():
-        raise SystemExit("self-compile output differs from the fixed-point compiler")
+    validate_compile_output(warm_up, expected)
 
     wall_p90 = float("inf")
     cpu_p90: float | None = float("inf") if resource else None
@@ -81,15 +98,18 @@ def main() -> None:
         walls: list[float] = []
         cpus: list[float] = []
         for _ in range(RUNS):
+            # Cleanup and correctness I/O stay outside the measured interval.
+            OUTPUT.unlink(missing_ok=True)
             before = resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None
             started = time.perf_counter()
             result = compile_once()
-            walls.append((time.perf_counter() - started) * 1000)
+            elapsed_ms = (time.perf_counter() - started) * 1000
             if before:
                 after = resource.getrusage(resource.RUSAGE_CHILDREN)
+            validate_compile_output(result, expected)
+            walls.append(elapsed_ms)
+            if before:
                 cpus.append(((after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)) * 1000)
-            if result.returncode != 0:
-                raise SystemExit(f"self-compile failed:\n{result.stderr}")
         wall_p90 = min(wall_p90, percentile(walls, 0.9))
         if cpu_p90 is not None:
             cpu_p90 = min(cpu_p90, percentile(cpus, 0.9))

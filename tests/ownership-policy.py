@@ -65,20 +65,20 @@ class OwnershipPolicy(unittest.TestCase):
 
     def selected(self, llvm, budget, modules=False):
         pattern = (r'^define .*? @"minyar.module\|(owners\d+)\|[^\n]+ noinline \{'
-                   if modules else r'^define .*? @(owners\d+)\([^\n]*\) noinline \{')
+                   if modules else r'^define .*? @\.minyar\.user\.(owners\d+)\([^\n]*\) noinline \{')
         actual = set(re.findall(pattern, llvm.read_text(), re.M))
         limit = 0 if budget is None else min(8, int(budget) - 1)
         self.assertEqual(actual, {f'owners{n}' for n in range(1, limit + 1)})
         for function in actual:
             body_pattern = (r'^define [^\n]* @"minyar.module\|' + function + r'\|[^\n]+ noinline \{\n.*?^\}'
-                            if modules else r'^define [^\n]* @' + function + r'\([^\n]*\) noinline \{\n.*?^\}')
+                            if modules else r'^define [^\n]* @\.minyar\.user\.' + function + r'\([^\n]*\) noinline \{\n.*?^\}')
             body = re.search(body_pattern, llvm.read_text(), re.M | re.S)
             self.assertIsNotNone(body)
             self.assertEqual(body.group(0).count('call void @minyar_stack_enter()'), 1)
             self.assertEqual(body.group(0).count('call void @minyar_rc_enter_stack_v1('), 1)
             self.assertNotIn('call void @minyar_rc_enter(i64', body.group(0),
                              'stack ownership must replace, not duplicate, the heap frame')
-        caller_name = r'@"minyar.module\|caller\|[^"\n]+"' if modules else r'@caller'
+        caller_name = r'@"minyar.module\|caller\|[^"\n]+"' if modules else r'@\.minyar\.user\.caller'
         caller = re.search(r'^define [^\n]* ' + caller_name +
                            r'\([^\n]*\)[^\n]*\{\n.*?^\}', llvm.read_text(), re.M | re.S)
         self.assertIsNotNone(caller, 'calling fixture must be emitted')
@@ -133,12 +133,56 @@ print(scalar(3))
         llvm = self.work / 'loop-service.ll'
         self.run_tool([COMPILER, source, llvm])
         generated = llvm.read_text()
-        owned = re.search(r'^define [^\n]* @owned\([^\n]*\)[^\n]*\{\n.*?^\}', generated, re.M | re.S)
-        scalar = re.search(r'^define [^\n]* @scalar\([^\n]*\)[^\n]*\{\n.*?^\}', generated, re.M | re.S)
+        owned = re.search(r'^define [^\n]* @\.minyar\.user\.owned\([^\n]*\)[^\n]*\{\n.*?^\}', generated, re.M | re.S)
+        scalar = re.search(r'^define [^\n]* @\.minyar\.user\.scalar\([^\n]*\)[^\n]*\{\n.*?^\}', generated, re.M | re.S)
         self.assertIsNotNone(owned)
         self.assertIsNotNone(scalar)
         self.assertIn('@minyar_rc_step()', owned.group(0))
         self.assertNotIn('@minyar_rc_step()', scalar.group(0))
+
+    def test_source_runtime_names_keep_bounded_ownership_calls_separate(self):
+        definitions = '''function minyar_rc_enter_stack_v1(seed: Integer): Text {
+let value = Text(seed) + "enter"
+return value
+}
+function minyar_rc_leave_stack_v1(seed: Integer): List<Integer> {
+let values = [seed, seed + 1]
+return values
+}
+'''
+        body = '''function work(seed: Integer): Text {
+let text = PREFIXminyar_rc_enter_stack_v1(seed)
+let values = PREFIXminyar_rc_leave_stack_v1(seed)
+return text + " " + Text(values[1])
+}
+print(work(41))
+'''
+        for modules in (False, True):
+            with self.subTest(modules=modules):
+                directory = self.work / ('runtime-names-module' if modules else 'runtime-names-ordinary')
+                directory.mkdir()
+                source = directory / 'main.min'
+                if modules:
+                    (directory / 'helpers.min').write_text(definitions.replace('function ', 'public function '))
+                    source.write_text('use "./helpers.min" as helpers\n' + body.replace('PREFIX', 'helpers.'))
+                else:
+                    source.write_text(definitions + body.replace('PREFIX', ''))
+                llvm = source.with_suffix('.ll')
+                if modules:
+                    empty = directory / 'empty'
+                    empty.write_text('')
+                    self.run_tool([MODULE_COMPILER, source, llvm, '--module-state', empty,
+                                   directory / 'state', directory / 'stats', '--bounded-owners', '9'])
+                else:
+                    self.run_tool([COMPILER, source, llvm, '--bounded-owners', '9'])
+                generated = llvm.read_text()
+                for name in ('minyar_rc_enter_stack_v1', 'minyar_rc_leave_stack_v1'):
+                    user_name = (r'@"minyar\.module\|' + name + r'\|[^"\n]+"'
+                                 if modules else r'@\.minyar\.user\.' + name)
+                    self.assertRegex(generated, r'define [^\n]* ' + user_name + r'\(')
+                    self.assertRegex(generated, r'call [^\n]* ' + user_name + r'\(')
+                    self.assertIn('call void @' + name + '(', generated)
+                self.native(llvm, '9', '41enter 42\n')
 
     def test_module_policy_transitions_and_native_output(self):
         directory = self.work / 'policy'

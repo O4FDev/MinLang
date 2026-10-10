@@ -9,7 +9,7 @@ class ProductionScalarStorage(CompilerTestCase):
     def function_body(self, source, name):
         result, llvm = self.compile(source)
         self.assertEqual(result.returncode, 0, result.stderr)
-        match = re.search(r'^define[^\n]*@' + name + r'\([^\n]*\)[^{]*\{(.*?)^}',
+        match = re.search(r'^define[^\n]*@\.minyar\.user\.' + name + r'\([^\n]*\)[^{]*\{(.*?)^}',
                           llvm.read_text(), re.M | re.S)
         self.assertIsNotNone(match)
         return match[1]

@@ -1,0 +1,3 @@
+# Discovery status
+
+Source discovery remains incomplete. Expanded candidate inventory includes Lib/idlelib (README fully read: automated idle_test discovery plus embedded human _htest hooks), all Platforms (Android/Apple testbeds and Emscripten browser Playwright suite), Lib/unittest helper sources, PCbuild test targets, Doc/includes and65additional Lib files matched for doctest/manual _test bodies. Those65 matches are discovery candidates, not reviewed tests. Lib/doctest and remaining documentation executable examples still require source-level discovery. Parsing source/AST to identify spans does not count as reading cases. Lib/test/test_tokenize.py now fullyread3867lines; fixture files referenced bythat suite remain separatelypending.

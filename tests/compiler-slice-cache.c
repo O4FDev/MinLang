@@ -3,7 +3,37 @@
 #include "../runtime/minyar_runtime.c"
 #include <assert.h>
 
+_Static_assert(sizeof(MinyarText) == 32, "compiler arena Text contains only its used prefix");
+_Static_assert(offsetof(MinyarText, bytes) == 0, "LLVM Text byte pointer offset");
+_Static_assert(offsetof(MinyarText, byte_length) == 8, "LLVM Text byte length offset");
+_Static_assert(offsetof(MinyarText, character_length) == 16, "LLVM Text scalar count offset");
+_Static_assert(offsetof(MinyarText, character_offsets) == 24, "LLVM Text index offset");
+extern MinyarText *fixture_ascii_literal(void);
+extern MinyarText *fixture_unicode_literal(void);
+static void literal_prefix_contract(void) {
+    /* These pointers come from full, unchanged 40-byte headers in LLVM, not
+     * C objects whose layout would shrink along with MinyarText. */
+    MinyarText *ascii = fixture_ascii_literal();
+    assert(ascii->byte_length == 3 && minyar_text_length(ascii) == 3);
+    assert(minyar_text_character_at(ascii, 1) == 'a');
+    MinyarText *unicode = fixture_unicode_literal();
+    assert(unicode->byte_length == 8 && unicode->character_length == -1);
+    assert(minyar_text_length(unicode) == 4);
+    assert(minyar_text_character_at(unicode, 2) == 0x1f642);
+    MinyarText *middle = minyar_text_slice(unicode, 1, 3);
+    assert(middle->byte_length == 6 && minyar_text_length(middle) == 2);
+    assert(!memcmp(middle->bytes, "\303\251\360\237\231\202", 6));
+    MinyarText *joined = minyar_join_text(middle, minyar_character_text('!'));
+    assert(joined->byte_length == 7 && !memcmp(joined->bytes, "\303\251\360\237\231\202!", 7));
+    /* The known full LLVM header's unused trailing word remains untouched. */
+    void *unused;
+    memcpy(&unused, (const unsigned char *)unicode + 32, sizeof unused);
+    assert(unused == NULL && minyar_text_character_at(unicode, 3) == 'z');
+}
+
+
 int main(void) {
+    literal_prefix_contract();
     MinyarText *first = copy_c_text("left identifier right");
     MinyarText *second = copy_c_text("identifier");
     MinyarText *a = minyar_text_slice(first, 5, 15);
@@ -40,7 +70,8 @@ int main(void) {
     assert(joined->byte_length == 8 && !memcmp(joined->bytes, "catapult", 8));
     assert(slice->byte_length == 3 && !memcmp(slice->bytes, "cat", 3));
     /* Force an in-place join while a cached slice still denotes its prefix. */
-    MinyarText suffix = {(const unsigned char *)"matic", 5, 5, NULL, NULL};
+    MinyarText suffix = {.bytes = (const unsigned char *)"matic", .byte_length = 5,
+                         .character_length = 5};
     MinyarText *dog = copy_c_text("dog");
     MinyarText *prefix = minyar_text_slice(dog, 0, 3);
     MinyarText *extended = minyar_join_text(prefix, &suffix);

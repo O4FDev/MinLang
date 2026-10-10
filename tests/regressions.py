@@ -5,12 +5,14 @@ Run against either compiler with MINYAR_TEST_COMPILER; native cases run at O0 an
 O2 so backend optimization cannot conceal a frontend/runtime disagreement.
 """
 import os
+import hashlib
+import inspect
 import shlex
 from pathlib import Path
 import subprocess
-import tempfile
 import unittest
 from llvm_sanitizer import prepare_llvm_for_link
+from test_evidence import Evidence
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPILER = Path(os.environ.get('MINYAR_TEST_COMPILER', ROOT / 'build/minyarc')).resolve()
@@ -26,17 +28,24 @@ RUN_TIMEOUT = 30 if LINK_FLAGS else 10
 
 class CompilerTestCase(unittest.TestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory(prefix='minyar-regression-')
-        self.addCleanup(self.directory.cleanup)
-        self.directory = Path(self.directory.name)
+        self.evidence = Evidence('regression', inputs=(COMPILER, RUNTIME, __file__, inspect.getsourcefile(type(self)) or __file__),
+                                 controls={'test': self.id(), 'link_flags': LINK_FLAGS})
+        self.directory = self.evidence.path
+        self.addCleanup(self.close_evidence)
         self.serial = 0
+
+    def close_evidence(self):
+        result = self._outcome.result
+        failed = any(test.id() == self.id() or test.id().startswith(self.id() + ' ')
+                     for test, _ in result.failures + result.errors)
+        self.evidence.close(failed=failed)
 
     def compile(self, source):
         self.serial += 1
         path = self.directory / f'case{self.serial}.min'
         path.write_text(source, encoding='utf-8')
         llvm = path.with_suffix('.ll')
-        result = subprocess.run([str(COMPILER), str(path), str(llvm)], capture_output=True, text=True, timeout=COMPILE_TIMEOUT)
+        result = self.evidence.run([str(COMPILER), str(path), str(llvm)], capture_output=True, text=True, timeout=COMPILE_TIMEOUT, phase='compile')
         if result.returncode == 0:
             prepare_llvm_for_link(llvm, LINK_FLAGS)
         return result, llvm
@@ -44,21 +53,34 @@ class CompilerTestCase(unittest.TestCase):
     def rejects(self, source, diagnostic):
         result, llvm = self.compile(source)
         self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertFalse(result.stdout, 'rejected source unexpectedly wrote standard output')
         self.assertIn(diagnostic, result.stderr)
         self.assertFalse(llvm.exists(), 'invalid source left LLVM output behind')
         self.assertNotIn('List position', result.stderr)
 
-    def executes(self, source, expected, status=0):
+    def executes(self, source, expected, status=0, stderr='', optimizations=('-O0', '-O2'), arguments=(), file_outputs=()):
+        file_outputs = tuple(file_outputs)
+        self.evidence.controls.setdefault('execution_oracles', []).append({
+            'source': f'case{self.serial + 1}.min', 'stdout': expected,
+            'stderr': stderr, 'status': status, 'optimizations': list(optimizations), 'arguments': list(arguments),
+            'file_outputs': [{'path': str(path), 'bytes': len(contents), 'sha256': hashlib.sha256(contents).hexdigest()} for path, contents in file_outputs],
+        })
         result, llvm = self.compile(source)
         self.assertEqual(result.returncode, 0, result.stderr)
-        for optimization in ('-O0', '-O2'):
+        for optimization in optimizations:
             with self.subTest(optimization=optimization):
                 exe = llvm.with_suffix('.' + optimization[1:])
-                link = subprocess.run([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], capture_output=True, text=True, timeout=30)
+                link = self.evidence.run([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], capture_output=True, text=True, timeout=30, phase='link')
                 self.assertEqual(link.returncode, 0, link.stderr)
-                run = subprocess.run([str(exe)], capture_output=True, timeout=RUN_TIMEOUT)
+                for path, _ in file_outputs:
+                    Path(path).unlink(missing_ok=True)
+                run = self.evidence.run([str(exe), *arguments], capture_output=True, timeout=RUN_TIMEOUT, phase='execute')
                 self.assertEqual(run.returncode, status, run.stderr)
                 self.assertEqual(run.stdout, expected.encode('utf-8'))
+                self.assertEqual(run.stderr, stderr.encode('utf-8'))
+                for path, contents in file_outputs:
+                    self.assertTrue(Path(path).is_file(), f'program did not create {path}')
+                    self.assertEqual(Path(path).read_bytes(), contents)
         return llvm
 
 class Regressions(CompilerTestCase):
@@ -112,21 +134,53 @@ print(slice(1))
         result, llvm = self.compile('let text = readTextFile(argument(0))\nprint(text.length)\n')
         self.assertEqual(result.returncode, 0, result.stderr)
         exe = llvm.with_suffix('.exe')
-        subprocess.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], check=True, capture_output=True, timeout=30)
+        self.evidence.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], check=True, capture_output=True, timeout=30)
         for encoded in (b'\xc0\xaf', b'\xed\xa0\x80', b'\xf4\x90\x80\x80', b'\xe2\x82'):
             with self.subTest(encoded=encoded):
                 path = self.directory / 'invalid-utf8.txt'
                 path.write_bytes(encoded)
-                run = subprocess.run([str(exe), str(path)], capture_output=True, timeout=RUN_TIMEOUT)
+                run = self.evidence.run([str(exe), str(path)], capture_output=True, timeout=RUN_TIMEOUT)
                 self.assertEqual(run.returncode, 1)
                 self.assertIn(b'invalid UTF-8', run.stderr)
+
+    def test_ascii_index_and_slice_validate_invalid_utf8_tail_first(self):
+        # The requested ASCII block is valid; malformed bytes are later in
+        # the same Text. Lazy indexing must validate the entire value first.
+        prefixes = ('a' * 128, '\ufeff' + 'a' * 128, 'é' + 'a' * 127)
+        tails = (b'\xff', b'\xe2\x82', b'\xed\xa0\x80', b'\xc0\xaf')
+        operations = (('text[0]', lambda value: value[0]),
+                      ('text[65]', lambda value: value[65]),
+                      ('text.slice(64, 128)', lambda value: value[64:128]))
+        path = self.directory / 'indexed-tail.txt'
+        for expression, oracle in operations:
+            source = 'let text = readTextFile(argument(0))\nprint(' + expression + ')\nprint("after")\n'
+            result, llvm = self.compile(source)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for optimization in ('-O0', '-O2'):
+                exe = llvm.with_suffix('.' + optimization[1:])
+                self.evidence.run([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module',
+                                   llvm, RUNTIME, '-o', exe], check=True, timeout=30, phase='link')
+                for prefix in prefixes:
+                    valid = prefix + '🙂'
+                    path.write_bytes(valid.encode('utf-8'))
+                    observed = self.evidence.run([exe, path], timeout=RUN_TIMEOUT, phase='execute-valid-tail')
+                    self.assertEqual((observed.returncode, observed.stdout, observed.stderr),
+                                     (0, (oracle(valid) + '\nafter\n').encode('utf-8'), b''))
+                    for tail in tails:
+                        with self.subTest(expression=expression, optimization=optimization,
+                                          prefix=prefix[:2], tail=tail):
+                            path.write_bytes(prefix.encode('utf-8') + tail)
+                            observed = self.evidence.run([exe, path], timeout=RUN_TIMEOUT,
+                                                         phase='execute-invalid-tail')
+                            self.assertEqual((observed.returncode, observed.stdout, observed.stderr),
+                                             (1, b'', b'Minyar stopped: Text contained invalid UTF-8.\n'))
 
     def test_file_io_failures_stop_cleanly(self):
         read_result, read_llvm = self.compile('print(readTextFile(argument(0)))\n')
         self.assertEqual(read_result.returncode, 0, read_result.stderr)
         read_exe = read_llvm.with_suffix('.read')
-        subprocess.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(read_llvm), str(RUNTIME), '-o', str(read_exe)], check=True, capture_output=True, timeout=30)
-        read_directory = subprocess.run([str(read_exe), str(self.directory)], capture_output=True, timeout=RUN_TIMEOUT)
+        self.evidence.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(read_llvm), str(RUNTIME), '-o', str(read_exe)], check=True, capture_output=True, timeout=30)
+        read_directory = self.evidence.run([str(read_exe), str(self.directory)], capture_output=True, timeout=RUN_TIMEOUT)
         self.assertEqual(read_directory.returncode, 1)
         self.assertTrue(
             b'could not be read' in read_directory.stderr or b'could not be opened' in read_directory.stderr,
@@ -136,12 +190,12 @@ print(slice(1))
         write_result, write_llvm = self.compile('writeTextFile(argument(0), "contents")\n')
         self.assertEqual(write_result.returncode, 0, write_result.stderr)
         write_exe = write_llvm.with_suffix('.write')
-        subprocess.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(write_llvm), str(RUNTIME), '-o', str(write_exe)], check=True, capture_output=True, timeout=30)
-        write_directory = subprocess.run([str(write_exe), str(self.directory)], capture_output=True, timeout=RUN_TIMEOUT)
+        self.evidence.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(write_llvm), str(RUNTIME), '-o', str(write_exe)], check=True, capture_output=True, timeout=30)
+        write_directory = self.evidence.run([str(write_exe), str(self.directory)], capture_output=True, timeout=RUN_TIMEOUT)
         self.assertEqual(write_directory.returncode, 1)
         self.assertIn(b'could not be created', write_directory.stderr)
         missing_parent = self.directory / 'missing' / 'output.txt'
-        write_missing = subprocess.run([str(write_exe), str(missing_parent)], capture_output=True, timeout=RUN_TIMEOUT)
+        write_missing = self.evidence.run([str(write_exe), str(missing_parent)], capture_output=True, timeout=RUN_TIMEOUT)
         self.assertEqual(write_missing.returncode, 1)
         self.assertIn(b'could not be created', write_missing.stderr)
 
@@ -149,12 +203,12 @@ print(slice(1))
         result, llvm = self.compile('print(readTextFile(argument(0)))\n')
         self.assertEqual(result.returncode, 0, result.stderr)
         exe = llvm.with_suffix('.exe')
-        subprocess.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], check=True, capture_output=True, timeout=30)
+        self.evidence.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], check=True, capture_output=True, timeout=30)
         path = self.directory / 'contents.txt'
         for contents in (b'', b'A', 'é🙂'.encode('utf-8'), b'first\r\nsecond\n'):
             with self.subTest(contents=contents):
                 path.write_bytes(contents)
-                run = subprocess.run([str(exe), str(path)], capture_output=True, timeout=RUN_TIMEOUT)
+                run = self.evidence.run([str(exe), str(path)], capture_output=True, timeout=RUN_TIMEOUT)
                 self.assertEqual(run.returncode, 0, run.stderr)
                 self.assertEqual(run.stdout, contents + b'\n')
 
@@ -163,9 +217,10 @@ print(slice(1))
         result, llvm = self.compile('print("unwritten")\n')
         self.assertEqual(result.returncode, 0, result.stderr)
         exe = llvm.with_suffix('.closed-output')
-        subprocess.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], check=True, capture_output=True, timeout=30)
-        executed = subprocess.run(
+        self.evidence.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], check=True, capture_output=True, timeout=30)
+        executed = self.evidence.run(
             [str(exe)],
+            capture_output=False,
             stdout=None,
             stderr=subprocess.PIPE,
             preexec_fn=lambda: os.close(1),
@@ -181,7 +236,9 @@ print(slice(1))
                 self.rejects(f'print({literal})\n', 'Integer literal is outside the supported range')
 
     def test_missing_return(self):
-        for body in ('', 'if flag { return 42 }', 'while flag { return 42 }'):
+        self.rejects('function value(): Integer { return }\n', 'a returned value has the wrong type')
+        for body in ('', 'if flag { return 42 }', 'while flag { return 42 }',
+                     'while false { return 42 }'):
             with self.subTest(body=body):
                 self.rejects(f'function value(flag: Boolean): Integer {{\n{body}\n}}\n', 'must return a value on every path')
 
@@ -193,6 +250,29 @@ print(slice(1))
     def test_unreachable_code_preserves_return(self):
         self.executes('function value(): Integer {\nreturn 42\nprint(true || false)\n}\nprint(value())\n', '42\n')
         self.executes('exit(7)\nprint(true && false)\n', '', status=7)
+
+    def test_literal_true_loop_is_terminal(self):
+        self.executes('''function scalar(): Integer {
+while true { return 1 }
+print("unreachable")
+}
+function owned(flag: Boolean): Text {
+let prefix = "retained"
+while (true) {
+if flag { return prefix + " yes" } else { return prefix + " no" }
+}
+}
+function nested(): List<Integer> { while true { while true { return [4, 2] } } }
+function never(): Integer { while true { } }
+print(scalar()); print(owned(true)); print(owned(false))
+let values = nested(); print(values[0]); print(values[1])
+''', '1\nretained yes\nretained no\n4\n2\n')
+        self.executes('function stop(): Integer { while true { exit(7) } }\nprint(stop())\n',
+                      '', status=7)
+        self.executes('function stop(): Integer { while true { fail("loop stopped") } }\nprint(stop())\n',
+                      '', status=1, stderr='Minyar stopped: loop stopped\n')
+        self.rejects('function value(): Integer { while true { return 1 }; print(missing) }\n',
+                     "I can't find a value named 'missing'")
 
     def test_main_signature(self):
         self.rejects('function main(value: Integer) {\nreturn value\n}\n', 'main expects no parameters')
@@ -210,10 +290,10 @@ print(slice(1))
         result, llvm = self.compile(source)
         self.assertEqual(result.returncode, 0, result.stderr)
         exe = llvm.with_suffix('.exe')
-        subprocess.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], check=True, capture_output=True, timeout=30)
+        self.evidence.run([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)], check=True, capture_output=True, timeout=30)
         for argument in ('é🙂', 'é🙂 with spaces', 'é🙂 "quoted" \\end\\'):
             with self.subTest(argument=argument):
-                run = subprocess.run([str(exe), argument, str(path)], capture_output=True, timeout=RUN_TIMEOUT)
+                run = self.evidence.run([str(exe), argument, str(path)], capture_output=True, timeout=RUN_TIMEOUT)
                 self.assertEqual(run.returncode, 0, run.stderr)
                 self.assertEqual(run.stdout, f'{argument}\né\n🙂\n'.encode('utf-8'))
 

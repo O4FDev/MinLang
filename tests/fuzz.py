@@ -9,8 +9,8 @@ import random
 import shlex
 import string
 import subprocess
-import tempfile
 from pathlib import Path
+from test_evidence import Evidence
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -22,8 +22,19 @@ if not RUNTIME.exists():
 LINK_FLAGS = shlex.split(os.environ.get("MINYAR_TEST_LINK_FLAGS", ""))
 
 
+EVIDENCE = None
+
+
 def run(command: list[str], *, timeout: float = 8, cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, cwd=cwd, text=True, capture_output=True, timeout=timeout)
+    runner = EVIDENCE.run if EVIDENCE is not None else subprocess.run
+    return runner(command, cwd=cwd, text=True, capture_output=True, timeout=timeout)
+
+
+def record_oracle(source, expected):
+    if EVIDENCE is not None:
+        EVIDENCE.controls.setdefault('execution_oracles', {})[str(source.relative_to(EVIDENCE.path))] = {
+            'stdout': expected, 'stderr': '', 'status': 0,
+        }
 
 
 def expression(random: random.Random, depth: int = 0) -> tuple[str, int]:
@@ -44,6 +55,7 @@ def check_expression_batch(compiler: Path, clang: str, cases: int, temporary: Pa
     generated = [expression(random) for _ in range(cases)]
     source = temporary / "expressions.min"
     source.write_text("".join(f"print({text})\n" for text, _ in generated), encoding="utf-8")
+    record_oracle(source, "".join(f"{value}\n" for _, value in generated))
     llvm = temporary / "expressions.ll"
     executable = temporary / "expressions"
     compiled = run([str(compiler), str(source), str(llvm)], timeout=max(8, cases / 20))
@@ -57,7 +69,7 @@ def check_expression_batch(compiler: Path, clang: str, cases: int, temporary: Pa
         raise AssertionError(f"generated LLVM was rejected:\n{linked.stderr}")
     executed = run([str(executable)])
     expected = "".join(f"{value}\n" for _, value in generated)
-    if executed.returncode != 0 or executed.stdout != expected:
+    if executed.returncode != 0 or executed.stdout != expected or executed.stderr:
         raise AssertionError("generated arithmetic changed meaning between Minyar and native execution")
 
 
@@ -127,6 +139,7 @@ def check_language_surface(compiler: Path, clang: str, cases: int, temporary: Pa
     if compiled.returncode != 0:
         raise AssertionError(f"valid generated language program failed:\n{compiled.stderr}\n{source.read_text()}")
     expected_text = "\n".join(expected) + "\n"
+    record_oracle(source, expected_text)
     for optimization in ("-O0", "-O2"):
         executable = temporary / f"language-surface-{optimization[2:]}"
         linked = run(
@@ -136,7 +149,7 @@ def check_language_surface(compiler: Path, clang: str, cases: int, temporary: Pa
         if linked.returncode != 0:
             raise AssertionError(f"generated language LLVM was rejected at {optimization}:\n{linked.stderr}")
         executed = run([str(executable)])
-        if executed.returncode != 0 or executed.stdout != expected_text:
+        if executed.returncode != 0 or executed.stdout != expected_text or executed.stderr:
             raise AssertionError(
                 f"generated language program changed meaning at {optimization}:\n{executed.stderr}"
             )
@@ -191,6 +204,7 @@ def check_generated_module_chain(compiler: Path, clang: str, modules: int, tempo
         f'use "./nested/../module{modules - 1}.min" as last\n\nprint(last.value())\n', encoding="utf-8"
     )
     (module_dir / "nested").mkdir()
+    record_oracle(entry, f"{modules}\n")
     first = temporary / "module-chain-first.ll"
     second = temporary / "module-chain-second.ll"
     for output in (first, second):
@@ -207,11 +221,12 @@ def check_generated_module_chain(compiler: Path, clang: str, modules: int, tempo
     if linked.returncode != 0:
         raise AssertionError(f"module-chain LLVM was rejected:\n{linked.stderr}")
     executed = run([str(executable)])
-    if executed.returncode != 0 or executed.stdout != f"{modules}\n":
+    if executed.returncode != 0 or executed.stdout != f"{modules}\n" or executed.stderr:
         raise AssertionError("generated module chain produced the wrong native result")
 
 
 def main() -> None:
+    global EVIDENCE
     parser = argparse.ArgumentParser()
     parser.add_argument("--compiler", type=Path, default=DEFAULT_COMPILER)
     parser.add_argument("--clang", default=os.environ.get("MINYAR_TEST_CLANG", "clang"))
@@ -220,8 +235,12 @@ def main() -> None:
     parser.add_argument("--program-cases", type=int, default=None)
     arguments = parser.parse_args()
     compiler = arguments.compiler.resolve()
-    with tempfile.TemporaryDirectory(prefix="minyar-fuzz-") as directory:
-        temporary = Path(directory)
+    with Evidence("fuzz", inputs=(compiler, RUNTIME),
+                  controls={"arguments": {k: str(v) if isinstance(v, Path) else v for k, v in vars(arguments).items()},
+                            "expression_seed": 0x4D494E594152,
+                            "surface_seed": 0x53555246414345, "hostile_seed": 0xBAD5EED}) as evidence:
+        EVIDENCE = evidence
+        temporary = evidence.path
         remaining = arguments.cases
         batch = 0
         while remaining > 0:

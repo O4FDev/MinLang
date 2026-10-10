@@ -22,6 +22,21 @@ def main():
         for header in runtime.parent.glob('*.h'):
             shutil.copy2(header, directory / 'runtime' / header.name)
         shutil.copy2(ROOT / 'tests/compiler-slice-cache.c', directory / 'tests/compiler-slice-cache.c')
+        literal_ir = directory / 'literal-prefix.ll'
+        # Match the compiler's ownership word plus complete 40-byte Text header.
+        literal_ir.write_text(r"""@ascii_bytes = private constant [4 x i8] c"cat\00"
+@ascii_header = private constant { i64, ptr, i64, i64, ptr, ptr } { i64 0, ptr @ascii_bytes, i64 3, i64 3, ptr null, ptr null }
+@unicode_bytes = private constant [9 x i8] c"a\C3\A9\F0\9F\99\82z\00"
+@unicode_header = private global { i64, ptr, i64, i64, ptr, ptr } { i64 0, ptr @unicode_bytes, i64 8, i64 -1, ptr null, ptr null }
+define ptr @fixture_ascii_literal() {
+  %text = getelementptr { i64, ptr, i64, i64, ptr, ptr }, ptr @ascii_header, i32 0, i32 1
+  ret ptr %text
+}
+define ptr @fixture_unicode_literal() {
+  %text = getelementptr { i64, ptr, i64, i64, ptr, ptr }, ptr @unicode_header, i32 0, i32 1
+  ret ptr %text
+}
+""")
         source = runtime.read_text()
         before = '!memcmp(cached->bytes, bytes, (size_t)length)'
         assert source.count(before) == 1, 'slice-cache collision check changed'
@@ -34,7 +49,8 @@ def main():
                     command = [CLANG, opt, '-Wall', '-Wextra', '-Werror']
                     if sanitized:
                         command += ['-fsanitize=address,undefined']
-                    command += [str(directory / 'tests/compiler-slice-cache.c'), '-o', str(exe)]
+                    command += ['-Wno-override-module', str(directory / 'tests/compiler-slice-cache.c'),
+                                str(literal_ir), '-o', str(exe)]
                     build = subprocess.run(command, text=True, capture_output=True, timeout=30)
                     assert build.returncode == 0, build.stderr
                     result = subprocess.run([str(exe)], env=env, text=True, capture_output=True, timeout=10)
