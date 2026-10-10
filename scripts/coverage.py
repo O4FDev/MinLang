@@ -20,6 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 COMPILER_SUITES = ("diagnostics", "conformance", "regressions", "compiler-hardening", "list-access",
                    "checked-arithmetic", "checked-scalars", "readonly-parameters",
+                   "statement-nesting",
                    "peer-research-semantics", "peer-research-reachability",
                    "peer-memory-nim-koka-lean", "peer-memory-nim-koka-followups")
 

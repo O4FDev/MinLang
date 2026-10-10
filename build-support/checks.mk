@@ -374,6 +374,7 @@ check-coverage-inlining:
 	MINYAR_TEST_CLANG="$${MINYAR_TEST_CLANG:-$(LLVM_CC)}" python3 tests/coverage-inlining.py
 
 check-runtime-bytes:
+	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/runtime-random.py
 	$(LIMITED) python3 tests/runtime-bytes.py --clang "$(LLVM_CC)"
 
 check-runtime-bytes-sanitize:
