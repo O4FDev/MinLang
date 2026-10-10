@@ -6,10 +6,12 @@ checks. Temporary fake tools model refusals at every externally visible phase.
 """
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from clang_helpers import windows_host
 
 SPEC = importlib.util.spec_from_file_location('release', Path(__file__).resolve().parents[1] / 'scripts/release.py')
 release = importlib.util.module_from_spec(SPEC)
@@ -121,10 +123,21 @@ class Shipping(unittest.TestCase):
                 'profile', entitlements=entitlements, run=self.tool)
         outside = self.root / 'external'
         outside.write_bytes(b'external')
-        try:
-            (self.app / 'Contents/escape').symlink_to(outside)
-        except OSError:
-            self.skipTest('creating symlinks requires Windows developer privileges')
+        link = self.app / 'Contents/escape'
+        if windows_host() and os.name != 'nt':
+            # The MSYS runtime defaults to copying the target, which is not a
+            # symlink fixture. A fresh process reads nativestrict at startup:
+            # fail if a real native link cannot be created; never test a copy.
+            environment = os.environ.copy()
+            flags = [flag for flag in environment.get('MSYS', '').split()
+                     if not flag.startswith('winsymlinks')]
+            environment['MSYS'] = ' '.join(flags + ['winsymlinks:nativestrict'])
+            subprocess.run(['ln', '-s', '--', outside, link], check=True, env=environment,
+                           capture_output=True, text=True, timeout=10)
+        else:
+            link.symlink_to(outside)
+        self.assertTrue(link.is_symlink(), 'escaping-link fixture must be a real symlink')
+        self.assertEqual(link.resolve(), outside.resolve())
         with self.assertRaises(ValueError):
             release.macos(self.app, self.out, 'Developer ID Application: Developer (ABC)',
                 'profile', run=self.tool)
