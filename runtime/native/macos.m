@@ -261,8 +261,10 @@ static NSFont *resolveFont(NSString *name, double size, double weight);
 @property(nonatomic, strong) NSColor *color;
 @property(nonatomic) long long lines;
 @end
+@class MNListCell;
 @interface MNList : NSScrollView <NSTableViewDataSource, NSTableViewDelegate>
 @property(nonatomic, strong) NSTableView *table;
+@property(nonatomic, strong) NSMutableArray<MNListCell *> *spareCells;
 @property(nonatomic, strong) NSMutableArray<MNListRow *> *rows;
 @property(nonatomic, copy) NSArray<MNListRow *> *shown;
 @property(nonatomic, strong) NSArray<MNListStyle *> *styles;
@@ -1205,6 +1207,7 @@ static void styleListLabel(NSTextField *label, MNListStyle *style, NSString *tex
 - (NSView *)tableView:(NSTableView *)table viewForTableColumn:(NSTableColumn *)column row:(NSInteger)row {
     (void)column;
     MNListCell *cell = [table makeViewWithIdentifier:@"MNListCell" owner:self];
+    if (!cell && self.spareCells.count) { cell = self.spareCells.lastObject; [self.spareCells removeLastObject]; }
     if (!cell) {
         cell = [MNListCell new]; cell.identifier = @"MNListCell";
         cell.top = listLabel(); cell.middle = listLabel(); cell.bottom = listLabel();
@@ -1264,8 +1267,19 @@ static void styleListLabel(NSTextField *label, MNListStyle *style, NSString *tex
     if (!pendingLists) pendingLists = [NSMutableSet new];
     [pendingLists addObject:self];
 }
+/* reloadData drops the cells on screen instead of queueing them for reuse,
+ * so a list refilled on every keystroke would build each visible row again.
+ * Take those cells out of their rows and hand them back when the table asks
+ * for new ones; every request configures a cell completely. */
 - (void)reload {
     self.shown = [self.rows copy];
+    NSMutableArray *cells = [NSMutableArray new];
+    [self.table enumerateAvailableRowViewsUsingBlock:^(NSTableRowView *rowView, NSInteger row) {
+        (void)row;
+        NSView *cell = rowView.numberOfColumns ? [rowView viewAtColumn:0] : nil;
+        if ([cell isKindOfClass:MNListCell.class]) { [cell removeFromSuperview]; [cells addObject:cell]; }
+    }];
+    self.spareCells = cells;
     [self.table reloadData];
 }
 /* clear ends the rows, and with them any clicks on them still queued. */

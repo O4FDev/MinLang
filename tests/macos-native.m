@@ -133,6 +133,30 @@ static void verifyList(void) {
     drain();
     cell = [table viewAtColumn:0 row:0 makeIfNecessary:YES];
     assert(cell.button.hidden && !cell.buttonEdge.active && cell.textEdge.active);
+    // Refilling a list reuses the cells on screen, as a search does on every
+    // keystroke; reloadData alone would build each of them again.
+    minyar_macos_rowButton(l,&trash,&remove,color);
+    minyar_macos_clear(l);
+    for (int i = 0; i < 50; ++i) minyar_macos_addRow(l,&date,&prompt,&preview);
+    drain(); [table.window displayIfNeeded];
+    NSMutableSet *before = [NSMutableSet new];
+    [table enumerateAvailableRowViewsUsingBlock:^(NSTableRowView *view, NSInteger row) { (void)row; [before addObject:[view viewAtColumn:0]]; }];
+    minyar_macos_clear(l);
+    for (int i = 0; i < 40; ++i) minyar_macos_addRow(l,&preview,&date,i == 2 ? &empty : &prompt);
+    drain(); [table.window displayIfNeeded];
+    __block NSInteger shown = 0, reused = 0;
+    [table enumerateAvailableRowViewsUsingBlock:^(NSTableRowView *view, NSInteger row) {
+        MNListCell *c = [view viewAtColumn:0];
+        ++shown; if ([before containsObject:c]) ++reused;
+        assert(c.superview == view && [c.top.stringValue isEqualToString:@"Chile"] && [c.middle.stringValue isEqualToString:@"10 Oct"]);
+        assert(c.bottom.hidden == (row == 2) && !c.button.hidden);
+    }];
+    assert(shown > 0 && reused == shown);
+    // A reused row's button reports its new row.
+    cell = [table viewAtColumn:0 row:1 makeIfNecessary:NO];
+    assert([before containsObject:cell]);
+    [cell.button performClick:nil];
+    assert(receive(MNAction,l)); assert(minyar_macos_clickedRow(l) == 1 && minyar_macos_clickedButton(l));
     table = nil; cell = nil; other = nil;
     minyar_macos_destroy(w);
 }
