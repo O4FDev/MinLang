@@ -2428,15 +2428,18 @@ function parseBytesMethod(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
     return emitCall(output, textState, state, returnType, callee, values, types)
 }
 
-// Whether the tokens at `position` are `[ ... ]` with no call inside, so
-// evaluating the position cannot run code that replaces the indexed value.
+// Whether the token at `cursor` is a name followed by `(`: a call.
+function callAt(tokenKinds: List<Integer>, tokenTexts: List<Text>, cursor: Integer): Boolean {
+    return tokenKinds[cursor] == 1 && tokenKinds[cursor + 1] == 4 && tokenTexts[cursor + 1] == "("
+}
+
 // Whether the tokens from `position` to the end of the statement make no call.
 // The tokenizer ends a statement only outside brackets and after a complete
 // line, so the scan cannot stop inside a multi-line expression.
 function statementWithoutCalls(tokenKinds: List<Integer>, tokenTexts: List<Text>, position: Integer): Boolean {
     let cursor = position
     while tokenKinds[cursor] != 0 && tokenKinds[cursor] != 6 {
-        if tokenKinds[cursor] == 1 && tokenKinds[cursor + 1] == 4 && tokenTexts[cursor + 1] == "(" {
+        if callAt(tokenKinds, tokenTexts, cursor) {
             return false
         }
         cursor = cursor + 1
@@ -2444,6 +2447,8 @@ function statementWithoutCalls(tokenKinds: List<Integer>, tokenTexts: List<Text>
     return true
 }
 
+// Whether the tokens at `position` are `[ ... ]` with no call inside, so
+// evaluating the position cannot run code that replaces the indexed value.
 function indexWithoutCalls(tokenKinds: List<Integer>, tokenTexts: List<Text>, position: Integer): Boolean {
     if tokenKinds[position] != 4 || tokenTexts[position] != "[" {
         return false
@@ -2451,7 +2456,7 @@ function indexWithoutCalls(tokenKinds: List<Integer>, tokenTexts: List<Text>, po
     let depth = 0
     let cursor = position
     while tokenKinds[cursor] != 0 {
-        if tokenKinds[cursor] == 1 && tokenKinds[cursor + 1] == 4 && tokenTexts[cursor + 1] == "(" {
+        if callAt(tokenKinds, tokenTexts, cursor) {
             return false
         }
         if tokenKinds[cursor] == 4 {
@@ -3790,6 +3795,7 @@ function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                                         output.add(value)
                                         output.add(" = ")
                                     }
+                                    state[14] = state[14] + 1
                                     output.add("call ")
                                     output.add(llvmType(returnType))
                                     if name == "main" || name[0] == '"' {
@@ -3980,8 +3986,8 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
     if operator != "=" {
         binary = operator.slice(0, 1)
     }
-    let name = tokenTexts[state[0]]
-    let nameKind = tokenKinds[state[0]]
+    let start = state[0]
+    let name = tokenTexts[start]
     let local = findLocal(localNames, localLengths, state, name)
     if local < 0 {
         fail(describeLocation(tokenLocation(tokenLines, state[0])) + ": I can't find a value named '" + name + "'")
@@ -3991,7 +3997,6 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
     state[0] = state[0] + 1
     let valueType: List<Integer> = []
     valueType.add(0)
-    let depth = 0
     if state[0] == operatorPosition {
         state[0] = operatorPosition + 1
         let value = assignedValue(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, binary, receiver, receiverType, valueType, operatorLocation)
@@ -4022,7 +4027,7 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
                 state[0] = operatorPosition + 1
                 // `name.field = name.field + more` appends, exactly like `+=`.
                 let next = state[0]
-                if binary == "" && fieldType == 2 && depth == 0 && tokenKinds[next] == nameKind && tokenTexts[next] == name && tokenTexts[next + 1] == "." && tokenTexts[next + 2] == member && tokenTexts[next + 3] == "+" {
+                if binary == "" && fieldType == 2 && operatorPosition == start + 3 && tokenKinds[next] == 1 && tokenTexts[next] == name && tokenTexts[next + 1] == "." && tokenTexts[next + 2] == member && tokenTexts[next + 3] == "+" {
                     binary = "+"
                     state[0] = next + 4
                 }
@@ -4096,7 +4101,6 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
                 if !(tokenTexts[state[0]] == "[" && statementWithoutCalls(tokenKinds, tokenTexts, state[0])) {
                     borrowReference(output, state, receiver, receiverType)
                 }
-                depth = depth + 1
             }
         } else {
             let bracketLocation = state[0]
@@ -4164,7 +4168,6 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
                 receiver = readListElement(output, textState, state, receiver, position, elementType)
                 receiverType = elementType
                 borrowReference(output, state, receiver, receiverType)
-                depth = depth + 1
             }
         }
     }
@@ -4699,16 +4702,12 @@ function finishParallelFunction(output: List<Text>, globals: List<Text>, entrySl
     if references {
         fail("parallel function '" + readableDeclarationName(name) + "' may use only Integer, Float, Boolean and Character values")
     }
-    let entry = output[entrySlot]
-    let enter = "  call void @minyar_stack_enter()\n"
-    if entry.length >= enter.length && entry.slice(0, enter.length) == enter {
-        output[entrySlot] = entry.slice(enter.length, entry.length)
-    }
+    dropCallDepthFrame(output, entrySlot, bodySlot)
     let body: List<Text> = []
     let piece = bodySlot
     while piece < output.length {
         let text = output[piece]
-        if text == "  call void @minyar_stack_leave()\n" || text == "  call void @minyar_rc_leave()\n" || text == "  call void @minyar_rc_step()\n" {
+        if text == "  call void @minyar_rc_leave()\n" || text == "  call void @minyar_rc_step()\n" {
             output[piece] = ""
         } else {
             body.add(text)
@@ -4736,20 +4735,13 @@ function finishParallelFunction(output: List<Text>, globals: List<Text>, entrySl
     }
 }
 
-// A function that calls no Minyar function (state[5] stayed -1) cannot deepen
-// recursion. With at most 256 locals and 1,024 temporaries its frame stays
-// within about 18 KiB even unoptimized, which fits in the 128 KiB reserve its
-// caller's call-depth check left (MINYAR_STACK_RESERVE_BYTES), so it needs no
-// call-depth frame of its own. Without one, LLVM can inline small accessors.
-// Its returns emit the leave call as a whole piece (dispatch lowering, which
-// embeds it in a larger piece, needs 4,096 labels and is excluded above).
-function finishLeafFunction(output: List<Text>, entrySlot: Integer, bodySlot: Integer) {
+// Remove the call-depth check from a function's entry and every return.
+function dropCallDepthFrame(output: List<Text>, entrySlot: Integer, bodySlot: Integer) {
     let enter = "  call void @minyar_stack_enter()\n"
     let entry = output[entrySlot]
-    if entry.length < enter.length || entry.slice(0, enter.length) != enter {
-        return
+    if entry.length >= enter.length && entry.slice(0, enter.length) == enter {
+        output[entrySlot] = entry.slice(enter.length, entry.length)
     }
-    output[entrySlot] = entry.slice(enter.length, entry.length)
     let piece = bodySlot
     while piece < output.length {
         if output[piece] == "  call void @minyar_stack_leave()\n" {
@@ -5081,6 +5073,8 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
     state.add(0)
     state.add(-1)
     state.add(0)
+    // 14: user-function calls emitted in the current body (leaf detection).
+    state.add(0)
     let hasNative = false
     let textState: List<Text> = []
     textState.add("entry")
@@ -5143,8 +5137,10 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         state[11] = 0
         state[13] = 0
         // Only parseCall writes a resolved user-function index into this cache.
-        // Reset it per body: -1 at finish proves the body made no user call.
-        state[5] = -1
+        // Reset it per body in bounded mode: -1 at finish proves no user call.
+        // Ordinary mode retains its existing cross-body cache behavior.
+        if stackOwnerLimit > 0 { state[5] = -1 }
+        state[14] = 0
         textState[0] = "entry"
         let localNames: List<Text> = []
         let localTypes: List<Integer> = []
@@ -5250,8 +5246,14 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         }
         if stackOwnerLimit > 0 && name != "main" && state[5] == -1 && state[6] == 1 && state[8] >= 1 && state[8] <= stackOwnerLimit {
             finishStackOwnership(output, entrySlot, state[8])
-        } else if !parallel && !machineIntrinsic && name != "main" && state[5] == -1 && state[4] <= 256 && state[1] <= 1024 && state[2] <= 1024 {
-            finishLeafFunction(output, entrySlot, bodySlot)
+        } else if !parallel && !machineIntrinsic && name != "main" && state[14] == 0 && state[4] <= 256 && state[1] <= 1024 && state[2] <= 1024 {
+            // A leaf (no user call, state[14]) cannot deepen recursion. With at
+            // most 256 locals and 1,024 temporaries its frame stays within
+            // about 18 KiB even unoptimized, inside the 128 KiB reserve its
+            // caller's check left (MINYAR_STACK_RESERVE_BYTES). Without the
+            // check, LLVM can inline small accessors. Dispatch lowering, which
+            // embeds a stack leave in a larger piece, needs 4,096 labels.
+            dropCallDepthFrame(output, entrySlot, bodySlot)
         }
         output.add("}\n\n")
         } else {
@@ -5278,6 +5280,7 @@ function compileTopLevel(tokenKinds: List<Integer>, tokenTexts: List<Text>, toke
     state.add(-1)
     state.add(0)
     state.add(-1)
+    state.add(0)
     state.add(0)
     let textState: List<Text> = []
     textState.add("entry")

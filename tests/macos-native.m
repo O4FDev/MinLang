@@ -18,6 +18,10 @@ static BOOL receive(long long kind, long long source) {
     }
     return NO;
 }
+/* Handle everything already queued. */
+static void drain(void) {
+    while (minyar_macos_nextEvent(0) && minyar_macos_eventType() != MNNone) {}
+}
 static void verifyRelease(void) {
     __weak NSView *weakView;
     __weak NSWindow *weakWindow;
@@ -99,7 +103,7 @@ static void verifyList(void) {
     // The table sees rows only when nextEvent reloads it, never half-built ones.
     assert(table.numberOfRows == 0);
     minyar_macos_show(w);
-    while (minyar_macos_nextEvent(0) && minyar_macos_eventType() != MNNone) {}
+    drain();
     assert(table.numberOfRows == 5000);
     // Only rows on screen have views.
     __block NSInteger realized = 0;
@@ -125,7 +129,7 @@ static void verifyList(void) {
     assert(table.numberOfRows == 0);
     // Without a row button the text runs to the inset.
     minyar_macos_rowButton(l,&empty,&empty,0); minyar_macos_addRow(l,&date,&prompt,&preview);
-    while (minyar_macos_nextEvent(0) && minyar_macos_eventType() != MNNone) {}
+    drain();
     cell = [table viewAtColumn:0 row:0 makeIfNecessary:YES];
     assert(cell.button.hidden && !cell.buttonEdge.active && cell.textEdge.active);
     table = nil; cell = nil; other = nil;
@@ -133,7 +137,7 @@ static void verifyList(void) {
 }
 /* Background progress (as from http) wakes nextEvent at most once a frame. */
 static void verifyWakeThrottle(void) {
-    while (minyar_macos_nextEvent(0) && minyar_macos_eventType() != MNNone) {}
+    drain();
     dispatch_semaphore_t posted = dispatch_semaphore_create(0);
     __block double sending = 0;
     [NSThread detachNewThreadWithBlock:^{
@@ -151,7 +155,7 @@ static void verifyWakeThrottle(void) {
         assert(minyar_macos_nextEvent(0.05));
         ++returns;
     }
-    while (minyar_macos_nextEvent(0) && minyar_macos_eventType() != MNNone) {}
+    drain();
     // At most one return a frame while the wake-ups arrive (plus 0.05 s
     // timeouts, and slack); unthrottled this would be near 200.
     assert(returns >= 1 && returns <= (int)(sending * 60) + 10);
@@ -210,7 +214,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     // waits for input; it must end the wait at once rather than at the timeout.
     // Needs the test to be trusted for accessibility, as automation tools are.
     if (AXIsProcessTrusted()) {
-        while (minyar_macos_nextEvent(0) && minyar_macos_eventType() != MNNone) {}
+        drain();
         NSButton *pressed = object(button,NSButton.class);
         NSRect frame = [pressed.window convertRectToScreen:[pressed convertRect:pressed.bounds toView:nil]];
         CGPoint point = CGPointMake(NSMidX(frame), NSHeight(NSScreen.screens.firstObject.frame) - NSMidY(frame));

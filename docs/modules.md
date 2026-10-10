@@ -75,9 +75,7 @@ validates certificates and can also stream (`start`, `read`, `finished`).
 [`json`](../library/json.min) parses and quotes JSON in Minyar itself. Some library functions are implemented
 in C or Objective-C: their body is, for example, `native "graphics"` or
 `native "macos"`, and `./minyar` builds and links the needed native code
-automatically. Packages from other sources are not yet supported, and
-`--incremental` builds search only `library` (so on macOS they get the portable
-`http`) and do not accept `--library`.
+automatically. Packages from other sources are not yet supported.
 
 The compiler finds packages through `--library DIRECTORY`, which may be given
 more than once (`./minyar` accepts it too, ahead of its standard directories); each directory is searched in order and the first with the

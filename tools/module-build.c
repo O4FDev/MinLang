@@ -301,9 +301,11 @@ static void ensure_directory(const char *path) {
     }
     free(copy);
 }
+/* Package directories, searched in order; the first holding a package wins. */
+enum { MAX_LIBRARIES = 8 };
 static int compiler_run(const char *compiler, const char *entry, const char *output, int input_fd,
                         const char *state, const char *stats, const char *error, const char *budget,
-                        const char *library) {
+                        char *const *libraries, size_t library_count) {
     if (lseek(input_fd, 0, SEEK_SET) < 0)
         stop("cache seek");
     pid_t child = fork();
@@ -320,16 +322,17 @@ static int compiler_run(const char *compiler, const char *entry, const char *out
             _exit(126);
         char path[64];
         snprintf(path, sizeof path, "/dev/fd/%d", input_fd);
-        char *args[12] = {(char *)compiler, (char *)entry, (char *)output, "--module-state", path,
-                          (char *)state,    (char *)stats};
+        char *args[10 + 2 * MAX_LIBRARIES] = {(char *)compiler, (char *)entry, (char *)output,
+                                              "--module-state",  path,          (char *)state,
+                                              (char *)stats};
         size_t argc = 7;
         if (budget) {
             args[argc++] = "--bounded-owners";
             args[argc++] = (char *)budget;
         }
-        if (library) {
+        for (size_t i = 0; i < library_count; i++) {
             args[argc++] = "--library";
-            args[argc++] = (char *)library;
+            args[argc++] = libraries[i];
         }
         args[argc] = NULL;
         execv(compiler, args);
@@ -490,7 +493,8 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--checksum-self-test"))
         return 0;
     int positional = argc;
-    const char *budget = NULL, *library_option = NULL;
+    const char *budget = NULL, *library_options[MAX_LIBRARIES];
+    size_t library_count = 0;
     unsigned owner_limit = 0;
     while (positional >= 7) {
         const char *option = argv[positional - 2], *value = argv[positional - 1];
@@ -501,19 +505,22 @@ int main(int argc, char **argv) {
                       stderr);
                 return 2;
             }
-        } else if (!strcmp(option, "--library") && !library_option)
-            library_option = value;
+        } else if (!strcmp(option, "--library") && library_count < MAX_LIBRARIES)
+            library_options[library_count++] = value;
         else
             break;
         positional -= 2;
     }
     if ((positional != 5 && positional != 6) || (positional == 6 && !strncmp(argv[5], "--", 2))) {
         fputs("usage: module-build COMPILER SOURCE LLVM CACHE_DIRECTORY [STATS] [--bounded-owners "
-              "BUDGET] [--library DIRECTORY]\n",
+              "BUDGET] [--library DIRECTORY]...\n",
               stderr);
         return 2;
     }
-    char *library = library_option ? absolute_source(library_option) : NULL;
+    /* Options were read from the end; restore the order they were given in. */
+    char *libraries[MAX_LIBRARIES];
+    for (size_t i = 0; i < library_count; i++)
+        libraries[i] = absolute_source(library_options[library_count - 1 - i]);
     umask(077);
     char *compiler = realpath(argv[1], NULL);
     if (!compiler)
@@ -529,8 +536,8 @@ int main(int argc, char **argv) {
         free(compiler_hex);
         compiler_hex = identity;
     }
-    if (library) {
-        Bytes library_bytes = {(unsigned char *)library, strlen(library)};
+    for (size_t i = 0; i < library_count; i++) {
+        Bytes library_bytes = {(unsigned char *)libraries[i], strlen(libraries[i])};
         char *library_hex = hexadecimal(library_bytes);
         size_t length = strlen(compiler_hex) + strlen(library_hex) + 10;
         char *identity = allocate(length);
@@ -617,10 +624,10 @@ int main(int argc, char **argv) {
         input_fd = plan_fd;
     }
     int result =
-        compiler_run(snapshot, entry, output, input_fd, state, stats, error, budget, library);
+        compiler_run(snapshot, entry, output, input_fd, state, stats, error, budget, libraries, library_count);
     if (result && cache_valid)
         result =
-            compiler_run(snapshot, entry, output, empty_fd, state, stats, error, budget, library);
+            compiler_run(snapshot, entry, output, empty_fd, state, stats, error, budget, libraries, library_count);
     if (!result) {
         Bytes diagnostic = read_path(stats, 4096);
         struct stat state_stat;
@@ -686,7 +693,8 @@ int main(int argc, char **argv) {
         cleanup_files[i] = NULL;
     free(compiler);
     free(compiler_hex);
-    free(library);
+    for (size_t i = 0; i < library_count; i++)
+        free(libraries[i]);
     free(entry);
     free(cache);
     free(work);
