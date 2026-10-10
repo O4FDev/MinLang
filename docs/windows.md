@@ -17,6 +17,29 @@ copied native text; OS callbacks retain no managed Minyar values. Dispatch is
 bounded to 256 Windows messages per iteration, and duplicate pending text edits
 are coalesced. Windows dialog keyboard navigation handles Tab between controls.
 
+`windows.shareNetworkLoop(loop)` connects an `eventloop` reactor to this same
+UI thread. After every `nextEvent` call, consume `eventloop.wait(loop, 0, maximum)`
+and handle its socket/timer events on that thread. A network or timer wake
+returns `NONE`; it is a readiness hint rather than an application action.
+`unshareNetworkLoop()` detaches without closing sockets or the reactor.
+Closing an attached reactor detaches before releasing its native resources.
+
+The Windows adapter uses Winsock event registrations and native threadpool
+waits to signal one aggregate event. `MsgWaitForMultipleObjectsEx` waits on that
+event, GUI messages and the reactor's earliest timer. It does not run a periodic
+socket poll, and the GUI wait is not limited to 63 socket handles. `WSAPoll`
+remains the owner-thread batch source. Emitted records are rearmed; readiness
+for other sockets survives a bounded batch, and consumed stale records settle
+to an idle kernel wait. Native callbacks retain only stable native nodes and
+signal the aggregate handle. Detachment cancels and joins callbacks before
+freeing nodes or event handles. Accepted sockets drop the listener's inherited
+event registration before returning to the caller. Ordinary network builds
+without the Windows UI package omit all adapter fields and hooks.
+
+The implementation follows Microsoft's [Winsock event semantics](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsaeventselect),
+[threadpool wait lifetime](https://learn.microsoft.com/en-us/windows/win32/api/threadpoolapiset/nf-threadpoolapiset-setthreadpoolwait),
+and [GUI wait contract](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-msgwaitformultipleobjectsex).
+
 Windows menu bars belong to a window, so `menu(window, title)` takes the owning
 window. `menuItem` currently requires an empty shortcut string. Tray items use
 the application icon; the symbol argument is reserved. Tray notifications use
@@ -114,6 +137,12 @@ contracts in debug and release. Login tests redirect all writes to a separate
 per-process test registry key; OS trust roots are never changed. Explorer tray
 lifetime is checked when the Windows test session has a taskbar. The local
 Windows 11 desktop VM is required for that check in headless CI environments.
+The same gate runs the GUI/socket/timer adapter with 128 concurrent socket
+watches, one-event batches, arrival during a real native edit, repeated reads,
+accepted-child event isolation, idle timeout settling, timer cancellation and
+stale reactor generations. Instrumented `WSAPoll` calls prove the GUI wait
+does not poll sockets periodically. Compiled Minyar adapter contracts run in
+debug and release.
 
 `python3 tests/schannel.py` is a separate mandatory Windows CI gate. It tests
 native state/buffer/lifetime contracts and compiled Minyar results in debug
