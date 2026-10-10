@@ -348,6 +348,15 @@ merged into v2 but not pushed; the suite run on it was stopped.
   10.55 MB peak footprint (the compiler's arena dominates). That is within
   noise, so it was reverted.
 
+## Measured and not pursued
+
+- **Record field bounds checks.** `minyar_record_get` checks the field index
+  on every read, although the compiler always emits a valid one. Removing the
+  check in a variant build took Minyarcraft from 17.30G to 16.69G
+  instructions (-3.6%). It stays: it is part of the runtime's hardening and
+  turns a compiler or layout mismatch into a clean stop instead of memory
+  corruption.
+
 ## Measured and not a bottleneck
 
 - **Atacama start-up.** Launch, session check, loading and parsing 500 runs,
