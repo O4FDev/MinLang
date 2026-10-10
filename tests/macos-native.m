@@ -83,6 +83,41 @@ static void verifyApplicationViews(void) {
     minyar_macos_destroy(w);
     assert(handles[@(color)] != nil);
 }
+/* Lists keep rows as text and build views only for visible rows. */
+static void verifyList(void) {
+    MinyarText title = literal("List"), date = literal("10 Oct"), prompt = literal("Where is the Atacama?"), preview = literal("Chile"),
+        empty = literal(""), trash = literal("trash"), remove = literal("Delete"), system = literal("");
+    long long w = minyar_macos_window(&title,400,300);
+    long long root = minyar_macos_column(w,0);
+    long long l = minyar_macos_list(root); minyar_macos_fill(l); minyar_macos_grow(l);
+    long long color = minyar_macos_color(0x222222,0xdddddd,1);
+    minyar_macos_listLine(l,1,&system,14,450,color,0); minyar_macos_listColors(l,color,color);
+    minyar_macos_rowButton(l,&trash,&remove,color);
+    for (int i = 0; i < 5000; ++i) minyar_macos_addRow(l,&date,&prompt,i == 1 ? &empty : &preview);
+    assert(minyar_macos_rowCount(l) == 5000 && minyar_macos_clickedRow(l) == -1);
+    minyar_macos_show(w);
+    while (minyar_macos_nextEvent(0) && minyar_macos_eventType() != MNNone) {}
+    NSTableView *table = list(l).table;
+    assert(table.numberOfRows == 5000);
+    // Only rows on screen have views.
+    __block NSInteger realized = 0;
+    [table enumerateAvailableRowViewsUsingBlock:^(NSTableRowView *view, NSInteger row) { (void)view; (void)row; ++realized; }];
+    assert(realized > 0 && realized < 100);
+    MNListCell *cell = [table viewAtColumn:0 row:1 makeIfNecessary:YES];
+    assert([cell.top.stringValue isEqualToString:@"10 Oct"] && [cell.middle.stringValue isEqualToString:@"Where is the Atacama?"]);
+    assert(cell.bottom.hidden && !cell.button.hidden);
+    assert([cell.button.toolTip isEqualToString:@"Delete Where is the Atacama?"]);
+    [cell.button performClick:nil];
+    assert(receive(MNAction,l)); assert(minyar_macos_clickedRow(l) == 1 && minyar_macos_clickedButton(l));
+    // A disabled list delivers no clicks.
+    minyar_macos_enabled(l,false); [cell.button performClick:nil];
+    assert(!receive(MNAction,l)); minyar_macos_enabled(l,true);
+    minyar_macos_clear(l); assert(minyar_macos_rowCount(l) == 0 && minyar_macos_clickedRow(l) == -1);
+    while (minyar_macos_nextEvent(0) && minyar_macos_eventType() != MNNone) {}
+    assert(table.numberOfRows == 0);
+    table = nil; cell = nil;
+    minyar_macos_destroy(w);
+}
 int main(int argc, char **argv) { @autoreleasepool {
     MinyarText title = literal("Native contract"), unicode = literal("é 🙂 漢字"), empty = literal("");
     if (argc > 1 && !strcmp(argv[1],"uninitialized")) { minyar_macos_window(&title,100,100); return 99; }
@@ -96,6 +131,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     if (argc > 1 && !strcmp(argv[1],"shape")) { MinyarText bad = literal("M 1 2 X"); long long v = minyar_macos_window(&title,100,100); minyar_macos_shape(minyar_macos_column(v,0),&bad,10,10); return 99; }
     if (argc > 1 && !strcmp(argv[1],"color")) { minyar_macos_color(0x1000000,0,1); return 99; }
     verifyApplicationViews();
+    verifyList();
     long long w = minyar_macos_window(&title,640,480);
     long long root = minyar_macos_column(w,8); minyar_macos_padding(root,10);
     long long field = minyar_macos_textField(root,&unicode);
@@ -115,6 +151,8 @@ int main(int argc, char **argv) { @autoreleasepool {
         if (!strcmp(argv[1],"duplicate-init")) minyar_macos_initialize(&title);
         if (!strcmp(argv[1],"overflow")) for (int i = 0; i < 4097; ++i) enqueue(MNAction,button,@"");
         if (!strcmp(argv[1],"dimension")) minyar_macos_window(&title,-1,100);
+        if (!strcmp(argv[1],"list-line")) minyar_macos_listLine(minyar_macos_list(root),3,&empty,12,400,0,1);
+        if (!strcmp(argv[1],"list-type")) minyar_macos_addRow(button,&title,&title,&title);
         return 99;
     }
     equals(minyar_macos_text(field),"é 🙂 漢字");
@@ -180,7 +218,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     // Drain AppKit's autoreleased notifications before checking release.
     minyar_macos_destroy(second);
     minyar_macos_quit(); assert(receive(MNQuit,0)); assert(!minyar_macos_nextEvent(0));
-    assert(handles.count == 3); // Only the application-scoped menu, item and color remain.
+    assert(handles.count == 4); // Only the application-scoped menu, item and two colors remain.
     puts("native AppKit actions, delegates, Unicode, windows, menus and lifecycle verified");
     return 0;
 } }
