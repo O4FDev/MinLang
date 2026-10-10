@@ -12,7 +12,8 @@
 //
 // http:// and https:// URLs are supported; https uses the `tls` package, which
 // validates the server certificate against OS roots. Unlike the macOS backend it
-// does not follow redirects, decode chunked bodies or time out. Minyar OS uses
+// does not follow redirects or decode chunked bodies. getBounded has deadlines.
+// Minyar OS uses
 // its own client in os/kernel/net/http.min over its own TCP/IP stack.
 use "net" as net
 use "tls" as tls
@@ -80,6 +81,30 @@ public function post(url: Text, headers: List<Text>, body: Text): Response {
 }
 
 public function request(method: Text, url: Text, headers: List<Text>, body: Text): Response {
+    return exchange(method, url, headers, body, 0, 0)
+}
+
+// Portable bounded download: certificate verification remains enabled. Reads
+// allocate at most limit + 32KiB HTTP framing, plus one bounded TLS record.
+// This backend does not follow redirects or decode transfer/content encodings.
+public function getBounded(url: Text, headers: List<Text>, limit: Integer): Response {
+    return getBoundedWithin(url, headers, limit, 30000)
+}
+
+// One absolute read deadline prevents a slow peer resetting a timeout forever.
+// Name resolution and initial blocking connect still use platform timeouts.
+public function getBoundedWithin(url: Text, headers: List<Text>, limit: Integer, timeoutMs: Integer): Response {
+    if limit < 1 || limit > 134217728 { return failed("invalid download size limit") }
+    if timeoutMs < 1 || timeoutMs > 300000 { return failed("invalid download timeout") }
+    return exchange("GET", url, headers, "", limit, timeoutMs)
+}
+
+function ready(connection: Integer, deadline: Integer): Boolean {
+    let remaining = deadline - net.monotonicMilliseconds()
+    return remaining > 0 && net.ready(connection, remaining)
+}
+
+function exchange(method: Text, url: Text, headers: List<Text>, body: Text, limit: Integer, timeoutMs: Integer): Response {
     let address = parse(url)
     if address.host == "" {
         return failed("only http:// and https:// URLs are supported: " + url)
@@ -88,6 +113,8 @@ public function request(method: Text, url: Text, headers: List<Text>, body: Text
     if connection < 0 {
         return failed(net.lastError())
     }
+    let deadline = 0
+    if limit > 0 { deadline = net.monotonicMilliseconds() + timeoutMs }
     let content = Bytes(body)
     let lines: List<Text> = [method + " " + address.path + " HTTP/1.1\r\n", "Host: " + address.host + "\r\n", "Connection: close\r\n"]
     for header in headers {
@@ -100,29 +127,37 @@ public function request(method: Text, url: Text, headers: List<Text>, body: Text
     let message = Bytes(joinText(lines))
     message.addBytes(content)
     if address.secure {
-        return secureExchange(connection, address.host, message)
+        return secureExchange(connection, address.host, message, limit, deadline)
     }
     net.send(connection, message)
     // The server closes the connection after its response.
     let received = Bytes()
-    let chunk = net.receive(connection, 65536)
-    while chunk.length > 0 {
+    while true {
+        if limit > 0 && !ready(connection, deadline) { net.close(connection); return failed("download timed out") }
+        let capacity = 65536
+        if limit > 0 { capacity = min(capacity, limit + 32768 - received.length) }
+        if capacity < 1 { net.close(connection); return failed("download exceeds its size limit") }
+        let chunk = net.receive(connection, capacity)
+        if chunk.length == 0 { break }
         received.addBytes(chunk)
-        chunk = net.receive(connection, 65536)
     }
     net.close(connection)
-    return read(received)
+    return boundedResponse(received, limit)
 }
 
-function secureExchange(connection: Integer, host: Text, message: Bytes): Response {
+function secureExchange(connection: Integer, host: Text, message: Bytes, limit: Integer, deadline: Integer): Response {
     let session = tls.client(host, randomBytes(64))
     net.send(connection, tls.takeOutgoing(session))
+    let handshakeBytes = 0
     while session.state == tls.HELLO_SENT || session.state == tls.HANDSHAKE {
+        if limit > 0 && !ready(connection, deadline) { net.close(connection); return failed("TLS handshake timed out") }
         let chunk = net.receive(connection, 65536)
         if chunk.length == 0 {
             net.close(connection)
             return failed("the server closed the connection during the TLS handshake")
         }
+        handshakeBytes += chunk.length
+        if limit > 0 && handshakeBytes > 1048576 { net.close(connection); return failed("TLS handshake exceeds its size limit") }
         tls.receive(session, chunk)
         let reply = tls.takeOutgoing(session)
         if reply.length > 0 { net.send(connection, reply) }
@@ -135,17 +170,31 @@ function secureExchange(connection: Integer, host: Text, message: Bytes): Respon
     net.send(connection, tls.takeOutgoing(session))
     let received = Bytes()
     while session.state == tls.ESTABLISHED {
+        if limit > 0 && !ready(connection, deadline) { net.close(connection); return failed("download timed out") }
         let chunk = net.receive(connection, 65536)
         if chunk.length == 0 { tls.endInput(session); break }
         tls.receive(session, chunk)
         received.addBytes(tls.takeIncoming(session))
+        if limit > 0 && received.length > limit + 32768 {
+            net.close(connection); return failed("download exceeds its size limit")
+        }
     }
     received.addBytes(tls.takeIncoming(session))
     net.close(connection)
     if session.state == tls.FAILED {
         return failed("TLS failed: " + session.error)
     }
-    return read(received)
+    return boundedResponse(received, limit)
+}
+
+function boundedResponse(data: Bytes, limit: Integer): Response {
+    if limit > 0 {
+        let end = headerEnd(data)
+        if end < 0 || end > 32768 || data.length - end - 4 > limit {
+            return failed("download exceeds its size limit or has invalid headers")
+        }
+    }
+    return read(data)
 }
 
 function headerEnd(data: Bytes): Integer {
