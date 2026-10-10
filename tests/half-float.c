@@ -4,10 +4,10 @@
 #include "../runtime/native/half-float.h"
 #include <stdio.h>
 
+#ifdef __FLT16_MAX__
 static unsigned long long mismatches;
 
 static void check(uint32_t pattern) {
-#ifdef __FLT16_MAX__
     float value;
     memcpy(&value, &pattern, 4);
     _Float16 half = (_Float16)value;
@@ -19,10 +19,8 @@ static void check(uint32_t pattern) {
             : actual != expected) {
         if (mismatches++ < 5) fprintf(stderr, "mismatch for 0x%08x: 0x%04x != 0x%04x\n", pattern, actual, expected);
     }
-#else
-    (void)pattern;
-#endif
 }
+#endif
 
 int main(int argc, char **argv) {
 #ifdef __FLT16_MAX__
