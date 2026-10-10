@@ -459,7 +459,10 @@ merged into v2 but not pushed; the suite run on it was stopped.
 The bake-off winner was ported onto v2 on branch `port/astra-cycles`. A
 subagent then spent three rounds cutting its cost, and the branch includes
 tonight's work up to `c986a76` (merged as `ebb02ba`); the later JSON, native
-cache, graphics and correctness commits are not on it. The base below is v2 at the time of each
+cache, graphics and correctness commits are not on it. In particular it still
+has the first version of the store-borrow scan, which misses multi-line record
+literals (see change 4), so merge current v2 into it before merging it
+anywhere. The base below is v2 at the time of each
 measurement.
 
 | Workload | v2 | First port | Final port |
