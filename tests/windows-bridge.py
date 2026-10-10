@@ -22,10 +22,12 @@ def main():
     with tempfile.TemporaryDirectory(prefix='windows-bridge-', dir=ROOT/'build') as directory:
         temp = Path(directory)
         fixtures = [
+            ('windows-notifications', ['-DMINYAR_NOTIFY_TEST=1', '-DNOTICE_LIMIT=8', '-DACTION_QUEUE_LIMIT=2'], ['winnotify.c', 'windows.c'],
+             ['user32', 'gdi32', 'shell32', 'advapi32', 'ole32', 'uuid', 'bcrypt', 'runtimeobject']),
             ('windows-certificate', [], ['wincert.c', 'tlsverify.c'],
              ['crypt32', 'ncrypt', 'bcrypt', 'ws2_32']),
-            ('windows-desktop', ['-DMINYAR_DESKTOP_TEST=1'], ['desktop.c'],
-             ['user32', 'shell32', 'advapi32', 'ole32', 'oleaut32', 'iphlpapi', 'uuid', 'ws2_32', 'bcrypt']),
+            ('windows-desktop', ['-DMINYAR_DESKTOP_TEST=1'], ['desktop.c', 'winnotify.c'],
+             ['user32', 'shell32', 'advapi32', 'ole32', 'oleaut32', 'iphlpapi', 'uuid', 'ws2_32', 'bcrypt', 'runtimeobject']),
             ('windows-native', ['-DMINYAR_WINDOWS_TEST=1'], ['windows.c'],
              ['user32', 'gdi32', 'shell32']),
             ('windows-loop', ['-DMINYAR_WINDOWS_TEST=1', '-DMINYAR_APP_EVENT_LOOP=1'], ['windows.c'],
@@ -54,6 +56,11 @@ def main():
                            check=True, timeout=120)
             result = subprocess.run([shared], check=True, capture_output=True, text=True, timeout=30)
             assert result.stdout == 'Windows shared reactor Minyar contracts verified\n', result
+            notification = temp/('notification-'+mode[2:]+'.exe')
+            subprocess.run([ROOT/'minyar', mode, ROOT/'tests/windows-notifications.min', '-o', notification],
+                           check=True, timeout=120)
+            result = subprocess.run([notification], check=True, capture_output=True, text=True, timeout=30)
+            assert result.stdout == 'Windows persistent notification Minyar contracts verified\n', result
 
 
 if __name__ == '__main__':
