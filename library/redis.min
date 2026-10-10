@@ -1,0 +1,116 @@
+// Socket-independent bounded Redis RESP2 pipeline. The owner drives one
+// nonblocking socket with the shared event loop. Commands are FIFO; a failed
+// connection retires every outstanding operation and never replays writes.
+use "resp2" as resp
+use "errors" as errors
+
+public record Client {
+    private output: Bytes
+    private outputAt: Integer
+    private input: Bytes
+    private count: Integer
+    private ready: Integer
+    private writeLengths: List<Integer>
+    private writeHead: Integer
+    private ended: Boolean
+    private closed: Boolean
+    private error: errors.Error
+}
+public record Reply { private value: resp.Value; private error: errors.Error }
+public function create(): Client {
+    return Client { output: Bytes(); outputAt: 0; input: Bytes(); count: 0; ready: 0; writeLengths: []; writeHead: 0; ended: false; closed: false; error: errors.none() }
+}
+public function pending(client: Client): Integer { return client.count }
+public function closed(client: Client): Boolean { return client.closed }
+public function ok(reply: Reply): Boolean { return !errors.isError(reply.error) }
+public function error(reply: Reply): errors.Error { return reply.error }
+public function value(reply: Reply): resp.Value {
+    if !ok(reply) { fail("cannot read a failed Redis reply") }
+    return reply.value
+}
+function absent(): resp.Value { return resp.value(resp.parse(Bytes("$-1\r\n"))) }
+function failed(error: errors.Error): Reply { return Reply { value: absent(); error: error } }
+function stop(client: Client, error: errors.Error) {
+    if client.closed { return }
+    client.error = error; client.closed = true; client.count = 0
+    client.input = Bytes(); client.output = Bytes(); client.outputAt = 0
+    client.ready = 0; client.writeLengths = []; client.writeHead = 0
+}
+public function abort(client: Client, error: errors.Error) {
+    if !errors.isError(error) { fail("Redis abort requires an error") }
+    stop(client,error)
+}
+public function queue(client: Client, arguments: List<Bytes>): errors.BooleanResult {
+    if client.closed { return errors.booleanFailure(client.error) }
+    if client.ended { return errors.booleanFailure(errors.make(errors.closedCode(),0,"Redis input ended")) }
+    let encoded = resp.command(arguments)
+    if !errors.bytesOk(encoded) { return errors.booleanFailure(errors.bytesError(encoded)) }
+    let data = errors.bytesValue(encoded)
+    if client.count >= 4096 || data.length > 1048576 - (client.output.length - client.outputAt) {
+        return errors.booleanFailure(errors.make(errors.wouldBlockCode(),0,"Redis pipeline backpressure"))
+    }
+    if client.outputAt > 0 {
+        client.output = client.output.slice(client.outputAt,client.output.length); client.outputAt = 0
+    }
+    // Amortized compaction keeps the write ledger bounded even when an owner
+    // continuously appends commands without completely draining its output.
+    if client.writeHead >= 1024 && client.writeHead * 2 >= client.writeLengths.length {
+        let remaining: List<Integer> = []
+        for index in client.writeHead..client.writeLengths.length { remaining.add(client.writeLengths[index]) }
+        client.writeLengths = remaining; client.writeHead = 0
+    }
+    client.output.addBytes(data); client.writeLengths.add(data.length); client.count += 1
+    return errors.boolean(true)
+}
+// A copied bounded view. Only sent() commits a successful socket write.
+public function outgoing(client: Client, limit: Integer): Bytes {
+    if limit < 1 || limit > 65536 { fail("Redis output limit must be 1..65536") }
+    if client.closed || client.ended { return Bytes() }
+    return client.output.slice(client.outputAt,min(client.output.length,client.outputAt+limit))
+}
+public function sent(client: Client, count: Integer) {
+    if count < 0 || count > client.output.length - client.outputAt { fail("invalid committed Redis write length") }
+    let left = count
+    while left > 0 {
+        let length = client.writeLengths[client.writeHead]
+        let used = min(left,length)
+        client.writeLengths[client.writeHead] -= used; left -= used
+        if used == length { client.ready += 1; client.writeHead += 1 }
+    }
+    client.outputAt += count
+    if client.outputAt == client.output.length {
+        client.output = Bytes(); client.outputAt = 0; client.writeLengths = []; client.writeHead = 0
+    }
+}
+public function feed(client: Client, data: Bytes): errors.BooleanResult {
+    if client.closed { return errors.booleanFailure(client.error) }
+    if client.ended { return errors.booleanFailure(errors.make(errors.closedCode(),0,"Redis input ended")) }
+    if data.length > 2097152 - client.input.length {
+        stop(client,errors.make(errors.invalidDataCode(),0,"Redis reply buffer limit exceeded"))
+        return errors.booleanFailure(client.error)
+    }
+    client.input.addBytes(data)
+    return errors.boolean(true)
+}
+// Complete replies already received remain readable after EOF. A partial
+// frame becomes truncation; unanswered commands become closed, never success.
+public function endInput(client: Client) { client.ended = true }
+public function reply(client: Client): Reply {
+    if client.closed { return failed(client.error) }
+    let parsed = resp.parse(client.input)
+    if !resp.ok(parsed) {
+        if resp.incomplete(parsed) && !client.ended { return failed(resp.error(parsed)) }
+        let error = resp.error(parsed)
+        if client.ended && resp.incomplete(parsed) {
+            let code = errors.closedCode(); if client.input.length > 0 { code = errors.truncatedCode() }
+            error = errors.make(code,0,"Redis reply ended before completion")
+        }
+        stop(client,error); return failed(error)
+    }
+    if client.ready == 0 {
+        stop(client,errors.make(errors.protocolCode(),0,"unsolicited Redis reply")); return failed(client.error)
+    }
+    client.input = client.input.slice(resp.consumed(parsed),client.input.length)
+    client.count -= 1; client.ready -= 1
+    return Reply { value: resp.value(parsed); error: errors.none() }
+}

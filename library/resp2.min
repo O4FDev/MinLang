@@ -1,0 +1,187 @@
+// Bounded RESP2 framing for Redis. All input is binary; malformed replies and
+// incomplete reads are recoverable values. No socket or scheduler calls.
+use "errors" as errors
+
+public constant SIMPLE = 0
+public constant ERROR = 1
+public constant INTEGER = 2
+public constant BULK = 3
+public constant ARRAY = 4
+public constant NULL_BULK = 5
+public constant NULL_ARRAY = 6
+
+public record Value {
+    private kind: Integer
+    private data: Bytes
+    private number: Integer
+    private items: List<Value>
+}
+public record Result {
+    private value: Value
+    private consumed: Integer
+    private incomplete: Boolean
+    private error: errors.Error
+}
+record Cursor {
+    source: Bytes
+    position: Integer
+    remainingNodes: Integer
+    incomplete: Boolean
+    error: errors.Error
+}
+function scalar(kind: Integer, data: Bytes, number: Integer): Value {
+    return Value { kind: kind; data: data; number: number; items: [] }
+}
+function missing(): Value { return scalar(NULL_BULK, Bytes(), 0) }
+public function ok(result: Result): Boolean { return !errors.isError(result.error) }
+public function incomplete(result: Result): Boolean { return result.incomplete }
+public function error(result: Result): errors.Error { return result.error }
+public function consumed(result: Result): Integer { return result.consumed }
+public function value(result: Result): Value {
+    if !ok(result) { fail("cannot read a failed RESP result") }
+    return result.value
+}
+public function kind(value: Value): Integer { return value.kind }
+public function data(value: Value): Bytes { return value.data }
+public function integer(value: Value): Integer {
+    if value.kind != INTEGER { fail("RESP value is not an integer") }
+    return value.number
+}
+public function items(value: Value): List<Value> {
+    if value.kind != ARRAY { fail("RESP value is not an array") }
+    return value.items
+}
+function invalid(cursor: Cursor, message: Text) {
+    if !errors.isError(cursor.error) { cursor.error = errors.make(errors.invalidDataCode(), 0, message) }
+}
+function waiting(cursor: Cursor) { cursor.incomplete = true }
+function active(cursor: Cursor): Boolean { return !cursor.incomplete && !errors.isError(cursor.error) }
+
+// One reply only: consumed identifies the next coalesced frame. On failure or
+// incomplete input it is zero, so callers never discard a partial reply.
+// Limits: 2 MiB input, 1 MiB bulk, 4096-byte simple line, 1024 array members,
+// 4096 total values, and 16 levels of nested arrays.
+public function parse(source: Bytes): Result {
+    let cursor = Cursor { source: source; position: 0; remainingNodes: 4096; incomplete: false; error: errors.none() }
+    if source.length > 2097152 { invalid(cursor, "RESP input limit exceeded") }
+    let parsed = missing()
+    if active(cursor) { parsed = parseValue(cursor, 0) }
+    if errors.isError(cursor.error) {
+        return Result { value: missing(); consumed: 0; incomplete: false; error: cursor.error }
+    }
+    if cursor.incomplete {
+        return Result { value: missing(); consumed: 0; incomplete: true; error: errors.make(errors.wouldBlockCode(), 0, "incomplete RESP reply") }
+    }
+    return Result { value: parsed; consumed: cursor.position; incomplete: false; error: errors.none() }
+}
+
+function line(cursor: Cursor, limit: Integer): Bytes {
+    let start = cursor.position
+    while cursor.position < cursor.source.length {
+        let byte = cursor.source[cursor.position]
+        if byte == 10 { invalid(cursor, "bare LF in RESP line"); return Bytes() }
+        if byte == 13 {
+            if cursor.position + 1 >= cursor.source.length { waiting(cursor); return Bytes() }
+            if cursor.source[cursor.position + 1] != 10 { invalid(cursor, "invalid RESP line delimiter"); return Bytes() }
+            let result = cursor.source.slice(start, cursor.position)
+            cursor.position += 2
+            return result
+        }
+        if cursor.position - start >= limit { invalid(cursor, "RESP line limit exceeded"); return Bytes() }
+        cursor.position += 1
+    }
+    waiting(cursor)
+    return Bytes()
+}
+
+// Accumulate negatively so INT64_MIN is representable without overflowing.
+// Bounds are checked before arithmetic, including every malformed digit.
+function decimal(cursor: Cursor, text: Bytes, allowPlus: Boolean): Integer {
+    let position = 0
+    let negative = false
+    if text.length > 0 && text[0] == 45 { negative = true; position = 1 }
+    if text.length > 0 && text[0] == 43 && allowPlus { position = 1 }
+    if position == text.length { invalid(cursor, "empty RESP number"); return 0 }
+    let minimum = -9223372036854775807
+    if negative { minimum = -9223372036854775808 }
+    let number = 0
+    while position < text.length {
+        let byte = text[position]
+        if byte < 48 || byte > 57 { invalid(cursor, "invalid RESP number"); return 0 }
+        let digit = byte - 48
+        if number < (minimum + digit) / 10 { invalid(cursor, "RESP integer overflow"); return 0 }
+        number = number * 10 - digit
+        position += 1
+    }
+    if negative { return number }
+    return -number
+}
+
+function parseValue(cursor: Cursor, depth: Integer): Value {
+    if depth > 16 || cursor.remainingNodes <= 0 { invalid(cursor, "RESP nesting or value limit exceeded"); return missing() }
+    cursor.remainingNodes -= 1
+    if cursor.position >= cursor.source.length { waiting(cursor); return missing() }
+    let tag = cursor.source[cursor.position]
+    cursor.position += 1
+    if tag != 43 && tag != 45 && tag != 58 && tag != 36 && tag != 42 {
+        invalid(cursor, "unknown RESP2 type")
+        return missing()
+    }
+    let limit = 64
+    if tag == 43 || tag == 45 { limit = 4096 }
+    let text = line(cursor, limit)
+    if !active(cursor) { return missing() }
+    if tag == 43 { return scalar(SIMPLE, text, 0) }
+    if tag == 45 { return scalar(ERROR, text, 0) }
+    let number = decimal(cursor, text, tag == 58)
+    if !active(cursor) { return missing() }
+    if tag == 58 { return scalar(INTEGER, Bytes(), number) }
+    if number < -1 { invalid(cursor, "invalid negative RESP length"); return missing() }
+    if tag == 36 {
+        if number == -1 { return missing() }
+        if number > 1048576 { invalid(cursor, "RESP bulk limit exceeded"); return missing() }
+        let remaining = cursor.source.length - cursor.position
+        if remaining <= number { waiting(cursor); return missing() }
+        let end = cursor.position + number
+        if cursor.source[end] != 13 { invalid(cursor, "invalid RESP bulk delimiter"); return missing() }
+        if remaining == number + 1 { waiting(cursor); return missing() }
+        if cursor.source[end + 1] != 10 { invalid(cursor, "invalid RESP bulk delimiter"); return missing() }
+        let data = cursor.source.slice(cursor.position, end)
+        cursor.position = end + 2
+        return scalar(BULK, data, 0)
+    }
+    if number == -1 { return scalar(NULL_ARRAY, Bytes(), 0) }
+    if number > 1024 { invalid(cursor, "RESP array limit exceeded"); return missing() }
+    let children: List<Value> = []
+    for index in 0..number {
+        let child = parseValue(cursor, depth + 1)
+        if !active(cursor) { return missing() }
+        children = children.appended(child)
+    }
+    return Value { kind: ARRAY; data: Bytes(); number: 0; items: children }
+}
+
+// Redis commands are arrays of binary bulk strings. Character counts must
+// never be used as lengths on the wire. Encoding is bounded before copying.
+public function command(arguments: List<Bytes>): errors.BytesResult {
+    if arguments.length < 1 || arguments.length > 1024 {
+        return errors.bytesFailure(errors.make(errors.invalidDataCode(), 0, "invalid Redis command argument count"))
+    }
+    let total = 16
+    for argument in arguments {
+        if argument.length > 1048576 {
+            return errors.bytesFailure(errors.make(errors.invalidDataCode(), 0, "Redis command argument limit exceeded"))
+        }
+        total += argument.length + Text(argument.length).length + 5
+        if total > 1048576 {
+            return errors.bytesFailure(errors.make(errors.invalidDataCode(), 0, "Redis command limit exceeded"))
+        }
+    }
+    let encoded = Bytes("*" + Text(arguments.length) + "\r\n")
+    for argument in arguments {
+        encoded.addBytes(Bytes("$" + Text(argument.length) + "\r\n"))
+        encoded.addBytes(argument)
+        encoded.addBytes(Bytes("\r\n"))
+    }
+    return errors.bytes(encoded)
+}

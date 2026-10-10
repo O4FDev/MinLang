@@ -577,6 +577,22 @@ check-quic-sanitize: build/minyarc
 check: check-quic
 check-sanitize: check-quic-sanitize
 
+.PHONY: check-redis-protocol check-redis-protocol-sanitize check-redis-pipeline check-redis-pipeline-sanitize
+check-redis-protocol: build/minyarc build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/redis-protocol.py
+
+check-redis-protocol-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o
+	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/redis-protocol.py
+
+check-redis-pipeline: build/minyarc build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/redis-pipeline.py
+
+check-redis-pipeline-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o
+	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/redis-pipeline.py
+
+check check-portable: check-redis-protocol check-redis-pipeline
+check-sanitize: check-redis-protocol-sanitize check-redis-pipeline-sanitize
+
 .PHONY: check-native-cache
 check-native-cache:
 	$(LIMITED) python3 tests/native-object-cache.py
