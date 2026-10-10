@@ -1,12 +1,15 @@
 # v2 performance work (2026-10-10)
 
-What limits real Minyar programs, ranked by measured gain. Each entry gives
-the problem, the evidence, the fix and the before/after numbers. Instruction
-counts are retired instructions of the application process (`proc_pid_rusage`
-or `/usr/bin/time -l`). They are steadier than wall time on this shared,
-heavily loaded machine; the load average was 30-76 throughout.
+What limited the real Minyar programs (the Atacama desktop app, Minyarcraft,
+Minyar-OS and the compiler itself), found by profiling them, in the order the
+fixes were made. Each entry gives the problem, the evidence, the fix, the
+before/after numbers and the test. Instruction counts are retired
+instructions of the application process (`proc_pid_rusage` or
+`/usr/bin/time -l`). They are steadier than wall time on this shared, heavily
+loaded machine; the load average was 30-76 throughout. By size of gain, the
+largest are 1 (10x), 5 (51x on long Texts), 2 (4x), 8 (2x builds) and 4 (-32%).
 
-## Ranked results
+## Results
 
 | # | Problem | Fix | Before | After | Gain |
 | --- | --- | --- | --- | --- | --- |
