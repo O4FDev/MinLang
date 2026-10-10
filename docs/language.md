@@ -128,6 +128,10 @@ and an invalid range stops with a descriptive bounds error.
 
 Use `argumentCount()` and `argument(position)` for command-line arguments,
 and `readTextFile(path)` and `writeTextFile(path, contents)` for text files.
+`contents` can also be a `List<Text>`: the file then holds what
+`joinText(contents)` would, written piece by piece without building the joined
+Text. A program that produces large output in small pieces, such as the
+compiler, avoids holding the whole file twice.
 
 File-backed Text preserves the file's bytes, including malformed UTF-8.
 `text.byteLength` counts those bytes, and `writeTextFile` writes them unchanged.

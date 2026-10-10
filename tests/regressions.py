@@ -334,6 +334,46 @@ print(read[2])
             arguments=(str(text_path), str(bytes_path)),
             file_outputs=((text_path, 'é🙂'.encode('utf-8')), (bytes_path, bytes([0, 255, 42]))))
 
+    def test_write_text_file_writes_list_pieces_without_joining(self):
+        # writeTextFile(path, List<Text>) must write exactly what joinText would
+        # build: pieces crossing the runtime's write buffer, one piece larger
+        # than the buffer, Unicode, and an empty piece.
+        path = self.directory / 'pieces é.txt'
+        lines = ''.join(f'line {index}\n' for index in range(40000))
+        expected = 'é🙂\n' + lines + 'abcde' * 70000 + 'end'
+        self.executes('''let pieces: List<Text> = []
+pieces.add("")
+pieces.add("é🙂\\n")
+let index = 0
+while index < 40000 {
+    pieces.add("line ")
+    pieces.add(Text(index))
+    pieces.add("\\n")
+    index = index + 1
+}
+let filler: List<Text> = []
+index = 0
+while index < 70000 {
+    filler.add("abcde")
+    index = index + 1
+}
+pieces.add(joinText(filler))
+pieces.add("end")
+writeTextFile(argument(0), pieces)
+let written = readTextFile(argument(0))
+print(written == joinText(pieces))
+print(written.byteLength)
+''', f'true\n{len(expected.encode("utf-8"))}\n', arguments=(str(path),),
+            file_outputs=((path, expected.encode('utf-8')),))
+        result, llvm = self.compile('let pieces: List<Text> = []\npieces.add("x")\nwriteTextFile(argument(0), pieces)\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('call void @minyar_write_text_parts(', llvm.read_text())
+        exe = llvm.with_suffix('.exe')
+        self.evidence.run(clang_command([CLANG, '-O2', *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)]), check=True, capture_output=True, timeout=30)
+        run = self.evidence.run([str(exe), str(self.directory)], capture_output=True, timeout=RUN_TIMEOUT)
+        self.assertEqual(run.returncode, 1)
+        self.assertIn(b'could not be created', run.stderr)
+
     def test_invalid_arithmetic_and_ordering(self):
         for operator in ('+', '-', '*', '/', '%'):
             for value in ('true', "'a'", '"text"'):
@@ -355,7 +395,7 @@ print(read[2])
                     self.rejects(f'{name}({arguments})\n', f'{name} expects')
 
     def test_builtin_types(self):
-        for expression in ('fail(1)', 'exit("x")', 'argument(true)', 'readTextFile(42)', 'writeTextFile("x", 1)', 'writeTextFile(1, "x")', 'joinText("x")', 'Text([])', 'print([])'):
+        for expression in ('fail(1)', 'exit("x")', 'argument(true)', 'readTextFile(42)', 'writeTextFile("x", 1)', 'writeTextFile(1, "x")', 'writeTextFile("x", [1, 2])', 'joinText("x")', 'Text([])', 'print([])'):
             with self.subTest(expression=expression):
                 self.rejects(expression + '\n', 'expects')
 

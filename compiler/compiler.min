@@ -3404,8 +3404,8 @@ function checkBuiltinArguments(name: Text, types: List<Integer>) {
             if name == "joinText" && type != 100002 {
                 fail("joinText expects one List<Text> argument")
             }
-            if name == "writeTextFile" && (type != 2 || types[1] != 2) {
-                fail("writeTextFile expects two Text arguments")
+            if name == "writeTextFile" && (type != 2 || (types[1] != 2 && types[1] != 100002)) {
+                fail("writeTextFile expects a Text path and Text or List<Text> contents")
             }
         }
     }
@@ -3795,7 +3795,12 @@ function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                             setType(resultType, 2)
                         } else {
                             if name == "writeTextFile" {
-                                output.add("  call void @minyar_write_text_file(ptr ")
+                                // A List<Text> is written piece by piece, never joined.
+                                if argumentTypes[1] == 100002 {
+                                    output.add("  call void @minyar_write_text_parts(ptr ")
+                                } else {
+                                    output.add("  call void @minyar_write_text_file(ptr ")
+                                }
                                 output.add(argumentValues[0])
                                 output.add(", ptr ")
                                 output.add(argumentValues[1])
@@ -5364,7 +5369,7 @@ function compileTopLevel(tokenKinds: List<Integer>, tokenTexts: List<Text>, toke
     output.add("}\n\n")
 }
 
-function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, scannedStarts: List<Integer>, scannedEnds: List<Integer>, stackOwnerLimit: Integer): Text {
+function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, scannedStarts: List<Integer>, scannedEnds: List<Integer>, stackOwnerLimit: Integer): List<Text> {
     // `parallel function` marks a function that may run on any processor. The
     // modifier becomes a line break so every later pass sees an ordinary
     // function; the names travel to compileFunctions as markers in `globals`.
@@ -5549,6 +5554,7 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     output.add("declare ptr @minyar_argument(i64)\n")
     output.add("declare ptr @minyar_read_text_file(ptr)\n")
     output.add("declare void @minyar_write_text_file(ptr, ptr)\n")
+    output.add("declare void @minyar_write_text_parts(ptr, ptr)\n")
     output.add("declare ptr @minyar_list_new()\n")
     output.add("declare void @minyar_list_references(ptr)\n")
     output.add("declare void @minyar_list_add(ptr, i64)\n")
@@ -5588,8 +5594,13 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
         output.add("declare void @minyar_rc_leave_stack_v1(ptr)\n")
     }
     if hasNative { appendNativeDeclarations(output) }
-    if globals.length == 0 { return joinText(output) }
-    return joinText(globals) + joinText(output)
+    // The module's pieces go to writeTextFile unjoined. Globals, when there
+    // are any, come first as one piece.
+    if globals.length == 0 { return output }
+    let pieces: List<Text> = []
+    pieces.add(joinText(globals))
+    pieces.add(joinText(output))
+    return pieces
 }
 
 function compileProgram(source: Text): Text {
@@ -5599,7 +5610,7 @@ function compileProgram(source: Text): Text {
     tokenize(source, tokenKinds, tokenTexts, tokenLines)
     let scannedStarts: List<Integer> = []
     let scannedEnds: List<Integer> = []
-    return compileTokens(tokenKinds, tokenTexts, tokenLines, scannedStarts, scannedEnds, 0)
+    return joinText(compileTokens(tokenKinds, tokenTexts, tokenLines, scannedStarts, scannedEnds, 0))
 }
 
 function pathCharacterIsSeparator(character: Character): Boolean {
@@ -6144,10 +6155,10 @@ function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integ
 }
 
 function compileEntry(path: Text, stackOwnerLimit: Integer): Text {
-    return compileEntryWithLibrary(path, stackOwnerLimit, "")
+    return joinText(compileEntryWithLibrary(path, stackOwnerLimit, ""))
 }
 
-function compileEntryWithLibrary(path: Text, stackOwnerLimit: Integer, library: Text): Text {
+function compileEntryWithLibrary(path: Text, stackOwnerLimit: Integer, library: Text): List<Text> {
     let modulePaths: List<Text> = []
     let moduleSources: List<Text> = []
     let moduleStates: List<Integer> = []
@@ -6267,14 +6278,16 @@ function main() {
             }
             position = position + 1
         }
-        let llvm = compileEntryWithLibrary(argument(0), stackOwnerLimit, library)
+        let pieces = compileEntryWithLibrary(argument(0), stackOwnerLimit, library)
         if freestanding {
-            llvm = freestandingModule(llvm)
+            let module: List<Text> = []
+            module.add(freestandingModule(joinText(pieces)))
+            pieces = module
         }
         if argumentCount() == 1 {
-            print(llvm)
+            print(joinText(pieces))
         } else {
-            writeTextFile(argument(1), llvm)
+            writeTextFile(argument(1), pieces)
         }
     }
 }

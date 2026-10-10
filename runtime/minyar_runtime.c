@@ -1172,7 +1172,7 @@ MinyarText *minyar_read_text_file(const MinyarText *path_text) {
     return new_text(bytes, length, -1);
 }
 
-void minyar_write_text_file(const MinyarText *path_text, const MinyarText *contents) {
+static FILE *create_text_file(const MinyarText *path_text) {
     char *path = text_as_path(path_text);
     FILE *file = open_text_path(path, "wb");
 #if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
@@ -1182,10 +1182,53 @@ void minyar_write_text_file(const MinyarText *path_text, const MinyarText *conte
 #endif
     if (!file)
         minyar_stop("a requested text file could not be created.");
-    if (fwrite(contents->bytes, 1, (size_t)contents->byte_length, file) !=
-            (size_t)contents->byte_length ||
-        fclose(file) != 0)
+    return file;
+}
+
+static void finish_text_file(FILE *file, int written) {
+    if (!written || fclose(file) != 0)
         minyar_stop("a requested text file could not be written.");
+}
+
+void minyar_write_text_file(const MinyarText *path_text, const MinyarText *contents) {
+    FILE *file = create_text_file(path_text);
+    finish_text_file(file, fwrite(contents->bytes, 1, (size_t)contents->byte_length, file) ==
+                               (size_t)contents->byte_length);
+}
+
+#ifndef MINYAR_WRITE_PARTS_BUFFER
+#define MINYAR_WRITE_PARTS_BUFFER (256u * 1024u)
+#endif
+
+/* writeTextFile(path, pieces) writes what joinText(pieces) would contain
+ * without building it, so a program that emits its output in many small
+ * pieces (the compiler emits about 200,000) never holds the whole file twice.
+ * Pieces are gathered in a buffer large enough that per-write file system
+ * costs stay small; each write call costs tens of thousands of instructions. */
+void minyar_write_text_parts(const MinyarText *path_text, const MinyarList *parts) {
+    FILE *file = create_text_file(path_text);
+    unsigned char *buffer = malloc(MINYAR_WRITE_PARTS_BUFFER);
+    size_t used = 0;
+    int written = 1;
+    if (!buffer)
+        out_of_memory();
+    for (long long index = 0; written && index < parts->length; index++) {
+        const MinyarText *part = (const MinyarText *)(intptr_t)parts->values[index];
+        size_t length = (size_t)part->byte_length;
+        if (length > MINYAR_WRITE_PARTS_BUFFER - used) {
+            written = fwrite(buffer, 1, used, file) == used;
+            used = 0;
+            if (length > MINYAR_WRITE_PARTS_BUFFER) {
+                written = written && fwrite(part->bytes, 1, length, file) == length;
+                continue;
+            }
+        }
+        copy_bytes(buffer + used, part->bytes, length);
+        used += length;
+    }
+    written = written && fwrite(buffer, 1, used, file) == used;
+    free(buffer);
+    finish_text_file(file, written);
 }
 
 #include "minyar_numbers.h"
