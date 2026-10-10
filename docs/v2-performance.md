@@ -123,6 +123,59 @@ requires that the leaf has no guard and both callers keep theirs, and that the
 leaf still runs at the deepest allowed frame before the clean overflow stop.
 The test fails on the previous compiler.
 
+### 4. Two competing `http` packages
+
+Not a speed fix, but one of the limits the brief named. appkit's NSURLSession
+`http` and minyar-os's portable socket/TLS `http` both arrived in v2 under the
+same name with the same blocking API. They are now one package with two
+backends, chosen by the package search path in the way `library/arch/arm64`
+already replaced `machine`:
+
+- `library/http.min` is the portable client (`net` + `tls`; it does not
+  validate certificates).
+- `library/platform/macos/http.min` is the NSURLSession client. `./minyar`
+  searches it first on macOS, and it adds the streaming handle API that
+  Atacama uses.
+- `./minyar` gained `--library DIR`, searched before the standard
+  directories, so `./minyar --library library` selects the portable client on
+  macOS.
+
+`examples/fetch` builds unchanged against either backend. On macOS it links
+`minyar_http_*` by default and `minyar_net_*` with `--library library`, and
+both fetched from a local server. `check-http`, `check-modules` and
+`tests/tls-local.py` (now forced onto the portable backend) pass, and the
+Atacama app builds and streams.
+
+Packages cannot hold state ("imported modules contain declarations only"),
+so a portable `start`/`read` would need a request record instead of an
+integer handle. That is the remaining gap if streaming is ever needed outside
+macOS.
+
+## Gates
+
+`make check-budget` (the compiler's self-compile budget) was already failing
+before tonight. The leaf-function change narrowed the gap but did not close
+it:
+
+| | Instructions (limit 75.0M) | Peak memory (limit 10.0 MiB) |
+| --- | ---: | ---: |
+| v2 before | about 91M | 10.8 MiB |
+| v2 after | 80.7M | 10.8 MiB |
+
+A Time Profiler trace of 300 self-compiles (`xctrace`, all processes) puts
+`minyar_join_texts` at 14% self time, dyld start-up at about 20%, and the rest
+spread across `compileFunctions`, `parseAtom`, `tokenIs` and `findLocal`, which
+are already tuned.
+
+## Tried and reverted
+
+- **Joining the compiler's output once.** `compileTokens` returned
+  `joinText(globals) + joinText(output)`, copying the 1.8 MB module twice.
+  Giving the globals slot 0 of `output` produced byte-identical output but
+  measured 81.2-81.8M instructions against 81.8-83.3M before, and the same
+  10.55 MB peak footprint (the compiler's arena dominates). That is within
+  noise, so it was reverted.
+
 ## Measured and not a bottleneck
 
 - **Compile times.** Front-end compile of real programs, in retired
