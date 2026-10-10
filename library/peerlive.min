@@ -70,6 +70,29 @@ function ipv6(text: Text): Boolean {
     if compressed { return groups < 8 }
     return groups == 8
 }
+// An advertised route is a dialable authority, never a URL or a process label.
+public function edgeEndpoint(text: Text): Boolean {
+    if text.length < 3 || text.length > 260 { return false }
+    let separator = -1
+    for index in 0..text.length { if text[index] == ':' { separator = index } }
+    if separator < 1 || separator >= text.length-1 || natural(text.slice(separator+1,text.length),65535) < 1 { return false }
+    let host = text.slice(0,separator)
+    if host[0] == '[' {
+        return host.length >= 4 && host[host.length-1] == ']' && ipv6(host.slice(1,host.length-1))
+    }
+    if host.length > 253 { return false }
+    let label = 0; let previous: Character = '.'
+    for c in host {
+        if c == '.' {
+            if label < 1 || previous == '-' { return false }; label = 0
+        } else {
+            if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-') || (label == 0 && c == '-') { return false }
+            label += 1; if label > 63 { return false }
+        }
+        previous = c
+    }
+    return label > 0 && previous != '-'
+}
 function printable(text: Text): Boolean {
     if text.length > 128 { return false }
     for c in text { if Integer(c) < 32 || Integer(c) > 126 { return false } }
@@ -104,9 +127,19 @@ public function heartbeat(data: Bytes): Health {
 public function reportedInFlight(health: Health): Integer { if !ok(health) { fail("failed heartbeat") }; return number(health.document,"in_flight",1000000) }
 public function maximum(health: Health): Integer { if !ok(health) { fail("failed heartbeat") }; return number(health.document,"max_concurrent",1000000) }
 public function paused(health: Health): Boolean { if !ok(health) { fail("failed heartbeat") }; return json.member(health.document,"paused").truth }
+public function capMaximum(health: Health, trustedMaximum: Integer): Health {
+    if !ok(health) { return health }
+    if trustedMaximum < 1 || trustedMaximum > 1000000 { return bad("invalid registry capacity") }
+    // Copy before replacing a member: callers may retain the raw heartbeat.
+    let document = json.parseUniqueBytes(Bytes(json.pretty(health.document,"")),16384)
+    for index in 0..document.keys.length {
+        if document.keys[index] == "max_concurrent" { document.items[index] = json.parse(Text(min(maximum(health),trustedMaximum))) }
+    }
+    return Health { document: document; error: errors.none() }
+}
 public function payload(health: Health, exit: Text, edge: Text, epoch: Text, now: Integer, admitted: Integer, registryPaused: Boolean, quarantined: Boolean, healthFactor: Float): errors.BytesResult {
     if !ok(health) { return errors.bytesFailure(health.error) }
-    if !identifier(exit) || !identifier(edge) || !digest(epoch) || now < 0 || now > 9007199254740991 || admitted < 0 || admitted > 1000000 || healthFactor != healthFactor || healthFactor < 0.0 || healthFactor > 1.0 {
+    if !identifier(exit) || (!identifier(edge) && !edgeEndpoint(edge)) || !digest(epoch) || now < 0 || now > 9007199254740991 || admitted < 0 || admitted > 1000000 || healthFactor != healthFactor || healthFactor < 0.0 || healthFactor > 1.0 {
         return errors.bytesFailure(errors.make(errors.invalidDataCode(),0,"invalid trusted live-state fields"))
     }
     let document = health.document; let count = max(admitted,reportedInFlight(health)); let limit = maximum(health)
@@ -121,6 +154,13 @@ public function payload(health: Health, exit: Text, edge: Text, epoch: Text, now
         ",\"public_ip\":" + json.quote(json.string(document,"public_ip")) + ",\"asn\":" + json.member(document,"asn").text +
         ",\"country\":" + json.quote(json.string(document,"country")) + ",\"sticky\":" + stickyText + ",\"ts\":" + Text(now) + "}"
     return errors.bytes(Bytes(output))
+}
+public function payloadRegion(health: Health, exit: Text, edge: Text, region: Text, epoch: Text, now: Integer, admitted: Integer, registryPaused: Boolean, quarantined: Boolean, healthFactor: Float): errors.BytesResult {
+    if !edgeEndpoint(edge) || !identifier(region) { return errors.bytesFailure(errors.make(errors.invalidDataCode(),0,"invalid advertised edge route")) }
+    let base = payload(health,exit,edge,epoch,now,admitted,registryPaused,quarantined,healthFactor)
+    if !errors.bytesOk(base) { return base }
+    let bytes = errors.bytesValue(base); let result = bytes.slice(0,bytes.length-1)
+    result.addBytes(Bytes(",\"edge_region\":" + json.quote(region) + "}")); return errors.bytes(result)
 }
 function commandFailure(): errors.BytesResult { return errors.bytesFailure(errors.make(errors.invalidDataCode(),0,"invalid fenced live command")) }
 function validState(exit: Text, epoch: Text, state: Bytes): Boolean {
