@@ -10,6 +10,62 @@ static MinyarBytes *batch_send_result(unsigned status, int code, unsigned count)
     put32((unsigned char *)b->bytes + 8, count);
     return b;
 }
+/* Peer addresses come from receiveBatchResult. AI_NUMERICHOST guarantees this
+ * packet path cannot initiate DNS; a server's socket stays unconnected. */
+MinyarBytes *minyar_net_sendToResult(long long connection, const MinyarText *host, long long port,
+                                     const MinyarBytes *data) {
+    if (!valid_socket(connection) || port < 1 || port > 65535 || host->byte_length < 1 ||
+        host->byte_length > 255 || data->byte_length < 0 || data->byte_length > NET_DATAGRAM_LIMIT)
+        return batch_send_result(NET_FAILURE, BAD_ARGUMENT, 0);
+    for (long long i = 0; i < host->byte_length; i++)
+        if (host->bytes[i] < 33 || host->bytes[i] > 126)
+            return batch_send_result(NET_FAILURE, BAD_ARGUMENT, 0);
+    int type = 0;
+    socklen_t type_length = sizeof(type);
+    if (getsockopt((socket_t)connection, SOL_SOCKET, SO_TYPE, (char *)&type, &type_length))
+        return batch_send_result(NET_FAILURE, socket_error(), 0);
+    if (type != SOCK_DGRAM)
+        return batch_send_result(NET_FAILURE, BAD_ARGUMENT, 0);
+    char name[256], service[6];
+    memcpy(name, host->bytes, (size_t)host->byte_length);
+    name[host->byte_length] = 0;
+    snprintf(service, sizeof(service), "%lld", port);
+    struct addrinfo hints = {0}, *found = NULL;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
+    if (getaddrinfo(name, service, &hints, &found))
+        return batch_send_result(NET_FAILURE, BAD_ARGUMENT, 0);
+    long long sent = -1;
+    int code = BAD_ARGUMENT;
+#ifdef _WIN32
+    if (!minyar_net_nonBlocking(connection, true)) {
+        code = socket_error();
+        freeaddrinfo(found);
+        return batch_send_result(NET_FAILURE, code, 0);
+    }
+#endif
+    for (struct addrinfo *peer = found; peer; peer = peer->ai_next) {
+        do {
+            int flags = 0;
+#ifndef _WIN32
+            flags = MSG_DONTWAIT;
+#ifdef MSG_NOSIGNAL
+            flags |= MSG_NOSIGNAL;
+#endif
+#endif
+            sent = sendto((socket_t)connection, (const char *)data->bytes, (int)data->byte_length,
+                          flags, peer->ai_addr, (socklen_t)peer->ai_addrlen);
+            code = sent < 0 ? socket_error() : 0;
+        } while (sent < 0 && interrupted(code));
+        if (sent >= 0 || would_block(code))
+            break;
+    }
+    freeaddrinfo(found);
+    return batch_send_result(sent < 0 ? (would_block(code) ? NET_WOULD_BLOCK : NET_FAILURE)
+                                      : NET_OK,
+                             code, sent < 0 ? 0 : (unsigned)sent);
+}
 MinyarBytes *minyar_net_sendBatchResult(long long connection, const MinyarBytes *packets) {
     if (!valid_socket(connection) || packets->byte_length < 4)
         return batch_send_result(NET_FAILURE, BAD_ARGUMENT, 0);

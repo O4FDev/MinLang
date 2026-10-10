@@ -11,6 +11,7 @@ bool minyar_net_udpConnect(long long, const MinyarText *, long long);
 bool minyar_net_ready(long long, long long);
 MinyarBytes *minyar_net_sendBatchResult(long long, const MinyarBytes *);
 MinyarBytes *minyar_net_receiveBatchResult(long long, long long, long long);
+MinyarBytes *minyar_net_sendToResult(long long, const MinyarText *, long long, const MinyarBytes *);
 void minyar_net_close(long long);
 void minyar_rc_release(void *);
 
@@ -29,6 +30,27 @@ int main(void) {
     MinyarText host = {(const unsigned char *)"127.0.0.1", 9, 0, NULL, NULL};
     long long receiver = minyar_net_udp(&host, 0), sender = minyar_net_udp(&host, 0);
     assert(receiver >= 0 && sender >= 0);
+    /* A server can reply to the numeric source of a datagram without DNS,
+     * changing its socket's peer filter, or losing zero-length packets. */
+    MinyarBytes empty = {NULL, 0, 0, NULL, NULL};
+    MinyarBytes *reply =
+        minyar_net_sendToResult(receiver, &host, minyar_net_localPort(sender), &empty);
+    assert(read32(reply, 0) == 0 && read32(reply, 8) == 0);
+    minyar_rc_release(reply);
+    assert(minyar_net_ready(sender, 1000));
+    reply = minyar_net_receiveBatchResult(sender, 1, 1024);
+    assert(read32(reply, 0) == 0 && read32(reply, 8) == 1 && read32(reply, 12) == 0);
+    assert(read32(reply, 20) == (unsigned)minyar_net_localPort(receiver));
+    minyar_rc_release(reply);
+    const char *invalid_hosts[] = {"localhost", "", "127.0.0.1.invalid", "[::1]", "127.0.0.1\n"};
+    for (unsigned i = 0; i < sizeof(invalid_hosts) / sizeof(*invalid_hosts); i++) {
+        MinyarText bad = {(const unsigned char *)invalid_hosts[i],
+                          (long long)strlen(invalid_hosts[i]), 0, NULL, NULL};
+        reply = minyar_net_sendToResult(receiver, &bad, minyar_net_localPort(sender), &empty);
+        assert(read32(reply, 0) == 3);
+        minyar_rc_release(reply);
+        assert(!minyar_net_ready(sender, 0));
+    }
     long long sender_port = minyar_net_localPort(sender);
     assert(minyar_net_udpConnect(sender, &host, minyar_net_localPort(receiver)));
     MinyarBytes *packets = minyar_bytes_new(0);

@@ -416,3 +416,10 @@ MinyarText *minyar_net_lastError(void) {
 
 #include "net_datagrams.h"
 #include "net_loop.h"
+
+long long minyar_net_monotonicMilliseconds(void) {
+    uint64_t now = net_loop_now();
+    if (now > LLONG_MAX)
+        minyar_native_stop("monotonic clock exceeds Integer range");
+    return (long long)now;
+}
