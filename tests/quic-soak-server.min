@@ -14,6 +14,16 @@ function number(text: Text): Integer { let value = 0; for digit in text { value 
 function mark(peers: List<Peer>, work: List<Integer>, id: Integer) {
     if id >= 0 && id < peers.length && peers[id].live && !peers[id].queued { peers[id].queued = true; work.add(id) }
 }
+function idleFixture(connection: quic.Connection) {
+    connection.idleTimeout=180000
+    let parameters=wire.parameters(connection.serverTLS.transportParameters,true);let changed=Bytes()
+    for parameter in parameters.parameters {
+        let value=parameter.value
+        if parameter.id==1 { value=errors.bytesValue(wire.encode(180000)) }
+        changed.addBytes(errors.bytesValue(wire.encode(parameter.id)));changed.addBytes(errors.bytesValue(wire.encode(value.length)));changed.addBytes(value)
+    }
+    connection.serverTLS.transportParameters=changed
+}
 function main(): Integer {
     let duration = number(argument(3)); let maximum = number(argument(4))
     if duration < 1 || maximum < 1 || maximum > 32768 { return 1 }
@@ -27,9 +37,13 @@ function main(): Integer {
     let issueTickets = argumentCount() > 5 && (argument(5) == "tickets" || argument(5) == "early")
     let store = tickets.store(randomBytes(16),3600); let resumed = 0
     if argumentCount() > 5 && argument(5) == "early" { tickets.allowEarlyData(store,0xffffffff) }
-    let started = net.monotonicMilliseconds(); let now = 0
+    let started = net.monotonicMilliseconds(); let now = 0; let retainedAt = 10000
     while now < duration {
         now = net.monotonicMilliseconds() - started
+        if argumentCount()>5 && argument(5)=="idle" && now >= retainedAt {
+            print("RETAINED " + Text(now) + " " + Text(active) + " " + Text(authenticated) + " " + Text(routing.count) + " " + Text(timers.count))
+            retainedAt = now + 10000
+        }
         let due = dispatch.takeDue(timers,now)
         while due >= 0 { mark(peers,work,due); due = dispatch.takeDue(timers,now) }
         for id in work {
@@ -91,6 +105,7 @@ function main(): Integer {
                             if header.valid && header.kind == wire.INITIAL && data.length >= 1200 {
                                 let connection = quic.server(randomBytes(80),"minyar-test",header.destination,[identity],key,[root],true)
                                 if issueTickets { connection = quic.serverWithTickets(randomBytes(80),"minyar-test",header.destination,[identity],key,[root],true,store) }
+                                if argumentCount()>5 && argument(5)=="idle" { idleFixture(connection) }
                                 if dispatch.lookup(routing,connection.local) < 0 {
                                     id = peers.length; if freeCount > 0 { freeCount -= 1; id = free[freeCount] }
                                     if !errors.booleanOk(dispatch.insert(routing,connection.local,id)) || !errors.booleanOk(dispatch.insert(routing,header.destination,id)) { return 5 }
@@ -111,6 +126,7 @@ function main(): Integer {
     loop.close(eventLoop); net.close(socket)
     print("RESULT " + Text(accepted) + " " + Text(echoes) + " " + Text(failures))
     print("AUTHENTICATED_TOTAL " + Text(authenticated) + " PEAK " + Text(peak) + " ROUTES " + Text(routing.entries.length) + " SLOTS " + Text(peers.length))
+    print("LIVE " + Text(active) + " LIVE_ROUTES " + Text(routing.count) + " LIVE_TIMERS " + Text(timers.count))
     if issueTickets { print("RESUMED " + Text(resumed)) }
     if failures > 0 { return 4 }; return 0
 }

@@ -45,9 +45,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                               PrivatePkcs8KeyDer::from(fs::read(&args[4])?).into())?;
     crypto.alpn_protocols = vec![b"minyar-test".to_vec()];
     crypto.enable_early_data = env::var_os("MINYAR_QUINN_EARLY").is_some();
+    let idle_seconds: u64=env::var("MINYAR_QUINN_IDLE_SECONDS").unwrap_or_else(|_| "0".into()).parse()?;
+    if idle_seconds>120 { return Err("idle fixture exceeds bounded window".into()); }
     let mut config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
     let mut transport=quinn::TransportConfig::default();
-    transport.keep_alive_interval(Some(Duration::from_secs(15)));config.transport_config(Arc::new(transport));
+    if idle_seconds>0 { transport.max_idle_timeout(Some(Duration::from_secs(180).try_into()?)); }
+    else { transport.keep_alive_interval(Some(Duration::from_secs(15))); }
+    config.transport_config(Arc::new(transport));
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
     endpoint.set_default_client_config(config);
     if args.len() > 7 {
@@ -77,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // releasing ten thousand writes in a single scheduler burst.
                 tokio::time::sleep(Duration::from_millis((id as u64*7919)%interval)).await;
                 let mut echoes = 0u64;
-                while started.elapsed() < Duration::from_secs(duration) {
+                while started.elapsed() < Duration::from_secs(duration) || (idle_seconds>0 && echoes==0) {
                     let mut message = [0u8; 64];
                     message[..8].copy_from_slice(&(id as u64).to_be_bytes());
                     message[8..16].copy_from_slice(&echoes.to_be_bytes());
@@ -86,7 +90,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     receive.read_exact(&mut reply).await?;
                     assert_eq!(reply, message);
                     echoes += 1;
+                    if idle_seconds>0 { break; }
                     tokio::time::sleep(Duration::from_millis(interval)).await;
+                }
+                if idle_seconds>0 {
+                    tokio::time::timeout(Duration::from_secs(600),barrier.wait()).await?;
+                    if id==0 { println!("IDLE_READY {peers} {idle_seconds}"); }
+                    tokio::time::sleep(Duration::from_secs(idle_seconds)).await;
+                    // Stagger teardown after the measured connected-idle
+                    // period, so shutdown itself does not flood socket queues.
+                    tokio::time::sleep(Duration::from_millis(id as u64*5)).await;
                 }
                 send.finish()?;
                 connection.close(0u32.into(), b"soak complete");

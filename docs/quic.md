@@ -267,6 +267,20 @@ Linux `/proc` RSS/CPU samples. `--server-only --front-address ADDRESS
 records the executable/source hashes, versions, raw samples, faults, and exit
 statuses; an external process deadline is still recommended.
 
+The fixture accepts up to 16,384 peers, with a setup allowance separated from
+the full duration after all peers authenticate. `tests/quic-peer-soak.py`
+records the independent peer's own CPU/RSS and binary hash, with file-backed
+output and an independent deadline. A separate `--idle-seconds` run negotiates
+180-second idle timeouts, disables Quinn keepalives, waits for one authenticated
+echo from every peer and a second barrier, then pauses for at most 120 seconds.
+Server `RETAINED` records expose active/authenticated counts, CID routes and
+timer entries. Proxy counters in each sample distinguish zero-ingress connected
+idle from a heartbeat/loss workload. Teardown is staggered after the quiet
+window; final live connections, routes and timers must all be zero. Such a
+measurement also requires a coordinated quiet host window without other
+builds or interoperability traffic. The fixture itself establishes no
+production capacity, idle-cost or flat-memory claim.
+
 Functional soak success, flat memory, and near-zero idle CPU must be reported
 from completed artifacts. A startup-only idle sample, a bounded parser fuzz
 run, and a loopback echo do not establish those results.
