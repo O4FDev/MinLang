@@ -791,7 +791,7 @@ bool minyar_windows_nextEvent(double seconds) {
             // The COM activator stores only native data and wakes this owner.
             // The caller consumes the typed winnotify.nextAction() result.
             if (message.message == WM_APP + 0x249 && !message.hwnd)
-                return false;
+                return true;
             if (message.message == WM_QUIT)
                 minyar_windows_quit();
             else if (message.message == WM_KEYDOWN && message.wParam == VK_RETURN) {
