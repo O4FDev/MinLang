@@ -26,6 +26,7 @@ record Cursor {
     text: Text
     position: Integer
     error: Text
+    strict: Boolean
 }
 
 function leaf(kind: Integer, text: Text, number: Float, truth: Boolean): Value {
@@ -33,7 +34,11 @@ function leaf(kind: Integer, text: Text, number: Float, truth: Boolean): Value {
 }
 
 public function parse(source: Text): Value {
-    let cursor = Cursor { text: source; position: 0; error: "" }
+    return parseText(source, false)
+}
+
+function parseText(source: Text, strict: Boolean): Value {
+    let cursor = Cursor { text: source; position: 0; error: ""; strict: strict }
     let value = parseValue(cursor, 0)
     skipSpace(cursor)
     if cursor.error == "" && cursor.position != source.length {
@@ -99,12 +104,22 @@ record UniqueCheck {
 // parse() keeps its ordinary JSON duplicate-name policy.
 public function parseUnique(source: Text): Value {
     if source.length > 65536 { return leaf(INVALID, "JSON metadata limit exceeded", 0.0, false) }
-    let value = parse(source)
+    let value = parseText(source, true)
     if value.kind == INVALID { return value }
     let check = UniqueCheck { remaining: 4096; error: "" }
     uniqueNames(value, check)
     if check.error != "" { return leaf(INVALID, check.error, 0.0, false) }
     return value
+}
+
+// Network metadata validates bytes before Text conversion, decoded names and
+// Unicode surrogates. Ordinary parse() retains its existing replacement policy.
+public function parseUniqueBytes(source: Bytes, maximumBytes: Integer): Value {
+    if maximumBytes <= 0 || source.length > maximumBytes || source.length > 65536 {
+        return leaf(INVALID, "JSON metadata byte limit exceeded", 0.0, false)
+    }
+    if !validUTF8(source) { return leaf(INVALID, "invalid JSON UTF-8", 0.0, false) }
+    return parseUnique(Text(source))
 }
 
 function uniqueNames(value: Value, check: UniqueCheck) {
@@ -296,7 +311,10 @@ function parseString(cursor: Cursor): Text {
                         cursor.position += 6
                     }
                 }
-                if code >= 0xD800 && code < 0xE000 { code = 0xFFFD }
+                if code >= 0xD800 && code < 0xE000 {
+                    if cursor.strict { failure(cursor, "unpaired Unicode surrogate"); return "" }
+                    code = 0xFFFD
+                }
                 parts.add(Text(Character(code)))
             }
             if e != 'n' && e != 't' && e != 'r' && e != 'b' && e != 'f' && e != '"' && e != '\\' && e != '/' && e != 'u' {
