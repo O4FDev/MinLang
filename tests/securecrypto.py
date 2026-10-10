@@ -11,5 +11,8 @@ def main():
     with tempfile.TemporaryDirectory(prefix='minyar-native-crypto-') as temporary:
         binary=Path(temporary)/'crypto';fixtures.compile_program(ROOT/'tests/securecrypto.min',binary)
         result=subprocess.run([str(binary)],capture_output=True,text=True,timeout=120)
-        assert result.returncode==0,(result.returncode,result.stdout,result.stderr);print(result.stdout,end='')
+        assert result.returncode==0 and not result.stderr,(result.returncode,result.stdout,result.stderr);print(result.stdout,end='')
+        shared=Path(temporary)/'shared';fixtures.compile_program(ROOT/'tests/securecrypto-update.min',shared)
+        result=subprocess.run([str(shared)],capture_output=True,text=True,timeout=120)
+        assert (result.returncode,result.stdout,result.stderr)==(0,'true\ntrue\n',''),(result.returncode,result.stdout,result.stderr)
 if __name__=='__main__':main()

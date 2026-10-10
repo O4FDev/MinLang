@@ -319,6 +319,8 @@ def main():
     if {'macos', 'net'} <= libraries:
         native_flags = [*native_flags, '-DMINYAR_APP_EVENT_LOOP=1']
     base = clang_identity(clang) if libraries - {'machine', 'machine_arm64'} else None
+    if libraries & {'securecrypto', 'update'}:
+        native += [native_object(project, clang, base, 'update_monocypher.c', native_flags)]
     for library in sorted(libraries):
         if library == 'graphics':
             native += graphics(project, clang, base, native_flags)
@@ -357,7 +359,7 @@ def main():
                 native += ['-lws2_32']
         elif library == 'update':
             native += [native_object(project, clang, base, name, native_flags)
-                       for name in ('update.c', 'update_monocypher.c', 'update_ed25519.c')]
+                       for name in ('update.c', 'update_ed25519.c')]
         elif library == 'workers':
             native += [native_object(project, clang, base, 'workers.c', native_flags)]
             if platform.system() != 'Windows':
@@ -374,8 +376,7 @@ def main():
             elif platform.system() != 'Darwin':
                 native += ['-lcrypto']
         elif library == 'securecrypto':
-            native += [native_object(project, clang, base, name, native_flags)
-                       for name in ('securecrypto.c', 'update_monocypher.c')]
+            native += [native_object(project, clang, base, 'securecrypto.c', native_flags)]
         elif library == 'tlsverify':
             native += [native_object(project, clang, base, 'tlsverify.c', native_flags)]
             if platform.system() == 'Darwin':
