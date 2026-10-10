@@ -1,0 +1,62 @@
+// Independent grpcio client fixture. Plain loopback transport only; root tests
+// the same parser behind actual mTLS/ALPN h2. No production socket adapter.
+use "peergrpc" as grpc
+use "net" as net
+use "errors" as errors
+record Active { id: Integer; pending: Bytes; ended: Boolean }
+let listener = net.listen("127.0.0.1", 0, 8)
+if listener < 0 { fail(net.lastError()) }
+print(Text(net.localPort(listener)))
+if !net.ready(listener, 10000) { fail("independent gRPC client did not connect") }
+let socket = net.accept(listener); net.close(listener)
+if socket < 0 || !net.nonBlocking(socket, true) { fail("test peer accept failed") }
+let server = grpc.create(); let calls: List<Active> = []; let output = Bytes()
+let started = net.monotonicMilliseconds(); let running = true
+while running && net.monotonicMilliseconds() - started < 12000 {
+    let mono = net.monotonicMilliseconds(); let wall = 1000000 + mono - started
+    let clocked = grpc.transportTick(server, mono)
+    if !errors.booleanOk(clocked) { fail("HTTP/2 transport timer failed") }
+    grpc.tick(server, wall)
+    if net.ready(socket, 1) {
+        let input = net.read(socket, 16384)
+        if errors.bytesStatus(input) == errors.endOfStreamStatus() { running = false }
+        else if errors.bytesStatus(input) == errors.successStatus() {
+            let accepted = grpc.receive(server, errors.bytesValue(input))
+            if !errors.booleanOk(accepted) { fail("independent gRPC client violated HTTP/2: " + errors.message(errors.booleanError(accepted))) }
+        } else if !errors.isWouldBlock(errors.bytesError(input)) { running = false }
+    }
+    let opened = grpc.requests(server, wall)
+    while grpc.openOk(opened) {
+        let id = grpc.openStreamID(opened)
+        if grpc.openExitID(opened) != "exit-a" || grpc.openConnID(opened) == "" || Text(grpc.openGrantBytes(opened)) != "fixture.jwt.signature" { fail("independent gRPC open changed") }
+        let status = grpc.sendStatus(server, id, "ok")
+        if !errors.booleanOk(status) { fail("first status failed") }
+        calls.add(Active { id: id; pending: Bytes(); ended: false })
+        opened = grpc.requests(server, wall)
+    }
+    for call in calls {
+        if !call.ended {
+            if call.pending.length == 0 {
+                let received = grpc.read(server, call.id, 8192)
+                if errors.bytesStatus(received) == errors.successStatus() { call.pending = errors.bytesValue(received) }
+                else if errors.bytesStatus(received) == errors.endOfStreamStatus() {
+                    let ended = grpc.closeStream(server, call.id, 0, "")
+                    if errors.booleanOk(ended) { call.ended = true }
+                } else if !errors.isWouldBlock(errors.bytesError(received)) { call.ended = true }
+            }
+            if call.pending.length > 0 {
+                let written = grpc.write(server, call.id, call.pending)
+                if errors.booleanOk(written) { call.pending = Bytes() }
+                else if !errors.isWouldBlock(errors.booleanError(written)) { call.ended = true }
+            }
+        }
+    }
+    if output.length == 0 { output = grpc.takeOutgoing(server, 4096) }
+    if output.length > 0 {
+        let written = net.write(socket, output)
+        if errors.integerOk(written) { let count = errors.integerValue(written); if count > 0 { output = output.slice(count, output.length) } }
+        else if !errors.isWouldBlock(errors.integerError(written)) { running = false }
+    }
+}
+net.close(socket)
+print("SERVER END")

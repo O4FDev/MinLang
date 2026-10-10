@@ -1,0 +1,31 @@
+use "http2" as h2
+use "errors" as errors
+function require(value: Boolean, message: Text) { if !value { fail(message) } }
+let server = h2.create()
+require(errors.booleanOk(h2.receive(server, readBytesFile(argument(0)))), "independent headers rejected")
+let request = h2.requests(server)
+require(h2.requestOk(request) && h2.streamID(request) == 1, "independent request missing")
+require(errors.booleanOk(h2.respond(server, 1, [h2.Header { name: ":status"; value: "200" }], false)), "response start failed")
+while h2.takeOutgoing(server, 1048576).length > 0 { }
+// Independent peer sets stream window zero. Writes are accepted up to the exact
+// connection budget, but no DATA can leave until WINDOW_UPDATE arrives.
+let block = Bytes(); for i in 0..65536 { block.add(i & 255) }
+for i in 0..15 { require(errors.booleanOk(h2.write(server, 1, block)), "bounded send fill failed") }
+let tail = Bytes(); for i in 0..61440 { tail.add(90) }
+require(errors.booleanOk(h2.write(server, 1, tail)), "exact bounded tail rejected")
+require(h2.bufferedOutput(server) == 1044480, "output budget miscounted")
+let blocked = h2.write(server, 1, Bytes("x"))
+require(!errors.booleanOk(blocked) && errors.isWouldBlock(errors.booleanError(blocked)) && h2.bufferedOutput(server) == 1044480, "backpressure changed queued bytes")
+require(h2.takeOutgoing(server, 1048576).length == 0, "zero stream window emitted DATA")
+require(errors.booleanOk(h2.receive(server, readBytesFile(argument(1)))), "window credit rejected")
+let outgoing = h2.takeOutgoing(server, 1048576)
+require(outgoing.length > 0 && h2.bufferedOutput(server) < 1044480, "window credit did not release pending bytes")
+require(errors.booleanOk(h2.write(server, 1, Bytes("x"))), "drain did not permit retry")
+writeBytesFile(argument(2), outgoing)
+// Input feed overload is recoverable and accepts no prefix; legal small data
+// after that return must still reach the same decoder.
+let second = h2.create(); let excessive = Bytes(); for i in 0..1048577 { excessive.add(0) }
+let rejected = h2.receive(second, excessive)
+require(!errors.booleanOk(rejected) && errors.isWouldBlock(errors.booleanError(rejected)) && h2.bufferedInput(second) == 0 && !errors.isError(h2.connectionError(second)), "input overload was not recoverable")
+require(errors.booleanOk(h2.receive(second, readBytesFile(argument(0)))), "retry after input backpressure failed")
+print("BOUNDS OK")
