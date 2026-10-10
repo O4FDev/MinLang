@@ -1,0 +1,120 @@
+// Spreading work over processors, for code shared by the loader and the kernel.
+//
+// A job is a parallel function run once per item. The processors that
+// kernel/system/processors.min starts wait in `worker` there and run `work`
+// below whenever a job is opened; `run` opens one, works on it too, and
+// returns when every item is done. With no other processors (block 0) the
+// items simply run here, one after another.
+use "machine" as machine
+use "arch" as arch
+
+// The shared control block, one 64-bit field each.
+public constant GENERATION = 0
+public constant ENTRY = 8
+public constant ARGUMENTS = 16
+public constant COUNT = 24
+public constant NEXT = 32
+public constant COMPLETED = 40
+// Bytes 48 to 63 belong to the architecture (os/arch/*/arch.min).
+public constant ONLINE = 64
+public constant OPEN = 72
+public constant JOINED = 80
+
+// Claim and run items of the open job until none are left.
+public parallel function work(shared: Integer) {
+    let entry = machine.read64(shared + ENTRY)
+    let arguments = machine.read64(shared + ARGUMENTS)
+    let count = machine.read64(shared + COUNT)
+    let item = machine.atomicAdd(shared + NEXT, 1)
+    while item < count {
+        machine.callEntry(entry, item, arguments)
+        machine.atomicAdd(shared + COMPLETED, 1)
+        item = machine.atomicAdd(shared + NEXT, 1)
+    }
+}
+
+// Run the parallel function `entry` for every item in 0..count.
+public function run(block: Integer, processors: Integer, entry: Integer, count: Integer, arguments: Integer) {
+    if count <= 0 { return }
+    if block == 0 || processors <= 1 || count == 1 {
+        for item in 0..count {
+            machine.callEntry(entry, item, arguments)
+        }
+        return
+    }
+    // Anyone still leaving the last job finishes before it is replaced.
+    while machine.read64(block + JOINED) != 0 {
+        machine.pause()
+    }
+    machine.store64(block + ENTRY, entry)
+    machine.store64(block + ARGUMENTS, arguments)
+    machine.store64(block + COUNT, count)
+    machine.store64(block + NEXT, 0)
+    machine.store64(block + COMPLETED, 0)
+    machine.store64(block + OPEN, 1)
+    machine.fence()
+    machine.atomicAdd(block + GENERATION, 1)
+    arch.wakeProcessors()
+    work(block)
+    while machine.read64(block + COMPLETED) < count {
+        machine.pause()
+    }
+    // Close the job. Processors that wake late see it closed; only those
+    // already inside, which have no items left to claim, are waited for.
+    machine.store64(block + OPEN, 0)
+    machine.fence()
+    while machine.read64(block + JOINED) != 0 {
+        machine.pause()
+    }
+}
+
+// ----- Bulk pixel rows -----
+
+public constant FILL = 0
+public constant COPY = 1
+public constant BLEND = 2
+constant ROWS_PER_ITEM = 24
+
+// One band of rows of a fill, copy or blend. The arguments, as 64-bit
+// Integers: operation, target, target stride, source, source stride, pixels
+// per row, rows, color, opacity.
+parallel function rowBand(item: Integer, arguments: Integer) {
+    let operation = machine.load64(arguments)
+    let target = machine.load64(arguments + 8)
+    let targetStride = machine.load64(arguments + 16)
+    let source = machine.load64(arguments + 24)
+    let sourceStride = machine.load64(arguments + 32)
+    let pixels = machine.load64(arguments + 40)
+    let rows = machine.load64(arguments + 48)
+    let color = machine.load64(arguments + 56)
+    let opacity = machine.load64(arguments + 64)
+    let first = item * ROWS_PER_ITEM
+    let last = min(first + ROWS_PER_ITEM, rows)
+    for row in first..last {
+        let at = target + row * targetStride
+        if operation == FILL {
+            machine.fill32(at, pixels, color)
+        } else {
+            if operation == COPY {
+                machine.copy(at, source + row * sourceStride, pixels * 4)
+            } else {
+                machine.blendSpan(at, pixels, color, opacity)
+            }
+        }
+    }
+}
+
+// Fill, copy or blend `rows` rows of `pixels` pixels over every processor.
+public function rows(block: Integer, processors: Integer, operation: Integer, target: Integer, targetStride: Integer, source: Integer, sourceStride: Integer, pixels: Integer, count: Integer, color: Integer, opacity: Integer, scratch: Bytes) {
+    let arguments = machine.address(scratch)
+    machine.store64(arguments, operation)
+    machine.store64(arguments + 8, target)
+    machine.store64(arguments + 16, targetStride)
+    machine.store64(arguments + 24, source)
+    machine.store64(arguments + 32, sourceStride)
+    machine.store64(arguments + 40, pixels)
+    machine.store64(arguments + 48, count)
+    machine.store64(arguments + 56, color)
+    machine.store64(arguments + 64, opacity)
+    run(block, processors, parallelEntry(rowBand), (count + ROWS_PER_ITEM - 1) / ROWS_PER_ITEM, arguments)
+}

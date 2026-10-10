@@ -544,3 +544,9 @@ check-bootstrap-policy:
 
 check-portable check: check-peer-semantics check-memory-regressions check-bootstrap-policy
 check-sanitize: check-peer-semantics-sanitize check-memory-regressions-sanitize
+
+# TLS 1.3 against a local OpenSSL server, through the hosted http, tls, crypto and net packages.
+.PHONY: check-tls
+check-tls: build/minyarc
+	$(LIMITED) python3 tests/tls-local.py
+check: check-tls

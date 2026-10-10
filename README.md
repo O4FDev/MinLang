@@ -62,6 +62,22 @@ the scroll wheel to choose, T to speed up time, and Escape to pause. It uses
 the standard `graphics` package, which needs GLFW (`brew install glfw` on
 macOS). Programs never write or link C themselves.
 
+## Minyar OS
+
+[`os/`](os/) is an operating system written in Minyar for x86-64 PCs and 64-bit
+Arm, from one source tree: a Minyar kernel with its own drivers, TrueType
+renderer, TCP/IP stack and an agent desktop. On x86-64 a 512-byte boot record
+hands over to a Minyar boot loader; on Arm, QEMU loads the kernel directly and
+it runs under Apple's hypervisor at native speed on an Arm Mac.
+
+```sh
+make -C os run              # x86-64; needs `brew install llvm lld qemu`
+make -C os run ARCH=arm64   # 64-bit Arm
+```
+
+The `machine` package and `--freestanding` builds that make it possible are
+described in [freestanding programs](docs/freestanding.md).
+
 ## Native macOS apps
 
 Build the AppKit notes example, with native text editing, menus and file dialogs:
@@ -126,6 +142,7 @@ remain unfinished.
 - [Native toolchains and LLVM audit](docs/toolchain.md)
 - [October language hardening review](docs/hardening-report.md)
 - [Modules](docs/modules.md) and [incremental builds](docs/incremental-builds.md)
+- [Freestanding programs](docs/freestanding.md) and [Minyar OS](os/README.md)
 - [Examples](examples/)
 - [Runtime ownership](docs/runtime-memory.md) and [runtime profiles](docs/bounded-runtime-contract.md)
 - [Performance testing](docs/performance.md)

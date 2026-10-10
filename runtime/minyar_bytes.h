@@ -48,6 +48,50 @@ MinyarBytes *minyar_bytes_new(long long length) {
     return new_text(data, length, length);
 }
 
+/* Text(bytes): the bytes, unchanged, as Text. Like file contents, they are
+ * validated as UTF-8 only when a character operation needs them. */
+MinyarText *minyar_bytes_text(const MinyarBytes *bytes) {
+    return minyar_native_copy_text(bytes->bytes, bytes->byte_length);
+}
+
+/* Bytes(text): the text's UTF-8 encoding. */
+MinyarBytes *minyar_text_bytes(const MinyarText *text) {
+    MinyarBytes *bytes = minyar_bytes_new(text->byte_length);
+    if (text->byte_length) memcpy((void *)bytes->bytes, text->bytes, (size_t)text->byte_length);
+    return bytes;
+}
+
+/* randomBytes(count): bytes from the platform's cryptographically secure
+ * generator. Freestanding programs supply minyar_platform_random. */
+#if defined(__APPLE__) || defined(__OpenBSD__) || defined(__FreeBSD__)
+static void fill_random(unsigned char *out, size_t count) { arc4random_buf(out, count); }
+#elif defined(__linux__)
+#include <sys/random.h>
+static void fill_random(unsigned char *out, size_t count) {
+    while (count) {
+        ssize_t got = getrandom(out, count, 0);
+        if (got <= 0) minyar_stop("the system could not provide random bytes.");
+        out += got;
+        count -= (size_t)got;
+    }
+}
+#elif defined(_WIN32)
+#include <bcrypt.h>
+static void fill_random(unsigned char *out, size_t count) {
+    if (BCryptGenRandom(NULL, out, (ULONG)count, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
+        minyar_stop("the system could not provide random bytes.");
+}
+#else
+void minyar_platform_random(unsigned char *out, size_t count);
+static void fill_random(unsigned char *out, size_t count) { minyar_platform_random(out, count); }
+#endif
+
+MinyarBytes *minyar_random_bytes(long long count) {
+    MinyarBytes *bytes = minyar_bytes_new(count);
+    if (count) fill_random((unsigned char *)bytes->bytes, (size_t)count);
+    return bytes;
+}
+
 long long minyar_bytes_length(const MinyarBytes *bytes) {
     return bytes->byte_length;
 }

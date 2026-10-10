@@ -1,0 +1,121 @@
+// Stage two of the Minyar OS boot.
+//
+// The boot record has switched the processor to 64-bit mode and loaded this
+// program at 0x10000. It sets the display mode, draws the boot screen, reads
+// the kernel from the disk directory, places its ELF segments in memory and
+// jumps to it.
+use "machine" as machine
+use "device" as device
+use "../../../shared/pci.min" as pci
+use "../../../shared/display.min" as display
+use "../../../shared/interrupts.min" as interrupts
+use "../../../shared/disk.min" as disk
+use "../../../shared/graphics/canvas.min" as canvas
+use "../../../shared/graphics/font.min" as font
+use "./screen.min" as screen
+
+constant WIDTH = 1720
+constant HEIGHT = 1080
+
+record Segment {
+    address: Integer
+    offset: Integer
+    fileSize: Integer
+    memorySize: Integer
+}
+
+function main(): Integer {
+    print("Minyar loader: long mode reached")
+    let devices = pci.scan()
+    let framebuffer = display.start(devices, WIDTH, HEIGHT)
+    if framebuffer.address == 0 {
+        fail("no Bochs-compatible display adapter was found")
+    }
+    let timer = interrupts.start()
+    let target = canvas.wrap(framebuffer.address, WIDTH, HEIGHT, framebuffer.stride)
+    let back = canvas.create(WIDTH, HEIGHT)
+    canvas.fill(back, 0, 0, WIDTH, HEIGHT, 0xF2F2F2)
+    canvas.present(back, target)
+
+    let drive = disk.open(devices)
+    let files = disk.directory(drive)
+    print("disk directory: " + Text(files.length) + " files")
+    let fontIndex = disk.find(files, "fonts/Archivo-Medium.ttf")
+    if fontIndex < 0 {
+        fail("the disk has no fonts/Archivo-Medium.ttf")
+    }
+    let started = interrupts.milliseconds()
+    let typeface = font.load(disk.read(files[fontIndex]))
+    print("font loaded in " + Text(interrupts.milliseconds() - started) + " ms")
+    let boot = screen.create(back, typeface)
+
+    let kernelIndex = disk.find(files, "kernel.elf")
+    if kernelIndex < 0 {
+        fail("the disk has no kernel.elf")
+    }
+    let file = files[kernelIndex]
+    screen.animateIn(boot, target)
+
+    // Read the kernel in steps so the progress line moves with the disk.
+    let image = Bytes()
+    let sectors = (file.size + 511) / 512
+    let done = 0
+    while done < sectors {
+        let chunk = min(256, sectors - done)
+        image.addBytes(disk.readSectors(drive, file.sector + done, chunk))
+        done += chunk
+        screen.progress(boot, target, Float(done) / Float(sectors) * 0.8, "Loading kernel.elf")
+    }
+    image.resize(file.size)
+    let entry = place(image)
+    screen.progress(boot, target, 1.0, "Starting Minyar OS")
+    screen.finish(boot, target)
+    print("entering kernel at " + Text(entry))
+    machine.disableInterrupts()
+    machine.jump(entry, 0x0800)
+    return 0
+}
+
+// Where boot/loader.ld puts the loader's own zeroed data and stack.
+constant LOADER_DATA = 0x03000000
+
+function u16(data: Bytes, offset: Integer): Integer { return data.getUInt16(offset) }
+function u32(data: Bytes, offset: Integer): Integer { return data.getUInt32(offset) }
+function u64(data: Bytes, offset: Integer): Integer { return data.getInt64(offset) }
+
+// Copy the loadable segments of an ELF64 executable to their physical
+// addresses and return its entry point.
+function place(image: Bytes): Integer {
+    if image.length < 64 || image[0] != 0x7F || image[1] != 0x45 || image[2] != 0x4C || image[3] != 0x46 || image[4] != 2 {
+        fail("kernel.elf is not a 64-bit ELF file")
+    }
+    let entry = u64(image, 24)
+    let headers = u64(image, 32)
+    let headerSize = u16(image, 54)
+    let count = u16(image, 56)
+    for index in 0..count {
+        let header = headers + index * headerSize
+        if u32(image, header) == 1 {
+            let segment = Segment {
+                address: u64(image, header + 24)
+                offset: u64(image, header + 8)
+                fileSize: u64(image, header + 32)
+                memorySize: u64(image, header + 40)
+            }
+            if segment.offset + segment.fileSize > image.length {
+                fail("kernel.elf has a segment past the end of the file")
+            }
+            if segment.address < 0x100000 || segment.address + segment.memorySize > LOADER_DATA {
+                fail("kernel.elf has a segment outside 1 MiB to " + Text(LOADER_DATA / 1048576) + " MiB")
+            }
+            if segment.fileSize > segment.memorySize {
+                fail("kernel.elf has a segment larger in the file than in memory")
+            }
+            let target = device.physical(segment.address, segment.memorySize)
+            device.write(target, 0, image, segment.offset, segment.fileSize)
+            device.fill(target, segment.fileSize, segment.memorySize - segment.fileSize, 0)
+            print("segment at " + Text(segment.address) + ": " + Text(segment.memorySize) + " bytes")
+        }
+    }
+    return entry
+}

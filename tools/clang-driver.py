@@ -276,6 +276,15 @@ def main():
                  '-fobjc-arc', '-fmodules', '-c', str(project / 'runtime/native/http.m'),
                  '-o', str(native_object)])
             native += [str(native_object), '-framework', 'AppKit']
+        elif library in ('machine', 'machine_arm64'):
+            pass  # Compiler intrinsics: the code is already inline in the program.
+        elif library == 'net':
+            native_object = Path(llvm).parent / 'net.o'
+            run([clang, *flags('MINYAR_NATIVE_FLAGS', shlex.join(link_flags)),
+                 '-c', str(project / 'runtime/native/net.c'), '-o', str(native_object)])
+            native += [str(native_object)]
+            if platform.system() == 'Windows':
+                native += ['-lws2_32']
         else:
             raise ValueError(f'the program uses an unknown native library: {library}')
     lto = lto_flags(clang, link_flags) if release == '1' else []

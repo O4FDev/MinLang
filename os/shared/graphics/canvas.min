@@ -1,0 +1,303 @@
+// Software rendering into 32-bit 0x00RRGGBB pixel memory.
+//
+// A Canvas is a rectangle of pixels in memory: its own Bytes, or memory that
+// belongs to a device such as the framebuffer. Drawing is clipped to the
+// canvas's clip rectangle, and every change widens its dirty rectangle so a
+// frame can be presented by copying only what changed.
+use "machine" as machine
+use "../parallel.min" as parallel
+
+public record Canvas {
+    storage: Bytes
+    address: Integer
+    width: Integer
+    height: Integer
+    stride: Integer
+    clipLeft: Integer
+    clipTop: Integer
+    clipRight: Integer
+    clipBottom: Integer
+    dirtyLeft: Integer
+    dirtyTop: Integer
+    dirtyRight: Integer
+    dirtyBottom: Integer
+    // Offset added to every drawing coordinate, for drawing into sub-areas.
+    originX: Integer
+    originY: Integer
+    // Large fills, copies and blends are spread over these processors (see
+    // shared/parallel.min); a block of 0 means this processor only.
+    workers: Integer
+    processors: Integer
+    scratch: Bytes
+}
+
+// Rectangles at least this many pixels are worth sharing out.
+constant PARALLEL_PIXELS = 60000
+
+public function useProcessors(canvas: Canvas, block: Integer, processors: Integer) {
+    canvas.workers = block
+    canvas.processors = processors
+}
+
+function shared(canvas: Canvas, pixels: Integer): Boolean {
+    return canvas.workers != 0 && canvas.processors > 1 && pixels >= PARALLEL_PIXELS
+}
+
+public function create(width: Integer, height: Integer): Canvas {
+    let storage = Bytes(width * height * 4)
+    return Canvas {
+        storage: storage; address: machine.address(storage); width: width; height: height; stride: width * 4
+        clipLeft: 0; clipTop: 0; clipRight: width; clipBottom: height
+        dirtyLeft: 0; dirtyTop: 0; dirtyRight: width; dirtyBottom: height
+        originX: 0; originY: 0; workers: 0; processors: 1; scratch: Bytes(128)
+    }
+}
+
+// A canvas over memory owned by something else, such as the framebuffer.
+public function wrap(address: Integer, width: Integer, height: Integer, stride: Integer): Canvas {
+    return Canvas {
+        storage: Bytes(); address: address; width: width; height: height; stride: stride
+        clipLeft: 0; clipTop: 0; clipRight: width; clipBottom: height
+        dirtyLeft: width; dirtyTop: height; dirtyRight: 0; dirtyBottom: 0
+        originX: 0; originY: 0; workers: 0; processors: 1; scratch: Bytes(128)
+    }
+}
+
+public function rgb(red: Integer, green: Integer, blue: Integer): Integer {
+    return (red << 16) | (green << 8) | blue
+}
+
+// ----- Clipping and damage -----
+
+public function setClip(canvas: Canvas, x: Integer, y: Integer, width: Integer, height: Integer) {
+    canvas.clipLeft = clamp(x + canvas.originX, 0, canvas.width)
+    canvas.clipTop = clamp(y + canvas.originY, 0, canvas.height)
+    canvas.clipRight = clamp(x + canvas.originX + width, canvas.clipLeft, canvas.width)
+    canvas.clipBottom = clamp(y + canvas.originY + height, canvas.clipTop, canvas.height)
+}
+
+public function resetClip(canvas: Canvas) {
+    canvas.clipLeft = 0
+    canvas.clipTop = 0
+    canvas.clipRight = canvas.width
+    canvas.clipBottom = canvas.height
+}
+
+public function markDirty(canvas: Canvas, left: Integer, top: Integer, right: Integer, bottom: Integer) {
+    if right <= left || bottom <= top { return }
+    canvas.dirtyLeft = min(canvas.dirtyLeft, left)
+    canvas.dirtyTop = min(canvas.dirtyTop, top)
+    canvas.dirtyRight = max(canvas.dirtyRight, right)
+    canvas.dirtyBottom = max(canvas.dirtyBottom, bottom)
+}
+
+public function clearDirty(canvas: Canvas) {
+    canvas.dirtyLeft = canvas.width
+    canvas.dirtyTop = canvas.height
+    canvas.dirtyRight = 0
+    canvas.dirtyBottom = 0
+}
+
+public function isDirty(canvas: Canvas): Boolean {
+    return canvas.dirtyRight > canvas.dirtyLeft && canvas.dirtyBottom > canvas.dirtyTop
+}
+
+// Copy the dirty part of `source` to the same place in `target`.
+public function present(source: Canvas, target: Canvas) {
+    if !isDirty(source) { return }
+    let left = max(source.dirtyLeft, 0)
+    let right = min(source.dirtyRight, min(source.width, target.width))
+    let top = max(source.dirtyTop, 0)
+    let bottom = min(source.dirtyBottom, min(source.height, target.height))
+    let bytes = (right - left) * 4
+    if shared(source, (right - left) * (bottom - top)) {
+        parallel.rows(source.workers, source.processors, parallel.COPY, target.address + top * target.stride + left * 4, target.stride, source.address + top * source.stride + left * 4, source.stride, right - left, bottom - top, 0, 0, source.scratch)
+    } else {
+        for row in top..bottom {
+            machine.copy(target.address + row * target.stride + left * 4, source.address + row * source.stride + left * 4, bytes)
+        }
+    }
+    clearDirty(source)
+}
+
+// ----- Rectangles -----
+
+public function fill(canvas: Canvas, x: Integer, y: Integer, width: Integer, height: Integer, color: Integer) {
+    let left = max(x + canvas.originX, canvas.clipLeft)
+    let top = max(y + canvas.originY, canvas.clipTop)
+    let right = min(x + canvas.originX + width, canvas.clipRight)
+    let bottom = min(y + canvas.originY + height, canvas.clipBottom)
+    if right <= left || bottom <= top { return }
+    markDirty(canvas, left, top, right, bottom)
+    let count = right - left
+    let address = canvas.address + top * canvas.stride + left * 4
+    if shared(canvas, count * (bottom - top)) {
+        parallel.rows(canvas.workers, canvas.processors, parallel.FILL, address, canvas.stride, 0, 0, count, bottom - top, color, 0, canvas.scratch)
+        return
+    }
+    for row in top..bottom {
+        machine.fill32(address, count, color)
+        address += canvas.stride
+    }
+}
+
+// Blend `color` over the rectangle with opacity `alpha` from 0 to 255.
+public function blend(canvas: Canvas, x: Integer, y: Integer, width: Integer, height: Integer, color: Integer, alpha: Integer) {
+    if alpha <= 0 { return }
+    if alpha >= 255 {
+        fill(canvas, x, y, width, height, color)
+        return
+    }
+    let left = max(x + canvas.originX, canvas.clipLeft)
+    let top = max(y + canvas.originY, canvas.clipTop)
+    let right = min(x + canvas.originX + width, canvas.clipRight)
+    let bottom = min(y + canvas.originY + height, canvas.clipBottom)
+    if right <= left || bottom <= top { return }
+    markDirty(canvas, left, top, right, bottom)
+    let opacity = alpha + (alpha >> 7)
+    let count = right - left
+    let address = canvas.address + top * canvas.stride + left * 4
+    if shared(canvas, count * (bottom - top)) {
+        parallel.rows(canvas.workers, canvas.processors, parallel.BLEND, address, canvas.stride, 0, 0, count, bottom - top, color, opacity, canvas.scratch)
+        return
+    }
+    for row in top..bottom {
+        machine.blendSpan(address, count, color, opacity)
+        address += canvas.stride
+    }
+}
+
+// An outline `thickness` pixels wide just inside the rectangle.
+public function frame(canvas: Canvas, x: Integer, y: Integer, width: Integer, height: Integer, thickness: Integer, color: Integer, alpha: Integer) {
+    blend(canvas, x, y, width, thickness, color, alpha)
+    blend(canvas, x, y + height - thickness, width, thickness, color, alpha)
+    blend(canvas, x, y + thickness, thickness, height - thickness * 2, color, alpha)
+    blend(canvas, x + width - thickness, y + thickness, thickness, height - thickness * 2, color, alpha)
+}
+
+// A vertical gradient from `top` to `bottom` colors, each with its own opacity.
+public function gradient(canvas: Canvas, x: Integer, y: Integer, width: Integer, height: Integer, topColor: Integer, topAlpha: Integer, bottomColor: Integer, bottomAlpha: Integer) {
+    if height <= 0 { return }
+    for row in 0..height {
+        let t = row * 256 / max(height - 1, 1)
+        let color = mix(topColor, bottomColor, t)
+        let alpha = topAlpha + (bottomAlpha - topAlpha) * t / 256
+        blend(canvas, x, y + row, width, 1, color, alpha)
+    }
+}
+
+// A horizontal gradient from `left` to `right` colors.
+public function horizontalGradient(canvas: Canvas, x: Integer, y: Integer, width: Integer, height: Integer, leftColor: Integer, leftAlpha: Integer, rightColor: Integer, rightAlpha: Integer) {
+    if width <= 0 { return }
+    for column in 0..width {
+        let t = column * 256 / max(width - 1, 1)
+        blend(canvas, x + column, y, 1, height, mix(leftColor, rightColor, t), leftAlpha + (rightAlpha - leftAlpha) * t / 256)
+    }
+}
+
+// Interpolate two colors; t runs from 0 (first) to 256 (second).
+public function mix(first: Integer, second: Integer, t: Integer): Integer {
+    let r = ((first >> 16) & 255) + ((((second >> 16) & 255) - ((first >> 16) & 255)) * t >> 8)
+    let g = ((first >> 8) & 255) + ((((second >> 8) & 255) - ((first >> 8) & 255)) * t >> 8)
+    let b = (first & 255) + (((second & 255) - (first & 255)) * t >> 8)
+    return (r << 16) | (g << 8) | b
+}
+
+// ----- Coverage masks -----
+
+// Blend `color` through an 8-bit coverage mask, such as a rendered glyph,
+// scaled by `alpha`.
+public function mask(canvas: Canvas, x: Integer, y: Integer, width: Integer, height: Integer, coverage: Bytes, color: Integer, alpha: Integer) {
+    if alpha <= 0 || width <= 0 || height <= 0 { return }
+    let left = max(x + canvas.originX, canvas.clipLeft)
+    let top = max(y + canvas.originY, canvas.clipTop)
+    let right = min(x + canvas.originX + width, canvas.clipRight)
+    let bottom = min(y + canvas.originY + height, canvas.clipBottom)
+    if right <= left || bottom <= top { return }
+    markDirty(canvas, left, top, right, bottom)
+    let scale = alpha + (alpha >> 7)
+    let source = machine.address(coverage)
+    let columns = right - left
+    for row in top..bottom {
+        let address = canvas.address + row * canvas.stride + left * 4
+        let cover = source + (row - y - canvas.originY) * width + (left - x - canvas.originX)
+        machine.blendMask(address, columns, cover, color, scale, 0, 255)
+    }
+}
+
+// Copy a rectangle of another canvas onto this one.
+public function blit(canvas: Canvas, source: Canvas, sourceX: Integer, sourceY: Integer, width: Integer, height: Integer, x: Integer, y: Integer) {
+    let left = max(x + canvas.originX, canvas.clipLeft)
+    let top = max(y + canvas.originY, canvas.clipTop)
+    let right = min(x + canvas.originX + width, canvas.clipRight)
+    let bottom = min(y + canvas.originY + height, canvas.clipBottom)
+    if right <= left || bottom <= top { return }
+    markDirty(canvas, left, top, right, bottom)
+    let fromX = sourceX + left - x - canvas.originX
+    if shared(canvas, (right - left) * (bottom - top)) {
+        let fromTop = sourceY + top - y - canvas.originY
+        parallel.rows(canvas.workers, canvas.processors, parallel.COPY, canvas.address + top * canvas.stride + left * 4, canvas.stride, source.address + fromTop * source.stride + fromX * 4, source.stride, right - left, bottom - top, 0, 0, canvas.scratch)
+        return
+    }
+    for row in top..bottom {
+        let fromY = sourceY + row - y - canvas.originY
+        machine.copy(canvas.address + row * canvas.stride + left * 4, source.address + fromY * source.stride + fromX * 4, (right - left) * 4)
+    }
+}
+
+// Blend a rectangle of another canvas onto this one with uniform opacity.
+public function blendCanvas(canvas: Canvas, source: Canvas, sourceX: Integer, sourceY: Integer, width: Integer, height: Integer, x: Integer, y: Integer, alpha: Integer) {
+    if alpha >= 255 {
+        blit(canvas, source, sourceX, sourceY, width, height, x, y)
+        return
+    }
+    if alpha <= 0 { return }
+    let left = max(x + canvas.originX, canvas.clipLeft)
+    let top = max(y + canvas.originY, canvas.clipTop)
+    let right = min(x + canvas.originX + width, canvas.clipRight)
+    let bottom = min(y + canvas.originY + height, canvas.clipBottom)
+    if right <= left || bottom <= top { return }
+    markDirty(canvas, left, top, right, bottom)
+    let a = alpha + (alpha >> 7)
+    let keep = 256 - a
+    for row in top..bottom {
+        let fromY = sourceY + row - y - canvas.originY
+        let target = canvas.address + row * canvas.stride + left * 4
+        let from = source.address + fromY * source.stride + (sourceX + left - x - canvas.originX) * 4
+        for column in 0..(right - left) {
+            let pixel = machine.load32(target + column * 4)
+            let over = machine.load32(from + column * 4)
+            let rb = ((pixel & 0xFF00FF) * keep + (over & 0xFF00FF) * a) >> 8 & 0xFF00FF
+            let g = ((pixel & 0x00FF00) * keep + (over & 0x00FF00) * a) >> 8 & 0x00FF00
+            machine.store32(target + column * 4, rb | g)
+        }
+    }
+}
+
+public function pixel(canvas: Canvas, x: Integer, y: Integer): Integer {
+    let px = x + canvas.originX
+    let py = y + canvas.originY
+    if px < 0 || py < 0 || px >= canvas.width || py >= canvas.height { return 0 }
+    return machine.load32(canvas.address + py * canvas.stride + px * 4)
+}
+
+// Narrow the clip to its intersection with a rectangle.
+public function intersectClip(canvas: Canvas, x: Integer, y: Integer, width: Integer, height: Integer) {
+    let left = max(canvas.clipLeft, x + canvas.originX)
+    let top = max(canvas.clipTop, y + canvas.originY)
+    canvas.clipRight = max(left, min(canvas.clipRight, x + canvas.originX + width))
+    canvas.clipBottom = max(top, min(canvas.clipBottom, y + canvas.originY + height))
+    canvas.clipLeft = left
+    canvas.clipTop = top
+}
+
+public function saveClip(canvas: Canvas): List<Integer> {
+    return [canvas.clipLeft, canvas.clipTop, canvas.clipRight, canvas.clipBottom]
+}
+
+public function restoreClip(canvas: Canvas, saved: List<Integer>) {
+    canvas.clipLeft = saved[0]
+    canvas.clipTop = saved[1]
+    canvas.clipRight = saved[2]
+    canvas.clipBottom = saved[3]
+}

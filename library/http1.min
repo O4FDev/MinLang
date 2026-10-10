@@ -1,0 +1,186 @@
+// HTTP/1.1 requests for hosted programs, over the `net` package.
+// Import it with `use "http1" as http1`. Portable: it needs only the `net` and
+// `tls` packages, so it works where the `http` package (NSURLSession) does not.
+//
+//     let response = http.post("http://127.0.0.1:8080/ask", ["Content-Type: application/json"], "{}")
+//     print(response.status)
+//     print(response.body)
+//
+// http:// and https:// URLs are supported; https uses the `tls` package, which
+// encrypts but does not validate certificates. Minyar OS uses its own client
+// in os/kernel/net/http.min over its own TCP/IP stack.
+use "net" as net
+use "tls" as tls
+
+public record Response {
+    status: Integer
+    reason: Text
+    headers: List<Text>
+    body: Text
+    error: Text
+}
+
+public record Address {
+    host: Text
+    port: Integer
+    path: Text
+    secure: Boolean
+}
+
+function failed(message: Text): Response {
+    return Response { status: 0; reason: ""; headers: []; body: ""; error: message }
+}
+
+// Split "http://host:port/path" or "https://..." into its parts; the host is
+// empty for any other kind of URL.
+public function parse(url: Text): Address {
+    let secure = false
+    let scheme = "http://"
+    if url.length >= 8 && url.slice(0, 8) == "https://" {
+        secure = true
+        scheme = "https://"
+    }
+    if url.length < scheme.length || url.slice(0, scheme.length) != scheme {
+        return Address { host: ""; port: 0; path: ""; secure: false }
+    }
+    let rest = url.slice(scheme.length, url.length)
+    let slash = rest.length
+    for position in 0..rest.length {
+        if slash == rest.length && rest[position] == '/' { slash = position }
+    }
+    let authority = rest.slice(0, slash)
+    let path = "/"
+    if slash < rest.length { path = rest.slice(slash, rest.length) }
+    let host = authority
+    let port = 80
+    if secure { port = 443 }
+    for position in 0..authority.length {
+        if authority[position] == ':' {
+            host = authority.slice(0, position)
+            port = 0
+            for character in authority.slice(position + 1, authority.length) {
+                port = port * 10 + Integer(character) - 48
+            }
+        }
+    }
+    return Address { host: host; port: port; path: path; secure: secure }
+}
+
+public function get(url: Text, headers: List<Text>): Response {
+    return request("GET", url, headers, "")
+}
+
+public function post(url: Text, headers: List<Text>, body: Text): Response {
+    return request("POST", url, headers, body)
+}
+
+public function request(method: Text, url: Text, headers: List<Text>, body: Text): Response {
+    let address = parse(url)
+    if address.host == "" {
+        return failed("only http:// and https:// URLs are supported: " + url)
+    }
+    let connection = net.connect(address.host, address.port)
+    if connection < 0 {
+        return failed(net.lastError())
+    }
+    let content = Bytes(body)
+    let lines: List<Text> = [method + " " + address.path + " HTTP/1.1\r\n", "Host: " + address.host + "\r\n", "Connection: close\r\n"]
+    for header in headers {
+        lines.add(header + "\r\n")
+    }
+    if body != "" {
+        lines.add("Content-Length: " + Text(content.length) + "\r\n")
+    }
+    lines.add("\r\n")
+    let message = Bytes(joinText(lines))
+    message.addBytes(content)
+    if address.secure {
+        return secureExchange(connection, address.host, message)
+    }
+    net.send(connection, message)
+    // The server closes the connection after its response.
+    let received = Bytes()
+    let chunk = net.receive(connection, 65536)
+    while chunk.length > 0 {
+        received.addBytes(chunk)
+        chunk = net.receive(connection, 65536)
+    }
+    net.close(connection)
+    return read(received)
+}
+
+function secureExchange(connection: Integer, host: Text, message: Bytes): Response {
+    let session = tls.client(host, randomBytes(64))
+    net.send(connection, tls.takeOutgoing(session))
+    while session.state == tls.HELLO_SENT || session.state == tls.HANDSHAKE {
+        let chunk = net.receive(connection, 65536)
+        if chunk.length == 0 {
+            net.close(connection)
+            return failed("the server closed the connection during the TLS handshake")
+        }
+        tls.receive(session, chunk)
+        let reply = tls.takeOutgoing(session)
+        if reply.length > 0 { net.send(connection, reply) }
+    }
+    if !tls.established(session) {
+        net.close(connection)
+        return failed("TLS failed: " + session.error)
+    }
+    tls.send(session, message)
+    net.send(connection, tls.takeOutgoing(session))
+    let received = Bytes()
+    while session.state == tls.ESTABLISHED {
+        let chunk = net.receive(connection, 65536)
+        if chunk.length == 0 { break }
+        tls.receive(session, chunk)
+        received.addBytes(tls.takeIncoming(session))
+    }
+    received.addBytes(tls.takeIncoming(session))
+    net.close(connection)
+    if session.state == tls.FAILED {
+        return failed("TLS failed: " + session.error)
+    }
+    return read(received)
+}
+
+function headerEnd(data: Bytes): Integer {
+    let index = 0
+    while index + 3 < data.length {
+        if data[index] == 13 && data[index + 1] == 10 && data[index + 2] == 13 && data[index + 3] == 10 {
+            return index
+        }
+        index += 1
+    }
+    return -1
+}
+
+function read(data: Bytes): Response {
+    let end = headerEnd(data)
+    if end < 0 {
+        return failed("the server's response was incomplete")
+    }
+    let head = Text(data.slice(0, end))
+    let lines: List<Text> = []
+    let start = 0
+    for position in 0..head.length {
+        if head[position] == '\n' {
+            let stop = position
+            if stop > start && head[stop - 1] == '\r' { stop -= 1 }
+            lines.add(head.slice(start, stop))
+            start = position + 1
+        }
+    }
+    lines.add(head.slice(start, head.length))
+    let status = 0
+    let reason = ""
+    let first = lines[0]
+    if first.length >= 12 {
+        for character in first.slice(9, 12) {
+            status = status * 10 + Integer(character) - 48
+        }
+        reason = first.slice(min(13, first.length), first.length)
+    }
+    let headers: List<Text> = []
+    for index in 1..lines.length { headers.add(lines[index]) }
+    return Response { status: status; reason: reason; headers: headers; body: Text(data.slice(end + 4, data.length)); error: "" }
+}

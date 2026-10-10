@@ -1,0 +1,429 @@
+// The floating task window: what the agent's computer is doing right now,
+// with a live view of the page it is working on.
+use "machine" as machine
+use "../../shared/graphics/canvas.min" as canvas
+use "../../shared/graphics/font.min" as font
+use "./state.min" as state
+use "./theme.min" as theme
+use "./icons.min" as icons
+use "./text.min" as text
+use "./pages.min" as pages
+
+public constant CONTROL_EXPAND = 0
+public constant CONTROL_PAUSE = 1
+
+public record Rect {
+    x: Integer
+    y: Integer
+    width: Integer
+    height: Integer
+}
+
+public function create(): state.Panel {
+    return state.Panel {
+        visible: false; shown: state.tween(0.0); title: ""; status: ""; since: 0.0; done: false; paused: false
+        page: state.PAGE_BLANK; pageSince: 0.0; pageScroll: 0.0; maximized: state.tween(0.0)
+        cache: canvas.create(1, 1); cachedPage: -1; cachedVersion: -1; version: 0; pageCaches: []; bigCaches: []
+        bigCache: canvas.create(1, 1); bigPage: -1; bigVersion: -1; bigRows: 0; stripTicks: 0; stripWait: 0
+        sheetNames: []; sheetPhones: []; sheetOutcomes: []; sheetQuotes: []; sheetDetails: []; sheetRows: 0
+        request: ""; response: ""
+        articleHost: ""; articleTitle: ""; articleDescription: ""; articleText: ""; searchResults: []
+    }
+}
+
+// The window's rectangle, between its docked place and the maximized one.
+public function rect(app: state.App): Rect {
+    let panel = app.panel
+    let m = state.value(panel.maximized, app.now)
+    // Appearing, the window grows up and out from its bottom-right corner.
+    let shown = state.ease(state.value(panel.shown, app.now))
+    let width = Float(theme.PANEL_WIDTH) * (0.62 + 0.38 * shown)
+    let height = Float(theme.PANEL_HEIGHT) * (0.12 + 0.88 * shown)
+    let x = Float(theme.PANEL_LEFT + theme.PANEL_WIDTH) - width
+    let y = Float(theme.PANEL_TOP + theme.PANEL_HEIGHT) - height
+    // Maximized, the window covers the conversation area.
+    let bigX = 130.0
+    let bigY = 24.0
+    let bigWidth = 1572.0
+    let bigHeight = 1010.0
+    return Rect {
+        x: Integer(x + (bigX - x) * m)
+        y: Integer(y + (bigY - y) * m)
+        width: Integer(width + (bigWidth - width) * m)
+        height: Integer(height + (bigHeight - height) * m)
+    }
+}
+
+public function contains(app: state.App, x: Integer, y: Integer): Boolean {
+    if !app.panel.visible { return false }
+    let r = rect(app)
+    return state.inside(x, y, r.x, r.y, r.width, r.height)
+}
+
+public function controlAt(app: state.App, x: Integer, y: Integer): Integer {
+    if !app.panel.visible { return -1 }
+    let r = rect(app)
+    if state.inside(x, y, r.x + r.width - 34, r.y + 4, 32, 32) { return CONTROL_EXPAND }
+    if state.inside(x, y, r.x + r.width - 36, r.y + 46, 30, 32) && !app.panel.done { return CONTROL_PAUSE }
+    return -1
+}
+
+public function invalidate(app: state.App) {
+    let r = rect(app)
+    state.invalidate(app, r.x - 4, r.y - 4, r.width + 8, r.height + 8)
+}
+
+public function show(app: state.App, title: Text) {
+    let panel = app.panel
+    panel.visible = true
+    panel.title = title
+    panel.done = false
+    panel.paused = false
+    state.retarget(panel.shown, 1.0, app.now, 0.45)
+    invalidate(app)
+}
+
+public function setStatus(app: state.App, status: Text) {
+    app.panel.status = status
+    app.panel.since = app.now
+    invalidateStatus(app)
+}
+
+public function setPage(app: state.App, page: Integer) {
+    let panel = app.panel
+    panel.page = page
+    panel.pageSince = app.now
+    panel.pageScroll = 0.0
+    panel.version += 1
+    invalidate(app)
+}
+
+// The page's contents changed (for example, a spreadsheet cell was filled).
+public function touch(app: state.App) {
+    app.panel.version += 1
+    invalidate(app)
+}
+
+public function finish(app: state.App) {
+    app.panel.done = true
+    invalidate(app)
+}
+
+public function toggleMaximized(app: state.App) {
+    let panel = app.panel
+    invalidate(app)
+    if panel.maximized.to > 0.5 {
+        state.retarget(panel.maximized, 0.0, app.now, 0.35)
+    } else {
+        state.retarget(panel.maximized, 1.0, app.now, 0.35)
+    }
+}
+
+function invalidateStatus(app: state.App) {
+    let r = rect(app)
+    state.invalidate(app, r.x, r.y + 40, r.width, 46)
+}
+
+public function animate(app: state.App) {
+    let panel = app.panel
+    if !panel.visible { return }
+    let now = app.now
+    if state.animating(panel.shown, now) || state.animating(panel.shown, app.previous) || state.animating(panel.maximized, now) || state.animating(panel.maximized, app.previous) {
+        // The whole area the window sweeps through.
+        state.invalidate(app, 120, 16, 1600, 1030)
+    }
+    if !panel.done {
+        invalidateStatus(app)
+    }
+    // Pages scroll gently while they are being read.
+    let scrolls = panel.page >= state.PAGE_ARTICLE && panel.page <= state.PAGE_NORTHSTAR || panel.page == state.PAGE_BIGMAN
+    if scrolls && !panel.paused {
+        let age = now - panel.pageSince
+        if age > 0.8 && age < 4.0 {
+            panel.pageScroll = (age - 0.8) * 26.0
+            let r = rect(app)
+            state.invalidate(app, r.x + 10, r.y + 86, r.width - 20, r.height - 101)
+        }
+    }
+}
+
+public function draw(app: state.App) {
+    let panel = app.panel
+    if !panel.visible { return }
+    let r = rect(app)
+    if !state.visible(app, r.x - 2, r.y - 2, r.width + 4, r.height + 4) { return }
+    let back = app.back
+    let outer = canvas.saveClip(back)
+    canvas.intersectClip(back, r.x, r.y, r.width, r.height)
+    let color = theme.ACCENT
+    if panel.done { color = theme.SUCCESS }
+    // Body, border and title bar. The page area is left for the page.
+    let pageX = r.x + 10
+    let pageY = r.y + 86
+    let pageWidth = r.width - 20
+    let pageHeight = r.height - 101
+    if pageWidth > 0 && pageHeight > 0 {
+        canvas.fill(back, r.x, r.y, r.width, 86, 0xF6F6F6)
+        canvas.fill(back, r.x, pageY, 10, pageHeight, 0xF6F6F6)
+        canvas.fill(back, pageX + pageWidth, pageY, r.width - 10 - pageWidth, pageHeight, 0xF6F6F6)
+        canvas.fill(back, r.x, pageY + pageHeight, r.width, r.height - 86 - pageHeight, 0xF6F6F6)
+    } else {
+        canvas.fill(back, r.x, r.y, r.width, r.height, 0xF6F6F6)
+    }
+    canvas.frame(back, r.x, r.y, r.width, r.height, 1, 0xE2E2E2, 255)
+    canvas.fill(back, r.x, r.y, r.width, theme.TITLE_HEIGHT, color)
+    font.draw(back, app.type.title, panel.title, Float(r.x + 9), Float(r.y + 26), theme.WHITE, 255)
+    icons.draw(back, app.icons, icons.EXPAND, r.x + r.width - 24, r.y + 14, theme.WHITE, 255)
+    // Status line.
+    let iconColor = theme.ACCENT
+    if panel.done { iconColor = 0x9A9A9A }
+    icons.draw(back, app.icons, icons.MONITOR, r.x + 12, r.y + 53, iconColor, 255)
+    let baseline = Float(r.y + 66)
+    if panel.done {
+        font.draw(back, app.type.status, panel.status, Float(r.x + 36), baseline, 0x9A9A9A, 255)
+        text.strike(back, app.type.status, panel.status, Float(r.x + 36), baseline, 0x9A9A9A, 255)
+    } else {
+        let width = font.measure(app.type.status, panel.status)
+        let phase = (app.now - panel.since) / 1.6
+        let fraction = phase - floor(phase)
+        let split = Float(r.x + 36) + (width + 60.0) * state.ease(fraction * 1.25) - 20.0
+        if panel.paused { split = Float(r.x + 36) + width + 40.0 }
+        text.drawSplit(back, app.type.status, panel.status, Float(r.x + 36), baseline, theme.INK, 0xA9A9A9, split, 26.0, 255)
+        let pause = icons.PAUSE
+        if panel.paused { pause = icons.PLAY }
+        icons.draw(back, app.icons, pause, r.x + r.width - 28, r.y + 53, 0x8C9DB0, 255)
+    }
+    // The page. It is rendered at two sizes only, docked and maximized; while
+    // the window changes size, the rendering for the size it is heading to is
+    // shown cropped.
+    if pageWidth > 0 && pageHeight > 0 {
+        let saved = canvas.saveClip(back)
+        canvas.intersectClip(back, pageX, pageY, pageWidth, pageHeight)
+        let source = dockedPage(app)
+        let offset = max(min(Integer(panel.pageScroll), source.height - DOCKED_HEIGHT), 0)
+        if panel.maximized.to > 0.5 {
+            source = bigPage(app)
+            offset = 0
+            if !bigReady(app) {
+                state.invalidate(app, pageX, pageY, pageWidth, pageHeight)
+            }
+        }
+        // White only where the rendering does not reach.
+        let shownWidth = min(pageWidth, source.width)
+        let shownHeight = min(pageHeight, source.height - offset)
+        canvas.blit(back, source, 0, offset, shownWidth, shownHeight, pageX, pageY)
+        if shownWidth < pageWidth {
+            canvas.fill(back, pageX + shownWidth, pageY, pageWidth - shownWidth, pageHeight, 0xFFFFFF)
+        }
+        if shownHeight < pageHeight {
+            canvas.fill(back, pageX, pageY + shownHeight, shownWidth, pageHeight - shownHeight, 0xFFFFFF)
+        }
+        // A new page fades in from white.
+        let age = app.now - panel.pageSince
+        if age < 0.3 {
+            canvas.blend(back, pageX, pageY, pageWidth, pageHeight, 0xFFFFFF, Integer((1.0 - age / 0.3) * 255.0))
+            state.invalidate(app, pageX, pageY, pageWidth, pageHeight)
+        }
+        canvas.restoreClip(back, saved)
+        canvas.frame(back, pageX - 1, pageY - 1, pageWidth + 2, pageHeight + 2, 1, 0xE8E8E8, 255)
+    }
+    // Sliding in, the window also fades up from the background.
+    canvas.restoreClip(back, outer)
+    let shown = state.value(panel.shown, app.now)
+    if shown < 1.0 {
+        canvas.blend(back, r.x - 1, r.y - 1, r.width + 2, r.height + 2, theme.BACKGROUND, Integer((1.0 - shown) * 200.0))
+        // Whatever the frame rate, draw once more after the fade.
+        state.invalidate(app, 120, 16, 1600, 1030)
+    }
+}
+
+constant DOCKED_WIDTH = 524
+constant DOCKED_HEIGHT = 261
+constant BIG_WIDTH = 1552
+constant BIG_HEIGHT = 909
+constant STRIP = 32
+
+// The page at the docked size: twice the window's height so it can scroll,
+// redrawn only when it changes.
+function dockedPage(app: state.App): canvas.Canvas {
+    let panel = app.panel
+    let width = DOCKED_WIDTH
+    let cacheHeight = DOCKED_HEIGHT * 2
+    if panel.cache.width != width || panel.cache.height != cacheHeight {
+        panel.cache = canvas.create(width, cacheHeight)
+        panel.cachedPage = -1
+    }
+    if panel.cachedPage != panel.page || panel.cachedVersion != panel.version {
+        let prepared = preparedPage(app, panel.page, width, cacheHeight)
+        if prepared.width == width && prepared.height == cacheHeight {
+            canvas.blit(panel.cache, prepared, 0, 0, width, cacheHeight, 0, 0)
+            if panel.page == state.PAGE_SHEET {
+                pages.sheetRows(app, panel.cache)
+            }
+        } else {
+            pages.draw(app, panel.cache, panel.page)
+        }
+        canvas.clearDirty(panel.cache)
+        panel.cachedPage = panel.page
+        panel.cachedVersion = panel.version
+    }
+    return panel.cache
+}
+
+// The page at the maximized size. Static pages and the spreadsheet's grid
+// are rendered at start-up; other pages are painted a strip at a time, as
+// many strips as fit in a millisecond here and more in spare time.
+function bigPage(app: state.App): canvas.Canvas {
+    let panel = app.panel
+    let prepared = preparedBig(app, panel.page)
+    if prepared.width != BIG_WIDTH {
+        paintBig(app, 1)
+        return panel.bigCache
+    }
+    if panel.page != state.PAGE_SHEET { return prepared }
+    updateBigSheet(app, prepared)
+    return panel.bigCache
+}
+
+// The maximized spreadsheet: its rows over a copy of the grid. A new version
+// copies back only the band the rows are written in.
+function updateBigSheet(app: state.App, grid: canvas.Canvas) {
+    let panel = app.panel
+    if panel.bigCache.width != BIG_WIDTH {
+        panel.bigCache = canvas.create(BIG_WIDTH, BIG_HEIGHT)
+        panel.bigPage = -1
+    }
+    if panel.bigPage == panel.page && panel.bigVersion == panel.version { return }
+    let big = panel.bigCache
+    canvas.resetClip(big)
+    if panel.bigPage == panel.page && panel.bigRows >= BIG_HEIGHT {
+        let band = pages.sheetRowsBand()
+        canvas.blit(big, grid, 0, band[0], BIG_WIDTH, band[1], 0, band[0])
+    } else {
+        canvas.blit(big, grid, 0, 0, BIG_WIDTH, BIG_HEIGHT, 0, 0)
+    }
+    pages.sheetRows(app, big)
+    canvas.clearDirty(big)
+    panel.bigPage = panel.page
+    panel.bigVersion = panel.version
+    panel.bigRows = BIG_HEIGHT
+}
+
+// Whether the maximized rendering of the current page is complete.
+function bigReady(app: state.App): Boolean {
+    let panel = app.panel
+    if panel.page != state.PAGE_SHEET && preparedBig(app, panel.page).width == BIG_WIDTH { return true }
+    return panel.bigPage == panel.page && panel.bigVersion == panel.version && panel.bigRows >= BIG_HEIGHT
+}
+
+function preparedBig(app: state.App, page: Integer): canvas.Canvas {
+    let panel = app.panel
+    if page < panel.bigCaches.length {
+        return panel.bigCaches[page]
+    }
+    return canvas.create(1, 1)
+}
+
+// Paint strips of a live page for up to `milliseconds`. A strip is started
+// only if its recent cost fits; one that never fits is painted anyway after
+// a few frames so the page still completes.
+function paintBig(app: state.App, milliseconds: Integer) {
+    let panel = app.panel
+    if panel.bigCache.width != BIG_WIDTH {
+        panel.bigCache = canvas.create(BIG_WIDTH, BIG_HEIGHT)
+        panel.bigPage = -1
+    }
+    let big = panel.bigCache
+    if panel.bigPage != panel.page || panel.bigVersion != panel.version {
+        // A new version of the same page repaints over the old one, strip by
+        // strip, rather than flashing white.
+        if panel.bigPage != panel.page {
+            canvas.resetClip(big)
+            canvas.fill(big, 0, 0, BIG_WIDTH, BIG_HEIGHT, 0xFFFFFF)
+        }
+        panel.bigPage = panel.page
+        panel.bigVersion = panel.version
+        panel.bigRows = 0
+    }
+    if panel.bigRows >= BIG_HEIGHT { return }
+    let deadline = machine.timestamp() + app.ticksPerMillisecond * milliseconds
+    let painted = false
+    while panel.bigRows < BIG_HEIGHT && (machine.timestamp() + panel.stripTicks < deadline || panel.stripWait > 8) {
+        let started = machine.timestamp()
+        let rows = min(STRIP, BIG_HEIGHT - panel.bigRows)
+        canvas.setClip(big, 0, panel.bigRows, BIG_WIDTH, rows)
+        pages.drawClipped(app, big, panel.page)
+        panel.bigRows += rows
+        // Remember the dearest recent strip, forgetting slowly.
+        let cost = machine.timestamp() - started
+        panel.stripTicks = max(cost, panel.stripTicks - panel.stripTicks / 8)
+        panel.stripWait = 0
+        painted = true
+    }
+    if !painted { panel.stripWait += 1 }
+    canvas.resetClip(big)
+    canvas.clearDirty(big)
+}
+
+// Spare-time work: paint the maximized view of a live page on show, so that
+// maximizing the window is instant. Returns true if there was work to do.
+public function prepare(app: state.App, milliseconds: Integer): Boolean {
+    let panel = app.panel
+    if !panel.visible || panel.page == state.PAGE_BLANK || bigReady(app) { return false }
+    if panel.page == state.PAGE_SHEET {
+        updateBigSheet(app, preparedBig(app, panel.page))
+        return true
+    }
+    if preparedBig(app, panel.page).width == BIG_WIDTH { return false }
+    paintBig(app, milliseconds)
+    return true
+}
+
+// The docked-size rendering of a page that never changes, or of the
+// spreadsheet without its rows; a 1×1 canvas for pages drawn every time.
+function preparedPage(app: state.App, page: Integer, width: Integer, height: Integer): canvas.Canvas {
+    let panel = app.panel
+    if page < panel.pageCaches.length {
+        return panel.pageCaches[page]
+    }
+    return canvas.create(1, 1)
+}
+
+// Render every page that does not depend on live data, at the docked size,
+// so changing page never costs a frame. Called once at start-up.
+public function preparePages(app: state.App) {
+    let width = DOCKED_WIDTH
+    let height = DOCKED_HEIGHT * 2
+    let caches: List<canvas.Canvas> = []
+    let bigs: List<canvas.Canvas> = []
+    for page in 0..(state.PAGE_SEARCH + 1) {
+        let fixed = page >= state.PAGE_ARTICLE && page <= state.PAGE_NORTHSTAR || page == state.PAGE_BIGMAN || page == state.PAGE_SHEET
+        if fixed {
+            let target = canvas.create(width, height)
+            if page == state.PAGE_SHEET {
+                pages.sheetGrid(app, target)
+            } else {
+                pages.draw(app, target, page)
+            }
+            canvas.clearDirty(target)
+            caches.add(target)
+            bigs.add(renderFixed(app, page, BIG_WIDTH, BIG_HEIGHT))
+        } else {
+            caches.add(canvas.create(1, 1))
+            bigs.add(canvas.create(1, 1))
+        }
+    }
+    app.panel.pageCaches = caches
+    app.panel.bigCaches = bigs
+}
+
+function renderFixed(app: state.App, page: Integer, width: Integer, height: Integer): canvas.Canvas {
+    let target = canvas.create(width, height)
+    if page == state.PAGE_SHEET {
+        pages.sheetGrid(app, target)
+    } else {
+        pages.draw(app, target, page)
+    }
+    canvas.clearDirty(target)
+    return target
+}

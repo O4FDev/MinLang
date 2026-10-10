@@ -1,0 +1,379 @@
+// Typed, checked hardware access for freestanding programs, built on
+// `machine`. Import it with `use "device" as device`.
+//
+// `machine` takes bare Integer addresses, so nothing stops a 64-bit write to a
+// 32-bit register, a port number used as an address, or an address kept after
+// its Bytes were released. Here each kind of location is its own record type:
+//
+//   Registers  a window of memory-mapped device registers, such as a PCI BAR
+//   Register8 / 16 / 32 / 64   one register of that width inside a window
+//   Port8 / 16 / 32            one I/O port
+//   Memory     a range of ordinary memory: DMA rings and buffers the program
+//              allocates, or a fixed physical range such as a framebuffer
+//
+// A location is checked once, when it is made: in range, aligned, and the
+// right width. Each access after that is the bare instruction plus a field
+// load. Accesses through Registers and Memory offsets are checked every time.
+// Every field is private, so locations come only from these functions: a
+// program cannot build a Register32 from an Integer or reach Memory's storage.
+// Every access is volatile, in program order, as devices require; plain
+// buffers the device never sees, such as pixels, should use `machine` or Bytes.
+use "machine" as machine
+
+// ----- Memory-mapped registers -----
+
+public record Registers {
+    private base: Integer
+    private size: Integer
+}
+
+public record Register8 {
+    private address: Integer
+}
+
+public record Register16 {
+    private address: Integer
+}
+
+public record Register32 {
+    private address: Integer
+}
+
+public record Register64 {
+    private address: Integer
+}
+
+// The `size` bytes of device registers at physical address `base`.
+public function registers(base: Integer, size: Integer): Registers {
+    if base <= 0 || size <= 0 {
+        fail("device registers need a positive base address and size, not " + Text(base) + " and " + Text(size))
+    }
+    return Registers { base: base; size: size }
+}
+
+// Where the window starts, for diagnostics.
+public function base(window: Registers): Integer {
+    return window.base
+}
+
+// Checks inline into every access; their messages are built out of line so
+// a driver's hot loop stays small.
+function outsideWindow(offset: Integer, size: Integer) {
+    fail("register offset " + Text(offset) + " is outside a " + Text(size) + "-byte register window")
+}
+
+function misaligned(offset: Integer, width: Integer) {
+    fail("a " + Text(width * 8) + "-bit register needs an offset aligned to " + Text(width) + " bytes, not " + Text(offset))
+}
+
+function tooWide(value: Integer, bits: Integer) {
+    fail(Text(value) + " does not fit in a " + Text(bits) + "-bit register")
+}
+
+function outsideMemory(offset: Integer, width: Integer, size: Integer) {
+    fail("offset " + Text(offset) + " and " + Text(width) + " bytes are outside " + Text(size) + " bytes of memory")
+}
+
+function outsideBytes(offset: Integer, count: Integer, length: Integer) {
+    fail("bytes " + Text(offset) + " to " + Text(offset + count) + " are outside " + Text(length) + " Bytes")
+}
+
+function registerAddress(window: Registers, offset: Integer, width: Integer): Integer {
+    if offset < 0 || offset > window.size - width {
+        outsideWindow(offset, window.size)
+    }
+    if offset % width != 0 {
+        misaligned(offset, width)
+    }
+    return window.base + offset
+}
+
+public function register8(window: Registers, offset: Integer): Register8 {
+    return Register8 { address: registerAddress(window, offset, 1) }
+}
+
+public function register16(window: Registers, offset: Integer): Register16 {
+    return Register16 { address: registerAddress(window, offset, 2) }
+}
+
+public function register32(window: Registers, offset: Integer): Register32 {
+    return Register32 { address: registerAddress(window, offset, 4) }
+}
+
+public function register64(window: Registers, offset: Integer): Register64 {
+    return Register64 { address: registerAddress(window, offset, 8) }
+}
+
+function fits(value: Integer, bits: Integer): Integer {
+    if bits < 64 && (value < 0 || value >= 1 << bits) {
+        tooWide(value, bits)
+    }
+    return value
+}
+
+public function read8(register: Register8): Integer {
+    return machine.read8(register.address)
+}
+
+public function read16(register: Register16): Integer {
+    return machine.read16(register.address)
+}
+
+public function read32(register: Register32): Integer {
+    return machine.read32(register.address)
+}
+
+public function read64(register: Register64): Integer {
+    return machine.read64(register.address)
+}
+
+public function write8(register: Register8, value: Integer) {
+    machine.write8(register.address, fits(value, 8))
+}
+
+public function write16(register: Register16, value: Integer) {
+    machine.write16(register.address, fits(value, 16))
+}
+
+public function write32(register: Register32, value: Integer) {
+    machine.write32(register.address, fits(value, 32))
+}
+
+public function write64(register: Register64, value: Integer) {
+    machine.write64(register.address, value)
+}
+
+// Registers read once, such as during set-up, need not be kept as values.
+public function readAt8(window: Registers, offset: Integer): Integer {
+    return machine.read8(registerAddress(window, offset, 1))
+}
+
+public function writeAt8(window: Registers, offset: Integer, value: Integer) {
+    machine.write8(registerAddress(window, offset, 1), fits(value, 8))
+}
+
+public function readAt16(window: Registers, offset: Integer): Integer {
+    return machine.read16(registerAddress(window, offset, 2))
+}
+
+public function writeAt16(window: Registers, offset: Integer, value: Integer) {
+    machine.write16(registerAddress(window, offset, 2), fits(value, 16))
+}
+
+public function readAt32(window: Registers, offset: Integer): Integer {
+    return machine.read32(registerAddress(window, offset, 4))
+}
+
+public function writeAt32(window: Registers, offset: Integer, value: Integer) {
+    machine.write32(registerAddress(window, offset, 4), fits(value, 32))
+}
+
+public function readAt64(window: Registers, offset: Integer): Integer {
+    return machine.read64(registerAddress(window, offset, 8))
+}
+
+public function writeAt64(window: Registers, offset: Integer, value: Integer) {
+    machine.write64(registerAddress(window, offset, 8), value)
+}
+
+// Set (`on`) or clear the bits of `mask` in a register, leaving the others.
+public function setBits32(register: Register32, mask: Integer, on: Boolean) {
+    let value = machine.read32(register.address)
+    if on {
+        value = value | mask
+    } else {
+        value = value & ~mask
+    }
+    machine.write32(register.address, value & 0xFFFFFFFF)
+}
+
+// ----- I/O ports -----
+
+public record Port8 {
+    private number: Integer
+}
+
+public record Port16 {
+    private number: Integer
+}
+
+public record Port32 {
+    private number: Integer
+}
+
+function portNumber(number: Integer, width: Integer): Integer {
+    if number < 0 || number > 0x10000 - width {
+        fail("I/O port " + Text(number) + " is outside 0 to 65535")
+    }
+    return number
+}
+
+public function port8(number: Integer): Port8 {
+    return Port8 { number: portNumber(number, 1) }
+}
+
+public function port16(number: Integer): Port16 {
+    return Port16 { number: portNumber(number, 2) }
+}
+
+public function port32(number: Integer): Port32 {
+    return Port32 { number: portNumber(number, 4) }
+}
+
+public function in8(port: Port8): Integer {
+    return machine.in8(port.number)
+}
+
+public function in16(port: Port16): Integer {
+    return machine.in16(port.number)
+}
+
+public function in32(port: Port32): Integer {
+    return machine.in32(port.number)
+}
+
+// Read `count` 16-bit values from `port` into `into` from `offset`, as a disk
+// controller's data port delivers a sector. The range is checked once.
+public function inBlock16(port: Port16, into: Bytes, offset: Integer, count: Integer) {
+    if offset < 0 || count < 0 || offset > into.length - count * 2 {
+        outsideBytes(offset, count * 2, into.length)
+    }
+    let number = port.number
+    let at = machine.address(into) + offset
+    for index in 0..count {
+        machine.store16(at + index * 2, machine.in16(number))
+    }
+}
+
+public function out8(port: Port8, value: Integer) {
+    machine.out8(port.number, fits(value, 8))
+}
+
+public function out16(port: Port16, value: Integer) {
+    machine.out16(port.number, fits(value, 16))
+}
+
+public function out32(port: Port32, value: Integer) {
+    machine.out32(port.number, fits(value, 32))
+}
+
+// ----- Memory -----
+
+// A range of memory. When `owner` holds the storage, the range is the
+// program's own and stays valid for as long as any Memory over it exists:
+// the Bytes are never exposed, so they can never grow or be released early.
+public record Memory {
+    private owner: Bytes
+    private address: Integer
+    private size: Integer
+}
+
+// `size` zeroed bytes whose address is a multiple of `alignment`, for rings
+// and buffers a device reads and writes by DMA.
+public function allocate(size: Integer, alignment: Integer): Memory {
+    if size <= 0 || alignment <= 0 || (alignment & (alignment - 1)) != 0 {
+        fail("memory needs a positive size and a power-of-two alignment, not " + Text(size) + " and " + Text(alignment))
+    }
+    let owner = Bytes(size + alignment - 1)
+    let address = (machine.address(owner) + alignment - 1) & ~(alignment - 1)
+    return Memory { owner: owner; address: address; size: size }
+}
+
+// A fixed physical range the program does not own, such as a framebuffer or
+// firmware table. Making one is the only unchecked step: `address` is trusted.
+public function physical(address: Integer, size: Integer): Memory {
+    if address <= 0 || size <= 0 {
+        fail("physical memory needs a positive address and size, not " + Text(address) + " and " + Text(size))
+    }
+    return Memory { owner: Bytes(); address: address; size: size }
+}
+
+function memoryAddress(memory: Memory, offset: Integer, width: Integer): Integer {
+    if offset < 0 || offset > memory.size - width {
+        outsideMemory(offset, width, memory.size)
+    }
+    return memory.address + offset
+}
+
+public function size(memory: Memory): Integer {
+    return memory.size
+}
+
+// `size` bytes of `memory` from `offset`, sharing its storage.
+public function view(memory: Memory, offset: Integer, size: Integer): Memory {
+    if size < 0 {
+        fail("a view cannot have a negative size")
+    }
+    return Memory { owner: memory.owner; address: memoryAddress(memory, offset, size); size: size }
+}
+
+// The physical address of `offset`, to hand to a device.
+public function addressOf(memory: Memory, offset: Integer): Integer {
+    return memoryAddress(memory, offset, 0)
+}
+
+public function load8(memory: Memory, offset: Integer): Integer {
+    return machine.read8(memoryAddress(memory, offset, 1))
+}
+
+public function load16(memory: Memory, offset: Integer): Integer {
+    return machine.read16(memoryAddress(memory, offset, 2))
+}
+
+public function load32(memory: Memory, offset: Integer): Integer {
+    return machine.read32(memoryAddress(memory, offset, 4))
+}
+
+public function load64(memory: Memory, offset: Integer): Integer {
+    return machine.read64(memoryAddress(memory, offset, 8))
+}
+
+public function store8(memory: Memory, offset: Integer, value: Integer) {
+    machine.write8(memoryAddress(memory, offset, 1), fits(value, 8))
+}
+
+public function store16(memory: Memory, offset: Integer, value: Integer) {
+    machine.write16(memoryAddress(memory, offset, 2), fits(value, 16))
+}
+
+public function store32(memory: Memory, offset: Integer, value: Integer) {
+    machine.write32(memoryAddress(memory, offset, 4), fits(value, 32))
+}
+
+public function store64(memory: Memory, offset: Integer, value: Integer) {
+    machine.write64(memoryAddress(memory, offset, 8), value)
+}
+
+// Copy `count` bytes of `memory` from `offset` into new Bytes.
+public function read(memory: Memory, offset: Integer, count: Integer): Bytes {
+    let source = memoryAddress(memory, offset, count)
+    let bytes = Bytes(count)
+    machine.fence()
+    if count > 0 { machine.copy(machine.address(bytes), source, count) }
+    return bytes
+}
+
+// Copy `count` bytes of `bytes`, from `start`, into `memory` at `offset`.
+public function write(memory: Memory, offset: Integer, bytes: Bytes, start: Integer, count: Integer) {
+    if start < 0 || count < 0 || start > bytes.length - count {
+        fail("bytes " + Text(start) + " to " + Text(start + count) + " are outside the " + Text(bytes.length) + " given")
+    }
+    let target = memoryAddress(memory, offset, count)
+    if count > 0 { machine.copy(target, machine.address(bytes) + start, count) }
+    machine.fence()
+}
+
+// Copy `count` bytes between two ranges, which may overlap.
+public function copy(target: Memory, targetOffset: Integer, source: Memory, sourceOffset: Integer, count: Integer) {
+    let to = memoryAddress(target, targetOffset, count)
+    let from = memoryAddress(source, sourceOffset, count)
+    if count > 0 { machine.copy(to, from, count) }
+    machine.fence()
+}
+
+// Set `count` bytes from `offset` to `value`.
+public function fill(memory: Memory, offset: Integer, count: Integer, value: Integer) {
+    let target = memoryAddress(memory, offset, count)
+    if count > 0 { machine.fill8(target, count, fits(value, 8)) }
+    machine.fence()
+}

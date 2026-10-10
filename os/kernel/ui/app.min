@@ -1,0 +1,326 @@
+// The desktop: input handling, animation and damage-driven redrawing.
+use "machine" as machine
+use "../../shared/graphics/canvas.min" as canvas
+use "../../shared/graphics/font.min" as font
+use "../input/devices.min" as devices
+use "./state.min" as state
+use "../system/processors.min" as processors
+use "./theme.min" as theme
+use "./type.min" as type
+use "./icons.min" as icons
+use "./desktop.min" as desktop
+use "../../shared/graphics/wordmark.min" as wordmark
+use "./composer.min" as composer
+use "./conversation.min" as conversation
+use "./panel.min" as panel
+use "./overlay.min" as overlay
+
+// Hover targets.
+public constant TARGET_NONE = 0
+public constant TARGET_NAV = 1
+public constant TARGET_SEND = 2
+public constant TARGET_TEXT = 3
+public constant TARGET_HELP = 4
+public constant TARGET_AVATAR = 5
+public constant TARGET_DEVICE = 6
+public constant TARGET_BLOCK = 7
+public constant TARGET_PANEL = 8
+public constant TARGET_PLUS = 9
+public constant TARGET_MICROPHONE = 10
+
+public record Desktop {
+    app: state.App
+    glow: Bytes
+    // A message waiting for the agent to pick up.
+    outbox: List<Text>
+    // Clicks on conversation controls, as block index * 16 + control.
+    actions: List<Integer>
+}
+
+public function create(screen: canvas.Canvas, typefaces: type.Type, input: devices.Input, cores: processors.Processors): Desktop {
+    let back = canvas.create(screen.width, screen.height)
+    canvas.useProcessors(back, cores.block, cores.count)
+    let app = state.App {
+        back: back; screen: screen; type: typefaces; icons: icons.create(); input: input; damage: state.newDamage()
+        now: 0.0; previous: 0.0; frames: 0; view: state.VIEW_CHAT; hoverView: -1; hover: TARGET_NONE; pressed: TARGET_NONE
+        column: state.tween(Float(theme.COLUMN_CENTERED_LEFT)); blocks: []; scroll: 0.0; scrollTarget: 0.0; contentHeight: 0
+        composer: state.Composer { text: ""; caret: 0; scroll: 0.0; edited: 0.0; focused: true }
+        panel: panel.create()
+        glow: state.tween(0.0); glowStep: 0
+        toast: state.Toast { text: ""; born: -10.0; x: 0; y: 0 }
+        menu: overlay.NONE; menuShown: state.tween(0.0)
+        pointerX: input.x; pointerY: input.y; pointerShape: state.POINTER_ARROW
+        drawnPointerX: input.x; drawnPointerY: input.y; drawnPointerShape: state.POINTER_ARROW
+        device: desktop.renderDevice(); wordmark: wordmark.render(1.0); clipboard: ""; library: []; system: []; timings: [0, 0, 0, 0, 0, 0, 0, 0]; layer: 0; warmFace: 0; warmCursor: 0; ticksPerMillisecond: 1000000; avatar: desktop.renderAvatar(); processors: cores; glowArguments: Bytes(128)
+    }
+    state.invalidateAll(app)
+    return Desktop { app: app; glow: desktop.glowTable(); outbox: []; actions: [] }
+}
+
+// ----- Input -----
+
+function hitTest(app: state.App, x: Integer, y: Integer): Integer {
+    if overlay.isOpen(app) {
+        return overlay.hit(app, x, y)
+    }
+    if desktop.navAt(app, x, y) >= 0 { return TARGET_NAV }
+    if state.inside(x, y, desktop.HELP_X - 4, desktop.HELP_Y - 4, 28, 28) { return TARGET_HELP }
+    if state.inside(x, y, desktop.AVATAR_X - 14, desktop.AVATAR_Y - 14, 28, 28) { return TARGET_AVATAR }
+    if state.inside(x, y, desktop.DEVICE_X + 10, desktop.DEVICE_Y + 6, 62, 140) { return TARGET_DEVICE }
+    if app.view == state.VIEW_CHAT {
+        if panel.contains(app, x, y) { return TARGET_PANEL }
+        if composer.onSend(app, x, y) { return TARGET_SEND }
+        let box = composer.frame(app)
+        if state.inside(x, y, box.left + 56, box.top + 60, 26, 26) { return TARGET_PLUS }
+        if state.inside(x, y, box.left + 102, box.top + 58, 26, 30) { return TARGET_MICROPHONE }
+        if composer.onText(app, x, y) { return TARGET_TEXT }
+        if conversation.controlAt(app, x, y) >= 0 { return TARGET_BLOCK }
+    }
+    return TARGET_NONE
+}
+
+function pointerShapeFor(app: state.App, target: Integer): Integer {
+    if target == TARGET_TEXT { return state.POINTER_TEXT }
+    if target == TARGET_NONE || target == TARGET_DEVICE { return state.POINTER_ARROW }
+    if target == TARGET_PANEL {
+        if panel.controlAt(app, app.input.x, app.input.y) >= 0 { return state.POINTER_HAND }
+        return state.POINTER_ARROW
+    }
+    if target >= 100 { return state.POINTER_HAND }
+    return state.POINTER_HAND
+}
+
+function handlePointer(desktopState: Desktop) {
+    let app = desktopState.app
+    let input = app.input
+    let x = input.x
+    let y = input.y
+    let target = hitTest(app, x, y)
+    let hoverView = -1
+    if target == TARGET_NAV { hoverView = desktop.navAt(app, x, y) }
+    if hoverView != app.hoverView {
+        app.hoverView = hoverView
+        desktop.invalidateSidebar(app)
+    }
+    if target != app.hover {
+        app.hover = target
+    }
+    if app.view == state.VIEW_CHAT && !overlay.isOpen(app) {
+        conversation.hover(app, x, y)
+    }
+    app.pointerX = x
+    app.pointerY = y
+    app.pointerShape = pointerShapeFor(app, target)
+    if input.scroll != 0 && app.view == state.VIEW_CHAT && !overlay.isOpen(app) {
+        conversation.scrollBy(app, Float(input.scroll) * 48.0)
+    }
+    if (input.pressed & devices.BUTTON_LEFT) == 0 { return }
+    if overlay.isOpen(app) {
+        overlay.click(app, x, y)
+        return
+    }
+    if target == TARGET_NAV {
+        let view = desktop.navAt(app, x, y)
+        if view != app.view {
+            app.view = view
+            state.invalidateAll(app)
+        }
+    }
+    if target == TARGET_HELP { overlay.open(app, overlay.HELP) }
+    if target == TARGET_AVATAR { overlay.open(app, overlay.ACCOUNT) }
+    if target == TARGET_DEVICE { overlay.open(app, overlay.SYSTEM) }
+    if target == TARGET_PLUS { showToast(app, "Attachments arrive in a later build", x, y - 40) }
+    if target == TARGET_MICROPHONE { showToast(app, "No microphone is attached to this machine", x, y - 40) }
+    if target == TARGET_SEND { send(desktopState) }
+    if target == TARGET_TEXT {
+        composer.click(app, x)
+    }
+    if target == TARGET_BLOCK {
+        desktopState.actions.add(conversation.controlAt(app, x, y))
+    }
+    if target == TARGET_PANEL {
+        let control = panel.controlAt(app, x, y)
+        if control >= 0 {
+            desktopState.actions.add(-1 - control)
+        }
+    }
+}
+
+public function showToast(app: state.App, text: Text, x: Integer, y: Integer) {
+    overlay.invalidateToast(app)
+    app.toast = state.Toast { text: text; born: app.now; x: x; y: y }
+    overlay.invalidateToast(app)
+}
+
+function send(desktopState: Desktop) {
+    let app = desktopState.app
+    if app.composer.text == "" { return }
+    desktopState.outbox.add(composer.take(app))
+}
+
+function handleKeys(desktopState: Desktop) {
+    let app = desktopState.app
+    for event in app.input.keys {
+        if overlay.isOpen(app) {
+            if event.key == devices.KEY_ESCAPE || event.key == devices.KEY_ENTER {
+                overlay.close(app)
+            }
+        } else {
+            if event.key == devices.KEY_F1 {
+                overlay.open(app, overlay.HELP)
+            } else {
+                if event.key == devices.KEY_PAGE_UP || event.key == devices.KEY_UP && app.composer.text == "" {
+                    conversation.scrollBy(app, -300.0)
+                } else {
+                    if event.key == devices.KEY_PAGE_DOWN || event.key == devices.KEY_DOWN && app.composer.text == "" {
+                        conversation.scrollBy(app, 300.0)
+                    } else {
+                        if app.view != state.VIEW_CHAT && event.key == devices.KEY_CHARACTER {
+                            app.view = state.VIEW_CHAT
+                            state.invalidateAll(app)
+                        }
+                        if composer.type(app, event) {
+                            send(desktopState)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ----- Frames -----
+
+// Spend spare time between frames filling glyph caches, so text that appears
+// for the first time never has to wait for rasterization. Returns false once
+// every cache is full.
+public function warmGlyphs(desktopState: Desktop): Boolean {
+    let app = desktopState.app
+    let faces = type.warmable(app.type)
+    if app.warmFace >= faces.length { return false }
+    let next = font.warm(faces[app.warmFace], app.warmCursor)
+    if next < 0 {
+        app.warmFace += 1
+        app.warmCursor = 0
+    } else {
+        app.warmCursor = next
+    }
+    return true
+}
+
+// Pixels waiting to be redrawn, for profiling.
+public function damageArea(desktopState: Desktop): Integer {
+    let damage = desktopState.app.damage
+    let area = 0
+    for index in 0..damage.lefts.length {
+        area += (damage.rights[index] - damage.lefts[index]) * (damage.bottoms[index] - damage.tops[index])
+    }
+    return area
+}
+
+// Advance to `now` (seconds): read input, run animations and redraw what
+// changed. Returns true if anything was drawn.
+public function step(desktopState: Desktop, now: Float): Boolean {
+    let app = desktopState.app
+    app.previous = app.now
+    app.now = now
+    let inputStart = machine.timestamp()
+    devices.poll(app.input)
+    handleKeys(desktopState)
+    handlePointer(desktopState)
+    animate(app)
+    lap(app, 7, inputStart)
+    if app.pointerX != app.drawnPointerX || app.pointerY != app.drawnPointerY || app.pointerShape != app.drawnPointerShape {
+        let old = desktop.pointerBox(app.drawnPointerX, app.drawnPointerY)
+        state.invalidate(app, old[0], old[1], old[2], old[3])
+        let box = desktop.pointerBox(app.pointerX, app.pointerY)
+        state.invalidate(app, box[0], box[1], box[2], box[3])
+        app.drawnPointerX = app.pointerX
+        app.drawnPointerY = app.pointerY
+        app.drawnPointerShape = app.pointerShape
+    }
+    let damage = app.damage
+    if damage.lefts.length == 0 {
+        return false
+    }
+    app.damage = state.newDamage()
+    for index in 0..damage.lefts.length {
+        canvas.setClip(app.back, damage.lefts[index], damage.tops[index], damage.rights[index] - damage.lefts[index], damage.bottoms[index] - damage.tops[index])
+        drawScene(desktopState)
+    }
+    canvas.resetClip(app.back)
+    let presentStart = machine.timestamp()
+    canvas.present(app.back, app.screen)
+    lap(app, 6, presentStart)
+    app.frames += 1
+    return true
+}
+
+// Copy the whole finished frame to the screen again. Stock QEMU's Cocoa window
+// redraws only what changes in video memory, and macOS can throw away the
+// window's contents (display sleep, screen lock, another Space), leaving it
+// gray until each part happens to change; rewriting everything heals that.
+// QEMU built by tools/build-qemu.sh keeps its contents and does not need it.
+public function refresh(desktopState: Desktop) {
+    let app = desktopState.app
+    canvas.markDirty(app.back, 0, 0, app.back.width, app.back.height)
+    canvas.present(app.back, app.screen)
+}
+
+function glowLevel(app: state.App): Integer {
+    return Integer(state.value(app.glow, app.now) * 24.0 + 0.5)
+}
+
+function animate(app: state.App) {
+    let now = app.now
+    if state.animating(app.column, now) || state.animating(app.column, app.previous) {
+        state.invalidate(app, 100, 0, 1300, app.back.height)
+    }
+    let glowStep = glowLevel(app)
+    if glowStep != app.glowStep {
+        app.glowStep = glowStep
+        desktop.invalidateGlow(app)
+    }
+    // The caret blinks.
+    if app.view == state.VIEW_CHAT && app.composer.focused {
+        let since = now - app.composer.edited
+        if since > 0.55 {
+            let phase = Integer(since * 1.9)
+            let previous = Integer((app.previous - app.composer.edited) * 1.9)
+            if phase != previous { composer.invalidateLine(app) }
+        }
+    }
+    conversation.animate(app)
+    panel.animate(app)
+    overlay.animate(app)
+}
+
+function lap(app: state.App, slot: Integer, since: Integer): Integer {
+    let now = machine.timestamp()
+    app.timings[slot] += now - since
+    return now
+}
+
+function drawScene(desktopState: Desktop) {
+    let app = desktopState.app
+    let back = app.back
+    let mark = machine.timestamp()
+    canvas.fill(back, back.clipLeft, back.clipTop, back.clipRight - back.clipLeft, back.clipBottom - back.clipTop, theme.BACKGROUND)
+    desktop.drawSidebar(app)
+    mark = lap(app, 0, mark)
+    if app.view == state.VIEW_CHAT {
+        conversation.draw(app)
+        mark = lap(app, 1, mark)
+        composer.draw(app)
+        mark = lap(app, 2, mark)
+        panel.draw(app)
+        mark = lap(app, 3, mark)
+    } else {
+        overlay.drawView(app)
+    }
+    desktop.drawGlow(app, desktopState.glow, Float(app.glowStep) / 24.0)
+    mark = lap(app, 4, mark)
+    overlay.draw(app)
+    desktop.drawPointer(app, app.pointerX, app.pointerY, app.pointerShape)
+    mark = lap(app, 5, mark)
+}

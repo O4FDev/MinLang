@@ -1,0 +1,59 @@
+// A virtio entropy source, for machines whose processors have no random
+// instruction (arch.NEEDS_ENTROPY). It keeps the boot code's entropy pool
+// (machine.symbol(3): a count, then up to 4096 bytes) full; the runtime's
+// randomBytes() takes bytes from it and never reuses them.
+use "machine" as machine
+use "device" as device
+use "../pci.min" as pci
+use "./virtio.min" as virtio
+
+constant POOL = 4096
+constant POOL_SYMBOL = 3
+
+public record Source {
+    private opened: virtio.Device
+    private requests: virtio.Queue
+    private buffer: device.Memory
+    private pool: device.Memory
+}
+
+public function present(devices: List<pci.Device>): Boolean {
+    return virtio.find(devices, virtio.ENTROPY).length > 0
+}
+
+public function open(devices: List<pci.Device>): Source {
+    let cards = virtio.find(devices, virtio.ENTROPY)
+    if cards.length == 0 {
+        fail("no virtio entropy device was found")
+    }
+    let opened = virtio.open(cards[0])
+    let requests = virtio.openQueue(opened, 0, 2)
+    virtio.ready(opened)
+    let source = Source {
+        opened: opened; requests: requests; buffer: device.allocate(POOL, 64)
+        pool: device.physical(machine.symbol(POOL_SYMBOL), 8 + POOL)
+    }
+    refill(source)
+    return source
+}
+
+// Top the pool up to full; returns how many bytes it now holds.
+public function refill(source: Source): Integer {
+    let available = device.load64(source.pool, 0)
+    let guard = 0
+    while available < POOL && guard < 64 {
+        virtio.describe(source.requests, 0, device.addressOf(source.buffer, 0), POOL - available, virtio.WRITE, 0)
+        virtio.complete(source.requests, 0)
+        let received = min(source.requests.length, POOL - available)
+        device.copy(source.pool, 8 + available, source.buffer, 0, received)
+        available += received
+        device.store64(source.pool, 0, available)
+        guard += 1
+    }
+    return available
+}
+
+// How many bytes the pool holds.
+public function available(source: Source): Integer {
+    return device.load64(source.pool, 0)
+}

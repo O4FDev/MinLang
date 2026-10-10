@@ -26,6 +26,37 @@ function sourcePath(locations: SourceMap, path: Text): Integer {
     return index
 }
 
+function tokenPath(locations: SourceMap, position: Integer): Text {
+    let indices = locations.pathIndices
+    if position < indices.length { return locations.paths[indices[position]] }
+    return locations.paths[0]
+}
+
+// A private record field is stored as its name, a space and the path of the
+// module that declares it, so symbol tables and cached interfaces carry its
+// visibility unchanged. Names never contain spaces.
+function declaredFieldName(stored: Text): Text {
+    let position = 0
+    while position < stored.length {
+        if stored[position] == ' ' { return stored.slice(0, position) }
+        position = position + 1
+    }
+    return stored
+}
+
+function isFieldNamed(stored: Text, name: Text): Boolean {
+    if stored == name { return true }
+    return stored.length > name.length && stored[name.length] == ' ' && stored.slice(0, name.length) == name
+}
+
+// Only code in the declaring module may read, assign or initialize a private field.
+function checkFieldAccess(locations: SourceMap, stored: Text, recordName: Text, position: Integer) {
+    let name = declaredFieldName(stored)
+    if stored.length > name.length && stored.slice(name.length + 1, stored.length) != tokenPath(locations, position) {
+        fail(describeLocation(tokenLocation(locations, position)) + ": field '" + name + "' of record '" + readableDeclarationName(recordName) + "' is private to its module")
+    }
+}
+
 function setTokenPath(locations: SourceMap, position: Integer, path: Integer) {
     let indices = locations.pathIndices
     if path != 0 || position < indices.length {
@@ -150,6 +181,7 @@ function lineCanEndStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>):
 }
 
 function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap) {
+    let firstToken = tokenKinds.length
     let coordinates = tokenLines.coordinates
     let position = 0
     let line = 1
@@ -414,6 +446,23 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
     }
 
     addToken(tokenKinds, tokenTexts, coordinates, 0, "", line, position - lineStart + 1)
+    // `parallel function` declares a function that may run on any processor.
+    // The modifier becomes a line break whose text still reads "parallel":
+    // every pass treats it as whitespace, and compileTokens recovers it.
+    let scan = firstToken
+    while scan + 1 < tokenKinds.length {
+        // `public parallel function` becomes `parallel public function`, so
+        // the modifier always comes first and `public function` stays intact.
+        if scan + 2 < tokenKinds.length && tokenKinds[scan] == 1 && tokenTexts[scan] == "public" && tokenKinds[scan + 1] == 1 && tokenTexts[scan + 1] == "parallel" && tokenKinds[scan + 2] == 1 && tokenTexts[scan + 2] == "function" {
+            tokenKinds[scan] = 6
+            tokenTexts[scan] = "parallel"
+            tokenTexts[scan + 1] = "public"
+        }
+        if tokenKinds[scan] == 1 && tokenTexts[scan] == "parallel" && tokenKinds[scan + 1] == 1 && tokenTexts[scan + 1] == "function" {
+            tokenKinds[scan] = 6
+        }
+        scan = scan + 1
+    }
 }
 
 function describeLocation(location: Text): Text {
@@ -957,6 +1006,12 @@ function discoverDeclarations(tokenKinds: List<Integer>, tokenTexts: List<Text>,
             let first = symbolParameterNames.length
             parameterStarts[record] = first
             while !tokenIs(tokenKinds, tokenTexts, cursor, "}") {
+                // `private name: Type`; a field may itself be named private.
+                let visibility = ""
+                if tokenTexts[cursor[0]] == "private" && tokenKinds[cursor[0]] == 1 && tokenKinds[cursor[0] + 1] == 1 {
+                    visibility = " " + tokenPath(tokenLines, cursor[0])
+                    cursor[0] = cursor[0] + 1
+                }
                 if tokenKinds[cursor[0]] != 1 {
                     fail(describeLocation(tokenLocation(tokenLines, cursor[0])) + ": expected a record field name")
                 }
@@ -964,7 +1019,7 @@ function discoverDeclarations(tokenKinds: List<Integer>, tokenTexts: List<Text>,
                 let previous = 0
                 let duplicate = false
                 while previous < count {
-                    if symbolParameterNames[first + previous] == fieldName {
+                    if isFieldNamed(symbolParameterNames[first + previous], fieldName) {
                         duplicate = true
                     }
                     previous = previous + 1
@@ -972,7 +1027,7 @@ function discoverDeclarations(tokenKinds: List<Integer>, tokenTexts: List<Text>,
                 if duplicate {
                     fail(describeLocation(tokenLocation(tokenLines, cursor[0])) + ": record '" + symbolNames[record] + "' declares '" + fieldName + "' twice")
                 }
-                symbolParameterNames.add(fieldName)
+                symbolParameterNames.add(fieldName + visibility)
                 cursor[0] = cursor[0] + 1
                 expectToken(tokenKinds, tokenTexts, tokenLines, cursor, ":")
                 symbolParameterTypes.add(takeValueType(tokenKinds, tokenTexts, tokenLines, cursor, symbolNames, symbolKinds))
@@ -1346,7 +1401,7 @@ function findRecordField(functionParameterCounts: List<Integer>, functionParamet
     let position = 0
     let found = -1
     while position < functionParameterCounts[record] && found == -1 {
-        if functionParameterNames[first + position] == fieldName {
+        if isFieldNamed(functionParameterNames[first + position], fieldName) {
             found = first + position
         }
         position = position + 1
@@ -2519,6 +2574,7 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                     if field < 0 {
                         fail("record '" + readableDeclarationName(functionNames[receiverType - 1000]) + "' has no field named '" + member + "'")
                     }
+                    checkFieldAccess(tokenLines, functionParameterNames[field], functionNames[receiverType - 1000], memberLocation)
                     let first = functionParameterOffset(functionParameterCounts, receiverType - 1000)
                     let fieldType = functionParameterTypes[field]
                     let temporary = newTemporary(state)
@@ -2633,6 +2689,15 @@ function parseRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLin
     if record < 0 {
         fail("I can't find a record named '" + readableDeclarationName(name) + "'")
     }
+    let hidden = 0
+    while hidden < functionParameterCounts[record] {
+        let stored = functionParameterNames[functionParameterOffset(functionParameterCounts, record) + hidden]
+        let declared = declaredFieldName(stored)
+        if stored.length > declared.length && stored.slice(declared.length + 1, stored.length) != tokenPath(tokenLines, state[0]) {
+            fail(describeLocation(tokenLocation(tokenLines, state[0])) + ": record '" + readableDeclarationName(name) + "' has private fields, so only its own module can create one")
+        }
+        hidden = hidden + 1
+    }
     state[0] = state[0] + 1
     expectToken(tokenKinds, tokenTexts, tokenLines, state, "{")
     skipTerminators(tokenKinds, state)
@@ -2737,7 +2802,7 @@ function parseRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLin
     position = 0
     while position < fieldCount {
         if !seen[position] {
-            fail(describeLocation(tokenLocation(tokenLines, closingLocation)) + ": record '" + readableDeclarationName(name) + "' is missing field '" + functionParameterNames[first + position] + "'")
+            fail(describeLocation(tokenLocation(tokenLines, closingLocation)) + ": record '" + readableDeclarationName(name) + "' is missing field '" + declaredFieldName(functionParameterNames[first + position]) + "'")
         }
         position = position + 1
     }
@@ -3265,8 +3330,11 @@ function checkBuiltinArguments(name: Text, types: List<Integer>) {
         }
         if count > 0 {
             let type = types[0]
-            if (name == "print" || name == "Text") && (type < 1 || type > 4) && type != 7 {
+            if name == "print" && (type < 1 || type > 4) && type != 7 {
                 fail(name + " expects one Integer, Float, Text, Character, or Boolean value")
+            }
+            if name == "Text" && (type < 1 || type > 4) && type != 7 && type != 8 {
+                fail(name + " expects one Integer, Float, Text, Character, Boolean, or Bytes value")
             }
             if (name == "fail" || name == "readTextFile") && type != 2 {
                 fail(name + " expects one Text argument")
@@ -3285,7 +3353,7 @@ function checkBuiltinArguments(name: Text, types: List<Integer>) {
 }
 
 function isNumericBuiltin(name: Text): Boolean {
-    return name == "Bytes" || name == "readBytesFile" || name == "writeBytesFile" || name == "fileExists" || name == "Float" || name == "Integer" || name == "Character" || isFloatFunction(name) || name == "atan2" || name == "pow" || name == "abs" || name == "min" || name == "max" || name == "clamp" || name == "wrappingAdd" || name == "wrappingSubtract" || name == "wrappingMultiply"
+    return name == "Bytes" || name == "randomBytes" || name == "readBytesFile" || name == "writeBytesFile" || name == "fileExists" || name == "Float" || name == "Integer" || name == "Character" || isFloatFunction(name) || name == "atan2" || name == "pow" || name == "abs" || name == "min" || name == "max" || name == "clamp" || name == "wrappingAdd" || name == "wrappingSubtract" || name == "wrappingMultiply"
 }
 
 function isFloatFunction(name: Text): Boolean {
@@ -3293,7 +3361,7 @@ function isFloatFunction(name: Text): Boolean {
 }
 
 function isBuiltinName(name: Text): Boolean {
-    return isNumericBuiltin(name) || name == "print" || name == "Text" || name == "fail" || name == "exit" || name == "joinText" || name == "argument" || name == "argumentCount" || name == "readTextFile" || name == "writeTextFile"
+    return isNumericBuiltin(name) || name == "parallelEntry" || name == "print" || name == "Text" || name == "fail" || name == "exit" || name == "joinText" || name == "argument" || name == "argumentCount" || name == "readTextFile" || name == "writeTextFile"
 }
 
 function requireBuiltinArguments(name: Text, types: List<Integer>, count: Integer, type: Integer) {
@@ -3376,9 +3444,20 @@ function emitNumericBuiltin(output: List<Text>, textState: List<Text>, state: Li
             values.add("0")
             types.add(1)
         }
+        // Bytes(text) is the text's UTF-8 encoding.
+        if types.length == 1 && types[0] == 2 {
+            setType(resultType, 8)
+            return emitCall(output, textState, state, 8, "minyar_text_bytes", values, types)
+        }
         requireBuiltinArguments(name, types, 1, 1)
         setType(resultType, 8)
         return emitCall(output, textState, state, 8, "minyar_bytes_new", values, types)
+    }
+    if name == "randomBytes" {
+        // Bytes from the platform's cryptographically secure generator.
+        requireBuiltinArguments(name, types, 1, 1)
+        setType(resultType, 8)
+        return emitCall(output, textState, state, 8, "minyar_random_bytes", values, types)
     }
     if name == "fileExists" {
         requireBuiltinArguments(name, types, 1, 2)
@@ -3496,6 +3575,25 @@ function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
     let callLocation = state[0]
     state[0] = state[0] + 1
     expectToken(tokenKinds, tokenTexts, tokenLines, state, "(")
+    if name == "parallelEntry" {
+        // The address of a parallel function, for starting it on other processors.
+        if tokenKinds[state[0]] != 1 {
+            fail(describeLocation(tokenLocation(tokenLines, callLocation)) + ": parallelEntry expects the name of a parallel function")
+        }
+        let target = tokenTexts[state[0]]
+        let function = findFunction(functionNames, symbolKinds, functionReturnTypes, target)
+        if function < 0 {
+            fail(describeLocation(tokenLocation(tokenLines, callLocation)) + ": I can't find a function named '" + readableDeclarationName(target) + "'")
+        }
+        state[0] = state[0] + 1
+        expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
+        globals.add("; minyar-parallel-entry: " + target + "\n")
+        let temporary = newTemporary(state)
+        let entry = valueName(textState, temporary)
+        output.add("  " + entry + " = ptrtoint ptr @.minyar.fn." + target + " to i64\n")
+        setType(resultType, 1)
+        return entry
+    }
     let argumentValues: List<Text> = []
     let argumentTypes: List<Integer> = []
     let argumentType: List<Integer> = []
@@ -3582,6 +3680,10 @@ function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                     }
                     if argumentTypes[0] == 3 {
                         suffix = "character"
+                    }
+                    // Text(bytes) reads the bytes as UTF-8.
+                    if argumentTypes[0] == 8 {
+                        suffix = "bytes"
                     }
                     let temporary = newTemporary(state)
                     value = valueName(textState, temporary)
@@ -3897,6 +3999,7 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
             if field < 0 {
                 fail(describeLocation(tokenLocation(tokenLines, memberLocation)) + ": record '" + readableDeclarationName(functionNames[receiverType - 1000]) + "' has no field named '" + member + "'")
             }
+            checkFieldAccess(tokenLines, functionParameterNames[field], functionNames[receiverType - 1000], memberLocation)
             let fieldType = functionParameterTypes[field]
             let fieldIndex = field - functionParameterOffset(functionParameterCounts, receiverType - 1000)
             if state[0] == operatorPosition {
@@ -4225,6 +4328,26 @@ function compileNative(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     if state[3] != count {
         fail(describeLocation(tokenLocation(tokenLines, location)) + ": native must be the only statement in its function")
     }
+    if library == "machine" || library == "machine_arm64" {
+        let intrinsic = ""
+        if library == "machine" {
+            intrinsic = machineIntrinsic(readableDeclarationName(name))
+        } else {
+            intrinsic = machineIntrinsicArm64(readableDeclarationName(name))
+        }
+        if intrinsic == "" {
+            fail(describeLocation(tokenLocation(tokenLines, location)) + ": the machine package has no intrinsic named '" + readableDeclarationName(name) + "'")
+        }
+        let split = findCharacter(intrinsic, '\n') + 1
+        if intrinsic[2] == ';' {
+            // A declaration marker must be its own piece for appendNativeDeclarations.
+            output.add(intrinsic.slice(0, split))
+            output.add(intrinsic.slice(split, intrinsic.length))
+        } else {
+            output.add(intrinsic)
+        }
+        return
+    }
     let callee = "minyar_" + library + "_" + readableDeclarationName(name)
     let signature = ""
     let arguments = ""
@@ -4261,6 +4384,346 @@ function compileNative(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
         output.add("  ret void\n")
     } else {
         output.add("  ret " + llvmType(returnType) + " %native.result\n")
+    }
+}
+
+// The `machine` package gives freestanding programs direct access to memory,
+// I/O ports and the processor. Its functions compile to these inline bodies,
+// with no prologue, so each use costs the same as the instructions themselves.
+// Arguments arrive as %argument.N; Integers are i64 and Bytes are pointers.
+function machineIntrinsic(name: Text): Text {
+    let result = machineMemoryIntrinsic(name, "8")
+    if result == "" { result = machineMemoryIntrinsic(name, "16") }
+    if result == "" { result = machineMemoryIntrinsic(name, "32") }
+    if result == "" { result = machineMemoryIntrinsic(name, "64") }
+    if result == "" { result = machinePortIntrinsic(name, "8", "al", "b") }
+    if result == "" { result = machinePortIntrinsic(name, "16", "ax", "w") }
+    if result == "" { result = machinePortIntrinsic(name, "32", "eax", "l") }
+    if result == "" { result = machineInstruction(name, "pause", "pause") }
+    if result == "" { result = machineInstruction(name, "halt", "hlt") }
+    if result == "" { result = machineInstruction(name, "enableInterrupts", "sti") }
+    if result == "" { result = machineInstruction(name, "disableInterrupts", "cli") }
+    if result == "" { result = machineInstruction(name, "waitForInterrupt", "sti; hlt") }
+    if result != "" { return result }
+    let pointer = "  %address = inttoptr i64 %argument.0 to ptr\n"
+    let clobbers = "~{dirflag},~{fpsr},~{flags}"
+    if name == "fill8" {
+        let declaration = "  ; minyar-native: machine|declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n"
+        return declaration + pointer + "  %byte = trunc i64 %argument.2 to i8\n  call void @llvm.memset.p0.i64(ptr %address, i8 %byte, i64 %argument.1, i1 false)\n  ret void\n"
+    }
+    if name == "fill32" {
+        let head = pointer + "  %word = trunc i64 %argument.2 to i32\n  %any = icmp sgt i64 %argument.1, 0\n  br i1 %any, label %fill, label %done\n"
+        let loop = "fill:\n  %index = phi i64 [ 0, %entry ], [ %next, %fill ]\n  %slot = getelementptr i32, ptr %address, i64 %index\n"
+        let tail = "  store i32 %word, ptr %slot, align 4\n  %next = add nuw nsw i64 %index, 1\n  %more = icmp slt i64 %next, %argument.1\n  br i1 %more, label %fill, label %done\ndone:\n  ret void\n"
+        return head + loop + tail
+    }
+    if name == "copy" {
+        let declaration = "  ; minyar-native: machine|declare void @llvm.memmove.p0.p0.i64(ptr, ptr, i64, i1)\n"
+        let pointers = "  %destination = inttoptr i64 %argument.0 to ptr\n  %source = inttoptr i64 %argument.1 to ptr\n"
+        return declaration + pointers + "  call void @llvm.memmove.p0.p0.i64(ptr %destination, ptr %source, i64 %argument.2, i1 false)\n  ret void\n"
+    }
+    if name == "address" {
+        return "  %storage = load ptr, ptr %argument.0, align 8\n  %value = ptrtoint ptr %storage to i64\n  ret i64 %value\n"
+    }
+    if name == "fence" {
+        return "  fence seq_cst\n  ret void\n"
+    }
+    if name == "timestamp" {
+        return "  %value = call i64 asm sideeffect \"rdtsc; shlq $$32, %rdx; orq %rdx, %rax\", \"={rax},~{rdx}," + clobbers + "\"()\n  ret i64 %value\n"
+    }
+    if name == "loadInterruptTable" {
+        let descriptor = "  %descriptor = alloca [16 x i8], align 8\n  %limit = trunc i64 %argument.1 to i16\n  store i16 %limit, ptr %descriptor, align 8\n"
+        let base = "  %base = getelementptr i8, ptr %descriptor, i64 2\n  store i64 %argument.0, ptr %base, align 1\n"
+        return descriptor + base + "  call void asm sideeffect \"lidt ($0)\", \"r,~{memory}," + clobbers + "\"(ptr %descriptor)\n  ret void\n"
+    }
+    if name == "interruptHandler" || name == "interruptCount" {
+        let table = "minyar_interrupt_handlers"
+        let load = "load i64"
+        if name == "interruptCount" {
+            table = "minyar_interrupt_counts"
+            load = "load volatile i64"
+        }
+        let address = "  %table = call ptr asm \"leaq " + table + "(%rip), $0\", \"=r\"()\n  %slot = getelementptr i64, ptr %table, i64 %argument.0\n"
+        return address + "  %value = " + load + ", ptr %slot, align 8\n  ret i64 %value\n"
+    }
+    if name == "blendSpan" {
+        return machineBlendSpan()
+    }
+    if name == "blendMask" {
+        return machineBlendMask()
+    }
+    if name == "coverage" {
+        return machineCoverage()
+    }
+    if name == "atomicAdd" {
+        return pointer + "  %old = atomicrmw add ptr %address, i64 %argument.1 seq_cst, align 8\n  ret i64 %old\n"
+    }
+    if name == "callEntry" {
+        return "  %target = inttoptr i64 %argument.0 to ptr\n  call void %target(i64 %argument.1, i64 %argument.2)\n  ret void\n"
+    }
+    if name == "symbol" {
+        let address = "  %table = call ptr asm \"leaq minyar_machine_symbols(%rip), $0\", \"=r\"()\n  %slot = getelementptr i64, ptr %table, i64 %argument.0\n"
+        return address + "  %value = load i64, ptr %slot, align 8\n  ret i64 %value\n"
+    }
+    if name == "jump" {
+        return "  %target = inttoptr i64 %argument.0 to ptr\n  call void %target(i64 %argument.1)\n  ret void\n"
+    }
+    if name == "hypervisorCall" {
+        let inputs = "  %magic = add i32 1447909480, 0\n  %parameter = trunc i64 %argument.1 to i32\n  %command = trunc i64 %argument.0 to i32\n"
+        let constraints = "\"={eax},={ebx},={ecx},={edx},{eax},{ebx},{ecx},{edx},~{memory}," + clobbers + "\""
+        let call = "  %registers = call { i32, i32, i32, i32 } asm sideeffect \"inl %dx, %eax\", " + constraints + "(i32 %magic, i32 %parameter, i32 %command, i32 22104)\n"
+        let stores = storeRegister(0) + storeRegister(1) + storeRegister(2) + storeRegister(3)
+        return inputs + call + "  %results = inttoptr i64 %argument.2 to ptr\n" + stores + "  ret void\n"
+    }
+    return ""
+}
+
+// The same package for 64-bit Arm (library/arch/arm64/machine.min). Memory,
+// atomics and pixel loops are the portable bodies above; processor
+// instructions are Arm's. I/O ports, the x86 interrupt table and the VMware
+// hypervisor call do not exist there: they compile, so portable packages that
+// offer them still build, but stop the processor if they are ever reached.
+function machineIntrinsicArm64(name: Text): Text {
+    let barrier = "~{memory}"
+    if name == "pause" { return armInstruction("yield") }
+    if name == "halt" { return armInstruction("wfi") }
+    if name == "enableInterrupts" { return armInstruction("msr daifclr, #2") }
+    if name == "disableInterrupts" { return armInstruction("msr daifset, #2") }
+    // Wait with interrupts masked (a pending one still wakes the processor),
+    // then unmask so its handler runs: like x86's `sti; hlt`.
+    if name == "waitForInterrupt" { return armInstruction("wfi; msr daifclr, #2") }
+    if name == "timestamp" {
+        return "  %value = call i64 asm sideeffect \"isb; mrs $0, cntvct_el0\", \"=r," + barrier + "\"()\n  ret i64 %value\n"
+    }
+    if name == "timerFrequency" {
+        return "  %value = call i64 asm \"mrs $0, cntfrq_el0\", \"=r\"()\n  ret i64 %value\n"
+    }
+    if name == "interruptCount" { return armTableLoad("minyar_interrupt_counts", "load volatile i64") }
+    if name == "symbol" { return armTableLoad("minyar_machine_symbols", "load i64") }
+    if name == "firmwareCall" {
+        // SMCCC through HVC: function in x0, arguments in x1-x3, result in x0.
+        let clobbers = "~{x4},~{x5},~{x6},~{x7},~{x8},~{x9},~{x10},~{x11},~{x12},~{x13},~{x14},~{x15},~{x16},~{x17},~{memory}"
+        let call = "  %registers = call { i64, i64, i64, i64 } asm sideeffect \"hvc #0\", \"={x0},={x1},={x2},={x3},0,1,2,3," + clobbers + "\"(i64 %argument.0, i64 %argument.1, i64 %argument.2, i64 %argument.3)\n"
+        return call + "  %value = extractvalue { i64, i64, i64, i64 } %registers, 0\n  ret i64 %value\n"
+    }
+    if name == "loadInterruptTable" || name == "interruptHandler" || name == "hypervisorCall" || armPortIntrinsic(name) {
+        return "  ; minyar-native: machine|declare void @llvm.trap()\n  call void @llvm.trap()\n  unreachable\n"
+    }
+    if name == "jump" || name == "callEntry" || name == "atomicAdd" || name == "fence" || name == "address" || name == "copy" || name == "fill8" || name == "fill32" || name == "blendSpan" || name == "blendMask" || name == "coverage" {
+        return machineIntrinsic(name)
+    }
+    let memory = machineMemoryIntrinsic(name, "8")
+    if memory == "" { memory = machineMemoryIntrinsic(name, "16") }
+    if memory == "" { memory = machineMemoryIntrinsic(name, "32") }
+    if memory == "" { memory = machineMemoryIntrinsic(name, "64") }
+    return memory
+}
+
+function armInstruction(instruction: Text): Text {
+    return "  call void asm sideeffect \"" + instruction + "\", \"~{memory}\"()\n  ret void\n"
+}
+
+function armPortIntrinsic(name: Text): Boolean {
+    return name == "in8" || name == "in16" || name == "in32" || name == "out8" || name == "out16" || name == "out32"
+}
+
+// A word of a table the boot code defines, such as the interrupt counts.
+function armTableLoad(table: Text, load: Text): Text {
+    let address = "  %table = call ptr asm \"adrp $0, " + table + "\\0A\\09add $0, $0, :lo12:" + table + "\", \"=r\"()\n"
+    return address + "  %slot = getelementptr i64, ptr %table, i64 %argument.0\n  %value = " + load + ", ptr %slot, align 8\n  ret i64 %value\n"
+}
+
+// Pixel blending loops, written without overflow checks so LLVM can
+// vectorize them. Pixels are 0x00RRGGBB; red and blue blend in one 32-bit
+// multiply and green in another, with opacities scaled to 0-256.
+function blendPixel(pixel: Text, opacity: Text, colorRedBlue: Text, colorGreen: Text, out: Text): Text {
+    let keep = "  %keep." + out + " = sub i32 256, " + opacity + "\n"
+    let redBlue = "  %rb." + out + " = and i32 " + pixel + ", 16711935\n  %rbk." + out + " = mul i32 %rb." + out + ", %keep." + out + "\n"
+    let redBlueColor = "  %rbc." + out + " = mul i32 " + colorRedBlue + ", " + opacity + "\n  %rbs." + out + " = add i32 %rbk." + out + ", %rbc." + out + "\n"
+    let redBlueOut = "  %rbo." + out + " = lshr i32 %rbs." + out + ", 8\n  %rbm." + out + " = and i32 %rbo." + out + ", 16711935\n"
+    let green = "  %g." + out + " = and i32 " + pixel + ", 65280\n  %gk." + out + " = mul i32 %g." + out + ", %keep." + out + "\n"
+    let greenColor = "  %gc." + out + " = mul i32 " + colorGreen + ", " + opacity + "\n  %gs." + out + " = add i32 %gk." + out + ", %gc." + out + "\n"
+    let greenOut = "  %go." + out + " = lshr i32 %gs." + out + ", 8\n  %gm." + out + " = and i32 %go." + out + ", 65280\n"
+    return keep + redBlue + redBlueColor + redBlueOut + green + greenColor + greenOut + "  %" + out + " = or i32 %rbm." + out + ", %gm." + out + "\n"
+}
+
+// blendSpan(address, count, color, opacity): blend `count` pixels toward one
+// color, opacity from 0 to 256.
+function machineBlendSpan(): Text {
+    let head = "  %base = inttoptr i64 %argument.0 to ptr\n  %color = trunc i64 %argument.2 to i32\n  %opacity = trunc i64 %argument.3 to i32\n"
+    let colors = "  %crb = and i32 %color, 16711935\n  %cg = and i32 %color, 65280\n  %any = icmp sgt i64 %argument.1, 0\n  br i1 %any, label %blend, label %done\n"
+    let loop = "blend:\n  %index = phi i64 [ 0, %entry ], [ %next, %blend ]\n  %slot = getelementptr i32, ptr %base, i64 %index\n  %pixel = load i32, ptr %slot, align 4\n"
+    let tail = "  store i32 %result, ptr %slot, align 4\n  %next = add i64 %index, 1\n  %more = icmp slt i64 %next, %argument.1\n  br i1 %more, label %blend, label %done\ndone:\n  ret void\n"
+    return head + colors + loop + blendPixel("%pixel", "%opacity", "%crb", "%cg", "result") + tail
+}
+
+// blendMask(address, count, mask, color, scale, bias, limit): blend `count`
+// pixels toward `color`, each through the byte at the same place in `mask`:
+// opacity = min(mask + bias, limit) * scale / 256, so a coverage mask uses
+// bias 0 and limit 255, and scale 256 for full strength.
+function machineBlendMask(): Text {
+    let head = "  %base = inttoptr i64 %argument.0 to ptr\n  %mask = inttoptr i64 %argument.2 to ptr\n  %color = trunc i64 %argument.3 to i32\n"
+    let parameters = "  %scale = trunc i64 %argument.4 to i32\n  %bias = trunc i64 %argument.5 to i32\n  %limit = trunc i64 %argument.6 to i32\n"
+    let colors = "  %crb = and i32 %color, 16711935\n  %cg = and i32 %color, 65280\n  %any = icmp sgt i64 %argument.1, 0\n  br i1 %any, label %blend, label %done\n"
+    let loop = "blend:\n  %index = phi i64 [ 0, %entry ], [ %next, %blend ]\n  %slot = getelementptr i32, ptr %base, i64 %index\n  %pixel = load i32, ptr %slot, align 4\n"
+    let cover = "  %coverSlot = getelementptr i8, ptr %mask, i64 %index\n  %cover8 = load i8, ptr %coverSlot, align 1\n  %cover = zext i8 %cover8 to i32\n"
+    let opacity = "  %biased = add i32 %cover, %bias\n  %capped = call i32 @llvm.umin.i32(i32 %biased, i32 %limit)\n  %scaled = mul i32 %capped, %scale\n  %raw = lshr i32 %scaled, 8\n  %round = lshr i32 %raw, 7\n  %opacity = add i32 %raw, %round\n"
+    let tail = "  store i32 %result, ptr %slot, align 4\n  %next = add i64 %index, 1\n  %more = icmp slt i64 %next, %argument.1\n  br i1 %more, label %blend, label %done\ndone:\n  ret void\n"
+    let declaration = "  ; minyar-native: machine|declare i32 @llvm.umin.i32(i32, i32)\n"
+    return declaration + head + parameters + colors + loop + cover + opacity + blendPixel("%pixel", "%opacity", "%crb", "%cg", "result") + tail
+}
+
+// coverage(source, target, count): the running sum of `count` float32 signed
+// areas at `source`, as coverage bytes 0-255 at `target` (the last step of
+// filling an outline).
+function machineCoverage(): Text {
+    let head = "  %source = inttoptr i64 %argument.0 to ptr\n  %target = inttoptr i64 %argument.1 to ptr\n  %any = icmp sgt i64 %argument.2, 0\n  br i1 %any, label %cover, label %done\n"
+    let loop = "cover:\n  %index = phi i64 [ 0, %entry ], [ %next, %cover ]\n  %sum = phi double [ 0.0, %entry ], [ %total, %cover ]\n"
+    let add = "  %slot = getelementptr float, ptr %source, i64 %index\n  %narrow = load float, ptr %slot, align 4\n  %delta = fpext float %narrow to double\n  %total = fadd double %sum, %delta\n"
+    let magnitude = "  %negated = fneg double %total\n  %below = fcmp olt double %total, 0.0\n  %magnitude = select i1 %below, double %negated, double %total\n"
+    let scale = magnitude + "  %over = fcmp ogt double %magnitude, 1.0\n  %capped = select i1 %over, double 1.0, double %magnitude\n  %scaled = fmul double %capped, 255.0\n  %rounded = fadd double %scaled, 0.5\n  %byte = fptoui double %rounded to i8\n"
+    let tail = "  %out = getelementptr i8, ptr %target, i64 %index\n  store i8 %byte, ptr %out, align 1\n  %next = add i64 %index, 1\n  %more = icmp slt i64 %next, %argument.2\n  br i1 %more, label %cover, label %done\ndone:\n  ret void\n"
+    return head + loop + add + scale + tail
+}
+
+function machineMemoryIntrinsic(name: Text, width: Text): Text {
+    let type = "i" + width
+    let pointer = "  %address = inttoptr i64 %argument.0 to ptr\n"
+    let extend = "  %value = zext " + type + " %loaded to i64\n"
+    let narrow = "  %narrow = trunc i64 %argument.1 to " + type + "\n"
+    if width == "64" {
+        extend = "  %value = add i64 %loaded, 0\n"
+        narrow = "  %narrow = add i64 %argument.1, 0\n"
+    }
+    if name == "load" + width {
+        return pointer + "  %loaded = load " + type + ", ptr %address, align 1\n" + extend + "  ret i64 %value\n"
+    }
+    if name == "read" + width {
+        return pointer + "  %loaded = load volatile " + type + ", ptr %address, align 1\n" + extend + "  ret i64 %value\n"
+    }
+    if name == "store" + width {
+        return pointer + narrow + "  store " + type + " %narrow, ptr %address, align 1\n  ret void\n"
+    }
+    if name == "write" + width {
+        return pointer + narrow + "  store volatile " + type + " %narrow, ptr %address, align 1\n  ret void\n"
+    }
+    return ""
+}
+
+function machinePortIntrinsic(name: Text, width: Text, register: Text, suffix: Text): Text {
+    let type = "i" + width
+    let clobbers = "~{dirflag},~{fpsr},~{flags}"
+    if name == "in" + width {
+        let call = "  %loaded = call " + type + " asm sideeffect \"in" + suffix + " $1, $0\", \"={" + register + "},{dx}," + clobbers + "\"(i16 %port)\n"
+        return "  %port = trunc i64 %argument.0 to i16\n" + call + "  %value = zext " + type + " %loaded to i64\n  ret i64 %value\n"
+    }
+    if name == "out" + width {
+        let values = "  %port = trunc i64 %argument.0 to i16\n  %narrow = trunc i64 %argument.1 to " + type + "\n"
+        return values + "  call void asm sideeffect \"out" + suffix + " $0, $1\", \"{" + register + "},{dx}," + clobbers + "\"(" + type + " %narrow, i16 %port)\n  ret void\n"
+    }
+    return ""
+}
+
+function machineInstruction(name: Text, expected: Text, instruction: Text): Text {
+    if name != expected { return "" }
+    return "  call void asm sideeffect \"" + instruction + "\", \"~{memory},~{dirflag},~{fpsr},~{flags}\"()\n  ret void\n"
+}
+
+function storeRegister(index: Integer): Text {
+    let number = Text(index)
+    let extract = "  %register." + number + " = extractvalue { i32, i32, i32, i32 } %registers, " + number + "\n"
+    let widen = "  %wide." + number + " = zext i32 %register." + number + " to i64\n"
+    let slot = "  %slot." + number + " = getelementptr i64, ptr %results, i64 " + number + "\n"
+    return extract + widen + slot + "  store i64 %wide." + number + ", ptr %slot." + number + ", align 8\n"
+}
+
+// A parallel function may run on any processor at the same time as others, so
+// it must not touch the single-threaded runtime: no reference values, no
+// call-depth or ownership frames, and calls only to other parallel functions,
+// machine intrinsics, checked-arithmetic helpers and mathematics. Its frames
+// are removed here; its calls are recorded for checkParallelCalls.
+function finishParallelFunction(output: List<Text>, globals: List<Text>, entrySlot: Integer, bodySlot: Integer, name: Text, references: Boolean) {
+    if references {
+        fail("parallel function '" + readableDeclarationName(name) + "' may use only Integer, Float, Boolean and Character values")
+    }
+    let entry = output[entrySlot]
+    let enter = "  call void @minyar_stack_enter()\n"
+    if entry.length >= enter.length && entry.slice(0, enter.length) == enter {
+        output[entrySlot] = entry.slice(enter.length, entry.length)
+    }
+    let body: List<Text> = []
+    let piece = bodySlot
+    while piece < output.length {
+        let text = output[piece]
+        if text == "  call void @minyar_stack_leave()\n" || text == "  call void @minyar_rc_leave()\n" || text == "  call void @minyar_rc_step()\n" {
+            output[piece] = ""
+        } else {
+            body.add(text)
+        }
+        piece = piece + 1
+    }
+    // Instructions are emitted in pieces; scan the whole body as one text.
+    let text = joinText(body)
+    let position = 0
+    while position + 8 < text.length {
+        if text[position] == '@' && text.slice(position, position + 8) == "@minyar_" {
+            let end = position + 8
+            while end < text.length && text[end] != '(' && text[end] != ' ' { end = end + 1 }
+            let callee = text.slice(position + 1, end)
+            if !parallelRuntimeAllowed(callee) {
+                fail("parallel function '" + readableDeclarationName(name) + "' cannot use the runtime ('" + callee + "')")
+            }
+        }
+        if text[position] == '@' && position + 12 < text.length && text.slice(position, position + 12) == "@.minyar.fn." {
+            let end = position + 12
+            while end < text.length && text[end] != '(' && text[end] != ' ' { end = end + 1 }
+            globals.add("; minyar-parallel-call: " + name + "|" + text.slice(position + 12, end) + "\n")
+        }
+        position = position + 1
+    }
+}
+
+// Runtime functions that are safe on any processor: failures that stop the
+// machine, and pure mathematics.
+function parallelRuntimeAllowed(callee: Text): Boolean {
+    if callee.length > 11 && callee.slice(0, 11) == "minyar_fail" { return true }
+    return callee == "minyar_tan" || callee == "minyar_asin" || callee == "minyar_acos" || callee == "minyar_atan" || callee == "minyar_atan2"
+}
+
+function markerValue(marker: Text, prefix: Text): Text {
+    return marker.slice(prefix.length, marker.length - 1)
+}
+
+// Every function a parallel function calls must itself be parallel or a
+// machine intrinsic; every parallelEntry must name a parallel function.
+function checkParallelCalls(globals: List<Text>) {
+    let callPrefix = "; minyar-parallel-call: "
+    let entryPrefix = "; minyar-parallel-entry: "
+    let index = 0
+    while index < globals.length {
+        let marker = globals[index]
+        let callee = ""
+        let caller = ""
+        if marker.length > callPrefix.length && marker.slice(0, callPrefix.length) == callPrefix {
+            let pair = markerValue(marker, callPrefix)
+            let separator = findCharacter(pair, '|')
+            caller = pair.slice(0, separator)
+            callee = pair.slice(separator + 1, pair.length)
+        }
+        if marker.length > entryPrefix.length && marker.slice(0, entryPrefix.length) == entryPrefix {
+            callee = markerValue(marker, entryPrefix)
+        }
+        if callee != "" {
+            let parallel = findText(globals, "; minyar-parallel: " + callee + "\n") >= 0
+            let machine = findText(globals, "; minyar-machine: " + callee + "\n") >= 0
+            if !parallel && !(machine && caller != "") {
+                if caller == "" {
+                    fail("parallelEntry needs a parallel function, and '" + readableDeclarationName(callee) + "' is not one")
+                }
+                fail("parallel function '" + readableDeclarationName(caller) + "' can only call parallel functions, not '" + readableDeclarationName(callee) + "'")
+            }
+        }
+        index = index + 1
     }
 }
 
@@ -4583,9 +5046,15 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         // Remember the exact first statement for native whole-body validation.
         state[12] = state[0] + 1
         while tokenKinds[state[12]] == 6 { state[12] = state[12] + 1 }
+        let machineIntrinsic = false
         if tokenKinds[state[12]] == 1 && tokenTexts[state[12]] == "native" && tokenKinds[state[12] + 1] == 3 {
             hasNative = true
+            machineIntrinsic = tokenTexts[state[12] + 1] == "machine" || tokenTexts[state[12] + 1] == "machine_arm64"
         }
+        if machineIntrinsic {
+            globals.add("; minyar-machine: " + name + "\n")
+        }
+        let parallel = findText(globals, "; minyar-parallel: " + name + "\n") >= 0
         state[1] = 0
         state[2] = 0
         state[3] = 0
@@ -4611,6 +5080,7 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         if name == "main" {
             emittedReturn = "i32"
         }
+        let defineSlot = output.length
         output.add("define ")
         output.add(emittedReturn)
         if name == "main" || name[0] == '"' {
@@ -4694,6 +5164,15 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
             }
         }
         finishFunctionEntry(output, entrySlot, state[4], parameterNames.length, state[8], state[6] == 1)
+        if parallel {
+            finishParallelFunction(output, globals, entrySlot, bodySlot, name, state[6] == 1)
+        }
+        if machineIntrinsic {
+            // Intrinsic bodies are bare instructions: no call-depth or ownership frame.
+            output[entrySlot] = ""
+            output[defineSlot] = "define internal "
+            output[definitionTailSlot] = ") alwaysinline {\nentry:\n"
+        }
         if stackOwnerLimit > 0 && name != "main" && state[5] == -1 && state[6] == 1 && state[8] >= 1 && state[8] <= stackOwnerLimit {
             finishStackOwnership(output, entrySlot, state[8])
         }
@@ -4766,6 +5245,20 @@ function compileTopLevel(tokenKinds: List<Integer>, tokenTexts: List<Text>, toke
 }
 
 function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, scannedStarts: List<Integer>, scannedEnds: List<Integer>, stackOwnerLimit: Integer): Text {
+    // `parallel function` marks a function that may run on any processor. The
+    // modifier becomes a line break so every later pass sees an ordinary
+    // function; the names travel to compileFunctions as markers in `globals`.
+    let parallelMarkers: List<Text> = []
+    let scan = 0
+    while scan + 2 < tokenKinds.length {
+        if tokenKinds[scan] == 6 && tokenTexts[scan] == "parallel" && tokenKinds[scan + 1] == 1 && tokenTexts[scan + 1] == "function" {
+            parallelMarkers.add("; minyar-parallel: " + tokenTexts[scan + 2] + "\n")
+        }
+        if scan + 3 < tokenKinds.length && tokenKinds[scan] == 6 && tokenTexts[scan] == "parallel" && tokenTexts[scan + 1] == "public" && tokenTexts[scan + 2] == "function" {
+            parallelMarkers.add("; minyar-parallel: " + tokenTexts[scan + 3] + "\n")
+        }
+        scan = scan + 1
+    }
     let functionNames: List<Text> = []
     let symbolKinds: List<Integer> = []
     let symbolLocations: List<Text> = []
@@ -4800,6 +5293,11 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
 
     let output: List<Text> = []
     let globals: List<Text> = []
+    let marker = 0
+    while marker < parallelMarkers.length {
+        globals.add(parallelMarkers[marker])
+        marker = marker + 1
+    }
     output.add("; Generated by the compiler written in Minyar.\n\n")
     let position = 0
     while position < tokenKinds.length {
@@ -4859,6 +5357,9 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     output.add("declare i64 @minyar_bytes_length(ptr)\n")
     output.add("declare zeroext i1 @minyar_file_exists(ptr)\n")
     output.add("declare ptr @minyar_bytes_new(i64)\n")
+    output.add("declare ptr @minyar_text_bytes(ptr)\n")
+    output.add("declare ptr @minyar_random_bytes(i64)\n")
+    output.add("declare ptr @minyar_bytes_text(ptr)\n")
     output.add("declare void @minyar_bytes_resize(ptr, i64)\n")
     output.add("declare void @minyar_bytes_clear(ptr)\n")
     output.add("declare void @minyar_bytes_add(ptr, i64)\n")
@@ -4960,6 +5461,7 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     if mainFunction < 0 {
         compileTopLevel(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, output, globals)
     }
+    checkParallelCalls(globals)
     if stackOwnerLimit > 0 {
         output.add("declare void @minyar_rc_enter_stack_v1(ptr, ptr, i64)\n")
         output.add("declare void @minyar_rc_leave_stack_v1(ptr)\n")
@@ -5097,11 +5599,20 @@ function resolveModulePath(importer: Text, specifier: Text): Text {
 }
 
 // Names without ./ or ../ are standard library packages, found in the
-// directory passed to the compiler with --library.
+// directories passed to the compiler with --library. `library` holds them one
+// per line; the first that has the package wins, so a directory such as
+// library/arch/arm64 listed first can replace a package for one processor.
 function resolveImport(importer: Text, specifier: Text, library: Text): Text {
     let relative = specifier.length >= 2 && specifier[0] == '.' && (pathCharacterIsSeparator(specifier[1]) || specifier[1] == '.')
     if relative || library == "" {
         return resolveModulePath(importer, specifier)
+    }
+    let split = findCharacter(library, '\n')
+    if split >= 0 {
+        let first = library.slice(0, split)
+        let candidate = resolveImport(importer, specifier, first)
+        if fileExists(candidate) { return candidate }
+        return resolveImport(importer, specifier, library.slice(split + 1, library.length))
     }
     let position = 0
     while position < specifier.length {
@@ -5358,6 +5869,11 @@ function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integ
             let cursor: List<Integer> = []
             cursor.add(position)
             skipTopLevelStatement(tokenKinds, tokenTexts, cursor)
+            // Keep the line breaks after the import, including a `parallel`
+            // modifier the lexer turned into one.
+            while cursor[0] > position + 1 && tokenKinds[cursor[0] - 1] == 6 {
+                cursor[0] = cursor[0] - 1
+            }
             position = cursor[0]
         } else {
             if declarationMode == 0 && tokenKinds[position] == 1 && tokenTexts[position] == "public" {
@@ -5420,6 +5936,10 @@ function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integ
                             declarationKind = 2
                         }
                         if declarationKind == 0 && position + 1 < tokenKinds.length && tokenTexts[position + 1] == "(" {
+                            declarationKind = 1
+                        }
+                        // parallelEntry(name) names a function without calling it.
+                        if declarationKind == 0 && position >= 2 && tokenTexts[position - 2] == "parallelEntry" && tokenTexts[position - 1] == "(" {
                             declarationKind = 1
                         }
                         if declarationKind == 0 && position + 1 < tokenKinds.length && tokenTexts[position + 1] == "{" {
@@ -5571,6 +6091,29 @@ function ownershipLimitForBudget(text: Text): Integer {
     return budget - 1
 }
 
+// Freestanding programs run with interrupts that arrive on the current stack,
+// so no function may keep data in the 128 bytes below the stack pointer.
+function freestandingModule(llvm: Text): Text {
+    let pieces: List<Text> = []
+    let start = 0
+    let position = 0
+    let length = llvm.length
+    while position < length {
+        if llvm[position] == '\n' {
+            if position > start + 8 && llvm[start] == 'd' && llvm[position - 1] == '{' && llvm.slice(start, start + 7) == "define " {
+                pieces.add(llvm.slice(start, position - 1))
+                pieces.add("noredzone {\n")
+            } else {
+                pieces.add(llvm.slice(start, position + 1))
+            }
+            start = position + 1
+        }
+        position = position + 1
+    }
+    pieces.add(llvm.slice(start, length))
+    return joinText(pieces)
+}
+
 function main() {
     if argumentCount() == 0 {
         print("Minyar compiler bootstrap is ready")
@@ -5579,25 +6122,34 @@ function main() {
     } else {
         let stackOwnerLimit = 0
         let library = ""
+        let freestanding = false
         let position = 2
         while position < argumentCount() {
+            if argument(position) == "--freestanding" {
+                freestanding = true
+            } else {
             if argument(position) == "--bounded-owners" {
                 stackOwnerLimit = 8
-                if position + 1 < argumentCount() && argument(position + 1) != "--library" && argument(position + 1) != "--bounded-owners" {
+                if position + 1 < argumentCount() && argument(position + 1) != "--library" && argument(position + 1) != "--bounded-owners" && argument(position + 1) != "--freestanding" {
                     stackOwnerLimit = ownershipLimitForBudget(argument(position + 1))
                     position = position + 1
                 }
             } else {
                 if argument(position) == "--library" && position + 1 < argumentCount() {
-                    library = argument(position + 1)
+                    if library != "" { library = library + "\n" }
+                    library = library + argument(position + 1)
                     position = position + 1
                 } else {
-                    fail("usage: compiler SOURCE OUTPUT [--bounded-owners [BUDGET]] [--library DIRECTORY]")
+                    fail("usage: compiler SOURCE OUTPUT [--bounded-owners [BUDGET]] [--library DIRECTORY] [--freestanding]")
                 }
+            }
             }
             position = position + 1
         }
         let llvm = compileEntryWithLibrary(argument(0), stackOwnerLimit, library)
+        if freestanding {
+            llvm = freestandingModule(llvm)
+        }
         if argumentCount() == 1 {
             print(llvm)
         } else {

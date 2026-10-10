@@ -1,0 +1,286 @@
+// The Minyar OS kernel.
+//
+// The loader has already set the display mode and drawn the boot screen. The
+// kernel finds its devices, loads its fonts from disk, brings up the network
+// and then runs the desktop: one loop that reads input, advances the agent and
+// the network, and redraws whatever changed, sleeping between timer ticks.
+use "machine" as machine
+use "arch" as arch
+use "../shared/pci.min" as pci
+use "../shared/display.min" as display
+use "../shared/interrupts.min" as interrupts
+use "../shared/disk.min" as disk
+use "../shared/graphics/canvas.min" as canvas
+use "../shared/graphics/font.min" as font
+use "./input/devices.min" as devices
+use "./ui/state.min" as state
+use "./ui/theme.min" as theme
+use "./ui/type.min" as type
+use "./ui/app.min" as app
+use "./ui/panel.min" as panel
+use "./net/e1000.min" as e1000
+use "./net/stack.min" as stack
+use "./agent/agent.min" as agent
+use "./system/processors.min" as processors
+use "../shared/virtio/entropy.min" as entropy
+
+// Frames start every 8 ms: 125 per second, above the 120 Hz of the host display.
+constant FRAME_MILLISECONDS = 8
+constant BUDGET_MICROSECONDS = 8000
+constant REFRESH_MILLISECONDS = 5000
+constant SPIN_MILLISECONDS = 24
+
+function loadFont(files: List<disk.File>, name: Text): font.Font {
+    let index = disk.find(files, name)
+    if index < 0 {
+        fail("the disk has no " + name)
+    }
+    return font.load(disk.read(files[index]))
+}
+
+// Settings come from config.txt on the disk: KEY=value lines.
+function readSettings(files: List<disk.File>): agent.Settings {
+    let settings = agent.Settings { host: "10.0.2.2"; port: 8080; key: "minyar-local" }
+    let index = disk.find(files, "config.txt")
+    if index < 0 { return settings }
+    let contents = disk.read(files[index])
+    let line: List<Text> = []
+    let lines: List<Text> = []
+    for byte in contents {
+        if byte == 10 {
+            lines.add(joinText(line))
+            line = []
+        } else {
+            if byte != 13 { line.add(Text(Character(byte))) }
+        }
+    }
+    lines.add(joinText(line))
+    for entry in lines {
+        let separator = -1
+        for position in 0..entry.length {
+            if separator < 0 && entry[position] == '=' { separator = position }
+        }
+        if separator > 0 {
+            let key = entry.slice(0, separator)
+            let value = entry.slice(separator + 1, entry.length)
+            if key == "ATACAMA_HOST" { settings.host = value }
+            if key == "ATACAMA_KEY" { settings.key = value }
+            if key == "ATACAMA_PORT" {
+                let port = 0
+                for character in value {
+                    if character >= '0' && character <= '9' { port = port * 10 + Integer(character) - 48 }
+                }
+                settings.port = port
+            }
+        }
+    }
+    return settings
+}
+
+function size(bytes: Integer): Text {
+    if bytes >= 1048576 { return Text(bytes / 1048576) + "." + Text(bytes % 1048576 * 10 / 1048576) + " MB" }
+    if bytes >= 1024 { return Text(bytes / 1024) + " KB" }
+    return Text(bytes) + " bytes"
+}
+
+function systemLines(network: stack.Network, worker: agent.Agent, hardware: List<pci.Device>, frames: Integer): List<Text> {
+    let lines: List<Text> = []
+    let seconds = interrupts.milliseconds() / 1000
+    lines.add("Minyar OS · " + arch.NAME + " · written in Minyar")
+    lines.add("Up " + Text(seconds / 60) + " min " + Text(seconds % 60) + " s · " + Text(frames) + " frames drawn")
+    lines.add("Display: 1720 × 1080, 32-bit, Bochs VBE · " + Text(hardware.length) + " PCI functions")
+    for line in stack.summary(network) {
+        lines.add(line)
+    }
+    let health = worker.health
+    if health == "" { health = "not checked yet" }
+    lines.add("Atacama at " + worker.settings.host + ":" + Text(worker.settings.port) + ": " + health)
+    return lines
+}
+
+function main(): Integer {
+    print("Minyar kernel: starting on " + arch.NAME)
+    let hardware = pci.scan()
+    pci.assignAddresses(hardware)
+    let framebuffer = display.start(hardware, theme.SCREEN_WIDTH, theme.SCREEN_HEIGHT)
+    if framebuffer.address == 0 {
+        fail("no Bochs-compatible display adapter was found")
+    }
+    let timer = interrupts.start()
+    let screen = canvas.wrap(framebuffer.address, theme.SCREEN_WIDTH, theme.SCREEN_HEIGHT, framebuffer.stride)
+    let drive = disk.open(hardware)
+    let files = disk.directory(drive)
+    let started = interrupts.milliseconds()
+    let typefaces = type.create(loadFont(files, "fonts/Archivo-Regular.ttf"), loadFont(files, "fonts/Archivo-Medium.ttf"), loadFont(files, "fonts/Archivo-SemiBold.ttf"))
+    print("kernel: fonts ready in " + Text(interrupts.milliseconds() - started) + " ms")
+    let input = devices.start(theme.SCREEN_WIDTH, theme.SCREEN_HEIGHT, hardware)
+    // Where the processor has no random instruction, TLS keys come from a
+    // virtio entropy device through the runtime's pool.
+    let entropySources: List<entropy.Source> = []
+    if arch.NEEDS_ENTROPY && entropy.present(hardware) {
+        entropySources.add(entropy.open(hardware))
+    }
+    let network = stack.create(e1000.start(hardware))
+    let settings = readSettings(files)
+    let worker = agent.create(settings)
+    let cores = processors.start(timer)
+    let desktop = app.create(screen, typefaces, input, cores)
+    for file in files {
+        desktop.app.library.add(file.name + " · " + size(file.size))
+    }
+    panel.preparePages(desktop.app)
+    print("kernel: desktop ready in " + Text(interrupts.milliseconds() - started) + " ms; Atacama at " + settings.host + ":" + Text(settings.port))
+
+    // Fade the desktop in over the empty boot background.
+    app.step(desktop, interrupts.seconds())
+    let fadeStart = interrupts.milliseconds()
+    let empty = canvas.create(theme.SCREEN_WIDTH, theme.SCREEN_HEIGHT)
+    canvas.fill(empty, 0, 0, theme.SCREEN_WIDTH, theme.SCREEN_HEIGHT, theme.BACKGROUND)
+    let fade = 0.0
+    while fade < 1.0 {
+        fade = clamp(Float(interrupts.milliseconds() - fadeStart) / 450.0, 0.0, 1.0)
+        canvas.blit(screen, empty, 0, 0, theme.SCREEN_WIDTH, theme.SCREEN_HEIGHT, 0, 0)
+        canvas.blendCanvas(screen, desktop.app.back, 0, 0, theme.SCREEN_WIDTH, theme.SCREEN_HEIGHT, 0, 0, Integer(state.ease(fade) * 255.0))
+    }
+    canvas.blit(screen, desktop.app.back, 0, 0, theme.SCREEN_WIDTH, theme.SCREEN_HEIGHT, 0, 0)
+
+    let ticksPerMillisecond = interrupts.calibrateClock()
+    let lastFrame = 0
+    let lastNetwork = -1
+    let lastStatus = 0
+    let profileStart = interrupts.milliseconds()
+    let profileFrames = 0
+    let profileDrawn = 0
+    let profileLate = 0
+    let profileWorst = 0
+    let profileTotal = 0
+    let lastDrawn = 0
+    let lastRefresh = 0
+    let profileWorkTotal = 0
+    let profileWorkWorst = 0
+    let profileWorkLate = 0
+    let profileGapWorst = 0
+    let profileMissed = 0
+    let profileRefresh = 0
+    let profileBackground = 0
+    desktop.app.ticksPerMillisecond = ticksPerMillisecond
+    while true {
+        let now = interrupts.milliseconds()
+        // The old spin path polled thousands of times per millisecond,
+        // allocating empty receive buffers and rebuilding connection lists.
+        // A 1 ms poll interval preserves responsiveness without that churn.
+        if now != lastNetwork {
+            for source in entropySources {
+                if entropy.available(source) < 2048 { entropy.refill(source) }
+            }
+            stack.poll(network)
+            lastNetwork = now
+        }
+        if now - lastFrame >= FRAME_MILLISECONDS {
+            let gap = now - lastFrame
+            if lastFrame > 0 {
+                profileGapWorst = max(profileGapWorst, gap)
+                profileMissed += max(gap / FRAME_MILLISECONDS - 1, 0)
+            }
+            lastFrame = now
+            let frameStart = machine.timestamp()
+            agent.update(desktop, worker, network)
+            agent.settle(desktop, worker)
+            if now - lastStatus > 1000 {
+                lastStatus = now
+                desktop.app.system = systemLines(network, worker, hardware, desktop.app.frames)
+            }
+            let before: List<Integer> = []
+            for index in 0..8 { before.add(desktop.app.timings[index]) }
+            let agentTicks = machine.timestamp() - frameStart
+            let drew = app.step(desktop, Float(now) / 1000.0)
+            if drew { lastDrawn = now }
+            // Microseconds this frame took.
+            let spent = (machine.timestamp() - frameStart) * 1000 / ticksPerMillisecond
+            if drew {
+                profileDrawn += 1
+                profileTotal += spent
+                profileWorst = max(profileWorst, spent)
+                if spent > BUDGET_MICROSECONDS {
+                    profileLate += 1
+                    // Bound serial-port work during a burst of late frames;
+                    // the aggregate count/worst below still includes all of
+                    // them. Unbounded diagnostics can amplify the slowdown.
+                    if profileLate <= 3 || spent >= 30000 {
+                        let names = ["sidebar", "conversation", "composer", "panel", "glow", "overlay", "present", "input"]
+                        let parts: List<Text> = ["late frame " + Text(spent) + " us: agent " + Text(agentTicks * 1000 / ticksPerMillisecond)]
+                        for index in 0..8 {
+                            let us = (desktop.app.timings[index] - before[index]) * 1000 / ticksPerMillisecond
+                            if us > 200 { parts.add(", " + names[index] + " " + Text(us)) }
+                        }
+                        print(joinText(parts))
+                    }
+                }
+            }
+            profileFrames += 1
+            // Use what is left of this frame's 8 ms for work done ahead of
+            // need: glyph caches first, then the task window's maximized page.
+            let backgroundStart = machine.timestamp()
+            let deadline = frameStart + ticksPerMillisecond * 5
+            while machine.timestamp() < deadline && app.warmGlyphs(desktop) {
+            }
+            let left = (deadline - machine.timestamp()) / ticksPerMillisecond
+            if left >= 1 {
+                panel.prepare(desktop.app, min(left, 3))
+            }
+            profileBackground += machine.timestamp() - backgroundStart
+            // Every few seconds, when the frame has room, rewrite the whole
+            // screen (see app.refresh).
+            if now - lastRefresh >= REFRESH_MILLISECONDS && machine.timestamp() + ticksPerMillisecond * 3 < frameStart + ticksPerMillisecond * FRAME_MILLISECONDS {
+                app.refresh(desktop)
+                lastRefresh = now
+                profileRefresh += 1
+            }
+            let work = (machine.timestamp() - frameStart) * 1000 / ticksPerMillisecond
+            profileWorkTotal += work
+            profileWorkWorst = max(profileWorkWorst, work)
+            if work > BUDGET_MICROSECONDS { profileWorkLate += 1 }
+            if now - profileStart >= 5000 {
+                if profileDrawn > 0 {
+                    let names = ["sidebar", "conversation", "composer", "panel", "glow", "overlay", "present", "input"]
+                    let parts: List<Text> = []
+                    for index in 0..8 {
+                        let samples = profileDrawn
+                        // Input is polled even on frames with no damage.
+                        if index == 7 { samples = profileFrames }
+                        parts.add(names[index] + " " + Text(desktop.app.timings[index] * 1000 / ticksPerMillisecond / max(samples, 1)) + "us ")
+                        desktop.app.timings[index] = 0
+                    }
+                    print("  per drawn frame (input per poll): " + joinText(parts))
+                    print("profile: " + Text(profileDrawn * 1000 / max(now - profileStart, 1)) + " fps drawn, " + Text(profileLate) + " of " + Text(profileDrawn) + " over 8 ms, average " + Text(profileTotal / profileDrawn) + " us, worst " + Text(profileWorst) + " us")
+                }
+                print("cadence: " + Text(profileFrames) + " frames in " + Text(now - profileStart) + " ms, " + Text(profileMissed) + " missed slots, worst gap " + Text(profileGapWorst) + " ms; complete work average " + Text(profileWorkTotal / max(profileFrames, 1)) + " us, worst " + Text(profileWorkWorst) + " us, " + Text(profileWorkLate) + " over 8 ms; background " + Text(profileBackground * 1000 / ticksPerMillisecond) + " us, refreshes " + Text(profileRefresh))
+                profileStart = now
+                profileFrames = 0
+                profileDrawn = 0
+                profileLate = 0
+                profileWorst = 0
+                profileTotal = 0
+                profileWorkTotal = 0
+                profileWorkWorst = 0
+                profileWorkLate = 0
+                profileGapWorst = 0
+                profileMissed = 0
+                profileRefresh = 0
+                profileBackground = 0
+                for index in 0..8 { desktop.app.timings[index] = 0 }
+            }
+        }
+        // While anything moves, wait for the next frame by spinning: a
+        // processor that halts between frames is put to sleep by the host,
+        // and wakes slowly. Once nothing has been drawn for a few frames (the
+        // caret blinking, alone, draws twice a second), halt until the next
+        // interrupt so an idle desktop leaves the host's processors alone.
+        if interrupts.milliseconds() - lastDrawn < SPIN_MILLISECONDS {
+            machine.pause()
+        } else {
+            interrupts.idle()
+        }
+    }
+    return 0
+}

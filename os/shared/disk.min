@@ -1,0 +1,76 @@
+// The Minyar OS disk: a boot record, the loader, a directory and its files.
+// See os/tools/mkimage.min for the layout. It is a virtio disk when there is
+// one, as on the Arm board, and otherwise the PC's first ATA disk.
+use "arch" as arch
+use "./ata.min" as ata
+use "./pci.min" as pci
+use "./virtio/block.min" as block
+
+public record Disk {
+    // The virtio disk, if there is one.
+    private drives: List<block.Drive>
+}
+
+public record File {
+    name: Text
+    sector: Integer
+    size: Integer
+    private disk: Disk
+}
+
+public function open(devices: List<pci.Device>): Disk {
+    let drives: List<block.Drive> = []
+    if block.present(devices) {
+        drives.add(block.open(devices))
+    } else if !arch.LEGACY_PC {
+        fail("there is no disk: give the machine a virtio-blk device")
+    }
+    return Disk { drives: drives }
+}
+
+public function readSectors(disk: Disk, sector: Integer, count: Integer): Bytes {
+    if disk.drives.length > 0 {
+        return block.read(disk.drives[0], sector, count)
+    }
+    return ata.readMany(sector, count)
+}
+
+public function directory(disk: Disk): List<File> {
+    let boot = readSectors(disk, 0, 1)
+    let first = boot.getUInt32(0x1F6)
+    let table = readSectors(disk, first, 4)
+    let files: List<File> = []
+    let magic = "MINYARFS"
+    for position in 0..magic.length {
+        if table[position] != Integer(magic[position]) {
+            fail("the disk has no Minyar directory")
+        }
+    }
+    let count = table.getUInt32(8)
+    for index in 0..count {
+        let entry = 64 + index * 64
+        let name: List<Text> = []
+        let position = 0
+        while position < 48 && table[entry + position] != 0 {
+            name.add(Text(Character(table[entry + position])))
+            position += 1
+        }
+        files.add(File { name: joinText(name); sector: table.getUInt32(entry + 48); size: table.getUInt32(entry + 52); disk: disk })
+    }
+    return files
+}
+
+public function find(files: List<File>, name: Text): Integer {
+    for index in 0..files.length {
+        if files[index].name == name {
+            return index
+        }
+    }
+    return -1
+}
+
+public function read(file: File): Bytes {
+    let contents = readSectors(file.disk, file.sector, (file.size + 511) / 512)
+    contents.resize(file.size)
+    return contents
+}

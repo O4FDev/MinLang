@@ -1,0 +1,111 @@
+// Builds the Minyar OS disk image.
+//
+//     mkimage OUTPUT MBR LOADER [NAME=PATH ...]
+//
+// Layout, in 512-byte sectors:
+//   0         the master boot record, patched with the loader's position and
+//             the directory's position
+//   1..       the stage-two loader, read by the MBR through the BIOS
+//   then      the directory: 4 sectors of 64-byte entries
+//   then      each file, starting on a sector boundary
+//
+// Directory: "MINYARFS", a 32-bit entry count, then from byte 64 one entry per
+// file: a 48-byte zero-padded name, a 32-bit first sector, a 32-bit size in
+// bytes, and 8 reserved bytes.
+
+constant SECTOR = 512
+constant DIRECTORY_SECTORS = 4
+
+function sectorsFor(length: Integer): Integer {
+    return (length + SECTOR - 1) / SECTOR
+}
+
+function padToSector(image: Bytes) {
+    let remainder = image.length % SECTOR
+    if remainder != 0 {
+        image.resize(image.length + SECTOR - remainder)
+    }
+}
+
+function main(): Integer {
+    if argumentCount() < 3 {
+        print("usage: mkimage OUTPUT MBR|- LOADER|- [NAME=PATH ...]")
+        return 2
+    }
+    // A disk that is not booted from (the Arm build's: QEMU loads its kernel
+    // directly) has an empty boot record and no loader; the directory and
+    // files are laid out the same.
+    let mbr = Bytes(SECTOR)
+    mbr[510] = 0x55
+    mbr[511] = 0xAA
+    if argument(1) != "-" { mbr = readBytesFile(argument(1)) }
+    let loader = Bytes()
+    if argument(2) != "-" { loader = readBytesFile(argument(2)) }
+    if mbr.length != SECTOR || mbr[510] != 0x55 || mbr[511] != 0xAA {
+        fail("the boot record must be one sector ending in 55 AA")
+    }
+    let loaderSectors = sectorsFor(loader.length)
+    if loaderSectors > 1024 {
+        fail("the loader is " + Text(loader.length) + " bytes; the boot record can read at most 512 KiB")
+    }
+    let directorySector = 1 + loaderSectors
+    mbr.setUInt32(0x1F0, 1)
+    mbr.setUInt16(0x1F4, loaderSectors)
+    mbr.setUInt32(0x1F6, directorySector)
+
+    let image = Bytes()
+    image.addBytes(mbr)
+    image.addBytes(loader)
+    padToSector(image)
+
+    let directory = Bytes(DIRECTORY_SECTORS * SECTOR)
+    let magic = "MINYARFS"
+    for position in 0..magic.length {
+        directory[position] = Integer(magic[position])
+    }
+    let files = Bytes()
+    let next = directorySector + DIRECTORY_SECTORS
+    let count = 0
+    for index in 3..argumentCount() {
+        let specification = argument(index)
+        let separator = -1
+        for position in 0..specification.length {
+            if separator < 0 && specification[position] == '=' {
+                separator = position
+            }
+        }
+        if separator <= 0 {
+            fail("expected NAME=PATH, not '" + specification + "'")
+        }
+        let name = specification.slice(0, separator)
+        let contents = readBytesFile(specification.slice(separator + 1, specification.length))
+        if name.byteLength >= 48 {
+            fail("file names are limited to 47 bytes: " + name)
+        }
+        let entry = 64 + count * 64
+        if entry + 64 > directory.length {
+            fail("the directory is full")
+        }
+        let position = 0
+        for character in name {
+            directory[entry + position] = Integer(character)
+            position += 1
+        }
+        directory.setUInt32(entry + 48, next)
+        directory.setUInt32(entry + 52, contents.length)
+        files.addBytes(contents)
+        padToSector(files)
+        next += sectorsFor(contents.length)
+        count += 1
+        print(name + ": " + Text(contents.length) + " bytes")
+    }
+    directory.setUInt32(8, count)
+    image.addBytes(directory)
+    image.addBytes(files)
+    // A little slack so the disk is never smaller than its last read.
+    image.resize(image.length + 64 * SECTOR)
+    writeBytesFile(argument(0), image)
+    print("loader: " + Text(loader.length) + " bytes in " + Text(loaderSectors) + " sectors")
+    print("image: " + Text(image.length) + " bytes")
+    return 0
+}

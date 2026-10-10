@@ -1,0 +1,375 @@
+// Keyboard and mouse.
+//
+// The keyboard is the PS/2 keyboard behind the i8042 controller, read as
+// scan code set 1. The mouse is QEMU's VMware-compatible absolute pointer: the
+// hypervisor reports the host cursor position directly, so the guest needs no
+// mouse grab. Its PS/2 packets only signal that new data is waiting.
+use "machine" as machine
+use "device" as device
+use "arch" as arch
+use "../../shared/interrupts.min" as interrupts
+use "../../shared/pci.min" as pci
+use "../../shared/virtio/input.min" as virtual
+
+// Key codes for keys that do not produce characters.
+public constant KEY_NONE = 0
+public constant KEY_ENTER = 1
+public constant KEY_BACKSPACE = 2
+public constant KEY_TAB = 3
+public constant KEY_ESCAPE = 4
+public constant KEY_LEFT = 5
+public constant KEY_RIGHT = 6
+public constant KEY_UP = 7
+public constant KEY_DOWN = 8
+public constant KEY_HOME = 9
+public constant KEY_END = 10
+public constant KEY_DELETE = 11
+public constant KEY_PAGE_UP = 12
+public constant KEY_PAGE_DOWN = 13
+public constant KEY_F1 = 14
+public constant KEY_F2 = 15
+public constant KEY_F3 = 16
+public constant KEY_CHARACTER = 100
+
+public constant BUTTON_LEFT = 1
+public constant BUTTON_RIGHT = 2
+public constant BUTTON_MIDDLE = 4
+
+constant HYPERVISOR_MAGIC = 0x564D5868
+constant GET_VERSION = 10
+constant MOUSE_DATA = 39
+constant MOUSE_STATUS = 40
+constant MOUSE_COMMAND = 41
+constant MOUSE_ENABLE = 0x45414552
+constant MOUSE_ABSOLUTE = 0x53424152
+
+public record KeyEvent {
+    key: Integer
+    character: Character
+    shift: Boolean
+    control: Boolean
+}
+
+public record Input {
+    // Keyboard state.
+    shift: Boolean
+    control: Boolean
+    alt: Boolean
+    capsLock: Boolean
+    extended: Boolean
+    keys: List<KeyEvent>
+    // Mouse state, in screen pixels.
+    hasPointer: Boolean
+    x: Integer
+    y: Integer
+    buttons: Integer
+    pressed: Integer
+    released: Integer
+    scroll: Integer
+    moved: Boolean
+    width: Integer
+    height: Integer
+    // The i8042 controller: status reads and commands at 0x64, data at 0x60.
+    controller: device.Port8
+    data: device.Port8
+    // Where the hypervisor call leaves its four result registers.
+    registers: device.Memory
+    // Interrupt counts at the last poll: the devices are read only when their
+    // interrupt has fired, because every port access takes QEMU's global lock.
+    keyboardSeen: Integer
+    mouseSeen: Integer
+    lastFullPoll: Integer
+    // Virtio keyboards and tablets, on machines without the PC's devices.
+    virtualDevices: List<virtual.Events>
+}
+
+function controllerReady(input: Input) {
+    let spins = 0
+    while (device.in8(input.controller) & 2) != 0 && spins < 100000 {
+        spins += 1
+    }
+}
+
+function writeController(input: Input, command: Integer) {
+    controllerReady(input)
+    device.out8(input.controller, command)
+}
+
+function writeData(input: Input, value: Integer) {
+    controllerReady(input)
+    device.out8(input.data, value)
+}
+
+function writeMouse(input: Input, value: Integer) {
+    writeController(input, 0xD4)
+    writeData(input, value)
+}
+
+function call(input: Input, command: Integer, parameter: Integer): Integer {
+    machine.hypervisorCall(command, parameter, device.addressOf(input.registers, 0))
+    return device.load64(input.registers, 0)
+}
+
+function register(input: Input, index: Integer): Integer {
+    return device.load64(input.registers, index * 8)
+}
+
+public function start(width: Integer, height: Integer, devices: List<pci.Device>): Input {
+    let input = Input {
+        shift: false; control: false; alt: false; capsLock: false; extended: false; keys: []
+        hasPointer: false; x: width / 2; y: height / 2; buttons: 0; pressed: 0; released: 0; scroll: 0; moved: false
+        width: width; height: height
+        controller: device.port8(0x64); data: device.port8(0x60); registers: device.allocate(32, 8)
+        keyboardSeen: -1; mouseSeen: -1; lastFullPoll: 0; virtualDevices: []
+    }
+    if !arch.LEGACY_PC {
+        input.virtualDevices = virtual.openAll(devices)
+        input.hasPointer = input.virtualDevices.length > 0
+        print("input: " + Text(input.virtualDevices.length) + " virtio input devices")
+        return input
+    }
+    // Enable the auxiliary (mouse) port and its interrupts, and let the mouse report.
+    writeController(input, 0xA8)
+    writeController(input, 0x20)
+    controllerReady(input)
+    let configuration = device.in8(input.data)
+    writeController(input, 0x60)
+    writeData(input, (configuration | 3) & 0xDF)
+    writeMouse(input, 0xF6)
+    writeMouse(input, 0xF4)
+    drain(input)
+
+    call(input, GET_VERSION, 0)
+    if register(input, 1) == HYPERVISOR_MAGIC {
+        call(input, MOUSE_COMMAND, MOUSE_ENABLE)
+        let status = call(input, MOUSE_STATUS, 0)
+        if (status & 0xFFFF) >= 1 {
+            call(input, MOUSE_DATA, 1)
+        }
+        call(input, MOUSE_COMMAND, MOUSE_ABSOLUTE)
+        input.hasPointer = true
+        print("input: absolute pointer enabled")
+    } else {
+        print("input: no hypervisor pointer; keyboard only")
+    }
+    return input
+}
+
+function drain(input: Input) {
+    let spins = 0
+    while (device.in8(input.controller) & 1) != 0 && spins < 64 {
+        device.in8(input.data)
+        spins += 1
+    }
+}
+
+// Collect everything that happened since the last call.
+public function poll(input: Input) {
+    input.keys = []
+    input.pressed = 0
+    input.released = 0
+    input.scroll = 0
+    input.moved = false
+    if input.virtualDevices.length > 0 {
+        for source in input.virtualDevices {
+            for event in virtual.take(source) {
+                virtualEvent(input, event)
+            }
+        }
+        return
+    }
+    let keyboard = machine.interruptCount(arch.KEYBOARD)
+    let mouse = machine.interruptCount(arch.MOUSE)
+    let now = interrupts.milliseconds()
+    // A slow poll catches anything whose interrupt was missed.
+    let periodic = now - input.lastFullPoll >= 100
+    if keyboard == input.keyboardSeen && mouse == input.mouseSeen && !periodic {
+        return
+    }
+    input.keyboardSeen = keyboard
+    input.mouseSeen = mouse
+    if periodic { input.lastFullPoll = now }
+    let guard = 0
+    while (device.in8(input.controller) & 1) != 0 && guard < 256 {
+        let status = device.in8(input.controller)
+        let value = device.in8(input.data)
+        if (status & 0x20) == 0 {
+            scancode(input, value)
+        }
+        guard += 1
+    }
+    if input.hasPointer {
+        pollPointer(input)
+    }
+}
+
+function pollPointer(input: Input) {
+    let guard = 0
+    while guard < 64 {
+        let status = call(input, MOUSE_STATUS, 0)
+        if (status & 0xFFFF0000) == 0xFFFF0000 {
+            // The device reset; ask for absolute reports again.
+            call(input, MOUSE_COMMAND, MOUSE_ENABLE)
+            call(input, MOUSE_COMMAND, MOUSE_ABSOLUTE)
+            return
+        }
+        if (status & 0xFFFF) < 4 {
+            return
+        }
+        call(input, MOUSE_DATA, 4)
+        let flags = register(input, 0)
+        let x = register(input, 1) * input.width / 65536
+        let y = register(input, 2) * input.height / 65536
+        let wheel = register(input, 3) & 0xFF
+        if wheel >= 128 { wheel -= 256 }
+        let buttons = 0
+        if (flags & 0x20) != 0 { buttons = buttons | BUTTON_LEFT }
+        if (flags & 0x10) != 0 { buttons = buttons | BUTTON_RIGHT }
+        if (flags & 0x08) != 0 { buttons = buttons | BUTTON_MIDDLE }
+        if x != input.x || y != input.y {
+            input.moved = true
+        }
+        input.x = clamp(x, 0, input.width - 1)
+        input.y = clamp(y, 0, input.height - 1)
+        input.pressed = input.pressed | (buttons & ~input.buttons)
+        input.released = input.released | (input.buttons & ~buttons)
+        input.buttons = buttons
+        input.scroll += wheel
+        guard += 1
+    }
+}
+
+// A Linux input event from a virtio device. Linux key codes for the main
+// keys are the PC's scan code set 1, so they go through `scancode` like PS/2
+// bytes; the cursor block and the right-hand modifiers are remapped to their
+// set 1 extended codes.
+function virtualEvent(input: Input, event: virtual.Event) {
+    if event.kind == virtual.KEY {
+        let bit = 0
+        if event.code == 0x110 { bit = BUTTON_LEFT }
+        if event.code == 0x111 { bit = BUTTON_RIGHT }
+        if event.code == 0x112 { bit = BUTTON_MIDDLE }
+        if bit != 0 {
+            if event.value != 0 {
+                input.pressed = input.pressed | (bit & ~input.buttons)
+                input.buttons = input.buttons | bit
+            } else {
+                input.released = input.released | (input.buttons & bit)
+                input.buttons = input.buttons & ~bit
+            }
+            return
+        }
+        let release = 0
+        if event.value == 0 { release = 0x80 }
+        if event.code >= 1 && event.code <= 0x58 {
+            scancode(input, event.code | release)
+            return
+        }
+        let extended = -1
+        if event.code == 96 { extended = 0x1C }
+        if event.code == 97 { extended = 0x1D }
+        if event.code == 100 { extended = 0x38 }
+        if event.code == 102 { extended = 0x47 }
+        if event.code == 103 { extended = 0x48 }
+        if event.code == 104 { extended = 0x49 }
+        if event.code == 105 { extended = 0x4B }
+        if event.code == 106 { extended = 0x4D }
+        if event.code == 107 { extended = 0x4F }
+        if event.code == 108 { extended = 0x50 }
+        if event.code == 109 { extended = 0x51 }
+        if event.code == 111 { extended = 0x53 }
+        if extended >= 0 {
+            scancode(input, 0xE0)
+            scancode(input, extended | release)
+        }
+        return
+    }
+    if event.kind == virtual.ABSOLUTE {
+        // The tablet reports 0 to 32767 across the screen.
+        if event.code == 0 {
+            let x = clamp(event.value * input.width / 32768, 0, input.width - 1)
+            if x != input.x { input.moved = true }
+            input.x = x
+        }
+        if event.code == 1 {
+            let y = clamp(event.value * input.height / 32768, 0, input.height - 1)
+            if y != input.y { input.moved = true }
+            input.y = y
+        }
+        return
+    }
+    // The wheel counts up for scrolling up; the VMware pointer the opposite way.
+    if event.kind == virtual.RELATIVE && event.code == 8 {
+        input.scroll -= event.value
+    }
+}
+
+function emit(input: Input, key: Integer, character: Character) {
+    input.keys.add(KeyEvent { key: key; character: character; shift: input.shift; control: input.control })
+}
+
+// US layout, scan code set 1, for codes 0x02 to 0x39. '#' marks codes for
+// keys handled above (backspace, tab, enter, control, shift, alt).
+constant PLAIN = "1234567890-=##qwertyuiop[]##asdfghjkl;'`#\\zxcvbnm,./#*# "
+constant SHIFTED = "!@#$%^&*()_+##QWERTYUIOP{}##ASDFGHJKL:\"~#|ZXCVBNM<>?#*# "
+
+function scancode(input: Input, code: Integer) {
+    if code == 0xE0 {
+        input.extended = true
+        return
+    }
+    let released = (code & 0x80) != 0
+    let key = code & 0x7F
+    let extended = input.extended
+    input.extended = false
+    if key == 0x2A || key == 0x36 {
+        input.shift = !released
+        return
+    }
+    if key == 0x1D {
+        input.control = !released
+        return
+    }
+    if key == 0x38 {
+        input.alt = !released
+        return
+    }
+    if released { return }
+    if key == 0x3A {
+        input.capsLock = !input.capsLock
+        return
+    }
+    if extended {
+        if key == 0x4B { emit(input, KEY_LEFT, ' ') }
+        if key == 0x4D { emit(input, KEY_RIGHT, ' ') }
+        if key == 0x48 { emit(input, KEY_UP, ' ') }
+        if key == 0x50 { emit(input, KEY_DOWN, ' ') }
+        if key == 0x47 { emit(input, KEY_HOME, ' ') }
+        if key == 0x4F { emit(input, KEY_END, ' ') }
+        if key == 0x53 { emit(input, KEY_DELETE, ' ') }
+        if key == 0x49 { emit(input, KEY_PAGE_UP, ' ') }
+        if key == 0x51 { emit(input, KEY_PAGE_DOWN, ' ') }
+        if key == 0x1C { emit(input, KEY_ENTER, ' ') }
+        return
+    }
+    if key == 0x01 { emit(input, KEY_ESCAPE, ' '); return }
+    if key == 0x0E { emit(input, KEY_BACKSPACE, ' '); return }
+    if key == 0x0F { emit(input, KEY_TAB, ' '); return }
+    if key == 0x1C { emit(input, KEY_ENTER, ' '); return }
+    if key == 0x3B { emit(input, KEY_F1, ' '); return }
+    if key == 0x3C { emit(input, KEY_F2, ' '); return }
+    if key == 0x3D { emit(input, KEY_F3, ' '); return }
+    if key >= 0x02 && key <= 0x39 {
+        let index = key - 0x02
+        let character = PLAIN[index]
+        let letter = character >= 'a' && character <= 'z'
+        let upper = input.shift
+        if letter && input.capsLock { upper = !upper }
+        if upper {
+            character = SHIFTED[index]
+        }
+        if Integer(character) >= 32 {
+            emit(input, KEY_CHARACTER, character)
+        }
+    }
+}

@@ -253,7 +253,7 @@ static void rc_bounded_chunk_unit(void) {
 /* Round-robin service across three queues: every continuously ready queue
  * receives one unit within three units, including when the poll budget is 1.
  * rc_pending_count includes objects, detached frames and temporary chunks. */
-size_t minyar_rc_poll(size_t budget) {
+static MINYAR_COLD size_t rc_bounded_poll_work(size_t budget) {
     if (budget > MINYAR_RC_POLL_BUDGET) budget = MINYAR_RC_POLL_BUDGET;
     size_t work = 0;
     if (!rc_bounded_frame_head && !rc_bounded_chunk_head) {
@@ -371,6 +371,19 @@ size_t minyar_rc_poll(size_t budget) {
     rc_bounded_last_work = work;
 #endif
     return work;
+}
+
+/* Every queue holds pending work, so with nothing pending a poll does no work
+ * and changes no state. Keep that constant-time test inline: generated code
+ * polls at every loop iteration and call, and almost always finds nothing. */
+size_t minyar_rc_poll(size_t budget) {
+    if (!rc_pending_count) {
+#ifdef MINYAR_RC_TESTING
+        rc_bounded_last_work = 0;
+#endif
+        return 0;
+    }
+    return rc_bounded_poll_work(budget);
 }
 
 void minyar_rc_release(void *value) {
