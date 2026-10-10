@@ -14,7 +14,7 @@ if [ "${1-}" = --backend ]; then
     esac
 fi
 usage() {
-    echo "usage: ./minyar [--backend llvm|swift|native] [--app] [--bundle-id ID] [--icon FILE.icns] [--resources DIR] [--check | --debug | --release] [--incremental] [--memory-profile eager|fixed|lazy|system] [--cleanup-budget 1..1024] [--heap-bytes BYTES] FILE.min [-o PROGRAM]" >&2
+    echo "usage: ./minyar [--backend llvm|swift|native] [--app] [--bundle-id ID] [--icon FILE.icns] [--resources DIR] [--check | --debug | --release] [--incremental] [--library DIR] [--memory-profile eager|fixed|lazy|system] [--cleanup-budget 1..1024] [--heap-bytes BYTES] FILE.min [-o PROGRAM]" >&2
     echo "native SwiftUI options: ./minyar --backend swift --help" >&2
     exit 2
 }
@@ -33,6 +33,7 @@ Build a native program; the compiler and runtime build on first use.
   --debug                  Disable program optimization (-O0)
   --release                Optimize across the program and runtime with LTO
   --incremental            Reuse unchanged local module compilation
+  --library DIR            Search DIR for packages before the standard ones
   --memory-profile PROFILE system (default), eager, fixed, or lazy
   --cleanup-budget N       Reclamation work budget, 1..1024 (default: 32)
   --heap-bytes N           Power-of-two capacity for fixed/lazy heaps
@@ -70,6 +71,8 @@ profile_requested=0
 cleanup_budget=32
 budget_requested=0
 heap_bytes=
+# Package directories from --library, searched before the standard ones.
+libraries=
 while :; do
     case "${1-}" in
         --release) [ "$optimization_requested" -eq 0 ] && [ "$check_only" -eq 0 ] || usage; release=1; optimization_requested=1; shift ;;
@@ -86,6 +89,10 @@ while :; do
             [ "$#" -ge 2 ] && [ -z "$resources_dir" ] && [ -n "$2" ] || usage
             resources_dir=$2; shift 2 ;;
         --incremental) incremental=1; shift ;;
+        --library)
+            [ "$#" -ge 2 ] && [ -d "$2" ] || usage
+            libraries="$libraries
+$2"; shift 2 ;;
         --memory-profile)
             [ "$#" -ge 2 ] && [ "$profile_requested" -eq 0 ] || usage
             case "$2" in eager|fixed|lazy|system) memory_profile=$2 ;; *) usage ;; esac
@@ -185,6 +192,14 @@ trap 'exit 143' TERM
 llvm_file="$llvm_dir/program.ll"
 set --
 if [ "$memory_profile" != eager ]; then set -- --bounded-owners "$cleanup_budget"; fi
+# The first directory holding a package wins: --library directories, then on
+# macOS the platform packages (such as the NSURLSession http), then the rest.
+old_ifs=$IFS
+IFS='
+'
+for library in $libraries; do set -- "$@" --library "$library"; done
+IFS=$old_ifs
+if [ "$(uname -s)" = Darwin ]; then set -- "$@" --library "$project_dir/library/platform/macos"; fi
 if [ "$incremental" -eq 1 ]; then
     "$project_dir/build/minyar-module-build" "$project_dir/build/minyarc-modules" \
         "$source_file" "$llvm_file" "${MINYAR_MODULE_CACHE:-$project_dir/build/module-cache}" "$@" --library "$project_dir/library"
