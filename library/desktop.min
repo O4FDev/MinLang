@@ -1,0 +1,86 @@
+// Native desktop services return recoverable errors. All calls belong to the
+// application's main thread; OS callbacks contain no managed Minyar values.
+use "errors" as errors
+
+public record Power {
+    private hasBattery: Boolean
+    private onCharger: Boolean
+    private percent: Integer
+}
+public record PowerResult { private value: Power; private error: errors.Error }
+public record Network {
+    private usable: Boolean
+    private wifi: Boolean
+    private ethernet: Boolean
+    private flags: Integer
+}
+public record NetworkResult { private value: Network; private error: errors.Error }
+
+function envelopeError(raw: Bytes, size: Integer, message: Text): errors.Error {
+    if raw.length != size { fail("invalid desktop native envelope") }
+    let code = raw.getUInt32(0)
+    if code == 0 { return errors.none() }
+    return errors.make(code, raw.getInt32(4), message)
+}
+function scalar(raw: Bytes, message: Text): errors.IntegerResult {
+    let error = envelopeError(raw, 16, message)
+    if errors.isError(error) { return errors.integerFailure(error) }
+    return errors.integer(raw.getInt64(8))
+}
+
+public function power(): PowerResult {
+    let raw = powerRaw()
+    let error = envelopeError(raw, 32, "power status unavailable")
+    return PowerResult { value: Power { hasBattery: raw.getInt64(8) != 0; onCharger: raw.getInt64(16) != 0; percent: raw.getInt64(24) }; error: error }
+}
+public function powerOk(result: PowerResult): Boolean { return !errors.isError(result.error) }
+public function powerError(result: PowerResult): errors.Error { return result.error }
+public function powerValue(result: PowerResult): Power {
+    if !powerOk(result) { fail("cannot extract a failed power result") }
+    return result.value
+}
+public function hasBattery(power: Power): Boolean { return power.hasBattery }
+public function onCharger(power: Power): Boolean { return power.onCharger }
+// -1 means that the OS did not provide a valid charge level.
+public function batteryPercent(power: Power): Integer { return power.percent }
+
+// macOS starts a path monitor on the first call. Its initial snapshot can be
+// would-block; the app event loop wakes when a new native snapshot arrives.
+public function network(): NetworkResult {
+    let raw = networkRaw()
+    let error = envelopeError(raw, 48, "network status unavailable")
+    return NetworkResult { value: Network { usable: raw.getInt64(16) != 0; wifi: raw.getInt64(24) != 0; ethernet: raw.getInt64(32) != 0; flags: raw.getInt64(40) }; error: error }
+}
+public function networkOk(result: NetworkResult): Boolean { return !errors.isError(result.error) }
+public function networkError(result: NetworkResult): errors.Error { return result.error }
+public function networkValue(result: NetworkResult): Network {
+    if !networkOk(result) { fail("cannot extract a failed network result") }
+    return result.value
+}
+public function usable(network: Network): Boolean { return network.usable }
+public function wifi(network: Network): Boolean { return network.wifi }
+public function ethernet(network: Network): Boolean { return network.ethernet }
+public function metered(network: Network): Boolean { return (network.flags & 1) != 0 }
+public function constrained(network: Network): Boolean { return (network.flags & 2) != 0 }
+// Windows can know the active route while its cost service is unavailable.
+public function meteringKnown(network: Network): Boolean { return (network.flags & 4) == 0 }
+public function networkStop(): errors.IntegerResult { return scalar(networkStopRaw(), "stopping network monitor failed") }
+
+// Values: 0 disabled, 1 enabled, 2 needs OS approval, 3 app not found.
+public function launchAtLoginStatus(): errors.IntegerResult { return scalar(launchAtLoginStatusRaw(), "login status unavailable") }
+public function setLaunchAtLogin(enabled: Boolean): errors.IntegerResult { return scalar(setLaunchAtLoginRaw(enabled), "changing launch at login failed") }
+
+// notify returns an owned request ID. Poll its status (0 pending, 1 accepted
+// by the OS), then close it. Acceptance does not promise visible delivery.
+public function notify(title: Text, body: Text): errors.IntegerResult { return scalar(notifyRaw(title, body), "notification submission failed") }
+public function notificationStatus(id: Integer): errors.IntegerResult { return scalar(notificationStatusRaw(id), "notification delivery failed") }
+public function notificationClose(id: Integer): errors.IntegerResult { return scalar(notificationCloseRaw(id), "notification cancellation failed") }
+
+function powerRaw(): Bytes { native "desktop" }
+function networkRaw(): Bytes { native "desktop" }
+function networkStopRaw(): Bytes { native "desktop" }
+function launchAtLoginStatusRaw(): Bytes { native "desktop" }
+function setLaunchAtLoginRaw(enabled: Boolean): Bytes { native "desktop" }
+function notifyRaw(title: Text, body: Text): Bytes { native "desktop" }
+function notificationStatusRaw(id: Integer): Bytes { native "desktop" }
+function notificationCloseRaw(id: Integer): Bytes { native "desktop" }

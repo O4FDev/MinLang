@@ -312,6 +312,21 @@ def main():
                 native += ['-lcrypt32', '-lbcrypt', '-lncrypt', '-lws2_32']
             else:
                 native += ['-lcrypto']
+        elif library == 'keychain':
+            if platform.system() != 'Darwin':
+                raise ValueError('the keychain package requires macOS')
+            native += [native_object(project, clang, base, 'keychain.c', native_flags),
+                       '-framework', 'Security', '-framework', 'CoreFoundation']
+        elif library == 'desktop':
+            if platform.system() == 'Darwin':
+                native += [native_object(project, clang, base, 'desktop.m',
+                                         [*native_flags, '-fobjc-arc', '-fmodules'])]
+                for framework in ('AppKit', 'UserNotifications', 'ServiceManagement', 'Network', 'IOKit'):
+                    native += ['-framework', framework]
+            else:
+                native += [native_object(project, clang, base, 'desktop.c', native_flags)]
+                if platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
+                    native += ['-luser32', '-lshell32', '-ladvapi32', '-lole32', '-loleaut32', '-liphlpapi']
         else:
             raise ValueError(f'the program uses an unknown native library: {library}')
     lto = lto_flags(clang, link_flags) if release == '1' else []

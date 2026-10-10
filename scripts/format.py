@@ -15,6 +15,8 @@ FILES = (
     "runtime/native/tlsverify.c",
     "runtime/native/update.c", "runtime/native/update_monocypher.c", "runtime/native/update_ed25519.c",
     "tests/update-native.c", "tests/update-sign.c",
+    "runtime/native/apple_identity.h", "runtime/native/keychain.c", "tests/keychain-native.c",
+    "runtime/native/desktop.c", "tests/net-soak.c",
     "tests/net-native.c", "tests/net-batch.c", "tests/net-loop.c",
     "tests/runtime-bytes.c", "tests/runtime-traps.c",
     "tests/llvm_symbols.h",

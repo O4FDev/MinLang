@@ -1,0 +1,108 @@
+use "tls" as tls
+use "net" as net
+use "errors" as errors
+use "eventloop" as loop
+
+record Peer {
+    socket: Integer
+    registration: Integer
+    session: tls.Session
+    received: Bytes
+}
+function decimal(text: Text): Integer {
+    let result = 0
+    for digit in text { result = result * 10 + Integer(digit) - 48 }
+    return result
+}
+function connectPeer(handle: Integer, index: Integer, port: Integer, roots: List<Bytes>, certificates: List<Bytes>, key: Bytes): Peer {
+    let socket = net.connect("127.0.0.1", port)
+    if socket < 0 { fail("soak peer connect failed") }
+    let session = tls.clientWithIdentity("localhost", randomBytes(64), roots, certificates, key)
+    net.send(socket, tls.takeOutgoing(session))
+    while session.state == tls.HELLO_SENT || session.state == tls.HANDSHAKE {
+        if !net.ready(socket, 5000) { fail("soak handshake timeout") }
+        let arrived = net.read(socket, 65536)
+        if errors.bytesStatus(arrived) != errors.successStatus() { fail("soak handshake read failed") }
+        tls.receive(session, errors.bytesValue(arrived))
+        let outgoing = tls.takeOutgoing(session)
+        if outgoing.length > 0 { net.send(socket, outgoing) }
+    }
+    if !tls.established(session) { fail("soak handshake: " + session.error) }
+    let registration = errors.integerValue(loop.watch(handle, socket, loop.readableInterest(), index))
+    return Peer { socket: socket; registration: registration; session: session; received: Bytes() }
+}
+function destroyPeer(handle: Integer, peer: Peer) {
+    loop.remove(handle, peer.registration)
+    net.close(peer.socket)
+}
+function flush(peer: Peer) {
+    let outgoing = tls.takeOutgoing(peer.session)
+    // Heartbeats are small; retain explicit failure rather than misreading an
+    // empty read. A slow or dropped peer is replaced by the harness.
+    if outgoing.length > 0 && net.send(peer.socket, outgoing) != outgoing.length {
+        peer.session.state = tls.FAILED
+        peer.session.error = "soak write failed"
+    }
+}
+let port = decimal(argument(0))
+let seconds = decimal(argument(1))
+let count = decimal(argument(2))
+let roots: List<Bytes> = [readBytesFile(argument(3))]
+let certificates: List<Bytes> = [readBytesFile(argument(4))]
+let key = readBytesFile(argument(5))
+let handle = errors.integerValue(loop.create())
+let peers: List<Peer> = []
+for index in 0..count { peers.add(connectPeer(handle, index, port, roots, certificates, key)) }
+let heartbeat = errors.integerValue(loop.timer(handle, 1, 15000, -1))
+let finished = errors.integerValue(loop.timer(handle, seconds * 1000, 0, -2))
+let request = Bytes("GET /heartbeat HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n")
+let response = Bytes("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+let answers = 0
+let replaced = 0
+let malformed = 0
+let done = false
+print("ready " + Text(count))
+while !done {
+    let batch = loop.wait(handle, 1000, 128)
+    if errors.isError(loop.batchError(batch)) { fail("soak loop wait failed") }
+    for event in loop.events(batch) {
+        if event.token == -2 { done = true }
+        if event.token == -1 {
+            for peer in peers { tls.send(peer.session, request); flush(peer) }
+            print("sample " + Text(answers) + " " + Text(replaced) + " " + Text(malformed))
+        }
+        if event.token >= 0 && event.token < peers.length {
+            let peer = peers[event.token]
+            let arrived = net.read(peer.socket, 65536)
+            let status = errors.bytesStatus(arrived)
+            if status == errors.successStatus() { tls.receive(peer.session, errors.bytesValue(arrived)) }
+            if status == errors.endOfStreamStatus() { tls.endInput(peer.session) }
+            if status == errors.failureStatus() { peer.session.state = tls.FAILED }
+            let plain = tls.takeIncoming(peer.session)
+            peer.received.addBytes(plain)
+            if peer.received.length > 65536 { peer.session.state = tls.FAILED; malformed = malformed + 1 }
+            while peer.received.length >= response.length && peer.session.state == tls.ESTABLISHED {
+                let valid = true
+                for position in 0..response.length {
+                    if peer.received[position] != response[position] { valid = false }
+                }
+                if valid {
+                    answers = answers + 1
+                    peer.received = peer.received.slice(response.length, peer.received.length)
+                } else {
+                    peer.session.state = tls.FAILED
+                    malformed = malformed + 1
+                }
+            }
+            if peer.session.state == tls.FAILED || peer.session.state == tls.CLOSED {
+                destroyPeer(handle, peer)
+                peers[event.token] = connectPeer(handle, event.token, port, roots, certificates, key)
+                replaced = replaced + 1
+            }
+        }
+    }
+}
+for peer in peers { destroyPeer(handle, peer) }
+loop.remove(handle, heartbeat)
+loop.close(handle)
+print("complete " + Text(answers) + " " + Text(replaced) + " " + Text(malformed))

@@ -967,10 +967,47 @@ long long minyar_macos_menu(const MinyarText *title) { @autoreleasepool {
 long long minyar_macos_menuItem(long long menu, const MinyarText *title, const MinyarText *key) { @autoreleasepool {
     NSMenu *m = object(menu,NSMenu.class);
     NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:string(title) action:@selector(action:) keyEquivalent:string(key)];
-    item.target = delegate; [m addItem:item]; return registerObject(item,0);
+    item.target = delegate; [m addItem:item]; return registerObject(item,entry(menu).owner);
 } }
 void minyar_macos_menuSeparator(long long menu) { @autoreleasepool {
     [object(menu,NSMenu.class) addItem:NSMenuItem.separatorItem];
+} }
+bool minyar_macos_accessory(bool enabled) { @autoreleasepool {
+    ready();
+    return [NSApp setActivationPolicy:enabled ? NSApplicationActivationPolicyAccessory : NSApplicationActivationPolicyRegular];
+} }
+long long minyar_macos_statusItem(const MinyarText *title, const MinyarText *symbol) { @autoreleasepool {
+    ready();
+    NSStatusItem *item = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
+    item.button.title = string(title);
+    NSString *name = string(symbol);
+    if (name.length) {
+        NSImage *image = [NSImage imageWithSystemSymbolName:name accessibilityDescription:string(title)];
+        image.template = YES;
+        item.button.image = image;
+        item.button.imagePosition = NSImageLeft;
+    }
+    item.button.toolTip = string(title);
+    return registerObject(item,0);
+} }
+long long minyar_macos_statusMenu(long long handle) { @autoreleasepool {
+    NSStatusItem *item = object(handle,NSStatusItem.class);
+    if (item.menu) return identifier(item.menu);
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:item.button.title];
+    item.menu = menu;
+    return registerObject(menu,handle);
+} }
+void minyar_macos_statusRemove(long long handle) { @autoreleasepool {
+    NSStatusItem *item = object(handle,NSStatusItem.class);
+    [NSStatusBar.systemStatusBar removeStatusItem:item];
+    item.menu = nil;
+    for (NSNumber *key in handles.allKeys) if (handles[key].owner == handle) {
+        [numbers removeObjectForKey:handles[key].object];
+        [handles removeObjectForKey:key];
+    }
+    [numbers removeObjectForKey:item];
+    [handles removeObjectForKey:@(handle)];
+    dropEvents(^BOOL(MNEvent *event) { return event.source != 0 && !handles[@(event.source)]; });
 } }
 bool minyar_macos_nextEvent(double timeout) { @autoreleasepool {
     ready(); if (!isfinite(timeout) || timeout < 0 || timeout > 60) minyar_native_stop("macos event timeout must be between 0 and 60 seconds.");

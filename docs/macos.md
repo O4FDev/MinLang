@@ -92,6 +92,7 @@ are process-local; do not serialize them or share them between processes.
 | Lists | `list`, `addRow`, `rowCount`, `listLine`, `listColors`, `rowButton`, `clickedRow`, `clickedButton` | View-based NSTableView with reused cells |
 | Interaction | `clickable`, `draggable` | Tracking areas, window dragging, accessibility press |
 | Menus | `menu`, `menuItem`, `menuSeparator` | NSMenu, NSMenuItem, target/action |
+| Menu bar | `statusItem`, `statusMenu`, `statusRemove`, `accessory` | NSStatusItem, accessory activation policy |
 | Events | `eventType`, `eventSource`, `eventText` | Queued delegate and target/action events |
 | System UI | `openFile`, `saveFile`, `alert`, `confirm`, `aboutText`, `showAbout`, `openURL` | NSOpenPanel, NSSavePanel, NSAlert, About panel, NSWorkspace |
 | Application | `appearance`, `isDark`, `setting`, `setSetting`, `resource`, `registerFont`, `seconds` | NSAppearance, NSUserDefaults, NSBundle, CTFontManager |
@@ -254,7 +255,8 @@ This is a public AppKit binding derived from Swift's observable lowering, not a
 replacement implementation of AppKit, a Swift compiler, or general SwiftUI
 interoperability. It supports the APIs listed above. Arbitrary SDK imports,
 Swift generics/closures, WebKit, Metal, accessibility customization,
-notifications and document-controller integration are not part of this package.
+document-controller integration are not part of this package. Notifications,
+login items, power and network status use the separate `desktop` package.
 The separate [experimental SwiftUI compiler target](swiftui.md) explores native
 Swift semantics and direct framework imports; it does not use this binding.
 

@@ -46,8 +46,16 @@ initial CertificateRequest with its Certificate, a signature using an
 offered compatible algorithm, and Finished. The certificate and private key
 must match. A missing identity produces an empty certificate response, which
 the server may reject. Native signing imports are ephemeral. This API takes
-key bytes; opaque Keychain/TPM signing identities still require a separate
-provider API and are not implemented by this change.
+key bytes. On macOS, `keychain.findIdentity(subject, store)` returns the public
+certificate and an opaque persistent identity reference. Pass
+`[keychain.certificate(identity)]` and `keychain.signingReference(identity)` to
+the same TLS constructor. The native provider asks Security.framework to sign
+with the Keychain key; it never exports the private key. A key's access policy
+can deny signing, which fails authentication. Empty `store` uses the OS search
+list; a nonempty path selects an existing file keychain. Exact subject-summary
+matches must be unique. The reference is local metadata, not a portable key,
+and ceases to work when the identity is removed. It should not be logged or
+sent to a peer. Hardware protection depends on how the identity was created.
 
 TCP callers drain `takeOutgoing`, feed records through `receive`, and drain
 `takeIncoming`. Call `endInput` when TCP reports EOF: an EOF without an
