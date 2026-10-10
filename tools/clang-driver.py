@@ -169,7 +169,10 @@ def lto_flags(clang, link_flags):
         directory = Path(shutil.which(clang) or clang).resolve().parent
         sibling = next((directory / name for name in names if (directory / name).is_file()), None)
         if sibling is not None:
-            lto += ['-fuse-ld=' + str(sibling)]
+            # MinGW checks the flavor literally before accepting bitcode.
+            # An absolute -fuse-ld path selects lld but disables that support;
+            # keep the flavor and executable location as separate arguments.
+            lto += ['-fuse-ld=lld', '--ld-path=' + str(sibling)] if windows else ['-fuse-ld=' + str(sibling)]
         elif any(shutil.which(name) for name in names):
             lto += ['-fuse-ld=lld']
     return lto

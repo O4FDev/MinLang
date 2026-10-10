@@ -12,6 +12,7 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+from clang_helpers import windows_host
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -154,9 +155,35 @@ Path(os.environ['TEST_MAKE_LOG']).write_text(json.dumps({name: os.environ.get(na
             with self.subTest(system=system), patch.object(driver.platform,'system',return_value=system), \
                  patch.object(driver.shutil,'which',side_effect=lambda name: str(self.clang) if name=='clang' else None):
                 self.assertEqual(driver.lto_flags('clang', []),
-                    ['-flto=thin', '-fuse-ld=' + str(linker.resolve())])
+                    ['-flto=thin', '-fuse-ld=lld', '--ld-path=' + str(linker.resolve())])
                 self.assertEqual(driver.lto_flags('clang', ['-fuse-ld=/chosen/linker']), ['-flto=thin'])
                 self.assertEqual(driver.lto_flags('clang', ['--ld-path=/chosen/linker']), ['-flto=thin'])
+
+    @unittest.skipUnless(windows_host(), 'requires native Windows Clang')
+    def test_windows_release_links_real_bitcode_with_discovered_linker(self):
+        spec = importlib.util.spec_from_file_location('driver', ROOT / 'tools/clang-driver.py')
+        driver = importlib.util.module_from_spec(spec); spec.loader.exec_module(driver)
+        clang = os.environ.get('MINYAR_TEST_CLANG', 'clang')
+        source = self.project / 'real-release.c'
+        source.write_text('int main(void) { return 0; }\n')
+        executable = self.project / 'real-release.exe'
+        result = subprocess.run([clang, *driver.lto_flags(clang, []), str(source), '-o', str(executable)],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(executable.is_file())
+
+    def test_native_openssl_config_paths_convert_msys_files_and_quote_syntax(self):
+        spec = importlib.util.spec_from_file_location('tls_local', ROOT / 'tests/tls-local.py')
+        tls = importlib.util.module_from_spec(spec); spec.loader.exec_module(tls)
+        with patch.object(tls,'windows_host',return_value=True), patch.object(tls.os,'name','posix'), \
+             patch.object(tls.shutil,'which',return_value='/usr/bin/cygpath'), \
+             patch.object(tls.subprocess,'check_output',return_value='D:/MSYS temp/fixture$1/root.key\n') as convert:
+            self.assertEqual(tls.openssl_config_path(Path('/tmp/fixture/root.key')),
+                             '"D:/MSYS temp/fixture\\$1/root.key"')
+            convert.assert_called_once_with(['/usr/bin/cygpath','-m','/tmp/fixture/root.key'],text=True,timeout=10)
+        with patch.object(tls,'windows_host',return_value=False):
+            self.assertEqual(tls.openssl_config_path(Path('/tmp/quoted"fixture/root.key')),
+                             '"/tmp/quoted\\"fixture/root.key"')
 
     def test_openssl_subject_exclusion_is_visible_to_msys_spawn_and_restores_parent(self):
         spec = importlib.util.spec_from_file_location('tls_local', ROOT / 'tests/tls-local.py')
