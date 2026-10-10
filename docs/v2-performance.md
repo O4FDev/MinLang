@@ -355,6 +355,9 @@ merged into v2 but not pushed; the suite run on it was stopped.
   before and after tonight's changes. AppKit set-up dominates, and the
   history parse is about 3% of it. The driver's `startup` scenario measures
   this.
+- **Typing in Atacama.** 300 keystrokes, 20 ms apart: 2.8G instructions and
+  0.61 s of CPU, about 2 ms per key. The main thread waits in `nextEvent` 95%
+  of the time, and the rest is AppKit's key handling, not the app's re-render.
 - **Atacama build after a one-line change.** The front end takes about 0.02 s,
   so an incremental front end would not help. What is left after change 8 is
   clang: about 0.4 s for a default build, and about 1 s more for `--release`
