@@ -150,17 +150,23 @@ was `record_get`, `rc_borrow`, the arithmetic, `bytes_set` and `rc_step`.
 
 **Fix.** When the target is `record.field[...]` and the rest of the statement
 (the remaining target path and the value) contains no call, no code can run
-between reading the field and storing into it, so the borrow is omitted. The
-tokenizer emits no line ends inside round and square brackets, but a record
-literal's braces may span lines, so the scan ends the statement at a line end
-only outside braces.
+between reading the field and storing into it, so the borrow is omitted. Line
+ends (kind-6 tokens) can appear inside a statement's brackets: across the lines
+of a record literal's braces, and as `;` separators anywhere. So the scan ends
+the statement at a line end only outside all brackets, or at a closing bracket
+below its start.
 
-The first version missed that case. The review workflow found it: in
-`board.cells[0] = Cell {⏎ first: 1⏎ value: replace(board) }`, the line end after
-`first: 1` stopped the scan before the call. The borrow was dropped, and ASan
-reported a heap-use-after-free when `replace` swapped the List. The scan now
-tracks braces, and `tests/codegen/owned-join.min` (`storeLiteral`) requires
-the borrow there; that check fails on the earlier compiler.
+The first version stopped at any line end, and the review workflow found two
+programs where that was unsound:
+- `board.cells[0] = Cell {⏎ first: 1⏎ value: replace(board) }`: the line end
+  after `first: 1` stopped the scan before the call.
+- `grid.rows[0] = [; resetGrid(grid)]`: the `;` did the same.
+
+In both, the borrow was dropped, and ASan reported a heap-use-after-free when
+the call replaced the List. `tests/codegen/owned-join.min` (`storeLiteral`,
+`storeSeparated`) now requires the borrow in both; these checks fail on the
+earlier compilers. The append rewrite in change 5 also now checks token kinds,
+so a string literal `"+"` cannot pass for the operator.
 
 | Workload | Before | After | Change |
 | --- | ---: | ---: | ---: |
