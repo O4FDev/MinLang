@@ -1,0 +1,55 @@
+name: macOS PMU measurement probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: ${{ matrix.runner }} counters
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build ordinary fixed-point compiler
+        run: make LIMITED= SANITIZER_LIMITED= build/minyarc build/compiler-stage3.ll
+      - name: Probe time and Instruments CPU counters
+        run: |
+          mkdir -p build/pmu-evidence
+          uname -a > build/pmu-evidence/platform.txt
+          clang --version > build/pmu-evidence/compiler.txt
+          sysctl -n machdep.cpu.brand_string > build/pmu-evidence/cpu.txt
+          /usr/bin/time -l build/minyarc compiler/compiler.min build/pmu-evidence/self.ll 2> build/pmu-evidence/time.txt
+          cmp build/compiler-stage3.ll build/pmu-evidence/self.ll
+          xcrun xctrace list templates > build/pmu-evidence/templates.txt 2>&1
+          python3 - <<'PY'
+          import pathlib, subprocess
+          root = pathlib.Path.cwd()
+          command = ['xcrun', 'xctrace', 'record', '--template', 'CPU Counters',
+                     '--time-limit', '5s', '--output', str(root / 'build/pmu-evidence/counters.trace'),
+                     '--launch', '--', str(root / 'build/minyarc'),
+                     str(root / 'compiler/compiler.min'), str(root / 'build/pmu-evidence/instruments.ll')]
+          try:
+              result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+              text = f'status={result.returncode}\n{result.stdout}{result.stderr}'
+          except subprocess.TimeoutExpired:
+              text = 'CPU Counters recording exceeded the 30-second probe limit\n'
+          (root / 'build/pmu-evidence/instruments.txt').write_text(text)
+          print(text)
+          PY
+          cat build/pmu-evidence/time.txt
+      - name: Upload measurement availability evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pmu-${{ matrix.runner }}
+          if-no-files-found: error
+          path: build/pmu-evidence

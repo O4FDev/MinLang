@@ -1,12 +1,12 @@
 # Selective managed graph support (isolated candidate)
 
 This candidate accepts formerly rejected cyclic List/record mutation. It is
-kept on `feat/v2-managed-graphs` until correctness, compatibility and the
+kept on `feat/v2-runtime-memory` until correctness, compatibility and the
 unchanged resource gates are established. Typed closures and callback dispatch
 are implemented through a generated optional frontend. Process-isolated
-workers with copied byte messages work on macOS/Linux; the Windows worker
-backend reports a recoverable unavailable result. Shared managed threads are
-not implemented.
+workers use copied byte messages on macOS/Linux and Windows. Windows uses
+overlapped named pipes; actual Windows CI validation is required before that
+backend is ready. Shared managed threads are not implemented.
 
 The ordinary compiler only recognizes feature syntax and requests the optional
 frontend; its former two cycle-prevention sites also request that frontend.
@@ -137,8 +137,16 @@ state. Concurrent managed programs are usable without changing ordinary RC.
 Process startup and RSS are higher than thread costs; this is not a managed
 thread implementation. A thread backend still requires execution-domain state
 migration and isolated literal/lazy-index handling, rather than atomic counts
-alone. The Windows backend requires bounded overlapped named pipes before it
-can provide equivalent behavior.
+alone. The Windows backend uses stable per-worker `OVERLAPPED` state, bounded
+copied frame queues, UTF-16 `CreateProcessW` arguments, an explicit inherited
+handle list, and kill-on-close jobs. Registry growth never moves pending I/O
+state or buffers. Parent waits block on I/O completion events; child pipe ends
+remain synchronous. Startup creates the process suspended, assigns its private
+job, then resumes it. Close cancels pending operations before releasing their
+buffers, terminates the worker, and waits for process cleanup. These choices
+follow Microsoft's [overlapped I/O](https://learn.microsoft.com/en-us/windows/win32/ipc/synchronous-and-overlapped-pipe-i-o)
+and [restricted handle inheritance](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute)
+contracts. Arguments use the documented [quote and backslash rules](https://learn.microsoft.com/en-us/cpp/c-language/parsing-c-command-line-arguments).
 
 Short TDD checks cover escaping scalar/reference captures, hidden closure
 cycles, indirect reference arguments/results, nested callbacks/recursion,
