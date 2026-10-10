@@ -1,0 +1,89 @@
+// Persistent native Windows notifications. Register during installation, then
+// initialize the same app identity on every launch, including COM cold relaunch.
+// OS callbacks retain native data only; consume actions on the owning main thread.
+use "errors" as errors
+
+public record Action { private id: Text; private label: Text }
+public record Activation { private notificationToken: Text; private action: Text }
+public record ActivationResult { private value: Activation; private error: errors.Error }
+public record TokenResult { private value: Text; private error: errors.Error }
+public function action(id: Text, label: Text): Action { return Action { id: id; label: label } }
+function nativeError(raw: Bytes): errors.Error {
+    if raw.length < 16 { fail("invalid Windows notification native result") }
+    if raw.getUInt32(0) == 0 { return errors.none() }
+    return errors.make(raw.getUInt32(0),raw.getInt32(4),"Windows notification operation failed")
+}
+function scalar(raw: Bytes): errors.IntegerResult {
+    let error = nativeError(raw)
+    if errors.isError(error) { return errors.integerFailure(error) }
+    if raw.length != 16 { fail("invalid Windows notification scalar result") }
+    return errors.integer(raw.getInt64(8))
+}
+// Registration modifies owned per-user COM and Start Menu entries. A different
+// executable owning this identity is a recoverable permission failure.
+public function register(appId: Text, displayName: Text): errors.IntegerResult { return scalar(registerRaw(appId,displayName)) }
+public function initialize(appId: Text): errors.IntegerResult { return scalar(initializeRaw(appId)) }
+// Stops in-process callbacks but preserves persistent notifications and registration.
+public function stop(): errors.IntegerResult { return scalar(stopRaw()) }
+public function unregister(): errors.IntegerResult { return scalar(unregisterRaw()) }
+function append16(data: Bytes, n: Integer) { data.add(n & 255); data.add((n >> 8) & 255) }
+public function notify(title: Text, body: Text, actions: List<Action>): errors.IntegerResult {
+    if actions.length > 5 { return errors.integerFailure(errors.make(errors.invalidDataCode(),0,"at most five notification actions are allowed")) }
+    let packed = Bytes()
+    packed.add(actions.length)
+    for action in actions {
+        let id = Bytes(action.id)
+        let label = Bytes(action.label)
+        if id.length > 64 || label.length > 512 { return errors.integerFailure(errors.make(errors.invalidDataCode(),0,"notification action exceeds its bounds")) }
+        append16(packed,id.length); packed.addBytes(id)
+        append16(packed,label.length); packed.addBytes(label)
+    }
+    return scalar(showRaw(title,body,packed))
+}
+public function status(id: Integer): errors.IntegerResult { return scalar(statusRaw(id)) }
+// Cancels the visible/persisted notification and discards queued clicks. To keep
+// it in Action Center across process exit, leave it open until explicitly cancelled.
+public function close(id: Integer): errors.IntegerResult { return scalar(closeRaw(id)) }
+// Cancellation by persisted token also works after a cold relaunch. Missing
+// tokens are harmless; cancellation is restricted to the initialized app.
+public function cancelToken(token: Text): errors.IntegerResult { return scalar(cancelTokenRaw(token)) }
+public function token(id: Integer): TokenResult {
+    let raw = tokenRaw(id)
+    let error = nativeError(raw)
+    if errors.isError(error) { return TokenResult { value: ""; error: error } }
+    if raw.length != 48 || raw.getUInt32(8) != 32 { fail("invalid notification token result") }
+    return TokenResult { value: Text(raw.slice(16,48)); error: error }
+}
+public function tokenOk(result: TokenResult): Boolean { return !errors.isError(result.error) }
+public function tokenError(result: TokenResult): errors.Error { return result.error }
+public function tokenValue(result: TokenResult): Text {
+    if !tokenOk(result) { fail("cannot extract a failed notification token result") }
+    return result.value
+}
+// Would-block means there is no click queued. Every successful action passed
+// the persisted allowlist and is consumed once. Tokens survive COM cold relaunch.
+public function nextAction(): ActivationResult {
+    let raw = nextActionRaw()
+    let error = nativeError(raw)
+    if errors.isError(error) { return ActivationResult { value: Activation { notificationToken: ""; action: "" }; error: error } }
+    if raw.length < 50 || raw.length > 113 || raw.getUInt32(8) != raw.length - 16 || raw[48] != 58 { fail("invalid notification action result") }
+    return ActivationResult { value: Activation { notificationToken: Text(raw.slice(16,48)); action: Text(raw.slice(49,raw.length)) }; error: error }
+}
+public function activationOk(result: ActivationResult): Boolean { return !errors.isError(result.error) }
+public function activationError(result: ActivationResult): errors.Error { return result.error }
+public function activationValue(result: ActivationResult): Activation {
+    if !activationOk(result) { fail("cannot extract a failed notification action result") }
+    return result.value
+}
+public function notificationToken(value: Activation): Text { return value.notificationToken }
+public function actionId(value: Activation): Text { return value.action }
+function registerRaw(appId: Text, displayName: Text): Bytes { native "winnotify" }
+function initializeRaw(appId: Text): Bytes { native "winnotify" }
+function stopRaw(): Bytes { native "winnotify" }
+function unregisterRaw(): Bytes { native "winnotify" }
+function showRaw(title: Text, body: Text, actions: Bytes): Bytes { native "winnotify" }
+function statusRaw(id: Integer): Bytes { native "winnotify" }
+function closeRaw(id: Integer): Bytes { native "winnotify" }
+function cancelTokenRaw(token: Text): Bytes { native "winnotify" }
+function tokenRaw(id: Integer): Bytes { native "winnotify" }
+function nextActionRaw(): Bytes { native "winnotify" }

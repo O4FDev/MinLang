@@ -28,13 +28,9 @@ static MinyarBytes *result(unsigned size, uint32_t error, int32_t native, int64_
 static DWORD owner;
 static INetworkCostManager *cost_manager;
 static bool com_owned, cost_initialized;
-static HWND notification_window;
-static UINT next_notification = 1;
-typedef struct Notification {
-    UINT id;
-    struct Notification *next;
-} Notification;
-static Notification *notifications;
+extern MinyarBytes *minyar_winnotify_showRaw(const MinyarText *, const MinyarText *,
+                                             const MinyarBytes *);
+extern MinyarBytes *minyar_winnotify_statusRaw(long long), *minyar_winnotify_closeRaw(long long);
 static void thread(void) {
     DWORD current = GetCurrentThreadId();
     if (!owner)
@@ -47,22 +43,6 @@ static uint32_t kind(DWORD status) {
 }
 static MinyarBytes *scalar(DWORD status, int64_t value) {
     return result(16, status ? kind(status) : 0, (int32_t)status, value);
-}
-static wchar_t *wide(const MinyarText *text, unsigned maximum) {
-    if (text->byte_length < 0 || text->byte_length > INT_MAX ||
-        memchr(text->bytes, 0, (size_t)text->byte_length))
-        return NULL;
-    int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (const char *)text->bytes,
-                                     (int)text->byte_length, NULL, 0);
-    if ((!length && text->byte_length) || (unsigned)length >= maximum)
-        return NULL;
-    wchar_t *out = calloc((size_t)length + 1, sizeof(*out));
-    if (!out)
-        minyar_native_stop("desktop allocation failed.");
-    if (length)
-        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (const char *)text->bytes,
-                            (int)text->byte_length, out, length);
-    return out;
 }
 MinyarBytes *minyar_desktop_powerRaw(void) {
     thread();
@@ -273,109 +253,19 @@ MinyarBytes *minyar_desktop_setLaunchAtLoginRaw(bool enabled) {
     DWORD status = login(true, enabled, &value);
     return scalar(status, value);
 }
-static LRESULT CALLBACK notification_proc(HWND handle, UINT message, WPARAM wp, LPARAM lp) {
-    return DefWindowProcW(handle, message, wp, lp);
-}
 MinyarBytes *minyar_desktop_notifyRaw(const MinyarText *title, const MinyarText *body) {
     thread();
-    wchar_t *t = wide(title, 64), *b = wide(body, 256);
-    if (!t || !b) {
-        free(t);
-        free(b);
-        return result(16, 6, ERROR_INVALID_PARAMETER, 0);
-    }
-    if (!notification_window) {
-        WNDCLASSW wc = {0};
-        wc.lpfnWndProc = notification_proc;
-        wc.hInstance = GetModuleHandleW(NULL);
-        wc.lpszClassName = L"MinyarDesktopNotificationsV1";
-        if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-            DWORD status = GetLastError();
-            free(t);
-            free(b);
-            return scalar(status, 0);
-        }
-        notification_window = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE,
-                                              NULL, wc.hInstance, NULL);
-        if (!notification_window) {
-            DWORD status = GetLastError();
-            free(t);
-            free(b);
-            return scalar(status, 0);
-        }
-    }
-    if (!next_notification || next_notification > INT_MAX) {
-        free(t);
-        free(b);
-        return result(16, 9, ERROR_NO_SYSTEM_RESOURCES, 0);
-    }
-    UINT id = next_notification++;
-    NOTIFYICONDATAW data = {0};
-    data.cbSize = sizeof(data);
-    data.hWnd = notification_window;
-    data.uID = id;
-    data.uFlags = NIF_ICON | NIF_TIP;
-    data.hIcon = LoadIconW(NULL, MAKEINTRESOURCEW(32512));
-    wcscpy(data.szTip, L"Minyar");
-    if (!Shell_NotifyIconW(NIM_ADD, &data)) {
-        free(t);
-        free(b);
-        return result(16, 9, ERROR_NOT_READY, 0);
-    }
-    data.uVersion = NOTIFYICON_VERSION;
-    if (!Shell_NotifyIconW(NIM_SETVERSION, &data)) {
-        Shell_NotifyIconW(NIM_DELETE, &data);
-        free(t);
-        free(b);
-        return result(16, 9, ERROR_NOT_SUPPORTED, 0);
-    }
-    data.uFlags = NIF_INFO;
-    wcscpy(data.szInfoTitle, t);
-    wcscpy(data.szInfo, b);
-    data.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND | NIIF_RESPECT_QUIET_TIME;
-    free(t);
-    free(b);
-    if (!Shell_NotifyIconW(NIM_MODIFY, &data)) {
-        Shell_NotifyIconW(NIM_DELETE, &data);
-        return result(16, 9, ERROR_NOT_READY, 0);
-    }
-    Notification *notification = malloc(sizeof(*notification));
-    if (!notification) {
-        Shell_NotifyIconW(NIM_DELETE, &data);
-        minyar_native_stop("desktop allocation failed.");
-    }
-    notification->id = id;
-    notification->next = notifications;
-    notifications = notification;
-    return scalar(0, id);
+    // Borrowed empty native bytes: the notification backend copies all inputs.
+    MinyarBytes actions = {0};
+    return minyar_winnotify_showRaw(title, body, &actions);
 }
 MinyarBytes *minyar_desktop_notificationStatusRaw(long long id) {
     thread();
-    for (Notification *n = notifications; n; n = n->next)
-        if (id == n->id)
-            return scalar(0, 1);
-    return result(16, 4, ERROR_INVALID_HANDLE, 0);
+    return minyar_winnotify_statusRaw(id);
 }
 MinyarBytes *minyar_desktop_notificationCloseRaw(long long id) {
     thread();
-    Notification **link = &notifications;
-    while (*link && id != (*link)->id)
-        link = &(*link)->next;
-    if (!*link)
-        return result(16, 4, ERROR_INVALID_HANDLE, 0);
-    Notification *n = *link;
-    NOTIFYICONDATAW data = {0};
-    data.cbSize = sizeof(data);
-    data.hWnd = notification_window;
-    data.uID = n->id;
-    Shell_NotifyIconW(NIM_DELETE, &data);
-    *link = n->next;
-    free(n);
-    if (!notifications && notification_window) {
-        DestroyWindow(notification_window);
-        notification_window = NULL;
-    }
-    return scalar(0, 0);
+    return minyar_winnotify_closeRaw(id);
 }
 #ifdef MINYAR_DESKTOP_TEST
 void minyar_desktop_testForeignLogin(void) {
