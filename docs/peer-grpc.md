@@ -8,20 +8,25 @@ mTLS and control-plane identity authorization before supplying plaintext
 bytes. The device connection continues to use [HPW1](peer-wire.md).
 
 This mapping uses standard HTTP/2, HPACK, uncompressed gRPC message envelopes,
-protobuf and gRPC status trailers. Its private service schema is
-[peer.proto](../tests/interop/peergrpc/peer.proto). This document does not claim
-interoperability with an existing Tolum gateway service whose schema has not
-been supplied; that service must use this explicitly agreed mapping.
+protobuf and gRPC status trailers. The exact unqualified service schema is
+[peer.proto](../tests/interop/peergrpc/peer.proto), transcribed from the local
+[HEARTH_PRODUCT_SPEC.md](../../Apify-alt/HEARTH_PRODUCT_SPEC.md:695), section
+10.3.2, lines 695–727. That normative product definition supersedes the older
+server-stream sketch and deadline field in HEARTH_PEER_SUPPLY.md lines 668–695.
+No existing generated `.proto` was found in Apify-alt. No alias of the earlier
+prototype service route is enabled.
 
 ## Service and first messages
 
-The bidi method is `/hearth.peer.v1.PeerGateway/Dial`. A request's first
-protobuf message is `DialRequest.open` with exact compact JWT bytes,
-`exit_id`, `conn_id`, and `deadline` in Unix seconds. Subsequent requests carry
-`DialRequest.data` opaque bytes. The first successful response is
-`DialResponse.status`, followed by `DialResponse.data`. Enum values are
-`OK=1`, `GRANT_INVALID=2`, `EXIT_OFFLINE=3`, `POLICY_DENIED=4`;
-`UNSPECIFIED=0` grants no authority. A rejection status ends the response with
+The bidi method is `/PeerEdgeDial/OpenExitStream`. Both directions carry
+`ExitByteFrame` with oneof `body`: `open=1`, `status=2`, `data=3`.
+The first client message is `OpenExitStreamRequest` containing exact
+`dial_grant` bytes, `exit_id` and `conn_id`; it has no deadline field.
+The first server response is the nested `ExitStatus` message with enum
+`OK=0`, `GRANT_INVALID=1`, `EXIT_OFFLINE=2`, `POLICY_DENIED=3`,
+`CONCURRENCY_FULL=4`, and optional `detail` bounded to 1024 UTF-8 bytes.
+Client DATA is rejected before status OK, including coalesced OPEN+DATA input.
+Server DATA requires that same admitted state. A rejection status ends with
 `grpc-status: 0`: the RPC carried a typed admission result successfully.
 Protocol failures instead use a gRPC error status, generally INTERNAL (13).
 Deadline expiry uses DEADLINE_EXCEEDED (4).
@@ -38,8 +43,12 @@ last-field routing changes; the private schema has no extension fields.
 
 Parsing an OPEN supplies no authority. The caller calls `peerauth.inspect`
 with the actual certificate/registry exit binding, exact JWT, immutable
-request IDs, current Unix seconds and `openDeadlineSeconds`. Only the private
-verified grant supplies the destination. It binds the selected device mux,
+request IDs, current Unix seconds and a viable establishment deadline within
+the signed expiry. `openDeadlineSeconds` is a ceiling of the transport bound,
+not a signed claim and must not be supplied as the auth verifier's authority.
+The caller caps the effective millisecond establishment deadline at the
+verified grant expiry times 1000 without extending either frozen timer.
+Only the private verified grant supplies the destination. It binds the device mux,
 then forwards `peerwire.makeStart` so the device independently verifies the
 same original JWT. No grant signing, target dialing, Redis state, registry
 network lookup or public service listener is performed by these modules.
@@ -55,7 +64,7 @@ let accepted = grpc.receive(server, plaintextBytes)
 let opened = grpc.requests(server, unixMilliseconds)
 if grpc.openOk(opened) {
     let id = grpc.openStreamID(opened)
-    // Verify openGrantBytes/openExitID/openConnID/openDeadlineSeconds.
+    // Verify openGrantBytes/openExitID/openConnID with peerauth.
     // Retain openDeadlineMilliseconds/openMonotonicDeadlineMillis unchanged.
     grpc.sendStatus(server, id, "ok")
 }
@@ -72,7 +81,8 @@ It accepts new HTTP/2 headers, drains bounded message fragments, and returns
 each valid OPEN once. A malformed RPC is terminated independently; the
 connection can continue with other streams. `read(server,id,positiveMaximum)`
 returns opaque request data, would-block, typed error or EOF. `write` queues
-one data message atomically. `sendStatus` must precede application data writes
+one data message atomically. `sendStatusDetail` adds an optional bounded detail.
+`sendStatus` must precede application data writes
 and reads; known rejection statuses close the response. `closeStream(server,
 id,grpcStatus,message)` sends final status trailers after previously queued
 responses, with standard percent-encoding of `grpc-message`.
@@ -86,10 +96,13 @@ after EOF discard the connection and its pending RPC contexts. Inspect
 ## Clocks and deadlines
 
 `requests`, `tick` and `nextDeadlineMillis` use **Unix wall-clock
-milliseconds**. `openDeadlineSeconds` preserves the original request deadline
-for the auth verifier. The effective millisecond deadline is the earlier of
-that absolute deadline and the request header's `grpc-timeout`, measured from
-header acceptance. The standard H/M/S/m/u/n timeout units and at most eight
+milliseconds**. `grpc-timeout` freezes the exact effective wall and monotonic
+deadlines at header acceptance; `openDeadlineSeconds` returns the ceiling of
+that wall deadline for display, not authentication. Without `grpc-timeout`,
+the adapter imposes a ten-second establishment deadline, disabled after
+`sendStatus("ok")`; an explicit timeout remains the whole RPC deadline.
+This local default is an implementation bound, not a field in Tolum's schema.
+The standard H/M/S/m/u/n timeout units and at most eight
 digits are supported. Submillisecond durations round up to the available
 millisecond timer precision; 500m remains exactly 500 milliseconds.
 
@@ -169,7 +182,7 @@ and apply only to isolated test venvs. Normal and ASan/UBSan gates are
 execution was on the existing authorised remote lab.
 
 The campaign covers every prefix of a request and maximum-size HTTP/2 DATA
-frame, 315 protobuf message prefixes, all 256 Huffman octet symbols and the
+frame, every OPEN and DATA protobuf message prefix, all 256 Huffman octet symbols and the
 fixed RFC 7541 C.4.1 vector, dynamic references/resizing, continuation ordering,
 24 framing/compression errors, ten header controls, 250 seeded HTTP/2
 mutations and 150 protobuf mutations. Exact queue limits and a zero-window
