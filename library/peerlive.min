@@ -1,0 +1,145 @@
+// Hearth's edge-owned live capacity plane. Peer metadata cannot set registry
+// eligibility, connection epochs or edge identity. Redis updates are fenced
+// against retired connections and expire after exactly three heartbeats.
+use "json" as json
+use "errors" as errors
+use "resp2" as resp
+
+public record Health { private document: json.Value; private error: errors.Error }
+function bad(message: Text): Health { return Health { document: json.parse("null"); error: errors.make(errors.invalidDataCode(),0,message) } }
+public function ok(value: Health): Boolean { return !errors.isError(value.error) }
+public function error(value: Health): errors.Error { return value.error }
+function natural(text: Text, maximum: Integer): Integer {
+    if text.length < 1 || text.length > 16 || (text.length > 1 && text[0] == '0') { return -1 }
+    let value = 0
+    for c in text {
+        if c < '0' || c > '9' { return -1 }
+        let digit = Integer(c) - 48
+        if value > (maximum - digit) / 10 { return -1 }
+        value = value * 10 + digit
+    }
+    return value
+}
+function number(value: json.Value, name: Text, maximum: Integer): Integer {
+    let member = json.member(value,name)
+    if member.kind != json.NUMBER { return -1 }
+    return natural(member.text,maximum)
+}
+public function identifier(text: Text): Boolean {
+    if text.length < 1 || text.length > 128 { return false }
+    for c in text {
+        if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.') { return false }
+    }
+    return true
+}
+function hex(c: Character): Boolean { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') }
+function digest(text: Text): Boolean {
+    if text.length != 64 { return false }
+    for c in text { if !hex(c) { return false } }
+    return true
+}
+function ipv4(text: Text): Boolean {
+    let start = 0; let components = 0
+    for index in 0..text.length {
+        if text[index] == '.' {
+            if natural(text.slice(start,index),255) < 0 { return false }
+            start = index + 1; components += 1
+        }
+    }
+    return components == 3 && natural(text.slice(start,text.length),255) >= 0
+}
+function ipv6(text: Text): Boolean {
+    if text.length < 2 || text.length > 45 { return false }
+    let at = 0; let groups = 0; let compressed = false
+    if text[0] == ':' { if text[1] != ':' { return false }; compressed = true; at = 2 }
+    while at < text.length {
+        let start = at
+        while at < text.length && hex(text[at]) { at += 1 }
+        if at < text.length && text[at] == '.' {
+            if !ipv4(text.slice(start,text.length)) { return false }
+            groups += 2; at = text.length; break
+        }
+        if at - start < 1 || at - start > 4 { return false }
+        groups += 1
+        if at == text.length { break }
+        if text[at] != ':' { return false }
+        at += 1
+        if at < text.length && text[at] == ':' { if compressed { return false }; compressed = true; at += 1 }
+        else if at == text.length { return false }
+    }
+    if compressed { return groups < 8 }
+    return groups == 8
+}
+function printable(text: Text): Boolean {
+    if text.length > 128 { return false }
+    for c in text { if Integer(c) < 32 || Integer(c) > 126 { return false } }
+    return true
+}
+public function heartbeat(data: Bytes): Health {
+    let value = json.parseUniqueBytes(data,16384)
+    if value.kind != json.OBJECT { return bad("invalid heartbeat JSON") }
+    for key in value.keys {
+        if key != "in_flight" && key != "max_concurrent" && key != "paused" && key != "policy_hash" && key != "public_ip" && key != "asn" && key != "country" && key != "sticky" { return bad("unknown heartbeat member") }
+    }
+    let maximum = number(value,"max_concurrent",1000000)
+    let count = number(value,"in_flight",1000000)
+    let address = json.string(value,"public_ip"); let country = json.string(value,"country")
+    if maximum < 1 || count < 0 || json.member(value,"paused").kind != json.BOOLEAN ||
+       !digest(json.string(value,"policy_hash")) || (!ipv4(address) && !ipv6(address)) ||
+       number(value,"asn",4294967295) < 0 || country.length != 2 { return bad("invalid heartbeat fields") }
+    for c in country { if c < 'A' || c > 'Z' { return bad("invalid heartbeat country") } }
+    let sticky = json.member(value,"sticky")
+    if sticky.kind != json.NULL {
+        if sticky.kind != json.OBJECT || sticky.keys.length > 16 { return bad("invalid sticky inputs") }
+        for index in 0..sticky.keys.length {
+            let item = sticky.items[index]
+            if !identifier(sticky.keys[index]) { return bad("invalid sticky name") }
+            if item.kind == json.STRING { if !printable(item.text) { return bad("invalid sticky text") } }
+            else if item.kind == json.NUMBER { if item.number != item.number || item.number < -1000000000000.0 || item.number > 1000000000000.0 { return bad("invalid sticky number") } }
+            else if item.kind != json.BOOLEAN && item.kind != json.NULL { return bad("invalid sticky value") }
+        }
+    }
+    return Health { document: value; error: errors.none() }
+}
+public function reportedInFlight(health: Health): Integer { if !ok(health) { fail("failed heartbeat") }; return number(health.document,"in_flight",1000000) }
+public function maximum(health: Health): Integer { if !ok(health) { fail("failed heartbeat") }; return number(health.document,"max_concurrent",1000000) }
+public function paused(health: Health): Boolean { if !ok(health) { fail("failed heartbeat") }; return json.member(health.document,"paused").truth }
+public function payload(health: Health, exit: Text, edge: Text, epoch: Text, now: Integer, admitted: Integer, registryPaused: Boolean, quarantined: Boolean, healthFactor: Float): errors.BytesResult {
+    if !ok(health) { return errors.bytesFailure(health.error) }
+    if !identifier(exit) || !identifier(edge) || !digest(epoch) || now < 0 || now > 9007199254740991 || admitted < 0 || admitted > 1000000 || healthFactor != healthFactor || healthFactor < 0.0 || healthFactor > 1.0 {
+        return errors.bytesFailure(errors.make(errors.invalidDataCode(),0,"invalid trusted live-state fields"))
+    }
+    let document = health.document; let count = max(admitted,reportedInFlight(health)); let limit = maximum(health)
+    let inactive = paused(health) || registryPaused || quarantined || count >= limit
+    let weight = 0.0
+    if !inactive { weight = (1.0 - Float(count) / Float(limit)) * healthFactor }
+    let sticky = json.member(document,"sticky"); let stickyText = "{}"
+    if sticky.kind == json.OBJECT { stickyText = json.pretty(sticky,"") }
+    let output = "{\"exit_id\":" + json.quote(exit) + ",\"edge_instance\":" + json.quote(edge) + ",\"_epoch\":" + json.quote(epoch) +
+        ",\"capacity_weight\":" + Text(weight) + ",\"in_flight\":" + Text(count) + ",\"max_concurrent\":" + Text(limit) +
+        ",\"paused\":" + Text(paused(health) || registryPaused) + ",\"policy_hash\":" + json.quote(json.string(document,"policy_hash")) +
+        ",\"public_ip\":" + json.quote(json.string(document,"public_ip")) + ",\"asn\":" + json.member(document,"asn").text +
+        ",\"country\":" + json.quote(json.string(document,"country")) + ",\"sticky\":" + stickyText + ",\"ts\":" + Text(now) + "}"
+    return errors.bytes(Bytes(output))
+}
+function commandFailure(): errors.BytesResult { return errors.bytesFailure(errors.make(errors.invalidDataCode(),0,"invalid fenced live command")) }
+function validState(exit: Text, epoch: Text, state: Bytes): Boolean {
+    let value = json.parseUniqueBytes(state,16384)
+    return identifier(exit) && digest(epoch) && value.kind == json.OBJECT && json.string(value,"exit_id") == exit && json.string(value,"_epoch") == epoch
+}
+public function bindCommand(exit: Text, epoch: Text, state: Bytes): errors.BytesResult {
+    if !validState(exit,epoch,state) { return commandFailure() }
+    return resp.command([Bytes("SET"),Bytes("peer:live:{" + exit + "}"),state,Bytes("EX"),Bytes("45")])
+}
+// A missing key is not resurrected by an old heartbeat. The application can
+// bind the current live owner after Redis reconnect, with a fresh epoch.
+public function refreshCommand(exit: Text, epoch: Text, state: Bytes): errors.BytesResult {
+    if !validState(exit,epoch,state) { return commandFailure() }
+    let script = "local raw=redis.call('GET',KEYS[1]); if not raw then return 0 end; local ok,v=pcall(cjson.decode,raw); if not ok or type(v)~='table' or v._epoch~=ARGV[1] then return 0 end; local good,n=pcall(cjson.decode,ARGV[2]); if not good or type(n)~='table' or n._epoch~=ARGV[1] or n.exit_id~=ARGV[3] then return 0 end; redis.call('SET',KEYS[1],ARGV[2],'EX',45); return 1"
+    return resp.command([Bytes("EVAL"),Bytes(script),Bytes("1"),Bytes("peer:live:{" + exit + "}"),Bytes(epoch),state,Bytes(exit)])
+}
+public function dropCommand(exit: Text, epoch: Text): errors.BytesResult {
+    if !identifier(exit) || !digest(epoch) { return commandFailure() }
+    let script = "local raw=redis.call('GET',KEYS[1]); if not raw then return 0 end; local ok,v=pcall(cjson.decode,raw); if not ok or type(v)~='table' or v._epoch~=ARGV[1] then return 0 end; return redis.call('DEL',KEYS[1])"
+    return resp.command([Bytes("EVAL"),Bytes(script),Bytes("1"),Bytes("peer:live:{" + exit + "}"),Bytes(epoch)])
+}
