@@ -566,6 +566,17 @@ check-tls-sanitize: build/minyarc
 
 check check-portable: check-tls
 
+.PHONY: check-quic check-quic-sanitize
+check-quic: build/minyarc
+	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/quic-suite.py --artifacts build/quic-native-O0
+	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/quic-suite.py --optimization 2 --artifacts build/quic-native-O2
+
+check-quic-sanitize: build/minyarc
+	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/quic-suite.py --sanitize --artifacts build/quic-sanitize
+
+check: check-quic
+check-sanitize: check-quic-sanitize
+
 .PHONY: check-native-cache
 check-native-cache:
 	$(LIMITED) python3 tests/native-object-cache.py

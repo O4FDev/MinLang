@@ -245,7 +245,8 @@ static MinyarText *verify_chain(const MinyarText *host, const MinyarBytes *chain
         CFArrayAppendValue(trusted, certificate);
         CFRelease(certificate);
     }
-    CFStringRef server = server_peer ? CFStringCreateWithCString(NULL, name, kCFStringEncodingASCII) : NULL;
+    CFStringRef server =
+        server_peer ? CFStringCreateWithCString(NULL, name, kCFStringEncodingASCII) : NULL;
     SecPolicyRef policy = server_peer ? (server ? SecPolicyCreateSSL(true, server) : NULL)
                                       : SecPolicyCreateSSL(false, NULL);
     SecTrustRef trust = NULL;
@@ -817,8 +818,11 @@ static MinyarText *verify_chain(const MinyarText *host, const MinyarBytes *chain
                                                        X509_CHECK_FLAG_NEVER_CHECK_SUBJECT);
         X509_VERIFY_PARAM_set_flags(parameter, X509_V_FLAG_X509_STRICT | X509_V_FLAG_TRUSTED_FIRST);
         unsigned char ip[16];
-        valid = X509_VERIFY_PARAM_set_purpose(parameter, server_peer ? X509_PURPOSE_SSL_SERVER : X509_PURPOSE_SSL_CLIENT) == 1;
-        if (valid && server_peer && (inet_pton(AF_INET, name, ip) == 1 || inet_pton(AF_INET6, name, ip) == 1))
+        valid =
+            X509_VERIFY_PARAM_set_purpose(parameter, server_peer ? X509_PURPOSE_SSL_SERVER
+                                                                 : X509_PURPOSE_SSL_CLIENT) == 1;
+        if (valid && server_peer &&
+            (inet_pton(AF_INET, name, ip) == 1 || inet_pton(AF_INET6, name, ip) == 1))
             valid = X509_VERIFY_PARAM_set1_ip_asc(parameter, name) == 1;
         else if (valid && server_peer)
             valid = X509_VERIFY_PARAM_set1_host(parameter, name, 0) == 1;
@@ -921,7 +925,8 @@ MinyarBytes *minyar_tlsverify_sign(const MinyarBytes *private_key, long long sch
 }
 #endif
 
-MinyarText *minyar_tlsverify_chain(const MinyarText *host, const MinyarBytes *chain, const MinyarBytes *anchors) {
+MinyarText *minyar_tlsverify_chain(const MinyarText *host, const MinyarBytes *chain,
+                                   const MinyarBytes *anchors) {
     return verify_chain(host, chain, anchors, true);
 }
 MinyarText *minyar_tlsverify_clientChain(const MinyarBytes *chain, const MinyarBytes *anchors) {
@@ -936,11 +941,14 @@ long long minyar_tlsverify_currentTimeMilliseconds(void) {
     ULARGE_INTEGER ticks;
     ticks.LowPart = filetime.dwLowDateTime;
     ticks.HighPart = filetime.dwHighDateTime;
-    if (ticks.QuadPart < UINT64_C(116444736000000000)) return 0;
+    if (ticks.QuadPart < UINT64_C(116444736000000000))
+        return 0;
     return (long long)((ticks.QuadPart - UINT64_C(116444736000000000)) / 10000);
 #else
     struct timeval time;
-    if (gettimeofday(&time, NULL) != 0 || time.tv_sec < 0 || (uint64_t)time.tv_sec > INT64_MAX / 1000) return 0;
+    if (gettimeofday(&time, NULL) != 0 || time.tv_sec < 0 ||
+        (uint64_t)time.tv_sec > INT64_MAX / 1000)
+        return 0;
     return (long long)time.tv_sec * 1000 + time.tv_usec / 1000;
 #endif
 }
