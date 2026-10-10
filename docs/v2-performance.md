@@ -1046,6 +1046,15 @@ v2 and passes now.
   `alwaysinline` in the emitted IR took the world build from 15.65G to 14.87G
   (-5%) and an `edit` run from 42.29G to 40.47G. Change 12 and the frameless
   call trees described there address the larger cost around it.
+- **The graphics bridge inside ThinLTO.** Native bridges are compiled to
+  machine code, so `add_vertex` cannot be inlined into Minyarcraft's
+  meshing. Compiling `graphics.c` with `-flto=thin` (`MINYAR_NATIVE_FLAGS`)
+  changed nothing: its target attributes block inlining into Minyar IR, as
+  they did for the runtime. With those attributes stripped, as the runtime's
+  IR is, `minyar_graphics_addLitVertex` was inlined away and
+  `craft --benchmark build` went from 9.52-9.54G to 9.46-9.47G (-0.8%, 3
+  runs each). After change 18 that is too small for a second native build
+  path.
 - **The default memory profile for allocation-heavy code.** A sample of
   the JSON history benchmark (2,000 parses) puts about 35% of its time in
   `malloc`/`free` and about 26% in bounded reclamation (`rc_bounded_poll_work`,
