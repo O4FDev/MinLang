@@ -5,7 +5,7 @@ import struct
 import os
 import json
 from regressions import CompilerTestCase, ROOT, CLANG, LINK_FLAGS
-from clang_helpers import clang_command, native_path
+from clang_helpers import clang_command, native_path, windows_host
 from pathlib import Path
 
 WORKER_RUNTIME = Path(os.environ.get('MINYAR_WORKER_RUNTIME', ROOT / 'build/minyar-default-runtime.o'))
@@ -13,6 +13,21 @@ WORKER_RUNTIME = Path(os.environ.get('MINYAR_WORKER_RUNTIME', ROOT / 'build/miny
 
 class IsolatedWorkers(CompilerTestCase):
     compiler_arguments = ('--library', str(ROOT / 'library'))
+
+    @unittest.skipUnless(windows_host(), 'native Windows process and handle contract')
+    def test_native_windows_handle_allowlist_and_job_lifecycle(self):
+        executable = self.directory / 'windows-workers-native.exe'
+        linked = self.evidence.run(clang_command([CLANG, '-std=c11', '-O2', *LINK_FLAGS,
+            '-Wall', '-Wextra', '-Werror', '-municode',
+            str(ROOT / 'tests/windows-workers-native.c'), str(WORKER_RUNTIME),
+            '-ladvapi32', '-o', str(executable)]), capture_output=True, text=True,
+            timeout=30, phase='link-windows-worker-lifecycle')
+        self.assertEqual(linked.returncode, 0, linked.stderr)
+        run = self.evidence.run([str(executable)], capture_output=True, timeout=30,
+                               phase='execute-windows-worker-lifecycle')
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout, b'Windows worker handle isolation and process lifecycle verified\n')
+        self.assertEqual(run.stderr, b'')
 
     def worker_program(self, source, expected):
         result, llvm = self.compile(source)
