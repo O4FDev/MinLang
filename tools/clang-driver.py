@@ -291,6 +291,14 @@ def main():
     if len(sys.argv) == 2 and sys.argv[1] == 'doctor':
         doctor(clang)
         return
+    if len(sys.argv) == 2 and sys.argv[1] == 'runtime-format':
+        # Clang has already instrumented C emitted as LLVM. Feeding that IR
+        # through a second sanitizer pipeline instruments shadow accesses and
+        # can crash before main. Keep a native object under sanitizer flags;
+        # ordinary release builds retain their existing LLVM/LTO path.
+        options = flags('MINYAR_RUNTIME_FLAGS', '-O2 -Wno-override-module')
+        print('object' if any(option.startswith('-fsanitize=') for option in options) else 'llvm')
+        return
     if len(sys.argv) >= 4 and sys.argv[1] == 'compile':
         run([clang, *flags('MINYAR_RUNTIME_FLAGS', '-O2 -Wno-override-module'), *sys.argv[2:]])
         return
