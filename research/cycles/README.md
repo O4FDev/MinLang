@@ -278,6 +278,29 @@ objects precede exit cleanup and include deferred garbage; these counts are
 not claimed to be leaks or the minimum live set. Exact recovery is checked
 separately by the profile matrix's exit harness.
 
+### Port onto v2 (3bd7f74)
+
+The port moved the List/record barriers into `runtime/minyar_collections.h`
+and kept v2's deferred Text-root retirement. Medians of five
+`/usr/bin/time -l` runs on macOS arm64 under background priority, against a
+clean 3bd7f74 build. Both compilers emit identical LLVM for these non-cyclic
+inputs apart from the two new declarations and the `minyar_rc_cycle_policy`
+call in `main`.
+
+| Workload | v2 retired instructions | Port | Change | Peak RSS |
+| --- | ---: | ---: | ---: | --- |
+| Compiler arena, compiling v2's compiler.min | 87.87 M (min) | 88.07 M (min) | +0.2% | unchanged |
+| Compiler using system runtime | 361.5 M | 397.6 M | +10.0% | ~12.3 MiB both |
+| `tests/performance/runtime.min 2` (system heap, -O2) | 208.9 M | 213.0 M | +2.0% | 13.4 MiB both |
+| `acyclic.min`, `--release` | 193.3 M | 227.1 M | +17.5% | 1.9 → 2.3 MiB |
+| 100,000-record chain, `--release` | 168.3 M | 201.6 M | +19.8% | 12.1 → 21.3 MiB |
+| 100,000 `List<Point>.add`, `--release` | 46.6 M | 57.3 M | +23.1% | 7.3 → 11.9 MiB |
+
+A non-cyclic program whose mutation types could close a cycle (100,000
+`root.children.add(Tree {...})`) enables tracing and costs about 37,000
+instructions per add (3.74 G in total, linear in the add count). v2 rejected
+that program, so it has no baseline.
+
 ### Validation status
 
 Final command outcomes are recorded in [validation.md](validation.md). The
