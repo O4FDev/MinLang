@@ -1,0 +1,50 @@
+use "resp2" as resp
+
+function same(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+function canonical(value: resp.Value): Bytes {
+    let kind = resp.kind(value)
+    if kind == resp.SIMPLE || kind == resp.ERROR {
+        let out = Bytes("+"); if kind == resp.ERROR { out = Bytes("-") }
+        out.addBytes(resp.data(value)); out.addBytes(Bytes("\r\n")); return out
+    }
+    if kind == resp.INTEGER { return Bytes(":" + Text(resp.integer(value)) + "\r\n") }
+    if kind == resp.NULL_BULK { return Bytes("$-1\r\n") }
+    if kind == resp.NULL_ARRAY { return Bytes("*-1\r\n") }
+    if kind == resp.BULK {
+        let data = resp.data(value); let out = Bytes("$" + Text(data.length) + "\r\n")
+        out.addBytes(data); out.addBytes(Bytes("\r\n")); return out
+    }
+    let items = resp.items(value); let out = Bytes("*" + Text(items.length) + "\r\n")
+    for item in items { out.addBytes(canonical(item)) }
+    return out
+}
+function size(data: Bytes, at: Integer): Integer {
+    return data[at] * 16777216 + data[at + 1] * 65536 + data[at + 2] * 256 + data[at + 3]
+}
+let corpus = readBytesFile(argument(0)); let at = 0; let count = 0
+while at < corpus.length {
+    if corpus.length - at < 9 { fail("broken RESP corpus header") }
+    let mode = corpus[at]; let length = size(corpus,at+1); let expectedLength = size(corpus,at+5); at += 9
+    if length > corpus.length - at { fail("broken RESP corpus payload") }
+    let input = corpus.slice(at,at+length); at += length
+    if expectedLength > corpus.length - at { fail("broken RESP corpus oracle") }
+    let expected = corpus.slice(at,at+expectedLength); at += expectedLength
+    let result = resp.parse(input)
+    if mode == 0 && resp.ok(result) { fail("accepted impossible short RESP " + Text(count)) }
+    if mode == 1 {
+        if !resp.ok(result) || !same(canonical(resp.value(result)),expected) || resp.consumed(result) != input.length {
+            fail("RESP model mismatch " + Text(count))
+        }
+    }
+    if mode == 3 && (!resp.incomplete(result) || resp.consumed(result) != 0) { fail("RESP prefix mismatch " + Text(count)) }
+    if resp.ok(result) {
+        let normalized = canonical(resp.value(result)); let repeated = resp.parse(normalized)
+        if !resp.ok(repeated) || !same(canonical(resp.value(repeated)),normalized) { fail("RESP normalization mismatch " + Text(count)) }
+    } else if resp.consumed(result) != 0 { fail("failed RESP consumed input") }
+    count += 1
+}
+print(count)

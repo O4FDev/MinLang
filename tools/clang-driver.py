@@ -74,6 +74,8 @@ def native_object(project, clang, base, name, compile_flags):
     # Includes native ABI helpers and platform headers. Content keys prevent
     # stale artifacts after restores which preserve old timestamps.
     dependencies = [source, *sorted((project / 'runtime').rglob('*.h'))]
+    if name.startswith(('securecrypto', 'update')):
+        dependencies += sorted((project / 'vendor/monocypher').glob('*'))
     identity = base.copy()
     identity.update(json.dumps([name, compile_flags]).encode())
     for dependency in dependencies:
@@ -93,6 +95,31 @@ def native_object(project, clang, base, name, compile_flags):
             os.replace(temporary, output)
         finally:
             Path(temporary).unlink(missing_ok=True)
+    return str(output)
+
+
+def cycle_runtime_object(project, clang, runtime, release, link_flags):
+    from cycle_runtime import configured_source
+    source = configured_source(project, runtime)
+    options = flags('MINYAR_RUNTIME_FLAGS', '-O2 -Wno-override-module')
+    if release == '1':
+        options += lto_flags(clang, link_flags)[:1]
+    identity = clang_identity(clang)
+    identity.update(json.dumps(options).encode() + source.encode())
+    for header in sorted((project / 'runtime').rglob('*.h')):
+        identity.update(str(header.relative_to(project)).encode() + header.read_bytes())
+    directory = project / 'build/native'
+    directory.mkdir(parents=True, exist_ok=True)
+    output = directory / ('cycle-runtime-' + identity.hexdigest() + '.o')
+    if not output.is_file():
+        with tempfile.TemporaryDirectory(prefix='cycle-runtime-', dir=directory) as temporary:
+            temporary = Path(temporary)
+            configured = temporary / 'runtime.c'
+            configured.write_text(source)
+            staged = temporary / 'runtime.o'
+            run([clang, *options, '-iquote', str(project / 'runtime'),
+                 '-c', str(configured), '-o', str(staged)])
+            os.replace(staged, output)
     return str(output)
 
 
@@ -163,10 +190,17 @@ def lto_flags(clang, link_flags):
     # Linux's default GNU linker needs an optional LLVMgold plugin for LTO.
     # Prefer the toolchain's lld when available unless the user chose a linker.
     if platform.system() != 'Darwin' and not any(a.startswith(('-fuse-ld=', '--ld-path=')) for a in link_flags):
-        sibling = Path(shutil.which(clang) or clang).resolve().parent / 'ld.lld'
-        if sibling.is_file():
-            lto += ['-fuse-ld=' + str(sibling)]
-        elif shutil.which('ld.lld'):
+        system = platform.system()
+        windows = system == 'Windows' or system.startswith(('MSYS', 'MINGW', 'CYGWIN'))
+        names = ('ld.lld.exe', 'ld.lld') if windows else ('ld.lld',)
+        directory = Path(shutil.which(clang) or clang).resolve().parent
+        sibling = next((directory / name for name in names if (directory / name).is_file()), None)
+        if sibling is not None:
+            # MinGW checks the flavor literally before accepting bitcode.
+            # An absolute -fuse-ld path selects lld but disables that support;
+            # keep the flavor and executable location as separate arguments.
+            lto += ['-fuse-ld=lld', '--ld-path=' + str(sibling)] if windows else ['-fuse-ld=' + str(sibling)]
+        elif any(shutil.which(name) for name in names):
             lto += ['-fuse-ld=lld']
     return lto
 
@@ -257,6 +291,14 @@ def main():
     if len(sys.argv) == 2 and sys.argv[1] == 'doctor':
         doctor(clang)
         return
+    if len(sys.argv) == 2 and sys.argv[1] == 'runtime-format':
+        # Clang has already instrumented C emitted as LLVM. Feeding that IR
+        # through a second sanitizer pipeline instruments shadow accesses and
+        # can crash before main. Keep a native object under sanitizer flags;
+        # ordinary release builds retain their existing LLVM/LTO path.
+        options = flags('MINYAR_RUNTIME_FLAGS', '-O2 -Wno-override-module')
+        print('object' if any(option.startswith('-fsanitize=') for option in options) else 'llvm')
+        return
     if len(sys.argv) >= 4 and sys.argv[1] == 'compile':
         run([clang, *flags('MINYAR_RUNTIME_FLAGS', '-O2 -Wno-override-module'), *sys.argv[2:]])
         return
@@ -270,12 +312,23 @@ def main():
                        else ('-O0 -g -Wno-override-module' if debug else '-O2 -Wno-override-module'))
     native = []
     libraries = set()
+    cycles = False
     with Path(llvm).open() as stream:
         for line in stream:
             if line.startswith('; minyar-native-library: '):
-                libraries.add(line.removeprefix('; minyar-native-library: ').strip())
+                library = line.removeprefix('; minyar-native-library: ').strip()
+                libraries.add(library)
+                if library == 'callbackruntime': cycles = True
+            if line in ('; minyar-cycle-runtime: 1\n', '; minyar-callback-runtime: 1\n'):
+                cycles = True
+    if cycles:
+        runtime = cycle_runtime_object(project, clang, runtime, release, link_flags)
     native_flags = flags('MINYAR_NATIVE_FLAGS', shlex.join(link_flags))
+    if {'macos', 'net'} <= libraries or {'windows', 'net'} <= libraries:
+        native_flags = [*native_flags, '-DMINYAR_APP_EVENT_LOOP=1']
     base = clang_identity(clang) if libraries - {'machine', 'machine_arm64'} else None
+    if libraries & {'securecrypto', 'update'}:
+        native += [native_object(project, clang, base, 'update_monocypher.c', native_flags)]
     for library in sorted(libraries):
         if library == 'graphics':
             native += graphics(project, clang, base, native_flags)
@@ -288,13 +341,84 @@ def main():
             if platform.system() != 'Darwin':
                 raise ValueError('the http package currently requires macOS and the Apple command-line tools')
             native += [native_object(project, clang, base, 'http.m', [*native_flags, '-fobjc-arc', '-fmodules']),
-                       '-framework', 'AppKit']
+                       '-framework', 'AppKit', '-framework', 'Security']
+        elif library == 'windows':
+            if not (platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN'))):
+                raise ValueError('the windows package requires Windows and its native UI')
+            native += [native_object(project, clang, base, 'windows.c', native_flags),
+                       '-luser32', '-lgdi32', '-lshell32', '-lcomctl32']
+        elif library == 'schannel':
+            if not (platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN'))):
+                raise ValueError('the schannel package requires Windows and its TLS provider')
+            native += [native_object(project, clang, base, 'schannel.c', native_flags),
+                       '-lsecur32', '-lcrypt32', '-lbcrypt', '-lncrypt', '-lws2_32']
+            if 'tlsverify' not in libraries:
+                native += [native_object(project, clang, base, 'tlsverify.c', native_flags)]
+        elif library == 'wincert':
+            if not (platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN'))):
+                raise ValueError('the wincert package requires Windows and its certificate store')
+            native += [native_object(project, clang, base, 'wincert.c', native_flags),
+                       '-lcrypt32', '-lbcrypt', '-lncrypt']
         elif library in ('machine', 'machine_arm64'):
             pass  # Compiler intrinsics: the code is already inline in the program.
         elif library == 'net':
             native += [native_object(project, clang, base, 'net.c', native_flags)]
-            if platform.system() == 'Windows':
+            if platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
                 native += ['-lws2_32']
+        elif library == 'update':
+            native += [native_object(project, clang, base, name, native_flags)
+                       for name in ('update.c', 'update_ed25519.c')]
+        elif library == 'workers':
+            native += [native_object(project, clang, base, 'workers.c', native_flags)]
+            if platform.system() != 'Windows':
+                native += ['-pthread']
+        elif library == 'callbackruntime':
+            # This bounded service entry is supplied by the opt-in engine.
+            pass
+        elif library == 'quicinteropio':
+            native += [native_object(project, clang, base, 'quicinteropio.c', native_flags)]
+        elif library == 'aes':
+            native += [native_object(project, clang, base, 'aes.c', native_flags)]
+            if platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
+                native += ['-lbcrypt']
+            elif platform.system() != 'Darwin':
+                native += ['-lcrypto']
+        elif library == 'securecrypto':
+            native += [native_object(project, clang, base, 'securecrypto.c', native_flags)]
+        elif library == 'tlsverify':
+            native += [native_object(project, clang, base, 'tlsverify.c', native_flags)]
+            if platform.system() == 'Darwin':
+                native += ['-framework', 'Security', '-framework', 'CoreFoundation']
+            elif platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
+                native += ['-lcrypt32', '-lbcrypt', '-lncrypt', '-lws2_32']
+            else:
+                native += ['-lcrypto']
+        elif library == 'keychain':
+            if platform.system() != 'Darwin':
+                raise ValueError('the keychain package requires macOS')
+            native += [native_object(project, clang, base, 'keychain.c', native_flags),
+                       '-framework', 'Security', '-framework', 'CoreFoundation']
+        elif library == 'winnotify':
+            if not (platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN'))):
+                raise ValueError('the winnotify package requires Windows')
+            notification_object = native_object(project, clang, base, 'winnotify.c', native_flags)
+            if notification_object not in native:
+                native += [notification_object]
+            native += ['-luser32', '-lshell32', '-ladvapi32', '-lole32', '-luuid', '-lbcrypt', '-lruntimeobject']
+        elif library == 'desktop':
+            if platform.system() == 'Darwin':
+                native += [native_object(project, clang, base, 'desktop.m',
+                                         [*native_flags, '-fobjc-arc', '-fmodules'])]
+                for framework in ('AppKit', 'UserNotifications', 'ServiceManagement', 'Network', 'IOKit'):
+                    native += ['-framework', framework]
+            else:
+                native += [native_object(project, clang, base, 'desktop.c', native_flags)]
+                if platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
+                    native += ['-luser32', '-lshell32', '-ladvapi32', '-lole32', '-loleaut32', '-liphlpapi',
+                               '-luuid', '-lws2_32', '-lbcrypt', '-lruntimeobject']
+                    notification_object = native_object(project, clang, base, 'winnotify.c', native_flags)
+                    if notification_object not in native:
+                        native += [notification_object]
         else:
             raise ValueError(f'the program uses an unknown native library: {library}')
     lto = lto_flags(clang, link_flags) if release == '1' else []

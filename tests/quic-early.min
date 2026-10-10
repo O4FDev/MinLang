@@ -1,0 +1,49 @@
+use "quic" as quic
+use "tlstickets" as tickets
+use "errors" as errors
+
+function drive(c: quic.Connection, s: quic.Connection, now: Integer) {
+    for packet in quic.poll(c, now) { quic.receive(s, packet, now) }
+    for packet in quic.poll(s, now) { quic.receive(c, packet, now) }
+}
+function main(): Integer {
+    let root = readBytesFile(argument(0)); let identity = readBytesFile(argument(1)); let key = readBytesFile(argument(2))
+    let client = readBytesFile(argument(3)); let clientKey = readBytesFile(argument(4))
+    let store = tickets.store(randomBytes(16), 3600)
+    if !tickets.allowEarlyData(store, 0xffffffff) { return 1 }
+    let c = quic.client("localhost", randomBytes(80), "minyar-test", [root], [client], clientKey)
+    if errors.integerOk(quic.openEarlyStream(c, false)) { return 2 }
+    let s = quic.serverWithTickets(randomBytes(80), "minyar-test", c.originalDestination, [identity], key, [root], true, store)
+    for count in 0..100 { drive(c, s, count * 10) }
+    let ticket = quic.takeTicket(c)
+    if !ticket.valid || ticket.earlyLimit != 0xffffffff { return 3 }
+    for attempt in 0..3 {
+        let early = quic.clientEarly("localhost", randomBytes(80), "minyar-test", [root], [client], clientKey, ticket)
+        let current = store
+        if attempt == 2 { current = tickets.store(store.key, 3600); tickets.allowEarlyData(current, 0xffffffff) }
+        let accepted = quic.serverWithTickets(randomBytes(80), "minyar-test", early.originalDestination, [identity], key, [root], true, current)
+        let id = errors.integerValue(quic.openEarlyStream(early, false))
+        if !errors.integerOk(quic.writeEarlyStream(early, id, Bytes("replay-safe heartbeat"), true)) { return 4 }
+        for packet in quic.poll(early, 0) { quic.receive(accepted, packet, 0) }
+        if attempt == 0 {
+            if accepted.state != quic.STARTING || !accepted.serverTLS.earlyAccepted || Text(errors.bytesValue(quic.readStream(accepted, id))) != "replay-safe heartbeat" { return 5 }
+        } else {
+            if accepted.serverTLS.earlyAccepted || accepted.streams.length != 0 { return 6 }
+        }
+        for count in 0..100 { drive(early, accepted, count * 10) }
+        if early.state != quic.ESTABLISHED || accepted.state != quic.ESTABLISHED || !accepted.serverTLS.authenticated { print(early.error); print(accepted.error); return 7 }
+        if attempt == 0 {
+            if early.earlyRejected || !early.clientTLS.earlyAccepted { return 8 }
+        } else {
+            if !early.earlyRejected || errors.code(errors.bytesError(quic.readStream(early, id))) != quic.earlyRejectedCode() { return 9 }
+            if errors.integerOk(quic.writeStream(early, id, Bytes("must not silently replay"), false)) { return 10 }
+            let retry = errors.integerValue(quic.openStream(early, false))
+            quic.writeStream(early, retry, Bytes("explicit retry"), true)
+            for count in 100..120 { drive(early, accepted, count * 10) }
+            if Text(errors.bytesValue(quic.readStream(accepted, retry))) != "explicit retry" { return 11 }
+        }
+    }
+    if store.seen.length != 1 { return 12 }
+    print("QUIC 0-RTT: explicit replay-safe API, PSK mTLS identity, early delivery, single-use/restart replay rejection and explicit retry passed")
+    return 0
+}

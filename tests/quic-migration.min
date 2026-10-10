@@ -1,0 +1,40 @@
+use "quic" as quic
+use "errors" as errors
+use "crypto" as crypto
+
+function drive(c: quic.Connection, s: quic.Connection, now: Integer) {
+    for packet in quic.pollDatagrams(c, now) { quic.receivePath(s, packet.data, packet.pathId, now) }
+    for packet in quic.pollDatagrams(s, now) { quic.receivePath(c, packet.data, packet.pathId, now) }
+}
+function main(): Integer {
+    let root = readBytesFile(argument(0)); let server = readBytesFile(argument(1)); let serverKey = readBytesFile(argument(2))
+    let client = readBytesFile(argument(3)); let clientKey = readBytesFile(argument(4))
+    let c = quic.client("localhost", randomBytes(80), "minyar-test", [root], [client], clientKey)
+    let s = quic.server(randomBytes(80), "minyar-test", c.originalDestination, [server], serverKey, [root], true)
+    if errors.booleanOk(quic.probePath(c, 7, 0)) { return 1 }
+    let now = 0
+    while now < 10000 && (!c.confirmed || !s.confirmed) { drive(c, s, now); now += 10 }
+    let id = errors.integerValue(quic.openStream(c, false))
+    quic.writeStream(c, id, Bytes("before"), false)
+    for count in 0..20 { drive(c, s, now); now += 10 }
+    if Text(errors.bytesValue(quic.readStream(s, id))) != "before" { return 2 }
+    // An attacker controls UDP source endpoints but not TLS traffic keys.
+    for path in 1..1000 { quic.receivePath(s, randomBytes(1200), path, now) }
+    if s.paths.length != 1 || s.activePath != 0 { return 3 }
+    if !errors.booleanOk(quic.probePath(c, 7, now)) { return 4 }
+    let challenges = quic.pollDatagrams(c, now)
+    if challenges.length == 0 || challenges[0].pathId != 7 || challenges[0].data.length < 1200 { return 5 }
+    for packet in challenges { quic.receivePath(s, packet.data, 7, now) }
+    let replies = quic.pollDatagrams(s, now)
+    // Even a cryptographically valid response on another path cannot validate.
+    for packet in replies { quic.receivePath(c, packet.data, 8, now) }
+    if c.activePath != 0 { return 6 }
+    for packet in replies { quic.receivePath(c, packet.data, 7, now) }
+    if c.activePath != 7 { return 7 }
+    quic.writeStream(c, id, Bytes("after"), false)
+    for count in 0..200 { drive(c, s, now); now += 10 }
+    if c.state != quic.ESTABLISHED || s.state != quic.ESTABLISHED || s.activePath != 7 || Text(errors.bytesValue(quic.readStream(s, id))) != "after" { return 8 }
+    if c.paths.length > 2 || s.paths.length > 2 { return 9 }
+    print("QUIC migration: authenticated exact-path validation, forged endpoints, bounded candidates and surviving streams passed")
+    return 0
+}

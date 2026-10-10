@@ -11,6 +11,8 @@
 // Minyar OS has its own TCP/IP stack in os/kernel/net; this package uses the
 // host's.
 
+use "errors" as errors
+
 // Resolve `host` and connect to `port`; the handle, or -1.
 public function connect(host: Text, port: Integer): Integer { native "net" }
 
@@ -27,3 +29,160 @@ public function close(connection: Integer) { native "net" }
 
 // A description of the last failure.
 public function lastError(): Text { native "net" }
+
+// Bound UDP sockets and TCP listeners start non-blocking and do not inherit
+// into child processes. Port zero asks the OS to choose an available port.
+public function udp(host: Text, port: Integer): Integer { native "net" }
+public function listen(host: Text, port: Integer, backlog: Integer): Integer { native "net" }
+public function accept(listener: Integer): Integer { native "net" }
+public function localPort(connection: Integer): Integer { native "net" }
+public function nonBlocking(connection: Integer, enabled: Boolean): Boolean { native "net" }
+
+// Begin a non-blocking TCP connection to a numeric IPv4/IPv6 address. The
+// caller owns the returned socket, including while establishment is pending.
+// Watch writability, then call connectFinish; close after any failed result.
+// Resolve DNS outside the event-loop owner before entering this API.
+public function connectStart(address: Text, port: Integer): errors.IntegerResult {
+    let result = connectStartResult(address,port)
+    if result.getUInt32(0) == 0 { return errors.integer(result.getInt64(8)) }
+    return errors.integerFailure(errors.make(errors.systemCode(),result.getUInt32(4),"socket connect failed"))
+}
+public function connectFinish(connection: Integer): errors.BooleanResult {
+    let result = connectFinishResult(connection)
+    if result.getUInt32(0) == 0 { return errors.boolean(true) }
+    let code = errors.systemCode()
+    if result.getUInt32(0) == 1 { code = errors.wouldBlockCode() }
+    return errors.booleanFailure(errors.make(code,result.getUInt32(4),"socket connect incomplete or failed"))
+}
+function connectStartResult(address: Text, port: Integer): Bytes { native "net" }
+function connectFinishResult(connection: Integer): Bytes { native "net" }
+
+// Set a default UDP destination and filter incoming datagrams to that peer.
+// Name resolution occurs here, never while waiting for socket readiness.
+public function udpConnect(connection: Integer, host: Text, port: Integer): Boolean { native "net" }
+
+// One read, with operation-owned errors. Stream EOF, would-block and failure
+// have separate tags; a failed network operation does not stop the program.
+public function read(connection: Integer, limit: Integer): errors.BytesResult {
+    return decodeRead(readResult(connection, limit, false))
+}
+
+// One whole UDP datagram. An empty datagram is successful data. TRUNCATED
+// returns its prefix and an error, so a parser cannot mistake it for a packet.
+public function receiveDatagram(connection: Integer, limit: Integer): errors.BytesResult {
+    return decodeRead(readResult(connection, limit, true))
+}
+
+function decodeRead(result: Bytes): errors.BytesResult {
+    let status = result.getUInt32(0)
+    let code = result.getUInt32(4)
+    if status == 0 { return errors.bytes(result.slice(8, result.length)) }
+    if status == 1 { return errors.wouldBlock(code) }
+    if status == 2 { return errors.endOfStream() }
+    if status == 4 { return errors.truncated(result.slice(8, result.length), code) }
+    return errors.bytesFailure(errors.make(errors.systemCode(), code, "socket read failed"))
+}
+
+// A single non-blocking write. TCP callers keep any unsent suffix and wait
+// for writability. UDP callers get one datagram, including empty datagrams.
+public function write(connection: Integer, data: Bytes): errors.IntegerResult {
+    let result = writeResult(connection, data)
+    let status = result.getUInt32(0)
+    if status == 0 { return errors.integer(result.getInt64(8)) }
+    let code = result.getUInt32(4)
+    if status == 1 {
+        return errors.integerFailure(errors.make(errors.wouldBlockCode(), code, "socket write would block"))
+    }
+    return errors.integerFailure(errors.make(errors.systemCode(), code, "socket write failed"))
+}
+
+function readResult(connection: Integer, limit: Integer, datagram: Boolean): Bytes { native "net" }
+function writeResult(connection: Integer, data: Bytes): Bytes { native "net" }
+
+// Send up to 64 packets to a connected UDP peer. A successful partial batch
+// returns the number of complete packets sent; retain and retry the suffix.
+public function sendDatagrams(connection: Integer, packets: List<Bytes>): errors.IntegerResult {
+    if packets.length > 64 {
+        return errors.integerFailure(errors.make(errors.invalidDataCode(), 0, "a UDP batch has at most 64 packets"))
+    }
+    let encoded = Bytes()
+    encoded.addUInt32(packets.length)
+    for packet in packets {
+        if packet.length > 65507 {
+            return errors.integerFailure(errors.make(errors.invalidDataCode(), 0, "UDP packet exceeds 65507 bytes"))
+        }
+        encoded.addUInt32(packet.length)
+        encoded.addBytes(packet)
+    }
+    let result = sendBatchResult(connection, encoded)
+    if result.getUInt32(0) == 0 { return errors.integer(result.getInt64(8)) }
+    let category = errors.systemCode()
+    if result.getUInt32(0) == 1 { category = errors.wouldBlockCode() }
+    return errors.integerFailure(errors.make(category, result.getUInt32(4), "UDP batch send failed"))
+}
+
+public record Datagram {
+    private data: errors.BytesResult
+    private source: Text
+    private port: Integer
+}
+public function datagramData(packet: Datagram): errors.BytesResult { return packet.data }
+public function datagramSource(packet: Datagram): Text { return packet.source }
+public function datagramPort(packet: Datagram): Integer { return packet.port }
+
+public record DatagramBatch {
+    private packets: List<Datagram>
+    private error: errors.Error
+}
+public function datagramBatchOk(batch: DatagramBatch): Boolean { return !errors.isError(batch.error) }
+public function datagramBatchError(batch: DatagramBatch): errors.Error { return batch.error }
+public function datagrams(batch: DatagramBatch): List<Datagram> {
+    if !datagramBatchOk(batch) { fail("cannot extract a failed UDP batch") }
+    return batch.packets
+}
+
+// Receive at most 64 packets in one call, preserving their source addresses
+// and individual truncation flags. Linux uses recvmmsg; no call waits for an
+// entire batch to fill. Empty UDP packets are included in the returned List.
+public function receiveDatagrams(connection: Integer, maximum: Integer, limit: Integer): DatagramBatch {
+    let encoded = receiveBatchResult(connection, maximum, limit)
+    let packets: List<Datagram> = []
+    let status = encoded.getUInt32(0)
+    if status != 0 {
+        let category = errors.systemCode()
+        if status == 1 { category = errors.wouldBlockCode() }
+        return DatagramBatch { packets: packets; error: errors.make(category, encoded.getUInt32(4), "UDP batch receive failed") }
+    }
+    let position = 12
+    for packet in 0..encoded.getUInt32(8) {
+        let length = encoded.getUInt32(position)
+        let truncated = encoded.getUInt32(position + 4) == 4
+        let port = encoded.getUInt32(position + 8)
+        let sourceLength = encoded.getUInt32(position + 12)
+        position = position + 16
+        let source = Text(encoded.slice(position, position + sourceLength))
+        position = position + sourceLength
+        let data = encoded.slice(position, position + length)
+        position = position + length
+        let result = errors.bytes(data)
+        if truncated { result = errors.truncated(data, 0) }
+        packets.add(Datagram { data: result; source: source; port: port })
+    }
+    return DatagramBatch { packets: packets; error: errors.none() }
+}
+
+function sendBatchResult(connection: Integer, packets: Bytes): Bytes { native "net" }
+function receiveBatchResult(connection: Integer, maximum: Integer, limit: Integer): Bytes { native "net" }
+
+// Reply to a datagram's numeric source address without connecting the socket
+// or doing DNS on the packet path. The result counts bytes in one whole packet.
+public function sendDatagramTo(connection: Integer, source: Text, port: Integer, data: Bytes): errors.IntegerResult {
+    let result = sendToResult(connection, source, port, data)
+    if result.getUInt32(0) == 0 { return errors.integer(result.getInt64(8)) }
+    let category = errors.systemCode()
+    if result.getUInt32(0) == 1 { category = errors.wouldBlockCode() }
+    return errors.integerFailure(errors.make(category, result.getUInt32(4), "UDP send to peer failed"))
+}
+function sendToResult(connection: Integer, source: Text, port: Integer, data: Bytes): Bytes { native "net" }
+// Process-independent monotonic time for transport deadlines; never wall time.
+public function monotonicMilliseconds(): Integer { native "net" }

@@ -19,7 +19,7 @@ SOURCE = ROOT / 'compiler/compiler.min'
 RUNTIME = ROOT / 'build/ownership-runtime.o'
 TARGETS = {
     'cycle': ('recursive-data.py',
-              'RecursiveData.test_direct_self_cycle_add_and_overwrite_rejected'),
+              'RecursiveData.test_direct_self_cycle_add_and_overwrite_use_collector'),
     'literal-owner': ('recursive-data.py',
                       'RecursiveData.test_literal_retains_earlier_projection_before_later_mutation'),
     'context': ('production-memory.py',
@@ -111,7 +111,7 @@ def main() -> None:
             output = result.stdout + result.stderr
             test_name = TARGETS[name][1].split('.')[-1]
             expected = {
-                'cycle': 'AssertionError: 0 != 1',
+                'cycle': 'AssertionError: 0 != 86',
                 'literal-owner': 'AddressSanitizer: heap-use-after-free',
                 'context': 'an argument passed to nodes has the wrong type',
             }[name]

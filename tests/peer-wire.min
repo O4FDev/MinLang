@@ -1,0 +1,62 @@
+use "peerwire" as wire
+use "errors" as errors
+
+function number(text: Text): Integer {
+    let value = 0
+    for c in text { value = value * 10 + (Integer(c) - 48) }
+    return value
+}
+function same(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+function report(value: wire.FrameResult) {
+    if wire.frameOk(value) { print("FRAME " + Text(wire.kind(value)) + " " + Text(wire.streamID(value)) + " " + Text(wire.payload(value).length)) }
+    else { print("FRAME_ERROR " + Text(errors.code(wire.frameError(value)))) }
+}
+let mode = argument(0)
+let bytes = readBytesFile(argument(1))
+if mode == "prefixes" {
+    let expectedKind = number(argument(2)); let expectedID = number(argument(3)); let expectedPayload = readBytesFile(argument(4))
+    for cut in 0..(bytes.length + 1) {
+        let decoder = wire.create()
+        let fed = wire.feed(decoder, bytes.slice(0, cut))
+        if !errors.booleanOk(fed) { fail("valid prefix rejected by feed") }
+        wire.finish(decoder)
+        let result = wire.take(decoder)
+        if cut == bytes.length {
+            if !wire.frameOk(result) || wire.kind(result) != expectedKind || wire.streamID(result) != expectedID || !same(wire.payload(result), expectedPayload) { fail("full independent fixture differs") }
+            if errors.code(wire.frameError(wire.take(decoder))) != errors.closedCode() { fail("completed decoder did not close") }
+        } else if cut == 0 {
+            if wire.frameOk(result) || errors.code(wire.frameError(result)) != errors.closedCode() { fail("empty completed input was not EOF") }
+        } else {
+            if wire.frameOk(result) || errors.code(wire.frameError(result)) != errors.truncatedCode() { fail("incomplete prefix was not typed truncation") }
+        }
+    }
+    print("PREFIXES " + Text(bytes.length + 1))
+} else {
+    let decoder = wire.create()
+    let piece = number(argument(2)); if piece < 1 { piece = bytes.length + 1 }
+    let at = 0; let stopped = false
+    while at < bytes.length && !stopped {
+        let end = min(bytes.length, at + piece)
+        let fed = wire.feed(decoder, bytes.slice(at, end)); at = end
+        if !errors.booleanOk(fed) { print("FEED_ERROR " + Text(errors.code(errors.booleanError(fed)))); stopped = true }
+        else {
+            let reading = true
+            while reading {
+                let result = wire.take(decoder)
+                if wire.frameOk(result) { report(result) }
+                else if errors.code(wire.frameError(result)) == errors.wouldBlockCode() { reading = false }
+                else { report(result); reading = false; stopped = true }
+            }
+        }
+    }
+    if !stopped {
+        wire.finish(decoder)
+        let result = wire.take(decoder)
+        while wire.frameOk(result) { report(result); result = wire.take(decoder) }
+        report(result)
+    }
+}

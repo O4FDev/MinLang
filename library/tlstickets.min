@@ -1,0 +1,116 @@
+// TLS 1.3 SHA-256 PSK binders and encrypted, scoped, expiring session tickets.
+// A Store has one owner and one process lifetime. Persisting anti-replay state
+// or coordinating it across servers is the deployer's responsibility.
+use "crypto" as crypto
+use "aes" as aes
+use "quicwire" as wire
+use "tlsverify" as trust
+
+public record Seen { fingerprint: Bytes; expires: Integer }
+public record Store { key: Bytes; lifetime: Integer; issued: Integer; seen: List<Seen>; earlyLimit: Integer; started: Integer; instance: Bytes }
+public record Issued { valid: Boolean; ticket: Bytes; ageAdd: Integer; expires: Integer; error: Text }
+public record Opened {
+    valid: Boolean; psk: Bytes; suite: Integer; earlyLimit: Integer; clientChain: Bytes
+    issued: Integer; expires: Integer; ageAdd: Integer; profile: Bytes; instance: Bytes
+}
+public record Client {
+    valid: Boolean; ticket: Bytes; psk: Bytes; suite: Integer; earlyLimit: Integer; host: Text; protocol: Text
+    issued: Integer; expires: Integer; ageAdd: Integer; certificateChain: Bytes; parameters: Bytes
+}
+function equal(left: Bytes, right: Bytes): Boolean { return crypto.constantTimeEqual(left, right) }
+function add(data: Bytes, value: Integer, width: Integer) {
+    for index in 0..width { data.add((value >> ((width - index - 1) * 8)) & 255) }
+}
+function get(data: Bytes, at: Integer, width: Integer): Integer {
+    let value = 0
+    for index in 0..width { value = (value << 8) | data[at + index] }
+    return value
+}
+public function store(key: Bytes, lifetimeSeconds: Integer): Store {
+    let retained = key
+    if key.length != 16 { retained = Bytes() }
+    return Store { key: retained; lifetime: max(1, min(lifetimeSeconds, 604800)); issued: 0; seen: []; earlyLimit: 0; started: trust.currentTimeMilliseconds(); instance: randomBytes(16) }
+}
+public function allowEarlyData(store: Store, limit: Integer): Boolean {
+    if store.key.length != 16 || limit < 0 || limit > 0xffffffff { return false }
+    store.earlyLimit = limit
+    return true
+}
+// Bind every limit QUIC permits a client to remember for 0-RTT. CIDs change.
+public function profile(parameters: Bytes): Bytes {
+    let parsed = wire.parameters(parameters, true)
+    if !parsed.valid { return Bytes() }
+    let ids = [3, 4, 5, 6, 7, 8, 9, 14]; let values = [65527, 0, 0, 0, 0, 0, 0, 2]
+    for parameter in parsed.parameters {
+        for index in 0..ids.length { if parameter.id == ids[index] { values[index] = parameter.integer } }
+    }
+    let result = Bytes()
+    for value in values { add(result, value, 8) }
+    return result
+}
+public function permitsEarly(previous: Bytes, current: Bytes): Boolean {
+    if previous.length != 64 || current.length != 64 { return false }
+    for index in 0..8 { if get(current, index * 8, 8) < get(previous, index * 8, 8) { return false } }
+    return true
+}
+public function none(): Store { return store(Bytes(), 1) }
+public function emptyClient(): Client {
+    return Client { valid: false; ticket: Bytes(); psk: Bytes(); suite: 0; earlyLimit: 0; host: ""; protocol: ""; issued: 0; expires: 0; ageAdd: 0; certificateChain: Bytes(); parameters: Bytes() }
+}
+function invalid(): Opened { return Opened { valid: false; psk: Bytes(); suite: 0; earlyLimit: 0; clientChain: Bytes(); issued: 0; expires: 0; ageAdd: 0; profile: Bytes(); instance: Bytes() } }
+public function binder(psk: Bytes, transcriptHash: Bytes): Bytes {
+    if psk.length != 32 || transcriptHash.length != 32 { return Bytes() }
+    let early = crypto.hkdfExtract(Bytes(), psk)
+    let key = crypto.expandLabel(early, "res binder", crypto.sha256(Bytes()), 32)
+    return crypto.hmac(crypto.expandLabel(key, "finished", Bytes(), 32), transcriptHash)
+}
+public function issue(store: Store, psk: Bytes, suite: Integer, protocol: Text, host: Text, identity: Bytes, clientChain: Bytes, now: Integer, earlyLimit: Integer): Issued {
+    return issueProfile(store, psk, suite, protocol, host, identity, clientChain, now, earlyLimit, Bytes())
+}
+public function issueProfile(store: Store, psk: Bytes, suite: Integer, protocol: Text, host: Text, identity: Bytes, clientChain: Bytes, now: Integer, earlyLimit: Integer, profile: Bytes): Issued {
+    let rejected = Issued { valid: false; ticket: Bytes(); ageAdd: 0; expires: 0; error: "invalid or exhausted TLS ticket configuration" }
+    if store.key.length != 16 || store.instance.length != 16 || store.issued >= (1 << 23) || psk.length != 32 || (suite != 0x1301 && suite != 0x1303) ||
+       protocol.length < 1 || protocol.length > 255 || host.length > 253 || identity.length != 32 || clientChain.length > 32768 || now < 1 ||
+       now > 0x3fffffffffffffff - store.lifetime * 1000 || earlyLimit < 0 || earlyLimit > 0xffffffff || profile.length > 512 { return rejected }
+    let random = randomBytes(16); let ageAdd = get(random, 12, 4)
+    let expires = now + store.lifetime * 1000
+    let body = Bytes("MST3"); add(body, now, 8); add(body, expires, 8); add(body, ageAdd, 4); add(body, suite, 2); add(body, earlyLimit, 4)
+    body.addBytes(psk); body.addBytes(identity); body.add(protocol.length); body.addBytes(Bytes(protocol)); body.add(host.length); body.addBytes(Bytes(host))
+    add(body, clientChain.length, 4); body.addBytes(clientChain); add(body, profile.length, 2); body.addBytes(profile); body.addBytes(store.instance)
+    let encrypted = aes.encrypt(store.key, random.slice(0, 12), Bytes("Minyar TLS session ticket v3"), body)
+    if encrypted.length != body.length + 16 { return rejected }
+    let result = random.slice(0, 12); result.addBytes(encrypted); store.issued += 1
+    return Issued { valid: true; ticket: result; ageAdd: ageAdd; expires: expires; error: "" }
+}
+public function open(store: Store, ticket: Bytes, protocol: Text, host: Text, identity: Bytes, now: Integer): Opened {
+    if store.key.length != 16 || ticket.length < 129 || ticket.length > 65535 || identity.length != 32 || now < 1 { return invalid() }
+    let authenticated = aes.decrypt(store.key, ticket.slice(0, 12), Bytes("Minyar TLS session ticket v3"), ticket.slice(12, ticket.length))
+    if authenticated.length < 101 || authenticated[0] != 1 { return invalid() }
+    let body = authenticated.slice(1, authenticated.length)
+    if !equal(body.slice(0, 4), Bytes("MST3")) { return invalid() }
+    let issued = get(body, 4, 8); let expires = get(body, 12, 8); let suite = get(body, 24, 2)
+    if issued < 1 || now < issued || expires <= now || expires - issued > 604800000 || (suite != 0x1301 && suite != 0x1303) || !equal(body.slice(62, 94), identity) { return invalid() }
+    let at = 95
+    if body[94] < 1 || body[94] > body.length - at || !equal(body.slice(at, at + body[94]), Bytes(protocol)) { return invalid() }; at += body[94]
+    if at >= body.length { return invalid() }
+    let name = body[at]; at += 1
+    if name > body.length - at || !equal(body.slice(at, at + name), Bytes(host)) { return invalid() }; at += name
+    if at + 4 > body.length { return invalid() }
+    let chain = get(body, at, 4); at += 4
+    if chain > 32768 || chain > body.length - at - 2 { return invalid() }
+    let clientChain = body.slice(at, at + chain); at += chain
+    let size = get(body, at, 2); at += 2
+    if size > 512 || size != body.length - at - 16 { return invalid() }
+    return Opened { valid: true; psk: body.slice(30, 62); suite: suite; earlyLimit: get(body, 26, 4); clientChain: clientChain; profile: body.slice(at, at + size); instance: body.slice(at + size, body.length); issued: issued; expires: expires; ageAdd: get(body, 20, 4) }
+}
+public function claimEarly(store: Store, ticket: Bytes, expires: Integer, now: Integer): Boolean {
+    if store.key.length != 16 || expires <= now || ticket.length > 65535 { return false }
+    let fingerprint = crypto.sha256(ticket); let retained: List<Seen> = []; let reused = false
+    for seen in store.seen {
+        if seen.expires > now { retained.add(seen); if equal(seen.fingerprint, fingerprint) { reused = true } }
+    }
+    store.seen = retained
+    if reused || retained.length >= 4096 { return false }
+    retained.add(Seen { fingerprint: fingerprint; expires: expires })
+    return true
+}

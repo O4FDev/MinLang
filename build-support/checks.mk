@@ -61,6 +61,16 @@ check-runtime-unit: build/runtime-unit
 check-modules: build/minyarc build/minyar-runtime.o
 	$(LIMITED) sh tests/run-module-tests.sh
 
+.PHONY: check-json-parser check-json-parser-sanitize
+check-json-parser: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/json-parser.py
+
+check-json-parser-sanitize: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/json-parser.py --sanitize
+
+check check-portable: check-json-parser
+check-sanitize: check-json-parser-sanitize
+
 .PHONY: check-module-performance
 check-module-performance: build/minyarc build/minyar-runtime.o
 	$(LIMITED) python3 tests/module-performance.py
@@ -301,7 +311,7 @@ check-recursive-data: build/minyarc build/minyarc-sanitize build/minyar-runtime.
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/recursive-data.py
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/production-memory.py
 	$(LIMITED) python3 experiments/memory/production-contract-model.py
-	$(LIMITED) python3 tests/recursive-mutation.py
+	$(SANITIZER_LIMITED) python3 tests/recursive-mutation.py
 
 check-bounded: build/minyarc build/minyar-runtime-bounded.o build/bounded-runtime build/bounded-runtime-sanitize build/bounded-ownership-runtime.o build/production-live-oracle build/production-frame-oracle build/bounded-list-capacity build/bounded-list-capacity-sanitize
 	$(LIMITED) ./build/bounded-runtime
@@ -547,10 +557,41 @@ check-portable check: check-peer-semantics check-memory-regressions check-bootst
 check-sanitize: check-peer-semantics-sanitize check-memory-regressions-sanitize
 
 # TLS 1.3 against a local OpenSSL server, through the hosted http, tls, crypto and net packages.
-.PHONY: check-tls
+.PHONY: check-tls check-tls-sanitize
 check-tls: build/minyarc
-	$(LIMITED) python3 tests/tls-local.py
-check: check-tls
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/tls-local.py
+
+check-tls-sanitize: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/tls-local.py --sanitize
+
+check check-portable: check-tls
+
+.PHONY: check-quic check-quic-sanitize
+check-quic: build/minyarc
+	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/quic-suite.py --artifacts build/quic-native-O0
+	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/quic-suite.py --optimization 2 --artifacts build/quic-native-O2
+
+check-quic-sanitize: build/minyarc
+	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/quic-suite.py --sanitize --artifacts build/quic-sanitize
+
+check: check-quic
+check-sanitize: check-quic-sanitize
+
+.PHONY: check-redis-protocol check-redis-protocol-sanitize check-redis-pipeline check-redis-pipeline-sanitize
+check-redis-protocol: build/minyarc build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/redis-protocol.py
+
+check-redis-protocol-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o
+	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/redis-protocol.py
+
+check-redis-pipeline: build/minyarc build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/redis-pipeline.py
+
+check-redis-pipeline-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o
+	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/redis-pipeline.py
+
+check check-portable: check-redis-protocol check-redis-pipeline
+check-sanitize: check-redis-protocol-sanitize check-redis-pipeline-sanitize
 
 .PHONY: check-native-cache
 check-native-cache:

@@ -1,0 +1,258 @@
+// Signed executable updates. Metadata policy is Minyar; native hooks provide
+// Ed25519 and locked, durable file replacement. A launcher reads `state` and
+// starts versions/<installed digest>.bin (.exe on Windows). See docs/shipping.md.
+use "crypto" as crypto
+use "errors" as errors
+// Force the bounded portable backend on macOS too; its TLS verifies OS roots
+// and it never redirects away from the pinned R2 origin.
+use "./http.min" as http
+
+function verify(data: Bytes, signature: Bytes, key: Bytes): Boolean { native "update" }
+function begin(root: Text): Integer { native "update" }
+function readState(handle: Integer): Bytes { native "update" }
+function storeState(handle: Integer, state: Bytes): Boolean { native "update" }
+function activate(handle: Integer, digest: Text, artifact: Bytes, state: Bytes): Boolean { native "update" }
+function end(handle: Integer) { native "update" }
+function lastError(): Text { native "update" }
+public function hostTarget(): Text { native "update" }
+
+public record Decision {
+    private error: errors.Error
+    private eligible: Boolean
+    private sequence: Integer
+    private version: Text
+    private url: Text
+    private digest: Text
+    private size: Integer
+    private metadataHash: Text
+}
+
+function rejected(message: Text): Decision {
+    return Decision { error: errors.make(errors.protocolCode(), 0, message); eligible: false;
+        sequence: 0; version: ""; url: ""; digest: ""; size: 0; metadataHash: "" }
+}
+
+public function accepted(value: Decision): Boolean { return !errors.isError(value.error) }
+public function eligible(value: Decision): Boolean { return accepted(value) && value.eligible }
+public function error(value: Decision): errors.Error { return value.error }
+public function version(value: Decision): Text { return value.version }
+public function url(value: Decision): Text { return value.url }
+public function digest(value: Decision): Text { return value.digest }
+public function size(value: Decision): Integer { return value.size }
+public function sequence(value: Decision): Integer { return value.sequence }
+
+function lines(data: Bytes): List<Text> {
+    let result: List<Text> = []
+    if data.length == 0 || data.length > 4096 || data[data.length - 1] != 10 { return result }
+    let start = 0
+    for index in 0..data.length {
+        if data[index] == 10 {
+            result.add(Text(data.slice(start, index)))
+            start = index + 1
+        } else {
+            if data[index] < 32 || data[index] > 126 { return [] }
+        }
+    }
+    return result
+}
+
+function natural(text: Text, limit: Integer): Integer {
+    if text.length < 1 || text.length > 19 || (text.length > 1 && text[0] == '0') { return -1 }
+    let value = 0
+    for character in text {
+        if character < '0' || character > '9' { return -1 }
+        let digit = Integer(character) - 48
+        if value > (limit - digit) / 10 { return -1 }
+        value = value * 10 + digit
+    }
+    return value
+}
+
+function versionParts(text: Text): List<Integer> {
+    let parts: List<Integer> = []
+    let start = 0
+    for index in 0..text.length {
+        if text[index] == '.' {
+            let part = natural(text.slice(start, index), 2147483647)
+            if part < 0 { return [] }
+            parts.add(part)
+            start = index + 1
+        }
+    }
+    let last = natural(text.slice(start, text.length), 2147483647)
+    if last < 0 { return [] }
+    parts.add(last)
+    if parts.length != 3 { return [] }
+    return parts
+}
+
+function compareVersions(left: Text, right: Text): Integer {
+    let a = versionParts(left)
+    let b = versionParts(right)
+    if a.length != 3 || b.length != 3 { return -2 }
+    for index in 0..3 {
+        if a[index] < b[index] { return -1 }
+        if a[index] > b[index] { return 1 }
+    }
+    return 0
+}
+
+function validDigest(text: Text): Boolean {
+    if text.length != 64 { return false }
+    for c in text {
+        if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) { return false }
+    }
+    return true
+}
+
+function validURL(url: Text, origin: Text, digest: Text): Boolean {
+    if origin.length < 9 || origin.slice(0, 8) != "https://" { return false }
+    let prefix = origin + "/releases/" + digest + "/"
+    if url.length <= prefix.length || url.slice(0, prefix.length) != prefix { return false }
+    for c in url.slice(prefix.length, url.length) {
+        if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+             c == '.' || c == '_' || c == '-') { return false }
+    }
+    return true
+}
+
+// Cohorts are stable across releases and rollout promotions. No device ID is
+// sent to R2. This identifier is local random installation data, not hardware ID.
+public function cohort(app: Text, channel: Text, installationID: Text): Integer {
+    let hash = crypto.sha256(Bytes("MINYAR-UPDATE-COHORT-V1\n" + app + "\n" + channel + "\n" + installationID))
+    let value = 0
+    for index in 0..4 { value = value * 256 + hash[index] }
+    return value % 100
+}
+
+// Offline policy entry point also used by the integration tests. High-water
+// arguments come from protected local state; they are never network metadata.
+public function inspect(metadata: Bytes, signature: Bytes, key: Bytes, app: Text, target: Text,
+    channel: Text, origin: Text, now: Integer, installationID: Text, installed: Text,
+    highestSequence: Integer, highestVersion: Text, previousMetadataHash: Text): Decision {
+    if metadata.length > 4096 { return rejected("metadata exceeds the size limit") }
+    let signed = Bytes("MINYAR-UPDATE-SIGNATURE-V1")
+    signed.add(0)
+    signed.addBytes(metadata)
+    if !verify(signed, signature, key) { return rejected("invalid Ed25519 metadata signature") }
+    let fields = lines(metadata)
+    if fields.length != 12 || fields[0] != "MINYAR-UPDATE-1" { return rejected("invalid metadata format") }
+    if fields[1] != app || fields[2] != target || fields[3] != channel { return rejected("metadata is for another application, target or channel") }
+    let sequence = natural(fields[4], 2147483647)
+    let issued = natural(fields[6], 9223372036854775807)
+    let expires = natural(fields[7], 9223372036854775807)
+    let rollout = natural(fields[8], 100)
+    let size = natural(fields[11], 134217728)
+    if sequence < 1 || issued < 0 || expires <= issued || size < 1 { return rejected("invalid metadata integer") }
+    if now < 0 || now > 9223372036854775507 || issued > now + 300 || expires <= now ||
+       expires - issued > 604800 { return rejected("expired or unreasonable metadata time") }
+    if rollout != 1 && rollout != 10 && rollout != 100 { return rejected("rollout must be 1, 10 or 100 percent") }
+    if versionParts(fields[5]).length != 3 || versionParts(installed).length != 3 || versionParts(highestVersion).length != 3 {
+        return rejected("version must be three canonical numeric components")
+    }
+    if !validDigest(fields[10]) || !validURL(fields[9], origin, fields[10]) { return rejected("invalid artifact digest or untrusted artifact URL") }
+    let metadataHash = crypto.hex(crypto.sha256(metadata))
+    if sequence < highestSequence || (sequence == highestSequence && metadataHash != previousMetadataHash) ||
+       compareVersions(fields[5], installed) < 0 || compareVersions(fields[5], highestVersion) < 0 {
+        return rejected("update would roll back or equivocate previously trusted metadata")
+    }
+    return Decision { error: errors.none(); eligible: compareVersions(fields[5], installed) > 0 &&
+        cohort(app, channel, installationID) < rollout; sequence: sequence; version: fields[5];
+        url: fields[9]; digest: fields[10]; size: size; metadataHash: metadataHash }
+}
+
+function state(sequence: Integer, highest: Text, metadataHash: Text, installed: Text, generation: Text, now: Integer): Bytes {
+    return Bytes("MINYAR-UPDATER-STATE-1\n" + Text(sequence) + "\n" + highest + "\n" + metadataHash +
+        "\n" + installed + "\n" + generation + "\n" + Text(now) + "\n")
+}
+
+function systemFailure(message: Text): errors.BooleanResult {
+    return errors.booleanFailure(errors.make(errors.systemCode(), 0, message))
+}
+
+// Metadata observation persists its high-water mark even outside the cohort or
+// when the artifact later fails. Retrying the identical signed metadata is safe.
+// Success true means activated; success false means accepted but not selected.
+public function install(root: Text, metadata: Bytes, signature: Bytes, key: Bytes, artifact: Bytes,
+    app: Text, target: Text, channel: Text, origin: Text, now: Integer, installationID: Text,
+    currentVersion: Text): errors.BooleanResult {
+    if target != hostTarget() {
+        return errors.booleanFailure(errors.make(errors.invalidDataCode(), 0, "target does not match this executable's platform and architecture"))
+    }
+    let handle = begin(root)
+    if handle < 0 { return systemFailure(lastError()) }
+    let persisted = readState(handle)
+    if lastError() != "" { let message = lastError(); end(handle); return systemFailure(message) }
+    let highestSequence = 0
+    let highestVersion = currentVersion
+    let installed = currentVersion
+    let metadataHash = ""
+    let generation = ""
+    if persisted.length > 0 {
+        let fields = lines(persisted)
+        if fields.length != 7 || fields[0] != "MINYAR-UPDATER-STATE-1" {
+            end(handle); return systemFailure("local update state is corrupt")
+        }
+        highestSequence = natural(fields[1], 2147483647)
+        highestVersion = fields[2]
+        metadataHash = fields[3]
+        installed = fields[4]
+        generation = fields[5]
+        let clock = natural(fields[6], 9223372036854775807)
+        if highestSequence < 1 || versionParts(highestVersion).length != 3 || versionParts(installed).length != 3 ||
+           !validDigest(metadataHash) || (generation != "" && !validDigest(generation)) || clock < 0 || now < clock {
+            end(handle); return systemFailure("local update state is corrupt or the clock moved backwards")
+        }
+        if compareVersions(currentVersion, installed) > 0 { installed = currentVersion }
+        if compareVersions(currentVersion, highestVersion) > 0 { highestVersion = currentVersion }
+    }
+    let decision = inspect(metadata, signature, key, app, target, channel, origin, now,
+        installationID, installed, highestSequence, highestVersion, metadataHash)
+    if !accepted(decision) { end(handle); return errors.booleanFailure(decision.error) }
+    let observed = state(decision.sequence, decision.version, decision.metadataHash, installed, generation, now)
+    if !storeState(handle, observed) { let message = lastError(); end(handle); return systemFailure(message) }
+    if !decision.eligible { end(handle); return errors.boolean(false) }
+    if artifact.length != decision.size || crypto.hex(crypto.sha256(artifact)) != decision.digest {
+        end(handle); return errors.booleanFailure(errors.make(errors.invalidDataCode(), 0, "artifact size or SHA256 does not match signed metadata"))
+    }
+    let active = state(decision.sequence, decision.version, decision.metadataHash, decision.version, decision.digest, now)
+    if !activate(handle, decision.digest, artifact, active) { let message = lastError(); end(handle); return systemFailure(message) }
+    end(handle)
+    return errors.boolean(true)
+}
+
+// Fetch one signature+metadata envelope, persist the authenticated floor, then
+// fetch and hash the selected artifact. All network failures are error values.
+// Calls are synchronous; run this outside the UI dispatch callback.
+public function downloadAndInstall(root: Text, key: Bytes, app: Text, target: Text, channel: Text,
+    origin: Text, now: Integer, installationID: Text, currentVersion: Text): errors.BooleanResult {
+    if target != hostTarget() {
+        return errors.booleanFailure(errors.make(errors.invalidDataCode(), 0, "target does not match this executable's platform and architecture"))
+    }
+    let response = http.getBounded(origin + "/channels/" + channel + "/" + target + ".update",
+        ["Cache-Control: no-cache", "Accept-Encoding: identity"], 4160)
+    if response.status != 200 || response.error != "" {
+        return errors.booleanFailure(errors.make(errors.unavailableCode(), 0, "update metadata download failed: " + response.error))
+    }
+    let envelope = Bytes(response.body)
+    if envelope.length <= 64 {
+        return errors.booleanFailure(errors.make(errors.invalidDataCode(), 0, "short update metadata envelope"))
+    }
+    let signature = envelope.slice(0, 64)
+    let metadata = envelope.slice(64, envelope.length)
+    let decision = inspect(metadata, signature, key, app, target, channel, origin, now, installationID,
+        currentVersion, 0, currentVersion, "")
+    if !accepted(decision) { return errors.booleanFailure(decision.error) }
+    // Empty artifact cannot activate. This records metadata before a network
+    // failure and checks the durable floor and actual active version/cohort.
+    let observed = install(root, metadata, signature, key, Bytes(), app, target, channel, origin, now,
+        installationID, currentVersion)
+    if errors.booleanOk(observed) { return observed }
+    if errors.code(errors.booleanError(observed)) != errors.invalidDataCode() { return observed }
+    let artifact = http.getBounded(decision.url, ["Accept-Encoding: identity"], decision.size)
+    if artifact.status != 200 || artifact.error != "" {
+        return errors.booleanFailure(errors.make(errors.unavailableCode(), 0, "update artifact download failed: " + artifact.error))
+    }
+    return install(root, metadata, signature, key, Bytes(artifact.body), app, target, channel, origin,
+        now, installationID, currentVersion)
+}

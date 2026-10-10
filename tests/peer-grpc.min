@@ -1,0 +1,59 @@
+use "peergrpc" as grpc
+use "errors" as errors
+function report(server: grpc.Server): Integer {
+    let open = grpc.requests(server, 1000000)
+    if !grpc.openOk(open) { print("ERROR " + Text(errors.code(grpc.openError(open)))); return 0 }
+    print("OPEN " + Text(grpc.openStreamID(open)) + " " + grpc.openExitID(open) + " " + grpc.openConnID(open) + " " + Text(grpc.openDeadlineSeconds(open)) + " " + Text(grpc.openGrantBytes(open)))
+    return grpc.openStreamID(open)
+}
+let server = grpc.create(); grpc.transportTick(server, 1000)
+let input = readBytesFile(argument(0)); let mode = argument(2)
+let result = grpc.receive(server, input)
+if !errors.booleanOk(result) { print("ERROR " + Text(errors.code(errors.booleanError(result)))) }
+else if mode == "timeout" || mode == "timeout-wall" {
+    let open = grpc.requests(server, 1000000)
+    if !grpc.openOk(open) { fail("valid 500ms deadline open rejected") }
+    if grpc.openDeadlineSeconds(open) != 1001 || grpc.openDeadlineMilliseconds(open) != 1000500 || grpc.openMonotonicDeadlineMillis(open) != 1500 { fail("deadline lost exact relative milliseconds") }
+    grpc.tick(server, 1000499); grpc.transportTick(server, 1499)
+    if grpc.nextDeadlineMillis(server) != 1000500 { fail("deadline fired early") }
+    if mode == "timeout-wall" { grpc.tick(server, 1000500) }
+    else {
+        grpc.tick(server, 999000) // Backward wall clock cannot extend the relative deadline.
+        grpc.transportTick(server, 1500)
+    }
+    let read = grpc.read(server, grpc.openStreamID(open), 1)
+    if errors.code(errors.bytesError(read)) != errors.timedOutCode() { fail("exact monotonic millisecond deadline not enforced") }
+    print("TIMEOUT OK")
+} else if mode == "echo" {
+    let id = report(server)
+    if id != 0 {
+        let status = grpc.sendStatus(server, id, "ok")
+        if !errors.booleanOk(status) { fail("cannot send initial status") }
+        if !errors.booleanOk(grpc.receive(server, readBytesFile(argument(3)))) { fail("DATA followup rejected") }
+        let read = grpc.read(server, id, 65536)
+        while errors.bytesStatus(read) == errors.successStatus() { let bytes = errors.bytesValue(read); print("DATA " + Text(bytes.length)); grpc.write(server, id, bytes); read = grpc.read(server, id, 65536) }
+        if errors.bytesStatus(read) != errors.endOfStreamStatus() && !errors.isWouldBlock(errors.bytesError(read)) { print("READERROR " + Text(errors.code(errors.bytesError(read)))) }
+        grpc.closeStream(server, id, 0, "done %\n")
+    }
+} else if mode == "reject" {
+    let id = report(server)
+    if id != 0 {
+        let result = grpc.sendStatusDetail(server, id, argument(3), "capacity reason")
+        if !errors.booleanOk(result) { fail("known rejection status was not serialized") }
+        if errors.booleanOk(grpc.write(server, id, Bytes("forbidden"))) { fail("rejected call accepted data") }
+        if errors.bytesOk(grpc.read(server, id, 1)) { fail("rejected call exposed unadmitted request data") }
+    }
+} else if mode == "established" {
+    let open = grpc.requests(server, 1000000)
+    if !grpc.openOk(open) || grpc.openDeadlineMilliseconds(open) != 1010000 { fail("default establishment deadline missing") }
+    grpc.sendStatus(server, grpc.openStreamID(open), "ok")
+    let ack = Bytes(); for i in 0..9 { ack.add(0) }; ack[3] = 4; ack[4] = 1
+    grpc.receive(server, ack)
+    grpc.tick(server, 1010000); grpc.transportTick(server, 11000)
+    if grpc.nextDeadlineMillis(server) != 0 { fail("establishment default cut off established stream") }
+    if !errors.isWouldBlock(errors.bytesError(grpc.read(server, grpc.openStreamID(open), 1))) { fail("established default deadline remained active") }
+    print("ESTABLISHED OK")
+} else if mode == "trap" {
+    print(grpc.openExitID(grpc.requests(server, 1000000)))
+} else { report(server) }
+writeBytesFile(argument(1), grpc.takeOutgoing(server, 1048576))

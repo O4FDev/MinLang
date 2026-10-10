@@ -1,0 +1,348 @@
+// Hearth device binding and DialGrant verification. Protocol/policy are Minyar;
+// the pinned, unmodified Monocypher 4.0.3 provider verifies Ed25519 only.
+use "errors" as errors
+use "json" as json
+use "tlsserver" as tls
+
+function verify(data: Bytes, signature: Bytes, key: Bytes): Boolean { native "update" }
+
+public record KeySet {
+    private error: errors.Error
+    private ids: List<Text>
+    private keys: List<Bytes>
+}
+public record Grant {
+    private error: errors.Error
+    private exit: Text
+    private connection: Text
+    private host: Text
+    private ip: Text
+    private destinationPort: Integer
+    private expiry: Integer
+    private originalToken: Bytes
+}
+public record Binding {
+    private error: errors.Error
+    private exit: Text
+    private device: Text
+}
+
+function badKeys(message: Text): KeySet {
+    return KeySet { error: errors.make(errors.invalidDataCode(), 0, message); ids: []; keys: [] }
+}
+function rejected(message: Text): Grant {
+    return Grant { error: errors.make(errors.permissionDeniedCode(), 0, message);
+        exit: ""; connection: ""; host: ""; ip: ""; destinationPort: 0; expiry: 0; originalToken: Bytes() }
+}
+function unbound(message: Text): Binding {
+    return Binding { error: errors.make(errors.certificateCode(), 0, message); exit: ""; device: "" }
+}
+public function keysOk(value: KeySet): Boolean { return !errors.isError(value.error) }
+public function keysError(value: KeySet): errors.Error { return value.error }
+public function grantOk(value: Grant): Boolean { return !errors.isError(value.error) }
+public function grantError(value: Grant): errors.Error { return value.error }
+public function bindingOk(value: Binding): Boolean { return !errors.isError(value.error) }
+public function bindingError(value: Binding): errors.Error { return value.error }
+function requireGrant(value: Grant) { if !grantOk(value) { fail("cannot read a rejected grant") } }
+public function exitID(value: Grant): Text { requireGrant(value); return value.exit }
+public function connID(value: Grant): Text { requireGrant(value); return value.connection }
+public function targetHost(value: Grant): Text { requireGrant(value); return value.host }
+public function targetIP(value: Grant): Text { requireGrant(value); return value.ip }
+public function port(value: Grant): Integer { requireGrant(value); return value.destinationPort }
+public function expires(value: Grant): Integer { requireGrant(value); return value.expiry }
+// Return a copy: neither caller mutation of the original input nor mutation of
+// a returned byte buffer can change the exact verified token retained here.
+public function grantBytes(value: Grant): Bytes { requireGrant(value); return value.originalToken.slice(0, value.originalToken.length) }
+public function boundExitID(value: Binding): Text {
+    if !bindingOk(value) { fail("cannot read a rejected device binding") }
+    return value.exit
+}
+public function boundDeviceID(value: Binding): Text {
+    if !bindingOk(value) { fail("cannot read a rejected device binding") }
+    return value.device
+}
+
+function identifier(text: Text): Boolean {
+    if text.length < 1 || text.length > 128 { return false }
+    for c in text {
+        if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.') { return false }
+    }
+    return true
+}
+function field(value: json.Value, name: Text): Text {
+    let member = json.member(value, name)
+    if member.kind != json.STRING { return "" }
+    return member.text
+}
+function has(value: json.Value, name: Text): Boolean {
+    for key in value.keys { if key == name { return true } }
+    return false
+}
+function allowed(value: json.Value, names: List<Text>): Boolean {
+    if value.kind != json.OBJECT { return false }
+    for key in value.keys {
+        let found = false
+        for name in names { if name == key { found = true } }
+        if !found { return false }
+    }
+    return true
+}
+function sextet(byte: Integer): Integer {
+    if byte >= 65 && byte <= 90 { return byte - 65 }
+    if byte >= 97 && byte <= 122 { return byte - 71 }
+    if byte >= 48 && byte <= 57 { return byte + 4 }
+    if byte == 45 { return 62 }
+    if byte == 95 { return 63 }
+    return -1
+}
+// No padding, ignored characters or unused nonzero pad bits (RFC 4648 §3.5).
+// Empty Bytes is the error sentinel; accepted protocol segments are nonempty.
+function decode(encoded: Bytes, maximum: Integer): Bytes {
+    if encoded.length < 1 || encoded.length > maximum * 2 || encoded.length % 4 == 1 { return Bytes() }
+    let output = Bytes(); let bits = 0; let value = 0
+    for byte in encoded {
+        let digit = sextet(byte)
+        if digit < 0 { return Bytes() }
+        value = (value << 6) | digit; bits += 6
+        if bits >= 8 {
+            bits -= 8; output.add((value >> bits) & 255)
+            if output.length > maximum { return Bytes() }
+            value = value & ((1 << bits) - 1)
+        }
+    }
+    if value != 0 { return Bytes() }
+    return output
+}
+function canonicalPoint(data: Bytes, offset: Integer): Boolean {
+    // Ed25519's compressed y must be less than 2^255-19. Monocypher permits
+    // noncanonical curve encodings; Hearth requires canonical wire encoding.
+    if data.length - offset < 32 { return false }
+    // x=0 has no negative encoding. Its y coordinates are 1 and p-1.
+    if data[offset + 31] >= 128 {
+        let identity = data[offset] == 1 && data[offset + 31] == 128
+        let opposite = data[offset] == 236 && data[offset + 31] == 255
+        for index in 1..31 {
+            if data[offset + index] != 0 { identity = false }
+            if data[offset + index] != 255 { opposite = false }
+        }
+        if identity || opposite { return false }
+    }
+    if (data[offset + 31] & 127) < 127 { return true }
+    for reverse in 1..31 {
+        let byte = data[offset + 31 - reverse]
+        if byte < 255 { return true }
+    }
+    return data[offset] < 237
+}
+function validKey(key: Bytes): Boolean {
+    if key.length != 32 || !canonicalPoint(key, 0) { return false }
+    let nonzero = 0
+    for byte in key { nonzero = nonzero | byte }
+    if nonzero == 0 { return false }
+    // Reject pure low-order keys using the provider, rather than a second curve
+    // implementation: R=identity,S=0 must never verify for a signing key.
+    let degenerate = Bytes(64); degenerate[0] = 1
+    return !verify(Bytes(), degenerate, key)
+}
+
+// JWKS comes from the authenticated internal control plane. Unknown IDs never
+// trigger network access or implicit key registration.
+public function parseKeys(data: Bytes): KeySet {
+    let document = json.parseUniqueBytes(data, 65536)
+    if document.kind != json.OBJECT { return badKeys("invalid JWKS metadata") }
+    let entries = json.member(document, "keys")
+    if entries.kind != json.ARRAY || entries.items.length < 1 || entries.items.length > 64 { return badKeys("JWKS must contain 1 to 64 keys") }
+    let ids: List<Text> = []; let keys: List<Bytes> = []
+    for entry in entries.items {
+        if !allowed(entry, ["kty", "crv", "kid", "x", "alg", "use", "key_ops"]) ||
+           field(entry, "kty") != "OKP" || field(entry, "crv") != "Ed25519" || !identifier(field(entry, "kid")) {
+            return badKeys("unsupported signing key")
+        }
+        if (has(entry, "alg") && field(entry, "alg") != "EdDSA") || (has(entry, "use") && field(entry, "use") != "sig") { return badKeys("key algorithm or use is not EdDSA signing") }
+        if has(entry, "key_ops") {
+            let operations = json.member(entry, "key_ops")
+            if operations.kind != json.ARRAY || operations.items.length != 1 || operations.items[0].kind != json.STRING || operations.items[0].text != "verify" { return badKeys("key is not verify-only") }
+        }
+        let id = field(entry, "kid")
+        for previous in ids { if previous == id { return badKeys("duplicate signing key ID") } }
+        let key = decode(Bytes(field(entry, "x")), 32)
+        if !validKey(key) { return badKeys("invalid Ed25519 public key encoding") }
+        ids.add(id); keys.add(key)
+    }
+    return KeySet { error: errors.none(); ids: ids; keys: keys }
+}
+
+function natural(text: Text, maximum: Integer): Integer {
+    if text.length < 1 || text.length > 19 || (text.length > 1 && text[0] == '0') { return -1 }
+    let value = 0
+    for c in text {
+        if c < '0' || c > '9' { return -1 }
+        let digit = Integer(c) - 48
+        if value > (maximum - digit) / 10 { return -1 }
+        value = value * 10 + digit
+    }
+    return value
+}
+function integer(value: json.Value, name: Text, maximum: Integer): Integer {
+    let member = json.member(value, name)
+    if member.kind != json.NUMBER { return -1 }
+    return natural(member.text, maximum)
+}
+function ipv4(text: Text): Boolean {
+    let start = 0; let components = 0
+    for index in 0..text.length {
+        if text[index] == '.' {
+            if natural(text.slice(start, index), 255) < 0 { return false }
+            start = index + 1; components += 1
+        }
+    }
+    return components == 3 && natural(text.slice(start, text.length), 255) >= 0
+}
+function hex(c: Character): Boolean {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+function ipv6(text: Text): Boolean {
+    if text.length < 2 || text.length > 45 { return false }
+    let index = 0; let groups = 0; let compressed = false
+    if text[0] == ':' {
+        if text[1] != ':' { return false }
+        compressed = true; index = 2
+    }
+    while index < text.length {
+        let start = index
+        while index < text.length && hex(text[index]) { index += 1 }
+        if index < text.length && text[index] == '.' {
+            if !ipv4(text.slice(start, text.length)) { return false }
+            groups += 2; index = text.length; break
+        }
+        if index - start < 1 || index - start > 4 { return false }
+        groups += 1
+        if index == text.length { break }
+        if text[index] != ':' { return false }
+        index += 1
+        if index < text.length && text[index] == ':' {
+            if compressed { return false }
+            compressed = true; index += 1
+        } else if index == text.length { return false }
+    }
+    if compressed { return groups < 8 }
+    return groups == 8
+}
+function hostName(text: Text): Boolean {
+    if text.length < 1 || text.length > 253 || ipv4(text) { return false }
+    let start = 0
+    for index in 0..text.length {
+        let c = text[index]
+        if c == '.' {
+            if index == start || index - start > 63 || text[start] == '-' || text[index - 1] == '-' { return false }
+            start = index + 1
+        } else if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-') { return false }
+    }
+    return start < text.length && text.length - start <= 63 && text[start] != '-' && text[text.length - 1] != '-'
+}
+
+// authenticatedExitID comes from bindDevice/the mux's trusted registry binding.
+// The signed destination is authoritative; callers must dial these getters.
+// Grant only authorizes establishment. Deadline must remain <=exp despite skew.
+public function inspect(token: Bytes, keys: KeySet, authenticatedExitID: Text, requestExitID: Text, requestConnID: Text, nowSeconds: Integer, establishmentDeadlineSeconds: Integer): Grant {
+    if !keysOk(keys) { return rejected("signing key bundle is invalid") }
+    if !identifier(authenticatedExitID) || requestExitID != authenticatedExitID || !identifier(requestConnID) { return rejected("request does not match the authenticated exit") }
+    if token.length < 1 || token.length > 8192 { return rejected("DialGrant size limit exceeded") }
+    let dots: List<Integer> = []
+    for index in 0..token.length { if token[index] == 46 { dots.add(index); if dots.length > 2 { return rejected("invalid compact DialGrant") } } }
+    if dots.length != 2 || dots[0] == 0 || dots[1] == dots[0] + 1 || dots[1] == token.length - 1 { return rejected("invalid compact DialGrant") }
+    let headerBytes = decode(token.slice(0, dots[0]), 1024)
+    let payloadBytes = decode(token.slice(dots[0] + 1, dots[1]), 4096)
+    let signature = decode(token.slice(dots[1] + 1, token.length), 64)
+    if headerBytes.length == 0 || payloadBytes.length == 0 || signature.length != 64 || !canonicalPoint(signature, 0) { return rejected("invalid DialGrant encoding") }
+    let header = json.parseUniqueBytes(headerBytes, 1024)
+    if !allowed(header, ["alg", "typ", "kid"]) || field(header, "alg") != "EdDSA" || field(header, "typ") != "hearth-dial-grant" { return rejected("unsupported DialGrant algorithm or type") }
+    let key = Bytes(); let kid = field(header, "kid")
+    for index in 0..keys.ids.length { if keys.ids[index] == kid { key = keys.keys[index] } }
+    if key.length != 32 { return rejected("unknown DialGrant signing key") }
+    // Verify exact wire signing input, never a reserialized JSON tree.
+    if !verify(token.slice(0, dots[1]), signature, key) { return rejected("invalid DialGrant signature") }
+    let claims = json.parseUniqueBytes(payloadBytes, 4096)
+    if claims.kind != json.OBJECT || field(claims, "iss") != "proxy-gateway" || field(claims, "exit_id") != authenticatedExitID || field(claims, "conn_id") != requestConnID { return rejected("DialGrant issuer, exit or connection mismatch") }
+    if has(claims, "kid") && field(claims, "kid") != kid { return rejected("DialGrant key ID mismatch") }
+    let host = field(claims, "target_host"); let ip = field(claims, "target_ip")
+    if has(claims, "target_host") == has(claims, "target_ip") || (has(claims, "target_host") && !hostName(host)) || (has(claims, "target_ip") && !ipv4(ip) && !ipv6(ip)) { return rejected("DialGrant requires exactly one valid target") }
+    let destinationPort = integer(claims, "port", 65535)
+    let issued = integer(claims, "iat", 9223372036854775777)
+    let expiry = integer(claims, "exp", 9223372036854775777)
+    if destinationPort < 1 || issued < 0 || expiry <= issued || expiry - issued > 60 { return rejected("invalid DialGrant port or lifetime") }
+    if nowSeconds < 0 || nowSeconds > 9223372036854775777 || issued > nowSeconds + 30 || expiry <= nowSeconds - 30 || establishmentDeadlineSeconds <= nowSeconds || establishmentDeadlineSeconds > expiry { return rejected("DialGrant time or establishment deadline invalid") }
+    return Grant { error: errors.none(); exit: authenticatedExitID; connection: requestConnID; host: host; ip: ip; destinationPort: destinationPort; expiry: expiry; originalToken: token.slice(0, token.length) }
+}
+
+// Bounded DER walk for URI SAN. TLS owns chain/EKU/signature/possession checks.
+record DER { source: Bytes; at: Integer; end: Integer; tag: Integer; first: Integer; last: Integer; valid: Boolean }
+function cursor(bytes: Bytes): DER { return DER { source: bytes; at: 0; end: bytes.length; tag: 0; first: 0; last: 0; valid: true } }
+function next(value: DER): Boolean {
+    if !value.valid || value.end - value.at < 2 { value.valid = false; return false }
+    value.tag = value.source[value.at]; let length = value.source[value.at + 1]; value.at += 2
+    if length >= 128 {
+        let count = length & 127
+        if count < 1 || count > 4 || count > value.end - value.at || value.source[value.at] == 0 { value.valid = false; return false }
+        length = 0
+        for index in 0..count { length = length * 256 + value.source[value.at + index] }
+        value.at += count
+        if length < 128 { value.valid = false; return false }
+    }
+    if length > value.end - value.at { value.valid = false; return false }
+    value.first = value.at; value.last = value.at + length; value.at = value.last
+    return true
+}
+function child(value: DER): DER { return DER { source: value.source; at: value.first; end: value.last; tag: 0; first: 0; last: 0; valid: true } }
+function deviceURI(certificate: Bytes): Text {
+    if certificate.length < 1 || certificate.length > 32768 { return "" }
+    let outer = cursor(certificate)
+    if !next(outer) || outer.tag != 48 || outer.at != outer.end { return "" }
+    let body = child(outer)
+    if !next(body) || body.tag != 48 { return "" }
+    let tbs = child(body)
+    if tbs.at < tbs.end && tbs.source[tbs.at] == 160 { if !next(tbs) { return "" } }
+    for index in 0..6 { if !next(tbs) { return "" } }
+    let found = false; let uri = ""
+    while tbs.at < tbs.end {
+        if !next(tbs) { return "" }
+        if tbs.tag == 163 {
+            let wrapper = child(tbs)
+            if !next(wrapper) || wrapper.tag != 48 || wrapper.at != wrapper.end { return "" }
+            let extensions = child(wrapper)
+            while extensions.at < extensions.end {
+                if !next(extensions) || extensions.tag != 48 { return "" }
+                let extension = child(extensions)
+                if !next(extension) || extension.tag != 6 { return "" }
+                let isSAN = extension.last - extension.first == 3 && extension.source[extension.first] == 85 && extension.source[extension.first + 1] == 29 && extension.source[extension.first + 2] == 17
+                if extension.at < extension.end && extension.source[extension.at] == 1 { if !next(extension) { return "" } }
+                if !next(extension) || extension.tag != 4 || extension.at != extension.end { return "" }
+                if isSAN {
+                    if found { return "" }; found = true
+                    let octets = child(extension)
+                    if !next(octets) || octets.tag != 48 || octets.at != octets.end { return "" }
+                    let names = child(octets)
+                    while names.at < names.end {
+                        if !next(names) { return "" }
+                        if names.tag == 134 {
+                            if uri != "" || names.last - names.first < 1 || names.last - names.first > 143 { return "" }
+                            for index in names.first..names.last { if names.source[index] < 33 || names.source[index] > 126 { return "" } }
+                            uri = Text(names.source.slice(names.first, names.last))
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return uri
+}
+
+// Registry IDs/revoked are trusted configuration, never peer metadata. Caller
+// refreshes revocations (<1 minute), rechecks before heartbeat/dial and drops a
+// revoked mux. Pass the actual TLS session; never manufacture its fields.
+public function bindDevice(session: tls.Session, trustedRegistryDeviceID: Text, trustedRegistryExitID: Text, revoked: Boolean): Binding {
+    if session.state != tls.ESTABLISHED || !session.requireClient || !session.authenticated || session.peerCertificate.length == 0 { return unbound("device TLS identity is not authenticated") }
+    if revoked || !identifier(trustedRegistryDeviceID) || !identifier(trustedRegistryExitID) { return unbound("device registry binding is revoked or invalid") }
+    if deviceURI(session.peerCertificate) != "hearth://device/" + trustedRegistryDeviceID { return unbound("device certificate does not match the registry") }
+    return Binding { error: errors.none(); exit: trustedRegistryExitID; device: trustedRegistryDeviceID }
+}

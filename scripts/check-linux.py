@@ -23,7 +23,7 @@ BUILD = ['build/minyarc', 'build/compiler-stage3.ll', 'build/minyarc-sanitize',
          'build/minyar-runtime.o', 'build/minyar-runtime-sanitize.o', 'build/ownership-runtime.o',
          'build/runtime-unit', 'build/runtime-unit-sanitize',
          'build/module-compiler-stage3.ll']
-TARGETS = ['check-toolchain-stamp', 'check-toolchain-portability', 'check-cold-bootstrap',
+TARGETS = ['check-linux-snapshot', 'check-toolchain-stamp', 'check-toolchain-portability', 'check-cold-bootstrap',
            'check-bootstrap-policy', 'check-peer-semantics', 'check-memory-regressions',
            'check-bootstrap-portability', 'check-bootstrap-records',
            'check-measurement-stats', 'check-budget-harness', 'check-stack-limits',
@@ -31,6 +31,9 @@ TARGETS = ['check-toolchain-stamp', 'check-toolchain-portability', 'check-cold-b
            'check-compiler-hardening', 'check-linkage', 'check-source-map', 'check-symbol-order', 'check-list-access',
            'check-checked-arithmetic', 'check-checked-scalars',
            'check-runtime-bytes', 'check-runtime-traps', 'check-runtime-numeric',
+           'check-errors-values', 'check-net', 'check-net-loop', 'check-tls-sanitize', 'check-json-parser-sanitize',
+           'check-feature-dispatch', 'check-managed-graphs', 'check-managed-graphs-launcher',
+           'check-callbacks', 'check-callback-domains', 'check-isolated-workers',
            'check-ownership-policy', 'check-stack-ownership', 'check-runtime-cache',
            'check-generated-sanitizer', 'check-sanitized-fixed-point',
            'check-smoke', 'check-release-build', 'check-launcher-isolation',
@@ -44,8 +47,25 @@ TARGETS = ['check-toolchain-stamp', 'check-toolchain-portability', 'check-cold-b
            'check-ownership-mutation', 'check-scalar-record-initialization',
            'check-incremental-modules', 'check-incremental-modules-sanitize',
            'check-sanitize']
-DIRECTORIES = ('bootstrap', 'compiler', 'runtime', 'library', 'vendor', 'examples', 'tests', 'build-support', 'docs',
+DIRECTORIES = ('.github', 'bootstrap', 'compiler', 'runtime', 'library', 'vendor', 'examples', 'tests', 'build-support', 'docs',
                'experiments', 'scripts', 'tools')
+
+
+def copy_source_snapshot(source, work):
+    """Copy declared sources without inheriting generated or host artifacts."""
+    for name in DIRECTORIES:
+        shutil.copytree(source / name, work / name,
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+    for name in ('Makefile', 'minyar'):
+        shutil.copy2(source / name, work / name)
+
+
+
+def snapshot_sources(source, work):
+    """Copy the correctness inputs without host binaries or repository state."""
+    copy_source_snapshot(source, work)
+    return {str(path.relative_to(work)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(work.rglob('*')) if path.is_file()}
 
 
 def main():
@@ -61,7 +81,7 @@ def main():
     source = (a.resume.resolve() / 'source') if a.resume else a.source.resolve()
     if a.timeout < 1:
         p.error('timeout must be positive')
-    required = ['Makefile', 'minyar', 'runtime/minyar_heap.h',
+    required = ['Makefile', 'minyar', '.github/workflows/ci.yml', 'runtime/minyar_heap.h',
                 'tests/generated-stack-sanitizer.py', 'tests/llvm_sanitizer.py',
                 'tests/binary-expression-ownership.py',
                 'tests/integer-text-cache.c', 'tests/integer-text-cache.py',
@@ -129,14 +149,7 @@ def main():
                   'invocation': sys.argv, 'tools': tools, 'source_sha256': {}, 'checks': [],
                   'scope': 'Correctness on the recorded Linux host/toolchain. No performance or deadline certification.'}
         # Copy source only: never inherit host binaries, generated IR or .git state.
-        for name in DIRECTORIES:
-            shutil.copytree(source / name, work / name,
-                            ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
-        for name in ('Makefile', 'minyar'):
-            shutil.copy2(source / name, work / name)
-        for path in sorted(work.rglob('*')):
-            if path.is_file():
-                report['source_sha256'][str(path.relative_to(work))] = hashlib.sha256(path.read_bytes()).hexdigest()
+        report['source_sha256'] = snapshot_sources(source, work)
     runner_bytes = Path(__file__).read_bytes()
     runner_hash = hashlib.sha256(runner_bytes).hexdigest()
     runner_history = evidence / 'runners'

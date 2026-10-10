@@ -1,0 +1,243 @@
+// RFC 9001 packet protection; RFC 9369 version-specific salts and labels.
+// Transport owns packet-number uniqueness, key usage limits and key phases.
+use "aes" as aes
+use "crypto" as crypto
+use "errors" as errors
+
+public constant VERSION_1 = 1
+public constant VERSION_2 = 0x6b3343cf
+public constant AES128_GCM = 0x1301
+public constant CHACHA20_POLY1305 = 0x1303
+constant MAX_NUMBER = 0x3fffffffffffffff
+
+public record Keys {
+    secret: Bytes
+    key: Bytes
+    iv: Bytes
+    hp: Bytes
+    suite: Integer
+    version: Integer
+}
+
+function prefix(version: Integer): Text {
+    if version == VERSION_2 { return "quicv2 " }
+    return "quic "
+}
+
+function emptyKeys(version: Integer): Keys {
+    return Keys { secret: Bytes(); key: Bytes(); iv: Bytes(); hp: Bytes(); suite: 0; version: version }
+}
+
+public function traffic(version: Integer, suite: Integer, secret: Bytes): Keys {
+    if (version != VERSION_1 && version != VERSION_2) || secret.length != 32 { return emptyKeys(version) }
+    let length = 16
+    if suite == CHACHA20_POLY1305 { length = 32 }
+    else if suite != AES128_GCM { return emptyKeys(version) }
+    let label = prefix(version)
+    return Keys {
+        secret: secret.slice(0, 32)
+        key: crypto.expandLabel(secret, label + "key", Bytes(), length)
+        iv: crypto.expandLabel(secret, label + "iv", Bytes(), 12)
+        hp: crypto.expandLabel(secret, label + "hp", Bytes(), length)
+        suite: suite; version: version
+    }
+}
+
+public function initial(version: Integer, destination: Bytes, server: Boolean): Keys {
+    if destination.length > 20 || (version != VERSION_1 && version != VERSION_2) { return emptyKeys(version) }
+    let salt = crypto.fromHex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a")
+    if version == VERSION_2 { salt = crypto.fromHex("0dede3def700a6db819381be6e269dcbf9bd2ed9") }
+    let secret = crypto.hkdfExtract(salt, destination)
+    let label = "client in"
+    if server { label = "server in" }
+    return traffic(version, AES128_GCM, crypto.expandLabel(secret, label, Bytes(), 32))
+}
+
+// RFC 9001 section 6.1: header protection key remains unchanged on update.
+public function update(keys: Keys): Keys {
+    let secret = crypto.expandLabel(keys.secret, prefix(keys.version) + "ku", Bytes(), 32)
+    let next = traffic(keys.version, keys.suite, secret)
+    next.hp = keys.hp.slice(0, keys.hp.length)
+    return next
+}
+
+public function nonce(iv: Bytes, number: Integer): Bytes {
+    if iv.length != 12 || number < 0 || number > MAX_NUMBER { return Bytes() }
+    let result = iv.slice(0, 12)
+    for index in 0..8 { result[11 - index] = result[11 - index] ^ ((number >> (index * 8)) & 255) }
+    return result
+}
+
+function validKeys(keys: Keys): Boolean {
+    if keys.iv.length != 12 { return false }
+    if keys.suite == AES128_GCM { return keys.key.length == 16 && keys.hp.length == 16 }
+    return keys.suite == CHACHA20_POLY1305 && keys.key.length == 32 && keys.hp.length == 32
+}
+
+function failure(message: Text): errors.BytesResult {
+    return errors.bytesFailure(errors.make(errors.protocolCode(), 0, message))
+}
+
+public function seal(keys: Keys, number: Integer, header: Bytes, payload: Bytes): errors.BytesResult {
+    if !validKeys(keys) || number < 0 || number > MAX_NUMBER || header.length > 65535 || payload.length > 65535 {
+        return failure("invalid QUIC packet protection input")
+    }
+    let iv = nonce(keys.iv, number)
+    if keys.suite == CHACHA20_POLY1305 { return errors.bytes(crypto.seal(keys.key, iv, header, payload)) }
+    let encrypted = aes.encrypt(keys.key, iv, header, payload)
+    if encrypted.length != payload.length + 16 { return failure("AES-GCM provider failed") }
+    return errors.bytes(encrypted)
+}
+
+public function open(keys: Keys, number: Integer, header: Bytes, sealed: Bytes): errors.BytesResult {
+    if !validKeys(keys) || number < 0 || number > MAX_NUMBER || header.length > 65535 || sealed.length < 16 || sealed.length > 65551 {
+        return failure("invalid protected QUIC packet")
+    }
+    let iv = nonce(keys.iv, number)
+    if keys.suite == CHACHA20_POLY1305 {
+        let result = crypto.open(keys.key, iv, header, sealed)
+        if !result.valid { return failure("QUIC packet authentication failed") }
+        return errors.bytes(result.plaintext)
+    }
+    let decrypted = aes.decrypt(keys.key, iv, header, sealed)
+    if decrypted.length != sealed.length - 15 || decrypted[0] != 1 { return failure("QUIC packet authentication failed") }
+    return errors.bytes(decrypted.slice(1, decrypted.length))
+}
+
+public function mask(keys: Keys, sample: Bytes): Bytes {
+    if !validKeys(keys) || sample.length != 16 { return Bytes() }
+    if keys.suite == AES128_GCM {
+        let block = aes.block(keys.hp, sample)
+        if block.length != 16 { return Bytes() }
+        return block.slice(0, 5)
+    }
+    let counter = sample[0] | (sample[1] << 8) | (sample[2] << 16) | (sample[3] << 24)
+    return crypto.chachaBlock(keys.hp, counter, sample.slice(4, 16)).slice(0, 5)
+}
+
+public function protect(keys: Keys, header: Bytes, offset: Integer, number: Integer, payload: Bytes): errors.BytesResult {
+    if header.length < 2 || offset < 1 || offset > header.length - 1 { return failure("invalid QUIC header") }
+    let length = (header[0] & 3) + 1
+    let long = (header[0] & 128) != 0
+    let reserved = 0x18
+    if long { reserved = 0x0c }
+    if offset + length != header.length || (header[0] & 64) == 0 || (header[0] & reserved) != 0 { return failure("invalid unprotected QUIC header") }
+    let truncated = 0
+    for index in offset..header.length { truncated = (truncated << 8) | header[index] }
+    let limit = 1 << (length * 8)
+    if number < 0 || number > MAX_NUMBER || truncated != (number & (limit - 1)) { return failure("QUIC packet number does not match header") }
+    let sealed = seal(keys, number, header, payload)
+    if !errors.bytesOk(sealed) { return sealed }
+    let result = header.slice(0, header.length)
+    result.addBytes(errors.bytesValue(sealed))
+    if result.length < offset + 20 { return failure("QUIC payload needs padding for header protection") }
+    let bits = mask(keys, result.slice(offset + 4, offset + 20))
+    if bits.length != 5 { return failure("QUIC header protection failed") }
+    let firstMask = 0x1f
+    if long { firstMask = 0x0f }
+    result[0] = result[0] ^ (bits[0] & firstMask)
+    for index in 0..length { result[offset + index] = result[offset + index] ^ bits[index + 1] }
+    return errors.bytes(result)
+}
+
+// RFC 9000 Appendix A.3; expected is largest authenticated + 1.
+public function packetNumber(truncated: Integer, length: Integer, largest: Integer): Integer {
+    if length < 1 || length > 4 || largest < -1 || largest > MAX_NUMBER || truncated < 0 { return -1 }
+    let window = 1 << (length * 8)
+    if truncated >= window { return -1 }
+    let expected = largest + 1
+    let candidate = (expected & ~(window - 1)) | truncated
+    if candidate + window / 2 <= expected && candidate <= MAX_NUMBER - window { candidate += window }
+    else if candidate > expected + window / 2 && candidate >= window { candidate -= window }
+    if candidate > MAX_NUMBER { return -1 }
+    return candidate
+}
+
+public record Packet {
+    valid: Boolean
+    number: Integer
+    header: Bytes
+    payload: Bytes
+    error: errors.Error
+}
+
+function rejected(message: Text): Packet {
+    return Packet { valid: false; number: -1; header: Bytes(); payload: Bytes(); error: errors.make(errors.protocolCode(), 0, message) }
+}
+
+// Only header protection is removed here. The header and number remain
+// unauthenticated until unprotect succeeds; callers may use them to select
+// precomputed current/previous/next keys, never to mutate connection state.
+public function inspect(keys: Keys, packet: Bytes, offset: Integer, largest: Integer): Packet {
+    if !validKeys(keys) || offset < 1 || offset > 65535 || packet.length < offset + 20 || packet.length > 65535 { return rejected("truncated or invalid QUIC packet") }
+    let header = packet.slice(0, offset + 4)
+    let long = (header[0] & 128) != 0
+    if (header[0] & 64) == 0 { return rejected("invalid fixed bit") }
+    let bits = mask(keys, packet.slice(offset + 4, offset + 20))
+    if bits.length != 5 { return rejected("QUIC header protection failed") }
+    let firstMask = 0x1f
+    if long { firstMask = 0x0f }
+    header[0] = header[0] ^ (bits[0] & firstMask)
+    let length = (header[0] & 3) + 1
+    let truncated = 0
+    for index in 0..length {
+        header[offset + index] = header[offset + index] ^ bits[index + 1]
+        truncated = (truncated << 8) | header[offset + index]
+    }
+    header.resize(offset + length)
+    let number = packetNumber(truncated, length, largest)
+    if number < 0 { return rejected("invalid packet number") }
+    return Packet { valid: true; number: number; header: header; payload: packet.slice(offset + length, packet.length); error: errors.none() }
+}
+
+public function unprotect(keys: Keys, packet: Bytes, offset: Integer, largest: Integer): Packet {
+    let input = inspect(keys, packet, offset, largest)
+    if !input.valid { return input }
+    let number = input.number; let header = input.header
+    let long = (header[0] & 128) != 0
+    let opened = open(keys, number, header, input.payload)
+    if !errors.bytesOk(opened) { return rejected("QUIC packet authentication failed") }
+    let reserved = 0x18
+    if long { reserved = 0x0c }
+    if (header[0] & reserved) != 0 { return rejected("nonzero authenticated reserved bits") }
+    return Packet { valid: true; number: number; header: header; payload: errors.bytesValue(opened); error: errors.none() }
+}
+
+public function retryTag(version: Integer, header: Bytes, original: Bytes): Bytes {
+    if header.length < 7 || original.length > 20 { return Bytes() }
+    let key = crypto.fromHex("be0c690b9f66575a1d766b54e368c84e")
+    let nonce = crypto.fromHex("461599d35d632bf2239825bb")
+    if version == VERSION_2 { key = crypto.fromHex("8fb4b01b56ac48e260fbcbcead7ccc92"); nonce = crypto.fromHex("d86969bc2d7c6d9990efb04a") }
+    else if version != VERSION_1 { return Bytes() }
+    let aad = Bytes(); aad.add(original.length); aad.addBytes(original); aad.addBytes(header)
+    return aes.encrypt(key,nonce,aad,Bytes())
+}
+public function retryPacket(version: Integer, destination: Bytes, source: Bytes, token: Bytes, original: Bytes): errors.BytesResult {
+    if (version != VERSION_1 && version != VERSION_2) || destination.length > 20 || source.length < 1 || source.length > 20 || original.length < 1 || original.length > 20 || token.length < 1 || token.length > 1024 {
+        return errors.bytesFailure(errors.make(errors.invalidDataCode(),0,"invalid Retry fields"))
+    }
+    let result = Bytes(); let first = 0xf0
+    if version == VERSION_2 { first = 0xc0 }
+    result.add(first); for index in 0..4 { result.add((version >> ((3-index)*8)) & 255) }
+    result.add(destination.length); result.addBytes(destination); result.add(source.length); result.addBytes(source); result.addBytes(token)
+    let tag = retryTag(version,result,original)
+    if tag.length != 16 { return errors.bytesFailure(errors.make(errors.unavailableCode(),0,"Retry integrity provider failed")) }
+    result.addBytes(tag); return errors.bytes(result)
+}
+public function retryValid(version: Integer, packet: Bytes, original: Bytes): Boolean {
+    if packet.length < 24 || packet.length > 65535 || original.length > 20 { return false }
+    if (packet[0] & 192) != 192 { return false }
+    let wireVersion = (packet[1] << 24) | (packet[2] << 16) | (packet[3] << 8) | packet[4]
+    if wireVersion != version { return false }
+    let type = (packet[0] >> 4) & 3
+    if (version == VERSION_1 && type != 3) || (version == VERSION_2 && type != 0) || (version != VERSION_1 && version != VERSION_2) { return false }
+    let at = 6 + packet[5]
+    if packet[5] > 20 || at >= packet.length - 16 { return false }
+    let length = packet[at]
+    if length > 20 || at + 1 + length >= packet.length - 16 { return false }
+    let tag = retryTag(version,packet.slice(0,packet.length-16),original)
+    if tag.length != 16 { return false }
+    let different = 0
+    for index in 0..16 { different = different | (tag[index] ^ packet[packet.length - 16 + index]) }
+    return different == 0
+}

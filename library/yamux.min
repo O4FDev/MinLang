@@ -1,0 +1,137 @@
+// HashiCorp yamux v0 framing over an authenticated ordered byte stream.
+// One owner, at most 128 streams, 1 MiB session buffers and 256 KiB windows.
+use "errors" as errors
+public constant READY = 0
+public constant CLOSED = 1
+public constant FAILED = 2
+public record Stream {
+    id: Integer; sendWindow: Integer; receiveWindow: Integer; incoming: Bytes
+    local: Boolean; acknowledged: Boolean; sendClosed: Boolean; receiveClosed: Boolean; reset: Boolean
+}
+public record Session {
+    state: Integer; error: Text; clientRole: Boolean; next: Integer; streams: List<Stream>
+    received: Bytes; outgoing: Bytes; buffered: Integer; peerGoingAway: Boolean
+}
+public function create(client: Boolean): Session {
+    let next = 2; if client { next = 1 }
+    return Session { state: READY; error: ""; clientRole: client; next: next; streams: []; received: Bytes(); outgoing: Bytes(); buffered: 0; peerGoingAway: false }
+}
+function find(session: Session, id: Integer): Integer {
+    for index in 0..session.streams.length { if session.streams[index].id == id { return index } }; return -1
+}
+function add(data: Bytes, value: Integer, width: Integer) {
+    for index in 0..width { data.add((value >> ((width - index - 1) * 8)) & 255) }
+}
+function get(data: Bytes, at: Integer, width: Integer): Integer {
+    let value = 0; for index in 0..width { value = (value << 8) | data[at + index] }; return value
+}
+function failPeer(session: Session, message: Text) {
+    session.state = FAILED; session.error = message; session.received = Bytes(); session.outgoing = Bytes()
+    for stream in session.streams { stream.incoming = Bytes(); stream.reset = true }; session.buffered = 0
+}
+function emit(session: Session, type: Integer, flags: Integer, id: Integer, value: Integer, data: Bytes) {
+    if session.outgoing.length + 12 + data.length > 1048576 { failPeer(session, "yamux output buffer exhausted"); return }
+    session.outgoing.add(0); session.outgoing.add(type); add(session.outgoing, flags, 2); add(session.outgoing, id, 4); add(session.outgoing, value, 4); session.outgoing.addBytes(data)
+}
+function newStream(session: Session, id: Integer, local: Boolean) {
+    session.streams.add(Stream { id: id; sendWindow: 262144; receiveWindow: 262144; incoming: Bytes(); local: local; acknowledged: false; sendClosed: false; receiveClosed: false; reset: false })
+}
+public function open(session: Session): errors.IntegerResult {
+    if session.state != READY || session.peerGoingAway { return errors.integerFailure(errors.make(errors.closedCode(), 0, "yamux session is closed to new streams")) }
+    if session.streams.length >= 128 || session.next > 0xffffffff || session.outgoing.length > 1048576 - 12 { return errors.integerFailure(errors.make(errors.wouldBlockCode(), 0, "yamux stream or buffer limit reached")) }
+    let id = session.next; session.next += 2; newStream(session, id, true); emit(session, 1, 1, id, 0, Bytes())
+    return errors.integer(id)
+}
+public function write(session: Session, id: Integer, data: Bytes, fin: Boolean): errors.IntegerResult {
+    let index = find(session, id)
+    if session.state != READY || index < 0 { return errors.integerFailure(errors.make(errors.closedCode(), 0, "yamux stream is unavailable")) }
+    let stream = session.streams[index]
+    if stream.reset || stream.sendClosed { return errors.integerFailure(errors.make(errors.closedCode(), 0, "yamux stream is reset or send-closed")) }
+    let frames = max(1, (data.length + 65535) / 65536)
+    if data.length > stream.sendWindow || data.length > 1048576 || data.length + frames * 12 > 1048576 - session.outgoing.length {
+        return errors.integerFailure(errors.make(errors.wouldBlockCode(), 0, "yamux flow credit or buffer exhausted"))
+    }
+    let at = 0
+    while at < data.length || (fin && data.length == 0) {
+        let size = min(65536, data.length - at); let flags = 0
+        if fin && at + size == data.length { flags = 4 }
+        emit(session, 0, flags, id, size, data.slice(at, at + size)); at += size
+        if size == 0 { break }
+    }
+    stream.sendWindow -= data.length; if fin { stream.sendClosed = true }
+    return errors.integer(data.length)
+}
+public function read(session: Session, id: Integer): errors.BytesResult {
+    let index = find(session, id)
+    if index < 0 { return errors.wouldBlock(0) }
+    let stream = session.streams[index]
+    if stream.reset || session.state == FAILED { return errors.bytesFailure(errors.make(errors.closedCode(), 0, "yamux stream reset or session failed")) }
+    if stream.incoming.length > 0 {
+        let data = stream.incoming; stream.incoming = Bytes(); session.buffered -= data.length; stream.receiveWindow += data.length
+        if session.state == READY { emit(session, 1, 0, id, data.length, Bytes()) }
+        return errors.bytes(data)
+    }
+    if stream.receiveClosed || session.state == CLOSED { return errors.endOfStream() }
+    return errors.wouldBlock(0)
+}
+function frame(session: Session, type: Integer, flags: Integer, id: Integer, value: Integer, data: Bytes) {
+    if type > 3 || (flags & 0xfff0) != 0 || ((flags & 1) != 0 && (flags & 2) != 0) || ((flags & 8) != 0 && (flags & 7) != 0) {
+        failPeer(session, "invalid yamux type or flags"); return
+    }
+    if type == 2 {
+        if id != 0 || (flags != 1 && flags != 2) { failPeer(session, "invalid yamux ping"); return }
+        if flags == 1 { emit(session, 2, 2, 0, value, Bytes()) }; return
+    }
+    if type == 3 {
+        if id != 0 || flags != 0 || value > 2 { failPeer(session, "invalid yamux go-away"); return }
+        session.peerGoingAway = true; if value != 0 { failPeer(session, "peer closed yamux with an error") }; return
+    }
+    if id == 0 { failPeer(session, "yamux stream zero is reserved"); return }
+    let index = find(session, id)
+    if (flags & 1) != 0 {
+        let remoteParity = 1; if session.clientRole { remoteParity = 0 }
+        if index >= 0 || (id & 1) != remoteParity || session.peerGoingAway { failPeer(session, "duplicate or wrong-role yamux stream"); return }
+        if session.streams.length >= 128 { emit(session, 1, 8, id, 0, Bytes()); return }
+        newStream(session, id, false); index = session.streams.length - 1; session.streams[index].acknowledged = true
+        emit(session, 1, 2, id, 0, Bytes())
+    }
+    if index < 0 { failPeer(session, "yamux frame for an unknown stream"); return }
+    let stream = session.streams[index]
+    if (flags & 2) != 0 {
+        if !stream.local || stream.acknowledged { failPeer(session, "unexpected yamux stream ACK"); return }; stream.acknowledged = true
+    }
+    if (flags & 8) != 0 { session.buffered -= stream.incoming.length; stream.incoming = Bytes(); stream.reset = true; return }
+    if stream.reset { return }
+    if type == 0 {
+        if stream.receiveClosed || value > stream.receiveWindow || value > 1048576 - session.buffered { failPeer(session, "yamux receive window or buffer exceeded"); return }
+        stream.incoming.addBytes(data); stream.receiveWindow -= value; session.buffered += value
+    } else {
+        if value > 0xffffffff - stream.sendWindow { failPeer(session, "yamux window update overflow"); return }; stream.sendWindow += value
+    }
+    if (flags & 4) != 0 { stream.receiveClosed = true }
+}
+public function receive(session: Session, data: Bytes) {
+    if session.state != READY { return }
+    if data.length > 1048576 || data.length > 1048576 - session.received.length { failPeer(session, "yamux input buffer exceeded"); return }
+    session.received.addBytes(data)
+    while session.received.length >= 12 && session.state == READY {
+        let input = session.received
+        let type = input[1]; let flags = get(input, 2, 2); let id = get(input, 4, 4); let value = get(input, 8, 4)
+        if input[0] != 0 || type > 3 || (type == 0 && value > 262144) { failPeer(session, "invalid yamux version, type or frame length"); return }
+        let size = 0; if type == 0 { size = value }
+        if input.length < 12 + size { return }
+        frame(session, type, flags, id, value, input.slice(12, 12 + size))
+        if session.state == READY { session.received = input.slice(12 + size, input.length) }
+    }
+}
+public function takeOutgoing(session: Session): Bytes { let data = session.outgoing; session.outgoing = Bytes(); return data }
+public function ping(session: Session, opaque: Integer): errors.BooleanResult {
+    if session.state != READY || opaque < 0 || opaque > 0xffffffff { return errors.booleanFailure(errors.make(errors.closedCode(), 0, "yamux ping unavailable")) }
+    emit(session, 2, 1, 0, opaque, Bytes()); return errors.boolean(session.state == READY)
+}
+public function endInput(session: Session) {
+    if session.state != READY { return }
+    if session.received.length != 0 { failPeer(session, "truncated yamux frame"); return }
+    session.state = CLOSED
+}
+public function close(session: Session) { if session.state == READY { emit(session, 3, 0, 0, 0, Bytes()); session.peerGoingAway = true } }

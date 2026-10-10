@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Check reference lifetimes, shared aliases, and cycle rejection."""
+"""Check reference lifetimes, shared aliases, and selective cycle tracing."""
 import os
 import random
 import unittest
 from regressions import CompilerTestCase, ROOT
+from feature_compiler import accepts_managed_graph
 
 
 class Ownership(CompilerTestCase):
@@ -30,8 +31,8 @@ class Ownership(CompilerTestCase):
                     operation = f'function append(values: List<R{node}>, value: R{node}) {{ values.add(value) }}\n'
                     result, _ = self.compile(source + operation)
                     if reaches[node][node]:
-                        self.assertEqual(result.returncode, 1, result.stderr)
-                        self.assertIn('this List mutation could create a reference cycle', result.stderr)
+                        self.assertEqual(result.returncode, 86, result.stderr)
+                        accepts_managed_graph(self, source + operation)
                     else:
                         self.assertEqual(result.returncode, 0, result.stderr)
 

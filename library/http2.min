@@ -1,0 +1,542 @@
+// Native bounded HTTP/2 server. RFC 9113 and HPACK RFC 7541; no sockets.
+use "errors" as errors
+public record Header { name: Text; value: Text }
+record Entry { name: Bytes; value: Bytes }
+record Node { zero: Integer; one: Integer; symbol: Integer }
+record HPack { table: List<Entry>; size: Integer; limit: Integer; nodes: List<Node>; bad: Boolean; invalidField: Boolean }
+record Cursor { bytes: Bytes; at: Integer; bad: Boolean }
+record Stream {
+    id: Integer; fields: List<Header>; incoming: Bytes; pending: Bytes
+    recvWindow: Integer; sendWindow: Integer; recvEnded: Boolean; sendEnded: Boolean
+    response: Boolean; ending: Boolean; trailers: List<Header>; error: errors.Error
+    contentLength: Integer; received: Integer
+}
+public record Server {
+    private error: errors.Error; private input: Bytes; private output: Bytes
+    private preface: Boolean; private firstSettings: Boolean; private ack: Boolean
+    private hpack: HPack; private streams: List<Stream>; private ready: List<Integer>
+    private lastID: Integer; private continuation: Integer; private block: Bytes; private blockEnd: Boolean
+    private recvWindow: Integer; private sendWindow: Integer; private initialSend: Integer
+    private maxFrame: Integer; private goaway: Boolean; private pendingBytes: Integer
+    private settingsDue: Integer
+    private ended: Boolean
+}
+public record RequestResult { private error: errors.Error; private id: Integer; private fields: List<Header>; private end: Boolean }
+constant LIMIT = 1048576
+constant HEADERS_LIMIT = 16384
+constant MAX_STREAMS = 64
+function staticNames(): List<Text> { return [":authority", ":method", ":method", ":path", ":path", ":scheme", ":scheme", ":status", ":status", ":status", ":status", ":status", ":status", ":status", "accept-charset", "accept-encoding", "accept-language", "accept-ranges", "accept", "access-control-allow-origin", "age", "allow", "authorization", "cache-control", "content-disposition", "content-encoding", "content-language", "content-length", "content-location", "content-range", "content-type", "cookie", "date", "etag", "expect", "expires", "from", "host", "if-match", "if-modified-since", "if-none-match", "if-range", "if-unmodified-since", "last-modified", "link", "location", "max-forwards", "proxy-authenticate", "proxy-authorization", "range", "referer", "refresh", "retry-after", "server", "set-cookie", "strict-transport-security", "transfer-encoding", "user-agent", "vary", "via", "www-authenticate"] }
+function staticValues(): List<Text> { return ["", "GET", "POST", "/", "/index.html", "http", "https", "200", "204", "206", "304", "400", "404", "500", "", "gzip, deflate", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""] }
+function problem(code: Integer, native: Integer, message: Text): errors.Error { return errors.make(code, native, message) }
+function failure(code: Integer, message: Text): errors.BooleanResult { return errors.booleanFailure(problem(code, 0, message)) }
+function get32(bytes: Bytes, at: Integer): Integer { return (bytes[at] << 24) | (bytes[at + 1] << 16) | (bytes[at + 2] << 8) | bytes[at + 3] }
+function add32(bytes: Bytes, value: Integer) { for i in 0..4 { bytes.add((value >> ((3 - i) * 8)) & 255) } }
+function frame(type: Integer, flags: Integer, id: Integer, body: Bytes): Bytes {
+    let result = Bytes(); result.add((body.length >> 16) & 255); result.add((body.length >> 8) & 255); result.add(body.length & 255)
+    result.add(type); result.add(flags); add32(result, id); result.addBytes(body); return result
+}
+function trie(): List<Node> {
+    let nodes = [Node { zero: -1; one: -1; symbol: -1 }]
+    let codes = huffCodes(); let lengths = huffBits()
+    for symbol in 0..257 {
+        let current = 0; let count = lengths[symbol]
+        for i in 0..count {
+            let bit = (codes[symbol] >> (count - i - 1)) & 1
+            let next = nodes[current].zero; if bit == 1 { next = nodes[current].one }
+            if next < 0 {
+                next = nodes.length; nodes.add(Node { zero: -1; one: -1; symbol: -1 })
+                if bit == 0 { nodes[current].zero = next } else { nodes[current].one = next }
+            }
+            current = next
+        }
+        nodes[current].symbol = symbol
+    }
+    return nodes
+}
+function integer(cursor: Cursor, bits: Integer): Integer {
+    if cursor.at >= cursor.bytes.length { cursor.bad = true; return 0 }
+    let mask = (1 << bits) - 1; let value = cursor.bytes[cursor.at] & mask; cursor.at = cursor.at + 1
+    if value != mask { return value }
+    let shift = 0; let count = 0
+    while cursor.at < cursor.bytes.length && count < 5 {
+        let byte = cursor.bytes[cursor.at]; cursor.at = cursor.at + 1
+        let piece = (byte & 127) << shift
+        if piece > 2147483647 - value { cursor.bad = true; return 0 }
+        value = value + piece
+        if (byte & 128) == 0 { return value }
+        shift = shift + 7; count = count + 1
+    }
+    cursor.bad = true; return 0
+}
+function string(cursor: Cursor, pack: HPack): Bytes {
+    if cursor.at >= cursor.bytes.length { cursor.bad = true; return Bytes() }
+    let huffman = (cursor.bytes[cursor.at] & 128) != 0; let size = integer(cursor, 7)
+    if cursor.bad || size > HEADERS_LIMIT || size > cursor.bytes.length - cursor.at { cursor.bad = true; return Bytes() }
+    let bytes = cursor.bytes.slice(cursor.at, cursor.at + size); cursor.at = cursor.at + size
+    if huffman {
+        let decoded = Bytes(); let current = 0; let tail = 0; let ones = true
+        for byte in bytes {
+            for i in 0..8 {
+                let bit = (byte >> (7 - i)) & 1; tail = tail + 1; if bit == 0 { ones = false }
+                if bit == 0 { current = pack.nodes[current].zero } else { current = pack.nodes[current].one }
+                if current < 0 { cursor.bad = true; return Bytes() }
+                let symbol = pack.nodes[current].symbol
+                if symbol >= 0 {
+                    if symbol == 256 || decoded.length >= HEADERS_LIMIT { cursor.bad = true; return Bytes() }
+                    decoded.add(symbol); current = 0; tail = 0; ones = true
+                }
+            }
+        }
+        if current != 0 && (tail > 7 || !ones) { cursor.bad = true; return Bytes() }
+        bytes = decoded
+    }
+    return bytes
+}
+function safeText(pack: HPack, bytes: Bytes): Text {
+    // Preserve original opaque bytes in the dynamic table. Never feed hostile
+    // UTF-8 to Text; private gateway fields accept visible ASCII/HTAB only.
+    for byte in bytes { if byte != 9 && (byte < 32 || byte > 126) { pack.invalidField = true; return "?" } }
+    return Text(bytes)
+}
+function indexed(pack: HPack, index: Integer): Entry {
+    if index >= 1 && index <= 61 { return Entry { name: Bytes(staticNames()[index - 1]); value: Bytes(staticValues()[index - 1]) } }
+    if index >= 62 && index - 62 < pack.table.length { return pack.table[index - 62] }
+    return Entry { name: Bytes(); value: Bytes() }
+}
+function trim(pack: HPack) {
+    while pack.size > pack.limit && pack.table.length > 0 {
+        let last = pack.table[pack.table.length - 1]; pack.size = pack.size - last.name.length - last.value.length - 32
+        let kept: List<Entry> = []; for i in 0..(pack.table.length - 1) { kept.add(pack.table[i]) }; pack.table = kept
+    }
+}
+function insert(pack: HPack, field: Entry) {
+    let size = field.name.length + field.value.length + 32
+    if size > pack.limit { pack.table = []; pack.size = 0; return }
+    let next = [field]; for old in pack.table { next.add(old) }; pack.table = next; pack.size = pack.size + size; trim(pack)
+}
+function decompress(pack: HPack, bytes: Bytes): List<Header> {
+    pack.bad = false
+    pack.invalidField = false
+    let cursor = Cursor { bytes: bytes; at: 0; bad: false }; let result: List<Header> = []; let total = 0; let started = false
+    while cursor.at < bytes.length && !cursor.bad {
+        let first = bytes[cursor.at]
+        if (first & 224) == 32 {
+            if started { pack.bad = true; return [] }
+            let size = integer(cursor, 5); if cursor.bad || size > 4096 { pack.bad = true; return [] }; pack.limit = size; trim(pack)
+        } else {
+            started = true; let field = Entry { name: Bytes(); value: Bytes() }; let store = false
+            if (first & 128) != 0 {
+                let index = integer(cursor, 7); if index < 1 || index > 61 + pack.table.length { pack.bad = true; return [] }; field = indexed(pack, index)
+            }
+            else {
+                let bits = 4; store = (first & 64) != 0; if store { bits = 6 }
+                let index = integer(cursor, bits)
+                if index == 0 { field.name = string(cursor, pack) } else { if index > 61 + pack.table.length { pack.bad = true; return [] }; field.name = indexed(pack, index).name }
+                field.value = string(cursor, pack)
+                if store && !cursor.bad { insert(pack, field) }
+            }
+            total = total + field.name.length + field.value.length + 32
+            if cursor.bad || total > HEADERS_LIMIT || result.length >= 128 { pack.bad = true; return [] }
+            result.add(Header { name: safeText(pack, field.name); value: safeText(pack, field.value) })
+        }
+    }
+    if cursor.bad { pack.bad = true; return [] }; return result
+}
+function addInteger(bytes: Bytes, value: Integer, bits: Integer, first: Integer) {
+    let mask = (1 << bits) - 1
+    if value < mask { bytes.add(first | value); return }
+    bytes.add(first | mask); let remaining = value - mask
+    while remaining >= 128 { bytes.add((remaining & 127) | 128); remaining = remaining >> 7 }
+    bytes.add(remaining)
+}
+function compress(fields: List<Header>): Bytes {
+    let bytes = Bytes()
+    for field in fields {
+        // Never index response metadata: no shared secret-dependent table state.
+        bytes.add(16); let name = Bytes(field.name); let value = Bytes(field.value)
+        addInteger(bytes, name.length, 7, 0); bytes.addBytes(name); addInteger(bytes, value.length, 7, 0); bytes.addBytes(value)
+    }
+    return bytes
+}
+function fieldValue(fields: List<Header>, name: Text): Text { for field in fields { if field.name == name { return field.value } }; return "" }
+public function headerValue(fields: List<Header>, name: Text): Text { return fieldValue(fields, name) }
+function nameByte(byte: Integer): Boolean {
+    if (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) { return true }
+    return byte == 33 || byte == 35 || byte == 36 || byte == 37 || byte == 38 || byte == 39 || byte == 42 || byte == 43 || byte == 45 || byte == 46 || byte == 94 || byte == 95 || byte == 96 || byte == 124 || byte == 126
+}
+function validFields(fields: List<Header>, trailers: Boolean): Boolean {
+    let regular = false; let pseudo: List<Text> = []; let hasMethod = false; let hasScheme = false; let hasPath = false
+    for field in fields {
+        let bytes = Bytes(field.name)
+        if bytes.length == 0 { return false }
+        for i in 0..bytes.length {
+            let c = bytes[i]
+            if !(c == 58 && i == 0) && !nameByte(c) { return false }
+        }
+        let value = Bytes(field.value)
+        if value.length > 0 && (value[0] == 32 || value[0] == 9 || value[value.length - 1] == 32 || value[value.length - 1] == 9) { return false }
+        for c in value { if c == 0 || c == 10 || c == 13 { return false } }
+        if bytes[0] == 58 {
+            if trailers || regular { return false }
+            for old in pseudo { if old == field.name { return false } }; pseudo.add(field.name)
+            if field.name == ":method" { hasMethod = field.value != "" }
+            else if field.name == ":scheme" { hasScheme = field.value == "https" || field.value == "http" }
+            else if field.name == ":path" { hasPath = field.value != "" }
+            else if field.name != ":authority" { return false }
+        } else {
+            regular = true
+            if field.name == "connection" || field.name == "proxy-connection" || field.name == "keep-alive" || field.name == "transfer-encoding" || field.name == "upgrade" { return false }
+            if field.name == "te" && field.value != "trailers" { return false }
+        }
+    }
+    return trailers || (hasMethod && hasScheme && hasPath)
+}
+function validResponse(fields: List<Header>, trailers: Boolean): Boolean {
+    let status = false; let regular = false
+    for field in fields {
+        if field.name == ":status" {
+            if trailers || regular || status || field.value.length != 3 || decimal(field.value) < 100 || decimal(field.value) > 599 { return false }; status = true
+        } else {
+            regular = true
+            if field.name == "" || field.name[0] == ':' { return false }
+        }
+        let name = Bytes(field.name)
+        for i in 0..name.length { if !(name[i] == 58 && i == 0) && !nameByte(name[i]) { return false } }
+        let value = Bytes(field.value)
+        if value.length > 0 && (value[0] == 32 || value[0] == 9 || value[value.length - 1] == 32 || value[value.length - 1] == 9) { return false }
+        for byte in value { if byte != 9 && (byte < 32 || byte > 126) { return false } }
+        if field.name == "connection" || field.name == "transfer-encoding" || field.name == "keep-alive" || field.name == "upgrade" || field.name == "proxy-connection" { return false }
+    }
+    return trailers || status
+}
+function decimal(text: Text): Integer {
+    if text.length == 0 || text.length > 19 { return -1 }; let value = 0
+    for c in text { if c < '0' || c > '9' { return -1 }; let digit = Integer(c) - 48; if value > (9223372036854775807 - digit) / 10 { return -1 }; value = value * 10 + digit }
+    return value
+}
+function position(server: Server, id: Integer): Integer { for i in 0..server.streams.length { if server.streams[i].id == id { return i } }; return -1 }
+function queue(server: Server, bytes: Bytes): Boolean {
+    if bytes.length > LIMIT - server.output.length - server.pendingBytes { return false }
+    server.output.addBytes(bytes); return true
+}
+function connectionFailure(server: Server, h2code: Integer, message: Text): errors.BooleanResult {
+    if !errors.isError(server.error) {
+        let body = Bytes(); add32(body, server.lastID); add32(body, h2code)
+        // GOAWAY replaces queued output if control capacity was exhausted.
+        if !queue(server, frame(7, 0, 0, body)) { server.output = frame(7, 0, 0, body) }
+        server.error = problem(errors.protocolCode(), h2code, message); server.input = Bytes()
+        for stream in server.streams { stream.incoming = Bytes(); stream.pending = Bytes(); stream.error = server.error }
+        server.pendingBytes = 0
+    }
+    return errors.booleanFailure(server.error)
+}
+public function connectionError(server: Server): errors.Error { return server.error }
+public function create(): Server {
+    let settings = Bytes(); settings.add(0); settings.add(3); add32(settings, MAX_STREAMS)
+    settings.add(0); settings.add(6); add32(settings, HEADERS_LIMIT)
+    return Server { error: errors.none(); input: Bytes(); output: frame(4, 0, 0, settings); preface: false; firstSettings: false; ack: false
+        hpack: HPack { table: []; size: 0; limit: 4096; nodes: trie(); bad: false; invalidField: false }; streams: []; ready: []; lastID: 0
+        continuation: 0; block: Bytes(); blockEnd: false; recvWindow: 65535; sendWindow: 65535; initialSend: 65535
+        maxFrame: 16384; goaway: false; pendingBytes: 0; settingsDue: -1; ended: false }
+}
+public function resetStream(server: Server, id: Integer, h2code: Integer): errors.BooleanResult {
+    let at = position(server, id); if at < 0 { return failure(errors.closedCode(), "unknown HTTP/2 stream") }
+    let body = Bytes(); add32(body, h2code)
+    if !queue(server, frame(3, 0, id, body)) { return connectionFailure(server, 11, "HTTP/2 control output limit") }
+    let stream = server.streams[at]
+    server.pendingBytes = server.pendingBytes - stream.pending.length
+    // Return connection credit for discarded application bytes; stream is reset.
+    if stream.incoming.length > 0 { let credit = Bytes(); add32(credit, stream.incoming.length); server.recvWindow = server.recvWindow + stream.incoming.length; if !queue(server, frame(8, 0, 0, credit)) { return connectionFailure(server, 11, "HTTP/2 control output limit") } }
+    stream.incoming = Bytes(); stream.pending = Bytes(); stream.recvEnded = true; stream.sendEnded = true
+    stream.error = problem(errors.cancelledCode(), h2code, "HTTP/2 stream reset")
+    return errors.boolean(true)
+}
+function pump(server: Server) {
+    for stream in server.streams {
+        if !errors.isError(stream.error) && stream.response && !stream.sendEnded {
+            while stream.pending.length > 0 && stream.sendWindow > 0 && server.sendWindow > 0 {
+                let size = min(min(stream.pending.length, 16384), min(stream.sendWindow, server.sendWindow))
+                if size + 9 > LIMIT - server.output.length - server.pendingBytes + size { return }
+                let bytes = stream.pending.slice(0, size); stream.pending = stream.pending.slice(size, stream.pending.length)
+                server.pendingBytes = server.pendingBytes - size
+                if !queue(server, frame(0, 0, stream.id, bytes)) { fail("HTTP/2 output accounting invariant") }
+                stream.sendWindow = stream.sendWindow - size; server.sendWindow = server.sendWindow - size
+            }
+            if stream.ending && stream.pending.length == 0 {
+                let bytes = compress(stream.trailers)
+                if bytes.length + 9 <= LIMIT - server.output.length - server.pendingBytes {
+                    queue(server, frame(1, 5, stream.id, bytes)); stream.sendEnded = true
+                }
+            }
+        }
+    }
+}
+public function takeOutgoing(server: Server, maximum: Integer): Bytes {
+    if maximum < 1 { fail("HTTP/2 output maximum must be positive") }
+    pump(server); let end = min(maximum, server.output.length); let result = server.output.slice(0, end)
+    server.output = server.output.slice(end, server.output.length); pump(server); return result
+}
+public function bufferedInput(server: Server): Integer { return server.input.length }
+public function bufferedOutput(server: Server): Integer { return server.output.length + server.pendingBytes }
+// Call with a monotonic millisecond sample immediately after create.
+public function tick(server: Server, nowMillis: Integer): errors.BooleanResult {
+    if errors.isError(server.error) { return errors.booleanFailure(server.error) }
+    if nowMillis < 0 || nowMillis > 9223372036854765807 { return failure(errors.invalidDataCode(), "invalid monotonic HTTP/2 clock") }
+    if server.settingsDue < 0 { server.settingsDue = nowMillis + 10000 }
+    if !server.ack && nowMillis >= server.settingsDue { return connectionFailure(server, 4, "SETTINGS acknowledgement timeout") }
+    return errors.boolean(true)
+}
+public function nextDeadlineMillis(server: Server): Integer { if server.ack || errors.isError(server.error) { return 0 }; return max(0, server.settingsDue) }
+public function requestOk(value: RequestResult): Boolean { return !errors.isError(value.error) }
+public function requestError(value: RequestResult): errors.Error { return value.error }
+function requireRequest(value: RequestResult) { if !requestOk(value) { fail("cannot read rejected HTTP/2 request") } }
+public function streamID(value: RequestResult): Integer { requireRequest(value); return value.id }
+public function headers(value: RequestResult): List<Header> { requireRequest(value); return value.fields }
+public function endStream(value: RequestResult): Boolean { requireRequest(value); return value.end }
+public function requests(server: Server): RequestResult {
+    while server.ready.length > 0 {
+        let id = server.ready[0]; let kept: List<Integer> = []; for i in 1..server.ready.length { kept.add(server.ready[i]) }; server.ready = kept
+        let at = position(server, id)
+        if at >= 0 && !errors.isError(server.streams[at].error) {
+            let stream = server.streams[at]; return RequestResult { error: errors.none(); id: id; fields: stream.fields; end: stream.recvEnded }
+        }
+    }
+    let error = problem(errors.wouldBlockCode(), 0, "no HTTP/2 request")
+    if errors.isError(server.error) { error = server.error }
+    return RequestResult { error: error; id: 0; fields: []; end: false }
+}
+function completeHeaders(server: Server): errors.BooleanResult {
+    let id = server.continuation; let fields = decompress(server.hpack, server.block)
+    server.continuation = 0; server.block = Bytes()
+    if server.hpack.bad { return connectionFailure(server, 9, "invalid HPACK block or header limit") }
+    let at = position(server, id)
+    if at >= 0 {
+        if server.streams[at].recvEnded || !server.blockEnd || server.hpack.invalidField || !validFields(fields, true) { return resetStream(server, id, 1) }
+        server.streams[at].recvEnded = true
+        if server.streams[at].contentLength >= 0 && server.streams[at].received != server.streams[at].contentLength { return resetStream(server, id, 1) }
+        return errors.boolean(true)
+    }
+    // The monotonic highest client ID also represents all implicitly closed IDs.
+    if id <= server.lastID || server.goaway { return connectionFailure(server, 1, "new HEADERS on closed stream") }
+    server.lastID = id
+    let kept: List<Stream> = []
+    for old in server.streams { if !(old.recvEnded && old.sendEnded && old.incoming.length == 0 && old.pending.length == 0) { kept.add(old) } }
+    server.streams = kept
+    let stream = Stream { id: id; fields: fields; incoming: Bytes(); pending: Bytes(); recvWindow: 65535; sendWindow: server.initialSend
+        recvEnded: server.blockEnd; sendEnded: false; response: false; ending: false; trailers: []; error: errors.none(); contentLength: -1; received: 0 }
+    server.streams.add(stream)
+    if server.streams.length > MAX_STREAMS || server.ready.length >= MAX_STREAMS { return resetStream(server, id, 7) }
+    if server.hpack.invalidField || !validFields(fields, false) { return resetStream(server, id, 1) }
+    let lengths = 0
+    for field in fields { if field.name == "content-length" { lengths = lengths + 1; stream.contentLength = decimal(field.value) } }
+    if lengths > 1 || (lengths == 1 && stream.contentLength < 0) || (stream.recvEnded && stream.contentLength > 0) { return resetStream(server, id, 1) }
+    server.ready.add(id); return errors.boolean(true)
+}
+function windowUpdate(server: Server, id: Integer, amount: Integer): errors.BooleanResult {
+    if amount == 0 { return errors.boolean(true) }
+    let credit = Bytes(); add32(credit, amount)
+    if !queue(server, frame(8, 0, 0, credit)) || (id != 0 && !queue(server, frame(8, 0, id, credit))) { return connectionFailure(server, 11, "HTTP/2 control output limit") }
+    server.recvWindow = server.recvWindow + amount
+    if id != 0 { let at = position(server, id); if at >= 0 { server.streams[at].recvWindow = server.streams[at].recvWindow + amount } }
+    return errors.boolean(true)
+}
+function process(server: Server, type: Integer, flags: Integer, id: Integer, body: Bytes): errors.BooleanResult {
+    if server.continuation != 0 && (type != 9 || id != server.continuation) { return connectionFailure(server, 1, "interleaved HTTP/2 header block") }
+    if !server.firstSettings {
+        if type != 4 || (flags & 1) != 0 { return connectionFailure(server, 1, "client preface requires SETTINGS") }; server.firstSettings = true
+    }
+    if type == 4 {
+        if id != 0 { return connectionFailure(server, 1, "SETTINGS stream must be zero") }
+        if (flags & 1) != 0 {
+            if body.length != 0 { return connectionFailure(server, 6, "SETTINGS ACK has payload") }
+            if server.ack { return connectionFailure(server, 1, "unexpected SETTINGS ACK") }; server.ack = true; return errors.boolean(true)
+        }
+        if body.length % 6 != 0 { return connectionFailure(server, 6, "invalid SETTINGS size") }
+        let at = 0
+        while at < body.length {
+            let setting = (body[at] << 8) | body[at + 1]; let value = get32(body, at + 2); at = at + 6
+            if setting == 2 && value > 1 { return connectionFailure(server, 1, "invalid ENABLE_PUSH") }
+            if setting == 4 {
+                if value > 2147483647 { return connectionFailure(server, 3, "invalid initial flow window") }
+                let difference = value - server.initialSend
+                for stream in server.streams { if stream.sendWindow + difference > 2147483647 { return connectionFailure(server, 3, "stream flow window overflow") }; stream.sendWindow = stream.sendWindow + difference }
+                server.initialSend = value
+            }
+            if setting == 5 { if value < 16384 || value > 16777215 { return connectionFailure(server, 1, "invalid maximum frame size") }; server.maxFrame = value }
+        }
+        if !queue(server, frame(4, 1, 0, Bytes())) { return connectionFailure(server, 11, "HTTP/2 control output limit") }; pump(server); return errors.boolean(true)
+    }
+    if type == 6 {
+        if id != 0 { return connectionFailure(server, 1, "PING stream must be zero") }
+        if body.length != 8 { return connectionFailure(server, 6, "invalid PING size") }
+        if (flags & 1) == 0 && !queue(server, frame(6, 1, 0, body)) { return connectionFailure(server, 11, "HTTP/2 control output limit") }; return errors.boolean(true)
+    }
+    if type == 7 {
+        if id != 0 { return connectionFailure(server, 1, "GOAWAY stream must be zero") }
+        if body.length < 8 { return connectionFailure(server, 6, "invalid GOAWAY size") }
+        server.goaway = true; return errors.boolean(true)
+    }
+    if type == 8 {
+        if body.length != 4 { return connectionFailure(server, 6, "invalid WINDOW_UPDATE size") }
+        let increment = get32(body, 0) & 2147483647
+        if id == 0 { if increment == 0 { return connectionFailure(server, 1, "zero connection window increment") }; if server.sendWindow > 2147483647 - increment { return connectionFailure(server, 3, "connection window overflow") }; server.sendWindow = server.sendWindow + increment }
+        else {
+            let at = position(server, id)
+            if at < 0 { if id > server.lastID { return connectionFailure(server, 1, "WINDOW_UPDATE on idle stream") }; return errors.boolean(true) }
+            if increment == 0 { return resetStream(server, id, 1) }
+            if server.streams[at].sendWindow > 2147483647 - increment { return resetStream(server, id, 3) }
+            server.streams[at].sendWindow = server.streams[at].sendWindow + increment
+        }
+        pump(server); return errors.boolean(true)
+    }
+    if type == 2 {
+        if id == 0 { return connectionFailure(server, 1, "PRIORITY stream must be nonzero") }
+        if body.length != 5 { return connectionFailure(server, 6, "invalid PRIORITY size") }
+        if (get32(body, 0) & 2147483647) == id { let at = position(server, id); if at >= 0 { return resetStream(server, id, 1) }; return connectionFailure(server, 1, "self-dependent idle PRIORITY") }
+        return errors.boolean(true)
+    }
+    if type == 5 { return connectionFailure(server, 1, "client PUSH_PROMISE prohibited") }
+    if type == 1 {
+        if id == 0 || id % 2 == 0 { return connectionFailure(server, 1, "invalid client HEADERS stream ID") }
+        let begin = 0; let end = body.length
+        if (flags & 8) != 0 { if body.length == 0 || body[0] >= body.length { return connectionFailure(server, 1, "invalid HEADERS padding") }; begin = 1; end = body.length - body[0] }
+        if (flags & 32) != 0 {
+            if end - begin < 5 { return connectionFailure(server, 6, "invalid HEADERS priority") }
+            if (get32(body, begin) & 2147483647) == id { return connectionFailure(server, 1, "self-dependent HEADERS") }; begin = begin + 5
+        }
+        server.continuation = id; server.block = body.slice(begin, end); server.blockEnd = (flags & 1) != 0
+        if (flags & 4) != 0 { return completeHeaders(server) }; return errors.boolean(true)
+    }
+    if type == 9 {
+        if server.continuation == 0 || id == 0 { return connectionFailure(server, 1, "unexpected CONTINUATION") }
+        if body.length > HEADERS_LIMIT - server.block.length { return connectionFailure(server, 11, "header block limit") }
+        server.block.addBytes(body); if (flags & 4) != 0 { return completeHeaders(server) }; return errors.boolean(true)
+    }
+    if type == 3 {
+        if id == 0 { return connectionFailure(server, 1, "RST_STREAM stream must be nonzero") }
+        if body.length != 4 { return connectionFailure(server, 6, "invalid RST_STREAM size") }
+        let at = position(server, id)
+        if at < 0 { if id > server.lastID { return connectionFailure(server, 1, "RST_STREAM on idle stream") }; return errors.boolean(true) }
+        let stream = server.streams[at]; server.pendingBytes = server.pendingBytes - stream.pending.length
+        if stream.incoming.length > 0 { let result = windowUpdate(server, 0, stream.incoming.length); if !errors.booleanOk(result) { return result } }
+        stream.incoming = Bytes(); stream.pending = Bytes(); stream.recvEnded = true; stream.sendEnded = true
+        stream.error = problem(errors.cancelledCode(), get32(body, 0), "peer reset HTTP/2 stream"); return errors.boolean(true)
+    }
+    if type == 0 {
+        if id == 0 { return connectionFailure(server, 1, "DATA stream must be nonzero") }
+        let at = position(server, id)
+        if at < 0 { if id > server.lastID { return connectionFailure(server, 1, "DATA on idle stream") }; return connectionFailure(server, 5, "DATA on closed stream") }
+        let stream = server.streams[at]
+        if body.length > server.recvWindow { return connectionFailure(server, 3, "connection receive window exceeded") }
+        server.recvWindow = server.recvWindow - body.length
+        if stream.recvEnded { windowUpdate(server, 0, body.length); return resetStream(server, id, 5) }
+        if body.length > stream.recvWindow { windowUpdate(server, 0, body.length); return resetStream(server, id, 3) }
+        stream.recvWindow = stream.recvWindow - body.length
+        let begin = 0; let end = body.length
+        if (flags & 8) != 0 { if body.length == 0 || body[0] >= body.length { return connectionFailure(server, 1, "invalid DATA padding") }; begin = 1; end = body.length - body[0] }
+        let padding = body.length - end + begin
+        if padding > 0 { let result = windowUpdate(server, id, padding); if !errors.booleanOk(result) { return result } }
+        stream.incoming.addBytes(body.slice(begin, end)); stream.received = stream.received + end - begin
+        if stream.contentLength >= 0 && stream.received > stream.contentLength { return resetStream(server, id, 1) }
+        if (flags & 1) != 0 {
+            stream.recvEnded = true
+            if stream.contentLength >= 0 && stream.received != stream.contentLength { return resetStream(server, id, 1) }
+        }
+        return errors.boolean(true)
+    }
+    // RFC 9113: unknown extension frame types and undefined flag bits are ignored.
+    return errors.boolean(true)
+}
+public function receive(server: Server, bytes: Bytes): errors.BooleanResult {
+    if errors.isError(server.error) { return errors.booleanFailure(server.error) }
+    if server.ended { return failure(errors.closedCode(), "HTTP/2 input already ended") }
+    if bytes.length > LIMIT - server.input.length { return failure(errors.wouldBlockCode(), "HTTP/2 input buffer full") }
+    server.input.addBytes(bytes)
+    if !server.preface {
+        let expected = Bytes("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        for i in 0..min(expected.length, server.input.length) { if server.input[i] != expected[i] { return connectionFailure(server, 1, "invalid HTTP/2 preface") } }
+        if server.input.length < expected.length { return errors.boolean(true) }
+        server.input = server.input.slice(expected.length, server.input.length); server.preface = true
+    }
+    while server.input.length >= 9 {
+        let input = server.input; let size = (input[0] << 16) | (input[1] << 8) | input[2]
+        if size > 16384 { return connectionFailure(server, 6, "incoming HTTP/2 frame exceeds advertised maximum") }
+        if input.length - 9 < size { return errors.boolean(true) }
+        let type = input[3]; let flags = input[4]; let id = get32(input, 5) & 2147483647; let body = input.slice(9, 9 + size)
+        server.input = input.slice(9 + size, input.length)
+        let result = process(server, type, flags, id, body); if !errors.booleanOk(result) { return result }
+    }
+    return errors.boolean(true)
+}
+public function finish(server: Server): errors.BooleanResult {
+    if errors.isError(server.error) { return errors.booleanFailure(server.error) }
+    server.ended = true
+    if !server.preface || !server.firstSettings || server.input.length > 0 || server.continuation != 0 { return errors.booleanFailure(problem(errors.truncatedCode(), 0, "EOF inside HTTP/2 input")) }
+    return errors.boolean(true)
+}
+public function read(server: Server, id: Integer, maximum: Integer): errors.BytesResult {
+    if maximum < 1 { fail("HTTP/2 read maximum must be positive") }
+    if errors.isError(server.error) { return errors.bytesFailure(server.error) }
+    let at = position(server, id); if at < 0 { return errors.bytesFailure(problem(errors.closedCode(), 0, "unknown HTTP/2 stream")) }
+    let stream = server.streams[at]; if errors.isError(stream.error) { return errors.bytesFailure(stream.error) }
+    if stream.incoming.length == 0 { if stream.recvEnded { return errors.endOfStream() }; return errors.wouldBlock(0) }
+    if 26 > LIMIT - server.output.length - server.pendingBytes { return errors.wouldBlock(0) }
+    let end = min(maximum, stream.incoming.length); let bytes = stream.incoming.slice(0, end)
+    stream.incoming = stream.incoming.slice(end, stream.incoming.length)
+    let updated = windowUpdate(server, id, end); if !errors.booleanOk(updated) { return errors.bytesFailure(errors.booleanError(updated)) }
+    return errors.bytes(bytes)
+}
+public function respond(server: Server, id: Integer, fields: List<Header>, end: Boolean): errors.BooleanResult {
+    if errors.isError(server.error) { return errors.booleanFailure(server.error) }
+    let at = position(server, id); if at < 0 { return failure(errors.closedCode(), "unknown HTTP/2 stream") }
+    let stream = server.streams[at]; if errors.isError(stream.error) { return errors.booleanFailure(stream.error) }
+    if stream.response || stream.sendEnded { return failure(errors.protocolCode(), "HTTP/2 response already started") }
+    if !validResponse(fields, false) { return failure(errors.invalidDataCode(), "invalid outgoing response headers") }
+    let bytes = compress(fields); if bytes.length > HEADERS_LIMIT { return failure(errors.invalidDataCode(), "outgoing headers too large") }
+    let flags = 4; if end { flags = 5 }
+    if !queue(server, frame(1, flags, id, bytes)) { return failure(errors.wouldBlockCode(), "HTTP/2 output full") }
+    stream.response = true; stream.sendEnded = end; return errors.boolean(true)
+}
+public function write(server: Server, id: Integer, bytes: Bytes): errors.BooleanResult {
+    if errors.isError(server.error) { return errors.booleanFailure(server.error) }
+    let at = position(server, id); if at < 0 { return failure(errors.closedCode(), "unknown HTTP/2 stream") }
+    let stream = server.streams[at]; if errors.isError(stream.error) { return errors.booleanFailure(stream.error) }
+    if !stream.response || stream.sendEnded || stream.ending { return failure(errors.protocolCode(), "HTTP/2 stream is not writable") }
+    if bytes.length > 65545 { return failure(errors.invalidDataCode(), "HTTP/2 write exceeds bounded chunk") }
+    if bytes.length > LIMIT - 4096 - server.output.length - server.pendingBytes { return failure(errors.wouldBlockCode(), "HTTP/2 output full") }
+    stream.pending.addBytes(bytes); server.pendingBytes = server.pendingBytes + bytes.length; pump(server); return errors.boolean(true)
+}
+public function closeStream(server: Server, id: Integer, trailers: List<Header>): errors.BooleanResult {
+    if errors.isError(server.error) { return errors.booleanFailure(server.error) }
+    let at = position(server, id); if at < 0 { return failure(errors.closedCode(), "unknown HTTP/2 stream") }
+    let stream = server.streams[at]; if errors.isError(stream.error) { return errors.booleanFailure(stream.error) }
+    if !stream.response || stream.sendEnded || stream.ending { return failure(errors.protocolCode(), "HTTP/2 stream already ended") }
+    if !validResponse(trailers, true) || compress(trailers).length > HEADERS_LIMIT { return failure(errors.invalidDataCode(), "invalid outgoing trailers") }
+    stream.trailers = trailers; stream.ending = true; pump(server); return errors.boolean(true)
+}
+// RFC 7541 Appendix B, immutable protocol constants.
+// Copyright (c) 2015 IETF Trust and the persons identified as authors of
+// the code. All rights reserved.
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
+// 1. Redistributions of source code must retain the above copyright notice,
+//    this list of conditions and the following disclaimer.
+// 2. Redistributions in binary form must reproduce the above copyright
+//    notice, this list of conditions and the following disclaimer in the
+//    documentation and/or other materials provided with the distribution.
+// 3. Neither the name of the copyright holder nor the names of its
+//    contributors may be used to endorse or promote products derived from
+//    this software without specific prior written permission.
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
+function huffCodes(): List<Integer> { return [8184, 8388568, 268435426, 268435427, 268435428, 268435429, 268435430, 268435431, 268435432, 16777194, 1073741820, 268435433, 268435434, 1073741821, 268435435, 268435436, 268435437, 268435438, 268435439, 268435440, 268435441, 268435442, 1073741822, 268435443, 268435444, 268435445, 268435446, 268435447, 268435448, 268435449, 268435450, 268435451, 20, 1016, 1017, 4090, 8185, 21, 248, 2042, 1018, 1019, 249, 2043, 250, 22, 23, 24, 0, 1, 2, 25, 26, 27, 28, 29, 30, 31, 92, 251, 32764, 32, 4091, 1020, 8186, 33, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 252, 115, 253, 8187, 524272, 8188, 16380, 34, 32765, 3, 35, 4, 36, 5, 37, 38, 39, 6, 116, 117, 40, 41, 42, 7, 43, 118, 44, 8, 9, 45, 119, 120, 121, 122, 123, 32766, 2044, 16381, 8189, 268435452, 1048550, 4194258, 1048551, 1048552, 4194259, 4194260, 4194261, 8388569, 4194262, 8388570, 8388571, 8388572, 8388573, 8388574, 16777195, 8388575, 16777196, 16777197, 4194263, 8388576, 16777198, 8388577, 8388578, 8388579, 8388580, 2097116, 4194264, 8388581, 4194265, 8388582, 8388583, 16777199, 4194266, 2097117, 1048553, 4194267, 4194268, 8388584, 8388585, 2097118, 8388586, 4194269, 4194270, 16777200, 2097119, 4194271, 8388587, 8388588, 2097120, 2097121, 4194272, 2097122, 8388589, 4194273, 8388590, 8388591, 1048554, 4194274, 4194275, 4194276, 8388592, 4194277, 4194278, 8388593, 67108832, 67108833, 1048555, 524273, 4194279, 8388594, 4194280, 33554412, 67108834, 67108835, 67108836, 134217694, 134217695, 67108837, 16777201, 33554413, 524274, 2097123, 67108838, 134217696, 134217697, 67108839, 134217698, 16777202, 2097124, 2097125, 67108840, 67108841, 268435453, 134217699, 134217700, 134217701, 1048556, 16777203, 1048557, 2097126, 4194281, 2097127, 2097128, 8388595, 4194282, 4194283, 33554414, 33554415, 16777204, 16777205, 67108842, 8388596, 67108843, 134217702, 67108844, 67108845, 134217703, 134217704, 134217705, 134217706, 134217707, 268435454, 134217708, 134217709, 134217710, 134217711, 134217712, 67108846, 1073741823] }
+function huffBits(): List<Integer> { return [13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 28, 6, 10, 10, 12, 13, 6, 8, 11, 10, 10, 8, 11, 8, 6, 6, 6, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 7, 8, 15, 6, 12, 10, 13, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 8, 13, 19, 13, 14, 6, 15, 5, 6, 5, 6, 5, 6, 6, 6, 5, 7, 7, 6, 6, 6, 5, 6, 7, 6, 5, 5, 6, 7, 7, 7, 7, 7, 15, 11, 14, 13, 28, 20, 22, 20, 20, 22, 22, 22, 23, 22, 23, 23, 23, 23, 23, 24, 23, 24, 24, 22, 23, 24, 23, 23, 23, 23, 21, 22, 23, 22, 23, 23, 24, 22, 21, 20, 22, 22, 23, 23, 21, 23, 22, 22, 24, 21, 22, 23, 23, 21, 21, 22, 21, 23, 22, 23, 23, 20, 22, 22, 22, 23, 22, 22, 23, 26, 26, 20, 19, 22, 23, 22, 25, 26, 26, 26, 27, 27, 26, 24, 25, 19, 21, 26, 27, 27, 26, 27, 24, 21, 21, 26, 26, 28, 27, 27, 27, 20, 24, 20, 21, 22, 21, 21, 23, 22, 22, 25, 25, 24, 24, 26, 23, 26, 27, 26, 26, 27, 27, 27, 27, 27, 28, 27, 27, 27, 27, 27, 26, 30] }

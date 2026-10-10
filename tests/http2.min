@@ -1,0 +1,51 @@
+use "http2" as h2
+use "errors" as errors
+function number(text: Text): Integer { let n = 0; for c in text { n = n * 10 + Integer(c) - 48 }; return n }
+function report(server: h2.Server) {
+    let request = h2.requests(server)
+    while h2.requestOk(request) {
+        print("REQUEST " + Text(h2.streamID(request)))
+        for field in h2.headers(request) { print(field.name + " " + field.value) }
+        request = h2.requests(server)
+    }
+}
+let mode = argument(2)
+let input = readBytesFile(argument(0))
+if mode == "prefixes" {
+    for cut in 0..(input.length + 1) {
+        let server = h2.create()
+        let result = h2.receive(server, input.slice(0, cut))
+        if !errors.booleanOk(result) { fail("valid HTTP/2 prefix caused hostile-input failure") }
+        let ended = h2.finish(server)
+        // Complete frame boundaries are legal EOF; partial prefaces/frames are typed truncations.
+        if !errors.booleanOk(ended) && errors.code(errors.booleanError(ended)) != errors.truncatedCode() { fail("prefix produced wrong EOF error") }
+        if cut == input.length && !h2.requestOk(h2.requests(server)) { fail("complete independent request missing") }
+    }
+    print("PREFIXES " + Text(input.length + 1))
+} else {
+    let server = h2.create(); let piece = number(argument(3)); if piece < 1 { piece = input.length + 1 }
+    let at = 0; let stopped = false
+    while at < input.length && !stopped {
+        let end = min(input.length, at + piece); let result = h2.receive(server, input.slice(at, end)); at = end
+        if !errors.booleanOk(result) { print("ERROR " + Text(errors.code(errors.booleanError(result))) + " " + Text(errors.nativeCode(errors.booleanError(result)))); stopped = true }
+    }
+    if !stopped {
+        report(server)
+        if mode == "echo" {
+            // Fixtures route only stream 1; independent peers verify serialized responses.
+            h2.respond(server, 1, [h2.Header { name: ":status"; value: "200" }, h2.Header { name: "content-type"; value: "application/octet-stream" }], false)
+            let result = h2.read(server, 1, 65536)
+            while errors.bytesStatus(result) == errors.successStatus() { h2.write(server, 1, errors.bytesValue(result)); result = h2.read(server, 1, 65536) }
+            h2.closeStream(server, 1, [h2.Header { name: "x-final"; value: "done" }])
+        }
+        if mode == "timer" {
+            h2.tick(server, 1000)
+            if h2.nextDeadlineMillis(server) != 11000 { fail("SETTINGS timer missing") }
+            if !errors.booleanOk(h2.tick(server, 10999)) { fail("SETTINGS deadline fired early") }
+            let result = h2.tick(server, 11000)
+            if errors.booleanOk(result) || errors.nativeCode(errors.booleanError(result)) != 4 { fail("SETTINGS exact deadline not enforced") }
+            print("TIMER OK")
+        }
+    }
+    writeBytesFile(argument(1), h2.takeOutgoing(server, 1048576))
+}

@@ -1,0 +1,38 @@
+use "net" as net
+use "tlsserver" as tls
+use "peerauth" as auth
+use "errors" as errors
+
+function main(): Integer {
+    let session = tls.server(randomBytes(64), "hearth-peer-test", [readBytesFile(argument(0))], readBytesFile(argument(1)), [readBytesFile(argument(2))], true)
+    let listener = net.listen("127.0.0.1", 0, 16)
+    if listener < 0 { return 2 }
+    print("READY " + Text(net.localPort(listener)))
+    if !net.ready(listener, 10000) { net.close(listener); return 3 }
+    let connection = net.accept(listener); net.close(listener)
+    if connection < 0 { return 4 }
+    while session.state == tls.STARTING || session.state == tls.HANDSHAKE {
+        if !net.ready(connection, 5000) { net.close(connection); return 5 }
+        let data = net.receive(connection, 65536)
+        if data.length == 0 { net.close(connection); return 6 }
+        tls.receive(session, data)
+        let reply = tls.takeOutgoing(session)
+        if reply.length > 0 { net.send(connection, reply) }
+    }
+    if session.state != tls.ESTABLISHED { print("TLS_ERROR"); net.close(connection); return 1 }
+    let binding = auth.bindDevice(session, argument(3), argument(4), argument(5) == "revoked")
+    if !auth.bindingOk(binding) {
+        print("BIND_ERROR " + Text(errors.code(auth.bindingError(binding))))
+        tls.close(session); net.send(connection, tls.takeOutgoing(session)); net.close(connection); return 0
+    }
+    // A fresh revocation decision must supersede a previously valid binding.
+    if argument(5) == "revoke-after-bind" {
+        let denied = auth.bindDevice(session, argument(3), argument(4), true)
+        if auth.bindingOk(denied) { fail("revocation failed to supersede binding") }
+        print("BIND_REVOKED"); tls.close(session); net.send(connection, tls.takeOutgoing(session)); net.close(connection); return 0
+    }
+    print("BOUND " + auth.boundDeviceID(binding) + " " + auth.boundExitID(binding))
+    tls.send(session, Bytes("bound")); tls.close(session)
+    net.send(connection, tls.takeOutgoing(session)); net.close(connection)
+    return 0
+}

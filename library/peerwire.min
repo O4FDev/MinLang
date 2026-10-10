@@ -1,0 +1,320 @@
+// HPW1: bounded private adapter frames, not a gRPC or HTTP/2 implementation.
+// Socket/mux ownership, certificate trust, revocation and health policy belong
+// to the caller. See docs/peer-wire.md for the exact adapter contract.
+use "errors" as errors
+use "json" as json
+use "peerauth" as auth
+
+public constant HELLO = 1
+public constant HEARTBEAT = 2
+public constant OPEN = 3
+public constant STATUS = 4
+public constant DATA = 5
+public constant CLOSE = 6
+public constant START = 7
+constant BUFFER_LIMIT = 1048576
+
+public record Decoder { private buffer: Bytes; private ended: Boolean; private error: errors.Error }
+public record FrameResult { private error: errors.Error; private type: Integer; private id: Integer; private body: Bytes }
+public record MetadataResult { private error: errors.Error; private value: json.Value }
+public record OpenResult { private error: errors.Error; private grant: Bytes; private exit: Text; private connection: Text; private deadline: Integer }
+public record StatusResult { private error: errors.Error; private value: Text }
+public record Device { private binding: auth.Binding; private hello: Boolean; private error: errors.Error }
+public record Relay {
+    private error: errors.Error; private id: Integer; private exit: Text; private connection: Text
+    private stage: Integer; private status: Text; private incoming: Bytes; private outgoing: Bytes
+}
+
+function error(code: Integer, message: Text): errors.Error { return errors.make(code, 0, message) }
+function failure(code: Integer, message: Text): errors.BooleanResult { return errors.booleanFailure(error(code, message)) }
+function frameFailure(problem: errors.Error): FrameResult { return FrameResult { error: problem; type: 0; id: 0; body: Bytes() } }
+function maximum(type: Integer): Integer {
+    if type == DATA { return 65536 }
+    if type == CLOSE { return 0 }
+    if type == STATUS { return 16 }
+    return 16384
+}
+function validHeader(type: Integer, id: Integer, size: Integer): Boolean {
+    if type < HELLO || type > START || id < 0 || id > 4294967295 || size < 0 || size > maximum(type) { return false }
+    if (type == HELLO || type == HEARTBEAT) != (id == 0) { return false }
+    return type == CLOSE || size > 0
+}
+public function create(): Decoder { return Decoder { buffer: Bytes(); ended: false; error: errors.none() } }
+public function decoderError(value: Decoder): errors.Error { return value.error }
+public function bufferedBytes(value: Decoder): Integer { return value.buffer.length }
+public function feed(value: Decoder, bytes: Bytes): errors.BooleanResult {
+    if errors.isError(value.error) { return errors.booleanFailure(value.error) }
+    if value.ended { return failure(errors.closedCode(), "wire input has ended") }
+    if bytes.length > BUFFER_LIMIT - value.buffer.length {
+        value.error = error(errors.invalidDataCode(), "wire buffer limit exceeded")
+        value.buffer = Bytes(); return errors.booleanFailure(value.error)
+    }
+    value.buffer.addBytes(bytes)
+    return errors.boolean(true)
+}
+// Mark EOF, then keep taking complete queued frames. An incomplete final
+// header/body becomes a typed truncation when take reaches it.
+public function finish(value: Decoder): errors.BooleanResult {
+    value.ended = true
+    if errors.isError(value.error) { return errors.booleanFailure(value.error) }
+    return errors.boolean(true)
+}
+function abandon(value: Decoder, message: Text): FrameResult {
+    value.error = error(errors.protocolCode(), message); value.buffer = Bytes()
+    return frameFailure(value.error)
+}
+function incomplete(value: Decoder): FrameResult {
+    if !value.ended { return frameFailure(error(errors.wouldBlockCode(), "incomplete wire frame")) }
+    if value.buffer.length == 0 { return frameFailure(error(errors.closedCode(), "wire input ended")) }
+    value.error = error(errors.truncatedCode(), "wire input ended inside a frame"); value.buffer = Bytes()
+    return frameFailure(value.error)
+}
+function get32(bytes: Bytes, at: Integer): Integer {
+    return (bytes[at] << 24) | (bytes[at + 1] << 16) | (bytes[at + 2] << 8) | bytes[at + 3]
+}
+public function take(value: Decoder): FrameResult {
+    if errors.isError(value.error) { return frameFailure(value.error) }
+    if value.buffer.length < 16 { return incomplete(value) }
+    let bytes = value.buffer
+    if bytes[0] != 72 || bytes[1] != 80 || bytes[2] != 87 || bytes[3] != 49 || bytes[5] != 0 || bytes[6] != 0 || bytes[7] != 0 { return abandon(value, "invalid HPW1 magic or reserved flags") }
+    let type = bytes[4]; let id = get32(bytes, 8); let size = get32(bytes, 12)
+    if !validHeader(type, id, size) { return abandon(value, "invalid wire kind, stream ID or length") }
+    if size > bytes.length - 16 { return incomplete(value) }
+    let body = bytes.slice(16, 16 + size)
+    value.buffer = bytes.slice(16 + size, bytes.length)
+    return FrameResult { error: errors.none(); type: type; id: id; body: body }
+}
+public function frameOk(value: FrameResult): Boolean { return !errors.isError(value.error) }
+public function frameError(value: FrameResult): errors.Error { return value.error }
+function requireFrame(value: FrameResult) { if !frameOk(value) { fail("cannot read a rejected wire frame") } }
+public function kind(value: FrameResult): Integer { requireFrame(value); return value.type }
+public function streamID(value: FrameResult): Integer { requireFrame(value); return value.id }
+public function payload(value: FrameResult): Bytes { requireFrame(value); return value.body }
+function add32(bytes: Bytes, value: Integer) {
+    for index in 0..4 { bytes.add((value >> ((3 - index) * 8)) & 255) }
+}
+public function encode(type: Integer, id: Integer, body: Bytes): errors.BytesResult {
+    if !validHeader(type, id, body.length) { return errors.bytesFailure(error(errors.invalidDataCode(), "invalid outgoing wire kind, stream ID or length")) }
+    let bytes = Bytes("HPW1"); bytes.add(type); bytes.add(0); bytes.add(0); bytes.add(0)
+    add32(bytes, id); add32(bytes, body.length); bytes.addBytes(body)
+    return errors.bytes(bytes)
+}
+
+function invalidJSON(): json.Value { return json.Value { kind: json.INVALID; text: ""; number: 0.0; truth: false; items: []; keys: [] } }
+function badMetadata(message: Text): MetadataResult { return MetadataResult { error: error(errors.invalidDataCode(), message); value: invalidJSON() } }
+public function metadataOk(value: MetadataResult): Boolean { return !errors.isError(value.error) }
+public function metadataError(value: MetadataResult): errors.Error { return value.error }
+public function metadataValue(value: MetadataResult): json.Value {
+    if !metadataOk(value) { fail("cannot read rejected wire metadata") }
+    return value.value
+}
+function metadata(frame: FrameResult, type: Integer): MetadataResult {
+    if !frameOk(frame) { return MetadataResult { error: frameError(frame); value: invalidJSON() } }
+    if frame.type != type { return badMetadata("unexpected metadata frame kind") }
+    let value = json.parseUniqueBytes(frame.body, 16384)
+    if value.kind != json.OBJECT { return badMetadata("invalid wire JSON metadata") }
+    return MetadataResult { error: errors.none(); value: value }
+}
+// Health/capacity fields are validated by peerlive, not this framing module.
+public function parseHeartbeat(frame: FrameResult): MetadataResult { return metadata(frame, HEARTBEAT) }
+public function parseStart(frame: FrameResult): MetadataResult { return metadata(frame, START) }
+function text(value: json.Value, name: Text): Text {
+    let member = json.member(value, name); if member.kind != json.STRING { return "" }; return member.text
+}
+function fields(value: json.Value, names: List<Text>): Boolean {
+    if value.keys.length != names.length { return false }
+    for key in value.keys {
+        let found = false
+        for name in names { if name == key { found = true } }
+        if !found { return false }
+    }
+    return true
+}
+function identifier(value: Text): Boolean {
+    if value.length < 1 || value.length > 128 { return false }
+    for c in value {
+        if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.') { return false }
+    }
+    return true
+}
+function tokenBytes(bytes: Bytes): Boolean {
+    if bytes.length < 1 || bytes.length > 8192 { return false }
+    for byte in bytes {
+        if !((byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 45 || byte == 95 || byte == 46) { return false }
+    }
+    return true
+}
+function natural(value: json.Value): Integer {
+    if value.kind != json.NUMBER || value.text.length < 1 || value.text.length > 19 || (value.text.length > 1 && value.text[0] == '0') { return -1 }
+    let result = 0
+    for c in value.text {
+        if c < '0' || c > '9' { return -1 }
+        let digit = Integer(c) - 48
+        if result > (9223372036854775807 - digit) / 10 { return -1 }
+        result = result * 10 + digit
+    }
+    return result
+}
+function badOpen(problem: errors.Error): OpenResult { return OpenResult { error: problem; grant: Bytes(); exit: ""; connection: ""; deadline: 0 } }
+public function parseOpen(frame: FrameResult): OpenResult {
+    let decoded = metadata(frame, OPEN)
+    if !metadataOk(decoded) { return badOpen(metadataError(decoded)) }
+    let value = decoded.value; let grant = Bytes(text(value, "dial_grant_bytes")); let exit = text(value, "exit_id"); let connection = text(value, "conn_id"); let deadline = natural(json.member(value, "deadline"))
+    if !fields(value, ["dial_grant_bytes", "exit_id", "conn_id", "deadline"]) || !tokenBytes(grant) || !identifier(exit) || !identifier(connection) || deadline < 1 { return badOpen(error(errors.invalidDataCode(), "invalid gateway open metadata")) }
+    return OpenResult { error: errors.none(); grant: grant; exit: exit; connection: connection; deadline: deadline }
+}
+public function openOk(value: OpenResult): Boolean { return !errors.isError(value.error) }
+public function openError(value: OpenResult): errors.Error { return value.error }
+function requireOpen(value: OpenResult) { if !openOk(value) { fail("cannot read a rejected gateway open") } }
+public function openGrant(value: OpenResult): Bytes { requireOpen(value); return value.grant }
+public function openExitID(value: OpenResult): Text { requireOpen(value); return value.exit }
+public function openConnID(value: OpenResult): Text { requireOpen(value); return value.connection }
+public function openDeadline(value: OpenResult): Integer { requireOpen(value); return value.deadline }
+public function makeOpen(id: Integer, grant: Bytes, exit: Text, connection: Text, deadline: Integer): errors.BytesResult {
+    if !tokenBytes(grant) || !identifier(exit) || !identifier(connection) || deadline < 1 { return errors.bytesFailure(error(errors.invalidDataCode(), "invalid outgoing gateway open metadata")) }
+    let body = "{\"dial_grant_bytes\":" + json.quote(Text(grant)) + ",\"exit_id\":" + json.quote(exit) + ",\"conn_id\":" + json.quote(connection) + ",\"deadline\":" + Text(deadline) + "}"
+    return encode(OPEN, id, Bytes(body))
+}
+public function helloMatches(frame: FrameResult, binding: auth.Binding): errors.BooleanResult {
+    if !auth.bindingOk(binding) { return errors.booleanFailure(auth.bindingError(binding)) }
+    let decoded = metadata(frame, HELLO)
+    if !metadataOk(decoded) { return errors.booleanFailure(metadataError(decoded)) }
+    if !fields(decoded.value, ["device_id", "exit_id"]) || text(decoded.value, "device_id") != auth.boundDeviceID(binding) || text(decoded.value, "exit_id") != auth.boundExitID(binding) { return failure(errors.certificateCode(), "hello does not match the authenticated registry binding") }
+    return errors.boolean(true)
+}
+public function makeHello(binding: auth.Binding): errors.BytesResult {
+    if !auth.bindingOk(binding) { return errors.bytesFailure(auth.bindingError(binding)) }
+    let body = "{\"device_id\":" + json.quote(auth.boundDeviceID(binding)) + ",\"exit_id\":" + json.quote(auth.boundExitID(binding)) + "}"
+    return encode(HELLO, 0, Bytes(body))
+}
+public function makeHeartbeat(body: Bytes): errors.BytesResult {
+    if json.parseUniqueBytes(body, 16384).kind != json.OBJECT { return errors.bytesFailure(error(errors.invalidDataCode(), "invalid outgoing heartbeat JSON")) }
+    return encode(HEARTBEAT, 0, body)
+}
+function validStatus(value: Text): Boolean { return value == "ok" || value == "grant_invalid" || value == "exit_offline" || value == "policy_denied" }
+public function parseStatus(frame: FrameResult): StatusResult {
+    if !frameOk(frame) { return StatusResult { error: frameError(frame); value: "" } }
+    if frame.type != STATUS { return StatusResult { error: error(errors.protocolCode(), "expected first relay status"); value: "" } }
+    for byte in frame.body { if byte < 97 || byte > 122 { if byte != 95 { return StatusResult { error: error(errors.protocolCode(), "invalid relay status"); value: "" } } } }
+    let value = Text(frame.body)
+    if !validStatus(value) { return StatusResult { error: error(errors.protocolCode(), "unknown relay status"); value: "" } }
+    return StatusResult { error: errors.none(); value: value }
+}
+public function statusOk(value: StatusResult): Boolean { return !errors.isError(value.error) }
+public function statusError(value: StatusResult): errors.Error { return value.error }
+public function statusValue(value: StatusResult): Text { if !statusOk(value) { fail("cannot read a rejected relay status") }; return value.value }
+public function makeStatus(id: Integer, value: Text): errors.BytesResult {
+    if !validStatus(value) { return errors.bytesFailure(error(errors.invalidDataCode(), "unknown outgoing relay status")) }
+    return encode(STATUS, id, Bytes(value))
+}
+public function makeStart(id: Integer, grant: auth.Grant): errors.BytesResult {
+    if !auth.grantOk(grant) { return errors.bytesFailure(auth.grantError(grant)) }
+    let target = ",\"target_host\":" + json.quote(auth.targetHost(grant))
+    if auth.targetIP(grant) != "" { target = ",\"target_ip\":" + json.quote(auth.targetIP(grant)) }
+    let body = "{\"dial_grant_bytes\":" + json.quote(Text(auth.grantBytes(grant))) + ",\"exit_id\":" + json.quote(auth.exitID(grant)) + ",\"conn_id\":" + json.quote(auth.connID(grant)) + target + ",\"port\":" + Text(auth.port(grant)) + ",\"expires\":" + Text(auth.expires(grant)) + "}"
+    return encode(START, id, Bytes(body))
+}
+// Device-side verification: the gateway token, not the edge's unsigned target
+// echo, authorizes the destination. Recheck all echoed fields against it.
+public function verifyStart(frame: FrameResult, keys: auth.KeySet, authenticatedExitID: Text, expectedConnID: Text, nowSeconds: Integer, deadlineSeconds: Integer): auth.Grant {
+    let rejected = auth.inspect(Bytes(), keys, authenticatedExitID, authenticatedExitID, expectedConnID, nowSeconds, deadlineSeconds)
+    let decoded = parseStart(frame)
+    if !metadataOk(decoded) { return rejected }
+    let value = decoded.value; let target = "target_host"
+    for key in value.keys { if key == "target_ip" { target = "target_ip" } }
+    if !fields(value, ["dial_grant_bytes", "exit_id", "conn_id", target, "port", "expires"]) { return rejected }
+    let grant = auth.inspect(Bytes(text(value, "dial_grant_bytes")), keys, authenticatedExitID, text(value, "exit_id"), expectedConnID, nowSeconds, deadlineSeconds)
+    if !auth.grantOk(grant) { return grant }
+    if text(value, "conn_id") != auth.connID(grant) || text(value, "target_host") != auth.targetHost(grant) || text(value, "target_ip") != auth.targetIP(grant) || natural(json.member(value, "port")) != auth.port(grant) || natural(json.member(value, "expires")) != auth.expires(grant) { return rejected }
+    return grant
+}
+
+public function heartbeatIntervalSeconds(): Integer { return 15 }
+public function createDevice(binding: auth.Binding): Device {
+    return Device { binding: binding; hello: false; error: auth.bindingError(binding) }
+}
+public function deviceError(value: Device): errors.Error { return value.error }
+public function deviceReady(value: Device): Boolean { return !errors.isError(value.error) && value.hello }
+function deviceFailure(value: Device, problem: errors.Error): errors.BooleanResult {
+    value.error = problem; return errors.booleanFailure(problem)
+}
+public function receiveDevice(value: Device, frame: FrameResult): errors.BooleanResult {
+    if errors.isError(value.error) { return errors.booleanFailure(value.error) }
+    if !frameOk(frame) { return deviceFailure(value, frameError(frame)) }
+    if frame.id != 0 { return deviceFailure(value, error(errors.protocolCode(), "cross-stream device control frame")) }
+    if frame.type == HELLO && !value.hello {
+        let checked = helloMatches(frame, value.binding)
+        if !errors.booleanOk(checked) { return deviceFailure(value, errors.booleanError(checked)) }
+        value.hello = true; return errors.boolean(true)
+    }
+    if frame.type == HEARTBEAT && value.hello {
+        let checked = parseHeartbeat(frame)
+        if !metadataOk(checked) { return deviceFailure(value, metadataError(checked)) }
+        return errors.boolean(true)
+    }
+    return deviceFailure(value, error(errors.protocolCode(), "invalid device hello or heartbeat ordering"))
+}
+
+public function createRelay(grant: auth.Grant, id: Integer): Relay {
+    let result = Relay { error: errors.none(); id: id; exit: ""; connection: ""; stage: 0; status: ""; incoming: Bytes(); outgoing: Bytes() }
+    if !auth.grantOk(grant) { result.error = auth.grantError(grant) }
+    else if id < 1 || id > 4294967295 { result.error = error(errors.invalidDataCode(), "invalid relay stream ID") }
+    else { result.exit = auth.exitID(grant); result.connection = auth.connID(grant) }
+    return result
+}
+public function relayError(value: Relay): errors.Error { return value.error }
+public function relayReady(value: Relay): Boolean { return !errors.isError(value.error) && value.stage == 1 }
+public function relayClosed(value: Relay): Boolean { return !errors.isError(value.error) && value.stage == 2 }
+public function relayStatus(value: Relay): Text { return value.status }
+function requireRelay(value: Relay) { if errors.isError(value.error) { fail("cannot read a rejected relay") } }
+public function relayExitID(value: Relay): Text { requireRelay(value); return value.exit }
+public function relayConnID(value: Relay): Text { requireRelay(value); return value.connection }
+public function relayStreamID(value: Relay): Integer { requireRelay(value); return value.id }
+public function incomingBytes(value: Relay): Integer { return value.incoming.length }
+public function outgoingBytes(value: Relay): Integer { return value.outgoing.length }
+function relayFailure(value: Relay, message: Text): errors.BooleanResult {
+    value.error = error(errors.protocolCode(), message); value.incoming = Bytes(); value.outgoing = Bytes()
+    return errors.booleanFailure(value.error)
+}
+public function receiveRelay(value: Relay, frame: FrameResult): errors.BooleanResult {
+    if errors.isError(value.error) { return errors.booleanFailure(value.error) }
+    if !frameOk(frame) { return errors.booleanFailure(frameError(frame)) }
+    if frame.id != value.id { return relayFailure(value, "cross-stream relay frame") }
+    if frame.type == STATUS && value.stage == 0 {
+        let checked = parseStatus(frame)
+        if !statusOk(checked) { return relayFailure(value, "invalid initial relay status") }
+        value.status = checked.value
+        if value.status == "ok" { value.stage = 1 } else { value.stage = 2 }
+        return errors.boolean(true)
+    }
+    if frame.type == DATA && value.stage == 1 {
+        if frame.body.length > BUFFER_LIMIT - value.incoming.length { return failure(errors.wouldBlockCode(), "relay sink is full") }
+        value.incoming.addBytes(frame.body); return errors.boolean(true)
+    }
+    if frame.type == CLOSE && value.stage == 1 { value.stage = 2; return errors.boolean(true) }
+    return relayFailure(value, "invalid relay status, data or close ordering")
+}
+public function enqueueRelay(value: Relay, bytes: Bytes): errors.BooleanResult {
+    if errors.isError(value.error) { return errors.booleanFailure(value.error) }
+    if value.stage != 1 { return failure(errors.protocolCode(), "relay is not open") }
+    if bytes.length > 65536 || bytes.length == 0 { return failure(errors.invalidDataCode(), "invalid relay data size") }
+    if bytes.length + 16 > BUFFER_LIMIT - value.outgoing.length { return failure(errors.wouldBlockCode(), "relay send buffer is full") }
+    value.outgoing.addBytes(errors.bytesValue(encode(DATA, value.id, bytes))); return errors.boolean(true)
+}
+public function closeRelay(value: Relay): errors.BooleanResult {
+    if errors.isError(value.error) { return errors.booleanFailure(value.error) }
+    if value.stage != 1 { return failure(errors.protocolCode(), "relay is not open") }
+    if 16 > BUFFER_LIMIT - value.outgoing.length { return failure(errors.wouldBlockCode(), "relay send buffer is full") }
+    value.outgoing.addBytes(errors.bytesValue(encode(CLOSE, value.id, Bytes()))); value.stage = 2
+    return errors.boolean(true)
+}
+public function takeIncoming(value: Relay, maximumBytes: Integer): Bytes {
+    if maximumBytes < 1 { fail("relay drain maximum must be positive") }
+    let end = min(value.incoming.length, maximumBytes); let result = value.incoming.slice(0, end)
+    value.incoming = value.incoming.slice(end, value.incoming.length); return result
+}
+public function takeOutgoing(value: Relay, maximumBytes: Integer): Bytes {
+    if maximumBytes < 1 { fail("relay drain maximum must be positive") }
+    let end = min(value.outgoing.length, maximumBytes); let result = value.outgoing.slice(0, end)
+    value.outgoing = value.outgoing.slice(end, value.outgoing.length); return result
+}

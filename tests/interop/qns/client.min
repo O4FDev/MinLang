@@ -1,0 +1,88 @@
+// Bounded HTTP/0.9 download fixture; NSS logs are test artifacts only.
+use "quic" as quic
+use "crypto" as crypto
+use "net" as net
+use "errors" as errors
+use "eventloop" as loop
+use "quicinteropio" as file
+use "tlstickets" as tickets
+record Download { id: Integer; handle: Integer; received: Integer; done: Boolean }
+function main(): Integer {
+    let root = readBytesFile(argument(0)); let host = argument(1); let port = 0
+    for digit in argument(2) { port = port * 10 + Integer(digit) - 48 }
+    let keyLog = argument(3); let directory = argument(4); let testcase = argument(5)
+    let maximum = argumentCount() - 6
+    if maximum < 1 || maximum > 16 { return 1 }
+    let rounds = 1; if testcase == "resumption" || testcase == "zerortt" { rounds = 2 }
+    let ticket = tickets.emptyClient()
+    let socket = net.udp("0.0.0.0", 0)
+    if socket < 0 || !net.udpConnect(socket, host, port) { print("connect failed"); return 2 }
+    let eventLoop = errors.integerValue(loop.create()); loop.watch(eventLoop, socket, loop.readableInterest(), 0)
+    for round in 0..rounds {
+        let connection = quic.client(host, randomBytes(80), "hq-interop", [root], [], Bytes())
+        if round == 1 {
+            connection = quic.clientResumed(host, randomBytes(80), "hq-interop", [root], [], Bytes(), ticket)
+            if testcase == "zerortt" { connection = quic.clientEarly(host, randomBytes(80), "hq-interop", [root], [], Bytes(), ticket) }
+        }
+        let downloads: List<Download> = []; let started = net.monotonicMilliseconds(); let now = 0; let logged = false; let completed = 0; let closed = false
+        let sent = false
+        while now < 60000 {
+            now = net.monotonicMilliseconds() - started
+            let early = round == 1 && testcase == "zerortt" && connection.earlyWrite.key.length > 0
+            if !sent && (connection.state == quic.ESTABLISHED || early) {
+                for index in 0..maximum {
+                    if rounds == 1 || (round == 0 && index == 0) || (round == 1 && index > 0) {
+                        let opened = errors.integer(0)
+                        if early { opened = quic.openEarlyStream(connection, false) } else { opened = quic.openStream(connection, false) }
+                        if !errors.integerOk(opened) { return 3 }
+                        let id = errors.integerValue(opened); let name = argument(index + 6)
+                        let handle = file.openWrite(directory + "/" + name); if handle < 0 { return 4 }
+                        let request = Bytes("GET /" + name + "\r\n")
+                        if early { quic.writeEarlyStream(connection, id, request, true) } else { quic.writeStream(connection, id, request, true) }
+                        downloads.add(Download { id: id; handle: handle; received: 0; done: false })
+                    }
+                }
+                sent = true
+            }
+            if !logged && connection.clientTLS.clientApplication.length == 32 {
+                let session = connection.clientTLS; let random = crypto.hex(session.random)
+                file.append(keyLog, "CLIENT_HANDSHAKE_TRAFFIC_SECRET " + random + " " + crypto.hex(session.clientSecret) + "\nSERVER_HANDSHAKE_TRAFFIC_SECRET " + random + " " + crypto.hex(session.serverSecret) + "\nCLIENT_TRAFFIC_SECRET_0 " + random + " " + crypto.hex(session.clientApplication) + "\nSERVER_TRAFFIC_SECRET_0 " + random + " " + crypto.hex(session.serverApplication) + "\n"); logged = true
+            }
+            if connection.earlyRejected { print("early data rejected: explicit test failure"); return 5 }
+            for download in downloads {
+                if !download.done {
+                    let data = quic.readStream(connection, download.id)
+                    if errors.bytesStatus(data) == errors.endOfStreamStatus() {
+                        file.close(download.handle); download.done = true; completed += 1
+                    } else if errors.bytesOk(data) {
+                        let bytes = errors.bytesValue(data)
+                        if bytes.length > 67108864 - download.received { return 6 }
+                        let at = 0
+                        while at < bytes.length {
+                            let slice = bytes.slice(at, min(at + 65536, bytes.length)); let written = file.write(download.handle, slice)
+                            if written != slice.length { return 7 }; at += written
+                        }
+                        download.received += bytes.length
+                    } else if !errors.isWouldBlock(errors.bytesError(data)) { print(errors.message(errors.bytesError(data))); return 8 }
+                }
+            }
+            if sent && completed == downloads.length && !closed && (round != 0 || rounds == 1 || connection.clientTLS.savedTickets.length > 0) {
+                if round == 1 && !connection.clientTLS.resumed { print("PSK not resumed"); return 9 }
+                if round == 1 && testcase == "zerortt" && !connection.clientTLS.earlyAccepted { return 10 }
+                ticket = quic.takeTicket(connection); quic.close(connection, 0, Bytes("done")); closed = true
+            }
+            for packet in quic.poll(connection, now) { net.write(socket, packet) }
+            if connection.state == quic.CLOSED && !connection.closing && !connection.draining { print("QNS client transfer complete"); break }
+            if connection.state == quic.FAILED { print(connection.error); return 11 }
+            let batch = loop.wait(eventLoop, min(100, max(0, quic.nextTimer(connection) - now)), 64)
+            if errors.isError(loop.batchError(batch)) { return 12 }
+            now = net.monotonicMilliseconds() - started
+            for event in loop.events(batch) {
+                let packets = net.receiveDatagrams(socket, 64, 65535)
+                if net.datagramBatchOk(packets) { for packet in net.datagrams(packets) { let bytes = net.datagramData(packet); if errors.bytesOk(bytes) { quic.receive(connection, errors.bytesValue(bytes), now) } } }
+            }
+        }
+        if !closed { print("QNS client timeout"); return 13 }
+    }
+    net.close(socket); loop.close(eventLoop); return 0
+}

@@ -7,6 +7,7 @@
 #include <math.h>
 #include <stdatomic.h>
 #include "../minyar_native.h"
+#include "apple_identity.h"
 
 /* Matches MNWakeSubtype in macos.m: ends a macos.nextEvent wait. */
 enum { MHWakeSubtype = 0x4D59 };
@@ -18,6 +19,9 @@ enum { MHWakeSubtype = 0x4D59 };
 @property(nonatomic, copy) NSString *error;
 @property(nonatomic) BOOL done;
 @property(nonatomic, strong) NSCondition *condition;
+@property(nonatomic, strong) NSURLCredential *clientCredential;
+@property(nonatomic, strong) NSURL *credentialOrigin;
+@property(nonatomic, strong) NSURLSession *identitySession;
 @end
 @implementation MHRequest
 @end
@@ -29,6 +33,9 @@ static NSMutableDictionary<NSNumber *, MHRequest *> *requests;
 static NSMapTable<NSURLSessionTask *, MHRequest *> *byTask;
 static long long nextRequest = 1;
 static atomic_bool wakePending;
+static void http_owner(void) {
+    if (![NSThread isMainThread]) minyar_native_stop("http APIs require the main thread.");
+}
 
 /* Wake a waiting desktop event loop, at most once until the program next looks. */
 static void wake(void) {
@@ -48,7 +55,66 @@ static void finish(MHRequest *r, NSString *error) {
     wake();
 }
 
+static BOOL http_same_origin(NSURL *a, NSURL *b) {
+    return a.host.length && b.host.length && [a.scheme.lowercaseString isEqualToString:@"https"] &&
+        [b.scheme.lowercaseString isEqualToString:@"https"] &&
+        [a.host caseInsensitiveCompare:b.host]==NSOrderedSame &&
+        (a.port?a.port.integerValue:443)==(b.port?b.port.integerValue:443) && !b.user && !b.password;
+}
+static NSURLCredential *http_identity_credential(const MinyarBytes *reference, const MinyarBytes *chain) {
+    SecIdentityRef identity=identity_value(reference);
+    if (!identity) return nil;
+    NSMutableArray *certificates=[NSMutableArray new];
+    BOOL valid=chain->byte_length>=0 && chain->byte_length<=1048576;
+    size_t offset=0;
+    if (valid && chain->byte_length) {
+        valid=chain->byte_length>=4;
+        uint32_t count=valid?identity_word(chain->bytes):0;
+        valid=valid && count<=16; offset=4;
+        for (uint32_t i=0;valid && i<count;i++) {
+            if ((uint64_t)chain->byte_length-offset<4) { valid=NO; break; }
+            uint32_t size=identity_word(chain->bytes+offset); offset+=4;
+            if (!size || size>(uint64_t)chain->byte_length-offset) { valid=NO; break; }
+            CFDataRef data=CFDataCreate(NULL,chain->bytes+offset,size);
+            SecCertificateRef cert=data?SecCertificateCreateWithData(NULL,data):NULL;
+            if (data) CFRelease(data);
+            if (!cert) { valid=NO; break; }
+            [certificates addObject:CFBridgingRelease(cert)]; offset+=size;
+        }
+        valid=valid && offset==(uint64_t)chain->byte_length;
+    }
+    NSURLCredential *credential=valid?[NSURLCredential credentialWithIdentity:identity
+        certificates:certificates.count?certificates:nil persistence:NSURLCredentialPersistenceForSession]:nil;
+    CFRelease(identity); return credential;
+}
+static void http_authenticate(MHRequest *r, NSURLAuthenticationChallenge *challenge,
+                              void (^handler)(NSURLSessionAuthChallengeDisposition,NSURLCredential *)) {
+    NSURLProtectionSpace *space=challenge.protectionSpace;
+    if (![space.authenticationMethod isEqualToString:NSURLAuthenticationMethodClientCertificate] || !r.clientCredential) {
+        handler(NSURLSessionAuthChallengePerformDefaultHandling,nil); return;
+    }
+    [r.condition lock]; BOOL done=r.done; [r.condition unlock];
+    NSURL *origin=r.credentialOrigin;
+    BOOL match=!done && space.host.length && origin.host.length && !space.isProxy && !challenge.previousFailureCount &&
+        [space.protocol.lowercaseString isEqualToString:@"https"] &&
+        [space.host caseInsensitiveCompare:origin.host]==NSOrderedSame &&
+        space.port==(origin.port?origin.port.integerValue:443);
+    handler(match?NSURLSessionAuthChallengeUseCredential:NSURLSessionAuthChallengeCancelAuthenticationChallenge,
+            match?r.clientCredential:nil);
+}
+
 @implementation MHDelegate
+- (void)URLSession:(NSURLSession *)s task:(NSURLSessionTask *)task didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge
+    completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition,NSURLCredential *))handler {
+    (void)s; http_authenticate(requestFor(task),challenge,handler);
+}
+- (void)URLSession:(NSURLSession *)s task:(NSURLSessionTask *)task willPerformHTTPRedirection:(NSHTTPURLResponse *)response
+    newRequest:(NSURLRequest *)request completionHandler:(void (^)(NSURLRequest *))handler {
+    (void)s; (void)response; MHRequest *r=requestFor(task);
+    if (r.clientCredential && !http_same_origin(r.credentialOrigin,request.URL)) {
+        finish(r,@"client certificate requests cannot redirect to another origin"); handler(nil);
+    } else handler(request);
+}
 - (void)URLSession:(NSURLSession *)s dataTask:(NSURLSessionDataTask *)task didReceiveResponse:(NSURLResponse *)response
     completionHandler:(void (^)(NSURLSessionResponseDisposition))handler {
     (void)s;
@@ -74,6 +140,7 @@ static void finish(MHRequest *r, NSString *error) {
     if (error) message = error.code == NSURLErrorCancelled ? @"cancelled" : error.localizedDescription;
     finish(r, message);
     @synchronized(byTask) { [byTask removeObjectForKey:task]; }
+    [r.identitySession finishTasksAndInvalidate]; r.identitySession=nil;
 }
 @end
 
@@ -87,6 +154,7 @@ static MinyarText *owned(NSString *s) {
     return minyar_native_copy_text(data.bytes, (long long)data.length);
 }
 static MHRequest *entry(long long handle) {
+    http_owner();
     MHRequest *r = requests[@(handle)];
     if (!r) minyar_native_stop("http received an invalid or closed request.");
     return r;
@@ -118,7 +186,9 @@ static MinyarText *decode(const unsigned char *bytes, size_t length) {
     return minyar_native_copy_text(out.bytes, (long long)out.length);
 }
 
-long long minyar_http_begin(const MinyarText *method, const MinyarText *url, const MinyarText *headers, const MinyarText *body) { @autoreleasepool {
+static long long http_begin(const MinyarText *method, const MinyarText *url, const MinyarText *headers, const MinyarText *body,
+                            NSURLCredential *credential, BOOL requiresIdentity) { @autoreleasepool {
+    http_owner();
     if (!session) {
         NSURLSessionConfiguration *configuration = NSURLSessionConfiguration.defaultSessionConfiguration;
         configuration.timeoutIntervalForRequest = 60;
@@ -153,12 +223,33 @@ long long minyar_http_begin(const MinyarText *method, const MinyarText *url, con
     if (nextRequest == LLONG_MAX) minyar_native_stop("http could not allocate a request.");
     MHRequest *r = [MHRequest new];
     r.unread = [NSMutableData new]; r.condition = [NSCondition new];
-    r.task = [session dataTaskWithRequest:request];
-    @synchronized(byTask) { [byTask setObject:r forKey:r.task]; }
     long long handle = nextRequest++;
     requests[@(handle)] = r;
+    if (requiresIdentity && (!credential || ![address.scheme isEqualToString:@"https"] || address.user || address.password)) {
+        finish(r,@"an HTTPS request requires an accessible Keychain identity and valid intermediate certificates"); return handle;
+    }
+    r.clientCredential=credential; r.credentialOrigin=credential?address:nil;
+    if (credential) {
+        /* Client certificate credentials and authenticated pooled connections
+         * must never be reused by an unrelated request or device identity. */
+        NSURLSessionConfiguration *configuration=NSURLSessionConfiguration.ephemeralSessionConfiguration;
+        configuration.timeoutIntervalForRequest=60; configuration.URLCache=nil;
+        configuration.URLCredentialStorage=nil;
+        NSOperationQueue *queue=[NSOperationQueue new]; queue.maxConcurrentOperationCount=1;
+        r.identitySession=[NSURLSession sessionWithConfiguration:configuration delegate:[MHDelegate new] delegateQueue:queue];
+    }
+    r.task = [(r.identitySession?:session) dataTaskWithRequest:request];
+    @synchronized(byTask) { [byTask setObject:r forKey:r.task]; }
     [r.task resume];
     return handle;
+} }
+long long minyar_http_begin(const MinyarText *method, const MinyarText *url, const MinyarText *headers, const MinyarText *body) {
+    return http_begin(method,url,headers,body,nil,NO);
+}
+long long minyar_http_beginWithIdentity(const MinyarText *method, const MinyarText *url, const MinyarText *headers,
+                                      const MinyarText *body, const MinyarBytes *reference, const MinyarBytes *chain) { @autoreleasepool {
+    http_owner();
+    return http_begin(method,url,headers,body,http_identity_credential(reference,chain),YES);
 } }
 bool minyar_http_wait(long long handle, double seconds) { @autoreleasepool {
     MHRequest *r = entry(handle);
@@ -229,6 +320,7 @@ void minyar_http_cancel(long long handle) { @autoreleasepool {
 } }
 void minyar_http_close(long long handle) { @autoreleasepool {
     MHRequest *r = entry(handle);
-    if (!r.done) [r.task cancel];
+    [r.condition lock]; BOOL done=r.done; [r.condition unlock];
+    if (!done) [r.task cancel];
     [requests removeObjectForKey:@(handle)];
 } }

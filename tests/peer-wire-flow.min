@@ -1,0 +1,118 @@
+use "peerwire" as wire
+use "peerauth" as auth
+use "errors" as errors
+use "tlsserver" as tls
+
+function same(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+function frame(bytes: Bytes): wire.FrameResult {
+    let decoder = wire.create()
+    let result = wire.feed(decoder, bytes)
+    if !errors.booleanOk(result) { fail("test frame exceeded decoder bound") }
+    return wire.take(decoder)
+}
+function ok(result: errors.BooleanResult) { if !errors.booleanOk(result) { fail("unexpected test operation error " + Text(errors.code(errors.booleanError(result)))) } }
+function bytes(result: errors.BytesResult): Bytes { if !errors.bytesOk(result) { fail("unexpected test encode failure") }; return errors.bytesValue(result) }
+function relay(grant: auth.Grant): wire.Relay {
+    let result = wire.createRelay(grant, 1)
+    ok(wire.receiveRelay(result, frame(bytes(wire.makeStatus(1, "ok")))))
+    return result
+}
+function pump(sender: wire.Relay, decoder: wire.Decoder, receiver: wire.Relay) {
+    while wire.outgoingBytes(sender) > 0 {
+        ok(wire.feed(decoder, wire.takeOutgoing(sender, 7)))
+        let next = wire.take(decoder)
+        while wire.frameOk(next) { ok(wire.receiveRelay(receiver, next)); next = wire.take(decoder) }
+        if errors.code(wire.frameError(next)) != errors.wouldBlockCode() { fail("pump parser failed") }
+    }
+}
+let mode = argument(0)
+let grant = auth.inspect(readBytesFile(argument(1)), auth.parseKeys(readBytesFile(argument(2))), "exit-a", "exit-a", "conn-1", 1000, 1060)
+if !auth.grantOk(grant) { fail("independent grant fixture rejected") }
+if mode == "start" {
+    let result = frame(bytes(wire.makeStart(1, grant)))
+    print(Text(wire.payload(result)))
+} else if mode == "verify-start" {
+    let result = wire.verifyStart(frame(readBytesFile(argument(3))), auth.parseKeys(readBytesFile(argument(2))), "exit-a", "conn-1", 1000, 1060)
+    if auth.grantOk(result) { print("VERIFIED " + auth.targetHost(result) + " " + Text(auth.port(result))) }
+    else { print("ERROR " + Text(errors.code(auth.grantError(result)))) }
+} else if mode == "open" {
+    let result = wire.parseOpen(frame(readBytesFile(argument(3))))
+    if !wire.openOk(result) { print("ERROR " + Text(errors.code(wire.openError(result)))) }
+    else { print("OPEN " + wire.openExitID(result) + " " + wire.openConnID(result) + " " + Text(wire.openDeadline(result)) + " " + Text(wire.openGrant(result))) }
+} else if mode == "heartbeat" {
+    let result = wire.parseHeartbeat(frame(readBytesFile(argument(3))))
+    if wire.metadataOk(result) { print("OK") } else { print("ERROR " + Text(errors.code(wire.metadataError(result)))) }
+} else if mode == "device" {
+    // Wire policy fixture only: real possession/CA/EKU checks are independently
+    // covered by peer-auth-device.py. Never manufacture session fields in apps.
+    let session = tls.none(); session.state = tls.ESTABLISHED; session.requireClient = true; session.authenticated = true; session.peerCertificate = readBytesFile(argument(4))
+    let binding = auth.bindDevice(session, "device-a", "exit-a", false)
+    if !auth.bindingOk(binding) { fail("test certificate binding rejected") }
+    let state = wire.createDevice(binding); let decoder = wire.create(); ok(wire.feed(decoder, readBytesFile(argument(3))))
+    let next = wire.take(decoder)
+    while wire.frameOk(next) {
+        let result = wire.receiveDevice(state, next)
+        if !errors.booleanOk(result) { print("ERROR " + Text(errors.code(errors.booleanError(result)))); break }
+        next = wire.take(decoder)
+    }
+    if !errors.isError(wire.deviceError(state)) { print("READY " + Text(wire.deviceReady(state))) }
+} else if mode == "relay" {
+    let state = wire.createRelay(grant, 1); let decoder = wire.create(); ok(wire.feed(decoder, readBytesFile(argument(3))))
+    let next = wire.take(decoder)
+    while wire.frameOk(next) {
+        let result = wire.receiveRelay(state, next)
+        if !errors.booleanOk(result) { print("ERROR " + Text(errors.code(errors.booleanError(result)))); break }
+        next = wire.take(decoder)
+    }
+    print("STATE " + Text(wire.relayReady(state)) + " " + Text(wire.relayClosed(state)) + " " + wire.relayStatus(state) + " " + Text(wire.incomingBytes(state)))
+    if !errors.isError(wire.relayError(state)) && !same(wire.takeIncoming(state, 1048576), readBytesFile(argument(4))) { fail("independent relay model bytes differ") }
+} else if mode == "bidirectional" {
+    let left = relay(grant); let right = relay(grant); let leftDecoder = wire.create(); let rightDecoder = wire.create()
+    let fromLeft = readBytesFile(argument(3)); let fromRight = readBytesFile(argument(4))
+    let at = 0
+    while at < max(fromLeft.length, fromRight.length) {
+        if at < fromLeft.length { ok(wire.enqueueRelay(left, fromLeft.slice(at, min(at + 97, fromLeft.length)))) }
+        if at < fromRight.length { ok(wire.enqueueRelay(right, fromRight.slice(at, min(at + 97, fromRight.length)))) }
+        pump(left, rightDecoder, right); pump(right, leftDecoder, left); at += 97
+    }
+    if !same(wire.takeIncoming(right, 1048576), fromLeft) || !same(wire.takeIncoming(left, 1048576), fromRight) { fail("bidirectional relay mixed or lost bytes") }
+    if wire.relayExitID(left) != "exit-a" || wire.relayConnID(right) != "conn-1" || wire.relayStreamID(right) != 1 { fail("relay identity changed") }
+    ok(wire.closeRelay(left)); pump(left, rightDecoder, right)
+    if !wire.relayClosed(left) || !wire.relayClosed(right) { fail("relay close was not terminal") }
+    if errors.booleanOk(wire.enqueueRelay(left, Bytes("after-close"))) { fail("closed relay accepted outgoing data") }
+    print("BIDIRECTIONAL OK")
+} else if mode == "backpressure" {
+    let sender = relay(grant); let block = Bytes(65536)
+    for index in 0..15 { ok(wire.enqueueRelay(sender, block)) }
+    ok(wire.enqueueRelay(sender, Bytes(65280)))
+    if wire.outgoingBytes(sender) != 1048576 { fail("send budget does not include headers") }
+    let blocked = wire.enqueueRelay(sender, Bytes("x"))
+    if errors.booleanOk(blocked) || errors.code(errors.booleanError(blocked)) != errors.wouldBlockCode() || wire.outgoingBytes(sender) != 1048576 { fail("send backpressure changed queued bytes") }
+    wire.takeOutgoing(sender, 17); ok(wire.enqueueRelay(sender, Bytes("x")))
+    if wire.outgoingBytes(sender) != 1048576 { fail("send backpressure retry did not preserve bound") }
+    let receiver = relay(grant)
+    for index in 0..16 {
+        block[0] = index
+        ok(wire.receiveRelay(receiver, frame(bytes(wire.encode(wire.DATA, 1, block)))))
+    }
+    block[0] = 16
+    let held = frame(bytes(wire.encode(wire.DATA, 1, block)))
+    blocked = wire.receiveRelay(receiver, held)
+    if errors.booleanOk(blocked) || errors.code(errors.booleanError(blocked)) != errors.wouldBlockCode() || wire.incomingBytes(receiver) != 1048576 || !wire.relayReady(receiver) { fail("receive backpressure poisoned or changed relay") }
+    wire.takeIncoming(receiver, 1)
+    blocked = wire.receiveRelay(receiver, held)
+    if errors.booleanOk(blocked) || errors.code(errors.booleanError(blocked)) != errors.wouldBlockCode() { fail("insufficient drain bypassed receive bound") }
+    wire.takeIncoming(receiver, 65535); ok(wire.receiveRelay(receiver, held))
+    if !same(wire.takeIncoming(receiver, 1048576), readBytesFile(argument(3))) { fail("retry duplicated or lost buffered data") }
+    let decoder = wire.create(); ok(wire.feed(decoder, readBytesFile(argument(4))))
+    if wire.bufferedBytes(decoder) != 1048576 { fail("decoder exact bound failed") }
+    blocked = wire.feed(decoder, Bytes("x"))
+    if errors.booleanOk(blocked) || errors.code(errors.booleanError(blocked)) != errors.invalidDataCode() || wire.bufferedBytes(decoder) != 0 || errors.code(wire.frameError(wire.take(decoder))) != errors.invalidDataCode() { fail("decoder overrun was not sticky typed failure") }
+    print("BACKPRESSURE OK")
+} else if mode == "trap" {
+    print(Text(wire.kind(wire.take(wire.create()))))
+}

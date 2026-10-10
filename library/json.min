@@ -26,6 +26,7 @@ record Cursor {
     text: Text
     position: Integer
     error: Text
+    strict: Boolean
 }
 
 function leaf(kind: Integer, text: Text, number: Float, truth: Boolean): Value {
@@ -33,13 +34,110 @@ function leaf(kind: Integer, text: Text, number: Float, truth: Boolean): Value {
 }
 
 public function parse(source: Text): Value {
-    let cursor = Cursor { text: source; position: 0; error: "" }
+    return parseText(source, false)
+}
+
+function parseText(source: Text, strict: Boolean): Value {
+    let cursor = Cursor { text: source; position: 0; error: ""; strict: strict }
     let value = parseValue(cursor, 0)
     skipSpace(cursor)
+    if cursor.error == "" && cursor.position != source.length {
+        return failure(cursor, "unexpected trailing input")
+    }
     if cursor.error != "" {
         return leaf(INVALID, cursor.error, 0.0, false)
     }
     return value
+}
+
+// Validate bytes before Text conversion, so malformed network input remains
+// an INVALID value. The caller supplies its protocol's maximum wire size.
+public function parseBytes(source: Bytes, maximumBytes: Integer): Value {
+    if maximumBytes <= 0 || source.length > maximumBytes {
+        return leaf(INVALID, "JSON byte limit exceeded", 0.0, false)
+    }
+    if !validUTF8(source) { return leaf(INVALID, "invalid JSON UTF-8", 0.0, false) }
+    return parse(Text(source))
+}
+
+function validUTF8(source: Bytes): Boolean {
+    let position = 0
+    while position < source.length {
+        let first = source[position]
+        if first < 128 {
+            position += 1
+        } else {
+            let count = 0
+            let lower = 128
+            let upper = 191
+            if first >= 194 && first <= 223 { count = 2 }
+            if first >= 224 && first <= 239 {
+                count = 3
+                if first == 224 { lower = 160 }
+                if first == 237 { upper = 159 }
+            }
+            if first >= 240 && first <= 244 {
+                count = 4
+                if first == 240 { lower = 144 }
+                if first == 244 { upper = 143 }
+            }
+            if count == 0 || count > source.length - position { return false }
+            let second = source[position + 1]
+            if second < lower || second > upper { return false }
+            for index in 2..count {
+                let continuation = source[position + index]
+                if continuation < 128 || continuation > 191 { return false }
+            }
+            position += count
+        }
+    }
+    return true
+}
+
+record UniqueCheck {
+    remaining: Integer
+    error: Text
+}
+
+// Bounded authentication metadata: duplicate decoded names are ambiguous.
+// Limits are 64 Ki characters, 4096 values and 256 members per object.
+// parse() keeps its ordinary JSON duplicate-name policy.
+public function parseUnique(source: Text): Value {
+    if source.length > 65536 { return leaf(INVALID, "JSON metadata limit exceeded", 0.0, false) }
+    let value = parseText(source, true)
+    if value.kind == INVALID { return value }
+    let check = UniqueCheck { remaining: 4096; error: "" }
+    uniqueNames(value, check)
+    if check.error != "" { return leaf(INVALID, check.error, 0.0, false) }
+    return value
+}
+
+// Network metadata validates bytes before Text conversion, decoded names and
+// Unicode surrogates. Ordinary parse() retains its existing replacement policy.
+public function parseUniqueBytes(source: Bytes, maximumBytes: Integer): Value {
+    if maximumBytes <= 0 || source.length > maximumBytes || source.length > 65536 {
+        return leaf(INVALID, "JSON metadata byte limit exceeded", 0.0, false)
+    }
+    if !validUTF8(source) { return leaf(INVALID, "invalid JSON UTF-8", 0.0, false) }
+    return parseUnique(Text(source))
+}
+
+function uniqueNames(value: Value, check: UniqueCheck) {
+    if check.error != "" { return }
+    check.remaining -= 1
+    if check.remaining < 0 { check.error = "JSON metadata value limit exceeded"; return }
+    if value.kind == OBJECT {
+        if value.keys.length > 256 { check.error = "JSON metadata member limit exceeded"; return }
+        for index in 0..value.keys.length {
+            for earlier in 0..index {
+                if value.keys[earlier] == value.keys[index] {
+                    check.error = "duplicate JSON member"
+                    return
+                }
+            }
+        }
+    }
+    for child in value.items { uniqueNames(child, check) }
 }
 
 function skipSpace(cursor: Cursor) {
@@ -148,6 +246,10 @@ function parseString(cursor: Cursor): Text {
     // Most strings have no escapes: they are one slice of the source.
     let end = start
     while end < text.length && text[end] != '"' && text[end] != '\\' {
+        if Integer(text[end]) < 32 {
+            failure(cursor, "unescaped string control")
+            return ""
+        }
         end += 1
     }
     if end < text.length && text[end] == '"' {
@@ -157,6 +259,10 @@ function parseString(cursor: Cursor): Text {
     let parts: List<Text> = []
     while cursor.position < text.length {
         let c = text[cursor.position]
+        if Integer(c) < 32 {
+            failure(cursor, "unescaped string control")
+            return ""
+        }
         if c == '"' {
             parts.add(text.slice(start, cursor.position))
             cursor.position += 1
@@ -171,27 +277,49 @@ function parseString(cursor: Cursor): Text {
             if e == 'n' { parts.add("\n") }
             if e == 't' { parts.add("\t") }
             if e == 'r' { parts.add("\r") }
-            if e == 'b' || e == 'f' { parts.add(" ") }
+            if e == 'b' { parts.add(Text(Character(8))) }
+            if e == 'f' { parts.add(Text(Character(12))) }
             if e == '"' || e == '\\' || e == '/' { parts.add(Text(e)) }
-            if e == 'u' && cursor.position + 4 <= text.length {
+            if e == 'u' {
+                if cursor.position + 4 > text.length {
+                    failure(cursor, "unfinished Unicode escape")
+                    return ""
+                }
                 let code = 0
                 for index in 0..4 {
-                    code = code * 16 + max(hexDigit(text[cursor.position + index]), 0)
+                    let digit = hexDigit(text[cursor.position + index])
+                    if digit < 0 {
+                        failure(cursor, "invalid Unicode escape")
+                        return ""
+                    }
+                    code = code * 16 + digit
                 }
                 cursor.position += 4
                 // Combine a surrogate pair.
                 if code >= 0xD800 && code < 0xDC00 && cursor.position + 6 <= text.length && text[cursor.position] == '\\' && text[cursor.position + 1] == 'u' {
                     let low = 0
                     for index in 0..4 {
-                        low = low * 16 + max(hexDigit(text[cursor.position + 2 + index]), 0)
+                        let digit = hexDigit(text[cursor.position + 2 + index])
+                        if digit < 0 {
+                            failure(cursor, "invalid Unicode escape")
+                            return ""
+                        }
+                        low = low * 16 + digit
                     }
                     if low >= 0xDC00 && low < 0xE000 {
                         code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
                         cursor.position += 6
                     }
                 }
-                if code >= 0xD800 && code < 0xE000 { code = 0xFFFD }
+                if code >= 0xD800 && code < 0xE000 {
+                    if cursor.strict { failure(cursor, "unpaired Unicode surrogate"); return "" }
+                    code = 0xFFFD
+                }
                 parts.add(Text(Character(code)))
+            }
+            if e != 'n' && e != 't' && e != 'r' && e != 'b' && e != 'f' && e != '"' && e != '\\' && e != '/' && e != 'u' {
+                failure(cursor, "invalid string escape")
+                return ""
             }
             start = cursor.position
         } else {
@@ -212,13 +340,18 @@ function parseNumber(cursor: Cursor): Value {
     }
     let value = 0.0
     let digits = 0
+    let integerStart = cursor.position
     while cursor.position < text.length && text[cursor.position] >= '0' && text[cursor.position] <= '9' {
         value = value * 10.0 + Float(Integer(text[cursor.position]) - 48)
         cursor.position += 1
         digits += 1
     }
+    if digits == 0 || (digits > 1 && text[integerStart] == '0') {
+        return failure(cursor, "invalid number integer")
+    }
     if cursor.position < text.length && text[cursor.position] == '.' {
         cursor.position += 1
+        let fractionStart = cursor.position
         let scale = 0.1
         while cursor.position < text.length && text[cursor.position] >= '0' && text[cursor.position] <= '9' {
             value += Float(Integer(text[cursor.position]) - 48) * scale
@@ -226,6 +359,7 @@ function parseNumber(cursor: Cursor): Value {
             cursor.position += 1
             digits += 1
         }
+        if cursor.position == fractionStart { return failure(cursor, "unfinished fraction") }
     }
     if cursor.position < text.length && (text[cursor.position] == 'e' || text[cursor.position] == 'E') {
         cursor.position += 1
@@ -235,10 +369,12 @@ function parseNumber(cursor: Cursor): Value {
             cursor.position += 1
         }
         let exponent = 0.0
+        let exponentStart = cursor.position
         while cursor.position < text.length && text[cursor.position] >= '0' && text[cursor.position] <= '9' {
             exponent = exponent * 10.0 + Float(Integer(text[cursor.position]) - 48)
             cursor.position += 1
         }
+        if cursor.position == exponentStart { return failure(cursor, "unfinished exponent") }
         value = value * pow(10.0, sign * exponent)
     }
     if digits == 0 { return failure(cursor, "unexpected character") }
