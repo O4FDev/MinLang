@@ -133,9 +133,9 @@ Readonly identifiers cannot enter scalar-record or ownership-slot metadata.
 ## Representation and destruction
 
 The word immediately before a native heap payload holds three kind bits and a
-reference count. Lists and mixed records also have a 48-byte collector prefix
-on the supported 64-bit ABI; Text and scalar records retain their eight-byte
-header. A zero count denotes an immortal object. Compiler-generated
+reference count. Lists and records whose static type can reach itself are
+allocated with kind `RC_TRACED` and a 32-byte collector prefix on the supported
+64-bit ABI; all other objects retain their eight-byte header. A zero count denotes an immortal object. Compiler-generated
 Text globals include the same prefix and expose the payload using an LLVM
 constant offset expression. Native calls must never pass an unprefixed object
 to ownership operations.

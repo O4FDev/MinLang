@@ -281,9 +281,9 @@ reclamation must add one to their harness.
 ## Platforms and checks
 
 The tested ABI uses an eight-byte ownership word and a 64-bit target. Lists
-and mixed records also reserve 48 bytes of collector metadata; this increases
-rounded pool charges (a unary mixed record now occupies 128 bytes). Scalar
-records and Text keep their existing layout.
+and records whose static type can reach itself (kind `RC_TRACED`) also reserve
+32 bytes of collector metadata, which increases their rounded pool charges.
+Every other List and record, scalar records, and Text keep their existing layout.
 The cycle collector's new checks have run on macOS arm64. Earlier runtime
 checks also ran on Ubuntu 24.04/glibc with Clang 18 on Linux aarch64 and x86_64.
 Linux runs used OrbStack on Apple Silicon, with

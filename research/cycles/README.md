@@ -30,14 +30,20 @@ Related work consulted:
 ## Representation and operations
 
 The eight-byte word immediately before a payload still stores its kind and
-ordinary ownership count. Text and scalar records retain their old layout.
-Lists and mixed records reserve a further 48 bytes on this 64-bit ABI:
-registry links, gray-queue links, an incoming-edge count, and generation/color,
-pin, registration, and cleared flags. Scalar Lists currently pay this space cost
-too, because their reference kind can be established after allocation.
+ordinary ownership count. Only a List or record whose static type can reach
+itself through reference fields and elements can lie on a heap cycle. The
+compiler allocates exactly those with `minyar_list_new_traced` or
+`minyar_record_new_traced` (kind `RC_TRACED`); `List + value` inherits its
+operand's layout. They reserve a further 32 bytes on this 64-bit ABI:
+registry links, a singly linked gray-queue link, and one word holding the
+incoming-edge count (57 bits) with generation/color, pin, registration,
+cleared, and record/List flags. All other objects keep v2's layout and kinds.
+A slot of an untraced aggregate is never counted as incoming, so it acts as
+an external owner of any traced child. That is safe, and complete: an
+untraced object cannot be on a cycle, since its type would then reach itself.
 
-Every aggregate slot insertion increments its target's incoming count; removing
-that slot decrements it. The ordinary count still includes that edge. Consequently
+Every traced aggregate's slot insertion increments its traced target's
+incoming count; removing that slot decrements it. The ordinary count still includes that edge. Consequently
 `ordinary - incoming` counts external owners, including locals, returned values,
 expression temporaries, native owners, and detached frames/chunks (plus explicitly recorded collector pins). Compiler
 transfers change the classification of an owner, even when they do not change
@@ -301,6 +307,61 @@ A non-cyclic program whose mutation types could close a cycle (100,000
 instructions per add (3.74 G in total, linear in the add count). v2 rejected
 that program, so it has no baseline.
 
+### Reducing the cost for programs without cycles
+
+Two later commits target the overhead above. Same method: medians of five
+`/usr/bin/time -l` runs under `nice -n 15`, v2 and every variant built in the
+same session (`--release`-equivalent LTO links of the default runtime; the
+system-runtime compiler compiles v2's `compiler.min`).
+
+1. `0ecd8f6`: the metadata shrinks from 48 to 32 bytes (singly linked gray
+   queue; incoming count and flags share one word). Shading, pinning and
+   request checks test one global (`rc_cycle_shading`, `rc_cycle_enabled`)
+   before loading any metadata, and their bodies moved out of line.
+2. `3aa1fa5`: type-level cycle capability. The compiler allocates metadata
+   only for List and record types that can reach themselves (`RC_TRACED`);
+   all barrier work is gated on that kind, so untraced objects take v2's
+   count path.
+
+| Workload | v2 | Port | Step 1 | Now | Now vs v2 | Peak RSS v2 / port / now |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Compiler using system runtime | 363.3 M | 397.9 M | 390.6 M | 384.6 M | +5.9% | 11.8 / 11.7 / 11.8 MiB |
+| `acyclic.min` (20 x 5,000 chain) | 193.2 M | 227.1 M | 219.5 M | 221.6 M | +14.7% | 1.88 / 2.34 / 2.19 MiB |
+| 100,000-record chain | 168.3 M | 203.0 M | 192.1 M | 184.0 M | +9.3% | 12.1 / 21.3 / 18.2 MiB |
+| 100,000 `List<Point>.add` | 46.5 M | 57.3 M | 53.3 M | 48.9 M | +5.3% | 7.30 / 11.9 / 7.30 MiB |
+| Compiler arena self-compile (min) | 88.24 M | | | 88.40 M | +0.2% | unchanged |
+
+`List<Point>` and the compiler's own types are not cycle-capable, so they no
+longer carry metadata: their peak memory equals v2's. Both chain programs use
+`Node { children: List<Node> }`, which can form a cycle, so they still pay.
+
+#### Remaining cost, and why it is not removable cheaply
+
+Variant builds (runtime copies with selected hooks stubbed) attribute the rest:
+
+- **Untraced programs** (compiler, `List<Point>`): about 6% with zero traced
+  objects and no cycle work at run time. The added kind tests are a few
+  instructions per operation, but they push several hot entry points over
+  LLVM's LTO inlining threshold: the system-runtime compiler has 232
+  out-of-line `minyar_rc_local` calls (v2: 60), and `minyar_list_add_take` and
+  `minyar_list_set_owned` stop inlining. Restructuring `minyar_rc_retain` to
+  fold the traced test into its overflow branch did not recover this, and
+  made the chain slower; it was reverted.
+- **Self-referential types while tracing is dormant**: with the 48-byte port,
+  the metadata alone costs +7.4 M instructions on the 100,000-record chain
+  and +9 MiB. Registry links and incoming counts cost 16 M (chain) and 20 M
+  (`acyclic.min`, which also destroys every node). These must be current when
+  the first potentially cyclic mutation enables tracing, because that one
+  edge can close a cycle through any number of objects built while dormant.
+  Deferring them would need a census of every live traced object at enable
+  time. Finding those objects requires the registry itself, and counting
+  slots while the mutator runs needs position-aware barriers. Leaving dormant
+  objects out instead would make any later cycle through them uncollectable.
+  So this is a constant per traced object and edge, but it is inherent to a
+  global snapshot cohort with exact incoming counts. A localized
+  candidate-buffer collector (Bacon and Rajan) would avoid the registry but
+  is a different algorithm.
+
 ### Validation status
 
 Final command outcomes are recorded in [validation.md](validation.md). The
@@ -370,8 +431,9 @@ Development findings that affected the final design:
   traffic can still trigger expensive live-graph scans. Type hints avoid that
   cost only before enabling. Finer eligibility metadata and localized cohorts
   would be useful follow-up work.
-- The 48-byte prefix and pool rounding are substantial for small aggregates.
-  Text and scalar records are unaffected; scalar Lists still reserve metadata.
+- Self-referential types still pay a 32-byte prefix, registry links, and
+  incoming-count updates from their first construction, even if the program
+  never mutates them into a cycle (see "Remaining cost" below).
 - Fairness and finite epochs prove eventual reclamation. They do not prove that
   every producer rate fits every fixed heap. Capacity must cover live objects,
   snapshots, deferred edges, cached ownership frames, allocator rounding and
