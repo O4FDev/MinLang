@@ -100,8 +100,11 @@ def main() -> None:
 
         # Functions that call no Minyar function carry no call-depth check of
         # their own (so LLVM can inline them); they run in the reserve the
-        # caller's check left. A leaf doing runtime Text work at the deepest
-        # allowed frame must still finish, and the overflow still stops cleanly.
+        # caller's check left. So do two levels of small functions above them
+        # whose calls all go to unchecked functions: they cannot recurse.
+        # A third level, recursion (direct or mutual) and a large frame keep
+        # their checks. A leaf doing runtime Text work at the deepest allowed
+        # frame must still finish, and the overflow still stops cleanly.
         leaves = temporary / "leaves.min"
         (temporary / "helpers.min").write_text(
             "public function twice(value: Integer): Integer { return value * 2 }\n", encoding="utf-8")
@@ -112,6 +115,14 @@ def main() -> None:
             "    return text.length\n"
             "}\n"
             "function caller(value: Integer): Integer { return helpers.twice(value) }\n"
+            "function middle(value: Integer): Integer { return caller(value) + leaf(value) }\n"
+            "function top(value: Integer): Integer { return middle(value) + 1 }\n"
+            "function ping(value: Integer): Integer {\n"
+            "    if value == 0 { return 0 }\n"
+            "    return pong(value - 1)\n"
+            "}\n"
+            "function pong(value: Integer): Integer { return ping(value) }\n"
+            "function callsLarge(value: Integer): Integer { return large(value) + 1 }\n"
             # More temporaries than a leaf may have: its frame could outgrow
             # the reserve unoptimized, so it keeps its own check.
             "function large(value: Integer): Integer { return " + " + ".join(["value * 3"] * 600) + " }\n"
@@ -119,7 +130,7 @@ def main() -> None:
             "    if depth == 0 { return leaf(7) }\n"
             "    return leaf(depth) - leaf(depth) + descend(depth - 1)\n"
             "}\n"
-            f"print(descend({safe_depth}) + caller(1) + large(0))\n"
+            f"print(descend({safe_depth}) + caller(1) + large(0) + top(0) * 0 + ping(3) + callsLarge(0) - 1)\n"
             "print(descend(100000000))\n",
             encoding="utf-8",
         )
@@ -135,7 +146,10 @@ def main() -> None:
 
         assert "@minyar_stack_enter" not in body("leaf") and "@minyar_stack_leave" not in body("leaf"), body("leaf")
         assert body("descend").count("call void @minyar_stack_enter()") == 1, body("descend")
-        assert body("caller").count("call void @minyar_stack_enter()") == 1, body("caller")
+        for name in ("caller", "middle"):
+            assert "@minyar_stack_enter" not in body(name) and "@minyar_stack_leave" not in body(name), body(name)
+        for name in ("top", "ping", "pong", "callsLarge"):
+            assert body(name).count("call void @minyar_stack_enter()") == 1, body(name)
         assert body("large").count("call void @minyar_stack_enter()") == 1, "a large leaf keeps its check"
         prepare_llvm_for_link(leaves_llvm, LINK_FLAGS)
         leaves_executable = temporary / "leaves"

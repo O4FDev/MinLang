@@ -4837,6 +4837,103 @@ function dropCallDepthFrame(output: List<Text>, entrySlot: Integer, bodySlot: In
     }
 }
 
+// dropCallDepthFrame for a function that is no longer the last one emitted.
+function dropCallDepthFrameBetween(output: List<Text>, entrySlot: Integer, bodySlot: Integer, endSlot: Integer) {
+    let enter = "  call void @minyar_stack_enter()\n"
+    let entry = output[entrySlot]
+    if entry.length >= enter.length && entry.slice(0, enter.length) == enter {
+        output[entrySlot] = entry.slice(enter.length, entry.length)
+    }
+    let piece = bodySlot
+    while piece < endSlot {
+        if output[piece] == "  call void @minyar_stack_leave()\n" {
+            output[piece] = ""
+        }
+        piece = piece + 1
+    }
+}
+
+// A function whose every call goes to a function without a call-depth check
+// cannot recurse: each of those calls returns without calling back. Two
+// levels of such functions above the leaves, each within the leaf limits on
+// locals, temporaries and labels, need at most three frames of about 18 KiB,
+// inside the 128 KiB reserve that their caller's check left
+// (MINYAR_STACK_RESERVE_BYTES). Their checks are removed like a leaf's. The
+// callees are read back from the emitted calls; a function whose calls were
+// not all recognised (fewer than the parser counted) keeps its check.
+function dropTreeGuards(output: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, treeFunctions: List<Integer>, treeKinds: List<Integer>, treeCalls: List<Integer>, treeSlots: List<Integer>) {
+    let recordOf: List<Integer> = []
+    let index = 0
+    while index < functionNames.length {
+        recordOf.add(-1)
+        index = index + 1
+    }
+    let record = 0
+    while record < treeFunctions.length {
+        if treeFunctions[record] >= 0 { recordOf[treeFunctions[record]] = record }
+        record = record + 1
+    }
+    // Callee records of each caller. A caller with a callee that is not a
+    // record can never lose its check: kind 9, and its scan stops there.
+    let calleeStarts: List<Integer> = []
+    let callees: List<Integer> = []
+    record = 0
+    while record < treeFunctions.length {
+        calleeStarts.add(callees.length)
+        if treeKinds[record] == 1 {
+            let found = 0
+            let piece = treeSlots[record * 3 + 1] + 2
+            let end = treeSlots[record * 3 + 2] - 1
+            while piece < end {
+                let marker = output[piece]
+                if output[piece - 2] == "call " && (marker == " @.minyar.fn." || (marker == " @" && output[piece + 1].length > 0 && output[piece + 1][0] == '"')) {
+                    let callee = findFunction(functionNames, symbolKinds, functionReturnTypes, output[piece + 1])
+                    if callee < 0 || recordOf[callee] < 0 {
+                        treeKinds[record] = 9
+                        piece = end
+                    } else {
+                        callees.add(recordOf[callee])
+                        found = found + 1
+                    }
+                }
+                piece = piece + 1
+            }
+            if treeKinds[record] == 1 && found != treeCalls[record] { treeKinds[record] = 9 }
+        }
+        record = record + 1
+    }
+    calleeStarts.add(callees.length)
+    // Kind 1 becomes level 2 or 3 once all its callees sit lower; what is
+    // still 1 or 9 afterwards keeps its check.
+    let level = 2
+    while level <= 3 {
+        record = 0
+        while record < treeFunctions.length {
+            if treeKinds[record] == 1 {
+                let free = true
+                let position = calleeStarts[record]
+                while free && position < calleeStarts[record + 1] {
+                    let callee = callees[position]
+                    if callee == record || treeKinds[callee] == 1 || treeKinds[callee] >= level {
+                        free = false
+                    }
+                    position = position + 1
+                }
+                if free { treeKinds[record] = level }
+            }
+            record = record + 1
+        }
+        level = level + 1
+    }
+    record = 0
+    while record < treeFunctions.length {
+        if treeKinds[record] == 2 || treeKinds[record] == 3 {
+            dropCallDepthFrameBetween(output, treeSlots[record * 3], treeSlots[record * 3 + 1], treeSlots[record * 3 + 2])
+        }
+        record = record + 1
+    }
+}
+
 // Runtime functions that are safe on any processor: failures that stop the
 // machine, and pure mathematics.
 function parallelRuntimeAllowed(callee: Text): Boolean {
@@ -5164,6 +5261,13 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
     // 14: user-function calls emitted in the current body (leaf detection).
     state.add(0)
     let hasNative = false
+    // Functions that dropTreeGuards may free of their call-depth check: per
+    // record its function, kind (0 leaf, 1 small caller), user-call count,
+    // and entry, body and end slots.
+    let treeFunctions: List<Integer> = []
+    let treeKinds: List<Integer> = []
+    let treeCalls: List<Integer> = []
+    let treeSlots: List<Integer> = []
     let textState: List<Text> = []
     textState.add("entry")
     textState.add("")
@@ -5332,16 +5436,27 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
             output[defineSlot] = "define internal "
             output[definitionTailSlot] = ") alwaysinline {\nentry:\n"
         }
-        if stackOwnerLimit > 0 && name != "main" && state[5] == -1 && state[6] == 1 && state[8] >= 1 && state[8] <= stackOwnerLimit {
+        let stackOwned = stackOwnerLimit > 0 && name != "main" && state[5] == -1 && state[6] == 1 && state[8] >= 1 && state[8] <= stackOwnerLimit
+        let smallFrame = !parallel && !machineIntrinsic && name != "main" && state[4] <= 256 && state[1] <= 1024 && state[2] <= 1024
+        if stackOwned {
             finishStackOwnership(output, entrySlot, state[8])
-        } else if !parallel && !machineIntrinsic && name != "main" && state[14] == 0 && state[4] <= 256 && state[1] <= 1024 && state[2] <= 1024 {
-            // A leaf (no user call, state[14]) cannot deepen recursion. With at
-            // most 256 locals and 1,024 temporaries its frame stays within
-            // about 18 KiB even unoptimized, inside the 128 KiB reserve its
-            // caller's check left (MINYAR_STACK_RESERVE_BYTES). Without the
-            // check, LLVM can inline small accessors. Dispatch lowering, which
-            // embeds a stack leave in a larger piece, needs 4,096 labels.
-            dropCallDepthFrame(output, entrySlot, bodySlot)
+        } else if smallFrame {
+            if state[14] == 0 {
+                // A leaf (no user call, state[14]) cannot deepen recursion. With at
+                // most 256 locals and 1,024 temporaries its frame stays within
+                // about 18 KiB even unoptimized, inside the 128 KiB reserve its
+                // caller's check left (MINYAR_STACK_RESERVE_BYTES). Without the
+                // check, LLVM can inline small accessors. Dispatch lowering, which
+                // embeds a stack leave in a larger piece, needs 4,096 labels.
+                dropCallDepthFrame(output, entrySlot, bodySlot)
+            }
+            treeFunctions.add(findFunction(functionNames, symbolKinds, functionReturnTypes, name))
+            // Callers with many calls rarely qualify; skipping them bounds the scan.
+            if state[14] == 0 { treeKinds.add(0) } else { if state[14] <= 16 { treeKinds.add(1) } else { treeKinds.add(9) } }
+            treeCalls.add(state[14])
+            treeSlots.add(entrySlot)
+            treeSlots.add(bodySlot)
+            treeSlots.add(output.length)
         }
         output.add("}\n\n")
         } else {
@@ -5350,6 +5465,7 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         }
         skipTerminators(tokenKinds, state)
     }
+    dropTreeGuards(output, functionNames, symbolKinds, functionReturnTypes, treeFunctions, treeKinds, treeCalls, treeSlots)
     return hasNative
 }
 
