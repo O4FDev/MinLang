@@ -13,6 +13,8 @@ heavily loaded machine; the load average was 30-76 throughout.
 | 1 | Atacama history: every search keystroke rebuilt a stack of views per row | `macos.list`, a virtualized NSTableView | 112.6G instructions, 11.4 s CPU | 11.0G, 1.8 s CPU | 10.2x |
 | 2 | Atacama streaming: each network chunk re-laid out the whole answer | background wake-ups capped at 60 Hz in `macos.nextEvent` | 60.5G instructions, 6.8 s CPU | 14.0G, 2.0 s CPU | 4.3x |
 | 3 | Every function, even a one-line accessor, called the runtime's call-depth guard, so LLVM never inlined hot leaves | leaf functions carry no call-depth frame | Minyarcraft world build 32.1G instructions; compiler self-compile 91M | 25.6G; 81M | -20%; -11% |
+| 4 | `record.field[i] = v` retained, registered and released the field on every store | no borrow when the rest of the statement makes no call | Minyarcraft 25.6G | 17.3G | -32% |
+| 5 | `record.text = record.text + piece` copied the whole Text each time (quadratic) | in-place append when the record holds the only other reference | 80,000 appends 4.11G | 79.8M | 51x (and linear) |
 
 ### 1. Long lists rebuilt as stacks of views
 
@@ -123,7 +125,76 @@ requires that the leaf has no guard and both callers keep theirs, and that the
 leaf still runs at the deepest allowed frame before the clean overflow stop.
 The test fails on the previous compiler.
 
-### 4. Two competing `http` packages
+### 4. Indexed stores through a field borrowed the field
+
+**Problem.** `world.blocks[index] = block` read `world.blocks`, retained it,
+registered it as a frame temporary, stored the byte, and released it at the
+end of the statement, in case evaluating the index or value replaced the
+field. Commit `650d79b` (September) already skipped this borrow for indexed
+reads, which made meshing 3.9x faster; stores still paid it.
+
+**Evidence.** After change 3, an `xctrace` Time Profiler run of
+`craft --screenshot` showed `terrain.put` at 110 inclusive samples, with
+`rc_bounded_poll_work`, `minyar_rc_keep` and malloc/free under it. Its IR
+was `record_get`, `rc_borrow`, the arithmetic, `bytes_set` and `rc_step`.
+
+**Fix.** When the target is `record.field[...]` and the rest of the statement
+(the remaining target path and the value) contains no call, no code can run
+between reading the field and storing into it, so the borrow is omitted. The
+tokenizer only ends a statement outside brackets and after a complete line,
+so the scan cannot stop inside a multi-line expression.
+
+| Workload | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Minyarcraft `--screenshot noon` (3 runs each) | 26.84G, 25.59G, 25.57G | 17.31G, 17.29G, 17.30G | -32% |
+
+Since the start of the night, Minyarcraft's world build has gone from 32.1G
+to 17.3G retired instructions (1.86x).
+
+**Test.** `tests/codegen/owned-join.min` FileChecks that a call-free store has
+no `minyar_rc_borrow` and that a store whose value calls a function that
+replaces the field keeps it. The program's output (42, then 7) is checked at
+O0 and O2, and the same program ran clean under ASan and UBSan. The contract
+fails on the previous compiler.
+
+### 5. Appending to a Text field was quadratic
+
+**Problem.** `local = local + piece` already appended in place
+(`minyar_join_text_take_left`), but `record.field = record.field + piece`, and
+`record.field += piece`, borrowed the field, copied it into a new Text, and
+replaced the field. Atacama does this per streamed delta
+(`run.text = run.text + event.text`).
+
+**Evidence.** A record field grown by 20,000, 40,000 and 80,000 appends:
+
+| Appends | Before | After |
+| ---: | ---: | ---: |
+| 20,000 | 340.0M | 27.2M |
+| 40,000 | 1,143.8M | 44.8M |
+| 80,000 | 4,105.0M | 79.8M |
+
+Before, each doubling cost 3.4-3.6x; after, each costs about 1.7x, roughly
+linear once the ~10M instructions of process start-up are subtracted.
+
+**Fix.** The compiler treats `name.field = name.field + rest` like `+=`, which
+keeps left-to-right evaluation: it reads and borrows the field, evaluates the
+rest, then calls `minyar_record_append_text(record, field, current, right)`. If
+the field still holds the borrowed Text and the record and that borrow are its
+only two owners, nothing else can observe it, so it grows in place with
+doubling capacity. Otherwise it falls back to the old join and replace. In
+Atacama the answers are only about 25 KB, so streaming did not get measurably
+faster (14.3-14.6G instructions either way); the fix removes the quadratic
+cost for longer texts.
+
+**Tests.** `tests/codegen/owned-join.min` FileChecks the append call and the
+absence of `minyar_record_replace`, and checks that an earlier alias of the
+field keeps its old value. A separate program covered aliases, another record
+sharing the Text, self-append, Unicode, a right side that replaces the field
+first, nested fields and List elements. It printed the same output as the v2
+compiler under the system, eager, fixed and lazy memory profiles, `--release`
+and `--debug`.
+
+### 6. Two competing `http` packages
 
 Not a speed fix, but one of the limits the brief named. appkit's NSURLSession
 `http` and minyar-os's portable socket/TLS `http` both arrived in v2 under the
