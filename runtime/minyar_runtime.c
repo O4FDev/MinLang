@@ -43,12 +43,14 @@
 #define MINYAR_NOINLINE __attribute__((noinline))
 #define MINYAR_NORETURN __attribute__((noreturn))
 #define MINYAR_HOT static inline __attribute__((always_inline))
+#define MINYAR_INLINE_ENTRY __attribute__((always_inline))
 #define MINYAR_NO_ADDRESS_SANITIZE __attribute__((no_sanitize_address))
 #else
 #define MINYAR_COLD
 #define MINYAR_NOINLINE
 #define MINYAR_NORETURN
 #define MINYAR_HOT static inline
+#define MINYAR_INLINE_ENTRY
 #define MINYAR_NO_ADDRESS_SANITIZE
 #endif
 
@@ -124,6 +126,8 @@ static MINYAR_COLD MINYAR_NORETURN void minyar_stop(const char *message);
 static size_t minyar_call_depth;
 static uintptr_t minyar_stack_low, minyar_stack_high;
 static int minyar_stack_bounds_ready;
+/* The depth at which minyar_stack_enter takes its exact path. */
+static size_t minyar_depth_limit;
 
 /* Keep first-use platform queries out of the frequent guard. This also lets
  * LTO inline the check without importing pthread setup into every caller. */
@@ -159,14 +163,15 @@ static MINYAR_COLD void minyar_find_stack_bounds(void) {
         }
     }
 #endif
+    minyar_depth_limit = MINYAR_MAX_CALL_DEPTH;
+    if ((!minyar_stack_low || !minyar_stack_high) && MINYAR_FALLBACK_CALL_DEPTH < minyar_depth_limit)
+        minyar_depth_limit = MINYAR_FALLBACK_CALL_DEPTH;
 }
 
-/* ASan's use-after-return mode moves address-taken locals to a fake stack.
- * Keep this marker on the native stack so the guard can measure its actual
- * distance from the thread's guard page. */
-MINYAR_NO_ADDRESS_SANITIZE void minyar_stack_enter(void) {
-    unsigned char stack_marker;
-    uintptr_t current = (uintptr_t)&stack_marker;
+/* The exact checks, taken only when the fast check in minyar_stack_enter
+ * fails: on the first call (the depth limit starts at zero, which also finds
+ * the stack bounds), at the depth limit, or within the stack reserve. */
+static MINYAR_COLD void minyar_stack_enter_slow(uintptr_t current) {
     if (!minyar_stack_bounds_ready)
         minyar_find_stack_bounds();
     if (minyar_call_depth >= MINYAR_MAX_CALL_DEPTH ||
@@ -175,6 +180,24 @@ MINYAR_NO_ADDRESS_SANITIZE void minyar_stack_enter(void) {
         (current >= minyar_stack_low && current < minyar_stack_high &&
          current - minyar_stack_low <= MINYAR_STACK_RESERVE_BYTES))
         minyar_stop("the program exceeded the maximum call depth.");
+}
+
+/* ASan's use-after-return mode moves address-taken locals to a fake stack.
+ * Keep this marker on the native stack so the guard can measure its actual
+ * distance from the thread's guard page.
+ *
+ * Every call that is not a leaf runs this check, so its common path is two
+ * comparisons that cover every stopping case of the exact checks: the depth
+ * limit is the lowest applicable cap, and the unsigned distance from the low
+ * end is at most the reserve for every address inside the reserve (addresses
+ * below the stack wrap to huge values). With unknown bounds the low end is
+ * zero, so only the depth limit applies. */
+MINYAR_NO_ADDRESS_SANITIZE void minyar_stack_enter(void) {
+    unsigned char stack_marker;
+    uintptr_t current = (uintptr_t)&stack_marker;
+    if (__builtin_expect(minyar_call_depth >= minyar_depth_limit ||
+                         current - minyar_stack_low <= MINYAR_STACK_RESERVE_BYTES, 0))
+        minyar_stack_enter_slow(current);
     minyar_call_depth++;
 }
 
@@ -454,9 +477,13 @@ MINYAR_HOT int bytes_are_equal(const unsigned char *left, const unsigned char *r
     return length == 0 || left[0] == right[0];
 }
 
-_Bool minyar_texts_are_equal(const MinyarText *left, const MinyarText *right) {
-    if (left == right)
-        return 1;
+/* Generated code compares a Text with a literal all the time. Inlining the
+ * length check lets link-time optimization fold the literal's length and
+ * bytes, so a run of comparisons with one Text shares its loads and most
+ * unequal comparisons cost a compare and a branch. There is no identity
+ * shortcut: a Text is rarely compared with itself, and the pointer test
+ * would keep every comparison from sharing those loads. */
+MINYAR_INLINE_ENTRY _Bool minyar_texts_are_equal(const MinyarText *left, const MinyarText *right) {
     return left->byte_length == right->byte_length &&
            bytes_are_equal(left->bytes, right->bytes, (size_t)left->byte_length);
 }
@@ -1150,7 +1177,7 @@ MinyarText *minyar_read_text_file(const MinyarText *path_text) {
     return new_text(bytes, length, -1);
 }
 
-void minyar_write_text_file(const MinyarText *path_text, const MinyarText *contents) {
+static FILE *create_text_file(const MinyarText *path_text) {
     char *path = text_as_path(path_text);
     FILE *file = open_text_path(path, "wb");
 #if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
@@ -1160,10 +1187,53 @@ void minyar_write_text_file(const MinyarText *path_text, const MinyarText *conte
 #endif
     if (!file)
         minyar_stop("a requested text file could not be created.");
-    if (fwrite(contents->bytes, 1, (size_t)contents->byte_length, file) !=
-            (size_t)contents->byte_length ||
-        fclose(file) != 0)
+    return file;
+}
+
+static void finish_text_file(FILE *file, int written) {
+    if (!written || fclose(file) != 0)
         minyar_stop("a requested text file could not be written.");
+}
+
+void minyar_write_text_file(const MinyarText *path_text, const MinyarText *contents) {
+    FILE *file = create_text_file(path_text);
+    finish_text_file(file, fwrite(contents->bytes, 1, (size_t)contents->byte_length, file) ==
+                               (size_t)contents->byte_length);
+}
+
+#ifndef MINYAR_WRITE_PARTS_BUFFER
+#define MINYAR_WRITE_PARTS_BUFFER (256u * 1024u)
+#endif
+
+/* writeTextFile(path, pieces) writes what joinText(pieces) would contain
+ * without building it, so a program that emits its output in many small
+ * pieces (the compiler emits about 200,000) never holds the whole file twice.
+ * Pieces are gathered in a buffer large enough that per-write file system
+ * costs stay small; each write call costs tens of thousands of instructions. */
+void minyar_write_text_parts(const MinyarText *path_text, const MinyarList *parts) {
+    FILE *file = create_text_file(path_text);
+    unsigned char *buffer = malloc(MINYAR_WRITE_PARTS_BUFFER);
+    size_t used = 0;
+    int written = 1;
+    if (!buffer)
+        out_of_memory();
+    for (long long index = 0; written && index < parts->length; index++) {
+        const MinyarText *part = (const MinyarText *)(intptr_t)parts->values[index];
+        size_t length = (size_t)part->byte_length;
+        if (length > MINYAR_WRITE_PARTS_BUFFER - used) {
+            written = fwrite(buffer, 1, used, file) == used;
+            used = 0;
+            if (length > MINYAR_WRITE_PARTS_BUFFER) {
+                written = written && fwrite(part->bytes, 1, length, file) == length;
+                continue;
+            }
+        }
+        copy_bytes(buffer + used, part->bytes, length);
+        used += length;
+    }
+    written = written && fwrite(buffer, 1, used, file) == used;
+    free(buffer);
+    finish_text_file(file, written);
 }
 
 #include "minyar_numbers.h"

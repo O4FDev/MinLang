@@ -3,8 +3,11 @@
  * input, and a small OpenGL 3.3 renderer for textured meshes, lines and a 2D
  * overlay. Minyar code reaches these functions through library/graphics.min.
  *
- * Mesh vertices are 40 bytes: position x, y, z, texture u, v, colour r, g, b,
- * sky and glow, each a little-endian Float32. A texel is multiplied by the
+ * Mesh vertices are 32 bytes: position x, y, z and texture u, v as
+ * little-endian Float32, then colour r, g, b, two bytes of padding, and sky
+ * and glow as little-endian Float16 (half precision, ample for 8-bit display
+ * and able to hold values above 1). Lines keep ten Float32 values per vertex.
+ * A texel is multiplied by the
  * colour and by sky * light + glow (at most 1), where light is the level set
  * with setLight; sky light dims at night and glow does not. Texels with alpha
  * below one half are discarded.
@@ -24,13 +27,17 @@
 #include <stdint.h>
 #include "../minyar_native.h"
 #include "opengl-functions.h"
+#include "half-float.h"
+#ifndef GL_HALF_FLOAT
+#define GL_HALF_FLOAT 0x140B
+#endif
 
-enum { VERTEX_FLOATS = 10, VERTEX_BYTES = VERTEX_FLOATS * 4, KEY_COUNT = GLFW_KEY_LAST + 1, BUTTON_COUNT = 8 };
+enum { VERTEX_FLOATS = 10, VERTEX_BYTES = 32, KEY_COUNT = GLFW_KEY_LAST + 1, BUTTON_COUNT = 8 };
 
 typedef struct {
     GLuint array, buffer;
     GLsizei count;
-    int used;
+    int used, quads;
 } Mesh;
 
 typedef struct {
@@ -41,6 +48,10 @@ typedef struct {
 static GLFWwindow *window;
 static GLuint world_program, overlay_program, texture, white_texture;
 static GLuint line_array, line_buffer, overlay_array, overlay_buffer;
+/* Shared triangle indices for quad meshes: quad q is (4q, 4q+1, 4q+2) and
+ * (4q, 4q+2, 4q+3). It grows to the largest quad mesh drawn so far. */
+static GLuint quad_indices;
+static size_t quad_index_capacity;
 static Mesh *meshes;
 static size_t mesh_count, mesh_capacity;
 static size_t mesh_next_slot;
@@ -48,6 +59,16 @@ static FloatBuffer lines, overlay;
 enum { OVERLAY_FLOATS = 9 };
 static float view_projection[16], camera[3], fog_color[3] = {0.6f, 0.75f, 0.95f}, fog_range[2] = {1e6f, 1e6f + 1};
 static float light_level = 1.0f;
+/* A frame draws hundreds of chunk meshes with the same program, uniforms,
+ * texture and blending, and the driver revalidates its state after every
+ * change. So uniform locations are looked up once, the world uniforms are
+ * uploaded only after setCamera, setFog or setLight, and the program,
+ * texture, opacity and translucent state are changed only when they differ. */
+static GLint world_view_projection_location, world_camera_location, world_fog_color_location,
+    world_fog_range_location, world_light_location, world_opacity_location, overlay_screen_location;
+static int world_uniforms_stale = 1, translucent;
+static float world_opacity = -1.0f;
+static GLuint used_program, bound_texture;
 static unsigned char key_down[KEY_COUNT], key_pressed[KEY_COUNT];
 static unsigned char button_down[BUTTON_COUNT], button_pressed[BUTTON_COUNT];
 static double mouse_x, mouse_y, mouse_move_x, mouse_move_y, scroll_total;
@@ -64,6 +85,10 @@ static void on_terminate(int signal_number) {
 }
 
 static void use_world_program(void);
+static void set_opacity(float opacity);
+static void set_translucent(int on);
+static void bind_texture(GLuint name);
+static void use_program(GLuint program);
 
 static void stop_graphics(const char *message) {
     minyar_native_stop(message);
@@ -219,21 +244,36 @@ static GLuint link_program(const char *vertex_source, const char *fragment_sourc
     return program;
 }
 
-static void world_layout(void) {
+/* Meshes: packed 32-byte vertices (see the top of this file). */
+static void mesh_layout(void) {
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, VERTEX_BYTES, (void *)0);
     glEnableVertexAttribArray(1);
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, VERTEX_BYTES, (void *)12);
     glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, VERTEX_BYTES, (void *)20);
+    glVertexAttribPointer(2, 3, GL_HALF_FLOAT, GL_FALSE, VERTEX_BYTES, (void *)20);
     glEnableVertexAttribArray(3);
-    glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, VERTEX_BYTES, (void *)32);
+    glVertexAttribPointer(3, 2, GL_HALF_FLOAT, GL_FALSE, VERTEX_BYTES, (void *)28);
+}
+
+/* Lines: ten Float32 values per vertex, streamed once a frame. */
+static void line_layout(void) {
+    const GLsizei stride = VERTEX_FLOATS * 4;
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, (void *)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, stride, (void *)12);
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, stride, (void *)20);
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, stride, (void *)32);
 }
 
 static GLuint make_texture(const unsigned char *pixels, int width, int height, int mipmaps) {
     GLuint name;
     glGenTextures(1, &name);
     glBindTexture(GL_TEXTURE_2D, name);
+    bound_texture = name;
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -319,6 +359,19 @@ void minyar_graphics_openWindow(long long width, long long height, const MinyarT
 
     world_program = link_program(world_vertex_source, world_fragment_source);
     overlay_program = link_program(overlay_vertex_source, overlay_fragment_source);
+    world_view_projection_location = glGetUniformLocation(world_program, "viewProjection");
+    world_camera_location = glGetUniformLocation(world_program, "camera");
+    world_fog_color_location = glGetUniformLocation(world_program, "fogColor");
+    world_fog_range_location = glGetUniformLocation(world_program, "fogRange");
+    world_light_location = glGetUniformLocation(world_program, "light");
+    world_opacity_location = glGetUniformLocation(world_program, "opacity");
+    overlay_screen_location = glGetUniformLocation(overlay_program, "screen");
+    /* Both programs sample the atlas from texture unit 0, the only one used. */
+    use_program(world_program);
+    glUniform1i(glGetUniformLocation(world_program, "atlas"), 0);
+    use_program(overlay_program);
+    glUniform1i(glGetUniformLocation(overlay_program, "atlas"), 0);
+    glActiveTexture(GL_TEXTURE0);
     const unsigned char white[4] = {255, 255, 255, 255};
     white_texture = make_texture(white, 1, 1, 0);
     texture = white_texture;
@@ -327,7 +380,7 @@ void minyar_graphics_openWindow(long long width, long long height, const MinyarT
     glGenBuffers(1, &line_buffer);
     glBindVertexArray(line_array);
     glBindBuffer(GL_ARRAY_BUFFER, line_buffer);
-    world_layout();
+    line_layout();
 
     glGenVertexArrays(1, &overlay_array);
     glGenBuffers(1, &overlay_buffer);
@@ -471,9 +524,11 @@ void minyar_graphics_saveScreenshot(const MinyarText *path) {
 
 /* Draw the batched lines and overlay, then present the frame. */
 static void finish_frame(void) {
+    set_translucent(0);
     if (lines.length) {
         use_world_program();
-        glBindTexture(GL_TEXTURE_2D, white_texture);
+        set_opacity(1.0f);
+        bind_texture(white_texture);
         glBindVertexArray(line_array);
         glBindBuffer(GL_ARRAY_BUFFER, line_buffer);
         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(lines.length * sizeof(float)), lines.values, GL_STREAM_DRAW);
@@ -485,15 +540,13 @@ static void finish_frame(void) {
         glDisable(GL_CULL_FACE);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glUseProgram(overlay_program);
+        use_program(overlay_program);
         int window_width, window_height;
         glfwGetWindowSize(window, &window_width, &window_height);
-        glUniform2f(glGetUniformLocation(overlay_program, "screen"), (float)window_width, (float)window_height);
+        glUniform2f(overlay_screen_location, (float)window_width, (float)window_height);
         glBindVertexArray(overlay_array);
         glBindBuffer(GL_ARRAY_BUFFER, overlay_buffer);
-        glUniform1i(glGetUniformLocation(overlay_program, "atlas"), 0);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, texture);
+        bind_texture(texture);
         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(overlay.length * sizeof(float)), overlay.values, GL_STREAM_DRAW);
         glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(overlay.length / OVERLAY_FLOATS));
         overlay.length = 0;
@@ -587,6 +640,7 @@ bool minyar_graphics_mouseCaptured(void) {
 
 void minyar_graphics_clear(double red, double green, double blue) {
     require_window();
+    set_translucent(0); /* depth writes must be on for the depth buffer to clear */
     glClearColor((float)red, (float)green, (float)blue, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 }
@@ -600,16 +654,19 @@ void minyar_graphics_setCamera(double x, double y, double z, double yaw, double 
     perspective(projection, (float)field_of_view, aspect, 0.05f, 1000.0f);
     look(view, camera, (float)yaw, (float)pitch);
     multiply(view_projection, projection, view);
+    world_uniforms_stale = 1;
 }
 
 void minyar_graphics_setFog(double red, double green, double blue, double start, double end) {
     fog_color[0] = (float)red; fog_color[1] = (float)green; fog_color[2] = (float)blue;
     fog_range[0] = (float)start;
     fog_range[1] = end > start ? (float)end : (float)start + 1.0f;
+    world_uniforms_stale = 1;
 }
 
 void minyar_graphics_setLight(double level) {
     light_level = (float)(level < 0 ? 0 : level);
+    world_uniforms_stale = 1;
 }
 
 void minyar_graphics_setTexture(const MinyarBytes *pixels, long long width, long long height) {
@@ -648,46 +705,151 @@ long long minyar_graphics_createMesh(void) {
     glGenBuffers(1, &mesh->buffer);
     glBindVertexArray(mesh->array);
     glBindBuffer(GL_ARRAY_BUFFER, mesh->buffer);
-    world_layout();
+    mesh_layout();
     glBindVertexArray(0);
     mesh_next_slot = slot + 1;
     return (long long)slot + 1;
 }
 
+/* Make the shared quad index buffer cover `quads` quads, bound to the current
+ * vertex array (each array remembers its element buffer). */
+static void bind_quad_indices(size_t quads) {
+    if (!quad_indices) glGenBuffers(1, &quad_indices);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, quad_indices);
+    if (quads <= quad_index_capacity) return;
+    if (quads > (size_t)INT32_MAX / 6) stop_graphics("a quad mesh can have at most 357913941 quads.");
+    size_t capacity = quad_index_capacity ? quad_index_capacity : 1024;
+    while (capacity < quads) capacity *= 2;
+    if (capacity > (size_t)INT32_MAX / 6) capacity = (size_t)INT32_MAX / 6;
+    uint32_t *indices = malloc(capacity * 6 * sizeof(uint32_t));
+    if (!indices) stop_graphics("the computer ran out of memory.");
+    for (size_t q = 0; q < capacity; q++) {
+        uint32_t first = (uint32_t)(q * 4);
+        uint32_t *six = indices + q * 6;
+        six[0] = first; six[1] = first + 1; six[2] = first + 2;
+        six[3] = first; six[4] = first + 2; six[5] = first + 3;
+    }
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(capacity * 6 * sizeof(uint32_t)), indices, GL_STATIC_DRAW);
+    free(indices);
+    quad_index_capacity = capacity;
+}
+
+/* Vertices in groups of four, a b c d, each drawn as triangles a b c and
+ * a c d: two thirds of the vertices that updateMesh needs for the same quads. */
+void minyar_graphics_updateQuads(long long handle, const MinyarBytes *vertices) {
+    Mesh *mesh = find_mesh(handle);
+    if (vertices->byte_length % (4 * VERTEX_BYTES))
+        stop_graphics("updateQuads needs four vertices per quad; build them with graphics.addVertex.");
+    size_t quads = (size_t)(vertices->byte_length / (4 * VERTEX_BYTES));
+    glBindVertexArray(mesh->array);
+    bind_quad_indices(quads);
+    glBindBuffer(GL_ARRAY_BUFFER, mesh->buffer);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)vertices->byte_length, vertices->bytes, GL_STATIC_DRAW);
+    glBindVertexArray(0);
+    mesh->count = (GLsizei)(quads * 6);
+    mesh->quads = 1;
+}
+
+static void draw_mesh_triangles(const Mesh *mesh) {
+    glBindVertexArray(mesh->array);
+    if (mesh->quads) glDrawElements(GL_TRIANGLES, mesh->count, GL_UNSIGNED_INT, (void *)0);
+    else glDrawArrays(GL_TRIANGLES, 0, mesh->count);
+    glBindVertexArray(0);
+}
+
 void minyar_graphics_updateMesh(long long handle, const MinyarBytes *vertices) {
     Mesh *mesh = find_mesh(handle);
     if (vertices->byte_length % VERTEX_BYTES)
-        stop_graphics("mesh vertices are 40 bytes each: x, y, z, u, v, red, green, blue, sky, glow as Float32; use graphics.addVertex.");
+        stop_graphics("mesh vertices are 32 bytes each (x, y, z, u, v as Float32; red, green, blue, padding, sky, glow as Float16); use graphics.addVertex.");
     glBindBuffer(GL_ARRAY_BUFFER, mesh->buffer);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)vertices->byte_length, vertices->bytes, GL_STATIC_DRAW);
     mesh->count = (GLsizei)(vertices->byte_length / VERTEX_BYTES);
+    mesh->quads = 0;
 }
 
+static void use_program(GLuint program) {
+    if (used_program == program) return;
+    glUseProgram(program);
+    used_program = program;
+}
+
+/* Uniforms belong to their program, so values uploaded earlier survive
+ * switching to the overlay program and back. */
 static void use_world_program(void) {
-    glUseProgram(world_program);
-    glUniformMatrix4fv(glGetUniformLocation(world_program, "viewProjection"), 1, GL_FALSE, view_projection);
-    glUniform3fv(glGetUniformLocation(world_program, "camera"), 1, camera);
-    glUniform3fv(glGetUniformLocation(world_program, "fogColor"), 1, fog_color);
-    glUniform2fv(glGetUniformLocation(world_program, "fogRange"), 1, fog_range);
-    glUniform1f(glGetUniformLocation(world_program, "light"), light_level);
-    glUniform1f(glGetUniformLocation(world_program, "opacity"), 1.0f);
-    glUniform1i(glGetUniformLocation(world_program, "atlas"), 0);
-    glActiveTexture(GL_TEXTURE0);
+    use_program(world_program);
+    if (!world_uniforms_stale) return;
+    glUniformMatrix4fv(world_view_projection_location, 1, GL_FALSE, view_projection);
+    glUniform3fv(world_camera_location, 1, camera);
+    glUniform3fv(world_fog_color_location, 1, fog_color);
+    glUniform2fv(world_fog_range_location, 1, fog_range);
+    glUniform1f(world_light_location, light_level);
+    world_uniforms_stale = 0;
+}
+
+/* Call after use_world_program. */
+static void set_opacity(float opacity) {
+    if (opacity == world_opacity) return;
+    glUniform1f(world_opacity_location, opacity);
+    world_opacity = opacity;
+}
+
+static void bind_texture(GLuint name) {
+    if (bound_texture == name) return;
+    glBindTexture(GL_TEXTURE_2D, name);
+    bound_texture = name;
+}
+
+/* Translucent meshes blend, do not write depth and show both sides. The state
+ * stays on across consecutive translucent meshes and is switched off before
+ * anything else is drawn or the screen is cleared. */
+static void set_translucent(int on) {
+    if (translucent == on) return;
+    if (on) {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDepthMask(GL_FALSE);
+        glDisable(GL_CULL_FACE);
+    } else {
+        glEnable(GL_CULL_FACE);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+    }
+    translucent = on;
+}
+
+static void put_float(unsigned char *target, float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, 4);
+    for (int i = 0; i < 4; i++) target[i] = (unsigned char)(bits >> (8 * i));
+}
+
+static void put_half(unsigned char *target, double value) {
+#ifdef __FLT16_MAX__
+    /* One instruction on processors with half-precision conversion. */
+    _Float16 half = (_Float16)(float)value;
+    uint16_t bits;
+    memcpy(&bits, &half, 2);
+#else
+    uint16_t bits = minyar_half_float((float)value);
+#endif
+    target[0] = (unsigned char)bits;
+    target[1] = (unsigned char)(bits >> 8);
 }
 
 static void add_vertex(MinyarBytes *vertices, double x, double y, double z, double u, double v,
                        double red, double green, double blue, double sky, double glow) {
-    float values[VERTEX_FLOATS] = {(float)x, (float)y, (float)z, (float)u, (float)v,
-                                   (float)red, (float)green, (float)blue, (float)sky, (float)glow};
     unsigned char *target = minyar_bytes_extend(vertices, VERTEX_BYTES);
-    for (int i = 0; i < VERTEX_FLOATS; i++) {
-        uint32_t bits;
-        memcpy(&bits, &values[i], 4);
-        target[i * 4] = (unsigned char)bits;
-        target[i * 4 + 1] = (unsigned char)(bits >> 8);
-        target[i * 4 + 2] = (unsigned char)(bits >> 16);
-        target[i * 4 + 3] = (unsigned char)(bits >> 24);
-    }
+    put_float(target, (float)x);
+    put_float(target + 4, (float)y);
+    put_float(target + 8, (float)z);
+    put_float(target + 12, (float)u);
+    put_float(target + 16, (float)v);
+    put_half(target + 20, red);
+    put_half(target + 22, green);
+    put_half(target + 24, blue);
+    target[26] = target[27] = 0;
+    put_half(target + 28, sky);
+    put_half(target + 30, glow);
 }
 
 void minyar_graphics_addVertex(MinyarBytes *vertices, double x, double y, double z, double u, double v,
@@ -703,11 +865,11 @@ void minyar_graphics_addLitVertex(MinyarBytes *vertices, double x, double y, dou
 void minyar_graphics_drawMesh(long long handle) {
     Mesh *mesh = find_mesh(handle);
     if (!mesh->count) return;
+    set_translucent(0);
     use_world_program();
-    glBindTexture(GL_TEXTURE_2D, texture);
-    glBindVertexArray(mesh->array);
-    glDrawArrays(GL_TRIANGLES, 0, mesh->count);
-    glBindVertexArray(0);
+    set_opacity(1.0f);
+    bind_texture(texture);
+    draw_mesh_triangles(mesh);
 }
 
 /* Draw a mesh partly see-through, after the opaque scene. It does not hide
@@ -715,19 +877,11 @@ void minyar_graphics_drawMesh(long long handle) {
 void minyar_graphics_drawTranslucentMesh(long long handle, double opacity) {
     Mesh *mesh = find_mesh(handle);
     if (!mesh->count) return;
+    set_translucent(1);
     use_world_program();
-    glUniform1f(glGetUniformLocation(world_program, "opacity"), (float)opacity);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glDepthMask(GL_FALSE);
-    glDisable(GL_CULL_FACE);
-    glBindTexture(GL_TEXTURE_2D, texture);
-    glBindVertexArray(mesh->array);
-    glDrawArrays(GL_TRIANGLES, 0, mesh->count);
-    glBindVertexArray(0);
-    glEnable(GL_CULL_FACE);
-    glDepthMask(GL_TRUE);
-    glDisable(GL_BLEND);
+    set_opacity((float)opacity);
+    bind_texture(texture);
+    draw_mesh_triangles(mesh);
 }
 
 void minyar_graphics_deleteMesh(long long handle) {

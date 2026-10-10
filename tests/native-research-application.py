@@ -267,7 +267,7 @@ def main():
                     result = execute(label + '-mesh-trap-' + trap, [graphics, 'mesh-trap', trap], required=False)
                     if trap == 'window': diagnostic = 'open a window with graphics.openWindow before drawing or reading input.'
                     elif trap.startswith('alloc-'): diagnostic = 'the computer ran out of memory.'
-                    elif trap == 'mesh-shape': diagnostic = 'mesh vertices are 40 bytes each: x, y, z, u, v, red, green, blue, sky, glow as Float32; use graphics.addVertex.'
+                    elif trap == 'mesh-shape': diagnostic = 'mesh vertices are 32 bytes each (x, y, z, u, v as Float32; red, green, blue, padding, sky, glow as Float16); use graphics.addVertex.'
                     else: diagnostic = 'this mesh does not exist; create it with graphics.createMesh.'
                     def check_trap(r=result, d=diagnostic):
                         assert r.returncode == 1 and r.stderr == 'Minyar stopped: ' + d + '\n', (r.returncode, r.stderr)

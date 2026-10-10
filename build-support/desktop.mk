@@ -29,3 +29,8 @@ check-native-project:
 .PHONY: check-native-linux
 check-native-linux: check-native-project
 	$${MINYAR_PYTHON:-/usr/bin/python3} tests/native-swift/linux.py --compiler "$(MINYAR_NATIVE_SWIFTC)"
+
+# Real renders through the graphics package (needs a macOS desktop session).
+.PHONY: check-graphics-render
+check-graphics-render: build/minyarc
+	$${MINYAR_PYTHON:-/usr/bin/python3} tests/graphics-render.py

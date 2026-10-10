@@ -22,6 +22,7 @@ void minyar_rc_borrow(void *value) { (void)value; }
 void minyar_rc_local(long long index, void *value) { (void)index; (void)value; }
 void minyar_rc_local_take(long long index, void *value) { (void)index; (void)value; }
 void minyar_rc_local_move(long long index) { (void)index; }
+void minyar_rc_local_move_owner(long long index, void *value) { (void)index; (void)value; }
 void minyar_rc_step(void) {}
 void minyar_rc_retain(void *value) { (void)value; }
 void minyar_rc_retain_traced(void *value) { (void)value; }
@@ -439,6 +440,24 @@ void minyar_rc_local_move(long long index) {
     rc_frames->locals[index] = (void *)(previous & 1);
 #else
     rc_frames->locals[index] = NULL;
+#endif
+}
+
+/* Moves a local's owner into a consuming call (x = x + e, x = x.appended(e)).
+ * A local that owns nothing yet, such as a parameter still holding its
+ * caller's value, gives the consumer a new count instead, so the consumer
+ * never mistakes the caller's only count for its own. */
+void minyar_rc_local_move_owner(long long index, void *value) {
+#ifdef MINYAR_BOUNDED_RC
+    uintptr_t previous = (uintptr_t)rc_frames->locals[index];
+    rc_frames->locals[index] = (void *)(previous & 1);
+    if (!(previous & ~(uintptr_t)1))
+        minyar_rc_retain(value);
+#else
+    void *previous = rc_frames->locals[index];
+    rc_frames->locals[index] = NULL;
+    if (!previous)
+        minyar_rc_retain(value);
 #endif
 }
 

@@ -564,3 +564,18 @@ check-cycle-profiles: build/minyarc
 
 check-cycles: check-cycle-profiles
 check: check-cycles
+
+.PHONY: check-native-cache
+check-native-cache:
+	$(LIMITED) python3 tests/native-object-cache.py
+
+check: check-native-cache
+check-portable: check-native-cache
+
+.PHONY: check-half-float
+check-half-float: | build
+	$(LIMITED) "$(LLVM_CC)" -O2 -Wall -Wextra -Werror tests/half-float.c -o build/half-float
+	$(LIMITED) ./build/half-float
+
+check: check-half-float
+check-portable: check-half-float

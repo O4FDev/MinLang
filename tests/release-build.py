@@ -33,7 +33,7 @@ class ReleaseBuild(unittest.TestCase):
                 self.assertEqual(built.returncode, 0, built.stderr)
                 args = json.loads(log.read_text())
                 self.assertIn(expected, args)
-                self.assertEqual('-flto' in args, lto)
+                self.assertEqual(any(arg.startswith('-flto') for arg in args), lto)
                 runtime_name = 'runtime.ll' if lto else 'runtime.o'
                 runtime_path = next(Path(arg) for arg in args if Path(arg).name == runtime_name)
                 self.assertTrue(runtime_path.parent.name.startswith('invocation.'))

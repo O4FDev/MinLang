@@ -1104,11 +1104,11 @@ static Type check_expression(Program *program, Function *function, Expression *e
             if (arrlen(expression->arguments) != 2)
                 fail_at(expression->line, expression->column,
                         "writeTextFile expects a file path and some Text");
-            for (index = 0; index < 2; index++) {
-                left = check_expression(program, function, expression->arguments[index]);
-                require_type(expression->arguments[index], left, TYPE_TEXT,
-                             index == 0 ? "a file path" : "file contents");
-            }
+            left = check_expression(program, function, expression->arguments[0]);
+            require_type(expression->arguments[0], left, TYPE_TEXT, "a file path");
+            left = check_expression(program, function, expression->arguments[1]);
+            if (left != TYPE_LIST_TEXT)
+                require_type(expression->arguments[1], left, TYPE_TEXT, "file contents");
             return expression->type = TYPE_NOTHING;
         }
         if (strcmp(expression->text, "argumentCount") == 0) {
@@ -1532,8 +1532,9 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
             return make_value(TYPE_INTEGER, "%%value.%d", temporary);
         }
         if (strcmp(expression->text, "writeTextFile") == 0) {
-            fprintf(output, "  call void @minyar_write_text_file(ptr %s, ptr %s)\n",
-                    arguments[0].name, arguments[1].name);
+            fprintf(output, "  call void @minyar_write_text_%s(ptr %s, ptr %s)\n",
+                    arguments[1].type == TYPE_LIST_TEXT ? "parts" : "file", arguments[0].name,
+                    arguments[1].name);
             arrfree(arguments);
             return make_value(TYPE_NOTHING, "");
         }
@@ -1901,6 +1902,7 @@ static void emit_program(FILE *output, Program *program) {
           "declare ptr @minyar_read_text_file(ptr)\n"
           "declare zeroext i1 @minyar_file_exists(ptr)\n"
           "declare void @minyar_write_text_file(ptr, ptr)\n"
+          "declare void @minyar_write_text_parts(ptr, ptr)\n"
           "declare ptr @minyar_list_new()\n"
           "declare void @minyar_list_add(ptr, i64)\n"
           "declare i64 @minyar_list_length(ptr)\n"

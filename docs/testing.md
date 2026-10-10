@@ -534,7 +534,8 @@ program must run; compiler or program exhaustion must exit with
 `Minyar stopped: the program exceeded the maximum call depth.` rather than a
 signal.
 
-A function that calls no Minyar function (a leaf of at most 256 locals) has no
+A function that calls no Minyar function (a leaf of at most 256 locals, 1,024
+temporaries and 1,024 labels) has no
 check of its own: it cannot deepen recursion, and its frame fits in the
 128 KiB reserve its caller's check left. Without the check, LLVM can inline
 small accessors. `check-stack-overflow` requires that a leaf has no guard,

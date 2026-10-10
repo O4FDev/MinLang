@@ -48,7 +48,8 @@ with tempfile.TemporaryDirectory(prefix='macos-test-',dir=ROOT/'build') as direc
                               ('dimension','dimensions'),('thread','main thread'),('overflow','event queue is full'),
                               ('uninitialized','call macos.initialize'),
                               ('hover','requires a button, row, or column'),('shape','shape paths support'),
-                              ('color','0xRRGGBB'),('list-line','list lines are 0'),('list-type','wrong object type')]:
+                              ('color','0xRRGGBB'),('list-line','list lines are 0'),('list-type','wrong object type'),
+                              ('append-type','requires a textView or textEditor')]:
             result = run([harness,mode],ok=False,env=env)
             assert result.returncode == 1 and message in result.stderr, result
             assert 'ERROR: AddressSanitizer' not in result.stderr and 'runtime error:' not in result.stderr

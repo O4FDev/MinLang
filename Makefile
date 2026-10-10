@@ -7,7 +7,7 @@ LLVM_FLAGS ?= -O2 -Wno-override-module
 LDLIBS ?= -lm
 SANITIZER_FLAGS ?= -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wno-override-module
 COMPILER_RUNTIME_FLAGS ?= -DMINYAR_COMPILER_ARENA
-COMPILER_LTO_FLAGS ?= -flto
+COMPILER_LTO_FLAGS ?= -flto=thin
 PROGRAM_RUNTIME_FLAGS ?= -DMINYAR_SYSTEM_HEAP=1
 BOUNDED_FLAGS ?= -DMINYAR_BOUNDED_HEAP=1
 RUNTIME_HEADERS = $(wildcard runtime/minyar_*.h) build/.toolchain.json

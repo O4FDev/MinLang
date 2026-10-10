@@ -64,13 +64,14 @@ certificates. [`examples/atacama`](../examples/atacama/main.min) and
 access to the hardware, and `device` gives them typed, checked registers, ports
 and DMA memory on top of it.
 `graphics` provides a window, keyboard and mouse input, textured 3D meshes
-with fog and lighting, lines, a 2D overlay with text, and screenshots; its
+(triangles, or quads with `updateQuads`) with fog and lighting, lines, a 2D overlay with text, and screenshots; its
 module documents each function. The [`macos`](macos.md) package provides native
 AppKit desktop applications and needs no third-party library. On macOS,
 `./minyar` searches [`library/platform/macos`](../library/platform/macos/http.min)
 before `library`, so `use "http"` there gets an `http` with the same
 `Response`, `get`, `post` and `request` that goes through NSURLSession: it
-validates certificates and can also stream (`start`, `read`, `finished`).
+validates certificates, follows redirects, decodes chunked bodies, and can
+also stream (`start`, `read`, `finished`). The portable one does none of those.
 `./minyar --library library` picks the portable one on macOS too.
 [`json`](../library/json.min) parses and quotes JSON in Minyar itself. Some library functions are implemented
 in C or Objective-C: their body is, for example, `native "graphics"` or

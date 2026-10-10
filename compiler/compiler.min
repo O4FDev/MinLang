@@ -1600,8 +1600,12 @@ function takeOwner(output: List<Text>, state: List<Integer>, value: Text, owner:
         // Delay clearing the slot until after the right operand has run. This
         // preserves expressions such as x = x + x while still handing the
         // left ownership count to the consuming join.
-        output.add("  call void @minyar_rc_local_move(i64 ")
+        // A local that does not own its value yet (a parameter before its
+        // first assignment) gets one count, so the consumer always takes one.
+        output.add("  call void @minyar_rc_local_move_owner(i64 ")
         output.add(output[owner + 1])
+        output.add(", ptr ")
+        output.add(value)
         output.add(")\n")
         output[owner] = ""
         output[owner + 1] = ""
@@ -2471,17 +2475,59 @@ function callAt(tokenKinds: List<Integer>, tokenTexts: List<Text>, cursor: Integ
 }
 
 // Whether the tokens from `position` to the end of the statement make no call.
-// The tokenizer ends a statement only outside brackets and after a complete
-// line, so the scan cannot stop inside a multi-line expression.
+// Line ends (kind 6, which includes `;`) can appear inside a statement's
+// brackets: in a record literal's braces across lines, and as `;` separators
+// anywhere. So a line end ends the statement only outside all brackets, and a
+// closing bracket below the start ends it too.
 function statementWithoutCalls(tokenKinds: List<Integer>, tokenTexts: List<Text>, position: Integer): Boolean {
     let cursor = position
-    while tokenKinds[cursor] != 0 && tokenKinds[cursor] != 6 {
+    let depth = 0
+    while tokenKinds[cursor] != 0 && (tokenKinds[cursor] != 6 || depth > 0) {
         if callAt(tokenKinds, tokenTexts, cursor) {
             return false
+        }
+        if tokenKinds[cursor] == 4 {
+            let text = tokenTexts[cursor]
+            if text == "(" || text == "[" || text == "{" {
+                depth = depth + 1
+            }
+            if text == ")" || text == "]" || text == "}" {
+                if depth == 0 {
+                    return true
+                }
+                depth = depth - 1
+            }
         }
         cursor = cursor + 1
     }
     return true
+}
+
+// Whether the value `name` is read from `position` to the end of the
+// statement. A member name (after `.`) or a record field label (before `:`)
+// is not a read of the local.
+function nameInStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, position: Integer, name: Text): Boolean {
+    let cursor = position
+    let depth = 0
+    while tokenKinds[cursor] != 0 && (tokenKinds[cursor] != 6 || depth > 0) {
+        if tokenKinds[cursor] == 1 && tokenTexts[cursor] == name && tokenTexts[cursor - 1] != "." && tokenTexts[cursor + 1] != ":" {
+            return true
+        }
+        if tokenKinds[cursor] == 4 {
+            let text = tokenTexts[cursor]
+            if text == "(" || text == "[" || text == "{" {
+                depth = depth + 1
+            }
+            if text == ")" || text == "]" || text == "}" {
+                if depth == 0 {
+                    return false
+                }
+                depth = depth - 1
+            }
+        }
+        cursor = cursor + 1
+    }
+    return false
 }
 
 // Whether the tokens at `position` are `[ ... ]` with no call inside, so
@@ -2529,6 +2575,8 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
         if tokenTexts[state[0]] == "." {
             let receiver = value
             let receiverType = resultType[0]
+            let receiverOwner = -1
+            if resultType.length > 1 { receiverOwner = resultType[1] }
             state[0] = state[0] + 1
             if tokenKinds[state[0]] != 1 {
                 fail("expected a field or method name after '.'")
@@ -2578,15 +2626,23 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                         }
                         let slot = valueAsListSlot(output, textState, state, argument, argumentType[0])
                         let transfers = takeResult(output, state, argument, argumentType)
+                        // An owned receiver, such as x in x = x.appended(e),
+                        // is consumed: a unique List grows in place.
+                        // Lists that can form cycles keep the traced copy:
+                        // growing one in place would need a traced take.
+                        let runtimeName = "minyar_list_appended"
+                        if typeMayCycle(argumentType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes) {
+                            runtimeName = "minyar_list_appended_traced"
+                        } else if takeOwner(output, state, receiver, receiverOwner) {
+                            runtimeName = "minyar_list_appended_take"
+                        }
                         let temporary = newTemporary(state)
                         value = valueName(textState, temporary)
                         output.add("  ")
                         output.add(value)
-                        if typeMayCycle(argumentType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes) {
-                            output.add(" = call ptr @minyar_list_appended_traced(ptr ")
-                        } else {
-                            output.add(" = call ptr @minyar_list_appended(ptr ")
-                        }
+                        output.add(" = call ptr @")
+                        output.add(runtimeName)
+                        output.add("(ptr ")
                         output.add(receiver)
                         output.add(", i64 ")
                         output.add(slot)
@@ -3432,8 +3488,8 @@ function checkBuiltinArguments(name: Text, types: List<Integer>) {
             if name == "joinText" && type != 100002 {
                 fail("joinText expects one List<Text> argument")
             }
-            if name == "writeTextFile" && (type != 2 || types[1] != 2) {
-                fail("writeTextFile expects two Text arguments")
+            if name == "writeTextFile" && (type != 2 || (types[1] != 2 && types[1] != 100002)) {
+                fail("writeTextFile expects a Text path and Text or List<Text> contents")
             }
         }
     }
@@ -3823,7 +3879,12 @@ function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                             setType(resultType, 2)
                         } else {
                             if name == "writeTextFile" {
-                                output.add("  call void @minyar_write_text_file(ptr ")
+                                // A List<Text> is written piece by piece, never joined.
+                                if argumentTypes[1] == 100002 {
+                                    output.add("  call void @minyar_write_text_parts(ptr ")
+                                } else {
+                                    output.add("  call void @minyar_write_text_file(ptr ")
+                                }
                                 output.add(argumentValues[0])
                                 output.add(", ptr ")
                                 output.add(argumentValues[1])
@@ -4143,7 +4204,7 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
                 state[0] = operatorPosition + 1
                 // `name.field = name.field + more` appends, exactly like `+=`.
                 let next = state[0]
-                if binary == "" && fieldType == 2 && operatorPosition == start + 3 && tokenKinds[next] == 1 && tokenTexts[next] == name && tokenTexts[next + 1] == "." && tokenTexts[next + 2] == member && tokenTexts[next + 3] == "+" {
+                if binary == "" && fieldType == 2 && operatorPosition == start + 3 && tokenKinds[next] == 1 && tokenTexts[next] == name && tokenKinds[next + 1] == 4 && tokenTexts[next + 1] == "." && tokenKinds[next + 2] == 1 && tokenTexts[next + 2] == member && tokenKinds[next + 3] == 4 && tokenTexts[next + 3] == "+" {
                     binary = "+"
                     state[0] = next + 4
                 }
@@ -4881,6 +4942,103 @@ function dropCallDepthFrame(output: List<Text>, entrySlot: Integer, bodySlot: In
     }
 }
 
+// dropCallDepthFrame for a function that is no longer the last one emitted.
+function dropCallDepthFrameBetween(output: List<Text>, entrySlot: Integer, bodySlot: Integer, endSlot: Integer) {
+    let enter = "  call void @minyar_stack_enter()\n"
+    let entry = output[entrySlot]
+    if entry.length >= enter.length && entry.slice(0, enter.length) == enter {
+        output[entrySlot] = entry.slice(enter.length, entry.length)
+    }
+    let piece = bodySlot
+    while piece < endSlot {
+        if output[piece] == "  call void @minyar_stack_leave()\n" {
+            output[piece] = ""
+        }
+        piece = piece + 1
+    }
+}
+
+// A function whose every call goes to a function without a call-depth check
+// cannot recurse: each of those calls returns without calling back. Two
+// levels of such functions above the leaves, each within the leaf limits on
+// locals, temporaries and labels, need at most three frames of about 18 KiB,
+// inside the 128 KiB reserve that their caller's check left
+// (MINYAR_STACK_RESERVE_BYTES). Their checks are removed like a leaf's. The
+// callees are read back from the emitted calls; a function whose calls were
+// not all recognised (fewer than the parser counted) keeps its check.
+function dropTreeGuards(output: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, treeFunctions: List<Integer>, treeKinds: List<Integer>, treeCalls: List<Integer>, treeSlots: List<Integer>) {
+    let recordOf: List<Integer> = []
+    let index = 0
+    while index < functionNames.length {
+        recordOf.add(-1)
+        index = index + 1
+    }
+    let record = 0
+    while record < treeFunctions.length {
+        if treeFunctions[record] >= 0 { recordOf[treeFunctions[record]] = record }
+        record = record + 1
+    }
+    // Callee records of each caller. A caller with a callee that is not a
+    // record can never lose its check: kind 9, and its scan stops there.
+    let calleeStarts: List<Integer> = []
+    let callees: List<Integer> = []
+    record = 0
+    while record < treeFunctions.length {
+        calleeStarts.add(callees.length)
+        if treeKinds[record] == 1 {
+            let found = 0
+            let piece = treeSlots[record * 3 + 1] + 2
+            let end = treeSlots[record * 3 + 2] - 1
+            while piece < end {
+                let marker = output[piece]
+                if output[piece - 2] == "call " && (marker == " @.minyar.fn." || (marker == " @" && output[piece + 1].length > 0 && output[piece + 1][0] == '"')) {
+                    let callee = findFunction(functionNames, symbolKinds, functionReturnTypes, output[piece + 1])
+                    if callee < 0 || recordOf[callee] < 0 {
+                        treeKinds[record] = 9
+                        piece = end
+                    } else {
+                        callees.add(recordOf[callee])
+                        found = found + 1
+                    }
+                }
+                piece = piece + 1
+            }
+            if treeKinds[record] == 1 && found != treeCalls[record] { treeKinds[record] = 9 }
+        }
+        record = record + 1
+    }
+    calleeStarts.add(callees.length)
+    // Kind 1 becomes level 2 or 3 once all its callees sit lower; what is
+    // still 1 or 9 afterwards keeps its check.
+    let level = 2
+    while level <= 3 {
+        record = 0
+        while record < treeFunctions.length {
+            if treeKinds[record] == 1 {
+                let free = true
+                let position = calleeStarts[record]
+                while free && position < calleeStarts[record + 1] {
+                    let callee = callees[position]
+                    if callee == record || treeKinds[callee] == 1 || treeKinds[callee] >= level {
+                        free = false
+                    }
+                    position = position + 1
+                }
+                if free { treeKinds[record] = level }
+            }
+            record = record + 1
+        }
+        level = level + 1
+    }
+    record = 0
+    while record < treeFunctions.length {
+        if treeKinds[record] == 2 || treeKinds[record] == 3 {
+            dropCallDepthFrameBetween(output, treeSlots[record * 3], treeSlots[record * 3 + 1], treeSlots[record * 3 + 2])
+        }
+        record = record + 1
+    }
+}
+
 // Runtime functions that are safe on any processor: failures that stop the
 // machine, and pure mathematics.
 function parallelRuntimeAllowed(callee: Text): Boolean {
@@ -5121,10 +5279,12 @@ function compileAtomicStatement(tokenKinds: List<Integer>, tokenTexts: List<Text
                         state[0] = state[0] + 2
                         let valueType: List<Integer> = []
                         valueType.add(localTypes[local])
-                        // For x = x + e, transfer x's local owner into the
-                        // consuming Text join. Runtime uniqueness still guards
-                        // in-place growth; aliases take the copying fallback.
-                        if localTypes[local] == 2 && tokenKinds[state[0]] == 1 && tokenTexts[state[0]] == name && tokenTexts[state[0] + 1] == "+" {
+                        // For x = x + e and x = x.appended(e), transfer x's
+                        // local owner into the consuming Text join or List
+                        // append. Runtime uniqueness still guards in-place
+                        // growth; aliases take the copying fallback. Not when
+                        // x appears again: a later read would see the change.
+                        if tokenKinds[state[0]] == 1 && tokenTexts[state[0]] == name && ((localTypes[local] == 2 && tokenTexts[state[0] + 1] == "+") || (isListType(localTypes[local]) && tokenTexts[state[0] + 1] == "." && tokenTexts[state[0] + 2] == "appended" && tokenTexts[state[0] + 3] == "(")) && !nameInStatement(tokenKinds, tokenTexts, state[0] + 1, name) {
                             valueType.add(-1)
                             valueType.add(localIds[local])
                             valueType.add(state[0])
@@ -5220,6 +5380,13 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
     // 14: user-function calls emitted in the current body (leaf detection).
     state.add(0)
     let hasNative = false
+    // Functions that dropTreeGuards may free of their call-depth check: per
+    // record its function, kind (0 leaf, 1 small caller), user-call count,
+    // and entry, body and end slots.
+    let treeFunctions: List<Integer> = []
+    let treeKinds: List<Integer> = []
+    let treeCalls: List<Integer> = []
+    let treeSlots: List<Integer> = []
     let textState: List<Text> = []
     textState.add("entry")
     textState.add("")
@@ -5389,16 +5556,27 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
             output[defineSlot] = "define internal "
             output[definitionTailSlot] = ") alwaysinline {\nentry:\n"
         }
-        if stackOwnerLimit > 0 && name != "main" && state[5] == -1 && state[6] == 1 && state[8] >= 1 && state[8] <= stackOwnerLimit {
+        let stackOwned = stackOwnerLimit > 0 && name != "main" && state[5] == -1 && state[6] == 1 && state[8] >= 1 && state[8] <= stackOwnerLimit
+        let smallFrame = !parallel && !machineIntrinsic && name != "main" && state[4] <= 256 && state[1] <= 1024 && state[2] <= 1024
+        if stackOwned {
             finishStackOwnership(output, entrySlot, state[8])
-        } else if !parallel && !machineIntrinsic && name != "main" && state[14] == 0 && state[4] <= 256 && state[1] <= 1024 && state[2] <= 1024 {
-            // A leaf (no user call, state[14]) cannot deepen recursion. With at
-            // most 256 locals and 1,024 temporaries its frame stays within
-            // about 18 KiB even unoptimized, inside the 128 KiB reserve its
-            // caller's check left (MINYAR_STACK_RESERVE_BYTES). Without the
-            // check, LLVM can inline small accessors. Dispatch lowering, which
-            // embeds a stack leave in a larger piece, needs 4,096 labels.
-            dropCallDepthFrame(output, entrySlot, bodySlot)
+        } else if smallFrame {
+            if state[14] == 0 {
+                // A leaf (no user call, state[14]) cannot deepen recursion. With at
+                // most 256 locals and 1,024 temporaries its frame stays within
+                // about 18 KiB even unoptimized, inside the 128 KiB reserve its
+                // caller's check left (MINYAR_STACK_RESERVE_BYTES). Without the
+                // check, LLVM can inline small accessors. Dispatch lowering, which
+                // embeds a stack leave in a larger piece, needs 4,096 labels.
+                dropCallDepthFrame(output, entrySlot, bodySlot)
+            }
+            treeFunctions.add(findFunction(functionNames, symbolKinds, functionReturnTypes, name))
+            // Callers with many calls rarely qualify; skipping them bounds the scan.
+            if state[14] == 0 { treeKinds.add(0) } else { if state[14] <= 16 { treeKinds.add(1) } else { treeKinds.add(9) } }
+            treeCalls.add(state[14])
+            treeSlots.add(entrySlot)
+            treeSlots.add(bodySlot)
+            treeSlots.add(output.length)
         }
         output.add("}\n\n")
         } else {
@@ -5407,6 +5585,7 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         }
         skipTerminators(tokenKinds, state)
     }
+    dropTreeGuards(output, functionNames, symbolKinds, functionReturnTypes, treeFunctions, treeKinds, treeCalls, treeSlots)
     return hasNative
 }
 
@@ -5470,7 +5649,7 @@ function compileTopLevel(tokenKinds: List<Integer>, tokenTexts: List<Text>, toke
     output.add("}\n\n")
 }
 
-function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, scannedStarts: List<Integer>, scannedEnds: List<Integer>, stackOwnerLimit: Integer): Text {
+function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, scannedStarts: List<Integer>, scannedEnds: List<Integer>, stackOwnerLimit: Integer): List<Text> {
     // `parallel function` marks a function that may run on any processor. The
     // modifier becomes a line break so every later pass sees an ordinary
     // function; the names travel to compileFunctions as markers in `globals`.
@@ -5574,6 +5753,7 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     output.add("declare void @minyar_rc_local(i64, ptr)\n")
     output.add("declare void @minyar_rc_local_take(i64, ptr)\n")
     output.add("declare void @minyar_rc_local_move(i64)\n")
+    output.add("declare void @minyar_rc_local_move_owner(i64, ptr)\n")
     output.add("declare void @minyar_rc_step()\n")
     output.add("declare void @minyar_print_integer(i64)\n")
     output.add("declare void @minyar_print_text(ptr)\n")
@@ -5660,6 +5840,7 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     output.add("declare ptr @minyar_argument(i64)\n")
     output.add("declare ptr @minyar_read_text_file(ptr)\n")
     output.add("declare void @minyar_write_text_file(ptr, ptr)\n")
+    output.add("declare void @minyar_write_text_parts(ptr, ptr)\n")
     output.add("declare ptr @minyar_list_new()\n")
     output.add("declare ptr @minyar_list_new_traced()\n")
     output.add("declare void @minyar_list_references(ptr)\n")
@@ -5680,6 +5861,7 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     output.add("declare void @minyar_record_set_take_traced(ptr, i64, i64)\n")
     output.add("declare void @minyar_record_set_reference_traced(ptr, i64, i64)\n")
     output.add("declare void @minyar_record_replace_traced(ptr, i64, i64, i64)\n")
+    output.add("declare ptr @minyar_list_appended_take(ptr, i64, i64, i64)\n")
     output.add("declare ptr @minyar_record_new(i64)\n")
     output.add("declare ptr @minyar_record_new_traced(i64)\n")
     output.add("declare ptr @minyar_record_new_scalar(i64)\n")
@@ -5710,8 +5892,13 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
         output.add("declare void @minyar_rc_leave_stack_v1(ptr)\n")
     }
     if hasNative { appendNativeDeclarations(output) }
-    if globals.length == 0 { return joinText(output) }
-    return joinText(globals) + joinText(output)
+    // The module's pieces go to writeTextFile unjoined. Globals, when there
+    // are any, come first as one piece.
+    if globals.length == 0 { return output }
+    let pieces: List<Text> = []
+    pieces.add(joinText(globals))
+    pieces.add(joinText(output))
+    return pieces
 }
 
 function compileProgram(source: Text): Text {
@@ -5721,7 +5908,7 @@ function compileProgram(source: Text): Text {
     tokenize(source, tokenKinds, tokenTexts, tokenLines)
     let scannedStarts: List<Integer> = []
     let scannedEnds: List<Integer> = []
-    return compileTokens(tokenKinds, tokenTexts, tokenLines, scannedStarts, scannedEnds, 0)
+    return joinText(compileTokens(tokenKinds, tokenTexts, tokenLines, scannedStarts, scannedEnds, 0))
 }
 
 function pathCharacterIsSeparator(character: Character): Boolean {
@@ -6266,10 +6453,10 @@ function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integ
 }
 
 function compileEntry(path: Text, stackOwnerLimit: Integer): Text {
-    return compileEntryWithLibrary(path, stackOwnerLimit, "")
+    return joinText(compileEntryWithLibrary(path, stackOwnerLimit, ""))
 }
 
-function compileEntryWithLibrary(path: Text, stackOwnerLimit: Integer, library: Text): Text {
+function compileEntryWithLibrary(path: Text, stackOwnerLimit: Integer, library: Text): List<Text> {
     let modulePaths: List<Text> = []
     let moduleSources: List<Text> = []
     let moduleStates: List<Integer> = []
@@ -6389,14 +6576,16 @@ function main() {
             }
             position = position + 1
         }
-        let llvm = compileEntryWithLibrary(argument(0), stackOwnerLimit, library)
+        let pieces = compileEntryWithLibrary(argument(0), stackOwnerLimit, library)
         if freestanding {
-            llvm = freestandingModule(llvm)
+            let module: List<Text> = []
+            module.add(freestandingModule(joinText(pieces)))
+            pieces = module
         }
         if argumentCount() == 1 {
-            print(llvm)
+            print(joinText(pieces))
         } else {
-            writeTextFile(argument(1), llvm)
+            writeTextFile(argument(1), pieces)
         }
     }
 }
