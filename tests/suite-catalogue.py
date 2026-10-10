@@ -5,6 +5,8 @@ This checks inventory and declared consumers, not execution or Make semantics.
 Minyar fixtures and data/oracles remain owned by their individual harnesses.
 """
 import copy
+import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import re
@@ -106,6 +108,30 @@ def controls():
             reject(mutant)
         (root / 'Makefile').write_text('check-example:\n\ttrue\n')
         reject(data)
+        # The Linux matrix checks this same catalogue inside a retained source
+        # snapshot. Hidden workflow consumers must survive that real copier.
+        spec = importlib.util.spec_from_file_location('linux_correctness', ROOT / 'scripts/check-linux.py')
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        for directory in runner.DIRECTORIES:
+            (root / directory).mkdir(exist_ok=True)
+        workflow = root / '.github/workflows/ci.yml'
+        workflow.parent.mkdir(parents=True)
+        workflow.write_text('run: python3 tests/example.py\n')
+        (root / 'minyar').write_text('#!/bin/sh\n')
+        for excluded in ('build/host-binary', '.git/config', 'tests/__pycache__/generated.py'):
+            path = root / excluded
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('must not enter snapshot\n')
+        snapshot = root / 'retained-source'
+        snapshot.mkdir()
+        manifest = runner.snapshot_sources(root, snapshot)
+        copied = copy.deepcopy(data)
+        copied['sources'][0]['consumers'] = ['.github/workflows/ci.yml']
+        validate(copied, snapshot)
+        assert manifest['.github/workflows/ci.yml'] == hashlib.sha256(workflow.read_bytes()).hexdigest()
+        assert not any((snapshot / excluded).exists() for excluded in
+                       ('build/host-binary', '.git/config', 'tests/__pycache__/generated.py'))
         return rejected
 
 

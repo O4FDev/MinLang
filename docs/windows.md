@@ -6,16 +6,25 @@ containers, controls, menu items and tray icons use generation-checked integer
 IDs. Destroying a window invalidates its children and removes their pending
 events. An invalid handle or wrong UI thread is a programmer error.
 
-The core API provides windows, rows, columns, padding, labels, buttons, text
-fields, checkboxes, fonts, window menus, tray menus and taskbar accessory mode.
+The core API provides windows, rows, columns, padding, labels, buttons, password
+and text fields, multiline editors, read-only text views, checkboxes, sliders,
+separators, explicit sizes, enablement, fonts, window menus, tray menus and
+taskbar accessory mode.
 Text is checked UTF-8 and converted through the Unicode Windows APIs.
 Programmatic text changes do not enqueue user edits. `nextEvent(seconds)` waits
-with `MsgWaitForMultipleObjectsEx`; `NONE` means timeout, while `QUIT` is delivered
+with `MsgWaitForMultipleObjectsEx`; `NONE` means no UI event was dispatched, while `QUIT` is delivered
 once before the loop returns false. Actions, edits, close, resize and text-field
 Return use the same event constants as the macOS bridge. Edit events carry
 copied native text; OS callbacks retain no managed Minyar values. Dispatch is
 bounded to 256 Windows messages per iteration, and duplicate pending text edits
 are coalesced. Windows dialog keyboard navigation handles Tab between controls.
+Multiline controls normalize Windows CRLF to LF when returning text. `appendText`
+preserves the selection and suppresses programmatic CHANGE events. Text views
+have a scrolling viewport; `size` sets it explicitly, and zero removes a dimension
+constraint. Sliders require finite increasing ranges and values within them, and
+map the range onto one million native trackbar intervals. Endpoints are exact.
+The [native trackbar contract](https://learn.microsoft.com/en-us/windows/win32/controls/trackbar-controls)
+provides user-driven CHANGE events.
 
 `windows.shareNetworkLoop(loop)` connects an `eventloop` reactor to this same
 UI thread. After every `nextEvent` call, consume `eventloop.wait(loop, 0, maximum)`
@@ -41,7 +50,13 @@ The implementation follows Microsoft's [Winsock event semantics](https://learn.m
 and [GUI wait contract](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-msgwaitformultipleobjectsex).
 
 Windows menu bars belong to a window, so `menu(window, title)` takes the owning
-window. `menuItem` currently requires an empty shortcut string. Tray items use
+window. Menu shortcuts are scoped to that window: `q` means Ctrl+Q; explicit
+Ctrl/Shift/Alt combinations, F1 through F24 and named keys such as Enter are
+supported. Duplicate combinations are programmer errors. Tray menus have no
+focused window, so their shortcuts must be empty. Destroyed and disabled items
+cannot dispatch an accelerator action; IDs are never reused. The message pump
+uses [Windows accelerator translation](https://learn.microsoft.com/en-us/windows/win32/learnwin32/accelerator-tables)
+before dialog navigation and text-field submission. Tray items use
 the application icon; the symbol argument is reserved. Tray notifications use
 full 32-bit native IDs and generation-checked public handles; keyboard activation
 is enabled. Explorer restart recreates registered icons. `accessory(true)` hides
@@ -56,15 +71,59 @@ The shared `desktop.min` API supplies these Windows services:
 - Current-user launch-at-login registration for the current executable. The
   quoted command and registration name identify that executable exactly. An
   existing foreign registration is denied rather than overwritten or removed.
-- Quiet-time-respecting, silent shell banner notifications. IDs must be closed
-  by their owner. Status 1 means the OS accepted the notification, not that it
-  was displayed. On Windows 11 these banners are transient, as documented by
-  [Microsoft's Shell notification API](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shell_notifyiconw).
+- Persistent Action Center notifications, after explicit Windows app registration
+  and initialization described below. Status 1 means the OS accepted a notification,
+  not that it was displayed. Disabled OS notification settings return denied.
 
 Missing OS capabilities and rejected notification input are recoverable error
 values. The Linux backend reports unavailable using the same fixed envelopes.
-Persistent Action Center toasts, advanced macOS-equivalent controls, menu
-accelerators and a unified Windows socket/GUI wait remain subsequent work.
+The Windows bridge still needs the macOS bridge's richer list, custom drawing,
+theme, constraint and file-dialog APIs for complete UI parity.
+
+## Persistent notifications and actions
+
+`winnotify.register(appId, displayName)` creates owned current-user COM,
+AppUserModelId and Start Menu entries for the current executable. Use a stable
+installation path and unique ASCII app identity. Existing foreign entries are
+denied. Call `winnotify.initialize(appId)` on the owning thread on every launch,
+including a COM relaunch with `--minyar-toast-activate appId`. Registration alone
+does not initialize callbacks. `desktop.notify` shares this initialized provider;
+without initialization it returns unavailable.
+
+```minyar
+use "winnotify" as notice
+use "errors" as errors
+let initialized = notice.initialize("com.example.Agent")
+if errors.integerOk(initialized) {
+    let actions: List<notice.Action> = [notice.action("open","Open agent")]
+    let sent = notice.notify("Agent connected","Your device is online.",actions)
+    if errors.integerOk(sent) {
+        let token = notice.token(errors.integerValue(sent))
+        // Persist tokenValue(token) if cancellation is needed after a relaunch.
+    }
+}
+```
+
+Poll the typed `nextAction()` result after `windows.nextEvent`: would-block means
+the queue is empty. Native COM callbacks wake the GUI pump and retain no Minyar
+values. Each action carries a random 32-character notification token and an
+allowlisted action ID. The default body click has action ID `default`. Foreign
+app identities, unknown actions, duplicate clicks, expired registrations and
+callbacks after cancellation are rejected. Accepted actions are consumed once;
+a crash between native queue insertion and application consumption can lose an
+action, so this is not a durable message queue.
+
+At most five unique actions are accepted, with bounded UTF-8 labels and escaped
+XML. The native queue holds at most 256 actions. At most 1,024 live registrations
+persist across restarts, and registrations expire after seven days. Expired
+entries and their scoped Action Center records are pruned on initialization and
+new delivery. `close(id)` cancels a current native handle; `cancelToken(token)`
+also removes a notification after relaunch. `stop()` releases callbacks and
+native state while preserving notifications and registration. `unregister()`
+clears owned notifications and removes owned installation entries.
+
+The implementation uses Windows' [desktop COM activation contract](https://learn.microsoft.com/en-us/previous-versions/windows/desktop/win32_tile_badge_notif/respond-to-toast-activations)
+and [scoped notification history removal](https://learn.microsoft.com/en-us/uwp/api/windows.ui.notifications.toastnotificationhistory.remove).
 
 ## Certificate-store private keys
 
@@ -143,6 +202,18 @@ accepted-child event isolation, idle timeout settling, timer cancellation and
 stale reactor generations. Instrumented `WSAPoll` calls prove the GUI wait
 does not poll sockets periodically. Compiled Minyar adapter contracts run in
 debug and release.
+The control fixture additionally verifies native password/multiline/read-only
+styles, Unicode append and line endings, explicit sizing, disabled actions,
+trackbar range/endpoints/notifications, accelerator translation and cancellation
+after destruction. Invalid sizes, nonfinite or out-of-range slider values, wrong
+control kinds, and malformed or duplicate shortcuts must stop with diagnostics.
+
+The notification fixture invokes the real COM activation object from another
+thread and parses real WinRT XML. It covers foreign owners/actions, duplicate
+clicks, late callbacks, queued-click cancellation, stale handles, expired
+registrations, persistent limits across restart and cancellation by token. OS
+policy may deny visible banners; XML, COM and persistence contracts remain
+mandatory in that case. Debug and release exercise the typed Minyar API too.
 
 `python3 tests/schannel.py` is a separate mandatory Windows CI gate. It tests
 native state/buffer/lifetime contracts and compiled Minyar results in debug

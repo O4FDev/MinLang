@@ -251,6 +251,31 @@ net.close(client)
 net.close(server)
 ''', '1\n1\n0\n0\n0\n')
 
+    def test_socket_interest_updates_preserve_callback_and_generation(self):
+        self.native_sources = (str(ROOT / 'runtime/native/net.c'),)
+        self.executes('''use "eventcallbacks" as callbacks
+use "eventloop" as loop
+use "errors" as errors
+use "net" as net
+record State { count: Integer; token: Integer }
+let state = State { count: 0; token: 0 }
+let socket = net.udp("127.0.0.1",0); let sender = net.udp("127.0.0.1",0)
+net.udpConnect(sender,"127.0.0.1",net.localPort(socket))
+let dispatcher = callbacks.value(callbacks.create())
+let watched = errors.integerValue(callbacks.watch(dispatcher,socket,loop.readableInterest(),1,function(event: loop.Event) {
+    state.count += 1; state.token = event.token; net.receiveDatagram(socket,32)
+}))
+print(errors.booleanOk(callbacks.update(dispatcher,watched,0,2)))
+net.write(sender,Bytes("queued"))
+print(errors.integerValue(callbacks.dispatch(dispatcher,0,8)))
+print(errors.booleanOk(callbacks.update(dispatcher,watched,loop.readableInterest(),77)))
+print(errors.integerValue(callbacks.dispatch(dispatcher,1000,8)))
+print(state.count); print(state.token)
+callbacks.cancel(dispatcher,watched)
+print(errors.booleanOk(callbacks.update(dispatcher,watched,loop.readableInterest(),88)))
+callbacks.close(dispatcher); net.close(sender); net.close(socket)
+''', 'true\n0\ntrue\n1\n1\n77\nfalse\n')
+
     def test_captured_binding_reassignment_has_a_source_diagnostic(self):
         result, llvm = self.compile('''let count = 0
 let callback = function(): Integer { count = count + 1; return count }

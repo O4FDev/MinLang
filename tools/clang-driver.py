@@ -338,7 +338,7 @@ def main():
             if not (platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN'))):
                 raise ValueError('the windows package requires Windows and its native UI')
             native += [native_object(project, clang, base, 'windows.c', native_flags),
-                       '-luser32', '-lgdi32', '-lshell32']
+                       '-luser32', '-lgdi32', '-lshell32', '-lcomctl32']
         elif library == 'schannel':
             if not (platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN'))):
                 raise ValueError('the schannel package requires Windows and its TLS provider')
@@ -390,6 +390,13 @@ def main():
                 raise ValueError('the keychain package requires macOS')
             native += [native_object(project, clang, base, 'keychain.c', native_flags),
                        '-framework', 'Security', '-framework', 'CoreFoundation']
+        elif library == 'winnotify':
+            if not (platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN'))):
+                raise ValueError('the winnotify package requires Windows')
+            notification_object = native_object(project, clang, base, 'winnotify.c', native_flags)
+            if notification_object not in native:
+                native += [notification_object]
+            native += ['-luser32', '-lshell32', '-ladvapi32', '-lole32', '-luuid', '-lbcrypt', '-lruntimeobject']
         elif library == 'desktop':
             if platform.system() == 'Darwin':
                 native += [native_object(project, clang, base, 'desktop.m',
@@ -400,7 +407,10 @@ def main():
                 native += [native_object(project, clang, base, 'desktop.c', native_flags)]
                 if platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
                     native += ['-luser32', '-lshell32', '-ladvapi32', '-lole32', '-loleaut32', '-liphlpapi',
-                               '-luuid', '-lws2_32', '-lbcrypt']
+                               '-luuid', '-lws2_32', '-lbcrypt', '-lruntimeobject']
+                    notification_object = native_object(project, clang, base, 'winnotify.c', native_flags)
+                    if notification_object not in native:
+                        native += [notification_object]
         else:
             raise ValueError(f'the program uses an unknown native library: {library}')
     lto = lto_flags(clang, link_flags) if release == '1' else []
