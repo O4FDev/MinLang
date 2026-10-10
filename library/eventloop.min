@@ -1,0 +1,95 @@
+// A single-owner readiness loop for thousands of hosted sockets and timers.
+// Watching enables non-blocking mode. Sockets remain owned by the caller.
+// Readiness is a hint: a read/write can
+// still would-block. Remove a watch before closing its socket. No callbacks
+// or cross-thread managed ownership are implied by this batch interface.
+use "errors" as errors
+
+public record Event {
+    registration: Integer
+    token: Integer
+    flags: Integer
+    nativeCode: Integer
+    kind: Integer
+}
+public record Batch {
+    private events: List<Event>
+    private error: errors.Error
+}
+
+public function readableInterest(): Integer { return 1 }
+public function writableInterest(): Integer { return 2 }
+public function readWriteInterest(): Integer { return 3 }
+public function isReadable(event: Event): Boolean { return event.flags % 2 == 1 }
+public function isWritable(event: Event): Boolean { return event.flags / 2 % 2 == 1 }
+public function isClosed(event: Event): Boolean { return event.flags / 4 % 2 == 1 }
+public function isError(event: Event): Boolean { return event.flags / 8 % 2 == 1 }
+public function isTimer(event: Event): Boolean { return event.kind == 1 }
+public function events(batch: Batch): List<Event> { return batch.events }
+public function batchError(batch: Batch): errors.Error { return batch.error }
+
+function operationError(result: Bytes, operation: Text): errors.Error {
+    if result.length != 16 { fail("invalid native loop operation envelope") }
+    return errors.make(errors.systemCode(), result.getUInt32(4), operation + " failed")
+}
+function integerResult(result: Bytes, operation: Text): errors.IntegerResult {
+    if result.length != 16 { fail("invalid native loop operation envelope") }
+    if result.getUInt32(0) == 0 { return errors.integer(result.getInt64(8)) }
+    return errors.integerFailure(operationError(result, operation))
+}
+function booleanResult(result: Bytes, operation: Text): errors.BooleanResult {
+    if result.length != 16 { fail("invalid native loop operation envelope") }
+    if result.getUInt32(0) == 0 { return errors.boolean(result.getInt64(8) == 1) }
+    return errors.booleanFailure(operationError(result, operation))
+}
+public function create(): errors.IntegerResult { return integerResult(loopCreate(), "loop create") }
+// interest may be zero to pause normal readable/writable notifications.
+public function watch(loop: Integer, socket: Integer, interest: Integer, token: Integer): errors.IntegerResult {
+    return integerResult(loopWatch(loop, socket, interest, token), "loop watch")
+}
+public function update(loop: Integer, registration: Integer, interest: Integer, token: Integer): errors.BooleanResult {
+    return booleanResult(loopUpdate(loop, registration, interest, token), "loop update")
+}
+public function remove(loop: Integer, registration: Integer): errors.BooleanResult {
+    return booleanResult(loopRemove(loop, registration), "loop remove")
+}
+// period zero means one-shot. A one-shot registration expires when emitted.
+// A repeating timer skips missed intervals, firing at most once per batch.
+public function timer(loop: Integer, delayMs: Integer, periodMs: Integer, token: Integer): errors.IntegerResult {
+    return integerResult(loopTimer(loop, delayMs, periodMs, token), "loop timer")
+}
+public function close(loop: Integer): errors.BooleanResult {
+    return booleanResult(loopClose(loop), "loop close")
+}
+// timeoutMs -1 waits until readiness or a timer. A successful timeout returns
+// an empty batch; an OS failure belongs to this result, not a global error.
+public function wait(loop: Integer, timeoutMs: Integer, maxEvents: Integer): Batch {
+    let result = loopWait(loop, timeoutMs, maxEvents)
+    if result.length < 8 || (result.length - 8) % 32 != 0 {
+        fail("invalid native loop event envelope")
+    }
+    let events: List<Event> = []
+    if result.getUInt32(0) != 0 {
+        return Batch { events: events; error: errors.make(errors.systemCode(), result.getUInt32(4), "loop wait failed") }
+    }
+    let at = 8
+    while at < result.length {
+        events.add(Event {
+            registration: result.getInt64(at)
+            token: result.getInt64(at + 8)
+            flags: result.getUInt32(at + 16)
+            nativeCode: result.getUInt32(at + 20)
+            kind: result.getUInt32(at + 24)
+        })
+        at = at + 32
+    }
+    return Batch { events: events; error: errors.none() }
+}
+
+function loopCreate(): Bytes { native "net" }
+function loopWatch(loop: Integer, socket: Integer, interest: Integer, token: Integer): Bytes { native "net" }
+function loopUpdate(loop: Integer, registration: Integer, interest: Integer, token: Integer): Bytes { native "net" }
+function loopRemove(loop: Integer, registration: Integer): Bytes { native "net" }
+function loopTimer(loop: Integer, delayMs: Integer, periodMs: Integer, token: Integer): Bytes { native "net" }
+function loopClose(loop: Integer): Bytes { native "net" }
+function loopWait(loop: Integer, timeoutMs: Integer, maxEvents: Integer): Bytes { native "net" }

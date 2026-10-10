@@ -293,8 +293,16 @@ def main():
             pass  # Compiler intrinsics: the code is already inline in the program.
         elif library == 'net':
             native += [native_object(project, clang, base, 'net.c', native_flags)]
-            if platform.system() == 'Windows':
+            if platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
                 native += ['-lws2_32']
+        elif library == 'tlsverify':
+            native += [native_object(project, clang, base, 'tlsverify.c', native_flags)]
+            if platform.system() == 'Darwin':
+                native += ['-framework', 'Security', '-framework', 'CoreFoundation']
+            elif platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
+                native += ['-lcrypt32', '-lbcrypt', '-lncrypt', '-lws2_32']
+            else:
+                native += ['-lcrypto']
         else:
             raise ValueError(f'the program uses an unknown native library: {library}')
     lto = lto_flags(clang, link_flags) if release == '1' else []

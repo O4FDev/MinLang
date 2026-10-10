@@ -58,8 +58,10 @@ while graphics.nextFrame() {
 `json` parses and writes JSON, `net` opens TCP connections and `http` makes
 HTTP/1.1 requests over them, for `https://` URLs through `tls`, a TLS 1.3
 client built on `crypto` (SHA-256, HMAC, HKDF, ChaCha20-Poly1305, X25519). The
-TLS client encrypts and verifies the handshake but does not validate
-certificates. [`examples/atacama`](../examples/atacama/main.min) and
+TLS client validates certificate chains against OS roots, checks names and
+validity, and verifies the server's handshake signature. It supports custom
+trust anchors and mutual authentication; see [the TLS API](tls.md).
+[`examples/atacama`](../examples/atacama/main.min) and
 [`examples/fetch`](../examples/fetch/main.min) use them. `machine` gives [freestanding programs](freestanding.md) direct
 access to the hardware, and `device` gives them typed, checked registers, ports
 and DMA memory on top of it.

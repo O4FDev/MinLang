@@ -1,0 +1,194 @@
+// Stateful adversarial tests for the Minyar handshake, independent of sockets.
+// The generated server chain/key are real; forged CVs keep valid transcript
+// Finished MACs, so a Finished-only verifier cannot accidentally pass.
+use "tls" as tls
+use "tlsverify" as trust
+use "crypto" as crypto
+
+function add16(data: Bytes, value: Integer) { data.add((value >> 8) & 255); data.add(value & 255) }
+function add24(data: Bytes, value: Integer) { data.add((value >> 16) & 255); add16(data, value) }
+function message(type: Integer, body: Bytes): Bytes {
+    let result = Bytes()
+    result.add(type)
+    add24(result, body.length)
+    result.addBytes(body)
+    return result
+}
+function extension(type: Integer, body: Bytes): Bytes {
+    let result = Bytes()
+    add16(result, type); add16(result, body.length); result.addBytes(body)
+    return result
+}
+function certificate(leaf: Bytes): Bytes {
+    let entry = Bytes()
+    add24(entry, leaf.length); entry.addBytes(leaf); add16(entry, 0)
+    let body = Bytes()
+    body.add(0); add24(body, entry.length); body.addBytes(entry)
+    return message(11, body)
+}
+function signatureContent(transcript: Bytes): Bytes {
+    let result = Bytes()
+    for index in 0..64 { result.add(32) }
+    result.addBytes(Bytes("TLS 1.3, server CertificateVerify")); result.add(0)
+    result.addBytes(crypto.sha256(transcript))
+    return result
+}
+function deliver(session: tls.Session, bytes: Bytes, level: Integer, fragment: Boolean) {
+    if fragment {
+        for index in 0..bytes.length { tls.receiveHandshake(session, bytes.slice(index, index + 1), level) }
+    } else { tls.receiveHandshake(session, bytes, level) }
+}
+
+function scenario(mode: Integer, root: Bytes, leaf: Bytes, key: Bytes, other: Bytes): Boolean {
+    let session = tls.quicClient("localhost", Bytes(64), "h3", crypto.fromHex("03048000ffff"), [root], [], Bytes())
+    let hello = tls.takeOutgoing(session)
+    if hello.length < 4 || hello[0] != 1 || hello[38] != 0 || session.outgoingLevel != tls.INITIAL_KEYS { return false }
+    if mode == 10 { tls.receive(session, Bytes()); return session.state == tls.FAILED }
+    let serverKey = Bytes(32)
+    serverKey[0] = 42
+    let share = Bytes()
+    add16(share, 0x001d); add16(share, 32)
+    if mode == 19 { share.addBytes(Bytes(32)) }
+    else { share.addBytes(crypto.x25519Public(serverKey)) }
+    let extensions = extension(43, crypto.fromHex("0304"))
+    extensions.addBytes(extension(51, share))
+    if mode == 18 { extensions.addBytes(extension(43, crypto.fromHex("0304"))) }
+    let body = crypto.fromHex("0303")
+    body.addBytes(Bytes(32)); body.add(0); add16(body, 0x1303); body.add(0)
+    add16(body, extensions.length); body.addBytes(extensions)
+    deliver(session, message(2, body), tls.INITIAL_KEYS, mode == 1)
+    if mode == 18 || mode == 19 { return session.state == tls.FAILED }
+    if session.state != tls.HANDSHAKE || session.serverSecret.length != 32 { return false }
+    extensions = Bytes()
+    if mode != 14 { extensions.addBytes(extension(16, crypto.fromHex("0003026833"))) }
+    if mode != 15 { extensions.addBytes(extension(57, crypto.fromHex("03048000ffff"))) }
+    if mode == 13 { extensions.addBytes(extension(42, Bytes())) }
+    body = Bytes(); add16(body, extensions.length); body.addBytes(extensions)
+    let encrypted = message(8, body)
+    let level = tls.HANDSHAKE_KEYS
+    if mode == 6 { level = tls.INITIAL_KEYS }
+    deliver(session, encrypted, level, mode == 1)
+    if mode == 6 || mode == 13 || mode == 14 || mode == 15 { return session.state == tls.FAILED }
+    if mode == 7 { tls.receiveHandshake(session, encrypted, level); return session.state == tls.FAILED }
+    if mode == 16 { tls.receiveHandshake(session, message(255, Bytes()), level); return session.state == tls.FAILED }
+    if mode == 17 { tls.receiveHandshake(session, message(13, crypto.fromHex("000005000d0000")), level); return session.state == tls.FAILED }
+    let cert = certificate(leaf)
+    if mode == 3 { cert = certificate(other) }
+    if mode == 8 { cert = message(11, crypto.fromHex("00000000")) }
+    if mode == 9 { cert[4] = 1 }
+    if mode == 12 { cert[7] = (cert[7] + 1) & 255 }
+    deliver(session, cert, level, mode == 1)
+    if mode == 8 || mode == 9 || mode == 12 { return session.state == tls.FAILED }
+    if session.state != tls.HANDSHAKE || session.stage != 4 { return false }
+    if mode != 4 {
+        let signature = trust.sign(key, 0x0804, signatureContent(session.transcript))
+        if signature.length == 0 { return false }
+        if mode == 2 { signature[0] = signature[0] ^ 1 }
+        body = Bytes()
+        let scheme = 0x0804
+        if mode == 11 { scheme = 0x0401 }
+        add16(body, scheme); add16(body, signature.length); body.addBytes(signature)
+        deliver(session, message(15, body), level, mode == 1)
+        if mode == 2 || mode == 3 || mode == 11 { return session.state == tls.FAILED && !session.authenticated }
+        if !session.authenticated { return false }
+    }
+    let finishedKey = crypto.expandLabel(session.serverSecret, "finished", Bytes(), 32)
+    let verify = crypto.hmac(finishedKey, crypto.sha256(session.transcript))
+    if mode == 5 { verify[0] = verify[0] ^ 1 }
+    let serverFinished = message(20, verify)
+    let finalTranscript = session.transcript.slice(0, session.transcript.length)
+    finalTranscript.addBytes(serverFinished)
+    let finalHash = crypto.sha256(finalTranscript)
+    let clientFinishedKey = crypto.expandLabel(session.clientSecret, "finished", Bytes(), 32)
+    let clientFinished = crypto.hmac(clientFinishedKey, finalHash)
+    let derived = crypto.expandLabel(session.handshakeSecret, "derived", crypto.sha256(Bytes()), 32)
+    let master = crypto.hkdfExtract(derived, Bytes(32))
+    let application = crypto.expandLabel(master, "s ap traffic", finalHash, 32)
+    deliver(session, serverFinished, level, mode == 1)
+    if mode == 4 || mode == 5 { return session.state == tls.FAILED }
+    let reply = tls.takeOutgoing(session)
+    return session.state == tls.ESTABLISHED && session.authenticated &&
+           session.clientApplication.length == 32 && session.serverApplication.length == 32 &&
+           session.outgoingLevel == tls.HANDSHAKE_KEYS && reply.length == 36 && reply[0] == 20 &&
+           session.peerTransportParameters.length == 6 && session.transcript.length == 0 &&
+           crypto.hex(reply.slice(4, reply.length)) == crypto.hex(clientFinished) &&
+           crypto.hex(session.serverApplication) == crypto.hex(application)
+}
+
+function main(): Integer {
+    let root = readBytesFile(argument(0))
+    let leaf = readBytesFile(argument(1))
+    let key = readBytesFile(argument(2))
+    let other = readBytesFile(argument(3))
+    for mode in 0..20 {
+        if !scenario(mode, root, leaf, key, other) { print("TLS protocol scenario failed: " + Text(mode)); return 1 }
+    }
+    // Every truncation of a real certificate must fail trust validation.
+    let anchors = certificate(root).slice(8, 8 + root.length + 5)
+    for length in 0..leaf.length {
+        let truncated = certificate(leaf.slice(0, length))
+        if trust.chain("localhost", truncated.slice(8, truncated.length), anchors) == "" {
+            print("TLS accepted a truncated DER certificate: " + Text(length)); return 1
+        }
+    }
+    // Differential parser fuzzing: arbitrary headers/bodies are recoverable
+    // failures and must never authenticate a peer or stop the process.
+    for seed in 0..2048 {
+        let session = tls.none()
+        session.state = tls.HELLO_SENT
+        let record = Bytes()
+        for index in 0..32 { record.add((seed * 31 + index * 17) & 255) }
+        tls.receive(session, record)
+        if tls.established(session) || session.authenticated { print("TLS parser authenticated random bytes"); return 1 }
+    }
+    // Keep outer handshake/vector framing valid while mutating inner fields.
+    // This reaches each parser instead of rejecting every input at the record
+    // header. Seed/stage identify reproducible failures for a future fuzzer.
+    let types = [2, 8, 13, 11, 15, 20]
+    for parser in 0..6 {
+        for seed in 0..256 {
+            let session = tls.none()
+            session.quic = true
+            session.state = tls.HANDSHAKE
+            if parser == 0 { session.state = tls.HELLO_SENT }
+            session.stage = parser
+            session.certificate = leaf
+            session.serverSecret = Bytes(32)
+            session.authenticated = parser == 5
+            let body = Bytes()
+            let size = seed % 64
+            if parser == 0 {
+                body.addBytes(crypto.fromHex("0303")); body.addBytes(Bytes(32)); body.add(0)
+                add16(body, 0x1303); body.add(0); add16(body, size)
+            } else if parser == 1 { add16(body, size) }
+            else if parser == 2 { body.add(0); add16(body, size) }
+            else if parser == 3 { body.add(0); add24(body, size + 5); add24(body, size) }
+            else if parser == 4 { add16(body, 0x0804); add16(body, size) }
+            for index in 0..size { body.add((seed * 31 + index * 17) & 255) }
+            if parser == 3 { add16(body, 0) }
+            let level = tls.HANDSHAKE_KEYS
+            if parser == 0 { level = tls.INITIAL_KEYS }
+            tls.receiveHandshake(session, message(types[parser], body), level)
+            if tls.established(session) { print("TLS inner parser accepted fuzz input"); return 1 }
+        }
+    }
+    // An authentic AEAD record carrying early application data must fail.
+    let premature = tls.none()
+    premature.state = tls.HANDSHAKE
+    premature.readKey = Bytes(32)
+    premature.readIv = Bytes(12)
+    let payload = Bytes("unverified application data")
+    payload.add(23)
+    let header = crypto.fromHex("170303")
+    add16(header, payload.length + 16)
+    let encrypted = crypto.seal(Bytes(32), Bytes(12), header, payload)
+    header.addBytes(encrypted)
+    tls.receive(premature, header)
+    if premature.state != tls.FAILED || tls.takeIncoming(premature).length != 0 {
+        print("TLS released application data before authentication"); return 1
+    }
+    let shortEntropy = tls.client("localhost", Bytes(63))
+    if shortEntropy.state != tls.FAILED { print("TLS accepted insufficient entropy"); return 1 }
+    print("TLS raw handshake: 20 state/signature/fragmentation cases, all DER truncations, 3584 parser fuzz cases, early application rejection passed")
+    return 0
+}

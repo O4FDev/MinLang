@@ -1,0 +1,42 @@
+use "net" as net
+use "tls" as tls
+
+function main(): Integer {
+    let port = 0
+    for digit in argument(0) { port = port * 10 + Integer(digit) - 48 }
+    let roots: List<Bytes> = []
+    if argument(2) != "" { roots.add(readBytesFile(argument(2))) }
+    let identity: List<Bytes> = []
+    let key = Bytes()
+    if argumentCount() > 3 && argument(3) != "" {
+        identity.add(readBytesFile(argument(3)))
+        key = readBytesFile(argument(4))
+    }
+    let session = tls.clientWithIdentity(argument(1), randomBytes(64), roots, identity, key)
+    let connection = net.connect("127.0.0.1", port)
+    if connection < 0 { print("connect: " + net.lastError()); return 2 }
+    net.send(connection, tls.takeOutgoing(session))
+    while session.state == tls.HELLO_SENT || session.state == tls.HANDSHAKE {
+        if !net.ready(connection, 5000) { net.close(connection); print("timeout"); return 3 }
+        let arrived = net.receive(connection, 65536)
+        if arrived.length == 0 { net.close(connection); print("closed during handshake"); return 4 }
+        tls.receive(session, arrived)
+        let reply = tls.takeOutgoing(session)
+        if reply.length > 0 { net.send(connection, reply) }
+    }
+    if !tls.established(session) { net.close(connection); print("TLS: " + session.error); return 1 }
+    tls.send(session, Bytes("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"))
+    net.send(connection, tls.takeOutgoing(session))
+    let plain = Bytes()
+    while session.state == tls.ESTABLISHED {
+        if !net.ready(connection, 5000) { net.close(connection); print("timeout reading"); return 3 }
+        let arrived = net.receive(connection, 65536)
+        if arrived.length == 0 { tls.endInput(session); break }
+        tls.receive(session, arrived)
+        plain.addBytes(tls.takeIncoming(session))
+    }
+    net.close(connection)
+    if session.state == tls.FAILED { print("TLS: " + session.error); return 1 }
+    print(Text(plain))
+    return 0
+}
