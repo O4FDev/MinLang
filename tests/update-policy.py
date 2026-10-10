@@ -50,6 +50,7 @@ class UpdatePolicy(unittest.TestCase):
         signature = self.directory/'release.sig'
         manifest.write_bytes(metadata)
         signed = subprocess.check_output([str(self.signer), str(manifest)])
+        self.assertEqual(len(signed), 64, 'the signer must preserve binary signature bytes')
         signature.write_bytes(bytes([signed[0] ^ 1]) + signed[1:] if corrupt else signed)
         if root is None:
             args = ['inspect', device, str(floor), highest, previous]
@@ -65,6 +66,18 @@ class UpdatePolicy(unittest.TestCase):
     def test_valid_metadata_and_signature_mutation(self):
         self.assertEqual(self.invoke()[0], ['true', 'true', '0'])
         self.assertEqual(self.invoke(corrupt=True)[0], ['false', 'false', '10'])
+
+    def test_signer_binary_output_survives_every_byte_value(self):
+        # Vary public fixture input independently of policy. Across these signatures,
+        # every possible byte (including LF, CR and DOS EOF) crosses the real pipe.
+        observed = set()
+        for index in range(256):
+            manifest = self.directory/'binary-signature-input'
+            manifest.write_bytes(f'binary-signature-{index}'.encode())
+            signed = subprocess.check_output([str(self.signer), str(manifest)])
+            self.assertEqual(len(signed), 64)
+            observed.update(signed)
+        self.assertEqual(observed, set(range(256)))
 
     def test_signed_malformed_fields_are_recoverable(self):
         replacements = {

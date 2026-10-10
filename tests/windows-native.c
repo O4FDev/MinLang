@@ -47,11 +47,22 @@ extern void minyar_rc_release(void *);
 static MinyarText *text(const char *s) {
     return minyar_native_copy_text((const unsigned char *)s, (long long)strlen(s));
 }
-static void equal(MinyarText *value, const char *expected) {
+static void equal_at(MinyarText *value, const char *expected, unsigned line) {
+    if (value->byte_length != (long long)strlen(expected) ||
+        memcmp(value->bytes, expected, strlen(expected))) {
+        fprintf(stderr, "text mismatch at fixture line %u; expected:", line);
+        for (size_t i = 0; i < strlen(expected); i++)
+            fprintf(stderr, " %02x", (unsigned char)expected[i]);
+        fprintf(stderr, "; actual:");
+        for (long long i = 0; i < value->byte_length; i++)
+            fprintf(stderr, " %02x", value->bytes[i]);
+        fputc('\n', stderr);
+    }
     assert(value->byte_length == (long long)strlen(expected));
     assert(!memcmp(value->bytes, expected, strlen(expected)));
     minyar_rc_release(value);
 }
+#define equal(value, expected) equal_at(value, expected, __LINE__)
 int main(int argc, char **argv) {
     MinyarText *name = text("Minyar Windows test"), *unicode = text("日本語 é 😀"),
                *family = text("Segoe UI");
@@ -99,10 +110,16 @@ int main(int argc, char **argv) {
               view = minyar_windows_textView(column, multiline);
     assert(GetWindowLongPtrW(minyar_windows_testHandle(editor), GWL_STYLE) & ES_MULTILINE);
     assert(GetWindowLongPtrW(minyar_windows_testHandle(view), GWL_STYLE) & ES_READONLY);
+    // Append must ignore the current caret/selection and restore it afterward.
+    SendMessageW(minyar_windows_testHandle(editor), EM_SETSEL, 2, 5);
     minyar_windows_appendText(editor, suffix);
     minyar_windows_appendText(view, suffix);
     equal(minyar_windows_text(editor), "line one\n日本語\n😀");
     equal(minyar_windows_text(view), "line one\n日本語\n😀");
+    DWORD selection_start = 0, selection_end = 0;
+    SendMessageW(minyar_windows_testHandle(editor), EM_GETSEL, (WPARAM)&selection_start,
+                 (LPARAM)&selection_end);
+    assert(selection_start == 2 && selection_end == 5);
     minyar_windows_enabled(editor, false);
     assert(!IsWindowEnabled(minyar_windows_testHandle(editor)));
     minyar_windows_enabled(editor, true);

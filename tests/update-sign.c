@@ -3,8 +3,16 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 int main(int argc, char **argv) {
     assert(argc == 2);
+#ifdef _WIN32
+    /* Signatures are binary; the CRT must never expand LF into CRLF. */
+    assert(_setmode(_fileno(stdout), _O_BINARY) != -1);
+#endif
     FILE *file = fopen(argv[1], "rb");
     assert(file);
     const unsigned char domain[] = "MINYAR-UPDATE-SIGNATURE-V1";
