@@ -11,6 +11,7 @@
 #include <wincrypt.h>
 #include <bcrypt.h>
 #include <ncrypt.h>
+#include "windows_identity.h"
 #else
 #include <arpa/inet.h>
 #endif
@@ -698,16 +699,23 @@ static void append_ec_der(MinyarBytes *out, const unsigned char *raw, size_t len
 MinyarBytes *minyar_tlsverify_sign(const MinyarBytes *private_key, long long scheme,
                                    const MinyarBytes *content) {
     MinyarBytes *result = minyar_bytes_new(0);
+    bool opaque = private_key->byte_length >= 4 && !memcmp(private_key->bytes, "MWI1", 4);
     if (private_key->byte_length <= 0 || private_key->byte_length > MAX_CERT_BYTES ||
-        !exact_der(private_key->bytes, (size_t)private_key->byte_length))
+        (!opaque && !exact_der(private_key->bytes, (size_t)private_key->byte_length)))
         return result;
     NCRYPT_PROV_HANDLE provider = 0;
     NCRYPT_KEY_HANDLE key = 0;
-    bool valid =
-        NCryptOpenStorageProvider(&provider, MS_KEY_STORAGE_PROVIDER, 0) == ERROR_SUCCESS &&
-        NCryptImportKey(provider, 0, NCRYPT_PKCS8_PRIVATE_KEY_BLOB, NULL, &key,
-                        (PBYTE)private_key->bytes, (DWORD)private_key->byte_length,
-                        NCRYPT_SILENT_FLAG) == ERROR_SUCCESS;
+    WinIdentityKey identity = {0};
+    bool valid;
+    if (opaque) {
+        valid = win_identity_acquire(&identity, private_key);
+        key = identity.key;
+    } else {
+        valid = NCryptOpenStorageProvider(&provider, MS_KEY_STORAGE_PROVIDER, 0) == ERROR_SUCCESS &&
+                NCryptImportKey(provider, 0, NCRYPT_PKCS8_PRIVATE_KEY_BLOB, NULL, &key,
+                                (PBYTE)private_key->bytes, (DWORD)private_key->byte_length,
+                                NCRYPT_SILENT_FLAG) == ERROR_SUCCESS;
+    }
     wchar_t algorithm[64] = {0}, curve[64] = {0};
     DWORD bits = 0, written = 0, hash_size = 0;
     LPCWSTR hash_algorithm = windows_hash(scheme, &hash_size);
@@ -730,7 +738,7 @@ MinyarBytes *minyar_tlsverify_sign(const MinyarBytes *private_key, long long sch
         valid = windows_digest(content, hash_algorithm, hash_size, digest);
     bool rsa = scheme >= 0x0804 && scheme <= 0x0806;
     BCRYPT_PSS_PADDING_INFO padding = {hash_algorithm, hash_size};
-    DWORD flags = rsa ? NCRYPT_PAD_PSS_FLAG : 0, size = 0;
+    DWORD flags = NCRYPT_SILENT_FLAG | (rsa ? NCRYPT_PAD_PSS_FLAG : 0), size = 0;
     if (valid)
         valid = NCryptSignHash(key, rsa ? &padding : NULL, digest, hash_size, NULL, 0, &size,
                                flags) == ERROR_SUCCESS;
@@ -743,7 +751,9 @@ MinyarBytes *minyar_tlsverify_sign(const MinyarBytes *private_key, long long sch
             append_ec_der(result, signature, written);
     }
     free(signature);
-    if (key)
+    if (opaque)
+        win_identity_release(&identity);
+    else if (key)
         NCryptFreeObject(key);
     if (provider)
         NCryptFreeObject(provider);
