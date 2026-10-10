@@ -20,7 +20,7 @@ Worktrees:
 - MORNING draft: /tmp/v2logs/MORNING2.md; summary page: /tmp/v2logs/summary.html
 
 ## In flight
-- /tmp/v2logs/final.sh on v2 5b27714 (summary in /tmp/v2logs/final/summary.log)
+- None. Wrap-up at 09:24: MORNING.md written, v2 pushed with changes 18-19 (35872d9).
 
 ## Next
 1. When final suites are green: push v2, then commit MORNING.md and push again

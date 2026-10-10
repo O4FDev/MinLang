@@ -123,3 +123,19 @@ exchange for supporting cyclic data, so it is left as a decision.
 and it was already pushed to origin on `integrate/desktop-tests-minecraft`, so
 v2 keeps it. Moving it to Git LFS or a separate repository would be a separate
 decision.
+
+## Phase 2 branches (made tonight)
+
+All three are merged into v2; their worktrees can be removed once v2 is reviewed.
+
+| Branch | Worktree | Contents |
+| --- | --- | --- |
+| `perf/macos-list` | `~/Projects/Minyar-Lang-list` | changes 1-12, 15, 16, 18 and 19 in `docs/v2-performance.md`, the review fixes, and the merge of the two below |
+| `perf/craft-frames` | `~/Projects/Minyar-Lang-craft` | Minyarcraft `--benchmark`, cached GL draw state (change 13), the two-comparison guard (change 14) |
+| `perf/text-stream` | `~/Projects/Minyar-Lang-stream` | `macos.textView` and `appendText`, `http` without URL cache, button redraws (change 17) |
+| `port/astra-cycles` | `~/Projects/Minyar-Lang-astra` | the Astra cycle collector on v2 as measured earlier. Not merged |
+| `port/astra-cycles-v2` | `~/Projects/Minyar-Lang-astra-v2` | the same, brought up to v2 a836412 (in-place appended for traced Lists). Not merged: see `research/cycles/README.md` on that branch |
+
+The Atacama app (`~/Projects/Atacama-desktop-app`, made a git repository
+tonight) has `v2-list` (History in `macos.list`) and `v2-stream` (streamed
+answers in `macos.textView`; needs this v2).
