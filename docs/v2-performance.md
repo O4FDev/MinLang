@@ -7,7 +7,7 @@ before/after numbers and the test. Instruction counts are retired
 instructions of the application process (`proc_pid_rusage` or
 `/usr/bin/time -l`). They are steadier than wall time on this shared, heavily
 loaded machine; the load average was 30-76 throughout. By size of gain, the
-largest are 1 (10x), 5 (51x on long Texts), 11 (9x on a long streamed
+largest are 1 (10x), 5 (51x on long Texts), 11 (10x on a long streamed
 answer), 2 (4x), 8 (2x builds) and 4 (-32%).
 
 ## Results
@@ -23,7 +23,7 @@ answer), 2 (4x), 8 (2x builds) and 4 (-32%).
 | 7 | `json.parse` built every string from a parts list, a slice and a join | one slice when a string has no escapes | 20 parses of a 143 KB history response 1.22G | 0.95G | -22% |
 | 8 | Every macOS app build recompiled the Objective-C bridges (`macos.m` 0.46 s, `http.m` 0.12 s) | content-keyed object cache, already used for `graphics.c`, now for every native bridge | Atacama default build 0.93-1.11 s; release app 1.86-2.41 s | 0.48 s; 1.39-1.46 s | about 2x |
 | 9 | Minyarcraft's GPU vertex buffers dominated its memory (40-byte float vertices, six per quad) | 32-byte vertices (Float16 colour and light) and `graphics.updateQuads` (four vertices per quad, shared indices) | peak RSS 602 MB, footprint 892 MB, 17.30G instructions | 419 MB, 697-725 MB, 16.44G | -30% RSS, -5% instructions |
-| 11 | Atacama streaming: the answer label measured, typeset and drew all of its text every frame | `macos.textView` and `appendText` (TextKit 1), no text checking in read-only text, no URL cache in `http` | 12,000-delta answer 123.0G instructions, 14.0-14.2 s CPU; 3,000 deltas 14.3-15.0G | 13.2-14.4G, 4.2-5.4 s CPU; 4.0G | 8.9x; 3.6x |
+| 11 | Atacama streaming: the answer label measured, typeset and drew all of its text every frame | `macos.textView` and `appendText` (TextKit 1), no text checking in read-only text, no URL cache in `http`, buttons skip drawing outside their bounds | 12,000-delta answer 123.0G instructions, 14.0-14.2 s CPU; 3,000 deltas 14.3-15.0G | 11.8-12.3G, 3.3-4.1 s CPU; 3.5-3.7G | 10.2x; 4.0x |
 
 ### 1. Long lists rebuilt as stacks of views
 
@@ -402,7 +402,7 @@ it again. Each frame cost more as the answer grew, so a stream's total grew
 with the square of its length.
 
 **Evidence.** Retired instructions of the app for the stream scenario (3 runs
-each, load average 9-32), by answer length:
+each, load average 4-32), by answer length:
 
 | Deltas (answer size) | Before |
 | ---: | ---: |
@@ -416,7 +416,7 @@ which 130 were drawing the label's text (`__NSStringDrawingEngine`), 52 were
 measuring it (`-[NSTextField intrinsicContentSize]`) and 20 were drawing
 buttons; the other 98 were on network threads.
 
-**Fix.** Three parts, each found by profiling after the one before.
+**Fix.** Four parts, each found by profiling after the one before.
 
 1. `macos.textView(parent, text)` is read-only, selectable text that wraps to
    its width and grows to fit, built on a TextKit 1 layout manager, and
@@ -449,6 +449,18 @@ buttons; the other 98 were on network threads.
    the old build shows `_CFURLCacheFSWriteCachedResponseToFS`). The cache
    cost 0.45G at 3,000 deltas and 8.6G at 12,000: 19 times as much for 4
    times the length.
+4. That left costs that are the same each frame. In a profile of the build
+   with parts 1-3 (12,000 deltas, 3,878 samples), 388 of the main thread's
+   2,423 samples were drawing buttons (`-[NSControl drawRect:]`), although no
+   button changed. A test window showed why: the Copy and Edit prompt buttons
+   sit below the answer, and each time the answer gained a line and pushed
+   them down, AppKit asked each one to draw the strip it had left, a
+   rectangle wholly outside its bounds. Skipping `enabled` calls that change
+   nothing, another layer redraw policy, and ignoring invalidations outside
+   the bounds did not stop it. A button now draws only when the rectangle it
+   is asked to draw meets its bounds. In the test window its cell drawing
+   went from 36 times in 60 appends to none, and the window looked the same,
+   pixel for pixel.
 
 Each step, measured with the app built at that step (3 runs each):
 
@@ -457,23 +469,24 @@ Each step, measured with the app built at that step (3 runs each):
 | Before: label | 14.42G, 14.34G, 15.05G | 122.99G, 122.15G, 124.58G |
 | 1: textView and appendText | 6.06G, 6.28G, 5.97G | 31.76G, 31.29G, 32.29G |
 | 2: and no text checking | 4.48G, 4.46G, 4.45G | 22.26G, 22.83G, 22.33G |
-| 3: and no URL cache (final) | 4.04G, 3.97G, 4.02G | 14.44G, 13.71G, 13.19G |
+| 3: and no URL cache | 4.04G, 3.97G, 4.02G | 14.44G, 13.71G, 13.19G |
+| 4: and no button drawing outside the bounds (final) | 3.75G, 3.54G, 3.55G | 11.95G, 12.34G, 11.80G |
 
 The step 1 runs at 3,000 deltas may have overlapped native GUI tests I was
 running at the time; the others ran alone.
 
-After all three, the main thread's on-CPU samples per 5 seconds stayed flat
+After parts 1-3, the main thread's on-CPU samples per 5 seconds stayed flat
 while a 12,000-delta answer streamed (428, 449, 443, 445, 422), so the cost
 of a frame no longer grows with the answer.
 
 | Deltas | Before | After (3 runs) | Change |
 | ---: | ---: | ---: | ---: |
-| 0 | 0.63G, 0.52G, 0.52G | 0.60G, 0.52G, 0.52G | none |
-| 3,000 | 14.42G, 14.34G, 15.05G (2.15-2.31 s CPU) | 4.04G, 3.97G, 4.02G (1.33-1.49 s) | 3.6x |
-| 12,000 | 122.99G, 122.15G, 124.58G (14.04-14.19 s CPU) | 14.44G, 13.71G, 13.19G (4.20-5.45 s) | 8.9x |
+| 0 | 0.63G, 0.52G, 0.52G | 0.51G, 0.51G, 0.51G | none |
+| 3,000 | 14.42G, 14.34G, 15.05G (2.15-2.31 s CPU) | 3.75G, 3.54G, 3.55G (1.03-1.11 s) | 4.0x |
+| 12,000 | 122.99G, 122.15G, 124.58G (14.04-14.19 s CPU) | 11.95G, 12.34G, 11.80G (3.33-4.05 s) | 10.2x |
 
-Four times the length now costs 3.4 times as much (3.8 times without the
-0.52G that the scenario costs with no answer), about linear, where it cost
+Four times the length now costs 3.3 times as much (3.7 times without the
+0.51G that the scenario costs with no answer), about linear, where it cost
 8.5 times as much before.
 
 **Layout.** The final text is the same: the answer's accessibility value
@@ -496,12 +509,12 @@ measured no longer fitted what it drew. The textView keeps the wrapping that the
 text, and shows all of it. The text is still selectable and copies as plain
 text.
 
-What is left in the profile is constant per frame: Core Animation commits
-(1,182 of 2,423 main-thread samples), much of it redrawing buttons
-(388), the incremental layout of new text (303) and Atacama's render
-(381, mostly the append). The buttons are redrawn every frame although they
-do not change. Skipping `enabled` calls that change nothing did not stop it,
-so that change was not kept.
+What is left is the work of each frame. A profile of the final build
+(12,000 deltas, 2,778 samples) has 1,942 on the main thread: AppKit's display
+cycle 384 (Auto Layout 174, drawing 226, of which the text view 78), the
+background layout of the new text 277, and Atacama's `render` 353 (233 of
+them appending). Button drawing is down to 2 samples. The 834 samples on
+other threads are mostly socket reads for the 12,000 chunks.
 
 **Tests.** `tests/macos-native.m` `verifyTextView` appends 2,000 times to a
 textView in a scroll view. Each append must produce exactly one text-storage
@@ -512,7 +525,10 @@ appended text, alignment, `selectable`, plain-text copy, appending to an
 editor, and the absence of text for text checking are checked too. A misuse
 diagnostic covers `appendText` on a label (`append-type`). Three mutants fail
 it: an append that sets the whole string again, one that invalidates all
-layout, and the view without the text-checking override. `tests/http.min`
+layout, and the view without the text-checking override.
+`verifyMovingButton` pushes a button down by 40 appends to the textView above
+it and requires that its cell is not drawn, then that it is drawn after its
+title changes; it fails without the `drawRect:` check. `tests/http.min`
 fetches a response marked cacheable for ten minutes twice and requires two
 different answers; with the URL cache left on, the second came from the
 cache. `check-macos` (with and without ASan/UBSan), `check-modules`,
