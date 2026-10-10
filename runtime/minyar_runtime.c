@@ -174,7 +174,9 @@ static MINYAR_COLD void minyar_check_stack(uintptr_t current) {
             minyar_stack_limit = minyar_stack_low + MINYAR_STACK_RESERVE_BYTES;
         } else {
             minyar_stack_limit = 0;
-            minyar_call_depth_cap = MINYAR_FALLBACK_CALL_DEPTH;
+            minyar_call_depth_cap = MINYAR_FALLBACK_CALL_DEPTH < MINYAR_MAX_CALL_DEPTH
+                                        ? MINYAR_FALLBACK_CALL_DEPTH
+                                        : MINYAR_MAX_CALL_DEPTH;
         }
     }
     if (minyar_call_depth >= MINYAR_MAX_CALL_DEPTH ||
