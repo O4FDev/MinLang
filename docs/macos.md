@@ -92,6 +92,7 @@ are process-local; do not serialize them or share them between processes.
 | Lists | `list`, `addRow`, `rowCount`, `listLine`, `listColors`, `rowButton`, `clickedRow`, `clickedButton` | View-based NSTableView with reused cells |
 | Interaction | `clickable`, `draggable` | Tracking areas, window dragging, accessibility press |
 | Menus | `menu`, `menuItem`, `menuSeparator` | NSMenu, NSMenuItem, target/action |
+| Menu bar | `statusItem`, `statusMenu`, `statusRemove`, `accessory` | NSStatusItem, accessory activation policy |
 | Events | `eventType`, `eventSource`, `eventText` | Queued delegate and target/action events |
 | System UI | `openFile`, `saveFile`, `alert`, `confirm`, `aboutText`, `showAbout`, `openURL` | NSOpenPanel, NSSavePanel, NSAlert, About panel, NSWorkspace |
 | Application | `appearance`, `isDark`, `setting`, `setSetting`, `resource`, `registerFont`, `seconds` | NSAppearance, NSUserDefaults, NSBundle, CTFontManager |
@@ -254,7 +255,8 @@ This is a public AppKit binding derived from Swift's observable lowering, not a
 replacement implementation of AppKit, a Swift compiler, or general SwiftUI
 interoperability. It supports the APIs listed above. Arbitrary SDK imports,
 Swift generics/closures, WebKit, Metal, accessibility customization,
-notifications and document-controller integration are not part of this package.
+document-controller integration are not part of this package. Notifications,
+login items, power and network status use the separate `desktop` package.
 The separate [experimental SwiftUI compiler target](swiftui.md) explores native
 Swift semantics and direct framework imports; it does not use this binding.
 
@@ -263,6 +265,25 @@ References: Apple's [imported C and Objective-C APIs](https://developer.apple.co
 and [event dispatch](https://developer.apple.com/documentation/appkit/nsapplication/nextevent(matching:until:inmode:dequeue:)).
 
 ## Verification
+
+`macos.shareNetworkLoop(handle)` attaches an `eventloop` reactor to the AppKit
+main run loop. It returns an `errors.IntegerResult`; a closed or stale handle
+is a recoverable failure. Initialize AppKit first. After `macos.nextEvent`, call
+`eventloop.wait(handle, 0, maximum)` or `eventcallbacks.poll` with timeout zero
+and dispatch callbacks on the main thread. `nextEvent` can return with `NONE`
+because network readiness or a timer woke it.
+
+The adapter monitors the reactor's kqueue descriptor with Apple's
+[CFFileDescriptor](https://developer.apple.com/documentation/corefoundation/cffiledescriptor)
+and schedules the earliest monotonic timer with a reusable
+[CFRunLoopTimer](https://developer.apple.com/documentation/corefoundation/cfrunlooptimersetnextfiredate(_:_:)).
+Readiness wakes are one-shot until the owner polls; an application that pauses
+network dispatch cannot accumulate wake events or spin. No managed reference
+or callback crosses a thread. Attaching another loop replaces the previous
+attachment. `unshareNetworkLoop` detaches without closing any socket; closing
+the attached reactor detaches before its descriptor is reused. The compiler
+selects this adapter only when both `macos` and `net` native packages are used.
+Ordinary network builds retain their original layout and instructions.
 
 Run `make check-macos` in a logged-in macOS desktop session. The suite verifies
 Swift selector lowering, actual native target/action and delegate delivery,

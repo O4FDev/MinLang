@@ -1,0 +1,90 @@
+// Socket-independent Windows TLS. Feed ciphertext from TCP/event-loop reads;
+// drain outgoing bytes to the transport. The OS performs the TLS handshake.
+use "errors" as errors
+use "wincert" as certificates
+public record Session { private handle: Integer }
+public record ClientResult { private session: Session; private error: errors.Error }
+public function handshaking(): Integer { return 0 }
+public function open(): Integer { return 1 }
+public function peerClosed(): Integer { return 2 }
+public function failed(): Integer { return 3 }
+function error(encoded: Bytes): errors.Error {
+    if encoded.length < 8 { fail("invalid SChannel result envelope") }
+    if encoded.getUInt32(0) == 0 { return errors.none() }
+    return errors.make(encoded.getUInt32(0),encoded.getInt32(4),"Windows TLS operation failed")
+}
+function scalar(encoded: Bytes): errors.IntegerResult {
+    if encoded.length != 16 { fail("invalid SChannel scalar envelope") }
+    let failure = error(encoded)
+    if errors.isError(failure) { return errors.integerFailure(failure) }
+    return errors.integer(encoded.getInt64(8))
+}
+function bytes(encoded: Bytes): errors.BytesResult {
+    let failure = error(encoded)
+    if errors.isError(failure) { return errors.bytesFailure(failure) }
+    return errors.bytes(encoded.slice(8,encoded.length))
+}
+function roots(trustRoots: List<Bytes>): Bytes {
+    let encoded = Bytes()
+    if trustRoots.length > 16 { return encoded }
+    for certificate in trustRoots {
+        if certificate.length == 0 || certificate.length > 1048571 - encoded.length { return Bytes() }
+        encoded.add((certificate.length >> 16) & 255)
+        encoded.add((certificate.length >> 8) & 255)
+        encoded.add(certificate.length & 255)
+        encoded.addBytes(certificate)
+        encoded.add(0)
+        encoded.add(0)
+    }
+    return encoded
+}
+function start(host: Text, roots: Bytes, signer: Bytes): ClientResult {
+    let result = scalar(clientRaw(host, roots, signer))
+    if !errors.integerOk(result) {
+        return ClientResult { session: Session { handle: 0 }; error: errors.integerError(result) }
+    }
+    return ClientResult { session: Session { handle: errors.integerValue(result) }; error: errors.none() }
+}
+// OS trust roots and OS certificate validation are enabled by default.
+public function client(host: Text): ClientResult { return start(host,Bytes(),Bytes()) }
+public function clientWithTrust(host: Text, trustRoots: List<Bytes>): ClientResult {
+    let encoded = roots(trustRoots)
+    if trustRoots.length == 0 || encoded.length == 0 {
+        return ClientResult { session: Session { handle: 0 };
+            error: errors.make(errors.invalidDataCode(),0,"explicit trust roots must contain bounded DER certificates") }
+    }
+    return start(host,encoded,Bytes())
+}
+// An empty roots list uses OS roots. The selected CNG key remains in its provider.
+public function clientWithIdentity(host: Text, trustRoots: List<Bytes>, identity: certificates.Identity): ClientResult {
+    let encoded = roots(trustRoots)
+    if trustRoots.length != 0 && encoded.length == 0 {
+        return ClientResult { session: Session { handle: 0 };
+            error: errors.make(errors.invalidDataCode(),0,"invalid explicit trust roots") }
+    }
+    return start(host,encoded,certificates.signingReference(identity))
+}
+public function clientOk(result: ClientResult): Boolean { return !errors.isError(result.error) }
+public function clientError(result: ClientResult): errors.Error { return result.error }
+public function clientValue(result: ClientResult): Session {
+    if !clientOk(result) { fail("cannot extract a failed SChannel client") }
+    return result.session
+}
+public function state(session: Session): errors.IntegerResult { return scalar(stateRaw(session.handle)) }
+public function receive(session: Session, ciphertext: Bytes): errors.IntegerResult { return scalar(receiveRaw(session.handle,ciphertext)) }
+public function write(session: Session, plaintext: Bytes): errors.IntegerResult { return scalar(writeRaw(session.handle,plaintext)) }
+public function takeOutgoing(session: Session): errors.BytesResult { return bytes(takeOutgoingRaw(session.handle)) }
+public function takeIncoming(session: Session): errors.BytesResult { return bytes(takeIncomingRaw(session.handle)) }
+// A TCP EOF without authenticated TLS close_notify is a truncation error.
+public function endInput(session: Session): errors.IntegerResult { return scalar(endInputRaw(session.handle)) }
+public function shutdown(session: Session): errors.IntegerResult { return scalar(shutdownRaw(session.handle)) }
+public function close(session: Session): errors.IntegerResult { return scalar(closeRaw(session.handle)) }
+function clientRaw(host: Text, roots: Bytes, signer: Bytes): Bytes { native "schannel" }
+function stateRaw(id: Integer): Bytes { native "schannel" }
+function receiveRaw(id: Integer, data: Bytes): Bytes { native "schannel" }
+function writeRaw(id: Integer, data: Bytes): Bytes { native "schannel" }
+function takeOutgoingRaw(id: Integer): Bytes { native "schannel" }
+function takeIncomingRaw(id: Integer): Bytes { native "schannel" }
+function endInputRaw(id: Integer): Bytes { native "schannel" }
+function shutdownRaw(id: Integer): Bytes { native "schannel" }
+function closeRaw(id: Integer): Bytes { native "schannel" }

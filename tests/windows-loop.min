@@ -1,0 +1,45 @@
+use "windows" as windows
+use "eventloop" as reactor
+use "net" as net
+use "errors" as errors
+windows.initialize("Shared Windows reactor")
+let created = reactor.create()
+if !errors.integerOk(created) { fail("reactor initialization failed") }
+let loop = errors.integerValue(created)
+let shared = windows.shareNetworkLoop(loop)
+if !errors.integerOk(shared) || errors.integerValue(shared) != loop { fail("GUI reactor attachment failed") }
+let invalid = windows.shareNetworkLoop(0)
+if errors.integerOk(invalid) || errors.code(errors.integerError(invalid)) != errors.invalidDataCode() { fail("invalid shared loop accepted") }
+let initial = reactor.wait(loop,0,8)
+if errors.isError(reactor.batchError(initial)) { fail("initial reactor poll failed") }
+let receiver = net.udp("127.0.0.1",0)
+let sender = net.udp("127.0.0.1",0)
+if receiver < 0 || sender < 0 { fail("loopback UDP failed") }
+let watched = reactor.watch(loop,receiver,reactor.readableInterest(),1234)
+if !errors.integerOk(watched) { fail("watch added after GUI attachment failed") }
+if !net.udpConnect(sender,"127.0.0.1",net.localPort(receiver)) { fail("loopback UDP destination failed") }
+let sent = net.sendDatagrams(sender,[Bytes("gui")])
+if !errors.integerOk(sent) || errors.integerValue(sent) != 1 { fail("UDP write failed") }
+if !windows.nextEvent(1.0) { fail("unexpected GUI quit") }
+let batch = reactor.wait(loop,0,8)
+if errors.isError(reactor.batchError(batch)) || reactor.events(batch).length != 1 { fail("GUI socket readiness lost") }
+let event = reactor.events(batch)[0]
+if event.token != 1234 || !reactor.isReadable(event) { fail("wrong socket wake event") }
+let datagrams = net.receiveDatagrams(receiver,1,16)
+if !net.datagramBatchOk(datagrams) || net.datagrams(datagrams).length != 1 { fail("UDP read failed") }
+if Text(errors.bytesValue(net.datagramData(net.datagrams(datagrams)[0]))) != "gui" { fail("UDP data mismatch") }
+let removed = reactor.remove(loop,errors.integerValue(watched))
+if !errors.booleanOk(removed) || !errors.booleanValue(removed) { fail("shared watch removal failed") }
+net.close(receiver)
+net.close(sender)
+let timer = reactor.timer(loop,0,0,9876)
+if !errors.integerOk(timer) { fail("shared timer registration failed") }
+if !windows.nextEvent(0.1) { fail("unexpected timer quit") }
+let timers = reactor.wait(loop,0,8)
+if errors.isError(reactor.batchError(timers)) || reactor.events(timers).length != 1 { fail("GUI timer lost") }
+if !reactor.isTimer(reactor.events(timers)[0]) || reactor.events(timers)[0].token != 9876 { fail("wrong timer wake") }
+let closed = reactor.close(loop)
+if !errors.booleanOk(closed) || !errors.booleanValue(closed) { fail("shared reactor cleanup failed") }
+let detached = windows.unshareNetworkLoop()
+if !errors.integerOk(detached) || errors.integerValue(detached) != 0 { fail("closed reactor remained attached") }
+print("Windows shared reactor Minyar contracts verified")

@@ -1,0 +1,39 @@
+// macOS identities stay in Keychain. The signer reference contains no private
+// key material; tls.clientWithIdentity accepts it in place of a PKCS#8 key.
+use "errors" as errors
+use "tlsverify" as trust
+public record Identity {
+    private certificate: Bytes
+    private signer: Bytes
+}
+public record Lookup {
+    private identity: Identity
+    private error: errors.Error
+}
+// Exact public certificate subject summary. Multiple matches fail rather than
+// choosing an arbitrary device identity. Empty store uses the OS search list.
+public function findIdentity(subject: Text, store: Text): Lookup {
+    let encoded = identity(subject, store)
+    if encoded.length < 16 { fail("invalid Keychain identity envelope") }
+    if encoded.getUInt32(0) != 0 {
+        return Lookup { identity: Identity { certificate: Bytes(); signer: Bytes() }; error: errors.make(errors.permissionDeniedCode(), encoded.getInt32(4), "Keychain identity lookup failed") }
+    }
+    let certificateLength = encoded.getUInt32(8)
+    let signerLength = encoded.getUInt32(12)
+    if certificateLength + signerLength + 16 != encoded.length { fail("invalid Keychain identity lengths") }
+    return Lookup { identity: Identity { certificate: encoded.slice(16, 16 + certificateLength); signer: encoded.slice(16 + certificateLength, encoded.length) }; error: errors.none() }
+}
+public function found(lookup: Lookup): Boolean { return !errors.isError(lookup.error) }
+public function lookupError(lookup: Lookup): errors.Error { return lookup.error }
+public function value(lookup: Lookup): Identity {
+    if !found(lookup) { fail("cannot extract a failed Keychain lookup") }
+    return lookup.identity
+}
+public function certificate(identity: Identity): Bytes { return identity.certificate }
+public function signingReference(identity: Identity): Bytes { return identity.signer }
+public function sign(identity: Identity, scheme: Integer, message: Bytes): errors.BytesResult {
+    let result = trust.sign(identity.signer, scheme, message)
+    if result.length == 0 { return errors.bytesFailure(errors.make(errors.permissionDeniedCode(), 0, "Keychain signing failed")) }
+    return errors.bytes(result)
+}
+function identity(subject: Text, store: Text): Bytes { native "keychain" }

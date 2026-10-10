@@ -61,6 +61,16 @@ check-runtime-unit: build/runtime-unit
 check-modules: build/minyarc build/minyar-runtime.o
 	$(LIMITED) sh tests/run-module-tests.sh
 
+.PHONY: check-json-parser check-json-parser-sanitize
+check-json-parser: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/json-parser.py
+
+check-json-parser-sanitize: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/json-parser.py --sanitize
+
+check check-portable: check-json-parser
+check-sanitize: check-json-parser-sanitize
+
 .PHONY: check-module-performance
 check-module-performance: build/minyarc build/minyar-runtime.o
 	$(LIMITED) python3 tests/module-performance.py

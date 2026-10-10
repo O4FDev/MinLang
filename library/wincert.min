@@ -1,0 +1,36 @@
+// Windows certificate-store identities. CNG private keys stay inside their OS
+// provider (software KSP, TPM or other configured provider). No key is exported.
+use "errors" as errors
+use "tlsverify" as trust
+public record Identity { private certificate: Bytes; private signer: Bytes }
+public record Lookup { private identity: Identity; private error: errors.Error }
+// Select exactly by lowercase SHA256 of public certificate DER, never by a
+// potentially ambiguous display name. Typical store is "My", current user.
+public function findIdentity(fingerprint: Text, store: Text, machineStore: Boolean): Lookup {
+    let encoded = identity(fingerprint, store, machineStore)
+    if encoded.length < 16 { fail("invalid Windows identity envelope") }
+    if encoded.getUInt32(0) != 0 {
+        return Lookup { identity: Identity { certificate: Bytes(); signer: Bytes() };
+            error: errors.make(encoded.getUInt32(0), encoded.getInt32(4), "Windows certificate identity lookup failed") }
+    }
+    let certLength = encoded.getUInt32(8)
+    let referenceLength = encoded.getUInt32(12)
+    if certLength + referenceLength + 16 != encoded.length { fail("invalid Windows identity envelope lengths") }
+    return Lookup { identity: Identity { certificate: encoded.slice(16,16+certLength);
+        signer: encoded.slice(16+certLength,encoded.length) }; error: errors.none() }
+}
+public function found(lookup: Lookup): Boolean { return !errors.isError(lookup.error) }
+public function lookupError(lookup: Lookup): errors.Error { return lookup.error }
+public function value(lookup: Lookup): Identity {
+    if !found(lookup) { fail("cannot extract a failed Windows identity lookup") }
+    return lookup.identity
+}
+public function certificate(identity: Identity): Bytes { return identity.certificate }
+// Supply this reference to tls.clientWithIdentity alongside certificate DER.
+public function signingReference(identity: Identity): Bytes { return identity.signer }
+public function sign(identity: Identity, scheme: Integer, message: Bytes): errors.BytesResult {
+    let signature = trust.sign(identity.signer, scheme, message)
+    if signature.length == 0 { return errors.bytesFailure(errors.make(errors.permissionDeniedCode(),0,"CNG signing failed or requires interaction")) }
+    return errors.bytes(signature)
+}
+function identity(fingerprint: Text, store: Text, machineStore: Boolean): Bytes { native "wincert" }

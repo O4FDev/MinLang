@@ -15,10 +15,12 @@ WINDOWS = windows_host()
 
 def main():
     with tempfile.TemporaryDirectory(prefix='net-loop-', dir=ROOT / 'build') as temporary:
-        for mode in (['native'] if WINDOWS else ['native', 'sanitize']):
+        for mode in (['native'] if WINDOWS else ['native', 'sanitize', 'app-native', 'app-sanitize']):
             executable = Path(temporary) / (mode + ('.exe' if WINDOWS else ''))
-            flags = ['-O2'] if mode == 'native' else [
+            flags = ['-O2'] if mode.endswith('native') else [
                 '-O1', '-g', '-fsanitize=address,undefined', '-fno-omit-frame-pointer']
+            if mode.startswith('app-'):
+                flags += ['-DMINYAR_APP_EVENT_LOOP=1']
             command = [CLANG, '-std=c11', '-D_GNU_SOURCE', '-DMINYAR_SYSTEM_HEAP=1',
                        '-Wall', '-Wextra', '-Werror', *flags,
                        str(ROOT / 'tests/net-loop.c'), str(ROOT / 'runtime/minyar_runtime.c'),
