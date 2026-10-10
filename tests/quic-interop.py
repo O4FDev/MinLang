@@ -7,19 +7,38 @@ import argparse, json, os, platform, re, subprocess, sys, time
 from pathlib import Path
 
 def command(args, **kwargs):return subprocess.run(args,check=True,**kwargs)
+def network_namespace(data):
+    # Pin the namespace itself: Docker's PID can exit and be reused between
+    # inspect and nsenter. Never configure the host namespace, even on a race.
+    if data['HostConfig'].get('NetworkMode') == 'host':
+        raise RuntimeError('host network mode is forbidden')
+    pid=data['State']['Pid']
+    if not isinstance(pid,int) or pid<=0:raise RuntimeError('endpoint has no running namespace')
+    descriptor=os.open(f'/proc/{pid}/ns/net',os.O_RDONLY|os.O_CLOEXEC)
+    try:
+        actual=os.fstat(descriptor);host=os.stat('/proc/self/ns/net')
+        if (actual.st_dev,actual.st_ino)==(host.st_dev,host.st_ino):
+            raise RuntimeError('endpoint namespace equals host namespace')
+        return descriptor
+    except BaseException:
+        os.close(descriptor);raise
 def configure(node):
     data=json.loads(subprocess.check_output(['docker','inspect',node],stderr=subprocess.DEVNULL))[0]
     pid=data['State']['Pid']
     if not pid:return None
     if data['Config']['User']!='65534:65534' or data['HostConfig'].get('CapAdd'):
         raise RuntimeError(f'{node} must have a nonroot user and no additional capabilities')
-    network=f'193.167.{100 if node=="server" else 0}.2'
-    command(['nsenter','-t',str(pid),'-n','ip','-4','route','replace','default','via',network],stdout=subprocess.DEVNULL)
-    v6=f'fd00:cafe:cafe:{100 if node=="server" else 0}::2'
-    command(['nsenter','-t',str(pid),'-n','ip','-6','route','replace','default','via',v6],stdout=subprocess.DEVNULL)
-    # Same checksum setting as the upstream /setup.sh: ns3 requires complete
-    # UDP checksums, whereas Docker's veth defaults to transmit offloading.
-    command(['nsenter','-t',str(pid),'-n','ethtool','-K','eth0','tx','off'],stdout=subprocess.DEVNULL)
+    namespace=network_namespace(data)
+    try:
+        enter=['nsenter',f'--net=/proc/self/fd/{namespace}']
+        network=f'193.167.{100 if node=="server" else 0}.2'
+        command([*enter,'ip','-4','route','replace','default','via',network],pass_fds=(namespace,),stdout=subprocess.DEVNULL)
+        v6=f'fd00:cafe:cafe:{100 if node=="server" else 0}::2'
+        command([*enter,'ip','-6','route','replace','default','via',v6],pass_fds=(namespace,),stdout=subprocess.DEVNULL)
+        # Same checksum setting as upstream /setup.sh, in the pinned endpoint
+        # namespace only. ns3 needs complete UDP checksums.
+        command([*enter,'ethtool','-K','eth0','tx','off'],pass_fds=(namespace,),stdout=subprocess.DEVNULL)
+    finally:os.close(namespace)
     for mount in data['Mounts']:
         if mount['Destination'] not in ('/certs','/www','/downloads'):raise RuntimeError('unexpected endpoint mount')
         path=Path(mount['Source']).resolve()
@@ -30,7 +49,7 @@ def configure(node):
             if entry.is_symlink():raise RuntimeError('unexpected fixture symlink')
             if entry.is_dir():os.chmod(entry,0o755)
             elif mount['Destination']!='/downloads':os.chmod(entry,0o444)
-    command(['docker','exec','--user','65534:65534',node,'sh','-c','mkdir -p /logs/qlog && touch /tmp/network-ready'],stdout=subprocess.DEVNULL)
+    command(['docker','exec','--user','65534:65534',data['Id'],'sh','-c','mkdir -p /logs/qlog && touch /tmp/network-ready'],stdout=subprocess.DEVNULL)
     return data['Id']
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--runner',required=True);parser.add_argument('--artifacts',required=True);parser.add_argument('--servers',default='minyar');parser.add_argument('--clients',default='minyar,quiche,ngtcp2,msquic');parser.add_argument('--tests',default='handshake,transfer');parser.add_argument('--must-include',default='minyar');options=parser.parse_args()
@@ -48,11 +67,12 @@ def main():
     # Apply only endpoint capability removals; the official simulator retains
     # its required NET_ADMIN/NET_RAW. Host nsenter handles endpoint routing.
     compose=runner/'docker-compose.yml'; original=compose.read_text(); original=original.replace('    cap_add:\n      - NET_ADMIN\n    ulimits:', '    ulimits:');compose.write_text(original)
-    image_tags={'quiche':'minyar-quiche:lab','ngtcp2':'minyar-ngtcp2:lab','msquic':'minyar-msquic:lab'}
+    image_tags={'quiche':'minyar-quiche:lab','ngtcp2':os.environ.get('MINYAR_NGTCP2_IMAGE','minyar-ngtcp2:lab'),'msquic':'minyar-msquic:lab'}
     replacements=','.join(f'{name}={image}' for name,image in image_tags.items())
     environment=dict(os.environ,TMPDIR=str(temporary),PYTHONUNBUFFERED='1')
     logs=artifacts/'runner.log'
-    invocation=[sys.executable,str(runner/'run.py'),'-s',options.servers,'-c',options.clients,'-i',options.must_include,'-t',options.tests,'-r',replacements,'-j',str(artifacts/'matrix.json'),'-l',str(artifacts/'logs'),'-n','minyar,quiche,ngtcp2,msquic']
+    selected=','.join(sorted(set((options.servers+','+options.clients).split(','))))
+    invocation=[sys.executable,str(runner/'run.py'),'-s',options.servers,'-c',options.clients,'-i',options.must_include,'-t',options.tests,'-r',replacements,'-j',str(artifacts/'matrix.json'),'-l',str(artifacts/'logs'),'-n',selected]
     started=time.monotonic();configured=set()
     with logs.open('w') as output:
         process=subprocess.Popen(invocation,cwd=runner,env=environment,stdout=output,stderr=subprocess.STDOUT)

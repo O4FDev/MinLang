@@ -25,8 +25,9 @@ transport; it requires the caller to open the replacement socket.
 - Ordered bidirectional/unidirectional streams, bounded offset reassembly,
   duplicate handling, conflicting buffered-byte detection, final-size checks,
   stream and connection flow control, and recoverable backpressure.
-- ACK ranges, RTT estimation, packet/time loss thresholds, retransmission under
-  fresh packet numbers, PTO probes, and CUBIC congestion window calculations.
+- ACK ranges, RTT estimation, packet/time loss deadlines, retransmission under
+  fresh packet numbers, PTO probes, CUBIC congestion window calculations, and
+  token-bucket pacing with two-MTU confirmed bursts and recovery buffer credit.
 - Application key updates with handshake/ACK gating, unchanged header
   protection keys, phase wrap, bounded retention of old read keys, precomputed
   next read keys, and per-key AES confidentiality usage limits.
@@ -82,6 +83,14 @@ without decrypting or parsing frames. This result does not authenticate a peer.
 New connection allocation still needs Initial bounds, amplification limits,
 and a separately bounded dispatcher.
 
+`quicdispatch` supplies a bounded SipHash-2-4 CID table and indexed timer heap.
+Use a fresh 16-byte random table key, stable connection slot IDs, and
+`lookup`/`insert`/`remove` plus `schedule`/`cancel`/`takeDue`/`nextDeadline`.
+Removal reuses slots; repeated timer updates retain one node per connection.
+The remote soak fixture uses these structures and only polls peers with input
+or due timers. `quic.release` clears retained state after closing completes;
+it rejects live connections. Idle expiry silently closes, per RFC 9000.
+
 `transport.client` / `serverQUIC` / `serverTCP` expose `receiveUDP`, `pollUDP`,
 `receiveTCP`, `pollTCP`, `tick`, and `nextTimer`. On `TCP_NEEDED`, open a fresh
 TCP socket and call `startTCP` with fresh entropy. TCP negotiates the configured
@@ -125,7 +134,7 @@ Yamux also retains at most 128 stream records and bounds connection buffers to
 1 MiB. Long-lived applications should reuse streams; stream-record reclamation
 and arbitrary stream churn still need implementation and measurement.
 Persistent-congestion and idle CUBIC helpers exist, but full integration,
-pacing, ECN, and BBR remain outstanding. Closing currently sends a bounded
+ECN, and BBR remain outstanding. Closing currently sends a bounded
 close packet; the full three-PTO closing/draining state is unfinished.
 
 The macOS AES provider uses CommonCrypto's CPU-dispatched AES block primitive

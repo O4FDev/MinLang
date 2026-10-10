@@ -45,6 +45,7 @@ public record Connection {
     addressValidated: Boolean; confirmed: Boolean; lastActivity: Integer; now: Integer
     earlyWrite: protection.Keys; earlyRead: protection.Keys; earlyRejected: Boolean; earlyStreams: List<Integer>; earlyData: Integer; earlyPackets: Integer
     closing: Boolean
+    paceCredit: Float; paceAt: Integer; paceNext: Integer
     ackExponent: Integer; idleTimeout: Integer; failedAuthentication: Integer
     activePath: Integer; incomingPath: Integer; paths: List<Path>; outgoingPaths: List<Integer>; peerDisabledMigration: Boolean
 }
@@ -95,6 +96,7 @@ function create(entropy: Bytes, original: Bytes, client: Boolean): Connection {
         addressValidated: client; confirmed: false; lastActivity: -1; now: -1
         earlyWrite: protection.traffic(1, 0, Bytes()); earlyRead: protection.traffic(1, 0, Bytes()); earlyRejected: false; earlyStreams: []; earlyData: 0; earlyPackets: 0
         closing: false
+        paceCredit: 12000.0; paceAt: -1; paceNext: -1
         ackExponent: 3; idleTimeout: 45000; failedAuthentication: 0
         activePath: 0; incomingPath: 0; paths: [Path { id: 0; validated: client; eligible: true; challenge: Bytes(); deadline: -1; attempts: 0; received: 0; sent: 0 }]; outgoingPaths: []; peerDisabledMigration: false
     }
@@ -545,7 +547,15 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
             else { path.challenge = Bytes(); path.deadline = -1 }
         }
     }
-    if !connection.closing && now - connection.lastActivity >= connection.idleTimeout { terminate(connection, 0, "QUIC idle timeout"); return outgoing }
+    if !connection.closing && now - connection.lastActivity >= connection.idleTimeout {
+        // RFC9000 idle expiry discards the connection without a close packet.
+        connection.state = CLOSED; connection.pending = []; connection.closing = false; return outgoing
+    }
+    let burst = min(connection.congestion.window, 10 * connection.congestion.mtu)
+    if connection.confirmed { burst = min(burst, 2 * connection.congestion.mtu) }
+    let paceRate = 1.25 * Float(connection.congestion.window) / Float(max(1,connection.congestion.smoothed))
+    if connection.paceAt >= 0 { connection.paceCredit += Float(now - connection.paceAt) * paceRate }
+    connection.paceCredit = min(Float(burst),connection.paceCredit); connection.paceAt = now; connection.paceNext = -1
     for level in 0..3 {
         let space = connection.spaces[level]
         if !space.active { continue }
@@ -603,6 +613,12 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
            (ackEliciting && !pending.probe && size > connection.congestion.window - connection.flight) {
             unsent.add(pending); continue
         }
+        if ackEliciting && !pending.probe && Float(size) > connection.paceCredit {
+            let wait = max(1,Integer((Float(size) - connection.paceCredit) / paceRate + 0.999999))
+            let deadline = now + wait
+            if connection.paceNext < 0 { connection.paceNext = deadline } else { connection.paceNext = min(connection.paceNext,deadline) }
+            unsent.add(pending); continue
+        }
         if space.next > 0xffffffff { terminate(connection, 15, "QUIC packet number budget exhausted"); return [] }
         if level == 3 && connection.earlyPackets >= (1 << 23) { terminate(connection, 15, "QUIC early AEAD key usage limit reached"); return [] }
         if level != 3 && space.write.suite == protection.AES128_GCM && space.writePackets >= (1 << 23) {
@@ -613,6 +629,7 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
         if !errors.bytesOk(encrypted) { terminate(connection, 1, errors.message(errors.bytesError(encrypted))); return [] }
         outgoing.add(errors.bytesValue(encrypted)); connection.outgoingPaths.add(route); connection.sentBytes += size; path.sent += size
         if ackEliciting {
+            connection.paceCredit = max(0.0,connection.paceCredit - Float(size))
             if space.sent.length >= 4096 { terminate(connection, 1, "QUIC outstanding packet limit exceeded"); return [] }
             space.sent.add(Sent { number: space.next; time: now; bytes: size; payload: pending.payload; path: pending.path; level: level })
             connection.flight += size
@@ -630,6 +647,7 @@ function advanceWrite(connection: Connection, space: Space) {
     space.write = protection.update(space.write); space.writeGeneration += 1; space.writeFirst = space.next; space.writePackets = 0; space.writeUpdatedAt = connection.now
 }
 public function updateKeys(connection: Connection): errors.BooleanResult {
+    if connection.state != ESTABLISHED { return errors.booleanFailure(errors.make(errors.unavailableCode(),0,"QUIC key update awaits authentication")) }
     let space = connection.spaces[2]
     if connection.state != ESTABLISHED || !connection.confirmed || space.largestAck < space.writeFirst || space.writeGeneration > space.readGeneration ||
        (space.writeUpdatedAt >= 0 && connection.now - space.writeUpdatedAt < 3 * recovery.pto(connection.congestion, true)) {
@@ -647,7 +665,11 @@ public function nextTimer(connection: Connection): Integer {
     if connection.state == FAILED || connection.state == CLOSED { return -1 }
     if connection.now < 0 { return 0 }
     let deadline = connection.lastActivity + connection.idleTimeout
-    for space in connection.spaces { if space.active && space.sent.length > 0 && space.probe >= 0 { deadline = min(deadline, space.probe) } }
+    if connection.paceNext >= 0 { deadline = min(deadline,connection.paceNext) }
+    for space in connection.spaces {
+        if space.active && space.sent.length > 0 && space.probe >= 0 { deadline = min(deadline,space.probe) }
+        if space.active { for sent in space.sent { if sent.number <= space.largestAck { deadline = min(deadline,sent.time + recovery.lossDelay(connection.congestion)) } } }
+    }
     for path in connection.paths { if path.deadline >= 0 { deadline = min(deadline, path.deadline) } }
     return deadline
 }
@@ -726,7 +748,11 @@ function write(connection: Connection, id: Integer, data: Bytes, fin: Boolean, e
     let output = connection.streams[index]
     if output.sendClosed || (!localInitiated(connection, id) && (id & 2) != 0) { return errors.integerFailure(errors.make(errors.closedCode(), 0, "QUIC stream is send-closed")) }
     let count = min(data.length, min(output.sendLimit - output.sendOffset, connection.peerMaxData - connection.sentData))
-    if count < data.length || data.length > 1048576 || connection.pending.length + (data.length + 999) / 1000 > 4096 { return errors.integerFailure(errors.make(errors.wouldBlockCode(), 0, "QUIC flow credit or send buffer exhausted")) }
+    let retained = connection.pending.length
+    for space in connection.spaces { retained += space.sent.length }
+    // Application data leaves room for recovery/control packets. Checking only
+    // pending data lets a full queue fail when in-flight packets need retry.
+    if count < data.length || data.length > 1048576 || retained + (data.length + 999) / 1000 > 3072 { return errors.integerFailure(errors.make(errors.wouldBlockCode(), 0, "QUIC flow credit or send buffer exhausted")) }
     let at = 0
     while at < count || (fin && count == 0) {
         let length = min(1000, count - at); let type = 14
@@ -763,4 +789,14 @@ public function close(connection: Connection, code: Integer, reason: Bytes): err
     let frame = Bytes(); add(frame, 29); add(frame, code); add(frame, reason.length); frame.addBytes(reason)
     enqueue(connection, 2, frame, false); connection.closing = true
     return errors.boolean(true)
+}
+// Release buffers and secrets after the caller finishes closing packets.
+public function release(connection: Connection): Boolean {
+    if (connection.state != CLOSED && connection.state != FAILED) || connection.closing { return false }
+    connection.clientTLS = tls.none(); connection.serverTLS = tlsserver.none()
+    connection.spaces = []; connection.pending = []; connection.streams = []; connection.remoteIds = []
+    connection.paths = []; connection.outgoingPaths = []; connection.earlyStreams = []
+    connection.earlyWrite = protection.traffic(1,0,Bytes()); connection.earlyRead = protection.traffic(1,0,Bytes())
+    connection.originalDestination = Bytes(); connection.local = Bytes(); connection.remote = Bytes(); connection.peerSource = Bytes()
+    return true
 }
