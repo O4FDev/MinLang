@@ -145,6 +145,38 @@ Path(os.environ['TEST_MAKE_LOG']).write_text(json.dumps({name: os.environ.get(na
                          ['-flto=thin', '-fuse-ld=' + str(linker.resolve()), '-Wl,--threads=1'])
         self.assertEqual(environment['LIMITED'], self.env['LIMITED'])
 
+    def test_windows_release_discovers_native_lld_exe_without_changing_explicit_linker(self):
+        spec = importlib.util.spec_from_file_location('driver', ROOT / 'tools/clang-driver.py')
+        driver = importlib.util.module_from_spec(spec); spec.loader.exec_module(driver)
+        linker = self.clang.parent / 'ld.lld.exe'
+        self.write_executable(linker, 'pass\n')
+        for system in ('Windows', 'MSYS_NT-10.0', 'MINGW64_NT-10.0'):
+            with self.subTest(system=system), patch.object(driver.platform,'system',return_value=system), \
+                 patch.object(driver.shutil,'which',side_effect=lambda name: str(self.clang) if name=='clang' else None):
+                self.assertEqual(driver.lto_flags('clang', []),
+                    ['-flto=thin', '-fuse-ld=' + str(linker.resolve())])
+                self.assertEqual(driver.lto_flags('clang', ['-fuse-ld=/chosen/linker']), ['-flto=thin'])
+                self.assertEqual(driver.lto_flags('clang', ['--ld-path=/chosen/linker']), ['-flto=thin'])
+
+    def test_openssl_subject_exclusion_is_visible_to_msys_spawn_and_restores_parent(self):
+        spec = importlib.util.spec_from_file_location('tls_local', ROOT / 'tests/tls-local.py')
+        tls = importlib.util.module_from_spec(spec); spec.loader.exec_module(tls)
+        for existing in (None, '--keep=', '*'):
+            with self.subTest(existing=existing), patch.dict(os.environ, {}, clear=True):
+                if existing is not None: os.environ['MSYS2_ARG_CONV_EXCL'] = existing
+                def spawn(command, **kwargs):
+                    exclusions = os.environ.get('MSYS2_ARG_CONV_EXCL','').split(';')
+                    self.assertTrue('/CN=' in exclusions or '*' in exclusions)
+                    self.assertEqual(command[command.index('-subj')+1], '/CN=root')
+                    return subprocess.CompletedProcess(command,0,'','')
+                with patch.object(tls.subprocess,'run',side_effect=spawn):
+                    tls.openssl('req','-subj','/CN=root')
+                self.assertEqual(os.environ.get('MSYS2_ARG_CONV_EXCL'),existing)
+                with patch.object(tls.subprocess,'run',side_effect=subprocess.TimeoutExpired('openssl',30)):
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        tls.openssl('req','-subj','/CN=root')
+                self.assertEqual(os.environ.get('MSYS2_ARG_CONV_EXCL'),existing)
+
     def test_bootstrap_preserves_explicit_limits_lto_and_linker_threads(self):
         self.write_executable(self.clang.parent / 'ld.lld', 'pass\n')
         configured = '-flto=thin ' + shlex.quote('-fuse-ld=/linker path/ld.lld') + ' -Wl,--threads=3'

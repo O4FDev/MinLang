@@ -163,10 +163,14 @@ def lto_flags(clang, link_flags):
     # Linux's default GNU linker needs an optional LLVMgold plugin for LTO.
     # Prefer the toolchain's lld when available unless the user chose a linker.
     if platform.system() != 'Darwin' and not any(a.startswith(('-fuse-ld=', '--ld-path=')) for a in link_flags):
-        sibling = Path(shutil.which(clang) or clang).resolve().parent / 'ld.lld'
-        if sibling.is_file():
+        system = platform.system()
+        windows = system == 'Windows' or system.startswith(('MSYS', 'MINGW', 'CYGWIN'))
+        names = ('ld.lld.exe', 'ld.lld') if windows else ('ld.lld',)
+        directory = Path(shutil.which(clang) or clang).resolve().parent
+        sibling = next((directory / name for name in names if (directory / name).is_file()), None)
+        if sibling is not None:
             lto += ['-fuse-ld=' + str(sibling)]
-        elif shutil.which('ld.lld'):
+        elif any(shutil.which(name) for name in names):
             lto += ['-fuse-ld=lld']
     return lto
 

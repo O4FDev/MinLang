@@ -20,12 +20,18 @@ BODY = 'Minyar spoke authenticated TLS 1.3: ' + 'é' * 3 + ' ' + 'x' * 40000
 
 
 def openssl(*args):
-    environment = os.environ.copy()
     # MSYS2 must convert fixture paths for native OpenSSL, but a /CN= subject
-    # is certificate syntax, not a drive-relative filesystem path.
-    existing = environment.get('MSYS2_ARG_CONV_EXCL', '')
-    environment['MSYS2_ARG_CONV_EXCL'] = (existing + ';' if existing else '') + '/CN='
-    result = subprocess.run(['openssl', *map(str, args)], capture_output=True, text=True, timeout=30, env=environment)
+    # is certificate syntax, not a drive-relative filesystem path. The MSYS
+    # spawn layer reads the PARENT environment before creating the child.
+    existing = os.environ.get('MSYS2_ARG_CONV_EXCL')
+    os.environ['MSYS2_ARG_CONV_EXCL'] = '*' if existing == '*' else (existing + ';' if existing else '') + '/CN='
+    try:
+        result = subprocess.run(['openssl', *map(str, args)], capture_output=True, text=True, timeout=30)
+    finally:
+        if existing is None:
+            os.environ.pop('MSYS2_ARG_CONV_EXCL', None)
+        else:
+            os.environ['MSYS2_ARG_CONV_EXCL'] = existing
     if result.returncode:
         raise RuntimeError(result.stderr[-2000:])
 
