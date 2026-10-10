@@ -1046,6 +1046,17 @@ v2 and passes now.
   `alwaysinline` in the emitted IR took the world build from 15.65G to 14.87G
   (-5%) and an `edit` run from 42.29G to 40.47G. Change 12 and the frameless
   call trees described there address the larger cost around it.
+- **The default memory profile for allocation-heavy code.** A sample of
+  the JSON history benchmark (2,000 parses) puts about 35% of its time in
+  `malloc`/`free` and about 26% in bounded reclamation (`rc_bounded_poll_work`,
+  the object units and `rc_drop`); `parseString` itself is 14%. By memory
+  profile (`./minyar --release --memory-profile ...`, 500 runs x 20, 3 runs
+  each): `system`, the default, 805.3-805.6M instructions; `lazy`
+  603.0-604.7M (-25%); `eager` 465.4-468.3M (-42%), with peak footprints
+  within 2.65-2.97 MB for all three. Minyarcraft's world build barely
+  differs (`system` 9.54-9.64G, `lazy` 9.51G, `eager` 9.36G). The default
+  trades throughput for bounded pauses, which is a decision for the memory
+  research rather than a fix for tonight.
 
 ## Measured and not a bottleneck
 
