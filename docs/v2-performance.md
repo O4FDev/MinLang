@@ -350,6 +350,16 @@ merged into v2 but not pushed; the suite run on it was stopped.
 
 ## Measured and not a bottleneck
 
+- **Atacama start-up.** Launch, session check, loading and parsing 500 runs,
+  and the first render: about 2.04G instructions and 0.31 s of CPU, the same
+  before and after tonight's changes. AppKit set-up dominates, and the
+  history parse is about 3% of it. The driver's `startup` scenario measures
+  this.
+- **Atacama build after a one-line change.** The front end takes about 0.02 s,
+  so an incremental front end would not help. What is left after change 8 is
+  clang: about 0.4 s for a default build, and about 1 s more for `--release`
+  LTO.
+
 - **Compile times.** Front-end compile of real programs, in retired
   instructions: the compiler itself (6,159 lines) 92M; Minyarcraft 110M;
   the Minyar-OS kernel 495M; Atacama 81M. End-to-end `./minyar` builds,
