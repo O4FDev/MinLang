@@ -49,6 +49,13 @@ from a rejected result traps as a programmer mistake. An empty/malformed token,
 unknown key, malformed UTF-8 or duplicate decoded JSON member returns a failure
 without trapping.
 
+`grantBytes` returns the exact verified compact JWT for forwarding to the agent,
+which must independently verify the gateway signature. The verifier retains a
+private copy only after successful verification, and the getter returns a copy;
+mutating either the original input or a returned buffer cannot change that
+retained signed token. The getter traps on a rejected grant like all other
+success getters.
+
 The protected header requires `alg=EdDSA`, `typ=hearth-dial-grant` and a known
 `kid`, and rejects unsupported JOSE extensions or embedded keys. Public JWKS
 entries require `kty=OKP`, `crv=Ed25519`, a unique nonempty `kid`, canonical

@@ -217,6 +217,13 @@ def main():
         check('empty key list', bundle=b'{"keys":[]}')
         check('too many keys', bundle=compact({'keys': [dict(good_key, kid='pop-' + str(i)) for i in range(65)]}))
         check('wrong use of failed result traps', b'bad', trap=True)
+        (directory / 'keys').write_bytes(jwks()); (directory / 'grant').write_bytes(token())
+        command = [str(binary), 'forward', str(directory / 'keys'), str(directory / 'grant'), 'exit-a', 'exit-a', 'conn-1', '1000', '1060']
+        assert subprocess.check_output(command, env=env).strip() == b'FORWARDED ' + token(), 'verified token was not forwarded byte-exact with copy isolation'
+        (directory / 'grant').write_bytes(b'bad')
+        command[1] = 'trap-token'
+        rejected = subprocess.run(command, env=env, capture_output=True, text=True)
+        assert rejected.returncode != 0 and 'cannot read a rejected grant' in rejected.stderr, 'failed token getter must remain a programmer trap'
         signing = b'eyJhbGciOiJFZERTQSJ9.RXhhbXBsZSBvZiBFZDI1NTE5IHNpZ25pbmc'
         sig = bytes.fromhex('860c98d2297f3060a33f42739672d61b53cf3adefed3d3c672f320dc021b411e9d59b8628dc351e248b88b29468e0e41855b0fb7d83bb15be902bfccb8cd0a02')
         assert KEY.sign(signing) == sig, 'independent signer disagrees with fixed RFC 8037 fixture'
