@@ -23,15 +23,15 @@ def main():
         temp = Path(directory)
         fixtures = [
             ('windows-notifications', ['-DMINYAR_NOTIFY_TEST=1', '-DNOTICE_LIMIT=8', '-DACTION_QUEUE_LIMIT=2'], ['winnotify.c', 'windows.c'],
-             ['user32', 'gdi32', 'shell32', 'advapi32', 'ole32', 'uuid', 'bcrypt', 'runtimeobject']),
+             ['user32', 'gdi32', 'shell32', 'comctl32', 'advapi32', 'ole32', 'uuid', 'bcrypt', 'runtimeobject']),
             ('windows-certificate', [], ['wincert.c', 'tlsverify.c'],
              ['crypt32', 'ncrypt', 'bcrypt', 'ws2_32']),
             ('windows-desktop', ['-DMINYAR_DESKTOP_TEST=1'], ['desktop.c', 'winnotify.c'],
              ['user32', 'shell32', 'advapi32', 'ole32', 'oleaut32', 'iphlpapi', 'uuid', 'ws2_32', 'bcrypt', 'runtimeobject']),
             ('windows-native', ['-DMINYAR_WINDOWS_TEST=1'], ['windows.c'],
-             ['user32', 'gdi32', 'shell32']),
+             ['user32', 'gdi32', 'shell32', 'comctl32']),
             ('windows-loop', ['-DMINYAR_WINDOWS_TEST=1', '-DMINYAR_APP_EVENT_LOOP=1'], ['windows.c'],
-             ['user32', 'gdi32', 'shell32', 'ws2_32']),
+             ['user32', 'gdi32', 'shell32', 'comctl32', 'ws2_32']),
         ]
         for name, defines, providers, libraries in fixtures:
             executable = temp/(name+'.exe')
@@ -43,8 +43,17 @@ def main():
                 check=True, timeout=60)
             subprocess.run([executable], check=True, timeout=30)
             if name == 'windows-native':
-                result = subprocess.run([executable, 'stale'], capture_output=True, text=True, timeout=30)
-                assert result.returncode == 1 and 'invalid or destroyed handle' in result.stderr, result
+                for argument, diagnostic in [
+                    ('stale', 'invalid or destroyed handle'),
+                    ('nan', 'invalid slider range or value'),
+                    ('wrong-slider', 'handle is not a slider'),
+                    ('invalid-size', 'invalid explicit size'),
+                    ('value-range', 'slider value is outside its range'),
+                    ('invalid-shortcut', 'invalid menu shortcut'),
+                    ('duplicate-shortcut', 'duplicate menu shortcut'),
+                ]:
+                    result = subprocess.run([executable, argument], capture_output=True, text=True, timeout=30)
+                    assert result.returncode == 1 and diagnostic in result.stderr, (argument, result)
         for mode in ['--debug', '--release']:
             executable = temp/('contract-'+mode[2:]+'.exe')
             subprocess.run([ROOT/'minyar', mode, ROOT/'tests/windows-bridge.min', '-o', executable],

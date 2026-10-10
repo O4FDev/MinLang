@@ -336,7 +336,7 @@ def main():
             if not (platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN'))):
                 raise ValueError('the windows package requires Windows and its native UI')
             native += [native_object(project, clang, base, 'windows.c', native_flags),
-                       '-luser32', '-lgdi32', '-lshell32']
+                       '-luser32', '-lgdi32', '-lshell32', '-lcomctl32']
         elif library == 'schannel':
             if not (platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN'))):
                 raise ValueError('the schannel package requires Windows and its TLS provider')
