@@ -85,8 +85,8 @@ are process-local; do not serialize them or share them between processes.
 | Windows | `window`, `show`, `close`, `destroy`, `width`, `height` | NSWindow |
 | Windows | `minimumSize`, `transparentTitlebar`, `autosave`, `capture` | NSWindow, frame autosave |
 | Layout | `column`, `row`, `scroll`, `view`, `spacer`, `padding`, `insets`, `size`, `minimumSize`, `maximumSize`, `fill`, `grow`, `align`, `gravity`, `spaceAfter`, `hidden`, `clear`, `remove`, `scrollToTop` | NSStackView, NSScrollView, NSLayoutConstraint |
-| Controls | `label`, `button`, `plainButton`, `link`, `textField`, `secureField`, `textEditor`, `checkbox`, `slider`, `separator`, `spinner`, `shape` | NSTextField, NSButton, NSSecureTextField, NSTextView/NSScrollView, NSSlider, NSBox, NSProgressIndicator, NSBezierPath |
-| Properties | `text`, `setText`, `enabled`, `checked`, `setChecked`, `value`, `setValue`, `placeholder`, `maxLength`, `focus`, `selectable`, `tooltip`, `accessibilityLabel` | AppKit properties |
+| Controls | `label`, `button`, `plainButton`, `link`, `textField`, `secureField`, `textEditor`, `textView`, `checkbox`, `slider`, `separator`, `spinner`, `shape` | NSTextField, NSButton, NSSecureTextField, NSTextView/NSScrollView, NSTextView (TextKit 1), NSSlider, NSBox, NSProgressIndicator, NSBezierPath |
+| Properties | `text`, `setText`, `appendText`, `enabled`, `checked`, `setChecked`, `value`, `setValue`, `placeholder`, `maxLength`, `focus`, `selectable`, `tooltip`, `accessibilityLabel` | AppKit properties |
 | Text input | `plain`, `autoHeight`, `submitOnEnter` | NSTextView delegate |
 | Styling | `color`, `background`, `border`, `cornerRadius`, `focusBorder`, `textColor`, `hover`, `font`, `letterSpacing`, `lineHeight`, `lines`, `textAlign`, `symbol` | Dynamic NSColor, CALayer, NSFont/CoreText, SF Symbols |
 | Lists | `list`, `addRow`, `rowCount`, `listLine`, `listColors`, `rowButton`, `clickedRow`, `clickedButton` | View-based NSTableView with reused cells |
@@ -136,6 +136,16 @@ line, styled for the whole list with `listLine`, and an optional trailing
 `rowButton`. A click delivers `ACTION` from the list; `clickedRow` and
 `clickedButton` say where. `benchmarks/desktop/history-rows.min` and
 `history-list.min` measure both.
+
+**Long, growing text.** A label measures and typesets all of its text again
+after every `setText`, so text that grows a little at a time, such as a
+streamed answer, costs more with each update, and the total grows with the
+square of its length. `textView` is read-only, selectable text that wraps to
+its width (give it one with `fill` or `size`) and grows to fit, like a
+wrapping label, and `appendText` adds to its end: the text before keeps its
+layout, so an append costs about the length of the new text, and a selection
+survives it. `appendText` also adds to a `textEditor`. Fonts, colours and line
+heights apply as for labels.
 
 **Text input.** `plain` removes an input's own bezel so a styled container can
 draw it; `focusBorder` on the container shows focus. Editors can size to their

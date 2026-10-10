@@ -140,8 +140,20 @@ static void requestQuit(void) {
 static NSTextView *editor(id value) {
     return [value isKindOfClass:NSScrollView.class] && [[value documentView] isKindOfClass:NSTextView.class] ? [value documentView] : nil;
 }
+/* Read-only text that wraps to its width and is as tall as its text. Its
+ * TextKit 1 layout manager keeps the layout of text that did not change, so
+ * appendText lays out only the new end; a label measures and typesets all of
+ * its text again after every change. */
+@interface MNTextBlock : NSTextView
+// A text view made from its own container does not own the text storage.
+@property(nonatomic, strong) NSTextStorage *storage;
+@end
+/* The text view of an editor or a textView, or nil. */
+static NSTextView *textView(id value) {
+    return [value isKindOfClass:MNTextBlock.class] ? value : editor(value);
+}
 static NSString *getText(id value) {
-    if (editor(value)) return editor(value).string;
+    if (textView(value)) return textView(value).string;
     if ([value isKindOfClass:NSTextField.class]) return [value stringValue];
     if ([value isKindOfClass:NSWindow.class] || [value isKindOfClass:NSButton.class] || [value isKindOfClass:NSMenuItem.class]) return [value title];
     minyar_native_stop("macos.text requires a window, text control, button, or menu item.");
@@ -171,6 +183,10 @@ static NSDictionary *textAttributes(MNHandle *h, NSFont *fallback, NSTextAlignme
     }
     a[NSParagraphStyleAttributeName] = p;
     return a;
+}
+/* Text in a text view's style and alignment, for setText and appendText. */
+static NSAttributedString *styledString(MNHandle *h, NSTextView *v, NSString *s) {
+    return [[NSAttributedString alloc] initWithString:s attributes:textAttributes(h, v.font, v.alignment)];
 }
 /* lines(label, 1) truncates with "…"; 0 wraps to the width; n wraps up to n lines. */
 static void wrapLabel(NSTextField *f, long long lines) {
@@ -202,14 +218,15 @@ static void applyText(MNHandle *h) {
             f.allowsEditingTextAttributes = f.isSelectable;
             f.attributedStringValue = [[NSAttributedString alloc] initWithString:f.stringValue attributes:textAttributes(h, f.font, f.alignment)];
         }
-    } else if (editor(o)) {
-        NSTextView *v = editor(o);
-        NSDictionary *a = textAttributes(h, v.font, NSTextAlignmentNatural);
+    } else if (textView(o)) {
+        NSTextView *v = textView(o);
+        NSDictionary *a = textAttributes(h, v.font, v.alignment);
         if (h.font) v.font = h.font;
         if (color) { v.textColor = color; v.insertionPointColor = color; }
         v.defaultParagraphStyle = a[NSParagraphStyleAttributeName];
         v.typingAttributes = a;
         [v.textStorage setAttributes:a range:NSMakeRange(0, v.textStorage.length)];
+        if (v == o) [v invalidateIntrinsicContentSize];
     }
 }
 static void restyle(MNHandle *h) {
@@ -440,6 +457,28 @@ static BOOL gapped(NSButtonCell *cell) {
     a[NSForegroundColorAttributeName] = NSColor.placeholderTextColor;
     NSPoint origin = self.textContainerOrigin;
     [self.placeholder drawAtPoint:NSMakePoint(origin.x + self.textContainer.lineFragmentPadding, origin.y) withAttributes:a];
+}
+@end
+@implementation MNTextBlock
+- (NSSize)intrinsicContentSize {
+    NSLayoutManager *layout = self.layoutManager;
+    [layout ensureLayoutForTextContainer:self.textContainer];
+    CGFloat height = NSHeight([layout usedRectForTextContainer:self.textContainer]) + 2 * self.textContainerInset.height;
+    return NSMakeSize(NSViewNoIntrinsicMetric, ceil(height));
+}
+- (void)setFrameSize:(NSSize)size {
+    BOOL rewraps = fabs(size.width - NSWidth(self.frame)) > 0.5;
+    [super setFrameSize:size];
+    if (rewraps) [self invalidateIntrinsicContentSize];
+}
+- (void)viewDidChangeEffectiveAppearance { [super viewDidChangeEffectiveAppearance]; styleView(self); }
+// Read-only text offers nothing to spell-check or correct. Otherwise, after
+// every edit, AppKit's text checking copies the paragraph around the
+// selection several times, which for a long one-paragraph answer is all of it.
+- (NSAttributedString *)annotatedSubstringForProposedRange:(NSRange)range actualRange:(NSRangePointer)actual {
+    (void)range;
+    if (actual) *actual = NSMakeRange(NSNotFound, 0);
+    return nil;
 }
 @end
 /* Fills an SVG path, scaled from its view box to the view, in the text color. */
@@ -803,6 +842,30 @@ long long minyar_macos_textEditor(long long parent, const MinyarText *text) { @a
     replaceMinimum(entry(h), scroll, 200, 100);
     return h;
 } }
+long long minyar_macos_textView(long long parent, const MinyarText *text) { @autoreleasepool {
+    ready();
+    // TextKit 1, built by hand: appending to a long paragraph lays out only
+    // the lines from the changed one on.
+    NSTextStorage *storage = [NSTextStorage new];
+    NSLayoutManager *layout = [NSLayoutManager new]; [storage addLayoutManager:layout];
+    NSTextContainer *container = [[NSTextContainer alloc] initWithSize:NSMakeSize(0, CGFLOAT_MAX)];
+    // Labels line up their text, not their cell's 2-point inset, with the
+    // stack's edge, so the text starts at the view's edge.
+    container.widthTracksTextView = YES; container.lineFragmentPadding = 0;
+    [layout addTextContainer:container];
+    MNTextBlock *v = [[MNTextBlock alloc] initWithFrame:NSZeroRect textContainer:container];
+    v.storage = storage;
+    v.richText = NO; v.importsGraphics = NO; v.editable = NO; v.selectable = YES; v.drawsBackground = NO;
+    v.verticallyResizable = NO; v.horizontallyResizable = NO; v.textContainerInset = NSZeroSize;
+    v.font = [NSFont systemFontOfSize:NSFont.systemFontSize];
+    long long handle = append(parent, v);
+    MNHandle *h = entry(handle);
+    // Like a wrapping label: system font, label color, word wrapping.
+    h.lines = 0; h.styledText = YES;
+    [storage setAttributedString:styledString(h, v, string(text))];
+    applyText(h);
+    return handle;
+} }
 long long minyar_macos_slider(long long parent, double minimum, double maximum, double value) { @autoreleasepool {
     ready();
     if (!isfinite(minimum) || !isfinite(maximum) || !isfinite(value) || minimum >= maximum || value < minimum || value > maximum)
@@ -823,6 +886,12 @@ MinyarText *minyar_macos_text(long long handle) { @autoreleasepool { return owne
 void minyar_macos_setText(long long handle, const MinyarText *text) { @autoreleasepool {
     MNHandle *h = entry(handle); id v = h.object; NSString *s = string(text);
     if (editor(v)) { editor(v).string = s; if (h.styledText) applyText(h); fitHeight(h); editor(v).needsDisplay = YES; return; }
+    if ([v isKindOfClass:MNTextBlock.class]) {
+        MNTextBlock *t = v;
+        [t.textStorage replaceCharactersInRange:NSMakeRange(0, t.textStorage.length) withAttributedString:styledString(h, t, s)];
+        [t invalidateIntrinsicContentSize];
+        return;
+    }
     if ([v isKindOfClass:NSTextField.class]) { [v setStringValue:s]; if (h.styledText) applyText(h); return; }
     if ([v isKindOfClass:NSWindow.class] || [v isKindOfClass:NSMenuItem.class]) { [v setTitle:s]; return; }
     if ([v isKindOfClass:NSButton.class]) {
@@ -832,6 +901,15 @@ void minyar_macos_setText(long long handle, const MinyarText *text) { @autorelea
         return;
     }
     minyar_native_stop("macos.setText requires a window, text control, button, or menu item.");
+} }
+void minyar_macos_appendText(long long handle, const MinyarText *text) { @autoreleasepool {
+    MNHandle *h = entry(handle); NSTextView *v = textView(h.object);
+    if (!v) minyar_native_stop("macos.appendText requires a textView or textEditor.");
+    NSString *s = string(text);
+    if (!s.length) return;
+    // Only the new characters are edited, so the existing layout and any selection stay.
+    [v.textStorage appendAttributedString:h.styledText ? styledString(h, v, s) : [[NSAttributedString alloc] initWithString:s attributes:v.typingAttributes]];
+    if (v == h.object) [v invalidateIntrinsicContentSize]; else { fitHeight(h); v.needsDisplay = YES; }
 } }
 void minyar_macos_enabled(long long handle, bool value) { @autoreleasepool {
     MNHandle *h = entry(handle); id v = h.object;
@@ -1345,6 +1423,7 @@ void minyar_macos_lines(long long handle, long long count) { @autoreleasepool {
     h.lines = count; h.styledText = YES; restyle(h);
 } }
 void minyar_macos_selectable(long long handle, bool value) { @autoreleasepool {
+    if ([entry(handle).object isKindOfClass:MNTextBlock.class]) { [entry(handle).object setSelectable:value]; return; }
     NSTextField *f = object(handle, NSTextField.class); f.selectable = value;
     MNHandle *h = entry(handle); if (h.styledText) applyText(h);
 } }
@@ -1357,7 +1436,7 @@ void minyar_macos_textAlign(long long handle, long long alignment) { @autoreleas
     if (alignment < MNStart || alignment > MNEnd) minyar_native_stop("macos text alignment must be START, CENTER, or END.");
     NSTextAlignment a = alignment == MNStart ? NSTextAlignmentNatural : alignment == MNCenter ? NSTextAlignmentCenter : NSTextAlignmentRight;
     if ([v isKindOfClass:NSButton.class] || [v isKindOfClass:NSTextField.class]) [v setAlignment:a];
-    else if (editor(v)) editor(v).alignment = a;
+    else if (textView(v)) textView(v).alignment = a;
     else minyar_native_stop("macos.textAlign requires a button, label, text field, or editor.");
     if (h.styledText) applyText(h);
 } }
