@@ -8,7 +8,7 @@ import copy
 import hashlib
 import importlib.util
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import tempfile
 
@@ -134,6 +134,29 @@ def controls():
         copied['sources'][0]['consumers'] = ['.github/workflows/ci.yml']
         validate(copied, snapshot)
         assert manifest['.github/workflows/ci.yml'] == hashlib.sha256(workflow.read_bytes()).hexdigest()
+
+        # Both provider-independent path types must identify the same retained
+        # bytes. Reject the old Windows separator key and an absolute POSIX
+        # key; neither can satisfy a relative catalogue consumer.
+        raw_hash = hashlib.sha256(workflow.read_bytes()).hexdigest()
+        for relative in ('.github/workflows/ci.yml', 'tests/nested/raw-source.py'):
+            windows_root = PureWindowsPath('C:/retained-source')
+            posix_root = PurePosixPath('/retained-source')
+            windows_path = windows_root / relative
+            posix_path = posix_root / relative
+            windows_key = runner.snapshot_source_key(windows_path, windows_root)
+            posix_key = runner.snapshot_source_key(posix_path, posix_root)
+            assert windows_key == posix_key == relative
+            for key in (windows_key, posix_key):
+                assert {key: raw_hash}[relative] == raw_hash
+            for wrong in (str(windows_path.relative_to(windows_root)), str(posix_path)):
+                assert wrong != relative
+                try:
+                    {wrong: raw_hash}[relative]
+                except KeyError:
+                    rejected += 1
+                else:
+                    raise AssertionError('Noncanonical source key accepted')
         assert not any((snapshot / excluded).exists() for excluded in
                        ('build/host-binary', '.git/config', 'tests/__pycache__/generated.py'))
         return rejected

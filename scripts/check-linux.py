@@ -72,10 +72,15 @@ def copy_source_snapshot(source, work):
 
 
 
+def snapshot_source_key(path, root):
+    """Canonical source keys preserve raw bytes across host path providers."""
+    return path.relative_to(root).as_posix()
+
+
 def snapshot_sources(source, work):
     """Copy the correctness inputs without host binaries or repository state."""
     copy_source_snapshot(source, work)
-    return {str(path.relative_to(work)): hashlib.sha256(path.read_bytes()).hexdigest()
+    return {snapshot_source_key(path, work): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in sorted(work.rglob('*')) if path.is_file()}
 
 
