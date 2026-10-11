@@ -23,7 +23,7 @@ use "resp2" as resp
 record Configuration {
     valid: Boolean; host: Text; devicePort: Integer; gatewayPort: Integer
     redisHost: Text; redisPort: Integer; instance: Text; region: Text; maximum: Integer
-    certificate: Text; key: Text; deviceRoots: Text; gatewayRoots: Text; registry: Text; jwks: Text
+    certificate: List<Text>; key: Text; deviceRoots: List<Text>; gatewayRoots: List<Text>; registry: Text; jwks: Text
 }
 function numeric(value: json.Value, name: Text, maximum: Integer): Integer {
     let member = json.member(value,name)
@@ -36,21 +36,39 @@ function numeric(value: json.Value, name: Text, maximum: Integer): Integer {
     }
     return result
 }
-function path(value: json.Value, name: Text): Text {
-    let result = json.string(value,name)
+function pathValue(value: json.Value): Text {
+    if value.kind != json.STRING { return "" }
+    let result = value.text
     if result.length < 1 || result.length > 4095 { return "" }
     for c in result { if Integer(c) < 32 { return "" } }
+    return result
+}
+function path(value: json.Value, name: Text): Text { return pathValue(json.member(value,name)) }
+function certificatePaths(value: json.Value, name: Text): List<Text> {
+    let member = json.member(value,name); let result: List<Text> = []
+    if member.kind == json.STRING {
+        let one = pathValue(member); if one != "" { result.add(one) }; return result
+    }
+    if member.kind != json.ARRAY || member.items.length < 1 || member.items.length > 16 { return result }
+    for entry in member.items {
+        let one = pathValue(entry); if one == "" { return [] }; result.add(one)
+    }
+    return result
+}
+function certificateFiles(paths: List<Text>): List<Bytes> {
+    let result: List<Bytes> = []
+    for path in paths { result.add(readBytesFile(path)) }
     return result
 }
 function configuration(data: Bytes): Configuration {
     let value = json.parseUniqueBytes(data,8192)
     let result = Configuration { valid: false; host: json.string(value,"host"); devicePort: numeric(value,"device_port",65535); gatewayPort: numeric(value,"gateway_port",65535)
         redisHost: json.string(value,"redis_host"); redisPort: numeric(value,"redis_port",65535); instance: json.string(value,"edge_instance"); region: json.string(value,"edge_region"); maximum: numeric(value,"max_connections",32768)
-        certificate: path(value,"certificate"); key: path(value,"private_key"); deviceRoots: path(value,"device_roots"); gatewayRoots: path(value,"gateway_roots"); registry: path(value,"registry"); jwks: path(value,"jwks") }
+        certificate: certificatePaths(value,"certificate"); key: path(value,"private_key"); deviceRoots: certificatePaths(value,"device_roots"); gatewayRoots: certificatePaths(value,"gateway_roots"); registry: path(value,"registry"); jwks: path(value,"jwks") }
     let endpoint = result.instance
     if endpoint.length > 2 && endpoint.slice(endpoint.length-2,endpoint.length) == ":0" { endpoint = endpoint.slice(0,endpoint.length-1) + "1" }
     if value.kind != json.OBJECT || result.host.length < 1 || result.host.length > 255 || result.redisHost.length < 1 || result.redisHost.length > 255 || !live.edgeEndpoint(endpoint) || !live.identifier(result.region) ||
-       result.devicePort < 0 || result.gatewayPort < 0 || result.redisPort < 1 || result.maximum < 1 || result.certificate == "" || result.key == "" || result.deviceRoots == "" || result.gatewayRoots == "" || result.registry == "" || result.jwks == "" { return result }
+       result.devicePort < 0 || result.gatewayPort < 0 || result.redisPort < 1 || result.maximum < 1 || result.certificate.length < 1 || result.key == "" || result.deviceRoots.length < 1 || result.gatewayRoots.length < 1 || result.registry == "" || result.jwks == "" { return result }
     for name in value.keys {
         if name != "host" && name != "device_port" && name != "gateway_port" && name != "redis_host" && name != "redis_port" && name != "edge_instance" && name != "edge_region" && name != "max_connections" && name != "certificate" && name != "private_key" && name != "device_roots" && name != "gateway_roots" && name != "registry" && name != "jwks" { return result }
     }
@@ -775,7 +793,7 @@ public function run(configBytes: Bytes, durationMs: Integer): errors.BooleanResu
     if udp < 0 || device < 0 || gateway < 0 { if udp >= 0 { net.close(udp) }; if device >= 0 { net.close(device) }; if gateway >= 0 { net.close(gateway) }; callbacks.close(callbacks.value(created)); return errors.booleanFailure(errors.make(errors.systemCode(),0,"edge listen failed")) }
     if config.instance.length > 2 && config.instance.slice(config.instance.length-2,config.instance.length) == ":0" { config.instance = config.instance.slice(0,config.instance.length-1) + Text(net.localPort(gateway)) }
     let core = Core { config: config; dispatcher: callbacks.value(created); now: 0; started: net.monotonicMilliseconds()
-        identity: [readBytesFile(config.certificate)]; key: readBytesFile(config.key); deviceRoots: [readBytesFile(config.deviceRoots)]; gatewayRoots: [readBytesFile(config.gatewayRoots)]; registry: registry; keys: keys
+        identity: certificateFiles(config.certificate); key: readBytesFile(config.key); deviceRoots: certificateFiles(config.deviceRoots); gatewayRoots: certificateFiles(config.gatewayRoots); registry: registry; keys: keys
         udp: udp; deviceListener: device; gatewayListener: gateway; peers: []; free: []; freeCount: 0; active: 0; work: []; workAt: 0
         relays: []; replays: []; replayIndex: dispatch.table(8192,65536,randomBytes(16)); nextRelay: 1; relaysRetired: 0; callsOpened: 0; callsReleased: 0; maxRelays: 0; replayAt: 1000
         retry: retry.store(randomBytes(16),10000); noRetry: retry.validateInitial(retry.store(Bytes(),1),Bytes(),Bytes(),0); allocated: 0; retryReplies: 0; retryValidated: 0

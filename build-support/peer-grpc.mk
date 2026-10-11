@@ -97,3 +97,13 @@ check-peer-edge-relay-lifetime-sanitize: build/minyarc check-peer-grpc-python te
 
 check: check-peer-edge-relay check-peer-edge-relay-lifetime
 check-sanitize: check-peer-edge-relay-sanitize check-peer-edge-relay-lifetime-sanitize
+
+
+# Real server chain presentation and independently trusted device/gateway CA overlap.
+.PHONY: check-peer-edge-pki check-peer-edge-pki-sanitize
+check-peer-edge-pki: build/minyarc check-peer-grpc-python
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge-pki.py
+check-peer-edge-pki-sanitize: build/minyarc check-peer-grpc-python
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge-pki.py --sanitize
+check: check-peer-edge-pki
+check-sanitize: check-peer-edge-pki-sanitize

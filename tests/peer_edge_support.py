@@ -27,7 +27,7 @@ def rss(pid):
     text=Path(f'/proc/{pid}/status').read_text()
     return int(next(line.split()[1] for line in text.splitlines() if line.startswith('VmRSS:')))
 class Lab:
-    def __init__(self,directory,binary=None,sanitize=False,duration=20000,maximum=128,sanitizer_quarantine=None):
+    def __init__(self,directory,binary=None,sanitize=False,duration=20000,maximum=128,sanitizer_quarantine=None,pki=False,server_intermediate=True):
         self.directory=Path(directory);self.directory.mkdir(parents=True,exist_ok=True)
         self.env=environment(sanitize)
         if sanitize and sanitizer_quarantine is not None:
@@ -43,12 +43,28 @@ class Lab:
         self.device=self.directory/'device'
         subprocess.run(['go','build','-trimpath','-o',str(self.device),'.'],cwd=ROOT/'tests/interop/peeredge',env=self.env,check=True,timeout=120)
         self.certs=admission.fixtures.Certificates(self.directory)
-        self.certs.root('ca');self.certs.leaf('server','ca',ec=True)
+        self.certs.root('ca')
+        if pki:
+            self.certs.root('ca-next');self.certs.root('ca-untrusted')
+            self.certs.root('gateway-ca');self.certs.root('gateway-ca-next')
+            self.certs.leaf('intermediate','ca',ca=True,ec=True)
+            self.certs.leaf('server','intermediate',ec=True)
+        else:self.certs.leaf('server','ca',ec=True)
         self.certs.leaf('device','ca',san='URI:hearth://device/device-a',usage='clientAuth',ec=True)
-        self.certs.leaf('gateway','ca',usage='clientAuth',ec=True)
+        self.certs.leaf('gateway','gateway-ca' if pki else 'ca',usage='clientAuth',ec=True)
         self.certs.leaf('unregistered','ca',usage='clientAuth',ec=True)
+        if pki:
+            for label,issuer in (('next','ca-next'),('untrusted','ca-untrusted')):
+                self.certs.leaf('device-'+label,issuer,san='URI:hearth://device/device-a',usage='clientAuth',ec=True)
+                self.certs.leaf('gateway-'+label,'gateway-ca-next' if label=='next' else issuer,usage='clientAuth',ec=True)
+            self.certs.leaf('gateway-device-root','ca',usage='clientAuth',ec=True)
+            self.certs.leaf('device-gateway-root','gateway-ca',san='URI:hearth://device/device-a',usage='clientAuth',ec=True)
         self.registry=self.directory/'registry.ndjson'
         self.registry.write_text(json.dumps(dict(role='device',device_id='device-a',exit_id='exit-a',revoked=False,paused=False,quarantined=False,max_concurrent=8))+'\n'+json.dumps(dict(role='gateway',sha256=hashlib.sha256(self.certs.path('gateway','der').read_bytes()).hexdigest()))+'\n')
+        if pki:
+            with self.registry.open('a') as registry:
+                for label in ('next','untrusted','device-root'):
+                    registry.write(json.dumps(dict(role='gateway',sha256=hashlib.sha256(self.certs.path('gateway-'+label,'der').read_bytes()).hexdigest()))+'\n')
         (self.directory/'jwks.json').write_bytes(auth.jwks())
         if auth.KEY is None: auth.KEY=auth.OpenSSLSigner(self.directory)
         with socket.socket() as reserved:reserved.bind(('127.0.0.1',0));self.redis_port=reserved.getsockname()[1]
@@ -69,11 +85,18 @@ class Lab:
             except OSError:return None
         self.client=admission.eventually(connect)
         config=dict(host='127.0.0.1',device_port=self.listen_port,gateway_port=0,redis_host='127.0.0.1',redis_port=self.redis_port,edge_instance='localhost:0',edge_region='eu-west',max_connections=maximum,certificate=str(self.certs.path('server','der')),private_key=str(self.certs.path('server','pk8')),device_roots=str(self.certs.path('ca','der')),gateway_roots=str(self.certs.path('ca','der')),registry=str(self.registry),jwks=str(self.directory/'jwks.json'))
+        if pki:
+            config['certificate']=[str(self.certs.path('server','der'))]
+            if server_intermediate:config['certificate'].append(str(self.certs.path('intermediate','der')))
+            config['device_roots']=[str(self.certs.path('ca','der')),str(self.certs.path('ca-next','der'))]
+            config['gateway_roots']=[str(self.certs.path('gateway-ca','der')),str(self.certs.path('gateway-ca-next','der'))]
+        self.config=config
         (self.directory/'edge.json').write_text(json.dumps(config))
         self.stderr=open(self.directory/'edge.stderr','wb')
         self.edge=subprocess.Popen([str(self.binary),str(self.directory/'edge.json'),str(duration)],env=self.env,stdout=subprocess.PIPE,stderr=self.stderr)
         self.output=admission.lines(self.edge);line=self.output.get(timeout=15)
-        assert line and line.startswith('READY '),(line,self.diagnostic())
+        if not line or not line.startswith('READY '):
+            diagnostic=self.diagnostic();self.close();raise AssertionError((line,diagnostic))
         self.udp_port,self.device_port,self.gateway_port=map(int,line.split()[1:])
         self.health=dict(in_flight=0,max_concurrent=8,paused=False,policy_hash='a'*64,public_ip='203.0.113.2',asn=64500,country='GB')
         # Immutable CI archives deliberately omit Git; source/binary hashes
@@ -94,8 +117,8 @@ class Lab:
     def diagnostic(self):
         if self.stderr and not self.stderr.closed:self.stderr.flush()
         return (self.directory/'edge.stderr').read_text()
-    def start_device(self):
-        proc=subprocess.Popen([str(self.device),str(self.device_port),str(self.certs.path('ca','pem')),str(self.certs.path('device','pem')),str(self.certs.path('device','key')),'device-a','exit-a',json.dumps(self.health)],env=self.env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    def start_device(self,certificate='device'):
+        proc=subprocess.Popen([str(self.device),str(self.device_port),str(self.certs.path('ca','pem')),str(self.certs.path(certificate,'pem')),str(self.certs.path(certificate,'key')),'device-a','exit-a',json.dumps(self.health)],env=self.env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         self.devices.append(proc);out=admission.lines(proc);self.device_outputs.append(out)
         assert out.get(timeout=10)=='READY'
         admission.eventually(lambda:self.client.command('GET','peer:live:{exit-a}'))
