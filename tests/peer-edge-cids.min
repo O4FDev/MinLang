@@ -1,0 +1,74 @@
+use "quic" as quic
+use "quicwire" as wire
+use "quiccrypto" as protection
+use "crypto" as crypto
+use "net" as net
+use "errors" as errors
+
+function number(text: Text): Integer {
+    let value = 0
+    for digit in text { value = value * 10 + Integer(digit) - 48 }
+    return value
+}
+function step(connection: quic.Connection, socket: Integer, started: Integer): Integer {
+    let now = net.monotonicMilliseconds() - started
+    for packet in quic.poll(connection, now) {
+        let sent = net.write(socket, packet)
+        if !errors.integerOk(sent) || errors.integerValue(sent) != packet.length { return 1 }
+    }
+    net.ready(socket, 1)
+    now = net.monotonicMilliseconds() - started
+    let received = net.receiveDatagrams(socket, 64, 65535)
+    if net.datagramBatchOk(received) {
+        for datagram in net.datagrams(received) {
+            let data = net.datagramData(datagram)
+            if !errors.bytesOk(data) { return 2 }
+            quic.receive(connection, errors.bytesValue(data), now)
+        }
+    } else if !errors.isWouldBlock(net.datagramBatchError(received)) { return 3 }
+    if connection.state == quic.FAILED { print(connection.error); return 4 }
+    return 0
+}
+function retire(connection: quic.Connection, socket: Integer, destination: Bytes, sequence: Integer): Boolean {
+    let payload = Bytes(); payload.add(25); payload.addBytes(errors.bytesValue(wire.encode(sequence)))
+    let number = connection.spaces[2].next; connection.spaces[2].next += 1
+    let header = Bytes(); header.add(0x43); header.addBytes(destination)
+    for index in 0..4 { header.add((number >> ((3-index)*8)) & 255) }
+    let packet = errors.bytesValue(protection.protect(connection.spaces[2].write,header,header.length-4,number,payload))
+    let sent = net.write(socket,packet)
+    return errors.integerOk(sent) && errors.integerValue(sent) == packet.length
+}
+function main(): Integer {
+    let root = readBytesFile(argument(0)); let identity = readBytesFile(argument(1)); let key = readBytesFile(argument(2))
+    let socket = net.udp("127.0.0.1",0)
+    if socket < 0 || !net.udpConnect(socket,"127.0.0.1",number(argument(3))) { return 10 }
+    let connection = quic.client("localhost",randomBytes(80),"hearth-peer",[root],[identity],key)
+    let started = net.monotonicMilliseconds()
+    while net.monotonicMilliseconds()-started < 4000 && (!connection.confirmed || connection.remoteIds.length != 2) {
+        let status = step(connection,socket,started); if status != 0 { return 11 }
+    }
+    if !connection.confirmed || !connection.clientTLS.authenticated || connection.remoteIds.length != 2 { print("edge handshake/CID supply failed"); return 12 }
+    for round in 0..128 {
+        let previous = connection.remoteIds[0].sequence
+        // The alternate CID must already route to the same authenticated peer.
+        if !retire(connection,socket,connection.remoteIds[1].id,previous) { return 13 }
+        let deadline = net.monotonicMilliseconds()+400
+        while net.monotonicMilliseconds() < deadline && connection.remoteIds[0].sequence == previous {
+            let status = step(connection,socket,started); if status != 0 { return 14 }
+        }
+        if connection.state != quic.ESTABLISHED || connection.remoteIds.length != 2 ||
+           connection.remoteIds[0].sequence != previous+1 || connection.remoteIds[1].sequence != previous+2 {
+            print("edge alternate CID route/replacement failed round " + Text(round)); return 15
+        }
+        // Duplicate retirements must leave the active routes and pool intact.
+        if !retire(connection,socket,connection.remoteIds[0].id,previous) { return 16 }
+        for count in 0..2 { let status = step(connection,socket,started); if status != 0 { return 17 } }
+        if connection.state != quic.ESTABLISHED || connection.remoteIds[1].sequence != previous+2 { return 18 }
+    }
+    let result = quic.close(connection,0,Bytes("CID routing complete"))
+    if !errors.booleanOk(result) { return 19 }
+    for count in 0..100 { let status = step(connection,socket,started); if status != 0 { return 20 } }
+    net.close(socket)
+    print("GREEN actual mTLS QUIC edge: 128 alternate-ID retirements, replacements and duplicate retirements")
+    return 0
+}

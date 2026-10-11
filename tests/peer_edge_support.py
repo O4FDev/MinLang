@@ -17,7 +17,7 @@ def load(name,file):
 admission=load('edge_admission','peer-edge.py')
 auth=load('edge_signing','peer-auth.py')
 def environment(sanitize=False):
-    env=dict(os.environ,MINYAR_CLANG=os.environ.get('MINYAR_TEST_CLANG','clang'),GOMAXPROCS='2',GOFLAGS='-p=2')
+    env=dict(os.environ,MINYAR_CLANG=os.environ.get('MINYAR_TEST_CLANG','clang'),GOMAXPROCS='1',GOFLAGS='-p=1')
     if sanitize:
         for key in ('MINYAR_CLANG_FLAGS','MINYAR_NATIVE_FLAGS','MINYAR_RUNTIME_FLAGS'):
             env[key]='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wno-override-module'
