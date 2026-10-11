@@ -1482,6 +1482,232 @@ class BuildWiring(unittest.TestCase):
             self.assertIn('peer Python verification failed:', result.stderr)
             self.assertFalse((work / 'build/peergrpc-venv/.ready').exists())
 
+    def test_quic_official_adapter_requires_all_linux_controls(self):
+        import importlib.util
+        import json
+        import re
+        fragment = (ROOT/'build-support/quic-official-adapter.mk').read_text()
+        target = 'check-quic-official-adapter'
+        inputs = {'tests/quic-official-adapter.py',
+                  'tests/interop/qns/owned_adapter.py',
+                  'tests/interop/qns/controls-requirements.txt',
+                  'scripts/check-quic-official-inputs.py'}
+        aggregates = ('check', 'check-portable', 'check-quic', 'check-quic-sanitize',
+                      'check-quic-rfc', 'check-quic-rfc-sanitize', 'check-sanitize')
+
+        def verify(candidate, host='Linux', operating_system=''):
+            with tempfile.TemporaryDirectory(prefix='owned adapter Make rules ') as folder:
+                directory = Path(folder)
+                uname = directory/'uname'
+                uname.write_text('#!/bin/sh\nprintf "%s\\n" "'+host+'"\n')
+                uname.chmod(0o755)
+                makefile = directory/'probe.mk'
+                makefile.write_text('LIMITED := ordinary-limit\n'
+                                    'SANITIZER_LIMITED := sanitizer-limit\n'
+                                    +candidate+'\n.PHONY: build\nbuild:\n\t@echo INPUT build\n')
+                env = dict(os.environ, PATH=str(directory)+os.pathsep+os.environ['PATH'],
+                           OS=operating_system)
+                env.pop('MAKEFLAGS', None)
+                result = subprocess.run(['make', '-rRnp', '-f', str(makefile), target],
+                                        cwd=ROOT, env=env, capture_output=True,
+                                        text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                rules = {}
+                for line in result.stdout.splitlines():
+                    match = re.match(r'^([\w./-]+):\s*(.*)$', line)
+                    if match:
+                        rules.setdefault(match[1], set()).update(match[2].split())
+                commands = result.stdout.split('# GNU Make', 1)[0]
+                supported = host == 'Linux' and operating_system != 'Windows_NT'
+                for aggregate in aggregates:
+                    if supported:
+                        self.assertIn(target, rules.get(aggregate, set()), aggregate)
+                    else:
+                        self.assertNotIn(target, rules.get(aggregate, set()), aggregate)
+                if not supported:
+                    self.assertIn('Linux adapter controls required', commands)
+                    self.assertIn('exit 2', commands)
+                    self.assertNotIn('prepare-', commands)
+                    self.assertNotIn('tests/quic-official-adapter.py', commands)
+                    self.assertFalse(rules.get(target, set()))
+                    return
+                self.assertTrue(inputs <= rules.get(target, set()))
+                controls = [line for line in commands.splitlines()
+                            if ' -E tests/quic-official-adapter.py ' in line]
+                self.assertEqual(len(controls), 1)
+                command = controls[0]
+                self.assertIn('ordinary-limit ', command)
+                self.assertNotIn('sanitizer-limit', command)
+                self.assertIn('--pinned-runner "', command)
+                self.assertIn('--artifacts "$artifacts/run"', command)
+                self.assertIn(str(ROOT/'build/quic-official-adapter.'), commands)
+                self.assertIn(str(ROOT/'build/quic-interop-runner-740c05a.git'), command)
+                self.assertIn('scripts/check-quic-official-inputs.py verify', commands)
+                for forbidden in ('--case ', '--sanitize', ' -O ', '/home/user/',
+                                  'docker ', 'compose ', '--pull ', '--build '):
+                    self.assertNotIn(forbidden, command)
+                self.assertIn('mktemp -d "$(abspath build)', candidate)
+                self.assertIn('prepare-runner', commands)
+                self.assertIn('prepare-python', commands)
+                self.assertIn('--requirements "tests/interop/qns/controls-requirements.txt"',
+                              commands)
+
+        verify(fragment)
+        for host, operating_system in (('Darwin', ''), ('Linux', 'Windows_NT'),
+                                      ('MSYS_NT-10.0', ''), ('MINGW64_NT-10.0', ''),
+                                      ('CYGWIN_NT-10.0', '')):
+            verify(fragment, host, operating_system)
+        edge = next(line for line in fragment.splitlines()
+                    if line.startswith('check check-portable '))
+        names, dependency = edge.split(': ', 1)
+        for aggregate in aggregates:
+            mutant = fragment.replace(edge, ' '.join(
+                name for name in names.split() if name != aggregate)+': '+dependency, 1)
+            with self.subTest(missing_gate=aggregate), self.assertRaises(AssertionError):
+                verify(mutant)
+        for source in sorted(inputs):
+            mutant = fragment.replace(source, '', 1)
+            with self.subTest(missing_input=source), self.assertRaises(AssertionError):
+                verify(mutant)
+        for label, old, new in (
+                ('case filter', '--pinned-runner', '--case criteria-no-pull --pinned-runner'),
+                ('ordinary limiter omitted', '$(LIMITED) "$(QUIC_OFFICIAL_PYTHON)" -E tests/',
+                 '"$(QUIC_OFFICIAL_PYTHON)" -E tests/'),
+                ('wrong limiter', '$(LIMITED) "$(QUIC_OFFICIAL_PYTHON)" -E tests/',
+                 '$(SANITIZER_LIMITED) "$(QUIC_OFFICIAL_PYTHON)" -E tests/'),
+                ('optimized Python', '-E tests/quic-official-adapter.py',
+                 '-O tests/quic-official-adapter.py'),
+                ('private cache', '$(abspath build)/quic-interop-runner-740c05a.git',
+                 '/home/user/private-runner'),
+                ('relative artifacts', '$(abspath build)/quic-official-adapter.',
+                 'build/quic-official-adapter.'),
+                ('existing artifact leaf', '$$artifacts/run', '$$artifacts'),
+                ('missing pin argument', '--pinned-runner "$(QUIC_OFFICIAL_RUNNER)"', ''),
+                ('missing dependency verification', 'scripts/check-quic-official-inputs.py verify',
+                 'scripts/check-quic-official-inputs.py ignored')):
+            mutant = fragment.replace(old, new, 1)
+            self.assertNotEqual(mutant, fragment, label)
+            with self.subTest(invalid_recipe=label), self.assertRaises(AssertionError):
+                verify(mutant)
+        tree = ast.parse((ROOT/'scripts/check-linux.py').read_text())
+        targets = next(ast.literal_eval(node.value) for node in tree.body
+                       if isinstance(node, ast.Assign) and any(
+                           isinstance(name, ast.Name) and name.id == 'TARGETS'
+                           for name in node.targets))
+        self.assertEqual(targets.count(target), 1)
+        spec = importlib.util.spec_from_file_location(
+            'official_adapter_catalogue', ROOT/'tests/suite-catalogue.py')
+        catalogue = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(catalogue)
+        data = json.loads((ROOT/'tests/suite-catalogue.json').read_text())
+        rows = {row['path']: row for row in data['sources']}
+        self.assertEqual(rows['tests/quic-official-adapter.py']['role'], 'suite')
+        self.assertIn('build-support/quic-official-adapter.mk',
+                      rows['tests/quic-official-adapter.py']['consumers'])
+        self.assertEqual(rows['tests/interop/qns/owned_adapter.py']['role'], 'support')
+        self.assertIn('tests/quic-official-adapter.py',
+                      rows['tests/interop/qns/owned_adapter.py']['consumers'])
+        for missing in ('tests/quic-official-adapter.py',
+                        'tests/interop/qns/owned_adapter.py'):
+            candidate = dict(data, sources=[row for row in data['sources']
+                                           if row['path'] != missing])
+            with self.subTest(omitted_source=missing), self.assertRaises(ValueError):
+                catalogue.validate(candidate, ROOT)
+
+    def test_quic_official_prerequisites_refuse_false_readiness(self):
+        import hashlib
+        import importlib.util
+        import json
+        from unittest.mock import patch
+        spec = importlib.util.spec_from_file_location(
+            'official_adapter_inputs', ROOT/'scripts/check-quic-official-inputs.py')
+        checker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(checker)
+        with tempfile.TemporaryDirectory(prefix='owned adapter Git objects ') as folder:
+            root = Path(folder)
+            repository = root/'repository'
+            subprocess.run(['git', 'init', '--bare', str(repository)],
+                           check=True, capture_output=True, timeout=15)
+            names = sorted(set(checker.PRIMARY_NAMES) |
+                           {f'fixture-{i:02}.txt' for i in range(35)})
+            self.assertEqual(len(names), 40)
+            objects, entries, primary = {}, [], {}
+            for name in names:
+                data = ('retained source '+name+'\n').encode()
+                result = subprocess.run(['git', '-C', str(repository),
+                                         'hash-object', '-w', '--stdin'], input=data,
+                                        check=True, capture_output=True, timeout=15)
+                blob = result.stdout.decode().strip()
+                objects[name] = blob
+                entries.append(f'100644 blob {blob}\t{name}\n'.encode())
+                if name in checker.PRIMARY_NAMES:
+                    primary[name] = hashlib.sha256(data).hexdigest()
+            tree = subprocess.run(['git', '-C', str(repository), 'mktree'],
+                                  input=b''.join(entries), check=True,
+                                  capture_output=True, timeout=15).stdout.decode().strip()
+            pin = subprocess.run(
+                ['git', '-C', str(repository), '-c', 'user.name=Fixture',
+                 '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false',
+                 'commit-tree', tree], input=b'Owned source fixture\n', check=True,
+                capture_output=True, timeout=15).stdout.decode().strip()
+            with patch.object(checker, 'load_contract', return_value=(pin, primary)):
+                verified = checker.verify_runner(repository)
+                self.assertTrue(verified['verified'])
+                self.assertEqual(len(verified['files']), 40)
+                for name in checker.PRIMARY_NAMES:
+                    changed = dict(primary, **{name: '0'*64})
+                    with patch.object(checker, 'load_contract', return_value=(pin, changed)):
+                        with self.subTest(corrupt_primary=name), self.assertRaises(ValueError):
+                            checker.verify_runner(repository)
+                with patch.object(checker, 'load_contract', return_value=('0'*40, primary)):
+                    with self.assertRaises((ValueError, subprocess.CalledProcessError)):
+                        checker.verify_runner(repository)
+                graft = repository/'info/grafts'
+                graft.write_text(pin+'\n')
+                with self.assertRaises(ValueError):
+                    checker.verify_runner(repository)
+                graft.unlink()
+                subprocess.run(['git', '-C', str(repository), 'update-ref',
+                                'refs/replace/'+pin, pin], check=True,
+                               capture_output=True, timeout=15)
+                with self.assertRaises(ValueError):
+                    checker.verify_runner(repository)
+                subprocess.run(['git', '-C', str(repository), 'update-ref', '-d',
+                                'refs/replace/'+pin], check=True,
+                               capture_output=True, timeout=15)
+                blob = objects[names[-1]]
+                (repository/'objects'/blob[:2]/blob[2:]).unlink()
+                with self.assertRaises((ValueError, subprocess.CalledProcessError)):
+                    checker.verify_runner(repository)
+        with tempfile.TemporaryDirectory(prefix='false adapter readiness ') as folder:
+            root = Path(folder)
+            with patch.object(checker.Commands, 'run', return_value=b''):
+                with self.assertRaises((ValueError, OSError)):
+                    checker.prepare_runner(root/'runner')
+            self.assertFalse((root/'runner/.ready.json').exists())
+            with patch.object(checker.Commands, 'run', return_value=b''):
+                with self.assertRaises((ValueError, OSError, json.JSONDecodeError)):
+                    checker.prepare_python(root/'venv',
+                                           ROOT/'tests/interop/qns/controls-requirements.txt')
+            self.assertFalse((root/'venv/.ready.json').exists())
+            external = root/'provided'
+            external.mkdir()
+            before = set(external.rglob('*'))
+            with self.assertRaises((ValueError, subprocess.CalledProcessError)):
+                checker.verify_runner(external)
+            self.assertEqual(set(external.rglob('*')), before)
+        with patch.object(checker.importlib.metadata, 'version', return_value='0'):
+            with self.assertRaises(ValueError):
+                checker.verify_python(ROOT/'tests/interop/qns/controls-requirements.txt')
+        with tempfile.TemporaryDirectory(prefix='invalid adapter requirements ') as folder:
+            requirement = Path(folder)/'requirements.txt'
+            for content in ('', 'PyYAML\n', 'PyYAML==6.0.3\n',
+                            'PyYAML==6.0.2\nPyYAML==6.0.2\n',
+                            'PyYAML==6.0.2\npyshark==0.6\n'):
+                requirement.write_text(content)
+                with self.subTest(content=content), self.assertRaises(ValueError):
+                    checker.requirements_contract(requirement)
+
 
 
 if __name__ == '__main__':
