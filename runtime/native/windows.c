@@ -827,6 +827,9 @@ static void destroy(long long value) {
         DeleteObject(w->font);
     if (w->accelerators)
         DestroyAcceleratorTable(w->accelerators);
+    // SetMenu can synchronously enqueue a resize after the first purge.
+    // A disposed widget must not leave newly queued events with its handle.
+    remove_events(value);
     w->kind = 0;
 }
 void minyar_windows_destroy(long long value) {
