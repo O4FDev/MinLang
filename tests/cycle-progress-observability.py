@@ -14,10 +14,16 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import shutil
+import sys
+import time
 
-from clang_helpers import windows_host
+from clang_helpers import native_path, windows_host
+from test_evidence import terminate_process_tree
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT/'tools'))
+from host_paths import host_path
 BASELINE = ROOT / 'tests/fixtures/cycle-progress-before-observability.c.txt'
 FIXTURE = ROOT / 'tests/cycle-progress.c'
 BASELINE_SHA256 = '1ab79ac428e106daf8d6f2aa8d1388571be3cc3d836ac6ccc9cd558bbf0e84b4'
@@ -170,18 +176,150 @@ def expected(values):
     }
 
 
-def check_case(name, values, binaries, evidence, report):
+def require_assertions():
+    if sys.flags.optimize:
+        raise RuntimeError('Idle observability requires Python assertions; do not use -O')
+
+
+def decoded(data):
+    return data.decode('utf-8', errors='replace').replace('\r\n', '\n').replace('\r', '\n')
+
+
+def secondary(report, primary, stage, error):
+    row = {'stage': stage, 'exception': type(error).__name__, 'message': str(error)}
+    report['passed'] = False
+    report['finalization_errors'].append(row)
+    if primary is not None and hasattr(primary, 'add_note'):
+        primary.add_note('idle observation finalization: ' + json.dumps(row, sort_keys=True))
+
+
+def finalize(evidence, report, primary):
+    failure = None
+    report.setdefault('files', {})
+    report.setdefault('unhashed_files', [])
+    for path in sorted(evidence.rglob('*')):
+        if not path.is_file() or path.is_symlink() or path.name == 'manifest.json':
+            continue
+        name = path.relative_to(evidence).as_posix()
+        try:
+            report['files'][name] = {
+                'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                'bytes': path.stat().st_size,
+            }
+        except BaseException as error:
+            report['unhashed_files'].append(name)
+            secondary(report, primary, 'file-retention:' + name, error)
+            failure = failure or error
+    try:
+        pending = evidence/'manifest.json.tmp'
+        pending.write_text(json.dumps(report, indent=2) + '\n')
+        os.replace(pending, evidence/'manifest.json')
+    except BaseException as error:
+        secondary(report, primary, 'manifest-retention', error)
+        failure = failure or error
+    if primary is None and failure is not None:
+        raise failure
+
+
+class CommandRecords:
+    """Raw observations and the shared, owned tree timeout convention."""
+    def __init__(self, evidence, report):
+        self.evidence, self.report = evidence, report
+
+    def run(self, command, *, timeout, label):
+        command = list(map(str, command))
+        requested = command[0]
+        executable = host_path(requested) if os.path.dirname(requested) else None
+        if executable is None:
+            found = shutil.which(requested)
+            if found is None:
+                raise FileNotFoundError('Missing command executable: ' + requested)
+            executable = host_path(found)
+        executable = executable.resolve()
+        row = {'argv': command, 'cwd': str(ROOT), 'label': label,
+               'timeout_seconds': timeout, 'timed_out': False, 'status': None,
+               'executable': str(executable),
+               'executable_sha256': hashlib.sha256(executable.read_bytes()).hexdigest(),
+               'cleanup': {'action': 'none', 'status': 'not-needed'}}
+        self.report['commands'].append(row)
+        began = time.monotonic()
+        process = None
+        out, err = b'', b''
+        primary = None
+        try:
+            process = subprocess.Popen(
+                command, executable=native_path(executable), cwd=ROOT,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=not windows_host())
+            row['pid'] = process.pid
+            row['start_new_session'] = not windows_host()
+            try:
+                out, err = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired as error:
+                row['timed_out'] = True
+                row['cleanup'] = {'action': 'terminate_process_tree', 'status': 'started',
+                                  'owned_pid': process.pid, 'backend': (
+                                      'native-Windows-tree' if windows_host() else 'owned-POSIX-group')}
+                try:
+                    terminate_process_tree(process)
+                    row['cleanup']['status'] = 'completed'
+                except BaseException as cleanup_error:
+                    row['cleanup']['status'] = 'failed'
+                    row['cleanup']['exception'] = type(cleanup_error).__name__ + ': ' + str(cleanup_error)
+                    error.add_note('idle mock tree cleanup failed: ' + row['cleanup']['exception'])
+                    # Fail closed; direct-child cleanup is not a tree success.
+                    process.kill()
+                try:
+                    out, err = process.communicate(timeout=10)
+                except BaseException as drain_error:
+                    row['cleanup']['status'] = 'failed'
+                    row['cleanup']['drain_error'] = type(drain_error).__name__ + ': ' + str(drain_error)
+                    error.add_note('idle mock post-cleanup drain failed: ' + str(drain_error))
+                    process.kill()
+                    for pipe in (process.stdout, process.stderr):
+                        if pipe is not None:
+                            pipe.close()
+                    process.wait(timeout=5)
+                row['status'] = process.returncode
+                raise subprocess.TimeoutExpired(command, timeout, output=out, stderr=err) from error
+            row['status'] = process.returncode
+            return subprocess.CompletedProcess(command, process.returncode, out, err)
+        except BaseException as error:
+            primary = error
+            row['exception'] = type(error).__name__ + ': ' + str(error)
+            raise
+        finally:
+            row['elapsed_seconds'] = time.monotonic() - began
+            for name, data in (('stdout', out), ('stderr', err)):
+                path = self.evidence/(label + '.' + name + '.bin')
+                try:
+                    path.write_bytes(data or b'')
+                    row[name + '_path'] = path.relative_to(self.evidence).as_posix()
+                    row[name + '_sha256'] = hashlib.sha256(data or b'').hexdigest()
+                    row[name + '_bytes'] = len(data or b'')
+                except BaseException as error:
+                    secondary(self.report, primary, label + '-' + name + '-retention', error)
+                    if primary is None:
+                        raise
+            if process is not None:
+                for pipe in (process.stdout, process.stderr):
+                    if pipe is not None and not pipe.closed:
+                        pipe.close()
+
+
+def check_case(name, values, binaries, owner, report):
     want = expected(values)
     failed = not want['idle_cpu'] <= 0.02
     results = {}
     for label, binary in binaries.items():
-        argv = [str(binary), *map(str, values)]
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
-        (evidence / f'{name}-{label}.stdout').write_text(result.stdout)
-        (evidence / f'{name}-{label}.stderr').write_text(result.stderr)
+        argv = [native_path(binary), *map(str, values)]
+        raw = owner.run(argv, timeout=10, label=f'{name}-{label}')
+        result = subprocess.CompletedProcess(argv, raw.returncode,
+                                             decoded(raw.stdout), decoded(raw.stderr))
         results[label] = result
         report['cases'].append({
             'case': name, 'fixture': label, 'argv': argv, 'status': result.returncode,
+            'command_index': len(report['commands']) - 1,
             'stdout': result.stdout, 'stderr': result.stderr,
             'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
         })
@@ -209,34 +347,68 @@ def check_case(name, values, binaries, evidence, report):
             assert float(actual[key]) == value, (name, key, actual[key], value)
 
 
-def main():
+def main(arguments=None):
+    require_assertions()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--evidence', type=Path, default=ROOT / 'build/cycle-progress-observability')
-    args = parser.parse_args()
-    baseline, current = BASELINE.read_text(), FIXTURE.read_text()
-    helpers, window = contract(baseline, current)
-    args.evidence.mkdir(parents=True, exist_ok=True)
+    args = parser.parse_args(arguments)
+    evidence = args.evidence.resolve()
+    if evidence.exists():
+        raise ValueError('Idle observability evidence must be a fresh directory')
+    evidence.mkdir(parents=True)
     report = {
         'passed': False, 'scope': 'mocked observability only; no historical failure replay',
-        'inputs': {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
-                   for path in [BASELINE, FIXTURE, Path(__file__).resolve()]},
-        'cases': [], 'compile': [],
+        'inputs': {}, 'cases': [], 'compile': [], 'commands': [],
+        'finalization_errors': [], 'unhashed_files': [],
     }
+    primary = None
     try:
+        inputs = [BASELINE, FIXTURE, Path(__file__).resolve(),
+                  ROOT/'tests/clang_helpers.py', ROOT/'tests/test_evidence.py',
+                  ROOT/'tools/host_paths.py']
+        for path in inputs:
+            name = path.relative_to(ROOT).as_posix()
+            raw = path.read_bytes()
+            before = hashlib.sha256(raw).hexdigest()
+            copied = evidence/'inputs'/name
+            copied.parent.mkdir(parents=True, exist_ok=True)
+            copied.write_bytes(raw)
+            copy_sha = hashlib.sha256(copied.read_bytes()).hexdigest()
+            after = hashlib.sha256(path.read_bytes()).hexdigest()
+            report['inputs'][name] = {
+                'before_sha256': before, 'retained_path': copied.relative_to(evidence).as_posix(),
+                'retained_sha256': copy_sha, 'after_sha256': after,
+            }
+            if before != copy_sha or before != after:
+                raise ValueError('Idle observability input changed while copying: ' + name)
+        baseline, current = BASELINE.read_text(), FIXTURE.read_text()
+        helpers, window = contract(baseline, current)
+        owner = CommandRecords(evidence, report)
+        compiler = os.environ.get('MINYAR_TEST_CLANG', 'clang')
+        version = owner.run([compiler, '--version'], timeout=10, label='compiler-version')
+        if version.returncode:
+            raise RuntimeError('Idle mock compiler version probe failed')
+        compiler_row = report['commands'][-1]
+        report['compiler'] = {
+            'path': compiler_row['executable'], 'before_sha256': compiler_row['executable_sha256'],
+            'version_stdout_path': compiler_row['stdout_path'],
+            'version_stderr_path': compiler_row['stderr_path'],
+        }
         binaries = {}
         for label, parts in [('before', sections(baseline)), ('after', (helpers, window))]:
-            source = args.evidence / f'{label}-mock.c'
+            source = evidence / f'{label}-mock.c'
             source.write_text(MOCK + parts[0] + MAIN.replace('__WINDOW__', parts[1]))
-            binary = args.evidence / (label + '-mock' + ('.exe' if windows_host() else ''))
-            argv = [os.environ.get('MINYAR_TEST_CLANG', 'clang'), '-std=c11', '-O2',
-                    '-Wall', '-Wextra', '-Werror', str(source), '-o', str(binary)]
-            result = subprocess.run(argv, capture_output=True, text=True, timeout=30)
-            (args.evidence / f'{label}-compile.stdout').write_text(result.stdout)
-            (args.evidence / f'{label}-compile.stderr').write_text(result.stderr)
-            report['compile'].append({'argv': argv, 'status': result.returncode,
-                                      'stdout': result.stdout, 'stderr': result.stderr,
-                                      'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest()})
-            assert result.returncode == 0, result.stderr
+            binary = evidence / (label + '-mock' + ('.exe' if windows_host() else ''))
+            argv = [compiler, '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+                    native_path(source), '-o', native_path(binary)]
+            result = owner.run(argv, timeout=30, label=label + '-compile')
+            report['compile'].append({
+                'argv': argv, 'status': result.returncode,
+                'stdout': decoded(result.stdout), 'stderr': decoded(result.stderr),
+                'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+                'command_index': len(report['commands']) - 1,
+            })
+            assert result.returncode == 0, decoded(result.stderr)
             binaries[label] = binary
         cases = [
             ('zero', (2000000, 2000000, 3000000, 3000000, 1000)),
@@ -249,16 +421,31 @@ def main():
             ('double-boundary', (10**16, 10**16 + 200000, 0, 0, 1000)),
             ('double-failure', (10**16, 10**16 + 300000, 0, 0, 1000)),
         ]
-        # Guard against replacing the gate's existing double subtraction with
-        # a newly computed integer-delta metric, even when both appear plausible.
+        # Preserve the original double-subtraction oracle, not integer deltas.
         assert expected(cases[-2][1])['cpu_delta'] != 200000 / 1e7
         assert expected(cases[-1][1])['cpu_delta'] != 300000 / 1e7
         for name, values in cases:
-            check_case(name, values, binaries, args.evidence, report)
+            check_case(name, values, binaries, owner, report)
+        for path in inputs:
+            name = path.relative_to(ROOT).as_posix()
+            actual = hashlib.sha256(path.read_bytes()).hexdigest()
+            report['inputs'][name]['final_sha256'] = actual
+            if actual != report['inputs'][name]['before_sha256']:
+                raise ValueError('Idle observability input changed during execution: ' + name)
+        report['compiler']['after_sha256'] = hashlib.sha256(
+            Path(report['compiler']['path']).read_bytes()).hexdigest()
+        if report['compiler']['after_sha256'] != report['compiler']['before_sha256']:
+            raise ValueError('Idle mock compiler changed during execution')
+        if report['finalization_errors']:
+            raise RuntimeError('Idle observability raw evidence retention failed')
         report['passed'] = True
         print(f'idle observability: {len(cases)} mocked controls passed; no performance claim')
+    except BaseException as error:
+        primary = error
+        report['exception'] = type(error).__name__ + ': ' + str(error)
+        raise
     finally:
-        (args.evidence / 'manifest.json').write_text(json.dumps(report, indent=2) + '\n')
+        finalize(evidence, report, primary)
 
 
 if __name__ == '__main__':
