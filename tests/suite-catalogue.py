@@ -18,12 +18,14 @@ ROLES = {'suite', 'support', 'fixture', 'manual', 'ungated'}
 # Minyar fixtures normally belong to harnesses. These maintained regressions
 # also have explicit mandatory dispositions, unlike generated Minyar samples.
 REQUIRED_MINYAR_FIXTURES = {'tests/cycle-late-registration.min', 'tests/quic-pto.min', 'tests/quic-ack.min'}
+REQUIRED_MINYAR_PREFIXES = ('tests/parallel-signatures/',)
 
 
 def discover(root):
     return {p.relative_to(root).as_posix() for p in (root / 'tests').rglob('*')
             if p.is_file() and (p.suffix in EXTENSIONS or
-                                    p.relative_to(root).as_posix() in REQUIRED_MINYAR_FIXTURES)}
+                                    p.relative_to(root).as_posix() in REQUIRED_MINYAR_FIXTURES or
+                                    (p.suffix == '.min' and p.relative_to(root).as_posix().startswith(REQUIRED_MINYAR_PREFIXES)))}
 
 
 def validate(data, root):
@@ -94,6 +96,12 @@ def controls():
         extra.write_text('pass\n')
         reject(data)  # Actual newly created source, not a simulated set mutation.
         extra.unlink()
+        # ABI Minyar cases cannot disappear behind the ordinary fixture policy.
+        managed = root / 'tests/parallel-signatures/new-managed.min'
+        managed.parent.mkdir()
+        managed.write_text('parallel function bad(value: Text) {}\n')
+        reject(data)
+        managed.unlink()
         objc = root / 'tests/new-native-fixture.m'
         objc.write_text('int main(void) { return 0; }\n')
         reject(data)

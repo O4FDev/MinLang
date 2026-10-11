@@ -15,6 +15,115 @@ ROOT = Path(__file__).resolve().parents[1]
 class BuildWiring(unittest.TestCase):
 
 
+    def test_parallel_signature_gates_prepare_every_frontend_and_fixture(self):
+        import importlib.util
+        import json
+        import re
+        native = 'check-parallel-signatures'
+        sanitize = native + '-sanitize'
+        source = (ROOT / 'build-support/parallel.mk').read_text()
+        ordinary = {'minyarc', 'minyarc-callbacks', 'minyarc-errors'}
+        instrumented = {x + '-sanitize' for x in ordinary}
+        fixtures = {(path.relative_to(ROOT)).as_posix()
+                    for path in (ROOT / 'tests/parallel-signatures').glob('*.min')}
+        self.assertEqual(len(fixtures), 20)
+        stage3 = {'build/compiler-stage3.ll', 'build/closure-compiler-stage3.ll',
+                  'build/errors-compiler-stage3.ll'}
+
+        def verify(fragment):
+            with tempfile.TemporaryDirectory(prefix='minyar parallel ABI wiring ') as folder:
+                makefile = Path(folder) / 'probe.mk'
+                artifacts = {'build/' + x for x in ordinary | instrumented} | stage3 | {
+                    'build/minyar-runtime.o', 'build'}
+                makefile.write_text(fragment + '\n.PHONY: ' + ' '.join(sorted(artifacts)) +
+                                   '\n' + ' '.join(sorted(artifacts)) + ':\n\t@echo ARTIFACT $@\n')
+                env = dict(os.environ)
+                env.pop('MAKEFLAGS', None)
+                result = subprocess.run(
+                    ['make', '-np', '-f', str(makefile), native, sanitize],
+                    cwd=ROOT, env=env, text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                rules = {}
+                for line in result.stdout.splitlines():
+                    match = re.match(r'^([\w./-]+):\s+(.*)$', line)
+                    if match:
+                        rules.setdefault(match[1], set()).update(match[2].split())
+                for gate in ('check', 'check-portable', 'check-parallel', 'check-callbacks',
+                             'check-errors-language'):
+                    self.assertIn(native, rules.get(gate, set()), gate)
+                for gate in ('check-sanitize', 'check-parallel-sanitize',
+                             'check-callbacks-sanitize', 'check-errors-language-sanitize'):
+                    self.assertIn(sanitize, rules.get(gate, set()), gate)
+                for target, frontends in ((native, ordinary), (sanitize, instrumented)):
+                    self.assertTrue({'build/' + x for x in frontends} <= rules[target], target)
+                    self.assertTrue(fixtures | {'tests/parallel-signatures.py',
+                                                'tests/regressions.py', 'build/minyar-runtime.o'}
+                                    <= rules[target], target)
+                self.assertTrue(stage3 <= rules[native])
+                commands = result.stdout.split('# GNU Make', 1)[0]
+                self.assertEqual(commands.count('python3 tests/parallel-signatures.py;'), 2)
+                self.assertIn('for frontend in minyarc minyarc-callbacks minyarc-errors;', commands)
+                self.assertIn('for frontend in minyarc-sanitize minyarc-callbacks-sanitize minyarc-errors-sanitize;', commands)
+                self.assertEqual(commands.count('MINYAR_TEST_COMPILER="./build/$frontend"'), 2)
+                self.assertEqual(commands.count('MINYAR_PARALLEL_OBSERVATIONS="$evidence/$frontend"'), 2)
+                self.assertEqual(commands.count('mktemp -d "'), 2)
+                self.assertIn('MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined', commands)
+                self.assertNotIn('MINYAR_PARALLEL_IR_CONTROL=', commands)
+                for suffix in ('native', 'sanitize'):
+                    self.assertIn((ROOT / 'build' / ('parallel-signatures-' + suffix)).as_posix(),
+                                  commands.replace('\\', '/'))
+                for family in ('compiler', 'closure-compiler', 'errors-compiler'):
+                    self.assertIn(f'cmp build/{family}-stage2.ll build/{family}-stage3.ll', commands)
+
+        verify(source)
+        for aggregate in (
+                'check check-portable check-parallel check-callbacks check-errors-language: ' + native,
+                'check-sanitize check-parallel-sanitize check-callbacks-sanitize check-errors-language-sanitize: ' + sanitize):
+            names, dependency = aggregate.split(': ', 1)
+            for gate in names.split():
+                mutant = source.replace(aggregate, ' '.join(x for x in names.split() if x != gate)
+                                        + ': ' + dependency, 1)
+                with self.subTest(missing_gate=gate), self.assertRaises(AssertionError):
+                    verify(mutant)
+        for declaration in (
+                'PARALLEL_SIGNATURE_FRONTENDS = minyarc minyarc-callbacks minyarc-errors',
+                'PARALLEL_SIGNATURE_SANITIZER_FRONTENDS = minyarc-sanitize minyarc-callbacks-sanitize minyarc-errors-sanitize'):
+            left, frontends = declaration.split(' = ', 1)
+            for missing in frontends.split():
+                mutant = source.replace(declaration, left + ' = ' +
+                                        ' '.join(x for x in frontends.split() if x != missing), 1)
+                with self.subTest(missing_frontend=missing), self.assertRaises(AssertionError):
+                    verify(mutant)
+        for fixture in fixtures:
+            mutant = source.replace(fixture, '', 1)
+            self.assertNotEqual(mutant, source)
+            with self.subTest(missing_fixture_prerequisite=fixture), self.assertRaises(AssertionError):
+                verify(mutant)
+        for old, new in (('$(abspath build)/parallel-signatures-', 'build/parallel-signatures-'),
+                         ('MINYAR_PARALLEL_OBSERVATIONS=', 'UNUSED_OBSERVATIONS=')):
+            with self.subTest(recipe=old), self.assertRaises(AssertionError):
+                verify(source.replace(old, new, 1))
+
+        tree = ast.parse((ROOT / 'scripts/check-linux.py').read_text())
+        targets = next(ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
+                       and any(isinstance(x, ast.Name) and x.id == 'TARGETS' for x in node.targets))
+        for target in (native, sanitize):
+            self.assertEqual(targets.count(target), 1)
+        workflow = (ROOT / '.github/workflows/ci.yml').read_text()
+        self.assertIn('check-portable', workflow)
+        self.assertIn('scripts/check-linux.py', workflow)
+        spec = importlib.util.spec_from_file_location('parallel_catalogue', ROOT / 'tests/suite-catalogue.py')
+        catalogue = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(catalogue)
+        data = json.loads((ROOT / 'tests/suite-catalogue.json').read_text())
+        catalogue.validate(data, ROOT)
+        for name in fixtures | {'tests/parallel-signatures.py'}:
+            self.assertIn(name, catalogue.discover(ROOT))
+            with self.subTest(missing_source=name), self.assertRaises(ValueError):
+                catalogue.validate(dict(data, sources=[r for r in data['sources'] if r['path'] != name]), ROOT)
+
+
+
 
     def test_signed_relay_has_pinned_peer_and_all_lifetime_gates(self):
         import importlib.util
