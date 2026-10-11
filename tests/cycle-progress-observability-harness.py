@@ -47,6 +47,63 @@ class ObservabilityHarness(unittest.TestCase):
                 self.assertIn(b'requires Python assertions', result.stderr)
                 self.assertFalse(destination.exists())
 
+
+    def test_exited_parent_does_not_release_descendant_ownership(self):
+        destination = self.root/'exited-parent'
+        destination.mkdir()
+        owner = self.driver.CommandRecords(destination, {'commands': [], 'finalization_errors': []})
+        late = destination/'late.txt'
+        script = destination/'exit-parent.py'
+        script.write_text(
+            'import subprocess,sys\n'
+            'code="import pathlib,time; time.sleep(1.5); pathlib.Path("+repr(sys.argv[1])+").write_text(\'late\')"\n'
+            'subprocess.Popen([sys.executable,"-c",code])\n'
+            'print("PARENT_EXIT",flush=True)\n')
+        with self.assertRaises(subprocess.TimeoutExpired):
+            owner.run([sys.executable, str(script), str(late)],
+                      timeout=.3, label='exited-parent')
+        row = owner.report['commands'][0]
+        self.assertTrue(row['timed_out'])
+        self.assertEqual(row['status'], 0)
+        self.assertEqual(row['cleanup']['status'], 'completed')
+        time.sleep(1.6)
+        self.assertFalse(late.exists())
+
+    def test_secondary_kill_close_wait_failures_preserve_timeout(self):
+        class Pipe:
+            closed = False
+            def close(self):
+                raise OSError('injected close failure')
+        class Process:
+            pid = 70001
+            returncode = None
+            stdout, stderr = Pipe(), Pipe()
+            def communicate(self, **kwargs):
+                raise subprocess.TimeoutExpired(['owned'], .1)
+            def poll(self):
+                return None
+            def kill(self):
+                raise OSError('injected kill failure')
+            def wait(self, **kwargs):
+                raise OSError('injected wait failure')
+        destination = self.root/'secondary-failure'
+        destination.mkdir()
+        report = {'commands': [], 'finalization_errors': []}
+        owner = self.driver.CommandRecords(destination, report)
+        with patch.object(self.driver.subprocess, 'Popen', return_value=Process()), \
+                patch.object(self.driver, 'terminate_process_tree',
+                             side_effect=OSError('injected tree failure')):
+            with self.assertRaises(subprocess.TimeoutExpired) as captured:
+                owner.run([sys.executable, '-c', 'pass'],
+                          timeout=.1, label='secondary-failure')
+        self.assertTrue(report['commands'][0]['timed_out'])
+        self.assertEqual(report['commands'][0]['cleanup']['status'], 'failed')
+        messages = '\n'.join(row['message'] for row in report['finalization_errors'])
+        for expected in ('kill failure', 'close failure', 'wait failure'):
+            self.assertIn(expected, messages)
+            self.assertTrue(any(expected in note
+                                for note in getattr(captured.exception, '__notes__', [])))
+
     def test_raw_streams_are_retained_without_text_normalization(self):
         destination = self.root/'raw'
         destination.mkdir()
