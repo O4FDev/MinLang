@@ -42,7 +42,7 @@ TARGETS = ['check-linux-snapshot', 'check-quic-interop-results', 'check-toolchai
            'check-peer-grpc-retire', 'check-peer-grpc-retire-sanitize',
            'check-peer-edge', 'check-peer-edge-sanitize',
            'check-peer-edge-retry', 'check-peer-edge-retry-sanitize', 'check-json-parser-sanitize',
-           'check-cycle-progress', 'check-cycle-progress-sanitize', 'check-feature-dispatch', 'check-managed-graphs', 'check-managed-graphs-launcher',
+           'check-cycle-progress', 'check-cycle-progress-sanitize', 'check-cycle-witness', 'check-cycle-witness-sanitize', 'check-feature-dispatch', 'check-managed-graphs', 'check-managed-graphs-launcher',
            'check-callbacks', 'check-callback-domains', 'check-isolated-workers',
            'check-ownership-policy', 'check-stack-ownership', 'check-runtime-cache',
            'check-generated-sanitizer', 'check-sanitized-fixed-point',
@@ -96,6 +96,7 @@ def main():
     p.add_argument('--clang', default='clang')
     p.add_argument('--cxx', default='clang++')
     p.add_argument('--timeout', type=int, default=1800, help='Maximum seconds for each top-level check.')
+    p.add_argument('--jobs', type=int, choices=(1, 2), default=2, help='Capped make concurrency; use 1 on shared remote hosts.')
     p.add_argument('--dry-run', action='store_true', help='Inspect the plan without copying or executing builds; usable on other hosts.')
     a = p.parse_args()
     source = (a.resume.resolve() / 'source') if a.resume else a.source.resolve()
@@ -110,7 +111,7 @@ def main():
                 'experiments/memory/critical-path-study.py',
                 'docs/research/exhaustive/implementations.jsonl']
     missing = [name for name in required if not (source / name).is_file()]
-    plan = {'source': str(source), 'build_targets': BUILD,
+    plan = {'source': str(source), 'make_jobs': a.jobs, 'build_targets': BUILD,
             'correctness_targets': TARGETS,
             'additional': ['stage2/stage3 LLVM byte equality', 'runtime unit native + ASan/UBSan',
                            'ordinary source regressions with sanitized compiler/runtime',
@@ -208,7 +209,7 @@ def main():
                UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1',
                CC='clang', CXX='clang++', CLANG='clang', MINYAR_TEST_CLANG='clang',
                LIMITED='', SANITIZER_LIMITED='')
-    make = [tools['make'], '-j2', 'LIMITED=', 'SANITIZER_LIMITED=', 'CC=clang', 'LLVM_CC=clang',
+    make = [tools['make'], '-j' + str(a.jobs), 'LIMITED=', 'SANITIZER_LIMITED=', 'CC=clang', 'LLVM_CC=clang',
             'COMPILER_LTO_FLAGS=-flto -fuse-ld=lld']
 
     def check(label, command, extra_env=None):

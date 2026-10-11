@@ -51,10 +51,24 @@ check-recursive-data check-bounded check-peer-sanitize check-peer-ownership chec
 check-portable check: check-feature-dispatch check-managed-graphs check-managed-graphs-launcher check-callbacks check-callback-domains check-isolated-workers
 check-sanitize: check-managed-graphs-sanitize check-callbacks-sanitize check-managed-graphs-profiles check-isolated-workers-sanitize
 
+# Explicit sanitizer installations may keep their Windows runtime DLLs
+# beside the selected compiler rather than the ordinary compiler's directory.
+CYCLE_SANITIZER_CLANG = $(or $(MINYAR_SANITIZER_CLANG),$(LLVM_CC))
+CYCLE_SANITIZER_PATH = $(if $(MINYAR_SANITIZER_CLANG),$(dir $(MINYAR_SANITIZER_CLANG)):$(PATH),$(PATH))
+
 .PHONY: check-cycle-progress check-cycle-progress-sanitize
 check-cycle-progress:
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-progress.py --evidence build/cycle-progress-native
 check-cycle-progress-sanitize:
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/cycle-progress.py --sanitize --evidence build/cycle-progress-sanitize
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-progress.py --sanitize --evidence build/cycle-progress-sanitize
 check check-portable: check-cycle-progress
 check-sanitize: check-cycle-progress-sanitize
+
+.PHONY: check-cycle-witness check-cycle-witness-sanitize
+check-cycle-witness:
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-witness.py --evidence build/cycle-witness-native
+check-cycle-witness-sanitize:
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-witness.py --sanitize --evidence build/cycle-witness-sanitize
+check check-portable: check-cycle-witness check-cycle-witness-sanitize
+check-sanitize: check-cycle-witness-sanitize
+check-managed-graphs-profiles: check-cycle-witness check-cycle-witness-sanitize
