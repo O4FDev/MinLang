@@ -446,7 +446,7 @@ static void list_store_traced(MinyarList *list, long long value, int retain_valu
         if (retain_value)
             minyar_rc_retain_traced((void *)(uintptr_t)value);
         if (kind == RC_TRACED)
-            rc_cycle_edge_add(list, (void *)(uintptr_t)value);
+            rc_cycle_edge_insert(list, (void *)(uintptr_t)value);
     }
     list->values[list->length++] = value;
 #ifdef MINYAR_BOUNDED_RC
@@ -552,9 +552,14 @@ void minyar_record_set_take_traced(MinyarRecord *record, long long field,
     if ((unsigned long long)field >= (unsigned long long)record->length)
         list_position_stop(field, record->length);
     unsigned char *references = (unsigned char *)(record->values + record->length);
+    unsigned additive = !(references[field] & 1) || !record->values[field];
     references[field] = 1;
-    if ((((RcObject *)record - 1)->ownership & 7) == RC_TRACED)
-        rc_cycle_edge_add(record, (void *)(uintptr_t)value);
+    if ((((RcObject *)record - 1)->ownership & 7) == RC_TRACED) {
+        if (additive)
+            rc_cycle_edge_insert(record, (void *)(uintptr_t)value);
+        else
+            rc_cycle_edge_add(record, (void *)(uintptr_t)value);
+    }
     minyar_record_set_traced(record, field, value);
 }
 

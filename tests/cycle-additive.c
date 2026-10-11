@@ -36,6 +36,7 @@ typedef struct { MinyarRecord *root, *interior; MinyarList *list; } Graph;
 /* Acyclic: root -> list -> interior -> scalar leaf. Only root has an external
  * owner after setup. The oracle is these explicit owning edges, not marks. */
 static Graph graph(void) {
+    size_t existing = rc_object_count;
     Graph g;
     g.root = minyar_record_new_traced(1);
     g.list = minyar_list_new_traced();
@@ -51,9 +52,11 @@ static Graph graph(void) {
     minyar_rc_release(g.list);
     rc_cycle_request();
     drain();
-    assert(rc_object_count == 4 && rc_cycle_proof_valid);
-    assert(rc_cycle_proof_anchor == rc_cycle_value(g.root));
-    assert(rc_cycle_proven(rc_cycle_value(g.interior)));
+    assert(rc_object_count == existing + 4 && rc_cycle_proof_valid);
+    if (!existing) {
+        assert(rc_cycle_proof_anchor == rc_cycle_value(g.root));
+        assert(rc_cycle_proven(rc_cycle_value(g.interior)));
+    }
     return g;
 }
 static void growth(unsigned n, int retained) {
@@ -93,15 +96,44 @@ static void growth(unsigned n, int retained) {
     minyar_rc_release(g.root);
     empty();
 }
+static void registered_growth(void) {
+    Graph g = graph();
+    size_t before = rc_cycle_units, epochs = rc_cycle_epochs;
+    for (unsigned i = 0; i < 32; i++) {
+        /* Still acyclic, but the new owner's traced outgoing edge registers
+         * it. This remains deliberately conservative; it is a measured
+         * limitation rather than evidence of general linear graph growth. */
+        MinyarRecord *branch = minyar_record_new_traced(1);
+        MinyarRecord *leaf = minyar_record_new_traced(1);
+        minyar_record_set_traced(leaf, 0, 2000 + i);
+        minyar_record_set_take_traced(branch, 0, slot(leaf));
+        assert(rc_cycle_value(branch)->registered);
+        assert(!rc_cycle_proven(rc_cycle_value(branch)));
+        minyar_list_add_take_traced(g.list, slot(branch));
+        minyar_rc_retain_traced(g.interior);
+        for (unsigned call = 0; call < 64; call++) poll_one();
+        rc_drop(g.interior);
+        drain();
+        assert(rc_object_count == 4u + 2u * (i + 1));
+        assert(leaf->values[0] == 2000 + (long long)i);
+    }
+    fprintf(stderr, "registered acyclic growth n=32 units=%zu epochs=%zu\n",
+            rc_cycle_units - before, rc_cycle_epochs - epochs);
+    assert(rc_cycle_epochs > epochs); /* Unknown registered targets do rescan. */
+    minyar_rc_release(g.root);
+    empty();
+}
 static void fresh_owners(void) {
     Graph g = graph();
     /* A new owner's edge points TOWARDS the old root. That cannot certify
      * the new owner or its other descendants as reachable FROM the root. */
     MinyarRecord *outside = minyar_record_new_traced(2);
-    minyar_record_set_reference_traced(outside, 0, slot(outside));
     minyar_record_set_reference_traced(outside, 1, slot(g.root));
     assert(rc_cycle_proof_valid);
     assert(!rc_cycle_proven(rc_cycle_value(outside)));
+    /* A later unknown self-cycle keeps the old conservative cohort boundary. */
+    minyar_record_set_reference_traced(outside, 0, slot(outside));
+    assert(!rc_cycle_proof_valid);
     minyar_rc_release(outside);
     drain();
     assert(rc_object_count == 4);
@@ -121,6 +153,28 @@ static void unknown_children(void) {
     minyar_list_set_traced(g.list, 1, 0);
     drain();
     assert(rc_object_count == 4);
+    minyar_rc_release(g.root);
+    empty();
+}
+static void copied_anchor(void) {
+    Graph g = graph();
+    /* The real copying API retains BEFORE incoming changes. The root's one
+     * external owner must therefore survive creating a new back edge. */
+    assert(rc_cycle_proof_valid);
+    minyar_list_add_traced(g.list, slot(g.root));
+    assert(rc_cycle_anchor_held() && rc_cycle_proof_valid);
+    assert((((RcObject *)g.root - 1)->ownership >> 3) ==
+           rc_cycle_value(g.root)->incoming + 1);
+    size_t before = rc_cycle_units, epochs = rc_cycle_epochs;
+    minyar_rc_retain_traced(g.interior);
+    for (unsigned i = 0; i < 64; i++) poll_one();
+    rc_drop(g.interior);
+    assert(rc_cycle_pending);
+    drain();
+    assert(rc_cycle_units - before == 1 && rc_cycle_epochs == epochs);
+    assert(rc_object_count == 4);
+    minyar_list_set_traced(g.list, 1, 0);
+    drain();
     minyar_rc_release(g.root);
     empty();
 }
@@ -169,6 +223,23 @@ static void replacement_and_reuse(void) {
         empty();
     }
 }
+static void anchor_boundary(void) {
+    MinyarRecord *outside = minyar_record_new_traced(1);
+    minyar_record_set_reference_traced(outside, 0, slot(outside));
+    MinyarRecord *anchor = minyar_record_new_traced(1);
+    minyar_record_set_reference_traced(anchor, 0, slot(outside));
+    minyar_rc_release(outside);
+    drain();
+    assert(rc_object_count == 2);
+    assert(rc_cycle_proof_anchor == rc_cycle_value(anchor));
+    /* Before any cleanup poll can obscure the allocator-reuse boundary. */
+    rc_drop(anchor);
+    assert(!rc_cycle_proof_anchor);
+#ifndef MINYAR_BOUNDED_RC
+    minyar_rc_release(NULL); /* Service the eager destructor after its boundary. */
+#endif
+    empty();
+}
 static void force_phase(unsigned phase) {
     size_t turns = 0;
     while (rc_cycle_phase != phase) {
@@ -184,9 +255,11 @@ static void phases(void) {
     for (unsigned phase = RC_CYCLE_ROOTS; phase <= RC_CYCLE_SWEEP; phase++) {
         Graph g = graph();
         MinyarRecord *other = minyar_record_new_traced(1);
-        minyar_record_set_reference_traced(other, 0, slot(other));
+        minyar_record_set_traced(other, 0, 123);
+        assert(rc_cycle_proof_valid);
         rc_cycle_request();
         force_phase(phase);
+        assert(rc_cycle_proof_valid && rc_cycle_proof_build);
         /* New allocation and list expansion may service work themselves.
          * Use an already live child and barrier prefix at the chosen phase. */
         minyar_rc_retain_traced(g.interior);
@@ -225,10 +298,13 @@ int main(int argc, char **argv) {
     assert(n == 32 || n == 256 || n == 2048);
     growth(n, 0);
     growth(n, 1);
+    registered_growth();
     fresh_owners();
     unknown_children();
+    copied_anchor();
     moved_anchor();
     replacement_and_reuse();
+    anchor_boundary();
     phases();
     roots();
     printf("additive certificates: n=%u objects=0 bytes=0\n", n);
