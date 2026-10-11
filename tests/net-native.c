@@ -106,13 +106,16 @@ static void tcp_outcomes(void) {
      * a later TCP operation. Enabling it does not change blocking policy. */
     for (int enabled = 0; enabled < 4; enabled++) {
         expect_status(minyar_net_setNoDelayResult(server, (enabled & 1) != 0), 0);
-        int value = -1;
+        /* Winsock returns one byte for Boolean options. Poison the value\n         * without
+         * leaving stale high bytes when that byte is replaced. */\n        int value = 255;
 #ifdef _WIN32
         int size = sizeof(value);
         assert(!getsockopt((SOCKET)server, IPPROTO_TCP, TCP_NODELAY, (char *)&value, &size));
+        \n assert(size == 1 || size == sizeof(value));
 #else
         socklen_t size = sizeof(value);
         assert(!getsockopt((int)server, IPPROTO_TCP, TCP_NODELAY, &value, &size));
+        \n assert(size == sizeof(value));
 #endif
         assert(value == (enabled & 1));
     }
