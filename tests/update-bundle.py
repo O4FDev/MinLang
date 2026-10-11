@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import struct
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -141,6 +142,20 @@ class Packager(unittest.TestCase):
                     bundle.prepare(self.root,self.output,self.main)
             self.assertEqual(self.output.read_bytes(),b'previous artifact')
             self.assertEqual(list(self.lab.glob('.minyar-bundle-*')),[])
+
+    def test_native_exe_name_and_previously_modified_image_are_valid(self):
+        # Use a real .exe spelling and rewrite the image before preparing it:
+        # this covers native Windows path-mode and creation/change-time APIs.
+        main=self.root/'Tolum.exe'
+        main.write_bytes(b'MZunsigned fixture')
+        time.sleep(0.02)
+        main.write_bytes(b'MZfinal signed image fixture')
+        first=bundle.prepare(self.root,self.output,'Tolum.exe')
+        self.assertEqual(first['entrypoint'],'Tolum.exe')
+        self.assertIn(main.read_bytes(),self.output.read_bytes())
+        second=bundle.prepare(self.root,self.lab/'again.pkg','Tolum.exe')
+        self.assertEqual(first,second)
+        self.assertEqual(self.output.read_bytes(),(self.lab/'again.pkg').read_bytes())
 
     def test_ambiguous_names_bad_entrypoints_and_embedded_output_refused(self):
         for name in ['../escape','/absolute','NUL','missing','App.app/Contents/Resources/resource with spaces']:
