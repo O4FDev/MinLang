@@ -15,6 +15,7 @@ use "tlsserver" as tls
 use "tlsverify" as trust
 use "peerauth" as auth
 use "peerwire" as wire
+use "peergrpc" as grpc
 use "peerlive" as live
 use "redis" as redis
 use "resp2" as resp
@@ -95,10 +96,10 @@ function registryID(registry: Registry, device: Text): Integer {
     return -1
 }
 record Address { host: Text; port: Integer }
-record InputStream { id: Integer; decoder: wire.Decoder }
+record InputStream { id: Integer; decoder: wire.Decoder; held: wire.FrameResult; blocked: Boolean; ended: Boolean }
 record Peer {
     live: Boolean; queued: Boolean; flags: Integer; mode: Integer; socket: Integer; watch: Integer
-    connection: transport.Connection; gateway: tls.Session; decoder: wire.Decoder; inputs: List<InputStream>
+    connection: transport.Connection; gateway: tls.Session; grpc: grpc.Server; releases: List<Integer>; finalizations: List<Finalization>; decoder: wire.Decoder; inputs: List<InputStream>
     paths: List<Address>; routed: Bytes; routedIds: List<Bytes>; routingVersion: Integer; output: Bytes; outputAt: Integer; since: Integer
     bound: Boolean; device: Text; exit: Text; epoch: Text; health: live.Health; heartbeatAt: Integer
     control: Integer; published: Boolean; publicationPending: Boolean; redisQueued: Boolean; admitted: Integer
@@ -109,6 +110,7 @@ record Core {
     identity: List<Bytes>; key: Bytes; deviceRoots: List<Bytes>; gatewayRoots: List<Bytes>; registry: Registry; keys: auth.KeySet
     udp: Integer; deviceListener: Integer; gatewayListener: Integer
     peers: List<Peer>; free: List<Integer>; freeCount: Integer; active: Integer
+    relays: List<Relay>; replays: List<Replay>; replayIndex: dispatch.Table; nextRelay: Integer; relaysRetired: Integer; callsOpened: Integer; callsReleased: Integer; maxRelays: Integer; replayAt: Integer
     retry: retry.Store; noRetry: retry.Opened; allocated: Integer; retryReplies: Integer; retryValidated: Integer
     work: List<Integer>; workAt: Integer; routing: dispatch.Table; exits: dispatch.Table; timers: dispatch.Timers
     redisSocket: Integer; redisWatch: Integer; redisClient: redis.Client; publications: List<Publication>; publicationAt: Integer
@@ -162,7 +164,7 @@ function allocate(core: Core, mode: Integer, socket: Integer, original: Bytes, a
     if mode == 1 { connection = transport.serverTCP(randomBytes(80),"hearth-peer",core.identity,core.key,core.deviceRoots,true,core.now) }
     let gateway = tls.none()
     if mode == 2 { gateway = tls.server(randomBytes(64),"h2",core.identity,core.key,core.gatewayRoots,true) }
-    let peer = Peer { live: true; queued: false; flags: 0; mode: mode; socket: socket; watch: 0; connection: connection; gateway: gateway; decoder: wire.create(); inputs: []
+    let peer = Peer { live: true; queued: false; flags: 0; mode: mode; socket: socket; watch: 0; connection: connection; gateway: gateway; grpc: grpc.create(); releases: []; finalizations: []; decoder: wire.create(); inputs: []
         paths: [address]; routed: original; routedIds: []; routingVersion: -1; output: Bytes(); outputAt: 0; since: core.now; bound: false; device: ""; exit: ""; epoch: ""; health: live.heartbeat(Bytes()); heartbeatAt: -1
         control: -1; published: false; publicationPending: false; redisQueued: false; admitted: 0 }
     let id = core.peers.length
@@ -204,7 +206,13 @@ function queuePublication(core: Core, id: Integer, operation: Integer): Boolean 
 function drop(core: Core, id: Integer) {
     let peer = core.peers[id]
     if !peer.live { return }
-    if peer.bound {
+    for relay in core.relays {
+        if relay.live && (relay.gateway == id || relay.device == id) {
+            if relay.gateway != id { finalize(core,relay.gateway,relay.call,"",14,"device disconnected") }
+            retireRelay(core,relay,relay.device != id)
+        }
+    }
+    if peer.bound && peer.mode != 2 {
         let key = identityKey(peer.exit)
         if dispatch.lookup(core.exits,key) == id { dispatch.remove(core.exits,key); queuePublication(core,id,3) }
     }
@@ -212,11 +220,229 @@ function drop(core: Core, id: Integer) {
     if peer.watch > 0 { callbacks.cancel(core.dispatcher,peer.watch) }
     if peer.socket >= 0 { net.close(peer.socket) }
     dispatch.cancel(core.timers,id); peer.live = false; peer.output = Bytes(); peer.inputs = []; peer.paths = []; peer.device = ""; peer.exit = ""; peer.epoch = ""; peer.health = live.heartbeat(Bytes()); peer.decoder = wire.create()
-    peer.connection = transport.client("retired.invalid",Bytes(),"retired",[],[],Bytes()); peer.gateway = tls.none()
+    peer.connection = transport.client("retired.invalid",Bytes(),"retired",[],[],Bytes()); peer.gateway = tls.none(); peer.grpc = grpc.create(); peer.releases = []; peer.finalizations = []
     core.active -= 1
     if core.freeCount == core.free.length { core.free.add(id) } else { core.free[core.freeCount] = id }; core.freeCount += 1
 }
 function session(peer: Peer): tls.Session { if peer.mode == 0 { return peer.connection.udp.serverTLS }; return peer.connection.serverTLS }
+record Relay {
+    live: Boolean; gateway: Integer; call: Integer; device: Integer; stream: Integer; id: Integer
+    value: wire.Relay; start: Bytes; toDevice: Bytes; toGateway: Bytes
+    statusSent: Boolean; clientEnded: Boolean; finSent: Boolean; openingDue: Integer
+}
+record Replay { key: Bytes; until: Integer }
+record Finalization { call: Integer; status: Text; code: Integer; message: Text }
+function relayForDevice(core: Core, device: Integer, stream: Integer): Integer {
+    for at in 0..core.relays.length {
+        let relay = core.relays[at]
+        if relay.live && relay.device == device && relay.stream == stream { return at }
+    }
+    return -1
+}
+function finalize(core: Core, gateway: Integer, call: Integer, status: Text, code: Integer, message: Text) {
+    if gateway < 0 || gateway >= core.peers.length || !core.peers[gateway].live { return }
+    let peer = core.peers[gateway]
+    let result = errors.boolean(true)
+    if status != "" { result = grpc.sendStatusDetail(peer.grpc,call,status,message) }
+    else { result = grpc.closeStream(peer.grpc,call,code,message) }
+    if !errors.booleanOk(result) && errors.isWouldBlock(errors.booleanError(result)) {
+        for pending in peer.finalizations { if pending.call == call { return } }
+        peer.finalizations.add(Finalization { call: call; status: status; code: code; message: message })
+    }
+    mark(core,gateway)
+}
+function retireRelay(core: Core, relay: Relay, cancel: Boolean) {
+    if !relay.live { return }
+    relay.live = false; relay.start = Bytes(); relay.toDevice = Bytes(); relay.toGateway = Bytes()
+    core.relaysRetired += 1
+    if relay.device >= 0 && relay.device < core.peers.length && core.peers[relay.device].live {
+        let peer = core.peers[relay.device]
+        if peer.admitted < 1 { fail("relay admission accounting underflow") }
+        peer.admitted -= 1; peer.publicationPending = live.ok(peer.health)
+        if cancel {
+            let cancelled = transport.cancelStream(peer.connection,relay.stream)
+            if !errors.booleanOk(cancelled) && !errors.isWouldBlock(errors.booleanError(cancelled)) && errors.code(errors.booleanError(cancelled)) != errors.closedCode() {
+                drop(core,relay.device)
+            }
+        }
+        mark(core,relay.device)
+    }
+}
+function relayFailure(core: Core, relay: Relay, code: Integer, message: Text) {
+    finalize(core,relay.gateway,relay.call,"",code,message); retireRelay(core,relay,true)
+}
+function serviceRelay(core: Core, relay: Relay) {
+    if !relay.live { return }
+    let device = core.peers[relay.device]; let gateway = core.peers[relay.gateway]
+    if !device.live || !gateway.live { relayFailure(core,relay,14,"relay endpoint closed"); return }
+    if !relay.statusSent && core.now >= relay.openingDue { relayFailure(core,relay,4,"establishment deadline exceeded"); return }
+    if relay.start.length > 0 {
+        let written = transport.write(device.connection,relay.stream,relay.start,false)
+        if errors.integerOk(written) {
+            let count = errors.integerValue(written)
+            if count < 0 || count > relay.start.length { fail("invalid relay start write count") }
+            relay.start = relay.start.slice(count,relay.start.length); mark(core,relay.device)
+        } else if !errors.isWouldBlock(errors.integerError(written)) { relayFailure(core,relay,14,"device stream unavailable"); return }
+        if relay.start.length > 0 { return }
+    }
+    if wire.relayReady(relay.value) && !relay.statusSent {
+        let sent = grpc.sendStatus(gateway.grpc,relay.call,"ok")
+        if errors.booleanOk(sent) { relay.statusSent = true; mark(core,relay.gateway) }
+        else if !errors.isWouldBlock(errors.booleanError(sent)) { relayFailure(core,relay,13,"gateway admission failed"); return }
+    }
+    if !relay.statusSent { return }
+    // Each direction has a bounded queue plus one retained partial write.
+    if !wire.relayClosed(relay.value) && !relay.clientEnded && wire.outgoingBytes(relay.value) <= 1048576 - 65552 {
+        for reads in 0..16 {
+            if wire.outgoingBytes(relay.value) > 1048576 - 65552 { break }
+            let data = grpc.read(gateway.grpc,relay.call,16384)
+            if errors.bytesStatus(data) == errors.successStatus() {
+                let bytes = errors.bytesValue(data)
+                if bytes.length > 0 {
+                    let queued = wire.enqueueRelay(relay.value,bytes)
+                    if !errors.booleanOk(queued) { fail("relay queue capacity reservation failed") }
+                }
+            } else if errors.bytesStatus(data) == errors.endOfStreamStatus() { relay.clientEnded = true; break }
+            else if errors.isWouldBlock(errors.bytesError(data)) { break }
+            else { relayFailure(core,relay,13,"invalid gateway relay data"); return }
+        }
+    }
+    for writes in 0..16 {
+        if relay.toDevice.length == 0 { relay.toDevice = wire.takeOutgoing(relay.value,16384) }
+        if relay.toDevice.length == 0 { break }
+        let written = transport.write(device.connection,relay.stream,relay.toDevice,false)
+        if errors.integerOk(written) {
+            let count = errors.integerValue(written)
+            if count < 0 || count > relay.toDevice.length { fail("invalid device relay write count") }
+            if count == 0 { break }
+            relay.toDevice = relay.toDevice.slice(count,relay.toDevice.length); mark(core,relay.device)
+        } else if errors.isWouldBlock(errors.integerError(written)) { break }
+        else { relayFailure(core,relay,14,"device relay closed"); return }
+    }
+    if relay.clientEnded && !relay.finSent && relay.toDevice.length == 0 && wire.outgoingBytes(relay.value) == 0 {
+        let ended = transport.write(device.connection,relay.stream,Bytes(),true)
+        if errors.integerOk(ended) { relay.finSent = true; mark(core,relay.device) }
+        else if !errors.isWouldBlock(errors.integerError(ended)) { relayFailure(core,relay,14,"device request close failed"); return }
+    }
+    for writes in 0..16 {
+        if relay.toGateway.length == 0 { relay.toGateway = wire.takeIncoming(relay.value,16384) }
+        if relay.toGateway.length == 0 { break }
+        let written = grpc.write(gateway.grpc,relay.call,relay.toGateway)
+        if errors.booleanOk(written) { relay.toGateway = Bytes(); mark(core,relay.gateway); mark(core,relay.device) }
+        else if errors.isWouldBlock(errors.booleanError(written)) { break }
+        else { relayFailure(core,relay,13,"gateway response closed"); return }
+    }
+    if wire.relayClosed(relay.value) && relay.toGateway.length == 0 && wire.incomingBytes(relay.value) == 0 {
+        if !relay.finSent {
+            let ended = transport.write(device.connection,relay.stream,Bytes(),true)
+            if errors.integerOk(ended) { relay.finSent = true; mark(core,relay.device) }
+            else if errors.isWouldBlock(errors.integerError(ended)) { return }
+        }
+        finalize(core,relay.gateway,relay.call,"",0,""); retireRelay(core,relay,false)
+    }
+}
+function acceptRelay(core: Core, gateway: Integer, opened: grpc.OpenResult) {
+    let call = grpc.openStreamID(opened); core.callsOpened += 1
+    let requested = grpc.openExitID(opened); let connection = grpc.openConnID(opened)
+    let registered = dispatch.lookup(core.registry.exits,identityKey(requested))
+    if registered < 0 || !core.registry.valid || core.registry.entries[registered].exit != requested {
+        finalize(core,gateway,call,"exit_offline",0,"unknown exit"); return
+    }
+    let entry = core.registry.entries[registered]; let wall = trust.currentTimeMilliseconds()/1000
+    let grant = auth.inspect(grpc.openGrantBytes(opened),core.keys,entry.exit,requested,connection,wall,grpc.openDeadlineSeconds(opened))
+    if !auth.grantOk(grant) { finalize(core,gateway,call,"grant_invalid",0,"invalid signed grant"); return }
+    let replayKey = identityKey(requested + ":" + connection)
+    if dispatch.lookup(core.replayIndex,replayKey) >= 0 { finalize(core,gateway,call,"grant_invalid",0,"connection grant replayed"); return }
+    let device = dispatch.lookup(core.exits,identityKey(requested))
+    if device < 0 || !core.peers[device].live || core.peers[device].exit != requested || !core.peers[device].published || !live.ok(core.peers[device].health) {
+        finalize(core,gateway,call,"exit_offline",0,"device is offline"); return
+    }
+    let peer = core.peers[device]
+    if entry.revoked || entry.paused || entry.quarantined || live.paused(peer.health) {
+        finalize(core,gateway,call,"policy_denied",0,"device policy denies open"); return
+    }
+    if max(peer.admitted,live.reportedInFlight(peer.health)) >= min(entry.maximum,live.maximum(peer.health)) || core.relays.length >= 4096 {
+        finalize(core,gateway,call,"concurrency_full",0,"device capacity exhausted"); return
+    }
+    if core.nextRelay > 4294967295 || core.replays.length >= 8192 {
+        finalize(core,gateway,call,"concurrency_full",0,"edge admission capacity exhausted"); return
+    }
+    let stream = transport.openStream(peer.connection)
+    if !errors.integerOk(stream) { finalize(core,gateway,call,"concurrency_full",0,"device transport capacity exhausted"); return }
+    let id = core.nextRelay; core.nextRelay += 1
+    let start = wire.makeStart(id,grant)
+    if !errors.bytesOk(start) { fail("verified grant failed START encoding") }
+    if !errors.booleanOk(dispatch.insert(core.replayIndex,replayKey,1)) { fail("replay admission reservation failed") }
+    core.replays.add(Replay { key: replayKey; until: auth.expires(grant)+30 })
+    let due = grpc.openMonotonicDeadlineMillis(opened)
+    if due <= 0 { due = core.now + max(0,grpc.openDeadlineMilliseconds(opened)-trust.currentTimeMilliseconds()) }
+    let relay = Relay { live: true; gateway: gateway; call: call; device: device; stream: errors.integerValue(stream); id: id
+        value: wire.createRelay(grant,id); start: errors.bytesValue(start); toDevice: Bytes(); toGateway: Bytes()
+        statusSent: false; clientEnded: false; finSent: false; openingDue: due }
+    core.relays.add(relay); core.maxRelays = max(core.maxRelays,core.relays.length)
+    peer.admitted += 1; peer.publicationPending = true
+    mark(core,device); serviceRelay(core,relay)
+}
+function gatewayService(core: Core, id: Integer) {
+    let peer = core.peers[id]; let wall = trust.currentTimeMilliseconds()
+    let clocked = grpc.transportTick(peer.grpc,core.now)
+    if !errors.booleanOk(clocked) { drop(core,id); return }
+    grpc.tick(peer.grpc,wall)
+    let incoming = tls.takeIncoming(peer.gateway)
+    if incoming.length > 0 {
+        let received = grpc.receive(peer.grpc,incoming)
+        if !errors.booleanOk(received) { drop(core,id); return }
+    }
+    for requests in 0..128 {
+        let opened = grpc.requests(peer.grpc,wall)
+        if grpc.openOk(opened) { acceptRelay(core,id,opened) }
+        else if errors.isWouldBlock(grpc.openError(opened)) { break }
+        else if errors.isError(grpc.connectionError(peer.grpc)) { drop(core,id); return }
+    }
+    // Process resets/deadlines before any queued application forwarding.
+    let closed = grpc.closed(peer.grpc)
+    while grpc.closedOk(closed) {
+        let call = grpc.closedStreamID(closed)
+        for relay in core.relays { if relay.live && relay.gateway == id && relay.call == call { retireRelay(core,relay,true) } }
+        peer.releases.add(call); closed = grpc.closed(peer.grpc)
+    }
+    let pending: List<Finalization> = []
+    for finalization in peer.finalizations {
+        let sent = errors.boolean(true)
+        if finalization.status != "" { sent = grpc.sendStatusDetail(peer.grpc,finalization.call,finalization.status,finalization.message) }
+        else { sent = grpc.closeStream(peer.grpc,finalization.call,finalization.code,finalization.message) }
+        if !errors.booleanOk(sent) && errors.isWouldBlock(errors.booleanError(sent)) { pending.add(finalization) }
+    }
+    peer.finalizations = pending
+    for relay in core.relays { if relay.live && relay.gateway == id { serviceRelay(core,relay) } }
+    if peer.outputAt > 0 { peer.output = peer.output.slice(peer.outputAt,peer.output.length); peer.outputAt = 0 }
+    if peer.output.length < 1048576 - 32768 {
+        let outgoing = grpc.takeOutgoing(peer.grpc,16384)
+        if outgoing.length > 0 { tls.send(peer.gateway,outgoing); mark(core,id) }
+    }
+    let released: List<Integer> = []
+    for call in peer.releases {
+        let result = grpc.release(peer.grpc,call)
+        if !errors.booleanOk(result) && errors.isWouldBlock(errors.booleanError(result)) { released.add(call) }
+        else if !errors.booleanOk(result) { fail("observed gRPC call could not be released") }
+        else { core.callsReleased += 1 }
+    }
+    peer.releases = released
+}
+function relayFrame(core: Core, id: Integer, handle: Integer, frame: wire.FrameResult): errors.BooleanResult {
+    let at = relayForDevice(core,id,handle)
+    if at < 0 { return errors.booleanFailure(errors.make(errors.protocolCode(),0,"unadmitted device relay stream")) }
+    let relay = core.relays[at]
+    let received = wire.receiveRelay(relay.value,frame)
+    if !errors.booleanOk(received) {
+        if !errors.isWouldBlock(errors.booleanError(received)) { relayFailure(core,relay,13,"invalid device relay frame") }
+        return received
+    }
+    if wire.kind(frame) == wire.STATUS && wire.relayClosed(relay.value) {
+        finalize(core,relay.gateway,relay.call,wire.relayStatus(relay.value),0,"device rejected signed destination"); retireRelay(core,relay,true)
+    } else { mark(core,relay.gateway); serviceRelay(core,relay) }
+    return errors.boolean(true)
+}
 function controlFrame(core: Core, id: Integer, stream: Integer, frame: wire.FrameResult) {
     let peer = core.peers[id]
     if wire.kind(frame) == wire.HELLO && !peer.bound {
@@ -239,29 +465,73 @@ function controlFrame(core: Core, id: Integer, stream: Integer, frame: wire.Fram
     } else { drop(core,id) }
 }
 function deviceInput(core: Core, id: Integer) {
-    let peer = core.peers[id]
-    for handle in transport.streamIds(peer.connection) {
+    let peer = core.peers[id]; let handles = transport.streamIds(peer.connection)
+    let retained: List<InputStream> = []
+    for input in peer.inputs {
+        let keep = false; for handle in handles { if input.id == handle { keep = true } }
+        if keep { retained.add(input) }
+    }
+    peer.inputs = retained
+    for handle in handles {
         let at = -1
         for index in 0..peer.inputs.length { if peer.inputs[index].id == handle { at = index; break } }
         if at < 0 {
             if peer.inputs.length >= 128 { drop(core,id); return }
-            at = peer.inputs.length; peer.inputs.add(InputStream { id: handle; decoder: wire.create() })
+            at = peer.inputs.length
+            peer.inputs.add(InputStream { id: handle; decoder: wire.create(); held: wire.take(wire.create()); blocked: false; ended: false })
         }
-        let input = transport.read(peer.connection,handle)
-        if errors.bytesStatus(input) == errors.endOfStreamStatus() { drop(core,id); return }
-        if errors.bytesOk(input) {
-            let decoder = peer.inputs[at].decoder
-            if !errors.booleanOk(wire.feed(decoder,errors.bytesValue(input))) { drop(core,id); return }
-            let frame = wire.take(decoder); let count = 0
-            while wire.frameOk(frame) && count < 256 && peer.live {
-                controlFrame(core,id,handle,frame); count += 1
-                if peer.live { frame = wire.take(decoder) }
+        let input = peer.inputs[at]; let processed = 0
+        for reads in 0..16 {
+            while processed < 256 && peer.live {
+                let frame = input.held
+                if !input.blocked { frame = wire.take(input.decoder) }
+                if !wire.frameOk(frame) {
+                    if errors.isWouldBlock(wire.frameError(frame)) { break }
+                    if input.ended && errors.code(wire.frameError(frame)) == errors.closedCode() {
+                        if handle == peer.control { drop(core,id); return }
+                        let relay = relayForDevice(core,id,handle)
+                        if relay >= 0 && core.relays[relay].live && !wire.relayClosed(core.relays[relay].value) { relayFailure(core,core.relays[relay],14,"device relay truncated") }
+                        break
+                    }
+                    if handle == peer.control || !peer.bound { drop(core,id); return }
+                    let relay = relayForDevice(core,id,handle)
+                    if relay >= 0 { relayFailure(core,core.relays[relay],13,"device relay framing failed") }
+                    break
+                }
+                if !peer.bound || handle == peer.control {
+                    controlFrame(core,id,handle,frame); input.blocked = false
+                } else {
+                    let result = relayFrame(core,id,handle,frame)
+                    if !errors.booleanOk(result) && errors.isWouldBlock(errors.booleanError(result)) { input.held = frame; input.blocked = true; break }
+                    input.blocked = false
+                    if !errors.booleanOk(result) { break }
+                }
+                processed += 1
             }
             if !peer.live { return }
-            if count == 256 { mark(core,id) }
-            else if !errors.isWouldBlock(wire.frameError(frame)) { drop(core,id); return }
-        } else if !errors.isWouldBlock(errors.bytesError(input)) { drop(core,id); return }
+            if input.blocked || input.ended || processed >= 256 { break }
+            let bytes = transport.read(peer.connection,handle)
+            if errors.bytesStatus(bytes) == errors.successStatus() {
+                if !errors.booleanOk(wire.feed(input.decoder,errors.bytesValue(bytes))) {
+                    if handle == peer.control || !peer.bound { drop(core,id); return }
+                    let relay = relayForDevice(core,id,handle)
+                    if relay >= 0 { relayFailure(core,core.relays[relay],13,"device decoder limit exceeded") }
+                    break
+                }
+            } else if errors.bytesStatus(bytes) == errors.endOfStreamStatus() {
+                input.ended = true; wire.finish(input.decoder)
+                if handle == peer.control { drop(core,id); return }
+            } else if errors.isWouldBlock(errors.bytesError(bytes)) { break }
+            else {
+                if handle == peer.control || !peer.bound { drop(core,id); return }
+                let relay = relayForDevice(core,id,handle)
+                if relay >= 0 { relayFailure(core,core.relays[relay],14,"device stream reset") }
+                break
+            }
+        }
+        if processed >= 256 { mark(core,id) }
     }
+    for relay in core.relays { if relay.live && relay.device == id { serviceRelay(core,relay) } }
 }
 function publish(core: Core, id: Integer) {
     let peer = core.peers[id]
@@ -273,7 +543,7 @@ function publish(core: Core, id: Integer) {
 function peerTick(core: Core, id: Integer) {
     let peer = core.peers[id]; peer.queued = false
     if !peer.live { return }
-    if (!peer.bound && core.now - peer.since >= 10000) || (peer.bound && core.now - peer.heartbeatAt >= 45000) { drop(core,id); return }
+    if (!peer.bound && core.now - peer.since >= 10000) || (peer.bound && peer.mode != 2 && core.now - peer.heartbeatAt >= 45000) { drop(core,id); return }
     if peer.mode != 2 {
         if peer.socket >= 0 && (peer.flags & 13) != 0 {
             for reads in 0..16 {
@@ -317,7 +587,12 @@ function peerTick(core: Core, id: Integer) {
             peer.bound = true; peer.heartbeatAt = core.now
         }
         if peer.gateway.state == tls.FAILED || peer.gateway.state == tls.CLOSED { drop(core,id); return }
-        peer.output.addBytes(tls.takeOutgoing(peer.gateway))
+        if peer.bound { gatewayService(core,id) }
+        if !peer.live { return }
+        let outgoing = tls.takeOutgoing(peer.gateway)
+        if outgoing.length > 1048576 - (peer.output.length-peer.outputAt) { drop(core,id); return }
+        if peer.outputAt > 0 { peer.output = peer.output.slice(peer.outputAt,peer.output.length); peer.outputAt = 0 }
+        peer.output.addBytes(outgoing)
     }
     if peer.socket >= 0 && peer.outputAt < peer.output.length {
         for writes in 0..16 {
@@ -330,9 +605,13 @@ function peerTick(core: Core, id: Integer) {
     }
     peer.flags = 0
     let deadline = peer.since + 10000
-    if peer.bound { deadline = peer.heartbeatAt + 45000 }
+    if peer.bound { deadline = peer.heartbeatAt + 45000; if peer.mode == 2 { deadline = -1 } }
     if peer.mode != 2 { let transportDeadline = transport.nextTimer(peer.connection); if transportDeadline >= 0 { deadline = min(deadline,transportDeadline) } }
-    dispatch.schedule(core.timers,id,deadline)
+    if peer.mode == 2 && peer.bound {
+        let due = grpc.nextTransportDeadlineMillis(peer.grpc)
+        if due > 0 { deadline = due }
+    }
+    if deadline >= 0 { dispatch.schedule(core.timers,id,deadline) } else { dispatch.cancel(core.timers,id) }
 }
 function redisOffline(core: Core) {
     if core.redisWatch > 0 { callbacks.cancel(core.dispatcher,core.redisWatch) }
@@ -402,6 +681,7 @@ function acceptPeers(core: Core, listener: Integer, mode: Integer) {
     core.now = net.monotonicMilliseconds() - core.started
     for accepted in 0..64 {
         let socket = net.accept(listener); if socket < 0 { break }
+        if !errors.booleanOk(net.setNoDelay(socket,true)) { net.close(socket); continue }
         allocate(core,mode,socket,randomBytes(8),Address { host: ""; port: 0 },core.noRetry)
     }
 }
@@ -458,6 +738,11 @@ function udpInput(core: Core) {
     }
 }
 function refresh(core: Core) {
+    if core.now >= core.replayAt {
+        let wall = trust.currentTimeMilliseconds()/1000; let retained: List<Replay> = []
+        for replay in core.replays { if replay.until > wall { retained.add(replay) } else { dispatch.remove(core.replayIndex,replay.key) } }
+        core.replays = retained; core.replayAt = core.now + 1000
+    }
     if core.now >= core.registryAt {
         core.registry = registry(readBytesFile(core.config.registry),core.config.maximum); core.registryAt = core.now + 15000
         for index in 0..core.peers.length {
@@ -487,6 +772,7 @@ public function run(configBytes: Bytes, durationMs: Integer): errors.BooleanResu
     let core = Core { config: config; dispatcher: callbacks.value(created); now: 0; started: net.monotonicMilliseconds()
         identity: [readBytesFile(config.certificate)]; key: readBytesFile(config.key); deviceRoots: [readBytesFile(config.deviceRoots)]; gatewayRoots: [readBytesFile(config.gatewayRoots)]; registry: registry; keys: keys
         udp: udp; deviceListener: device; gatewayListener: gateway; peers: []; free: []; freeCount: 0; active: 0; work: []; workAt: 0
+        relays: []; replays: []; replayIndex: dispatch.table(8192,65536,randomBytes(16)); nextRelay: 1; relaysRetired: 0; callsOpened: 0; callsReleased: 0; maxRelays: 0; replayAt: 1000
         retry: retry.store(randomBytes(16),10000); noRetry: retry.validateInitial(retry.store(Bytes(),1),Bytes(),Bytes(),0); allocated: 0; retryReplies: 0; retryValidated: 0
         routing: dispatch.table(config.maximum*2,65536,randomBytes(16)); exits: dispatch.table(config.maximum,65536,randomBytes(16)); timers: dispatch.timers(config.maximum)
         redisSocket: -1; redisWatch: 0; redisClient: redis.create(); publications: []; publicationAt: 0; redisReconnectAt: 0; redisFlags: 0; redisConnecting: false; redisConnectDeadline: 0; registryAt: 15000; keysAt: 300000 }
@@ -503,7 +789,10 @@ public function run(configBytes: Bytes, durationMs: Integer): errors.BooleanResu
         while core.workAt < core.work.length && processed < 256 {
             let id = core.work[core.workAt]; core.workAt += 1; processed += 1; peerTick(core,id)
         }
-        if core.workAt == core.work.length { core.work = []; core.workAt = 0 }
+        if core.relays.length > 0 {
+            let retainedRelays: List<Relay> = []; for relay in core.relays { if relay.live { retainedRelays.add(relay) } }; core.relays = retainedRelays
+        }
+        if core.work.length > 0 && core.workAt == core.work.length { core.work = []; core.workAt = 0 }
         let timeout = 1000
         if core.work.length > 0 { timeout = 0 }
         let deadline = dispatch.nextDeadline(core.timers); if deadline >= 0 { timeout = min(timeout,max(0,deadline-core.now)) }
@@ -515,6 +804,6 @@ public function run(configBytes: Bytes, durationMs: Integer): errors.BooleanResu
     redisService(core)
     callbacks.close(core.dispatcher); if core.redisSocket >= 0 { net.close(core.redisSocket) }; net.close(udp); net.close(device); net.close(gateway)
     core.key = Bytes(); core.identity = []; core.deviceRoots = []; core.gatewayRoots = []
-    print("EDGE_COUNTS allocated=" + Text(core.allocated) + " active=" + Text(core.active) + " peer_slots=" + Text(core.peers.length) + " retries=" + Text(core.retryReplies) + " retry_validated=" + Text(core.retryValidated))
+    print("EDGE_COUNTS allocated=" + Text(core.allocated) + " active=" + Text(core.active) + " peer_slots=" + Text(core.peers.length) + " retries=" + Text(core.retryReplies) + " retry_validated=" + Text(core.retryValidated) + " calls_opened=" + Text(core.callsOpened) + " calls_released=" + Text(core.callsReleased) + " relays_retired=" + Text(core.relaysRetired) + " max_relays=" + Text(core.maxRelays) + " retained_relays=" + Text(core.relays.length))
     if errors.isError(failure) { return errors.booleanFailure(failure) }; return errors.boolean(true)
 }
