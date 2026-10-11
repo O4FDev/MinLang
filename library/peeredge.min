@@ -99,7 +99,7 @@ record InputStream { id: Integer; decoder: wire.Decoder }
 record Peer {
     live: Boolean; queued: Boolean; flags: Integer; mode: Integer; socket: Integer; watch: Integer
     connection: transport.Connection; gateway: tls.Session; decoder: wire.Decoder; inputs: List<InputStream>
-    paths: List<Address>; routed: Bytes; output: Bytes; outputAt: Integer; since: Integer
+    paths: List<Address>; routed: Bytes; routedIds: List<Bytes>; routingVersion: Integer; output: Bytes; outputAt: Integer; since: Integer
     bound: Boolean; device: Text; exit: Text; epoch: Text; health: live.Health; heartbeatAt: Integer
     control: Integer; published: Boolean; publicationPending: Boolean; redisQueued: Boolean; admitted: Integer
 }
@@ -127,6 +127,33 @@ function watchPeer(core: Core, id: Integer) {
 function interests(core: Core, peer: Peer) {
     if peer.watch > 0 { let interest = loop.readableInterest(); if peer.outputAt < peer.output.length { interest = loop.readWriteInterest() }; callbacks.update(core.dispatcher,peer.watch,interest,0) }
 }
+function syncRouting(core: Core, id: Integer): Boolean {
+    let peer = core.peers[id]; let connection = peer.connection.udp
+    // Initial-only routing consumes its slot until Initial keys are discarded.
+    // Delete it before installing spare CIDs, keeping at most two slots/peer.
+    if peer.routed.length > 0 && connection.spaces.length > 0 && !connection.spaces[0].active {
+        if !quic.ownsConnectionId(connection,peer.routed) && dispatch.lookup(core.routing,peer.routed) == id { dispatch.remove(core.routing,peer.routed) }
+        peer.routed = Bytes()
+    }
+    if peer.routingVersion == connection.connectionIdVersion { return true }
+    let retained: List<Bytes> = []
+    for previous in peer.routedIds {
+        if quic.ownsConnectionId(connection,previous) { retained.add(previous) }
+        else if dispatch.lookup(core.routing,previous) == id { dispatch.remove(core.routing,previous) }
+    }
+    peer.routedIds = retained
+    for known in connection.localIds {
+        let present = false
+        for previous in peer.routedIds { if crypto.hex(previous) == crypto.hex(known.id) { present = true } }
+        if !present {
+            let existing = dispatch.lookup(core.routing,known.id)
+            if existing >= 0 && existing != id { return false }
+            if !errors.booleanOk(dispatch.insert(core.routing,known.id,id)) { return false }
+            peer.routedIds.add(known.id)
+        }
+    }
+    peer.routingVersion = connection.connectionIdVersion; return true
+}
 function allocate(core: Core, mode: Integer, socket: Integer, original: Bytes, address: Address, validated: retry.Opened): Integer {
     if mode == 0 && !retry.valid(validated) { return -1 }
     if core.active >= core.config.maximum { if socket >= 0 { net.close(socket) }; return -1 }
@@ -136,14 +163,14 @@ function allocate(core: Core, mode: Integer, socket: Integer, original: Bytes, a
     let gateway = tls.none()
     if mode == 2 { gateway = tls.server(randomBytes(64),"h2",core.identity,core.key,core.gatewayRoots,true) }
     let peer = Peer { live: true; queued: false; flags: 0; mode: mode; socket: socket; watch: 0; connection: connection; gateway: gateway; decoder: wire.create(); inputs: []
-        paths: [address]; routed: original; output: Bytes(); outputAt: 0; since: core.now; bound: false; device: ""; exit: ""; epoch: ""; health: live.heartbeat(Bytes()); heartbeatAt: -1
+        paths: [address]; routed: original; routedIds: []; routingVersion: -1; output: Bytes(); outputAt: 0; since: core.now; bound: false; device: ""; exit: ""; epoch: ""; health: live.heartbeat(Bytes()); heartbeatAt: -1
         control: -1; published: false; publicationPending: false; redisQueued: false; admitted: 0 }
     let id = core.peers.length
     if core.freeCount > 0 { core.freeCount -= 1; id = core.free[core.freeCount] }
     if id == core.peers.length { core.peers.add(peer) } else { core.peers[id] = peer }
     core.active += 1; core.allocated += 1
     if mode == 0 {
-        if !errors.booleanOk(dispatch.insert(core.routing,connection.udp.local,id)) || !errors.booleanOk(dispatch.insert(core.routing,peer.routed,id)) { drop(core,id); return -1 }
+        if !errors.booleanOk(dispatch.insert(core.routing,peer.routed,id)) || !syncRouting(core,id) { drop(core,id); return -1 }
     } else { watchPeer(core,id) }
     if !peer.live { return -1 }
     mark(core,id); return id
@@ -181,7 +208,7 @@ function drop(core: Core, id: Integer) {
         let key = identityKey(peer.exit)
         if dispatch.lookup(core.exits,key) == id { dispatch.remove(core.exits,key); queuePublication(core,id,3) }
     }
-    if peer.mode == 0 { dispatch.remove(core.routing,peer.connection.udp.local); dispatch.remove(core.routing,peer.routed) }
+    if peer.mode == 0 { for cid in peer.routedIds { if dispatch.lookup(core.routing,cid) == id { dispatch.remove(core.routing,cid) } }; peer.routedIds = []; if dispatch.lookup(core.routing,peer.routed) == id { dispatch.remove(core.routing,peer.routed) } }
     if peer.watch > 0 { callbacks.cancel(core.dispatcher,peer.watch) }
     if peer.socket >= 0 { net.close(peer.socket) }
     dispatch.cancel(core.timers,id); peer.live = false; peer.output = Bytes(); peer.inputs = []; peer.paths = []; peer.device = ""; peer.exit = ""; peer.epoch = ""; peer.health = live.heartbeat(Bytes()); peer.decoder = wire.create()
@@ -415,6 +442,7 @@ function udpInput(core: Core) {
                     if path < 0 && peer.paths.length < 8 { path = peer.paths.length; provisional = true; peer.paths.add(Address { host: net.datagramSource(packet); port: net.datagramPort(packet) }) }
                     if path >= 0 {
                         transport.receiveUDP(peer.connection,data,path,core.now)
+                        if !syncRouting(core,id) { drop(core,id); continue }
                         // A visible CID alone does not authenticate a source.
                         // Keep new addresses only after QUIC admitted the path.
                         if provisional {
