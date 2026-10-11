@@ -20,6 +20,27 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def preserve_observations(manifest, evidence, save, failed):
+    """Persist raw observations before successful workspace cleanup."""
+    manifest["raw_command_records"] = {
+        "schema_version": 1,
+        "workspace": str(evidence.path),
+        "inputs": evidence.inputs,
+        "controls": evidence.controls,
+        "tool_hashes": evidence.tool_hashes,
+        "commands": evidence.commands,
+    }
+    manifest["raw_command_records_retained"] = True
+    manifest["raw_evidence"] = str(evidence.path)
+    manifest["raw_workspace_retained"] = None
+    save()
+    try:
+        evidence.close(failed=failed)
+    finally:
+        manifest["raw_workspace_retained"] = evidence.path.is_dir()
+        save()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifacts", type=Path, required=True)
@@ -114,9 +135,7 @@ def main():
         if manifest["source_after_mismatches"]:
             manifest["state"] = "failed"
             failed = True
-        evidence.close(failed=failed)
-        manifest["raw_evidence"] = str(evidence.path)
-        save()
+        preserve_observations(manifest, evidence, save, failed)
         if manifest["source_after_mismatches"]:
             raise AssertionError(("source changed during verification", manifest["source_after_mismatches"]))
 
