@@ -67,3 +67,14 @@ check-peer-edge-retry-sanitize: build/minyarc check-peer-grpc-python
 
 check: check-peer-edge-retry
 check-sanitize: check-peer-edge-retry-sanitize
+
+# CID routing is an actual Redis-backed mTLS/Retry integration on Linux.
+.PHONY: check-peer-edge-cids check-peer-edge-cids-sanitize
+check-peer-edge-cids: build/minyarc check-peer-grpc-python
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge-cids.py --evidence build/peer-edge-cids-native
+
+check-peer-edge-cids-sanitize: build/minyarc check-peer-grpc-python
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge-cids.py --sanitize --evidence build/peer-edge-cids-sanitize
+
+check: check-peer-edge-cids
+check-sanitize: check-peer-edge-cids-sanitize

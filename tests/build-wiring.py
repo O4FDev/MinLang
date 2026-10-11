@@ -137,7 +137,8 @@ class BuildWiring(unittest.TestCase):
                              'preinstalled Python'):
                 for gate in ('check-http2', 'check-peer-grpc', 'check-peer-grpc-sanitize',
                              'check-http2-churn', 'check-peer-grpc-churn',
-                             'check-peer-grpc-retire'):
+                             'check-peer-grpc-retire', 'check-peer-edge-cids',
+                             'check-peer-edge-cids-sanitize'):
                     with self.subTest(selected=selected, gate=gate):
                         env = dict(os.environ)
                         env.pop('MAKEFLAGS', None)
