@@ -59,12 +59,12 @@ def run(command, environment, output, label, resource):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--sanitize", action="store_true")
-    p.add_argument("--fixture", choices=["cycle-additive.c", "cycle-registry-growth.c", "cycle-leaf-churn.c", "cycle-captured-retirement.c", "cycle-fresh-mark-retirement.c"], default="cycle-additive.c")
+    p.add_argument("--fixture", choices=["cycle-additive.c", "cycle-registry-growth.c", "cycle-leaf-churn.c", "cycle-captured-retirement.c", "cycle-fresh-mark-retirement.c", "cycle-detached-first-insertion.c"], default="cycle-additive.c")
     p.add_argument("--case", choices=["all", "registered", "callbacks", "streaming", "safety", "active"], default="all")
     p.add_argument("--profiles", nargs="+", choices=["system", "fixed", "lazy", "eager"],
                    default=None)
     p.add_argument("--budgets", type=int, nargs="+", choices=[1, 32, 1024], default=[1, 32, 1024])
-    p.add_argument("--nodes", type=int, nargs="+", choices=[32, 256, 2048], default=[32, 256, 2048])
+    p.add_argument("--nodes", type=int, nargs="+", choices=[32, 256, 512, 2048], default=[32, 256, 2048])
     p.add_argument("--evidence", type=Path, required=True)
     args = p.parse_args()
     try:
@@ -79,6 +79,16 @@ def main():
         profiles = [profile for profile in profiles if profile != "eager"]
         unsupported.append({"profile": "eager",
                             "reason": "Dead-owner certificates use bounded cleanup; eager RC is unchanged."})
+    if args.fixture == "cycle-detached-first-insertion.c":
+        if args.case != "all":
+            p.error("detached first insertion owns its full positive and negative schedule")
+        if any(budget > 32 for budget in args.budgets) or any(n < 512 for n in args.nodes):
+            p.error("detached first insertion requires --budgets 1 32 and --nodes 512 2048")
+        if args.profiles is not None and "eager" in args.profiles:
+            p.error("detached first insertion observes bounded full-build phases")
+        profiles = [profile for profile in profiles if profile != "eager"]
+        unsupported.append({"profile": "eager",
+                            "reason": "Detached first insertion observes bounded full-build phases."})
     out = args.evidence.resolve(); out.mkdir(parents=True, exist_ok=True)
     (ROOT / "build").mkdir(exist_ok=True)
     (ROOT / "build/managed-graphs-engine.c").write_text(engine_source(ROOT))
@@ -86,7 +96,8 @@ def main():
     inputs = [ROOT/"tests/cycle-additive.c", ROOT/"tests"/args.fixture, Path(__file__).resolve(),
               ROOT/"tools/cycle_runtime.py", ROOT/"tests/clang_helpers.py",
               ROOT/"tests/test_evidence.py", ROOT/"runtime/minyar_runtime.c", *headers]
-    if args.fixture in ("cycle-captured-retirement.c", "cycle-fresh-mark-retirement.c"):
+    if args.fixture in ("cycle-captured-retirement.c", "cycle-fresh-mark-retirement.c",
+                        "cycle-detached-first-insertion.c"):
         inputs.append(ROOT/"tests/cycle-leaf-churn.c")
     report = {"passed": False, "sanitize": args.sanitize, "cases": [], "resources": [],
               "profiles": profiles, "unsupported_profiles": unsupported,
@@ -114,7 +125,21 @@ def main():
                 if historical:
                     command.append("-Drc_cycle_edge_insert=rc_cycle_edge_add")
                 command += [str(ROOT/"tests"/args.fixture),"-lm","-o",str(binary)]
-                phases = [("compile",command)] + [(f"run-n{n}",[str(binary),str(n),args.case]) for n in args.nodes]
+                phases = [("compile", command)]
+                for n in args.nodes:
+                    if args.fixture == "cycle-detached-first-insertion.c":
+                        for phase in (1, 2, 3):
+                            for copied in (0, 1):
+                                phases.append((f"run-n{n}-detached-p{phase}-copy{copied}",
+                                               [str(binary), str(n), "detached", str(phase), str(copied)]))
+                            for mode in ("internal", "exposed", "registered-descendant", "self-cycle"):
+                                phases.append((f"run-n{n}-{mode}-p{phase}",
+                                               [str(binary), str(n), mode, str(phase), "1"]))
+                            if phase >= 2:
+                                phases.append((f"run-n{n}-anchor-take-p{phase}",
+                                               [str(binary), str(n), "anchor-take", str(phase), "0"]))
+                    else:
+                        phases.append((f"run-n{n}", [str(binary), str(n), args.case]))
                 for phase, argv in phases:
                     case = run(argv, environment, out, label+"-"+phase, report["resources"])
                     if binary.is_file():
