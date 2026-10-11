@@ -636,6 +636,224 @@ function validationResponseOrder(p: Pair, firstChallenge: Boolean): Integer {
     return 0
 }
 
+// RFC9000 9.4: old-route packets keep delivery records but cannot
+// update the RTT or congestion controller established for another route.
+record RecoveryPair { pair: Pair; streamId: Integer; oldNumber: Integer; oldBytes: Integer; newProbe: Integer; latestWire: Integer; newBytes: Integer; now: Integer }
+function recoveryPair(p: Pair): RecoveryPair {
+    let c=p.client;let s=p.server;let now=p.now;let id=-1;let old=-1;let bytes=0;let probe=-1;let newBytes=0
+    if ready(p) {
+        let opened=quic.openStream(s,true)
+        if errors.integerOk(opened) {
+            id=errors.integerValue(opened);old=s.spaces[2].next
+            quic.writeStream(s,id,Bytes("old-route delivery survives migration"),true)
+            for packet in quic.pollDatagrams(s,now) { bytes+=packet.data.length }
+        }
+        now+=10
+        if errors.booleanOk(quic.probePath(c,7,now)) {
+            for packet in quic.pollDatagrams(c,now) { quic.receivePath(s,packet.data,packet.pathId,now) }
+            for packet in quic.pollDatagrams(s,now) {
+                if packet.pathId==7 {
+                    newBytes+=packet.data.length
+                    let header=wire.header(packet.data,0,c.local.length)
+                    let opened=protection.unprotect(c.spaces[2].read,packet.data,header.numberOffset,-1)
+                    if opened.valid { probe=opened.number }
+                }
+                // Retain every real old/new validation send without ACKing it.
+            }
+            let clientPath=-1;let serverPath=-1
+            for at in 0..c.paths.length { if c.paths[at].id==7 { clientPath=at } }
+            for at in 0..s.paths.length { if s.paths[at].id==7 { serverPath=at } }
+            if clientPath>=0 && serverPath>=0 {
+                let reply=Bytes();appendInteger(reply,27);reply.addBytes(c.paths[clientPath].challenge)
+                quic.receivePath(c,authenticatedFrame(s,c,s.paths[serverPath].remoteId,reply),7,now+1)
+                reply=Bytes();appendInteger(reply,27);reply.addBytes(s.paths[serverPath].challenge);appendInteger(reply,1)
+                quic.receivePath(s,authenticatedFrame(c,s,c.remote,reply),7,now+2)
+            }
+        }
+    }
+    return RecoveryPair { pair:p;streamId:id;oldNumber:old;oldBytes:bytes;newProbe:probe;latestWire:s.spaces[2].next-1;newBytes:newBytes;now:now+2 }
+}
+function recoveryReady(r: RecoveryPair): Boolean {
+    return r.streamId>=0 && r.oldNumber>=0 && r.oldBytes>0 && r.newProbe>r.oldNumber &&
+        r.pair.client.activePath==7 && r.pair.server.activePath==7 &&
+        r.pair.client.state==quic.ESTABLISHED && r.pair.server.state==quic.ESTABLISHED
+}
+function acknowledgePacket(c: quic.Connection, s: quic.Connection, first: Integer, last: Integer, now: Integer) {
+    let payload=Bytes();appendInteger(payload,2);appendInteger(payload,last);appendInteger(payload,0)
+    appendInteger(payload,0);appendInteger(payload,last-first)
+    quic.receivePath(s,authenticatedFrame(c,s,c.remote,payload),s.activePath,now)
+}
+function exactFlight(c: quic.Connection): Integer { let bytes=0;for space in c.spaces { for sent in space.sent { bytes+=sent.bytes } };return bytes }
+function reuseRecoveryRoute(r: RecoveryPair) {
+    let c=r.pair.client;let s=r.pair.server;let now=r.now+10
+    // Authenticated retirement makes each issuer supply a fresh spare CID.
+    let retire=Bytes();appendInteger(retire,25);appendInteger(retire,0)
+    quic.receivePath(s,authenticatedFrame(c,s,c.remote,retire),7,now)
+    quic.receivePath(c,authenticatedFrame(s,c,s.remote,retire),7,now)
+    for known in s.localIds { if known.sequence==2 { quic.receivePath(c,authenticatedFrame(s,c,s.remote,newCid(2,0,known.id,known.token)),7,now) } }
+    for known in c.localIds { if known.sequence==2 { quic.receivePath(s,authenticatedFrame(c,s,c.remote,newCid(2,0,known.id,known.token)),7,now) } }
+    if !errors.booleanOk(quic.probePath(c,0,now)) { r.streamId=-1;return }
+    for packet in quic.pollDatagrams(c,now) {
+        if packet.pathId==0 {
+            let header=wire.header(packet.data,0,s.local.length)
+            let opened=protection.unprotect(s.spaces[2].read,packet.data,header.numberOffset,-1)
+            // Drop ACKs and unrelated control traffic to keep epoch-0 sends
+            // genuinely outstanding while validating another use of route 0.
+            if opened.valid { for frame in wire.frames(opened.payload).frames { if frame.type==26 {
+                let payload=Bytes();appendInteger(payload,26);payload.addBytes(frame.data)
+                quic.receivePath(s,authenticatedFrame(c,s,header.destination,payload),0,now)
+            } } }
+        }
+    }
+    r.newProbe=-1;r.newBytes=0
+    for packet in quic.pollDatagrams(s,now) {
+        if packet.pathId==0 {
+            let header=wire.header(packet.data,0,c.local.length)
+            let opened=protection.unprotect(c.spaces[2].read,packet.data,header.numberOffset,-1)
+            if opened.valid { r.newProbe=opened.number;r.newBytes+=packet.data.length }
+        }
+    }
+    let cp=-1;let sp=-1
+    for at in 0..c.paths.length { if c.paths[at].id==0 { cp=at } }
+    for at in 0..s.paths.length { if s.paths[at].id==0 { sp=at } }
+    if cp<0 || sp<0 { r.streamId=-1;return }
+    let reply=Bytes();appendInteger(reply,27);reply.addBytes(c.paths[cp].challenge)
+    quic.receivePath(c,authenticatedFrame(s,c,s.paths[sp].remoteId,reply),0,now+1)
+    reply=Bytes();appendInteger(reply,27);reply.addBytes(s.paths[sp].challenge);appendInteger(reply,1)
+    quic.receivePath(s,authenticatedFrame(c,s,c.remote,reply),0,now+2)
+    r.latestWire=s.spaces[2].next-1;r.now=now+2
+}
+function reusedRecoveryReady(r: RecoveryPair): Boolean {
+    return r.streamId>=0 && r.newProbe>r.oldNumber && r.pair.client.activePath==0 && r.pair.server.activePath==0 &&
+        r.pair.client.state==quic.ESTABLISHED && r.pair.server.state==quic.ESTABLISHED
+}
+function mixedRecoveryAck(p: Pair): Integer {
+    let r=recoveryPair(p);if !recoveryReady(r) { return 153 };reuseRecoveryRoute(r)
+    if !reusedRecoveryReady(r) { return 153 }
+    let c=p.client;let s=p.server;let opened=quic.openStream(s,true);if !errors.integerOk(opened) { return 153 }
+    let id=errors.integerValue(opened);let expected=Bytes("current-route delivery")
+    quic.writeStream(s,id,expected,true);let at=r.now+30;let bytes=r.newBytes;let sent=false
+    for packet in quic.pollDatagrams(s,at) {
+        if packet.pathId!=0 { return 171 }
+        let header=wire.header(packet.data,0,c.local.length)
+        let decoded=protection.unprotect(c.spaces[2].read,packet.data,header.numberOffset,-1);let eliciting=false
+        if decoded.valid { for frame in wire.frames(decoded.payload).frames { if frame.type!=0 && frame.type!=2 && frame.type!=3 && frame.type!=28 && frame.type!=29 { eliciting=true } } }
+        if eliciting { bytes+=packet.data.length;sent=true }
+    }
+    if !sent { return 153 }
+    acknowledgePacket(c,s,r.oldNumber,s.spaces[2].next-1,at+20)
+    if s.congestion.window!=12000+bytes { print("semantic failure: mixed ACK ranges counted an earlier route epoch in the current window");return 170 }
+    if !s.congestion.measured || s.congestion.latest!=20 || s.flight!=0 || exactFlight(s)!=0 { return 172 }
+    let oldDelivered=false;let newDelivered=false
+    for output in s.streams {
+        if output.id==r.streamId { oldDelivered=output.sendAcknowledged==Bytes("old-route delivery survives migration").length && output.finalAcknowledged }
+        if output.id==id { newDelivered=output.sendAcknowledged==expected.length && output.finalAcknowledged }
+    }
+    if !oldDelivered || !newDelivered || s.remoteRetireOutstanding.length!=0 { return 173 }
+    print("mixed ACK ranges delivered both epochs and retired their control state while counting only the current route epoch")
+    return 0
+}
+function oldPathAck(p: Pair, reuse: Boolean): Integer {
+    let r=recoveryPair(p);if !recoveryReady(r) { print("setup failed: real old send and reciprocal migration absent");return 153 }
+    if reuse { reuseRecoveryRoute(r);if !reusedRecoveryReady(r) { return 153 } }
+    let s=p.server;let state=s.congestion;let window=state.window;let latest=state.latest;let smoothed=state.smoothed
+    let variance=state.variance;let minimum=state.minimum;let measured=state.measured;let flight=s.flight
+    acknowledgePacket(p.client,s,r.oldNumber,r.oldNumber,r.now+20)
+    if s.congestion.latest!=latest || s.congestion.smoothed!=smoothed || s.congestion.variance!=variance ||
+       s.congestion.minimum!=minimum || s.congestion.measured!=measured {
+        print("semantic failure: delayed old-route ACK sampled the new route RTT");return 155
+    }
+    if s.congestion.window!=window { print("semantic failure: delayed old-route ACK grew the new route congestion window");return 156 }
+    let delivered=false
+    for output in s.streams { if output.id==r.streamId { delivered=output.sendAcknowledged==Bytes("old-route delivery survives migration").length && output.finalAcknowledged } }
+    if !delivered || s.spaces[2].largestAck!=r.oldNumber || s.flight!=flight-r.oldBytes || s.flight!=exactFlight(s) { return 158 }
+    let pending=s.pending.length;let retire=s.remoteRetireOutstanding.length;let remaining=s.spaces[2].sent.length
+    acknowledgePacket(p.client,s,r.oldNumber,r.oldNumber,r.now+21)
+    if s.congestion.window!=window || s.congestion.latest!=latest || s.flight!=flight-r.oldBytes ||
+       s.pending.length!=pending || s.remoteRetireOutstanding.length!=retire || s.spaces[2].sent.length!=remaining { return 159 }
+    print("old-route ACK and duplicate retained stream/flight/range/retirement bookkeeping without changing new-route RTT or congestion")
+    return 0
+}
+function oldPathLoss(p: Pair, reuse: Boolean): Integer {
+    let r=recoveryPair(p);if !recoveryReady(r) { return 153 }
+    if reuse { reuseRecoveryRoute(r);if !reusedRecoveryReady(r) { return 153 } }
+    let c=p.client;let s=p.server
+    // ACK all real new-route validation packets, leaving only old-route sends.
+    acknowledgePacket(c,s,r.newProbe,r.latestWire,r.now+20)
+    let window=s.congestion.window;let latest=s.congestion.latest;let smoothed=s.congestion.smoothed;let variance=s.congestion.variance
+    let retransmitted=false
+    for packet in quic.pollDatagrams(s,r.now+2000) {
+        let header=wire.header(packet.data,0,c.local.length)
+        let opened=protection.unprotect(c.spaces[2].read,packet.data,header.numberOffset,-1)
+        if opened.valid {
+            for frame in wire.frames(opened.payload).frames {
+                if frame.type>=8 && frame.type<=15 && frame.stream==r.streamId {
+                    if packet.pathId!=s.activePath { return 160 };retransmitted=true
+                }
+            }
+        }
+        quic.receivePath(c,packet.data,packet.pathId,r.now+2000)
+    }
+    if s.congestion.window!=window { print("semantic failure: old-route loss reduced the new route congestion window");return 157 }
+    if s.congestion.latest!=latest || s.congestion.smoothed!=smoothed || s.congestion.variance!=variance || s.flight!=exactFlight(s) { return 161 }
+    if !retransmitted { print("old-route loss discarded stream data instead of retrying on the active route");return 162 }
+    let read=quic.readStream(c,r.streamId)
+    if !errors.bytesOk(read) || Text(errors.bytesValue(read))!="old-route delivery survives migration" { return 163 }
+    let now=r.now+2010;for count in 0..100 { drive(c,s,now);now+=10 }
+    let delivered=false;for output in s.streams { if output.id==r.streamId { delivered=output.sendAcknowledged==Bytes("old-route delivery survives migration").length && output.finalAcknowledged } }
+    // A fully ACKed unidirectional stream is reclaimed by poll(); its
+    // closed-stream ledger is the authoritative final-delivery record.
+    for range in s.closedStreams { if range.kind==(r.streamId&3) && r.streamId/4>=range.first && r.streamId/4<=range.last { delivered=true } }
+    if !delivered || s.flight!=exactFlight(s) || s.state!=quic.ESTABLISHED || c.state!=quic.ESTABLISHED { return 164 }
+    print("old-route loss preserved new-route congestion and retried undelivered stream data on the validated route")
+    return 0
+}
+function oldPathLateAck(p: Pair, reuse: Boolean): Integer {
+    let r=recoveryPair(p);if !recoveryReady(r) { return 153 }
+    if reuse { reuseRecoveryRoute(r);if !reusedRecoveryReady(r) { return 153 } }
+    let c=p.client;let s=p.server
+    acknowledgePacket(c,s,r.newProbe,r.latestWire,r.now+20)
+    // Old data is lost, retransmitted on the current route, and dropped.
+    quic.pollDatagrams(s,r.now+2000)
+    let retained=false
+    for at in s.spaces[2].lostStreamsAt..s.spaces[2].lostStreams.length { if s.spaces[2].lostStreams[at].number==r.oldNumber { retained=true } }
+    let timer=s.spaces[2].probe
+    if !retained || timer<=r.now+2000 { return 175 }
+    quic.pollDatagrams(s,timer)
+    let probes=s.congestion.probes;let window=s.congestion.window;let latest=s.congestion.latest;let flight=s.flight
+    if probes<=0 { return 176 }
+    acknowledgePacket(c,s,r.oldNumber,r.oldNumber,timer+10)
+    if s.congestion.probes!=probes { print("semantic failure: late old-epoch delivery ACK reset the current route PTO backoff");return 174 }
+    if s.congestion.window!=window || s.congestion.latest!=latest || s.flight!=flight || s.flight!=exactFlight(s) { return 177 }
+    let delivered=false
+    for output in s.streams { if output.id==r.streamId { delivered=output.sendAcknowledged==Bytes("old-route delivery survives migration").length && output.finalAcknowledged } }
+    if !delivered || s.spaces[2].lostReferences!=0 || s.state!=quic.ESTABLISHED { return 178 }
+    print("late old-epoch ACK delivered cached ranges while preserving current-route RTT/window/PTO and exact outstanding bytes")
+    return 0
+}
+function currentPathRecovery(p: Pair, lose: Boolean): Integer {
+    let r=recoveryPair(p);if !recoveryReady(r) { return 153 }
+    let c=p.client;let s=p.server
+    acknowledgePacket(c,s,0,r.latestWire,r.now+20)
+    let at=r.now+30;let number=s.spaces[2].next;quic.ping(s)
+    let sent=false
+    for packet in quic.pollDatagrams(s,at) { if packet.pathId!=7 { return 165 };sent=true }
+    if !sent { return 166 }
+    let window=s.congestion.window
+    if lose {
+        for count in 0..3 { authenticatedFrame(s,c,s.remote,crypto.fromHex("01")) }
+        acknowledgePacket(c,s,s.spaces[2].next-1,s.spaces[2].next-1,at+20)
+        quic.pollDatagrams(s,at+2000)
+        if s.congestion.window>=window || s.congestion.window<2400 { return 167 }
+    } else {
+        acknowledgePacket(c,s,number,number,at+20)
+        if !s.congestion.measured || s.congestion.latest!=20 || s.congestion.window<=window { return 168 }
+    }
+    if s.flight!=exactFlight(s) || s.state!=quic.ESTABLISHED { return 169 }
+    print("current-route ACK/loss still updates its own RTT/congestion with exact flight accounting")
+    return 0
+}
+
 function main(): Integer {
     let root = readBytesFile(argument(0)); let identity = readBytesFile(argument(1)); let key = readBytesFile(argument(2))
     let client = readBytesFile(argument(3)); let clientKey = readBytesFile(argument(4)); let mode = argument(5)
@@ -648,6 +866,15 @@ function main(): Integer {
     }
     if mode=="early-routes" { return earlyRoutes(root,identity,key,client,clientKey) }
     let p = connected(root, identity, key, client, clientKey)
+    if mode=="old-path-late-ack" { return oldPathLateAck(p,false) }
+    if mode=="reused-path-late-ack" { return oldPathLateAck(p,true) }
+    if mode=="reused-path-ack" { return oldPathAck(p,true) }
+    if mode=="reused-path-loss" { return oldPathLoss(p,true) }
+    if mode=="mixed-path-ack" { return mixedRecoveryAck(p) }
+    if mode=="old-path-ack" { return oldPathAck(p,false) }
+    if mode=="old-path-loss" { return oldPathLoss(p,false) }
+    if mode=="current-path-ack" { return currentPathRecovery(p,false) }
+    if mode=="current-path-loss" { return currentPathRecovery(p,true) }
     if mode == "migration-cid" { return intentionalMigration(p) }
     if mode == "cid-unavailable" { return noSpareCid(p) }
     if mode == "nat-rebinding" { return natRebinding(p) }

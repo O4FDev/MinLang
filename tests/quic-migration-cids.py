@@ -19,6 +19,15 @@ SPEC = importlib.util.spec_from_file_location("quic_cid_certificates", CA_SOURCE
 FIXTURES = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(FIXTURES)
 BASELINE = {
+    "old-path-late-ack": (174, "semantic failure: late old-epoch delivery ACK reset the current route PTO backoff"),
+    "reused-path-late-ack": (174, "semantic failure: late old-epoch delivery ACK reset the current route PTO backoff"),
+    "reused-path-ack": (155, "semantic failure: delayed old-route ACK sampled the new route RTT"),
+    "reused-path-loss": (157, "semantic failure: old-route loss reduced the new route congestion window"),
+    "mixed-path-ack": (170, "semantic failure: mixed ACK ranges counted an earlier route epoch in the current window"),
+    "old-path-ack": (155, "semantic failure: delayed old-route ACK sampled the new route RTT"),
+    "old-path-loss": (157, "semantic failure: old-route loss reduced the new route congestion window"),
+    "current-path-ack": (0, "current-route ACK/loss still updates"),
+    "current-path-loss": (0, "current-route ACK/loss still updates"),
     "migration-cid": (42, "semantic failure: intentional new path reused the original destination CID"),
     "cid-unavailable": (52, "semantic failure: intentional migration accepted without an unused destination CID"),
     "preferred-address": (62, "semantic failure: a valid preferred_address caused a transport-parameter failure"),

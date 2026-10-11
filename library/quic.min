@@ -17,7 +17,7 @@ public constant STARTING = 0
 public constant ESTABLISHED = 1
 public constant CLOSED = 2
 public constant FAILED = 3
-record Sent { number: Integer; time: Integer; bytes: Integer; payload: Bytes; path: Integer; level: Integer; status: Integer; measured: Boolean }
+record Sent { number: Integer; time: Integer; bytes: Integer; payload: Bytes; path: Integer; recoveryGeneration: Integer; level: Integer; status: Integer; measured: Boolean }
 record Pending { level: Integer; payload: Bytes; probe: Boolean; path: Integer; acknowledgement: Boolean }
 public record Datagram { data: Bytes; pathId: Integer }
 public record Path {
@@ -33,9 +33,9 @@ public record PreferredAddress {
 function noPreferredAddress(): PreferredAddress {
     return PreferredAddress { valid: false; ipv4: Bytes(); ipv4Port: 0; ipv6: Bytes(); ipv6Port: 0; connectionId: Bytes(); resetToken: Bytes() }
 }
-record SentTime { number: Integer; time: Integer }
+record SentTime { number: Integer; time: Integer; path: Integer; recoveryGeneration: Integer }
 record SentStream { id: Integer; first: Integer; length: Integer; fin: Boolean; reset: Boolean }
-record LostStreams { number: Integer; level: Integer; time: Integer; measured: Boolean; streams: List<SentStream> }
+record LostStreams { number: Integer; level: Integer; time: Integer; path: Integer; recoveryGeneration: Integer; measured: Boolean; streams: List<SentStream> }
 public record ClosedStreams { kind: Integer; first: Integer; last: Integer }
 record Space {
     read: protection.Keys; write: protection.Keys; next: Integer; largest: Integer; largestAck: Integer
@@ -60,7 +60,7 @@ public record Connection {
     closedStreams: List<ClosedStreams>; incomingBidi: Integer; incomingUni: Integer; receiveBidi: Integer; receiveUni: Integer
     peerMaxData: Integer; peerBidi: Integer; peerUni: Integer; peerBidiLocal: Integer; peerBidiRemote: Integer; peerUniData: Integer
     sentData: Integer; receivedData: Integer; consumedData: Integer; receiveMaxData: Integer; parametersChecked: Boolean
-    congestion: recovery.State; flight: Integer; receivedBytes: Integer; sentBytes: Integer
+    congestion: recovery.State; recoveryGeneration: Integer; flight: Integer; receivedBytes: Integer; sentBytes: Integer
     history: List<Sent>; lossFirst: Integer; lossLast: Integer; lossAfter: Integer; emptySince: Integer
     addressValidated: Boolean; confirmed: Boolean; handshakeAcknowledged: Boolean; handshakeProbe: Integer; lastActivity: Integer; now: Integer
     earlyWrite: protection.Keys; earlyRead: protection.Keys; earlyRejected: Boolean; earlyStreams: List<Integer>; earlyData: Integer; earlyPackets: Integer
@@ -132,11 +132,39 @@ function abandonPath(connection: Connection, path: Path) {
     }
     path.challenge = Bytes(); path.deadline = -1
 }
+function currentRecovery(connection: Connection, path: Integer, generation: Integer): Boolean {
+    return path == connection.activePath && generation == connection.recoveryGeneration
+}
+function recoveryFlight(connection: Connection): Integer {
+    // The common single-route connection preserves O(1) admission. Probing
+    // or migrated connections scan only the bounded outstanding lists;
+    // Connection.flight always remains the total across every route/epoch.
+    if connection.recoveryGeneration == 0 && connection.paths.length == 1 { return connection.flight }
+    let bytes = 0
+    for space in connection.spaces { for sent in space.sent {
+        if currentRecovery(connection,sent.path,sent.recoveryGeneration) { bytes += sent.bytes }
+    } }
+    return bytes
+}
 function activatePath(connection: Connection, path: Path) {
     if path.id == connection.activePath { return }
     let previous = connection.activePath
     connection.activePath = path.id; connection.remote = path.remoteId
-    connection.congestion = recovery.create(1200); rearmProbes(connection,-1)
+    connection.congestion = recovery.create(1200); connection.recoveryGeneration += 1
+    connection.lossFirst = -1; connection.lossLast = -1; connection.lossAfter = -1; connection.emptySince = -1
+    // Validation sends on this very route belong to its new controller. An
+    // earlier use of the same route ID keeps its original generation.
+    for space in connection.spaces {
+        for sent in space.sent {
+            if sent.path == path.id && sent.recoveryGeneration == connection.recoveryGeneration - 1 {
+                sent.recoveryGeneration = connection.recoveryGeneration; sent.measured = false
+            }
+        }
+        for time in space.ackTimes {
+            if time.path == path.id && time.recoveryGeneration == connection.recoveryGeneration - 1 { time.recoveryGeneration = connection.recoveryGeneration }
+        }
+    }
+    rearmProbes(connection,-1)
     if path.intentional {
         // Keep the authenticated candidate, then retire the abandoned route.
         let retained: List<Path> = []
@@ -244,7 +272,7 @@ function create(entropy: Bytes, original: Bytes, client: Boolean): Connection {
         closedStreams: []; incomingBidi: 0; incomingUni: 0; receiveBidi: 16; receiveUni: 16
         peerMaxData: 0; peerBidi: 0; peerUni: 0; peerBidiLocal: 0; peerBidiRemote: 0; peerUniData: 0
         sentData: 0; receivedData: 0; consumedData: 0; receiveMaxData: 262144; parametersChecked: false
-        congestion: recovery.create(1200); flight: 0; receivedBytes: 0; sentBytes: 0
+        congestion: recovery.create(1200); recoveryGeneration: 0; flight: 0; receivedBytes: 0; sentBytes: 0
         history: []; lossFirst: -1; lossLast: -1; lossAfter: -1; emptySince: -1
         addressValidated: client; confirmed: false; handshakeAcknowledged: false; handshakeProbe: -1; lastActivity: -1; now: -1
         earlyWrite: protection.traffic(1, 0, Bytes()); earlyRead: protection.traffic(1, 0, Bytes()); earlyRejected: false; earlyStreams: []; earlyData: 0; earlyPackets: 0
@@ -669,18 +697,21 @@ function processAck(connection: Connection, space: Space, frame: wire.Frame, lev
     let sampleAt = -1; let eliciting = false; let cachedAck = false; let deliveryChanged = false
     for sent in space.sent {
         for range in frame.ranges {
-            if sent.number >= range.first && sent.number <= range.last { eliciting = true; if sent.number == frame.value { sampleAt = sent.time } }
+            if sent.number >= range.first && sent.number <= range.last && currentRecovery(connection,sent.path,sent.recoveryGeneration) { eliciting = true; if sent.number == frame.value { sampleAt = sent.time } }
         }
     }
     for at in space.lostStreamsAt..space.lostStreams.length {
         let packet = space.lostStreams[at]
         for range in frame.ranges {
-            if packet.number >= range.first && packet.number <= range.last { eliciting = true; cachedAck = true; if packet.number == frame.value { sampleAt = packet.time } }
+            if packet.number >= range.first && packet.number <= range.last {
+                cachedAck = true
+                if currentRecovery(connection,packet.path,packet.recoveryGeneration) { eliciting = true; if packet.number == frame.value { sampleAt = packet.time } }
+            }
         }
     }
     let retainedTimes: List<SentTime> = []
     for time in space.ackTimes {
-        if time.number == frame.value { sampleAt = time.time }
+        if time.number == frame.value && currentRecovery(connection,time.path,time.recoveryGeneration) { sampleAt = time.time }
         if time.number > max(space.largestAck,frame.value) { retainedTimes.add(time) }
     }
     space.ackTimes = retainedTimes
@@ -714,11 +745,13 @@ function processAck(connection: Connection, space: Space, frame: wire.Frame, lev
                 }
             }
             connection.flight = max(0, connection.flight - sent.bytes)
-            recovery.acknowledged(connection.congestion, sent.bytes, connection.now, sent.time)
-            // The generic congestion helper also resets probes. Initial and
-            // early-data ACKs cannot reset an unvalidated client's backoff.
-            if connection.clientRole && !connection.confirmed && !connection.handshakeAcknowledged { connection.congestion.probes = backoff }
-            else { connection.congestion.probes = 0 }
+            if currentRecovery(connection,sent.path,sent.recoveryGeneration) {
+                recovery.acknowledged(connection.congestion, sent.bytes, connection.now, sent.time)
+                // Initial/early ACKs cannot reset an unvalidated client's
+                // backoff. Old-route ACKs preserve the current backoff too.
+                if connection.clientRole && !connection.confirmed && !connection.handshakeAcknowledged { connection.congestion.probes = backoff }
+                else { connection.congestion.probes = 0 }
+            }
             sent.status = 1; sent.payload = Bytes()
         } else { remaining.add(sent) }
     }
@@ -730,9 +763,9 @@ function processAck(connection: Connection, space: Space, frame: wire.Frame, lev
             if acknowledged {
                 // Late ACKs break future persistent-loss intervals, without
                 // removing flight bytes or growing congestion twice.
-                if packet.measured && connection.lossFirst >= 0 && packet.time >= connection.lossFirst { connection.lossFirst = -1; connection.lossLast = -1 }
+                if currentRecovery(connection,packet.path,packet.recoveryGeneration) && packet.measured && connection.lossFirst >= 0 && packet.time >= connection.lossFirst { connection.lossFirst = -1; connection.lossLast = -1 }
                 for known in connection.history { if known.level == packet.level && known.number == packet.number && known.status == 2 { known.status = 1 } }
-                if !connection.clientRole || connection.confirmed || connection.handshakeAcknowledged { connection.congestion.probes = 0 }
+                if currentRecovery(connection,packet.path,packet.recoveryGeneration) && (!connection.clientRole || connection.confirmed || connection.handshakeAcknowledged) { connection.congestion.probes = 0 }
                 for item in packet.streams {
                     let index = streamIndex(connection,item.id)
                     if index >= 0 {
@@ -914,6 +947,24 @@ function pendingPayload(connection: Connection, payload: Bytes): Bytes {
     return result
 }
 function retryPayload(connection: Connection, payload: Bytes): Boolean { return pendingPayload(connection,payload).length > 0 }
+function retryPacket(connection: Connection, sent: Sent, probe: Boolean): Boolean {
+    let payload = pendingPayload(connection,sent.payload)
+    if payload.length == 0 { return false }
+    if sent.path == connection.activePath && sent.recoveryGeneration == connection.recoveryGeneration {
+        enqueuePath(connection,sent.level,payload,probe,sent.path); return true
+    }
+    // Application/control delivery follows the active route. Validation
+    // frames remain bound to the route on which their token was sent.
+    let general = Bytes(); let validation = Bytes(); let hasGeneral = false
+    for frame in wire.frames(payload).frames {
+        if frame.type == 26 || frame.type == 27 { validation.addBytes(payload.slice(frame.start,frame.end)) }
+        else { general.addBytes(payload.slice(frame.start,frame.end)); if frame.type != 0 { hasGeneral = true } }
+    }
+    let queued = false
+    if validation.length > 0 && pathIndex(connection,sent.path) >= 0 { enqueuePath(connection,sent.level,validation,probe,sent.path); queued = true }
+    if hasGeneral { enqueue(connection,sent.level,general,probe); queued = true }
+    return queued
+}
 function rememberLostStreams(connection: Connection, space: Space, packet: Sent) {
     let references: List<SentStream> = []
     for frame in wire.frames(packet.payload).frames {
@@ -926,8 +977,10 @@ function rememberLostStreams(connection: Connection, space: Space, packet: Sent)
         let evicted = space.lostStreams[space.lostStreamsAt]
         // A later ACK can no longer correct this timing evidence. Forget the
         // entire prefix conservatively, including history held by another space.
-        connection.lossAfter = max(connection.lossAfter,evicted.time)
-        if connection.lossFirst >= 0 && connection.lossFirst <= connection.lossAfter { connection.lossFirst = -1; connection.lossLast = -1 }
+        if currentRecovery(connection,evicted.path,evicted.recoveryGeneration) {
+            connection.lossAfter = max(connection.lossAfter,evicted.time)
+            if connection.lossFirst >= 0 && connection.lossFirst <= connection.lossAfter { connection.lossFirst = -1; connection.lossLast = -1 }
+        }
         space.lostReferences -= evicted.streams.length
         evicted.streams = []; space.lostStreamsAt += 1
     }
@@ -936,12 +989,22 @@ function rememberLostStreams(connection: Connection, space: Space, packet: Sent)
         for at in space.lostStreamsAt..space.lostStreams.length { retained.add(space.lostStreams[at]) }
         space.lostStreams = retained; space.lostStreamsAt = 0
     }
-    space.lostStreams.add(LostStreams { number: packet.number; level: packet.level; time: packet.time; measured: packet.measured; streams: references })
+    space.lostStreams.add(LostStreams { number: packet.number; level: packet.level; time: packet.time; path: packet.path; recoveryGeneration: packet.recoveryGeneration; measured: packet.measured; streams: references })
     space.lostReferences += references.length
 }
 function persistentLoss(connection: Connection) {
     let remaining: List<Sent> = []; let unresolved = false
     for sent in connection.history {
+        if !currentRecovery(connection,sent.path,sent.recoveryGeneration) {
+            // Old delivery history is retained until resolved, but cannot
+            // extend or interrupt the current route's persistent-loss run.
+            if sent.status == 0 { remaining.add(sent) }
+            else {
+                let level = sent.level; if level == 3 { level = 2 }
+                connection.spaces[level].historyPassed = max(connection.spaces[level].historyPassed,sent.number)
+            }
+            continue
+        }
         if sent.status == 0 { unresolved = true }
         if unresolved { remaining.add(sent) }
         else if sent.status == 1 { connection.lossFirst = -1; connection.lossLast = -1 }
@@ -1319,8 +1382,8 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
         for sent in space.sent {
             if recovery.isLost(connection.congestion, sent.number, space.largestAck, sent.time, now) {
                 connection.flight = max(0, connection.flight - sent.bytes)
-                recovery.lost(connection.congestion, now, sent.time)
-                if retryPayload(connection,sent.payload) { enqueuePath(connection, sent.level, sent.payload, false, sent.path) }
+                if currentRecovery(connection,sent.path,sent.recoveryGeneration) { recovery.lost(connection.congestion, now, sent.time) }
+                retryPacket(connection,sent,false)
                 rememberLostStreams(connection,space,sent); sent.status = 2; sent.payload = Bytes()
             } else { remaining.add(sent) }
         }
@@ -1355,8 +1418,7 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
         if !probeCrypto(connection,probeLevel) {
             if space.sent.length > 0 {
                 let sent = space.sent[0]
-                if retryPayload(connection,sent.payload) { enqueuePath(connection,sent.level,sent.payload,true,sent.path) }
-                else { enqueuePath(connection,probeLevel,crypto.fromHex("01"),true,sent.path) }
+                if !retryPacket(connection,sent,true) { enqueue(connection,probeLevel,crypto.fromHex("01"),true) }
             } else { enqueue(connection,probeLevel,crypto.fromHex("01"),true) }
         }
         connection.congestion.probes += 1
@@ -1450,7 +1512,7 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
         // application packet must not repeatedly consume a blocked Finished's
         // credit. ACK-only traffic and unrelated path limits remain independent.
         if ackEliciting && level >= 2 && handshakeBudgetBlocked { unsent.add(pending); continue }
-        if ackEliciting && !pending.probe && size > connection.congestion.window - connection.flight {
+        if ackEliciting && !pending.probe && size > connection.congestion.window - recoveryFlight(connection) {
             if level < 2 { handshakeBudgetBlocked = true }
             unsent.add(pending); continue
         }
@@ -1475,11 +1537,11 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
             connection.closeAttempts += 1
         }
         if ackEliciting {
-            if connection.flight == 0 && connection.emptySince >= 0 { recovery.idle(connection.congestion,now - connection.emptySince) }
+            if recoveryFlight(connection) == 0 && connection.emptySince >= 0 { recovery.idle(connection.congestion,now - connection.emptySince) }
             connection.emptySince = -1
             connection.paceCredit = max(0.0,connection.paceCredit - Float(size))
             if space.sent.length >= 4096 { terminate(connection, 1, "QUIC outstanding packet limit exceeded"); return [] }
-            let sent = Sent { number: space.next; time: now; bytes: size; payload: pending.payload; path: pending.path; level: level; status: 0; measured: connection.congestion.measured }
+            let sent = Sent { number: space.next; time: now; bytes: size; payload: pending.payload; path: route; recoveryGeneration: connection.recoveryGeneration; level: level; status: 0; measured: connection.congestion.measured }
             space.sent.add(sent); connection.history.add(sent)
             connection.flight += size
             space.lastEliciting = now; space.probe = -1
@@ -1492,7 +1554,7 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
                 for index in 1..space.ackTimes.length { retained.add(space.ackTimes[index]) }
                 space.ackTimes = retained
             }
-            space.ackTimes.add(SentTime { number: space.next; time: now })
+            space.ackTimes.add(SentTime { number: space.next; time: now; path: route; recoveryGeneration: connection.recoveryGeneration })
         }
         if includedAck { clearAck(space) }
         space.next += 1; if level == 3 { connection.earlyPackets += 1 } else { space.writePackets += 1 }
