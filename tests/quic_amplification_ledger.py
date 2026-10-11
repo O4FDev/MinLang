@@ -384,7 +384,7 @@ class Ledger:
 def analyze(capture_bytes,keylogs,server_addresses,port=443,policy="peer-unknown",expected_connections=1):
     server_addresses={str(ipaddress.ip_address(address)) for address in server_addresses}
     keys=HandshakeKeys(keylogs);attribution=Attribution();ledger=Ledger(policy)
-    interface=None;duplicates=set();issued_handshake={};closing_connections=set();uncertain_handshake=set();limitations=[];last_time=None
+    interface=None;duplicates=set();issued_handshake={};closing_connections=set();uncertain_handshake=set();limitations=[];last_time=None;route_times={}
     for index,record in enumerate(capture(capture_bytes)):
         exact_time=Fraction(*record["timestamp_exact"])
         if last_time is not None and exact_time<last_time:raise CoverageError("capture timestamps decrease in file order")
@@ -407,6 +407,10 @@ def analyze(capture_bytes,keylogs,server_addresses,port=443,policy="peer-unknown
         connections={attribution.packet(entry,direction) for entry in entries}
         if len(connections)!=1:raise CoverageError("coalesced datagram attribution is ambiguous")
         connection=next(iter(connections));authentication=None
+        previous=route_times.get((connection,tuple(route)))
+        if previous is not None and previous[0]==exact_time and previous[1]!=direction:
+            raise CoverageError("opposite-direction UDP ordering is ambiguous at declared timestamp resolution")
+        route_times[(connection,tuple(route))]=(exact_time,direction)
         rejected = []
         for entry in entries:
             if entry["type"]!="handshake":continue
@@ -563,11 +567,44 @@ def checked_link_graph(build,root,retention):
         raise CoverageError("staged/final output bytes differ")
     return {"status":"checked-byte-graph","binary_sha256":sha(final_data),"bytes":len(final_data)}
 
+
+def checked_frontend_graph(record,sources,raw,retention):
+    """Check canonical source/output argv and retained generated output bytes."""
+    if type(record.get("status")) is not int or record["status"]!=0 or record.get("timed_out") is not False or type(record.get("timeout_seconds")) is not int or record["timeout_seconds"]!=120:
+        raise CoverageError("exact successful bounded frontend status required")
+    server=Path(sources["server"]["path"]);quic=Path(sources["quic"]["path"])
+    if server.parts[-4:]!=("tests","interop","qns","server.min") or quic.parts[-2:]!=("library","quic.min") or server.parents[3]!=quic.parents[1]:
+        raise CoverageError("reviewed source/library layout required")
+    compiler=record.get("compiler",{});output=record.get("output",{})
+    expected=[compiler.get("path"),str(server),raw.get("original"),"--bounded-owners","32","--library",str(quic.parent)]
+    if record.get("argv")!=expected or output.get("path")!=raw.get("original"):
+        raise CoverageError("canonical frontend argv/output mismatch")
+    data=retention.expected(output)
+    if sha(data)!=raw.get("sha256") or type(raw.get("bytes")) is not int or len(data)!=raw["bytes"]:
+        raise CoverageError("frontend generated output is not actual raw program LLVM")
+    for stream in ("stdout","stderr"):retention.expected(record.get(stream,{}))
+    return {"status":"checked-frontend-graph","raw_sha256":sha(data)}
+
+
+def checked_endpoint_mode(endpoint,run,args):
+    """Bind executable mode and selected server tuple to actual inspect fields."""
+    configuration=endpoint.get("Config",{})
+    if endpoint.get("Path")!="python3" or endpoint.get("Args")!=["/opt/minyar/endpoint.py"] or configuration.get("Entrypoint")!=["python3","/opt/minyar/endpoint.py"] or configuration.get("Cmd") not in (None,[]):
+        raise CoverageError("captured endpoint executable command mismatch")
+    project=run.get("project")
+    networks=endpoint.get("NetworkSettings",{}).get("Networks",{})
+    if set(networks)!={project+"_rightnet"}:raise CoverageError("captured server network membership mismatch")
+    network=networks[project+"_rightnet"]
+    actual=[str(ipaddress.ip_address(network[field])) for field in ("IPAddress","GlobalIPv6Address") if network.get(field)]
+    if not actual or run.get("server_addresses")!=actual or args.server_address!=actual or type(run.get("server_port")) is not int or run["server_port"]!=443 or type(args.server_port) is not int or args.server_port!=443:
+        raise CoverageError("captured endpoint tuple mismatch")
+    return {"status":"checked-endpoint-command-and-tuple","addresses":actual,"port":443}
+
 def checked_policy_receipt(args,retention):
     """Check the graph; policy-file existence alone supplies no policy authority."""
     if args.policy_receipt is None:raise CoverageError("checked source/build/run/captured-endpoint policy receipt absent")
     receipt=json.loads(retention.capture(args.policy_receipt))
-    if type(receipt.get("schema_version")) is not int or receipt["schema_version"]!=1 or receipt.get("policy")!=POLICY_CONTRACT:
+    if type(receipt.get("schema_version")) is not int or receipt["schema_version"]!=1 or receipt.get("policy")!=POLICY_CONTRACT or any(type(receipt.get("policy",{}).get(key)) is not type(value) for key,value in POLICY_CONTRACT.items()):
         raise CoverageError("unreviewed endpoint validation policy")
     if receipt.get("capture_origin")!=args.capture_origin:
         raise CoverageError("policy receipt capture origin mismatch")
@@ -597,9 +634,10 @@ def checked_policy_receipt(args,retention):
         raise CoverageError("source snapshot is not bound to server build")
     compile_record=snapshot.get("compiler_invocation",{})
     compiler=retention.expected(compile_record.get("compiler",{}))
-    if sha(compiler)!="df167d371354ccd151801156d803b15d77ade81e973a29f22cd5b39c9c732a7d" or compile_record.get("status")!=0:
+    if sha(compiler)!="df167d371354ccd151801156d803b15d77ade81e973a29f22cd5b39c9c732a7d" or type(compile_record.get("status")) is not int or compile_record["status"]!=0:
         raise CoverageError("reviewed successful Minyar compiler invocation absent")
-    if sources["server"]["path"] not in compile_record.get("argv",[]) or snapshot.get("raw_program_sha256")!=build.get("raw_sha256"):
+    checked_frontend_graph(compile_record,sources,build["raw_program_input"],retention)
+    if snapshot.get("raw_program_sha256")!=build["raw_program_input"]["sha256"] or snapshot["raw_program_sha256"]!=build.get("raw_sha256"):
         raise CoverageError("server source is not bound to actual program LLVM")
     for field in ("raw_program_input","program_input"):
         value=build.get(field,{})
@@ -628,6 +666,7 @@ def checked_policy_receipt(args,retention):
     for role,expected in (("server",sha(binary)),("adapter",REVIEWED_POLICY_SOURCES["adapter"])):
         if sha(retention.expected(run.get("image_contents",{}).get(role,{})))!=expected:
             raise CoverageError("actual image endpoint bytes differ from build/source")
+    checked_endpoint_mode(endpoint,run,args)
     capture_binding=run.get("capture",{})
     if retention.expected(capture_binding)!=retention.capture(args.capture) or Path(capture_binding["path"]).resolve()!=args.capture.resolve():
         raise CoverageError("run receipt is not bound to selected capture")

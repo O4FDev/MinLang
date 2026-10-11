@@ -22,7 +22,10 @@ CASES=("exact3x","one-byte-over","forged-handshake","invalid-handshake-frame","c
        "pcap-nanoseconds","pcapng-decimal-resolution","pcapng-binary-resolution","pcapng-time-offset","pcap-invalid-subsecond","cli-unbound-policy","cli-retained-input-binding","cli-retained-mutation","cli-original-mutation",
        "cli-missing-input","cli-provider-error","cli-primary-finalization-error","initial-token-policy-unknown",
        "receipt-byte-graph","receipt-runtime-missing","receipt-provider-changed","receipt-extra-link-input","receipt-compiler-mismatch",
-       "receipt-flags-mismatch","receipt-tool-changed","receipt-staging-mismatch","receipt-extra-program","receipt-final-mismatch")
+       "receipt-flags-mismatch","receipt-tool-changed","receipt-staging-mismatch","receipt-extra-program","receipt-final-mismatch",
+       "pcap-client-first-equal-time","pcap-server-first-equal-time","receipt-schema-float","receipt-status-bool","receipt-raw-mismatch","receipt-policy-bool",
+       "frontend-byte-graph","frontend-status-bool","frontend-status-float","frontend-help-argv","frontend-output-mismatch",
+       "endpoint-command-tuple","endpoint-command-mismatch","endpoint-tuple-mismatch")
 CLIENT=b"client01";SERVER=b"server01";ORIGINAL=b"original"
 SECRET=bytes(range(32));RANDOM=bytes(range(32,64))
 CLIENT2=b"client02";SERVER2=b"server02"
@@ -122,7 +125,11 @@ def fixtures(case):
     sequence=[("client",initial(),12345),("server",initial(direction="server"),12345),
               ("server",short(1200),12345),("server",short(1200),12345),("client",hs,12345),
               ("server",short(5000),12345)]
-    if case=="initial-token-policy-unknown":sequence[0]=("client",initial(token=b"opaque token"),12345);expected="coverage-limited"
+    if case in ("pcap-client-first-equal-time","pcap-server-first-equal-time"):
+        sequence=[("client",initial(),12345),("server",initial(direction="server"),12345),("client",hs,12345)]
+        if case=="pcap-server-first-equal-time":sequence[0],sequence[1]=sequence[1],sequence[0]
+        expected="coverage-limited"
+    elif case=="initial-token-policy-unknown":sequence[0]=("client",initial(token=b"opaque token"),12345);expected="coverage-limited"
     elif case=="one-byte-over":sequence[3]=("server",short(1201),12345);expected="failed"
     elif case in ("forged-handshake","invalid-handshake-frame","closing-handshake","ack-never-sent"):
         bad=hs[:-1]+bytes([hs[-1]^1]) if case=="forged-handshake" else handshake(payload=b"\x1c\0\0\0" if case=="closing-handshake" else b"\x02\x01\0\0\0" if case=="ack-never-sent" else b"\x08\0\0\0")
@@ -193,12 +200,14 @@ def fixtures(case):
     elif case=="pcapng-binary-resolution":data=pcapng(frames,stamps=list(range(129,129+len(frames))),resolution=0x8a)
     elif case=="pcapng-time-offset":data=pcapng(frames,resolution=9,offset=60)
     if case=="truncated-pcap":data=data[:-1]
+    if case in ("pcap-client-first-equal-time","pcap-server-first-equal-time"):data=pcap(frames,stamps=[(1,0)]*len(frames))
     return data,logs,connection_count,policy,expected
 
 
 def run_case(case,target=None):
     if case.startswith("cli-"):return cli_control(case,target)
     if case.startswith("receipt-"):return receipt_graph_control(case,target)
+    if case.startswith(("frontend-","endpoint-")):return authority_graph_control(case,target)
     if case=="rfc-chacha-vector":
         secret=bytes.fromhex("9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b")
         hp=ledger.expand(secret,b"quic hp",32,hashlib.sha256)
@@ -246,6 +255,44 @@ def run_case(case,target=None):
 
 
 
+
+def authority_graph_control(case,target):
+    from types import SimpleNamespace
+    expected="passed" if case in ("frontend-byte-graph","endpoint-command-tuple") else "coverage-limited"
+    retention=ledger.InputRetention(target)
+    try:
+        if case.startswith("frontend-"):
+            root=target/"mock-source";server=root/"tests/interop/qns/server.min";quic=root/"library/quic.min"
+            server.parent.mkdir(parents=True);quic.parent.mkdir();server.write_bytes(b"mock server");quic.write_bytes(b"mock quic")
+            output=target/"server.ll";output.write_bytes(b"mock generated LLVM")
+            def binding(path):
+                data=path.read_bytes();return {"path":str(path),"sha256":ledger.sha(data),"bytes":len(data)}
+            compiler=target/"compiler";compiler.write_bytes(b"mock frontend bytes")
+            out=target/"stdout";err=target/"stderr";out.write_bytes(b"");err.write_bytes(b"")
+            raw={"original":str(output),"sha256":ledger.sha(output.read_bytes()),"bytes":len(output.read_bytes())}
+            record={"compiler":binding(compiler),"argv":[str(compiler),str(server),str(output),"--bounded-owners","32","--library",str(quic.parent)],
+                    "status":0,"timed_out":False,"timeout_seconds":120,"output":binding(output),"stdout":binding(out),"stderr":binding(err)}
+            if case=="frontend-status-bool":record["status"]=False
+            elif case=="frontend-status-float":record["status"]=0.0
+            elif case=="frontend-help-argv":record["argv"]=[str(compiler),"--help",str(server)]
+            elif case=="frontend-output-mismatch":raw["sha256"]="0"*64
+            graph=ledger.checked_frontend_graph(record,{"server":binding(server),"quic":binding(quic)},raw,retention)
+        else:
+            project="minyar-qns-"+"a"*24
+            addresses=["193.167.100.100","fd00:cafe:cafe:100::100"]
+            endpoint={"Path":"python3","Args":["/opt/minyar/endpoint.py"],
+                      "Config":{"Entrypoint":["python3","/opt/minyar/endpoint.py"],"Cmd":None},
+                      "NetworkSettings":{"Networks":{project+"_rightnet":{"IPAddress":addresses[0],"GlobalIPv6Address":addresses[1]}}}}
+            run={"project":project,"server_addresses":addresses,"server_port":443}
+            args=SimpleNamespace(server_address=list(addresses),server_port=443)
+            if case=="endpoint-command-mismatch":endpoint["Path"]="other";endpoint["Args"]=["--help"]
+            elif case=="endpoint-tuple-mismatch":run["server_addresses"]=args.server_address=["193.167.100.101"]
+            graph=ledger.checked_endpoint_mode(endpoint,run,args)
+        report={"status":"passed","graph":graph}
+    except ledger.CoverageError as error:report={"status":"coverage-limited","reason":str(error)}
+    report["scope"]="mock graph shape only; no compiler or endpoint execution and no official authority"
+    return b"",b"",report,expected
+
 def receipt_graph_control(case,target):
     """Mock byte-graph metadata only; never an owned-run policy receipt."""
     import copy
@@ -276,7 +323,10 @@ def receipt_graph_control(case,target):
            "compiler_pre_link":{"selected_command":"/usr/bin/clang-18","resolved_path":tools["clang.bin"]["original"],"sha256":tools["clang.bin"]["sha256"]},
            "command":command,"actual_command":command+["-o",str(staged_path)],"staged_requested_path":str(staged_path),
            "staged_output":staged,"final_output":final,"binary_sha256":final["sha256"]}
-    if case=="receipt-runtime-missing":build["inputs"]=objects[1:]
+    if case=="receipt-schema-float":build["schema"]=2.0
+    elif case=="receipt-status-bool":build["link_status"]=False
+    elif case=="receipt-raw-mismatch":build["raw_sha256"]="0"*64
+    elif case=="receipt-runtime-missing":build["inputs"]=objects[1:]
     elif case=="receipt-provider-changed":(build_root/"native-0.o").write_bytes(b"changed provider")
     elif case=="receipt-extra-link-input":build["actual_command"].insert(-2,str(target/"unrepresented.o"))
     elif case=="receipt-compiler-mismatch":build["compiler_pre_link"]["selected_command"]="/different/compiler"
@@ -287,6 +337,16 @@ def receipt_graph_control(case,target):
     elif case=="receipt-final-mismatch":(build_root/"program").write_bytes(b"different output")
     (target/"mock-build.json").write_text(json.dumps(build,indent=2)+"\n")
     evidence=target/"checked-inputs";evidence.mkdir();retention=ledger.InputRetention(evidence)
+    if case=="receipt-policy-bool":
+        from types import SimpleNamespace
+        policy=dict(ledger.POLICY_CONTRACT);policy["early_cid_validation"]=0
+        receipt=target/"policy.json";receipt.write_text(json.dumps({"schema_version":1,"policy":policy,"capture_origin":"synthetic-control","evidence_kind":"mocked-control"}))
+        try:
+            ledger.checked_policy_receipt(SimpleNamespace(policy_receipt=receipt,capture_origin="synthetic-control"),retention)
+        except ledger.CoverageError as error:
+            rejected=str(error)=="unreviewed endpoint validation policy"
+            return b"",b"",{"status":"coverage-limited" if rejected else "passed","reason":str(error),"scope":"policy-header exact-type control only"},"coverage-limited"
+        raise AssertionError("mocked policy unexpectedly supplied official authority")
     try:
         result=ledger.checked_link_graph(build,build_root,retention)
         report={"status":"passed","graph":result}
