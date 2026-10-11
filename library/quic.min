@@ -42,6 +42,7 @@ public record Connection {
     originalDestination: Bytes; local: Bytes; remote: Bytes; peerSource: Bytes; peerKnown: Boolean
     initialDestination: Bytes; initialHandshake: Bytes; retryAccepted: Boolean; retrySource: Bytes; retryToken: Bytes
     remoteIds: List<ConnectionId>; retirePrior: Integer
+    localIds: List<ConnectionId>; nextLocalSequence: Integer; peerIdLimit: Integer; connectionIdVersion: Integer
     clientTLS: tls.Session; serverTLS: tlsserver.Session; spaces: List<Space>; pending: List<Pending>
     streams: List<stream.Stream>; nextBidi: Integer; nextUni: Integer
     closedStreams: List<ClosedStreams>; incomingBidi: Integer; incomingUni: Integer; receiveBidi: Integer; receiveUni: Integer
@@ -59,6 +60,28 @@ public record Connection {
 function contains(values: List<Integer>, value: Integer): Boolean { for item in values { if item == value { return true } }; return false }
 function add(data: Bytes, value: Integer) { data.addBytes(errors.bytesValue(wire.encode(value))) }
 function equal(left: Bytes, right: Bytes): Boolean { return crypto.hex(left) == crypto.hex(right) }
+public function ownsConnectionId(connection: Connection, id: Bytes): Boolean {
+    for known in connection.localIds { if equal(known.id, id) { return true } }
+    return false
+}
+function issueConnectionIds(connection: Connection) {
+    let attempts = 0
+    while connection.localIds.length < min(2, connection.peerIdLimit) {
+        if connection.nextLocalSequence > wire.MAX_VARINT || attempts >= 8 { terminate(connection, 1, "connection ID generation exhausted"); return }
+        attempts += 1
+        let entropy = randomBytes(24)
+        if entropy.length != 24 { terminate(connection, 1, "connection ID generation failed"); return }
+        let id = entropy.slice(0, 8); let token = entropy.slice(8, 24)
+        if equal(id, connection.local) || ownsConnectionId(connection, id) { continue }
+        let sequence = connection.nextLocalSequence; connection.nextLocalSequence += 1
+        connection.localIds.add(ConnectionId { sequence: sequence; id: id; token: token }); connection.connectionIdVersion += 1
+        let prior = sequence
+        for known in connection.localIds { prior = min(prior, known.sequence) }
+        let frame = Bytes(); add(frame, 24); add(frame, sequence); add(frame, prior)
+        frame.add(id.length); frame.addBytes(id); frame.addBytes(token)
+        enqueue(connection, 2, frame, false)
+    }
+}
 function parameters(local: Bytes, original: Bytes, server: Boolean): Bytes {
     let result = Bytes()
     if server { add(result, 0); add(result, original.length); result.addBytes(original) }
@@ -98,6 +121,7 @@ function create(entropy: Bytes, original: Bytes, client: Boolean): Connection {
         originalDestination: destination; local: local; remote: destination; peerSource: Bytes(); peerKnown: false
         initialDestination: destination; initialHandshake: Bytes(); retryAccepted: false; retrySource: Bytes(); retryToken: Bytes()
         remoteIds: []; retirePrior: 0
+        localIds: [ConnectionId { sequence: 0; id: local; token: Bytes() }]; nextLocalSequence: 1; peerIdLimit: 2; connectionIdVersion: 0
         clientTLS: tls.none(); serverTLS: tlsserver.none(); spaces: spaces; pending: []; streams: []; nextBidi: role; nextUni: role + 2
         closedStreams: []; incomingBidi: 0; incomingUni: 0; receiveBidi: 16; receiveUni: 16
         peerMaxData: 0; peerBidi: 0; peerUni: 0; peerBidiLocal: 0; peerBidiRemote: 0; peerUniData: 0
@@ -271,6 +295,7 @@ function peerParameters(connection: Connection, bytes: Bytes) {
         if id == 10 { connection.ackExponent = parameter.integer }
         if id == 1 && parameter.integer > 0 { connection.idleTimeout = min(connection.idleTimeout, parameter.integer) }
         if id == 12 { connection.peerDisabledMigration = true }
+        if id == 14 { connection.peerIdLimit = parameter.integer }
     }
     if !connection.clientRole { retryBound = true }
     if !original || !source || !retryBound { terminate(connection, 8, "transport parameters do not bind the observed connection IDs"); return }
@@ -319,6 +344,7 @@ function synchronize(connection: Connection) {
     if established && connection.state != ESTABLISHED && connection.state != FAILED {
         connection.state = ESTABLISHED
         if !connection.clientRole { enqueue(connection, 2, crypto.fromHex("1e"), false); connection.confirmed = true; discard(connection, 1) }
+        issueConnectionIds(connection)
     }
 }
 function acknowledge(space: Space, number: Integer): Boolean {
@@ -531,7 +557,7 @@ function persistentLoss(connection: Connection) {
     }
     connection.history = remaining
 }
-function processFrame(connection: Connection, level: Integer, frame: wire.Frame) {
+function processFrame(connection: Connection, level: Integer, frame: wire.Frame, destination: Bytes) {
     let space = connection.spaces[level]
     if frame.type == 2 || frame.type == 3 { processAck(connection, space, frame) }
     else if frame.type == 6 {
@@ -616,7 +642,15 @@ function processFrame(connection: Connection, level: Integer, frame: wire.Frame)
     }
     else if frame.type == 7 { /* Session tickets/tokens are not retained. */ }
     else if frame.type == 25 {
-        terminate(connection, 10, "this QUIC control-frame feature is not implemented")
+        if frame.value >= connection.nextLocalSequence { terminate(connection, 10, "peer retired an unissued connection ID"); return }
+        let retained: List<ConnectionId> = []; let found = false
+        for known in connection.localIds {
+            if known.sequence == frame.value {
+                if equal(known.id, destination) { terminate(connection, 10, "peer retired the packet destination connection ID"); return }
+                found = true
+            } else { retained.add(known) }
+        }
+        if found { connection.localIds = retained; connection.connectionIdVersion += 1; issueConnectionIds(connection) }
     }
 }
 public function receive(connection: Connection, datagram: Bytes, now: Integer) { receivePath(connection, datagram, connection.activePath, now) }
@@ -662,7 +696,7 @@ public function receivePath(connection: Connection, datagram: Bytes, pathId: Int
         if header.kind == wire.VERSION_NEGOTIATION { negotiateClient(connection,header); return }
         if header.kind == wire.RETRY { retryClient(connection,datagram.slice(at,header.end),header); return }
         if header.kind != wire.ONE_RTT && header.version != connection.version { return }
-        if !equal(header.destination, connection.local) && !((header.kind == wire.INITIAL || header.kind == wire.ZERO_RTT) && !connection.clientRole && equal(header.destination, connection.initialDestination)) { return }
+        if !ownsConnectionId(connection, header.destination) && !((header.kind == wire.INITIAL || header.kind == wire.ZERO_RTT) && !connection.clientRole && equal(header.destination, connection.initialDestination)) { return }
         if !connection.clientRole && header.kind == wire.INITIAL && datagram.length < 1200 { return }
         let level = 2
         if header.kind == wire.INITIAL { level = 0 }
@@ -760,7 +794,7 @@ public function receivePath(connection: Connection, datagram: Bytes, pathId: Int
         for frame in parsed.frames {
             if !wire.allowed(frame, header.kind, !connection.clientRole) { terminate(connection, 10, "frame at prohibited encryption level"); return }
             if frame.type != 0 && frame.type != 2 && frame.type != 3 && frame.type != 28 && frame.type != 29 { ackEliciting = true }
-            processFrame(connection, level, frame)
+            processFrame(connection, level, frame, header.destination)
             if connection.state == FAILED || connection.state == CLOSED { return }
         }
         // A key-phase response can itself contain only ACK frames. Confirm
@@ -1130,7 +1164,7 @@ public function close(connection: Connection, code: Integer, reason: Bytes): err
 public function release(connection: Connection): Boolean {
     if (connection.state != CLOSED && connection.state != FAILED) || connection.closing || connection.draining { return false }
     connection.clientTLS = tls.none(); connection.serverTLS = tlsserver.none()
-    connection.spaces = []; connection.pending = []; connection.streams = []; connection.remoteIds = []
+    connection.spaces = []; connection.pending = []; connection.streams = []; connection.remoteIds = []; connection.localIds = []
     connection.history = []
     connection.closedStreams = []
     connection.paths = []; connection.outgoingPaths = []; connection.earlyStreams = []
