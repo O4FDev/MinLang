@@ -77,15 +77,44 @@ function queuedMixed(c: quic.Connection,s: quic.Connection,now: Integer): Intege
     if controls!=1 { return 67 }
     return 0
 }
+
+function recoveredDelivery(c: quic.Connection,s: quic.Connection,now: Integer): Integer {
+    let id=errors.integerValue(quic.openStream(c,false))
+    for round in 0..4097 {
+        let tick=now+round*50
+        c.paceCredit=Float(c.congestion.window);c.paceAt=tick
+        quic.writeStream(c,id,Bytes("x"),false)
+        quic.poll(c,tick)
+        if c.spaces[2].sent.length!=1 { print("recovery original "+Text(round)+" "+Text(c.spaces[2].sent.length));return 69 }
+        let original=c.spaces[2].sent[0]
+        for step in 1..4 {
+            quic.ping(c)
+            for packet in quic.poll(c,tick+step) { quic.receive(s,packet,tick+step) }
+        }
+        let frame=Bytes();frame.add(2);number(frame,c.spaces[2].next-1);number(frame,0);number(frame,0);number(frame,2)
+        inject(s,c,frame,tick+4)
+        c.paceCredit=0.0;c.paceAt=tick+4
+        quic.poll(c,tick+4)
+        if original.status!=2 || original.payload.length!=0 || c.pending.length!=1 { print("recovery loss phase "+Text(round));return 70 }
+        for packet in quic.poll(c,tick+20) { quic.receive(s,packet,tick+20) }
+        for packet in quic.poll(s,tick+21) { quic.receive(c,packet,tick+21) }
+        if c.streams[0].sendAcknowledged!=round+1 { print("recovery ACK "+Text(round)+" "+Text(c.streams[0].sendAcknowledged));return 71 }
+        if c.spaces[2].lostStreams.length-c.spaces[2].lostStreamsAt!=0 {
+            print("acknowledged retransmission retained stale delivery metadata "+Text(round));return 72
+        }
+        if c.flight!=0 || c.spaces[2].sent.length!=0 || c.pending.length!=0 { return 73 }
+    }
+    return 0
+}
 function main(): Integer {
     let root=readBytesFile(argument(0));let cert=readBytesFile(argument(1));let key=readBytesFile(argument(2));let client=readBytesFile(argument(3));let clientKey=readBytesFile(argument(4))
-    for scenario in 0..2 {
+    for scenario in 0..3 {
         let candidate=quic.client("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey)
         let peer=quic.server(randomBytes(80),"minyar-test",candidate.originalDestination,[cert],key,[root],true)
         for count in 0..200 { drive(candidate,peer,count*10) }
         if !candidate.confirmed || !peer.confirmed { return 68 }
         let result=0
-        if scenario==0 { result=lateACK(candidate,peer,2000) } else { result=queuedMixed(candidate,peer,2000) }
+        if scenario==0 { result=lateACK(candidate,peer,2000) } else if scenario==1 { result=queuedMixed(candidate,peer,2000) } else { result=recoveredDelivery(candidate,peer,2000) }
         if result!=0 { return result }
     }
     let c=quic.client("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey)
