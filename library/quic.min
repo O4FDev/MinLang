@@ -231,7 +231,18 @@ function enqueuePath(connection: Connection, level: Integer, payload: Bytes, pro
     if connection.emptySince >= 0 && payload.length > 0 && payload[0] != 0 && payload[0] != 2 && payload[0] != 3 && payload[0] != 28 && payload[0] != 29 {
         recovery.idle(connection.congestion,max(0,connection.now - connection.emptySince)); connection.emptySince = -1
     }
-    connection.pending.add(Pending { level: level; payload: payload; probe: probe; path: path })
+    let value = Pending { level: level; payload: payload; probe: probe; path: path }
+    if level < 2 && connection.pending.length > 0 {
+        // RFC9001 5.7: peers cannot process application data before Finished.
+        // Insert only handshake traffic; application-only queues stay in place.
+        let ordered: List<Pending> = []; let inserted = false
+        for queued in connection.pending {
+            if !inserted && queued.level > level { ordered.add(value); inserted = true }
+            ordered.add(queued)
+        }
+        if !inserted { ordered.add(value) }
+        connection.pending = ordered
+    } else { connection.pending.add(value) }
 }
 function cryptoData(connection: Connection, level: Integer, data: Bytes) {
     if connection.clientRole && level == 0 && data.length > 0 && connection.initialHandshake.length == 0 { connection.initialHandshake = data.slice(0,data.length) }
@@ -245,6 +256,23 @@ function cryptoData(connection: Connection, level: Integer, data: Bytes) {
         enqueue(connection, level, frame, false)
         space.sendCrypto += count; at += count
     }
+}
+// If 0-RTT flight consumes the window before Finished was sent, there is
+// no Handshake-space PTO yet. Use the due application probe opportunity for
+// that queued CRYPTO, under the existing probe and amplification rules.
+function probeHandshake(connection: Connection): Boolean {
+    if !connection.clientRole || connection.confirmed || !connection.spaces[1].active || connection.spaces[1].write.key.length == 0 { return false }
+    for pending in connection.pending {
+        if pending.level != 1 { continue }
+        let route = pending.path; if route < 0 { route = connection.activePath }
+        if pathIndex(connection, route) < 0 { continue }
+        let frames = wire.frames(pending.payload)
+        if !frames.valid { continue }
+        for frame in frames.frames {
+            if frame.type == 6 && frame.data.length > 0 { pending.probe = true; return true }
+        }
+    }
+    return false
 }
 function rememberedLimit(connection: Connection, id: Integer, value: Integer) {
     if id == 4 { connection.peerMaxData = value }
@@ -988,14 +1016,17 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
         space.sent = remaining
         if remaining.length == 0 { space.probe = -1 }
         if remaining.length > 0 && space.probe >= 0 && now >= space.probe {
-            if retryPayload(connection,remaining[0].payload) { enqueuePath(connection, remaining[0].level, remaining[0].payload, true, remaining[0].path) }
-            else { enqueuePath(connection,remaining[0].level,crypto.fromHex("01"),true,remaining[0].path) }
+            let handshakeProbe = level == 2 && probeHandshake(connection)
+            if !handshakeProbe {
+                if retryPayload(connection,remaining[0].payload) { enqueuePath(connection, remaining[0].level, remaining[0].payload, true, remaining[0].path) }
+                else { enqueuePath(connection,remaining[0].level,crypto.fromHex("01"),true,remaining[0].path) }
+            }
             connection.congestion.probes += 1; space.probe = now + recovery.pto(connection.congestion, connection.confirmed)
         }
         if space.ack && space.write.key.length > 0 && (level != 2 || connection.state == ESTABLISHED) { enqueuePath(connection, level, ackFrame(space), false, space.ackPath); space.ack = false }
     }
     persistentLoss(connection)
-    let unsent: List<Pending> = []
+    let unsent: List<Pending> = []; let handshakeBudgetBlocked = false
     for pending in connection.pending {
         let filtered = pendingPayload(connection,pending.payload)
         if filtered.length == 0 { continue }
@@ -1034,11 +1065,19 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
         for frame in parsed.frames { if frame.type != 0 && frame.type != 2 && frame.type != 3 && frame.type != 28 && frame.type != 29 { ackEliciting = true } }
         if ackEliciting && connection.history.length >= 8192 { unsent.add(pending); continue }
         if (!connection.addressValidated && size > 3 * connection.receivedBytes - connection.sentBytes) ||
-           (!connection.clientRole && !path.validated && size > 3 * path.received - path.sent) ||
-           (ackEliciting && !pending.probe && size > connection.congestion.window - connection.flight) {
+           (!connection.clientRole && !path.validated && size > 3 * path.received - path.sent) {
+            unsent.add(pending); continue
+        }
+        // Congestion and pacing credit are shared by all paths. A smaller
+        // application packet must not repeatedly consume a blocked Finished's
+        // credit. ACK-only traffic and unrelated path limits remain independent.
+        if ackEliciting && level >= 2 && handshakeBudgetBlocked { unsent.add(pending); continue }
+        if ackEliciting && !pending.probe && size > connection.congestion.window - connection.flight {
+            if level < 2 { handshakeBudgetBlocked = true }
             unsent.add(pending); continue
         }
         if ackEliciting && !pending.probe && Float(size) > connection.paceCredit {
+            if level < 2 { handshakeBudgetBlocked = true }
             let wait = max(1,Integer((Float(size) - connection.paceCredit) / paceRate + 0.999999))
             let deadline = now + wait
             if connection.paceNext < 0 { connection.paceNext = deadline } else { connection.paceNext = min(connection.paceNext,deadline) }
