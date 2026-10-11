@@ -228,7 +228,7 @@ def finalize(evidence, report, primary):
 
 
 class CommandRecords:
-    """Raw observations and the shared, owned tree timeout convention."""
+    """Raw observations; owned groups on POSIX and contained jobs on Windows."""
     def __init__(self, evidence, report):
         self.evidence, self.report = evidence, report
 
@@ -242,7 +242,48 @@ class CommandRecords:
         began = time.monotonic()
         process = None
         out, err = b'', b''
-        primary = None
+        primary, secondary_failure = None, None
+
+        def attempt(stage, action):
+            nonlocal secondary_failure
+            try:
+                return True, action()
+            except BaseException as error:
+                row['cleanup']['status'] = 'failed'
+                row['cleanup'].setdefault('errors', []).append({
+                    'stage': stage, 'exception': type(error).__name__, 'message': str(error)})
+                secondary(self.report, primary, stage, error)
+                secondary_failure = secondary_failure or error
+                return False, None
+
+        def close_pipes():
+            for name in ('stdout', 'stderr'):
+                pipe = getattr(process, name, None)
+                if pipe is not None and not pipe.closed:
+                    attempt(name + '-close', pipe.close)
+
+        def cleanup():
+            nonlocal out, err
+            row['cleanup'] = {'action': (
+                'owned-Windows-job' if windows_host() else 'terminate_process_tree'),
+                'status': 'started', 'owned_pid': process.pid}
+            stop = (process.terminate_owned if windows_host()
+                    else lambda: terminate_process_tree(process))
+            stopped, _ = attempt('owned-tree-terminate', stop)
+            if not stopped:
+                attempt('fallback-child-kill', process.kill)
+            drained, streams = attempt('post-cleanup-drain',
+                                       lambda: process.communicate(timeout=10))
+            if drained:
+                out, err = streams
+            else:
+                attempt('fallback-child-kill', process.kill)
+                close_pipes()
+                attempt('fallback-child-wait', lambda: process.wait(timeout=5))
+            row['status'] = process.returncode
+            if row['cleanup']['status'] != 'failed':
+                row['cleanup']['status'] = 'completed'
+
         try:
             requested = command[0]
             executable = host_path(requested) if os.path.dirname(requested) else None
@@ -254,92 +295,44 @@ class CommandRecords:
             executable = executable.resolve()
             row['executable'] = str(executable)
             row['executable_sha256'] = hashlib.sha256(executable.read_bytes()).hexdigest()
-            process = subprocess.Popen(
-                command, executable=native_path(executable), cwd=ROOT,
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                start_new_session=not windows_host())
+            if windows_host():
+                from windows_job_owner import WindowsJobProcess
+                process = WindowsJobProcess(command, executable, ROOT, self.evidence,
+                                            label, timeout, row)
+            else:
+                process = subprocess.Popen(
+                    command, executable=str(executable), cwd=ROOT,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    start_new_session=True)
             row['pid'] = process.pid
             row['start_new_session'] = not windows_host()
-            try:
-                out, err = process.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired as error:
-                row['timed_out'] = True
-                row['cleanup'] = {'action': 'terminate_process_tree', 'status': 'started',
-                                  'owned_pid': process.pid, 'backend': (
-                                      'native-Windows-tree' if windows_host() else 'owned-POSIX-group')}
-                try:
-                    terminate_process_tree(process)
-                    row['cleanup']['status'] = 'completed'
-                except BaseException as cleanup_error:
-                    row['cleanup']['status'] = 'failed'
-                    row['cleanup']['exception'] = type(cleanup_error).__name__ + ': ' + str(cleanup_error)
-                    error.add_note('idle mock tree cleanup failed: ' + row['cleanup']['exception'])
-                    # Fail closed; direct-child cleanup is not a tree success.
-                    process.kill()
-                try:
-                    out, err = process.communicate(timeout=10)
-                except BaseException as drain_error:
-                    row['cleanup']['status'] = 'failed'
-                    row['cleanup']['drain_error'] = type(drain_error).__name__ + ': ' + str(drain_error)
-                    error.add_note('idle mock post-cleanup drain failed: ' + str(drain_error))
-                    process.kill()
-                    for pipe in (process.stdout, process.stderr):
-                        if pipe is not None:
-                            pipe.close()
-                    process.wait(timeout=5)
-                row['status'] = process.returncode
-                raise subprocess.TimeoutExpired(command, timeout, output=out, stderr=err) from error
+            out, err = process.communicate(timeout=timeout)
             row['status'] = process.returncode
             return subprocess.CompletedProcess(command, process.returncode, out, err)
         except BaseException as error:
             primary = error
-            if process is not None and process.poll() is None:
-                row['cleanup'] = {'action': 'terminate_process_tree', 'status': 'started',
-                                  'owned_pid': process.pid, 'reason': 'command-exception'}
-                try:
-                    terminate_process_tree(process)
-                    row['cleanup']['status'] = 'completed'
-                except BaseException as cleanup_error:
-                    row['cleanup']['status'] = 'failed'
-                    row['cleanup']['exception'] = type(cleanup_error).__name__ + ': ' + str(cleanup_error)
-                    error.add_note('idle mock exception cleanup failed: ' + str(cleanup_error))
-                    process.kill()
-                try:
-                    out, err = process.communicate(timeout=10)
-                except BaseException as drain_error:
-                    row['cleanup']['status'] = 'failed'
-                    row['cleanup']['drain_error'] = str(drain_error)
-                    error.add_note('idle mock exception drain failed: ' + str(drain_error))
-                    process.kill()
-                    for pipe in (process.stdout, process.stderr):
-                        if pipe is not None and not pipe.closed:
-                            pipe.close()
-                    try:
-                        process.wait(timeout=5)
-                    except BaseException as wait_error:
-                        row['cleanup']['wait_error'] = str(wait_error)
-                        error.add_note('idle mock final child wait failed: ' + str(wait_error))
-            if process is not None:
-                row['status'] = process.returncode
+            row['timed_out'] = isinstance(error, subprocess.TimeoutExpired)
             row['exception'] = type(error).__name__ + ': ' + str(error)
+            if process is not None:
+                cleanup()
+                row['status'] = process.returncode
+            if isinstance(error, subprocess.TimeoutExpired):
+                error.output, error.stderr = out, err
             raise
         finally:
             row['elapsed_seconds'] = time.monotonic() - began
             for name, data in (('stdout', out), ('stderr', err)):
                 path = self.evidence/(label + '.' + name + '.bin')
-                try:
+                def retain(path=path, name=name, data=data):
                     path.write_bytes(data or b'')
                     row[name + '_path'] = path.relative_to(self.evidence).as_posix()
                     row[name + '_sha256'] = hashlib.sha256(data or b'').hexdigest()
                     row[name + '_bytes'] = len(data or b'')
-                except BaseException as error:
-                    secondary(self.report, primary, label + '-' + name + '-retention', error)
-                    if primary is None:
-                        raise
+                attempt(label + '-' + name + '-retention', retain)
             if process is not None:
-                for pipe in (process.stdout, process.stderr):
-                    if pipe is not None and not pipe.closed:
-                        pipe.close()
+                close_pipes()
+            if primary is None and secondary_failure is not None:
+                raise secondary_failure
 
 
 def check_case(name, values, binaries, owner, report):
