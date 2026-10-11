@@ -14,6 +14,108 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class BuildWiring(unittest.TestCase):
 
+    def test_quic_rfc_gates_keep_all_drivers_and_public_frontends(self):
+        import importlib.util
+        import json
+        import re
+        source = (ROOT / 'build-support/quic-rfc.mk').read_text()
+        native, sanitize = 'check-quic-rfc', 'check-quic-rfc-sanitize'
+        frontends = {'build/minyarc', 'build/minyarc-callbacks',
+                     'build/minyarc-errors-request', 'build/minyarc-errors'}
+        inputs = {'minyar', 'tools/clang-driver.py', 'tools/sanitizer_llvm.py',
+                  'tests/quic-rfc.py', 'tests/quic-rfc-harness.py',
+                  'tests/test_evidence.py', 'tests/clang_helpers.py',
+                  'tests/tls-local.py', 'library/quic.min', 'library/tls.min',
+                  'library/tlsserver.min', 'tests/quic-migration-cids.py',
+                  'tests/quic-migration-cids.min', 'tests/quic-cipher-policy.py',
+                  'tests/quic-cipher-policy.min', 'tests/quic-qns-local.py',
+                  'tests/quic-vn-probe.py', 'tests/interop/qns/client.min',
+                  'tests/interop/qns/server.min'}
+
+        def verify(fragment):
+            with tempfile.TemporaryDirectory(prefix='QUIC RFC Make rules ') as folder:
+                makefile = Path(folder) / 'probe.mk'
+                fixtures = sorted(frontends | inputs | {'build'})
+                makefile.write_text(fragment + '\n.PHONY: ' + ' '.join(fixtures)
+                                   + '\n' + ' '.join(fixtures)
+                                   + ':\n\t@echo INPUT $@\n')
+                env = dict(os.environ)
+                env.pop('MAKEFLAGS', None)
+                result = subprocess.run(['make', '-rRnp', '-f', str(makefile),
+                                         native, sanitize], cwd=ROOT, env=env,
+                                        text=True, capture_output=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                rules = {}
+                for line in result.stdout.splitlines():
+                    match = re.match(r'^([\w./-]+):\s*(.*)$', line)
+                    if match:
+                        rules.setdefault(match[1], set()).update(match[2].split())
+                for gate in ('check', 'check-portable', 'check-quic'):
+                    self.assertIn(native, rules.get(gate, set()), gate)
+                for gate in ('check-sanitize', 'check-quic-sanitize'):
+                    self.assertIn(sanitize, rules.get(gate, set()), gate)
+                for target in (native, sanitize):
+                    self.assertTrue(frontends | inputs <= rules.get(target, set()), target)
+                commands = result.stdout.split('# GNU Make', 1)[0]
+                self.assertEqual(commands.count('python3 tests/quic-rfc.py'), 2)
+                self.assertEqual(commands.count('--optimization both'), 2)
+                self.assertEqual(commands.count('--sanitize'), 1)
+                self.assertEqual(commands.count('mktemp -d "'), 2)
+                self.assertEqual(commands.count('--artifacts "$artifacts/run"'), 2)
+                self.assertNotIn('--case ', commands)
+                self.assertNotIn('--expect-old-code', commands)
+                for suffix in ('native', 'sanitize'):
+                    self.assertIn((ROOT/'build'/('quic-rfc-' + suffix)).as_posix(),
+                                  commands.replace('\\', '/'))
+
+        verify(source)
+        for gate in ('check', 'check-portable', 'check-quic',
+                     'check-sanitize', 'check-quic-sanitize'):
+            aggregate = ('check-sanitize check-quic-sanitize: ' + sanitize
+                         if gate in ('check-sanitize', 'check-quic-sanitize')
+                         else 'check check-portable check-quic: ' + native)
+            names, dependency = aggregate.split(': ', 1)
+            mutant = source.replace(aggregate, ' '.join(
+                name for name in names.split() if name != gate) + ': ' + dependency, 1)
+            with self.subTest(missing_gate=gate), self.assertRaises(AssertionError):
+                verify(mutant)
+        for dependency in sorted(frontends | inputs):
+            mutant = source.replace(dependency, '', 1)
+            self.assertNotEqual(mutant, source)
+            with self.subTest(missing_dependency=dependency), self.assertRaises(AssertionError):
+                verify(mutant)
+        for name, old, new in (
+                ('single optimization', '--optimization both', '--optimization 0'),
+                ('missing sanitizer', '--sanitize --artifacts', '--artifacts'),
+                ('case filter', '--optimization both', '--optimization both --case migration-cid'),
+                ('old-code oracle', '--optimization both', '--optimization both --expect-old-code'),
+                ('relative evidence', '$(abspath build)/quic-rfc-', 'build/quic-rfc-')):
+            mutant = source.replace(old, new, 1)
+            self.assertNotEqual(mutant, source)
+            with self.subTest(invalid_recipe=name), self.assertRaises(AssertionError):
+                verify(mutant)
+        tree = ast.parse((ROOT/'scripts/check-linux.py').read_text())
+        targets = next(ast.literal_eval(node.value) for node in tree.body
+                       if isinstance(node, ast.Assign)
+                       and any(isinstance(target, ast.Name) and target.id == 'TARGETS'
+                               for target in node.targets))
+        for target in (native, sanitize):
+            self.assertEqual(targets.count(target), 1)
+        spec = importlib.util.spec_from_file_location(
+            'quic_rfc_catalogue', ROOT/'tests/suite-catalogue.py')
+        catalogue = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(catalogue)
+        data = json.loads((ROOT/'tests/suite-catalogue.json').read_text())
+        catalogue.validate(data, ROOT)
+        for name in sorted(inputs - {'minyar', 'tools/clang-driver.py',
+                                     'tools/sanitizer_llvm.py', 'library/quic.min',
+                                     'library/tls.min', 'library/tlsserver.min'}):
+            self.assertIn(name, catalogue.discover(ROOT))
+            with self.subTest(missing_source=name), self.assertRaises(ValueError):
+                catalogue.validate(dict(data, sources=[row for row in data['sources']
+                                                       if row['path'] != name]), ROOT)
+
+
     def test_generated_llvm_sanitizer_is_mandatory_and_tracks_canonical_helper(self):
         import json
         import re
