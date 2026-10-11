@@ -26,10 +26,12 @@ public record Path {
 }
 record ConnectionId { sequence: Integer; id: Bytes; token: Bytes }
 record SentTime { number: Integer; time: Integer }
+record SentStream { id: Integer; first: Integer; length: Integer; fin: Boolean; reset: Boolean }
+record LostStreams { number: Integer; level: Integer; time: Integer; measured: Boolean; streams: List<SentStream> }
 public record ClosedStreams { kind: Integer; first: Integer; last: Integer }
 record Space {
     read: protection.Keys; write: protection.Keys; next: Integer; largest: Integer; largestAck: Integer
-    ackTimes: List<SentTime>
+    ackTimes: List<SentTime>; lostStreams: List<LostStreams>; lostStreamsAt: Integer; lostReferences: Integer; historyPassed: Integer; lastEliciting: Integer
     ranges: List<wire.Range>; ack: Boolean; sent: List<Sent>; active: Boolean; probe: Integer
     receivedCrypto: stream.Stream; sendCrypto: Integer
     nextRead: protection.Keys; previousRead: protection.Keys; previousUntil: Integer
@@ -106,7 +108,7 @@ function create(entropy: Bytes, original: Bytes, client: Boolean): Connection {
         if level == 0 { read = protection.initial(1, destination, client); write = protection.initial(1, destination, !client) }
         spaces.add(Space {
             read: read; write: write; next: 0; largest: -1; largestAck: -1; ranges: []; ack: false; sent: []; active: true; probe: -1
-            ackTimes: []
+            ackTimes: []; lostStreams: []; lostStreamsAt: 0; lostReferences: 0; historyPassed: -1; lastEliciting: -1
             receivedCrypto: stream.create(level, 1048576, 1048576); sendCrypto: 0
             nextRead: protection.traffic(1, 0, Bytes()); previousRead: protection.traffic(1, 0, Bytes()); previousUntil: -1
             readGeneration: 0; writeGeneration: 0; readFirst: 0; writeFirst: 0; writePackets: 0
@@ -195,7 +197,7 @@ function terminate(connection: Connection, code: Integer, message: Text) {
     connection.state = FAILED; connection.code = code; connection.error = message
     connection.pending = []; connection.flight = 0
     connection.history = []
-    for space in connection.spaces { space.sent = []; space.ack = false }
+    for space in connection.spaces { space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.ack = false }
     connection.streams = []
     let level = 0
     if connection.spaces[1].write.key.length > 0 { level = 1 }
@@ -210,7 +212,7 @@ function beginClosing(connection: Connection, level: Integer, frame: Bytes) {
     connection.closeInterval = recovery.pto(connection.congestion,connection.confirmed); connection.closeAttempts = 0; connection.closeFrame = frame; connection.closeLevel = level
     connection.pending = [Pending { level: level; payload: frame; probe: false; path: -1 }]; connection.flight = 0
     connection.history = []
-    for space in connection.spaces { space.sent = []; space.ack = false }
+    for space in connection.spaces { space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.ack = false }
     for path in connection.paths { path.challenge = Bytes(); path.deadline = -1 }
 }
 function beginDraining(connection: Connection, code: Integer) {
@@ -218,7 +220,7 @@ function beginDraining(connection: Connection, code: Integer) {
     connection.closeUntil = max(connection.closeUntil,connection.now + 3 * recovery.pto(connection.congestion,connection.confirmed))
     connection.pending = []; connection.flight = 0; connection.streams = []; connection.closeFrame = Bytes()
     connection.history = []
-    for space in connection.spaces { space.sent = []; space.ack = false }
+    for space in connection.spaces { space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.ack = false }
     for path in connection.paths { path.challenge = Bytes(); path.deadline = -1 }
 }
 function enqueue(connection: Connection, level: Integer, payload: Bytes, probe: Boolean) {
@@ -264,6 +266,13 @@ function rejectEarly(connection: Connection) {
         else { sent.add(packet) }
     }
     connection.spaces[2].sent = sent
+    let lost: List<LostStreams> = []
+    for at in connection.spaces[2].lostStreamsAt..connection.spaces[2].lostStreams.length {
+        let packet = connection.spaces[2].lostStreams[at]
+        if packet.level != 3 { lost.add(packet) }
+    }
+    connection.spaces[2].lostStreams = lost; connection.spaces[2].lostStreamsAt = 0; connection.spaces[2].lostReferences = 0
+    for packet in lost { connection.spaces[2].lostReferences += packet.streams.length }
     connection.sentData = max(0, connection.sentData - connection.earlyData)
     for id in connection.earlyStreams {
         let index = streamIndex(connection, id)
@@ -377,10 +386,16 @@ function ackFrame(space: Space): Bytes {
 }
 function processAck(connection: Connection, space: Space, frame: wire.Frame) {
     if frame.value >= space.next { terminate(connection, 10, "peer acknowledged an unsent packet"); return }
-    let sampleAt = -1; let eliciting = false
+    let sampleAt = -1; let eliciting = false; let cachedAck = false; let deliveryChanged = false
     for sent in space.sent {
         for range in frame.ranges {
             if sent.number >= range.first && sent.number <= range.last { eliciting = true; if sent.number == frame.value { sampleAt = sent.time } }
+        }
+    }
+    for at in space.lostStreamsAt..space.lostStreams.length {
+        let packet = space.lostStreams[at]
+        for range in frame.ranges {
+            if packet.number >= range.first && packet.number <= range.last { eliciting = true; cachedAck = true; if packet.number == frame.value { sampleAt = packet.time } }
         }
     }
     let retainedTimes: List<SentTime> = []
@@ -404,6 +419,7 @@ function processAck(connection: Connection, space: Space, frame: wire.Frame) {
             let frames = wire.frames(sent.payload)
             for item in frames.frames {
                 if (item.type >= 8 && item.type <= 15) || item.type == 4 {
+                    deliveryChanged = true
                     let index = streamIndex(connection,item.stream)
                     if index >= 0 {
                         let output = connection.streams[index]
@@ -418,17 +434,53 @@ function processAck(connection: Connection, space: Space, frame: wire.Frame) {
             sent.status = 1; sent.payload = Bytes()
         } else { remaining.add(sent) }
     }
+    if (cachedAck || deliveryChanged) && space.lostStreamsAt < space.lostStreams.length {
+        let lost: List<LostStreams> = []
+        for at in space.lostStreamsAt..space.lostStreams.length {
+            let packet = space.lostStreams[at]; let acknowledged = false
+            for range in frame.ranges { if packet.number >= range.first && packet.number <= range.last { acknowledged = true } }
+            if acknowledged {
+                // Late ACKs break future persistent-loss intervals, without
+                // removing flight bytes or growing congestion twice.
+                if packet.measured && connection.lossFirst >= 0 && packet.time >= connection.lossFirst { connection.lossFirst = -1; connection.lossLast = -1 }
+                for known in connection.history { if known.level == packet.level && known.number == packet.number && known.status == 2 { known.status = 1 } }
+                connection.congestion.probes = 0
+                for item in packet.streams {
+                    let index = streamIndex(connection,item.id)
+                    if index >= 0 {
+                        let output = connection.streams[index]
+                        if item.reset { output.resetAcknowledged = true }
+                        else if !stream.acknowledgeSend(output,item.first,item.length,item.fin) { terminate(connection,1,"stream acknowledgement ranges exceed buffer bound"); return }
+                    }
+                }
+            }
+        }
+        // Apply every delivery first: a newer lost retry can cover older ones.
+        for at in space.lostStreamsAt..space.lostStreams.length {
+            let packet = space.lostStreams[at]; let acknowledged = false
+            for range in frame.ranges { if packet.number >= range.first && packet.number <= range.last { acknowledged = true } }
+            if !acknowledged {
+                let delivery = lostReferenceNeeded(connection,packet)
+                // Delivered data no longer owns references, but its original
+                // packet's late ACK can still break a persistent-loss interval.
+                if !delivery { packet.streams = [] }
+                if delivery || packet.number > space.historyPassed || (connection.lossFirst >= 0 && packet.time >= connection.lossFirst) { lost.add(packet) }
+            }
+        }
+        space.lostStreams = lost; space.lostStreamsAt = 0; space.lostReferences = 0
+        for packet in lost { space.lostReferences += packet.streams.length }
+    }
     space.sent = remaining; space.largestAck = max(space.largestAck, frame.value)
     if connection.flight == 0 && connection.pending.length == 0 && connection.emptySince < 0 { connection.emptySince = connection.now }
-    space.probe = -1
-    if remaining.length > 0 { space.probe = connection.now + recovery.pto(connection.congestion, connection.confirmed) }
+    if remaining.length == 0 { space.probe = -1 }
+    else if eliciting { space.probe = space.lastEliciting + recovery.pto(connection.congestion, connection.confirmed) }
 }
 function discard(connection: Connection, level: Integer) {
     let space = connection.spaces[level]
     if !space.active { return }
     space.active = false; space.ack = false
     for sent in space.sent { connection.flight = max(0, connection.flight - sent.bytes); sent.status = 3; sent.payload = Bytes() }
-    space.sent = []; space.ackTimes = []; space.read = protection.traffic(1, 0, Bytes()); space.write = space.read
+    space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; space.ackTimes = []; space.read = protection.traffic(1, 0, Bytes()); space.write = space.read
 }
 function streamIndex(connection: Connection, id: Integer): Integer {
     for index in 0..connection.streams.length { if connection.streams[index].id == id { return index } }
@@ -529,16 +581,61 @@ function resetSend(connection: Connection, output: stream.Stream, code: Integer)
     connection.pending = remaining
     let frame = Bytes(); add(frame,4); add(frame,output.id); add(frame,code); add(frame,output.sendOffset); enqueue(connection,2,frame,false)
 }
-function retryPayload(connection: Connection, payload: Bytes): Boolean {
-    let frames = wire.frames(payload)
-    for frame in frames.frames {
-        if frame.type >= 8 && frame.type <= 15 {
-            let index = streamIndex(connection,frame.stream)
-            if streamRetired(connection,frame.stream) { return false }
-            if index >= 0 && (connection.streams[index].sendReset || (frame.offset + frame.data.length <= connection.streams[index].sendAcknowledged && (!frame.fin || connection.streams[index].finalAcknowledged))) { return false }
+function rangeDelivered(output: stream.Stream, first: Integer, length: Integer, fin: Boolean): Boolean {
+    let delivered = first + length <= output.sendAcknowledged
+    for range in output.acknowledged { if first >= range.first && first + length <= range.last { delivered = true } }
+    return delivered && (!fin || output.finalAcknowledged)
+}
+function lostReferenceNeeded(connection: Connection, packet: LostStreams): Boolean {
+    for item in packet.streams {
+        let index = streamIndex(connection,item.id)
+        if index >= 0 {
+            let output = connection.streams[index]
+            if item.reset { if !output.resetAcknowledged { return true } }
+            else if !output.sendReset && !rangeDelivered(output,item.first,item.length,item.fin) { return true }
         }
     }
-    return true
+    return false
+}
+function pendingPayload(connection: Connection, payload: Bytes): Bytes {
+    let frames = wire.frames(payload); let result = Bytes()
+    for frame in frames.frames {
+        let keep = true
+        if frame.type >= 8 && frame.type <= 15 {
+            let index = streamIndex(connection,frame.stream)
+            if streamRetired(connection,frame.stream) { keep = false }
+            else if index >= 0 {
+                let output = connection.streams[index]
+                if output.sendReset || rangeDelivered(output,frame.offset,frame.data.length,frame.fin) { keep = false }
+            }
+        } else if frame.type == 4 {
+            let index = streamIndex(connection,frame.stream)
+            if streamRetired(connection,frame.stream) || (index >= 0 && connection.streams[index].resetAcknowledged) { keep = false }
+        }
+        if keep { result.addBytes(payload.slice(frame.start,frame.end)) }
+    }
+    return result
+}
+function retryPayload(connection: Connection, payload: Bytes): Boolean { return pendingPayload(connection,payload).length > 0 }
+function rememberLostStreams(space: Space, packet: Sent) {
+    let references: List<SentStream> = []
+    for frame in wire.frames(packet.payload).frames {
+        if (frame.type >= 8 && frame.type <= 15) || frame.type == 4 {
+            references.add(SentStream { id: frame.stream; first: frame.offset; length: frame.data.length; fin: frame.fin; reset: frame.type == 4 })
+        }
+    }
+    // Keep bounded delivery/timing metadata, never application bytes.
+    while space.lostStreams.length - space.lostStreamsAt >= 4096 || space.lostReferences + references.length > 4096 {
+        space.lostReferences -= space.lostStreams[space.lostStreamsAt].streams.length
+        space.lostStreams[space.lostStreamsAt].streams = []; space.lostStreamsAt += 1
+    }
+    if space.lostStreamsAt >= 1024 && space.lostStreamsAt * 2 >= space.lostStreams.length {
+        let retained: List<LostStreams> = []
+        for at in space.lostStreamsAt..space.lostStreams.length { retained.add(space.lostStreams[at]) }
+        space.lostStreams = retained; space.lostStreamsAt = 0
+    }
+    space.lostStreams.add(LostStreams { number: packet.number; level: packet.level; time: packet.time; measured: packet.measured; streams: references })
+    space.lostReferences += references.length
 }
 function persistentLoss(connection: Connection) {
     let remaining: List<Sent> = []; let unresolved = false
@@ -553,6 +650,11 @@ function persistentLoss(connection: Connection) {
                 connection.lossLast = sent.time
                 if connection.lossLast - connection.lossFirst > recovery.persistentDuration(connection.congestion) { recovery.persistentCongestion(connection.congestion) }
             }
+        }
+        if !unresolved {
+            let level = sent.level
+            if level == 3 { level = 2 }
+            connection.spaces[level].historyPassed = max(connection.spaces[level].historyPassed,sent.number)
         }
     }
     connection.history = remaining
@@ -611,7 +713,7 @@ function processFrame(connection: Connection, level: Integer, frame: wire.Frame,
                     connection.activePath = path.id; connection.congestion = recovery.create(1200)
                     for pending in connection.spaces {
                         pending.probe = -1
-                        if pending.sent.length > 0 { pending.probe = connection.now + recovery.pto(connection.congestion, true) }
+                        if pending.sent.length > 0 { pending.probe = pending.lastEliciting + recovery.pto(connection.congestion, true) }
                     }
                 }
             }
@@ -660,10 +762,10 @@ function retryClient(connection: Connection, packet: Bytes, header: wire.Header)
     let retained: List<Pending> = []
     for pending in connection.pending { if pending.level != 0 { retained.add(pending) } }
     for sent in connection.spaces[2].sent { if sent.level == 3 { retained.add(Pending { level: 3; payload: sent.payload; probe: false; path: sent.path }); sent.status = 3; sent.payload = Bytes() } }
-    connection.spaces[2].sent = []; connection.spaces[2].probe = -1; connection.pending = retained
+    connection.spaces[2].sent = []; connection.spaces[2].lostStreams = []; connection.spaces[2].lostStreamsAt = 0; connection.spaces[2].lostReferences = 0; connection.spaces[2].probe = -1; connection.pending = retained
     let space = connection.spaces[0]
     for sent in space.sent { sent.status = 3; sent.payload = Bytes() }
-    space.sent = []; space.probe = -1; space.read = protection.initial(connection.version,header.source,true); space.write = protection.initial(connection.version,header.source,false)
+    space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; space.probe = -1; space.read = protection.initial(connection.version,header.source,true); space.write = protection.initial(connection.version,header.source,false)
     space.sendCrypto = 0; space.writePackets = 0
     connection.remote = header.source; connection.initialDestination = header.source; connection.retrySource = header.source; connection.retryToken = header.token; connection.retryAccepted = true
     connection.congestion = recovery.create(1200); connection.flight = 0; connection.paceCredit = 12000.0; connection.paceAt = -1
@@ -680,7 +782,7 @@ function negotiateClient(connection: Connection, header: wire.Header) {
     // unauthenticated multi-version downgrade decision. Transport can retry TCP.
     connection.state = FAILED; connection.code = 0; connection.error = "QUIC version negotiation has no supported version; explicit TCP retry required"
     connection.pending = []; connection.history = []; connection.flight = 0
-    for space in connection.spaces { space.sent = []; space.ack = false }
+    for space in connection.spaces { space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.ack = false }
 }
 public function receivePath(connection: Connection, datagram: Bytes, pathId: Integer, now: Integer) {
     if connection.draining || ((connection.state == FAILED || connection.state == CLOSED) && !connection.closing) || now < 0 || now < connection.now || datagram.length > 65535 || pathId < 0 { return }
@@ -810,7 +912,7 @@ public function receivePath(connection: Connection, datagram: Bytes, pathId: Int
                 connection.activePath = path.id; connection.congestion = recovery.create(1200)
                 for pending in connection.spaces {
                     pending.probe = -1
-                    if pending.sent.length > 0 { pending.probe = now + recovery.pto(connection.congestion, connection.confirmed) }
+                    if pending.sent.length > 0 { pending.probe = pending.lastEliciting + recovery.pto(connection.congestion, connection.confirmed) }
                 }
             }
         }
@@ -875,10 +977,11 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
                 connection.flight = max(0, connection.flight - sent.bytes)
                 recovery.lost(connection.congestion, now, sent.time)
                 if retryPayload(connection,sent.payload) { enqueuePath(connection, sent.level, sent.payload, false, sent.path) }
-                sent.status = 2; sent.payload = Bytes()
+                rememberLostStreams(space,sent); sent.status = 2; sent.payload = Bytes()
             } else { remaining.add(sent) }
         }
         space.sent = remaining
+        if remaining.length == 0 { space.probe = -1 }
         if remaining.length > 0 && space.probe >= 0 && now >= space.probe {
             if retryPayload(connection,remaining[0].payload) { enqueuePath(connection, remaining[0].level, remaining[0].payload, true, remaining[0].path) }
             else { enqueuePath(connection,remaining[0].level,crypto.fromHex("01"),true,remaining[0].path) }
@@ -889,6 +992,9 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
     persistentLoss(connection)
     let unsent: List<Pending> = []
     for pending in connection.pending {
+        let filtered = pendingPayload(connection,pending.payload)
+        if filtered.length == 0 { continue }
+        pending.payload = filtered
         let level = pending.level; let index = level
         if level == 3 { index = 2; if connection.spaces[2].write.key.length > 0 { level = 2; pending.level = 2 } }
         let space = connection.spaces[index]; let keys = space.write
@@ -954,7 +1060,7 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
             let sent = Sent { number: space.next; time: now; bytes: size; payload: pending.payload; path: pending.path; level: level; status: 0; measured: connection.congestion.measured }
             space.sent.add(sent); connection.history.add(sent)
             connection.flight += size
-            if space.probe < 0 { space.probe = now + recovery.pto(connection.congestion, connection.confirmed) }
+            space.lastEliciting = now; space.probe = now + recovery.pto(connection.congestion, connection.confirmed)
         } else {
             // ACK-only packets are not in flight and do not arm PTO. Bound
             // timestamp retention; normal ACK progress releases this list.
