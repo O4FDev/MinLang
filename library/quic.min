@@ -19,7 +19,7 @@ public constant CLOSED = 2
 public constant FAILED = 3
 record Sent { number: Integer; time: Integer; bytes: Integer; payload: Bytes; path: Integer; recoveryGeneration: Integer; level: Integer; status: Integer; measured: Boolean }
 record Pending { level: Integer; payload: Bytes; probe: Boolean; path: Integer; acknowledgement: Boolean }
-record PolledPayload { payload: Bytes; parsed: wire.Frames; eliciting: Boolean; challenge: Boolean }
+record PolledPayload { payload: Bytes; largestAck: Integer; eliciting: Boolean; challenge: Boolean }
 public record Datagram { data: Bytes; pathId: Integer }
 public record Path {
     id: Integer; validated: Boolean; eligible: Boolean; challenge: Bytes
@@ -974,6 +974,38 @@ function pendingPayload(connection: Connection, payload: Bytes): Bytes {
 // Poll-local metadata is rebuilt each turn because public pending payloads
 // can be changed between polls. Retry filtering still returns copied bytes.
 function polledPayload(connection: Connection, payload: Bytes, filter: Boolean): PolledPayload {
+    // A complete single STREAM has no ACK or path metadata. Decode its
+    // header without copying application data into a temporary Frame.
+    // Every unqualified payload still uses the ordinary parser below.
+    if filter && payload.length > 0 && payload.length <= 65535 && payload[0] >= 8 && payload[0] <= 15 {
+        let type = payload[0]; let id = wire.varint(payload,1)
+        if id.valid {
+            let at = id.end; let offset = 0; let valid = true
+            if (type & 4) != 0 {
+                let decoded = wire.varint(payload,at)
+                valid = decoded.valid; offset = decoded.value; at = decoded.end
+            }
+            let length = payload.length - at
+            if valid && (type & 2) != 0 {
+                let decoded = wire.varint(payload,at)
+                valid = decoded.valid; length = decoded.value; at = decoded.end
+            }
+            if valid && length == payload.length - at && length <= wire.MAX_VARINT - offset {
+                let keep = true; let index = streamIndex(connection,id.value)
+                if streamRetired(connection,id.value) { keep = false }
+                else if index >= 0 {
+                    let output = connection.streams[index]
+                    if output.sendReset || rangeDelivered(output,offset,length,(type & 1) != 0) { keep = false }
+                }
+                let result = payload; if !keep { result = Bytes() }
+                return PolledPayload {
+                    payload: result
+                    largestAck: -1
+                    eliciting: keep; challenge: false
+                }
+            }
+        }
+    }
     let parsed = wire.frames(payload); let result = payload; let changed = false
     if filter && !parsed.valid { result = Bytes() }
     for frame in parsed.frames {
@@ -1001,12 +1033,13 @@ function polledPayload(connection: Connection, payload: Bytes, filter: Boolean):
         else if keep && changed { result.addBytes(payload.slice(frame.start,frame.end)) }
     }
     if changed { parsed = wire.frames(result) }
-    let eliciting = false; let challenge = false
+    let eliciting = false; let challenge = false; let largestAck = -1
     for frame in parsed.frames {
         if frame.type != 0 && frame.type != 2 && frame.type != 3 && frame.type != 28 && frame.type != 29 { eliciting = true }
         if frame.type == 26 { challenge = true }
+        if frame.type == 2 || frame.type == 3 { largestAck = max(largestAck,frame.value) }
     }
-    return PolledPayload { payload: result; parsed: parsed; eliciting: eliciting; challenge: challenge }
+    return PolledPayload { payload: result; largestAck: largestAck; eliciting: eliciting; challenge: challenge }
 }
 function retryPayload(connection: Connection, payload: Bytes): Boolean { return pendingPayload(connection,payload).length > 0 }
 function retryPacket(connection: Connection, sent: Sent, probe: Boolean): Boolean {
@@ -1581,7 +1614,7 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
         }
         let size = headerLength + payloadLength + 16
         let ackEliciting = inspected.eliciting
-        let parsed = inspected.parsed
+        let largestAck = inspected.largestAck
         if ackEliciting && connection.history.length >= 8192 { unsent.add(pending); continue }
         if (!connection.addressValidated && size > 3 * connection.receivedBytes - connection.sentBytes) ||
            (!connection.clientRole && !path.validated && size > 3 * path.received - path.sent) {
@@ -1644,7 +1677,7 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
         }
         if includedAck { clearAck(space) }
         space.next += 1; if level == 3 { connection.earlyPackets += 1 } else { space.writePackets += 1 }
-        for frame in parsed.frames { if level == 2 && (frame.type == 2 || frame.type == 3) && frame.value >= space.readFirst { space.readAcknowledged = true } }
+        if level == 2 && largestAck >= 0 && largestAck >= space.readFirst { space.readAcknowledged = true }
         if connection.clientRole && level == 1 { discard(connection, 0) }
     }
     connection.pending = unsent

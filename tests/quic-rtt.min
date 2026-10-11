@@ -3,6 +3,7 @@ use "errors" as errors
 use "quiccrypto" as protection
 use "quicwire" as wire
 use "quicrecovery" as recovery
+use "quicstream" as stream
 function number(data: Bytes,value: Integer) { data.addBytes(errors.bytesValue(wire.encode(value))) }
 function inject(sender: quic.Connection,receiver: quic.Connection,frame: Bytes,now: Integer) {
     let space=sender.spaces[2];let header=Bytes();header.add(0x43);header.addBytes(sender.remote)
@@ -421,16 +422,327 @@ function exactSendBudget(c: quic.Connection,now: Integer): Integer {
     if pending.payload.length!=43 || c.spaces[2].sent.length!=1 || c.spaces[2].sent[0].payload.length!=43 || c.spaces[2].readAcknowledged!=readAcknowledged { return 120 }
     return 0
 }
+// Deliberately permit nonminimal STREAM field integers; only the frame
+// type has a minimal-encoding requirement in the maintained wire parser.
+function streamInteger(data: Bytes,value: Integer,width: Integer) {
+    let encoded=Bytes(width)
+    for at in 0..width { encoded[width-1-at]=(value>>(at*8))&255 }
+    let prefix=0;if width==2 { prefix=64 } else if width==4 { prefix=128 } else if width==8 { prefix=192 }
+    encoded[0]=encoded[0]|prefix;data.addBytes(encoded)
+}
+function streamFrame(type: Integer,id: Integer,offset: Integer,length: Integer): Bytes {
+    let data=Bytes();data.add(type);number(data,id)
+    if (type&4)!=0 { number(data,offset) }
+    if (type&2)!=0 { number(data,length) }
+    data.addBytes(Bytes(length));return data
+}
+// The ordinary public parser supplies the reference frame extents. The
+// caller supplies delivery state independently; no private helper is called.
+function streamPayloadOracle(c: quic.Connection,data: Bytes,keep: Boolean,now: Integer,transmit: Boolean): Integer {
+    let parsed=wire.frames(data);let expected=Bytes();let eliciting=false
+    for frame in parsed.frames {
+        let retain=frame.type!=2 && frame.type!=3
+        if frame.type>=8 && frame.type<=15 { retain=keep }
+        if frame.type==25 {
+            retain=false;for value in c.remoteRetireOutstanding { if value==frame.value { retain=true } }
+        }
+        if frame.type==26 {
+            retain=false
+            for path in c.paths {
+                if path.challenge.length==8 && frame.data.length==8 {
+                    let same=true;for at in 0..8 { if path.challenge[at]!=frame.data[at] { same=false } }
+                    if same { retain=true }
+                }
+            }
+        }
+        if retain {
+            expected.addBytes(data.slice(frame.start,frame.end))
+            if frame.type!=0 && frame.type!=28 && frame.type!=29 { eliciting=true }
+        }
+    }
+    let snapshot=data.slice(0,data.length);let space=c.spaces[2]
+    c.pending=[];c.history=[];space.sent=[];space.probe=-1;c.flight=0
+    space.ack=false;space.ackQueued=false;space.ackCount=0;space.ackDeadline=-1;space.ackPath=-1;space.readAcknowledged=false
+    if !errors.booleanOk(quic.ping(c)) || c.pending.length!=1 { return 121 }
+    let pending=c.pending[0];pending.payload=data
+    c.paceCredit=0.0;c.paceAt=now
+    let packets=quic.poll(c,now)
+    if space.readAcknowledged { return 122 }
+    if data.length!=snapshot.length { return 123 }
+    for at in 0..data.length { if data[at]!=snapshot[at] { return 123 } }
+    if expected.length==0 {
+        if packets.length!=0 || c.pending.length!=0 { return 124 }
+        return 0
+    }
+    if eliciting {
+        if packets.length!=0 || c.pending.length!=1 || c.pending[0].payload.length!=expected.length { return 125 }
+        for at in 0..expected.length { if c.pending[0].payload[at]!=expected[at] { return 126 } }
+        if transmit && expected.length<=1100 {
+            c.paceCredit=2400.0;c.paceAt=now;packets=quic.poll(c,now)
+            if packets.length!=1 || c.pending.length!=0 || space.sent.length!=1 || space.readAcknowledged { return 127 }
+        }
+    } else if packets.length!=1 || c.pending.length!=0 || space.sent.length!=0 { return 127 }
+    if packets.length>0 {
+        let header=wire.header(packets[0],0,c.remote.length)
+        if !header.valid { return 128 }
+        let opened=protection.unprotect(space.write,packets[0],header.numberOffset,space.next-2)
+        if !opened.valid || opened.payload.length<expected.length { return 129 }
+        for at in 0..expected.length { if opened.payload[at]!=expected[at] { return 130 } }
+        if eliciting {
+            if space.sent[0].payload.length!=expected.length { return 129 }
+            for at in 0..expected.length { if space.sent[0].payload[at]!=expected[at] { return 130 } }
+        }
+        for at in expected.length..opened.payload.length { if opened.payload[at]!=0 { return 130 } }
+    }
+    c.pending=[];c.history=[];space.sent=[];space.probe=-1;c.flight=0
+    return 0
+}
+function singleStreamCorpus(c: quic.Connection,s: quic.Connection,now: Integer): Integer {
+    let opened=quic.openStream(c,false);if !errors.integerOk(opened) { return 131 }
+    let id=errors.integerValue(opened);let output=c.streams[0]
+    let lengths: List<Integer> = [0,1,1000]
+    let widths: List<Integer> = [1,2,4,8]
+    let cases=0
+    for type in 8..16 {
+        for length in lengths {
+            let offset=0;if (type&4)!=0 { offset=1 }
+            let keep=length>0 || offset>0 || (type&1)!=0
+            let result=streamPayloadOracle(c,streamFrame(type,id,offset,length),keep,now,true)
+            cases+=1;if result!=0 { print("STREAM flag case "+Text(type)+" "+Text(length));return result }
+        }
+    }
+    // Vary each integer width independently, not as a Cartesian product.
+    for field in 0..3 {
+        for width in widths {
+            let idWidth=1;let offsetWidth=1;let lengthWidth=1
+            if field==0 { idWidth=width } else if field==1 { offsetWidth=width } else { lengthWidth=width }
+            let data=Bytes();data.add(15)
+            streamInteger(data,id,idWidth);streamInteger(data,1,offsetWidth);streamInteger(data,1,lengthWidth);data.add(0)
+            let result=streamPayloadOracle(c,data,true,now,true)
+            cases+=1;if result!=0 { print("STREAM field width "+Text(field)+" "+Text(width));return result }
+        }
+    }
+    let values: List<Integer> = [63,64,16383,16384,0x3fffffff,0x40000000,wire.MAX_VARINT-1,wire.MAX_VARINT]
+    for value in values {
+        let data=Bytes();data.add(15);number(data,value);number(data,1);number(data,1);data.add(0)
+        let result=streamPayloadOracle(c,data,true,now,true)
+        cases+=1;if result!=0 { print("STREAM ID boundary "+Text(value));return result }
+        data=Bytes();data.add(15);number(data,id);number(data,value);number(data,1);data.add(0)
+        result=streamPayloadOracle(c,data,true,now,true)
+        cases+=1;if result!=0 { print("STREAM offset boundary "+Text(value));return result }
+        data=Bytes();data.add(15);number(data,id);number(data,1);number(data,value);data.add(0)
+        result=streamPayloadOracle(c,data,true,now,true)
+        cases+=1;if result!=0 { print("STREAM length boundary "+Text(value));return result }
+    }
+    let emptyUnknown=Bytes();emptyUnknown.add(8);number(emptyUnknown,63)
+    let emptyResult=streamPayloadOracle(c,emptyUnknown,true,now,true)
+    cases+=1;if emptyResult!=0 { return emptyResult }
+    let maximumOffset=Bytes();maximumOffset.add(15);number(maximumOffset,id);number(maximumOffset,wire.MAX_VARINT);number(maximumOffset,0)
+    emptyResult=streamPayloadOracle(c,maximumOffset,true,now,true)
+    cases+=1;if emptyResult!=0 { return emptyResult }
+    let complete=Bytes();complete.add(15);number(complete,wire.MAX_VARINT);number(complete,wire.MAX_VARINT-1);number(complete,1);complete.add(0)
+    for end in 0..complete.length {
+        let result=streamPayloadOracle(c,complete.slice(0,end),true,now,false)
+        cases+=1;if result!=0 { print("STREAM truncated prefix "+Text(end));return result }
+    }
+    for width in widths {
+        if width==1 { continue }
+        let data=Bytes();streamInteger(data,15,width);number(data,id);number(data,1);number(data,1);data.add(0)
+        let result=streamPayloadOracle(c,data,true,now,false)
+        cases+=1;if result!=0 { print("STREAM nonminimal type "+Text(width));return result }
+    }
+    let sizes: List<Integer> = [65535,65536]
+    for size in sizes {
+        let data=Bytes();data.add(8);number(data,1);data.addBytes(Bytes(size-2))
+        let result=streamPayloadOracle(c,data,true,now,false)
+        cases+=1;if result!=0 { print("STREAM parser size bound "+Text(size));return result }
+    }
+    let base=streamFrame(14,id,1,1)
+    for trailing in 0..5 {
+        let data=base.slice(0,base.length)
+        if trailing==0 { data.add(1) }
+        else if trailing==1 { data.add(2);number(data,0);number(data,0);number(data,0);number(data,0) }
+        else if trailing==2 {
+            c.paths[0].challenge=Bytes(8);c.paths[0].deadline=-1
+            data.add(26);data.addBytes(c.paths[0].challenge)
+        } else if trailing==3 { data.addBytes(streamFrame(14,id,2,1)) }
+        else { data.add(31) }
+        let result=streamPayloadOracle(c,data,true,now,true)
+        c.paths[0].challenge=Bytes();cases+=1
+        if result!=0 { print("STREAM mixed suffix "+Text(trailing));return result }
+    }
+    // Without LEN, bytes resembling frame types are application data.
+    for type in 8..14 {
+        if (type&2)!=0 { continue }
+        let data=Bytes();data.add(type);number(data,id);if (type&4)!=0 { number(data,1) }
+        data.add(1);data.add(2);data.add(26);data.addBytes(Bytes(8))
+        let result=streamPayloadOracle(c,data,true,now,true)
+        cases+=1;if result!=0 { print("STREAM implicit tail "+Text(type));return result }
+    }
+    let short=streamFrame(14,id,1,1);short[3]=2
+    let result=streamPayloadOracle(c,short,true,now,false)
+    cases+=1;if result!=0 { return result }
+    // Public acknowledgement logic establishes contiguous delivery, a
+    // separate acknowledged range, and an unacknowledged hole.
+    if !stream.acknowledgeSend(output,0,3,false) { return 132 }
+    result=streamPayloadOracle(c,streamFrame(14,id,0,3),false,now,true);cases+=1;if result!=0 { return result }
+    result=streamPayloadOracle(c,streamFrame(15,id,0,3),true,now,true);cases+=1;if result!=0 { return result }
+    result=streamPayloadOracle(c,streamFrame(15,id,3,0),true,now,true);cases+=1;if result!=0 { return result }
+    if !stream.acknowledgeSend(output,5,3,false) { return 132 }
+    result=streamPayloadOracle(c,streamFrame(14,id,5,3),false,now,true);cases+=1;if result!=0 { return result }
+    result=streamPayloadOracle(c,streamFrame(14,id,2,4),true,now,true);cases+=1;if result!=0 { return result }
+    if !stream.acknowledgeSend(output,0,3,true) { return 132 }
+    result=streamPayloadOracle(c,streamFrame(15,id,0,3),false,now,true);cases+=1;if result!=0 { return result }
+    result=streamPayloadOracle(c,streamFrame(15,id,3,0),false,now,true);cases+=1;if result!=0 { return result }
+    if !errors.booleanOk(quic.cancelStream(c,id,73)) { return 133 }
+    result=streamPayloadOracle(c,streamFrame(14,id,8,1),false,now,true);cases+=1;if result!=0 { return result }
+    // Retire a genuine public send-only stream, then prune a stale queued
+    // payload for its old ID without constructing private retirement ranges.
+    c.pending=[];let retired=errors.integerValue(quic.openStream(c,true))
+    if !errors.integerOk(quic.writeStream(c,retired,Bytes("r"),true)) { return 134 }
+    let observed=false
+    for turn in 0..100 {
+        drive(c,s,now+turn+1)
+        let read=quic.readStream(s,retired)
+        if errors.bytesStatus(read)==errors.successStatus() { observed=true }
+    }
+    let live=false;for value in c.streams { if value.id==retired { live=true } }
+    if !observed || live { return 134 }
+    result=streamPayloadOracle(c,streamFrame(15,retired,0,1),false,now+101,true);cases+=1;if result!=0 { return result }
+    // A retained STREAM can acquire an ACK only after the poll-local fast
+    // classification; the mixed payload must still update ACK state on send.
+    let active=errors.integerValue(quic.openStream(c,false))
+    c.spaces[2].readAcknowledged=true
+    let ping=Bytes();ping.add(1);inject(s,c,ping,now+102)
+    if !c.spaces[2].ack || c.spaces[2].ackCount!=1 || c.spaces[2].ackDeadline<=now+102 { return 135 }
+    c.spaces[2].readAcknowledged=false
+    if !errors.integerOk(quic.writeStream(c,active,Bytes("a"),false)) { return 135 }
+    c.paceCredit=0.0;c.paceAt=now+102
+    if quic.poll(c,now+102).length!=0 || c.spaces[2].readAcknowledged { return 135 }
+    c.paceCredit=2400.0;c.paceAt=now+102
+    let packets=quic.poll(c,now+102)
+    if packets.length!=1 || !c.spaces[2].readAcknowledged { return 136 }
+    let header=wire.header(packets[0],0,c.remote.length)
+    let plain=protection.unprotect(c.spaces[2].write,packets[0],header.numberOffset,c.spaces[2].next-2)
+    if !header.valid || !plain.valid { return 136 }
+    let ackCount=0;let streamCount=0
+    for frame in wire.frames(plain.payload).frames {
+        if frame.type==2 || frame.type==3 { ackCount+=1 }
+        if frame.type>=8 && frame.type<=15 && frame.stream==active { streamCount+=1 }
+    }
+    if ackCount!=1 || streamCount!=1 { return 136 }
+    print("QUIC STREAM corpus: "+Text(cases)+" parser, pruning, ownership and authenticated-wire cases")
+    return 0
+}
+// Fixed budget and seed: mutate headers, then ask the unchanged public
+// wire parser for frame extents instead of duplicating the fast decoder.
+function seededStreamCorpus(c: quic.Connection,now: Integer): Integer {
+    if c.streams.length!=0 || c.closedStreams.length!=0 { return 137 }
+    c.spaces[2].readFirst=-1
+    let seed=0x5eedc0de;let budget=256
+    let single=0;let mixed=0;let malformed=0;let empty=0;let other=0
+    for iteration in 0..budget {
+        seed=(seed*1664525+1013904223)&0xffffffff
+        let type=8+(seed&7);let id=(seed>>8)&63;let offset=(seed>>14)&63;let length=(seed>>20)&31
+        let data=Bytes();data.add(type)
+        seed=(seed*1664525+1013904223)&0xffffffff
+        streamInteger(data,id,1<<((seed>>30)&3))
+        let offsetAt=-1;let lengthAt=-1
+        if (type&4)!=0 {
+            offsetAt=data.length;seed=(seed*1664525+1013904223)&0xffffffff
+            streamInteger(data,offset,1<<((seed>>30)&3))
+        }
+        if (type&2)!=0 {
+            lengthAt=data.length;seed=(seed*1664525+1013904223)&0xffffffff
+            streamInteger(data,length,1<<((seed>>30)&3))
+        }
+        data.addBytes(Bytes(length));seed=(seed*1664525+1013904223)&0xffffffff
+        let mutation=iteration%8
+        if mutation==1 { data[0]=8+((type^seed)&7) }
+        else if mutation==2 { data=data.slice(0,seed%(data.length+1)) }
+        else if mutation==3 {
+            let at=1;if offsetAt>=0 && (seed&1)!=0 { at=offsetAt }
+            data[at]=data[at]^(1<<(6+((seed>>1)&1)))
+        } else if mutation==4 {
+            if lengthAt>=0 { data[lengthAt]=(data[lengthAt]&192)|(seed&63) }
+            else { data.add(2);number(data,0);number(data,0);number(data,0);number(data,0) }
+        } else if mutation==5 {
+            data.add(1);data.add(2);number(data,0);number(data,0);number(data,0);number(data,0)
+        } else if mutation==6 {
+            let extended=Bytes();streamInteger(extended,type,2);extended.addBytes(data.slice(1,data.length));data=extended
+        } else if mutation==7 {
+            let prefixed=Bytes();prefixed.add(2);number(prefixed,0);number(prefixed,0);number(prefixed,0);number(prefixed,0)
+            prefixed.addBytes(data);data=prefixed
+        }
+        let parsed=wire.frames(data)
+        if !parsed.valid { malformed+=1 }
+        else if parsed.frames.length==0 { empty+=1 }
+        else if parsed.frames.length==1 && parsed.frames[0].type>=8 && parsed.frames[0].type<=15 { single+=1 }
+        else if parsed.frames.length>1 { mixed+=1 }
+        else { other+=1 }
+        let result=streamPayloadOracle(c,data,true,now,true)
+        if result!=0 { print("seeded STREAM case "+Text(iteration)+" mutation "+Text(mutation));return result }
+        if c.streams.length!=0 || c.closedStreams.length!=0 { return 137 }
+    }
+    if single==0 || mixed==0 || malformed==0 || single+mixed+malformed+empty+other!=budget { return 138 }
+    print("QUIC STREAM seeded corpus: seed 0x5eedc0de, budget "+Text(budget)+", single "+Text(single)+", mixed "+Text(mixed)+", malformed "+Text(malformed)+", empty "+Text(empty)+", other "+Text(other)+", skipped 0")
+    return 0
+}
+// The outgoing factory emits ACK2. Stale ACK2/ACK3 candidates are pruned,
+// then the authenticated piggyback ACK must govern read-key bookkeeping.
+function ackMetadataCorpus(c: quic.Connection,s: quic.Connection,now: Integer): Integer {
+    let cases=0;let space=c.spaces[2]
+    for candidateType in 2..4 {
+        for boundary in 0..3 {
+            let at=now+cases
+            c.pending=[];c.history=[];space.sent=[];space.probe=-1;c.flight=0
+            space.ack=false;space.ackQueued=false;space.ackCount=0;space.ackDeadline=-1;space.ackPath=-1
+            space.readAcknowledged=true
+            let ping=Bytes();ping.add(1);inject(s,c,ping,at)
+            if !space.ack || space.ackCount!=1 || space.ackDeadline<=at { return 139 }
+            let largest=space.largest
+            space.readFirst=largest
+            if boundary==0 { space.readFirst=largest+1 }
+            else if boundary==2 { space.readFirst=largest-1 }
+            space.readAcknowledged=false
+            let data=streamFrame(14,63,0,1)
+            data.add(candidateType);number(data,space.readFirst+1);number(data,0);number(data,0);number(data,0)
+            if candidateType==3 { number(data,0);number(data,0);number(data,0) }
+            if !errors.booleanOk(quic.ping(c)) || c.pending.length!=1 { return 139 }
+            c.pending[0].payload=data;c.paceCredit=0.0;c.paceAt=at
+            if quic.poll(c,at).length!=0 || space.readAcknowledged || c.pending.length!=1 { return 140 }
+            c.paceCredit=2400.0;c.paceAt=at
+            let packets=quic.poll(c,at)
+            if packets.length!=1 || space.readAcknowledged!=(boundary!=0) { return 141 }
+            let header=wire.header(packets[0],0,c.remote.length)
+            if !header.valid { return 142 }
+            let plain=protection.unprotect(space.write,packets[0],header.numberOffset,space.next-2)
+            if !plain.valid { return 142 }
+            let acks=0;let streams=0
+            for frame in wire.frames(plain.payload).frames {
+                if frame.type==2 || frame.type==3 {
+                    if frame.type!=2 || frame.value!=largest { return 142 };acks+=1
+                }
+                if frame.type>=8 && frame.type<=15 { streams+=1 }
+            }
+            if acks!=1 || streams!=1 { return 142 }
+            cases+=1
+        }
+    }
+    print("QUIC ACK metadata corpus: "+Text(cases)+" ACK2/ACK3 pruning, below/equal/above readFirst and blocked/actual-send cases; outgoing factory ACK2")
+    return 0
+}
+
 function main(): Integer {
     let root=readBytesFile(argument(0));let cert=readBytesFile(argument(1));let key=readBytesFile(argument(2));let client=readBytesFile(argument(3));let clientKey=readBytesFile(argument(4))
     let geometry=longHeaderGeometry(root,client,clientKey);if geometry!=0 { return geometry }
-    for scenario in 0..15 {
+    for scenario in 0..18 {
         let candidate=quic.client("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey)
         let peer=quic.server(randomBytes(80),"minyar-test",candidate.originalDestination,[cert],key,[root],true)
         for count in 0..200 { drive(candidate,peer,count*10) }
         if !candidate.confirmed || !peer.confirmed { return 68 }
         let result=0
-        if scenario==14 { result=exactSendBudget(candidate,2000) } else if scenario==0 { result=lateACK(candidate,peer,2000) } else if scenario==1 { result=queuedMixed(candidate,peer,2000) } else if scenario==2 { result=recoveredDelivery(candidate,peer,2000) } else if scenario==3 { result=boundedLateDelivery(candidate,peer,2000,1) } else if scenario==4 { result=freshProbe(candidate,peer,2000) } else if scenario==7 { result=boundedLateDelivery(candidate,peer,2000,3) } else if scenario==8 { result=lateReset(candidate,peer,2000) } else if scenario==11 { result=duplicateProbe(candidate,peer,2000) } else if scenario==12 { result=sendProgressProbe(candidate,peer,2000) } else if scenario==13 { result=partialLostReferences(candidate,peer,2000) } else { result=delayedPersistent(candidate,peer,2000,scenario==6 || scenario==9,scenario==9 || scenario==10) }
+        if scenario==17 { result=ackMetadataCorpus(candidate,peer,2000) } else if scenario==16 { result=seededStreamCorpus(candidate,2000) } else if scenario==15 { result=singleStreamCorpus(candidate,peer,2000) } else if scenario==14 { result=exactSendBudget(candidate,2000) } else if scenario==0 { result=lateACK(candidate,peer,2000) } else if scenario==1 { result=queuedMixed(candidate,peer,2000) } else if scenario==2 { result=recoveredDelivery(candidate,peer,2000) } else if scenario==3 { result=boundedLateDelivery(candidate,peer,2000,1) } else if scenario==4 { result=freshProbe(candidate,peer,2000) } else if scenario==7 { result=boundedLateDelivery(candidate,peer,2000,3) } else if scenario==8 { result=lateReset(candidate,peer,2000) } else if scenario==11 { result=duplicateProbe(candidate,peer,2000) } else if scenario==12 { result=sendProgressProbe(candidate,peer,2000) } else if scenario==13 { result=partialLostReferences(candidate,peer,2000) } else { result=delayedPersistent(candidate,peer,2000,scenario==6 || scenario==9,scenario==9 || scenario==10) }
         if result!=0 { return result }
     }
     let capped=retainedHistoryCap(root,cert,key,client,clientKey);if capped!=0 { return capped }
