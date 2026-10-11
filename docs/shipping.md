@@ -351,3 +351,10 @@ Native cleanup runs under ASan/UBSan on supported POSIX hosts. Actual Windows an
 macOS provider results must be recorded separately from Linux; an unavailable
 provider is not a passing mock. Production signing/notarization and R2 deployment
 require the respective host credentials and operator provisioning.
+
+The Linux public process-failure fixture deliberately sets RLIMIT_NPROC to zero
+in an owned driver subprocess. LeakSanitizer also needs a tracing process, so
+that restricted subprocess alone uses `detect_leaks=0` while ASan/UBSan remain
+enabled and all Result/journal/caller-survival assertions remain unchanged. The
+native fork-failure fixture restores the limit before exit, checks exact
+descriptor cleanup and runs with LeakSanitizer enabled.
