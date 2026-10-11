@@ -1,0 +1,203 @@
+use "quic" as quic
+use "quiccrypto" as protection
+use "quicwire" as wire
+use "quicrecovery" as recovery
+use "quicretry" as retry
+use "tlstickets" as tickets
+use "errors" as errors
+record Pair { client: quic.Connection; server: quic.Connection; acknowledgement: Bytes; valid: Boolean }
+function drive(c: quic.Connection, s: quic.Connection, now: Integer) {
+    for packet in quic.poll(c, now) { quic.receive(s, packet, now) }
+    for packet in quic.poll(s, now) { quic.receive(c, packet, now) }
+}
+// Use genuine peer-generated Initial ACKs. Deliver ServerHello only when
+// requested, and withhold every Handshake CRYPTO packet from the client.
+function bootstrap(root: Bytes, identity: Bytes, key: Bytes, certificate: Bytes, clientKey: Bytes, keys: Boolean): Pair {
+    let c = quic.client("localhost", randomBytes(80), "minyar-test", [root], [certificate], clientKey)
+    let s = quic.server(randomBytes(80), "minyar-test", c.originalDestination, [identity], key, [root], true)
+    for packet in quic.poll(c, 0) { quic.receive(s, packet, 0) }
+    let acknowledgement = Bytes(); let valid = true
+    for packet in quic.poll(s, 100) {
+        let header = wire.header(packet, 0, c.local.length)
+        if header.kind == wire.INITIAL {
+            let opened = protection.unprotect(c.spaces[0].read, packet.slice(0, header.end), header.numberOffset, c.spaces[0].largest)
+            if !opened.valid { valid = false }
+            else {
+                let crypto = false; let ack = false
+                for frame in wire.frames(opened.payload).frames {
+                    if frame.type == 6 { crypto = true }
+                    if frame.type == 2 || frame.type == 3 { ack = true }
+                }
+                if ack && !crypto { acknowledgement = packet; quic.receive(c, packet, 100) }
+                else if keys && crypto { quic.receive(c, packet, 100) }
+            }
+        }
+    }
+    return Pair { client: c; server: s; acknowledgement: acknowledgement; valid: valid }
+}
+function noFlight(root: Bytes, identity: Bytes, key: Bytes, certificate: Bytes, clientKey: Bytes, keys: Boolean, acknowledge: Boolean): Integer {
+    let pair = bootstrap(root, identity, key, certificate, clientKey, keys)
+    let c = pair.client; let s = pair.server
+    if !pair.valid || pair.acknowledgement.length == 0 || c.flight != 0 || c.spaces[0].sent.length != 0 || c.spaces[1].sent.length != 0 || c.state != quic.STARTING { return 40 }
+    if (c.spaces[1].write.key.length > 0) != keys { return 40 }
+    for packet in quic.poll(c, 100) { quic.receive(s, packet, 100) }
+    let deadline = quic.nextTimer(c)
+    if deadline <= 100 || deadline > 100 + recovery.pto(c.congestion, false) { print("no-flight client has no handshake alarm"); return 41 }
+    // Both idle polling and duplicate authenticated Initial ACKs must leave
+    // this absolute alarm fixed, even though the connection clock advances.
+    for tick in 101..110 {
+        if quic.nextTimer(c) != deadline { return 42 }
+        quic.receive(c, pair.acknowledgement, tick)
+        for packet in quic.poll(c, tick) { quic.receive(s, packet, tick) }
+        if quic.nextTimer(c) != deadline { print("duplicate ACK or idle poll postponed handshake alarm"); return 42 }
+    }
+    let found = 0
+    for packet in quic.poll(c, deadline) {
+        let header = wire.header(packet, 0, s.local.length)
+        let expected = wire.INITIAL; if keys { expected = wire.HANDSHAKE }
+        if header.kind != expected { return 43 }
+        if !keys && packet.length < 1200 { return 43 }
+        let space = s.spaces[0]; if keys { space = s.spaces[1] }
+        let opened = protection.unprotect(space.read, packet.slice(0, header.end), header.numberOffset, space.largest)
+        if !opened.valid { return 43 }
+        let eliciting = false
+        for frame in wire.frames(opened.payload).frames {
+            if frame.type != 0 && frame.type != 2 && frame.type != 3 && frame.type != 28 && frame.type != 29 { eliciting = true }
+        }
+        if eliciting { found += 1 }
+        quic.receive(s, packet, deadline)
+    }
+    if found == 0 { print("no-flight handshake alarm did not send a probe"); return 43 }
+    if !keys { return 0 }
+    if c.spaces[0].active { print("Handshake probe retained Initial space"); return 44 }
+    if !acknowledge {
+        let next = quic.nextTimer(c)
+        if next <= deadline { return 44 }
+        quic.receive(c, pair.acknowledgement, deadline + 1)
+        if quic.nextTimer(c) != next { return 44 }
+        let probes = 0
+        for packet in quic.poll(c, next) {
+            let header = wire.header(packet, 0, s.local.length)
+            if header.kind != wire.HANDSHAKE { return 44 }
+            probes += 1
+        }
+        if probes == 0 { return 44 }
+        return 0
+    }
+    let received = 0; let duplicate = Bytes()
+    for packet in quic.poll(s, deadline + 1) {
+        let header = wire.header(packet, 0, c.local.length)
+        if header.kind == wire.HANDSHAKE {
+            let opened = protection.unprotect(c.spaces[1].read, packet.slice(0, header.end), header.numberOffset, c.spaces[1].largest)
+            if !opened.valid { return 45 }
+            let crypto = false; let ack = false
+            for frame in wire.frames(opened.payload).frames {
+                if frame.type == 6 { crypto = true }
+                if frame.type == 2 || frame.type == 3 { ack = true }
+            }
+            if ack && !crypto { quic.receive(c, packet, deadline + 1); duplicate = packet; received += 1 }
+        }
+    }
+    if received == 0 || c.spaces[1].sent.length != 0 || c.flight != 0 || c.confirmed || c.spaces[1].largestAck < 0 { return 45 }
+    if quic.nextTimer(c) != c.lastActivity + c.idleTimeout { print("valid Handshake ACK left a no-flight alarm"); return 46 }
+    quic.receive(c, duplicate, deadline + 2); quic.poll(c, deadline + 2)
+    if quic.nextTimer(c) != c.lastActivity + c.idleTimeout { return 46 }
+    return 0
+}
+function application(root: Bytes, identity: Bytes, key: Bytes, certificate: Bytes, clientKey: Bytes): Integer {
+    let store = tickets.store(randomBytes(16), 3600); tickets.allowEarlyData(store, 0xffffffff)
+    let initial = quic.client("localhost", randomBytes(80), "minyar-test", [root], [certificate], clientKey)
+    let issuer = quic.serverWithTickets(randomBytes(80), "minyar-test", initial.originalDestination, [identity], key, [root], true, store)
+    for tick in 0..100 { drive(initial, issuer, tick * 10) }
+    let ticket = quic.takeTicket(initial); if !ticket.valid { return 50 }
+    let c = quic.clientEarly("localhost", randomBytes(80), "minyar-test", [root], [certificate], clientKey, ticket)
+    let s = quic.serverWithTickets(randomBytes(80), "minyar-test", c.originalDestination, [identity], key, [root], true, store)
+    for request in 0..16 {
+        let id = errors.integerValue(quic.openEarlyStream(c, false))
+        quic.writeEarlyStream(c, id, Bytes(257), true)
+    }
+    for packet in quic.poll(c, 0) {
+        let header = wire.header(packet, 0, s.local.length)
+        if header.kind == wire.INITIAL { quic.receive(s, packet, 0) }
+    }
+    if c.earlyPackets < 8 || c.confirmed || c.spaces[1].write.key.length != 0 { return 50 }
+    let next = c.spaces[2].next; let deadline = c.spaces[0].probe
+    if deadline <= 0 { return 50 }
+    let initialProbe = 0
+    for packet in quic.poll(c, deadline) {
+        let header = wire.header(packet, 0, s.local.length)
+        if header.kind == wire.ZERO_RTT || header.kind == wire.ONE_RTT { print("application PTO fired before confirmation"); return 51 }
+        if header.kind == wire.INITIAL && packet.length >= 1200 { initialProbe += 1 }
+    }
+    if initialProbe == 0 || c.spaces[2].next != next || c.congestion.probes != 1 { return 52 }
+    let fixed = quic.nextTimer(c); quic.poll(c, deadline)
+    if quic.nextTimer(c) != fixed || c.congestion.probes != 1 { return 52 }
+    return 0
+}
+function confirmed(root: Bytes, identity: Bytes, key: Bytes, certificate: Bytes, clientKey: Bytes): Integer {
+    let c = quic.client("localhost", randomBytes(80), "minyar-test", [root], [certificate], clientKey)
+    let s = quic.server(randomBytes(80), "minyar-test", c.originalDestination, [identity], key, [root], true)
+    for tick in 0..100 { drive(c, s, tick * 10) }
+    if !c.confirmed || c.spaces[0].active || c.spaces[1].active || c.spaces[2].sent.length != 0 { return 60 }
+    quic.ping(c); quic.poll(c, 1200)
+    let deadline = quic.nextTimer(c); let next = c.spaces[2].next
+    if deadline != c.spaces[2].probe || deadline <= 1200 { return 60 }
+    quic.poll(c, deadline - 1)
+    if c.spaces[2].next != next { return 61 }
+    let probes = 0
+    for packet in quic.poll(c, deadline) { if wire.header(packet, 0, s.local.length).kind == wire.ONE_RTT { probes += 1 } }
+    if probes == 0 || c.spaces[2].next == next { return 61 }
+    return 0
+}
+function closing(root: Bytes, identity: Bytes, key: Bytes, certificate: Bytes, clientKey: Bytes, drain: Boolean): Integer {
+    let pair = bootstrap(root, identity, key, certificate, clientKey, true)
+    let c = pair.client; let s = pair.server
+    if !pair.valid || c.spaces[1].write.key.length == 0 { return 70 }
+    if drain {
+        quic.close(s, 0, Bytes("finished"))
+        for packet in quic.poll(s, 101) { quic.receive(c, packet, 101) }
+        if !c.draining { return 70 }
+    } else {
+        quic.close(c, 0, Bytes("finished")); quic.poll(c, 101)
+        if !c.closing { return 70 }
+    }
+    let deadline = quic.nextTimer(c)
+    if deadline != c.closeUntil { return 71 }
+    let before = c.spaces[1].next
+    if quic.poll(c, deadline).length != 0 || c.spaces[1].next != before || quic.nextTimer(c) != -1 || !quic.release(c) || quic.nextTimer(c) != -1 { return 71 }
+    return 0
+}
+function retried(root: Bytes, identity: Bytes, key: Bytes, certificate: Bytes, clientKey: Bytes): Integer {
+    let c = quic.client("localhost", randomBytes(80), "minyar-test", [root], [certificate], clientKey)
+    let store = retry.store(randomBytes(16), 30000); let address = Bytes("127.0.0.1:50001")
+    let first = quic.poll(c, 0); if first.length == 0 { return 80 }
+    let old = quic.nextTimer(c)
+    let response = retry.reply(store, first[0], address, randomBytes(8), 100)
+    if !errors.bytesOk(response) { return 80 }
+    c.congestion.probes = 3
+    quic.receive(c, errors.bytesValue(response), 100)
+    if !c.retryAccepted || c.congestion.probes != 0 { return 80 }
+    quic.poll(c, 100)
+    let deadline = quic.nextTimer(c)
+    if deadline != c.spaces[0].probe || deadline <= old { print("Retry retained the old handshake deadline"); return 81 }
+    if quic.poll(c, old).length != 0 || quic.nextTimer(c) != deadline { return 81 }
+    let probes = quic.poll(c, deadline)
+    if probes.length == 0 { return 81 }
+    for packet in probes { if wire.header(packet, 0, c.local.length).kind != wire.INITIAL || packet.length < 1200 { return 81 } }
+    return 0
+}
+function main(): Integer {
+    let root = readBytesFile(argument(0)); let identity = readBytesFile(argument(1)); let key = readBytesFile(argument(2))
+    let certificate = readBytesFile(argument(3)); let clientKey = readBytesFile(argument(4)); let mode = argument(5)
+    let result = 90
+    if mode == "initial" { result = noFlight(root, identity, key, certificate, clientKey, false, false) }
+    else if mode == "handshake" { result = noFlight(root, identity, key, certificate, clientKey, true, false) }
+    else if mode == "handshake-ack" { result = noFlight(root, identity, key, certificate, clientKey, true, true) }
+    else if mode == "application" { result = application(root, identity, key, certificate, clientKey) }
+    else if mode == "confirmed" { result = confirmed(root, identity, key, certificate, clientKey) }
+    else if mode == "close" { result = closing(root, identity, key, certificate, clientKey, false) }
+    else if mode == "drain" { result = closing(root, identity, key, certificate, clientKey, true) }
+    else if mode == "retry" { result = retried(root, identity, key, certificate, clientKey) }
+    if result == 0 { print("QUIC PTO " + mode + " passed") }
+    return result
+}
