@@ -180,6 +180,7 @@ static void queued_full_root(void) {
     minyar_rc_release(g.root);
     empty();
 }
+#ifndef MINYAR_LATE_REGISTRATION_NO_MAIN
 int main(void) {
     queued_full_root();
     for (int kind = 0; kind < 2; kind++)
@@ -191,3 +192,5 @@ int main(void) {
     fprintf(stderr, "late registration 96 owning-path schedules exact cleanup zero\n");
     return 0;
 }
+
+#endif
