@@ -6,7 +6,6 @@ from urllib.parse import urlsplit
 case=os.environ.get('TESTCASE','')
 if case not in ('handshake','transfer','retry','resumption','zerortt','multiconnect','rebind-port','rebind-addr','chacha20','keyupdate','connectionmigration'):
     sys.exit(127)
-while not Path('/tmp/network-ready').exists():time.sleep(.05)
 role=os.environ['ROLE']
 child=None;stopping_signal=None
 def forward_signal(number,frame):
@@ -17,6 +16,10 @@ def forward_signal(number,frame):
 # otherwise Docker waits its entire stop timeout before killing the child,
 # which incorrectly consumes the upstream protocol test's wall-clock budget.
 signal.signal(signal.SIGTERM,forward_signal);signal.signal(signal.SIGINT,forward_signal)
+while not Path('/tmp/network-ready').exists():
+    if stopping_signal is not None:sys.exit(128+stopping_signal)
+    time.sleep(.05)
+if stopping_signal is not None:sys.exit(128+stopping_signal)
 with tempfile.TemporaryDirectory(prefix='minyar-qns-') as d:
     d=Path(d)
     def openssl(*args):subprocess.run(['openssl',*map(str,args)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
