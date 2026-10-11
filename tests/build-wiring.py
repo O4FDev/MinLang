@@ -458,15 +458,25 @@ class BuildWiring(unittest.TestCase):
                     self.assertTrue(pair <= rules.get(gate,set()),gate)
                 self.assertIn('check-cycle-private-retirement-sanitize',rules.get('check-sanitize',set()))
                 for target in pair:self.assertTrue(inputs <= rules[target],target)
-                commands=result.stdout.split('# GNU Make',1)[0]
+                private_commands={}
+                for kind in ('native','sanitize'):
+                    target='check-cycle-private-retirement'+('-sanitize' if kind=='sanitize' else '')
+                    recipe=subprocess.run(['make','-rRn','-f',str(probe),target],
+                                          cwd=ROOT,capture_output=True,text=True,timeout=15)
+                    self.assertEqual(recipe.returncode,0,recipe.stderr)
+                    commands=recipe.stdout
+                    private_commands[kind]=commands
+                    self.assertEqual(commands.count('python3 tests/cycle-private-retirement.py'),1,target)
+                    self.assertEqual(commands.count('--evidence "$evidence/run"'),1,target)
+                    self.assertEqual(commands.count('--sanitize --evidence'),int(kind=='sanitize'),target)
+                    self.assertNotIn('--profiles',commands)
+                    self.assertNotIn('--budgets',commands)
+                    self.assertIn((ROOT/'build'/('cycle-private-retirement-'+kind)).as_posix(),
+                                  commands.replace('\\','/'))
+                commands='\n'.join(private_commands.values())
                 self.assertEqual(commands.count('python3 tests/cycle-private-retirement.py'),2)
                 self.assertEqual(commands.count('--evidence "$evidence/run"'),2)
                 self.assertEqual(commands.count('--sanitize --evidence'),1)
-                self.assertNotIn('--profiles',commands)
-                self.assertNotIn('--budgets',commands)
-                for kind in ('native','sanitize'):
-                    self.assertIn((ROOT/'build'/('cycle-private-retirement-'+kind)).as_posix(),
-                                  commands.replace('\\','/'))
         verify(fragment)
         for gate in ('check','check-portable','check-managed-graphs-profiles','check-sanitize'):
             line = next(line for line in fragment.splitlines() if line.startswith(gate+':'))
@@ -476,6 +486,16 @@ class BuildWiring(unittest.TestCase):
         for dependency in sorted(inputs):
             with self.subTest(input=dependency),self.assertRaises(AssertionError):
                 verify(fragment.replace(dependency+' ','',1))
+        evidence='--evidence "$$evidence/run"'
+        for target in sorted(pair):
+            block=re.search(r'(?m)^'+re.escape(target)+r':[^\n]*\n(?:\t[^\n]*(?:\n|$))+',fragment)
+            self.assertIsNotNone(block,target)
+            recipe=block.group()
+            self.assertEqual(recipe.count(evidence),1,target)
+            for replacement in ('',evidence+' '+evidence):
+                broken=fragment[:block.start()]+recipe.replace(evidence,replacement,1)+fragment[block.end():]
+                with self.subTest(target=target,evidence=replacement),self.assertRaises(AssertionError):
+                    verify(broken)
         spec=importlib.util.spec_from_file_location('retirement_operation_contract',
                                                  ROOT/'tests/cycle-private-retirement.py')
         driver=importlib.util.module_from_spec(spec);spec.loader.exec_module(driver)
