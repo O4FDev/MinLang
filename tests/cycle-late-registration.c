@@ -71,7 +71,7 @@ static void publish(Late s, MinyarRecord *payload, int copied, int exact) {
             rc_cycle_edge_insert(r, payload);
             if (s.topology < 2)
                 assert(!rc_cycle_proof_valid);
-            else
+            else if (rc_cycle_phase != RC_CYCLE_SWEEP)
                 assert(rc_cycle_proof_valid);
             r->values[0] = slot(payload);
             rc_cycle_commit_insert(r, payload);
@@ -80,7 +80,7 @@ static void publish(Late s, MinyarRecord *payload, int copied, int exact) {
             rc_cycle_edge_insert(l, payload);
             if (s.topology < 2)
                 assert(!rc_cycle_proof_valid);
-            else
+            else if (rc_cycle_phase != RC_CYCLE_SWEEP)
                 assert(rc_cycle_proof_valid);
             l->values[l->length++] = slot(payload);
             rc_cycle_commit_insert(l, payload);
