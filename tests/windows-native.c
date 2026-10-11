@@ -206,6 +206,38 @@ int main(int argc, char **argv) {
         puts("Windows Explorer tray icon and owned menu lifetime verified");
     } else
         puts("Windows session has no Explorer taskbar; real tray check requires desktop VM");
+    // Cached intrinsic sizes must follow every public mutation and native edits.
+    GetWindowRect(minyar_windows_testHandle(label), &left);
+    unsigned long long before_measure = minyar_windows_testMeasures();
+    minyar_windows_font(label, family, 28, 400);
+    GetWindowRect(minyar_windows_testHandle(label), &right);
+    assert(right.bottom - right.top > left.bottom - left.top);
+    assert(minyar_windows_testMeasures() > before_measure);
+    MinyarText *long_text =
+        text("long text must expand beyond the minimum width of an input field");
+    GetWindowRect(minyar_windows_testHandle(field), &left);
+    before_measure = minyar_windows_testMeasures();
+    minyar_windows_setText(field, long_text);
+    GetWindowRect(minyar_windows_testHandle(field), &right);
+    assert(right.right - right.left > left.right - left.left);
+    assert(minyar_windows_testMeasures() > before_measure);
+    SendMessageW(minyar_windows_testHandle(field), WM_SETTEXT, 0, (LPARAM)L"x");
+    before_measure = minyar_windows_testMeasures();
+    minyar_windows_padding(column, 10);
+    GetWindowRect(minyar_windows_testHandle(field), &left);
+    assert(left.right - left.left < right.right - right.left);
+    assert(minyar_windows_testMeasures() > before_measure);
+    GetWindowRect(minyar_windows_testHandle(editor), &left);
+    minyar_windows_size(editor, 60, 40);
+    GetWindowRect(minyar_windows_testHandle(editor), &right);
+    assert(right.right - right.left < left.right - left.left);
+    assert(right.bottom - right.top < left.bottom - left.top);
+    before_measure = minyar_windows_testMeasures();
+    SendMessageW(minyar_windows_testHandle(window), WM_FONTCHANGE, 0, 0);
+    assert(minyar_windows_testMeasures() > before_measure);
+    minyar_rc_release(long_text);
+    while (minyar_windows_nextEvent(0) && minyar_windows_eventType() != 0) {
+    }
     minyar_windows_close(window);
     assert(minyar_windows_nextEvent(0) && minyar_windows_eventType() == 3);
     minyar_windows_destroy(window);

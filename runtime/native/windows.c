@@ -35,7 +35,9 @@ typedef struct Widget {
     double minimum, maximum;
     HACCEL accelerators;
     ACCEL accelerator;
-    bool disabled;
+    bool disabled, positioned;
+    int measured_dpi, measured_width, measured_height;
+    int placed_x, placed_y, placed_width, placed_height;
 } Widget;
 typedef struct Event {
     int type;
@@ -56,6 +58,7 @@ static unsigned next_command = 1;
 #ifdef MINYAR_WINDOWS_TEST
 static unsigned long long measured_controls, positioned_controls;
 #endif
+static int layout_dpi;
 static const wchar_t window_class[] = L"MinyarWindowV1";
 #ifdef MINYAR_APP_EVENT_LOOP
 extern bool minyar_net_appLoopWindowsValid(long long);
@@ -173,6 +176,8 @@ static Widget *root(Widget *w) {
     return w;
 }
 static int scaled(Widget *w, int value) {
+    if (layout_dpi)
+        return MulDiv(value, layout_dpi, 96);
     HDC dc = GetDC(root(w)->handle);
     int dpi = dc ? GetDeviceCaps(dc, LOGPIXELSY) : 96;
     if (dc)
@@ -201,6 +206,13 @@ static wchar_t *edit_text(Widget *w, const MinyarText *value) {
     }
     free(text);
     return out;
+}
+static void remember_measure(Widget *w, int width, int height) {
+    if (w->measured_dpi != layout_dpi)
+        w->positioned = false;
+    w->measured_dpi = layout_dpi;
+    w->measured_width = width;
+    w->measured_height = height;
 }
 static void measure(Widget *w, int *width, int *height) {
     if (w->kind == COLUMN || w->kind == ROW) {
@@ -235,12 +247,18 @@ static void measure(Widget *w, int *width, int *height) {
             *height = scaled(w, w->height);
         return;
     }
+    if (layout_dpi && w->measured_dpi == layout_dpi) {
+        *width = w->measured_width;
+        *height = w->measured_height;
+        return;
+    }
     if (w->kind == EDITOR || w->kind == TEXTVIEW || w->kind == SLIDER || w->kind == SEPARATOR) {
         *width = scaled(w, w->width ? w->width : 200);
         *height = scaled(w, w->height              ? w->height
                             : w->kind == SEPARATOR ? 2
                             : w->kind == SLIDER    ? 28
                                                    : 100);
+        remember_measure(w, *width, *height);
         return;
     }
 #ifdef MINYAR_WINDOWS_TEST
@@ -264,13 +282,23 @@ static void measure(Widget *w, int *width, int *height) {
         *width = scaled(w, w->width);
     if (w->height)
         *height = scaled(w, w->height);
+    remember_measure(w, *width, *height);
 }
 static void arrange(Widget *w, int x, int y, int width, int height) {
     if (w->handle && w->kind != WINDOW) {
+        if (w->positioned && w->placed_x == x && w->placed_y == y && w->placed_width == width &&
+            w->placed_height == height)
+            return;
+        w->placed_x = x;
+        w->placed_y = y;
+        w->placed_width = width;
+        w->placed_height = height;
+        w->positioned = true;
 #ifdef MINYAR_WINDOWS_TEST
         positioned_controls++;
 #endif
-        SetWindowPos(w->handle, NULL, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
+        if (!SetWindowPos(w->handle, NULL, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE))
+            w->positioned = false;
         return;
     }
     int padding = scaled(w, w->padding), spacing = scaled(w, w->spacing);
@@ -295,9 +323,17 @@ static void arrange(Widget *w, int x, int y, int width, int height) {
 }
 static void layout(Widget *w) {
     w = root(w);
+    int previous_dpi = layout_dpi;
+    HDC dc = GetDC(w->handle);
+    layout_dpi = dc ? GetDeviceCaps(dc, LOGPIXELSY) : 96;
+    if (dc)
+        ReleaseDC(w->handle, dc);
+    if (layout_dpi <= 0)
+        layout_dpi = 96;
     RECT area;
     if (GetClientRect(w->handle, &area))
         arrange(w, 0, 0, area.right, area.bottom);
+    layout_dpi = previous_dpi;
 }
 static void rebuild_accelerators(Widget *window) {
     unsigned count = 0;
@@ -343,6 +379,8 @@ static LRESULT CALLBACK procedure(HWND handle, UINT message, WPARAM wp, LPARAM l
         if (child) {
             Widget *c = get(child);
             int code = HIWORD(wp);
+            if (editable(c) && code == EN_CHANGE)
+                c->measured_dpi = 0;
             if (!c->suppress && !c->disabled && editable(c) && code == EN_CHANGE)
                 enqueue(2, child, read_text(c->handle));
             else if (!c->suppress && !c->disabled && (c->kind == BUTTON || c->kind == CHECKBOX) &&
@@ -408,6 +446,11 @@ static LRESULT CALLBACK procedure(HWND handle, UINT message, WPARAM wp, LPARAM l
                 }
             }
         return 0;
+    }
+    if (w && (message == WM_SETTINGCHANGE || message == WM_FONTCHANGE)) {
+        for (size_t i = 0; i < capacity; i++)
+            widgets[i].measured_dpi = 0;
+        layout(w);
     }
     if (w && message == WM_CLOSE) {
         ShowWindow(handle, SW_HIDE);
@@ -583,6 +626,7 @@ void minyar_windows_size(long long handle, long long width, long long height) {
         fail("windows: size requires a view");
     w->width = (int)width;
     w->height = (int)height;
+    w->measured_dpi = 0;
     layout(w);
 }
 double minyar_windows_value(long long handle) {
@@ -694,6 +738,7 @@ void minyar_windows_setText(long long value, const MinyarText *text) {
     SetWindowTextW(w->handle, s);
     w->suppress--;
     free(s);
+    w->measured_dpi = 0;
     layout(w);
 }
 MinyarText *minyar_windows_text(long long value) {
@@ -730,6 +775,7 @@ void minyar_windows_font(long long value, const MinyarText *family, double size,
     if (w->font)
         DeleteObject(w->font);
     w->font = font;
+    w->measured_dpi = 0;
     layout(w);
 }
 bool minyar_windows_checked(long long value) {
