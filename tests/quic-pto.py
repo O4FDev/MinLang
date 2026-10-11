@@ -112,9 +112,12 @@ def main():
                                                if not Path(name).is_file() or digest(name) != value]
         if manifest["source_after_mismatches"]:
             manifest["state"] = "failed"
+            failed = True
         evidence.close(failed=failed)
         manifest["raw_evidence"] = str(evidence.path)
         save()
+        if manifest["source_after_mismatches"]:
+            raise AssertionError(("source changed during verification", manifest["source_after_mismatches"]))
 
 
 if __name__ == "__main__":
