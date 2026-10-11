@@ -52,6 +52,12 @@ static double wall_seconds(void) {
     return (double)now.tv_sec + (double)now.tv_nsec / 1e9;
 #endif
 }
+#ifdef _WIN32
+/* Preserve the raw values from the existing two endpoint calls. They are
+ * evidence only; the gate keeps its original double CPU arithmetic. */
+static unsigned idle_cpu_calls;
+static ULONGLONG idle_kernel[2], idle_user[2];
+#endif
 static double cpu_seconds(void) {
 #ifdef _WIN32
     FILETIME created, exited, kernel, user;
@@ -61,6 +67,11 @@ static double cpu_seconds(void) {
     k.HighPart = kernel.dwHighDateTime;
     u.LowPart = user.dwLowDateTime;
     u.HighPart = user.dwHighDateTime;
+    unsigned sample = idle_cpu_calls++;
+    if (sample < 2) {
+        idle_kernel[sample] = k.QuadPart;
+        idle_user[sample] = u.QuadPart;
+    }
     return (double)(k.QuadPart + u.QuadPart) / 1e7;
 #else
     return (double)clock() / CLOCKS_PER_SEC;
@@ -217,8 +228,24 @@ int main(int argc, char **argv) {
             sleep_ms(wait);
         }
     }
-    double elapsed = wall_seconds() - start;
-    double idle_cpu = (cpu_seconds() - cpu_start) / elapsed;
+    double wall_end = wall_seconds();
+    double elapsed = wall_end - start;
+    double cpu_end = cpu_seconds();
+    double idle_cpu = (cpu_end - cpu_start) / elapsed;
+#ifdef _WIN32
+    /* Log only after both measured endpoints, before assertion terminates the
+     * process. Passing output and the timed loop remain unchanged. */
+    if (!(idle_cpu <= 0.02)) {
+        fprintf(stderr,
+                "cycle progress idle failure: calls=%u kernel_begin=%llu kernel_end=%llu "
+                "user_begin=%llu user_end=%llu cpu_start=%.17g cpu_end=%.17g cpu_delta=%.17g "
+                "wall_start=%.17g wall_end=%.17g elapsed=%.17g idle_cpu=%.17g\n",
+                idle_cpu_calls, (unsigned long long)idle_kernel[0],
+                (unsigned long long)idle_kernel[1], (unsigned long long)idle_user[0],
+                (unsigned long long)idle_user[1], cpu_start, cpu_end, cpu_end - cpu_start,
+                start, wall_end, elapsed, idle_cpu);
+    }
+#endif
     assert(waits > 0);
     assert(idle_cpu <= 0.02);
     /* Unreachable cycles must disappear even while helper borrows of a
