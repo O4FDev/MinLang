@@ -153,7 +153,7 @@ function boundedLateDelivery(c: quic.Connection,s: quic.Connection,now: Integer,
     return 0
 }
 
-function delayedPersistent(c: quic.Connection,s: quic.Connection,now: Integer,late: Boolean): Integer {
+function delayedPersistent(c: quic.Connection,s: quic.Connection,now: Integer,late: Boolean,retried: Boolean): Integer {
     if c.spaces[2].sent.length!=0 || c.history.length!=0 { return 81 }
     c.congestion.smoothed=100;c.congestion.latest=100;c.congestion.minimum=100;c.congestion.variance=0;c.congestion.window=12000;c.congestion.measured=true
     c.emptySince=-1;c.paceCredit=12000.0;c.paceAt=now
@@ -169,9 +169,17 @@ function delayedPersistent(c: quic.Connection,s: quic.Connection,now: Integer,la
     c.paceCredit=0.0;c.paceAt=now+1020
     quic.poll(c,now+1020)
     if c.lossFirst!=now || c.lossLast!=now || c.congestion.window<=2400 { print("persistent setup");return 82 }
+    if retried {
+        c.paceCredit=Float(c.congestion.window);c.paceAt=now+1022
+        let retry=c.spaces[2].next
+        for packet in quic.poll(c,now+1022) { quic.receive(s,packet,now+1022) }
+        if c.spaces[2].next!=retry+1 { print("persistent retry setup");return 93 }
+        ack(s,c,retry,now+1023)
+        if c.streams[0].sendAcknowledged!=1 { return 93 }
+    }
     if late {
         let flight=c.flight
-        ack(s,c,original,now+1021)
+        ack(s,c,original,now+1024)
         if c.streams[0].sendAcknowledged!=1 || c.flight!=flight { return 83 }
     }
     c.paceCredit=0.0;c.paceAt=now+1200;quic.poll(c,now+1200)
@@ -195,15 +203,56 @@ function freshProbe(c: quic.Connection,s: quic.Connection,now: Integer): Integer
     if c.spaces[2].probe<=now+1000 { print("new packet inherited an expired PTO deadline");return 87 }
     return 0
 }
+
+function lateReset(c: quic.Connection,s: quic.Connection,now: Integer): Integer {
+    let id=errors.integerValue(quic.openStream(c,true));quic.cancelStream(c,id,73)
+    let first=c.spaces[2].next
+    for packet in quic.poll(c,now) { quic.receive(s,packet,now) }
+    if c.spaces[2].sent.length!=1 { return 89 }
+    let original=c.spaces[2].sent[0]
+    for step in 1..4 { quic.ping(c);for packet in quic.poll(c,now+step) { quic.receive(s,packet,now+step) } }
+    let frame=Bytes();frame.add(2);number(frame,c.spaces[2].next-1);number(frame,0);number(frame,0);number(frame,2)
+    inject(s,c,frame,now+4)
+    c.paceCredit=0.0;c.paceAt=now+4;quic.poll(c,now+4)
+    if original.status!=2 || original.payload.length!=0 || c.pending.length!=1 { return 89 }
+    let before=c.flight;ack(s,c,first,now+5)
+    if !c.streams[0].resetAcknowledged || c.flight!=before { print("late reset ACK lost delivery");return 90 }
+    quic.poll(c,now+100)
+    for sent in c.spaces[2].sent {
+        for frame in wire.frames(sent.payload).frames { if frame.type==4 && frame.stream==id { return 91 } }
+    }
+    return 0
+}
+function duplicateProbe(c: quic.Connection,s: quic.Connection,now: Integer): Integer {
+    c.congestion.measured=true;c.congestion.smoothed=100;c.congestion.latest=100;c.congestion.minimum=100;c.congestion.variance=0
+    c.paceCredit=Float(c.congestion.window);c.paceAt=now
+    let original=c.spaces[2].next;quic.ping(c)
+    for packet in quic.poll(c,now) { quic.receive(s,packet,now) }
+    ack(s,c,original,now+10)
+    let id=errors.integerValue(quic.openStream(c,false))
+    quic.writeStream(c,id,Bytes("dropped"),false);quic.poll(c,now+20)
+    if c.spaces[2].sent.length!=1 { return 94 }
+    let deadline=c.spaces[2].probe;let first=c.spaces[2].next
+    if deadline<=now+20 { return 94 }
+    let tick=now+30
+    while tick<deadline {
+        ack(s,c,original,tick)
+        if c.spaces[2].probe!=deadline { print("duplicate ACK postponed outstanding PTO");return 92 }
+        quic.poll(c,tick);tick+=10
+    }
+    quic.poll(c,deadline)
+    if c.congestion.probes!=1 || c.spaces[2].next<=first { print("outstanding probe did not retransmit");return 95 }
+    return 0
+}
 function main(): Integer {
     let root=readBytesFile(argument(0));let cert=readBytesFile(argument(1));let key=readBytesFile(argument(2));let client=readBytesFile(argument(3));let clientKey=readBytesFile(argument(4))
-    for scenario in 0..8 {
+    for scenario in 0..12 {
         let candidate=quic.client("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey)
         let peer=quic.server(randomBytes(80),"minyar-test",candidate.originalDestination,[cert],key,[root],true)
         for count in 0..200 { drive(candidate,peer,count*10) }
         if !candidate.confirmed || !peer.confirmed { return 68 }
         let result=0
-        if scenario==0 { result=lateACK(candidate,peer,2000) } else if scenario==1 { result=queuedMixed(candidate,peer,2000) } else if scenario==2 { result=recoveredDelivery(candidate,peer,2000) } else if scenario==3 { result=boundedLateDelivery(candidate,peer,2000,1) } else if scenario==4 { result=freshProbe(candidate,peer,2000) } else if scenario==7 { result=boundedLateDelivery(candidate,peer,2000,3) } else { result=delayedPersistent(candidate,peer,2000,scenario==6) }
+        if scenario==0 { result=lateACK(candidate,peer,2000) } else if scenario==1 { result=queuedMixed(candidate,peer,2000) } else if scenario==2 { result=recoveredDelivery(candidate,peer,2000) } else if scenario==3 { result=boundedLateDelivery(candidate,peer,2000,1) } else if scenario==4 { result=freshProbe(candidate,peer,2000) } else if scenario==7 { result=boundedLateDelivery(candidate,peer,2000,3) } else if scenario==8 { result=lateReset(candidate,peer,2000) } else if scenario==11 { result=duplicateProbe(candidate,peer,2000) } else { result=delayedPersistent(candidate,peer,2000,scenario==6 || scenario==9,scenario==9 || scenario==10) }
         if result!=0 { return result }
     }
     let c=quic.client("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey)
