@@ -1595,6 +1595,33 @@ class BuildWiring(unittest.TestCase):
                            isinstance(name, ast.Name) and name.id == 'TARGETS'
                            for name in node.targets))
         self.assertEqual(targets.count(target), 1)
+        workflow = (ROOT/'.github/workflows/ci.yml').read_text()
+        self.assertIn('build/linux-evidence/**/build/quic-official-adapter.*', workflow)
+        self.assertEqual(workflow.count('            build/quic-official-adapter.*'), 2)
+        driver = ast.parse((ROOT/'tests/quic-official-adapter.py').read_text())
+        cases = []
+        for node in driver.body:
+            if isinstance(node, ast.Assign) and any(
+                    isinstance(name, ast.Name) and name.id == 'CASES' for name in node.targets):
+                cases.extend(ast.literal_eval(node.value))
+            elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name) and node.target.id == 'CASES':
+                if isinstance(node.value, ast.Name):
+                    declaration = next(item.value for item in driver.body
+                                       if isinstance(item, ast.Assign) and any(
+                                           isinstance(name, ast.Name) and name.id == node.value.id
+                                           for name in item.targets))
+                    cases.extend(ast.literal_eval(declaration))
+                else:
+                    cases.extend(ast.literal_eval(node.value))
+        self.assertEqual(len(cases), 107)
+        self.assertEqual(len(set(cases)), 107)
+        main = next(node for node in driver.body
+                    if isinstance(node, ast.FunctionDef) and node.name == 'main')
+        selection = next(node.value for node in ast.walk(main)
+                         if isinstance(node, ast.Assign) and any(
+                             isinstance(name, ast.Name) and name.id == 'cases'
+                             for name in node.targets))
+        self.assertEqual(ast.unparse(selection), 'args.case or CASES')
         spec = importlib.util.spec_from_file_location(
             'official_adapter_catalogue', ROOT/'tests/suite-catalogue.py')
         catalogue = importlib.util.module_from_spec(spec)
@@ -1699,6 +1726,40 @@ class BuildWiring(unittest.TestCase):
         with patch.object(checker.importlib.metadata, 'version', return_value='0'):
             with self.assertRaises(ValueError):
                 checker.verify_python(ROOT/'tests/interop/qns/controls-requirements.txt')
+        for version in ((3, 11), (3, 13), (3, 14)):
+            with patch.object(checker.sys, 'version_info', version):
+                with self.subTest(unverified_abi=version), self.assertRaises(ValueError):
+                    checker.require_supported_python()
+        from types import SimpleNamespace
+        with patch.object(checker.sys, 'implementation', SimpleNamespace(name='pypy')):
+            with self.assertRaises(ValueError):
+                checker.require_supported_python()
+        with tempfile.TemporaryDirectory(prefix='controls wheel byte proof ') as folder:
+            import base64
+            root = Path(folder)
+            module = root/'yaml/__init__.py'
+            module.parent.mkdir()
+            module.write_bytes(b'retained module fixture\n')
+            expected = base64.urlsafe_b64encode(
+                hashlib.sha256(module.read_bytes()).digest()).decode().rstrip('=')
+            class Entry:
+                hash = SimpleNamespace(mode='sha256', value=expected)
+                def __str__(self):
+                    return 'yaml/__init__.py'
+            distribution = SimpleNamespace(files=[Entry()],
+                                           locate_file=lambda item: root/str(item))
+            yaml = SimpleNamespace(__file__=str(module), __version__='6.0.2')
+            with patch.object(checker.importlib.metadata, 'version', return_value='6.0.2'), \
+                    patch.object(checker.importlib.metadata, 'distribution',
+                                 return_value=distribution), \
+                    patch.object(checker.importlib, 'import_module', return_value=yaml) as imported:
+                report = checker.verify_python(ROOT/'tests/interop/qns/controls-requirements.txt')
+                self.assertTrue(report['verified'])
+                self.assertEqual(imported.call_count, 1)
+                module.write_bytes(b'changed module fixture\n')
+                with self.assertRaises(ValueError):
+                    checker.verify_python(ROOT/'tests/interop/qns/controls-requirements.txt')
+                self.assertEqual(imported.call_count, 1)
         with tempfile.TemporaryDirectory(prefix='invalid adapter requirements ') as folder:
             requirement = Path(folder)/'requirements.txt'
             for content in ('', 'PyYAML\n', 'PyYAML==6.0.3\n',
