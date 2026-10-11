@@ -403,6 +403,43 @@ static void move_stale_root_before_visit(int kind) {
     minyar_rc_release(owner);
     empty();
 }
+/* A canceled local job can finish an internal known parent outside its
+ * captured sweep cohort. Unlike an external root, this stale completed
+ * node has no ROOTS shading call to repair it before its owning path is
+ * traversed in the following full MARK. */
+static void internal_completed_parent(void) {
+    Graph g = graph();
+    void *receiver = receiver_new(0);
+    MinyarRecord *parent = parent_new(g, receiver, 1);
+    parent_commit(g, parent);
+    drain();
+    assert(rc_cycle_proven(rc_cycle_value(parent)));
+    assert(rc_cycle_value(receiver)->gray_next & 4);
+    MinyarRecord *payload = minyar_record_new_traced(3);
+    minyar_record_set_traced(payload, 0, 1);
+    minyar_record_set_reference_traced(payload, 1, slot(g.root));
+    minyar_record_set_traced(payload, 2, 123);
+    Late s = {g, parent, receiver, 0, 0};
+    rc_cycle_request_local();
+    rc_cycle_unit();
+    assert(rc_cycle_phase == RC_CYCLE_ROOTS && rc_cycle_local_job);
+    publish(s, payload, 0, 1);
+    size_t steps = 0;
+    while (rc_cycle_phase != RC_CYCLE_IDLE) {
+        assert(++steps < 10000);
+        rc_cycle_unit();
+    }
+    RcCycle *internal = rc_cycle_value(parent);
+    assert(internal->marked == 2 && rc_cycle_rescan && rc_cycle_pending);
+    assert((((RcObject *)parent - 1)->ownership >> 3) == internal->incoming);
+    drain();
+    MinyarList *list = receiver;
+    assert(rc_object_count == 7 && list->length == 1 && list->values[0] == slot(payload));
+    assert(parent->values[0] == slot(g.root) && parent->values[1] == slot(receiver));
+    assert(parent->values[2] == 99 && payload->values[1] == slot(g.root));
+    minyar_rc_release(g.root);
+    empty();
+}
 /* A first finite cohort must reclaim fresh internal cycles, even when no
  * external root shades their initial registration state. The two copied
  * stores use the public barrier ordering; rc_drop releases the external
@@ -434,6 +471,7 @@ static void fresh_internal_cycle(void) {
     empty();
 }
 int main(void) {
+    internal_completed_parent();
     fresh_internal_cycle();
     queued_full_root();
     move_stale_root_before_visit(0);
