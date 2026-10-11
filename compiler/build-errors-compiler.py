@@ -64,6 +64,17 @@ def assemble():
         '        fail("Result payloads are only accessible through match or try")\n    }\n')
     source = replace(source, 'token != "List" && (token != "Callback" || tokenTexts[position + 1] != "<") && genericDepth == 0',
         'token != "List" && token != "Result" && (token != "Callback" || tokenTexts[position + 1] != "<") && genericDepth == 0')
+    # Body ownership alone cannot reject unused managed parameters. Keep the
+    # scalar-only parallel ABI independent of liveness and body optimization.
+    source = replace(source,
+        '            finishParallelFunction(output, globals, entrySlot, bodySlot, name, state[6] == 1)',
+        '            let parallelReferences = state[6] == 1 || isReferenceType(returnType)\n'
+        '            let parallelParameter = 0\n'
+        '            while parallelParameter < parameterNames.length {\n'
+        '                if isReferenceType(parameterTypes[parallelParameter]) { parallelReferences = true }\n'
+        '                parallelParameter = parallelParameter + 1\n'
+        '            }\n'
+        '            finishParallelFunction(output, globals, entrySlot, bodySlot, name, parallelReferences)')
     # Type arguments in explicit constructor headers need module qualification.
     source = replace(source, '                if kind == 4 && token == ":" && (declarationMode == 1 || functionHeader || letDeclaration) {',
         '                if kind == 1 && (token == "Ok" || token == "Err") && tokenTexts[position + 1] == "<" { typeMode = true; genericDepth = 0 }\n'
