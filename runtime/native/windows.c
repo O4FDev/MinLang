@@ -777,10 +777,16 @@ static void remove_events(long long value) {
 }
 static void destroy(long long value) {
     Widget *w = get(value);
-    for (long long child = w->first; child;) {
-        long long next = get(child)->next;
+    while (w->first) {
+        long long child = w->first;
+        // Native disposal can synchronously reenter layout. Remove the child
+        // before its handle becomes stale, while keeping its parent alive for
+        // menu/control cleanup.
+        w->first = get(child)->next;
+        if (!w->first)
+            w->last = 0;
         destroy(child);
-        child = next;
+        w = get(value);
     }
     w = get(value);
     remove_events(value);
