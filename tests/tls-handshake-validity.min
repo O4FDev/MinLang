@@ -1,0 +1,66 @@
+use "tls" as tls
+use "tlsserver" as server
+use "tlstickets" as tickets
+use "tlsverify" as trust
+use "eventloop" as loop
+use "errors" as errors
+function exchange(c: tls.Session, s: server.Session) {
+    server.receiveHandshake(s,tls.takeOutgoing(c),0)
+    tls.receiveHandshake(c,server.takeInitial(s),0);tls.receiveHandshake(c,server.takeHandshake(s),1)
+    server.receiveHandshake(s,tls.takeOutgoing(c),1);tls.receiveHandshake(c,server.takeApplication(s),2)
+}
+function main(): Integer {
+    let root=readBytesFile(argument(0));let identity=readBytesFile(argument(1));let key=readBytesFile(argument(2))
+    let device=readBytesFile(argument(3));let deviceKey=readBytesFile(argument(4));let mode=argument(5)
+    let expires=0;for digit in argument(6) { expires=expires*10+Integer(digit)-48 }
+    let store=tickets.store(randomBytes(16),3600);let ticket=tickets.emptyClient()
+    let resumed=mode!="server-full-finished" && mode!="client-full-finished" && mode!="control"
+    if resumed {
+        let initial=tls.quicClient("localhost",randomBytes(64),"minyar-test",Bytes(),[root],[device],deviceKey)
+        let initialPeer=server.quicServerWithTickets(randomBytes(64),"minyar-test",Bytes(),[identity],key,[root],true,store)
+        exchange(initial,initialPeer)
+        if initial.state!=tls.ESTABLISHED || initialPeer.state!=server.ESTABLISHED { print(initial.error);print(initialPeer.error);return 1 }
+        ticket=tls.takeTicket(initial);if !ticket.valid { return 2 }
+    }
+    let c=tls.quicClient("localhost",randomBytes(64),"minyar-test",Bytes(),[root],[device],deviceKey)
+    if resumed { c=tls.quicClientResumed("localhost",randomBytes(64),"minyar-test",Bytes(),[root],[device],deviceKey,ticket) }
+    let s=server.quicServerWithTickets(randomBytes(64),"minyar-test",Bytes(),[identity],key,[root],true,store)
+    server.receiveHandshake(s,tls.takeOutgoing(c),0)
+    let hello=server.takeInitial(s);let flight=server.takeHandshake(s)
+    if hello.length==0 || flight.length<36 || s.state!=server.HANDSHAKE || (resumed && !s.resumed) { print(s.error);return 3 }
+    let clientSide=mode=="client-full-finished" || mode=="client-resumed-finished"
+    let held=Bytes()
+    if clientSide || mode=="control" {
+        tls.receiveHandshake(c,hello,0);tls.receiveHandshake(c,flight,1)
+        if c.state!=tls.ESTABLISHED { print(c.error);return 4 }
+        held=tls.takeOutgoing(c)
+        if held.length<36 { return 5 }
+        server.receiveHandshake(s,held.slice(0,held.length-36),1)
+        if s.state!=server.HANDSHAKE || !s.authenticated { print(s.error);return 6 }
+        held=held.slice(held.length-36,held.length)
+    } else if mode!="server-resumed-hello" {
+        tls.receiveHandshake(c,hello,0);tls.receiveHandshake(c,flight.slice(0,flight.length-36),1)
+        if c.state!=tls.HANDSHAKE || !c.authenticated { print(c.error);return 7 }
+        held=flight.slice(flight.length-36,flight.length)
+    }
+    if mode!="control" {
+        let eventLoop=errors.integerValue(loop.create())
+        while trust.currentTimeMilliseconds()<=expires+1000 { loop.wait(eventLoop,100,1) }
+        loop.close(eventLoop)
+    }
+    if clientSide || mode=="control" {
+        server.receiveHandshake(s,held,1)
+        if mode=="control" { if s.state!=server.ESTABLISHED { print(s.error);return 8 } }
+        else if s.state!=server.FAILED || s.authenticated { print("expired client identity accepted authentic delayed Finished: "+mode);return 14 }
+    } else {
+        if mode=="server-resumed-hello" {
+            tls.receiveHandshake(c,hello,0)
+            if c.state!=tls.FAILED || c.authenticated { print("expired cached identity authenticated at ServerHello");return 13 }
+            tls.receiveHandshake(c,flight,1)
+        }
+        else { tls.receiveHandshake(c,held,1) }
+        if c.state!=tls.FAILED || c.authenticated { print("expired server identity accepted authentic delayed flight: "+mode);return 12 }
+    }
+    print("TLS delayed authentic handshake: "+mode+" passed")
+    return 0
+}
