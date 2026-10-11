@@ -6,6 +6,7 @@ policy evidence; an unknown peer policy is a coverage limitation, not a failure.
 No endpoint implementation, runner dissector or tolerance is reused.
 """
 import argparse
+from fractions import Fraction
 import hashlib
 import hmac
 import ipaddress
@@ -79,7 +80,18 @@ def capture(data):
             body = block[8:-4]
             if kind == 1:
                 link,reserved,snaplen = struct.unpack(endian+"HHI",need(body,0,8))
-                interfaces.append((link,snaplen))
+                denominator=1000000;time_offset=0;seen=set()
+                for option,value in options(body[8:],endian):
+                    if option in (9,14):
+                        if option in seen:raise CoverageError("duplicate pcapng timestamp option")
+                        seen.add(option)
+                    if option==9:
+                        if len(value)!=1:raise CoverageError("invalid pcapng timestamp resolution")
+                        denominator=(1<<(value[0]&127)) if value[0]&128 else 10**value[0]
+                    elif option==14:
+                        if len(value)!=8:raise CoverageError("invalid pcapng timestamp offset")
+                        time_offset=struct.unpack(endian+"q",value)[0]
+                interfaces.append((link,snaplen,denominator,time_offset))
             elif kind == 6:
                 interface,high,low,caplen,original = struct.unpack(endian+"IIIII",need(body,0,20))
                 if interface >= len(interfaces):raise CoverageError("unknown pcapng interface")
@@ -91,7 +103,10 @@ def capture(data):
                     if option==4 and (len(value)!=8 or struct.unpack(endian+"Q",value)[0]):
                         raise CoverageError("capture reports dropped packets")
 
-                yield {"offset":at,"timestamp":[high,low],"interface":interface,"section":section,
+                denominator,time_offset=interfaces[interface][2:]
+                exact=Fraction((high<<32)|low,denominator)+time_offset
+                yield {"offset":at,"timestamp":[high,low],"timestamp_exact":[exact.numerator,exact.denominator],
+                       "timestamp_resolution":[1,denominator],"timestamp_offset_seconds":time_offset,"interface":interface,"section":section,
                        "linktype":interfaces[interface][0],"frame":frame}
             elif kind==5:
                 interface,high,low=struct.unpack(endian+"III",need(body,0,12))
@@ -110,6 +125,7 @@ def capture(data):
                     b"\x4d\x3c\xb2\xa1":"<",b"\xa1\xb2\x3c\x4d":">"}
         if magic not in variants:raise CoverageError("unsupported capture format")
         endian = variants[magic]
+        denominator=1000000000 if magic in (b"\x4d\x3c\xb2\xa1",b"\xa1\xb2\x3c\x4d") else 1000000
         major,minor,zone,sigfigs,snaplen,linktype = struct.unpack(endian+"HHiIII",need(data,4,20))
         if (major,minor)!=(2,4):raise CoverageError("unsupported pcap version")
         at = 24
@@ -117,7 +133,10 @@ def capture(data):
             seconds,fraction,caplen,original = struct.unpack(endian+"IIII",need(data,at,16))
             if caplen != original:raise CoverageError("truncated pcap packet")
             if snaplen and caplen>snaplen:raise CoverageError("pcap packet exceeds snapshot length")
-            yield {"offset":at,"timestamp":[seconds,fraction],"interface":0,"section":0,
+            if fraction>=denominator:raise CoverageError("invalid pcap subsecond timestamp")
+            exact=Fraction(seconds*denominator+fraction,denominator)
+            yield {"offset":at,"timestamp":[seconds,fraction],"timestamp_exact":[exact.numerator,exact.denominator],
+                   "timestamp_resolution":[1,denominator],"timestamp_offset_seconds":0,"interface":0,"section":0,
                    "linktype":linktype & 0xffff,"frame":need(data,at+16,caplen)}
             at += 16+caplen
 
@@ -360,8 +379,11 @@ class Ledger:
 def analyze(capture_bytes,keylogs,server_addresses,port=443,policy="peer-unknown",expected_connections=1):
     server_addresses={str(ipaddress.ip_address(address)) for address in server_addresses}
     keys=HandshakeKeys(keylogs);attribution=Attribution();ledger=Ledger(policy)
-    interface=None;duplicates=set();issued_handshake={};closing_connections=set();uncertain_handshake=set();limitations=[]
+    interface=None;duplicates=set();issued_handshake={};closing_connections=set();uncertain_handshake=set();limitations=[];last_time=None
     for index,record in enumerate(capture(capture_bytes)):
+        exact_time=Fraction(*record["timestamp_exact"])
+        if last_time is not None and exact_time<last_time:raise CoverageError("capture timestamps decrease in file order")
+        last_time=exact_time
         parsed=udp(record["frame"],record["linktype"])
         if parsed is None:continue
         endpoint,payload=parsed
@@ -408,6 +430,7 @@ def analyze(capture_bytes,keylogs,server_addresses,port=443,policy="peer-unknown
                     authentication=found
         ledger.record(connection,route,direction,len(payload),authentication,
                       capture_index=index,file_offset=record["offset"],timestamp=record["timestamp"],
+                      timestamp_exact=record["timestamp_exact"],timestamp_resolution=record["timestamp_resolution"],timestamp_offset_seconds=record["timestamp_offset_seconds"],
                       interface=record["interface"],section=record["section"],udp_payload_sha256=sha(payload),frame_sha256=sha(record["frame"]),
                       packet_types=[entry["type"] for entry in entries],boundary_rejections=rejected)
     if not ledger.rows:raise CoverageError("no selected server UDP datagrams")

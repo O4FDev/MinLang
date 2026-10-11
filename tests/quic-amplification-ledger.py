@@ -18,7 +18,8 @@ CASES=("exact3x","one-byte-over","forged-handshake","invalid-handshake-frame","c
        "capture-duplicate","real-retransmission","truncated-pcap","pcapng","big-endian-pcap",
        "ipv6","aes256-handshake","chacha-handshake","rfc-chacha-vector","peer-policy-unknown",
        "server-before-credit","missing-authenticated-boundary","closing-handshake","ack-never-sent","ack-issued-handshake","missing-server-keylog","pcapng-capture-loss","pcapng-dropcount","pcapng-multiple-interface","handshake-replay-same-route","handshake-replay-new-route",
-       "fresh-handshake-new-route","nonminimal-frame-type","crypto-end-overflow","crypto-wide-length")
+       "fresh-handshake-new-route","nonminimal-frame-type","crypto-end-overflow","crypto-wide-length","pcap-time-decrease","pcapng-time-decrease",
+       "pcap-nanoseconds","pcapng-decimal-resolution","pcapng-binary-resolution","pcapng-time-offset","pcap-invalid-subsecond")
 CLIENT=b"client01";SERVER=b"server01";ORIGINAL=b"original"
 SECRET=bytes(range(32));RANDOM=bytes(range(32,64))
 CLIENT2=b"client02";SERVER2=b"server02"
@@ -83,25 +84,28 @@ def wire(payload,direction="client",port=12345,ipv6=False):
     return header+udp
 
 
-def pcap(frames,endian="<",duplicate=False):
-    magic=b"\xd4\xc3\xb2\xa1" if endian=="<" else b"\xa1\xb2\xc3\xd4"
+def pcap(frames,endian="<",duplicate=False,stamps=None,nanoseconds=False):
+    magic=(b"\x4d\x3c\xb2\xa1" if endian=="<" else b"\xa1\xb2\x3c\x4d") if nanoseconds else (b"\xd4\xc3\xb2\xa1" if endian=="<" else b"\xa1\xb2\xc3\xd4")
     data=magic+struct.pack(endian+"HHiIII",2,4,0,0,65535,101)
     for index,frame in enumerate(frames):
         stamp=index if not duplicate or index!=1 else 0
-        data+=struct.pack(endian+"IIII",1,stamp,len(frame),len(frame))+frame
+        seconds,fraction=stamps[index] if stamps is not None else (1,stamp)
+        data+=struct.pack(endian+"IIII",seconds,fraction,len(frame),len(frame))+frame
     return data
 
 
-def pcapng(frames,drop=0,epbdrop=0,multiple=False):
+def pcapng(frames,drop=0,epbdrop=0,multiple=False,stamps=None,resolution=6,offset=0):
     def block(kind,body):
         body+=bytes((-len(body))%4);size=len(body)+12
         return struct.pack("<II",kind,size)+body+struct.pack("<I",size)
-    data=block(0x0a0d0d0a,struct.pack("<IHHq",0x1a2b3c4d,1,0,-1))+block(1,struct.pack("<HHI",101,0,65535))
+    interface_options=struct.pack("<HHB",9,1,resolution)+bytes(3)+struct.pack("<HHq",14,8,offset)+bytes(4)
+    data=block(0x0a0d0d0a,struct.pack("<IHHq",0x1a2b3c4d,1,0,-1))+block(1,struct.pack("<HHI",101,0,65535)+interface_options)
     if multiple:data+=block(1,struct.pack("<HHI",101,0,65535))
     for index,frame in enumerate(frames):
         padding=bytes((-len(frame))%4)
         option=struct.pack("<HHQ",4,8,epbdrop)+bytes(4) if epbdrop and index==0 else b""
-        data+=block(6,struct.pack("<IIIII",1 if multiple and index==1 else 0,0,index+1,len(frame),len(frame))+frame+padding+option)
+        stamp=stamps[index] if stamps is not None else index+1
+        data+=block(6,struct.pack("<IIIII",1 if multiple and index==1 else 0,stamp>>32,stamp&0xffffffff,len(frame),len(frame))+frame+padding+option)
     data+=block(5,struct.pack("<IIIHHQ",0,0,len(frames)+1,5,8,drop)+bytes(4))
     return data
 
@@ -177,6 +181,13 @@ def fixtures(case):
     if case in ("pcapng-capture-loss","pcapng-dropcount","pcapng-multiple-interface"):expected="coverage-limited"
     frames=[wire(payload,direction,port,case=="ipv6") for direction,payload,port in sequence]
     data=pcapng(frames,drop=1 if case=="pcapng-capture-loss" else 0,epbdrop=1 if case=="pcapng-dropcount" else 0,multiple=case=="pcapng-multiple-interface") if case.startswith("pcapng") else pcap(frames,">" if case=="big-endian-pcap" else "<",case=="capture-duplicate")
+    if case=="pcap-time-decrease":data=pcap(frames,stamps=[(1,2),(1,1)]+[(1,index+3) for index in range(len(frames)-2)]);expected="coverage-limited"
+    elif case=="pcapng-time-decrease":data=pcapng(frames,stamps=[2,1]+list(range(3,len(frames)+1)));expected="coverage-limited"
+    elif case=="pcap-invalid-subsecond":data=pcap(frames,stamps=[(1,1000000)]+[(2,index) for index in range(1,len(frames))]);expected="coverage-limited"
+    elif case=="pcap-nanoseconds":data=pcap(frames,stamps=[(1,123456789+index) for index in range(len(frames))],nanoseconds=True)
+    elif case=="pcapng-decimal-resolution":data=pcapng(frames,stamps=list(range(123456789,123456789+len(frames))),resolution=9)
+    elif case=="pcapng-binary-resolution":data=pcapng(frames,stamps=list(range(129,129+len(frames))),resolution=0x8a)
+    elif case=="pcapng-time-offset":data=pcapng(frames,resolution=9,offset=60)
     if case=="truncated-pcap":data=data[:-1]
     return data,logs,connection_count,policy,expected
 
@@ -221,6 +232,10 @@ def run_case(case):
             "invalid_plaintext_not_boundary":report["rows"][4]["authentication"] is None,
             "discarded_udp_credit_counted":report["rows"][4]["received"]==1200+len(handshake(payload=b"\x40\x01\0\0" if case=="nonminimal-frame-type" else b"\x06"+bytes([255])*8+b"\x01z")),
         }
+    expected_time={"pcap-nanoseconds":[1123456789,1000000000],"pcapng-decimal-resolution":[123456789,1000000000],
+                   "pcapng-binary-resolution":[129,1024],"pcapng-time-offset":[60000000001,1000000000]}
+    if case in expected_time and "rows" in report:
+        report["control_checks"]={"exact_declared_timestamp_resolution":report["rows"][0].get("timestamp_exact")==expected_time[case]}
     return data,logs,report,expected
 
 
