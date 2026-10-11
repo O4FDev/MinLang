@@ -59,6 +59,48 @@ function inspect(receiver: quic.Connection, packets: List<Bytes>): Ack {
     }
     return result
 }
+record WireSize { valid: Boolean; maximum: Integer; packets: Integer; acknowledgements: Integer; streams: Integer; data: Bytes; fins: Integer; elicitingBytes: Integer; challenges: Integer }
+function wireSize(receiver: quic.Connection, packets: List<Bytes>): WireSize {
+    let result = WireSize { valid: true; maximum: 0; packets: packets.length; acknowledgements: 0; streams: 0; data: Bytes(); fins: 0; elicitingBytes: 0; challenges: 0 }
+    for data in packets {
+        result.maximum = max(result.maximum,data.length)
+        let header = wire.header(data,0,receiver.local.length)
+        if !header.valid || header.kind != wire.ONE_RTT { result.valid = false; return result }
+        let opened = protection.unprotect(receiver.spaces[2].read,data,header.numberOffset,-1)
+        if !opened.valid { result.valid = false; return result }
+        let parsed = wire.frames(opened.payload)
+        if !parsed.valid { result.valid = false; return result }
+        let eliciting = false
+        for frame in parsed.frames {
+            if frame.type == 2 || frame.type == 3 { result.acknowledgements += 1 }
+            if frame.type == 26 || frame.type == 27 { result.challenges += 1 }
+            if frame.type >= 8 && frame.type <= 15 { result.streams += 1; result.data.addBytes(frame.data); if frame.fin { result.fins += 1 } }
+            if frame.type != 0 && frame.type != 2 && frame.type != 3 && frame.type != 28 && frame.type != 29 { eliciting = true }
+        }
+        if eliciting { result.elicitingBytes += data.length }
+    }
+    return result
+}
+function flightBytes(c: quic.Connection): Integer {
+    let result = 0
+    for space in c.spaces { for sent in space.sent { result += sent.bytes } }
+    return result
+}
+function advertisedLimit(c: quic.Connection): Integer {
+    let decoded = wire.parameters(c.clientTLS.peerTransportParameters,true)
+    if !decoded.valid { return -1 }
+    for parameter in decoded.parameters { if parameter.id == 3 { return parameter.integer } }
+    return 65527
+}
+function gapped(s: quic.Connection,c: quic.Connection,pn: Integer,count: Integer,path: Integer,now: Integer) {
+    for index in 0..count { quic.receivePath(c,packet(s,2,pn + index * 2,crypto.fromHex("01")),path,now) }
+}
+function bytes(count: Integer): Bytes {
+    let data = Bytes(); data.resize(count)
+    for index in 0..count { data[index] = index & 255 }
+    return data
+}
+
 function main(): Integer {
     let root = readBytesFile(argument(0)); let identity = readBytesFile(argument(1)); let key = readBytesFile(argument(2))
     let client = readBytesFile(argument(3)); let clientKey = readBytesFile(argument(4)); let mode = 0; for digit in argument(5) { mode = mode * 10 + Integer(digit) - 48 }
@@ -325,6 +367,79 @@ function main(): Integer {
             if state.ack || state.ackDeadline != -1 || state.ackCount != 0 || state.ackQueued {
                 print("terminal state retained ACK scheduling"); return 49
             }
+        }
+    }
+    if mode >= 29 && mode <= 35 {
+        let limit = advertisedLimit(c)
+        if limit != 1200 || c.congestion.mtu != 1200 { return 90 }
+        let at = 2000; let route = 0; let count = 90
+        if mode == 30 || mode == 35 { count = 256 }
+        if mode == 34 {
+            if !errors.booleanOk(quic.probePath(c,7,1600)) { return 90 }
+            for tick in 0..20 {
+                let clock = 1600 + tick * 5
+                for outgoing in quic.pollDatagrams(c,clock) { quic.receivePath(s,outgoing.data,outgoing.pathId,clock) }
+                for outgoing in quic.pollDatagrams(s,clock) { quic.receivePath(c,outgoing.data,outgoing.pathId,clock) }
+            }
+            if c.activePath != 7 || c.pending.length != 0 || c.flight != 0 { return 90 }
+            route = 7; pn = max(s.spaces[2].next,c.spaces[2].largest + 1)
+        }
+        if mode == 32 { route = 7 }
+        gapped(s,c,pn,count,route,at)
+        if c.spaces[2].ranges.length < count || !c.spaces[2].ack || quic.nextTimer(c) != at { return 90 }
+        if mode == 31 || mode == 32 {
+            if mode == 31 && !errors.booleanOk(quic.ping(c)) { return 90 }
+            let outgoing = quic.pollDatagrams(c,at); let packets: List<Bytes> = []
+            for entry in outgoing { if entry.pathId != route { return 55 }; packets.add(entry.data) }
+            let result = wireSize(s,packets)
+            if !result.valid || result.maximum > limit || result.acknowledgements != 1 ||
+               result.packets != 1 || c.flight != result.elicitingBytes || c.flight != flightBytes(c) ||
+               (mode == 32 && (result.maximum != 1200 || result.challenges != 1)) { print("long ACK control packet exceeded MTU"); return 52 }
+            if c.spaces[2].ack || c.pending.length != 0 { return 52 }
+        } else if mode == 33 {
+            // Retain the long ACK history but send its immediate ACK first.
+            let history = quic.poll(c,at)
+            if wireSize(s,history).maximum > limit || c.spaces[2].ack { return 90 }
+            let id = errors.integerValue(quic.openStream(c,false)); let body = bytes(1000)
+            if errors.integerValue(quic.writeStream(c,id,body,true)) != 1000 { return 90 }
+            let first = quic.poll(c,at + 1)
+            if first.length != 1 || wireSize(s,first).maximum > limit { return 90 }
+            // The original STREAM is genuinely sent and deliberately dropped.
+            let retryAt = quic.nextTimer(c); let receivedAt = retryAt - 5
+            if receivedAt <= at + 1 { return 90 }
+            inject(s,c,pn + (count - 1) * 2 + 1,ping,receivedAt)
+            if quic.nextTimer(c) != retryAt { return 90 }
+            let retried = quic.poll(c,retryAt); let result = wireSize(s,retried)
+            if !result.valid || result.maximum > limit || result.streams != 1 || crypto.hex(result.data) != crypto.hex(body) ||
+               c.flight != flightBytes(c) { print("PTO ACK and STREAM exceeded MTU " + Text(result.maximum)); return 53 }
+            let deadline = receivedAt + 25
+            if !c.spaces[2].ack || c.spaces[2].ackDeadline != deadline || quic.nextTimer(c) != deadline { return 54 }
+            if wireSize(s,quic.poll(c,deadline - 1)).acknowledgements != 0 { return 54 }
+            let answer = wireSize(s,quic.poll(c,deadline))
+            if !answer.valid || answer.maximum > limit || answer.acknowledgements != 1 || c.spaces[2].ack { return 54 }
+        } else {
+            let id = errors.integerValue(quic.openStream(c,false)); let length = 1000
+            if mode == 30 { length = 3000 }
+            let body = bytes(length)
+            if errors.integerValue(quic.writeStream(c,id,body,true)) != length { return 90 }
+            if mode == 35 {
+                c.addressValidated = false; c.paths[0].validated = false; c.receivedBytes = 0; c.paths[0].received = 0
+                for clock in at..at + 3 {
+                    if quic.poll(c,clock).length != 0 || c.pending.length != 2 || !c.spaces[2].ack { return 56 }
+                }
+                c.addressValidated = true; c.paths[0].validated = true; at += 3
+            }
+            let outgoing = quic.pollDatagrams(c,at); let packets: List<Bytes> = []
+            for entry in outgoing { if entry.pathId != route { return 55 }; packets.add(entry.data) }
+            let result = wireSize(s,packets)
+            if !result.valid || result.maximum > limit { print("ACK and STREAM exceeded MTU " + Text(result.maximum)); return 50 }
+            if result.acknowledgements != 1 || result.streams != (length + 999) / 1000 || result.fins != 1 ||
+               crypto.hex(result.data) != crypto.hex(body) || c.flight != result.elicitingBytes || c.flight != flightBytes(c) ||
+               c.spaces[2].ack || c.pending.length != 0 { return 51 }
+            for data in packets { quic.receivePath(s,data,route,at) }
+            let read = quic.readStream(s,id)
+            if !errors.bytesOk(read) || crypto.hex(errors.bytesValue(read)) != crypto.hex(body) { return 51 }
+            if wireSize(s,quic.poll(c,at + 1)).acknowledgements != 0 { return 51 }
         }
     }
     print("ACK case " + Text(mode)); return 0
