@@ -415,6 +415,60 @@ output.write_bytes(b'complete executable')
         self.assertIn('-lm', run.call_args.args[0])
         self.assertEqual(self.output.read_text(), 'complete executable')
 
+    def test_appkit_managed_cleanup_selection_and_native_cache(self):
+        spec = importlib.util.spec_from_file_location('driver', ROOT / 'tools/clang-driver.py')
+        driver = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(driver)
+        llvm = self.work / 'app.ll'
+        argv = ['clang-driver.py', 'link', str(self.project), str(llvm),
+                'runtime.o', str(self.output), '0']
+        macro = '-DMINYAR_APP_MANAGED_CLEANUP=1'
+        variants = {}
+        cases = [
+            ('ordinary', ['macos', 'net'], '', False),
+            ('cycle', ['macos', 'net'], '; minyar-cycle-runtime: 1\n', True),
+            ('callback', ['macos', 'net'], '; minyar-callback-runtime: 1\n', True),
+            ('callback-library', ['macos', 'net', 'callbackruntime'], '', True),
+            ('ordinary-warm', ['macos', 'net'], '', False),
+            ('cycle-without-appkit', ['net'], '; minyar-cycle-runtime: 1\n', False),
+            ('plain', [], '', False),
+        ]
+        environment = dict(self.env, MINYAR_CLANG_FLAGS='-O0',
+                           MINYAR_NATIVE_FLAGS='-O1 -DCONTROL=1')
+        for label, libraries, marker, managed_app in cases:
+            with self.subTest(case=label):
+                llvm.write_text(marker + ''.join('; minyar-native-library: ' + name + '\n'
+                                                for name in libraries))
+                self.log.write_text('')
+                with patch.dict(driver.os.environ, environment, clear=True), \
+                     patch.object(driver.platform, 'system', return_value='Darwin'), \
+                     patch.object(driver.sys, 'argv', argv), \
+                     patch.object(driver, 'cycle_runtime_object', return_value='managed-runtime.o') as runtime:
+                    driver.main()
+                calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+                link = calls[-1]
+                self.assertNotIn(macro, link, 'cleanup hooks belong only in native objects')
+                self.assertEqual(runtime.call_count, int(bool(marker or 'callbackruntime' in libraries)))
+                app_objects = [arg for arg in link if '/native/macos-' in arg]
+                if 'macos' in libraries:
+                    self.assertEqual(len(app_objects), 1)
+                    variants[label] = app_objects[0]
+                    app_compiles = [args for args in calls if any(arg.endswith('/native/macos.m')
+                                                                   for arg in args)]
+                    if app_compiles:
+                        self.assertEqual(app_compiles[0].count(macro), int(managed_app))
+                        self.assertIn('-DCONTROL=1', app_compiles[0])
+                        self.assertIn('-DMINYAR_APP_EVENT_LOOP=1', app_compiles[0])
+                    else:
+                        self.assertIn(label, ('callback', 'callback-library', 'ordinary-warm'))
+                else:
+                    self.assertEqual(app_objects, [])
+                    self.assertFalse(any(macro in args for args in calls))
+        self.assertNotEqual(variants['ordinary'], variants['cycle'])
+        self.assertEqual(variants['cycle'], variants['callback'])
+        self.assertEqual(variants['cycle'], variants['callback-library'])
+        self.assertEqual(variants['ordinary'], variants['ordinary-warm'])
+
     def test_quoted_flags_and_globs_are_literal_arguments(self):
         (self.work / 'expansion-must-not-happen').touch()
         flags = '-O1 ' + shlex.quote('-DNAME=two words') + ' expansion-* ' + shlex.quote('$(touch injected)')
