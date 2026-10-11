@@ -20,6 +20,8 @@ def main():
     parser.add_argument('--sanitize', action='store_true')
     parser.add_argument('--legacy-service', action='store_true')
     parser.add_argument('--quick', action='store_true')
+    parser.add_argument('--nodes', type=int, nargs='+', choices=[32, 2048, 4096],
+                        default=[32, 2048, 4096])
     parser.add_argument('--evidence', type=Path)
     args = parser.parse_args()
     output = args.evidence or ROOT / 'build/cycle-progress'
@@ -30,7 +32,7 @@ def main():
               ROOT / 'tools/cycle_runtime.py', ROOT / 'runtime/minyar_runtime.c',
               *sorted((ROOT / 'runtime').glob('*.h'))]
     report = {'passed': False, 'sanitize': args.sanitize,
-              'legacy_service': args.legacy_service,
+              'legacy_service': args.legacy_service, 'nodes': args.nodes,
               'inputs': {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
                          for p in inputs}, 'cases': []}
     flags = (['-O1', '-g', '-fsanitize=address,undefined', '-fno-omit-frame-pointer']
@@ -52,7 +54,8 @@ def main():
                     f'-DMINYAR_RC_POLL_BUDGET={budget}']
                 if args.legacy_service: command += ['-DMINYAR_CYCLE_LEGACY_SERVICE=1']
                 command += [str(ROOT / 'tests/cycle-progress.c'), '-lm', '-o', str(binary)]
-                for phase, argv in [('compile', command), ('run', [str(binary), '1'])]:
+                for phase, argv in [('compile', command), *[
+                    (f'run-n{nodes}', [str(binary), '1', str(nodes)]) for nodes in args.nodes]]:
                     result = subprocess.run(argv, cwd=ROOT, env=environment, capture_output=True,
                                             text=True, timeout=120)
                     (output / f'{label}-{phase}.stdout').write_text(result.stdout)
