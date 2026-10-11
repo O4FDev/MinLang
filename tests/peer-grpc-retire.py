@@ -19,7 +19,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='minyar-grpc-retire-') as folder:
         folder=Path(folder); binary=folder/'probe'; subprocess.run([str(ROOT/'minyar'),str(ROOT/'tests/peer-grpc-retire.min'),'-o',str(binary)],env=env,check=True,timeout=240)
         initial=folder/'initial'; reset=folder/'reset'; output=folder/'output'; reset.write_bytes(b'\0\0\4\3\0'+struct.pack('>II',1,8))
-        for mode in ('normal','deadline','cancel','trap'):
+        for mode in ('normal','early','deadline','cancel','trap'):
             client=peer.client('500m' if mode=='deadline' else None); client.send_data(1,peer.envelope(peer.opened()),end_stream=mode=='normal'); initial.write_bytes(client.data_to_send())
             result=subprocess.run([str(binary),str(initial),str(output),mode,str(reset)],env=env,capture_output=True,text=True,timeout=60)
             if mode=='trap':
@@ -27,9 +27,12 @@ def main():
                 continue
             assert result.returncode==0 and result.stdout=='RETIRED\n' and result.stderr=='',(mode,result.stdout,result.stderr)
             events=client.receive_data(output.read_bytes())
-            if mode=='normal':
+            if mode in ('normal','early'):
                 messages=peer.messages(events); assert messages[0].status.code==0 and messages[1].data==b'queued forwarding bytes'
                 assert any(isinstance(e,h2.events.TrailersReceived) and ('grpc-status','0') in e.headers for e in events)
+                if mode=='early':
+                    resets=[event for event in events if isinstance(event,h2.events.StreamReset)]
+                    assert len(resets)==1 and resets[0].error_code==0,'complete response before request EOF must use NO_ERROR, not CANCEL'
             elif mode=='deadline':
                 assert not any(isinstance(e,h2.events.DataReceived) for e in events),'deadline forwarded queued data'
                 assert any(isinstance(e,h2.events.TrailersReceived) and ('grpc-status','4') in e.headers for e in events)
