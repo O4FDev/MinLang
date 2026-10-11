@@ -76,6 +76,33 @@ def mock_cleanup(case,root):
     if case=="successful-cleanup":
         simulator=state["containers"]["1"*64]
         simulator["HostConfig"]["CapAdd"]=["CAP_NET_ADMIN","CAP_NET_RAW"]
+        for role,identity in (("sim","1"*64),("server","2"*64),("client","3"*64)):
+            state["containers"][identity]["State"]={"Running":False,"ExitCode":0 if role=="client" else 143}
+        raw=owner.paths["artifacts"]/"daemon-commands"/"compose-output";raw.mkdir(parents=True)
+        stdout=raw/"stdout";stderr=raw/"stderr"
+        stdout.write_text(owner.project+"-client exited with code 0\n")
+        stderr.write_text("Compose Stopping Aborting on container exit...\n"+"".join(
+            "Container "+owner.project+"-"+role+" Stopping\nContainer "+owner.project+"-"+role+" Stopped\n"
+            for role in ("sim","server")))
+        receipt={"argv":["/usr/bin/docker","compose","--project-name",owner.project,"--file",str(owner.paths["compose_path"]),
+                         "--env-file",str(owner.paths["runner_root"]/"empty.env"),"up","--abort-on-container-exit","sim","client","server"],
+                 "status":0,"timed_out":False,"primary_exception":None,"finalization_errors":[],
+                 "lifetime":{"state":"closed","certified":True},
+                 "stdout":adapter.binding(stdout),"stderr":adapter.binding(stderr)}
+        intent={"project":owner.project,"nonce":owner.nonce,"state":"closed","certified":True,
+                "created_ids":list(state["containers"]),"up_receipt":receipt}
+        adapter.atomic_json(owner.paths["artifacts"]/"create-admission.json",intent)
+        for field,value in (("certified",False),("created_ids",[])):
+            mutant=json.loads(json.dumps(intent));mutant[field]=value
+            adapter.atomic_json(owner.paths["artifacts"]/"create-admission.json",mutant)
+            strict_capabilities=not adapter.recorded_compose_stop(owner,"1"*64,simulator,list(state["containers"].values()),None) and strict_capabilities
+        mutant=json.loads(json.dumps(intent));mutant["up_receipt"]["status"]=1
+        adapter.atomic_json(owner.paths["artifacts"]/"create-admission.json",mutant)
+        strict_capabilities=not adapter.recorded_compose_stop(owner,"1"*64,simulator,list(state["containers"].values()),None) and strict_capabilities
+        adapter.atomic_json(owner.paths["artifacts"]/"create-admission.json",intent)
+        original_stderr=stderr.read_bytes();stderr.write_bytes(original_stderr+b"unbound edit")
+        strict_capabilities=not adapter.recorded_compose_stop(owner,"1"*64,simulator,list(state["containers"].values()),None) and strict_capabilities
+        stderr.write_bytes(original_stderr)
         for invalid in (["CAP_NET_ADMIN","CAP_NET_RAW","CAP_SYS_ADMIN"],
                         ["CAP_NET_ADMIN","CAP_NET_ADMIN"],
                         ["CAP_NET_ADMIN","NET_RAW"], []):

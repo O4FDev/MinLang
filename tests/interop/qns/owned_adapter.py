@@ -669,6 +669,41 @@ class JsonDaemon:
         self.action("remove_network",identity);state=self.read();del state["networks"][identity];atomic_json(self.path,state)
 
 
+
+def recorded_compose_stop(spec,identity,entry,entries,unsupported_compliance):
+    """Distinguish a bound Compose SIGTERM stop from an unexplained exit."""
+    if entry["State"]["ExitCode"]!=143:return False
+    try:
+        intent=json.loads((spec.paths["artifacts"]/"create-admission.json").read_bytes())
+        if intent.get("project")!=spec.project or intent.get("nonce")!=spec.nonce or intent.get("state")!="closed" or intent.get("certified") is not True:return False
+        if set(intent.get("created_ids",[]))!={value["Id"] for value in entries} or identity not in intent["created_ids"]:return False
+        receipt=intent["up_receipt"];argv=receipt["argv"]
+        prefix=[argv[0],"compose","--project-name",spec.project,"--file",str(spec.paths["compose_path"]),"--env-file",str(spec.paths["runner_root"]/"empty.env"),"up"]
+        if argv[:len(prefix)]!=prefix or "--abort-on-container-exit" not in argv[len(prefix):]:return False
+        if receipt["status"] not in (0,127) or receipt["timed_out"] is not False or receipt["primary_exception"] is not None or receipt["finalization_errors"] or receipt["lifetime"].get("state")!="closed" or receipt["lifetime"].get("certified") is not True:return False
+        streams={}
+        for name in ("stdout","stderr"):
+            bound=receipt[name];path=Path(bound["path"])
+            if path.resolve()!=path or path.is_symlink() or spec.paths["artifacts"]/"daemon-commands" not in path.parents or stream_binding(path,MAX_BYTES,time.monotonic()+10)!={key:bound[key] for key in ("sha256","bytes")}:return False
+            streams[name]=path.read_text(errors="replace")
+        trigger=False
+        for value in entries:
+            role=spec.container(value);status=value["State"]["ExitCode"]
+            unsupported=False
+            if status==127 and unsupported_compliance is not None and unsupported_compliance.get("role")==role:
+                testcase=unsupported_compliance.get("testcase");env=value.get("Config",{}).get("Env",[])
+                known=("handshake","transfer","retry","resumption","zerortt","multiconnect","rebind-port","rebind-addr","chacha20","keyupdate","connectionmigration")
+                unsupported=isinstance(testcase,str) and bool(testcase) and testcase not in known and env.count("ROLE="+role)==1 and env.count("TESTCASE="+testcase)==1
+            allowed=status==0 or unsupported
+            if role in ("client","server") and role in argv[len(prefix):] and value["State"]["Running"] is False and allowed and status==receipt["status"] and re.search(re.escape(spec.project+"-"+role)+r"\s+exited with code "+str(status)+r"(?:\s|$)",streams["stdout"]):trigger=True
+        if not trigger:return False
+        lines=[line.strip() for line in streams["stderr"].splitlines()]
+        abort=lines.index("Compose Stopping Aborting on container exit...")
+        name=spec.project+"-"+spec.container(entry)
+        return abort<lines.index("Container "+name+" Stopping")<lines.index("Container "+name+" Stopped")
+    except (OSError,ValueError,KeyError,TypeError):return False
+
+
 def cleanup_owned(spec,daemon,root,reason,primary=None,unsupported_compliance=None,abort_first=False,revoke_admission=True):
     root=Path(root);root.mkdir(parents=True,exist_ok=False)
     result={"schema_version":1,"scope":"owned IDs only; mock backend is not actual daemon proof","reason":reason,"project":spec.project,"nonce":spec.nonce,"verified_ids":[],"errors":[],"status":"cleaning",
@@ -676,7 +711,7 @@ def cleanup_owned(spec,daemon,root,reason,primary=None,unsupported_compliance=No
     def error(stage,exception):
         result["errors"].append({"stage":stage,"type":type(exception).__name__,"message":str(exception)})
         if primary is not None and hasattr(primary,"add_note"):primary.add_note(stage+": "+str(exception))
-    owned=[];networks=[];result["states_before_cleanup"]={}
+    owned=[];owned_entries=[];networks=[];result["states_before_cleanup"]={}
     try:result["admission"]=close_admission(spec,revoke=revoke_admission)
     except BaseException as exception:error("create-admission",exception)
 
@@ -689,7 +724,7 @@ def cleanup_owned(spec,daemon,root,reason,primary=None,unsupported_compliance=No
             if entry.get("Id")!=identity:raise OwnershipError("inspect ID mismatch")
             role=spec.container(entry)
             if role in roles:raise OwnershipError("colliding service identities")
-            roles.add(role);owned.append(identity)
+            roles.add(role);owned.append(identity);owned_entries.append(entry)
             state=entry.get("State",{});result["states_before_cleanup"][identity]=state
             if type(state.get("Running")) is not bool or type(state.get("ExitCode")) is not int:raise OwnershipError("endpoint state primitive types differ")
         network_entries=daemon.networks()
@@ -718,7 +753,9 @@ def cleanup_owned(spec,daemon,root,reason,primary=None,unsupported_compliance=No
                 if requested==role and isinstance(testcase,str) and testcase and testcase not in known and env.count("ROLE="+role)==1 and env.count("TESTCASE="+testcase)==1:
                     allowed_unsupported=state["ExitCode"]==127
             except BaseException as exception:error("compliance-reinspection",exception)
-        if not state["Running"] and state["ExitCode"]!=0 and not allowed_unsupported:
+        allowed_compose_stop=not state["Running"] and recorded_compose_stop(spec,identity,daemon.inspect(identity),owned_entries,unsupported_compliance) if state["ExitCode"]==143 else False
+        if allowed_compose_stop:result.setdefault("recorded_compose_stops",[]).append(identity)
+        if not state["Running"] and state["ExitCode"]!=0 and not allowed_unsupported and not allowed_compose_stop:
             error("unexpected-endpoint-exit",CleanupError("endpoint exited before owned stop: "+str(state["ExitCode"])))
         try:daemon.retain(identity,root/(identity+"-before-stop"))
         except BaseException as exception:error("retention",exception)
