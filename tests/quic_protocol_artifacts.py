@@ -29,6 +29,7 @@ class ProtocolArtifacts:
         self.declared_cases = list(declared_cases)
         self.temporary = None
         self.endpoint_commands = []
+        self.endpoints = []
         self.fixture_modules = []
         self.report = None
         self.shared_fixtures = []
@@ -150,6 +151,8 @@ class ProtocolArtifacts:
             raw = []
             for row in [self.evidence.commands[i] for i in commands]+[self.endpoint_commands[i] for i in endpoints]:
                 raw.extend(Path(row[name+"_path"]) for name in ("stdout","stderr") if name+"_path" in row)
+                receipt = row.get("lifecycle",{}).get("receipt",{})
+                raw.extend(Path(receipt[name+"_path"]) for name in ("stdout","stderr") if name+"_path" in receipt)
             roles["raw_output"] = paths(raw)
             result.append({"case":case,"command_indices":commands,"endpoint_indices":endpoints,
                            "fixture_workspace":str(self.workspace),"file_roles":roles,
@@ -170,13 +173,20 @@ class ProtocolArtifacts:
         return self
 
     def __exit__(self, kind, value, traceback):
+        cleanup_failure = None
+        for endpoint in self.endpoints:
+            if not endpoint.stopped:
+                try:
+                    endpoint.stop(primary=value)
+                except BaseException as error:
+                    cleanup_failure = error
         try:
             if self.path is not None:
                 commands = self.evidence.commands
                 self._persist_commands()
                 self.evidence.closed = True
                 files = {p.relative_to(self.path).as_posix(): digest(p) for p in self.path.rglob("*") if p.is_file() and not p.is_symlink() and p.name != "manifest.json"}
-                manifest = {"schema_version":1,"status":"passed" if kind is None and self.passed else "failed",
+                manifest = {"schema_version":1,"status":"passed" if kind is None and cleanup_failure is None and self.passed else "failed",
                     "workspace":str(self.workspace),"inputs":self.inputs,"commands":commands,
                     "endpoint_commands":self.endpoint_commands,"declared_cases":self.declared_cases,"case_inventory":self._case_inventory(),"files":files,
                     "file_bytes":{name:(self.path/name).stat().st_size for name in files}}
@@ -188,6 +198,8 @@ class ProtocolArtifacts:
                 module.subprocess = original
             if self.temporary is not None:
                 self.temporary.cleanup()
+        if cleanup_failure is not None:
+            raise cleanup_failure
 
 
 class EndpointProcess:
@@ -201,17 +213,27 @@ class EndpointProcess:
         self.row = {"argv":list(map(str, command)),"case":case,"peer_timeout_seconds":peer_timeout,"readiness_timeout_seconds":10,
                     "shutdown_grace_seconds":5,"cwd":str(Path.cwd().resolve()),"timed_out":False,"binary_sha256":digest(command[0]),"stdout_path":str(self.paths["stdout"]),"stderr_path":str(self.paths["stderr"])}
         owner.endpoint_commands.append(self.row)
+        self.threads = []
+        self.drain_errors = []
+        for path in self.paths.values():
+            path.write_bytes(b"")
         self.process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE, start_new_session=not windows_host())
-        self.threads = []
-        for name in ("stdout", "stderr"):
-            thread = threading.Thread(target=self._drain, args=(name, getattr(self.process, name)), daemon=True)
-            self.threads.append(thread)
-            thread.start()
+        owner.endpoints.append(self)
+        self.row["pid"] = self.process.pid
+        try:
+            for name in ("stdout", "stderr"):
+                thread = threading.Thread(target=self._drain, args=(name, getattr(self.process, name)), daemon=True)
+                self.threads.append((name, thread))
+                thread.start()
+        except BaseException as error:
+            self.row["startup_exception"] = type(error).__name__
+            self.stop(primary=error)
+            raise
 
     def _drain(self, name, pipe):
         pending = b""
-        with self.paths[name].open("wb") as output:
+        with self.paths[name].open("ab") as output:
             try:
                 while True:
                     data = pipe.read1(65536)
@@ -226,6 +248,8 @@ class EndpointProcess:
                             self.lines.put(line + b"\n")
                 if name == "stdout" and pending:
                     self.lines.put(pending)
+            except BaseException as error:
+                self.drain_errors.append({"stage":name+"-drain","exception":type(error).__name__,"message":str(error)})
             finally:
                 pipe.close()
                 if name == "stdout":
@@ -241,37 +265,127 @@ class EndpointProcess:
         self.row["ready_line_sha256"] = hashlib.sha256(self.consumed).hexdigest()
         return text(self.consumed)
 
-    def stop(self):
+    def _windows_stop(self):
+        native_pid = self.process.pid if os.name == "nt" else int(
+            Path("/proc/"+str(self.process.pid)+"/winpid").read_text().strip())
+        if native_pid <= 0:
+            raise ValueError("invalid owned native process identity")
+        command = ["taskkill.exe", "-F", "-T", "-PID", str(native_pid)]
+        receipt = {"pid":self.process.pid,"native_pid":native_pid,
+                   "pid_source":"popen" if os.name == "nt" else "proc-winpid",
+                   "python_os_name":os.name,"argv":command,"timeout_seconds":10,"attempted":True}
+        self.row["lifecycle"]["receipt"] = receipt
+        result = subprocess.run(command, capture_output=True, timeout=10)
+        receipt["status"] = result.returncode
+        for name, data in (("stdout",result.stdout),("stderr",result.stderr)):
+            path = Path(str(self.paths[name])+".termination.bin")
+            path.write_bytes(data)
+            receipt[name+"_path"] = str(path)
+            receipt[name+"_sha256"] = digest(path)
+            receipt[name+"_bytes"] = len(data)
+        if result.returncode:
+            raise RuntimeError("owned native tree termination failed")
+        # This exact prediction fails closed on an unsupported native mapping;
+        # taskkill success alone never makes an arbitrary target status healthy.
+        # Native/MSYS execution is required before claiming platform coverage.
+
+    def stop(self, *, primary=None):
         if not self.stopped:
-            try:
-                self.row["status_before_shutdown"] = self.process.poll()
-                self.row["owned_termination_requested"] = self.row["status_before_shutdown"] is None
-                if self.row["owned_termination_requested"]:
+            errors = []
+            prior = self.process.poll()
+            requested = prior is None
+            self.row.update(status_before_shutdown=prior, owned_termination_requested=requested)
+            lifecycle = {"healthy_before_shutdown":prior is None or prior == 0,
+                         "termination_strategy":"already-exited","expected_final_status":0,
+                         "escalated":False,"cleanup_errors":errors,"receipt":{}}
+            self.row["lifecycle"] = lifecycle
+            def failure(stage, error):
+                errors.append({"stage":stage,"exception":type(error).__name__,"message":str(error)})
+            def signal_group(signum):
+                pgid = os.getpgid(self.process.pid)
+                if pgid != self.process.pid:
+                    raise RuntimeError("endpoint no longer owns its process group")
+                receipt = lifecycle["receipt"]
+                receipt.update(pid=self.process.pid,pgid=pgid,attempted=True,signal=int(signum),
+                               grace_seconds=5,wait_timed_out=False,result="pending")
+                os.killpg(pgid, signum)
+                receipt["result"] = "sent"
+            if requested:
+                try:
                     if windows_host():
-                        terminate_process_tree(self.process)
+                        lifecycle.update(termination_strategy="windows-taskkill-tree",expected_final_status=1)
+                        self._windows_stop()
                     else:
-                        try:
-                            os.killpg(self.process.pid, signal.SIGTERM)
-                        except ProcessLookupError:
-                            pass
+                        lifecycle.update(termination_strategy="posix-sigterm",expected_final_status=-int(signal.SIGTERM))
+                        signal_group(signal.SIGTERM)
                     try:
                         self.process.wait(timeout=5)
                     except subprocess.TimeoutExpired:
-                        terminate_process_tree(self.process)
-                        self.process.wait(timeout=5)
-            finally:
-                for thread in self.threads:
-                    thread.join(timeout=5)
-                if any(thread.is_alive() for thread in self.threads):
-                    raise RuntimeError("owned endpoint pipe drains did not finish")
-                self.stopped = True
-                self.row.update(status=self.process.returncode, elapsed_seconds=time.monotonic()-self.started)
-                for name, path in self.paths.items():
-                    self.row[name + "_sha256"] = digest(path)
-                    self.row[name + "_bytes"] = path.stat().st_size
+                        lifecycle["receipt"]["wait_timed_out"] = True
+                        raise
+                except BaseException as error:
+                    if not isinstance(error, subprocess.TimeoutExpired):
+                        failure("termination",error)
+                    if self.process.poll() is None:
+                        lifecycle["escalated"] = True
+                        try:
+                            if windows_host():
+                                self._windows_stop()
+                            else:
+                                previous = dict(lifecycle["receipt"])
+                                lifecycle.update(termination_strategy="posix-sigkill-after-grace",expected_final_status=-int(signal.SIGKILL))
+                                signal_group(signal.SIGKILL)
+                                lifecycle["receipt"]["previous"] = previous
+                            self.process.wait(timeout=5)
+                        except BaseException as cleanup_error:
+                            failure("forced-termination",cleanup_error)
+            for name, thread in self.threads:
+                if thread.ident is not None:
+                    try:
+                        thread.join(timeout=5)
+                        if thread.is_alive():
+                            raise RuntimeError("owned endpoint pipe drain did not finish")
+                    except BaseException as error:
+                        failure(name+"-join",error)
+                elif self.process.poll() is not None:
+                    # A failed Thread.start leaves this pipe solely owned here.
+                    try:
+                        pipe = getattr(self.process,name)
+                        with self.paths[name].open("ab") as output:
+                            output.write(pipe.read())
+                        pipe.close()
+                    except BaseException as error:
+                        failure(name+"-unstarted-drain",error)
+            # A first start failure can leave the other stream without a Thread.
+            names = {name for name,_ in self.threads}
+            for name in set(self.paths)-names:
+                pipe = getattr(self.process,name)
+                if self.process.poll() is not None:
+                    try:
+                        with self.paths[name].open("ab") as output:
+                            output.write(pipe.read())
+                        pipe.close()
+                    except BaseException as error:
+                        failure(name+"-unstarted-drain",error)
+            errors.extend(self.drain_errors)
+            complete = self.process.poll() is not None and all(
+                thread.ident is None or not thread.is_alive() for _,thread in self.threads
+            ) and all(getattr(self.process,name).closed for name in self.paths)
+            self.stopped = complete
+            self.row.update(status=self.process.returncode, elapsed_seconds=time.monotonic()-self.started)
+            for name,path in self.paths.items():
+                self.row[name+"_sha256"] = digest(path)
+                self.row[name+"_bytes"] = path.stat().st_size
+            lifecycle.update(cleanup_complete=complete,passed=lifecycle["healthy_before_shutdown"] and
+                             complete and not errors and self.process.returncode == lifecycle["expected_final_status"])
+        if not self.row["lifecycle"]["passed"]:
+            error = RuntimeError("owned endpoint lifecycle failed: "+json.dumps(self.row["lifecycle"],sort_keys=True))
+            if primary is None:
+                raise error
+            if hasattr(primary,"add_note"):
+                primary.add_note(str(error))
+            self.row["primary_exception"] = type(primary).__name__
         output = self.paths["stdout"].read_bytes()
-        # Preserve the previous report's consumed greeting, while the raw
-        # file retains every byte including native Windows CRLF endings.
         if output.startswith(self.consumed):
             output = output[len(self.consumed):]
         return text(output), text(self.paths["stderr"].read_bytes())

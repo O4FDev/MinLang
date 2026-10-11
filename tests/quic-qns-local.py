@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Run already compiled QNS endpoints over local UDP; setup is separate."""
-import argparse,hashlib,hmac,importlib.util,json,os,subprocess
+import argparse,hashlib,hmac,importlib.util,json,os,subprocess,sys
 from quic_protocol_artifacts import ProtocolArtifacts
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
@@ -30,16 +30,15 @@ def main():
    if not a.expect_old_code:command+=["--port="+str(a.port)]
    if case=="preferred":command+=["--preferred-ipv4=7f000001","--preferred-port="+str(a.port+1)]
    server=artifacts.endpoint(command,case+"-server",case=case,peer_timeout=180)
-   greeting=server.ready_line()
-   if greeting!="QNS server ready\n":
-    stdout,stderr=server.stop()
-    raise RuntimeError(("server setup",server.process.returncode,greeting,stdout,stderr))
    try:
+    greeting=server.ready_line()
+    if greeting!="QNS server ready\n":
+     raise RuntimeError(("server setup",server.process.poll(),greeting))
     host="::1" if case=="ipv6" else "127.0.0.1"
     command=[str(a.client.resolve()),str(ca.path("root","der")),host,str(a.port),str(clientlog),str(downloads),testcase,*names]
     c=artifacts.run(command,capture_output=True,text=True,timeout=180,case=case)
    finally:
-    serverout,servererr=server.stop()
+    serverout,servererr=server.stop(primary=sys.exc_info()[1])
    labels=[line.split()[0] for line in clientlog.read_text().splitlines()] if clientlog.exists() else []
    serverlabels=[line.split()[0] for line in serverlog.read_text().splitlines()] if serverlog.exists() else []
    reciprocal=True

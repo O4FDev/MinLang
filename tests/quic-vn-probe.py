@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Reserved-version server probe independent of the disabled runner case."""
-import argparse,hashlib,importlib.util,json,os,socket
+import argparse,hashlib,importlib.util,json,os,socket,sys
 from quic_protocol_artifacts import ProtocolArtifacts
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
@@ -14,10 +14,10 @@ def main():
   artifacts.bind_files("reserved-version","packets",[d/"request.bin",d/"response.bin"]);artifacts.bind_files("reserved-version","keylogs",[d/"keys"])
   command=[str(a.server.resolve()),str(ca.path("server","pk8")),str(ca.path("root","der")),str(d/"keys"),str(www),"transfer",str(ca.path("server","der")),"--port="+str(a.port)]
   server=artifacts.endpoint(command,"vn-server",case="reserved-version",peer_timeout=3)
-  line=server.ready_line()
-  if line!="QNS server ready\n":
-   out,err=server.stop();raise RuntimeError(("server setup",line,out,err))
   try:
+   line=server.ready_line()
+   if line!="QNS server ready\n":
+    raise RuntimeError(("server setup",line))
    source=os.urandom(8);destination=os.urandom(8);reserved=0x0a0a0a0a
    header=b"\xc0"+reserved.to_bytes(4,"big")+bytes([8])+destination+bytes([8])+source
    packet=header+bytes(1200-len(header));(d/"request.bin").write_bytes(packet)
@@ -32,8 +32,8 @@ def main():
    if len(response)>3*len(packet):raise AssertionError("strict3x unvalidated response budget exceeded")
    report={"request_path":"fixtures/request.bin","response_path":"fixtures/response.bin","reserved_version":hex(reserved),"versions":versions,"request_bytes":len(packet),"response_bytes":len(response),"request_sha256":hashlib.sha256(packet).hexdigest(),"response_sha256":hashlib.sha256(response).hexdigest(),"server_sha256":hashlib.sha256(a.server.read_bytes()).hexdigest(),"result":"passed","official_case_disabled":True}
   finally:
-   out,err=server.stop()
-   if err:raise AssertionError(err)
+   out,err=server.stop(primary=sys.exc_info()[1])
+   if err and sys.exc_info()[1] is None:raise AssertionError(err)
   artifacts.publish(report,True)
  print(json.dumps(report))
 if __name__=="__main__":main()
