@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import struct
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -95,6 +96,51 @@ class Packager(unittest.TestCase):
                 bundle.prepare(self.root,self.output,self.main)
         self.assertEqual(self.output.read_bytes(),b'previous artifact')
         self.assertEqual(list(self.lab.glob('.minyar-bundle-*')),[])
+
+    def test_directory_index_hint_can_change_without_changing_the_bundle(self):
+        # Actual Windows R8 changed only empty-directory attributes from
+        # 0x10000010 to 0x10 after enumeration. Reproduce that metadata
+        # contract on other hosts, without calling it Windows verification.
+        empty=self.root/'empty';lstat=Path.lstat;calls=0
+        info=empty.lstat()
+        def observed(path,*args,**kwargs):
+            nonlocal calls
+            current=lstat(path,*args,**kwargs)
+            if path==empty:
+                calls+=1
+                values={name:getattr(info,name) for name in
+                    ('st_dev','st_ino','st_mode','st_size','st_mtime_ns','st_ctime_ns','st_nlink')}
+                values['st_file_attributes']=0x10 | (0x10000000 if calls==1 else 0)
+                return SimpleNamespace(**values)
+            return current
+        with patch.object(Path,'lstat',observed):
+            first=bundle.prepare(self.root,self.output,self.main)
+        second=bundle.prepare(self.root,self.lab/'again.pkg',self.main)
+        self.assertEqual(first,second)
+        self.assertEqual(self.output.read_bytes(),(self.lab/'again.pkg').read_bytes())
+
+    def test_directory_security_attributes_and_identity_still_fail_closed(self):
+        empty=self.root/'empty';lstat=Path.lstat;info=empty.lstat()
+        for changed in [{'st_file_attributes':0x410},{'st_file_attributes':0x11},
+                        {'st_mode':info.st_mode ^ 0o200},{'st_ino':info.st_ino+1}]:
+            calls=0
+            def observed(path,*args,**kwargs):
+                nonlocal calls
+                current=lstat(path,*args,**kwargs)
+                if path==empty:
+                    calls+=1
+                    values={name:getattr(info,name) for name in
+                        ('st_dev','st_ino','st_mode','st_size','st_mtime_ns','st_ctime_ns','st_nlink')}
+                    values['st_file_attributes']=0x10
+                    if calls>1:values.update(changed)
+                    return SimpleNamespace(**values)
+                return current
+            self.output.write_bytes(b'previous artifact')
+            with self.subTest(changed=changed),patch.object(Path,'lstat',observed):
+                with self.assertRaises(ValueError):
+                    bundle.prepare(self.root,self.output,self.main)
+            self.assertEqual(self.output.read_bytes(),b'previous artifact')
+            self.assertEqual(list(self.lab.glob('.minyar-bundle-*')),[])
 
     def test_ambiguous_names_bad_entrypoints_and_embedded_output_refused(self):
         for name in ['../escape','/absolute','NUL','missing','App.app/Contents/Resources/resource with spaces']:
