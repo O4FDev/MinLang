@@ -127,8 +127,20 @@ fn close_time(start: Instant, duration: Duration, id: usize) -> Instant {
     start + duration + Duration::from_secs(10) + Duration::from_millis(id as u64 * 5)
 }
 
-async fn write_hello(send: &mut quinn::SendStream, bytes: &[u8]) -> Result<(), Failure> {
-    tokio::time::timeout(IO_LIMIT, async {
+async fn device_io<F, T, E>(id: usize, stage: &str, limit: Duration, operation: F) -> Result<T, Failure>
+where F: std::future::Future<Output = Result<T, E>>, E: Into<Failure> {
+    match tokio::time::timeout(limit, operation).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => {
+            let cause: Failure = error.into();
+            Err(format!("device-{id:05} {stage} failed: {cause}").into())
+        },
+        Err(_) => Err(format!("device-{id:05} {stage} timed out after {}ms", limit.as_millis()).into()),
+    }
+}
+
+async fn write_hello(id: usize, send: &mut quinn::SendStream, bytes: &[u8]) -> Result<(), Failure> {
+    device_io(id, "fragmented HELLO", IO_LIMIT, async {
         // Split the magic, header and payload across separate asynchronous
         // writes, exercising the edge decoder before its first heartbeat.
         send.write_all(&bytes[..3]).await?;
@@ -137,7 +149,7 @@ async fn write_hello(send: &mut quinn::SendStream, bytes: &[u8]) -> Result<(), F
         tokio::time::sleep(Duration::from_millis(1)).await;
         send.write_all(&bytes[11..]).await?;
         Ok::<_, Failure>(())
-    }).await??;
+    }).await?;
     Ok(())
 }
 
@@ -151,11 +163,11 @@ async fn device(
     mut start: watch::Receiver<Option<Instant>>,
     authenticated: Arc<AtomicUsize>,
 ) -> Result<u64, Failure> {
-    let connection = tokio::time::timeout(IO_LIMIT, endpoint.connect_with(config, address, "localhost")?).await??;
-    let (mut send, mut receive) = tokio::time::timeout(IO_LIMIT, connection.open_bi()).await??;
-    write_hello(&mut send, &hello_frame(id)?).await?;
+    let connection = device_io(id, "TLS handshake", IO_LIMIT, endpoint.connect_with(config, address, "localhost")?).await?;
+    let (mut send, mut receive) = device_io(id, "open control stream", IO_LIMIT, connection.open_bi()).await?;
+    write_hello(id, &mut send, &hello_frame(id)?).await?;
     let health = control_frame(2, HEALTH)?;
-    tokio::time::timeout(IO_LIMIT, send.write_all(&health)).await??;
+    device_io(id, "initial HEALTH", IO_LIMIT, send.write_all(&health)).await?;
     let count = authenticated.fetch_add(1, Ordering::SeqCst) + 1;
     if count == 1 || count % 1000 == 0 || count == peers {
         println!("AUTHENTICATED {count}");
@@ -187,7 +199,7 @@ async fn device(
                 }
             },
             _ = tokio::time::sleep_until(next_heartbeat) => {
-                tokio::time::timeout(IO_LIMIT, send.write_all(&health)).await??;
+                device_io(id, "periodic HEALTH", IO_LIMIT, send.write_all(&health)).await?;
                 heartbeats += 1;
                 next_heartbeat += HEARTBEAT_INTERVAL;
                 // Never emit a catch-up burst after a scheduler stall. The
@@ -213,6 +225,10 @@ fn premature_completion(result: Option<Result<Result<u64, Failure>, JoinError>>)
     }
 }
 
+fn cohort_failure(result: Option<Result<Result<u64, Failure>, JoinError>>, authenticated: &AtomicUsize, peers: usize) -> Failure {
+    format!("cohort authenticated {}/{} before failure: {}", authenticated.load(Ordering::SeqCst), peers, premature_completion(result)).into()
+}
+
 async fn run(options: Options) -> Result<(), Failure> {
     if options.start_file.try_exists()? {
         return Err("START_FILE must not exist before this cohort is admitted".into());
@@ -234,7 +250,7 @@ async fn run(options: Options) -> Result<(), Failure> {
 
     for id in 0..options.peers {
         if Instant::now() >= setup_deadline { return Err("cohort setup exceeded 1800 seconds".into()); }
-        if let Some(result) = devices.try_join_next() { return Err(premature_completion(Some(result))); }
+        if let Some(result) = devices.try_join_next() { return Err(cohort_failure(Some(result), &authenticated, options.peers)); }
         let cert = CertificateDer::from(fs::read(options.fixtures.join(format!("device-{id:05}.der")))?);
         let mut crypto = rustls::ClientConfig::builder()
             .with_root_certificates(roots.clone())
@@ -251,7 +267,7 @@ async fn run(options: Options) -> Result<(), Failure> {
             tokio::task::yield_now().await;
         } else {
             tokio::select! {
-                result = devices.join_next() => return Err(premature_completion(result)),
+                result = devices.join_next() => return Err(cohort_failure(result, &authenticated, options.peers)),
                 _ = tokio::time::sleep_until(setup_deadline) => return Err("cohort setup exceeded 1800 seconds".into()),
                 _ = tokio::time::sleep(options.setup_delay) => {},
             }
@@ -265,7 +281,7 @@ async fn run(options: Options) -> Result<(), Failure> {
             if let Some(start) = read_start(&options.start_file)? { break start; }
         }
         tokio::select! {
-            result = devices.join_next() => return Err(premature_completion(result)),
+            result = devices.join_next() => return Err(cohort_failure(result, &authenticated, options.peers)),
             _ = tokio::time::sleep_until(setup_deadline) => return Err("cohort admission/start exceeded 1800 seconds".into()),
             _ = tokio::time::sleep(Duration::from_millis(200)) => {},
         }
@@ -402,4 +418,23 @@ mod tests {
         assert_eq!(close_time(start, Duration::from_secs(30), 0), start + Duration::from_secs(40));
         assert_eq!(close_time(start, Duration::from_secs(30), 19999), start + Duration::from_millis(139_995));
     }
+    #[tokio::test]
+    async fn io_timeout_names_the_device_and_operation() {
+        let operation = std::future::pending::<Result<(), std::io::Error>>();
+        let error = device_io(4095, "TLS handshake", Duration::from_millis(1), operation).await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("device-04095 TLS handshake"), "{message}");
+        assert!(message.contains("timed out"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn io_failure_keeps_the_device_stage_and_original_cause() {
+        let operation = std::future::ready(Err::<(), _>(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "peer reset marker")));
+        let error = device_io(31, "initial HEALTH", IO_LIMIT, operation).await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("device-00031 initial HEALTH"), "{message}");
+        assert!(message.contains("peer reset marker"), "{message}");
+        assert_eq!(device_io(0, "successful write", IO_LIMIT, std::future::ready(Ok::<_, std::io::Error>(17))).await.unwrap(), 17);
+    }
+
 }
