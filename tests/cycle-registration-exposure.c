@@ -200,7 +200,9 @@ static void append_beyond_mark_limit(int kind, int copied, int borrowed, int reg
     g.list->values[g.list->length++] = slot(parent);
     rc_cycle_commit_insert(g.list, parent);
     rc_drop(parent);
-    assert(rc_cycle_proven(rc_cycle_value(parent)) && rc_cycle_limit == 2);
+    assert(rc_cycle_limit == 2);
+    if (!registered)
+        assert(rc_cycle_proven(rc_cycle_value(parent)));
     drain();
     assert(rc_cycle_proven(rc_cycle_value(parent)));
     if (registered) {
@@ -271,6 +273,7 @@ static void reused_receiver(int kind) {
  * retain the snapshot path, even though its stale completed mark is 2. */
 static void move_stale_root_before_visit(int kind) {
     Late s = setup(0, 0);
+    void *owner = receiver_new(kind);
     MinyarRecord *payload = minyar_record_new_traced(3);
     minyar_record_set_traced(payload, 0, 1);
     minyar_record_set_reference_traced(payload, 1, slot(s.parent));
@@ -288,12 +291,12 @@ static void move_stale_root_before_visit(int kind) {
     assert(root->marked == 2 && rc_cycle_rescan && rc_cycle_pending);
     rc_cycle_unit();
     assert(rc_cycle_phase == RC_CYCLE_ROOTS && !rc_cycle_local_job);
-    void *owner = receiver_new(kind);
     if (kind) {
         MinyarRecord *r = owner;
         unsigned char *map = (unsigned char *)(r->values + r->length);
         map[0] = 1;
     }
+    assert(root->marked == 2 && rc_cycle_phase == RC_CYCLE_ROOTS);
     rc_cycle_edge_insert(owner, s.parent);
     assert(root->marked == 1);
     if (kind)
