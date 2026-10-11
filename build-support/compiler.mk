@@ -86,6 +86,47 @@ build/closure-compiler-sanitize.ll: build/closure-compiler-stage2.ll tests/llvm_
 build/minyarc-callbacks-sanitize: build/closure-compiler-sanitize.ll build/minyar-compiler-runtime-sanitize.o
 	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
+# Typed Result is an optional frontend assembled from the same guarded core.
+build/errors-compiler.min: compiler/compiler.min compiler/errors-compiler.min compiler/closure-compiler.min compiler/managed-graphs-adapter.patch scripts/build-closure-compiler.py scripts/build-module-compiler.py compiler/build-errors-compiler.py | build
+	python3 compiler/build-errors-compiler.py $@
+
+build/errors-compiler-stage1.ll: build/errors-compiler.min build/minyarc
+	$(LIMITED) ./build/minyarc $< $@
+
+build/errors-compiler-stage1: build/errors-compiler-stage1.ll build/minyar-compiler-runtime.ll
+	$(LIMITED) "$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
+
+build/errors-compiler-stage2.ll: build/errors-compiler.min build/errors-compiler-stage1
+	$(LIMITED) ./build/errors-compiler-stage1 $< $@
+
+build/minyarc-errors: build/errors-compiler-stage2.ll build/minyar-compiler-runtime.ll
+	$(LIMITED) "$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
+
+build/errors-compiler-stage3.ll: build/errors-compiler.min build/minyarc-errors
+	$(LIMITED) ./build/minyarc-errors $< $@
+
+build/errors-compiler-sanitize.ll: build/errors-compiler-stage2.ll tests/llvm_sanitizer.py
+	$(SANITIZER_LIMITED) python3 tests/llvm_sanitizer.py $< $@
+
+build/minyarc-errors-sanitize: build/errors-compiler-sanitize.ll build/minyar-compiler-runtime-sanitize.o
+	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
+
+# The request frontend emits only parser status 87; it is never self-hosted.
+build/errors-request.min: compiler/compiler.min compiler/closure-compiler.min compiler/errors-request.min compiler/managed-graphs-adapter.patch scripts/build-closure-compiler.py scripts/build-module-compiler.py compiler/build-errors-request.py | build
+	python3 compiler/build-errors-request.py $@
+
+build/errors-request.ll: build/errors-request.min build/minyarc
+	$(LIMITED) ./build/minyarc $< $@
+
+build/minyarc-errors-request: build/errors-request.ll build/minyar-compiler-runtime.ll
+	$(LIMITED) "$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
+
+build/errors-request-sanitize.ll: build/errors-request.ll tests/llvm_sanitizer.py
+	$(SANITIZER_LIMITED) python3 tests/llvm_sanitizer.py $< $@
+
+build/minyarc-errors-request-sanitize: build/errors-request-sanitize.ll build/minyar-compiler-runtime-sanitize.o
+	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
+
 # The historical identity control is reconstructed from the current core by
 # removing only reviewed dispatch sites, then checked against its fixed hash.
 build/compiler-baseline-control.min: compiler/compiler.min scripts/build-closure-compiler.py | build

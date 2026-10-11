@@ -204,20 +204,35 @@ IFS=$old_ifs
 if [ "$(uname -s)" = Darwin ]; then set -- "$@" --library "$project_dir/library/platform/macos"; fi
 set -- "$@" --library "$project_dir/library"
 compiler_status=0
+primary_stderr="$llvm_dir/primary.stderr"
 if [ "$incremental" -eq 1 ]; then
     "$project_dir/build/minyar-module-build" "$project_dir/build/minyarc-modules" \
-        "$source_file" "$llvm_file" "${MINYAR_MODULE_CACHE:-$project_dir/build/module-cache}" "$@" || compiler_status=$?
+        "$source_file" "$llvm_file" "${MINYAR_MODULE_CACHE:-$project_dir/build/module-cache}" "$@" 2>"$primary_stderr" || compiler_status=$?
 else
-    "$project_dir/build/minyarc" "$source_file" "$llvm_file" "$@" || compiler_status=$?
+    "$project_dir/build/minyarc" "$source_file" "$llvm_file" "$@" 2>"$primary_stderr" || compiler_status=$?
 fi
-if [ "$compiler_status" -eq 86 ]; then
-    # The parser requests this extension only after recognizing valid callable
-    # syntax. Its generated source reuses the current core parser and emitter.
+request_status=0
+if [ "$compiler_status" -eq 1 ] || [ "$compiler_status" -eq 86 ]; then
+    # This separate parser recognizes complete Result type/constructor headers.
+    # Successful ordinary programs never build or execute the request frontend.
+    MINYAR_INTERACTIVE_BOOTSTRAP=1 python3 "$project_dir/tools/clang-driver.py" build "$project_dir" build/minyarc-errors-request
+    "$project_dir/build/minyarc-errors-request" "$source_file" "$llvm_dir/request.ll" "$@" \
+        2>"$llvm_dir/request.stderr" || request_status=$?
+fi
+selected_status=0
+if [ "$request_status" -eq 87 ]; then
+    rm -f -- "$llvm_file"
+    MINYAR_INTERACTIVE_BOOTSTRAP=1 python3 "$project_dir/tools/clang-driver.py" build "$project_dir" build/minyarc-errors
+    "$project_dir/build/minyarc-errors" "$source_file" "$llvm_file" "$@" || selected_status=$?
+elif [ "$compiler_status" -eq 86 ]; then
+    rm -f -- "$llvm_file"
     MINYAR_INTERACTIVE_BOOTSTRAP=1 python3 "$project_dir/tools/clang-driver.py" build "$project_dir" build/minyarc-callbacks
-    "$project_dir/build/minyarc-callbacks" "$source_file" "$llvm_file" "$@"
-elif [ "$compiler_status" -ne 0 ]; then
-    exit "$compiler_status"
+    "$project_dir/build/minyarc-callbacks" "$source_file" "$llvm_file" "$@" || selected_status=$?
+else
+    cat "$primary_stderr" >&2
+    if [ "$compiler_status" -ne 0 ]; then exit "$compiler_status"; fi
 fi
+if [ "$selected_status" -ne 0 ]; then exit "$selected_status"; fi
 if [ "$check_only" -eq 1 ]; then
     echo "checked $source_file"
     exit 0

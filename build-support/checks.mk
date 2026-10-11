@@ -30,7 +30,7 @@ check: check-memory-contracts-harness
 .PHONY: check-release-build check-critical-path check-launcher-isolation
 check: check-launcher-isolation
 
-check-launcher-isolation: build/minyarc build/minyar-runtime.o build/minyar-runtime-release.ll
+check-launcher-isolation: build/minyarc build/minyarc-errors-request build/minyar-runtime.o build/minyar-runtime-release.ll
 	$(LIMITED) python3 tests/launcher-isolation.py
 
 check-release-build: build/minyarc build/minyar-runtime.o build/minyar-runtime-release.ll
@@ -327,7 +327,7 @@ check-bounded: build/minyarc build/minyar-runtime-bounded.o build/bounded-runtim
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/bounded-ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/production-memory.py
 
 .PHONY: check-incremental-modules
-check-incremental-modules: build/minyarc-modules build/module-compiler-stage3.ll build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-release.ll
+check-incremental-modules: build/minyarc-errors-request build/minyarc-modules build/module-compiler-stage3.ll build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-release.ll build/minyarc-callbacks
 	cmp build/module-compiler-stage2.ll build/module-compiler-stage3.ll
 	$(LIMITED) python3 tests/incremental-modules.py
 	$(LIMITED) python3 tests/incremental-module-driver.py
@@ -345,8 +345,8 @@ check-incremental-module-performance: build/minyarc-modules build/minyar-module-
 check: check-incremental-module-performance
 
 .PHONY: check-incremental-modules-sanitize
-check-incremental-modules-sanitize: build/minyarc-modules-sanitize build/minyar-module-build-sanitize build/minyarc-modules build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-sanitize.o build/ownership-runtime.o
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-modules-sanitize $(SANITIZER_LIMITED) python3 tests/incremental-modules.py
+check-incremental-modules-sanitize: build/minyarc-modules-sanitize build/minyar-module-build-sanitize build/minyarc-modules build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-sanitize.o build/ownership-runtime.o build/minyarc-callbacks-sanitize
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-modules-sanitize MINYAR_MODULE_CALLBACK_COMPILER=./build/minyarc-callbacks-sanitize $(SANITIZER_LIMITED) python3 tests/incremental-modules.py
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_MODULE_DRIVER=./build/minyar-module-build-sanitize $(SANITIZER_LIMITED) python3 tests/incremental-module-driver.py
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-modules-sanitize MINYAR_MODULE_DRIVER=./build/minyar-module-build-sanitize $(SANITIZER_LIMITED) python3 tests/incremental-module-delta.py
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-modules-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/incremental-module-artifacts.py
@@ -682,10 +682,12 @@ build/yamux-peer: tests/interop/yamux/main.go tests/interop/yamux/go.mod tests/i
 check-transport-go: build/minyarc build/yamux-peer
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/transport-go.py --peer-binary build/yamux-peer
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/transport-go.py --peer-binary build/yamux-peer --streams 1536
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/transport-go.py --fin-schedule
 
 check-transport-go-sanitize: build/minyarc build/yamux-peer
 	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/transport-go.py --peer-binary build/yamux-peer --sanitize
 	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/transport-go.py --peer-binary build/yamux-peer --streams 1536 --sanitize
+	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/transport-go.py --fin-schedule --sanitize
 
 check check-portable: check-yamux-churn check-transport-cancel
 check: check-transport-go
