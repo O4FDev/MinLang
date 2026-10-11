@@ -30,6 +30,8 @@ def main():
              ['user32', 'shell32', 'advapi32', 'ole32', 'oleaut32', 'iphlpapi', 'uuid', 'ws2_32', 'bcrypt', 'runtimeobject']),
             ('windows-native', ['-DMINYAR_WINDOWS_TEST=1'], ['windows.c'],
              ['user32', 'gdi32', 'shell32', 'comctl32']),
+            ('windows-layout', ['-DMINYAR_WINDOWS_TEST=1'], ['windows.c'],
+             ['user32', 'gdi32', 'shell32', 'comctl32']),
             ('windows-loop', ['-DMINYAR_WINDOWS_TEST=1', '-DMINYAR_APP_EVENT_LOOP=1'], ['windows.c'],
              ['user32', 'gdi32', 'shell32', 'comctl32', 'ws2_32']),
         ]
@@ -51,6 +53,26 @@ def main():
                     ('value-range', 'slider value is outside its range'),
                     ('invalid-shortcut', 'invalid menu shortcut'),
                     ('duplicate-shortcut', 'duplicate menu shortcut'),
+                ]:
+                    result = subprocess.run([executable, argument], capture_output=True, text=True, timeout=30)
+                    assert result.returncode == 1 and diagnostic in result.stderr, (argument, result)
+            if name == 'windows-layout':
+                for argument, diagnostic in [
+                    ('invalid-minimum', 'dimensions must be between 0 and 100000'),
+                    ('invalid-maximum', 'dimensions must be between 0 and 100000'),
+                    ('invalid-insets', 'dimensions must be between 0 and 100000'),
+                    ('invalid-alignment', 'alignment must be START, CENTER, or END'),
+                    ('wrong-align', 'align requires a row or column'),
+                    ('wrong-clear', 'clear requires a row or column'),
+                    ('remove-root', "cannot remove a window's root view"),
+                    ('invalid-gap', 'dimensions must be between 0 and 100000'),
+                    ('wrong-insets', 'insets requires a row or column'),
+                    ('wrong-grow', 'layout requires a view inside a row or column'),
+                    ('maximum-window', 'layout requires a view'),
+                    ('conflicting-bounds', 'minimum size exceeds maximum size'),
+                    ('conflicting-size', 'explicit size conflicts with bounds'),
+                    ('stale-remove', 'invalid or destroyed handle'),
+                    ('stale-clear', 'invalid or destroyed handle'),
                 ]:
                     result = subprocess.run([executable, argument], capture_output=True, text=True, timeout=30)
                     assert result.returncode == 1 and diagnostic in result.stderr, (argument, result)
