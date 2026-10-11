@@ -17,6 +17,7 @@ typedef SOCKET socket_t;
 #define BAD_SOCKET INVALID_SOCKET
 #define BAD_ARGUMENT WSAEINVAL
 #else
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
@@ -90,6 +91,21 @@ static bool initialize(void) {
 #endif
     return true;
 }
+long long minyar_net_ipVersion(const MinyarText *address) {
+    char name[256];
+    unsigned char bytes[16];
+    if (address->byte_length <= 0 ||
+        address->byte_length >= (long long)sizeof(name) ||
+        memchr(address->bytes, 0, (size_t)address->byte_length))
+        return 0;
+    minyar_native_text(address, name, sizeof(name));
+    if (inet_pton(AF_INET, name, bytes) == 1)
+        return 4;
+    if (inet_pton(AF_INET6, name, bytes) == 1)
+        return 6;
+    return 0;
+}
+
 static bool address(const MinyarText *host, long long port, int type, struct addrinfo **found) {
     char name[256], service[16];
     if (port < 0 || port > 65535 || host->byte_length <= 0 ||

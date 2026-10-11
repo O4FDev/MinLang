@@ -28,6 +28,7 @@ public record Response {
 
 record Address {
     host: Text
+    authority: Text
     port: Integer
     path: Text
     secure: Boolean
@@ -37,8 +38,12 @@ function failed(message: Text): Response {
     return Response { status: 0; reason: ""; headers: []; body: ""; error: message }
 }
 
-// Split "http://host:port/path" or "https://..." into its parts; the host is
-// empty for any other kind of URL.
+// Keep the URI authority separate from the unbracketed connection host.
+// A malformed URL is a recoverable request failure, never Integer overflow.
+function invalidAddress(): Address {
+    return Address { host: ""; authority: ""; port: 0; path: ""; secure: false }
+}
+
 function parse(url: Text): Address {
     let secure = false
     let scheme = "http://"
@@ -47,29 +52,77 @@ function parse(url: Text): Address {
         scheme = "https://"
     }
     if url.length < scheme.length || url.slice(0, scheme.length) != scheme {
-        return Address { host: ""; port: 0; path: ""; secure: false }
+        return invalidAddress()
+    }
+    // Reject raw whitespace and controls before they can enter HTTP framing.
+    for character in url {
+        if Integer(character) <= 32 || Integer(character) == 127 { return invalidAddress() }
     }
     let rest = url.slice(scheme.length, url.length)
-    let slash = rest.length
+    let end = rest.length
     for position in 0..rest.length {
-        if slash == rest.length && rest[position] == '/' { slash = position }
-    }
-    let authority = rest.slice(0, slash)
-    let path = "/"
-    if slash < rest.length { path = rest.slice(slash, rest.length) }
-    let host = authority
-    let port = 80
-    if secure { port = 443 }
-    for position in 0..authority.length {
-        if authority[position] == ':' {
-            host = authority.slice(0, position)
-            port = 0
-            for character in authority.slice(position + 1, authority.length) {
-                port = port * 10 + Integer(character) - 48
-            }
+        if end == rest.length && (rest[position] == '/' || rest[position] == '?' || rest[position] == '#') {
+            end = position
         }
     }
-    return Address { host: host; port: port; path: path; secure: secure }
+    let authority = rest.slice(0, end)
+    if authority == "" { return invalidAddress() }
+    let host = authority
+    let portText = ""
+    let portAt = -1
+    if authority[0] == '[' {
+        let closing = -1
+        for position in 1..authority.length {
+            if closing < 0 && authority[position] == ']' { closing = position }
+        }
+        if closing < 0 { return invalidAddress() }
+        host = authority.slice(1, closing)
+        if net.ipVersion(host) != 6 { return invalidAddress() }
+        if closing + 1 < authority.length {
+            if authority[closing + 1] != ':' { return invalidAddress() }
+            portAt = closing + 1
+        }
+    } else {
+        for position in 0..authority.length {
+            let character = authority[position]
+            if character == '[' || character == ']' || character == '@' { return invalidAddress() }
+            if character == ':' {
+                if portAt >= 0 { return invalidAddress() }
+                portAt = position
+            }
+        }
+        if portAt >= 0 { host = authority.slice(0, portAt) }
+        if host == "" { return invalidAddress() }
+    }
+    let port = 80
+    if secure { port = 443 }
+    if portAt >= 0 {
+        portText = authority.slice(portAt + 1, authority.length)
+        if portText == "" {
+            // An empty explicit port uses the scheme default.
+            authority = authority.slice(0, portAt)
+        } else {
+            port = 0
+            for character in portText {
+                let digit = Integer(character) - 48
+                if digit < 0 || digit > 9 || port > 6553 || (port == 6553 && digit > 5) {
+                    return invalidAddress()
+                }
+                port = port * 10 + digit
+            }
+            if port == 0 { return invalidAddress() }
+        }
+    }
+    let targetEnd = rest.length
+    for position in end..rest.length {
+        if targetEnd == rest.length && rest[position] == '#' { targetEnd = position }
+    }
+    let path = "/"
+    if end < targetEnd {
+        path = rest.slice(end, targetEnd)
+        if path[0] == '?' { path = "/" + path }
+    }
+    return Address { host: host; authority: authority; port: port; path: path; secure: secure }
 }
 
 public function get(url: Text, headers: List<Text>): Response {
@@ -107,7 +160,7 @@ function ready(connection: Integer, deadline: Integer): Boolean {
 function exchange(method: Text, url: Text, headers: List<Text>, body: Text, limit: Integer, timeoutMs: Integer): Response {
     let address = parse(url)
     if address.host == "" {
-        return failed("only http:// and https:// URLs are supported: " + url)
+        return failed("invalid http:// or https:// URL: " + url)
     }
     let connection = net.connect(address.host, address.port)
     if connection < 0 {
@@ -116,7 +169,7 @@ function exchange(method: Text, url: Text, headers: List<Text>, body: Text, limi
     let deadline = 0
     if limit > 0 { deadline = net.monotonicMilliseconds() + timeoutMs }
     let content = Bytes(body)
-    let lines: List<Text> = [method + " " + address.path + " HTTP/1.1\r\n", "Host: " + address.host + "\r\n", "Connection: close\r\n"]
+    let lines: List<Text> = [method + " " + address.path + " HTTP/1.1\r\n", "Host: " + address.authority + "\r\n", "Connection: close\r\n"]
     for header in headers {
         lines.add(header + "\r\n")
     }
