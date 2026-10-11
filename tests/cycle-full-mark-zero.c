@@ -90,11 +90,10 @@ static void full_zero(unsigned n, unsigned rescan) {
     size_t full_completed = rc_cycle_completed - completed;
     core_payloads(c, n, 1, 0);
     assert(primary->values[0] == slot(c.g.root));
-    minyar_rc_release(primary);
-    drain();
-    churn_check(c, n, 0);
 
-    /* A full snapshot already in progress necessarily has its own finite work.
+    /* Keep the same independently held primary for the locality measurement.
+     * Releasing it here would require an unrelated replacement proof.
+     * A full snapshot already in progress necessarily has its own finite work.
      * Count that captured completion separately; retain the exact established
      * 192-unit gate for eight subsequent borrow/drop requests after completion. */
     size_t units = rc_cycle_units;
@@ -102,9 +101,13 @@ static void full_zero(unsigned n, unsigned rescan) {
         minyar_rc_retain_traced(c.g.interior);
         minyar_rc_release(c.g.interior);
         drain();
-        churn_check(c, n, 0);
+        core_payloads(c, n, 1, 0); /* The measured primary remains externally held. */
+        assert(primary->values[0] == slot(c.g.root));
     }
     size_t borrowed_work = rc_cycle_units - units;
+    minyar_rc_release(primary);
+    drain();
+    churn_check(c, n, 0);
     minyar_rc_release(c.g.root);
     empty(); /* Independent payload/count/root-drop oracle precedes locality. */
     fprintf(stderr, "FULL_ZERO n=%u k=%u rescan=%u build_after=%u valid_after=%u rescan_after=%u marker=%zu epochs=%zu completed=%zu borrowed_units=%zu reclaimed=1\n",
