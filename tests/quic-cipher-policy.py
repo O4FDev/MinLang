@@ -11,7 +11,7 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
-import tempfile
+from quic_protocol_artifacts import ProtocolArtifacts
 
 ROOT = Path(__file__).resolve().parents[1]
 CA_SOURCE = ROOT / "tests/tls-local.py"
@@ -37,26 +37,30 @@ def main():
     parser.add_argument("--binary", required=True, type=Path, help="binary compiled successfully from quic-cipher-policy.min")
     parser.add_argument("--expect-old-code", action="store_true")
     parser.add_argument("--case", action="append", choices=tuple(BASELINE))
+    parser.add_argument("--artifacts", type=Path)
     options = parser.parse_args()
     binary = options.binary.resolve(strict=True)
     results = []
-    with tempfile.TemporaryDirectory(prefix="minyar-quic-cid-") as directory:
-        certificates = FIXTURES.Certificates(directory)
+    with ProtocolArtifacts("minyar-quic-cipher-policy", options.artifacts, inputs=[Path(__file__), ROOT / "tests/quic-cipher-policy.min", CA_SOURCE, binary, ROOT / "tests/quic_protocol_artifacts.py", ROOT / "tests/test_evidence.py"], declared_cases=options.case or list(BASELINE)) as artifacts:
+        artifacts.fixture(FIXTURES)
+        certificates = FIXTURES.Certificates(artifacts.workspace)
         certificates.root("root")
         certificates.leaf("server", "root")
         certificates.leaf("client", "root", usage="clientAuth")
+        artifacts.certificates_ready()
         inputs = [str(certificates.path("root", "der")), str(certificates.path("server", "der")),
                   str(certificates.path("server", "pk8")), str(certificates.path("client", "der")),
                   str(certificates.path("client", "pk8"))]
         for case in options.case or list(BASELINE):
-            completed = subprocess.run([str(binary), *inputs, case], capture_output=True, text=True, timeout=60)
+            completed = artifacts.run([str(binary), *inputs, case], capture_output=True, text=True, timeout=60, case=case)
             expected_code, required_message = BASELINE[case] if options.expect_old_code else (0, "")
             matched = completed.returncode == expected_code and required_message in completed.stdout
             results.append({"case": case, "returncode": completed.returncode, "expected_returncode": expected_code,
                             "matched": matched, "stdout": completed.stdout, "stderr": completed.stderr})
-    report = {"test_source_sha256": sha256(ROOT / "tests/quic-cipher-policy.min"),
-              "binary_sha256": sha256(binary), "baseline": options.expect_old_code,
-              "compiler_invoked": False, "results": results}
+        report = {"test_source_sha256": sha256(ROOT / "tests/quic-cipher-policy.min"),
+                  "binary_sha256": sha256(binary), "baseline": options.expect_old_code,
+                  "compiler_invoked": False, "results": results}
+        artifacts.publish(report, all(row["matched"] for row in results))
     print(json.dumps(report, indent=2))
     if not all(row["matched"] for row in results):
         raise SystemExit(1)

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run already compiled QNS endpoints over local UDP; setup is separate."""
-import argparse,hashlib,hmac,importlib.util,json,os,select,subprocess,tempfile,time
+import argparse,hashlib,hmac,importlib.util,json,os,subprocess
+from quic_protocol_artifacts import ProtocolArtifacts
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location("qns_certificates",ROOT/"tests/tls-local.py")
@@ -9,9 +10,12 @@ CASES=("multiplex1999","multiconnect50","keyupdate","chacha20","ipv6","preferred
 def main():
  p=argparse.ArgumentParser();p.add_argument("--client",type=Path,required=True);p.add_argument("--server",type=Path,required=True)
  p.add_argument("--case",action="append",choices=CASES);p.add_argument("--expect-old-code",action="store_true");p.add_argument("--port",type=int,default=44300)
+ p.add_argument("--artifacts",type=Path)
  a=p.parse_args();results=[]
- with tempfile.TemporaryDirectory(prefix="minyar-qns-local-") as d:
-  d=Path(d);ca=fixtures.Certificates(d);ca.root("root");ca.leaf("server","root",san="DNS:localhost,IP:127.0.0.1,IP:::1")
+ with ProtocolArtifacts("minyar-qns-local",a.artifacts,inputs=[Path(__file__),a.client,a.server,ROOT/"tests/tls-local.py",ROOT/"tests/quic_protocol_artifacts.py",ROOT/"tests/test_evidence.py",ROOT/"tests/interop/qns/client.min",ROOT/"tests/interop/qns/server.min",ROOT/"tests/interop/qns/endpoint.py"],declared_cases=a.case or CASES) as artifacts:
+  artifacts.fixture(fixtures)
+  d=artifacts.workspace;ca=fixtures.Certificates(d);ca.root("root");ca.leaf("server","root",san="DNS:localhost,IP:127.0.0.1,IP:::1")
+  artifacts.certificates_ready()
   for case in a.case or CASES:
    www=d/(case+"-www");downloads=d/(case+"-downloads");www.mkdir();downloads.mkdir()
    count=1999 if case=="multiplex1999" else (50 if case=="multiconnect50" else (40 if case in ("resumption40","zerortt40") else 1))
@@ -20,24 +24,22 @@ def main():
    payload=bytes((i*17+3)%256 for i in range(size))
    for name in names:(www/name).write_bytes(payload)
    serverlog=d/(case+"-server.keys");clientlog=d/(case+"-client.keys")
+   artifacts.bind_files(case,"payloads",[www]);artifacts.bind_files(case,"downloads",[downloads]);artifacts.bind_files(case,"keylogs",[serverlog,clientlog])
    testcase={"multiplex1999":"transfer","multiconnect50":"multiconnect","ipv6":"transfer","preferred":"connectionmigration","resumption40":"resumption","zerortt40":"zerortt"}.get(case,case)
    command=[str(a.server.resolve()),str(ca.path("server","pk8")),str(ca.path("root","der")),str(serverlog),str(www),testcase,str(ca.path("server","der"))]
    if not a.expect_old_code:command+=["--port="+str(a.port)]
    if case=="preferred":command+=["--preferred-ipv4=7f000001","--preferred-port="+str(a.port+1)]
-   server=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,bufsize=1)
-   ready=select.select([server.stdout],[],[],10)[0]
-   greeting=server.stdout.readline() if ready else ""
+   server=artifacts.endpoint(command,case+"-server",case=case,peer_timeout=180)
+   greeting=server.ready_line()
    if greeting!="QNS server ready\n":
-    server.terminate();stdout,stderr=server.communicate(timeout=5)
-    raise RuntimeError(("server setup",server.returncode,greeting,stdout,stderr))
+    stdout,stderr=server.stop()
+    raise RuntimeError(("server setup",server.process.returncode,greeting,stdout,stderr))
    try:
     host="::1" if case=="ipv6" else "127.0.0.1"
     command=[str(a.client.resolve()),str(ca.path("root","der")),host,str(a.port),str(clientlog),str(downloads),testcase,*names]
-    c=subprocess.run(command,capture_output=True,text=True,timeout=180)
+    c=artifacts.run(command,capture_output=True,text=True,timeout=180,case=case)
    finally:
-    server.terminate()
-    try:serverout,servererr=server.communicate(timeout=5)
-    except subprocess.TimeoutExpired:server.kill();serverout,servererr=server.communicate(timeout=5)
+    serverout,servererr=server.stop()
    labels=[line.split()[0] for line in clientlog.read_text().splitlines()] if clientlog.exists() else []
    serverlabels=[line.split()[0] for line in serverlog.read_text().splitlines()] if serverlog.exists() else []
    reciprocal=True
@@ -64,6 +66,9 @@ def main():
       "files_match":files_ok,"reciprocal_epoch_secrets":reciprocal,"handshakes":labels.count("CLIENT_HANDSHAKE_TRAFFIC_SECRET"),
       "client_epochs":sorted(set(x for x in labels if x.startswith("CLIENT_TRAFFIC_SECRET_"))),
       "server_epochs":sorted(set(x for x in serverlabels if x.startswith("SERVER_TRAFFIC_SECRET_")))})
- print(json.dumps({"binary_hashes":{n:hashlib.sha256(x.read_bytes()).hexdigest() for n,x in [("client",a.client),("server",a.server)]},"results":results},indent=2))
- return 0 if all(x["matched"] and not x["client_stderr"] and not x["server_stderr"] for x in results) else 1
+  passed=all(x["matched"] and not x["client_stderr"] and not x["server_stderr"] for x in results)
+  report={"binary_hashes":{n:hashlib.sha256(x.read_bytes()).hexdigest() for n,x in [("client",a.client),("server",a.server)]},"results":results}
+  artifacts.publish(report,passed)
+ print(json.dumps(report,indent=2))
+ return 0 if passed else 1
 if __name__=="__main__":raise SystemExit(main())
