@@ -17,7 +17,7 @@ EXTENSIONS = {'.py', '.c', '.h', '.m', '.sh'}
 ROLES = {'suite', 'support', 'fixture', 'manual', 'ungated'}
 # Minyar fixtures normally belong to harnesses. These maintained regressions
 # also have explicit mandatory dispositions, unlike generated Minyar samples.
-REQUIRED_MINYAR_FIXTURES = {'tests/cycle-late-registration.min', 'tests/generated-llvm-sanitizer.min', 'tests/quic-pto.min', 'tests/quic-ack.min'}
+REQUIRED_MINYAR_FIXTURES = {'tests/cycle-late-registration.min', 'tests/generated-llvm-sanitizer.min', 'tests/quic-pto.min', 'tests/quic-ack.min', 'tests/quic-migration-cids.min', 'tests/quic-cipher-policy.min', 'tests/interop/qns/client.min', 'tests/interop/qns/server.min'}
 REQUIRED_MINYAR_PREFIXES = ('tests/parallel-signatures/',)
 REQUIRED_DATA_FIXTURES = {'tests/cycle-private-retirement-v5.json'}
 
@@ -104,6 +104,15 @@ def controls():
         managed.write_text('parallel function bad(value: Text) {}\n')
         reject(data)
         managed.unlink()
+        # Every new RFC program is a mandatory source, including nested QNS
+        # endpoint programs normally hidden behind the Minyar fixture policy.
+        for name in ('tests/quic-migration-cids.min', 'tests/quic-cipher-policy.min',
+                     'tests/interop/qns/client.min', 'tests/interop/qns/server.min'):
+            fixture = root / name
+            fixture.parent.mkdir(parents=True, exist_ok=True)
+            fixture.write_text('function main() {}\n')
+            reject(data)
+            fixture.unlink()
         # The exact v5 input pair is mandatory failure-control data, not an
         # optional JSON archive that can disappear from the source inventory.
         baseline = root / 'tests/cycle-private-retirement-v5.json'

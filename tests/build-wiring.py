@@ -101,6 +101,15 @@ class BuildWiring(unittest.TestCase):
                                for target in node.targets))
         for target in (native, sanitize):
             self.assertEqual(targets.count(target), 1)
+        workflow = (ROOT/'.github/workflows/ci.yml').read_text()
+        self.assertIn('check-quic\n', workflow)
+        self.assertIn('check-quic-sanitize\n', workflow)
+        format_tree = ast.parse((ROOT/'scripts/format.py').read_text())
+        version = next(ast.literal_eval(node.value) for node in format_tree.body
+                       if isinstance(node, ast.Assign)
+                       and any(isinstance(target, ast.Name) and target.id == 'VERSION'
+                               for target in node.targets))
+        self.assertEqual(version, '23.1.2')
         spec = importlib.util.spec_from_file_location(
             'quic_rfc_catalogue', ROOT/'tests/suite-catalogue.py')
         catalogue = importlib.util.module_from_spec(spec)
