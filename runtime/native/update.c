@@ -192,8 +192,10 @@ static int directory_fd(const char *path) {
 static bool wide(const char *path, wchar_t output[UPD_PATH]) {
     return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, output, UPD_PATH) > 0;
 }
-/* Pin every Windows ancestor without delete sharing. Junctions, volume
- * mount reparse points, UNC roots and relative/dot paths are refused. */
+/* Pin every Windows ancestor without delete sharing. Allow directory write
+ * sharing so MoveFileExW can publish a child in the pinned root. This does not
+ * grant delete sharing for an ancestor or write sharing for a checked file.
+ * Junctions, mount reparse points, UNC roots and relative/dot paths fail. */
 static bool windows_ancestors(const char *path, bool include_leaf, UpdateSession *owner) {
     size_t n = strlen(path);
     if (n < 3 || !((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) ||
@@ -226,7 +228,7 @@ static bool windows_ancestors(const char *path, bool include_leaf, UpdateSession
             break;
         }
         HANDLE handle =
-            CreateFileW(name, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+            CreateFileW(name, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
                         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
         BY_HANDLE_FILE_INFORMATION info;
         if (handle == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(handle, &info) ||

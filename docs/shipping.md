@@ -160,9 +160,15 @@ observed at that check. macOS retains the image descriptor and checks root,
 working-directory and executable pathname identities in the child before
 replacing it with `posix_spawn(POSIX_SPAWN_SETEXEC)` from its
 `.app/Contents/MacOS` location; macOS lacks fexecve.
-Windows holds non-write/non-delete shared handles across verification and
-CreateProcessW, with an explicit application path and exact CRT argument
-quoting. POSIX inherits only non-CLOEXEC standard streams 0/1/2. Linux
+Windows holds non-write/non-delete shared handles for checked executable and
+resource files across verification and CreateProcessW, with an explicit
+application path and exact CRT argument quoting. Installation ancestor
+directory handles share reads and writes so journal publication can open the
+parent for a child rename, but omit delete sharing so ancestors cannot be
+renamed or replaced while pinned. The launch directory pins also omit write
+sharing. [Microsoft's file sharing contract](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)
+defines the read, write and delete sharing restrictions.
+POSIX inherits only non-CLOEXEC standard streams 0/1/2. Linux
 uses kernel close_range over the whole descriptor table, keeping only the
 CLOEXEC executable and status pipe until exec; this requires Linux 5.9+ with
 close_range available in the build headers and permitted by sandbox policy.
