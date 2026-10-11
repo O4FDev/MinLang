@@ -287,8 +287,8 @@ MinyarBytes *minyar_net_setNoDelayResult(long long connection, bool enabled) {
     if (!initialize() || !valid_socket(connection))
         return connect_result(NET_FAILURE, BAD_ARGUMENT, 0);
     int value = enabled ? 1 : 0;
-    if (setsockopt((socket_t)connection, IPPROTO_TCP, TCP_NODELAY,
-                   (const char *)&value, sizeof(value))) {
+    if (setsockopt((socket_t)connection, IPPROTO_TCP, TCP_NODELAY, (const char *)&value,
+                   sizeof(value))) {
         int code = socket_error();
         remember_code("TCP_NODELAY", code);
         return connect_result(NET_FAILURE, code, 0);
