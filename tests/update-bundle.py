@@ -157,6 +157,44 @@ class Packager(unittest.TestCase):
         self.assertEqual(first,second)
         self.assertEqual(self.output.read_bytes(),(self.lab/'again.pkg').read_bytes())
 
+    def test_windows_path_fd_metadata_relation_keeps_copy_change_detection(self):
+        # Replay CPython's API semantics with the real copy on every host.
+        # Actual .exe preparation above is the separate Windows provider proof.
+        main=self.root/self.main;info=main.lstat()
+        lstat=Path.lstat;fstat=bundle.os.fstat
+        for mode_difference,ctime_difference in [(True,False),(False,True),(True,True)]:
+            for during_copy in [False,True]:
+                calls=0
+                def metadata(current,*,by_fd):
+                    values={name:getattr(current,name) for name in
+                        ('st_dev','st_ino','st_mode','st_size','st_mtime_ns','st_ctime_ns','st_nlink')}
+                    values['st_file_attributes']=0x20
+                    values['st_birthtime_ns']=100
+                    values['st_ctime_ns']=200 if by_fd and ctime_difference else 100
+                    if by_fd and during_copy and calls>1:values['st_ctime_ns']+=1
+                    if not by_fd and mode_difference:values['st_mode']|=0o111
+                    return SimpleNamespace(**values)
+                def path_info(path,*args,**kwargs):
+                    current=lstat(path,*args,**kwargs)
+                    return metadata(current,by_fd=False) if path==main else current
+                def fd_info(fd):
+                    nonlocal calls
+                    current=fstat(fd)
+                    if current.st_dev==info.st_dev and current.st_ino==info.st_ino:
+                        calls+=1;return metadata(current,by_fd=True)
+                    return current
+                self.output.write_bytes(b'previous artifact')
+                with self.subTest(mode=mode_difference,ctime=ctime_difference,changed=during_copy), \
+                     patch.object(Path,'lstat',path_info),patch.object(bundle.os,'fstat',side_effect=fd_info):
+                    if during_copy:
+                        with self.assertRaisesRegex(ValueError,'file changed during copying'):
+                            bundle.prepare(self.root,self.output,self.main)
+                        self.assertEqual(self.output.read_bytes(),b'previous artifact')
+                    else:
+                        bundle.prepare(self.root,self.output,self.main)
+                        self.assertIn(main.read_bytes(),self.output.read_bytes())
+                self.assertEqual(list(self.lab.glob('.minyar-bundle-*')),[])
+
     def test_ambiguous_names_bad_entrypoints_and_embedded_output_refused(self):
         for name in ['../escape','/absolute','NUL','missing','App.app/Contents/Resources/resource with spaces']:
             with self.subTest(main=name),self.assertRaises((ValueError,OSError)):

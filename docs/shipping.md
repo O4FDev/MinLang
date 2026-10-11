@@ -237,7 +237,14 @@ The encoder compares file identity, type/mode, size, timestamps and attributes
 before and after copying and rescans the final directory index before publication.
 Windows can expose the transient directory bit `0x10000000` before enumeration
 and omit it afterward; only that bit on real directories is normalized.
-Readonly/reparse attributes and all other snapshot fields remain checked.
+Readonly/reparse attributes and file identities remain checked. CPython on
+Windows derives path execute bits from the filename, and Python 3.12 path
+`ctime` reports creation time while descriptor `ctime` reports change time.
+The encoder compares the common path/descriptor fields using birth time and
+keeps raw descriptor mode/change time checks across the copy; final path modes
+remain bound by the rescanned index. See the
+[CPython path metadata implementation](https://github.com/python/cpython/blob/v3.12.10/Modules/posixmodule.c)
+and [descriptor metadata implementation](https://github.com/python/cpython/blob/v3.12.10/Python/fileutils.c).
 Output temporaries are closed before replacement and failure cleanup on Windows.
 
 The whole artifact, including the index and entry point, is bound by the
