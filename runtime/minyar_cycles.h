@@ -19,7 +19,8 @@
 typedef struct RcCycle {
     struct RcCycle *previous, *next;
     uintptr_t gray_next; /* Registered: aligned link, bits0/1 proof tags, bit2 local namespace.
-                          * Unregistered: bit2 retains captured incoming-path exposure. */
+                          * Unregistered: bit2 retains captured incoming-path exposure; bit3
+                          * marks private bounded zero-count cleanup, never a live certificate. */
     size_t generation : 1, marked : 2, registered : 1, pinned : 1, cleared : 1, record : 1,
         incoming : 57;
 } RcCycle;
@@ -263,6 +264,34 @@ static inline void rc_cycle_unregister(RcObject *object) {
         rc_cycle_unlink(cycle);
     cycle->gray_next = 0;
 }
+#ifdef MINYAR_BOUNDED_RC
+/* Only an irreversibly dead, unregistered object may carry this bit. It is
+ * separate from live proof/exposure tags; allocation and registration reset it. */
+enum { RC_CYCLE_PRIVATE_DEAD = 8 };
+static inline int rc_cycle_primary_idle(void) {
+    return !rc_cycle_inside && rc_cycle_phase == RC_CYCLE_IDLE && !rc_cycle_pending &&
+           !rc_cycle_requested && !rc_cycle_rescan && !rc_cycle_local_requested &&
+           rc_cycle_proof_valid && !rc_cycle_proof_build && rc_cycle_anchor_held() &&
+           !rc_cycle_proof_anchor->pinned;
+}
+/* Called only after a real outside-collector RC decrement reached zero, before
+ * the bounded queue reuses ownership as its link. A fresh uncaptured owner has
+ * never contributed an anchor path; retiring it cannot remove a proven edge. */
+static inline void rc_cycle_unregister_zero(RcObject *object) {
+    RcCycle *cycle = rc_cycle_metadata(object);
+    if (object->ownership != RC_TRACED || cycle->incoming || !cycle->registered ||
+        cycle->marked != 3 || (cycle->gray_next & ~(uintptr_t)4) || cycle->pinned ||
+        cycle->cleared || cycle == rc_cycle_proof_anchor || cycle == rc_cycle_temporary_anchor ||
+        cycle == rc_cycle_proof_retry || !rc_cycle_primary_idle()) {
+        rc_cycle_unregister(object);
+        return;
+    }
+    rc_cycle_temporary_changed();
+    rc_cycle_unlink(cycle);
+    cycle->gray_next = RC_CYCLE_PRIVATE_DEAD;
+}
+#endif
+
 static int rc_cycle_snapshot_new(RcCycle *cycle) {
     if (rc_cycle_local_job)
         return cycle->generation == rc_cycle_local_generation;
@@ -482,6 +511,28 @@ static inline void rc_cycle_edge_remove(void *value) {
     rc_cycle_shade(cycle);
     cycle->incoming--;
 }
+#ifdef MINYAR_BOUNDED_RC
+/* The parent's ownership word is already a cleanup link/cursor. Its private
+ * marker was established at true RC zero; each field rechecks current proof
+ * state, because application calls may run between bounded cleanup units. */
+static inline void rc_cycle_dead_edge_remove(RcObject *parent, void *value) {
+    RcCycle *child = rc_cycle_value(value);
+    if (!child)
+        return;
+    RcCycle *owner = rc_cycle_metadata(parent);
+    if (owner->registered || owner->gray_next != RC_CYCLE_PRIVATE_DEAD || owner->pinned ||
+        owner->cleared || owner->incoming || !rc_cycle_primary_idle()) {
+        rc_cycle_edge_remove(value);
+        return;
+    }
+    /* This excluded dead owner is not an anchor-to-child path. The paired
+     * incoming decrement and ordinary child RC drop preserve external owners;
+     * an unknown surviving child still requests its own bounded work. */
+    rc_cycle_temporary_changed();
+    child->incoming--;
+}
+#endif
+
 #ifndef MINYAR_BOUNDED_RC
 /* Eager profile helpers; the bounded profile has separate traced paths. */
 static void rc_cycle_free_object(RcObject *object) {

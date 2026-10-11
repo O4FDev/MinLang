@@ -107,7 +107,7 @@ static inline unsigned rc_drop_traced(RcObject *object) {
     object->ownership -= 8;
     if (object->ownership >> 3) { rc_cycle_after_drop(object); return 0; }
     if (rc_cycle_defer_zero(object)) return 0;
-    rc_cycle_unregister(object);
+    rc_cycle_unregister_zero(object);
     RcCycle *cycle = rc_cycle_metadata(object);
     if (cycle->cleared || !(cycle->record ? ((MinyarRecord *)(object + 1))->length
                                           : ((MinyarList *)(object + 1))->length)) {
@@ -177,7 +177,7 @@ static inline int rc_bounded_traced_visit(RcObject *object, size_t cursor, int r
     }
     if (recent) rc_bounded_save_cursor(object, cursor + 1);
     else rc_bounded_cursor = cursor + 1;
-    rc_cycle_edge_remove(child);
+    rc_cycle_dead_edge_remove(object, child);
     rc_drop(child);
     return 1;
 }
