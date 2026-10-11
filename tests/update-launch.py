@@ -82,8 +82,9 @@ class Launch(unittest.TestCase):
         if os.environ.get('MINYAR_UPDATE_EVIDENCE'):
             corpus=type(self).lab/'signed-corpus';corpus.mkdir(exist_ok=True)
             (corpus/(digest+'.artifact')).write_bytes(data)
-            metadata_hash=hashlib.sha256(self.metadata.read_bytes()).hexdigest()
-            (corpus/(metadata_hash+'.receipt')).write_bytes(self.signature.read_bytes()+self.metadata.read_bytes())
+            receipt=self.signature.read_bytes()+self.metadata.read_bytes()
+            receipt_hash=hashlib.sha256(receipt).hexdigest()
+            (corpus/(receipt_hash+'.receipt')).write_bytes(receipt)
         result=self.run_driver('install',str(self.artifact),device=device)
         return result,digest
 
