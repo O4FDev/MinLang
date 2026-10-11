@@ -153,9 +153,13 @@ or deletes them. Administrators can remove inactive staging data offline.
 Launch holds the updater lock, checks the entire indexed tree, rejects missing
 and extra files, symlinks/reparse points, hardlinks and changed file permissions,
 and compares all resources and code against the authenticated bundle bytes.
-Linux executes the retained checked native image with fexecve. macOS retains
-the image descriptor, checks its pathname identity immediately before execve,
-and launches it from its `.app/Contents/MacOS` location; macOS lacks fexecve.
+Linux executes the retained checked native image with fexecve. POSIX launch
+also resolves the original root through every lexical ancestor and compares it
+with the pinned root descriptor, rejecting root/parent renames and substitutions
+observed at that check. macOS retains the image descriptor and, after closing
+other inherited descriptors in the child, checks root, working-directory and
+executable pathname identities before execve from its
+`.app/Contents/MacOS` location; macOS lacks fexecve.
 Windows holds non-write/non-delete shared handles across verification and
 CreateProcessW, with an explicit application path and exact CRT argument
 quoting. POSIX inherits only descriptors 0/1/2; Windows supplies an explicit
@@ -165,8 +169,14 @@ override variables `LD_*` and `DYLD_*` are removed.
 
 These guarantees assume the documented protected app-owned root. A privileged
 or same-user attacker able to chmod/replace the app or its root is outside this
-boundary; on macOS descriptor retention is not a kernel descriptor-exec
-primitive. Call updater APIs from one thread. Application launchers must preserve
+boundary. Retained POSIX descriptors do not prohibit same-user rename or
+in-place writes. In particular, Darwin's final identity checks and execve are
+separate operations: a writer can change an ancestor, executable pathname or
+checked inode after the checks and before the kernel resolves the launch path.
+The deterministic mutation hook exercises changes before the final checks; it
+does not prove atomicity across this remaining boundary. macOS launch therefore
+requires the protected-root assumption and makes no absolute TOCTOU guarantee.
+Call updater APIs from one thread. Application launchers must preserve
 the journal during reinstall/recovery and surface refusal instead of silently
 running an older generation. No changes to application UI or global launcher
 dispatch are made by this updater source slice.
@@ -218,11 +228,18 @@ native host images. Files are published read-only (0444 data, 0555 code on POSIX
 
 Bundle v1 supports complete regular-file `.app`/Windows trees, including
 Info.plist, signature/ticket files, nested code and all indexed resources. It
-deliberately rejects symlink framework layouts, hardlinks, non-ASCII filenames,
-special files, xattr-only code signatures and resource forks. Build a compatible
-regular-file layout before signing; do not flatten or modify an already signed
-framework after notarization. Extended attributes are not transported. Production
-platform checks must validate the final reconstructed signed/stapled tree.
+deliberately rejects symlink framework layouts, including the usual
+`Foo.framework/Versions/Current` and top-level framework aliases, even when their
+targets remain inside the app. This is a supported resource-bundle scope, not a
+general transport for arbitrary existing macOS apps. It also rejects hardlinks,
+non-ASCII filenames, special files, xattr-only code signatures and resource forks.
+Build a compatible regular-file layout before signing; do not dereference,
+flatten or modify an already signed framework after notarization. The encoder
+does not offer a safe-dereference mode. Extended attributes are not transported.
+The signed package authenticates the exact directory index, executable modes
+and file bytes, and launch verifies the complete reconstructed tree. Production
+platform checks must additionally validate the final reconstructed
+signed/stapled tree with real platform tools and credentials.
 
 ## Signed wire format and rollback protection
 

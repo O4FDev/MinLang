@@ -65,10 +65,13 @@ def main():
                 return result.stdout.splitlines()
             prefix='san-' if sanitize else 'normal-'
             # Deterministic post-verification mutation races.
-            for mode in ['replace','write','extra']:
+            for mode in ['replace','write','extra','ancestor','parent','anchored-parent']:
                 for bundled,item in [(False,raw),(True,old)]:
                     if mode=='extra' and not bundled:continue
-                    root=lab/(prefix+mode+str(bundled));root.mkdir(mode=0o700)
+                    root=lab/(prefix+mode+str(bundled))
+                    if mode in ('parent','anchored-parent'):
+                        root.mkdir(mode=0o700);root=root/'installation'
+                    root.mkdir(mode=0o700)
                     assert invoke(root,item)==['ACTIVATED']
                     digest=item[1]
                     if bundled:
@@ -76,6 +79,8 @@ def main():
                         mutation=payload/('extra' if mode=='extra' else 'App.app/Contents/Resources/message.txt')
                     else:
                         mutation=root/'versions'/(digest+('.exe' if windows_host() else '.bin'))
+                    if mode=='ancestor':mutation=root
+                    if mode in ('parent','anchored-parent'):mutation=root.parent
                     output=invoke(root,item,mode,mutation=mutation)
                     if windows_host() and mode!='extra':
                         assert 'MUTATION-BLOCKED' in output and 'OWNED-HELPER' in output,output
@@ -112,7 +117,7 @@ def main():
                 parent=lab/(prefix+'alias');parent.symlink_to(lab,target_is_directory=True)
                 assert invoke(parent/actual.name,old)[0]=='ERROR'
         if os.environ.get('MINYAR_UPDATE_EVIDENCE'):
-            shutil.copytree(lab,Path(os.environ['MINYAR_UPDATE_EVIDENCE'])/'native-launch-fixtures',dirs_exist_ok=True)
+            shutil.copytree(lab,Path(os.environ['MINYAR_UPDATE_EVIDENCE'])/'native-launch-fixtures',dirs_exist_ok=True,symlinks=True)
         print('Checked OS execution, exclusive writers, every bundle death boundary, deterministic TOCTOU races and cleanup passed')
 
 if __name__=='__main__':main()

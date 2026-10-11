@@ -109,10 +109,10 @@ bool minyar_update_verify(const MinyarBytes *message, const MinyarBytes *signatu
 #ifndef _WIN32
 /* Every operation below starts from the pinned root descriptor. Intermediate
  * components are opened one at a time without following links. */
-static int safe_parent(const char *path, char leaf[UPD_PATH]) {
+static int path_parent(const char *path, char leaf[UPD_PATH], bool anchored) {
     const char *relative = path;
     int parent = -1;
-    for (int i = 0; i < UPD_HANDLES; i++) {
+    for (int i = 0; anchored && i < UPD_HANDLES; i++) {
         size_t n = strlen(sessions[i].root);
         if (sessions[i].id && n && !strncmp(path, sessions[i].root, n) && path[n] == '/') {
             parent = fcntl(sessions[i].root_fd, F_DUPFD_CLOEXEC, 3);
@@ -159,6 +159,9 @@ static int safe_parent(const char *path, char leaf[UPD_PATH]) {
     }
     memmove(leaf, component, strlen(component) + 1);
     return parent;
+}
+static int safe_parent(const char *path, char leaf[UPD_PATH]) {
+    return path_parent(path, leaf, true);
 }
 static int directory_fd(const char *path) {
     char leaf[UPD_PATH];
@@ -823,6 +826,26 @@ static bool identity_matches(int original, const char *path, bool is_directory) 
     upd_close(current);
     return success;
 }
+#ifndef _WIN32
+static bool root_identity_matches(UpdateSession *found) {
+    char leaf[UPD_PATH];
+    /* Never use another session's cached ancestor. This check must observe
+     * the current lexical namespace all the way from the filesystem root. */
+    int parent = path_parent(found->root, leaf, false);
+    if (parent < 0)
+        return false;
+    int current = openat(parent, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    close(parent);
+    if (current < 0)
+        return false;
+    struct stat original, now;
+    bool success = fstat(found->root_fd, &original) == 0 && fstat(current, &now) == 0 &&
+                   original.st_dev == now.st_dev && original.st_ino == now.st_ino;
+    close(current);
+    return success;
+}
+#endif
+
 static bool tree_contains(const UpdateBundle *bundle, const char *path, bool directory_entry) {
     for (size_t i = 0; i < bundle->count; i++)
         if (!strcmp(bundle->entries[i].path, path) &&
@@ -1256,7 +1279,13 @@ long long minyar_update_launchChecked(long long id, const MinyarText *digest,
         problem("active executable is incomplete, changed or not a native host image");
     if (success) {
         UPDATE_HOOK("launch-before-exec");
-        success = identity_matches(cwd, payload, true) &&
+#ifndef _WIN32
+        /* Descendant opens are anchored to root_fd. Also resolve the original
+         * root through its lexical ancestors so a moved/replaced namespace
+         * cannot pass only descriptor-relative generation checks. */
+        success = root_identity_matches(found);
+#endif
+        success = success && identity_matches(cwd, payload, true) &&
                   identity_matches(executable, path, false) &&
                   same_bytes(executable, image, image_size);
         if (success && bundle.entries) {
@@ -1411,19 +1440,27 @@ long long minyar_update_launchChecked(long long id, const MinyarText *digest,
             close(report[0]);
             if (fchdir(cwd) < 0)
                 error = errno;
+            /* Close all nonstandard inherited descriptors. Darwin also keeps
+             * two close-on-exec directory descriptors for its last pathname
+             * identity checks; none survive a successful exec. */
+            for (int fd = 3; fd < bound; fd++)
+                if (fd != executable && fd != report[1]
 #ifdef __APPLE__
-            if (!error && !identity_matches(executable, path, false))
+                    && fd != found->root_fd && fd != cwd
+#endif
+                )
+                    close(fd);
+#ifdef __APPLE__
+            if (!error && (!root_identity_matches(found) || !identity_matches(cwd, payload, true) ||
+                           !identity_matches(executable, path, false)))
                 error = ESTALE;
 #endif
-            /* Close all nonstandard inherited descriptors; retain only the
-             * authenticated image and close-on-exec status pipe. */
-            for (int fd = 3; fd < bound; fd++)
-                if (fd != executable && fd != report[1])
-                    close(fd);
             if (!error) {
 #ifdef __APPLE__
-                /* Darwin lacks fexecve. The retained descriptor and immutable
-                 * protected tree are checked again immediately before exec. */
+                /* Darwin has no descriptor-exec primitive here. A same-user
+                 * writer can still rename/write after this final check and
+                 * before pathname resolution in execve. Protected-root policy,
+                 * not descriptor retention, excludes that remaining race. */
                 execve(path, argv, environment);
 #else
                 fexecve(executable, argv, environment);

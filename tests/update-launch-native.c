@@ -31,6 +31,16 @@ void minyar_update_test_hook(const char *point) {
     }
     if (!mutation || strcmp(point, "launch-before-exec"))
         return;
+    if (!strcmp(action, "ancestor") || !strcmp(action, "parent") ||
+        !strcmp(action, "anchored-parent")) {
+        char moved[4096];
+        assert(snprintf(moved, sizeof(moved), "%s.moved", mutation) < (int)sizeof(moved));
+        if (rename(mutation, moved))
+            puts("MUTATION-BLOCKED");
+        else
+            puts("ANCESTOR-RENAMED");
+        return;
+    }
     if (!strcmp(action, "replace")) {
 #ifdef _WIN32
         int removed = remove(mutation);
@@ -75,6 +85,13 @@ static MinyarBytes *file(const char *path) {
 int main(int argc, char **argv) {
     assert(argc == 10);
     MinyarText *root = text(argv[1]), *digest = text(argv[4]), *hash = text(argv[5]);
+    long long ancestor = -1;
+    if (!strcmp(argv[7], "anchored-parent")) {
+        MinyarText *parent = text(argv[9]);
+        ancestor = minyar_update_begin(parent);
+        minyar_rc_release(parent);
+        assert(ancestor >= 0);
+    }
     long long handle = minyar_update_begin(root);
     if (handle < 0) {
         puts("ERROR");
@@ -85,6 +102,8 @@ int main(int argc, char **argv) {
         minyar_rc_release(root);
         minyar_rc_release(digest);
         minyar_rc_release(hash);
+        if (ancestor >= 0)
+            minyar_update_end(ancestor);
         return 0;
     }
     if (!strcmp(argv[7], "hold")) {
@@ -135,6 +154,8 @@ int main(int argc, char **argv) {
         }
     }
     minyar_update_end(handle);
+    if (ancestor >= 0)
+        minyar_update_end(ancestor);
     minyar_rc_release(root);
     minyar_rc_release(digest);
     minyar_rc_release(hash);
