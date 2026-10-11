@@ -357,19 +357,23 @@ use "results" as results
 use "errors" as errors
 let listener = net.listen("127.0.0.1", 0, 4)
 let sender = net.connect("127.0.0.1", net.localPort(listener))
+let written = results.write(sender, Bytes("abc"))
+if !net.ready(listener, 1000) { fail("TCP listener did not become ready") }
 let receiver = net.accept(listener)
 print(listener >= 0 && sender >= 0 && receiver >= 0)
-match results.write(sender, Bytes("abc")) { Ok(n) { print(n) } Err(e) { print(errors.message(e)) } }
+match written { Ok(n) { print(n) } Err(e) { print(errors.message(e)) } }
 net.close(sender)
 print(net.ready(receiver, 1000))
 match results.read(receiver, 2) {
     Ok(read) { print(Text(results.data(read))); print(results.ended(read)) }
     Err(error) { print(errors.message(results.error(error))) }
 }
+if !net.ready(receiver, 1000) { fail("TCP suffix did not become ready") }
 match results.read(receiver, 16) {
     Ok(read) { print(Text(results.data(read))); print(results.ended(read)) }
     Err(error) { print(errors.message(results.error(error))) }
 }
+if !net.ready(receiver, 1000) { fail("TCP EOF did not become ready") }
 match results.read(receiver, 16) {
     Ok(read) { print(results.data(read).length); print(results.ended(read)) }
     Err(error) { print(errors.message(results.error(error))) }
