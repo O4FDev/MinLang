@@ -6,7 +6,9 @@
 #include <time.h>
 #include <errno.h>
 
-static long long slot(void *value) { return (long long)(uintptr_t)value; }
+static long long slot(void *value) {
+    return (long long)(uintptr_t)value;
+}
 static size_t waits, maximum_work;
 
 static long long service_wait(long long timeout) {
@@ -17,7 +19,8 @@ static long long service_wait(long long timeout) {
 #endif
 #ifdef MINYAR_BOUNDED_RC
     assert(rc_bounded_last_work <= MINYAR_RC_POLL_BUDGET);
-    if (maximum_work < rc_bounded_last_work) maximum_work = rc_bounded_last_work;
+    if (maximum_work < rc_bounded_last_work)
+        maximum_work = rc_bounded_last_work;
 #endif
     assert(result == timeout || (result >= 0 && result <= 10));
     return result;
@@ -50,8 +53,10 @@ static double cpu_seconds(void) {
     FILETIME created, exited, kernel, user;
     assert(GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user));
     ULARGE_INTEGER k, u;
-    k.LowPart = kernel.dwLowDateTime; k.HighPart = kernel.dwHighDateTime;
-    u.LowPart = user.dwLowDateTime; u.HighPart = user.dwHighDateTime;
+    k.LowPart = kernel.dwLowDateTime;
+    k.HighPart = kernel.dwHighDateTime;
+    u.LowPart = user.dwLowDateTime;
+    u.HighPart = user.dwHighDateTime;
     return (double)(k.QuadPart + u.QuadPart) / 1e7;
 #else
     return (double)clock() / CLOCKS_PER_SEC;
@@ -63,7 +68,8 @@ static void sleep_ms(long long milliseconds) {
     Sleep((DWORD)milliseconds);
 #else
     struct timespec request = {milliseconds / 1000, milliseconds % 1000 * 1000000};
-    while (nanosleep(&request, &request) && errno == EINTR) {}
+    while (nanosleep(&request, &request) && errno == EINTR) {
+    }
 #endif
 }
 static void no_debt(void) {
@@ -87,7 +93,8 @@ static void ordinary_debt(void) {
     while (pending()) {
         long long wait = service_wait(-1);
         /* Ordinary frame/object/chunk debt remains immediately runnable. */
-        if (pending()) assert(wait == 0);
+        if (pending())
+            assert(wait == 0);
     }
     assert(!rc_object_count && !rc_bytes);
     no_debt();
@@ -99,13 +106,15 @@ int main(int argc, char **argv) {
     no_debt();
     ordinary_debt();
     MinyarRecord *nodes[N];
-    for (unsigned i = 0; i < N; i++) nodes[i] = minyar_record_new_traced(F);
+    for (unsigned i = 0; i < N; i++)
+        nodes[i] = minyar_record_new_traced(F);
     for (unsigned i = 0; i < N; i++) {
         minyar_record_set_reference_traced(nodes[i], 0, slot(nodes[i]));
         minyar_record_set_reference_traced(nodes[i], 1, slot(nodes[(i + 1) % N]));
         minyar_record_set_reference_traced(nodes[i], 2, slot(nodes[(i + N - 1) % N]));
     }
-    for (unsigned i = 1; i < N; i++) minyar_rc_release(nodes[i]);
+    for (unsigned i = 1; i < N; i++)
+        minyar_rc_release(nodes[i]);
     drain();
     assert(rc_object_count == N);
     size_t attempts = 0, epochs = rc_cycle_epochs;
@@ -118,12 +127,13 @@ int main(int argc, char **argv) {
         long long wait = service_wait(-1);
         if (wait != 0) {
             /* Infinite waits cannot strand newly requested graph debt. */
-            if (pending()) assert(wait > 0 && wait <= 10);
+            if (pending())
+                assert(wait > 0 && wait <= 10);
             break;
         }
         if (++attempts >= 16u * N * F + 16) {
-            fprintf(stderr, "borrow-only churn: attempts=%zu epochs=%zu objects=%zu\n",
-                    attempts, rc_cycle_epochs - epochs, rc_object_count);
+            fprintf(stderr, "borrow-only churn: attempts=%zu epochs=%zu objects=%zu\n", attempts,
+                    rc_cycle_epochs - epochs, rc_object_count);
             assert(!"a completed snapshot must permit a bounded reactor wait");
         }
     }
@@ -134,7 +144,10 @@ int main(int argc, char **argv) {
         long long wait = service_wait(20);
         assert(rc_object_count == N);
         assert(minyar_record_get(nodes[0], 0) == slot(nodes[0]));
-        if (wait > 0) { waits++; sleep_ms(wait); }
+        if (wait > 0) {
+            waits++;
+            sleep_ms(wait);
+        }
     }
     double elapsed = wall_seconds() - start;
     double idle_cpu = (cpu_seconds() - cpu_start) / elapsed;
@@ -151,7 +164,8 @@ int main(int argc, char **argv) {
     drain();
     assert(!rc_object_count && !rc_bytes && !rc_cycle_head && !rc_cycle_pending);
     no_debt();
-    printf("cycle progress: borrows=%zu epochs=%zu waits=%zu idle_cpu=%.6f max_work=%zu objects=0 bytes=0\n",
+    printf("cycle progress: borrows=%zu epochs=%zu waits=%zu idle_cpu=%.6f max_work=%zu objects=0 "
+           "bytes=0\n",
            attempts, rc_cycle_epochs, waits, idle_cpu, maximum_work);
     return 0;
 }

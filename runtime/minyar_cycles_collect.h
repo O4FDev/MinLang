@@ -35,7 +35,10 @@ static void rc_cycle_unit_body(void) {
     }
     if (rc_cycle_phase == RC_CYCLE_ROOTS) {
         RcCycle *cycle = rc_cycle_cursor;
-        if (!cycle) { rc_cycle_phase = RC_CYCLE_MARK; return; }
+        if (!cycle) {
+            rc_cycle_phase = RC_CYCLE_MARK;
+            return;
+        }
         rc_cycle_cursor = cycle->next;
         if ((rc_cycle_object(cycle)->ownership >> 3) > cycle->incoming)
             rc_cycle_shade(cycle);
@@ -58,7 +61,8 @@ static void rc_cycle_unit_body(void) {
         }
         if (rc_cycle_index < rc_cycle_limit) {
             long long *slot = rc_cycle_slot(cycle, rc_cycle_index++);
-            if (slot) rc_cycle_shade(rc_cycle_value((void *)(uintptr_t)*slot));
+            if (slot)
+                rc_cycle_shade(rc_cycle_value((void *)(uintptr_t)*slot));
         }
         if (rc_cycle_index == rc_cycle_limit) {
             rc_cycle_active = NULL;
@@ -75,6 +79,7 @@ static void rc_cycle_unit_body(void) {
         cycle = rc_cycle_cursor;
         if (!cycle) {
             rc_cycle_cohort = NULL;
+            rc_cycle_completed++;
             rc_cycle_phase = RC_CYCLE_IDLE;
             if (!rc_cycle_requested) {
                 rc_cycle_pending = 0;
@@ -88,7 +93,8 @@ static void rc_cycle_unit_body(void) {
         unsigned live = cycle->marked;
         cycle->generation = rc_cycle_generation;
         cycle->marked = 0;
-        if (live) return;
+        if (live)
+            return;
         minyar_rc_retain(rc_cycle_object(cycle) + 1);
         rc_cycle_active = cycle;
         rc_cycle_index = 0;
@@ -126,7 +132,8 @@ static MINYAR_NOINLINE void rc_cycle_unit(void) {
 static void rc_cycle_eager_service(size_t budget) {
     /* Recursive public releases only occur in the eager queue drain. */
     static unsigned servicing;
-    if (servicing) return;
+    if (servicing)
+        return;
     servicing = 1;
     while (rc_cycle_pending && budget--) {
         rc_cycle_unit();
