@@ -76,7 +76,21 @@ class Lab:
         assert line and line.startswith('READY '),(line,self.diagnostic())
         self.udp_port,self.device_port,self.gateway_port=map(int,line.split()[1:])
         self.health=dict(in_flight=0,max_concurrent=8,paused=False,policy_hash='a'*64,public_ip='203.0.113.2',asn=64500,country='GB')
-        (self.directory/'source.json').write_text(json.dumps(dict(commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),source_sha256=hashlib.sha256((ROOT/'library/peeredge.min').read_bytes()).hexdigest(),binary_sha256=hashlib.sha256(self.binary.read_bytes()).hexdigest(),start=time.time(),pid=self.edge.pid,asan_options=self.env.get('ASAN_OPTIONS')),indent=2))
+        # Immutable CI archives deliberately omit Git; source/binary hashes
+        # remain the proof. An explicit original commit is validated metadata.
+        commit=os.environ.get('MINYAR_SOURCE_COMMIT')
+        commit_source='environment' if commit else 'git'
+        if not commit:
+            found=subprocess.run(['git','rev-parse','HEAD'],cwd=ROOT,capture_output=True,text=True)
+            commit=found.stdout.strip() if found.returncode==0 else None
+        if commit is not None and (len(commit)!=40 or any(c not in '0123456789abcdef' for c in commit)):
+            raise ValueError('MINYAR_SOURCE_COMMIT must be a full commit SHA')
+        hashes={}
+        for group in ('library','runtime','compiler','tools'):
+            for path in (ROOT/group).rglob('*'):
+                if path.is_file() and path.suffix in ('.min','.c','.m','.h','.py'):
+                    hashes[str(path.relative_to(ROOT))]=hashlib.sha256(path.read_bytes()).hexdigest()
+        (self.directory/'source.json').write_text(json.dumps(dict(commit=commit,commit_source=commit_source if commit else 'git-free snapshot',source_sha256=hashlib.sha256((ROOT/'library/peeredge.min').read_bytes()).hexdigest(),sources_sha256=hashes,binary_sha256=hashlib.sha256(self.binary.read_bytes()).hexdigest(),launcher_sha256=hashlib.sha256((ROOT/'minyar').read_bytes()).hexdigest(),start=time.time(),pid=self.edge.pid,asan_options=self.env.get('ASAN_OPTIONS')),indent=2))
     def diagnostic(self):
         if self.stderr and not self.stderr.closed:self.stderr.flush()
         return (self.directory/'edge.stderr').read_text()
