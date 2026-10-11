@@ -16,6 +16,7 @@ static int udp_offload_unavailable(void) {
 #endif
 #if defined(__linux__) && !defined(MINYAR_DISABLE_UDP_OFFLOAD)
 #include <netinet/udp.h>
+#include <time.h>
 #ifndef UDP_SEGMENT
 #define UDP_SEGMENT 103
 #endif
@@ -44,6 +45,18 @@ static NetUdpOffload *udp_offload_find(long long handle) {
         return NULL;
     NetUdpOffload *slot = &udp_offload_slots[low - 1];
     return slot->active && slot->generation == (uint32_t)(value >> 32) ? slot : NULL;
+}
+/* Only positive, kernel-backed waits need a clock. Keep one absolute
+ * deadline across EINTR; clock failures remain recoverable native results. */
+static int udp_offload_clock(uint64_t *nanoseconds) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now))
+        return errno;
+    if (now.tv_sec < 0 || now.tv_nsec < 0 || now.tv_nsec >= 1000000000 ||
+        (uint64_t)now.tv_sec > (UINT64_MAX - (uint64_t)now.tv_nsec) / 1000000000)
+        return EOVERFLOW;
+    *nanoseconds = (uint64_t)now.tv_sec * 1000000000 + (uint64_t)now.tv_nsec;
+    return 0;
 }
 static bool udp_offload_unsupported(int code) {
     return code == ENOPROTOOPT || code == EOPNOTSUPP || code == ENOSYS;
@@ -410,11 +423,32 @@ MinyarBytes *minyar_net_offloadReadyResult(long long handle, long long milliseco
         return connect_result(NET_FAILURE, slot ? EINVAL : EBADF, 0);
     if (slot->wire_length)
         return connect_result(NET_OK, 0, 1);
+    uint64_t deadline = 0;
+    if (milliseconds) {
+        int code = udp_offload_clock(&deadline);
+        uint64_t duration = (uint64_t)milliseconds * 1000000;
+        if (code || deadline > UINT64_MAX - duration)
+            return connect_result(NET_FAILURE, code ? code : EOVERFLOW, 0);
+        deadline += duration;
+    }
     struct pollfd entry = {slot->socket, POLLIN, 0};
-    int ready;
-    do {
-        ready = poll(&entry, 1, (int)milliseconds);
-    } while (ready < 0 && interrupted(errno));
+    int ready, remaining = (int)milliseconds;
+    for (;;) {
+        ready = poll(&entry, 1, remaining);
+        if (ready >= 0 || !interrupted(errno))
+            break;
+        uint64_t now = 0;
+        int code = milliseconds ? udp_offload_clock(&now) : 0;
+        if (code)
+            return connect_result(NET_FAILURE, code, 0);
+        if (!milliseconds || now >= deadline) {
+            ready = 0;
+            break;
+        }
+        uint64_t left = deadline - now;
+        uint64_t rounded = left / 1000000 + (left % 1000000 != 0);
+        remaining = rounded > INT_MAX ? INT_MAX : (int)rounded;
+    }
     if (ready > 0 && (entry.revents & POLLNVAL))
         return connect_result(NET_FAILURE, EBADF, 0);
     return connect_result(ready < 0 ? NET_FAILURE : NET_OK, ready < 0 ? errno : 0, ready > 0);
