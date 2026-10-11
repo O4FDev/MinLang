@@ -422,11 +422,11 @@ def main():
             else:
                 native += [native_object(project, clang, base, 'desktop.c', native_flags)]
                 if platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
-                    native += ['-luser32', '-lshell32', '-ladvapi32', '-lole32', '-loleaut32', '-liphlpapi',
-                               '-luuid', '-lws2_32', '-lbcrypt', '-lruntimeobject']
                     notification_object = native_object(project, clang, base, 'winnotify.c', native_flags)
                     if notification_object not in native:
                         native += [notification_object]
+                    native += ['-luser32', '-lshell32', '-ladvapi32', '-lole32', '-loleaut32', '-liphlpapi',
+                               '-luuid', '-lws2_32', '-lbcrypt', '-lruntimeobject']
         else:
             raise ValueError(f'the program uses an unknown native library: {library}')
     lto = lto_flags(clang, link_flags) if release == '1' else []
