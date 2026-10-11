@@ -251,10 +251,22 @@ def serve(options):
         ready_monotonic = time.monotonic()
         print('READY ' + json.dumps(dict(port=udp, gateway_port=gateway, pid=edge.pid)), flush=True)
         advertised = f'localhost:{gateway}'
+        result['admission_samples'] = []
         while time.monotonic() < deadline:
             if edge.poll() is not None:
                 raise ValueError('edge exited before device admission')
-            if client.command('DBSIZE') == options.peers:
+            count = client.command('DBSIZE')
+            udp_queues = []
+            for family in ('udp', 'udp6'):
+                for line in Path('/proc/net/' + family).read_text().splitlines()[1:]:
+                    fields = line.split()
+                    if int(fields[1].rsplit(':', 1)[1], 16) == udp:
+                        udp_queues.append(dict(family=family, rx_bytes=int(fields[4].split(':')[1],16), drops=int(fields[-1])))
+            admission = dict(elapsed_seconds=time.monotonic()-ready_monotonic, redis_live_count=count, target=process_sample(edge.pid), udp=udp_queues)
+            result['admission_samples'].append(admission)
+            with (directory / 'admission.jsonl').open('a') as observation:
+                observation.write(json.dumps(admission,sort_keys=True)+'\n')
+            if count == options.peers:
                 epochs = validate_states(client.states(), options.peers, advertised, int(time.time()))
                 break
             time.sleep(.5)
