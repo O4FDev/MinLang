@@ -32,9 +32,27 @@ let refused = net.connectStart("127.0.0.1",port)
 if errors.integerOk(refused) {
     let socket = errors.integerValue(refused)
     let registration = errors.integerValue(loop.watch(selector,socket,loop.readWriteInterest(),2))
+    let deadline = net.monotonicMilliseconds() + 5000
+    let finished = errors.boolean(false); let completed = false
     let event = loop.wait(selector,1000,16)
+    while !errors.isError(loop.batchError(event)) && loop.events(event).length == 0 {
+        // A timed readiness wait may expire before Winsock finishes its
+        // asynchronous refusal. It must still report pending, not success.
+        let pending = net.connectFinish(socket)
+        if errors.booleanOk(pending) { fail("refusal accepted while pending") }
+        if errors.code(errors.booleanError(pending)) != errors.wouldBlockCode() {
+            // Completion may race the timed wait. Preserve its owned error:
+            // SO_ERROR is consumed by connectFinish, so do not read it twice.
+            finished = pending; completed = true
+            event = loop.wait(selector,0,16)
+            break
+        }
+        if net.monotonicMilliseconds() >= deadline { fail("refusal deadline") }
+        event = loop.wait(selector,1000,16)
+    }
     if errors.isError(loop.batchError(event)) || loop.events(event).length == 0 { fail("refusal readiness") }
-    if errors.booleanOk(net.connectFinish(socket)) { fail("refusal accepted") }
+    if !completed { finished = net.connectFinish(socket) }
+    if errors.booleanOk(finished) || errors.code(errors.booleanError(finished)) == errors.wouldBlockCode() { fail("refusal accepted or still pending") }
     loop.remove(selector,registration); net.close(socket)
 }
 loop.close(selector)
