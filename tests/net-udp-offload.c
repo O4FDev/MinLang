@@ -20,6 +20,9 @@ static ssize_t oracle_sendmsg(int, const struct msghdr *, int);
 #ifdef __linux__
 #include <netinet/udp.h>
 #include <sys/time.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <time.h>
 #endif
 void minyar_rc_release(void *);
 static uint32_t u32(const MinyarBytes *b, size_t at) {
@@ -76,6 +79,55 @@ static size_t packet(const MinyarBytes *b, size_t at, const unsigned char *want,
     if (length)
         assert(!memcmp(b->bytes + at + 25, want, length));
     return at + 25 + length;
+}
+static volatile sig_atomic_t readiness_interruptions;
+static void readiness_signal(int signal) {
+    (void)signal;
+    readiness_interruptions++;
+}
+static double readiness_clock(void) {
+    struct timespec now;
+    assert(!clock_gettime(CLOCK_MONOTONIC, &now));
+    return now.tv_sec + now.tv_nsec / 1e9;
+}
+static void readiness_deadline(void) {
+    MinyarText host = {(const unsigned char *)"127.0.0.1", 9, 0, NULL, NULL};
+    MinyarBytes *r = minyar_net_offloadOpenResult(&host, 0);
+    assert(u32(r, 0) == NET_OK);
+    long long id = value(r);
+    minyar_rc_release(r);
+    struct sigaction action = {0}, prior;
+    action.sa_handler = readiness_signal;
+    assert(!sigemptyset(&action.sa_mask) && !sigaction(SIGUSR1, &action, &prior));
+    pid_t owner = getpid(), child = fork();
+    assert(child >= 0);
+    if (!child) {
+        for (unsigned i = 0; i < 45; i++) {
+            struct timespec pause = {0, 5000000};
+            nanosleep(&pause, NULL);
+            if (kill(owner, SIGUSR1))
+                _exit(0);
+        }
+        _exit(0);
+    }
+    double start = readiness_clock();
+    r = minyar_net_offloadReadyResult(id, 30);
+    double elapsed = readiness_clock() - start;
+    int status;
+    kill(child, SIGTERM);
+    while (waitpid(child, &status, 0) < 0)
+        assert(errno == EINTR);
+    assert(!sigaction(SIGUSR1, &prior, NULL));
+    assert(u32(r, 0) == NET_OK && value(r) == 0);
+    minyar_rc_release(r);
+    r = minyar_net_offloadCloseResult(id);
+    assert(u32(r, 0) == NET_OK);
+    minyar_rc_release(r);
+    fprintf(stderr, "UDP readiness deadline: 30ms requested, %.3fms observed, %d signals\n",
+            elapsed * 1000, (int)readiness_interruptions);
+    assert(readiness_interruptions > 0);
+    assert(elapsed >= 0.020 && elapsed < 0.100);
+    puts("signal-interrupted UDP readiness retains its original deadline");
 }
 static void send_oracle(void) {
     MinyarText host = {(const unsigned char *)"127.0.0.1", 9, 0, NULL, NULL};
@@ -680,6 +732,7 @@ static void controls(void) {
 #endif
 int main(void) {
 #if defined(__linux__) && !defined(MINYAR_DISABLE_UDP_OFFLOAD)
+    readiness_deadline();
     send_oracle();
     recv_oracle();
     ipv6_oracle();
