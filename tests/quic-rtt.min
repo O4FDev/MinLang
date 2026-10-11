@@ -359,15 +359,76 @@ function retainedHistoryCap(root: Bytes,cert: Bytes,key: Bytes,client: Bytes,cli
     if newer!=0 { return newer }
     return 0
 }
+// Check actual authenticated wire geometry independently of the send scheduler.
+// Padding-only packets isolate header widths from congestion and pacing.
+function longHeaderGeometry(root: Bytes,client: Bytes,clientKey: Bytes): Integer {
+    let lengths: List<Integer> = [40,43,44,1170,16363,16364]
+    let tokens: List<Integer> = [0,63,64]
+    for level in 0..4 {
+        if level==2 { continue }
+        for role in 0..2 {
+            for token in tokens {
+                if level!=0 && (role!=0 || token!=0) { continue }
+                for length in lengths {
+                    let c=quic.client("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey)
+                    if c.pending.length==0 { return 106 }
+                    let keys=c.spaces[0].write
+                    let pending=c.pending[0];pending.level=level;pending.payload=Bytes(length);c.pending=[pending]
+                    c.clientRole=role==0;c.addressValidated=true;c.paths[0].validated=true;c.retryToken=Bytes(token)
+                    let index=level;if level==3 { index=2;c.earlyWrite=keys }
+                    c.spaces[index].active=true
+                    if level!=3 { c.spaces[index].write=keys }
+                    let packets=quic.poll(c,0)
+                    if packets.length!=1 { print("long-header geometry packet count");return 107 }
+                    let packet=packets[0];let header=wire.header(packet,0,c.remote.length)
+                    if !header.valid || header.destination.length!=c.remote.length || header.source.length!=c.local.length || header.end!=packet.length { return 108 }
+                    let opened=protection.unprotect(keys,packet,header.numberOffset,-1)
+                    if !opened.valid || opened.payload.length<length { return 109 }
+                    let expected=11+c.remote.length+c.local.length+errors.bytesValue(wire.encode(opened.payload.length+20)).length
+                    if level==0 {
+                        let expectedToken=0;if role==0 { expectedToken=token }
+                        if header.token.length!=expectedToken { return 110 }
+                        expected+=errors.bytesValue(wire.encode(expectedToken)).length+expectedToken
+                        if packet.length!=max(1200,expected+length+16) { return 111 }
+                    } else if opened.payload.length!=length { return 112 }
+                    if opened.header.length!=expected || packet.length!=expected+opened.payload.length+16 { return 113 }
+                    for at in 0..opened.payload.length { if opened.payload[at]!=0 { return 114 } }
+                    if pending.payload.length!=length || c.pending.length!=0 { return 115 }
+                }
+            }
+        }
+    }
+    return 0
+}
+function exactSendBudget(c: quic.Connection,now: Integer): Integer {
+    if c.pending.length!=0 || c.flight!=0 { return 116 }
+    quic.ping(c);let pending=c.pending[0];pending.payload.resize(43)
+    // A path CID can have a different width from the active connection CID.
+    c.paths[0].remoteId=Bytes(20)
+    c.spaces[2].writeGeneration=1;c.spaces[2].next=0x10000
+    let expected=1+20+4+43+16
+    c.paceAt=now;c.paceCredit=Float(expected-1)
+    let next=c.spaces[2].next;let readAcknowledged=c.spaces[2].readAcknowledged
+    if quic.poll(c,now).length!=0 || c.pending.length!=1 || pending.payload.length!=43 || c.spaces[2].next!=next || c.spaces[2].readAcknowledged!=readAcknowledged { return 117 }
+    c.paceCredit=Float(expected);c.paceAt=now
+    let packets=quic.poll(c,now)
+    if packets.length!=1 || packets[0].length!=expected { return 118 }
+    let header=wire.header(packets[0],0,20)
+    let opened=protection.unprotect(c.spaces[2].write,packets[0],header.numberOffset,next-1)
+    if !header.valid || !opened.valid || opened.number!=next || opened.header.length!=25 || (opened.header[0]&4)==0 || opened.payload.length!=43 || opened.payload[0]!=1 { return 119 }
+    if pending.payload.length!=43 || c.spaces[2].sent.length!=1 || c.spaces[2].sent[0].payload.length!=43 || c.spaces[2].readAcknowledged!=readAcknowledged { return 120 }
+    return 0
+}
 function main(): Integer {
     let root=readBytesFile(argument(0));let cert=readBytesFile(argument(1));let key=readBytesFile(argument(2));let client=readBytesFile(argument(3));let clientKey=readBytesFile(argument(4))
-    for scenario in 0..14 {
+    let geometry=longHeaderGeometry(root,client,clientKey);if geometry!=0 { return geometry }
+    for scenario in 0..15 {
         let candidate=quic.client("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey)
         let peer=quic.server(randomBytes(80),"minyar-test",candidate.originalDestination,[cert],key,[root],true)
         for count in 0..200 { drive(candidate,peer,count*10) }
         if !candidate.confirmed || !peer.confirmed { return 68 }
         let result=0
-        if scenario==0 { result=lateACK(candidate,peer,2000) } else if scenario==1 { result=queuedMixed(candidate,peer,2000) } else if scenario==2 { result=recoveredDelivery(candidate,peer,2000) } else if scenario==3 { result=boundedLateDelivery(candidate,peer,2000,1) } else if scenario==4 { result=freshProbe(candidate,peer,2000) } else if scenario==7 { result=boundedLateDelivery(candidate,peer,2000,3) } else if scenario==8 { result=lateReset(candidate,peer,2000) } else if scenario==11 { result=duplicateProbe(candidate,peer,2000) } else if scenario==12 { result=sendProgressProbe(candidate,peer,2000) } else if scenario==13 { result=partialLostReferences(candidate,peer,2000) } else { result=delayedPersistent(candidate,peer,2000,scenario==6 || scenario==9,scenario==9 || scenario==10) }
+        if scenario==14 { result=exactSendBudget(candidate,2000) } else if scenario==0 { result=lateACK(candidate,peer,2000) } else if scenario==1 { result=queuedMixed(candidate,peer,2000) } else if scenario==2 { result=recoveredDelivery(candidate,peer,2000) } else if scenario==3 { result=boundedLateDelivery(candidate,peer,2000,1) } else if scenario==4 { result=freshProbe(candidate,peer,2000) } else if scenario==7 { result=boundedLateDelivery(candidate,peer,2000,3) } else if scenario==8 { result=lateReset(candidate,peer,2000) } else if scenario==11 { result=duplicateProbe(candidate,peer,2000) } else if scenario==12 { result=sendProgressProbe(candidate,peer,2000) } else if scenario==13 { result=partialLostReferences(candidate,peer,2000) } else { result=delayedPersistent(candidate,peer,2000,scenario==6 || scenario==9,scenario==9 || scenario==10) }
         if result!=0 { return result }
     }
     let capped=retainedHistoryCap(root,cert,key,client,clientKey);if capped!=0 { return capped }
