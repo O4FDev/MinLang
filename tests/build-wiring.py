@@ -23,9 +23,10 @@ class BuildWiring(unittest.TestCase):
         aggregates = {'check', 'check-portable', 'check-sanitize',
                       'check-managed-graphs-profiles', 'check-cycle-progress',
                       'check-cycle-progress-sanitize'}
-        inputs = {'tests/cycle-progress-observability.py', 'tests/cycle-progress.c',
+        inputs = {'tests/cycle-progress-observability.py',
+                  'tests/cycle-progress-observability-harness.py', 'tests/cycle-progress.c',
                   'tests/fixtures/cycle-progress-before-observability.c.txt',
-                  'tests/clang_helpers.py'}
+                  'tests/clang_helpers.py', 'tests/test_evidence.py', 'tools/host_paths.py'}
         source = (ROOT/'build-support/managed-graphs.mk').read_text()
         marker = '# Mocked idle observability preserves the historical metric.'
         self.assertIn(marker, source)
@@ -55,6 +56,7 @@ class BuildWiring(unittest.TestCase):
                 self.assertTrue(inputs <= rules.get(target, set()))
                 commands = result.stdout.split('# GNU Make', 1)[0]
                 self.assertEqual(commands.count('python3 tests/cycle-progress-observability.py'), 1)
+                self.assertEqual(commands.count('python3 tests/cycle-progress-observability-harness.py'), 1)
                 self.assertIn('MINYAR_TEST_CLANG="retained-clang"', commands)
                 self.assertIn('retained-limited python3', commands)
                 self.assertIn('--evidence "$evidence/run"', commands)
@@ -103,7 +105,7 @@ class BuildWiring(unittest.TestCase):
         spec.loader.exec_module(catalogue)
         data = json.loads((ROOT/'tests/suite-catalogue.json').read_text())
         catalogue.validate(data, ROOT)
-        for name in sorted(inputs - {'tests/clang_helpers.py'}):
+        for name in sorted(name for name in inputs if name.startswith('tests/')):
             self.assertIn(name, catalogue.discover(ROOT))
             with self.subTest(omitted_source=name), self.assertRaises(ValueError):
                 catalogue.validate(dict(data, sources=[row for row in data['sources']
