@@ -6,6 +6,7 @@ from pathlib import Path
 import struct
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[1]
 SPEC=importlib.util.spec_from_file_location('update_bundle',ROOT/'scripts/update-bundle.py')
@@ -63,7 +64,7 @@ class Packager(unittest.TestCase):
         external=self.lab/'outside';external.write_bytes(b'external')
         # POSIX actual link cases; Windows link/reparse provider is tested in the
         # native launch suite and must never substitute a copied file fixture.
-        if os.name!='nt' and __import__('platform').system()=='Linux':
+        if os.name!='nt':
             linked=self.root/'escape';linked.symlink_to(external)
             with self.assertRaises(ValueError):bundle.prepare(self.root,self.output,self.main)
             linked.unlink()
@@ -75,5 +76,34 @@ class Packager(unittest.TestCase):
             linked.unlink()
         with self.assertRaises(ValueError):bundle.safe_path('NUL.txt')
         self.assertEqual(self.output.read_bytes(),b'previous artifact')
+
+    def test_internal_framework_aliases_are_refused_without_dereferencing(self):
+        if os.name=='nt':self.skipTest('actual POSIX framework symlink layout')
+        framework=self.root/'App.app/Contents/Frameworks/Foo.framework'
+        (framework/'Versions/A/Resources').mkdir(parents=True)
+        (framework/'Versions/A/Foo').write_bytes(b'nested signed code')
+        (framework/'Versions/A/Resources/data').write_bytes(b'nested signed resource')
+        (framework/'Versions/Current').symlink_to('A',target_is_directory=True)
+        (framework/'Foo').symlink_to('Versions/Current/Foo')
+        (framework/'Resources').symlink_to('Versions/Current/Resources',target_is_directory=True)
+        self.output.write_bytes(b'previous artifact')
+        with self.assertRaisesRegex(ValueError,'links'):
+            bundle.prepare(self.root,self.output,self.main)
+        self.assertEqual(os.readlink(framework/'Versions/Current'),'A')
+        self.assertEqual((framework/'Versions/A/Foo').read_bytes(),b'nested signed code')
+        self.assertEqual(self.output.read_bytes(),b'previous artifact')
+
+    def test_unsupported_attribute_policy_covers_root_directories_and_files(self):
+        # A policy unit test, not a claim of macOS xattr/signing validation.
+        # The final tree cannot silently omit unsupported attributes anywhere.
+        for node in [self.root,self.root/'App.app',self.root/self.main]:
+            for attribute in ['com.apple.cs.CodeDirectory','com.apple.ResourceFork']:
+                self.output.write_bytes(b'previous artifact')
+                with self.subTest(node=node,attribute=attribute):
+                    with patch.object(bundle.os,'listxattr',
+                        side_effect=lambda path,**_: [attribute] if Path(path)==node else [],create=True):
+                        with self.assertRaisesRegex(ValueError,'unsupported'):
+                            bundle.prepare(self.root,self.output,self.main)
+                    self.assertEqual(self.output.read_bytes(),b'previous artifact')
 
 if __name__=='__main__':unittest.main()

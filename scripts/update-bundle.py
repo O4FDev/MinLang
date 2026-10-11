@@ -44,6 +44,14 @@ def native_image(data):
         b'\xfe\xed\xfa\xcf',b'\xcf\xfa\xed\xfe',b'\xca\xfe\xba\xbe',b'\xbe\xba\xfe\xca',
         b'\xca\xfe\xba\xbf',b'\xbf\xba\xfe\xca') or data[:2]==b'MZ'
 
+def inspect_attributes(path):
+    if hasattr(os,'listxattr'):
+        # File-data bundles cannot retain xattr-only signatures/resource forks,
+        # including attributes attached to the bundle root or directories.
+        names=os.listxattr(path,follow_symlinks=False)
+        if any(name.startswith('com.apple.cs.') or name=='com.apple.ResourceFork' for name in names):
+            raise ValueError('xattr code signatures/resource forks are unsupported; use regular-file resources')
+
 def prepare(root,output,entrypoint,*,notarized_app=None):
     entrypoint=safe_path(entrypoint)
     root=Path(root).absolute();output=Path(output).absolute()
@@ -53,6 +61,7 @@ def prepare(root,output,entrypoint,*,notarized_app=None):
     if output.resolve().is_relative_to(root):
         raise ValueError('bundle output cannot be inside its input tree')
     records=[];observed={};folded=set();root_stat=snapshot(root.lstat())
+    inspect_attributes(root)
     def scan(directory):
         for path in sorted(directory.iterdir(),key=lambda p:p.name):
             relative=safe_path(path.relative_to(root).as_posix())
@@ -60,18 +69,13 @@ def prepare(root,output,entrypoint,*,notarized_app=None):
             if fold in folded:raise ValueError('case-insensitive duplicate bundle path')
             folded.add(fold);info=path.lstat()
             if forbidden(info):raise ValueError('bundle links and reparse points are not supported')
+            inspect_attributes(path)
             if len(records)>=MAX_ENTRIES:raise ValueError('bundle has too many entries')
             if stat.S_ISDIR(info.st_mode):
                 records.append((relative,'D',0,0,path));observed[path]=snapshot(info);scan(path)
             elif stat.S_ISREG(info.st_mode):
                 if info.st_nlink!=1:raise ValueError('bundle hardlinks are not supported')
                 if info.st_size>MAX_BYTES:raise ValueError('bundle file exceeds size limit')
-                if hasattr(os,'listxattr'):
-                    # File data cannot preserve xattr-only signatures/resource
-                    # forks. Refuse these instead of silently dropping them.
-                    names=os.listxattr(path,follow_symlinks=False)
-                    if any(name.startswith('com.apple.cs.') or name=='com.apple.ResourceFork' for name in names):
-                        raise ValueError('xattr code signatures/resource forks are unsupported; use regular-file resources')
                 mode=int(relative==entrypoint or bool(info.st_mode&0o111))
                 records.append((relative,'F',mode,info.st_size,path));observed[path]=snapshot(info)
             else:raise ValueError('bundle contains a special file')
