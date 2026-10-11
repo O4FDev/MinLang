@@ -31,7 +31,7 @@ TARGETS = ['check-linux-snapshot', 'check-quic-interop-results', 'check-toolchai
            'check-compiler-hardening', 'check-linkage', 'check-source-map', 'check-symbol-order', 'check-list-access',
            'check-checked-arithmetic', 'check-checked-scalars',
            'check-runtime-bytes', 'check-runtime-traps', 'check-runtime-numeric',
-           'check-shipping', 'check-errors-values', 'check-errors-language', 'check-errors-language-sanitize', 'check-errors-language-bounded', 'check-errors-launcher', 'check-errors-review', 'check-errors-review-sanitize', 'check-errors-review-bounded', 'check-errors-review-bounded-sanitize', 'check-schannel-framing', 'check-schannel-framing-sanitize', 'check-net', 'check-net-loop', 'check-tls', 'check-tls-sanitize',
+           'check-shipping', 'check-errors-values', 'check-errors-language', 'check-errors-language-sanitize', 'check-errors-language-bounded', 'check-errors-launcher', 'check-errors-review', 'check-errors-review-sanitize', 'check-errors-review-bounded', 'check-errors-review-bounded-sanitize', 'check-schannel-framing', 'check-schannel-framing-sanitize', 'check-net', 'check-net-loop', 'check-net-udp-offload', 'check-net-udp-offload-sanitize', 'check-tls', 'check-tls-sanitize',
            'check-peer-live', 'check-peer-live-sanitize',
            'check-peer-live-redis', 'check-peer-live-redis-sanitize',
            'check-yamux-churn', 'check-yamux-churn-sanitize',
@@ -96,7 +96,7 @@ def main():
     p.add_argument('--clang', default='clang')
     p.add_argument('--cxx', default='clang++')
     p.add_argument('--timeout', type=int, default=1800, help='Maximum seconds for each top-level check.')
-    p.add_argument('--jobs', type=int, choices=(1, 2), default=2, help='Capped make concurrency; use 1 on shared remote hosts.')
+    p.add_argument('--jobs', type=int, choices=(1, 2), default=1, help='Capped make concurrency; use 1 on shared remote hosts.')
     p.add_argument('--dry-run', action='store_true', help='Inspect the plan without copying or executing builds; usable on other hosts.')
     a = p.parse_args()
     source = (a.resume.resolve() / 'source') if a.resume else a.source.resolve()
