@@ -315,6 +315,123 @@ match failed { Ok(read) { print("unexpected") } Err(error) { print(Text(results.
 net.close(sender); net.close(receiver)
 """, 'true\ntrue\ntrue\n6\ntrue\ntrue\nabc\n0\ntrue\nfalse\n0\nabc\n')
 
+
+    def test_review_tcp_short_reads_and_eof_are_distinct(self):
+        self.native_sources = (str(language.ROOT / 'runtime/native/net.c'),)
+        self.executes("""use "net" as net
+use "results" as results
+use "errors" as errors
+let listener = net.listen("127.0.0.1", 0, 4)
+let sender = net.connect("127.0.0.1", net.localPort(listener))
+let receiver = net.accept(listener)
+print(listener >= 0 && sender >= 0 && receiver >= 0)
+match results.write(sender, Bytes("abc")) { Ok(n) { print(n) } Err(e) { print(errors.message(e)) } }
+net.close(sender)
+print(net.ready(receiver, 1000))
+match results.read(receiver, 2) {
+    Ok(read) { print(Text(results.data(read))); print(results.ended(read)) }
+    Err(error) { print(errors.message(results.error(error))) }
+}
+match results.read(receiver, 16) {
+    Ok(read) { print(Text(results.data(read))); print(results.ended(read)) }
+    Err(error) { print(errors.message(results.error(error))) }
+}
+match results.read(receiver, 16) {
+    Ok(read) { print(results.data(read).length); print(results.ended(read)) }
+    Err(error) { print(errors.message(results.error(error))) }
+}
+net.close(receiver); net.close(listener)
+""", 'true\n3\ntrue\nab\nfalse\nc\nfalse\n0\ntrue\n')
+
+    def test_review_inactive_reference_slots_are_null_and_unowned(self):
+        # A test-only LLVM call checks the real slots immediately before each
+        # match tag read. Preserve the uninstrumented IR as replay evidence.
+        self.native_helpers = """
+void review_result_slots(MinyarRecord *result) {
+    assert(result->length == 3);
+    long long good = result->values[0];
+    assert(good == 0 || good == 1);
+    unsigned char *references = (unsigned char *)(result->values + result->length);
+    long long active = good ? 1 : 2, inactive = good ? 2 : 1;
+    assert(references[0] == 0);
+    assert(references[active] == 1);
+    assert(references[inactive] == 0);
+    assert(result->values[active] != 0);
+    assert(result->values[inactive] == 0);
+}
+"""
+        original_compile = self.compile
+        def compile_with_slot_assertions(source):
+            import re
+            result, llvm = original_compile(source)
+            if result.returncode == 0:
+                original = llvm.read_text()
+                llvm.with_suffix('.original.ll').write_text(original)
+                pattern = r'(?m)^(  %[^ ]+ = call i64 @minyar_record_get\(ptr ([^,]+), i64 0\)\n)'
+                patched, count = re.subn(pattern,
+                    lambda found: '  call void @review_result_slots(ptr ' + found.group(2) + ')\n' + found.group(1),
+                    original)
+                self.assertEqual(count, 2, 'instrumentation must cover both active slots')
+                patched += '\ndeclare void @review_result_slots(ptr)\n'
+                llvm.write_text(patched)
+                self.evidence.controls['slot_assertion_instrumentation'] = {
+                    'original': llvm.with_suffix('.original.ll').name,
+                    'instrumented': llvm.name, 'assertion_calls': count}
+            return result, llvm
+        self.compile = compile_with_slot_assertions
+        try:
+            self.executes("""let ok = Ok<Text, Text>("active" + " success")
+let error = Err<Text, Text>("active" + " error")
+match ok { Ok(value) { print(value) } Err(error) { print(error) } }
+match error { Ok(value) { print(value) } Err(error) { print(error) } }
+""", 'active success\nactive error\n')
+        finally:
+            self.compile = original_compile
+
+    def test_review_early_return_reclaims_cycles_before_next_iteration(self):
+        self.native_helpers = """
+long long minyar_reviewcleanup_live(void) {
+    while (rc_pending_count) assert(minyar_rc_poll(1) > 0);
+    return (long long)(rc_object_count - rc_immortal_object_count);
+}
+"""
+        self.executes("""function live(): Integer { native "reviewcleanup" }
+record Node { results: List<Result<Callback<Integer>, Callback<Integer>>> }
+function leaf(good: Boolean): Result<Integer, Integer> {
+    if good { return Ok<Integer, Integer>(42) }
+    return Err<Integer, Integer>(7)
+}
+function work(good: Boolean): Result<Integer, Integer> {
+    let node = Node { results: [] }
+    let callback = function(): Integer { return node.results.length }
+    node.results.add(Ok<Callback<Integer>, Callback<Integer>>(callback))
+    node.results.add(Err<Callback<Integer>, Callback<Integer>>(callback))
+    let local = Bytes(256)
+    let value = try leaf(good)
+    return Ok<Integer, Integer>(value + local.length)
+}
+let baseline = live()
+for i in 0..64 {
+    match work(i % 2 == 0) {
+        Ok(value) { if value != 298 { fail("wrong success") } }
+        Err(error) { if error != 7 { fail("wrong error") } }
+    }
+    if live() != baseline { fail("early return retained an owner") }
+}
+print("clean each iteration")
+""", 'clean each iteration\n')
+
+    def test_review_quoted_double_close_is_not_type_punctuation(self):
+        for source in [
+            'let x: Result<Text, Result<Integer, Bytes">>" = Err<Text, Result<Integer, Bytes>>(Err<Integer, Bytes>(Bytes()))\n',
+            'let x: Result<Result<Integer, Bytes>, Text">" = Err<Result<Integer, Bytes>, Text>("bad")\n',
+        ]:
+            with self.subTest(source=source):
+                result, llvm = self.compile(source)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertFalse(llvm.exists())
+                self.assertNotIn('List position', result.stderr)
+
 if __name__ == '__main__':
     suite = unittest.TestSuite(ResultReview(name) for name in
         unittest.defaultTestLoader.getTestCaseNames(ResultReview)
