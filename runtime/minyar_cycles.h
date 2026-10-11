@@ -18,7 +18,8 @@
  * eight-byte slots that fit in the address space; 58 bits cover 2^61 bytes. */
 typedef struct RcCycle {
     struct RcCycle *previous, *next;
-    uintptr_t gray_next; /* Aligned link, with bits0/1 proof tags and bit2 the local snapshot namespace. */
+    uintptr_t gray_next; /* Registered: aligned link, bits0/1 proof tags, bit2 local namespace.
+                          * Unregistered: bit2 retains captured incoming-path exposure. */
     size_t generation : 1, marked : 2, registered : 1, pinned : 1, cleared : 1, record : 1,
         incoming : 57;
 } RcCycle;
@@ -111,6 +112,9 @@ static void rc_cycle_register(RcCycle *cycle) {
         minyar_stop("cycle metadata is not eight-byte aligned.");
     cycle->gray_next = 0;
     cycle->registered = 1;
+    /* Fresh registry nodes stay outside completed cohorts until ROOTS or
+     * real snapshot shading exposes them. Value 3 is never a gray mark. */
+    cycle->marked = 3;
     unsigned local = rc_cycle_local_job || (rc_cycle_proof_valid && !rc_cycle_proof_build);
     cycle->gray_next = local ? 4 : 0;
     cycle->generation = local ? rc_cycle_local_generation : rc_cycle_generation;
@@ -265,9 +269,17 @@ static int rc_cycle_snapshot_new(RcCycle *cycle) {
     return !(cycle->gray_next & 4) && cycle->generation == rc_cycle_generation;
 }
 static MINYAR_COLD void rc_cycle_shade_slow(RcCycle *cycle) {
-    if (!cycle || !cycle->registered || cycle->marked ||
-        (rc_cycle_local_job && !(cycle->gray_next & 4) &&
-         rc_cycle_proof_valid && rc_cycle_anchor_held() && rc_cycle_proven(cycle)) ||
+    if (!cycle || !cycle->registered)
+        return;
+    /* Before full MARK begins, completed marks belong to an old job.
+     * A take/drop barrier can run before this root's own ROOTS visit. */
+    if (rc_cycle_phase == RC_CYCLE_ROOTS && !rc_cycle_local_job && cycle->marked == 2)
+        cycle->marked = 0;
+    if (cycle->marked == 3 && !rc_cycle_snapshot_new(cycle))
+        cycle->marked = 0;
+    if (cycle->marked ||
+        (rc_cycle_local_job && !(cycle->gray_next & 4) && rc_cycle_proof_valid &&
+         rc_cycle_anchor_held() && rc_cycle_proven(cycle)) ||
         rc_cycle_snapshot_new(cycle))
         return;
     cycle->marked = 1;
@@ -375,18 +387,25 @@ static MINYAR_NOINLINE void rc_cycle_add_incoming(RcObject *parent, RcCycle *cyc
     RcCycle *source = rc_cycle_metadata(parent);
     rc_cycle_temporary_changed();
     unsigned was_registered = source->registered;
+    /* Bit 2 is sticky exposure while unregistered, not a certificate tag.
+     * Read it before registration assigns the snapshot namespace. */
+    unsigned exposed = !was_registered && (source->gray_next & 4);
     if (!was_registered)
         rc_cycle_register(source);
+    if (!cycle->registered && was_registered && source->marked != 3)
+        cycle->gray_next |= 4;
     /* A committed proof certifies existing paths, not all registry objects.
      * Insertion removes no such path, even while a fresh owner is constructed.
      * Unknown children request separate bounded work after publication.
      * Unknown self-insertion retains the strict full-cohort scheduling rule.
      * Never infer new descendants from the incoming-count update. */
-    /* An internally owned unregistered container may have been skipped by
-     * an earlier certified-parent scan. First registration must rejoin those
-     * parents, even when a temporary borrower makes its count external. */
+    /* An exposed internally owned container may have been skipped by an
+     * earlier captured-parent scan. Rejoin those parents on registration,
+     * even when a temporary borrower makes its count external. Unexposed
+     * inbound parents remain in the finite unknown cohort and cannot have
+     * been omitted as completed known parents. */
     unsigned preserve =
-        additive && (was_registered || !source->incoming) &&
+        additive && (was_registered || !source->incoming || !exposed) &&
         (rc_cycle_phase == RC_CYCLE_IDLE ||
          (rc_cycle_local_job && (rc_cycle_phase != RC_CYCLE_SWEEP || !cycle->registered ||
                                  rc_cycle_proven(cycle) || rc_cycle_snapshot_new(cycle)))) &&
@@ -425,8 +444,17 @@ static void rc_cycle_commit_insert(void *owner, void *value) {
     if (!(child->gray_next & 4) && rc_cycle_proven(child))
         return;
     unsigned first_proof = !rc_cycle_proven(child);
-    child->gray_next = (child->gray_next & ~(uintptr_t)3) | 1 |
-                      ((uintptr_t)rc_cycle_proof_generation << 1);
+    /* First proving an active List restarts its index, not its captured
+     * limit. An appended suffix still needs a joined finite scan before
+     * that parent may move into the known registry. */
+    if (first_proof && child == rc_cycle_active && rc_cycle_phase == RC_CYCLE_MARK &&
+        !child->record &&
+        (size_t)((MinyarList *)(rc_cycle_object(child) + 1))->length > rc_cycle_limit) {
+        rc_cycle_proof_invalidate();
+        return;
+    }
+    child->gray_next =
+        (child->gray_next & ~(uintptr_t)3) | 1 | ((uintptr_t)rc_cycle_proof_generation << 1);
     if (first_proof && child == rc_cycle_active && rc_cycle_phase == RC_CYCLE_MARK)
         rc_cycle_index = 0;
     else if (first_proof && rc_cycle_shading && child->marked == 2) {

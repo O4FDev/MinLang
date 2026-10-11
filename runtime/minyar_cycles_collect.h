@@ -72,6 +72,8 @@ static void rc_cycle_unit_body(void) {
             return;
         }
         rc_cycle_cursor = rc_cycle_cohort_next(cycle);
+        if (cycle->marked == 3)
+            cycle->marked = 0;
         if (rc_cycle_local_job) {
             cycle->gray_next |= 4;
             /* Temporary paths are rebuilt for each finite local cohort. */
@@ -93,8 +95,8 @@ static void rc_cycle_unit_body(void) {
         }
         if (!rc_cycle_proof_preserve)
             cycle->gray_next &= ~(uintptr_t)1;
-        if (rc_cycle_local_job && rc_cycle_proof_valid &&
-            rc_cycle_anchor_held() && rc_cycle_proven(cycle))
+        if (rc_cycle_local_job && rc_cycle_proof_valid && rc_cycle_anchor_held() &&
+            rc_cycle_proven(cycle))
             rc_cycle_shade_proven(cycle);
         if (cycle == rc_cycle_proof_retry)
             rc_cycle_proof_after_retry = 1;
@@ -135,6 +137,21 @@ static void rc_cycle_unit_body(void) {
             long long *slot = rc_cycle_slot(cycle, rc_cycle_index++);
             if (slot) {
                 RcCycle *child = rc_cycle_value((void *)(uintptr_t)*slot);
+                /* A skipped empty container keeps this history through
+                 * namespace flips and shared incoming-edge removals. */
+                if (child && !child->registered)
+                    child->gray_next |= 4;
+                /* A new registered child is outside this captured cohort.
+                 * Its proven parent must not retire to the known registry
+                 * before a joined scan can discover that owning path. */
+                if (child && child->registered && child->marked == 3 &&
+                    rc_cycle_snapshot_new(child) && rc_cycle_proven(cycle) &&
+                    (rc_cycle_proof_build ||
+                     (rc_cycle_local_job && rc_cycle_proof_valid && rc_cycle_anchor_held()))) {
+                    rc_cycle_proof_valid = rc_cycle_proof_build = 0;
+                    rc_cycle_join_known();
+                    rc_cycle_rescan = rc_cycle_requested = 1;
+                }
                 if ((rc_cycle_proof_build ||
                      (rc_cycle_local_job && rc_cycle_proof_valid && rc_cycle_anchor_held())) &&
                     rc_cycle_proven(cycle))
