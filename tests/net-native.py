@@ -51,7 +51,8 @@ def captured_run(directory, records, errors, command, *, phase, **kwargs):
            'cwd': str(Path(kwargs.get('cwd', Path.cwd())).resolve()),
            'tool': tool, 'tool_sha256': digest(tool) if tool else None,
            'environment': {name: environment[name] for name in
-                           ('ASAN_OPTIONS', 'UBSAN_OPTIONS', 'MINYAR_TEST_CLANG')
+                           ('ASAN_OPTIONS', 'UBSAN_OPTIONS', 'MINYAR_TEST_CLANG',
+                            'MINYAR_CLANG_FLAGS', 'MINYAR_NATIVE_FLAGS', 'MINYAR_RUNTIME_FLAGS')
                            if name in environment}}
     records.append(row)
     start = time.monotonic()
@@ -108,7 +109,7 @@ def finalize_evidence(directory, inputs, records, errors, modes, status, primary
     report = {'schema_version': 1, 'status': 'failed' if errors or primary else status,
               'modes': modes, 'public_program_sanitizer_enabled_by_suite': False,
               'public_program_scope': None if modes == ['sanitize'] else 'ordinary-launcher-path',
-              'windows_sanitizer_capability': False, 'inputs': inputs,
+              'windows_sanitizer_enabled_by_suite': False, 'inputs': inputs,
               'inputs_after': after, 'commands': records, 'files': files,
               'primary_error': None if primary is None else type(primary).__name__+': '+str(primary),
               'evidence_errors': errors}

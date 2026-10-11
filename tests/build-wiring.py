@@ -102,6 +102,8 @@ class BuildWiring(unittest.TestCase):
                 self.assertFalse(manifest['public_program_sanitizer_enabled_by_suite'])
                 self.assertEqual(manifest['public_program_scope'], expected_scope)
                 self.assertNotIn('public_program_sanitized', manifest)
+                self.assertFalse(manifest['windows_sanitizer_enabled_by_suite'])
+                self.assertNotIn('windows_sanitizer_capability', manifest)
 
     def test_network_native_and_sanitizer_keep_distinct_limits(self):
         import re
