@@ -714,6 +714,15 @@ public function receivePath(connection: Connection, datagram: Bytes, pathId: Int
         if pathAt < 0 {
             if level == 0 && connection.state == STARTING && connection.spaces[0].largest < 0 && connection.paths.length == 1 && connection.paths[0].received == 0 {
                 connection.paths[0].id = pathId; connection.activePath = pathId; pathAt = 0
+            } else if level == 1 && !connection.clientRole {
+                // NAT can rebind before confirmation. This packet has already
+                // passed Handshake AEAD authentication; replayed old numbers
+                // must not change the reply route or allocate another path.
+                if packet.number <= space.largest { continue }
+                let retained: List<Path> = []
+                for previous in connection.paths { if previous.id == connection.activePath { retained.add(previous) } }
+                retained.add(Path { id: pathId; validated: false; eligible: false; challenge: Bytes(); deadline: -1; attempts: 0; received: 0; sent: 0 })
+                connection.paths = retained; pathAt = retained.length - 1
             } else {
                 if level != 2 || !connection.confirmed { continue }
                 pathAt = candidatePath(connection, pathId, false)
@@ -745,7 +754,19 @@ public function receivePath(connection: Connection, datagram: Bytes, pathId: Int
             if connection.state == FAILED || connection.state == CLOSED { return }
         }
         if ackEliciting { space.ack = true; space.ackPath = pathId }
-        if level == 1 && !connection.clientRole { connection.addressValidated = true; path.validated = true; discard(connection, 0) }
+        if level == 1 && !connection.clientRole {
+            // RFC9000 8.1: successful Handshake processing validates its source.
+            // Keep Finished/certificate checks in TLS and route subsequent
+            // replies only for a highest-numbered non-probing packet.
+            connection.addressValidated = true; path.validated = true; discard(connection, 0)
+            if path.eligible && path.id != connection.activePath {
+                connection.activePath = path.id; connection.congestion = recovery.create(1200)
+                for pending in connection.spaces {
+                    pending.probe = -1
+                    if pending.sent.length > 0 { pending.probe = now + recovery.pto(connection.congestion, connection.confirmed) }
+                }
+            }
+        }
     }
 }
 function packetHeader(connection: Connection, level: Integer, length: Integer, number: Integer): Bytes {

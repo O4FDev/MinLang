@@ -2,16 +2,40 @@ use "quic" as quic
 use "errors" as errors
 use "crypto" as crypto
 use "quicwire" as wire
+use "quiccrypto" as protection
 
 function drive(c: quic.Connection, s: quic.Connection, now: Integer) {
     for packet in quic.pollDatagrams(c, now) { quic.receivePath(s, packet.data, packet.pathId, now) }
     for packet in quic.pollDatagrams(s, now) { quic.receivePath(c, packet.data, packet.pathId, now) }
 }
+function handshakePing(c: quic.Connection, number: Integer): Bytes {
+    let header = Bytes(); header.add(0xe3)
+    for index in 0..4 { header.add((c.version >> ((3 - index) * 8)) & 255) }
+    header.add(c.remote.length); header.addBytes(c.remote); header.add(c.local.length); header.addBytes(c.local)
+    header.add(25)
+    for index in 0..4 { header.add((number >> ((3 - index) * 8)) & 255) }
+    return errors.bytesValue(protection.protect(c.spaces[1].write, header, header.length - 4, number, crypto.fromHex("0100000000")))
+}
 function handshakeRebinding(root: Bytes, identity: Bytes, key: Bytes, client: Bytes, clientKey: Bytes): Integer {
     let c = quic.client("localhost", randomBytes(80), "minyar-test", [root], [client], clientKey)
     let s = quic.server(randomBytes(80), "minyar-test", c.originalDestination, [identity], key, [root], true)
-    let rebound = false; let dropped = 0; let now = 0
+    let rebound = false; let guarded = false; let dropped = 0; let now = 0
     while now < 12000 && (!c.confirmed || !s.confirmed) {
+        if !guarded && c.spaces[1].write.key.length > 0 && c.spaces[1].next == 0 {
+            guarded = true
+            let ping = handshakePing(c, 0); c.spaces[1].next = 1
+            let invalid = ping.slice(0, ping.length); invalid[invalid.length - 1] = invalid[invalid.length - 1] ^ 1
+            quic.receivePath(s, invalid, 99, now)
+            quic.receivePath(s, invalid, 0, now)
+            if s.paths.length != 1 || s.activePath != 0 || s.state == quic.FAILED || s.serverTLS.authenticated { return 28 }
+            quic.receivePath(s, ping, 0, now)
+            if s.spaces[1].largest != 0 || s.serverTLS.authenticated { return 29 }
+            quic.receivePath(s, ping, 98, now)
+            if s.paths.length != 1 || s.activePath != 0 || s.serverTLS.authenticated { return 30 }
+            let nextPing = handshakePing(c, 1); c.spaces[1].next = 2
+            quic.receivePath(s, nextPing, 7, now)
+            if s.paths.length != 2 || s.activePath != 7 || s.serverTLS.authenticated { return 31 }
+        }
         for packet in quic.pollDatagrams(c, now) {
             let header = wire.header(packet.data, 0, 8)
             if header.valid && header.kind == wire.HANDSHAKE { rebound = true }
@@ -23,7 +47,7 @@ function handshakeRebinding(root: Bytes, identity: Bytes, key: Bytes, client: By
         }
         now += 10
     }
-    if !rebound || !c.confirmed || !s.confirmed || s.activePath != 7 {
+    if !guarded || !rebound || !c.confirmed || !s.confirmed || s.activePath != 7 {
         print("handshake NAT rebinding failed " + Text(c.confirmed) + " " + Text(s.confirmed) + " dropped " + Text(dropped)); return 20
     }
     if !c.clientTLS.authenticated || !s.serverTLS.authenticated { return 21 }
