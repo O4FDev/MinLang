@@ -176,7 +176,13 @@ class Launch(unittest.TestCase):
         self.assertEqual(self.run_driver('restart',current='9.0.0')[0],'false')
         self.assertNotIn('OWNED-HELPER',self.run_driver('launch',now=1799999999))
         self.assertEqual(self.run_driver('launch',args=['x']*256)[0],'false')
-        self.assertEqual(self.run_driver('launch',args=['x'*32769])[0],'false')
+        before=(self.root/'state').read_bytes()
+        rejected=self.run_driver('launch-overlong')
+        self.assertEqual(rejected[0],'false')
+        self.assertIn('launch arguments exceed the size limit',rejected)
+        self.assertNotIn('OWNED-HELPER',rejected)
+        self.assertEqual((self.root/'state').read_bytes(),before)
+        self.assertIn('OWNED-HELPER',self.run_driver('launch'))
 
     def test_launch_rechecks_signed_cohort_and_manifest_binding(self):
         self.install(package(self.entries),rollout=100)
@@ -200,7 +206,16 @@ class Launch(unittest.TestCase):
         _,digest=self.install(self.helper.read_bytes())
         state=(self.root/'state').read_text().splitlines()
         state[0]='MINYAR-UPDATER-STATE-1'
-        (self.root/'state').write_text('\n'.join(state[:7])+'\n')
+        # State wire bytes are LF on every host; write_text adds CRLF on NT.
+        legacy=('\n'.join(state[:7])+'\n').encode('ascii')
+        # Preserve strict framing: a CRLF variant is corrupt, not a migration.
+        (self.root/'state').write_bytes(legacy.replace(b'\n',b'\r\n'))
+        self.assertEqual(self.run_driver('launch')[0],'false')
+        refused,_=self.install(self.helper.read_bytes())
+        self.assertEqual(refused[0],'false')
+        self.assertIn('local update state is corrupt',refused)
+        (self.root/'state').write_bytes(legacy)
+        self.assertNotIn(b'\r', (self.root/'state').read_bytes())
         self.assertEqual(self.run_driver('launch')[0],'false')
         # Exact signed same-version artifact supplies the missing authorization.
         result,_=self.install(self.helper.read_bytes())
