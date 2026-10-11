@@ -206,8 +206,8 @@ public function openStream(connection: Connection): errors.IntegerResult {
 }
 public function streamIds(connection: Connection): List<Integer> {
     let ids: List<Integer> = []
-    if connection.state == QUIC_READY { for stream in connection.udp.streams { ids.add(handle(connection, stream.id)) } }
-    if connection.state == TCP_READY { for stream in connection.mux.streams { ids.add(handle(connection, stream.id)) } }
+    if connection.state == QUIC_READY { for stream in connection.udp.streams { if !stream.cancelled { ids.add(handle(connection, stream.id)) } } }
+    if connection.state == TCP_READY { for stream in connection.mux.streams { if stream.active { ids.add(handle(connection, stream.id)) } } }
     return ids
 }
 public function write(connection: Connection, id: Integer, data: Bytes, fin: Boolean): errors.IntegerResult {
@@ -227,6 +227,17 @@ public function read(connection: Connection, id: Integer): errors.BytesResult {
     if connection.state == FAILED { return errors.bytesFailure(errors.make(connection.code, 0, connection.error)) }
     if connection.state == CLOSED { return errors.endOfStream() }
     return errors.wouldBlock(0)
+}
+// Cancellation is independent of application send credit. It discards the
+// receive queue and permanently closes this handle; no payload is retried on
+// a replacement connection or physical slot.
+public function cancelStream(connection: Connection, id: Integer): errors.BooleanResult {
+    if stale(connection,id) { return errors.booleanFailure(errors.make(retryRequiredCode(),0,"connection changed; explicit application retry required")) }
+    if id < 0 { return errors.booleanFailure(errors.make(errors.invalidDataCode(),0,"invalid transport stream handle")) }
+    if connection.state == QUIC_READY { return quic.cancelStream(connection.udp,id & 0xffffffff,0) }
+    if connection.state == TCP_READY { return yamux.cancel(connection.mux,id & 0xffffffff) }
+    if connection.state == FAILED { return errors.booleanFailure(errors.make(connection.code,0,connection.error)) }
+    return errors.booleanFailure(errors.make(errors.closedCode(),0,"transport stream is unavailable"))
 }
 public function close(connection: Connection) {
     if connection.state == QUIC_READY { quic.close(connection.udp, 0, Bytes("done")); connection.closing = true }
