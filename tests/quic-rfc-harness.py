@@ -154,11 +154,16 @@ class QuicRfcHarness(unittest.TestCase):
             mutation('wrong optimization', lambda row:row.update(optimization='2'))
             for name, flag in (('late optimization override','-O2'),
                                ('late ASan disable','-fno-sanitize=address'),
+                               ('late UBSan disable','-fno-sanitize=undefined'),
                                ('late all-sanitizer disable','-fno-sanitize=all')):
                 def change(row, flag=flag):
                     row['command'].append(flag)
                     row['actual_command'] = row['command'] + ['-o',row['staged_requested_path']]
                 mutation(name,change)
+            def reenabled_mode(row):
+                row['command'] += ['-fno-sanitize=undefined','-fsanitize=undefined']
+                row['actual_command'] = row['command'] + ['-o',row['staged_requested_path']]
+            mutation('late UBSan disable/re-enable beyond exact prefix',reenabled_mode)
             mutation('extra runtime IR', lambda row:row['command'].append('/extra/runtime.ll'))
             mutation('unrepresented provider', lambda row:row['command'].append('/extra/provider.o'))
             mutation('missing provider', lambda row:row.update(inputs=row['inputs'][:1]))
@@ -174,6 +179,12 @@ class QuicRfcHarness(unittest.TestCase):
                 manifest.write_text(json.dumps(mutant))
                 with self.subTest(name=name), self.assertRaises(ValueError):
                     RFC.verify_link(artifacts, binary, True)
+            # Recovery-policy options do not change which accesses are instrumented.
+            benign=copy.deepcopy(positive)
+            benign['command'].append('-fno-sanitize-recover=undefined')
+            benign['actual_command']=benign['command']+['-o',benign['staged_requested_path']]
+            manifest.write_text(json.dumps(benign))
+            RFC.verify_link(artifacts,binary,True)
             manifest.write_text(json.dumps(positive))
             (artifacts/'native-0.o').write_bytes(b'corrupt provider')
             with self.assertRaises(ValueError):
@@ -181,7 +192,7 @@ class QuicRfcHarness(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             artifacts, binary, native = self.link_fixture(Path(folder), False)
             RFC.verify_link(artifacts, binary, False)
-            for flag in ('-fsanitize=address', '@unrepresented-flags'):
+            for flag in ('-fsanitize=address', '-fsanitize=undefined', '-fno-sanitize=undefined', '@unrepresented-flags'):
                 mutant=copy.deepcopy(native)
                 mutant['command'].append(flag)
                 mutant['actual_command']=mutant['command']+['-o',mutant['staged_requested_path']]
@@ -309,7 +320,7 @@ class QuicRfcHarness(unittest.TestCase):
                         results=[dict(case=case,stdout='passed\n',stderr='') for case in ('a','b')])
             result_path=artifacts/'results.json';result_path.write_text(json.dumps(parsed))
             files=RFC.inventory(artifacts)
-            positive=dict(schema_version=1,status='passed',workspace=str(artifacts/'fixtures'),
+            positive=dict(schema_version=1,status='passed',finalization_errors=[],unhashed_files=[],workspace=str(artifacts/'fixtures'),
                 inputs={str((project/name).resolve()):value for name,value in sources.items()},
                 commands=commands,endpoint_commands=[],declared_cases=['a','b'],
                 case_inventory=references,files=files,
@@ -325,6 +336,10 @@ class QuicRfcHarness(unittest.TestCase):
                     value=copy.deepcopy(positive);change(value);mutations.append((name,value))
                 add('boolean schema',lambda row:row.update(schema_version=True))
                 add('float schema',lambda row:row.update(schema_version=1.0))
+                add('finalization error',lambda row:row.update(finalization_errors=[{'exception':'Failure'}]))
+                add('unhashed file',lambda row:row.update(unhashed_files=['lost-output.bin']))
+                add('missing finalization result',lambda row:row.pop('finalization_errors'))
+                add('missing unhashed result',lambda row:row.pop('unhashed_files'))
                 add('wrong source hash',lambda row:row['inputs'].update({str(project/names[0]):'0'*64}))
                 add('missing source',lambda row:row['inputs'].pop(str(project/names[0])))
                 add('wrong file hash',lambda row:row['files'].update({'fixtures/root.der':'0'*64}))
