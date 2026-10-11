@@ -1010,11 +1010,20 @@ void minyar_macos_statusRemove(long long handle) { @autoreleasepool {
     dropEvents(^BOOL(MNEvent *event) { return event.source != 0 && !handles[@(event.source)]; });
 } }
 #include "app_net_loop.h"
+#ifdef MINYAR_APP_MANAGED_CLEANUP
+extern bool minyar_callbackruntime_service(void);
+#endif
 bool minyar_macos_nextEvent(double timeout) { @autoreleasepool {
     ready(); if (!isfinite(timeout) || timeout < 0 || timeout > 60) minyar_native_stop("macos event timeout must be between 0 and 60 seconds.");
     current = nil;
     reloadLists();
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+#ifdef MINYAR_APP_MANAGED_CLEANUP
+    // Collection stays on the owning main thread. Give abandoned captures one
+    // bounded batch, then pump input without sleeping while old debt remains.
+    // A drained application resumes its requested OS wait without idle ticks.
+    if (minyar_callbackruntime_service()) deadline = NSDate.distantPast;
+#endif
     BOOL woken = NO;
     // Always pump at least one native event, even while Minyar events are pending.
     // This keeps menus, window drawing and text input responsive under load.

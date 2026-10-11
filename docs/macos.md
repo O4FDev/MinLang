@@ -269,7 +269,7 @@ and [event dispatch](https://developer.apple.com/documentation/appkit/nsapplicat
 `macos.shareNetworkLoop(handle)` attaches an `eventloop` reactor to the AppKit
 main run loop. It returns an `errors.IntegerResult`; a closed or stale handle
 is a recoverable failure. Initialize AppKit first. After `macos.nextEvent`, call
-`eventloop.wait(handle, 0, maximum)` or `eventcallbacks.poll` with timeout zero
+`eventloop.wait(handle, 0, maximum)` or `eventcallbacks.dispatch` with timeout zero
 and dispatch callbacks on the main thread. `nextEvent` can return with `NONE`
 because network readiness or a timer woke it.
 
@@ -284,6 +284,15 @@ attachment. `unshareNetworkLoop` detaches without closing any socket; closing
 the attached reactor detaches before its descriptor is reused. The compiler
 selects this adapter only when both `macos` and `net` native packages are used.
 Ordinary network builds retain their original layout and instructions.
+
+When the program selects the managed graph runtime, `nextEvent` services one
+bounded collector batch before waiting. If abandoned cyclic captures still
+need work, it pumps AppKit input and returns without sleeping, so the main loop
+can dispatch other work and advance another batch. Once that debt drains,
+the requested wait sleeps normally; no recurring cleanup timer remains.
+This hook is absent from ordinary applications. Native and sanitizer tests
+drop a 1,024-node capture cycle without any future network I/O or timers,
+check exact reclamation with budgets of one and 32, then check sleeping.
 
 Run `make check-macos` in a logged-in macOS desktop session. The suite verifies
 Swift selector lowering, actual native target/action and delegate delivery,
