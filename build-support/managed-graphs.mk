@@ -81,3 +81,12 @@ check-cycle-additive-sanitize:
 check check-portable: check-cycle-additive check-cycle-additive-sanitize
 check-sanitize: check-cycle-additive-sanitize
 check-managed-graphs-profiles: check-cycle-additive check-cycle-additive-sanitize
+
+.PHONY: check-cycle-registry-growth check-cycle-registry-growth-sanitize
+check-cycle-registry-growth: tests/cycle-registry-growth.c tests/cycle-additive.c tests/cycle-additive.py tools/cycle_runtime.py
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-additive.py --fixture cycle-registry-growth.c --evidence "$(CURDIR)/build/cycle-registry-growth-native"
+check-cycle-registry-growth-sanitize: tests/cycle-registry-growth.c tests/cycle-additive.c tests/cycle-additive.py tools/cycle_runtime.py
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-additive.py --fixture cycle-registry-growth.c --sanitize --evidence "$(CURDIR)/build/cycle-registry-growth-sanitize"
+check check-portable: check-cycle-registry-growth check-cycle-registry-growth-sanitize
+check-sanitize: check-cycle-registry-growth-sanitize
+check-managed-graphs-profiles: check-cycle-registry-growth check-cycle-registry-growth-sanitize

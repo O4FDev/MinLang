@@ -12,6 +12,39 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class BuildWiring(unittest.TestCase):
+
+    def test_registered_growth_is_mandatory_with_native_and_sanitizer_drivers(self):
+        import re
+        with tempfile.TemporaryDirectory(prefix='minyar registry wiring ') as folder:
+            makefile = Path(folder) / 'probe.mk'
+            makefile.write_text(
+                'include ' + str(ROOT / 'build-support/managed-graphs.mk').replace(' ', '\\ ') + '\n')
+            env = dict(os.environ)
+            env.pop('MAKEFLAGS', None)
+            result = subprocess.run(
+                ['make', '-np', '-f', str(makefile), 'check-cycle-registry-growth',
+                 'check-cycle-registry-growth-sanitize'],
+                cwd=ROOT, env=env, text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rules = {}
+            for line in result.stdout.splitlines():
+                match = re.match(r'^([\w./-]+):\s+(.*)$', line)
+                if match:
+                    rules.setdefault(match[1], set()).update(match[2].split())
+            both = {'check-cycle-registry-growth', 'check-cycle-registry-growth-sanitize'}
+            for gate in ('check', 'check-portable', 'check-managed-graphs-profiles'):
+                self.assertTrue(both <= rules.get(gate, set()), gate)
+            self.assertIn('check-cycle-registry-growth-sanitize', rules.get('check-sanitize', set()))
+            for target in both:
+                self.assertIn('tests/cycle-registry-growth.c', rules.get(target, set()), target)
+                self.assertIn('tests/cycle-additive.c', rules.get(target, set()), target)
+            commands = result.stdout.split('# GNU Make', 1)[0]
+            self.assertEqual(commands.count('tests/cycle-additive.py'), 2)
+            self.assertEqual(commands.count('--fixture cycle-registry-growth.c'), 2)
+            self.assertEqual(commands.count('--sanitize'), 1)
+            self.assertIn('cycle-registry-growth-native', commands)
+            self.assertIn('cycle-registry-growth-sanitize', commands)
+
     def test_native_sanitizers_use_supported_leak_detection(self):
         from unittest.mock import patch
         from clang_helpers import asan_leak_options
