@@ -90,7 +90,8 @@ class ObservabilityHarness(unittest.TestCase):
         destination.mkdir()
         report = {'commands': [], 'finalization_errors': []}
         owner = self.driver.CommandRecords(destination, report)
-        with patch.object(self.driver.subprocess, 'Popen', return_value=Process()), \
+        with patch.object(self.driver, 'windows_host', return_value=False), \
+                patch.object(self.driver.subprocess, 'Popen', return_value=Process()), \
                 patch.object(self.driver, 'terminate_process_tree',
                              side_effect=OSError('injected tree failure')):
             with self.assertRaises(subprocess.TimeoutExpired) as captured:
@@ -104,6 +105,52 @@ class ObservabilityHarness(unittest.TestCase):
             self.assertTrue(any(expected in note
                                 for note in getattr(captured.exception, '__notes__', [])))
 
+
+    def test_windows_job_invalid_timeout_refuses_before_creation(self):
+        from windows_job_owner import owned_job_run
+        class API:
+            def create_job(self):
+                raise AssertionError('Invalid preparation executed a native API')
+            def close(self):
+                return []
+        for timeout in (0, -1, True, float('inf'), float('nan')):
+            request = {'timeout_seconds': timeout}
+            report = {}
+            with self.subTest(timeout=timeout):
+                with self.assertRaisesRegex(ValueError, 'positive and finite'):
+                    owned_job_run(API(), request, report)
+                self.assertFalse(report['started'])
+                self.assertFalse(report['resumed'])
+                self.assertFalse(report['closed'])
+
+    def test_windows_job_cleanup_failures_preserve_assignment_error(self):
+        from windows_job_owner import owned_job_run
+        from types import SimpleNamespace
+        class API:
+            def create_job(self):
+                return 'owned'
+            def spawn_suspended(self, *args):
+                return SimpleNamespace(pid=123, tid=456)
+            def verify_assignment(self, *args):
+                raise ValueError('original assignment error')
+            def terminate(self, *args):
+                raise OSError('injected job termination failure')
+            def active(self, *args):
+                raise OSError('injected accounting failure')
+            def close(self):
+                self.close_attempted = True
+                return [OSError('injected handle closure failure')]
+        request = {'argv': ['owned-command'], 'cwd': str(self.root),
+                   'stdout_path': str(self.root/'out'), 'stderr_path': str(self.root/'err'),
+                   'timeout_seconds': 1}
+        api, report = API(), {}
+        with self.assertRaisesRegex(ValueError, 'original assignment error') as captured:
+            owned_job_run(api, request, report)
+        self.assertTrue(api.close_attempted)
+        self.assertFalse(report['closed'])
+        for message in ('termination failure', 'accounting failure', 'closure failure'):
+            self.assertTrue(any(message in note
+                                for note in getattr(captured.exception, '__notes__', [])))
 
     def test_windows_job_assigns_before_resume_and_keeps_descendants_owned(self):
         from windows_job_owner import owned_job_run
@@ -251,7 +298,8 @@ class ObservabilityHarness(unittest.TestCase):
                       timeout=.3, label='owned-timeout')
         row = report['commands'][0]
         self.assertTrue(row['timed_out'])
-        self.assertEqual(row['cleanup']['action'], 'terminate_process_tree')
+        self.assertEqual(row['cleanup']['action'],
+                         'owned-Windows-job' if self.driver.windows_host() else 'terminate_process_tree')
         self.assertEqual(row['cleanup']['status'], 'completed')
         self.assertIsNotNone(row['status'])
         self.assertTrue(child_pid.is_file())
@@ -270,20 +318,38 @@ class ObservabilityHarness(unittest.TestCase):
         self.assertEqual(report['commands'][1]['status'], 0)
 
     def test_cleanup_failure_is_recorded_and_never_a_pass(self):
+        class Pipe:
+            closed = False
+            def close(self):
+                self.closed = True
+        class Process:
+            pid = 70002
+            returncode = None
+            stdout, stderr = Pipe(), Pipe()
+            calls = 0
+            def communicate(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired(['controlled'], .1)
+                return b'', b''
+            def kill(self):
+                self.returncode = -9
         destination = self.root/'cleanup-error'
         destination.mkdir()
         report = {'commands': [], 'finalization_errors': []}
         owner = self.driver.CommandRecords(destination, report)
-        with patch.object(self.driver, 'terminate_process_tree',
-                          side_effect=RuntimeError('controlled cleanup failure')):
+        with patch.object(self.driver, 'windows_host', return_value=False), \
+                patch.object(self.driver.subprocess, 'Popen', return_value=Process()), \
+                patch.object(self.driver, 'terminate_process_tree',
+                             side_effect=RuntimeError('controlled cleanup failure')):
             with self.assertRaises(subprocess.TimeoutExpired):
-                owner.run([sys.executable, '-c', 'import time; time.sleep(30)'],
-                          timeout=.1, label='cleanup-error')
+                owner.run([sys.executable, '-c', 'pass'], timeout=.1, label='cleanup-error')
         row = report['commands'][0]
         self.assertTrue(row['timed_out'])
         self.assertEqual(row['cleanup']['status'], 'failed')
-        self.assertIn('controlled cleanup failure', row['cleanup']['exception'])
-        self.assertIsNotNone(row['status'])
+        self.assertTrue(any('controlled cleanup failure' in error['message']
+                            for error in row['cleanup']['errors']))
+        self.assertEqual(row['status'], -9)
 
     def test_finalization_preserves_primary_exception(self):
         report = {'passed': False, 'finalization_errors': []}
