@@ -330,3 +330,28 @@ run, and a loopback echo do not establish those results.
 - [HashiCorp yamux protocol](https://github.com/hashicorp/yamux/blob/master/spec.md)
   and [its session tests](https://github.com/hashicorp/yamux/blob/master/session_test.go)
   inform wire flags, flow control and half-close behavior.
+
+### Queued client Finished and probe progress
+
+The client sends queued Initial and Handshake frames before older application
+frames, preserving order within each encryption level. A ready handshake packet
+blocked by shared congestion or pacing credit holds eliciting application data;
+inactive keys, invalid routes and path-specific amplification limits do not
+reserve that shared credit. ACK-only packets remain independent. If an existing
+application probe opportunity occurs before confirmation while Finished has
+never been sent, it probes the queued Handshake CRYPTO under the existing probe
+limits.
+
+The actual pre-fix official 0-RTT captures showed four converted requests before
+client Finished, then four necessary retransmissions because both peers omitted
+them from ACKs. Tests use real issued tickets, unsent early-request queues,
+independent pacing/congestion limits and real outstanding early flight. The
+ordering, retention and probe assertions fail under isolated guard mutations at
+both O0 and O2. [RFC 9001 section 5.7](https://www.rfc-editor.org/rfc/rfc9001.html#section-5.7)
+explains why servers cannot process these requests before Finished.
+
+This repair does not establish complete PTO conformance. The existing scheduler
+still considers application-space PTO before confirmation and does not maintain
+an absolute client anti-deadlock alarm when no eligible Initial/Handshake packet
+is in flight. Those remain separate requirements of
+[RFC 9002 sections 6.2.1 and 6.2.2.1](https://www.rfc-editor.org/rfc/rfc9002.html#section-6.2.1).
