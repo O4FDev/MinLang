@@ -183,6 +183,7 @@ static void negative(unsigned n, unsigned phase, const char *mode) {
     assert(canceled);
 }
 #endif
+#ifndef MINYAR_DETACHED_FIRST_INSERTION_HELPERS
 int main(int argc, char **argv) {
     assert(argc == 5);
     unsigned n = (unsigned)strtoul(argv[1], NULL, 10);
@@ -201,3 +202,4 @@ int main(int argc, char **argv) {
 #endif
     return 0;
 }
+#endif
