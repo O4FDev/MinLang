@@ -21,7 +21,9 @@ bundle=importlib.util.module_from_spec(SPEC);SPEC.loader.exec_module(bundle)
 class Packager(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory()
-        self.lab=Path(self.temp.name)
+        # prepare resolves its input root. macOS /var temporary paths alias
+        # /private/var; use that same spelling for injected path adversaries.
+        self.lab=Path(self.temp.name).resolve()
         self.root=self.lab/'root';self.root.mkdir()
         (self.root/'App.app/Contents/MacOS').mkdir(parents=True)
         (self.root/'App.app/Contents/MacOS/main').write_bytes(b'\x7fELFowned')
