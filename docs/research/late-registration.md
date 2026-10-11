@@ -1,5 +1,7 @@
 # First registration and canceled local marking
 
+This document preserves the initial conservative two-fix checkpoint and its real performance red. The tested selective follow-up is described in [registration-exposure.md](registration-exposure.md).
+
 This is a correctness repair for the optional single-owner cycle runtime. It does not change the ordinary compiler or runtime. Native callers must use all owning-edge barriers and may only publish values through legal live owners; the repair does not permit resurrection of an active white object.
 
 ## Two independently reproduced defects
