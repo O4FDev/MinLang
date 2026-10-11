@@ -218,7 +218,7 @@ class BuildWiring(unittest.TestCase):
                                                           if x != gate) + ': check-generated-llvm-sanitizer')
             with self.subTest(gate=gate), self.assertRaises(AssertionError):
                 verify(missing)
-        for dependency in sorted(expected - {'build/minyarc'}):
+        for dependency in sorted(expected):
             with self.subTest(dependency=dependency), self.assertRaises(AssertionError):
                 verify(fragment.replace(dependency+' ', '', 1))
         compiler = (ROOT/'build-support/compiler.mk').read_text()
