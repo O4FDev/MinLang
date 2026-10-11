@@ -1,6 +1,6 @@
 # Desktop release and update delivery
 
-This slice prepares signed releases and provides the Minyar executable-update API.
+This slice prepares signed releases and provides the Minyar executable and application-bundle update API.
 It creates local artifacts only. It does not create cloud resources, upload to R2,
 buy signing certificates, or generate a production update key.
 
@@ -86,24 +86,160 @@ encoding.
 An update root contains:
 
 ```
-state                     # atomically published high-water + active digest
-.update-lock              # OS lock; automatically released after process death
-versions/<sha256>.bin      # immutable executable generations (.exe on Windows)
+state                                   # atomic journal; sole active pointer
+.update-lock                            # exclusive OS lock, released on death
+versions/<sha256>.bin                    # raw executable (.exe on Windows)
+versions/<sha256>.bundle/artifact        # authenticated complete bundle bytes
+versions/<sha256>.bundle/payload/        # the exact indexed code/resource tree
+versions/<sha256>.<metadatahash>.receipt  # signature + installation metadata
 ```
 
-The previous executable remains available. The bridge fsyncs staged bytes and
-containing directories on POSIX and uses committed writes plus write-through
-replacement on Windows. The one state file is the activation pointer. A crash
-before its replacement leaves the old generation active; a crash after leaves
-the complete new generation active. An interrupted write may leave an unused
-version or temp file. No updater path executes downloaded bytes.
+`update.launch(root, key, app, target, channel, origin, now, installationID,
+currentVersion, arguments)` returns `errors.IntegerResult`: on success its value
+is an owned child token, not an OS PID. Arguments are a `List<Text>` excluding
+argv[0]; the updater supplies the exact authenticated executable path. Empty
+arguments, quotes, backslashes and UTF-8 are preserved. NUL, over 255 arguments,
+and more than 32768 encoded argument bytes are errors. `update.wait(token)`
+consumes the token once and returns the child's exit status; up to eight children
+can await collection. Do not pass tokens to OS process APIs.
 
-**Remaining desktop integration:** a launcher must read the active generation
-and launch it after process exit, and app bundles/resources require a separate
-signed bundle installation strategy. The current API installs one executable;
-it does not install a DMG/MSI or update a macOS `.app` bundle in place. Production
-key provisioning, R2 deployment, release credentials and launcher/restart wiring
-are not completed by this slice.
+`update.restart(...)` has the same arguments. Close application work gracefully
+before calling it. It starts a checked successor and exits the calling process
+only after process creation/exec succeeds. The successor has a new PID. A failed
+restart returns a recoverable error and keeps the current process alive.
+Neither API falls back automatically to another generation, a PATH executable,
+a mutable symlink, an interpreter, or a shell command. The existing failed-result
+value extractors still stop on programmer misuse.
+
+The shipped launcher or application's restart callback must pin its public key,
+app/channel/origin, installation ID and trusted current version, then call this
+API. A command-line or downloaded manifest must not select these trust anchors.
+A target differing from the compiled host, corrupt state, clock rollback, a
+lower installed version than the caller's trusted current version, a changed
+receipt or artifact, or a device outside the receipt's signed cohort refuses
+launch. Observing an unselected/failed newer update preserves the authorization
+of the installed generation. Launch verifies that receipt's installed version,
+sequence, SHA-256 and size, independently of the newer observation's metadata.
+
+Installed receipts remain valid for offline launch after metadata expiry. Expiry
+still blocks every new installation or legacy authorization. Requiring fresh
+network metadata for every restart would prevent an offline installed app from
+starting. A legacy seven-line v1 journal can still observe newer metadata.
+Launching a legacy generation requires fresh signed metadata and the exact
+previous artifact through `install`/`downloadAndInstall`; this authenticates a
+same-version, same-digest generation and upgrades the journal. There is no
+unsigned compatibility fallback.
+
+The journal v2 is nine printable ASCII LF-terminated lines: header
+`MINYAR-UPDATER-STATE-2`, highest observed sequence, highest observed version,
+observed metadata SHA-256, installed version, installed artifact SHA-256,
+last observed UTC time, active metadata SHA-256, and active sequence. The last
+two fields identify the installed receipt independently of newer observations
+and version bumps reusing identical artifact bytes. A root without an installed
+generation has an empty active metadata field and active sequence zero. The
+original first seven field positions are preserved.
+
+The bridge stages and commits all bytes before replacing `state`. Bundle
+publication creates a complete new directory, publishes it without replacing a
+prior directory, then durably stores its separate immutable receipt, and finally
+replaces the one journal. POSIX commits files and directories with fsync;
+Windows commits files and uses write-through publication. A crash before the
+journal changes leaves the previous generation active; after it changes the
+complete new generation is active. An uncertain storage error can be checked by
+retrying under the lock. Inert `.update-*` files/directories or an unused complete
+generation may remain after interruption; the updater never recursively follows
+or deletes them. Administrators can remove inactive staging data offline.
+
+Launch holds the updater lock, checks the entire indexed tree, rejects missing
+and extra files, symlinks/reparse points, hardlinks and changed file permissions,
+and compares all resources and code against the authenticated bundle bytes.
+Linux executes the retained checked native image with fexecve. POSIX launch
+also resolves the original root through every lexical ancestor and compares it
+with the pinned root descriptor, rejecting root/parent renames and substitutions
+observed at that check. macOS retains the image descriptor and, after closing
+other inherited descriptors in the child, checks root, working-directory and
+executable pathname identities before execve from its
+`.app/Contents/MacOS` location; macOS lacks fexecve.
+Windows holds non-write/non-delete shared handles across verification and
+CreateProcessW, with an explicit application path and exact CRT argument
+quoting. POSIX inherits only descriptors 0/1/2; Windows supplies an explicit
+handle list for duplicated standard streams. Update locks, resource handles
+and arbitrary application handles are not inherited. POSIX child loader
+override variables `LD_*` and `DYLD_*` are removed.
+
+These guarantees assume the documented protected app-owned root. A privileged
+or same-user attacker able to chmod/replace the app or its root is outside this
+boundary. Retained POSIX descriptors do not prohibit same-user rename or
+in-place writes. In particular, Darwin's final identity checks and execve are
+separate operations: a writer can change an ancestor, executable pathname or
+checked inode after the checks and before the kernel resolves the launch path.
+The deterministic mutation hook exercises changes before the final checks; it
+does not prove atomicity across this remaining boundary. macOS launch therefore
+requires the protected-root assumption and makes no absolute TOCTOU guarantee.
+Call updater APIs from one thread. Application launchers must preserve
+the journal during reinstall/recovery and surface refusal instead of silently
+running an older generation. No changes to application UI or global launcher
+dispatch are made by this updater source slice.
+
+## Complete application bundle format
+
+Use the local encoder, then the existing Ed25519 manifest preparation tool:
+
+```sh
+python3 scripts/update-bundle.py \
+  --root dist/signed-app-tree --output dist/Tolum.mbundle \
+  --entrypoint Tolum.app/Contents/MacOS/Tolum \
+  --notarized-app Tolum.app
+```
+
+For Windows, prepare a tree with the exact signed executable, signed DLLs and
+all resources and use, for example, `--entrypoint Tolum.exe`; omit
+`--notarized-app`. Authenticode-sign/verify every executable or DLL before
+encoding the final tree. The encoder does not sign, notarize, fabricate a key,
+or publish. `--notarized-app` runs real codesign, stapler and Gatekeeper checks
+on an actual Mac before output publication. The final custom bundle, rather
+than a DMG/MSI/ZIP, becomes `--artifact` for `scripts/update-manifest.py`.
+
+The macOS release pipeline must retain the exact signed, notarized and stapled
+staging app used for the verified DMG (the CI owner adds
+`--signed-app-output dist/signed-app-tree/Tolum.app`). Encoding the original
+unsigned input or an app modified after signing cannot substitute for that
+artifact. Actual Developer ID/Authenticode/notarization verification remains
+dependent on production credentials. An Ed25519 fixture signature proves only
+the updater protocol and never claims production OS signing.
+
+Bundle v1 is deterministic and uncompressed, with no ZIP/tar extraction or
+compression bombs. Its binary format is:
+
+- 16 bytes `MINYAR-BUNDLE-1\n`.
+- Entry point UTF-8 length (u32 big endian), its bytes, then entry count (u32).
+- Each sorted entry: type byte `D` or `F`, executable byte 0 or 1, path length
+  (u32), data length (u64), path bytes, then exact file bytes.
+- Directories have executable byte and data length zero and must precede their
+  children. Every parent directory is explicit; empty directories are preserved.
+
+The whole artifact, including the index and entry point, is bound by the
+existing signed size/SHA-256. At most 4096 entries and 128 MiB including the index
+are allowed. Paths are portable ASCII relative paths, at most 512 bytes with
+components up to 64 bytes. The encoder/parser reject dot components, absolute
+paths, control bytes, Windows streams/reserved device names, trailing dot/space
+aliases and case-insensitive duplicates. Entry points must be executable regular
+native host images. Files are published read-only (0444 data, 0555 code on POSIX).
+
+Bundle v1 supports complete regular-file `.app`/Windows trees, including
+Info.plist, signature/ticket files, nested code and all indexed resources. It
+deliberately rejects symlink framework layouts, including the usual
+`Foo.framework/Versions/Current` and top-level framework aliases, even when their
+targets remain inside the app. This is a supported resource-bundle scope, not a
+general transport for arbitrary existing macOS apps. It also rejects hardlinks,
+non-ASCII filenames, special files, xattr-only code signatures and resource forks.
+Build a compatible regular-file layout before signing; do not dereference,
+flatten or modify an already signed framework after notarization. The encoder
+does not offer a safe-dereference mode. Extended attributes are not transported.
+The signed package authenticates the exact directory index, executable modes
+and file bytes, and launch verifies the complete reconstructed tree. Production
+platform checks must additionally validate the final reconstructed
+signed/stapled tree with real platform tools and credentials.
 
 ## Signed wire format and rollback protection
 
@@ -137,7 +273,7 @@ must exactly match the pinned origin and content-addressed release path, with
 one safe ASCII filename; signatures bind its size and SHA-256.
 
 The protected state records highest sequence, highest version, metadata hash,
-installed version, installed artifact digest and last observed time. A lower
+installed version, installed artifact digest, last observed time and the active receipt identity. A lower
 sequence, lower version, altered metadata at the same sequence, corrupt state or
 clock rollback fails closed. Identical metadata may be retried after a failed
 artifact download. Valid newer metadata records its high-water mark before
@@ -195,6 +331,14 @@ RFC 8032 known-answer and signature/key mutations, native ASan/UBSan checks,
 OS lock and path checks, process-death fault injection around every publication
 boundary, compiled Minyar adversarial policy and cohort tests, and a hostile
 bounded HTTP peer. The same gate is included in `check` and `check-portable`.
-Existing coverage and mutation thresholds are unchanged. Real signing,
-notarization, Windows execution and online R2 deployment need their respective
-host environment and credentials.
+Existing coverage and mutation thresholds are unchanged. New gates are `tests/update-bundle.py`, `tests/update-launch.py` and
+`tests/update-launch-native.py`; the CI owner registers them globally. They use
+locally built owned helper images signed with the public fixture key, exact argv
+and resource checks (native CFBundle lookup on macOS), fresh legacy authorization,
+installed receipt expiry/cohort/version checks, independent malicious binary
+indexes, deterministic post-check mutation races, real writer lock contention,
+and abrupt death during every bundle/receipt/journal publication phase.
+Native cleanup runs under ASan/UBSan on supported POSIX hosts. Actual Windows and
+macOS provider results must be recorded separately from Linux; an unavailable
+provider is not a passing mock. Production signing/notarization and R2 deployment
+require the respective host credentials and operator provisioning.
