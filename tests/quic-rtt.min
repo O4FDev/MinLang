@@ -107,9 +107,11 @@ function recoveredDelivery(c: quic.Connection,s: quic.Connection,now: Integer): 
     return 0
 }
 
-function boundedLateDelivery(c: quic.Connection,s: quic.Connection,now: Integer): Integer {
+function boundedLateDelivery(c: quic.Connection,s: quic.Connection,now: Integer,references: Integer): Integer {
     let id=errors.integerValue(quic.openStream(c,false))
     quic.writeStream(c,id,Bytes("x"),true)
+    let encoded=c.pending[0].payload.slice(0,c.pending[0].payload.length)
+    for copy in 1..references { c.pending[0].payload.addBytes(encoded) }
     let last=-1
     for round in 0..4097 {
         let tick=now+round*50
@@ -129,8 +131,13 @@ function boundedLateDelivery(c: quic.Connection,s: quic.Connection,now: Integer)
         quic.poll(c,tick+4)
         if original.status!=2 || original.payload.length!=0 || c.pending.length!=1 { print("bounded loss phase "+Text(round));return 75 }
         let space=c.spaces[2];let live=space.lostStreams.length-space.lostStreamsAt
-        if live>4096 || space.lostStreams.length>8192 { print("bounded cache count "+Text(round)+" "+Text(live)+" "+Text(space.lostStreams.length));return 76 }
+        if live>4096 || space.lostStreams.length>8192 || space.lostReferences>4096 { print("bounded cache count "+Text(round)+" "+Text(live)+" "+Text(space.lostStreams.length));return 76 }
         for at in 0..space.lostStreamsAt { if space.lostStreams[at].streams.length!=0 { print("bounded expired refs "+Text(round));return 76 } }
+        if round%256==0 || round==4096 {
+            let actual=0
+            for at in space.lostStreamsAt..space.lostStreams.length { actual+=space.lostStreams[at].streams.length }
+            if actual!=space.lostReferences || actual>4096 { print("lost cache reference accounting "+Text(round)+" "+Text(actual)+" "+Text(space.lostReferences));return 88 }
+        }
         if c.streams[0].sendAcknowledged!=0 || c.streams[0].finalAcknowledged { print("bounded premature delivery "+Text(round)+" "+Text(last));return 76 }
     }
     let before=c.flight
@@ -190,13 +197,13 @@ function freshProbe(c: quic.Connection,s: quic.Connection,now: Integer): Integer
 }
 function main(): Integer {
     let root=readBytesFile(argument(0));let cert=readBytesFile(argument(1));let key=readBytesFile(argument(2));let client=readBytesFile(argument(3));let clientKey=readBytesFile(argument(4))
-    for scenario in 0..4 {
+    for scenario in 0..8 {
         let candidate=quic.client("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey)
         let peer=quic.server(randomBytes(80),"minyar-test",candidate.originalDestination,[cert],key,[root],true)
         for count in 0..200 { drive(candidate,peer,count*10) }
         if !candidate.confirmed || !peer.confirmed { return 68 }
         let result=0
-        if scenario==0 { result=lateACK(candidate,peer,2000) } else if scenario==1 { result=queuedMixed(candidate,peer,2000) } else if scenario==2 { result=recoveredDelivery(candidate,peer,2000) } else { result=boundedLateDelivery(candidate,peer,2000) }
+        if scenario==0 { result=lateACK(candidate,peer,2000) } else if scenario==1 { result=queuedMixed(candidate,peer,2000) } else if scenario==2 { result=recoveredDelivery(candidate,peer,2000) } else if scenario==3 { result=boundedLateDelivery(candidate,peer,2000,1) } else if scenario==4 { result=freshProbe(candidate,peer,2000) } else if scenario==7 { result=boundedLateDelivery(candidate,peer,2000,3) } else { result=delayedPersistent(candidate,peer,2000,scenario==6) }
         if result!=0 { return result }
     }
     let c=quic.client("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey)
