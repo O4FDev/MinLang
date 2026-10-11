@@ -181,6 +181,13 @@ class QuicRfcHarness(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             artifacts, binary, native = self.link_fixture(Path(folder), False)
             RFC.verify_link(artifacts, binary, False)
+            for flag in ('-fsanitize=address', '@unrepresented-flags'):
+                mutant=copy.deepcopy(native)
+                mutant['command'].append(flag)
+                mutant['actual_command']=mutant['command']+['-o',mutant['staged_requested_path']]
+                (artifacts/'manifest.json').write_text(json.dumps(mutant))
+                with self.subTest(native_override=flag),self.assertRaises(ValueError):
+                    RFC.verify_link(artifacts,binary,False)
             self.assertEqual((artifacts/'program.raw.ll').read_bytes(),
                              (Path(folder)/'transient-program.ll').read_bytes())
 
@@ -443,6 +450,28 @@ class QuicRfcHarness(unittest.TestCase):
                 wrong=list(server);wrong[location]='incorrect'
                 with self.subTest(vn_argument=location),self.assertRaises(ValueError):
                     RFC.verify_case_invocation('vn','reserved-version',None,wrong,vn_roles,directory,binaries)
+
+
+    def test_pre_shutdown_state_rejects_unexpected_exit_and_inconsistent_ownership(self):
+        for prior,requested,status in ((None,True,-15),(0,False,0)):
+            row=dict(status_before_shutdown=prior,owned_termination_requested=requested,status=status)
+            RFC.verify_server_shutdown_state(row)
+        for changes in ({'status_before_shutdown':-11,'owned_termination_requested':False,'status':-11},
+                        {'status_before_shutdown':7,'owned_termination_requested':False,'status':7},
+                        {'status_before_shutdown':0.0,'owned_termination_requested':False,'status':0},
+                        {'status_before_shutdown':False,'owned_termination_requested':False,'status':0},
+                        {'status_before_shutdown':None,'owned_termination_requested':False,'status':0},
+                        {'status_before_shutdown':0,'owned_termination_requested':True,'status':0},
+                        {'status_before_shutdown':0,'owned_termination_requested':False,'status':-11},
+                        {'status_before_shutdown':None,'owned_termination_requested':1,'status':-15},
+                        {'status_before_shutdown':None,'owned_termination_requested':True,'status':-15.0}):
+            with self.subTest(changes=changes),self.assertRaises(ValueError):
+                RFC.verify_server_shutdown_state(changes)
+        for name in ('status_before_shutdown','owned_termination_requested','status'):
+            row=dict(status_before_shutdown=None,owned_termination_requested=True,status=-15)
+            row.pop(name)
+            with self.subTest(missing=name),self.assertRaises(ValueError):
+                RFC.verify_server_shutdown_state(row)
 
 
 if __name__ == '__main__':
