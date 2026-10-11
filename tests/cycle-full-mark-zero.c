@@ -62,7 +62,29 @@ static void full_zero(unsigned n, unsigned rescan) {
         assert(child->registered && !rc_cycle_proven(child));
         assert(references(branch) == child->incoming && child->incoming == 1);
         minyar_rc_retain_traced(branch);
-        minyar_rc_release(branch);
+        assert(!rc_cycle_rescan && references(branch) == 2 && child->incoming == 1);
+        assert(child->registered && !rc_cycle_snapshot_new(child));
+        assert((child->marked == 1 || child->marked == 2) && !child->pinned && !child->cleared);
+        assert(child != rc_cycle_proof_anchor && child != rc_cycle_proof_retry &&
+               child != rc_cycle_temporary_anchor && !rc_cycle_proven(child));
+        fprintf(stderr, "UNPAIRED_PRE n=%u rescan=%u references=%zu incoming=%zu phase=%u registered=%u snapshot_new=%u mark=%u pinned=%u cleared=%u proven=%u primary_held=%u\n",
+                n, rc_cycle_rescan, references(branch), (size_t)child->incoming,
+                rc_cycle_phase, (unsigned)child->registered,
+                (unsigned)rc_cycle_snapshot_new(child), (unsigned)child->marked,
+                (unsigned)child->pinned, (unsigned)child->cleared,
+                (unsigned)rc_cycle_proven(child), (unsigned)rc_cycle_anchor_held());
+        minyar_rc_release(branch); /* No incoming-edge removal accompanies this. */
+        assert(rc_cycle_rescan && references(branch) == 1 && child->incoming == 1);
+        assert(child->registered && !rc_cycle_snapshot_new(child));
+        assert((child->marked == 1 || child->marked == 2) && !child->pinned && !child->cleared);
+        assert(child != rc_cycle_proof_anchor && child != rc_cycle_proof_retry &&
+               child != rc_cycle_temporary_anchor && !rc_cycle_proven(child));
+        fprintf(stderr, "UNPAIRED_POST n=%u rescan=%u references=%zu incoming=%zu phase=%u registered=%u snapshot_new=%u mark=%u pinned=%u cleared=%u proven=%u primary_held=%u\n",
+                n, rc_cycle_rescan, references(branch), (size_t)child->incoming,
+                rc_cycle_phase, (unsigned)child->registered,
+                (unsigned)rc_cycle_snapshot_new(child), (unsigned)child->marked,
+                (unsigned)child->pinned, (unsigned)child->cleared,
+                (unsigned)rc_cycle_proven(child), (unsigned)rc_cycle_anchor_held());
         full_zero_contract(primary, owner, 1);
     }
     /* Observe the same real decrement before unrelated bounded queue service.
@@ -161,6 +183,82 @@ static void full_roots_registered_add(unsigned n) {
     empty();
     fprintf(stderr, "FULL_ROOTS_REGISTERED n=%u canceled=%u reclaimed=1\n", n, canceled);
     assert(canceled); /* Live registered graph discovery remains conservative. */
+}
+/* A captured unproven self-cycle loses its only external owning path when
+ * this genuine scanned zero owner dies. Preserving the primary must not let
+ * the idle shortcut discard its independent unknown-cohort collection debt. */
+static void full_zero_private_cycle(unsigned n) {
+    Churn c = churn_graph(n);
+    MinyarRecord *private = minyar_record_new_traced(2);
+    minyar_record_set_traced(private, 1, 94001);
+    minyar_record_set_reference_traced(private, 0, slot(private));
+    MinyarRecord *owner = minyar_record_new_traced(3);
+    minyar_record_set_reference_traced(owner, 0, slot(c.g.interior));
+    minyar_record_set_take_traced(owner, 1, slot(private));
+    minyar_record_set_traced(owner, 2, 94002);
+    MinyarRecord *primary = full_zero_primary(c);
+    drain();
+    full_phase(c, RC_CYCLE_MARK);
+    RcCycle *source = rc_cycle_value(owner), *child = rc_cycle_value(private);
+    size_t turns = 0;
+    while (source->marked != 2) {
+        assert(++turns < 4000000 && rc_cycle_phase == RC_CYCLE_MARK);
+        minyar_rc_poll(1);
+    }
+    full_zero_contract(primary, owner, 0);
+    assert(child->registered && !rc_cycle_snapshot_new(child));
+    assert((child->marked == 1 || child->marked == 2) && !child->pinned && !child->cleared);
+    assert(child != rc_cycle_proof_anchor && child != rc_cycle_proof_retry &&
+           child != rc_cycle_temporary_anchor && !rc_cycle_proven(child));
+    assert(references(private) == 2 && child->incoming == 2);
+    assert(private->values[0] == slot(private) && private->values[1] == 94001);
+    assert(owner->values[1] == slot(private) && owner->values[2] == 94002);
+    core_payloads(c, n, 3, 0);
+    fprintf(stderr, "PRIVATE_CYCLE_PRE n=%u phase=%u local=%u valid=%u build=%u rescan=%u private_refs=%zu private_incoming=%zu private_mark=%u private_proven=%u\n",
+            n, rc_cycle_phase, rc_cycle_local_job, rc_cycle_proof_valid,
+            rc_cycle_proof_build, rc_cycle_rescan, references(private),
+            (size_t)child->incoming, (unsigned)child->marked, (unsigned)rc_cycle_proven(child));
+    rc_drop(owner);
+    /* Never read the private object or queued owner count after this point. */
+    unsigned full_jobs = 1, local_jobs = 0;
+    size_t local_units = 0;
+    turns = 0;
+    while (rc_pending_count) {
+        assert(++turns < 4000000);
+        size_t epochs = rc_cycle_epochs, units = rc_cycle_units;
+        unsigned was_local = rc_cycle_local_job;
+        minyar_rc_poll(1);
+        assert(rc_cycle_epochs - epochs <= 1 && rc_cycle_units - units <= 1);
+        if (rc_cycle_epochs != epochs) {
+            if (rc_cycle_local_job) local_jobs++;
+            else full_jobs++;
+        }
+        if (was_local || rc_cycle_local_job)
+            local_units += rc_cycle_units - units;
+    }
+    /* Must reclaim the private cycle now, before changing any primary root.
+     * A later anchor loss/full scan must not mask an idle cached-cycle leak. */
+    core_payloads(c, n, 1, 0);
+    assert(primary->values[0] == slot(c.g.root));
+    unsigned held = rc_cycle_proof_valid && rc_cycle_anchor_held();
+    size_t units = rc_cycle_units;
+    for (unsigned i = 0; i < 8; i++) {
+        minyar_rc_retain_traced(c.g.interior);
+        minyar_rc_release(c.g.interior);
+        drain();
+        core_payloads(c, n, 1, 0);
+    }
+    size_t borrowed_units = rc_cycle_units - units;
+    minyar_rc_release(primary);
+    drain();
+    churn_check(c, n, 0);
+    minyar_rc_release(c.g.root);
+    empty();
+    fprintf(stderr, "PRIVATE_CYCLE n=%u k=%u full_jobs=%u local_jobs=%u local_units=%zu held=%u borrowed_units=%zu reclaimed=1\n",
+            n, MINYAR_RC_POLL_BUDGET, full_jobs, local_jobs, local_units, held, borrowed_units);
+    assert(held && full_jobs == 1 && local_jobs <= 1);
+    assert(local_units <= 16u + 64u);
+    assert(borrowed_units <= 16u * 8u + 64u); /* Unchanged 192. */
 }
 /* Authentic product observer interleavings, following the existing issued40
  * controls: construction and last-owner death are real; collector and object
@@ -303,6 +401,8 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "all") || !strcmp(mode, "rescan"))
         full_zero(n, 1);
+    if (!strcmp(mode, "all") || !strcmp(mode, "private-cycle"))
+        full_zero_private_cycle(n);
     const char *queued_modes[] = { "queued-rescan", "queued-sweep", "queued-complete",
                                    "queued-restart", "queued-generation-aba", "queued-anchor" };
     for (size_t i = 0; i < sizeof(queued_modes) / sizeof(queued_modes[0]); i++)
