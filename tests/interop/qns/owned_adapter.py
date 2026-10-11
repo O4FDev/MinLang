@@ -136,7 +136,7 @@ class OwnerSpec:
             for mount in mounts:
                 source=Path(mount.get("Source",""))
                 if mount.get("Type")!="bind" or not source.is_absolute() or self.paths["fixture_root"] not in source.resolve().parents or source.is_symlink() or mount.get("RW") is not (mount.get("Destination")=="/downloads"):raise OwnershipError("endpoint bind ownership differs")
-        elif host.get("CapAdd")!=["NET_ADMIN","NET_RAW"]:raise OwnershipError("simulator capabilities differ")
+        elif host.get("CapAdd") not in (["NET_ADMIN","NET_RAW"],["CAP_NET_ADMIN","CAP_NET_RAW"]):raise OwnershipError("simulator capabilities differ")
         attached=entry.get("NetworkSettings",{}).get("Networks")
         expected={self.project+"_"+name for name in NETWORK_ROLES[role]}
         if not isinstance(attached,dict) or set(attached)!=expected:raise OwnershipError("complete endpoint network membership differs")

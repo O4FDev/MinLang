@@ -72,6 +72,17 @@ def stopped_or_error(owner,daemon,root,reason="control",primary=None):
 
 def mock_cleanup(case,root):
     owner,daemon=setup(root);state=daemon.read()
+    strict_capabilities=True
+    if case=="successful-cleanup":
+        simulator=state["containers"]["1"*64]
+        simulator["HostConfig"]["CapAdd"]=["CAP_NET_ADMIN","CAP_NET_RAW"]
+        for invalid in (["CAP_NET_ADMIN","CAP_NET_RAW","CAP_SYS_ADMIN"],
+                        ["CAP_NET_ADMIN","CAP_NET_ADMIN"],
+                        ["CAP_NET_ADMIN","NET_RAW"], []):
+            mutant=json.loads(json.dumps(simulator));mutant["HostConfig"]["CapAdd"]=invalid
+            try:owner.container(mutant)
+            except adapter.OwnershipError:pass
+            else:strict_capabilities=False
     if case=="partial-setup-retention":
         state["containers"]={"2"*64:state["containers"]["2"*64]}
         state["networks"]={"8"*64:state["networks"]["8"*64]}
@@ -103,6 +114,7 @@ def mock_cleanup(case,root):
         rejected=case in ("unknown-container-id","colliding-service","wrong-label","wrong-image","duplicate-container-ids","wrong-network-label","unowned-network-member")
         result["checks"]={"no_unowned_mutation":not events if rejected else True,
                           "exact_immutable_ids":all(event["immutable_id"] is None or len(event["immutable_id"])==64 for event in events)}
+        if case=="successful-cleanup":result["checks"]["exact_simulator_capabilities"]=strict_capabilities
         if case=="cleanup-command-failure":result["checks"].update({"failure_is_not_passed":result["status"]=="failed","remove_after_stop_failure":not daemon.containers()})
     expected="failed" if case in ("unknown-container-id","colliding-service","wrong-label","wrong-image","cleanup-command-failure","unexpected-endpoint-exit","duplicate-container-ids","wrong-network-label","unowned-network-member") else "passed"
     return result,expected
