@@ -36,6 +36,7 @@ extern void minyar_windows_show(long long), minyar_windows_close(long long),
     minyar_windows_destroy(long long), minyar_windows_quit(void);
 extern HWND minyar_windows_testHandle(long long);
 extern HMENU minyar_windows_testMenu(long long);
+extern unsigned long long minyar_windows_testMeasures(void), minyar_windows_testPositions(void);
 extern long long minyar_windows_menu(long long, const MinyarText *),
     minyar_windows_menuItem(long long, const MinyarText *, const MinyarText *);
 extern void minyar_windows_menuSeparator(long long);
@@ -218,8 +219,19 @@ int main(int argc, char **argv) {
         long long owned = minyar_windows_window(name, 400, 200);
         assert(owned != window);
         long long content = minyar_windows_column(owned, 1);
-        for (unsigned index = 0; index < 256; index++)
+        unsigned long long measured = minyar_windows_testMeasures();
+        unsigned long long positioned = minyar_windows_testPositions();
+        for (unsigned index = 0; index < 256; index++) {
             minyar_windows_label(content, unicode);
+            if ((index + 1) % 64 == 0) {
+                unsigned long long measurements = minyar_windows_testMeasures() - measured;
+                unsigned long long moves = minyar_windows_testPositions() - positioned;
+                fprintf(stderr, "LAYOUT_WORK round=%u labels=%u measures=%llu positions=%llu\n",
+                        round, index + 1, measurements, moves);
+                assert(measurements <= 2 * (index + 1));
+                assert(moves <= 3 * (index + 1));
+            }
+        }
         long long owned_menu = minyar_windows_menu(owned, name);
         minyar_windows_menuItem(owned_menu, unicode, empty);
         minyar_windows_show(owned);
