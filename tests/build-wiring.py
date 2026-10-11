@@ -26,7 +26,8 @@ class BuildWiring(unittest.TestCase):
         inputs = {'tests/cycle-progress-observability.py',
                   'tests/cycle-progress-observability-harness.py', 'tests/cycle-progress.c',
                   'tests/fixtures/cycle-progress-before-observability.c.txt',
-                  'tests/clang_helpers.py', 'tests/test_evidence.py', 'tools/host_paths.py'}
+                  'tests/clang_helpers.py', 'tests/test_evidence.py',
+                  'tests/windows_job_owner.py', 'tools/host_paths.py'}
         source = (ROOT/'build-support/managed-graphs.mk').read_text()
         marker = '# Mocked idle observability preserves the historical metric.'
         self.assertIn(marker, source)
