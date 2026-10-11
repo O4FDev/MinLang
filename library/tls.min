@@ -31,7 +31,7 @@ constant AES128_GCM = 0x1301
 constant X25519 = 0x001d
 
 public record Session {
-    cipherSuite: Integer
+    cipherSuite: Integer; allowedSuites: List<Integer>
     host: Text
     state: Integer
     error: Text
@@ -128,7 +128,7 @@ function abandon(session: Session, message: Text) {
 // A session that is never used, for connections without TLS.
 public function none(): Session {
     return Session {
-        cipherSuite: CHACHA20_POLY1305
+        cipherSuite: CHACHA20_POLY1305; allowedSuites: [AES128_GCM,CHACHA20_POLY1305]
         host: ""; state: CLOSED; error: ""; privateKey: Bytes(); random: Bytes()
         transcript: Bytes(); received: Bytes(); handshake: Bytes(); outgoing: Bytes(); incoming: Bytes()
         handshakeSecret: Bytes(); clientSecret: Bytes(); serverSecret: Bytes()
@@ -188,9 +188,25 @@ public function clientResumed(host: Text, entropy: Bytes, roots: List<Bytes>, ce
 function offerTicket(session: Session, ticket: tickets.Client) {
     let now = trust.currentTimeMilliseconds()
     if session.state == FAILED || !ticket.valid || now < ticket.issued || now >= ticket.expires || ticket.host != session.host || ticket.protocol != session.protocol ||
-       ticket.psk.length != 32 || ticket.ticket.length < 1 || ticket.ticket.length > 65500 || ticket.certificateChain.length == 0 ||
+       !contains(session.allowedSuites,ticket.suite) || ticket.psk.length != 32 || ticket.ticket.length < 1 || ticket.ticket.length > 65500 || ticket.certificateChain.length == 0 ||
        trust.chain(session.host, ticket.certificateChain, session.anchors) != "" { return }
     session.ticket = ticket; session.outgoing = Bytes(); session.transcript = Bytes(); sendHello(session)
+}
+// Configuration must precede processing any peer handshake. This records
+// policy independently of the selected/negotiated cipher suite.
+public function setCipherSuites(session: Session, suites: List<Integer>): Boolean {
+    if session.state != HELLO_SENT || session.stage != 0 || session.received.length != 0 || suites.length < 1 || suites.length > 2 { return false }
+    let seen: List<Integer> = []
+    for suite in suites {
+        if (suite != AES128_GCM && suite != CHACHA20_POLY1305) || contains(seen,suite) { return false }
+        seen.add(suite)
+    }
+    session.allowedSuites = seen
+    if session.ticket.valid && !contains(seen,session.ticket.suite) {
+        session.ticket = tickets.emptyClient(); session.earlyOffered = false; session.clientEarlySecret = Bytes()
+    }
+    session.outgoing = Bytes(); session.transcript = Bytes(); sendHello(session)
+    return true
 }
 public function takeTicket(session: Session): tickets.Client {
     if session.savedTickets.length == 0 { return tickets.emptyClient() }
@@ -243,9 +259,8 @@ function sendHello(session: Session) {
         body.add(32)
         body.addBytes(crypto.sha256(session.random))
     }
-    add16(body, 4)
-    add16(body, AES128_GCM)
-    add16(body, CHACHA20_POLY1305)
+    add16(body,session.allowedSuites.length * 2)
+    for suite in session.allowedSuites { add16(body,suite) }
     body.add(1)
     body.add(0)
     let extensions = Bytes()
@@ -570,8 +585,8 @@ function serverHello(session: Session, message: Bytes) {
         return
     }
     at += 3
-    if suite != CHACHA20_POLY1305 && suite != AES128_GCM {
-        abandon(session, "the server chose an unsupported cipher suite")
+    if !contains(session.allowedSuites,suite) {
+        abandon(session, "the server chose an unoffered cipher suite")
         return
     }
     session.cipherSuite = suite

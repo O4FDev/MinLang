@@ -17,7 +17,7 @@ constant AES128_GCM = 0x1301
 constant CHACHA20_POLY1305 = 0x1303
 
 public record Session {
-    state: Integer; stage: Integer; error: Text; cipherSuite: Integer
+    state: Integer; stage: Integer; error: Text; cipherSuite: Integer; allowedSuites: List<Integer>
     quic: Boolean; requireClient: Boolean; authenticated: Boolean
     protocol: Text; transportParameters: Bytes; peerTransportParameters: Bytes; identityExpires: Integer; clientIdentityExpires: Integer
     privateKey: Bytes; random: Bytes; identity: Bytes; identityKey: Bytes; anchors: Bytes
@@ -87,7 +87,7 @@ public function serverWithTickets(entropy: Bytes, protocol: Text, identity: List
 }
 function create(entropy: Bytes, protocol: Text, parameters: Bytes, identity: List<Bytes>, privateKey: Bytes, roots: List<Bytes>, requireClient: Boolean, quic: Boolean): Session {
     let session = Session {
-        state: STARTING; stage: 0; error: ""; cipherSuite: AES128_GCM
+        state: STARTING; stage: 0; error: ""; cipherSuite: AES128_GCM; allowedSuites: [AES128_GCM,CHACHA20_POLY1305]
         quic: quic; requireClient: requireClient; authenticated: false
         protocol: protocol; transportParameters: parameters; peerTransportParameters: Bytes(); identityExpires: 0; clientIdentityExpires: 0
         privateKey: Bytes(); random: Bytes(); identity: pack(identity); identityKey: privateKey; anchors: pack(roots)
@@ -106,6 +106,16 @@ function create(entropy: Bytes, protocol: Text, parameters: Bytes, identity: Lis
     }
     session.privateKey = entropy.slice(0, 32); session.random = entropy.slice(32, 64)
     return session
+}
+public function setCipherSuites(session: Session, suites: List<Integer>): Boolean {
+    if session.state != STARTING || session.stage != 0 || session.received.length != 0 || suites.length < 1 || suites.length > 2 { return false }
+    let seen: List<Integer> = []
+    for suite in suites {
+        if (suite != AES128_GCM && suite != CHACHA20_POLY1305) || contains(seen,suite) { return false }
+        seen.add(suite)
+    }
+    session.allowedSuites = seen
+    return true
 }
 function keySize(session: Session): Integer {
     if session.cipherSuite == AES128_GCM { return 16 }
@@ -160,9 +170,10 @@ function clientHello(session: Session, hello: Bytes) {
     if size < 2 || size % 2 != 0 || size > hello.length - at - 2 { abandon(session, "invalid ClientHello cipher suites"); return }
     let suites: List<Integer> = []
     for index in 0..size / 2 { suites.add(get16(hello, at + index * 2)) }; at += size
-    if contains(suites, AES128_GCM) { session.cipherSuite = AES128_GCM }
-    else if contains(suites, CHACHA20_POLY1305) { session.cipherSuite = CHACHA20_POLY1305 }
-    else { abandon(session, "no supported TLS cipher suite"); return }
+    let selected = 0
+    for allowed in session.allowedSuites { if selected == 0 && contains(suites,allowed) { selected = allowed } }
+    if selected == 0 { abandon(session,"no supported TLS cipher suite under server policy"); return }
+    session.cipherSuite = selected
     if hello[at] != 1 || hello[at + 1] != 0 { abandon(session, "invalid ClientHello compression"); return }; at += 2
     if at + 2 > hello.length || get16(hello, at) != hello.length - at - 2 { abandon(session, "malformed ClientHello extensions"); return }; at += 2
     let seen: List<Integer> = []; let schemes: List<Integer> = []; let groups: List<Integer> = []
@@ -249,7 +260,7 @@ function clientHello(session: Session, hello: Bytes) {
             let difference = age - (now - opened.issued); if difference < 0 { difference = -difference }
             let clientExpiry=trust.currentCertificateExpiry(opened.clientChain)
             let identityValid = !session.requireClient || (opened.clientChain.length > 0 && clientExpiry>now && trust.clientChain(opened.clientChain, session.anchors) == "")
-            if difference <= 10000 && identityValid && contains(suites, opened.suite) {
+            if difference <= 10000 && identityValid && contains(suites,opened.suite) && contains(session.allowedSuites,opened.suite) {
                 session.resumed = true; session.resumePSK = opened.psk; session.cipherSuite = opened.suite
                 if session.quic && session.earlyOffered && opened.earlyLimit == 0xffffffff && session.ticketStore.earlyLimit == 0xffffffff &&
                    equal(opened.instance, session.ticketStore.instance) && opened.issued >= session.ticketStore.started && tickets.permitsEarly(opened.profile, tickets.profile(session.transportParameters)) &&
