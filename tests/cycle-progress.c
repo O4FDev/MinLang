@@ -100,12 +100,14 @@ static void ordinary_debt(void) {
     no_debt();
 }
 int main(int argc, char **argv) {
-    enum { N = 32, F = 3 };
+    enum { F = 3 };
+    unsigned N = argc > 2 ? (unsigned)strtoul(argv[2], NULL, 10) : 32;
+    assert(N == 32 || N == 2048 || N == 4096);
     double seconds = argc > 1 ? strtod(argv[1], NULL) : 1.0;
     assert(seconds >= 0.1 && seconds <= 30);
     no_debt();
     ordinary_debt();
-    MinyarRecord *nodes[N];
+    MinyarRecord *nodes[4096];
     for (unsigned i = 0; i < N; i++)
         nodes[i] = minyar_record_new_traced(F);
     for (unsigned i = 0; i < N; i++) {
@@ -117,6 +119,22 @@ int main(int argc, char **argv) {
         minyar_rc_release(nodes[i]);
     drain();
     assert(rc_object_count == N);
+    /* A large live cohort must not force the reactor to spin until its
+     * final field. Pacing applies after each bounded cycle-only batch,
+     * including ROOTS/MARK/SWEEP, while the real job stays queued. */
+    if (N >= 2048) {
+        size_t completed = rc_cycle_completed;
+        minyar_rc_retain_traced(nodes[1]);
+        minyar_rc_release(nodes[1]);
+        assert(pending() && rc_cycle_phase != RC_CYCLE_IDLE);
+        assert(rc_cycle_completed == completed);
+        const long long timeouts[] = {-1, 20, 1, 0};
+        for (size_t i = 0; i < sizeof(timeouts) / sizeof(*timeouts); i++) {
+            long long wait = service_wait(timeouts[i]);
+            assert(pending() && rc_cycle_completed == completed);
+            assert(wait == (timeouts[i] < 0 || timeouts[i] > 10 ? 10 : timeouts[i]));
+        }
+    }
     size_t attempts = 0, epochs = rc_cycle_epochs;
     /* Real helper calls borrow an interior node without changing the graph.
      * Their last transient external owner repeatedly requests a new epoch.
@@ -153,6 +171,30 @@ int main(int argc, char **argv) {
     double idle_cpu = (cpu_seconds() - cpu_start) / elapsed;
     assert(waits > 0);
     assert(idle_cpu <= 0.02);
+    /* Unreachable cycles must disappear even while helper borrows of a
+     * separate large live graph keep requesting new captured cohorts.
+     * Model every returned wake deadline without sleeping: the fixed input
+     * graph gives a finite call bound, and no call can postpone it >10ms. */
+    MinyarRecord *garbage[2];
+    for (unsigned i = 0; i < 2; i++)
+        garbage[i] = minyar_record_new_traced(1);
+    minyar_record_set_reference_traced(garbage[0], 0, slot(garbage[1]));
+    minyar_record_set_reference_traced(garbage[1], 0, slot(garbage[0]));
+    minyar_rc_release(garbage[0]);
+    minyar_rc_release(garbage[1]);
+    size_t cleanup_batches = 0, cleanup_deadline_ms = 0;
+    while (rc_object_count > N) {
+        assert(++cleanup_batches < 64u * N * (F + 1) + 64);
+        minyar_rc_retain_traced(nodes[1]);
+        minyar_rc_release(nodes[1]);
+        long long wait = service_wait(-1);
+        if (pending())
+            assert(wait >= 0 && wait <= 10);
+        if (wait > 0)
+            cleanup_deadline_ms += (size_t)wait;
+        assert(minyar_record_get(nodes[0], 0) == slot(nodes[0]));
+    }
+    assert(rc_object_count == N);
     /* The very same temporary may really become the last external owner.
      * Keeping cycle requests preserves eventual reclamation after it drops. */
     minyar_rc_retain_traced(nodes[1]);
@@ -164,8 +206,10 @@ int main(int argc, char **argv) {
     drain();
     assert(!rc_object_count && !rc_bytes && !rc_cycle_head && !rc_cycle_pending);
     no_debt();
-    printf("cycle progress: borrows=%zu epochs=%zu waits=%zu idle_cpu=%.6f max_work=%zu objects=0 "
+    printf("cycle progress: nodes=%u borrows=%zu epochs=%zu waits=%zu idle_cpu=%.6f max_work=%zu "
+           "churn_cleanup_batches=%zu churn_deadline_ms=%zu objects=0 "
            "bytes=0\n",
-           attempts, rc_cycle_epochs, waits, idle_cpu, maximum_work);
+           N, attempts, rc_cycle_epochs, waits, idle_cpu, maximum_work, cleanup_batches,
+           cleanup_deadline_ms);
     return 0;
 }
