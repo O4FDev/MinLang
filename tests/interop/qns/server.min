@@ -9,7 +9,7 @@ use "quicinteropio" as file
 use "tlstickets" as tickets
 use "quicretry" as retry
 record Transfer { id: Integer; request: Bytes; handle: Integer; size: Integer; sent: Integer; pending: Bytes; done: Boolean }
-record Peer { connection: quic.Connection; addresses: List<Text>; ports: List<Integer>; transfers: List<Transfer>; logged: Boolean }
+record Peer { connection: quic.Connection; addresses: List<Text>; ports: List<Integer>; sockets: List<Integer>; transfers: List<Transfer>; logged: Boolean; writeLogged: Integer; readLogged: Integer; random: Text }
 function httpPolicy(connection: quic.Connection) {
     // The independent early-data case sends forty concurrent tiny requests.
     // Keep the production default separate and the fixture below its 128
@@ -23,12 +23,31 @@ function httpPolicy(connection: quic.Connection) {
     connection.serverTLS.transportParameters=changed
 }
 function logKeys(peer: Peer, path: Text) {
-    let session = peer.connection.serverTLS
-    if peer.logged || session.clientApplication.length != 32 || session.transcript.length < 38 { return }
-    let random = crypto.hex(session.transcript.slice(6, 38))
-    file.append(path, "CLIENT_HANDSHAKE_TRAFFIC_SECRET " + random + " " + crypto.hex(session.clientSecret) + "\nSERVER_HANDSHAKE_TRAFFIC_SECRET " + random + " " + crypto.hex(session.serverSecret) + "\nCLIENT_TRAFFIC_SECRET_0 " + random + " " + crypto.hex(session.clientApplication) + "\nSERVER_TRAFFIC_SECRET_0 " + random + " " + crypto.hex(session.serverApplication) + "\n")
-    peer.logged = true
+    let session=peer.connection.serverTLS
+    if !peer.logged && (session.clientApplication.length!=32 || session.transcript.length<38) { return }
+    if !peer.logged {
+        peer.random=crypto.hex(session.transcript.slice(6,38))
+    }
+    let random=peer.random
+    if !peer.logged {
+        file.append(path,"CLIENT_HANDSHAKE_TRAFFIC_SECRET "+random+" "+crypto.hex(session.clientSecret)+"\nSERVER_HANDSHAKE_TRAFFIC_SECRET "+random+" "+crypto.hex(session.serverSecret)+"\nCLIENT_TRAFFIC_SECRET_0 "+random+" "+crypto.hex(session.clientApplication)+"\nSERVER_TRAFFIC_SECRET_0 "+random+" "+crypto.hex(session.serverApplication)+"\n")
+        peer.logged=true
+    }
+    let space=peer.connection.spaces[2]
+    if space.writeGeneration>peer.writeLogged { file.append(path,"SERVER_TRAFFIC_SECRET_"+Text(space.writeGeneration)+" "+random+" "+crypto.hex(space.write.secret)+"\n");peer.writeLogged=space.writeGeneration }
+    if space.readGeneration>peer.readLogged { file.append(path,"CLIENT_TRAFFIC_SECRET_"+Text(space.readGeneration)+" "+random+" "+crypto.hex(space.read.secret)+"\n");peer.readLogged=space.readGeneration }
 }
+function integer(text: Text): Integer {
+    let result=0
+    for digit in text { if digit<'0' || digit>'9' { return -1 };result=result*10+Integer(digit)-48 }
+    return result
+}
+function bind(port: Integer): Integer {
+    let socket=net.udp("::",port)
+    if socket<0 { socket=net.udp("0.0.0.0",port) }
+    return socket
+}
+
 function ended(request: Bytes): Boolean { return request.length >= 2 && request[request.length - 2] == 13 && request[request.length - 1] == 10 }
 function requested(request: Bytes): Text {
     let text = Text(request)
@@ -40,15 +59,29 @@ function requested(request: Bytes): Text {
 }
 function main(): Integer {
     let key = readBytesFile(argument(0)); let root = readBytesFile(argument(1)); let keyLog = argument(2); let directory = argument(3)
-    let identity: List<Bytes> = []; for index in 5..argumentCount() { identity.add(readBytesFile(argument(index))) }
-    let socket = net.udp("0.0.0.0", 443); if socket < 0 { print("QNS bind failed"); return 1 }
-    let eventLoop = errors.integerValue(loop.create()); loop.watch(eventLoop, socket, loop.readableInterest(), 0)
+    let identity: List<Bytes> = [];let bindPort=443;let preferredPort=444
+    let preferred4=crypto.fromHex("c1a76464");let preferred6=Bytes(16)
+    for index in 5..argumentCount() {
+        let value=argument(index)
+        if value.length>7 && value.slice(0,7)=="--port=" { bindPort=integer(value.slice(7,value.length)) }
+        else if value.length>17 && value.slice(0,17)=="--preferred-ipv4=" { preferred4=crypto.fromHex(value.slice(17,value.length)) }
+        else if value.length>17 && value.slice(0,17)=="--preferred-ipv6=" { preferred6=crypto.fromHex(value.slice(17,value.length)) }
+        else if value.length>17 && value.slice(0,17)=="--preferred-port=" { preferredPort=integer(value.slice(17,value.length)) }
+        else { identity.add(readBytesFile(value)) }
+    }
+    if bindPort<1 || bindPort>65535 || preferredPort<1 || preferredPort>65535 { return 8 }
+    let socket=bind(bindPort);if socket<0 { print("QNS bind failed");return 1 }
+    let sockets=[socket];let eventLoop=errors.integerValue(loop.create());loop.watch(eventLoop,socket,loop.readableInterest(),0)
+    if argument(4)=="connectionmigration" {
+        let alternative=bind(preferredPort);if alternative<0 { return 9 }
+        sockets.add(alternative);loop.watch(eventLoop,alternative,loop.readableInterest(),1)
+    }
     let store = tickets.store(randomBytes(16), 3600)
     let retries = retry.store(randomBytes(16),30000)
     if argument(4) == "zerortt" { tickets.allowEarlyData(store, 0xffffffff) }
     let peers: List<Peer> = []; let started = net.monotonicMilliseconds(); let now = 0
     print("QNS server ready")
-    while now < 90000 {
+    while now < 300000 {
         now = net.monotonicMilliseconds() - started; let timeout = 1000; let active: List<Peer> = []
         for peer in peers {
             let connection = peer.connection
@@ -90,7 +123,7 @@ function main(): Integer {
                 }
             }
             for packet in quic.pollDatagrams(connection, now) {
-                if packet.pathId < peer.addresses.length { net.sendDatagramTo(socket, peer.addresses[packet.pathId], peer.ports[packet.pathId], packet.data) }
+                if packet.pathId < peer.addresses.length { net.sendDatagramTo(peer.sockets[packet.pathId], peer.addresses[packet.pathId], peer.ports[packet.pathId], packet.data) }
             }
             let retained: List<Transfer> = []
             for transfer in peer.transfers {
@@ -106,14 +139,16 @@ function main(): Integer {
         let batch = loop.wait(eventLoop, timeout, 64); if errors.isError(loop.batchError(batch)) { return 7 }
         now = net.monotonicMilliseconds() - started
         for event in loop.events(batch) {
-            let packets = net.receiveDatagrams(socket, 64, 65535)
+            if event.token<0 || event.token>=sockets.length { continue }
+            let incomingSocket=sockets[event.token]
+            let packets = net.receiveDatagrams(incomingSocket, 64, 65535)
             if net.datagramBatchOk(packets) { for packet in net.datagrams(packets) {
                 let data = net.datagramData(packet)
                 if errors.bytesOk(data) {
                     let bytes = errors.bytesValue(data); let header = wire.header(bytes, 0, 8); let index = -1
                     if !header.valid || (header.kind != wire.ONE_RTT && header.version != 1) {
                         let response = wire.negotiateVersion(bytes)
-                        if errors.bytesOk(response) { net.sendDatagramTo(socket, net.datagramSource(packet), net.datagramPort(packet), errors.bytesValue(response)) }
+                        if errors.bytesOk(response) { net.sendDatagramTo(incomingSocket, net.datagramSource(packet), net.datagramPort(packet), errors.bytesValue(response)) }
                         continue
                     }
                     if header.valid {
@@ -123,25 +158,28 @@ function main(): Integer {
                                 let address=Bytes(net.datagramSource(packet)+"#"+Text(net.datagramPort(packet)))
                                 if header.token.length==0 {
                                     let response=retry.reply(retries,bytes,address,randomBytes(8),now)
-                                    if errors.bytesOk(response) { net.sendDatagramTo(socket,net.datagramSource(packet),net.datagramPort(packet),errors.bytesValue(response)) }
+                                    if errors.bytesOk(response) { net.sendDatagramTo(incomingSocket,net.datagramSource(packet),net.datagramPort(packet),errors.bytesValue(response)) }
                                     continue
                                 }
                                 let validated=retry.validateInitial(retries,bytes,address,now)
                                 if !retry.valid(validated) { continue }
                                 let connection=quic.serverAfterRetry(randomBytes(80),"hq-interop",validated,identity,key,[root],false)
                                 httpPolicy(connection)
-                                peers.add(Peer { connection: connection; addresses: [net.datagramSource(packet)]; ports: [net.datagramPort(packet)]; transfers: []; logged: false })
+                                if argument(4)=="chacha20" && !errors.booleanOk(quic.setCipherSuites(connection,[0x1303])) { return 10 }
+                                peers.add(Peer { connection: connection; addresses: [net.datagramSource(packet)]; ports: [net.datagramPort(packet)]; sockets: [incomingSocket]; transfers: []; logged: false; writeLogged: 0; readLogged: 0; random: "" })
                             } else {
                                 let connection = quic.serverWithTickets(randomBytes(80), "hq-interop", header.destination, identity, key, [root], false, store)
                                 httpPolicy(connection)
-                                peers.add(Peer { connection: connection; addresses: [net.datagramSource(packet)]; ports: [net.datagramPort(packet)]; transfers: []; logged: false })
+                                if argument(4)=="chacha20" && !errors.booleanOk(quic.setCipherSuites(connection,[0x1303])) { return 10 }
+                                if argument(4)=="connectionmigration" && !errors.booleanOk(quic.configurePreferredAddress(connection,preferred4,preferredPort,preferred6,0)) { return 11 }
+                                peers.add(Peer { connection: connection; addresses: [net.datagramSource(packet)]; ports: [net.datagramPort(packet)]; sockets: [incomingSocket]; transfers: []; logged: false; writeLogged: 0; readLogged: 0; random: "" })
                             }
                             index = peers.length - 1
                         }
                         if index >= 0 {
                             let peer = peers[index]; let route = -1
-                            for at in 0..peer.addresses.length { if peer.addresses[at] == net.datagramSource(packet) && peer.ports[at] == net.datagramPort(packet) { route = at } }
-                            if route < 0 && peer.addresses.length < 8 { peer.addresses.add(net.datagramSource(packet)); peer.ports.add(net.datagramPort(packet)); route = peer.addresses.length - 1 }
+                            for at in 0..peer.addresses.length { if peer.sockets[at] == incomingSocket && peer.addresses[at] == net.datagramSource(packet) && peer.ports[at] == net.datagramPort(packet) { route = at } }
+                            if route < 0 && peer.addresses.length < 8 { peer.addresses.add(net.datagramSource(packet)); peer.ports.add(net.datagramPort(packet)); peer.sockets.add(incomingSocket); route = peer.addresses.length - 1 }
                             if route >= 0 { quic.receivePath(peer.connection, bytes, route, now); logKeys(peer, keyLog) }
                         }
                     }
@@ -149,5 +187,6 @@ function main(): Integer {
             } }
         }
     }
+    loop.close(eventLoop);for socket in sockets { net.close(socket) }
     return 0
 }
