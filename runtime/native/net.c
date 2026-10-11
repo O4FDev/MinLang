@@ -19,6 +19,7 @@ typedef SOCKET socket_t;
 #else
 #include <fcntl.h>
 #include <netdb.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -279,6 +280,20 @@ static MinyarBytes *connect_result(unsigned status, int code, long long value) {
     for (unsigned i = 0; i < 8; i++)
         ((unsigned char *)result->bytes)[8 + i] = (unsigned char)((uint64_t)value >> (8 * i));
     return result;
+}
+/* Explicit TCP policy; ordinary connect/accept retain their existing
+ * socket defaults. Each failure owns the original native error value. */
+MinyarBytes *minyar_net_setNoDelayResult(long long connection, bool enabled) {
+    if (!initialize() || !valid_socket(connection))
+        return connect_result(NET_FAILURE, BAD_ARGUMENT, 0);
+    int value = enabled ? 1 : 0;
+    if (setsockopt((socket_t)connection, IPPROTO_TCP, TCP_NODELAY,
+                   (const char *)&value, sizeof(value))) {
+        int code = socket_error();
+        remember_code("TCP_NODELAY", code);
+        return connect_result(NET_FAILURE, code, 0);
+    }
+    return connect_result(NET_OK, 0, 1);
 }
 /* Literal-address connect never invokes DNS or waits for a remote peer. */
 MinyarBytes *minyar_net_connectStartResult(const MinyarText *host, long long port) {
