@@ -973,6 +973,10 @@ def derive_runner(pinned,destination,spec,registry_images):
         data=data.replace('dir="/tmp"','dir='+repr(str(spec.paths["fixture_root"])))
         data=data.replace("tempfile.TemporaryDirectory(","_AuthorTemporaryDirectory(")
         data="from owned_adapter import temporary_directory as _AuthorTemporaryDirectory\n"+data
+        if name=="interop.py":
+            marker="        status = TestResult.FAILED\n        output = \"\"\n        expired = False\n"
+            if data.count(marker)!=1:raise OwnershipError("pinned timed-run setup marker differs")
+            data=data.replace(marker,"        from owned_adapter import prepare_runner_phase\n        prepare_runner_phase()\n\n"+marker,1)
         if name=="testcase.py":
             node=next(node for node in ast.parse(data).body if isinstance(node,ast.FunctionDef) and node.name=="docker_cleanup_dir")
             lines=data.splitlines(keepends=True)
@@ -1154,6 +1158,21 @@ def close_admission(spec,revoke=True):
     return value
 
 
+def cleanup_previous_phase(spec,daemon):
+    # Setup retention must not consume the unchanged official protocol deadline.
+    if daemon.containers() or daemon.networks():
+        index=len(list(spec.paths["artifacts"].glob("between-up-*")))
+        phase_path=spec.paths["artifacts"]/"phase.json"
+        phase=json.loads(phase_path.read_bytes()) if phase_path.exists() else {}
+        cleanup_owned(spec,daemon,spec.paths["artifacts"]/("between-up-"+str(index)),"upstream-next-phase",unsupported_compliance=phase.get("unsupported_compliance"),revoke_admission=False)
+
+
+def prepare_runner_phase():
+    spec,daemon=runner_daemon()
+    with admission_lock(spec):require_admission(spec)
+    cleanup_previous_phase(spec,daemon)
+
+
 def docker_entry(argv):
     spec,daemon=runner_daemon()
     if argv[:4]==["compose","--env-file","empty.env","up"]:
@@ -1161,13 +1180,7 @@ def docker_entry(argv):
         command=compose_up_argv(spec,argv)
         for role in ("server","client"):
             if os.environ.get(role.upper()) not in spec.images[role]:raise OwnershipError("selected endpoint image is outside pinned cell")
-        # A repeated upstream compliance phase may leave stopped owned objects.
-        # Verify them and retain before removing; foreign collisions fail closed.
-        if daemon.containers() or daemon.networks():
-            index=len(list(spec.paths["artifacts"].glob("between-up-*")))
-            phase_path=spec.paths["artifacts"]/"phase.json"
-            phase=json.loads(phase_path.read_bytes()) if phase_path.exists() else {}
-            cleanup_owned(spec,daemon,spec.paths["artifacts"]/("between-up-"+str(index)),"upstream-next-phase",unsupported_compliance=phase.get("unsupported_compliance"),revoke_admission=False)
+        cleanup_previous_phase(spec,daemon)
         requested=argv[4:]
         role="client" if requested[-2:]==["sim","client"] else "server" if requested==["-V","server"] else None
         testcase=None if role is None else os.environ.get("TESTCASE_"+role.upper())

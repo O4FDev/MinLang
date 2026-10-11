@@ -377,8 +377,34 @@ def criteria_control(root,pinned):
     process=subprocess.run([sys.executable,str(wrapper),"compose","--env-file","empty.env","up","server"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=5)
     (root/"wrapper.stdout").write_bytes(process.stdout);(root/"wrapper.stderr").write_bytes(process.stderr)
     adapter.atomic_json(root/"wrapper-command.json",{"argv":[sys.executable,str(wrapper),"compose","--env-file","empty.env","up","server"],"status":process.returncode,"timeout_seconds":5,"stdout":adapter.binding(root/"wrapper.stdout"),"stderr":adapter.binding(root/"wrapper.stderr")})
+    import ast
+    run=next(node for node in ast.walk(ast.parse((root/"derived/interop.py").read_text()))
+             if isinstance(node,ast.FunctionDef) and node.name=="_run_test")
+    timed=[node for node in run.body if isinstance(node,ast.Try) and
+           any(isinstance(call,ast.Call) and isinstance(call.func,ast.Attribute) and
+               isinstance(call.func.value,ast.Name) and call.func.value.id=="subprocess" and
+               call.func.attr=="run" for call in ast.walk(node))]
+    prepared=[node for node in run.body if isinstance(node,ast.Expr) and
+              isinstance(node.value,ast.Call) and isinstance(node.value.func,ast.Name) and
+              node.value.func.id=="prepare_runner_phase"]
+    before_timeout=bool(prepared) and len(timed)==1 and prepared[0].lineno<timed[0].lineno
+    timeout_unchanged=all(ast.unparse(keyword.value)=="test.timeout()" for call in
+        ast.walk(timed[0]) if isinstance(call,ast.Call) and isinstance(call.func,ast.Attribute)
+        and isinstance(call.func.value,ast.Name) and call.func.value.id=="subprocess"
+        and call.func.attr=="run" for keyword in call.keywords if keyword.arg=="timeout")
+    (root/"phase-control").mkdir()
+    mock_owner,mock_daemon=setup(root/"phase-control")
+    real=adapter.runner_daemon
+    phase_cleaned=False
+    try:
+        adapter.runner_daemon=lambda:(mock_owner,mock_daemon)
+        if hasattr(adapter,"prepare_runner_phase"):
+            adapter.prepare_runner_phase()
+            phase_cleaned=not mock_daemon.containers() and not mock_daemon.networks() and bool(
+                list(mock_owner.paths["artifacts"].glob("between-up-*/cleanup.json")))
+    finally:adapter.runner_daemon=real
     return {"status":"passed","checks":{"official_criteria_unchanged":report["official_criteria_unchanged"],"pinned_original_hash":report["original_files"]["testcases_quic.py"]["sha256"]==adapter.PINNED["testcases_quic.py"],
-                                      "explicit_never_pull":good[good.index("--pull")+1]=="never","exact_project":good[good.index("--project-name")+1]==owner.project,
+                                      "previous_phase_prepared_before_timeout":before_timeout,"original_test_timeout_unchanged":timeout_unchanged,"previous_owned_objects_retained_and_removed":phase_cleaned,"explicit_never_pull":good[good.index("--pull")+1]=="never","exact_project":good[good.index("--project-name")+1]==owner.project,
                                       "all_unreviewed_commands_rejected":rejected==4,"execution_stays_held":config["execution_authorized"] is False and process.returncode!=0 and b"official Docker execution remains held" in process.stderr}},"passed"
 
 
