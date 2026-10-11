@@ -1,0 +1,51 @@
+use "transport" as transport
+use "errors" as errors
+use "quic" as quic
+function move(c: transport.Connection, s: transport.Connection, now: Integer, udp: Boolean) {
+    if udp {
+        for packet in transport.pollUDP(c,now) { transport.receiveUDP(s,packet.data,0,now) }
+        for packet in transport.pollUDP(s,now) { transport.receiveUDP(c,packet.data,0,now) }
+    } else { transport.receiveTCP(s,transport.pollTCP(c,now),now);transport.receiveTCP(c,transport.pollTCP(s,now),now) }
+}
+function main(): Integer {
+    let root=readBytesFile(argument(0));let identity=readBytesFile(argument(1));let key=readBytesFile(argument(2));let device=readBytesFile(argument(3));let deviceKey=readBytesFile(argument(4))
+    for mode in 0..2 {
+        let udp=mode==0
+        let c=transport.client("localhost",randomBytes(80),"minyar-test",[root],[device],deviceKey)
+        let s=transport.serverQUIC(randomBytes(80),"minyar-test",c.udp.originalDestination,[identity],key,[root],true)
+        if !udp { transport.udpUnavailable(c);transport.startTCP(c,randomBytes(64),0);s=transport.serverTCP(randomBytes(64),"minyar-test",[identity],key,[root],true,0) }
+        let now=0
+        while now<10000 && (c.state!=transport.QUIC_READY && c.state!=transport.TCP_READY) { move(c,s,now,udp);now+=10 }
+        for round in 0..20 { move(c,s,now,udp);now+=1 }
+        let ready=transport.TCP_READY;if udp { ready=transport.QUIC_READY }
+        if c.state!=ready || s.state!=ready { print(c.error);print(s.error);return 1 }
+        let previous=-1
+        for cycle in 0..1536 {
+            let opened=transport.openStream(c);if !errors.integerOk(opened) { print("cancel churn open failed "+Text(mode)+" "+Text(cycle));return 2 }
+            let id=errors.integerValue(opened);let remoteId=id&0xffffffff
+            if previous>=0 && id<=previous { return 3 }
+            let size=1;if cycle==0 { size=65536;if !udp { size=262144 } }
+            if !errors.integerOk(transport.write(c,id,Bytes(size),false)) { return 4 }
+            for round in 0..5 { move(c,s,now,udp);now+=1 }
+            if errors.booleanOk(transport.cancelStream(c,id^(1<<32))) { return 5 }
+            if !errors.booleanOk(transport.cancelStream(c,id)) { return 6 }
+            if errors.integerOk(transport.write(c,id,Bytes("forbidden"),false)) { return 7 }
+            if transport.streamIds(c).length!=0 { return 8 }
+            // Independent delivery of reset, stop and acknowledgments still
+            // governs QUIC reclamation; cancellation never fabricates ACKs.
+            for round in 0..100 {
+                move(c,s,now,udp);now+=1
+                let received=transport.read(s,remoteId)
+                if errors.bytesStatus(received)==errors.failureStatus() { transport.cancelStream(s,remoteId) }
+            }
+            if c.state!=ready || s.state!=ready { print(c.error);print(s.error);return 9 }
+            if udp {
+                if c.udp.streams.length>1 || s.udp.streams.length>1 || c.udp.closedStreams.length>8 || s.udp.closedStreams.length>8 { print("retained cancel context "+Text(cycle));return 10 }
+                for input in c.udp.streams { if input.incoming.length!=0 || input.segments.length!=0 { return 11 } }
+            } else if c.mux.streams.length>128 || s.mux.streams.length>128 || c.mux.buffered!=0 || s.mux.buffered!=0 { return 12 }
+            previous=id
+        }
+        print("transport cancel: 1536 "+Text(mode)+" stream resets, exhausted send credit, discarded queues, bounded physical contexts and stale generations passed")
+    }
+    return 0
+}
