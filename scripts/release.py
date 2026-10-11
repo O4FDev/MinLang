@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Sign and notarize release copies; publish the output only after verification."""
 import argparse
+from contextlib import ExitStack
+import ctypes
+import errno
 import json
 import os
 from pathlib import Path
@@ -8,6 +11,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import sys
 from urllib.parse import urlsplit
 
 
@@ -30,12 +34,63 @@ def notarize(path, profile, run):
         raise ValueError(f'notarization was not accepted: {status}')
 
 
-def macos(app, output, identity, profile, *, entitlements=None, run=subprocess.run):
+def publish_directory(source, destination):
+    """Atomically publish a generation without replacing even an empty directory."""
+    if os.name == 'nt':
+        # Windows rename refuses an existing destination, including directories.
+        os.rename(source, destination)
+        return
+    if sys.platform.startswith(('cygwin', 'msys')):
+        # MSYS exposes POSIX replacement semantics and has no renameat2.
+        # MoveFileW retains Windows' exclusive directory publication contract.
+        native = [subprocess.check_output(['cygpath', '-w', str(path)],
+                                         text=True).strip()
+                  for path in (source, destination)]
+        kernel = ctypes.CDLL('kernel32.dll')
+        move = kernel.MoveFileW
+        move.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+        move.restype = ctypes.c_int
+        if not move(*native):
+            if os.path.lexists(destination):
+                raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST),
+                                      str(destination))
+            # Keep an unpublished generation on any other native rename failure.
+            raise OSError(errno.EIO, 'exclusive Windows directory publication failed',
+                          str(destination))
+        return
+    library = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == 'darwin':
+        # Apple XNU bsd/sys/stdio.h: RENAME_EXCL=0x4.
+        function = library.renamex_np
+        function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        arguments = [os.fsencode(source), os.fsencode(destination), 4]
+    else:
+        # Linux renameat2: RENAME_NOREPLACE=1, AT_FDCWD=-100.
+        function = library.renameat2
+        function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                             ctypes.c_char_p, ctypes.c_uint]
+        arguments = [-100, os.fsencode(source), -100, os.fsencode(destination), 1]
+    function.restype = ctypes.c_int
+    if function(*arguments):
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), str(destination))
+
+
+def macos(app, output, identity, profile, *, entitlements=None,
+          signed_app_output=None, run=subprocess.run):
     if not identity.startswith('Developer ID Application: ') or not profile:
         raise ValueError('a Developer ID Application identity and notarytool Keychain profile are required')
     app, output = Path(app).resolve(strict=True), Path(output).absolute()
     if app.suffix != '.app' or not (app / 'Contents/MacOS').is_dir() or output.suffix != '.dmg':
         raise ValueError('macOS release requires an application bundle and .dmg output')
+    retained = None
+    if signed_app_output is not None:
+        retained = Path(signed_app_output).absolute()
+        if retained.suffix != '.app':
+            raise ValueError('signed app output must be a new .app generation')
+        if os.path.lexists(retained):
+            raise FileExistsError(f'signed app output already exists: {retained}')
+        retained.parent.mkdir(parents=True, exist_ok=True)
     if entitlements is not None:
         import plistlib
         entitlements = Path(entitlements).resolve(strict=True)
@@ -46,9 +101,12 @@ def macos(app, output, identity, profile, *, entitlements=None, run=subprocess.r
         if path.is_symlink() and not path.resolve().is_relative_to(app):
             raise ValueError(f'bundle symlink escapes the app: {path}')
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='.minyar-release-', dir=output.parent) as directory:
-        temp = Path(directory)
-        stage = temp / app.name
+    with ExitStack() as stack:
+        temp = Path(stack.enter_context(tempfile.TemporaryDirectory(
+            prefix='.minyar-release-', dir=output.parent)))
+        app_temp = temp if retained is None else Path(stack.enter_context(
+            tempfile.TemporaryDirectory(prefix='.minyar-signed-app-', dir=retained.parent)))
+        stage = app_temp / app.name
         shutil.copytree(app, stage, symlinks=True)
         macho = {b'\xfe\xed\xfa\xce', b'\xce\xfa\xed\xfe', b'\xfe\xed\xfa\xcf', b'\xcf\xfa\xed\xfe',
                  b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca', b'\xca\xfe\xba\xbf', b'\xbf\xba\xfe\xca'}
@@ -81,7 +139,17 @@ def macos(app, output, identity, profile, *, entitlements=None, run=subprocess.r
         checked(run, ['xcrun', 'stapler', 'validate', str(image)])
         checked(run, ['codesign', '--verify', '--strict', str(image)])
         checked(run, ['spctl', '--assess', '--type', 'open', '--context', 'context:primary-signature', str(image)])
-        os.replace(image, output)
+        if retained is None:
+            os.replace(image, output)
+        else:
+            # Move the exact verified stage on its original filesystem; copying
+            # would risk losing signature/staple metadata or resource forks.
+            publish_directory(stage, retained)
+            try:
+                os.replace(image, output)
+            except BaseException:
+                os.rename(retained, stage)
+                raise
 
 
 def windows(source, output, signtool, thumbprint, timestamp, *, azure_dlib=None,
@@ -129,6 +197,7 @@ def main():
     mac.add_argument('--identity', required=True)
     mac.add_argument('--notary-profile', required=True)
     mac.add_argument('--entitlements')
+    mac.add_argument('--signed-app-output', help='retain the exact verified signed/stapled app as a new immutable generation')
     win = modes.add_parser('windows')
     win.add_argument('--input', required=True)
     win.add_argument('--output', required=True)
@@ -141,7 +210,8 @@ def main():
     args = parser.parse_args()
     try:
         if args.mode == 'macos':
-            macos(args.app, args.output, args.identity, args.notary_profile, entitlements=args.entitlements)
+            macos(args.app, args.output, args.identity, args.notary_profile, entitlements=args.entitlements,
+                  signed_app_output=args.signed_app_output)
         else:
             windows(args.input, args.output, args.signtool, args.thumbprint, args.timestamp,
                     azure_dlib=args.azure_dlib, azure_metadata=args.azure_metadata, machine_store=args.machine_store)

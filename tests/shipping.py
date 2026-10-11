@@ -86,6 +86,89 @@ class Shipping(unittest.TestCase):
                 release.macos(self.app, self.out, 'Developer ID Application: Developer (ABC)', 'profile', run=reject)
             self.assertEqual(self.out.read_bytes(), b'previous release')
 
+    def test_retains_exact_signed_stapled_stage_used_for_image(self):
+        retained = self.root / 'immutable generation.app'
+        snapshot = {}
+        def signed_tool(args, **kwargs):
+            self.assertFalse(retained.exists(), 'published app before all checks')
+            if args[:2] == ['codesign', '--force'] and Path(args[-1]).suffix == '.app':
+                (Path(args[-1]) / 'Contents/signed-marker').write_bytes(b'exact signature')
+            if args[:3] == ['xcrun', 'stapler', 'staple'] and Path(args[-1]).suffix == '.app':
+                (Path(args[-1]) / 'Contents/stapled-ticket').write_bytes(b'exact ticket')
+            if args[:2] == ['hdiutil', 'create']:
+                stage = Path(args[args.index('-srcfolder') + 1])
+                snapshot['inode'] = stage.stat().st_ino
+                snapshot['files'] = {str(p.relative_to(stage)): p.read_bytes()
+                                     for p in stage.rglob('*') if p.is_file()}
+            return self.tool(args, **kwargs)
+        release.macos(self.app, self.out, 'Developer ID Application: Developer (ABC)',
+                      'profile', signed_app_output=retained, run=signed_tool)
+        self.assertEqual(retained.stat().st_ino, snapshot['inode'])
+        self.assertEqual({str(p.relative_to(retained)): p.read_bytes()
+                          for p in retained.rglob('*') if p.is_file()}, snapshot['files'])
+        self.assertEqual((retained / 'Contents/signed-marker').read_bytes(), b'exact signature')
+        self.assertEqual((retained / 'Contents/stapled-ticket').read_bytes(), b'exact ticket')
+        self.assertFalse((self.app / 'Contents/signed-marker').exists())
+        self.assertEqual(self.out.read_bytes(), b'disk image')
+
+    def test_retained_app_refuses_existing_empty_or_occupied_generation(self):
+        for contents in (False, True):
+            retained = self.root / f'existing-{contents}.app'
+            retained.mkdir()
+            if contents: (retained / 'owned').write_bytes(b'previous app')
+            self.out.write_bytes(b'previous image')
+            with self.assertRaises((ValueError, FileExistsError)):
+                release.macos(self.app, self.out, 'Developer ID Application: Developer (ABC)',
+                              'profile', signed_app_output=retained, run=self.tool)
+            self.assertEqual(self.out.read_bytes(), b'previous image')
+            self.assertEqual(self.calls, [])
+            self.assertEqual(list(retained.iterdir()), [retained / 'owned'] if contents else [])
+
+    def test_every_tool_failure_leaves_both_publications_untouched(self):
+        baseline = self.root / 'baseline.app'
+        release.macos(self.app, self.out, 'Developer ID Application: Developer (ABC)',
+                      'profile', signed_app_output=baseline, run=self.tool)
+        count = len(self.calls)
+        for phase in range(count):
+            retained = self.root / f'failure-{phase}.app'
+            self.out.write_bytes(b'previous image')
+            calls = []
+            def fail(args, **kwargs):
+                self.assertFalse(retained.exists())
+                calls.append(args)
+                if len(calls) - 1 == phase:
+                    raise subprocess.CalledProcessError(1, args)
+                return self.tool(args, **kwargs)
+            with self.subTest(phase=phase), self.assertRaises(subprocess.CalledProcessError):
+                release.macos(self.app, self.out, 'Developer ID Application: Developer (ABC)',
+                              'profile', signed_app_output=retained, run=fail)
+            self.assertFalse(retained.exists())
+            self.assertEqual(self.out.read_bytes(), b'previous image')
+
+    def test_late_generation_collision_does_not_replace_even_an_empty_directory(self):
+        retained = self.root / 'raced.app'
+        self.out.write_bytes(b'previous image')
+        def race(args, **kwargs):
+            if args[:5] == ['spctl', '--assess', '--type', 'open', '--context']:
+                retained.mkdir()
+            return self.tool(args, **kwargs)
+        with self.assertRaises(FileExistsError):
+            release.macos(self.app, self.out, 'Developer ID Application: Developer (ABC)',
+                          'profile', signed_app_output=retained, run=race)
+        self.assertEqual(list(retained.iterdir()), [])
+        self.assertEqual(self.out.read_bytes(), b'previous image')
+
+    def test_failed_image_publication_rolls_back_new_app_generation(self):
+        from unittest.mock import patch
+        retained = self.root / 'rollback.app'
+        self.out.write_bytes(b'previous image')
+        with patch.object(release.os, 'replace', side_effect=OSError('publication denied')):
+            with self.assertRaises(OSError):
+                release.macos(self.app, self.out, 'Developer ID Application: Developer (ABC)',
+                              'profile', signed_app_output=retained, run=self.tool)
+        self.assertFalse(retained.exists())
+        self.assertEqual(self.out.read_bytes(), b'previous image')
+
     def test_windows_uses_explicit_certificate_sha256_timestamp_and_authenticode_policy(self):
         source = self.root / 'input with spaces.exe'
         source.write_bytes(b'MZfixture')
