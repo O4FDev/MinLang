@@ -1540,7 +1540,7 @@ class BuildWiring(unittest.TestCase):
                     self.assertIn('Linux adapter controls required', commands)
                     self.assertIn('exit 2', commands)
                     self.assertNotIn('prepare-', commands)
-                    self.assertNotIn(' controls ', commands)
+                    self.assertNotIn('check-quic-official-inputs.py controls ', commands)
                     self.assertFalse(rules.get(target, set()))
                     return
                 self.assertTrue(inputs <= rules.get(target, set()))
