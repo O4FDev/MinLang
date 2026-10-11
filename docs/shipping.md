@@ -372,6 +372,17 @@ macOS provider results must be recorded separately from Linux; an unavailable
 provider is not a passing mock. Production signing/notarization and R2 deployment
 require the respective host credentials and operator provisioning.
 
+Packager link fixtures check their actual `lstat`/readlink identity, hardlink
+inode/link counts and FIFO type before testing rejection. MSYS2 defaults to
+deep copies when asked to create a symlink; these copies are valid regular
+resources and have a separate positive control. On MSYS/Cygwin the link fixture
+starts a fresh interpreter with `winsymlinks:sys` to create a recognized POSIX
+link without native symlink privileges. This proves that provider's link
+rejection; native Windows reparse results remain separate.
+[MSYS2 link modes](https://www.msys2.org/docs/symlinks/)
+and [Cygwin symbolic links](https://cygwin.com/cygwin-ug-net/using.html#pathnames-symlinks)
+describe these representations.
+
 The Linux public process-failure fixture deliberately sets RLIMIT_NPROC to zero
 in an owned driver subprocess. LeakSanitizer also needs a tracing process, so
 that restricted subprocess alone uses `detect_leaks=0` while ASan/UBSan remain

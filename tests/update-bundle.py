@@ -2,6 +2,10 @@
 """Production bundle encoder roundtrips through the signed owned launch gate."""
 import importlib.util
 import os
+import shutil
+import stat
+import subprocess
+import sys
 from pathlib import Path
 import struct
 import tempfile
@@ -27,6 +31,44 @@ class Packager(unittest.TestCase):
         self.output=self.lab/'Tolum.pkg'
         self.main='App.app/Contents/MacOS/main'
     def tearDown(self):self.temp.cleanup()
+
+    def link_fixture(self,path,target,*,directory=False):
+        if sys.platform in ('cygwin','msys'):
+            # MSYS defaults to copying. Its DLL reads link creation policy when
+            # the process starts, so a fresh interpreter must create the link.
+            # The documented sys representation needs no symlink privilege.
+            env=dict(os.environ)
+            for variable in ('MSYS','CYGWIN'):
+                flags=[word for word in env.get(variable,'').split()
+                       if word!='winsymlinks' and not word.startswith('winsymlinks:')]
+                env[variable]=' '.join([*flags,'winsymlinks:sys'])
+            subprocess.run([sys.executable,'-c',
+                'import os,sys;os.symlink(sys.argv[1],sys.argv[2],target_is_directory=sys.argv[3]=="1")',
+                str(target),str(path),'1' if directory else '0'],
+                env=env,check=True,timeout=15)
+        else:path.symlink_to(target,target_is_directory=directory)
+        self.assertTrue(stat.S_ISLNK(path.lstat().st_mode),'fixture must be a real symlink')
+        self.assertEqual(os.readlink(path),str(target))
+
+    def test_link_fixture_never_accepts_a_copied_file_or_directory(self):
+        # MSYS default symlink creation can copy the target. Such a fixture
+        # must fail setup rather than falsely proving link rejection.
+        for directory in [False,True]:
+            source=self.lab/('directory' if directory else 'file')
+            if directory:
+                source.mkdir();(source/'data').write_bytes(b'original data')
+            else:source.write_bytes(b'original data')
+            link=self.root/('copied-directory' if directory else 'copied-file')
+            def copy_target(*args,**kwargs):
+                if directory:shutil.copytree(source,link)
+                else:shutil.copy2(source,link)
+            with self.subTest(directory=directory), \
+                 patch.object(Path,'symlink_to',side_effect=copy_target), \
+                 patch.object(subprocess,'run',side_effect=copy_target):
+                with self.assertRaisesRegex(AssertionError,'real symlink'):
+                    self.link_fixture(link,source,directory=directory)
+            self.assertFalse(stat.S_ISLNK(link.lstat().st_mode))
+            self.assertEqual((link/'data' if directory else link).read_bytes(),b'original data')
 
     def test_complete_tree_modes_empty_directories_and_deterministic_output(self):
         first=bundle.prepare(self.root,self.output,self.main)
@@ -195,6 +237,29 @@ class Packager(unittest.TestCase):
                         self.assertIn(main.read_bytes(),self.output.read_bytes())
                 self.assertEqual(list(self.lab.glob('.minyar-bundle-*')),[])
 
+    def test_regular_copies_are_valid_independent_bundle_resources(self):
+        # A deep copy is ordinary data, not a link. Keep a positive control
+        # rather than turning valid copied resources into rejected adversaries.
+        outside=self.lab/'outside-resource';outside.write_bytes(b'copied resource')
+        tree=self.lab/'outside-directory';tree.mkdir()
+        (tree/'data').write_bytes(b'copied directory resource')
+        copied=self.root/'copied-resource';shutil.copy2(outside,copied)
+        folder=self.root/'copied-directory';shutil.copytree(tree,folder)
+        self.assertTrue(stat.S_ISREG(copied.lstat().st_mode))
+        self.assertTrue(stat.S_ISDIR(folder.lstat().st_mode))
+        self.assertEqual(copied.lstat().st_nlink,1)
+        self.assertNotEqual((outside.lstat().st_dev,outside.lstat().st_ino),
+                            (copied.lstat().st_dev,copied.lstat().st_ino))
+        first=bundle.prepare(self.root,self.output,self.main)
+        data=self.output.read_bytes()
+        self.assertIn(b'copied resource',data)
+        self.assertIn(b'copied directory resource',data)
+        outside.write_bytes(b'changed source');(tree/'data').write_bytes(b'changed source')
+        self.assertEqual(copied.read_bytes(),b'copied resource')
+        self.assertEqual((folder/'data').read_bytes(),b'copied directory resource')
+        self.assertEqual(bundle.prepare(self.root,self.lab/'again.pkg',self.main),first)
+        self.assertEqual((self.lab/'again.pkg').read_bytes(),data)
+
     def test_ambiguous_names_bad_entrypoints_and_embedded_output_refused(self):
         for name in ['../escape','/absolute','NUL','missing','App.app/Contents/Resources/resource with spaces']:
             with self.subTest(main=name),self.assertRaises((ValueError,OSError)):
@@ -213,13 +278,18 @@ class Packager(unittest.TestCase):
         # POSIX actual link cases; Windows link/reparse provider is tested in the
         # native launch suite and must never substitute a copied file fixture.
         if os.name!='nt':
-            linked=self.root/'escape';linked.symlink_to(external)
+            linked=self.root/'escape';self.link_fixture(linked,external)
             with self.assertRaises(ValueError):bundle.prepare(self.root,self.output,self.main)
             linked.unlink()
             os.link(external,linked)
+            source_info=external.lstat();link_info=linked.lstat()
+            self.assertEqual((source_info.st_dev,source_info.st_ino),(link_info.st_dev,link_info.st_ino))
+            self.assertGreaterEqual(source_info.st_nlink,2)
+            self.assertEqual(source_info.st_nlink,link_info.st_nlink)
             with self.assertRaises(ValueError):bundle.prepare(self.root,self.output,self.main)
             linked.unlink()
             os.mkfifo(linked)
+            self.assertTrue(stat.S_ISFIFO(linked.lstat().st_mode),'fixture must be a real FIFO')
             with self.assertRaises(ValueError):bundle.prepare(self.root,self.output,self.main)
             linked.unlink()
         with self.assertRaises(ValueError):bundle.safe_path('NUL.txt')
@@ -231,9 +301,9 @@ class Packager(unittest.TestCase):
         (framework/'Versions/A/Resources').mkdir(parents=True)
         (framework/'Versions/A/Foo').write_bytes(b'nested signed code')
         (framework/'Versions/A/Resources/data').write_bytes(b'nested signed resource')
-        (framework/'Versions/Current').symlink_to('A',target_is_directory=True)
-        (framework/'Foo').symlink_to('Versions/Current/Foo')
-        (framework/'Resources').symlink_to('Versions/Current/Resources',target_is_directory=True)
+        self.link_fixture(framework/'Versions/Current','A',directory=True)
+        self.link_fixture(framework/'Foo','Versions/Current/Foo')
+        self.link_fixture(framework/'Resources','Versions/Current/Resources',directory=True)
         self.output.write_bytes(b'previous artifact')
         with self.assertRaisesRegex(ValueError,'links'):
             bundle.prepare(self.root,self.output,self.main)
