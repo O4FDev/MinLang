@@ -1,7 +1,8 @@
 # Ownership, callbacks, cycles and recoverable errors
 
-Research and implementation record, 2026-10-10. This distinguishes the working
-error-value module from language/runtime work that has not been implemented.
+Research and implementation record, 2026-10-10, with the 2026-10-11 optional
+Result language update. This distinguishes the ordinary concrete error-value
+module from the optional checked frontend and remaining language/runtime work.
 Upstream documentation and sampled official test sources were inspected; no
 upstream suite was executed and no claim of a community consensus is made.
 
@@ -17,8 +18,11 @@ a separate representation and synchronization protocol.
 
 Use explicit typed result values for recoverable failures. The implemented
 `library/errors.min` provides concrete `IntegerResult`, `BooleanResult` and
-`BytesResult` records on today's compiler. Adopt tagged `Result<T, E>` and
-exhaustive matching before adding propagation sugar such as `?`. An OS read
+`BytesResult` records on the ordinary compiler. The opt-in native `minyarc-errors` frontend
+now implements typed tagged `Result<T, E>`, exhaustive two-arm matching and
+checked binding-initializer propagation with `try`; see
+[the implemented language contract](errors-language.md). Postfix `?` remains
+outside that initial grammar. An OS read
 failure or invalid packet becomes a result; invalid indexing, integer overflow,
 violated runtime invariants and explicit `fail` remain fatal. There is no
 unwinding exception implementation in this work.
@@ -239,8 +243,11 @@ TRUNCATED prefix, but callers must inspect status before parsing it as a
 complete datagram. WOULD_BLOCK and FAILURE have no readable payload.
 
 These are managed records, with real allocation/ownership costs, not zero-cost
-sum types. Private fields ensure representation consistency, but this compiler
-does not enforce handling every result, exhaustive branching or linear use.
+sum types. Private fields ensure representation consistency, but the ordinary
+compiler does not enforce handling every concrete result, exhaustive branching
+or linear use. The optional Result frontend checks its own outcome matching
+and rejects discarded Result expression statements; unused bindings remain
+permitted.
 Bytes retain ordinary alias/mutation behavior; a result's payload is not a
 frozen cross-thread buffer. No callbacks, generic Result, `?`, typed throws,
 managed worker domains or cycle collection are implemented by this module.
