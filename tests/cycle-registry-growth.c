@@ -218,6 +218,38 @@ static void local_cancellations(void) {
     }
 }
 
+
+static void active_publication(void) {
+    Graph g = graph();
+    MinyarRecord *c = minyar_record_new_traced(1);
+    MinyarRecord *d = minyar_record_new_traced(1);
+    MinyarRecord *left = minyar_record_new_traced(1);
+    MinyarRecord *right = minyar_record_new_traced(1);
+    MinyarRecord *p = minyar_record_new_traced(8);
+    minyar_record_set_traced(left, 0, 8101);
+    minyar_record_set_traced(right, 0, 8102);
+    minyar_record_set_take_traced(c, 0, slot(left));
+    minyar_record_set_take_traced(d, 0, slot(right));
+    minyar_record_set_reference_traced(p, 0, slot(c));
+    minyar_record_set_reference_traced(p, 7, slot(d));
+    rc_drop(c); rc_drop(d);
+    rc_cycle_request_local();
+    local_phase(RC_CYCLE_MARK);
+    size_t turns = 0;
+    while (rc_cycle_active != rc_cycle_value(p) || rc_cycle_index != 1) {
+        assert(++turns < 100000); rc_cycle_unit();
+    }
+    assert(!rc_cycle_proven(rc_cycle_value(p)) && !rc_cycle_proven(rc_cycle_value(c)));
+    minyar_list_add_take_traced(g.list, slot(p));
+    assert(rc_cycle_proven(rc_cycle_value(p)));
+    drain();
+    assert(rc_object_count == 9);
+    assert(p->values[0] == slot(c) && p->values[7] == slot(d));
+    assert(c->values[0] == slot(left) && left->values[0] == 8101);
+    assert(d->values[0] == slot(right) && right->values[0] == 8102);
+    minyar_rc_release(g.root); empty();
+}
+
 static void temporary_contracts(void) {
     for (unsigned action = 0; action < 4; action++) {
         Graph g = graph();
@@ -331,6 +363,9 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "callbacks") || !strcmp(mode, "all")) callback_work(n, 0);
     if (!strcmp(mode, "streaming") || !strcmp(mode, "all")) callback_work(n, 1);
+#ifdef MINYAR_CYCLE_LOCAL_PROOFS
+    if (!strcmp(mode, "active") || !strcmp(mode, "all")) active_publication();
+#endif
     if (!strcmp(mode, "safety") || !strcmp(mode, "all")) {
         char *old[] = {(char *)"additive", (char *)"32", NULL};
         additive_fixture_main(2, old);
