@@ -1588,7 +1588,7 @@ class BuildWiring(unittest.TestCase):
             with self.subTest(missing_input=source), self.assertRaises(AssertionError):
                 verify(mutant)
         for label, old, new in (
-                ('case filter', '--repository', '--case criteria-no-pull --repository'),
+                ('case filter', 'controls --repository', 'controls --case criteria-no-pull --repository'),
                 ('ordinary limiter omitted', '$(LIMITED) "$(QUIC_OFFICIAL_PYTHON)" -E scripts/',
                  '"$(QUIC_OFFICIAL_PYTHON)" -E scripts/'),
                 ('wrong limiter', '$(LIMITED) "$(QUIC_OFFICIAL_PYTHON)" -E scripts/',
@@ -1600,7 +1600,7 @@ class BuildWiring(unittest.TestCase):
                 ('relative artifacts', '$(abspath build)/quic-official-adapter.',
                  'build/quic-official-adapter.'),
                 ('existing artifact leaf', '$$artifacts/run', '$$artifacts'),
-                ('missing pin argument', '--repository "$(QUIC_OFFICIAL_RUNNER)"', ''),
+                ('missing pin argument', 'controls --repository "$(QUIC_OFFICIAL_RUNNER)"', 'controls'),
                 ('missing dependency verification', 'scripts/check-quic-official-inputs.py controls',
                  'scripts/check-quic-official-inputs.py ignored')):
             mutant = fragment.replace(old, new, 1)
