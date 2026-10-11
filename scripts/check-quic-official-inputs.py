@@ -246,6 +246,8 @@ def require_empty_pycache(prefix):
 
 
 def import_route():
+    if sys.flags.safe_path is not True:
+        raise ValueError('controls require the CPython3.12 safe import path')
     if sys.dont_write_bytecode is not True:
         raise ValueError('controls must disable bytecode writes on the fresh route')
     prefix = require_empty_pycache(sys.pycache_prefix)
@@ -256,7 +258,7 @@ def import_route():
 
 def fresh_python_argv(python, arguments, prefix):
     prefix = require_empty_pycache(prefix)
-    return [str(python), '-E', '-B', '-X', 'pycache_prefix='+str(prefix)]+list(arguments)
+    return [str(python), '-E', '-B', '-P', '-X', 'pycache_prefix='+str(prefix)]+list(arguments)
 
 def verify_python(requirements):
     route = import_route()
@@ -284,7 +286,7 @@ def verify_python(requirements):
     spec = importlib.util.find_spec('yaml')
     if (spec is None or spec.origin is None or
             Path(spec.origin).resolve() not in paths or
-            not isinstance(spec.loader, importlib.machinery.SourceFileLoader)):
+            type(spec.loader) is not importlib.machinery.SourceFileLoader):
         raise ValueError('controls YAML must load a verified source file')
     require_empty_pycache(route['prefix'])
     yaml = importlib.import_module('yaml')
