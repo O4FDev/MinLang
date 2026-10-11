@@ -18,6 +18,7 @@ spec.loader.exec_module(fixtures)
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--sanitize', action='store_true')
+    parser.add_argument('--curve', choices=('X25519', 'prime256v1'))
     options = parser.parse_args()
     if options.sanitize:
         for name in ('MINYAR_CLANG_FLAGS', 'MINYAR_NATIVE_FLAGS', 'MINYAR_RUNTIME_FLAGS'):
@@ -44,6 +45,7 @@ def main():
                 assert ready.startswith('READY '), ready
                 context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
                 context.minimum_version = context.maximum_version = ssl.TLSVersion.TLSv1_3
+                if options.curve: context.set_ecdh_curve(options.curve)
                 context.load_verify_locations(ca.path('root', 'pem'))
                 context.set_alpn_protocols(['http/1.1'])
                 if name:
