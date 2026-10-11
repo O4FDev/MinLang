@@ -86,6 +86,7 @@ class WinAPI:
             function.restype, function.argtypes = result, arguments
         self.attributes, self.handles, self.files = None, [], []
         self.attributes_initialized = False
+        self.attribute_values = []
 
     def checked(self, name, *args):
         result = getattr(self.k, name)(*args)
@@ -129,6 +130,9 @@ class WinAPI:
         self.attributes_initialized = True
         job_list = (HANDLE * 1)(job)
         handle_list = (HANDLE * 3)(*std)
+        # Microsoft requires lpValue buffers to live until attribute deletion.
+        # Own both before the first update, including partial-update failures.
+        self.attribute_values.extend((job_list, handle_list))
         self.checked('UpdateProcThreadAttribute', self.attributes, 0, 0x0002000D,
                      job_list, ctypes.sizeof(job_list), None, None)
         self.checked('UpdateProcThreadAttribute', self.attributes, 0, 0x00020002,
@@ -184,8 +188,13 @@ class WinAPI:
                 self.k.DeleteProcThreadAttributeList(self.attributes)
             except BaseException as error:
                 failures.append(error)
-            self.attributes_initialized = False
-        self.attributes = None
+            else:
+                self.attributes_initialized = False
+                self.attributes = None
+                self.attribute_values.clear()
+        else:
+            self.attributes = None
+            self.attribute_values.clear()
         # Process/thread/std duplicates close before the final job handle.
         for handle in reversed(self.handles):
             try:
