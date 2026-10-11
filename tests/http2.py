@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Pinned independent h2/HPACK peer, RFC controls and hostile-input campaign."""
 import argparse
+from clang_helpers import launcher_command
 import os
 from pathlib import Path
 import random
@@ -37,7 +38,7 @@ def main():
         env['ASAN_OPTIONS'] = 'detect_leaks=1'; env['UBSAN_OPTIONS'] = 'halt_on_error=1'
     with tempfile.TemporaryDirectory(prefix='minyar-http2-') as directory:
         directory = Path(directory); binary = directory / 'probe'
-        subprocess.run([str(ROOT / 'minyar'), str(ROOT / 'tests/http2.min'), '-o', str(binary)], env=env, check=True, timeout=240)
+        subprocess.run([*launcher_command(ROOT), str(ROOT / 'tests/http2.min'), '-o', str(binary)], env=env, check=True, timeout=240)
         def run(raw, mode='', piece=0):
             (directory / 'input').write_bytes(raw)
             result = subprocess.run([str(binary), str(directory / 'input'), str(directory / 'output'), mode, str(piece)], env=env, capture_output=True, text=True, timeout=60)
@@ -125,7 +126,7 @@ def main():
         assert run(prefix, 'timer')[0] == 'TIMER OK\n'
         # True flow-control stall, exact send budget, no-consumption overload and retry.
         bounds = directory / 'bounds'
-        subprocess.run([str(ROOT / 'minyar'), str(ROOT / 'tests/http2-bounds.min'), '-o', str(bounds)], env=env, check=True, timeout=240)
+        subprocess.run([*launcher_command(ROOT), str(ROOT / 'tests/http2-bounds.min'), '-o', str(bounds)], env=env, check=True, timeout=240)
         peer = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=True, header_encoding='utf-8'))
         peer.initiate_connection(); peer.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 0}); peer.send_headers(1, FIELDS)
         (directory / 'input').write_bytes(peer.data_to_send())

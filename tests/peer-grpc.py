@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Independent protobuf/HTTP2 clients for Tolum's normative PeerEdgeDial schema."""
 import argparse
+from clang_helpers import launcher_command
 import os
 from pathlib import Path
 import struct
@@ -72,7 +73,7 @@ def main():
         if options.compat_red:
             source = directory / 'red.min'
             source.write_text('use "peergrpc" as grpc\nuse "errors" as errors\nlet server = grpc.create()\ngrpc.receive(server, readBytesFile(argument(0)))\nlet open = grpc.requests(server, 1000000)\nif grpc.openOk(open) { print("OPEN") } else { print("ERROR " + Text(errors.code(grpc.openError(open)))) }\nwriteBytesFile(argument(1), grpc.takeOutgoing(server, 1048576))\n')
-        compiler = [str(ROOT / 'minyar')]
+        compiler = launcher_command(ROOT)
         if options.library: compiler += ['--library', str(options.library)]
         compiler += [str(source), '-o', str(binary)]
         subprocess.run(compiler, env=env, check=True, timeout=240)
@@ -158,7 +159,7 @@ def main():
                 assert Request.FromString(bytes(bad[5:])).WhichOneof('body') == 'open'
         run(b'', 'trap', trap=True)
         serving = directory / 'serve'
-        subprocess.run([str(ROOT / 'minyar'), str(ROOT / 'tests/peer-grpc-serve.min'), '-o', str(serving)], env=env, check=True, timeout=240)
+        subprocess.run([*launcher_command(ROOT), str(ROOT / 'tests/peer-grpc-serve.min'), '-o', str(serving)], env=env, check=True, timeout=240)
         process = subprocess.Popen([str(serving)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             port = int(process.stdout.readline().strip())
