@@ -34,13 +34,24 @@ def safe_path(value):
 
 def snapshot(info):
     attributes=getattr(info,'st_file_attributes',0)
-    if stat.S_ISDIR(info.st_mode):
+    mode=info.st_mode;stamp=info.st_ctime_ns
+    if hasattr(info,'st_file_attributes'):
+        # CPython Windows path stat adds execute bits based on filename, while
+        # fstat does not. From 3.12 path ctime is birth time, fd ctime is change
+        # time. Compare their common identity/content fields; retain raw fd
+        # mode/change time separately across the copy, and path modes in index.
+        if stat.S_ISREG(mode):mode&=~0o111
+        stamp=getattr(info,'st_birthtime_ns',stamp)
+    if stat.S_ISDIR(mode):
         # NTFS can expose this internal directory-index bit through the path
         # query and drop it after enumeration. It is not part of bundle v1.
         # Retain every other attribute, including readonly and reparse bits.
         attributes&=~0x10000000
-    return (info.st_dev,info.st_ino,info.st_mode,info.st_size,info.st_mtime_ns,info.st_ctime_ns,
-            attributes)
+    return (info.st_dev,info.st_ino,mode,info.st_size,info.st_mtime_ns,stamp,attributes)
+
+def descriptor_snapshot(info):
+    # Both observations use fstat: raw mode/ctime now have identical semantics.
+    return (snapshot(info),info.st_mode,info.st_ctime_ns)
 
 def forbidden(info):
     return stat.S_ISLNK(info.st_mode) or bool(getattr(info,'st_file_attributes',0)&0x400)
@@ -118,14 +129,16 @@ def prepare(root,output,entrypoint,*,notarized_app=None):
                 if kind=='F':
                     fd=os.open(path,os.O_RDONLY|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_BINARY',0))
                     with os.fdopen(fd,'rb') as source:
-                        if snapshot(os.fstat(source.fileno()))!=observed[path]:
+                        before=os.fstat(source.fileno())
+                        if snapshot(before)!=observed[path]:
                             raise ValueError('bundle input changed while preparing output')
+                        copying=descriptor_snapshot(before)
                         remaining=size
                         while remaining:
                             chunk=source.read(min(65536,remaining))
                             if not chunk:raise ValueError('bundle file was truncated')
                             stream.write(chunk);remaining-=len(chunk)
-                        if source.read(1) or snapshot(os.fstat(source.fileno()))!=observed[path]:
+                        if source.read(1) or descriptor_snapshot(os.fstat(source.fileno()))!=copying:
                             raise ValueError('bundle file changed during copying')
             stream.flush();os.fsync(stream.fileno())
             # Rescan the actual index too. Directory timestamps/sizes alone
