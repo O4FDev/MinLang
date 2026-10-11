@@ -1,7 +1,7 @@
 # v2 implementation and verification map
 
 This checkpoint describes the combined implementation based on
-`49edb0f6bf28f7f44251a1f3ba0f1da18aede1cf` at 23:12 UTC on 2026-10-11.
+`f2d8f0e` at 23:49 UTC on 2026-10-11.
 An implemented API, a passing focused suite and a complete deployment are
 separate claims. Retained results establish only their recorded source and
 configuration. Combined CI, current macOS/Windows gates, ordinary performance
@@ -107,9 +107,19 @@ a rescan. The first test also released its independently held primary before
 measuring locality, requiring an unrelated replacement proof. With that fixture
 corrected, payload/count/root-drop and empty-heap assertions pass, and eight
 borrows take eight units under the unchanged 192-unit limit. Initial cleanup
-still performs two full epochs/completions instead of the required one.
+still reports two aggregate epochs/completions instead of the required one.
 The candidate runtime is isolated and unqualified; expiry and safety controls
 do not substitute for this remaining regression or a capacity pass.
+
+A strengthened test separately proves that an ordinary unpaired drop still
+requests a rescan and that losing a private cycle's last owning path reclaims
+that cycle before changing the primary root. The proposed paired-drop repair
+passes those controls: the private case uses one full job and one seven-unit
+local job. Its final acyclic smoke still fails the aggregate completion count.
+Those counters include local jobs, so this result does not establish a second
+full scan. Classification is under review; the 192-unit gate, safety assertions
+and requirement to avoid another full scan remain unchanged. No sanitizer or
+broader qualification is claimed for this candidate.
 
 ## Recoverable errors
 
@@ -253,6 +263,12 @@ Native and sanitizer IPv4/IPv6 cases now pass exact tuple, path and one-MiB
 payload assertions. These are loopback fixture checks; the official migration
 follow-up remains separate, and the earlier primary matrix nonpasses remain
 unchanged. Its 107 indexed metadata/source files were independently verified.
+The subsequent literal official Quinn-client migration verdict is FAILED:
+retained authenticated handshake decoding confirms both advertised ports are
+444, but the unchanged checker observes only the original IPv6 port-443 path.
+The exact pinned client's preferred-address policy is unproven. This does not
+establish an unsupported case or a product root cause. Its 80 exported metadata
+files were verified; private decoding and capture material remain on Boat.
 
 Actual runner failures exposed fixture defects in Docker 29 capability
 spelling, simulator capture writers that had not flushed during shutdown, and
@@ -339,6 +355,18 @@ UDP-blocked fallback, malformed-input and flat-memory measurements remain
 required. Resource guard samples bound their sampling interval, not every
 instantaneous CPU/RAM peak.
 
+Current supplied-binary short controls pass natively and with actual
+ASan/UBSan/LSan builds: 4,096 TCP connections, 64 mutual-TLS/HTTP connections
+and 64 QUIC peers with injected loss and reordering. A real QUIC harness
+failure first timed out waiting for a server whose configured setup allowance
+outlasted its client. The observation loop now waits for normal server
+completion within the same independent deadline; no timeout was increased.
+Both QUIC endpoints exit normally, all 64 peers authenticate, and live routes
+and timers return to zero. The original failure and all six successful controls
+are retained in a 118-file verified metadata archive. Five-second controls do
+not certify warmed memory, connected idle or hours-long stability; missing
+helper-process memory sampling is being addressed before the mixed soak.
+
 ## Desktop and shipping
 
 macOS exposes AppKit controls/menu-bar/accessory mode, notifications and login
@@ -412,10 +440,22 @@ Windows CI configuration then passed all six unchanged debug/release bridge,
 shared-loop and notification language probes. The contained Windows Job closed
 with zero active processes, the VM stopped normally, and no sampled whole-host
 CPU/RAM limit was exceeded. The 406 indexed source/metadata files were
-independently verified. Additional PE/link/frontend receipts remain in the
-guest's owned output directory and require recovery in the next layout session;
-these results do not establish default-wrapper support, full portable CI,
-layout completion or interactive tray behavior.
+independently verified. The following layout session recovered and hash-checked
+all six actual PEs, schema-2 link inputs and frontend receipts without repeating
+those probes. They retain their prior-source qualification boundary.
+
+The layout change at `47aa5655` adds constrained views, asymmetric insets,
+alignment, visibility, descendant removal and stale-handle checks. The same
+immutable fixture first fails to link against the old provider, then passes
+natively and under ASan/UBSan, including all 15 programmer-error controls.
+Affected native controls, shared GUI/socket looping and notifications also pass
+in both configurations; the two changed language probes pass with exact output.
+All 76 contained Windows Jobs close with no active processes, and the VM and
+owned host processes retire. The 818-file archive, actual link bindings and 197
+selected final source files were independently verified before integration.
+Native layout-counter diagnostics are retained as expected measurement output.
+These focused results do not establish default-wrapper support, Windows LSan,
+full portable CI, complete desktop parity or interactive tray behavior.
 
 The updater authenticates Ed25519 manifests, rollout selection and monotonic
 versions; installs indexed regular-file app/resource trees; and validates an
