@@ -185,6 +185,6 @@ print("public launcher services captured cycles before AppKit sleep")
         executable = temp/('capture-contract-'+mode[2:])
         subprocess.run([ROOT/'minyar', mode, '--cleanup-budget', '1',
                         capture_source, '-o', executable], check=True, timeout=180)
-        result = subprocess.run([executable], check=True, capture_output=True,
-                                text=True, timeout=30)
+        result = subprocess.run([executable], capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
         assert result.stdout == 'public launcher services captured cycles before AppKit sleep\n', result
