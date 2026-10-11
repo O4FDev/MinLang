@@ -5,10 +5,10 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--artifacts',type=Path,required=True);parser.add_argument('--yamux-peer',type=Path);parser.add_argument('--state-only',action='store_true');parser.add_argument('--sanitize',action='store_true');parser.add_argument('--optimization',choices=('0','2'),default='0');options=parser.parse_args()
-    commands=[['securecrypto.py'],['quic-crypto.py'],['quic-wire.py'],['quic-dispatch.py'],['tls-server.py'],['tls-validity.py']]
+    commands=[['securecrypto.py'],['quic-crypto.py'],['quic-wire.py'],['quic-dispatch.py'],['tls-server.py'],['tls-server.py','--curve','prime256v1'],['tls-keyshare.py'],['tls-validity.py'],['yamux-churn.py'],['transport-cancel.py']]
     commands += [['quic-transport.py',*([mode] if mode else [])] for mode in ('','--key-update','--migration','--server-protocol','--resumption','--quic-resumption','--early','--fallback','--congestion','--stream-control','--stream-churn','--closing','--persistent','--retry','--rtt')]
-    commands += [['tls-resumption-expiry.py']]
-    if options.yamux_peer:commands += [['transport-go.py','--peer-binary',str(options.yamux_peer.resolve())]]
+    commands += [['tls-resumption-expiry.py'],['tls-handshake-validity.py']]
+    if options.yamux_peer:commands += [['transport-go.py','--peer-binary',str(options.yamux_peer.resolve()),*extra] for extra in ([],['--streams','1536'])]
     results=[];options.artifacts.mkdir(parents=True,exist_ok=True)
     with (options.artifacts/'suite.log').open('w') as log:
         spec=importlib.util.spec_from_file_location('tls_tests',ROOT/'tests/tls-local.py');fixtures=importlib.util.module_from_spec(spec);spec.loader.exec_module(fixtures)
@@ -26,7 +26,7 @@ def main():
         if options.state_only:return 0
         for command in commands:
             started=time.monotonic();print('RUN',command,flush=True);log.write('RUN '+str(command)+'\n');log.flush()
-            result=subprocess.run([sys.executable,str(ROOT/'tests'/command[0]),*command[1:],*(['--sanitize'] if options.sanitize else [])],cwd=ROOT,stdout=log,stderr=subprocess.STDOUT,timeout=180)
+            result=subprocess.run([sys.executable,str(ROOT/'tests'/command[0]),*command[1:],*(['--sanitize'] if options.sanitize else [])],cwd=ROOT,stdout=log,stderr=subprocess.STDOUT,timeout=240 if '--streams' in command else 180)
             row={'command':command,'status':result.returncode,'seconds':time.monotonic()-started};results.append(row);print(json.dumps(row),flush=True)
             (options.artifacts/'suite.json').write_text(json.dumps(results,indent=2)+'\n')
             if result.returncode:return result.returncode

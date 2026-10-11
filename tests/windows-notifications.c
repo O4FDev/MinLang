@@ -264,8 +264,8 @@ int main(void) {
         assert(integer(minyar_winnotify_closeRaw(real)) == 0);
     } else {
         fprintf(stderr, "visible notification error: kind=%u HRESULT=0x%08lx\n", error(shown),
-                 (unsigned long)((uint32_t)shown->bytes[4] | (uint32_t)shown->bytes[5] << 8 |
-                                 (uint32_t)shown->bytes[6] << 16 | (uint32_t)shown->bytes[7] << 24));
+                (unsigned long)((uint32_t)shown->bytes[4] | (uint32_t)shown->bytes[5] << 8 |
+                                (uint32_t)shown->bytes[6] << 16 | (uint32_t)shown->bytes[7] << 24));
         assert(error(shown) == 8);
         minyar_rc_release(shown);
     }

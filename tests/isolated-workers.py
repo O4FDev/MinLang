@@ -24,11 +24,11 @@ class IsolatedWorkers(CompilerTestCase):
             '-ladvapi32', '-o', str(executable)]), capture_output=True, text=True,
             timeout=30, phase='link-windows-worker-lifecycle')
         self.assertEqual(linked.returncode, 0, linked.stderr)
-        run = self.evidence.run([str(executable)], capture_output=True, timeout=30,
+        run = self.evidence.run([str(executable)], capture_output=True, text=True, timeout=30,
                                phase='execute-windows-worker-lifecycle')
         self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertEqual(run.stdout, b'Windows worker handle isolation and process lifecycle verified\n')
-        self.assertEqual(run.stderr, b'')
+        self.assertEqual(run.stdout, 'Windows worker handle isolation and process lifecycle verified\n')
+        self.assertEqual(run.stderr, '')
 
     def worker_program(self, source, expected):
         result, llvm = self.compile(source)
