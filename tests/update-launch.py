@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import platform
 import plistlib
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -38,8 +39,14 @@ class Launch(unittest.TestCase):
             '-o',str(cls.signer)],check=True,timeout=60)
         subprocess.run([clang,'-O2','-Wall','-Wextra','-Werror',str(ROOT/'tests/update-owned-helper.c'),
             *(['-lshell32'] if windows_host() else ['-framework','CoreFoundation'] if platform.system()=='Darwin' else []),'-o',str(cls.helper)],check=True,timeout=60)
-        subprocess.run([str(ROOT/'minyar'),'--library',str(ROOT/'library'),
-            str(ROOT/'tests/update-launch-driver.min'),'-o',str(cls.driver)],
+        command=[str(ROOT/'minyar'),'--library',str(ROOT/'library'),
+            str(ROOT/'tests/update-launch-driver.min'),'-o',str(cls.driver)]
+        if os.name=='nt':
+            shell=shutil.which('bash')
+            if not shell:
+                raise AssertionError('Update launch Minyar tests require the MSYS2 toolchain')
+            command.insert(0,shell)
+        subprocess.run(command,
             env=dict(os.environ,LIMITED='',SANITIZER_LIMITED=''),check=True,timeout=180)
         cls.target=('windows' if windows_host() else {'Darwin':'macos','Linux':'linux'}[platform.system()])+'-'+(
             'arm64' if platform.machine().lower() in ('arm64','aarch64') else 'x86_64')
@@ -54,9 +61,8 @@ class Launch(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         if os.environ.get('MINYAR_UPDATE_EVIDENCE'):
-            import shutil
             destination=Path(os.environ['MINYAR_UPDATE_EVIDENCE'])/'launch-fixtures'
-            shutil.copytree(cls.lab,destination,dirs_exist_ok=True)
+            shutil.copytree(cls.lab,destination,dirs_exist_ok=True,symlinks=True)
         cls.temp.cleanup()
 
     def setUp(self):
@@ -214,6 +220,35 @@ class Launch(unittest.TestCase):
         artifact=self.lab/'production.pkg'
         encoder.prepare(source,artifact,'App.app/Contents/MacOS/main')
         self.assertEqual(self.install(artifact.read_bytes())[0],['true','true'])
+        self.assertIn('RESOURCE:signed resource',self.run_driver('launch'))
+
+    def test_signed_binary_index_overflows_truncations_and_invalid_modes_preserve_active(self):
+        _,active=self.install(self.helper.read_bytes())
+        original=package(self.entries)
+        main='App.app/Contents/MacOS/main'.encode()
+        count_offset=16+4+len(main)
+        first=count_offset+4
+        cases=[]
+        for value in [0,4097,0xffffffff]:
+            data=bytearray(original);data[count_offset:count_offset+4]=struct.pack('>I',value);cases.append(bytes(data))
+        data=bytearray(original);data[16:20]=struct.pack('>I',0xffffffff);cases.append(bytes(data))
+        for offset,value in [(first,ord('L')),(first+1,1),(first+1,2)]:
+            data=bytearray(original);data[offset]=value;cases.append(bytes(data))
+        for offset,width,value in [(first+2,4,0xffffffff),(first+6,8,1),(first+6,8,0xffffffffffffffff)]:
+            data=bytearray(original);data[offset:offset+width]=value.to_bytes(width,'big');cases.append(bytes(data))
+        for marker in [b'\0',b'\n',b'\r',b'\xff']:
+            data=bytearray(original);data[first+14:first+15]=marker;cases.append(bytes(data))
+        for length in [7,15,16,19,count_offset,first,first+13,len(original)-1]:
+            cases.append(original[:length])
+        cases.append(package(list(reversed(self.entries))))
+        for index,data in enumerate(cases):
+            with self.subTest(index=index):
+                result,_=self.install(data,version='1.2.0',sequence=index+2)
+                self.assertEqual(result[0],'false',result)
+                self.assertEqual((self.root/'state').read_text().splitlines()[5],active)
+                self.assertIn('OWNED-HELPER',self.run_driver('launch'))
+        # Fresh complete bytes can recover despite every failed signed proposal.
+        self.assertEqual(self.install(original,version='1.2.0',sequence=len(cases)+2)[0],['true','true'])
         self.assertIn('RESOURCE:signed resource',self.run_driver('launch'))
 
     def test_missing_or_extra_payload_file_and_symlink_are_rejected(self):
