@@ -14,6 +14,144 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class BuildWiring(unittest.TestCase):
 
+    def test_generated_llvm_sanitizer_is_mandatory_and_tracks_canonical_helper(self):
+        import json
+        import re
+        source = (ROOT / 'build-support/checks.mk').read_text()
+        marker = '# Real unsafe generated-program accesses must fail'
+        self.assertIn(marker, source)
+        fragment = source[source.index(marker):]
+        expected = {'build/minyarc', 'tests/generated-llvm-sanitizer.py',
+                    'tests/generated-llvm-sanitizer.min', 'tests/llvm_sanitizer.py',
+                    'tools/sanitizer_llvm.py', 'tools/clang-driver.py'}
+
+        def verify(candidate):
+            with tempfile.TemporaryDirectory(prefix='actual sanitizer Make rules ') as folder:
+                probe = Path(folder)/'probe.mk'
+                probe.write_text(candidate + '\nbuild:\n')
+                result = subprocess.run(['make', '-rRnp', '-f', str(probe), 'check'],
+                                        cwd=ROOT, capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                rules = {}
+                for line in result.stdout.splitlines():
+                    match = re.match(r'^([A-Za-z][\w/-]*):(?: *)([^#]*)$', line)
+                    if match:
+                        rules.setdefault(match[1], set()).update(match[2].split())
+                for gate in ('check', 'check-portable', 'check-sanitize'):
+                    self.assertIn('check-generated-llvm-sanitizer', rules.get(gate,set()), gate)
+                self.assertTrue(expected <= rules.get('check-generated-llvm-sanitizer',set()))
+                commands = result.stdout.split('# GNU Make',1)[0]
+                self.assertIn('python3 tests/generated-llvm-sanitizer.py', commands)
+                self.assertIn('--artifacts "$artifacts/run"', commands)
+                self.assertIn((ROOT/'build/generated-llvm-sanitizer-').as_posix(),
+                              commands.replace('\\','/'))
+        verify(fragment)
+        aggregate = 'check check-portable check-sanitize: check-generated-llvm-sanitizer'
+        for gate in ('check','check-portable','check-sanitize'):
+            missing = fragment.replace(aggregate, ' '.join(x for x in aggregate.split(':')[0].split()
+                                                          if x != gate) + ': check-generated-llvm-sanitizer')
+            with self.subTest(gate=gate), self.assertRaises(AssertionError):
+                verify(missing)
+        for dependency in sorted(expected - {'build/minyarc'}):
+            with self.subTest(dependency=dependency), self.assertRaises(AssertionError):
+                verify(fragment.replace(dependency+' ', '', 1))
+        compiler = (ROOT/'build-support/compiler.mk').read_text()
+        rules = re.findall(r'^build/[^:\n]*sanitize\.ll:([^\n]*)',compiler,re.M)
+        self.assertEqual(len(rules),5)
+        self.assertTrue(all('tests/llvm_sanitizer.py' in r and 'tools/sanitizer_llvm.py' in r for r in rules))
+        shim = (ROOT/'tests/llvm_sanitizer.py').read_text()
+        self.assertIn('from sanitizer_llvm import',shim)
+        self.assertNotIn('def instrument_address_sanitizer',shim)
+        loader = {}
+        exec(compile((ROOT/'scripts/check-linux.py').read_text(), 'linux driver','exec'),
+             {'__name__':'static_linux_driver','__file__':str(ROOT/'scripts/check-linux.py')},loader)
+        self.assertEqual(loader['TARGETS'].count('check-generated-llvm-sanitizer'),1)
+
+    def test_private_retirement_gates_execute_actual_operation_contract(self):
+        import importlib.util
+        import json
+        import re
+        source = (ROOT/'build-support/managed-graphs.mk').read_text()
+        marker = '# Every C command takes N OPERATION [ARGS]'
+        self.assertIn(marker,source)
+        fragment = source[source.index(marker):]
+        pair = {'check-cycle-private-retirement','check-cycle-private-retirement-sanitize'}
+        inputs = {'tests/cycle-private-retirement.py','tests/cycle-idle-invalidation.c',
+                  'tests/cycle-private-retirement-v5.json','tests/cycle-additive.c',
+                  'tests/cycle-additive.py','tests/test_evidence.py','tools/cycle_runtime.py'}
+
+        def verify(candidate):
+            with tempfile.TemporaryDirectory(prefix='actual private retirement Make rules ') as folder:
+                probe=Path(folder)/'probe.mk'
+                probe.write_text(candidate+'\nbuild:\n')
+                result=subprocess.run(['make','-rRnp','-f',str(probe),'check'],
+                                      cwd=ROOT,capture_output=True,text=True,timeout=15)
+                self.assertEqual(result.returncode,0,result.stderr)
+                rules={}
+                for line in result.stdout.splitlines():
+                    match=re.match(r'^([A-Za-z][\w/-]*):(?: *)([^#]*)$',line)
+                    if match:rules.setdefault(match[1],set()).update(match[2].split())
+                for gate in ('check','check-portable','check-managed-graphs-profiles'):
+                    self.assertTrue(pair <= rules.get(gate,set()),gate)
+                self.assertIn('check-cycle-private-retirement-sanitize',rules.get('check-sanitize',set()))
+                for target in pair:self.assertTrue(inputs <= rules[target],target)
+                commands=result.stdout.split('# GNU Make',1)[0]
+                self.assertEqual(commands.count('python3 tests/cycle-private-retirement.py'),2)
+                self.assertEqual(commands.count('--evidence "$evidence/run"'),2)
+                self.assertEqual(commands.count('--sanitize --evidence'),1)
+                self.assertNotIn('--profiles',commands)
+                self.assertNotIn('--budgets',commands)
+                for kind in ('native','sanitize'):
+                    self.assertIn((ROOT/'build'/('cycle-private-retirement-'+kind)).as_posix(),
+                                  commands.replace('\\','/'))
+        verify(fragment)
+        for gate in ('check','check-portable','check-managed-graphs-profiles','check-sanitize'):
+            line = next(line for line in fragment.splitlines() if line.startswith(gate+':'))
+            for target in set(line.split(':',1)[1].split()) & pair:
+                with self.subTest(gate=gate,target=target),self.assertRaises(AssertionError):
+                    verify(fragment.replace(line,line.replace(' '+target,'',1),1))
+        for dependency in sorted(inputs):
+            with self.subTest(input=dependency),self.assertRaises(AssertionError):
+                verify(fragment.replace(dependency+' ','',1))
+        spec=importlib.util.spec_from_file_location('retirement_operation_contract',
+                                                 ROOT/'tests/cycle-private-retirement.py')
+        driver=importlib.util.module_from_spec(spec);spec.loader.exec_module(driver)
+        self.assertEqual(driver.HEAP_BYTES,4194304)
+        self.assertEqual(len(driver.operation_plan('system',1)),38)
+        self.assertEqual(len(driver.operation_plan('fixed',32)),36)
+        self.assertEqual(len(driver.operation_plan('eager',32)),16)
+        for mode in driver.QUEUED:
+            for recent in ('0','1'):
+                self.assertIn(['32','queued',mode,recent],driver.operation_plan('fixed',32))
+        for mode in ('active-local','active-full'):
+            for phase in ('1','2','3'):
+                self.assertIn(['32',mode,phase],driver.operation_plan('system',1024))
+        for n in (32,256,2048):
+            self.assertIn([str(n),'private','assert-local'],driver.operation_plan('system',1))
+        self.assertFalse(any(row[1] in ('queued','certificate','reuse','unknown-after-drop')
+                             for row in driver.operation_plan('eager',32)))
+        self.assertEqual(driver.profile_selection(None,True)[0],['system','fixed','eager'])
+        with self.assertRaises(ValueError):driver.profile_selection(['lazy'],True)
+        red=b'IDLE label=private n=32 rounds=8 units=1136 epochs=8\nAssertion work <= 16u * rounds + 64u failed\n'
+        driver.validate_failure_control(-6,b'',red)
+        for status,stdout,stderr,timedout in ((0,b'',red,False),(-6,b'output',red,False),
+                (-6,b'',red,True),(-6,b'',red.replace(b'1136',b'128'),False),
+                (-6,b'',red.replace(b'work <= 16u * rounds + 64u',b'unrelated assertion'),False)):
+            with self.assertRaises(AssertionError):
+                driver.validate_failure_control(status,stdout,stderr,timedout)
+        spec=importlib.util.spec_from_file_location('retirement_catalogue',ROOT/'tests/suite-catalogue.py')
+        catalogue=importlib.util.module_from_spec(spec);spec.loader.exec_module(catalogue)
+        data=json.loads((ROOT/'tests/suite-catalogue.json').read_text())
+        catalogue.validate(data,ROOT)
+        for name in ('tests/cycle-private-retirement.py','tests/cycle-idle-invalidation.c',
+                     'tests/cycle-private-retirement-v5.json','tests/generated-llvm-sanitizer.py',
+                     'tests/generated-llvm-sanitizer.min'):
+            omitted=dict(data,sources=[row for row in data['sources'] if row['path']!=name])
+            with self.subTest(source=name),self.assertRaises(ValueError):
+                catalogue.validate(omitted,ROOT)
+        self.assertIn('tests/cycle-idle-invalidation.c',(ROOT/'scripts/format.py').read_text())
+        self.assertIn('VERSION = "23.1.2"',(ROOT/'scripts/format.py').read_text())
+
 
     def test_parallel_signature_gates_prepare_every_frontend_and_fixture(self):
         import importlib.util

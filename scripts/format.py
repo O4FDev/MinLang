@@ -29,6 +29,7 @@ FILES = (
     "tests/net-native.c", "tests/net-batch.c", "tests/net-loop.c", "tests/net-udp-offload.c",
     "tests/runtime-bytes.c", "tests/runtime-traps.c",
     "tests/cycle-late-registration.c", "tests/cycle-registration-exposure.c",
+    "tests/cycle-idle-invalidation.c",
     "tests/llvm_symbols.h",
     "tests/stack-limits.c", "experiments/memory/checked-scalars-driver.c",
     "experiments/memory/checked-scalars-cpp.cpp",

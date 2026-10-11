@@ -102,3 +102,17 @@ check: check-cycle-registration-exposure check-cycle-registration-exposure-sanit
 check-portable: check-cycle-registration-exposure check-cycle-registration-exposure-sanitize
 check-managed-graphs-profiles: check-cycle-registration-exposure check-cycle-registration-exposure-sanitize
 check-sanitize: check-cycle-registration-exposure-sanitize
+
+# Every C command takes N OPERATION [ARGS]; these are production-header controls.
+.PHONY: check-cycle-private-retirement check-cycle-private-retirement-sanitize
+CYCLE_PRIVATE_RETIREMENT_INPUTS = tests/cycle-private-retirement.py tests/cycle-idle-invalidation.c tests/cycle-private-retirement-v5.json tests/cycle-additive.c tests/cycle-additive.py tests/clang_helpers.py tests/test_evidence.py tools/cycle_runtime.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
+check-cycle-private-retirement: $(CYCLE_PRIVATE_RETIREMENT_INPUTS) | build
+	@set -e; evidence=$$(mktemp -d "$(abspath build)/cycle-private-retirement-native-XXXXXX"); \
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-private-retirement.py --evidence "$$evidence/run"
+check-cycle-private-retirement-sanitize: $(CYCLE_PRIVATE_RETIREMENT_INPUTS) | build
+	@set -e; evidence=$$(mktemp -d "$(abspath build)/cycle-private-retirement-sanitize-XXXXXX"); \
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-private-retirement.py --sanitize --evidence "$$evidence/run"
+check: check-cycle-private-retirement check-cycle-private-retirement-sanitize
+check-portable: check-cycle-private-retirement check-cycle-private-retirement-sanitize
+check-managed-graphs-profiles: check-cycle-private-retirement check-cycle-private-retirement-sanitize
+check-sanitize: check-cycle-private-retirement-sanitize
