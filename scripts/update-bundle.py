@@ -134,6 +134,8 @@ def prepare(root,output,entrypoint,*,notarized_app=None):
                 try:os.fsync(fd)
                 finally:os.close(fd)
         finally:
+            # Close on failure too: Windows will not unlink an open temporary.
+            stream.close()
             if temporary.exists():temporary.unlink()
     return {'format':1,'entrypoint':entrypoint,'entries':len(records),'size':expected,'sha256':digest}
 
