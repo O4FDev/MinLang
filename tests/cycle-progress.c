@@ -146,6 +146,9 @@ int main(int argc, char **argv) {
      * including ROOTS/MARK/SWEEP, while the real job stays queued. */
     if (N >= 2048) {
         size_t completed = rc_cycle_completed;
+        /* A stable read request may now validate in one unit. An actual
+         * owning store must still force the same bounded midcohort policy. */
+        minyar_record_replace_traced(nodes[0], 0, slot(nodes[0]), 0);
         minyar_rc_retain_traced(nodes[1]);
         minyar_rc_release(nodes[1]);
         assert(pending() && rc_cycle_phase != RC_CYCLE_IDLE);

@@ -17,17 +17,26 @@
  * incoming counts owning aggregate slots, so it never exceeds the number of
  * eight-byte slots that fit in the address space; 58 bits cover 2^61 bytes. */
 typedef struct RcCycle {
-    struct RcCycle *previous, *next, *gray_next;
+    struct RcCycle *previous, *next;
+    uintptr_t gray_next; /* Aligned link, with bits0/1 holding proof validity/generation. */
     size_t generation : 1, marked : 2, registered : 1, pinned : 1, cleared : 1, record : 1,
         incoming : 57;
 } RcCycle;
 _Static_assert(sizeof(RcCycle) == 32, "cycle metadata must stay four words");
+_Static_assert(_Alignof(RcCycle) >= 8, "cycle links require eight-byte alignment");
 enum { RC_CYCLE_IDLE, RC_CYCLE_ROOTS, RC_CYCLE_MARK, RC_CYCLE_SWEEP };
 static RcCycle *rc_cycle_head, *rc_cycle_cohort, *rc_cycle_cursor;
 static RcCycle *rc_cycle_gray_head, *rc_cycle_gray_tail, *rc_cycle_active;
 static size_t rc_cycle_index, rc_cycle_limit;
 static unsigned rc_cycle_generation, rc_cycle_phase, rc_cycle_requested;
 static unsigned rc_cycle_pending, rc_cycle_inside;
+/* A proof certifies only nodes reached from this still-external anchor.
+ * Any owning traced-edge change invalidates it before the store. A failed
+ * temporary anchor advances selection through the finite registry. */
+static RcCycle *rc_cycle_proof_anchor, *rc_cycle_proof_retry;
+static unsigned rc_cycle_proof_valid, rc_cycle_proof_build, rc_cycle_proof_generation;
+static unsigned rc_cycle_proof_preserve, rc_cycle_proof_after_retry, rc_cycle_rescan;
+
 /* Completed finite cohorts let reactors distinguish old snapshot work
  * from requests created by their own transient borrowed owners. */
 static size_t rc_cycle_completed;
@@ -53,7 +62,7 @@ void minyar_rc_enable_cycles(void) {
 #endif
 }
 #ifdef MINYAR_RC_TESTING
-static size_t rc_cycle_units, rc_cycle_epochs;
+static size_t rc_cycle_units, rc_cycle_epochs, rc_cycle_cached_requests;
 #endif
 static MINYAR_NOINLINE void rc_cycle_unit(void);
 #ifndef MINYAR_BOUNDED_RC
@@ -82,6 +91,9 @@ static inline RcCycle *rc_cycle_value(void *value) {
     return rc_cycle_metadata((RcObject *)value - 1);
 }
 static void rc_cycle_register(RcCycle *cycle) {
+    if ((uintptr_t)cycle & 7)
+        minyar_stop("cycle metadata is not eight-byte aligned.");
+    cycle->gray_next = 0;
     cycle->registered = 1;
     cycle->generation = rc_cycle_generation;
     cycle->next = rc_cycle_head;
@@ -89,9 +101,29 @@ static void rc_cycle_register(RcCycle *cycle) {
         rc_cycle_head->previous = cycle;
     rc_cycle_head = cycle;
 }
-static MINYAR_COLD void rc_cycle_request(void) {
+static inline void rc_cycle_proof_invalidate(void) {
     if (rc_cycle_inside)
         return;
+    rc_cycle_proof_valid = rc_cycle_proof_build = 0;
+    if (rc_cycle_pending)
+        rc_cycle_rescan = 1;
+}
+static inline int rc_cycle_anchor_held(void) {
+    /* Unregister clears the pointer before either allocator can recycle it. */
+    return rc_cycle_proof_anchor && (rc_cycle_object(rc_cycle_proof_anchor)->ownership >> 3) >
+                                        rc_cycle_proof_anchor->incoming;
+}
+static inline int rc_cycle_proven(RcCycle *cycle) {
+    if (!(cycle->gray_next & 1))
+        return 0;
+    unsigned generation = (unsigned)((cycle->gray_next >> 1) & 1);
+    return (rc_cycle_proof_valid && generation == rc_cycle_proof_generation) ||
+           (rc_cycle_proof_build && generation == rc_cycle_generation);
+}
+static MINYAR_COLD void rc_cycle_request_kind(unsigned rescan) {
+    if (rc_cycle_inside)
+        return;
+    rc_cycle_rescan |= rescan;
     rc_cycle_requested = 1;
     if (!rc_cycle_pending) {
         rc_cycle_pending = 1;
@@ -100,12 +132,15 @@ static MINYAR_COLD void rc_cycle_request(void) {
 #endif
     }
 }
+static MINYAR_COLD void rc_cycle_request(void) {
+    rc_cycle_request_kind(1);
+}
 static RcCycle *rc_cycle_gray_pop(void) {
     RcCycle *cycle = rc_cycle_gray_head;
-    rc_cycle_gray_head = cycle->gray_next;
+    rc_cycle_gray_head = (RcCycle *)(cycle->gray_next & ~(uintptr_t)3);
     if (!rc_cycle_gray_head)
         rc_cycle_gray_tail = NULL;
-    cycle->gray_next = NULL;
+    cycle->gray_next &= 3;
     return cycle;
 }
 static void rc_cycle_unlink(RcCycle *cycle) {
@@ -128,19 +163,42 @@ static void rc_cycle_unlink(RcCycle *cycle) {
 }
 static inline void rc_cycle_unregister(RcObject *object) {
     RcCycle *cycle = rc_cycle_metadata(object);
+    if (rc_cycle_proof_anchor == cycle) {
+        rc_cycle_proof_valid = rc_cycle_proof_build = 0;
+        rc_cycle_proof_anchor = NULL;
+        if (rc_cycle_pending)
+            rc_cycle_rescan = 1;
+    }
+    if (rc_cycle_proof_retry == cycle)
+        rc_cycle_proof_retry = NULL;
     if (cycle->registered)
         rc_cycle_unlink(cycle);
+    cycle->gray_next = 0;
 }
 static MINYAR_COLD void rc_cycle_shade_slow(RcCycle *cycle) {
     if (!cycle || !cycle->registered || cycle->generation == rc_cycle_generation || cycle->marked)
         return;
     cycle->marked = 1;
-    cycle->gray_next = NULL;
+    cycle->gray_next &= 3;
     if (rc_cycle_gray_tail)
-        rc_cycle_gray_tail->gray_next = cycle;
+        rc_cycle_gray_tail->gray_next = (uintptr_t)cycle | (rc_cycle_gray_tail->gray_next & 3);
     else
         rc_cycle_gray_head = cycle;
     rc_cycle_gray_tail = cycle;
+}
+/* Root-witness propagation is distinct from conservative snapshot shading.
+ * A node already scanned from a temporary is queued once more when first
+ * reached from the anchor. Each scan still visits only one field per unit. */
+static void rc_cycle_shade_proven(RcCycle *cycle) {
+    if (!cycle || !cycle->registered || cycle->generation == rc_cycle_generation)
+        return;
+    if (!(cycle->gray_next & 1) || ((cycle->gray_next >> 1) & 1) != rc_cycle_generation) {
+        cycle->gray_next =
+            (cycle->gray_next & ~(uintptr_t)3) | 1 | ((uintptr_t)rc_cycle_generation << 1);
+        if (cycle->marked == 2)
+            cycle->marked = 0;
+    }
+    rc_cycle_shade_slow(cycle);
 }
 static inline void rc_cycle_shade(RcCycle *cycle) {
     if (rc_cycle_shading)
@@ -173,8 +231,16 @@ static inline int rc_cycle_defer_zero(RcObject *object) {
 }
 static MINYAR_COLD void rc_cycle_check_external(RcObject *object) {
     RcCycle *cycle = rc_cycle_value(object + 1);
-    if (cycle && cycle->registered && (object->ownership >> 3) == cycle->incoming)
-        rc_cycle_request();
+    if (!cycle || !cycle->registered || (object->ownership >> 3) != cycle->incoming)
+        return;
+    if (cycle == rc_cycle_proof_anchor) {
+        rc_cycle_proof_retry = cycle;
+        rc_cycle_proof_invalidate();
+    }
+    /* Do not discard the last temporary's request. Its queued unit validates
+     * an unchanged owning path to an independently held root, or rescans. */
+    unsigned proven = rc_cycle_proven(cycle) && rc_cycle_anchor_held();
+    rc_cycle_request_kind(!proven);
 }
 /* While tracing is dormant no cycle can exist, so no request is needed. */
 static inline void rc_cycle_after_drop(RcObject *object) {
@@ -185,6 +251,7 @@ static MINYAR_NOINLINE void rc_cycle_add_incoming(RcObject *parent, RcCycle *cyc
     RcCycle *source = rc_cycle_metadata(parent);
     if (!source->registered)
         rc_cycle_register(source);
+    rc_cycle_proof_invalidate();
     rc_cycle_shade(cycle);
     cycle->incoming++;
     if (rc_cycle_enabled && cycle->registered &&
@@ -201,6 +268,7 @@ static inline void rc_cycle_edge_remove(void *value) {
     RcCycle *cycle = rc_cycle_value(value);
     if (!cycle)
         return;
+    rc_cycle_proof_invalidate();
     rc_cycle_shade(cycle);
     cycle->incoming--;
 }
