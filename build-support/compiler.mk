@@ -145,5 +145,5 @@ export COMPILER_RUNTIME_FLAGS COMPILER_LTO_FLAGS PROGRAM_RUNTIME_FLAGS BOUNDED_F
 .PHONY: FORCE
 FORCE:
 
-build/.toolchain.json: FORCE scripts/toolchain-stamp.py | build
+build/.toolchain.json: FORCE scripts/toolchain-stamp.py tools/host_paths.py | build
 	@python3 scripts/toolchain-stamp.py $@

@@ -13,6 +13,9 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
+from host_paths import host_path
+
 FLAGS = (
     "CPPFLAGS", "CFLAGS", "LLVM_FLAGS", "LDLIBS", "SANITIZER_FLAGS", "COMPILER_RUNTIME_FLAGS",
     "COMPILER_LTO_FLAGS", "PROGRAM_RUNTIME_FLAGS", "BOUNDED_FLAGS",
@@ -24,7 +27,7 @@ def identity(name, default):
     resolved = shutil.which(command)
     if resolved is None:
         raise ValueError(f"{name}: compiler executable not found: {command}")
-    path = Path(resolved).resolve()
+    path = host_path(resolved).resolve()
     stat = path.stat()
     return {
         "command": command, "path": str(path), "device": stat.st_dev,

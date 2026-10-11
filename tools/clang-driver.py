@@ -17,6 +17,9 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from host_paths import host_path
+
 
 def flags(name, default):
     try:
@@ -57,7 +60,7 @@ def clang_identity(clang):
     executable = shutil.which(clang)
     if not executable:
         raise ValueError(f'cannot find Clang: {clang}')
-    executable_path = Path(executable).resolve()
+    executable_path = host_path(executable).resolve()
     # Compiler binaries can be hundreds of megabytes. File identity detects
     # replacement (including preserved mtime) without rereading one per link.
     stat = executable_path.stat()
@@ -137,7 +140,7 @@ def graphics(project, clang, base, native_flags):
 
 
 def bootstrap(project, targets):
-    project = Path(project)
+    project = host_path(project)
     (project / 'build').mkdir(parents=True, exist_ok=True)
     environment = dict(os.environ)
     if 'MINYAR_CLANG' in environment:
@@ -193,7 +196,7 @@ def lto_flags(clang, link_flags):
         system = platform.system()
         windows = system == 'Windows' or system.startswith(('MSYS', 'MINGW', 'CYGWIN'))
         names = ('ld.lld.exe', 'ld.lld') if windows else ('ld.lld',)
-        directory = Path(shutil.which(clang) or clang).resolve().parent
+        directory = host_path(shutil.which(clang) or clang).resolve().parent
         sibling = next((directory / name for name in names if (directory / name).is_file()), None)
         if sibling is not None:
             # MinGW checks the flavor literally before accepting bitcode.
@@ -206,7 +209,7 @@ def lto_flags(clang, link_flags):
 
 
 def version(project):
-    project = Path(project)
+    project = host_path(project)
     sources = sorted((project / 'compiler').glob('*.min'))
     if sources:
         identity = hashlib.sha256()
@@ -249,7 +252,8 @@ def doctor(clang):
 
 
 def publish_executable(command, output, source=None):
-    destination = Path(output)
+    destination = host_path(output)
+    source = host_path(source) if source else None
     # Stage on the destination filesystem so publishing is one atomic rename.
     # A failed or interrupted linker never truncates the last successful build.
     previous_handlers = {}
@@ -307,13 +311,13 @@ def main():
     project, llvm, runtime, output, release = sys.argv[2:7]
     debug = len(sys.argv) >= 8 and sys.argv[7] == '1'
     source = sys.argv[8] if len(sys.argv) == 9 else None
-    project = Path(project)
+    project = host_path(project)
     link_flags = flags('MINYAR_CLANG_FLAGS', '-O2 -Wno-override-module' if release == '1'
                        else ('-O0 -g -Wno-override-module' if debug else '-O2 -Wno-override-module'))
     native = []
     libraries = set()
     cycles = False
-    with Path(llvm).open() as stream:
+    with host_path(llvm).open() as stream:
         for line in stream:
             if line.startswith('; minyar-native-library: '):
                 library = line.removeprefix('; minyar-native-library: ').strip()
