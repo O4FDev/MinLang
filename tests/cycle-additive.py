@@ -59,6 +59,8 @@ def run(command, environment, output, label, resource):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--sanitize", action="store_true")
+    p.add_argument("--fixture", choices=["cycle-additive.c", "cycle-registry-growth.c"], default="cycle-additive.c")
+    p.add_argument("--case", choices=["all", "registered", "callbacks", "streaming", "safety"], default="all")
     p.add_argument("--profiles", nargs="+", choices=["system", "fixed", "lazy", "eager"],
                    default=None)
     p.add_argument("--budgets", type=int, nargs="+", choices=[1, 32, 1024], default=[1, 32, 1024])
@@ -73,7 +75,7 @@ def main():
     (ROOT / "build").mkdir(exist_ok=True)
     (ROOT / "build/managed-graphs-engine.c").write_text(engine_source(ROOT))
     headers = sorted((ROOT / "runtime").glob("*.h"))
-    inputs = [ROOT/"tests/cycle-additive.c", Path(__file__).resolve(),
+    inputs = [ROOT/"tests/cycle-additive.c", ROOT/"tests"/args.fixture, Path(__file__).resolve(),
               ROOT/"tools/cycle_runtime.py", ROOT/"tests/clang_helpers.py",
               ROOT/"tests/test_evidence.py", ROOT/"runtime/minyar_runtime.c", *headers]
     report = {"passed": False, "sanitize": args.sanitize, "cases": [], "resources": [],
@@ -99,8 +101,8 @@ def main():
                            "-DMINYAR_RC_POLL_BUDGET="+str(budget)]
                 if historical:
                     command.append("-Drc_cycle_edge_insert=rc_cycle_edge_add")
-                command += [str(ROOT/"tests/cycle-additive.c"),"-lm","-o",str(binary)]
-                phases = [("compile",command)] + [(f"run-n{n}",[str(binary),str(n)]) for n in args.nodes]
+                command += [str(ROOT/"tests"/args.fixture),"-lm","-o",str(binary)]
+                phases = [("compile",command)] + [(f"run-n{n}",[str(binary),str(n),args.case]) for n in args.nodes]
                 for phase, argv in phases:
                     case = run(argv, environment, out, label+"-"+phase, report["resources"])
                     if binary.is_file():
