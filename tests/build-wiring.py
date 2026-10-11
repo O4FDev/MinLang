@@ -14,6 +14,110 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class BuildWiring(unittest.TestCase):
 
+    def test_cycle_progress_observability_is_mandatory_without_idle_replay(self):
+        import importlib.util
+        import json
+        import re
+
+        target = 'check-cycle-progress-observability'
+        aggregates = {'check', 'check-portable', 'check-sanitize',
+                      'check-managed-graphs-profiles', 'check-cycle-progress',
+                      'check-cycle-progress-sanitize'}
+        inputs = {'tests/cycle-progress-observability.py', 'tests/cycle-progress.c',
+                  'tests/fixtures/cycle-progress-before-observability.c.txt',
+                  'tests/clang_helpers.py'}
+        source = (ROOT/'build-support/managed-graphs.mk').read_text()
+        marker = '# Mocked idle observability preserves the historical metric.'
+        self.assertIn(marker, source)
+        fragment = source[source.index(marker):]
+
+        def verify(candidate):
+            with tempfile.TemporaryDirectory(prefix='idle observability Make rules ') as folder:
+                makefile = Path(folder)/'probe.mk'
+                fixtures = sorted(inputs | {'build'})
+                makefile.write_text(
+                    'LLVM_CC := retained-clang\nLIMITED := retained-limited\n'
+                    + candidate + '\n.PHONY: ' + ' '.join(fixtures)
+                    + '\n' + ' '.join(fixtures) + ':\n\t@echo INPUT $@\n')
+                env = dict(os.environ)
+                env.pop('MAKEFLAGS', None)
+                result = subprocess.run(['make', '-rRnp', '-f', str(makefile), target],
+                                        cwd=ROOT, env=env, capture_output=True,
+                                        text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                rules = {}
+                for line in result.stdout.splitlines():
+                    match = re.match(r'^([\w./-]+):\s*(.*)$', line)
+                    if match:
+                        rules.setdefault(match[1], set()).update(match[2].split())
+                for aggregate in aggregates:
+                    self.assertIn(target, rules.get(aggregate, set()), aggregate)
+                self.assertTrue(inputs <= rules.get(target, set()))
+                commands = result.stdout.split('# GNU Make', 1)[0]
+                self.assertEqual(commands.count('python3 tests/cycle-progress-observability.py'), 1)
+                self.assertIn('MINYAR_TEST_CLANG="retained-clang"', commands)
+                self.assertIn('retained-limited python3', commands)
+                self.assertIn('--evidence "$evidence/run"', commands)
+                self.assertIn((ROOT/'build/cycle-progress-observability.').as_posix(),
+                              commands.replace('\\', '/'))
+                for forbidden in ('--sanitize', '--case ', '--nodes ', '--seconds ',
+                                  '--expect-old-code', 'tests/cycle-progress.py'):
+                    self.assertNotIn(forbidden, commands)
+
+        verify(fragment)
+        aggregate_line = next(line for line in fragment.splitlines()
+                              if line.split(':', 1)[0].split() == sorted(aggregates))
+        for aggregate in sorted(aggregates):
+            names, dependency = aggregate_line.split(': ', 1)
+            mutant = fragment.replace(aggregate_line, ' '.join(
+                name for name in names.split() if name != aggregate) + ': ' + dependency, 1)
+            with self.subTest(missing_aggregate=aggregate), self.assertRaises(AssertionError):
+                verify(mutant)
+        dependency_line = next(line for line in fragment.splitlines()
+                               if line.startswith(target + ':'))
+        for dependency in sorted(inputs):
+            mutant = fragment.replace(dependency_line,
+                                      dependency_line.replace(' ' + dependency, '', 1), 1)
+            with self.subTest(missing_input=dependency), self.assertRaises(AssertionError):
+                verify(mutant)
+        for name, old, new in (
+                ('relative evidence', '$(abspath build)/cycle-progress-observability.',
+                 'build/cycle-progress-observability.'),
+                ('filtered controls', '--evidence', '--case zero --evidence'),
+                ('runtime replay', 'python3 tests/cycle-progress-observability.py',
+                 'python3 tests/cycle-progress.py')):
+            mutant = fragment.replace(old, new, 1)
+            self.assertNotEqual(fragment, mutant)
+            with self.subTest(invalid_recipe=name), self.assertRaises(AssertionError):
+                verify(mutant)
+
+        tree = ast.parse((ROOT/'scripts/check-linux.py').read_text())
+        targets = next(ast.literal_eval(node.value) for node in tree.body
+                       if isinstance(node, ast.Assign)
+                       and any(isinstance(name, ast.Name) and name.id == 'TARGETS'
+                               for name in node.targets))
+        self.assertEqual(targets.count(target), 1)
+        spec = importlib.util.spec_from_file_location(
+            'idle_observability_catalogue', ROOT/'tests/suite-catalogue.py')
+        catalogue = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(catalogue)
+        data = json.loads((ROOT/'tests/suite-catalogue.json').read_text())
+        catalogue.validate(data, ROOT)
+        for name in sorted(inputs - {'tests/clang_helpers.py'}):
+            self.assertIn(name, catalogue.discover(ROOT))
+            with self.subTest(omitted_source=name), self.assertRaises(ValueError):
+                catalogue.validate(dict(data, sources=[row for row in data['sources']
+                                                       if row['path'] != name]), ROOT)
+        row = next(row for row in data['sources']
+                   if row['path'] == 'tests/cycle-progress-observability.py')
+        self.assertEqual(row['role'], 'suite')
+        self.assertIn('build-support/managed-graphs.mk', row['consumers'])
+        historical = next(row for row in data['sources']
+                          if row['path'] == 'tests/fixtures/cycle-progress-before-observability.c.txt')
+        self.assertEqual(historical['role'], 'fixture')
+        self.assertEqual(historical['consumers'], ['tests/cycle-progress-observability.py'])
+
+
     def test_quic_ledger_requires_full_offline_controls(self):
         import importlib.util
         import json
