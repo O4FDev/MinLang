@@ -22,7 +22,7 @@ PARALLEL_SIGNATURE_FIXTURES = tests/parallel-signatures/managed-after-scalars.mi
     tests/parallel-signatures/unused-record.min \
     tests/parallel-signatures/unused-text-entry.min \
     tests/parallel-signatures/unused-text.min
-PARALLEL_SIGNATURE_INPUTS = tests/parallel-signatures.py tests/regressions.py tests/test_evidence.py tests/clang_helpers.py tests/llvm_sanitizer.py $(PARALLEL_SIGNATURE_FIXTURES) $(wildcard tests/parallel/*.min tests/parallel/errors/*.min)
+PARALLEL_SIGNATURE_INPUTS = tests/parallel-signatures.py tests/regressions.py tests/test_evidence.py tests/clang_helpers.py tests/llvm_sanitizer.py tools/sanitizer_llvm.py $(PARALLEL_SIGNATURE_FIXTURES) $(wildcard tests/parallel/*.min tests/parallel/errors/*.min)
 
 check-parallel-signatures: $(addprefix build/,$(PARALLEL_SIGNATURE_FRONTENDS)) build/minyar-runtime.o build/compiler-stage3.ll build/closure-compiler-stage3.ll build/errors-compiler-stage3.ll $(PARALLEL_SIGNATURE_INPUTS) | build
 	cmp build/compiler-stage2.ll build/compiler-stage3.ll

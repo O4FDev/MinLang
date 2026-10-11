@@ -742,3 +742,10 @@ check-tls-signing-usage-sanitize: build/minyarc
 
 check-tls: check-tls-signing-usage
 check-tls-sanitize: check-tls-signing-usage-sanitize
+
+# Real unsafe generated-program accesses must fail after the public link driver.
+.PHONY: check-generated-llvm-sanitizer
+GENERATED_SANITIZER_INPUTS = tests/generated-llvm-sanitizer.py tests/generated-llvm-sanitizer.min tests/llvm_sanitizer.py tests/clang_helpers.py tests/test_evidence.py tools/clang-driver.py tools/sanitizer_llvm.py tools/host_paths.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
+check-generated-llvm-sanitizer: build/minyarc $(GENERATED_SANITIZER_INPUTS) | build
+	@set -e; artifacts=$$(mktemp -d "$(abspath build)/generated-llvm-sanitizer-XXXXXXXX"); MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/generated-llvm-sanitizer.py --artifacts "$$artifacts/run"
+check check-portable check-sanitize: check-generated-llvm-sanitizer

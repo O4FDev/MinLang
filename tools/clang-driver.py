@@ -19,6 +19,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from host_paths import host_path
+from sanitizer_llvm import address_sanitizer_enabled, instrument_address_sanitizer
 
 
 def flags(name, default):
@@ -282,6 +283,86 @@ def publish_executable(command, output, source=None):
             signal.signal(number, handler)
 
 
+
+def link_program(clang, link_flags, lto, llvm, runtime, native, libraries, output, source):
+    """Sanitize only generated program IR; optionally retain exact link inputs.
+
+    MINYAR_LINK_ARTIFACTS names a fresh directory. A reused path is rejected
+    rather than overwriting another invocation's evidence. No program-IR cache
+    is reused: each sanitizer invocation validates the current helper and bytes.
+    """
+    enabled = address_sanitizer_enabled(link_flags)
+    requested = os.environ.get('MINYAR_LINK_ARTIFACTS')
+    if not enabled and not requested:
+        publish_executable([clang, *link_flags, *lto, llvm, runtime, *native, *libraries],
+                           output, source)
+        return
+    artifacts = host_path(requested).resolve() if requested else None
+    if artifacts:
+        artifacts.mkdir(parents=True, exist_ok=False)
+    with tempfile.TemporaryDirectory(prefix='minyar-program-sanitize-') as temporary:
+        directory = artifacts or Path(temporary)
+        raw = host_path(llvm).read_bytes()
+        program = llvm
+        if artifacts:
+            (directory / 'program.raw.ll').write_bytes(raw)
+        if enabled:
+            program = str(directory / 'program.asan.ll')
+            try:
+                Path(program).write_bytes(instrument_address_sanitizer(raw.decode('utf-8')).encode('utf-8'))
+            except (UnicodeError, ValueError) as error:
+                if artifacts:
+                    for name in ('clang-driver.py', 'sanitizer_llvm.py'):
+                        shutil.copyfile(Path(__file__).resolve().parent / name, directory / name)
+                    (directory / 'manifest.json').write_text(json.dumps({
+                        'schema': 1, 'phase': 'program-annotation', 'error': repr(error),
+                        'raw_sha256': hashlib.sha256(raw).hexdigest(),
+                        'address_sanitizer_enabled': True, 'runtime_reannotated': False,
+                        'link_attempted': False}, indent=2) + '\n')
+                raise
+        command = [clang, *link_flags, *lto, program, runtime, *native, *libraries]
+        manifest = {'schema': 1, 'address_sanitizer_enabled': enabled,
+                    'program_ir_cached': False, 'command': command,
+                    'raw_program': str(host_path(llvm).resolve()),
+                    'raw_sha256': hashlib.sha256(raw).hexdigest(),
+                    'linked_program_sha256': hashlib.sha256(host_path(program).read_bytes()).hexdigest(),
+                    'runtime_reannotated': False, 'inputs': [], 'tools': {}}
+        if artifacts:
+            for label, path in [('runtime', runtime), *[(f'native-{i}', value)
+                                                      for i, value in enumerate(native)]]:
+                path = host_path(path)
+                if not path.is_file():
+                    continue
+                name = label + path.suffix
+                shutil.copyfile(path, directory / name)
+                manifest['inputs'].append({'original': str(path.resolve()),
+                                          'retained': name,
+                                          'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+            for name in ('clang-driver.py', 'sanitizer_llvm.py'):
+                path = Path(__file__).resolve().parent / name
+                shutil.copyfile(path, directory / name)
+                manifest['tools'][name] = hashlib.sha256(path.read_bytes()).hexdigest()
+            compiler = host_path(shutil.which(clang) or clang).resolve()
+            shutil.copyfile(compiler, directory / 'clang.bin')
+            manifest['tools']['clang.bin'] = hashlib.sha256(compiler.read_bytes()).hexdigest()
+            manifest['compiler'] = str(compiler)
+            manifest['compiler_version'] = subprocess.check_output([clang, '--version'], text=True)
+        try:
+            publish_executable(command, output, source)
+            manifest['link_status'] = 0
+            executable = host_path(output)
+            if not executable.exists() and host_path(output + '.exe').exists():
+                executable = host_path(output + '.exe')
+            if artifacts:
+                shutil.copyfile(executable, directory / ('program' + executable.suffix))
+                manifest['binary_sha256'] = hashlib.sha256(executable.read_bytes()).hexdigest()
+        except BaseException as error:
+            manifest['link_error'] = repr(error)
+            raise
+        finally:
+            if artifacts:
+                (directory / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+
 def main():
     if sys.version_info < (3, 9):
         raise ValueError('Python 3.9 or newer is required for the portable launcher')
@@ -431,7 +512,7 @@ def main():
             raise ValueError(f'the program uses an unknown native library: {library}')
     lto = lto_flags(clang, link_flags) if release == '1' else []
     math_libraries = [] if platform.system() == 'Darwin' else ['-lm']
-    publish_executable([clang, *link_flags, *lto, llvm, runtime, *native, *math_libraries], output, source)
+    link_program(clang, link_flags, lto, llvm, runtime, native, math_libraries, output, source)
 
 
 if __name__ == '__main__':

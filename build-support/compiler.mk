@@ -7,7 +7,7 @@ build/compiler-stage1.ll: compiler/compiler.min build/stage0
 build/compiler-stage1: build/compiler-stage1.ll build/minyar-compiler-runtime.ll
 	$(LIMITED) "$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
-build/compiler-stage2-sanitize.ll: build/compiler-stage2.ll tests/llvm_sanitizer.py
+build/compiler-stage2-sanitize.ll: build/compiler-stage2.ll tests/llvm_sanitizer.py tools/sanitizer_llvm.py
 	$(SANITIZER_LIMITED) python3 tests/llvm_sanitizer.py $< $@
 
 build/minyarc-sanitize: build/compiler-stage2-sanitize.ll build/minyar-compiler-runtime-sanitize.o
@@ -51,7 +51,7 @@ build/module-compiler-stage3.ll: build/module-compiler.min build/minyarc-modules
 build/minyar-module-build: tools/module-build.c build/.toolchain.json | build
 	$(LIMITED) "$(CC)" $(CFLAGS) $< -o $@
 
-build/module-compiler-sanitize.ll: build/module-compiler-stage2.ll tests/llvm_sanitizer.py
+build/module-compiler-sanitize.ll: build/module-compiler-stage2.ll tests/llvm_sanitizer.py tools/sanitizer_llvm.py
 	$(SANITIZER_LIMITED) python3 tests/llvm_sanitizer.py $< $@
 
 build/minyarc-modules-sanitize: build/module-compiler-sanitize.ll build/minyar-compiler-runtime-sanitize.o
@@ -80,7 +80,7 @@ build/minyarc-callbacks: build/closure-compiler-stage2.ll build/minyar-compiler-
 build/closure-compiler-stage3.ll: build/closure-compiler.min build/minyarc-callbacks
 	$(LIMITED) ./build/minyarc-callbacks $< $@
 
-build/closure-compiler-sanitize.ll: build/closure-compiler-stage2.ll tests/llvm_sanitizer.py
+build/closure-compiler-sanitize.ll: build/closure-compiler-stage2.ll tests/llvm_sanitizer.py tools/sanitizer_llvm.py
 	$(SANITIZER_LIMITED) python3 tests/llvm_sanitizer.py $< $@
 
 build/minyarc-callbacks-sanitize: build/closure-compiler-sanitize.ll build/minyar-compiler-runtime-sanitize.o
@@ -105,7 +105,7 @@ build/minyarc-errors: build/errors-compiler-stage2.ll build/minyar-compiler-runt
 build/errors-compiler-stage3.ll: build/errors-compiler.min build/minyarc-errors
 	$(LIMITED) ./build/minyarc-errors $< $@
 
-build/errors-compiler-sanitize.ll: build/errors-compiler-stage2.ll tests/llvm_sanitizer.py
+build/errors-compiler-sanitize.ll: build/errors-compiler-stage2.ll tests/llvm_sanitizer.py tools/sanitizer_llvm.py
 	$(SANITIZER_LIMITED) python3 tests/llvm_sanitizer.py $< $@
 
 build/minyarc-errors-sanitize: build/errors-compiler-sanitize.ll build/minyar-compiler-runtime-sanitize.o
@@ -121,7 +121,7 @@ build/errors-request.ll: build/errors-request.min build/minyarc
 build/minyarc-errors-request: build/errors-request.ll build/minyar-compiler-runtime.ll
 	$(LIMITED) "$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
-build/errors-request-sanitize.ll: build/errors-request.ll tests/llvm_sanitizer.py
+build/errors-request-sanitize.ll: build/errors-request.ll tests/llvm_sanitizer.py tools/sanitizer_llvm.py
 	$(SANITIZER_LIMITED) python3 tests/llvm_sanitizer.py $< $@
 
 build/minyarc-errors-request-sanitize: build/errors-request-sanitize.ll build/minyar-compiler-runtime-sanitize.o
