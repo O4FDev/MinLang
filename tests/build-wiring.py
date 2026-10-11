@@ -15,6 +15,75 @@ ROOT = Path(__file__).resolve().parents[1]
 class BuildWiring(unittest.TestCase):
 
 
+
+    def test_signed_relay_has_pinned_peer_and_all_lifetime_gates(self):
+        import importlib.util
+        import json
+        import re
+        text = (ROOT / 'build-support/peer-grpc.mk').read_text()
+        source = text[text.index('# Signed relay and independently malformed/abrupt'):]
+        native = {'check-peer-edge-relay', 'check-peer-edge-relay-lifetime'}
+        sanitize = {name + '-sanitize' for name in native}
+
+        def verify(fragment):
+            with tempfile.TemporaryDirectory(prefix='minyar relay wiring ') as folder:
+                makefile = Path(folder) / 'probe.mk'
+                makefile.write_text('PEER_GRPC_PYTHON=/selected-pinned/python\n' + fragment +
+                                   '\n.PHONY: build/minyarc build check-peer-grpc-python\n'
+                                   'build/minyarc build check-peer-grpc-python:\n\t@echo ARTIFACT $@\n')
+                env = dict(os.environ)
+                env.pop('MAKEFLAGS', None)
+                result = subprocess.run(['make', '-np', '-f', str(makefile), *sorted(native | sanitize)],
+                                        cwd=ROOT, env=env, text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                rules = {}
+                for line in result.stdout.splitlines():
+                    match = re.match(r'^([\w./-]+):\s+(.*)$', line)
+                    if match:
+                        rules.setdefault(match[1], set()).update(match[2].split())
+                self.assertTrue(native <= rules.get('check', set()))
+                self.assertTrue(sanitize <= rules.get('check-sanitize', set()))
+                for target in native | sanitize:
+                    self.assertIn('check-peer-grpc-python', rules.get(target, set()))
+                    self.assertIn('tests/peer-edge-relay.py', rules.get(target, set()))
+                    if 'lifetime' in target:
+                        self.assertIn('tests/peer-edge-relay-lifetime.py', rules[target])
+                commands = result.stdout.split('# GNU Make', 1)[0]
+                self.assertEqual(commands.count('"/selected-pinned/python"'), 6)
+                self.assertEqual(commands.count('mktemp -d "'), 6)
+                self.assertEqual(commands.count('--sanitize'), 3)
+                for mode in ('malformed', 'abrupt'):
+                    self.assertEqual(commands.count('--mode ' + mode), 2)
+                self.assertNotIn('--rounds', commands)  # Original functional default1024 preserved.
+                self.assertIn((ROOT / 'build' / 'peer-edge-relay-').as_posix(),
+                              commands.replace('\\', '/'))
+
+        verify(source)
+        for gate, targets in (('check', native), ('check-sanitize', sanitize)):
+            for missing in targets:
+                line = next(line for line in source.splitlines()
+                            if line.startswith(gate + ': '))
+                mutant = source.replace(line, gate + ': ' +
+                                        ' '.join(x for x in line.split(': ', 1)[1].split() if x != missing), 1)
+                with self.subTest(missing_gate=missing), self.assertRaises(AssertionError):
+                    verify(mutant)
+        tree = ast.parse((ROOT / 'scripts/check-linux.py').read_text())
+        targets = next(ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
+                       and any(isinstance(x, ast.Name) and x.id == 'TARGETS' for x in node.targets))
+        workflow = (ROOT / '.github/workflows/ci.yml').read_text()
+        for target in native | sanitize:
+            self.assertEqual(targets.count(target), 1)
+            self.assertIn(target, workflow)
+        spec = importlib.util.spec_from_file_location('relay_catalogue', ROOT / 'tests/suite-catalogue.py')
+        catalogue = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(catalogue)
+        data = json.loads((ROOT / 'tests/suite-catalogue.json').read_text())
+        catalogue.validate(data, ROOT)
+        for name in ('tests/peer-edge-relay.py', 'tests/peer-edge-relay-lifetime.py', 'tests/peer-edge-soak.py'):
+            with self.subTest(missing_source=name), self.assertRaises(ValueError):
+                catalogue.validate(dict(data, sources=[x for x in data['sources'] if x['path'] != name]), ROOT)
+
+
     def test_handshake_pto_has_native_and_sanitizer_gates(self):
         import importlib.util
         import json
