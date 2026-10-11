@@ -352,6 +352,7 @@ def startup_control(root,case="startup-permissions-before-start"):
             super().__init__(path);self.commands=type("Rows",(),{"rows":[]})()
         def command(self,*args,**kwargs):
             operation=next((part for part in args if part in ("up","create","start")),None)
+            if operation=="up" and "--no-start" in args:operation="create"
             events.append(operation)
             if operation=="create":
                 selected={r for r in args if r in adapter.ROLES};created=json.loads(json.dumps(template));created["containers"]={k:v for k,v in created["containers"].items() if v["Config"]["Labels"]["com.docker.compose.service"] in selected}
@@ -895,10 +896,6 @@ def birthday_failure_control(root,escaped=False):
         escaped_source.write_text("import json,os,sys,time\nfrom pathlib import Path\nos.setsid()\nPath(sys.argv[1]).write_text(json.dumps({'pid':os.getpid(),'parent_pid':os.getppid()}))\ntime.sleep(10)\n")
         root_source.write_text("import subprocess,time\nsubprocess.Popen("+repr([sys.executable,str(escaped_source),str(parent)])+")\ntime.sleep(10)\n")
     def birthday(child):
-        if escaped:
-            deadline=time.monotonic()+2
-            while not parent.exists() and time.monotonic()<deadline:time.sleep(.01)
-            if not parent.exists():raise RuntimeError("escaped fixture did not start")
         raise original
     adapter.subprocess.Popen=create;adapter.child_birthday=birthday;caught=None
     try:
@@ -906,8 +903,7 @@ def birthday_failure_control(root,escaped=False):
         except BaseException as error:caught=error
         checks={"primary_identity":caught is original,"owned_child_gone":not any(adapter.process_identity(child.pid) for child in created),"raw_ledger":(records.root/"commands.json").exists(),"no_numeric_signal":all(r.get("authority")=="held-pidfd" for r in records.rows[0]["lifetime"]["receipts"])}
         if escaped:
-            actual=json.loads(parent.read_bytes());receipts=records.rows[0]["lifetime"]["receipts"]
-            checks.update({"escaped_descendant_gone":adapter.process_identity(actual["pid"]) is None,"escaped_birthday_bound":any(r["identity"]["pid"]==actual["pid"] and type(r["identity"]["start_ticks"]) is int and r["identity"]["session"]==actual["pid"] for r in receipts),"actual_root_parent":actual["parent_pid"]==created[0].pid})
+            checks.update({"would_escape_target_never_executed":not parent.exists(),"bootstrap_closed_before_restore":records.rows[0]["bootstrap_gate"]["owned_bootstrap_reaped"] is True,"no_target_permit":records.rows[0]["bootstrap_gate"]["permit_sent"] is False})
     finally:
         adapter.child_birthday=real;adapter.subprocess.Popen=popen
         for child in created:
@@ -993,6 +989,168 @@ def bootstrap_control(case,root):
     if case in ("created-wrong-configured-id","stopped-wrong-configured-id"):return wrong_configured_control(case,root)
     return admitted_control(case,root)
 
+NEXT_CASES=("held-empty-nonready","held-empty-later-ready","held-empty-already-ready","compose-server-renewal","compose-client-renewal","compose-workload-attachment","retained-file-sentinel","retained-file-timeout","retained-file-nonzero","pidfd-post-popen-emfile","pidfd-post-popen-attribute","pidfd-post-popen-gate-close","sigchld-preflight-ignored")
+CASES+=NEXT_CASES
+
+def held_empty_control(case,root):
+    identity={"pid":424255,"start_ticks":901};member={"pid":424256,"start_ticks":902,"pgid":424255,"session":424255}
+    events=[];state=[case=="held-empty-already-ready"];real=adapter.cli_members;numeric=adapter.os.kill
+    class Held:
+        def __init__(self):self.identity=dict(member);self.closed=False
+        def ready(self):return state[0]
+        def send(self,sig):
+            events.append({"identity":dict(self.identity),"signal":sig})
+            if case=="held-empty-later-ready":state[0]=True
+            return True
+        def close(self):self.closed=True
+    handle=Held();known={member["pid"]:dict(member)};handles={member["pid"]:handle};receipts=[]
+    adapter.cli_members=lambda *a,**k:[];adapter.os.kill=lambda *a,**k:(_ for _ in ()).throw(RuntimeError("numeric signal forbidden"))
+    try:
+        result=adapter.drain_cli(identity,known,receipts,time.monotonic()+.05,handles=handles)
+        latched=adapter.cli_key(identity) in adapter._extinct_cli
+    finally:
+        adapter.cli_members=real;adapter.os.kill=numeric;adapter._extinct_cli.discard(adapter.cli_key(identity))
+    checks={"empty_rows_do_not_override_held_life":result==(case!="held-empty-nonready"),"extinction_only_when_ready":latched==(case!="held-empty-nonready"),"held_signal_when_nonready":bool(events)==(case!="held-empty-already-ready"),"no_early_handle_release":not handle.closed}
+    adapter.atomic_json(root/"held-transitions.json",{"scope":"mock thread-group-exit transition only; no real foreign PID/reuse","known":known,"events":events,"receipts":receipts,"ready":state[0],"result":result,"latched":latched})
+    return {"status":"passed","checks":checks},"passed"
+
+def exact_compose_control(case,root):
+    owner,base=receipt_daemon(root,0);commands=[];original=base.command
+    def command(*args,**kwargs):
+        commands.append(list(args));prepare="create" in args or "--no-start" in args
+        modeled=list(args)
+        if "--no-start" in modeled:modeled[modeled.index("up")]="create"
+        raw=original(*modeled,**kwargs)
+        if prepare:
+            state=base.read();roles={v for v in args if v in adapter.ROLES}
+            state["containers"]={k:v for k,v in state["containers"].items() if v["Config"]["Labels"]["com.docker.compose.service"] in roles}
+            for network in state["networks"].values():network["Containers"]={k:v for k,v in network["Containers"].items() if k in state["containers"]}
+            adapter.atomic_json(base.path,state)
+        return raw
+    base.command=command
+    argv=["compose","--env-file","empty.env","up"]+(
+        ["-V","server"] if case=="compose-server-renewal" else
+        ["--timeout","0","--abort-on-container-exit","-V","sim","client"] if case=="compose-client-renewal" else
+        ["--abort-on-container-exit","--timeout","10","sim","client","server"])
+    real=adapter.runner_daemon;old={k:os.environ.get(k) for k in ("SERVER","CLIENT")};out=sys.stdout;err=sys.stderr
+    import io
+    class Output:
+        def __init__(self):self.buffer=io.BytesIO()
+        def flush(self):pass
+    adapter.runner_daemon=lambda:(owner,base);os.environ["SERVER"]=IMAGE;os.environ["CLIENT"]=IMAGE;sys.stdout=Output();sys.stderr=Output()
+    try:status=adapter.docker_entry(argv)
+    finally:
+        adapter.runner_daemon=real;sys.stdout=out;sys.stderr=err
+        for k,v in old.items():
+            if v is None:os.environ.pop(k,None)
+            else:os.environ[k]=v
+    prefix=["compose","--project-name",owner.project,"--file",str(owner.paths["compose_path"]),"--env-file",str(owner.paths["runner_root"]/"empty.env")]
+    roles=["sim","server"] if case=="compose-server-renewal" else ["sim","client"] if case=="compose-client-renewal" else ["sim","server","client"]
+    flags=[] if case=="compose-server-renewal" else ["--timeout","0","--abort-on-container-exit"] if case=="compose-client-renewal" else ["--abort-on-container-exit","--timeout","10"]
+    expected_prepare=prefix+(["up","--no-start","--pull","never","--no-build","-V"] if "-V" in argv else ["create","--pull","never","--no-build","--no-recreate"])+roles
+    expected_attached=prefix+["up","--no-build","--no-recreate","--no-deps","--pull","never"]+flags+roles
+    adapter.atomic_json(root/"phase-argv.json",{"scope":"mock exact pinned runner phases; installed Compose version unqueried","upstream":argv,"commands":commands,"expected_prepare":expected_prepare,"expected_attached":expected_attached})
+    return {"status":"passed","checks":{"exact_setup_and_attached_argv":commands==[expected_prepare,expected_attached],"no_flag_conflict":all(not ("-V" in c and "--no-recreate" in c) for c in commands),"attached_abort_timeout_preserved":commands[-1]==expected_attached,"exact_up_status":status==0}},"passed"
+
+def retained_file_control(case,root):
+    records=adapter.RawCommands(root/"commands");original=RuntimeError("original retained file sentinel")
+    real_open=Path.open;real_selector=adapter.selectors.DefaultSelector;closed=[];injections=[]
+    class Retained:
+        def __init__(self,file,name):self.file=file;self.name=name;self.failed=False
+        def __getattr__(self,name):return getattr(self.file,name)
+        def __enter__(self):return self
+        def __exit__(self,*args):self.close()
+        def close(self):
+            closed.append(self.name)
+            self.file.close()
+            if not self.failed:self.failed=True;injections.append(self.name);raise OSError("secondary retained "+self.name+" FILE close")
+    def opened(path,*args,**kwargs):
+        file=real_open(path,*args,**kwargs)
+        if Path(path).parent==records.root and Path(path).name in ("000.stdout","000.stderr") and (args[0] if args else kwargs.get("mode"))=="wb":return Retained(file,Path(path).name)
+        return file
+    timeout_original=subprocess.TimeoutExpired([sys.executable,"-c","owned"],.1)
+    class Selected:
+        def __init__(self):self.real=real_selector()
+        def register(self,*args,**kwargs):return self.real.register(*args,**kwargs)
+        def get_map(self):return self.real.get_map()
+        def select(self,*args,**kwargs):raise timeout_original if case=="retained-file-timeout" else original
+        def close(self):return self.real.close()
+    Path.open=opened
+    if case!="retained-file-nonzero":adapter.selectors.DefaultSelector=Selected
+    caught=None
+    try:
+        try:records.run([sys.executable,"-c","import sys;print('status37');sys.exit(37)"] if case=="retained-file-nonzero" else [sys.executable,"-c","import time;time.sleep(10)"],3)
+        except BaseException as error:caught=error
+    finally:Path.open=real_open;adapter.selectors.DefaultSelector=real_selector
+    row=records.rows[0]
+    desired=isinstance(caught,adapter.CleanupError) and str(caught)=="owned command failed: 37" and row["status"]==37 if case=="retained-file-nonzero" else caught is (timeout_original if case=="retained-file-timeout" else original)
+    return {"status":"passed","checks":{"original_primary_identity_or_exact37":desired,"both_retained_FILES_closed":set(injections)=={"000.stdout","000.stderr"},"secondary_FILE_errors_retained":sum("retained" in e["message"] and "FILE close" in e["message"] for e in row["finalization_errors"])==2,"secondary_notes_on_primary":sum("FILE close" in n for n in getattr(caught,"__notes__",[]))==2,"owned_children_drained":not adapter.direct_children(),"final_raw_ledger":(records.root/"commands.json").exists()}},"passed"
+
+def post_pidfd_control(case,root):
+    import errno
+    records=adapter.RawCommands(root/"commands");target=root/"target-executed";created=[];restored=[];real_popen=adapter.subprocess.Popen;real_open=adapter.os.pidfd_open;real_begin=adapter.subreaper_begin
+    original=AttributeError("one-shot post-Popen pidfd missing") if case=="pidfd-post-popen-attribute" else OSError(errno.EMFILE,"one-shot post-Popen pidfd allocation")
+    failed=[False];prior=subreaper_value();pipe_pairs=[];close_fault=[False];real_pipe=adapter.os.pipe;real_close=adapter.os.close
+    def pipe():
+        pair=real_pipe();pipe_pairs.append(pair);return pair
+    def close(fd):
+        if case=="pidfd-post-popen-gate-close" and pipe_pairs and fd==pipe_pairs[0][1] and not close_fault[0]:
+            close_fault[0]=True;raise OSError("secondary bootstrap gate FILE descriptor close")
+        return real_close(fd)
+    def popen(*args,**kwargs):
+        child=real_popen(*args,**kwargs);created.append(child);return child
+    def opened(pid,*args,**kwargs):
+        if created and pid==created[-1].pid and not failed[0]:failed[0]=True;raise original
+        return real_open(pid,*args,**kwargs)
+    class Libc:
+        def __init__(self,real):self.real=real
+        def prctl(self,*args):
+            if args[0]==36:restored.append(all(child.returncode is not None for child in created))
+            return self.real.prctl(*args)
+    def begin():
+        libc,value=real_begin();return Libc(libc),value
+    adapter.subprocess.Popen=popen;adapter.os.pidfd_open=opened;adapter.subreaper_begin=begin;adapter.os.pipe=pipe;adapter.os.close=close;caught=None
+    try:
+        argv=[sys.executable,"-c","from pathlib import Path;import time;Path("+repr(str(target))+").write_text('must not execute');time.sleep(10)"]
+        try:records.run(argv,3)
+        except BaseException as error:caught=error
+        time.sleep(.1)
+        checks={"actual_post_Popen_fault":failed[0] and bool(created),"original_fd_error_identity":caught is original,"target_never_executed":not target.exists(),"exact_bootstrap_reaped":all(child.returncode is not None for child in created),"restore_after_owned_closure":bool(restored) and all(restored),"nonpass_raw_ledger":records.rows[0]["lifetime"]["certified"] is False and (records.root/"commands.json").exists(),"no_numeric_signal_fallback":all(r.get("authority")=="held-pidfd" for r in records.rows[0]["lifetime"]["receipts"])}
+        if case=="pidfd-post-popen-gate-close":
+            checks.update({"actual_secondary_gate_close":close_fault[0],"gate_close_preserves_primary":caught is original and any("gate FILE descriptor close" in n for n in getattr(original,"__notes__",[]))})
+    finally:
+        adapter.subprocess.Popen=real_popen;adapter.os.pidfd_open=real_open;adapter.subreaper_begin=real_begin;adapter.os.pipe=real_pipe;adapter.os.close=real_close
+        # Exact test-owned Popen cleanup after recording assertions. This is
+        # not a production numeric fallback nor a foreign/reuse probe.
+        for child in created:
+            if child.poll() is None:child.kill()
+            child.wait(timeout=2)
+        import ctypes
+        ctypes.CDLL(None).prctl(36,prior,0,0,0)
+    return {"status":"passed","checks":checks},"passed"
+
+def sigchld_control(root):
+    records=adapter.RawCommands(root/"commands");real=adapter.subprocess.Popen;created=[];old=signal.getsignal(signal.SIGCHLD);caught=None
+    def popen(*args,**kwargs):child=real(*args,**kwargs);created.append(child);return child
+    adapter.subprocess.Popen=popen;signal.signal(signal.SIGCHLD,signal.SIG_IGN)
+    try:
+        try:records.run([sys.executable,"-c","import time;time.sleep(3)"],.1)
+        except BaseException as error:caught=error
+        checks={"SIGCHLD_ignored_rejected_prelaunch":isinstance(caught,adapter.OwnershipError),"no_child_spawned":not created,"raw_rejection_ledger":(records.root/"commands.json").exists()}
+    finally:
+        signal.signal(signal.SIGCHLD,old);adapter.subprocess.Popen=real
+        for child in created:
+            if child.poll() is None:child.kill()
+            child.wait(timeout=2)
+    return {"status":"passed","checks":checks},"passed"
+
+def next_control(case,root):
+    if case.startswith("held-empty-"):return held_empty_control(case,root)
+    if case.startswith("compose-"):return exact_compose_control(case,root)
+    if case.startswith("retained-file-"):return retained_file_control(case,root)
+    if case=="sigchld-preflight-ignored":return sigchld_control(root)
+    return post_pidfd_control(case,root)
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument("--artifacts",type=Path,required=True)
@@ -1009,7 +1167,8 @@ def main():
     for case in cases:
         root=args.artifacts/case;root.mkdir()
         try:
-            if case in BOOT_CASES:result,expected=bootstrap_control(case,root)
+            if case in NEXT_CASES:result,expected=next_control(case,root)
+            elif case in BOOT_CASES:result,expected=bootstrap_control(case,root)
             elif case in REVIEW_CASES:result,expected=review_control(case,root)
             elif case=="copy-official-fixture-layout":result,expected=copy_layout_control(root)
             elif case in TAIL_CASES:result,expected=tail_control(case,root)
