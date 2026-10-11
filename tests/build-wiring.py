@@ -1756,7 +1756,13 @@ class BuildWiring(unittest.TestCase):
                 checker.verify_runner(external)
             self.assertEqual(set(external.rglob('*')), before)
         with tempfile.TemporaryDirectory(prefix='wrong wheel version route ') as folder:
-            with patch.object(checker.sys, 'pycache_prefix', folder), \
+            from types import SimpleNamespace
+            version_flags = SimpleNamespace(**{
+                name: getattr(sys.flags, name) for name in dir(sys.flags)
+                if isinstance(getattr(sys.flags, name), (int, bool))})
+            version_flags.safe_path = True
+            with patch.object(checker.sys, 'flags', version_flags), \
+                    patch.object(checker.sys, 'pycache_prefix', folder), \
                     patch.object(checker.sys, 'dont_write_bytecode', True), \
                     patch.object(checker.importlib.metadata, 'version', return_value='0'):
                 with self.assertRaisesRegex(ValueError, 'PyYAML version differs'):
@@ -1766,6 +1772,10 @@ class BuildWiring(unittest.TestCase):
                 with self.subTest(unverified_abi=version), self.assertRaises(ValueError):
                     checker.require_supported_python()
         from types import SimpleNamespace
+        trusted_flags = SimpleNamespace(**{
+            name: getattr(sys.flags, name) for name in dir(sys.flags)
+            if isinstance(getattr(sys.flags, name), (int, bool))})
+        trusted_flags.safe_path = True
         with patch.object(checker.sys, 'implementation', SimpleNamespace(name='pypy')):
             with self.assertRaises(ValueError):
                 checker.require_supported_python()
@@ -1786,7 +1796,8 @@ class BuildWiring(unittest.TestCase):
             yaml = SimpleNamespace(__file__=str(module), __version__='6.0.2')
             cache = root/'fresh-bytecode'
             cache.mkdir()
-            with patch.object(checker.sys, 'pycache_prefix', str(cache)), \
+            with patch.object(checker.sys, 'flags', trusted_flags), \
+                    patch.object(checker.sys, 'pycache_prefix', str(cache)), \
                     patch.object(checker.sys, 'dont_write_bytecode', True), \
                     patch.object(checker.importlib.util, 'find_spec',
                                  return_value=SimpleNamespace(
@@ -1796,6 +1807,19 @@ class BuildWiring(unittest.TestCase):
                     patch.object(checker.importlib.metadata, 'distribution',
                                  return_value=distribution), \
                     patch.object(checker.importlib, 'import_module', return_value=yaml) as imported:
+                class AlternateLoader(checker.importlib.machinery.SourceFileLoader):
+                    pass
+                for origin, loader in (
+                        (str(root/'shadow/yaml.py'),
+                         checker.importlib.machinery.SourceFileLoader('yaml', str(root/'shadow/yaml.py'))),
+                        (str(module), AlternateLoader('yaml', str(module))),
+                        (str(module), None)):
+                    with patch.object(checker.importlib.util, 'find_spec',
+                                      return_value=SimpleNamespace(origin=origin, loader=loader)):
+                        with self.subTest(unverified_origin=origin, loader=type(loader).__name__):
+                            with self.assertRaisesRegex(ValueError, 'verified source file'):
+                                checker.verify_python(checker.REQUIREMENTS)
+                        imported.assert_not_called()
                 report = checker.verify_python(ROOT/'tests/interop/qns/controls-requirements.txt')
                 self.assertTrue(report['verified'])
                 self.assertEqual(imported.call_count, 1)
@@ -1822,12 +1846,12 @@ class BuildWiring(unittest.TestCase):
                 def harmless_child(argv, **kwargs):
                     selections.append((list(argv), kwargs['env']))
                     self.assertEqual(kwargs['env'], clean)
-                    self.assertEqual(argv[1:4], ['-E', '-B', '-X'])
-                    self.assertTrue(argv[4].startswith('pycache_prefix='))
-                    cache = Path(argv[4].split('=', 1)[1])
+                    self.assertEqual(argv[1:5], ['-E', '-B', '-P', '-X'])
+                    self.assertTrue(argv[5].startswith('pycache_prefix='))
+                    cache = Path(argv[5].split('=', 1)[1])
                     checker.require_empty_pycache(cache)
                     if len(selections) == 1:
-                        self.assertEqual(argv[5:7],
+                        self.assertEqual(argv[6:8],
                                          [str(ROOT/'scripts/check-quic-official-inputs.py'),
                                           'verify'])
                         self.assertIn(str(repository), argv)
@@ -1836,8 +1860,8 @@ class BuildWiring(unittest.TestCase):
                                              'bytecode_route': {'prefix': str(cache),
                                                                 'dont_write_bytecode': True}}}
                         return subprocess.CompletedProcess(argv, 0, json.dumps(result).encode(), b'')
-                    self.assertEqual(argv[5], str(ROOT/'tests/quic-official-adapter.py'))
-                    self.assertEqual(argv[6:],
+                    self.assertEqual(argv[6], str(ROOT/'tests/quic-official-adapter.py'))
+                    self.assertEqual(argv[7:],
                                      ['--pinned-runner', str(repository),
                                       '--artifacts', str(root/'run')])
                     self.assertNotIn('--case', argv)
@@ -1854,7 +1878,7 @@ class BuildWiring(unittest.TestCase):
                     calls = []
                     def poisoned_preflight(argv, **kwargs):
                         calls.append(list(argv))
-                        cache = Path(argv[4].split('=', 1)[1])
+                        cache = Path(argv[5].split('=', 1)[1])
                         result = {'verified': True, 'runner': {'verified': True},
                                   'python': {'verified': True,
                                              'bytecode_route': {'prefix': str(cache),
@@ -1913,7 +1937,8 @@ class BuildWiring(unittest.TestCase):
                     self.assertNotIn('yaml', sys.modules)
                 cache = root/'exclusive-clean-route'
                 cache.mkdir()
-                with patch.object(sys, 'pycache_prefix', str(cache)), \
+                with patch.object(sys, 'flags', trusted_flags), \
+                        patch.object(sys, 'pycache_prefix', str(cache)), \
                         patch.object(sys, 'dont_write_bytecode', True):
                     verified = checker.verify_python(checker.REQUIREMENTS)
                     self.assertTrue(verified['verified'])
@@ -1924,6 +1949,14 @@ class BuildWiring(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         checker.verify_python(checker.REQUIREMENTS)
                     self.assertNotIn('yaml', sys.modules)
+                untrusted_flags = SimpleNamespace(**vars(trusted_flags))
+                untrusted_flags.safe_path = False
+                with patch.object(sys, 'flags', untrusted_flags), \
+                        patch.object(sys, 'dont_write_bytecode', True), \
+                        patch.object(checker.importlib, 'import_module') as imported:
+                    with self.assertRaisesRegex(ValueError, 'safe import path'):
+                        checker.verify_python(checker.REQUIREMENTS)
+                    imported.assert_not_called()
                 for route, no_write in ((None, True), ('relative', True),
                                         (str(root/'absent'), True), (str(cache), False)):
                     with patch.object(sys, 'pycache_prefix', route), \
