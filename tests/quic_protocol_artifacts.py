@@ -35,6 +35,7 @@ class ProtocolArtifacts:
         self.shared_fixtures = []
         self.case_files = {case:{} for case in self.declared_cases}
         self.passed = False
+        self.finalization_errors = []
         self.inputs = {str(Path(p).resolve()): digest(p) for p in inputs}
         self.evidence = None
         if requested is None:
@@ -174,31 +175,79 @@ class ProtocolArtifacts:
 
     def __exit__(self, kind, value, traceback):
         cleanup_failure = None
+        manifest = None
+        def secondary(stage,error):
+            nonlocal cleanup_failure
+            row = {"stage":stage,"exception":type(error).__name__,"message":str(error)}
+            self.finalization_errors.append(row)
+            self.passed = False
+            if value is not None:
+                if hasattr(value,"add_note"):
+                    value.add_note("protocol artifact finalization failed: "+json.dumps(row,sort_keys=True))
+            elif cleanup_failure is None:
+                cleanup_failure = error
         for endpoint in self.endpoints:
             if not endpoint.stopped:
                 try:
                     endpoint.stop(primary=value)
                 except BaseException as error:
-                    cleanup_failure = error
-        try:
-            if self.path is not None:
-                commands = self.evidence.commands
+                    secondary("endpoint-cleanup",error)
+        if self.path is not None:
+            try:
                 self._persist_commands()
-                self.evidence.closed = True
-                files = {p.relative_to(self.path).as_posix(): digest(p) for p in self.path.rglob("*") if p.is_file() and not p.is_symlink() and p.name != "manifest.json"}
-                manifest = {"schema_version":1,"status":"passed" if kind is None and cleanup_failure is None and self.passed else "failed",
-                    "workspace":str(self.workspace),"inputs":self.inputs,"commands":commands,
-                    "endpoint_commands":self.endpoint_commands,"declared_cases":self.declared_cases,"case_inventory":self._case_inventory(),"files":files,
-                    "file_bytes":{name:(self.path/name).stat().st_size for name in files}}
-                if kind is not None:
-                    manifest["exception"] = kind.__name__
-                (self.path / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-        finally:
-            for module, original in self.fixture_modules:
-                module.subprocess = original
-            if self.temporary is not None:
+            except BaseException as error:
+                secondary("command-retention",error)
+            self.evidence.closed = True
+            files = {}
+            unhashed = []
+            try:
+                candidates = sorted(self.path.rglob("*"))
+                for path in candidates:
+                    if not path.is_file() or path.is_symlink() or path.name=="manifest.json":
+                        continue
+                    name = path.relative_to(self.path).as_posix()
+                    try:
+                        files[name] = digest(path)
+                    except BaseException as error:
+                        unhashed.append(name)
+                        secondary("file-retention:"+name,error)
+                inventory = self._case_inventory()
+            except BaseException as error:
+                inventory = []
+                secondary("file-inventory",error)
+            manifest = {"schema_version":1,"status":"passed" if kind is None and
+                        cleanup_failure is None and self.passed and not unhashed else "failed",
+                        "workspace":str(self.workspace),"inputs":self.inputs,
+                        "commands":self.evidence.commands,"endpoint_commands":self.endpoint_commands,
+                        "declared_cases":self.declared_cases,"case_inventory":inventory,"files":files,
+                        "file_bytes":{},"finalization_errors":self.finalization_errors,
+                        "unhashed_files":unhashed}
+            for name in files:
+                try:
+                    manifest["file_bytes"][name]=(self.path/name).stat().st_size
+                except BaseException as error:
+                    secondary("file-size:"+name,error)
+                    manifest["status"]="failed"
+            if kind is not None:
+                manifest["exception"]=kind.__name__
+        for module,original in self.fixture_modules:
+            try:
+                module.subprocess=original
+            except BaseException as error:
+                secondary("fixture-restoration",error)
+        if self.temporary is not None:
+            try:
                 self.temporary.cleanup()
-        if cleanup_failure is not None:
+            except BaseException as error:
+                secondary("temporary-cleanup",error)
+        if manifest is not None:
+            if self.finalization_errors:
+                manifest["status"]="failed"
+            try:
+                (self.path/"manifest.json").write_text(json.dumps(manifest,indent=2)+"\n")
+            except BaseException as error:
+                secondary("manifest-retention",error)
+        if value is None and cleanup_failure is not None:
             raise cleanup_failure
 
 
@@ -290,6 +339,26 @@ class EndpointProcess:
         # Native/MSYS execution is required before claiming platform coverage.
 
     def stop(self, *, primary=None):
+        try:
+            return self._stop(primary=primary)
+        except BaseException as error:
+            # Retention failures can occur after the process has already been
+            # stopped. They must fail the ledger without replacing the caller's
+            # original startup/readiness exception.
+            lifecycle = self.row.setdefault("lifecycle",{})
+            errors = lifecycle.setdefault("cleanup_errors",[])
+            errors.append({"stage":"cleanup-or-retention","exception":type(error).__name__,"message":str(error)})
+            lifecycle["passed"] = False
+            lifecycle.setdefault("cleanup_complete",self.stopped)
+            self.owner.passed = False
+            if primary is None:
+                raise
+            self.row["primary_exception"] = type(primary).__name__
+            if hasattr(primary,"add_note"):
+                primary.add_note("owned endpoint secondary failure: "+type(error).__name__+": "+str(error))
+            return "", ""
+
+    def _stop(self, *, primary=None):
         if not self.stopped:
             errors = []
             prior = self.process.poll()
