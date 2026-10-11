@@ -144,3 +144,12 @@ check-cycle-captured-retirement: $(CYCLE_CAPTURED_RETIREMENT_INPUTS) | build
 check-cycle-captured-retirement-sanitize: $(CYCLE_CAPTURED_RETIREMENT_INPUTS) | build
 	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-additive.py --fixture cycle-captured-retirement.c --sanitize --evidence "$(CURDIR)/build/cycle-captured-retirement-sanitize"
 check-managed-graphs-profiles: check-cycle-captured-retirement check-cycle-captured-retirement-sanitize
+
+# Fresh local-MARK zero retirement and issued-marker expiry, bounded profiles only.
+.PHONY: check-cycle-fresh-mark-retirement check-cycle-fresh-mark-retirement-sanitize
+CYCLE_FRESH_MARK_RETIREMENT_INPUTS = tests/cycle-fresh-mark-retirement.c tests/cycle-leaf-churn.c tests/cycle-additive.c tests/cycle-additive.py tools/cycle_runtime.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
+check-cycle-fresh-mark-retirement: $(CYCLE_FRESH_MARK_RETIREMENT_INPUTS) | build
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-additive.py --fixture cycle-fresh-mark-retirement.c --evidence "$(CURDIR)/build/cycle-fresh-mark-retirement-native"
+check-cycle-fresh-mark-retirement-sanitize: $(CYCLE_FRESH_MARK_RETIREMENT_INPUTS) | build
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-additive.py --fixture cycle-fresh-mark-retirement.c --sanitize --evidence "$(CURDIR)/build/cycle-fresh-mark-retirement-sanitize"
+check-managed-graphs-profiles: check-cycle-fresh-mark-retirement check-cycle-fresh-mark-retirement-sanitize
