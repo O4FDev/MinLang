@@ -1,7 +1,16 @@
 /* Registered owner/callback growth, with an independent explicit-edge oracle. */
 #define main additive_fixture_main
+#define empty additive_empty
 #include "cycle-additive.c"
+#undef empty
 #undef main
+static void empty(void) {
+    additive_empty();
+#ifdef MINYAR_CYCLE_LOCAL_PROOFS
+    assert(!rc_cycle_known_head && !rc_cycle_known_tail && !rc_cycle_tail);
+    assert(!rc_cycle_local_requested && !rc_cycle_temporary_anchor);
+#endif
+}
 
 static void borrow_old(Graph g, unsigned calls) {
     minyar_rc_retain_traced(g.interior);
@@ -219,8 +228,61 @@ static void local_cancellations(void) {
 }
 
 
-static void active_publication(void) {
+
+static void controlled_unit(void) {
+    if (!rc_cycle_pending) return;
+    size_t units = rc_cycle_units;
+    rc_cycle_unit();
+    assert(rc_cycle_units == units + 1);
+}
+static void controlled_reference(MinyarRecord *record, unsigned field, void *child) {
+    unsigned char *map = (unsigned char *)(record->values + record->length);
+    assert(!map[field] && !record->values[field]);
+    minyar_rc_retain_traced(child);
+    map[field] = 1;
+    rc_cycle_edge_insert(record, child);
+    record->values[field] = slot(child);
+    rc_cycle_commit_insert(record, child);
+    controlled_unit();
+}
+static void controlled_callbacks(void) {
     Graph g = graph();
+    for (unsigned i = 0; i < 32; i++) {
+        MinyarRecord *p = minyar_record_new_traced(2);
+        MinyarRecord *env = minyar_record_new_traced(3);
+        MinyarRecord *cb = minyar_record_new_traced(3);
+        MinyarRecord *details = minyar_record_new_traced(16);
+        minyar_record_set_traced(env, 0, minyar_callback_domain());
+        controlled_reference(env, 1, g.root);
+        controlled_reference(env, 2, p);
+        controlled_reference(cb, 1, env);
+        minyar_record_set_traced(cb, 2, minyar_callback_domain());
+        controlled_reference(details, 0, g.root);
+        controlled_reference(details, 1, cb);
+        minyar_record_set_traced(details, 15, i);
+        controlled_reference(p, 0, cb);
+        controlled_reference(p, 1, details);
+        rc_drop(env); controlled_unit();
+        rc_drop(cb); controlled_unit();
+        rc_drop(details); controlled_unit();
+        if (g.list->length == g.list->capacity) list_grow(g.list);
+        rc_cycle_edge_insert(g.list, p);
+        g.list->values[g.list->length++] = slot(p);
+        rc_cycle_commit_insert(g.list, p);
+        controlled_unit();
+        minyar_rc_retain_traced(g.interior);
+        for (unsigned j = 0; j < 64; j++) controlled_unit();
+        rc_drop(g.interior);
+        drain();
+        assert(rc_object_count == 4u + 4u * (i + 1));
+        check_peer(p, g.root, i);
+    }
+    minyar_rc_release(g.root); empty();
+}
+
+static void active_publication(unsigned offset, int copied, int repeated) {
+    Graph g = graph();
+    if (repeated) list_reserve(g.list, 16);
     MinyarRecord *c = minyar_record_new_traced(1);
     MinyarRecord *d = minyar_record_new_traced(1);
     MinyarRecord *left = minyar_record_new_traced(1);
@@ -236,11 +298,31 @@ static void active_publication(void) {
     rc_cycle_request_local();
     local_phase(RC_CYCLE_MARK);
     size_t turns = 0;
-    while (rc_cycle_active != rc_cycle_value(p) || rc_cycle_index != 1) {
+    while (rc_cycle_active != rc_cycle_value(p) || rc_cycle_index != offset) {
         assert(++turns < 100000); rc_cycle_unit();
     }
+    assert(rc_cycle_limit == 8);
     assert(!rc_cycle_proven(rc_cycle_value(p)) && !rc_cycle_proven(rc_cycle_value(c)));
-    minyar_list_add_take_traced(g.list, slot(p));
+    if (repeated) {
+        rc_cycle_edge_insert(g.list, p);
+        g.list->values[g.list->length++] = slot(p);
+        rc_cycle_commit_insert(g.list, p);
+        assert(rc_cycle_index == 0 && rc_cycle_limit == 8);
+        while (rc_cycle_active == rc_cycle_value(p)) {
+            size_t previous = rc_cycle_index, units = rc_cycle_units;
+            minyar_rc_retain_traced(p);
+            rc_cycle_edge_insert(g.list, p);
+            g.list->values[g.list->length++] = slot(p);
+            rc_cycle_commit_insert(g.list, p);
+            assert(rc_cycle_index == previous && rc_cycle_limit == 8);
+            rc_cycle_unit();
+            assert(rc_cycle_units == units + 1);
+        }
+    } else if (copied) {
+        minyar_list_add_traced(g.list, slot(p));
+        minyar_rc_release(p);
+    } else
+        minyar_list_add_take_traced(g.list, slot(p));
     assert(rc_cycle_proven(rc_cycle_value(p)));
     drain();
     assert(rc_object_count == 9);
@@ -314,6 +396,13 @@ static void temporary_contracts(void) {
         ((unsigned char *)(outside->values + outside->length))[0] = 1;
         rc_cycle_commit_insert(outside, outside);
         rc_drop(outside);
+        /* A forced full request survives cancellation of the local job. */
+        while (rc_cycle_local_job) rc_cycle_unit();
+        assert(rc_cycle_phase == RC_CYCLE_IDLE && rc_cycle_pending);
+        unsigned generation = rc_cycle_generation;
+        rc_cycle_unit();
+        assert(rc_cycle_phase == RC_CYCLE_ROOTS && !rc_cycle_local_job &&
+               rc_cycle_proof_build && rc_cycle_generation != generation);
 #ifndef MINYAR_BOUNDED_RC
         minyar_rc_release(NULL);
 #endif
@@ -364,7 +453,14 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "callbacks") || !strcmp(mode, "all")) callback_work(n, 0);
     if (!strcmp(mode, "streaming") || !strcmp(mode, "all")) callback_work(n, 1);
 #ifdef MINYAR_CYCLE_LOCAL_PROOFS
-    if (!strcmp(mode, "active") || !strcmp(mode, "all")) active_publication();
+    if (!strcmp(mode, "active") || !strcmp(mode, "all")) {
+        controlled_callbacks();
+        active_publication(1, 0, 0);
+        active_publication(1, 1, 0);
+        active_publication(7, 0, 0);
+        active_publication(7, 1, 0);
+        active_publication(7, 0, 1);
+    }
 #endif
     if (!strcmp(mode, "safety") || !strcmp(mode, "all")) {
         char *old[] = {(char *)"additive", (char *)"32", NULL};
