@@ -1,0 +1,425 @@
+// RFC 9000 sections 9.5 and 9.6 regression oracles.
+// Uses only existing APIs so a baseline failure must be a protocol assertion,
+// not a missing function or parser error. Run only after the heavy-work GO.
+use "quic" as quic
+use "quicwire" as wire
+use "crypto" as crypto
+use "errors" as errors
+use "quiccrypto" as protection
+use "tlstickets" as tickets
+
+record Pair { client: quic.Connection; server: quic.Connection; now: Integer }
+function drive(c: quic.Connection, s: quic.Connection, now: Integer) {
+    for packet in quic.pollDatagrams(c, now) { quic.receivePath(s, packet.data, packet.pathId, now) }
+    for packet in quic.pollDatagrams(s, now) { quic.receivePath(c, packet.data, packet.pathId, now) }
+}
+function connected(root: Bytes, identity: Bytes, key: Bytes, client: Bytes, clientKey: Bytes): Pair {
+    let c = quic.client("localhost", randomBytes(80), "minyar-test", [root], [client], clientKey)
+    let s = quic.server(randomBytes(80), "minyar-test", c.originalDestination, [identity], key, [root], true)
+    let now = 0
+    for count in 0..200 { drive(c, s, now); now += 10 }
+    return Pair { client: c; server: s; now: now }
+}
+function ready(p: Pair): Boolean {
+    return p.client.state == quic.ESTABLISHED && p.server.state == quic.ESTABLISHED &&
+        p.client.confirmed && p.server.confirmed && p.client.remoteIds.length == 2
+}
+function intentionalMigration(p: Pair): Integer {
+    if !ready(p) { print("setup failed: authenticated peers or spare CID absent"); return 40 }
+    let c = p.client; let s = p.server; let now = p.now
+    let original = crypto.hex(c.remote)
+    if !errors.booleanOk(quic.probePath(c, 7, now)) { print("setup failed: intentional probe refused despite spare CID"); return 41 }
+    let observed = false
+    for packet in quic.pollDatagrams(c, now) {
+        if packet.pathId == 7 {
+            let header = wire.header(packet.data, 0, s.local.length)
+            if !header.valid || header.kind != wire.ONE_RTT { return 43 }
+            if crypto.hex(header.destination) == original {
+                print("semantic failure: intentional new path reused the original destination CID")
+                return 42
+            }
+            let issued = false
+            for known in c.remoteIds { if crypto.hex(known.id) == crypto.hex(header.destination) { issued = true } }
+            if !issued { print("semantic failure: probe used an unissued CID"); return 44 }
+            observed = true
+        }
+        quic.receivePath(s, packet.data, packet.pathId, now)
+    }
+    if !observed { print("setup failed: no new-path packet"); return 45 }
+    for count in 0..200 { drive(c, s, now); now += 10 }
+    if c.state != quic.ESTABLISHED || s.state != quic.ESTABLISHED || c.activePath != 7 { return 46 }
+    print("intentional migration used a different issued CID and validated the exact new path")
+    return 0
+}
+function noSpareCid(p: Pair): Integer {
+    if !ready(p) { return 50 }
+    let c = p.client
+    // Model a peer that has not supplied another usable destination CID.
+    // The wire/TLS state is already authenticated; no new transport API is used.
+    c.remoteIds = [c.remoteIds[0]]
+    let original = crypto.hex(c.remote); let paths = c.paths.length
+    if errors.booleanOk(quic.probePath(c, 7, p.now)) {
+        print("semantic failure: intentional migration accepted without an unused destination CID")
+        return 52
+    }
+    if c.activePath != 0 || c.paths.length != paths || crypto.hex(c.remote) != original { return 53 }
+    for packet in quic.pollDatagrams(c, p.now) { if packet.pathId == 7 { return 54 } }
+    if c.state != quic.ESTABLISHED { return 55 }
+    print("CID exhaustion left the validated original path usable without a new-path transmission")
+    return 0
+}
+function preferredAddress(root: Bytes, identity: Bytes, key: Bytes, client: Bytes, clientKey: Bytes): Integer {
+    let c = quic.client("localhost", randomBytes(80), "minyar-test", [root], [client], clientKey)
+    let s = quic.server(randomBytes(80), "minyar-test", c.originalDestination, [identity], key, [root], true)
+    // RFC 9000 section 18.2: 192.0.2.44:443, absent IPv6 address/port,
+    // an eight-byte alternative CID and a sixteen-byte stateless-reset token.
+    // This test stops at authenticated client handshake completion before
+    // the synthetic server would need to own/use the alternative CID.
+    let value = crypto.fromHex("c000022c01bb")
+    value.addBytes(Bytes(18)); value.add(8); value.addBytes(randomBytes(8)); value.addBytes(randomBytes(16))
+    let transport = s.serverTLS.transportParameters.slice(0, s.serverTLS.transportParameters.length)
+    transport.addBytes(errors.bytesValue(wire.encode(13)))
+    transport.addBytes(errors.bytesValue(wire.encode(value.length))); transport.addBytes(value)
+    s.serverTLS.transportParameters = transport
+    let now = 0
+    while now < 10000 && c.state != quic.ESTABLISHED && c.state != quic.FAILED {
+        drive(c, s, now); now += 10
+    }
+    if c.state == quic.FAILED && c.code == 8 {
+        print("semantic failure: a valid preferred_address caused a transport-parameter failure")
+        return 62
+    }
+    if c.state != quic.ESTABLISHED || !c.clientTLS.authenticated { print("setup failed: preferred-address handshake did not authenticate"); return 63 }
+    if c.activePath != 0 { print("semantic failure: unmapped preferred address changed the active path"); return 64 }
+    print("valid preferred_address preserved authenticated handshake and the original active path")
+    return 0
+}
+function natRebinding(p: Pair): Integer {
+    if !ready(p) { return 70 }
+    let c = p.client; let s = p.server; let now = p.now
+    let original = crypto.hex(c.remote)
+    let opened = quic.openStream(c, false); if !errors.integerOk(opened) { return 71 }
+    let id = errors.integerValue(opened); let expected = Bytes("NAT rebinding keeps the existing client connection")
+    if !errors.integerOk(quic.writeStream(c, id, expected, true)) { return 72 }
+    let received = Bytes(); let observed = false
+    for count in 0..500 {
+        for packet in quic.pollDatagrams(c, now) {
+            let header = wire.header(packet.data, 0, s.local.length)
+            if header.valid && header.kind == wire.ONE_RTT {
+                if crypto.hex(header.destination) != original { return 73 }
+                observed = true
+            }
+            // Only the external source mapping changed. The client did not
+            // deliberately probe/migrate its own local endpoint.
+            quic.receivePath(s, packet.data, 7, now)
+        }
+        for packet in quic.pollDatagrams(s, now) { quic.receivePath(c, packet.data, 0, now) }
+        let read = quic.readStream(s, id)
+        if errors.bytesOk(read) { received.addBytes(errors.bytesValue(read)) }
+        now += 10
+    }
+    if !observed || crypto.hex(received) != crypto.hex(expected) || c.state != quic.ESTABLISHED ||
+       s.state != quic.ESTABLISHED || c.activePath != 0 || s.activePath != 7 { return 74 }
+    print("NAT rebinding preserved the client's CID and authenticated stream while the server validated the source")
+    return 0
+}
+function appendInteger(data: Bytes, value: Integer) { data.addBytes(errors.bytesValue(wire.encode(value))) }
+function authenticatedFrame(sender: quic.Connection, receiver: quic.Connection, destination: Bytes, payload: Bytes): Bytes {
+    let number = sender.spaces[2].next; sender.spaces[2].next += 1
+    let header = Bytes(); header.add(0x43 | ((sender.spaces[2].writeGeneration & 1) << 2)); header.addBytes(destination)
+    for index in 0..4 { header.add((number >> ((3 - index) * 8)) & 255) }
+    return errors.bytesValue(protection.protect(sender.spaces[2].write,header,header.length - 4,number,payload))
+}
+function newCid(sequence: Integer, prior: Integer, id: Bytes, token: Bytes): Bytes {
+    let data = Bytes(); appendInteger(data,24); appendInteger(data,sequence); appendInteger(data,prior)
+    data.add(id.length); data.addBytes(id); data.addBytes(token); return data
+}
+function failedValidation(p: Pair): Integer {
+    if !ready(p) { return 80 }
+    let c=p.client;let s=p.server;let now=p.now;let original=crypto.hex(c.remote)
+    if !errors.booleanOk(quic.probePath(c,7,now)) { return 81 }
+    for count in 0..1000 {
+        for packet in quic.pollDatagrams(c,now) { if packet.pathId==0 { quic.receivePath(s,packet.data,0,now) } }
+        for packet in quic.pollDatagrams(s,now) { quic.receivePath(c,packet.data,0,now) }
+        now+=10
+    }
+    if c.paths.length!=1 {
+        print("semantic failure: expired intentional candidate retained its path and destination CID")
+        return 82
+    }
+    if c.activePath!=0 || crypto.hex(c.remote)!=original || c.state!=quic.ESTABLISHED || s.state!=quic.ESTABLISHED { return 83 }
+    if !errors.booleanOk(quic.probePath(c,9,now)) { print("failed candidate blocked the next migration despite replacement CID");return 84 }
+    print("failed validation retired the candidate CID, kept the original route and allowed another bounded probe")
+    return 0
+}
+function retirePrior(p: Pair): Integer {
+    if !ready(p) { return 90 }
+    let c=p.client;let s=p.server;let id=randomBytes(8);let token=randomBytes(16)
+    let frame=newCid(2,2,id,token)
+    quic.receivePath(c,authenticatedFrame(s,c,c.local,frame),0,p.now)
+    if c.state!=quic.ESTABLISHED || c.remoteIds.length!=1 { return 91 }
+    quic.ping(c);let observed=false
+    for packet in quic.pollDatagrams(c,p.now) {
+        let header=wire.header(packet.data,0,c.local.length)
+        if header.valid && header.kind==wire.ONE_RTT {
+            if crypto.hex(header.destination)!=crypto.hex(id) {
+                print("semantic failure: retiring the active CID left a path transmitting the retired destination")
+                return 92
+            }
+            observed=true
+        }
+    }
+    if !observed { return 93 }
+    print("increased retire-prior replaced every affected path before sending retirement frames")
+    return 0
+}
+function duplicateRetirement(p: Pair): Integer {
+    if !ready(p) { return 100 }
+    let c=p.client;let s=p.server;let old=c.remoteIds[1]
+    quic.receivePath(c,authenticatedFrame(s,c,c.local,newCid(2,2,randomBytes(8),randomBytes(16))),0,p.now)
+    if c.state!=quic.ESTABLISHED { return 101 }
+    for count in 0..1000 {
+        quic.receivePath(c,authenticatedFrame(s,c,c.local,newCid(old.sequence,0,old.id,old.token)),0,p.now)
+        if c.state!=quic.ESTABLISHED || c.remoteIds.length>2 || c.pending.length>8 {
+            print("semantic failure: reordered duplicate NEW_CONNECTION_ID accumulated retirement state")
+            return 102
+        }
+    }
+    print("reordered obsolete NEW_CONNECTION_ID duplicates retained one bounded retirement per sequence")
+    return 0
+}
+function successfulRetirement(p: Pair): Integer {
+    let original=crypto.hex(p.client.remote)
+    let result=intentionalMigration(p);if result!=0 { return result }
+    if p.client.paths.length!=1 {
+        print("semantic failure: validated intentional migration retained the abandoned original path")
+        return 112
+    }
+    for known in p.client.remoteIds { if crypto.hex(known.id)==original { return 113 } }
+    if crypto.hex(p.client.remote)==original { return 114 }
+    print("validated migration retired the abandoned path CID")
+    return 0
+}
+function unknownDestination(p: Pair): Integer {
+    if !ready(p) { return 120 }
+    let c=p.client;let s=p.server;let largest=c.spaces[2].largest;let paths=c.paths.length
+    let id=randomBytes(8)
+    while quic.ownsConnectionId(c,id) { id=randomBytes(8) }
+    let payload=crypto.fromHex("0100000000")
+    quic.receivePath(c,authenticatedFrame(s,c,id,payload),9,p.now)
+    if c.spaces[2].largest!=largest || c.paths.length!=paths || c.activePath!=0 || c.state!=quic.ESTABLISHED { return 121 }
+    print("unknown destination CID did not allocate a path or advance authenticated packet state")
+    return 0
+}
+
+function preferredPair(root: Bytes, identity: Bytes, key: Bytes, client: Bytes, clientKey: Bytes, disabled: Boolean, configured: Boolean): Pair {
+    let c=quic.client("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey)
+    let s=quic.server(randomBytes(80),"minyar-test",c.originalDestination,[identity],key,[root],true)
+    if configured {
+        if !errors.booleanOk(quic.configurePreferredAddress(s,crypto.fromHex("c000022c"),443,Bytes(16),0)) { return Pair { client:c;server:s;now:0 } }
+    } else {
+        let value=crypto.fromHex("c000022c01bb");value.addBytes(Bytes(18));value.add(8)
+        value.addBytes(randomBytes(8));value.addBytes(randomBytes(16))
+        let transport=s.serverTLS.transportParameters.slice(0,s.serverTLS.transportParameters.length)
+        appendInteger(transport,13);appendInteger(transport,value.length);transport.addBytes(value)
+        if disabled { appendInteger(transport,12);appendInteger(transport,0) }
+        s.serverTLS.transportParameters=transport
+    }
+    let now=0
+    while now<10000 && c.state!=quic.ESTABLISHED && c.state!=quic.FAILED { drive(c,s,now);now+=10 }
+    // The synthetic server owns the authenticated preferred CID before it
+    // processes client Finished. This leaves certificate/Finished checks intact.
+    if c.state==quic.ESTABLISHED && c.remoteIds.length==2 {
+        if !configured { s.localIds.add(c.remoteIds[1]);s.nextLocalSequence=2 }
+        for count in 0..200 { drive(c,s,now);now+=10 }
+    }
+    return Pair { client:c;server:s;now:now }
+}
+function preferredValidation(p: Pair, disabled: Boolean): Integer {
+    if !ready(p) || !p.client.clientTLS.authenticated || !p.client.peerPreferred.valid { return 150 }
+    let c=p.client;let s=p.server;let now=p.now;let original=crypto.hex(c.remote)
+    let preferred=crypto.hex(c.peerPreferred.connectionId)
+    if crypto.hex(c.peerPreferred.ipv4)!="c000022c" || c.peerPreferred.ipv4Port!=443 || c.peerPreferred.ipv6Port!=0 { return 151 }
+    if !errors.booleanOk(quic.probePath(c,7,now)) {
+        if disabled { print("semantic failure: disable_active_migration blocked authenticated preferred-address validation");return 152 }
+        return 153
+    }
+    let observed=false
+    for packet in quic.pollDatagrams(c,now) {
+        if packet.pathId==7 {
+            let header=wire.header(packet.data,0,c.local.length)
+            if crypto.hex(header.destination)!=preferred || crypto.hex(header.destination)==original { return 154 }
+            let plaintext=protection.unprotect(s.spaces[2].read,packet.data,header.numberOffset,s.spaces[2].largest)
+            if !plaintext.valid { return 155 }
+            for frame in wire.frames(plaintext.payload).frames { if frame.type!=0 && frame.type!=26 { return 156 } }
+            observed=true
+        }
+        quic.receivePath(s,packet.data,packet.pathId,now)
+    }
+    if !observed || c.activePath!=0 { return 157 }
+    for count in 0..300 { drive(c,s,now);now+=10 }
+    if c.activePath!=7 || crypto.hex(c.remote)!=preferred || c.paths.length!=1 || c.state!=quic.ESTABLISHED || s.state!=quic.ESTABLISHED { return 158 }
+    let opened=quic.openStream(c,false);if !errors.integerOk(opened) { return 159 }
+    let id=errors.integerValue(opened);quic.writeStream(c,id,Bytes("validated preferred route"),true)
+    for count in 0..300 { drive(c,s,now);now+=10 }
+    let received=quic.readStream(s,id)
+    if !errors.bytesOk(received) || Text(errors.bytesValue(received))!="validated preferred route" { return 160 }
+    print("authenticated preferred CID carried only probes until exact-path validation, then authenticated stream traffic")
+    return 0
+}
+function preferredFallback(p: Pair): Integer {
+    let result=failedValidation(p);if result!=0 { return result }
+    let c=p.client;let s=p.server;let now=max(c.now,s.now)
+    let opened=quic.openStream(c,false);if !errors.integerOk(opened) { return 165 }
+    let id=errors.integerValue(opened);quic.writeStream(c,id,Bytes("original route survives"),true)
+    for count in 0..300 {
+        for packet in quic.pollDatagrams(c,now) { if packet.pathId==0 { quic.receivePath(s,packet.data,0,now) } }
+        for packet in quic.pollDatagrams(s,now) { quic.receivePath(c,packet.data,0,now) }
+        now+=10
+    }
+    let received=quic.readStream(s,id)
+    if !errors.bytesOk(received) || Text(errors.bytesValue(received))!="original route survives" || c.activePath!=0 { return 166 }
+    print("failed preferred-address validation kept the authenticated original route usable")
+    return 0
+}
+function responseRoutes(p: Pair): Integer {
+    if !ready(p) { return 170 }
+    let c=p.client;let s=p.server;let now=p.now
+    if !errors.booleanOk(quic.probePath(c,7,now)) { return 171 }
+    let response=Bytes();appendInteger(response,27);response.addBytes(c.paths[1].challenge)
+    quic.receivePath(c,authenticatedFrame(s,c,c.local,response),0,now)
+    if c.activePath!=0 || c.paths[1].validated { return 172 }
+    let correct=authenticatedFrame(s,c,c.local,response)
+    let later=authenticatedFrame(s,c,c.local,crypto.fromHex("0100000000"))
+    quic.receivePath(c,later,0,now)
+    quic.receivePath(c,correct,7,now)
+    if c.activePath!=7 || c.paths.length!=1 { return 173 }
+    quic.receivePath(c,correct,7,now)
+    if c.activePath!=7 || c.paths.length!=1 || c.state!=quic.ESTABLISHED { return 174 }
+    print("wrong-route response was ignored; reordered matching response validated once and its replay changed no path")
+    return 0
+}
+function lateResponse(p: Pair): Integer {
+    if !ready(p) { return 180 }
+    let c=p.client;let s=p.server;let now=p.now
+    if !errors.booleanOk(quic.probePath(c,7,now)) { return 181 }
+    let response=Bytes();appendInteger(response,27);response.addBytes(c.paths[1].challenge)
+    for count in 0..1000 {
+        for packet in quic.pollDatagrams(c,now) { if packet.pathId==0 { quic.receivePath(s,packet.data,0,now) } }
+        for packet in quic.pollDatagrams(s,now) { quic.receivePath(c,packet.data,0,now) };now+=10
+    }
+    let largest=c.spaces[2].largest
+    quic.receivePath(c,authenticatedFrame(s,c,c.local,response),7,now)
+    if c.paths.length!=1 || c.activePath!=0 || c.spaces[2].largest!=largest || c.state!=quic.ESTABLISHED { return 182 }
+    print("late response to an expired challenge did not recreate a path or advance received packet state")
+    return 0
+}
+function tokenReuse(p: Pair): Integer {
+    if !ready(p) { return 190 }
+    let c=p.client;let s=p.server;let token=c.remoteIds[1].token
+    quic.receivePath(c,authenticatedFrame(s,c,c.local,newCid(2,1,randomBytes(8),token)),0,p.now)
+    if c.state!=quic.FAILED || c.code!=10 {
+        print("semantic failure: two live destination CIDs shared a stateless-reset token")
+        return 192
+    }
+    print("distinct live CID sequences cannot reuse a stateless-reset token")
+    return 0
+}
+function retirementBound(p: Pair): Integer {
+    if !ready(p) { return 200 }
+    let c=p.client;let s=p.server
+    for sequence in 2..6 {
+        quic.receivePath(c,authenticatedFrame(s,c,c.local,newCid(sequence,sequence,randomBytes(8),randomBytes(16))),0,p.now)
+    }
+    if c.state!=quic.FAILED || c.code!=9 || c.remoteRetireOutstanding.length>4 || c.retiredRemote.length>64 { return 201 }
+    print("unacknowledged retirement state is bounded at twice the advertised active CID limit")
+    return 0
+}
+function retiredDestination(p: Pair): Integer {
+    if !ready(p) { return 210 }
+    let old=p.server.local
+    let result=intentionalMigration(p);if result!=0 { return result }
+    let s=p.server;let largest=s.spaces[2].largest;let paths=s.paths.length
+    if quic.ownsConnectionId(s,old) { return 211 }
+    quic.receivePath(s,authenticatedFrame(p.client,s,old,crypto.fromHex("0100000000")),19,max(p.client.now,s.now))
+    if s.spaces[2].largest!=largest || s.paths.length!=paths || s.state!=quic.ESTABLISHED { return 212 }
+    print("authenticated packets addressed to a retired CID cannot allocate a path or advance packet state")
+    return 0
+}
+function earlyRoutes(root: Bytes, identity: Bytes, key: Bytes, client: Bytes, clientKey: Bytes): Integer {
+    let store=tickets.store(randomBytes(16),3600);tickets.allowEarlyData(store,0xffffffff)
+    let c=quic.client("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey)
+    let s=quic.serverWithTickets(randomBytes(80),"minyar-test",c.originalDestination,[identity],key,[root],true,store)
+    for tick in 0..300 { drive(c,s,tick*10) }
+    let ticket=quic.takeTicket(c);if !ticket.valid { return 220 }
+    let early=quic.clientEarly("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey,ticket)
+    let peer=quic.serverWithTickets(randomBytes(80),"minyar-test",early.originalDestination,[identity],key,[root],true,store)
+    if errors.booleanOk(quic.probePath(early,7,0)) || early.paths.length!=1 { return 221 }
+    let opened=quic.openEarlyStream(early,false);if !errors.integerOk(opened) { return 222 }
+    let id=errors.integerValue(opened);quic.writeEarlyStream(early,id,Bytes("replay-safe"),true)
+    let destination=crypto.hex(early.originalDestination);let earlySeen=false
+    for tick in 0..300 {
+        for packet in quic.pollDatagrams(early,tick*10) {
+            let header=wire.header(packet.data,0,early.local.length)
+            if packet.pathId!=0 { return 223 }
+            if header.kind==wire.ZERO_RTT { if crypto.hex(header.destination)!=destination { return 224 };earlySeen=true }
+            quic.receivePath(peer,packet.data,0,tick*10)
+        }
+        for packet in quic.pollDatagrams(peer,tick*10) { quic.receivePath(early,packet.data,0,tick*10) }
+    }
+    if !earlySeen || !early.confirmed || !early.clientTLS.resumed || !early.clientTLS.earlyAccepted || early.activePath!=0 || peer.state!=quic.ESTABLISHED { return 225 }
+    print("0-RTT used the original destination and route; intentional migration remained unavailable before confirmation")
+    return 0
+}
+
+function repeatedMigration(p: Pair): Integer {
+    if !ready(p) { return 230 }
+    let c=p.client;let s=p.server;let now=p.now
+    for cycle in 0..50 {
+        let original=crypto.hex(c.remote);let route=cycle+1
+        if !errors.booleanOk(quic.probePath(c,route,now)) { return 231 }
+        for tick in 0..100 { drive(c,s,now);now+=10 }
+        if c.activePath!=route || crypto.hex(c.remote)==original || c.paths.length!=1 || s.paths.length>2 ||
+           c.state!=quic.ESTABLISHED || s.state!=quic.ESTABLISHED || c.remoteIds.length>2 || s.localIds.length>2 ||
+           c.remoteRetireOutstanding.length!=0 || c.retiredRemote.length>64 { return 232 }
+    }
+    print("fifty sequential migrations acknowledged each retirement and retained bounded CID/path state")
+    return 0
+}
+function cidRebound(p: Pair): Integer {
+    if !ready(p) { return 240 }
+    let c=p.client;let s=p.server;let known=c.remoteIds[1]
+    quic.receivePath(c,authenticatedFrame(s,c,c.local,newCid(known.sequence,0,randomBytes(8),known.token)),0,p.now)
+    if c.state!=quic.FAILED || c.code!=10 { return 241 }
+    print("an authenticated sequence rebound to another CID is a protocol error")
+    return 0
+}
+
+function main(): Integer {
+    let root = readBytesFile(argument(0)); let identity = readBytesFile(argument(1)); let key = readBytesFile(argument(2))
+    let client = readBytesFile(argument(3)); let clientKey = readBytesFile(argument(4)); let mode = argument(5)
+    if mode == "preferred-address" { return preferredAddress(root, identity, key, client, clientKey) }
+    if mode == "preferred-validation" || mode == "preferred-disabled" || mode == "preferred-fallback" || mode == "preferred-api" {
+        let preferred=preferredPair(root,identity,key,client,clientKey,mode=="preferred-disabled",mode=="preferred-api")
+        if mode=="preferred-fallback" { return preferredFallback(preferred) }
+        return preferredValidation(preferred,mode=="preferred-disabled")
+    }
+    if mode=="early-routes" { return earlyRoutes(root,identity,key,client,clientKey) }
+    let p = connected(root, identity, key, client, clientKey)
+    if mode == "migration-cid" { return intentionalMigration(p) }
+    if mode == "cid-unavailable" { return noSpareCid(p) }
+    if mode == "nat-rebinding" { return natRebinding(p) }
+    if mode == "failed-validation" { return failedValidation(p) }
+    if mode == "retire-prior" { return retirePrior(p) }
+    if mode == "duplicate-retirement" { return duplicateRetirement(p) }
+    if mode == "successful-retirement" { return successfulRetirement(p) }
+    if mode == "unknown-destination" { return unknownDestination(p) }
+    if mode=="repeated-migration" { return repeatedMigration(p) }
+    if mode=="cid-rebound" { return cidRebound(p) }
+    if mode=="response-routes" { return responseRoutes(p) }
+    if mode=="late-response" { return lateResponse(p) }
+    if mode=="token-reuse" { return tokenReuse(p) }
+    if mode=="retirement-bound" { return retirementBound(p) }
+    if mode=="retired-destination" { return retiredDestination(p) }
+    print("unknown regression case"); return 2
+}
