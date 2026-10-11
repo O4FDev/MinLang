@@ -432,6 +432,30 @@ print("clean each iteration")
                 self.assertFalse(llvm.exists())
                 self.assertNotIn('List position', result.stderr)
 
+
+    def test_review_callback_type_commas_are_punctuation(self):
+        for comma in ['","', "','"]:
+            callback = 'Callback<Integer ' + comma + ' Integer>'
+            for declaration in [
+                'let result: Result<' + callback + ', Text> = Ok<Callback<Integer, Integer>, Text>(function(n: Integer): Integer { return n })\n',
+                'let results: List<Result<' + callback + ', Text>> = []\n',
+                'record Box { result: Result<' + callback + ', Text> }\n',
+            ]:
+                with self.subTest(declaration=declaration):
+                    result, llvm = self.compile(declaration)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertFalse(llvm.exists())
+                    self.assertNotIn('List position', result.stderr)
+
+    def test_review_results_cannot_cross_scalar_parallel_or_native_abi(self):
+        for source, diagnostic in [
+            ('parallel function bad(result: Result<Integer, Text>): Integer { return 1 }\n', 'may use only Integer'),
+            ('parallel function bad(): Result<Integer, Integer> { return Ok<Integer, Integer>(1) }\n', 'may use only Integer'),
+            ('function bad(result: Result<Integer, Text>): Integer { native "review" }\n', 'native functions accept'),
+        ]:
+            with self.subTest(source=source):
+                self.rejects(source, diagnostic)
+
 if __name__ == '__main__':
     suite = unittest.TestSuite(ResultReview(name) for name in
         unittest.defaultTestLoader.getTestCaseNames(ResultReview)
