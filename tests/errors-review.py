@@ -225,6 +225,96 @@ match second.values[1] { Ok(call) { print(call()) } Err(call) { print(call()) } 
 print(first.values.length); print(second.values.length)
 """, 'alive!\nalive!\n0\n0\n')
 
+
+    def test_review_each_result_generic_delimiter_keeps_lexical_kind(self):
+        headers = [
+            'Ok<Integer, Text>(1)', 'Err<Integer, Text>("bad")',
+            'Ok<List<Integer>, Text>([1])',
+            'Ok<Result<Integer, Text>, Bytes>(Ok<Integer, Text>(1))',
+        ]
+        import re
+        for constructor in headers:
+            for match in re.finditer(r'>>|[<,>]', constructor):
+                mutated = constructor[:match.start()] + '"' + match.group() + '"' + constructor[match.end():]
+                with self.subTest(constructor=mutated):
+                    result, llvm = self.compile('let result = ' + mutated + '\n')
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertFalse(llvm.exists())
+                    self.assertNotIn('List position', result.stderr)
+
+    def test_review_collect_short_circuits_before_fatal_callback(self):
+        self.executes("""function collect(calls: List<Callback<Result<Integer, Text>>>): Result<List<Integer>, Text> {
+    let collected: List<Integer> = []
+    for call in calls {
+        let value = try call()
+        collected.add(value)
+    }
+    return Ok<List<Integer>, Text>(collected)
+}
+let first = function(): Result<Integer, Text> { return Ok<Integer, Text>(42) }
+let error = function(): Result<Integer, Text> { return Err<Integer, Text>("stop" + "!") }
+let fatal = function(): Result<Integer, Text> { fail("must never run"); return Ok<Integer, Text>(0) }
+match collect([first, error, fatal]) {
+    Ok(values) { print(values.length) }
+    Err(error) { print(error) }
+}
+match collect([first, first]) {
+    Ok(values) { print(values[0] + values[1]) }
+    Err(error) { print(error) }
+}
+""", 'stop!\n84\n')
+
+    def test_review_match_and_try_evaluate_input_once(self):
+        self.executes("""record Counter { calls: Integer }
+function next(counter: Counter): Result<Integer, Text> {
+    counter.calls = counter.calls + 1
+    return Ok<Integer, Text>(counter.calls)
+}
+function twice(counter: Counter): Result<Integer, Text> {
+    let first = try next(counter)
+    match next(counter) {
+        Ok(second) { return Ok<Integer, Text>(first + second) }
+        Err(error) { return Err<Integer, Text>(error) }
+    }
+}
+let counter = Counter { calls: 0 }
+match twice(counter) { Ok(value) { print(value) } Err(error) { print(error) } }
+print(counter.calls)
+""", '3\n2\n')
+
+    def test_review_udp_truncation_empty_packet_wouldblock_and_recovery(self):
+        self.native_sources = (str(language.ROOT / 'runtime/native/net.c'),)
+        self.executes("""use "results" as results
+use "errors" as errors
+use "net" as net
+let receiver = net.udp("127.0.0.1", 0)
+let sender = net.udp("127.0.0.1", 0)
+print(receiver >= 0 && sender >= 0)
+print(net.udpConnect(sender, "127.0.0.1", net.localPort(receiver)))
+match results.receiveDatagram(receiver, 16) {
+    Ok(read) { print("unexpected initial packet") }
+    Err(error) { print(errors.code(results.error(error)) == errors.wouldBlockCode()) }
+}
+match results.write(sender, Bytes("abcdef")) { Ok(n) { print(n) } Err(e) { print(errors.message(e)) } }
+print(net.ready(receiver, 1000))
+let failed = results.receiveDatagram(receiver, 3)
+match failed {
+    Ok(read) { print("unexpected full packet") }
+    Err(error) {
+        print(errors.code(results.error(error)) == errors.truncatedCode())
+        print(Text(results.prefix(error)))
+    }
+}
+match results.write(sender, Bytes()) { Ok(n) { print(n) } Err(e) { print(errors.message(e)) } }
+print(net.ready(receiver, 1000))
+match results.receiveDatagram(receiver, 16) {
+    Ok(read) { print(results.ended(read)); print(results.data(read).length) }
+    Err(error) { print(errors.message(results.error(error))) }
+}
+match failed { Ok(read) { print("unexpected") } Err(error) { print(Text(results.prefix(error))) } }
+net.close(sender); net.close(receiver)
+""", 'true\ntrue\ntrue\n6\ntrue\ntrue\nabc\n0\ntrue\nfalse\n0\nabc\n')
+
 if __name__ == '__main__':
     suite = unittest.TestSuite(ResultReview(name) for name in
         unittest.defaultTestLoader.getTestCaseNames(ResultReview)
