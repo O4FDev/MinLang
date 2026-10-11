@@ -566,6 +566,18 @@ check-tls-sanitize: build/minyarc
 
 check check-portable: check-tls
 
+# Handshake PTO virtual-clock modes use fresh absolute evidence directories.
+.PHONY: check-quic-pto check-quic-pto-sanitize
+check-quic-pto: build/minyarc tests/quic-pto.py tests/quic-pto.min | build
+	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-pto-native-O0.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/quic-pto.py --optimization 0 --artifacts "$$artifacts"
+	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-pto-native-O2.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/quic-pto.py --optimization 2 --artifacts "$$artifacts"
+
+check-quic-pto-sanitize: build/minyarc tests/quic-pto.py tests/quic-pto.min | build
+	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-pto-sanitize-O1.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/quic-pto.py --optimization 1 --sanitize --artifacts "$$artifacts"
+
+check check-portable check-quic: check-quic-pto
+check-sanitize check-quic-sanitize: check-quic-pto-sanitize
+
 # Pure controller regression; no privileged runner, Docker, or peer provisioning.
 .PHONY: check-quic-interop-results
 check-quic-interop-results:

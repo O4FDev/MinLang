@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Probe actual Make prerequisites under POSIX and native Windows host names."""
+import ast
 import os
 from pathlib import Path
 import shlex
@@ -12,6 +13,82 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class BuildWiring(unittest.TestCase):
+
+
+    def test_handshake_pto_has_native_and_sanitizer_gates(self):
+        import importlib.util
+        import json
+        import re
+        text = (ROOT / 'build-support/checks.mk').read_text()
+        begin = text.index('# Handshake PTO virtual-clock modes')
+        end = text.index('# Pure controller regression', begin)
+        source = text[begin:end]
+        native, sanitize = 'check-quic-pto', 'check-quic-pto-sanitize'
+
+        def verify(fragment):
+            with tempfile.TemporaryDirectory(prefix='minyar PTO wiring ') as folder:
+                makefile = Path(folder) / 'probe.mk'
+                makefile.write_text(fragment + '\n.PHONY: build/minyarc build\n'
+                                   'build/minyarc build:\n\t@echo ARTIFACT $@\n')
+                env = dict(os.environ)
+                env.pop('MAKEFLAGS', None)
+                result = subprocess.run(['make', '-np', '-f', str(makefile), native, sanitize],
+                                        cwd=ROOT, env=env, text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                rules = {}
+                for line in result.stdout.splitlines():
+                    match = re.match(r'^([\w./-]+):\s+(.*)$', line)
+                    if match:
+                        rules.setdefault(match[1], set()).update(match[2].split())
+                for gate in ('check', 'check-portable', 'check-quic'):
+                    self.assertIn(native, rules.get(gate, set()), gate)
+                for gate in ('check-sanitize', 'check-quic-sanitize'):
+                    self.assertIn(sanitize, rules.get(gate, set()), gate)
+                for target in (native, sanitize):
+                    self.assertTrue({'tests/quic-pto.py', 'tests/quic-pto.min', 'build/minyarc'}
+                                    <= rules.get(target, set()), target)
+                commands = result.stdout.split('# GNU Make', 1)[0]
+                self.assertEqual(commands.count('tests/quic-pto.py'), 3)
+                for level in ('0', '1', '2'):
+                    self.assertEqual(commands.count('--optimization ' + level), 1)
+                self.assertEqual(commands.count('--sanitize'), 1)
+                self.assertEqual(commands.count('mktemp -d "'), 3)
+                for suffix in ('native-O0', 'native-O2', 'sanitize-O1'):
+                    self.assertIn((ROOT / 'build' / ('quic-pto-' + suffix)).as_posix(),
+                                  commands.replace('\\', '/'))
+
+        verify(source)
+        for gate in ('check', 'check-portable', 'check-quic', 'check-sanitize', 'check-quic-sanitize'):
+            aggregate = ('check-sanitize check-quic-sanitize: ' + sanitize if
+                         gate in ('check-sanitize', 'check-quic-sanitize') else
+                         'check check-portable check-quic: ' + native)
+            names, dependency = aggregate.split(': ', 1)
+            mutant = source.replace(aggregate, ' '.join(x for x in names.split() if x != gate)
+                                    + ': ' + dependency, 1)
+            with self.subTest(missing_gate=gate), self.assertRaises(AssertionError):
+                verify(mutant)
+        namespace = {}
+        tree = ast.parse((ROOT / 'scripts/check-linux.py').read_text())
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == 'TARGETS':
+                        namespace['TARGETS'] = ast.literal_eval(node.value)
+        for target in (native, sanitize):
+            self.assertEqual(namespace['TARGETS'].count(target), 1)
+        workflow = (ROOT / '.github/workflows/ci.yml').read_text()
+        self.assertIn('check-quic\n', workflow)
+        self.assertIn('check-quic-sanitize\n', workflow)
+        spec = importlib.util.spec_from_file_location('pto_catalogue', ROOT / 'tests/suite-catalogue.py')
+        catalogue = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(catalogue)
+        data = json.loads((ROOT / 'tests/suite-catalogue.json').read_text())
+        catalogue.validate(data, ROOT)
+        for fixture in ('tests/quic-pto.py', 'tests/quic-pto.min'):
+            self.assertIn(fixture, catalogue.discover(ROOT))
+            with self.subTest(missing_source=fixture), self.assertRaises(ValueError):
+                catalogue.validate(dict(data, sources=[x for x in data['sources'] if x['path'] != fixture]), ROOT)
+
 
     def test_registration_exposure_has_required_native_and_sanitizer_gates(self):
         import importlib.util

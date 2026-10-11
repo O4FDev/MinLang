@@ -15,9 +15,9 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 EXTENSIONS = {'.py', '.c', '.h', '.m', '.sh'}
 ROLES = {'suite', 'support', 'fixture', 'manual', 'ungated'}
-# Minyar fixtures normally belong to harnesses. This retained correctness case
-# also has an explicit mandatory disposition, unlike generated Minyar samples.
-REQUIRED_MINYAR_FIXTURES = {'tests/cycle-late-registration.min'}
+# Minyar fixtures normally belong to harnesses. These maintained regressions
+# also have explicit mandatory dispositions, unlike generated Minyar samples.
+REQUIRED_MINYAR_FIXTURES = {'tests/cycle-late-registration.min', 'tests/quic-pto.min'}
 
 
 def discover(root):
