@@ -19,6 +19,7 @@ public constant CLOSED = 2
 public constant FAILED = 3
 record Sent { number: Integer; time: Integer; bytes: Integer; payload: Bytes; path: Integer; recoveryGeneration: Integer; level: Integer; status: Integer; measured: Boolean }
 record Pending { level: Integer; payload: Bytes; probe: Boolean; path: Integer; acknowledgement: Boolean }
+record PolledPayload { payload: Bytes; parsed: wire.Frames; eliciting: Boolean; challenge: Boolean }
 public record Datagram { data: Bytes; pathId: Integer }
 public record Path {
     id: Integer; validated: Boolean; eligible: Boolean; challenge: Bytes
@@ -970,6 +971,43 @@ function pendingPayload(connection: Connection, payload: Bytes): Bytes {
     }
     return result
 }
+// Poll-local metadata is rebuilt each turn because public pending payloads
+// can be changed between polls. Retry filtering still returns copied bytes.
+function polledPayload(connection: Connection, payload: Bytes, filter: Boolean): PolledPayload {
+    let parsed = wire.frames(payload); let result = payload; let changed = false
+    if filter && !parsed.valid { result = Bytes() }
+    for frame in parsed.frames {
+        let keep = true
+        if filter {
+            keep = frame.type != 2 && frame.type != 3
+            if frame.type >= 8 && frame.type <= 15 {
+                let index = streamIndex(connection,frame.stream)
+                if streamRetired(connection,frame.stream) { keep = false }
+                else if index >= 0 {
+                    let output = connection.streams[index]
+                    if output.sendReset || rangeDelivered(output,frame.offset,frame.data.length,frame.fin) { keep = false }
+                }
+            } else if frame.type == 4 {
+                let index = streamIndex(connection,frame.stream)
+                if streamRetired(connection,frame.stream) || (index >= 0 && connection.streams[index].resetAcknowledged) { keep = false }
+            }
+            if frame.type == 25 && !contains(connection.remoteRetireOutstanding,frame.value) { keep = false }
+            if frame.type == 26 {
+                keep = false
+                for path in connection.paths { if path.challenge.length == 8 && equal(path.challenge,frame.data) { keep = true } }
+            }
+        }
+        if !keep && !changed { result = payload.slice(0,frame.start); changed = true }
+        else if keep && changed { result.addBytes(payload.slice(frame.start,frame.end)) }
+    }
+    if changed { parsed = wire.frames(result) }
+    let eliciting = false; let challenge = false
+    for frame in parsed.frames {
+        if frame.type != 0 && frame.type != 2 && frame.type != 3 && frame.type != 28 && frame.type != 29 { eliciting = true }
+        if frame.type == 26 { challenge = true }
+    }
+    return PolledPayload { payload: result; parsed: parsed; eliciting: eliciting; challenge: challenge }
+}
 function retryPayload(connection: Connection, payload: Bytes): Boolean { return pendingPayload(connection,payload).length > 0 }
 function retryPacket(connection: Connection, sent: Sent, probe: Boolean): Boolean {
     let payload = pendingPayload(connection,sent.payload)
@@ -1461,10 +1499,10 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
     persistentLoss(connection)
     let unsent: List<Pending> = []; let handshakeBudgetBlocked = false
     for pending in connection.pending {
+        let inspected = polledPayload(connection,pending.payload,!pending.acknowledgement)
         if !pending.acknowledgement {
-            let filtered = pendingPayload(connection,pending.payload)
-            if filtered.length == 0 { continue }
-            pending.payload = filtered
+            if inspected.payload.length == 0 { continue }
+            pending.payload = inspected.payload
         }
         let level = pending.level; let index = level
         if level == 3 { index = 2; if connection.spaces[2].write.key.length > 0 { level = 2; pending.level = 2 } }
@@ -1474,6 +1512,7 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
         if pending.acknowledgement {
             if !space.ack { space.ackQueued = false; continue }
             pending.payload = ackFrame(space,level,now,true,ackPayloadLimit(connection,level,space.ackPath)); pending.path = space.ackPath
+            inspected = polledPayload(connection,pending.payload,false)
         }
         if keys.key.length == 0 {
             if pending.acknowledgement { unsent.add(pending) }
@@ -1488,11 +1527,7 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
         let path = connection.paths[pathAt]
         let includedAck = pending.acknowledgement
         if level == 2 && !includedAck && space.ack && (space.ackPath < 0 || space.ackPath == route) {
-            let eliciting = false
-            for frame in wire.frames(pending.payload).frames {
-                if frame.type != 0 && frame.type != 2 && frame.type != 3 && frame.type != 28 && frame.type != 29 { eliciting = true }
-            }
-            if eliciting {
+            if inspected.eliciting {
                 // An actual eliciting transmission can acknowledge a lone
                 // packet before the delay deadline, without another datagram.
                 let mixed = ackFrame(space,level,now,false,ackPayloadLimit(connection,level,route)); mixed.addBytes(pending.payload)
@@ -1503,6 +1538,7 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
                 let mixedHeader = packetHeaderPath(connection,level,mixed.length,space.next,route)
                 if mixedHeader.length + mixed.length + 16 <= 1200 {
                     pending.payload = mixed; includedAck = true
+                    inspected = polledPayload(connection,pending.payload,false)
                 }
             }
         }
@@ -1516,17 +1552,13 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
             }
         }
         if level == 2 {
-            let isChallenge = false
-            let frames = wire.frames(pending.payload)
-            for frame in frames.frames { if frame.type == 26 { isChallenge = true } }
-            if isChallenge && (connection.clientRole || path.validated || 3 * path.received - path.sent >= 1200) {
+            if inspected.challenge && (connection.clientRole || path.validated || 3 * path.received - path.sent >= 1200) {
                 payload.resize(max(payload.length, 1200 - header.length - 16)); header = packetHeaderPath(connection, level, payload.length, space.next,route)
             }
         }
         let size = header.length + payload.length + 16
-        let ackEliciting = false
-        let parsed = wire.frames(pending.payload)
-        for frame in parsed.frames { if frame.type != 0 && frame.type != 2 && frame.type != 3 && frame.type != 28 && frame.type != 29 { ackEliciting = true } }
+        let ackEliciting = inspected.eliciting
+        let parsed = inspected.parsed
         if ackEliciting && connection.history.length >= 8192 { unsent.add(pending); continue }
         if (!connection.addressValidated && size > 3 * connection.receivedBytes - connection.sentBytes) ||
            (!connection.clientRole && !path.validated && size > 3 * path.received - path.sent) {
