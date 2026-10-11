@@ -23,11 +23,13 @@ def digest(path):
 def preserve_observations(manifest, evidence, save, failed):
     """Persist raw observations before successful workspace cleanup."""
     manifest["raw_command_records"] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "workspace": str(evidence.path),
         "inputs": evidence.inputs,
         "controls": evidence.controls,
-        "tool_hashes": evidence.tool_hashes,
+        "tool_identity_fields": ["executable", "size", "mtime_ns", "inode"],
+        "tool_hashes": [{"identity": list(identity), "sha256": fingerprint}
+                        for identity, fingerprint in sorted(evidence.tool_hashes.items())],
         "commands": evidence.commands,
     }
     manifest["raw_command_records_retained"] = True
