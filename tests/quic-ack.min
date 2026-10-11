@@ -431,6 +431,18 @@ function main(): Integer {
             }
             let outgoing = quic.pollDatagrams(c,at); let packets: List<Bytes> = []
             for entry in outgoing { if entry.pathId != route { return 55 }; packets.add(entry.data) }
+            // Pacing admits at most two full STREAM packets initially.
+            // Drain the third through the public advertised timer, preserving
+            // the original pacing budget rather than forcing extra credit.
+            if mode == 30 {
+                for attempt in 0..3 {
+                    if c.pending.length == 0 { break }
+                    let next = quic.nextTimer(c)
+                    if next < at || next > at + 25 { return 51 }
+                    at = max(at + 1,next)
+                    for entry in quic.pollDatagrams(c,at) { if entry.pathId != route { return 55 }; packets.add(entry.data) }
+                }
+            }
             let result = wireSize(s,packets)
             if !result.valid || result.maximum > limit { print("ACK and STREAM exceeded MTU " + Text(result.maximum)); return 50 }
             if result.acknowledgements != 1 || result.streams != (length + 999) / 1000 || result.fins != 1 ||
@@ -440,6 +452,25 @@ function main(): Integer {
             let read = quic.readStream(s,id)
             if !errors.bytesOk(read) || crypto.hex(errors.bytesValue(read)) != crypto.hex(body) { return 51 }
             if wireSize(s,quic.poll(c,at + 1)).acknowledgements != 0 { return 51 }
+        }
+    }
+    if mode == 36 {
+        // Adjacent histories straddle the exact encoded boundary: 1199
+        // bytes with 80 ranges fits, 1201 with 81 must split. The limit
+        // comes from the authenticated public transport parameter.
+        for count in 80..82 {
+            let fresh = pair(root,identity,key,client,clientKey); let local = fresh.client; let peer = fresh.server
+            if !local.confirmed || !peer.confirmed || advertisedLimit(local) != 1200 { return 90 }
+            let first = max(peer.spaces[2].next,local.spaces[2].largest + 1)
+            gapped(peer,local,first,count,0,2000)
+            let id = errors.integerValue(quic.openStream(local,false)); let body = bytes(1000)
+            if errors.integerValue(quic.writeStream(local,id,body,true)) != 1000 { return 90 }
+            let packets = quic.poll(local,2000); let result = wireSize(peer,packets)
+            if !result.valid || result.maximum > 1200 { print("encoded boundary exceeded MTU " + Text(result.maximum)); return 57 }
+            if result.acknowledgements != 1 || result.streams != 1 || result.fins != 1 ||
+               crypto.hex(result.data) != crypto.hex(body) || local.flight != result.elicitingBytes || local.flight != flightBytes(local) { return 57 }
+            if (count == 80 && (result.maximum != 1199 || result.packets != 1)) ||
+               (count == 81 && result.packets != 2) || local.spaces[2].ack || local.pending.length != 0 { return 57 }
         }
     }
     print("ACK case " + Text(mode)); return 0
