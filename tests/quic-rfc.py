@@ -355,6 +355,13 @@ def verify_link(directory, binary, sanitize, optimization='0', compiler_identity
             and address_sanitizer_enabled(actual[1:-2]) is sanitize
             and not any(value.startswith('@') for value in actual[1:-2]),
             'actual argv overrides requested optimization or sanitizer mode')
+    # The requested prefix owns both ASan and UBSan. Additional enable/disable
+    # options could alter either set, including a disable followed by re-enable;
+    # reject them instead of treating ASan's state as proof of the entire set.
+    sanitizer_options = lambda values: [
+        value for value in values if value.startswith(('-fsanitize=', '-fno-sanitize='))]
+    require(sanitizer_options(actual[1:-2]) == sanitizer_options(report['link_flags']),
+            'actual argv changes the exact requested sanitizer options')
     ir_inputs = [value for value in command[1:] if value.endswith(('.ll', '.bc'))]
     require(ir_inputs == [linked_original], 'extra or missing program/runtime LLVM input')
     inputs = report.get('inputs')
@@ -456,7 +463,10 @@ def bound_copy(source, target):
 def verify_driver_artifacts(directory, kind, parsed, cases, binaries, source_inputs, observed_tools=None):
     manifest = json.loads((directory / 'manifest.json').read_text())
     require(exact_integer(manifest.get('schema_version')) and manifest['schema_version'] == 1
-            and manifest.get('status') == 'passed', 'author artifact manifest did not pass')
+            and manifest.get('status') == 'passed'
+            and manifest.get('finalization_errors') == []
+            and manifest.get('unhashed_files') == [],
+            'author artifact manifest did not pass complete retention')
     require(json.loads((directory / 'results.json').read_text()) == parsed,
             'printed author results differ from retained results')
     cases = cases if cases is not None else parsed.get('declared_cases')
