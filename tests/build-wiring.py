@@ -1755,9 +1755,12 @@ class BuildWiring(unittest.TestCase):
             with self.assertRaises((ValueError, subprocess.CalledProcessError)):
                 checker.verify_runner(external)
             self.assertEqual(set(external.rglob('*')), before)
-        with patch.object(checker.importlib.metadata, 'version', return_value='0'):
-            with self.assertRaises(ValueError):
-                checker.verify_python(ROOT/'tests/interop/qns/controls-requirements.txt')
+        with tempfile.TemporaryDirectory(prefix='wrong wheel version route ') as folder:
+            with patch.object(checker.sys, 'pycache_prefix', folder), \
+                    patch.object(checker.sys, 'dont_write_bytecode', True), \
+                    patch.object(checker.importlib.metadata, 'version', return_value='0'):
+                with self.assertRaisesRegex(ValueError, 'PyYAML version differs'):
+                    checker.verify_python(ROOT/'tests/interop/qns/controls-requirements.txt')
         for version in ((3, 11), (3, 13), (3, 14)):
             with patch.object(checker.sys, 'version_info', version):
                 with self.subTest(unverified_abi=version), self.assertRaises(ValueError):
@@ -1786,7 +1789,9 @@ class BuildWiring(unittest.TestCase):
             with patch.object(checker.sys, 'pycache_prefix', str(cache)), \
                     patch.object(checker.sys, 'dont_write_bytecode', True), \
                     patch.object(checker.importlib.util, 'find_spec',
-                                 return_value=SimpleNamespace(origin=str(module))), \
+                                 return_value=SimpleNamespace(
+                                     origin=str(module),
+                                     loader=checker.importlib.machinery.SourceFileLoader('yaml', str(module)))), \
                     patch.object(checker.importlib.metadata, 'version', return_value='6.0.2'), \
                     patch.object(checker.importlib.metadata, 'distribution',
                                  return_value=distribution), \
@@ -1845,6 +1850,27 @@ class BuildWiring(unittest.TestCase):
                 self.assertEqual(selections[0][1], selections[1][1])
                 self.assertEqual(report['git_environment'],
                                  {key: value for key, value in clean.items() if key.startswith('GIT_')})
+                for tamper in ('poisoned route', 'missing route report', 'failed verification'):
+                    calls = []
+                    def poisoned_preflight(argv, **kwargs):
+                        calls.append(list(argv))
+                        cache = Path(argv[4].split('=', 1)[1])
+                        result = {'verified': True, 'runner': {'verified': True},
+                                  'python': {'verified': True,
+                                             'bytecode_route': {'prefix': str(cache),
+                                                                'dont_write_bytecode': True}}}
+                        if tamper == 'poisoned route':
+                            (cache/'unexpected.pyc').write_bytes(b'not fresh')
+                        elif tamper == 'missing route report':
+                            result['python'].pop('bytecode_route')
+                        else:
+                            result['verified'] = False
+                        return subprocess.CompletedProcess(argv, 0, json.dumps(result).encode(), b'')
+                    with patch.object(checker.subprocess, 'run', side_effect=poisoned_preflight):
+                        with self.subTest(tamper=tamper), self.assertRaises(ValueError):
+                            checker.run_controls(repository, checker.REQUIREMENTS,
+                                                 root/('refused-'+tamper.replace(' ', '-')))
+                    self.assertEqual(len(calls), 1)
                 with patch.object(checker.Commands, 'run') as launched:
                     with self.assertRaises(ValueError):
                         checker.run_controls(repository, checker.REQUIREMENTS, root/'run')
@@ -1858,7 +1884,8 @@ class BuildWiring(unittest.TestCase):
             module.write_text("__version__='6.0.2'\nSOURCE_MARKER='verified source'\n")
             altered = root/'altered.py'
             altered.write_text("__version__='6.0.2'\nSOURCE_MARKER='altered valid cache'\n")
-            cached = Path(importlib.util.cache_from_source(str(module)))
+            with patch.object(sys, 'pycache_prefix', None):
+                cached = Path(importlib.util.cache_from_source(str(module)))
             cached.parent.mkdir()
             py_compile.compile(str(altered), cfile=str(cached), doraise=True,
                                invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)

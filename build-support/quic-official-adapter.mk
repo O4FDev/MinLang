@@ -19,8 +19,7 @@ build/quic-official-controls-venv/.ready.json: | build scripts/check-quic-offici
 
 check-quic-official-adapter: $(QUIC_OFFICIAL_INPUTS) $(QUIC_OFFICIAL_RUNNER_BOOTSTRAP) $(QUIC_OFFICIAL_PYTHON_BOOTSTRAP) | build
 	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-official-adapter.XXXXXXXX"); \
-	$(LIMITED) "$(QUIC_OFFICIAL_PYTHON)" -E scripts/check-quic-official-inputs.py verify --repository "$(QUIC_OFFICIAL_RUNNER)" --requirements "tests/interop/qns/controls-requirements.txt" --report "$$artifacts/inputs.json"; \
-	$(LIMITED) "$(QUIC_OFFICIAL_PYTHON)" -E tests/quic-official-adapter.py --pinned-runner "$(QUIC_OFFICIAL_RUNNER)" --artifacts "$$artifacts/run"
+	$(LIMITED) "$(QUIC_OFFICIAL_PYTHON)" -E scripts/check-quic-official-inputs.py controls --repository "$(QUIC_OFFICIAL_RUNNER)" --requirements "tests/interop/qns/controls-requirements.txt" --report "$$artifacts/inputs.json" --artifacts "$$artifacts/run"
 
 check check-portable check-quic check-quic-sanitize check-quic-rfc check-quic-rfc-sanitize check-sanitize: check-quic-official-adapter
 else

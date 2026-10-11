@@ -12,6 +12,8 @@ import ctypes
 import hashlib
 import importlib
 import importlib.metadata
+import importlib.machinery
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -24,6 +26,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT/'tests/interop/qns/owned_adapter.py'
+DRIVER = ROOT/'tests/quic-official-adapter.py'
 PIN = '740c05a10b61d65e8abd3ad38d60898004d335d9'
 URL = 'https://github.com/quic-interop/quic-interop-runner.git'
 PRIMARY_NAMES = ('run.py', 'interop.py', 'testcase.py', 'testcases_quic.py',
@@ -40,8 +43,9 @@ def binding(path):
             'bytes': len(data)}
 
 
-def git_environment():
-    environment = {key: value for key, value in os.environ.items()
+def git_environment(source=None):
+    source = os.environ if source is None else source
+    environment = {key: value for key, value in source.items()
                    if not key.startswith('GIT_')}
     environment.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
                        GIT_NO_REPLACE_OBJECTS='1', GIT_TERMINAL_PROMPT='0')
@@ -49,15 +53,17 @@ def git_environment():
 
 
 class Commands:
-    def __init__(self):
+    def __init__(self, environment=None):
         self.rows = []
+        # This same routing policy is used by verification and control children.
+        self.environment = git_environment(environment)
         COMMAND_LOGS.append(self.rows)
 
     def run(self, argv, timeout=30):
         tool = Path(shutil.which(str(argv[0])) or str(argv[0])).resolve()
         before = binding(tool)
         try:
-            result = subprocess.run(argv, env=git_environment(), stdin=subprocess.DEVNULL,
+            result = subprocess.run(argv, env=self.environment, stdin=subprocess.DEVNULL,
                                     capture_output=True, timeout=timeout)
         except subprocess.TimeoutExpired as error:
             self.rows.append({'argv': list(map(str, argv)), 'timeout_seconds': timeout,
@@ -229,7 +235,31 @@ def requirements_contract(path):
             'requirements': binding(path)}
 
 
+def require_empty_pycache(prefix):
+    if prefix is None:
+        raise ValueError('fresh bytecode route is required')
+    path = Path(prefix)
+    if (not path.is_absolute() or not path.is_dir() or path.is_symlink() or
+            path.resolve() != path or any(path.iterdir())):
+        raise ValueError('bytecode route must be an existing empty absolute directory')
+    return path
+
+
+def import_route():
+    if sys.dont_write_bytecode is not True:
+        raise ValueError('controls must disable bytecode writes on the fresh route')
+    prefix = require_empty_pycache(sys.pycache_prefix)
+    if any(name == 'yaml' or name.startswith('yaml.') for name in sys.modules):
+        raise ValueError('controls YAML must be imported freshly from verified source')
+    return {'prefix': str(prefix), 'dont_write_bytecode': True}
+
+
+def fresh_python_argv(python, arguments, prefix):
+    prefix = require_empty_pycache(prefix)
+    return [str(python), '-E', '-B', '-X', 'pycache_prefix='+str(prefix)]+list(arguments)
+
 def verify_python(requirements):
+    route = import_route()
     contract = requirements_contract(requirements)
     actual = importlib.metadata.version('PyYAML')
     if actual != contract['version']:
@@ -251,6 +281,12 @@ def verify_python(requirements):
             hashlib.sha256(path.read_bytes()).digest()).decode().rstrip('=')
         if actual_hash != name.hash.value:
             raise ValueError('controls distribution bytes differ from its wheel record')
+    spec = importlib.util.find_spec('yaml')
+    if (spec is None or spec.origin is None or
+            Path(spec.origin).resolve() not in paths or
+            not isinstance(spec.loader, importlib.machinery.SourceFileLoader)):
+        raise ValueError('controls YAML must load a verified source file')
+    require_empty_pycache(route['prefix'])
     yaml = importlib.import_module('yaml')
     module = Path(yaml.__file__).resolve()
     if module not in paths or yaml.__version__ != contract['version']:
@@ -258,11 +294,12 @@ def verify_python(requirements):
     after = [binding(path) for path in paths]
     if before != after:
         raise ValueError('controls distribution bytes changed during import')
+    require_empty_pycache(route['prefix'])
     return {'verified': True, 'scope': 'new controls dependency; not historical107 binding',
             'contract': contract, 'python': binding(Path(sys.executable).resolve()),
             'implementation': sys.implementation.name,
             'python_version': platform.python_version(), 'packages': before,
-            'module': binding(module)}
+            'module': binding(module), 'bytecode_route': route}
 
 
 def require_supported_python():
@@ -328,28 +365,79 @@ def prepare_python(directory, requirements):
     python = directory/'bin/python'
     commands.run([str(python), '-E', '-m', 'pip', '--disable-pip-version-check',
                   'install', '--only-binary=:all:', '-r', str(requirements)], timeout=180)
-    raw = commands.run([str(python), '-E', str(Path(__file__).resolve()),
-                        'verify-python', '--requirements', str(requirements)], timeout=30)
+    prefix = Path(tempfile.mkdtemp(prefix='verified-source.', dir=directory))
+    raw = commands.run(fresh_python_argv(
+        python, [str(Path(__file__).resolve()), 'verify-python',
+                 '--requirements', str(requirements)], prefix), timeout=30)
     report = json.loads(raw)
     if (not isinstance(report, dict) or report.get('verified') is not True or
             report.get('contract') != requirements_contract(requirements) or
             not report.get('packages') or report.get('implementation') != 'cpython' or
             report.get('python') != binding(python.resolve()) or
-            report.get('module') not in report['packages']):
+            report.get('module') not in report['packages'] or
+            report.get('bytecode_route') != {'prefix': str(prefix),
+                                             'dont_write_bytecode': True}):
         raise ValueError('controls import verification did not produce readiness')
+    require_empty_pycache(prefix)
     write_ready(directory/'.ready.json', report)
     return {'verified': True, 'published': str(directory),
             'preparation_commands': commands.rows, 'python': report}
 
 
+def run_controls(repository, requirements, artifacts):
+    repository, artifacts = Path(repository), Path(artifacts)
+    if (not repository.is_absolute() or not repository.is_dir() or
+            not artifacts.is_absolute() or artifacts.exists() or
+            not artifacts.parent.is_dir() or artifacts.parent.resolve() != artifacts.parent):
+        raise ValueError('controls need an explicit repository and fresh absolute artifacts')
+    requirements_contract(requirements)
+    sources = [Path(__file__).resolve(), HELPER, DRIVER, Path(requirements)]
+    before = [binding(path) for path in sources]
+    prefix = Path(tempfile.mkdtemp(prefix='verified-source.', dir=artifacts.parent))
+    environment = git_environment()
+    commands = Commands(environment)
+    raw = commands.run(fresh_python_argv(
+        sys.executable, [str(Path(__file__).resolve()), 'verify',
+                         '--repository', str(repository),
+                         '--requirements', str(requirements)], prefix))
+    inputs = json.loads(raw)
+    route = {'prefix': str(prefix), 'dont_write_bytecode': True}
+    if (not isinstance(inputs, dict) or inputs.get('verified') is not True or
+            not isinstance(inputs.get('runner'), dict) or
+            not isinstance(inputs.get('python'), dict) or
+            inputs['runner'].get('verified') is not True or
+            inputs['python'].get('verified') is not True or
+            inputs['python'].get('bytecode_route') != route):
+        raise ValueError('fresh verified inputs are required before controls')
+    require_empty_pycache(prefix)
+    if before != [binding(path) for path in sources]:
+        raise ValueError('control sources changed before launch')
+    # No new control timeout: the unchanged ordinary limiter owns the full gate.
+    # Exact accepted driver, no --case or real-Docker option: all 107 safe controls.
+    commands.run(fresh_python_argv(
+        sys.executable, [str(DRIVER), '--pinned-runner', str(repository),
+                         '--artifacts', str(artifacts)], prefix), timeout=None)
+    require_empty_pycache(prefix)
+    after = [binding(path) for path in sources]
+    if before != after:
+        raise ValueError('control sources changed during launch')
+    return {'verified': True, 'scope': 'all107 safe/mock controls; no Docker authority',
+            'inputs': inputs, 'sources_before': before, 'sources_after': after,
+            'bytecode_route': route,
+            'git_environment': {key: value for key, value in environment.items()
+                                if key.startswith('GIT_')},
+            'commands': commands.rows}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode', choices=('prepare-runner', 'prepare-python',
-                                        'verify-python', 'verify'))
+                                        'verify-python', 'verify', 'controls'))
     parser.add_argument('--repository', type=Path)
     parser.add_argument('--directory', type=Path)
     parser.add_argument('--requirements', type=Path, default=REQUIREMENTS)
     parser.add_argument('--report', type=Path)
+    parser.add_argument('--artifacts', type=Path)
     options = parser.parse_args()
     require_linux()
     require_supported_python()
@@ -366,6 +454,10 @@ def main():
         report = prepare_python(options.directory, options.requirements)
     elif options.mode == 'verify-python':
         report = verify_python(options.requirements)
+    elif options.mode == 'controls':
+        if options.repository is None or options.artifacts is None:
+            parser.error('--repository and --artifacts required')
+        report = run_controls(options.repository, options.requirements, options.artifacts)
     else:
         if options.repository is None:
             parser.error('--repository required')
