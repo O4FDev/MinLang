@@ -501,6 +501,68 @@ POLICY_CONTRACT={
 }
 
 
+
+def checked_link_graph(build,root,retention):
+    """Validate native Linux schema2 bytes and complete actual link arguments."""
+    if build.get("schema")!=2 or type(build.get("schema")) is not int or build.get("mode")!="native" or build.get("optimization")!="2":
+        raise CoverageError("reviewed native O2 schema2 build required")
+    if build.get("link_attempted") is not True or type(build.get("link_status")) is not int or build["link_status"]!=0 or type(build.get("link_subprocess_status")) is not int or build["link_subprocess_status"]!=0 or build.get("retention_errors")!=[]:
+        raise CoverageError("successful retained link required")
+    if build.get("link_flags")!=["-O2","-Wno-override-module"] or build.get("lto_flags")!=[] or build.get("address_sanitizer_enabled") is not False:
+        raise CoverageError("unexpected native link flags")
+    def retained(value,epochs=True):
+        name=value.get("retained")
+        if not isinstance(name,str) or not name or Path(name).is_absolute() or ".." in Path(name).parts:
+            raise CoverageError("invalid retained build path")
+        data=retention.capture(root/name);digest=sha(data)
+        fields=("sha256","source_before_sha256","retained_sha256","source_after_sha256","pre_link_sha256","post_link_sha256") if epochs else ("sha256",)
+        if type(value.get("bytes")) is not int or value["bytes"]!=len(data) or any(value.get(field)!=digest for field in fields):
+            raise CoverageError("build input bytes or before/copy/after binding mismatch")
+        return data
+    program=build.get("program_input",{});raw=build.get("raw_program_input",{})
+    if program.get("role")!="program" or program.get("format")!="llvm":
+        raise CoverageError("one generated LLVM program required")
+    raw_data=retained(raw);program_data=retained(program)
+    if raw_data!=program_data or sha(raw_data)!=build.get("raw_sha256") or sha(program_data)!=build.get("linked_program_sha256"):
+        raise CoverageError("native program LLVM identity mismatch")
+    inputs=build.get("inputs")
+    if not isinstance(inputs,list) or len(inputs)!=7 or [item.get("role") for item in inputs]!=["runtime"]+["provider"]*6:
+        raise CoverageError("one runtime and six represented provider objects required")
+    originals=[program.get("original")]+[item.get("original") for item in inputs]
+    if any(not isinstance(path,str) or not Path(path).is_absolute() for path in originals) or len(set(originals))!=len(originals):
+        raise CoverageError("ambiguous original build inputs")
+    for item in inputs:
+        if item.get("format")!="native_object":raise CoverageError("native runtime/provider object required")
+        retained(item)
+    pinned={"clang-driver.py":"c30f69207d809558af9affe4d2a354e759b49b5c6fd74b9c5884a7529baad6af",
+            "sanitizer_llvm.py":"4d74874d1119abb31d68af4a733f9e3e90aa7788f2a767678672226592f2c3a2"}
+    tools=build.get("tool_bindings",{})
+    if set(tools)!={"clang-driver.py","sanitizer_llvm.py","clang.bin"}:raise CoverageError("complete retained compiler/tool bindings required")
+    for name,value in tools.items():
+        data=retained(value,False);digest=sha(data)
+        if any(value.get(field)!=digest for field in ("source_before_sha256","retained_sha256","source_after_sha256")) or build.get("tools",{}).get(name)!=digest:
+            raise CoverageError("tool before/copy/after bytes mismatch")
+        if name in pinned and digest!=pinned[name]:raise CoverageError("unreviewed canonical link tool")
+    compiler=build.get("compiler_pre_link",{})
+    if compiler.get("selected_command")!=build.get("compiler_selected_command") or compiler.get("resolved_path")!=tools["clang.bin"].get("original") or compiler.get("sha256")!=tools["clang.bin"].get("sha256"):
+        raise CoverageError("actual compiler command or bytes not bound")
+    if Path(compiler.get("selected_command","")).resolve()!=Path(compiler.get("resolved_path","")).resolve():
+        raise CoverageError("selected compiler resolves to different bytes")
+    staged=build.get("staged_output",{});final=build.get("final_output",{})
+    if not all(isinstance(item.get("path"),str) and Path(item["path"]).is_absolute() for item in (staged,final)):
+        raise CoverageError("staged/final build output paths required")
+    final_path=Path(final["path"]);staged_path=Path(staged["path"])
+    if staged_path.name!=final_path.name or staged_path.parent.parent!=final_path.parent or not staged_path.parent.name.startswith(".minyar-link-") or staged_path==final_path:
+        raise CoverageError("unexpected staged output location")
+    object_paths=[item["original"] for item in inputs]
+    expected=[compiler["selected_command"],*build["link_flags"],program["original"],*object_paths[:3],"-lcrypto",*object_paths[3:],"-lcrypto","-lm"]
+    if build.get("command")!=expected or build.get("actual_command")!=expected+["-o",staged["path"]] or build.get("staged_requested_path")!=staged["path"]:
+        raise CoverageError("complete actual linker argv or staging mismatch")
+    final_data=retained(final,False);staged_data=retained(staged,False)
+    if final_data!=staged_data or build.get("binary_sha256")!=sha(final_data):
+        raise CoverageError("staged/final output bytes differ")
+    return {"status":"checked-byte-graph","binary_sha256":sha(final_data),"bytes":len(final_data)}
+
 def checked_policy_receipt(args,retention):
     """Check the graph; policy-file existence alone supplies no policy authority."""
     if args.policy_receipt is None:raise CoverageError("checked source/build/run/captured-endpoint policy receipt absent")
@@ -524,6 +586,7 @@ def checked_policy_receipt(args,retention):
     build=json.loads(retention.expected(receipt["build_receipt"]))
     if build.get("schema")!=2 or type(build.get("link_status")) is not int or build["link_status"]!=0 or build.get("retention_errors")!=[]:
         raise CoverageError("successful checked schema2 build receipt absent")
+    checked_link_graph(build,Path(receipt["build_receipt"]["path"]).parent,retention)
     final=build.get("final_output",{})
     if final.get("sha256")!=sha(binary) or final.get("bytes")!=len(binary):
         raise CoverageError("source build output is not captured server binary")
@@ -548,9 +611,11 @@ def checked_policy_receipt(args,retention):
     if not isinstance(inspect,list) or len(inspect)!=1:raise CoverageError("exact single captured endpoint inspect absent")
     endpoint=inspect[0];container=run.get("container_id")
     labels=endpoint.get("Config",{}).get("Labels",{})
-    if endpoint.get("Id")!=container or len(container or "")!=64 or endpoint.get("Image")!=run.get("image_id"):
+    import re
+    if not isinstance(container,str) or re.fullmatch(r"[0-9a-f]{64}",container) is None or not isinstance(run.get("image_id"),str) or re.fullmatch(r"sha256:[0-9a-f]{64}",run["image_id"]) is None or endpoint.get("Id")!=container or endpoint.get("Image")!=run["image_id"]:
         raise CoverageError("actual endpoint/image identity mismatch")
-    if labels.get("com.docker.compose.project")!=run.get("project") or labels.get("com.docker.compose.service")!="server":
+    project=run.get("project");nonce=run.get("ownership_nonce")
+    if not isinstance(project,str) or re.fullmatch(r"minyar-qns-[0-9a-f]{24}",project) is None or not isinstance(nonce,str) or re.fullmatch(r"[0-9a-f]{64}",nonce) is None or endpoint.get("Name")!="/"+project+"-server" or labels.get("io.minyar.qns.owner")!=nonce or labels.get("com.docker.compose.project")!=project or labels.get("com.docker.compose.service")!="server":
         raise CoverageError("captured endpoint ownership mismatch")
     environment={}
     for item in endpoint.get("Config",{}).get("Env",[]):

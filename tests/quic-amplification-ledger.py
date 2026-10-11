@@ -20,7 +20,9 @@ CASES=("exact3x","one-byte-over","forged-handshake","invalid-handshake-frame","c
        "server-before-credit","missing-authenticated-boundary","closing-handshake","ack-never-sent","ack-issued-handshake","missing-server-keylog","pcapng-capture-loss","pcapng-dropcount","pcapng-multiple-interface","handshake-replay-same-route","handshake-replay-new-route",
        "fresh-handshake-new-route","nonminimal-frame-type","crypto-end-overflow","crypto-wide-length","pcap-time-decrease","pcapng-time-decrease",
        "pcap-nanoseconds","pcapng-decimal-resolution","pcapng-binary-resolution","pcapng-time-offset","pcap-invalid-subsecond","cli-unbound-policy","cli-retained-input-binding","cli-retained-mutation","cli-original-mutation",
-       "cli-missing-input","cli-provider-error","cli-primary-finalization-error","initial-token-policy-unknown")
+       "cli-missing-input","cli-provider-error","cli-primary-finalization-error","initial-token-policy-unknown",
+       "receipt-byte-graph","receipt-runtime-missing","receipt-provider-changed","receipt-extra-link-input","receipt-compiler-mismatch",
+       "receipt-flags-mismatch","receipt-tool-changed","receipt-staging-mismatch","receipt-extra-program","receipt-final-mismatch")
 CLIENT=b"client01";SERVER=b"server01";ORIGINAL=b"original"
 SECRET=bytes(range(32));RANDOM=bytes(range(32,64))
 CLIENT2=b"client02";SERVER2=b"server02"
@@ -196,6 +198,7 @@ def fixtures(case):
 
 def run_case(case,target=None):
     if case.startswith("cli-"):return cli_control(case,target)
+    if case.startswith("receipt-"):return receipt_graph_control(case,target)
     if case=="rfc-chacha-vector":
         secret=bytes.fromhex("9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b")
         hp=ledger.expand(secret,b"quic hp",32,hashlib.sha256)
@@ -241,6 +244,57 @@ def run_case(case,target=None):
         report["control_checks"]={"exact_declared_timestamp_resolution":report["rows"][0].get("timestamp_exact")==expected_time[case]}
     return data,logs,report,expected
 
+
+
+def receipt_graph_control(case,target):
+    """Mock byte-graph metadata only; never an owned-run policy receipt."""
+    import copy
+    root=Path(ledger.__file__).resolve().parent.parent
+    build_root=target/"build";build_root.mkdir()
+    def item(name,data,original,role=None,format=None):
+        (build_root/name).write_bytes(data);digest=ledger.sha(data)
+        value={"original":str(original),"retained":name,"sha256":digest,"bytes":len(data)}
+        value.update({field:digest for field in ("source_before_sha256","retained_sha256","source_after_sha256","pre_link_sha256","post_link_sha256")})
+        if role:value["role"]=role
+        if format:value["format"]=format
+        return value
+    raw=item("program.raw.ll",b"define i32 @main() { ret i32 0 }\n",target/"server.ll","program","llvm")
+    objects=[item("runtime.o",b"mock-runtime",target/"runtime.o","runtime","native_object")]
+    objects += [item("native-"+str(n)+".o",("mock-provider-"+str(n)).encode(),target/("provider-"+str(n)+".o"),"provider","native_object") for n in range(6)]
+    tools={}
+    for name,path in (("clang-driver.py",root/"tools/clang-driver.py"),("sanitizer_llvm.py",root/"tools/sanitizer_llvm.py"),("clang.bin",Path("/usr/bin/clang-18").resolve())):
+        tools[name]=item(name,path.read_bytes(),path.resolve())
+    staged_path=target/".minyar-link-control"/"server"
+    final=item("program",b"mock-linked-output",target/"server")
+    staged=item("program.staged",b"mock-linked-output",staged_path)
+    final["path"]=str(target/"server");staged["path"]=str(staged_path)
+    command=["/usr/bin/clang-18","-O2","-Wno-override-module",raw["original"],*[value["original"] for value in objects[:3]],"-lcrypto",*[value["original"] for value in objects[3:]],"-lcrypto","-lm"]
+    build={"schema":2,"mode":"native","optimization":"2","link_attempted":True,"link_status":0,"link_subprocess_status":0,"retention_errors":[],
+           "link_flags":["-O2","-Wno-override-module"],"lto_flags":[],"address_sanitizer_enabled":False,"raw_program_input":copy.deepcopy(raw),"program_input":raw,
+           "inputs":objects,"tools":{name:value["sha256"] for name,value in tools.items()},"tool_bindings":tools,
+           "raw_sha256":raw["sha256"],"linked_program_sha256":raw["sha256"],"compiler_selected_command":"/usr/bin/clang-18",
+           "compiler_pre_link":{"selected_command":"/usr/bin/clang-18","resolved_path":tools["clang.bin"]["original"],"sha256":tools["clang.bin"]["sha256"]},
+           "command":command,"actual_command":command+["-o",str(staged_path)],"staged_requested_path":str(staged_path),
+           "staged_output":staged,"final_output":final,"binary_sha256":final["sha256"]}
+    if case=="receipt-runtime-missing":build["inputs"]=objects[1:]
+    elif case=="receipt-provider-changed":(build_root/"native-0.o").write_bytes(b"changed provider")
+    elif case=="receipt-extra-link-input":build["actual_command"].insert(-2,str(target/"unrepresented.o"))
+    elif case=="receipt-compiler-mismatch":build["compiler_pre_link"]["selected_command"]="/different/compiler"
+    elif case=="receipt-flags-mismatch":build["actual_command"].insert(1,"-O0")
+    elif case=="receipt-tool-changed":(build_root/"clang-driver.py").write_bytes(b"changed tool")
+    elif case=="receipt-staging-mismatch":build["actual_command"][-1]=str(target/"server")
+    elif case=="receipt-extra-program":build["actual_command"].insert(-2,raw["original"])
+    elif case=="receipt-final-mismatch":(build_root/"program").write_bytes(b"different output")
+    (target/"mock-build.json").write_text(json.dumps(build,indent=2)+"\n")
+    evidence=target/"checked-inputs";evidence.mkdir();retention=ledger.InputRetention(evidence)
+    try:
+        result=ledger.checked_link_graph(build,build_root,retention)
+        report={"status":"passed","graph":result}
+    except ledger.CoverageError as error:report={"status":"coverage-limited","reason":str(error)}
+    report["scope"]="mock byte-graph validation only; no endpoint ran and no official policy authority"
+    report["retained_inputs"]=retention.inputs
+    (target/"retention.json").write_text(json.dumps(retention.inputs,indent=2)+"\n")
+    return b"",b"",report,"passed" if case=="receipt-byte-graph" else "coverage-limited"
 
 def cli_control(case,target):
     import subprocess,sys
