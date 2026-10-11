@@ -123,6 +123,28 @@ int main(int argc, char **argv) {
         minyar_rc_release(nodes[i]);
     drain();
     assert(rc_object_count == N);
+#ifdef MINYAR_BOUNDED_RC
+    /* Sharing the queues with ordinary owning-slot cleanup never permits
+     * the cycle deadline to delay that cleanup. This survives budgets that
+     * can dispose of the small ordinary-only fixture in one batch. */
+    MinyarRecord *wide = minyar_record_new(4096);
+    MinyarRecord *child = minyar_record_new_scalar(1);
+    for (unsigned i = 0; i < 4096; i++)
+        minyar_record_set_reference(wide, i, slot(child));
+    minyar_rc_release(child);
+    minyar_rc_release(wide);
+    minyar_rc_retain_traced(nodes[1]);
+    /* The low-level drop separates mutation from its following service
+     * point, so even a small cohort and large budget start with both jobs. */
+    rc_drop(nodes[1]);
+    assert(rc_pending_count > 1 && rc_cycle_pending);
+    while (pending()) {
+        long long wait = service_wait(-1);
+        if (rc_pending_count > (size_t)(rc_cycle_pending != 0))
+            assert(wait == 0);
+    }
+    assert(rc_object_count == N);
+#endif
     /* A large live cohort must not force the reactor to spin until its
      * final field. Pacing applies after each bounded cycle-only batch,
      * including ROOTS/MARK/SWEEP, while the real job stays queued. */
@@ -132,6 +154,12 @@ int main(int argc, char **argv) {
         minyar_rc_release(nodes[1]);
         assert(pending() && rc_cycle_phase != RC_CYCLE_IDLE);
         assert(rc_cycle_completed == completed);
+        size_t units = rc_cycle_units;
+        const long long invalid[] = {LLONG_MIN, -2, 2147483648LL, LLONG_MAX};
+        for (size_t i = 0; i < sizeof(invalid) / sizeof(*invalid); i++) {
+            assert(minyar_callbackruntime_serviceWait(invalid[i]) == invalid[i]);
+            assert(rc_cycle_units == units && pending());
+        }
         const long long timeouts[] = {-1, 20, 1, 0};
         for (size_t i = 0; i < sizeof(timeouts) / sizeof(*timeouts); i++) {
             long long wait = service_wait(timeouts[i]);
