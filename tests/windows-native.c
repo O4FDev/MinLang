@@ -212,6 +212,22 @@ int main(int argc, char **argv) {
         minyar_windows_text(field);
         assert(!"stale child handle accepted");
     }
+    // Grow the handle table, reuse disposed slots, and dispose nested controls
+    // before native menu removal can synchronously request another layout.
+    for (unsigned round = 0; round < 3; round++) {
+        long long owned = minyar_windows_window(name, 400, 200);
+        assert(owned != window);
+        long long content = minyar_windows_column(owned, 1);
+        for (unsigned index = 0; index < 256; index++)
+            minyar_windows_label(content, unicode);
+        long long owned_menu = minyar_windows_menu(owned, name);
+        minyar_windows_menuItem(owned_menu, unicode, empty);
+        minyar_windows_show(owned);
+        minyar_windows_destroy(owned);
+        while (minyar_windows_nextEvent(0) && minyar_windows_eventType() != 0) {
+            assert(minyar_windows_eventSource() != owned);
+        }
+    }
     minyar_windows_quit();
     assert(minyar_windows_nextEvent(0) && minyar_windows_eventType() == 5);
     assert(!minyar_windows_nextEvent(0));
