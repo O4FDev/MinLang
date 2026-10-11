@@ -9,6 +9,8 @@ import sys
 import tempfile
 import unittest
 
+from clang_helpers import native_path
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -23,7 +25,7 @@ class ToolchainStamp(unittest.TestCase):
             shutil.copy2(sys.executable, first)
             shutil.copy2(sys.executable, second)
             stamp = work / "stamp.json"
-            environment = {**os.environ, "CC": str(first), "LLVM_CC": str(first)}
+            environment = {**os.environ, "CC": native_path(first), "LLVM_CC": native_path(first)}
 
             def probe():
                 result = subprocess.run(
@@ -35,7 +37,7 @@ class ToolchainStamp(unittest.TestCase):
 
             original = probe()
             self.assertEqual(probe(), original)
-            environment["LLVM_CC"] = str(second)
+            environment["LLVM_CC"] = native_path(second)
             changed = probe()
             self.assertNotEqual(changed[0], original[0])
             self.assertGreater(changed[1] // 1_000_000_000, original[1] // 1_000_000_000,

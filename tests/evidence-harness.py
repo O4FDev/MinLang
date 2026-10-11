@@ -185,7 +185,7 @@ with Evidence("stdin-parent") as evidence:
                 evidence.run(command, input='payload', timeout=5)
             self.assertEqual(evidence.commands, [])
             observed = evidence.run(command, stdin=subprocess.PIPE, timeout=5)
-            self.assertEqual(observed.stdout, b'0\n')
+            self.assertEqual(observed.stdout, b'0' + os.linesep.encode())
             self.assertEqual(evidence.commands[0]['stdin'], {'mode': 'input', 'base64': ''})
 
     def test_replay_refuses_inherited_or_unrecorded_stdin(self):
@@ -211,7 +211,7 @@ with Evidence("stdin-parent") as evidence:
         row = json.loads((evidence.path / 'evidence.json').read_text())['commands'][0]
         self.assertTrue(row['timed_out'])
         self.assertEqual(base64.b64decode(row['stdin']['base64']), payload)
-        self.assertEqual(base64.b64decode(row['stdout_base64']), b'ready\n')
+        self.assertEqual(base64.b64decode(row['stdout_base64']), b'ready' + os.linesep.encode())
 
     def test_output_reference_priority_and_missing_oracle(self):
         with Evidence('reference-output') as evidence:
@@ -355,7 +355,7 @@ with Evidence("stdin-parent") as evidence:
         self.assertTrue(row['timed_out'])
         self.assertIn(b'started', base64.b64decode(row['stdout_base64']))
         with Evidence('following') as following:
-            self.assertEqual(following.run([sys.executable, '-c', 'print(7)'], timeout=5).stdout, b'7\n')
+            self.assertEqual(following.run([sys.executable, '-c', 'print(7)'], timeout=5).stdout, b'7' + os.linesep.encode())
 
     @unittest.skipIf(os.name == 'nt', 'POSIX executable fixture')
     def test_executable_resolution_uses_command_directory_and_path(self):
@@ -382,7 +382,7 @@ with Evidence("stdin-parent") as evidence:
         with Evidence('empty-environment') as evidence:
             result = evidence.run([sys.executable, '-c', 'import os; print(os.environ.get("MINYAR_TEST_EVIDENCE", "absent"))'],
                                   env={}, timeout=5)
-            self.assertEqual(result.stdout, b'absent\n')
+            self.assertEqual(result.stdout, b'absent' + os.linesep.encode())
             self.assertEqual(evidence.commands[0]['environment'], {})
             self.assertTrue(evidence.commands[0]['empty_environment'])
 
