@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 from peer_edge_support import Lab, ROOT, environment
 
 def digest(path):
@@ -38,17 +39,19 @@ def main():
         lab=None
         try:
             lab=Lab(directory/'lab',args.binary,args.sanitize,duration=8000,maximum=1)
-            output=command([client,lab.certs.path('ca','der'),lab.certs.path('device','der'),
-                lab.certs.path('device','pk8'),lab.udp_port],directory,env,10)
-            assert output==b'GREEN actual mTLS QUIC edge: 128 alternate-ID retirements, replacements and duplicate retirements\n',output
+            for session in range(3):
+                output=command([client,lab.certs.path('ca','der'),lab.certs.path('device','der'),
+                    lab.certs.path('device','pk8'),lab.udp_port],directory,env,10)
+                assert output==b'GREEN actual mTLS QUIC edge: 128 alternate-ID retirements, replacements and duplicate retirements\n',output
+                time.sleep(.25)
             lines=lab.completed(timeout=10)
             counts=next(line for line in lines if line.startswith('EDGE_COUNTS ')).split()
             values=dict(part.split('=') for part in counts[1:])
-            assert int(values['allocated'])==int(values['retry_validated'])==1,values
+            assert int(values['allocated'])==int(values['retry_validated'])==3,values
             assert int(values['active'])==0 and int(values['peer_slots'])==1,values
             inputs=[ROOT/'library/quic.min',ROOT/'library/peeredge.min',ROOT/'tests/peer-edge-cids.min',Path(__file__),client,lab.binary]
             (directory/'manifest.json').write_text(json.dumps(dict(sanitize=args.sanitize,inputs_sha256={str(p):digest(p) for p in inputs},counts=values),indent=2))
-            print(output.decode().strip()+'; exact one allocated peer and zero active peers')
+            print(output.decode().strip()+'; three reused sessions, exact three allocated peers and zero active peers')
         finally:
             if lab:lab.close()
 if __name__=='__main__':main()
