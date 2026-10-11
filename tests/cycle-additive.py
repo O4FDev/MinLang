@@ -59,7 +59,7 @@ def run(command, environment, output, label, resource):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--sanitize", action="store_true")
-    p.add_argument("--fixture", choices=["cycle-additive.c", "cycle-registry-growth.c", "cycle-leaf-churn.c"], default="cycle-additive.c")
+    p.add_argument("--fixture", choices=["cycle-additive.c", "cycle-registry-growth.c", "cycle-leaf-churn.c", "cycle-captured-retirement.c"], default="cycle-additive.c")
     p.add_argument("--case", choices=["all", "registered", "callbacks", "streaming", "safety", "active"], default="all")
     p.add_argument("--profiles", nargs="+", choices=["system", "fixed", "lazy", "eager"],
                    default=None)
@@ -71,6 +71,14 @@ def main():
         profiles, unsupported = profile_selection(args.profiles, windows_host())
     except ValueError as error:
         p.error(str(error))
+    if args.fixture == "cycle-captured-retirement.c":
+        if args.case != "all":
+            p.error("captured retirement owns its complete C schedule")
+        if args.profiles is not None and "eager" in args.profiles:
+            p.error("captured retirement certifies bounded cleanup; eager RC is unchanged")
+        profiles = [profile for profile in profiles if profile != "eager"]
+        unsupported.append({"profile": "eager",
+                            "reason": "Captured dead-owner certificates use bounded cleanup; eager RC is unchanged."})
     out = args.evidence.resolve(); out.mkdir(parents=True, exist_ok=True)
     (ROOT / "build").mkdir(exist_ok=True)
     (ROOT / "build/managed-graphs-engine.c").write_text(engine_source(ROOT))
@@ -78,6 +86,8 @@ def main():
     inputs = [ROOT/"tests/cycle-additive.c", ROOT/"tests"/args.fixture, Path(__file__).resolve(),
               ROOT/"tools/cycle_runtime.py", ROOT/"tests/clang_helpers.py",
               ROOT/"tests/test_evidence.py", ROOT/"runtime/minyar_runtime.c", *headers]
+    if args.fixture == "cycle-captured-retirement.c":
+        inputs.append(ROOT/"tests/cycle-leaf-churn.c")
     report = {"passed": False, "sanitize": args.sanitize, "cases": [], "resources": [],
               "profiles": profiles, "unsupported_profiles": unsupported,
               "source_sha256": {str(f.relative_to(ROOT)):hashlib.sha256(f.read_bytes()).hexdigest()

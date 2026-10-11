@@ -49,6 +49,7 @@ static void churn_check(Churn c, unsigned n, unsigned children) {
     assert(churn_buffer(c)->length == children);
     assert(rc_object_count == 7u + 2u * n + 2u * children);
 }
+#ifndef MINYAR_LEAF_CHURN_HELPERS
 static void churn_borrow(Churn c) {
     minyar_rc_retain_traced(c.g.interior);
     minyar_rc_release(c.g.interior);
@@ -137,3 +138,5 @@ int main(int argc, char **argv) {
     empty();
     return 0;
 }
+
+#endif /* MINYAR_LEAF_CHURN_HELPERS */

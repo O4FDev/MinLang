@@ -135,3 +135,12 @@ check-cycle-leaf-churn-sanitize: tests/cycle-leaf-churn.c tests/cycle-additive.c
 check check-portable: check-cycle-leaf-churn check-cycle-leaf-churn-sanitize
 check-managed-graphs-profiles: check-cycle-leaf-churn check-cycle-leaf-churn-sanitize
 check-sanitize: check-cycle-leaf-churn-sanitize
+
+# Captured-zero locality uses the existing driver and only bounded profiles.
+.PHONY: check-cycle-captured-retirement check-cycle-captured-retirement-sanitize
+CYCLE_CAPTURED_RETIREMENT_INPUTS = tests/cycle-captured-retirement.c tests/cycle-leaf-churn.c tests/cycle-additive.c tests/cycle-additive.py tools/cycle_runtime.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
+check-cycle-captured-retirement: $(CYCLE_CAPTURED_RETIREMENT_INPUTS) | build
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-additive.py --fixture cycle-captured-retirement.c --evidence "$(CURDIR)/build/cycle-captured-retirement-native"
+check-cycle-captured-retirement-sanitize: $(CYCLE_CAPTURED_RETIREMENT_INPUTS) | build
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-additive.py --fixture cycle-captured-retirement.c --sanitize --evidence "$(CURDIR)/build/cycle-captured-retirement-sanitize"
+check-managed-graphs-profiles: check-cycle-captured-retirement check-cycle-captured-retirement-sanitize
