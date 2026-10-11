@@ -1,7 +1,7 @@
 # v2 implementation and verification map
 
 This checkpoint describes the combined implementation based on
-`bafcb67bcdd9ad5871d4cb16f497ad60d0479abb` at 17:44 UTC on 2026-10-11.
+`3dad1e7dedded613d984858cff53301cab11e15a` at 19:33 UTC on 2026-10-11.
 An implemented API, a passing focused suite and a complete deployment are
 separate claims. Retained results establish only their recorded source and
 configuration. Combined CI, current macOS/Windows gates, ordinary performance
@@ -64,6 +64,17 @@ Windows VM readiness attempt exceeded the whole-host 75% resource ceiling
 before any current product test ran; the guest was stopped and its retained
 backing image was unchanged.
 
+Two subsequent collector fixes passed actual red/green regressions without
+changing the 192-unit work bound. Replacing an eligible unregistered leaf
+preserves the completed idle primary proof. Retiring an independently captured
+owner at real zero can preserve that proof in idle/local collection phases;
+gray pinning, proof construction, anchor changes and registered mutations remain
+conservative. The captured-owner matrix passed 594 native/sanitizer cases and
+21 serial safety commands. Ordinary production runtime objects remained
+byte-identical. The unchanged one-second/2% Linux idle oracle passed; Windows
+and actual device capacity are separate tests. The current 4,096-device setup
+still fails, as recorded below.
+
 ## Recoverable errors
 
 The optional Result frontend supports explicit `Result<T,E>`,
@@ -102,11 +113,19 @@ the probe. Source-text searches do not select a frontend.
 
 | Area | Implemented source and focused checks | Verification boundary |
 | --- | --- | --- |
-| Portable TLS | `tls.min` / `tlsserver.min` drive TLS 1.3 over TCP records or QUIC CRYPTO bytes. OS trust providers build chains and check names, time, purpose and signatures; configured roots are exclusive. Mutual TLS, X25519/native P-256 key shares, delayed-handshake identity revalidation and digitalSignature key usage have native/sanitizer adversaries. | Native validation does not fetch live CRL/OCSP or missing intermediates. This is not an independent security audit or complete RFC certification. |
+| Portable TLS | `tls.min` / `tlsserver.min` drive TLS 1.3 over TCP records or QUIC CRYPTO bytes. OS trust providers build chains and check names, time, purpose and signatures; configured roots are exclusive. Mutual TLS, X25519/native P-256 key shares, delayed-handshake identity revalidation and digitalSignature key usage have native/sanitizer adversaries. | Native validation does not fetch live CRL/OCSP or missing intermediates. Literal-IP SNI regression source is prepared, but has not run or changed TLS. This is not an independent security audit or complete RFC certification. |
 | Socket reactor | `eventloop.min` uses kqueue, epoll or WSAPoll with timers and recoverable results; `eventcallbacks.min` dispatches on the owner thread. UDP retains packet boundaries and empty/truncated packets; Linux batches use sendmmsg/recvmmsg. AppKit and the Windows GUI can share the reactor's wake source. | Windows WSAPoll scans its socket array. IOCP and io_uring are not implemented. Connect refusal has OS-dependent timing; callers use deadlines rather than assuming one wait reports refusal. |
 | UDP offload | Explicit `net.sendDatagramsOffload*` calls use Linux UDP_SEGMENT. Dedicated generation-checked `DatagramOffload` receivers enable UDP_GRO, split coalesced packets and preserve per-packet truncation/source results. | Offload is opt-in, not transparent on every UDP socket. Kernel/MTU failures are recoverable; unsupported macOS/Windows or disabled Linux builds report unavailable. The receiver and its registry have one owner; drain buffered segments to would-block after readiness. |
 | QUIC and fallback | QUIC v1 streams, flow control, CUBIC/loss recovery, current-route recovery generations, client path validation, server preferred-address configuration, resumption and explicit replay-safe early data are implemented. Authenticated TLS/yamux supplies the TCP replacement. | The caller opens/maps sockets and handles `TCP_NEEDED`, retired stream generations and explicit application retries. Writes are not silently replayed. BBR, ECN, live v2 and unsolicited server-initiated active migration remain outside the implemented scope. |
 | Peer edge | `peeredge.min` combines owned connection state, device authentication, 15-second live-state heartbeats/Redis and gateway relay. Focused relay tests cover binary data, half-close, cancellation and admission limits. | The measured TCP gateway workload below does not establish QUIC device capacity, multi-hour flat memory or deployment readiness. |
+
+The HTTP authority parser had fifteen actual failures covering IPv6 connection
+hosts, wire Host ports, query/fragment targets and malformed or overflowing
+ports. The repair separates the URI authority from the connection host, uses
+numeric IP classification without DNS, and rejects malformed input with a
+recoverable response. Four native and four fully instrumented ASan/UBSan/LSan
+tests now pass with normal exits and empty target diagnostics. Their four source
+files are byte-identical after integration. TLS was unchanged by this repair.
 
 Focused QUIC source `26841d1399f82f3189039189deb8b1e94890cb08` and the later
 protocol-evidence lifecycle fixes are integrated. The combined focused candidate
@@ -127,13 +146,21 @@ Quinn tests retain migration, resumption and early-data evidence. A later frozen
 `5387aea6` run passed all four client 0-RTT peer cells under the unchanged
 criterion. Those historical results do not validate the current combined QUIC
 source. The new 128-cell plan covers 16 selected scenarios, four independent
-peers and both roles. At this checkpoint, 14 cells passed: all eight handshake
-cells, all four Minyar-client ChaCha20 cells, and the Minyar-server ChaCha20
-cells with Quinn and msquic. A pinned quiche client explicitly reports ChaCha20
-unsupported; that cell remains a nonpass coverage gap. The Minyar-server /
-ngtcp2-client ChaCha20 cell retains its literal failed result: the independent
-peer rejected its cipher-selection CLI option before QUIC traffic. The
-remaining 112 cells have not run; full interoperability remains pending.
+peers and both roles. At this checkpoint, 31 cells have passed, covering every
+handshake and Minyar-client ordinary-transfer cell, plus selected ChaCha20,
+key-update and multiplexing cells. Five literal unsupported results and seven
+literal failures remain nonpasses. These include peer cipher/feature limits,
+migration checker or preferred-address fixture limitations, a peer SIGSEGV
+and a peer open-file failure; those diagnoses do not turn failures into passes.
+
+Pinned-runner exceptions also retain no protocol verdict: an ICMPv6 packet
+caused a migration checker KeyError, and two consecutive large transfers to
+the Minyar server timed out before the runner decoded missing stdout. The
+quiche and Quinn clients received correct but incomplete prefixes of the
+10-MiB workload. The primary sequence is paused after exact ownership cleanup
+for a bounded current-native profile of this possible server bottleneck.
+No timeout, protocol checker or completed result has been relaxed or relabeled.
+The remaining primary cells and fresh affected repair cells remain pending.
 
 Actual runner failures exposed fixture defects in Docker 29 capability
 spelling, simulator capture writers that had not flushed during shutdown, and
@@ -179,12 +206,21 @@ and native retirement ended with zero active peers and retained relays. The
 two-hour flat memory. Intermediate certificate chains and exclusive
 device/gateway root rollover also passed native and sanitizer checks.
 
-The first 4,096-device probe failed during setup after reporting at least
-1,000 authenticated devices: the independent client returned a bounded I/O
-timeout before complete Redis admission. No steady-state measurement began.
-Native diagnostics were empty, but controller-triggered teardown means this
-run does not establish normal retirement or capacity. The failed evidence is
-retained for diagnosis; 20,000 actual QUIC devices remain unqualified.
+The current 4,096-device probe uses one freshly built maintained executable
+at `3dad1e7`, including both qualified collector fixes and the HTTP native
+provider change. It still fails during setup: 1,739 devices authenticated,
+Redis admission reached 1,244, and a device hit the unchanged 20,000-ms TLS
+deadline. Native CPU consumed 30.67 seconds over 32.07 wall seconds; 27,446
+UDP drops were observed. The guard did not abort for resource use. All 11,632
+tracked source hashes remained unchanged and owned processes retired, but
+controller teardown is not normal product retirement or a capacity pass.
+
+A separate eight-second profile of that exact executable recorded 792 samples
+with none lost: the collector unit accounted for 73.99% of self samples and
+bounded traced polling for 9.85%. The call paths run through heartbeat JSON
+handling rather than TLS crypto. This diagnoses a remaining collector cost,
+not its exact invalidation cause. No steady-state measurement began; 20,000
+actual QUIC devices and two-hour flat memory remain unqualified.
 
 Earlier source-frozen TLS/HTTP, QUIC and socket soaks remain evidence only for
 their recorded sources, peers, faults and exit statuses. A foundation
@@ -205,6 +241,25 @@ capture public-launcher case. `nextEvent` pumps without sleeping while its
 Boolean service result reports debt; it does not use the dispatcher's 10 ms
 cycle-only wait policy. Current macOS, larger application graphs and production
 permission behavior remain unverified.
+
+Small current AppKit status-item lifetime and Keychain import/signature checks
+passed natively and with ASan/UBSan. A notification declaration compile error
+was repaired; denial, late completion, cancellation and stale-handle controls
+pass. The current direct AppKit/kqueue adapter also passes socket/timer wakes,
+one-shot readiness and generation-safe detach in both builds. An earlier
+adapter attempt under additional background scheduling timed out and is
+retained separately. These direct checks do not certify the public launcher,
+managed AppKit cleanup matrix, physical network transitions or normal-exit
+leak detection.
+
+The Keychain import fixture proves opaque Minyar identity references, not
+hardware nonexportability. A legacy software key that rejected SecItemExport
+still yielded a usable private representation through another Security API;
+that limitation is recorded without exposing key bytes. An ephemeral Secure
+Enclave P-256 key rejected private export and verified signatures, but the
+persistent identity fixture requires a properly entitled app and stopped
+before Minyar lookup. Hardware identity and OS mutual-TLS qualification remain
+pending with production signing work deferred.
 
 The retained Windows R14 full bridge gate passed actual native controls,
 disposal, layout invalidation, shared-loop idle settling, notifications and
@@ -228,6 +283,11 @@ shipping gates still need verification.
 The portable bundle packager's 14 Python methods now pass on macOS after its
 temporary-directory fixture resolves the platform's `/var` pathname alias.
 Only fixture paths changed; the packaging implementation remained unchanged.
+
+The publisher's HTTPS origin validation now rejects credential-bearing,
+noncanonical and malformed-port origins before signing. Eleven hostile-origin
+regressions first failed; all five publisher controls then passed using public
+fixture signing material. This is local contract evidence, not R2 publication.
 
 Usual framework symlink layouts are unsupported. Darwin pathname execution
 requires a protected update root and has no absolute same-user TOCTOU guarantee.
