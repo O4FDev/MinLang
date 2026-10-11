@@ -122,7 +122,12 @@ def prepare(root,output,entrypoint,*,notarized_app=None):
                         if source.read(1) or snapshot(os.fstat(source.fileno()))!=observed[path]:
                             raise ValueError('bundle file changed during copying')
             stream.flush();os.fsync(stream.fileno())
-            if snapshot(root.lstat())!=root_stat or any(snapshot(path.lstat())!=before for path,before in observed.items()):
+            # Rescan the actual index too. Directory timestamps/sizes alone
+            # cannot prove that no unindexed entry was added or removed.
+            previous_records,previous_observed=records,observed
+            records=[];observed={};folded=set()
+            scan(root);records.sort(key=lambda record:record[0])
+            if snapshot(root.lstat())!=root_stat or records!=previous_records or observed!=previous_observed:
                 raise ValueError('bundle tree changed while preparing output')
             if app is not None:verify_app()
             with temporary.open('rb') as source:digest=hashlib.file_digest(source,'sha256').hexdigest()
