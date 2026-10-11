@@ -348,8 +348,8 @@ static void public_append_before_parent_certificate(int kind) {
     minyar_rc_release(parent);
     drain();
     receiver_check(receiver, kind, payload);
-    assert(rc_object_count == 8 && parent->length == 33 &&
-           parent->values[32] == slot(receiver) && leaf->values[0] == 808);
+    assert(rc_object_count == 8 && parent->length == 33 && parent->values[32] == slot(receiver) &&
+           leaf->values[0] == 808);
     minyar_rc_release(g.root);
     empty();
 #else
@@ -403,7 +403,38 @@ static void move_stale_root_before_visit(int kind) {
     minyar_rc_release(owner);
     empty();
 }
+/* A first finite cohort must reclaim fresh internal cycles, even when no
+ * external root shades their initial registration state. The two copied
+ * stores use the public barrier ordering; rc_drop releases the external
+ * owners without servicing between them, preserving the first cohort. */
+static void fresh_internal_cycle(void) {
+    Graph g = graph();
+    MinyarRecord *a = minyar_record_new_traced(1);
+    MinyarRecord *b = minyar_record_new_traced(1);
+    minyar_rc_retain_traced(b);
+    rc_cycle_edge_insert(a, b);
+    a->values[0] = slot(b);
+    ((unsigned char *)(a->values + a->length))[0] = 1;
+    rc_cycle_commit_insert(a, b);
+    minyar_rc_retain_traced(a);
+    rc_cycle_edge_insert(b, a);
+    b->values[0] = slot(a);
+    ((unsigned char *)(b->values + b->length))[0] = 1;
+    rc_cycle_commit_insert(b, a);
+    assert(rc_cycle_phase == RC_CYCLE_IDLE);
+    assert(rc_cycle_value(a)->marked == 3 && rc_cycle_value(b)->marked == 3);
+    rc_drop(a);
+    rc_drop(b);
+    assert(rc_cycle_value(a)->incoming == 1 && rc_cycle_value(b)->incoming == 1);
+    assert((((RcObject *)a - 1)->ownership >> 3) == 1);
+    assert((((RcObject *)b - 1)->ownership >> 3) == 1);
+    drain();
+    assert(rc_object_count == 4 && g.interior->values[1] == 19);
+    minyar_rc_release(g.root);
+    empty();
+}
 int main(void) {
+    fresh_internal_cycle();
     queued_full_root();
     move_stale_root_before_visit(0);
     move_stale_root_before_visit(1);
