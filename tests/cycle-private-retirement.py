@@ -117,7 +117,8 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     inputs = [Path(__file__), ROOT / "tests/cycle-idle-invalidation.c",
               ROOT / "tests/cycle-additive.c", ROOT / "tests/cycle-additive.py",
-              ROOT / "tests/cycle-private-retirement-v5.json", ROOT / "tools/cycle_runtime.py",
+              ROOT / "tests/cycle-private-retirement-v5.json",
+              ROOT / "tests/fixtures/cycle-private-retirement-v5-collector.h", ROOT / "tools/cycle_runtime.py",
               ROOT / "tests/clang_helpers.py", ROOT / "tests/test_evidence.py",
               ROOT / "runtime/minyar_runtime.c", *sorted((ROOT / "runtime").glob("*.h"))]
     fingerprints = {p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
@@ -210,7 +211,9 @@ def main():
         baseline = json.loads((ROOT / "tests/cycle-private-retirement-v5.json").read_text())
         assert baseline["schema_version"] == 1 and set(baseline["headers"]) == set(BASELINE_HASHES)
         assert baseline["collector_sha256"] == COLLECTOR_HASH
-        assert fingerprints["runtime/minyar_cycles_collect.h"] == COLLECTOR_HASH
+        # Product collector changes must not rewrite the independent frozen
+        # control. Bind the old pair to its exact original collector source.
+        assert fingerprints["tests/fixtures/cycle-private-retirement-v5-collector.h"] == COLLECTOR_HASH
         control_headers = out / "failure-control/runtime"
         control_headers.mkdir(parents=True)
         for header in sorted((ROOT / "runtime").glob("*.h")):
@@ -220,6 +223,9 @@ def main():
             raw = row["source"].encode("utf-8")
             assert row["sha256"] == digest == hashlib.sha256(raw).hexdigest()
             (control_headers / name).write_bytes(raw)
+        frozen_collector = (ROOT / "tests/fixtures/cycle-private-retirement-v5-collector.h").read_bytes()
+        assert hashlib.sha256(frozen_collector).hexdigest() == COLLECTOR_HASH
+        (control_headers / "minyar_cycles_collect.h").write_bytes(frozen_collector)
         binary = compile_fixture("v5-failure-control", "system", 1, control_headers)
         failure = observe("v5-locality-expected-failure",
                           [str(binary), "32", "private", "assert-local"], binary)
