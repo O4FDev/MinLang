@@ -26,6 +26,27 @@ map the range onto one million native trackbar intervals. Endpoints are exact.
 The [native trackbar contract](https://learn.microsoft.com/en-us/windows/win32/controls/trackbar-controls)
 provides user-driven CHANGE events.
 
+
+Layout properties use logical points. `view` creates an empty native view and
+`spacer` takes remaining space along its row or column. `grow` shares that
+remaining space with other flexible siblings; `fill` uses the available
+cross-axis space. Explicit `size` dimensions stay fixed. `minimumSize` and
+`maximumSize` constrain each axis independently; zero removes a bound.
+Window minimums constrain the native resize border. Bounds and insets accept
+0 through 100000 points; a minimum greater than its maximum is a programmer
+error, as is an explicit size outside those bounds. `insets` currently applies to rows and columns. Button text insets
+remain part of the missing drawing/theme work.
+
+`align` sets a row or column's cross-axis alignment to `START`, `CENTER` or
+`END`. Until alignment is explicitly set, columns retain their existing
+width-filling default. `spaceAfter` replaces the parent's spacing after one
+view. Hidden views and their descendants consume no layout space; unhiding
+an ancestor preserves each child's own hidden state. `clear` removes a row
+or column's children and `remove` removes a nested view and its subtree.
+Their descendant handles end and pending descendant events are purged.
+A window's root view cannot be removed with `remove`; use `destroy` for
+the window's lifetime.
+
 `windows.shareNetworkLoop(loop)` connects an `eventloop` reactor to this same
 UI thread. After every `nextEvent` call, consume `eventloop.wait(loop, 0, maximum)`
 and handle its socket/timer events on that thread. A network or timer wake
@@ -78,7 +99,7 @@ The shared `desktop.min` API supplies these Windows services:
 Missing OS capabilities and rejected notification input are recoverable error
 values. The Linux backend reports unavailable using the same fixed envelopes.
 The Windows bridge still needs the macOS bridge's richer list, custom drawing,
-theme, constraint and file-dialog APIs for complete UI parity.
+theme, scrolling, remaining constraint and file-dialog APIs for complete UI parity.
 
 ## Persistent notifications and actions
 

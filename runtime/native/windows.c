@@ -5,12 +5,14 @@
 #include <commctrl.h>
 #include <math.h>
 #include <stdint.h>
+#include <limits.h>
 
 /* The UI owns only native memory. Generation checked IDs never expose pointers. */
 enum {
     WINDOW = 1,
     COLUMN,
     ROW,
+    VIEW,
     LABEL,
     BUTTON,
     FIELD,
@@ -26,7 +28,10 @@ enum {
 };
 typedef struct Widget {
     uint32_t generation;
-    int kind, padding, spacing, width, height, suppress;
+    int kind, spacing, width, height, suppress;
+    int inset_top, inset_left, inset_bottom, inset_right, alignment, space_after;
+    int min_width, min_height, max_width, max_height;
+    unsigned grow_children;
     long long parent, first, last, next;
     HWND handle;
     HFONT font;
@@ -35,7 +40,7 @@ typedef struct Widget {
     double minimum, maximum;
     HACCEL accelerators;
     ACCEL accelerator;
-    bool disabled, positioned;
+    bool disabled, positioned, hidden, grows, fills, custom_spacing;
     int measured_dpi, measured_width, measured_height;
     int placed_x, placed_y, placed_width, placed_height;
 } Widget;
@@ -207,6 +212,37 @@ static wchar_t *edit_text(Widget *w, const MinyarText *value) {
     free(text);
     return out;
 }
+static int extent(int64_t value) {
+    return value <= 0 ? 0 : value > INT_MAX ? INT_MAX : (int)value;
+}
+static bool stack(const Widget *w) {
+    return w->kind == COLUMN || w->kind == ROW;
+}
+static bool hidden(const Widget *w) {
+    for (;;) {
+        if (w->hidden)
+            return true;
+        if (!w->parent)
+            return false;
+        w = get(w->parent);
+    }
+}
+static int bounded(Widget *w, int value, bool horizontal) {
+    int minimum_points = horizontal ? w->min_width : w->min_height;
+    int maximum_points = horizontal ? w->max_width : w->max_height;
+    if (!minimum_points && !maximum_points)
+        return value < 0 ? 0 : value;
+    int minimum = scaled(w, minimum_points);
+    int maximum = scaled(w, maximum_points);
+    if (value < minimum)
+        value = minimum;
+    if (maximum && value > maximum)
+        value = maximum;
+    return value < 0 ? 0 : value;
+}
+static int gap(Widget *parent, Widget *previous) {
+    return previous ? scaled(parent, previous->custom_spacing ? previous->space_after : parent->spacing) : 0;
+}
 static void remember_measure(Widget *w, int width, int height) {
     if (w->measured_dpi != layout_dpi)
         w->positioned = false;
@@ -215,36 +251,34 @@ static void remember_measure(Widget *w, int width, int height) {
     w->measured_height = height;
 }
 static void measure(Widget *w, int *width, int *height) {
-    if (w->kind == COLUMN || w->kind == ROW) {
-        int x = 0, y = 0, count = 0;
+    if (stack(w)) {
+        int64_t x = 0, y = 0;
+        Widget *previous = NULL;
         for (long long child = w->first; child; child = get(child)->next) {
-            if (get(child)->kind >= MENU)
+            Widget *c = get(child);
+            if (c->kind >= MENU || c->hidden)
                 continue;
             int cw, ch;
-            measure(get(child), &cw, &ch);
-            count++;
+            measure(c, &cw, &ch);
             if (w->kind == ROW) {
-                x += cw;
+                x += (int64_t)gap(w, previous) + cw;
                 if (ch > y)
                     y = ch;
             } else {
                 if (cw > x)
                     x = cw;
-                y += ch;
+                y += (int64_t)gap(w, previous) + ch;
             }
+            previous = c;
         }
-        if (count > 1) {
-            if (w->kind == ROW)
-                x += (count - 1) * scaled(w, w->spacing);
-            else
-                y += (count - 1) * scaled(w, w->spacing);
-        }
-        *width = x + 2 * scaled(w, w->padding);
-        *height = y + 2 * scaled(w, w->padding);
+        *width = extent(x + scaled(w, w->inset_left) + scaled(w, w->inset_right));
+        *height = extent(y + scaled(w, w->inset_top) + scaled(w, w->inset_bottom));
         if (w->width)
             *width = scaled(w, w->width);
         if (w->height)
             *height = scaled(w, w->height);
+        *width = bounded(w, *width, true);
+        *height = bounded(w, *height, false);
         return;
     }
     if (layout_dpi && w->measured_dpi == layout_dpi) {
@@ -252,12 +286,16 @@ static void measure(Widget *w, int *width, int *height) {
         *height = w->measured_height;
         return;
     }
-    if (w->kind == EDITOR || w->kind == TEXTVIEW || w->kind == SLIDER || w->kind == SEPARATOR) {
-        *width = scaled(w, w->width ? w->width : 200);
+    if (w->kind == VIEW || w->kind == EDITOR || w->kind == TEXTVIEW ||
+        w->kind == SLIDER || w->kind == SEPARATOR) {
+        *width = scaled(w, w->width ? w->width : w->kind == VIEW ? 0 : 200);
         *height = scaled(w, w->height              ? w->height
+                            : w->kind == VIEW      ? 0
                             : w->kind == SEPARATOR ? 2
                             : w->kind == SLIDER    ? 28
                                                    : 100);
+        *width = bounded(w, *width, true);
+        *height = bounded(w, *height, false);
         remember_measure(w, *width, *height);
         return;
     }
@@ -273,8 +311,8 @@ static void measure(Widget *w, int *width, int *height) {
     ReleaseDC(w->handle, dc);
     free(text);
     int extra = editable(w) ? 24 : (w->kind == LABEL ? 0 : 32);
-    *width = size.cx + scaled(w, extra);
-    *height = size.cy + scaled(w, w->kind == LABEL ? 4 : 14);
+    *width = extent((int64_t)size.cx + scaled(w, extra));
+    *height = extent((int64_t)size.cy + scaled(w, w->kind == LABEL ? 4 : 14));
     int minimum = scaled(w, editable(w) ? 120 : 40);
     if (*width < minimum)
         *width = minimum;
@@ -282,7 +320,30 @@ static void measure(Widget *w, int *width, int *height) {
         *width = scaled(w, w->width);
     if (w->height)
         *height = scaled(w, w->height);
+    *width = bounded(w, *width, true);
+    *height = bounded(w, *height, false);
     remember_measure(w, *width, *height);
+}
+static bool grows(const Widget *parent, const Widget *child) {
+    return child->grows && !(parent->kind == ROW ? child->width : child->height);
+}
+static int growth_capacity(Widget *parent, Widget *child) {
+    int width, height;
+    measure(child, &width, &height);
+    int maximum = parent->kind == ROW ? child->max_width : child->max_height;
+    int base = parent->kind == ROW ? width : height;
+    return maximum ? extent((int64_t)scaled(child, maximum) - base) : INT_MAX - base;
+}
+static uint64_t growth_cost(Widget *parent, int level) {
+    uint64_t cost = 0;
+    for (long long child = parent->first; child; child = get(child)->next) {
+        Widget *c = get(child);
+        if (c->kind >= MENU || c->hidden || !grows(parent, c))
+            continue;
+        int capacity = growth_capacity(parent, c);
+        cost += (unsigned)(level < capacity ? level : capacity);
+    }
+    return cost;
 }
 static void arrange(Widget *w, int x, int y, int width, int height) {
     if (w->handle && w->kind != WINDOW) {
@@ -301,24 +362,83 @@ static void arrange(Widget *w, int x, int y, int width, int height) {
             w->positioned = false;
         return;
     }
-    int padding = scaled(w, w->padding), spacing = scaled(w, w->spacing);
-    x += padding;
-    y += padding;
-    width -= 2 * padding;
-    height -= 2 * padding;
+    int left = scaled(w, w->inset_left), top = scaled(w, w->inset_top);
+    x = extent((int64_t)x + left);
+    y = extent((int64_t)y + top);
+    width = extent((int64_t)width - left - scaled(w, w->inset_right));
+    height = extent((int64_t)height - top - scaled(w, w->inset_bottom));
+    int64_t used = 0;
+    unsigned flexible = 0;
+    Widget *previous = NULL;
+    if (w->grow_children)
+        for (long long child = w->first; child; child = get(child)->next) {
+            Widget *c = get(child);
+            if (c->kind >= MENU || c->hidden)
+                continue;
+            int cw, ch;
+            measure(c, &cw, &ch);
+            used += (int64_t)gap(w, previous) + (w->kind == ROW ? cw : ch);
+            if (grows(w, c))
+                flexible++;
+            previous = c;
+        }
+    int remaining = extent((int64_t)(w->kind == ROW ? width : height) - used);
+    int level = 0, residual = 0;
+    if (flexible && remaining) {
+        // Find one fair expansion level, excluding capped children. No arrays
+        // or quadratic retries are needed when many siblings have different caps.
+        int low = 0, high = remaining;
+        while (low < high) {
+            int middle = low + (high - low) / 2 + (high - low) % 2;
+            if (growth_cost(w, middle) <= (uint64_t)remaining)
+                low = middle;
+            else
+                high = middle - 1;
+        }
+        level = low;
+        residual = remaining - (int)growth_cost(w, level);
+    }
+    int64_t cursor = w->kind == ROW ? x : y;
+    previous = NULL;
     for (long long child = w->first; child; child = get(child)->next) {
         Widget *c = get(child);
-        if (c->kind >= MENU)
+        if (c->kind >= MENU || c->hidden)
             continue;
+        cursor += gap(w, previous);
         int cw, ch;
         measure(c, &cw, &ch);
-        if (w->kind == ROW) {
-            arrange(c, x, y, cw, ch);
-            x += cw + spacing;
-        } else {
-            arrange(c, x, y, c->width ? cw : width > 0 ? width : 0, ch);
-            y += ch + spacing;
+        if (grows(w, c)) {
+            int capacity = growth_capacity(w, c);
+            int addition = level < capacity ? level : capacity;
+            if (residual && addition < capacity) {
+                addition++;
+                residual--;
+            }
+            if (w->kind == ROW)
+                cw = extent((int64_t)cw + addition);
+            else
+                ch = extent((int64_t)ch + addition);
         }
+        bool horizontal = w->kind != ROW;
+        int available = horizontal ? width : height;
+        int across = horizontal ? cw : ch;
+        bool explicit_size = horizontal ? c->width != 0 : c->height != 0;
+        // A zero alignment retains the existing column-fill default. Explicit
+        // alignment uses intrinsic cross-axis size unless fill was requested.
+        if (!explicit_size && (c->fills || (horizontal && !w->alignment)))
+            across = bounded(c, available, horizontal);
+        int offset = available > across ? available - across : 0;
+        offset = w->alignment == 3 ? offset : w->alignment == 2 ? offset / 2 : 0;
+        if (horizontal) {
+            cw = across;
+            arrange(c, extent((int64_t)x + offset), extent(cursor), cw, ch);
+            cursor += ch;
+        } else {
+            ch = across;
+            arrange(c, extent(cursor), extent((int64_t)y + offset), cw, ch);
+            cursor += cw;
+        }
+        previous = c;
     }
 }
 static void layout(Widget *w) {
@@ -452,6 +572,19 @@ static LRESULT CALLBACK procedure(HWND handle, UINT message, WPARAM wp, LPARAM l
             widgets[i].measured_dpi = 0;
         layout(w);
     }
+    if (w && w->kind == WINDOW && message == WM_GETMINMAXINFO &&
+        (w->min_width || w->min_height)) {
+        MINMAXINFO *limits = (MINMAXINFO *)lp;
+        RECT frame = {0, 0, scaled(w, w->min_width), scaled(w, w->min_height)};
+        if (AdjustWindowRectEx(&frame, (DWORD)GetWindowLongPtrW(handle, GWL_STYLE),
+                               GetMenu(handle) != NULL, (DWORD)GetWindowLongPtrW(handle, GWL_EXSTYLE))) {
+            if (w->min_width)
+                limits->ptMinTrackSize.x = frame.right - frame.left;
+            if (w->min_height)
+                limits->ptMinTrackSize.y = frame.bottom - frame.top;
+        }
+        return 0;
+    }
     if (w && message == WM_CLOSE) {
         ShowWindow(handle, SW_HIDE);
         enqueue(3, value, NULL);
@@ -563,9 +696,9 @@ static long long control(int kind, long long parent, const MinyarText *title, bo
     bool edit = editable(w) || kind == TEXTVIEW;
     const wchar_t *class_name = kind == SLIDER                       ? TRACKBAR_CLASSW
                                 : edit                               ? L"EDIT"
-                                : kind == LABEL || kind == SEPARATOR ? L"STATIC"
+                                : kind == VIEW || kind == LABEL || kind == SEPARATOR ? L"STATIC"
                                                                      : L"BUTTON";
-    DWORD style = WS_CHILD | WS_VISIBLE;
+    DWORD style = WS_CHILD | (hidden(w) ? 0 : WS_VISIBLE);
     if (kind == SLIDER)
         style |= TBS_HORZ | TBS_NOTICKS | WS_TABSTOP;
     else if (kind == EDITOR || kind == TEXTVIEW)
@@ -573,7 +706,7 @@ static long long control(int kind, long long parent, const MinyarText *title, bo
                  (kind == TEXTVIEW ? ES_READONLY : ES_WANTRETURN);
     else if (edit)
         style |= ES_AUTOHSCROLL | WS_TABSTOP | (kind == SECURE ? ES_PASSWORD : 0);
-    else if (kind == LABEL || kind == SEPARATOR)
+    else if (kind == VIEW || kind == LABEL || kind == SEPARATOR)
         style |= kind == SEPARATOR ? SS_ETCHEDHORZ : SS_LEFT;
     else
         style |= WS_TABSTOP | (kind == CHECKBOX ? BS_AUTOCHECKBOX : BS_PUSHBUTTON);
@@ -591,6 +724,132 @@ static long long control(int kind, long long parent, const MinyarText *title, bo
     return value;
 }
 static const MinyarText empty_text = {.bytes = (const unsigned char *)""};
+static void dimension(long long value) {
+    if (value < 0 || value > 100000)
+        fail("windows: dimensions must be between 0 and 100000 points");
+}
+static Widget *view(long long value) {
+    Widget *w = get(value);
+    if (w->kind == WINDOW || w->kind >= MENU)
+        fail("windows: layout requires a view");
+    return w;
+}
+static Widget *stack_child(long long value) {
+    Widget *w = view(value);
+    if (!w->parent || !stack(get(w->parent)))
+        fail("windows: layout requires a view inside a row or column");
+    return w;
+}
+long long minyar_windows_view(long long parent) {
+    return control(VIEW, parent, &empty_text, false);
+}
+long long minyar_windows_spacer(long long parent) {
+    thread();
+    if (!stack(get(parent)))
+        fail("windows: spacer requires a row or column");
+    long long value = minyar_windows_view(parent);
+    Widget *w = get(value);
+    w->grows = true;
+    get(parent)->grow_children++;
+    layout(w);
+    return value;
+}
+void minyar_windows_grow(long long value) {
+    thread();
+    Widget *w = stack_child(value);
+    if (!w->grows) {
+        w->grows = true;
+        get(w->parent)->grow_children++;
+        layout(w);
+    }
+}
+void minyar_windows_fill(long long value) {
+    thread();
+    Widget *w = stack_child(value);
+    if (!w->fills) {
+        w->fills = true;
+        layout(w);
+    }
+}
+static void bounds(long long value, long long width, long long height, bool minimum) {
+    thread();
+    dimension(width); dimension(height);
+    Widget *w = minimum ? get(value) : view(value);
+    if (w->kind >= MENU)
+        fail("windows: minimumSize requires a window or view");
+    int min_width = minimum ? (int)width : w->min_width;
+    int min_height = minimum ? (int)height : w->min_height;
+    int max_width = minimum ? w->max_width : (int)width;
+    int max_height = minimum ? w->max_height : (int)height;
+    if ((max_width && min_width > max_width) || (max_height && min_height > max_height))
+        fail("windows: minimum size exceeds maximum size");
+    if ((w->width && (w->width < min_width || (max_width && w->width > max_width))) ||
+        (w->height && (w->height < min_height || (max_height && w->height > max_height))))
+        fail("windows: explicit size conflicts with bounds");
+    if (w->min_width == min_width && w->min_height == min_height &&
+        w->max_width == max_width && w->max_height == max_height)
+        return;
+    w->min_width = min_width; w->min_height = min_height;
+    w->max_width = max_width; w->max_height = max_height;
+    w->measured_dpi = 0;
+    layout(w);
+}
+void minyar_windows_minimumSize(long long value, long long width, long long height) {
+    bounds(value, width, height, true);
+}
+void minyar_windows_maximumSize(long long value, long long width, long long height) {
+    bounds(value, width, height, false);
+}
+void minyar_windows_insets(long long value, long long top, long long left, long long bottom, long long right) {
+    thread();
+    dimension(top); dimension(left); dimension(bottom); dimension(right);
+    Widget *w = get(value);
+    if (!stack(w))
+        fail("windows: insets requires a row or column");
+    w->inset_top = (int)top; w->inset_left = (int)left;
+    w->inset_bottom = (int)bottom; w->inset_right = (int)right;
+    w->measured_dpi = 0;
+    layout(w);
+}
+void minyar_windows_align(long long value, long long alignment) {
+    thread();
+    Widget *w = get(value);
+    if (!stack(w))
+        fail("windows: align requires a row or column");
+    if (alignment < 1 || alignment > 3)
+        fail("windows: alignment must be START, CENTER, or END");
+    if (w->alignment != alignment) {
+        w->alignment = (int)alignment;
+        layout(w);
+    }
+}
+void minyar_windows_spaceAfter(long long value, long long points) {
+    thread();
+    dimension(points);
+    Widget *w = stack_child(value);
+    if (!w->custom_spacing || w->space_after != points) {
+        w->custom_spacing = true;
+        w->space_after = (int)points;
+        layout(w);
+    }
+}
+static void show_descendants(Widget *w, bool ancestor_hidden) {
+    bool hide = ancestor_hidden || w->hidden;
+    if (w->handle)
+        ShowWindow(w->handle, hide ? SW_HIDE : SW_SHOWNOACTIVATE);
+    for (long long child = w->first; child; child = get(child)->next)
+        if (get(child)->kind < MENU)
+            show_descendants(get(child), hide);
+}
+void minyar_windows_hidden(long long value, bool hide) {
+    thread();
+    Widget *w = view(value);
+    if (w->hidden == hide)
+        return;
+    w->hidden = hide;
+    show_descendants(w, w->parent && hidden(get(w->parent)));
+    layout(w);
+}
 long long minyar_windows_secureField(long long parent) {
     return control(SECURE, parent, &empty_text, false);
 }
@@ -624,6 +883,9 @@ void minyar_windows_size(long long handle, long long width, long long height) {
     Widget *w = get(handle);
     if (w->kind >= MENU || w->kind == WINDOW)
         fail("windows: size requires a view");
+    if ((width && (width < w->min_width || (w->max_width && width > w->max_width))) ||
+        (height && (height < w->min_height || (w->max_height && height > w->max_height))))
+        fail("windows: explicit size conflicts with bounds");
     w->width = (int)width;
     w->height = (int)height;
     w->measured_dpi = 0;
@@ -674,7 +936,7 @@ void minyar_windows_enabled(long long handle, bool enabled) {
     thread();
     Widget *w = get(handle);
     w->disabled = !enabled;
-    if (w->kind == COLUMN || w->kind == ROW) {
+    if (stack(w)) {
         for (long long child = w->first; child; child = get(child)->next)
             minyar_windows_enabled(child, enabled);
     } else if (w->kind > WINDOW && w->kind < MENU) {
@@ -725,7 +987,8 @@ void minyar_windows_padding(long long value, long long padding) {
     if (padding < 0 || padding > 32768)
         fail("windows: invalid padding");
     Widget *w = get(value);
-    w->padding = (int)padding;
+    if (stack(w) || w->kind == WINDOW)
+        w->inset_top = w->inset_left = w->inset_bottom = w->inset_right = (int)padding;
     layout(w);
 }
 void minyar_windows_setText(long long value, const MinyarText *text) {
@@ -902,10 +1165,37 @@ void minyar_windows_destroy(long long value) {
             p->first = w->next;
         if (p->last == value)
             p->last = previous;
+        if (w->grows && p->grow_children)
+            p->grow_children--;
     }
     destroy(value);
-    if (window != value && get(window)->kind == WINDOW)
+    if (window != value && get(window)->kind == WINDOW) {
         rebuild_accelerators(get(window));
+        layout(get(window));
+    }
+}
+void minyar_windows_clear(long long value) {
+    thread();
+    Widget *w = get(value);
+    if (!stack(w))
+        fail("windows: clear requires a row or column");
+    long long child = w->first;
+    w->first = w->last = 0;
+    w->grow_children = 0;
+    while (child) {
+        long long next = get(child)->next;
+        destroy(child);
+        child = next;
+    }
+    layout(get(value));
+}
+void minyar_windows_remove(long long value) {
+    thread();
+    Widget *w = view(value);
+    if (w->parent && get(w->parent)->kind == WINDOW)
+        fail("windows: cannot remove a window's root view");
+    stack_child(value);
+    minyar_windows_destroy(value);
 }
 void minyar_windows_quit(void) {
     thread();
