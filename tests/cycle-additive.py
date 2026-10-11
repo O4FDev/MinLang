@@ -8,6 +8,17 @@ from cycle_runtime import engine_source
 from clang_helpers import asan_leak_options, windows_host
 from test_evidence import terminate_process_tree
 
+def profile_selection(requested, windows):
+    unsupported = ([{"profile": "lazy",
+                     "reason": "The lazy heap profile requires a POSIX mmap backend; Windows is not supported."}]
+                   if windows else [])
+    if windows and requested is not None and "lazy" in requested:
+        raise ValueError(unsupported[0]["reason"])
+    return (requested if requested is not None else
+            (["system", "fixed", "eager"] if windows else
+             ["system", "fixed", "lazy", "eager"])), unsupported
+
+
 def counters():
     rows = Path("/proc/stat").read_text().splitlines()[0].split()[1:]
     values = list(map(int, rows))
@@ -49,11 +60,15 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--sanitize", action="store_true")
     p.add_argument("--profiles", nargs="+", choices=["system", "fixed", "lazy", "eager"],
-                   default=["system", "fixed", "lazy", "eager"])
+                   default=None)
     p.add_argument("--budgets", type=int, nargs="+", choices=[1, 32, 1024], default=[1, 32, 1024])
     p.add_argument("--nodes", type=int, nargs="+", choices=[32, 256, 2048], default=[32, 256, 2048])
     p.add_argument("--evidence", type=Path, required=True)
     args = p.parse_args()
+    try:
+        profiles, unsupported = profile_selection(args.profiles, windows_host())
+    except ValueError as error:
+        p.error(str(error))
     out = args.evidence.resolve(); out.mkdir(parents=True, exist_ok=True)
     (ROOT / "build").mkdir(exist_ok=True)
     (ROOT / "build/managed-graphs-engine.c").write_text(engine_source(ROOT))
@@ -62,6 +77,7 @@ def main():
               ROOT/"tools/cycle_runtime.py", ROOT/"tests/clang_helpers.py",
               ROOT/"tests/test_evidence.py", ROOT/"runtime/minyar_runtime.c", *headers]
     report = {"passed": False, "sanitize": args.sanitize, "cases": [], "resources": [],
+              "profiles": profiles, "unsupported_profiles": unsupported,
               "source_sha256": {str(f.relative_to(ROOT)):hashlib.sha256(f.read_bytes()).hexdigest()
                                 for f in inputs}}
     environment = dict(os.environ, ASAN_OPTIONS=asan_leak_options()+":halt_on_error=1",
@@ -73,7 +89,7 @@ def main():
     historical = "rc_cycle_edge_insert" not in (ROOT/"runtime/minyar_cycles.h").read_text()
     report["historical_barrier_adapter"] = historical
     try:
-        for profile in args.profiles:
+        for profile in profiles:
             for budget in ([32] if profile == "eager" else args.budgets):
                 label = profile+"-k"+str(budget)
                 binary = out/(label+(".exe" if windows_host() else ""))
