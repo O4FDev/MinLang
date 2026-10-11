@@ -68,7 +68,22 @@ function noFlight(root: Bytes, identity: Bytes, key: Bytes, certificate: Bytes, 
         quic.receive(s, packet, deadline)
     }
     if found == 0 { print("no-flight handshake alarm did not send a probe"); return 43 }
-    if !keys { return 0 }
+    if !keys {
+        let before = c.congestion.probes; let accepted = 0
+        for packet in quic.poll(s, deadline + 1) {
+            let header = wire.header(packet, 0, c.local.length)
+            if header.kind == wire.INITIAL {
+                let opened = protection.unprotect(c.spaces[0].read, packet.slice(0, header.end), header.numberOffset, c.spaces[0].largest)
+                if !opened.valid { return 47 }
+                let crypto = false; let ack = false
+                for frame in wire.frames(opened.payload).frames { if frame.type == 6 { crypto = true }; if frame.type == 2 || frame.type == 3 { ack = true } }
+                if ack && !crypto { quic.receive(c, packet, deadline + 1); accepted += 1 }
+            }
+        }
+        if accepted == 0 || c.spaces[0].sent.length != 0 || c.handshakeAcknowledged { return 47 }
+        if c.congestion.probes != before { print("Initial ACK reset client backoff before peer validation"); return 47 }
+        return 0
+    }
     if c.spaces[0].active { print("Handshake probe retained Initial space"); return 44 }
     if !acknowledge {
         let next = quic.nextTimer(c)
@@ -136,6 +151,42 @@ function application(root: Bytes, identity: Bytes, key: Bytes, certificate: Byte
         if kind == wire.ZERO_RTT || kind == wire.ONE_RTT { return 51 }
     }
     if c.spaces[2].next != next || quic.nextTimer(c) != fixed || c.congestion.probes != 1 { return 52 }
+    return 0
+}
+// Accept early data with actual TLS keys, but block the queued client
+// Finished with the bounded admission state used below. Authenticated
+// application ACKs do not prove the peer has validated the client's address.
+function applicationAck(root: Bytes, identity: Bytes, key: Bytes, certificate: Bytes, clientKey: Bytes): Integer {
+    let store = tickets.store(randomBytes(16), 3600); tickets.allowEarlyData(store, 0xffffffff)
+    let initial = quic.client("localhost", randomBytes(80), "minyar-test", [root], [certificate], clientKey)
+    let issuer = quic.serverWithTickets(randomBytes(80), "minyar-test", initial.originalDestination, [identity], key, [root], true, store)
+    for tick in 0..100 { drive(initial, issuer, tick * 10) }
+    let ticket = quic.takeTicket(initial); if !ticket.valid { return 55 }
+    let c = quic.clientEarly("localhost", randomBytes(80), "minyar-test", [root], [certificate], clientKey, ticket)
+    let s = quic.serverWithTickets(randomBytes(80), "minyar-test", c.originalDestination, [identity], key, [root], true, store)
+    for request in 0..16 { let id = errors.integerValue(quic.openEarlyStream(c, false)); quic.writeEarlyStream(c, id, Bytes(257), true) }
+    for packet in quic.poll(c, 0) { quic.receive(s, packet, 0) }
+    if c.spaces[2].sent.length < 3 { return 55 }
+    let actual = c.spaces[2].sent[0]
+    for packet in quic.poll(s, 100) { quic.receive(c, packet, 100) }
+    if c.state != quic.ESTABLISHED || c.confirmed || c.handshakeAcknowledged || c.spaces[1].write.key.length == 0 { return 55 }
+    while c.history.length < 8192 { c.history.add(actual) }
+    quic.poll(c, 100)
+    if c.spaces[0].active || c.spaces[1].sent.length != 0 || c.handshakeProbe <= 100 { return 55 }
+    let deadline = c.handshakeProbe; c.congestion.probes = 3
+    for index in 0..3 {
+        let number = c.spaces[2].sent[0].number
+        let frame = Bytes(); frame.add(2)
+        frame.addBytes(errors.bytesValue(wire.encode(number))); frame.add(0); frame.add(0); frame.add(0)
+        let space = s.spaces[2]; let header = Bytes(); header.add(0x43); header.addBytes(s.remote)
+        for byte in 0..4 { header.add((space.next >> ((3-byte)*8)) & 255) }
+        let packet = errors.bytesValue(protection.protect(space.write, header, header.length-4, space.next, frame)); space.next += 1
+        quic.receive(c, packet, 110 + index)
+        if c.handshakeProbe != deadline { print("application ACK postponed independent handshake alarm"); return 53 }
+        if c.congestion.probes != 3 { print("application ACK reset unvalidated client backoff"); return 54 }
+        quic.poll(c, 110 + index)
+        if c.handshakeProbe != deadline { return 53 }
+    }
     return 0
 }
 function confirmed(root: Bytes, identity: Bytes, key: Bytes, certificate: Bytes, clientKey: Bytes): Integer {
@@ -236,6 +287,7 @@ function main(): Integer {
     else if mode == "handshake" { result = noFlight(root, identity, key, certificate, clientKey, true, false) }
     else if mode == "handshake-ack" { result = noFlight(root, identity, key, certificate, clientKey, true, true) }
     else if mode == "application" { result = application(root, identity, key, certificate, clientKey) }
+    else if mode == "application-ack" { result = applicationAck(root, identity, key, certificate, clientKey) }
     else if mode == "confirmed" { result = confirmed(root, identity, key, certificate, clientKey) }
     else if mode == "close" { result = closing(root, identity, key, certificate, clientKey, false) }
     else if mode == "drain" { result = closing(root, identity, key, certificate, clientKey, true) }
