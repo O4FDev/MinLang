@@ -1,7 +1,7 @@
 # v2 implementation and verification map
 
 This checkpoint describes the combined implementation based on
-`e2862a3f2464f5b4a247cb5a39ee1c8c870e4dbb` at 22:08 UTC on 2026-10-11.
+`49edb0f6bf28f7f44251a1f3ba0f1da18aede1cf` at 23:12 UTC on 2026-10-11.
 An implemented API, a passing focused suite and a complete deployment are
 separate claims. Retained results establish only their recorded source and
 configuration. Combined CI, current macOS/Windows gates, ordinary performance
@@ -54,12 +54,13 @@ Actual Windows evidence at frozen `a154153` passed all 21 native progress
 cases. Its sanitizer progress gate failed at `system-k1024/n2048` on the
 unchanged `idle_cpu <= .02` assertion after seven successful cases.
 Registration, witness, additive and registered-growth gates passed separately.
-That recurring idle failure remains unresolved; neither a diagnostic pass nor
-a collector work-count bound certifies it.
+That recurring idle failure remained unresolved at that source; neither a
+diagnostic pass nor a collector work-count bound certifies it. The fresh
+current-source critical Windows check below now passes independently.
 
 The current Linux native and sanitizer progress matrices passed, including the
 unchanged one-second `system-k1024/n2048` idle oracle. The native case measured
-about 0.50% of one CPU. This does not resolve the Windows failure. A later
+about 0.50% of one CPU. That Linux result does not resolve the Windows failure. A later
 Windows VM readiness attempt exceeded the whole-host 75% resource ceiling
 before any current product test ran; the guest was stopped and its retained
 backing image was unchanged.
@@ -83,7 +84,7 @@ recheck it and fall back when a full rebuild or anchor transfer invalidates it.
 The 540 native/sanitizer cases and 23 serial safety commands passed. Ordinary
 system/default runtime objects remained identical; native and sanitizer idle
 maxima were 1.1504% and 1.1485% under the unchanged one-second/2% gate.
-This fixes neither device capacity nor Windows idle.
+This focused regression does not establish device capacity or Windows idle.
 
 A separate first-insertion fix now preserves a full proof build when the
 source and child are distinct, independently held, unregistered and unexposed
@@ -96,7 +97,19 @@ descendant, self-cycle and anchor controls. All 25 serial safety commands
 passed. Ordinary runtime objects remained identical; native and sanitizer
 idle maxima were 0.3594% and 0.5826% under the unchanged one-second/2% gate.
 The fresh 32-device baseline passes; the 4,096-device setup still fails.
-Current Windows checks remain pending.
+Fresh Windows critical-idle and bridge results are recorded below; the full
+current Windows portable suite remains unqualified.
+
+A new full-MARK zero-count regression is still under development. An actual
+per-poll trace shows that removing a scanned dead owner's edge and dropping
+the matching child reference preserves the child's external count, yet requests
+a rescan. The first test also released its independently held primary before
+measuring locality, requiring an unrelated replacement proof. With that fixture
+corrected, payload/count/root-drop and empty-heap assertions pass, and eight
+borrows take eight units under the unchanged 192-unit limit. Initial cleanup
+still performs two full epochs/completions instead of the required one.
+The candidate runtime is isolated and unqualified; expiry and safety controls
+do not substitute for this remaining regression or a capacity pass.
 
 ## Recoverable errors
 
@@ -231,6 +244,15 @@ process, Compose and network retirement receipts. The current-source
 128-cell matrix and multi-hour tests remain incomplete. The small evidence
 archive has 274 independently verified indexed files, including actual build
 bindings, raw verdicts and teardown records.
+
+The QNS preferred-address fixture at `49edb0f6` now supplies IPv4 and IPv6
+ports independently, and its official-runner adapter resolves both server
+aliases. A new authenticated-tuple oracle first rejected the old fixture's
+IPv6 address with port zero despite a successful transfer and path validation.
+Native and sanitizer IPv4/IPv6 cases now pass exact tuple, path and one-MiB
+payload assertions. These are loopback fixture checks; the official migration
+follow-up remains separate, and the earlier primary matrix nonpasses remain
+unchanged. Its 107 indexed metadata/source files were independently verified.
 
 Actual runner failures exposed fixture defects in Docker 29 capability
 spelling, simulator capture writers that had not flushed during shutdown, and
@@ -372,14 +394,28 @@ disposal, layout invalidation, shared-loop idle settling, notifications and
 compiled debug/release API contracts. Separate real SChannel checks passed
 server rejection cases and nonexportable CNG mutual TLS under TLS 1.2 and 1.3.
 These passes supersede the earlier window-handle/shared-loop failures at those
-sources, but do not certify current Windows portable CI or the unresolved
-sanitizer idle gate. UI parity with macOS is also incomplete; see
-[the Windows contract](windows.md). A direct encrypted sparse-copy canary
-between the existing Boat hosts has passed, including content, sparse extent,
-forced endpoint and exact retirement checks. The retained Windows VM is now
-being copied directly between those hosts before current idle and bridge
-checks; no VM image or disposable authentication profile passes through this
-computer.
+sources, but do not certify current Windows portable CI. UI parity with macOS
+is also incomplete; see [the Windows contract](windows.md).
+
+The retained Windows VM was copied directly between the existing Boat hosts;
+the full base-image hash matches, and no VM image or disposable authentication
+profile passed through this computer. At frozen `2bb1ee1`, the original
+one-second `system-k1024/n2048` idle case passes on native Windows: sanitizer
+CPU is 1.5625% of one CPU and native CPU is zero, under the unchanged 2% limit.
+Both finish normally with empty diagnostics and zero retained objects/bytes.
+Five maintained native bridge fixtures also pass; the Explorer-dependent tray
+case was skipped.
+
+A default POSIX resource wrapper stopped the first language bootstrap before
+any language probe ran. A separate genuine cold bootstrap using the existing
+Windows CI configuration then passed all six unchanged debug/release bridge,
+shared-loop and notification language probes. The contained Windows Job closed
+with zero active processes, the VM stopped normally, and no sampled whole-host
+CPU/RAM limit was exceeded. The 406 indexed source/metadata files were
+independently verified. Additional PE/link/frontend receipts remain in the
+guest's owned output directory and require recovery in the next layout session;
+these results do not establish default-wrapper support, full portable CI,
+layout completion or interactive tray behavior.
 
 The updater authenticates Ed25519 manifests, rollout selection and monotonic
 versions; installs indexed regular-file app/resource trees; and validates an
