@@ -144,12 +144,13 @@ static void scenario(unsigned n, const char *label, int assert_local) {
             "valid_after_drop=%u final_valid=%u\n",
             label, n, rounds, work, rc_cycle_epochs - epochs, rc_cycle_cached_requests - cached,
             rc_cycle_completed - completed, valid_after_drop, rc_cycle_proof_valid);
-    if (!strcmp(label, "borrow") || !strcmp(label, "fieldless")) {
+    if (!strcmp(label, "borrow") || !strcmp(label, "fieldless") ||
+        !strcmp(label, "replacement")) {
         assert(valid_after_drop == rounds);
         assert(rc_cycle_epochs == epochs);
         assert(work <= 16u * rounds + 64u);
     }
-    if (!strcmp(label, "remove-live") || !strcmp(label, "replacement"))
+    if (!strcmp(label, "remove-live"))
         assert(rc_cycle_epochs > epochs);
     minyar_rc_release(g.root);
     empty();

@@ -59,7 +59,7 @@ def run(command, environment, output, label, resource):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--sanitize", action="store_true")
-    p.add_argument("--fixture", choices=["cycle-additive.c", "cycle-registry-growth.c"], default="cycle-additive.c")
+    p.add_argument("--fixture", choices=["cycle-additive.c", "cycle-registry-growth.c", "cycle-leaf-churn.c"], default="cycle-additive.c")
     p.add_argument("--case", choices=["all", "registered", "callbacks", "streaming", "safety", "active"], default="all")
     p.add_argument("--profiles", nargs="+", choices=["system", "fixed", "lazy", "eager"],
                    default=None)

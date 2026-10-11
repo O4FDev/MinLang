@@ -125,7 +125,15 @@ int main(int argc, char **argv) {
     unsigned n = (unsigned)strtoul(argv[1], NULL, 10);
     assert(n >= 32 && n <= 2048);
     unsigned phase = argc == 4 ? (unsigned)strtoul(argv[3], NULL, 10) : 0;
-    churn(n, argv[2], phase);
+    if (!strcmp(argv[2], "all")) {
+        churn(n, "churn", 0);
+        churn(n, "late", 0);
+        churn(n, "registered", 0);
+        for (unsigned active = RC_CYCLE_ROOTS; active <= RC_CYCLE_SWEEP; active++)
+            churn(n, "active", active);
+    } else {
+        churn(n, argv[2], phase);
+    }
     empty();
     return 0;
 }

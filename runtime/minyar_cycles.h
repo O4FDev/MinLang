@@ -264,16 +264,24 @@ static inline void rc_cycle_unregister(RcObject *object) {
         rc_cycle_unlink(cycle);
     cycle->gray_next = 0;
 }
-#ifdef MINYAR_BOUNDED_RC
-/* Only an irreversibly dead, unregistered object may carry this bit. It is
- * separate from live proof/exposure tags; allocation and registration reset it. */
-enum { RC_CYCLE_PRIVATE_DEAD = 8 };
 static inline int rc_cycle_primary_idle(void) {
     return !rc_cycle_inside && rc_cycle_phase == RC_CYCLE_IDLE && !rc_cycle_pending &&
            !rc_cycle_requested && !rc_cycle_rescan && !rc_cycle_local_requested &&
            rc_cycle_proof_valid && !rc_cycle_proof_build && rc_cycle_anchor_held() &&
            !rc_cycle_proof_anchor->pinned;
 }
+/* A live unregistered object has no outgoing traced edge: the first such
+ * edge registers its source. Bit 2 may remember exposure by a captured parent;
+ * later registration must still invalidate that parent's completed proof. */
+static inline int rc_cycle_unregistered_leaf(RcCycle *cycle) {
+    return !cycle->registered && !cycle->pinned && !cycle->cleared &&
+           !(cycle->gray_next & ~(uintptr_t)4) &&
+           (rc_cycle_object(cycle)->ownership >> 3) != 0;
+}
+#ifdef MINYAR_BOUNDED_RC
+/* Only an irreversibly dead, unregistered object may carry this bit. It is
+ * separate from live proof/exposure tags; allocation and registration reset it. */
+enum { RC_CYCLE_PRIVATE_DEAD = 8 };
 /* Called only after a real outside-collector RC decrement reached zero, before
  * the bounded queue reuses ownership as its link. A fresh uncaptured owner has
  * never contributed an anchor path; retiring it cannot remove a proven edge. */
@@ -433,8 +441,12 @@ static MINYAR_NOINLINE void rc_cycle_add_incoming(RcObject *parent, RcCycle *cyc
      * even when a temporary borrower makes its count external. Unexposed
      * inbound parents remain in the finite unknown cohort and cannot have
      * been omitted as completed known parents. */
+    /* Replacing a leaf cannot remove a path to any registered descendant.
+     * Restrict this exception to a completed idle proof. Exposure above remains
+     * sticky so a leaf gaining its first traced child rejoins captured parents. */
+    unsigned leaf = rc_cycle_unregistered_leaf(cycle) && rc_cycle_primary_idle();
     unsigned preserve =
-        additive && (was_registered || !source->incoming || !exposed) &&
+        (additive || leaf) && (was_registered || !source->incoming || !exposed) &&
         (rc_cycle_phase == RC_CYCLE_IDLE ||
          (rc_cycle_local_job && (rc_cycle_phase != RC_CYCLE_SWEEP || !cycle->registered ||
                                  rc_cycle_proven(cycle) || rc_cycle_snapshot_new(cycle)))) &&
@@ -507,7 +519,11 @@ static inline void rc_cycle_edge_remove(void *value) {
     RcCycle *cycle = rc_cycle_value(value);
     if (!cycle)
         return;
-    rc_cycle_proof_invalidate();
+    rc_cycle_temporary_changed();
+    /* Removing a live leaf changes no proven path to a registered object.
+     * Active finite cohorts and registered removals remain conservative. */
+    if (!rc_cycle_unregistered_leaf(cycle) || !rc_cycle_primary_idle())
+        rc_cycle_proof_invalidate();
     rc_cycle_shade(cycle);
     cycle->incoming--;
 }
