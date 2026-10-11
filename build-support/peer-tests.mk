@@ -2,7 +2,7 @@ PEER_SUITES ?= tests/peer-regressions.py tests/peer-cpp-java-js.py tests/peer-ru
 PEER_DRIVER_ARTIFACTS = build/minyarc build/minyarc-modules build/minyar-default-runtime.o
 # Only the extended Rust/Go/Zig suite exercises the POSIX incremental driver.
 ifneq ($(filter tests/peer-rust-go-zig.py,$(PEER_SUITES)),)
-PEER_DRIVER_ARTIFACTS += build/minyar-module-build
+PEER_DRIVER_ARTIFACTS += build/minyar-module-build build/minyarc-errors-request
 endif
 
 .PHONY: check-stateful-lists check-stateful-lists-sanitize check-runtime-size-guards check-compiler-allocation-faults check-peer-ownership check-peer-sanitize check-peer-audit-harness check-evidence-harness check-peer-manifest check-peer-regressions check-peer-optimizations check-allocation-faults check-codegen check-reduction-harness
@@ -79,7 +79,8 @@ check-peer-sanitize: check-peer-manifest $(PEER_DRIVER_ARTIFACTS) build/minyarc-
 	@test -n "$(strip $(PEER_SUITES))" || { echo "PEER_SUITES must not be empty" >&2; exit 1; }
 	@for suite in $(PEER_SUITES); do MINYAR_PEER_GATE=check-peer-sanitize ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 "$$suite" || exit $$?; done
 
-check-peer-ownership: check-peer-manifest $(PEER_DRIVER_ARTIFACTS) build/minyarc-sanitize build/ownership-runtime.o
+# Ownership selects driver regressions independently of PEER_SUITES.
+check-peer-ownership: check-peer-manifest $(PEER_DRIVER_ARTIFACTS) build/minyar-module-build build/minyarc-errors-request build/minyarc-sanitize build/ownership-runtime.o
 	MINYAR_PEER_GATE=check-peer-ownership ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/peer-regressions.py \
 		PeerRegressions.test_mixed_width_boundary_views_survive_nonsequential_access \
 		PeerRegressions.test_self_join_keeps_old_alias_across_growth \

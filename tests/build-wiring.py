@@ -43,5 +43,48 @@ class BuildWiring(unittest.TestCase):
                     self.assertIn('tests/managed-graphs-launcher.py', result.stdout)
 
 
+    def test_peer_driver_gates_prepare_the_request_frontend(self):
+        # The real driver runs the request parser after status 1 or 86. Its
+        # artifact-only make shim must never trigger a build while testing
+        # rejection diagnostics or declaration-cache transitions.
+        with tempfile.TemporaryDirectory(prefix='minyar peer wiring ') as folder:
+            work = Path(folder)
+            makefile = work / 'probe.mk'
+            targets = (
+                'build/minyarc', 'build/minyarc-modules',
+                'build/minyar-default-runtime.o', 'build/minyar-module-build',
+                'build/minyarc-errors-request', 'build/minyar-runtime.o',
+                'build/minyarc-sanitize', 'build/minyar-runtime-sanitize.o',
+                'build/ownership-runtime.o')
+            makefile.write_text(
+                'include ' + str(ROOT / 'build-support/peer-tests.mk').replace(' ', '\\ ') + '\n'
+                '.PHONY: ' + ' '.join(targets) + '\n' +
+                ' '.join(targets) + ':\n\t@echo ARTIFACT $@\n')
+            for suite in ('tests/peer-rust-go-zig.py', 'tests/peer-regressions.py'):
+                for gate in ('check-peer-regressions', 'check-peer-optimizations',
+                             'check-peer-sanitize', 'check-peer-ownership'):
+                    with self.subTest(suite=suite, gate=gate):
+                        env = dict(os.environ)
+                        env.pop('MAKEFLAGS', None)
+                        result = subprocess.run(
+                            ['make', '-n', '-f', str(makefile),
+                             'PEER_SUITES=' + suite, gate],
+                            cwd=work, env=env, text=True, capture_output=True,
+                            timeout=10)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        artifacts = {
+                            line.split('ARTIFACT ', 1)[1]
+                            for line in result.stdout.splitlines()
+                            if 'ARTIFACT ' in line}
+                        needs_driver = (suite == 'tests/peer-rust-go-zig.py'
+                                        or gate == 'check-peer-ownership')
+                        self.assertEqual(
+                            'build/minyarc-errors-request' in artifacts,
+                            needs_driver)
+                        self.assertEqual(
+                            'build/minyar-module-build' in artifacts,
+                            needs_driver)
+
+
 if __name__ == '__main__':
     unittest.main()
