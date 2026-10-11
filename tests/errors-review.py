@@ -448,6 +448,13 @@ print("clean each iteration")
                     self.assertNotIn('List position', result.stderr)
 
     def test_review_results_cannot_cross_scalar_parallel_or_native_abi(self):
+        for type in ['Result<Integer, Text>', 'List<Result<Integer, Text>>',
+                     'Callback<Result<Integer, Text>>', 'Text', 'Bytes', 'Box']:
+            for suffix in ['', 'let entry = parallelEntry(bad)\n']:
+                with self.subTest(parameter_type=type, entry=bool(suffix)):
+                    self.rejects('record Box { value: Integer }\nparallel function bad(result: '
+                                 + type + '): Integer { return 1 }\n' + suffix,
+                                 'may use only Integer')
         for source, diagnostic in [
             ('parallel function bad(result: Result<Integer, Text>): Integer { return 1 }\n', 'may use only Integer'),
             ('parallel function bad(): Result<Integer, Integer> { return Ok<Integer, Integer>(1) }\n', 'may use only Integer'),
