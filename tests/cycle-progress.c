@@ -12,6 +12,7 @@ static long long slot(void *value) {
 static size_t waits, maximum_work;
 
 static long long service_wait(long long timeout) {
+    size_t cycle_units = rc_cycle_units;
 #ifdef MINYAR_CYCLE_LEGACY_SERVICE
     long long result = minyar_callbackruntime_service() ? 0 : timeout;
 #else
@@ -19,8 +20,11 @@ static long long service_wait(long long timeout) {
 #endif
 #ifdef MINYAR_BOUNDED_RC
     assert(rc_bounded_last_work <= MINYAR_RC_POLL_BUDGET);
+    assert(rc_cycle_units - cycle_units <= rc_bounded_last_work);
     if (maximum_work < rc_bounded_last_work)
         maximum_work = rc_bounded_last_work;
+#else
+    assert(rc_cycle_units - cycle_units <= 32);
 #endif
     assert(result == timeout || (result >= 0 && result <= 10));
     return result;
