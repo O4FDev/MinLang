@@ -33,9 +33,9 @@ class ModuleTestDriver(CompilerTestCase):
             'arguments[1]=os.environ["MODULE_DRIVER_PROJECT"]\n'
             'sys.exit(subprocess.call([sys.executable,os.environ["MODULE_DRIVER_REAL"],*arguments]))\n')
         environment = dict(os.environ, MINYAR_TEST_COMPILER=native_path(COMPILER),
-                           MINYAR_TEST_CLANG=CLANG, MODULE_DRIVER_LOG=native_path(log),
-                           MODULE_DRIVER_PROJECT=native_path(ROOT),
-                           MODULE_DRIVER_REAL=native_path(ROOT / 'tools/clang-driver.py'))
+                           MINYAR_TEST_CLANG=CLANG, MODULE_DRIVER_LOG=str(log),
+                           MODULE_DRIVER_PROJECT=str(ROOT),
+                           MODULE_DRIVER_REAL=str(ROOT / 'tools/clang-driver.py'))
         result = self.evidence.run(['sh', native_path(project / 'tests/run-module-tests.sh')],
                                    env=environment, text=True, timeout=240, phase='module-shell-harness')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

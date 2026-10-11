@@ -117,6 +117,23 @@ with Evidence("stdin-parent") as evidence:
                 self.assertEqual(base64.b64decode(observed['inherited']), payload)
                 self.assertEqual(observed['modes'], ['eof', 'inherited'])
 
+    def test_text_newlines_match_subprocess_without_changing_raw_evidence(self):
+        payload = b'one\r\ntwo\rthree\n\x00tail'
+        command = [sys.executable, '-c',
+                   'import sys; sys.stdout.buffer.write(%r); sys.stderr.buffer.write(%r)' %
+                   (payload, payload)]
+        oracle = subprocess.run(command, capture_output=True, text=True, timeout=5)
+        with Evidence('text-newlines') as evidence:
+            observed = evidence.run(command, text=True, timeout=5)
+            self.assertEqual((observed.returncode, observed.stdout, observed.stderr),
+                             (oracle.returncode, oracle.stdout, oracle.stderr))
+            self.assertEqual(oracle.stdout, 'one\ntwo\nthree\n\x00tail')
+            row = evidence.commands[-1]
+            self.assertEqual(base64.b64decode(row['stdout_base64']), payload)
+            self.assertEqual(base64.b64decode(row['stderr_base64']), payload)
+            binary = evidence.run(command, timeout=5)
+            self.assertEqual((binary.stdout, binary.stderr), (payload, payload))
+
     def test_explicit_binary_and_text_input_are_recorded_and_replayed(self):
         command = [sys.executable, '-c', 'import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())']
         for payload, text in ((b'\x00\xffbinary\n', False), ('é🙂\x00\n', True)):
