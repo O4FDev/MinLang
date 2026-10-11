@@ -160,7 +160,7 @@ MinyarBytes *minyar_desktop_setLaunchAtLoginRaw(bool enabled) { @autoreleasepool
 @property(nonatomic) uint32_t error;
 @property(nonatomic) NSInteger nativeCode;
 @property(nonatomic,copy) NSString *identifier;
-@property(nonatomic,copy) NSString *title,body;
+@property(nonatomic,copy) NSString *title, *body;
 @end
 @implementation DesktopNotice
 @end
