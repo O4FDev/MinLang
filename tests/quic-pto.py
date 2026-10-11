@@ -43,7 +43,8 @@ def main():
         env["ASAN_OPTIONS"] = "detect_leaks=" + ("1" if sys.platform.startswith("linux") else "0")
         env["UBSAN_OPTIONS"] = "halt_on_error=1"
     inputs = [ROOT / "tests/quic-pto.min", ROOT / "tests/quic-pto.py",
-              ROOT / "tests/tls-local.py", ROOT / "tests/test_evidence.py", ROOT / "minyar"]
+              ROOT / "tests/tls-local.py", ROOT / "tests/test_evidence.py",
+              ROOT / "tests/clang_helpers.py", ROOT / "minyar"]
     for base in ("library", "runtime", "compiler", "tools"):
         inputs += [p for p in (ROOT / base).rglob("*")
                    if p.is_file() and p.suffix in (".min", ".c", ".h", ".py", ".sh")]
