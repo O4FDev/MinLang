@@ -53,6 +53,9 @@ static bool accessory;
 static HWND tray_window;
 static UINT next_tray = 1, taskbar_created;
 static unsigned next_command = 1;
+#ifdef MINYAR_WINDOWS_TEST
+static unsigned long long measured_controls, positioned_controls;
+#endif
 static const wchar_t window_class[] = L"MinyarWindowV1";
 #ifdef MINYAR_APP_EVENT_LOOP
 extern bool minyar_net_appLoopWindowsValid(long long);
@@ -240,6 +243,9 @@ static void measure(Widget *w, int *width, int *height) {
                                                    : 100);
         return;
     }
+#ifdef MINYAR_WINDOWS_TEST
+    measured_controls++;
+#endif
     wchar_t *text = read_text(w->handle);
     HDC dc = GetDC(w->handle);
     HFONT old = SelectObject(dc, w->font ? w->font : GetStockObject(DEFAULT_GUI_FONT));
@@ -261,6 +267,9 @@ static void measure(Widget *w, int *width, int *height) {
 }
 static void arrange(Widget *w, int x, int y, int width, int height) {
     if (w->handle && w->kind != WINDOW) {
+#ifdef MINYAR_WINDOWS_TEST
+        positioned_controls++;
+#endif
         SetWindowPos(w->handle, NULL, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
         return;
     }
@@ -1206,6 +1215,14 @@ MinyarText *minyar_windows_eventText(void) {
     return narrow(current.text ? current.text : L"");
 }
 #ifdef MINYAR_WINDOWS_TEST
+unsigned long long minyar_windows_testMeasures(void) {
+    thread();
+    return measured_controls;
+}
+unsigned long long minyar_windows_testPositions(void) {
+    thread();
+    return positioned_controls;
+}
 HWND minyar_windows_testHandle(long long value) {
     thread();
     return get(value)->handle;
