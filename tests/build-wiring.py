@@ -1491,7 +1491,9 @@ class BuildWiring(unittest.TestCase):
         inputs = {'tests/quic-official-adapter.py',
                   'tests/interop/qns/owned_adapter.py',
                   'tests/interop/qns/controls-requirements.txt',
-                  'scripts/check-quic-official-inputs.py'}
+                  'scripts/check-quic-official-inputs.py',
+                  'tests/quic-simulator-shutdown.py',
+                  'tests/interop/qns/simulator-shutdown.sh'}
         aggregates = ('check', 'check-portable', 'check-quic', 'check-quic-sanitize',
                       'check-quic-rfc', 'check-quic-rfc-sanitize', 'check-sanitize')
 
