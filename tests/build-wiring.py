@@ -194,7 +194,7 @@ class BuildWiring(unittest.TestCase):
         def verify(candidate):
             with tempfile.TemporaryDirectory(prefix='actual sanitizer Make rules ') as folder:
                 probe = Path(folder)/'probe.mk'
-                probe.write_text(candidate + '\nbuild:\n')
+                probe.write_text(candidate + '\n.PHONY: build build/minyarc\nbuild build/minyarc:\n')
                 result = subprocess.run(['make', '-rRnp', '-f', str(probe), 'check'],
                                         cwd=ROOT, capture_output=True, text=True, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr)
