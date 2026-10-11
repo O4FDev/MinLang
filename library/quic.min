@@ -974,6 +974,38 @@ function pendingPayload(connection: Connection, payload: Bytes): Bytes {
 // Poll-local metadata is rebuilt each turn because public pending payloads
 // can be changed between polls. Retry filtering still returns copied bytes.
 function polledPayload(connection: Connection, payload: Bytes, filter: Boolean): PolledPayload {
+    // A complete single STREAM has no ACK or path metadata. Decode its
+    // header without copying application data into a temporary Frame.
+    // Every unqualified payload still uses the ordinary parser below.
+    if filter && payload.length > 0 && payload.length <= 65535 && payload[0] >= 8 && payload[0] <= 15 {
+        let type = payload[0]; let id = wire.varint(payload,1)
+        if id.valid {
+            let at = id.end; let offset = 0; let valid = true
+            if (type & 4) != 0 {
+                let decoded = wire.varint(payload,at)
+                valid = decoded.valid; offset = decoded.value; at = decoded.end
+            }
+            let length = payload.length - at
+            if valid && (type & 2) != 0 {
+                let decoded = wire.varint(payload,at)
+                valid = decoded.valid; length = decoded.value; at = decoded.end
+            }
+            if valid && length == payload.length - at && length <= wire.MAX_VARINT - offset {
+                let keep = true; let index = streamIndex(connection,id.value)
+                if streamRetired(connection,id.value) { keep = false }
+                else if index >= 0 {
+                    let output = connection.streams[index]
+                    if output.sendReset || rangeDelivered(output,offset,length,(type & 1) != 0) { keep = false }
+                }
+                let result = payload; if !keep { result = Bytes() }
+                return PolledPayload {
+                    payload: result
+                    parsed: wire.Frames { valid: true; frames: []; error: errors.none() }
+                    eliciting: keep; challenge: false
+                }
+            }
+        }
+    }
     let parsed = wire.frames(payload); let result = payload; let changed = false
     if filter && !parsed.valid { result = Bytes() }
     for frame in parsed.frames {
