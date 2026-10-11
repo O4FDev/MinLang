@@ -104,6 +104,115 @@ class ObservabilityHarness(unittest.TestCase):
             self.assertTrue(any(expected in note
                                 for note in getattr(captured.exception, '__notes__', [])))
 
+
+    def test_windows_job_assigns_before_resume_and_keeps_descendants_owned(self):
+        from windows_job_owner import owned_job_run
+        from types import SimpleNamespace
+        class API:
+            def __init__(self):
+                self.calls = []
+                self.counts = iter((2, 1, 0))
+            def create_job(self):
+                self.calls.append('create noninheritable kill-on-close job')
+                return 'owned'
+            def spawn_suspended(self, *args):
+                self.calls.append('atomic job-list suspended spawn')
+                return SimpleNamespace(pid=123, tid=456)
+            def verify_assignment(self, *args):
+                self.calls.append('verify own job')
+            def resume(self, *args):
+                self.calls.append('resume')
+            def active(self, *args):
+                count = next(self.counts)
+                self.calls.append('active=' + str(count))
+                return count
+            def status(self, *args):
+                self.calls.append('root status')
+                return 0
+            def close(self):
+                self.calls.append('close owned handles')
+                return []
+        api = API()
+        request = {'argv': ['owned-command'], 'cwd': str(self.root),
+                   'stdout_path': str(self.root/'out'), 'stderr_path': str(self.root/'err'),
+                   'timeout_seconds': 1}
+        report = {}
+        owned_job_run(api, request, report)
+        self.assertEqual(api.calls[:4], [
+            'create noninheritable kill-on-close job', 'atomic job-list suspended spawn',
+            'verify own job', 'resume'])
+        self.assertLess(api.calls.index('active=0'), api.calls.index('close owned handles'))
+        self.assertTrue(report['closed'])
+        self.assertFalse(report['job_inheritable'])
+        self.assertFalse(report['breakaway_allowed'])
+
+    def test_windows_job_exited_root_child_timeout_requires_zero_count(self):
+        from windows_job_owner import owned_job_run
+        from types import SimpleNamespace
+        class API:
+            def create_job(self):
+                self.terminated = False
+                return 'owned'
+            def spawn_suspended(self, *args):
+                return SimpleNamespace(pid=123, tid=456)
+            def verify_assignment(self, *args):
+                pass
+            def resume(self, *args):
+                pass
+            def active(self, *args):
+                return 0 if self.terminated else 1
+            def terminate(self, *args):
+                self.terminated = True
+            def status(self, *args):
+                return 0  # Root exit does not prove its child ended.
+            def close(self):
+                return []
+        request = {'argv': ['owned-command'], 'cwd': str(self.root),
+                   'stdout_path': str(self.root/'out'), 'stderr_path': str(self.root/'err'),
+                   'timeout_seconds': 1}
+        api, report = API(), {}
+        with patch('windows_job_owner.time.monotonic', side_effect=(0, 2, 3)):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                owned_job_run(api, request, report)
+        self.assertTrue(api.terminated)
+        self.assertEqual(report['active_processes'], 0)
+        self.assertTrue(report['closed'])
+        self.assertTrue(report['timed_out'])
+        self.assertEqual(report['status'], 0)
+
+    def test_windows_assignment_or_close_failure_never_releases_uncontained_code(self):
+        from windows_job_owner import owned_job_run
+        from types import SimpleNamespace
+        class API:
+            resumed = False
+            def create_job(self):
+                self.terminated = False
+                return 'owned'
+            def spawn_suspended(self, *args):
+                return SimpleNamespace(pid=123, tid=456)
+            def verify_assignment(self, *args):
+                raise ValueError('controlled assignment failure')
+            def resume(self, *args):
+                self.resumed = True
+            def active(self, *args):
+                return 0 if self.terminated else 1
+            def terminate(self, *args):
+                self.terminated = True
+            def status(self, *args):
+                return 253
+            def close(self):
+                raise OSError('controlled close failure')
+        request = {'argv': ['owned-command'], 'cwd': str(self.root),
+                   'stdout_path': str(self.root/'out'), 'stderr_path': str(self.root/'err'),
+                   'timeout_seconds': 1}
+        api, report = API(), {}
+        with self.assertRaisesRegex(ValueError, 'controlled assignment failure') as captured:
+            owned_job_run(api, request, report)
+        self.assertFalse(api.resumed)
+        self.assertFalse(report['closed'])
+        self.assertTrue(any('controlled close failure' in note
+                            for note in getattr(captured.exception, '__notes__', [])))
+
     def test_raw_streams_are_retained_without_text_normalization(self):
         destination = self.root/'raw'
         destination.mkdir()
@@ -201,22 +310,15 @@ class ObservabilityHarness(unittest.TestCase):
         self.assertIn('contract setup red', report['exception'])
         self.assertEqual(report['cases'], [])
 
-    def test_windows_mode_never_requests_a_posix_session(self):
-        destination = self.root/'native-mode'
-        destination.mkdir()
-        report = {'commands': [], 'finalization_errors': []}
-        owner = self.driver.CommandRecords(destination, report)
-        real_popen = subprocess.Popen
-        options = []
-        def spawn(*args, **kwargs):
-            options.append(kwargs['start_new_session'])
-            return real_popen(*args, **kwargs)
-        with patch.object(self.driver, 'windows_host', return_value=True), \
-                patch.object(self.driver.subprocess, 'Popen', side_effect=spawn):
-            result = owner.run([sys.executable, '-c', 'print(42)'],
-                               timeout=5, label='no-posix-session')
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(options, [False])
+    def test_windows_helper_launch_never_requests_a_posix_session(self):
+        import ast
+        tree = ast.parse((ROOT/'tests/windows_job_owner.py').read_text())
+        launches = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute) and node.func.attr == 'Popen']
+        self.assertEqual(len(launches), 1)
+        option = next(value for value in launches[0].keywords if value.arg == 'start_new_session')
+        self.assertIs(ast.literal_eval(option.value), False)
+        # This source contract alone never certifies a Windows native API call.
 
 
 if __name__ == '__main__':
