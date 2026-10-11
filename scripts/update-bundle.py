@@ -33,8 +33,14 @@ def safe_path(value):
     return value
 
 def snapshot(info):
+    attributes=getattr(info,'st_file_attributes',0)
+    if stat.S_ISDIR(info.st_mode):
+        # NTFS can expose this internal directory-index bit through the path
+        # query and drop it after enumeration. It is not part of bundle v1.
+        # Retain every other attribute, including readonly and reparse bits.
+        attributes&=~0x10000000
     return (info.st_dev,info.st_ino,info.st_mode,info.st_size,info.st_mtime_ns,info.st_ctime_ns,
-            getattr(info,'st_file_attributes',0))
+            attributes)
 
 def forbidden(info):
     return stat.S_ISLNK(info.st_mode) or bool(getattr(info,'st_file_attributes',0)&0x400)
