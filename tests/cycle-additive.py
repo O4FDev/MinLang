@@ -5,6 +5,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 from cycle_runtime import engine_source
+from clang_helpers import asan_leak_options, windows_host
+from test_evidence import terminate_process_tree
 
 def counters():
     rows = Path("/proc/stat").read_text().splitlines()[0].split()[1:]
@@ -13,7 +15,7 @@ def counters():
     total = sum(values[:8])
     return total, values[3] + values[4]
 def run(command, environment, output, label, resource):
-    proc = subprocess.Popen(command, cwd=ROOT, env=environment, start_new_session=True,
+    proc = subprocess.Popen(command, cwd=ROOT, env=environment, start_new_session=not windows_host(),
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     previous = counters() if platform.system() == "Linux" else None
     started = time.monotonic()
@@ -34,9 +36,9 @@ def run(command, environment, output, label, resource):
                 os.killpg(proc.pid, signal.SIGCONT); stopped = False
                 resource.append({"label": label, "action": "resume", "aggregate_cpu_percent": usage})
         if time.monotonic() - started > 180:
-            os.killpg(proc.pid, signal.SIGKILL)
+            terminate_process_tree(proc)
             break
-    stdout, stderr = proc.communicate()
+    stdout, stderr = proc.communicate(timeout=10)
     (output / (label + ".stdout")).write_text(stdout)
     (output / (label + ".stderr")).write_text(stderr)
     resource.append({"label": label, "maximum_aggregate_cpu_percent": maximum})
@@ -57,11 +59,12 @@ def main():
     (ROOT / "build/managed-graphs-engine.c").write_text(engine_source(ROOT))
     headers = sorted((ROOT / "runtime").glob("*.h"))
     inputs = [ROOT/"tests/cycle-additive.c", Path(__file__).resolve(),
-              ROOT/"tools/cycle_runtime.py", ROOT/"runtime/minyar_runtime.c", *headers]
+              ROOT/"tools/cycle_runtime.py", ROOT/"tests/clang_helpers.py",
+              ROOT/"tests/test_evidence.py", ROOT/"runtime/minyar_runtime.c", *headers]
     report = {"passed": False, "sanitize": args.sanitize, "cases": [], "resources": [],
               "source_sha256": {str(f.relative_to(ROOT)):hashlib.sha256(f.read_bytes()).hexdigest()
                                 for f in inputs}}
-    environment = dict(os.environ, ASAN_OPTIONS="detect_leaks=1:halt_on_error=1",
+    environment = dict(os.environ, ASAN_OPTIONS=asan_leak_options()+":halt_on_error=1",
                        UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1")
     options = {"system":["-DMINYAR_SYSTEM_HEAP=1"], "fixed":["-DMINYAR_BOUNDED_HEAP=1"],
                "lazy":["-DMINYAR_BOUNDED_HEAP=1","-DMINYAR_LAZY_HEAP=1"], "eager":[]}
@@ -73,7 +76,7 @@ def main():
         for profile in args.profiles:
             for budget in ([32] if profile == "eager" else args.budgets):
                 label = profile+"-k"+str(budget)
-                binary = out/label
+                binary = out/(label+(".exe" if windows_host() else ""))
                 command = [os.environ.get("MINYAR_TEST_CLANG","clang"), *flags, "-std=c11",
                            "-Wall","-Wextra","-Werror","-iquote",str(ROOT/"runtime"),
                            *options[profile], "-DMINYAR_BOUNDED_HEAP_BYTES=1048576",
