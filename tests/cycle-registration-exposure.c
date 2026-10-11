@@ -421,12 +421,22 @@ static void internal_completed_parent(void) {
     minyar_record_set_traced(payload, 2, 123);
     Late s = {g, parent, receiver, 0, 0};
     drain();
-    if (rc_cycle_local_generation != rc_cycle_value(g.root)->generation) {
+    MinyarRecord *triggers[2] = {NULL, NULL};
+    unsigned trigger_count = 0;
+    do {
+        assert(trigger_count < 2);
+        MinyarRecord *trigger = minyar_record_new_traced(1);
+        MinyarRecord *leaf = minyar_record_new_traced(1);
+        minyar_record_set_take_traced(trigger, 0, slot(leaf));
+        triggers[trigger_count++] = trigger;
+        if (rc_cycle_local_generation == rc_cycle_value(g.root)->generation)
+            break;
         rc_cycle_request_local();
         drain();
-    }
+    } while (1);
     assert(rc_cycle_local_generation == rc_cycle_value(g.root)->generation);
     assert(!pending() && rc_cycle_phase == RC_CYCLE_IDLE && rc_cycle_proof_valid);
+    assert(!rc_cycle_temporary_valid);
     rc_cycle_request_local();
     rc_cycle_unit();
     assert(rc_cycle_phase == RC_CYCLE_ROOTS && rc_cycle_local_job);
@@ -441,9 +451,12 @@ static void internal_completed_parent(void) {
     assert((((RcObject *)parent - 1)->ownership >> 3) == internal->incoming);
     drain();
     MinyarList *list = receiver;
-    assert(rc_object_count == 7 && list->length == 1 && list->values[0] == slot(payload));
+    assert(rc_object_count == 7 + 2 * trigger_count && list->length == 1 &&
+           list->values[0] == slot(payload));
     assert(parent->values[0] == slot(g.root) && parent->values[1] == slot(receiver));
     assert(parent->values[2] == 99 && payload->values[1] == slot(g.root));
+    for (unsigned i = 0; i < trigger_count; i++)
+        minyar_rc_release(triggers[i]);
     minyar_rc_release(g.root);
     empty();
 }
