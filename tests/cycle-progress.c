@@ -145,6 +145,21 @@ int main(int argc, char **argv) {
     }
     assert(rc_object_count == N);
 #endif
+    /* A stable rooted read still queues its last-temporary request. Its
+     * witness validates in exactly one accounted unit, rather than starting
+     * another full cohort. This is independent of platform/polling speed. */
+    assert(!pending() && rc_cycle_phase == RC_CYCLE_IDLE);
+    size_t read_units = rc_cycle_units, read_completed = rc_cycle_completed;
+    minyar_rc_retain_traced(nodes[1]);
+    rc_drop(nodes[1]);
+    assert(pending() && rc_cycle_pending && rc_cycle_phase == RC_CYCLE_IDLE);
+#ifdef MINYAR_BOUNDED_RC
+    assert(rc_pending_count == 1);
+#endif
+    assert(service_wait(20) == 20);
+    assert(!pending() && rc_cycle_phase == RC_CYCLE_IDLE);
+    assert(rc_cycle_units - read_units == 1 && rc_cycle_completed == read_completed);
+    assert(rc_object_count == N && minyar_record_get(nodes[0], 0) == slot(nodes[0]));
     /* A large live cohort must not force the reactor to spin until its
      * final field. Pacing applies after each bounded cycle-only batch,
      * including ROOTS/MARK/SWEEP, while the real job stays queued. */
