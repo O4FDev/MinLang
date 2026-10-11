@@ -78,6 +78,16 @@ def snapshot_sources(source, work):
             for path in sorted(work.rglob('*')) if path.is_file()}
 
 
+def resolve_toolchain(clang, cxx):
+    tools = {name: shutil.which(command) for name, command in
+             [('clang', clang), ('clang++', cxx), ('make', 'make'), ('ld.lld', 'ld.lld')]}
+    if tools['clang']:
+        matching = Path(tools['clang']).resolve().parent / 'ld.lld'
+        if matching.is_file():
+            tools['ld.lld'] = str(matching)
+    return tools
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--source', type=Path, default=ROOT)
@@ -118,8 +128,7 @@ def main():
         p.error('this runner currently covers Linux aarch64 and x86_64')
     if missing:
         p.error('selected source lacks required profile implementation/fixtures: ' + ', '.join(missing))
-    tools = {name: shutil.which(command) for name, command in
-             [('clang', a.clang), ('clang++', a.cxx), ('make', 'make'), ('ld.lld', 'ld.lld')]}
+    tools = resolve_toolchain(a.clang, a.cxx)
     if not all(tools.values()):
         p.error('missing tools: ' + ', '.join(name for name, path in tools.items() if not path))
     if a.output_dir and not a.resume:
@@ -182,9 +191,14 @@ def main():
         wrapper.write_text('#!' + sys.executable + '\nimport os,sys\n'
                            'args=sys.argv[1:]\n'
                            'if not any(x in args for x in ("-c","-S","-E","-fsyntax-only","--version","-v")):\n'
-                           '    args=["-fuse-ld=lld",*args,"-lm"]\n'
+                           '    args=[' + repr('--ld-path=' + tools['ld.lld']) + ',*args,"-lm"]\n'
                            'os.execv(' + repr(tools[name]) + ',[' + repr(tools[name]) + ',*args])\n')
         wrapper.chmod(0o755)
+    # Nested cold-bootstrap probes inspect the wrapper's sibling linker.
+    # Keep that identity aligned with an explicitly selected LLVM release.
+    linker = bindir / 'ld.lld'
+    if not linker.exists():
+        linker.symlink_to(tools['ld.lld'])
     env = dict(os.environ)
     for name in list(env):
         if name.startswith('MINYAR_'):
