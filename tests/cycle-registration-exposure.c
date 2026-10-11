@@ -274,6 +274,46 @@ static void reused_receiver(int kind) {
         empty();
     }
 }
+/* A fresh local-namespace root may be shaded before its first full
+ * ROOTS visit. Consume its external owner only after that barrier queues it. */
+static void move_fresh_root_before_visit(int kind) {
+    Graph g = graph();
+    void *owner = receiver_new(kind);
+    MinyarRecord *root = minyar_record_new_traced(2);
+    MinyarRecord *leaf = minyar_record_new_traced(1);
+    minyar_record_set_traced(leaf, 0, 812);
+    unsigned char *map = (unsigned char *)(root->values + root->length);
+    map[0] = 1;
+    rc_cycle_edge_insert(root, leaf);
+    root->values[0] = slot(leaf);
+    root->values[1] = 511;
+    rc_cycle_commit_insert(root, leaf);
+    RcCycle *fresh = rc_cycle_value(root);
+    assert(fresh->marked == 3 && (fresh->gray_next & 4));
+    rc_cycle_request();
+    rc_cycle_unit();
+    assert(rc_cycle_phase == RC_CYCLE_ROOTS && !rc_cycle_local_job);
+    if (kind) {
+        MinyarRecord *r = owner;
+        unsigned char *owner_map = (unsigned char *)(r->values + r->length);
+        owner_map[0] = 1;
+    }
+    rc_cycle_edge_insert(owner, root);
+    assert(fresh->marked == 1 && rc_cycle_gray_head == fresh);
+    if (kind)
+        ((MinyarRecord *)owner)->values[0] = slot(root);
+    else {
+        MinyarList *l = owner;
+        l->values[l->length++] = slot(root);
+    }
+    rc_cycle_commit_insert(owner, root);
+    drain();
+    assert(rc_object_count == 7 && root->values[0] == slot(leaf) && root->values[1] == 511 &&
+           leaf->values[0] == 812);
+    minyar_rc_release(owner);
+    minyar_rc_release(g.root);
+    empty();
+}
 /* Normal public append polling still leaves this long active scan open.
  * The next public copied store certifies that parent, not its unvisited tail. */
 static void public_append_before_parent_certificate(int kind) {
@@ -367,6 +407,8 @@ int main(void) {
     queued_full_root();
     move_stale_root_before_visit(0);
     move_stale_root_before_visit(1);
+    move_fresh_root_before_visit(0);
+    move_fresh_root_before_visit(1);
     public_append_before_parent_certificate(0);
     public_append_before_parent_certificate(1);
     for (int kind = 0; kind < 2; kind++) {
