@@ -154,6 +154,14 @@ function application(root: Bytes, identity: Bytes, key: Bytes, certificate: Byte
     if c.spaces[2].next != next || quic.nextTimer(c) != fixed || c.congestion.probes != 1 { return 52 }
     return 0
 }
+function acknowledgeApplication(sender: quic.Connection, receiver: quic.Connection, number: Integer, now: Integer) {
+    let frame = Bytes(); frame.add(2)
+    frame.addBytes(errors.bytesValue(wire.encode(number))); frame.add(0); frame.add(0); frame.add(0)
+    let space = sender.spaces[2]; let header = Bytes(); header.add(0x43); header.addBytes(sender.remote)
+    for byte in 0..4 { header.add((space.next >> ((3-byte)*8)) & 255) }
+    let packet = errors.bytesValue(protection.protect(space.write, header, header.length-4, space.next, frame)); space.next += 1
+    quic.receive(receiver, packet, now)
+}
 // Accept early data with actual TLS keys, but block the queued client
 // Finished with the bounded admission state used below. Authenticated
 // application ACKs do not prove the peer has validated the client's address.
@@ -178,17 +186,19 @@ function applicationAck(root: Bytes, identity: Bytes, key: Bytes, certificate: B
     let deadline = c.handshakeProbe; c.congestion.probes = 3
     for index in 0..3 {
         let number = c.spaces[2].sent[0].number
-        let frame = Bytes(); frame.add(2)
-        frame.addBytes(errors.bytesValue(wire.encode(number))); frame.add(0); frame.add(0); frame.add(0)
-        let space = s.spaces[2]; let header = Bytes(); header.add(0x43); header.addBytes(s.remote)
-        for byte in 0..4 { header.add((space.next >> ((3-byte)*8)) & 255) }
-        let packet = errors.bytesValue(protection.protect(space.write, header, header.length-4, space.next, frame)); space.next += 1
-        quic.receive(c, packet, 110 + index)
+        acknowledgeApplication(s, c, number, 110 + index)
         if c.handshakeProbe != deadline { print("application ACK postponed independent handshake alarm"); return 53 }
         if c.congestion.probes != 3 { print("application ACK reset unvalidated client backoff"); return 54 }
         quic.poll(c, 110 + index)
         if c.handshakeProbe != deadline { return 53 }
     }
+    // Independently control one existing flight timer, as the retained-history
+    // loss-classifier fixture does. An unrelated ACK must not reactivate it.
+    c.history = [actual]; quic.poll(c, 114)
+    if c.spaces[1].sent.length == 0 || c.handshakeAcknowledged { return 57 }
+    c.spaces[1].probe = -1
+    acknowledgeApplication(s, c, c.spaces[2].sent[0].number, 115)
+    if c.spaces[1].probe != -1 { print("application ACK rearmed a disabled Handshake flight timer"); return 56 }
     return 0
 }
 function confirmed(root: Bytes, identity: Bytes, key: Bytes, certificate: Bytes, clientKey: Bytes): Integer {
