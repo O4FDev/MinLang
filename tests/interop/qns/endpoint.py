@@ -36,7 +36,9 @@ with tempfile.TemporaryDirectory(prefix='minyar-qns-') as d:
         if case=='connectionmigration':
             addresses=socket.getaddrinfo('server4',443,socket.AF_INET,socket.SOCK_DGRAM)
             address=ipaddress.IPv4Address(addresses[0][4][0])
-            command+=['--preferred-ipv4='+address.packed.hex(),'--preferred-port=444']
+            addresses6=socket.getaddrinfo('server6',443,socket.AF_INET6,socket.SOCK_DGRAM)
+            address6=ipaddress.IPv6Address(addresses6[0][4][0])
+            command+=['--preferred-ipv4='+address.packed.hex(),'--preferred-ipv6='+address6.packed.hex(),'--preferred-port=444']
     else:
         urls=[urlsplit(u) for u in os.environ.get('REQUESTS','').split()]
         if not urls or len(urls)>1999 or any(u.scheme!='https' or u.hostname!=urls[0].hostname or u.port!=urls[0].port or u.query or u.fragment or not re.fullmatch('/[a-zA-Z0-9_-]{1,255}',u.path) for u in urls):sys.exit(1)
