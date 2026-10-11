@@ -182,29 +182,42 @@ function applicationAck(root: Bytes, identity: Bytes, key: Bytes, certificate: B
     let s = quic.serverWithTickets(randomBytes(80), "minyar-test", c.originalDestination, [identity], key, [root], true, store)
     for request in 0..16 { let id = errors.integerValue(quic.openEarlyStream(c, false)); quic.writeEarlyStream(c, id, Bytes(257), true) }
     for packet in quic.poll(c, 0) { quic.receive(s, packet, 0) }
-    if c.spaces[2].sent.length < 3 { return 55 }
+    for attempt in 0..3 {
+        let due = quic.nextTimer(c)
+        for packet in quic.poll(c, due) {
+            if wire.header(packet, 0, s.local.length).kind != wire.INITIAL { return 55 }
+            quic.receive(s, packet, due)
+        }
+    }
+    if c.spaces[2].sent.length < 3 || c.congestion.probes != 3 { return 55 }
+    let responseAt = c.now + 100
     let actual = c.spaces[2].sent[c.spaces[2].sent.length-1]
-    for packet in quic.poll(s, 100) { quic.receive(c, packet, 100) }
+    for packet in quic.poll(s, responseAt) { quic.receive(c, packet, responseAt) }
     if c.state != quic.ESTABLISHED || c.confirmed || c.handshakeAcknowledged || c.spaces[1].write.key.length == 0 { return 55 }
     c.history = [actual]
     while c.history.length < 8192 { c.history.add(actual) }
-    quic.poll(c, 100)
-    if c.spaces[0].active || c.spaces[1].sent.length != 0 || c.handshakeProbe <= 100 { return 55 }
-    let deadline = c.handshakeProbe; c.congestion.probes = 3
+    quic.poll(c, responseAt)
+    if c.spaces[0].active || c.spaces[1].sent.length != 0 || c.handshakeProbe <= responseAt { return 55 }
+    if c.congestion.probes != 0 || c.handshakeProbe != responseAt + recovery.pto(c.congestion, false) {
+        print("Initial key discard retained a backed-off no-flight deadline"); return 58
+    }
+    for attempt in 0..3 { quic.poll(c, quic.nextTimer(c)) }
+    if c.congestion.probes != 3 || c.spaces[1].sent.length != 0 { return 55 }
+    let alarmAt = c.now; let deadline = c.handshakeProbe
     for index in 0..3 {
         let number = c.spaces[2].sent[0].number
-        acknowledgeApplication(s, c, number, 110 + index)
+        acknowledgeApplication(s, c, number, alarmAt + 10 + index)
         if c.handshakeProbe != deadline { print("application ACK postponed independent handshake alarm"); return 53 }
         if c.congestion.probes != 3 { print("application ACK reset unvalidated client backoff"); return 54 }
-        quic.poll(c, 110 + index)
+        quic.poll(c, alarmAt + 10 + index)
         if c.handshakeProbe != deadline { return 53 }
     }
     // Independently control one existing flight timer, as the retained-history
     // loss-classifier fixture does. An unrelated ACK must not reactivate it.
-    c.history = [actual]; quic.poll(c, 114)
+    c.history = [actual]; quic.poll(c, alarmAt + 14)
     if c.spaces[1].sent.length == 0 || c.handshakeAcknowledged { return 57 }
     c.spaces[1].probe = -1
-    acknowledgeApplication(s, c, c.spaces[2].sent[0].number, 115)
+    acknowledgeApplication(s, c, c.spaces[2].sent[0].number, alarmAt + 15)
     if c.spaces[1].probe != -1 { print("application ACK rearmed a disabled Handshake flight timer"); return 56 }
     return 0
 }
