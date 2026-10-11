@@ -50,11 +50,15 @@ def setup(root):
                              "HostConfig":{"Privileged":False,"NetworkMode":owner.project+("_leftnet" if role=="client" else "_rightnet"),
                                            "CpusetCpus":"7","NanoCpus":1000000000,"CapAdd":["NET_ADMIN","NET_RAW"] if role=="sim" else None,
                                            "CapDrop":None if role=="sim" else ["ALL"],"SecurityOpt":[] if role=="sim" else ["no-new-privileges:true"]}}
+    for entry in containers.values():
+        role=entry["Config"]["Labels"]["com.docker.compose.service"]
+        entry["HostConfig"].update({"PidMode":"","IpcMode":"private"})
+        entry["NetworkSettings"]={"Networks":{owner.project+"_"+name:{"NetworkID":("7" if name=="leftnet" else "8")*64} for name in adapter.NETWORK_ROLES[role]}}
     networks={}
     for index,name in enumerate(("leftnet","rightnet")):
         identity=str(index+7)*64
         networks[identity]={"Id":identity,"Name":owner.project+"_"+name,"Labels":owner.labels(),"Driver":"bridge","Internal":False,
-                            "Containers":{identity:{} for identity in containers}}
+                            "Containers":{key:{} for key,entry in containers.items() if owner.project+"_"+name in entry["NetworkSettings"]["Networks"]}}
     state=root/"daemon.json";adapter.atomic_json(state,{"scope":"mock daemon only","containers":containers,"networks":networks,"events":[]})
     adapter.atomic_json(root/"spec.json",value)
     return owner,adapter.JsonDaemon(state)
@@ -69,7 +73,9 @@ def stopped_or_error(owner,daemon,root,reason="control",primary=None):
 def mock_cleanup(case,root):
     owner,daemon=setup(root);state=daemon.read()
     if case=="partial-setup-retention":
-        state["containers"]={"2"*64:state["containers"]["2"*64]};state["networks"]={}
+        state["containers"]={"2"*64:state["containers"]["2"*64]}
+        state["networks"]={"8"*64:state["networks"]["8"*64]}
+        state["networks"]["8"*64]["Containers"]={"2"*64:{}}
         adapter.atomic_json(daemon.path,state)
         registry=adapter.FixtureRegistry(owner.paths["fixture_root"],root/"retained-fixtures")
         temp=registry.temporary_directory(dir=str(owner.paths["fixture_root"]),prefix="partial-")
@@ -108,7 +114,7 @@ def process_control(case,root):
         state=daemon.read()
         count=0 if case=="controller-before-create" else 1 if case=="controller-partial-create" else 3
         state["containers"]={key:value for key,value in list(state["containers"].items())[:count]}
-        for network in state["networks"].values():network["Containers"]={key:{} for key in state["containers"]}
+        for network in state["networks"].values():network["Containers"]={key:{} for key,entry in state["containers"].items() if network["Name"] in entry["NetworkSettings"]["Networks"]}
         adapter.atomic_json(daemon.path,state)
         adapter.atomic_json(root/"phase-marker.json",{"scope":"simulated controller phase; no official workload","phase":case,"created_objects":count})
     try:
@@ -154,21 +160,21 @@ def process_control(case,root):
 def tree_primary_control(root):
     owner,_=setup(root);tree=owner.paths["fixture_root"]/"partial";tree.mkdir();fixture=tree/"fixture";fixture.write_bytes(b"fixture")
     retention=adapter.TreeRetention(root/"retained")
-    original=RuntimeError("original read failure");real_read=Path.read_bytes;real_json=adapter.atomic_json;failed=[False]
-    def read(path):
-        if path==fixture:raise original
-        return real_read(path)
+    original=RuntimeError("original read failure");real_read=adapter.stream_binding;real_json=adapter.atomic_json;failed=[False]
+    def read(path,*args,**kwargs):
+        if Path(path)==fixture:raise original
+        return real_read(path,*args,**kwargs)
     def write_json(path,value):
         if Path(path).name=="retention.json" and not failed[0]:
             failed[0]=True;raise OSError("secondary finalization failure")
         return real_json(path,value)
-    Path.read_bytes=read;adapter.atomic_json=write_json
+    adapter.stream_binding=read;adapter.atomic_json=write_json
     try:
         try:retention.capture(tree,"partial")
         except BaseException as caught:
             result={"status":"passed" if caught is original else "failed","checks":{"primary_identity":caught is original,"secondary_note":bool(getattr(original,"__notes__",[])),"secondary_ledger":any(error.get("stage")=="retention-finalization" for error in retention.errors)}}
         else:result={"status":"failed","checks":{"primary_identity":False}}
-    finally:Path.read_bytes=real_read;adapter.atomic_json=real_json
+    finally:adapter.stream_binding=real_read;adapter.atomic_json=real_json
     return result,"passed"
 
 
@@ -221,17 +227,18 @@ def unsupported_control(root):
 def late_mutation_control(root):
     owner,_=setup(root);tree=owner.paths["fixture_root"]/"mutable";tree.mkdir()
     (tree/"a").write_bytes(b"original-a");(tree/"b").write_bytes(b"original-b")
-    retention=adapter.TreeRetention(root/"retained");real_write=Path.write_bytes
-    def write(path,data):
-        result=real_write(path,data)
-        if path.name=="b" and retention.root in path.parents:real_write(tree/"a",b"changed-after-first-copy")
+    retention=adapter.TreeRetention(root/"retained");real_copy=adapter.stream_binding
+    def copy(path,*args,**kwargs):
+        result=real_copy(path,*args,**kwargs)
+        copy_to=kwargs.get("copy_to",args[2] if len(args)>2 else None)
+        if Path(path).name=="b" and copy_to is not None:(tree/"a").write_bytes(b"changed-after-first-copy")
         return result
-    Path.write_bytes=write
+    adapter.stream_binding=copy
     try:
         try:retention.capture(tree,"mutable")
         except adapter.OwnershipError as error:result={"status":"failed","reason":str(error)}
         else:result={"status":"passed"}
-    finally:Path.write_bytes=real_write
+    finally:adapter.stream_binding=real_copy
     return result,"failed"
 
 
@@ -246,18 +253,18 @@ def raw_reuse_control(root):
 
 def raw_primary_control(root):
     records=adapter.RawCommands(root/"commands");original=RuntimeError("original process setup failure")
-    real_run=adapter.subprocess.run;real_json=adapter.atomic_json;failed=[False]
+    real_run=adapter.subprocess.Popen;real_json=adapter.atomic_json;failed=[False]
     def run(*args,**kwargs):raise original
     def write_json(path,value):
-        if Path(path).name=="commands.json" and not failed[0]:failed[0]=True;raise OSError("secondary raw finalization failure")
+        if Path(path).name=="commands.json" and value["commands"][0].get("primary_exception") is not None and not failed[0]:failed[0]=True;raise OSError("secondary raw finalization failure")
         return real_json(path,value)
-    adapter.subprocess.run=run;adapter.atomic_json=write_json
+    adapter.subprocess.Popen=run;adapter.atomic_json=write_json
     try:
         try:records.run([sys.executable,"-c","pass"],5)
         except BaseException as caught:
             result={"status":"passed" if caught is original else "failed","checks":{"primary_identity":caught is original,"secondary_ledger":bool(records.rows[0]["finalization_errors"]),"secondary_note":bool(getattr(original,"__notes__",[])),"durable_failure":(root/"commands/commands.json").is_file()}}
         else:result={"status":"failed"}
-    finally:adapter.subprocess.run=real_run;adapter.atomic_json=real_json
+    finally:adapter.subprocess.Popen=real_run;adapter.atomic_json=real_json
     return result,"passed"
 
 
@@ -271,7 +278,7 @@ def fixture_access_control(case,root):
         receipt=adapter.prepare_fixture_access(owner,daemon)
         adapter.atomic_json(root/"permission-receipt.json",receipt)
         downloads=Path(state["containers"]["2"*64]["Mounts"][1]["Source"])
-        result={"status":"passed","checks":{"ephemeral_cert_readable":source.stat().st_mode&0o777==0o644,"downloads_writable":downloads.stat().st_mode&0o777==0o777,"only_fixture_prefix":all(owner.paths["fixture_root"] in Path(row["path"]).parents for row in receipt["permissions"])}}
+        result={"status":"passed","checks":{"ephemeral_cert_readable":source.stat().st_mode&0o777==0o644,"downloads_writable":downloads.stat().st_mode&0o777==0o777,"only_fixture_prefix":all(Path(row["path"])==owner.paths["fixture_root"] or owner.paths["fixture_root"] in Path(row["path"]).parents for row in receipt["permissions"])}}
     except adapter.OwnershipError as error:result={"status":"failed","reason":str(error),"checks":{"unowned_rejected_before_permission_change":source.stat().st_mode&0o777==before}}
     return result,"failed" if case=="fixture-access-unowned" else "passed"
 
@@ -329,6 +336,346 @@ def criteria_control(root,pinned):
                                       "all_unreviewed_commands_rejected":rejected==4,"execution_stays_held":config["execution_authorized"] is False and process.returncode!=0 and b"official Docker execution remains held" in process.stderr}},"passed"
 
 
+ROUND2_CASES=("startup-permissions-before-start","watch-cleanup-retains-tree","watch-sample-failure","watch-identity-failure","watch-monitor-failure","author-registry-primary","late-reinspection-failure","foreign-network-mode","host-pid-mode","host-ipc-mode","extra-network-membership","wrong-network-id","raw-cli-exited-descendant","raw-cli-delayed-create","retention-stream-bound","retention-lazy-file-bound","retention-final-deadline","copy-size-bound")
+CASES+=ROUND2_CASES
+
+def startup_control(root,case="startup-permissions-before-start"):
+    owner,base=setup(root);template=base.read();events=[]
+    for entry in template["containers"].values():
+        entry["State"]={"Running":False,"ExitCode":0}
+        for mount in entry["Mounts"]:
+            Path(mount["Source"]).chmod(0o700)
+            (Path(mount["Source"])/"fixture").chmod(0o600)
+    adapter.atomic_json(base.path,{"containers":{},"networks":{},"events":[]})
+    class MockCompose(adapter.JsonDaemon):
+        def __init__(self,path):
+            super().__init__(path);self.commands=type("Rows",(),{"rows":[]})()
+        def command(self,*args,**kwargs):
+            operation=next((part for part in args if part in ("up","create","start")),None)
+            events.append(operation)
+            if operation=="create":
+                selected={r for r in args if r in adapter.ROLES};created=json.loads(json.dumps(template));created["containers"]={k:v for k,v in created["containers"].items() if v["Config"]["Labels"]["com.docker.compose.service"] in selected}
+                for network in created["networks"].values():network["Containers"]={k:v for k,v in network["Containers"].items() if k in created["containers"]}
+                adapter.atomic_json(self.path,created)
+            elif operation=="up" and not self.containers():adapter.atomic_json(self.path,template)
+            if operation in ("up","start"):
+                entries=self.read()["containers"].values()
+                readable=all(Path(m["Source"]).stat().st_mode&0o777==(0o777 if m["Destination"]=="/downloads" else 0o755) and (Path(m["Source"])/"fixture").stat().st_mode&0o777==(0o666 if m["Destination"]=="/downloads" else 0o644) for e in entries for m in e["Mounts"])
+                events.append("permissions-ready" if readable else "permissions-private")
+            stderr=root/("command-"+str(len(events))+".stderr");stderr.write_bytes(b"")
+            self.commands.rows.append({"status":0,"stderr":adapter.binding(stderr)})
+            return b""
+    daemon=MockCompose(base.path);real=adapter.runner_daemon;old={k:os.environ.get(k) for k in ("SERVER","CLIENT")}
+    adapter.runner_daemon=lambda:(owner,daemon)
+    os.environ["SERVER"]=IMAGE;os.environ["CLIENT"]=IMAGE
+    try:
+        argv=["compose","--env-file","empty.env","up"]+(["-V","server"] if case=="startup-server-compliance" else ["-V","sim","client"] if case=="startup-client-compliance" else ["--abort-on-container-exit","--timeout","10","sim","client","server"])
+        status=adapter.docker_entry(argv)
+    finally:
+        adapter.runner_daemon=real
+        for k,v in old.items():
+            if v is None:os.environ.pop(k,None)
+            else:os.environ[k]=v
+    return {"status":"passed","events":events,"checks":{"entry_status":status==0,"created_before_started":events[:1]==["create"] and ("start" in events or "up" in events[1:]),"verified_permissions_before_start":"permissions-ready" in events and "permissions-private" not in events}},"passed"
+
+def watch_fault_control(case,root):
+    owner,daemon=setup(root);original=RuntimeError("controlled primary "+case)
+    current=adapter.process_identity(os.getpid());real_sample=adapter.resource_sample;real_identity=adapter.process_identity;real_json=adapter.atomic_json
+    if case=="watch-cleanup-retains-tree":
+        state=daemon.read();state["fail"]="remove";adapter.atomic_json(daemon.path,state)
+    elif case=="watch-sample-failure":adapter.resource_sample=lambda *a,**k:(_ for _ in ()).throw(original)
+    elif case=="watch-identity-failure":adapter.process_identity=lambda *a,**k:(_ for _ in ()).throw(original)
+    elif case=="watch-monitor-failure":
+        once=[False]
+        def write(path,value):
+            if Path(path).name=="monitor.json" and not once[0]:once[0]=True;raise original
+            return real_json(path,value)
+        adapter.atomic_json=write
+    caught=None
+    try:
+        try:adapter.watch_owned(owner,daemon,current,current,time.monotonic()-.01,root/"watch",interval=.5)
+        except BaseException as error:caught=error
+    finally:adapter.resource_sample=real_sample;adapter.process_identity=real_identity;adapter.atomic_json=real_json
+    retained=root/"watch/retained-trees/retention.json";final=root/"watch/watch-final.json"
+    return {"status":"passed","caught":None if caught is None else str(caught),"checks":{"failure_not_pass":caught is not None,"primary_preserved":case=="watch-cleanup-retains-tree" or caught is original,"tree_retained_despite_failure":retained.is_file(),"durable_final_inventory":final.is_file(),"cleanup_attempted":bool(daemon.read()["events"])}},"passed"
+
+def registry_primary_control(root):
+    original=RuntimeError("controlled main primary");secondary=OSError("controlled registry init failure")
+    real=adapter.runner_registry;real_file=adapter.__file__;adapter.__file__=str(root/"owned_adapter.py")
+    def registry():raise secondary
+    adapter.runner_registry=registry
+    try:
+        try:adapter.author_execute(lambda:(_ for _ in ()).throw(original))
+        except BaseException as caught:result={"status":"passed","checks":{"primary_identity":caught is original,"secondary_note":any(str(secondary) in note for note in getattr(original,"__notes__",[])),"durable_primary_secondary":(root/"author-finalization-failure.json").is_file()}}
+        else:result={"status":"failed"}
+    finally:adapter.runner_registry=real;adapter.__file__=real_file
+    return result,"passed"
+
+def reinspect_control(root):
+    owner,daemon=setup(root);real=daemon.inspect;counts={}
+    def inspect(identity):
+        counts[identity]=counts.get(identity,0)+1
+        if identity=="1"*64 and counts[identity]==4:raise OSError("controlled late reinspect failure")
+        return real(identity)
+    daemon.inspect=inspect;primary=RuntimeError("main remains primary")
+    try:result=adapter.cleanup_owned(owner,daemon,root/"cleanup","late-inspect",primary=primary,unsupported_compliance={"role":"server","testcase":"unknown-control"})
+    except BaseException as caught:result={"status":"failed","escaped":str(caught)}
+    return {"status":"passed","checks":{"durable_cleanup":(root/"cleanup/cleanup.json").is_file(),"nonpass_secondary":result["status"]=="failed","cleanup_continued":not daemon.containers(),"primary_not_replaced":"escaped" not in result}},"passed"
+
+def network_control(case,root):
+    owner,daemon=setup(root);state=daemon.read();entry=state["containers"]["2"*64]
+    if case=="foreign-network-mode":entry["HostConfig"]["NetworkMode"]="foreign_bridge"
+    elif case=="host-pid-mode":entry["HostConfig"]["PidMode"]="host"
+    elif case=="host-ipc-mode":entry["HostConfig"]["IpcMode"]="host"
+    else:
+        entry.setdefault("NetworkSettings",{})["Networks"]={owner.project+"_rightnet":{"NetworkID":"8"*64}}
+        if case=="extra-network-membership":entry["NetworkSettings"]["Networks"]["foreign"]={"NetworkID":"f"*64}
+        else:entry["NetworkSettings"]["Networks"][owner.project+"_rightnet"]["NetworkID"]="f"*64
+    adapter.atomic_json(daemon.path,state);result=stopped_or_error(owner,daemon,root)
+    return {"status":"passed","checks":{"foreign_network_rejected":result["status"]=="failed","no_foreign_mutation":not daemon.read()["events"]}},"passed"
+
+def cli_descendant_control(case,root):
+    records=adapter.RawCommands(root/"commands");marker=root/"delayed-create.json";pidfile=root/"descendant.json";parentfile=root/"parent.json"
+    child=root/"plugin.py"
+    child.write_text("import json,os,sys,time\n"+("os.setsid()\n" if case=="raw-cli-escaped-descendant" else "")+"from pathlib import Path\nPath(sys.argv[2]).write_text(json.dumps({'pid':os.getpid(),'parent_pid':os.getppid()}))\ntime.sleep(.35)\nPath(sys.argv[1]).write_text(json.dumps({'mock_created_id':'2'*64,'owner':'controlled-only'}))\ntime.sleep(.15)\n")
+    argvchild=[sys.executable,str(child),str(marker),str(parentfile)]
+    source=root/"cli.py"
+    source.write_text("import json,subprocess,time\nfrom pathlib import Path\nchild=subprocess.Popen("+repr(argvchild)+")\nPath("+repr(str(pidfile))+").write_text(json.dumps({'pid':child.pid}))\ntime.sleep(.12)\n")
+    argv=[sys.executable,str(source)];descendant=None
+    try:
+        raw=records.run(argv,3)
+        pid=json.loads(pidfile.read_bytes())["pid"];descendant=adapter.process_identity(pid)
+        time.sleep(.55)
+        actual=json.loads(parentfile.read_bytes())
+        return {"status":"passed","checks":{"real_root_exited_descendant":actual["parent_pid"]==records.rows[0].get("process_identity",{}).get("pid"),"descendant_drained_before_return":descendant is None,"delayed_create_prevented":not marker.exists(),"lifetime_certified":records.rows[0].get("lifetime",{}).get("certified") is True},"argv":argv,"actual_parent":actual},"passed"
+    finally:
+        if descendant is not None and adapter.process_identity(descendant["pid"])==descendant:os.kill(descendant["pid"],signal.SIGTERM)
+
+def bounded_retention_control(case,root):
+    owner,_=setup(root);tree=root/"bounded-source";tree.mkdir();file=tree/"a";file.write_bytes(b"abcd")
+    retention=adapter.TreeRetention(root/"retained",max_bytes=3 if case=="retention-stream-bound" else 20,max_files=2)
+    real_read=Path.read_bytes;real_glob=Path.rglob;real_time=adapter.time.monotonic;attempts=[];clock=[0];yielded=[0]
+    if case=="retention-stream-bound":
+        def read(path):
+            if path==file:attempts.append("whole-read");raise RuntimeError("whole overlimit input was read")
+            return real_read(path)
+        Path.read_bytes=read
+    elif case=="retention-lazy-file-bound":
+        for n in range(6):(tree/str(n)).write_bytes(b"x")
+        def glob(path,pattern):
+            for value in real_glob(path,pattern):
+                if path==tree:
+                    yielded[0]+=1
+                    if yielded[0]>3:raise RuntimeError("enumerated past the admission bound")
+                yield value
+        Path.rglob=glob
+    else:
+        def monotonic():
+            clock[0]+=1
+            return 0 if clock[0]<=2 else 31
+        adapter.time.monotonic=monotonic
+    caught=None
+    try:
+        try:retention.capture(tree,"bounded")
+        except BaseException as error:caught=error
+    finally:Path.read_bytes=real_read;Path.rglob=real_glob;adapter.time.monotonic=real_time
+    return {"status":"passed","checks":{"bound_rejected_before_unbounded_read":isinstance(caught,adapter.OwnershipError),"whole_read_not_attempted":not attempts,"enumeration_bounded":yielded[0]<=3,"failed_manifest":bool(retention.rows) and retention.rows[0]["status"]=="failed"}},"passed"
+
+def copy_bound_control(root):
+    import io,tarfile
+    owner,base=setup(root)
+    daemon=object.__new__(adapter.DockerDaemon);daemon.spec=owner;daemon.inspect=base.inspect
+    commands=[]
+    def command(*args,**kwargs):
+        commands.append(args)
+        if args[0]=="cp":
+            header=tarfile.TarInfo("oversize");header.size=536870913
+            raw=root/"archive.tar";raw.write_bytes(header.tobuf());return raw
+        return b"mock log"
+    daemon.command=command
+    try:daemon.retain("2"*64,root/"copy")
+    except adapter.OwnershipError:rejected=True
+    else:rejected=False
+    return {"status":"passed","checks":{"oversize_copy_rejected":rejected,"copy_bound_precedes_second_copy":sum(args[0]=="cp" for args in commands)<=1}},"passed"
+
+def round2_control(case,root):
+    if case=="startup-permissions-before-start":return startup_control(root)
+    if case.startswith("watch-"):return watch_fault_control(case,root)
+    if case=="author-registry-primary":return registry_primary_control(root)
+    if case=="late-reinspection-failure":return reinspect_control(root)
+    if case in ("foreign-network-mode","host-pid-mode","host-ipc-mode","extra-network-membership","wrong-network-id"):return network_control(case,root)
+    if case.startswith("raw-cli-"):return cli_descendant_control(case,root)
+    if case.startswith("retention-"):return bounded_retention_control(case,root)
+    return copy_bound_control(root)
+
+
+EXTRA_CASES=("raw-cli-escaped-descendant","admission-kill-before-create","admission-kill-partial-create","admission-kill-before-retention","admission-kill-after-criterion","admission-quiet-inflight","admission-foreign-intent","raw-stream-overlimit","copy-safe-archive","copy-unsafe-archive")
+CASES+=EXTRA_CASES
+
+def admission_control(case,root):
+    owner,daemon=setup(root);state=daemon.read()
+    count=0 if case in ("admission-kill-before-create","admission-quiet-inflight","admission-foreign-intent") else 1 if case=="admission-kill-partial-create" else 3
+    state["containers"]={k:v for k,v in list(state["containers"].items())[:count]}
+    for network in state["networks"].values():network["Containers"]={k:{} for k,v in state["containers"].items() if network["Name"] in v["NetworkSettings"]["Networks"]}
+    adapter.atomic_json(daemon.path,state)
+    closed=case=="admission-kill-after-criterion"
+    intent={"schema_version":1,"project":owner.project,"nonce":"f"*64 if case=="admission-foreign-intent" else owner.nonce,"state":"closed" if closed else "creating","certified":closed,
+            "intended_containers":[{"name":owner.project+"-"+r,"role":r,"image":SIM if r=="sim" else IMAGE,"labels":owner.labels(r)} for r in adapter.ROLES],"scope":"mock phase only"}
+    adapter.atomic_json(owner.paths["artifacts"]/"create-admission.json",intent)
+    result=stopped_or_error(owner,daemon,root)
+    return {"status":"passed","checks":{"exact_nonpass_unless_closed":result["status"]==("passed" if closed else "failed"),"daemon_final_inventory_retained":"remaining_ids" in result and not result["remaining_ids"],"creation_uncertainty_retained":closed or any(e["stage"]=="create-admission" for e in result["errors"])}},"passed"
+
+def raw_stream_control(root):
+    records=adapter.RawCommands(root/"commands");caught=None
+    try:records.run([sys.executable,"-c","import os;os.write(1,b'x'*4096)"],3,max_bytes=32)
+    except adapter.OwnershipError as error:caught=error
+    row=records.rows[0]
+    return {"status":"passed","checks":{"stream_bound_failed":caught is not None,"retained_stream_bounded":row.get("stdout",{}).get("bytes",999)<=32,"process_lifetime_nonpass":row["lifetime"]["certified"] is False,"raw_failure_ledger":(root/"commands/commands.json").exists()}},"passed"
+
+def archive_control(case,root):
+    import io,tarfile
+    owner,base=setup(root);daemon=object.__new__(adapter.DockerDaemon);daemon.spec=owner;daemon.inspect=base.inspect
+    buffer=io.BytesIO()
+    with tarfile.open(fileobj=buffer,mode="w") as archive:
+        member=tarfile.TarInfo("../foreign" if case=="copy-unsafe-archive" else "log.txt");member.size=3
+        archive.addfile(member,io.BytesIO(b"log"))
+    raw=root/"archive.tar";raw.write_bytes(buffer.getvalue())
+    daemon.command=lambda *a,**k:raw
+    try:daemon.copy_bounded("2"*64,"/logs/.",root/"copy")
+    except adapter.OwnershipError:rejected=True
+    else:rejected=False
+    return {"status":"passed","checks":{"archive_expected_result":rejected==(case=="copy-unsafe-archive"),"no_foreign_write":not (root/"foreign").exists(),"positive_exact_bytes":case!="copy-safe-archive" or (root/"copy/log.txt").read_bytes()==b"log"}},"passed"
+
+def extra_control(case,root):
+    if case=="raw-cli-escaped-descendant":return cli_descendant_control(case,root)
+    if case.startswith("admission-"):return admission_control(case,root)
+    if case=="raw-stream-overlimit":return raw_stream_control(root)
+    return archive_control(case,root)
+
+
+FINAL_CASES=("raw-partial-initialization","raw-escaped-timeout","raw-foreign-child-boundary","startup-server-compliance","startup-client-compliance","watch-primary-cleanup-secondary")
+CASES+=FINAL_CASES
+
+def subreaper_value():
+    import ctypes
+    value=ctypes.c_int();libc=ctypes.CDLL(None)
+    if libc.prctl(37,ctypes.byref(value),0,0,0)!=0:raise RuntimeError("cannot inspect subreaper control")
+    return value.value
+
+def partial_cli_control(root):
+    records=adapter.RawCommands(root/"commands");original=RuntimeError("controlled second pipe registration failure")
+    real_selector=adapter.selectors.DefaultSelector;prior=subreaper_value();registered=[0]
+    class PartialSelector:
+        def __init__(self):self.real=real_selector()
+        def register(self,*args,**kwargs):
+            registered[0]+=1
+            if registered[0]==2:raise original
+            return self.real.register(*args,**kwargs)
+        def close(self):self.real.close()
+    adapter.selectors.DefaultSelector=PartialSelector;caught=None
+    try:
+        try:records.run([sys.executable,"-c","import time;time.sleep(10)"],3)
+        except BaseException as error:caught=error
+    finally:adapter.selectors.DefaultSelector=real_selector
+    row=records.rows[0]
+    return {"status":"passed","checks":{"primary_identity":caught is original,"owned_root_gone":row["process_identity"] is not None and adapter.process_identity(row["process_identity"]["pid"]) is None,"no_adopted_descendants":not adapter.direct_children(),"subreaper_restored":subreaper_value()==prior,"exact_cleanup_receipts":bool(row["lifetime"]["receipts"]) and all(type(r["identity"]["start_ticks"]) is int for r in row["lifetime"]["receipts"]),"failure_ledger_retained":row["primary_exception"]["message"]==str(original) and (root/"commands/commands.json").exists()}},"passed"
+
+def timeout_cli_control(root):
+    records=adapter.RawCommands(root/"commands");marker=root/"delayed-create.json";parent=root/"actual-parent.json"
+    child=root/"escaped.py"
+    child.write_text("import json,os,sys,time\nfrom pathlib import Path\nos.setsid()\nPath(sys.argv[2]).write_text(json.dumps({'pid':os.getpid(),'parent_pid':os.getppid()}))\ntime.sleep(.6)\nPath(sys.argv[1]).write_text('delayed mock create')\ntime.sleep(10)\n")
+    root_cli=root/"cli.py"
+    root_cli.write_text("import subprocess,time\nsubprocess.Popen("+repr([sys.executable,str(child),str(marker),str(parent)])+")\ntime.sleep(10)\n")
+    argv=[sys.executable,str(root_cli)];prior=subreaper_value();caught=None
+    try:records.run(argv,.2)
+    except subprocess.TimeoutExpired as error:caught=error
+    row=records.rows[0];actual=json.loads(parent.read_bytes())
+    receipts=row["lifetime"]["receipts"]
+    return {"status":"passed","actual_parent":actual,"checks":{"actual_timeout":caught is not None and row["timed_out"] is True,"actual_descendant":actual["parent_pid"]==row["process_identity"]["pid"],"both_root_and_escaped_descendant_gone":adapter.process_identity(actual["pid"]) is None and adapter.process_identity(row["process_identity"]["pid"]) is None,"escaped_birthday_bound":any(r["identity"]["pid"]==actual["pid"] and r["identity"]["session"]==actual["pid"] and type(r["identity"]["start_ticks"]) is int for r in receipts),"no_delayed_create":not marker.exists(),"interrupted_lifetime_nonpass":row["lifetime"]["certified"] is False,"subreaper_restored":subreaper_value()==prior}},"passed"
+
+def foreign_cli_control(root):
+    foreign=subprocess.Popen([sys.executable,"-c","import time;time.sleep(10)"],start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    birthday=adapter.process_identity(foreign.pid);prior=subreaper_value();records=adapter.RawCommands(root/"commands");caught=None
+    try:
+        try:records.run([sys.executable,"-c","pass"],2)
+        except adapter.OwnershipError as error:caught=error
+        return {"status":"passed","checks":{"foreign_boundary_rejected":caught is not None,"foreign_process_untouched":foreign.poll() is None and adapter.process_identity(foreign.pid)==birthday,"no_arbitrary_signal":not records.rows[0]["lifetime"]["receipts"],"subreaper_unchanged":subreaper_value()==prior}},"passed"
+    finally:
+        if foreign.poll() is None:foreign.terminate();foreign.wait(timeout=2)
+
+def watch_secondary_control(root):
+    owner,daemon=setup(root);state=daemon.read();state["fail"]="stop";adapter.atomic_json(daemon.path,state)
+    original=RuntimeError("original monitor failure");real=adapter.resource_sample;current=adapter.process_identity(os.getpid())
+    adapter.resource_sample=lambda *a,**k:(_ for _ in ()).throw(original);caught=None
+    try:
+        try:adapter.watch_owned(owner,daemon,current,current,time.monotonic()+1,root/"watch",interval=.5)
+        except BaseException as error:caught=error
+    finally:adapter.resource_sample=real
+    final=json.loads((root/"watch/watch-final.json").read_bytes())
+    return {"status":"passed","checks":{"main_primary_identity":caught is original,"secondary_cleanup_ledger":any(e["stage"]=="stop" for e in final["cleanup"]["errors"]),"secondary_note":any("controlled mock stop failure" in n for n in getattr(original,"__notes__",[])),"nonpass_preserved":final["status"]=="failed","tree_retained":(root/"watch/retained-trees/retention.json").exists(),"final_ids_empty":final["remaining_ids"]==[]}},"passed"
+
+def final_control(case,root):
+    if case=="raw-partial-initialization":return partial_cli_control(root)
+    if case=="raw-escaped-timeout":return timeout_cli_control(root)
+    if case=="raw-foreign-child-boundary":return foreign_cli_control(root)
+    if case.startswith("startup-"):return startup_control(root,case)
+    return watch_secondary_control(root)
+
+
+TAIL_CASES=("raw-restoration-failure","retention-manifest-deadline")
+CASES+=TAIL_CASES
+
+def restoration_control(root):
+    records=adapter.RawCommands(root/"commands");real=adapter.subreaper_begin;prior=subreaper_value()
+    class Failure:
+        def __init__(self,libc):self.libc=libc
+        def prctl(self,*args):
+            actual=self.libc.prctl(*args)
+            if actual!=0:raise RuntimeError("real restoration unexpectedly failed")
+            return -1
+    def begin():
+        libc,value=real();return Failure(libc),value
+    adapter.subreaper_begin=begin;caught=None
+    try:
+        try:records.run([sys.executable,"-c","print('harmless')"],3)
+        except adapter.CleanupError as error:caught=error
+    finally:adapter.subreaper_begin=real
+    return {"status":"passed","checks":{"restoration_failure_nonpass":caught is not None,"failure_raw_ledger":any("restoration" in e["message"] for e in records.rows[0]["finalization_errors"]),"actual_control_restores_flag":subreaper_value()==prior,"owned_lifetime_closed":not adapter.direct_children()}},"passed"
+
+def manifest_deadline_control(root):
+    tree=root/"tree";tree.mkdir();(tree/"a").write_bytes(b"retained")
+    retention=adapter.TreeRetention(root/"retained");real_time=adapter.time.monotonic;real_json=adapter.atomic_json;clock=[0]
+    adapter.time.monotonic=lambda:clock[0]
+    def write(path,value):
+        if Path(path).name=="retention.json":clock[0]=31
+        return real_json(path,value)
+    adapter.atomic_json=write;caught=None
+    try:
+        try:retention.capture(tree,"late-finalization")
+        except adapter.OwnershipError as error:caught=error
+    finally:adapter.time.monotonic=real_time;adapter.atomic_json=real_json
+    retained=json.loads((retention.root/"retention.json").read_bytes())
+    return {"status":"passed","checks":{"whole_operation_deadline_nonpass":caught is not None,"late_manifest_not_retained_success":retained["trees"][0]["status"]=="failed","raw_bound_failure_retained":bool(retained["errors"])}},"passed"
+
+def tail_control(case,root):
+    return restoration_control(root) if case=="raw-restoration-failure" else manifest_deadline_control(root)
+
+
+CASES+=("copy-official-fixture-layout",)
+def copy_layout_control(root):
+    import io,tarfile
+    owner,base=setup(root);daemon=object.__new__(adapter.DockerDaemon);daemon.spec=owner;daemon.inspect=base.inspect;daemon.containers=base.containers
+    buffer=io.BytesIO()
+    with tarfile.open(fileobj=buffer,mode="w") as archive:
+        member=tarfile.TarInfo("keys.log");member.size=3;archive.addfile(member,io.BytesIO(b"log"))
+    raw=root/"archive.tar";raw.write_bytes(buffer.getvalue());daemon.command=lambda *a,**k:raw
+    destination=owner.paths["fixture_root"]/"official-logdir";destination.mkdir()
+    real=adapter.runner_daemon;adapter.runner_daemon=lambda:(owner,daemon)
+    try:adapter.copy_runner_logs("server",destination)
+    finally:adapter.runner_daemon=real
+    return {"status":"passed","checks":{"upstream_logdir_contents_preserved":(destination/"keys.log").is_file(),"no_unrequested_subdirectory":not (destination/"owned-logs").exists()}},"passed"
+
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument("--artifacts",type=Path,required=True)
@@ -345,7 +692,12 @@ def main():
     for case in cases:
         root=args.artifacts/case;root.mkdir()
         try:
-            if case.startswith("controller-") or case in ("guard-death","deadline","resource-abort"):result,expected=process_control(case,root)
+            if case=="copy-official-fixture-layout":result,expected=copy_layout_control(root)
+            elif case in TAIL_CASES:result,expected=tail_control(case,root)
+            elif case in FINAL_CASES:result,expected=final_control(case,root)
+            elif case in EXTRA_CASES:result,expected=extra_control(case,root)
+            elif case in ROUND2_CASES:result,expected=round2_control(case,root)
+            elif case.startswith("controller-") or case in ("guard-death","deadline","resource-abort"):result,expected=process_control(case,root)
             elif case=="tree-primary-finalization":result,expected=tree_primary_control(root)
             elif case=="raw-nonzero-status":result,expected=raw_status_control(root)
             elif case=="root-exited-descendant":result,expected=descendant_control(root)
