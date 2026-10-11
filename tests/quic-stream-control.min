@@ -76,6 +76,28 @@ function discardedCredit(c: quic.Connection,s: quic.Connection,now: Integer): In
         if s.state!=quic.ESTABLISHED || errors.bytesOk(quic.readStream(s,id)) { return 52 }
     }
     if creditFrames(s)!=0 || s.receiveMaxData!=262144 || s.receivedData!=8 { return 53 }
+    for index in 0..4 {
+        let id=errors.integerValue(quic.openStream(c,false));let frame=Bytes()
+        frame.add(4);number(frame,id);number(frame,42);number(frame,65536);inject(c,s,frame,now);now+=1
+        if s.state!=quic.ESTABLISHED || errors.bytesOk(quic.readStream(s,id)) { return 55 }
+    }
+    if creditFrames(s)!=2 || s.receiveMaxData!=524296 || s.receivedData!=262152 { return 56 }
+    return 0
+}
+function finalCredit(c: quic.Connection,s: quic.Connection,now: Integer): Integer {
+    let id=errors.integerValue(quic.openStream(c,false));let frame=Bytes()
+    frame.add(14);number(frame,id);number(frame,0);number(frame,1);frame.add(0);inject(c,s,frame,now)
+    if !errors.bytesOk(quic.readStream(s,id)) { return 57 }
+    let input=s.streams[0]
+    // Reachable lifetime counters just below the QUIC varint ceiling.
+    input.delivered=wire.MAX_VARINT-32768;input.highest=input.delivered;input.consumed=input.delivered
+    input.receiveLimit=wire.MAX_VARINT-16384
+    s.receivedData=wire.MAX_VARINT-131072;s.consumedData=s.receivedData;s.receiveMaxData=wire.MAX_VARINT-65536
+    frame=Bytes();frame.add(14);number(frame,id);number(frame,input.delivered);number(frame,512);frame.addBytes(Bytes(512))
+    inject(c,s,frame,now+1)
+    let read=quic.readStream(s,id)
+    if !errors.bytesOk(read) || errors.bytesValue(read).length!=512 { return 58 }
+    if input.receiveLimit!=wire.MAX_VARINT || s.receiveMaxData!=wire.MAX_VARINT || creditFrames(s)!=2 { return 59 }
     return 0
 }
 function main(): Integer {
@@ -120,7 +142,7 @@ function main(): Integer {
             if c.state != quic.FAILED || c.code != 5 { return 9 }
         }
     }
-    for scenario in 0..3 {
+    for scenario in 0..4 {
         let c=quic.client("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey)
         let s=quic.server(randomBytes(80),"minyar-test",c.originalDestination,[cert],key,[root],true);let now=0
         while now<10000 && (c.state!=quic.ESTABLISHED || s.state!=quic.ESTABLISHED) { transfer(c,s,now);now+=10 }
@@ -129,7 +151,8 @@ function main(): Integer {
         let result=0
         if scenario==0 { result=tinyReads(c,s,now) }
         else if scenario==1 { result=reusedWindows(c,s,now) }
-        else { result=discardedCredit(c,s,now) }
+        else if scenario==2 { result=discardedCredit(c,s,now) }
+        else { result=finalCredit(c,s,now) }
         if result!=0 { return result }
     }
     print("QUIC streams: RESET/STOP retransmission, recoverable application codes, zero-code reset, final-size/flow/direction adversaries passed")
