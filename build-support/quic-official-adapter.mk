@@ -4,11 +4,12 @@
 QUIC_OFFICIAL_RUNNER ?= $(abspath build)/quic-interop-runner-740c05a.git
 QUIC_OFFICIAL_PYTHON ?= $(abspath build)/quic-official-controls-venv/bin/python
 QUIC_OFFICIAL_INPUTS = tests/quic-official-adapter.py tests/interop/qns/owned_adapter.py \
-    scripts/check-quic-official-inputs.py tests/interop/qns/controls-requirements.txt
+    scripts/check-quic-official-inputs.py tests/interop/qns/controls-requirements.txt \
+    tests/quic-simulator-shutdown.py tests/interop/qns/simulator-shutdown.sh
 QUIC_OFFICIAL_RUNNER_BOOTSTRAP = $(if $(filter $(abspath build)/quic-interop-runner-740c05a.git,$(QUIC_OFFICIAL_RUNNER)),build/quic-interop-runner-740c05a.git/.ready.json)
 QUIC_OFFICIAL_PYTHON_BOOTSTRAP = $(if $(filter $(abspath build)/quic-official-controls-venv/bin/python,$(QUIC_OFFICIAL_PYTHON)),build/quic-official-controls-venv/.ready.json)
 QUIC_OFFICIAL_HOST := $(if $(filter Windows_NT,$(OS)),unsupported,$(shell uname -s))
-.PHONY: check-quic-official-adapter
+.PHONY: check-quic-official-adapter check-quic-simulator-shutdown
 
 ifeq ($(QUIC_OFFICIAL_HOST),Linux)
 build/quic-interop-runner-740c05a.git/.ready.json: | build scripts/check-quic-official-inputs.py tests/interop/qns/owned_adapter.py
@@ -17,6 +18,10 @@ build/quic-interop-runner-740c05a.git/.ready.json: | build scripts/check-quic-of
 build/quic-official-controls-venv/.ready.json: | build scripts/check-quic-official-inputs.py tests/interop/qns/controls-requirements.txt
 	$(LIMITED) python3 -E scripts/check-quic-official-inputs.py prepare-python --directory "$(abspath build)/quic-official-controls-venv" --requirements "tests/interop/qns/controls-requirements.txt"
 
+check-quic-simulator-shutdown: tests/quic-simulator-shutdown.py tests/interop/qns/simulator-shutdown.sh $(QUIC_OFFICIAL_PYTHON_BOOTSTRAP) | build
+	$(LIMITED) "$(QUIC_OFFICIAL_PYTHON)" -E tests/quic-simulator-shutdown.py
+
+check-quic-official-adapter: check-quic-simulator-shutdown
 check-quic-official-adapter: $(QUIC_OFFICIAL_INPUTS) $(QUIC_OFFICIAL_RUNNER_BOOTSTRAP) $(QUIC_OFFICIAL_PYTHON_BOOTSTRAP) | build
 	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-official-adapter.XXXXXXXX"); \
 	$(LIMITED) "$(QUIC_OFFICIAL_PYTHON)" -E scripts/check-quic-official-inputs.py controls --repository "$(QUIC_OFFICIAL_RUNNER)" --requirements "tests/interop/qns/controls-requirements.txt" --report "$$artifacts/inputs.json" --artifacts "$$artifacts/run"
