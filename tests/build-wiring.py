@@ -88,6 +88,30 @@ class BuildWiring(unittest.TestCase):
                     (AssertionError, StopIteration)):
                 verify(mutant)
 
+
+        import argparse
+        import contextlib
+        import importlib.util
+        import io
+        from unittest.mock import patch
+        spec = importlib.util.spec_from_file_location(
+            'network_native_mode_contract', ROOT/'tests/net-native.py')
+        driver = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(driver)
+        parser = argparse.ArgumentParser()
+        for windows, mode, expected in (
+                (False, None, ['native', 'sanitize']),
+                (False, 'native', ['native']), (False, 'sanitize', ['sanitize']),
+                (True, None, ['native']), (True, 'native', ['native'])):
+            with self.subTest(windows=windows, mode=mode), patch.object(
+                    driver, 'WINDOWS', windows):
+                self.assertEqual(driver.selected_modes(parser, mode), expected)
+        with patch.object(driver, 'WINDOWS', True), contextlib.redirect_stderr(
+                io.StringIO()) as error, self.assertRaises(SystemExit) as rejected:
+            driver.selected_modes(parser, 'sanitize')
+        self.assertEqual(rejected.exception.code, 2)
+        self.assertIn('unavailable on Windows', error.getvalue())
+
     def test_cycle_progress_observability_is_mandatory_without_idle_replay(self):
         import importlib.util
         import json

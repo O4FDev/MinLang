@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """Run actual loopback socket contracts against eager RC and ASan/UBSan."""
+import argparse
+from contextlib import nullcontext
+import hashlib
+import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 from clang_helpers import windows_host
 
@@ -13,31 +19,127 @@ CLANG = os.environ.get('MINYAR_TEST_CLANG', 'clang')
 WINDOWS = windows_host()
 
 
+def selected_modes(parser, mode):
+    if WINDOWS and mode == 'sanitize':
+        parser.error('native network sanitizer mode is unavailable on Windows')
+    return [mode] if mode else (['native'] if WINDOWS else ['native', 'sanitize'])
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--mode', choices=('native', 'sanitize'))
+    parser.add_argument('--evidence', type=Path)
+    options = parser.parse_args()
+    modes = selected_modes(parser, options.mode)
     (ROOT / 'build').mkdir(exist_ok=True)
-    modes = ['native'] if WINDOWS else ['native', 'sanitize']
-    with tempfile.TemporaryDirectory(prefix='net-native-', dir=ROOT / 'build') as directory:
-        for mode in modes:
-            flags = ['-O2'] if mode == 'native' else [
-                '-O1', '-g', '-fsanitize=address,undefined', '-fno-omit-frame-pointer']
-            environment = os.environ.copy()
-            environment['ASAN_OPTIONS'] = 'detect_leaks=1' if sys.platform.startswith('linux') else 'detect_leaks=0'
-            for fixture in ('net-native', 'net-batch'):
-                executable = Path(directory) / (f'{fixture}-{mode}' + ('.exe' if WINDOWS else ''))
-                command = [CLANG, '-std=c11', '-D_GNU_SOURCE', '-DMINYAR_SYSTEM_HEAP=1',
-                           '-Wall', '-Wextra', '-Werror', *flags,
-                           str(ROOT / f'tests/{fixture}.c'), str(ROOT / 'runtime/native/net.c'),
-                           str(ROOT / 'runtime/minyar_runtime.c'), '-lm', '-o', str(executable)]
-                if WINDOWS:
-                    command += ['-lws2_32']
-                subprocess.run(command, check=True, cwd=ROOT)
-                subprocess.run([executable], check=True, env=environment, timeout=30)
-        program = Path(directory) / ('net-contract.exe' if WINDOWS else 'net-contract')
-        subprocess.run([ROOT / 'minyar', ROOT / 'tests/net-contract.min', '-o', program],
-                       check=True, cwd=ROOT, capture_output=True)
-        result = subprocess.run([program], check=True, capture_output=True, text=True, timeout=30)
-        assert result.stdout == 'true\n' * 11, (result.stdout, result.stderr)
-        print('Minyar network result contracts verified')
+    if options.evidence:
+        directory = options.evidence.resolve()
+        directory.mkdir(parents=True, exist_ok=True)
+        if any(directory.iterdir()):
+            parser.error('network evidence directory must be empty')
+        workspace = nullcontext(str(directory))
+    else:
+        workspace = tempfile.TemporaryDirectory(prefix='net-native-', dir=ROOT / 'build')
+    with workspace as directory:
+        directory = Path(directory)
+        records = []
+        digest = lambda path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        inputs = {}
+        if options.evidence:
+            sources = [Path(__file__), ROOT/'tests/clang_helpers.py',
+                       ROOT/'tests/net-native.c', ROOT/'tests/net-batch.c',
+                       ROOT/'tests/net-contract.min', ROOT/'runtime/native/net.c',
+                       ROOT/'runtime/minyar_runtime.c', ROOT/'minyar']
+            sources.extend((ROOT/'runtime').rglob('*.h'))
+            inputs = {str(path.relative_to(ROOT)): digest(path) for path in sources}
+
+        def run(command, *, phase, **kwargs):
+            if not options.evidence:
+                return subprocess.run(command, **kwargs)
+            command = [str(argument) for argument in command]
+            capture = kwargs.pop('capture_output', False)
+            text = kwargs.pop('text', False)
+            check = kwargs.pop('check', False)
+            environment = kwargs.get('env', os.environ)
+            tool = shutil.which(command[0], path=environment.get('PATH'))
+            if tool is None and Path(command[0]).is_file():
+                tool = str(Path(command[0]).resolve())
+            row = {'argv': command, 'phase': phase, 'cwd': str(Path(kwargs.get('cwd', Path.cwd())).resolve()),
+                   'tool': tool, 'tool_sha256': digest(tool) if tool else None,
+                   'environment': {name: environment[name] for name in
+                                   ('ASAN_OPTIONS', 'UBSAN_OPTIONS', 'MINYAR_TEST_CLANG')
+                                   if name in environment}}
+            records.append(row)
+            start = time.monotonic()
+            try:
+                result = subprocess.run(command, capture_output=True, **kwargs)
+                row['status'] = result.returncode
+                out, err = result.stdout, result.stderr
+            except subprocess.TimeoutExpired as error:
+                row['timed_out'] = True
+                out, err = error.stdout or b'', error.stderr or b''
+                raise
+            finally:
+                row['elapsed_seconds'] = time.monotonic() - start
+                if 'out' in locals():
+                    for stream, data in (('stdout', out), ('stderr', err)):
+                        path = directory/f'{len(records):02d}-{phase}.{stream}'
+                        path.write_bytes(data)
+                        row[stream] = {'path': path.name, 'sha256': digest(path),
+                                       'bytes': len(data)}
+            if not capture:
+                sys.stdout.buffer.write(out)
+                sys.stderr.buffer.write(err)
+            if check:
+                result.check_returncode()
+            if text:
+                result.stdout = result.stdout.decode().replace('\r\n', '\n').replace('\r', '\n')
+                result.stderr = result.stderr.decode().replace('\r\n', '\n').replace('\r', '\n')
+            return result
+
+        status = 'failed'
+        try:
+            if options.evidence:
+                run([CLANG, '--version'], phase='clang-version', check=True,
+                    capture_output=True, timeout=10)
+            for mode in modes:
+                flags = ['-O2'] if mode == 'native' else [
+                    '-O1', '-g', '-fsanitize=address,undefined', '-fno-omit-frame-pointer']
+                environment = os.environ.copy()
+                environment['ASAN_OPTIONS'] = 'detect_leaks=1' if sys.platform.startswith('linux') else 'detect_leaks=0'
+                for fixture in ('net-native', 'net-batch'):
+                    executable = directory / (f'{fixture}-{mode}' + ('.exe' if WINDOWS else ''))
+                    command = [CLANG, '-std=c11', '-D_GNU_SOURCE', '-DMINYAR_SYSTEM_HEAP=1',
+                               '-Wall', '-Wextra', '-Werror', *flags,
+                               str(ROOT / f'tests/{fixture}.c'), str(ROOT / 'runtime/native/net.c'),
+                               str(ROOT / 'runtime/minyar_runtime.c'), '-lm', '-o', str(executable)]
+                    if WINDOWS:
+                        command += ['-lws2_32']
+                    run(command, phase=f'{fixture}-{mode}-compile', check=True, cwd=ROOT)
+                    run([executable], phase=f'{fixture}-{mode}-run', check=True,
+                        env=environment, timeout=30)
+            # This public program was ordinary code in the original combined suite.
+            if options.mode != 'sanitize':
+                program = directory / ('net-contract.exe' if WINDOWS else 'net-contract')
+                run([ROOT / 'minyar', ROOT / 'tests/net-contract.min', '-o', program],
+                    phase='net-contract-compile', check=True, cwd=ROOT, capture_output=True)
+                result = run([program], phase='net-contract-run', check=True,
+                             capture_output=True, text=True, timeout=30)
+                assert result.stdout == 'true\n' * 11, (result.stdout, result.stderr)
+                print('Minyar network result contracts verified')
+            else:
+                print('Native network ASan/UBSan contracts verified')
+            status = 'passed'
+        finally:
+            if options.evidence:
+                (directory/'manifest.json').write_text(json.dumps({
+                    'schema_version': 1, 'status': status, 'modes': modes,
+                    'public_program_sanitized': False,
+                    'windows_sanitizer_capability': False,
+                    'inputs': inputs, 'commands': records,
+                    'files': {path.name: digest(path) for path in directory.iterdir()
+                              if path.is_file() and not path.is_symlink()},
+                }, indent=2) + '\n')
 
 
 if __name__ == '__main__':
