@@ -275,6 +275,48 @@ static void reused_receiver(int kind) {
         empty();
     }
 }
+/* Normal public append polling still leaves this long active scan open.
+ * The next public copied store certifies that parent, not its unvisited tail. */
+static void public_append_before_parent_certificate(int kind) {
+#if defined(MINYAR_BOUNDED_RC) && MINYAR_RC_POLL_BUDGET == 1
+    Graph g = graph();
+    MinyarList *parent = minyar_list_new_traced();
+    minyar_list_references(parent);
+    list_reserve(parent, 40);
+    MinyarRecord *leaf = minyar_record_new_traced(1);
+    minyar_record_set_traced(leaf, 0, 808);
+    for (int i = 0; i < 32; i++)
+        minyar_list_add_traced(parent, slot(leaf));
+    minyar_rc_release(leaf);
+    void *receiver = receiver_new(kind);
+    MinyarRecord *payload = payload_new(g.root);
+    if (kind)
+        minyar_record_set_take_traced(receiver, 0, slot(payload));
+    else
+        minyar_list_add_take_traced(receiver, slot(payload));
+    drain();
+    assert(!rc_cycle_proven(rc_cycle_value(parent)) && !rc_cycle_proven(rc_cycle_value(receiver)));
+    rc_cycle_request_local();
+    size_t steps = 0;
+    do {
+        assert(++steps < 10000);
+        rc_cycle_unit();
+    } while (rc_cycle_active != rc_cycle_value(parent) || rc_cycle_index != 1);
+    assert(rc_cycle_phase == RC_CYCLE_MARK && rc_cycle_limit == 32);
+    minyar_list_add_take_traced(parent, slot(receiver));
+    assert(rc_cycle_active == rc_cycle_value(parent) && rc_cycle_index < rc_cycle_limit);
+    minyar_list_add_traced(g.list, slot(parent));
+    minyar_rc_release(parent);
+    drain();
+    receiver_check(receiver, kind, payload);
+    assert(rc_object_count == 8 && parent->length == 33 &&
+           parent->values[32] == slot(receiver) && leaf->values[0] == 808);
+    minyar_rc_release(g.root);
+    empty();
+#else
+    (void)kind;
+#endif
+}
 /* A canceled local MARK can finish a known root outside its sweep cohort.
  * Moving its last external owner before the next full ROOTS visit must
  * retain the snapshot path, even though its stale completed mark is 2. */
@@ -326,6 +368,8 @@ int main(void) {
     queued_full_root();
     move_stale_root_before_visit(0);
     move_stale_root_before_visit(1);
+    public_append_before_parent_certificate(0);
+    public_append_before_parent_certificate(1);
     for (int kind = 0; kind < 2; kind++) {
         for (int copied = 0; copied < 2; copied++)
             for (int borrowed = 0; borrowed < 2; borrowed++) {
