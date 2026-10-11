@@ -46,7 +46,7 @@ public record Connection {
     streams: List<stream.Stream>; nextBidi: Integer; nextUni: Integer
     closedStreams: List<ClosedStreams>; incomingBidi: Integer; incomingUni: Integer; receiveBidi: Integer; receiveUni: Integer
     peerMaxData: Integer; peerBidi: Integer; peerUni: Integer; peerBidiLocal: Integer; peerBidiRemote: Integer; peerUniData: Integer
-    sentData: Integer; receivedData: Integer; receiveMaxData: Integer; parametersChecked: Boolean
+    sentData: Integer; receivedData: Integer; consumedData: Integer; receiveMaxData: Integer; parametersChecked: Boolean
     congestion: recovery.State; flight: Integer; receivedBytes: Integer; sentBytes: Integer
     history: List<Sent>; lossFirst: Integer; lossLast: Integer; emptySince: Integer
     addressValidated: Boolean; confirmed: Boolean; lastActivity: Integer; now: Integer
@@ -101,7 +101,7 @@ function create(entropy: Bytes, original: Bytes, client: Boolean): Connection {
         clientTLS: tls.none(); serverTLS: tlsserver.none(); spaces: spaces; pending: []; streams: []; nextBidi: role; nextUni: role + 2
         closedStreams: []; incomingBidi: 0; incomingUni: 0; receiveBidi: 16; receiveUni: 16
         peerMaxData: 0; peerBidi: 0; peerUni: 0; peerBidiLocal: 0; peerBidiRemote: 0; peerUniData: 0
-        sentData: 0; receivedData: 0; receiveMaxData: 262144; parametersChecked: false
+        sentData: 0; receivedData: 0; consumedData: 0; receiveMaxData: 262144; parametersChecked: false
         congestion: recovery.create(1200); flight: 0; receivedBytes: 0; sentBytes: 0
         history: []; lossFirst: -1; lossLast: -1; emptySince: -1
         addressValidated: client; confirmed: false; lastActivity: -1; now: -1
@@ -473,12 +473,22 @@ function incomingSendStream(connection: Connection, id: Integer): Integer {
     if localInitiated(connection,id) { terminate(connection,5,"peer referenced an unopened local stream"); return -1 }
     return incomingStream(connection,id)
 }
+function consumedConnection(connection: Connection, credit: Integer, update: Bytes) {
+    connection.consumedData += credit
+    let limit = min(wire.MAX_VARINT, connection.consumedData + 262144)
+    // Refill while half of the advertised receive window remains. Tiny reads
+    // share a reliable update instead of allocating one packet per read.
+    if connection.receiveMaxData - connection.consumedData <= 131072 && limit > connection.receiveMaxData {
+        connection.receiveMaxData = limit
+        add(update, 16); add(update, limit)
+    }
+}
 function consumeDiscard(connection: Connection, input: stream.Stream) {
     let credit = input.highest - input.consumed
     input.incoming = Bytes(); input.segments = []; input.consumed = input.highest
     if credit > 0 {
-        connection.receiveMaxData += credit
-        let update = Bytes(); add(update,16); add(update,connection.receiveMaxData); enqueue(connection,2,update,false)
+        let update = Bytes(); consumedConnection(connection, credit, update)
+        if update.length > 0 { enqueue(connection, 2, update, false) }
     }
 }
 function resetSend(connection: Connection, output: stream.Stream, code: Integer) {
@@ -753,7 +763,10 @@ public function receivePath(connection: Connection, datagram: Bytes, pathId: Int
             processFrame(connection, level, frame)
             if connection.state == FAILED || connection.state == CLOSED { return }
         }
-        if ackEliciting { space.ack = true; space.ackPath = pathId }
+        // A key-phase response can itself contain only ACK frames. Confirm
+        // that new receive phase once, so a later reciprocal update does not
+        // depend on unrelated application or flow-control traffic.
+        if ackEliciting || (level == 2 && !early && !space.readAcknowledged) { space.ack = true; space.ackPath = pathId }
         if level == 1 && !connection.clientRole {
             // RFC9000 8.1: successful Handshake processing validates its source.
             // Keep Finished/certificate checks in TLS and route subsequent
@@ -1057,10 +1070,14 @@ public function readStream(connection: Connection, id: Integer): errors.BytesRes
     if input.reset { input.receiveObserved = true; return errors.bytesFailure(errors.make(streamResetCode(),input.resetCode,"QUIC stream receiving was reset")) }
     let result = stream.take(input)
     if result.length > 0 {
-        input.receiveLimit += result.length; connection.receiveMaxData += result.length
         input.consumed += result.length
-        let update = Bytes(); add(update, 17); add(update, id); add(update, input.receiveLimit); add(update, 16); add(update, connection.receiveMaxData)
-        enqueue(connection, 2, update, false)
+        let update = Bytes(); let limit = min(wire.MAX_VARINT, input.consumed + 65536)
+        if input.receiveLimit - input.consumed <= 32768 && limit > input.receiveLimit {
+            input.receiveLimit = limit
+            add(update, 17); add(update, id); add(update, limit)
+        }
+        consumedConnection(connection, result.length, update)
+        if update.length > 0 { enqueue(connection, 2, update, false) }
         return errors.bytes(result)
     }
     if stream.finished(input) { input.receiveObserved = true; return errors.endOfStream() }
