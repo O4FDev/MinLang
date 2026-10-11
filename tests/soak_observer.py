@@ -27,14 +27,26 @@ def stop(process):
     process.wait(timeout=5)
 
 def observe(process, timeout, period=1):
-    """Yield independently timed samples and framed output; kill on any failure."""
+    """Yield samples in the main thread; reap on failure or interruption.
+
+    Signal cleanup begins on first iteration, after the caller launches its
+    child. Termination before entering this observer is outside its scope.
+    """
     if timeout <= 0 or period <= 0: raise ValueError('positive observation times required')
     started = time.monotonic()
     next_sample = started
     pending = bytearray()
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ)
+    previous_handlers = {}
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt(f'soak observation interrupted by signal {signum}')
     try:
+        # The native target owns another session, so driver termination alone
+        # cannot reap it. Unwind through the existing cleanup on TERM and INT.
+        for value in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[value] = signal.getsignal(value)
+            signal.signal(value, interrupt)
         while selector.get_map() or process.poll() is None:
             now = time.monotonic()
             if now - started >= timeout:
@@ -57,10 +69,14 @@ def observe(process, timeout, period=1):
                     yield {'line': line.decode('utf-8'), 'elapsed_seconds': time.monotonic() - started}
                 if len(pending) > 65536: raise ValueError('soak output line exceeded 64 KiB')
     finally:
-        selector.close()
-        stop(process)
-        process.stdout.close()
-        if process.stderr is not None: process.stderr.close()
+        try:
+            selector.close()
+            stop(process)
+            process.stdout.close()
+            if process.stderr is not None: process.stderr.close()
+        finally:
+            for value, handler in previous_handlers.items():
+                signal.signal(value, handler)
 
 def memory_summary(samples, warmup=60):
     warm = [s for s in samples if s.get('elapsed_seconds', 0) >= warmup and 'rss_kib' in s]
