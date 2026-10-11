@@ -1148,10 +1148,11 @@ def docker_entry(argv):
             atomic_json(spec.paths["artifacts"]/"fixture-permissions.json",permissions)
             intent["state"]="starting";intent["created_ids"]=created_ids
             admission_write(spec,intent)
-            # Preserve upstream attached/abort/timeout criteria; precreated IDs
-            # must remain identical. Any interrupted up is coverage failure.
+            # Preserve explicit upstream monitored roles and dependency startup.
+            # Expanded precreate ownership must not expand attached monitoring;
+            # all dependency IDs stay identical and interrupted up is nonpass.
             up_index=command.index("up")
-            command=command[:up_index+1]+["--no-build","--no-recreate","--no-deps"]+[token for token in command[up_index+1:] if token not in ROLES and token!="-V"]+roles
+            command=command[:up_index+1]+["--no-build","--no-recreate"]+[token for token in command[up_index+1:] if token not in ROLES and token!="-V"]+requested_roles
             intent["workload_argv"]=command;admission_write(spec,intent)
             raw=daemon.command(*command,timeout=330,check=False)
             up_receipt=dict(daemon.commands.rows[-1])

@@ -989,7 +989,7 @@ def bootstrap_control(case,root):
     if case in ("created-wrong-configured-id","stopped-wrong-configured-id"):return wrong_configured_control(case,root)
     return admitted_control(case,root)
 
-NEXT_CASES=("held-empty-nonready","held-empty-later-ready","held-empty-already-ready","compose-server-renewal","compose-client-renewal","compose-workload-attachment","retained-file-sentinel","retained-file-timeout","retained-file-nonzero","pidfd-post-popen-emfile","pidfd-post-popen-attribute","pidfd-post-popen-gate-close","sigchld-preflight-ignored")
+NEXT_CASES=("held-empty-nonready","held-empty-later-ready","held-empty-already-ready","compose-server-renewal","compose-client-renewal","compose-workload-attachment","retained-file-sentinel","retained-file-timeout","retained-file-nonzero","pidfd-post-popen-emfile","pidfd-post-popen-attribute","pidfd-post-popen-gate-close","sigchld-preflight-ignored","server-exit-live-simulator","compose-unknown-service","compose-dependency-recreation","compose-dependency-foreign-object")
 CASES+=NEXT_CASES
 
 def held_empty_control(case,root):
@@ -1014,43 +1014,107 @@ def held_empty_control(case,root):
     adapter.atomic_json(root/"held-transitions.json",{"scope":"mock thread-group-exit transition only; no real foreign PID/reuse","known":known,"events":events,"receipts":receipts,"ready":state[0],"result":result,"latched":latched})
     return {"status":"passed","checks":checks},"passed"
 
-def exact_compose_control(case,root):
-    owner,base=receipt_daemon(root,0);commands=[];original=base.command
+def exact_compose_control(case,root,pinned_runner):
+    import shutil
+    records=adapter.RawCommands(root/"pinned-input-commands")
+    git=shutil.which("git")
+    if git is None:raise adapter.OwnershipError("existing git missing for pinned source fixture")
+    pinned=records.run([git,"-C",str(pinned_runner),"show",adapter.PIN+":docker-compose.yml"],5,max_bytes=65536)
+    fixture=root/"pinned-compose.yml";fixture.write_bytes(pinned)
+    graph={};role=None;depends=False
+    for line in pinned.decode("utf-8").splitlines():
+        if line.startswith("  ") and not line.startswith("    ") and line.endswith(":"):
+            role=line.strip()[:-1];graph[role]=[];depends=False
+        elif role is not None and line=="    depends_on:":depends=True
+        elif depends and line.startswith("      - "):graph[role].append(line[8:])
+        elif line and not line.startswith("      "):depends=False
+    selected_graph={r:graph.get(r) for r in adapter.ROLES}
+    if selected_graph!={"sim":[],"server":["sim"],"client":["sim"]}:raise adapter.OwnershipError("pinned endpoint dependency graph differs")
+    server_phase=case in ("compose-server-renewal","server-exit-live-simulator","compose-dependency-recreation","compose-dependency-foreign-object")
+    owner,base=receipt_daemon(root,127 if case=="server-exit-live-simulator" else 0);commands=[];original=base.command;model={}
     def command(*args,**kwargs):
         commands.append(list(args));prepare="create" in args or "--no-start" in args
         modeled=list(args)
         if "--no-start" in modeled:modeled[modeled.index("up")]="create"
         raw=original(*modeled,**kwargs)
+        state=base.read()
         if prepare:
-            state=base.read();roles={v for v in args if v in adapter.ROLES}
+            roles={v for v in args if v in adapter.ROLES}
             state["containers"]={k:v for k,v in state["containers"].items() if v["Config"]["Labels"]["com.docker.compose.service"] in roles}
             for network in state["networks"].values():network["Containers"]={k:v for k,v in network["Containers"].items() if k in state["containers"]}
-            adapter.atomic_json(base.path,state)
+            model["created_ids"]=sorted(state["containers"])
+        else:
+            monitored=[v for v in args if v in adapter.ROLES]
+            started=[]
+            def visit(role):
+                if role in started:return
+                if "--no-deps" not in args:
+                    for dependency in selected_graph[role]:visit(dependency)
+                started.append(role)
+            for role in monitored:visit(role)
+            model.update({"monitored_services":monitored,"started_services":started,"dependency_graph":selected_graph,"recreate":False if "--no-recreate" in args else True})
+            if case=="server-exit-live-simulator":
+                for identity,entry in state["containers"].items():
+                    role=entry["Config"]["Labels"]["com.docker.compose.service"]
+                    entry["State"]={"Running":role=="sim" and role in started,"ExitCode":127 if role=="server" else 0}
+                    for name,value in entry["NetworkSettings"]["Networks"].items():
+                        network=next(v for v in state["networks"].values() if v["Name"]==name)
+                        if entry["State"]["Running"]:network["Containers"][identity]={};value["NetworkID"]=network["Id"]
+                        else:network["Containers"].pop(identity,None);value["NetworkID"]=""
+                model["events"]=[{"service":"sim","event":"running"},{"service":"server","event":"exited","status":127}]
+                model["simulator_alive"]=state["containers"]["1"*64]["State"]["Running"]
+                model["monitor_complete"]=all(not entry["State"]["Running"] for entry in state["containers"].values() if entry["Config"]["Labels"]["com.docker.compose.service"] in monitored)
+                adapter.atomic_json(base.path,state)
+                adapter.atomic_json(root/"monitor-model.json",model)
+                if not model["monitor_complete"]:raise subprocess.TimeoutExpired(list(args),kwargs["timeout"])
+                return b"mock server UNSUPPORTED\n"
+            if case in ("compose-dependency-recreation","compose-dependency-foreign-object"):
+                entry=json.loads(json.dumps(state["containers"]["1"*64]))
+                if case=="compose-dependency-recreation":state["containers"].pop("1"*64)
+                else:entry["Config"]["Labels"]["com.docker.compose.service"]="foreign"
+                entry["Id"]="9"*64;state["containers"]["9"*64]=entry
+                model["injected_unreviewed_id"]="9"*64
+        adapter.atomic_json(base.path,state)
         return raw
     base.command=command
     argv=["compose","--env-file","empty.env","up"]+(
-        ["-V","server"] if case=="compose-server-renewal" else
+        ["-V","server"] if server_phase else
         ["--timeout","0","--abort-on-container-exit","-V","sim","client"] if case=="compose-client-renewal" else
         ["--abort-on-container-exit","--timeout","10","sim","client","server"])
-    real=adapter.runner_daemon;old={k:os.environ.get(k) for k in ("SERVER","CLIENT")};out=sys.stdout;err=sys.stderr
+    if case=="compose-unknown-service":argv.append("foreign")
+    real=adapter.runner_daemon;keys=("SERVER","CLIENT","TESTCASE_SERVER");old={k:os.environ.get(k) for k in keys};out=sys.stdout;err=sys.stderr
     import io
     class Output:
         def __init__(self):self.buffer=io.BytesIO()
         def flush(self):pass
-    adapter.runner_daemon=lambda:(owner,base);os.environ["SERVER"]=IMAGE;os.environ["CLIENT"]=IMAGE;sys.stdout=Output();sys.stderr=Output()
-    try:status=adapter.docker_entry(argv)
+    captured_out=Output();captured_err=Output()
+    adapter.runner_daemon=lambda:(owner,base);os.environ["SERVER"]=IMAGE;os.environ["CLIENT"]=IMAGE
+    if case=="server-exit-live-simulator":os.environ["TESTCASE_SERVER"]="mock-unsupported"
+    sys.stdout=captured_out;sys.stderr=captured_err;status=None;caught=None
+    try:
+        try:status=adapter.docker_entry(argv)
+        except (adapter.OwnershipError,subprocess.TimeoutExpired) as error:caught=error
     finally:
         adapter.runner_daemon=real;sys.stdout=out;sys.stderr=err
         for k,v in old.items():
             if v is None:os.environ.pop(k,None)
             else:os.environ[k]=v
     prefix=["compose","--project-name",owner.project,"--file",str(owner.paths["compose_path"]),"--env-file",str(owner.paths["runner_root"]/"empty.env")]
-    roles=["sim","server"] if case=="compose-server-renewal" else ["sim","client"] if case=="compose-client-renewal" else ["sim","server","client"]
-    flags=[] if case=="compose-server-renewal" else ["--timeout","0","--abort-on-container-exit"] if case=="compose-client-renewal" else ["--abort-on-container-exit","--timeout","10"]
-    expected_prepare=prefix+(["up","--no-start","--pull","never","--no-build","-V"] if "-V" in argv else ["create","--pull","never","--no-build","--no-recreate"])+roles
-    expected_attached=prefix+["up","--no-build","--no-recreate","--no-deps","--pull","never"]+flags+roles
-    adapter.atomic_json(root/"phase-argv.json",{"scope":"mock exact pinned runner phases; installed Compose version unqueried","upstream":argv,"commands":commands,"expected_prepare":expected_prepare,"expected_attached":expected_attached})
-    return {"status":"passed","checks":{"exact_setup_and_attached_argv":commands==[expected_prepare,expected_attached],"no_flag_conflict":all(not ("-V" in c and "--no-recreate" in c) for c in commands),"attached_abort_timeout_preserved":commands[-1]==expected_attached,"exact_up_status":status==0}},"passed"
+    created_roles=["sim","server"] if server_phase else ["sim","client"] if case=="compose-client-renewal" else ["sim","server","client"]
+    attached_roles=["server"] if server_phase else ["sim","client"] if case=="compose-client-renewal" else ["sim","client","server"]
+    flags=[] if server_phase else ["--timeout","0","--abort-on-container-exit"] if case=="compose-client-renewal" else ["--abort-on-container-exit","--timeout","10"]
+    expected_prepare=prefix+(["up","--no-start","--pull","never","--no-build","-V"] if "-V" in argv else ["create","--pull","never","--no-build","--no-recreate"])+created_roles
+    expected_attached=prefix+["up","--no-build","--no-recreate","--pull","never"]+flags+attached_roles
+    adapter.atomic_json(root/"phase-argv.json",{"scope":"mock pinned source phases and monitor; no actual Docker behavior proof","pinned_commit":adapter.PIN,"pinned_fixture":adapter.binding(fixture),"pinned_source_commands":records.rows,"dependency_graph":selected_graph,"upstream":argv,"commands":commands,"expected_prepare":expected_prepare,"expected_attached":expected_attached,"model":model,"caught":None if caught is None else {"type":type(caught).__name__,"message":str(caught)}})
+    if case=="compose-unknown-service":
+        checks={"unknown_selected_service_rejected":isinstance(caught,adapter.OwnershipError),"no_daemon_command":not commands}
+    elif case in ("compose-dependency-recreation","compose-dependency-foreign-object"):
+        admission=json.loads((owner.paths["artifacts"]/"create-admission.json").read_bytes())
+        checks={"changed_dependency_objects_rejected":isinstance(caught,adapter.OwnershipError),"admission_uncertified":admission["state"]=="interrupted-uncertified" and admission["certified"] is False,"exact_precreated_dependency_ids":admission["created_ids"]==model["created_ids"],"injected_object_retained":model["injected_unreviewed_id"] in base.read()["containers"]}
+    else:
+        checks={"exact_setup_and_attached_argv":commands==[expected_prepare,expected_attached],"no_flag_conflict":all(not ("-V" in c and "--no-recreate" in c) for c in commands),"attached_abort_timeout_preserved":commands[-1]==expected_attached,"exact_up_status":status==(127 if case=="server-exit-live-simulator" else 0),"original_selected_monitor_roles":model.get("monitored_services")==attached_roles,"dependency_start_order":model.get("started_services")==(["sim","server"] if server_phase else ["sim","client"] if case=="compose-client-renewal" else ["sim","client","server"]),"no_dependency_recreation":model.get("recreate") is False}
+        if case=="server-exit-live-simulator":checks.update({"server_returns_with_simulator_alive":caught is None and model.get("monitor_complete") is True and model.get("simulator_alive") is True,"exact_unsupported_output":captured_out.buffer.getvalue()==b"mock server UNSUPPORTED\n"})
+    return {"status":"passed","checks":checks},"passed"
 
 def retained_file_control(case,root):
     records=adapter.RawCommands(root/"commands");original=RuntimeError("original retained file sentinel")
@@ -1144,9 +1208,9 @@ def sigchld_control(root):
             child.wait(timeout=2)
     return {"status":"passed","checks":checks},"passed"
 
-def next_control(case,root):
+def next_control(case,root,pinned_runner):
     if case.startswith("held-empty-"):return held_empty_control(case,root)
-    if case.startswith("compose-"):return exact_compose_control(case,root)
+    if case.startswith("compose-") or case=="server-exit-live-simulator":return exact_compose_control(case,root,pinned_runner)
     if case.startswith("retained-file-"):return retained_file_control(case,root)
     if case=="sigchld-preflight-ignored":return sigchld_control(root)
     return post_pidfd_control(case,root)
@@ -1167,7 +1231,7 @@ def main():
     for case in cases:
         root=args.artifacts/case;root.mkdir()
         try:
-            if case in NEXT_CASES:result,expected=next_control(case,root)
+            if case in NEXT_CASES:result,expected=next_control(case,root,args.pinned_runner)
             elif case in BOOT_CASES:result,expected=bootstrap_control(case,root)
             elif case in REVIEW_CASES:result,expected=review_control(case,root)
             elif case=="copy-official-fixture-layout":result,expected=copy_layout_control(root)
