@@ -155,7 +155,7 @@ static void captured_publication(int kind, int copied, int borrowed, int complet
 }
 /* The newly appended child lies outside the captured List scan limit.
  * Subsequent direct certification can restart the index but not that limit. */
-static void append_beyond_mark_limit(int kind, int copied, int borrowed) {
+static void append_beyond_mark_limit(int kind, int copied, int borrowed, int registered) {
     Graph g = graph();
     MinyarList *parent = minyar_list_new_traced();
     minyar_list_references(parent);
@@ -174,6 +174,23 @@ static void append_beyond_mark_limit(int kind, int copied, int borrowed) {
         rc_cycle_unit();
     } while (rc_cycle_active != rc_cycle_value(parent) || rc_cycle_index != 1);
     assert(rc_cycle_phase == RC_CYCLE_MARK && rc_cycle_limit == 2);
+    if (registered) {
+        if (kind) {
+            MinyarRecord *r = receiver;
+            unsigned char *map = (unsigned char *)(r->values + r->length);
+            map[0] = 1;
+        }
+        rc_cycle_edge_insert(receiver, payload);
+        if (kind)
+            ((MinyarRecord *)receiver)->values[0] = slot(payload);
+        else {
+            MinyarList *l = receiver;
+            l->values[l->length++] = slot(payload);
+        }
+        rc_cycle_commit_insert(receiver, payload);
+        assert(rc_cycle_value(receiver)->marked == 3 &&
+               rc_cycle_snapshot_new(rc_cycle_value(receiver)));
+    }
     rc_cycle_edge_insert(parent, receiver);
     parent->values[parent->length++] = slot(receiver);
     rc_cycle_commit_insert(parent, receiver);
@@ -186,7 +203,12 @@ static void append_beyond_mark_limit(int kind, int copied, int borrowed) {
     assert(rc_cycle_proven(rc_cycle_value(parent)) && rc_cycle_limit == 2);
     drain();
     assert(rc_cycle_proven(rc_cycle_value(parent)));
-    receiver_publish(receiver, kind, payload, copied, borrowed, 0);
+    if (registered) {
+        rc_cycle_request_local();
+        drain();
+        receiver_check(receiver, kind, payload);
+    } else
+        receiver_publish(receiver, kind, payload, copied, borrowed, 0);
     assert(rc_object_count == 8 && parent->length == 3);
     assert(parent->values[2] == slot(receiver) && leaf->values[0] == 808);
     minyar_rc_release(g.root);
@@ -302,7 +324,8 @@ int main(void) {
                     delayed_direct_certificate(kind, copied, borrowed, exposed);
                     captured_publication(kind, copied, borrowed, exposed);
                 }
-                append_beyond_mark_limit(kind, copied, borrowed);
+                append_beyond_mark_limit(kind, copied, borrowed, 0);
+                append_beyond_mark_limit(kind, copied, borrowed, 1);
                 shared_exposure(kind, copied, borrowed);
             }
         reused_receiver(kind);
