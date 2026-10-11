@@ -984,11 +984,18 @@ MinyarBytes *minyar_winnotify_showRaw(const MinyarText *title, const MinyarText 
                                                &notice->failed_token);
         }
     }
-    enum __x_ABI_CWindows_CUI_CNotifications_CNotificationSetting setting;
-    if (SUCCEEDED(hr))
-        hr = IToastNotifier_get_Setting(notifier, &setting);
-    if (SUCCEEDED(hr) && setting != NotificationSetting_Enabled)
-        hr = E_ACCESSDENIED;
+    if (SUCCEEDED(hr)) {
+        enum __x_ABI_CWindows_CUI_CNotifications_CNotificationSetting setting;
+        HRESULT setting_hr = IToastNotifier_get_Setting(notifier, &setting);
+        // A freshly registered unpackaged identity has no notification state
+        // until its first Show. Only that absence may proceed; Show still
+        // reports failures, and an existing disabled setting remains denied.
+        if (setting_hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) {
+            hr = setting_hr;
+            if (SUCCEEDED(hr) && setting != NotificationSetting_Enabled)
+                hr = E_ACCESSDENIED;
+        }
+    }
     if (SUCCEEDED(hr))
         hr = persist_notice(notice, definitions, count);
     if (SUCCEEDED(hr))
