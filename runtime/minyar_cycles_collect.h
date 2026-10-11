@@ -77,8 +77,12 @@ static void rc_cycle_unit_body(void) {
             /* Temporary paths are rebuilt for each finite local cohort. */
             if (((cycle->gray_next >> 1) & 1) != rc_cycle_proof_generation)
                 cycle->gray_next &= ~(uintptr_t)1;
-        }
-        else {
+        } else {
+            /* A canceled local mark may have scanned a known parent outside
+             * its finite sweep cohort. Its completed mark belongs to the old
+             * snapshot; queued marks still belong to this ROOTS pass. */
+            if (cycle->marked == 2)
+                cycle->marked = 0;
             /* Previous temporary tags can equal the new full generation.
              * Clear them before they enter the full proof namespace. */
             if ((cycle->gray_next & 4) &&

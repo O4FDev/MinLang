@@ -371,24 +371,28 @@ static inline void rc_cycle_after_drop(RcObject *object) {
         rc_cycle_check_external(object);
 }
 static MINYAR_NOINLINE void rc_cycle_add_incoming(RcObject *parent, RcCycle *cycle,
-                                                unsigned additive) {
+                                                  unsigned additive) {
     RcCycle *source = rc_cycle_metadata(parent);
     rc_cycle_temporary_changed();
-    if (!source->registered)
+    unsigned was_registered = source->registered;
+    if (!was_registered)
         rc_cycle_register(source);
     /* A committed proof certifies existing paths, not all registry objects.
      * Insertion removes no such path, even while a fresh owner is constructed.
      * Unknown children request separate bounded work after publication.
      * Unknown self-insertion retains the strict full-cohort scheduling rule.
      * Never infer new descendants from the incoming-count update. */
-    unsigned preserve = additive &&
-                        (rc_cycle_phase == RC_CYCLE_IDLE ||
-                         (rc_cycle_local_job &&
-                          (rc_cycle_phase != RC_CYCLE_SWEEP || !cycle->registered ||
-                           rc_cycle_proven(cycle) || rc_cycle_snapshot_new(cycle)))) &&
-                        rc_cycle_proof_valid && !rc_cycle_proof_build &&
-                        rc_cycle_anchor_held() && !rc_cycle_proof_anchor->pinned &&
-                        (!cycle->registered || rc_cycle_proven(cycle) || source != cycle);
+    /* An internally owned unregistered container may have been skipped by
+     * an earlier certified-parent scan. First registration must rejoin those
+     * parents, even when a temporary borrower makes its count external. */
+    unsigned preserve =
+        additive && (was_registered || !source->incoming) &&
+        (rc_cycle_phase == RC_CYCLE_IDLE ||
+         (rc_cycle_local_job && (rc_cycle_phase != RC_CYCLE_SWEEP || !cycle->registered ||
+                                 rc_cycle_proven(cycle) || rc_cycle_snapshot_new(cycle)))) &&
+        rc_cycle_proof_valid && !rc_cycle_proof_build && rc_cycle_anchor_held() &&
+        !rc_cycle_proof_anchor->pinned &&
+        (!cycle->registered || rc_cycle_proven(cycle) || source != cycle);
     if (!preserve)
         rc_cycle_proof_invalidate();
     rc_cycle_shade(cycle);
