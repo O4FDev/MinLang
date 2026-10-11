@@ -700,3 +700,13 @@ check-tls-handshake-validity-sanitize: build/minyarc
 
 check-tls: check-tls-handshake-validity
 check-tls-sanitize: check-tls-handshake-validity-sanitize
+
+.PHONY: check-tls-signing-usage check-tls-signing-usage-sanitize
+check-tls-signing-usage: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/tls-signing-usage.py
+
+check-tls-signing-usage-sanitize: build/minyarc
+	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/tls-signing-usage.py --sanitize
+
+check-tls: check-tls-signing-usage
+check-tls-sanitize: check-tls-signing-usage-sanitize
