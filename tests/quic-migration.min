@@ -1,10 +1,64 @@
 use "quic" as quic
 use "errors" as errors
 use "crypto" as crypto
+use "quicwire" as wire
 
 function drive(c: quic.Connection, s: quic.Connection, now: Integer) {
     for packet in quic.pollDatagrams(c, now) { quic.receivePath(s, packet.data, packet.pathId, now) }
     for packet in quic.pollDatagrams(s, now) { quic.receivePath(c, packet.data, packet.pathId, now) }
+}
+function handshakeRebinding(root: Bytes, identity: Bytes, key: Bytes, client: Bytes, clientKey: Bytes): Integer {
+    let c = quic.client("localhost", randomBytes(80), "minyar-test", [root], [client], clientKey)
+    let s = quic.server(randomBytes(80), "minyar-test", c.originalDestination, [identity], key, [root], true)
+    let rebound = false; let dropped = 0; let now = 0
+    while now < 12000 && (!c.confirmed || !s.confirmed) {
+        for packet in quic.pollDatagrams(c, now) {
+            let header = wire.header(packet.data, 0, 8)
+            if header.valid && header.kind == wire.HANDSHAKE { rebound = true }
+            let route = 0; if rebound { route = 7 }; quic.receivePath(s, packet.data, route, now)
+        }
+        for packet in quic.pollDatagrams(s, now) {
+            if !rebound || packet.pathId == 7 { quic.receivePath(c, packet.data, 0, now) }
+            else { dropped += 1 }
+        }
+        now += 10
+    }
+    if !rebound || !c.confirmed || !s.confirmed || s.activePath != 7 {
+        print("handshake NAT rebinding failed " + Text(c.confirmed) + " " + Text(s.confirmed) + " dropped " + Text(dropped)); return 20
+    }
+    if !c.clientTLS.authenticated || !s.serverTLS.authenticated { return 21 }
+    print("handshake NAT rebinding: authenticated peers and replacement path survived")
+    return 0
+}
+function lostDataMigration(root: Bytes, identity: Bytes, key: Bytes, client: Bytes, clientKey: Bytes): Integer {
+    let c = quic.client("localhost", randomBytes(80), "minyar-test", [root], [client], clientKey)
+    let s = quic.server(randomBytes(80), "minyar-test", c.originalDestination, [identity], key, [root], true)
+    let now = 0
+    while now < 10000 && (!c.confirmed || !s.confirmed) { drive(c, s, now); now += 10 }
+    if !c.confirmed || !s.confirmed { return 22 }
+    let id = errors.integerValue(quic.openStream(s, false)); let expected = randomBytes(32768)
+    if !errors.integerOk(quic.writeStream(s, id, expected, true)) { return 23 }
+    let lost = quic.pollDatagrams(s, now).length
+    if lost == 0 { return 24 }
+    if !errors.booleanOk(quic.probePath(c, 7, now)) { return 25 }
+    let received = Bytes(); let retired = 0
+    for count in 0..2000 {
+        for packet in quic.pollDatagrams(c, now) { quic.receivePath(s, packet.data, 7, now) }
+        for packet in quic.pollDatagrams(s, now) {
+            if packet.pathId == 7 { quic.receivePath(c, packet.data, 7, now) }
+            else { retired += 1 }
+        }
+        let read = quic.readStream(c, id)
+        if errors.bytesOk(read) { received.addBytes(errors.bytesValue(read)) }
+        now += 10
+        if received.length == expected.length { break }
+    }
+    if crypto.hex(received) != crypto.hex(expected) {
+        print("lost data migration failed bytes " + Text(received.length) + " retired packets " + Text(retired)); return 26
+    }
+    if c.state != quic.ESTABLISHED || s.state != quic.ESTABLISHED { return 27 }
+    print("lost data migration: old-route loss recovered on validated replacement path")
+    return 0
 }
 function main(): Integer {
     let root = readBytesFile(argument(0)); let server = readBytesFile(argument(1)); let serverKey = readBytesFile(argument(2))
@@ -35,6 +89,8 @@ function main(): Integer {
     for count in 0..200 { drive(c, s, now); now += 10 }
     if c.state != quic.ESTABLISHED || s.state != quic.ESTABLISHED || s.activePath != 7 || Text(errors.bytesValue(quic.readStream(s, id))) != "after" { return 8 }
     if c.paths.length > 2 || s.paths.length > 2 { return 9 }
+    let loss = lostDataMigration(root, server, serverKey, client, clientKey); if loss != 0 { return loss }
+    let rebinding = handshakeRebinding(root, server, serverKey, client, clientKey); if rebinding != 0 { return rebinding }
     print("QUIC migration: authenticated exact-path validation, forged endpoints, bounded candidates and surviving streams passed")
     return 0
 }
