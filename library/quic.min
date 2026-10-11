@@ -458,22 +458,32 @@ function acknowledge(space: Space, number: Integer, now: Integer): Boolean {
     if number > space.largest { space.largest = number; space.largestReceivedAt = now }
     return true
 }
-function ackFrame(space: Space, level: Integer, now: Integer, needsPing: Boolean): Bytes {
+function ackFrame(space: Space, level: Integer, now: Integer, needsPing: Boolean, maximum: Integer): Bytes {
     let result = Bytes()
     if space.ranges.length == 0 { return result }
     let first = space.ranges[0]; let delay = 0
     // RFC9000 13.2.5 measures the largest PN, including ACK-only packets,
     // when the ACK actually leaves the queue, with our advertised exponent.
     if level == 2 { delay = min(max(0,now - space.largestReceivedAt),wire.MAX_VARINT / 1000) * 1000 / (1 << ACK_EXPONENT) }
-    add(result, 2); add(result, first.last); add(result, delay); add(result, space.ranges.length - 1); add(result, first.last - first.first)
-    let low = first.first
+    let prefix = Bytes(); add(prefix,2); add(prefix,first.last); add(prefix,delay)
+    let firstLength = wire.encode(first.last - first.first); let firstBytes = errors.bytesValue(firstLength)
+    let pairs = Bytes(); let included = 1; let low = first.first
+    let ping = level == 2 && !space.readAcknowledged && needsPing
+    let reserved = 0; if ping { reserved = 1 }
+    // RFC9000 13.2.3 permits omitting oldest ranges when the ACK would not
+    // fit. This is a wire prefix only: all received ranges and the rejection
+    // floor remain intact, including while keys or amplification block send.
     for index in 1..space.ranges.length {
-        let range = space.ranges[index]
-        add(result, low - range.last - 2); add(result, range.last - range.first); low = range.first
+        let range = space.ranges[index]; let pair = Bytes()
+        add(pair,low - range.last - 2); add(pair,range.last - range.first)
+        let count = errors.bytesValue(wire.encode(included))
+        if prefix.length + count.length + firstBytes.length + pairs.length + pair.length + reserved > maximum { break }
+        pairs.addBytes(pair); included += 1; low = range.first
     }
+    result.addBytes(prefix); add(result,included - 1); result.addBytes(firstBytes); result.addBytes(pairs)
     // A reciprocal key-phase confirmation is eliciting. Never start an
     // ACK-only response loop when the new phase itself contains only ACK.
-    if level == 2 && !space.readAcknowledged && needsPing { add(result,1) }
+    if ping { add(result,1) }
     return result
 }
 function processAck(connection: Connection, space: Space, frame: wire.Frame, level: Integer) {
@@ -1051,6 +1061,13 @@ function packetHeader(connection: Connection, level: Integer, length: Integer, n
     for index in 0..4 { header.add((number >> ((3 - index) * 8)) & 255) }
     return header
 }
+function ackPayloadLimit(connection: Connection, level: Integer): Integer {
+    // A legal long-header ACK uses at most the length-field width of this
+    // full path budget; short headers are exact for the current CID and PN.
+    // Reserve the AEAD tag separately. Each retained range is visited once.
+    let header = packetHeader(connection,level,1200,connection.spaces[level].next)
+    return 1200 - header.length - 16
+}
 public function poll(connection: Connection, now: Integer): List<Bytes> {
     let outgoing: List<Bytes> = []
     connection.outgoingPaths = []
@@ -1100,7 +1117,7 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
         if space.ack && !space.ackQueued && space.ackDeadline >= 0 && now >= space.ackDeadline &&
            space.write.key.length > 0 && (level != 2 || connection.state == ESTABLISHED) {
             space.ackQueued = true
-            enqueuePending(connection, Pending { level: level; payload: ackFrame(space,level,now,true); probe: false; path: space.ackPath; acknowledgement: true })
+            enqueuePending(connection, Pending { level: level; payload: ackFrame(space,level,now,true,ackPayloadLimit(connection,level)); probe: false; path: space.ackPath; acknowledgement: true })
         }
     }
     refreshHandshakeProbe(connection,false)
@@ -1157,7 +1174,7 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
         if !space.active { continue }
         if pending.acknowledgement {
             if !space.ack { space.ackQueued = false; continue }
-            pending.payload = ackFrame(space,level,now,true); pending.path = space.ackPath
+            pending.payload = ackFrame(space,level,now,true,ackPayloadLimit(connection,level)); pending.path = space.ackPath
         }
         if keys.key.length == 0 {
             if pending.acknowledgement { unsent.add(pending) }
@@ -1179,7 +1196,7 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
             if eliciting {
                 // An actual eliciting transmission can acknowledge a lone
                 // packet before the delay deadline, without another datagram.
-                let mixed = ackFrame(space,level,now,false); mixed.addBytes(pending.payload)
+                let mixed = ackFrame(space,level,now,false,ackPayloadLimit(connection,level)); mixed.addBytes(pending.payload)
                 // This transport uses a 1200-byte path budget, which fits
                 // every valid peer max_udp_payload_size. Account for the
                 // exact protected header and AEAD tag before piggybacking;
