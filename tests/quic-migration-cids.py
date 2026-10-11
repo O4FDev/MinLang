@@ -49,6 +49,7 @@ BASELINE = {
     "previous-path-probe": (224, "semantic failure: apparent migration did not challenge the previously active route"),
     "previous-path-return": (234, "semantic failure: newer original-route packet retained the spurious migration candidate"),
     "previous-path-timeout": (0, "expired old and candidate validation"),
+    "validation-response-order": (242, "semantic failure: old-route revalidation deferred the admitted candidate response"),
 }
 
 def sha256(path):
