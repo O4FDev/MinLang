@@ -1,0 +1,77 @@
+use "yamux" as mux
+use "errors" as errors
+use "crypto" as crypto
+function exchange(a: mux.Session, b: mux.Session) { mux.receive(b, mux.takeOutgoing(a)); mux.receive(a, mux.takeOutgoing(b)) }
+function main(): Integer {
+    let client=mux.create(true);let server=mux.create(false);let previous=0
+    for count in 0..1536 {
+        let opened=mux.open(client)
+        if !errors.integerOk(opened) { print("sequential stream failed at " + Text(count + 1));return 1 }
+        let id=errors.integerValue(opened);if id!=count*2+1 { return 2 }
+        let data=Bytes("rpc " + Text(count))
+        if !errors.integerOk(mux.write(client,id,data,true)) { return 3 };exchange(client,server)
+        let request=mux.read(server,id);if !errors.bytesOk(request) || Text(errors.bytesValue(request))!=Text(data) { return 4 }
+        if errors.bytesStatus(mux.read(server,id))!=errors.endOfStreamStatus() { return 5 }
+        if !errors.integerOk(mux.write(server,id,data,true)) { return 6 };exchange(server,client)
+        let reply=mux.read(client,id);if !errors.bytesOk(reply) || Text(errors.bytesValue(reply))!=Text(data) { return 7 }
+        if errors.bytesStatus(mux.read(client,id))!=errors.endOfStreamStatus() { return 8 };exchange(client,server)
+        if client.state!=mux.READY || server.state!=mux.READY { print(client.error);print(server.error);return 9 }
+        if client.streams.length>128 || server.streams.length>128 { return 10 }
+        if count>0 && errors.integerOk(mux.write(client,previous,Bytes("stale"),false)) { return 11 }
+        previous=id
+    }
+    // FIN cannot release an unread buffer or consume application EOF.
+    let unread=mux.create(true);let unreadPeer=mux.create(false)
+    for n in 0..128 { let id=errors.integerValue(mux.open(unread));mux.write(unread,id,Bytes("x"),true) }
+    exchange(unread,unreadPeer)
+    for input in unreadPeer.streams { mux.write(unreadPeer,input.id,Bytes("x"),true) }
+    exchange(unreadPeer,unread)
+    if errors.integerOk(mux.open(unread)) { return 12 }
+    if Text(errors.bytesValue(mux.read(unread,1)))!="x" || errors.integerOk(mux.open(unread)) { return 13 }
+    if errors.bytesStatus(mux.read(unread,1))!=errors.endOfStreamStatus() || !errors.integerOk(mux.open(unread)) { return 14 }
+    // Neither local FIN alone nor active streams weaken the 128-slot cap.
+    let half=mux.create(true);let halfPeer=mux.create(false)
+    for n in 0..128 { let id=errors.integerValue(mux.open(half));mux.write(half,id,Bytes(),true) }
+    exchange(half,halfPeer)
+    if errors.integerOk(mux.open(half)) { return 15 }
+    if !errors.booleanOk(mux.cancel(half,1)) || errors.bytesStatus(mux.read(half,1))!=errors.failureStatus() { return 16 }
+    let replacement=mux.open(half)
+    if !errors.integerOk(replacement) || errors.integerValue(replacement)!=257 { return 17 }
+    exchange(half,halfPeer)
+    if halfPeer.state!=mux.READY || halfPeer.streams.length!=128 { print(halfPeer.error);return 18 }
+    // Concurrent HashiCorp openers can send SYNs out of ID order.
+    let reordered=mux.create(false)
+    mux.receive(reordered,crypto.fromHex("000100010000000300000000"));mux.receive(reordered,crypto.fromHex("000100010000000100000000"))
+    if reordered.state!=mux.READY || reordered.peerNext!=5 { return 19 }
+    mux.cancel(reordered,3);mux.cancel(reordered,1)
+    mux.receive(reordered,crypto.fromHex("000100010000000500000000"))
+    if reordered.state!=mux.READY || reordered.streams.length>2 { return 20 }
+    mux.receive(reordered,crypto.fromHex("000100010000000300000000"))
+    if reordered.state!=mux.FAILED { return 21 }
+    // Old control/data frames cannot grant credit or deliver to a reused slot.
+    let next=errors.integerValue(mux.open(client));exchange(client,server)
+    let credit=server.streams[0].sendWindow
+    mux.receive(server,crypto.fromHex("00010000000000010000007f"))
+    mux.receive(server,crypto.fromHex("00000000000000010000000158"))
+    if server.state!=mux.READY || server.streams[0].sendWindow!=credit || server.buffered!=0 || errors.bytesStatus(mux.read(server,next))!=errors.wouldBlockStatus() { return 22 }
+    mux.receive(server,crypto.fromHex("000100010000000100000000"))
+    if server.state!=mux.FAILED { return 23 }
+    let overflow=mux.create(false);mux.receive(overflow,crypto.fromHex("000100010000000100000000"))
+    mux.receive(overflow,crypto.fromHex("0001000000000001ffffffff"));if overflow.state!=mux.FAILED { return 24 }
+    let unknown=mux.create(false);mux.receive(unknown,crypto.fromHex("000100000000000100000001"))
+    if unknown.state!=mux.FAILED { return 25 }
+    let queued=mux.create(true);let queuedPeer=mux.create(false);let queuedId=errors.integerValue(mux.open(queued))
+    mux.write(queued,queuedId,Bytes(262144),false)
+    if !errors.booleanOk(mux.cancel(queued,queuedId)) || queued.outgoing.length>24 { print("cancel retained unsent stream payload");return 26 }
+    mux.receive(queuedPeer,mux.takeOutgoing(queued))
+    if queuedPeer.state!=mux.READY || queuedPeer.buffered!=0 || queuedPeer.streams[0].active { return 27 }
+    // Cancellation must not remove another stream's queued bytes.
+    let mixed=mux.create(true);let mixedPeer=mux.create(false)
+    let keep=errors.integerValue(mux.open(mixed));let discard=errors.integerValue(mux.open(mixed))
+    mux.write(mixed,keep,Bytes("keep"),false);mux.write(mixed,discard,Bytes("discard"),false);mux.cancel(mixed,discard)
+    mux.receive(mixedPeer,mux.takeOutgoing(mixed))
+    if mixedPeer.state!=mux.READY || Text(errors.bytesValue(mux.read(mixedPeer,keep)))!="keep" || mixedPeer.buffered!=0 { return 28 }
+    print("yamux: unread EOF, half-close/capacity, reset/reuse, out-of-order SYN, stale wire IDs and window overflow passed")
+    print("yamux: 1536 sequential RPCs, immutable increasing IDs, bounded slots, stale handles and half-close passed")
+    return 0
+}
