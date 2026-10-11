@@ -29,8 +29,10 @@ def flags(name, default):
         raise ValueError(f'{name}: {error}') from error
 
 
-def run(args, **kwargs):
+def run(args, *, observation=None, **kwargs):
     result = subprocess.run(args, **kwargs)
+    if observation is not None:
+        observation['link_subprocess_status'] = result.returncode
     if result.returncode:
         # Preserve the public launcher's failure status even after a signal.
         sys.exit(result.returncode if result.returncode > 0 else 128 - result.returncode)
@@ -252,11 +254,38 @@ def doctor(clang):
     print('Ready: 64-bit C headers, opaque LLVM pointers, and LTO linking verified.')
 
 
-def publish_executable(command, output, source=None):
+def file_binding(path, retained):
+    """Bind transient source bytes to the independently retained copy."""
+    original = host_path(path).resolve()
+    retained = host_path(retained).resolve()
+    before = original.read_bytes()
+    if original != retained:
+        shutil.copyfile(original, retained)
+    copied = retained.read_bytes()
+    after = original.read_bytes()
+    hashes = [hashlib.sha256(value).hexdigest() for value in (before, copied, after)]
+    if len(set(hashes)) != 1:
+        raise ValueError('link input changed while retaining evidence')
+    return {'original': str(original), 'retained': retained.name,
+            'sha256': hashes[0], 'source_before_sha256': hashes[0],
+            'retained_sha256': hashes[1], 'source_after_sha256': hashes[2],
+            'bytes': len(before)}
+
+
+def effective_optimization(options):
+    value = None
+    for option in options:
+        if option.startswith('-O'):
+            value = option[2:]
+    return value
+
+
+def publish_executable(command, output, source=None, *, observation=None):
     destination = host_path(output)
     source = host_path(source) if source else None
     # Stage on the destination filesystem so publishing is one atomic rename.
-    # A failed or interrupted linker never truncates the last successful build.
+    # Metadata observes this same invocation; it does not select another tool
+    # or change the program, flags, publication behavior or signal status.
     previous_handlers = {}
 
     def interrupted(number, frame):
@@ -269,15 +298,54 @@ def publish_executable(command, output, source=None):
                 previous_handlers[number] = signal.signal(number, interrupted)
         with tempfile.TemporaryDirectory(prefix='.minyar-link-', dir=destination.parent) as temporary:
             staged = Path(temporary) / destination.name
-            run([*command, '-o', str(staged)])
+            actual = [*command, '-o', str(staged)]
+            if observation is not None:
+                observation['actual_command'] = list(map(str, actual))
+                observation['staged_requested_path'] = str(staged.resolve())
+                compiler = host_path(shutil.which(str(command[0])) or command[0]).resolve()
+                compiler_hash = hashlib.sha256(compiler.read_bytes()).hexdigest()
+                observation['compiler_pre_link'] = {'selected_command': str(command[0]),
+                    'resolved_path': str(compiler), 'sha256': compiler_hash}
+                if (str(compiler) != observation['compiler']
+                        or compiler_hash != observation['tools']['clang.bin']):
+                    raise ValueError('selected link compiler changed')
+                for row in [observation['raw_program_input'], observation['program_input'],
+                            *observation['inputs']]:
+                    value = hashlib.sha256(host_path(row['original']).read_bytes()).hexdigest()
+                    row['pre_link_sha256'] = value
+                    if value != row['retained_sha256']:
+                        raise ValueError('retained link input changed before Clang')
+                observation['link_attempted'] = True
+            run(actual, **({'observation': observation} if observation is not None else {}))
             # Some Windows drivers supply .exe when the requested name lacks it.
             if not staged.is_file() and Path(str(staged) + '.exe').is_file():
                 staged = Path(str(staged) + '.exe')
                 destination = Path(str(destination) + '.exe')
+            if observation is not None:
+                retained = host_path(observation['artifact_directory']) / ('program.staged' + staged.suffix)
+                binding = file_binding(staged, retained)
+                observation['staged_output'] = {'path': str(staged.resolve()),
+                    'retained': retained.name, 'sha256': binding['sha256'],
+                    'bytes': binding['bytes']}
+                for row in [observation['raw_program_input'], observation['program_input'],
+                            *observation['inputs']]:
+                    value = hashlib.sha256(host_path(row['original']).read_bytes()).hexdigest()
+                    row['post_link_sha256'] = value
+                    if value != row['pre_link_sha256']:
+                        raise ValueError('link input changed while Clang ran')
             if source and destination.exists() and destination.samefile(source):
                 raise ValueError('refusing to replace the source file; choose a different -o path: ' +
                                  str(destination))
             os.replace(staged, destination)
+            if observation is not None:
+                retained = host_path(observation['artifact_directory']) / ('program' + destination.suffix)
+                binding = file_binding(destination, retained)
+                observation['final_output'] = {'path': str(destination.resolve()),
+                    'retained': retained.name, 'sha256': binding['sha256'],
+                    'bytes': binding['bytes']}
+                if (observation['staged_output']['sha256'] != binding['sha256']
+                        or observation['staged_output']['bytes'] != binding['bytes']):
+                    raise ValueError('published link output changed')
     finally:
         for number, handler in previous_handlers.items():
             signal.signal(number, handler)
@@ -287,9 +355,9 @@ def publish_executable(command, output, source=None):
 def link_program(clang, link_flags, lto, llvm, runtime, native, libraries, output, source):
     """Sanitize only generated program IR; optionally retain exact link inputs.
 
-    MINYAR_LINK_ARTIFACTS names a fresh directory. A reused path is rejected
-    rather than overwriting another invocation's evidence. No program-IR cache
-    is reused: each sanitizer invocation validates the current helper and bytes.
+    Schema 2 binds the actual staged-output argv and immediately observed input
+    bytes. It does not measure internal runtime compilation counts or promise
+    atomic pathname resolution against another same-user process.
     """
     enabled = address_sanitizer_enabled(link_flags)
     requested = os.environ.get('MINYAR_LINK_ARTIFACTS')
@@ -302,66 +370,86 @@ def link_program(clang, link_flags, lto, llvm, runtime, native, libraries, outpu
         artifacts.mkdir(parents=True, exist_ok=False)
     with tempfile.TemporaryDirectory(prefix='minyar-program-sanitize-') as temporary:
         directory = artifacts or Path(temporary)
-        raw = host_path(llvm).read_bytes()
-        program = llvm
-        if artifacts:
-            (directory / 'program.raw.ll').write_bytes(raw)
-        if enabled:
-            program = str(directory / 'program.asan.ll')
-            try:
-                Path(program).write_bytes(instrument_address_sanitizer(raw.decode('utf-8')).encode('utf-8'))
-            except (UnicodeError, ValueError) as error:
-                if artifacts:
-                    for name in ('clang-driver.py', 'sanitizer_llvm.py'):
-                        shutil.copyfile(Path(__file__).resolve().parent / name, directory / name)
-                    (directory / 'manifest.json').write_text(json.dumps({
-                        'schema': 1, 'phase': 'program-annotation', 'error': repr(error),
-                        'raw_sha256': hashlib.sha256(raw).hexdigest(),
-                        'address_sanitizer_enabled': True, 'runtime_reannotated': False,
-                        'link_attempted': False}, indent=2) + '\n')
-                raise
-        command = [clang, *link_flags, *lto, program, runtime, *native, *libraries]
-        manifest = {'schema': 1, 'address_sanitizer_enabled': enabled,
-                    'program_ir_cached': False, 'command': command,
-                    'raw_program': str(host_path(llvm).resolve()),
-                    'raw_sha256': hashlib.sha256(raw).hexdigest(),
-                    'linked_program_sha256': hashlib.sha256(host_path(program).read_bytes()).hexdigest(),
-                    'runtime_reannotated': False, 'inputs': [], 'tools': {}}
-        if artifacts:
-            for label, path in [('runtime', runtime), *[(f'native-{i}', value)
-                                                      for i, value in enumerate(native)]]:
-                path = host_path(path)
-                if not path.is_file():
-                    continue
-                name = label + path.suffix
-                shutil.copyfile(path, directory / name)
-                manifest['inputs'].append({'original': str(path.resolve()),
-                                          'retained': name,
-                                          'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
-            for name in ('clang-driver.py', 'sanitizer_llvm.py'):
-                path = Path(__file__).resolve().parent / name
-                shutil.copyfile(path, directory / name)
-                manifest['tools'][name] = hashlib.sha256(path.read_bytes()).hexdigest()
-            compiler = host_path(shutil.which(clang) or clang).resolve()
-            shutil.copyfile(compiler, directory / 'clang.bin')
-            manifest['tools']['clang.bin'] = hashlib.sha256(compiler.read_bytes()).hexdigest()
-            manifest['compiler'] = str(compiler)
-            manifest['compiler_version'] = subprocess.check_output([clang, '--version'], text=True)
+        manifest = {'schema': 2, 'address_sanitizer_enabled': enabled,
+                    'program_ir_cached': False, 'runtime_reannotated': False,
+                    'link_flags': list(link_flags), 'lto_flags': list(lto),
+                    'optimization': effective_optimization([*link_flags, *lto]),
+                    'mode': 'asan' if enabled else 'native',
+                    'compiler_selected_command': str(clang),
+                    'inputs': [], 'tools': {}, 'link_attempted': False,
+                    'artifact_directory': str(directory), 'retention_errors': []}
         try:
-            publish_executable(command, output, source)
-            manifest['link_status'] = 0
-            executable = host_path(output)
-            if not executable.exists() and host_path(output + '.exe').exists():
-                executable = host_path(output + '.exe')
+            raw = host_path(llvm).read_bytes()
+            program = llvm
+            manifest.update(raw_program=str(host_path(llvm).resolve()),
+                            raw_sha256=hashlib.sha256(raw).hexdigest())
             if artifacts:
-                shutil.copyfile(executable, directory / ('program' + executable.suffix))
-                manifest['binary_sha256'] = hashlib.sha256(executable.read_bytes()).hexdigest()
+                manifest['raw_program_input'] = file_binding(llvm, directory / 'program.raw.ll')
+            if enabled:
+                program = str(directory / 'program.asan.ll')
+                try:
+                    Path(program).write_bytes(instrument_address_sanitizer(raw.decode('utf-8')).encode('utf-8'))
+                except (UnicodeError, ValueError) as error:
+                    manifest.update(phase='program-annotation', error=repr(error))
+                    raise
+            command = [clang, *link_flags, *lto, program, runtime, *native, *libraries]
+            manifest.update(command=list(map(str, command)),
+                linked_program_sha256=hashlib.sha256(host_path(program).read_bytes()).hexdigest())
+            if artifacts:
+                manifest['program_input'] = file_binding(program, directory /
+                    ('program.asan.ll' if enabled else 'program.raw.ll'))
+                manifest['program_input'].update(role='program', format='llvm')
+                for label, role, path in [('runtime', 'runtime', runtime),
+                        *[(f'native-{i}', 'provider', value) for i, value in enumerate(native)]]:
+                    path = host_path(path)
+                    if not path.is_file():
+                        continue
+                    row = file_binding(path, directory / (label + path.suffix))
+                    row.update(role=role, format=('native_object' if path.suffix == '.o' else
+                                                 'llvm' if path.suffix in ('.ll', '.bc') else 'native_input'))
+                    manifest['inputs'].append(row)
+                for name in ('clang-driver.py', 'sanitizer_llvm.py'):
+                    path = Path(__file__).resolve().parent / name
+                    row = file_binding(path, directory / name)
+                    manifest['tools'][name] = row['sha256']
+                compiler = host_path(shutil.which(clang) or clang).resolve()
+                row = file_binding(compiler, directory / 'clang.bin')
+                manifest['tools']['clang.bin'] = row['sha256']
+                manifest['compiler'] = str(compiler)
+                manifest['compiler_version'] = subprocess.check_output([clang, '--version'], text=True)
+            publish_executable(command, output, source,
+                               **({'observation': manifest} if artifacts else {}))
+            manifest['link_status'] = 0
+            if artifacts:
+                manifest['binary_sha256'] = manifest['final_output']['sha256']
         except BaseException as error:
             manifest['link_error'] = repr(error)
             raise
         finally:
             if artifacts:
-                (directory / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+                # A retention failure cannot replace a linker signal/status.
+                active_error = sys.exc_info()[0] is not None
+                for name in ('clang-driver.py', 'sanitizer_llvm.py'):
+                    try:
+                        path = Path(__file__).resolve().parent / name
+                        if not (directory / name).exists():
+                            shutil.copyfile(path, directory / name)
+                    except (OSError, ValueError) as error:
+                        manifest['retention_errors'].append({'phase': 'helper-retention',
+                                                             'error': repr(error)})
+                try:
+                    (directory / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+                except (OSError, ValueError) as error:
+                    manifest['retention_errors'].append({'phase': 'manifest-retention',
+                                                         'error': repr(error)})
+                    try:
+                        (directory / 'manifest-retention-error.json').write_text(
+                            json.dumps(manifest, indent=2) + '\n')
+                    except (OSError, ValueError):
+                        pass
+                if manifest['retention_errors'] and not active_error:
+                    raise ValueError('could not retain complete final link evidence')
+
 
 def main():
     if sys.version_info < (3, 9):
