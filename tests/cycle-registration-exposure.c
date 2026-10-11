@@ -208,8 +208,7 @@ static void append_beyond_mark_limit(int kind, int copied, int borrowed, int reg
     rc_cycle_commit_insert(g.list, parent);
     rc_drop(parent);
     assert(rc_cycle_limit == 2);
-    if (!registered)
-        assert(rc_cycle_proven(rc_cycle_value(parent)));
+    assert(!rc_cycle_proof_valid && rc_cycle_rescan);
     drain();
     assert(rc_cycle_proven(rc_cycle_value(parent)));
     if (registered) {
