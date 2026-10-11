@@ -449,6 +449,8 @@ static void list_store_traced(MinyarList *list, long long value, int retain_valu
             rc_cycle_edge_insert(list, (void *)(uintptr_t)value);
     }
     list->values[list->length++] = value;
+    if (kind == RC_TRACED)
+        rc_cycle_commit_insert(list, (void *)(uintptr_t)value);
 #ifdef MINYAR_BOUNDED_RC
     if (rc_pending_count)
         minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
@@ -560,7 +562,14 @@ void minyar_record_set_take_traced(MinyarRecord *record, long long field,
         else
             rc_cycle_edge_add(record, (void *)(uintptr_t)value);
     }
-    minyar_record_set_traced(record, field, value);
+    record->values[field] = value;
+    if (additive && (((RcObject *)record - 1)->ownership & 7) == RC_TRACED)
+        rc_cycle_commit_insert(record, (void *)(uintptr_t)value);
+#ifdef MINYAR_BOUNDED_RC
+    unsigned kind = ((RcObject *)record - 1)->ownership & 7;
+    if (kind == RC_RECORD || kind == RC_TRACED)
+        minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
+#endif
 }
 
 void minyar_record_set_reference_traced(MinyarRecord *record, long long field, long long value) {

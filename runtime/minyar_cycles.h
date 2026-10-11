@@ -18,18 +18,33 @@
  * eight-byte slots that fit in the address space; 58 bits cover 2^61 bytes. */
 typedef struct RcCycle {
     struct RcCycle *previous, *next;
-    uintptr_t gray_next; /* Aligned link, with bits0/1 holding proof validity/generation. */
+    uintptr_t gray_next; /* Aligned link, with bits0/1 proof tags and bit2 the local snapshot namespace. */
     size_t generation : 1, marked : 2, registered : 1, pinned : 1, cleared : 1, record : 1,
         incoming : 57;
 } RcCycle;
 _Static_assert(sizeof(RcCycle) == 32, "cycle metadata must stay four words");
 _Static_assert(_Alignof(RcCycle) >= 8, "cycle links require eight-byte alignment");
 enum { RC_CYCLE_IDLE, RC_CYCLE_ROOTS, RC_CYCLE_MARK, RC_CYCLE_SWEEP };
-static RcCycle *rc_cycle_head, *rc_cycle_cohort, *rc_cycle_cursor;
+#define MINYAR_CYCLE_LOCAL_PROOFS 1
+/* The unknown prefix is scanned; completed certificates wait on a separate
+ * list. Cancellation joins both lists in constant time, before any reuse. */
+static RcCycle *rc_cycle_head, *rc_cycle_tail, *rc_cycle_known_head, *rc_cycle_known_tail;
+static RcCycle *rc_cycle_cohort, *rc_cycle_cursor, *rc_cycle_last;
+static unsigned rc_cycle_local_job, rc_cycle_local_requested, rc_cycle_local_generation;
+/* An unchanged unknown cohort may also have one temporary external witness.
+ * Its tags use the opposite certificate bit, never the completed anchor's
+ * namespace. Every registry/owning-edge change cancels this temporary proof. */
+static RcCycle *rc_cycle_temporary_anchor;
+static unsigned rc_cycle_temporary_valid, rc_cycle_temporary_build, rc_cycle_temporary_covered;
+
 static RcCycle *rc_cycle_gray_head, *rc_cycle_gray_tail, *rc_cycle_active;
 static size_t rc_cycle_index, rc_cycle_limit;
 static unsigned rc_cycle_generation, rc_cycle_phase, rc_cycle_requested;
 static unsigned rc_cycle_pending, rc_cycle_inside;
+static inline void rc_cycle_temporary_changed(void) {
+    if (!rc_cycle_inside)
+        rc_cycle_temporary_valid = rc_cycle_temporary_build = 0;
+}
 /* A proof certifies only nodes reached from this still-external anchor.
  * Any owning traced-edge change invalidates it before the store. A failed
  * temporary anchor advances selection through the finite registry. */
@@ -49,7 +64,7 @@ static unsigned rc_cycle_present;
  * compiler mutation hints, before constructing any graph. */
 static unsigned rc_cycle_enabled = 1;
 void minyar_rc_cycle_policy(void) {
-    if (!rc_cycle_head && !rc_cycle_pending)
+    if (!rc_cycle_head && !rc_cycle_known_head && !rc_cycle_pending)
         rc_cycle_enabled = 0;
 }
 void minyar_rc_enable_cycles(void) {
@@ -91,20 +106,39 @@ static inline RcCycle *rc_cycle_value(void *value) {
     return rc_cycle_metadata((RcObject *)value - 1);
 }
 static void rc_cycle_register(RcCycle *cycle) {
+    rc_cycle_temporary_changed();
     if ((uintptr_t)cycle & 7)
         minyar_stop("cycle metadata is not eight-byte aligned.");
     cycle->gray_next = 0;
     cycle->registered = 1;
-    cycle->generation = rc_cycle_generation;
+    unsigned local = rc_cycle_local_job || (rc_cycle_proof_valid && !rc_cycle_proof_build);
+    cycle->gray_next = local ? 4 : 0;
+    cycle->generation = local ? rc_cycle_local_generation : rc_cycle_generation;
+    cycle->previous = NULL;
     cycle->next = rc_cycle_head;
+    if (!rc_cycle_head)
+        rc_cycle_tail = cycle;
     if (rc_cycle_head)
         rc_cycle_head->previous = cycle;
     rc_cycle_head = cycle;
+}
+static void rc_cycle_join_known(void) {
+    if (!rc_cycle_known_head)
+        return;
+    if (rc_cycle_tail) {
+        rc_cycle_tail->next = rc_cycle_known_head;
+        rc_cycle_known_head->previous = rc_cycle_tail;
+    } else
+        rc_cycle_head = rc_cycle_known_head;
+    rc_cycle_tail = rc_cycle_known_tail;
+    rc_cycle_known_head = rc_cycle_known_tail = NULL;
 }
 static inline void rc_cycle_proof_invalidate(void) {
     if (rc_cycle_inside)
         return;
     rc_cycle_proof_valid = rc_cycle_proof_build = 0;
+    rc_cycle_temporary_changed();
+    rc_cycle_join_known();
     if (rc_cycle_pending)
         rc_cycle_rescan = 1;
 }
@@ -118,7 +152,8 @@ static inline int rc_cycle_proven(RcCycle *cycle) {
         return 0;
     unsigned generation = (unsigned)((cycle->gray_next >> 1) & 1);
     return (rc_cycle_proof_valid && generation == rc_cycle_proof_generation) ||
-           (rc_cycle_proof_build && generation == rc_cycle_generation);
+           (rc_cycle_proof_build && !(cycle->gray_next & 4) &&
+            generation == rc_cycle_generation);
 }
 static MINYAR_COLD void rc_cycle_request_kind(unsigned rescan) {
     if (rc_cycle_inside)
@@ -135,39 +170,88 @@ static MINYAR_COLD void rc_cycle_request_kind(unsigned rescan) {
 static MINYAR_COLD void rc_cycle_request(void) {
     rc_cycle_request_kind(1);
 }
+static inline int rc_cycle_temporary_held(void) {
+    return rc_cycle_temporary_anchor &&
+           (rc_cycle_object(rc_cycle_temporary_anchor)->ownership >> 3) >
+               rc_cycle_temporary_anchor->incoming && !rc_cycle_temporary_anchor->pinned;
+}
+static inline int rc_cycle_temporary_proven(RcCycle *cycle) {
+    return (cycle->gray_next & 1) &&
+           ((cycle->gray_next >> 1) & 1) != rc_cycle_proof_generation;
+}
+static void rc_cycle_request_local(void) {
+    if (rc_cycle_inside)
+        return;
+    if (!(rc_cycle_temporary_valid && rc_cycle_temporary_held() &&
+          rc_cycle_proof_valid && rc_cycle_anchor_held()))
+        rc_cycle_local_requested = 1;
+    rc_cycle_request_kind(0);
+}
+static RcCycle *rc_cycle_cohort_next(RcCycle *cycle) {
+    return cycle == rc_cycle_last ? NULL : cycle->next;
+}
 static RcCycle *rc_cycle_gray_pop(void) {
     RcCycle *cycle = rc_cycle_gray_head;
-    rc_cycle_gray_head = (RcCycle *)(cycle->gray_next & ~(uintptr_t)3);
+    rc_cycle_gray_head = (RcCycle *)(cycle->gray_next & ~(uintptr_t)7);
     if (!rc_cycle_gray_head)
         rc_cycle_gray_tail = NULL;
-    cycle->gray_next &= 3;
+    cycle->gray_next &= 7;
     return cycle;
 }
 static void rc_cycle_unlink(RcCycle *cycle) {
     cycle->registered = 0;
-    /* Collector cursors are all null between epochs. */
     if (rc_cycle_phase != RC_CYCLE_IDLE) {
+        RcCycle *next = rc_cycle_cohort_next(cycle);
+        if (rc_cycle_last == cycle)
+            rc_cycle_last = cycle == rc_cycle_cohort ? NULL : cycle->previous;
         if (rc_cycle_cohort == cycle)
-            rc_cycle_cohort = cycle->next;
+            rc_cycle_cohort = next;
         if (rc_cycle_cursor == cycle)
-            rc_cycle_cursor = cycle->next;
+            rc_cycle_cursor = next;
         if (rc_cycle_active == cycle)
             rc_cycle_active = NULL;
     }
     if (cycle->previous)
         cycle->previous->next = cycle->next;
+    else if (rc_cycle_known_head == cycle)
+        rc_cycle_known_head = cycle->next;
     else
         rc_cycle_head = cycle->next;
     if (cycle->next)
         cycle->next->previous = cycle->previous;
+    if (rc_cycle_tail == cycle)
+        rc_cycle_tail = cycle->previous;
+    if (rc_cycle_known_tail == cycle)
+        rc_cycle_known_tail = cycle->previous;
+}
+static void rc_cycle_promote(RcCycle *cycle) {
+    rc_cycle_unlink(cycle);
+    cycle->registered = 1;
+    cycle->previous = rc_cycle_known_tail;
+    cycle->next = NULL;
+    if (rc_cycle_known_tail)
+        rc_cycle_known_tail->next = cycle;
+    else
+        rc_cycle_known_head = cycle;
+    rc_cycle_known_tail = cycle;
+    cycle->gray_next &= ~(uintptr_t)4;
+    cycle->generation = rc_cycle_generation;
 }
 static inline void rc_cycle_unregister(RcObject *object) {
     RcCycle *cycle = rc_cycle_metadata(object);
+    rc_cycle_temporary_changed();
+    if (cycle->registered)
+        rc_cycle_proof_invalidate();
+    if (rc_cycle_temporary_anchor == cycle) {
+        rc_cycle_temporary_valid = rc_cycle_temporary_build = 0;
+        rc_cycle_temporary_anchor = NULL;
+    }
     if (rc_cycle_proof_anchor == cycle) {
         rc_cycle_proof_valid = rc_cycle_proof_build = 0;
         rc_cycle_proof_anchor = NULL;
+        rc_cycle_join_known();
         if (rc_cycle_pending)
-            rc_cycle_rescan = 1;
+            rc_cycle_rescan = rc_cycle_requested = 1;
     }
     if (rc_cycle_proof_retry == cycle)
         rc_cycle_proof_retry = NULL;
@@ -175,13 +259,21 @@ static inline void rc_cycle_unregister(RcObject *object) {
         rc_cycle_unlink(cycle);
     cycle->gray_next = 0;
 }
+static int rc_cycle_snapshot_new(RcCycle *cycle) {
+    if (rc_cycle_local_job)
+        return cycle->generation == rc_cycle_local_generation;
+    return !(cycle->gray_next & 4) && cycle->generation == rc_cycle_generation;
+}
 static MINYAR_COLD void rc_cycle_shade_slow(RcCycle *cycle) {
-    if (!cycle || !cycle->registered || cycle->generation == rc_cycle_generation || cycle->marked)
+    if (!cycle || !cycle->registered || cycle->marked ||
+        (rc_cycle_local_job && !(cycle->gray_next & 4) &&
+         rc_cycle_proof_valid && rc_cycle_anchor_held() && rc_cycle_proven(cycle)) ||
+        rc_cycle_snapshot_new(cycle))
         return;
     cycle->marked = 1;
-    cycle->gray_next &= 3;
+    cycle->gray_next &= 7;
     if (rc_cycle_gray_tail)
-        rc_cycle_gray_tail->gray_next = (uintptr_t)cycle | (rc_cycle_gray_tail->gray_next & 3);
+        rc_cycle_gray_tail->gray_next = (uintptr_t)cycle | (rc_cycle_gray_tail->gray_next & 7);
     else
         rc_cycle_gray_head = cycle;
     rc_cycle_gray_tail = cycle;
@@ -190,12 +282,37 @@ static MINYAR_COLD void rc_cycle_shade_slow(RcCycle *cycle) {
  * A node already scanned from a temporary is queued once more when first
  * reached from the anchor. Each scan still visits only one field per unit. */
 static void rc_cycle_shade_proven(RcCycle *cycle) {
-    if (!cycle || !cycle->registered || cycle->generation == rc_cycle_generation)
+    if (!cycle || !cycle->registered || rc_cycle_snapshot_new(cycle) ||
+        (rc_cycle_local_job && !(cycle->gray_next & 4) && rc_cycle_proven(cycle)))
         return;
-    if (!(cycle->gray_next & 1) || ((cycle->gray_next >> 1) & 1) != rc_cycle_generation) {
+    unsigned generation = rc_cycle_local_job ? rc_cycle_proof_generation : rc_cycle_generation;
+    if (!rc_cycle_local_job) {
+        cycle->gray_next &= ~(uintptr_t)4;
+        cycle->generation = rc_cycle_generation ^ 1;
+    }
+    if (!(cycle->gray_next & 1) || ((cycle->gray_next >> 1) & 1) != generation) {
         cycle->gray_next =
-            (cycle->gray_next & ~(uintptr_t)3) | 1 | ((uintptr_t)rc_cycle_generation << 1);
-        if (cycle->marked == 2)
+            (cycle->gray_next & ~(uintptr_t)3) | 1 | ((uintptr_t)generation << 1);
+        if (cycle == rc_cycle_active && rc_cycle_phase == RC_CYCLE_MARK)
+            rc_cycle_index = 0;
+        else if (cycle->marked == 2)
+            cycle->marked = 0;
+    }
+    rc_cycle_shade_slow(cycle);
+}
+static void rc_cycle_shade_temporary(RcCycle *cycle) {
+    if (!cycle || !cycle->registered || rc_cycle_snapshot_new(cycle))
+        return;
+    if (rc_cycle_proven(cycle)) {
+        rc_cycle_shade_proven(cycle);
+        return;
+    }
+    if (!rc_cycle_temporary_proven(cycle)) {
+        cycle->gray_next = (cycle->gray_next & ~(uintptr_t)3) | 1 |
+                          ((uintptr_t)(rc_cycle_proof_generation ^ 1) << 1);
+        if (cycle == rc_cycle_active && rc_cycle_phase == RC_CYCLE_MARK)
+            rc_cycle_index = 0;
+        else if (cycle->marked == 2)
             cycle->marked = 0;
     }
     rc_cycle_shade_slow(cycle);
@@ -233,6 +350,9 @@ static MINYAR_COLD void rc_cycle_check_external(RcObject *object) {
     RcCycle *cycle = rc_cycle_value(object + 1);
     if (!cycle || !cycle->registered || (object->ownership >> 3) != cycle->incoming)
         return;
+    if (cycle == rc_cycle_temporary_anchor) {
+        rc_cycle_temporary_valid = rc_cycle_temporary_build = 0;
+    }
     if (cycle == rc_cycle_proof_anchor) {
         rc_cycle_proof_retry = cycle;
         rc_cycle_proof_invalidate();
@@ -240,7 +360,10 @@ static MINYAR_COLD void rc_cycle_check_external(RcObject *object) {
     /* Do not discard the last temporary's request. Its queued unit validates
      * an unchanged owning path to an independently held root, or rescans. */
     unsigned proven = rc_cycle_proven(cycle) && rc_cycle_anchor_held();
-    rc_cycle_request_kind(!proven);
+    if (!proven && rc_cycle_proof_valid && !rc_cycle_proof_build && rc_cycle_anchor_held())
+        rc_cycle_request_local();
+    else
+        rc_cycle_request_kind(!proven);
 }
 /* While tracing is dormant no cycle can exist, so no request is needed. */
 static inline void rc_cycle_after_drop(RcObject *object) {
@@ -250,16 +373,22 @@ static inline void rc_cycle_after_drop(RcObject *object) {
 static MINYAR_NOINLINE void rc_cycle_add_incoming(RcObject *parent, RcCycle *cycle,
                                                 unsigned additive) {
     RcCycle *source = rc_cycle_metadata(parent);
+    rc_cycle_temporary_changed();
     if (!source->registered)
         rc_cycle_register(source);
     /* A committed proof certifies existing paths, not all registry objects.
      * Insertion removes no such path, even while a fresh owner is constructed.
-     * Unknown registered children retain conservative invalidation: they may
-     * contain cycles or require a new cohort. Never infer new descendants. */
-    unsigned preserve = additive && rc_cycle_phase == RC_CYCLE_IDLE &&
+     * Unknown children request separate bounded work after publication.
+     * Unknown self-insertion retains the strict full-cohort scheduling rule.
+     * Never infer new descendants from the incoming-count update. */
+    unsigned preserve = additive &&
+                        (rc_cycle_phase == RC_CYCLE_IDLE ||
+                         (rc_cycle_local_job &&
+                          (rc_cycle_phase != RC_CYCLE_SWEEP || !cycle->registered ||
+                           rc_cycle_proven(cycle) || rc_cycle_snapshot_new(cycle)))) &&
                         rc_cycle_proof_valid && !rc_cycle_proof_build &&
                         rc_cycle_anchor_held() && !rc_cycle_proof_anchor->pinned &&
-                        (!cycle->registered || rc_cycle_proven(cycle));
+                        (!cycle->registered || rc_cycle_proven(cycle) || source != cycle);
     if (!preserve)
         rc_cycle_proof_invalidate();
     rc_cycle_shade(cycle);
@@ -270,8 +399,37 @@ static MINYAR_NOINLINE void rc_cycle_add_incoming(RcObject *parent, RcCycle *cyc
         rc_cycle_proof_invalidate();
     if (rc_cycle_enabled && cycle->registered &&
         (rc_cycle_object(cycle)->ownership >> 3) == cycle->incoming &&
-        (parent->ownership >> 3) == source->incoming)
-        rc_cycle_request();
+        (parent->ownership >> 3) == source->incoming) {
+        if (preserve && rc_cycle_proof_valid) {
+            if (rc_cycle_proven(source) && rc_cycle_proven(cycle))
+                rc_cycle_request_kind(0);
+            else
+                rc_cycle_request_local();
+        } else
+            rc_cycle_request();
+    }
+}
+/* Called only after publishing an additive owning slot, before its poll.
+ * The edge proves the direct child. Descendants need bounded field work. */
+static void rc_cycle_commit_insert(void *owner, void *value) {
+    RcCycle *source = rc_cycle_value(owner), *child = rc_cycle_value(value);
+    if (!source || !child || !child->registered || !rc_cycle_proven(source) ||
+        !rc_cycle_proof_valid || rc_cycle_proof_build || !rc_cycle_anchor_held() ||
+        rc_cycle_proof_anchor->pinned ||
+        (rc_cycle_phase != RC_CYCLE_IDLE && !rc_cycle_local_job))
+        return;
+    if (!(child->gray_next & 4) && rc_cycle_proven(child))
+        return;
+    unsigned first_proof = !rc_cycle_proven(child);
+    child->gray_next = (child->gray_next & ~(uintptr_t)3) | 1 |
+                      ((uintptr_t)rc_cycle_proof_generation << 1);
+    if (first_proof && child == rc_cycle_active && rc_cycle_phase == RC_CYCLE_MARK)
+        rc_cycle_index = 0;
+    else if (first_proof && rc_cycle_shading && child->marked == 2) {
+        child->marked = 0;
+        rc_cycle_shade(child);
+    }
+    rc_cycle_request_local();
 }
 static inline void rc_cycle_edge_add(void *owner, void *value) {
     RcCycle *cycle = rc_cycle_value(value);
