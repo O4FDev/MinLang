@@ -244,8 +244,56 @@ static void reused_receiver(int kind) {
         empty();
     }
 }
+/* A canceled local MARK can finish a known root outside its sweep cohort.
+ * Moving its last external owner before the next full ROOTS visit must
+ * retain the snapshot path, even though its stale completed mark is 2. */
+static void move_stale_root_before_visit(int kind) {
+    Late s = setup(0, 0);
+    MinyarRecord *payload = minyar_record_new_traced(3);
+    minyar_record_set_traced(payload, 0, 1);
+    minyar_record_set_reference_traced(payload, 1, slot(s.parent));
+    minyar_record_set_traced(payload, 2, 123);
+    rc_cycle_request_local();
+    rc_cycle_unit();
+    assert(rc_cycle_phase == RC_CYCLE_ROOTS && rc_cycle_local_job);
+    publish(s, payload, 0, 1);
+    size_t steps = 0;
+    while (rc_cycle_phase != RC_CYCLE_IDLE) {
+        assert(++steps < 10000);
+        rc_cycle_unit();
+    }
+    RcCycle *root = rc_cycle_value(s.parent);
+    assert(root->marked == 2 && rc_cycle_rescan && rc_cycle_pending);
+    rc_cycle_unit();
+    assert(rc_cycle_phase == RC_CYCLE_ROOTS && !rc_cycle_local_job);
+    void *owner = receiver_new(kind);
+    if (kind) {
+        MinyarRecord *r = owner;
+        unsigned char *map = (unsigned char *)(r->values + r->length);
+        map[0] = 1;
+    }
+    rc_cycle_edge_insert(owner, s.parent);
+    assert(root->marked == 1);
+    if (kind)
+        ((MinyarRecord *)owner)->values[0] = slot(s.parent);
+    else {
+        MinyarList *l = owner;
+        l->values[l->length++] = slot(s.parent);
+    }
+    rc_cycle_commit_insert(owner, s.parent);
+    drain();
+    check(s, payload, s.parent, 4);
+    if (kind)
+        assert(((MinyarRecord *)owner)->values[0] == slot(s.parent));
+    else
+        assert(((MinyarList *)owner)->values[0] == slot(s.parent));
+    minyar_rc_release(owner);
+    empty();
+}
 int main(void) {
     queued_full_root();
+    move_stale_root_before_visit(0);
+    move_stale_root_before_visit(1);
     for (int kind = 0; kind < 2; kind++) {
         for (int copied = 0; copied < 2; copied++)
             for (int borrowed = 0; borrowed < 2; borrowed++) {
