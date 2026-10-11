@@ -106,15 +106,97 @@ function recoveredDelivery(c: quic.Connection,s: quic.Connection,now: Integer): 
     }
     return 0
 }
+
+function boundedLateDelivery(c: quic.Connection,s: quic.Connection,now: Integer): Integer {
+    let id=errors.integerValue(quic.openStream(c,false))
+    quic.writeStream(c,id,Bytes("x"),true)
+    let last=-1
+    for round in 0..4097 {
+        let tick=now+round*50
+        // Isolate packet-threshold loss from an outstanding PTO deadline.
+        c.spaces[2].probe=-1
+        c.paceCredit=Float(c.congestion.window);c.paceAt=tick
+        quic.poll(c,tick)
+        if c.spaces[2].sent.length!=1 { print("bounded original "+Text(round)+" "+Text(c.spaces[2].sent.length));return 74 }
+        let original=c.spaces[2].sent[0];last=original.number
+        for step in 1..4 {
+            quic.ping(c)
+            for packet in quic.poll(c,tick+step) { quic.receive(s,packet,tick+step) }
+        }
+        let frame=Bytes();frame.add(2);number(frame,c.spaces[2].next-1);number(frame,0);number(frame,0);number(frame,2)
+        inject(s,c,frame,tick+4)
+        c.paceCredit=0.0;c.paceAt=tick+4
+        quic.poll(c,tick+4)
+        if original.status!=2 || original.payload.length!=0 || c.pending.length!=1 { print("bounded loss phase "+Text(round));return 75 }
+        let space=c.spaces[2];let live=space.lostStreams.length-space.lostStreamsAt
+        if live>4096 || space.lostStreams.length>8192 { print("bounded cache count "+Text(round)+" "+Text(live)+" "+Text(space.lostStreams.length));return 76 }
+        for at in 0..space.lostStreamsAt { if space.lostStreams[at].streams.length!=0 { print("bounded expired refs "+Text(round));return 76 } }
+        if c.streams[0].sendAcknowledged!=0 || c.streams[0].finalAcknowledged { print("bounded premature delivery "+Text(round)+" "+Text(last));return 76 }
+    }
+    let before=c.flight
+    ack(s,c,last,now+4097*50)
+    if c.streams[0].sendAcknowledged!=1 || !c.streams[0].finalAcknowledged || c.flight!=before { return 77 }
+    if c.spaces[2].lostStreams.length-c.spaces[2].lostStreamsAt!=0 {
+        print("later lost retry ACK left earlier delivered metadata");return 78
+    }
+    quic.poll(c,now+4097*50+100)
+    for sent in c.spaces[2].sent {
+        for frame in wire.frames(sent.payload).frames { if frame.type>=8 && frame.type<=15 && frame.stream==id { return 79 } }
+    }
+    return 0
+}
+
+function delayedPersistent(c: quic.Connection,s: quic.Connection,now: Integer,late: Boolean): Integer {
+    if c.spaces[2].sent.length!=0 || c.history.length!=0 { return 81 }
+    c.congestion.smoothed=100;c.congestion.latest=100;c.congestion.minimum=100;c.congestion.variance=0;c.congestion.window=12000;c.congestion.measured=true
+    c.emptySince=-1;c.paceCredit=12000.0;c.paceAt=now
+    let id=errors.integerValue(quic.openStream(c,false));let original=c.spaces[2].next
+    quic.writeStream(c,id,Bytes("a"),false)
+    for packet in quic.poll(c,now) { quic.receive(s,packet,now) }
+    c.spaces[2].probe=-1
+    quic.writeStream(c,id,Bytes("b"),false)
+    for packet in quic.poll(c,now+1000) { quic.receive(s,packet,now+1000) }
+    quic.ping(c)
+    for packet in quic.poll(c,now+1001) { quic.receive(s,packet,now+1001) }
+    ack(s,c,c.spaces[2].next-1,now+1020)
+    c.paceCredit=0.0;c.paceAt=now+1020
+    quic.poll(c,now+1020)
+    if c.lossFirst!=now || c.lossLast!=now || c.congestion.window<=2400 { print("persistent setup");return 82 }
+    if late {
+        let flight=c.flight
+        ack(s,c,original,now+1021)
+        if c.streams[0].sendAcknowledged!=1 || c.flight!=flight { return 83 }
+    }
+    c.paceCredit=0.0;c.paceAt=now+1200;quic.poll(c,now+1200)
+    if late && c.congestion.window<=2400 { print("delayed ACK left false persistent loss interval");return 84 }
+    if !late && c.congestion.window!=2400 { print("persistent positive control");return 85 }
+    return 0
+}
+function freshProbe(c: quic.Connection,s: quic.Connection,now: Integer): Integer {
+    c.congestion.measured=true;c.congestion.smoothed=100;c.congestion.latest=100;c.congestion.minimum=100
+    c.paceCredit=Float(c.congestion.window);c.paceAt=now
+    let id=errors.integerValue(quic.openStream(c,false))
+    quic.writeStream(c,id,Bytes("probe"),false);quic.poll(c,now)
+    for step in 1..4 { quic.ping(c);for packet in quic.poll(c,now+step) { quic.receive(s,packet,now+step) } }
+    let frame=Bytes();frame.add(2);number(frame,c.spaces[2].next-1);number(frame,0);number(frame,0);number(frame,2)
+    inject(s,c,frame,now+4)
+    c.paceCredit=0.0;c.paceAt=now+4;quic.poll(c,now+4)
+    if c.spaces[2].sent.length!=0 || c.pending.length!=1 { return 86 }
+    c.paceCredit=Float(c.congestion.window);c.paceAt=now+1000
+    quic.poll(c,now+1000)
+    if c.spaces[2].sent.length!=1 { return 86 }
+    if c.spaces[2].probe<=now+1000 { print("new packet inherited an expired PTO deadline");return 87 }
+    return 0
+}
 function main(): Integer {
     let root=readBytesFile(argument(0));let cert=readBytesFile(argument(1));let key=readBytesFile(argument(2));let client=readBytesFile(argument(3));let clientKey=readBytesFile(argument(4))
-    for scenario in 0..3 {
+    for scenario in 0..4 {
         let candidate=quic.client("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey)
         let peer=quic.server(randomBytes(80),"minyar-test",candidate.originalDestination,[cert],key,[root],true)
         for count in 0..200 { drive(candidate,peer,count*10) }
         if !candidate.confirmed || !peer.confirmed { return 68 }
         let result=0
-        if scenario==0 { result=lateACK(candidate,peer,2000) } else if scenario==1 { result=queuedMixed(candidate,peer,2000) } else { result=recoveredDelivery(candidate,peer,2000) }
+        if scenario==0 { result=lateACK(candidate,peer,2000) } else if scenario==1 { result=queuedMixed(candidate,peer,2000) } else if scenario==2 { result=recoveredDelivery(candidate,peer,2000) } else { result=boundedLateDelivery(candidate,peer,2000) }
         if result!=0 { return result }
     }
     let c=quic.client("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey)
