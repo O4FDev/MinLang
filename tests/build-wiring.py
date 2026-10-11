@@ -13,6 +13,102 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class BuildWiring(unittest.TestCase):
 
+    def test_registration_exposure_has_required_native_and_sanitizer_gates(self):
+        import importlib.util
+        import json
+        import re
+        from unittest.mock import patch
+        native = 'check-cycle-registration-exposure'
+        sanitize = native + '-sanitize'
+        source = (ROOT / 'build-support/managed-graphs.mk').read_text()
+
+        def verify(text):
+            with tempfile.TemporaryDirectory(prefix='minyar registration wiring ') as folder:
+                makefile = Path(folder) / 'probe.mk'
+                makefile.write_text(text + '\n.PHONY: build/minyarc-errors build/minyarc-errors-sanitize\n'
+                                   'build/minyarc-errors build/minyarc-errors-sanitize:\n\t@echo ARTIFACT $@\n')
+                env = dict(os.environ)
+                env.pop('MAKEFLAGS', None)
+                result = subprocess.run(
+                    ['make', '-np', '-f', str(makefile), native, sanitize],
+                    cwd=ROOT, env=env, text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                rules = {}
+                for line in result.stdout.splitlines():
+                    match = re.match(r'^([\w./-]+):\s+(.*)$', line)
+                    if match:
+                        rules.setdefault(match[1], set()).update(match[2].split())
+                both = {native, sanitize}
+                for gate in ('check', 'check-portable', 'check-managed-graphs-profiles'):
+                    self.assertTrue(both <= rules.get(gate, set()), gate)
+                self.assertIn(sanitize, rules.get('check-sanitize', set()))
+                fixtures = {'tests/cycle-registration-exposure.c', 'tests/cycle-late-registration.c',
+                            'tests/cycle-late-registration.min', 'tests/cycle-additive.c',
+                            'tests/cycle-registration.py', 'tools/cycle_runtime.py'}
+                for target in both:
+                    self.assertTrue(fixtures <= rules.get(target, set()), target)
+                self.assertIn('build/minyarc-errors', rules[native])
+                self.assertIn('build/minyarc-errors-sanitize', rules[sanitize])
+                commands = result.stdout.split('# GNU Make', 1)[0]
+                self.assertEqual(commands.count('tests/cycle-registration.py'), 2)
+                self.assertEqual(commands.count('--sanitize'), 1)
+                self.assertNotIn('--nodes', commands)
+                self.assertIn('cycle-registration-exposure-native', commands)
+                self.assertIn('cycle-registration-exposure-sanitize', commands)
+
+        verify(source)
+        # Removing any required aggregate really changes Make's prerequisite
+        # database; a source-string reference alone cannot satisfy this gate.
+        for gate in ('check', 'check-portable', 'check-managed-graphs-profiles', 'check-sanitize'):
+            line = gate + ': ' + (sanitize if gate == 'check-sanitize'
+                                  else native + ' ' + sanitize) + '\n'
+            self.assertEqual(source.count(line), 1, gate)
+            with self.subTest(missing_gate=gate), self.assertRaises(AssertionError):
+                verify(source.replace(line, '', 1))
+
+        def load(name, path):
+            spec = importlib.util.spec_from_file_location(name, ROOT / path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+
+        runner = load('registration_linux_runner', 'scripts/check-linux.py')
+        for target in (native, sanitize):
+            self.assertEqual(runner.TARGETS.count(target), 1)
+        formatter = load('registration_formatter', 'scripts/format.py')
+        for fixture in ('tests/cycle-registration-exposure.c', 'tests/cycle-late-registration.c'):
+            self.assertIn(fixture, formatter.FILES)
+        catalogue = load('registration_catalogue', 'tests/suite-catalogue.py')
+        data = json.loads((ROOT / 'tests/suite-catalogue.json').read_text())
+        catalogue.validate(data, ROOT)
+        for fixture in ('tests/cycle-registration-exposure.c', 'tests/cycle-late-registration.c',
+                        'tests/cycle-late-registration.min', 'tests/cycle-registration.py'):
+            self.assertIn(fixture, catalogue.discover(ROOT))
+            with self.subTest(uncatalogued=fixture), self.assertRaises(ValueError):
+                catalogue.validate(dict(data, sources=[row for row in data['sources']
+                                                       if row['path'] != fixture]), ROOT)
+        driver = load('registration_driver', 'tests/cycle-registration.py')
+        import inspect
+        language = driver.load('registration_inspection_control', 'tests/errors-language.py')
+        self.assertEqual(Path(inspect.getsourcefile(language.ErrorsLanguage)),
+                         ROOT / 'tests/errors-language.py')
+        with patch('clang_helpers.platform.system', return_value='Windows'):
+            profiles, unsupported = driver.profile_selection(None, True)
+            self.assertEqual(profiles, ['system', 'fixed', 'eager'])
+            self.assertEqual(unsupported[0]['profile'], 'lazy')
+            with self.assertRaises(ValueError):
+                driver.profile_selection(['lazy'], True)
+        with patch.object(driver, 'windows_host', return_value=True), \
+                patch.object(sys, 'argv', ['cycle-registration.py', '--profiles', 'lazy',
+                                         '--evidence', 'unused']), \
+                self.assertRaises(SystemExit) as unsupported_exit:
+            driver.main()
+        self.assertEqual(unsupported_exit.exception.code, 2)
+        # These schedules are built into main(void), not runtime graph sizes.
+        self.assertFalse(driver.build_parser().parse_args(['--evidence', 'out']).__dict__.get('nodes'))
+        with self.assertRaises(SystemExit):
+            driver.build_parser().parse_args(['--evidence', 'out', '--nodes', '2048'])
+
     def test_registered_growth_is_mandatory_with_native_and_sanitizer_drivers(self):
         import re
         with tempfile.TemporaryDirectory(prefix='minyar registry wiring ') as folder:

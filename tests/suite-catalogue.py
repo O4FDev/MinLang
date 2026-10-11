@@ -15,11 +15,15 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 EXTENSIONS = {'.py', '.c', '.h', '.m', '.sh'}
 ROLES = {'suite', 'support', 'fixture', 'manual', 'ungated'}
+# Minyar fixtures normally belong to harnesses. This retained correctness case
+# also has an explicit mandatory disposition, unlike generated Minyar samples.
+REQUIRED_MINYAR_FIXTURES = {'tests/cycle-late-registration.min'}
 
 
 def discover(root):
     return {p.relative_to(root).as_posix() for p in (root / 'tests').rglob('*')
-            if p.is_file() and p.suffix in EXTENSIONS}
+            if p.is_file() and (p.suffix in EXTENSIONS or
+                                    p.relative_to(root).as_posix() in REQUIRED_MINYAR_FIXTURES)}
 
 
 def validate(data, root):

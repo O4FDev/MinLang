@@ -90,3 +90,15 @@ check-cycle-registry-growth-sanitize: tests/cycle-registry-growth.c tests/cycle-
 check check-portable: check-cycle-registry-growth check-cycle-registry-growth-sanitize
 check-sanitize: check-cycle-registry-growth-sanitize
 check-managed-graphs-profiles: check-cycle-registry-growth check-cycle-registry-growth-sanitize
+
+# Both C mains own their complete schedules; no --nodes arguments apply.
+.PHONY: check-cycle-registration-exposure check-cycle-registration-exposure-sanitize
+CYCLE_REGISTRATION_INPUTS = tests/cycle-registration.py tests/cycle-registration-exposure.c tests/cycle-late-registration.c tests/cycle-late-registration.min tests/cycle-additive.c tests/cycle-additive.py tests/errors-language.py tests/callbacks.py tests/errors_evidence.py tests/test_evidence.py tools/cycle_runtime.py $(RUNTIME_HEADERS)
+check-cycle-registration-exposure: build/minyarc-errors $(CYCLE_REGISTRATION_INPUTS)
+	MINYAR_ERRORS_COMPILER=./build/minyarc-errors MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-registration.py --evidence "$(CURDIR)/build/cycle-registration-exposure-native"
+check-cycle-registration-exposure-sanitize: build/minyarc-errors-sanitize $(CYCLE_REGISTRATION_INPUTS)
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_ERRORS_COMPILER=./build/minyarc-errors-sanitize MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-registration.py --sanitize --evidence "$(CURDIR)/build/cycle-registration-exposure-sanitize"
+check: check-cycle-registration-exposure check-cycle-registration-exposure-sanitize
+check-portable: check-cycle-registration-exposure check-cycle-registration-exposure-sanitize
+check-managed-graphs-profiles: check-cycle-registration-exposure check-cycle-registration-exposure-sanitize
+check-sanitize: check-cycle-registration-exposure-sanitize
