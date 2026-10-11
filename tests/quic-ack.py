@@ -22,7 +22,7 @@ def digest(path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sanitize", action="store_true")
-    parser.add_argument("--mode", type=int, action="append", choices=range(46))
+    parser.add_argument("--mode", type=int, action="append", choices=range(48))
     parser.add_argument("--artifacts", type=Path)
     parser.add_argument("--library", type=Path)
     parser.add_argument("--optimization", choices=("0", "2", "both"), default="both")
@@ -82,7 +82,7 @@ def main():
             print("ACK compiler failed", opt, result.returncode, result.stderr.decode(errors="replace")[-3000:])
             return 1
         row["binary_sha256"] = digest(binary)
-        for mode in options.mode or range(46):
+        for mode in options.mode or range(48):
             command = [str(binary), *[str(ca.path(name, suffix)) for name, suffix in (
                 ("root", "der"), ("server", "der"), ("server", "pk8"), ("client", "der"), ("client", "pk8"))], str(mode)]
             started = time.monotonic()
