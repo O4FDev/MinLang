@@ -112,7 +112,10 @@ function remoteIdIndex(connection: Connection, sequence: Integer): Integer {
     return -1
 }
 function abandonPath(connection: Connection, path: Path) {
-    if path.id == connection.activePath { return }
+    if path.id == connection.activePath {
+        // Failed revalidation must not discard the last validated fallback.
+        path.challenge = Bytes(); path.deadline = -1; path.attempts = 0; return
+    }
     let retained: List<Path> = []; let shared = false
     for known in connection.paths {
         if known.id != path.id { retained.add(known); if known.remoteSequence == path.remoteSequence { shared = true } }
@@ -1151,6 +1154,11 @@ public function receivePath(connection: Connection, datagram: Bytes, pathId: Int
                 // A changed incoming CID identifies intentional peer migration;
                 // only same-CID rebinding permits reciprocal CID reuse.
                 if receivedInterval(space,packet.number,packet.number) { continue }
+                // RFC9000 8.2.3: an unsolicited response on an unknown route
+                // cannot resurrect validation that has already been abandoned.
+                let routed = wire.frames(packet.payload); let responseOnly = true
+                for frame in routed.frames { if frame.type != 0 && frame.type != 27 { responseOnly = false } }
+                if routed.valid && routed.frames.length > 0 && responseOnly { continue }
                 let active = pathIndex(connection,connection.activePath)
                 let changed = active < 0 || !equal(connection.paths[active].localId,header.destination)
                 pathAt = candidatePath(connection, pathId, changed)
@@ -1163,9 +1171,20 @@ public function receivePath(connection: Connection, datagram: Bytes, pathId: Int
         connection.lastActivity = now
         let parsed = wire.frames(packet.payload)
         if !parsed.valid || parsed.frames.length == 0 { terminate(connection, 7, "malformed or empty QUIC payload"); return }
-        if packet.number > space.largest && path.id != connection.activePath {
-            for frame in parsed.frames { if frame.type != 0 && frame.type != 24 && frame.type != 26 && frame.type != 27 { path.eligible = true } }
-            if path.validated && path.eligible { activatePath(connection,path) }
+        if packet.number > space.largest {
+            let nonProbing = false
+            for frame in parsed.frames { if frame.type != 0 && frame.type != 24 && frame.type != 26 && frame.type != 27 { nonProbing = true } }
+            if path.id != connection.activePath {
+                if nonProbing { path.eligible = true }
+                if path.validated && path.eligible { activatePath(connection,path) }
+            }
+            // RFC9000 9.3.2/9.3.3: newer traffic on the original validated
+            // route cancels an apparent migration, but reordered packets do not.
+            if level == 2 && !connection.clientRole && nonProbing && path.id == connection.activePath && path.validated {
+                for other in connection.paths {
+                    if other.id != path.id && other.eligible && other.challenge.length == 8 { abandonPath(connection,other) }
+                }
+            }
         }
         let wrongResponse = false
         for frame in parsed.frames {
@@ -1527,7 +1546,17 @@ function candidatePath(connection: Connection, id: Integer, local: Boolean): Int
         else if path.challenge.length == 8 { return -1 }
     }
     let path = Path { id: id; validated: false; eligible: local && connection.clientRole; challenge: randomBytes(8); remoteSequence: sequence; remoteId: destination; localId: connection.local; intentional: local; deadline: -1; attempts: 0; received: 0; sent: 0 }
-    retained.add(path); connection.paths = retained; challengePath(connection, path)
+    retained.add(path); connection.paths = retained
+    // RFC9000 9.3.3: elicit the previously active route as well as the new
+    // peer route. Start early so confirmation cannot discard an unsent probe.
+    if !connection.clientRole {
+        for previous in retained {
+            if previous.id == connection.activePath && previous.challenge.length == 0 {
+                previous.challenge = randomBytes(8); previous.attempts = 0; challengePath(connection,previous)
+            }
+        }
+    }
+    challengePath(connection, path)
     return retained.length - 1
 }
 public function probePath(connection: Connection, pathId: Integer, now: Integer): errors.BooleanResult {

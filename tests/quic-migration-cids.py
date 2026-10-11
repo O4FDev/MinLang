@@ -46,6 +46,9 @@ BASELINE = {
     "preferred-reciprocal": (202, "semantic failure: server reused its original destination CID for an intentional peer path"),
     "server-cid-unavailable": (214, "semantic failure: server replied to intentional migration without an unused destination CID"),
     "nat-cid-unavailable": (0, "NAT rebinding preserved the client"),
+    "previous-path-probe": (224, "semantic failure: apparent migration did not challenge the previously active route"),
+    "previous-path-return": (234, "semantic failure: newer original-route packet retained the spurious migration candidate"),
+    "previous-path-timeout": (0, "expired old and candidate validation"),
 }
 
 def sha256(path):
