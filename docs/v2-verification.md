@@ -1,11 +1,27 @@
 # v2 implementation and verification map
 
 This checkpoint describes the combined implementation based on
-`0e1fc1b4a5cd853ac86d7614c8588a960e7d5f0b` on 2026-10-11.
+`bafcb67bcdd9ad5871d4cb16f497ad60d0479abb` at 17:44 UTC on 2026-10-11.
 An implemented API, a passing focused suite and a complete deployment are
 separate claims. Retained results establish only their recorded source and
 configuration. Combined CI, current macOS/Windows gates, ordinary performance
 gates and long application fault measurements remain incomplete.
+
+The original red CI was repaired at `30bcee930480036ab9ae5fa0a0fd0c4d5fead4e7`:
+run `38055713661` passed all 17 jobs. That historical result does not certify
+the subsequent combined implementation. The current checkpoint preserves the
+v2 branches and their evidence; the interrupted thread's recurring scheduler
+is disabled so it cannot duplicate this work.
+
+At frozen `43e1b2f020d4ada0c3f50e37cbc6d04cf9f3353a`, 21 standalone Linux
+targets passed: feature dispatch; native/sanitizer managed graphs, callbacks,
+isolated workers and cycle progress; domain/profile and launcher checks;
+Result review/base/bounded profiles; and coverage. The source remained
+byte-identical before and after both recorded batches. Coverage measured
+79.63% compiler edges, 80.70% runtime lines and 65.28% runtime branches against
+the unchanged 79%/72%/55% floors. These checks are not the full CI matrix.
+The automatically rejected generated-access sanitizer demonstration remains
+held; aggregate targets that require it have not been rerun or reported green.
 
 ## Memory and concurrency
 
@@ -41,6 +57,13 @@ Registration, witness, additive and registered-growth gates passed separately.
 That recurring idle failure remains unresolved; neither a diagnostic pass nor
 a collector work-count bound certifies it.
 
+The current Linux native and sanitizer progress matrices passed, including the
+unchanged one-second `system-k1024/n2048` idle oracle. The native case measured
+about 0.50% of one CPU. This does not resolve the Windows failure. A later
+Windows VM readiness attempt exceeded the whole-host 75% resource ceiling
+before any current product test ran; the guest was stopped and its retained
+backing image was unchanged.
+
 ## Recoverable errors
 
 The optional Result frontend supports explicit `Result<T,E>`,
@@ -62,6 +85,13 @@ passed actual Windows NT native/sanitizer checks at their recorded source.
 These earlier profiles do not certify the final combined tree. See
 [the language contract](research/errors-language.md) and
 [the lexical, ABI and ownership review](research/errors-review.md).
+
+At the current Linux qualification source `43e1b2f`, the 23 review methods
+passed native, sanitizer and bounded profiles. Their executable footer selects
+only review methods, so the 26 base methods were also run independently:
+native, sanitizer and bounded budgets 1/32/1024 all passed. Coverage remains
+an ordinary eager-RC measurement; it does not replace the optional frontend
+and collector suites.
 
 Launcher selection uses a parsed request-only probe after the primary compiler
 returns 1 or 86. Probe status 87 selects Result; otherwise the existing callback
@@ -96,8 +126,33 @@ both roles at frozen source `83a3ebe`; server Retry also passed. Independent
 Quinn tests retain migration, resumption and early-data evidence. A later frozen
 `5387aea6` run passed all four client 0-RTT peer cells under the unchanged
 criterion. Those historical results do not validate the current combined QUIC
-source. A new 128-cell plan covers 16 selected scenarios, four independent peers
-and both roles; it has not run. Full interoperability remains pending.
+source. The new 128-cell plan covers 16 selected scenarios, four independent
+peers and both roles. At this checkpoint, 14 cells passed: all eight handshake
+cells, all four Minyar-client ChaCha20 cells, and the Minyar-server ChaCha20
+cells with Quinn and msquic. A pinned quiche client explicitly reports ChaCha20
+unsupported; that cell remains a nonpass coverage gap. The Minyar-server /
+ngtcp2-client ChaCha20 cell retains its literal failed result: the independent
+peer rejected its cipher-selection CLI option before QUIC traffic. The
+remaining 112 cells have not run; full interoperability remains pending.
+
+Actual runner failures exposed fixture defects in Docker 29 capability
+spelling, simulator capture writers that had not flushed during shutdown, and
+signal handlers registered only after endpoint network readiness. Focused
+red/green controls and fresh affected cells establish the narrow repairs.
+Pre-scenario cleanup now runs before the unchanged scenario timeout. Neither
+the protocol checker nor an independent peer was changed to accept a failed
+or unsupported protocol result. The unsupported quiche cell retains its setup
+and controller errors even though our repaired endpoint exited promptly with
+143 and its owned objects were absent afterward.
+
+Actual UDP-blocked fallback now passes native and ASan/UBSan/LSan checks both
+before connection and after an authenticated Quinn echo. The mid-session test
+acknowledges a permanent physical proxy blackhole, observes `TCP_NEEDED` at
+generation 1, rejects the retired stream handle, then performs fresh mutual
+TLS and sixteen 32-KiB half-closed streams against independent Go yamux.
+Minyar and Go exit normally with empty diagnostics. The isolated Quinn oracle
+receives owned SIGTERM after proof; this does not certify that helper's
+normal-exit leak behavior. This focused fallback pass is not a multi-hour soak.
 
 ## Application measurements and long runs
 
@@ -115,6 +170,21 @@ run by binding the compiler, 32 runtime headers, cache key, publication rule,
 object and final executable. It did not rerun the workload. This result is
 TCP gateway capacity and a one-minute idle measurement: it is not 20,000 QUIC
 devices, a two-hour steady-state run, or flat-RSS certification.
+
+A separate current-source fixture now exercises actual QUIC devices. Its
+32-device baseline passed: independent Quinn authenticated each device,
+Redis admitted all 32 exact live-state records, 149 heartbeats were observed,
+and native retirement ended with zero active peers and retained relays. The
+30-second CPU measurement was 1.0395% of one CPU; it does not establish
+two-hour flat memory. Intermediate certificate chains and exclusive
+device/gateway root rollover also passed native and sanitizer checks.
+
+The first 4,096-device probe failed during setup after reporting at least
+1,000 authenticated devices: the independent client returned a bounded I/O
+timeout before complete Redis admission. No steady-state measurement began.
+Native diagnostics were empty, but controller-triggered teardown means this
+run does not establish normal retirement or capacity. The failed evidence is
+retained for diagnosis; 20,000 actual QUIC devices remain unqualified.
 
 Earlier source-frozen TLS/HTTP, QUIC and socket soaks remain evidence only for
 their recorded sources, peers, faults and exit statuses. A foundation
@@ -155,9 +225,13 @@ skip. Sys-mode link fixtures establish the POSIX-provider rejection contract;
 genuine Windows reparse-link evidence is recorded separately. Current combined
 shipping gates still need verification.
 
+The portable bundle packager's 14 Python methods now pass on macOS after its
+temporary-directory fixture resolves the platform's `/var` pathname alias.
+Only fixture paths changed; the packaging implementation remained unchanged.
+
 Usual framework symlink layouts are unsupported. Darwin pathname execution
 requires a protected update root and has no absolute same-user TOCTOU guarantee.
-See [shipping](shipping.md) for the precise boundary. Developer ID,
-notarization, Windows publisher signing and production R2 publication still
-require actual distribution identities and operator credentials. Fixture
-signatures and release-tool contract tests do not establish those operations.
+See [shipping](shipping.md) for the precise boundary. Production signing and
+publication are deferred at the user's request. Developer ID, notarization,
+Windows publisher signing and production R2 publication remain unestablished;
+fixture signatures and release-tool contract tests do not certify them.
