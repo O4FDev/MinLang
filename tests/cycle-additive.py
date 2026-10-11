@@ -90,6 +90,7 @@ def main():
              if args.sanitize else ["-O2"])
     historical = "rc_cycle_edge_insert" not in (ROOT/"runtime/minyar_cycles.h").read_text()
     report["historical_barrier_adapter"] = historical
+    report["bounded_heap_bytes"] = 4194304 if args.fixture == "cycle-registry-growth.c" else 1048576
     try:
         for profile in profiles:
             for budget in ([32] if profile == "eager" else args.budgets):
@@ -97,7 +98,8 @@ def main():
                 binary = out/(label+(".exe" if windows_host() else ""))
                 command = [os.environ.get("MINYAR_TEST_CLANG","clang"), *flags, "-std=c11",
                            "-Wall","-Wextra","-Werror","-iquote",str(ROOT/"runtime"),
-                           *options[profile], "-DMINYAR_BOUNDED_HEAP_BYTES=1048576",
+                           *options[profile], "-DMINYAR_BOUNDED_HEAP_BYTES="+str(
+                               4194304 if args.fixture == "cycle-registry-growth.c" else 1048576),
                            "-DMINYAR_RC_POLL_BUDGET="+str(budget)]
                 if historical:
                     command.append("-Drc_cycle_edge_insert=rc_cycle_edge_add")

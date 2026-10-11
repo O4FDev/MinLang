@@ -130,6 +130,197 @@ static void conservative_mix(void) {
     minyar_rc_release(g.root);
     empty();
 }
+
+#ifdef MINYAR_CYCLE_LOCAL_PROOFS
+static size_t registry_list(RcCycle *head, RcCycle *tail) {
+    size_t count = 0; RcCycle *previous = NULL;
+    for (RcCycle *c = head; c; c = c->next) {
+        assert(++count <= rc_object_count);
+        assert(c->registered && c->previous == previous);
+        previous = c;
+    }
+    assert(previous == tail);
+    return count;
+}
+static size_t check_registry(void) {
+    size_t unknown = registry_list(rc_cycle_head, rc_cycle_tail);
+    size_t known = registry_list(rc_cycle_known_head, rc_cycle_known_tail);
+    for (RcCycle *a = rc_cycle_head; a; a = a->next)
+        for (RcCycle *b = rc_cycle_known_head; b; b = b->next) assert(a != b);
+    return unknown + known;
+}
+static Graph local_batch(void) {
+    Graph g = graph();
+    MinyarRecord *branches[96];
+    for (unsigned i = 0; i < 96; i++) {
+        branches[i] = minyar_record_new_traced(1);
+        MinyarRecord *leaf = minyar_record_new_traced(1);
+        minyar_record_set_traced(leaf, 0, 5000 + i);
+        minyar_record_set_take_traced(branches[i], 0, slot(leaf));
+    }
+    list_reserve(g.list, 128);
+    /* Exact take-store ordering without its service point, so each phase is
+     * deliberately interruptible even for budget1024 and eager profiles. */
+    for (unsigned i = 0; i < 96; i++) {
+        rc_cycle_edge_insert(g.list, branches[i]);
+        g.list->values[g.list->length++] = slot(branches[i]);
+        rc_cycle_commit_insert(g.list, branches[i]);
+    }
+    assert(rc_cycle_proof_valid && rc_cycle_local_requested);
+    assert(check_registry() == 99);
+    return g;
+}
+static void local_phase(unsigned target) {
+    size_t units = 0;
+    while (rc_cycle_phase != target) {
+        assert(rc_cycle_pending && ++units < 100000);
+        rc_cycle_unit();
+    }
+    assert(rc_cycle_local_job && rc_cycle_proof_valid && !rc_cycle_proof_build);
+}
+static void local_cancellations(void) {
+    for (unsigned phase = RC_CYCLE_ROOTS; phase <= RC_CYCLE_SWEEP; phase++) {
+        for (unsigned action = 0; action < 3; action++) {
+            Graph g = local_batch();
+            local_phase(phase);
+            if (phase == RC_CYCLE_SWEEP) {
+                size_t before = registry_list(rc_cycle_known_head, rc_cycle_known_tail);
+                while (registry_list(rc_cycle_known_head, rc_cycle_known_tail) == before)
+                    rc_cycle_unit();
+                assert(rc_cycle_phase == RC_CYCLE_SWEEP && rc_cycle_local_job);
+            }
+            check_registry();
+            if (action == 0) {
+                rc_drop(g.root); /* Sole anchor release cancels partial promotion. */
+                assert(!rc_cycle_proof_anchor && !rc_cycle_proof_valid);
+#ifndef MINYAR_BOUNDED_RC
+                minyar_rc_release(NULL);
+#endif
+                empty();
+            } else if (action == 1) {
+                minyar_list_set_traced(g.list, 17, 0);
+                drain();
+                fprintf(stderr,"cancel phase=%u action=%u objects=%zu\n",phase,action,rc_object_count);
+                assert(rc_object_count == 194);
+                check_registry();
+                minyar_rc_release(g.root); empty();
+            } else {
+                /* Take sole root into a rooted interior owner: incoming must
+                 * invalidate before the publication or any collector unit. */
+                rc_cycle_edge_insert(g.list, g.root);
+                assert(!rc_cycle_anchor_held() && !rc_cycle_proof_valid);
+                g.list->values[g.list->length++] = slot(g.root);
+                rc_cycle_commit_insert(g.list, g.root);
+                empty();
+            }
+            assert(!rc_cycle_known_head && !rc_cycle_known_tail && !rc_cycle_tail);
+        }
+    }
+}
+
+static void temporary_contracts(void) {
+    for (unsigned action = 0; action < 4; action++) {
+        Graph g = graph();
+        MinyarRecord *p = captured_peer(g.root, action);
+        drain();
+        assert(rc_object_count == 8);
+        assert(rc_cycle_temporary_valid && rc_cycle_temporary_held());
+        assert(rc_cycle_temporary_anchor == rc_cycle_value(p));
+        assert(!rc_cycle_proven(rc_cycle_value(p)));
+        assert(rc_cycle_proof_anchor == rc_cycle_value(g.root));
+        size_t units = rc_cycle_units;
+        rc_cycle_request_local(); drain();
+        assert(rc_cycle_units - units == 1);
+        if (action == 0) {
+            /* Opposite temporary tags must not alias a newly started full
+             * proof before this unknown node's ROOTS unit has cleared them. */
+            rc_cycle_request(); rc_cycle_unit();
+            assert(rc_cycle_phase == RC_CYCLE_ROOTS && rc_cycle_proof_build);
+            assert(!rc_cycle_proven(rc_cycle_value(p)));
+            drain();
+            minyar_rc_release(p);
+            drain();
+            assert(rc_object_count == 4);
+        } else if (action == 1) {
+            MinyarRecord *owner = minyar_record_new_traced(1);
+            minyar_record_set_take_traced(owner, 0, slot(p));
+            assert(!rc_cycle_temporary_valid && !rc_cycle_temporary_build);
+            minyar_rc_release(owner); drain();
+            assert(rc_object_count == 4);
+        } else if (action == 2) {
+            /* Copying preserves p's external owner; future release still
+             * must not retain a stale temporary certificate after reuse. */
+            MinyarRecord *owner = minyar_record_new_traced(1);
+            minyar_record_set_reference_traced(owner, 0, slot(p));
+            minyar_rc_release(owner); drain();
+            assert(rc_object_count == 8);
+            minyar_rc_release(p); drain();
+            assert(rc_object_count == 4);
+        } else {
+            /* Two unknown roots cannot both inherit the first root witness. */
+            MinyarRecord *second = captured_peer(g.root, 10);
+            drain();
+            assert(rc_object_count == 12);
+            assert(!rc_cycle_temporary_valid);
+            minyar_rc_release(p); drain();
+            assert(rc_object_count == 8);
+            check_peer(second, g.root, 10);
+            minyar_rc_release(second); drain();
+            assert(rc_object_count == 4);
+        }
+        minyar_rc_release(g.root); empty();
+        assert(!rc_cycle_temporary_anchor);
+    }
+    for (unsigned phase = RC_CYCLE_ROOTS; phase <= RC_CYCLE_SWEEP; phase++) {
+        MinyarRecord *outside = minyar_record_new_traced(1);
+        Graph g = local_batch();
+        local_phase(phase);
+        minyar_rc_retain_traced(outside);
+        rc_cycle_edge_insert(outside, outside);
+        assert(!rc_cycle_proof_valid && rc_cycle_rescan);
+        outside->values[0] = slot(outside);
+        ((unsigned char *)(outside->values + outside->length))[0] = 1;
+        rc_cycle_commit_insert(outside, outside);
+        rc_drop(outside);
+#ifndef MINYAR_BOUNDED_RC
+        minyar_rc_release(NULL);
+#endif
+        drain();
+        assert(rc_object_count == 196);
+        check_registry();
+        minyar_rc_release(g.root); empty();
+    }
+}
+
+static void stale_jobs_and_reuse(void) {
+    for (unsigned turn = 0; turn < 32; turn++) {
+        Graph g = local_batch();
+        local_phase(RC_CYCLE_ROOTS);
+        /* Unregister captured tail and a new prefix, then re-register one
+         * live allocation. This stresses both namespace bits and finite tail. */
+        RcCycle *tail = rc_cycle_tail;
+        RcObject *object = rc_cycle_object(tail);
+        rc_cycle_unregister(object);
+        assert(!tail->registered);
+        rc_cycle_register(tail);
+        assert(tail->registered && tail == rc_cycle_head);
+        rc_cycle_request(); /* Mandatory full request survives local cancel. */
+        drain();
+        assert(rc_object_count == 196);
+        check_registry();
+        for (unsigned flip = 0; flip < 3; flip++) { rc_cycle_request(); drain(); }
+        MinyarRecord *lost = minyar_record_new_traced(2);
+        minyar_record_set_reference_traced(lost, 0, slot(lost));
+        minyar_record_set_reference_traced(lost, 1, slot(g.root));
+        minyar_rc_release(lost);
+        drain();
+        assert(rc_object_count == 196);
+        minyar_rc_release(g.root); empty();
+        assert(!rc_cycle_local_requested);
+    }
+}
+#endif
+
 int main(int argc, char **argv) {
     unsigned n = argc > 1 ? (unsigned)strtoul(argv[1], NULL, 10) : 256;
     const char *mode = argc > 2 ? argv[2] : "all";
@@ -144,6 +335,11 @@ int main(int argc, char **argv) {
         char *old[] = {(char *)"additive", (char *)"32", NULL};
         additive_fixture_main(2, old);
         conservative_mix();
+#ifdef MINYAR_CYCLE_LOCAL_PROOFS
+        local_cancellations();
+        stale_jobs_and_reuse();
+        temporary_contracts();
+#endif
     }
     printf("registered graph growth n=%u mode=%s objects=0 bytes=0\n", n, mode);
     return 0;
