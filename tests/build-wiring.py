@@ -14,6 +14,80 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class BuildWiring(unittest.TestCase):
 
+
+    def test_network_native_and_sanitizer_keep_distinct_limits(self):
+        import re
+
+        fragment = (ROOT/'build-support/networking.mk').read_text()
+
+        def verify(candidate, host='Linux', operating_system=''):
+            with tempfile.TemporaryDirectory(prefix='network limits Make rules ') as folder:
+                directory = Path(folder)
+                uname = directory/'uname'
+                uname.write_text('#!/bin/sh\nprintf "%s\\n" "' + host + '"\n')
+                uname.chmod(0o755)
+                makefile = directory/'probe.mk'
+                makefile.write_text(
+                    'LLVM_CC := retained-clang\nLIMITED := ordinary-limit\n'
+                    'SANITIZER_LIMITED := sanitizer-limit\n' + candidate
+                    + '\n.PHONY: build/minyarc\nbuild/minyarc:\n\t@echo INPUT $@\n')
+                env = dict(os.environ, PATH=str(directory)+os.pathsep+os.environ['PATH'],
+                           OS=operating_system)
+                env.pop('MAKEFLAGS', None)
+                result = subprocess.run(
+                    ['make', '-rRn', '-f', str(makefile), 'check-net'],
+                    cwd=ROOT, env=env, capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                commands = [line for line in result.stdout.splitlines()
+                            if 'python3 tests/net-native.py' in line]
+                windows = operating_system == 'Windows_NT' or host.startswith(
+                    ('MSYS', 'MINGW', 'CYGWIN'))
+                self.assertEqual(len(commands), 1 if windows else 2)
+                native = next(line for line in commands if '--mode native' in line)
+                self.assertIn('ordinary-limit python3 tests/net-native.py --mode native', native)
+                self.assertNotIn('sanitizer-limit', native)
+                self.assertIn('MINYAR_TEST_CLANG="retained-clang"', native)
+                self.assertIn('--evidence "$evidence"', native)
+                self.assertIn(str(ROOT/'build/net-native.'), native.replace('\\', '/'))
+                if not windows:
+                    sanitize = next(line for line in commands if '--mode sanitize' in line)
+                    self.assertIn('sanitizer-limit python3 tests/net-native.py --mode sanitize',
+                                  sanitize)
+                    self.assertNotIn('ordinary-limit', sanitize)
+                    self.assertIn('MINYAR_TEST_CLANG="retained-clang"', sanitize)
+                    self.assertIn('--evidence "$evidence"', sanitize)
+                    self.assertIn(str(ROOT/'build/net-native-sanitize.'),
+                                  sanitize.replace('\\', '/'))
+                self.assertEqual(result.stdout.count('python3 tests/soak-observer-test.py'), 1)
+
+        verify(fragment)
+        for host, operating_system in (
+                ('Darwin', ''), ('Linux', 'Windows_NT'), ('MSYS_NT-10.0', ''),
+                ('MINGW64_NT-10.0', ''), ('CYGWIN_NT-10.0', '')):
+            with self.subTest(host=host, operating_system=operating_system):
+                verify(fragment, host, operating_system)
+        native = next(line for line in fragment.splitlines()
+                      if 'tests/net-native.py --mode native' in line)
+        sanitize = next(line for line in fragment.splitlines()
+                        if 'tests/net-native.py --mode sanitize' in line)
+        for name, old, new in (
+                ('missing native', native, ''),
+                ('missing POSIX sanitizer', sanitize, ''),
+                ('sanitizer ordinary limit', sanitize, sanitize.replace(
+                    '$(SANITIZER_LIMITED)', '$(LIMITED)')),
+                ('native sanitizer limit', native, native.replace(
+                    '$(LIMITED)', '$(SANITIZER_LIMITED)')),
+                ('sanitizer default mixed modes', sanitize, sanitize.replace(
+                    ' --mode sanitize', '')),
+                ('native default mixed modes', native, native.replace(
+                    ' --mode native', '')),
+                ('relative evidence', '$(abspath build)', 'build')):
+            mutant = fragment.replace(old, new, 1)
+            self.assertNotEqual(mutant, fragment)
+            with self.subTest(invalid_recipe=name), self.assertRaises(
+                    (AssertionError, StopIteration)):
+                verify(mutant)
+
     def test_cycle_progress_observability_is_mandatory_without_idle_replay(self):
         import importlib.util
         import json
