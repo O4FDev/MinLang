@@ -32,8 +32,8 @@ extern void minyar_windows_setChecked(long long, bool);
 extern bool minyar_windows_nextEvent(double);
 extern long long minyar_windows_eventType(void), minyar_windows_eventSource(void);
 extern MinyarText *minyar_windows_eventText(void);
-extern void minyar_windows_close(long long), minyar_windows_destroy(long long),
-    minyar_windows_quit(void);
+extern void minyar_windows_show(long long), minyar_windows_close(long long),
+    minyar_windows_destroy(long long), minyar_windows_quit(void);
 extern HWND minyar_windows_testHandle(long long);
 extern HMENU minyar_windows_testMenu(long long);
 extern long long minyar_windows_menu(long long, const MinyarText *),
