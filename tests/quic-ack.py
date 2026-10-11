@@ -22,7 +22,9 @@ def digest(path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sanitize", action="store_true")
+    parser.add_argument("--mode", type=int, action="append", choices=range(29))
     parser.add_argument("--artifacts", type=Path)
+    parser.add_argument("--library", type=Path)
     parser.add_argument("--optimization", choices=("0", "2", "both"), default="both")
     options = parser.parse_args()
     directory = options.artifacts or Path(tempfile.mkdtemp(prefix="minyar-quic-ack-"))
@@ -43,6 +45,9 @@ def main():
     def save():
         target.write_text(json.dumps(manifest, indent=2) + "\n")
     save()
+    library = (options.library or ROOT / "library").resolve()
+    if library != ROOT / "library":
+        manifest["override_sources"] = {str(p): digest(p) for p in library.rglob("*") if p.is_file()}
     opts = ("0", "2") if options.optimization == "both" else (options.optimization,)
     for opt in opts:
         flags = f"-O{opt} -Wno-override-module"
@@ -55,7 +60,10 @@ def main():
         env["ASAN_OPTIONS"] = "detect_leaks=1" if sys.platform.startswith("linux") else "detect_leaks=0"
         env["UBSAN_OPTIONS"] = "halt_on_error=1"
         binary = directory / f"ack-O{opt}.exe"
-        command = [str(ROOT / "minyar"), "--library", str(ROOT / "library"), str(ROOT / "tests/quic-ack.min"), "-o", str(binary)]
+        command = [str(ROOT / "minyar"), "--library", str(library)]
+        if library != ROOT / "library":
+            command += ["--library", str(ROOT / "library")]
+        command += [str(ROOT / "tests/quic-ack.min"), "-o", str(binary)]
         if os.name == "nt":
             shell = shutil.which("bash")
             if not shell:
@@ -74,7 +82,7 @@ def main():
             print("ACK compiler failed", opt, result.returncode, result.stderr.decode(errors="replace")[-3000:])
             return 1
         row["binary_sha256"] = digest(binary)
-        for mode in range(22):
+        for mode in options.mode or range(29):
             command = [str(binary), *[str(ca.path(name, suffix)) for name, suffix in (
                 ("root", "der"), ("server", "der"), ("server", "pk8"), ("client", "der"), ("client", "pk8"))], str(mode)]
             started = time.monotonic()

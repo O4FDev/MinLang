@@ -252,5 +252,80 @@ function main(): Integer {
         let answer = inspect(s, packets)
         if answer.count != 1 || answer.delay != 3125 { return 42 }
     }
+    if mode == 22 || mode == 23 {
+        // The record is an actual sent eliciting packet. Peer exponent and
+        // maximum delay are selected independently of our local wire policy.
+        c.congestion.measured = true; c.congestion.minimum = 20
+        c.congestion.latest = 20; c.congestion.smoothed = 20; c.congestion.variance = 0
+        c.congestion.maxAckDelay = 25; c.ackExponent = 0
+        let encoded = 25000
+        if mode == 23 { c.ackExponent = 20; encoded = wire.MAX_VARINT }
+        c.paceAt = 2000; c.paceCredit = Float(c.congestion.window)
+        let sent = c.spaces[2].next
+        if !errors.booleanOk(quic.ping(c)) { return 90 }
+        let outgoing = quic.poll(c, 2000)
+        if outgoing.length != 1 || c.spaces[2].sent.length != 1 || c.spaces[2].sent[0].time != 2000 { return 90 }
+        for data in outgoing { quic.receive(s, data, 2010) }
+        let body = Bytes(); number(body,2); number(body,sent); number(body,encoded); number(body,0); number(body,0)
+        inject(s,c,s.spaces[2].next,body,2045)
+        if c.flight != 0 || c.congestion.latest != 45 || c.congestion.smoothed != 20 || c.congestion.variance != 0 {
+            print("peer ACK exponent or decoded clamp changed RTT"); return 44
+        }
+    }
+    if mode == 24 {
+        c.addressValidated = false; c.paths[0].validated = false
+        inject(s,c,pn,ping,2000); inject(s,c,pn + 1,ping,2001)
+        c.receivedBytes = 0; c.paths[0].received = 0
+        if quic.poll(c,2001).length != 0 || c.pending.length != 1 { return 45 }
+        let write = c.spaces[2].write; c.spaces[2].write = protection.traffic(1,0,Bytes())
+        c.addressValidated = true; c.paths[0].validated = true
+        for at in 2002..2012 { if quic.poll(c,at).length != 0 || c.pending.length != 1 { return 45 } }
+        c.spaces[2].write = write
+        let answer = inspect(s,quic.poll(c,2030))
+        if answer.count != 1 || answer.largest != pn + 1 || answer.delay != 3625 || c.pending.length != 0 { return 45 }
+    }
+    if mode == 25 {
+        if !errors.booleanOk(quic.updateKeys(s)) { return 90 }
+        inject(s,c,pn,ackOnly(c),2000)
+        let packets = 0
+        for tick in 0..200 {
+            let now = 2000 + tick * 5
+            for data in quic.poll(c,now) { packets += 1; quic.receive(s,data,now) }
+            for data in quic.poll(s,now) { packets += 1; quic.receive(c,data,now) }
+        }
+        if packets != 3 || c.flight != 0 || s.flight != 0 || c.pending.length != 0 || s.pending.length != 0 ||
+           !c.spaces[2].readAcknowledged || !s.spaces[2].readAcknowledged { print("reciprocal key phase caused ACK loop " + Text(packets) + " " + Text(c.flight) + " " + Text(s.flight) + " " + Text(c.spaces[2].readAcknowledged) + " " + Text(s.spaces[2].readAcknowledged)); return 46 }
+    }
+    if mode == 26 || mode == 27 {
+        inject(s,c,pn,ping,2000)
+        let at = 2000
+        if mode == 27 { inject(s,c,pn + 1,ping,2001); at = 2001 }
+        if !errors.booleanOk(quic.ping(c)) { return 90 }
+        let outgoing = quic.poll(c,at); let answer = inspect(s,outgoing)
+        if outgoing.length != 1 || answer.count != 1 || answer.ping != 1 || answer.delay != 0 {
+            print("pending ACK was not piggybacked on eliciting traffic"); return 47
+        }
+        if inspect(s,quic.poll(c,at + 1)).count != 0 || c.pending.length != 0 { return 48 }
+    }
+    if mode == 28 {
+        for ending in 0..3 {
+            let pair = pair(root,identity,key,client,clientKey); let local = pair.client; let peer = pair.server
+            if !local.confirmed || !peer.confirmed { return 90 }
+            local.addressValidated = false; local.paths[0].validated = false
+            let first = max(peer.spaces[2].next,local.spaces[2].largest + 1)
+            inject(peer,local,first,ping,2000); inject(peer,local,first + 1,ping,2001)
+            local.receivedBytes = 0; local.paths[0].received = 0
+            if quic.poll(local,2001).length != 0 || local.pending.length != 1 || !local.spaces[2].ackQueued { return 90 }
+            if ending == 0 { quic.close(local,0,Bytes("done")) }
+            else if ending == 1 {
+                let closing = Bytes(); number(closing,28); number(closing,0); number(closing,0); number(closing,0)
+                inject(peer,local,peer.spaces[2].next,closing,2002)
+            } else { local.idleTimeout = 10; quic.poll(local,2011) }
+            let state = local.spaces[2]
+            if state.ack || state.ackDeadline != -1 || state.ackCount != 0 || state.ackQueued {
+                print("terminal state retained ACK scheduling"); return 49
+            }
+        }
+    }
     print("ACK case " + Text(mode)); return 0
 }
