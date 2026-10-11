@@ -247,13 +247,27 @@ static inline void rc_cycle_after_drop(RcObject *object) {
     if (rc_cycle_enabled)
         rc_cycle_check_external(object);
 }
-static MINYAR_NOINLINE void rc_cycle_add_incoming(RcObject *parent, RcCycle *cycle) {
+static MINYAR_NOINLINE void rc_cycle_add_incoming(RcObject *parent, RcCycle *cycle,
+                                                unsigned additive) {
     RcCycle *source = rc_cycle_metadata(parent);
     if (!source->registered)
         rc_cycle_register(source);
-    rc_cycle_proof_invalidate();
+    /* A committed proof certifies existing paths, not all registry objects.
+     * Insertion removes no such path, even while a fresh owner is constructed.
+     * Unknown registered children retain conservative invalidation: they may
+     * contain cycles or require a new cohort. Never infer new descendants. */
+    unsigned preserve = additive && rc_cycle_phase == RC_CYCLE_IDLE &&
+                        rc_cycle_proof_valid && !rc_cycle_proof_build &&
+                        rc_cycle_anchor_held() && !rc_cycle_proof_anchor->pinned &&
+                        (!cycle->registered || rc_cycle_proven(cycle));
+    if (!preserve)
+        rc_cycle_proof_invalidate();
     rc_cycle_shade(cycle);
     cycle->incoming++;
+    /* A take-store can consume the anchor's sole external owner without an
+     * RC decrement. Recheck AFTER incoming changes, before store/poll/reuse. */
+    if (preserve && !rc_cycle_anchor_held())
+        rc_cycle_proof_invalidate();
     if (rc_cycle_enabled && cycle->registered &&
         (rc_cycle_object(cycle)->ownership >> 3) == cycle->incoming &&
         (parent->ownership >> 3) == source->incoming)
@@ -262,7 +276,13 @@ static MINYAR_NOINLINE void rc_cycle_add_incoming(RcObject *parent, RcCycle *cyc
 static inline void rc_cycle_edge_add(void *owner, void *value) {
     RcCycle *cycle = rc_cycle_value(value);
     if (cycle)
-        rc_cycle_add_incoming((RcObject *)owner - 1, cycle);
+        rc_cycle_add_incoming((RcObject *)owner - 1, cycle, 0);
+}
+/* Append or initial field insertion only. Replacements use edge_add above. */
+static inline void rc_cycle_edge_insert(void *owner, void *value) {
+    RcCycle *cycle = rc_cycle_value(value);
+    if (cycle)
+        rc_cycle_add_incoming((RcObject *)owner - 1, cycle, 1);
 }
 static inline void rc_cycle_edge_remove(void *value) {
     RcCycle *cycle = rc_cycle_value(value);

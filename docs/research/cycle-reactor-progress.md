@@ -43,3 +43,7 @@ The next actual Windows run accepted all native witness profiles but failed the 
 The progress fixture now separately verifies both contracts. A last-temporary read of the stable rooted ring must actually queue one cycle debt, then retire in exactly one accounted unit without a new cohort or any object loss. An owning replacement must invalidate that proof and leave the existing large bounded cohort queued; all original midcohort timeout, invalid-timeout, work-budget, idle-CPU, concurrent garbage recovery and last-real-root cleanup assertions remain. The guest archive must include the current fixture as well as the headers. There is no runtime change for this source mismatch.
 
 The expanded progress fixture passed all 21 native and 21 ASan/UBSan cases at 32, 2,048 and 4,096 nodes across the same system, 1MiB pool and eager profiles. Three isolated wrong implementations were killed at exact assertions in 18 O0/O2/ASan runs with budgets 1 and 32: suppressing certified requests, retracing a certified read, and failing to account its collector unit. No existing assertion, budget or CPU threshold was removed or widened.
+
+## Additive construction
+
+A subsequent narrow opt-in change preserves completed certificates across eligible pure insertions. Replacements, removals, unknown registered targets and active collector phases remain conservative. See [Completed cycle proofs across additive stores](additive-cycle-proofs.md) for the post-incoming root check, unchanged witness contracts, source-current TDD evidence and remaining application setup limits.

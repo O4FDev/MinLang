@@ -64,7 +64,7 @@ def main():
     environment = dict(os.environ, ASAN_OPTIONS="detect_leaks=1:halt_on_error=1",
                        UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1")
     options = {"system":["-DMINYAR_SYSTEM_HEAP=1"], "fixed":["-DMINYAR_BOUNDED_HEAP=1"],
-               "lazy":["-DMINYAR_LAZY_HEAP=1"], "eager":[]}
+               "lazy":["-DMINYAR_BOUNDED_HEAP=1","-DMINYAR_LAZY_HEAP=1"], "eager":[]}
     flags = (["-O1","-g","-fsanitize=address,undefined","-fno-omit-frame-pointer"]
              if args.sanitize else ["-O2"])
     historical = "rc_cycle_edge_insert" not in (ROOT/"runtime/minyar_cycles.h").read_text()
