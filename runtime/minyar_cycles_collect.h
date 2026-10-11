@@ -25,6 +25,22 @@ static long long *rc_cycle_slot(RcCycle *cycle, size_t index) {
 static void rc_cycle_unit_body(void) {
     RC_ACCOUNT(rc_cycle_units++);
     if (rc_cycle_phase == RC_CYCLE_IDLE) {
+        if (!rc_cycle_rescan && rc_cycle_proof_valid && rc_cycle_anchor_held()) {
+            /* One real bounded unit retires the coalesced read requests.
+             * Graph/anchor invalidation changes this to a normal scan. */
+            rc_cycle_requested = rc_cycle_pending = 0;
+#ifdef MINYAR_BOUNDED_RC
+            rc_pending_count--;
+#endif
+            RC_ACCOUNT(rc_cycle_cached_requests++);
+            return;
+        }
+        rc_cycle_proof_preserve = rc_cycle_proof_valid && rc_cycle_anchor_held();
+        rc_cycle_proof_build = 1;
+        rc_cycle_proof_after_retry = !rc_cycle_proof_retry;
+        if (!rc_cycle_proof_preserve)
+            rc_cycle_proof_anchor = NULL;
+        rc_cycle_rescan = 0;
         rc_cycle_requested = 0;
         rc_cycle_generation ^= 1;
         rc_cycle_cohort = rc_cycle_cursor = rc_cycle_head;
@@ -36,12 +52,25 @@ static void rc_cycle_unit_body(void) {
     if (rc_cycle_phase == RC_CYCLE_ROOTS) {
         RcCycle *cycle = rc_cycle_cursor;
         if (!cycle) {
+            if (!rc_cycle_proof_anchor)
+                rc_cycle_proof_retry = NULL;
             rc_cycle_phase = RC_CYCLE_MARK;
             return;
         }
         rc_cycle_cursor = cycle->next;
-        if ((rc_cycle_object(cycle)->ownership >> 3) > cycle->incoming)
-            rc_cycle_shade(cycle);
+        if (!rc_cycle_proof_preserve)
+            cycle->gray_next &= ~(uintptr_t)1;
+        if (cycle == rc_cycle_proof_retry)
+            rc_cycle_proof_after_retry = 1;
+        if ((rc_cycle_object(cycle)->ownership >> 3) > cycle->incoming) {
+            if (!rc_cycle_proof_anchor && rc_cycle_proof_after_retry &&
+                cycle != rc_cycle_proof_retry)
+                rc_cycle_proof_anchor = cycle;
+            if (cycle == rc_cycle_proof_anchor)
+                rc_cycle_shade_proven(cycle);
+            else
+                rc_cycle_shade(cycle);
+        }
         return;
     }
     if (rc_cycle_phase == RC_CYCLE_MARK) {
@@ -61,8 +90,13 @@ static void rc_cycle_unit_body(void) {
         }
         if (rc_cycle_index < rc_cycle_limit) {
             long long *slot = rc_cycle_slot(cycle, rc_cycle_index++);
-            if (slot)
-                rc_cycle_shade(rc_cycle_value((void *)(uintptr_t)*slot));
+            if (slot) {
+                RcCycle *child = rc_cycle_value((void *)(uintptr_t)*slot);
+                if (rc_cycle_proof_build && rc_cycle_proven(cycle))
+                    rc_cycle_shade_proven(child);
+                else
+                    rc_cycle_shade(child);
+            }
         }
         if (rc_cycle_index == rc_cycle_limit) {
             rc_cycle_active = NULL;
@@ -80,6 +114,9 @@ static void rc_cycle_unit_body(void) {
         if (!cycle) {
             rc_cycle_cohort = NULL;
             rc_cycle_completed++;
+            rc_cycle_proof_valid = rc_cycle_proof_build && rc_cycle_anchor_held();
+            rc_cycle_proof_generation = rc_cycle_generation;
+            rc_cycle_proof_build = 0;
             rc_cycle_phase = RC_CYCLE_IDLE;
             if (!rc_cycle_requested) {
                 rc_cycle_pending = 0;
@@ -91,6 +128,11 @@ static void rc_cycle_unit_body(void) {
         }
         rc_cycle_cursor = cycle->next;
         unsigned live = cycle->marked;
+        /* No certified bit may survive two generation flips unvisited.
+         * A proof invalidated mid-cohort can leave old cached tags behind;
+         * discard those in this already bounded survivor/white unit. */
+        if (((cycle->gray_next >> 1) & 1) != rc_cycle_generation)
+            cycle->gray_next &= ~(uintptr_t)1;
         cycle->generation = rc_cycle_generation;
         cycle->marked = 0;
         if (live)
