@@ -51,8 +51,9 @@ int main(int argc, char **argv) {
     CHECK(CertStrToNameW(X509_ASN_ENCODING, L"CN=Minyar isolated Schannel device",
                          CERT_X500_NAME_STR, NULL, name_bytes, &name_size, NULL));
     CERT_NAME_BLOB name = {name_size, name_bytes};
-    CRYPT_KEY_PROV_INFO info = {key_name, MS_KEY_STORAGE_PROVIDER, 0, 0, 0,
-                                NULL,     CERT_NCRYPT_KEY_SPEC};
+    /* This is NCryptOpenKey's legacy spec, matching creation above.
+     * CERT_NCRYPT_KEY_SPEC describes an acquired handle, not its lookup key. */
+    CRYPT_KEY_PROV_INFO info = {key_name, MS_KEY_STORAGE_PROVIDER, 0, 0, 0, NULL, 0};
     CRYPT_ALGORITHM_IDENTIFIER algorithm = {szOID_RSA_SHA256RSA, {0, NULL}};
     certificate = CertCreateSelfSignCertificate((HCRYPTPROV_OR_NCRYPT_KEY_HANDLE)key, &name, 0,
                                                 &info, &algorithm, NULL, NULL, NULL);
