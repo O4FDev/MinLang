@@ -749,3 +749,12 @@ GENERATED_SANITIZER_INPUTS = tests/generated-llvm-sanitizer.py tests/generated-l
 check-generated-llvm-sanitizer: build/minyarc $(GENERATED_SANITIZER_INPUTS) | build
 	@set -e; artifacts=$$(mktemp -d "$(abspath build)/generated-llvm-sanitizer-XXXXXXXX"); MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/generated-llvm-sanitizer.py --artifacts "$$artifacts/run"
 check check-portable check-sanitize: check-generated-llvm-sanitizer
+
+# Actual UDP blackholes before/mid-session, then independent TCP mTLS/yamux.
+.PHONY: check-transport-udp-fallback check-transport-udp-fallback-sanitize
+check-transport-udp-fallback: build/minyarc build/yamux-peer | build
+	@set -e; evidence=$$(mktemp -d "$(abspath build)/transport-udp-fallback-native.XXXXXXXX"); MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/transport-udp-fallback.py --go-binary build/yamux-peer --evidence "$$evidence"
+check-transport-udp-fallback-sanitize: build/minyarc build/yamux-peer | build
+	@set -e; evidence=$$(mktemp -d "$(abspath build)/transport-udp-fallback-sanitize.XXXXXXXX"); $(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/transport-udp-fallback.py --go-binary build/yamux-peer --sanitize --evidence "$$evidence"
+check: check-transport-udp-fallback
+check-sanitize: check-transport-udp-fallback-sanitize

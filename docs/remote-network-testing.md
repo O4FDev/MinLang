@@ -53,3 +53,37 @@ memory and CPU after warm-up and during a separate quiet idle window; a zero
 exit code alone does not establish flat memory or low idle CPU. Retain failed
 and interrupted evidence with its completion status. Interrupted laptop runs
 are incomplete and cannot establish long-run results.
+
+The existing drivers accept `--binary PATH` for a separately qualified matching
+native executable. QUIC additionally accepts `--peer-binary PATH` for the pinned
+independent Quinn executable and `--sanitize` for sanitizer builds. Omitting
+these paths retains the normal build behavior. Reports record actual binary
+hashes and commands; a sanitizer command-line flag alone does not prove the
+supplied binary was instrumented. Retain its source/link qualification separately.
+
+For a simultaneous mixed run, build the three native applications serially,
+then run `net-soak.py --seconds 7200 --connections 4096`,
+`tls-soak.py --seconds 7200 --connections 64` and
+`quic-soak.py --duration 7200 --peers 64 --interval-ms 15000 --loss .01 --reorder .01`
+with their matching binary paths and distinct output/report paths under one
+authorized remote resource guard. Repeat with separately qualified sanitizer
+binaries. Compilers must not start concurrently with this measurement.
+The QUIC peer cohort shares one endpoint/UDP source; its proxy is not a router
+for unrelated client endpoints. The TLS soak checks real HTTP keep-alive traffic
+with a fixed response oracle; the separate HTTP library correctness gates still
+apply. All runs require normal native completion and empty native diagnostics,
+plus independent warmed RSS/CPU assessment; no aggregate exit status substitutes
+for those measurements.
+
+`make check-transport-udp-fallback` and its `-sanitize` variant exercise
+actual UDP blackholes before connection and after an authenticated QUIC echo.
+A control acknowledgment establishes the mid-session blackhole before a new
+stream is queued. Real monotonic time advances the transport into
+`TCP_NEEDED`; the fixture never calls `udpUnavailable`. The old stream
+requires explicit retry, and a new physical TCP connection performs fresh
+mutual TLS before the pinned Go yamux peer verifies all sixteen half-closed
+32-KiB streams. UDP remains blocked throughout TCP verification. The Minyar
+client and Go peer exit normally with empty diagnostics. The independent Quinn
+helper remains behind the deliberate blackhole and receives owned SIGTERM only
+after native/TCP proof; this does not claim normal-exit leak coverage for that
+uninstrumented helper.
