@@ -1,12 +1,12 @@
-# Selective managed graph support (isolated candidate)
+# Selective managed graph support
 
-This candidate accepts formerly rejected cyclic List/record mutation. It is
-kept on `feat/v2-runtime-memory` until correctness, compatibility and the
-unchanged resource gates are established. Typed closures and callback dispatch
-are implemented through a generated optional frontend. Process-isolated
-workers use copied byte messages on macOS/Linux and Windows. Windows uses
-overlapped named pipes; actual Windows CI validation is required before that
-backend is ready. Shared managed threads are not implemented.
+The integrated v2 implementation accepts formerly rejected cyclic List/record
+mutation through an optional generated frontend. Typed closures and callback
+dispatch use the same ownership analysis. Process-isolated workers use copied
+byte messages on macOS/Linux and Windows; Windows uses overlapped named pipes.
+Focused actual Windows worker checks have passed at their recorded sources.
+Combined correctness, platform, resource and performance gates still need final
+verification. Shared managed threads are not implemented.
 
 The ordinary compiler only recognizes feature syntax and requests the optional
 frontend; its former two cycle-prevention sites also request that frontend.
@@ -65,8 +65,13 @@ heaps with budgets 1 and 32 (eager has no bounded poll), seeds 314159 and
 4294967295. Compiled graph/alias cases passed O0/O2 with exact accounting.
 Existing LLVM identity and a separate untraced recursive component passed.
 Independent normal-runtime C compilation against the foundation source produced
-byte-identical ordinary object files. The cycle engine passes strict Windows
-Clang 18 target cross-compilation; actual Windows execution is still required.
+byte-identical ordinary object files. The cycle engine also passed strict
+Windows Clang 18 target cross-compilation.
+Later actual Windows profile checks cover supported system/fixed/eager heaps;
+Windows lazy heap is unavailable because it requires POSIX mmap. The frozen
+`a154153` native progress gate passed 21 cases, while its sanitizer gate failed
+the unchanged 2% idle assertion at `system-k1024/n2048`. This unresolved timed
+failure is separate from the passing exact-cleanup and registration checks.
 
 Before moving graph emitter bookkeeping into the optional frontend, the first
 self-compilation run failed the wall gate: 31.45 ms versus the
@@ -109,11 +114,13 @@ Dispatch uses direct slot tokens and native registration identities to reject
 stale events. Cancellation releases captures; one-shot timers retire before
 calling their callback; callbacks selected into a returned batch stay alive
 through their call even if cancellation or closing removes registry owners.
-Before sleeping, this opt-in dispatcher services one bounded collector batch.
-When debt remains it polls readiness without sleeping and may return an empty
-batch, letting its caller schedule other work. Once debt drains, the requested
-OS wait blocks normally. Invalid timeout contracts still return errors before
-the wait; cleanup cannot turn an invalid timeout into a valid zero timeout.
+Before sleeping, this opt-in dispatcher services the selected bounded collector
+budget. Ordinary retirement debt requests an immediate readiness poll. If only
+cycle work remains, including an unfinished cohort, the requested wait is capped
+at 10 ms; shorter waits remain shorter. Pending work is retained for later
+service. Once debt drains, the requested OS wait passes through unchanged.
+Invalid timeout contracts still return errors before the wait; cleanup cannot
+turn an invalid timeout into a valid zero timeout.
 The idle regression drops a 1,025-node ring with no future I/O or timers,
 checks exact reclamation, then checks that a subsequent wait blocks. The
 ordinary runtime and raw batch event loop contain no new collector hooks.
@@ -186,12 +193,17 @@ Both pass the existing time ceilings and both fail the Apple-calibrated 10 MiB
 RSS ceiling. No threshold changed. The available x86 PMU measured 58.50 M and
 61.12 M user instructions respectively; those are not the macOS retired
 instruction metric. Remote evidence is under `build/remote-evidence`; the
-candidate remains unmerged pending compatible-platform gate evidence.
+paired candidate predates the later integrated fixes and does not establish
+current compatible-platform performance.
 
-The final remote validation preserves [logs and source-hashed coverage](research/evidence/managed-graphs-2026-10-10/README.md).
+The recorded 2026-10-10 validation preserves
+[logs and source-hashed coverage](research/evidence/managed-graphs-2026-10-10/README.md).
 Compiler coverage is 79.70%, ordinary runtime lines 80.73% and branches 66.16%,
 passing the unchanged 79/72/55 gates. All 18 callback cases pass native and
 ASan/UBSan at O0/O2, including value names that resemble generic type syntax.
 The normal O2 system runtime object is byte-identical to a separately compiled
 foundation runtime archive. These are correctness/compatibility results; the
-earlier paired performance files precede the final optional-frontend split.
+earlier paired performance files precede the optional-frontend split. These
+coverage, callback and object-identity results belong to their recorded source,
+not the current combined tree. See [the verification map](v2-verification.md)
+for later registration/retirement evidence and outstanding platform gates.

@@ -123,6 +123,16 @@ This wait policy belongs to `eventcallbacks.dispatch`. The separate AppKit
 `macos.nextEvent` hook services one batch and pumps input without sleeping while
 debt remains; see [the AppKit cleanup contract](macos.md#shared-socket-and-callback-loop).
 
+Current registration barriers distinguish fresh or newly exposed owning edges
+from an already proven snapshot cohort. Irreversibly dead private owners are
+unregistered before their edges are retired; removing those excluded edges
+must not invalidate an unrelated live-path proof. Late-registration, exposure
+and private-retirement gates exercise phase interleavings, ownership transfers
+and exact cleanup. These checks bound recorded work units; they do not certify
+idle CPU or a wall-clock collection deadline. The retained Result-cycle failure
+from frozen `907804b` passed a focused replay with the repaired runtime at O0/O2,
+native and ASan/UBSan/LSan, with exact `42/41` output and empty stderr.
+
 Typed `Result<T,E>` values use owned records with only the active payload slot
 initialized and owning. Match and early propagation preserve payload lifetimes
 and run scope cleanup; cycles through either payload follow the same optional
@@ -305,13 +315,22 @@ because the underlying arena storage remains alive.
 | `make check-scalar-record-storage` | Initializer order, escape analysis, shadowing, and analysis limits |
 | `make check-readonly-parameters` | Mutable fallback, alias lifetimes, and parameter boundaries |
 | `make check-compiler-slice-cache` | Collisions, eviction, Unicode, and surviving aliases |
+| `make check-cycle-registration-exposure` / `-sanitize` | Standalone exposure/late-registration schedules and both Result payload-cycle cleanup oracles |
+| `make check-cycle-registry-growth` / `-sanitize` | Registered-graph growth with exact reachability, cleanup and work assertions |
+| `make check-cycle-private-retirement` / `-sanitize` | Operation-aware retirement, phase/reuse controls and private locality bounds |
+| `make check-cycle-progress` / `-sanitize` | Live-cohort progress, exact reclamation and the separate strict idle CPU assertion |
 
 The optional graph and callback checks additionally include
 `tests/managed-graphs.py`, `tests/managed-graphs-profiles.py`,
 `tests/callbacks.py`, `tests/callback-domains.py` and `tests/cycle-progress.py`.
 Their exact reachability, object/debt and work-budget assertions complement
 application soaks; short collector tests do not establish a server's idle CPU
-or large-connection behavior.
+or large-connection behavior. Windows supports system, fixed and eager heaps;
+its lazy heap requires the absent POSIX mmap backend and explicit lazy requests
+fail rather than being counted as passing cases. At frozen `a154153`, actual
+Windows native progress passed all 21 cases, but sanitizer progress failed the
+unchanged 2% idle assertion at `system-k1024/n2048`. That timed failure remains
+unresolved, independently of passing registration and locality controls.
 
 See [runtime profiles](bounded-runtime-contract.md) for incremental cleanup and
 finite-heap configuration, and [the v2 verification map](v2-verification.md)

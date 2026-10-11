@@ -305,10 +305,12 @@ drop a 1,024-node capture cycle without any future network I/O or timers,
 check exact reclamation with budgets of one and 32, then check sleeping.
 
 The same [AppKit gate](../tests/macos-network.py) creates 4,096 anonymous
-capture cycles through the public launcher. Actual hosted macOS debug and
-release runs passed the cleanup-before-sleep check. The direct 1,024-node
-fixture checks exact reclamation and subsequent sleeping at budgets one and
-32, including native and sanitizer execution.
+capture cycles through the public launcher. Retained hosted macOS debug and
+release runs at their earlier source passed the cleanup-before-sleep check.
+The direct 1,024-node fixture checked exact reclamation and subsequent sleeping
+at budgets one and 32, including native and sanitizer execution. These results
+do not certify the current combined runtime or a large desktop application.
+A fresh macOS run remains required.
 
 This `nextEvent` hook uses the Boolean bounded service result and pumps AppKit
 without sleeping while debt remains. It is separate from the private

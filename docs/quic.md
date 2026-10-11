@@ -140,8 +140,13 @@ implemented, and relay/arbitrary requests must keep early data disabled.
 
 `receivePath` and `pollDatagrams` use stable numeric path IDs mapped by the
 caller to local sockets and exact peer addresses. `probePath` initiates client
-validation; a second unvalidated candidate is refused. Server-initiated active
-migration and preferred-address migration are not implemented. Version 2 crypto/parser vectors pass, while live constructors
+validation; a second unvalidated candidate is refused. Unsolicited
+server-initiated active migration is not implemented.
+`configurePreferredAddress` can advertise server IPv4/IPv6 addresses before the
+handshake; the client authenticates that transport parameter and uses
+`probePreferredPath` with a caller-owned socket/address mapping. Preferred-path
+validation, including IPv6, has focused native/sanitizer coverage. Version 2
+crypto/parser vectors pass, while live constructors
 currently use version 1. The server can emit stateless version negotiation for
 unsupported versions. The v1-only client follows RFC 9000 section 6.2: it
 abandons an eligible version-negotiation response containing no v1, allowing
@@ -266,16 +271,27 @@ tests reject reused tickets and tickets from a new server instance, and real
 short-lived certificates expire between initial and resumed handshakes.
 HashiCorp yamux v0.1.2 with Go's independent TLS 1.3 exchanges sixteen concurrent
 32 KiB half-closed streams in both roles, including required client certificates.
-Quinn is not linked
-into Minyar. On 2026-10-10, the remote official runner's handshake and transfer
-cases passed with quiche and MsQuic in both client/server directions. The
-ngtcp2 wolfSSL image failed in both directions with `ERR_CRYPTO` at the TLS
-ClientHello/ServerHello boundary; this remains unresolved. The runner's
-`--must-include` filtered square matrix also hit an upstream JSON-export
-`KeyError`, after producing its individual checks and logs. Rectangular matrices
-avoid that reporting issue. These results do not establish full RFC compliance;
-retry, loss/corruption, migration, key-update, resumption and 0-RTT runner cases
-still need their independent matrix. See the accompanying evidence manifest.
+Quinn is not linked into Minyar. Earlier official-runner failures, including
+ngtcp2's TLS boundary failure and the filtered square-matrix JSON-export
+`KeyError`, remain retained. A later frozen `83a3ebe` run with official runner
+`740c05a10b61d65e8abd3ad38d60898004d335d9` passed selected handshake and
+transfer cases with quiche, MsQuic and ngtcp2 in both roles, plus Retry with
+Minyar as server. A separate frozen `5387aea6` run passed four client 0-RTT
+peer cells under the unchanged criterion. These historical results supersede
+those individual failures, not the requirement for current full interoperability.
+
+Current protocol source `26841d1399f82f3189039189deb8b1e94890cb08` plus
+protocol-evidence lifecycle fixes passed the combined focused candidate
+`c010c9aae1e848fa565f508c2fc8f124c300986b`: 260 migration/recovery,
+cipher/key-update, local QNS and reserved-version cases across O0/O2 and
+native/ASan/UBSan/LSan configurations. Generated program LLVM, runtime and
+providers are bound in the sanitizer artifacts. Helper servers are terminated
+during teardown; this does not certify their normal-exit leak behavior. This is
+focused local protocol
+evidence, not execution against the official peer images. The new 128-cell
+plan covers 16 selected scenarios, four peers and both roles; it has not run.
+Current full-runner interoperability and sustained fault measurements remain
+pending. See [the verification map](v2-verification.md).
 
 ## Remote fault soak
 
@@ -350,8 +366,10 @@ ordering, retention and probe assertions fail under isolated guard mutations at
 both O0 and O2. [RFC 9001 section 5.7](https://www.rfc-editor.org/rfc/rfc9001.html#section-5.7)
 explains why servers cannot process these requests before Finished.
 
-This repair does not establish complete PTO conformance. The existing scheduler
-still considers application-space PTO before confirmation and does not maintain
-an absolute client anti-deadlock alarm when no eligible Initial/Handshake packet
-is in flight. Those remain separate requirements of
+The scheduler now excludes application-space PTO before confirmation and keeps
+a fixed client anti-deadlock alarm when no eligible Initial/Handshake packet
+is in flight. Handshake probe, shared-space backoff and ACK-retention controls
+exercise these cases with virtual clocks at O0/O2. Their focused pass does not
+establish complete PTO conformance or sustained deployment behavior. The
+requirements are described in
 [RFC 9002 sections 6.2.1 and 6.2.2.1](https://www.rfc-editor.org/rfc/rfc9002.html#section-6.2.1).
