@@ -71,7 +71,7 @@ public record Session {
     resumed: Boolean
     ticket: tickets.Client
     savedTickets: List<tickets.Client>
-    verifiedChain: Bytes
+    verifiedChain: Bytes; peerIdentityExpires: Integer
     resumptionMaster: Bytes
 }
 
@@ -105,7 +105,7 @@ function extension(type: Integer, body: Bytes): Bytes {
 
 function abandon(session: Session, message: Text) {
     if session.state != FAILED {
-        session.state = FAILED
+        session.state = FAILED; session.authenticated = false
         session.error = message
         session.incoming = Bytes()
         session.outgoing = Bytes()
@@ -138,7 +138,7 @@ public function none(): Session {
         peerTransportParameters: Bytes(); quic: false; outgoingLevel: INITIAL_KEYS; incomingLevel: INITIAL_KEYS
         clientApplication: Bytes(); serverApplication: Bytes()
         earlyOffered: false; earlyAccepted: false; clientEarlySecret: Bytes()
-        resumed: false; ticket: tickets.emptyClient(); savedTickets: []; verifiedChain: Bytes(); resumptionMaster: Bytes()
+        resumed: false; ticket: tickets.emptyClient(); savedTickets: []; verifiedChain: Bytes(); peerIdentityExpires: 0; resumptionMaster: Bytes()
     }
 }
 
@@ -601,7 +601,12 @@ function serverHello(session: Session, message: Bytes) {
         }
         if type == 41 {
             if !session.ticket.valid || size != 2 || get16(message, data) != 0 { abandon(session, "unsolicited or invalid server PSK selection"); return }
-            session.resumed = true; session.authenticated = true; session.verifiedChain = session.ticket.certificateChain
+            let now=trust.currentTimeMilliseconds()
+            let expiry=trust.currentCertificateExpiry(session.ticket.certificateChain)
+            if now>=session.ticket.expires || expiry<=now || trust.chain(session.host,session.ticket.certificateChain,session.anchors)!="" {
+                abandon(session,"TLS PSK server identity is no longer valid");return
+            }
+            session.resumed = true; session.authenticated = true; session.verifiedChain = session.ticket.certificateChain; session.peerIdentityExpires=expiry
         }
         if type != 43 && type != 51 && type != 41 {
             abandon(session, "unsolicited ServerHello extension")
@@ -782,6 +787,8 @@ function serverCertificate(session: Session, message: Bytes) {
         abandon(session, failure)
         return
     }
+    session.peerIdentityExpires=trust.currentCertificateExpiry(message.slice(8,message.length))
+    if session.peerIdentityExpires<=trust.currentTimeMilliseconds() { abandon(session,"server certificate time bounds did not verify");return }
     if message.length - 8 <= 32768 { session.verifiedChain = message.slice(8, message.length) }
     session.transcript.addBytes(message)
     session.stage = 4
@@ -823,6 +830,9 @@ function serverFinished(session: Session, message: Bytes) {
         abandon(session, "the server's Finished message did not verify")
         return
     }
+    // Certificate validity is checked again at authenticated completion:
+    // an authentic flight can be delayed beyond its identity's expiry.
+    if session.peerIdentityExpires<=trust.currentTimeMilliseconds() { abandon(session,"server identity expired during TLS handshake");return }
     session.transcript.addBytes(message)
     let derived = crypto.expandLabel(session.handshakeSecret, "derived", crypto.sha256(Bytes()), 32)
     let master = crypto.hkdfExtract(derived, Bytes(32))

@@ -19,7 +19,7 @@ constant CHACHA20_POLY1305 = 0x1303
 public record Session {
     state: Integer; stage: Integer; error: Text; cipherSuite: Integer
     quic: Boolean; requireClient: Boolean; authenticated: Boolean
-    protocol: Text; transportParameters: Bytes; peerTransportParameters: Bytes; identityExpires: Integer
+    protocol: Text; transportParameters: Bytes; peerTransportParameters: Bytes; identityExpires: Integer; clientIdentityExpires: Integer
     privateKey: Bytes; random: Bytes; identity: Bytes; identityKey: Bytes; anchors: Bytes
     transcript: Bytes; received: Bytes; handshake: Bytes; incomingLevel: Integer
     outgoing: Bytes; initialOutgoing: Bytes; handshakeOutgoing: Bytes; incoming: Bytes
@@ -56,7 +56,7 @@ function pack(certificates: List<Bytes>): Bytes {
     return result
 }
 function abandon(session: Session, error: Text) {
-    session.state = FAILED; session.error = error
+    session.state = FAILED; session.authenticated = false; session.error = error
     session.incoming = Bytes(); session.received = Bytes(); session.handshake = Bytes()
     session.outgoing = Bytes(); session.initialOutgoing = Bytes(); session.handshakeOutgoing = Bytes()
     session.transcript = Bytes(); session.identityKey = Bytes(); session.privateKey = Bytes()
@@ -89,7 +89,7 @@ function create(entropy: Bytes, protocol: Text, parameters: Bytes, identity: Lis
     let session = Session {
         state: STARTING; stage: 0; error: ""; cipherSuite: AES128_GCM
         quic: quic; requireClient: requireClient; authenticated: false
-        protocol: protocol; transportParameters: parameters; peerTransportParameters: Bytes(); identityExpires: 0
+        protocol: protocol; transportParameters: parameters; peerTransportParameters: Bytes(); identityExpires: 0; clientIdentityExpires: 0
         privateKey: Bytes(); random: Bytes(); identity: pack(identity); identityKey: privateKey; anchors: pack(roots)
         transcript: Bytes(); received: Bytes(); handshake: Bytes(); incomingLevel: INITIAL_KEYS
         outgoing: Bytes(); initialOutgoing: Bytes(); handshakeOutgoing: Bytes(); incoming: Bytes()
@@ -247,7 +247,8 @@ function clientHello(session: Session, hello: Bytes) {
             if !equal(tickets.binder(opened.psk, crypto.sha256(hello.slice(0, binderEnd))), binder) { abandon(session, "TLS PSK binder did not verify"); return }
             let age = (ticketAge - opened.ageAdd) & 0xffffffff
             let difference = age - (now - opened.issued); if difference < 0 { difference = -difference }
-            let identityValid = !session.requireClient || (opened.clientChain.length > 0 && trust.clientChain(opened.clientChain, session.anchors) == "")
+            let clientExpiry=trust.currentCertificateExpiry(opened.clientChain)
+            let identityValid = !session.requireClient || (opened.clientChain.length > 0 && clientExpiry>now && trust.clientChain(opened.clientChain, session.anchors) == "")
             if difference <= 10000 && identityValid && contains(suites, opened.suite) {
                 session.resumed = true; session.resumePSK = opened.psk; session.cipherSuite = opened.suite
                 if session.quic && session.earlyOffered && opened.earlyLimit == 0xffffffff && session.ticketStore.earlyLimit == 0xffffffff &&
@@ -256,7 +257,7 @@ function clientHello(session: Session, hello: Bytes) {
                     session.earlyAccepted = true
                     session.clientEarlySecret = crypto.expandLabel(crypto.hkdfExtract(Bytes(), opened.psk), "c e traffic", crypto.sha256(hello), 32)
                 }
-                session.authenticated = session.requireClient; session.verifiedClientChain = opened.clientChain
+                session.authenticated = session.requireClient; session.verifiedClientChain = opened.clientChain; session.clientIdentityExpires=clientExpiry
                 if opened.clientChain.length >= 5 { let leaf = get24(opened.clientChain, 0); if leaf <= opened.clientChain.length - 5 { session.peerCertificate = opened.clientChain.slice(3, 3 + leaf) } }
             }
         }
@@ -343,6 +344,8 @@ function clientCertificate(session: Session, certificate: Bytes) {
     if at != chain.length { abandon(session, "truncated client certificate entry"); return }
     let result = trust.clientChain(chain, session.anchors)
     if result != "" { abandon(session, result); return }
+    session.clientIdentityExpires=trust.currentCertificateExpiry(chain)
+    if session.clientIdentityExpires<=trust.currentTimeMilliseconds() { abandon(session,"client certificate time bounds did not verify");return }
     if chain.length <= 32768 { session.verifiedClientChain = chain }
     session.transcript.addBytes(certificate); session.stage = 2
 }
@@ -359,6 +362,10 @@ function clientFinished(session: Session, finished: Bytes) {
     if finished.length != 36 || (session.requireClient && !session.authenticated) { abandon(session, "missing client authentication or malformed Finished"); return }
     let key = crypto.expandLabel(session.clientSecret, "finished", Bytes(), 32)
     if !equal(crypto.hmac(key, crypto.sha256(session.transcript)), finished.slice(4, 36)) { abandon(session, "client Finished did not verify"); return }
+    let now=trust.currentTimeMilliseconds()
+    if session.identityExpires<=now || (session.requireClient && session.clientIdentityExpires<=now) {
+        abandon(session,"authenticated identity expired during TLS handshake");return
+    }
     session.transcript.addBytes(finished)
     session.resumptionMaster = crypto.expandLabel(session.masterSecret, "res master", crypto.sha256(session.transcript), 32)
     session.readKey = crypto.expandLabel(session.clientApplication, "key", Bytes(), keySize(session)); session.readIv = crypto.expandLabel(session.clientApplication, "iv", Bytes(), 12); session.readSequence = 0
