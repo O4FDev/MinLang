@@ -566,6 +566,13 @@ check-tls-sanitize: build/minyarc
 
 check check-portable: check-tls
 
+# Pure controller regression; no privileged runner, Docker, or peer provisioning.
+.PHONY: check-quic-interop-results
+check-quic-interop-results:
+	python3 tests/quic-interop-results.py
+
+check check-portable check-quic check-quic-sanitize: check-quic-interop-results
+
 .PHONY: check-quic check-quic-sanitize
 check-quic: build/minyarc
 	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/quic-suite.py --artifacts build/quic-native-O0

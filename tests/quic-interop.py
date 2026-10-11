@@ -3,7 +3,7 @@
 The trusted host configures only each endpoint's network namespace. Endpoints
 have no Docker socket, host tokens, or NET_ADMIN/NET_RAW capabilities.
 """
-import argparse, json, os, platform, re, subprocess, sys, time
+import argparse, hashlib, json, os, platform, re, subprocess, sys, time
 from pathlib import Path
 
 def command(args, **kwargs):return subprocess.run(args,check=True,**kwargs)
@@ -58,6 +58,104 @@ def configure(node):
             elif mount['Destination']!='/downloads':os.chmod(entry,0o444)
     command(['docker','exec','--user','65534:65534',data['Id'],'sh','-c','mkdir -p /logs/qlog && touch /tmp/network-ready'],stdout=subprocess.DEVNULL)
     return data['Id']
+def selected_names(value, label):
+    names = value.split(',')
+    if (not names or len(names) != len(set(names)) or
+            any(not re.fullmatch('[a-zA-Z0-9_-]+', name) for name in names)):
+        raise ValueError('invalid ' + label + ' selection')
+    return names
+
+def unique_json_object(pairs):
+    result = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValueError('duplicate JSON field: ' + name)
+        result[name] = value
+    return result
+
+def validate_matrix(matrix, selected_servers, selected_clients, selected_tests, must_include):
+    servers = selected_names(selected_servers, 'server')
+    clients = selected_names(selected_clients, 'client')
+    tests = selected_names(selected_tests, 'test')
+    included = selected_names(must_include, 'required implementation')
+    if len(included) != 1:
+        raise ValueError('exactly one required implementation is supported by the official runner')
+    if not any(server == must_include or client == must_include
+               for server in servers for client in clients):
+        raise ValueError('selection contains no pair with ' + must_include)
+    if not isinstance(matrix, dict):
+        raise ValueError('official matrix must be a JSON object')
+    axes = {}
+    for label, expected in (('servers', servers), ('clients', clients)):
+        actual = matrix.get(label)
+        if (not isinstance(actual, list) or not actual or
+                any(not isinstance(name, str) for name in actual) or
+                len(actual) != len(set(actual)) or set(actual) != set(expected)):
+            raise ValueError('official matrix ' + label + ' differ from the requested selection')
+        axes[label] = actual
+    metadata = matrix.get('tests')
+    if not isinstance(metadata, dict) or not metadata:
+        raise ValueError('official matrix has no test metadata')
+    abbreviations = {}
+    for name in tests:
+        matches = [abbreviation for abbreviation, row in metadata.items()
+                   if isinstance(row, dict) and row.get('name') == name]
+        if len(matches) != 1:
+            raise ValueError('missing or ambiguous official metadata for ' + name)
+        abbreviations[name] = matches[0]
+    cells = matrix.get('results')
+    if (not isinstance(cells, list) or
+            len(cells) != len(axes['servers']) * len(axes['clients'])):
+        raise ValueError('official matrix has missing or extra pair cells')
+    pairs = []
+    succeeded = 0
+    # Upstream InteropRunner._export_results emits clients first, then servers.
+    # Axis order is exported from sets and can differ from CLI order.
+    for client_index, client in enumerate(axes['clients']):
+        for server_index, server in enumerate(axes['servers']):
+            if must_include not in (server, client):
+                continue
+            cell = cells[client_index * len(axes['servers']) + server_index]
+            if not isinstance(cell, list) or not cell:
+                raise ValueError('empty official results for ' + server + '/' + client)
+            names = []
+            codes = []
+            for row in cell:
+                if (not isinstance(row, dict) or not isinstance(row.get('name'), str) or
+                        not isinstance(row.get('abbr'), str)):
+                    raise ValueError('malformed official result for ' + server + '/' + client)
+                names.append(row['name'])
+                codes.append(row['abbr'])
+            if len(names) != len(set(names)) or len(codes) != len(set(codes)):
+                raise ValueError('ambiguous official results for ' + server + '/' + client)
+            for name in tests:
+                matching = [row for row in cell if row['name'] == name]
+                if len(matching) != 1 or matching[0]['abbr'] != abbreviations[name]:
+                    raise ValueError('missing or mismatched ' + name + ' result for ' + server + '/' + client)
+                result = matching[0].get('result')
+                if result != 'succeeded':
+                    raise ValueError(name + ' for ' + server + '/' + client +
+                                     ' did not succeed: ' + repr(result))
+                succeeded += 1
+            pairs.append({'server': server, 'client': client})
+    return {'status': 'succeeded', 'pairs': pairs, 'succeeded_cases': succeeded}
+
+def matrix_evidence(path, options, runner_status):
+    raw = None
+    try:
+        raw = path.read_bytes()
+        matrix = json.loads(raw, object_pairs_hook=unique_json_object)
+        verdict = validate_matrix(matrix, options.servers, options.clients,
+                                  options.tests, options.must_include)
+    except (OSError, UnicodeError, ValueError) as error:
+        verdict = {'status': 'failed', 'error': str(error)}
+    return {'runner_status': runner_status,
+            'status': runner_status if runner_status != 0 else
+                      (0 if verdict['status'] == 'succeeded' else 1),
+            'matrix_sha256': hashlib.sha256(raw).hexdigest() if raw is not None else None,
+            'matrix_bytes': len(raw) if raw is not None else None,
+            'result_validation': verdict}
+
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--runner',required=True);parser.add_argument('--artifacts',required=True);parser.add_argument('--servers',default='minyar');parser.add_argument('--clients',default='minyar,quiche,ngtcp2,msquic');parser.add_argument('--tests',default='handshake,transfer');parser.add_argument('--must-include',default='minyar');options=parser.parse_args()
     if platform.system()!='Linux' or os.geteuid()!=0 or os.environ.get('MINYAR_REMOTE_LOAD')!='1':raise RuntimeError('remote Linux admin orchestration required')
@@ -69,7 +167,9 @@ def main():
         contents=source.read_text();changed=contents.replace('dir="/tmp"',f'dir="{temporary}"')
         if changed!=contents:source.write_text(changed)
     for name in ('servers','clients','tests','must_include'):
-        if not re.fullmatch('[a-zA-Z0-9,_-]+',getattr(options,name)):raise RuntimeError('invalid matrix selection')
+        selected_names(getattr(options,name), name)
+    if len(selected_names(options.must_include, 'required implementation')) != 1:
+        raise ValueError('exactly one required implementation is supported by the official runner')
     registry=runner/'implementations_quic.json'; implementations=json.loads(registry.read_text());implementations['minyar']={'image':'minyar-interop:development','url':'local-development','role':'both'};registry.write_text(json.dumps(implementations,indent=2)+'\n')
     # Apply only endpoint capability removals; the official simulator retains
     # its required NET_ADMIN/NET_RAW. Host nsenter handles endpoint routing.
@@ -99,7 +199,8 @@ def main():
             if process.poll() is None:process.terminate();process.wait(timeout=20)
             cleanup_environment=dict(environment,SERVER='minyar-interop:development',CLIENT='minyar-interop:development',SERVER_WWW=str(temporary),CLIENT_WWW=str(temporary),SERVER_DOWNLOADS=str(temporary),CLIENT_DOWNLOADS=str(temporary),CERTS=str(temporary))
             subprocess.run(['docker','compose','--env-file','empty.env','down','--timeout','5'],cwd=runner,env=cleanup_environment,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    manifest={'runner_commit':subprocess.check_output(['git','-c',f'safe.directory={runner}','rev-parse','HEAD'],cwd=runner,text=True).strip(),'tshark':subprocess.check_output(['tshark','--version'],text=True,stderr=subprocess.DEVNULL).splitlines()[0],'status':status,'elapsed_seconds':time.monotonic()-started,'configured_endpoints':len(configured),'tests':options.tests}
+    manifest={'runner_commit':subprocess.check_output(['git','-c',f'safe.directory={runner}','rev-parse','HEAD'],cwd=runner,text=True).strip(),'tshark':subprocess.check_output(['tshark','--version'],text=True,stderr=subprocess.DEVNULL).splitlines()[0],'elapsed_seconds':time.monotonic()-started,'configured_endpoints':len(configured),'tests':options.tests,'servers':options.servers,'clients':options.clients,'must_include':options.must_include,'controller_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+    manifest.update(matrix_evidence(artifacts/'matrix.json',options,status))
     (artifacts/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n');print(json.dumps(manifest))
-    return status
+    return manifest['status']
 if __name__=='__main__':sys.exit(main())
