@@ -223,7 +223,7 @@ class QuicRfcHarness(unittest.TestCase):
                     target=patch.object(RFC,'Evidence',side_effect=original)
                 inputs={'minyar':RFC.digest(ROOT/'minyar')}
                 # Supply all frontend copies without invoking an actual compiler.
-                fakecopy=lambda source,target:dict(before='a'*64,retained='a'*64,after='a'*64,
+                fakecopy=lambda source,target:dict(before=inputs.get(source.relative_to(ROOT).as_posix(),'a'*64),retained=inputs.get(source.relative_to(ROOT).as_posix(),'a'*64),after=inputs.get(source.relative_to(ROOT).as_posix(),'a'*64),
                                                   source=str(source),copy=str(target))
                 with patch.object(RFC,'snapshot_inputs',return_value=inputs), \
                         patch.object(RFC,'bound_copy',side_effect=fakecopy), \
@@ -255,6 +255,125 @@ class QuicRfcHarness(unittest.TestCase):
             with patch.object(RFC.shutil,'copyfile',side_effect=lambda a,b:Path(b).write_bytes(b'wrong')):
                 with self.assertRaises(ValueError):
                     RFC.bound_copy(source,target)
+
+    def test_per_case_artifact_inventories_reject_missing_and_wrong_hashes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base=Path(folder);project=base/'project';artifacts=base/'artifacts'
+            project.mkdir();artifacts.mkdir();(artifacts/'fixtures').mkdir()
+            names=('tests/quic-migration-cids.py','tests/quic-migration-cids.min',
+                   'tests/quic_protocol_artifacts.py','tests/test_evidence.py','tests/tls-local.py')
+            sources={}
+            for name in names:
+                path=project/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(name.encode())
+                sources[name]=RFC.digest(path)
+            binary=base/'migration';binary.write_bytes(b'benign native fixture')
+            certificate=artifacts/'fixtures/root.der';certificate.write_bytes(b'local certificate fixture')
+            commands=[]
+            for index,case in enumerate((None,'a','b')):
+                row=dict(command=['openssl','version'] if case is None else [str(binary),case],
+                    cwd=str(project),timeout=30 if case is None else 60,
+                    phase='certificate-fixture' if case is None else 'protocol-case',case=case,
+                    returncode=0,status=0,timed_out=False,executable_sha256='e'*64 if case is None else RFC.digest(binary))
+                for stream in ('stdout','stderr'):
+                    path=artifacts/(str(index)+'.'+stream)
+                    path.write_bytes(b'passed\r\n' if case is not None and stream=='stdout' else b'')
+                    row[stream+'_path']=str(path)
+                    row[stream+'_sha256']=RFC.digest(path);row[stream+'_bytes']=path.stat().st_size
+                commands.append(row)
+            references=[]
+            for case,index in (('a',1),('b',2)):
+                raw=sorted(Path(commands[i][stream+'_path']).relative_to(artifacts).as_posix()
+                           for i in (0,index) for stream in ('stdout','stderr'))
+                roles=dict(certificates=['fixtures/root.der'],raw_output=raw)
+                references.append(dict(case=case,command_indices=[0,index],endpoint_indices=[],
+                    fixture_workspace=str(artifacts/'fixtures'),file_roles=roles,
+                    files=sorted(['fixtures/root.der',*raw])))
+            parsed=dict(declared_cases=['a','b'],case_inventory=references,
+                        results=[dict(case=case,stdout='passed\n',stderr='') for case in ('a','b')])
+            result_path=artifacts/'results.json';result_path.write_text(json.dumps(parsed))
+            files=RFC.inventory(artifacts)
+            positive=dict(schema_version=1,status='passed',workspace=str(artifacts/'fixtures'),
+                inputs={str((project/name).resolve()):value for name,value in sources.items()},
+                commands=commands,endpoint_commands=[],declared_cases=['a','b'],
+                case_inventory=references,files=files,
+                file_bytes={name:(artifacts/name).stat().st_size for name in files})
+            positive['inputs'][str(binary)]=RFC.digest(binary)
+            manifest=artifacts/'manifest.json'
+            manifest.write_text(json.dumps(positive))
+            with patch.object(RFC,'ROOT',project):
+                RFC.verify_driver_artifacts(artifacts,'migration',parsed,['a','b'],
+                                            {'migration':binary},sources)
+                mutations=[]
+                def add(name, change):
+                    value=copy.deepcopy(positive);change(value);mutations.append((name,value))
+                add('boolean schema',lambda row:row.update(schema_version=True))
+                add('float schema',lambda row:row.update(schema_version=1.0))
+                add('wrong source hash',lambda row:row['inputs'].update({str(project/names[0]):'0'*64}))
+                add('missing source',lambda row:row['inputs'].pop(str(project/names[0])))
+                add('wrong file hash',lambda row:row['files'].update({'fixtures/root.der':'0'*64}))
+                add('missing file hash',lambda row:row['files'].pop('fixtures/root.der'))
+                add('boolean file size',lambda row:row['file_bytes'].update({'fixtures/root.der':True}))
+                add('float status',lambda row:row['commands'][1].update(status=0.0))
+                add('boolean returncode',lambda row:row['commands'][1].update(returncode=False))
+                add('float timeout',lambda row:row['commands'][1].update(timeout=60.0))
+                add('wrong raw hash',lambda row:row['commands'][1].update(stdout_sha256='0'*64))
+                add('missing raw path',lambda row:row['commands'][1].pop('stdout_path'))
+                add('boolean raw bytes',lambda row:row['commands'][1].update(stdout_bytes=True))
+                add('reordered cases',lambda row:row.update(case_inventory=row['case_inventory'][::-1]))
+                add('missing case hash refs',lambda row:row['case_inventory'][0].update(files=[]))
+                add('missing case command',lambda row:row['case_inventory'][0].update(command_indices=[0]))
+                add('boolean case index',lambda row:row['case_inventory'][0].update(command_indices=[0,True]))
+                add('missing fixture role',lambda row:row['case_inventory'][0]['file_roles'].pop('certificates'))
+                for name,value in mutations:
+                    manifest.write_text(json.dumps(value))
+                    with self.subTest(name=name),self.assertRaises((ValueError,TypeError)):
+                        RFC.verify_driver_artifacts(artifacts,'migration',parsed,['a','b'],
+                                                    {'migration':binary},sources)
+
+
+    def test_snapshot_includes_assembly_and_all_native_cache_inputs(self):
+        with tempfile.TemporaryDirectory() as folder:
+            project=Path(folder)
+            names={'minyar','Makefile','tests/quic-rfc.py','tests/quic-rfc-harness.py',
+                   'tests/tls-local.py','tests/test_evidence.py','tests/clang_helpers.py',
+                   'tests/quic_protocol_artifacts.py','tests/interop/qns/endpoint.py',
+                   'compiler/managed-graphs-adapter.patch','scripts/build-closure-compiler.py',
+                   'compiler/build-errors-compiler.py','vendor/monocypher/LICENCE.md',
+                   'vendor/monocypher/NOTICE','runtime/native/abi.h'}
+            names.update(RFC.BINARIES.values())
+            names.update(row[1] for row in RFC.DRIVERS)
+            for name in names:
+                path=project/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_text(name)
+            with patch.object(RFC,'ROOT',project),patch.object(RFC,'__file__',str(project/'tests/quic-rfc.py')):
+                before=RFC.snapshot_inputs()
+                self.assertEqual(set(before),names)
+                (project/'vendor/monocypher/NOTICE').write_text('changed cache metadata')
+                self.assertNotEqual(RFC.snapshot_inputs(),before)
+
+    def test_original_child_status_survives_manifest_retention_failure(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory=Path(folder)
+            compiler,raw,runtime=(directory/name for name in ('compiler','raw.ll','runtime.o'))
+            compiler.write_bytes(b'compiler');runtime.write_bytes(b'runtime')
+            raw.write_bytes(b'define i32 @main() {\n ret i32 0\n}\n')
+            original_write=Path.write_text
+            def fail_primary(path,*args,**kwargs):
+                if path.name=='manifest.json':
+                    raise OSError('intentional finalization failure')
+                return original_write(path,*args,**kwargs)
+            artifacts=directory/'failed-link'
+            with patch.dict(os.environ,{'MINYAR_LINK_ARTIFACTS':str(artifacts)}), \
+                    patch.object(DRIVER.subprocess,'run',return_value=SimpleNamespace(returncode=37)), \
+                    patch.object(DRIVER.subprocess,'check_output',return_value='version'), \
+                    patch.object(Path,'write_text',new=fail_primary):
+                with self.assertRaises(SystemExit) as observed:
+                    DRIVER.link_program(str(compiler),RFC.requested_flags('0',False),[],
+                                        str(raw),str(runtime),[],[],str(directory/'output'),None)
+            self.assertEqual(observed.exception.code,37)
+            report=json.loads((artifacts/'manifest-retention-error.json').read_text())
+            self.assertEqual(report['link_subprocess_status'],37)
+            self.assertIn('SystemExit',report['link_error'])
+            self.assertEqual(report['retention_errors'][0]['phase'],'manifest-retention')
 
 
 if __name__ == '__main__':
