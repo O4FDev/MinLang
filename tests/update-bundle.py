@@ -32,16 +32,33 @@ class Packager(unittest.TestCase):
         self.main='App.app/Contents/MacOS/main'
     def tearDown(self):self.temp.cleanup()
 
+    def link_environment(self):
+        env=dict(os.environ)
+        for variable in ('MSYS','CYGWIN'):
+            # The runtime uses the final mode. Keep quoted options and spacing
+            # byte for byte while selecting sys links in the fresh process.
+            env[variable]=env.get(variable,'')+' winsymlinks:sys'
+        return env
+
+    def test_link_fixture_environment_preserves_quoted_options_exactly(self):
+        values={'MSYS':'  winsymlinks:deepcopy  error_start:"C:/Tools/Debug  Helper.exe"  pipe_byte ',
+                'CYGWIN':'error_start:"C:/Other  Tools/Debugger.exe"\twinsymlinks:nativestrict',
+                'MINYAR_LINK_FIXTURE_MARKER':'keep exactly'}
+        with patch.dict(os.environ,values):
+            before=dict(os.environ);actual=self.link_environment()
+            for variable in ('MSYS','CYGWIN'):
+                with self.subTest(variable=variable):
+                    self.assertEqual(actual[variable],values[variable]+' winsymlinks:sys')
+            self.assertEqual({k:v for k,v in actual.items() if k not in ('MSYS','CYGWIN')},
+                             {k:v for k,v in before.items() if k not in ('MSYS','CYGWIN')})
+            self.assertEqual(dict(os.environ),before)
+
     def link_fixture(self,path,target,*,directory=False):
         if sys.platform in ('cygwin','msys'):
             # MSYS defaults to copying. Its DLL reads link creation policy when
             # the process starts, so a fresh interpreter must create the link.
             # The documented sys representation needs no symlink privilege.
-            env=dict(os.environ)
-            for variable in ('MSYS','CYGWIN'):
-                flags=[word for word in env.get(variable,'').split()
-                       if word!='winsymlinks' and not word.startswith('winsymlinks:')]
-                env[variable]=' '.join([*flags,'winsymlinks:sys'])
+            env=self.link_environment()
             subprocess.run([sys.executable,'-c',
                 'import os,sys;os.symlink(sys.argv[1],sys.argv[2],target_is_directory=sys.argv[3]=="1")',
                 str(target),str(path),'1' if directory else '0'],
