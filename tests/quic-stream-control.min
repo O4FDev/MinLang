@@ -14,6 +14,70 @@ function inject(sender: quic.Connection,receiver: quic.Connection,frame: Bytes,n
     let packet=errors.bytesValue(protection.protect(space.write,header,header.length-4,space.next,frame));space.next+=1
     quic.receive(receiver,packet,now)
 }
+function creditFrames(connection: quic.Connection): Integer {
+    let count=0
+    for pending in connection.pending {
+        for frame in wire.frames(pending.payload).frames { if frame.type==16 || frame.type==17 { count+=1 } }
+    }
+    return count
+}
+function tinyReads(c: quic.Connection,s: quic.Connection,now: Integer): Integer {
+    let id=errors.integerValue(quic.openStream(c,false))
+    for offset in 0..512 {
+        let frame=Bytes();frame.add(14);number(frame,id);number(frame,offset);number(frame,1);frame.add(offset&255)
+        inject(c,s,frame,now);now+=1
+        let read=quic.readStream(s,id)
+        if !errors.bytesOk(read) || errors.bytesValue(read).length!=1 || errors.bytesValue(read)[0]!=(offset&255) { return 40 }
+    }
+    // Tiny consumed reads must not create a reliable control packet each.
+    if creditFrames(s)!=0 || s.receiveMaxData!=262144 || s.streams[0].receiveLimit!=65536 { return 41 }
+    for offset in 1..64 {
+        let frame=Bytes();frame.add(14);number(frame,id);number(frame,offset*512);number(frame,512);frame.addBytes(Bytes(512))
+        inject(c,s,frame,now);now+=1
+        let read=quic.readStream(s,id);if !errors.bytesOk(read) || errors.bytesValue(read).length!=512 { return 42 }
+    }
+    if creditFrames(s)!=1 || s.streams[0].receiveLimit!=98304 || s.receiveMaxData!=262144 { return 43 }
+    for index in 0..100 { transfer(c,s,now);now+=10 }
+    if c.streams[0].sendLimit!=98304 { return 44 }
+    return 0
+}
+function reusedWindows(c: quic.Connection,s: quic.Connection,now: Integer): Integer {
+    let id=errors.integerValue(quic.openStream(c,false));let sent=0;let received=0
+    let dropped=false;let blockedUntil=-1
+    while now<60000 && received<393216 {
+        if sent<393216 {
+            let payload=Bytes(512);for index in 0..payload.length { payload[index]=((sent+index)*7)&255 }
+            let written=quic.writeStream(c,id,payload,sent+512==393216)
+            if errors.integerOk(written) { sent+=errors.integerValue(written) }
+            else if !errors.isWouldBlock(errors.integerError(written)) { return 45 }
+        }
+        for packet in quic.poll(c,now) { quic.receive(s,packet,now) }
+        let read=quic.readStream(s,id)
+        if errors.bytesOk(read) {
+            let data=errors.bytesValue(read)
+            for index in 0..data.length { if data[index]!=((received+index)*7)&255 { return 46 } }
+            received+=data.length
+        } else if errors.bytesStatus(read)!=errors.endOfStreamStatus() && !errors.isWouldBlock(errors.bytesError(read)) { return 47 }
+        // Drop the first advertised credit and its retries for half a second.
+        if !dropped && creditFrames(s)>0 { dropped=true;blockedUntil=now+500 }
+        for packet in quic.poll(s,now) { if now>=blockedUntil { quic.receive(c,packet,now) } }
+        if c.state!=quic.ESTABLISHED || s.state!=quic.ESTABLISHED { return 48 }
+        now+=10
+    }
+    if sent!=393216 || received!=393216 || !dropped { return 49 }
+    if s.receiveMaxData<393216 || s.streams[0].receiveLimit<393216 { return 50 }
+    if errors.bytesStatus(quic.readStream(s,id))!=errors.endOfStreamStatus() { return 51 }
+    return 0
+}
+function discardedCredit(c: quic.Connection,s: quic.Connection,now: Integer): Integer {
+    for index in 0..8 {
+        let id=errors.integerValue(quic.openStream(c,false));let frame=Bytes()
+        frame.add(4);number(frame,id);number(frame,42);number(frame,1);inject(c,s,frame,now);now+=1
+        if s.state!=quic.ESTABLISHED || errors.bytesOk(quic.readStream(s,id)) { return 52 }
+    }
+    if creditFrames(s)!=0 || s.receiveMaxData!=262144 || s.receivedData!=8 { return 53 }
+    return 0
+}
 function main(): Integer {
     let root=readBytesFile(argument(0));let cert=readBytesFile(argument(1));let key=readBytesFile(argument(2));let client=readBytesFile(argument(3));let clientKey=readBytesFile(argument(4))
     for scenario in 0..8 {
@@ -55,6 +119,18 @@ function main(): Integer {
             let frame=Bytes();frame.add(4);number(frame,id);number(frame,1);number(frame,0);inject(s,c,frame,now)
             if c.state != quic.FAILED || c.code != 5 { return 9 }
         }
+    }
+    for scenario in 0..3 {
+        let c=quic.client("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey)
+        let s=quic.server(randomBytes(80),"minyar-test",c.originalDestination,[cert],key,[root],true);let now=0
+        while now<10000 && (c.state!=quic.ESTABLISHED || s.state!=quic.ESTABLISHED) { transfer(c,s,now);now+=10 }
+        if c.state!=quic.ESTABLISHED || s.state!=quic.ESTABLISHED { return 54 }
+        for index in 0..100 { transfer(c,s,now);now+=10 }
+        let result=0
+        if scenario==0 { result=tinyReads(c,s,now) }
+        else if scenario==1 { result=reusedWindows(c,s,now) }
+        else { result=discardedCredit(c,s,now) }
+        if result!=0 { return result }
     }
     print("QUIC streams: RESET/STOP retransmission, recoverable application codes, zero-code reset, final-size/flow/direction adversaries passed")
     return 0
