@@ -8,6 +8,7 @@ use "eventloop" as loop
 use "eventcallbacks" as callbacks
 use "quic" as quic
 use "quicwire" as quicwire
+use "quicretry" as retry
 use "quicdispatch" as dispatch
 use "transport" as transport
 use "tlsserver" as tls
@@ -98,7 +99,7 @@ record InputStream { id: Integer; decoder: wire.Decoder }
 record Peer {
     live: Boolean; queued: Boolean; flags: Integer; mode: Integer; socket: Integer; watch: Integer
     connection: transport.Connection; gateway: tls.Session; decoder: wire.Decoder; inputs: List<InputStream>
-    paths: List<Address>; output: Bytes; outputAt: Integer; since: Integer
+    paths: List<Address>; routed: Bytes; output: Bytes; outputAt: Integer; since: Integer
     bound: Boolean; device: Text; exit: Text; epoch: Text; health: live.Health; heartbeatAt: Integer
     control: Integer; published: Boolean; publicationPending: Boolean; redisQueued: Boolean; admitted: Integer
 }
@@ -108,6 +109,7 @@ record Core {
     identity: List<Bytes>; key: Bytes; deviceRoots: List<Bytes>; gatewayRoots: List<Bytes>; registry: Registry; keys: auth.KeySet
     udp: Integer; deviceListener: Integer; gatewayListener: Integer
     peers: List<Peer>; free: List<Integer>; freeCount: Integer; active: Integer
+    retry: retry.Store; noRetry: retry.Opened; allocated: Integer; retryReplies: Integer; retryValidated: Integer
     work: List<Integer>; workAt: Integer; routing: dispatch.Table; exits: dispatch.Table; timers: dispatch.Timers
     redisSocket: Integer; redisWatch: Integer; redisClient: redis.Client; publications: List<Publication>; publicationAt: Integer
     redisReconnectAt: Integer; redisFlags: Integer; redisConnecting: Boolean; redisConnectDeadline: Integer; registryAt: Integer; keysAt: Integer
@@ -125,21 +127,23 @@ function watchPeer(core: Core, id: Integer) {
 function interests(core: Core, peer: Peer) {
     if peer.watch > 0 { let interest = loop.readableInterest(); if peer.outputAt < peer.output.length { interest = loop.readWriteInterest() }; callbacks.update(core.dispatcher,peer.watch,interest,0) }
 }
-function allocate(core: Core, mode: Integer, socket: Integer, original: Bytes, address: Address): Integer {
+function allocate(core: Core, mode: Integer, socket: Integer, original: Bytes, address: Address, validated: retry.Opened): Integer {
+    if mode == 0 && !retry.valid(validated) { return -1 }
     if core.active >= core.config.maximum { if socket >= 0 { net.close(socket) }; return -1 }
-    let connection = transport.serverQUIC(randomBytes(80),"hearth-peer",original,core.identity,core.key,core.deviceRoots,true)
+    let connection = transport.client("inactive.invalid",Bytes(),"inactive",[],[],Bytes())
+    if mode == 0 { connection = transport.serverQUICAfterRetry(randomBytes(80),"hearth-peer",validated,core.identity,core.key,core.deviceRoots,true) }
     if mode == 1 { connection = transport.serverTCP(randomBytes(80),"hearth-peer",core.identity,core.key,core.deviceRoots,true,core.now) }
     let gateway = tls.none()
     if mode == 2 { gateway = tls.server(randomBytes(64),"h2",core.identity,core.key,core.gatewayRoots,true) }
     let peer = Peer { live: true; queued: false; flags: 0; mode: mode; socket: socket; watch: 0; connection: connection; gateway: gateway; decoder: wire.create(); inputs: []
-        paths: [address]; output: Bytes(); outputAt: 0; since: core.now; bound: false; device: ""; exit: ""; epoch: ""; health: live.heartbeat(Bytes()); heartbeatAt: -1
+        paths: [address]; routed: original; output: Bytes(); outputAt: 0; since: core.now; bound: false; device: ""; exit: ""; epoch: ""; health: live.heartbeat(Bytes()); heartbeatAt: -1
         control: -1; published: false; publicationPending: false; redisQueued: false; admitted: 0 }
     let id = core.peers.length
     if core.freeCount > 0 { core.freeCount -= 1; id = core.free[core.freeCount] }
     if id == core.peers.length { core.peers.add(peer) } else { core.peers[id] = peer }
-    core.active += 1
+    core.active += 1; core.allocated += 1
     if mode == 0 {
-        if !errors.booleanOk(dispatch.insert(core.routing,connection.udp.local,id)) || !errors.booleanOk(dispatch.insert(core.routing,original,id)) { drop(core,id); return -1 }
+        if !errors.booleanOk(dispatch.insert(core.routing,connection.udp.local,id)) || !errors.booleanOk(dispatch.insert(core.routing,peer.routed,id)) { drop(core,id); return -1 }
     } else { watchPeer(core,id) }
     if !peer.live { return -1 }
     mark(core,id); return id
@@ -177,7 +181,7 @@ function drop(core: Core, id: Integer) {
         let key = identityKey(peer.exit)
         if dispatch.lookup(core.exits,key) == id { dispatch.remove(core.exits,key); queuePublication(core,id,3) }
     }
-    if peer.mode == 0 { dispatch.remove(core.routing,peer.connection.udp.local); dispatch.remove(core.routing,peer.connection.udp.originalDestination) }
+    if peer.mode == 0 { dispatch.remove(core.routing,peer.connection.udp.local); dispatch.remove(core.routing,peer.routed) }
     if peer.watch > 0 { callbacks.cancel(core.dispatcher,peer.watch) }
     if peer.socket >= 0 { net.close(peer.socket) }
     dispatch.cancel(core.timers,id); peer.live = false; peer.output = Bytes(); peer.inputs = []; peer.paths = []; peer.device = ""; peer.exit = ""; peer.epoch = ""; peer.health = live.heartbeat(Bytes()); peer.decoder = wire.create()
@@ -371,7 +375,7 @@ function acceptPeers(core: Core, listener: Integer, mode: Integer) {
     core.now = net.monotonicMilliseconds() - core.started
     for accepted in 0..64 {
         let socket = net.accept(listener); if socket < 0 { break }
-        allocate(core,mode,socket,randomBytes(8),Address { host: ""; port: 0 })
+        allocate(core,mode,socket,randomBytes(8),Address { host: ""; port: 0 },core.noRetry)
     }
 }
 function udpInput(core: Core) {
@@ -386,7 +390,23 @@ function udpInput(core: Core) {
                 let destination = errors.bytesValue(cid); let id = dispatch.lookup(core.routing,destination)
                 if id < 0 {
                     let header = quicwire.header(data,0,8)
-                    if header.valid && header.kind == quicwire.INITIAL && data.length >= 1200 { id = allocate(core,0,-1,header.destination,Address { host: net.datagramSource(packet); port: net.datagramPort(packet) }) }
+                    if header.valid && header.kind == quicwire.INITIAL && data.length >= 1200 {
+                        let address = Address { host: net.datagramSource(packet); port: net.datagramPort(packet) }
+                        let canonical = Bytes("[" + address.host + "]:" + Text(address.port))
+                        if header.token.length == 0 {
+                            let response = retry.reply(core.retry,data,canonical,randomBytes(8),core.now)
+                            if errors.bytesOk(response) {
+                                net.sendDatagramTo(core.udp,address.host,address.port,errors.bytesValue(response))
+                                core.retryReplies += 1
+                            }
+                        } else {
+                            let validated = retry.validateInitial(core.retry,data,canonical,core.now)
+                            if retry.valid(validated) {
+                                id = allocate(core,0,-1,header.destination,address,validated)
+                                if id >= 0 { core.retryValidated += 1 }
+                            }
+                        }
+                    }
                 }
                 if id >= 0 && core.peers[id].live {
                     let peer = core.peers[id]; let path = -1
@@ -439,6 +459,7 @@ public function run(configBytes: Bytes, durationMs: Integer): errors.BooleanResu
     let core = Core { config: config; dispatcher: callbacks.value(created); now: 0; started: net.monotonicMilliseconds()
         identity: [readBytesFile(config.certificate)]; key: readBytesFile(config.key); deviceRoots: [readBytesFile(config.deviceRoots)]; gatewayRoots: [readBytesFile(config.gatewayRoots)]; registry: registry; keys: keys
         udp: udp; deviceListener: device; gatewayListener: gateway; peers: []; free: []; freeCount: 0; active: 0; work: []; workAt: 0
+        retry: retry.store(randomBytes(16),10000); noRetry: retry.validateInitial(retry.store(Bytes(),1),Bytes(),Bytes(),0); allocated: 0; retryReplies: 0; retryValidated: 0
         routing: dispatch.table(config.maximum*2,65536,randomBytes(16)); exits: dispatch.table(config.maximum,65536,randomBytes(16)); timers: dispatch.timers(config.maximum)
         redisSocket: -1; redisWatch: 0; redisClient: redis.create(); publications: []; publicationAt: 0; redisReconnectAt: 0; redisFlags: 0; redisConnecting: false; redisConnectDeadline: 0; registryAt: 15000; keysAt: 300000 }
     callbacks.watch(core.dispatcher,udp,loop.readableInterest(),0,function(event: loop.Event) { udpInput(core) })
@@ -466,5 +487,6 @@ public function run(configBytes: Bytes, durationMs: Integer): errors.BooleanResu
     redisService(core)
     callbacks.close(core.dispatcher); if core.redisSocket >= 0 { net.close(core.redisSocket) }; net.close(udp); net.close(device); net.close(gateway)
     core.key = Bytes(); core.identity = []; core.deviceRoots = []; core.gatewayRoots = []
+    print("EDGE_COUNTS allocated=" + Text(core.allocated) + " active=" + Text(core.active) + " peer_slots=" + Text(core.peers.length) + " retries=" + Text(core.retryReplies) + " retry_validated=" + Text(core.retryValidated))
     if errors.isError(failure) { return errors.booleanFailure(failure) }; return errors.boolean(true)
 }
