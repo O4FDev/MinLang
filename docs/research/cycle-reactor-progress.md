@@ -66,3 +66,25 @@ objects are byte-identical to the current pre-fix control under the maintained
 flags. Linux progress passes the unchanged one-second/2% idle gate; this does
 not replay the retained Windows sanitizer failure or certify device capacity.
 The strict 4096-device cohort still needs a freshly built native executable.
+
+### Captured owners at real zero
+
+A local JSON-like owner can finish a finite cohort without belonging to the
+completed callback/Core proof. Retiring it used to cancel that independent
+proof: eight completed-owner drops at N=32 required2448 collector units and16
+epochs despite unchanged live payloads and exact final reclamation. The focused
+captured-retirement fixture verifies actual ownership, incoming counts, captured
+marks and independent graph survival before its unchanged192-unit work bound.
+
+The bounded zero-drop entry may stamp a separate captured-dead certificate only
+after the last real owner disappears, incoming is zero, gray pinning has not
+deferred retirement, and a held completed nonbuilding primary remains valid.
+Marks0/2 distinguish actual captured state from fresh mark3; arbitrary fresh
+certificate tags still take the historical fallback. The dead marker is not a
+live reachability proof. It cancels the temporary witness and clears its pointer
+before unlinking. Each remaining field rechecks the current primary, no-rescan
+state and idle/local phase before its paired incoming removal and ordinary
+child drop. Full proof construction, gray/pinned owners, anchor changes and
+ordinary registered mutations remain conservative. The original fresh-dead
+marker retains its active-phase fallback. The eager and ordinary RC engines are
+unchanged. Actual4096-device capacity and Windows qualification remain separate.

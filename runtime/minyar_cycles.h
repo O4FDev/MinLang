@@ -20,7 +20,8 @@ typedef struct RcCycle {
     struct RcCycle *previous, *next;
     uintptr_t gray_next; /* Registered: aligned link, bits0/1 proof tags, bit2 local namespace.
                           * Unregistered: bit2 retains captured incoming-path exposure; bit3
-                          * marks private bounded zero-count cleanup, never a live certificate. */
+                          * marks private bounded zero-count cleanup; bit4 distinguishes captured
+                          * dead owners. Neither bit is a live certificate. */
     size_t generation : 1, marked : 2, registered : 1, pinned : 1, cleared : 1, record : 1,
         incoming : 57;
 } RcCycle;
@@ -281,22 +282,41 @@ static inline int rc_cycle_unregistered_leaf(RcCycle *cycle) {
 #ifdef MINYAR_BOUNDED_RC
 /* Only an irreversibly dead, unregistered object may carry this bit. It is
  * separate from live proof/exposure tags; allocation and registration reset it. */
-enum { RC_CYCLE_PRIVATE_DEAD = 8 };
+enum { RC_CYCLE_PRIVATE_DEAD = 8, RC_CYCLE_CAPTURED_DEAD = 16 };
+/* Actual-zero owners are outside every current owning path. A previously
+ * captured owner may retire during a local job without canceling the primary;
+ * a full proof under construction still needs the conservative fallback. */
+static inline int rc_cycle_primary_retirement(void) {
+    return !rc_cycle_inside && !rc_cycle_rescan &&
+           (rc_cycle_phase == RC_CYCLE_IDLE ||
+            (rc_cycle_local_job && rc_cycle_phase >= RC_CYCLE_ROOTS &&
+             rc_cycle_phase <= RC_CYCLE_SWEEP)) &&
+           rc_cycle_proof_valid && !rc_cycle_proof_build && rc_cycle_anchor_held() &&
+           !rc_cycle_proof_anchor->pinned;
+}
 /* Called only after a real outside-collector RC decrement reached zero, before
  * the bounded queue reuses ownership as its link. A fresh uncaptured owner has
  * never contributed an anchor path; retiring it cannot remove a proven edge. */
 static inline void rc_cycle_unregister_zero(RcObject *object) {
     RcCycle *cycle = rc_cycle_metadata(object);
+    unsigned fresh = cycle->marked == 3 && !(cycle->gray_next & ~(uintptr_t)4) &&
+                     cycle != rc_cycle_temporary_anchor && rc_cycle_primary_idle();
+    unsigned captured = (cycle->marked == 0 || cycle->marked == 2) &&
+                        !(cycle->gray_next & ~(uintptr_t)7) && !rc_cycle_proven(cycle) &&
+                        rc_cycle_primary_retirement();
     if (object->ownership != RC_TRACED || cycle->incoming || !cycle->registered ||
-        cycle->marked != 3 || (cycle->gray_next & ~(uintptr_t)4) || cycle->pinned ||
-        cycle->cleared || cycle == rc_cycle_proof_anchor || cycle == rc_cycle_temporary_anchor ||
-        cycle == rc_cycle_proof_retry || !rc_cycle_primary_idle()) {
+        cycle->pinned || cycle->cleared || cycle == rc_cycle_proof_anchor ||
+        cycle == rc_cycle_proof_retry || (!fresh && !captured)) {
         rc_cycle_unregister(object);
         return;
     }
     rc_cycle_temporary_changed();
+    if (rc_cycle_temporary_anchor == cycle)
+        rc_cycle_temporary_anchor = NULL;
     rc_cycle_unlink(cycle);
-    cycle->gray_next = RC_CYCLE_PRIVATE_DEAD;
+    /* The additional bit certifies only this irreversible captured retirement;
+     * it cannot certify a live object or relax a fresh owner's phase rules. */
+    cycle->gray_next = RC_CYCLE_PRIVATE_DEAD | (captured ? RC_CYCLE_CAPTURED_DEAD : 0);
 }
 #endif
 
@@ -536,8 +556,11 @@ static inline void rc_cycle_dead_edge_remove(RcObject *parent, void *value) {
     if (!child)
         return;
     RcCycle *owner = rc_cycle_metadata(parent);
-    if (owner->registered || owner->gray_next != RC_CYCLE_PRIVATE_DEAD || owner->pinned ||
-        owner->cleared || owner->incoming || !rc_cycle_primary_idle()) {
+    unsigned captured = owner->gray_next == (RC_CYCLE_PRIVATE_DEAD | RC_CYCLE_CAPTURED_DEAD);
+    unsigned eligible = captured ? rc_cycle_primary_retirement() : rc_cycle_primary_idle();
+    if (owner->registered ||
+        (!captured && owner->gray_next != RC_CYCLE_PRIVATE_DEAD) || owner->pinned ||
+        owner->cleared || owner->incoming || !eligible) {
         rc_cycle_edge_remove(value);
         return;
     }
