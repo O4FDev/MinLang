@@ -84,6 +84,96 @@ class BuildWiring(unittest.TestCase):
                 catalogue.validate(dict(data, sources=[x for x in data['sources'] if x['path'] != name]), ROOT)
 
 
+
+    def test_ack_scheduling_has_both_optimizations_and_all_mandatory_gates(self):
+        import importlib.util
+        import json
+        import re
+        text = (ROOT / 'build-support/checks.mk').read_text()
+        begin = text.index('# ACK scheduling gates')
+        end = text.index('# Handshake PTO virtual-clock modes', begin)
+        source = text[begin:end]
+        native, sanitize = 'check-quic-ack', 'check-quic-ack-sanitize'
+
+        def verify(fragment):
+            with tempfile.TemporaryDirectory(prefix='minyar ACK wiring ') as folder:
+                makefile = Path(folder) / 'probe.mk'
+                makefile.write_text(fragment + '\n.PHONY: build/minyarc build\n'
+                                   'build/minyarc build:\n\t@echo ARTIFACT $@\n')
+                env = dict(os.environ)
+                env.pop('MAKEFLAGS', None)
+                result = subprocess.run(['make', '-np', '-f', str(makefile), native, sanitize],
+                                        cwd=ROOT, env=env, text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                rules = {}
+                for line in result.stdout.splitlines():
+                    match = re.match(r'^([\w./-]+):\s+(.*)$', line)
+                    if match:
+                        rules.setdefault(match[1], set()).update(match[2].split())
+                for gate in ('check', 'check-portable', 'check-quic'):
+                    self.assertIn(native, rules.get(gate, set()), gate)
+                for gate in ('check-sanitize', 'check-quic-sanitize'):
+                    self.assertIn(sanitize, rules.get(gate, set()), gate)
+                for target in (native, sanitize):
+                    self.assertTrue({'tests/quic-ack.py', 'tests/quic-ack.min',
+                                     'tests/tls-local.py', 'build/minyarc'}
+                                    <= rules.get(target, set()), target)
+                commands = result.stdout.split('# GNU Make', 1)[0]
+                self.assertEqual(commands.count('tests/quic-ack.py'), 2)
+                self.assertEqual(commands.count('--optimization both'), 2)
+                self.assertEqual(commands.count('--sanitize'), 1)
+                self.assertEqual(commands.count('mktemp -d "'), 2)
+                self.assertEqual(commands.count('--artifacts '), 2)
+                self.assertNotIn('--mode ', commands)  # All author-owned modes stay mandatory.
+                for suffix in ('native', 'sanitize'):
+                    self.assertIn((ROOT / 'build' / ('quic-ack-' + suffix)).as_posix(),
+                                  commands.replace('\\', '/'))
+
+        verify(source)
+        for gate in ('check', 'check-portable', 'check-quic',
+                     'check-sanitize', 'check-quic-sanitize'):
+            aggregate = ('check-sanitize check-quic-sanitize: ' + sanitize if
+                         gate in ('check-sanitize', 'check-quic-sanitize') else
+                         'check check-portable check-quic: ' + native)
+            names, dependency = aggregate.split(': ', 1)
+            mutant = source.replace(aggregate, ' '.join(x for x in names.split() if x != gate)
+                                    + ': ' + dependency, 1)
+            with self.subTest(missing_gate=gate), self.assertRaises(AssertionError):
+                verify(mutant)
+        for name, old, new in (
+                ('single optimization', '--optimization both', '--optimization 0'),
+                ('no sanitizer', '--sanitize --artifacts', '--artifacts'),
+                ('relative evidence', '$(abspath build)/quic-ack-', 'build/quic-ack-'),
+                ('selected mode only', '--optimization both', '--optimization both --mode 0')):
+            mutant = source.replace(old, new, 1)
+            self.assertNotEqual(mutant, source)
+            with self.subTest(invalid_recipe=name), self.assertRaises(AssertionError):
+                verify(mutant)
+        tree = ast.parse((ROOT / 'scripts/check-linux.py').read_text())
+        targets = next(ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
+                       and any(isinstance(x, ast.Name) and x.id == 'TARGETS' for x in node.targets))
+        for target in (native, sanitize):
+            self.assertEqual(targets.count(target), 1)
+        workflow = (ROOT / '.github/workflows/ci.yml').read_text()
+        self.assertIn('check-quic\n', workflow)
+        self.assertIn('check-quic-sanitize\n', workflow)
+        format_tree = ast.parse((ROOT / 'scripts/format.py').read_text())
+        version = next(ast.literal_eval(node.value) for node in format_tree.body
+                       if isinstance(node, ast.Assign)
+                       and any(isinstance(x, ast.Name) and x.id == 'VERSION' for x in node.targets))
+        self.assertEqual(version, '23.1.2')
+        self.assertIn('clang-format==23.1.2', workflow)
+        spec = importlib.util.spec_from_file_location('ack_catalogue', ROOT / 'tests/suite-catalogue.py')
+        catalogue = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(catalogue)
+        data = json.loads((ROOT / 'tests/suite-catalogue.json').read_text())
+        catalogue.validate(data, ROOT)
+        for fixture in ('tests/quic-ack.py', 'tests/quic-ack.min'):
+            self.assertIn(fixture, catalogue.discover(ROOT))
+            with self.subTest(missing_source=fixture), self.assertRaises(ValueError):
+                catalogue.validate(dict(data, sources=[x for x in data['sources']
+                                                       if x['path'] != fixture]), ROOT)
+
     def test_handshake_pto_has_native_and_sanitizer_gates(self):
         import importlib.util
         import json

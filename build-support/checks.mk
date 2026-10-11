@@ -566,6 +566,17 @@ check-tls-sanitize: build/minyarc
 
 check check-portable: check-tls
 
+# ACK scheduling gates retain both native and sanitizer optimizations.
+.PHONY: check-quic-ack check-quic-ack-sanitize
+check-quic-ack: build/minyarc tests/quic-ack.py tests/quic-ack.min tests/tls-local.py | build
+	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-ack-native.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/quic-ack.py --optimization both --artifacts "$$artifacts"
+
+check-quic-ack-sanitize: build/minyarc tests/quic-ack.py tests/quic-ack.min tests/tls-local.py | build
+	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-ack-sanitize.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/quic-ack.py --optimization both --sanitize --artifacts "$$artifacts"
+
+check check-portable check-quic: check-quic-ack
+check-sanitize check-quic-sanitize: check-quic-ack-sanitize
+
 # Handshake PTO virtual-clock modes use fresh absolute evidence directories.
 .PHONY: check-quic-pto check-quic-pto-sanitize
 check-quic-pto: build/minyarc tests/quic-pto.py tests/quic-pto.min | build

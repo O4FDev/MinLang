@@ -17,7 +17,7 @@ EXTENSIONS = {'.py', '.c', '.h', '.m', '.sh'}
 ROLES = {'suite', 'support', 'fixture', 'manual', 'ungated'}
 # Minyar fixtures normally belong to harnesses. These maintained regressions
 # also have explicit mandatory dispositions, unlike generated Minyar samples.
-REQUIRED_MINYAR_FIXTURES = {'tests/cycle-late-registration.min', 'tests/quic-pto.min'}
+REQUIRED_MINYAR_FIXTURES = {'tests/cycle-late-registration.min', 'tests/quic-pto.min', 'tests/quic-ack.min'}
 
 
 def discover(root):
