@@ -47,6 +47,7 @@ def main():
         if options.evidence:
             sources = [Path(__file__), ROOT/'tests/network_evidence.py',
                        ROOT/'tests/clang_helpers.py', ROOT/'tests/net-loop.c',
+                       ROOT/'runtime/native/net.c',
                        ROOT/'tests/net-loop.min', ROOT/'runtime/minyar_runtime.c',
                        ROOT/'library/eventloop.min', ROOT/'library/net.min', ROOT/'minyar']
             sources.extend((ROOT/'runtime').rglob('*.h'))

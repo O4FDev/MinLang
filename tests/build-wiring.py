@@ -91,6 +91,23 @@ class BuildWiring(unittest.TestCase):
                          "['native', 'app-native', 'sanitize', 'app-sanitize']")):
             mutant=source.replace(old,new,1);self.assertNotEqual(mutant,source)
             with self.assertRaises(AssertionError):verify_modes(mutant)
+        def verify_inputs(candidate):
+            main=next(n for n in ast.parse(candidate).body
+                      if isinstance(n,ast.FunctionDef) and n.name=='main')
+            sources=next(n.value for n in ast.walk(main) if isinstance(n,ast.Assign)
+                         and any(isinstance(target,ast.Name) and target.id=='sources'
+                                 for target in n.targets))
+            bound={n.right.value for n in sources.elts if isinstance(n,ast.BinOp)
+                   and isinstance(n.left,ast.Name) and n.left.id=='ROOT'
+                   and isinstance(n.right,ast.Constant)}
+            self.assertIn('tests/network_evidence.py',bound)
+            self.assertIn('runtime/native/net.c',bound)
+        loop_source=(ROOT/'tests/net-loop.py').read_text()
+        verify_inputs(loop_source)
+        for name in ('tests/network_evidence.py','runtime/native/net.c'):
+            old="ROOT/"+repr(name)+","
+            mutant=loop_source.replace(old,'',1);self.assertNotEqual(mutant,loop_source)
+            with self.assertRaises(AssertionError):verify_inputs(mutant)
         spec=importlib.util.spec_from_file_location('loop_catalogue',ROOT/'tests/suite-catalogue.py')
         catalogue=importlib.util.module_from_spec(spec);spec.loader.exec_module(catalogue)
         data=json.loads((ROOT/'tests/suite-catalogue.json').read_text());catalogue.validate(data,ROOT)
