@@ -166,7 +166,7 @@ function clientHello(session: Session, hello: Bytes) {
     if hello[at] != 1 || hello[at + 1] != 0 { abandon(session, "invalid ClientHello compression"); return }; at += 2
     if at + 2 > hello.length || get16(hello, at) != hello.length - at - 2 { abandon(session, "malformed ClientHello extensions"); return }; at += 2
     let seen: List<Integer> = []; let schemes: List<Integer> = []; let groups: List<Integer> = []
-    let peer = Bytes(); let version = false; let protocol = false; let parameters = false
+    let peer = Bytes(); let p256Peer = Bytes(); let group = 0x001d; let version = false; let protocol = false; let parameters = false
     let psk = Bytes(); let binder = Bytes(); let binderEnd = 0; let ticketAge = 0; let pskMode = false
     while at + 4 <= hello.length {
         let type = get16(hello, at); size = get16(hello, at + 2); at += 4
@@ -189,7 +189,9 @@ function clientHello(session: Session, hello: Bytes) {
                 let group = get16(body, offset); let length = get16(body, offset + 2); offset += 4
                 if length > size - offset || contains(shares, group) { abandon(session, "invalid client key share"); return }
                 shares.add(group)
-                if group == 0x001d && length == 32 { peer = body.slice(offset, offset + 32) }
+                if (group == 0x001d && length != 32) || (group == 0x0017 && length != 65) { abandon(session, "invalid supported client key share length"); return }
+                if group == 0x001d { peer = body.slice(offset, offset + 32) }
+                if group == 0x0017 { p256Peer = body.slice(offset, offset + 65) }
                 offset += length
             }
             if offset != size { abandon(session, "truncated client key share"); return }
@@ -226,8 +228,14 @@ function clientHello(session: Session, hello: Bytes) {
         }
         at += size
     }
-    if at != hello.length || !version || !protocol || schemes.length == 0 || peer.length != 32 || !contains(groups, 0x001d) || (session.quic && !parameters) {
+    if at != hello.length || !version || !protocol || schemes.length == 0 || (peer.length == 0 && p256Peer.length == 0) || (session.quic && !parameters) {
         abandon(session, "unsupported TLS version, ALPN, key share or QUIC parameters"); return
+    }
+    if peer.length == 32 {
+        if !contains(groups, 0x001d) { abandon(session, "X25519 key share not in supported groups"); return }
+    } else {
+        if !contains(groups, 0x0017) { abandon(session, "P-256 key share not in supported groups"); return }
+        group = 0x0017; peer = p256Peer
     }
     if session.earlyOffered && psk.length == 0 { abandon(session, "early data requires a PSK"); return }
     session.identityExpires=trust.currentCertificateExpiry(session.identity)
@@ -253,10 +261,12 @@ function clientHello(session: Session, hello: Bytes) {
             }
         }
     }
-    let shared = crypto.x25519(session.privateKey, peer)
-    if shared.length != 32 || equal(shared, Bytes(32)) { abandon(session, "all-zero X25519 shared secret"); return }
+    let shared = Bytes(); let publicKey = Bytes()
+    if group == 0x001d { shared = crypto.x25519(session.privateKey, peer); publicKey = crypto.x25519Public(session.privateKey) }
+    else { let ephemeral = trust.p256Key(); publicKey = trust.p256Public(ephemeral); shared = trust.p256(ephemeral, peer) }
+    if shared.length != 32 || equal(shared, Bytes(32)) || publicKey.length == 0 { abandon(session, "invalid TLS key share or shared secret"); return }
     session.transcript.addBytes(hello)
-    let share = Bytes(); add16(share, 0x001d); add16(share, 32); share.addBytes(crypto.x25519Public(session.privateKey))
+    let share = Bytes(); add16(share, group); add16(share, publicKey.length); share.addBytes(publicKey)
     let extensions = extension(43, crypto.fromHex("0304")); extensions.addBytes(extension(51, share))
     if session.resumed { extensions.addBytes(extension(41, crypto.fromHex("0000"))) }
     let body = crypto.fromHex("0303"); body.addBytes(session.random); body.add(idLength); body.addBytes(identifier)

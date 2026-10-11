@@ -965,19 +965,22 @@ static bool certificate_time(unsigned char tag, Der date, long long *millisecond
     for (size_t field = 0; field < 6; field++) {
         size_t width = field ? 2 : year_digits;
         for (size_t digit = 0; digit < width; digit++, at++) {
-            if (date.data[at] < '0' || date.data[at] > '9') return false;
+            if (date.data[at] < '0' || date.data[at] > '9')
+                return false;
             fields[field] = fields[field] * 10 + date.data[at] - '0';
         }
     }
     int year = fields[0];
-    if (year_digits == 2) year += year >= 50 ? 1900 : 2000;
+    if (year_digits == 2)
+        year += year >= 50 ? 1900 : 2000;
     int month = fields[1], day = fields[2];
     bool leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    static const int lengths[] = {31,28,31,30,31,30,31,31,30,31,30,31};
-    static const int elapsed[] = {0,31,59,90,120,151,181,212,243,273,304,334};
+    static const int lengths[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    static const int elapsed[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
     if (year < 1 || month < 1 || month > 12 || day < 1 ||
-        day > lengths[month - 1] + (month == 2 && leap) ||
-        fields[3] > 23 || fields[4] > 59 || fields[5] > 59) return false;
+        day > lengths[month - 1] + (month == 2 && leap) || fields[3] > 23 || fields[4] > 59 ||
+        fields[5] > 59)
+        return false;
     int prior = year - 1;
     long long days = (long long)(year - 1970) * 365 + prior / 4 - prior / 100 + prior / 400 - 477;
     days += elapsed[month - 1] + day - 1 + (month > 2 && leap);
@@ -988,30 +991,339 @@ static bool certificate_time(unsigned char tag, Der date, long long *millisecond
 static long long certificate_expiry(CertBytes bytes, long long now) {
     Der input = bytes, outer, tbs, field, validity;
     unsigned char tag;
-    if (!der_next(&input,&tag,&outer) || tag != 0x30 || input.length ||
-        !der_next(&outer,&tag,&tbs) || tag != 0x30) return 0;
-    if (tbs.length && tbs.data[0] == 0xa0 && !der_next(&tbs,&tag,&field)) return 0;
-    static const unsigned char expected[] = {2,0x30,0x30,0x30};
+    if (!der_next(&input, &tag, &outer) || tag != 0x30 || input.length ||
+        !der_next(&outer, &tag, &tbs) || tag != 0x30)
+        return 0;
+    if (tbs.length && tbs.data[0] == 0xa0 && !der_next(&tbs, &tag, &field))
+        return 0;
+    static const unsigned char expected[] = {2, 0x30, 0x30, 0x30};
     for (size_t i = 0; i < sizeof(expected); i++) {
-        if (!der_next(&tbs,&tag,&field) || tag != expected[i]) return 0;
+        if (!der_next(&tbs, &tag, &field) || tag != expected[i])
+            return 0;
     }
     validity = field;
     long long before, after;
-    if (!der_next(&validity,&tag,&field) || !certificate_time(tag,field,&before) ||
-        !der_next(&validity,&tag,&field) || !certificate_time(tag,field,&after) || validity.length ||
-        before > now || after <= now || before >= after) return 0;
+    if (!der_next(&validity, &tag, &field) || !certificate_time(tag, field, &before) ||
+        !der_next(&validity, &tag, &field) || !certificate_time(tag, field, &after) ||
+        validity.length || before > now || after <= now || before >= after)
+        return 0;
     return after;
 }
 
 long long minyar_tlsverify_currentCertificateExpiry(const MinyarBytes *chain) {
     CertBytes certificates[MAX_CHAIN];
-    int count = unpack_chain(chain,certificates);
+    int count = unpack_chain(chain, certificates);
     long long now = minyar_tlsverify_currentTimeMilliseconds(), expires = INT64_MAX;
-    if (count < 1 || now < 1) return 0;
+    if (count < 1 || now < 1)
+        return 0;
     for (int i = 0; i < count; i++) {
-        long long bound = certificate_expiry(certificates[i],now);
-        if (!bound) return 0;
-        if (bound < expires) expires = bound;
+        long long bound = certificate_expiry(certificates[i], now);
+        if (!bound)
+            return 0;
+        if (bound < expires)
+            expires = bound;
     }
     return expires;
 }
+
+/* Native ephemeral P-256 key agreement for TLS 1.3 secp256r1 key shares.
+ * Private encodings are provider-owned bytes, never a global key registry.
+ * The peer must be exactly the RFC 8446 uncompressed SEC1 point. */
+#ifdef __APPLE__
+static SecKeyRef p256_apple_key(const MinyarBytes *data, bool private_key) {
+    if (data->byte_length != (private_key ? 97 : 65) || data->bytes[0] != 4)
+        return NULL;
+    int bits = 256;
+    CFNumberRef size = CFNumberCreate(NULL, kCFNumberIntType, &bits);
+    const void *keys[] = {kSecAttrKeyType, kSecAttrKeyClass, kSecAttrKeySizeInBits};
+    const void *values[] = {kSecAttrKeyTypeECSECPrimeRandom,
+                            private_key ? kSecAttrKeyClassPrivate : kSecAttrKeyClassPublic, size};
+    CFDictionaryRef attributes =
+        size ? CFDictionaryCreate(NULL, keys, values, 3, &kCFTypeDictionaryKeyCallBacks,
+                                  &kCFTypeDictionaryValueCallBacks)
+             : NULL;
+    CFDataRef bytes = attributes ? CFDataCreate(NULL, data->bytes, data->byte_length) : NULL;
+    SecKeyRef key = bytes ? SecKeyCreateWithData(bytes, attributes, NULL) : NULL;
+    if (bytes)
+        CFRelease(bytes);
+    if (attributes)
+        CFRelease(attributes);
+    if (size)
+        CFRelease(size);
+    return key;
+}
+static void p256_apple_export(MinyarBytes *output, SecKeyRef key, size_t expected) {
+    CFDataRef data = key ? SecKeyCopyExternalRepresentation(key, NULL) : NULL;
+    if (data && CFDataGetLength(data) == (CFIndex)expected && CFDataGetBytePtr(data)[0] == 4)
+        memcpy(minyar_bytes_extend(output, expected), CFDataGetBytePtr(data), expected);
+    if (data)
+        CFRelease(data);
+}
+MinyarBytes *minyar_tlsverify_p256Key(void) {
+    MinyarBytes *output = minyar_bytes_new(0);
+    int bits = 256;
+    CFNumberRef size = CFNumberCreate(NULL, kCFNumberIntType, &bits);
+    const void *keys[] = {kSecAttrKeyType, kSecAttrKeySizeInBits};
+    const void *values[] = {kSecAttrKeyTypeECSECPrimeRandom, size};
+    CFDictionaryRef attributes =
+        size ? CFDictionaryCreate(NULL, keys, values, 2, &kCFTypeDictionaryKeyCallBacks,
+                                  &kCFTypeDictionaryValueCallBacks)
+             : NULL;
+    SecKeyRef key = attributes ? SecKeyCreateRandomKey(attributes, NULL) : NULL;
+    p256_apple_export(output, key, 97);
+    if (key)
+        CFRelease(key);
+    if (attributes)
+        CFRelease(attributes);
+    if (size)
+        CFRelease(size);
+    return output;
+}
+MinyarBytes *minyar_tlsverify_p256Public(const MinyarBytes *private_key) {
+    MinyarBytes *output = minyar_bytes_new(0);
+    SecKeyRef key = p256_apple_key(private_key, true);
+    SecKeyRef public_key = key ? SecKeyCopyPublicKey(key) : NULL;
+    p256_apple_export(output, public_key, 65);
+    if (public_key)
+        CFRelease(public_key);
+    if (key)
+        CFRelease(key);
+    return output;
+}
+MinyarBytes *minyar_tlsverify_p256(const MinyarBytes *private_key, const MinyarBytes *public_key) {
+    MinyarBytes *output = minyar_bytes_new(0);
+    SecKeyRef local = p256_apple_key(private_key, true);
+    SecKeyRef peer = p256_apple_key(public_key, false);
+    CFDictionaryRef parameters = CFDictionaryCreate(
+        NULL, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFDataRef shared =
+        local && peer && parameters &&
+                SecKeyIsAlgorithmSupported(local, kSecKeyOperationTypeKeyExchange,
+                                           kSecKeyAlgorithmECDHKeyExchangeStandard)
+            ? SecKeyCopyKeyExchangeResult(local, kSecKeyAlgorithmECDHKeyExchangeStandard, peer,
+                                          parameters, NULL)
+            : NULL;
+    if (shared && CFDataGetLength(shared) == 32)
+        memcpy(minyar_bytes_extend(output, 32), CFDataGetBytePtr(shared), 32);
+    if (shared)
+        CFRelease(shared);
+    if (parameters)
+        CFRelease(parameters);
+    if (peer)
+        CFRelease(peer);
+    if (local)
+        CFRelease(local);
+    return output;
+}
+#elif defined(_WIN32)
+static BCRYPT_KEY_HANDLE p256_windows_private(BCRYPT_ALG_HANDLE provider,
+                                              const MinyarBytes *bytes) {
+    if (bytes->byte_length != sizeof(BCRYPT_ECCKEY_BLOB) + 96)
+        return NULL;
+    BCRYPT_ECCKEY_BLOB header;
+    memcpy(&header, bytes->bytes, sizeof(header));
+    if (header.dwMagic != BCRYPT_ECDH_PRIVATE_P256_MAGIC || header.cbKey != 32)
+        return NULL;
+    BCRYPT_KEY_HANDLE key = NULL;
+    if (BCryptImportKeyPair(provider, NULL, BCRYPT_ECCPRIVATE_BLOB, &key, (PUCHAR)bytes->bytes,
+                            (ULONG)bytes->byte_length, 0) < 0)
+        return NULL;
+    return key;
+}
+MinyarBytes *minyar_tlsverify_p256Key(void) {
+    MinyarBytes *output = minyar_bytes_new(0);
+    BCRYPT_ALG_HANDLE provider = NULL;
+    BCRYPT_KEY_HANDLE key = NULL;
+    unsigned char encoded[sizeof(BCRYPT_ECCKEY_BLOB) + 96];
+    ULONG size = 0;
+    if (BCryptOpenAlgorithmProvider(&provider, BCRYPT_ECDH_P256_ALGORITHM, NULL, 0) >= 0 &&
+        BCryptGenerateKeyPair(provider, &key, 256, 0) >= 0 && BCryptFinalizeKeyPair(key, 0) >= 0 &&
+        BCryptExportKey(key, NULL, BCRYPT_ECCPRIVATE_BLOB, encoded, sizeof(encoded), &size, 0) >=
+            0 &&
+        size == sizeof(encoded))
+        memcpy(minyar_bytes_extend(output, size), encoded, size);
+    SecureZeroMemory(encoded, sizeof(encoded));
+    if (key)
+        BCryptDestroyKey(key);
+    if (provider)
+        BCryptCloseAlgorithmProvider(provider, 0);
+    return output;
+}
+MinyarBytes *minyar_tlsverify_p256Public(const MinyarBytes *private_key) {
+    MinyarBytes *output = minyar_bytes_new(0);
+    BCRYPT_ALG_HANDLE provider = NULL;
+    BCRYPT_KEY_HANDLE key = NULL;
+    unsigned char encoded[sizeof(BCRYPT_ECCKEY_BLOB) + 64];
+    ULONG size = 0;
+    if (BCryptOpenAlgorithmProvider(&provider, BCRYPT_ECDH_P256_ALGORITHM, NULL, 0) >= 0 &&
+        (key = p256_windows_private(provider, private_key)) &&
+        BCryptExportKey(key, NULL, BCRYPT_ECCPUBLIC_BLOB, encoded, sizeof(encoded), &size, 0) >=
+            0 &&
+        size == sizeof(encoded)) {
+        unsigned char *point = minyar_bytes_extend(output, 65);
+        point[0] = 4;
+        memcpy(point + 1, encoded + sizeof(BCRYPT_ECCKEY_BLOB), 64);
+    }
+    if (key)
+        BCryptDestroyKey(key);
+    if (provider)
+        BCryptCloseAlgorithmProvider(provider, 0);
+    return output;
+}
+MinyarBytes *minyar_tlsverify_p256(const MinyarBytes *private_key, const MinyarBytes *public_key) {
+    MinyarBytes *output = minyar_bytes_new(0);
+    if (public_key->byte_length != 65 || public_key->bytes[0] != 4)
+        return output;
+    BCRYPT_ALG_HANDLE provider = NULL;
+    BCRYPT_KEY_HANDLE local = NULL, peer = NULL;
+    BCRYPT_SECRET_HANDLE agreement = NULL;
+    unsigned char encoded[sizeof(BCRYPT_ECCKEY_BLOB) + 64], shared[32];
+    BCRYPT_ECCKEY_BLOB header = {BCRYPT_ECDH_PUBLIC_P256_MAGIC, 32};
+    memcpy(encoded, &header, sizeof(header));
+    memcpy(encoded + sizeof(header), public_key->bytes + 1, 64);
+    ULONG size = 0;
+    if (BCryptOpenAlgorithmProvider(&provider, BCRYPT_ECDH_P256_ALGORITHM, NULL, 0) >= 0 &&
+        (local = p256_windows_private(provider, private_key)) &&
+        BCryptImportKeyPair(provider, NULL, BCRYPT_ECCPUBLIC_BLOB, &peer, encoded, sizeof(encoded),
+                            0) >= 0 &&
+        BCryptSecretAgreement(local, peer, &agreement, 0) >= 0 &&
+        BCryptDeriveKey(agreement, BCRYPT_KDF_RAW_SECRET, NULL, shared, sizeof(shared), &size, 0) >=
+            0 &&
+        size == 32) {
+        unsigned char *big_endian = minyar_bytes_extend(output, 32);
+        for (size_t i = 0; i < 32; i++)
+            big_endian[i] = shared[31 - i];
+    }
+    SecureZeroMemory(shared, sizeof(shared));
+    if (agreement)
+        BCryptDestroySecret(agreement);
+    if (peer)
+        BCryptDestroyKey(peer);
+    if (local)
+        BCryptDestroyKey(local);
+    if (provider)
+        BCryptCloseAlgorithmProvider(provider, 0);
+    return output;
+}
+#else
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#include <openssl/core_names.h>
+#include <openssl/params.h>
+#endif
+static EVP_PKEY *p256_unix_private(const MinyarBytes *bytes) {
+    if (bytes->byte_length <= 0 || bytes->byte_length > 1024 ||
+        !exact_der(bytes->bytes, (size_t)bytes->byte_length))
+        return NULL;
+    const unsigned char *cursor = bytes->bytes;
+    EVP_PKEY *key = d2i_AutoPrivateKey(NULL, &cursor, (long)bytes->byte_length);
+    bool valid =
+        key && cursor == bytes->bytes + bytes->byte_length && EVP_PKEY_base_id(key) == EVP_PKEY_EC;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    char group[80];
+    size_t length = 0;
+    valid = valid && EVP_PKEY_get_group_name(key, group, sizeof(group), &length) == 1 &&
+            !strcmp(group, "prime256v1");
+#else
+    EC_KEY *ec = valid ? EVP_PKEY_get1_EC_KEY(key) : NULL;
+    valid = ec && EC_GROUP_get_curve_name(EC_KEY_get0_group(ec)) == NID_X9_62_prime256v1 &&
+            EC_KEY_check_key(ec) == 1;
+    EC_KEY_free(ec);
+#endif
+    EVP_PKEY_CTX *check = valid ? EVP_PKEY_CTX_new(key, NULL) : NULL;
+    valid = check && EVP_PKEY_private_check(check) == 1;
+    EVP_PKEY_CTX_free(check);
+    if (!valid) {
+        EVP_PKEY_free(key);
+        key = NULL;
+    }
+    return key;
+}
+MinyarBytes *minyar_tlsverify_p256Key(void) {
+    MinyarBytes *output = minyar_bytes_new(0);
+    EVP_PKEY_CTX *context = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL);
+    EVP_PKEY *key = NULL;
+    if (context && EVP_PKEY_keygen_init(context) == 1 &&
+        EVP_PKEY_CTX_set_ec_paramgen_curve_nid(context, NID_X9_62_prime256v1) == 1 &&
+        EVP_PKEY_keygen(context, &key) == 1) {
+        int size = i2d_PrivateKey(key, NULL);
+        if (size > 0 && size <= 1024) {
+            unsigned char encoded[1024], *cursor = encoded;
+            if (i2d_PrivateKey(key, &cursor) == size)
+                memcpy(minyar_bytes_extend(output, size), encoded, size);
+            OPENSSL_cleanse(encoded, sizeof(encoded));
+        }
+    }
+    EVP_PKEY_free(key);
+    EVP_PKEY_CTX_free(context);
+    return output;
+}
+MinyarBytes *minyar_tlsverify_p256Public(const MinyarBytes *private_key) {
+    MinyarBytes *output = minyar_bytes_new(0);
+    EVP_PKEY *key = p256_unix_private(private_key);
+    unsigned char point[65];
+    size_t size = 0;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    bool valid = key && EVP_PKEY_get_octet_string_param(key, OSSL_PKEY_PARAM_PUB_KEY, point,
+                                                        sizeof(point), &size) == 1;
+#else
+    EC_KEY *ec = key ? EVP_PKEY_get1_EC_KEY(key) : NULL;
+    size = ec ? EC_POINT_point2oct(EC_KEY_get0_group(ec), EC_KEY_get0_public_key(ec),
+                                   POINT_CONVERSION_UNCOMPRESSED, point, sizeof(point), NULL)
+              : 0;
+    bool valid = ec && size == 65;
+    EC_KEY_free(ec);
+#endif
+    if (valid && size == 65 && point[0] == 4)
+        memcpy(minyar_bytes_extend(output, 65), point, 65);
+    EVP_PKEY_free(key);
+    return output;
+}
+MinyarBytes *minyar_tlsverify_p256(const MinyarBytes *private_key, const MinyarBytes *public_key) {
+    MinyarBytes *output = minyar_bytes_new(0);
+    if (public_key->byte_length != 65 || public_key->bytes[0] != 4)
+        return output;
+    EVP_PKEY *local = p256_unix_private(private_key), *peer = NULL;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    EVP_PKEY_CTX *decoder = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL);
+    char group[] = "prime256v1";
+    OSSL_PARAM parameters[] = {
+        OSSL_PARAM_construct_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME, group, 0),
+        OSSL_PARAM_construct_octet_string(OSSL_PKEY_PARAM_PUB_KEY, (void *)public_key->bytes, 65),
+        OSSL_PARAM_construct_end()};
+    if (!decoder || EVP_PKEY_fromdata_init(decoder) != 1 ||
+        EVP_PKEY_fromdata(decoder, &peer, EVP_PKEY_PUBLIC_KEY, parameters) != 1) {
+        EVP_PKEY_free(peer);
+        peer = NULL;
+    }
+    EVP_PKEY_CTX_free(decoder);
+#else
+    EC_KEY *ec = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+    const unsigned char *cursor = public_key->bytes;
+    if (ec && o2i_ECPublicKey(&ec, &cursor, 65) && cursor == public_key->bytes + 65 &&
+        EC_KEY_check_key(ec) == 1) {
+        peer = EVP_PKEY_new();
+        if (!peer || EVP_PKEY_assign_EC_KEY(peer, ec) != 1) {
+            EVP_PKEY_free(peer);
+            peer = NULL;
+        } else
+            ec = NULL;
+    }
+    EC_KEY_free(ec);
+#endif
+    EVP_PKEY_CTX *check = peer ? EVP_PKEY_CTX_new(peer, NULL) : NULL;
+    bool valid = check && EVP_PKEY_public_check(check) == 1;
+    EVP_PKEY_CTX_free(check);
+    EVP_PKEY_CTX *agreement = local && valid ? EVP_PKEY_CTX_new(local, NULL) : NULL;
+    unsigned char shared[32];
+    size_t size = sizeof(shared);
+    if (agreement && EVP_PKEY_derive_init(agreement) == 1 &&
+        EVP_PKEY_derive_set_peer(agreement, peer) == 1 &&
+        EVP_PKEY_derive(agreement, shared, &size) == 1 && size == 32)
+        memcpy(minyar_bytes_extend(output, 32), shared, 32);
+    OPENSSL_cleanse(shared, sizeof(shared));
+    EVP_PKEY_CTX_free(agreement);
+    EVP_PKEY_free(peer);
+    EVP_PKEY_free(local);
+    return output;
+}
+#endif
