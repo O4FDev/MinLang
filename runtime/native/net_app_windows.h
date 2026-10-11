@@ -159,7 +159,11 @@ static void net_app_windows_polled(NetLoop *loop, const MinyarBytes *result) {
          * stale records on an empty later poll, retaining unemitted ready nodes. */
         if (node->polled || (loop->app_socket_snapshot && !node->ready && signaled)) {
             node->polled = false;
-            if (WSAEventSelect(node->socket, node->event, node->interests))
+            /* A new registration does not acknowledge the old Winsock
+             * record. Copy/clear it and reset its event atomically, so consumed
+             * readiness cannot repeatedly wake the GUI or erase a new event. */
+            WSANETWORKEVENTS events;
+            if (WSAEnumNetworkEvents(node->socket, node->event, &events))
                 SetEvent(loop->app_event);
         }
         SetThreadpoolWait(node->wait, node->event, NULL);
