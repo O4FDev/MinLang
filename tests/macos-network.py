@@ -152,3 +152,39 @@ int main(void) { @autoreleasepool {
                             fixture, runtime, '-framework', 'AppKit', '-o', executable], check=True)
             subprocess.run([executable], check=True, timeout=30,
                            env=dict(os.environ, ASAN_OPTIONS='detect_leaks=0', UBSAN_OPTIONS='halt_on_error=1'))
+
+    # Exercise actual anonymous captures through the public launcher. The
+    # producer's locals are gone before AppKit sleeps; bounded compiler polls
+    # cannot finish these thousands of dropped cycles in the few following
+    # statements. No timer or callback dispatch is present to wake the app.
+    capture_source = temp/'capture-contract.min'
+    capture_source.write_text('''use "macos" as macos
+use "net" as net
+record Node { value: Integer; callbacks: List<Callback<Integer, Integer>> }
+function abandonCapturedCycles() {
+    let held: List<Node> = []
+    for index in 0..4096 {
+        let node = Node { value: index; callbacks: [] }
+        let callback = function(delta: Integer): Integer { return node.value + delta }
+        node.callbacks.add(callback)
+        held.add(node)
+        if callback(1) != index + 1 { fail("capture value changed") }
+    }
+}
+macos.initialize("public captured cycle cleanup")
+macos.accessory(true)
+for index in 0..16 { macos.nextEvent(0.0) }
+abandonCapturedCycles()
+let started = net.monotonicMilliseconds()
+if !macos.nextEvent(0.4) { fail("AppKit stopped before cleanup") }
+let elapsed = net.monotonicMilliseconds() - started
+if elapsed >= 200 { fail("AppKit blocked with dropped captures") }
+print("public launcher services captured cycles before AppKit sleep")
+''')
+    for mode in ['--debug', '--release']:
+        executable = temp/('capture-contract-'+mode[2:])
+        subprocess.run([ROOT/'minyar', mode, '--cleanup-budget', '1',
+                        capture_source, '-o', executable], check=True, timeout=180)
+        result = subprocess.run([executable], check=True, capture_output=True,
+                                text=True, timeout=30)
+        assert result.stdout == 'public launcher services captured cycles before AppKit sleep\n', result
