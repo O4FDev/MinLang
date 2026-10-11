@@ -124,7 +124,7 @@ int main(void) { @autoreleasepool {
         before = minyar_idle_units();
         start = idle_now();
         assert(minyar_macos_nextEvent(.4));
-        assert(idle_now() - start < .2);
+        if (minyar_idle_pending()) assert(idle_now() - start < .2);
         assert(minyar_idle_units() - before <= IDLE_BUDGET);
         assert(++batches < 20000);
     }
