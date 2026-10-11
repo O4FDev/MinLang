@@ -86,17 +86,18 @@ public function write(session: Session, id: Integer, data: Bytes, fin: Boolean):
     if stream.reset || stream.sendClosed { return errors.integerFailure(errors.make(errors.closedCode(), 0, "yamux stream is reset or send-closed")) }
     // Reserve one reset header per live slot; other streams' data cannot
     // prevent flow-independent cancellation. The total buffer cap is unchanged.
-    let frames = max(1, (data.length + 65535) / 65536)
+    let frames = (data.length + 65535) / 65536; if fin { frames += 1 }
     if data.length > stream.sendWindow || data.length > 1048576 || data.length + frames * 12 > 1048576 - 128 * 12 - session.outgoing.length {
         return errors.integerFailure(errors.make(errors.wouldBlockCode(), 0, "yamux flow credit or buffer exhausted"))
     }
     let at = 0
-    while at < data.length || (fin && data.length == 0) {
-        let size = min(65536, data.length - at); let flags = 0
-        if fin && at + size == data.length { flags = 4 }
-        emit(session, 0, flags, id, size, data.slice(at, at + size)); at += size
-        if size == 0 { break }
+    while at < data.length {
+        let size = min(65536, data.length - at)
+        emit(session, 0, 0, id, size, data.slice(at, at + size)); at += size
     }
+    // Deliver every DATA payload before making EOF visible. Pinned Go
+    // peers process flags before acquiring their DATA receive lock.
+    if fin { emit(session, 1, 4, id, 0, Bytes()) }
     stream.sendWindow -= data.length; if fin { stream.sendClosed = true }; retire(stream)
     return errors.integer(data.length)
 }
