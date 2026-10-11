@@ -106,18 +106,24 @@ static void tcp_outcomes(void) {
      * a later TCP operation. Enabling it does not change blocking policy. */
     for (int enabled = 0; enabled < 4; enabled++) {
         expect_status(minyar_net_setNoDelayResult(server, (enabled & 1) != 0), 0);
-        /* Winsock returns one byte for Boolean options. Poison the value\n         * without
-         * leaving stale high bytes when that byte is replaced. */\n        int value = 255;
+        /* Winsock returns one byte for Boolean options. Poison the low byte
+         * without leaving stale high bytes when that byte is replaced. */
+        int value = 255;
 #ifdef _WIN32
         int size = sizeof(value);
         assert(!getsockopt((SOCKET)server, IPPROTO_TCP, TCP_NODELAY, (char *)&value, &size));
-        \n assert(size == 1 || size == sizeof(value));
+        assert(size == 1 || size == sizeof(value));
 #else
         socklen_t size = sizeof(value);
         assert(!getsockopt((int)server, IPPROTO_TCP, TCP_NODELAY, &value, &size));
-        \n assert(size == sizeof(value));
+        assert(size == sizeof(value));
 #endif
+#ifdef __APPLE__
+        /* XNU exposes its TF_NODELAY bit (0x4), rather than normalized 1. */
+        assert(value == ((enabled & 1) ? 4 : 0));
+#else
         assert(value == (enabled & 1));
+#endif
     }
     MinyarBytes *option_failure = minyar_net_setNoDelayResult(-1, true);
     assert(word(option_failure, 0) == 3 && word(option_failure, 4));
