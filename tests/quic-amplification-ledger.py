@@ -17,7 +17,8 @@ CASES=("exact3x","one-byte-over","forged-handshake","invalid-handshake-frame","c
        "route-credit-isolated","connection-credit-isolated","unknown-cid","cross-connection-coalescing",
        "capture-duplicate","real-retransmission","truncated-pcap","pcapng","big-endian-pcap",
        "ipv6","aes256-handshake","chacha-handshake","rfc-chacha-vector","peer-policy-unknown",
-       "server-before-credit","missing-authenticated-boundary","closing-handshake","ack-never-sent","ack-issued-handshake","missing-server-keylog","pcapng-capture-loss","pcapng-dropcount","pcapng-multiple-interface")
+       "server-before-credit","missing-authenticated-boundary","closing-handshake","ack-never-sent","ack-issued-handshake","missing-server-keylog","pcapng-capture-loss","pcapng-dropcount","pcapng-multiple-interface","handshake-replay-same-route","handshake-replay-new-route",
+       "fresh-handshake-new-route","nonminimal-frame-type","crypto-end-overflow","crypto-wide-length")
 CLIENT=b"client01";SERVER=b"server01";ORIGINAL=b"original"
 SECRET=bytes(range(32));RANDOM=bytes(range(32,64))
 CLIENT2=b"client02";SERVER2=b"server02"
@@ -50,14 +51,14 @@ def fixture_expand(secret,label,size,sha384=False):
     return HKDFExpand(algorithm=hashes.SHA384() if sha384 else hashes.SHA256(),length=size,info=info).derive(secret)
 
 
-def handshake(secret=SECRET,client=CLIENT,server=SERVER,suite="AES128",payload=b"\x01\0\0\0",direction="client"):
+def handshake(secret=SECRET,client=CLIENT,server=SERVER,suite="AES128",payload=b"\x01\0\0\0",direction="client",packet_number=0):
     destination=server if direction=="client" else client
     source=client if direction=="client" else server
     chacha=suite=="CHACHA20";sha384=suite=="AES256";size=32 if chacha or sha384 else 16
-    pn=b"\0\0"
+    pn=packet_number.to_bytes(2,"big")
     header=b"\xe1"+bytes([0,0,0,1,len(destination)])+destination+bytes([len(source)])+source+number(len(pn)+len(payload)+16)
     key=fixture_expand(secret,b"quic key",size,sha384);iv=fixture_expand(secret,b"quic iv",12,sha384)
-    ciphertext=(ChaCha20Poly1305(key) if chacha else AESGCM(key)).encrypt(iv,payload,header+pn)
+    ciphertext=(ChaCha20Poly1305(key) if chacha else AESGCM(key)).encrypt((int.from_bytes(iv,"big")^packet_number).to_bytes(12,"big"),payload,header+pn)
     packet=bytearray(header+pn+ciphertext);offset=len(header)
     hp=fixture_expand(secret,b"quic hp",size,sha384);sample=bytes(packet[offset+4:offset+20])
     cipher=Cipher(algorithms.ChaCha20(hp,sample),None) if chacha else Cipher(algorithms.AES(hp),modes.ECB())
@@ -120,6 +121,19 @@ def fixtures(case):
         sequence=sequence[:4]+[("client",bad,12345),("server",short(3*len(bad)+1),12345)]
         expected="failed"
         if case=="ack-never-sent":logs+=keylog(bytes(range(128,160)),direction="SERVER")
+    elif case in ("handshake-replay-same-route","handshake-replay-new-route","fresh-handshake-new-route"):
+        rebound=12345 if case=="handshake-replay-same-route" else 12346
+        next_hs=handshake(packet_number=1) if case=="fresh-handshake-new-route" else hs
+        sequence=[("client",initial(),12345),("server",initial(direction="server"),12345),
+                  ("client",hs,12345),("client",next_hs,rebound)]
+        if case=="handshake-replay-new-route":
+            sequence.append(("server",short(3*len(hs)+1),12346));expected="failed"
+        elif case=="fresh-handshake-new-route":sequence.append(("server",short(5000),12346))
+    elif case in ("nonminimal-frame-type","crypto-end-overflow","crypto-wide-length"):
+        plaintext=b"\x40\x01\0\0" if case=="nonminimal-frame-type" else b"\x06"+bytes([255])*8+b"\x01z" if case=="crypto-end-overflow" else b"\x06\x40\0\x40\x01z\0"
+        candidate=handshake(payload=plaintext)
+        sequence=sequence[:4]+[("client",candidate,12345),("server",short(3*len(candidate)+1),12345)]
+        expected="passed" if case=="crypto-wide-length" else "failed"
     elif case=="coalesced-once":
         combined=initial()+initial(200,kind=1)
         sequence=[("client",initial(),12345),("server",initial(direction="server"),12345),
@@ -192,6 +206,21 @@ def run_case(case):
         if row["udp_payload_bytes"]!=1400 or row["received"]!=2600:raise AssertionError("coalesced UDP was counted more than once")
     if case=="connection-credit-isolated" and report["status"]=="failed":
         if report["connection_count"]!=2 or report["violations"]!=[3]:raise AssertionError("cross-connection credit was shared")
+    if case.startswith("handshake-replay") and "rows" in report:
+        row=report["rows"][3]
+        report["control_checks"]={
+            "first_boundary_retained":report["authenticated_boundaries"]==[2],
+            "replay_cannot_release_boundary":row["authentication"] is None,
+            "replay_udp_credit_counted":row["received"]==(1200+2*len(handshake()) if case.endswith("same-route") else len(handshake())),
+            "rebound_stays_unvalidated":case.endswith("same-route") or not row["validated_after"],
+        }
+    if case=="fresh-handshake-new-route" and "rows" in report:
+        report["control_checks"]={"distinct_packet_validates_new_route":report["authenticated_boundaries"]==[2,3]}
+    if case in ("nonminimal-frame-type","crypto-end-overflow") and "rows" in report:
+        report["control_checks"]={
+            "invalid_plaintext_not_boundary":report["rows"][4]["authentication"] is None,
+            "discarded_udp_credit_counted":report["rows"][4]["received"]==1200+len(handshake(payload=b"\x40\x01\0\0" if case=="nonminimal-frame-type" else b"\x06"+bytes([255])*8+b"\x01z")),
+        }
     return data,logs,report,expected
 
 
@@ -209,7 +238,7 @@ def main():
             data,logs,report,expected=run_case(case)
             (target/"trace.pcap").write_bytes(data);(target/"client.keys").write_bytes(logs)
             (target/"ledger.json").write_text(json.dumps(report,indent=2)+"\n")
-            results.append({"case":case,"status":report["status"],"expected":expected,"matched":report["status"]==expected})
+            results.append({"case":case,"status":report["status"],"expected":expected,"matched":report["status"]==expected and all(report.get("control_checks",{}).values())})
         passed=all(row["matched"] for row in results)
         inputs={str(path.resolve()):ledger.sha(path.read_bytes()) for path in (Path(__file__),Path(ledger.__file__))}
         report={"schema_version":1,"scope":"synthetic capture and independent accounting controls only","status":"passed" if passed else "failed","inputs":inputs,"crypto_provider":ledger.crypto_provider(),"declared_cases":list(cases),"results":results}

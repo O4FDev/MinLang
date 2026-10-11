@@ -220,7 +220,8 @@ def decoded_frames(data):
     if not data:return None
     try:
         while at<len(data):
-            kind,at=varint(data,at);types.append(kind)
+            type_start=at;kind,at=varint(data,at);types.append(kind)
+            if at-type_start!=1:return None
             if kind in (0,1):continue
             if kind in (2,3):
                 largest,at=varint(data,at);delay,at=varint(data,at);ranges,at=varint(data,at);first,at=varint(data,at)
@@ -234,7 +235,9 @@ def decoded_frames(data):
                 if kind==3:
                     for _ in range(3):_,at=varint(data,at)
             elif kind==6:
-                offset,at=varint(data,at);size,at=varint(data,at);need(data,at,size);at+=size
+                offset,at=varint(data,at);size,at=varint(data,at)
+                if offset+size>=1<<62:return None
+                need(data,at,size);at+=size
             elif kind==0x1c:
                 error,at=varint(data,at);frame,at=varint(data,at);size,at=varint(data,at);need(data,at,size);at+=size;closed=True
             else:return None
@@ -244,7 +247,7 @@ def decoded_frames(data):
 
 class HandshakeKeys:
     def __init__(self, logs):
-        self.secrets={};self.largest={}
+        self.secrets={};self.largest={};self.processed=set()
         for data in logs:
             for line in data.decode("ascii").splitlines():
                 if not line or line.startswith("#"):continue
@@ -286,7 +289,9 @@ class HandshakeKeys:
                 frames=decoded_frames(plaintext)
                 if frames is None:continue
                 self.largest[(connection,direction,identity)]=max(largest,number)
-                return {"key_identifier":identity,"suite":suite,"packet_number":number,**frames}
+                processed=(connection,direction,identity,number)
+                duplicate=processed in self.processed;self.processed.add(processed)
+                return {"key_identifier":identity,"suite":suite,"packet_number":number,"duplicate":duplicate,**frames}
         return None
 
 
@@ -393,7 +398,9 @@ def analyze(capture_bytes,keylogs,server_addresses,port=443,policy="peer-unknown
                 if found["ack_ranges"] and (("server",found["key_identifier"]) not in keys.secrets or connection in uncertain_handshake):
                     limitations.append("server-handshake-ack-ownership-unproved")
                 owns_ack=all(high-low+1<=len(known) and all(number in known for number in range(low,high+1)) for low,high in found["ack_ranges"])
-                if found["closing"] or connection in closing_connections:
+                if found["duplicate"]:
+                    rejected.append("already-processed-handshake-packet")
+                elif found["closing"] or connection in closing_connections:
                     rejected.append("authenticated-closing-packet")
                 elif not owns_ack:
                     rejected.append("unknown-handshake-ack-ownership")
