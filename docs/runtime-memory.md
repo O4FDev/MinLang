@@ -10,11 +10,11 @@ and operations outside that budget; it is not a wall-clock deadline.
 
 ## Recursive data and cycle prevention
 
-The following proof describes ordinary untraced allocation. The isolated
-managed-graphs candidate adds a parsed optional frontend for cycle-capable
-mutation and typed closures; those programs use a separate traced runtime and
-exact hidden capture edges. They do not use this no-cycles proof. See
-[the candidate's ownership and execution-domain contract](managed-graphs.md).
+The following proof describes ordinary untraced allocation. The optional
+managed-graph frontend supports cycle-capable mutation and typed closures.
+Activated type components use a separate traced runtime with exact hidden
+capture edges; they do not use this no-cycles proof. See
+[the graph ownership and execution-domain contract](managed-graphs.md).
 The ordinary compiler's cycle checks request that frontend with status 86
 instead of emitting an unsafe edge. Programs that require no such feature
 retain the original LLVM and runtime allocation representation.
@@ -75,11 +75,59 @@ while its inputs are evaluated, none of them can already point back to it; the
 first-cycle proof therefore still holds. This supports dynamic bottom-up tree
 construction, at linear cost per append, without weakening the mutation rule.
 
-Arbitrary cyclic graphs remain unsupported. Integer identifiers in a List of
-records remain an option; see [`examples/graph.min`](../examples/graph.min).
-Inferred lifetime regions and permissive mutation analysis are not implemented.
-Dynamic types, closures, foreign pointers or changes to the type encoding must
-revisit this proof before being added.
+Arbitrary cycles are unsupported by this ordinary allocation path. Programs
+that need them select the optional graph frontend described below. Integer
+identifiers remain an option without that extension; see
+[`examples/graph.min`](../examples/graph.min). Inferred lifetime regions and
+permissive mutation analysis are not implemented. This proof does not cover
+closure capture edges or raw foreign-pointer mutation. New dynamic types or
+changes to the type encoding must establish their own ownership argument.
+
+## Closures, cycles and execution domains
+
+Typed callbacks use `Callback<ArgumentTypes..., ReturnType>` and anonymous
+`function(...)[: ReturnType] { ... }` values. Their environments own exact
+capture fields: scalar captures are snapshots and reference captures preserve
+aliases. Captured bindings cannot be rebound; a captured record can hold
+mutable state. Callback calls use the ordinary owned/borrowed convention.
+
+The optional frontend includes environment and callback edges in its type
+analysis. Cycle-capable mutation activates the relevant strongly connected
+type component, with traced allocations, owning-slot barriers and a bounded
+snapshot collector. Unrelated acyclic components remain untraced. A traced
+allocation adds 32 metadata bytes before the ordinary RC header, plus allocator
+rounding. Cycles have real storage and collection costs; ordinary programs do
+not acquire atomic counts or dormant collector checks.
+
+Managed heaps remain single-owner. A callback carries its creator's execution
+domain and rejects foreign-domain entry before touching ownership or stack
+state. Atomic allocation of domain identities does not make a heap shareable.
+`workers` provides concurrency through subprocesses and bounded copied Bytes
+messages, with a separate heap, caches and ownership frames in each process.
+It does not transfer managed pointers or implement shared managed threads.
+The scalar-only parallel ABI also excludes managed arguments and results.
+
+`eventcallbacks.dispatch(dispatcher, timeoutMs, maximum)` runs callbacks on
+that owner thread. Its private wait policy first services exactly the selected
+cleanup budget. Ordinary retirement debt requests an immediate readiness poll.
+When only cycle work remains, including a partially scanned cohort, the wait
+is capped at 10 ms; a shorter requested wait stays shorter. With no debt, the
+requested wait passes through unchanged. Pending work and cursors stay queued.
+This allows idle reactors to yield while collection continues, at the cost of
+reclamation latency. For a fixed 4,096-node test graph, budget 32 required 470
+batches with at most 4.7 seconds of summed wake deadlines; budget 1 required
+18,332 batches with at most 183.31 seconds. These are deterministic deadline
+sums, not measured wall times or bounds for growing application graphs. See
+[the progress tests and tradeoff](research/cycle-reactor-progress.md).
+This wait policy belongs to `eventcallbacks.dispatch`. The separate AppKit
+`macos.nextEvent` hook services one batch and pumps input without sleeping while
+debt remains; see [the AppKit cleanup contract](macos.md#shared-socket-and-callback-loop).
+
+Typed `Result<T,E>` values use owned records with only the active payload slot
+initialized and owning. Match and early propagation preserve payload lifetimes
+and run scope cleanup; cycles through either payload follow the same optional
+graph analysis. See [the Result language contract](research/errors-language.md)
+and [the independent review](research/errors-review.md).
 
 ## Compiler/runtime ownership contract
 
@@ -165,8 +213,9 @@ Readonly identifiers cannot enter scalar-record or ownership-slot metadata.
 
 ## Representation and destruction
 
-A native heap object has an eight-byte private prefix: three kind bits and a
-reference count. A zero count denotes an immortal object. Compiler-generated
+An ordinary native heap object has an eight-byte private prefix: three kind
+bits and a reference count. Traced allocations additionally carry the metadata
+described above. A zero count denotes an immortal object. Compiler-generated
 Text globals include the same prefix and expose the payload using an LLVM
 constant offset expression. Native calls must never pass an unprefixed object
 to ownership operations.
@@ -257,5 +306,13 @@ because the underlying arena storage remains alive.
 | `make check-readonly-parameters` | Mutable fallback, alias lifetimes, and parameter boundaries |
 | `make check-compiler-slice-cache` | Collisions, eviction, Unicode, and surviving aliases |
 
+The optional graph and callback checks additionally include
+`tests/managed-graphs.py`, `tests/managed-graphs-profiles.py`,
+`tests/callbacks.py`, `tests/callback-domains.py` and `tests/cycle-progress.py`.
+Their exact reachability, object/debt and work-budget assertions complement
+application soaks; short collector tests do not establish a server's idle CPU
+or large-connection behavior.
+
 See [runtime profiles](bounded-runtime-contract.md) for incremental cleanup and
-finite-heap configuration.
+finite-heap configuration, and [the v2 verification map](v2-verification.md)
+for source-specific evidence and remaining platform checks.

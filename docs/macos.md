@@ -26,9 +26,12 @@ the same source builds a directly executable desktop program. `--app` appends
 Use your own `--bundle-id` for each application; the default is
 `org.minyar.application`. `--icon FILE.icns` sets the application icon and
 `--resources DIR` copies a directory's contents into `Contents/Resources`, for
-example fonts that the application registers with `registerFont`. It is not a
-Developer ID distribution or notarization workflow. Entitlements, universal
-binaries and App Store packaging are not supplied yet.
+example fonts that the application registers with `registerFont`. This `--app`
+path provides local ad-hoc signing. Developer ID signing,
+notarization and DMG preparation use the separate
+[release workflow](shipping.md), which requires distribution credentials.
+`--app` does not configure entitlements, universal binaries or App Store
+packaging.
 
 Existing Minyar-generated bundles can be rebuilt. The packager constructs and
 signs a complete replacement before moving the old bundle aside, and restores
@@ -264,13 +267,14 @@ References: Apple's [imported C and Objective-C APIs](https://developer.apple.co
 [NSApplication](https://developer.apple.com/documentation/appkit/nsapplication),
 and [event dispatch](https://developer.apple.com/documentation/appkit/nsapplication/nextevent(matching:until:inmode:dequeue:)).
 
-## Verification
+## Shared socket and callback loop
 
 `macos.shareNetworkLoop(handle)` attaches an `eventloop` reactor to the AppKit
 main run loop. It returns an `errors.IntegerResult`; a closed or stale handle
 is a recoverable failure. Initialize AppKit first. After `macos.nextEvent`, call
-`eventloop.wait(handle, 0, maximum)` or `eventcallbacks.dispatch` with timeout zero
-and dispatch callbacks on the main thread. `nextEvent` can return with `NONE`
+`eventloop.wait(handle, 0, maximum)`, or
+`eventcallbacks.dispatch(dispatcher, 0, maximum)` for a callback dispatcher.
+Callbacks run on the main thread. `nextEvent` can return with `NONE`
 because network readiness or a timer woke it.
 
 The adapter monitors the reactor's kqueue descriptor with Apple's
@@ -285,6 +289,12 @@ the attached reactor detaches before its descriptor is reused. The compiler
 selects this adapter only when both `macos` and `net` native packages are used.
 Ordinary network builds retain their original layout and instructions.
 
+For callback registrations, obtain the borrowed reactor handle through
+`eventcallbacks.nativeLoop(dispatcher)` and check its IntegerResult before
+attaching it. The dispatcher owns that reactor: do not close the borrowed
+handle or change its registrations through the batch API. Detach the AppKit
+observer before closing the dispatcher.
+
 When the program selects the managed graph runtime, `nextEvent` services one
 bounded collector batch before waiting. If abandoned cyclic captures still
 need work, it pumps AppKit input and returns without sleeping, so the main loop
@@ -293,6 +303,36 @@ the requested wait sleeps normally; no recurring cleanup timer remains.
 This hook is absent from ordinary applications. Native and sanitizer tests
 drop a 1,024-node capture cycle without any future network I/O or timers,
 check exact reclamation with budgets of one and 32, then check sleeping.
+
+The same [AppKit gate](../tests/macos-network.py) creates 4,096 anonymous
+capture cycles through the public launcher. Actual hosted macOS debug and
+release runs passed the cleanup-before-sleep check. The direct 1,024-node
+fixture checks exact reclamation and subsequent sleeping at budgets one and
+32, including native and sanitizer execution.
+
+This `nextEvent` hook uses the Boolean bounded service result and pumps AppKit
+without sleeping while debt remains. It is separate from the private
+`eventcallbacks.dispatch` wait policy, which caps cycle-only waits at 10 ms.
+Work budgets bound collector units, not time spent in AppKit or a callback.
+Large-graph application idle behavior still needs measurements.
+
+## Desktop services and identities
+
+The [desktop package](desktop-services.md) supplies owned, recoverable results
+for notifications, launch at login, battery/charger state and the active network
+path. Notification acceptance does not promise visual delivery, and login
+registration can require OS approval. `macos.accessory(true)` selects accessory
+activation policy; `statusItem`, `statusMenu` and `statusRemove` manage the
+menu-bar item independently of a window.
+
+The `keychain` package resolves a public certificate and an opaque persistent
+signing reference. Security.framework performs signatures without exporting
+the private key. Minyar's TLS client/server can use that reference, and
+`http.startWithIdentity` uses it with NSURLSession's OS TLS. Key access policies
+can deny use, and hardware protection depends on how the identity was created.
+See [TLS authentication](tls.md) for trust and identity limits.
+
+## Verification
 
 Run `make check-macos` in a logged-in macOS desktop session. The suite verifies
 Swift selector lowering, actual native target/action and delegate delivery,
@@ -311,3 +351,5 @@ cancellation and connection failures.
 windows. The Swift probe requires `swiftc` for verification only; application
 builds use Clang. Interactive file panels and clipboard behavior need manual
 verification; automated tests do not dismiss dialogs or alter your clipboard.
+The [v2 verification map](v2-verification.md) separates focused bridge evidence
+from full CI, production signing and application capacity measurements.
