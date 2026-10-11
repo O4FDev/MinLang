@@ -1,7 +1,7 @@
 # v2 implementation and verification map
 
 This checkpoint describes the combined implementation based on
-`3dad1e7dedded613d984858cff53301cab11e15a` at 19:33 UTC on 2026-10-11.
+`680e10bdf18f442e8d72f2880d5efd5c6317ea69` at 20:39 UTC on 2026-10-11.
 An implemented API, a passing focused suite and a complete deployment are
 separate claims. Retained results establish only their recorded source and
 configuration. Combined CI, current macOS/Windows gates, ordinary performance
@@ -75,6 +75,16 @@ byte-identical. The unchanged one-second/2% Linux idle oracle passed; Windows
 and actual device capacity are separate tests. The current 4,096-device setup
 still fails, as recorded below.
 
+A third actual-zero retirement fix now covers fresh owners during local MARK.
+The regression fell from 1,264 work units and eight restarted epochs to 24
+units and no restarted epochs under the unchanged 192-unit bound. The marker
+is issued only after a real zero-count decrement; queued remaining fields
+recheck it and fall back when a full rebuild or anchor transfer invalidates it.
+The 540 native/sanitizer cases and 23 serial safety commands passed. Ordinary
+system/default runtime objects remained identical; native and sanitizer idle
+maxima were 1.1504% and 1.1485% under the unchanged one-second/2% gate.
+This fixes neither full-build insertion nor device capacity or Windows idle.
+
 ## Recoverable errors
 
 The optional Result frontend supports explicit `Result<T,E>`,
@@ -113,7 +123,7 @@ the probe. Source-text searches do not select a frontend.
 
 | Area | Implemented source and focused checks | Verification boundary |
 | --- | --- | --- |
-| Portable TLS | `tls.min` / `tlsserver.min` drive TLS 1.3 over TCP records or QUIC CRYPTO bytes. OS trust providers build chains and check names, time, purpose and signatures; configured roots are exclusive. Mutual TLS, X25519/native P-256 key shares, delayed-handshake identity revalidation and digitalSignature key usage have native/sanitizer adversaries. | Native validation does not fetch live CRL/OCSP or missing intermediates. Literal-IP SNI regression source is prepared, but has not run or changed TLS. This is not an independent security audit or complete RFC certification. |
+| Portable TLS | `tls.min` / `tlsserver.min` drive TLS 1.3 over TCP records or QUIC CRYPTO bytes. OS trust providers build chains and check names, time, purpose and signatures; configured roots are exclusive. Mutual TLS, X25519/native P-256 key shares, delayed-handshake identity revalidation and digitalSignature key usage have native/sanitizer adversaries. Literal IP connections now omit SNI while still verifying IP SANs. | Native validation does not fetch live CRL/OCSP or missing intermediates. Full current-source TLS gates remain pending. This is not an independent security audit or complete RFC certification. |
 | Socket reactor | `eventloop.min` uses kqueue, epoll or WSAPoll with timers and recoverable results; `eventcallbacks.min` dispatches on the owner thread. UDP retains packet boundaries and empty/truncated packets; Linux batches use sendmmsg/recvmmsg. AppKit and the Windows GUI can share the reactor's wake source. | Windows WSAPoll scans its socket array. IOCP and io_uring are not implemented. Connect refusal has OS-dependent timing; callers use deadlines rather than assuming one wait reports refusal. |
 | UDP offload | Explicit `net.sendDatagramsOffload*` calls use Linux UDP_SEGMENT. Dedicated generation-checked `DatagramOffload` receivers enable UDP_GRO, split coalesced packets and preserve per-packet truncation/source results. | Offload is opt-in, not transparent on every UDP socket. Kernel/MTU failures are recoverable; unsupported macOS/Windows or disabled Linux builds report unavailable. The receiver and its registry have one owner; drain buffered segments to would-block after readiness. |
 | QUIC and fallback | QUIC v1 streams, flow control, CUBIC/loss recovery, current-route recovery generations, client path validation, server preferred-address configuration, resumption and explicit replay-safe early data are implemented. Authenticated TLS/yamux supplies the TCP replacement. | The caller opens/maps sockets and handles `TCP_NEEDED`, retired stream generations and explicit application retries. Writes are not silently replayed. BBR, ECN, live v2 and unsolicited server-initiated active migration remain outside the implemented scope. |
@@ -126,6 +136,13 @@ numeric IP classification without DNS, and rejects malformed input with a
 recoverable response. Four native and four fully instrumented ASan/UBSan/LSan
 tests now pass with normal exits and empty target diagnostics. Their four source
 files are byte-identical after integration. TLS was unchanged by this repair.
+
+The later literal-IP TLS regression failed against a strict SNI server before
+the repair. Nine native and nine fully instrumented sanitizer cases now pass:
+DNS names still send SNI; IPv4, IPv6 and expanded IPv6 omit it; wrong names,
+wrong IP SANs and untrusted chains still fail certificate authentication.
+The tested binaries exited normally with empty diagnostics and stable source
+and frontend bindings. This focused result does not replace the full TLS gate.
 
 Focused QUIC source `26841d1399f82f3189039189deb8b1e94890cb08` and the later
 protocol-evidence lifecycle fixes are integrated. The combined focused candidate
@@ -158,9 +175,23 @@ caused a migration checker KeyError, and two consecutive large transfers to
 the Minyar server timed out before the runner decoded missing stdout. The
 quiche and Quinn clients received correct but incomplete prefixes of the
 10-MiB workload. The primary sequence is paused after exact ownership cleanup
-for a bounded current-native profile of this possible server bottleneck.
+for a bounded current-native profile of this server bottleneck.
 No timeout, protocol checker or completed result has been relaxed or relabeled.
 The remaining primary cells and fresh affected repair cells remain pending.
+
+That profile recorded 359 samples with none lost. Inclusive costs overlapped:
+polling 95.3%, frame parsing 48.2%, pending-payload reconstruction 36.5% and
+bounded RC 35.1%. Two reviewed changes now reuse transient parsed frames,
+copy only when pruning changes a payload, and project exact wire size before
+allocating a packet that can actually be sent. Native/sanitizer correctness
+passed all 14 stages, plus authenticated header-width, pacing-boundary and
+automatic key-update assertions. They do not change queue limits or deadlines.
+Fresh strict quiche transfers still timed out: the first change received all
+three responses after 54.23 request seconds but exceeded the whole scenario
+deadline; the second received only 8,343,456 of 10,485,760 application bytes.
+Both are nonpasses. Exact teardown closed all owned Compose lifetimes and
+confirmed process and container/network absence. Quinn and the primary next
+cell remain pending; the combined collector/protocol candidate is unqualified.
 
 Actual runner failures exposed fixture defects in Docker 29 capability
 spelling, simulator capture writers that had not flushed during shutdown, and
@@ -219,8 +250,16 @@ A separate eight-second profile of that exact executable recorded 792 samples
 with none lost: the collector unit accounted for 73.99% of self samples and
 bounded traced polling for 9.85%. The call paths run through heartbeat JSON
 handling rather than TLS crypto. This diagnoses a remaining collector cost,
-not its exact invalidation cause. No steady-state measurement began; 20,000
-actual QUIC devices and two-hour flat memory remain unqualified.
+not its exact invalidation cause. A subsequent bounded diagnostic joined each
+actual proof/build invalidation to its same-call state. All 136 tuples summed
+to 20,571 events, without table misses, overflow or reaching its report limit.
+At 28.04 CPU seconds, 1,085 events involved fresh actual-zero retirement during
+local work, and 9,175 involved first registration of a detached source/child
+pair during full proof construction. The qualified fresh-MARK fix covers the
+narrow retirement case. A public-API fixture for detached full-build insertion
+is being tested before authorizing any exception; no insertion exception has
+landed. No steady-state measurement began; 20,000 actual QUIC devices and
+two-hour flat memory remain unqualified.
 
 Earlier source-frozen TLS/HTTP, QUIC and socket soaks remain evidence only for
 their recorded sources, peers, faults and exit statuses. A foundation
@@ -283,6 +322,14 @@ shipping gates still need verification.
 The portable bundle packager's 14 Python methods now pass on macOS after its
 temporary-directory fixture resolves the platform's `/var` pathname alias.
 Only fixture paths changed; the packaging implementation remained unchanged.
+
+Current native and ASan/UBSan updater checks also pass: manifest signature
+mutations, exclusive locks, durable activation and process-death recovery;
+and safe helper launch, descriptor exclusion and publication races. The two
+unchanged suites completed in 22.06 and 33.84 seconds with stable inputs and
+empty diagnostics. The temporary app-bundle/ad-hoc signing controls passed
+separately in 7.60 seconds using system Python. These are fixture results,
+without public-launcher, LSan, production signing or R2 publication credit.
 
 The publisher's HTTPS origin validation now rejects credential-bearing,
 noncanonical and malformed-port origins before signing. Eleven hostile-origin
