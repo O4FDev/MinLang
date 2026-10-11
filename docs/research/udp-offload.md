@@ -131,3 +131,41 @@ Primary references:
   exact uint16_t UDP_SEGMENT cmsg ABI.
 - [Linux v6.8 UDP receive metadata](https://github.com/torvalds/linux/blob/v6.8/include/linux/udp.h):
   int UDP_GRO ABI and the kernel's segment-count limit.
+
+## Independent readiness review
+
+A signal-interrupted readiness wait previously restarted its full timeout.
+The independent real-signal test reproduced a 30 ms request taking 263 ms
+during 45 signals. The Linux offload path now calculates one monotonic
+deadline, rounds only its remaining duration for poll, and retains it
+across EINTR. An interrupted zero-timeout poll returns no readiness after
+that single poll. Queued GRO bytes return readiness immediately without
+consulting the clock or kernel. Clock failures and nanosecond overflow
+return recoverable native failure results.
+
+The retained C regression uses actual SIGUSR1 delivery and checks bounded
+elapsed time, then injects initial/retry clock errors, timestamp/deadline
+overflow, zero-timeout interruption and queued-prefix readiness. Native
+and ASan/UBSan O0/O2 runs completed the 30 ms request in 30.2–31.1 ms.
+The existing real GSO/GRO, IPv6 and malformed-aggregate assertions remain
+unchanged.
+
+A separate independent lab checked 478 randomized retained-prefix
+aggregates against a scalar packet model and grew the private registry
+to 40 active sockets while one held queued GRO data. It checked invalid
+arguments without consuming prefixes, stale and ordinary handles,
+generation exhaustion, epoll removal, buffer release and unchanged open
+descriptor count. All four native/sanitized O0/O2 profiles passed.
+Five wrong readiness implementations failed exact runtime assertions
+across native O0/O2 and ASan/UBSan O0 (15 mutation runs); compilation
+failures and timeouts were not counted as mutation kills.
+
+Evidence lives under /home/user/minyar-overnight/udp-offload-review on the
+existing Boat machine. Linux-disabled runs cover the unavailable branch;
+this review does not add an actual Windows/macOS execution claim.
+The timeout fix changes only the opt-in offload header, its existing
+fixture and this report. Ordinary net.c, runtime and compiler sources
+remain identical to the reviewed source baseline.
+
+The [Linux poll(2) specification](https://man7.org/linux/man-pages/man2/poll.2.html)
+documents millisecond waits, scheduler overrun and interruption by signals.

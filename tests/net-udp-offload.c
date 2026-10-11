@@ -6,15 +6,23 @@
 #endif
 #if defined(__linux__) && !defined(MINYAR_DISABLE_UDP_OFFLOAD)
 #include <sys/socket.h>
+#include <poll.h>
+#include <time.h>
 static ssize_t oracle_recvmsg(int, struct msghdr *, int);
 static ssize_t oracle_sendmsg(int, const struct msghdr *, int);
+static int oracle_clock_gettime(clockid_t, struct timespec *);
+static int oracle_poll(struct pollfd *, nfds_t, int);
 #define recvmsg oracle_recvmsg
 #define sendmsg oracle_sendmsg
+#define clock_gettime oracle_clock_gettime
+#define poll oracle_poll
 #endif
 #include "../runtime/native/net.c"
 #if defined(__linux__) && !defined(MINYAR_DISABLE_UDP_OFFLOAD)
 #undef recvmsg
 #undef sendmsg
+#undef clock_gettime
+#undef poll
 #endif
 #include <assert.h>
 #ifdef __linux__
@@ -128,6 +136,62 @@ static void readiness_deadline(void) {
     assert(readiness_interruptions > 0);
     assert(elapsed >= 0.020 && elapsed < 0.100);
     puts("signal-interrupted UDP readiness retains its original deadline");
+}
+static unsigned readiness_clock_mode, readiness_clock_calls, readiness_poll_mode,
+    readiness_poll_calls;
+static int oracle_clock_gettime(clockid_t clock, struct timespec *now) {
+    readiness_clock_calls++;
+    if (readiness_clock_mode == 1 || (readiness_clock_mode == 4 && readiness_clock_calls > 1)) {
+        errno = EIO;
+        return -1;
+    }
+    if (readiness_clock_mode == 2) {
+        now->tv_sec = LLONG_MAX;
+        now->tv_nsec = 0;
+        return 0;
+    }
+    if (readiness_clock_mode == 3) {
+        now->tv_sec = UINT64_MAX / 1000000000;
+        now->tv_nsec = UINT64_MAX % 1000000000;
+        return 0;
+    }
+    return clock_gettime(clock, now);
+}
+static int oracle_poll(struct pollfd *entries, nfds_t count, int timeout) {
+    readiness_poll_calls++;
+    if (readiness_poll_mode == 1) {
+        errno = EINTR;
+        return -1;
+    }
+    return poll(entries, count, timeout);
+}
+static void readiness_clock_failures(void) {
+    MinyarText host = {(const unsigned char *)"127.0.0.1", 9, 0, NULL, NULL};
+    MinyarBytes *r = minyar_net_offloadOpenResult(&host, 0);
+    assert(u32(r, 0) == NET_OK);
+    long long id = value(r);
+    minyar_rc_release(r);
+    for (unsigned mode = 1; mode <= 4; mode++) {
+        readiness_clock_mode = mode;
+        readiness_clock_calls = readiness_poll_calls = 0;
+        readiness_poll_mode = mode == 4 ? 1 : 0;
+        r = minyar_net_offloadReadyResult(id, 20);
+        assert(u32(r, 0) == NET_FAILURE &&
+               u32(r, 4) == (mode == 2 || mode == 3 ? EOVERFLOW : EIO) && value(r) == 0);
+        assert(readiness_poll_calls == (mode == 4 ? 1u : 0u));
+        minyar_rc_release(r);
+    }
+    readiness_clock_mode = 1;
+    readiness_clock_calls = readiness_poll_calls = 0;
+    readiness_poll_mode = 1;
+    r = minyar_net_offloadReadyResult(id, 0);
+    assert(u32(r, 0) == NET_OK && !value(r) && !readiness_clock_calls && readiness_poll_calls == 1);
+    minyar_rc_release(r);
+    readiness_clock_mode = readiness_poll_mode = 0;
+    r = minyar_net_offloadCloseResult(id);
+    assert(u32(r, 0) == NET_OK);
+    minyar_rc_release(r);
+    puts("readiness clock failures, overflow and zero-timeout EINTR are recoverable");
 }
 static void send_oracle(void) {
     MinyarText host = {(const unsigned char *)"127.0.0.1", 9, 0, NULL, NULL};
@@ -330,6 +394,15 @@ static void recv_oracle(void) {
         r = minyar_net_offloadReadyResult(id, 0);
         assert(u32(r, 0) == NET_OK && value(r) == (consumed < 64));
         minyar_rc_release(r);
+        if (consumed < 64) {
+            readiness_clock_mode = 1;
+            readiness_clock_calls = readiness_poll_calls = 0;
+            r = minyar_net_offloadReadyResult(id, 20);
+            assert(u32(r, 0) == NET_OK && value(r) == 1 && !readiness_clock_calls &&
+                   !readiness_poll_calls);
+            minyar_rc_release(r);
+            readiness_clock_mode = 0;
+        }
     }
     assert(offset == 63017);
     r = minyar_net_offloadReceiveResult(id, 64, 65507);
@@ -733,6 +806,7 @@ static void controls(void) {
 int main(void) {
 #if defined(__linux__) && !defined(MINYAR_DISABLE_UDP_OFFLOAD)
     readiness_deadline();
+    readiness_clock_failures();
     send_oracle();
     recv_oracle();
     ipv6_oracle();
