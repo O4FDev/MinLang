@@ -120,7 +120,7 @@ check-sanitize: check-cycle-private-retirement-sanitize
 # Mocked idle observability preserves the historical metric.
 # This deterministic API contract does not replay a Windows idle failure.
 .PHONY: check-cycle-progress-observability
-check-cycle-progress-observability: tests/cycle-progress-observability.py tests/cycle-progress-observability-harness.py tests/cycle-progress.c tests/fixtures/cycle-progress-before-observability.c.txt tests/clang_helpers.py tests/test_evidence.py tools/host_paths.py | build
+check-cycle-progress-observability: tests/cycle-progress-observability.py tests/cycle-progress-observability-harness.py tests/cycle-progress.c tests/fixtures/cycle-progress-before-observability.c.txt tests/clang_helpers.py tests/test_evidence.py tests/windows_job_owner.py tools/host_paths.py | build
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-progress-observability-harness.py
 	@set -e; evidence=$$(mktemp -d "$(abspath build)/cycle-progress-observability.XXXXXXXX"); \
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-progress-observability.py --evidence "$$evidence/run"
