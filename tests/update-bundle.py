@@ -73,6 +73,29 @@ class Packager(unittest.TestCase):
         self.assertTrue(opened[0].closed)
         self.assertEqual(list(self.lab.glob('.minyar-bundle-*')),[])
 
+    def test_index_must_stay_exact_even_when_directory_metadata_is_unchanged(self):
+        # Some providers report fixed directory sizes/creation times. Model
+        # that metadata contract while changing the real directory listing.
+        # This is a semantic test, not Windows execution evidence.
+        self.output.write_bytes(b'previous artifact')
+        original=self.root.lstat()
+        lstat=Path.lstat;commit=bundle.os.fsync
+        changed=False
+        def stable_root(path,*args,**kwargs):
+            return original if path==self.root else lstat(path,*args,**kwargs)
+        def change_tree(fd):
+            nonlocal changed
+            commit(fd)
+            if not changed:
+                (self.root/'late unsigned resource').write_bytes(b'not in the index')
+                changed=True
+        with patch.object(Path,'lstat',stable_root), \
+             patch.object(bundle.os,'fsync',side_effect=change_tree):
+            with self.assertRaisesRegex(ValueError,'tree changed'):
+                bundle.prepare(self.root,self.output,self.main)
+        self.assertEqual(self.output.read_bytes(),b'previous artifact')
+        self.assertEqual(list(self.lab.glob('.minyar-bundle-*')),[])
+
     def test_ambiguous_names_bad_entrypoints_and_embedded_output_refused(self):
         for name in ['../escape','/absolute','NUL','missing','App.app/Contents/Resources/resource with spaces']:
             with self.subTest(main=name),self.assertRaises((ValueError,OSError)):
