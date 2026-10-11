@@ -14,6 +14,96 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class BuildWiring(unittest.TestCase):
 
+    def test_quic_ledger_requires_full_offline_controls(self):
+        import importlib.util
+        import json
+        import re
+        fragment_path = ROOT / 'build-support/quic-ledger.mk'
+        source = fragment_path.read_text()
+        target = 'check-quic-amplification-ledger'
+        inputs = {'tests/quic-amplification-ledger.py',
+                  'tests/quic_amplification_ledger.py'}
+
+        def verify(fragment):
+            with tempfile.TemporaryDirectory(prefix='QUIC ledger Make rules ') as folder:
+                makefile = Path(folder) / 'probe.mk'
+                fixtures = sorted(inputs | {'build'})
+                makefile.write_text(fragment + '\n.PHONY: ' + ' '.join(fixtures)
+                                   + '\n' + ' '.join(fixtures)
+                                   + ':\n\t@echo INPUT $@\n')
+                env = dict(os.environ)
+                env.pop('MAKEFLAGS', None)
+                result = subprocess.run(['make', '-rRnp', '-f', str(makefile), target],
+                                        cwd=ROOT, env=env, text=True,
+                                        capture_output=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                rules = {}
+                for line in result.stdout.splitlines():
+                    match = re.match(r'^([\w./-]+):\s*(.*)$', line)
+                    if match:
+                        rules.setdefault(match[1], set()).update(match[2].split())
+                for gate in ('check', 'check-portable', 'check-quic',
+                             'check-quic-sanitize', 'check-quic-rfc',
+                             'check-quic-rfc-sanitize', 'check-sanitize'):
+                    self.assertIn(target, rules.get(gate, set()), gate)
+                self.assertTrue(inputs <= rules.get(target, set()))
+                commands = result.stdout.split('# GNU Make', 1)[0]
+                self.assertEqual(commands.count('python3 -E tests/quic-amplification-ledger.py'), 1)
+                self.assertIn('--artifacts "$artifacts/run"', commands)
+                self.assertIn((ROOT / 'build/quic-ledger.').as_posix(),
+                              commands.replace('\\', '/'))
+                self.assertNotIn('--case ', commands)
+                self.assertNotIn('--expect-old-code', commands)
+                self.assertNotIn('--sanitize', commands)
+
+        verify(source)
+        aggregates = ('check', 'check-portable', 'check-quic', 'check-quic-sanitize',
+                      'check-quic-rfc', 'check-quic-rfc-sanitize', 'check-sanitize')
+        line = next(line for line in source.splitlines()
+                    if line.startswith('check check-portable '))
+        names, dependency = line.split(': ', 1)
+        for gate in aggregates:
+            mutant = source.replace(line, ' '.join(
+                name for name in names.split() if name != gate) + ': ' + dependency, 1)
+            with self.subTest(missing_gate=gate), self.assertRaises(AssertionError):
+                verify(mutant)
+        for dependency in sorted(inputs):
+            mutant = source.replace(dependency, '', 1)
+            self.assertNotEqual(mutant, source)
+            with self.subTest(missing_source=dependency), self.assertRaises(AssertionError):
+                verify(mutant)
+        for label, old, new in (
+                ('filtered cases', '--artifacts', '--case exact3x --artifacts'),
+                ('relative artifact path', '$(abspath build)/quic-ledger.', 'build/quic-ledger.'),
+                ('inherited optimization', 'python3 -E ', 'python3 -O ')):
+            mutant = source.replace(old, new, 1)
+            self.assertNotEqual(mutant, source)
+            with self.subTest(invalid_recipe=label), self.assertRaises(AssertionError):
+                verify(mutant)
+        tree = ast.parse((ROOT / 'scripts/check-linux.py').read_text())
+        targets = next(ast.literal_eval(node.value) for node in tree.body
+                       if isinstance(node, ast.Assign)
+                       and any(isinstance(name, ast.Name) and name.id == 'TARGETS'
+                               for name in node.targets))
+        self.assertEqual(targets.count(target), 1)
+        spec = importlib.util.spec_from_file_location('ledger_catalogue',
+                                                     ROOT / 'tests/suite-catalogue.py')
+        catalogue = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(catalogue)
+        data = json.loads((ROOT / 'tests/suite-catalogue.json').read_text())
+        rows = {row['path']: row for row in data['sources']}
+        self.assertEqual(rows['tests/quic-amplification-ledger.py']['role'], 'suite')
+        self.assertIn('build-support/quic-ledger.mk',
+                      rows['tests/quic-amplification-ledger.py']['consumers'])
+        self.assertEqual(rows['tests/quic_amplification_ledger.py']['role'], 'support')
+        self.assertIn('tests/quic-amplification-ledger.py',
+                      rows['tests/quic_amplification_ledger.py']['consumers'])
+        for missing in sorted(inputs):
+            candidate = dict(data, sources=[row for row in data['sources']
+                                           if row['path'] != missing])
+            with self.subTest(omitted_source=missing), self.assertRaises(ValueError):
+                catalogue.validate(candidate, ROOT)
+
     def test_quic_rfc_requires_owned_lifecycle_controls(self):
         import json
         import re
