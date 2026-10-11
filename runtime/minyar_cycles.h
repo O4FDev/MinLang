@@ -21,7 +21,8 @@ typedef struct RcCycle {
     uintptr_t gray_next; /* Registered: aligned link, bits0/1 proof tags, bit2 local namespace.
                           * Unregistered: bit2 retains captured incoming-path exposure; bit3
                           * marks private bounded zero-count cleanup; bit4 distinguishes captured
-                          * dead owners. Neither bit is a live certificate. */
+                          * dead owners; bit5 distinguishes fresh local-MARK retirement. None is a
+                          * live certificate. */
     size_t generation : 1, marked : 2, registered : 1, pinned : 1, cleared : 1, record : 1,
         incoming : 57;
 } RcCycle;
@@ -282,7 +283,8 @@ static inline int rc_cycle_unregistered_leaf(RcCycle *cycle) {
 #ifdef MINYAR_BOUNDED_RC
 /* Only an irreversibly dead, unregistered object may carry this bit. It is
  * separate from live proof/exposure tags; allocation and registration reset it. */
-enum { RC_CYCLE_PRIVATE_DEAD = 8, RC_CYCLE_CAPTURED_DEAD = 16 };
+enum { RC_CYCLE_PRIVATE_DEAD = 8, RC_CYCLE_CAPTURED_DEAD = 16,
+       RC_CYCLE_FRESH_MARK_DEAD = 32 };
 /* Actual-zero owners are outside every current owning path. A previously
  * captured owner may retire during a local job without canceling the primary;
  * a full proof under construction still needs the conservative fallback. */
@@ -304,9 +306,14 @@ static inline void rc_cycle_unregister_zero(RcObject *object) {
     unsigned captured = (cycle->marked == 0 || cycle->marked == 2) &&
                         !(cycle->gray_next & ~(uintptr_t)7) && !rc_cycle_proven(cycle) &&
                         rc_cycle_primary_retirement();
+    /* Issued only at genuine RC zero for a node registered after this local
+     * cohort began. Its fresh tag is not itself a live reachability proof. */
+    unsigned fresh_mark = cycle->marked == 3 && cycle->gray_next == 4 &&
+                          cycle != rc_cycle_temporary_anchor && rc_cycle_local_job &&
+                          rc_cycle_phase == RC_CYCLE_MARK && rc_cycle_primary_retirement();
     if (object->ownership != RC_TRACED || cycle->incoming || !cycle->registered ||
         cycle->pinned || cycle->cleared || cycle == rc_cycle_proof_anchor ||
-        cycle == rc_cycle_proof_retry || (!fresh && !captured)) {
+        cycle == rc_cycle_proof_retry || (!fresh && !captured && !fresh_mark)) {
         rc_cycle_unregister(object);
         return;
     }
@@ -314,9 +321,10 @@ static inline void rc_cycle_unregister_zero(RcObject *object) {
     if (rc_cycle_temporary_anchor == cycle)
         rc_cycle_temporary_anchor = NULL;
     rc_cycle_unlink(cycle);
-    /* The additional bit certifies only this irreversible captured retirement;
-     * it cannot certify a live object or relax a fresh owner's phase rules. */
-    cycle->gray_next = RC_CYCLE_PRIVATE_DEAD | (captured ? RC_CYCLE_CAPTURED_DEAD : 0);
+    /* Distinct issued bits certify irreversible zero-count retirement. The
+     * older fresh-private marker retains its original idle-only field rules. */
+    cycle->gray_next = RC_CYCLE_PRIVATE_DEAD | (captured ? RC_CYCLE_CAPTURED_DEAD : 0) |
+                      (fresh_mark ? RC_CYCLE_FRESH_MARK_DEAD : 0);
 }
 #endif
 
@@ -557,9 +565,11 @@ static inline void rc_cycle_dead_edge_remove(RcObject *parent, void *value) {
         return;
     RcCycle *owner = rc_cycle_metadata(parent);
     unsigned captured = owner->gray_next == (RC_CYCLE_PRIVATE_DEAD | RC_CYCLE_CAPTURED_DEAD);
-    unsigned eligible = captured ? rc_cycle_primary_retirement() : rc_cycle_primary_idle();
+    unsigned fresh_mark = owner->gray_next == (RC_CYCLE_PRIVATE_DEAD | RC_CYCLE_FRESH_MARK_DEAD);
+    unsigned eligible = (captured || fresh_mark) ? rc_cycle_primary_retirement() :
+                                                  rc_cycle_primary_idle();
     if (owner->registered ||
-        (!captured && owner->gray_next != RC_CYCLE_PRIVATE_DEAD) || owner->pinned ||
+        (!captured && !fresh_mark && owner->gray_next != RC_CYCLE_PRIVATE_DEAD) || owner->pinned ||
         owner->cleared || owner->incoming || !eligible) {
         rc_cycle_edge_remove(value);
         return;
