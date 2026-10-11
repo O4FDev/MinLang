@@ -1,0 +1,256 @@
+use "quic" as quic
+use "errors" as errors
+use "quiccrypto" as protection
+use "quicwire" as wire
+use "crypto" as crypto
+record Pair { client: quic.Connection; server: quic.Connection }
+record Ack { count: Integer; largest: Integer; delay: Integer; ping: Integer; level: Integer; initial: Integer; handshake: Integer; application: Integer }
+function number(data: Bytes, value: Integer) { data.addBytes(errors.bytesValue(wire.encode(value))) }
+function drive(c: quic.Connection, s: quic.Connection, now: Integer) {
+    for packet in quic.poll(c, now) { quic.receive(s, packet, now) }
+    for packet in quic.poll(s, now) { quic.receive(c, packet, now) }
+}
+function pair(root: Bytes, identity: Bytes, key: Bytes, client: Bytes, clientKey: Bytes): Pair {
+    let c = quic.client("localhost", randomBytes(80), "minyar-ack-test", [root], [client], clientKey)
+    let s = quic.server(randomBytes(80), "minyar-ack-test", c.originalDestination, [identity], key, [root], true)
+    for tick in 0..150 { drive(c, s, tick * 10) }
+    return Pair { client: c; server: s }
+}
+function packet(sender: quic.Connection, level: Integer, pn: Integer, payload: Bytes): Bytes {
+    let space = sender.spaces[level]; let data = payload.slice(0, payload.length); let header = Bytes()
+    if level == 2 { header.add(0x43 | ((space.writeGeneration & 1) << 2)); header.addBytes(sender.remote) }
+    else {
+        let first = 0xc3; if level == 1 { first = 0xe3 }
+        header.add(first)
+        for index in 0..4 { header.add((sender.version >> ((3 - index) * 8)) & 255) }
+        header.add(sender.remote.length); header.addBytes(sender.remote); header.add(sender.local.length); header.addBytes(sender.local)
+        if level == 0 { number(header, 0) }
+        if level == 0 { data.resize(1200 - header.length - 2 - 4 - 16) }
+        number(header, data.length + 20)
+    }
+    for index in 0..4 { header.add((pn >> ((3 - index) * 8)) & 255) }
+    space.next = max(space.next, pn + 1)
+    return errors.bytesValue(protection.protect(space.write, header, header.length - 4, pn, data))
+}
+function inject(sender: quic.Connection, receiver: quic.Connection, pn: Integer, data: Bytes, now: Integer) {
+    quic.receive(receiver, packet(sender, 2, pn, data), now)
+}
+function ackOnly(receiver: quic.Connection): Bytes {
+    let data = Bytes(); data.add(2); number(data, receiver.spaces[2].next - 1); number(data, 0); number(data, 0); number(data, 0)
+    return data
+}
+function inspect(receiver: quic.Connection, packets: List<Bytes>): Ack {
+    let result = Ack { count: 0; largest: -1; delay: -1; ping: 0; level: -1; initial: 0; handshake: 0; application: 0 }
+    for data in packets {
+        let header = wire.header(data, 0, receiver.local.length)
+        if !header.valid { result.count = -100; return result }
+        let level = 2; if header.kind == wire.INITIAL { level = 0 }; if header.kind == wire.HANDSHAKE { level = 1 }
+        if receiver.spaces[level].read.key.length == 0 { continue }
+        let opened = protection.unprotect(receiver.spaces[level].read, data, header.numberOffset, -1)
+        if !opened.valid { result.count = -101; return result }
+        let frames = wire.frames(opened.payload); if !frames.valid { result.count = -102; return result }
+        for frame in frames.frames {
+            if frame.type == 1 { result.ping += 1 }
+            if frame.type == 2 || frame.type == 3 {
+                result.count += 1; result.largest = frame.value; result.delay = frame.values[0]; result.level = level
+                if level == 0 { result.initial += 1 }; if level == 1 { result.handshake += 1 }; if level == 2 { result.application += 1 }
+            }
+        }
+    }
+    return result
+}
+function main(): Integer {
+    let root = readBytesFile(argument(0)); let identity = readBytesFile(argument(1)); let key = readBytesFile(argument(2))
+    let client = readBytesFile(argument(3)); let clientKey = readBytesFile(argument(4)); let mode = 0; for digit in argument(5) { mode = mode * 10 + Integer(digit) - 48 }
+    if mode == 6 {
+        let c = quic.client("localhost", randomBytes(80), "minyar-ack-test", [root], [client], clientKey)
+        let s = quic.server(randomBytes(80), "minyar-ack-test", c.originalDestination, [identity], key, [root], true)
+        for data in quic.poll(c, 0) { quic.receive(s, data, 0) }
+        let answer = inspect(c, quic.poll(s, 0))
+        if answer.count != 1 || answer.level != 0 || answer.delay != 0 { return 16 }
+        print("ACK case " + Text(mode)); return 0
+    }
+    if mode == 7 || mode == 21 {
+        let c = quic.client("localhost", randomBytes(80), "minyar-ack-test", [root], [client], clientKey)
+        let s = quic.server(randomBytes(80), "minyar-ack-test", c.originalDestination, [identity], key, [root], true)
+        // Isolate packet-number-space ACK timing from amplification admission.
+        s.addressValidated = true; s.paths[0].validated = true
+        let readyAt = 1
+        for tick in 0..50 {
+            let now = tick * 10
+            for data in quic.poll(c, now) { quic.receive(s, data, now) }
+            for data in quic.poll(s, now + 1) { quic.receive(c, data, now + 1) }
+            readyAt = now + 1
+            if c.state == quic.ESTABLISHED && s.state == quic.STARTING { break }
+        }
+        if c.state != quic.ESTABLISHED || s.state != quic.STARTING || c.spaces[1].read.key.length == 0 { return 90 }
+        c.pending = []
+        if mode == 21 {
+            let answer = inspect(s, quic.poll(c, readyAt + 1))
+            if answer.count != 2 || answer.initial != 1 || answer.handshake != 1 || answer.application != 0 || answer.delay != 0 { return 43 }
+            print("ACK case " + Text(mode)); return 0
+        }
+        quic.poll(c, readyAt)
+        quic.receive(c, packet(s, 1, s.spaces[1].next, crypto.fromHex("01")), readyAt + 1)
+        let answer = inspect(s, quic.poll(c, readyAt + 1))
+        if answer.count != 1 || answer.level != 1 || answer.delay != 0 { return 17 }
+        print("ACK case " + Text(mode)); return 0
+    }
+    let peers = pair(root, identity, key, client, clientKey); let c = peers.client; let s = peers.server
+    if c.state != quic.ESTABLISHED || s.state != quic.ESTABLISHED || !c.confirmed || !s.confirmed ||
+       c.pending.length != 0 || s.pending.length != 0 || c.spaces[2].sent.length != 0 || s.spaces[2].sent.length != 0 { return 90 }
+    let pn = max(s.spaces[2].next, c.spaces[2].largest + 1); let ping = crypto.fromHex("01")
+    if mode == 0 {
+        inject(s, c, pn, ping, 2000)
+        if inspect(s, quic.poll(c, 2000)).count != 0 { print("ACK sent before pair"); return 10 }
+        inject(s, c, pn + 1, ping, 2001)
+        let answer = inspect(s, quic.poll(c, 2001))
+        if answer.count != 1 || answer.largest != pn + 1 || answer.delay != 0 { return 11 }
+        if inspect(s, quic.poll(c, 2026)).count != 0 { return 12 }
+    }
+    if mode == 1 {
+        inject(s, c, pn, ping, 2000)
+        if quic.nextTimer(c) != 2025 { print("lone ACK has no fixed deadline"); return 13 }
+        for index in 0..8 { if quic.nextTimer(c) != 2025 { return 13 } }
+        if inspect(s, quic.poll(c, 2024)).count != 0 || quic.nextTimer(c) != 2025 { return 13 }
+        let answer = inspect(s, quic.poll(c, 2025))
+        if answer.count != 1 || answer.delay != 3125 || answer.largest != pn { return 14 }
+        if quic.nextTimer(c) == 2025 || c.flight != 0 { return 15 }
+    }
+    if mode == 2 {
+        inject(s, c, pn + 2, ping, 2000)
+        let answer = inspect(s, quic.poll(c, 2000))
+        if answer.count != 1 || answer.largest != pn + 2 { return 18 }
+    }
+    if mode == 3 {
+        inject(s, c, pn + 1, ping, 2000); quic.poll(c, 2000)
+        inject(s, c, pn, ping, 2001)
+        let answer = inspect(s, quic.poll(c, 2001))
+        if answer.count != 1 || answer.largest != pn + 1 || answer.delay != 125 { return 19 }
+    }
+    if mode == 4 {
+        let frame = ackOnly(c); inject(s, c, pn + 2, frame, 2000)
+        if inspect(s, quic.poll(c, 2000)).count != 0 { return 20 }
+        inject(s, c, pn + 2, frame, 2001)
+        if inspect(s, quic.poll(c, 2001)).count != 0 || quic.nextTimer(c) < 2026 { print("duplicate ACK-only elicited ACK"); return 21 }
+    }
+    if mode == 5 {
+        inject(s, c, pn, ping, 2000); inject(s, c, pn, ping, 2001)
+        if inspect(s, quic.poll(c, 2001)).count != 1 { return 22 }
+        if inspect(s, quic.poll(c, 2002)).count != 0 { return 22 }
+        inject(s, c, pn, ping, 2003)
+        if inspect(s, quic.poll(c, 2003)).count != 1 { return 22 }
+    }
+    if mode == 8 {
+        inject(s, c, pn, ping, 2000); inject(s, c, pn + 1, ackOnly(c), 2010)
+        if quic.nextTimer(c) != 2025 { return 23 }
+        let answer = inspect(s, quic.poll(c, 2025))
+        if answer.count != 1 || answer.largest != pn + 1 || answer.delay != 1875 { print("delay used first pending packet"); return 24 }
+    }
+    if mode == 9 {
+        inject(s, c, pn + 1, ping, 2000); quic.poll(c, 2000)
+        inject(s, c, pn, ping, 2007)
+        let answer = inspect(s, quic.poll(c, 2007))
+        if answer.count != 1 || answer.delay != 875 { print("reordering changed largest timestamp"); return 25 }
+    }
+    if mode == 10 {
+        inject(s, c, pn, ping, 2000); inject(s, c, pn + 1, ping, 2001)
+        let write = c.spaces[2].write; c.spaces[2].write = protection.traffic(1, 0, Bytes())
+        for at in 2001..2010 { if quic.poll(c, at).length != 0 { return 26 } }
+        c.spaces[2].write = write
+        let answer = inspect(s, quic.poll(c, 2030))
+        if answer.count != 1 || answer.largest != pn + 1 || answer.delay != 3625 { return 27 }
+    }
+    if mode == 11 {
+        c.addressValidated = false; c.paths[0].validated = false
+        inject(s, c, pn, ping, 2000); inject(s, c, pn + 1, ping, 2001)
+        c.receivedBytes = 0; c.paths[0].received = 0
+        for at in 2001..2011 { if quic.poll(c, at).length != 0 || c.pending.length != 1 { print("ACK backlog grew"); return 28 } }
+        inject(s, c, pn + 2, ping, 2020); c.receivedBytes = 0; c.paths[0].received = 0
+        if quic.poll(c, 2020).length != 0 || c.pending.length != 1 { return 28 }
+        c.addressValidated = true; c.paths[0].validated = true
+        let answer = inspect(s, quic.poll(c, 2030))
+        if answer.count != 1 || answer.largest != pn + 2 || answer.delay != 1250 { print("queued ACK was stale"); return 29 }
+        if c.pending.length != 0 || inspect(s, quic.poll(c, 2040)).count != 0 { return 29 }
+    }
+    if mode == 12 {
+        c.congestion.maxAckDelay = 0; c.ackExponent = 20
+        inject(s, c, pn, ping, 2000)
+        if inspect(s, quic.poll(c, 2000)).count != 0 || quic.nextTimer(c) != 2025 { return 30 }
+        let answer = inspect(s, quic.poll(c, 2025))
+        if answer.count != 1 || answer.delay != 3125 { print("peer ACK parameters changed local policy"); return 31 }
+    }
+    if mode == 13 {
+        inject(s, c, pn, ping, 2000); quic.close(c, 0, Bytes("done"))
+        if inspect(s, quic.poll(c, 2000)).count != 0 { return 32 }
+        if quic.nextTimer(c) == 2025 { return 32 }
+    }
+    if mode == 14 {
+        for index in 0..300 { inject(s, c, pn + index * 2, ping, 2000 + index); quic.poll(c, 2000 + index) }
+        if c.spaces[2].ranges.length > 256 { return 33 }
+        inject(s, c, pn, ping, 2400)
+        if inspect(s, quic.poll(c, 2400)).count != 0 { print("forgotten packet was accepted again"); return 34 }
+    }
+    if mode == 15 {
+        inject(s, c, pn, ping, 2000); let largest = c.spaces[2].largest
+        inject(s, c, pn + 1, ping, 1999)
+        if quic.poll(c, 1999).length != 0 || c.spaces[2].largest != largest || quic.nextTimer(c) != 2025 { return 35 }
+        let answer = inspect(s, quic.poll(c, 2025)); if answer.count != 1 || answer.delay != 3125 { return 35 }
+    }
+    if mode == 16 {
+        if !errors.booleanOk(quic.updateKeys(s)) { return 90 }
+        inject(s, c, pn, ackOnly(c), 2000)
+        let response = quic.poll(c, 2000)
+        // A reciprocal key-phase confirmation must elicit one response; an
+        // ACK-only response to an ACK-only packet would violate RFC9000.
+        if response.length != 1 { return 36 }
+        let opened = protection.unprotect(c.spaces[2].write, response[0], 1 + c.remote.length, -1)
+        if !opened.valid { return 90 }
+        let acks = 0; let pings = 0
+        for frame in wire.frames(opened.payload).frames { if frame.type == 1 { pings += 1 }; if frame.type == 2 { acks += 1 } }
+        if acks != 1 || pings != 1 { print("key phase ACK-only response could loop"); return 36 }
+    }
+    if mode == 17 {
+        // A non-eliciting packet above a gap must not hide that gap when a
+        // later eliciting packet arrives (RFC9000 13.2.1).
+        inject(s, c, pn + 1, ackOnly(c), 2000)
+        inject(s, c, pn + 2, ping, 2001)
+        let answer = inspect(s, quic.poll(c, 2001))
+        if answer.count != 1 || answer.largest != pn + 2 { print("ACK-only packet hid a receive gap"); return 37 }
+    }
+    if mode == 18 {
+        // ACK-only packets fill packet-number continuity without increasing
+        // the two-packet elicitation counter.
+        inject(s, c, pn, ackOnly(c), 2000)
+        inject(s, c, pn + 1, ping, 2001)
+        if inspect(s, quic.poll(c, 2001)).count != 0 || quic.nextTimer(c) != 2026 { print("ACK-only packet counted as eliciting"); return 38 }
+        let answer = inspect(s, quic.poll(c, 2026))
+        if answer.count != 1 || answer.delay != 3125 { return 38 }
+    }
+    if mode == 19 {
+        // Exercise the actual send-time RTT record, not only ACK wire syntax.
+        c.congestion.measured = true; c.congestion.minimum = 20
+        c.congestion.latest = 20; c.congestion.smoothed = 20; c.congestion.variance = 0
+        c.paceAt = 2000; c.paceCredit = Float(c.congestion.window)
+        if !errors.booleanOk(quic.ping(c)) { return 90 }
+        for data in quic.poll(c, 2000) { quic.receive(s, data, 2010) }
+        if quic.poll(s, 2010).length != 0 || quic.nextTimer(s) != 2035 { return 39 }
+        let answer = quic.poll(s, 2035)
+        let decoded = inspect(c, answer)
+        if decoded.count != 1 || decoded.delay != 3125 { return 39 }
+        for data in answer { quic.receive(c, data, 2045) }
+        if c.flight != 0 || c.congestion.latest != 45 || c.congestion.smoothed != 20 || c.congestion.variance != 0 { print("encoded ACK delay did not adjust RTT"); return 40 }
+    }
+    if mode == 20 {
+        c.congestion.measured = true; c.congestion.smoothed = 100; c.congestion.latest = 100; c.congestion.variance = 50
+        if !errors.booleanOk(quic.probePath(c, 7, 2000)) { return 90 }
+        quic.poll(c, 2000)
+        quic.receivePath(c, packet(s, 2, pn, ping), 7, 2001)
+        if quic.nextTimer(c) != 2026 { return 41 }
+        let packets: List<Bytes> = []; let routes = quic.pollDatagrams(c, 2026)
+        for outgoing in routes { if outgoing.pathId != 7 { print("ACK lost receive route"); return 42 }; packets.add(outgoing.data) }
+        let answer = inspect(s, packets)
+        if answer.count != 1 || answer.delay != 3125 { return 42 }
+    }
+    print("ACK case " + Text(mode)); return 0
+}
