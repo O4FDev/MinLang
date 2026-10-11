@@ -334,6 +334,12 @@ python3 scripts/update-manifest.py \
   --key /secure/offline-ed25519.pem
 ```
 
+The origin uses the exact ASCII `https://` prefix, a host and an optional port
+from 1 to 65535. Credentials, whitespace, control bytes, paths and query or
+fragment delimiters are rejected before signing or writing output, including
+empty `?` and `#` suffixes. Valid host casing and explicit HTTPS ports are
+preserved in the signed URL.
+
 `--passphrase-env NAME` asks OpenSSL to read an existing environment variable;
 the tool never places its value in an argument. It validates the Ed25519 public
 key format, signs and independently self-verifies the signature, rechecks copied

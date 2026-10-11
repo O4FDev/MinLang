@@ -45,8 +45,14 @@ def prepare(artifact,output,app,target,channel,sequence,version,issued,expires,r
     if type(issued) is not int or type(expires) is not int or issued<0 or not 0<expires-issued<=604800 or expires>9223372036854775507:
         raise ValueError('invalid metadata expiry; maximum seven days')
     address=urlsplit(origin)
-    if address.scheme!='https' or not address.hostname or address.username or address.password or address.query or address.fragment or address.path:
-        raise ValueError('origin must be a pinned HTTPS origin without credentials, path or query')
+    # urlsplit strips controls and tolerates empty query/fragment delimiters.
+    # Signed bytes must be the exact origin consumed by the portable updater.
+    port=address.port
+    if origin!='https://'+address.netloc or not address.hostname or \
+            address.username is not None or address.password is not None or \
+            any(ord(c)<33 or ord(c)>126 for c in origin) or address.netloc.endswith(':') or \
+            (port is not None and not 1<=port<=65535):
+        raise ValueError('origin must be an ASCII HTTPS origin with a valid port and no credentials, path, query or fragment')
     if not artifact.is_file() or not re.fullmatch('[A-Za-z0-9._-]+',artifact.name): raise ValueError('artifact needs a safe filename')
     size=artifact.stat().st_size
     if not 1<=size<=134217728: raise ValueError('artifact size outside 1..128MiB limit')
