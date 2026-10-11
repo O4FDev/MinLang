@@ -27,9 +27,15 @@ def rss(pid):
     text=Path(f'/proc/{pid}/status').read_text()
     return int(next(line.split()[1] for line in text.splitlines() if line.startswith('VmRSS:')))
 class Lab:
-    def __init__(self,directory,binary=None,sanitize=False,duration=20000,maximum=128):
+    def __init__(self,directory,binary=None,sanitize=False,duration=20000,maximum=128,sanitizer_quarantine=None):
         self.directory=Path(directory);self.directory.mkdir(parents=True,exist_ok=True)
-        self.env=environment(sanitize);self.devices=[];self.device_outputs=[];self.events=[]
+        self.env=environment(sanitize)
+        if sanitize and sanitizer_quarantine is not None:
+            # A bounded freed-object quarantine leaves temporal checks enabled
+            # while allowing the unchanged live RSS ceiling to be measured.
+            assert sanitizer_quarantine==1
+            self.env['ASAN_OPTIONS']='detect_leaks=1:quarantine_size_mb=1:thread_local_quarantine_size_kb=64'
+        self.devices=[];self.device_outputs=[];self.events=[]
         self.edge=None;self.redis=None;self.client=None
         self.binary=Path(binary) if binary else self.directory/'edge'
         if not binary:
@@ -70,7 +76,7 @@ class Lab:
         assert line and line.startswith('READY '),(line,self.diagnostic())
         self.udp_port,self.device_port,self.gateway_port=map(int,line.split()[1:])
         self.health=dict(in_flight=0,max_concurrent=8,paused=False,policy_hash='a'*64,public_ip='203.0.113.2',asn=64500,country='GB')
-        (self.directory/'source.json').write_text(json.dumps(dict(commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),source_sha256=hashlib.sha256((ROOT/'library/peeredge.min').read_bytes()).hexdigest(),binary_sha256=hashlib.sha256(self.binary.read_bytes()).hexdigest(),start=time.time(),pid=self.edge.pid),indent=2))
+        (self.directory/'source.json').write_text(json.dumps(dict(commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),source_sha256=hashlib.sha256((ROOT/'library/peeredge.min').read_bytes()).hexdigest(),binary_sha256=hashlib.sha256(self.binary.read_bytes()).hexdigest(),start=time.time(),pid=self.edge.pid,asan_options=self.env.get('ASAN_OPTIONS')),indent=2))
     def diagnostic(self):
         if self.stderr and not self.stderr.closed:self.stderr.flush()
         return (self.directory/'edge.stderr').read_text()
@@ -108,6 +114,21 @@ class Lab:
             if proc.poll() is None:proc.terminate()
             proc.communicate(timeout=5)
         if self.edge and self.edge.poll() is None:self.edge.kill();self.edge.wait()
+        if self.edge:
+            pending=[]
+            while True:
+                try:line=self.output.get(timeout=.1)
+                except queue.Empty:break
+                if line is None:break
+                pending.append(line)
+            if pending:(self.directory/'edge.partial.stdout').write_text('\n'.join(pending)+'\n')
+        for at,out in enumerate(self.device_outputs):
+            events=[]
+            while True:
+                try:line=out.get_nowait()
+                except queue.Empty:break
+                events.append(line)
+            (self.directory/f'device-{at}.events.json').write_text(json.dumps(events))
         if self.client:self.client.close()
         if self.redis:
             self.redis.terminate();self.redis.communicate(timeout=5)
