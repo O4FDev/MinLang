@@ -15,6 +15,81 @@ ROOT = Path(__file__).resolve().parents[1]
 class BuildWiring(unittest.TestCase):
 
 
+
+    def test_network_evidence_preserves_primary_and_finalizes_independently(self):
+        import contextlib
+        import importlib.util
+        import io
+        import json
+        from unittest.mock import patch
+        spec = importlib.util.spec_from_file_location(
+            'network_evidence_contract', ROOT/'tests/net-native.py')
+        driver = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(driver)
+        real_write_bytes = Path.write_bytes
+        real_write_text = Path.write_text
+        with tempfile.TemporaryDirectory(prefix='network evidence controls ') as folder:
+            directory = Path(folder)
+            records, errors = [], []
+            attempted = []
+            def one_shot_stream(path, data):
+                attempted.append(path.name)
+                if path.name.endswith('.stdout') and attempted.count(path.name) == 1:
+                    raise OSError('sentinel stream write failure')
+                return real_write_bytes(path, data)
+            provider = subprocess.CompletedProcess([sys.executable], 37,
+                                                   b'provider stdout', b'provider stderr')
+            with patch.object(driver.subprocess, 'run', return_value=provider), patch.object(
+                    Path, 'write_bytes', one_shot_stream), self.assertRaises(
+                        subprocess.CalledProcessError) as failed:
+                driver.captured_run(directory, records, errors, [sys.executable],
+                                    phase='provider', check=True, capture_output=True)
+            self.assertEqual(failed.exception.returncode, 37)
+            self.assertEqual((directory/'01-provider.stderr').read_bytes(), b'provider stderr')
+            self.assertIn('01-provider.stdout', attempted)
+            self.assertIn('01-provider.stderr', attempted)
+            manifest_attempts = []
+            def one_shot_manifest(path, data, *args, **kwargs):
+                manifest_attempts.append(path.name)
+                if path.name == 'manifest.json' and manifest_attempts.count(path.name) == 1:
+                    raise OSError('sentinel manifest write failure')
+                return real_write_text(path, data, *args, **kwargs)
+            with patch.object(Path, 'write_text', one_shot_manifest), contextlib.redirect_stderr(
+                    io.StringIO()) as raw:
+                driver.finalize_evidence(directory, {}, records, errors, ['native'],
+                                         'failed', failed.exception)
+            self.assertEqual(manifest_attempts, ['manifest.json'])
+            self.assertIn('sentinel stream write failure', raw.getvalue())
+            self.assertIn('sentinel manifest write failure', raw.getvalue())
+            self.assertEqual(records[0]['status'], 37)
+            self.assertTrue(any(row['operation'] == 'manifest write' for row in errors))
+        with tempfile.TemporaryDirectory(prefix='network tool mutation ') as folder:
+            directory = Path(folder)
+            tool = directory/'owned-tool'
+            tool.write_bytes(b'original')
+            records, errors = [], []
+            def mutate_tool(*args, **kwargs):
+                tool.write_bytes(b'changed')
+                return subprocess.CompletedProcess([str(tool)], 0, b'', b'')
+            with patch.object(driver.subprocess, 'run', side_effect=mutate_tool), self.assertRaises(
+                    RuntimeError):
+                driver.captured_run(directory, records, errors, [tool], phase='binding',
+                                    check=True, capture_output=True)
+            self.assertTrue(any(row['operation'] == 'tool binding' for row in errors))
+        with tempfile.TemporaryDirectory(prefix='network source mutation ') as folder:
+            directory = Path(folder)
+            source = directory/'owned-source'
+            source.write_bytes(b'original')
+            inputs = {'owned-source': driver.digest(source)}
+            source.write_bytes(b'changed')
+            errors = []
+            with patch.object(driver, 'ROOT', directory), contextlib.redirect_stderr(
+                    io.StringIO()), self.assertRaises(RuntimeError):
+                driver.finalize_evidence(directory, inputs, [], errors, ['native'], 'passed')
+            manifest = json.loads((directory/'manifest.json').read_text())
+            self.assertEqual(manifest['status'], 'failed')
+            self.assertTrue(any(row['operation'] == 'input binding' for row in errors))
+
     def test_network_native_and_sanitizer_keep_distinct_limits(self):
         import re
 
