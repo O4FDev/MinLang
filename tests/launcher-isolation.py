@@ -26,11 +26,11 @@ class LauncherIsolation(unittest.TestCase):
         build = self.project / 'build'
         build.mkdir(parents=True)
         shutil.copy2(ROOT / 'minyar', self.project / 'minyar')
-        for name in ('minyarc', 'minyar-runtime.o', 'minyar-runtime-release.ll'):
+        for name in ('minyarc', 'minyarc-errors-request', 'minyar-runtime.o', 'minyar-runtime-release.ll'):
             shutil.copy2(ROOT / 'build' / name, build / name)
         (self.project / 'Makefile').write_text(
-            '.PHONY: build/minyarc build/minyar-runtime.o build/minyar-runtime-release.ll\n'
-            'build/minyarc build/minyar-runtime.o build/minyar-runtime-release.ll:\n\t@:\n')
+            '.PHONY: build/minyarc build/minyarc-errors-request build/minyar-runtime.o build/minyar-runtime-release.ll\n'
+            'build/minyarc build/minyarc-errors-request build/minyar-runtime.o build/minyar-runtime-release.ll:\n\t@:\n')
         shutil.copytree(ROOT / 'runtime', self.project / 'runtime')
         shutil.copytree(ROOT / 'tools', self.project / 'tools')
         # Keep this path space-free for the race-only regression on the old launcher.
@@ -69,7 +69,8 @@ os.execv(os.environ['LAUNCHER_TEST_REAL_CLANG'], ['clang', *sys.argv[1:]])
         self.env = dict(os.environ, MINYAR_CLANG=str(self.wrapper),
                         MINYAR_CLANG_FLAGS='-O1 -Wno-override-module',
                         LAUNCHER_TEST_WORK=str(self.work),
-                        LAUNCHER_TEST_REAL_CLANG=shutil.which('clang'))
+                        LAUNCHER_TEST_REAL_CLANG=shutil.which('clang'), MAKEFLAGS='-j1')
+        self.env.pop('MFLAGS', None)
 
     def command(self, identity, text, release=False):
         directory = self.work / identity
@@ -145,6 +146,28 @@ os.execv(os.environ['LAUNCHER_TEST_REAL_CLANG'], ['clang', *sys.argv[1:]])
         self.assertFalse(output.exists())
         self.assertFalse((self.work / 'invalid.json').exists(), 'linker must not run')
         self.assert_clean()
+
+    def test_nonrequest_probe_failures_preserve_primary_diagnostic(self):
+        command, output = self.command('probe-failure', 'print(missingName)\n')
+        environment = dict(self.env, LAUNCHER_TEST_ID='probe-failure')
+        original = subprocess.run(command, cwd=self.work, env=environment,
+                                  capture_output=True, timeout=30)
+        self.assertEqual(original.returncode, 1)
+        self.assertIn(b"can't find a value", original.stderr)
+        probe = self.project / 'build/minyarc-errors-request'
+        for status in (0, 1, 37, 143):
+            with self.subTest(status=status):
+                probe.write_text('#!/bin/sh\nprintf partial > "$2"\n'
+                                 'printf "probe-only diagnostic\\n" >&2\n'
+                                 f'exit {status}\n')
+                probe.chmod(0o755)
+                result = subprocess.run(command, cwd=self.work, env=environment,
+                                        capture_output=True, timeout=30)
+                self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                 (original.returncode, original.stdout, original.stderr))
+                self.assertFalse(output.exists())
+                self.assertFalse((self.work / 'probe-failure.json').exists())
+                self.assert_clean()
 
     def test_linker_failure_and_signal_clean_intermediates(self):
         for mode, status in [('failure', 37), ('signal', 143)]:

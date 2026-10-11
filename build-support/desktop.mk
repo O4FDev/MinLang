@@ -34,3 +34,20 @@ check-native-linux: check-native-project
 .PHONY: check-graphics-render
 check-graphics-render: build/minyarc
 	$${MINYAR_PYTHON:-/usr/bin/python3} tests/graphics-render.py
+
+.PHONY: check-schannel-framing check-schannel-framing-sanitize
+
+build/schannel-framing: tests/schannel-framing.c runtime/native/schannel_framing.h build/.toolchain.json | build
+	$(LIMITED) "$(CC)" $(CFLAGS) $< -o $@
+
+build/schannel-framing-sanitize: tests/schannel-framing.c runtime/native/schannel_framing.h build/.toolchain.json | build
+	$(SANITIZER_LIMITED) "$(CC)" $(SANITIZER_FLAGS) -std=c11 -Wall -Wextra -Werror $< -o $@
+
+check-schannel-framing: build/schannel-framing
+	$(LIMITED) ./build/schannel-framing
+
+check-schannel-framing-sanitize: build/schannel-framing-sanitize
+	$(SANITIZER_LIMITED) ./build/schannel-framing-sanitize
+
+check check-portable: check-schannel-framing
+check-sanitize: check-schannel-framing-sanitize

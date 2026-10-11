@@ -9,11 +9,16 @@ from clang_helpers import clang_command
 ROOT=Path(__file__).resolve().parents[1]
 COMPILER=Path(os.environ.get('MINYAR_TEST_COMPILER',ROOT/'build/minyarc-modules')).resolve()
 BASE=ROOT/'build/minyarc'
+CALLBACKS=Path(os.environ.get('MINYAR_MODULE_CALLBACK_COMPILER',ROOT/'build/minyarc-callbacks')).resolve()
 
 
-def run(command,success=True):
-    result=subprocess.run(list(map(str,command)),capture_output=True,text=True,timeout=60)
-    assert (result.returncode==0)==success,result.stderr
+def run(command,success=True,allowed=None):
+    environment=os.environ.copy()
+    if str(command[0])==str(ROOT/'minyar'):
+        environment.pop('MFLAGS',None)
+        environment['MAKEFLAGS']='-j1'
+    result=subprocess.run(list(map(str,command)),capture_output=True,text=True,timeout=60,env=environment)
+    assert result.returncode in allowed if allowed is not None else (result.returncode==0)==success,result.stderr
     return result
 
 
@@ -25,13 +30,13 @@ with tempfile.TemporaryDirectory(prefix='minyar-module-interface-') as temp:
     cold=directory/'cold.ll'; warm=directory/'warm.ll'
 
     def compile(entry,*,expected=None,counts=None,update=True):
-        result=run([COMPILER,entry,warm,'--module-state',prior,next_state,stats])
+        result=run([COMPILER,entry,warm,'--module-state',prior,next_state,stats,'--library',ROOT/'library'])
         fields=stats.read_text().split()
         measured=tuple(map(int,fields[:6]))
         table_reused=fields[6]=='true'
         state=next_state.read_bytes()
         if update and state: prior.write_bytes(state)
-        run([COMPILER,entry,cold,'--module-state',empty,next_state,stats])
+        run([COMPILER,entry,cold,'--module-state',empty,next_state,stats,'--library',ROOT/'library'])
         assert cold.read_bytes()==warm.read_bytes(),'clean and reused module LLVM differ'
         if counts is not None: assert measured==counts,(entry,measured,counts)
         if expected is not None:
@@ -94,7 +99,7 @@ function main() {
     # function: a third-module field-layout edit must invalidate the entry.
     library.write_text('use "./leaf.min" as leaf\npublic function get(): leaf.Hidden { return leaf.make() }\n')
     # Directly naming the private type in a signature is correctly rejected.
-    failure=run([COMPILER,entry,warm,'--module-state',prior,next_state,stats],success=False)
+    failure=run([COMPILER,entry,warm,'--module-state',prior,next_state,stats,'--library',ROOT/'library'],success=False)
     assert 'private to its module' in failure.stderr
     public_leaf=leaf_source.replace('record Hidden','public record Hidden')
     leaf.write_text(public_leaf)
@@ -112,7 +117,7 @@ function main() {
     compile(entry,expected='7\n')
     leaf.write_text(leaf_source)
     saved=prior.read_bytes()
-    failure=run([COMPILER,entry,warm,'--module-state',prior,next_state,stats],success=False)
+    failure=run([COMPILER,entry,warm,'--module-state',prior,next_state,stats,'--library',ROOT/'library'],success=False)
     assert 'private to its module' in failure.stderr,failure.stderr
     assert prior.read_bytes()==saved
 
@@ -141,10 +146,10 @@ function main() {
         (public_leaf.replace('return Hidden','return missing'),'expected'),
     ]:
         leaf.write_text(source)
-        failure=run([COMPILER,entry,warm,'--module-state',prior,next_state,stats],success=False)
+        failure=run([COMPILER,entry,warm,'--module-state',prior,next_state,stats,'--library',ROOT/'library'],success=False)
         if diagnostic!='expected': assert diagnostic in failure.stderr,failure.stderr
     leaf.unlink()
-    assert 'could not be opened' in run([COMPILER,entry,warm,'--module-state',prior,next_state,stats],success=False).stderr
+    assert 'could not be opened' in run([COMPILER,entry,warm,'--module-state',prior,next_state,stats,'--library',ROOT/'library'],success=False).stderr
 
     # Diagnostics after long omitted bodies retain original source lines.
     leaf.write_text(public_leaf)
@@ -152,7 +157,7 @@ function main() {
     library.write_text(bad)
     entry.write_text('use "./library.min" as library\nprint(1)\n')
     expected_line=str(bad[:bad.index('public function bad')].count('\n')+1)
-    failure=run([COMPILER,entry,warm,'--module-state',prior,next_state,stats],success=False)
+    failure=run([COMPILER,entry,warm,'--module-state',prior,next_state,stats,'--library',ROOT/'library'],success=False)
     assert f'{library}:{expected_line}, column ' in failure.stderr,failure.stderr
 
     # Unicode, quotes and separators in paths must remain injective identities.
@@ -203,9 +208,26 @@ public function total(node: Node): Integer {
 
     for fixture in sorted((ROOT/'examples').glob('*.min')):
         prior.write_text('')
-        first,_=compile(fixture)
-        counts,table=compile(fixture)
-        assert counts==(first[1],0,0,first[1],0,0),counts
-        assert table
+        feature_output=directory/'feature-probe.ll'
+        if feature_output.exists(): feature_output.unlink()
+        feature=run([COMPILER,fixture,feature_output,'--library',ROOT/'library'],allowed=(0,86))
+        if feature.returncode==86:
+            # Parsed callback/cycle packages must preserve the ordinary signal,
+            # then compile through the public incremental fallback twice.
+            assert not feature_output.exists(),'ordinary feature request emitted partial LLVM'
+            ordinary=run([BASE,fixture,feature_output,'--library',ROOT/'library'],allowed=(86,))
+            assert not ordinary.stdout and not ordinary.stderr and not feature_output.exists()
+            extended=CALLBACKS
+            run([extended,fixture,cold,'--library',ROOT/'library'])
+            run([extended,fixture,warm,'--library',ROOT/'library'])
+            assert cold.read_bytes()==warm.read_bytes(),'extended package LLVM changed between cold and warm checks'
+            for _ in range(2):
+                checked=run([ROOT/'minyar','--incremental','--check',fixture])
+                assert 'checked ' in checked.stdout and not checked.stderr,checked
+        else:
+            first,_=compile(fixture)
+            counts,table=compile(fixture)
+            assert counts==(first[1],0,0,first[1],0,0),counts
+            assert table
 
 print('module interfaces: native equivalence, actual body bypass, stable identities, typed private closures, invalidation and source diagnostics verified')

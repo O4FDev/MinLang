@@ -50,3 +50,11 @@ check-recursive-data check-bounded check-peer-sanitize check-peer-ownership chec
 
 check-portable check: check-feature-dispatch check-managed-graphs check-managed-graphs-launcher check-callbacks check-callback-domains check-isolated-workers
 check-sanitize: check-managed-graphs-sanitize check-callbacks-sanitize check-managed-graphs-profiles check-isolated-workers-sanitize
+
+.PHONY: check-cycle-progress check-cycle-progress-sanitize
+check-cycle-progress:
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-progress.py --evidence build/cycle-progress-native
+check-cycle-progress-sanitize:
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/cycle-progress.py --sanitize --evidence build/cycle-progress-sanitize
+check check-portable: check-cycle-progress
+check-sanitize: check-cycle-progress-sanitize

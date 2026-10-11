@@ -9,6 +9,7 @@ def main():
     commands += [['quic-transport.py',*([mode] if mode else [])] for mode in ('','--key-update','--migration','--server-protocol','--resumption','--quic-resumption','--early','--fallback','--congestion','--stream-control','--stream-churn','--closing','--persistent','--retry','--rtt')]
     commands += [['tls-resumption-expiry.py'],['tls-handshake-validity.py']]
     if options.yamux_peer:commands += [['transport-go.py','--peer-binary',str(options.yamux_peer.resolve()),*extra] for extra in ([],['--streams','1536'])]
+    if options.yamux_peer:commands += [['transport-go.py','--fin-schedule']]
     results=[];options.artifacts.mkdir(parents=True,exist_ok=True)
     with (options.artifacts/'suite.log').open('w') as log:
         spec=importlib.util.spec_from_file_location('tls_tests',ROOT/'tests/tls-local.py');fixtures=importlib.util.module_from_spec(spec);spec.loader.exec_module(fixtures)
