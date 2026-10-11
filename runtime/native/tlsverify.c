@@ -203,6 +203,51 @@ static bool certificate_hostname(CertBytes certificate, const char *host) {
     return found_san && matched;
 }
 
+/* TLS1.3 authenticates by signature, even when a legacy SSL purpose allows
+ * keyEncipherment/keyAgreement. RFC8446 section4.4.2 requires digitalSignature
+ * when KU is present. Keep chain/path/EKU validation in the platform provider. */
+static bool certificate_signing_usage(CertBytes certificate) {
+    Der input = certificate, outer, tbs, field;
+    unsigned char tag;
+    if (!der_next(&input, &tag, &outer) || tag != 0x30 || input.length ||
+        !der_next(&outer, &tag, &tbs) || tag != 0x30)
+        return false;
+    if (tbs.length && tbs.data[0] == 0xa0 && !der_next(&tbs, &tag, &field))
+        return false;
+    for (int i = 0; i < 6; i++)
+        if (!der_next(&tbs, &tag, &field))
+            return false;
+    bool found = false;
+    while (tbs.length) {
+        if (!der_next(&tbs, &tag, &field))
+            return false;
+        if (tag != 0xa3)
+            continue;
+        Der extensions;
+        if (!der_next(&field, &tag, &extensions) || tag != 0x30 || field.length)
+            return false;
+        while (extensions.length) {
+            Der extension, oid, value;
+            if (!der_next(&extensions, &tag, &extension) || tag != 0x30 ||
+                !der_next(&extension, &tag, &oid) || tag != 6)
+                return false;
+            if (extension.length && extension.data[0] == 1 && !der_next(&extension, &tag, &value))
+                return false;
+            if (!der_next(&extension, &tag, &value) || tag != 4 || extension.length)
+                return false;
+            if (oid.length != 3 || memcmp(oid.data, "\x55\x1d\x0f", 3))
+                continue;
+            Der bits;
+            if (found || !der_next(&value, &tag, &bits) || tag != 3 || value.length ||
+                bits.length < 2 || bits.length > 3 || bits.data[0] > 7 || !(bits.data[1] & 0x80) ||
+                (bits.data[bits.length - 1] & ((1u << bits.data[0]) - 1)))
+                return false;
+            found = true;
+        }
+    }
+    return true;
+}
+
 #ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
 #include <Security/Security.h>
@@ -221,7 +266,7 @@ static MinyarText *verify_chain(const MinyarText *host, const MinyarBytes *chain
     CertBytes peers[MAX_CHAIN], roots[MAX_CHAIN];
     int peer_count = unpack_chain(chain, peers), root_count = unpack_chain(anchors, roots);
     char name[254] = {0};
-    if (peer_count <= 0 || root_count < 0 ||
+    if (peer_count <= 0 || root_count < 0 || !certificate_signing_usage(peers[0]) ||
         (server_peer && (!hostname(host, name) || !certificate_hostname(peers[0], name))))
         return error_text("invalid certificate chain or hostname");
     CFMutableArrayRef certificates = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
@@ -452,7 +497,7 @@ static MinyarText *verify_chain(const MinyarText *host, const MinyarBytes *chain
     CertBytes peers[MAX_CHAIN], roots[MAX_CHAIN];
     int peer_count = unpack_chain(chain, peers), root_count = unpack_chain(anchors, roots);
     char name[254] = {0};
-    if (peer_count <= 0 || root_count < 0 ||
+    if (peer_count <= 0 || root_count < 0 || !certificate_signing_usage(peers[0]) ||
         (server_peer && (!hostname(host, name) || !certificate_hostname(peers[0], name))))
         return error_text("invalid certificate chain or hostname");
     HCERTSTORE peer_store =
@@ -786,7 +831,7 @@ static MinyarText *verify_chain(const MinyarText *host, const MinyarBytes *chain
     CertBytes peers[MAX_CHAIN], roots[MAX_CHAIN];
     int peer_count = unpack_chain(chain, peers), root_count = unpack_chain(anchors, roots);
     char name[254] = {0};
-    if (peer_count <= 0 || root_count < 0 ||
+    if (peer_count <= 0 || root_count < 0 || !certificate_signing_usage(peers[0]) ||
         (server_peer && (!hostname(host, name) || !certificate_hostname(peers[0], name))))
         return error_text("invalid certificate chain or hostname");
     X509_STORE *store = X509_STORE_new();
