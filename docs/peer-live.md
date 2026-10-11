@@ -83,3 +83,67 @@ for both device and gateway clients, rejection of a registry-listed gateway
 and device from an omitted root, and malformed path-array configuration. Both gates require normal reactor
 shutdown with zero active peers/relays, so sanitizer leak checks run at exit.
 The existing scalar edge gate remains a separate compatibility control.
+
+
+## Independent QUIC device capacity fixture
+
+`tests/interop/quinn/src/bin/peer-edge-scale.rs` supplies a pinned Quinn/rustls
+client for actual device connections. It verifies the server as `localhost`,
+uses ALPN `hearth-peer`, and presents a distinct signed device certificate on
+each connection. Each device keeps one bidirectional HPW1 control stream open
+and sends HELLO followed by staggered fifteen-second HEARTBEAT messages.
+Heartbeat processing continues while the cohort connects, waits for the common
+measurement start, and shuts down. A failed task or early stream/connection
+closure fails the entire cohort; the peer never reconnects or skips a device.
+
+The Python fixture runs the supplied native edge against disposable Redis.
+Admission requires every expected `peer:live:{exit_id}` key, a distinct stable
+ownership epoch, the correct edge and region, and the complete healthy state.
+Client `AUTHENTICATED` output reports TLS and initial writes; server
+`ADMITTED` output establishes actual Redis-backed device admission.
+Gateway connection counts cannot substitute for device admission.
+
+Run load only on an authorized remote Linux host under its resource guard.
+The fixture additionally requires `MINYAR_REMOTE_LOAD=1`. It accepts
+1–20,000 devices, 30–82,800 measurement seconds and 30–1,800 setup seconds.
+The certificate generator uses disposable P-256 keys, unique device URI SANs
+and serials, and one shared lab leaf key. This is not a provisioning workflow.
+
+Build the peer separately, keeping Cargo serial:
+
+```sh
+CARGO_BUILD_JOBS=1 cargo build --release --locked \
+  --manifest-path tests/interop/quinn/Cargo.toml --bin peer-edge-scale -j1
+```
+
+The client arguments are:
+
+```text
+peer-edge-scale ADDRESS FIXTURES PEERS DURATION_SECONDS START_FILE [SETUP_DELAY_MS]
+```
+
+For a local-to-host short fixture, generate certificates with
+`python3 -B tests/peer-edge-device-scale.py --make-fixtures --fixtures DIR --peers 32`,
+then start the server with `--binary EDGE_BINARY --fixtures DIR --peers 32
+--seconds 30 --setup-seconds 60 --host :: --port 24567 --output EVIDENCE
+--start-file START_FILE`. Start the peer against `[::1]:24567` with the same
+fixtures, count, duration and initially absent start file. Only after server
+`ADMITTED 32` and client `AUTHENTICATED 32`, atomically write
+`{"utc_start": INTEGER_UNIX_SECONDS}` with a future start within thirty
+seconds. Separate hosts require the same fresh value in their respective start
+files. The client maps this once to monotonic time and holds every connection
+at least ten seconds beyond measurement before staggered closes.
+
+The measurement checks all devices remain present and all heartbeat timestamps
+advance after the common start. Idle edge CPU must remain at most 2% of one
+core. For a run of at least 7,200 seconds, RSS growth must stay at most 16 MiB and
+its fitted slope at most 0.2 KiB/s. Teardown requires all live keys to retire,
+normal native exit, empty native stderr, zero active peers/retained relays and
+balanced opened/released relay calls. A short fixture is functional admission
+and teardown evidence; the sustained 20,000-device run is a separate capacity
+measurement.
+
+`make check-peer-edge-device-scale-controls` exercises adversarial Redis
+accounting and certificate fixtures. `make check-peer-edge-device-scale-peer`
+runs the Rust argument, common-start, framing and timing unit controls.
+Neither target starts the load fixture or certifies production deployment.

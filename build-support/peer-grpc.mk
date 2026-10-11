@@ -107,3 +107,12 @@ check-peer-edge-pki-sanitize: build/minyarc check-peer-grpc-python
 	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge-pki.py --sanitize
 check: check-peer-edge-pki
 check-sanitize: check-peer-edge-pki-sanitize
+
+# The independent device peer stays outside default CI and sustained-load runs.
+PEER_EDGE_SCALE_PYTHON ?= python3
+.PHONY: check-peer-edge-device-scale-controls check-peer-edge-device-scale-peer
+check-peer-edge-device-scale-controls:
+	"$(PEER_EDGE_SCALE_PYTHON)" -B tests/peer-edge-device-scale-controls.py
+
+check-peer-edge-device-scale-peer:
+	CARGO_BUILD_JOBS=1 cargo test --release --locked --manifest-path tests/interop/quinn/Cargo.toml --bin peer-edge-scale -j1
