@@ -64,6 +64,16 @@ def main():
                 assert result.returncode==expected,(mode,fault,result.returncode,result.stdout,result.stderr)
                 return result.stdout.splitlines()
             prefix='san-' if sanitize else 'normal-'
+            # Actual nonprivileged fork refusal is recoverable and must close
+            # both status-pipe descriptors, preserving the installed journal.
+            if sys.platform.startswith('linux') and os.geteuid()!=0:
+                root=lab/(prefix+'fork-failure');root.mkdir(mode=0o700)
+                assert invoke(root,old)==['ACTIVATED']
+                before=(root/'state').read_bytes()
+                output=invoke(root,old,'fork-failure')
+                assert 'FORK-REFUSED-WITHOUT-LEAK' in output and 'ERROR' in output,output
+                assert (root/'state').read_bytes()==before
+                assert 'OWNED-HELPER' in invoke(root,old,'launch')
             # Deterministic post-verification mutation races.
             for mode in ['replace','write','extra','ancestor','parent','anchored-parent']:
                 for bundled,item in [(False,raw),(True,old)]:
@@ -86,6 +96,14 @@ def main():
                         assert 'MUTATION-BLOCKED' in output and 'OWNED-HELPER' in output,output
                     else:
                         assert 'ERROR' in output and 'OWNED-HELPER' not in output,output
+            # Existing non-CLOEXEC descriptors remain valid after reducing
+            # RLIMIT_NOFILE; the updater must still exclude them from children.
+            if not windows_host():
+                for bundled,item in [(False,raw),(True,old)]:
+                    root=lab/(prefix+'descriptor'+str(bundled));root.mkdir(mode=0o700)
+                    assert invoke(root,item)==['ACTIVATED']
+                    output=invoke(root,item,'descriptor')
+                    assert 'OWNED-HELPER' in output and 'LEAKED:0' in output,output
             # Every new bundle publication phase preserves an old complete
             # generation or exposes exactly one complete new generation.
             for point in ['bundle-entry-written','bundle-before-replace','bundle-after-replace',

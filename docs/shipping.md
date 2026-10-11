@@ -156,22 +156,31 @@ and compares all resources and code against the authenticated bundle bytes.
 Linux executes the retained checked native image with fexecve. POSIX launch
 also resolves the original root through every lexical ancestor and compares it
 with the pinned root descriptor, rejecting root/parent renames and substitutions
-observed at that check. macOS retains the image descriptor and, after closing
-other inherited descriptors in the child, checks root, working-directory and
-executable pathname identities before execve from its
+observed at that check. macOS retains the image descriptor and checks root,
+working-directory and executable pathname identities in the child before
+replacing it with `posix_spawn(POSIX_SPAWN_SETEXEC)` from its
 `.app/Contents/MacOS` location; macOS lacks fexecve.
 Windows holds non-write/non-delete shared handles across verification and
 CreateProcessW, with an explicit application path and exact CRT argument
-quoting. POSIX inherits only descriptors 0/1/2; Windows supplies an explicit
-handle list for duplicated standard streams. Update locks, resource handles
+quoting. POSIX inherits only non-CLOEXEC standard streams 0/1/2. Linux
+uses kernel close_range over the whole descriptor table, keeping only the
+CLOEXEC executable and status pipe until exec; this requires Linux 5.9+ with
+close_range available in the build headers and permitted by sandbox policy.
+Unavailable descriptor cleanup returns a recoverable launch error. Darwin uses
+`POSIX_SPAWN_CLOEXEC_DEFAULT` and explicit inheritance actions for standard
+streams, so open descriptors above a subsequently lowered RLIMIT_NOFILE are
+also excluded. [Apple's spawn interface](https://github.com/apple-oss-distributions/xnu/blob/main/libsyscall/wrappers/spawn/spawn.h)
+and [kernel inheritance handling](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_exec.c)
+define these platform mechanisms. Windows supplies an explicit handle list for
+duplicated standard streams. Update locks, resource handles
 and arbitrary application handles are not inherited. POSIX child loader
 override variables `LD_*` and `DYLD_*` are removed.
 
 These guarantees assume the documented protected app-owned root. A privileged
 or same-user attacker able to chmod/replace the app or its root is outside this
 boundary. Retained POSIX descriptors do not prohibit same-user rename or
-in-place writes. In particular, Darwin's final identity checks and execve are
-separate operations: a writer can change an ancestor, executable pathname or
+in-place writes. In particular, Darwin's final identity checks and the subsequent
+kernel pathname resolution during SETEXEC are separate operations: a writer can change an ancestor, executable pathname or
 checked inode after the checks and before the kernel resolves the launch path.
 The deterministic mutation hook exercises changes before the final checks; it
 does not prove atomicity across this remaining boundary. macOS launch therefore

@@ -2,6 +2,16 @@
  * The application owns the protected installation directory. No downloaded
  * path or shell command is ever evaluated. State is the sole active pointer.
  */
+#ifdef __APPLE__
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE 1
+#endif
+#endif
+#ifdef __linux__
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+#endif
 #include "../minyar_native.h"
 #include "../../vendor/monocypher/monocypher-ed25519.h"
 #include <errno.h>
@@ -26,6 +36,11 @@
 #include <dirent.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
+#ifdef __APPLE__
+#include <spawn.h>
+#elif defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #define upd_close close
 #define upd_read read
 #define upd_write write
@@ -1180,6 +1195,40 @@ static long long next_child;
 
 #ifndef _WIN32
 extern char **environ;
+static bool process_problem(const char *message, int error) {
+    char detail[256];
+    snprintf(detail, sizeof(detail), "%s: %s", message, strerror(error));
+    return problem(detail);
+}
+#ifdef __linux__
+static int close_inherited(int image, int report) {
+#ifdef SYS_close_range
+    /* Current resource limits need not cover descriptors opened before the
+     * application lowered them. Kernel ranges cover the actual entire table. */
+    int keep[2] = {image, report};
+    if (keep[0] > keep[1]) {
+        int temporary = keep[0];
+        keep[0] = keep[1];
+        keep[1] = temporary;
+    }
+    unsigned first = 3;
+    for (size_t i = 0; i < 2; i++) {
+        if (keep[i] < 3)
+            continue;
+        unsigned retained = (unsigned)keep[i];
+        if (first < retained && syscall(SYS_close_range, first, retained - 1, 0U) < 0)
+            return -1;
+        first = retained + 1;
+    }
+    return (int)syscall(SYS_close_range, first, UINT_MAX, 0U);
+#else
+    (void)image;
+    (void)report;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+#endif
 static char **launch_environment(void) {
     size_t count = 0;
     while (environ[count])
@@ -1419,6 +1468,29 @@ long long minyar_update_launchChecked(long long id, const MinyarText *digest,
             problem("cannot allocate clean launch environment");
         }
     }
+#ifdef __APPLE__
+    posix_spawnattr_t spawn_attributes;
+    posix_spawn_file_actions_t spawn_actions;
+    bool attributes_ready = false, actions_ready = false;
+    if (success) {
+        attributes_ready = posix_spawnattr_init(&spawn_attributes) == 0;
+        actions_ready = attributes_ready && posix_spawn_file_actions_init(&spawn_actions) == 0;
+        success = actions_ready &&
+                  posix_spawnattr_setflags(&spawn_attributes,
+                                           POSIX_SPAWN_SETEXEC | POSIX_SPAWN_CLOEXEC_DEFAULT) == 0;
+        for (int fd = 0; success && fd < 3; fd++) {
+            int flags = fcntl(fd, F_GETFD);
+            /* Internal descriptors may occupy closed standard slots. Preserve
+             * only actual non-CLOEXEC streams, never those updater handles. */
+            if (flags >= 0 && !(flags & FD_CLOEXEC))
+                success = posix_spawn_file_actions_addinherit_np(&spawn_actions, fd) == 0;
+            else if (flags < 0 && errno != EBADF)
+                success = false;
+        }
+        if (!success)
+            problem("cannot configure standard-only macOS process inheritance");
+    }
+#endif
     if (success) {
         int report[2] = {-1, -1};
         if (pipe(report) < 0 || fcntl(report[0], F_SETFD, FD_CLOEXEC) < 0 ||
@@ -1430,26 +1502,18 @@ long long minyar_update_launchChecked(long long id, const MinyarText *digest,
             if (report[1] >= 0)
                 close(report[1]);
         }
-        struct rlimit limit;
-        long bound = 65536;
-        if (getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur < (rlim_t)INT_MAX)
-            bound = (long)limit.rlim_cur;
         pid_t process = success ? fork() : -1;
         if (process == 0) {
             int error = 0;
             close(report[0]);
             if (fchdir(cwd) < 0)
                 error = errno;
-            /* Close all nonstandard inherited descriptors. Darwin also keeps
-             * two close-on-exec directory descriptors for its last pathname
-             * identity checks; none survive a successful exec. */
-            for (int fd = 3; fd < bound; fd++)
-                if (fd != executable && fd != report[1]
-#ifdef __APPLE__
-                    && fd != found->root_fd && fd != cwd
+#ifdef __linux__
+            if (!error && close_inherited(executable, report[1]) < 0)
+                error = errno;
+#elif !defined(__APPLE__)
+            error = ENOTSUP;
 #endif
-                )
-                    close(fd);
 #ifdef __APPLE__
             if (!error && (!root_identity_matches(found) || !identity_matches(cwd, payload, true) ||
                            !identity_matches(executable, path, false)))
@@ -1457,16 +1521,18 @@ long long minyar_update_launchChecked(long long id, const MinyarText *digest,
 #endif
             if (!error) {
 #ifdef __APPLE__
-                /* Darwin has no descriptor-exec primitive here. A same-user
-                 * writer can still rename/write after this final check and
-                 * before pathname resolution in execve. Protected-root policy,
-                 * not descriptor retention, excludes that remaining race. */
-                execve(path, argv, environment);
+                /* SETEXEC replaces this forked child; CLOEXEC_DEFAULT applies
+                 * to the actual descriptor table, regardless of lowered limits.
+                 * It still resolves a pathname after these separate checks.
+                 * Protected-root policy excludes the remaining rename/write
+                 * race; descriptor retention does not make it atomic. */
+                pid_t ignored_pid;
+                error = posix_spawn(&ignored_pid, path, &spawn_actions, &spawn_attributes, argv,
+                                    environment);
 #else
                 fexecve(executable, argv, environment);
+                error = errno;
 #endif
-                if (!error)
-                    error = errno;
             }
             ssize_t ignored = write(report[1], &error, sizeof(error));
             (void)ignored;
@@ -1488,7 +1554,7 @@ long long minyar_update_launchChecked(long long id, const MinyarText *digest,
                 int status;
                 while (waitpid(process, &status, 0) < 0 && errno == EINTR) {
                 }
-                problem("authenticated executable could not start");
+                process_problem("authenticated executable could not start", error);
             } else {
                 if (replace)
                     _exit(0);
@@ -1496,9 +1562,19 @@ long long minyar_update_launchChecked(long long id, const MinyarText *digest,
                 child->id = ++next_child;
                 result = child->id;
             }
-        } else if (success)
-            problem("cannot fork checked update process");
+        } else if (success) {
+            int error = errno;
+            close(report[0]);
+            close(report[1]);
+            process_problem("cannot fork checked update process", error);
+        }
     }
+#ifdef __APPLE__
+    if (actions_ready)
+        posix_spawn_file_actions_destroy(&spawn_actions);
+    if (attributes_ready)
+        posix_spawnattr_destroy(&spawn_attributes);
+#endif
     free(environment);
 #endif
     if (pins)

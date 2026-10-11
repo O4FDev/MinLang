@@ -79,6 +79,11 @@ class Launch(unittest.TestCase):
         self.metadata.write_bytes(('\n'.join(fields)+'\n').encode())
         sig=subprocess.check_output([str(self.signer),str(self.metadata)],timeout=10)
         self.signature.write_bytes(bytes([sig[0]^1])+sig[1:] if corrupt else sig)
+        if os.environ.get('MINYAR_UPDATE_EVIDENCE'):
+            corpus=type(self).lab/'signed-corpus';corpus.mkdir(exist_ok=True)
+            (corpus/(digest+'.artifact')).write_bytes(data)
+            metadata_hash=hashlib.sha256(self.metadata.read_bytes()).hexdigest()
+            (corpus/(metadata_hash+'.receipt')).write_bytes(self.signature.read_bytes()+self.metadata.read_bytes())
         result=self.run_driver('install',str(self.artifact),device=device)
         return result,digest
 
@@ -87,6 +92,26 @@ class Launch(unittest.TestCase):
             current,str(now),device,*args],capture_output=True,text=True,timeout=15)
         self.assertEqual(result.returncode,0,result.stderr)
         return result.stdout.splitlines()
+
+    def test_actual_fork_refusal_returns_error_and_preserves_restart_caller(self):
+        if platform.system()!='Linux' or os.geteuid()==0:
+            self.skipTest('actual nonprivileged Linux RLIMIT_NPROC refusal')
+        import resource
+        self.assertEqual(self.install(package(self.entries))[0],['true','true'])
+        before=(self.root/'state').read_bytes()
+        def refuse_fork():
+            _,hard=resource.getrlimit(resource.RLIMIT_NPROC)
+            resource.setrlimit(resource.RLIMIT_NPROC,(0,hard))
+        for mode in ['launch','restart']:
+            result=subprocess.run([str(self.driver),mode,str(self.root),str(self.metadata),
+                str(self.signature),'1.0.0','1800000000','test-device'],
+                capture_output=True,text=True,preexec_fn=refuse_fork,timeout=15)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(result.stdout.splitlines()[0],'false')
+            self.assertIn('cannot fork checked update process',result.stdout)
+            self.assertNotIn('OWNED-HELPER',result.stdout)
+            self.assertEqual((self.root/'state').read_bytes(),before)
+        self.assertIn('OWNED-HELPER',self.run_driver('launch'))
 
     def test_signed_bundle_launch_preserves_arguments_resources_and_handles(self):
         result,digest=self.install(package(self.entries))

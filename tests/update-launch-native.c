@@ -7,6 +7,8 @@
 #else
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
+#include <fcntl.h>
 #endif
 extern long long minyar_update_begin(const MinyarText *);
 extern void minyar_update_end(long long);
@@ -68,6 +70,15 @@ void minyar_update_test_hook(const char *point) {
 static MinyarText *text(const char *source) {
     return minyar_native_copy_text((const unsigned char *)source, (long long)strlen(source));
 }
+#ifdef __linux__
+static int descriptor_count(void) {
+    int count = 0;
+    for (int fd = 3; fd < 256; fd++)
+        if (fcntl(fd, F_GETFD) >= 0)
+            count++;
+    return count;
+}
+#endif
 static MinyarBytes *file(const char *path) {
     FILE *stream = fopen(path, "rb");
     assert(stream);
@@ -143,7 +154,51 @@ int main(int argc, char **argv) {
     } else {
         unsigned char args[] = {'s', 'a', 'f', 'e', 0, 0};
         MinyarBytes arguments = {args, sizeof(args), sizeof(args), NULL, NULL};
+#ifndef _WIN32
+        struct rlimit original_limit;
+        int owned_descriptor = -1, before = 0;
+        bool refuse_fork = false;
+#ifdef __linux__
+        refuse_fork = !strcmp(action, "fork-failure");
+        if (refuse_fork) {
+            assert(geteuid() != 0);
+            assert(getrlimit(RLIMIT_NPROC, &original_limit) == 0);
+            struct rlimit reduced = original_limit;
+            reduced.rlim_cur = 0;
+            assert(setrlimit(RLIMIT_NPROC, &reduced) == 0);
+            before = descriptor_count();
+        }
+#endif
+        if (!strcmp(action, "descriptor")) {
+            int descriptor = open("/dev/null", O_RDONLY);
+            assert(descriptor >= 0);
+            owned_descriptor = fcntl(descriptor, F_DUPFD, 200);
+            close(descriptor);
+            assert(owned_descriptor >= 200);
+            assert(getrlimit(RLIMIT_NOFILE, &original_limit) == 0);
+            struct rlimit reduced = original_limit;
+            reduced.rlim_cur = 128;
+            assert(setrlimit(RLIMIT_NOFILE, &reduced) == 0);
+        }
+#endif
         long long child = minyar_update_launchChecked(handle, digest, artifact, &arguments, false);
+#ifndef _WIN32
+        if (owned_descriptor >= 0) {
+            assert(setrlimit(RLIMIT_NOFILE, &original_limit) == 0);
+            close(owned_descriptor);
+        }
+#ifdef __linux__
+        if (refuse_fork) {
+            assert(setrlimit(RLIMIT_NPROC, &original_limit) == 0);
+            assert(child < 0);
+            assert(descriptor_count() == before);
+            puts("FORK-REFUSED-WITHOUT-LEAK");
+        }
+#else
+        (void)before;
+        (void)refuse_fork;
+#endif
+#endif
         if (child < 0)
             puts("ERROR");
         else {
