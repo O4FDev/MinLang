@@ -676,6 +676,323 @@ def copy_layout_control(root):
     return {"status":"passed","checks":{"upstream_logdir_contents_preserved":(destination/"keys.log").is_file(),"no_unrequested_subdirectory":not (destination/"owned-logs").exists()}},"passed"
 
 
+REVIEW_CASES=("up-status-one","up-status-unsupported","created-declared-networks","stopped-declared-networks","admission-not-opened-revoked","admission-closed-revoked","watch-late-object","pidfd-check-signal-race","session-extinction-latch","root-wnowait-before-drain","close-secondary-preserves-primary","close-state-secondary-preserves-primary")
+CASES+=REVIEW_CASES
+
+def receipt_daemon(root,status=0):
+    owner,base=setup(root);template=base.read()
+    for entry in template["containers"].values():entry["State"]={"Running":False,"ExitCode":0}
+    adapter.atomic_json(base.path,{"containers":{},"networks":{},"events":[]})
+    class Fake(adapter.JsonDaemon):
+        def __init__(self,path):super().__init__(path);self.commands=type("Rows",(),{"rows":[]})();self.after=False;self.events=[]
+        def row(self,operation,code=0,stderr=b""):
+            path=root/("raw-"+str(len(self.commands.rows))+".stderr");path.write_bytes(stderr)
+            self.commands.rows.append({"operation":operation,"status":code,"stderr":adapter.binding(path),"lifetime":{"certified":True}})
+        def command(self,*args,**kwargs):
+            operation=next((v for v in args if v in ("create","up")),args[0]);self.events.append(operation)
+            if operation=="create":adapter.atomic_json(self.path,template)
+            self.row(operation,status if operation=="up" else 0,b"exact up stderr\n" if operation=="up" else b"inspection stderr\n")
+            if operation=="up":self.after=True
+            return b""
+        def containers(self):
+            if self.after:self.row("post-ps")
+            return super().containers()
+        def inspect(self,identity):
+            if self.after:self.row("post-inspect")
+            return super().inspect(identity)
+        def networks(self):
+            if self.after:self.row("post-network")
+            return super().networks()
+    return owner,Fake(base.path)
+
+def invoke_fake(owner,daemon):
+    real=adapter.runner_daemon;previous={key:os.environ.get(key) for key in ("SERVER","CLIENT")}
+    adapter.runner_daemon=lambda:(owner,daemon);os.environ["SERVER"]=IMAGE;os.environ["CLIENT"]=IMAGE
+    import io
+    class Output:
+        def __init__(self):self.buffer=io.BytesIO()
+        def flush(self):pass
+    out=Output();err=Output();real_out=sys.stdout;real_err=sys.stderr;sys.stdout=out;sys.stderr=err
+    try:status=adapter.docker_entry(["compose","--env-file","empty.env","up","--abort-on-container-exit","--timeout","10","sim","client","server"])
+    finally:
+        sys.stdout=real_out;sys.stderr=real_err;adapter.runner_daemon=real
+        for key,value in previous.items():
+            if value is None:os.environ.pop(key,None)
+            else:os.environ[key]=value
+    return status,out.buffer.getvalue(),err.buffer.getvalue()
+
+def up_receipt_control(case,root):
+    code=1 if case=="up-status-one" else 127;owner,daemon=receipt_daemon(root,code)
+    status,out,err=invoke_fake(owner,daemon);intent=json.loads((owner.paths["artifacts"]/"create-admission.json").read_bytes())
+    return {"status":"passed","checks":{"exact_up_status":status==code,"exact_up_stderr":err==b"exact up stderr\n","intent_binds_up_status":intent.get("workload_status")==code,"successful_later_inspection_present":any(row["operation"].startswith("post-") and row["status"]==0 for row in daemon.commands.rows)}},"passed"
+
+def declared_topology_control(case,root):
+    owner,daemon=setup(root);state=daemon.read()
+    configured={}
+    for entry in state["containers"].values():
+        entry["State"]={"Running":False,"ExitCode":0,"Status":"created" if case.startswith("created") else "exited"}
+        configured[entry["Id"]]={name:value["NetworkID"] for name,value in entry["NetworkSettings"]["Networks"].items()}
+        for value in entry["NetworkSettings"]["Networks"].values():value["NetworkID"]="";value["EndpointID"]=""
+    for network in state["networks"].values():network["Containers"]={}
+    adapter.atomic_json(owner.paths["artifacts"]/"configured-topology.json",{"schema_version":1,"project":owner.project,"nonce":owner.nonce,"containers":configured,"networks":{v["Name"]:v["Id"] for v in state["networks"].values()}})
+    accepted=False
+    try:adapter.verified_topology(owner,list(state["containers"].values()),list(state["networks"].values()));accepted=True
+    except adapter.OwnershipError:pass
+    return {"status":"passed","checks":{"honest_declared_phase_accepted":accepted,"no_live_endpoint_members":all(not network["Containers"] for network in state["networks"].values())}},"passed"
+
+def revoked_control(case,root):
+    owner,daemon=receipt_daemon(root)
+    if case=="admission-closed-revoked":adapter.atomic_json(owner.paths["artifacts"]/"create-admission.json",{"schema_version":1,"project":owner.project,"nonce":owner.nonce,"state":"closed","certified":True})
+    adapter.close_admission(owner);refused=False
+    try:invoke_fake(owner,daemon)
+    except (adapter.OwnershipError,adapter.CleanupError):refused=True
+    return {"status":"passed","checks":{"delayed_wrapper_refused":refused,"no_create_after_closure":not daemon.events,"persistent_revocation":(owner.paths["artifacts"]/"admission-revoked.json").exists()}},"passed"
+
+def late_object_control(root):
+    owner,daemon=setup(root);template=daemon.read();real=adapter.TreeRetention.capture;current=adapter.process_identity(os.getpid())
+    def capture(self,path,label):
+        result=real(self,path,label)
+        if label=="runner_root":
+            late=json.loads(json.dumps(template));late["containers"]={"2"*64:late["containers"]["2"*64]};late["networks"]={"8"*64:late["networks"]["8"*64]};late["networks"]["8"*64]["Containers"]={"2"*64:{}}
+            adapter.atomic_json(daemon.path,late)
+        return result
+    adapter.TreeRetention.capture=capture;caught=None
+    try:
+        try:adapter.watch_owned(owner,daemon,current,current,time.monotonic()-.01,root/"watch",interval=.5)
+        except adapter.CleanupError as error:caught=error
+    finally:adapter.TreeRetention.capture=real
+    final=json.loads((root/"watch/watch-final.json").read_bytes())
+    return {"status":"passed","checks":{"late_object_forces_nonpass":caught is not None and final["status"]=="failed","late_immutable_identity_retained":final["remaining_ids"]==["2"*64],"tree_retention_survives":(root/"watch/retained-trees/retention.json").exists()}},"passed"
+
+def pidfd_control(case,root):
+    member={"pid":424242,"start_ticks":77,"pgid":424243,"session":424243};identity={"pid":424243,"start_ticks":76};done=[False];numeric=[];held=[];opens=[]
+    real_members=adapter.cli_members;real_identity=adapter.process_identity;real_kill=adapter.os.kill;real_open=getattr(adapter,"open_process_handle",None)
+    class Handle:
+        def __init__(self,value):self.identity=value;self.exited=False;self.closed=False
+        def send(self,sig):held.append({"identity":self.identity,"signal":sig});done[0]=True;self.exited=True
+        def close(self):self.closed=True
+        def ready(self):return self.exited
+    def members(*args,**kwargs):return [] if done[0] else [dict(member)]
+    def open_handle(value,*args,**kwargs):opens.append(dict(value));return Handle(dict(value))
+    adapter.cli_members=members;adapter.process_identity=lambda pid:{"pid":pid,"start_ticks":77 if pid==424242 else 76}
+    adapter.os.kill=lambda pid,sig:(numeric.append(pid),done.__setitem__(0,True))
+    adapter.open_process_handle=open_handle;known={};receipts=[]
+    try:
+        if case=="session-extinction-latch":
+            done[0]=True;adapter.drain_cli(identity,known,receipts,time.monotonic()+1)
+            done[0]=False
+            adapter.drain_cli(identity,known,receipts,time.monotonic()+1)
+            checks={"permanent_extinction_refuses_numeric_reuse":not numeric and not held,"no_reopened_membership":not known}
+        else:
+            adapter.drain_cli(identity,known,receipts,time.monotonic()+1)
+            checks={"no_numeric_pid_signal":not numeric,"signal_uses_held_birth_handle":bool(held) and bool(opens),"owned_signal_receipt":bool(receipts)}
+    finally:
+        adapter.cli_members=real_members;adapter.process_identity=real_identity;adapter.os.kill=real_kill
+        if real_open is None:del adapter.open_process_handle
+        else:adapter.open_process_handle=real_open
+    return {"status":"passed","scope":"mock transition only; no actual PID reuse or signal","checks":checks,"numeric_requests":numeric,"held_requests":held},"passed"
+
+def wnowait_control(root):
+    records=adapter.RawCommands(root/"commands");real=adapter.subprocess.Popen;children=[];polls=[]
+    class NoEarlyReap(real):
+        def poll(self):polls.append(self.pid);raise RuntimeError("sole reap before final drain")
+    def popen(*args,**kwargs):
+        child=NoEarlyReap(*args,**kwargs);children.append(child);return child
+    adapter.subprocess.Popen=popen;completed=False
+    try:
+        try:records.run([sys.executable,"-c","print('harmless completion')"],3);completed=True
+        except BaseException:pass
+    finally:
+        adapter.subprocess.Popen=real
+        for child in children:
+            if real.poll(child) is None:child.kill()
+            child.wait(timeout=2)
+    return {"status":"passed","checks":{"no_poll_before_drain":not polls,"actual_harmless_completion":completed,"raw_receipt_retained":(root/"commands/commands.json").exists()}},"passed"
+
+def close_primary_control(root,close_state_failure=False):
+    records=adapter.RawCommands(root/"commands");original=RuntimeError("original second registration sentinel")
+    real_popen=adapter.subprocess.Popen;real_selector=adapter.selectors.DefaultSelector;children=[];attempts=[];prior=subreaper_value()
+    class Stream:
+        def __init__(self,stream,name):self.stream=stream;self.name=name;self.failed=False
+        def fileno(self):return self.stream.fileno()
+        def close(self):
+            attempts.append(self.name)
+            if self.name=="stdout" and not self.failed:self.failed=True;raise OSError("secondary stdout close failure")
+            return self.stream.close()
+        def __getattr__(self,name):
+            if name=="closed" and close_state_failure:raise OSError("secondary close state failure")
+            return getattr(self.stream,name)
+    class Partial:
+        def __init__(self):self.real=real_selector();self.count=0
+        def register(self,*args,**kwargs):
+            self.count+=1
+            if self.count==2:raise original
+            return self.real.register(*args,**kwargs)
+        def close(self):attempts.append("selector");return self.real.close()
+    def popen(*args,**kwargs):
+        child=real_popen(*args,**kwargs);child.stdout=Stream(child.stdout,"stdout");child.stderr=Stream(child.stderr,"stderr");children.append(child);return child
+    adapter.subprocess.Popen=popen;adapter.selectors.DefaultSelector=Partial;caught=None
+    try:
+        try:records.run([sys.executable,"-c","import time;time.sleep(10)"],3)
+        except BaseException as error:caught=error
+        flag=subreaper_value()
+    finally:
+        adapter.subprocess.Popen=real_popen;adapter.selectors.DefaultSelector=real_selector
+        for child in children:
+            for stream in (child.stdout,child.stderr):
+                try:stream.close()
+                except OSError:stream.close()
+            if child.poll() is None:child.kill()
+            child.wait(timeout=2)
+        import ctypes
+        ctypes.CDLL(None).prctl(36,prior,0,0,0)
+    row=records.rows[0]
+    return {"status":"passed","checks":{"original_primary_identity":caught is original,"stderr_and_selector_attempted":"stderr" in attempts and "selector" in attempts,"restoration_attempted":flag==prior,"secondary_ledger":any("stdout close" in e["message"] for e in row["finalization_errors"]),"secondary_note":any("stdout close" in n for n in getattr(original,"__notes__",[])),"final_raw_ledger":(root/"commands/commands.json").exists()}},"passed"
+
+def review_control(case,root):
+    if case.startswith("up-status-"):return up_receipt_control(case,root)
+    if case.startswith(("created-","stopped-")):return declared_topology_control(case,root)
+    if case.startswith("admission-"):return revoked_control(case,root)
+    if case=="watch-late-object":return late_object_control(root)
+    if case in ("pidfd-check-signal-race","session-extinction-latch"):return pidfd_control(case,root)
+    if case=="root-wnowait-before-drain":return wnowait_control(root)
+    return close_primary_control(root,case=="close-state-secondary-preserves-primary")
+
+
+BOOT_CASES=("admitted-cli-success","admitted-cli-publication-failure","admitted-cli-revoked-at-spawn","admitted-cli-controller-death","admission-close-lock-race","phase-next-admission","created-wrong-configured-id","stopped-wrong-configured-id","raw-birthday-failure","raw-birthday-failure-escaped")
+CASES+=BOOT_CASES
+
+def admitted_control(case,root):
+    owner,daemon=setup(root);records=adapter.RawCommands(root/"commands");marker=root/"executed"
+    intent={"schema_version":1,"project":owner.project,"nonce":owner.nonce,"state":"creating","certified":False}
+    adapter.atomic_json(owner.paths["artifacts"]/"create-admission.json",intent)
+    original=RuntimeError("original publication failure");real=records.save;raised=[False]
+    if case=="admitted-cli-publication-failure":
+        def save():
+            if records.rows[0]["process_identity"] is not None and not raised[0]:raised[0]=True;raise original
+            return real()
+        records.save=save
+    if case=="admitted-cli-revoked-at-spawn":
+        try:adapter.close_admission(owner)
+        except adapter.CleanupError:pass
+    caught=None
+    argv=[sys.executable,"-c","from pathlib import Path;Path("+repr(str(marker))+").write_text('owned harmless execution');print('admitted')"]
+    try:raw=records.run(argv,3,admission_spec=owner)
+    except BaseException as error:caught=error;raw=None
+    row=records.rows[0]
+    checks={"raw_ledger":(records.root/"commands.json").exists(),"no_remaining_children":not adapter.direct_children()}
+    if case=="admitted-cli-success":checks.update({"actual_owned_execution":raw==b"admitted\n" and marker.exists(),"launcher_and_intended_argv_bound":row["argv"]==argv and bool(row.get("launcher_argv")) and row["launcher_source"]==adapter.binding(MODULE),"status_and_lifetime":row["status"]==0 and row["lifetime"]["certified"]})
+    elif case=="admitted-cli-publication-failure":checks.update({"primary_identity":caught is original,"no_unpublished_execution":not marker.exists(),"birthday_published":row["process_identity"] is not None,"nonpass":row["lifetime"]["certified"] is False})
+    else:checks.update({"revocation_rejected":isinstance(caught,adapter.OwnershipError),"never_spawned":row["process_identity"] is None,"no_execution":not marker.exists()})
+    return {"status":"passed","checks":checks},"passed"
+
+def birthday_failure_control(root,escaped=False):
+    records=adapter.RawCommands(root/"commands");original=RuntimeError("original root birthday failure");real=adapter.child_birthday;created=[];popen=adapter.subprocess.Popen
+    def create(*a,**k):
+        child=popen(*a,**k);created.append(child);return child
+    parent=root/"escaped-birthday.json";escaped_source=root/"escaped.py";root_source=root/"root.py"
+    if escaped:
+        escaped_source.write_text("import json,os,sys,time\nfrom pathlib import Path\nos.setsid()\nPath(sys.argv[1]).write_text(json.dumps({'pid':os.getpid(),'parent_pid':os.getppid()}))\ntime.sleep(10)\n")
+        root_source.write_text("import subprocess,time\nsubprocess.Popen("+repr([sys.executable,str(escaped_source),str(parent)])+")\ntime.sleep(10)\n")
+    def birthday(child):
+        if escaped:
+            deadline=time.monotonic()+2
+            while not parent.exists() and time.monotonic()<deadline:time.sleep(.01)
+            if not parent.exists():raise RuntimeError("escaped fixture did not start")
+        raise original
+    adapter.subprocess.Popen=create;adapter.child_birthday=birthday;caught=None
+    try:
+        try:records.run([sys.executable,str(root_source)] if escaped else [sys.executable,"-c","import time;time.sleep(10)"],2)
+        except BaseException as error:caught=error
+        checks={"primary_identity":caught is original,"owned_child_gone":not any(adapter.process_identity(child.pid) for child in created),"raw_ledger":(records.root/"commands.json").exists(),"no_numeric_signal":all(r.get("authority")=="held-pidfd" for r in records.rows[0]["lifetime"]["receipts"])}
+        if escaped:
+            actual=json.loads(parent.read_bytes());receipts=records.rows[0]["lifetime"]["receipts"]
+            checks.update({"escaped_descendant_gone":adapter.process_identity(actual["pid"]) is None,"escaped_birthday_bound":any(r["identity"]["pid"]==actual["pid"] and type(r["identity"]["start_ticks"]) is int and r["identity"]["session"]==actual["pid"] for r in receipts),"actual_root_parent":actual["parent_pid"]==created[0].pid})
+    finally:
+        adapter.child_birthday=real;adapter.subprocess.Popen=popen
+        for child in created:
+            if child.poll() is None:child.kill()
+            child.wait(timeout=2)
+    return {"status":"passed","checks":checks},"passed"
+
+def parent_death_control(root):
+    owner,daemon=setup(root);marker=root/"executed";receipt=root/"published.json"
+    adapter.atomic_json(owner.paths["artifacts"]/"create-admission.json",{"schema_version":1,"project":owner.project,"nonce":owner.nonce,"state":"creating","certified":False})
+    source=root/"controller.py"
+    source.write_text("import importlib.util,json,os,sys\nfrom pathlib import Path\nspec=importlib.util.spec_from_file_location('owned',"+repr(str(MODULE))+")\nm=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)\nowner=m.OwnerSpec(json.loads(Path("+repr(str(root/"spec.json"))+").read_bytes()))\nr=m.RawCommands(Path("+repr(str(root/"inner"))+"))\nreal=r.save\ndef save():\n if r.rows and r.rows[0]['process_identity'] is not None:\n  m.atomic_json(Path("+repr(str(receipt))+"),r.rows[0]);os._exit(23)\n real()\nr.save=save\nr.run([sys.executable,'-c',"+repr("from pathlib import Path;Path("+repr(str(marker))+").write_text('must not execute')")+"],3,admission_spec=owner)\n")
+    libc,prior=adapter.subreaper_begin();child=None;held=None;bootstrap=None;boot_handle=None;known={};actions=[]
+    try:
+        with (root/"controller.stdout").open("wb") as out,(root/"controller.stderr").open("wb") as err:
+            argv=[sys.executable,str(source)];child=subprocess.Popen(argv,stdout=out,stderr=err,start_new_session=True)
+            identity=adapter.child_birthday(child);held=adapter.open_process_handle(identity)
+            deadline=time.monotonic()+3
+            while not held.ready() and time.monotonic()<deadline:time.sleep(.01)
+            if not held.ready():raise RuntimeError("controlled controller did not exit")
+            published=json.loads(receipt.read_bytes());bootstrap=published["process_identity"];boot_handle=adapter.open_process_handle(bootstrap)
+            while not boot_handle.ready() and time.monotonic()<deadline:time.sleep(.01)
+            natural=boot_handle.ready();status=child.wait(timeout=2)
+            fields=Path("/proc/"+str(bootstrap["pid"])+"/stat").read_text().rpartition(") ")[2].split()
+            known[bootstrap["pid"]]={**bootstrap,"pgid":int(fields[2]),"session":int(fields[3]),"origin":"recorded-bootstrap"}
+            drained=adapter.drain_cli(identity,known,actions,time.monotonic()+2,adopt=False)
+        adapter.atomic_json(root/"actual-death.json",{"scope":"owned harmless child, no Docker","controller":identity,"bootstrap":bootstrap,"argv":argv,"status":status,"natural_bootstrap_exit":natural,"actions":actions,"stdout":adapter.binding(root/"controller.stdout"),"stderr":adapter.binding(root/"controller.stderr")})
+        return {"status":"passed","checks":{"actual_controller_death":status==23,"blocked_child_exits_on_eof":natural,"no_unpublished_execution":not marker.exists(),"drained_and_no_signal_needed":drained and not actions,"durable_identity_before_permit":bool(published.get("launcher_argv")) and published["lifetime"]["state"]=="running"}},"passed"
+    finally:
+        if boot_handle is not None:
+            if not boot_handle.ready():boot_handle.send(signal.SIGKILL)
+            try:os.waitpid(bootstrap["pid"],os.WNOHANG)
+            except ChildProcessError:pass
+            boot_handle.close()
+        if held is not None:
+            if not held.ready():held.send(signal.SIGKILL)
+            held.close()
+        if child is not None:child.wait(timeout=2)
+        if libc.prctl(36,prior,0,0,0)!=0:raise RuntimeError("control subreaper restoration failed")
+
+def lock_race_control(root):
+    owner,daemon=setup(root);adapter.atomic_json(owner.paths["artifacts"]/"create-admission.json",{"schema_version":1,"project":owner.project,"nonce":owner.nonce,"state":"closed","certified":True})
+    source=root/"closer.py"
+    source.write_text("import importlib.util,json\nfrom pathlib import Path\nspec=importlib.util.spec_from_file_location('owned',"+repr(str(MODULE))+")\nm=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)\nowner=m.OwnerSpec(json.loads(Path("+repr(str(root/"spec.json"))+").read_bytes()))\nm.close_admission(owner)\n")
+    child=None
+    with (root/"close.stdout").open("wb") as out,(root/"close.stderr").open("wb") as err:
+        with adapter.admission_lock(owner):
+            child=subprocess.Popen([sys.executable,str(source)],stdout=out,stderr=err,start_new_session=True)
+            time.sleep(.05)
+            before=not (owner.paths["artifacts"]/"admission-revoked.json").exists()
+        status=child.wait(timeout=3)
+    caught=None
+    try:adapter.admission_write(owner,{"schema_version":1,"project":owner.project,"nonce":owner.nonce,"state":"creating","certified":False})
+    except adapter.OwnershipError as error:caught=error
+    adapter.atomic_json(root/"closer-command.json",{"argv":[sys.executable,str(source)],"timeout_seconds":3,"status":status,"stdout":adapter.binding(root/"close.stdout"),"stderr":adapter.binding(root/"close.stderr")})
+    return {"status":"passed","checks":{"closure_waited_for_atomic_scope":before,"actual_closer_success":status==0,"permanent_closure_refuses_write":caught is not None,"no_reopened_intent":json.loads((owner.paths["artifacts"]/"create-admission.json").read_bytes())["state"]=="closed"}},"passed"
+
+def phase_next_control(root):
+    owner,daemon=receipt_daemon(root,0)
+    first,_,_=invoke_fake(owner,daemon)
+    second,_,_=invoke_fake(owner,daemon)
+    return {"status":"passed","checks":{"two_owned_phases":first==second==0,"phase_cleanup_not_global_revocation":not (owner.paths["artifacts"]/"admission-revoked.json").exists(),"previous_owned_ids_retained":bool(list(owner.paths["artifacts"].glob("between-up-*/cleanup.json")))}},"passed"
+
+def wrong_configured_control(case,root):
+    owner,daemon=setup(root);state=daemon.read()
+    for entry in state["containers"].values():
+        entry["State"]["Running"]=False
+        for value in entry["NetworkSettings"]["Networks"].values():value.update({"NetworkID":"","EndpointID":""})
+    for network in state["networks"].values():network["Containers"]={}
+    configured={"schema_version":1,"project":owner.project,"nonce":owner.nonce,"containers":{entry["Id"]:{name:("7" if name.endswith("leftnet") else "8")*64 for name in entry["NetworkSettings"]["Networks"]} for entry in state["containers"].values()},"networks":{n["Name"]:n["Id"] for n in state["networks"].values()}}
+    configured["containers"]["2"*64][owner.project+"_rightnet"]="f"*64
+    adapter.atomic_json(owner.paths["artifacts"]/"configured-topology.json",configured)
+    caught=None
+    try:adapter.verified_topology(owner,list(state["containers"].values()),list(state["networks"].values()))
+    except adapter.OwnershipError as error:caught=error
+    return {"status":"passed","checks":{"foreign_configured_bridge_rejected":caught is not None,"no_daemon_mutation":not daemon.read()["events"]}},"passed"
+
+def bootstrap_control(case,root):
+    if case in ("raw-birthday-failure","raw-birthday-failure-escaped"):return birthday_failure_control(root,case.endswith("-escaped"))
+    if case=="admitted-cli-controller-death":return parent_death_control(root)
+    if case=="admission-close-lock-race":return lock_race_control(root)
+    if case=="phase-next-admission":return phase_next_control(root)
+    if case in ("created-wrong-configured-id","stopped-wrong-configured-id"):return wrong_configured_control(case,root)
+    return admitted_control(case,root)
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument("--artifacts",type=Path,required=True)
@@ -692,7 +1009,9 @@ def main():
     for case in cases:
         root=args.artifacts/case;root.mkdir()
         try:
-            if case=="copy-official-fixture-layout":result,expected=copy_layout_control(root)
+            if case in BOOT_CASES:result,expected=bootstrap_control(case,root)
+            elif case in REVIEW_CASES:result,expected=review_control(case,root)
+            elif case=="copy-official-fixture-layout":result,expected=copy_layout_control(root)
             elif case in TAIL_CASES:result,expected=tail_control(case,root)
             elif case in FINAL_CASES:result,expected=final_control(case,root)
             elif case in EXTRA_CASES:result,expected=extra_control(case,root)

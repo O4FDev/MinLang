@@ -7,6 +7,9 @@ allow_real constructor argument; controls use JsonDaemon and retain that scope.
 import ast
 import hashlib
 import ctypes
+import contextlib
+import fcntl
+import select
 import threading
 import json
 import os
@@ -137,7 +140,9 @@ class OwnerSpec:
         attached=entry.get("NetworkSettings",{}).get("Networks")
         expected={self.project+"_"+name for name in NETWORK_ROLES[role]}
         if not isinstance(attached,dict) or set(attached)!=expected:raise OwnershipError("complete endpoint network membership differs")
-        if any(not isinstance(v,dict) or not isinstance(v.get("NetworkID"),str) or re.fullmatch(r"[0-9a-f]{64}",v["NetworkID"]) is None for v in attached.values()):raise OwnershipError("immutable endpoint network ID missing")
+        running=entry.get("State",{}).get("Running")
+        if type(running) is not bool:raise OwnershipError("endpoint phase missing")
+        if any(not isinstance(v,dict) or not isinstance(v.get("NetworkID"),str) or (re.fullmatch(r"[0-9a-f]{64}",v["NetworkID"]) is None and not (running is False and v["NetworkID"]=="")) for v in attached.values()):raise OwnershipError("immutable endpoint network ID missing")
         return role
     def network(self,entry,owned_ids):
         identity=entry.get("Id")
@@ -147,16 +152,45 @@ class OwnerSpec:
         return identity
 
 
+def configured_topology(spec,entries,networks):
+    # Created/stopped objects declare names, not live endpoints. Record the
+    # independently owner-checked bridges before starting any endpoint.
+    names={}
+    for network in networks:
+        spec.network(network,{entry["Id"] for entry in entries})
+        if network["Name"] in names:raise OwnershipError("colliding configured bridges")
+        names[network["Name"]]=network["Id"]
+    containers={}
+    for entry in entries:
+        role=spec.container(entry)
+        containers[entry["Id"]]={spec.project+"_"+name:names[spec.project+"_"+name] for name in NETWORK_ROLES[role]}
+        for name,attached in entry["NetworkSettings"]["Networks"].items():
+            if attached["NetworkID"] not in ("",names[name]):raise OwnershipError("declared endpoint bridge differs")
+    value={"schema_version":1,"project":spec.project,"nonce":spec.nonce,"containers":containers,"networks":names}
+    atomic_json(spec.paths["artifacts"]/"configured-topology.json",value)
+    return value
+
 def verified_topology(spec,entries,networks):
-    owned={entry["Id"]:spec.container(entry) for entry in entries};names={}
+    owned={entry["Id"]:spec.container(entry) for entry in entries};names={};configured=None
+    if len(owned)!=len(entries):raise OwnershipError("colliding endpoint identities")
     for network in networks:
         spec.network(network,set(owned))
         if network["Name"] in names:raise OwnershipError("colliding network names")
         names[network["Name"]]=network
     for entry in entries:
+        running=entry["State"]["Running"]
         for name,attached in entry["NetworkSettings"]["Networks"].items():
             network=names.get(name)
-            if network is None or attached["NetworkID"]!=network["Id"] or entry["Id"] not in network.get("Containers",{}):raise OwnershipError("endpoint network does not bind actual owned bridge ID")
+            if network is None:raise OwnershipError("declared owned bridge missing")
+            if running:
+                if attached["NetworkID"]!=network["Id"] or entry["Id"] not in network.get("Containers",{}):raise OwnershipError("running endpoint bridge membership is not reciprocal")
+            elif attached["NetworkID"]=="" or entry["Id"] not in network.get("Containers",{}):
+                if configured is None:
+                    configured=json.loads((spec.paths["artifacts"]/"configured-topology.json").read_bytes())
+                    if type(configured.get("schema_version")) is not int or configured["schema_version"]!=1 or configured.get("project")!=spec.project or configured.get("nonce")!=spec.nonce:raise OwnershipError("configured bridge receipt ownership differs")
+                expected={spec.project+"_"+n:names[spec.project+"_"+n]["Id"] for n in NETWORK_ROLES[owned[entry["Id"]]]}
+                if configured.get("containers",{}).get(entry["Id"])!=expected or any(configured.get("networks",{}).get(n)!=identity for n,identity in expected.items()) or attached["NetworkID"] not in ("",network["Id"]):raise OwnershipError("stopped endpoint does not bind checked configured bridge IDs")
+            elif attached["NetworkID"]!=network["Id"]:raise OwnershipError("stopped endpoint bridge ID differs")
     for name,network in names.items():
         for identity in network.get("Containers",{}):
             if name not in {spec.project+"_"+n for n in NETWORK_ROLES[owned[identity]]}:raise OwnershipError("role attached to unexpected bridge")
@@ -248,8 +282,19 @@ def subreaper_begin():
     return libc,prior.value
 
 def cli_members(identity,known,adopt=True):
-    members={member["pid"]:member for member in session_members(identity["pid"])}
-    if adopt:
+    # Never reopen a numeric session after its bound root vanished or closed.
+    root_matches=False
+    try:
+        fields=Path("/proc/"+str(identity["pid"])+"/stat").read_text().rpartition(") ")[2].split()
+        root_matches=int(fields[19])==identity["start_ticks"]
+    except (FileNotFoundError,ProcessLookupError):pass
+    # Only the exclusive local subreaper may use a direct, still-unreaped
+    # Popen/pidfd authority when birthday evidence failed. A watchdog never
+    # trusts that serialized marker as a substitute for a birthday.
+    direct_scope=adopt and identity.get("origin")=="direct-unreaped-Popen"
+    root_matches=root_matches or direct_scope
+    members={member["pid"]:member for member in session_members(identity["pid"])} if root_matches and cli_key(identity) not in _extinct_cli else {}
+    if adopt and root_matches and cli_key(identity) not in _extinct_cli:
         for member in direct_children():
             if member["pid"]!=identity["pid"] and member["pid"] not in members:members[member["pid"]]=member
     for pid,member in known.items():
@@ -261,24 +306,83 @@ def cli_members(identity,known,adopt=True):
         except (FileNotFoundError,ProcessLookupError):continue
     return list(members.values())
 
-def drain_cli(identity,known,receipts,deadline,adopt=True):
-    while time.monotonic()<deadline:
-        members=cli_members(identity,known,adopt)
-        if not members:
-            for pid in known:
-                if pid!=identity["pid"]:
-                    try:os.waitpid(pid,os.WNOHANG)
-                    except ChildProcessError:pass
-            return True
-        for member in members:
-            prior=known.get(member["pid"])
-            if prior is not None and any(prior[key]!=member[key] for key in ("pid","start_ticks")):raise OwnershipError("CLI descendant birthday changed")
-            known[member["pid"]]=member
-            if process_identity(member["pid"])!={"pid":member["pid"],"start_ticks":member["start_ticks"]}:continue
-            os.kill(member["pid"],signal.SIGKILL)
-            receipts.append({"identity":member,"signal":"SIGKILL","owned_cli":identity})
-        time.sleep(.01)
-    return not cli_members(identity,known,adopt)
+class ProcessHandle:
+    """A pidfd is the signal authority; numeric IDs are evidence only."""
+    def __init__(self,identity):
+        self.identity=dict(identity);self.closed=False;self.fd=os.pidfd_open(identity["pid"],0)
+        try:
+            fields=Path("/proc/"+str(identity["pid"])+"/stat").read_text().rpartition(") ")[2].split()
+            if int(fields[19])!=identity["start_ticks"]:raise OwnershipError("pidfd birthday differs")
+        except BaseException:
+            os.close(self.fd);self.closed=True;raise
+    def ready(self):
+        probe=select.poll();probe.register(self.fd,select.POLLIN)
+        return bool(probe.poll(0))
+    def send(self,sig):
+        try:signal.pidfd_send_signal(self.fd,sig,None,0);return True
+        except ProcessLookupError:
+            if not self.ready():raise
+            return False
+    def close(self):
+        if not self.closed:os.close(self.fd);self.closed=True
+
+def open_process_handle(identity):return ProcessHandle(identity)
+
+def open_owned_child_handle(child):
+    # This exact direct Popen child has not been reaped; acquire its kernel
+    # handle before any fallible birthday/session evidence lookup.
+    handle=object.__new__(ProcessHandle);handle.closed=False;handle.fd=os.pidfd_open(child.pid,0)
+    handle.identity={"pid":child.pid,"start_ticks":None,"origin":"direct-unreaped-Popen"}
+    return handle
+
+_extinct_cli=set()
+def cli_key(identity):return (identity["pid"],identity["start_ticks"])
+def latch_extinction(identity):
+    key=cli_key(identity)
+    if key not in _extinct_cli and len(_extinct_cli)>=MAX_FILES:raise OwnershipError("owned CLI extinction ledger bound exceeded")
+    _extinct_cli.add(key)
+
+def drain_cli(identity,known,receipts,deadline,adopt=True,handles=None):
+    key=cli_key(identity)
+    if key in _extinct_cli:return True
+    local=handles is None;handles={} if local else handles
+    try:
+        while time.monotonic()<deadline:
+            members=cli_members(identity,known,adopt)
+            if not members:
+                latch_extinction(identity)
+                # This is the final descendant drain, before the root is reaped.
+                for pid in known:
+                    if pid!=identity["pid"]:
+                        try:os.waitpid(pid,os.WNOHANG)
+                        except ChildProcessError:pass
+                return True
+            for member in members:
+                prior=known.get(member["pid"])
+                if prior is not None and any(prior[k]!=member[k] for k in ("pid","start_ticks")):raise OwnershipError("CLI descendant birthday changed")
+                known[member["pid"]]=member
+                handle=handles.get(member["pid"])
+                if handle is None:
+                    try:handle=open_process_handle(member)
+                    except (FileNotFoundError,ProcessLookupError):continue
+                    handles[member["pid"]]=handle
+                if any(handle.identity[k]!=member[k] for k in ("pid","start_ticks")):raise OwnershipError("held descendant birthday differs")
+                if not handle.ready():
+                    attempted=handle.send(signal.SIGKILL)
+                    receipts.append({"identity":member,"signal":"SIGKILL","owned_cli":identity,"authority":"held-pidfd","attempted":attempted is not False})
+            time.sleep(.01)
+        if not cli_members(identity,known,adopt):latch_extinction(identity);return True
+        return False
+    finally:
+        if local:
+            for handle in handles.values():handle.close()
+
+def child_exited(child):
+    # WNOWAIT retains the root zombie and its numeric session identity until
+    # discovery and descendant drain have closed permanently.
+    result=os.waitid(os.P_PID,child.pid,os.WEXITED|os.WNOHANG|os.WNOWAIT)
+    return result is not None
+
 
 def session_members(pgid):
     result=[]
@@ -295,82 +399,111 @@ def session_members(pgid):
 class RawCommands:
     def __init__(self,root):self.root=Path(root);self.root.mkdir(parents=True,exist_ok=False);self.rows=[]
     def save(self):atomic_json(self.root/"commands.json",{"schema_version":1,"commands":self.rows})
-    def run(self,argv,timeout,check=True,max_bytes=MAX_BYTES,return_bytes=True):
+    def run(self,argv,timeout,check=True,max_bytes=MAX_BYTES,return_bytes=True,admission_spec=None):
         index=len(self.rows);out=self.root/(str(index).zfill(3)+".stdout");err=self.root/(str(index).zfill(3)+".stderr")
         row={"argv":list(argv),"timeout_seconds":timeout,"status":None,"timed_out":False,"primary_exception":None,"finalization_errors":[],
              "owner_process_identity":process_identity(os.getpid()),"process_identity":None,"lifetime":{"state":"intent","certified":False,"receipts":[],"members":[],"root_exited_with_descendants":False}}
         self.rows.append(row)
-        primary=None;child=None;selector=None;known={};deadline=time.monotonic()+timeout;total=0;subreaper=None
+        primary=None;child=None;selector=None;known={};handles={};root_handle=None;deadline=time.monotonic()+timeout;total=0;subreaper=None
+        def secondary(stage,error):
+            row["finalization_errors"].append({"stage":stage,"type":type(error).__name__,"message":str(error)})
+            row["lifetime"]["certified"]=False
+            if primary is not None and hasattr(primary,"add_note"):primary.add_note(stage+": "+str(error))
+        def attempt(stage,call):
+            try:return call()
+            except BaseException as error:secondary(stage,error);return None
         try:
             with out.open("wb") as stdout,err.open("wb") as stderr:
-                self.save()
-                subreaper=subreaper_begin()
-                child=subprocess.Popen(argv,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
-                identity=child_birthday(child)
-                if identity is None:raise OwnershipError("CLI birthday unavailable")
-                row["process_identity"]=identity;row["lifetime"]["state"]="running";self.save()
+                self.save();subreaper=subreaper_begin()
+                if admission_spec is None:
+                    child=subprocess.Popen(argv,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
+                    root_handle=open_owned_child_handle(child)
+                    identity=child_birthday(child);root_handle.identity=identity
+                    row["process_identity"]=identity;row["lifetime"]["state"]="running";self.save()
+                else:
+                    with admission_lock(admission_spec):
+                        require_admission(admission_spec)
+                        read_fd,write_fd=os.pipe()
+                        try:
+                            launch=[sys.executable,str(Path(__file__).resolve()),"--owned-exec-fd",str(read_fd),"--owned-exec-json",json.dumps(list(argv))]
+                            row["launcher_argv"]=launch;row["launcher_source"]=binding(__file__)
+                            child=subprocess.Popen(launch,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True,pass_fds=(read_fd,))
+                            root_handle=open_owned_child_handle(child)
+                            identity=child_birthday(child);root_handle.identity=identity
+                            row["process_identity"]=identity;row["lifetime"]["state"]="running";self.save()
+                            require_admission(admission_spec)
+                            os.write(write_fd,b"G")
+                        finally:
+                            os.close(read_fd);os.close(write_fd)
                 selector=selectors.DefaultSelector()
                 selector.register(child.stdout,selectors.EVENT_READ,stdout);selector.register(child.stderr,selectors.EVENT_READ,stderr)
-                while selector.get_map() or child.poll() is None:
+                while True:
+                    exited=child_exited(child)
                     members=cli_members(identity,known)
                     for member in members:
                         prior=known.get(member["pid"])
-                        if prior is not None and any(prior[key]!=member[key] for key in ("pid","start_ticks")):raise OwnershipError("CLI birthday changed")
+                        if prior is not None and any(prior[k]!=member[k] for k in ("pid","start_ticks")):raise OwnershipError("CLI birthday changed")
                         known[member["pid"]]=member
+                        if member["pid"] not in handles:
+                            try:handles[member["pid"]]=open_process_handle(member)
+                            except (FileNotFoundError,ProcessLookupError):pass
                     row["lifetime"]["members"]=list(known.values());self.save()
-                    if child.poll() is not None and any(member["pid"]!=child.pid for member in members):
+                    if exited and any(member["pid"]!=child.pid for member in members):
                         row["lifetime"]["root_exited_with_descendants"]=True
-                        if not drain_cli(identity,known,row["lifetime"]["receipts"],time.monotonic()+2):raise CleanupError("CLI descendants not drained")
+                        if not drain_cli(identity,known,row["lifetime"]["receipts"],time.monotonic()+2,handles=handles):raise CleanupError("CLI descendants not drained")
+                    if exited and not selector.get_map():break
                     if time.monotonic()>deadline:raise subprocess.TimeoutExpired(argv,timeout)
                     for key,_ in selector.select(.02):
                         data=os.read(key.fd,min(CHUNK,max_bytes-total+1))
-                        if not data:selector.unregister(key.fileobj);key.fileobj.close();continue
+                        if not data:selector.unregister(key.fileobj);continue
                         if total+len(data)>max_bytes:raise OwnershipError("command stream bound exceeded")
                         total+=len(data);key.data.write(data)
-                row["status"]=child.wait(timeout=.1)
-                row["lifetime"]["certified"]=drain_cli(identity,known,row["lifetime"]["receipts"],time.monotonic()+2)
+                row["lifetime"]["certified"]=drain_cli(identity,known,row["lifetime"]["receipts"],time.monotonic()+2,handles=handles)
                 row["lifetime"]["state"]="closed";row["lifetime"]["members"]=list(known.values())
                 if not row["lifetime"]["certified"]:raise CleanupError("CLI lifetime not certified closed")
+                row["status"]=child.wait(timeout=.1)
         except BaseException as error:
             primary=error;row["timed_out"]=isinstance(error,subprocess.TimeoutExpired)
             row["primary_exception"]={"type":type(error).__name__,"message":str(error)}
             raise
         finally:
             if child is not None:
-                try:
-                    identity=row["process_identity"]
-                    if identity is not None:drain_cli(identity,known,row["lifetime"]["receipts"],time.monotonic()+2)
-                    if child.poll() is None:child.kill()
-                    row["status"]=child.wait(timeout=2);row["lifetime"]["members"]=list(known.values())
-                except BaseException as error:
-                    row["finalization_errors"].append({"type":type(error).__name__,"message":str(error)})
-                    if primary is not None and hasattr(primary,"add_note"):primary.add_note("CLI cleanup: "+str(error))
-                for stream in (child.stdout,child.stderr):
-                    if stream is not None:stream.close()
-            if selector is not None:selector.close()
+                cleanup_identity=row["process_identity"] if row["process_identity"] is not None else None if root_handle is None else root_handle.identity
+                if cleanup_identity is not None:
+                    attempt("CLI descendant cleanup",lambda:drain_cli(cleanup_identity,known,row["lifetime"]["receipts"],time.monotonic()+2,handles=handles))
+                if root_handle is not None:
+                    def finish_root():
+                        if not root_handle.ready():
+                            attempted=root_handle.send(signal.SIGKILL)
+                            row["lifetime"]["receipts"].append({"identity":root_handle.identity,"signal":"SIGKILL","owned_cli":row["process_identity"],"authority":"held-pidfd","attempted":attempted is not False})
+                        row["status"]=child.wait(timeout=2)
+                    attempt("CLI root cleanup",finish_root)
+                else:
+                    secondary("CLI root cleanup",CleanupError("owned root pidfd unavailable; no numeric signal permitted"))
+                row["lifetime"]["members"]=list(known.values())
+                for name,stream in (("stdout",child.stdout),("stderr",child.stderr)):
+                    if stream is not None:
+                        before=len(row["finalization_errors"])
+                        attempt(name+" close",stream.close)
+                        # Retry a one-shot close failure without another fallible
+                        # stream property access between independent attempts.
+                        if len(row["finalization_errors"])!=before:attempt(name+" close retry",stream.close)
+            if selector is not None:attempt("selector close",selector.close)
+            for handle in handles.values():attempt("descendant pidfd close",handle.close)
+            if root_handle is not None:attempt("root pidfd close",root_handle.close)
             if subreaper is not None:
                 libc,prior=subreaper
-                if libc.prctl(36,prior,0,0,0)!=0:
-                    error=CleanupError("owned CLI subreaper restoration failed")
-                    row["finalization_errors"].append({"type":type(error).__name__,"message":str(error)})
-                    if primary is not None and hasattr(primary,"add_note"):primary.add_note(str(error))
-
-            try:
-                row["stdout"]={"path":str(out.resolve()),**stream_binding(out,max_bytes,None if primary is not None else deadline)};row["stderr"]={"path":str(err.resolve()),**stream_binding(err,max_bytes,None if primary is not None else deadline)};self.save()
-            except BaseException as error:
-                row["finalization_errors"].append({"type":type(error).__name__,"message":str(error)})
-                if primary is None:raise
-                if hasattr(primary,"add_note"):primary.add_note("command evidence finalization: "+str(error))
-                try:self.save()
-                except BaseException as final:
-                    if hasattr(primary,"add_note"):primary.add_note("command failure ledger: "+str(final))
-        if row["finalization_errors"]:
-            row["lifetime"]["certified"]=False
-            failure=CleanupError("owned CLI cleanup/finalization failed; retained command ledger")
-            try:self.save()
-            except BaseException as secondary:
-                if hasattr(failure,"add_note"):failure.add_note("command failure ledger: "+str(secondary))
-            raise failure
+                def restore():
+                    if libc.prctl(36,prior,0,0,0)!=0:raise CleanupError("owned CLI subreaper restoration failed")
+                attempt("subreaper restoration",restore)
+            if primary is not None or row["finalization_errors"]:row["lifetime"]["certified"]=False
+            for name,path in (("stdout",out),("stderr",err)):
+                def bind(name=name,path=path):
+                    row[name]={"path":str(path.resolve()),**stream_binding(path,max_bytes,None if primary is not None else deadline)}
+                attempt(name+" evidence finalization",bind)
+            attempt("command ledger finalization",self.save)
+            if row["finalization_errors"]:attempt("command failure ledger",self.save)
+        if row["finalization_errors"]:raise CleanupError("owned CLI cleanup/finalization failed; retained command ledger")
         if check and row["status"]!=0:raise CleanupError("owned command failed: "+str(row["status"]))
         return out.read_bytes() if return_bytes else out
 
@@ -387,7 +520,8 @@ class DockerDaemon:
         self.cli=binding(self.docker)
     def command(self,*args,timeout=10,check=True,return_bytes=True):
         if binding(self.docker)!=self.cli:raise OwnershipError("Docker CLI bytes changed")
-        return self.commands.run([self.docker,*args],timeout,check=check,return_bytes=return_bytes)
+        admitted=args and args[0]=="compose" and any(token in ("create","up") for token in args)
+        return self.commands.run([self.docker,*args],timeout,check=check,return_bytes=return_bytes,admission_spec=self.spec if admitted else None)
     def containers(self):
         return self.command("ps","-aq","--no-trunc","--filter","label=com.docker.compose.project="+self.spec.project).decode().splitlines()
     def inspect(self,identity):return json.loads(self.command("inspect",identity))[0]
@@ -464,7 +598,7 @@ class JsonDaemon:
         self.action("remove_network",identity);state=self.read();del state["networks"][identity];atomic_json(self.path,state)
 
 
-def cleanup_owned(spec,daemon,root,reason,primary=None,unsupported_compliance=None,abort_first=False):
+def cleanup_owned(spec,daemon,root,reason,primary=None,unsupported_compliance=None,abort_first=False,revoke_admission=True):
     root=Path(root);root.mkdir(parents=True,exist_ok=False)
     result={"schema_version":1,"scope":"owned IDs only; mock backend is not actual daemon proof","reason":reason,"project":spec.project,"nonce":spec.nonce,"verified_ids":[],"errors":[],"status":"cleaning",
             "primary_exception":None if primary is None else {"type":type(primary).__name__,"message":str(primary)}}
@@ -472,7 +606,7 @@ def cleanup_owned(spec,daemon,root,reason,primary=None,unsupported_compliance=No
         result["errors"].append({"stage":stage,"type":type(exception).__name__,"message":str(exception)})
         if primary is not None and hasattr(primary,"add_note"):primary.add_note(stage+": "+str(exception))
     owned=[];networks=[];result["states_before_cleanup"]={}
-    try:result["admission"]=close_admission(spec)
+    try:result["admission"]=close_admission(spec,revoke=revoke_admission)
     except BaseException as exception:error("create-admission",exception)
 
     try:
@@ -600,7 +734,10 @@ def watch_owned(spec,daemon,controller,guard,deadline,output,interval=1.0,sample
     except BaseException as error:secondary("retention-setup",error)
     final={"schema_version":1,"reason":reason,"status":"failed" if primary is not None or errors or result is None or result.get("status")!="passed" else "passed",
            "primary_exception":None if primary is None else {"type":type(primary).__name__,"message":str(primary)},"errors":errors,"cleanup":result,"remaining_ids":None,"remaining_networks":None}
-    try:final["remaining_ids"]=daemon.containers();final["remaining_networks"]=[entry["Id"] for entry in daemon.networks()]
+    try:
+        final["remaining_ids"]=daemon.containers();final["remaining_networks"]=[entry["Id"] for entry in daemon.networks()]
+        if final["remaining_ids"] or final["remaining_networks"]:
+            secondary("final-inventory",CleanupError("owned daemon objects appeared or remain after retention"));final["status"]="failed"
     except BaseException as error:secondary("final-inventory",error);final["status"]="failed"
     try:atomic_json(output/"watch-final.json",final)
     except BaseException as error:
@@ -842,11 +979,40 @@ def copy_runner_logs(role,directory):
     daemon.copy_bounded(ids[0],"/logs/.",directory)
 
 
-def close_admission(spec):
+@contextlib.contextmanager
+def admission_lock(spec,timeout=2):
+    path=spec.paths["artifacts"]/"admission.lock"
+    with path.open("a+b") as lock:
+        deadline=time.monotonic()+timeout
+        while True:
+            try:fcntl.flock(lock.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB);break
+            except BlockingIOError:
+                if time.monotonic()>=deadline:raise CleanupError("admission lock deadline exceeded")
+                time.sleep(.01)
+        try:yield
+        finally:fcntl.flock(lock.fileno(),fcntl.LOCK_UN)
+
+def require_admission(spec):
+    if (spec.paths["artifacts"]/"admission-revoked.json").exists():raise OwnershipError("daemon creation admission permanently revoked")
     path=spec.paths["artifacts"]/"create-admission.json"
-    if not path.exists():return {"state":"not-opened","certified":True}
-    value=json.loads(path.read_bytes())
-    if value.get("project")!=spec.project or value.get("nonce")!=spec.nonce:raise OwnershipError("create intent ownership differs")
+    if path.exists():
+        value=json.loads(path.read_bytes())
+        if value.get("project")!=spec.project or value.get("nonce")!=spec.nonce or value.get("state")=="interrupted-uncertified":raise OwnershipError("creation admission is interrupted or foreign")
+
+def admission_write(spec,value):
+    with admission_lock(spec):
+        require_admission(spec)
+        atomic_json(spec.paths["artifacts"]/"create-admission.json",value)
+
+def close_admission(spec,revoke=True):
+    path=spec.paths["artifacts"]/"create-admission.json"
+    with admission_lock(spec):
+        if revoke:
+            revoked=spec.paths["artifacts"]/"admission-revoked.json"
+            if not revoked.exists():atomic_json(revoked,{"schema_version":1,"project":spec.project,"nonce":spec.nonce,"revoked":True})
+        if not path.exists():return {"state":"not-opened","certified":True,"revoked":revoke}
+        value=json.loads(path.read_bytes())
+        if value.get("project")!=spec.project or value.get("nonce")!=spec.nonce:raise OwnershipError("create intent ownership differs")
     if value.get("state")!="closed":
         errors=[]
         root=spec.paths["artifacts"]/"daemon-commands"
@@ -861,12 +1027,10 @@ def close_admission(spec):
                     if not isinstance(member,dict) or any(type(member.get(key)) is not int for key in ("pid","start_ticks","pgid","session")):raise OwnershipError("CLI descendant receipt types differ")
                     if process_identity(member["pid"])=={"pid":member["pid"],"start_ticks":member["start_ticks"]}:known[member["pid"]]=member
                 actions=[]
-                # Watchdog is not the command's subreaper, so it never adopts
-                # its own children as belonging to this recorded CLI.
                 drain_cli(identity,known,actions,time.monotonic()+2,adopt=False)
                 errors.extend(actions)
         value["state"]="interrupted-uncertified";value["certified"]=False;value["owned_cli_abort_receipts"]=errors
-        atomic_json(path,value)
+        with admission_lock(spec):atomic_json(path,value)
         raise CleanupError("in-flight create/start admission cannot certify daemon absence")
     if value.get("certified") is not True:raise CleanupError("create admission did not close successfully")
     return value
@@ -875,6 +1039,7 @@ def close_admission(spec):
 def docker_entry(argv):
     spec,daemon=runner_daemon()
     if argv[:4]==["compose","--env-file","empty.env","up"]:
+        with admission_lock(spec):require_admission(spec)
         command=compose_up_argv(spec,argv)
         for role in ("server","client"):
             if os.environ.get(role.upper()) not in spec.images[role]:raise OwnershipError("selected endpoint image is outside pinned cell")
@@ -884,7 +1049,7 @@ def docker_entry(argv):
             index=len(list(spec.paths["artifacts"].glob("between-up-*")))
             phase_path=spec.paths["artifacts"]/"phase.json"
             phase=json.loads(phase_path.read_bytes()) if phase_path.exists() else {}
-            cleanup_owned(spec,daemon,spec.paths["artifacts"]/("between-up-"+str(index)),"upstream-next-phase",unsupported_compliance=phase.get("unsupported_compliance"))
+            cleanup_owned(spec,daemon,spec.paths["artifacts"]/("between-up-"+str(index)),"upstream-next-phase",unsupported_compliance=phase.get("unsupported_compliance"),revoke_admission=False)
         requested=argv[4:]
         role="client" if requested[-2:]==["sim","client"] else "server" if requested==["-V","server"] else None
         testcase=None if role is None else os.environ.get("TESTCASE_"+role.upper())
@@ -897,39 +1062,43 @@ def docker_entry(argv):
         intent={"schema_version":1,"project":spec.project,"nonce":spec.nonce,"state":"creating","certified":False,
                 "intended_containers":[{"name":spec.project+"-"+r,"role":r,"image":spec.images["sim"][0] if r=="sim" else os.environ[r.upper()],"labels":spec.labels(r)} for r in roles],
                 "create_argv":create,"upstream_argv":argv,"workload_argv":command}
-        atomic_json(spec.paths["artifacts"]/"create-admission.json",intent)
+        admission_write(spec,intent)
         try:
             daemon.command(*create,timeout=30)
             created_ids=daemon.containers()
             created_entries=[daemon.inspect(identity) for identity in created_ids]
             if {spec.container(entry) for entry in created_entries}!=set(roles) or len(created_ids)!=len(roles):raise OwnershipError("created endpoint roles differ from intent")
             if any(entry.get("State",{}).get("Running") is not False for entry in created_entries):raise OwnershipError("endpoint started before fixture preparation")
-            verified_topology(spec,created_entries,daemon.networks())
+            created_networks=daemon.networks()
+            configured_topology(spec,created_entries,created_networks)
+            verified_topology(spec,created_entries,created_networks)
             permissions=prepare_fixture_access(spec,daemon)
             atomic_json(spec.paths["artifacts"]/"fixture-permissions.json",permissions)
             intent["state"]="starting";intent["created_ids"]=created_ids
-            atomic_json(spec.paths["artifacts"]/"create-admission.json",intent)
+            admission_write(spec,intent)
             # Preserve upstream attached/abort/timeout criteria; precreated IDs
             # must remain identical. Any interrupted up is coverage failure.
             up_index=command.index("up")
             command=command[:up_index+1]+["--no-build","--no-recreate","--no-deps"]+[token for token in command[up_index+1:] if token not in ROLES]+roles
-            intent["workload_argv"]=command;atomic_json(spec.paths["artifacts"]/"create-admission.json",intent)
+            intent["workload_argv"]=command;admission_write(spec,intent)
             raw=daemon.command(*command,timeout=330,check=False)
+            up_receipt=dict(daemon.commands.rows[-1])
+            intent["up_receipt"]=up_receipt
             if set(daemon.containers())!=set(created_ids):raise OwnershipError("workload container IDs changed after precreate")
             verified_topology(spec,[daemon.inspect(identity) for identity in created_ids],daemon.networks())
             rows=daemon.commands.rows
             if any(row.get("lifetime",{}).get("root_exited_with_descendants") for row in rows):raise CleanupError("compose root exited with active descendants; admission uncertified")
-            intent["state"]="closed";intent["certified"]=True;intent["workload_status"]=rows[-1]["status"]
-            atomic_json(spec.paths["artifacts"]/"create-admission.json",intent)
+            intent["state"]="closed";intent["certified"]=True;intent["workload_status"]=up_receipt["status"]
+            admission_write(spec,intent)
         except BaseException as primary:
             intent["state"]="interrupted-uncertified";intent["primary_exception"]={"type":type(primary).__name__,"message":str(primary)}
-            try:atomic_json(spec.paths["artifacts"]/"create-admission.json",intent)
+            try:admission_write(spec,intent)
             except BaseException as secondary:
                 if hasattr(primary,"add_note"):primary.add_note("admission failure ledger: "+str(secondary))
             raise
         sys.stdout.buffer.write(raw)
-        sys.stderr.buffer.write(Path(daemon.commands.rows[-1]["stderr"]["path"]).read_bytes())
-        return daemon.commands.rows[-1]["status"]
+        sys.stderr.buffer.write(Path(up_receipt["stderr"]["path"]).read_bytes())
+        return up_receipt["status"]
     if argv[:4]==["compose","--env-file","empty.env","stop"]:
         roles=argv[4:]
         if not roles or any(role not in ROLES for role in roles) or len(roles)!=len(set(roles)):raise OwnershipError("unreviewed stop roles")
@@ -940,7 +1109,20 @@ def docker_entry(argv):
         return 0
     raise OwnershipError("Docker operation outside reviewed official adapter")
 
+def owned_exec(fd,argv):
+    # Parent publishes immutable command PID/birthday under the admission lock
+    # before releasing this child. Parent death before publication closes EOF.
+    deadline=time.monotonic()+5
+    readable,_,_=select.select([fd],[],[],max(0,deadline-time.monotonic()))
+    if not readable or os.read(fd,1)!=b"G":return 125
+    os.close(fd)
+    if not isinstance(argv,list) or not argv or any(not isinstance(v,str) for v in argv):return 125
+    os.execv(argv[0],argv)
+    return 125
+
 def main():
+    if len(sys.argv)==5 and sys.argv[1]=="--owned-exec-fd" and sys.argv[3]=="--owned-exec-json":
+        return owned_exec(int(sys.argv[2]),json.loads(sys.argv[4]))
     import argparse
     parser=argparse.ArgumentParser()
     parser.add_argument("--mock-watch",type=Path);parser.add_argument("--spec",type=Path);parser.add_argument("--controller",type=Path);parser.add_argument("--guard",type=Path)
