@@ -65,7 +65,8 @@ function wireSize(receiver: quic.Connection, packets: List<Bytes>): WireSize {
     for data in packets {
         result.maximum = max(result.maximum,data.length)
         let header = wire.header(data,0,receiver.local.length)
-        if !header.valid || header.kind != wire.ONE_RTT { result.valid = false; return result }
+        if !header.valid || header.kind != wire.ONE_RTT || header.numberOffset != 1 + receiver.local.length ||
+           !quic.ownsConnectionId(receiver,header.destination) { result.valid = false; return result }
         let opened = protection.unprotect(receiver.spaces[2].read,data,header.numberOffset,-1)
         if !opened.valid { result.valid = false; return result }
         let parsed = wire.frames(opened.payload)
@@ -85,6 +86,19 @@ function flightBytes(c: quic.Connection): Integer {
     let result = 0
     for space in c.spaces { for sent in space.sent { result += sent.bytes } }
     return result
+}
+function destinationWidth(c: quic.Connection,s: quic.Connection,length: Integer): Boolean {
+    // This synthetic MTU setup changes one authenticated destination CID;
+    // keep the registry, active path and compatibility alias consistent.
+    let id=bytes(length);let matched=false
+    for path in c.paths {
+        if path.id==c.activePath {
+            for known in c.remoteIds { if known.sequence==path.remoteSequence { known.id=id;matched=true } }
+            path.remoteId=id
+        }
+    }
+    c.remote=id;s.local=id;s.localIds[0].id=id
+    return matched
 }
 function advertisedLimit(c: quic.Connection): Integer {
     let decoded = wire.parameters(c.clientTLS.peerTransportParameters,true)
@@ -107,7 +121,7 @@ function rangeWire(c: quic.Connection,s: quic.Connection,packets: List<Bytes>): 
     if packets.length != 1 { return result }
     let data = packets[0]; result.maximum = data.length
     let header = wire.header(data,0,s.local.length)
-    if !header.valid { return result }
+    if !header.valid || header.numberOffset != 1 + s.local.length || !quic.ownsConnectionId(s,header.destination) { return result }
     // Authenticate the packet against retained peer keys; a reciprocal key
     // phase confirmation can legitimately use its next read key.
     let opened = protection.unprotect(s.spaces[2].read,data,header.numberOffset,-1)
@@ -433,7 +447,17 @@ function main(): Integer {
             if c.activePath != 7 || c.pending.length != 0 || c.flight != 0 { return 90 }
             route = 7; pn = max(s.spaces[2].next,c.spaces[2].largest + 1)
         }
-        if mode == 32 { route = 7 }
+        if mode == 32 {
+            // RFC9000 section9 forbids unsolicited server migration. Its
+            // authentic unknown-route packet cannot mutate ACK/path history.
+            let before=rangeState(c);let paths=c.paths.length;let pending=c.pending.length
+            quic.receivePath(c,packet(s,2,pn,ping),7,at)
+            if rangeState(c)!=before || c.paths.length!=paths || c.pending.length!=pending || c.activePath!=0 { return 90 }
+            // Provision an unused CID through the public client probe API,
+            // then retain the original long-ACK plus PATH_CHALLENGE budget.
+            if !errors.booleanOk(quic.probePath(c,7,at)) { return 90 }
+            route = 7;pn=max(s.spaces[2].next,c.spaces[2].largest+1)
+        }
         gapped(s,c,pn,count,route,at)
         if c.spaces[2].ranges.length < count || !c.spaces[2].ack || quic.nextTimer(c) != at { return 90 }
         if mode == 31 || mode == 32 {
@@ -528,14 +552,14 @@ function main(): Integer {
         if mode == 40 || mode == 45 || mode == 46 {
             // Isolate the maximum legal short-header CID width. Cryptographic
             // keys/peer max_udp_payload_size remain authenticated and unchanged.
-            let length = 20; if mode == 46 { length = 14 }; let id = bytes(length); c.remote = id; s.local = id; s.localIds[0].id = id
+            let length = 20; if mode == 46 { length = 14 }; if !destinationWidth(c,s,length) { return 90 }
         }
         if mode == 43 { count = 300 }
         if (mode == 44 || mode == 46) && !errors.booleanOk(quic.updateKeys(s)) { return 90 }
         if mode == 47 {
             for ranges in 64..66 {
                 let fresh = pair(root,identity,key,client,clientKey); let local = fresh.client; let peer = fresh.server
-                let id = bytes(20); local.remote = id; peer.local = id; peer.localIds[0].id = id
+                if !destinationWidth(local,peer,20) { return 90 }
                 let first = max(peer.spaces[2].next,local.spaces[2].largest + 1)
                 sparse(peer,local,first,ranges,step,2000)
                 if local.spaces[2].ranges.length != ranges { return 90 }

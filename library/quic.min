@@ -22,7 +22,7 @@ record Pending { level: Integer; payload: Bytes; probe: Boolean; path: Integer; 
 public record Datagram { data: Bytes; pathId: Integer }
 public record Path {
     id: Integer; validated: Boolean; eligible: Boolean; challenge: Bytes
-    remoteSequence: Integer; remoteId: Bytes; intentional: Boolean
+    remoteSequence: Integer; remoteId: Bytes; localId: Bytes; intentional: Boolean
     deadline: Integer; attempts: Integer; received: Integer; sent: Integer
 }
 record ConnectionId { sequence: Integer; id: Bytes; token: Bytes }
@@ -248,7 +248,7 @@ function create(entropy: Bytes, original: Bytes, client: Boolean): Connection {
         closing: false; draining: false; closeUntil: -1; closeResponseAt: -1; closeInterval: 0; closeAttempts: 0; closeFrame: Bytes(); closeLevel: 0
         paceCredit: 12000.0; paceAt: -1; paceNext: -1
         ackExponent: 3; idleTimeout: 45000; failedAuthentication: 0
-        activePath: 0; incomingPath: 0; paths: [Path { id: 0; validated: client; eligible: true; challenge: Bytes(); remoteSequence: 0; remoteId: destination; intentional: false; deadline: -1; attempts: 0; received: 0; sent: 0 }]; outgoingPaths: []; peerDisabledMigration: false
+        activePath: 0; incomingPath: 0; paths: [Path { id: 0; validated: client; eligible: true; challenge: Bytes(); remoteSequence: 0; remoteId: destination; localId: local; intentional: false; deadline: -1; attempts: 0; received: 0; sent: 0 }]; outgoingPaths: []; peerDisabledMigration: false
     }
     if entropy.length < 80 || destination.length < 1 || destination.length > 20 { terminate(result, 1, "invalid QUIC entropy or destination connection ID") }
     return result
@@ -1058,6 +1058,9 @@ function negotiateClient(connection: Connection, header: wire.Header) {
     for space in connection.spaces { space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; clearAck(space) }
 }
 public function receivePath(connection: Connection, datagram: Bytes, pathId: Integer, now: Integer) {
+    // RFC9000 section9: discard unknown server addresses before packet
+    // authentication can advance keys, ACK history, accounting or routes.
+    if connection.clientRole && connection.state == ESTABLISHED && pathIndex(connection,pathId) < 0 { return }
     if connection.draining || ((connection.state == FAILED || connection.state == CLOSED) && !connection.closing) || now < 0 || now < connection.now || datagram.length > 65535 || pathId < 0 { return }
     if connection.now < 0 { connection.lastActivity = now }
     connection.now = now
@@ -1141,11 +1144,17 @@ public function receivePath(connection: Connection, datagram: Bytes, pathId: Int
                 if packet.number <= space.largest { continue }
                 let retained: List<Path> = []
                 for previous in connection.paths { if previous.id == connection.activePath { retained.add(previous) } }
-                retained.add(Path { id: pathId; validated: false; eligible: false; challenge: Bytes(); remoteSequence: 0; remoteId: connection.remote; intentional: false; deadline: -1; attempts: 0; received: 0; sent: 0 })
+                retained.add(Path { id: pathId; validated: false; eligible: false; challenge: Bytes(); remoteSequence: 0; remoteId: connection.remote; localId: connection.local; intentional: false; deadline: -1; attempts: 0; received: 0; sent: 0 })
                 connection.paths = retained; pathAt = retained.length - 1
             } else {
                 if level != 2 || !connection.confirmed || connection.clientRole { continue }
-                pathAt = candidatePath(connection, pathId, false)
+                // A changed incoming CID identifies intentional peer migration;
+                // only same-CID rebinding permits reciprocal CID reuse.
+                if receivedInterval(space,packet.number,packet.number) { continue }
+                let active = pathIndex(connection,connection.activePath)
+                let changed = active < 0 || !equal(connection.paths[active].localId,header.destination)
+                pathAt = candidatePath(connection, pathId, changed)
+                if pathAt >= 0 { connection.paths[pathAt].localId = header.destination }
             }
             if pathAt < 0 { continue }
         }
@@ -1175,6 +1184,7 @@ public function receivePath(connection: Connection, datagram: Bytes, pathId: Int
             if packet.number >= space.receiveFloor && ackEliciting { scheduleAck(space,level,now,pathId,true) }
             continue
         }
+        if level == 2 && packet.number == space.largest { path.localId = header.destination }
         for frame in parsed.frames {
             processFrame(connection, level, frame, header.destination)
             if connection.state == FAILED || connection.state == CLOSED { return }
@@ -1223,11 +1233,11 @@ function packetHeaderPath(connection: Connection, level: Integer, length: Intege
     for index in 0..4 { header.add((number >> ((3 - index) * 8)) & 255) }
     return header
 }
-function ackPayloadLimit(connection: Connection, level: Integer): Integer {
+function ackPayloadLimit(connection: Connection, level: Integer, pathId: Integer): Integer {
     // A legal long-header ACK uses at most the length-field width of this
-    // full path budget; short headers are exact for the current CID and PN.
+    // full path budget; short headers use the destination path CID and PN.
     // Reserve the AEAD tag separately. Each retained range is visited once.
-    let header = packetHeader(connection,level,1200,connection.spaces[level].next)
+    let header = packetHeaderPath(connection,level,1200,connection.spaces[level].next,pathId)
     return 1200 - header.length - 16
 }
 public function poll(connection: Connection, now: Integer): List<Bytes> {
@@ -1279,7 +1289,7 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
         if space.ack && !space.ackQueued && space.ackDeadline >= 0 && now >= space.ackDeadline &&
            space.write.key.length > 0 && (level != 2 || connection.state == ESTABLISHED) {
             space.ackQueued = true
-            enqueuePending(connection, Pending { level: level; payload: ackFrame(space,level,now,true,ackPayloadLimit(connection,level)); probe: false; path: space.ackPath; acknowledgement: true })
+            enqueuePending(connection, Pending { level: level; payload: ackFrame(space,level,now,true,ackPayloadLimit(connection,level,space.ackPath)); probe: false; path: space.ackPath; acknowledgement: true })
         }
     }
     refreshHandshakeProbe(connection,false)
@@ -1336,7 +1346,7 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
         if !space.active { continue }
         if pending.acknowledgement {
             if !space.ack { space.ackQueued = false; continue }
-            pending.payload = ackFrame(space,level,now,true,ackPayloadLimit(connection,level)); pending.path = space.ackPath
+            pending.payload = ackFrame(space,level,now,true,ackPayloadLimit(connection,level,space.ackPath)); pending.path = space.ackPath
         }
         if keys.key.length == 0 {
             if pending.acknowledgement { unsent.add(pending) }
@@ -1358,7 +1368,7 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
             if eliciting {
                 // An actual eliciting transmission can acknowledge a lone
                 // packet before the delay deadline, without another datagram.
-                let mixed = ackFrame(space,level,now,false,ackPayloadLimit(connection,level)); mixed.addBytes(pending.payload)
+                let mixed = ackFrame(space,level,now,false,ackPayloadLimit(connection,level,route)); mixed.addBytes(pending.payload)
                 // This transport uses a 1200-byte path budget, which fits
                 // every valid peer max_udp_payload_size. Account for the
                 // exact protected header and AEAD tag before piggybacking;
@@ -1516,7 +1526,7 @@ function candidatePath(connection: Connection, id: Integer, local: Boolean): Int
         if path.id == connection.activePath { retained.add(path) }
         else if path.challenge.length == 8 { return -1 }
     }
-    let path = Path { id: id; validated: false; eligible: local; challenge: randomBytes(8); remoteSequence: sequence; remoteId: destination; intentional: local; deadline: -1; attempts: 0; received: 0; sent: 0 }
+    let path = Path { id: id; validated: false; eligible: local && connection.clientRole; challenge: randomBytes(8); remoteSequence: sequence; remoteId: destination; localId: connection.local; intentional: local; deadline: -1; attempts: 0; received: 0; sent: 0 }
     retained.add(path); connection.paths = retained; challengePath(connection, path)
     return retained.length - 1
 }

@@ -395,13 +395,139 @@ function cidRebound(p: Pair): Integer {
     return 0
 }
 
+function reciprocalMigration(p: Pair): Integer {
+    if !ready(p) { return 200 }
+    let c=p.client;let peer=p.server;let original=crypto.hex(peer.remote);let now=p.now
+    if !errors.booleanOk(quic.probePath(c,7,now)) { return 201 }
+    for packet in quic.pollDatagrams(c,now) { quic.receivePath(peer,packet.data,packet.pathId,now) }
+    let replies=0;let received=0;let sent=0
+    for path in peer.paths { if path.id==7 { received=path.received } }
+    for packet in quic.pollDatagrams(peer,now) {
+        if packet.pathId==7 {
+            let header=wire.header(packet.data,0,c.local.length)
+            if !header.valid || !quic.ownsConnectionId(c,header.destination) { return 203 }
+            if crypto.hex(header.destination)==original {
+                print("semantic failure: server reused its original destination CID for an intentional peer path")
+                return 202
+            }
+            let opened=protection.unprotect(c.spaces[2].read,packet.data,header.numberOffset,-1)
+            if !opened.valid || packet.data.length>1200 { return 204 }
+            replies+=1;sent+=packet.data.length
+        }
+        quic.receivePath(c,packet.data,packet.pathId,now)
+    }
+    if replies==0 || sent>received*3 { return 205 }
+    for tick in 0..200 { drive(c,peer,now);now+=10 }
+    if c.activePath!=7 || peer.activePath!=7 || c.paths.length!=1 || peer.paths.length!=1 ||
+       c.state!=quic.ESTABLISHED || peer.state!=quic.ESTABLISHED || crypto.hex(peer.remote)==original ||
+       c.remoteRetireOutstanding.length!=0 || peer.remoteRetireOutstanding.length!=0 { return 206 }
+    print("intentional peer migration used distinct issued CIDs in both directions, validated both routes and acknowledged bounded retirements")
+    return 0
+}
+function serverWithoutSpare(p: Pair): Integer {
+    if !ready(p) { return 210 }
+    let c=p.client;let peer=p.server;peer.remoteIds=[peer.remoteIds[0]]
+    let original=crypto.hex(peer.remote);let paths=peer.paths.length;let largest=peer.spaces[2].largest
+    if !errors.booleanOk(quic.probePath(c,7,p.now)) { return 211 }
+    for packet in quic.pollDatagrams(c,p.now) { quic.receivePath(peer,packet.data,packet.pathId,p.now) }
+    for packet in quic.pollDatagrams(peer,p.now) {
+        if packet.pathId==7 {
+            print("semantic failure: server replied to intentional migration without an unused destination CID")
+            return 214
+        }
+    }
+    if peer.paths.length!=paths || peer.activePath!=0 || crypto.hex(peer.remote)!=original ||
+       peer.spaces[2].largest!=largest || peer.state!=quic.ESTABLISHED { return 215 }
+    for tick in 0..800 { drive(c,peer,p.now+tick*10) }
+    if c.activePath!=0 || peer.activePath!=0 || c.state!=quic.ESTABLISHED || peer.state!=quic.ESTABLISHED { return 216 }
+    print("server CID exhaustion refused intentional new-path transmission and preserved the validated original route")
+    return 0
+}
+
+function candidateAckWidth(p: Pair): Integer {
+    if !ready(p) { return 243 }
+    let c=p.client;let s=p.server;let first=s.spaces[2].next;let destination=randomBytes(20)
+    // Isolate a legal peer-issued 20-byte spare while keeping the original
+    // eight-byte active destination. Registry ownership agrees at both ends.
+    let sequence=c.remoteIds[1].sequence;c.remoteIds[1].id=destination
+    for known in s.localIds { if known.sequence==sequence { known.id=destination } }
+    if !errors.booleanOk(quic.probePath(c,7,p.now)) { return 244 }
+    for index in 0..256 {
+        s.spaces[2].next=first+index*((1<<30)+2)
+        quic.receivePath(c,authenticatedFrame(s,c,c.local,crypto.fromHex("0100000000")),7,p.now)
+    }
+    if c.spaces[2].ranges.length!=256 || c.activePath!=0 { return 246 }
+    let acknowledgements=0;let challenges=0;let flight=0
+    for packet in quic.pollDatagrams(c,p.now) {
+        if packet.pathId!=7 { return 247 }
+        let header=wire.header(packet.data,0,20)
+        if !header.valid || header.numberOffset!=21 || crypto.hex(header.destination)!=crypto.hex(destination) { return 248 }
+        let opened=protection.unprotect(s.spaces[2].read,packet.data,header.numberOffset,-1)
+        if !opened.valid { return 249 }
+        let parsed=wire.frames(opened.payload);if !parsed.valid { return 250 }
+        let eliciting=false
+        for frame in parsed.frames {
+            if frame.type==2 { acknowledgements+=1 }
+            if frame.type==26 { challenges+=1 }
+            if frame.type!=0 && frame.type!=2 && frame.type!=3 && frame.type!=28 && frame.type!=29 { eliciting=true }
+        }
+        if eliciting { flight+=packet.data.length }
+        if packet.data.length>1200 {
+            print("semantic failure: candidate-path ACK used active CID width and exceeded the peer MTU")
+            return 245
+        }
+    }
+    if acknowledgements!=1 || challenges!=1 || c.flight!=flight || c.spaces[2].ack { return 251 }
+    print("candidate-path ACK honored its issued twenty-byte CID, peer MTU and exact challenge flight accounting")
+    return 0
+}
+
+function routeState(c: quic.Connection): Text {
+    let space=c.spaces[2]
+    let state=Text(c.activePath)+":"+Text(c.incomingPath)+":"+Text(c.receivedBytes)+":"+Text(c.flight)+":"+Text(c.lastActivity)
+    state+=":"+Text(space.readGeneration)+":"+Text(space.writeGeneration)+":"+crypto.hex(space.read.secret)+":"+crypto.hex(space.write.secret)
+    state+=":"+crypto.hex(space.nextRead.secret)+":"+crypto.hex(space.previousRead.secret)+":"+Text(space.readAcknowledged)
+    state+=":"+Text(space.largest)+":"+Text(space.ack)+":"+Text(space.ackDeadline)+":"+Text(space.ackCount)+":"+Text(space.ackQueued)
+    for range in space.ranges { state+=":"+Text(range.first)+"-"+Text(range.last) }
+    for sent in space.sent { state+=":"+Text(sent.number)+":"+Text(sent.status)+":"+Text(sent.bytes)+":"+crypto.hex(sent.payload) }
+    for sent in c.history { state+=":"+Text(sent.number)+":"+Text(sent.status)+":"+Text(sent.bytes)+":"+crypto.hex(sent.payload) }
+    for pending in c.pending { state+=":"+Text(pending.level)+":"+Text(pending.path)+":"+crypto.hex(pending.payload) }
+    for path in c.paths { state+=":"+Text(path.id)+":"+Text(path.validated)+":"+Text(path.eligible)+":"+crypto.hex(path.challenge)+":"+Text(path.remoteSequence)+":"+crypto.hex(path.remoteId)+":"+crypto.hex(path.localId)+":"+Text(path.received)+":"+Text(path.sent)+":"+Text(path.deadline)+":"+Text(path.attempts) }
+    return state
+}
+function unknownServerRoute(p: Pair): Integer {
+    if !ready(p) { return 250 }
+    let c=p.client;let s=p.server;let largest=c.spaces[2].largest;let paths=c.paths.length
+    let read=c.spaces[2].readGeneration;let write=c.spaces[2].writeGeneration;let pending=c.pending.length
+    let before=routeState(c)
+    if !errors.booleanOk(quic.updateKeys(s)) { return 251 }
+    let packet=authenticatedFrame(s,c,c.local,crypto.fromHex("0100000000"))
+    // RFC9000 section9: unknown server addresses are discarded, including
+    // an authentic next-key-phase packet. No transport key state may advance.
+    quic.receivePath(c,packet,19,c.now)
+    if c.spaces[2].readGeneration!=read || c.spaces[2].writeGeneration!=write ||
+       c.spaces[2].largest!=largest || c.paths.length!=paths || c.pending.length!=pending || routeState(c)!=before {
+        print("semantic failure: discarded unknown server route changed packet or key-phase state")
+        return 252
+    }
+    if quic.pollDatagrams(c,p.now).length!=0 || c.activePath!=0 { return 253 }
+    // The identical authenticated packet on the known original route remains
+    // admissible: discard did not consume its packet number or key generation.
+    quic.receivePath(c,packet,0,p.now)
+    if c.spaces[2].readGeneration!=read+1 || c.spaces[2].writeGeneration!=write+1 ||
+       c.spaces[2].largest<=largest || c.activePath!=0 || c.state!=quic.ESTABLISHED { return 254 }
+    print("unknown server route preserved packet and key-phase state; the same authenticated packet remained valid on the original route")
+    return 0
+}
+
 function main(): Integer {
     let root = readBytesFile(argument(0)); let identity = readBytesFile(argument(1)); let key = readBytesFile(argument(2))
     let client = readBytesFile(argument(3)); let clientKey = readBytesFile(argument(4)); let mode = argument(5)
     if mode == "preferred-address" { return preferredAddress(root, identity, key, client, clientKey) }
-    if mode == "preferred-validation" || mode == "preferred-disabled" || mode == "preferred-fallback" || mode == "preferred-api" {
+    if mode == "preferred-validation" || mode == "preferred-disabled" || mode == "preferred-fallback" || mode == "preferred-api" || mode == "preferred-reciprocal" {
         let preferred=preferredPair(root,identity,key,client,clientKey,mode=="preferred-disabled",mode=="preferred-api")
         if mode=="preferred-fallback" { return preferredFallback(preferred) }
+        if mode=="preferred-reciprocal" { return reciprocalMigration(preferred) }
         return preferredValidation(preferred,mode=="preferred-disabled")
     }
     if mode=="early-routes" { return earlyRoutes(root,identity,key,client,clientKey) }
@@ -416,6 +542,11 @@ function main(): Integer {
     if mode == "unknown-destination" { return unknownDestination(p) }
     if mode=="repeated-migration" { return repeatedMigration(p) }
     if mode=="cid-rebound" { return cidRebound(p) }
+    if mode=="unknown-server-route" { return unknownServerRoute(p) }
+    if mode=="candidate-ack-width" { return candidateAckWidth(p) }
+    if mode=="reciprocal-cid" { return reciprocalMigration(p) }
+    if mode=="server-cid-unavailable" { return serverWithoutSpare(p) }
+    if mode=="nat-cid-unavailable" { p.server.remoteIds=[p.server.remoteIds[0]];return natRebinding(p) }
     if mode=="response-routes" { return responseRoutes(p) }
     if mode=="late-response" { return lateResponse(p) }
     if mode=="token-reuse" { return tokenReuse(p) }

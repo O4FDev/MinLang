@@ -40,6 +40,12 @@ BASELINE = {
     "retired-destination": (0, "authenticated packets addressed to a retired CID"),
     "early-routes": (0, "0-RTT used the original destination"),
     "unknown-destination": (0, "unknown destination CID did not allocate a path"),
+    "unknown-server-route": (252, "semantic failure: discarded unknown server route changed packet or key-phase state"),
+    "candidate-ack-width": (245, "semantic failure: candidate-path ACK used active CID width and exceeded the peer MTU"),
+    "reciprocal-cid": (202, "semantic failure: server reused its original destination CID for an intentional peer path"),
+    "preferred-reciprocal": (202, "semantic failure: server reused its original destination CID for an intentional peer path"),
+    "server-cid-unavailable": (214, "semantic failure: server replied to intentional migration without an unused destination CID"),
+    "nat-cid-unavailable": (0, "NAT rebinding preserved the client"),
 }
 
 def sha256(path):
