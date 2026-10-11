@@ -106,6 +106,83 @@ class ObservabilityHarness(unittest.TestCase):
                                 for note in getattr(captured.exception, '__notes__', [])))
 
 
+    def test_windows_attribute_values_live_until_successful_deletion(self):
+        import ctypes
+        import gc
+        from types import SimpleNamespace
+        import weakref
+        from windows_job_owner import WinAPI
+        class File:
+            def fileno(self):
+                return 1
+            def close(self):
+                pass
+        for failing in ('none', 'first-update', 'second-update', 'create', 'delete'):
+            api = WinAPI.__new__(WinAPI)
+            api.attributes, api.handles, api.files = None, [123], []
+            api.attributes_initialized = False
+            api.attribute_values = []
+            calls, refs = [], []
+            updates = 0
+            def initialize(*args):
+                args[3]._obj.value = 64
+                return 0
+            def delete(attributes):
+                calls.append('delete')
+                self.assertTrue(refs)
+                self.assertTrue(all(ref() is not None for ref in refs))
+                if failing == 'delete' and calls.count('delete') == 1:
+                    raise OSError('injected attribute deletion failure')
+            def checked(name, *args):
+                nonlocal updates
+                if name == 'DuplicateHandle':
+                    args[3]._obj.value = 200 + len(api.handles)
+                elif name == 'UpdateProcThreadAttribute':
+                    updates += 1
+                    calls.append('update')
+                    if failing == ('first-update' if updates == 1 else 'second-update'):
+                        raise OSError('injected attribute update failure')
+                elif name == 'CreateProcessW':
+                    calls.append('create')
+                    if failing == 'create':
+                        raise OSError('injected process creation failure')
+                    args[-1]._obj.process, args[-1]._obj.thread = 300, 301
+                elif name == 'CloseHandle':
+                    calls.append('close')
+                return 1
+            api.k = SimpleNamespace(
+                GetCurrentProcess=lambda: 1,
+                InitializeProcThreadAttributeList=initialize,
+                DeleteProcThreadAttributeList=delete)
+            api.checked = checked
+            with self.subTest(failing=failing), \
+                    patch.dict(sys.modules, msvcrt=SimpleNamespace(get_osfhandle=lambda fd: 1)), \
+                    patch('builtins.open', return_value=File()), \
+                    patch.object(ctypes, 'get_last_error', return_value=122, create=True):
+                if failing in ('first-update', 'second-update', 'create'):
+                    with self.assertRaises(OSError):
+                        api.spawn_suspended(123, ['contained'], self.root, 'out', 'err')
+                else:
+                    api.spawn_suspended(123, ['contained'], self.root, 'out', 'err')
+                self.assertEqual(len(api.attribute_values), 2)
+                refs[:] = [weakref.ref(value) for value in api.attribute_values]
+                gc.collect()
+                self.assertTrue(all(ref() is not None for ref in refs))
+                errors = api.close()
+                self.assertEqual(calls.count('delete'), 1)
+                if failing == 'delete':
+                    self.assertTrue(errors)
+                    self.assertTrue(api.attributes_initialized)
+                    self.assertTrue(all(ref() is not None for ref in refs))
+                    self.assertEqual(api.close(), [])
+                    self.assertEqual(calls.count('delete'), 2)
+                else:
+                    self.assertEqual(errors, [])
+                gc.collect()
+                self.assertTrue(all(ref() is None for ref in refs))
+                self.assertFalse(api.attributes_initialized)
+                self.assertEqual(api.attribute_values, [])
+
     def test_windows_job_invalid_timeout_refuses_before_creation(self):
         from windows_job_owner import owned_job_run
         class API:
