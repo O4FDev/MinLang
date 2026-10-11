@@ -47,3 +47,22 @@ The expanded progress fixture passed all 21 native and 21 ASan/UBSan cases at 32
 ## Additive construction
 
 A subsequent narrow opt-in change preserves completed certificates across eligible pure insertions. Replacements, removals, unknown registered targets and active collector phases remain conservative. See [Completed cycle proofs across additive stores](additive-cycle-proofs.md) for the post-incoming root check, unchanged witness contracts, source-current TDD evidence and remaining application setup limits.
+
+The leaf-buffer replacement regression now models a rooted callback/Core
+cycle with 32, 256 and 2048 live branches. On the current 9958888 control,
+eight empty traced-buffer replacements took 1216 collector units and eight
+full epochs at N=32, then failed the unchanged 192-unit work assertion after
+payload, object-count and root-drop reclamation checks. The narrow idle-leaf
+exception reduces this to eight units and zero epochs at all three sizes.
+
+Only live unregistered leaves qualify, with a completed, held, unpinned primary
+proof and no pending or active work. Their first outgoing traced edge still
+registers the source; sticky exposure forces captured parents to rejoin.
+Registered replacements and active ROOTS/MARK/SWEEP remain conservative.
+Native and ASan/UBSan system/fixed/lazy budgets 1/32/1024 and eager/32 passed,
+alongside the frozen private-retirement, registration/exposure, witness,
+additive/growth and independent graph controls. Both ordinary production
+objects are byte-identical to the current pre-fix control under the maintained
+flags. Linux progress passes the unchanged one-second/2% idle gate; this does
+not replay the retained Windows sanitizer failure or certify device capacity.
+The strict 4096-device cohort still needs a freshly built native executable.
