@@ -58,6 +58,47 @@ class Publication(unittest.TestCase):
             self.assertEqual(fields[9],'https://updates.example/'+asset['key'])
             self.assertNotIn('credential',json.dumps(plan).lower())
 
+    def test_malformed_origins_fail_before_signing_or_output(self):
+        # urlsplit is permissive: it strips controls and does not validate a
+        # port until .port is read. None of these may enter signed metadata.
+        origins = [
+            'HTTPS://updates.example', ' https://updates.example',
+            'https://updates.example\n', 'https://updates.ex\tample',
+            'https://updates.example?', 'https://updates.example#',
+            'https://updates.example:', 'https://updates.example:invalid',
+            'https://updates.example:0', 'https://updates.example:65536',
+            'https://@updates.example', 'https://updates.example/path',
+            'https://updates.example?query', 'https://updates.example#fragment',
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); artifact=root/'agent';artifact.write_bytes(b'fixture')
+            for index, origin in enumerate(origins):
+                calls=[]; output=root/f'static-{index}'
+                with self.subTest(origin=origin):
+                    with self.assertRaises(ValueError):
+                        manifest.prepare(artifact,output,'org.tolum.peer','macos-arm64','stable',
+                            1,'1.1.0',1800000000,1800003600,1,origin,
+                            sign=lambda data:(calls.append(data) or (b'S'*64,b'P'*32)))
+                    self.assertEqual(calls,[])
+                    self.assertFalse(output.exists())
+
+    def test_valid_origins_and_rollout_promotions_preserve_signed_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); artifact=root/'agent';artifact.write_bytes(b'fixture')
+            for index, origin in enumerate(('https://updates.example',
+                    'https://UPDATES.example', 'https://updates.example:443',
+                    'https://updates.example:8443')):
+                for rollout in (1,10,100):
+                    output=root/f'static-{index}-{rollout}'
+                    calls=[]
+                    manifest.prepare(artifact,output,'org.tolum.peer','macos-arm64','stable',
+                        rollout,'1.1.0',1800000000,1800003600,rollout,origin,
+                        sign=lambda data:(calls.append(data) or (b'S'*64,b'P'*32)))
+                    self.assertEqual(len(calls),1)
+                    fields=calls[0].decode('ascii').splitlines()
+                    self.assertEqual(fields[8],str(rollout))
+                    self.assertTrue(fields[9].startswith(origin+'/releases/'))
+
     def test_invalid_rollout_version_or_expiration_never_invokes_signer_or_publishes(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); artifact=root/'agent';artifact.write_bytes(b'fixture')
