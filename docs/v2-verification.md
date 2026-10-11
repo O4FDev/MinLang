@@ -1,7 +1,7 @@
 # v2 implementation and verification map
 
 This checkpoint describes the combined implementation based on
-`680e10bdf18f442e8d72f2880d5efd5c6317ea69` at 20:39 UTC on 2026-10-11.
+`aaa5bc72b195a8cb779fc0a52a5126bb825595bb` at 21:03 UTC on 2026-10-11.
 An implemented API, a passing focused suite and a complete deployment are
 separate claims. Retained results establish only their recorded source and
 configuration. Combined CI, current macOS/Windows gates, ordinary performance
@@ -83,7 +83,19 @@ recheck it and fall back when a full rebuild or anchor transfer invalidates it.
 The 540 native/sanitizer cases and 23 serial safety commands passed. Ordinary
 system/default runtime objects remained identical; native and sanitizer idle
 maxima were 1.1504% and 1.1485% under the unchanged one-second/2% gate.
-This fixes neither full-build insertion nor device capacity or Windows idle.
+This fixes neither device capacity nor Windows idle.
+
+A separate first-insertion fix now preserves a full proof build when the
+source and child are distinct, independently held, unregistered and unexposed
+leaves. It classifies their state before normal registration; registration,
+shading and publication remain unchanged, and it creates no completed proof.
+Six genuine red cases completed safe reclamation before detecting an extra
+epoch. The repaired runtime passed 480 native/sanitizer cases, including
+copied/taken ownership in ROOTS/MARK/SWEEP and conservative receiver,
+descendant, self-cycle and anchor controls. All 25 serial safety commands
+passed. Ordinary runtime objects remained identical; native and sanitizer
+idle maxima were 0.3594% and 0.5826% under the unchanged one-second/2% gate.
+Fresh device capacity and Windows checks remain pending.
 
 ## Recoverable errors
 
@@ -193,6 +205,11 @@ Both are nonpasses. Exact teardown closed all owned Compose lifetimes and
 confirmed process and container/network absence. Quinn and the primary next
 cell remain pending; the combined collector/protocol candidate is unqualified.
 
+The runner transfer endpoint uses the ordinary runtime, without cycle or
+callback markers. The collector header fixes therefore cannot change that
+executable or explain its transfer performance. A further ordinary-path repair
+is being designed before another strict transfer attempt.
+
 Actual runner failures exposed fixture defects in Docker 29 capability
 spelling, simulator capture writers that had not flushed during shutdown, and
 signal handlers registered only after endpoint network readiness. Focused
@@ -256,9 +273,10 @@ to 20,571 events, without table misses, overflow or reaching its report limit.
 At 28.04 CPU seconds, 1,085 events involved fresh actual-zero retirement during
 local work, and 9,175 involved first registration of a detached source/child
 pair during full proof construction. The qualified fresh-MARK fix covers the
-narrow retirement case. A public-API fixture for detached full-build insertion
-is being tested before authorizing any exception; no insertion exception has
-landed. No steady-state measurement began; 20,000 actual QUIC devices and
+narrow retirement case, and the separately qualified first-insertion fix covers
+the detached pair case without exempting other mutations. A fresh combined
+endpoint and capacity probe remain pending. No steady-state measurement began;
+20,000 actual QUIC devices and
 two-hour flat memory remain unqualified.
 
 Earlier source-frozen TLS/HTTP, QUIC and socket soaks remain evidence only for
@@ -290,6 +308,15 @@ adapter attempt under additional background scheduling timed out and is
 retained separately. These direct checks do not certify the public launcher,
 managed AppKit cleanup matrix, physical network transitions or normal-exit
 leak detection.
+
+Three exact language probes now also pass with compiler and ARM64 object
+generation offloaded to Boat: missing-Keychain lookup, ordinary desktop
+services, and the shared AppKit/network debug loop. Their original 15-second
+execution limits and output checks are unchanged. They completed in 1.89,
+1.23 and 2.80 seconds. Actual object/runtime/provider/link bindings and stable
+source receipts are retained; local work comprised small native providers and
+final links. These native probe passes do not certify the full public launcher,
+release/LTO, sanitizer, managed-capture or hardware-identity gates.
 
 The Keychain import fixture proves opaque Minyar identity references, not
 hardware nonexportability. A legacy software key that rejected SecItemExport
