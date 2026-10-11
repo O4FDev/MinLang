@@ -197,11 +197,17 @@ def finalize(evidence, report, primary):
     failure = None
     report.setdefault('files', {})
     report.setdefault('unhashed_files', [])
-    for path in sorted(evidence.rglob('*')):
-        if not path.is_file() or path.is_symlink() or path.name == 'manifest.json':
-            continue
+    try:
+        paths = sorted(evidence.rglob('*'))
+    except BaseException as error:
+        paths = []
+        secondary(report, primary, 'file-inventory', error)
+        failure = failure or error
+    for path in paths:
         name = path.relative_to(evidence).as_posix()
         try:
+            if not path.is_file() or path.is_symlink() or path.name == 'manifest.json':
+                continue
             report['files'][name] = {
                 'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
                 'bytes': path.stat().st_size,
@@ -228,18 +234,9 @@ class CommandRecords:
 
     def run(self, command, *, timeout, label):
         command = list(map(str, command))
-        requested = command[0]
-        executable = host_path(requested) if os.path.dirname(requested) else None
-        if executable is None:
-            found = shutil.which(requested)
-            if found is None:
-                raise FileNotFoundError('Missing command executable: ' + requested)
-            executable = host_path(found)
-        executable = executable.resolve()
         row = {'argv': command, 'cwd': str(ROOT), 'label': label,
                'timeout_seconds': timeout, 'timed_out': False, 'status': None,
-               'executable': str(executable),
-               'executable_sha256': hashlib.sha256(executable.read_bytes()).hexdigest(),
+               'executable': None, 'executable_sha256': None,
                'cleanup': {'action': 'none', 'status': 'not-needed'}}
         self.report['commands'].append(row)
         began = time.monotonic()
@@ -247,6 +244,16 @@ class CommandRecords:
         out, err = b'', b''
         primary = None
         try:
+            requested = command[0]
+            executable = host_path(requested) if os.path.dirname(requested) else None
+            if executable is None:
+                found = shutil.which(requested)
+                if found is None:
+                    raise FileNotFoundError('Missing command executable: ' + requested)
+                executable = host_path(found)
+            executable = executable.resolve()
+            row['executable'] = str(executable)
+            row['executable_sha256'] = hashlib.sha256(executable.read_bytes()).hexdigest()
             process = subprocess.Popen(
                 command, executable=native_path(executable), cwd=ROOT,
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -286,6 +293,34 @@ class CommandRecords:
             return subprocess.CompletedProcess(command, process.returncode, out, err)
         except BaseException as error:
             primary = error
+            if process is not None and process.poll() is None:
+                row['cleanup'] = {'action': 'terminate_process_tree', 'status': 'started',
+                                  'owned_pid': process.pid, 'reason': 'command-exception'}
+                try:
+                    terminate_process_tree(process)
+                    row['cleanup']['status'] = 'completed'
+                except BaseException as cleanup_error:
+                    row['cleanup']['status'] = 'failed'
+                    row['cleanup']['exception'] = type(cleanup_error).__name__ + ': ' + str(cleanup_error)
+                    error.add_note('idle mock exception cleanup failed: ' + str(cleanup_error))
+                    process.kill()
+                try:
+                    out, err = process.communicate(timeout=10)
+                except BaseException as drain_error:
+                    row['cleanup']['status'] = 'failed'
+                    row['cleanup']['drain_error'] = str(drain_error)
+                    error.add_note('idle mock exception drain failed: ' + str(drain_error))
+                    process.kill()
+                    for pipe in (process.stdout, process.stderr):
+                        if pipe is not None and not pipe.closed:
+                            pipe.close()
+                    try:
+                        process.wait(timeout=5)
+                    except BaseException as wait_error:
+                        row['cleanup']['wait_error'] = str(wait_error)
+                        error.add_note('idle mock final child wait failed: ' + str(wait_error))
+            if process is not None:
+                row['status'] = process.returncode
             row['exception'] = type(error).__name__ + ': ' + str(error)
             raise
         finally:
