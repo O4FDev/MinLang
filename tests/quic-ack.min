@@ -101,6 +101,55 @@ function bytes(count: Integer): Bytes {
     return data
 }
 
+record RangeWire { valid: Boolean; maximum: Integer; count: Integer; largest: Integer; delay: Integer; width: Integer; ping: Integer; maximal: Boolean; lowest: Integer }
+function rangeWire(c: quic.Connection,s: quic.Connection,packets: List<Bytes>): RangeWire {
+    let result = RangeWire { valid: false; maximum: 0; count: 0; largest: -1; delay: -1; width: 0; ping: 0; maximal: true; lowest: -1 }
+    if packets.length != 1 { return result }
+    let data = packets[0]; result.maximum = data.length
+    let header = wire.header(data,0,s.local.length)
+    if !header.valid { return result }
+    // Authenticate the packet against retained peer keys; a reciprocal key
+    // phase confirmation can legitimately use its next read key.
+    let opened = protection.unprotect(s.spaces[2].read,data,header.numberOffset,-1)
+    if !opened.valid && s.spaces[2].nextRead.key.length > 0 { opened = protection.unprotect(s.spaces[2].nextRead,data,header.numberOffset,-1) }
+    if !opened.valid && s.spaces[2].previousRead.key.length > 0 { opened = protection.unprotect(s.spaces[2].previousRead,data,header.numberOffset,-1) }
+    if !opened.valid { return result }
+    let parsed = wire.frames(opened.payload); if !parsed.valid { return result }
+    let found = false
+    for frame in parsed.frames {
+        if frame.type == 1 { result.ping += 1 }
+        if frame.type == 2 {
+            if found { return result }; found = true
+            result.count = frame.ranges.length; result.largest = frame.value; result.delay = frame.values[0]
+            let encoded = opened.payload.slice(frame.start,frame.end)
+            let largest = wire.varint(encoded,1); let delay = wire.varint(encoded,largest.end); let count = wire.varint(encoded,delay.end)
+            if !largest.valid || !delay.valid || !count.valid || count.value + 1 != result.count { return result }
+            result.width = count.end - delay.end
+            if result.count > c.spaces[2].ranges.length { return result }
+            for index in 0..result.count {
+                let actual = frame.ranges[index]; let received = c.spaces[2].ranges[index]
+                if actual.first != received.first || actual.last != received.last { return result }
+            }
+            let low = frame.ranges[result.count - 1].first; result.lowest = low
+            if result.count < c.spaces[2].ranges.length {
+                let next = c.spaces[2].ranges[result.count]
+                let extra = errors.bytesValue(wire.encode(low - next.last - 2)).length + errors.bytesValue(wire.encode(next.last - next.first)).length
+                let countGrowth = errors.bytesValue(wire.encode(result.count)).length - result.width
+                if data.length + extra + countGrowth <= advertisedLimit(c) { result.maximal = false }
+            }
+        }
+    }
+    result.valid = found; return result
+}
+function rangeState(c: quic.Connection): Text {
+    let result = Text(c.spaces[2].receiveFloor) + ":" + Text(c.spaces[2].largest) + ":" + Text(c.spaces[2].largestReceivedAt)
+    for range in c.spaces[2].ranges { result += ":" + Text(range.first) + "-" + Text(range.last) }
+    return result
+}
+function sparse(s: quic.Connection,c: quic.Connection,pn: Integer,count: Integer,step: Integer,now: Integer) {
+    for index in 0..count { inject(s,c,pn + index * step,crypto.fromHex("01"),now) }
+}
+
 function main(): Integer {
     let root = readBytesFile(argument(0)); let identity = readBytesFile(argument(1)); let key = readBytesFile(argument(2))
     let client = readBytesFile(argument(3)); let clientKey = readBytesFile(argument(4)); let mode = 0; for digit in argument(5) { mode = mode * 10 + Integer(digit) - 48 }
@@ -471,6 +520,76 @@ function main(): Integer {
                crypto.hex(result.data) != crypto.hex(body) || local.flight != result.elicitingBytes || local.flight != flightBytes(local) { return 57 }
             if (count == 80 && (result.maximum != 1199 || result.packets != 1)) ||
                (count == 81 && result.packets != 2) || local.spaces[2].ack || local.pending.length != 0 { return 57 }
+        }
+    }
+    if mode >= 37 && mode <= 45 {
+        let step = 16386; let count = 256
+        if mode == 38 || mode == 39 || mode == 40 || mode == 41 || mode == 42 || mode == 44 || mode == 45 { step = (1 << 30) + 2 }
+        if mode == 40 || mode == 45 {
+            // Isolate the maximum legal short-header CID width. Cryptographic
+            // keys/peer max_udp_payload_size remain authenticated and unchanged.
+            let id = bytes(20); c.remote = id; s.local = id; s.localIds[0].id = id
+        }
+        if mode == 43 { count = 300 }
+        if mode == 44 && !errors.booleanOk(quic.updateKeys(s)) { return 90 }
+        if mode == 39 {
+            for ranges in 63..67 {
+                let fresh = pair(root,identity,key,client,clientKey); let local = fresh.client; let peer = fresh.server
+                let first = max(peer.spaces[2].next,local.spaces[2].largest + 1)
+                sparse(peer,local,first,ranges,step,2000)
+                if local.spaces[2].largest != first + (ranges - 1) * step || local.spaces[2].ranges.length != ranges { return 90 }
+                let result = rangeWire(local,peer,quic.poll(local,2000)); let width = 1
+                if ranges > 64 { width = 2 }
+                if !result.valid || result.maximum > 1200 || result.count != ranges || result.width != width || result.delay != 0 { return 60 }
+            }
+        } else {
+            sparse(s,c,pn,count,step,2000)
+            let space = c.spaces[2]; let largest = pn + (count - 1) * step
+            if c.state != quic.ESTABLISHED || space.largest != largest || space.ranges.length != min(256,count) { return 90 }
+            let before = rangeState(c); let sentAt = 2000
+            if mode == 41 || mode == 42 {
+                c.addressValidated = false; c.paths[0].validated = false; c.receivedBytes = 0; c.paths[0].received = 0
+                if quic.poll(c,2000).length != 0 || c.pending.length != 1 || rangeState(c) != before { return 61 }
+                let write = space.write
+                if mode == 41 { space.write = protection.traffic(1,0,Bytes()); c.addressValidated = true; c.paths[0].validated = true }
+                for clock in 2001..2011 {
+                    if quic.poll(c,clock).length != 0 || c.pending.length != 1 || rangeState(c) != before || space.ackDeadline != 2000 { return 61 }
+                }
+                inject(s,c,largest + 1,ping,2020); largest += 1
+                before = rangeState(c)
+                if mode == 42 { c.receivedBytes = 0; c.paths[0].received = 0 }
+                if quic.poll(c,2020).length != 0 || c.pending.length != 1 || rangeState(c) != before || space.ackDeadline != 2000 { return 61 }
+                space.write = write; c.addressValidated = true; c.paths[0].validated = true; sentAt = 2030
+            }
+            if mode == 45 {
+                let id = errors.integerValue(quic.openStream(c,false)); let body = bytes(1000)
+                if errors.integerValue(quic.writeStream(c,id,body,true)) != 1000 { return 90 }
+                let outgoing = quic.poll(c,sentAt); let result = wireSize(s,outgoing)
+                if !result.valid || result.maximum > 1200 { print("wide-CID ACK and STREAM exceeded MTU " + Text(result.maximum)); return 62 }
+                if result.streams != 1 || result.acknowledgements != 1 || result.fins != 1 ||
+                   crypto.hex(result.data) != crypto.hex(body) || c.flight != result.elicitingBytes || c.flight != flightBytes(c) { return 62 }
+            } else {
+                let outgoing = quic.poll(c,sentAt); let result = rangeWire(c,s,outgoing)
+                if !result.valid || result.maximum > advertisedLimit(c) { print("standalone sparse ACK exceeded MTU " + Text(result.maximum)); return 58 }
+                if !result.maximal || result.largest != largest || result.count >= space.ranges.length ||
+                   result.count <= 0 || result.lowest <= pn || (mode == 44 && result.ping != 1) { return 59 }
+                let delay = 0; if mode == 41 || mode == 42 { delay = 1250 }
+                if result.delay != delay || rangeState(c) != before || space.ack || c.pending.length != 0 { return 59 }
+                let inFlight = 0; if mode == 44 { inFlight = outgoing[0].length }
+                if c.flight != inFlight || c.flight != flightBytes(c) { return 59 }
+                if mode == 37 || mode == 43 {
+                    let duplicate = Bytes(); number(duplicate,15); number(duplicate,1); number(duplicate,0); number(duplicate,1); duplicate.add(120)
+                    inject(s,c,pn,duplicate,sentAt + 1)
+                    if c.receivedData != 0 || c.streams.length != 0 || rangeState(c) != before { return 63 }
+                    let old = quic.poll(c,sentAt + 1)
+                    if mode == 43 {
+                        if space.receiveFloor <= pn || old.length != 0 { return 63 }
+                    } else {
+                        let repeat = rangeWire(c,s,old)
+                        if space.receiveFloor > pn || !repeat.valid || repeat.maximum > 1200 || repeat.largest != largest || repeat.delay != 125 { return 63 }
+                    }
+                }
+            }
         }
     }
     print("ACK case " + Text(mode)); return 0
