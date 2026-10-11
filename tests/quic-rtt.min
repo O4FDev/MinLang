@@ -57,11 +57,14 @@ function queuedMixed(c: quic.Connection,s: quic.Connection,now: Integer): Intege
     let id=errors.integerValue(quic.openStream(c,false));quic.writeStream(c,id,Bytes("queued"),true)
     let pending=c.pending[0]
     for packet in quic.poll(c,now) { quic.receive(s,packet,now) }
-    let acknowledgements=quic.poll(s,now+1)
+    // A lone eliciting application packet is acknowledged at the public
+    // deadline, capped by the default advertised maximum ACK delay.
+    let ackAt=max(now+1,min(now+25,quic.nextTimer(s)))
+    let acknowledgements=quic.poll(s,ackAt)
     pending.payload=pending.payload.slice(0,pending.payload.length)
     c.receiveMaxData+=65536;pending.payload.add(16);number(pending.payload,c.receiveMaxData)
     c.pending.add(pending)
-    for packet in acknowledgements { quic.receive(c,packet,now+1) }
+    for packet in acknowledgements { quic.receive(c,packet,ackAt) }
     if c.streams[0].sendAcknowledged!=6 || !c.streams[0].finalAcknowledged { return 65 }
     let first=c.spaces[2].next
     quic.poll(c,now+100)
@@ -363,11 +366,12 @@ function main(): Integer {
     }
     c.congestion=recovery.create(1200)
     let first=c.spaces[2].next;quic.ping(c);quic.poll(c,1000)
-    let ping=Bytes();ping.add(1);inject(s,c,ping,1005);quic.poll(c,1005)
+    let ping=Bytes();ping.add(1);inject(s,c,ping,1005)
+    let sampleAt=max(1005,min(1030,quic.nextTimer(c)));quic.poll(c,sampleAt)
     let last=c.spaces[2].next-1
     if last<=first { return 1 }
     let ack=Bytes();ack.add(2);number(ack,last);number(ack,0);number(ack,0);number(ack,last-first)
-    inject(s,c,ack,1105)
+    inject(s,c,ack,sampleAt+100)
     if !c.congestion.measured || c.congestion.latest != 100 { print("RTT " + Text(c.congestion.measured) + " " + Text(c.congestion.latest));return 2 }
     let duplicate=ack.slice(0,ack.length);inject(s,c,duplicate,1205)
     if c.congestion.latest != 100 { return 3 }

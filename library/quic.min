@@ -18,7 +18,7 @@ public constant ESTABLISHED = 1
 public constant CLOSED = 2
 public constant FAILED = 3
 record Sent { number: Integer; time: Integer; bytes: Integer; payload: Bytes; path: Integer; level: Integer; status: Integer; measured: Boolean }
-record Pending { level: Integer; payload: Bytes; probe: Boolean; path: Integer }
+record Pending { level: Integer; payload: Bytes; probe: Boolean; path: Integer; acknowledgement: Boolean }
 public record Datagram { data: Bytes; pathId: Integer }
 public record Path {
     id: Integer; validated: Boolean; eligible: Boolean; challenge: Bytes
@@ -37,7 +37,8 @@ record Space {
     nextRead: protection.Keys; previousRead: protection.Keys; previousUntil: Integer
     readGeneration: Integer; writeGeneration: Integer; readFirst: Integer; writeFirst: Integer; writePackets: Integer
     readAcknowledged: Boolean; writeUpdatedAt: Integer
-    ackPath: Integer
+    ackPath: Integer; ackDeadline: Integer; ackCount: Integer; ackQueued: Boolean
+    largestReceivedAt: Integer; largestElicitingReceived: Integer; receiveFloor: Integer
 }
 public record Connection {
     state: Integer; error: Text; code: Integer; clientRole: Boolean; version: Integer
@@ -113,7 +114,8 @@ function create(entropy: Bytes, original: Bytes, client: Boolean): Connection {
             nextRead: protection.traffic(1, 0, Bytes()); previousRead: protection.traffic(1, 0, Bytes()); previousUntil: -1
             readGeneration: 0; writeGeneration: 0; readFirst: 0; writeFirst: 0; writePackets: 0
             readAcknowledged: true; writeUpdatedAt: -1
-            ackPath: -1
+            ackPath: -1; ackDeadline: -1; ackCount: 0; ackQueued: false
+            largestReceivedAt: -1; largestElicitingReceived: -1; receiveFloor: 0
         })
     }
     let role = 1
@@ -197,7 +199,7 @@ function terminate(connection: Connection, code: Integer, message: Text) {
     connection.state = FAILED; connection.code = code; connection.error = message
     connection.pending = []; connection.flight = 0
     connection.history = []; connection.lossFirst = -1; connection.lossLast = -1; connection.lossAfter = -1; connection.handshakeProbe = -1; connection.handshakeAcknowledged = false
-    for space in connection.spaces { space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; space.ack = false }
+    for space in connection.spaces { space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; clearAck(space) }
     connection.streams = []
     let level = 0
     if connection.spaces[1].write.key.length > 0 { level = 1 }
@@ -210,9 +212,9 @@ function terminate(connection: Connection, code: Integer, message: Text) {
 function beginClosing(connection: Connection, level: Integer, frame: Bytes) {
     connection.closing = true; connection.draining = false; connection.closeUntil = -1; connection.closeResponseAt = -1
     connection.closeInterval = recovery.pto(connection.congestion,connection.confirmed); connection.closeAttempts = 0; connection.closeFrame = frame; connection.closeLevel = level
-    connection.pending = [Pending { level: level; payload: frame; probe: false; path: -1 }]; connection.flight = 0
+    connection.pending = [Pending { level: level; payload: frame; probe: false; path: -1; acknowledgement: false }]; connection.flight = 0
     connection.history = []; connection.lossFirst = -1; connection.lossLast = -1; connection.lossAfter = -1; connection.handshakeProbe = -1; connection.handshakeAcknowledged = false
-    for space in connection.spaces { space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; space.ack = false }
+    for space in connection.spaces { space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; clearAck(space) }
     for path in connection.paths { path.challenge = Bytes(); path.deadline = -1 }
 }
 function beginDraining(connection: Connection, code: Integer) {
@@ -220,18 +222,21 @@ function beginDraining(connection: Connection, code: Integer) {
     connection.closeUntil = max(connection.closeUntil,connection.now + 3 * recovery.pto(connection.congestion,connection.confirmed))
     connection.pending = []; connection.flight = 0; connection.streams = []; connection.closeFrame = Bytes()
     connection.history = []; connection.lossFirst = -1; connection.lossLast = -1; connection.lossAfter = -1; connection.handshakeProbe = -1; connection.handshakeAcknowledged = false
-    for space in connection.spaces { space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; space.ack = false }
+    for space in connection.spaces { space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; clearAck(space) }
     for path in connection.paths { path.challenge = Bytes(); path.deadline = -1 }
 }
 function enqueue(connection: Connection, level: Integer, payload: Bytes, probe: Boolean) {
     enqueuePath(connection, level, payload, probe, -1)
 }
 function enqueuePath(connection: Connection, level: Integer, payload: Bytes, probe: Boolean, path: Integer) {
+    enqueuePending(connection, Pending { level: level; payload: payload; probe: probe; path: path; acknowledgement: false })
+}
+function enqueuePending(connection: Connection, value: Pending) {
+    let level = value.level; let payload = value.payload
     if connection.pending.length >= 4096 { terminate(connection, 1, "QUIC send queue exceeds bounded packet count"); return }
     if connection.emptySince >= 0 && payload.length > 0 && payload[0] != 0 && payload[0] != 2 && payload[0] != 3 && payload[0] != 28 && payload[0] != 29 {
         recovery.idle(connection.congestion,max(0,connection.now - connection.emptySince)); connection.emptySince = -1
     }
-    let value = Pending { level: level; payload: payload; probe: probe; path: path }
     if level < 2 && connection.pending.length > 0 {
         // RFC9001 5.7: peers cannot process application data before Finished.
         // Insert only handshake traffic; application-only queues stay in place.
@@ -410,8 +415,32 @@ function synchronize(connection: Connection) {
         issueConnectionIds(connection)
     }
 }
-function acknowledge(space: Space, number: Integer): Boolean {
-    for range in space.ranges { if number >= range.first && number <= range.last { space.ack = true; return false } }
+// The local defaults we advertise are independent of the peer's ACK policy.
+constant ACK_DELAY = 25
+constant ACK_EXPONENT = 3
+function clearAck(space: Space) {
+    space.ack = false; space.ackDeadline = -1; space.ackCount = 0; space.ackQueued = false; space.ackPath = -1
+}
+function receivedInterval(space: Space, first: Integer, last: Integer): Boolean {
+    if last < first { return true }
+    let wanted = last
+    for range in space.ranges {
+        if range.last < wanted { return false }
+        if range.first <= first { return true }
+        wanted = range.first - 1
+    }
+    return false
+}
+function scheduleAck(space: Space, level: Integer, now: Integer, path: Integer, immediate: Boolean) {
+    space.ack = true; space.ackPath = path; space.ackCount = min(2,space.ackCount + 1)
+    let deadline = now + ACK_DELAY
+    if level < 2 || immediate || space.ackCount >= 2 { deadline = now }
+    if space.ackDeadline < 0 { space.ackDeadline = deadline }
+    else { space.ackDeadline = min(space.ackDeadline,deadline) }
+}
+function acknowledge(space: Space, number: Integer, now: Integer): Boolean {
+    if number < space.receiveFloor { return false }
+    for range in space.ranges { if number >= range.first && number <= range.last { return false } }
     let ordered: List<wire.Range> = []; let inserted = false
     for range in space.ranges {
         if !inserted && number > range.last { ordered.add(wire.Range { first: number; last: number }); inserted = true }
@@ -422,20 +451,29 @@ function acknowledge(space: Space, number: Integer): Boolean {
     for range in ordered {
         if merged.length > 0 && merged[merged.length - 1].first <= range.last + 1 { merged[merged.length - 1].first = range.first }
         else if merged.length < 256 { merged.add(range) }
+        else { space.receiveFloor = max(space.receiveFloor,range.last + 1) }
     }
-    space.ranges = merged; space.largest = max(space.largest, number)
+    space.ranges = merged
+    if number < space.receiveFloor { return false }
+    if number > space.largest { space.largest = number; space.largestReceivedAt = now }
     return true
 }
-function ackFrame(space: Space): Bytes {
+function ackFrame(space: Space, level: Integer, now: Integer, needsPing: Boolean): Bytes {
     let result = Bytes()
     if space.ranges.length == 0 { return result }
-    let first = space.ranges[0]
-    add(result, 2); add(result, first.last); add(result, 0); add(result, space.ranges.length - 1); add(result, first.last - first.first)
+    let first = space.ranges[0]; let delay = 0
+    // RFC9000 13.2.5 measures the largest PN, including ACK-only packets,
+    // when the ACK actually leaves the queue, with our advertised exponent.
+    if level == 2 { delay = min(max(0,now - space.largestReceivedAt),wire.MAX_VARINT / 1000) * 1000 / (1 << ACK_EXPONENT) }
+    add(result, 2); add(result, first.last); add(result, delay); add(result, space.ranges.length - 1); add(result, first.last - first.first)
     let low = first.first
     for index in 1..space.ranges.length {
         let range = space.ranges[index]
         add(result, low - range.last - 2); add(result, range.last - range.first); low = range.first
     }
+    // A reciprocal key-phase confirmation is eliciting. Never start an
+    // ACK-only response loop when the new phase itself contains only ACK.
+    if level == 2 && !space.readAcknowledged && needsPing { add(result,1) }
     return result
 }
 function processAck(connection: Connection, space: Space, frame: wire.Frame, level: Integer) {
@@ -464,7 +502,11 @@ function processAck(connection: Connection, space: Space, frame: wire.Frame, lev
     // its send time when another newly ACKed packet was ack-eliciting.
     if eliciting && sampleAt >= 0 && frame.value > space.largestAck {
         let delay = 0
-        if frame.values.length > 0 { delay = min(frame.values[0], connection.congestion.maxAckDelay * 1000) * (1 << connection.ackExponent) / 1000 }
+        if level == 2 && frame.values.length > 0 {
+            let scale = 1 << connection.ackExponent
+            let encoded = min(frame.values[0],wire.MAX_VARINT / scale)
+            delay = min(encoded * scale / 1000,connection.congestion.maxAckDelay)
+        }
         recovery.sample(connection.congestion,connection.now - sampleAt,delay,connection.confirmed)
     }
     let remaining: List<Sent> = []
@@ -539,7 +581,7 @@ function processAck(connection: Connection, space: Space, frame: wire.Frame, lev
 function discard(connection: Connection, level: Integer) {
     let space = connection.spaces[level]
     if !space.active { return }
-    space.active = false; space.ack = false; space.probe = -1
+    space.active = false; clearAck(space); space.probe = -1
     for sent in space.sent { connection.flight = max(0, connection.flight - sent.bytes); sent.status = 3; sent.payload = Bytes() }
     space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; space.ackTimes = []; space.read = protection.traffic(1, 0, Bytes()); space.write = space.read
     connection.congestion.probes = 0; rearmProbes(connection,-1)
@@ -663,7 +705,7 @@ function lostReferenceNeeded(connection: Connection, packet: LostStreams): Boole
 function pendingPayload(connection: Connection, payload: Bytes): Bytes {
     let frames = wire.frames(payload); let result = Bytes()
     for frame in frames.frames {
-        let keep = true
+        let keep = frame.type != 2 && frame.type != 3
         if frame.type >= 8 && frame.type <= 15 {
             let index = streamIndex(connection,frame.stream)
             if streamRetired(connection,frame.stream) { keep = false }
@@ -826,7 +868,7 @@ function retryClient(connection: Connection, packet: Bytes, header: wire.Header)
        !equal(header.destination,connection.local) || equal(header.source,connection.originalDestination) || !protection.retryValid(connection.version,packet,connection.originalDestination) { return }
     let retained: List<Pending> = []
     for pending in connection.pending { if pending.level != 0 { retained.add(pending) } }
-    for sent in connection.spaces[2].sent { if sent.level == 3 { retained.add(Pending { level: 3; payload: sent.payload; probe: false; path: sent.path }); sent.status = 3; sent.payload = Bytes() } }
+    for sent in connection.spaces[2].sent { if sent.level == 3 { retained.add(Pending { level: 3; payload: sent.payload; probe: false; path: sent.path; acknowledgement: false }); sent.status = 3; sent.payload = Bytes() } }
     connection.spaces[2].sent = []; connection.spaces[2].lostStreams = []; connection.spaces[2].lostStreamsAt = 0; connection.spaces[2].lostReferences = 0; connection.spaces[2].probe = -1; connection.pending = retained
     let space = connection.spaces[0]
     for sent in space.sent { sent.status = 3; sent.payload = Bytes() }
@@ -847,7 +889,7 @@ function negotiateClient(connection: Connection, header: wire.Header) {
     // unauthenticated multi-version downgrade decision. Transport can retry TCP.
     connection.state = FAILED; connection.code = 0; connection.error = "QUIC version negotiation has no supported version; explicit TCP retry required"
     connection.pending = []; connection.history = []; connection.lossFirst = -1; connection.lossLast = -1; connection.lossAfter = -1; connection.handshakeProbe = -1; connection.handshakeAcknowledged = false; connection.flight = 0
-    for space in connection.spaces { space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; space.ack = false }
+    for space in connection.spaces { space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; clearAck(space) }
 }
 public function receivePath(connection: Connection, datagram: Bytes, pathId: Integer, now: Integer) {
     if connection.draining || ((connection.state == FAILED || connection.state == CLOSED) && !connection.closing) || now < 0 || now < connection.now || datagram.length > 65535 || pathId < 0 { return }
@@ -899,7 +941,7 @@ public function receivePath(connection: Connection, datagram: Bytes, pathId: Int
             let pathAt = pathIndex(connection,pathId)
             if pathAt >= 0 && pathId == connection.activePath && now >= connection.closeResponseAt && connection.pending.length == 0 {
                 connection.paths[pathAt].received += datagram.length
-                connection.pending.add(Pending { level: connection.closeLevel; payload: connection.closeFrame; probe: false; path: pathId })
+                connection.pending.add(Pending { level: connection.closeLevel; payload: connection.closeFrame; probe: false; path: pathId; acknowledgement: false })
             }
             return
         }
@@ -956,18 +998,27 @@ public function receivePath(connection: Connection, datagram: Bytes, pathId: Int
             }
         }
         if wrongResponse { continue }
-        if !acknowledge(space, packet.number) { continue }
         let ackEliciting = false
         for frame in parsed.frames {
             if !wire.allowed(frame, header.kind, !connection.clientRole) { terminate(connection, 10, "frame at prohibited encryption level"); return }
             if frame.type != 0 && frame.type != 2 && frame.type != 3 && frame.type != 28 && frame.type != 29 { ackEliciting = true }
+        }
+        let immediate = packet.number < space.largest || !receivedInterval(space,space.largestElicitingReceived + 1,packet.number - 1)
+        if !acknowledge(space, packet.number, now) {
+            if packet.number >= space.receiveFloor && ackEliciting { scheduleAck(space,level,now,pathId,true) }
+            continue
+        }
+        for frame in parsed.frames {
             processFrame(connection, level, frame, header.destination)
             if connection.state == FAILED || connection.state == CLOSED { return }
         }
         // A key-phase response can itself contain only ACK frames. Confirm
         // that new receive phase once, so a later reciprocal update does not
         // depend on unrelated application or flow-control traffic.
-        if ackEliciting || (level == 2 && !early && !space.readAcknowledged) { space.ack = true; space.ackPath = pathId }
+        if ackEliciting {
+            scheduleAck(space,level,now,pathId,immediate)
+            space.largestElicitingReceived = max(space.largestElicitingReceived,packet.number)
+        } else if level == 2 && !early && !space.readAcknowledged { scheduleAck(space,level,now,pathId,true) }
         if level == 1 && !connection.clientRole {
             // RFC9000 8.1: successful Handshake processing validates its source.
             // Keep Finished/certificate checks in TLS and route subsequent
@@ -1023,7 +1074,7 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
     }
     if !connection.closing && now - connection.lastActivity >= connection.idleTimeout {
         // RFC9000 idle expiry discards the connection without a close packet.
-        connection.state = CLOSED; connection.pending = []; connection.closing = false; connection.handshakeProbe = -1; return outgoing
+        connection.state = CLOSED; connection.pending = []; connection.closing = false; connection.handshakeProbe = -1; for space in connection.spaces { clearAck(space) }; return outgoing
     }
     let burst = min(connection.congestion.window, 10 * connection.congestion.mtu)
     if connection.confirmed { burst = min(burst, 2 * connection.congestion.mtu) }
@@ -1046,7 +1097,11 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
         space.sent = remaining
         if remaining.length == 0 { space.probe = -1 }
         if level == 2 && !connection.confirmed { space.probe = -1 }
-        if space.ack && space.write.key.length > 0 && (level != 2 || connection.state == ESTABLISHED) { enqueuePath(connection, level, ackFrame(space), false, space.ackPath); space.ack = false }
+        if space.ack && !space.ackQueued && space.ackDeadline >= 0 && now >= space.ackDeadline &&
+           space.write.key.length > 0 && (level != 2 || connection.state == ESTABLISHED) {
+            space.ackQueued = true
+            enqueuePending(connection, Pending { level: level; payload: ackFrame(space,level,now,true); probe: false; path: space.ackPath; acknowledgement: true })
+        }
     }
     refreshHandshakeProbe(connection,false)
     let probeLevel = -1; let probeAt = -1
@@ -1090,20 +1145,44 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
     persistentLoss(connection)
     let unsent: List<Pending> = []; let handshakeBudgetBlocked = false
     for pending in connection.pending {
-        let filtered = pendingPayload(connection,pending.payload)
-        if filtered.length == 0 { continue }
-        pending.payload = filtered
+        if !pending.acknowledgement {
+            let filtered = pendingPayload(connection,pending.payload)
+            if filtered.length == 0 { continue }
+            pending.payload = filtered
+        }
         let level = pending.level; let index = level
         if level == 3 { index = 2; if connection.spaces[2].write.key.length > 0 { level = 2; pending.level = 2 } }
         let space = connection.spaces[index]; let keys = space.write
         if level == 3 { keys = connection.earlyWrite }
-        if !space.active || keys.key.length == 0 { continue }
+        if !space.active { continue }
+        if pending.acknowledgement {
+            if !space.ack { space.ackQueued = false; continue }
+            pending.payload = ackFrame(space,level,now,true); pending.path = space.ackPath
+        }
+        if keys.key.length == 0 {
+            if pending.acknowledgement { unsent.add(pending) }
+            continue
+        }
         if level == 2 && connection.state != ESTABLISHED && !connection.closing { unsent.add(pending); continue }
         let route = pending.path
         if route < 0 { route = connection.activePath }
         let pathAt = pathIndex(connection, route)
-        if pathAt < 0 { continue }
+        if pathAt < 0 && pending.acknowledgement { route = connection.activePath; pathAt = pathIndex(connection,route) }
+        if pathAt < 0 { if pending.acknowledgement { unsent.add(pending) }; continue }
         let path = connection.paths[pathAt]
+        let includedAck = pending.acknowledgement
+        if level == 2 && !includedAck && space.ack && (space.ackPath < 0 || space.ackPath == route) {
+            let eliciting = false
+            for frame in wire.frames(pending.payload).frames {
+                if frame.type != 0 && frame.type != 2 && frame.type != 3 && frame.type != 28 && frame.type != 29 { eliciting = true }
+            }
+            if eliciting {
+                // An actual eliciting transmission can acknowledge a lone
+                // packet before the delay deadline, without another datagram.
+                let mixed = ackFrame(space,level,now,false); mixed.addBytes(pending.payload)
+                pending.payload = mixed; includedAck = true
+            }
+        }
         let payload = pending.payload.slice(0, pending.payload.length)
         let header = packetHeader(connection, level, payload.length, space.next)
         if level == 0 {
@@ -1178,6 +1257,7 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
             }
             space.ackTimes.add(SentTime { number: space.next; time: now })
         }
+        if includedAck { clearAck(space) }
         space.next += 1; if level == 3 { connection.earlyPackets += 1 } else { space.writePackets += 1 }
         for frame in parsed.frames { if level == 2 && (frame.type == 2 || frame.type == 3) && frame.value >= space.readFirst { space.readAcknowledged = true } }
         if connection.clientRole && level == 1 { discard(connection, 0) }
@@ -1215,6 +1295,8 @@ public function nextTimer(connection: Connection): Integer {
     for level in 0..3 {
         let space = connection.spaces[level]
         if space.active && space.sent.length > 0 && space.probe >= 0 && (level < 2 || connection.confirmed) { deadline = min(deadline,space.probe) }
+        if space.active && space.ack && !space.ackQueued && space.ackDeadline >= 0 && space.write.key.length > 0 &&
+           (level != 2 || connection.state == ESTABLISHED) { deadline = min(deadline,space.ackDeadline) }
         if space.active { for sent in space.sent { if sent.number <= space.largestAck { deadline = min(deadline,sent.time + recovery.lossDelay(connection.congestion)) } } }
     }
     for path in connection.paths { if path.deadline >= 0 { deadline = min(deadline, path.deadline) } }
