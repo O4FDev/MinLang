@@ -393,6 +393,7 @@ def main(arguments=None):
     try:
         inputs = [BASELINE, FIXTURE, Path(__file__).resolve(),
                   ROOT/'tests/clang_helpers.py', ROOT/'tests/test_evidence.py',
+                  ROOT/'tests/windows_job_owner.py',
                   ROOT/'tools/host_paths.py']
         for path in inputs:
             name = path.relative_to(ROOT).as_posix()
