@@ -219,6 +219,8 @@ function drop(core: Core, id: Integer) {
     if peer.mode == 0 { for cid in peer.routedIds { if dispatch.lookup(core.routing,cid) == id { dispatch.remove(core.routing,cid) } }; peer.routedIds = []; if dispatch.lookup(core.routing,peer.routed) == id { dispatch.remove(core.routing,peer.routed) } }
     if peer.watch > 0 { callbacks.cancel(core.dispatcher,peer.watch) }
     if peer.socket >= 0 { net.close(peer.socket) }
+    // Discarding a gateway releases its remaining contexts without a trailers exchange.
+    if peer.mode == 2 { core.callsReleased += grpc.retainedCalls(peer.grpc) }
     dispatch.cancel(core.timers,id); peer.live = false; peer.output = Bytes(); peer.inputs = []; peer.paths = []; peer.device = ""; peer.exit = ""; peer.epoch = ""; peer.health = live.heartbeat(Bytes()); peer.decoder = wire.create()
     peer.connection = transport.client("retired.invalid",Bytes(),"retired",[],[],Bytes()); peer.gateway = tls.none(); peer.grpc = grpc.create(); peer.releases = []; peer.finalizations = []
     core.active -= 1
@@ -342,7 +344,7 @@ function serviceRelay(core: Core, relay: Relay) {
     }
 }
 function acceptRelay(core: Core, gateway: Integer, opened: grpc.OpenResult) {
-    let call = grpc.openStreamID(opened); core.callsOpened += 1
+    let call = grpc.openStreamID(opened)
     let requested = grpc.openExitID(opened); let connection = grpc.openConnID(opened)
     let registered = dispatch.lookup(core.registry.exits,identityKey(requested))
     if registered < 0 || !core.registry.valid || core.registry.entries[registered].exit != requested {
@@ -394,7 +396,10 @@ function gatewayService(core: Core, id: Integer) {
         if !errors.booleanOk(received) { drop(core,id); return }
     }
     for requests in 0..128 {
+        let retained = grpc.retainedCalls(peer.grpc)
         let opened = grpc.requests(peer.grpc,wall)
+        // Account every actual context, including rejected headers or malformed opens.
+        core.callsOpened += grpc.retainedCalls(peer.grpc) - retained
         if grpc.openOk(opened) { acceptRelay(core,id,opened) }
         else if errors.isWouldBlock(grpc.openError(opened)) { break }
         else if errors.isError(grpc.connectionError(peer.grpc)) { drop(core,id); return }
