@@ -16,6 +16,91 @@ class BuildWiring(unittest.TestCase):
 
 
 
+
+    def test_event_loop_native_and_sanitizer_keep_distinct_limits(self):
+        import argparse
+        import contextlib
+        import importlib.util
+        import io
+        import json
+        fragment = (ROOT/'build-support/networking.mk').read_text()
+        def verify(candidate, host='Linux', operating_system=''):
+            with tempfile.TemporaryDirectory(prefix='loop limits Make rules ') as folder:
+                directory = Path(folder)
+                uname = directory/'uname';uname.write_text(
+                    '#!/bin/sh\nprintf "%s\\n" "'+host+'"\n');uname.chmod(0o755)
+                makefile = directory/'probe.mk'
+                makefile.write_text('LLVM_CC := retained-clang\nLIMITED := ordinary-limit\n'
+                    'SANITIZER_LIMITED := sanitizer-limit\n'+candidate
+                    +'\n.PHONY: build/minyarc\nbuild/minyarc:\n\t@echo INPUT $@\n')
+                env = dict(os.environ, PATH=str(directory)+os.pathsep+os.environ['PATH'],
+                           OS=operating_system);env.pop('MAKEFLAGS',None)
+                result = subprocess.run(['make','-rRn','-f',str(makefile),'check-net-loop'],
+                    cwd=ROOT,env=env,capture_output=True,text=True,timeout=15)
+                self.assertEqual(result.returncode,0,result.stderr)
+                commands=[line for line in result.stdout.splitlines()
+                          if 'python3 tests/net-loop.py' in line]
+                windows=operating_system=='Windows_NT' or host.startswith(('MSYS','MINGW','CYGWIN'))
+                self.assertEqual(len(commands),1 if windows else 2)
+                native=next(line for line in commands if '--mode native' in line)
+                self.assertIn('ordinary-limit python3 tests/net-loop.py --mode native',native)
+                self.assertNotIn('sanitizer-limit',native)
+                self.assertIn('--evidence "$evidence"',native)
+                self.assertIn(str(ROOT/'build/net-loop.'),native.replace('\\','/'))
+                if not windows:
+                    sanitize=next(line for line in commands if '--mode sanitize' in line)
+                    self.assertIn('sanitizer-limit python3 tests/net-loop.py --mode sanitize',sanitize)
+                    self.assertNotIn('ordinary-limit',sanitize)
+                    self.assertIn('--evidence "$evidence"',sanitize)
+                    self.assertIn(str(ROOT/'build/net-loop-sanitize.'),sanitize.replace('\\','/'))
+        verify(fragment)
+        for host, operating_system in (('Darwin',''),('Linux','Windows_NT'),
+                ('MSYS_NT-10.0',''),('MINGW64_NT-10.0',''),('CYGWIN_NT-10.0','')):
+            verify(fragment,host,operating_system)
+        native=next(line for line in fragment.splitlines() if 'tests/net-loop.py --mode native' in line)
+        sanitize=next(line for line in fragment.splitlines() if 'tests/net-loop.py --mode sanitize' in line)
+        for old,new in ((native,''),(sanitize,''),
+                (native,native.replace('$(LIMITED)','$(SANITIZER_LIMITED)')),
+                (sanitize,sanitize.replace('$(SANITIZER_LIMITED)','$(LIMITED)')),
+                (native,native.replace(' --mode native','')),
+                (sanitize,sanitize.replace(' --mode sanitize',''))):
+            mutant=fragment.replace(old,new,1);self.assertNotEqual(mutant,fragment)
+            with self.assertRaises((AssertionError,StopIteration)):verify(mutant)
+
+        spec=importlib.util.spec_from_file_location('loop_mode_contract',ROOT/'tests/net-loop.py')
+        driver=importlib.util.module_from_spec(spec);spec.loader.exec_module(driver)
+        definition=next(n for n in ast.parse((ROOT/'tests/net-loop.py').read_text()).body
+                        if isinstance(n,ast.FunctionDef) and n.name=='selected_modes')
+        source=ast.get_source_segment((ROOT/'tests/net-loop.py').read_text(),definition)
+        def verify_modes(candidate):
+            for windows,mode,expected in (
+                    (False,None,['native','sanitize','app-native','app-sanitize']),
+                    (False,'native',['native','app-native']),
+                    (False,'sanitize',['sanitize','app-sanitize']),
+                    (True,None,['native']),(True,'native',['native'])):
+                scope={'WINDOWS':windows};exec(candidate,scope)
+                self.assertEqual(scope['selected_modes'](argparse.ArgumentParser(),mode),expected)
+            scope={'WINDOWS':True};exec(candidate,scope)
+            with contextlib.redirect_stderr(io.StringIO()),self.assertRaises(SystemExit) as error:
+                scope['selected_modes'](argparse.ArgumentParser(),'sanitize')
+            self.assertEqual(error.exception.code,2)
+        verify_modes(source)
+        for old,new in (("['native', 'app-native']","['native']"),
+                        ("['sanitize', 'app-sanitize']","['sanitize']"),
+                        ("['native', 'sanitize', 'app-native', 'app-sanitize']",
+                         "['native', 'app-native', 'sanitize', 'app-sanitize']")):
+            mutant=source.replace(old,new,1);self.assertNotEqual(mutant,source)
+            with self.assertRaises(AssertionError):verify_modes(mutant)
+        spec=importlib.util.spec_from_file_location('loop_catalogue',ROOT/'tests/suite-catalogue.py')
+        catalogue=importlib.util.module_from_spec(spec);spec.loader.exec_module(catalogue)
+        data=json.loads((ROOT/'tests/suite-catalogue.json').read_text());catalogue.validate(data,ROOT)
+        helper=next(row for row in data['sources'] if row['path']=='tests/network_evidence.py')
+        self.assertEqual(helper['role'],'support')
+        self.assertEqual(set(helper['consumers']),{'tests/net-native.py','tests/net-loop.py'})
+        with self.assertRaises(ValueError):
+            catalogue.validate(dict(data,sources=[row for row in data['sources']
+                if row['path']!='tests/network_evidence.py']),ROOT)
+
     def test_network_evidence_preserves_primary_and_finalizes_independently(self):
         import contextlib
         import importlib.util
