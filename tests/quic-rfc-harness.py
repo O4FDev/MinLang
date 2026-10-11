@@ -152,6 +152,13 @@ class QuicRfcHarness(unittest.TestCase):
             mutation('wrong compiler', lambda row:row['compiler_pre_link'].update(sha256='0'*64))
             mutation('wrong flags', lambda row:row.update(link_flags=['-O2']))
             mutation('wrong optimization', lambda row:row.update(optimization='2'))
+            for name, flag in (('late optimization override','-O2'),
+                               ('late ASan disable','-fno-sanitize=address'),
+                               ('late all-sanitizer disable','-fno-sanitize=all')):
+                def change(row, flag=flag):
+                    row['command'].append(flag)
+                    row['actual_command'] = row['command'] + ['-o',row['staged_requested_path']]
+                mutation(name,change)
             mutation('extra runtime IR', lambda row:row['command'].append('/extra/runtime.ll'))
             mutation('unrepresented provider', lambda row:row['command'].append('/extra/provider.o'))
             mutation('missing provider', lambda row:row.update(inputs=row['inputs'][:1]))
@@ -267,10 +274,13 @@ class QuicRfcHarness(unittest.TestCase):
                 path=project/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(name.encode())
                 sources[name]=RFC.digest(path)
             binary=base/'migration';binary.write_bytes(b'benign native fixture')
-            certificate=artifacts/'fixtures/root.der';certificate.write_bytes(b'local certificate fixture')
+            certificate_files=['fixtures/'+name for name in
+                               ('root.der','server.der','server.pk8','client.der','client.pk8')]
+            for name in certificate_files:
+                (artifacts/name).write_bytes(name.encode())
             commands=[]
             for index,case in enumerate((None,'a','b')):
-                row=dict(command=['openssl','version'] if case is None else [str(binary),case],
+                row=dict(command=['openssl','version'] if case is None else [str(binary),*[str(artifacts/name) for name in certificate_files],case],
                     cwd=str(project),timeout=30 if case is None else 60,
                     phase='certificate-fixture' if case is None else 'protocol-case',case=case,
                     returncode=0,status=0,timed_out=False,executable_sha256='e'*64 if case is None else RFC.digest(binary))
@@ -284,10 +294,10 @@ class QuicRfcHarness(unittest.TestCase):
             for case,index in (('a',1),('b',2)):
                 raw=sorted(Path(commands[i][stream+'_path']).relative_to(artifacts).as_posix()
                            for i in (0,index) for stream in ('stdout','stderr'))
-                roles=dict(certificates=['fixtures/root.der'],raw_output=raw)
+                roles=dict(certificates=sorted(certificate_files),raw_output=raw)
                 references.append(dict(case=case,command_indices=[0,index],endpoint_indices=[],
                     fixture_workspace=str(artifacts/'fixtures'),file_roles=roles,
-                    files=sorted(['fixtures/root.der',*raw])))
+                    files=sorted([*certificate_files,*raw])))
             parsed=dict(declared_cases=['a','b'],case_inventory=references,
                         results=[dict(case=case,stdout='passed\n',stderr='') for case in ('a','b')])
             result_path=artifacts/'results.json';result_path.write_text(json.dumps(parsed))
@@ -316,6 +326,9 @@ class QuicRfcHarness(unittest.TestCase):
                 add('float status',lambda row:row['commands'][1].update(status=0.0))
                 add('boolean returncode',lambda row:row['commands'][1].update(returncode=False))
                 add('float timeout',lambda row:row['commands'][1].update(timeout=60.0))
+                add('different actual case',lambda row:row['commands'][1]['command'].__setitem__(-1,'b'))
+                add('truncated case argv',lambda row:row['commands'][1].update(command=[str(binary),'a']))
+                add('swapped certificate argv',lambda row:row['commands'][1]['command'].__setitem__(1,str(artifacts/'fixtures/server.der')))
                 add('wrong raw hash',lambda row:row['commands'][1].update(stdout_sha256='0'*64))
                 add('missing raw path',lambda row:row['commands'][1].pop('stdout_path'))
                 add('boolean raw bytes',lambda row:row['commands'][1].update(stdout_bytes=True))
@@ -374,6 +387,62 @@ class QuicRfcHarness(unittest.TestCase):
             self.assertEqual(report['link_subprocess_status'],37)
             self.assertIn('SystemExit',report['link_error'])
             self.assertEqual(report['retention_errors'][0]['phase'],'manifest-retention')
+
+
+    def test_complete_client_server_case_and_fixture_argv_are_required(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory=Path(folder);workspace=directory/'fixtures';workspace.mkdir()
+            binaries={name:directory/name for name in RFC.BINARIES}
+            for name,path in binaries.items():path.write_bytes(name.encode())
+            certificate_files=['fixtures/'+name for name in
+                               ('root.der','server.der','server.pk8','client.der','client.pk8')]
+            for name in certificate_files:(directory/name).write_bytes(name.encode())
+            roles={'certificates':sorted(certificate_files)}
+            migration=[str(binaries['migration'].resolve()),
+                       *[str(directory/name) for name in certificate_files],'a']
+            RFC.verify_case_invocation('migration','a',migration,None,roles,directory,binaries)
+            for label,command in (('b',migration),('a',migration[:-1]),
+                                  ('a',migration[:-1]+['b']),
+                                  ('a',[migration[0],migration[2],*migration[2:]])):
+                with self.subTest(label=label,command=command),self.assertRaises(ValueError):
+                    RFC.verify_case_invocation('migration',label,command,None,roles,directory,binaries)
+            mapping={'multiplex1999':'transfer','multiconnect50':'multiconnect',
+                     'ipv6':'transfer','preferred':'connectionmigration',
+                     'resumption40':'resumption','zerortt40':'zerortt',
+                     'keyupdate':'keyupdate','chacha20':'chacha20'}
+            for case,testcase in mapping.items():
+                count=1999 if case=='multiplex1999' else 50 if case=='multiconnect50' else (
+                    40 if case in ('resumption40','zerortt40') else 1)
+                names=['file'+str(index) for index in range(count)]
+                local_roles=dict(roles,payloads=['fixtures/'+case+'-www/'+name for name in sorted(names)],
+                    downloads=['fixtures/'+case+'-downloads/'+name for name in sorted(names)],
+                    keylogs=sorted(['fixtures/'+case+'-client.keys','fixtures/'+case+'-server.keys']))
+                client=[str(binaries['client'].resolve()),str(workspace/'root.der'),
+                        '::1' if case=='ipv6' else '127.0.0.1','44300',
+                        str(workspace/(case+'-client.keys')),str(workspace/(case+'-downloads')),
+                        testcase,*names]
+                server=[str(binaries['server'].resolve()),str(workspace/'server.pk8'),
+                        str(workspace/'root.der'),str(workspace/(case+'-server.keys')),
+                        str(workspace/(case+'-www')),testcase,str(workspace/'server.der'),'--port=44300']
+                if case=='preferred':server+=['--preferred-ipv4=7f000001','--preferred-port=44301']
+                RFC.verify_case_invocation('local',case,client,server,local_roles,directory,binaries)
+                for location in (0,1,2,3,4,5,6,7):
+                    wrong=list(client);wrong[location]='incorrect'
+                    with self.subTest(case=case,client_argument=location),self.assertRaises(ValueError):
+                        RFC.verify_case_invocation('local',case,wrong,server,local_roles,directory,binaries)
+                for location in range(len(server)):
+                    wrong=list(server);wrong[location]='incorrect'
+                    with self.subTest(case=case,server_argument=location),self.assertRaises(ValueError):
+                        RFC.verify_case_invocation('local',case,client,wrong,local_roles,directory,binaries)
+            vn_roles=dict(roles,packets=['fixtures/request.bin','fixtures/response.bin'],keylogs=[])
+            server=[str(binaries['server'].resolve()),str(workspace/'server.pk8'),
+                    str(workspace/'root.der'),str(workspace/'keys'),str(workspace/'www'),
+                    'transfer',str(workspace/'server.der'),'--port=44300']
+            RFC.verify_case_invocation('vn','reserved-version',None,server,vn_roles,directory,binaries)
+            for location in range(len(server)):
+                wrong=list(server);wrong[location]='incorrect'
+                with self.subTest(vn_argument=location),self.assertRaises(ValueError):
+                    RFC.verify_case_invocation('vn','reserved-version',None,wrong,vn_roles,directory,binaries)
 
 
 if __name__ == '__main__':
