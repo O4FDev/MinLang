@@ -173,8 +173,8 @@ class Evidence:
                 if row['timed_out']:
                     raise subprocess.TimeoutExpired(command, timeout, output=out, stderr=err)
                 result = subprocess.CompletedProcess(command, process.returncode,
-                    out.decode('utf-8', errors='replace') if text and out is not None else out,
-                    err.decode('utf-8', errors='replace') if text and err is not None else err)
+                    out.decode('utf-8', errors='replace').replace('\r\n', '\n').replace('\r', '\n') if text and out is not None else out,
+                    err.decode('utf-8', errors='replace').replace('\r\n', '\n').replace('\r', '\n') if text and err is not None else err)
                 if check:
                     result.check_returncode()
                 return result
