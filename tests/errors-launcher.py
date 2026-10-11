@@ -75,7 +75,11 @@ class ErrorsLauncher(CompilerTestCase):
         for name in ('MINYAR_CLANG', 'MINYAR_RUNTIME_FLAGS', 'MINYAR_CLANG_FLAGS'):
             environment.pop(name, None)
         environment.pop("MFLAGS", None)
-        environment.update(LLVM_CC=CLANG, CC=CLANG, MAKEFLAGS="-j1")
+        # These cases compare frontend diagnostics at O0. The LLVM frontend
+        # emits no debug metadata; linking with -g on Darwin invokes dsymutil
+        # and reports missing symbols independently of compiler dispatch.
+        environment.update(LLVM_CC=CLANG, CC=CLANG, MAKEFLAGS="-j1",
+                           MINYAR_CLANG_FLAGS="-O0 -Wno-override-module")
         shell = shutil.which('sh')
         self.assertTrue(shell)
         arguments = [shell, *(['-x'] if trace else []), str(ROOT / 'minyar'),
