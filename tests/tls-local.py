@@ -18,6 +18,7 @@ from clang_helpers import windows_host
 
 ROOT = Path(__file__).resolve().parents[1]
 BODY = 'Minyar spoke authenticated TLS 1.3: ' + 'é' * 3 + ' ' + 'x' * 40000
+UNSET_SNI = object()
 
 
 def openssl_config_path(path):
@@ -117,11 +118,17 @@ authorityKeyIdentifier=keyid,issuer
 
 
 class Server:
-    def __init__(self, fixtures, certificate, intermediate=None, mutual=False):
-        self.errors, self.peer = [], None
+    def __init__(self, fixtures, certificate, intermediate=None, mutual=False, expected_sni=UNSET_SNI):
+        self.errors, self.peer, self.sni_names = [], None, []
         self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.context.minimum_version = self.context.maximum_version = ssl.TLSVersion.TLSv1_3
         self.context.set_alpn_protocols(['http/1.1'])
+        if expected_sni is not UNSET_SNI:
+            def check_sni(connection, name, context):
+                self.sni_names.append(name)
+                if name != expected_sni:
+                    return ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
+            self.context.sni_callback = check_sni
         chain = fixtures.path(certificate, 'pem')
         if intermediate:
             chain = fixtures.path(certificate, 'chain')
@@ -180,9 +187,52 @@ def compile_program(source, output):
         raise AssertionError(f'compile {source}: {result.stdout} {result.stderr}')
 
 
+def check_literal_sni(fixtures, program):
+    # RFC6066 host_name is a DNS name. IP literals still require matching IP
+    # SANs and a trusted chain; omitting SNI must not disable authentication.
+    san = 'DNS:localhost,IP:127.0.0.1,IP:0:0:0:0:0:0:0:1'
+    fixtures.leaf('literal-addresses', 'root', san=san)
+    fixtures.leaf('literal-mismatch', 'root', san='IP:192.0.2.1,IP:2001:db8::1')
+    fixtures.leaf('literal-untrusted', 'untrusted', san=san)
+    cases = [
+        ('DNS retains SNI', 'literal-addresses', 'localhost', 'localhost', True),
+        ('IPv4 omits SNI', 'literal-addresses', '127.0.0.1', None, True),
+        ('IPv6 omits SNI', 'literal-addresses', '::1', None, True),
+        ('expanded IPv6 omits SNI', 'literal-addresses', '0:0:0:0:0:0:0:1', None, True),
+        ('DNS requires DNS SAN', 'literal-mismatch', 'localhost', 'localhost', False),
+        ('IPv4 requires matching IP SAN', 'literal-mismatch', '127.0.0.1', None, False),
+        ('IPv6 requires matching IP SAN', 'literal-mismatch', '::1', None, False),
+        ('IPv4 requires trusted issuer', 'literal-untrusted', '127.0.0.1', None, False),
+        ('IPv6 requires trusted issuer', 'literal-untrusted', '::1', None, False),
+    ]
+    failures = []
+    for name, certificate, host, expected_sni, accepted in cases:
+        server = Server(fixtures, certificate, expected_sni=expected_sni)
+        try:
+            result = subprocess.run([program, str(server.port), host, fixtures.path('root', 'der')],
+                                    capture_output=True, text=True, timeout=20)
+        finally:
+            server.finish()
+        success = result.returncode == 0 and '200 OK' in result.stdout and BODY in result.stdout
+        saw_expected_sni = bool(server.sni_names) and all(value == expected_sni for value in server.sni_names)
+        rejected_certificate = result.returncode == 1 and (
+            'invalid certificate chain or hostname' in result.stdout or 'did not verify' in result.stdout)
+        if (success != accepted or result.stderr or not saw_expected_sni or
+                (not accepted and not rejected_certificate)):
+            failures.append(f'{name}: accepted={success} expected={accepted} '
+                            f'sni={server.sni_names!r} expected_sni={expected_sni!r} '
+                            f'code={result.returncode} stdout={result.stdout[:300]!r} '
+                            f'stderr={result.stderr[:300]!r} peer={server.errors!r}')
+        print(f'TLS {name}: observed_sni={server.sni_names!r} '
+              f'{"accepted" if success else "rejected"}', flush=True)
+    if failures:
+        raise AssertionError('\n'.join(failures))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--sanitize', action='store_true', help='Compile generated code, runtime, and provider with ASan/UBSan')
+    parser.add_argument('--literal-sni-only', action='store_true', help='Only DNS/IP SNI and certificate authentication controls')
     arguments = parser.parse_args()
     if arguments.sanitize:
         sanitizer = '-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer'
@@ -193,6 +243,12 @@ def main():
         fixtures = Certificates(temporary)
         fixtures.root('root')
         fixtures.root('untrusted')
+        if arguments.literal_sni_only:
+            program = Path(temporary) / 'literal-client.exe'
+            compile_program(ROOT / 'tests/tls-client.min', program)
+            check_literal_sni(fixtures, program)
+            print('TLS literal SNI and certificate authentication checks passed')
+            return
         openssl('req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=localhost',
                 '-addext', 'basicConstraints=critical,CA:FALSE', '-addext', 'keyUsage=critical,digitalSignature',
                 '-addext', 'extendedKeyUsage=serverAuth', '-addext', 'subjectAltName=DNS:localhost',
@@ -290,6 +346,7 @@ def main():
             if accepted and mutual and not server.peer:
                 raise AssertionError(f'{name}: server saw no client certificate')
             print(f'TLS {name}: {"accepted" if accepted else "rejected"}', flush=True)
+        check_literal_sni(fixtures, program)
         server = Server(fixtures, 'unknown-issuer')
         result = subprocess.run([fetch, f'https://localhost:{server.port}/'], capture_output=True, text=True, timeout=20)
         server.finish()
