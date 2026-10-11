@@ -233,6 +233,13 @@ compression bombs. Its binary format is:
 - Directories have executable byte and data length zero and must precede their
   children. Every parent directory is explicit; empty directories are preserved.
 
+The encoder compares file identity, type/mode, size, timestamps and attributes
+before and after copying and rescans the final directory index before publication.
+Windows can expose the transient directory bit `0x10000000` before enumeration
+and omit it afterward; only that bit on real directories is normalized.
+Readonly/reparse attributes and all other snapshot fields remain checked.
+Output temporaries are closed before replacement and failure cleanup on Windows.
+
 The whole artifact, including the index and entry point, is bound by the
 existing signed size/SHA-256. At most 4096 entries and 128 MiB including the index
 are allowed. Paths are portable ASCII relative paths, at most 512 bytes with
