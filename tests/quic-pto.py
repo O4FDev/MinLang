@@ -13,7 +13,7 @@ from test_evidence import Evidence
 
 ROOT = Path(__file__).resolve().parents[1]
 MODES = ("initial", "handshake", "handshake-ack", "application",
-         "confirmed", "close", "drain", "retry", "blocked-probe", "application-ack")
+         "confirmed", "close", "drain", "retry", "blocked-probe", "application-ack", "shared", "shared-late")
 
 
 def digest(path):

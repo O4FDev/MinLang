@@ -216,6 +216,31 @@ function confirmed(root: Bytes, identity: Bytes, key: Bytes, certificate: Bytes,
     if probes == 0 || c.spaces[2].next == next { return 61 }
     return 0
 }
+// Deliver three genuine Initial datagrams before server output, giving
+// sufficient amplification credit without changing address validation.
+function sharedBackoff(root: Bytes, identity: Bytes, key: Bytes, certificate: Bytes, clientKey: Bytes, late: Boolean): Integer {
+    let c = quic.client("localhost", randomBytes(80), "minyar-test", [root], [certificate], clientKey)
+    let s = quic.server(randomBytes(80), "minyar-test", c.originalDestination, [identity], key, [root], true)
+    for packet in quic.poll(c, 0) { quic.receive(s, packet, 0) }
+    for attempt in 0..2 {
+        let due = quic.nextTimer(c)
+        for packet in quic.poll(c, due) { quic.receive(s, packet, due) }
+    }
+    let sentAt = c.now + 1; quic.poll(s, sentAt)
+    if s.addressValidated || s.spaces[0].sent.length == 0 || s.spaces[1].sent.length == 0 ||
+       s.spaces[0].probe != s.spaces[1].probe || s.congestion.probes != 0 { return 65 }
+    let due = quic.nextTimer(s); if late { due += 5000 }
+    let before = s.spaces[0].next + s.spaces[1].next
+    let packets = quic.poll(s, due)
+    if packets.length == 0 || s.spaces[0].next + s.spaces[1].next <= before || s.congestion.probes != 1 { return 65 }
+    let next = quic.nextTimer(s); let numbers = s.spaces[0].next + s.spaces[1].next
+    if next <= due { print("unselected space retained expired shared PTO"); return 66 }
+    quic.poll(s, due)
+    if s.congestion.probes != 1 || quic.nextTimer(s) != next || s.spaces[0].next + s.spaces[1].next != numbers {
+        print("shared PTO backoff advanced twice at one clock"); return 66
+    }
+    return 0
+}
 function closing(root: Bytes, identity: Bytes, key: Bytes, certificate: Bytes, clientKey: Bytes, drain: Boolean): Integer {
     let pair = bootstrap(root, identity, key, certificate, clientKey, true)
     let c = pair.client; let s = pair.server
@@ -301,6 +326,8 @@ function main(): Integer {
     else if mode == "application" { result = application(root, identity, key, certificate, clientKey) }
     else if mode == "application-ack" { result = applicationAck(root, identity, key, certificate, clientKey) }
     else if mode == "confirmed" { result = confirmed(root, identity, key, certificate, clientKey) }
+    else if mode == "shared" { result = sharedBackoff(root, identity, key, certificate, clientKey, false) }
+    else if mode == "shared-late" { result = sharedBackoff(root, identity, key, certificate, clientKey, true) }
     else if mode == "close" { result = closing(root, identity, key, certificate, clientKey, false) }
     else if mode == "drain" { result = closing(root, identity, key, certificate, clientKey, true) }
     else if mode == "retry" { result = retried(root, identity, key, certificate, clientKey) }
