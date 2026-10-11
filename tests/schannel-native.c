@@ -75,6 +75,13 @@ int main(int argc, char **argv) {
         minyar_rc_release(received);
     }
     error(minyar_schannel_takeIncomingRaw(malformed), 10);
+    error(minyar_schannel_takeIncomingRaw(malformed), 10);
+    error(minyar_schannel_takeOutgoingRaw(malformed), 10);
+    error(minyar_schannel_receiveRaw(malformed, &empty), 10);
+    error(minyar_schannel_writeRaw(malformed, &empty), 10);
+    error(minyar_schannel_stateRaw(malformed), 10);
+    error(minyar_schannel_endInputRaw(malformed), 10);
+    error(minyar_schannel_shutdownRaw(malformed), 10);
     assert(scalar(minyar_schannel_closeRaw(malformed)) == 0);
     const unsigned char nul[] = {'a', 0, 'b'};
     MinyarText invalid = {nul, 3, 3, NULL, NULL};
