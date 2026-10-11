@@ -10,6 +10,9 @@ int main(void) { @autoreleasepool {
     minyar_macos_initialize(&name);
     assert(minyar_macos_accessory(true));
     assert(NSApp.activationPolicy == NSApplicationActivationPolicyAccessory);
+    long long live = minyar_macos_statusItem(&name, &symbol);
+    long long liveMenu = minyar_macos_statusMenu(live);
+    long long liveAction = minyar_macos_menuItem(liveMenu, &name, &empty);
     NSUInteger baseline = handles.count;
     for (int i = 0; i < 128; i++) {
         long long tray = minyar_macos_statusItem(&name, &symbol);
@@ -24,7 +27,15 @@ int main(void) { @autoreleasepool {
         minyar_macos_statusRemove(tray);
         assert(!handles[@(tray)] && !handles[@(menu)] && !handles[@(action)]);
         assert(!events.count && handles.count == baseline);
+        [object(liveMenu, NSMenu.class) performActionForItemAtIndex:0];
+        minyar_macos_statusRemove(tray);
+        assert(handles[@(live)] && handles[@(liveMenu)] && handles[@(liveAction)]);
+        assert(events.count == 1 && events.lastObject.source == liveAction);
+        assert(handles.count == baseline);
+        [events removeLastObject];
     }
+    minyar_macos_statusRemove(live);
+    assert(!handles.count && !events.count);
     assert(minyar_macos_accessory(false));
     assert(NSApp.activationPolicy == NSApplicationActivationPolicyRegular);
     puts("status icon, accessory mode, menu actions and lifecycle verified");
