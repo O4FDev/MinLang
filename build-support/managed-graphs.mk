@@ -116,3 +116,11 @@ check: check-cycle-private-retirement check-cycle-private-retirement-sanitize
 check-portable: check-cycle-private-retirement check-cycle-private-retirement-sanitize
 check-managed-graphs-profiles: check-cycle-private-retirement check-cycle-private-retirement-sanitize
 check-sanitize: check-cycle-private-retirement-sanitize
+
+# Mocked idle observability preserves the historical metric.
+# This deterministic API contract does not replay a Windows idle failure.
+.PHONY: check-cycle-progress-observability
+check-cycle-progress-observability: tests/cycle-progress-observability.py tests/cycle-progress.c tests/fixtures/cycle-progress-before-observability.c.txt tests/clang_helpers.py | build
+	@set -e; evidence=$$(mktemp -d "$(abspath build)/cycle-progress-observability.XXXXXXXX"); \
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-progress-observability.py --evidence "$$evidence/run"
+check check-cycle-progress check-cycle-progress-sanitize check-managed-graphs-profiles check-portable check-sanitize: check-cycle-progress-observability

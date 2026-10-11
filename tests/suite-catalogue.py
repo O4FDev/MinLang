@@ -19,7 +19,7 @@ ROLES = {'suite', 'support', 'fixture', 'manual', 'ungated'}
 # also have explicit mandatory dispositions, unlike generated Minyar samples.
 REQUIRED_MINYAR_FIXTURES = {'tests/cycle-late-registration.min', 'tests/generated-llvm-sanitizer.min', 'tests/quic-pto.min', 'tests/quic-ack.min', 'tests/quic-migration-cids.min', 'tests/quic-cipher-policy.min', 'tests/interop/qns/client.min', 'tests/interop/qns/server.min'}
 REQUIRED_MINYAR_PREFIXES = ('tests/parallel-signatures/',)
-REQUIRED_DATA_FIXTURES = {'tests/cycle-private-retirement-v5.json'}
+REQUIRED_DATA_FIXTURES = {'tests/cycle-private-retirement-v5.json', 'tests/fixtures/cycle-progress-before-observability.c.txt'}
 
 
 def discover(root):
@@ -123,6 +123,13 @@ def controls():
         baseline.write_text('{}\n')
         reject(data)
         baseline.unlink()
+        # Historical idle input is a byte-pinned oracle, including its .txt
+        # suffix, and must not disappear behind ordinary data-file discovery.
+        idle_baseline = root / 'tests/fixtures/cycle-progress-before-observability.c.txt'
+        idle_baseline.parent.mkdir(parents=True, exist_ok=True)
+        idle_baseline.write_text('historical input\n')
+        reject(data)
+        idle_baseline.unlink()
         objc = root / 'tests/new-native-fixture.m'
         objc.write_text('int main(void) { return 0; }\n')
         reject(data)

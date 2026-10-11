@@ -45,7 +45,7 @@ TARGETS = ['check-quic-amplification-ledger', 'check-quic-rfc', 'check-quic-rfc-
            'check-peer-edge-cids', 'check-peer-edge-cids-sanitize',
            'check-peer-edge-relay', 'check-peer-edge-relay-sanitize',
            'check-peer-edge-relay-lifetime', 'check-peer-edge-relay-lifetime-sanitize', 'check-json-parser-sanitize',
-           'check-cycle-progress', 'check-cycle-progress-sanitize', 'check-cycle-witness', 'check-cycle-witness-sanitize', 'check-cycle-additive', 'check-cycle-additive-sanitize', 'check-cycle-registry-growth', 'check-cycle-registry-growth-sanitize', 'check-cycle-registration-exposure', 'check-cycle-registration-exposure-sanitize', 'check-feature-dispatch', 'check-managed-graphs', 'check-managed-graphs-launcher',
+           'check-cycle-progress-observability', 'check-cycle-progress', 'check-cycle-progress-sanitize', 'check-cycle-witness', 'check-cycle-witness-sanitize', 'check-cycle-additive', 'check-cycle-additive-sanitize', 'check-cycle-registry-growth', 'check-cycle-registry-growth-sanitize', 'check-cycle-registration-exposure', 'check-cycle-registration-exposure-sanitize', 'check-feature-dispatch', 'check-managed-graphs', 'check-managed-graphs-launcher',
            'check-callbacks', 'check-callback-domains', 'check-isolated-workers',
            'check-ownership-policy', 'check-stack-ownership', 'check-runtime-cache',
            'check-generated-sanitizer', 'check-sanitized-fixed-point',
