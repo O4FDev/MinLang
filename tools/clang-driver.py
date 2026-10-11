@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shlex
 import shutil
 import signal
@@ -275,8 +276,8 @@ def file_binding(path, retained):
 def effective_optimization(options):
     value = None
     for option in options:
-        if option.startswith('-O'):
-            value = option[2:]
+        if re.fullmatch(r'-O(?:[0-9]+|s|z|g|fast)?', option):
+            value = option[2:] or '1'
     return value
 
 
@@ -376,7 +377,7 @@ def link_program(clang, link_flags, lto, llvm, runtime, native, libraries, outpu
                     'optimization': effective_optimization([*link_flags, *lto]),
                     'mode': 'asan' if enabled else 'native',
                     'compiler_selected_command': str(clang),
-                    'inputs': [], 'tools': {}, 'link_attempted': False,
+                    'inputs': [], 'tools': {}, 'tool_bindings': {}, 'link_attempted': False,
                     'artifact_directory': str(directory), 'retention_errors': []}
         try:
             raw = host_path(llvm).read_bytes()
@@ -412,9 +413,11 @@ def link_program(clang, link_flags, lto, llvm, runtime, native, libraries, outpu
                     path = Path(__file__).resolve().parent / name
                     row = file_binding(path, directory / name)
                     manifest['tools'][name] = row['sha256']
+                    manifest['tool_bindings'][name] = row
                 compiler = host_path(shutil.which(clang) or clang).resolve()
                 row = file_binding(compiler, directory / 'clang.bin')
                 manifest['tools']['clang.bin'] = row['sha256']
+                manifest['tool_bindings']['clang.bin'] = row
                 manifest['compiler'] = str(compiler)
                 manifest['compiler_version'] = subprocess.check_output([clang, '--version'], text=True)
             publish_executable(command, output, source,
