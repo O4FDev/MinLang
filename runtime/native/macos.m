@@ -998,6 +998,9 @@ long long minyar_macos_statusMenu(long long handle) { @autoreleasepool {
     return registerObject(menu,handle);
 } }
 void minyar_macos_statusRemove(long long handle) { @autoreleasepool {
+    ready();
+    /* Issued handles never repeat, so retired handles need no tombstone. */
+    if (handle > 0 && handle < nextHandle && !handles[@(handle)]) return;
     NSStatusItem *item = object(handle,NSStatusItem.class);
     [NSStatusBar.systemStatusBar removeStatusItem:item];
     item.menu = nil;
