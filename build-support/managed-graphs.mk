@@ -72,3 +72,12 @@ check-cycle-witness-sanitize:
 check check-portable: check-cycle-witness check-cycle-witness-sanitize
 check-sanitize: check-cycle-witness-sanitize
 check-managed-graphs-profiles: check-cycle-witness check-cycle-witness-sanitize
+
+.PHONY: check-cycle-additive check-cycle-additive-sanitize
+check-cycle-additive:
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-additive.py --evidence build/cycle-additive-native
+check-cycle-additive-sanitize:
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-additive.py --sanitize --evidence build/cycle-additive-sanitize
+check check-portable: check-cycle-additive check-cycle-additive-sanitize
+check-sanitize: check-cycle-additive-sanitize
+check-managed-graphs-profiles: check-cycle-additive check-cycle-additive-sanitize

@@ -42,7 +42,7 @@ TARGETS = ['check-linux-snapshot', 'check-quic-interop-results', 'check-toolchai
            'check-peer-grpc-retire', 'check-peer-grpc-retire-sanitize',
            'check-peer-edge', 'check-peer-edge-sanitize',
            'check-peer-edge-retry', 'check-peer-edge-retry-sanitize', 'check-json-parser-sanitize',
-           'check-cycle-progress', 'check-cycle-progress-sanitize', 'check-cycle-witness', 'check-cycle-witness-sanitize', 'check-feature-dispatch', 'check-managed-graphs', 'check-managed-graphs-launcher',
+           'check-cycle-progress', 'check-cycle-progress-sanitize', 'check-cycle-witness', 'check-cycle-witness-sanitize', 'check-cycle-additive', 'check-cycle-additive-sanitize', 'check-feature-dispatch', 'check-managed-graphs', 'check-managed-graphs-launcher',
            'check-callbacks', 'check-callback-domains', 'check-isolated-workers',
            'check-ownership-policy', 'check-stack-ownership', 'check-runtime-cache',
            'check-generated-sanitizer', 'check-sanitized-fixed-point',
