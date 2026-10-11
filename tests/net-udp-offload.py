@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -14,6 +15,20 @@ import time
 from clang_helpers import windows_host
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+
+def native_diagnostics(stderr, linux):
+    if not linux:
+        assert stderr == b'', stderr
+        return None
+    match = re.fullmatch(
+        rb'UDP readiness deadline: 30ms requested, ([0-9]+\.[0-9]{3})ms observed, ([0-9]+) signals\n',
+        stderr)
+    assert match, stderr
+    elapsed_ms, signals = float(match[1]), int(match[2])
+    assert 20 <= elapsed_ms < 100 and signals > 0, stderr
+    return {'requested_ms': 30, 'observed_ms': elapsed_ms, 'signals': signals}
 
 
 def main():
@@ -90,9 +105,12 @@ def main():
             if linux:
                 assert b'UDP offload explicitly unavailable' not in native.stdout
                 assert b'GRO' in native.stdout, native.stdout
+                assert b'signal-interrupted UDP readiness retains its original deadline\n' in native.stdout
             else:
                 assert native.stdout == b'UDP offload explicitly unavailable on this OS\n'
-            assert native.stderr == b'', native.stderr
+            deadline = native_diagnostics(native.stderr, linux)
+            if deadline:
+                report['cases'][-1]['readiness_deadline'] = deadline
 
             typed = output / ('typed-' + label + ('.exe' if windows else ''))
             typed_environment = dict(environment)
