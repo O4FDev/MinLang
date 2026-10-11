@@ -61,6 +61,11 @@ class CompilerTestCase(unittest.TestCase):
         self.assertFalse(llvm.exists(), 'invalid source left LLVM output behind')
         self.assertNotIn('List position', result.stderr)
 
+    def link_program(self, llvm, optimization, exe):
+        return self.evidence.run(clang_command([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module',
+                                               str(llvm), str(RUNTIME), '-o', str(exe)]),
+                                 capture_output=True, text=True, timeout=30, phase='link')
+
     def executes(self, source, expected, status=0, stderr='', optimizations=('-O0', '-O2'), arguments=(), file_outputs=()):
         file_outputs = tuple(file_outputs)
         self.evidence.controls.setdefault('execution_oracles', []).append({
@@ -73,7 +78,7 @@ class CompilerTestCase(unittest.TestCase):
         for optimization in optimizations:
             with self.subTest(optimization=optimization):
                 exe = llvm.with_suffix('.' + optimization[1:])
-                link = self.evidence.run(clang_command([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module', str(llvm), str(RUNTIME), '-o', str(exe)]), capture_output=True, text=True, timeout=30, phase='link')
+                link = self.link_program(llvm, optimization, exe)
                 self.assertEqual(link.returncode, 0, link.stderr)
                 for path, _ in file_outputs:
                     Path(path).unlink(missing_ok=True)

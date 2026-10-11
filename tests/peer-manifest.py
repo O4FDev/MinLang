@@ -10,7 +10,12 @@ ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / 'tests/peer-cases.json'
 
 
-def validate(data):
+def build_wiring():
+    return (ROOT / 'Makefile').read_text() + '\n' + '\n'.join(
+        path.read_text() for path in sorted((ROOT / 'build-support').glob('*.mk')))
+
+
+def validate(data, makefile=None):
     if data.get('schema_version') != 1 or not data.get('cases'):
         raise ValueError('Missing schema or empty case selection')
     seen = set()
@@ -75,8 +80,8 @@ def validate(data):
             raise ValueError('Executable test omitted from catalogue')
     # Discover whole suites as well as methods: removing every declaration for
     # a newly split suite must not make that source invisible to this gate.
-    makefile = (ROOT / 'Makefile').read_text() + '\n' + '\n'.join(
-        path.read_text() for path in sorted((ROOT / 'build-support').glob('*.mk')))
+    if makefile is None:
+        makefile = build_wiring()
     # The memory-research adaptations have their own portable and sanitizer
     # gate; they do not use this audit's case manifest or peer runner.
     independent = {
@@ -84,20 +89,36 @@ def validate(data):
         'tests/peer-memory-nim-koka-lean.py', 'tests/peer-memory-nim-koka-followups.py',
     }
     manual_research = {'tests/peer-research-swift-statements.py', 'tests/peer-breadth-semantics.py'}
+    dedicated = {
+        'tests/peer-live.py': 'check-peer-live',
+        'tests/peer-live-redis.py': 'check-peer-live-redis',
+    }
+    catalogue = {row['path']: row for row in json.loads(
+        (ROOT / 'tests/suite-catalogue.json').read_text())['sources']}
+    for source, target in dedicated.items():
+        row = catalogue.get(source, {})
+        if row.get('role') != 'suite' or 'build-support/peer-live.mk' not in row.get('consumers', []):
+            raise ValueError('Dedicated peer suite lost its catalogue consumer: ' + source)
+        for gate in (target, target + '-sanitize'):
+            recipe = re.search(r'^' + re.escape(gate) + r':[^\n]*\n((?:[\t ].*\n|\n)*)', makefile, re.M)
+            if not recipe or source not in recipe[1]:
+                raise ValueError('Dedicated peer suite lost its build gate: ' + gate)
+            if gate.endswith('-sanitize') and 'MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined' not in recipe[1]:
+                raise ValueError('Dedicated peer suite lost sanitizer instrumentation: ' + gate)
     semantic_suites = re.search(r'^PEER_SEMANTIC_SUITES\s*=([^\n]+)', makefile, re.M)
     semantic_names = set(semantic_suites[1].split()) if semantic_suites else set()
     discovered = set()
     for path in (ROOT / 'tests').glob('peer-*.py'):
         tree = ast.parse(path.read_text())
         if any(isinstance(node, ast.ClassDef) and any(
-                isinstance(base, ast.Name) and base.id == 'CompilerTestCase'
+                isinstance(base, ast.Name) and base.id in {'CompilerTestCase', 'PackageCompilerTestCase'}
                 for base in node.bases) for node in tree.body):
             source = path.relative_to(ROOT).as_posix()
             if source in independent:
                 recipe = re.search(r'^check-peer-semantics:[^\n]*\n((?:[\t ].*\n|\n)*)', makefile, re.M)
                 if not recipe or '$(PEER_SEMANTIC_SUITES)' not in recipe[1] or path.stem not in semantic_names:
                     raise ValueError('Independent peer suite lost its build gate: ' + source)
-            elif source not in manual_research:
+            elif source not in manual_research and source not in dedicated:
                 discovered.add(source)
     if set(sources) != discovered:
         raise ValueError('Peer regression suite omitted from catalogue or unknown suite declared')
@@ -139,6 +160,24 @@ def main():
             pass
         else:
             raise AssertionError('Manifest gate accepted an invalid catalogue')
+    wiring = build_wiring()
+    wiring_controls = 0
+    for gate in ('check-peer-live', 'check-peer-live-sanitize',
+                 'check-peer-live-redis', 'check-peer-live-redis-sanitize'):
+        mutant = re.sub(r'^' + re.escape(gate) + r':[^\n]*\n((?:[\t ].*\n|\n)*)', '', wiring, flags=re.M)
+        try:
+            validate(data, mutant)
+        except ValueError:
+            wiring_controls += 1
+        else:
+            raise AssertionError('Dedicated peer suite accepted a missing build gate: ' + gate)
+    try:
+        validate(data, wiring.replace('MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined', ''))
+    except ValueError:
+        wiring_controls += 1
+    else:
+        raise AssertionError('Dedicated peer suite accepted missing sanitizer instrumentation')
+    print(f'{wiring_controls} invalid dedicated peer build gates rejected')
     print(f"{len(data['cases'])} peer case declarations across {len({row['source'] for row in data['cases']})} suites and codegen oracles valid; {len(mutations)} invalid catalogues rejected")
 
 

@@ -49,3 +49,13 @@ check-peer-edge-sanitize: build/minyarc build/peergrpc-venv/.ready
 
 check: check-http2-churn check-peer-grpc-churn check-peer-grpc-retire check-peer-edge
 check-sanitize: check-http2-churn-sanitize check-peer-grpc-churn-sanitize check-peer-grpc-retire-sanitize check-peer-edge-sanitize
+
+.PHONY: check-peer-edge-retry check-peer-edge-retry-sanitize
+check-peer-edge-retry: build/minyarc build/peergrpc-venv/.ready
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) $(PEER_GRPC_PYTHON) tests/peer-edge-retry.py
+
+check-peer-edge-retry-sanitize: build/minyarc build/peergrpc-venv/.ready
+	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) $(PEER_GRPC_PYTHON) tests/peer-edge-retry.py --sanitize
+
+check: check-peer-edge-retry
+check-sanitize: check-peer-edge-retry-sanitize

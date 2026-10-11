@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Hearth live-state policy, then the exact emitted commands against Redis."""
 import unittest
-from regressions import CompilerTestCase, ROOT
+from regressions import ROOT
+from package_compiler import PackageCompilerTestCase
 
 
-class PeerLive(CompilerTestCase):
+class PeerLive(PackageCompilerTestCase):
     compiler_arguments = ('--library', str(ROOT / 'library'))
 
     def test_dialable_edge_endpoint_and_region_are_trusted_fields(self):

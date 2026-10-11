@@ -6,9 +6,10 @@ import socket
 import subprocess
 import time
 import unittest
-from regressions import CompilerTestCase, ROOT
+from regressions import ROOT
+from package_compiler import PackageCompilerTestCase
 
-class PeerLiveRedis(CompilerTestCase):
+class PeerLiveRedis(PackageCompilerTestCase):
     compiler_arguments = ('--library', str(ROOT / 'library'))
 
     def test_actual_redis_fences_replaced_owners_and_preserves_exact_ttl(self):
