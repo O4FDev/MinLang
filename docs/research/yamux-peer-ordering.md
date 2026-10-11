@@ -1,0 +1,7 @@
+# DATA and FIN ordering with the pinned Go peer
+
+The independent HashiCorp yamux v0.1.2 peer changes stream state in processFlags before acquiring the receive-buffer lock and copying a DATA frame. A scheduler switch in that small interval allows an application reader to observe EOF before the frame payload. This explains a hosted concurrent-stream payload failure even though repeated unmodified peer runs often pass.
+
+The regression preserves the pinned peer parser, state machine and exact payload oracle. A Go build overlay adds a test-only 25ms scheduler pause between the existing flag processing and receive lock. The old Minyar output produces an actual payload assertion: zero received bytes instead of 32,768. The source hashes of both pinned and scheduled files are printed. Ordinary, unmodified peer runs remain separate gates.
+
+Minyar now emits all DATA before a separate FIN control frame. This preserves ordered bytes and stream half-close semantics for both peers. The additional header is included in output admission accounting; the 1MiB total cap, 128-stream reset-header reserve and flow-control windows are unchanged. Native and ASan/UBSan lifetime/cancellation tests, unmodified 16-stream and 1,536-RPC peers in both roles, and the scheduling regression pass. This is compatibility evidence, not a claim that every independent peer or long-running application workload has passed.
