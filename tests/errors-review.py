@@ -4,8 +4,10 @@
 Adapted from Rust's propagation/lexical-scope contracts and Gleam's
 exhaustive results, with Minyar's exact object/frame/debt oracle.
 """
+import hashlib
 import importlib.util
 import pathlib
+import sys
 import unittest
 
 spec = importlib.util.spec_from_file_location(
@@ -317,7 +319,39 @@ net.close(sender); net.close(receiver)
 
 
     def test_review_tcp_short_reads_and_eof_are_distinct(self):
-        self.native_sources = (str(language.ROOT / 'runtime/native/net.c'),)
+        self._tcp_short_reads_and_eof()
+
+    @unittest.skipUnless(sys.platform.startswith('linux'),
+                         'TCP_DEFER_ACCEPT is a Linux kernel accept-queue probe')
+    def test_review_tcp_deferred_accept_short_reads_and_eof(self):
+        self._tcp_short_reads_and_eof(deferred_accept=True)
+
+    def _tcp_short_reads_and_eof(self, deferred_accept=False):
+        provider = language.ROOT / 'runtime/native/net.c'
+        self.native_sources = (str(provider),)
+        if deferred_accept:
+            # Keep the real socket implementation and kernel queue. A client
+            # connect can finish before this listener can accept: data wakes it.
+            wrapper = self.directory / 'deferred-net.c'
+            wrapper.write_text('#define minyar_net_listen review_actual_listen\n'
+                f'#include "{provider.as_posix()}"\n'
+                '#undef minyar_net_listen\n'
+                '#include <assert.h>\n'
+                '#include <netinet/in.h>\n'
+                '#include <netinet/tcp.h>\n'
+                'long long minyar_net_listen(const MinyarText *host, long long port, long long backlog) {\n'
+                '    long long handle = review_actual_listen(host, port, backlog);\n'
+                '    if (handle >= 0) {\n'
+                '        int seconds = 10;\n'
+                '        assert(setsockopt((int)handle, IPPROTO_TCP, TCP_DEFER_ACCEPT,\n'
+                '                         &seconds, sizeof(seconds)) == 0);\n'
+                '    }\n'
+                '    return handle;\n'
+                '}\n')
+            self.native_sources = (str(wrapper),)
+            self.evidence.inputs[str(wrapper)] = hashlib.sha256(wrapper.read_bytes()).hexdigest()
+            self.evidence.controls['accept_queue'] = {'kernel_option': 'TCP_DEFER_ACCEPT',
+                                                      'seconds': 10}
         self.executes("""use "net" as net
 use "results" as results
 use "errors" as errors
