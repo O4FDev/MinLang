@@ -125,3 +125,13 @@ check-cycle-progress-observability: tests/cycle-progress-observability.py tests/
 	@set -e; evidence=$$(mktemp -d "$(abspath build)/cycle-progress-observability.XXXXXXXX"); \
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-progress-observability.py --evidence "$$evidence/run"
 check check-cycle-progress check-cycle-progress-sanitize check-managed-graphs-profiles check-portable check-sanitize: check-cycle-progress-observability
+
+# Leaf churn uses the existing rooted-graph driver and its complete C schedule.
+.PHONY: check-cycle-leaf-churn check-cycle-leaf-churn-sanitize
+check-cycle-leaf-churn: tests/cycle-leaf-churn.c tests/cycle-additive.c tests/cycle-additive.py tools/cycle_runtime.py
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-additive.py --fixture cycle-leaf-churn.c --evidence "$(CURDIR)/build/cycle-leaf-churn-native"
+check-cycle-leaf-churn-sanitize: tests/cycle-leaf-churn.c tests/cycle-additive.c tests/cycle-additive.py tools/cycle_runtime.py
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-additive.py --fixture cycle-leaf-churn.c --sanitize --evidence "$(CURDIR)/build/cycle-leaf-churn-sanitize"
+check check-portable: check-cycle-leaf-churn check-cycle-leaf-churn-sanitize
+check-managed-graphs-profiles: check-cycle-leaf-churn check-cycle-leaf-churn-sanitize
+check-sanitize: check-cycle-leaf-churn-sanitize
