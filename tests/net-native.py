@@ -102,7 +102,8 @@ def finalize_evidence(directory, inputs, records, errors, modes, status, primary
     files = {}
     paths = attempt(errors, 'artifact listing', lambda: sorted(directory.iterdir())) or []
     for path in paths:
-        if path.is_file() and not path.is_symlink():
+        if attempt(errors, 'artifact classification: '+path.name,
+                   lambda path=path: path.is_file() and not path.is_symlink()):
             files[path.name] = attempt(errors, 'artifact hash: '+path.name, lambda path=path: digest(path))
     report = {'schema_version': 1, 'status': 'failed' if errors or primary else status,
               'modes': modes, 'public_program_sanitized': False,
@@ -114,7 +115,8 @@ def finalize_evidence(directory, inputs, records, errors, modes, status, primary
         json.dumps(report, indent=2)+'\n'))
     if errors:
         # Outer raw stderr remains available even when this directory cannot be written.
-        print('Network evidence finalization errors: '+json.dumps(errors), file=sys.stderr)
+        attempt(errors, 'finalization stderr', lambda: print(
+            'Network evidence finalization errors: '+json.dumps(errors), file=sys.stderr))
         if primary is None:
             raise RuntimeError('network evidence finalization failed')
 
