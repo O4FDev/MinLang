@@ -375,7 +375,8 @@ def verify_driver_artifacts(directory, kind, parsed, cases, binaries, source_inp
         require(isinstance(row, dict) and isinstance(row.get('argv'), list) and row['argv']
                 and all(isinstance(value, str) for value in row['argv'])
                 and exact_integer(row.get('status'))
-                and exact_integer(row.get('peer_timeout_seconds'), minimum=1)
+                and exact_integer(row.get('peer_timeout_seconds'))
+                and row['peer_timeout_seconds'] == (3 if kind == 'vn' else 180)
                 and exact_integer(row.get('readiness_timeout_seconds'))
                 and row['readiness_timeout_seconds'] == 10
                 and exact_integer(row.get('shutdown_grace_seconds'))
