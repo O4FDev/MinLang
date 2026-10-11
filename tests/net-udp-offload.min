@@ -1,0 +1,54 @@
+use "net" as net
+use "errors" as errors
+use "eventloop" as loop
+
+let receiver = net.datagramOffload("127.0.0.1", 0)
+if !net.datagramOffloadOk(receiver) {
+    if errors.code(net.datagramOffloadError(receiver)) != errors.unavailableCode() { fail("offload open") }
+    print("UDP offload unavailable")
+} else {
+    let selector = errors.integerValue(loop.create())
+    let watch = errors.integerValue(net.watchDatagramOffload(receiver, selector, loop.readableInterest(), 91))
+    let port = errors.integerValue(net.datagramOffloadPort(receiver))
+    let sender = net.udp("127.0.0.1", 0)
+    if !net.udpConnect(sender, "127.0.0.1", port) { fail("offload peer") }
+    let payload = Bytes("abcdefghij")
+    if errors.integerValue(net.sendDatagramsOffload(sender, payload, 3)) != 4 { fail("segmented count") }
+    let event = loop.wait(selector, 1000, 1)
+    if errors.isError(loop.batchError(event)) || loop.events(event).length != 1 { fail("offload loop readiness") }
+    let received = 0
+    let offset = 0
+    while received < 4 {
+        let batch = net.receiveDatagramsOffload(receiver, 1, 2)
+        if !net.datagramBatchOk(batch) || net.datagrams(batch).length != 1 { fail("offload boundary") }
+        let packet = net.datagrams(batch)[0]
+        let data = net.datagramData(packet)
+        let full = 3
+        if received == 3 { full = 1 }
+        let prefix = full
+        if prefix > 2 { prefix = 2 }
+        if full > prefix {
+            if errors.bytesStatus(data) != errors.truncatedStatus() { fail("offload truncation") }
+            if Text(errors.bytesValue(data)) != Text(payload.slice(offset, offset + prefix)) { fail("offload prefix") }
+        } else {
+            if !errors.bytesOk(data) || Text(errors.bytesValue(data)) != Text(payload.slice(offset, offset + prefix)) { fail("offload short tail") }
+        }
+        if net.datagramSource(packet) != "127.0.0.1" || net.datagramPort(packet) != net.localPort(sender) { fail("offload source") }
+        received = received + 1; offset = offset + full
+    }
+    let pending = net.receiveDatagramsOffload(receiver, 64, 65507)
+    if net.datagramBatchOk(pending) || !errors.isWouldBlock(net.datagramBatchError(pending)) || net.datagramBatchPrefix(pending).length != 0 { fail("offload would block") }
+    if errors.integerValue(net.sendDatagramOffloadTo(receiver, "127.0.0.1", net.localPort(sender), Bytes("reply!"), 2)) != 3 { fail("offload reply") }
+    if !net.ready(sender, 1000) { fail("offload reply readiness") }
+    let replies = net.receiveDatagrams(sender, 3, 20)
+    if !net.datagramBatchOk(replies) || net.datagrams(replies).length != 3 { fail("ordinary boundaries after offload reply") }
+    if Text(errors.bytesValue(net.datagramData(net.datagrams(replies)[0]))) != "re" { fail("reply content") }
+    if errors.integerOk(net.sendDatagramsOffload(sender, Bytes("x"), 0)) { fail("zero segment accepted") }
+    if errors.integerOk(net.sendDatagramsOffload(sender, Bytes("12345678901234567890123456789012345678901234567890123456789012345"), 1)) { fail("65 segments accepted") }
+    if net.datagramBatchOk(net.receiveDatagramsOffload(receiver, 65, 1)) { fail("65 receive accepted") }
+    loop.remove(selector, watch)
+    if !errors.booleanOk(net.closeDatagramOffload(receiver)) { fail("offload close") }
+    if net.datagramBatchOk(net.receiveDatagramsOffload(receiver, 1, 1)) { fail("closed offload accepted") }
+    net.close(sender); loop.close(selector)
+    print("typed UDP offload boundaries verified")
+}

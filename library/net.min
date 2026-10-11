@@ -195,3 +195,110 @@ public function sendDatagramTo(connection: Integer, source: Text, port: Integer,
 function sendToResult(connection: Integer, source: Text, port: Integer, data: Bytes): Bytes { native "net" }
 // Process-independent monotonic time for transport deadlines; never wall time.
 public function monotonicMilliseconds(): Integer { native "net" }
+
+// Linux UDP_SEGMENT is explicit per message: data is split at segmentSize
+// boundaries, with a possibly shorter final packet. Empty data sends one
+// empty packet. Both the total payload and each packet stay <=65507 bytes;
+// at most 64 packets are sent. Kernel/MTU errors remain recoverable values.
+public function sendDatagramsOffload(connection: Integer, data: Bytes, segmentSize: Integer): errors.IntegerResult {
+    return offloadInteger(sendOffloadResult(connection, data, segmentSize), "UDP segmentation send")
+}
+public function sendDatagramsOffloadTo(connection: Integer, source: Text, port: Integer, data: Bytes, segmentSize: Integer): errors.IntegerResult {
+    return offloadInteger(sendOffloadToResult(connection, source, port, data, segmentSize), "UDP segmentation send to peer")
+}
+
+// A dedicated single-owner UDP_GRO socket. Its opaque ID is never an OS
+// socket handle: ordinary read/receive/close APIs reject it. Numeric bind
+// addresses avoid DNS. macOS/Windows return an unavailable Error.
+public record DatagramOffload {
+    private handle: Integer
+    private error: errors.Error
+}
+public function datagramOffload(host: Text, port: Integer): DatagramOffload {
+    let result = offloadOpenResult(host, port)
+    if result.getUInt32(0) == 0 {
+        return DatagramOffload { handle: result.getInt64(8); error: errors.none() }
+    }
+    return DatagramOffload { handle: -1; error: offloadError(result, "UDP receive offload open") }
+}
+public function datagramOffloadOk(receiver: DatagramOffload): Boolean { return !errors.isError(receiver.error) }
+public function datagramOffloadError(receiver: DatagramOffload): errors.Error { return receiver.error }
+public function datagramOffloadPort(receiver: DatagramOffload): errors.IntegerResult {
+    if !datagramOffloadOk(receiver) { return errors.integerFailure(receiver.error) }
+    return offloadInteger(offloadPortResult(receiver.handle), "UDP receive offload local port")
+}
+public function readyDatagramOffload(receiver: DatagramOffload, milliseconds: Integer): errors.BooleanResult {
+    if !datagramOffloadOk(receiver) { return errors.booleanFailure(receiver.error) }
+    let result = offloadReadyResult(receiver.handle, milliseconds)
+    if result.getUInt32(0) == 0 { return errors.boolean(result.getInt64(8) == 1) }
+    return errors.booleanFailure(offloadError(result, "UDP receive offload readiness"))
+}
+// Use the ordinary eventloop registration/update/remove/wait APIs. Remove
+// the registration before closing this socket. After readiness, drain this
+// receiver until would-block: a short maximum can leave segments buffered
+// in userspace, where the kernel selector cannot signal them again.
+public function watchDatagramOffload(receiver: DatagramOffload, loop: Integer, interest: Integer, token: Integer): errors.IntegerResult {
+    if !datagramOffloadOk(receiver) { return errors.integerFailure(receiver.error) }
+    return offloadInteger(offloadWatchResult(loop, receiver.handle, interest, token), "UDP receive offload watch")
+}
+public function closeDatagramOffload(receiver: DatagramOffload): errors.BooleanResult {
+    if !datagramOffloadOk(receiver) { return errors.booleanFailure(receiver.error) }
+    let result = offloadCloseResult(receiver.handle)
+    if result.getUInt32(0) == 0 { return errors.boolean(true) }
+    return errors.booleanFailure(offloadError(result, "UDP receive offload close"))
+}
+// Reply from the same bound GRO socket without exposing its descriptor or
+// changing its peer filter. The destination must be a numeric IPv4/IPv6 address.
+public function sendDatagramOffloadTo(receiver: DatagramOffload, source: Text, port: Integer, data: Bytes, segmentSize: Integer): errors.IntegerResult {
+    if !datagramOffloadOk(receiver) { return errors.integerFailure(receiver.error) }
+    return offloadInteger(offloadSendToResult(receiver.handle, source, port, data, segmentSize), "UDP receive offload reply")
+}
+// Returns individual source-addressed packets, never an opaque aggregate.
+// maximum counts logical datagrams, and limit truncates each one's prefix.
+// Malformed/truncated control or a later receive failure preserves previously
+// decoded packets; inspect datagramBatchPrefix even when datagramBatchOk is false.
+public function receiveDatagramsOffload(receiver: DatagramOffload, maximum: Integer, limit: Integer): DatagramBatch {
+    let packets: List<Datagram> = []
+    if !datagramOffloadOk(receiver) { return DatagramBatch { packets: packets; error: receiver.error } }
+    let encoded = offloadReceiveResult(receiver.handle, maximum, limit)
+    let position = 12
+    for packet in 0..encoded.getUInt32(8) {
+        let length = encoded.getUInt32(position)
+        let truncated = encoded.getUInt32(position + 4) == 4
+        let port = encoded.getUInt32(position + 8)
+        let sourceLength = encoded.getUInt32(position + 12)
+        position = position + 16
+        let source = Text(encoded.slice(position, position + sourceLength))
+        position = position + sourceLength
+        let data = encoded.slice(position, position + length)
+        position = position + length
+        let result = errors.bytes(data)
+        if truncated { result = errors.truncated(data, 0) }
+        packets.add(Datagram { data: result; source: source; port: port })
+    }
+    let error = errors.none()
+    if encoded.getUInt32(0) != 0 { error = offloadError(encoded, "UDP receive offload") }
+    return DatagramBatch { packets: packets; error: error }
+}
+public function datagramBatchPrefix(batch: DatagramBatch): List<Datagram> { return batch.packets }
+
+function offloadError(result: Bytes, operation: Text): errors.Error {
+    let category = errors.systemCode()
+    if result.getUInt32(0) == 1 { category = errors.wouldBlockCode() }
+    if result.getUInt32(0) == 4 { category = errors.truncatedCode() }
+    if result.getUInt32(0) == 5 { category = errors.unavailableCode() }
+    return errors.make(category, result.getUInt32(4), operation + " failed")
+}
+function offloadInteger(result: Bytes, operation: Text): errors.IntegerResult {
+    if result.getUInt32(0) == 0 { return errors.integer(result.getInt64(8)) }
+    return errors.integerFailure(offloadError(result, operation))
+}
+function sendOffloadResult(connection: Integer, data: Bytes, segmentSize: Integer): Bytes { native "net" }
+function sendOffloadToResult(connection: Integer, source: Text, port: Integer, data: Bytes, segmentSize: Integer): Bytes { native "net" }
+function offloadOpenResult(host: Text, port: Integer): Bytes { native "net" }
+function offloadReceiveResult(receiver: Integer, maximum: Integer, limit: Integer): Bytes { native "net" }
+function offloadPortResult(receiver: Integer): Bytes { native "net" }
+function offloadReadyResult(receiver: Integer, milliseconds: Integer): Bytes { native "net" }
+function offloadWatchResult(loop: Integer, receiver: Integer, interest: Integer, token: Integer): Bytes { native "net" }
+function offloadSendToResult(receiver: Integer, source: Text, port: Integer, data: Bytes, segmentSize: Integer): Bytes { native "net" }
+function offloadCloseResult(receiver: Integer): Bytes { native "net" }

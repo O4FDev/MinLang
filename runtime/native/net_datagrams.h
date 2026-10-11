@@ -231,3 +231,5 @@ MinyarBytes *minyar_net_receiveBatchResult(long long connection, long long maxim
     }
     return result;
 }
+
+#include "net_udp_offload.h"
