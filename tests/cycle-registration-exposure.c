@@ -167,6 +167,13 @@ static void append_beyond_mark_limit(int kind, int copied, int borrowed, int reg
     minyar_rc_release(leaf);
     void *receiver = receiver_new(kind);
     MinyarRecord *payload = payload_new(g.root);
+    if (registered == 2) {
+        if (kind)
+            minyar_record_set_take_traced(receiver, 0, slot(payload));
+        else
+            minyar_list_add_take_traced(receiver, slot(payload));
+        assert(rc_cycle_value(receiver)->registered && !rc_cycle_proven(rc_cycle_value(receiver)));
+    }
     rc_cycle_request_local();
     size_t steps = 0;
     do {
@@ -174,7 +181,7 @@ static void append_beyond_mark_limit(int kind, int copied, int borrowed, int reg
         rc_cycle_unit();
     } while (rc_cycle_active != rc_cycle_value(parent) || rc_cycle_index != 1);
     assert(rc_cycle_phase == RC_CYCLE_MARK && rc_cycle_limit == 2);
-    if (registered) {
+    if (registered == 1) {
         if (kind) {
             MinyarRecord *r = receiver;
             unsigned char *map = (unsigned char *)(r->values + r->length);
@@ -329,6 +336,7 @@ int main(void) {
                 }
                 append_beyond_mark_limit(kind, copied, borrowed, 0);
                 append_beyond_mark_limit(kind, copied, borrowed, 1);
+                append_beyond_mark_limit(kind, copied, borrowed, 2);
                 shared_exposure(kind, copied, borrowed);
             }
         reused_receiver(kind);
