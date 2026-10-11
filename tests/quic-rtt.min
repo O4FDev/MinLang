@@ -10,8 +10,84 @@ function inject(sender: quic.Connection,receiver: quic.Connection,frame: Bytes,n
     let packet=errors.bytesValue(protection.protect(space.write,header,header.length-4,space.next,frame));space.next+=1
     quic.receive(receiver,packet,now)
 }
+function ack(sender: quic.Connection,receiver: quic.Connection,packet: Integer,now: Integer) {
+    let frame=Bytes();frame.add(2);number(frame,packet);number(frame,0);number(frame,0);number(frame,0)
+    inject(sender,receiver,frame,now)
+}
+function drive(c: quic.Connection,s: quic.Connection,now: Integer) {
+    for packet in quic.poll(c,now) { quic.receive(s,packet,now) }
+    for packet in quic.poll(s,now) { quic.receive(c,packet,now) }
+}
+function lateACK(c: quic.Connection,s: quic.Connection,now: Integer): Integer {
+    if c.spaces[2].sent.length!=0 { return 60 }
+    c.congestion.measured=true;c.congestion.smoothed=100;c.congestion.latest=100;c.congestion.minimum=100
+    c.paceCredit=Float(c.congestion.window);c.paceAt=now
+    let id=errors.integerValue(quic.openStream(c,false))
+    let originalNumber=c.spaces[2].next
+    quic.writeStream(c,id,Bytes("delayed"),true)
+    for packet in quic.poll(c,now) { quic.receive(s,packet,now) }
+    if c.spaces[2].sent.length!=1 { return 60 }
+    let original=c.spaces[2].sent[0]
+    for index in 1..4 {
+        quic.ping(c)
+        for packet in quic.poll(c,now+index) { quic.receive(s,packet,now+index) }
+    }
+    let newest=c.spaces[2].next-1
+    ack(s,c,newest,now+4)
+    c.paceCredit=0.0;c.paceAt=now+4
+    quic.poll(c,now+4)
+    if original.status!=2 || original.payload.length!=0 || c.pending.length==0 { return 60 }
+    let before=c.flight
+    ack(s,c,originalNumber,now+5)
+    if c.streams[0].sendAcknowledged!=7 { print("late ACK lost stream delivery metadata");return 61 }
+    if !c.streams[0].finalAcknowledged { return 62 }
+    if c.flight!=before { return 63 }
+    let next=c.spaces[2].next
+    quic.poll(c,now+100)
+    for packet in c.spaces[2].sent {
+        if packet.number>=next {
+            for frame in wire.frames(packet.payload).frames {
+                if frame.type>=8 && frame.type<=15 && frame.stream==id { return 64 }
+            }
+        }
+    }
+    return 0
+}
+function queuedMixed(c: quic.Connection,s: quic.Connection,now: Integer): Integer {
+    let id=errors.integerValue(quic.openStream(c,false));quic.writeStream(c,id,Bytes("queued"),true)
+    let pending=c.pending[0]
+    for packet in quic.poll(c,now) { quic.receive(s,packet,now) }
+    let acknowledgements=quic.poll(s,now+1)
+    pending.payload=pending.payload.slice(0,pending.payload.length)
+    c.receiveMaxData+=65536;pending.payload.add(16);number(pending.payload,c.receiveMaxData)
+    c.pending.add(pending)
+    for packet in acknowledgements { quic.receive(c,packet,now+1) }
+    if c.streams[0].sendAcknowledged!=6 || !c.streams[0].finalAcknowledged { return 65 }
+    let first=c.spaces[2].next
+    quic.poll(c,now+100)
+    let controls=0
+    for packet in c.spaces[2].sent {
+        if packet.number>=first {
+            for frame in wire.frames(packet.payload).frames {
+                if frame.type>=8 && frame.type<=15 && frame.stream==id { print("queued retransmission ignored delivered bytes");return 66 }
+                if frame.type==16 && frame.value==c.receiveMaxData { controls+=1 }
+            }
+        }
+    }
+    if controls!=1 { return 67 }
+    return 0
+}
 function main(): Integer {
     let root=readBytesFile(argument(0));let cert=readBytesFile(argument(1));let key=readBytesFile(argument(2));let client=readBytesFile(argument(3));let clientKey=readBytesFile(argument(4))
+    for scenario in 0..2 {
+        let candidate=quic.client("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey)
+        let peer=quic.server(randomBytes(80),"minyar-test",candidate.originalDestination,[cert],key,[root],true)
+        for count in 0..200 { drive(candidate,peer,count*10) }
+        if !candidate.confirmed || !peer.confirmed { return 68 }
+        let result=0
+        if scenario==0 { result=lateACK(candidate,peer,2000) } else { result=queuedMixed(candidate,peer,2000) }
+        if result!=0 { return result }
+    }
     let c=quic.client("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey)
     let s=quic.server(randomBytes(80),"minyar-test",c.originalDestination,[cert],key,[root],true);let now=0
     while now<10000 && (c.state != quic.ESTABLISHED || s.state != quic.ESTABLISHED) {
