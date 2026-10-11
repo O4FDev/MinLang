@@ -18,7 +18,6 @@ from clang_helpers import windows_host
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--sanitize', action='store_true')
-    parser.add_argument('--legacy-service', action='store_true')
     parser.add_argument('--quick', action='store_true')
     parser.add_argument('--nodes', type=int, nargs='+', choices=[32, 256, 2048],
                         default=[32, 2048])
@@ -32,7 +31,7 @@ def main():
               ROOT / 'tools/cycle_runtime.py', ROOT / 'runtime/minyar_runtime.c',
               *sorted((ROOT / 'runtime').glob('*.h'))]
     report = {'passed': False, 'sanitize': args.sanitize,
-              'legacy_service': args.legacy_service, 'nodes': args.nodes,
+              'nodes': args.nodes,
               'inputs': {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
                          for p in inputs}, 'cases': []}
     flags = (['-O1', '-g', '-fsanitize=address,undefined', '-fno-omit-frame-pointer']
@@ -52,7 +51,6 @@ def main():
                     '-std=c11', '-Wall', '-Wextra', '-Werror', '-iquote', str(ROOT / 'runtime'),
                     *options, '-DMINYAR_BOUNDED_HEAP_BYTES=1048576',
                     f'-DMINYAR_RC_POLL_BUDGET={budget}']
-                if args.legacy_service: command += ['-DMINYAR_CYCLE_LEGACY_SERVICE=1']
                 command += [str(ROOT / 'tests/cycle-witness.c'), '-lm', '-o', str(binary)]
                 for phase, argv in [('compile', command), *[
                     (f'run-n{nodes}', [str(binary), str(nodes)]) for nodes in
