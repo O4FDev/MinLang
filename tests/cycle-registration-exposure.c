@@ -420,6 +420,8 @@ static void internal_completed_parent(void) {
     minyar_record_set_reference_traced(payload, 1, slot(g.root));
     minyar_record_set_traced(payload, 2, 123);
     Late s = {g, parent, receiver, 0, 0};
+    drain();
+    assert(!pending() && rc_cycle_phase == RC_CYCLE_IDLE && rc_cycle_proof_valid);
     rc_cycle_request_local();
     rc_cycle_unit();
     assert(rc_cycle_phase == RC_CYCLE_ROOTS && rc_cycle_local_job);
