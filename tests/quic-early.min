@@ -1,10 +1,100 @@
 use "quic" as quic
 use "tlstickets" as tickets
 use "errors" as errors
+use "quiccrypto" as protection
+use "quicwire" as wire
 
 function drive(c: quic.Connection, s: quic.Connection, now: Integer) {
     for packet in quic.poll(c, now) { quic.receive(s, packet, now) }
     for packet in quic.poll(s, now) { quic.receive(c, packet, now) }
+}
+function finishedOrdering(root: Bytes, identity: Bytes, key: Bytes, client: Bytes, clientKey: Bytes): Integer {
+    for mode in 0..6 {
+        let current = tickets.store(randomBytes(16), 3600); tickets.allowEarlyData(current, 0xffffffff)
+        let initial = quic.client("localhost", randomBytes(80), "minyar-test", [root], [client], clientKey)
+        let issuer = quic.serverWithTickets(randomBytes(80), "minyar-test", initial.originalDestination, [identity], key, [root], true, current)
+        for tick in 0..100 { drive(initial, issuer, tick * 10) }
+        let ticket = quic.takeTicket(initial)
+        if !ticket.valid { return 20 }
+        let early = quic.clientEarly("localhost", randomBytes(80), "minyar-test", [root], [client], clientKey, ticket)
+        let peer = quic.serverWithTickets(randomBytes(80), "minyar-test", early.originalDestination, [identity], key, [root], true, current)
+        for request in 0..4 {
+            let id = errors.integerValue(quic.openEarlyStream(early, false))
+            if !errors.integerOk(quic.writeEarlyStream(early, id, Bytes("x"), true)) { return 20 }
+        }
+        // Send ClientHello while retaining the real early-request queue.
+        let queued = early.pending; early.pending = []
+        for pending in queued { if pending.level == 0 { early.pending.add(pending) } }
+        for packet in quic.poll(early, 0) { quic.receive(peer, packet, 0) }
+        for pending in queued { if pending.level == 3 { early.pending.add(pending) } }
+        for packet in quic.poll(peer, 1) { quic.receive(early, packet, 1) }
+        if early.state != quic.ESTABLISHED || peer.state != quic.STARTING || !early.clientTLS.earlyAccepted || early.earlyPackets != 0 { print("Finished ordering setup"); return 21 }
+        let handshakes = 0; let requests = 0; let first = -1
+        for at in 0..early.pending.length {
+            let pending = early.pending[at]
+            if pending.level == 1 { handshakes += 1 }
+            if pending.level == 3 { requests += 1; if first < 0 { first = at } }
+        }
+        if handshakes == 0 || requests != 4 || first < 0 { return 21 }
+        early.paceAt = 2; early.paceCredit = Float(early.congestion.window)
+        if mode == 1 {
+            // Enough credit for one small request, but not client Finished.
+            early.paceCredit = Float(early.remote.length + 21 + early.pending[first].payload.length)
+        }
+        if mode == 5 { early.congestion.window = early.remote.length + 21 + early.pending[first].payload.length + early.flight }
+        if mode == 2 { early.spaces[1].write = protection.traffic(1, 0, Bytes()) }
+        if mode == 3 { early.spaces[1].active = false }
+        if mode == 4 { for pending in early.pending { if pending.level == 1 { pending.path = 999 } } }
+        let firstPacket = early.spaces[2].next
+        let packets = quic.poll(early, 2); let application = 0; let handshakeSeen = false
+        for packet in packets {
+            if (packet[0] & 128) == 0 {
+                if mode == 0 && !handshakeSeen { print("application preceded client Finished"); return 22 }
+                if mode == 1 || mode == 5 { print("application consumed blocked Finished credit"); return 23 }
+            } else if ((packet[0] >> 4) & 3) == 2 { handshakeSeen = true }
+            if mode == 0 { quic.receive(peer, packet, 2) }
+        }
+        for sent in early.spaces[2].sent {
+            if sent.number >= firstPacket {
+                for frame in wire.frames(sent.payload).frames {
+                    if frame.type >= 8 && frame.type <= 15 && frame.stream < 16 { application += 1 }
+                }
+            }
+        }
+        if mode == 0 {
+            if !handshakeSeen || application != 4 || peer.state != quic.ESTABLISHED { return 24 }
+            for id in 0..4 {
+                if Text(errors.bytesValue(quic.readStream(peer, id * 4))) != "x" { return 24 }
+            }
+        }
+        if mode == 1 || mode == 5 {
+            let retainedHandshake = false; let retainedRequests = 0
+            for pending in early.pending {
+                if pending.level == 1 { retainedHandshake = true }
+                if pending.level == 2 || pending.level == 3 {
+                    for frame in wire.frames(pending.payload).frames {
+                        if frame.type >= 8 && frame.type <= 15 && frame.stream < 16 { retainedRequests += 1 }
+                    }
+                }
+            }
+            if !retainedHandshake || retainedRequests != 4 { return 25 }
+            early.congestion.window = 12000
+            early.paceCredit = Float(early.congestion.window); early.paceAt = 3
+            let resumed = quic.poll(early, 3); handshakeSeen = false
+            for packet in resumed {
+                if (packet[0] & 128) == 0 && !handshakeSeen { return 22 }
+                if (packet[0] & 128) != 0 && ((packet[0] >> 4) & 3) == 2 { handshakeSeen = true }
+                quic.receive(peer, packet, 3)
+            }
+            if peer.state != quic.ESTABLISHED { return 25 }
+            for id in 0..4 {
+                if Text(errors.bytesValue(quic.readStream(peer, id * 4))) != "x" { return 25 }
+            }
+        }
+        // Inactive keys/spaces and invalid paths cannot starve another queue.
+        if mode >= 2 && mode < 5 && application != 4 { print("unusable handshake blocked application"); return 26 }
+    }
+    return 0
 }
 function main(): Integer {
     let root = readBytesFile(argument(0)); let identity = readBytesFile(argument(1)); let key = readBytesFile(argument(2))
@@ -44,6 +134,8 @@ function main(): Integer {
         }
     }
     if store.seen.length != 1 { return 12 }
+    let ordering = finishedOrdering(root, identity, key, client, clientKey)
+    if ordering != 0 { return ordering }
     print("QUIC 0-RTT: explicit replay-safe API, PSK mTLS identity, early delivery, single-use/restart replay rejection and explicit retry passed")
     return 0
 }
