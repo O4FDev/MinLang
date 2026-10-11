@@ -71,11 +71,12 @@ func run() error {
 	conf := yamux.DefaultConfig()
 	conf.EnableKeepAlive = false
 	conf.LogOutput = io.Discard
+	var connection io.ReadWriteCloser = raw
 	var session *yamux.Session
 	if server {
-		session, e = yamux.Server(raw, conf)
+		session, e = yamux.Server(connection, conf)
 	} else {
-		session, e = yamux.Client(raw, conf)
+		session, e = yamux.Client(connection, conf)
 	}
 	if e != nil {
 		return e
@@ -173,7 +174,7 @@ func run() error {
 					return
 				}
 				if !bytes.Equal(reply, data) {
-					failures <- fmt.Errorf("wrong stream %d", i)
+					failures <- fmt.Errorf("wrong stream %d: received %d bytes, expected %d (first byte %x)", i, len(reply), len(data), reply[:min(len(reply), 8)])
 				}
 			}
 		}(i, stream)
