@@ -455,6 +455,18 @@ static MINYAR_NOINLINE void rc_cycle_add_incoming(RcObject *parent, RcCycle *cyc
     /* Bit 2 is sticky exposure while unregistered, not a certificate tag.
      * Read it before registration assigns the snapshot namespace. */
     unsigned exposed = !was_registered && (source->gray_next & 4);
+    /* First insertion into two independently held, unexposed leaves cannot
+     * change a captured full cohort. Classify before registration resets tags;
+     * ordinary registration/shading/publication never certifies these nodes. */
+    unsigned detached =
+        additive && !was_registered && source != cycle &&
+        !source->incoming && !source->gray_next && !source->pinned && !source->cleared &&
+        !cycle->registered && !cycle->incoming && !cycle->gray_next &&
+        !cycle->pinned && !cycle->cleared &&
+        (parent->ownership >> 3) && (rc_cycle_object(cycle)->ownership >> 3) &&
+        !rc_cycle_inside && !rc_cycle_local_job && !rc_cycle_rescan &&
+        rc_cycle_proof_build && !rc_cycle_proof_valid &&
+        rc_cycle_phase >= RC_CYCLE_ROOTS && rc_cycle_phase <= RC_CYCLE_SWEEP;
     if (!was_registered)
         rc_cycle_register(source);
     if (!cycle->registered && was_registered && source->marked != 3)
@@ -481,7 +493,7 @@ static MINYAR_NOINLINE void rc_cycle_add_incoming(RcObject *parent, RcCycle *cyc
         rc_cycle_proof_valid && !rc_cycle_proof_build && rc_cycle_anchor_held() &&
         !rc_cycle_proof_anchor->pinned &&
         (!cycle->registered || rc_cycle_proven(cycle) || source != cycle);
-    if (!preserve)
+    if (!preserve && !detached)
         rc_cycle_proof_invalidate();
     rc_cycle_shade(cycle);
     cycle->incoming++;
