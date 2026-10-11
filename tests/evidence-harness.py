@@ -339,7 +339,6 @@ with Evidence("stdin-parent") as evidence:
         with self.assertRaisesRegex(ValueError, 'Replay artifact changed'):
             replay(manifest, -1)
 
-    @unittest.skipIf(os.name == 'nt', 'POSIX process-group descendant check')
     def test_timeout_terminates_descendant_and_next_case_runs(self):
         heartbeat = self.base / 'heartbeat'
         child = "import pathlib,time; p=pathlib.Path(%r);\nwhile True: p.write_text(str(time.time())); time.sleep(.03)" % str(heartbeat)
