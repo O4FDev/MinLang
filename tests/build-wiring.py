@@ -90,6 +90,19 @@ class BuildWiring(unittest.TestCase):
             self.assertEqual(manifest['status'], 'failed')
             self.assertTrue(any(row['operation'] == 'input binding' for row in errors))
 
+
+        for modes, expected_scope in (
+                (['native'], 'ordinary-launcher-path'),
+                (['native', 'sanitize'], 'ordinary-launcher-path'),
+                (['sanitize'], None)):
+            with tempfile.TemporaryDirectory(prefix='network public scope ') as folder:
+                directory = Path(folder)
+                driver.finalize_evidence(directory, {}, [], [], modes, 'passed')
+                manifest = json.loads((directory/'manifest.json').read_text())
+                self.assertFalse(manifest['public_program_sanitizer_enabled_by_suite'])
+                self.assertEqual(manifest['public_program_scope'], expected_scope)
+                self.assertNotIn('public_program_sanitized', manifest)
+
     def test_network_native_and_sanitizer_keep_distinct_limits(self):
         import re
 

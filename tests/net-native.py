@@ -106,7 +106,8 @@ def finalize_evidence(directory, inputs, records, errors, modes, status, primary
                    lambda path=path: path.is_file() and not path.is_symlink()):
             files[path.name] = attempt(errors, 'artifact hash: '+path.name, lambda path=path: digest(path))
     report = {'schema_version': 1, 'status': 'failed' if errors or primary else status,
-              'modes': modes, 'public_program_sanitized': False,
+              'modes': modes, 'public_program_sanitizer_enabled_by_suite': False,
+              'public_program_scope': None if modes == ['sanitize'] else 'ordinary-launcher-path',
               'windows_sanitizer_capability': False, 'inputs': inputs,
               'inputs_after': after, 'commands': records, 'files': files,
               'primary_error': None if primary is None else type(primary).__name__+': '+str(primary),
@@ -176,7 +177,8 @@ def main():
                     run(command, phase=f'{fixture}-{mode}-compile', check=True, cwd=ROOT)
                     run([executable], phase=f'{fixture}-{mode}-run', check=True,
                         env=environment, timeout=30)
-            # This public program was ordinary code in the original combined suite.
+            # Keep the original public launcher path and any caller-supplied flags;
+            # this suite only selects sanitizer flags for the native C fixtures.
             if options.mode != 'sanitize':
                 program = directory / ('net-contract.exe' if WINDOWS else 'net-contract')
                 run([ROOT / 'minyar', ROOT / 'tests/net-contract.min', '-o', program],
