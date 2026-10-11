@@ -7,6 +7,7 @@ with a public test fixture seed, so malformed signed metadata is tested too.
 import hashlib
 import os
 import platform
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -28,8 +29,14 @@ class UpdatePolicy(unittest.TestCase):
             '-o', str(cls.signer)], check=True)
         cls.driver = cls.directory / ('driver.exe' if windows_host() else 'driver')
         env = dict(os.environ, LIMITED='', SANITIZER_LIMITED='')
-        subprocess.run([str(ROOT/'minyar'), '--library', str(ROOT/'library'), str(ROOT/'tests/update-driver.min'),
-            '-o', str(cls.driver)], env=env, check=True, capture_output=True, text=True)
+        command=[str(ROOT/'minyar'), '--library', str(ROOT/'library'), str(ROOT/'tests/update-driver.min'),
+            '-o', str(cls.driver)]
+        if os.name=='nt':
+            shell=shutil.which('bash')
+            if not shell:
+                raise AssertionError('Update policy Minyar tests require the MSYS2 toolchain')
+            command.insert(0,shell)
+        subprocess.run(command, env=env, check=True, capture_output=True, text=True)
 
     @classmethod
     def tearDownClass(cls):
