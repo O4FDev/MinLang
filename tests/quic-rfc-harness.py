@@ -474,5 +474,94 @@ class QuicRfcHarness(unittest.TestCase):
                 RFC.verify_server_shutdown_state(row)
 
 
+    def test_lifecycle_receipts_bind_owned_termination_and_exact_final_status(self):
+        pid=123
+        def posix_receipt(signal=15):
+            return dict(pid=pid,pgid=pid,attempted=True,signal=signal,
+                        grace_seconds=5,wait_timed_out=False,result='sent')
+        def endpoint(strategy='posix-sigterm'):
+            return dict(pid=pid,status_before_shutdown=None,owned_termination_requested=True,status=-15,
+                lifecycle=dict(healthy_before_shutdown=True,cleanup_complete=True,passed=True,
+                    termination_strategy=strategy,expected_final_status=-15,escalated=False,
+                    cleanup_errors=[],receipt=posix_receipt()))
+        with patch.object(RFC,'windows_host',return_value=False):
+            row=endpoint()
+            self.assertEqual(RFC.verify_server_lifecycle(row,lambda row,stream:stream),[])
+            already=endpoint()
+            already.update(status_before_shutdown=0,owned_termination_requested=False,status=0)
+            already['lifecycle'].update(termination_strategy='already-exited',
+                                        expected_final_status=0,receipt={})
+            self.assertEqual(RFC.verify_server_lifecycle(already,lambda row,stream:stream),[])
+            escalated=endpoint('posix-sigkill-after-grace')
+            escalated['status']=-9
+            previous=posix_receipt();previous['wait_timed_out']=True
+            receipt=posix_receipt(9);receipt['previous']=previous
+            escalated['lifecycle'].update(expected_final_status=-9,escalated=True,receipt=receipt)
+            self.assertEqual(RFC.verify_server_lifecycle(escalated,lambda row,stream:stream),[])
+            mutations=[
+                ('prior crash',lambda r:r.update(status_before_shutdown=-11,owned_termination_requested=False)),
+                ('final status',lambda r:r.update(status=0)),
+                ('expected status',lambda r:r['lifecycle'].update(expected_final_status=0)),
+                ('expected bool',lambda r:r['lifecycle'].update(expected_final_status=True)),
+                ('passed flag',lambda r:r['lifecycle'].update(passed=False)),
+                ('health flag',lambda r:r['lifecycle'].update(healthy_before_shutdown=False)),
+                ('cleanup flag',lambda r:r['lifecycle'].update(cleanup_complete=False)),
+                ('cleanup error',lambda r:r['lifecycle'].update(cleanup_errors=[{'exception':'Failure'}])),
+                ('unknown action',lambda r:r['lifecycle'].update(termination_strategy='any-zero-or-signal')),
+                ('unproved escalation',lambda r:r['lifecycle'].update(escalated=True)),
+                ('wrong process',lambda r:r['lifecycle']['receipt'].update(pid=124)),
+                ('wrong group',lambda r:r['lifecycle']['receipt'].update(pgid=124)),
+                ('wrong signal',lambda r:r['lifecycle']['receipt'].update(signal=9)),
+                ('signal bool',lambda r:r['lifecycle']['receipt'].update(signal=True)),
+                ('missing action',lambda r:r['lifecycle']['receipt'].update(attempted=False)),
+                ('wrong grace',lambda r:r['lifecycle']['receipt'].update(grace_seconds=6)),
+                ('grace float',lambda r:r['lifecycle']['receipt'].update(grace_seconds=5.0)),
+                ('unsent action',lambda r:r['lifecycle']['receipt'].update(result='pending')),
+                ('unexplained timeout',lambda r:r['lifecycle']['receipt'].update(wait_timed_out=True)),
+                ('unexpected previous',lambda r:r['lifecycle']['receipt'].update(previous=posix_receipt())),
+            ]
+            for name,mutate in mutations:
+                wrong=endpoint();mutate(wrong)
+                with self.subTest(mutation=name),self.assertRaises(ValueError):
+                    RFC.verify_server_lifecycle(wrong,lambda row,stream:stream)
+            for name in ('healthy_before_shutdown','cleanup_complete','passed','termination_strategy',
+                         'expected_final_status','escalated','cleanup_errors','receipt'):
+                wrong=endpoint();wrong['lifecycle'].pop(name)
+                with self.subTest(missing=name),self.assertRaises(ValueError):
+                    RFC.verify_server_lifecycle(wrong,lambda row,stream:stream)
+            for name,mutate in (
+                    ('missing grace timeout',lambda r:r['lifecycle']['receipt']['previous'].update(wait_timed_out=False)),
+                    ('wrong first signal',lambda r:r['lifecycle']['receipt']['previous'].update(signal=9)),
+                    ('different first pid',lambda r:r['lifecycle']['receipt']['previous'].update(pid=124))):
+                wrong=copy.deepcopy(escalated);mutate(wrong)
+                with self.subTest(escalation=name),self.assertRaises(ValueError):
+                    RFC.verify_server_lifecycle(wrong,lambda row,stream:stream)
+        with patch.object(RFC,'windows_host',return_value=True):
+            row=endpoint('windows-taskkill-tree');row['status']=1
+            receipt=dict(pid=pid,native_pid=456,pid_source='proc-winpid',python_os_name='posix',
+                         argv=['taskkill.exe','-F','-T','-PID','456'],timeout_seconds=10,
+                         attempted=True,status=0)
+            row['lifecycle'].update(expected_final_status=1,receipt=receipt)
+            self.assertEqual(RFC.verify_server_lifecycle(row,lambda row,stream:'termination.'+stream),
+                             ['termination.stdout','termination.stderr'])
+            for name,mutate in (
+                    ('wrong process',lambda r:r['lifecycle']['receipt'].update(pid=124)),
+                    ('zero native pid',lambda r:r['lifecycle']['receipt'].update(native_pid=0)),
+                    ('native pid bool',lambda r:r['lifecycle']['receipt'].update(native_pid=True)),
+                    ('wrong action',lambda r:r['lifecycle']['receipt'].update(argv=['taskkill.exe','-F','-PID','456'])),
+                    ('wrong status',lambda r:r['lifecycle']['receipt'].update(status=1)),
+                    ('status bool',lambda r:r['lifecycle']['receipt'].update(status=False)),
+                    ('wrong pid source',lambda r:r['lifecycle']['receipt'].update(pid_source='popen')),
+                    ('wrong timeout',lambda r:r['lifecycle']['receipt'].update(timeout_seconds=11)),
+                    ('missing action',lambda r:r['lifecycle']['receipt'].update(attempted=False)),
+                    ('generic exit',lambda r:r.update(status=-11)),
+                    ('inferred escalation',lambda r:r['lifecycle'].update(escalated=True))):
+                wrong=copy.deepcopy(row);mutate(wrong)
+                with self.subTest(native_action=name),self.assertRaises(ValueError):
+                    RFC.verify_server_lifecycle(wrong,lambda row,stream:stream)
+            with self.assertRaises(ValueError):
+                RFC.verify_server_lifecycle(row,lambda row,stream:(_ for _ in ()).throw(ValueError('raw missing')))
+
+
 if __name__ == '__main__':
     unittest.main()

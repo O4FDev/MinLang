@@ -14,6 +14,60 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class BuildWiring(unittest.TestCase):
 
+    def test_quic_rfc_requires_owned_lifecycle_controls(self):
+        import json
+        import re
+        source=(ROOT/'build-support/quic-rfc.mk').read_text()
+        helper='check-quic-protocol-artifacts'
+        inputs={'tests/quic-protocol-artifacts.py','tests/quic_protocol_artifacts.py',
+                'tests/quic-qns-local.py','tests/quic-vn-probe.py','tests/test_evidence.py',
+                'tests/clang_helpers.py','tests/tls-local.py','tests/interop/qns/endpoint.py'}
+        def verify(fragment):
+            with tempfile.TemporaryDirectory(prefix='QUIC owned lifecycle rules ') as folder:
+                makefile=Path(folder)/'probe.mk'
+                makefile.write_text(fragment+'\n.PHONY: '+' '.join(sorted(inputs|{'build'}))+
+                    '\n'+' '.join(sorted(inputs|{'build'}))+':\n\t@echo INPUT $@\n')
+                env=dict(os.environ);env.pop('MAKEFLAGS',None)
+                result=subprocess.run(['make','-rRnp','-f',str(makefile),helper],
+                    cwd=ROOT,env=env,text=True,capture_output=True,timeout=15)
+                self.assertEqual(result.returncode,0,result.stderr)
+                rules={}
+                for line in result.stdout.splitlines():
+                    match=re.match(r'^([\w./-]+):\s*(.*)$',line)
+                    if match:rules.setdefault(match[1],set()).update(match[2].split())
+                for gate in ('check-quic-rfc','check-quic-rfc-sanitize'):
+                    self.assertIn(helper,rules.get(gate,set()))
+                self.assertTrue(inputs<=rules.get(helper,set()))
+                commands=result.stdout.split('# GNU Make',1)[0]
+                self.assertEqual(commands.count('python3 tests/quic-protocol-artifacts.py'),1)
+                self.assertIn('--artifacts "$artifacts/run"',commands)
+                self.assertIn((ROOT/'build/quic-protocol-artifacts.').as_posix(),commands.replace('\\','/'))
+                self.assertNotIn('--expect-old-code',commands)
+                self.assertNotIn('--case ',commands)
+        verify(source)
+        for gate in ('check-quic-rfc','check-quic-rfc-sanitize'):
+            line=next(line for line in source.splitlines() if line.startswith(gate+':'))
+            mutant=source.replace(line,line.replace(' '+helper,'',1),1)
+            with self.subTest(missing_helper=gate),self.assertRaises(AssertionError):verify(mutant)
+        for dependency in sorted(inputs):
+            line=next(line for line in source.splitlines() if line.startswith(helper+':'))
+            mutant=source.replace(line,line.replace(' '+dependency,'',1),1)
+            with self.subTest(missing_input=dependency),self.assertRaises(AssertionError):verify(mutant)
+        for name,old,new in (
+                ('old code oracle','tests/quic-protocol-artifacts.py --artifacts',
+                    'tests/quic-protocol-artifacts.py --expect-old-code --artifacts'),
+                ('filtered control','tests/quic-protocol-artifacts.py --artifacts',
+                    'tests/quic-protocol-artifacts.py --case healthy-shutdown --artifacts'),
+                ('relative evidence','$(abspath build)/quic-protocol-artifacts.',
+                    'build/quic-protocol-artifacts.')):
+            mutant=source.replace(old,new,1)
+            self.assertNotEqual(source,mutant)
+            with self.subTest(invalid_helper=name),self.assertRaises(AssertionError):verify(mutant)
+        catalogue=json.loads((ROOT/'tests/suite-catalogue.json').read_text())
+        row=next(row for row in catalogue['sources'] if row['path']=='tests/quic-protocol-artifacts.py')
+        self.assertEqual(row['role'],'suite')
+        self.assertIn('build-support/quic-rfc.mk',row['consumers'])
+
     def test_quic_rfc_gates_keep_all_drivers_and_public_frontends(self):
         import importlib.util
         import json
@@ -61,8 +115,8 @@ class BuildWiring(unittest.TestCase):
                 self.assertEqual(commands.count('python3 tests/quic-rfc.py'), 2)
                 self.assertEqual(commands.count('--optimization both'), 2)
                 self.assertEqual(commands.count('--sanitize'), 1)
-                self.assertEqual(commands.count('mktemp -d "'), 2)
-                self.assertEqual(commands.count('--artifacts "$artifacts/run"'), 2)
+                self.assertEqual(commands.count('mktemp -d "'), 3)
+                self.assertEqual(commands.count('--artifacts "$artifacts/run"'), 3)
                 self.assertNotIn('--case ', commands)
                 self.assertNotIn('--expect-old-code', commands)
                 for suffix in ('native', 'sanitize'):
