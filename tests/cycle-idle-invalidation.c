@@ -264,11 +264,218 @@ static void active_retirement(unsigned n, unsigned phase, unsigned local) {
     empty();
 }
 
+#ifdef MINYAR_BOUNDED_RC
+static void cycle_only_drain(void) {
+    size_t steps = 0;
+    while (rc_cycle_pending) {
+        assert(++steps < 4000000);
+        size_t before = rc_cycle_units;
+        rc_cycle_unit();
+        assert(rc_cycle_units - before == 1);
+    }
+}
+static void queued_retirement(unsigned n, const char *mode, unsigned recent) {
+    Graph g = held(n);
+    MinyarRecord *outside = branch(51000);
+    MinyarRecord *receiver = minyar_record_new_traced(1);
+    MinyarRecord *owner = minyar_record_new_traced(4);
+    minyar_record_set_take_traced(owner, 0, slot(branch(52000)));
+    minyar_record_set_reference_traced(owner, 1, slot(g.interior));
+    minyar_record_set_reference_traced(owner, 2, slot(outside));
+    minyar_record_set_take_traced(owner, 3, slot(branch(53000)));
+    assert(rc_cycle_phase == RC_CYCLE_IDLE && rc_cycle_proof_valid);
+    assert(!rc_cycle_pending && rc_cycle_value(owner)->marked == 3);
+    size_t units = rc_cycle_units, epochs = rc_cycle_epochs;
+    clear_ledger();
+    RcObject *object = (RcObject *)owner - 1;
+    /* Real irreversible drop, without the public call's following poll. */
+    rc_drop(owner);
+    assert(!rc_cycle_value(owner)->registered && rc_bounded_recent_head == object);
+    assert(rc_bounded_saved_cursor(object) == 0);
+    if (recent) {
+        rc_bounded_recent_object_unit();
+        assert(rc_bounded_saved_cursor(object) == 1);
+        assert(rc_bounded_recent_head != object); /* Newly dead first child preempts. */
+    } else {
+        rc_bounded_object_unit();
+        assert(rc_bounded_active == object && rc_bounded_cursor == 1);
+        assert(rc_bounded_recent_head); /* Child release occurred after cursor advance. */
+    }
+    int transferred = !strcmp(mode, "transfer");
+    int dropped = !strcmp(mode, "drop");
+    if (transferred) {
+        minyar_record_set_take_traced(receiver, 0, slot(g.root));
+        assert(!rc_cycle_proof_valid);
+    } else if (dropped) {
+        rc_drop(g.root);
+        assert(!rc_cycle_proof_valid && !rc_cycle_proof_anchor);
+    } else if (!strcmp(mode, "phase")) {
+        /* Rebuild current proof without draining object queues, then change
+         * phase before the next dead field. The marker must not freeze old
+         * eligibility across this boundary. */
+        rc_cycle_request();
+        cycle_only_drain();
+        assert(rc_cycle_proof_valid && rc_cycle_anchor_held());
+        rc_cycle_request();
+        rc_cycle_unit();
+        assert(rc_cycle_phase == RC_CYCLE_ROOTS && !rc_cycle_local_job);
+        if (recent) {
+            size_t steps = 0;
+            while (rc_bounded_recent_head != object) {
+                assert(++steps < 32 && rc_bounded_recent_head);
+                rc_bounded_recent_object_unit();
+            }
+            rc_bounded_recent_object_unit();
+            assert(rc_bounded_saved_cursor(object) == 2);
+        } else {
+            rc_bounded_old_object_unit();
+            assert(rc_bounded_active == object && rc_bounded_cursor == 2);
+        }
+        assert(!rc_cycle_proof_valid); /* Remaining field uses active-job fallback. */
+    } else {
+        assert(!strcmp(mode, "rebuild"));
+        /* Genuine live owning-edge replacement remains conservative, even
+         * with identical pointer bits. Rebuild only the collector queue while
+         * the dead owner's cleanup cursor remains parked after its first slot. */
+        minyar_rc_retain_traced((void *)(uintptr_t)g.list->values[1]);
+        rc_cycle_edge_add(g.list, (void *)(uintptr_t)g.list->values[1]);
+        rc_cycle_edge_remove((void *)(uintptr_t)g.list->values[1]);
+        rc_drop((void *)(uintptr_t)g.list->values[1]);
+        assert(!rc_cycle_proof_valid);
+        rc_cycle_request();
+        cycle_only_drain();
+        assert(rc_cycle_proof_valid && rc_cycle_anchor_held());
+        if (recent)
+            assert(rc_bounded_saved_cursor(object) == 1);
+        else
+            assert(rc_bounded_active == object && rc_bounded_cursor == 1);
+    }
+    drain();
+    MinyarRecord *leaf = (MinyarRecord *)(uintptr_t)outside->values[0];
+    assert(leaf->values[0] == 51000);
+    if (dropped) {
+        assert(rc_object_count == 3);
+    } else {
+        borrow_held(g);
+        check_held(g, n, 0, 0);
+        assert(rc_object_count == 7u + 2u * n);
+        if (transferred) {
+            assert(receiver->values[0] == slot(g.root));
+            assert(rc_cycle_proof_anchor == rc_cycle_value(receiver));
+        }
+    }
+    print_ledger(mode);
+    fprintf(stderr, "QUEUED n=%u mode=%s recent=%u units=%zu epochs=%zu\n", n, mode, recent,
+            rc_cycle_units - units, rc_cycle_epochs - epochs);
+    minyar_rc_release(outside);
+    minyar_rc_release(receiver);
+    if (!dropped && !transferred)
+        minyar_rc_release(g.root);
+    empty();
+}
+static void certificate_exclusion(unsigned n, unsigned temporary) {
+    Graph g = held(n);
+    MinyarRecord *owner = branch(54000);
+    RcCycle *cycle = rc_cycle_value(owner);
+    assert(cycle->marked == 3 && cycle->incoming == 0 && !cycle->pinned);
+    /* Guard fault injection: these tags are deliberately not evidence that
+     * this private owner is reached from an anchor. ANY tag must reject the
+     * fast retirement predicate, including stale/opposite temporary tags. */
+    unsigned generation = temporary ? rc_cycle_proof_generation ^ 1 : rc_cycle_proof_generation;
+    cycle->gray_next |= 1 | ((uintptr_t)generation << 1);
+    clear_ledger();
+    rc_drop(owner);
+    assert(!rc_cycle_proof_valid);
+    drain();
+    borrow_held(g);
+    check_held(g, n, 0, 0);
+    assert(rc_object_count == 4u + 2u * n);
+    print_ledger(temporary ? "opposite-certificate" : "primary-certificate");
+    minyar_rc_release(g.root);
+    empty();
+}
+
+static void unknown_after_drop(unsigned n) {
+    /* Allocate the unrelated cyclic root first, so the later held graph is
+     * the actual primary anchor. Full capture keeps this child alive through
+     * its own external owner, without certifying it from the primary anchor. */
+    MinyarRecord *child = minyar_record_new_traced(2);
+    minyar_record_set_reference_traced(child, 0, slot(child));
+    minyar_record_set_traced(child, 1, 56000);
+    Graph g = graph();
+    for (unsigned i = 0; i < n; i++)
+        minyar_list_add_take_traced(g.list, slot(branch(10000 + i)));
+    drain();
+    assert(rc_object_count == 5u + 2u * n);
+    assert(rc_cycle_proof_anchor == rc_cycle_value(g.root));
+    assert(rc_cycle_proof_valid && !rc_cycle_proven(rc_cycle_value(child)));
+    MinyarRecord *owner = minyar_record_new_traced(1);
+    minyar_record_set_take_traced(owner, 0, slot(child));
+    assert(rc_cycle_proof_valid && rc_cycle_value(owner)->marked == 3);
+    clear_ledger();
+    rc_drop(owner);
+    unsigned preserved = rc_cycle_proof_valid;
+    rc_bounded_object_unit(); /* Paired incoming removal then ordinary child drop. */
+    assert(rc_cycle_pending);
+    if (preserved)
+        assert(rc_cycle_local_requested && !rc_cycle_rescan);
+    else
+        assert(rc_cycle_rescan);
+    drain();
+    check_held(g, n, 0, 0);
+    assert(rc_object_count == 4u + 2u * n);
+    print_ledger("unknown-after-drop");
+    fprintf(stderr, "UNKNOWN_AFTER_DROP n=%u primary_preserved=%u child_reclaimed=1\n", n,
+            preserved);
+    minyar_rc_release(g.root);
+    empty();
+}
+
+static void metadata_reuse(unsigned n) {
+    Graph g = held(n);
+    uintptr_t previous = 0;
+    unsigned reused = 0;
+    for (unsigned i = 0; i < 128; i++) {
+        MinyarRecord *owner = minyar_record_new_traced(1);
+        RcCycle *cycle = rc_cycle_value(owner);
+        /* Every allocation starts a new lifetime, including pool/libc reuse.
+         * Do not infer reuse from allocator type; record actual address reuse. */
+        assert(!cycle->registered && !cycle->marked && !cycle->gray_next && !cycle->incoming &&
+               !cycle->pinned && !cycle->cleared);
+        reused += previous == (uintptr_t)owner;
+        previous = (uintptr_t)owner;
+        MinyarRecord *leaf = minyar_record_new_traced(1);
+        minyar_record_set_traced(leaf, 0, 55000 + i);
+        minyar_record_set_take_traced(owner, 0, slot(leaf));
+        minyar_rc_release(owner);
+        borrow_held(g);
+        check_held(g, n, 0, 0);
+        assert(rc_object_count == 4u + 2u * n);
+    }
+    fprintf(stderr, "REUSE n=%u rounds=128 observed_consecutive=%u\n", n, reused);
+    minyar_rc_release(g.root);
+    empty();
+}
+#endif
+
 int main(int argc, char **argv) {
     assert(argc >= 3);
     unsigned n = (unsigned)strtoul(argv[1], NULL, 10);
     assert(n >= 1 && n <= 4096);
-    if (!strcmp(argv[2], "active-local") || !strcmp(argv[2], "active-full")) {
+#ifdef MINYAR_BOUNDED_RC
+    if (!strcmp(argv[2], "queued")) {
+        assert(argc == 5);
+        queued_retirement(n, argv[3], (unsigned)strtoul(argv[4], NULL, 10));
+    } else if (!strcmp(argv[2], "certificate")) {
+        assert(argc == 4);
+        certificate_exclusion(n, (unsigned)strtoul(argv[3], NULL, 10));
+    } else if (!strcmp(argv[2], "unknown-after-drop"))
+        unknown_after_drop(n);
+    else if (!strcmp(argv[2], "reuse"))
+        metadata_reuse(n);
+    else
+#endif
+        if (!strcmp(argv[2], "active-local") || !strcmp(argv[2], "active-full")) {
         assert(argc == 4);
         unsigned phase = (unsigned)strtoul(argv[3], NULL, 10);
         assert(phase >= RC_CYCLE_ROOTS && phase <= RC_CYCLE_SWEEP);
