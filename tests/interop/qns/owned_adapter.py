@@ -107,6 +107,7 @@ class OwnerSpec:
         for role,images in self.images.items():
             if not isinstance(images,list) or not images or len(set(images))!=len(images) or any(not isinstance(image,str) or re.fullmatch(r"sha256:[0-9a-f]{64}",image) is None for image in images):raise OwnershipError("invalid pinned image ID")
             if (role=="sim" and len(images)!=1) or (role!="sim" and len(images)>2):raise OwnershipError("unbounded cell image set")
+        if value.get("minyar_image") is not None and (not isinstance(value["minyar_image"],str) or any(value["minyar_image"] not in self.images[role] for role in ("server","client"))):raise OwnershipError("Minyar image outside pinned endpoint pools")
         self.paths={}
         for name in ("runner_root","compose_path","fixture_root","artifacts"):
             path=Path(value.get(name,""))
@@ -672,7 +673,10 @@ class JsonDaemon:
 
 def recorded_compose_stop(spec,identity,entry,entries,unsupported_compliance):
     """Distinguish a bound Compose SIGTERM stop from an unexplained exit."""
-    if entry["State"]["ExitCode"]!=143:return False
+    exit_status=entry["State"]["ExitCode"]
+    if exit_status not in (137,143):return False
+    force_stop=exit_status==137
+    if force_stop and (spec.container(entry)!="server" or spec.value.get("minyar_image") is None or entry["Image"]==spec.value["minyar_image"] or entry["State"].get("OOMKilled") is not False):return False
     try:
         intent=json.loads((spec.paths["artifacts"]/"create-admission.json").read_bytes())
         if intent.get("project")!=spec.project or intent.get("nonce")!=spec.nonce or intent.get("state")!="closed" or intent.get("certified") is not True:return False
@@ -686,7 +690,8 @@ def recorded_compose_stop(spec,identity,entry,entries,unsupported_compliance):
             bound=receipt[name];path=Path(bound["path"])
             if path.resolve()!=path or path.is_symlink() or spec.paths["artifacts"]/"daemon-commands" not in path.parents or stream_binding(path,MAX_BYTES,time.monotonic()+10)!={key:bound[key] for key in ("sha256","bytes")}:return False
             streams[name]=path.read_text(errors="replace")
-        trigger=False
+        if force_stop and (receipt["status"]!=0 or not any(argv[i:i+2]==["--timeout","10"] for i in range(len(prefix),len(argv)-1))):return False
+        trigger=False;trigger_finished=None
         for value in entries:
             role=spec.container(value);status=value["State"]["ExitCode"]
             unsupported=False
@@ -695,8 +700,13 @@ def recorded_compose_stop(spec,identity,entry,entries,unsupported_compliance):
                 known=("handshake","transfer","retry","resumption","zerortt","multiconnect","rebind-port","rebind-addr","chacha20","keyupdate","connectionmigration")
                 unsupported=isinstance(testcase,str) and bool(testcase) and testcase not in known and env.count("ROLE="+role)==1 and env.count("TESTCASE="+testcase)==1
             allowed=status==0 or unsupported
-            if role in ("client","server") and role in argv[len(prefix):] and value["State"]["Running"] is False and allowed and status==receipt["status"] and re.search(re.escape(spec.project+"-"+role)+r"\s+exited with code "+str(status)+r"(?:\s|$)",streams["stdout"]):trigger=True
+            if role in ("client","server") and role in argv[len(prefix):] and value["State"]["Running"] is False and allowed and status==receipt["status"] and re.search(re.escape(spec.project+"-"+role)+r"\s+exited with code "+str(status)+r"(?:\s|$)",streams["stdout"]):
+                trigger=True;trigger_finished=value["State"].get("FinishedAt")
         if not trigger:return False
+        if force_stop:
+            import datetime
+            parse=lambda value:datetime.datetime.fromisoformat(value.replace("Z","+00:00"))
+            if (parse(entry["State"]["FinishedAt"])-parse(trigger_finished)).total_seconds()<9:return False
         lines=[line.strip() for line in streams["stderr"].splitlines()]
         abort=lines.index("Compose Stopping Aborting on container exit...")
         name=spec.project+"-"+spec.container(entry)
@@ -753,7 +763,7 @@ def cleanup_owned(spec,daemon,root,reason,primary=None,unsupported_compliance=No
                 if requested==role and isinstance(testcase,str) and testcase and testcase not in known and env.count("ROLE="+role)==1 and env.count("TESTCASE="+testcase)==1:
                     allowed_unsupported=state["ExitCode"]==127
             except BaseException as exception:error("compliance-reinspection",exception)
-        allowed_compose_stop=not state["Running"] and recorded_compose_stop(spec,identity,daemon.inspect(identity),owned_entries,unsupported_compliance) if state["ExitCode"]==143 else False
+        allowed_compose_stop=not state["Running"] and recorded_compose_stop(spec,identity,daemon.inspect(identity),owned_entries,unsupported_compliance) if state["ExitCode"] in (137,143) else False
         if allowed_compose_stop:result.setdefault("recorded_compose_stops",[]).append(identity)
         if not state["Running"] and state["ExitCode"]!=0 and not allowed_unsupported and not allowed_compose_stop:
             error("unexpected-endpoint-exit",CleanupError("endpoint exited before owned stop: "+str(state["ExitCode"])))

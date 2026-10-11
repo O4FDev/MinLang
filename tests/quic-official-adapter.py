@@ -30,7 +30,7 @@ def setup(root):
     paths={name:root/name for name in ("runner","fixtures","evidence")}
     for path in paths.values():path.mkdir()
     value={"schema_version":1,"runner_commit":adapter.PIN,"project":"minyar-qns-"+"d"*24,"nonce":"e"*64,
-           "images":{"sim":[SIM],"server":[IMAGE,PEER],"client":[IMAGE,PEER]},
+           "images":{"sim":[SIM],"server":[IMAGE,PEER],"client":[IMAGE,PEER]},"minyar_image":IMAGE,
            "runner_root":str(paths["runner"]),"compose_path":str(paths["runner"]/"docker-compose.yml"),
            "fixture_root":str(paths["fixtures"]),"artifacts":str(paths["evidence"])}
     owner=adapter.OwnerSpec(value);containers={}
@@ -77,7 +77,8 @@ def mock_cleanup(case,root):
         simulator=state["containers"]["1"*64]
         simulator["HostConfig"]["CapAdd"]=["CAP_NET_ADMIN","CAP_NET_RAW"]
         for role,identity in (("sim","1"*64),("server","2"*64),("client","3"*64)):
-            state["containers"][identity]["State"]={"Running":False,"ExitCode":0 if role=="client" else 143}
+            state["containers"][identity]["State"]={"Running":False,"ExitCode":0 if role=="client" else 137 if role=="server" else 143,"OOMKilled":False,"FinishedAt":"2026-10-11T16:00:10Z" if role=="client" else "2026-10-11T16:00:20Z"}
+        state["containers"]["2"*64]["Image"]=PEER
         raw=owner.paths["artifacts"]/"daemon-commands"/"compose-output";raw.mkdir(parents=True)
         stdout=raw/"stdout";stderr=raw/"stderr"
         stdout.write_text(owner.project+"-client exited with code 0\n")
@@ -85,7 +86,7 @@ def mock_cleanup(case,root):
             "Container "+owner.project+"-"+role+" Stopping\nContainer "+owner.project+"-"+role+" Stopped\n"
             for role in ("sim","server")))
         receipt={"argv":["/usr/bin/docker","compose","--project-name",owner.project,"--file",str(owner.paths["compose_path"]),
-                         "--env-file",str(owner.paths["runner_root"]/"empty.env"),"up","--abort-on-container-exit","sim","client","server"],
+                         "--env-file",str(owner.paths["runner_root"]/"empty.env"),"up","--timeout","10","--abort-on-container-exit","sim","client","server"],
                  "status":0,"timed_out":False,"primary_exception":None,"finalization_errors":[],
                  "lifetime":{"state":"closed","certified":True},
                  "stdout":adapter.binding(stdout),"stderr":adapter.binding(stderr)}
@@ -103,6 +104,12 @@ def mock_cleanup(case,root):
         original_stderr=stderr.read_bytes();stderr.write_bytes(original_stderr+b"unbound edit")
         strict_capabilities=not adapter.recorded_compose_stop(owner,"1"*64,simulator,list(state["containers"].values()),None) and strict_capabilities
         stderr.write_bytes(original_stderr)
+        peer=state["containers"]["2"*64]
+        for field,value in (("Image",IMAGE),("OOMKilled",True),("FinishedAt","2026-10-11T16:00:11Z")):
+            mutant=json.loads(json.dumps(peer))
+            if field=="Image":mutant[field]=value
+            else:mutant["State"][field]=value
+            strict_capabilities=not adapter.recorded_compose_stop(owner,"2"*64,mutant,list(state["containers"].values()),None) and strict_capabilities
         for invalid in (["CAP_NET_ADMIN","CAP_NET_RAW","CAP_SYS_ADMIN"],
                         ["CAP_NET_ADMIN","CAP_NET_ADMIN"],
                         ["CAP_NET_ADMIN","NET_RAW"], []):
