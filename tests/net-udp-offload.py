@@ -18,6 +18,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 
+def text_stdout(stdout, windows):
+    # Preserve the raw evidence; only native Windows CRT text uses CRLF.
+    return stdout.replace(b'\r\n', b'\n') if windows else stdout
+
+
 def native_diagnostics(stderr, linux):
     if not linux:
         assert stderr == b'', stderr
@@ -107,7 +112,7 @@ def main():
                 assert b'GRO' in native.stdout, native.stdout
                 assert b'signal-interrupted UDP readiness retains its original deadline\n' in native.stdout
             else:
-                assert native.stdout == b'UDP offload explicitly unavailable on this OS\n'
+                assert text_stdout(native.stdout, windows) == b'UDP offload explicitly unavailable on this OS\n', native.stdout
             deadline = native_diagnostics(native.stderr, linux)
             if deadline:
                 report['cases'][-1]['readiness_deadline'] = deadline
@@ -128,7 +133,7 @@ def main():
                          binary=typed, timeout=30)
             expected = (b'typed UDP offload boundaries verified\n' if linux
                         else b'UDP offload unavailable\n')
-            assert result.stdout == expected and result.stderr == b'', result
+            assert text_stdout(result.stdout, windows) == expected and result.stderr == b'', result
             print(label + ': native and typed ' + ('Linux offload' if linux else
                   'explicit unavailable contracts') + ' passed', flush=True)
         report['passed'] = True
