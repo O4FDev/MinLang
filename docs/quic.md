@@ -169,8 +169,9 @@ records remain, and MAX_STREAMS credit is replenished on peer-stream closure.
 The sanitizer churn test completes 2000 mixed bidirectional/unidirectional
 streams with at most two retained records. This is a bounded functional test,
 not hours-long churn or a memory benchmark. Locally issued connection-ID
-retirement remains unsupported. Yamux still retains at most 128 stream records
-and bounds connection buffers to 1 MiB; its stream reclamation is outstanding.
+retirement replenishes the bounded set of locally issued IDs. Yamux
+reclaims completed streams, caps active records at 128 and bounds connection
+buffers to 1 MiB. Its independent Go regression covers 1536 sequential RPCs.
 Persistent congestion uses bounded send-order history across all packet-number
 spaces. It collapses CUBIC to two datagrams only after an uninterrupted loss
 interval longer than three base PTOs, with an RTT sample predating those sends;
@@ -182,6 +183,17 @@ RTT sampling uses the largest newly acknowledged packet's send time even when
 that packet was ACK-only, provided the ACK also acknowledges new eliciting
 data. ACK-only send timestamps are capped at 4096; an ACK older than retained
 metadata cannot contribute a sample. Duplicate ACKs do not sample again.
+Late ACKs of lost STREAM, FIN and RESET frames still mark delivery without
+crediting flight or CUBIC twice; pending mixed packets retain their control
+frames. Each packet-number space retains at most 4096 lost-packet timestamps
+and 4096 scalar stream descriptors, never application bytes. Evicting this
+metadata conservatively excludes the entire older send-time prefix, including
+sends in the same millisecond, from persistent-congestion evidence. The cutoff
+remains monotonic until the connection history is fully discarded; a newer
+uninterrupted loss interval remains eligible. Cached ACK history matching is
+bounded but can require quadratic comparisons across these retained records;
+this is not evidence of acceptable worst-case ACK CPU cost. PTO deadlines use
+the last actual eliciting send; duplicate ACKs do not postpone them.
 ECN remains outstanding. BBR is exploratory: Google's BBRv3 and QUIC BBRv2
 implementations require delivery-rate and minimum-RTT models, app-limited
 sampling and probe states, rather than a different CUBIC window formula.
