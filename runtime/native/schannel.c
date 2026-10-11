@@ -11,6 +11,7 @@
 #include <security.h>
 #include <schannel.h>
 #include "windows_identity.h"
+#include "schannel_framing.h"
 
 #define CHANNEL_LIMIT (1024 * 1024)
 extern MinyarText *minyar_tlsverify_chain(const MinyarText *, const MinyarBytes *,
@@ -33,6 +34,7 @@ typedef struct {
     char host[254];
     wchar_t target[254];
     ChannelBuffer roots, input, outgoing, incoming;
+    SchannelFraming framing;
 } Channel;
 typedef struct {
     uint32_t generation;
@@ -448,6 +450,9 @@ MinyarBytes *minyar_schannel_receiveRaw(long long id, const MinyarBytes *data) {
     if (data->byte_length < 0 || data->byte_length > CHANNEL_LIMIT ||
         !channel_append(&c->input, data->bytes, (size_t)data->byte_length))
         channel_fail(c, 10, SEC_E_BUFFER_TOO_SMALL);
+    else if (!schannel_plaintext_feed(&c->framing, data->bytes, (size_t)data->byte_length,
+                                      CHANNEL_LIMIT))
+        channel_fail(c, 10, SEC_E_INVALID_TOKEN);
     else
         channel_process(c);
     return channel_status(c, data->byte_length);
