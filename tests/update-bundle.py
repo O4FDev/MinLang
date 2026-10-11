@@ -47,6 +47,32 @@ class Packager(unittest.TestCase):
         self.assertEqual(entries[self.main][1],1)
         self.assertEqual(entries['App.app/Contents/Resources/resource with spaces'][2],b'full resource')
 
+    def test_failed_final_tree_check_closes_temporary_before_cleanup(self):
+        # Windows refuses unlink of an open NamedTemporaryFile. Enforce that
+        # API ordering on every host while retaining the original tree error.
+        self.output.write_bytes(b'previous artifact')
+        factory=bundle.tempfile.NamedTemporaryFile
+        unlink=Path.unlink
+        commit=bundle.os.fsync
+        opened=[]
+        def temporary(*args,**kwargs):
+            stream=factory(*args,**kwargs);opened.append(stream);return stream
+        def remove(path,*args,**kwargs):
+            if path.name.startswith('.minyar-bundle-'):
+                self.assertTrue(opened[-1].closed,'cleanup must close its temporary first')
+            return unlink(path,*args,**kwargs)
+        def change_tree(fd):
+            commit(fd)
+            (self.root/'late unsigned resource').write_bytes(b'not in the index')
+        with patch.object(bundle.tempfile,'NamedTemporaryFile',side_effect=temporary), \
+             patch.object(bundle.os,'fsync',side_effect=change_tree), \
+             patch.object(Path,'unlink',remove):
+            with self.assertRaisesRegex(ValueError,'tree changed'):
+                bundle.prepare(self.root,self.output,self.main)
+        self.assertEqual(self.output.read_bytes(),b'previous artifact')
+        self.assertTrue(opened[0].closed)
+        self.assertEqual(list(self.lab.glob('.minyar-bundle-*')),[])
+
     def test_ambiguous_names_bad_entrypoints_and_embedded_output_refused(self):
         for name in ['../escape','/absolute','NUL','missing','App.app/Contents/Resources/resource with spaces']:
             with self.subTest(main=name),self.assertRaises((ValueError,OSError)):
