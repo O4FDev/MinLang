@@ -162,7 +162,9 @@ def main():
                       'command':server_command,'peer_command':peer_command,'compile_command':compile_command,'peer_build_command':peer_build_command,
                       'peer_sha256':hashlib.sha256(peer_binary.read_bytes()).hexdigest() if not options.server_only else None}
             options.report.parent.mkdir(parents=True, exist_ok=True)
-            while (client is None or client.poll() is None) and server.poll() is None:
+            # The server's bounded lifetime includes setup and teardown grace.
+            # Keep observing it after a successful peer finishes.
+            while server.poll() is None and (client is None or client.poll() in (None, 0)):
                 if time.monotonic() > deadline:
                     raise TimeoutError('QUIC soak exceeded its independent wall-clock deadline')
                 sample = process_sample(server.pid); sample['elapsed_seconds'] = time.monotonic() - started
