@@ -31,6 +31,11 @@ static void receiver_publish(void *receiver, int kind, MinyarRecord *payload, in
         minyar_rc_retain_traced(receiver);
     if (copied)
         minyar_rc_retain_traced(payload);
+    if (kind) {
+        MinyarRecord *r = receiver;
+        unsigned char *map = (unsigned char *)(r->values + r->length);
+        map[0] = 1;
+    }
     rc_cycle_edge_insert(receiver, payload);
     assert(!!rc_cycle_proof_valid == preserve);
     if (kind) {
@@ -225,6 +230,9 @@ static void reused_receiver(int kind) {
         assert(rc_cycle_value(receiver)->gray_next & 4);
         minyar_rc_release(old);
         drain();
+        rc_cycle_request();
+        drain();
+        assert(rc_cycle_proof_valid);
         void *fresh = receiver_new(kind);
         assert(!rc_cycle_value(fresh)->gray_next && !rc_cycle_value(fresh)->incoming);
         MinyarRecord *parent = parent_new(g, fresh, 1);
