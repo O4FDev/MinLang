@@ -103,10 +103,18 @@ class Launch(unittest.TestCase):
         def refuse_fork():
             _,hard=resource.getrlimit(resource.RLIMIT_NPROC)
             resource.setrlimit(resource.RLIMIT_NPROC,(0,hard))
+        # LSan starts a tracing process at exit, which this intentional limit
+        # forbids too. Keep ASan/UBSan active, disable only leak tracing in this
+        # restricted subprocess. The native probe restores NPROC before LSan
+        # and independently verifies exact status-pipe descriptor cleanup.
+        probe_env=dict(os.environ)
+        options=[value for value in probe_env.get('ASAN_OPTIONS','').split(':')
+                 if value and not value.startswith('detect_leaks=')]
+        probe_env['ASAN_OPTIONS']=':'.join([*options,'detect_leaks=0'])
         for mode in ['launch','restart']:
             result=subprocess.run([str(self.driver),mode,str(self.root),str(self.metadata),
                 str(self.signature),'1.0.0','1800000000','test-device'],
-                capture_output=True,text=True,preexec_fn=refuse_fork,timeout=15)
+                capture_output=True,text=True,env=probe_env,preexec_fn=refuse_fork,timeout=15)
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertEqual(result.stdout.splitlines()[0],'false')
             self.assertIn('cannot fork checked update process',result.stdout)
