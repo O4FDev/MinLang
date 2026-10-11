@@ -186,6 +186,44 @@ function retried(root: Bytes, identity: Bytes, key: Bytes, certificate: Bytes, c
     for packet in probes { if wire.header(packet, 0, c.local.length).kind != wire.INITIAL || packet.length < 1200 { return 81 } }
     return 0
 }
+// Fill the existing history admission budget with retained actual-send
+// references, independently of packet flight. This is a bounded admission
+// state adversary, not a claim of 8192 distinct peer packets.
+function blockedProbe(root: Bytes, identity: Bytes, key: Bytes, certificate: Bytes, clientKey: Bytes): Integer {
+    let c = quic.client("localhost", randomBytes(80), "minyar-test", [root], [certificate], clientKey)
+    let s = quic.server(randomBytes(80), "minyar-test", c.originalDestination, [identity], key, [root], true)
+    for packet in quic.poll(c, 0) { quic.receive(s, packet, 0) }
+    for packet in quic.poll(s, 100) {
+        let header = wire.header(packet, 0, c.local.length)
+        if header.kind == wire.INITIAL {
+            let opened = protection.unprotect(c.spaces[0].read, packet.slice(0, header.end), header.numberOffset, c.spaces[0].largest)
+            if !opened.valid { return 82 }
+            let crypto = false
+            for frame in wire.frames(opened.payload).frames { if frame.type == 6 { crypto = true } }
+            if crypto { quic.receive(c, packet, 100) }
+        }
+    }
+    if c.spaces[0].sent.length == 0 || c.spaces[1].write.key.length == 0 || c.spaces[1].sent.length != 0 { return 82 }
+    let actual = c.spaces[0].sent[0]
+    while c.history.length < 8192 { c.history.add(actual) }
+    quic.poll(c, 100)
+    let deadline = quic.nextTimer(c)
+    if deadline <= 100 { return 82 }
+    quic.poll(c, deadline)
+    let next = quic.nextTimer(c); let queued = c.pending.length; let probes = c.congestion.probes
+    if next <= deadline || queued == 0 || probes != 1 { print("blocked probe retained an expired timer"); return 83 }
+    quic.poll(c, deadline)
+    if quic.nextTimer(c) != next || c.pending.length != queued || c.congestion.probes != probes { return 83 }
+    // Releasing the admission obstruction sends the already queued probe.
+    c.history = [actual]
+    let handshake = 0
+    for packet in quic.poll(c, deadline + 1) {
+        if wire.header(packet, 0, s.local.length).kind == wire.HANDSHAKE { handshake += 1 }
+        quic.receive(s, packet, deadline + 1)
+    }
+    if handshake == 0 || !s.addressValidated { return 84 }
+    return 0
+}
 function main(): Integer {
     let root = readBytesFile(argument(0)); let identity = readBytesFile(argument(1)); let key = readBytesFile(argument(2))
     let certificate = readBytesFile(argument(3)); let clientKey = readBytesFile(argument(4)); let mode = argument(5)
@@ -198,6 +236,7 @@ function main(): Integer {
     else if mode == "close" { result = closing(root, identity, key, certificate, clientKey, false) }
     else if mode == "drain" { result = closing(root, identity, key, certificate, clientKey, true) }
     else if mode == "retry" { result = retried(root, identity, key, certificate, clientKey) }
+    else if mode == "blocked-probe" { result = blockedProbe(root, identity, key, certificate, clientKey) }
     if result == 0 { print("QUIC PTO " + mode + " passed") }
     return result
 }
