@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import importlib.util
 import json
+import hashlib
 import os
 from pathlib import Path
 import ssl
@@ -20,7 +21,9 @@ parser.add_argument('--seconds',type=int,default=7200)
 parser.add_argument('--connections',type=int,default=64)
 parser.add_argument('--output',type=Path,required=True)
 parser.add_argument('--sanitize',action='store_true')
+parser.add_argument('--binary',type=Path,help='use a separately built matching native binary')
 args=parser.parse_args()
+if args.binary and not args.binary.is_file(): parser.error('prebuilt binary must be a file')
 require_remote_lab()
 if not 1<=args.seconds<=86400 or not 1<=args.connections<=512: parser.error('invalid duration or connection count')
 args.output.mkdir(parents=True,exist_ok=False)
@@ -77,12 +80,15 @@ if args.sanitize:
     flags='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer'
     for key in ('MINYAR_CLANG_FLAGS','MINYAR_NATIVE_FLAGS','MINYAR_RUNTIME_FLAGS'): environment[key]=flags
     environment['ASAN_OPTIONS']='detect_leaks=1'; environment['UBSAN_OPTIONS']='halt_on_error=1'
-program=temp/'client'
-compiled=subprocess.run([ROOT/'minyar','--library',ROOT/'library',ROOT/'tests/tls-soak.min','-o',program],capture_output=True,text=True,env=environment)
-assert compiled.returncode==0,compiled.stderr
+program=args.binary.resolve() if args.binary else temp/'client'
+compile_command=None if args.binary else [str(ROOT/'minyar'),'--library',str(ROOT/'library'),str(ROOT/'tests/tls-soak.min'),'-o',str(program)]
+if compile_command:
+    compiled=subprocess.run(compile_command,capture_output=True,text=True,env=environment)
+    assert compiled.returncode==0,compiled.stderr
+run_command=[str(program),str(port),str(args.seconds),str(args.connections),str(fixtures.path('root','der')),str(fixtures.path('client','der')),str(fixtures.path('client','pk8'))]
 started=time.time(); samples=[]; complete=False; failure=None
 with (temp/'stderr.log').open('w') as errors,(temp/'samples.jsonl').open('w') as evidence:
-    process=subprocess.Popen([program,str(port),str(args.seconds),str(args.connections),fixtures.path('root','der'),fixtures.path('client','der'),fixtures.path('client','pk8')],stdout=subprocess.PIPE,stderr=errors,start_new_session=True,env=environment)
+    process=subprocess.Popen(run_command,stdout=subprocess.PIPE,stderr=errors,start_new_session=True,env=environment)
     try:
         for sample in observe(process,args.seconds+120):
             sample['server']=dict(stats)
@@ -98,8 +104,9 @@ async def shutdown():
     await asyncio.gather(*active,return_exceptions=True)
 asyncio.run_coroutine_threadsafe(shutdown(),loop).result(timeout=15)
 loop.call_soon_threadsafe(loop.stop); thread.join(15)
-report={'status':status,'duration_seconds':time.time()-started,'connections':args.connections,'sanitized':args.sanitize,'server':stats,'unexpected_server_errors':unexpected,'observer_failure':failure,'completed':complete,**memory_summary(samples),'scope':'Minyar TLS1.3 mutual TLS and HTTP keep-alive; QUIC not included'}
+diagnostics=(temp/'stderr.log').read_text()
+report={'binary_sha256':hashlib.sha256(program.read_bytes()).hexdigest(),'command':run_command,'compile_command':compile_command,'diagnostics_empty':not diagnostics,'status':status,'duration_seconds':time.time()-started,'connections':args.connections,'sanitized':None if args.binary else args.sanitize,'sanitized_requested':args.sanitize,'binary_prebuilt':bool(args.binary),'server':stats,'unexpected_server_errors':unexpected,'observer_failure':failure,'completed':complete,**memory_summary(samples),'scope':'Minyar TLS1.3 mutual TLS and HTTP keep-alive; QUIC not included'}
 (temp/'report.json').write_text(json.dumps(report,indent=2)+'\n'); print(json.dumps(report),flush=True)
-assert status==0 and not unexpected and failure is None, 'soak failed; inspect evidence'
+assert status==0 and not unexpected and failure is None and not diagnostics, 'soak failed; inspect evidence'
 assert complete, 'client did not complete'
 assert stats['responses']>0,'no authenticated response received'

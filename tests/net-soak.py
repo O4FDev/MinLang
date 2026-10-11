@@ -4,6 +4,7 @@ QUIC/TLS composite soak is separate: this measures native socket foundations.
 """
 import argparse
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -16,24 +17,28 @@ parser.add_argument('--seconds', type=int, default=7200)
 parser.add_argument('--connections', type=int, default=4096)
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--sanitize', action='store_true')
+parser.add_argument('--binary', type=Path, help='use a separately built matching native binary')
 args = parser.parse_args()
+if args.binary and not args.binary.is_file(): parser.error('prebuilt binary must be a file')
 require_remote_lab()
 if not 1 <= args.seconds <= 86400 or not 1 <= args.connections <= 10000:
     parser.error('seconds must be 1..86400 and connections 1..10000')
 args.output.mkdir(parents=True, exist_ok=False)
 flags = ['-O1','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer'] if args.sanitize else ['-O2']
-executable = args.output.resolve()/'soak'
+executable = args.binary.resolve() if args.binary else args.output.resolve()/'soak'
 command = [os.environ.get('MINYAR_TEST_CLANG','clang'),'-std=c11','-D_GNU_SOURCE',
            '-DMINYAR_SYSTEM_HEAP=1','-Wall','-Wextra','-Werror',*flags,
            str(ROOT/'tests/net-soak.c'),str(ROOT/'runtime/minyar_runtime.c'),'-lm','-o',str(executable)]
-subprocess.run(command,check=True)
+compile_command = None if args.binary else command
+if compile_command: subprocess.run(compile_command,check=True)
+run_command = [str(executable),str(args.seconds),str(args.connections)]
 started = time.time()
 samples=[]
 failure = None
 last_peer = None
 complete = False
 with (args.output/'stderr.log').open('w') as errors, (args.output/'samples.jsonl').open('w') as evidence:
-    process = subprocess.Popen([executable,str(args.seconds),str(args.connections)],stdout=subprocess.PIPE,
+    process = subprocess.Popen(run_command,stdout=subprocess.PIPE,
                                stderr=errors,start_new_session=True,
                                env=dict(os.environ,ASAN_OPTIONS='detect_leaks=1',UBSAN_OPTIONS='halt_on_error=1'))
     try:
@@ -48,14 +53,17 @@ with (args.output/'stderr.log').open('w') as errors, (args.output/'samples.jsonl
     except Exception as error:
         failure = str(error)
     status=process.wait(timeout=15)
-report={'seconds_requested':args.seconds,'connections':args.connections,'status':status,
-        'samples':len(samples),'wall_seconds':time.time()-started,'sanitized':args.sanitize,
+diagnostics = (args.output/'stderr.log').read_text()
+report={'binary_sha256':hashlib.sha256(executable.read_bytes()).hexdigest(),
+        'command':run_command,'compile_command':compile_command,'diagnostics_empty':not diagnostics,
+        'seconds_requested':args.seconds,'connections':args.connections,'status':status,
+        'samples':len(samples),'wall_seconds':time.time()-started,'sanitized':None if args.binary else args.sanitize,'sanitized_requested':args.sanitize,'binary_prebuilt':bool(args.binary),
         'last_sample':samples[-1] if samples else None,
         'last_peer':last_peer,'observer_failure':failure,'completed':complete,
         **memory_summary(samples),
         'scope':'native TCP/UDP/readiness/timers; no TLS or QUIC transport'}
 (args.output/'report.json').write_text(json.dumps(report,indent=2)+'\n')
 print(json.dumps(report),flush=True)
-assert status==0 and complete and failure is None, 'soak crashed or timed out; inspect evidence'
+assert status==0 and complete and failure is None and not diagnostics, 'soak crashed or timed out; inspect evidence'
 assert samples, 'soak emitted no samples'
 assert last_peer and last_peer['registry_slots'] <= args.connections+2, 'registry growth'

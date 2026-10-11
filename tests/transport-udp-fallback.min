@@ -1,0 +1,122 @@
+use "transport" as transport
+use "net" as net
+use "errors" as errors
+record Message { id: Integer; data: Bytes; finished: Boolean; count: Integer }
+function number(text: Text): Integer { let n=0; for digit in text { n=n*10+Integer(digit)-48 }; return n }
+function udpPhase(connection: transport.Connection, socket: Integer, controlPort: Integer, mid: Boolean, serverIdentity: Bytes): Integer {
+    let started = net.monotonicMilliseconds(); let opened = false; let blocked = false
+    let id = -1; let retired = -1; let received = Bytes()
+    let message = Bytes("authenticated QUIC before UDP blackhole")
+    while net.monotonicMilliseconds() - started < 8000 {
+        let now = net.monotonicMilliseconds() - started
+        if mid && connection.state == transport.QUIC_READY && !opened {
+            if !errors.bytesOk(transport.peerCertificate(connection)) || Text(errors.bytesValue(transport.peerCertificate(connection))) != Text(serverIdentity) { return -2 }
+            id = errors.integerValue(transport.openStream(connection))
+            if id < 0 || !errors.integerOk(transport.write(connection,id,message,true)) { return -2 }
+            opened = true
+        }
+        if opened && !blocked {
+            let arrived = transport.read(connection,id)
+            if errors.bytesOk(arrived) { received.addBytes(errors.bytesValue(arrived)) }
+            if received.length == message.length {
+                if Text(received) != Text(message) { return -2 }
+                print("QUIC_ECHO authenticated")
+                let control = net.connect("127.0.0.1",controlPort)
+                if control < 0 || net.send(control,Bytes("B")) != 1 || !net.ready(control,3000) { return -2 }
+                let acknowledged = net.receive(control,1); net.close(control)
+                if Text(acknowledged) != "B" { return -2 }
+                blocked = true
+                retired = errors.integerValue(transport.openStream(connection))
+                if retired < 0 || !errors.integerOk(transport.write(connection,retired,Bytes("must not replay on TCP"),false)) { return -2 }
+                print("UDP_BLOCKED acknowledged")
+            }
+        }
+        for packet in transport.pollUDP(connection,now) {
+            let sent = net.write(socket,packet.data)
+            if !errors.integerOk(sent) || errors.integerValue(sent) != packet.data.length { return -2 }
+        }
+        if connection.state == transport.TCP_NEEDED {
+            if connection.generation != 1 || errors.bytesOk(transport.peerCertificate(connection)) || (mid && !blocked) { return -2 }
+            if mid && errors.code(errors.bytesError(transport.read(connection,retired))) != transport.retryRequiredCode() { return -2 }
+            print("TCP_NEEDED generation=1 elapsed_ms=" + Text(now))
+            return retired
+        }
+        if connection.state == transport.FAILED || connection.state == transport.CLOSED { print(connection.error); return -2 }
+        if net.ready(socket,10) {
+            let packets = net.receiveDatagrams(socket,32,65535)
+            if !net.datagramBatchOk(packets) { return -2 }
+            for packet in net.datagrams(packets) {
+                let bytes = net.datagramData(packet)
+                if errors.bytesOk(bytes) { transport.receiveUDP(connection,errors.bytesValue(bytes),0,net.monotonicMilliseconds()-started) }
+            }
+        }
+    }
+    print("real UDP fallback timed out"); return -2
+}
+function main(): Integer {
+    let mid=argument(0)=="mid"
+    let udpPort=number(argument(1)); let tcpPort=number(argument(2)); let controlPort=number(argument(3))
+    let identity=readBytesFile(argument(4)); let key=readBytesFile(argument(5)); let root=readBytesFile(argument(6)); let serverIdentity=readBytesFile(argument(7))
+    let connection=transport.client("localhost",randomBytes(80),"minyar-test",[root],[identity],key)
+    if !errors.booleanOk(transport.timeouts(connection,1500,300,1500)) { return 1 }
+    let udp=net.udp("127.0.0.1",0)
+    if udp<0 || !net.udpConnect(udp,"127.0.0.1",udpPort) { return 2 }
+    let retired=udpPhase(connection,udp,controlPort,mid,serverIdentity)
+    net.close(udp)
+    if retired == -2 { return 12 }
+    if connection.state!=transport.TCP_NEEDED { return 3 }
+    let socket=net.connect("127.0.0.1",tcpPort); if socket<0 { return 4 }
+    let started=net.monotonicMilliseconds(); let base=connection.now
+    if !errors.booleanOk(transport.startTCP(connection,randomBytes(64),base)) { net.close(socket); return 5 }
+    let opened=false; let completed=0; let messages: List<Message> = []
+    while net.monotonicMilliseconds()-started<12000 {
+        let now=base+net.monotonicMilliseconds()-started
+        if connection.state==transport.TCP_READY && !opened {
+            if !connection.clientTLS.authenticated || connection.clientTLS.resumed || !errors.bytesOk(transport.peerCertificate(connection)) ||
+               Text(errors.bytesValue(transport.peerCertificate(connection)))!=Text(serverIdentity) || connection.mux.streams.length!=0 { return 6 }
+            if mid && errors.code(errors.integerError(transport.write(connection,retired,Bytes("stale handle"),true)))!=transport.retryRequiredCode() { return 7 }
+            opened=true; print("TCP_AUTHENTICATED fresh")
+            for index in 0..16 {
+                let id=errors.integerValue(transport.openStream(connection)); let data=Bytes(32768)
+                for at in 0..data.length { data[at]=index }
+                if id<0 || !errors.integerOk(transport.write(connection,id,data,true)) { return 8 }
+                messages.add(Message { id:id;data:Bytes();finished:false;count:0 })
+            }
+        }
+        if connection.state==transport.TCP_READY {
+            for index in 0..messages.length {
+                let message=messages[index]
+                if !message.finished {
+                    let data=transport.read(connection,message.id)
+                    if errors.bytesStatus(data)==errors.endOfStreamStatus() {
+                        if message.count!=32768 { return 9 }
+                        message.finished=true; completed+=1
+                    } else if errors.bytesOk(data) {
+                        let bytes=errors.bytesValue(data); message.count+=bytes.length
+                        for byte in bytes { if byte!=index { return 10 } }
+                    } else if errors.bytesStatus(data)!=errors.wouldBlockStatus() { return 11 }
+                }
+            }
+        }
+        let outgoing=transport.pollTCP(connection,now); let at=0
+        while at<outgoing.length {
+            let count=net.send(socket,outgoing.slice(at,min(outgoing.length,at+1021)))
+            if count<=0 { return 13 }; at+=count
+        }
+        if completed==16 {
+            transport.close(connection)
+            let ending=transport.pollTCP(connection,now)
+            if net.send(socket,ending)!=ending.length { return 14 }
+            net.close(socket)
+            print("TCP_STREAMS_COMPLETE 16 bytes=524288")
+            return 0
+        }
+        if connection.state==transport.FAILED { print(connection.error); return 15 }
+        if net.ready(socket,10) {
+            let bytes=net.receive(socket,65536)
+            if bytes.length==0 { transport.endTCPInput(connection);print(connection.error);return 16 }
+            transport.receiveTCP(connection,bytes,base+net.monotonicMilliseconds()-started)
+        }
+    }
+    net.close(socket); print("TCP fallback stream timeout"); return 17
+}
