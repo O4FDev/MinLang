@@ -11,6 +11,11 @@ def windows_host():
     return system == 'Windows' or system.startswith(('MSYS', 'MINGW', 'CYGWIN'))
 
 
+def asan_leak_options():
+    """LSan is supported by our Linux native provider, not Windows/macOS."""
+    return 'detect_leaks=' + ('1' if platform.system() == 'Linux' else '0')
+
+
 def clang_command(arguments):
     """Keep libm after its users, and avoid linker arguments in compile phases."""
     arguments = list(arguments)

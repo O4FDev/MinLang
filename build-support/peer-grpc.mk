@@ -32,28 +32,28 @@ check-http2-churn: build/minyarc check-peer-grpc-python
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "$(PEER_GRPC_PYTHON)" tests/http2-churn.py
 
 check-http2-churn-sanitize: build/minyarc check-peer-grpc-python
-	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/http2-churn.py --sanitize
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/http2-churn.py --sanitize
 
 .PHONY: check-peer-grpc-churn check-peer-grpc-churn-sanitize
 check-peer-grpc-churn: build/minyarc check-peer-grpc-python
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-grpc-churn.py
 
 check-peer-grpc-churn-sanitize: build/minyarc check-peer-grpc-python
-	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-grpc-churn.py --sanitize
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-grpc-churn.py --sanitize
 
 .PHONY: check-peer-grpc-retire check-peer-grpc-retire-sanitize
 check-peer-grpc-retire: build/minyarc check-peer-grpc-python
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-grpc-retire.py
 
 check-peer-grpc-retire-sanitize: build/minyarc check-peer-grpc-python
-	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-grpc-retire.py --sanitize
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-grpc-retire.py --sanitize
 
 .PHONY: check-peer-edge check-peer-edge-sanitize
 check-peer-edge: build/minyarc check-peer-grpc-python
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge.py
 
 check-peer-edge-sanitize: build/minyarc check-peer-grpc-python
-	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge.py --sanitize
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge.py --sanitize
 
 check: check-http2-churn check-peer-grpc-churn check-peer-grpc-retire check-peer-edge
 check-sanitize: check-http2-churn-sanitize check-peer-grpc-churn-sanitize check-peer-grpc-retire-sanitize check-peer-edge-sanitize
@@ -63,7 +63,7 @@ check-peer-edge-retry: build/minyarc check-peer-grpc-python
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge-retry.py
 
 check-peer-edge-retry-sanitize: build/minyarc check-peer-grpc-python
-	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge-retry.py --sanitize
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) "$(PEER_GRPC_PYTHON)" tests/peer-edge-retry.py --sanitize
 
 check: check-peer-edge-retry
 check-sanitize: check-peer-edge-retry-sanitize

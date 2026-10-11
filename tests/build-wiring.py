@@ -12,6 +12,39 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class BuildWiring(unittest.TestCase):
+    def test_native_sanitizers_use_supported_leak_detection(self):
+        from unittest.mock import patch
+        from clang_helpers import asan_leak_options
+        with tempfile.TemporaryDirectory(prefix='minyar sanitizer wiring ') as folder:
+            work = Path(folder)
+            uname = work / 'uname'
+            uname.write_text('#!' + sys.executable + '\nimport os\nprint(os.environ["TEST_UNAME"])\n')
+            uname.chmod(0o755)
+            makefile = work / 'probe.mk'
+            makefile.write_text(
+                'include ' + str(ROOT / 'Makefile').replace(' ', '\\ ') + '\n'
+                '.PHONY: probe\nprobe:\n\t@echo "$(NATIVE_SANITIZER_ENV)"\n')
+            for system, os_value, leaks in (
+                    ('Linux', '', 1), ('Darwin', '', 0),
+                    ('Windows', 'Windows_NT', 0), ('Linux', 'Windows_NT', 0),
+                    ('MINGW64_NT-10.0', '', 0), ('MSYS_NT-10.0', '', 0),
+                    ('CYGWIN_NT-10.0', '', 0)):
+                with self.subTest(system=system, os_value=os_value):
+                    env = dict(os.environ, PATH=str(work) + os.pathsep + os.environ['PATH'],
+                               TEST_UNAME=system)
+                    env.pop('MAKEFLAGS', None)
+                    result = subprocess.run(
+                        ['make', '-n', '-f', str(makefile), 'OS=' + os_value,
+                         '-o', 'build/minyarc', 'probe', 'check-tls-validity-sanitize'],
+                        cwd=ROOT, env=env, text=True, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    expected = f'ASAN_OPTIONS=detect_leaks={leaks} UBSAN_OPTIONS=halt_on_error=1'
+                    self.assertEqual(result.stdout.count(expected), 2, result.stdout)
+                    self.assertIn('tests/tls-validity.py --sanitize', result.stdout)
+                    if not os_value or system == 'Windows':
+                        with patch('clang_helpers.platform.system', return_value=system):
+                            self.assertEqual(asan_leak_options(), f'detect_leaks={leaks}')
+
     def test_managed_graph_launcher_builds_only_supported_incremental_driver(self):
         with tempfile.TemporaryDirectory(prefix='minyar build wiring ') as folder:
             work = Path(folder)

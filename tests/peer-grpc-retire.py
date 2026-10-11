@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Independent envelopes verify checked closure notifications and drain-before-retire."""
 import argparse
-from clang_helpers import launcher_command
+from clang_helpers import asan_leak_options, launcher_command
 import importlib.util
 import os
 from pathlib import Path
@@ -16,7 +16,7 @@ def main():
     env=dict(os.environ,MINYAR_CLANG=os.environ.get('MINYAR_TEST_CLANG','clang'))
     if options.sanitize:
         for name in ('MINYAR_CLANG_FLAGS','MINYAR_NATIVE_FLAGS','MINYAR_RUNTIME_FLAGS'): env[name]='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wno-override-module'
-        env['ASAN_OPTIONS']='detect_leaks=1'; env['UBSAN_OPTIONS']='halt_on_error=1'
+        env['ASAN_OPTIONS'] = asan_leak_options(); env['UBSAN_OPTIONS']='halt_on_error=1'
     with tempfile.TemporaryDirectory(prefix='minyar-grpc-retire-') as folder:
         folder=Path(folder); binary=folder/'probe'; subprocess.run([*launcher_command(ROOT),str(ROOT/'tests/peer-grpc-retire.min'),'-o',str(binary)],env=env,check=True,timeout=240)
         initial=folder/'initial'; reset=folder/'reset'; output=folder/'output'; reset.write_bytes(b'\0\0\4\3\0'+struct.pack('>II',1,8))
