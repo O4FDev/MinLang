@@ -1,0 +1,308 @@
+// Optional typed recoverable-error frontend. The runtime representation is
+// an ordinary owned record with a Boolean tag and two typed slots. Only the
+// active slot is initialized; inactive reference slots stay null/unowned.
+record ResultTokenSet {
+    kinds: List<Integer>
+    texts: List<Text>
+    lines: SourceMap
+}
+
+function resultPrefix(name: Text, prefix: Text): Boolean {
+    return name.length >= prefix.length && name.slice(0, prefix.length) == prefix
+}
+
+function resultTypeName(type: Integer, names: List<Text>): Boolean {
+    return isRecordType(type) && resultPrefix(names[type - 1000], "minyar_result_type_")
+}
+
+function resultClose(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, cursor: List<Integer>) {
+    if cursor[1] > 0 {
+        cursor[1] = cursor[1] - 1
+        return
+    }
+    if texts[cursor[0]] == ">>" {
+        cursor[0] = cursor[0] + 1
+        cursor[1] = 1
+        return
+    }
+    expectToken(kinds, texts, lines, cursor, ">")
+}
+
+function internResultType(success: Text, error: Text, successes: List<Text>, errors: List<Text>): Text {
+    let index = 0
+    while index < successes.length {
+        if successes[index] == success && errors[index] == error {
+            return "minyar_result_type_" + Text(index)
+        }
+        index = index + 1
+    }
+    if index >= 4096 { fail("too many Result instantiations") }
+    successes.add(success)
+    errors.add(error)
+    return "minyar_result_type_" + Text(index)
+}
+
+function resultReadType(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, cursor: List<Integer>, successes: List<Text>, errors: List<Text>): Text {
+    if cursor[2] >= 64 { fail("Result type nesting exceeds 64") }
+    if cursor[1] != 0 || kinds[cursor[0]] != 1 {
+        fail(describeLocation(tokenLocation(lines, cursor[0])) + ": expected a Result payload type")
+    }
+    let name = texts[cursor[0]]
+    cursor[0] = cursor[0] + 1
+    if name != "Result" && name != "List" && name != "Callback" { return name }
+    expectToken(kinds, texts, lines, cursor, "<")
+    cursor[2] = cursor[2] + 1
+    let first = resultReadType(kinds, texts, lines, cursor, successes, errors)
+    let result = name + "<" + first
+    if name == "Result" {
+        expectToken(kinds, texts, lines, cursor, ",")
+        let second = resultReadType(kinds, texts, lines, cursor, successes, errors)
+        result = internResultType(first, second, successes, errors)
+    } else {
+        if name == "Callback" {
+            while cursor[1] == 0 && texts[cursor[0]] == "," {
+                cursor[0] = cursor[0] + 1
+                result = result + "," + resultReadType(kinds, texts, lines, cursor, successes, errors)
+            }
+        }
+        result = result + ">"
+    }
+    resultClose(kinds, texts, lines, cursor)
+    cursor[2] = cursor[2] - 1
+    return result
+}
+
+function normalizeResultTypes(kinds: List<Integer>, texts: List<Text>, lines: SourceMap): ResultTokenSet {
+    let outputKinds: List<Integer> = []
+    let outputTexts: List<Text> = []
+    let outputLines = newSourceMap()
+    let successes: List<Text> = []
+    let errors: List<Text> = []
+    let position = 0
+    while position < kinds.length {
+        let token = texts[position]
+        if kinds[position] == 1 && resultPrefix(readableDeclarationName(token), "minyar_result_") {
+            fail(describeLocation(tokenLocation(lines, position)) + ": reserved result compiler name")
+        }
+        let recognized = kinds[position] == 1 && position + 1 < kinds.length && texts[position + 1] == "<" && (token == "Result" || token == "Ok" || token == "Err")
+        if recognized {
+            let cursor: List<Integer> = [position, 0, 0]
+            let replacement = ""
+            if token == "Result" {
+                replacement = resultReadType(kinds, texts, lines, cursor, successes, errors)
+            } else {
+                cursor[0] = position + 2
+                let success = resultReadType(kinds, texts, lines, cursor, successes, errors)
+                expectToken(kinds, texts, lines, cursor, ",")
+                let error = resultReadType(kinds, texts, lines, cursor, successes, errors)
+                resultClose(kinds, texts, lines, cursor)
+                let type = internResultType(success, error, successes, errors)
+                let index = type.slice(19, type.length)
+                replacement = "minyar_result_ok_" + index
+                if token == "Err" { replacement = "minyar_result_err_" + index }
+            }
+            copyModuleToken(outputKinds, outputTexts, outputLines, 1, replacement, lines, position, sourcePath(outputLines, tokenPath(lines, position)))
+            if cursor[1] != 0 {
+                copyModuleToken(outputKinds, outputTexts, outputLines, 4, ">", lines, position, sourcePath(outputLines, tokenPath(lines, position)))
+            }
+            position = cursor[0]
+        } else {
+            copyModuleToken(outputKinds, outputTexts, outputLines, kinds[position], token, lines, position, sourcePath(outputLines, tokenPath(lines, position)))
+            position = position + 1
+        }
+    }
+    if successes.length == 0 {
+        return ResultTokenSet { kinds: kinds; texts: texts; lines: lines }
+    }
+    let declarations: List<Text> = []
+    position = 0
+    while position < successes.length {
+        declarations.add("record minyar_result_type_" + Text(position) + " { ok: Boolean; value: " + successes[position] + "; error: " + errors[position] + " }\n")
+        position = position + 1
+    }
+    let resultKinds: List<Integer> = []
+    let resultTexts: List<Text> = []
+    let resultLines = newSourceMap()
+    let declarationKinds: List<Integer> = []
+    let declarationTexts: List<Text> = []
+    let declarationLines = newSourceMap()
+    tokenize(joinText(declarations), declarationKinds, declarationTexts, declarationLines)
+    position = 0
+    while position + 1 < declarationKinds.length {
+        copyModuleToken(resultKinds, resultTexts, resultLines, declarationKinds[position], declarationTexts[position], declarationLines, position, 0)
+        position = position + 1
+    }
+    position = 0
+    while position < outputKinds.length {
+        copyModuleToken(resultKinds, resultTexts, resultLines, outputKinds[position], outputTexts[position], outputLines, position, sourcePath(resultLines, tokenPath(outputLines, position)))
+        position = position + 1
+    }
+    return ResultTokenSet { kinds: resultKinds; texts: resultTexts; lines: resultLines }
+}
+
+function emitResultValue(output: List<Text>, textState: List<Text>, state: List<Integer>, payload: Text, payloadType: List<Integer>, success: Boolean, result: Integer, counts: List<Integer>, fields: List<Integer>, returnTypes: List<Integer>): Text {
+    let value = valueName(textState, newTemporary(state))
+    // Reference-slot flags start cleared. Only the selected arm owns a payload.
+    noteCycleFixup(output, returnTypes, counts, fields, output.length, result, 0)
+    output.add("  " + value + " = call ptr @minyar_record_new(i64 3)\n")
+    let tag = "0"
+    let field = 2
+    if success { tag = "1"; field = 1 }
+    output.add("  call void @minyar_record_set(ptr " + value + ", i64 0, i64 " + tag + ")\n")
+    let slot = valueAsListSlot(output, textState, state, payload, payloadType[0])
+    let setter = "minyar_record_set"
+    if isReferenceType(payloadType[0]) {
+        setter = "minyar_record_set_reference"
+        if takeResult(output, state, payload, payloadType) { setter = "minyar_record_set_take" }
+    }
+    noteCycleFixup(output, returnTypes, counts, fields, output.length, result, payloadType[0])
+    output.add("  call void @" + setter + "(ptr " + value + ", i64 " + Text(field) + ", i64 " + slot + ")\n")
+    return value
+}
+
+function parseResultConstructor(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
+    let location = state[0]
+    let name = tokenTexts[location]
+    let success = resultPrefix(name, "minyar_result_ok_")
+    let start = 18
+    if success { start = 17 }
+    let record = findCompiledSymbol(functionNames, symbolKinds, functionReturnTypes, "minyar_result_type_" + name.slice(start, name.length), 2)
+    if record < 0 { fail("missing Result type") }
+    let offset = functionParameterOffset(functionParameterCounts, record)
+    let field = 2
+    if success { field = 1 }
+    let expected = functionParameterTypes[offset + field]
+    state[0] = state[0] + 1
+    expectToken(tokenKinds, tokenTexts, tokenLines, state, "(")
+    let payloadType: List<Integer> = [expected]
+    let payload = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, payloadType)
+    expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
+    if payloadType[0] != expected {
+        fail(describeLocation(tokenLocation(tokenLines, location)) + ": result payload has the wrong type")
+    }
+    let value = emitResultValue(output, textState, state, payload, payloadType, success, 1000 + record, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+    setType(resultType, 1000 + record)
+    // parsePrimary registers the constructor result once, like a call.
+    return value
+}
+
+function parseResultTry(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, returnType: Integer): Text {
+    let location = state[0]
+    if textState[1] == "top level" || !resultTypeName(returnType, functionNames) {
+        fail(describeLocation(tokenLocation(tokenLines, location)) + ": try requires a Result-returning function")
+    }
+    state[0] = state[0] + 1
+    let inputType: List<Integer> = [0]
+    let input = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, inputType)
+    if !resultTypeName(inputType[0], functionNames) {
+        fail(describeLocation(tokenLocation(tokenLines, location)) + ": try needs a Result")
+    }
+    let first = functionParameterOffset(functionParameterCounts, inputType[0] - 1000)
+    let target = functionParameterOffset(functionParameterCounts, returnType - 1000)
+    let errorType = functionParameterTypes[first + 2]
+    if errorType != functionParameterTypes[target + 2] {
+        fail(describeLocation(tokenLocation(tokenLines, location)) + ": try error type must match the enclosing Result error type")
+    }
+    // A borrowed scrutinee is pinned across subsequent calls/cleanup. An owned
+    // scrutinee already has a registered temporary owner.
+    if inputType.length == 1 || inputType[1] == -1 {
+        noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, inputType[0], 0)
+        output.add("  call void @minyar_rc_retain(ptr " + input + ")\n")
+        ownResult(output, state, input, inputType)
+    }
+    let tag = readRecordField(output, textState, state, input, 0, 4)
+    let okLabel = "result.try.ok." + Text(newLabel(state))
+    let errorLabel = "result.try.error." + Text(newLabel(state))
+    output.add(conditionalBranch(tag, okLabel, errorLabel))
+    output.add("\n" + errorLabel + ":\n")
+    let error = readRecordField(output, textState, state, input, 2, errorType)
+    let errorPayload: List<Integer> = [errorType]
+    let returned = emitResultValue(output, textState, state, error, errorPayload, false, returnType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+    // The new result is the owned return value; frame exit drops every
+    // parameter/local/temporary, including the input Result, exactly once.
+    output.add("  call void @minyar_rc_leave()\n")
+    output.add("  call void @minyar_stack_leave()\n")
+    output.add("  ret ptr " + returned + "\n")
+    output.add("\n" + okLabel + ":\n")
+    textState[0] = okLabel
+    setType(resultType, functionParameterTypes[first + 1])
+    return readRecordField(output, textState, state, input, 1, resultType[0])
+}
+
+function compileResultMatch(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, returnType: Integer): Boolean {
+    let location = state[0]
+    state[0] = state[0] + 1
+    let inputType: List<Integer> = [0]
+    let input = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, inputType)
+    if !resultTypeName(inputType[0], functionNames) {
+        fail(describeLocation(tokenLocation(tokenLines, location)) + ": match needs a Result")
+    }
+    let outerScope = state[3]
+    let owner = nextLocal(state)
+    addLocal(localNames, localTypes, localIds, localLengths, state, " result match", inputType[0], owner)
+    assignReference(output, state, owner, input, inputType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+    storeLocal(output, owner, inputType[0], input)
+    let tag = readRecordField(output, textState, state, input, 0, 4)
+    let okLabel = "result.match.ok." + Text(newLabel(state))
+    let errorLabel = "result.match.error." + Text(newLabel(state))
+    let endLabel = "result.match.end." + Text(newLabel(state))
+    output.add(conditionalBranch(tag, okLabel, errorLabel))
+    expectToken(tokenKinds, tokenTexts, tokenLines, state, "{")
+    skipTerminators(tokenKinds, state)
+    let seenOk = false
+    let seenError = false
+    let allReturn = true
+    let first = functionParameterOffset(functionParameterCounts, inputType[0] - 1000)
+    while !tokenIs(tokenKinds, tokenTexts, state, "}") {
+        let arm = tokenTexts[state[0]]
+        if tokenKinds[state[0]] != 1 || (arm != "Ok" && arm != "Err") {
+            fail(describeLocation(tokenLocation(tokenLines, state[0])) + ": expected Ok or Err in result match")
+        }
+        let field = 2
+        let label = errorLabel
+        if arm == "Ok" {
+            if seenOk { fail("duplicate result arm Ok") }
+            seenOk = true
+            field = 1
+            label = okLabel
+        } else {
+            if seenError { fail("duplicate result arm Err") }
+            seenError = true
+        }
+        state[0] = state[0] + 1
+        expectToken(tokenKinds, tokenTexts, tokenLines, state, "(")
+        if tokenKinds[state[0]] != 1 { fail("expected a result payload binding") }
+        let binding = tokenTexts[state[0]]
+        state[0] = state[0] + 1
+        expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
+        output.add("\n" + label + ":\n")
+        textState[0] = label
+        let scope = state[3]
+        let type = functionParameterTypes[first + field]
+        let payload = readRecordField(output, textState, state, input, field, type)
+        let id = nextLocal(state)
+        addLocal(localNames, localTypes, localIds, localLengths, state, binding, type, id)
+        let payloadType: List<Integer> = [type]
+        assignReference(output, state, id, payload, payloadType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+        storeLocal(output, id, type, payload)
+        let returns = compileBlock(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
+        if !returns {
+            rootLocal(output, state, id, "null", type)
+            output.add("  br label %" + endLabel + "\n")
+            allReturn = false
+        }
+        state[3] = scope
+        skipTerminators(tokenKinds, state)
+    }
+    expectToken(tokenKinds, tokenTexts, tokenLines, state, "}")
+    if !seenOk || !seenError { fail("match must handle both Ok and Err") }
+    if !allReturn {
+        output.add("\n" + endLabel + ":\n")
+        textState[0] = endLabel
+        rootLocal(output, state, owner, "null", inputType[0])
+        output.add("  call void @minyar_rc_step()\n")
+    }
+    state[3] = outerScope
+    return allReturn
+}
+
