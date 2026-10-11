@@ -5,7 +5,7 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--artifacts',type=Path,required=True);parser.add_argument('--yamux-peer',type=Path);parser.add_argument('--state-only',action='store_true');parser.add_argument('--sanitize',action='store_true');parser.add_argument('--optimization',choices=('0','2'),default='0');options=parser.parse_args()
-    commands=[['securecrypto.py'],['quic-crypto.py'],['quic-wire.py'],['quic-dispatch.py'],['tls-server.py'],['tls-server.py','--curve','prime256v1'],['tls-keyshare.py'],['tls-validity.py'],['yamux-churn.py'],['transport-cancel.py']]
+    commands=[['securecrypto.py'],['quic-crypto.py'],['quic-wire.py'],['quic-dispatch.py'],['tls-server.py'],['tls-server.py','--curve','prime256v1'],['tls-keyshare.py'],['tls-signing-usage.py'],['tls-validity.py'],['yamux-churn.py'],['transport-cancel.py']]
     commands += [['quic-transport.py',*([mode] if mode else [])] for mode in ('','--key-update','--migration','--server-protocol','--resumption','--quic-resumption','--early','--fallback','--congestion','--stream-control','--stream-churn','--closing','--persistent','--retry','--rtt')]
     commands += [['tls-resumption-expiry.py'],['tls-handshake-validity.py']]
     if options.yamux_peer:commands += [['transport-go.py','--peer-binary',str(options.yamux_peer.resolve()),*extra] for extra in ([],['--streams','1536'])]
