@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location('linux_checks', ROOT / 'scripts/check-linux.py')
@@ -28,6 +29,25 @@ class LinuxSnapshot(unittest.TestCase):
         workflow.write_text('jobs:\n  native:\n    run: python3 tests/native.py\n')
         (source / 'tests/native.py').write_text('print("native")\n')
         return source, work, workflow
+
+    def test_explicit_llvm_uses_its_matching_linker_instead_of_path_linker(self):
+        with tempfile.TemporaryDirectory(prefix='minyar-selected-llvm-') as temporary:
+            work = Path(temporary)
+            chosen = work / 'llvm23'
+            old = work / 'llvm18'
+            chosen.mkdir()
+            old.mkdir()
+            for path in (chosen / 'clang', chosen / 'clang++', chosen / 'ld.lld', old / 'ld.lld'):
+                path.write_bytes(b'tool fixture')
+            commands = {'chosen-clang': str(chosen / 'clang'), 'chosen-cxx': str(chosen / 'clang++'),
+                        'make': 'make', 'ld.lld': str(old / 'ld.lld')}
+            with mock.patch.object(RUNNER.shutil, 'which', side_effect=commands.get):
+                tools = RUNNER.resolve_toolchain('chosen-clang', 'chosen-cxx')
+            self.assertEqual(tools['ld.lld'], str(chosen / 'ld.lld'))
+            (chosen / 'ld.lld').unlink()
+            with mock.patch.object(RUNNER.shutil, 'which', side_effect=commands.get):
+                tools = RUNNER.resolve_toolchain('chosen-clang', 'chosen-cxx')
+            self.assertEqual(tools['ld.lld'], str(old / 'ld.lld'))
 
     def test_workflow_consumers_remain_reviewable_and_catalogue_valid(self):
         with tempfile.TemporaryDirectory(prefix='minyar-linux-snapshot-') as temporary:
