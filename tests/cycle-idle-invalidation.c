@@ -309,16 +309,29 @@ static void queued_retirement(unsigned n, const char *mode, unsigned recent) {
     } else if (dropped) {
         rc_drop(g.root);
         assert(!rc_cycle_proof_valid && !rc_cycle_proof_anchor);
-    } else if (!strcmp(mode, "phase")) {
+    } else if (!strcmp(mode, "phase") || !strncmp(mode, "local-", 6) ||
+               !strncmp(mode, "full-", 5)) {
         /* Rebuild current proof without draining object queues, then change
          * phase before the next dead field. The marker must not freeze old
          * eligibility across this boundary. */
         rc_cycle_request();
         cycle_only_drain();
         assert(rc_cycle_proof_valid && rc_cycle_anchor_held());
-        rc_cycle_request();
-        rc_cycle_unit();
-        assert(rc_cycle_phase == RC_CYCLE_ROOTS && !rc_cycle_local_job);
+        unsigned local = !strncmp(mode, "local-", 6);
+        unsigned phase = strstr(mode, "mark")    ? RC_CYCLE_MARK
+                         : strstr(mode, "sweep") ? RC_CYCLE_SWEEP
+                                                 : RC_CYCLE_ROOTS;
+        if (local)
+            rc_cycle_request_local();
+        else
+            rc_cycle_request();
+        size_t phase_steps = 0;
+        while (rc_cycle_phase != phase) {
+            assert(++phase_steps < 4000000);
+            rc_cycle_unit(); /* Collector only: dead cursor stays after field zero. */
+        }
+        assert(rc_cycle_local_job == local && rc_cycle_proof_valid);
+        assert(rc_cycle_anchor_held());
         if (recent) {
             size_t steps = 0;
             while (rc_bounded_recent_head != object) {
@@ -433,8 +446,8 @@ static void unknown_after_drop(unsigned n) {
 
 static void metadata_reuse(unsigned n) {
     Graph g = held(n);
-    uintptr_t previous = 0;
-    unsigned reused = 0;
+    uintptr_t previous = 0, addresses[128];
+    unsigned reused = 0, any_reused = 0;
     for (unsigned i = 0; i < 128; i++) {
         MinyarRecord *owner = minyar_record_new_traced(1);
         RcCycle *cycle = rc_cycle_value(owner);
@@ -443,7 +456,11 @@ static void metadata_reuse(unsigned n) {
         assert(!cycle->registered && !cycle->marked && !cycle->gray_next && !cycle->incoming &&
                !cycle->pinned && !cycle->cleared);
         reused += previous == (uintptr_t)owner;
-        previous = (uintptr_t)owner;
+        unsigned seen = 0;
+        for (unsigned j = 0; j < i; j++)
+            seen |= addresses[j] == (uintptr_t)owner;
+        any_reused += seen;
+        addresses[i] = previous = (uintptr_t)owner;
         MinyarRecord *leaf = minyar_record_new_traced(1);
         minyar_record_set_traced(leaf, 0, 55000 + i);
         minyar_record_set_take_traced(owner, 0, slot(leaf));
@@ -452,7 +469,11 @@ static void metadata_reuse(unsigned n) {
         check_held(g, n, 0, 0);
         assert(rc_object_count == 4u + 2u * n);
     }
-    fprintf(stderr, "REUSE n=%u rounds=128 observed_consecutive=%u\n", n, reused);
+    fprintf(stderr, "REUSE n=%u rounds=128 observed_consecutive=%u observed_any_prior=%u\n", n,
+            reused, any_reused);
+#ifdef MINYAR_BOUNDED_HEAP
+    assert(any_reused > 0); /* Actual supported pool reuse, not allocator inference. */
+#endif
     minyar_rc_release(g.root);
     empty();
 }
