@@ -84,9 +84,57 @@ function lostDataMigration(root: Bytes, identity: Bytes, key: Bytes, client: Byt
     print("lost data migration: old-route loss recovered on validated replacement path")
     return 0
 }
+function appendInteger(data: Bytes, value: Integer) { data.addBytes(errors.bytesValue(wire.encode(value))) }
+function retirePacket(sender: quic.Connection, receiver: quic.Connection, destination: Bytes, sequence: Integer, now: Integer) {
+    let payload = Bytes(); appendInteger(payload, 25); appendInteger(payload, sequence)
+    let number = sender.spaces[2].next; sender.spaces[2].next += 1
+    let header = Bytes(); header.add(0x43); header.addBytes(destination)
+    for index in 0..4 { header.add((number >> ((3-index)*8)) & 255) }
+    let packet = errors.bytesValue(protection.protect(sender.spaces[2].write, header, header.length-4, number, payload))
+    quic.receive(receiver, packet, now)
+}
+function connectionIdLifecycle(root: Bytes, identity: Bytes, key: Bytes, client: Bytes, clientKey: Bytes): Integer {
+    let c = quic.client("localhost", randomBytes(80), "minyar-test", [root], [client], clientKey)
+    let s = quic.server(randomBytes(80), "minyar-test", c.originalDestination, [identity], key, [root], true)
+    let now = 0
+    for count in 0..200 { drive(c, s, now); now += 10 }
+    if !c.confirmed || !s.confirmed { return 33 }
+    if c.remoteIds.length != 2 || s.remoteIds.length != 2 { return 32 }
+    if c.remoteIds[1].id.length != 8 || c.remoteIds[1].token.length != 16 ||
+       crypto.hex(c.remoteIds[0].id) == crypto.hex(c.remoteIds[1].id) { return 34 }
+    for round in 0..12 {
+        let oldSequence = c.remoteIds[0].sequence
+        let destination = c.remoteIds[1].id
+        retirePacket(c, s, destination, oldSequence, now)
+        if s.state != quic.ESTABLISHED { return 35 }
+        // The replacement remains reliable if all initial replies are lost.
+        if round == 0 { let lost = quic.pollDatagrams(s, now); if lost.length == 0 { return 36 }; now += 1000 }
+        for count in 0..200 { drive(c, s, now); now += 10 }
+        if c.state != quic.ESTABLISHED || s.state != quic.ESTABLISHED || c.remoteIds.length != 2 ||
+           c.remoteIds[0].sequence != oldSequence+1 || c.remoteIds[1].sequence != oldSequence+2 { return 37 }
+        // Repeated retirements of an already retired CID do not consume the pool.
+        retirePacket(c, s, c.remoteIds[0].id, oldSequence, now)
+        for count in 0..50 { drive(c, s, now); now += 10 }
+        if s.state != quic.ESTABLISHED || c.remoteIds.length != 2 || c.remoteIds[1].sequence != oldSequence+2 { return 38 }
+    }
+    for malformed in 0..2 {
+        let badClient = quic.client("localhost", randomBytes(80), "minyar-test", [root], [client], clientKey)
+        let badServer = quic.server(randomBytes(80), "minyar-test", badClient.originalDestination, [identity], key, [root], true)
+        let at = 0
+        for count in 0..200 { drive(badClient, badServer, at); at += 10 }
+        let sequence = badClient.remoteIds[0].sequence
+        if malformed == 1 { sequence = badClient.remoteIds[1].sequence+1 }
+        retirePacket(badClient, badServer, badClient.remoteIds[0].id, sequence, at)
+        if badServer.state != quic.FAILED || badServer.code != 10 { return 39 }
+    }
+    print("QUIC connection IDs: supply, retirement, retransmission, duplicates and invalid retirements passed")
+    return 0
+}
+
 function main(): Integer {
     let root = readBytesFile(argument(0)); let server = readBytesFile(argument(1)); let serverKey = readBytesFile(argument(2))
     let client = readBytesFile(argument(3)); let clientKey = readBytesFile(argument(4))
+    let cid = connectionIdLifecycle(root, server, serverKey, client, clientKey); if cid != 0 { return cid }
     let c = quic.client("localhost", randomBytes(80), "minyar-test", [root], [client], clientKey)
     let s = quic.server(randomBytes(80), "minyar-test", c.originalDestination, [server], serverKey, [root], true)
     if errors.booleanOk(quic.probePath(c, 7, 0)) { return 1 }
