@@ -421,6 +421,11 @@ static void internal_completed_parent(void) {
     minyar_record_set_traced(payload, 2, 123);
     Late s = {g, parent, receiver, 0, 0};
     drain();
+    if (rc_cycle_local_generation != rc_cycle_value(g.root)->generation) {
+        rc_cycle_request_local();
+        drain();
+    }
+    assert(rc_cycle_local_generation == rc_cycle_value(g.root)->generation);
     assert(!pending() && rc_cycle_phase == RC_CYCLE_IDLE && rc_cycle_proof_valid);
     rc_cycle_request_local();
     rc_cycle_unit();
