@@ -154,7 +154,34 @@ static void run_case(int kind, int topology, int copied, int borrowed, unsigned 
         minyar_rc_release(s.main.root);
     empty();
 }
+/* A barrier can queue a live root before its own full ROOTS unit. A
+ * completed mark from an old local scan may be cleared; this current gray
+ * mark and link must survive, without inserting the same node twice. */
+static void queued_full_root(void) {
+    Graph g = graph();
+    RcCycle *root = rc_cycle_value(g.root);
+    rc_cycle_request();
+    rc_cycle_unit();
+    assert(rc_cycle_phase == RC_CYCLE_ROOTS && !rc_cycle_local_job);
+    minyar_rc_retain_traced(g.root);
+    rc_drop(g.root);
+    assert(root->marked == 1 && rc_cycle_gray_head == root && rc_cycle_gray_tail == root);
+    size_t units = 0;
+    while (rc_cycle_cursor != root) {
+        assert(++units < 10000 && rc_cycle_phase == RC_CYCLE_ROOTS);
+        rc_cycle_unit();
+    }
+    assert(root->marked == 1 && !(root->gray_next & ~(uintptr_t)7));
+    rc_cycle_unit();
+    assert(root->marked == 1 && rc_cycle_gray_head == root && rc_cycle_gray_tail == root);
+    assert(!(root->gray_next & ~(uintptr_t)7));
+    drain();
+    assert(rc_object_count == 4 && g.interior->values[1] == 19);
+    minyar_rc_release(g.root);
+    empty();
+}
 int main(void) {
+    queued_full_root();
     for (int kind = 0; kind < 2; kind++)
         for (int topology = 0; topology < 3; topology++)
             for (int copied = 0; copied < 2; copied++)
