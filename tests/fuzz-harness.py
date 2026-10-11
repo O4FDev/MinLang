@@ -113,7 +113,6 @@ class FuzzHarness(unittest.TestCase):
         self.assertEqual(result.stderr, "\\xff")
         self.assertEqual(fuzz.COMMANDS[-1]["stderr"], "\\xff")
 
-    @unittest.skipIf(os.name == "nt", "POSIX process group assertion")
     def test_timeout_terminates_descendants(self):
         with tempfile.TemporaryDirectory() as directory:
             marker = Path(directory) / "orphan-wrote-file"

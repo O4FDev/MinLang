@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import platform
 import re
 from pathlib import Path
 import shutil
@@ -21,6 +22,49 @@ _DEFAULT_STDIN = object()
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+
+def terminate_process_tree(process):
+    """Terminate this test's native Windows tree or POSIX process group."""
+    windows = os.name == 'nt' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN'))
+    if windows:
+        native_pids = {process.pid}
+        if os.name != 'nt':
+            # MSYS fork/exec may replace a Windows parent PID. Snapshot the
+            # POSIX group before terminating its native trees, so children
+            # cannot survive under the replaced Windows parent identity.
+            native_pids = {int(Path(f'/proc/{process.pid}/winpid').read_text().strip())}
+            listing = subprocess.check_output(['ps', '-e'], text=True, timeout=5).splitlines()
+            columns = listing[0].split()
+            group_column, native_column = columns.index('PGID'), columns.index('WINPID')
+            for line in listing[1:]:
+                fields = line.split()
+                if fields and not fields[0].isdigit():
+                    fields = fields[1:]
+                if len(fields) > max(group_column, native_column) and int(fields[group_column]) == process.pid:
+                    native_pids.add(int(fields[native_column]))
+        if not native_pids or any(pid <= 0 for pid in native_pids):
+            raise ValueError('invalid native Windows process ID')
+        # Native taskkill accepts dash flags, which MSYS cannot rewrite as paths.
+        arguments = ['taskkill.exe', '-F', '-T']
+        for native_pid in sorted(native_pids):
+            arguments += ['-PID', str(native_pid)]
+        try:
+            result = subprocess.run(arguments, capture_output=True, timeout=10)
+            if result.returncode and process.poll() is None:
+                raise RuntimeError('Windows test tree termination failed: ' +
+                                   result.stderr.decode('utf-8', errors='replace'))
+        finally:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 class Evidence:
@@ -153,19 +197,10 @@ class Evidence:
                     out, err = process.communicate(input=input_bytes, timeout=timeout)
                 except subprocess.TimeoutExpired:
                     row['timed_out'] = True
-                    if os.name == 'nt':
-                        try:
-                            subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)],
-                                           capture_output=True, timeout=10)
-                        except (OSError, subprocess.TimeoutExpired) as error:
-                            row['tree_termination_error'] = str(error)
-                        finally:
-                            process.kill()
-                    else:
-                        try:
-                            os.killpg(process.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
+                    try:
+                        terminate_process_tree(process)
+                    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
+                        row['tree_termination_error'] = str(error)
                     out, err = process.communicate(timeout=10)
                 row.update(returncode=process.returncode,
                            stdout_base64=base64.b64encode(out or b'').decode('ascii'),

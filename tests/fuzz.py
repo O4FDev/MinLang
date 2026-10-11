@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from test_evidence import terminate_process_tree
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -53,14 +54,7 @@ def run(command: list[str], *, timeout: float = 8, cwd: Path = ROOT) -> subproce
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
-            if os.name == "nt":
-                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True)
-                process.kill()
-            else:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            terminate_process_tree(process)
             stdout, stderr = process.communicate(timeout=10)
         result = subprocess.CompletedProcess(command, process.returncode,
                                              stdout.decode("utf-8", errors="backslashreplace"),
