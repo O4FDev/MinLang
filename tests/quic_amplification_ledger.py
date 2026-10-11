@@ -14,11 +14,14 @@ import json
 from pathlib import Path
 import struct
 import sys
-import cryptography
-
-from cryptography.exceptions import InvalidTag
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
+CRYPTO_IMPORT_ERROR=None
+try:
+    import cryptography
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
+except ImportError as error:
+    CRYPTO_IMPORT_ERROR=error
 
 
 class CoverageError(ValueError):
@@ -30,6 +33,7 @@ def sha(data):
 
 
 def crypto_provider():
+    if CRYPTO_IMPORT_ERROR is not None:raise CRYPTO_IMPORT_ERROR
     files={}
     for name,module in sorted(sys.modules.items()):
         path=getattr(module,"__file__",None)
@@ -205,15 +209,16 @@ def packets(data):
         size=need(data,at,1)[0];at+=1
         if size>20:raise CoverageError("oversized source CID")
         scid=need(data,at,size);at+=size
-        kind=(first>>4)&3
+        kind=(first>>4)&3;token_length=0;token_sha256=None
         if kind==3:raise CoverageError("Retry requires separately bound token policy")
         if kind==0:
-            size,at=varint(data,at);need(data,at,size);at+=size
+            size,at=varint(data,at);token=need(data,at,size);at+=size
+            token_length=size;token_sha256=sha(token)
         length,at=varint(data,at);offset=at-start
         packet=need(data,start,offset+length)
         if not length:raise CoverageError("empty protected QUIC packet")
         yield {"type":("initial","zerortt","handshake")[kind],"packet":packet,
-               "dcid":dcid,"scid":scid,"pn_offset":offset}
+               "dcid":dcid,"scid":scid,"pn_offset":offset,"token_length":token_length,"token_sha256":token_sha256}
         at=start+len(packet)
 
 
@@ -370,7 +375,7 @@ class Ledger:
     def result(self):
         boundaries=[state["boundary"] for state in self.routes.values() if state["boundary"] is not None]
         status="failed" if self.violations and self.policy=="handshake-only" else "coverage-limited" if self.violations or not boundaries else "passed"
-        return {"schema_version":1,"scope":"RFC v1 connection establishment, explicit validation policy",
+        return {"schema_version":1,"scope":"synthetic accounting or separately checked endpoint-policy receipt; no official claim from direct analyze()",
                 "policy":self.policy,"status":status,"violations":self.violations,"authenticated_boundaries":boundaries,
                 "connection_count":len({key[0] for key in self.routes}),"rows":self.rows,
                 "limitation":"Unknown peer CID/token validation policy cannot be inferred from PCAP." if self.policy=="peer-unknown" else None}
@@ -398,6 +403,7 @@ def analyze(capture_bytes,keylogs,server_addresses,port=443,policy="peer-unknown
         if duplicate in duplicates:raise CoverageError("ambiguous exact capture duplicate")
         duplicates.add(duplicate)
         entries=list(packets(payload))
+        if any(entry.get("token_length",0) for entry in entries):raise CoverageError("Initial token validation policy is unproved")
         connections={attribution.packet(entry,direction) for entry in entries}
         if len(connections)!=1:raise CoverageError("coalesced datagram attribution is ambiguous")
         connection=next(iter(connections));authentication=None
@@ -441,6 +447,137 @@ def analyze(capture_bytes,keylogs,server_addresses,port=443,policy="peer-unknown
     return result
 
 
+
+class InputRetention:
+    """Copy each actual input and independently verify original/copy/original."""
+    def __init__(self,root):
+        self.root=root;self.inputs={};self.snapshots={}
+    def capture(self,path):
+        path=Path(path).resolve();key=str(path)
+        if key in self.snapshots:return self.snapshots[key]
+        data=path.read_bytes();before={"sha256":sha(data),"bytes":len(data)}
+        retained=self.root/("input-"+str(len(self.inputs)).zfill(3)+".bin")
+        entry={"sha256":before["sha256"],"bytes":before["bytes"],"original_before":before,
+               "retained_path":retained.relative_to(self.root).as_posix(),"copied_exact":False}
+        self.inputs[key]=entry
+        retained.write_bytes(data)
+        copy=retained.read_bytes();after=path.read_bytes()
+        entry["retained"]={"sha256":sha(copy),"bytes":len(copy)}
+        entry["original_after"]={"sha256":sha(after),"bytes":len(after)}
+        entry["copied_exact"]=before==entry["retained"]==entry["original_after"]
+        if not entry["copied_exact"]:raise CoverageError("input changed during retention: "+key)
+        self.snapshots[key]=data
+        return data
+    def expected(self,binding):
+        if not isinstance(binding,dict) or not isinstance(binding.get("path"),str) or type(binding.get("bytes")) is not int:
+            raise CoverageError("invalid evidence input binding")
+        path=Path(binding["path"])
+        if not path.is_absolute():raise CoverageError("evidence input path must be absolute")
+        data=self.capture(path)
+        if sha(data)!=binding.get("sha256") or len(data)!=binding["bytes"]:
+            raise CoverageError("evidence input bytes mismatch")
+        return data
+    def recheck(self):
+        errors=[]
+        for key,entry in self.inputs.items():
+            try:
+                original=Path(key).read_bytes();retained=(self.root/entry["retained_path"]).read_bytes()
+                entry["original_after"]={"sha256":sha(original),"bytes":len(original)}
+                entry["retained"]={"sha256":sha(retained),"bytes":len(retained)}
+                entry["copied_exact"]=entry["original_before"]==entry["original_after"]==entry["retained"]
+                if not entry["copied_exact"]:raise CoverageError("input changed before finalization: "+key)
+            except BaseException as error:errors.append(error)
+        return errors
+
+
+REVIEWED_POLICY_SOURCES={
+    "quic":"295dbe88c1066312b3748373cf6205af8a7a71d0019a3aa5b03c3be149f49fe4",
+    "server":"5058595f3bc9c0e5ac7d330c6b85b39167cd7e619d714a2f9e437b2130fdeb44",
+    "adapter":"8dd22250a1720ffd7f4120cd3204057ea19d692fdd8d799a0977b60483a417da",
+}
+POLICY_CONTRACT={
+    "name":"minyar-handshake-only-v1","role":"server","testcase":"transfer",
+    "early_cid_validation":False,"retry_validation":False,"token_validation":False,
+}
+
+
+def checked_policy_receipt(args,retention):
+    """Check the graph; policy-file existence alone supplies no policy authority."""
+    if args.policy_receipt is None:raise CoverageError("checked source/build/run/captured-endpoint policy receipt absent")
+    receipt=json.loads(retention.capture(args.policy_receipt))
+    if type(receipt.get("schema_version")) is not int or receipt["schema_version"]!=1 or receipt.get("policy")!=POLICY_CONTRACT:
+        raise CoverageError("unreviewed endpoint validation policy")
+    if receipt.get("capture_origin")!=args.capture_origin:
+        raise CoverageError("policy receipt capture origin mismatch")
+    if receipt.get("evidence_kind")!="owned-official-run":
+        raise CoverageError("mocked or unknown run receipt cannot prove official endpoint policy")
+    sources=receipt.get("sources",{})
+    for role,digest in REVIEWED_POLICY_SOURCES.items():
+        if role not in sources or sha(retention.expected(sources[role]))!=digest:
+            raise CoverageError("endpoint policy source lacks exact review binding")
+    if Path(sources["quic"]["path"]).resolve()!=args.policy_source.resolve():
+        raise CoverageError("policy source path mismatch")
+    binary=retention.capture(args.policy_binary)
+    binary_binding=receipt.get("binary",{})
+    if Path(binary_binding.get("path","")).resolve()!=args.policy_binary.resolve() or retention.expected(binary_binding)!=binary:
+        raise CoverageError("policy binary bytes mismatch")
+    build=json.loads(retention.expected(receipt["build_receipt"]))
+    if build.get("schema")!=2 or type(build.get("link_status")) is not int or build["link_status"]!=0 or build.get("retention_errors")!=[]:
+        raise CoverageError("successful checked schema2 build receipt absent")
+    final=build.get("final_output",{})
+    if final.get("sha256")!=sha(binary) or final.get("bytes")!=len(binary):
+        raise CoverageError("source build output is not captured server binary")
+    retained_final=Path(receipt["build_receipt"]["path"]).parent/final.get("retained","")
+    if retention.capture(retained_final)!=binary:raise CoverageError("retained link output differs")
+    snapshot=json.loads(retention.expected(receipt["source_build_receipt"]))
+    if snapshot.get("sources")!=sources or snapshot.get("server_binary_sha256")!=sha(binary):
+        raise CoverageError("source snapshot is not bound to server build")
+    compile_record=snapshot.get("compiler_invocation",{})
+    compiler=retention.expected(compile_record.get("compiler",{}))
+    if sha(compiler)!="df167d371354ccd151801156d803b15d77ade81e973a29f22cd5b39c9c732a7d" or compile_record.get("status")!=0:
+        raise CoverageError("reviewed successful Minyar compiler invocation absent")
+    if sources["server"]["path"] not in compile_record.get("argv",[]) or snapshot.get("raw_program_sha256")!=build.get("raw_sha256"):
+        raise CoverageError("server source is not bound to actual program LLVM")
+    for field in ("raw_program_input","program_input"):
+        value=build.get(field,{})
+        data=retention.capture(Path(receipt["build_receipt"]["path"]).parent/value.get("retained",""))
+        if any(value.get(name)!=sha(data) for name in ("sha256","source_before_sha256","retained_sha256","source_after_sha256","pre_link_sha256","post_link_sha256")) or value.get("bytes")!=len(data):
+            raise CoverageError("actual generated program input not checked")
+    run=json.loads(retention.expected(receipt["run_receipt"]))
+    inspect=json.loads(retention.expected(run["endpoint_inspect"]))
+    if not isinstance(inspect,list) or len(inspect)!=1:raise CoverageError("exact single captured endpoint inspect absent")
+    endpoint=inspect[0];container=run.get("container_id")
+    labels=endpoint.get("Config",{}).get("Labels",{})
+    if endpoint.get("Id")!=container or len(container or "")!=64 or endpoint.get("Image")!=run.get("image_id"):
+        raise CoverageError("actual endpoint/image identity mismatch")
+    if labels.get("com.docker.compose.project")!=run.get("project") or labels.get("com.docker.compose.service")!="server":
+        raise CoverageError("captured endpoint ownership mismatch")
+    environment={}
+    for item in endpoint.get("Config",{}).get("Env",[]):
+        key,separator,value=item.partition("=")
+        if separator and key in ("ROLE","TESTCASE"):
+            if key in environment:raise CoverageError("ambiguous endpoint mode")
+            environment[key]=value
+    if environment!={"ROLE":"server","TESTCASE":"transfer"}:
+        raise CoverageError("captured endpoint mode mismatch")
+    for role,expected in (("server",sha(binary)),("adapter",REVIEWED_POLICY_SOURCES["adapter"])):
+        if sha(retention.expected(run.get("image_contents",{}).get(role,{})))!=expected:
+            raise CoverageError("actual image endpoint bytes differ from build/source")
+    capture_binding=run.get("capture",{})
+    if retention.expected(capture_binding)!=retention.capture(args.capture) or Path(capture_binding["path"]).resolve()!=args.capture.resolve():
+        raise CoverageError("run receipt is not bound to selected capture")
+    if run.get("server_addresses")!=args.server_address or run.get("server_port")!=args.server_port:
+        raise CoverageError("captured endpoint tuple mismatch")
+    keylogs=run.get("keylogs",[])
+    if len(keylogs)!=len(args.keylog):raise CoverageError("captured keylog bindings missing")
+    for binding,path in zip(keylogs,args.keylog):
+        if Path(binding["path"]).resolve()!=path.resolve() or retention.expected(binding)!=retention.capture(path):
+            raise CoverageError("captured endpoint keylog bytes mismatch")
+    return {"status":"checked-bound-receipt","policy":POLICY_CONTRACT,
+            "receipt_sha256":sha(retention.capture(args.policy_receipt)),
+            "container_id":container,"image_id":run["image_id"]}
+
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument("--capture",required=True,type=Path)
@@ -449,33 +586,58 @@ def main():
     parser.add_argument("--server-address",required=True,action="append")
     parser.add_argument("--server-port",type=int,default=443)
     parser.add_argument("--policy",required=True,choices=("handshake-only","peer-unknown"))
-    parser.add_argument("--policy-source",type=Path)
-    parser.add_argument("--policy-binary",type=Path)
+    parser.add_argument("--policy-source",type=Path);parser.add_argument("--policy-binary",type=Path)
+    parser.add_argument("--policy-receipt",type=Path)
     parser.add_argument("--artifacts",required=True,type=Path)
     args=parser.parse_args()
     if not args.artifacts.is_absolute() or args.artifacts.exists():
         raise ValueError("--artifacts requires a fresh absolute path")
-    if args.policy=="handshake-only" and (args.policy_source is None or args.policy_binary is None):
-        raise ValueError("handshake-only requires exact source and binary policy inputs")
     args.artifacts.mkdir(parents=True)
-    inputs=[Path(__file__),args.capture,*args.keylog]+[p for p in (args.policy_source,args.policy_binary) if p is not None]
-    bindings={};snapshots={}
-    for index,path in enumerate(inputs):
-        data=path.read_bytes();retained=args.artifacts/("input-"+str(index).zfill(3)+".bin")
-        retained.write_bytes(data);snapshots[path]=data
-        bindings[str(path.resolve())]={"sha256":sha(data),"bytes":len(data),
-                                      "retained_path":retained.relative_to(args.artifacts).as_posix()}
+    retention=InputRetention(args.artifacts)
+    report={"schema_version":1,"scope":"capture evidence or synthetic control; endpoint policy requires checked receipt",
+            "status":"coverage-limited","inputs":retention.inputs,"capture_origin":args.capture_origin,
+            "server_addresses":args.server_address,"server_port":args.server_port,
+            "primary_exception":None,"evidence_errors":[],"finalization_errors":[]}
+    primary=None
+    def failed(error,stage):
+        nonlocal primary
+        if primary is None:
+            primary=error;report["primary_exception"]={"type":type(error).__name__,"message":str(error),"stage":stage}
+        else:
+            if hasattr(primary,"add_note"):primary.add_note(stage+": "+str(error))
+        target="finalization_errors" if stage=="finalization" else "evidence_errors"
+        report[target].append({"type":type(error).__name__,"message":str(error),"stage":stage})
+        report["status"]="coverage-limited"
+    provider_before=None
     try:
-        report=analyze(snapshots[args.capture],[snapshots[path] for path in args.keylog],
+        for path in [Path(__file__),args.capture,*args.keylog]+[p for p in (args.policy_source,args.policy_binary,args.policy_receipt) if p is not None]:
+            retention.capture(path)
+        provider_before=crypto_provider();report["crypto_provider"]=provider_before
+        for path,binding in provider_before["inputs"].items():
+            retention.expected({"path":path,**binding})
+        if args.policy=="handshake-only":
+            if args.policy_source is None or args.policy_binary is None:raise CoverageError("exact policy source/binary binding absent")
+            report["policy_evidence"]=checked_policy_receipt(args,retention)
+        result=analyze(retention.capture(args.capture),[retention.capture(path) for path in args.keylog],
                        args.server_address,args.server_port,args.policy)
-    except (CoverageError,ValueError) as error:
-        report={"schema_version":1,"status":"coverage-limited","exception":type(error).__name__,"reason":str(error)}
-    report["inputs"]=bindings
-    report["crypto_provider"]=crypto_provider()
-    report["policy_bindings"]={role:str(path.resolve()) for role,path in (("source",args.policy_source),("binary",args.policy_binary)) if path is not None}
-    report["capture_origin"]=args.capture_origin
-    report["server_addresses"]=args.server_address;report["server_port"]=args.server_port
-    (args.artifacts/"ledger.json").write_text(json.dumps(report,indent=2)+"\n")
+        report.update(result)
+        report["scope"]="checked official endpoint trace" if args.capture_origin=="official-server-trace" and args.policy=="handshake-only" else "synthetic control or unknown-peer-policy capture; no Minyar endpoint-policy claim"
+    except BaseException as error:failed(error,"setup-or-analysis")
+    if provider_before is not None:
+        try:
+            provider_after=crypto_provider();report["crypto_provider_after"]=provider_after
+            if provider_after!=provider_before:raise CoverageError("loaded crypto provider bytes changed")
+        except BaseException as error:failed(error,"provider-after")
+    for error in retention.recheck():failed(error,"input-after")
+    for attempt in range(2):
+        try:
+            data=(json.dumps(report,indent=2)+"\n").encode()
+            temporary=args.artifacts/"ledger.json.tmp";temporary.write_bytes(data)
+            if temporary.read_bytes()!=data:raise CoverageError("durable ledger bytes mismatch")
+            temporary.replace(args.artifacts/"ledger.json")
+            if (args.artifacts/"ledger.json").read_bytes()!=data:raise CoverageError("final ledger bytes mismatch")
+            break
+        except BaseException as error:failed(error,"finalization")
     print(json.dumps({k:v for k,v in report.items() if k!="rows"},indent=2))
     return 0 if report["status"]=="passed" else 1 if report["status"]=="failed" else 2
 if __name__=="__main__":raise SystemExit(main())

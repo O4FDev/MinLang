@@ -19,7 +19,8 @@ CASES=("exact3x","one-byte-over","forged-handshake","invalid-handshake-frame","c
        "ipv6","aes256-handshake","chacha-handshake","rfc-chacha-vector","peer-policy-unknown",
        "server-before-credit","missing-authenticated-boundary","closing-handshake","ack-never-sent","ack-issued-handshake","missing-server-keylog","pcapng-capture-loss","pcapng-dropcount","pcapng-multiple-interface","handshake-replay-same-route","handshake-replay-new-route",
        "fresh-handshake-new-route","nonminimal-frame-type","crypto-end-overflow","crypto-wide-length","pcap-time-decrease","pcapng-time-decrease",
-       "pcap-nanoseconds","pcapng-decimal-resolution","pcapng-binary-resolution","pcapng-time-offset","pcap-invalid-subsecond")
+       "pcap-nanoseconds","pcapng-decimal-resolution","pcapng-binary-resolution","pcapng-time-offset","pcap-invalid-subsecond","cli-unbound-policy","cli-retained-input-binding","cli-retained-mutation","cli-original-mutation",
+       "cli-missing-input","cli-provider-error","cli-primary-finalization-error","initial-token-policy-unknown")
 CLIENT=b"client01";SERVER=b"server01";ORIGINAL=b"original"
 SECRET=bytes(range(32));RANDOM=bytes(range(32,64))
 CLIENT2=b"client02";SERVER2=b"server02"
@@ -32,11 +33,11 @@ def number(value):
     raise ValueError("fixture varint out of range")
 
 
-def initial(size=1200,client=CLIENT,server=SERVER,direction="client",kind=0):
+def initial(size=1200,client=CLIENT,server=SERVER,direction="client",kind=0,token=b""):
     destination=ORIGINAL if direction=="client" and kind==0 else server if direction=="client" else client
     source=client if direction=="client" else server
     header=bytes([0xc1|(kind<<4)])+bytes([0,0,0,1,len(destination)])+destination+bytes([len(source)])+source
-    if kind==0:header+=b"\0"
+    if kind==0:header+=number(len(token))+token
     width=1 if size-len(header)-1<64 else 2
     length=size-len(header)-width
     return header+number(length)+bytes(length)
@@ -119,7 +120,8 @@ def fixtures(case):
     sequence=[("client",initial(),12345),("server",initial(direction="server"),12345),
               ("server",short(1200),12345),("server",short(1200),12345),("client",hs,12345),
               ("server",short(5000),12345)]
-    if case=="one-byte-over":sequence[3]=("server",short(1201),12345);expected="failed"
+    if case=="initial-token-policy-unknown":sequence[0]=("client",initial(token=b"opaque token"),12345);expected="coverage-limited"
+    elif case=="one-byte-over":sequence[3]=("server",short(1201),12345);expected="failed"
     elif case in ("forged-handshake","invalid-handshake-frame","closing-handshake","ack-never-sent"):
         bad=hs[:-1]+bytes([hs[-1]^1]) if case=="forged-handshake" else handshake(payload=b"\x1c\0\0\0" if case=="closing-handshake" else b"\x02\x01\0\0\0" if case=="ack-never-sent" else b"\x08\0\0\0")
         sequence=sequence[:4]+[("client",bad,12345),("server",short(3*len(bad)+1),12345)]
@@ -192,7 +194,8 @@ def fixtures(case):
     return data,logs,connection_count,policy,expected
 
 
-def run_case(case):
+def run_case(case,target=None):
+    if case.startswith("cli-"):return cli_control(case,target)
     if case=="rfc-chacha-vector":
         secret=bytes.fromhex("9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b")
         hp=ledger.expand(secret,b"quic hp",32,hashlib.sha256)
@@ -239,6 +242,33 @@ def run_case(case):
     return data,logs,report,expected
 
 
+def cli_control(case,target):
+    import subprocess,sys
+    if target is None:raise ValueError("CLI controls require retained case workspace")
+    data,logs,_,_,_=fixtures("exact3x")
+    (target/"trace.pcap").write_bytes(data);(target/"client.keys").write_bytes(logs)
+    (target/"unreviewed.source").write_bytes(b"arbitrary policy text");(target/"unreviewed.binary").write_bytes(b"arbitrary binary")
+    program='import importlib.util,json,sys\nfrom pathlib import Path\nclass OriginalProviderFailure(RuntimeError):pass\nclass RetentionFailure(RuntimeError):pass\nspec=importlib.util.spec_from_file_location("checked_ledger",sys.argv[1])\nmodule=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)\ncase=sys.argv[2];root=Path(sys.argv[3]);real_write=Path.write_bytes\ninjected=[False]\ndef write(path,data):\n    result=real_write(path,data)\n    if case=="cli-retained-mutation" and path.name=="input-001.bin":real_write(path,data+b"x")\n    if case=="cli-original-mutation" and path.name=="input-001.bin":real_write(root/"trace.pcap",(root/"trace.pcap").read_bytes()+b"x")\n    if case=="cli-primary-finalization-error" and path.name.startswith("ledger") and not injected[0]:\n        injected[0]=True;raise RetentionFailure("secondary finalization failure")\n    return result\nPath.write_bytes=write\nif case in ("cli-provider-error","cli-primary-finalization-error"):\n    def provider():raise OriginalProviderFailure("original provider failure")\n    module.crypto_provider=provider\ncapture=root/("missing.pcap" if case=="cli-missing-input" else "trace.pcap")\nargs=[str(sys.argv[1]),"--capture",str(capture),"--capture-origin","official-server-trace","--keylog",str(root/"client.keys"),"--server-address","193.167.100.100","--policy","handshake-only" if case=="cli-unbound-policy" else "peer-unknown","--artifacts",str(root/"checker")]\nif case=="cli-unbound-policy":args+=["--policy-source",str(root/"unreviewed.source"),"--policy-binary",str(root/"unreviewed.binary")]\nsys.argv=args\nraise SystemExit(module.main())\n'
+    child=target/"child.py";child.write_text(program)
+    argv=[sys.executable,str(child),str(Path(ledger.__file__).resolve()),case,str(target)]
+    process=subprocess.run(argv,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=10)
+    (target/"child.stdout").write_bytes(process.stdout);(target/"child.stderr").write_bytes(process.stderr)
+    command={"argv":argv,"status":process.returncode,"timeout_seconds":10,
+             "stdout":{"path":"child.stdout","sha256":ledger.sha(process.stdout),"bytes":len(process.stdout)},
+             "stderr":{"path":"child.stderr","sha256":ledger.sha(process.stderr),"bytes":len(process.stderr)}}
+    (target/"command.json").write_text(json.dumps(command,indent=2)+"\n")
+    expected="passed" if case=="cli-retained-input-binding" else "coverage-limited"
+    result_path=target/"checker/ledger.json"
+    report=json.loads(result_path.read_text()) if result_path.exists() else {"status":"missing-durable-ledger"}
+    report["control_checks"]={"exact_exit_status":process.returncode==(0 if expected=="passed" else 2)}
+    if case=="cli-retained-input-binding":
+        report["control_checks"]["checked_before_copy_after"]=bool(report.get("inputs")) and all(
+            value.get("original_before")==value.get("retained")==value.get("original_after") and value.get("copied_exact") is True for value in report["inputs"].values())
+    elif case in ("cli-provider-error","cli-primary-finalization-error"):
+        report["control_checks"]["primary_error_preserved"]=report.get("primary_exception",{}).get("type")=="OriginalProviderFailure"
+        if case=="cli-primary-finalization-error":report["control_checks"]["secondary_error_retained"]=bool(report.get("finalization_errors"))
+    return data,logs,report,expected
+
 def main():
     parser=argparse.ArgumentParser();parser.add_argument("--artifacts",type=Path);parser.add_argument("--case",action="append",choices=CASES);args=parser.parse_args()
     cases=args.case or CASES
@@ -250,7 +280,7 @@ def main():
         root=Path(directory);results=[]
         for case in cases:
             target=root/case;target.mkdir()
-            data,logs,report,expected=run_case(case)
+            data,logs,report,expected=run_case(case,target)
             (target/"trace.pcap").write_bytes(data);(target/"client.keys").write_bytes(logs)
             (target/"ledger.json").write_text(json.dumps(report,indent=2)+"\n")
             results.append({"case":case,"status":report["status"],"expected":expected,"matched":report["status"]==expected and all(report.get("control_checks",{}).values())})
