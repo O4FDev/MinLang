@@ -98,6 +98,10 @@ def controls():
         extra.write_text('pass\n')
         reject(data)  # Actual newly created source, not a simulated set mutation.
         extra.unlink()
+        lifecycle = root / 'tests/quic-protocol-artifacts.py'
+        lifecycle.write_text('pass\n')
+        reject(data)
+        lifecycle.unlink()
         # ABI Minyar cases cannot disappear behind the ordinary fixture policy.
         managed = root / 'tests/parallel-signatures/new-managed.min'
         managed.parent.mkdir()

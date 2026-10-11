@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -23,7 +24,7 @@ from test_evidence import Evidence
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 from host_paths import host_path
-from sanitizer_llvm import instrument_address_sanitizer
+from sanitizer_llvm import address_sanitizer_enabled, instrument_address_sanitizer
 
 BINARIES = {
     'migration': 'tests/quic-migration-cids.min',
@@ -165,6 +166,147 @@ def requested_flags(optimization, sanitize):
     return flags
 
 
+def effective_optimization(arguments):
+    value = None
+    for argument in arguments:
+        if re.fullmatch(r'-O(?:[0-9]+|s|z|g|fast)?', argument):
+            value = argument[2:] or '1'
+    return value
+
+
+def verify_server_shutdown_state(row):
+    # This checks prior health/ownership consistency; the lifecycle proof below
+    # must separately establish the final status of an intentional termination.
+    require(isinstance(row, dict) and 'status_before_shutdown' in row
+            and 'owned_termination_requested' in row and exact_integer(row.get('status')),
+            'endpoint shutdown observation missing')
+    prior = row['status_before_shutdown']
+    requested = row['owned_termination_requested']
+    require((prior is None or (exact_integer(prior) and prior == 0))
+            and type(requested) is bool and requested is (prior is None),
+            'endpoint exited unexpectedly or shutdown ownership is inconsistent')
+    if prior is not None:
+        require(row['status'] == 0, 'endpoint status changed after its normal exit')
+
+
+def verify_server_lifecycle(row, raw_file):
+    verify_server_shutdown_state(row)
+    require(exact_integer(row.get('pid'), minimum=1), 'endpoint owned process identity missing')
+    lifecycle = row.get('lifecycle')
+    require(isinstance(lifecycle, dict)
+            and all(lifecycle.get(name) is True for name in
+                    ('healthy_before_shutdown', 'cleanup_complete', 'passed'))
+            and lifecycle.get('cleanup_errors') == []
+            and type(lifecycle.get('escalated')) is bool
+            and exact_integer(lifecycle.get('expected_final_status'))
+            and lifecycle['expected_final_status'] == row['status'],
+            'endpoint lifecycle did not prove healthy complete cleanup')
+    strategy, receipt = lifecycle.get('termination_strategy'), lifecycle.get('receipt')
+    require(isinstance(receipt, dict), 'endpoint termination receipt missing')
+    if row['status_before_shutdown'] == 0:
+        require(strategy == 'already-exited' and lifecycle['expected_final_status'] == 0
+                and lifecycle['escalated'] is False and receipt == {},
+                'normal endpoint exit acquired an inconsistent termination receipt')
+        return []
+    require(strategy != 'already-exited', 'running endpoint lacks owned termination')
+    pid = row['pid']
+
+    def posix_action(action, signum, timed_out):
+        require(isinstance(action, dict)
+                and exact_integer(action.get('pid')) and action['pid'] == pid
+                and exact_integer(action.get('pgid')) and action['pgid'] == pid
+                and action.get('attempted') is True
+                and exact_integer(action.get('signal')) and action['signal'] == signum
+                and exact_integer(action.get('grace_seconds')) and action['grace_seconds'] == 5
+                and action.get('wait_timed_out') is timed_out
+                and action.get('result') == 'sent', 'unproved owned POSIX termination action')
+
+    if strategy in ('posix-sigterm', 'posix-sigkill-after-grace'):
+        require(not windows_host(), 'POSIX termination cannot certify a Windows endpoint')
+        escalated = strategy == 'posix-sigkill-after-grace'
+        require(lifecycle['escalated'] is escalated
+                and lifecycle['expected_final_status'] == (-9 if escalated else -15),
+                'POSIX final status differs from its exact termination action')
+        posix_action(receipt, 9 if escalated else 15, False)
+        if escalated:
+            previous = receipt.get('previous')
+            posix_action(previous, 15, True)
+            require('previous' not in previous, 'ambiguous POSIX escalation chain')
+        else:
+            require('previous' not in receipt, 'unexplained POSIX prior termination action')
+        return []
+    require(strategy == 'windows-taskkill-tree' and windows_host()
+            and lifecycle['escalated'] is False and lifecycle['expected_final_status'] == 1,
+            'unsupported or unproved native termination strategy')
+    native_pid = receipt.get('native_pid')
+    python_os_name = receipt.get('python_os_name')
+    require(exact_integer(receipt.get('pid')) and receipt['pid'] == pid
+            and exact_integer(native_pid, minimum=1)
+            and python_os_name in ('nt', 'posix')
+            and receipt.get('pid_source') == ('popen' if python_os_name == 'nt' else 'proc-winpid')
+            and (python_os_name != 'nt' or native_pid == pid)
+            and receipt.get('argv') == ['taskkill.exe', '-F', '-T', '-PID', str(native_pid)]
+            and exact_integer(receipt.get('timeout_seconds')) and receipt['timeout_seconds'] == 10
+            and receipt.get('attempted') is True
+            and exact_integer(receipt.get('status')) and receipt['status'] == 0
+            and receipt.get('wait_timed_out', False) is False
+            and 'previous' not in receipt, 'native termination ownership/action receipt differs')
+    # This exact final-status prediction is fail-closed. Platform coverage still
+    # requires native execution; taskkill success alone is not a target verdict.
+    return [raw_file(receipt, stream) for stream in ('stdout', 'stderr')]
+
+
+def verify_case_invocation(kind, case, command, endpoint, roles, directory, binaries):
+    workspace = directory / 'fixtures'
+    def fixture(name):
+        relative = 'fixtures/' + name
+        require(relative in roles['certificates'], 'invocation certificate fixture omitted')
+        return str(retained_path(directory, relative))
+    if kind in ('migration', 'cipher'):
+        expected = [str(binaries[kind].resolve()), *[
+            fixture(name) for name in ('root.der', 'server.der', 'server.pk8',
+                                       'client.der', 'client.pk8')], case]
+        require(command == expected and endpoint is None,
+                'case label differs from complete migration/cipher argv')
+        return
+    if kind == 'local':
+        mapping = {'multiplex1999': 'transfer', 'multiconnect50': 'multiconnect',
+                   'ipv6': 'transfer', 'preferred': 'connectionmigration',
+                   'resumption40': 'resumption', 'zerortt40': 'zerortt',
+                   'keyupdate': 'keyupdate', 'chacha20': 'chacha20'}
+        require(case in mapping, 'unknown local endpoint case')
+        testcase = mapping[case]
+        count = 1999 if case == 'multiplex1999' else (
+            50 if case == 'multiconnect50' else 40 if case in ('resumption40', 'zerortt40') else 1)
+        names = ['file' + str(index) for index in range(count)]
+        expected = [str(binaries['client'].resolve()), fixture('root.der'),
+                    '::1' if case == 'ipv6' else '127.0.0.1', '44300',
+                    str(workspace / (case + '-client.keys')),
+                    str(workspace / (case + '-downloads')), testcase, *names]
+        expected_server = [str(binaries['server'].resolve()), fixture('server.pk8'),
+            fixture('root.der'), str(workspace / (case + '-server.keys')),
+            str(workspace / (case + '-www')), testcase, fixture('server.der'), '--port=44300']
+        if case == 'preferred':
+            expected_server += ['--preferred-ipv4=7f000001', '--preferred-port=44301']
+        require(command == expected and endpoint == expected_server,
+                'local testcase/client-server/fixture argv binding mismatch')
+        require(roles['payloads'] == ['fixtures/' + case + '-www/' + name for name in sorted(names)]
+                and roles['downloads'] == ['fixtures/' + case + '-downloads/' + name for name in sorted(names)]
+                and roles['keylogs'] == sorted(['fixtures/' + case + '-client.keys',
+                                               'fixtures/' + case + '-server.keys']),
+                'local payload/download/keylog case mapping mismatch')
+        return
+    require(kind == 'vn' and case == 'reserved-version', 'unknown version-negotiation case')
+    expected_server = [str(binaries['server'].resolve()), fixture('server.pk8'),
+        fixture('root.der'), str(workspace / 'keys'), str(workspace / 'www'),
+        'transfer', fixture('server.der'), '--port=44300']
+    require(command is None and endpoint == expected_server,
+            'version-negotiation server/fixture argv binding mismatch')
+    require(roles['packets'] == ['fixtures/request.bin', 'fixtures/response.bin']
+            and roles['keylogs'] in ([], ['fixtures/keys']),
+            'version-negotiation packet/keylog case mapping mismatch')
+
+
 def verify_link(directory, binary, sanitize, optimization='0', compiler_identity=None):
     report = json.loads((directory / 'manifest.json').read_text())
     require(exact_integer(report.get('schema')) and report['schema'] == 2,
@@ -209,6 +351,10 @@ def verify_link(directory, binary, sanitize, optimization='0', compiler_identity
     require(command[0] == report.get('compiler_selected_command')
             and command[1:1+len(report['link_flags'])] == report['link_flags'],
             'selected compiler or link flags changed')
+    require(effective_optimization(actual[1:-2]) == optimization
+            and address_sanitizer_enabled(actual[1:-2]) is sanitize
+            and not any(value.startswith('@') for value in actual[1:-2]),
+            'actual argv overrides requested optimization or sanitizer mode')
     ir_inputs = [value for value in command[1:] if value.endswith(('.ll', '.bc'))]
     require(ir_inputs == [linked_original], 'extra or missing program/runtime LLVM input')
     inputs = report.get('inputs')
@@ -283,6 +429,7 @@ def snapshot_inputs():
     paths += [Path(__file__), ROOT / 'tests/quic-rfc-harness.py',
               ROOT / 'tests/tls-local.py', ROOT / 'tests/test_evidence.py',
               ROOT / 'tests/clang_helpers.py', ROOT / 'tests/quic_protocol_artifacts.py',
+              ROOT / 'tests/quic-protocol-artifacts.py',
               ROOT / 'tests/interop/qns/endpoint.py']
     require(all(not path.is_symlink() for path in paths), 'symlink source snapshot input')
     return {path.relative_to(ROOT).as_posix(): digest(path) for path in sorted(set(paths))}
@@ -394,9 +541,7 @@ def verify_driver_artifacts(directory, kind, parsed, cases, binaries, source_inp
         require(normalized_text(first) == 'QNS server ready\n'
                 and row.get('ready_line_sha256') == hashlib.sha256(first).hexdigest(),
                 'exact endpoint readiness marker changed')
-        require(row.get('status_before_shutdown') is None or
-                exact_integer(row.get('status_before_shutdown')),
-                'endpoint prior shutdown status is not exact integer')
+        verify_server_lifecycle(row, raw_file)
     rows = manifest.get('case_inventory')
     require(isinstance(rows, list) and all(isinstance(row, dict) for row in rows)
             and [row.get('case') for row in rows] == cases
@@ -438,16 +583,21 @@ def verify_driver_artifacts(directory, kind, parsed, cases, binaries, source_inp
         require(host_path(row.get('fixture_workspace', '')).resolve() ==
                 host_path(manifest.get('workspace', '')).resolve(),
                 'per-case fixture workspace mismatch')
+        def observation_raw(observation, endpoint=False):
+            raw = [raw_file(observation, stream) for stream in ('stdout', 'stderr')]
+            if endpoint:
+                raw += verify_server_lifecycle(observation, raw_file)
+            return raw
         for index in ci:
-            require(all(raw_file(commands[index], stream) in files for stream in ('stdout', 'stderr')),
+            require(all(name in files for name in observation_raw(commands[index])),
                     'per-case raw command files missing')
         for index in ei:
-            require(all(raw_file(endpoints[index], stream) in files for stream in ('stdout', 'stderr')),
-                    'per-case raw endpoint files missing')
-        expected_raw = sorted(set(raw_file(observation, stream)
-            for observation in [commands[index] for index in ci] +
-                               [endpoints[index] for index in ei]
-            for stream in ('stdout', 'stderr')))
+            require(all(name in files for name in observation_raw(endpoints[index], True)),
+                    'per-case raw endpoint/termination files missing')
+        expected_raw = sorted(set(name
+            for observation, endpoint in [(commands[index], False) for index in ci] +
+                                         [(endpoints[index], True) for index in ei]
+            for name in observation_raw(observation, endpoint)))
         require(roles['raw_output'] == expected_raw, 'raw per-case role inventory mismatch')
         result_row = next((result for result in parsed.get('results', [])
                            if result.get('case') == case), None)
@@ -476,6 +626,10 @@ def verify_driver_artifacts(directory, kind, parsed, cases, binaries, source_inp
                     and result_row['server_stderr'] ==
                         normalized_text(host_path(observation['stderr_path']).read_bytes()),
                     'printed server result differs from retained raw bytes')
+        case_command = commands[next(iter(own_commands))]['command'] if own_commands else None
+        require(len(own_endpoints) <= 1, 'ambiguous per-case server invocation')
+        case_endpoint = endpoints[next(iter(own_endpoints))]['argv'] if own_endpoints else None
+        verify_case_invocation(kind, case, case_command, case_endpoint, roles, directory, binaries)
         referenced_commands.update(ci)
         referenced_endpoints.update(ei)
     require(referenced_commands == set(range(len(commands)))

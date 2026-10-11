@@ -356,7 +356,7 @@ class QuicRfcHarness(unittest.TestCase):
             project=Path(folder)
             names={'minyar','Makefile','tests/quic-rfc.py','tests/quic-rfc-harness.py',
                    'tests/tls-local.py','tests/test_evidence.py','tests/clang_helpers.py',
-                   'tests/quic_protocol_artifacts.py','tests/interop/qns/endpoint.py',
+                   'tests/quic_protocol_artifacts.py','tests/quic-protocol-artifacts.py','tests/interop/qns/endpoint.py',
                    'compiler/managed-graphs-adapter.patch','scripts/build-closure-compiler.py',
                    'compiler/build-errors-compiler.py','vendor/monocypher/LICENCE.md',
                    'vendor/monocypher/NOTICE','runtime/native/abi.h'}
