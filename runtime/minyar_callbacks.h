@@ -50,9 +50,11 @@ bool minyar_callbackruntime_service(void) {
  * transient owner drops. Draining every such new request before sleeping
  * lets an otherwise idle dispatcher perpetually restart collection.
  *
- * Finish old captured work, then yield for at most 10ms if the only debt
- * is newly requested cycle work. Keep that job queued, and cap infinite
+ * Pace every cycle-only batch with a wait of at most 10ms, including an
+ * unfinished captured cohort. Waiting only at cohort completion makes
+ * idle CPU grow with the live graph. Keep the job queued, and cap infinite
  * waits too: a true last-owner drop still receives another cleanup batch.
+ * Ordinary object/frame/chunk debt remains immediately runnable.
  * Each call performs exactly the existing profile's service budget. */
 long long minyar_callbackruntime_serviceWait(long long timeout_ms) {
     if (timeout_ms < -1 || timeout_ms > 2147483647LL)
@@ -60,13 +62,10 @@ long long minyar_callbackruntime_serviceWait(long long timeout_ms) {
 #ifdef MINYAR_COMPILER_ARENA
     return timeout_ms;
 #else
-    static size_t completed_seen;
     bool pending = minyar_callbackruntime_service();
-    unsigned completed = rc_cycle_completed != completed_seen;
-    completed_seen = rc_cycle_completed;
     if (!pending)
         return timeout_ms;
-    if (!rc_cycle_pending || !completed)
+    if (!rc_cycle_pending)
         return 0;
 #ifdef MINYAR_BOUNDED_RC
     if (rc_pending_count != 1)

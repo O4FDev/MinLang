@@ -67,7 +67,8 @@ def main():
                     report['cases'].append(case)
                     if result.returncode:
                         raise AssertionError(f'{label} {phase}: {result.returncode}\n{result.stdout}{result.stderr}')
-                print(label + ': ' + result.stdout.strip(), flush=True)
+                    if phase.startswith('run'):
+                        print(label + ' ' + phase + ': ' + result.stdout.strip(), flush=True)
         report['passed'] = True
     finally:
         (output / 'manifest.json').write_text(json.dumps(report, indent=2) + '\n')
