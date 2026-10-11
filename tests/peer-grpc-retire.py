@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Independent envelopes verify checked closure notifications and drain-before-retire."""
 import argparse
+from clang_helpers import launcher_command
 import importlib.util
 import os
 from pathlib import Path
@@ -17,7 +18,7 @@ def main():
         for name in ('MINYAR_CLANG_FLAGS','MINYAR_NATIVE_FLAGS','MINYAR_RUNTIME_FLAGS'): env[name]='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wno-override-module'
         env['ASAN_OPTIONS']='detect_leaks=1'; env['UBSAN_OPTIONS']='halt_on_error=1'
     with tempfile.TemporaryDirectory(prefix='minyar-grpc-retire-') as folder:
-        folder=Path(folder); binary=folder/'probe'; subprocess.run([str(ROOT/'minyar'),str(ROOT/'tests/peer-grpc-retire.min'),'-o',str(binary)],env=env,check=True,timeout=240)
+        folder=Path(folder); binary=folder/'probe'; subprocess.run([*launcher_command(ROOT),str(ROOT/'tests/peer-grpc-retire.min'),'-o',str(binary)],env=env,check=True,timeout=240)
         initial=folder/'initial'; reset=folder/'reset'; output=folder/'output'; reset.write_bytes(b'\0\0\4\3\0'+struct.pack('>II',1,8))
         for mode in ('normal','early','deadline','cancel','trap'):
             client=peer.client('500m' if mode=='deadline' else None); client.send_data(1,peer.envelope(peer.opened()),end_stream=mode=='normal'); initial.write_bytes(client.data_to_send())

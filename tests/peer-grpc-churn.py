@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """2048 RPCs plus cancellation on one actual independent grpcio HTTP/2 connection."""
 import argparse
+from clang_helpers import launcher_command
 import importlib.util
 import os
 from pathlib import Path
@@ -18,7 +19,7 @@ def main():
         for name in ('MINYAR_CLANG_FLAGS','MINYAR_NATIVE_FLAGS','MINYAR_RUNTIME_FLAGS'): env[name]='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wno-override-module'
         env['ASAN_OPTIONS']='detect_leaks=1'; env['UBSAN_OPTIONS']='halt_on_error=1'
     with tempfile.TemporaryDirectory(prefix='minyar-grpc-churn-') as folder:
-        binary=Path(folder)/'serve'; subprocess.run([str(ROOT/'minyar'),str(ROOT/'tests/peer-grpc-churn-serve.min'),'-o',str(binary)],env=env,check=True,timeout=240)
+        binary=Path(folder)/'serve'; subprocess.run([*launcher_command(ROOT),str(ROOT/'tests/peer-grpc-churn-serve.min'),'-o',str(binary)],env=env,check=True,timeout=240)
         process=subprocess.Popen([str(binary)],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
         try:
             line=process.stdout.readline().strip(); assert line.isdecimal(),line

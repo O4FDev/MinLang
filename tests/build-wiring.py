@@ -2,6 +2,7 @@
 """Probe actual Make prerequisites under POSIX and native Windows host names."""
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -84,6 +85,84 @@ class BuildWiring(unittest.TestCase):
                         self.assertEqual(
                             'build/minyar-module-build' in artifacts,
                             needs_driver)
+
+
+    def test_grpc_gates_verify_external_peers_and_bound_default_builds(self):
+        with tempfile.TemporaryDirectory(prefix='minyar grpc wiring ') as folder:
+            work = Path(folder)
+            for name in ('tests/interop/peergrpc/requirements.txt',
+                         'scripts/check-peer-python.py'):
+                path = work / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('')
+            makefile = work / 'probe.mk'
+            makefile.write_text(
+                'include ' + str(ROOT / 'build-support/peer-grpc.mk').replace(' ', '\\ ') + '\n'
+                '.PHONY: build/minyarc\n'
+                'build/minyarc:\n\t@echo ARTIFACT $@\n')
+            for selected in ('build/peergrpc-venv/bin/python', 'preinstalled-python',
+                             'preinstalled Python'):
+                for gate in ('check-http2', 'check-peer-grpc', 'check-peer-grpc-sanitize',
+                             'check-http2-churn', 'check-peer-grpc-churn',
+                             'check-peer-grpc-retire'):
+                    with self.subTest(selected=selected, gate=gate):
+                        env = dict(os.environ)
+                        env.pop('MAKEFLAGS', None)
+                        result = subprocess.run(
+                            ['make', '-n', '-f', str(makefile),
+                             'PEER_GRPC_PYTHON=' + selected, gate],
+                            cwd=work, env=env, text=True, capture_output=True, timeout=10)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertIn('scripts/check-peer-python.py', result.stdout)
+                        self.assertIn('"' + selected + '" scripts/check-peer-python.py', result.stdout)
+                        self.assertIn('"' + selected + '" tests/', result.stdout)
+                        setup = selected == 'build/peergrpc-venv/bin/python'
+                        self.assertEqual('python3 -m venv' in result.stdout, setup)
+                        if setup:
+                            self.assertIn('GRPC_PYTHON_BUILD_EXT_COMPILER_JOBS=1', result.stdout)
+                            self.assertIn('CMAKE_BUILD_PARALLEL_LEVEL=1', result.stdout)
+
+
+
+    def test_successful_empty_pip_cannot_publish_peer_ready_stamp(self):
+        # Windows task termination can return zero to the MSYS parent even
+        # though wheel installation never completed. Verify actual imports
+        # before publishing the cache stamp.
+        with tempfile.TemporaryDirectory(prefix='minyar incomplete peer ') as folder:
+            work = Path(folder)
+            for name in ('tests/interop/peergrpc/requirements.txt',
+                         'scripts/check-peer-python.py'):
+                path = work / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes((ROOT / name).read_bytes())
+            mock = work / 'bin/python3'
+            mock.parent.mkdir()
+            mock.write_text(
+                '#!' + sys.executable + '\nfrom pathlib import Path\n'
+                'root=Path("build/peergrpc-venv/bin"); root.mkdir(parents=True)\n'
+                'pip=root/"pip"; pip.write_text("#!/bin/sh\\n'
+                'echo PIP_JOBS=$GRPC_PYTHON_BUILD_EXT_COMPILER_JOBS\\nexit 0\\n"); pip.chmod(0o755)\n'
+                'python=root/"python"; python.write_text(' +
+                repr('#!/bin/sh\nexec ' + shlex.quote(sys.executable) + ' "$@"\n') +
+                '); python.chmod(0o755)\n')
+            mock.chmod(0o755)
+            # No interpreter can satisfy this exact pin; the empty installer
+            # must not make that incomplete environment appear ready.
+            requirements = work / 'tests/interop/peergrpc/requirements.txt'
+            requirements.write_text(requirements.read_text().replace('h2==4.3.0', 'h2==0.0.0'))
+            makefile = work / 'probe.mk'
+            makefile.write_text(
+                'include ' + str(ROOT / 'build-support/peer-grpc.mk').replace(' ', '\\ ') + '\n')
+            env = dict(os.environ, PATH=str(mock.parent) + os.pathsep + os.environ['PATH'])
+            env.pop('MAKEFLAGS', None)
+            result = subprocess.run(
+                ['make', '-f', str(makefile), 'build/peergrpc-venv/.ready'],
+                cwd=work, env=env, text=True, capture_output=True, timeout=15)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn('PIP_JOBS=1', result.stdout)
+            self.assertIn('peer Python verification failed:', result.stderr)
+            self.assertFalse((work / 'build/peergrpc-venv/.ready').exists())
+
 
 
 if __name__ == '__main__':

@@ -1,6 +1,7 @@
 """Platform libraries for direct Clang invocations in standalone test scripts."""
 import os
 import platform
+import shutil
 import subprocess
 
 
@@ -27,3 +28,14 @@ def native_path(path):
     if platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
         return subprocess.check_output(['cygpath', '-m', str(path)], text=True).strip()
     return str(path).replace('\\', '/') if os.name == 'nt' else str(path)
+
+
+def launcher_command(root):
+    """Invoke the shell launcher explicitly under native Windows Python."""
+    command = [str(root / 'minyar')]
+    if os.name == 'nt':
+        bash = shutil.which('bash')
+        if not bash:
+            raise RuntimeError('Bash is required for the native Windows launcher')
+        command.insert(0, bash)
+    return command
