@@ -5,6 +5,13 @@
 #include <assert.h>
 #include <limits.h>
 #include <stdint.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#else
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#endif
 
 long long minyar_net_connect(const MinyarText *, long long);
 long long minyar_net_listen(const MinyarText *, long long, long long);
@@ -12,6 +19,7 @@ long long minyar_net_accept(long long);
 long long minyar_net_udp(const MinyarText *, long long);
 long long minyar_net_localPort(long long);
 bool minyar_net_nonBlocking(long long, bool);
+MinyarBytes *minyar_net_setNoDelayResult(long long, bool);
 bool minyar_net_udpConnect(long long, const MinyarText *, long long);
 bool minyar_net_ready(long long, long long);
 MinyarBytes *minyar_net_readResult(long long, long long, bool);
@@ -93,6 +101,31 @@ static void tcp_outcomes(void) {
     assert(minyar_net_ready(listener, 1000));
     long long server = minyar_net_accept(listener);
     assert(server >= 0 && minyar_net_nonBlocking(server, true));
+    /* The requested low-latency policy is observable in the actual OS
+     * socket. Invalid/UDP/stale handles report owned errors and never stop
+     * a later TCP operation. Enabling it does not change blocking policy. */
+    for (int enabled = 0; enabled < 4; enabled++) {
+        expect_status(minyar_net_setNoDelayResult(server, (enabled & 1) != 0), 0);
+        int value = -1;
+#ifdef _WIN32
+        int size = sizeof(value);
+        assert(!getsockopt((SOCKET)server, IPPROTO_TCP, TCP_NODELAY, (char *)&value, &size));
+#else
+        socklen_t size = sizeof(value);
+        assert(!getsockopt((int)server, IPPROTO_TCP, TCP_NODELAY, &value, &size));
+#endif
+        assert(value == (enabled & 1));
+    }
+    MinyarBytes *option_failure = minyar_net_setNoDelayResult(-1, true);
+    assert(word(option_failure, 0) == 3 && word(option_failure, 4));
+    long long datagram = minyar_net_udp(&host, 0);
+    assert(datagram >= 0);
+    expect_status(minyar_net_setNoDelayResult(datagram, true), 3);
+    minyar_net_close(datagram);
+    expect_status(minyar_net_setNoDelayResult((1LL << 32) + server, true), 3);
+    expect_status(minyar_net_setNoDelayResult(client, true), 0);
+    assert(word(option_failure, 0) == 3 && word(option_failure, 4));
+    minyar_rc_release(option_failure);
     expect_status(minyar_net_readResult(server, 64, false), 1);
     MinyarBytes packet = literal("hello\xff");
     expect_status(minyar_net_writeResult(client, &packet), 0);
@@ -105,6 +138,7 @@ static void tcp_outcomes(void) {
     assert(minyar_net_ready(server, 1000));
     expect_status(minyar_net_readResult(server, 64, false), 2);
     minyar_net_close(server);
+    expect_status(minyar_net_setNoDelayResult(server, true), 3);
     minyar_net_close(listener);
 }
 
