@@ -84,8 +84,10 @@ public function write(session: Session, id: Integer, data: Bytes, fin: Boolean):
     if session.state != READY || index < 0 { return errors.integerFailure(errors.make(errors.closedCode(), 0, "yamux stream is unavailable")) }
     let stream = session.streams[index]
     if stream.reset || stream.sendClosed { return errors.integerFailure(errors.make(errors.closedCode(), 0, "yamux stream is reset or send-closed")) }
+    // Reserve one reset header per live slot; other streams' data cannot
+    // prevent flow-independent cancellation. The total buffer cap is unchanged.
     let frames = max(1, (data.length + 65535) / 65536)
-    if data.length > stream.sendWindow || data.length > 1048576 || data.length + frames * 12 > 1048576 - session.outgoing.length {
+    if data.length > stream.sendWindow || data.length > 1048576 || data.length + frames * 12 > 1048576 - 128 * 12 - session.outgoing.length {
         return errors.integerFailure(errors.make(errors.wouldBlockCode(), 0, "yamux flow credit or buffer exhausted"))
     }
     let at = 0
@@ -146,7 +148,7 @@ function frame(session: Session, type: Integer, flags: Integer, id: Integer, val
     if (flags & 2) != 0 {
         if !stream.local || stream.acknowledged { failPeer(session, "unexpected yamux stream ACK"); return }; stream.acknowledged = true
     }
-    if (flags & 8) != 0 { session.buffered -= stream.incoming.length; stream.incoming = Bytes(); stream.reset = true; retire(stream); return }
+    if (flags & 8) != 0 { discardOutgoing(session,id); session.buffered -= stream.incoming.length; stream.incoming = Bytes(); stream.reset = true; retire(stream); return }
     if stream.reset { return }
     if type == 0 {
         if stream.receiveClosed || value > stream.receiveWindow || value > 1048576 - session.buffered { failPeer(session, "yamux receive window or buffer exceeded"); return }
