@@ -1,6 +1,6 @@
-// Signed executable updates. Metadata policy is Minyar; native hooks provide
-// Ed25519 and locked, durable file replacement. A launcher reads `state` and
-// starts versions/<installed digest>.bin (.exe on Windows). See docs/shipping.md.
+// Signed executable and application-bundle updates. Metadata policy is Minyar;
+// native hooks provide locked activation and checked process launch.
+// See docs/shipping.md for the protected generation and restart contracts.
 use "crypto" as crypto
 use "errors" as errors
 // Force the bounded portable backend on macOS too; its TLS verifies OS roots
@@ -12,6 +12,11 @@ function begin(root: Text): Integer { native "update" }
 function readState(handle: Integer): Bytes { native "update" }
 function storeState(handle: Integer, state: Bytes): Boolean { native "update" }
 function activate(handle: Integer, digest: Text, artifact: Bytes, state: Bytes): Boolean { native "update" }
+function activateChecked(handle: Integer, digest: Text, artifact: Bytes, receipt: Bytes, receiptHash: Text, state: Bytes): Boolean { native "update" }
+function readArtifact(handle: Integer, digest: Text): Bytes { native "update" }
+function readReceipt(handle: Integer, digest: Text, receiptHash: Text): Bytes { native "update" }
+function launchChecked(handle: Integer, digest: Text, artifact: Bytes, arguments: Bytes, replace: Boolean): Integer { native "update" }
+function waitChild(child: Integer): Integer { native "update" }
 function end(handle: Integer) { native "update" }
 function lastError(): Text { native "update" }
 public function hostTarget(): Text { native "update" }
@@ -161,9 +166,16 @@ public function inspect(metadata: Bytes, signature: Bytes, key: Bytes, app: Text
         url: fields[9]; digest: fields[10]; size: size; metadataHash: metadataHash }
 }
 
-function state(sequence: Integer, highest: Text, metadataHash: Text, installed: Text, generation: Text, now: Integer): Bytes {
-    return Bytes("MINYAR-UPDATER-STATE-1\n" + Text(sequence) + "\n" + highest + "\n" + metadataHash +
-        "\n" + installed + "\n" + generation + "\n" + Text(now) + "\n")
+function state(sequence: Integer, highest: Text, metadataHash: Text, installed: Text, generation: Text, now: Integer,
+    activeMetadata: Text, activeSequence: Integer): Bytes {
+    // A legacy generation has no signed receipt yet. Preserve its v1 journal
+    // until the exact currently installed artifact can be freshly authorized.
+    if generation != "" && activeMetadata == "" {
+        return Bytes("MINYAR-UPDATER-STATE-1\n" + Text(sequence) + "\n" + highest + "\n" + metadataHash +
+            "\n" + installed + "\n" + generation + "\n" + Text(now) + "\n")
+    }
+    return Bytes("MINYAR-UPDATER-STATE-2\n" + Text(sequence) + "\n" + highest + "\n" + metadataHash +
+        "\n" + installed + "\n" + generation + "\n" + Text(now) + "\n" + activeMetadata + "\n" + Text(activeSequence) + "\n")
 }
 
 function systemFailure(message: Text): errors.BooleanResult {
@@ -188,9 +200,12 @@ public function install(root: Text, metadata: Bytes, signature: Bytes, key: Byte
     let installed = currentVersion
     let metadataHash = ""
     let generation = ""
+    let activeMetadata = ""
+    let activeSequence = 0
     if persisted.length > 0 {
         let fields = lines(persisted)
-        if fields.length != 7 || fields[0] != "MINYAR-UPDATER-STATE-1" {
+        if !((fields.length == 7 && fields[0] == "MINYAR-UPDATER-STATE-1") ||
+             (fields.length == 9 && fields[0] == "MINYAR-UPDATER-STATE-2")) {
             end(handle); return systemFailure("local update state is corrupt")
         }
         highestSequence = natural(fields[1], 2147483647)
@@ -198,9 +213,17 @@ public function install(root: Text, metadata: Bytes, signature: Bytes, key: Byte
         metadataHash = fields[3]
         installed = fields[4]
         generation = fields[5]
-        let clock = natural(fields[6], 9223372036854775807)
+        if fields.length == 9 {
+            activeMetadata = fields[7]
+            activeSequence = natural(fields[8], 2147483647)
+            if (generation != "" && (!validDigest(activeMetadata) || activeSequence < 1 || activeSequence > highestSequence)) ||
+               (generation == "" && (activeMetadata != "" || activeSequence != 0)) {
+                end(handle); return systemFailure("local active receipt state is corrupt")
+            }
+        }
+        let clock = natural(fields[6], 9223372036854775507)
         if highestSequence < 1 || versionParts(highestVersion).length != 3 || versionParts(installed).length != 3 ||
-           !validDigest(metadataHash) || (generation != "" && !validDigest(generation)) || clock < 0 || now < clock {
+           !validDigest(metadataHash) || (generation != "" && !validDigest(generation)) || clock < 0 || now < clock || now > 9223372036854775507 {
             end(handle); return systemFailure("local update state is corrupt or the clock moved backwards")
         }
         if compareVersions(currentVersion, installed) > 0 { installed = currentVersion }
@@ -209,14 +232,19 @@ public function install(root: Text, metadata: Bytes, signature: Bytes, key: Byte
     let decision = inspect(metadata, signature, key, app, target, channel, origin, now,
         installationID, installed, highestSequence, highestVersion, metadataHash)
     if !accepted(decision) { end(handle); return errors.booleanFailure(decision.error) }
-    let observed = state(decision.sequence, decision.version, decision.metadataHash, installed, generation, now)
+    let observed = state(decision.sequence, decision.version, decision.metadataHash, installed, generation, now, activeMetadata, activeSequence)
     if !storeState(handle, observed) { let message = lastError(); end(handle); return systemFailure(message) }
-    if !decision.eligible { end(handle); return errors.boolean(false) }
+    let signedFields = lines(metadata)
+    let migrate = generation != "" && activeMetadata == "" && decision.version == installed &&
+        decision.digest == generation && cohort(app, channel, installationID) < natural(signedFields[8], 100)
+    if !decision.eligible && !migrate { end(handle); return errors.boolean(false) }
     if artifact.length != decision.size || crypto.hex(crypto.sha256(artifact)) != decision.digest {
         end(handle); return errors.booleanFailure(errors.make(errors.invalidDataCode(), 0, "artifact size or SHA256 does not match signed metadata"))
     }
-    let active = state(decision.sequence, decision.version, decision.metadataHash, decision.version, decision.digest, now)
-    if !activate(handle, decision.digest, artifact, active) { let message = lastError(); end(handle); return systemFailure(message) }
+    let active = state(decision.sequence, decision.version, decision.metadataHash, decision.version, decision.digest, now, decision.metadataHash, decision.sequence)
+    let receipt = signature.slice(0, signature.length)
+    receipt.addBytes(metadata)
+    if !activateChecked(handle, decision.digest, artifact, receipt, decision.metadataHash, active) { let message = lastError(); end(handle); return systemFailure(message) }
     end(handle)
     return errors.boolean(true)
 }
@@ -255,4 +283,108 @@ public function downloadAndInstall(root: Text, key: Bytes, app: Text, target: Te
     }
     return install(root, metadata, signature, key, Bytes(artifact.body), app, target, channel, origin,
         now, installationID, currentVersion)
+}
+
+// Active receipts authorize already installed bytes after expiry. Freshness is
+// required for installation, not for an offline restart of the same generation.
+// Observation of a newer, unselected release cannot prevent the old active
+// generation from launching. The installed floor still forbids downgrades.
+function start(root: Text, key: Bytes, app: Text, target: Text, channel: Text, origin: Text,
+    now: Integer, installationID: Text, currentVersion: Text, arguments: List<Text>,
+    replace: Boolean): errors.IntegerResult {
+    if target != hostTarget() {
+        return errors.integerFailure(errors.make(errors.invalidDataCode(), 0, "launch target differs from this host"))
+    }
+    if arguments.length > 255 {
+        return errors.integerFailure(errors.make(errors.invalidDataCode(), 0, "too many launch arguments"))
+    }
+    let encoded = Bytes()
+    for argument in arguments {
+        let bytes = Bytes(argument)
+        for byte in bytes {
+            if byte == 0 { return errors.integerFailure(errors.make(errors.invalidDataCode(), 0, "launch argument contains NUL")) }
+        }
+        encoded.addBytes(bytes)
+        encoded.add(0)
+        if encoded.length > 32768 {
+            return errors.integerFailure(errors.make(errors.invalidDataCode(), 0, "launch arguments exceed the size limit"))
+        }
+    }
+    let handle = begin(root)
+    if handle < 0 { return errors.integerFailure(errors.make(errors.systemCode(), 0, lastError())) }
+    let persisted = readState(handle)
+    if lastError() != "" {
+        let message = lastError(); end(handle)
+        return errors.integerFailure(errors.make(errors.systemCode(), 0, message))
+    }
+    let fields = lines(persisted)
+    if fields.length != 9 || fields[0] != "MINYAR-UPDATER-STATE-2" {
+        end(handle)
+        return errors.integerFailure(errors.make(errors.invalidDataCode(), 0, "missing or corrupt active update state"))
+    }
+    let sequence = natural(fields[1], 2147483647)
+    let clock = natural(fields[6], 9223372036854775507)
+    let activeSequence = natural(fields[8], 2147483647)
+    if sequence < 1 || activeSequence < 1 || activeSequence > sequence ||
+       !validDigest(fields[7]) || !validDigest(fields[3]) || !validDigest(fields[5]) ||
+       compareVersions(fields[2], fields[4]) < 0 || compareVersions(fields[4], currentVersion) < 0 ||
+       versionParts(currentVersion).length != 3 || clock < 0 || now < clock || now > 9223372036854775507 {
+        end(handle)
+        return errors.integerFailure(errors.make(errors.invalidDataCode(), 0, "active state violates version, digest or clock floor"))
+    }
+    let receipt = readReceipt(handle, fields[5], fields[7])
+    if lastError() != "" || receipt.length <= 64 || receipt.length > 4160 {
+        let message = lastError(); end(handle)
+        return errors.integerFailure(errors.make(errors.invalidDataCode(), 0, "missing or invalid signed active receipt: " + message))
+    }
+    let metadata = receipt.slice(64, receipt.length)
+    let active = lines(metadata)
+    if active.length != 12 {
+        end(handle)
+        return errors.integerFailure(errors.make(errors.invalidDataCode(), 0, "invalid signed active receipt format"))
+    }
+    let issued = natural(active[6], 9223372036854775807)
+    let decision = inspect(metadata, receipt.slice(0, 64), key, app, target, channel, origin,
+        issued, installationID, "0.0.0", 0, currentVersion, "")
+    if !accepted(decision) {
+        end(handle); return errors.integerFailure(decision.error)
+    }
+    if decision.sequence != activeSequence || decision.metadataHash != fields[7] ||
+       (decision.sequence == sequence && decision.metadataHash != fields[3]) ||
+       decision.version != fields[4] || decision.digest != fields[5] ||
+       cohort(app, channel, installationID) >= natural(active[8], 100) || issued > clock + 300 {
+        end(handle)
+        return errors.integerFailure(errors.make(errors.protocolCode(), 0, "active receipt violates installed version, cohort or metadata floor"))
+    }
+    let artifact = readArtifact(handle, fields[5])
+    if lastError() != "" || artifact.length != decision.size || crypto.hex(crypto.sha256(artifact)) != decision.digest {
+        let message = lastError(); end(handle)
+        return errors.integerFailure(errors.make(errors.invalidDataCode(), 0, "active artifact differs from signed receipt: " + message))
+    }
+    let child = launchChecked(handle, decision.digest, artifact, encoded, replace)
+    let message = lastError()
+    end(handle)
+    if child < 0 { return errors.integerFailure(errors.make(errors.systemCode(), 0, message)) }
+    return errors.integer(child)
+}
+
+// Returns an owned child token, not an OS PID. wait() consumes it exactly once.
+// Arguments exclude argv[0], which is the authenticated executable's path.
+public function launch(root: Text, key: Bytes, app: Text, target: Text, channel: Text, origin: Text,
+    now: Integer, installationID: Text, currentVersion: Text, arguments: List<Text>): errors.IntegerResult {
+    return start(root, key, app, target, channel, origin, now, installationID, currentVersion, arguments, false)
+}
+
+// Gracefully close application work before calling. Successful restart replaces
+// the current application: start the checked child, then exit this process.
+// A failed restart returns an error and leaves this process alive.
+public function restart(root: Text, key: Bytes, app: Text, target: Text, channel: Text, origin: Text,
+    now: Integer, installationID: Text, currentVersion: Text, arguments: List<Text>): errors.IntegerResult {
+    return start(root, key, app, target, channel, origin, now, installationID, currentVersion, arguments, true)
+}
+
+public function wait(child: Integer): errors.IntegerResult {
+    let status = waitChild(child)
+    if status < 0 { return errors.integerFailure(errors.make(errors.systemCode(), 0, lastError())) }
+    return errors.integer(status)
 }
