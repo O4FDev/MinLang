@@ -7,6 +7,7 @@ use "crypto" as crypto
 use "errors" as errors
 use "quiccrypto" as protection
 use "tlstickets" as tickets
+use "quicrecovery" as recovery
 
 record Pair { client: quic.Connection; server: quic.Connection; now: Integer }
 function drive(c: quic.Connection, s: quic.Connection, now: Integer) {
@@ -841,7 +842,11 @@ function currentPathRecovery(p: Pair, lose: Boolean): Integer {
     if !sent { return 166 }
     let window=s.congestion.window
     if lose {
-        for count in 0..3 { authenticatedFrame(s,c,s.remote,crypto.fromHex("01")) }
+        for count in 0..3 {
+            quic.ping(s);let emitted=false
+            for packet in quic.pollDatagrams(s,at+count+1) { if packet.pathId==7 { emitted=true } }
+            if !emitted { return 166 }
+        }
         acknowledgePacket(c,s,s.spaces[2].next-1,s.spaces[2].next-1,at+20)
         quic.pollDatagrams(s,at+2000)
         if s.congestion.window>=window || s.congestion.window<2400 { return 167 }
@@ -851,6 +856,137 @@ function currentPathRecovery(p: Pair, lose: Boolean): Integer {
     }
     if s.flight!=exactFlight(s) || s.state!=quic.ESTABLISHED { return 169 }
     print("current-route ACK/loss still updates its own RTT/congestion with exact flight accounting")
+    return 0
+}
+
+// Probing on a retained NAT fallback does not itself request migration.
+record RetainedRecovery { pair: Pair; newProbe: Integer; deadline: Integer; now: Integer }
+function retainedRecovery(p: Pair): RetainedRecovery {
+    let c=p.client;let s=p.server;let probe=-1;let deadline=-1
+    if ready(p) {
+        let payload=crypto.fromHex("01");payload.resize(1171)
+        quic.receivePath(s,authenticatedFrame(c,s,c.remote,payload),7,p.now)
+        for packet in quic.pollDatagrams(s,p.now) {
+            let header=wire.header(packet.data,0,c.local.length)
+            let opened=protection.unprotect(c.spaces[2].read,packet.data,header.numberOffset,-1)
+            if packet.pathId==7 && opened.valid { probe=opened.number }
+        }
+        let at=-1
+        for index in 0..s.paths.length {
+            if s.paths[index].id==7 { at=index }
+            if s.paths[index].id==0 { deadline=s.paths[index].deadline }
+        }
+        if at>=0 {
+            let reply=Bytes();appendInteger(reply,27);reply.addBytes(s.paths[at].challenge)
+            quic.receivePath(s,authenticatedFrame(c,s,c.remote,reply),7,p.now+1)
+        }
+    }
+    return RetainedRecovery { pair:p;newProbe:probe;deadline:deadline;now:p.now+1 }
+}
+function retainedReady(r: RetainedRecovery): Boolean {
+    return r.newProbe>=0 && r.deadline>r.now+20 && r.pair.server.activePath==7 &&
+        r.pair.server.paths.length==2 && r.pair.server.state==quic.ESTABLISHED
+}
+function retainedOldTraffic(p: Pair, probing: Boolean): Integer {
+    let r=retainedRecovery(p);if !retainedReady(r) { return 183 }
+    let c=p.client;let s=p.server;let payload=Bytes()
+    if probing { appendInteger(payload,26);payload.addBytes(randomBytes(8)) }
+    else { appendInteger(payload,1) }
+    quic.receivePath(s,authenticatedFrame(c,s,c.remote,payload),0,r.now+1)
+    if probing && s.activePath!=7 {
+        print("semantic failure: probing-only retained old-route packet changed the active route");return 181
+    }
+    if !probing && s.activePath!=0 { return 184 }
+    if s.state!=quic.ESTABLISHED || s.flight!=exactFlight(s) { return 185 }
+    print("retained old-route probing preserved the active route; ordinary authenticated traffic can return to the old route")
+    return 0
+}
+
+record OldValidationSends { retained: RetainedRecovery; currentNumber: Integer; currentAt: Integer; highOldNumber: Integer; alarm: Integer; now: Integer }
+function oldValidationSends(p: Pair): OldValidationSends {
+    let r=retainedRecovery(p);let c=p.client;let s=p.server;let number=-1;let high=-1;let alarm=-1;let at=r.deadline-10;let now=r.deadline
+    if retainedReady(r) {
+        acknowledgePacket(c,s,r.newProbe,r.newProbe,at-1)
+        number=s.spaces[2].next;quic.ping(s)
+        let emitted=false
+        for packet in quic.pollDatagrams(s,at) { if packet.pathId==7 { emitted=true } }
+        if !emitted { number=-1 }
+        alarm=s.spaces[2].probe
+        for count in 0..3 {
+            let payload=Bytes();appendInteger(payload,26);payload.addBytes(randomBytes(8))
+            quic.receivePath(s,authenticatedFrame(c,s,c.remote,payload),0,at+1)
+        }
+        for count in 0..7 {
+            now=r.deadline+count*2
+            for packet in quic.pollDatagrams(s,now) {
+                let header=wire.header(packet.data,0,c.local.length)
+                let opened=protection.unprotect(c.spaces[2].read,packet.data,header.numberOffset,-1)
+                if opened.valid && packet.pathId==0 { high=max(high,opened.number) }
+            }
+        }
+    }
+    return OldValidationSends { retained:r;currentNumber:number;currentAt:at;highOldNumber:high;alarm:alarm;now:now }
+}
+function oldValidationReady(v: OldValidationSends): Boolean {
+    let s=v.retained.pair.server;let outstanding=false
+    for sent in s.spaces[2].sent { if sent.number==v.currentNumber && sent.path==7 { outstanding=true } }
+    if !outstanding || v.highOldNumber<v.currentNumber+3 || s.activePath!=7 || !s.congestion.measured ||
+       v.now-v.currentAt>=recovery.lossDelay(s.congestion) { return false }
+    return true
+}
+function oldValidationRecovery(p: Pair, mode: Text): Integer {
+    let v=oldValidationSends(p);let c=p.client;let s=p.server
+    if !oldValidationReady(v) { return 186 }
+    let window=s.congestion.window;let latest=s.congestion.latest
+    if mode=="current-route-alarm" {
+        let sent=false;quic.ping(s)
+        for packet in quic.pollDatagrams(s,v.now+1) { if packet.pathId==7 { sent=true } }
+        if !sent || s.spaces[2].probe!=v.now+1+recovery.pto(s.congestion,true) ||
+           s.spaces[2].probe<=v.alarm { return 191 }
+    } else if mode=="old-route-alarm" {
+        if s.spaces[2].probe!=v.alarm {
+            print("semantic failure: retained old-route validation sends postponed the current route PTO");return 180
+        }
+    } else {
+        acknowledgePacket(c,s,v.highOldNumber,v.highOldNumber,v.now)
+        if mode=="old-high-ack" {
+            quic.pollDatagrams(s,v.now)
+            let outstanding=false
+            for sent in s.spaces[2].sent { if sent.number==v.currentNumber { outstanding=true } }
+            if !outstanding || s.congestion.window!=window {
+                print("semantic failure: old-route high packet ACK triggered loss on the current route");return 179
+            }
+        } else {
+            acknowledgePacket(c,s,v.currentNumber,v.currentNumber,v.now+1)
+            if s.congestion.latest!=v.now+1-v.currentAt {
+                print("semantic failure: old-route high packet ACK suppressed a later current-route RTT sample");return 182
+            }
+        }
+    }
+    if s.flight!=exactFlight(s) || s.state!=quic.ESTABLISHED { return 187 }
+    print("old-route validation ACKs and sends preserved current-route loss, RTT and PTO authority with exact flight")
+    return 0
+}
+function currentPacketThreshold(p: Pair): Integer {
+    let r=retainedRecovery(p);if !retainedReady(r) { return 183 }
+    let c=p.client;let s=p.server
+    acknowledgePacket(c,s,r.newProbe,r.newProbe,r.now+30)
+    let first=-1;let last=-1;let sentAt=r.now+31
+    for count in 0..4 {
+        let number=s.spaces[2].next;let emitted=false;quic.ping(s)
+        for packet in quic.pollDatagrams(s,sentAt+count) { if packet.pathId==7 { emitted=true } }
+        if !emitted { return 188 }
+        if count==0 { first=number };last=number
+    }
+    let now=sentAt+4
+    if last<first+3 || now-sentAt>=recovery.lossDelay(s.congestion) { return 189 }
+    acknowledgePacket(c,s,last,last,now)
+    let window=s.congestion.window
+    quic.pollDatagrams(s,now)
+    let retained=false
+    for sent in s.spaces[2].sent { if sent.number==first { retained=true } }
+    if retained || s.congestion.window>=window || s.congestion.window<2400 || s.flight!=exactFlight(s) { return 190 }
+    print("three real current-route packets triggered packet-threshold loss before the time threshold")
     return 0
 }
 
@@ -866,6 +1002,10 @@ function main(): Integer {
     }
     if mode=="early-routes" { return earlyRoutes(root,identity,key,client,clientKey) }
     let p = connected(root, identity, key, client, clientKey)
+    if mode=="old-high-ack" || mode=="old-route-alarm" || mode=="old-high-current-rtt" || mode=="current-route-alarm" { return oldValidationRecovery(p,mode) }
+    if mode=="current-packet-threshold" { return currentPacketThreshold(p) }
+    if mode=="old-probing-return" { return retainedOldTraffic(p,true) }
+    if mode=="old-nonprobing-return" { return retainedOldTraffic(p,false) }
     if mode=="old-path-late-ack" { return oldPathLateAck(p,false) }
     if mode=="reused-path-late-ack" { return oldPathLateAck(p,true) }
     if mode=="reused-path-ack" { return oldPathAck(p,true) }

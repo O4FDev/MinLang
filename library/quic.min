@@ -38,8 +38,8 @@ record SentStream { id: Integer; first: Integer; length: Integer; fin: Boolean; 
 record LostStreams { number: Integer; level: Integer; time: Integer; path: Integer; recoveryGeneration: Integer; measured: Boolean; streams: List<SentStream> }
 public record ClosedStreams { kind: Integer; first: Integer; last: Integer }
 record Space {
-    read: protection.Keys; write: protection.Keys; next: Integer; largest: Integer; largestAck: Integer
-    ackTimes: List<SentTime>; lostStreams: List<LostStreams>; lostStreamsAt: Integer; lostReferences: Integer; historyPassed: Integer; lastEliciting: Integer
+    read: protection.Keys; write: protection.Keys; next: Integer; largest: Integer; largestAck: Integer; recoveryLargestAck: Integer
+    ackTimes: List<SentTime>; lostStreams: List<LostStreams>; lostStreamsAt: Integer; lostReferences: Integer; historyPassed: Integer; lastEliciting: Integer; recoveryLastEliciting: Integer
     ranges: List<wire.Range>; ack: Boolean; sent: List<Sent>; active: Boolean; probe: Integer
     receivedCrypto: stream.Stream; sendCrypto: Integer
     nextRead: protection.Keys; previousRead: protection.Keys; previousUntil: Integer
@@ -135,6 +135,12 @@ function abandonPath(connection: Connection, path: Path) {
 function currentRecovery(connection: Connection, path: Integer, generation: Integer): Boolean {
     return path == connection.activePath && generation == connection.recoveryGeneration
 }
+function recoveryAck(connection: Connection, space: Space, sent: Sent): Integer {
+    // Global ACK progress remains authoritative for packet validity/delivery.
+    // Loss for the active route uses only that route's current recovery epoch.
+    if currentRecovery(connection,sent.path,sent.recoveryGeneration) { return space.recoveryLargestAck }
+    return space.largestAck
+}
 function recoveryFlight(connection: Connection): Integer {
     // The common single-route connection preserves O(1) admission. Probing
     // or migrated connections scan only the bounded outstanding lists;
@@ -149,17 +155,25 @@ function recoveryFlight(connection: Connection): Integer {
 function activatePath(connection: Connection, path: Path) {
     if path.id == connection.activePath { return }
     let previous = connection.activePath
+    // A retained validated fallback needs fresh non-probing traffic to move
+    // back. Its earlier eligibility cannot turn a probe into migration.
+    for known in connection.paths { if known.id == previous { known.eligible = false } }
     connection.activePath = path.id; connection.remote = path.remoteId
     connection.congestion = recovery.create(1200); connection.recoveryGeneration += 1
     connection.lossFirst = -1; connection.lossLast = -1; connection.lossAfter = -1; connection.emptySince = -1
     // Validation sends on this very route belong to its new controller. An
     // earlier use of the same route ID keeps its original generation.
     for space in connection.spaces {
+        space.recoveryLargestAck = -1; space.recoveryLastEliciting = -1
         for sent in space.sent {
             if sent.path == path.id && sent.recoveryGeneration == connection.recoveryGeneration - 1 {
                 sent.recoveryGeneration = connection.recoveryGeneration; sent.measured = false
+                space.recoveryLastEliciting = max(space.recoveryLastEliciting,sent.time)
             }
         }
+        // Old delivery can still need retransmission on the new route even
+        // if no validation packet remains outstanding at activation.
+        if space.sent.length > 0 && space.recoveryLastEliciting < 0 { space.recoveryLastEliciting = connection.now }
         for time in space.ackTimes {
             if time.path == path.id && time.recoveryGeneration == connection.recoveryGeneration - 1 { time.recoveryGeneration = connection.recoveryGeneration }
         }
@@ -250,8 +264,8 @@ function create(entropy: Bytes, original: Bytes, client: Boolean): Connection {
         let read = protection.traffic(1, 0, Bytes()); let write = read
         if level == 0 { read = protection.initial(1, destination, client); write = protection.initial(1, destination, !client) }
         spaces.add(Space {
-            read: read; write: write; next: 0; largest: -1; largestAck: -1; ranges: []; ack: false; sent: []; active: true; probe: -1
-            ackTimes: []; lostStreams: []; lostStreamsAt: 0; lostReferences: 0; historyPassed: -1; lastEliciting: -1
+            read: read; write: write; next: 0; largest: -1; largestAck: -1; recoveryLargestAck: -1; ranges: []; ack: false; sent: []; active: true; probe: -1
+            ackTimes: []; lostStreams: []; lostStreamsAt: 0; lostReferences: 0; historyPassed: -1; lastEliciting: -1; recoveryLastEliciting: -1
             receivedCrypto: stream.create(level, 1048576, 1048576); sendCrypto: 0
             nextRead: protection.traffic(1, 0, Bytes()); previousRead: protection.traffic(1, 0, Bytes()); previousUntil: -1
             readGeneration: 0; writeGeneration: 0; readFirst: 0; writeFirst: 0; writePackets: 0
@@ -364,7 +378,7 @@ function terminate(connection: Connection, code: Integer, message: Text) {
     connection.state = FAILED; connection.code = code; connection.error = message
     connection.pending = []; connection.flight = 0
     connection.history = []; connection.lossFirst = -1; connection.lossLast = -1; connection.lossAfter = -1; connection.handshakeProbe = -1; connection.handshakeAcknowledged = false
-    for space in connection.spaces { space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; clearAck(space) }
+    for space in connection.spaces { space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; space.recoveryLastEliciting = -1; space.recoveryLargestAck = -1; clearAck(space) }
     connection.streams = []
     let level = 0
     if connection.spaces[1].write.key.length > 0 { level = 1 }
@@ -379,7 +393,7 @@ function beginClosing(connection: Connection, level: Integer, frame: Bytes) {
     connection.closeInterval = recovery.pto(connection.congestion,connection.confirmed); connection.closeAttempts = 0; connection.closeFrame = frame; connection.closeLevel = level
     connection.pending = [Pending { level: level; payload: frame; probe: false; path: -1; acknowledgement: false }]; connection.flight = 0
     connection.history = []; connection.lossFirst = -1; connection.lossLast = -1; connection.lossAfter = -1; connection.handshakeProbe = -1; connection.handshakeAcknowledged = false
-    for space in connection.spaces { space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; clearAck(space) }
+    for space in connection.spaces { space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; space.recoveryLastEliciting = -1; space.recoveryLargestAck = -1; clearAck(space) }
     for path in connection.paths { path.challenge = Bytes(); path.deadline = -1 }
 }
 function beginDraining(connection: Connection, code: Integer) {
@@ -387,7 +401,7 @@ function beginDraining(connection: Connection, code: Integer) {
     connection.closeUntil = max(connection.closeUntil,connection.now + 3 * recovery.pto(connection.congestion,connection.confirmed))
     connection.pending = []; connection.flight = 0; connection.streams = []; connection.closeFrame = Bytes()
     connection.history = []; connection.lossFirst = -1; connection.lossLast = -1; connection.lossAfter = -1; connection.handshakeProbe = -1; connection.handshakeAcknowledged = false
-    for space in connection.spaces { space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; clearAck(space) }
+    for space in connection.spaces { space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; space.recoveryLastEliciting = -1; space.recoveryLargestAck = -1; clearAck(space) }
     for path in connection.paths { path.challenge = Bytes(); path.deadline = -1 }
 }
 function enqueue(connection: Connection, level: Integer, payload: Bytes, probe: Boolean) {
@@ -488,7 +502,7 @@ function rearmProbes(connection: Connection, acknowledgedLevel: Integer) {
         let armed = space.probe >= 0 || acknowledgedLevel < 0 || acknowledgedLevel == level
         space.probe = -1
         if armed && space.active && space.sent.length > 0 && (level < 2 || connection.confirmed) {
-            space.probe = space.lastEliciting + recovery.pto(connection.congestion,connection.confirmed)
+            space.probe = space.recoveryLastEliciting + recovery.pto(connection.congestion,connection.confirmed)
         }
     }
 }
@@ -694,10 +708,11 @@ function processAck(connection: Connection, space: Space, frame: wire.Frame, lev
     if frame.value >= space.next { terminate(connection, 10, "peer acknowledged an unsent packet"); return }
     if level == 1 && connection.clientRole && !connection.handshakeAcknowledged { connection.handshakeAcknowledged = true; connection.congestion.probes = 0 }
     let backoff = connection.congestion.probes
+    let currentLargest = space.recoveryLargestAck
     let sampleAt = -1; let eliciting = false; let cachedAck = false; let deliveryChanged = false
     for sent in space.sent {
         for range in frame.ranges {
-            if sent.number >= range.first && sent.number <= range.last && currentRecovery(connection,sent.path,sent.recoveryGeneration) { eliciting = true; if sent.number == frame.value { sampleAt = sent.time } }
+            if sent.number >= range.first && sent.number <= range.last && currentRecovery(connection,sent.path,sent.recoveryGeneration) { eliciting = true; currentLargest = max(currentLargest,sent.number); if sent.number == frame.value { sampleAt = sent.time } }
         }
     }
     for at in space.lostStreamsAt..space.lostStreams.length {
@@ -705,19 +720,28 @@ function processAck(connection: Connection, space: Space, frame: wire.Frame, lev
         for range in frame.ranges {
             if packet.number >= range.first && packet.number <= range.last {
                 cachedAck = true
-                if currentRecovery(connection,packet.path,packet.recoveryGeneration) { eliciting = true; if packet.number == frame.value { sampleAt = packet.time } }
+                if currentRecovery(connection,packet.path,packet.recoveryGeneration) { eliciting = true; currentLargest = max(currentLargest,packet.number); if packet.number == frame.value { sampleAt = packet.time } }
             }
         }
     }
     let retainedTimes: List<SentTime> = []
     for time in space.ackTimes {
-        if time.number == frame.value && currentRecovery(connection,time.path,time.recoveryGeneration) { sampleAt = time.time }
-        if time.number > max(space.largestAck,frame.value) { retainedTimes.add(time) }
+        if currentRecovery(connection,time.path,time.recoveryGeneration) {
+            for range in frame.ranges {
+                if time.number >= range.first && time.number <= range.last { currentLargest = max(currentLargest,time.number) }
+            }
+            if time.number == frame.value { sampleAt = time.time }
+        }
+    }
+    for time in space.ackTimes {
+        let acknowledgedThrough = max(space.largestAck,frame.value)
+        if currentRecovery(connection,time.path,time.recoveryGeneration) { acknowledgedThrough = currentLargest }
+        if time.number > acknowledgedThrough { retainedTimes.add(time) }
     }
     space.ackTimes = retainedTimes
     // The largest newly ACKed packet can be ACK-only. RFC9002 still requires
     // its send time when another newly ACKed packet was ack-eliciting.
-    if eliciting && sampleAt >= 0 && frame.value > space.largestAck {
+    if eliciting && sampleAt >= 0 && frame.value > space.recoveryLargestAck {
         let delay = 0
         if level == 2 && frame.values.length > 0 {
             let scale = 1 << connection.ackExponent
@@ -791,7 +815,7 @@ function processAck(connection: Connection, space: Space, frame: wire.Frame, lev
         space.lostStreams = lost; space.lostStreamsAt = 0; space.lostReferences = 0
         for packet in lost { space.lostReferences += packet.streams.length }
     }
-    space.sent = remaining; space.largestAck = max(space.largestAck, frame.value)
+    space.sent = remaining; space.largestAck = max(space.largestAck, frame.value); space.recoveryLargestAck = currentLargest
     if connection.flight == 0 && connection.pending.length == 0 && connection.emptySince < 0 { connection.emptySince = connection.now }
     if remaining.length == 0 { space.probe = -1 }
     if eliciting { rearmProbes(connection,level) }
@@ -803,7 +827,7 @@ function discard(connection: Connection, level: Integer) {
     if !space.active { return }
     space.active = false; clearAck(space); space.probe = -1
     for sent in space.sent { connection.flight = max(0, connection.flight - sent.bytes); sent.status = 3; sent.payload = Bytes() }
-    space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; space.ackTimes = []; space.read = protection.traffic(1, 0, Bytes()); space.write = space.read
+    space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; space.recoveryLastEliciting = -1; space.recoveryLargestAck = -1; space.ackTimes = []; space.read = protection.traffic(1, 0, Bytes()); space.write = space.read
     connection.congestion.probes = 0; rearmProbes(connection,-1)
     refreshHandshakeProbe(connection,true)
 }
@@ -1126,7 +1150,7 @@ function retryClient(connection: Connection, packet: Bytes, header: wire.Header)
     connection.spaces[2].sent = []; connection.spaces[2].lostStreams = []; connection.spaces[2].lostStreamsAt = 0; connection.spaces[2].lostReferences = 0; connection.spaces[2].probe = -1; connection.pending = retained
     let space = connection.spaces[0]
     for sent in space.sent { sent.status = 3; sent.payload = Bytes() }
-    space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; space.probe = -1; space.read = protection.initial(connection.version,header.source,true); space.write = protection.initial(connection.version,header.source,false)
+    space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; space.recoveryLastEliciting = -1; space.recoveryLargestAck = -1; space.probe = -1; space.read = protection.initial(connection.version,header.source,true); space.write = protection.initial(connection.version,header.source,false)
     space.sendCrypto = 0; space.writePackets = 0
     connection.remote = header.source; connection.initialDestination = header.source; connection.retrySource = header.source; connection.retryToken = header.token; connection.retryAccepted = true
     connection.congestion = recovery.create(1200); connection.flight = 0; connection.paceCredit = 12000.0; connection.paceAt = -1; connection.handshakeProbe = -1; connection.handshakeAcknowledged = false
@@ -1143,7 +1167,7 @@ function negotiateClient(connection: Connection, header: wire.Header) {
     // unauthenticated multi-version downgrade decision. Transport can retry TCP.
     connection.state = FAILED; connection.code = 0; connection.error = "QUIC version negotiation has no supported version; explicit TCP retry required"
     connection.pending = []; connection.history = []; connection.lossFirst = -1; connection.lossLast = -1; connection.lossAfter = -1; connection.handshakeProbe = -1; connection.handshakeAcknowledged = false; connection.flight = 0
-    for space in connection.spaces { space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; clearAck(space) }
+    for space in connection.spaces { space.sent = []; space.lostStreams = []; space.lostStreamsAt = 0; space.lostReferences = 0; space.historyPassed = -1; space.lastEliciting = -1; space.recoveryLastEliciting = -1; space.recoveryLargestAck = -1; clearAck(space) }
 }
 public function receivePath(connection: Connection, datagram: Bytes, pathId: Integer, now: Integer) {
     // RFC9000 section9: discard unknown server addresses before packet
@@ -1380,7 +1404,7 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
         if space.previousUntil >= 0 && now > space.previousUntil { space.previousRead = protection.traffic(1, 0, Bytes()); space.previousUntil = -1 }
         let remaining: List<Sent> = []
         for sent in space.sent {
-            if recovery.isLost(connection.congestion, sent.number, space.largestAck, sent.time, now) {
+            if recovery.isLost(connection.congestion, sent.number, recoveryAck(connection,space,sent), sent.time, now) {
                 connection.flight = max(0, connection.flight - sent.bytes)
                 if currentRecovery(connection,sent.path,sent.recoveryGeneration) { recovery.lost(connection.congestion, now, sent.time) }
                 retryPacket(connection,sent,false)
@@ -1544,8 +1568,11 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
             let sent = Sent { number: space.next; time: now; bytes: size; payload: pending.payload; path: route; recoveryGeneration: connection.recoveryGeneration; level: level; status: 0; measured: connection.congestion.measured }
             space.sent.add(sent); connection.history.add(sent)
             connection.flight += size
-            space.lastEliciting = now; space.probe = -1
-            if level < 2 || connection.confirmed { space.probe = now + recovery.pto(connection.congestion, connection.confirmed) }
+            space.lastEliciting = now
+            if currentRecovery(connection,route,sent.recoveryGeneration) {
+                space.recoveryLastEliciting = now; space.probe = -1
+                if level < 2 || connection.confirmed { space.probe = now + recovery.pto(connection.congestion, connection.confirmed) }
+            }
         } else {
             // ACK-only packets are not in flight and do not arm PTO. Bound
             // timestamp retention; normal ACK progress releases this list.
@@ -1596,7 +1623,7 @@ public function nextTimer(connection: Connection): Integer {
         if space.active && space.sent.length > 0 && space.probe >= 0 && (level < 2 || connection.confirmed) { deadline = min(deadline,space.probe) }
         if space.active && space.ack && !space.ackQueued && space.ackDeadline >= 0 && space.write.key.length > 0 &&
            (level != 2 || connection.state == ESTABLISHED) { deadline = min(deadline,space.ackDeadline) }
-        if space.active { for sent in space.sent { if sent.number <= space.largestAck { deadline = min(deadline,sent.time + recovery.lossDelay(connection.congestion)) } } }
+        if space.active { for sent in space.sent { if sent.number <= recoveryAck(connection,space,sent) { deadline = min(deadline,sent.time + recovery.lossDelay(connection.congestion)) } } }
     }
     for path in connection.paths { if path.deadline >= 0 { deadline = min(deadline, path.deadline) } }
     return deadline

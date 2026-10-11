@@ -19,6 +19,13 @@ SPEC = importlib.util.spec_from_file_location("quic_cid_certificates", CA_SOURCE
 FIXTURES = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(FIXTURES)
 BASELINE = {
+    "current-route-alarm": (0, "old-route validation ACKs and sends preserved current-route loss"),
+    "old-high-ack": (179, "semantic failure: old-route high packet ACK triggered loss on the current route"),
+    "old-route-alarm": (180, "semantic failure: retained old-route validation sends postponed the current route PTO"),
+    "old-high-current-rtt": (182, "semantic failure: old-route high packet ACK suppressed a later current-route RTT sample"),
+    "current-packet-threshold": (0, "three real current-route packets triggered packet-threshold loss"),
+    "old-probing-return": (181, "semantic failure: probing-only retained old-route packet changed the active route"),
+    "old-nonprobing-return": (0, "ordinary authenticated traffic can return to the old route"),
     "old-path-late-ack": (174, "semantic failure: late old-epoch delivery ACK reset the current route PTO backoff"),
     "reused-path-late-ack": (174, "semantic failure: late old-epoch delivery ACK reset the current route PTO backoff"),
     "reused-path-ack": (155, "semantic failure: delayed old-route ACK sampled the new route RTT"),
