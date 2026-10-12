@@ -1,0 +1,105 @@
+name: Release signing TEST artifacts
+
+# Manual, local-artifact evidence only. No release/R2 deployment or production secrets.
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Native TEST platform
+        type: choice
+        options: [macos, windows, both]
+        default: macos
+      windows_gates_complete:
+        description: Owner confirms Windows gates completed and exclusive OWN Boat signing slot handed off
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    if: inputs.platform == 'macos' || inputs.platform == 'both'
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+      - name: Python signing contracts
+        run: |
+          python3 tests/release-signing.py
+          python3 tests/shipping.py
+      - name: Ephemeral trusted TEST signing and complete updater roundtrip
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl_path="$(brew --prefix openssl@3)/bin/openssl"
+          test -x "$openssl_path"
+          python3 tests/release-pipeline.py --native macos --ephemeral-macos-ci \
+            --cc /usr/bin/clang --openssl "$openssl_path" \
+            --output "$RUNNER_TEMP/TEST-macos-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --report "$RUNNER_TEMP/TEST-macos-status-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+      - name: Upload public TEST evidence after credential cleanup
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: TEST-macos-signing-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/TEST-macos-${{ github.run_id }}-${{ github.run_attempt }}/
+            ${{ runner.temp }}/TEST-macos-status-${{ github.run_id }}-${{ github.run_attempt }}.json
+
+  windows:
+    if: (inputs.platform == 'windows' || inputs.platform == 'both') && inputs.windows_gates_complete
+    # These labels are attached ONLY to the owned Boat Windows guest by its owner.
+    runs-on: [self-hosted, Windows, X64, boat, minyar-signing]
+    timeout-minutes: 10
+    concurrency:
+      group: minyar-own-boat-windows
+      cancel-in-progress: false
+    env:
+      MINYAR_OWN_BOAT_ID: ${{ vars.MINYAR_OWN_BOAT_ID }}
+      MINYAR_BOAT_PYTHON: ${{ vars.MINYAR_BOAT_PYTHON }}
+      MINYAR_BOAT_CLANG: ${{ vars.MINYAR_BOAT_CLANG }}
+      MINYAR_BOAT_OPENSSL: ${{ vars.MINYAR_BOAT_OPENSSL }}
+      MINYAR_BOAT_SIGNTOOL: ${{ vars.MINYAR_BOAT_SIGNTOOL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate provisioned native tool paths and Python contracts
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @('MINYAR_BOAT_PYTHON','MINYAR_BOAT_CLANG','MINYAR_BOAT_OPENSSL','MINYAR_BOAT_SIGNTOOL')) {
+            $path = [Environment]::GetEnvironmentVariable($name)
+            if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing owner-provisioned tool: $name" }
+          }
+          & $env:MINYAR_BOAT_PYTHON tests/release-signing.py
+          if ($LASTEXITCODE -ne 0) { throw 'Signing contracts failed' }
+          & $env:MINYAR_BOAT_PYTHON tests/shipping.py
+          if ($LASTEXITCODE -ne 0) { throw 'Shipping contracts failed' }
+      - name: OWN Boat trusted TEST signing and complete updater roundtrip
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:MINYAR_BOAT_PYTHON tests/release-pipeline.py --native windows --owned-boat-windows `
+            --cc $env:MINYAR_BOAT_CLANG --openssl $env:MINYAR_BOAT_OPENSSL --signtool $env:MINYAR_BOAT_SIGNTOOL `
+            --output "$env:RUNNER_TEMP\TEST-windows-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" `
+            --report "$env:RUNNER_TEMP\TEST-windows-status-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Windows native TEST signing/cleanup failed' }
+      - name: Upload public TEST evidence after credential cleanup
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: TEST-windows-signing-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/TEST-windows-${{ github.run_id }}-${{ github.run_attempt }}/
+            ${{ runner.temp }}/TEST-windows-status-${{ github.run_id }}-${{ github.run_attempt }}.json
