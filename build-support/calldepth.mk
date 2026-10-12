@@ -52,5 +52,8 @@ check-calldepth-hooks: build/minyarc build/minyar-compiler-runtime.ll
 check-calldepth-hooks-sanitize: build/minyarc build/minyar-compiler-runtime.ll
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/calldepth-hooks.py --sanitize --evidence build/calldepth-hook-sanitize-evidence
 
+# Recovery is qualified on Linux and macOS; native Windows linking of the test hooks is not yet.
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
 check check-portable: check-calldepth check-calldepth-launcher check-calldepth-reporting check-calldepth-hooks
 check-sanitize: check-calldepth-sanitize check-calldepth-reporting-sanitize check-calldepth-hooks-sanitize
+endif
