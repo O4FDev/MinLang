@@ -33,7 +33,8 @@ compile_command = None if args.binary else command
 if compile_command: subprocess.run(compile_command,check=True)
 run_command = [str(executable),str(args.seconds),str(args.connections)]
 started = time.time()
-samples=[]
+sample_count=0
+last_sample=None
 failure = None
 last_peer = None
 complete = False
@@ -50,23 +51,27 @@ with (args.output/'stderr.log').open('w') as errors, (args.output/'samples.jsonl
                 if sample['peer']['phase'] == 'complete': complete = True
             sample['wall_time']=time.time()
             evidence.write(json.dumps(sample,sort_keys=True)+'\n'); evidence.flush()
-            if 'rss_kib' in sample: samples.append(sample)
+            if 'rss_kib' in sample:
+                sample_count += 1
+                last_sample = sample
     except Exception as error:
         failure = str(error)
     status=process.wait(timeout=15)
 diagnostics = (args.output/'stderr.log').read_text()
+with (args.output/'samples.jsonl').open() as saved:
+    summary = memory_summary(json.loads(line) for line in saved)
 report={'binary_sha256':hashlib.sha256(executable.read_bytes()).hexdigest(),
         'controller_pid':os.getpid(),'target_pid':process.pid,
         'controller_role':'native socket observer',
         'command':run_command,'compile_command':compile_command,'diagnostics_empty':not diagnostics,
         'seconds_requested':args.seconds,'connections':args.connections,'status':status,
-        'samples':len(samples),'wall_seconds':time.time()-started,'sanitized':None if args.binary else args.sanitize,'sanitized_requested':args.sanitize,'binary_prebuilt':bool(args.binary),
-        'last_sample':samples[-1] if samples else None,
+        'samples':sample_count,'wall_seconds':time.time()-started,'sanitized':None if args.binary else args.sanitize,'sanitized_requested':args.sanitize,'binary_prebuilt':bool(args.binary),
+        'last_sample':last_sample,
         'last_peer':last_peer,'observer_failure':failure,'completed':complete,
-        **memory_summary(samples),
+        **summary,
         'scope':'native TCP/UDP/readiness/timers; no TLS or QUIC transport'}
 (args.output/'report.json').write_text(json.dumps(report,indent=2)+'\n')
 print(json.dumps(report),flush=True)
 assert status==0 and complete and failure is None and not diagnostics, 'soak crashed or timed out; inspect evidence'
-assert samples, 'soak emitted no samples'
+assert sample_count, 'soak emitted no samples'
 assert last_peer and last_peer['registry_slots'] <= args.connections+2, 'registry growth'

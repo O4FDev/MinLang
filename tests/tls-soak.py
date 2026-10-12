@@ -86,7 +86,7 @@ if compile_command:
     compiled=subprocess.run(compile_command,capture_output=True,text=True,env=environment)
     assert compiled.returncode==0,compiled.stderr
 run_command=[str(program),str(port),str(args.seconds),str(args.connections),str(fixtures.path('root','der')),str(fixtures.path('client','der')),str(fixtures.path('client','pk8'))]
-started=time.time(); samples=[]; complete=False; failure=None
+started=time.time(); complete=False; failure=None
 with (temp/'stderr.log').open('w') as errors,(temp/'samples.jsonl').open('w') as evidence:
     process=subprocess.Popen(run_command,stdout=subprocess.PIPE,stderr=errors,start_new_session=True,env=environment)
     try:
@@ -94,7 +94,7 @@ with (temp/'stderr.log').open('w') as errors,(temp/'samples.jsonl').open('w') as
             if 'rss_kib' in sample: sample['controller']=process_sample(os.getpid())
             sample['server']=dict(stats)
             if sample.get('line','').startswith('complete '): complete=True
-            evidence.write(json.dumps(sample,sort_keys=True)+'\n'); evidence.flush(); samples.append(sample)
+            evidence.write(json.dumps(sample,sort_keys=True)+'\n'); evidence.flush()
     except Exception as error:
         failure=str(error)
     status=process.wait(timeout=15)
@@ -106,7 +106,9 @@ async def shutdown():
 asyncio.run_coroutine_threadsafe(shutdown(),loop).result(timeout=15)
 loop.call_soon_threadsafe(loop.stop); thread.join(15)
 diagnostics=(temp/'stderr.log').read_text()
-report={'binary_sha256':hashlib.sha256(program.read_bytes()).hexdigest(),'command':run_command,'compile_command':compile_command,'diagnostics_empty':not diagnostics,'status':status,'duration_seconds':time.time()-started,'connections':args.connections,'sanitized':None if args.binary else args.sanitize,'sanitized_requested':args.sanitize,'binary_prebuilt':bool(args.binary),'controller_pid':os.getpid(),'target_pid':process.pid,'controller_role':'TLS server and observer share this process','server':stats,'unexpected_server_errors':unexpected,'observer_failure':failure,'completed':complete,**memory_summary(samples),'scope':'Minyar TLS1.3 mutual TLS and HTTP keep-alive; QUIC not included'}
+with (temp/'samples.jsonl').open() as saved:
+    summary=memory_summary(json.loads(line) for line in saved)
+report={'binary_sha256':hashlib.sha256(program.read_bytes()).hexdigest(),'command':run_command,'compile_command':compile_command,'diagnostics_empty':not diagnostics,'status':status,'duration_seconds':time.time()-started,'connections':args.connections,'sanitized':None if args.binary else args.sanitize,'sanitized_requested':args.sanitize,'binary_prebuilt':bool(args.binary),'controller_pid':os.getpid(),'target_pid':process.pid,'controller_role':'TLS server and observer share this process','server':stats,'unexpected_server_errors':unexpected,'observer_failure':failure,'completed':complete,**summary,'scope':'Minyar TLS1.3 mutual TLS and HTTP keep-alive; QUIC not included'}
 (temp/'report.json').write_text(json.dumps(report,indent=2)+'\n'); print(json.dumps(report),flush=True)
 assert status==0 and not unexpected and failure is None and not diagnostics, 'soak failed; inspect evidence'
 assert complete, 'client did not complete'

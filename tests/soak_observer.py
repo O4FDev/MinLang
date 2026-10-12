@@ -79,16 +79,25 @@ def observe(process, timeout, period=1):
                 signal.signal(value, handler)
 
 def memory_summary(samples, warmup=60):
-    warm = [s for s in samples if s.get('elapsed_seconds', 0) >= warmup and 'rss_kib' in s]
-    if not warm:
-        return {'warm_rss_min_kib': None, 'warm_rss_max_kib': None, 'rss_slope_kib_per_second': None}
-    mean_time = sum(s['elapsed_seconds'] for s in warm) / len(warm)
-    mean_rss = sum(s['rss_kib'] for s in warm) / len(warm)
-    numerator = sum((s['elapsed_seconds'] - mean_time) * (s['rss_kib'] - mean_rss) for s in warm)
-    denominator = sum((s['elapsed_seconds'] - mean_time) ** 2 for s in warm)
-    return {'warm_rss_min_kib': min(s['rss_kib'] for s in warm),
-            'warm_rss_max_kib': max(s['rss_kib'] for s in warm),
-            'rss_slope_kib_per_second': numerator / denominator if denominator else 0}
+    # Online centered moments consume iterators without retaining sample rows.
+    count = 0
+    mean_time = mean_rss = covariance = variance = 0.0
+    low = high = None
+    for sample in samples:
+        if not (sample.get('elapsed_seconds', 0) >= warmup and 'rss_kib' in sample):
+            continue
+        elapsed, rss = sample['elapsed_seconds'], sample['rss_kib']
+        count += 1
+        delta_time, delta_rss = elapsed - mean_time, rss - mean_rss
+        mean_time += delta_time / count
+        mean_rss += delta_rss / count
+        covariance += delta_time * (rss - mean_rss)
+        variance += delta_time * (elapsed - mean_time)
+        low = rss if low is None else min(low, rss)
+        high = rss if high is None else max(high, rss)
+    return {'warm_rss_min_kib': low, 'warm_rss_max_kib': high,
+            'rss_slope_kib_per_second': None if not count else covariance / variance if variance else 0}
+
 
 def require_remote_lab():
     if not sys.platform.startswith('linux') or os.environ.get('MINYAR_REMOTE_LAB') != '1':
