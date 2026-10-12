@@ -21,7 +21,7 @@ def main():
             for name in order:
                 start = time.perf_counter_ns()
                 subprocess.run([str(getattr(args, name).resolve()), str(args.source.resolve()), str(output)],
-                               check=True, stdout=subprocess.DEVNULL, timeout=60)
+                               check=True, capture_output=True, timeout=60)
                 elapsed = (time.perf_counter_ns() - start) / 1e9
                 if repeat >= 3:
                     samples[name].append(elapsed)

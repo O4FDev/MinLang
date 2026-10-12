@@ -54,9 +54,9 @@ def check(compiler, directory, clang, runtime, profile):
             if result.stdout != expected or result.stderr:
                 raise AssertionError(f'{compiler}: {name} {optimization}: {result}')
     for source, diagnostic in (
-        ('print(missing)\n', 'unknown'),
+        ('print(missing)\n', "can't find a value named"),
         ('print(9223372036854775808)\n', 'outside the supported range'),
-        ('let value: Integer = "wrong"\n', 'type'),
+        ('let value: Integer = "wrong"\n', 'integer'),
     ):
         path = directory / 'invalid.min'
         path.write_text(source)
