@@ -555,7 +555,13 @@ def main():
         elif library == 'callbackruntime':
             # This bounded service entry is supplied by the opt-in engine.
             pass
-        elif library in ('files', 'system'):
+        elif library == 'system':
+            native += [native_object(project, clang, base, 'system.c', native_flags)]
+            if platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
+                native += ['-lpsapi']
+            else:
+                native += ['-pthread']
+        elif library == 'files':
             if platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
                 raise ValueError(f'the {library} package currently supports macOS and Linux')
             native += [native_object(project, clang, base, library + '.c', native_flags)]
