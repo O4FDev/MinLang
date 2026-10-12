@@ -36,6 +36,16 @@ function main(): Integer {
     print(location.valid)
     print(location.letter)
     print(location.counter)
+    let bytes = Bytes("Aé🙂")
+    print(bytes.length)
+    print(bytes[0])
+    print(bytes[1])
+    print(Bytes(3).length)
+    let frames = Bytes(0)
+    frames.addInt64(-42)
+    print(frames.getInt64(0))
+    frames.setInt64(0, 42)
+    print(frames.getInt64(0))
     return 0
 }
 ''')
@@ -46,8 +56,9 @@ function main(): Integer {
                                            '-Wno-override-module', llvm, ROOT / 'runtime/minyar_runtime.c',
                                            '-o', executable]), capture_output=True, text=True)
     assert linked.returncode == 0, linked.stderr
-    assert subprocess.check_output([executable], text=True) == '42\nsource\ntrue\nQ\nchanged\nfalse\nZ\n42\n'
+    assert subprocess.check_output([executable], text=True) == '42\nsource\ntrue\nQ\nchanged\nfalse\nZ\n42\n7\n65\n195\n3\n-42\n42\n'
     failures = [
+        ('function main(): Integer { let bytes = Bytes(true); return 0 }\n', 'Bytes expects one Integer or Text value'),
         ('record Pair { value: Integer }\nfunction main(): Integer { let p = Pair { value: 1 }; p.value = \"bad\"; return 0 }\n', 'this field contains'),
         ('record Pair { value: Integer; value: Text }\n', 'more than once'),
         ('record Pair { value: Integer }\nrecord Pair { value: Integer }\n', 'more than once'),

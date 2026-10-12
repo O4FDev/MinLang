@@ -29,6 +29,7 @@ enum {
     TYPE_CHARACTER,
     TYPE_BOOLEAN,
     TYPE_NOTHING,
+    TYPE_BYTES = 8,
     TYPE_LIST_INTEGER = 101,
     TYPE_LIST_TEXT,
     TYPE_LIST_CHARACTER,
@@ -477,6 +478,8 @@ static Type parse_type(Parser *parser) {
         type = TYPE_BOOLEAN;
     else if (word_is(parser, "Nothing"))
         type = TYPE_NOTHING;
+    else if (word_is(parser, "Bytes"))
+        type = TYPE_BYTES;
     else if (word_is(parser, "List")) {
         advance(parser);
         expect(parser, '<', "'<' followed by the list's element type");
@@ -865,7 +868,8 @@ static void parse_record(Parser *parser) {
                 record.name);
     if (!strcmp(record.name, "Integer") || !strcmp(record.name, "Text") ||
         !strcmp(record.name, "Character") || !strcmp(record.name, "Boolean") ||
-        !strcmp(record.name, "Nothing") || !strcmp(record.name, "List"))
+        !strcmp(record.name, "Nothing") || !strcmp(record.name, "Bytes") ||
+        !strcmp(record.name, "List"))
         fail_at(parser->token.line, parser->token.column,
                 "a record cannot replace a built-in type");
     int index = (int)arrlen(parser->program.records);
@@ -932,6 +936,8 @@ static const char *type_name(Type type) {
         return "Boolean";
     case TYPE_NOTHING:
         return "Nothing";
+    case TYPE_BYTES:
+        return "Bytes";
     case TYPE_LIST_INTEGER:
         return "List<Integer>";
     case TYPE_LIST_TEXT:
@@ -950,6 +956,7 @@ static const char *llvm_type(Type type) {
     case TYPE_INTEGER:
         return "i64";
     case TYPE_TEXT:
+    case TYPE_BYTES:
         return "ptr";
     case TYPE_CHARACTER:
         return "i32";
@@ -1083,6 +1090,16 @@ static Type check_expression(Program *program, Function *function, Expression *e
                         "Nothing cannot be converted to Text");
             return expression->type = TYPE_TEXT;
         }
+        if (strcmp(expression->text, "Bytes") == 0) {
+            if (arrlen(expression->arguments) != 1)
+                fail_at(expression->line, expression->column,
+                        "Bytes expects one Integer or Text value");
+            left = check_expression(program, function, expression->arguments[0]);
+            if (left != TYPE_INTEGER && left != TYPE_TEXT)
+                fail_at(expression->line, expression->column,
+                        "Bytes expects one Integer or Text value");
+            return expression->type = TYPE_BYTES;
+        }
         if (strcmp(expression->text, "Character") == 0) {
             if (arrlen(expression->arguments) != 1)
                 fail_at(expression->line, expression->column,
@@ -1215,7 +1232,8 @@ static Type check_expression(Program *program, Function *function, Expression *e
         }
         if (left == TYPE_TEXT && strcmp(expression->text, "byteLength") == 0)
             return expression->type = TYPE_INTEGER;
-        if ((left == TYPE_TEXT || (left >= TYPE_LIST_INTEGER && left <= TYPE_LIST_BOOLEAN)) &&
+        if ((left == TYPE_TEXT || left == TYPE_BYTES ||
+             (left >= TYPE_LIST_INTEGER && left <= TYPE_LIST_BOOLEAN)) &&
             strcmp(expression->text, "length") == 0)
             return expression->type = TYPE_INTEGER;
         fail_at(expression->line, expression->column, "%s does not have a property named '%s'",
@@ -1227,6 +1245,8 @@ static Type check_expression(Program *program, Function *function, Expression *e
         require_type(expression->right, right, TYPE_INTEGER, "a position");
         if (left == TYPE_TEXT)
             return expression->type = TYPE_CHARACTER;
+        if (left == TYPE_BYTES)
+            return expression->type = TYPE_INTEGER;
         if (left >= TYPE_LIST_INTEGER && left <= TYPE_LIST_BOOLEAN)
             return expression->type = TYPE_INTEGER + left - TYPE_LIST_INTEGER;
         fail_at(expression->line, expression->column, "%s values cannot be accessed by position",
@@ -1254,6 +1274,22 @@ static Type check_expression(Program *program, Function *function, Expression *e
         return expression->type;
     case EXPRESSION_METHOD_CALL:
         left = check_expression(program, function, expression->left);
+        if (left == TYPE_BYTES) {
+            int count = !strcmp(expression->text, "setInt64") ? 2 : 1;
+            if (strcmp(expression->text, "getInt64") && strcmp(expression->text, "addInt64") &&
+                strcmp(expression->text, "setInt64"))
+                fail_at(expression->line, expression->column,
+                        "Bytes does not provide the '%s' operation", expression->text);
+            if (arrlen(expression->arguments) != count)
+                fail_at(expression->line, expression->column,
+                        "Bytes.%s expects %d Integer arguments", expression->text, count);
+            for (index = 0; index < (size_t)count; index++)
+                require_type(expression->arguments[index],
+                             check_expression(program, function, expression->arguments[index]),
+                             TYPE_INTEGER, "a Bytes method argument");
+            return expression->type =
+                       !strcmp(expression->text, "getInt64") ? TYPE_INTEGER : TYPE_NOTHING;
+        }
         if (left == TYPE_TEXT) {
             if (!strcmp(expression->text, "trim")) {
                 if (arrlen(expression->arguments))
@@ -1565,6 +1601,14 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
             arrfree(arguments);
             return make_value(TYPE_TEXT, "%%value.%d", temporary);
         }
+        if (strcmp(expression->text, "Bytes") == 0) {
+            temporary = new_temporary(emitter);
+            fprintf(output, "  %%value.%d = call ptr @minyar_%s(%s %s)\n", temporary,
+                    arguments[0].type == TYPE_TEXT ? "text_bytes" : "bytes_new",
+                    llvm_type(arguments[0].type), arguments[0].name);
+            arrfree(arguments);
+            return make_value(TYPE_BYTES, "%%value.%d", temporary);
+        }
         if (strcmp(expression->text, "Character") == 0) {
             temporary = new_temporary(emitter);
             fprintf(output, "  %%value.%d = call i32 @.minyar.character.checked(i64 %s)\n",
@@ -1681,7 +1725,10 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
                     left.name);
         else
             fprintf(output, "  %%value.%d = call i64 @minyar_%s_length(ptr %s)\n", temporary,
-                    expression->left->type == TYPE_TEXT ? "text" : "list", left.name);
+                    expression->left->type == TYPE_TEXT    ? "text"
+                    : expression->left->type == TYPE_BYTES ? "bytes"
+                                                           : "list",
+                    left.name);
         return make_value(TYPE_INTEGER, "%%value.%d", temporary);
     case EXPRESSION_INDEX:
         left = emit_expression(emitter, expression->left);
@@ -1691,6 +1738,10 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
             fprintf(output, "  %%value.%d = call i32 @minyar_text_character_at(ptr %s, i64 %s)\n",
                     temporary, left.name, right.name);
             return make_value(TYPE_CHARACTER, "%%value.%d", temporary);
+        } else if (expression->left->type == TYPE_BYTES) {
+            fprintf(output, "  %%value.%d = call i64 @minyar_bytes_get(ptr %s, i64 %s)\n",
+                    temporary, left.name, right.name);
+            return make_value(TYPE_INTEGER, "%%value.%d", temporary);
         } else {
             int raw = temporary;
             Type element = expression->type;
@@ -1725,6 +1776,26 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
     }
     case EXPRESSION_METHOD_CALL:
         left = emit_expression(emitter, expression->left);
+        if (expression->left->type == TYPE_BYTES) {
+            Value *arguments = NULL;
+            for (index = 0; index < (size_t)arrlen(expression->arguments); index++)
+                arrput(arguments, emit_expression(emitter, expression->arguments[index]));
+            temporary = expression->type == TYPE_NOTHING ? -1 : new_temporary(emitter);
+            fputs("  ", output);
+            if (temporary >= 0)
+                fprintf(output, "%%value.%d = ", temporary);
+            const char *operation = !strcmp(expression->text, "getInt64")   ? "get"
+                                    : !strcmp(expression->text, "setInt64") ? "set"
+                                                                            : "add";
+            fprintf(output, "call %s @minyar_bytes_%s_int64(ptr %s", llvm_type(expression->type),
+                    operation, left.name);
+            for (index = 0; index < (size_t)arrlen(arguments); index++)
+                fprintf(output, ", i64 %s", arguments[index].name);
+            fputs(")\n", output);
+            arrfree(arguments);
+            return temporary < 0 ? make_value(TYPE_NOTHING, "")
+                                 : make_value(TYPE_INTEGER, "%%value.%d", temporary);
+        }
         if (expression->left->type == TYPE_TEXT && strcmp(expression->text, "slice")) {
             const char *name = !strcmp(expression->text, "startsWith") ? "starts_with"
                                : !strcmp(expression->text, "endsWith") ? "ends_with"
@@ -2060,6 +2131,13 @@ static void emit_program(FILE *output, Program *program) {
           "declare zeroext i1 @minyar_file_exists(ptr)\n"
           "declare void @minyar_write_text_file(ptr, ptr)\n"
           "declare void @minyar_write_text_parts(ptr, ptr)\n"
+          "declare ptr @minyar_bytes_new(i64)\n"
+          "declare ptr @minyar_text_bytes(ptr)\n"
+          "declare i64 @minyar_bytes_length(ptr)\n"
+          "declare i64 @minyar_bytes_get(ptr, i64)\n"
+          "declare i64 @minyar_bytes_get_int64(ptr, i64)\n"
+          "declare void @minyar_bytes_add_int64(ptr, i64)\n"
+          "declare void @minyar_bytes_set_int64(ptr, i64, i64)\n"
           "declare ptr @minyar_list_new()\n"
           "declare void @minyar_list_add(ptr, i64)\n"
           "declare i64 @minyar_list_length(ptr)\n"
