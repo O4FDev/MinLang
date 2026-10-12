@@ -97,3 +97,28 @@ Pending: independent parent review; actual Windows execution on its admitted
 verified relay; root integration/full programme performance regression gates.
 No rebase/v2 merge/push by this child, no downstream edits, no paid spend. All
 owned remote jobs are exited; parent controls host lifecycle and slot release.
+
+## R1 correction and requalification
+
+Independent R1 requested one P2 fix: FIN plus backpressured writes could keep
+HUP ready and spin. Corrected in1751f1e: unwatch immediately on writing HUP,
+retain unsent bytes, bounded10ms would-block probes through shared wait clamping,
+unchanged fixed deadline and I/O fairness budget. Mandatory combined regression
+detects spin and proves exact4MiB resumed-FIN replies, timer/other-client
+progress and cleanup. The initial red530995 waits/530965 closed-only, plus an
+intermediate unchanged-bound nonpass, are preserved.
+
+The first corrected default benchmark failed hit p99=1.6303; entire failed
+run retained. Performance change f6d9dfb packs responses<=64KiB with headers;
+large bodies remain borrowed. After source-bound full correctness/SAN tests,
+all original default three-round/five-cohort p50 ANDp99 gates passed on the
+exclusive quiet host (PID33933, exit0; worst1.103x). No gate, corpus, delay,
+cohort or sample selection was changed. Original283a/bd43 evidence is intact.
+
+Test-only64bb2e9 adds empty/65535/65536/65537 exact binary pipeline/CL boundaries.
+Final source-bound baseline f4 compiler debug/release/ASan+UBSan+LSan plus all
+protocol/HUP/front controls pass (PID79356), as do bounded Mac native checks.
+All jobs exited. Complete original finding, reply, red/failure/passing runs,
+runner commands, source/mode/tool/object identities and samples are in
+ws4-http-r1-response.md and ws4-http-evidence/r1/. Fresh independent R2 and
+actual Windows execution remain pending, alongside root integration gates.
