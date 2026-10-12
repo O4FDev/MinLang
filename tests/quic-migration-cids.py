@@ -36,6 +36,8 @@ BASELINE = {
     "response-mixed-loss": (36, "semantic failure: PATH_RESPONSE retransmitted after loss or PTO"),
     "response-mixed-path-loss": (36, "semantic failure: PATH_RESPONSE retransmitted after loss or PTO"),
     "cid-stock-single-path": (0, "original-CID traffic retained exactly two drained wire IDs"),
+    "cid-stock-receive-size": (66, "semantic failure: supported peer datagram exceeds advertised receive size"),
+    "cid-stock-receive-size-server": (66, "semantic failure: supported peer datagram exceeds advertised receive size"),
     "cid-stock-first-use": (66, "semantic failure: authenticated CID1 use did not supply wire CID2"),
     "cid-stock-first-use-server": (66, "semantic failure: authenticated CID1 use did not supply wire CID2"),
     "cid-stock-chain": (66, "semantic failure: consumed CID had no fresh wire-observed spare"),
