@@ -15,14 +15,15 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--prepare',action='store_true'); p.add_argument('--measure',action='store_true')
     p.add_argument('--work',type=Path,default=ROOT/'build/tar-native-benchmark')
-    p.add_argument('--samples',type=int,default=7); p.add_argument('--output',type=Path)
+    p.add_argument('--release',action='store_true'); p.add_argument('--samples',type=int,default=7); p.add_argument('--output',type=Path)
     a=p.parse_args(); a.work.mkdir(parents=True,exist_ok=True)
     if a.prepare and a.measure: p.error('prepare and measure must be separate commands')
     if a.prepare:
-        build_program(a.work,ROOT/'benchmarks/tar/minyar.min','minyar',False)
+        build_program(a.work,ROOT/'benchmarks/tar/minyar.min','minyar',False,release=a.release)
         clang=os.environ.get('MINYAR_TEST_CLANG','clang')
-        cflags,libraries=tar_provider(clang,('-O2',))
-        subprocess.run([clang,'-O2',*cflags,ROOT/'benchmarks/tar/libarchive.c',*libraries,'-o',a.work/'libarchive'],check=True)
+        flags=['-O2', *(['-flto','-fuse-ld=lld'] if a.release and platform.system()=='Linux' else ['-flto'] if a.release else [])]
+        cflags,libraries=tar_provider(clang,tuple(flags))
+        subprocess.run([clang,*flags,*cflags,ROOT/'benchmarks/tar/libarchive.c',*libraries,'-o',a.work/'libarchive'],check=True)
         for name,count,size in [('metadata',1024,64),('payload',64,65536)]:
             out=io.BytesIO()
             with tarfile.open(fileobj=out,mode='w',format=tarfile.USTAR_FORMAT) as t:
@@ -33,7 +34,7 @@ def main():
             (a.work/f'{name}.tar').write_bytes(out.getvalue())
         from format_provider import provider_info
         manifest={'machine':platform.platform(),'compiler':call([clang,'--version']),
-                  'libarchive':call([a.work/'libarchive','version']),'provider':provider_info('tararchive',clang,('-O2',)),'sources':{}}
+                  'release':a.release,'libarchive':call([a.work/'libarchive','version']),'provider':provider_info('tararchive',clang,('-O2',)),'sources':{}}
         compiler=Path(os.environ.get('MINYAR_TEST_COMPILER',ROOT/'build/minyarc'))
         for file in [ROOT/'library/tar.min',ROOT/'runtime/native/tararchive.c',ROOT/'runtime/minyar_native.h',ROOT/'benchmarks/tar/minyar.min',ROOT/'benchmarks/tar/libarchive.c',ROOT/'benchmarks/tar/run.py',ROOT/'tests/tar.py',a.work/'minyar',a.work/'libarchive',a.work/'runtime.o',compiler,ROOT/'runtime/minyar_runtime.c',a.work/'metadata.tar',a.work/'payload.tar']:
             manifest['sources'][str(file)]=hashlib.sha256(file.read_bytes()).hexdigest()
