@@ -1,0 +1,116 @@
+function recoveryCheckpoint(output: List<Text>, textState: List<Text>, state: List<Integer>) {
+    let pending = valueName(textState, newTemporary(state))
+    let failed = valueName(textState, newTemporary(state))
+    let continuation = "recovery.continue." + Text(newLabel(state))
+    output.add("  " + pending + " = call i32 @minyar_recovery_pending()\n")
+    output.add("  " + failed + " = icmp ne i32 " + pending + ", 0\n")
+    output.add(conditionalBranch(failed, "recovery.unwind", continuation))
+    output.add("\n" + continuation + ":\n")
+    textState[0] = continuation
+}
+
+function recoveryNativeCheckpoint(output: List<Text>, textState: List<Text>, state: List<Integer>, type: Integer) {
+    let pending = valueName(textState, newTemporary(state))
+    let failed = valueName(textState, newTemporary(state))
+    let continuation = "recovery.native.continue." + Text(newLabel(state))
+    let rejected = "recovery.native.return." + Text(newLabel(state))
+    output.add("  " + pending + " = call i32 @minyar_recovery_pending()\n")
+    output.add("  " + failed + " = icmp ne i32 " + pending + ", 0\n")
+    output.add(conditionalBranch(failed, rejected, continuation))
+    output.add("\n" + rejected + ":\n")
+    // Native ABI producers return an owned value. If a cooperating native
+    // bridge reentered a failing language callback, discard its result before
+    // unwinding this accepted wrapper. Caller never consumes the dummy.
+    if isReferenceType(type) { output.add("  call void @minyar_rc_release(ptr %native.result)\n") }
+    output.add("  br label %recovery.unwind\n")
+    output.add("\n" + continuation + ":\n")
+    textState[0] = continuation
+}
+
+function recoveryOwnedCheckpoint(output: List<Text>, textState: List<Text>, state: List<Integer>, owned: Text) {
+    let pending = valueName(textState, newTemporary(state))
+    let failed = valueName(textState, newTemporary(state))
+    let continuation = "recovery.continue." + Text(newLabel(state))
+    let rejected = "recovery.release." + Text(newLabel(state))
+    output.add("  " + pending + " = call i32 @minyar_recovery_pending()\n")
+    output.add("  " + failed + " = icmp ne i32 " + pending + ", 0\n")
+    output.add(conditionalBranch(failed, rejected, continuation))
+    // The fresh result is not yet a frame owner, so the unwind edge drops it.
+    output.add("\n" + rejected + ":\n  call void @minyar_rc_release(ptr " + owned + ")\n  br label %recovery.unwind\n")
+    output.add("\n" + continuation + ":\n")
+    textState[0] = continuation
+}
+
+function recoveryResetConstant(output: List<Text>, slot: Integer, flag: Text) {
+    let piece = output.length - 1
+    while piece > slot && output[piece] != "\nrecovery.unwind:\n" { piece = piece - 1 }
+    if piece == slot { fail("recovery constant unwind metadata drifted") }
+    output[piece] = output[piece] + "  store i8 0, ptr " + flag + "\n"
+}
+
+function recoveryDummy(type: Text): Text {
+    if type == "void" { return "  ret void\n" }
+    if type == "ptr" { return "  ret ptr null\n" }
+    if type == "double" { return "  ret double 0.0\n" }
+    return "  ret " + type + " 0\n"
+}
+
+function compileDepthBoundary(output: List<Text>, names: List<Text>, kinds: List<Integer>, returns: List<Integer>, counts: List<Integer>, fields: List<Integer>, name: Text, returnType: Integer) {
+    let function = findFunction(names, kinds, returns, name)
+    let first = functionParameterOffset(counts, function)
+    let readable = readableDeclarationName(name)
+    if readable == "remaining" && counts[function] == 0 && returnType == 1 {
+        output.add("  %depth.remaining = call i64 @minyar_calldepth_remaining()\n  ret i64 %depth.remaining\n")
+        return
+    }
+    if readable != "run" || counts[function] != 2 || fields[first] != 1 || !isCallbackType(fields[first + 1], names) {
+        fail("calldepth native boundary requires run(Integer, Callback<Integer>)")
+    }
+    let signature = callbackSignatureTypes(names[fields[first + 1] - 1000])
+    if signature.length != 1 || signature[0] != 1 { fail("calldepth.run requires Callback<Integer>") }
+    let prefix = name.slice(0, name.length - 3)
+    let success = findFunction(names, kinds, returns, prefix + "depthSuccess")
+    let failure = findFunction(names, kinds, returns, prefix + "depthFailure")
+    if success < 0 || failure < 0 { fail("calldepth requires its result factories") }
+    if returns[success] != returnType || returns[failure] != returnType || !isRecordType(returnType) {
+        fail("calldepth result factories have incompatible types")
+    }
+    if counts[success] != 1 || counts[failure] != 0 { fail("calldepth result factories have incompatible signatures") }
+    let successParameter = functionParameterOffset(counts, success)
+    if fields[successParameter] != 1 { fail("calldepth success factory requires Integer") }
+    output.add("  call void @minyar_callback_check(ptr %argument.1)\n")
+    output.add("  %depth.parent.pending = call i32 @minyar_recovery_pending()\n")
+    output.add("  %depth.parent.failed = icmp ne i32 %depth.parent.pending, 0\n")
+    output.add("  br i1 %depth.parent.failed, label %depth.parent.unwind, label %depth.start\n")
+    output.add("depth.parent.unwind:\n  ret ptr null\ndepth.start:\n")
+    output.add("  %depth.scope = alloca [32 x i8], align 8\n")
+    output.add("  call void @minyar_calldepth_begin(ptr %depth.scope, i64 %argument.0)\n")
+    output.add("  %depth.code.slot = getelementptr i64, ptr %argument.1, i64 1\n  %depth.code = load ptr, ptr %depth.code.slot\n")
+    output.add("  %depth.env.slot = getelementptr i64, ptr %argument.1, i64 2\n  %depth.env = load ptr, ptr %depth.env.slot\n")
+    output.add("  %depth.value = call i64 %depth.code(ptr %depth.env)\n")
+    output.add("  %depth.status = call i32 @minyar_calldepth_end(ptr %depth.scope)\n")
+    output.add("  %depth.report.accepted = call i32 @minyar_calldepth_reporting_begin()\n")
+    output.add("  %depth.report.allowed = icmp ne i32 %depth.report.accepted, 0\n")
+    output.add("  br i1 %depth.report.allowed, label %depth.report.body, label %depth.report.unwind\n")
+    output.add("depth.report.unwind:\n  ret ptr null\ndepth.report.body:\n")
+    output.add("  %depth.failed = icmp ne i32 %depth.status, 0\n  br i1 %depth.failed, label %depth.failure, label %depth.success\n")
+    output.add("depth.failure:\n  %depth.error = call ptr @.minyar.fn." + names[failure] + "()\n")
+    output.add("  br label %depth.report.finish\n")
+    output.add("depth.success:\n  %depth.result = call ptr @.minyar.fn." + names[success] + "(i64 %depth.value)\n")
+    output.add("  br label %depth.report.finish\ndepth.report.finish:\n")
+    output.add("  %depth.report.result = phi ptr [ %depth.error, %depth.failure ], [ %depth.result, %depth.success ]\n")
+    output.add("  %depth.report.status = call i32 @minyar_calldepth_reporting_end()\n")
+    output.add("  %depth.report.failed = icmp ne i32 %depth.report.status, 0\n")
+    output.add("  br i1 %depth.report.failed, label %depth.report.discard, label %depth.report.return\n")
+    output.add("depth.report.discard:\n  call void @minyar_rc_release(ptr %depth.report.result)\n  ret ptr null\n")
+    output.add("depth.report.return:\n  ret ptr %depth.report.result\n")
+}
+
+function recoveryTextPosition(text: Text, wanted: Text): Integer {
+    let position = 0
+    while position + wanted.length <= text.length {
+        if text.slice(position, position + wanted.length) == wanted { return position }
+        position = position + 1
+    }
+    return -1
+}

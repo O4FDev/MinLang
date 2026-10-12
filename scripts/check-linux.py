@@ -32,6 +32,8 @@ TARGETS = ['check-raw-syscall-linux-native', 'check-raw-syscall-sanitize', 'chec
            'check-checked-arithmetic', 'check-checked-scalars',
            'check-checked-results', 'check-checked-results-sanitize',
            'check-checked-results-frontends', 'check-checked-results-frontends-sanitize',
+           'check-calldepth', 'check-calldepth-sanitize', 'check-calldepth-profiles', 'check-calldepth-launcher',
+           'check-calldepth-reporting', 'check-calldepth-reporting-sanitize', 'check-calldepth-hooks', 'check-calldepth-hooks-sanitize',
            'check-runtime-bytes', 'check-runtime-traps', 'check-runtime-numeric',
            'check-shipping', 'check-errors-values', 'check-errors-language', 'check-errors-language-sanitize', 'check-errors-language-bounded', 'check-errors-launcher', 'check-errors-review', 'check-errors-review-sanitize', 'check-errors-review-bounded', 'check-errors-review-bounded-sanitize', 'check-schannel-framing', 'check-schannel-framing-sanitize', 'check-net', 'check-net-loop', 'check-net-udp-offload', 'check-net-udp-offload-sanitize', 'check-tls', 'check-tls-sanitize',
            'check-peer-live', 'check-peer-live-sanitize',
