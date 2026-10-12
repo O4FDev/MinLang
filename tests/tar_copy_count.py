@@ -41,8 +41,8 @@ def main():
         receipt['runs'][operation]={'command':[str(x) for x in run],'observable':expected,'counts':counts}
     read=receipt['runs']['read']['counts']; write=receipt['runs']['roundtrip']['counts']
     assert read['large_slices']==read['large_extends']==0
-    assert write['large_slices']==write['large_extends']==1
-    assert write['large_slice_bytes']==write['large_extend_bytes']==4228096
+    assert write['large_slices']==write['large_extends']==0
+    assert write['large_slice_bytes']==write['large_extend_bytes']==0
     (args.artifacts/'results.json').write_text(json.dumps(receipt,indent=2)+'\n')
     print(json.dumps({operation:data['counts'] for operation,data in receipt['runs'].items()}))
 

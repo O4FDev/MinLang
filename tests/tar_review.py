@@ -54,6 +54,7 @@ def run(work,sanitize=False,environment=None):
         bounds[name]=spans[-1][4] if success else None
         cases.append((name,source,['bound',str(maximum),'accept' if success else 'reject'],success))
     cases.append(('fresh-finish',None,['finish'],True))
+    cases.append(('owned-finish',None,['owned'],True))
     hashes={str(path.relative_to(ROOT)):hashlib.sha256(path.read_bytes()).hexdigest() for path in
             [ROOT/'library/tar.min',ROOT/'runtime/native/tararchive.c',ROOT/'tests/tar-review.min',ROOT/'tests/tar_review.py',ROOT/'tests/tar_support.py',ROOT/'tests/tar.py',ROOT/'runtime/minyar_runtime.c']}
     compiler=Path(os.environ.get('MINYAR_TEST_COMPILER',ROOT/'build/minyarc'))
@@ -67,7 +68,7 @@ def run(work,sanitize=False,environment=None):
         if source is not None: input.write_bytes(source)
         prefix=work/(name+'-out-')
         if arguments[0]=='bound': command=[binary,'bound',input,*arguments[1:]]
-        elif arguments[0]=='finish': command=[binary,'finish']
+        elif arguments[0] in ('finish','owned'): command=[binary,arguments[0]]
         else: command=[binary,arguments[0],input,prefix]
         result=subprocess.run(command,text=True,capture_output=True,env=environment,timeout=30)
         problem=None

@@ -1,8 +1,3 @@
-/* Bounded OCI tar binding. libarchive owns archive validation and header/data
- * writing; the wire scanner adds exact PAX semantics, byte names, attributes,
- * strict limits and physical spans that libarchive's public API cannot expose.
- * Context pointers are private to shared Minyar records, never public handles.
- */
 #include "../minyar_native.h"
 #include <archive.h>
 #include <archive_entry.h>
@@ -11,18 +6,33 @@
 #include <inttypes.h>
 _Static_assert(sizeof(void *)==8 && sizeof(long long)==8 && sizeof(time_t)==8, "tar binding requires the 64-bit native ABI");
 
+typedef struct NativeRecord NativeRecord;
+typedef struct NativeList NativeList;
+extern NativeRecord *minyar_record_new(long long);
+extern long long minyar_record_get(const NativeRecord *, long long);
+extern void minyar_record_set_scalar(NativeRecord *, long long, long long);
+extern void minyar_record_set_take(NativeRecord *, long long, long long);
+extern NativeList *minyar_list_new(void);
+extern void minyar_list_references(NativeList *);
+extern void minyar_list_add_take(NativeList *, long long);
+extern long long minyar_list_length(const NativeList *);
+extern long long minyar_list_get(const NativeList *, long long);
+extern void minyar_rc_retain(void *);
+extern void minyar_rc_release(void *);
+
 typedef struct { const unsigned char *p; size_t n; } Blob;
 typedef struct { unsigned char *key, *value; size_t kn, vn; } Attr;
 typedef struct { Attr *a; size_t count, bytes; } Attrs;
 typedef struct {
-    struct archive *archive;
     const unsigned char *source; size_t length, position;
-    size_t max_path, max_metadata, max_chain, max_headers, headers; int normalize;
+    size_t max_path, max_metadata, max_chain, max_headers, headers;
     Attrs globals;
+    const char *last_error;
 } Reader;
 typedef struct {
     struct archive *archive;
-    unsigned char *output, *capture; size_t length, capacity, cn, cc, maximum;
+    MinyarBytes *output;
+    unsigned char *capture; size_t length, cn, cc, maximum;
     int capturing; const char *error;
 } Writer;
 typedef struct {
@@ -173,7 +183,7 @@ static int apply(Entry *e, const char **error) {
 }
 static int zero(const unsigned char *p,size_t n) { for (size_t i=0;i<n;i++) if (p[i]) return 0; return 1; }
 static int scan(Reader *r, Entry *e, const char **error) {
-    size_t at=r->position,start=at,chain=0,metadata=0,local_headers=0; Attrs local={0};
+    size_t at=r->position,start=at,chain=0,metadata=0; Attrs local={0};
     Blob long_path={0},long_link={0}; unsigned char combined[256]; int status=0;
     memset(e,0,sizeof(*e));
     for (;;) {
@@ -185,9 +195,16 @@ static int scan(Reader *r, Entry *e, const char **error) {
             status=2; break;
         }
         if (r->headers>=r->max_headers) { *error="tar header limit exceeded"; break; } r->headers++;
-        int64_t checksum; int64_t sum=0,signed_sum=0;
-        for (size_t i=0;i<512;i++) { int c=i>=148 && i<156 ? ' ' : h[i]; sum+=c; signed_sum+=c<128 ? c : c-256; }
-        if (!number(h+148,8,&checksum) || (checksum!=sum && checksum!=signed_sum)) { *error="tar checksum mismatch"; break; }
+        int64_t checksum, sum = 8 * ' ';
+        for (size_t i = 0; i < 148; i++) sum += h[i];
+        for (size_t i = 156; i < 512; i++) sum += h[i];
+        if (!number(h + 148, 8, &checksum)) { *error = "tar checksum mismatch"; break; }
+        if (checksum != sum) {
+            int64_t signed_sum = 8 * ' ';
+            for (size_t i = 0; i < 148; i++) signed_sum += (int8_t)h[i];
+            for (size_t i = 156; i < 512; i++) signed_sum += (int8_t)h[i];
+            if (checksum != signed_sum) { *error = "tar checksum mismatch"; break; }
+        }
         int v7=zero(h+257,8),ustar=!memcmp(h+257,"ustar\00000",8),gnu=!memcmp(h+257,"ustar  \0",8);
         if (!v7 && !ustar && !gnu) { *error="unsupported tar magic/version"; break; }
         e->type=h[156] ? h[156] : '0'; e->path=field(h,100); e->link=field(h+157,100);
@@ -218,9 +235,6 @@ static int scan(Reader *r, Entry *e, const char **error) {
         if (ext) {
             Blob data=blob(r->source+offset,(size_t)e->size);
             if (e->type=='x' || e->type=='g') {
-                // Resolve multiple local headers ourselves: provider recursion
-                // limits and earlier-header precedence differ from this API.
-                if (e->type=='g' || ++local_headers>1) r->normalize=1;
                 if (e->type=='g') { if (!pax_global(data,&r->globals,r->max_metadata,error)) break; }
                 else if (!pax_parse(data,&local,r->max_metadata,error)) break;
             }
@@ -243,107 +257,136 @@ static int scan(Reader *r, Entry *e, const char **error) {
     }
     attrs_free(&local); return status;
 }
-static void put_i64(MinyarBytes *b,int64_t v) { memcpy(minyar_bytes_extend(b,8),&v,8); }
-static void put_blob(MinyarBytes *b,Blob v) { put_i64(b,(int64_t)v.n); if (v.n) memcpy(minyar_bytes_extend(b,(long long)v.n),v.p,v.n); }
-static MinyarBytes *encode(Entry *e) {
-    MinyarBytes *b=minyar_bytes_new(0);
-    int64_t n[]={1,e->type,e->mode,e->uid,e->gid,e->seconds,e->nanos,e->size,e->major,e->minor,(int64_t)e->start,(int64_t)e->header,(int64_t)e->offset,(int64_t)e->end};
-    for (size_t i=0;i<14;i++) put_i64(b,n[i]);
-    put_blob(b,e->path); put_blob(b,e->link); put_blob(b,e->uname); put_blob(b,e->gname); put_i64(b,(int64_t)e->attrs.count);
-    for (size_t i=0;i<e->attrs.count;i++) { Attr *a=e->attrs.a+i; put_blob(b,blob(a->key,a->kn)); put_blob(b,blob(a->value,a->vn)); }
-    return b;
-}
 long long minyar_tararchive_openReader(const MinyarBytes *source,long long path,long long metadata,long long chain,long long headers) {
     if (!source || source->byte_length<0 || path<1 || metadata<0 || chain<1 || headers<1 || (uint64_t)source->byte_length>SIZE_MAX || (uint64_t)path>SIZE_MAX || (uint64_t)metadata>SIZE_MAX) return 0;
     Reader *r=calloc(1,sizeof(*r)); if (!r) return 0;
     r->source=source->bytes; r->length=(size_t)source->byte_length; r->max_path=(size_t)path; r->max_metadata=(size_t)metadata; r->max_chain=(size_t)chain; r->max_headers=(size_t)headers;
-    r->archive=archive_read_new(); if (!r->archive) { free(r); return 0; }
-    archive_read_support_filter_none(r->archive); archive_read_support_format_tar(r->archive);
-    // Opening can reject a malformed first header. Defer that error until next
-    // so EOF/error remain normal recoverable values with a sticky wrapper.
-    archive_read_open_memory(r->archive,r->source,r->length);
     return (long long)(intptr_t)r;
 }
-MinyarBytes *minyar_tararchive_readNext(long long handle) {
-    Reader *r=(Reader *)(intptr_t)handle; Entry e; const char *error="invalid tar";
-    int status=scan(r,&e,&error); MinyarBytes *out;
-    if (status==1) {
-        struct archive_entry *library_entry=NULL;
-        if (r->normalize) {
-            // libarchive ignores global PAX and differs on local chains. The
-            // scanner has resolved/validated that layer and cursor movement;
-            // validate each physical base header separately through libarchive.
-            archive_read_free(r->archive); r->archive=archive_read_new();
-            if (!r->archive) { free(e.owned_path); attrs_free(&e.attrs); return result(0,"allocation failure"); }
-            archive_read_support_filter_none(r->archive); archive_read_support_format_tar(r->archive);
-            archive_read_open_memory(r->archive,r->source+e.header,r->length-e.header);
-        }
-        int code=archive_read_next_header(r->archive,&library_entry);
-        if (code<ARCHIVE_WARN || code==ARCHIVE_EOF) out=result(0,"libarchive rejected tar member");
-        else out=encode(&e);
-
-    } else out=result(status,error);
-    free(e.owned_path); attrs_free(&e.attrs); return out;
+static MinyarBytes *owned_blob(Blob data) {
+    if (data.n >= SIZE_MAX / 2) minyar_native_stop("these tar bytes are too large");
+    MinyarBytes *out = minyar_native_copy_text(data.p, (long long)data.n);
+    out->character_length = (long long)data.n;
+    return out;
+}
+static void record_take(NativeRecord *record, long long field, void *value) {
+    minyar_record_set_take(record, field, (long long)(intptr_t)value);
+}
+static NativeRecord *managed_entry(const Entry *e, const Reader *r) {
+    NativeRecord *value = minyar_record_new(22);
+    record_take(value, 0, owned_blob(e->path)); record_take(value, 1, owned_blob(e->link));
+    int64_t numbers[] = {e->mode, e->uid, e->gid, e->seconds, e->nanos, e->type, e->size, e->major, e->minor};
+    for (size_t i = 0; i < 9; i++) minyar_record_set_scalar(value, (long long)i + 2, numbers[i]);
+    record_take(value, 11, owned_blob(e->uname)); record_take(value, 12, owned_blob(e->gname));
+    NativeList *attrs = minyar_list_new(); minyar_list_references(attrs);
+    for (size_t i = 0; i < e->attrs.count; i++) {
+        Attr *a = e->attrs.a + i;
+        NativeRecord *attribute = minyar_record_new(2);
+        record_take(attribute, 0, owned_blob(blob(a->key, a->kn)));
+        record_take(attribute, 1, owned_blob(blob(a->value, a->vn)));
+        minyar_list_add_take(attrs, (long long)(intptr_t)attribute);
+    }
+    record_take(value, 13, attrs);
+    int64_t spans[] = {(int64_t)e->start, (int64_t)e->header, (int64_t)e->offset, (int64_t)e->end,
+                       (int64_t)(intptr_t)r->source, (int64_t)r->length, e->size};
+    for (size_t i = 0; i < 7; i++) minyar_record_set_scalar(value, (long long)i + 14, spans[i]);
+    return value;
+}
+NativeRecord *minyar_tararchive_readValue(long long handle) {
+    Reader *r = (Reader *)(intptr_t)handle;
+    Entry e; const char *error = "invalid tar";
+    int status = scan(r, &e, &error);
+    r->last_error = status == 0 ? error : NULL;
+    if (status != 1) {
+        free(e.owned_path); attrs_free(&e.attrs); memset(&e, 0, sizeof(e)); e.type = '0'; e.mode = 420;
+        e.start = e.header = e.offset = e.end = SIZE_MAX;
+    }
+    NativeRecord *out = managed_entry(&e, r);
+    minyar_record_set_scalar(out, 21, status);
+    free(e.owned_path); attrs_free(&e.attrs);
+    return out;
+}
+MinyarBytes *minyar_tararchive_readerMessage(long long handle) {
+    Reader *r = (Reader *)(intptr_t)handle;
+    const char *error = r->last_error ? r->last_error : "";
+    return owned_blob(blob((const unsigned char *)error, strlen(error)));
+}
+MinyarBytes *minyar_tararchive_copyRange(const MinyarBytes *source, long long offset, long long length) {
+    if (!source || offset < 0 || length < 0 || offset > source->byte_length || length > source->byte_length - offset)
+        return minyar_bytes_new(0);
+    return owned_blob(blob(source->bytes + offset, (size_t)length));
 }
 void minyar_tararchive_freeReader(long long handle) {
     Reader *r=(Reader *)(intptr_t)handle; if (!r) return;
-    archive_read_free(r->archive); attrs_free(&r->globals); free(r);
+    attrs_free(&r->globals); free(r);
 }
 MinyarText *minyar_tararchive_providerVersion(void) { const char *s=archive_version_string(); return minyar_native_copy_text((const unsigned char *)s,(long long)strlen(s)); }
 
 static la_ssize_t output_callback(struct archive *archive, void *opaque, const void *p, size_t n) {
     (void)archive; Writer *w=opaque;
-    unsigned char **buffer=w->capturing ? &w->capture : &w->output;
-    size_t *length=w->capturing ? &w->cn : &w->length,*capacity=w->capturing ? &w->cc : &w->capacity;
-    size_t maximum=w->capturing ? 1048576+32768 : w->maximum;
-    if (*length>maximum || n>maximum-*length || !grow(buffer,capacity,*length+n,maximum)) { w->error="tar output/capture limit or allocation failure"; return -1; }
-    if (n) memcpy(*buffer+*length,p,n); *length+=n; return (la_ssize_t)n;
+    if (!w->capturing) {
+        if (w->length > w->maximum || n > w->maximum - w->length) { w->error = "tar output limit exceeded"; return -1; }
+        if (n) memcpy(minyar_native_bytes_append(w->output, (long long)n), p, n);
+        w->length += n;
+        return (la_ssize_t)n;
+    }
+    size_t maximum = 1048576 + 32768;
+    if (w->cn > maximum || n > maximum - w->cn || !grow(&w->capture, &w->cc, w->cn + n, maximum)) { w->error = "tar capture limit or allocation failure"; return -1; }
+    if (n) memcpy(w->capture + w->cn, p, n); w->cn += n; return (la_ssize_t)n;
 }
 long long minyar_tararchive_openWriter(long long maximum) {
     if (maximum<1024 || (uint64_t)maximum>SIZE_MAX) return 0;
     Writer *w=calloc(1,sizeof(*w)); if (!w) return 0; w->maximum=(size_t)maximum;
     w->archive=archive_write_new(); if (!w->archive) { free(w); return 0; }
+    w->output = minyar_bytes_new(0);
     if (archive_write_set_format_pax_restricted(w->archive)!=ARCHIVE_OK ||
         archive_write_set_format_option(w->archive,"pax","hdrcharset","BINARY")!=ARCHIVE_OK ||
         archive_write_set_bytes_per_block(w->archive,0)!=ARCHIVE_OK ||
         archive_write_open(w->archive,w,NULL,output_callback,NULL)!=ARCHIVE_OK) {
-        archive_write_free(w->archive); free(w); return 0;
+        archive_write_free(w->archive); minyar_rc_release(w->output); free(w); return 0;
     }
     return (long long)(intptr_t)w;
-}
-static int take_i64(const unsigned char *p,size_t length,size_t *at,int64_t *out) {
-    if (*at>length || length-*at<8) return 0; memcpy(out,p+*at,8); *at+=8; return 1;
-}
-static int take_blob(const unsigned char *p,size_t length,size_t *at,Blob *out) {
-    int64_t n; if (!take_i64(p,length,at,&n) || n<0 || (uint64_t)n>length-*at) return 0;
-    *out=blob(p+*at,(size_t)n); *at+=(size_t)n; return 1;
 }
 static int standard(Blob k) {
     return equal(k,"path") || equal(k,"linkpath") || equal(k,"size") || equal(k,"uid") || equal(k,"gid") || equal(k,"mtime") ||
         equal(k,"uname") || equal(k,"gname") || equal(k,"SCHILY.devmajor") || equal(k,"SCHILY.devminor") || equal(k,"hdrcharset");
 }
-static int decode(const MinyarBytes *info,const MinyarBytes *data,Entry *e,const char **error) {
-    memset(e,0,sizeof(*e)); size_t at=0;
-    if (!info || !data || info->byte_length<0 || data->byte_length<0 || (uint64_t)info->byte_length>1048576+200000) { *error="excessive tar writer metadata"; return 0; }
-    const unsigned char *p=info->bytes; size_t n=(size_t)info->byte_length;
-    int64_t *fields[]={&e->type,&e->mode,&e->uid,&e->gid,&e->seconds,&e->nanos,&e->size,&e->major,&e->minor};
-    for (size_t i=0;i<9;i++) if (!take_i64(p,n,&at,fields[i])) { *error="invalid encoded tar metadata"; return 0; }
-    if (!take_blob(p,n,&at,&e->path) || !take_blob(p,n,&at,&e->link) || !take_blob(p,n,&at,&e->uname) || !take_blob(p,n,&at,&e->gname)) { *error="invalid encoded tar names"; return 0; }
-    if (e->type<'0' || e->type>'6' || e->mode<0 || e->mode>07777777 || e->major<0 || e->minor<0 || e->nanos<0 || e->nanos>=1000000000 || e->size!=data->byte_length || (e->type!='0' && data->byte_length)) { *error="invalid tar writer fields"; return 0; }
+static const MinyarBytes *entry_bytes(const NativeRecord *value, long long field) {
+    return (const MinyarBytes *)(intptr_t)minyar_record_get(value, field);
+}
+static int decode_value(const NativeRecord *value, const MinyarBytes *data, Entry *e, const char **error) {
+    memset(e, 0, sizeof(*e));
+    if (!value || !data || data->byte_length < 0) { *error = "invalid tar writer metadata"; return 0; }
+    e->type = minyar_record_get(value, 7); e->mode = minyar_record_get(value, 2);
+    e->uid = minyar_record_get(value, 3); e->gid = minyar_record_get(value, 4);
+    e->seconds = minyar_record_get(value, 5); e->nanos = minyar_record_get(value, 6);
+    e->size = data->byte_length; e->major = minyar_record_get(value, 9); e->minor = minyar_record_get(value, 10);
+    const MinyarBytes *names[] = {entry_bytes(value, 0), entry_bytes(value, 1), entry_bytes(value, 11), entry_bytes(value, 12)};
+    Blob *fields[] = {&e->path, &e->link, &e->uname, &e->gname};
+    for (size_t i = 0; i < 4; i++) {
+        if (!names[i] || names[i]->byte_length < 0 || names[i]->byte_length > 4096) { *error = "tar writer name limit/NUL"; return 0; }
+        *fields[i] = blob(names[i]->bytes, (size_t)names[i]->byte_length);
+    }
+    if (e->type<'0' || e->type>'6' || e->mode<0 || e->mode>07777777 || e->major<0 || e->minor<0 || e->nanos<0 || e->nanos>=1000000000 || (e->type!='0' && data->byte_length)) { *error="invalid tar writer fields"; return 0; }
     if (!string_ok(e->path,4096,0) || !string_ok(e->link,4096,1) || !string_ok(e->uname,4096,1) || !string_ok(e->gname,4096,1)) { *error="tar writer name limit/NUL"; return 0; }
-    int64_t count;
-    if (!take_i64(p,n,&at,&count) || count<0 || count>4096) { *error="tar writer attribute count"; return 0; }
-    size_t total=0;
-    for (int64_t i=0;i<count;i++) {
-        Blob k,v;
-        if (!take_blob(p,n,&at,&k) || !take_blob(p,n,&at,&v) || !k.n || k.n>1048576 || v.n>1048576-k.n || total>1048576-k.n-v.n) { *error="tar writer attribute bounds"; return 0; }
-        total+=k.n+v.n;
+    NativeList *attrs = (NativeList *)(intptr_t)minyar_record_get(value, 13);
+    if (!attrs) { *error = "tar writer attribute count"; return 0; }
+    long long count = minyar_list_length(attrs);
+    if (count < 0 || count > 4096) { *error = "tar writer attribute count"; return 0; }
+    size_t total = 0;
+    for (long long i = 0; i < count; i++) {
+        NativeRecord *a = (NativeRecord *)(intptr_t)minyar_list_get(attrs, i);
+        const MinyarBytes *key = entry_bytes(a, 0), *data_value = entry_bytes(a, 1);
+        if (!key || !data_value || key->byte_length < 0 || data_value->byte_length < 0) { *error = "tar writer attribute bounds"; return 0; }
+        Blob k = blob(key->bytes, (size_t)key->byte_length), v = blob(data_value->bytes, (size_t)data_value->byte_length);
+        if (!k.n || k.n>1048576 || v.n>1048576-k.n || total>1048576-k.n-v.n) { *error="tar writer attribute bounds"; return 0; }
+        total += k.n + v.n;
         for (size_t j=0;j<k.n;j++) if (k.p[j]<33 || k.p[j]>126 || k.p[j]=='=') { *error="invalid PAX writer keyword"; return 0; }
         if (sparse(k)) { *error="unsupported sparse tar writer"; return 0; }
         if (equal(k,"SCHILY.filetype") && equal(v,"sparse")) { *error="unsupported sparse tar writer"; return 0; }
         if (!standard(k) && v.n && !attrs_set(&e->attrs,k,v,1048576)) { *error="PAX writer metadata limit"; return 0; }
     }
-    if (at!=n) { *error="trailing encoded tar metadata"; return 0; } return 1;
+    return 1;
 }
 static void octal(unsigned char *p,size_t n,uint64_t value) {
     memset(p,'0',n-1); p[n-1]=0; for (size_t i=n-1;i>0;i--) { p[i-1]=(unsigned char)('0'+value%8); value/=8; }
@@ -381,14 +424,28 @@ static int pax_encode(Attrs *m,unsigned char **output,size_t *length) {
     }
     return 1;
 }
+static int plain_header(const Entry *e, unsigned char h[512]) {
+    if (e->attrs.count || e->path.n > 100 || e->link.n > 100 || e->uname.n > 32 || e->gname.n > 32 ||
+        e->uid < 0 || e->uid > 07777777 || e->gid < 0 || e->gid > 07777777 ||
+        e->seconds < 0 || e->seconds > 077777777777LL || e->nanos || e->size > 077777777777LL ||
+        e->major > 07777777 || e->minor > 07777777 ||
+        ((e->type != '3' && e->type != '4') && (e->major || e->minor))) return 0;
+    memset(h, 0, 512);
+    memcpy(h, e->path.p, e->path.n); if (e->link.n) memcpy(h + 157, e->link.p, e->link.n);
+    if (e->uname.n) memcpy(h + 265, e->uname.p, e->uname.n);
+    if (e->gname.n) memcpy(h + 297, e->gname.p, e->gname.n);
+    octal(h + 100, 8, (uint64_t)e->mode); octal(h + 108, 8, (uint64_t)e->uid);
+    octal(h + 116, 8, (uint64_t)e->gid); octal(h + 124, 12, (uint64_t)e->size);
+    octal(h + 136, 12, (uint64_t)e->seconds); octal(h + 329, 8, (uint64_t)e->major);
+    octal(h + 337, 8, (uint64_t)e->minor); h[156] = (unsigned char)e->type;
+    memcpy(h + 257, "ustar\00000", 8); checksum(h);
+    return 1;
+}
 static int writer_header(Writer *w,Entry *e,unsigned char base[512],const char **error) {
     struct archive_entry *a=archive_entry_new(); if (!a) { *error="allocation failure"; return 0; }
     // Blob names are length-delimited; libarchive needs terminated copies.
-    char *names[4]={0}; Blob fields[]={e->path,e->link,e->uname,e->gname};
-    for (size_t i=0;i<4;i++) {
-        names[i]=malloc(fields[i].n+1); if (!names[i]) { *error="allocation failure"; for (size_t j=0;j<i;j++) free(names[j]); archive_entry_free(a); return 0; }
-        if (fields[i].n) memcpy(names[i],fields[i].p,fields[i].n); names[i][fields[i].n]=0;
-    }
+    char names[4][4097]; Blob fields[]={e->path,e->link,e->uname,e->gname};
+    for (size_t i=0;i<4;i++) { if (fields[i].n) memcpy(names[i],fields[i].p,fields[i].n); names[i][fields[i].n]=0; }
     int types[]={AE_IFREG,AE_IFREG,AE_IFLNK,AE_IFCHR,AE_IFBLK,AE_IFDIR,AE_IFIFO};
     archive_entry_set_filetype(a,types[e->type-'0']); archive_entry_set_perm(a,(mode_t)e->mode);
     // Avoid provider-internal decimal formatting overflow at signed extremes.
@@ -403,7 +460,7 @@ static int writer_header(Writer *w,Entry *e,unsigned char base[512],const char *
     if (e->type=='1') archive_entry_set_hardlink(a,names[1]); if (e->type=='2') archive_entry_set_symlink(a,names[1]);
     w->capturing=1; w->cn=0;
     int code=archive_write_header(w->archive,a);
-    archive_entry_free(a); for (size_t i=0;i<4;i++) free(names[i]);
+    archive_entry_free(a);
     if (code<ARCHIVE_WARN || w->error || w->cn<512 || w->cn%512) { *error=w->error ? w->error : archive_error_string(w->archive); if (!*error) *error="libarchive writer header failure"; return 0; }
     // Native library generates base headers. Merge its generated PAX with raw
     // vendor attributes into ONE local extension, since multiple x headers
@@ -442,15 +499,16 @@ static int writer_header(Writer *w,Entry *e,unsigned char base[512],const char *
     octal(base+100,8,(uint64_t)e->mode);
     checksum(base); return 1;
 }
-MinyarBytes *minyar_tararchive_writeEntry(long long handle,const MinyarBytes *info,const MinyarBytes *data) {
+long long minyar_tararchive_writeStatus(long long handle,const NativeRecord *value,const MinyarBytes *data) {
     Writer *w=(Writer *)(intptr_t)handle; Entry e; const char *error="tar writer metadata failure";
-    if (!decode(info,data,&e,&error)) { attrs_free(&e.attrs); return result(1,error); }
+    if (!decode_value(value,data,&e,&error)) { attrs_free(&e.attrs); w->error = error; return 1; }
     unsigned char base[512],*pax=NULL; size_t pn=0;
-    if (!writer_header(w,&e,base,&error) || !pax_encode(&e.attrs,&pax,&pn)) { attrs_free(&e.attrs); free(pax); return result(1,error); }
+    int plain = plain_header(&e, base);
+    if (!plain && (!writer_header(w,&e,base,&error) || !pax_encode(&e.attrs,&pax,&pn))) { attrs_free(&e.attrs); free(pax); w->error = error; return 1; }
     size_t padding=(512-(size_t)data->byte_length%512)%512;
     size_t extra=pn ? 512+pn+(512-pn%512)%512 : 0;
     if (w->length>w->maximum-1024 || (uint64_t)data->byte_length>w->maximum-1024-w->length || padding+512+extra>w->maximum-1024-w->length-(size_t)data->byte_length) {
-        attrs_free(&e.attrs); free(pax); return result(1,"tar writer archive limit exceeded");
+        attrs_free(&e.attrs); free(pax); w->error = "tar writer archive limit exceeded"; return 1;
     }
     w->capturing=0;
     if (pn) {
@@ -459,18 +517,29 @@ MinyarBytes *minyar_tararchive_writeEntry(long long handle,const MinyarBytes *in
         if (output_callback(NULL,w,h,512)<0 || output_callback(NULL,w,pax,pn)<0 || output_callback(NULL,w,zeros,(512-pn%512)%512)<0) w->error="tar writer extension output failure";
     }
     if (!w->error && output_callback(NULL,w,base,512)<0) w->error="tar writer base output failure";
-    if (!w->error && data->byte_length && archive_write_data(w->archive,data->bytes,(size_t)data->byte_length)!=data->byte_length) w->error="libarchive writer payload failure";
-    if (!w->error && archive_write_finish_entry(w->archive)!=ARCHIVE_OK) w->error="libarchive writer padding failure";
+    if (plain) {
+        unsigned char zeros[512] = {0};
+        if (!w->error && data->byte_length && output_callback(NULL, w, data->bytes, (size_t)data->byte_length) < 0) w->error = "tar writer payload failure";
+        if (!w->error && padding && output_callback(NULL, w, zeros, padding) < 0) w->error = "tar writer padding failure";
+    } else {
+        if (!w->error && data->byte_length && archive_write_data(w->archive,data->bytes,(size_t)data->byte_length)!=data->byte_length) w->error="libarchive writer payload failure";
+        if (!w->error && archive_write_finish_entry(w->archive)!=ARCHIVE_OK) w->error="libarchive writer padding failure";
+    }
     attrs_free(&e.attrs); free(pax);
-    return w->error ? result(1,w->error) : result(0,NULL);
+    return w->error ? 1 : 0;
 }
-MinyarBytes *minyar_tararchive_endWriter(long long handle) {
-    Writer *w=(Writer *)(intptr_t)handle; w->capturing=0;
-    if (archive_write_close(w->archive)!=ARCHIVE_OK || w->error) return result(1,w->error ? w->error : "libarchive writer finish failure");
-    MinyarBytes *out=result(0,NULL); if (w->length) memcpy(minyar_bytes_extend(out,(long long)w->length),w->output,w->length); return out;
+MinyarBytes *minyar_tararchive_finishData(long long handle) {
+    Writer *w = (Writer *)(intptr_t)handle; w->capturing = 0;
+    if (archive_write_close(w->archive) != ARCHIVE_OK && !w->error) w->error = "libarchive writer finish failure";
+    minyar_rc_retain(w->output);
+    return w->output;
+}
+MinyarBytes *minyar_tararchive_writerStatus(long long handle) {
+    Writer *w = (Writer *)(intptr_t)handle;
+    return w->error ? result(1, w->error) : result(0, NULL);
 }
 void minyar_tararchive_freeWriter(long long handle) {
     Writer *w=(Writer *)(intptr_t)handle; if (!w) return;
     // Discard libarchive's close-time footer on explicit early close/error.
-    w->capturing=1; w->cn=0; archive_write_free(w->archive); free(w->output); free(w->capture); free(w);
+    w->capturing=1; w->cn=0; archive_write_free(w->archive); minyar_rc_release(w->output); free(w->capture); free(w);
 }
