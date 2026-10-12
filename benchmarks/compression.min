@@ -1,0 +1,71 @@
+// Timed complete codec operations from actual Minyar code; input loading is untimed.
+use "zstd" as zstd
+use "deflate" as deflate
+use "system" as system
+use "machine" as machine
+function number(text: Text): Integer { let n=0; for c in text { n=n*10+Integer(c)-48 }; return n }
+let codec=argument(0)
+let operation=argument(1)
+let style=argument(2)
+let input=readBytesFile(argument(3))
+let dictionary=readBytesFile(argument(4))
+let cap=number(argument(5))
+let rounds=number(argument(6))
+let c=zstd.createCCtx(); let d=zstd.createDCtx()
+let cd=zstd.createCDict(dictionary,3); let dd=zstd.createDDict(dictionary)
+let output=Bytes(cap)
+let format=deflate.GZIP
+if codec == "zlib" { format=deflate.ZLIB }
+if codec == "raw" { format=deflate.RAW }
+let total=0
+let started=0
+// Eight warm operations exercise the same path outside the timed interval.
+for i in 0..(rounds+8) {
+    if i == 8 { started=system.monotonicNanoseconds() }
+    let n=0
+    if operation == "build" {
+        let temporaryC=zstd.createCDict(dictionary,3)
+        let temporaryD=zstd.createDDict(dictionary)
+        if !zstd.isOpenCDict(temporaryC) || !zstd.isOpenDDict(temporaryD) { fail("dictionary allocation") }
+        zstd.closeCDict(temporaryC); zstd.closeDDict(temporaryD)
+        n=dictionary.length
+    } else if codec == "zstd" {
+        if style == "raw" {
+            if operation == "compress" { n=zstd.compressCtxRaw(c,machine.address(input),input.length,machine.address(output),cap,3) }
+            else { n=zstd.decompressCtxRaw(d,machine.address(input),input.length,machine.address(output),cap) }
+        } else if style == "buffer" {
+            if operation == "compress" {
+                let result=zstd.compressWith(c,input,3,cap)
+                if !zstd.ok(result) { fail("zstd buffer compress") }; n=zstd.data(result).length
+            } else {
+                let result=zstd.decompressWith(d,input,cap)
+                if !zstd.ok(result) { fail("zstd buffer decompress") }; n=zstd.data(result).length
+            }
+        } else {
+            if operation == "compress" { n=zstd.compressInto(c,input,output,3) }
+            else { n=zstd.decompressInto(d,input,output) }
+        }
+    } else if codec == "dict" {
+        if operation == "compress" { n=zstd.compressDictionaryInto(c,cd,input,output) }
+        else { n=zstd.decompressDictionaryInto(d,dd,input,output) }
+    } else {
+        if style == "buffer" {
+            if operation == "compress" {
+                let result=deflate.compress(input,format,6,cap)
+                if !deflate.ok(result) { fail("deflate buffer compress") }; n=deflate.data(result).length
+            } else {
+                let result=deflate.decompress(input,format,cap)
+                if !deflate.ok(result) { fail("deflate buffer decompress") }; n=deflate.data(result).length
+            }
+        } else {
+            if operation == "compress" { n=deflate.compressInto(input,output,format,6) }
+            else { n=deflate.decompressInto(input,output,format) }
+        }
+    }
+    if n < 0 { fail("codec failed") }
+    if i >= 8 { total+=n }
+}
+let elapsed=system.monotonicNanoseconds()-started
+zstd.closeCCtx(c); zstd.closeDCtx(d); zstd.closeCDict(cd); zstd.closeDDict(dd)
+print(elapsed)
+print(total)

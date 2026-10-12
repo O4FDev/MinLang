@@ -1,0 +1,128 @@
+// Maintained libzstd, linked statically with matching headers (advanced RAW dictionaries).
+// Explicit close is required. Record copies share a private cell: closing any copy closes all.
+// No automatic native destructor. One context per thread, exclusive use including close.
+// Dictionaries are by-copy rawContent even when their bytes start with dictionary magic.
+// Calls borrow dictionaries synchronously and release the reference before returning/resetting.
+// Wrong RAW bytes may decode undetected: DICTIONARY means a diagnosed codec dictionary error,
+// not proof of dictionary identity. Checksums/integrity are separate; default compression has no checksum.
+public constant INVALID = -1
+public constant LIMIT = -2
+public constant TRUNCATED = -3
+public constant CORRUPT = -4
+public constant DICTIONARY = -5
+public constant MEMORY = -6
+public constant CLOSED = -7
+public constant TRAILING = -8
+public constant MAX_OUTPUT = 268435456
+public record Result { private code: Integer; private value: Bytes }
+public function ok(result: Result): Boolean { return result.code >= 0 }
+public function status(result: Result): Integer { if result.code >= 0 { return 0 }; return result.code }
+public function data(result: Result): Bytes { return result.value }
+function finish(code: Integer, output: Bytes): Result {
+    if code < 0 { return Result { code: code; value: Bytes() } }
+    output.resize(code)
+    return Result { code: code; value: output }
+}
+function failure(code: Integer): Result { return Result { code: code; value: Bytes() } }
+public record CCtx { private state: List<Integer> }
+public record DCtx { private state: List<Integer> }
+public record CDict { private state: List<Integer> }
+public record DDict { private state: List<Integer> }
+public function createCCtx(): CCtx { return CCtx { state: [rawCreateCCtx()] } }
+public function createDCtx(): DCtx { return DCtx { state: [rawCreateDCtx()] } }
+public function createCDict(bytes: Bytes, level: Integer): CDict { return CDict { state: [newCDict(bytes, level)] } }
+public function createDDict(bytes: Bytes): DDict { return DDict { state: [newDDict(bytes)] } }
+public function isOpenCCtx(owner: CCtx): Boolean { return owner.state[0] != 0 }
+public function isOpenDCtx(owner: DCtx): Boolean { return owner.state[0] != 0 }
+public function isOpenCDict(owner: CDict): Boolean { return owner.state[0] != 0 }
+public function isOpenDDict(owner: DDict): Boolean { return owner.state[0] != 0 }
+public function closeCCtx(owner: CCtx) { if owner.state[0] != 0 { rawCloseCCtx(owner.state[0]); owner.state[0] = 0 } }
+public function closeDCtx(owner: DCtx) { if owner.state[0] != 0 { rawCloseDCtx(owner.state[0]); owner.state[0] = 0 } }
+public function closeCDict(owner: CDict) { if owner.state[0] != 0 { rawCloseCDict(owner.state[0]); owner.state[0] = 0 } }
+public function closeDDict(owner: DDict) { if owner.state[0] != 0 { rawCloseDDict(owner.state[0]); owner.state[0] = 0 } }
+public function version(): Integer { native "zstd" }
+public function compressBound(length: Integer): Integer { native "zstd" }
+// Into writes at most destination.length bytes; failures may leave an untrusted prefix.
+// Destination length is unchanged. Source/destination memory must not overlap.
+public function compressInto(owner: CCtx, input: Bytes, destination: Bytes, level: Integer): Integer {
+    return bufferCompress(owner.state[0], input, destination, level)
+}
+public function decompressInto(owner: DCtx, input: Bytes, destination: Bytes): Integer {
+    return bufferDecompress(owner.state[0], input, destination)
+}
+public function compressWith(owner: CCtx, input: Bytes, level: Integer, maxOutput: Integer): Result {
+    if maxOutput < 0 || maxOutput > MAX_OUTPUT { return failure(INVALID) }
+    if !isOpenCCtx(owner) { return failure(CLOSED) }
+    let output = Bytes(maxOutput)
+    return finish(compressInto(owner, input, output, level), output)
+}
+public function decompressWith(owner: DCtx, input: Bytes, maxOutput: Integer): Result {
+    if maxOutput < 0 || maxOutput > MAX_OUTPUT { return failure(INVALID) }
+    if !isOpenDCtx(owner) { return failure(CLOSED) }
+    let output = Bytes(maxOutput)
+    return finish(decompressInto(owner, input, output), output)
+}
+public function compress(input: Bytes, level: Integer, maxOutput: Integer): Result {
+    if maxOutput < 0 || maxOutput > MAX_OUTPUT { return failure(INVALID) }
+    let owner = createCCtx()
+    if !isOpenCCtx(owner) { return failure(MEMORY) }
+    let result = compressWith(owner, input, level, maxOutput)
+    closeCCtx(owner); return result
+}
+public function decompress(input: Bytes, maxOutput: Integer): Result {
+    if maxOutput < 0 || maxOutput > MAX_OUTPUT { return failure(INVALID) }
+    let owner = createDCtx()
+    if !isOpenDCtx(owner) { return failure(MEMORY) }
+    let result = decompressWith(owner, input, maxOutput)
+    closeDCtx(owner); return result
+}
+public function compressDictionaryInto(owner: CCtx, dictionary: CDict, input: Bytes, destination: Bytes): Integer {
+    return bufferCompressDict(owner.state[0], dictionary.state[0], input, destination)
+}
+public function decompressDictionaryInto(owner: DCtx, dictionary: DDict, input: Bytes, destination: Bytes): Integer {
+    return bufferDecompressDict(owner.state[0], dictionary.state[0], input, destination)
+}
+public function compressDictionary(owner: CCtx, dictionary: CDict, input: Bytes, maxOutput: Integer): Result {
+    if maxOutput < 0 || maxOutput > MAX_OUTPUT { return failure(INVALID) }
+    if !isOpenCCtx(owner) || !isOpenCDict(dictionary) { return failure(CLOSED) }
+    let output = Bytes(maxOutput)
+    return finish(compressDictionaryInto(owner, dictionary, input, output), output)
+}
+public function decompressDictionary(owner: DCtx, dictionary: DDict, input: Bytes, maxOutput: Integer): Result {
+    if maxOutput < 0 || maxOutput > MAX_OUTPUT { return failure(INVALID) }
+    if !isOpenDCtx(owner) || !isOpenDDict(dictionary) { return failure(CLOSED) }
+    let output = Bytes(maxOutput)
+    return finish(decompressDictionaryInto(owner, dictionary, input, output), output)
+}
+// Managed context with caller-owned raw memory; same four data arguments as neo-vm's shim.
+// Source/destination signed addresses must describe live readable/writable nonoverlapping regions.
+// Numeric checks cannot validate mapped memory. Zero address is allowed only for zero length.
+public function decompressCtxRaw(owner: DCtx, src: Integer, srcLen: Integer, dst: Integer, dstCap: Integer): Integer {
+    return rawDecompressCtx(owner.state[0], src, srcLen, dst, dstCap)
+}
+public function compressCtxRaw(owner: CCtx, src: Integer, srcLen: Integer, dst: Integer, dstCap: Integer, level: Integer): Integer {
+    return rawCompressCtx(owner.state[0], src, srcLen, dst, dstCap, level)
+}
+// UNSAFE Integer native handles. Only handles returned here, with matching kind, may be used.
+// Exactly-once destruction; no use after close, copied-handle double close, arbitrary/stale handle
+// validation, concurrent context use, or close during calls. Prefer the managed owner APIs above.
+public function rawCreateCCtx(): Integer { native "zstd" }
+public function rawCreateDCtx(): Integer { native "zstd" }
+public function rawCloseCCtx(handle: Integer) { native "zstd" }
+public function rawCloseDCtx(handle: Integer) { native "zstd" }
+public function rawCreateCDict(src: Integer, length: Integer, level: Integer): Integer { native "zstd" }
+public function rawCreateDDict(src: Integer, length: Integer): Integer { native "zstd" }
+public function rawCloseCDict(handle: Integer) { native "zstd" }
+public function rawCloseDDict(handle: Integer) { native "zstd" }
+public function rawCompress(src: Integer, srcLen: Integer, dst: Integer, dstCap: Integer, level: Integer): Integer { native "zstd" }
+public function rawDecompress(src: Integer, srcLen: Integer, dst: Integer, dstCap: Integer): Integer { native "zstd" }
+public function rawCompressCtx(handle: Integer, src: Integer, srcLen: Integer, dst: Integer, dstCap: Integer, level: Integer): Integer { native "zstd" }
+public function rawDecompressCtx(handle: Integer, src: Integer, srcLen: Integer, dst: Integer, dstCap: Integer): Integer { native "zstd" }
+public function rawCompressDict(handle: Integer, dict: Integer, src: Integer, srcLen: Integer, dst: Integer, dstCap: Integer): Integer { native "zstd" }
+public function rawDecompressDict(handle: Integer, dict: Integer, src: Integer, srcLen: Integer, dst: Integer, dstCap: Integer): Integer { native "zstd" }
+function newCDict(bytes: Bytes, level: Integer): Integer { native "zstd" }
+function newDDict(bytes: Bytes): Integer { native "zstd" }
+function bufferCompress(handle: Integer, input: Bytes, output: Bytes, level: Integer): Integer { native "zstd" }
+function bufferDecompress(handle: Integer, input: Bytes, output: Bytes): Integer { native "zstd" }
+function bufferCompressDict(handle: Integer, dict: Integer, input: Bytes, output: Bytes): Integer { native "zstd" }
+function bufferDecompressDict(handle: Integer, dict: Integer, input: Bytes, output: Bytes): Integer { native "zstd" }

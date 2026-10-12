@@ -569,12 +569,21 @@ def main():
                 native += ['-pthread']
         elif library == 'quicinteropio':
             native += [native_object(project, clang, base, 'quicinteropio.c', native_flags)]
+        elif library in ('sha256', 'tararchive'):
+            from format_provider import format_provider
+            cflags, libraries = format_provider(library, clang, native_flags, link_flags)
+            native += [native_object(project, clang, base, library + '.c',
+                                     [*native_flags, *cflags]), *libraries]
         elif library == 'aes':
             native += [native_object(project, clang, base, 'aes.c', native_flags)]
             if platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
                 native += ['-lbcrypt']
             elif platform.system() != 'Darwin':
                 native += ['-lcrypto']
+        elif library in ('zstd', 'deflate'):
+            from compression_provider import codec_provider
+            cflags, archives = codec_provider(library, clang, native_flags, link_flags)
+            native += [native_object(project, clang, base, library + '.c', [*native_flags, *cflags]), *archives]
         elif library == 'securecrypto':
             native += [native_object(project, clang, base, 'securecrypto.c', native_flags)]
         elif library == 'tlsverify':

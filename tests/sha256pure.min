@@ -1,0 +1,170 @@
+// Benchmark candidate derived from neo-vm/image/sha256.min (read-only reference).
+// Same streaming API as library/sha256.min; not installed as a public library.
+use "machine" as machine
+
+public record State {
+    state: Bytes
+    k: Bytes
+    w: Bytes
+    tail: Bytes
+    count: Integer
+}
+function bswap(x: Integer): Integer {
+    return ((x & 255) << 24) | ((x & 0xFF00) << 8) | ((x >> 8) & 0xFF00) | ((x >> 24) & 255)
+}
+public function new(): State {
+    let constants = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    ]
+    let k = Bytes()
+    for c in constants { k.addUInt32(c) }
+    let state = Bytes(32)
+    let s = machine.address(state)
+    machine.store32(s, 0x6a09e667)
+    machine.store32(s + 4, 0xbb67ae85)
+    machine.store32(s + 8, 0x3c6ef372)
+    machine.store32(s + 12, 0xa54ff53a)
+    machine.store32(s + 16, 0x510e527f)
+    machine.store32(s + 20, 0x9b05688c)
+    machine.store32(s + 24, 0x1f83d9ab)
+    machine.store32(s + 28, 0x5be0cd19)
+    return State { state: state; k: k; w: Bytes(256); tail: Bytes(128); count: 0 }
+}
+function copied(input: Bytes): Bytes {
+    let out = Bytes(input.length)
+    machine.copy(machine.address(out), machine.address(input), input.length)
+    return out
+}
+public function clone(state: State): State {
+    return State { state: copied(state.state); k: state.k; w: Bytes(256); tail: copied(state.tail); count: state.count }
+}
+public function bytesHashed(state: State): Integer { return state.count }
+public function update(state: State, input: Bytes): Boolean {
+    return updateRange(state, input, 0, input.length)
+}
+public function updateRange(state: State, input: Bytes, offset: Integer, length: Integer): Boolean {
+    if offset < 0 || length < 0 || offset > input.length { return false }
+    if length > input.length - offset { return false }
+    return updateAddress(state, machine.address(input) + offset, length)
+}
+public function updateAddress(state: State, address: Integer, length: Integer): Boolean {
+    if state.count < 0 || state.count > 2305843009213693951 { return false }
+    if length < 0 || length > 2305843009213693951 - state.count { return false }
+    if address < 0 { return false }
+    if length == 0 { return true }
+    if address == 0 || length - 1 > 9223372036854775807 - address { return false }
+    let s = machine.address(state.state)
+    let k = machine.address(state.k)
+    let w = machine.address(state.w)
+    let t = machine.address(state.tail)
+    let at = 0
+    let rest = state.count % 64
+    if rest > 0 {
+        let take = 64 - rest
+        if take > length { take = length }
+        machine.copy(t + rest, address, take)
+        at += take
+        if rest + take == 64 { compress(s, k, w, t) }
+    }
+    while length - at >= 64 {
+        compress(s, k, w, address + at)
+        at += 64
+    }
+    if at < length { machine.copy(t, address + at, length - at) }
+    state.count += length
+    return true
+}
+public function finalize(state: State): Bytes {
+    let snapshot = clone(state)
+    let t = machine.address(snapshot.tail)
+    let rest = snapshot.count % 64
+    let padded = 64
+    if rest >= 56 { padded = 128 }
+    machine.fill8(t + rest, padded - rest, 0)
+    machine.store8(t + rest, 128)
+    // Encode count << 3 in bytes; never multiply a signed Integer by eight.
+    machine.store8(t + padded - 1, (snapshot.count & 31) << 3)
+    for index in 1..8 {
+        machine.store8(t + padded - 1 - index, (snapshot.count >> (index * 8 - 3)) & 255)
+    }
+    let s = machine.address(snapshot.state)
+    let k = machine.address(snapshot.k)
+    let w = machine.address(snapshot.w)
+    compress(s, k, w, t)
+    if padded == 128 { compress(s, k, w, t + 64) }
+    let out = Bytes(32)
+    let o = machine.address(out)
+    for index in 0..8 { machine.store32(o + index * 4, bswap(machine.load32(s + index * 4))) }
+    return out
+}
+public function digest(input: Bytes): Bytes {
+    let state = new()
+    if !update(state, input) { return Bytes() }
+    return finalize(state)
+}
+public function digestAddress(address: Integer, length: Integer): Bytes {
+    let state = new()
+    if !updateAddress(state, address, length) { return Bytes() }
+    return finalize(state)
+}
+
+function compress(s: Integer, k: Integer, w: Integer, block: Integer) {
+    for index in 0..16 {
+        machine.store32(w + index * 4, bswap(machine.load32(block + index * 4)))
+    }
+    for index in 16..64 {
+        let x = machine.load32(w + (index - 15) * 4)
+        let y = machine.load32(w + (index - 2) * 4)
+        let s0 = (((x >> 7) | (x << 25)) ^ ((x >> 18) | (x << 14)) ^ (x >> 3)) & 0xFFFFFFFF
+        let s1 = (((y >> 17) | (y << 15)) ^ ((y >> 19) | (y << 13)) ^ (y >> 10)) & 0xFFFFFFFF
+        machine.store32(w + index * 4, (machine.load32(w + (index - 16) * 4) + s0 + machine.load32(w + (index - 7) * 4) + s1) & 0xFFFFFFFF)
+    }
+    let a = machine.load32(s)
+    let b = machine.load32(s + 4)
+    let c = machine.load32(s + 8)
+    let d = machine.load32(s + 12)
+    let e = machine.load32(s + 16)
+    let f = machine.load32(s + 20)
+    let g = machine.load32(s + 24)
+    let h = machine.load32(s + 28)
+    for index in 0..64 {
+        let s1 = (((e >> 6) | (e << 26)) ^ ((e >> 11) | (e << 21)) ^ ((e >> 25) | (e << 7))) & 0xFFFFFFFF
+        let choose = (e & f) ^ ((e ^ 0xFFFFFFFF) & g)
+        let first = (h + s1 + choose + machine.load32(k + index * 4) + machine.load32(w + index * 4)) & 0xFFFFFFFF
+        let s0 = (((a >> 2) | (a << 30)) ^ ((a >> 13) | (a << 19)) ^ ((a >> 22) | (a << 10))) & 0xFFFFFFFF
+        let majority = (a & b) ^ (a & c) ^ (b & c)
+        h = g
+        g = f
+        f = e
+        e = (d + first) & 0xFFFFFFFF
+        d = c
+        c = b
+        b = a
+        a = (first + s0 + majority) & 0xFFFFFFFF
+    }
+    machine.store32(s, (machine.load32(s) + a) & 0xFFFFFFFF)
+    machine.store32(s + 4, (machine.load32(s + 4) + b) & 0xFFFFFFFF)
+    machine.store32(s + 8, (machine.load32(s + 8) + c) & 0xFFFFFFFF)
+    machine.store32(s + 12, (machine.load32(s + 12) + d) & 0xFFFFFFFF)
+    machine.store32(s + 16, (machine.load32(s + 16) + e) & 0xFFFFFFFF)
+    machine.store32(s + 20, (machine.load32(s + 20) + f) & 0xFFFFFFFF)
+    machine.store32(s + 24, (machine.load32(s + 24) + g) & 0xFFFFFFFF)
+    machine.store32(s + 28, (machine.load32(s + 28) + h) & 0xFFFFFFFF)
+}
+
+public function hex(data: Bytes): Text {
+    let digits = Bytes("0123456789abcdef")
+    let out = Bytes()
+    for byte in data {
+        out.add(digits[byte >> 4])
+        out.add(digits[byte & 15])
+    }
+    return Text(out)
+}

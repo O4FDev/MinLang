@@ -1,0 +1,84 @@
+use "sha256" as sha
+use "machine" as machine
+
+function check(condition: Boolean, message: Text) {
+    if !condition { fail(message) }
+}
+
+function vector(data: Bytes, expected: Text) {
+    check(sha.hex(sha.digest(data)) == expected, "one-shot vector")
+    let state = sha.new()
+    for index in 0..data.length {
+        check(sha.updateRange(state, data, index, 1), "byte update")
+    }
+    check(sha.hex(sha.finalize(state)) == expected, "byte-split vector")
+    check(sha.hex(sha.finalize(state)) == expected, "repeated finalization")
+    check(sha.bytesHashed(state) == data.length, "finalization changed length")
+}
+
+vector(Bytes(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+vector(Bytes("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+vector(Bytes("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+vector(Bytes("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"), "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1")
+let million = Bytes(1000000)
+machine.fill8(machine.address(million), million.length, 97)
+check(sha.hex(sha.digest(million)) == "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0", "million a vector")
+
+let source = Bytes("abc")
+let state = sha.new()
+check(sha.update(state, source), "Bytes update")
+source[0] = 122
+let saved = sha.finalize(state)
+let branch = sha.clone(state)
+check(sha.update(state, Bytes("def")), "continuation")
+check(sha.hex(saved) == sha.hex(sha.digest(Bytes("abc"))), "digest aliased state")
+check(sha.hex(sha.finalize(branch)) == sha.hex(saved), "clone aliased state")
+check(sha.update(branch, Bytes("!")), "branch update")
+check(sha.hex(sha.finalize(branch)) == sha.hex(sha.digest(Bytes("abc!"))), "clone continuation")
+check(sha.hex(sha.finalize(state)) == sha.hex(sha.digest(Bytes("abcdef"))), "original continuation")
+
+// Reject invalid ranges before reading, and leave the state unchanged.
+let data = Bytes(300)
+for length in 0..301 {
+    check(!sha.updateRange(state, data, -1, length), "negative offset")
+    check(!sha.updateRange(state, data, 301, length), "past-end offset")
+    check(!sha.updateRange(state, data, 300 - length, length + 1), "past-end range")
+    check(!sha.updateRange(state, data, length, -1), "negative length")
+    check(!sha.updateRange(state, data, 9223372036854775807, length), "offset overflow")
+}
+check(!sha.updateRange(state, data, 1, 9223372036854775807), "range overflow")
+check(!sha.updateAddress(state, -1, 0), "negative address")
+check(!sha.updateAddress(state, 0, 1), "null nonempty range")
+check(!sha.updateAddress(state, machine.address(data), -1), "raw negative length")
+check(!sha.updateAddress(state, 9223372036854775807, 2), "raw address overflow")
+check(!sha.updateAddress(state, machine.address(data), 2305843009213693952), "SHA bit-length overflow")
+check(!sha.updateAddress(state, machine.address(data), 2305843009213693951), "cumulative SHA bit-length overflow")
+check(sha.updateRange(state, data, data.length, 0), "empty Bytes range")
+check(sha.updateAddress(state, 0, 0), "empty null range")
+check(sha.updateAddress(state, 9223372036854775807, 0), "empty signed-ceiling range")
+check(sha.bytesHashed(state) == 6, "rejected update changed length")
+check(sha.hex(sha.finalize(state)) == sha.hex(sha.digest(Bytes("abcdef"))), "rejected update changed hash")
+check(sha.digestAddress(0, 1).length == 0, "invalid one-shot range")
+check(sha.hex(sha.digestAddress(0, 0)) == sha.hex(sha.digest(Bytes())), "empty raw digest")
+// Seed only the implementation's count to test exhaustion without reading
+// exabytes. Rejection must precede even a read of address 1 and preserve state.
+let boundary = sha.new()
+check(sha.update(boundary, Bytes("abc")), "boundary seed")
+let before = sha.hex(sha.finalize(boundary))
+boundary.count = 2305843009213693950
+check(!sha.updateAddress(boundary, 1, 2), "cumulative limit before read")
+check(!sha.update(boundary, Bytes("ab")), "Bytes cumulative limit")
+check(!sha.updateRange(boundary, Bytes("ab"), 0, 2), "range cumulative limit")
+check(sha.bytesHashed(boundary) == 2305843009213693950, "limit rejection changed count")
+boundary.count = 3
+check(sha.hex(sha.finalize(boundary)) == before, "limit rejection changed state")
+let last = Bytes("!")
+boundary.count = 2305843009213693950
+check(sha.update(boundary, last), "last representable byte")
+check(sha.bytesHashed(boundary) == 2305843009213693951, "maximum count")
+check(!sha.updateAddress(boundary, 1, 1), "exhausted count before read")
+check(sha.updateAddress(boundary, 0, 0), "empty at maximum count")
+// Exercise maximum bit-length serialization (high bit set) without signed
+// multiply overflow. The synthetic context is not an exabyte vector oracle.
+check(sha.finalize(boundary).length == 32, "maximum bit-length serialization")
+print("SHA-256 vectors, snapshots, clones and malformed ranges passed")
