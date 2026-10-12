@@ -1267,9 +1267,24 @@ function stockDiscardedRoute(st: CidStock): Integer {
 }
 function stockWrongResponse(st: CidStock): Integer {
     if !errors.booleanOk(quic.probePath(st.subject,7,st.now)) { return 65 }
-    if !stockDrain(st) { return 67 }
-    let challenge=Bytes();for path in st.subject.paths { if path.id==7 { challenge=path.challenge } }
-    if challenge.length!=8 { return 65 }
+    // Observe the real wire challenge before the unchanged validation deadline.
+    // Draining thirty-two polls here expires the candidate before this control.
+    let challenge=Bytes();let deadline=-1
+    for path in st.subject.paths { if path.id==7 { challenge=path.challenge;deadline=path.deadline } }
+    if challenge.length!=8 || deadline<=st.now+1 { return 65 }
+    st.now+=1;let challenges=0
+    for packet in quic.pollDatagrams(st.subject,st.now) {
+        if !stockRecord(st,packet.data) { return 67 }
+        let header=wire.header(packet.data,0,st.peer.local.length)
+        let opened=protection.unprotect(st.peer.spaces[2].read,packet.data,header.numberOffset,-1)
+        let parsed=wire.frames(opened.payload)
+        if !opened.valid || !parsed.valid { return 67 }
+        for frame in parsed.frames { if frame.type==26 {
+            if packet.pathId!=7 || crypto.hex(frame.data)!=crypto.hex(challenge) { return 67 }
+            challenges+=1
+        } }
+    }
+    if challenges!=1 { return 65 }
     let before=stockSignature(st.subject);let largest=st.subject.spaces[2].largest
     let payload=Bytes();payload.add(27);payload.addBytes(challenge)
     stockReceive(st,stockId(st.subject,1),payload)
