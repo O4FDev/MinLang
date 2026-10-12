@@ -538,15 +538,17 @@ def checked_link_graph(build,root,retention):
     for item in inputs:
         if item.get("format")!="native_object":raise CoverageError("native runtime/provider object required")
         retained(item)
-    pinned={"clang-driver.py":"c30f69207d809558af9affe4d2a354e759b49b5c6fd74b9c5884a7529baad6af",
-            "sanitizer_llvm.py":"4d74874d1119abb31d68af4a733f9e3e90aa7788f2a767678672226592f2c3a2"}
+    # Preserve the reviewed legacy tool and the files/system dispatch integration.
+    pinned={"clang-driver.py":("c30f69207d809558af9affe4d2a354e759b49b5c6fd74b9c5884a7529baad6af",
+                               "52943b71b8b41b85da5cdc78b9a1388699cb4b40d4e86e1bd179714fa48febd6"),
+            "sanitizer_llvm.py":("4d74874d1119abb31d68af4a733f9e3e90aa7788f2a767678672226592f2c3a2",)}
     tools=build.get("tool_bindings",{})
     if set(tools)!={"clang-driver.py","sanitizer_llvm.py","clang.bin"}:raise CoverageError("complete retained compiler/tool bindings required")
     for name,value in tools.items():
         data=retained(value,False);digest=sha(data)
         if any(value.get(field)!=digest for field in ("source_before_sha256","retained_sha256","source_after_sha256")) or build.get("tools",{}).get(name)!=digest:
             raise CoverageError("tool before/copy/after bytes mismatch")
-        if name in pinned and digest!=pinned[name]:raise CoverageError("unreviewed canonical link tool")
+        if name in pinned and digest not in pinned[name]:raise CoverageError("unreviewed canonical link tool")
     compiler=build.get("compiler_pre_link",{})
     if compiler.get("selected_command")!=build.get("compiler_selected_command") or compiler.get("resolved_path")!=tools["clang.bin"].get("original") or compiler.get("sha256")!=tools["clang.bin"].get("sha256"):
         raise CoverageError("actual compiler command or bytes not bound")
