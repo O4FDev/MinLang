@@ -34,7 +34,8 @@ typedef int socket_t;
 enum { NET_OK, NET_WOULD_BLOCK, NET_EOF, NET_FAILURE, NET_TRUNCATED };
 enum { NET_MAX_READ = 16 * 1024 * 1024 };
 static _Thread_local char last_error[256];
-static _Thread_local int last_error_code; /* errno / Winsock code of the last failure, 0 after success */
+static _Thread_local int
+    last_error_code; /* errno / Winsock code of the last failure, 0 after success */
 
 static bool valid_socket(long long connection) {
 #ifdef _WIN32
@@ -96,8 +97,7 @@ static bool initialize(void) {
 long long minyar_net_ipVersion(const MinyarText *address) {
     char name[256];
     unsigned char bytes[16];
-    if (address->byte_length <= 0 ||
-        address->byte_length >= (long long)sizeof(name) ||
+    if (address->byte_length <= 0 || address->byte_length >= (long long)sizeof(name) ||
         memchr(address->bytes, 0, (size_t)address->byte_length))
         return 0;
     minyar_native_text(address, name, sizeof(name));
@@ -550,8 +550,9 @@ void minyar_net_close(long long connection) {
 long long minyar_net_lastErrorCode(void) {
     return last_error[0] ? -(long long)last_error_code : 0;
 }
-/* Append up to `limit` received bytes to `buffer` in place: no fresh allocation, no zero-fill once the buffer has
- * capacity, no copy. Returns the count (> 0), 0 at end of stream, -1 if the read would block, -2 on failure. */
+/* Append up to `limit` received bytes to `buffer` in place: no fresh allocation, no zero-fill once
+ * the buffer has capacity, no copy. Returns the count (> 0), 0 at end of stream, -1 if the read
+ * would block, -2 on failure. */
 long long minyar_net_readInto(long long connection, MinyarBytes *buffer, long long limit) {
     last_error[0] = 0;
     if (!valid_socket(connection) || limit <= 0 || limit > NET_MAX_READ) {
@@ -572,15 +573,17 @@ long long minyar_net_readInto(long long connection, MinyarBytes *buffer, long lo
     } while (count < 0 && interrupted(code));
     buffer->byte_length = before + (count > 0 ? count : 0);
     if (count < 0) {
-        if (would_block(code)) return -1;
+        if (would_block(code))
+            return -1;
         remember_code("readInto", code);
         return -2;
     }
     return count;
 }
-/* Send data[offset, offset + length) once without slicing. Returns the count sent (>= 0), -1 if the socket
- * would block, -2 on failure. */
-long long minyar_net_writeRange(long long connection, const MinyarBytes *data, long long offset, long long length) {
+/* Send data[offset, offset + length) once without slicing. Returns the count sent (>= 0), -1 if the
+ * socket would block, -2 on failure. */
+long long minyar_net_writeRange(long long connection, const MinyarBytes *data, long long offset,
+                                long long length) {
     last_error[0] = 0;
     if (!valid_socket(connection) || offset < 0 || length < 0 || offset > data->byte_length ||
         length > data->byte_length - offset || length > INT_MAX) {
@@ -598,7 +601,8 @@ long long minyar_net_writeRange(long long connection, const MinyarBytes *data, l
         code = count < 0 ? socket_error() : 0;
     } while (count < 0 && interrupted(code));
     if (count < 0) {
-        if (would_block(code)) return -1;
+        if (would_block(code))
+            return -1;
         remember_code("writeRange", code);
         return -2;
     }

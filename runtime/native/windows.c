@@ -241,7 +241,9 @@ static int bounded(Widget *w, int value, bool horizontal) {
     return value < 0 ? 0 : value;
 }
 static int gap(Widget *parent, Widget *previous) {
-    return previous ? scaled(parent, previous->custom_spacing ? previous->space_after : parent->spacing) : 0;
+    return previous
+               ? scaled(parent, previous->custom_spacing ? previous->space_after : parent->spacing)
+               : 0;
 }
 static void remember_measure(Widget *w, int width, int height) {
     if (w->measured_dpi != layout_dpi)
@@ -286,8 +288,8 @@ static void measure(Widget *w, int *width, int *height) {
         *height = w->measured_height;
         return;
     }
-    if (w->kind == VIEW || w->kind == EDITOR || w->kind == TEXTVIEW ||
-        w->kind == SLIDER || w->kind == SEPARATOR) {
+    if (w->kind == VIEW || w->kind == EDITOR || w->kind == TEXTVIEW || w->kind == SLIDER ||
+        w->kind == SEPARATOR) {
         *width = scaled(w, w->width ? w->width : w->kind == VIEW ? 0 : 200);
         *height = scaled(w, w->height              ? w->height
                             : w->kind == VIEW      ? 0
@@ -572,12 +574,12 @@ static LRESULT CALLBACK procedure(HWND handle, UINT message, WPARAM wp, LPARAM l
             widgets[i].measured_dpi = 0;
         layout(w);
     }
-    if (w && w->kind == WINDOW && message == WM_GETMINMAXINFO &&
-        (w->min_width || w->min_height)) {
+    if (w && w->kind == WINDOW && message == WM_GETMINMAXINFO && (w->min_width || w->min_height)) {
         MINMAXINFO *limits = (MINMAXINFO *)lp;
         RECT frame = {0, 0, scaled(w, w->min_width), scaled(w, w->min_height)};
         if (AdjustWindowRectEx(&frame, (DWORD)GetWindowLongPtrW(handle, GWL_STYLE),
-                               GetMenu(handle) != NULL, (DWORD)GetWindowLongPtrW(handle, GWL_EXSTYLE))) {
+                               GetMenu(handle) != NULL,
+                               (DWORD)GetWindowLongPtrW(handle, GWL_EXSTYLE))) {
             if (w->min_width)
                 limits->ptMinTrackSize.x = frame.right - frame.left;
             if (w->min_height)
@@ -694,10 +696,10 @@ static long long control(int kind, long long parent, const MinyarText *title, bo
     Widget *w = get(value);
     wchar_t *text = edit_text(w, title);
     bool edit = editable(w) || kind == TEXTVIEW;
-    const wchar_t *class_name = kind == SLIDER                       ? TRACKBAR_CLASSW
-                                : edit                               ? L"EDIT"
+    const wchar_t *class_name = kind == SLIDER ? TRACKBAR_CLASSW
+                                : edit         ? L"EDIT"
                                 : kind == VIEW || kind == LABEL || kind == SEPARATOR ? L"STATIC"
-                                                                     : L"BUTTON";
+                                                                                     : L"BUTTON";
     DWORD style = WS_CHILD | (hidden(w) ? 0 : WS_VISIBLE);
     if (kind == SLIDER)
         style |= TBS_HORZ | TBS_NOTICKS | WS_TABSTOP;
@@ -773,7 +775,8 @@ void minyar_windows_fill(long long value) {
 }
 static void bounds(long long value, long long width, long long height, bool minimum) {
     thread();
-    dimension(width); dimension(height);
+    dimension(width);
+    dimension(height);
     Widget *w = minimum ? get(value) : view(value);
     if (w->kind >= MENU)
         fail("windows: minimumSize requires a window or view");
@@ -786,11 +789,13 @@ static void bounds(long long value, long long width, long long height, bool mini
     if ((w->width && (w->width < min_width || (max_width && w->width > max_width))) ||
         (w->height && (w->height < min_height || (max_height && w->height > max_height))))
         fail("windows: explicit size conflicts with bounds");
-    if (w->min_width == min_width && w->min_height == min_height &&
-        w->max_width == max_width && w->max_height == max_height)
+    if (w->min_width == min_width && w->min_height == min_height && w->max_width == max_width &&
+        w->max_height == max_height)
         return;
-    w->min_width = min_width; w->min_height = min_height;
-    w->max_width = max_width; w->max_height = max_height;
+    w->min_width = min_width;
+    w->min_height = min_height;
+    w->max_width = max_width;
+    w->max_height = max_height;
     w->measured_dpi = 0;
     layout(w);
 }
@@ -800,14 +805,20 @@ void minyar_windows_minimumSize(long long value, long long width, long long heig
 void minyar_windows_maximumSize(long long value, long long width, long long height) {
     bounds(value, width, height, false);
 }
-void minyar_windows_insets(long long value, long long top, long long left, long long bottom, long long right) {
+void minyar_windows_insets(long long value, long long top, long long left, long long bottom,
+                           long long right) {
     thread();
-    dimension(top); dimension(left); dimension(bottom); dimension(right);
+    dimension(top);
+    dimension(left);
+    dimension(bottom);
+    dimension(right);
     Widget *w = get(value);
     if (!stack(w))
         fail("windows: insets requires a row or column");
-    w->inset_top = (int)top; w->inset_left = (int)left;
-    w->inset_bottom = (int)bottom; w->inset_right = (int)right;
+    w->inset_top = (int)top;
+    w->inset_left = (int)left;
+    w->inset_bottom = (int)bottom;
+    w->inset_right = (int)right;
     w->measured_dpi = 0;
     layout(w);
 }
