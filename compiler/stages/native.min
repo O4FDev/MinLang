@@ -18,11 +18,15 @@ function nativeType(type: Integer): Text {
     return llvmType(type)
 }
 
-// `native "library"` is the whole body of a standard library function. It
-// forwards the parameters to the C function minyar_<library>_<name>, which
-// borrows Text and Bytes arguments and returns owned references. The marker
-// comment lets compileTokens declare the symbol and name the library to link.
 function compileNative(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, returnType: Integer) {
+    if (state[15] / 4 % 2) != 0 {
+    let effectFunction = findFunction(functionNames, symbolKinds, functionReturnTypes, textState[1])
+    let effectTypes: List<Integer> = []
+    let effectFirst = functionParameterOffset(functionParameterCounts, effectFunction)
+    let effectIndex = 0
+    while effectIndex < functionParameterCounts[effectFunction] { effectTypes.add(functionParameterTypes[effectFirst + effectIndex]); effectIndex = effectIndex + 1 }
+    if (state[15] / 4 % 2) != 0 { threadNote(output, textState[1], "native", "minyar_" + tokenTexts[state[0] + 1] + "_" + readableDeclarationName(textState[1]), threadSignature(returnType, effectTypes)) }
+    }
     let location = state[0]
     let name = textState[1]
     if name == "top level" || name == "main" {
@@ -54,8 +58,6 @@ function compileNative(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
         fail(describeLocation(tokenLocation(tokenLines, location)) + ": native must be the only statement in its function")
     }
     if library == "integer_overflow" {
-        // Only the scalar flag crosses this boundary. The errors library owns
-        // its private Result fields and constructs success/failure values.
         let operation = ""
         let intrinsicName = readableDeclarationName(name)
         if intrinsicName == "addOverflows" { operation = "sadd" }
@@ -69,10 +71,18 @@ function compileNative(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
         }
         output.add("  %integer.overflow.pair = call { i64, i1 } @llvm." + operation + ".with.overflow.i64(i64 %argument.0, i64 %argument.1)\n")
         output.add("  %integer.overflow.flag = extractvalue { i64, i1 } %integer.overflow.pair, 1\n")
-        output.add("  call void @minyar_rc_leave()\n")
+        recoveryNativeCheckpoint(output, textState, state, returnType)
+    output.add("  call void @minyar_rc_leave()\n")
         output.add("  call void @minyar_stack_leave()\n")
         output.add("  ret i1 %integer.overflow.flag\n")
         return
+    }
+    if library == "calldepth" {
+        compileDepthBoundary(output, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterTypes, name, returnType)
+        return
+    }
+    if recoveryEnabled(state) && (library == "machine" || library == "machine_arm64") && readableDeclarationName(name) == "callEntry" {
+        fail("machine.callEntry is unavailable in recoverable call-depth programs; use a typed language callback")
     }
     if library == "machine" || library == "machine_arm64" {
         let intrinsic = ""
@@ -86,7 +96,6 @@ function compileNative(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
         }
         let split = findCharacter(intrinsic, '\n') + 1
         if intrinsic[2] == ';' {
-            // A declaration marker must be its own piece for appendNativeDeclarations.
             output.add(intrinsic.slice(0, split))
             output.add(intrinsic.slice(split, intrinsic.length))
         } else {
@@ -124,6 +133,7 @@ function compileNative(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     } else {
         output.add("  %native.result = call " + result + " @" + callee + "(" + arguments + ")\n")
     }
+    recoveryNativeCheckpoint(output, textState, state, returnType)
     output.add("  call void @minyar_rc_leave()\n")
     output.add("  call void @minyar_stack_leave()\n")
     if returnType == 5 {
@@ -133,10 +143,6 @@ function compileNative(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     }
 }
 
-// The `machine` package gives freestanding programs direct access to memory,
-// I/O ports and the processor. Its functions compile to these inline bodies,
-// with no runtime prologue. Raw hosted syscalls call the shared runtime helper.
-// Arguments arrive as %argument.N; Integers are i64 and Bytes are pointers.
 function machineIntrinsic(name: Text): Text {
     if name == "syscall" {
         let declaration = "  ; minyar-native: machine|declare i64 @minyar_machine_syscall(i64, i64, i64, i64, i64, i64, i64)\n"
@@ -228,19 +234,12 @@ function machineIntrinsic(name: Text): Text {
     return ""
 }
 
-// The same package for 64-bit Arm (library/arch/arm64/machine.min). Memory,
-// atomics and pixel loops are the portable bodies above; processor
-// instructions are Arm's. I/O ports, the x86 interrupt table and the VMware
-// hypervisor call do not exist there: they compile, so portable packages that
-// offer them still build, but stop the processor if they are ever reached.
 function machineIntrinsicArm64(name: Text): Text {
     let barrier = "~{memory}"
     if name == "pause" { return armInstruction("yield") }
     if name == "halt" { return armInstruction("wfi") }
     if name == "enableInterrupts" { return armInstruction("msr daifclr, #2") }
     if name == "disableInterrupts" { return armInstruction("msr daifset, #2") }
-    // Wait with interrupts masked (a pending one still wakes the processor),
-    // then unmask so its handler runs: like x86's `sti; hlt`.
     if name == "waitForInterrupt" { return armInstruction("wfi; msr daifclr, #2") }
     if name == "timestamp" {
         return "  %value = call i64 asm sideeffect \"isb; mrs $0, cntvct_el0\", \"=r," + barrier + "\"()\n  ret i64 %value\n"
@@ -251,7 +250,6 @@ function machineIntrinsicArm64(name: Text): Text {
     if name == "interruptCount" { return armTableLoad("minyar_interrupt_counts", "load volatile i64") }
     if name == "symbol" { return armTableLoad("minyar_machine_symbols", "load i64") }
     if name == "firmwareCall" {
-        // SMCCC through HVC: function in x0, arguments in x1-x3, result in x0.
         let clobbers = "~{x4},~{x5},~{x6},~{x7},~{x8},~{x9},~{x10},~{x11},~{x12},~{x13},~{x14},~{x15},~{x16},~{x17},~{memory}"
         let call = "  %registers = call { i64, i64, i64, i64 } asm sideeffect \"hvc #0\", \"={x0},={x1},={x2},={x3},0,1,2,3," + clobbers + "\"(i64 %argument.0, i64 %argument.1, i64 %argument.2, i64 %argument.3)\n"
         return call + "  %value = extractvalue { i64, i64, i64, i64 } %registers, 0\n  ret i64 %value\n"
@@ -277,15 +275,11 @@ function armPortIntrinsic(name: Text): Boolean {
     return name == "in8" || name == "in16" || name == "in32" || name == "out8" || name == "out16" || name == "out32"
 }
 
-// A word of a table the boot code defines, such as the interrupt counts.
 function armTableLoad(table: Text, load: Text): Text {
     let address = "  %table = call ptr asm \"adrp $0, " + table + "\\0A\\09add $0, $0, :lo12:" + table + "\", \"=r\"()\n"
     return address + "  %slot = getelementptr i64, ptr %table, i64 %argument.0\n  %value = " + load + ", ptr %slot, align 8\n  ret i64 %value\n"
 }
 
-// Pixel blending loops, written without overflow checks so LLVM can
-// vectorize them. Pixels are 0x00RRGGBB; red and blue blend in one 32-bit
-// multiply and green in another, with opacities scaled to 0-256.
 function blendPixel(pixel: Text, opacity: Text, colorRedBlue: Text, colorGreen: Text, out: Text): Text {
     let keep = "  %keep." + out + " = sub i32 256, " + opacity + "\n"
     let redBlue = "  %rb." + out + " = and i32 " + pixel + ", 16711935\n  %rbk." + out + " = mul i32 %rb." + out + ", %keep." + out + "\n"
@@ -297,8 +291,6 @@ function blendPixel(pixel: Text, opacity: Text, colorRedBlue: Text, colorGreen: 
     return keep + redBlue + redBlueColor + redBlueOut + green + greenColor + greenOut + "  %" + out + " = or i32 %rbm." + out + ", %gm." + out + "\n"
 }
 
-// blendSpan(address, count, color, opacity): blend `count` pixels toward one
-// color, opacity from 0 to 256.
 function machineBlendSpan(): Text {
     let head = "  %base = inttoptr i64 %argument.0 to ptr\n  %color = trunc i64 %argument.2 to i32\n  %opacity = trunc i64 %argument.3 to i32\n"
     let colors = "  %crb = and i32 %color, 16711935\n  %cg = and i32 %color, 65280\n  %any = icmp sgt i64 %argument.1, 0\n  br i1 %any, label %blend, label %done\n"
@@ -307,10 +299,6 @@ function machineBlendSpan(): Text {
     return head + colors + loop + blendPixel("%pixel", "%opacity", "%crb", "%cg", "result") + tail
 }
 
-// blendMask(address, count, mask, color, scale, bias, limit): blend `count`
-// pixels toward `color`, each through the byte at the same place in `mask`:
-// opacity = min(mask + bias, limit) * scale / 256, so a coverage mask uses
-// bias 0 and limit 255, and scale 256 for full strength.
 function machineBlendMask(): Text {
     let head = "  %base = inttoptr i64 %argument.0 to ptr\n  %mask = inttoptr i64 %argument.2 to ptr\n  %color = trunc i64 %argument.3 to i32\n"
     let parameters = "  %scale = trunc i64 %argument.4 to i32\n  %bias = trunc i64 %argument.5 to i32\n  %limit = trunc i64 %argument.6 to i32\n"
@@ -323,9 +311,6 @@ function machineBlendMask(): Text {
     return declaration + head + parameters + colors + loop + cover + opacity + blendPixel("%pixel", "%opacity", "%crb", "%cg", "result") + tail
 }
 
-// coverage(source, target, count): the running sum of `count` float32 signed
-// areas at `source`, as coverage bytes 0-255 at `target` (the last step of
-// filling an outline).
 function machineCoverage(): Text {
     let head = "  %source = inttoptr i64 %argument.0 to ptr\n  %target = inttoptr i64 %argument.1 to ptr\n  %any = icmp sgt i64 %argument.2, 0\n  br i1 %any, label %cover, label %done\n"
     let loop = "cover:\n  %index = phi i64 [ 0, %entry ], [ %next, %cover ]\n  %sum = phi double [ 0.0, %entry ], [ %total, %cover ]\n"
@@ -386,9 +371,3 @@ function storeRegister(index: Integer): Text {
     let slot = "  %slot." + number + " = getelementptr i64, ptr %results, i64 " + number + "\n"
     return extract + widen + slot + "  store i64 %wide." + number + ", ptr %slot." + number + ", align 8\n"
 }
-
-// A parallel function may run on any processor at the same time as others, so
-// it must not touch the single-threaded runtime: no reference values, no
-// call-depth or ownership frames, and calls only to other parallel functions,
-// machine intrinsics, checked-arithmetic helpers and mathematics. Its frames
-// are removed here; its calls are recorded for checkParallelCalls.

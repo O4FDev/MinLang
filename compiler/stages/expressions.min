@@ -22,8 +22,6 @@ function nameInStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, posi
     return false
 }
 
-// Whether the tokens at `position` are `[ ... ]` with no call inside, so
-// evaluating the position cannot run code that replaces the indexed value.
 function indexWithoutCalls(tokenKinds: List<Integer>, tokenTexts: List<Text>, position: Integer): Boolean {
     if tokenKinds[position] != 4 || tokenTexts[position] != "[" {
         return false
@@ -61,13 +59,11 @@ function sortRuntimeDeclarations(globals: List<Text>) {
 }
 
 function sortBorrowReference(output: List<Text>, state: List<Integer>, value: Text, type: Integer, counts: List<Integer>, fields: List<Integer>, returns: List<Integer>) {
-    borrowReference(output, state, value, type)
+    borrowReference(output, state, value, type, counts, fields, returns)
 }
 
 function sortComparatorThunk(names: List<Text>, type: Integer, element: Integer, globals: List<Text>): Text {
-    // Request the optional closure frontend before emitting any user output.
-    exit(86)
-    return ""
+    return closureSortComparatorThunk(names, type, element, globals)
 }
 
 function appendTextRuntimeDeclaration(globals: List<Text>, name: Text, returnType: Integer, count: Integer) {
@@ -136,7 +132,6 @@ function hasGlobalDeclarations(globals: List<Text>): Boolean {
     while pieceIndex < globals.length {
         let piece = globals[pieceIndex]
         if startsDeclaration(piece) { return true }
-        // Ordinary literal/table globals and definitions need no line scan.
         if piece.byteLength > 0 && piece[0] != '@' && !(piece.byteLength >= 7 && piece[0] == 'd' && piece.slice(0, 7) == "define ") {
         let position = 0
         let scan = true
@@ -154,9 +149,6 @@ function hasGlobalDeclarations(globals: List<Text>): Boolean {
     return false
 }
 
-// Feature globals can contain declaration blocks shared by several modules.
-// Keep exact complete declaration lines once, regardless of feature/API name.
-// Stop at the first definition: cached function bodies never need rescanning.
 function deduplicateGlobalDeclarations(code: Text, seen: List<Text>): Text {
     let pieces: List<Text> = []
     let position = 0
@@ -228,7 +220,7 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
         let local = findLocal(localNames, localLengths, state, tokenTexts[atom])
         if local >= 0 { scalarValues = scalarRecordValues(state, localIds[local]) }
     }
-    if (tokenKinds[atom] == 1 && tokenTexts[atom + 1] == "(") || (tokenKinds[atom] == 4 && tokenTexts[atom] == "[") {
+    if ((state[15] / 4 % 2) != 0 && tokenKinds[atom] == 3) || (tokenTexts[atom] != "function" && ((tokenKinds[atom] == 1 && tokenTexts[atom + 1] == "(") || (tokenKinds[atom] == 4 && tokenTexts[atom] == "["))) {
         ownResult(output, state, value, resultType)
     }
 
@@ -250,7 +242,6 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                 state[0] = state[0] + 1
                 if member.byteLength >= 4 && isListType(receiverType) && member[0] == 's' && (member == "sort" || member == "sorted" || member == "sortBy" || member == "sortedBy") {
                     sortRuntimeDeclarations(globals)
-                    // Root the selected receiver before evaluating arbitrary arguments.
                     sortBorrowReference(output, state, receiver, receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
                     let element = listElementType(receiverType)
                     let copying = member == "sorted" || member == "sortedBy"
@@ -288,6 +279,10 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                         if isReferenceType(element) { output.add(", i64 1") } else { output.add(", i64 0") }
                     }
                     output.add(")\n")
+                    if by && recoveryEnabled(state) {
+                        state[14] = state[14] + 1
+                        if copying { recoveryOwnedCheckpoint(output, textState, state, value) } else { recoveryCheckpoint(output, textState, state) }
+                    }
                     if copying {
                         setType(resultType, receiverType)
                         ownsResult = true
@@ -298,8 +293,12 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                 if isMapType(receiverType) {
                     value = parseMapMethod(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, receiver, receiverType, member, resultType)
                 } else {
-                if receiverType == 8 {
+                if receiverType == 8 || receiverType == 9 {
+                    if receiverType == 9 {
+                        value = threadFrozenMethod(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, receiver, member, resultType)
+                    } else {
                     value = parseBytesMethod(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, receiver, member, memberLocation, resultType)
+                    }
                     ownsResult = resultType[0] == 8
                 } else {
                 if (receiverType == 2 && member != "slice" && isTextBasicMethod(member)) || (member.byteLength == 5 && member == "clear" && isListType(receiverType)) {
@@ -342,8 +341,6 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                         }
                         let slot = valueAsListSlot(output, textState, state, argument, argumentType[0])
                         let transfers = takeResult(output, state, argument, argumentType)
-                        // An owned receiver, such as x in x = x.appended(e),
-                        // is consumed: a unique List grows in place.
                         let runtimeName = "minyar_list_appended"
                         if takeOwner(output, state, receiver, receiverOwner) {
                             runtimeName = "minyar_list_appended_take"
@@ -353,6 +350,7 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                         output.add("  ")
                         output.add(value)
                         output.add(" = call ptr @")
+                        noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, receiverType, argumentType[0])
                         output.add(runtimeName)
                         output.add("(ptr ")
                         output.add(receiver)
@@ -381,7 +379,11 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                         fail("the value added to a List has the wrong type")
                     }
                     checkListMutation(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+                    if possibleCycleType(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes) {
+                        output.add("  call void @minyar_rc_enable_cycles()\n")
+                    }
                     let slot = valueAsListSlot(output, textState, state, argument, argumentType[0])
+                    noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, receiverType, argumentType[0])
                     if takeResult(output, state, argument, argumentType) {
                         output.add("  call void @minyar_list_add_take(ptr ")
                     } else {
@@ -400,7 +402,10 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                 }
                 }
             } else {
-                if isRecordType(receiverType) {
+                if receiverType == 12 || receiverType == 13 || receiverType == 15 {
+                    value = threadResultMember(output, textState, state, receiver, receiverType, member, resultType)
+                    ownsResult = resultType[0] == 9 || resultType[0] == 11
+                } else if isRecordType(receiverType) {
                     let field = findRecordField(functionParameterCounts, functionParameterNames, receiverType, member)
                     if field < 0 {
                         fail("record '" + readableDeclarationName(functionNames[receiverType - 1000]) + "' has no field named '" + member + "'")
@@ -425,7 +430,7 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                     value = slotAsValue(output, textState, state, raw, fieldType)
                     setType(resultType, fieldType)
                 } else {
-                    if receiverType != 2 && receiverType != 8 && !isContainerType(receiverType) {
+                    if receiverType != 2 && receiverType != 8 && receiverType != 9 && !isContainerType(receiverType) {
                         fail("this value does not provide a field named '" + member + "'")
                     }
                     if member != "length" && !(receiverType == 2 && member == "byteLength") {
@@ -443,9 +448,8 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                             operation = "text_byte_length"
                         }
                     }
-                    if receiverType == 8 {
-                        operation = "bytes_length"
-                    }
+                    if receiverType == 8 { operation = "bytes_length" }
+                    if receiverType == 9 { operation = "frozen_bytes_length" }
                     value = valueName(textState, temporary)
                     output.add("  ")
                     output.add(value)
@@ -490,8 +494,13 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                 output.add(")\n")
                 setType(resultType, 3)
             } else {
-                if collectionType == 8 {
-                    value = emitBytesRead(output, textState, state, collection, position)
+                if collectionType == 8 || collectionType == 9 {
+                    if collectionType == 9 {
+                        let types: List<Integer> = [9, 1]
+                        value = emitCall(output, textState, state, 1, "minyar_frozen_bytes_get_uint8", pairOf(collection, position), types)
+                    } else {
+                        value = emitBytesRead(output, textState, state, collection, position)
+                    }
                     setType(resultType, 1)
                 } else {
                 if !isListType(collectionType) {
@@ -515,12 +524,9 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
         if ownsResult {
             ownResult(output, state, value, resultType)
         } else {
-            // A following field read cannot change the receiver's owner, and
-            // neither can an index whose expression makes no calls. Other
-            // calls and indexed expressions can, so keep those receivers alive.
             let fieldRead = tokenIs(tokenKinds, tokenTexts, state, ".") && state[0] + 2 < tokenTexts.length && tokenTexts[state[0] + 2] != "("
             if !fieldRead && !indexWithoutCalls(tokenKinds, tokenTexts, state[0]) {
-                borrowReference(output, state, value, resultType[0])
+                borrowReference(output, state, value, resultType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes)
             }
         }
     }
@@ -528,6 +534,9 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
 }
 
 function parseRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
+    if resultPrefix(tokenTexts[state[0]], "minyar_result_type_") {
+        fail("Result values require Ok or Err constructors")
+    }
     let name = tokenTexts[state[0]]
     let record = findCompiledSymbol(functionNames, symbolKinds, functionReturnTypes, name, 2)
     if record < 0 {
@@ -579,6 +588,7 @@ function parseRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLin
         if scalar {
             output.add(" = call ptr @minyar_record_new_scalar(i64 ")
         } else {
+            noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, 1000 + record, 0)
             output.add(" = call ptr @minyar_record_new(i64 ")
         }
         output.add(Text(fieldCount))
@@ -615,6 +625,7 @@ function parseRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLin
         if scalarValues >= 0 {
             output[scalarValues + fieldPosition * 3 + 1] = slot
         } else {
+        noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, 1000 + record, fieldType[0])
         if isReferenceType(fieldType[0]) {
             if takeResult(output, state, fieldValue, fieldType) {
                 output.add("  call void @minyar_record_set_take(ptr ")
@@ -687,6 +698,7 @@ function appendIntegerListRun(tokenKinds: List<Integer>, tokenTexts: List<Text>,
         output.add("  call void @minyar_list_add(ptr " + value + ", i64 " + constants[0] + ")\n")
     } else {
         let name = "@.list." + Text(first)
+        if textState[2] != "" { name = "@\"minyar.literal|" + textState[2] + "|list|" + Text(first) + "\"" }
         globals.add(name + " = private unnamed_addr constant [" + Text(constants.length) + " x i64] [")
         let position = 0
         while position < constants.length {
@@ -699,6 +711,3 @@ function appendIntegerListRun(tokenKinds: List<Integer>, tokenTexts: List<Text>,
         output.add("  call void @minyar_list_append_scalars(ptr " + value + ", ptr " + name + ", i64 " + Text(constants.length) + ")\n")
     }
 }
-
-// Literal conditions have one possible edge. Preserve both parsed bodies for
-// diagnostics, but do not leave LLVM to analyse impossible deeply nested CFGs.

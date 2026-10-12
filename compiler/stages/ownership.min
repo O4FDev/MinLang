@@ -20,14 +20,12 @@ function markOwner(resultType: List<Integer>, owner: Integer) {
 }
 
 function ownResult(output: List<Text>, state: List<Integer>, value: Text, resultType: List<Integer>) {
+    if recoveryEnabled(state) && resultType.length > 1 && resultType[1] >= 0 { return }
     if isReferenceType(resultType[0]) {
         markOwner(resultType, keepReference(output, state, value, resultType[0]))
     }
 }
 
-// A producer returns one owned reference. A consuming destination can take
-// that exact reference, eliminating temporary registration and a retain/drop
-// pair. Borrowed values never carry this token. No heap uniqueness is assumed.
 function takeResult(output: List<Text>, state: List<Integer>, value: Text, resultType: List<Integer>): Boolean {
     if isReferenceType(resultType[0]) && resultType.length > 1 {
         let owner = resultType[1]
@@ -40,13 +38,9 @@ function takeResult(output: List<Text>, state: List<Integer>, value: Text, resul
 }
 
 function takeOwner(output: List<Text>, state: List<Integer>, value: Text, owner: Integer): Boolean {
+    if recoveryEnabled(state) { return false }
     if owner == -1 { return false }
     if output[owner] == "  ; minyar-owned-local-transfer\n" {
-        // Delay clearing the slot until after the right operand has run. This
-        // preserves expressions such as x = x + x while still handing the
-        // left ownership count to the consuming join.
-        // A local that does not own its value yet (a parameter before its
-        // first assignment) gets one count, so the consumer always takes one.
         output.add("  call void @minyar_rc_local_move_owner(i64 ")
         output.add(output[owner + 1])
         output.add(", ptr ")
@@ -66,13 +60,8 @@ function takeOwner(output: List<Text>, state: List<Integer>, value: Text, owner:
     return false
 }
 
-// LLVM local identifiers and runtime ownership slots are independent. Only
-// bindings that acquire an owner need a slot. Generation tags reuse the map
-// between functions without clearing its high-water capacity each time.
-// The first 15 entries hold compiler state, including reachability at index 13
-// and the body's user-call count at index 14.
 function ownershipSlot(state: List<Integer>, id: Integer): Integer {
-    let entry = 15 + id * 2
+    let entry = 16 + id * 2
     while state.length <= entry + 1 {
         state.add(-1)
     }
@@ -84,12 +73,9 @@ function ownershipSlot(state: List<Integer>, id: Integer): Integer {
     return state[entry + 1]
 }
 
-// Negative ownership-map values identify scalar-replaced records. Their
-// initializer SSA values are kept in harmless output comments, just as owned
-// expression tokens identify editable output pieces elsewhere in this emitter.
 function scalarRecordValues(state: List<Integer>, id: Integer): Integer {
     if id < 0 { return -1 }
-    let entry = 15 + id * 2
+    let entry = 16 + id * 2
     if entry + 1 < state.length && state[entry] == state[9] && state[entry + 1] < -1 {
         return -2 - state[entry + 1]
     }
@@ -97,17 +83,14 @@ function scalarRecordValues(state: List<Integer>, id: Integer): Integer {
 }
 
 function markScalarRecord(state: List<Integer>, id: Integer, values: Integer) {
-    let entry = 15 + id * 2
+    let entry = 16 + id * 2
     while state.length <= entry + 1 { state.add(-1) }
     state[entry] = state[9]
     state[entry + 1] = -2 - values
 }
 
-// A let-bound scalar record can be replaced only when every occurrence of its
-// name in the remaining lexical scope is a field projection. Reject aliases,
-// assignments, argument passing, returns of the object, and shadowing. This is
-// deliberately conservative and does not infer anything from return types.
 function prepareScalarRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, counts: List<Integer>, fields: List<Integer>, state: List<Integer>, name: Text) {
+    if (state[15] / 1 % 2) != 0 { return }
     let record = findCompiledSymbol(functionNames, symbolKinds, functionReturnTypes, tokenTexts[state[0]], 2)
     if record < 0 { return }
     let cost = counts[record] * 8
@@ -119,7 +102,6 @@ function prepareScalarRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, 
         if isReferenceType(fields[first + field]) { return }
         field = field + 1
     }
-    // Charge rejected proofs too, so at most 64 suffix scans run per body.
     state[11] = state[11] + cost
     let cursor: List<Integer> = []
     cursor.add(state[0])
@@ -157,7 +139,7 @@ function rootLocal(output: List<Text>, state: List<Integer>, id: Integer, value:
     }
 }
 
-function assignReference(output: List<Text>, state: List<Integer>, id: Integer, value: Text, resultType: List<Integer>) {
+function assignReference(output: List<Text>, state: List<Integer>, id: Integer, value: Text, resultType: List<Integer>, counts: List<Integer>, fields: List<Integer>, returnTypes: List<Integer>) {
     if takeResult(output, state, value, resultType) {
         state[6] = 1
         output.add("  call void @minyar_rc_local_take(i64 ")
@@ -166,13 +148,17 @@ function assignReference(output: List<Text>, state: List<Integer>, id: Integer, 
         output.add(value)
         output.add(")\n")
     } else {
+        let piece = output.length
         rootLocal(output, state, id, value, resultType[0])
+        if piece < output.length { noteCycleFixup(output, returnTypes, counts, fields, piece, resultType[0], 0) }
     }
 }
-function borrowReference(output: List<Text>, state: List<Integer>, value: Text, type: Integer) {
+
+function borrowReference(output: List<Text>, state: List<Integer>, value: Text, type: Integer, counts: List<Integer>, fields: List<Integer>, returnTypes: List<Integer>) {
     if isReferenceType(type) {
         state[6] = 1
         state[7] = state[7] + 1
+        noteCycleFixup(output, returnTypes, counts, fields, output.length, type, 0)
         output.add("  call void @minyar_rc_borrow(ptr ")
         output.add(value)
         output.add(")\n")
@@ -180,13 +166,14 @@ function borrowReference(output: List<Text>, state: List<Integer>, value: Text, 
 }
 
 function finishStackOwnership(output: List<Text>, slot: Integer, owners: Integer) {
-    let stackEntry = "  call void @minyar_stack_enter()\n"
-    let prefix = stackEntry + "  call void @minyar_rc_enter(i64 " + Text(owners) + ")\n"
-    let entry = stackEntry + "  %rc.stack.header = alloca [64 x i8], align 8\n"
-    entry = entry + "  %rc.stack.owners = alloca [" + Text(owners * 2) + " x i64], align 8\n"
-    entry = entry + "  call void @minyar_rc_enter_stack_v1(ptr %rc.stack.header, ptr %rc.stack.owners, i64 " + Text(owners) + ")\n"
-    output[slot] = entry + output[slot].slice(prefix.length, output[slot].length)
-    output[slot - 1] = ") noinline {\nentry:\n"
+    let prefix = "  call void @minyar_rc_enter(i64 " + Text(owners) + ")\n"
+    let entry = output[slot]
+    let start = recoveryTextPosition(entry, prefix)
+    if start < 0 { fail("recovery stack frame entry metadata drifted") }
+    let storage = "  %rc.stack.header = alloca [64 x i8], align 8\n"
+    storage = storage + "  %rc.stack.owners = alloca [" + Text(owners * 2) + " x i64], align 8\n"
+    storage = storage + "  call void @minyar_rc_enter_stack_v1(ptr %rc.stack.header, ptr %rc.stack.owners, i64 " + Text(owners) + ")\n"
+    output[slot] = entry.slice(0, start) + storage + entry.slice(start + prefix.length, entry.length)
     let piece = slot + 1
     while piece < output.length {
         if output[piece] == "  call void @minyar_rc_leave()\n" {
@@ -196,9 +183,15 @@ function finishStackOwnership(output: List<Text>, slot: Integer, owners: Integer
     }
 }
 
-function finishFunctionEntry(output: List<Text>, slot: Integer, locals: Integer, parameters: Integer, owners: Integer, references: Boolean) {
+function finishFunctionEntry(output: List<Text>, slot: Integer, locals: Integer, parameters: Integer, owners: Integer, references: Boolean, returnedType: Text, features: Integer, caller: Text, globals: List<Text>, constants: Boolean) {
     let entry: List<Text> = []
-    entry.add("  call void @minyar_stack_enter()\n")
+    let recoverable = features / 8 % 2 != 0
+    if recoverable {
+        entry.add("  %recovery.accepted = call i32 @minyar_recovery_enter()\n")
+        entry.add("  %recovery.allowed = icmp ne i32 %recovery.accepted, 0\n")
+        entry.add("  br i1 %recovery.allowed, label %recovery.body, label %recovery.reject\n")
+        entry.add("recovery.reject:\n" + recoveryDummy(returnedType) + "recovery.body:\n")
+    } else { entry.add("  call void @minyar_stack_enter()\n") }
     if references {
         entry.add("  call void @minyar_rc_enter(i64 ")
         entry.add(Text(owners))
@@ -220,5 +213,169 @@ function finishFunctionEntry(output: List<Text>, slot: Integer, locals: Integer,
         local = local + 1
     }
     output[slot] = joinText(entry)
+    if recoverable {
+        output.add("\nrecovery.unwind:\n")
+        if features / 4 % 2 != 0 { threadJoinOnReturn(output, globals, caller) }
+        if constants { output.add("  call void @.minyar.constants.release()\n") }
+        if references { output.add("  call void @minyar_rc_leave()\n") }
+        output.add("  call void @minyar_stack_leave()\n")
+        output.add(recoveryDummy(returnedType))
+    }
 }
 
+function activateCycleType(returnTypes: List<Integer>, type: Integer, start: Integer) {
+    let position = start
+    while position + 1 < returnTypes.length {
+        if returnTypes[position] == -3 {
+            if returnTypes[position + 1] == -1 - type { return }
+            position = position + 2
+        } else {
+            if returnTypes[position] == -2 { position = position + 4 } else { position = position + 1 }
+        }
+    }
+    returnTypes.add(-3)
+    returnTypes.add(-1 - type)
+}
+
+function cycleTypeReaches(from: Integer, target: Integer, counts: List<Integer>, fields: List<Integer>): Boolean {
+    if from == target { return true }
+    if !isContainerType(from) && !isRecordType(from) { return false }
+    let visited: List<Boolean> = []
+    let position = 0
+    while position < counts.length / 2 { visited.add(false)
+        position = position + 1 }
+    let pending: List<Integer> = []
+    pending.add(from)
+    position = 0
+    while position < pending.length {
+        let type = pending[position]
+        position = position + 1
+        while isContainerType(type) {
+            if type == target { return true }
+            type = containerValueType(type)
+        }
+        if type == target { return true }
+        if isRecordType(type) && !visited[type - 1000] {
+            let record = type - 1000
+            visited[record] = true
+            let field = 0
+            let first = functionParameterOffset(counts, record)
+            while field < counts[record] {
+                pending.add(fields[first + field])
+                field = field + 1
+            }
+        }
+    }
+    return false
+}
+
+function possibleCycleType(type: Integer, counts: List<Integer>, fields: List<Integer>, returnTypes: List<Integer>): Boolean {
+    let base = type
+    while isContainerType(base) { base = containerValueType(base) }
+    if !isRecordType(base) { return false }
+    let position = counts.length
+    while position < returnTypes.length {
+        if returnTypes[position] == -2 { position = position + 4 } else {
+            if returnTypes[position] == -3 || returnTypes[position] == -5 { position = position + 2 } else {
+                if type >= 0 && returnTypes[position] == type { return false }
+                position = position + 1
+            }
+        }
+    }
+    let starts: List<Integer> = []
+    if isContainerType(type) {
+        starts.add(containerValueType(type))
+    } else {
+        let record = type - 1000
+        let first = functionParameterOffset(counts, record)
+        position = 0
+        while position < counts[record] { starts.add(fields[first + position])
+            position = position + 1 }
+    }
+    position = 0
+    while position < starts.length {
+        if cycleTypeReaches(starts[position], type, counts, fields) { return true }
+        position = position + 1
+    }
+    if type >= 0 { returnTypes.add(type) }
+    return false
+}
+
+function noteCycleFixup(output: List<Text>, returnTypes: List<Integer>, counts: List<Integer>, fields: List<Integer>, piece: Integer, typeA: Integer, typeB: Integer) {
+    let baseA = typeA
+    let baseB = typeB
+    while isContainerType(baseA) { baseA = containerValueType(baseA) }
+    while isContainerType(baseB) { baseB = containerValueType(baseB) }
+    if !isRecordType(baseA) && !isRecordType(baseB) { return }
+    returnTypes.add(-2)
+    returnTypes.add(-1 - piece)
+    returnTypes.add(-1 - typeA)
+    returnTypes.add(-1 - typeB)
+}
+
+function cycleTypeActive(type: Integer, returnTypes: List<Integer>, counts: List<Integer>, fields: List<Integer>): Boolean {
+    if !isContainerType(type) && !isRecordType(type) { return false }
+    let position = counts.length
+    while position + 1 < returnTypes.length {
+        if returnTypes[position] == -3 {
+            let root = -1 - returnTypes[position + 1]
+            if possibleCycleType(root, counts, fields, returnTypes) && cycleTypeReaches(root, type, counts, fields) && cycleTypeReaches(type, root, counts, fields) { return true }
+            position = position + 2
+        } else {
+            if returnTypes[position] == -2 { position = position + 4 } else { position = position + 1 }
+        }
+    }
+    return false
+}
+
+function finishCycleFixups(output: List<Text>, returnTypes: List<Integer>, counts: List<Integer>, fields: List<Integer>) {
+    let position = counts.length
+    let enabled = false
+    while position + 1 < returnTypes.length {
+        if returnTypes[position] == -3 {
+            enabled = true
+            position = position + 2
+        } else {
+            if returnTypes[position] == -2 { position = position + 4 } else { position = position + 1 }
+        }
+    }
+    if !enabled { return }
+    position = counts.length
+    while position + 3 < returnTypes.length {
+        if returnTypes[position] == -2 {
+            let piece = -1 - returnTypes[position + 1]
+            let typeA = -1 - returnTypes[position + 2]
+            let typeB = -1 - returnTypes[position + 3]
+            if cycleTypeActive(typeA, returnTypes, counts, fields) || cycleTypeActive(typeB, returnTypes, counts, fields) {
+                let text = output[piece]
+                let end = 0
+                while end < text.byteLength && text[end] != '(' { end = end + 1 }
+                if end < text.byteLength {
+                    output[piece] = text.slice(0, end) + "_traced" + text.slice(end, text.byteLength)
+                } else {
+                    if text != "" { output[piece] = text + "_traced" }
+                }
+            }
+            position = position + 4
+        } else {
+            if returnTypes[position] == -3 { position = position + 2 } else { position = position + 1 }
+        }
+    }
+    output.add("; minyar-cycle-runtime: 1\n")
+    output.add("declare void @minyar_rc_retain_traced(ptr)\n")
+    output.add("declare void @minyar_rc_local_traced(i64, ptr)\n")
+    output.add("declare void @minyar_rc_borrow_traced(ptr)\n")
+    output.add("declare void @minyar_rc_enable_cycles()\n")
+    output.add("declare ptr @minyar_list_new_traced()\n")
+    output.add("declare ptr @minyar_list_appended_traced(ptr, i64, i64, i64)\n")
+    output.add("declare ptr @minyar_list_appended_take_traced(ptr, i64, i64, i64)\n")
+    output.add("declare void @minyar_list_add_traced(ptr, i64)\n")
+    output.add("declare void @minyar_list_add_take_traced(ptr, i64)\n")
+    output.add("declare void @minyar_list_set_traced(ptr, i64, i64)\n")
+    output.add("declare void @minyar_list_set_take_traced(ptr, i64, i64)\n")
+    output.add("declare ptr @minyar_record_new_traced(i64)\n")
+    output.add("declare void @minyar_record_set_traced(ptr, i64, i64)\n")
+    output.add("declare void @minyar_record_set_take_traced(ptr, i64, i64)\n")
+    output.add("declare void @minyar_record_set_reference_traced(ptr, i64, i64)\n")
+    output.add("declare void @minyar_record_replace_traced(ptr, i64, i64, i64)\n")
+}

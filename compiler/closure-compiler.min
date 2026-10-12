@@ -1,6 +1,3 @@
-// The optional frontend shares the ordinary parser and ownership emitter.
-// Signature and environment symbols are private to this compilation. Their
-// graph fields describe owned edges; signature arguments are not graph edges.
 record CallbackTokens { kinds: List<Integer>; texts: List<Text>; lines: SourceMap }
 
 function closureSortComparatorThunk(names: List<Text>, type: Integer, element: Integer, globals: List<Text>): Text {
@@ -10,8 +7,6 @@ function closureSortComparatorThunk(names: List<Text>, type: Integer, element: I
     if signature[0] != element || signature[1] != element || signature[2] != 1 {
         fail("sortBy and sortedBy require Callback<T, T, Integer>")
     }
-    // A parameter-only callback still needs domain checks and its runtime,
-    // even when this program never constructs a closure literal.
     globals.add("; minyar-sort-callback-runtime: 1\n")
     let name = "@.minyar.sort.compare." + Text(globals.length)
     let code = "define internal i64 " + name + "(ptr %callback, i64 %left.slot, i64 %right.slot) {\nentry:\n"
@@ -40,8 +35,6 @@ function callbackTypePositions(kinds: List<Integer>, texts: List<Text>): List<Bo
     for kind in kinds { positions.add(false) }
     let position = 0
     while position < kinds.length && kinds[position] != 0 {
-        // Only declarations and typed headers introduce type syntax. Values
-        // named List/Callback can still participate in ordinary comparisons.
         if kinds[position] == 1 && texts[position] == "function" {
             let cursor = position + 1
             while kinds[cursor] != 0 && texts[cursor] != "{" {
@@ -88,6 +81,7 @@ function normalizeCallbackTokens(kinds: List<Integer>, texts: List<Text>, lines:
     let outputKinds: List<Integer> = []
     let outputTexts: List<Text> = []
     let outputLines = newSourceMap()
+    outputLines.features = lines.features
     let mapping: List<Integer> = []
     let typePositions = callbackTypePositions(kinds, texts)
     let depth = 0
@@ -223,8 +217,6 @@ function takeCallbackHeader(kinds: List<Integer>, texts: List<Text>, lines: Sour
 function prepareCallbackSymbols(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, names: List<Text>, symbols: List<Integer>, locations: List<Text>, returns: List<Integer>, counts: List<Integer>) {
     let position = 0
     let typePositions = callbackTypePositions(kinds, texts)
-    // Register nested signature syntax from the inside out. All user record
-    // names already exist, including records declared after a signature.
     position = kinds.length - 2
     while position >= 0 {
         if kinds[position] == 1 && typePositions[position] && texts[position] == "Callback" && texts[position + 1] == "<" {
@@ -308,8 +300,6 @@ function callbackReadsName(kinds: List<Integer>, texts: List<Text>, start: Integ
             shadow = shadows[depth] == 1
         }
         if texts[position] == "let" && texts[position + 1] == name {
-            // The initializer still reads the outer binding. The new binding
-            // shadows it from the next statement within this lexical scope.
             let cursor = position + 2
             while cursor < end && kinds[cursor] != 6 { cursor = cursor + 1 }
             let read = position + 2
@@ -343,6 +333,7 @@ function addCallbackEdge(counts: List<Integer>, fields: List<Integer>, fieldName
 }
 
 function parseClosure(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
+    if (state[15] / 4 % 2) != 0 { threadNote(output, textState[1], "indirect", "closure creation", "unreviewed") }
     let start = state[0]
     let parameters: List<Text> = []
     let types: List<Integer> = []
@@ -407,12 +398,11 @@ function parseClosure(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
 }
 
 function parseCallbackCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, callback: Text, callbackType: Integer): Text {
+    if (state[15] / 4 % 2) != 0 { threadNote(output, textState[1], "indirect", "callback call", "unreviewed") }
     let signature = callbackSignatureTypes(functionNames[callbackType - 1000])
     let count = signature.length - 1
     state[0] = state[0] + 1
     expectToken(tokenKinds, tokenTexts, tokenLines, state, "(")
-    // Protect the selected receiver before arbitrary argument expressions
-    // can replace a local or remove it from an aliased container.
     output.add("  call void @minyar_callback_check(ptr " + callback + ")\n")
     borrowReference(output, state, callback, callbackType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
     let values: List<Text> = []
@@ -444,11 +434,12 @@ function parseCallbackCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
     }
     output.add(")\n")
     state[14] = state[14] + 1
+    recoveryCheckpoint(output, textState, state)
     setType(resultType, result)
     return value
 }
 
-function compileClosureBodies(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, output: List<Text>, globals: List<Text>) {
+function compileClosureBodies(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, output: List<Text>, globals: List<Text>, stackOwnerLimit: Integer) {
     let marker = 0
     let emitted = false
     while marker < globals.length {
@@ -470,7 +461,8 @@ function compileClosureBodies(tokenKinds: List<Integer>, tokenTexts: List<Text>,
             let signature = takeCallbackHeader(tokenKinds, tokenTexts, tokenLines, state, functionNames, symbolKinds, parameters, parameterTypes)
             let result = parameterTypes[parameters.length]
             let environment = callbackEnvironment(functionNames, start)
-            let textState: List<Text> = ["entry", "callback"]
+            let textState: List<Text> = ["entry", "callback", ""]
+            if recoveryEnabled(state) { textState[0] = "recovery.body" }
             let localNames: List<Text> = []
             let localTypes: List<Integer> = []
             let localIds: List<Integer> = []
@@ -482,7 +474,6 @@ function compileClosureBodies(tokenKinds: List<Integer>, tokenTexts: List<Text>,
                 parameter = parameter + 1
             }
             output.add(") {\nentry:\n")
-            // Check the domain before either the stack guard or RC frames.
             output.add("  call void @minyar_callback_check_environment(ptr %environment)\n")
             let entry = output.length
             output.add("")
@@ -514,21 +505,20 @@ function compileClosureBodies(tokenKinds: List<Integer>, tokenTexts: List<Text>,
                 output.add("  call void @minyar_stack_leave()\n")
                 output.add("  ret void\n")
             }
-            finishFunctionEntry(output, entry, state[4], parameters.length, state[8], state[6] == 1)
+            finishFunctionEntry(output, entry, state[4], parameters.length, state[8], state[6] == 1, llvmType(result), state[15], textState[1], globals, false)
+            if stackOwnerLimit > 0 && state[14] == 0 && state[6] == 1 && state[8] >= 1 && state[8] <= stackOwnerLimit { finishStackOwnership(output, entry, state[8]) }
             output.add("}\n\n")
         }
     }
     if emitted {
         output.add("; minyar-callback-runtime: 1\n")
-        output.add("declare i64 @minyar_callback_domain()\n")
-        output.add("declare void @minyar_callback_check(ptr)\n")
-        output.add("declare void @minyar_callback_check_environment(ptr)\n")
+        if tokenLines.features / 8 % 2 == 0 { output.add("declare i64 @minyar_callback_domain()\n") }
+        if tokenLines.features / 8 % 2 == 0 { output.add("declare void @minyar_callback_check(ptr)\n") }
+        if tokenLines.features / 8 % 2 == 0 { output.add("declare void @minyar_callback_check_environment(ptr)\n") }
     }
 }
 
 function finishCallbackGraph(returns: List<Integer>, counts: List<Integer>, fields: List<Integer>) {
-    // Capture/environment edges can be discovered after a Map store was
-    // lowered, including stores in functions declared before their callers.
     let mutation = counts.length
     while mutation + 1 < returns.length {
         if returns[mutation] == -5 {

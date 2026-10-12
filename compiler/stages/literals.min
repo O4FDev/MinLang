@@ -8,9 +8,13 @@ function parseListLiteral(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
     let value = valueName(textState, temporary)
     output.add("  ")
     output.add(value)
+    let constructor = output.length
     output.add(" = call ptr @minyar_list_new()\n")
+    let constructionOwner = -1
+    if recoveryEnabled(state) { constructionOwner = keepReference(output, state, value, 100001) }
     let references = false
     if isReferenceType(elementType) {
+        noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, constructor, makeListType(elementType), 0)
         output.add("  call void @minyar_list_references(ptr ")
         output.add(value)
         output.add(")\n")
@@ -38,12 +42,14 @@ function parseListLiteral(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
             fail("all values in a List literal must have the same type")
         }
         if isReferenceType(elementType) && !references {
+            noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, constructor, makeListType(elementType), 0)
             output.add("  call void @minyar_list_references(ptr ")
             output.add(value)
             output.add(")\n")
             references = true
         }
         let slot = valueAsListSlot(output, textState, state, item, elementType)
+        noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, makeListType(elementType), elementType)
         if takeResult(output, state, item, itemType) {
             output.add("  call void @minyar_list_add_take(ptr ")
         } else {
@@ -62,6 +68,7 @@ function parseListLiteral(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
     }
     expectToken(tokenKinds, tokenTexts, tokenLines, state, "]")
     setType(resultType, makeListType(elementType))
+    if recoveryEnabled(state) { markOwner(resultType, constructionOwner) }
     return value
 }
 
@@ -72,23 +79,13 @@ function parseAtom(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
     let value = ""
 
     if token == "function" && tokenTexts[tokenIndex + 1] == "(" {
-        state[0] = tokenIndex + 2
-        while !tokenIs(tokenKinds, tokenTexts, state, ")") {
-            if tokenKinds[state[0]] != 1 { fail("expected a callback parameter name") }
-            state[0] = state[0] + 1
-            expectToken(tokenKinds, tokenTexts, tokenLines, state, ":")
-            takeValueType(tokenKinds, tokenTexts, tokenLines, state, functionNames, symbolKinds)
-            if tokenIs(tokenKinds, tokenTexts, state, ",") { state[0] = state[0] + 1 }
-        }
-        expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
-        if tokenIs(tokenKinds, tokenTexts, state, ":") {
-            state[0] = state[0] + 1
-            takeType(tokenKinds, tokenTexts, tokenLines, state, functionNames, symbolKinds)
-        }
-        expectToken(tokenKinds, tokenTexts, tokenLines, state, "{")
-        exit(86)
+        return parseClosure(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
     }
 
+    if kind == 1 && token == "try" { fail("try is only supported as a binding initializer") }
+    if kind == 1 && (resultPrefix(token, "minyar_result_ok_") || resultPrefix(token, "minyar_result_err_")) {
+        return parseResultConstructor(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
+    }
     if kind == 1 {
         if token == "Map" && (tokenTexts[tokenIndex + 1] == "<" || tokenTexts[tokenIndex + 1] == "(") {
             declareMapRuntime(globals)
@@ -104,8 +101,6 @@ function parseAtom(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
             if isReferenceType(mapValueType(type)) { references = "1" }
             output.add("  " + value + " = call ptr @minyar_map_new(i64 " + Text(mapKeyType(type)) + ", i64 " + references + ")\n")
             setType(resultType, type)
-            // Contextual Map() follows parsePrimary's ordinary call ownership;
-            // the explicit generic constructor needs its own producer token.
             if tokenTexts[tokenIndex + 1] == "<" { ownResult(output, state, value, resultType) }
             return value
         }
@@ -129,16 +124,17 @@ function parseAtom(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                         }
                     }
                     if constant >= 0 {
+                        if (state[15] / 4 % 2) != 0 { threadNote(output, textState[1], "constant", functionNames[constant], Text(functionReturnTypes[constant])) }
                         if functionParameterCounts[constant] < 0 {
                             let values: List<Text> = []
                             let types: List<Integer> = []
                             let type = functionReturnTypes[constant]
                             value = emitCall(output, textState, state, type, constantIRName(token, "load"), values, types)
                             state[14] = state[14] + 1
+                            recoveryCheckpoint(output, textState, state)
                             setType(resultType, type)
-                            borrowReference(output, state, value, type)
+                            borrowReference(output, state, value, type, functionParameterCounts, functionParameterTypes, functionReturnTypes)
                         } else {
-                            // Literal constants still substitute at the use site.
                             state[0] = functionParameterCounts[constant]
                             value = parseUnary(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
                         }
@@ -160,7 +156,7 @@ function parseAtom(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                         output.add("\n")
                     }
                     setType(resultType, localTypes[local])
-                    if id >= 0 && resultType.length > 3 && resultType[2] == id && resultType[3] == tokenIndex {
+                    if !recoveryEnabled(state) && id >= 0 && resultType.length > 3 && resultType[2] == id && resultType[3] == tokenIndex {
                         let owner = output.length
                         output.add("  ; minyar-owned-local-transfer\n")
                         output.add(Text(ownershipSlot(state, id)))
@@ -182,8 +178,17 @@ function parseAtom(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
             setType(resultType, 7)
         } else {
             if kind == 3 {
-                value = "getelementptr (i8, ptr @.text." + Text(tokenIndex) + ", i64 8)"
+                if textState[2] == "" {
+                    value = "getelementptr (i8, ptr @.text." + Text(tokenIndex) + ", i64 8)"
+                } else {
+                    value = "getelementptr (i8, ptr @" + literalName(textState[2], tokenIndex, false) + ", i64 8)"
+                }
                 state[0] = tokenIndex + 1
+                if (state[15] / 4 % 2) != 0 {
+                    let values: List<Text> = [value]
+                    let types: List<Integer> = [2]
+                    value = emitCall(output, textState, state, 2, "minyar_thread_text_literal", values, types)
+                }
                 setType(resultType, 2)
             } else {
                 if kind == 5 {
@@ -209,4 +214,3 @@ function parseAtom(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
     }
     return value
 }
-

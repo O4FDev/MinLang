@@ -46,7 +46,7 @@ function isFloatFunction(name: Text): Boolean {
 }
 
 function isBuiltinName(name: Text): Boolean {
-    return isNumericBuiltin(name) || name == "parallelEntry" || name == "print" || name == "Text" || name == "Map" || name == "fail" || name == "exit" || name == "joinText" || name == "argument" || name == "argumentCount" || name == "readTextFile" || name == "writeTextFile"
+    return threadFeatureName(name) || isNumericBuiltin(name) || name == "parallelEntry" || name == "print" || name == "Text" || name == "Map" || name == "fail" || name == "exit" || name == "joinText" || name == "argument" || name == "argumentCount" || name == "readTextFile" || name == "writeTextFile"
 }
 
 function requireBuiltinArguments(name: Text, types: List<Integer>, count: Integer, type: Integer) {
@@ -68,6 +68,7 @@ function requireBuiltinArguments(name: Text, types: List<Integer>, count: Intege
 }
 
 function emitCall(output: List<Text>, textState: List<Text>, state: List<Integer>, returnType: Integer, callee: Text, values: List<Text>, types: List<Integer>): Text {
+    if (state[15] / 4 % 2) != 0 { threadNote(output, textState[1], "runtime", callee, threadSignature(returnType, types)) }
     let value = ""
     output.add("  ")
     if returnType != 5 {
@@ -121,15 +122,12 @@ function emitInstruction(output: List<Text>, textState: List<Text>, state: List<
     return value
 }
 
-// Conversions and arithmetic helpers. Float math follows IEEE 754; Integer
-// helpers keep the checked-overflow rule unless their name says otherwise.
 function emitNumericBuiltin(output: List<Text>, textState: List<Text>, state: List<Integer>, name: Text, values: List<Text>, types: List<Integer>, resultType: List<Integer>): Text {
     if name == "Bytes" {
         if types.length == 0 {
             values.add("0")
             types.add(1)
         }
-        // Bytes(text) is the text's UTF-8 encoding.
         if types.length == 1 && types[0] == 2 {
             setType(resultType, 8)
             return emitCall(output, textState, state, 8, "minyar_text_bytes", values, types)
@@ -139,7 +137,6 @@ function emitNumericBuiltin(output: List<Text>, textState: List<Text>, state: Li
         return emitCall(output, textState, state, 8, "minyar_bytes_new", values, types)
     }
     if name == "randomBytes" {
-        // Bytes from the platform's cryptographically secure generator.
         requireBuiltinArguments(name, types, 1, 1)
         setType(resultType, 8)
         return emitCall(output, textState, state, 8, "minyar_random_bytes", values, types)
@@ -260,11 +257,29 @@ function emitMinimumOrMaximum(output: List<Text>, textState: List<Text>, state: 
 
 function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
     let name = tokenTexts[state[0]]
+    let callbackLocal = findLocal(localNames, localLengths, state, name)
+    if callbackLocal >= 0 && isCallbackType(localTypes[callbackLocal], functionNames) {
+        let callback = loadLocal(output, textState, state, localIds[callbackLocal], localTypes[callbackLocal])
+        return parseCallbackCall(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType, callback, localTypes[callbackLocal])
+    }
     let callLocation = state[0]
     state[0] = state[0] + 1
     expectToken(tokenKinds, tokenTexts, tokenLines, state, "(")
+    if (state[15] / 4 % 2) != 0 && isThreadType(simpleTypeCode(name)) { fail("opaque thread types cannot be constructed") }
+    let threadTarget = ""
+    let threadChannelType = 10
+    if name == "startThread" || name == "startThreadResult" {
+        if tokenKinds[state[0]] != 1 { fail("startThread requires a named thread entry") }
+        threadTarget = tokenTexts[state[0]]
+        if findLocal(localNames, localLengths, state, threadTarget) >= 0 || findLocal(localNames, localLengths, state, readableDeclarationName(threadTarget)) >= 0 || !threadEntry(globals, threadTarget) { fail("startThread requires a named thread entry") }
+        let targetIndex = findFunction(functionNames, symbolKinds, functionReturnTypes, threadTarget)
+        threadChannelType = functionParameterTypes[functionParameterOffset(functionParameterCounts, targetIndex) + 2]
+        state[0] = state[0] + 1
+        if !tokenIs(tokenKinds, tokenTexts, state, ",") { fail("startThread requires a named thread entry followed by seed, FrozenBytes, BytesChannel") }
+        state[0] = state[0] + 1
+    }
     if name == "parallelEntry" {
-        // The address of a parallel function, for starting it on other processors.
+        if (state[15] / 4 % 2) != 0 { threadNote(output, textState[1], "indirect", "parallelEntry", "unreviewed raw function address") }
         if tokenKinds[state[0]] != 1 {
             fail(describeLocation(tokenLocation(tokenLines, callLocation)) + ": parallelEntry expects the name of a parallel function")
         }
@@ -288,8 +303,6 @@ function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
     argumentType.add(0)
     while !tokenIs(tokenKinds, tokenTexts, state, ")") {
         setType(argumentType, 0)
-        // Only literals (possibly parenthesized) need an expected type here.
-        // Resolve before parsing so a nested call cannot replace this context.
         if tokenIs(tokenKinds, tokenTexts, state, "[") || tokenIs(tokenKinds, tokenTexts, state, "(") || (tokenIs(tokenKinds, tokenTexts, state, "Map") && tokenTexts[state[0] + 1] == "(") {
             let contextFunction = findFunction(functionNames, symbolKinds, functionReturnTypes, name)
             if contextFunction >= 0 && argumentValues.length < functionParameterCounts[contextFunction] {
@@ -307,11 +320,21 @@ function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
         }
     }
     expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
+    if (state[15] / 4 % 2) != 0 && isThreadBuiltin(name) { return threadBuiltin(output, textState, state, name, argumentValues, argumentTypes, threadTarget, threadChannelType, resultType) }
+    if (state[15] / 4 % 2) != 0 {
+    let effectKind = "call"
+    if isBuiltinName(name) { effectKind = "builtin" }
+    let effectResult = 0
+    if effectKind == "call" {
+        let resolvedEffect = findFunction(functionNames, symbolKinds, functionReturnTypes, name)
+        if resolvedEffect >= 0 { effectResult = functionReturnTypes[resolvedEffect] }
+    }
+    if (state[15] / 4 % 2) != 0 { threadNote(output, textState[1], effectKind, name, threadSignature(effectResult, argumentTypes)) }
+    }
     checkBuiltinArguments(name, argumentTypes)
 
     let value = ""
     if name == "print" {
-        // checkBuiltinArguments has already established the single argument.
         if argumentTypes[0] > 4 && argumentTypes[0] != 7 {
             fail("print expects one Integer, Float, Text, Character, or Boolean value")
         }
@@ -369,7 +392,6 @@ function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                     if argumentTypes[0] == 3 {
                         suffix = "character"
                     }
-                    // Text(bytes) reads the bytes as UTF-8.
                     if argumentTypes[0] == 8 {
                         suffix = "bytes"
                     }
@@ -424,7 +446,6 @@ function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                             setType(resultType, 2)
                         } else {
                             if name == "writeTextFile" {
-                                // A List<Text> is written piece by piece, never joined.
                                 if argumentTypes[1] == 100002 {
                                     output.add("  call void @minyar_write_text_parts(ptr ")
                                 } else {
@@ -493,6 +514,7 @@ function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                                         argumentIndex = argumentIndex + 1
                                     }
                                     output.add(")\n")
+                                    recoveryCheckpoint(output, textState, state)
                                     setType(resultType, returnType)
                                 }
                             }
@@ -505,4 +527,3 @@ function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
     }
     return value
 }
-

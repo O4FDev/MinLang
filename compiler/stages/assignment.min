@@ -8,8 +8,6 @@ function isAssignmentOperator(token: Text): Boolean {
     return token == "=" || token == "+=" || token == "-=" || token == "*=" || token == "/=" || token == "%="
 }
 
-// Find the operator of `name(.field | [position])* op= value`, or -1 when the
-// statement is not an assignment.
 function assignmentOperatorPosition(tokenKinds: List<Integer>, tokenTexts: List<Text>, start: Integer): Integer {
     if tokenKinds[start] != 1 {
         return -1
@@ -95,9 +93,6 @@ function readListElement(output: List<Text>, textState: List<Text>, state: List<
     return slotAsValue(output, textState, state, raw, type)
 }
 
-// Maps deliberately stay outside traced cycles in this first ABI. Their
-// values may themselves be traced graphs; only a path back to THIS Map type
-// is forbidden. Runtime bucket stores still use traced-aware retention.
 function checkMapMutation(mapType: Integer, counts: List<Integer>, fields: List<Integer>) {
     let visited: List<Boolean> = []
     let index = 0
@@ -128,45 +123,12 @@ function checkMapMutation(mapType: Integer, counts: List<Integer>, fields: List<
     }
 }
 
-// Adding an edge R -> F can close a first cycle only when a value reachable
-// from F can itself be an R. Mirror checkListMutation for record fields.
-function checkFieldMutation(recordType: Integer, fieldType: Integer, counts: List<Integer>, fields: List<Integer>, locations: SourceMap, location: Integer) {
-    let recordCount = counts.length / 2
-    let visited: List<Boolean> = []
-    let index = 0
-    while index < recordCount {
-        visited.add(false)
-        index = index + 1
-    }
-    let pending: List<Integer> = []
-    pending.add(fieldType)
-    index = 0
-    while index < pending.length {
-        let type = pending[index]
-        index = index + 1
-        while isContainerType(type) {
-            type = containerValueType(type)
-        }
-        if isRecordType(type) {
-            if type == recordType {
-                exit(86)
-            }
-            let record = type - 1000
-            if !visited[record] {
-                visited[record] = true
-                let first = functionParameterOffset(counts, record)
-                let field = 0
-                while field < counts[record] {
-                    pending.add(fields[first + field])
-                    field = field + 1
-                }
-            }
-        }
-    }
+function checkFieldMutation(recordType: Integer, fieldType: Integer, counts: List<Integer>, fields: List<Integer>, locations: SourceMap, location: Integer, returnTypes: List<Integer>) {
+    let element = fieldType
+    while isContainerType(element) { element = containerValueType(element) }
+    if isRecordType(element) { activateCycleType(returnTypes, recordType, counts.length) }
 }
 
-// Parse the right side of `target op= value`. A compound operator combines the
-// current value with the right side exactly as the binary operator would.
 function assignedValue(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, binary: Text, current: Text, type: Integer, valueType: List<Integer>, location: Integer): Text {
     setType(valueType, type)
     if binary == "" {
@@ -179,8 +141,6 @@ function assignedValue(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     return emitBinary(output, textState, state, binary, current, type, -1, right, rightType[0], valueType, tokenLines, location)
 }
 
-// Assign through a local or constant receiver, record fields, and List positions. Plain `local = v`
-// keeps its dedicated path in compileStatement for Text append ownership.
 function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, operatorPosition: Integer) {
     let operator = tokenTexts[operatorPosition]
     let operatorLocation = operatorPosition
@@ -205,8 +165,6 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
         if start + 1 == operatorPosition {
             fail(describeLocation(tokenLocation(tokenLines, start)) + ": constant '" + readableDeclarationName(name) + "' cannot be reassigned")
         }
-        // Cached getter reads borrow their managed root for the statement,
-        // including when an index or right-hand call replaces nested owners.
         let type: List<Integer> = []
         type.add(0)
         receiver = parseAtom(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, type)
@@ -220,7 +178,7 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
         if valueType[0] != receiverType {
             fail(describeLocation(tokenLocation(tokenLines, operatorLocation)) + ": an assignment to '" + name + "' has the wrong type")
         }
-        assignReference(output, state, localIds[local], value, valueType)
+        assignReference(output, state, localIds[local], value, valueType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
         storeLocal(output, localIds[local], receiverType, value)
         return
     }
@@ -242,25 +200,21 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
             let fieldIndex = field - functionParameterOffset(functionParameterCounts, receiverType - 1000)
             if state[0] == operatorPosition {
                 state[0] = operatorPosition + 1
-                // `name.field = name.field + more` appends, exactly like `+=`.
                 let next = state[0]
                 if binary == "" && fieldType == 2 && operatorPosition == start + 3 && tokenKinds[next] == 1 && tokenTexts[next] == name && tokenKinds[next + 1] == 4 && tokenTexts[next + 1] == "." && tokenKinds[next + 2] == 1 && tokenTexts[next + 2] == member && tokenKinds[next + 3] == 4 && tokenTexts[next + 3] == "+" {
                     binary = "+"
                     state[0] = next + 4
                 }
                 if isReferenceType(fieldType) {
-                    checkFieldMutation(receiverType, fieldType, functionParameterCounts, functionParameterTypes, tokenLines, memberLocation)
+                    checkFieldMutation(receiverType, fieldType, functionParameterCounts, functionParameterTypes, tokenLines, memberLocation, functionReturnTypes)
                 }
                 let current = ""
                 if binary != "" {
                     current = readRecordField(output, textState, state, receiver, fieldIndex, fieldType)
-                    borrowReference(output, state, current, fieldType)
+                    borrowReference(output, state, current, fieldType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
                 }
                 let value = ""
                 if binary == "+" && fieldType == 2 {
-                    // Appending to a Text field grows it in place when the
-                    // record holds the only other reference, so building a
-                    // Text in a field is linear rather than quadratic.
                     let rightType: List<Integer> = []
                     rightType.add(2)
                     let right = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, rightType)
@@ -286,10 +240,14 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
                 }
                 let slot = valueAsListSlot(output, textState, state, value, fieldType)
                 if isReferenceType(fieldType) {
+                    if possibleCycleType(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes) && cycleTypeReaches(fieldType, receiverType, functionParameterCounts, functionParameterTypes) {
+                        output.add("  call void @minyar_rc_enable_cycles()\n")
+                    }
                     let transfers = "0"
                     if takeResult(output, state, value, valueType) {
                         transfers = "1"
                     }
+                    noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, receiverType, fieldType)
                     output.add("  call void @minyar_record_replace(ptr ")
                     output.add(receiver)
                     output.add(", i64 ")
@@ -312,11 +270,8 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
             } else {
                 receiver = readRecordField(output, textState, state, receiver, fieldIndex, fieldType)
                 receiverType = fieldType
-                // `record.field[position] = value` with no call in the rest of
-                // the statement: nothing can replace the field before the
-                // store, so it needs no borrow (as for reads, see parsePrimary).
-                if !(tokenTexts[state[0]] == "[" && statementWithoutCalls(tokenKinds, tokenTexts, state[0])) {
-                    borrowReference(output, state, receiver, receiverType)
+                if possibleCycleType(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes) || !(tokenTexts[state[0]] == "[" && statementWithoutCalls(tokenKinds, tokenTexts, state[0])) {
+                    borrowReference(output, state, receiver, receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
                 }
             }
         } else {
@@ -330,7 +285,7 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
             if isMapType(receiverType) {
                 declareMapRuntime(globals)
                 requireType(tokenLines, state, positionType[0], mapKeyType(receiverType), "Map key has the wrong type")
-                if mapKeyType(receiverType) == 2 { borrowReference(output, state, position, 2) }
+                if mapKeyType(receiverType) == 2 { borrowReference(output, state, position, 2, functionParameterCounts, functionParameterTypes, functionReturnTypes) }
                 position = valueAsListSlot(output, textState, state, position, positionType[0])
             } else { requireType(tokenLines, state, positionType[0], 1, "a position must be an Integer") }
             if !isContainerType(receiverType) && receiverType != 8 {
@@ -345,12 +300,12 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
                 state[0] = operatorPosition + 1
                 let current = ""
                 if isMapType(receiverType) {
+                    functionReturnTypes.add(-5)
+                    functionReturnTypes.add(receiverType)
                     checkMapMutation(receiverType, functionParameterCounts, functionParameterTypes)
-                    // A key borrowed from a Map value can be invalidated by
-                    // the right side. Keep it before evaluating that side.
                     if binary != "" {
                         current = readMapElement(output, textState, state, receiver, position, elementType)
-                        borrowReference(output, state, current, elementType)
+                        borrowReference(output, state, current, elementType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
                     }
                     let value = assignedValue(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, binary, current, elementType, valueType, operatorLocation)
                     requireType(tokenLines, state, valueType[0], elementType, "Map value has the wrong type")
@@ -374,13 +329,17 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
                     checkListMutation(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
                     if binary != "" {
                         current = readListElement(output, textState, state, receiver, position, elementType)
-                        borrowReference(output, state, current, elementType)
+                        borrowReference(output, state, current, elementType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
                     }
                     let value = assignedValue(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, binary, current, elementType, valueType, operatorLocation)
                     if valueType[0] != elementType {
                         fail(describeLocation(tokenLocation(tokenLines, operatorLocation)) + ": an indexed assignment needs " + describeType(elementType) + ", not " + describeType(valueType[0]))
                     }
+                    if possibleCycleType(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes) {
+                        output.add("  call void @minyar_rc_enable_cycles()\n")
+                    }
                     let slot = valueAsListSlot(output, textState, state, value, elementType)
+                    noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, receiverType, elementType)
                     if takeResult(output, state, value, valueType) {
                         output.add("  call void @minyar_list_set_take(ptr ")
                     } else {
@@ -407,7 +366,7 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
                     receiver = readListElement(output, textState, state, receiver, position, elementType)
                 }
                 receiverType = elementType
-                borrowReference(output, state, receiver, receiverType)
+                borrowReference(output, state, receiver, receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
             }
         }
     }
@@ -425,9 +384,6 @@ function emitBytesRead(output: List<Text>, textState: List<Text>, state: List<In
     return value
 }
 
-// Loops push a marker into the lexical scope so break and continue find the
-// innermost loop. Its name cannot be written in source; its type is -1 for
-// while (-3 after a reachable break) and -2 for for; its id is the first label.
 function findLoopMarker(localNames: List<Text>, localLengths: List<Integer>, state: List<Integer>): Integer {
     return findLocal(localNames, localLengths, state, " loop")
 }
@@ -457,9 +413,6 @@ function compileLoopJump(tokenKinds: List<Integer>, tokenTexts: List<Text>, toke
     }
 }
 
-// for name in start..end iterates Integers; for name in collection visits each
-// List element or Text character. Bounds and the collection are evaluated once;
-// the loop variable is a fresh binding for each iteration.
 function compileFor(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, returnType: Integer) {
     state[0] = state[0] + 1
     if tokenKinds[state[0]] != 1 {
@@ -508,7 +461,7 @@ function compileFor(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLine
         }
         collection = nextLocal(state)
         addLocal(localNames, localTypes, localIds, localLengths, state, " for collection", sourceType[0], collection)
-        assignReference(output, state, collection, source, sourceType)
+        assignReference(output, state, collection, source, sourceType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
         storeLocal(output, collection, sourceType[0], source)
         storeLocal(output, counter, 1, "0")
     }
@@ -554,7 +507,7 @@ function compileFor(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLine
     addLocal(localNames, localTypes, localIds, localLengths, state, name, elementType, variable)
     let elementResult: List<Integer> = []
     elementResult.add(elementType)
-    assignReference(output, state, variable, element, elementResult)
+    assignReference(output, state, variable, element, elementResult, functionParameterCounts, functionParameterTypes, functionReturnTypes)
     storeLocal(output, variable, elementType, element)
     addLocal(localNames, localTypes, localIds, localLengths, state, " loop", -2, loopLabel)
     let bodyReturns = compileBlock(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
@@ -564,7 +517,6 @@ function compileFor(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLine
     output.add("\nfor.step." + Text(stepLabel) + ":\n")
     textState[0] = "for.step." + Text(stepLabel)
     let current = loadLocal(output, textState, state, counter, 1)
-    // The condition proved current < bound, so this increment cannot overflow.
     let next = emitInstruction(output, textState, state, "add nsw i64 " + current + ", 1")
     storeLocal(output, counter, 1, next)
     output.add("  call void @minyar_rc_step()\n")
@@ -577,4 +529,3 @@ function compileFor(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLine
     }
     state[3] = firstLoopLocal
 }
-

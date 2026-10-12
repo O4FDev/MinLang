@@ -66,6 +66,8 @@ function lineCanEndStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>):
 
 function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap) {
     let firstToken = tokenKinds.length
+    let delimiterFrames: List<Integer> = []
+    let delimiterDepth = 0
     let coordinates = tokenLines.coordinates
     let position = 0
     let line = 1
@@ -73,8 +75,6 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
     let length = source.length
     let roundDepth = 0
     let squareDepth = 0
-    // UTF-8 permits a leading byte-order mark. Treat it as an encoding marker,
-    // never as an invisible punctuation token in a later diagnostic.
     if length > 0 && source[0] == Character(65279) {
         position = 1
     }
@@ -118,8 +118,6 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
                         let start = position
                         let tokenLine = line
                         let tokenColumn = position - lineStart + 1
-                        // The outer loop already classified the first character.
-                        // Read each continuation once, including one delimiter peek.
                         position = position + 1
                         let inName = true
                         while position < length && inName {
@@ -150,8 +148,6 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
                                 while position < length && source[position] >= '0' && source[position] <= '7' {
                                     let digit = Integer(source[position]) - Integer('0')
                                     if hexValue > (9223372036854775807 - digit) / 8 {
-                                        // As for decimal and hexadecimal, only
-                                        // unary minus may consume the 2^63 magnitude.
                                         if hexValue == 1152921504606846976 && digit == 0 && (position + 1 == length || source[position + 1] < '0' || source[position + 1] > '7') {
                                             hexMinimum = true
                                         } else {
@@ -171,9 +167,6 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
                                 while position < length && characterIsHexDigit(source[position]) {
                                     let digit = hexDigitValue(source[position])
                                     if hexValue > (9223372036854775807 - digit) / 16 {
-                                        // Preserve exactly 2^63 as a magnitude
-                                        // token; unary minus, rather than lexical
-                                        // context, decides whether it is legal.
                                         if hexValue == 576460752303423488 && digit == 0 && (position + 1 == length || !characterIsHexDigit(source[position + 1])) {
                                             hexMinimum = true
                                         } else {
@@ -188,8 +181,6 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
                                 if octal { fail("line " + sourceLocation(tokenLine, tokenColumn) + ": octal literals are Integers and cannot have a decimal point") }
                                 fail("line " + sourceLocation(tokenLine, tokenColumn) + ": hexadecimal literals are Integers and cannot have a decimal point")
                             }
-                            // A Float needs digits on both sides of its point, so
-                            // ranges such as 0..count remain two Integer tokens.
                             if numberKind == 2 && position + 1 < length && source[position] == '.' && characterIsDigit(source[position + 1]) {
                                 numberKind = 7
                                 position = position + 1
@@ -340,6 +331,19 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
                                         }
                                     }
                                     let punctuationKind = 4
+                                    if punctuation == "{" {
+                                        while delimiterFrames.length < delimiterDepth * 2 + 2 { delimiterFrames.add(0) }
+                                        delimiterFrames[delimiterDepth * 2] = roundDepth
+                                        delimiterFrames[delimiterDepth * 2 + 1] = squareDepth
+                                        delimiterDepth = delimiterDepth + 1
+                                        roundDepth = 0
+                                        squareDepth = 0
+                                    }
+                                    if punctuation == "}" && delimiterDepth > 0 {
+                                        delimiterDepth = delimiterDepth - 1
+                                        roundDepth = delimiterFrames[delimiterDepth * 2]
+                                        squareDepth = delimiterFrames[delimiterDepth * 2 + 1]
+                                    }
                                     if punctuation == "(" { roundDepth = roundDepth + 1 }
                                     if punctuation == ")" && roundDepth > 0 { roundDepth = roundDepth - 1 }
                                     if punctuation == "[" { squareDepth = squareDepth + 1 }
@@ -359,23 +363,28 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
     }
 
     addToken(tokenKinds, tokenTexts, coordinates, 0, "", line, position - lineStart + 1)
-    // `parallel function` declares a function that may run on any processor.
-    // The modifier becomes a line break whose text still reads "parallel":
-    // every pass treats it as whitespace, and compileTokens recovers it.
+    let features = tokenLines.features
     let scan = firstToken
     while scan + 1 < tokenKinds.length {
-        // `public parallel function` becomes `parallel public function`, so
-        // the modifier always comes first and `public function` stays intact.
-        if scan + 2 < tokenKinds.length && tokenKinds[scan] == 1 && tokenTexts[scan] == "public" && tokenKinds[scan + 1] == 1 && tokenTexts[scan + 1] == "parallel" && tokenKinds[scan + 2] == 1 && tokenTexts[scan + 2] == "function" {
+        if tokenKinds[scan] == 1 {
+            let name = tokenTexts[scan]
+            let next = tokenTexts[scan + 1]
+            if (name == "Callback" && next == "<") || (name == "function" && next == "(") { if features / 1 % 2 == 0 { features = features + 1 } }
+            if (name == "Result" || name == "Ok" || name == "Err") && next == "<" { if features / 2 % 2 == 0 { features = features + 2 } }
+            if name == "native" && tokenKinds[scan + 1] == 3 && next == "calldepth" { if features / 8 % 2 == 0 { features = features + 8 } }
+            if name == "thread" || threadFeatureName(name) { if features / 4 % 2 == 0 { features = features + 4 } }
+        }
+        if scan + 2 < tokenKinds.length && tokenKinds[scan] == 1 && tokenTexts[scan] == "public" && tokenKinds[scan + 1] == 1 && (tokenTexts[scan + 1] == "parallel" || tokenTexts[scan + 1] == "thread") && tokenKinds[scan + 2] == 1 && tokenTexts[scan + 2] == "function" {
             tokenKinds[scan] = 6
-            tokenTexts[scan] = "parallel"
+            tokenTexts[scan] = tokenTexts[scan + 1]
             tokenTexts[scan + 1] = "public"
         }
-        if tokenKinds[scan] == 1 && tokenTexts[scan] == "parallel" && tokenKinds[scan + 1] == 1 && tokenTexts[scan + 1] == "function" {
+        if tokenKinds[scan] == 1 && (tokenTexts[scan] == "parallel" || tokenTexts[scan] == "thread") && tokenKinds[scan + 1] == 1 && tokenTexts[scan + 1] == "function" {
             tokenKinds[scan] = 6
         }
         scan = scan + 1
     }
+    tokenLines.features = features
 }
 
 function describeLocation(location: Text): Text {
@@ -458,4 +467,3 @@ function finishStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, toke
         }
     }
 }
-

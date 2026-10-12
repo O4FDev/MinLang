@@ -1,0 +1,387 @@
+function isThreadType(type: Integer): Boolean {
+    return type >= 9 && type <= 15
+}
+
+function isThreadBuiltin(name: Text): Boolean {
+    return name == "freezeBytes" || name == "freezeBytesTake" || name == "copyFrozenBytes" || name == "bytesChannel" || name == "trySendBytes" || name == "sendBytes" || name == "tryReceiveBytes" || name == "receiveBytes" || name == "closeBytesChannel" || name == "startThread" || name == "joinThread" || name == "startThreadResult" || name == "joinThreadResult" || name == "frozenBytesChannel" || name == "trySendFrozen" || name == "sendFrozen" || name == "tryReceiveFrozen" || name == "receiveFrozen" || name == "closeFrozenChannel" || name == "threadProcessId" || name == "threadSleepNanoseconds" || name == "threadFsync" || name == "threadKernelRun"
+}
+
+function threadProgram(kinds: List<Integer>, texts: List<Text>): Boolean {
+    let i = 0
+    while i < kinds.length {
+        if (kinds[i] == 1 || kinds[i] == 6) && (texts[i] == "thread" || isThreadType(simpleTypeCode(texts[i])) || isThreadBuiltin(texts[i])) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+function threadMode(globals: List<Text>): Boolean {
+    return findText(globals, "; minyar-thread-runtime: 1\n") >= 0
+}
+
+function threadEntry(globals: List<Text>, name: Text): Boolean {
+    return findText(globals, "; minyar-thread-entry: " + name + "\n") >= 0
+}
+
+function threadSignature(result: Integer, types: List<Integer>): Text {
+    let signature = Text(result) + "("
+    let i = 0
+    while i < types.length {
+        if i > 0 { signature = signature + "," }
+        signature = signature + Text(types[i])
+        i = i + 1
+    }
+    return signature + ")"
+}
+
+function threadField(value: Text): Text { return Text(value.length) + ":" + value }
+
+function threadNote(output: List<Text>, caller: Text, kind: Text, name: Text, signature: Text) {
+    if caller == "top level" { caller = "main" }
+    output.add("  ; minyar-thread-effect: " + threadField(caller) + threadField(kind) + threadField(name) + threadField(signature) + "\n")
+}
+
+function threadReadField(text: Text, cursor: List<Integer>): Text {
+    let length = 0
+    while cursor[0] < text.length && text[cursor[0]] >= '0' && text[cursor[0]] <= '9' {
+        length = length * 10 + Integer(text[cursor[0]]) - Integer('0')
+        cursor[0] = cursor[0] + 1
+    }
+    if cursor[0] >= text.length || text[cursor[0]] != ':' { fail("invalid thread effect metadata") }
+    cursor[0] = cursor[0] + 1
+    let start = cursor[0]
+    cursor[0] = start + length
+    if cursor[0] > text.length { fail("invalid thread effect metadata") }
+    return text.slice(start, cursor[0])
+}
+
+function threadParameters(name: Text, actual: List<Integer>, expected: List<Integer>) {
+    let correct = actual.length == expected.length
+    let i = 0
+    while correct && i < actual.length {
+        correct = actual[i] == expected[i]
+        i = i + 1
+    }
+    if !correct { fail(name + " has the wrong thread boundary argument types") }
+}
+
+function threadBuiltin(output: List<Text>, textState: List<Text>, state: List<Integer>, name: Text, values: List<Text>, types: List<Integer>, target: Text, channelType: Integer, resultType: List<Integer>): Text {
+    let expected: List<Integer> = []
+    let result = 5
+    let callee = ""
+    if name == "freezeBytes" { expected.add(8); result = 9; callee = "minyar_frozen_bytes_copy" }
+    if name == "freezeBytesTake" { expected.add(8); result = 9; callee = "minyar_frozen_bytes_take" }
+    if name == "copyFrozenBytes" { expected.add(9); result = 8; callee = "minyar_frozen_bytes_local_copy" }
+    if name == "bytesChannel" { expected.add(1); expected.add(1); result = 10; callee = "minyar_bytes_channel_new" }
+    if name == "trySendBytes" || name == "sendBytes" {
+        expected.add(10); expected.add(8); result = 4; callee = "minyar_bytes_channel_try_send"
+        if name == "sendBytes" { callee = "minyar_bytes_channel_send" }
+    }
+    if name == "tryReceiveBytes" || name == "receiveBytes" {
+        expected.add(10); expected.add(8); result = 1; callee = "minyar_bytes_channel_try_receive"
+        if name == "receiveBytes" { result = 4; callee = "minyar_bytes_channel_receive" }
+    }
+    if name == "closeBytesChannel" { expected.add(10); callee = "minyar_bytes_channel_close" }
+    if name == "joinThread" { expected.add(11); result = 1; callee = "minyar_thread_join" }
+    if name == "joinThreadResult" { expected.add(11); result = 13; callee = "minyar_thread_join_result" }
+    if name == "frozenBytesChannel" { expected.add(1); expected.add(1); result = 14; callee = "minyar_frozen_channel_new" }
+    if name == "trySendFrozen" || name == "sendFrozen" {
+        expected.add(14); expected.add(9); result = 4; callee = "minyar_frozen_channel_try_send"
+        if name == "sendFrozen" { callee = "minyar_frozen_channel_send" }
+    }
+    if name == "tryReceiveFrozen" || name == "receiveFrozen" {
+        expected.add(14); result = 15; callee = "minyar_frozen_channel_try_receive"
+        if name == "receiveFrozen" { callee = "minyar_frozen_channel_receive" }
+    }
+    if name == "closeFrozenChannel" { expected.add(14); callee = "minyar_frozen_channel_close" }
+    if name == "threadProcessId" { result = 1; callee = "minyar_thread_process_id" }
+    if name == "threadSleepNanoseconds" { expected.add(1); result = 1; callee = "minyar_thread_sleep_ns" }
+    if name == "threadFsync" { expected.add(1); result = 1; callee = "minyar_thread_fsync" }
+    if name == "threadKernelRun" { expected.add(1); result = 1; callee = "minyar_thread_kernel_run" }
+    if name == "startThread" || name == "startThreadResult" {
+        expected.add(1); expected.add(9); expected.add(channelType); result = 11; callee = "minyar_thread_spawn"
+        if name == "startThreadResult" { result = 12; callee = "minyar_thread_spawn_result" }
+    }
+    threadParameters(name, types, expected)
+    if name == "startThread" || name == "startThreadResult" {
+        let bridgeValues: List<Text> = ["@.minyar.thread.bridge." + target, values[0], values[1], values[2]]
+        let bridgeTypes: List<Integer> = [9, 1, 9, channelType]
+        if (state[15] / 4 % 2) != 0 { threadNote(output, textState[1], "spawn", target, "1(1,9,10)") }
+        setType(resultType, result)
+        return emitCall(output, textState, state, result, callee, bridgeValues, bridgeTypes)
+    }
+    if (state[15] / 4 % 2) != 0 { threadNote(output, textState[1], "builtin", name, threadSignature(result, types)) }
+    setType(resultType, result)
+    return emitCall(output, textState, state, result, callee, values, types)
+}
+
+function threadFrozenMethod(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, receiver: Text, member: Text, resultType: List<Integer>): Text {
+    if member != "getUInt8" && member != "getInt64" { fail("FrozenBytes exposes only immutable readers") }
+    let positionType: List<Integer> = [0]
+    let position = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, positionType)
+    requireType(tokenLines, state, positionType[0], 1, "FrozenBytes position must be Integer")
+    expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
+    let callee = "minyar_frozen_bytes_get_uint8"
+    if member == "getInt64" { callee = "minyar_frozen_bytes_get_int64" }
+    let types: List<Integer> = [9, 1]
+    setType(resultType, 1)
+    return emitCall(output, textState, state, 1, callee, pairOf(receiver, position), types)
+}
+
+function threadValidateEntries(globals: List<Text>, names: List<Text>, kinds: List<Integer>, results: List<Integer>, counts: List<Integer>, parameters: List<Integer>) {
+    let prefix = "; minyar-thread-entry: "
+    let i = 0
+    while i < globals.length {
+        let marker = globals[i]
+        if marker.length > prefix.length && marker.slice(0, prefix.length) == prefix {
+            let name = markerValue(marker, prefix)
+            let function = findFunction(names, kinds, results, name)
+            let valid = function >= 0 && name != "main" && name[0] != '"'
+            if valid {
+                valid = counts[function] == 3 && (results[function] == 1 || results[function] == 5)
+                if valid {
+                    let first = functionParameterOffset(counts, function)
+                    valid = parameters[first] == 1 && parameters[first + 1] == 9 && (parameters[first + 2] == 10 || parameters[first + 2] == 14)
+                }
+            }
+            if !valid { fail("thread entry '" + readableDeclarationName(name) + "' requires (Integer, FrozenBytes, BytesChannel or FrozenBytesChannel) and Integer or Nothing result") }
+        }
+        i = i + 1
+    }
+}
+
+function threadNativeAllowed(name: Text, signature: Text): Boolean { return false }
+
+function threadBuiltinAllowed(name: Text): Boolean {
+    return isThreadBuiltin(name) || isFloatFunction(name) || name == "atan2" || name == "pow" || name == "abs" || name == "min" || name == "max" || name == "clamp" || name == "wrappingAdd" || name == "wrappingSubtract" || name == "wrappingMultiply" || name == "Bytes" || name == "Text" || name == "Float" || name == "Integer" || name == "Character" || name == "print" || name == "fail" || name == "joinText" || name == "argument" || name == "argumentCount"
+}
+
+function threadManagedGetter(name: Text, metadata: List<Text>): Boolean {
+    let prefix = "\"minyar.constant|"
+    if name.length <= prefix.length || name.slice(0, prefix.length) != prefix { return false }
+    let tail = name.slice(prefix.length, name.length)
+    let separator = findCharacter(tail, '|')
+    if separator < 0 { fail("unreviewed module constant getter") }
+    let resolved = tail.slice(0, separator)
+    let scalar = "; minyar-module-constant: " + resolved + "|scalar\n"
+    let managed = "; minyar-module-constant: " + resolved + "|managed\n"
+    if findText(metadata, scalar) >= 0 { return false }
+    if findText(metadata, managed) >= 0 { return true }
+    fail("unreviewed module constant getter '" + resolved + "'")
+    return true
+}
+
+function threadConstantIdentity(name: Text): Text {
+    let prefix = "\"minyar.constant|"
+    if name.length <= prefix.length || name.slice(0, prefix.length) != prefix { return "" }
+    let tail = name.slice(prefix.length, name.length)
+    let separator = findCharacter(tail, '|')
+    if separator < 0 { fail("unreviewed module constant getter") }
+    return tail.slice(0, separator)
+}
+
+function threadCheckGraph(output: List<Text>, globals: List<Text>) {
+    if !threadMode(globals) { return }
+    let callers: List<Text> = []
+    let kinds: List<Text> = []
+    let names: List<Text> = []
+    let signatures: List<Text> = []
+    let metadata: List<Text> = []
+    let i = 0
+    while i < globals.length { metadata.add(globals[i]); i = i + 1 }
+    let prefix = "  ; minyar-thread-effect: "
+    i = 0
+    while i < output.length {
+        let piece = output[i]
+        metadata.add(piece)
+        if piece.length > prefix.length && piece.slice(0, prefix.length) == prefix {
+            let cursor: List<Integer> = [prefix.length]
+            callers.add(threadReadField(piece, cursor)); kinds.add(threadReadField(piece, cursor))
+            names.add(threadReadField(piece, cursor)); signatures.add(threadReadField(piece, cursor))
+        }
+        i = i + 1
+    }
+    let pass = 0
+    while pass < 2 {
+        let pending: List<Text> = []
+        if pass == 0 { pending.add("main") }
+        if pass == 0 {
+            let constantPrefix = "; minyar-module-constant: "
+            let constantIndex = 0
+            while constantIndex < metadata.length {
+                let marker = metadata[constantIndex]
+                if marker.length > constantPrefix.length && marker.slice(0, constantPrefix.length) == constantPrefix {
+                    let value = markerValue(marker, constantPrefix)
+                    let separator = findCharacter(value, '|')
+                    if separator < 0 { fail("invalid module constant effect metadata") }
+                    pending.add("constant " + value.slice(0, separator))
+                }
+                constantIndex = constantIndex + 1
+            }
+        }
+        i = 0
+        let entryPrefix = "; minyar-thread-entry: "
+        while i < globals.length {
+            let marker = globals[i]
+            if marker.length > entryPrefix.length && marker.slice(0, entryPrefix.length) == entryPrefix { pending.add(markerValue(marker, entryPrefix)) }
+            i = i + 1
+        }
+        let seen: List<Text> = []
+        let cursor = 0
+        while cursor < pending.length {
+            let caller = pending[cursor]
+            cursor = cursor + 1
+            if findText(seen, caller) < 0 {
+                seen.add(caller)
+                i = 0
+                while i < callers.length {
+                    if callers[i] == caller {
+                        let kind = kinds[i]
+                        let name = names[i]
+                        let allowed = true
+                        if kind == "call" || kind == "spawn" {
+                            if threadManagedGetter(name, metadata) && pass == 1 { allowed = false }
+                            pending.add(name)
+                        } else if kind == "native" {
+                            allowed = threadNativeAllowed(name, signatures[i])
+                        } else if kind == "builtin" {
+                            allowed = threadBuiltinAllowed(name)
+                        } else if kind == "constant" {
+                            let managed = "; minyar-module-constant: " + name + "|managed\n"
+                            if pass == 1 && findText(metadata, managed) >= 0 { allowed = false }
+                        } else if kind == "runtime" {
+                            allowed = true
+                            if threadConstantIdentity(name) != "" {
+                                if threadManagedGetter(name, metadata) && pass == 1 { allowed = false }
+                            }
+                        } else { allowed = false }
+                        if !allowed { fail("unsafe thread effect in '" + readableDeclarationName(caller) + "': " + kind + " '" + name + "' " + signatures[i]) }
+                    }
+                    i = i + 1
+                }
+            }
+        }
+        pass = pass + 1
+    }
+}
+
+function threadAppendABI(output: List<Text>, globals: List<Text>, names: List<Text>, kinds: List<Integer>, results: List<Integer>, recoverable: Boolean) {
+    if !threadMode(globals) { return }
+    let declarations: List<Text> = [
+        "declare ptr @minyar_frozen_bytes_copy(ptr)",
+        "declare ptr @minyar_frozen_bytes_take(ptr)",
+        "declare ptr @minyar_frozen_bytes_local_copy(ptr)",
+        "declare i64 @minyar_frozen_bytes_length(ptr)",
+        "declare i64 @minyar_frozen_bytes_get_uint8(ptr, i64)",
+        "declare i64 @minyar_frozen_bytes_get_int64(ptr, i64)",
+        "declare ptr @minyar_bytes_channel_new(i64, i64)",
+        "declare zeroext i1 @minyar_bytes_channel_try_send(ptr, ptr)",
+        "declare zeroext i1 @minyar_bytes_channel_send(ptr, ptr)",
+        "declare i64 @minyar_bytes_channel_try_receive(ptr, ptr)",
+        "declare zeroext i1 @minyar_bytes_channel_receive(ptr, ptr)",
+        "declare void @minyar_bytes_channel_close(ptr)",
+        "declare ptr @minyar_thread_spawn(ptr, i64, ptr, ptr)",
+        "declare i64 @minyar_thread_join(ptr)",
+        "declare void @minyar_thread_join_children()",
+        "declare ptr @minyar_thread_text_literal(ptr)",
+        "declare ptr @minyar_thread_spawn_result(ptr, i64, ptr, ptr)",
+        "declare ptr @minyar_thread_join_result(ptr)",
+        "declare i64 @minyar_thread_result_code(ptr)",
+        "declare ptr @minyar_thread_start_result_value(ptr)",
+        "declare i64 @minyar_thread_join_result_value(ptr)",
+        "declare ptr @minyar_frozen_channel_new(i64, i64)",
+        "declare zeroext i1 @minyar_frozen_channel_try_send(ptr, ptr)",
+        "declare zeroext i1 @minyar_frozen_channel_send(ptr, ptr)",
+        "declare ptr @minyar_frozen_channel_try_receive(ptr)",
+        "declare ptr @minyar_frozen_channel_receive(ptr)",
+        "declare void @minyar_frozen_channel_close(ptr)",
+        "declare i64 @minyar_frozen_result_code(ptr)",
+        "declare ptr @minyar_frozen_result_value(ptr)",
+        "declare i64 @minyar_thread_process_id()",
+        "declare i64 @minyar_thread_sleep_ns(i64)",
+        "declare i64 @minyar_thread_fsync(i64)",
+        "declare i64 @minyar_thread_kernel_run(i64)"
+    ]
+    let declaration = 0
+    while declaration < declarations.length {
+        output.add(declarations[declaration] + "\n")
+        declaration = declaration + 1
+    }
+    let prefix = "; minyar-thread-entry: "
+    let i = 0
+    while i < globals.length {
+        let marker = globals[i]
+        if marker.length > prefix.length && marker.slice(0, prefix.length) == prefix {
+            let name = markerValue(marker, prefix)
+            let function = findFunction(names, kinds, results, name)
+            threadAppendBridge(output, name, results[function], recoverable)
+        }
+        i = i + 1
+    }
+}
+
+function threadAppendBridge(output: List<Text>, name: Text, result: Integer, recovery: Boolean) {
+    output.add("define internal i64 @.minyar.thread.bridge." + name + "(i64 %seed, ptr %frozen.local, ptr %channel.local) {\nentry:\n")
+    if recovery {
+        output.add("  %thread.accepted = call i32 @minyar_recovery_enter()\n")
+        output.add("  %thread.allowed = icmp ne i32 %thread.accepted, 0\n")
+        output.add("  br i1 %thread.allowed, label %thread.body, label %thread.reject\n")
+        output.add("thread.reject:\n  ret i64 0\nthread.body:\n")
+    } else {
+        output.add("  call void @minyar_stack_enter()\n")
+    }
+    if result == 1 {
+        output.add("  %result = call i64 @.minyar.fn." + name + "(i64 %seed, ptr %frozen.local, ptr %channel.local)\n")
+    } else {
+        output.add("  call void @.minyar.fn." + name + "(i64 %seed, ptr %frozen.local, ptr %channel.local)\n")
+    }
+    if recovery {
+        output.add("  %thread.pending = call i32 @minyar_recovery_pending()\n")
+        output.add("  %thread.failed = icmp ne i32 %thread.pending, 0\n")
+        output.add("  br i1 %thread.failed, label %thread.unwind, label %thread.success\nthread.success:\n")
+    }
+    output.add("  call void @minyar_stack_leave()\n")
+    if result == 1 { output.add("  ret i64 %result\n") }
+    else { output.add("  ret i64 0\n") }
+    if recovery {
+        output.add("thread.unwind:\n  call void @minyar_stack_leave()\n  ret i64 0\n")
+    }
+    output.add("}\n")
+}
+
+function threadJoinOnReturn(output: List<Text>, globals: List<Text>, caller: Text) {
+    if threadMode(globals) && (caller == "main" || caller == "top level" || threadEntry(globals, caller)) {
+        output.add("  call void @minyar_thread_join_children()\n")
+    }
+}
+
+function threadResultMember(output: List<Text>, textState: List<Text>, state: List<Integer>, receiver: Text, type: Integer, member: Text, resultType: List<Integer>): Text {
+    let types: List<Integer> = [type]
+    let values: List<Text> = [receiver]
+    if member == "code" || member == "ok" {
+        let callee = "minyar_thread_result_code"
+        if type == 15 { callee = "minyar_frozen_result_code" }
+        let code = emitCall(output, textState, state, 1, callee, values, types)
+        if member == "ok" {
+            setType(resultType, 4)
+            return emitInstruction(output, textState, state, "icmp eq i64 " + code + ", 0")
+        }
+        setType(resultType, 1)
+        return code
+    }
+    let result = 1
+    let callee = "minyar_thread_join_result_value"
+    if type == 12 && member == "thread" { result = 11; callee = "minyar_thread_start_result_value" }
+    else if type == 15 && member == "value" { result = 9; callee = "minyar_frozen_result_value" }
+    else if type != 13 || member != "value" { fail("opaque thread result exposes only ok, code and its checked successful payload") }
+    setType(resultType, result)
+    return emitCall(output, textState, state, result, callee, values, types)
+}
+
+function threadFeatureName(name: Text): Boolean {
+    if name == "FrozenBytes" || name == "BytesChannel" || name == "Thread" || name == "ThreadStartResult" || name == "ThreadJoinResult" || name == "FrozenBytesChannel" || name == "FrozenBytesResult" { return true }
+    if name.length == 0 { return false }
+    let first = name[0]
+    if first != 'f' && first != 'c' && first != 'b' && first != 't' && first != 's' && first != 'j' && first != 'r' { return false }
+    return isThreadBuiltin(name)
+}

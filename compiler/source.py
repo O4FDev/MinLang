@@ -22,6 +22,11 @@ SOURCES = (
     'stages/functions.min',
     'stages/pipeline.min',
     'stages/modules.min',
+    'stages/incremental.min',
+    'closure-compiler.min',
+    'errors-compiler.min',
+    'calldepth-compiler.min',
+    'thread-compiler.min',
     'compiler.min',
 )
 
