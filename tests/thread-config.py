@@ -2,19 +2,21 @@
 """Check thread-selector storage and effective allocator admission."""
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 from cycle_runtime import engine_source
-from clang_helpers import native_path
+from clang_helpers import native_path, windows_host
 
 
 class ThreadConfig(unittest.TestCase):
-    @unittest.skipIf(os.name == 'nt', 'POSIX depth fixture; Windows runtime qualification is separate')
+    @unittest.skipIf(windows_host(), 'POSIX depth fixture; Windows runtime qualification is separate')
     def test_depth_thread_isolation(self):
         with tempfile.TemporaryDirectory(prefix='minyar-depth-tls-') as temporary:
             for optimization in ('-O0', '-O2'):
@@ -29,6 +31,16 @@ class ThreadConfig(unittest.TestCase):
                     self.assertEqual(executed.returncode, 0, executed.stderr)
                     self.assertEqual(executed.stdout, '')
                     self.assertEqual(executed.stderr, '')
+
+    def test_depth_fixture_platform_selection(self):
+        # Evaluate the actual decorator again, including POSIX Python on MSYS.
+        for host in ('Linux', 'Darwin', 'Windows', 'MSYS_NT-10.0',
+                     'MINGW64_NT-10.0', 'CYGWIN_NT-10.0'):
+            with self.subTest(host=host), patch('clang_helpers.platform.system', return_value=host):
+                module = runpy.run_path(__file__, run_name='thread_config_platform_probe')
+                fixture = module['ThreadConfig'].test_depth_thread_isolation
+                self.assertEqual(getattr(fixture, '__unittest_skip__', False),
+                                 host not in ('Linux', 'Darwin'))
 
     def compile(self, definitions, source=None):
         header_root = Path(os.environ.get('MINYAR_THREAD_CONFIG_ROOT', ROOT / 'runtime'))
