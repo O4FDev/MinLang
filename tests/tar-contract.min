@@ -1,0 +1,88 @@
+use "tar" as tar
+use "errors" as errors
+function require(value: Boolean, message: Text) { if !value { fail(message) } }
+let plain = readBytesFile(argument(0))
+let combined = readBytesFile(argument(1))
+let metadata = readBytesFile(argument(2))
+let metadataLimit = 0
+for digit in argument(3) { metadataLimit = metadataLimit * 10 + Integer(digit) - 48 }
+// Footer counted in exact writer limit, without hidden record blocking.
+for count in 0..2 {
+    let exact = 1536; if count == 1 { exact = 2048 }
+    let w = tar.writer(exact)
+    let appended = tar.append(w,tar.entry(Bytes("a"),tar.REGULAR),Bytes(count))
+    require(errors.booleanOk(appended),"exact writer limit: " + errors.message(errors.booleanError(appended)))
+    let finished = errors.bytesValue(tar.finish(w))
+    require(finished.length == exact,"exact writer length")
+    let original = finished[0]; finished[0] = 0
+    require(errors.bytesValue(tar.finish(w))[0] == original,"finish result aliases context")
+    let short = tar.writer(exact-1)
+    require(!errors.booleanOk(tar.append(short,tar.entry(Bytes("a"),tar.REGULAR),Bytes(count))),"one-short writer limit")
+    require(!errors.bytesOk(tar.finish(short)),"sticky writer limit")
+}
+let e = tar.entry(Bytes("extension"),tar.REGULAR)
+e.attributes.add(tar.Attribute { key: Bytes("VENDOR.raw"); value: Bytes(1) })
+let exact = tar.writer(3072)
+require(errors.booleanOk(tar.append(exact,e,Bytes(1))),"exact extension limit")
+require(errors.bytesValue(tar.finish(exact)).length == 3072,"exact extension length")
+let short = tar.writer(3071)
+require(!errors.booleanOk(tar.append(short,e,Bytes(1))),"one-short extension limit")
+// Shared record aliases close exactly once, including repeated close/error.
+let cursor = tar.reader(plain,plain.length,4096); let alias = cursor
+tar.close(cursor); tar.close(alias)
+require(errors.code(tar.next(alias).error) == errors.closedCode(),"reader alias close")
+let output = tar.writer(4096); let outputAlias = output
+tar.closeWriter(output); tar.closeWriter(outputAlias)
+require(!errors.booleanOk(tar.append(outputAlias,e,Bytes())),"writer alias close")
+require(!errors.bytesOk(tar.finish(outputAlias)),"finish closed writer")
+let chain = tar.readerWithLimits(combined,combined.length,4096,1048576,3,4)
+let first = tar.next(chain)
+require(!errors.isError(first.error) && !first.end,"exact extension/header bound")
+require(tar.memberStart(first.entry) == 0 && tar.memberEnd(first.entry) == combined.length - 1024,"extension-inclusive member span")
+require(errors.bytesValue(tar.memberBytes(chain,first.entry)).length == combined.length - 1024,"member copy excludes footer")
+require(tar.next(chain).end,"extension/header EOF bound")
+require(errors.bytesOk(tar.memberBytes(chain,first.entry)),"member copy after EOF")
+let chainShort = tar.readerWithLimits(combined,combined.length,4096,1048576,2,4)
+require(errors.isError(tar.next(chainShort).error),"extension chain one-short")
+let headerShort = tar.readerWithLimits(combined,combined.length,4096,1048576,3,3)
+require(errors.isError(tar.next(headerShort).error),"header count one-short")
+let doubled = plain.slice(0,plain.length - 1024); doubled.addBytes(plain)
+let cumulative = tar.readerWithLimits(doubled,doubled.length,4096,0,1,1)
+require(!errors.isError(tar.next(cumulative).error),"first cumulative header")
+require(errors.isError(tar.next(cumulative).error),"cumulative physical header limit")
+let meta = tar.readerWithLimits(metadata,metadata.length,4096,metadataLimit,64,100)
+require(!errors.isError(tar.next(meta).error),"exact metadata bound")
+tar.close(meta)
+let metaShort = tar.readerWithLimits(metadata,metadata.length,4096,metadataLimit-1,64,100)
+require(errors.isError(tar.next(metaShort).error),"metadata bound one-short")
+// Edit authoritative fields and stale standard attrs; payload uses validated
+// private length, while append always derives wire size from supplied bytes.
+let reader = tar.reader(metadata,metadata.length,4096)
+let item = tar.next(reader).entry
+let data = errors.bytesValue(tar.payload(reader,item))
+item.path = Bytes("edited"); item.link = Bytes(); item.uid = -7; item.gid = 9223372036854775807
+item.mtime = -2; item.mtimeNanos = 750000000; item.size = 9223372036854775807
+item.attributes.add(tar.Attribute { key: Bytes("path"); value: Bytes("stale") })
+item.attributes.add(tar.Attribute { key: Bytes("uid"); value: Bytes("999") })
+item.attributes.add(tar.Attribute { key: Bytes("size"); value: Bytes("999") })
+item.attributes.add(tar.Attribute { key: Bytes("mtime"); value: Bytes("999") })
+require(errors.bytesValue(tar.payload(reader,item)).length == data.length,"edited size changes original payload range")
+require(tar.next(reader).end,"reader final EOF")
+require(errors.bytesValue(tar.payload(reader,item)).length == data.length,"payload after EOF")
+let other = tar.reader(plain,plain.length,4096)
+require(!errors.bytesOk(tar.payload(other,item)),"foreign reader provenance")
+require(!errors.bytesOk(tar.memberBytes(other,item)),"foreign member provenance")
+tar.close(other)
+let edited = tar.writer(8192)
+require(errors.booleanOk(tar.append(edited,item,data)),"edited field writer")
+writeBytesFile(argument(4),errors.bytesValue(tar.finish(edited)))
+// Opaque binary values are not interpreted or dropped by append; malformed
+// xattr encodings surface in the optional normalized view.
+let bad = tar.entry(Bytes("x"),tar.REGULAR)
+bad.attributes.add(tar.Attribute { key: Bytes("LIBARCHIVE.xattr.user.bad"); value: Bytes("AB==") })
+require(errors.isError(tar.xattrs(bad).error),"noncanonical base64 tail")
+bad.attributes = []
+bad.attributes.add(tar.Attribute { key: Bytes("SCHILY.xattr.user.same"); value: Bytes("a") })
+bad.attributes.add(tar.Attribute { key: Bytes("LIBARCHIVE.xattr.user.same"); value: Bytes("Yg==") })
+require(errors.isError(tar.xattrs(bad).error),"conflicting xattr aliases")
+print("tar contracts passed")

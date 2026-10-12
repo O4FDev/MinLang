@@ -1,0 +1,436 @@
+// In-memory tar without extraction. Byte paths, effective PAX attributes and
+// extension-inclusive spans are preserved. See docs/tar.md for limits/policy.
+use "errors" as errors
+use "machine" as machine
+
+public constant REGULAR = 48
+public constant HARDLINK = 49
+public constant SYMLINK = 50
+public constant CHARACTER = 51
+public constant BLOCK = 52
+public constant DIRECTORY = 53
+public constant FIFO = 54
+constant MAXIMUM = 9223372036854775807
+
+public record Attribute { key: Bytes; value: Bytes }
+public record Entry {
+    path: Bytes; link: Bytes; mode: Integer; uid: Integer; gid: Integer
+    mtime: Integer; mtimeNanos: Integer; type: Integer; size: Integer
+    deviceMajor: Integer; deviceMinor: Integer; uname: Bytes; gname: Bytes
+    attributes: List<Attribute>
+    private start: Integer; private header: Integer; private offset: Integer; private end: Integer
+    private sourceAddress: Integer; private sourceLength: Integer
+}
+public record NextResult { entry: Entry; end: Boolean; error: errors.Error }
+public record Reader {
+    private source: Bytes; private position: Integer; private maximumPath: Integer
+    private maximumMetadata: Integer; private maximumChain: Integer; private maximumHeaders: Integer
+    private headers: Integer; private globals: List<Attribute>; private error: errors.Error; private ended: Boolean
+}
+public record Writer { private output: Bytes; private maximum: Integer; private error: errors.Error; private ended: Boolean }
+
+public function entry(path: Bytes, type: Integer): Entry {
+    return Entry { path: path; link: Bytes(); mode: 420; uid: 0; gid: 0; mtime: 0; mtimeNanos: 0
+        type: type; size: 0; deviceMajor: 0; deviceMinor: 0; uname: Bytes(); gname: Bytes(); attributes: []
+        start: -1; header: -1; offset: -1; end: -1; sourceAddress: 0; sourceLength: 0 }
+}
+function invalid(message: Text): errors.Error { return errors.make(errors.invalidDataCode(), 0, message) }
+function ustarMagic(): Bytes { let value = Bytes("ustar"); value.add(0); value.addBytes(Bytes("00")); return value }
+function gnuMagic(): Bytes { let value = Bytes("ustar  "); value.add(0); return value }
+function same(a: Bytes, b: Bytes): Boolean {
+    if a.length != b.length { return false }
+    let ap = machine.address(a); let bp = machine.address(b)
+    for i in 0..a.length { if machine.load8(ap + i) != machine.load8(bp + i) { return false } }
+    return true
+}
+function key(a: Bytes, b: Text): Boolean { return same(a, Bytes(b)) }
+function prefix(a: Bytes, b: Text): Boolean {
+    let bytes = Bytes(b)
+    if a.length < bytes.length { return false }
+    for i in 0..bytes.length { if a[i] != bytes[i] { return false } }
+    return true
+}
+function validString(value: Bytes, maximum: Integer, empty: Boolean): Boolean {
+    if value.length > maximum || (!empty && value.length == 0) { return false }
+    for byte in value { if byte == 0 { return false } }
+    return true
+}
+public function reader(source: Bytes, maximumBytes: Integer, maximumPath: Integer): Reader {
+    return readerWithLimits(source, maximumBytes, maximumPath, 1048576, 64, 1000000)
+}
+public function readerWithLimits(source: Bytes, maximumBytes: Integer, maximumPath: Integer, maximumMetadata: Integer, maximumChain: Integer, maximumHeaders: Integer): Reader {
+    let result = Reader { source: source; position: 0; maximumPath: maximumPath; maximumMetadata: maximumMetadata
+        maximumChain: maximumChain; maximumHeaders: maximumHeaders; headers: 0; globals: []; error: errors.none(); ended: false }
+    if maximumBytes < 0 || maximumPath < 1 || maximumMetadata < 0 || maximumChain < 1 || maximumHeaders < 1 || source.length > maximumBytes {
+        result.error = invalid("tar input or limit exceeded")
+    }
+    return result
+}
+public function memberStart(value: Entry): Integer { return value.start }
+public function headerOffset(value: Entry): Integer { return value.header }
+public function payloadOffset(value: Entry): Integer { return value.offset }
+public function memberEnd(value: Entry): Integer { return value.end }
+public function payload(cursor: Reader, value: Entry): errors.BytesResult {
+    if value.sourceAddress != machine.address(cursor.source) || value.sourceLength != cursor.source.length || value.offset < 0 || value.size < 0 || value.offset > cursor.source.length - value.size {
+        return errors.bytesFailure(invalid("tar entry does not belong to reader"))
+    }
+    return errors.bytes(cursor.source.slice(value.offset, value.offset + value.size))
+}
+public function memberBytes(cursor: Reader, value: Entry): errors.BytesResult {
+    if value.sourceAddress != machine.address(cursor.source) || value.sourceLength != cursor.source.length || value.start < 0 || value.end < value.start || value.end > cursor.source.length {
+        return errors.bytesFailure(invalid("tar entry does not belong to reader"))
+    }
+    return errors.bytes(cursor.source.slice(value.start, value.end))
+}
+function rejected(cursor: Reader, message: Text): NextResult {
+    cursor.error = invalid(message)
+    return NextResult { entry: entry(Bytes(), REGULAR); end: false; error: cursor.error }
+}
+function zero(source: Bytes, start: Integer, end: Integer): Boolean {
+    let p = machine.address(source)
+    for i in start..end { if machine.load8(p + i) != 0 { return false } }
+    return true
+}
+function stringField(source: Bytes, at: Integer, count: Integer): Bytes {
+    let n = 0; let p = machine.address(source) + at
+    while n < count && machine.load8(p + n) != 0 { n += 1 }
+    return source.slice(at, at + n)
+}
+// Parse via a negative accumulator so INT64_MIN never overflows.
+function digits(value: Bytes, radix: Integer, signed: Boolean): errors.IntegerResult {
+    if value.length == 0 { return errors.integerFailure(invalid("empty tar number")) }
+    let at = 0; let negative = false
+    if signed && value[0] == 45 { negative = true; at = 1 }
+    if at == value.length { return errors.integerFailure(invalid("empty signed tar number")) }
+    let result = 0; let bottom = -MAXIMUM
+    if negative { bottom -= 1 }
+    while at < value.length {
+        let digit = value[at] - 48
+        if digit < 0 || digit >= radix || result < bottom / radix { return errors.integerFailure(invalid("invalid or overflowing tar number")) }
+        result *= radix
+        if result < bottom + digit { return errors.integerFailure(invalid("overflowing tar number")) }
+        result -= digit; at += 1
+    }
+    if negative { return errors.integer(result) }
+    return errors.integer(-result)
+}
+function number(source: Bytes, at: Integer, count: Integer): errors.IntegerResult {
+    if source[at] >= 128 {
+        let negative = (source[at] & 64) != 0
+        let result = source[at] & 127
+        if negative { result -= 128 }
+        for i in 1..count {
+            let byte = source[at + i]
+            if result > MAXIMUM / 256 || result < (-MAXIMUM - 1) / 256 { return errors.integerFailure(invalid("base256 tar number overflow")) }
+            result *= 256
+            if result > MAXIMUM - byte { return errors.integerFailure(invalid("base256 tar number overflow")) }
+            result += byte
+        }
+        return errors.integer(result)
+    }
+    let first = at; let end = at + count
+    while first < end && (source[first] == 32 || source[first] == 0) { first += 1 }
+    let last = first
+    while last < end && source[last] >= 48 && source[last] <= 55 { last += 1 }
+    for i in last..end { if source[i] != 0 && source[i] != 32 { return errors.integerFailure(invalid("invalid octal tar number")) } }
+    if first == last { return errors.integer(0) }
+    return digits(source.slice(first, last), 8, false)
+}
+function setAttribute(attrs: List<Attribute>, name: Bytes, value: Bytes) {
+    for attr in attrs { if same(attr.key, name) { attr.value = value; return } }
+    attrs.add(Attribute { key: name; value: value })
+}
+function copyAttrs(attrs: List<Attribute>): List<Attribute> {
+    let result: List<Attribute> = []
+    for attr in attrs { result.add(Attribute { key: attr.key; value: attr.value }) }
+    return result
+}
+function attrBytes(attrs: List<Attribute>): Integer {
+    let count = 0
+    for attr in attrs { count += attr.key.length + attr.value.length }
+    return count
+}
+function mergeAttrs(global: List<Attribute>, local: List<Attribute>): List<Attribute> {
+    let result: List<Attribute> = []
+    for attr in global { if attr.value.length > 0 { setAttribute(result, attr.key, attr.value) } }
+    for attr in local { setAttribute(result, attr.key, attr.value) }
+    let filtered: List<Attribute> = []
+    for attr in result { if attr.value.length > 0 { filtered.add(attr) } }
+    return filtered
+}
+function pax(cursor: Reader, at: Integer, length: Integer, attrs: List<Attribute>): Boolean {
+    let end = at + length
+    while at < end {
+        let space = at
+        while space < end && cursor.source[space] >= 48 && cursor.source[space] <= 57 { space += 1 }
+        if space == at || space == end || cursor.source[space] != 32 { cursor.error = invalid("invalid PAX length"); return false }
+        let parsed = digits(cursor.source.slice(at, space), 10, false)
+        if !errors.integerOk(parsed) { cursor.error = errors.integerError(parsed); return false }
+        let size = errors.integerValue(parsed)
+        if size < space - at + 4 || size > end - at || cursor.source[at + size - 1] != 10 { cursor.error = invalid("invalid PAX record span"); return false }
+        let equal = space + 1
+        while equal < at + size - 1 && cursor.source[equal] != 61 { equal += 1 }
+        if equal == space + 1 || equal == at + size - 1 { cursor.error = invalid("invalid PAX keyword"); return false }
+        let name = cursor.source.slice(space + 1, equal)
+        for byte in name { if byte < 33 || byte > 126 { cursor.error = invalid("invalid PAX keyword"); return false } }
+        if prefix(name, "GNU.sparse.") || key(name, "SCHILY.realsize") { cursor.error = invalid("unsupported sparse tar"); return false }
+        setAttribute(attrs, name, cursor.source.slice(equal + 1, at + size - 1))
+        if attrs.length > 4096 || attrBytes(attrs) > cursor.maximumMetadata { cursor.error = invalid("PAX metadata limit exceeded"); return false }
+        at += size
+    }
+    return true
+}
+record Timestamp { seconds: Integer; nanos: Integer; valid: Boolean }
+function timestamp(value: Bytes): Timestamp {
+    let dot = value.length
+    for i in 0..value.length { if value[i] == 46 { if dot != value.length { return Timestamp { seconds: 0; nanos: 0; valid: false } }; dot = i } }
+    let whole = digits(value.slice(0, dot), 10, true)
+    if !errors.integerOk(whole) { return Timestamp { seconds: 0; nanos: 0; valid: false } }
+    let nanos = 0; let width = 0
+    if dot < value.length {
+        if dot + 1 == value.length { return Timestamp { seconds: 0; nanos: 0; valid: false } }
+        for i in (dot + 1)..value.length {
+            let digit = value[i] - 48
+            if digit < 0 || digit > 9 || (width >= 9 && digit != 0) { return Timestamp { seconds: 0; nanos: 0; valid: false } }
+            if width < 9 { nanos = nanos * 10 + digit }
+            width += 1
+        }
+    }
+    while width < 9 { nanos *= 10; width += 1 }
+    let seconds = errors.integerValue(whole)
+    if value[0] == 45 && nanos > 0 {
+        if seconds == -MAXIMUM - 1 { return Timestamp { seconds: 0; nanos: 0; valid: false } }
+        seconds -= 1; nanos = 1000000000 - nanos
+    }
+    return Timestamp { seconds: seconds; nanos: nanos; valid: true }
+}
+function apply(cursor: Reader, value: Entry): Boolean {
+    for attr in value.attributes {
+        if key(attr.key, "path") { value.path = attr.value }
+        else if key(attr.key, "linkpath") { value.link = attr.value }
+        else if key(attr.key, "uname") { value.uname = attr.value }
+        else if key(attr.key, "gname") { value.gname = attr.value }
+        else if key(attr.key, "mtime") {
+            let parsed = timestamp(attr.value)
+            if !parsed.valid { cursor.error = invalid("invalid PAX timestamp"); return false }
+            value.mtime = parsed.seconds; value.mtimeNanos = parsed.nanos
+        } else if key(attr.key, "size") || key(attr.key, "uid") || key(attr.key, "gid") || key(attr.key, "SCHILY.devmajor") || key(attr.key, "SCHILY.devminor") {
+            let parsed = digits(attr.value, 10, !key(attr.key, "size"))
+            if !errors.integerOk(parsed) { cursor.error = errors.integerError(parsed); return false }
+            let n = errors.integerValue(parsed)
+            if key(attr.key, "size") { value.size = n }
+            if key(attr.key, "uid") { value.uid = n }
+            if key(attr.key, "gid") { value.gid = n }
+            if key(attr.key, "SCHILY.devmajor") { value.deviceMajor = n }
+            if key(attr.key, "SCHILY.devminor") { value.deviceMinor = n }
+        }
+    }
+    return true
+}
+public function next(cursor: Reader): NextResult {
+    if errors.isError(cursor.error) { return NextResult { entry: entry(Bytes(), REGULAR); end: false; error: cursor.error } }
+    if cursor.ended { return NextResult { entry: entry(Bytes(), REGULAR); end: true; error: errors.none() } }
+    let start = cursor.position; let local: List<Attribute> = []; let chain = 0; let metadata = 0
+    let longPath = Bytes(); let longLink = Bytes()
+    while true {
+        let at = cursor.position
+        if cursor.source.length - at < 512 { return rejected(cursor, "truncated tar header or footer") }
+        if zero(cursor.source, at, at + 512) {
+            if chain > 0 { return rejected(cursor, "dangling tar extension") }
+            if cursor.source.length - at < 1024 || (cursor.source.length - at) % 512 != 0 || !zero(cursor.source, at, cursor.source.length) { return rejected(cursor, "invalid tar footer or record padding") }
+            cursor.ended = true
+            return NextResult { entry: entry(Bytes(), REGULAR); end: true; error: errors.none() }
+        }
+        cursor.headers += 1
+        if cursor.headers > cursor.maximumHeaders { return rejected(cursor, "tar header limit exceeded") }
+        let check = number(cursor.source, at + 148, 8)
+        if !errors.integerOk(check) { return rejected(cursor, "invalid tar checksum field") }
+        let sum = 0; let signed = 0; let p = machine.address(cursor.source) + at
+        for i in 0..512 {
+            let byte = 32
+            if i < 148 || i >= 156 { byte = machine.load8(p + i) }
+            sum += byte; signed += byte
+            if byte >= 128 { signed -= 256 }
+        }
+        if errors.integerValue(check) != sum && errors.integerValue(check) != signed { return rejected(cursor, "tar checksum mismatch") }
+        let magic = cursor.source.slice(at + 257, at + 265)
+        let v7 = zero(cursor.source, at + 257, at + 265)
+        let ustar = same(magic, ustarMagic())
+        let gnu = same(magic, gnuMagic())
+        if !v7 && !ustar && !gnu { return rejected(cursor, "unsupported tar magic or version") }
+        let value = entry(stringField(cursor.source, at, 100), cursor.source[at + 156])
+        if value.type == 0 { value.type = REGULAR }
+        if ustar {
+            let pre = stringField(cursor.source, at + 345, 155)
+            if pre.length > 0 { pre.add(47); pre.addBytes(value.path); value.path = pre }
+        }
+        value.link = stringField(cursor.source, at + 157, 100)
+        value.uname = stringField(cursor.source, at + 265, 32); value.gname = stringField(cursor.source, at + 297, 32)
+        let nums: List<Integer> = []
+        let offsets = [100, 108, 116, 124, 136, 329, 337]; let widths = [8, 8, 8, 12, 12, 8, 8]
+        for i in 0..7 {
+            if v7 && i >= 5 { nums.add(0) } else {
+                let n = number(cursor.source, at + offsets[i], widths[i])
+                if !errors.integerOk(n) { return rejected(cursor, "invalid tar numeric field") }
+                nums.add(errors.integerValue(n))
+            }
+        }
+        value.mode = nums[0]; value.uid = nums[1]; value.gid = nums[2]; value.size = nums[3]
+        value.mtime = nums[4]; value.deviceMajor = nums[5]; value.deviceMinor = nums[6]
+        if value.size < 0 || value.mode < 0 || value.deviceMajor < 0 || value.deviceMinor < 0 { return rejected(cursor, "negative tar size/mode/device") }
+        let extension = value.type == 120 || value.type == 103 || value.type == 76 || value.type == 75
+        if extension {
+            chain += 1
+            if chain > cursor.maximumChain || value.size > cursor.maximumMetadata - metadata { return rejected(cursor, "tar extension chain or metadata limit exceeded") }
+            metadata += value.size
+        } else {
+            if value.type < REGULAR || value.type > FIFO { return rejected(cursor, "unsupported tar member type (including sparse)") }
+            if longPath.length > 0 { value.path = longPath }
+            if longLink.length > 0 { value.link = longLink }
+            value.attributes = mergeAttrs(cursor.globals, local)
+            if attrBytes(value.attributes) > cursor.maximumMetadata || !apply(cursor, value) { return rejected(cursor, "invalid or excessive PAX metadata") }
+        }
+        let offset = at + 512
+        if value.size > cursor.source.length - offset { return rejected(cursor, "truncated tar payload") }
+        let padding = (512 - value.size % 512) % 512
+        if padding > cursor.source.length - offset - value.size { return rejected(cursor, "truncated tar payload padding") }
+        let end = offset + value.size + padding
+        cursor.position = end
+        if extension {
+            if value.type == 120 || value.type == 103 {
+                let attrs = local
+                if value.type == 103 { attrs = cursor.globals }
+                if !pax(cursor, offset, value.size, attrs) { return NextResult { entry: entry(Bytes(), REGULAR); end: false; error: cursor.error } }
+                if value.type == 103 { cursor.globals = mergeAttrs([], cursor.globals) }
+            } else {
+                let name = cursor.source.slice(offset, offset + value.size)
+                if name.length > 0 && name[name.length - 1] == 0 { name = name.slice(0, name.length - 1) }
+                if !validString(name, cursor.maximumPath, false) { return rejected(cursor, "invalid GNU long path or link") }
+                if value.type == 76 { longPath = name } else { longLink = name }
+            }
+        } else {
+            if !validString(value.path, cursor.maximumPath, false) || !validString(value.link, cursor.maximumPath, true) || !validString(value.uname, cursor.maximumPath, true) || !validString(value.gname, cursor.maximumPath, true) { return rejected(cursor, "invalid or excessive tar byte name") }
+            if value.type != REGULAR && value.size != 0 { return rejected(cursor, "nonregular tar payload unsupported") }
+            value.start = start; value.header = at; value.offset = offset; value.end = end
+            value.sourceAddress = machine.address(cursor.source); value.sourceLength = cursor.source.length
+            return NextResult { entry: value; end: false; error: errors.none() }
+        }
+    }
+    return rejected(cursor, "unreachable tar parser")
+}
+
+public function writer(maximumBytes: Integer): Writer {
+    let result = Writer { output: Bytes(); maximum: maximumBytes; error: errors.none(); ended: false }
+    if maximumBytes < 1024 { result.error = invalid("tar writer requires footer capacity") }
+    return result
+}
+function writerFailure(output: Writer, message: Text): errors.BooleanResult {
+    output.error = invalid(message); return errors.booleanFailure(output.error)
+}
+function standard(name: Bytes): Boolean {
+    return key(name, "path") || key(name, "linkpath") || key(name, "size") || key(name, "uid") || key(name, "gid") || key(name, "mtime") || key(name, "uname") || key(name, "gname") || key(name, "SCHILY.devmajor") || key(name, "SCHILY.devminor") || key(name, "hdrcharset")
+}
+function octal(value: Integer, width: Integer): Bytes {
+    let result = Bytes(width); let at = width - 2
+    while at >= 0 { result[at] = 48 + value % 8; value /= 8; at -= 1 }
+    return result
+}
+function put(header: Bytes, at: Integer, value: Bytes) { machine.copy(machine.address(header) + at, machine.address(value), value.length) }
+function checksum(header: Bytes) {
+    let sum = 0
+    for i in 0..512 { if i >= 148 && i < 156 { sum += 32 } else { sum += header[i] } }
+    let bytes = octal(sum, 7); bytes.add(32); put(header, 148, bytes)
+}
+function paxRecord(output: Bytes, name: Bytes, value: Bytes) {
+    let size = name.length + value.length + 4
+    while true {
+        let text = Bytes(Text(size))
+        let n = text.length + 1 + name.length + 1 + value.length + 1
+        if n == size { output.addBytes(text); output.add(32); output.addBytes(name); output.add(61); output.addBytes(value); output.add(10); return }
+        size = n
+    }
+}
+function timeText(seconds: Integer, nanos: Integer): Bytes {
+    if nanos == 0 { return Bytes(Text(seconds)) }
+    let negative = seconds < 0; let whole = Text(seconds)
+    if negative { whole = "-" + Text(-(seconds + 1)); nanos = 1000000000 - nanos }
+    let frac = Text(nanos)
+    while frac.length < 9 { frac = "0" + frac }
+    while frac[frac.length - 1] == '0' { frac = frac.slice(0, frac.length - 1) }
+    return Bytes(whole + "." + frac)
+}
+function buildHeader(value: Entry, dataLength: Integer, attrs: List<Attribute>): Bytes {
+    let header = Bytes(512); let path = value.path
+    if path.length > 100 {
+        let slash = -1
+        for i in 0..path.length { if path[i] == 47 && i <= 155 && path.length - i - 1 <= 100 && path.length - i - 1 > 0 { slash = i } }
+        if slash >= 0 { put(header, 345, path.slice(0, slash)); path = path.slice(slash + 1, path.length) }
+        else { setAttribute(attrs, Bytes("path"), path); path = Bytes("PaxEntry") }
+    }
+    put(header, 0, path)
+    if value.link.length <= 100 { put(header, 157, value.link) } else { setAttribute(attrs, Bytes("linkpath"), value.link) }
+    let numbers = [value.mode, value.uid, value.gid, dataLength, value.mtime, value.deviceMajor, value.deviceMinor]
+    let widths = [8, 8, 8, 12, 12, 8, 8]; let offsets = [100,108,116,124,136,329,337]
+    let maxima = [2097151,2097151,2097151,8589934591,8589934591,2097151,2097151]
+    let names = ["", "uid", "gid", "size", "mtime", "SCHILY.devmajor", "SCHILY.devminor"]
+    for i in 0..7 {
+        let n = numbers[i]
+        if n < 0 || n > maxima[i] || (i == 4 && value.mtimeNanos != 0) {
+            if i == 4 { setAttribute(attrs, Bytes(names[i]), timeText(n, value.mtimeNanos)) } else { setAttribute(attrs, Bytes(names[i]), Bytes(Text(n))) }
+            n = 0
+        }
+        put(header, offsets[i], octal(n, widths[i]))
+    }
+    header[156] = value.type; put(header, 257, ustarMagic())
+    if value.uname.length <= 32 { put(header,265,value.uname) } else { setAttribute(attrs,Bytes("uname"),value.uname) }
+    if value.gname.length <= 32 { put(header,297,value.gname) } else { setAttribute(attrs,Bytes("gname"),value.gname) }
+    checksum(header); return header
+}
+public function append(output: Writer, value: Entry, data: Bytes): errors.BooleanResult {
+    if errors.isError(output.error) { return errors.booleanFailure(output.error) }
+    if output.ended { return errors.booleanFailure(invalid("tar writer is finished")) }
+    if value.type < REGULAR || value.type > FIFO || (value.type != REGULAR && data.length != 0) || value.mode < 0 || value.mode > 2097151 || value.deviceMajor < 0 || value.deviceMinor < 0 || value.mtimeNanos < 0 || value.mtimeNanos >= 1000000000 {
+        return writerFailure(output, "invalid tar writer metadata")
+    }
+    if !validString(value.path,4096,false) || !validString(value.link,4096,true) || !validString(value.uname,4096,true) || !validString(value.gname,4096,true) { return writerFailure(output,"invalid tar writer byte name") }
+    let attrs: List<Attribute> = []
+    if value.attributes.length > 4096 { return writerFailure(output,"tar writer attribute count exceeded") }
+    for attr in value.attributes {
+        if prefix(attr.key,"GNU.sparse.") || key(attr.key,"SCHILY.realsize") { return writerFailure(output,"unsupported sparse tar writer") }
+        if !validString(attr.key,256,false) { return writerFailure(output,"invalid PAX writer keyword") }
+        for byte in attr.key { if byte < 33 || byte > 126 || byte == 61 { return writerFailure(output,"invalid PAX writer keyword") } }
+        if !standard(attr.key) { setAttribute(attrs,attr.key,attr.value) }
+    }
+    if attrBytes(attrs) > 1048576 { return writerFailure(output,"tar writer metadata limit exceeded") }
+    let header = buildHeader(value, data.length, attrs)
+    // Byte fields use the PAX BINARY charset whenever extensions are needed.
+    if attrs.length > 0 { setAttribute(attrs, Bytes("hdrcharset"), Bytes("BINARY")) }
+    // Stable key sorting by raw bytes; insertion order is irrelevant.
+    for i in 0..attrs.length {
+        for j in (i + 1)..attrs.length {
+            let a = attrs[i].key; let b = attrs[j].key; let less = false; let done = false
+            for k in 0..min(a.length,b.length) { if !done && a[k] != b[k] { less = b[k] < a[k]; done = true } }
+            if !done { less = b.length < a.length }
+            if less { let swap = attrs[i]; attrs[i] = attrs[j]; attrs[j] = swap }
+        }
+    }
+    let paxData = Bytes()
+    for attr in attrs { paxRecord(paxData,attr.key,attr.value) }
+    if paxData.length > 1048576 { return writerFailure(output,"tar writer PAX limit exceeded") }
+    let needed = 512 + data.length + (512 - data.length % 512) % 512
+    if paxData.length > 0 { needed += 512 + paxData.length + (512 - paxData.length % 512) % 512 }
+    if needed > output.maximum - 1024 - output.output.length { return writerFailure(output,"tar writer archive limit exceeded") }
+    if paxData.length > 0 {
+        let paxEntry = entry(Bytes("PaxHeaders/entry"),120)
+        output.output.addBytes(buildHeader(paxEntry,paxData.length,[])); output.output.addBytes(paxData)
+        output.output.addBytes(Bytes((512 - paxData.length % 512) % 512))
+    }
+    output.output.addBytes(header); output.output.addBytes(data); output.output.addBytes(Bytes((512 - data.length % 512) % 512))
+    return errors.boolean(true)
+}
+public function finish(output: Writer): errors.BytesResult {
+    if errors.isError(output.error) { return errors.bytesFailure(output.error) }
+    if !output.ended { output.output.addBytes(Bytes(1024)); output.ended = true }
+    // Caller owns a copy; later edits cannot corrupt an idempotent finish.
+    return errors.bytes(output.output.slice(0,output.output.length))
+}

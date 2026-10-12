@@ -1,0 +1,85 @@
+use "tar" as tar
+use "errors" as errors
+
+function hex(bytes: Bytes): Text {
+    let digits = "0123456789abcdef"
+    let result = ""
+    for byte in bytes { result += Text(digits[byte / 16]) + Text(digits[byte % 16]) }
+    return result
+}
+
+// Binary frames permit embedded NULs and a single process for the fuzz corpus.
+let corpus = readBytesFile(argument(0))
+let at = 0
+let count = 0
+while at < corpus.length {
+    let size = corpus.getUInt32(at)
+    at += 4
+    let source = corpus.slice(at, at + size)
+    at += size
+    let reader = tar.reader(source, 16777216, 4096)
+    let done = false
+    while !done {
+        let result = tar.next(reader)
+        if errors.isError(result.error) {
+            print(Text(count) + "|ERROR|" + errors.message(result.error))
+            // A failed cursor must remain failed, without advancing.
+            if !errors.isError(tar.next(reader).error) { fail("nonsticky tar error") }
+            done = true
+        } else {
+            if result.end {
+                print(Text(count) + "|END")
+                if !tar.next(reader).end { fail("nonsticky tar EOF") }
+                done = true
+            } else {
+                let entry = result.entry
+                let payload = tar.payload(reader, entry)
+                if !errors.bytesOk(payload) { fail("invalid validated payload range") }
+                print(Text(count) + "|ENTRY|" + hex(entry.path) + "|" + hex(entry.link) + "|" + Text(entry.mode) + "|" + Text(entry.uid) + "|" + Text(entry.gid) + "|" + Text(entry.mtime) + "|" + Text(entry.mtimeNanos) + "|" + Text(entry.type) + "|" + Text(entry.size) + "|" + Text(entry.deviceMajor) + "|" + Text(entry.deviceMinor) + "|" + hex(errors.bytesValue(payload)) + "|" + hex(entry.uname) + "|" + hex(entry.gname))
+                print(Text(count)+"|SPAN|"+hex(entry.path)+"|"+Text(tar.memberStart(entry))+"|"+Text(tar.headerOffset(entry))+"|"+Text(tar.payloadOffset(entry))+"|"+Text(tar.memberEnd(entry)))
+                for attr in entry.attributes { print(Text(count)+"|ATTR|"+hex(entry.path)+"|"+hex(attr.key)+"|"+hex(attr.value)) }
+                let xattrs = tar.xattrs(entry)
+                if errors.isError(xattrs.error) { print(Text(count)+"|XATTRERROR") } else {
+                    for attr in xattrs.attributes { print(Text(count)+"|XATTR|"+hex(entry.path)+"|"+hex(attr.key)+"|"+hex(attr.value)) }
+                }
+
+
+            }
+        }
+    }
+    count += 1
+}
+
+// Produce archives from the same metadata/payload, twice, for determinism and
+// independent Python/libarchive verification. No filesystem extraction exists.
+let writer = tar.writer(16777216)
+let reader = tar.reader(readBytesFile(argument(1)), 16777216, 4096)
+let done = false
+while !done {
+    let result = tar.next(reader)
+    if errors.isError(result.error) { fail("writer fixture input: " + errors.message(result.error)) }
+    if result.end { done = true } else {
+        let data = errors.bytesValue(tar.payload(reader, result.entry))
+        let added = tar.append(writer, result.entry, data)
+        if !errors.booleanOk(added) { fail("tar writer " + hex(result.entry.path) + ": " + errors.message(errors.booleanError(added))) }
+    }
+}
+let archive = tar.finish(writer)
+if !errors.bytesOk(archive) { fail("tar finish") }
+writeBytesFile(argument(2), errors.bytesValue(archive))
+if hex(errors.bytesValue(tar.finish(writer))) != hex(errors.bytesValue(archive)) { fail("nonidempotent finish") }
+if errors.booleanOk(tar.append(writer, tar.entry(Bytes("late"), tar.REGULAR), Bytes())) { fail("append after finish") }
+
+let tiny = tar.writer(1024)
+if errors.booleanOk(tar.append(tiny, tar.entry(Bytes("a"), tar.REGULAR), Bytes(1))) { fail("writer archive bound") }
+if errors.bytesOk(tar.finish(tiny)) { fail("nonsticky writer error") }
+let nulPath = Bytes("bad path"); nulPath[3] = 0
+let bad = tar.entry(nulPath, tar.REGULAR)
+if errors.booleanOk(tar.append(tar.writer(4096), bad, Bytes())) { fail("NUL writer path") }
+bad = tar.entry(Bytes("link"), tar.SYMLINK)
+if errors.booleanOk(tar.append(tar.writer(4096), bad, Bytes("payload"))) { fail("symlink payload") }
+bad = tar.entry(Bytes("number"), tar.REGULAR)
+bad.mode = -1
+if errors.booleanOk(tar.append(tar.writer(4096), bad, Bytes())) { fail("negative mode") }
+if !errors.isError(tar.next(tar.reader(Bytes(1024), -1, 1)).error) { fail("negative reader bound") }
+if !errors.isError(tar.next(tar.reader(Bytes(1024), 1, -1)).error) { fail("negative header bound") }
