@@ -29,7 +29,7 @@ def network_namespace(data):
         return descriptor
     except BaseException:
         os.close(descriptor);raise
-def configure(node):
+def configure(node, temporary=Path('/home/minyar/lab/quic-runner-tmp')):
     data=json.loads(subprocess.check_output(['docker','inspect',node],stderr=subprocess.DEVNULL))[0]
     pid=data['State']['Pid']
     if not pid:return None
@@ -49,7 +49,7 @@ def configure(node):
     for mount in data['Mounts']:
         if mount['Destination'] not in ('/certs','/www','/downloads'):raise RuntimeError('unexpected endpoint mount')
         path=Path(mount['Source']).resolve()
-        if not str(path).startswith('/home/minyar/lab/quic-runner-tmp/'):
+        if temporary not in path.parents:
             raise RuntimeError('endpoint mount is outside ephemeral runner files')
         os.chmod(path,0o755 if mount['Destination']!='/downloads' else 0o777)
         for entry in path.rglob('*'):
@@ -157,10 +157,10 @@ def matrix_evidence(path, options, runner_status):
             'result_validation': verdict}
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('--runner',required=True);parser.add_argument('--artifacts',required=True);parser.add_argument('--servers',default='minyar');parser.add_argument('--clients',default='minyar,quiche,ngtcp2,msquic');parser.add_argument('--tests',default='handshake,transfer');parser.add_argument('--must-include',default='minyar');options=parser.parse_args()
+    parser=argparse.ArgumentParser();parser.add_argument('--runner',required=True);parser.add_argument('--artifacts',required=True);parser.add_argument('--servers',default='minyar');parser.add_argument('--clients',default='minyar,quiche,ngtcp2,msquic');parser.add_argument('--tests',default='handshake,transfer');parser.add_argument('--must-include',default='minyar');parser.add_argument('--temporary',type=Path,default=Path('/home/minyar/lab/quic-runner-tmp'));options=parser.parse_args()
     if platform.system()!='Linux' or os.geteuid()!=0 or os.environ.get('MINYAR_REMOTE_LOAD')!='1':raise RuntimeError('remote Linux admin orchestration required')
     runner=Path(options.runner).resolve();artifacts=Path(options.artifacts).resolve();artifacts.mkdir(parents=True,exist_ok=True)
-    temporary=Path('/home/minyar/lab/quic-runner-tmp');temporary.mkdir(exist_ok=True)
+    temporary=options.temporary.resolve();temporary.mkdir(parents=True,exist_ok=True)
     # The upstream runner explicitly chooses /tmp at several fixture sites.
     # Relocate those paths only, preserving every protocol test and assertion.
     for source in runner.glob('*.py'):
@@ -174,7 +174,7 @@ def main():
     # Apply only endpoint capability removals; the official simulator retains
     # its required NET_ADMIN/NET_RAW. Host nsenter handles endpoint routing.
     compose=runner/'docker-compose.yml'; original=compose.read_text(); original=original.replace('    cap_add:\n      - NET_ADMIN\n    ulimits:', '    ulimits:');compose.write_text(original)
-    image_tags={'quiche':'minyar-quiche:lab','ngtcp2':os.environ.get('MINYAR_NGTCP2_IMAGE','minyar-ngtcp2:lab'),'msquic':'minyar-msquic:lab'}
+    image_tags={'quiche':'minyar-quiche:lab','quinn':'minyar-quinn:lab','ngtcp2':os.environ.get('MINYAR_NGTCP2_IMAGE','minyar-ngtcp2:lab'),'msquic':'minyar-msquic:lab'}
     replacements=','.join(f'{name}={image}' for name,image in image_tags.items())
     environment=runner_environment(temporary)
     logs=artifacts/'runner.log'
@@ -190,7 +190,7 @@ def main():
                     try:
                         identifier=subprocess.check_output(['docker','inspect','--format','{{.Id}} {{.State.Running}}',node],stderr=subprocess.DEVNULL,text=True).strip()
                         if identifier.endswith(' true') and identifier not in configured:
-                            found=configure(node)
+                            found=configure(node,temporary)
                             if found:configured.add(identifier)
                     except subprocess.CalledProcessError:pass
                 time.sleep(.1)
