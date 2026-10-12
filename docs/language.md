@@ -79,8 +79,23 @@ constant GRAVITY: Float = -9.81
 constant TITLE = "Minyarcraft"
 ```
 
-The value must be one literal, optionally negated: an Integer, Float, Text,
-Character or Boolean. An annotation, if present, must match its type.
+A literal value may omit its type annotation: an Integer, Float, Text,
+Character or Boolean, optionally negated. Other expressions need an annotation:
+
+```minyar
+constant MODES: List<Integer> = [0o644, 0o755]
+constant CRC_TABLE: List<Integer> = makeTable()
+```
+
+Annotated nonliteral initializers run once before `main()` or the entry module's
+top-level statements, including declarations in imported modules. Repeated and
+diamond imports share the same module table. An initializer may depend on another
+constant; recursively initializing a constant stops with a clear error. Literal
+constants retain their direct substitution behavior.
+
+The binding cannot be reassigned. A List, Bytes or record value retains its usual
+mutable alias semantics; initialize lookup tables once and share them within the
+owning domain. Normal return from the executable entry releases the module roots.
 
 ## Loops
 

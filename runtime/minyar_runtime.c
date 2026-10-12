@@ -221,6 +221,10 @@ static MINYAR_COLD MINYAR_NORETURN void minyar_stop(const char *message) {
     exit(1);
 }
 
+MINYAR_COLD MINYAR_NORETURN void minyar_constant_initialization_fail(void) {
+    minyar_stop("module constant initialization is recursive.");
+}
+
 static MINYAR_COLD MINYAR_NORETURN void out_of_memory(void) {
     minyar_stop("the computer ran out of memory.");
 }
