@@ -1,0 +1,52 @@
+// The producer's own immutable backing survives the creator's domain.
+// Two new worker domains read that same backing concurrently via native shares.
+record Node { label: Text, children: List<Node> }
+
+thread function producer(seed: Integer, input: FrozenBytes, queue: FrozenBytesChannel): Integer {
+    let bytes = Bytes(0)
+    bytes.addInt64(123456789)
+    let aliases: List<Bytes> = [bytes]
+    let owned = freezeBytesTake(bytes)
+    if aliases[0].length != 0 { fail("take did not empty producer aliases") }
+    if !sendFrozen(queue, owned) { fail("producer could not publish frozen backing") }
+    return 17
+}
+
+thread function reader(seed: Integer, input: FrozenBytes, queue: FrozenBytesChannel): Integer {
+    let local = Node { label: "λ🙂", children: [] }
+    local.children.add(local)
+    let copy = copyFrozenBytes(input)
+    copy.setInt64(0, 42)
+    let sum = 0
+    for index in 0..100000 {
+        sum = sum + input.getInt64(0)
+        let text = "λ🙂"
+        if text.length != 2 { fail("thread literal metadata is not private") }
+    }
+    if copy.getInt64(0) != 42 { fail("local copy was not mutable") }
+    return sum + seed
+}
+
+function main() {
+    let queue = frozenBytesChannel(4096, 4)
+    let empty = freezeBytes(Bytes(0))
+    let started = startThreadResult(producer, 0, empty, queue)
+    if !started.ok { fail("producer creation failed") }
+    let producerHandle = started.thread
+    let exited = joinThreadResult(producerHandle)
+    if !exited.ok || exited.value != 17 { fail("producer did not exit") }
+    // Receive only after the creating domain is fully joined and torn down.
+    let message = receiveFrozen(queue)
+    if !message.ok { fail("creator-exit frozen message is missing") }
+    let shared = message.value
+    if shared.getInt64(0) != 123456789 { fail("creator backing was lost") }
+    let first = startThread(reader, 1, shared, queue)
+    let second = startThread(reader, 2, shared, queue)
+    let mainSum = 0
+    for index in 0..100000 { mainSum = mainSum + shared.getInt64(0) }
+    if joinThread(first) != 12345678900001 { fail("first shared reader failed") }
+    if joinThread(second) != 12345678900002 { fail("second shared reader failed") }
+    if mainSum != 12345678900000 { fail("main shared reader failed") }
+    closeFrozenChannel(queue)
+    print("creator-exit shared frozen passed")
+}
