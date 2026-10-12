@@ -4,6 +4,10 @@ Branch: `ws2/checked-arithmetic`, based on
 `bf9c0e9bb6ced1f40d8d7c51bedca769b05909c0`.
 Implementation: `5e77925394807d2531c2a52330b2d436890286c8`.
 Catalogue/Linux wiring: `e90edfd487b682a65b7dbdbda1696af58ab6bddd`.
+After the original handoff, parent approved the common baseline dependency:
+`193c8af` / `47a1159` / `39a8e72`, cherry-picked separately as
+`44b044f` / `0459e7a` / `f22e3c7`. G15 arithmetic source hashes remain unchanged;
+the active independent review still targets original handoff `fa6257d`.
 No push, merge, owning-project edits, or claim of a closed/merged gap.
 Fresh independent review belongs to the parent; no children were created.
 
@@ -109,12 +113,18 @@ All other artifact identities are in `*-artifacts.sha256` and test manifests.
 ## Remaining review and qualification
 
 Parent owns the pinned foundation baseline dependency stack
-`193c8af` + `47a1159` + `39a8e72`, with fresh review pending at handoff.
-It was not cherry-picked before parent release. Integration must apply the
-reviewed stack before this arithmetic change: current-core reconstruction of
-the frozen comparator would otherwise drift. The exact frozen digest remains
+`193c8af` + `47a1159` + `39a8e72`. Its R2 review approved the whole stack after
+the original handoff; it is now present on this branch through the separate
+cherry-picks above. Integration must retain this dependency: reconstruction
+from the evolving core would otherwise drift. The exact frozen digest remains
 `a5f30a7954381231fbe04a712b72bd9663d1bd7082c667fef851b739ec63c3cf`;
-this branch does not alter the builder or silently redefine that comparator.
+the imported builder reads the reviewed pinned source without redefining that
+comparator. Local follow-up checks passed: three foundation tests, exact frozen
+output digest, 509-source catalogue, current module/callback/Result assembly,
+and combined portable/Linux CI wiring. Evidence is in
+`build/ws2-evidence/foundation-dependency-*`,
+`suite-catalogue-with-foundation.log` and `linux-plan-with-foundation.json`.
+No host was resumed and no native validation was repeated for this dependency.
 
 Optimized x86_64 checkedMultiply shares one `imulq` between overflow detection
 and the success value. Retained AArch64 cross-assembly emits `mul`/`smulh` for
@@ -134,5 +144,6 @@ The parent held-state report and unresolved G14 cleanup/propagation, G13
 default-profile/collector, syscall/thread-pointer and WS1 TLS findings were read
 and preserved. Owner release revoked the implementation/Boat hold only; it did
 not waive those findings or qualification thresholds. This implementation edits
-arithmetic APIs/codegen plus the requested catalogue/CI wiring, with no call-depth,
-RC, syscall or other-worktree edits.
+arithmetic APIs/codegen plus the requested catalogue/CI wiring and approved
+common baseline dependency, with no call-depth, RC, syscall or other-worktree
+edits.
