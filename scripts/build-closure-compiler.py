@@ -55,6 +55,10 @@ def assemble(source):
     source, type_dispatch, atom_dispatch = ordinary_control(source)
     adapt = runpy.run_path(str(ROOT / 'scripts/build-module-compiler.py'))['adapt']
     source = adapt(source, (ROOT / 'compiler/managed-graphs-adapter.patch').read_text())
+    source = replace(source, 'borrowReference(output, state, position, 2)',
+        'borrowReference(output, state, position, 2, functionParameterCounts, functionParameterTypes, functionReturnTypes)')
+    source = replace(source, 'borrowReference(output, state, current, elementType)',
+        'borrowReference(output, state, current, elementType, functionParameterCounts, functionParameterTypes, functionReturnTypes)')
     type_position = source.index('    let code = simpleTypeCode(name)', source.index('function takeType('))
     source = source[:type_position] + type_dispatch + source[type_position:]
     atom_position = source.index('    if kind == 1 {', source.index('function parseAtom('))
@@ -105,8 +109,8 @@ def assemble(source):
         '    finishCycleFixups(')
     source = body(source, 'noteCycleFixup', '''    let baseA = typeA
     let baseB = typeB
-    while isListType(baseA) { baseA = listElementType(baseA) }
-    while isListType(baseB) { baseB = listElementType(baseB) }
+    while isContainerType(baseA) { baseA = containerValueType(baseA) }
+    while isContainerType(baseB) { baseB = containerValueType(baseB) }
     if !isRecordType(baseA) && !isRecordType(baseB) { return }
     returnTypes.add(-2)
     returnTypes.add(-1 - piece)
@@ -115,6 +119,10 @@ def assemble(source):
     source = body(source, 'checkListMutation', '''    if isReferenceType(listElementType(listType)) {
         activateCycleType(returnTypes, listType, counts.length)
     }''')
+    source = replace(source, '                    checkMapMutation(receiverType, functionParameterCounts, functionParameterTypes)\n',
+        '                    functionReturnTypes.add(-5)\n'
+        '                    functionReturnTypes.add(receiverType)\n'
+        '                    checkMapMutation(receiverType, functionParameterCounts, functionParameterTypes)\n')
     source = body(source, 'checkFieldMutation', '''    if isReferenceType(fieldType) {
         activateCycleType(returnTypes, recordType, counts.length)
     }''')
@@ -128,8 +136,8 @@ def assemble(source):
     # have been type checked. Markers are filtered against that final graph.
     source = replace(source, '    if (tokenKinds[atom] == 1 && tokenTexts[atom + 1] == "(") || (tokenKinds[atom] == 4 && tokenTexts[atom] == "[") {',
         '    if tokenTexts[atom] != "function" && ((tokenKinds[atom] == 1 && tokenTexts[atom + 1] == "(") || (tokenKinds[atom] == 4 && tokenTexts[atom] == "[")) {')
-    source = replace(source, 'token != "List" && genericDepth == 0',
-        'token != "List" && (token != "Callback" || tokenTexts[position + 1] != "<") && genericDepth == 0')
+    source = replace(source, 'token != "List" && token != "Map" && genericDepth == 0',
+        'token != "List" && token != "Map" && (token != "Callback" || tokenTexts[position + 1] != "<") && genericDepth == 0')
     # Normalize anonymous header state in the shared module name rewriter.
     source = replace(source, '(token == "record" || token == "function") {',
         '(token == "record" || (token == "function" && tokenTexts[position + 1] != "(")) {')
@@ -137,6 +145,10 @@ def assemble(source):
         '                let token = tokenTexts[position]\n                let kind = tokenKinds[position]\n'
         '                if token == "function" && tokenTexts[position + 1] == "(" { functionHeader = true }\n'
         '                if token == "{" && functionHeader { functionHeader = false }\n')
+    source = body(source, 'sortBorrowReference',
+        '    borrowReference(output, state, value, type, counts, fields, returns)')
+    source = body(source, 'sortComparatorThunk',
+        '    return closureSortComparatorThunk(names, type, element, globals)')
     main = source.index('\nfunction main(')
     helpers = (ROOT / 'compiler/closure-compiler.min').read_text()
     source = source[:main] + '\n' + helpers + source[main:]
@@ -149,31 +161,23 @@ def assemble(source):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path)
-    parser.add_argument('--baseline', action='store_true', help='reconstruct the exact foundation compiler control')
+    parser.add_argument('--baseline', action='store_true', help='verify and emit the frozen foundation compiler control')
     args = parser.parse_args()
-    core = (ROOT / 'compiler/compiler.min').read_text()
     if args.baseline:
-        assembled = ordinary_control(core)[0]
-        # The foundation predates managed parallel-signature rejection.
-        # Reverse that later core change only for this frozen control; current
-        # optional frontends must retain the stricter signature checks.
-        assembled = replace(assembled,
-            '            let parallelReferences = state[6] == 1 || isReferenceType(returnType)\n'
-            '            let parallelParameter = 0\n'
-            '            while parallelParameter < parameterNames.length {\n'
-            '                if isReferenceType(parameterTypes[parallelParameter]) { parallelReferences = true }\n'
-            '                parallelParameter = parallelParameter + 1\n'
-            '            }\n'
-            '            finishParallelFunction(output, globals, entrySlot, bodySlot, name, parallelReferences)\n',
-            '            finishParallelFunction(output, globals, entrySlot, bodySlot, name, state[6] == 1)\n')
+        # This is the exact comparator previously reconstructed from bf9c0e9.
+        # Keep current frontend assembly independent of this frozen source.
+        assembled = (ROOT / 'compiler/foundation-baseline.min').read_bytes()
         expected = 'a5f30a7954381231fbe04a712b72bd9663d1bd7082c667fef851b739ec63c3cf'
-        if hashlib.sha256(assembled.encode()).hexdigest() != expected:
-            raise ValueError('foundation baseline reconstruction drifted; do not update the control silently')
+        if hashlib.sha256(assembled).hexdigest() != expected:
+            raise ValueError('foundation baseline source changed; do not update the control silently')
     else:
-        assembled = assemble(core)
+        assembled = assemble((ROOT / 'compiler/compiler.min').read_text())
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_name(args.output.name + '.tmp')
-    temporary.write_text(assembled)
+    if args.baseline:
+        temporary.write_bytes(assembled)
+    else:
+        temporary.write_text(assembled)
     temporary.replace(args.output)
 
 

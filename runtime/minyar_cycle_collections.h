@@ -186,6 +186,25 @@ long long minyar_list_length(const MinyarList *list) {
     return list->length;
 }
 
+/* Publish each removed edge before release can service the cycle tracer.
+ * Keep the remaining slots visible until their incoming counts are removed. */
+void minyar_list_clear(MinyarList *list) {
+#ifndef MINYAR_COMPILER_ARENA
+    unsigned kind = ((RcObject *)list - 1)->ownership & 7;
+    if (kind == RC_REFERENCES || kind == RC_TRACED) {
+        while (list->length) {
+            long long value = list->values[--list->length];
+            list->values[list->length] = 0;
+            if (kind == RC_TRACED)
+                rc_cycle_edge_remove((void *)(uintptr_t)value);
+            minyar_rc_release((void *)(uintptr_t)value);
+        }
+        return;
+    }
+#endif
+    list->length = 0;
+}
+
 static MINYAR_COLD MINYAR_NORETURN void list_position_stop(long long position, long long length) {
     char message[128];
     snprintf(message, sizeof(message), "List position %lld is outside its length of %lld.",

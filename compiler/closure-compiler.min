@@ -3,6 +3,38 @@
 // graph fields describe owned edges; signature arguments are not graph edges.
 record CallbackTokens { kinds: List<Integer>; texts: List<Text>; lines: SourceMap }
 
+function closureSortComparatorThunk(names: List<Text>, type: Integer, element: Integer, globals: List<Text>): Text {
+    if !isCallbackType(type, names) { fail("sortBy and sortedBy require Callback<T, T, Integer>") }
+    let signature = callbackSignatureTypes(names[type - 1000])
+    if signature.length != 3 { fail("sortBy and sortedBy require Callback<T, T, Integer>") }
+    if signature[0] != element || signature[1] != element || signature[2] != 1 {
+        fail("sortBy and sortedBy require Callback<T, T, Integer>")
+    }
+    // A parameter-only callback still needs domain checks and its runtime,
+    // even when this program never constructs a closure literal.
+    globals.add("; minyar-sort-callback-runtime: 1\n")
+    let name = "@.minyar.sort.compare." + Text(globals.length)
+    let code = "define internal i64 " + name + "(ptr %callback, i64 %left.slot, i64 %right.slot) {\nentry:\n"
+    code = code + "  call void @minyar_callback_check(ptr %callback)\n"
+    code = code + "  %code.slot = call i64 @minyar_record_get(ptr %callback, i64 0)\n"
+    code = code + "  %env.slot = call i64 @minyar_record_get(ptr %callback, i64 1)\n"
+    code = code + "  %code = inttoptr i64 %code.slot to ptr\n  %env = inttoptr i64 %env.slot to ptr\n"
+    let left = "%left.slot"
+    let right = "%right.slot"
+    if element != 1 {
+        let conversion = "trunc"
+        if isReferenceType(element) { conversion = "inttoptr" }
+        if element == 7 { conversion = "bitcast" }
+        code = code + "  %left = " + conversion + " i64 %left.slot to " + llvmType(element) + "\n"
+        code = code + "  %right = " + conversion + " i64 %right.slot to " + llvmType(element) + "\n"
+        left = "%left"
+        right = "%right"
+    }
+    code = code + "  %result = call i64 %code(ptr %env, " + llvmType(element) + " " + left + ", " + llvmType(element) + " " + right + ")\n  ret i64 %result\n}\n"
+    globals.add(code)
+    return name
+}
+
 function callbackTypePositions(kinds: List<Integer>, texts: List<Text>): List<Boolean> {
     let positions: List<Boolean> = []
     for kind in kinds { positions.add(false) }
@@ -35,6 +67,18 @@ function callbackTypePositions(kinds: List<Integer>, texts: List<Text>): List<Bo
                 cursor = cursor + 1
             }
         }
+        if kinds[position] == 1 && texts[position] == "Map" && position + 1 < kinds.length && texts[position + 1] == "<" {
+            let cursor = position + 1
+            let depth = 0
+            while cursor < kinds.length && kinds[cursor] != 0 {
+                positions[cursor] = true
+                if texts[cursor] == "<" { depth = depth + 1 }
+                if texts[cursor] == ">" { depth = depth - 1 }
+                if texts[cursor] == ">>" { depth = depth - 2 }
+                cursor = cursor + 1
+                if depth <= 0 { break }
+            }
+        }
         position = position + 1
     }
     return positions
@@ -53,7 +97,7 @@ function normalizeCallbackTokens(kinds: List<Integer>, texts: List<Text>, lines:
         let text = texts[position]
         let origin = sourcePath(outputLines, tokenPath(lines, position))
         if !typePositions[position] { depth = 0 }
-        if kinds[position] == 4 && text == "<" && position > 0 && typePositions[position] && (depth > 0 || texts[position - 1] == "List" || texts[position - 1] == "Callback") { depth = depth + 1 }
+        if kinds[position] == 4 && text == "<" && position > 0 && typePositions[position] && (depth > 0 || texts[position - 1] == "List" || texts[position - 1] == "Map" || texts[position - 1] == "Callback") { depth = depth + 1 }
         if kinds[position] == 4 && text == ">>" && depth >= 2 {
             copyModuleToken(outputKinds, outputTexts, outputLines, 4, ">", lines, position, origin)
             copyModuleToken(outputKinds, outputTexts, outputLines, 4, ">", lines, position, origin)
@@ -94,6 +138,8 @@ function callbackSignatureTypes(name: Text): List<Integer> {
     while position < name.length && name[position] != ':' { position = position + 1 }
     while position < name.length {
         position = position + 1
+        let negative = false
+        if position < name.length && name[position] == '-' { negative = true; position = position + 1 }
         let value = 0
         while position < name.length && name[position] != ':' {
             let digit = findCharacter("0123456789", name[position])
@@ -101,6 +147,7 @@ function callbackSignatureTypes(name: Text): List<Integer> {
             value = value * 10 + digit
             position = position + 1
         }
+        if negative { value = -value }
         types.add(value)
     }
     return types
@@ -305,7 +352,7 @@ function parseClosure(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
     let captured: List<Integer> = []
     let local = 0
     while local < state[3] {
-        if localTypes[local] > 0 && findLocal(localNames, localLengths, state, localNames[local]) == local && findText(parameters, localNames[local]) < 0 && callbackReadsName(tokenKinds, tokenTexts, state[0], end, localNames[local]) {
+        if (localTypes[local] > 0 || isContainerType(localTypes[local])) && findLocal(localNames, localLengths, state, localNames[local]) == local && findText(parameters, localNames[local]) < 0 && callbackReadsName(tokenKinds, tokenTexts, state[0], end, localNames[local]) {
             captured.add(local)
         }
         local = local + 1
@@ -408,6 +455,7 @@ function compileClosureBodies(tokenKinds: List<Integer>, tokenTexts: List<Text>,
         let prefix = "; minyar-closure-body: "
         let text = globals[marker]
         marker = marker + 1
+        if text == "; minyar-sort-callback-runtime: 1\n" { emitted = true }
         if text.length > prefix.length && text.slice(0, prefix.length) == prefix {
             emitted = true
             let start = 0
@@ -479,6 +527,19 @@ function compileClosureBodies(tokenKinds: List<Integer>, tokenTexts: List<Text>,
 }
 
 function finishCallbackGraph(returns: List<Integer>, counts: List<Integer>, fields: List<Integer>) {
+    // Capture/environment edges can be discovered after a Map store was
+    // lowered, including stores in functions declared before their callers.
+    let mutation = counts.length
+    while mutation + 1 < returns.length {
+        if returns[mutation] == -5 {
+            checkMapMutation(returns[mutation + 1], counts, fields)
+            mutation = mutation + 2
+        } else {
+            if returns[mutation] == -2 { mutation = mutation + 4 } else {
+                if returns[mutation] == -3 { mutation = mutation + 2 } else { mutation = mutation + 1 }
+            }
+        }
+    }
     let position = counts.length
     while position + 1 < returns.length {
         if returns[position] == -3 {

@@ -256,6 +256,31 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
                             let numberKind = 2
                             let hexValue = -1
                             let hexMinimum = false
+                            let octal = character == '0' && position == start + 1 && position < length && source[position] == 'o'
+                            if octal {
+                                position = position + 1
+                                if position >= length || source[position] < '0' || source[position] > '7' {
+                                    fail("line " + sourceLocation(tokenLine, tokenColumn) + ": an octal Integer literal needs only digits 0 through 7 after 0o")
+                                }
+                                hexValue = 0
+                                while position < length && source[position] >= '0' && source[position] <= '7' {
+                                    let digit = Integer(source[position]) - Integer('0')
+                                    if hexValue > (9223372036854775807 - digit) / 8 {
+                                        // As for decimal and hexadecimal, only
+                                        // unary minus may consume the 2^63 magnitude.
+                                        if hexValue == 1152921504606846976 && digit == 0 && (position + 1 == length || source[position + 1] < '0' || source[position + 1] > '7') {
+                                            hexMinimum = true
+                                        } else {
+                                            fail("line " + sourceLocation(tokenLine, tokenColumn) + ": Integer literal is outside the supported range")
+                                        }
+                                    }
+                                    if !hexMinimum { hexValue = hexValue * 8 + digit }
+                                    position = position + 1
+                                }
+                                if position < length && (characterIsLetter(source[position]) || characterIsDigit(source[position]) || source[position] == '_') {
+                                    fail("line " + sourceLocation(tokenLine, tokenColumn) + ": an octal Integer literal needs only digits 0 through 7 after 0o")
+                                }
+                            }
                             if character == '0' && position == start + 1 && position + 1 < length && source[position] == 'x' && characterIsHexDigit(source[position + 1]) {
                                 position = position + 1
                                 hexValue = 0
@@ -276,6 +301,7 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
                                 }
                             }
                             if hexValue >= 0 && position + 1 < length && source[position] == '.' && characterIsDigit(source[position + 1]) {
+                                if octal { fail("line " + sourceLocation(tokenLine, tokenColumn) + ": octal literals are Integers and cannot have a decimal point") }
                                 fail("line " + sourceLocation(tokenLine, tokenColumn) + ": hexadecimal literals are Integers and cannot have a decimal point")
                             }
                             // A Float needs digits on both sides of its point, so
@@ -300,6 +326,9 @@ function tokenize(source: Text, tokenKinds: List<Integer>, tokenTexts: List<Text
                                 }
                             }
                             let digits = source.slice(start, position)
+                            if numberKind == 2 && hexValue < 0 && character == '0' && position > start + 1 {
+                                fail("line " + sourceLocation(tokenLine, tokenColumn) + ": decimal Integer literals cannot have a leading zero; use 0o for octal")
+                            }
                             if hexValue >= 0 {
                                 if hexMinimum { digits = "9223372036854775808" } else { digits = Text(hexValue) }
                             }
@@ -774,6 +803,94 @@ function findCompiledSymbol(symbolNames: List<Text>, symbolKinds: List<Integer>,
     return -1
 }
 
+// Positive List IDs remain unchanged. Structural types use negative IDs with
+// a three-bit tag (0 List, otherwise the scalar Map key kind) and a zigzag
+// encoded child. Check BEFORE arithmetic so excessive nesting is diagnostic.
+function structuralType(tag: Integer, child: Integer): Integer {
+    if child > 576460752303423487 || child < -576460752303423487 {
+        fail("generic type nesting exceeds the supported limit")
+    }
+    let payload = child * 2
+    if child < 0 { payload = -child * 2 - 1 }
+    return -(payload * 8 + tag)
+}
+
+function makeListType(child: Integer): Integer {
+    if child < 0 { return structuralType(0, child) }
+    if child > 9223372036854675807 { fail("generic type nesting exceeds the supported limit") }
+    return 100000 + child
+}
+
+function structuralChild(type: Integer): Integer {
+    let payload = -type / 8
+    if payload % 2 == 0 { return payload / 2 }
+    return -(payload / 2) - 1
+}
+
+function isMapType(type: Integer): Boolean {
+    return type < -8 && (-type % 8) != 0
+}
+
+function mapKeyType(type: Integer): Integer { return -type % 8 }
+function mapValueType(type: Integer): Integer { return structuralChild(type) }
+function isContainerType(type: Integer): Boolean { return isListType(type) || isMapType(type) }
+function containerValueType(type: Integer): Integer {
+    if isMapType(type) { return mapValueType(type) }
+    return listElementType(type)
+}
+
+// Explicit frames keep deep List syntax stack safe and consume shared '>>'
+// tokens without mutating tokens used again by discovery/module frontends.
+function takeContainerType(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, cursor: List<Integer>, names: List<Text>, symbols: List<Integer>): Integer {
+    let frames: List<Integer> = []
+    let depth = 0
+    let closing = 0
+    let needType = true
+    let code = 0
+    while needType || depth > 0 {
+        if needType {
+            if closing != 0 { fail("expected a value type") }
+            let name = texts[cursor[0]]
+            if name == "List" || name == "Map" {
+                cursor[0] = cursor[0] + 1
+                expectToken(kinds, texts, lines, cursor, "<")
+                while frames.length < (depth + 1) * 3 { frames.add(0) }
+                frames[depth * 3] = 0
+                if name == "Map" { frames[depth * 3] = 1 }
+                frames[depth * 3 + 1] = 0
+                depth = depth + 1
+            } else {
+                code = takeValueType(kinds, texts, lines, cursor, names, symbols)
+                needType = false
+            }
+        } else {
+            let frame = (depth - 1) * 3
+            if frames[frame] == 1 && frames[frame + 1] == 0 {
+                if code != 1 && code != 2 && code != 3 && code != 4 && code != 7 {
+                    fail("Map keys must be Integer, Text, Character, Boolean, or Float")
+                }
+                frames[frame + 2] = code
+                frames[frame + 1] = 1
+                expectToken(kinds, texts, lines, cursor, ",")
+                needType = true
+            } else {
+                if closing > 0 { closing = closing - 1 } else {
+                    if tokenIs(kinds, texts, cursor, ">>") {
+                        cursor[0] = cursor[0] + 1
+                        closing = 1
+                    } else { expectToken(kinds, texts, lines, cursor, ">") }
+                }
+                if frames[frame] == 0 { code = makeListType(code) } else {
+                    code = structuralType(frames[frame + 2], code)
+                }
+                depth = depth - 1
+            }
+        }
+    }
+    if closing != 0 { fail("unexpected extra '>' after a generic type") }
+    return code
+}
+
 function takeType(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, cursor: List<Integer>, symbolNames: List<Text>, symbolKinds: List<Integer>): Integer {
     let name = tokenTexts[cursor[0]]
     if name == "Callback" && tokenTexts[cursor[0] + 1] == "<" {
@@ -805,24 +922,8 @@ function takeType(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines:
         exit(86)
     }
     let code = simpleTypeCode(name)
-    if name == "List" {
-        // Take every nested opener first: one '>>' token can close two Lists.
-        let depth = 0
-        while tokenKinds[cursor[0]] == 1 && tokenTexts[cursor[0]] == "List" {
-            cursor[0] = cursor[0] + 1
-            expectToken(tokenKinds, tokenTexts, tokenLines, cursor, "<")
-            depth = depth + 1
-        }
-        code = depth * 100000 + takeValueType(tokenKinds, tokenTexts, tokenLines, cursor, symbolNames, symbolKinds)
-        while depth > 0 {
-            if depth >= 2 && tokenIs(tokenKinds, tokenTexts, cursor, ">>") {
-                cursor[0] = cursor[0] + 1
-                depth = depth - 2
-            } else {
-                expectToken(tokenKinds, tokenTexts, tokenLines, cursor, ">")
-                depth = depth - 1
-            }
-        }
+    if name == "List" || name == "Map" {
+        code = takeContainerType(tokenKinds, tokenTexts, tokenLines, cursor, symbolNames, symbolKinds)
     } else {
         if code == 0 {
             let record = findSymbol(symbolNames, symbolKinds, name, 2)
@@ -985,8 +1086,8 @@ function addConstantSymbol(tokenTexts: List<Text>, tokenLines: SourceMap, start:
     symbolParameterCounts.add(0)
 }
 
-// A constant's value is one literal, optionally negated. Its type comes from
-// the literal and must match an optional annotation.
+// Literals retain their substitution path. Annotated expressions are evaluated
+// once at startup; a negative token position identifies their cached initializer.
 function takeConstant(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, cursor: List<Integer>, symbolNames: List<Text>, symbolKinds: List<Integer>, symbolLookup: List<Integer>, symbolReturnTypes: List<Integer>, symbolParameterCounts: List<Integer>) {
     expectToken(tokenKinds, tokenTexts, tokenLines, cursor, "constant")
     let name = tokenTexts[cursor[0]]
@@ -1017,7 +1118,13 @@ function takeConstant(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
         if kind == 1 && (tokenTexts[literal] == "true" || tokenTexts[literal] == "false") { type = 4 }
     }
     if type == 0 || (tokenKinds[literal + 1] != 6 && tokenKinds[literal + 1] != 0) {
-        fail(describeLocation(tokenLocation(tokenLines, location)) + ": a constant needs one literal value, such as 16, -2.5, \"text\", 'c', or true")
+        if declared == 0 {
+            fail(describeLocation(tokenLocation(tokenLines, location)) + ": a nonliteral constant needs a type annotation, such as constant TABLE: List<Integer> = makeTable()")
+        }
+        symbolReturnTypes[constant] = declared
+        symbolParameterCounts[constant] = -1 - valueStart
+        skipTopLevelStatement(tokenKinds, tokenTexts, cursor)
+        return
     }
     if declared != 0 && declared != type {
         fail(describeLocation(tokenLocation(tokenLines, location)) + ": the value for constant '" + readableDeclarationName(name) + "' is " + describeType(type) + ", not " + describeType(declared))
@@ -1099,7 +1206,8 @@ function discoverDeclarations(tokenKinds: List<Integer>, tokenTexts: List<Text>,
                 }
                 let functionName = tokenTexts[cursor[0]]
                 if isBuiltinName(readableDeclarationName(functionName)) {
-                    fail(describeLocation(tokenLocation(tokenLines, cursor[0])) + ": '" + readableDeclarationName(functionName) + "' is a built-in function; choose another name")
+                    let reserved = readableDeclarationName(functionName)
+                    fail(describeLocation(tokenLocation(tokenLines, cursor[0])) + ": function '" + reserved + "' uses a reserved built-in name; rename this function (for example, '" + reserved + "Local'); see docs/reserved-names.md")
                 }
                 symbolNames.add(functionName)
                 symbolKinds.add(1)
@@ -1337,7 +1445,7 @@ function readableDeclarationName(name: Text): Text {
 }
 
 function isListType(type: Integer): Boolean {
-    return type >= 100000
+    return type >= 100000 || (type < -8 && (-type % 8) == 0)
 }
 
 function isRecordType(type: Integer): Boolean {
@@ -1345,11 +1453,12 @@ function isRecordType(type: Integer): Boolean {
 }
 
 function listElementType(type: Integer): Integer {
+    if type < 0 { return structuralChild(type) }
     return type - 100000
 }
 
 function isReferenceType(type: Integer): Boolean {
-    return type == 2 || type == 8 || type >= 1000
+    return type == 2 || type == 8 || type >= 1000 || type < -8
 }
 
 function llvmType(type: Integer): Text {
@@ -1469,8 +1578,8 @@ function findRecordField(functionParameterCounts: List<Integer>, functionParamet
 // lookup index. Its tail caches proven-safe List types for this compilation.
 function checkListMutation(listType: Integer, counts: List<Integer>, fields: List<Integer>, returnTypes: List<Integer>) {
     let base = listElementType(listType)
-    while isListType(base) {
-        base = listElementType(base)
+    while isContainerType(base) {
+        base = containerValueType(base)
     }
     if !isRecordType(base) {
         return
@@ -1478,7 +1587,7 @@ function checkListMutation(listType: Integer, counts: List<Integer>, fields: Lis
     let recordCount = counts.length / 2
     let cached = recordCount * 2
     while cached < returnTypes.length {
-        if returnTypes[cached] == listType {
+        if listType >= 0 && returnTypes[cached] == listType {
             return
         }
         cached = cached + 1
@@ -1495,11 +1604,11 @@ function checkListMutation(listType: Integer, counts: List<Integer>, fields: Lis
     while index < pending.length {
         let type = pending[index]
         index = index + 1
-        while isListType(type) {
+        while isContainerType(type) {
             if type == listType {
                 exit(86)
             }
-            type = listElementType(type)
+            type = containerValueType(type)
         }
         if isRecordType(type) {
             let record = type - 1000
@@ -1514,7 +1623,7 @@ function checkListMutation(listType: Integer, counts: List<Integer>, fields: Lis
             }
         }
     }
-    returnTypes.add(listType)
+    if listType >= 0 { returnTypes.add(listType) }
 }
 
 function requireType(tokenLines: SourceMap, state: List<Integer>, actual: Integer, expected: Integer, explanation: Text) {
@@ -1812,6 +1921,7 @@ function describeType(type: Integer): Text {
     if type == 5 || type == 6 { return "Nothing" }
     if type == 7 { return "Float" }
     if type == 8 { return "Bytes" }
+    if isMapType(type) { return "Map<" + describeType(mapKeyType(type)) + ", " + describeType(mapValueType(type)) + ">" }
     if isListType(type) { return "List<" + describeType(listElementType(type)) + ">" }
     if isRecordType(type) { return "a record" }
     return "an unknown type"
@@ -1851,7 +1961,7 @@ function emitBinary(output: List<Text>, textState: List<Text>, state: List<Integ
         }
         fail(describeLocation(tokenLocation(locations, location)) + ": " + "the two sides of '" + operator + "' have different types (" + describeType(leftType) + " and " + describeType(rightType) + ")" + hint)
     }
-    if (operator == "==" || operator == "!=") && (isRecordType(leftType) || isListType(leftType) || leftType == 8) {
+    if (operator == "==" || operator == "!=") && (isRecordType(leftType) || isContainerType(leftType) || leftType == 8) {
         fail(describeLocation(tokenLocation(locations, location)) + ": " + "records, Lists, and Bytes do not yet support equality")
     }
     if isArithmeticOperator(operator) {
@@ -2574,6 +2684,176 @@ function indexWithoutCalls(tokenKinds: List<Integer>, tokenTexts: List<Text>, po
     return false
 }
 
+function sortRuntimeDeclarations(globals: List<Text>) {
+    let declaration = "declare void @minyar_list_sort(ptr, i64)\n" + "declare ptr @minyar_list_sorted(ptr, i64, i64)\n" + "declare void @minyar_list_sort_by(ptr, ptr, ptr, i64)\n" + "declare ptr @minyar_list_sorted_by(ptr, ptr, ptr, i64)\n"
+    let i = 0
+    while i < globals.length {
+        if globals[i] == declaration { return }
+        i = i + 1
+    }
+    globals.add(declaration)
+}
+
+function sortBorrowReference(output: List<Text>, state: List<Integer>, value: Text, type: Integer, counts: List<Integer>, fields: List<Integer>, returns: List<Integer>) {
+    borrowReference(output, state, value, type)
+}
+
+function sortComparatorThunk(names: List<Text>, type: Integer, element: Integer, globals: List<Text>): Text {
+    // Request the optional closure frontend before emitting any user output.
+    exit(86)
+    return ""
+}
+
+function appendTextRuntimeDeclaration(globals: List<Text>, name: Text, returnType: Integer, count: Integer) {
+    let declaration = "declare "
+    if returnType == 4 { declaration = declaration + "zeroext " }
+    declaration = declaration + llvmType(returnType) + " @" + name + "(ptr"
+    if count == 2 { declaration = declaration + ", ptr" }
+    declaration = declaration + ")\n"
+    let position = 0
+    while position < globals.length {
+        if globals[position] == declaration { return }
+        position = position + 1
+    }
+    globals.add(declaration)
+}
+
+function isTextBasicMethod(member: Text): Boolean {
+    return member == "find" || member == "split" || member == "startsWith" || member == "endsWith" || member == "trim"
+}
+
+function parseTextBasicMethod(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, receiver: Text, receiverType: Integer, member: Text, resultType: List<Integer>): Text {
+    let values: List<Text> = []
+    let types: List<Integer> = []
+    values.add(receiver)
+    types.add(receiverType)
+    let runtimeName = "minyar_list_clear"
+    let returnType = 5
+    if receiverType == 2 {
+        runtimeName = "minyar_text_trim"
+        returnType = 2
+        if member != "trim" {
+            let argumentType: List<Integer> = []
+            argumentType.add(0)
+            let argument = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, argumentType)
+            if argumentType[0] != 2 { fail("Text." + member + " expects one Text argument") }
+            values.add(argument)
+            types.add(2)
+            runtimeName = "minyar_text_find"
+            returnType = 1
+            if member == "split" {
+                runtimeName = "minyar_text_split"
+                returnType = 100002
+            }
+            if member == "startsWith" {
+                runtimeName = "minyar_text_starts_with"
+                returnType = 4
+            }
+            if member == "endsWith" {
+                runtimeName = "minyar_text_ends_with"
+                returnType = 4
+            }
+        }
+    }
+    expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
+    setType(resultType, returnType)
+    appendTextRuntimeDeclaration(globals, runtimeName, returnType, values.length)
+    return emitCall(output, textState, state, returnType, runtimeName, values, types)
+}
+
+function startsDeclaration(text: Text): Boolean {
+    return text.byteLength >= 8 && text[0] == 'd' && text.length >= 8 && text.slice(0, 8) == "declare "
+}
+
+function hasGlobalDeclarations(globals: List<Text>): Boolean {
+    let pieceIndex = 0
+    while pieceIndex < globals.length {
+        let piece = globals[pieceIndex]
+        if startsDeclaration(piece) { return true }
+        // Ordinary literal/table globals and definitions need no line scan.
+        if piece.byteLength > 0 && piece[0] != '@' && !(piece.byteLength >= 7 && piece[0] == 'd' && piece.slice(0, 7) == "define ") {
+        let position = 0
+        let scan = true
+        while position < piece.length && scan {
+            let end = position
+            while end < piece.length && piece[end] != '\n' { end = end + 1 }
+            let line = piece.slice(position, end)
+            if startsDeclaration(line) { return true }
+            if line.byteLength > 0 && line[0] != ';' { scan = false }
+            position = end + 1
+        }
+        }
+        pieceIndex = pieceIndex + 1
+    }
+    return false
+}
+
+// Feature globals can contain declaration blocks shared by several modules.
+// Keep exact complete declaration lines once, regardless of feature/API name.
+// Stop at the first definition: cached function bodies never need rescanning.
+function deduplicateGlobalDeclarations(code: Text, seen: List<Text>): Text {
+    let pieces: List<Text> = []
+    let position = 0
+    while position < code.length {
+        let end = position
+        while end < code.length && code[end] != '\n' { end = end + 1 }
+        if end < code.length { end = end + 1 }
+        let line = code.slice(position, end)
+        if line.length >= 7 && line.slice(0, 7) == "define " {
+            pieces.add(code.slice(position, code.length))
+            return joinText(pieces)
+        }
+        if startsDeclaration(line) {
+            if findText(seen, line) < 0 {
+                seen.add(line)
+                pieces.add(line)
+            }
+        } else { pieces.add(line) }
+        position = end
+    }
+    return joinText(pieces)
+}
+
+function declareMapRuntime(globals: List<Text>) {
+    let marker = "; minyar-maps: 1\n"
+    if findText(globals, marker) >= 0 { return }
+    globals.add(marker)
+    globals.add("declare ptr @minyar_map_new(i64, i64)\n")
+    globals.add("declare i64 @minyar_map_get(ptr, i64)\n")
+    globals.add("declare void @minyar_map_set(ptr, i64, i64)\n")
+    globals.add("declare zeroext i1 @minyar_map_has(ptr, i64)\n")
+    globals.add("declare zeroext i1 @minyar_map_remove(ptr, i64)\n")
+    globals.add("declare i64 @minyar_map_length(ptr)\n")
+    globals.add("declare void @minyar_map_clear(ptr)\n")
+}
+
+function parseMapMethod(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, receiver: Text, receiverType: Integer, member: Text, resultType: List<Integer>): Text {
+    declareMapRuntime(globals)
+    if member == "clear" {
+        expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
+        output.add("  call void @minyar_map_clear(ptr " + receiver + ")\n")
+        setType(resultType, 5)
+        return ""
+    }
+    if member != "has" && member != "remove" { fail("this Map has no method named '" + member + "'") }
+    let keyType: List<Integer> = []
+    keyType.add(mapKeyType(receiverType))
+    let key = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, keyType)
+    requireType(tokenLines, state, keyType[0], mapKeyType(receiverType), "Map key has the wrong type")
+    expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
+    let slot = valueAsListSlot(output, textState, state, key, keyType[0])
+    let value = valueName(textState, newTemporary(state))
+    output.add("  " + value + " = call zeroext i1 @minyar_map_" + member + "(ptr " + receiver + ", i64 " + slot + ")\n")
+    setType(resultType, 4)
+    return value
+}
+
+function readMapElement(output: List<Text>, textState: List<Text>, state: List<Integer>, map: Text, key: Text, type: Integer): Text {
+    let raw = valueName(textState, newTemporary(state))
+    output.add("  " + raw + " = call i64 @minyar_map_get(ptr " + map + ", i64 " + key + ")\n")
+    return slotAsValue(output, textState, state, raw, type)
+}
+
 function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
     let atom = state[0]
     let scalarValues = -1
@@ -2602,9 +2882,63 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
             state[0] = state[0] + 1
             if tokenIs(tokenKinds, tokenTexts, state, "(") {
                 state[0] = state[0] + 1
+                if member.byteLength >= 4 && isListType(receiverType) && member[0] == 's' && (member == "sort" || member == "sorted" || member == "sortBy" || member == "sortedBy") {
+                    sortRuntimeDeclarations(globals)
+                    // Root the selected receiver before evaluating arbitrary arguments.
+                    sortBorrowReference(output, state, receiver, receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+                    let element = listElementType(receiverType)
+                    let copying = member == "sorted" || member == "sortedBy"
+                    let by = member == "sortBy" || member == "sortedBy"
+                    let compare = ""
+                    let thunk = ""
+                    if by {
+                        let compareType: List<Integer> = []
+                        compareType.add(0)
+                        compare = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, compareType)
+                        thunk = sortComparatorThunk(functionNames, compareType[0], element, globals)
+                        sortBorrowReference(output, state, compare, compareType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes)
+                    } else {
+                        if element != 1 && element != 2 && element != 3 && element != 4 && element != 7 {
+                            fail("this List element type has no natural order; use sortBy or sortedBy with Callback<T, T, Integer>")
+                        }
+                    }
+                    expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
+                    value = ""
+                    let operation = "sort"
+                    if copying {
+                        operation = "sorted"
+                        value = valueName(textState, newTemporary(state))
+                    }
+                    if by { operation = operation + "_by" }
+                    output.add("  ")
+                    if copying { output.add(value + " = call ptr @minyar_list_") } else { output.add("call void @minyar_list_") }
+                    output.add(operation + "(ptr " + receiver)
+                    if by {
+                        output.add(", ptr " + compare + ", ptr " + thunk)
+                    } else {
+                        output.add(", i64 " + Text(element))
+                    }
+                    if by || copying {
+                        if isReferenceType(element) { output.add(", i64 1") } else { output.add(", i64 0") }
+                    }
+                    output.add(")\n")
+                    if copying {
+                        setType(resultType, receiverType)
+                        ownsResult = true
+                    } else {
+                        setType(resultType, 5)
+                    }
+                } else {
+                if isMapType(receiverType) {
+                    value = parseMapMethod(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, receiver, receiverType, member, resultType)
+                } else {
                 if receiverType == 8 {
                     value = parseBytesMethod(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, receiver, member, memberLocation, resultType)
                     ownsResult = resultType[0] == 8
+                } else {
+                if (receiverType == 2 && member != "slice" && isTextBasicMethod(member)) || (member.byteLength == 5 && member == "clear" && isListType(receiverType)) {
+                    value = parseTextBasicMethod(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, receiver, receiverType, member, resultType)
+                    ownsResult = isReferenceType(resultType[0])
                 } else {
                 let argumentType: List<Integer> = []
                 argumentType.add(0)
@@ -2696,6 +3030,9 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                     }
                 }
                 }
+                }
+                }
+                }
             } else {
                 if isRecordType(receiverType) {
                     let field = findRecordField(functionParameterCounts, functionParameterNames, receiverType, member)
@@ -2722,7 +3059,7 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                     value = slotAsValue(output, textState, state, raw, fieldType)
                     setType(resultType, fieldType)
                 } else {
-                    if receiverType != 2 && receiverType != 8 && !isListType(receiverType) {
+                    if receiverType != 2 && receiverType != 8 && !isContainerType(receiverType) {
                         fail("this value does not provide a field named '" + member + "'")
                     }
                     if member != "length" && !(receiverType == 2 && member == "byteLength") {
@@ -2730,6 +3067,10 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                     }
                     let temporary = newTemporary(state)
                     let operation = "list_length"
+                    if isMapType(receiverType) {
+                        declareMapRuntime(globals)
+                        operation = "map_length"
+                    }
                     if receiverType == 2 {
                         operation = "text_length"
                         if member == "byteLength" {
@@ -2760,8 +3101,16 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
             state[0] = state[0] + 1
             let positionType: List<Integer> = []
             positionType.add(0)
+            if isMapType(collectionType) { positionType[0] = mapKeyType(collectionType) }
             let position = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, positionType)
             expectToken(tokenKinds, tokenTexts, tokenLines, state, "]")
+            if isMapType(collectionType) {
+                declareMapRuntime(globals)
+                requireType(tokenLines, state, positionType[0], mapKeyType(collectionType), "Map key has the wrong type")
+                let slot = valueAsListSlot(output, textState, state, position, positionType[0])
+                value = readMapElement(output, textState, state, collection, slot, mapValueType(collectionType))
+                setType(resultType, mapValueType(collectionType))
+            } else {
             requireType(tokenLines, state, positionType[0], 1, "a position must be an Integer")
             let temporary = newTemporary(state)
             if collectionType == 2 {
@@ -2794,6 +3143,7 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                 value = slotAsValue(output, textState, state, raw, elementType)
                 setType(resultType, elementType)
                 }
+            }
             }
         }
         if ownsResult {
@@ -3339,7 +3689,7 @@ function parseListLiteral(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         }
     }
     expectToken(tokenKinds, tokenTexts, tokenLines, state, "]")
-    setType(resultType, 100000 + elementType)
+    setType(resultType, makeListType(elementType))
     return value
 }
 
@@ -3368,6 +3718,25 @@ function parseAtom(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
     }
 
     if kind == 1 {
+        if token == "Map" && (tokenTexts[tokenIndex + 1] == "<" || tokenTexts[tokenIndex + 1] == "(") {
+            declareMapRuntime(globals)
+            let type = resultType[0]
+            if tokenTexts[tokenIndex + 1] == "<" {
+                type = takeType(tokenKinds, tokenTexts, tokenLines, state, functionNames, symbolKinds)
+            } else { state[0] = tokenIndex + 1 }
+            if !isMapType(type) { fail("Map() needs a contextual Map<K, V> type") }
+            expectToken(tokenKinds, tokenTexts, tokenLines, state, "(")
+            expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
+            value = valueName(textState, newTemporary(state))
+            let references = "0"
+            if isReferenceType(mapValueType(type)) { references = "1" }
+            output.add("  " + value + " = call ptr @minyar_map_new(i64 " + Text(mapKeyType(type)) + ", i64 " + references + ")\n")
+            setType(resultType, type)
+            // Contextual Map() follows parsePrimary's ordinary call ownership;
+            // the explicit generic constructor needs its own producer token.
+            if tokenTexts[tokenIndex + 1] == "<" { ownResult(output, state, value, resultType) }
+            return value
+        }
         if token == "true" || token == "false" {
             value = token
             state[0] = tokenIndex + 1
@@ -3388,9 +3757,19 @@ function parseAtom(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                         }
                     }
                     if constant >= 0 {
-                        // Evaluate the declaration's literal in place of the name.
-                        state[0] = functionParameterCounts[constant]
-                        value = parseUnary(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
+                        if functionParameterCounts[constant] < 0 {
+                            let values: List<Text> = []
+                            let types: List<Integer> = []
+                            let type = functionReturnTypes[constant]
+                            value = emitCall(output, textState, state, type, constantIRName(token, "load"), values, types)
+                            state[14] = state[14] + 1
+                            setType(resultType, type)
+                            borrowReference(output, state, value, type)
+                        } else {
+                            // Literal constants still substitute at the use site.
+                            state[0] = functionParameterCounts[constant]
+                            value = parseUnary(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
+                        }
                         state[0] = tokenIndex + 1
                     } else {
                     state[0] = tokenIndex + 1
@@ -3507,7 +3886,7 @@ function isFloatFunction(name: Text): Boolean {
 }
 
 function isBuiltinName(name: Text): Boolean {
-    return isNumericBuiltin(name) || name == "parallelEntry" || name == "print" || name == "Text" || name == "fail" || name == "exit" || name == "joinText" || name == "argument" || name == "argumentCount" || name == "readTextFile" || name == "writeTextFile"
+    return isNumericBuiltin(name) || name == "parallelEntry" || name == "print" || name == "Text" || name == "Map" || name == "fail" || name == "exit" || name == "joinText" || name == "argument" || name == "argumentCount" || name == "readTextFile" || name == "writeTextFile"
 }
 
 function requireBuiltinArguments(name: Text, types: List<Integer>, count: Integer, type: Integer) {
@@ -3694,8 +4073,11 @@ function emitNumericBuiltin(output: List<Text>, textState: List<Text>, state: Li
         if types.length == 1 && types[0] == 3 {
             return emitInstruction(output, textState, state, "zext i32 " + values[0] + " to i64")
         }
+        if types.length == 1 && types[0] == 2 {
+            return emitCall(output, textState, state, 1, "minyar_text_integer", values, types)
+        }
         if types.length != 1 || types[0] != 7 {
-            fail("Integer expects one Integer, Float, or Character argument")
+            fail("Integer expects one Integer, Float, Character, or Text argument")
         }
         return emitCall(output, textState, state, 1, ".minyar.float.integer.checked", values, types)
     }
@@ -3748,7 +4130,7 @@ function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
         setType(argumentType, 0)
         // Only literals (possibly parenthesized) need an expected type here.
         // Resolve before parsing so a nested call cannot replace this context.
-        if tokenIs(tokenKinds, tokenTexts, state, "[") || tokenIs(tokenKinds, tokenTexts, state, "(") {
+        if tokenIs(tokenKinds, tokenTexts, state, "[") || tokenIs(tokenKinds, tokenTexts, state, "(") || (tokenIs(tokenKinds, tokenTexts, state, "Map") && tokenTexts[state[0] + 1] == "(") {
             let contextFunction = findFunction(functionNames, symbolKinds, functionReturnTypes, name)
             if contextFunction >= 0 && argumentValues.length < functionParameterCounts[contextFunction] {
                 let first = functionParameterOffset(functionParameterCounts, contextFunction)
@@ -3896,6 +4278,9 @@ function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                             } else {
                                 if isNumericBuiltin(name) {
                                     value = emitNumericBuiltin(output, textState, state, name, argumentValues, argumentTypes, resultType)
+                                    if name == "Integer" && argumentTypes.length == 1 && argumentTypes[0] == 2 {
+                                        appendTextRuntimeDeclaration(globals, "minyar_text_integer", 1, 1)
+                                    }
                                 } else {
                                     let functionIndex = state[5]
                                     if functionIndex < 0 || functionNames[functionIndex] != name {
@@ -4058,6 +4443,39 @@ function readListElement(output: List<Text>, textState: List<Text>, state: List<
     return slotAsValue(output, textState, state, raw, type)
 }
 
+// Maps deliberately stay outside traced cycles in this first ABI. Their
+// values may themselves be traced graphs; only a path back to THIS Map type
+// is forbidden. Runtime bucket stores still use traced-aware retention.
+function checkMapMutation(mapType: Integer, counts: List<Integer>, fields: List<Integer>) {
+    let visited: List<Boolean> = []
+    let index = 0
+    while index < counts.length / 2 {
+        visited.add(false)
+        index = index + 1
+    }
+    let pending: List<Integer> = []
+    pending.add(mapValueType(mapType))
+    index = 0
+    while index < pending.length {
+        let type = pending[index]
+        index = index + 1
+        while isContainerType(type) {
+            if type == mapType { fail("Map mutation could create a reference cycle") }
+            type = containerValueType(type)
+        }
+        if isRecordType(type) && !visited[type - 1000] {
+            let record = type - 1000
+            visited[record] = true
+            let first = functionParameterOffset(counts, record)
+            let field = 0
+            while field < counts[record] {
+                pending.add(fields[first + field])
+                field = field + 1
+            }
+        }
+    }
+}
+
 // Adding an edge R -> F can close a first cycle only when a value reachable
 // from F can itself be an R. Mirror checkListMutation for record fields.
 function checkFieldMutation(recordType: Integer, fieldType: Integer, counts: List<Integer>, fields: List<Integer>, locations: SourceMap, location: Integer) {
@@ -4074,8 +4492,8 @@ function checkFieldMutation(recordType: Integer, fieldType: Integer, counts: Lis
     while index < pending.length {
         let type = pending[index]
         index = index + 1
-        while isListType(type) {
-            type = listElementType(type)
+        while isContainerType(type) {
+            type = containerValueType(type)
         }
         if isRecordType(type) {
             if type == recordType {
@@ -4109,7 +4527,7 @@ function assignedValue(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     return emitBinary(output, textState, state, binary, current, type, -1, right, rightType[0], valueType, tokenLines, location)
 }
 
-// Assign through a local, record fields, and List positions. Plain `local = v`
+// Assign through a local or constant receiver, record fields, and List positions. Plain `local = v`
 // keeps its dedicated path in compileStatement for Text append ownership.
 function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, operatorPosition: Integer) {
     let operator = tokenTexts[operatorPosition]
@@ -4121,12 +4539,27 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
     let start = state[0]
     let name = tokenTexts[start]
     let local = findLocal(localNames, localLengths, state, name)
-    if local < 0 {
-        fail(describeLocation(tokenLocation(tokenLines, state[0])) + ": I can't find a value named '" + name + "'")
+    let receiverType = 0
+    let receiver = ""
+    if local >= 0 {
+        receiverType = localTypes[local]
+        receiver = loadLocal(output, textState, state, localIds[local], receiverType)
+        state[0] = state[0] + 1
+    } else {
+        let constant = findCompiledSymbol(functionNames, symbolKinds, functionReturnTypes, name, 3)
+        if constant < 0 {
+            fail(describeLocation(tokenLocation(tokenLines, start)) + ": I can't find a value named '" + readableDeclarationName(name) + "'")
+        }
+        if start + 1 == operatorPosition {
+            fail(describeLocation(tokenLocation(tokenLines, start)) + ": constant '" + readableDeclarationName(name) + "' cannot be reassigned")
+        }
+        // Cached getter reads borrow their managed root for the statement,
+        // including when an index or right-hand call replaces nested owners.
+        let type: List<Integer> = []
+        type.add(0)
+        receiver = parseAtom(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, type)
+        receiverType = type[0]
     }
-    let receiverType = localTypes[local]
-    let receiver = loadLocal(output, textState, state, localIds[local], receiverType)
-    state[0] = state[0] + 1
     let valueType: List<Integer> = []
     valueType.add(0)
     if state[0] == operatorPosition {
@@ -4239,19 +4672,39 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
             state[0] = state[0] + 1
             let positionType: List<Integer> = []
             positionType.add(0)
+            if isMapType(receiverType) { positionType[0] = mapKeyType(receiverType) }
             let position = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, positionType)
             expectToken(tokenKinds, tokenTexts, tokenLines, state, "]")
-            requireType(tokenLines, state, positionType[0], 1, "a position must be an Integer")
-            if !isListType(receiverType) && receiverType != 8 {
+            if isMapType(receiverType) {
+                declareMapRuntime(globals)
+                requireType(tokenLines, state, positionType[0], mapKeyType(receiverType), "Map key has the wrong type")
+                if mapKeyType(receiverType) == 2 { borrowReference(output, state, position, 2) }
+                position = valueAsListSlot(output, textState, state, position, positionType[0])
+            } else { requireType(tokenLines, state, positionType[0], 1, "a position must be an Integer") }
+            if !isContainerType(receiverType) && receiverType != 8 {
                 fail(describeLocation(tokenLocation(tokenLines, bracketLocation)) + ": indexed assignment needs a List or Bytes, not " + describeType(receiverType))
             }
             let elementType = 1
             if isListType(receiverType) {
                 elementType = listElementType(receiverType)
             }
+            if isMapType(receiverType) { elementType = mapValueType(receiverType) }
             if state[0] == operatorPosition {
                 state[0] = operatorPosition + 1
                 let current = ""
+                if isMapType(receiverType) {
+                    checkMapMutation(receiverType, functionParameterCounts, functionParameterTypes)
+                    // A key borrowed from a Map value can be invalidated by
+                    // the right side. Keep it before evaluating that side.
+                    if binary != "" {
+                        current = readMapElement(output, textState, state, receiver, position, elementType)
+                        borrowReference(output, state, current, elementType)
+                    }
+                    let value = assignedValue(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, binary, current, elementType, valueType, operatorLocation)
+                    requireType(tokenLines, state, valueType[0], elementType, "Map value has the wrong type")
+                    let slot = valueAsListSlot(output, textState, state, value, elementType)
+                    output.add("  call void @minyar_map_set(ptr " + receiver + ", i64 " + position + ", i64 " + slot + ")\n")
+                } else {
                 if receiverType == 8 {
                     if binary != "" {
                         current = emitBytesRead(output, textState, state, receiver, position)
@@ -4292,12 +4745,15 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
                     output.add(slot)
                     output.add(")\n")
                 }
+                }
                 done = true
             } else {
                 if receiverType == 8 {
                     fail(describeLocation(tokenLocation(tokenLines, bracketLocation)) + ": a byte has no fields or positions to assign")
                 }
-                receiver = readListElement(output, textState, state, receiver, position, elementType)
+                if isMapType(receiverType) { receiver = readMapElement(output, textState, state, receiver, position, elementType) } else {
+                    receiver = readListElement(output, textState, state, receiver, position, elementType)
+                }
                 receiverType = elementType
                 borrowReference(output, state, receiver, receiverType)
             }
@@ -5167,6 +5623,9 @@ function compileAtomicStatement(tokenKinds: List<Integer>, tokenTexts: List<Text
                 output.add(value)
                 output.add(")\n")
             }
+            if textState[1] == "main" {
+                emitModuleConstantCleanup(output, symbolKinds, functionParameterCounts)
+            }
             output.add("  call void @minyar_rc_leave()\n")
             output.add("  call void @minyar_stack_leave()\n")
             if textState[1] == "main" {
@@ -5201,6 +5660,9 @@ function compileAtomicStatement(tokenKinds: List<Integer>, tokenTexts: List<Text
                         let name = tokenTexts[state[0]]
                         let local = findLocal(localNames, localLengths, state, name)
                         if local < 0 {
+                            if findCompiledSymbol(functionNames, symbolKinds, functionReturnTypes, name, 3) >= 0 {
+                                fail(describeLocation(tokenLocation(tokenLines, state[0])) + ": constant '" + readableDeclarationName(name) + "' cannot be reassigned")
+                            }
                             fail("I can't find a value named '" + name + "'")
                         }
                         state[0] = state[0] + 2
@@ -5424,6 +5886,7 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         output.add("")
         if name == "main" {
             output.add("  call void @minyar_initialize_arguments(i32 %minyar.argument.count, ptr %minyar.argument.values)\n")
+            if hasModuleConstants(symbolKinds, functionParameterCounts) { output.add("  call void @.minyar.constants.initialize()\n") }
         }
         let parameter = 0
         while parameter < parameterNames.length {
@@ -5451,6 +5914,7 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         let bodySlot = output.length
         let returns = compileBlock(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
         if !returns {
+            if name == "main" { emitModuleConstantCleanup(output, symbolKinds, functionParameterCounts) }
             output.add("  call void @minyar_rc_leave()\n")
             output.add("  call void @minyar_stack_leave()\n")
             if name == "main" {
@@ -5521,6 +5985,129 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
     return hasNative
 }
 
+function constantIRName(name: Text, suffix: Text): Text {
+    return "\"minyar.constant|" + escapeLLVMText(name) + "|" + suffix + "\""
+}
+
+function hasModuleConstants(kinds: List<Integer>, counts: List<Integer>): Boolean {
+    let symbol = 0
+    while symbol < kinds.length {
+        if kinds[symbol] == 3 && counts[symbol] < 0 { return true }
+        symbol = symbol + 1
+    }
+    return false
+}
+
+function emitModuleConstantCleanup(output: List<Text>, kinds: List<Integer>, counts: List<Integer>) {
+    if hasModuleConstants(kinds, counts) { output.add("  call void @.minyar.constants.release()\n") }
+}
+
+function compileModuleConstants(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, output: List<Text>, globals: List<Text>) {
+    if !hasModuleConstants(symbolKinds, functionParameterCounts) { return }
+    output.add("declare void @minyar_rc_release(ptr)\n")
+    output.add("declare void @minyar_constant_initialization_fail() cold noreturn\n")
+    let symbol = 0
+    while symbol < symbolKinds.length {
+        if symbolKinds[symbol] == 3 && functionParameterCounts[symbol] < 0 {
+            let name = functionNames[symbol]
+            let type = functionReturnTypes[symbol]
+            let cell = "@" + constantIRName(name, "value")
+            let flag = "@" + constantIRName(name, "state")
+            globals.add(cell + " = internal global " + llvmType(type) + " zeroinitializer\n")
+            globals.add(flag + " = internal global i8 0\n")
+            let effect = "scalar"
+            if isReferenceType(type) { effect = "managed" }
+            globals.add("; minyar-module-constant: " + escapeLLVMText(name) + "|" + effect + "\n")
+            let emittedType = llvmType(type)
+            if type == 4 { emittedType = "zeroext " + emittedType }
+            output.add("define internal " + emittedType + " @" + constantIRName(name, "load") + "() {\nentry:\n")
+            output.add("  %constant.state = load i8, ptr " + flag + "\n")
+            output.add("  %constant.ready = icmp eq i8 %constant.state, 2\n")
+            output.add("  br i1 %constant.ready, label %ready, label %check\ncheck:\n")
+            output.add("  %constant.busy = icmp eq i8 %constant.state, 1\n")
+            output.add("  br i1 %constant.busy, label %recursive, label %initialize\nrecursive:\n")
+            output.add("  call void @minyar_constant_initialization_fail()\n  unreachable\ninitialize:\n")
+            output.add("  store i8 1, ptr " + flag + "\n")
+            // Only the initialization path owns a frame. Cached reads are loads.
+            let entrySlot = output.length
+            output.add("")
+            let state: List<Integer> = []
+            state.add(-1 - functionParameterCounts[symbol])
+            state.add(0)
+            state.add(0)
+            state.add(0)
+            state.add(0)
+            state.add(-1)
+            state.add(0)
+            state.add(0)
+            state.add(0)
+            state.add(1)
+            state.add(-1)
+            state.add(0)
+            state.add(-1)
+            state.add(0)
+            state.add(0)
+            let textState: List<Text> = []
+            textState.add("initialize")
+            textState.add("constant " + name)
+            let localNames: List<Text> = []
+            let localTypes: List<Integer> = []
+            let localIds: List<Integer> = []
+            let localLengths: List<Integer> = []
+            let valueType: List<Integer> = []
+            valueType.add(type)
+            let value = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, valueType)
+            if valueType[0] != type {
+                fail(describeLocation(tokenLocation(tokenLines, -1 - functionParameterCounts[symbol])) + ": the initializer for constant '" + readableDeclarationName(name) + "' has the wrong type")
+            }
+            if tokenKinds[state[0]] != 6 && tokenKinds[state[0]] != 0 {
+                fail(describeLocation(tokenLocation(tokenLines, state[0])) + ": expected the end of the constant initializer")
+            }
+            if isReferenceType(type) { output.add("  call void @minyar_rc_retain(ptr " + value + ")\n") }
+            output.add("  store " + llvmType(type) + " " + value + ", ptr " + cell + "\n")
+            output.add("  store i8 2, ptr " + flag + "\n")
+            // Frame elision matches individual pieces, as in normal functions.
+            output.add("  call void @minyar_rc_leave()\n")
+            output.add("  call void @minyar_stack_leave()\n")
+            output.add("  br label %ready\nready:\n")
+            output.add("  %constant.value = load " + llvmType(type) + ", ptr " + cell + "\n")
+            output.add("  ret " + llvmType(type) + " %constant.value\n")
+            finishFunctionEntry(output, entrySlot, state[4], 0, state[8], state[6] == 1)
+            output.add("}\n\n")
+        }
+        symbol = symbol + 1
+    }
+    output.add("define internal void @.minyar.constants.initialize() {\nentry:\n")
+    symbol = 0
+    while symbol < symbolKinds.length {
+        if symbolKinds[symbol] == 3 && functionParameterCounts[symbol] < 0 {
+            let emittedType = llvmType(functionReturnTypes[symbol])
+            if functionReturnTypes[symbol] == 4 { emittedType = "zeroext " + emittedType }
+            output.add("  call " + emittedType + " @" + constantIRName(functionNames[symbol], "load") + "()\n")
+        }
+        symbol = symbol + 1
+    }
+    output.add("  ret void\n}\n\n")
+    output.add("define internal void @.minyar.constants.release() {\nentry:\n")
+    let releasesRoots = false
+    symbol = 0
+    while symbol < symbolKinds.length {
+        if symbolKinds[symbol] == 3 && functionParameterCounts[symbol] < 0 && isReferenceType(functionReturnTypes[symbol]) {
+            let cell = "@" + constantIRName(functionNames[symbol], "value")
+            output.add("  %constant." + Text(symbol) + " = load ptr, ptr " + cell + "\n")
+            output.add("  store ptr null, ptr " + cell + "\n")
+            output.add("  call void @minyar_rc_release(ptr %constant." + Text(symbol) + ")\n")
+            releasesRoots = true
+        }
+        symbol = symbol + 1
+    }
+    // An unused managed constant can outlive a scalar-only main whose frame
+    // was elided. The existing null release drains eager cycle work; bounded
+    // profiles keep their existing service budget and normal-return contract.
+    if releasesRoots { output.add("  call void @minyar_rc_release(ptr null)\n") }
+    output.add("  ret void\n}\n\n")
+}
+
 function compileTopLevel(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, output: List<Text>, globals: List<Text>) {
     let state: List<Integer> = []
     state.add(0)
@@ -5550,6 +6137,7 @@ function compileTopLevel(tokenKinds: List<Integer>, tokenTexts: List<Text>, toke
     let entrySlot = output.length
     output.add("")
     output.add("  call void @minyar_initialize_arguments(i32 %minyar.argument.count, ptr %minyar.argument.values)\n")
+    if hasModuleConstants(symbolKinds, functionParameterCounts) { output.add("  call void @.minyar.constants.initialize()\n") }
 
     skipTerminators(tokenKinds, state)
     let terminated = false
@@ -5572,6 +6160,7 @@ function compileTopLevel(tokenKinds: List<Integer>, tokenTexts: List<Text>, toke
         skipTerminators(tokenKinds, state)
     }
     if !terminated {
+        emitModuleConstantCleanup(output, symbolKinds, functionParameterCounts)
         output.add("  call void @minyar_rc_leave()\n")
         output.add("  call void @minyar_stack_leave()\n")
         output.add("  ret i32 0\n")
@@ -5797,6 +6386,7 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     if topLevelStatements && mainFunction >= 0 {
         fail(describeLocation(symbolLocations[mainFunction]) + ": a program cannot combine top-level statements with function main()")
     }
+    compileModuleConstants(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, output, globals)
     let hasNative = compileFunctions(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, output, globals, stackOwnerLimit)
     if mainFunction < 0 {
         compileTopLevel(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, output, globals)
@@ -5811,7 +6401,20 @@ function compileTokens(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     // are any, come first as one piece.
     if globals.length == 0 { return output }
     let pieces: List<Text> = []
-    pieces.add(joinText(globals))
+    let globalCode = joinText(globals)
+    if hasGlobalDeclarations(globals) {
+        let declarations: List<Text> = []
+        let declarationPiece = 0
+        while declarationPiece < output.length {
+            let piece = output[declarationPiece]
+            if startsDeclaration(piece) && piece[piece.length - 1] == '\n' {
+                deduplicateGlobalDeclarations(piece, declarations)
+            }
+            declarationPiece = declarationPiece + 1
+        }
+        globalCode = deduplicateGlobalDeclarations(globalCode, declarations)
+    }
+    pieces.add(globalCode)
     pieces.add(joinText(output))
     return pieces
 }
@@ -6239,11 +6842,15 @@ function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integ
                         functionHeader = true
                     }
                 } else {
-                    if kind == 1 && token == "let" {
+                    if kind == 1 && (token == "let" || token == "constant") {
                         letDeclaration = true
                     }
                 }
 
+                if kind == 1 && token == "Map" && tokenTexts[position + 1] == "<" && !typeMode {
+                    typeMode = true
+                    genericDepth = 0
+                }
                 if kind == 4 && token == ":" && (declarationMode == 1 || functionHeader || letDeclaration) {
                     typeMode = true
                     genericDepth = 0
@@ -6323,7 +6930,7 @@ function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integ
                     }
                     copyModuleToken(outputKinds, outputTexts, outputLines, kind, rewritten, tokenLines, position, origin)
 
-                    if typeMode && kind == 1 && token != "List" && genericDepth == 0 {
+                    if typeMode && kind == 1 && token != "List" && token != "Map" && genericDepth == 0 {
                         typeMode = false
                     }
                     if kind == 4 && token == "<" && typeMode {

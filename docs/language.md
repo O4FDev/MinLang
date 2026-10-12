@@ -21,7 +21,9 @@ List positions, with the same type rules as the operator itself.
 Arithmetic overflow and division by zero stop the program with an error.
 Integer literals outside this range are rejected.
 The minimum value is spelled `-9223372036854775808`. Hexadecimal literals such
-as `0xFF` are also Integers.
+as `0xFF` and octal literals such as `0o755` are also Integers. Decimal Integer
+literals cannot have a leading zero: `0755` is a compile error, so file modes
+cannot silently become decimal. Use `0o755` (493) or plain decimal `493`.
 
 `Float` is an IEEE 754 double-precision number. A Float literal has digits on
 both sides of its point, with an optional exponent: `1.0`, `0.25`, `6.02e23`.
@@ -64,6 +66,9 @@ included.
 
 ## Constants
 
+Function declarations cannot use a [reserved built-in name](reserved-names.md).
+The compiler identifies the colliding name and suggests a rename.
+
 `constant` declares a named literal value that every function in the module
 can use. It is a declaration, like a function or record, and `public` exports
 it from a module:
@@ -74,8 +79,23 @@ constant GRAVITY: Float = -9.81
 constant TITLE = "Minyarcraft"
 ```
 
-The value must be one literal, optionally negated: an Integer, Float, Text,
-Character or Boolean. An annotation, if present, must match its type.
+A literal value may omit its type annotation: an Integer, Float, Text,
+Character or Boolean, optionally negated. Other expressions need an annotation:
+
+```minyar
+constant MODES: List<Integer> = [0o644, 0o755]
+constant CRC_TABLE: List<Integer> = makeTable()
+```
+
+Annotated nonliteral initializers run once before `main()` or the entry module's
+top-level statements, including declarations in imported modules. Repeated and
+diamond imports share the same module table. An initializer may depend on another
+constant; recursively initializing a constant stops with a clear error. Literal
+constants retain their direct substitution behavior.
+
+The binding cannot be reassigned. A List, Bytes or record value retains its usual
+mutable alias semantics; initialize lookup tables once and share them within the
+owning domain. Normal return from the executable entry releases the module roots.
 
 ## Loops
 
@@ -169,6 +189,39 @@ A List is a reference value: aliases observe the same additions and indexed
 replacements, including those performed by functions. Mutations that could
 create an ownership cycle are rejected, as described below. Reading or writing
 outside a List's bounds stops with a clear error.
+
+`list.sort()` stably orders its elements in place and returns `Nothing`;
+aliases observe the same List. `list.sorted()` returns a fresh shallow copy.
+Natural order supports Integer, Character (code point), Boolean (`false`
+before `true`), Float, and Text (lexicographic unsigned UTF8 bytes). Float
+NaNs come last and compare equal to one another; signed zeros compare equal.
+Equal elements keep their original order. Text sorting does not build its
+lazy character-offset cache.
+
+`list.sortBy(compare)` and `list.sortedBy(compare)` take a
+`Callback<T, T, Integer>`. Its signed three-way result is negative when the
+first element comes earlier, zero when equal, and positive when later:
+
+```minyar
+let values = [3, 1, 2]
+values.sortBy(function(a: Integer, b: Integer): Integer { return a - b })
+```
+
+The callback sees the original slot order throughout comparison. Changes to
+separate captured state and element record fields are allowed. If the List's
+length or slots differ from their original snapshot after comparison, the
+program stops with `the List was mutated during its sort comparator.` before
+publishing any sorted slots. Callback side effects are retained. A transient
+mutation restored exactly before that check is not reported. Rebinding a
+variable or field holding the receiver or comparator keeps the selected
+objects alive for the sort.
+
+All four methods use O(n log n) comparisons and O(n) extra space. Natural
+sorting needs at most ceil(n/2) scratch slots; comparator sorting retains n
+original slots and uses n indices plus ceil(n/2) scratch indices. A copied
+result adds its own List storage. Comparator results should define a
+consistent ordering; subtraction can overflow for distant Integer values,
+so comparisons returning -1, 0, or 1 are safer for general Integers.
 
 `Bytes` holds packed binary data, such as file contents, compact tables or
 vertex data. `Bytes(length)` makes zero-filled Bytes and `Bytes()` makes empty

@@ -221,6 +221,10 @@ static MINYAR_COLD MINYAR_NORETURN void minyar_stop(const char *message) {
     exit(1);
 }
 
+MINYAR_COLD MINYAR_NORETURN void minyar_constant_initialization_fail(void) {
+    minyar_stop("module constant initialization is recursive.");
+}
+
 static MINYAR_COLD MINYAR_NORETURN void out_of_memory(void) {
     minyar_stop("the computer ran out of memory.");
 }
@@ -376,6 +380,7 @@ MINYAR_HOT unsigned char *new_bytes(long long length) {
 }
 
 #include "minyar_collections.h"
+#include "minyar_sort.h"
 
 static MinyarText *copy_c_text(const char *source) {
     size_t length = strlen(source);
@@ -937,6 +942,8 @@ MinyarText *minyar_text_slice(MinyarText *text, long long start, long long end) 
 #endif
 }
 
+#include "minyar_text.h"
+
 static MINYAR_COLD MinyarText *format_integer_text(long long integer) {
     char buffer[32];
     char *end = buffer + sizeof(buffer);
@@ -1234,6 +1241,7 @@ void minyar_write_text_parts(const MinyarText *path_text, const MinyarList *part
     finish_text_file(file, written);
 }
 
+#include "minyar_maps.h"
 #include "minyar_numbers.h"
 
 #include "minyar_bytes.h"
