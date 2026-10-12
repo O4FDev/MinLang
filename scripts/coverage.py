@@ -22,7 +22,9 @@ COMPILER_SUITES = ("diagnostics", "conformance", "regressions", "feature-dispatc
                    "checked-arithmetic", "checked-scalars", "readonly-parameters",
                    "statement-nesting",
                    "peer-research-semantics", "peer-research-reachability",
-                   "peer-memory-nim-koka-lean", "peer-memory-nim-koka-followups")
+                   "peer-memory-nim-koka-lean", "peer-memory-nim-koka-followups",
+                   "maps", "list-sort", "text-basics", "text-basics-errors", "collections-integration",
+                   "module-constants", "octal-literals", "reserved-names", "checked-results")
 
 
 def find_tool(environment: str, name: str) -> str:
@@ -98,6 +100,62 @@ def instrument_compiler_ir(source: Path, destination: Path, *, clang: str, opt: 
         return
     run([clang, "-O0", "-S", "-emit-llvm", "-fsanitize-coverage=trace-pc-guard",
          "-Wno-override-module", str(source), "-o", str(destination)], env=env)
+
+
+def run_expecting(command: list[str], *, env: dict[str, str], returncode: int, stdout: str = "",
+                  stderr: str = "") -> None:
+    result = subprocess.run(command, cwd=ROOT, env=env, text=True, capture_output=True, timeout=180)
+    if (result.returncode, result.stdout, result.stderr) != (returncode, stdout, stderr):
+        raise RuntimeError(f"unexpected result from {' '.join(command)}: "
+                           f"{result.returncode}\n{result.stdout}{result.stderr}")
+
+
+def build_runtime_harness(source: str, destination: Path, *, clang: str, definitions: list[str],
+                          link_flags: list[str], env: dict[str, str]) -> Path:
+    run([clang, "-O0", "-g", "-fprofile-instr-generate", "-fcoverage-mapping", *definitions,
+         str(ROOT / "tests" / source), *link_flags, "-o", str(destination)], env=env)
+    return destination
+
+
+def run_feature_harnesses(run_dir: Path, *, clang: str, link_flags: list[str],
+                          env: dict[str, str]) -> list[Path]:
+    """Exercise Map, Text, sort and call-depth runtime contracts with their own oracles."""
+    def build(source: str, name: str, *definitions: str) -> Path:
+        return build_runtime_harness(source, run_dir / f"{name}-profile", clang=clang,
+                                     definitions=list(definitions), link_flags=link_flags, env=env)
+
+    maps = build("map-runtime.c", "runtime-maps")
+    if not run([str(maps)], env=env).stdout.startswith("map runtime: "):
+        raise RuntimeError("map runtime harness did not report its contracts")
+    run_expecting([str(maps), "missing"], env=env, returncode=1,
+                  stderr="Minyar stopped: Map key is absent.\n")
+
+    text = build("text-basics.c", "runtime-text")
+    spec = importlib.util.spec_from_file_location("text_basics_model", ROOT / "tests/text-basics-model.py")
+    text_model = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(text_model)
+    text_model.check(text, env)
+
+    sort = build("list-sort-runtime.c", "runtime-sort")
+    run_expecting([str(sort)], env=env, returncode=0,
+                  stdout="natural-models-alias-copy-float-text-comparator-stability-ok\n")
+    for mutation in ("set", "add"):
+        run_expecting([str(sort), mutation], env=env, returncode=1,
+                      stderr="Minyar stopped: the List was mutated during its sort comparator.\n")
+
+    depth = build("calldepth-runtime.c", "runtime-calldepth", "-DMINYAR_FALLBACK_CALL_DEPTH=16")
+    run([str(depth)], env=env)
+    harnesses = [maps, text, sort, depth]
+    for name, definitions, controls in (
+            ("global", ["-DMINYAR_MAX_CALL_DEPTH=2"], ("global", "bounded", "physical", "escape")),
+            ("fallback", ["-DMINYAR_MAX_CALL_DEPTH=1000", "-DMINYAR_FALLBACK_CALL_DEPTH=16"], ("fallback",))):
+        executable = build("calldepth-reporting.c", f"runtime-calldepth-reporting-{name}", *definitions)
+        for control in controls:
+            run_expecting([str(executable), control], env=env, returncode=0,
+                          stdout="escaped pending status 2\n" if control == "escape" else
+                          "nested failure; success; alive\n")
+        harnesses.append(executable)
+    return harnesses
 
 
 def compiler_edge_coverage(directory: Path) -> dict:
@@ -245,6 +303,9 @@ def main() -> int:
     numeric_result = run([str(runtime_numeric)], env=env, input=numeric_input)
     numeric_oracle.verify_output(numeric_bits, numeric_result.stdout, numeric_golden)
     (run_dir / "numeric.stdout").write_text(numeric_result.stdout)
+    thread_flags = [] if os.name == "nt" else ["-pthread"]
+    feature_harnesses = run_feature_harnesses(run_dir, clang=clang, link_flags=[*math_flags, *thread_flags],
+                                              env=env)
 
     compiler_reports = {}
     self_outputs = []
@@ -284,6 +345,7 @@ def main() -> int:
             str(runtime_unit),
             f"-object={runtime_bytes}",
             f"-object={runtime_numeric}",
+            *(f"-object={harness}" for harness in feature_harnesses),
             f"-instr-profile={merged}",
         ],
         env=env,
