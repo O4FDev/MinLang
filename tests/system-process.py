@@ -29,6 +29,7 @@ with tempfile.TemporaryDirectory(prefix='minyar-system-process-') as directory:
     fixture = [native_path(target), 'contracts', native_path(unicode)]
     if options.root:
         if windows_host(): parser.error('--root requires POSIX')
+        fixture[1] = 'root-contracts'
         fixture = ['sudo', '-n', 'timeout', '20', *fixture]
     run = subprocess.run(fixture, env=env, capture_output=True, timeout=25)
     assert run.returncode == 0, (run.returncode, run.stdout, run.stderr)

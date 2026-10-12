@@ -45,6 +45,9 @@ static long long launch(const char *path, const char **args, size_t argc, const 
     test_release(a); test_release(e); return handle;
 }
 static void exited(long long handle, long long exit_code) {
+    static unsigned ordinal;
+    ordinal++;
+    if (handle <= 0) fprintf(stderr, "launch %u failed with %lld\n", ordinal, handle);
     assert(handle > 0 && minyar_system_childProcessId(handle) > 0);
     MinyarBytes *status = minyar_system_waitNative(handle, false);
     assert(status->byte_length == 32 && get64(status, 0) == 0 && get64(status, 8) == 1);
@@ -104,16 +107,19 @@ static int child(int argc, char **argv) {
         return 37;
     } else if (!strcmp(argv[1], "child-credentials")) {
 #ifndef _WIN32
-        assert(getuid() == 65534 && geteuid() == 65534 && getgid() == 65534 && getegid() == 65534);
+        assert(argc == 4);
+        uid_t expected_uid = (uid_t)strtoul(argv[2], NULL, 10);
+        gid_t expected_gid = (gid_t)strtoul(argv[3], NULL, 10);
+        assert(expected_uid != 0 && getuid() == expected_uid && geteuid() == expected_uid && getgid() == expected_gid && getegid() == expected_gid);
 #ifdef __linux__
         uid_t real_uid, effective_uid, saved_uid; gid_t real_gid, effective_gid, saved_gid;
-        assert(!getresuid(&real_uid, &effective_uid, &saved_uid) && real_uid == 65534 && effective_uid == 65534 && saved_uid == 65534);
-        assert(!getresgid(&real_gid, &effective_gid, &saved_gid) && real_gid == 65534 && effective_gid == 65534 && saved_gid == 65534);
+        assert(!getresuid(&real_uid, &effective_uid, &saved_uid) && real_uid == expected_uid && effective_uid == expected_uid && saved_uid == expected_uid);
+        assert(!getresgid(&real_gid, &effective_gid, &saved_gid) && real_gid == expected_gid && effective_gid == expected_gid && saved_gid == expected_gid);
 #endif
         assert(setuid(0) == -1 && errno == EPERM);
         gid_t groups[16]; int n = getgroups(16, groups); assert(n >= 0);
         int extras = 0;
-        for (int i = 0; i < n; i++) { assert(groups[i] == 777 || groups[i] == 888 || groups[i] == 65534); if (groups[i] != 65534) extras++; }
+        for (int i = 0; i < n; i++) { assert(groups[i] == 777 || groups[i] == 888 || groups[i] == expected_gid); if (groups[i] != expected_gid) extras++; }
         assert(extras == 2);
 #endif
     } else if (!strcmp(argv[1], "child-cleared-groups")) {
@@ -134,6 +140,7 @@ static int process_main(int argc, char **argv) {
     assert(argc == 3);
 #ifndef _WIN32
     alarm(20);
+    if (!strcmp(argv[1], "root-contracts")) assert(geteuid() == 0);
 #endif
     MinyarBytes *groups = minyar_bytes_new(0);
     const char *args[] = {"custom name", "child-arguments", "", "with space", "quote\"slash\\", "trail\\", "λ☃", ";$HOME*"};
@@ -218,8 +225,15 @@ static int process_main(int argc, char **argv) {
         simple[1] = "child-cleared-groups";
         exited(launch(argv[0], simple, 2, NULL, 0, "", -1, -1, groups, true), 0);
         MinyarBytes *extras = minyar_bytes_new(16); put64((unsigned char *)extras->bytes, 777); put64((unsigned char *)extras->bytes + 8, 888);
-        simple[1] = "child-credentials";
-        exited(launch(argv[0], simple, 2, NULL, 0, "", 65534, 65534, extras, true), 0); test_release(extras);
+        /* Keep traversal within the admitted namespace: a private home may
+         * exclude nobody. Drop to the fixture owner, with explicit new groups. */
+        struct stat fixture; assert(!stat(argv[0], &fixture));
+        uid_t target_uid = fixture.st_uid ? fixture.st_uid : 65534;
+        gid_t target_gid = fixture.st_uid ? fixture.st_gid : 65534;
+        char uid_text[32], gid_text[32]; snprintf(uid_text, sizeof(uid_text), "%u", (unsigned)target_uid);
+        snprintf(gid_text, sizeof(gid_text), "%u", (unsigned)target_gid);
+        const char *credential_args[] = {"custom name", "child-credentials", uid_text, gid_text};
+        exited(launch(argv[0], credential_args, 4, NULL, 0, "", target_uid, target_gid, extras, true), 0); test_release(extras);
         simple[1] = "child-pipe";
         handle = launch(argv[0], simple, 2, NULL, 0, "", -1, -1, groups, true); assert(handle > 0);
         status = minyar_system_waitNative(handle, false);
