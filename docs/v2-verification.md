@@ -309,8 +309,17 @@ The exact two Python fixture files are integrated here at `1fae21e` and on Y
 at `a4f6b406`. The 172 native inputs, three frontends, two endpoint executables
 and six peer/image IDs remain unchanged from qualified `49edb0f6`; no endpoint
 rebuild was needed. A separate changed-fixture diagnostic of original index 69
-is authorized with the original checker and deadlines. It cannot rewrite the
-original result or admit later cells without its actual verdict and retirement.
+now passes the official 0-RTT criterion with Minyar as server and Quinn as
+client, using the original checker and deadlines. The command finished normally
+in 99.56 seconds; 1,144 indexed
+files, the raw verdict, all six creation/workload lifetimes and retirement of
+692 recorded process identities and 450 groups were independently reviewed.
+The unknown-test compliance probe retains its expected 127 exit. One polling
+inspection retains status 1 after the owned container was removed, matching the
+controller's existing exact `MissingContainer` contract. Neither receipt was
+normalized. The original index-69 error remains unchanged. Original indices
+70–119 are admitted serially, stopping on the first unexpected nonpass; their
+actual results remain required.
 
 Actual runner failures exposed fixture defects in Docker 29 capability
 spelling, simulator capture writers that had not flushed during shutdown, and
