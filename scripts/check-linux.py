@@ -135,9 +135,11 @@ def copy_source_snapshot(source, work):
     for name in DIRECTORIES:
         shutil.copytree(source / name, work / name,
                         ignore=shutil.ignore_patterns('build', '.git', '__pycache__', '*.pyc'))
-    # .clang-format is the style the formatting group checks against.
-    for name in ('Makefile', 'minyar', '.clang-format'):
+    for name in ('Makefile', 'minyar'):
         shutil.copy2(source / name, work / name)
+    # The style the formatting group checks against.
+    if (source / '.clang-format').is_file():
+        shutil.copy2(source / '.clang-format', work / '.clang-format')
 
 
 
