@@ -181,6 +181,28 @@ static void failures_are_values(void) {
     minyar_net_close(udp);
 }
 
+#ifndef _WIN32
+static void reuse_address_boolean_contract(void) {
+    int raw = socket(AF_INET, SOCK_STREAM, 0);
+    assert(raw >= 0);
+    int value = -1;
+    socklen_t size = sizeof(value);
+    assert(!getsockopt(raw, SOL_SOCKET, SO_REUSEADDR, &value, &size));
+    assert(size == sizeof(value) && value == 0);
+    int enabled = 1;
+    assert(!setsockopt(raw, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)));
+    size = sizeof(value);
+    assert(!getsockopt(raw, SOL_SOCKET, SO_REUSEADDR, &value, &size));
+    assert(size == sizeof(value) && value != 0);
+    int disabled = 0;
+    assert(!setsockopt(raw, SOL_SOCKET, SO_REUSEADDR, &disabled, sizeof(disabled)));
+    size = sizeof(value);
+    assert(!getsockopt(raw, SOL_SOCKET, SO_REUSEADDR, &value, &size));
+    assert(size == sizeof(value) && value == 0);
+    minyar_net_close(raw);
+}
+#endif
+
 static void reusable_stream_buffers(void) {
     MinyarText host = literal("127.0.0.1");
     long long listener = minyar_net_listen(&host, 0, 16);
@@ -190,7 +212,21 @@ static void reusable_stream_buffers(void) {
     int reuse = 0;
     socklen_t size = sizeof(reuse);
     assert(!getsockopt((int)listener, SOL_SOCKET, SO_REUSEADDR, &reuse, &size));
-    assert(reuse == 1);
+    assert(size == sizeof(reuse));
+    int disabled = 0;
+    assert(!setsockopt((int)listener, SOL_SOCKET, SO_REUSEADDR, &disabled, sizeof(disabled)));
+    int off = -1;
+    size = sizeof(off);
+    assert(!getsockopt((int)listener, SOL_SOCKET, SO_REUSEADDR, &off, &size));
+    assert(size == sizeof(off) && off == 0);
+    int enabled = 1;
+    assert(!setsockopt((int)listener, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)));
+    int restored = 0;
+    size = sizeof(restored);
+    assert(!getsockopt((int)listener, SOL_SOCKET, SO_REUSEADDR, &restored, &size));
+    assert(size == sizeof(restored) && restored != 0);
+    /* Boolean socket options report zero or a platform-specific nonzero bit. */
+    assert(reuse != 0);
 #endif
     long long client = minyar_net_connect(&host, port);
     assert(client >= 0 && minyar_net_ready(listener, 1000));
@@ -239,6 +275,9 @@ static void reusable_stream_buffers(void) {
 }
 
 int main(void) {
+#ifndef _WIN32
+    reuse_address_boolean_contract();
+#endif
     failures_are_values();
     udp_outcomes();
     tcp_outcomes();
