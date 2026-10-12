@@ -485,6 +485,8 @@ def main():
             if k.startswith((b"SCHILY.xattr.",b"LIBARCHIVE.xattr.",b"VENDOR.")): assert edited_attrs[k]==v,("edited binary attrs",k)
         cref=subprocess.check_output([reference_binary,"verify",edited],text=True,env=environment,timeout=10)
         compare_reference(rows,[tuple(line.split("|")[2:]) for line in cref.splitlines() if "|ENTRY|" in line],edited.read_bytes(),"edited writer",provider_version)
+        from tar_review import run as review_contracts
+        review_contracts(work/'completed-review',args.sanitize,environment)
         print(f"tar: {len(cases)} fixture/malformed/differential cases; metadata, spans, binary xattrs, Python/libarchive writer interop, limits and determinism passed; provider {provider_version}")
 
 

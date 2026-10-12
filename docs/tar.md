@@ -10,7 +10,9 @@ opening the provider. `readerWithLimits` additionally takes
 extension data/effective attributes, 64 extension headers per member, and one
 million physical headers. Metadata counts cumulatively across each member's
 extension chain, including overwritten records. Persistent global attributes
-and effective global/local attributes also obey the metadata bound. At most
+and effective global/local attributes also obey the metadata bound. Replacements
+and deletions are resolved before checking the final byte/count bounds, including
+updates within a global header; equivalent maps do not depend on keyword order. At most
 4096 distinct attributes are retained. Names, links, uname and gname obey the
 byte path limit, without embedded NULs. These are resource limits, not an
 extraction policy.
@@ -66,7 +68,10 @@ return an error in that view while raw attributes remain accessible.
 exact output limit includes header/extension/payload padding and the two-block
 footer. The writer adds no extra record blocking. Typed fields take precedence
 over stale standard PAX attributes; supplied payload length determines size.
-Unknown nonempty attributes are preserved. Wide signed fields and exact
+Unknown nonempty attributes are preserved. Accepted empty-target hardlinks keep
+their hardlink wire type; callers still own filesystem/link-target policy.
+Absolute byte paths that cannot use a nonempty ustar prefix remain exact PAX
+paths. Wide signed fields and exact
 timestamps are materialized in PAX without passing extreme values to the
 provider's decimal formatter. Finish is idempotent and returns an independent
 copy. Append after finish fails. Invalid append/limit errors are sticky.
@@ -102,7 +107,7 @@ writer round trips, binary xattrs, context aliases and exact resource limits.
 An isolated tar branch may set `MINYAR_TAR_PROVIDER_TOOLS` to the parent-owned
 tools directory until those shared changes are integrated.
 
-Final owned Linux verification (2026-10-12, `bx_ev9fa25q`) passed 2073 cases
+Initial `033dbf6` Linux verification (2026-10-12, `bx_ev9fa25q`) passed 2073 cases
 in both native and generated-LLVM/runtime/binding ASan/UBSan modes, including
 LeakSanitizer. `native-final-r3.log` and `sanitize-final-r3.log` retain output;
 `commands-r3.json` retains command `cmd_4faxchwpxjsx` and its 15:18:26–15:18:43
@@ -138,7 +143,7 @@ The Minyar API also performs strict validation, byte/span bookkeeping and
 recoverable error checks. Native overhead must be reported from these samples;
 selection of a C backend does not establish a 1.5 native/C ratio.
 
-The final native run (`cmd_sytxxef4wwiy`, 15:23:56–15:24:06 UTC, 2026-10-12)
+The `033dbf6` native run (`cmd_sytxxef4wwiy`, 15:23:56–15:24:06 UTC, 2026-10-12)
 retains seven alternating Minyar/C samples per operation in
 `docs/evidence/tar/native-linux-r3.json`. Median native/C ratios are **3.948**
 for metadata read, **3.348** for metadata round trip, **2.041** for payload
@@ -158,6 +163,40 @@ and all 83 actual provider inputs, then used only the prebuilt binaries under
 the parent-approved `flock -n` slot. Compiler/provider discovery occurred at
 preparation time. Broader platform and shared 1% performance gates remain
 integration work; these new-module measurements do not qualify those gates.
+
+## Completed-review fixes
+
+The first completed review of `033dbf6` reproduced three gaps: loss of the
+leading slash on a 101-byte absolute path, conversion of an empty-target
+hardlink to a regular file, and order-dependent rejection of a valid final PAX
+map. `tests/tar-review.min` and `tests/tar_review.py` add direct-write/rewrite
+and byte/count-bound regressions. The same map-construction bug also affected
+global replacements/deletions and the 4096-attribute boundary; those cases are
+covered. Exact 100-byte and 4096-key final maps pass, while one-over maps fail.
+Raw wire, cumulative extension and ownership limits are unchanged.
+
+`docs/evidence/tar/fixes-r1/` retains RED/green outcomes, source/compiler/LLVM/
+binary hashes, complete commands and a new prebuilt provider manifest. The
+original candidate fails eight focused variants; the corrected implementation
+passes all 21 controls, the original 2073-case corpus and generated-LLVM/runtime/
+binding ASan/UBSan/LeakSanitizer. Command `cmd_nziqfhzjbg0z` ran full native,
+full sanitizer, focused sanitizer and prebuild checks at 15:50:09–15:50:40 UTC
+on 2026-10-12 in the separate owned `/home/user/ws5-tar-fixes` directory using
+the read-only base compiler. `tests/tar.py` includes these regressions in both
+ordinary and sanitizer runs; the standalone script takes `--artifacts PATH`.
+
+`finish` now retains its owned native status packet directly and slices only
+the independently owned caller value. Repeated/aliased finish still returns
+fresh bytes, including at a 1 MiB payload's exact archive cap. The non-timing
+Linux `tests/tar_copy_count.py --artifacts PATH` probe proves one large output
+slice and one native output extent, each 4,228,096 bytes. The earlier review
+counted two such slices plus that extent. The unchanged reader counts and
+observable checksums accompany the counters in `copy-results.json`. This
+removes one complete output copy; it does not transfer the C buffer or weaken
+caller ownership. No new timings were collected. The 11.048 ratio above belongs
+to `033dbf6` and is preserved as historical evidence, not a measurement of the
+fixed source. New timings need green prebuilt binaries and parent quiet-slot
+approval. A new fresh review and all platform/integration gates remain pending.
 
 This implements the tar portion of IMAGE-4. erofs/ext4 image writing is still
 deferred; no IMAGE-4 completion or integration claim follows from this module.

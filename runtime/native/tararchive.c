@@ -74,10 +74,17 @@ static void attrs_delete(Attrs *m, Blob key) {
     }
 }
 static int attrs_merge(Attrs *out, const Attrs *global, const Attrs *local, size_t maximum) {
-    for (size_t i=0;i<global->count;i++) if (!attrs_set(out,blob(global->a[i].key,global->a[i].kn),blob(global->a[i].value,global->a[i].vn),maximum)) return 0;
+    // Every intermediate map must be a subset of the final map. Copying an
+    // overridden global first can exceed the limit before a later deletion
+    // or smaller replacement, making equivalent maps depend on keyword order.
+    for (size_t i=0;i<global->count;i++) {
+        const Attr *a=global->a+i; int overridden=0;
+        for (size_t j=0;j<local->count;j++) if (local->a[j].kn==a->kn && !memcmp(local->a[j].key,a->key,a->kn)) { overridden=1; break; }
+        if (!overridden && !attrs_set(out,blob(a->key,a->kn),blob(a->value,a->vn),maximum)) return 0;
+    }
     for (size_t i=0;i<local->count;i++) {
         Blob k=blob(local->a[i].key,local->a[i].kn),v=blob(local->a[i].value,local->a[i].vn);
-        if (!v.n) attrs_delete(out,k); else if (!attrs_set(out,k,v,maximum)) return 0;
+        if (v.n && !attrs_set(out,k,v,maximum)) return 0;
     }
     return 1;
 }
@@ -117,7 +124,7 @@ static int timestamp(Blob b, int64_t *seconds, int64_t *nanos) {
     *nanos=fraction; return 1;
 }
 static int sparse(Blob k) { return begins(k,"GNU.sparse.") || equal(k,"SCHILY.realsize"); }
-static int pax_parse(Blob data, Attrs *attrs, size_t maximum, int global, const char **error) {
+static int pax_parse(Blob data, Attrs *attrs, size_t maximum, const char **error) {
     size_t at=0;
     while (at<data.n) {
         size_t space=at; while (space<data.n && data.p[space]>='0' && data.p[space]<='9') space++;
@@ -129,11 +136,20 @@ static int pax_parse(Blob data, Attrs *attrs, size_t maximum, int global, const 
         Blob k=blob(data.p+space+1,equal_at-space-1),v=blob(data.p+equal_at+1,end-equal_at-1);
         for (size_t i=0;i<k.n;i++) if (k.p[i]<33 || k.p[i]>126) { *error="invalid PAX keyword"; return 0; }
         if (sparse(k) || (equal(k,"SCHILY.filetype") && equal(v,"sparse"))) { *error="unsupported sparse tar"; return 0; }
-        if (global && !v.n) attrs_delete(attrs,k);
-        else if (!attrs_set(attrs,k,v,maximum)) { *error="PAX metadata/count limit exceeded"; return 0; }
+        if (!attrs_set(attrs,k,v,maximum)) { *error="PAX metadata/count limit exceeded"; return 0; }
         at+=(size_t)size;
     }
     return 1;
+}
+static int pax_global(Blob data, Attrs *globals, size_t maximum, const char **error) {
+    Attrs changes={0},merged={0};
+    // Bound the incoming wire map independently, then apply its final
+    // replacements/deletions without transiently enlarging persistent state.
+    int ok=pax_parse(data,&changes,maximum,error);
+    if (ok && !attrs_merge(&merged,globals,&changes,maximum)) { *error="global PAX metadata/count limit exceeded"; ok=0; }
+    attrs_free(&changes);
+    if (!ok) { attrs_free(&merged); return 0; }
+    attrs_free(globals); *globals=merged; return 1;
 }
 static int apply(Entry *e, const char **error) {
     for (size_t i=0;i<e->attrs.count;i++) {
@@ -205,7 +221,8 @@ static int scan(Reader *r, Entry *e, const char **error) {
                 // Resolve multiple local headers ourselves: provider recursion
                 // limits and earlier-header precedence differ from this API.
                 if (e->type=='g' || ++local_headers>1) r->normalize=1;
-                if (!pax_parse(data,e->type=='g' ? &r->globals : &local,r->max_metadata,e->type=='g',error)) break;
+                if (e->type=='g') { if (!pax_global(data,&r->globals,r->max_metadata,error)) break; }
+                else if (!pax_parse(data,&local,r->max_metadata,error)) break;
             }
             else {
                 if (data.n && data.p[data.n-1]==0) data.n--;
@@ -395,7 +412,7 @@ static int writer_header(Writer *w,Entry *e,unsigned char base[512],const char *
     while (w->cn-at>512) {
         const unsigned char *h=w->capture+at; int64_t n;
         if (h[156]!='x' || !number(h+124,12,&n) || n<0 || (uint64_t)n>w->cn-at-512) { *error="unexpected libarchive extension"; return 0; }
-        if (!pax_parse(blob(h+512,(size_t)n),&e->attrs,1048576,0,error)) return 0;
+        if (!pax_parse(blob(h+512,(size_t)n),&e->attrs,1048576,error)) return 0;
         size_t span=512+(size_t)n+(512-(size_t)n%512)%512; if (span>w->cn-at) { *error="invalid libarchive extension span"; return 0; } at+=span;
     }
     memcpy(base,w->capture+at,512);
@@ -414,11 +431,14 @@ static int writer_header(Writer *w,Entry *e,unsigned char base[512],const char *
     if (e->path.n<=100) { memcpy(base,e->path.p,e->path.n); attrs_delete(&e->attrs,blob((const unsigned char *)"path",4)); }
     else {
         size_t split=SIZE_MAX;
-        for (size_t i=0;i<e->path.n;i++) if (e->path.p[i]=='/' && i<=155 && e->path.n-i-1>0 && e->path.n-i-1<=100) split=i;
+        for (size_t i=1;i<e->path.n;i++) if (e->path.p[i]=='/' && i<=155 && e->path.n-i-1>0 && e->path.n-i-1<=100) split=i;
         if (split!=SIZE_MAX) { memcpy(base,e->path.p+split+1,e->path.n-split-1); memcpy(base+345,e->path.p,split); attrs_delete(&e->attrs,blob((const unsigned char *)"path",4)); }
         else { memcpy(base,"PaxEntry",8); if (!attrs_set(&e->attrs,blob((const unsigned char *)"path",4),e->path,1048576)) return 0; }
     }
     if (e->attrs.count && !set_text(&e->attrs,"hdrcharset","BINARY")) return 0;
+    // An empty hardlink target is accepted by this byte-level API, but some
+    // providers generate a regular header for it. Preserve the requested type.
+    base[156]=(unsigned char)e->type;
     octal(base+100,8,(uint64_t)e->mode);
     checksum(base); return 1;
 }

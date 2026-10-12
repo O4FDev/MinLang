@@ -55,6 +55,7 @@ def strict_scan(source, max_metadata=1048576, max_chain=64, max_headers=1000000,
         else:
             if kind not in range(48,55): return reject('unsupported member type/sparse')
             attrs=dict(globals); attrs.update(local); attrs={k:v for k,v in attrs.items() if v}
+            if len(attrs)>4096: return reject('effective attribute count limit')
             if sum(len(k)+len(v) for k,v in attrs.items())>max_metadata: return reject('effective metadata limit')
             for k,v in attrs.items():
                 if k in (b'size',b'uid',b'gid',b'SCHILY.devmajor',b'SCHILY.devminor'):
@@ -84,7 +85,8 @@ def strict_scan(source, max_metadata=1048576, max_chain=64, max_headers=1000000,
                 target=globals if kind==103 else local
                 for k,v in pairs:
                     if k.startswith(b'GNU.sparse.') or k==b'SCHILY.realsize' or (k==b'SCHILY.filetype' and v==b'sparse'): return reject('unsupported sparse attributes')
-                    target[k]=v
+                    if kind==103 and not v: target.pop(k,None)
+                    else: target[k]=v
                 if len(target)>4096 or sum(len(k)+len(v) for k,v in target.items())>max_metadata: return reject('attribute count/metadata limit')
                 if kind==103: globals={k:v for k,v in globals.items() if v}
             else:

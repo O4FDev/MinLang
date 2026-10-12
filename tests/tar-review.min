@@ -1,0 +1,91 @@
+use "tar" as tar
+use "errors" as errors
+function require(value: Boolean, message: Text) { if !value { fail(message) } }
+function equal(a: Bytes, b: Bytes): Boolean {
+    if a.length != b.length { return false }
+    for i in 0..a.length { if a[i] != b[i] { return false } }
+    return true
+}
+function hex(bytes: Bytes): Text {
+    let digits = "0123456789abcdef"; let result = ""
+    for byte in bytes { result += Text(digits[byte / 16]) + Text(digits[byte % 16]) }
+    return result
+}
+if argument(0) == "path" {
+    let source = readBytesFile(argument(1))
+    let input = tar.reader(source,source.length,4096)
+    let original = tar.next(input)
+    require(!errors.isError(original.error),"absolute input")
+    let path = original.entry.path
+    require(tar.next(input).end,"absolute input EOF")
+    for rewrite in 0..2 {
+        let w = tar.writer(8192)
+        let value = tar.entry(path,tar.REGULAR)
+        if rewrite == 1 { value = original.entry }
+        require(errors.booleanOk(tar.append(w,value,Bytes())),"absolute append")
+        let wire = errors.bytesValue(tar.finish(w))
+        let r = tar.reader(wire,wire.length,4096)
+        let read = tar.next(r)
+        require(!errors.isError(read.error) && equal(read.entry.path,path),"absolute pathname changed on write")
+        require(tar.next(r).end,"absolute output EOF")
+        writeBytesFile(argument(2)+Text(rewrite)+".tar",wire)
+    }
+    print("path preserved")
+}
+if argument(0) == "hardlink" {
+    let source = readBytesFile(argument(1))
+    let input = tar.reader(source,source.length,4096)
+    let original = tar.next(input)
+    require(!errors.isError(original.error) && original.entry.type == tar.HARDLINK && original.entry.link.length == 0,"accepted empty hardlink input")
+    require(tar.next(input).end,"hardlink input EOF")
+    for rewrite in 0..2 {
+        let w = tar.writer(1536)
+        let value = tar.entry(Bytes("empty-hardlink"),tar.HARDLINK)
+        if rewrite == 1 { value = original.entry }
+        require(errors.booleanOk(tar.append(w,value,Bytes())),"empty hardlink append")
+        let wire = errors.bytesValue(tar.finish(w))
+        require(wire.length == 1536 && wire[156] == tar.HARDLINK,"empty hardlink wire type changed")
+        let r = tar.reader(wire,wire.length,4096)
+        let read = tar.next(r)
+        require(!errors.isError(read.error) && read.entry.type == tar.HARDLINK && read.entry.link.length == 0,"empty hardlink roundtrip type")
+        require(tar.next(r).end,"hardlink output EOF")
+        writeBytesFile(argument(2)+Text(rewrite)+".tar",wire)
+    }
+    print("empty hardlink preserved")
+}
+if argument(0) == "bound" {
+    let source = readBytesFile(argument(1)); let maximum = 0
+    for digit in argument(2) { maximum = maximum * 10 + Integer(digit) - 48 }
+    let r = tar.readerWithLimits(source,source.length,4096,maximum,64,100)
+    let first = tar.next(r)
+    require(!errors.isError(first.error) && !first.end,"bounded global member")
+    let second = tar.next(r)
+    if argument(3) == "reject" {
+        require(errors.isError(second.error),"final effective map limit not enforced")
+        require(errors.isError(tar.next(r).error),"nonsticky effective limit error")
+        print("final bound rejected")
+    } else {
+        require(!errors.isError(second.error) && !second.end,"order-dependent effective metadata bound")
+        for attr in second.entry.attributes { print("ATTR|"+hex(attr.key)+"|"+hex(attr.value)) }
+        require(tar.next(r).end,"bounded output EOF")
+        print("final bound accepted")
+    }
+}
+if argument(0) == "finish" {
+    let w = tar.writer(1050112); let alias = w
+    require(errors.booleanOk(tar.append(w,tar.entry(Bytes("large"),tar.REGULAR),Bytes(1048576))),"large exact cap append")
+    let first = errors.bytesValue(tar.finish(w))
+    require(first.length == 1050112,"large archive length")
+    let second = errors.bytesValue(tar.finish(alias))
+    first[0] = 0; first[512] = 9
+    require(second[0] == 108 && second[512] == 0,"finish results share bytes")
+    second[0] = 0
+    let third = errors.bytesValue(tar.finish(w))
+    require(third[0] == 108 && third[512] == 0,"finish result aliases retained packet")
+    tar.closeWriter(w); tar.closeWriter(alias)
+    require(errors.bytesValue(tar.finish(alias))[0] == 108,"closed finished alias")
+    let short = tar.writer(1050111)
+    require(!errors.booleanOk(tar.append(short,tar.entry(Bytes("large"),tar.REGULAR),Bytes(1048576))),"large one-short cap")
+    require(!errors.bytesOk(tar.finish(short)),"large sticky cap")
+    print("fresh finish ownership preserved")
+}
