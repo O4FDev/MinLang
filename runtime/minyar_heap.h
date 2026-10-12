@@ -3,7 +3,17 @@
  * fixed-capacity bookkeeping contract. Neither backend changes object headers. */
 #ifdef MINYAR_SYSTEM_HEAP
 #ifndef MINYAR_SYSTEM_SMALL_HEAP
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define MINYAR_SYSTEM_SMALL_HEAP 0
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__)
+#define MINYAR_SYSTEM_SMALL_HEAP 0
+#endif
+#ifndef MINYAR_SYSTEM_SMALL_HEAP
 #define MINYAR_SYSTEM_SMALL_HEAP 1
+#endif
 #endif
 #if !MINYAR_THREADED && MINYAR_SYSTEM_SMALL_HEAP
 #include "minyar_system_small_heap.h"
