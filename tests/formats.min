@@ -1,0 +1,72 @@
+use "tar" as tar
+use "errors" as errors
+use "zstd" as zstd
+use "deflate" as deflate
+use "sha256" as sha
+
+function require(value: Boolean, reason: Text) { if !value { fail(reason) } }
+function same(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for i in 0..left.length { if left[i] != right[i] { return false } }
+    return true
+}
+function inspect(layer: Bytes, data: Bytes) {
+    let reader = tar.reader(layer,layer.length,4096)
+    let file = tar.next(reader)
+    require(!errors.isError(file.error) && !file.end,"layer file")
+    require(Text(file.entry.path) == "layer/binary" && file.entry.uid == 123 && file.entry.gid == 456,"layer identity")
+    require(file.entry.mtime == -2 && file.entry.mtimeNanos == 750000000,"layer exact time")
+    require(same(errors.bytesValue(tar.payload(reader,file.entry)),data),"layer payload")
+    require(file.entry.attributes.length > 0,"layer attributes")
+    let whiteout = tar.next(reader)
+    require(!errors.isError(whiteout.error) && Text(whiteout.entry.path) == "layer/.wh.deleted","layer whiteout")
+    require(errors.bytesValue(tar.payload(reader,whiteout.entry)).length == 0,"whiteout payload")
+    let link = tar.next(reader)
+    require(!errors.isError(link.error) && link.entry.type == tar.SYMLINK && Text(link.entry.link) == "binary","layer link")
+    require(tar.next(reader).end,"layer footer")
+    tar.close(reader)
+}
+
+let payload = Bytes(256)
+for i in 0..256 { payload[i] = i }
+let attr = Bytes(4); attr[0] = 0; attr[1] = 255; attr[2] = 10; attr[3] = 61
+let writer = tar.writer(16384)
+let file = tar.entry(Bytes("layer/binary"),tar.REGULAR)
+file.uid = 123; file.gid = 456; file.mtime = -2; file.mtimeNanos = 750000000
+file.attributes.add(tar.Attribute { key: Bytes("VENDOR.binary"); value: attr })
+require(errors.booleanOk(tar.append(writer,file,payload)),"append binary member")
+require(errors.booleanOk(tar.append(writer,tar.entry(Bytes("layer/.wh.deleted"),tar.REGULAR),Bytes())),"append whiteout")
+let link = tar.entry(Bytes("layer/link"),tar.SYMLINK); link.link = Bytes("binary")
+require(errors.booleanOk(tar.append(writer,link,Bytes())),"append link")
+let finished = tar.finish(writer)
+require(errors.bytesOk(finished),"finish layer")
+let layer = errors.bytesValue(finished)
+inspect(layer,payload)
+let digest = sha.digest(layer)
+let state = sha.new()
+require(sha.updateRange(state,layer,0,17),"hash prefix")
+let branch = sha.clone(state)
+require(sha.updateRange(branch,layer,17,layer.length-17),"hash tail")
+require(same(sha.finalize(branch),digest) && sha.bytesHashed(state) == 17,"streaming branch hash")
+
+let gzip = deflate.compress(layer,deflate.GZIP,6,16384)
+require(deflate.ok(gzip),"gzip layer")
+let gunzip = deflate.decompress(deflate.data(gzip),deflate.GZIP,layer.length)
+require(deflate.ok(gunzip) && same(deflate.data(gunzip),layer),"inflate layer")
+inspect(deflate.data(gunzip),payload)
+require(!deflate.ok(deflate.decompress(deflate.data(gzip),deflate.GZIP,layer.length-1)),"gzip output bound")
+
+let compressor = zstd.createCCtx(); let decoder = zstd.createDCtx()
+require(zstd.isOpenCCtx(compressor) && zstd.isOpenDCtx(decoder),"codec context")
+let packed = zstd.compressWith(compressor,layer,3,16384)
+require(zstd.ok(packed),"zstd layer")
+let plain = zstd.decompressWith(decoder,zstd.data(packed),layer.length)
+require(zstd.ok(plain) && same(zstd.data(plain),layer),"zstd decode layer")
+inspect(zstd.data(plain),payload)
+require(!zstd.ok(zstd.decompressWith(decoder,zstd.data(packed),layer.length-1)),"zstd output bound")
+require(zstd.ok(zstd.decompressWith(decoder,zstd.data(packed),layer.length)),"decoder recovery")
+zstd.closeCCtx(compressor); zstd.closeDCtx(decoder)
+print("tar=" + sha.hex(layer))
+print("gzip=" + sha.hex(deflate.data(gzip)))
+print("zstd=" + sha.hex(zstd.data(packed)))
+print("sha256=" + sha.hex(digest))

@@ -2,6 +2,8 @@
 """Actual codec provider contracts, including static linking and header identity."""
 import os
 import platform
+import re
+import shlex
 from pathlib import Path
 import shutil
 import subprocess
@@ -24,7 +26,7 @@ class Providers(unittest.TestCase):
     def setUpClass(cls):
         cls.flags, cls.libraries = codec_provider('zstd', cls.clang)
         cls.include = Path(cls.flags[cls.flags.index('-isystem') + 1])
-        cls.archive = Path(cls.libraries[0])
+        cls.archive = next(Path(value) for value in cls.libraries if value.endswith('libzstd.a'))
 
     def prefix(self, directory):
         prefix = (Path(directory) / "provider space's").resolve()
@@ -47,7 +49,7 @@ class Providers(unittest.TestCase):
     def test_matched_real_archive_and_effective_flags(self):
         if WINDOWS:
             flags, libraries = codec_provider('zstd', self.clang, ['-O1'], ['-O1'])
-            self.assertEqual(Path(libraries[0]), self.archive)
+            self.assertIn(str(self.archive), libraries)
             self.assertTrue(flags)
             return
         with tempfile.TemporaryDirectory() as directory:
@@ -55,7 +57,7 @@ class Providers(unittest.TestCase):
             shutil.copyfile(self.archive, prefix / 'lib/libzstd.a')
             with patch.dict(os.environ, {'MINYAR_ZSTD_PREFIX': str(prefix)}):
                 flags, libraries = codec_provider('zstd', self.clang, ['-O1'], ['-O1'])
-                self.assertEqual(Path(libraries[0]), prefix / 'lib/libzstd.a')
+                self.assertIn(str(prefix / 'lib/libzstd.a'), libraries)
                 before = flags
                 with (prefix / 'include/zstd_errors.h').open('a') as stream:
                     stream.write('\n/* cache input */\n')
@@ -127,6 +129,67 @@ class Providers(unittest.TestCase):
             with patch.dict(os.environ, {'MINYAR_ZSTD_PREFIX': str(target)}):
                 with self.assertRaisesRegex(ValueError, 'literal backslash provider paths are unsupported'):
                     codec_provider('zstd', self.clang)
+
+    @unittest.skipIf(WINDOWS, 'Fixture needs unprivileged POSIX symlinks')
+    def test_foreign_secondary_symlink_rejected(self):
+        flags, _ = codec_provider('deflate', self.clang)
+        include = Path(flags[flags.index('-isystem') + 1])
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'other-config.h'
+            shutil.copyfile(include / 'zconf.h', target)
+            foreign = Path(directory) / 'zconf.h'
+            foreign.symlink_to(target)
+            with self.assertRaisesRegex(ValueError, 'headers must belong to provider prefix'):
+                codec_provider('deflate', self.clang, ['-include', str(foreign)])
+
+    def test_forced_probe_suffix_header_refreshes_fingerprint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            header = Path(directory) / 'codec-probe.c'
+            header.write_text('#define CALLER_CONFIG 1\n')
+            first = codec_provider('deflate', self.clang, ['-include', str(header)])[0]
+            header.write_text('#define CALLER_CONFIG 2\n')
+            second = codec_provider('deflate', self.clang, ['-include', str(header)])[0]
+            self.assertNotEqual(first, second)
+
+    def test_earlier_dynamic_link_flags_keep_advanced_static_definitions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'advanced.c'; binary = root / 'advanced'
+            source.write_text('#define ZSTD_STATIC_LINKING_ONLY\n#include <zstd.h>\n'
+                              'int main(void) { ZSTD_customMem m={0}; ZSTD_DDict *d=ZSTD_createDDict_advanced("raw",3,ZSTD_dlm_byCopy,ZSTD_dct_rawContent,m); if (!d) return 1; ZSTD_freeDDict(d); return 0; }\n')
+            link = ['-L' + str(self.archive.parent), '-lzstd']
+            if platform.system() == 'Linux': link.insert(0, '-Wl,--no-as-needed')
+            flags, libraries = codec_provider('zstd', self.clang, ['-O2'], link)
+            subprocess.run([self.clang, *link, *flags, str(source), *libraries, '-o', str(binary)],
+                           check=True, capture_output=True)
+            subprocess.run([str(binary)], check=True, capture_output=True)
+            self.assert_static_definitions(binary)
+
+    def assert_static_definitions(self, binary):
+        nm = shutil.which('llvm-nm') or shutil.which('nm')
+        symbols = subprocess.check_output([nm, '-g', str(binary)], text=True)
+        for name in ('ZSTD_createCDict_advanced', 'ZSTD_createDDict_advanced'):
+            self.assertRegex(symbols, r'(?m)^\s*[0-9a-fA-F]+\s+T\s+_?' + name + r'\s*$')
+
+    def test_actual_driver_with_dynamic_caller_flags(self):
+        compiler = Path(os.environ.get('MINYAR_TEST_COMPILER', ROOT / 'build/minyarc'))
+        runtime = Path(os.environ.get('MINYAR_TEST_RUNTIME', ROOT / 'build/minyar-default-runtime.o'))
+        if not compiler.is_file() or not runtime.is_file():
+            self.skipTest('existing compiler/runtime needed for actual driver qualification')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); source = root / 'driver.min'; llvm = root / 'driver.ll'; binary = root / 'driver'
+            source.write_text('use "zstd" as zstd\nlet d = zstd.createDDict(Bytes("raw"))\nif !zstd.isOpenDDict(d) { fail("dictionary") }\nzstd.closeDDict(d)\n')
+            subprocess.run([str(compiler), str(source), str(llvm), '--library', str(ROOT / 'library')],
+                           check=True, capture_output=True)
+            link = ['-O2', '-L' + str(self.archive.parent), '-lzstd']
+            if platform.system() == 'Linux': link.insert(1, '-Wl,--no-as-needed')
+            environment = dict(os.environ, MINYAR_CLANG=self.clang,
+                               MINYAR_NATIVE_FLAGS='-O2', MINYAR_CLANG_FLAGS=shlex.join(link))
+            subprocess.run([sys.executable, str(ROOT / 'tools/clang-driver.py'), 'link', str(ROOT),
+                            str(llvm), str(runtime), str(binary), '0'], env=environment,
+                           check=True, capture_output=True)
+            subprocess.run([str(binary)], check=True, capture_output=True)
+            self.assert_static_definitions(binary)
 
 
 if __name__ == '__main__':
