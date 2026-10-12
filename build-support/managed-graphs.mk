@@ -163,10 +163,17 @@ check-cycle-detached-first-insertion-sanitize: $(CYCLE_DETACHED_FIRST_INSERTION_
 check-managed-graphs-profiles: check-cycle-detached-first-insertion check-cycle-detached-first-insertion-sanitize
 
 # Scanned full-MARK actual-zero retirement and issued-job expiry, bounded profiles only.
+.PHONY: check-cycle-full-mark-zero check-cycle-full-mark-zero-sanitize
+CYCLE_FULL_MARK_ZERO_INPUTS = tests/cycle-full-mark-zero.c tests/cycle-detached-first-insertion.c tests/cycle-leaf-churn.c tests/cycle-additive.c tests/cycle-additive.py tests/clang_helpers.py tests/test_evidence.py tools/cycle_runtime.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
+check-cycle-full-mark-zero: $(CYCLE_FULL_MARK_ZERO_INPUTS) | build
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-additive.py --fixture cycle-full-mark-zero.c --budgets 1 32 --nodes 512 2048 --evidence "$(CURDIR)/build/cycle-full-mark-zero-native"
+check-cycle-full-mark-zero-sanitize: $(CYCLE_FULL_MARK_ZERO_INPUTS) | build
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-additive.py --fixture cycle-full-mark-zero.c --budgets 1 32 --nodes 512 2048 --sanitize --evidence "$(CURDIR)/build/cycle-full-mark-zero-sanitize"
+check-managed-graphs-profiles: check-cycle-full-mark-zero check-cycle-full-mark-zero-sanitize
+
+check-sanitize: check-cycle-full-mark-zero-sanitize
+
+# Keep the original standalone names as aliases without repeating either recipe.
 .PHONY: check-cycle-full-mark-retirement check-cycle-full-mark-retirement-sanitize
-CYCLE_FULL_MARK_RETIREMENT_INPUTS = tests/cycle-full-mark-zero.c tests/cycle-detached-first-insertion.c tests/cycle-leaf-churn.c tests/cycle-additive.c tests/cycle-additive.py tools/cycle_runtime.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
-check-cycle-full-mark-retirement: $(CYCLE_FULL_MARK_RETIREMENT_INPUTS) | build
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-additive.py --fixture cycle-full-mark-zero.c --budgets 1 32 --nodes 512 2048 --evidence "$(CURDIR)/build/cycle-full-mark-retirement-native"
-check-cycle-full-mark-retirement-sanitize: $(CYCLE_FULL_MARK_RETIREMENT_INPUTS) | build
-	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-additive.py --fixture cycle-full-mark-zero.c --budgets 1 32 --nodes 512 2048 --sanitize --evidence "$(CURDIR)/build/cycle-full-mark-retirement-sanitize"
-check-managed-graphs-profiles: check-cycle-full-mark-retirement check-cycle-full-mark-retirement-sanitize
+check-cycle-full-mark-retirement: check-cycle-full-mark-zero
+check-cycle-full-mark-retirement-sanitize: check-cycle-full-mark-zero-sanitize
