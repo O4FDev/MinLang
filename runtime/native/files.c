@@ -236,8 +236,46 @@ long long minyar_files_pathSize(const MinyarText *path) {
 }
 
 long long minyar_files_truncate(long long fd, long long length) {
-    if (!files_valid_fd(fd) || length < 0) return -EINVAL;
+    if (!files_valid_fd(fd)) return -EBADF;
+    if (length < 0) return -EINVAL;
+    if ((long long)(off_t)length != length) return -EOVERFLOW;
     return ftruncate((int)fd, (off_t)length) == 0 ? 0 : -errno;
+}
+
+/* Reserve storage without discarding existing bytes or shrinking the file. No durability is implied. */
+long long minyar_files_preallocate(long long fd, long long length) {
+    if (!files_valid_fd(fd)) return -EBADF;
+    if (length < 0) return -EINVAL;
+    if ((long long)(off_t)length != length) return -EOVERFLOW;
+    struct stat st;
+    if (fstat((int)fd, &st) != 0) return -errno;
+    if (!S_ISREG(st.st_mode)) return -EINVAL;
+    if (!length) return 0;
+    int rc;
+#if defined(__APPLE__) && defined(F_PREALLOCATE)
+    /* Darwin reserves additional bytes from physical EOF, rather than a logical file range. */
+    fstore_t store = {0};
+    store.fst_flags = F_ALLOCATEALL;
+#ifdef F_ALLOCATEPERSIST
+    store.fst_flags |= F_ALLOCATEPERSIST;
+#endif
+    store.fst_posmode = F_PEOFPOSMODE;
+    long long allocated = st.st_blocks > LLONG_MAX / 512 ? LLONG_MAX : st.st_blocks * 512;
+    if (length > allocated) {
+        store.fst_length = (off_t)(length - allocated);
+        do { rc = fcntl((int)fd, F_PREALLOCATE, &store); } while (rc != 0 && errno == EINTR);
+        if (rc != 0) return -errno;
+    }
+    if (st.st_size < length) return minyar_files_truncate(fd, length);
+    return 0;
+#elif defined(__linux__)
+    /* Use the kernel operation: libc's fallback can overwrite concurrent writes while filling holes. */
+    do { rc = fallocate((int)fd, 0, 0, (off_t)length); } while (rc != 0 && errno == EINTR);
+    return rc == 0 ? 0 : -errno;
+#else
+    do { rc = posix_fallocate((int)fd, 0, (off_t)length); } while (rc == EINTR);
+    return -rc;
+#endif
 }
 
 long long minyar_files_rename(const MinyarText *from, const MinyarText *to) {
@@ -346,8 +384,8 @@ typedef struct {
 static FilesSyncer files_syncers[FILES_MAX_SYNCERS];
 
 static FilesSyncer *files_syncer(long long handle) {
-    if (handle <= 0) return NULL;
-    uint64_t identity = (uint64_t)handle - 1;
+    if (handle <= 0 || !(handle & 1)) return NULL;
+    uint64_t identity = (uint64_t)handle / 2;
     FilesSyncer *s = &files_syncers[identity % FILES_MAX_SYNCERS];
     return s->used && s->generation == identity / FILES_MAX_SYNCERS ? s : NULL;
 }
@@ -407,7 +445,7 @@ long long minyar_files_syncerStart(long long fd) {
     int slot = -1;
     for (int i = 0; i < FILES_MAX_SYNCERS; i++)
         if (!files_syncers[i].used && files_syncers[i].generation <
-            ((uint64_t)LLONG_MAX - FILES_MAX_SYNCERS) / FILES_MAX_SYNCERS) {
+            ((uint64_t)LLONG_MAX / 2 - FILES_MAX_SYNCERS) / FILES_MAX_SYNCERS) {
             slot = i;
             break;
         }
@@ -441,7 +479,7 @@ long long minyar_files_syncerStart(long long fd) {
     if (error) goto fail_done;
     s->generation = generation + 1;
     s->used = true;
-    return (long long)(s->generation * FILES_MAX_SYNCERS) + slot + 1;
+    return ((long long)(s->generation * FILES_MAX_SYNCERS) + slot) * 2 + 1;
 fail_done:
     pthread_cond_destroy(&s->done);
 fail_wake:
@@ -589,4 +627,144 @@ long long minyar_files_syncerStop(long long handle) {
     pthread_cond_destroy(&s->done);
     s->used = false;
     return err;
+}
+
+/* ---------------------------------------------------------------- one-shot file preparation
+ * The caller exclusively owns the file contents until completion. The worker owns a dup, uses only unmanaged
+ * storage, and publishes completion only after zeroing and stable-storage sync (or a sticky failure). Stop joins;
+ * it does not cancel a partially prepared file or report it durable before the worker has actually finished. */
+enum { FILES_MAX_PREPARES = 16 };
+typedef struct {
+    bool used;
+    uint64_t generation;
+    pthread_t thread;
+    pthread_mutex_t mu;
+    pthread_cond_t done;
+    int fd, notify_read, notify_write;
+    long long length;
+    _Atomic int complete, error;
+} FilesPrepare;
+static FilesPrepare files_prepares[FILES_MAX_PREPARES];
+static FilesPrepare *files_prepare(long long handle) {
+    /* Even handles are prepare jobs; odd handles remain syncers. Cross-kind handles are invalid. */
+    if (handle <= 0 || (handle & 1)) return NULL;
+    uint64_t identity = (uint64_t)handle / 2 - 1;
+    FilesPrepare *p = &files_prepares[identity % FILES_MAX_PREPARES];
+    return p->used && p->generation == identity / FILES_MAX_PREPARES ? p : NULL;
+}
+static void *files_prepare_main(void *argument) {
+    FilesPrepare *p = argument;
+    int error = (int)minyar_files_preallocate(p->fd, p->length);
+    if (!error) error = (int)minyar_files_truncate(p->fd, p->length);
+    unsigned char zeros[65536] = {0};
+    long long at = 0;
+    while (!error && at < p->length) {
+        size_t count = (size_t)(p->length-at);
+        if (count > sizeof(zeros)) count = sizeof(zeros);
+        ssize_t n = pwrite(p->fd, zeros, count, (off_t)at);
+        if (n < 0) { if (errno == EINTR) continue; error = -errno; }
+        else if (!n) error = -EIO;
+        else at += n;
+    }
+    if (!error) {
+        int rc;
+        do { rc = files_datasync(p->fd); } while (rc != 0 && errno == EINTR);
+        if (rc) error = -errno;
+    }
+    pthread_mutex_lock(&p->mu);
+    atomic_store(&p->error, error);
+    atomic_store_explicit(&p->complete, 1, memory_order_release);
+    /* Publish readiness before releasing waiters, so a successful Wait can immediately drain it. */
+    char byte = 1; ssize_t n;
+    do { n = write(p->notify_write, &byte, 1); } while (n < 0 && errno == EINTR);
+    pthread_cond_broadcast(&p->done);
+    pthread_mutex_unlock(&p->mu);
+    return NULL;
+}
+long long minyar_files_prepareStart(long long fd, long long length) {
+    if (!files_valid_fd(fd)) return -EBADF;
+    if (length < 0) return -EINVAL;
+    if ((long long)(off_t)length != length) return -EOVERFLOW;
+    /* Check append mode before duplicating; positioned writes must honor their position on every platform. */
+    int flags = fcntl((int)fd, F_GETFL);
+    if (flags < 0) return -errno;
+    if ((flags & O_ACCMODE) == O_RDONLY) return -EBADF;
+    if (flags & O_APPEND) return -EINVAL;
+    int slot = -1;
+    for (int i=0; i<FILES_MAX_PREPARES; i++)
+        if (!files_prepares[i].used && files_prepares[i].generation <
+            ((uint64_t)LLONG_MAX / 2 - FILES_MAX_PREPARES) / FILES_MAX_PREPARES) { slot=i; break; }
+    if (slot < 0) return -EMFILE;
+    int dupfd = fcntl((int)fd, F_DUPFD_CLOEXEC, 0);
+    if (dupfd < 0) return -errno;
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) { int e=errno; close(dupfd); return -e; }
+    int error = files_cloexec_nonblock(sv[0], true);
+    if (!error) error = files_cloexec_nonblock(sv[1], true);
+    FilesPrepare *p = &files_prepares[slot];
+    uint64_t generation = p->generation;
+    if (error) goto fail_descriptors;
+    memset(p, 0, sizeof(*p)); p->generation=generation;
+    p->fd=dupfd; p->length=length; p->notify_read=sv[0]; p->notify_write=sv[1];
+    atomic_init(&p->complete, 0); atomic_init(&p->error, 0);
+    error = -pthread_mutex_init(&p->mu, NULL);
+    if (error) goto fail_descriptors;
+    error = -pthread_cond_init(&p->done, NULL);
+    if (error) goto fail_mutex;
+    error = -pthread_create(&p->thread, NULL, files_prepare_main, p);
+    if (error) goto fail_condition;
+    p->generation=generation+1; p->used=true;
+    return ((long long)p->generation * FILES_MAX_PREPARES + slot + 1) * 2;
+fail_condition:
+    pthread_cond_destroy(&p->done);
+fail_mutex:
+    pthread_mutex_destroy(&p->mu);
+fail_descriptors:
+    close(dupfd); close(sv[0]); close(sv[1]); return error;
+}
+long long minyar_files_prepareNotifySocket(long long handle) {
+    FilesPrepare *p=files_prepare(handle); return p ? p->notify_read : -EBADF;
+}
+long long minyar_files_prepareDone(long long handle) {
+    FilesPrepare *p=files_prepare(handle);
+    return p ? atomic_load_explicit(&p->complete, memory_order_acquire) : -EBADF;
+}
+long long minyar_files_prepareError(long long handle) {
+    FilesPrepare *p=files_prepare(handle); return p ? atomic_load(&p->error) : -EBADF;
+}
+long long minyar_files_prepareDrain(long long handle) {
+    FilesPrepare *p=files_prepare(handle); if (!p) return -EBADF;
+    char buffer[256]; long long total=0;
+    for (;;) {
+        ssize_t n=read(p->notify_read, buffer, sizeof(buffer));
+        if (n>0) total+=n;
+        else if (n<0 && errno==EINTR) continue;
+        else if (n<0 && errno!=EAGAIN && errno!=EWOULDBLOCK) return -errno;
+        else return total;
+    }
+}
+long long minyar_files_prepareWait(long long handle, long long timeoutMs) {
+    FilesPrepare *p=files_prepare(handle); if (!p) return -EBADF;
+    if (timeoutMs < -1) return -EINVAL;
+    struct timespec deadline; clock_gettime(CLOCK_REALTIME, &deadline);
+    if (timeoutMs>=0) {
+        deadline.tv_sec+=timeoutMs/1000; deadline.tv_nsec+=(timeoutMs%1000)*1000000L;
+        if (deadline.tv_nsec>=1000000000L) { deadline.tv_sec++; deadline.tv_nsec-=1000000000L; }
+    }
+    int error=0; pthread_mutex_lock(&p->mu);
+    while (!atomic_load_explicit(&p->complete, memory_order_acquire)) {
+        int rc=timeoutMs<0 ? pthread_cond_wait(&p->done,&p->mu)
+                          : pthread_cond_timedwait(&p->done,&p->mu,&deadline);
+        if (rc) { error=-rc; break; }
+    }
+    if (!error) error=atomic_load(&p->error);
+    pthread_mutex_unlock(&p->mu); return error ? error : 1;
+}
+long long minyar_files_prepareStop(long long handle) {
+    FilesPrepare *p=files_prepare(handle); if (!p) return -EBADF;
+    pthread_join(p->thread,NULL);
+    int error=atomic_load(&p->error);
+    close(p->fd); close(p->notify_read); close(p->notify_write);
+    pthread_cond_destroy(&p->done); pthread_mutex_destroy(&p->mu); p->used=false;
+    return error;
 }

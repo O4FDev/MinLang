@@ -8,13 +8,14 @@
 #include <stdint.h>
 #include <sys/stat.h>
 #include <unistd.h>
-static int pseudo, calls;
+static int pseudo, calls, partial_failure;
 static MinyarBytes *bounded_new(long long length) {
     assert(length <= 65536); return minyar_bytes_new(length);
 }
 static ssize_t ranged_pread(int fd, void *out, size_t length, off_t position) {
     if (!pseudo) return pread(fd, out, length, position);
     if (!calls++) { errno = EINTR; return -1; }
+    if (partial_failure && position >= 2) { errno = EIO; return -1; }
     const char payload[] = "pseudo-data";
     if (position >= (off_t)sizeof(payload)-1) return 0;
     size_t count = sizeof(payload)-1-(size_t)position;
@@ -56,6 +57,33 @@ int main(int argc, char **argv) {
         expect(fd, 3, 20, "def", 0); expect(fd, 6, 4, "", 0); expect(fd, 30, 4, "", 0);
         expect(fd, 0, 0, "", 0); expect(fd, -1, 1, "", -EINVAL);
         expect(fd, LLONG_MAX-1, 3, "", -EOVERFLOW);
+        expect(fd, 0, -1, "", -EINVAL);
+        expect(fd, 0, LLONG_MAX, "", -EOVERFLOW);
+    } else if (!strcmp(argv[1], "partial-error")) {
+        pseudo = partial_failure = 1;
+        expect(fd, 0, 64, "", -EIO);
+        pseudo = 0; expect(fd, 0, 6, "abcdef", 0);
+    } else if (!strcmp(argv[1], "read-file")) {
+        const char name[] = "/tmp/minyar-ranges-path-XXXXXX";
+        char pathname[sizeof(name)]; memcpy(pathname, name, sizeof(name));
+        int other = mkstemp(pathname); assert(other >= 0);
+        assert(write(other, "contents", 8) == 8); close(other);
+        MinyarText pathtext = {(const unsigned char *)pathname, (long long)strlen(pathname), 0, NULL, NULL};
+        MinyarBytes *b = minyar_files_readFile(&pathtext);
+        assert(b->byte_length == 8 && !memcmp(b->bytes,"contents",8) && !minyar_files_lastError());
+        minyar_rc_release(b); unlink(pathname);
+        b = minyar_files_readFile(&pathtext); assert(!b->byte_length && minyar_files_lastError()==-ENOENT);
+        minyar_rc_release(b);
+    } else if (!strcmp(argv[1], "procfs")) {
+#ifdef __linux__
+        int proc = open("/proc/self/cmdline", O_RDONLY); assert(proc >= 0);
+        struct stat st; assert(!fstat(proc,&st) && st.st_size == 0);
+        MinyarBytes *b = minyar_files_readAt(proc,0,1LL<<40);
+        assert(b->byte_length > 0 && !minyar_files_lastError()); minyar_rc_release(b); close(proc);
+        MinyarText pathtext = {(const unsigned char *)"/proc/self/cmdline", 18, 0, NULL, NULL};
+        b = minyar_files_readFile(&pathtext); assert(b->byte_length > 0 && !minyar_files_lastError());
+        minyar_rc_release(b);
+#endif
     } else abort();
     close(fd); return 0;
 }
