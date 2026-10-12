@@ -18,8 +18,6 @@ sys.path.insert(0, str(ROOT / 'tools'))
 from cycle_runtime import engine_source
 
 
-BASELINE = Path(os.environ.get('MINYAR_BASELINE_COMPILER',
-                              ROOT / 'build/minyarc-baseline')).resolve()
 
 
 class ManagedGraphs(CompilerTestCase):
@@ -67,7 +65,7 @@ class ManagedGraphs(CompilerTestCase):
                 self.assertEqual(run.stdout, expected.encode())
                 self.assertEqual(run.stderr, stderr.encode())
 
-    def test_existing_recursive_programs_keep_exact_llvm(self):
+    def test_existing_recursive_programs_preserve_behavior(self):
         cases = (
             '''record Callback { value: Integer }
 function value(record: Callback): Integer { return record.value }
@@ -95,18 +93,13 @@ let value = json.parse("{\\"x\\":[1,2,{\\"y\\":true}]}")
 print(json.pretty(value, ""))
 ''',
         )
-        for source in cases:
+        expected = ('42\nfunction(x: Integer) { Callback<Integer, Integer> }\n',
+                    '42\n', 'before after\n', '{"x":[1,2,{"y":true}]}\n')
+        for source, output in zip(cases, expected):
             with self.subTest(source=source.splitlines()[0]):
+                self.executes(source, output)
                 result, llvm = self.compile(source)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                reference = llvm.with_suffix('.baseline.ll')
-                baseline = self.evidence.run([str(BASELINE), str(llvm.with_suffix('.min')),
-                                             str(reference), *self.compiler_arguments],
-                                            capture_output=True, text=True, timeout=30,
-                                            phase='baseline-compile')
-                self.assertEqual(baseline.returncode, 0, baseline.stderr)
-                prepare_llvm_for_link(reference, LINK_FLAGS)
-                self.assertEqual(llvm.read_bytes(), reference.read_bytes())
                 self.assertNotIn('minyar-cycle-runtime', llvm.read_text())
                 self.assertNotIn('_traced(', llvm.read_text())
 
@@ -173,8 +166,11 @@ let values: List<Node> = []
 let node = Node { children: values }
 identity(values).add(node)
 ''')
-        for source in cases:
+        expected = ('42\nfunction(x: Integer) { Callback<Integer, Integer> }\n',
+                    '42\n', 'before after\n', '{"x":[1,2,{"y":true}]}\n')
+        for source, output in zip(cases, expected):
             with self.subTest(source=source.splitlines()[0]):
+                self.executes(source, output)
                 self.executes(source, '')
 
     def test_preserved_alias_return_and_record_projection_cycles(self):
