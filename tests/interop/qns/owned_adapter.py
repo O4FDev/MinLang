@@ -427,7 +427,7 @@ def lifetime_preflight():
 class RawCommands:
     def __init__(self,root):self.root=Path(root);self.root.mkdir(parents=True,exist_ok=False);self.rows=[]
     def save(self):atomic_json(self.root/"commands.json",{"schema_version":1,"commands":self.rows})
-    def run(self,argv,timeout,check=True,max_bytes=MAX_BYTES,return_bytes=True,admission_spec=None):
+    def run(self,argv,timeout,check=True,max_bytes=MAX_BYTES,return_bytes=True,admission_spec=None,stream_output=False):
         index=len(self.rows);out=self.root/(str(index).zfill(3)+".stdout");err=self.root/(str(index).zfill(3)+".stderr")
         row={"argv":list(argv),"timeout_seconds":timeout,"status":None,"timed_out":False,"primary_exception":None,"finalization_errors":[],
              "owner_process_identity":process_identity(os.getpid()),"process_identity":None,"lifetime":{"state":"intent","certified":False,"receipts":[],"members":[],"root_exited_with_descendants":False},
@@ -439,6 +439,25 @@ class RawCommands:
             row["finalization_errors"].append({"stage":stage,"type":type(error).__name__,"message":str(error)})
             row["lifetime"]["certified"]=False
             if primary is not None and hasattr(primary,"add_note"):primary.add_note(stage+": "+str(error))
+        def forward(target,data):
+            fd=target.fileno();blocking=os.get_blocking(fd);failure=None
+            try:
+                os.set_blocking(fd,False);remaining_data=memoryview(data)
+                while remaining_data:
+                    remaining_time=deadline-time.monotonic()
+                    if remaining_time<=0:raise subprocess.TimeoutExpired(argv,timeout)
+                    try:written=os.write(fd,remaining_data)
+                    except BlockingIOError:
+                        select.select([], [fd], [], min(.02,remaining_time));continue
+                    if written<=0:raise OwnershipError("forward stream made no progress")
+                    remaining_data=remaining_data[written:]
+            except BaseException as error:
+                failure=error;raise
+            finally:
+                try:os.set_blocking(fd,blocking)
+                except BaseException as error:
+                    if failure is None:raise
+                    secondary("forward stream mode restore",error)
         def attempt(stage,call):
             try:return call()
             except BaseException as error:secondary(stage,error);return None
@@ -506,6 +525,9 @@ class RawCommands:
                     if not data:selector.unregister(key.fileobj);continue
                     if total+len(data)>max_bytes:raise OwnershipError("command stream bound exceeded")
                     total+=len(data);key.data.write(data)
+                    if stream_output:
+                        key.data.flush()
+                        forward(sys.stdout.buffer if key.data is stdout else sys.stderr.buffer,data)
             row["lifetime"]["certified"]=drain_cli(identity,known,row["lifetime"]["receipts"],time.monotonic()+2,handles=handles)
             if not row["lifetime"]["certified"] or not all(handle.ready() for handle in handles.values()):raise CleanupError("CLI lifetime not certified closed")
             row["lifetime"]["state"]="closed";row["lifetime"]["members"]=list(known.values())
@@ -590,10 +612,10 @@ class DockerDaemon:
         self.docker=docker_path or shutil.which("docker")
         if not self.docker:raise OwnershipError("existing Docker CLI missing")
         self.cli=binding(self.docker)
-    def command(self,*args,timeout=10,check=True,return_bytes=True):
+    def command(self,*args,timeout=10,check=True,return_bytes=True,stream_output=False):
         if binding(self.docker)!=self.cli:raise OwnershipError("Docker CLI bytes changed")
         admitted=args and args[0]=="compose" and any(token in ("create","up") for token in args)
-        return self.commands.run([self.docker,*args],timeout,check=check,return_bytes=return_bytes,admission_spec=self.spec if admitted else None)
+        return self.commands.run([self.docker,*args],timeout,check=check,return_bytes=return_bytes,admission_spec=self.spec if admitted else None,stream_output=stream_output)
     def containers(self):
         return self.command("ps","-aq","--no-trunc","--filter","label=com.docker.compose.project="+self.spec.project).decode().splitlines()
     def inspect(self,identity):return json.loads(self.command("inspect",identity))[0]
@@ -1214,7 +1236,7 @@ def docker_entry(argv):
             up_index=command.index("up")
             command=command[:up_index+1]+["--no-build","--no-recreate"]+[token for token in command[up_index+1:] if token not in ROLES and token!="-V"]+requested_roles
             intent["workload_argv"]=command;admission_write(spec,intent)
-            raw=daemon.command(*command,timeout=330,check=False)
+            raw=daemon.command(*command,timeout=330,check=False,stream_output=True)
             up_receipt=dict(daemon.commands.rows[-1])
             intent["up_receipt"]=up_receipt
             if set(daemon.containers())!=set(created_ids):raise OwnershipError("workload container IDs changed after precreate")
@@ -1229,8 +1251,6 @@ def docker_entry(argv):
             except BaseException as secondary:
                 if hasattr(primary,"add_note"):primary.add_note("admission failure ledger: "+str(secondary))
             raise
-        sys.stdout.buffer.write(raw)
-        sys.stderr.buffer.write(Path(up_receipt["stderr"]["path"]).read_bytes())
         return up_receipt["status"]
     if argv[:4]==["compose","--env-file","empty.env","stop"]:
         roles=argv[4:]

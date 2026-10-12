@@ -765,6 +765,7 @@ def receipt_daemon(root,status=0):
             operation=next((v for v in args if v in ("create","up")),args[0]);self.events.append(operation)
             if operation=="create":adapter.atomic_json(self.path,template)
             self.row(operation,status if operation=="up" else 0,b"exact up stderr\n" if operation=="up" else b"inspection stderr\n")
+            if operation=="up" and kwargs.get("stream_output",False):sys.stderr.buffer.write(b"exact up stderr\n")
             if operation=="up":self.after=True
             return b""
         def containers(self):
@@ -1139,7 +1140,9 @@ def exact_compose_control(case,root,pinned_runner):
                 adapter.atomic_json(base.path,state)
                 adapter.atomic_json(root/"monitor-model.json",model)
                 if not model["monitor_complete"]:raise subprocess.TimeoutExpired(list(args),kwargs["timeout"])
-                return b"mock server UNSUPPORTED\n"
+                raw=b"mock server UNSUPPORTED\n"
+                if kwargs.get("stream_output",False):sys.stdout.buffer.write(raw);sys.stdout.buffer.flush()
+                return raw
             if case in ("compose-dependency-recreation","compose-dependency-foreign-object"):
                 entry=json.loads(json.dumps(state["containers"]["1"*64]))
                 if case=="compose-dependency-recreation":state["containers"].pop("1"*64)
@@ -1287,6 +1290,216 @@ def next_control(case,root,pinned_runner):
     if case=="sigchld-preflight-ignored":return sigchld_control(root)
     return post_pidfd_control(case,root)
 
+FORWARD_CASES=("raw-forward-incremental","raw-forward-stderr-status","raw-forward-no-duplicate",
+               "raw-forward-empty","raw-forward-private-json","raw-forward-backpressure")
+CASES+=FORWARD_CASES
+
+def forwarding_death_setup(parent_pid):
+    # Test-only, single-threaded Linux pre-exec setup. The production bootstrap
+    # still performs its original gate/publication and lifetime protocol.
+    import ctypes
+    libc=ctypes.CDLL(None,use_errno=True)
+    def install():
+        if libc.prctl(1,signal.SIGKILL,0,0,0)!=0:os._exit(125)
+        # Close the parent-death race before running any bootstrap/target code.
+        if os.getppid()!=parent_pid:os._exit(125)
+    return install
+
+def forwarding_replay_control(root):
+    # Actual docker_entry branch, mock Docker boundaries, no processes/daemon.
+    owner,daemon=receipt_daemon(root);real_command=daemon.command;calls=[]
+    payload=b"ready-out\ntail-out\n"
+    def command(*args,**kwargs):
+        raw=real_command(*args,**kwargs);calls.append({"argv":list(args),"stream_output":kwargs.get("stream_output",False)})
+        if "up" in args:
+            if kwargs.get("stream_output",False):sys.stdout.buffer.write(payload)
+            return payload
+        return raw
+    daemon.command=command
+    status,out,err=invoke_fake(owner,daemon)
+    intent=json.loads((owner.paths["artifacts"]/"create-admission.json").read_bytes())
+    ups=[value for value in calls if "up" in value["argv"]]
+    return {"status":"passed","scope":"actual docker_entry with mocked Docker boundaries only",
+            "checks":{"adapter_branch_completed":status==0 and intent["state"]=="closed" and intent["certified"] is True,
+                      "actual_workload_opt_in":len(ups)==1 and ups[0]["stream_output"] is True,
+                      "stdout_replay_absent":out==payload,"stderr_replay_absent":err==b"exact up stderr\n",
+                      "create_not_forwarded":all(value["stream_output"] is False for value in calls if "create" in value["argv"])}},"passed"
+
+def forwarding_control(case,root):
+    if case=="raw-forward-no-duplicate":return forwarding_replay_control(root)
+    # Real harmless subprocesses only. The caller survives communicate(timeout).
+    mode="private" if case=="raw-forward-private-json" else "blocked" if case=="raw-forward-backpressure" else "stream"
+    empty=case=="raw-forward-empty";code=7 if case=="raw-forward-stderr-status" else 0
+    ready=b"" if empty else b'{"inspect":"mock"}\n' if mode=="private" else b"ready-out\n"
+    warning=b"" if empty or mode=="private" else b"ready-err\n"
+    tail=b"" if empty or mode=="private" else b"tail-out\n";tailerr=b"" if empty or mode=="private" else b"tail-err\n"
+    emitted=root/"emitted.json";release=root/"release";worker_result=root/"worker-result.json"
+    producer=root/"producer.py";worker=root/"worker.py";worker_ready=root/"worker-ready.json"
+    producer.write_text(
+        "import ctypes,json,os,time\nfrom pathlib import Path\n"
+        +"libc=ctypes.CDLL(None);death=ctypes.c_int();assert libc.prctl(2,ctypes.byref(death),0,0,0)==0\n"
+        +"fields=Path('/proc/self/stat').read_text().rpartition(') ')[2].split()\n"
+        +"birth={'pid':os.getpid(),'start_ticks':int(fields[19]),'pgid':int(fields[2]),'session':int(fields[3]),'parent_pid':os.getppid(),'parent_death_signal':death.value}\n"
+        +"os.write(1,"+repr(ready)+");os.write(2,"+repr(warning)+")\n"
+        +"published=Path("+repr(str(emitted))+ ");temporary=published.with_suffix('.tmp');temporary.write_text(json.dumps(birth));os.replace(temporary,published)\n"
+        +("os.write(1,b'x'*(2*1024*1024))\n" if mode=="blocked" else
+          "deadline=time.monotonic()+8\nwhile not Path("+repr(str(release))+").exists():\n"
+          +" if time.monotonic()>deadline:raise SystemExit(9)\n time.sleep(.01)\n")
+        +"os.write(1,"+repr(tail)+");os.write(2,"+repr(tailerr)+")\nraise SystemExit("+str(code)+")\n")
+    worker.write_text(
+        "import ctypes,hashlib,importlib.util,inspect,json,os,signal,sys\nfrom pathlib import Path\n"
+        +"path=Path("+repr(str(MODULE))+");before=path.read_bytes()\n"
+        +"spec=importlib.util.spec_from_file_location('owned',path);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)\n"
+        +"libc=ctypes.CDLL(None,use_errno=True);death=ctypes.c_int();assert libc.prctl(2,ctypes.byref(death),0,0,0)==0\n"
+        +"m.atomic_json(Path("+repr(str(worker_ready))+"),{'identity':m.process_identity(os.getpid()),'pgid':os.getpgrp(),'parent_pid':os.getppid(),'parent_death_signal':death.value})\n"
+        +"expected=os.getpid();original_popen=m.subprocess.Popen\n"
+        +"def install():\n if libc.prctl(1,signal.SIGKILL,0,0,0)!=0:os._exit(125)\n if os.getppid()!=expected:os._exit(125)\n"
+        +"def owned_popen(*args,**kwargs):\n assert kwargs.get('preexec_fn') is None\n kwargs['preexec_fn']=install\n return original_popen(*args,**kwargs)\n"
+        +"m.subprocess.Popen=owned_popen\n"
+        +"r=m.RawCommands(Path("+repr(str(root/"commands"))+"));failure=None;raw=b''\n"
+        +"available='stream_output' in inspect.signature(r.run).parameters\n"
+        +"stream=available and "+repr(mode!="private")+"\n"
+        +"options={'stream_output':stream} if available else {}\n"
+        +"blocking=[os.get_blocking(1),os.get_blocking(2)]\n"
+        +"try:raw=r.run([sys.executable,'-B',"+repr(str(producer))+"],"+("1.0" if mode=="blocked" else "5.0")+",check=False,**options)\n"
+        +"except BaseException as e:failure={'type':type(e).__name__,'message':str(e)}\n"
+        +"finally:m.subprocess.Popen=original_popen\n"
+        +"value={'row':r.rows[0],'failure':failure,'api_present':available,'blocking_before':blocking,'blocking_after':[os.get_blocking(1),os.get_blocking(2)],'source_equal':path.read_bytes()==before,'raw_sha256':hashlib.sha256(raw).hexdigest()}\n"
+        +"m.atomic_json(Path("+repr(str(worker_result))+"),value)\n"
+        # Old valid API + its original late replay are the genuine baseline.
+        +"if "+repr(mode!="private")+" and not available and failure is None:\n"
+        +" sys.stdout.buffer.write(raw);sys.stdout.buffer.flush()\n"
+        +" sys.stderr.buffer.write(Path(r.rows[0]['stderr']['path']).read_bytes());sys.stderr.buffer.flush()\n"
+        +"raise SystemExit("+str(code)+" if failure is None else 0)\n")
+    subreaper=adapter.subreaper_begin();proc=None;handles=[];worker_handle=None;producer_handle=None
+    custody={"outer_group":os.getpgrp(),"driver_identity":adapter.process_identity(os.getpid()),"forced_cleanup":False,"signals":[],"reaped":[],"handles":[],"subreaper_restored":False}
+    worker_identity=None;producer_identity=None;early_stdout=None;early_stderr=None;expired=False;forced=False
+    early_private_stdout=b"";early_private_stderr=b"";live_at_observation=False;stdout=b"";stderr=b""
+    try:
+        # Stay in the accepted outer guard's group, with kernel death coupling
+        # as well; the worker's producer is still RawCommands' own new session.
+        proc=subprocess.Popen([sys.executable,"-B",str(worker)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                              preexec_fn=forwarding_death_setup(os.getpid()))
+        worker_handle=adapter.open_owned_child_handle(proc);handles.append(worker_handle)
+        worker_identity=adapter.process_identity(proc.pid);custody["worker_identity"]=worker_identity
+        if worker_identity is None:raise RuntimeError("worker birth unavailable")
+        worker_handle.identity=dict(worker_identity)
+        deadline=time.monotonic()+4
+        while not emitted.exists() and proc.poll() is None and time.monotonic()<deadline:time.sleep(.01)
+        if not emitted.exists():raise RuntimeError("harmless producer did not start")
+        producer_identity=json.loads(emitted.read_bytes());custody["producer_identity"]=producer_identity
+        producer_handle=adapter.open_process_handle(producer_identity);handles.append(producer_handle)
+        if mode=="blocked":
+            # Do not drain until the original command deadline has completed.
+            deadline=time.monotonic()+7
+            while not worker_result.exists() and proc.poll() is None and time.monotonic()<deadline:time.sleep(.01)
+            if not worker_result.exists():raise RuntimeError("backpressure did not finish within the control bound")
+        else:
+            try:stdout,stderr=proc.communicate(timeout=.4)
+            except subprocess.TimeoutExpired as error:
+                expired=True;early_stdout=error.stdout;early_stderr=error.stderr
+                live_at_observation=proc.poll() is None
+                for filename,stream in (("000.stdout","stdout"),("000.stderr","stderr")):
+                    p=root/"commands"/filename;data=p.read_bytes() if p.exists() else b""
+                    if stream=="stdout":early_private_stdout=data
+                    else:early_private_stderr=data
+            release.touch()
+        stdout,stderr=proc.communicate(timeout=8)
+    finally:
+        release.touch(exist_ok=True)
+        if proc is not None and proc.poll() is None:
+            try:stdout,stderr=proc.communicate(timeout=8)
+            except subprocess.TimeoutExpired:
+                forced=True
+                if worker_handle is None:worker_handle=adapter.open_owned_child_handle(proc);handles.append(worker_handle)
+                worker_handle.send(signal.SIGTERM);custody["signals"].append({"identity":worker_identity,"signal":"SIGTERM","authority":"held-pidfd"})
+                try:proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    worker_handle.send(signal.SIGKILL);custody["signals"].append({"identity":worker_identity,"signal":"SIGKILL","authority":"held-pidfd"});proc.wait(timeout=2)
+        # Parent is the exclusive subreaper: if the worker failed before its
+        # result/identity publication, a producer killed by PDEATHSIG is adopted
+        # here. Discovery never opens or signals an unrelated session by PID.
+        for identity in adapter.direct_children():
+            forced=True;handle=adapter.open_process_handle(identity);handles.append(handle)
+            if not handle.ready():
+                handle.send(signal.SIGKILL);custody["signals"].append({"identity":identity,"signal":"SIGKILL","authority":"exclusive-subreaper-held-pidfd"})
+            expiry=time.monotonic()+2
+            while True:
+                pid,status=os.waitpid(identity["pid"],os.WNOHANG)
+                if pid:break
+                if time.monotonic()>=expiry:
+                    adapter.atomic_json(root/"custody.json",custody)
+                    raise RuntimeError("adopted harmless producer did not reap within bound")
+                time.sleep(.01)
+            custody["reaped"].append({"identity":identity,"pid":pid,"wait_status":status})
+        deadline=time.monotonic()+2
+        while not all(handle.ready() for handle in handles) and time.monotonic()<deadline:time.sleep(.01)
+        custody["forced_cleanup"]=forced;custody["handles"]=[{"identity":handle.identity,"ready":handle.ready()} for handle in handles]
+        if not all(handle.ready() for handle in handles):
+            adapter.atomic_json(root/"custody.json",custody)
+            raise RuntimeError("harmless test lifetime remains unresolved")
+        for handle in handles:handle.close()
+        libc,prior=subreaper
+        if libc.prctl(36,prior,0,0,0)!=0:raise RuntimeError("harmless test subreaper restoration failed")
+        custody["subreaper_restored"]=True;adapter.atomic_json(root/"custody.json",custody)
+    value=json.loads(worker_result.read_bytes());row=value["row"];lifetime=row["lifetime"]
+    worker_birth=json.loads(worker_ready.read_bytes())
+    private_stdout=Path(row["stdout"]["path"]).read_bytes();private_stderr=Path(row["stderr"]["path"]).read_bytes()
+    def absent(identity):
+        # A zombie with the same birthday is still an unreaped lifetime.
+        try:fields=Path("/proc/"+str(identity["pid"])+"/stat").read_text().rpartition(") ")[2].split()
+        except (FileNotFoundError,ProcessLookupError):return True
+        return int(fields[19])!=identity["start_ticks"]
+    identities=lifetime.get("members",[])
+    physical_closed=all(absent(identity) for identity in identities)
+    worker_absent=worker_identity is not None and absent(worker_identity)
+    producer_absent=producer_identity is not None and absent(producer_identity)
+    checks={"real_child_executed":row["process_identity"] is not None,"source_unchanged":value["source_equal"],
+            "physical_lifetime_closed":physical_closed and worker_absent and producer_absent and all(item["ready"] for item in custody["handles"]),
+            "root_wait_recorded":type(row["status"]) is int,"no_forced_worker_cleanup":not forced,
+            "sink_mode_restored":value["blocking_before"]==value["blocking_after"],
+            "outer_group_owns_worker":worker_birth["pgid"]==custody["outer_group"],
+            "kernel_death_chain":worker_birth["parent_pid"]==os.getpid() and worker_birth["parent_death_signal"]==signal.SIGKILL and producer_identity["parent_pid"]==proc.pid and producer_identity["parent_death_signal"]==signal.SIGKILL,
+            "producer_separate_session_bound":producer_identity["pid"]==producer_identity["pgid"]==producer_identity["session"] and all(row["process_identity"][key]==producer_identity[key] for key in ("pid","start_ticks")),
+            "subreaper_restored":custody["subreaper_restored"]}
+    if mode=="blocked":
+        checks.update({"actual_timeout_preserved":value["failure"] is not None and value["failure"]["type"]=="TimeoutExpired" and row["timed_out"] is True and row["primary_exception"]["type"]=="TimeoutExpired",
+                       "abort_not_certified":lifetime["certified"] is False,
+                       "private_retention_bounded":row["stdout"]["bytes"]<=adapter.MAX_BYTES,
+                       "control_worker_not_protocol_verdict":proc.returncode==0})
+    else:
+        checks.update({"normal_child_status":row["status"]==code and proc.returncode==code,
+                       "normal_lifetime_state_closed":lifetime["state"]=="closed","normal_lifetime_certified":lifetime["certified"] is True,
+                       "caller_timeout_observed":expired and live_at_observation,
+                       "private_exact_stdout":private_stdout==ready+tail,"private_exact_stderr":private_stderr==warning+tailerr})
+        if empty:
+            try:early_stdout.decode("utf-8",errors="replace")
+            except AttributeError:literal_error=True
+            else:literal_error=False
+            checks.update({"empty_still_literal_error":literal_error and early_stdout is None,
+                           "no_fabricated_upstream_bytes":stdout==b"" and stderr==b""})
+        elif mode=="private":
+            checks.update({"structured_json_not_forwarded":early_stdout is None and early_stderr is None and stdout==b"" and stderr==b""})
+            daemon=object.__new__(adapter.DockerDaemon);mock_cli=root/"mock-cli";mock_cli.write_bytes(b"mock binding, never executed")
+            daemon.docker=str(mock_cli);daemon.cli=adapter.binding(mock_cli);daemon.spec=object();calls=[]
+            class Capture:
+                def run(self,*args,**kwargs):calls.append(kwargs);return b'{"mock":true}'
+            daemon.commands=Capture();daemon.command("inspect","mock");daemon.command("compose","create","mock")
+            checks["inspect_create_default_private"]=len(calls)==2 and all(x.get("stream_output",False) is False for x in calls)
+        else:
+            checks.update({"early_ready_stdout":early_stdout is not None and early_stdout.startswith(ready),
+                           "early_ready_stderr":early_stderr is not None and early_stderr.startswith(warning),
+                           "early_private_before_forward":early_private_stdout.startswith(ready) and early_private_stderr.startswith(warning),
+                           "upstream_exact_once":stdout==ready+tail and stderr==warning+tailerr})
+    result={"status":"passed","scope":"harmless forwarding control only; no Docker/network or official verdict",
+            "checks":checks,"worker_identity":worker_identity,"worker_status":proc.returncode,"worker_result":value,"custody":custody,
+            "early":{"caller_timed_out":expired,"worker_still_running":live_at_observation,
+                     "stdout_bytes":None if early_stdout is None else len(early_stdout),
+                     "stderr_bytes":None if early_stderr is None else len(early_stderr),
+                     "private_stdout_bytes":len(early_private_stdout),"private_stderr_bytes":len(early_private_stderr)}}
+    return result,"passed"
+
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument("--artifacts",type=Path,required=True)
@@ -1303,7 +1516,8 @@ def main():
     for case in cases:
         root=args.artifacts/case;root.mkdir()
         try:
-            if case in NEXT_CASES:result,expected=next_control(case,root,args.pinned_runner)
+            if case in FORWARD_CASES:result,expected=forwarding_control(case,root)
+            elif case in NEXT_CASES:result,expected=next_control(case,root,args.pinned_runner)
             elif case in BOOT_CASES:result,expected=bootstrap_control(case,root)
             elif case in REVIEW_CASES:result,expected=review_control(case,root)
             elif case=="copy-official-fixture-layout":result,expected=copy_layout_control(root)
