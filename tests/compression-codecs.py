@@ -300,7 +300,7 @@ def qualify(options, evidence):
     manifest={'mode':options.mode,'compiler':str(compiler),'clang_version':evidence.run([clang,'--version']).decode(),
               'providers':providers,'hashes':{}}
     sources=[compiler,*[ROOT/p for p in ['library/zstd.min','library/deflate.min','runtime/native/zstd.c','runtime/native/deflate.c',
-                'runtime/native/compression.h','tools/compression_provider.py','tools/clang-driver.py','tests/compression.py',
+                'runtime/native/compression.h','tools/compression_provider.py','tools/clang-driver.py','tests/compression-codecs.py',
                 'tests/compression.min','tests/compression-driver.min','tests/compression-native.c','tests/compression-reference.c',
                 'runtime/minyar_runtime.c','runtime/minyar_native.h','tests/llvm_sanitizer.py','tools/sanitizer_llvm.py']],
              *evidence.directory.glob('*.ll')]

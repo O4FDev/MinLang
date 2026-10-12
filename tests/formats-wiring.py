@@ -26,7 +26,7 @@ class Dispatch(unittest.TestCase):
 print(json.dumps({'clang':os.environ.get('MINYAR_TEST_CLANG'),'path':os.environ['PATH'],
                   'ubsan':os.environ.get('UBSAN_OPTIONS'),'argv':sys.argv[1:]}))
 '''
-            for script in ('compression.py', 'sha256.py', 'tar.py', 'formats.py'):
+            for script in ('compression-codecs.py', 'sha256.py', 'tar.py', 'formats.py'):
                 (root / 'tests' / script).write_text(spy)
             environment = dict(os.environ)
             # This isolated Makefile sets its own native compiler. An outer
