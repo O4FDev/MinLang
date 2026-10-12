@@ -62,8 +62,11 @@ Implemented chunks, awaiting review/remaining qualification:
   half-close/backpressure HUP spin. The separate fix's combined regression is green;
   exact source `1751f1e` passes Linux debug/release/sanitizer and Mac native tests.
   Its full benchmark rerun failed hit p99 at 1.6303x (188.1/115.4 us); all other nine
-  cells pass. All failure samples are retained. A generic bounded small-response
-  buffer optimization is underway before repeating the complete unchanged gate.
+  cells pass. All failure samples are retained. Generic small-response coalescing
+  `f6d9dfb` passed the complete unchanged gate (worst 1.103x); binary packing
+  boundary tests `64bb2e9` and evidence `2e7a50f` preserve all prior failures.
+  Fresh independent R2 review is running; the final Linux debug/release/sanitizer
+  and bounded Mac native checks pass.
   Windows execution pending.
 
 ## Gates and coordination
