@@ -124,8 +124,11 @@ native/sanitizer targets use the qualified budgets 1/32 and sizes 512/2048.
 Their separate Make wiring passed dry-run review; the catalogue covers 498
 sources and rejects all 24 invalid controls. Two small ARM64 C native and
 ASan/UBSan checks also pass all 18 modes with stable inputs. These results do
-not claim macOS LSan, a combined language suite or device capacity. Four
-affected Windows C checks are running separately; long tests remain pending.
+not claim macOS LSan, a combined language suite or device capacity. All four
+affected Windows C checks also pass: native and ASan/UBSan full-MARK cases,
+plus the original one-second idle checks at 1.5625% and zero CPU respectively.
+Their 102 indexed files, current sources, nine closed Windows Jobs and normal
+VM shutdown were independently reviewed. Long tests remain pending.
 
 ## Recoverable errors
 
@@ -282,12 +285,14 @@ peers and Retry in both directions against all four peers.
 Each literal official verdict, original deadline and owned cleanup remains
 intact. All 340 indexed metadata files and their literal verdicts, source
 admission and owned retirement were independently verified. A further serial
-continuation has passed indices 56–63: resumption in both directions against
-all four peers. It retired normally and handed Y to the affected Windows
-collector checks. The next untouched cell is 64 (0-RTT); 64 original cells
-remain untouched at this checkpoint. These
-results do not rewrite the historical matrix or certify all 128 current-source
-cells.
+continuation has passed indices 56–68: resumption in both directions against
+all four peers, all four client 0-RTT cases and the server 0-RTT quiche case.
+After the affected Windows checks, unchanged endpoint inputs returned to Y.
+Original index 69, server 0-RTT against Quinn, stopped with runner status 1
+before producing a matrix verdict. Its missing-file wrapper error, failed
+cleanup/watch records and raw runner evidence are preserved; process lifetime
+review and diagnosis remain pending. Later cells are suspended. These results
+do not rewrite historical failures or certify all 128 current-source cells.
 
 Actual runner failures exposed fixture defects in Docker 29 capability
 spelling, simulator capture writers that had not flushed during shutdown, and
@@ -413,6 +418,15 @@ source/tool inputs and a validated x86-64 ELF/loader ABI. An accidental
 no test ran in that interrupted attempt. The successful continuation used
 the original 600-second inner guard. This qualifies the helper needed for
 the next device cohort; it is not a 4,096-device or sustained-capacity pass.
+
+The current `b1dfe092` peer-edge release build also passes independent source,
+runtime content-key, actual ThinLTO, link and ABI review. Its first unchanged
+4,096-device cohort fails during setup: 2,063 devices authenticate before a
+device TLS handshake reaches the original 20-second timeout. The last recorded
+admission sample has 1,362 Redis entries, 172,792 KiB target RSS and 32,850 UDP
+drops. No common start or steady-state measurement occurs. This preserves a
+current-source capacity failure; the collector regression passes above do not
+establish device capacity. Failure retirement and causal review are separate.
 
 ## Desktop and shipping
 
