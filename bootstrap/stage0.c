@@ -718,8 +718,10 @@ static Expression *parse_expression(Parser *parser) {
 }
 
 static void finish_simple_statement(Parser *parser) {
-    if (parser->token.kind == ';')
+    if (parser->token.kind == ';') {
         advance(parser);
+        return;
+    }
     if (parser->token.kind == TOKEN_NEWLINE) {
         skip_separators(parser);
         return;
