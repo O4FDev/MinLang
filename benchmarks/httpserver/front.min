@@ -1,0 +1,258 @@
+// front PORT NUMERIC_UPSTREAM_IP UPSTREAM_PORT [ENTRIES] [BYTES]
+// Uses the reusable HTTP server, with a fresh asynchronous upstream per miss.
+use "httpserver" as http
+use "eventloop" as loop
+use "errors" as errors
+use "net" as net
+use "./cache.min" as cache
+
+record Pending {
+    active: Boolean
+    request: http.Request
+    key: Text
+    socket: Integer
+    registration: Integer
+    phase: Integer
+    output: Bytes
+    sent: Integer
+    input: Bytes
+    scan: Integer
+    header: Integer
+    length: Integer
+    status: Integer
+    deadline: Integer
+}
+record Front {
+    server: http.Server
+    cache: cache.Cache
+    upstream: Text
+    upstreamPort: Integer
+    pending: List<Pending>
+    freeSlots: List<Integer>
+    freeCount: Integer
+    connects: Integer
+}
+function number(value: Text): Integer {
+    let result = 0
+    for byte in Bytes(value) {
+        if byte < 48 || byte > 57 || result > 100000000 { fail("invalid fixture number") }
+        result = result * 10 + byte - 48
+    }
+    if value == "" { fail("empty fixture number") }
+    return result
+}
+function reply(front: Front, request: http.Request, status: Integer, body: Bytes, state: Text) {
+    let response = http.response(status, "application/json", body)
+    response.headers.add(http.Header { name: "x-cache"; value: state })
+    if http.requestActive(front.server, request) { http.respond(front.server, request, response) }
+}
+function retire(front: Front, slot: Integer) {
+    let pending = front.pending[slot]
+    if !pending.active { return }
+    if pending.registration >= 0 { loop.remove(http.loopHandle(front.server), pending.registration) }
+    if pending.socket >= 0 { net.close(pending.socket) }
+    pending.active = false; pending.registration = -1; pending.socket = -1
+    pending.input = Bytes(); pending.output = Bytes(); pending.key = ""
+    if front.freeCount < front.freeSlots.length { front.freeSlots[front.freeCount] = slot }
+    else { front.freeSlots.add(slot) }
+    front.freeCount += 1
+}
+function failed(front: Front, slot: Integer) {
+    let request = front.pending[slot].request
+    retire(front, slot)
+    reply(front, request, 502, Bytes("upstream failed"), "error")
+}
+function start(front: Front, request: http.Request, key: Text) {
+    let slot = front.pending.length
+    if front.freeCount > 0 { front.freeCount -= 1; slot = front.freeSlots[front.freeCount] }
+    let host = front.upstream
+    if net.ipVersion(host) == 6 { host = "[" + host + "]" }
+    let pending = Pending { active: true; request: request; key: key; socket: -1; registration: -1;
+        phase: 1; output: Bytes("GET " + request.target + " HTTP/1.1\r\nhost: " + host +
+            "\r\nconnection: close\r\n\r\n"); sent: 0; input: Bytes(); scan: 0; header: -1;
+        length: -1; status: 0; deadline: net.monotonicMilliseconds() + 5000 }
+    if slot == front.pending.length { front.pending.add(pending) } else { front.pending[slot] = pending }
+    front.connects += 1
+    let opened = net.connectStart(front.upstream, front.upstreamPort)
+    if !errors.integerOk(opened) { failed(front, slot); return }
+    pending.socket = errors.integerValue(opened)
+    net.setNoDelay(pending.socket, true)
+    let watched = loop.watch(http.loopHandle(front.server), pending.socket, loop.writableInterest(), -2 - slot)
+    if !errors.integerOk(watched) { failed(front, slot); return }
+    pending.registration = errors.integerValue(watched)
+}
+function index(data: Bytes, byte: Integer, from: Integer, to: Integer): Integer {
+    for at in from..to { if data[at] == byte { return at } }
+    return -1
+}
+function lower(data: Bytes): Text {
+    let out = Bytes()
+    for byte in data {
+        let value = byte
+        if byte >= 65 && byte <= 90 { value += 32 }
+        out.add(value)
+    }
+    return Text(out)
+}
+function upstreamHead(pending: Pending): Boolean {
+    let data = pending.input
+    if pending.header < 12 { return false }
+    for at in 0..pending.header {
+        let byte = data[at]
+        if byte >= 127 || byte < 32 && byte != 9 && byte != 13 && byte != 10 { return false }
+        if byte == 13 && (at + 1 >= data.length || data[at + 1] != 10) { return false }
+        if byte == 10 && (at == 0 || data[at - 1] != 13) { return false }
+    }
+    if Text(data.slice(0, 9)) != "HTTP/1.1 " { return false }
+    for at in 9..12 { if data[at] < 48 || data[at] > 57 { return false } }
+    pending.status = (data[9] - 48) * 100 + (data[10] - 48) * 10 + data[11] - 48
+    let at = index(data, 13, 0, pending.header) + 2
+    let count = 0
+    while at < pending.header {
+        let end = index(data, 13, at, pending.header + 1)
+        let colon = index(data, 58, at, end)
+        if end < 0 || colon <= at { return false }
+        let name = lower(data.slice(at, colon))
+        if name == "transfer-encoding" { return false }
+        if name == "content-length" {
+            count += 1
+            let from = colon + 1
+            let to = end
+            while from < to && (data[from] == 32 || data[from] == 9) { from += 1 }
+            while to > from && (data[to - 1] == 32 || data[to - 1] == 9) { to -= 1 }
+            if from == to { return false }
+            let value = 0
+            for i in from..to {
+                if data[i] < 48 || data[i] > 57 || value > 4194304 / 10 { return false }
+                value = value * 10 + data[i] - 48
+                if value > 4194304 { return false }
+            }
+            pending.length = value
+        }
+        at = end + 2
+    }
+    return count == 1 && pending.status >= 200 && pending.status <= 599
+}
+function complete(front: Front, slot: Integer) {
+    let pending = front.pending[slot]
+    let body = pending.input.slice(pending.header + 4, pending.header + 4 + pending.length)
+    let request = pending.request
+    let status = pending.status
+    if status == 200 { cache.insert(front.cache, pending.key, body) }
+    retire(front, slot)
+    let state = "error"
+    if status == 200 { state = "miss" }
+    reply(front, request, status, body, state)
+}
+function upstreamReady(front: Front, slot: Integer) {
+    let pending = front.pending[slot]
+    if pending.phase == 1 {
+        let connected = net.connectFinish(pending.socket)
+        if !errors.booleanOk(connected) {
+            if errors.isWouldBlock(errors.booleanError(connected)) { return }
+            failed(front, slot); return
+        }
+        pending.phase = 2
+    }
+    if pending.phase == 2 {
+        let written = net.writeRange(pending.socket, pending.output, pending.sent, pending.output.length - pending.sent)
+        if written == -1 { return }
+        if written <= 0 { failed(front, slot); return }
+        pending.sent += written
+        if pending.sent < pending.output.length { return }
+        if !errors.booleanOk(loop.update(http.loopHandle(front.server), pending.registration, loop.readableInterest(), -2 - slot)) {
+            failed(front, slot); return
+        }
+        pending.phase = 3
+        return
+    }
+    let limit = 4194304 + 16384 - pending.input.length
+    if limit <= 0 { failed(front, slot); return }
+    let read = net.readInto(pending.socket, pending.input, min(65536, limit))
+    if read == -1 { return }
+    if read <= 0 { failed(front, slot); return }
+    if pending.header < 0 {
+        let at = pending.scan
+        while at + 3 < pending.input.length {
+            if pending.input[at] == 13 && pending.input[at + 1] == 10 && pending.input[at + 2] == 13 && pending.input[at + 3] == 10 {
+                pending.header = at; break
+            }
+            at += 1
+            if at >= 16380 { failed(front, slot); return }
+        }
+        pending.scan = at
+        if pending.header >= 0 {
+            if !upstreamHead(pending) { failed(front, slot); return }
+        }
+    }
+    if pending.header >= 0 && pending.input.length >= pending.header + 4 + pending.length { complete(front, slot) }
+}
+function handle(front: Front, request: http.Request) {
+    if request.method != "GET" { reply(front, request, 405, Bytes("method not allowed"), "none"); return }
+    let question = index(Bytes(request.target), 63, 0, request.target.byteLength)
+    let path = request.target
+    if question >= 0 { path = request.target.slice(0, question) }
+    if path == "/stats" {
+        let c = front.cache
+        let stats = "{\"hits\":" + Text(c.hits) + ",\"misses\":" + Text(c.misses) + ",\"entries\":" + Text(c.count) +
+            ",\"bytes\":" + Text(c.bytes) + ",\"evictions\":" + Text(c.evictions) + ",\"upstream_connects\":" + Text(front.connects) + "}"
+        reply(front, request, 200, Bytes(stats), "none"); return
+    }
+    if path != "/api/search" || question < 0 { reply(front, request, 404, Bytes("not found"), "none"); return }
+    let key = cache.key(request.target)
+    let found = cache.lookup(front.cache, key)
+    if found >= 0 {
+        front.cache.hits += 1; reply(front, request, 200, front.cache.values[found], "hit"); return
+    }
+    front.cache.misses += 1
+    start(front, request, key)
+}
+function main(): Integer {
+    if argumentCount() < 3 { print("usage: front PORT UPSTREAM_IP UPSTREAM_PORT [ENTRIES] [BYTES]"); return 2 }
+    if net.ipVersion(argument(1)) == 0 { fail("upstream must be numeric") }
+    let entries = 100000
+    let bytes = 268435456
+    if argumentCount() > 3 { entries = number(argument(3)) }
+    if argumentCount() > 4 { bytes = number(argument(4)) }
+    if entries <= 0 || entries > 1000000 || bytes <= 0 || bytes > 1073741824 { fail("invalid cache bounds") }
+    let limits = http.defaults()
+    limits.maxBodyBytes = 0
+    limits.maxResponseBytes = 4194304
+    limits.applicationMilliseconds = 6000
+    let server = http.listen("127.0.0.1", number(argument(0)), limits)
+    if !http.ok(server) { fail(errors.message(http.serverError(server))) }
+    let front = Front { server: server; cache: cache.newCache(entries, bytes); upstream: argument(1);
+        upstreamPort: number(argument(2)); pending: []; freeSlots: []; freeCount: 0; connects: 0 }
+    print(http.port(server))
+    while http.ok(server) {
+        let timeout = http.waitMilliseconds(server, -1)
+        let now = net.monotonicMilliseconds()
+        for pending in front.pending {
+            if pending.active { timeout = min(timeout, max(0, pending.deadline - now)) }
+        }
+        let batch = loop.wait(http.loopHandle(server), timeout, 256)
+        let requests = http.advance(server, batch)
+        if errors.isError(http.batchError(requests)) { break }
+        for request in http.requests(requests) { handle(front, request) }
+        now = net.monotonicMilliseconds()
+        for slot in 0..front.pending.length {
+            let pending = front.pending[slot]
+            if pending.active {
+                if !http.requestActive(server, pending.request) { retire(front, slot) }
+                else { if now >= pending.deadline { failed(front, slot) } }
+            }
+        }
+        for event in loop.events(batch) {
+            if event.token <= -2 {
+                let slot = -2 - event.token
+                if slot < front.pending.length {
+                    let pending = front.pending[slot]
+                    if pending.active && pending.registration == event.registration { upstreamReady(front, slot) }
+                }
+            }
+        }
+    }
+    for slot in 0..front.pending.length { retire(front, slot) }
+    http.close(server)
+    return 0
+}

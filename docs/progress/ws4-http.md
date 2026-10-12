@@ -38,6 +38,28 @@ remote catalogue invocation failed because the parent baseline archive lacks
 .github/workflows/ci.yml; the full local checkout catalogue passes. Its failing
 command result is retained rather than counted as passing qualification.
 
-Pending: independent parent review; actual macOS and Windows execution; cache
-front using this API, Rust/axum comparator and finite 548-query byte/LRU/HoL
-harness; quiet-host <=1.5x axum p50 AND p99 gate. No performance claim yet.
+Cache fixture/harness implemented in benchmarks/httpserver/. Pinned 548-query
+corpus and original recorded body gzip are included byte-for-byte. Exact key is
+first raw k + one NUL octet + first raw q, bounded exact LRU and nonblocking
+fresh upstream connections; both fronts run single-owner/current-thread loops.
+Pinned axum/Tokio plus Cargo.lock; no Map/compiler/runtime changes.
+
+Linux `make -j1 check-httpserver-front` passes the actual API fixture and
+independent OrderedDict byte/entry/LRU oracle plus causal held-upstream HoL.
+`cargo build/test --release --locked --jobs 1` passes. Full 548-query
+`compare.py --verify-only` passes raw miss/hit identity, LRU/key/byte accounting
+and concurrent HoL for both fixtures (PID40275, exit0). It explicitly records
+performance not qualified; all original 1.5x p50/p99 gates remain unchanged.
+
+Preserved reds: PID36250 exit2 (independent NUL key byte accounting); subsequent
+byte-level Minyar regression exit1. The reference brace Unicode escape produced
+four bytes on the frozen compiler; constructing Bytes.add(0) fixes only this
+fixture. PID38496 exit1: AppleDouble tests/._httpserver.py from the initial
+upload was correctly rejected by the catalogue. Removed that upload artifact
+only; subsequent archives disable Mac metadata. After copying the parent's
+immutable bf9 workflow repair, catalogue passes 508 sources / 24 controls.
+Original omission/nonpasses remain in evidence. Full correctness samples stay
+in owned Linux build/httpserver-verify-r4, with concise receipts here.
+
+Pending: independent parent review; actual macOS and Windows execution;
+dedicated quiet-host <=1.5x axum p50 AND p99 gate. No performance claim yet.
