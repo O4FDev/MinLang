@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include <signal.h>
 #include <math.h>
+#include "minyar_thread_config.h"
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
