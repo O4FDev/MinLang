@@ -1,5 +1,6 @@
 /* Included by system.c. All process APIs have one serialized owner. Native
  * argument copies, registry slots and child state are prepared before launch. */
+#include <stddef.h>
 #ifndef _WIN32
 #include <spawn.h>
 #include <sys/wait.h>
@@ -136,7 +137,16 @@ MinyarBytes *minyar_system_waitNative(long long handle, bool poll) {
 }
 
 #if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
-#define SYSTEM_CHILD __attribute__((no_sanitize("address", "undefined", "thread", "coverage"), no_stack_protector, no_instrument_function, no_profile_instrument_function))
+/* no_sanitize("thread") still permits TSan function-entry hooks. The shared-VM
+ * child requires the compiler's complete exclusion, in every build mode. */
+#if !defined(__has_attribute)
+#error "Linux clone-vfork requires complete child instrumentation exclusion"
+#elif !__has_attribute(disable_sanitizer_instrumentation) || !__has_attribute(no_sanitize) || \
+      !__has_attribute(no_stack_protector) || !__has_attribute(no_instrument_function) || \
+      !__has_attribute(no_profile_instrument_function)
+#error "Linux clone-vfork requires complete child instrumentation exclusion"
+#endif
+#define SYSTEM_CHILD __attribute__((disable_sanitizer_instrumentation, no_sanitize("address", "undefined", "thread", "coverage"), no_stack_protector, no_instrument_function, no_profile_instrument_function))
 /* Direct kernel results: never libc syscall() or errno/TLS in the shared-VM child. */
 static SYSTEM_CHILD __attribute__((always_inline)) inline long system_raw(long number, long a, long b, long c, long d) {
 #if defined(__x86_64__)
@@ -152,11 +162,22 @@ static SYSTEM_CHILD __attribute__((always_inline)) inline long system_raw(long n
 }
 typedef struct SystemKernelAction {
     unsigned long handler, flags;
-#ifdef __x86_64__
+    /* Both Linux x86_64 and arm64 kernel UAPIs carry this slot, even when
+     * libc hides SA_RESTORER. It remains zero for the default disposition. */
     unsigned long restorer;
-#endif
     uint64_t mask;
 } SystemKernelAction;
+_Static_assert(sizeof(unsigned long) == 8 && sizeof(void *) == 8, "Linux clone-vfork requires LP64");
+#if defined(__aarch64__)
+_Static_assert(sizeof(SystemKernelAction) == 32 && offsetof(SystemKernelAction, mask) == 24,
+               "arm64 kernel sigaction ABI must be 32 bytes with mask at byte 24");
+#else
+_Static_assert(sizeof(SystemKernelAction) == 32 && offsetof(SystemKernelAction, mask) == 24,
+               "x86_64 kernel sigaction ABI must be 32 bytes with mask at byte 24");
+#endif
+_Static_assert(offsetof(SystemKernelAction, handler) == 0 && offsetof(SystemKernelAction, flags) == 8 &&
+               offsetof(SystemKernelAction, restorer) == 16 && _Alignof(SystemKernelAction) == 8,
+               "kernel sigaction field offsets and alignment must match");
 typedef struct SystemChild {
     const char *path, *cwd;
     char **argv, **envp;
