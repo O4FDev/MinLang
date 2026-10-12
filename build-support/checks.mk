@@ -614,16 +614,32 @@ check-quic-interop-results:
 
 check check-portable check-quic check-quic-sanitize: check-quic-interop-results
 
-.PHONY: check-quic check-quic-sanitize
-check-quic: build/minyarc
+# Native suite levels are independent children so a parallel runner overlaps them.
+.PHONY: check-quic check-quic-sanitize check-quic-native-O0 check-quic-native-O2
+check-quic-native-O0: build/minyarc
 	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/quic-suite.py --artifacts build/quic-native-O0
+
+check-quic-native-O2: build/minyarc
 	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/quic-suite.py --optimization 2 --artifacts build/quic-native-O2
+
+check-quic: build/minyarc check-quic-native-O0 check-quic-native-O2
 
 check-quic-sanitize: build/minyarc
 	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/quic-suite.py --sanitize --artifacts build/quic-sanitize
 
 check: check-quic
 check-sanitize: check-quic-sanitize
+
+# Pinned Quinn peer in every CI mode. Modes that build the same Minyar endpoint
+# reuse it: ten endpoint builds become four within one recipe.
+.PHONY: check-quic-quinn
+check-quic-quinn: build/minyarc | build
+	@set -e; cache=$$(mktemp -d "$(abspath build)/quic-quinn-programs.XXXXXXXX"); trap 'rm -rf "$$cache"' EXIT; export MINYAR_TEST_PROGRAM_CACHE="$$cache"; \
+	$(LIMITED) python3 tests/quic-quinn.py; \
+	MINYAR_QUINN_KEY_UPDATE=1 $(LIMITED) python3 tests/quic-quinn.py; \
+	$(LIMITED) python3 tests/quic-quinn.py --migration; \
+	$(LIMITED) python3 tests/quic-quinn.py --resumption; \
+	$(LIMITED) python3 tests/quic-quinn.py --early
 
 .PHONY: check-redis-protocol check-redis-protocol-sanitize check-redis-pipeline check-redis-pipeline-sanitize
 check-redis-protocol: build/minyarc build/minyar-runtime.o
@@ -727,14 +743,17 @@ check-transport-cancel-sanitize: build/minyarc
 build/yamux-peer: tests/interop/yamux/main.go tests/interop/yamux/go.mod tests/interop/yamux/go.sum | build
 	cd tests/interop/yamux && GOMAXPROCS=2 go build -mod=readonly -o "$(abspath $@)" .
 
-check-transport-go: build/minyarc build/yamux-peer
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/transport-go.py --peer-binary build/yamux-peer
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/transport-go.py --peer-binary build/yamux-peer --streams 1536
+# The ordinary and FIN-schedule runs share one compiled Minyar peer per recipe.
+check-transport-go: build/minyarc build/yamux-peer | build
+	@set -e; cache=$$(mktemp -d "$(abspath build)/transport-go-programs.XXXXXXXX"); trap 'rm -rf "$$cache"' EXIT; export MINYAR_TEST_PROGRAM_CACHE="$$cache"; \
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/transport-go.py --peer-binary build/yamux-peer; \
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/transport-go.py --peer-binary build/yamux-peer --streams 1536; \
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/transport-go.py --fin-schedule
 
-check-transport-go-sanitize: build/minyarc build/yamux-peer
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/transport-go.py --peer-binary build/yamux-peer --sanitize
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/transport-go.py --peer-binary build/yamux-peer --streams 1536 --sanitize
+check-transport-go-sanitize: build/minyarc build/yamux-peer | build
+	@set -e; cache=$$(mktemp -d "$(abspath build)/transport-go-sanitize-programs.XXXXXXXX"); trap 'rm -rf "$$cache"' EXIT; export MINYAR_TEST_PROGRAM_CACHE="$$cache"; \
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/transport-go.py --peer-binary build/yamux-peer --sanitize; \
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/transport-go.py --peer-binary build/yamux-peer --streams 1536 --sanitize; \
 	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/transport-go.py --fin-schedule --sanitize
 
 check check-portable: check-yamux-churn check-transport-cancel
