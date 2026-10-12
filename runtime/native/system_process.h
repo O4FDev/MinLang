@@ -136,12 +136,12 @@ MinyarBytes *minyar_system_waitNative(long long handle, bool poll) {
 }
 
 #if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
-#define SYSTEM_CHILD __attribute__((no_sanitize("address", "undefined", "thread"), no_stack_protector, no_instrument_function))
+#define SYSTEM_CHILD __attribute__((no_sanitize("address", "undefined", "thread", "coverage"), no_stack_protector, no_instrument_function, no_profile_instrument_function))
 /* Direct kernel results: never libc syscall() or errno/TLS in the shared-VM child. */
 static SYSTEM_CHILD __attribute__((always_inline)) inline long system_raw(long number, long a, long b, long c, long d) {
 #if defined(__x86_64__)
     long result; register long fourth __asm__("r10") = d;
-    __asm__ volatile("syscall" : "=a"(result) : "a"(number), "D"(a), "S"(b), "d"(c), "r"(fourth) : "rcx", "r11", "memory");
+    __asm__ volatile("syscall" : "=a"(result) : "a"(number), "D"(a), "S"(b), "d"(c), "r"(fourth) : "rcx", "r11", "memory", "cc");
     return result;
 #else
     register long x8 __asm__("x8") = number, x0 __asm__("x0") = a, x1 __asm__("x1") = b,
