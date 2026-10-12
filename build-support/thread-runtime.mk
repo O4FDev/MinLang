@@ -21,4 +21,7 @@ check-thread-runtime-tsan:
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/thread-runtime-ir.py --tsan
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/thread-runtime.py --sanitize thread
 
+# The threaded fixtures have no native Windows qualification yet (WS7 owns that run).
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
 check check-portable: check-thread-runtime
+endif

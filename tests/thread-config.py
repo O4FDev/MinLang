@@ -81,6 +81,7 @@ class ThreadConfig(unittest.TestCase):
         self.assertNotEqual(self.compile(['MINYAR_THREADED=bogus'],
                             '#include "minyar_thread_config.h"\n').returncode, 0)
 
+    @unittest.skipIf(windows_host(), 'Threaded runtime is not yet qualified on native Windows')
     def test_runtime_effective_allocators(self):
         engines = [(ROOT / 'runtime/minyar_runtime.c').read_text(), engine_source(ROOT)]
         for number, source in enumerate(engines):

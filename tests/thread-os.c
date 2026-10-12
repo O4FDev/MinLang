@@ -14,7 +14,7 @@
 #endif
 #endif
 static RcTestGate started;
-static _Atomic unsigned sleeping, progressed;
+static _Atomic unsigned sleeping, progressed, released;
 #ifndef _WIN32
 static volatile sig_atomic_t interrupted;
 static void wake_signal(int signal_number) { (void)signal_number; interrupted++; }
@@ -36,10 +36,16 @@ static long long sleeper(long long duration, void *input, void *channel) {
 #endif
     atomic_store(&sleeping, 1);
     rc_test_gate_arrive(&started);
-    errno = EDOM;
-    assert(minyar_thread_sleep_ns(duration) == 0);
-    assert(errno == EDOM);
-    assert(!rc_pending_count);
+    /* Stay in kernel sleep until the main thread has observed progress and
+       signalled us, so a slow scheduler cannot turn the proof into a race. */
+    unsigned rounds = 0;
+    do {
+        errno = EDOM;
+        assert(minyar_thread_sleep_ns(duration) == 0);
+        assert(errno == EDOM);
+        assert(!rc_pending_count);
+    } while (!atomic_load(&released) && ++rounds < 600);
+    assert(atomic_load(&released));
     atomic_store(&sleeping, 0);
     return 71;
 }
@@ -77,6 +83,7 @@ static void blocking_progress(void) {
         assert(minyar_thread_sleep_ns(10000000) == 0);
     }
 #endif
+    atomic_store(&released, 1);
     assert(minyar_thread_join(t) == 71);
 #ifndef _WIN32
     assert(monotonic_ns() - before >= 200000000);
