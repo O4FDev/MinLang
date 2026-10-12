@@ -710,13 +710,20 @@ class BuildWiring(unittest.TestCase):
                     'tests/generated-llvm-sanitizer.min', 'tests/llvm_sanitizer.py',
                     'tools/sanitizer_llvm.py', 'tools/clang-driver.py'}
 
-        def verify(candidate):
+        def verify(candidate, sanitizer=None):
             with tempfile.TemporaryDirectory(prefix='actual sanitizer Make rules ') as folder:
                 probe = Path(folder)/'probe.mk'
-                probe.write_text(candidate + '\n.PHONY: build build/minyarc build/yamux-peer\n'
+                probe.write_text('LLVM_CC := retained-native-clang\n'
+                                 'SANITIZER_LIMITED := sanitizer-limit\n'
+                                 'PATH := /retained/native/bin:/usr/bin\n'
+                                 'MINYAR_SANITIZER_CLANG := ' + (sanitizer or '') + '\n'
+                                 + candidate + '\n.PHONY: build build/minyarc build/yamux-peer\n'
                                  'build build/minyarc build/yamux-peer:\n')
+                environment = dict(os.environ)
+                environment.pop('MAKEFLAGS', None)
                 result = subprocess.run(['make', '-rRnp', '-f', str(probe), 'check'],
-                                        cwd=ROOT, capture_output=True, text=True, timeout=15)
+                                        cwd=ROOT, env=environment, capture_output=True,
+                                        text=True, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 rules = {}
                 for line in result.stdout.splitlines():
@@ -728,10 +735,25 @@ class BuildWiring(unittest.TestCase):
                 self.assertTrue(expected <= rules.get('check-generated-llvm-sanitizer',set()))
                 commands = result.stdout.split('# GNU Make',1)[0]
                 self.assertIn('python3 tests/generated-llvm-sanitizer.py', commands)
+                self.assertIn('MINYAR_TEST_CLANG="' + (sanitizer or 'retained-native-clang')
+                              + '" sanitizer-limit python3 tests/generated-llvm-sanitizer.py',
+                              commands)
+                if sanitizer:
+                    self.assertIn('PATH="/clang64/bin/:/retained/native/bin:/usr/bin"',
+                                  commands)
                 self.assertIn('--artifacts "$artifacts/run"', commands)
                 self.assertIn((ROOT/'build/generated-llvm-sanitizer-').as_posix(),
                               commands.replace('\\','/'))
         verify(fragment)
+        verify(fragment, '/clang64/bin/clang.exe')
+        for old, new in (
+                ('MINYAR_TEST_CLANG="$(GENERATED_SANITIZER_CLANG)"',
+                 'MINYAR_TEST_CLANG="$(LLVM_CC)"'),
+                ('PATH="$(GENERATED_SANITIZER_PATH)" ', '')):
+            mutant = fragment.replace(old, new, 1)
+            self.assertNotEqual(mutant, fragment)
+            with self.subTest(dispatch=old), self.assertRaises(AssertionError):
+                verify(mutant, '/clang64/bin/clang.exe')
         aggregate = 'check check-portable check-sanitize: check-generated-llvm-sanitizer'
         for gate in ('check','check-portable','check-sanitize'):
             missing = fragment.replace(aggregate, ' '.join(x for x in aggregate.split(':')[0].split()
