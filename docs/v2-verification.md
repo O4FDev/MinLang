@@ -456,8 +456,8 @@ normal exit 0, rejected exit 7 and absent-peer null observations are preserved.
 Both corrected-fixture generations retire all 12 published process identities
 and five groups normally. An earlier binary/text fixture failure remains recorded separately.
 These accelerated history controls do not establish hours-long performance or
-the exclusive cause of the active cohort's RSS changes. That cohort continues
-with its original QUIC driver and memory gates.
+the exclusive cause of the original cohort's RSS changes. That cohort retained
+its original QUIC driver and memory gates throughout its run.
 
 Twelve harmless Linux lifecycle controls now pass for the supplied-binary
 launcher: normal exits 0/1/7, parent loss before/after arming and after exec,
@@ -465,13 +465,23 @@ signal behavior, wrong-parent/mode refusal and invalid-launch rejection.
 Each selected network driver's actual native child uses the qualified
 parent-death bootstrap. All 25 recorded process identities and 13 groups
 were confirmed retired; an earlier fixture-publication race remains a separate
-nonpass. The native mixed cohort started on W at 04:24 UTC on 2026-10-12,
+nonpass. The native mixed cohort ran on W from 04:24 to 06:25 UTC on 2026-10-12,
 with 4,096 TCP sockets, 64 mutual-TLS/HTTP fixture connections and 64 QUIC peers
-running concurrently for a configured 7,200 seconds. It retains the original
-loss, reordering, malformed/slow/half-close scenarios and memory thresholds.
-Completion, actual common overlap, warmed memory and normal retirement remain
-unqualified while it runs. The sanitizer cohort and separate connected-idle
-and UDP-blocked fallback measurements require later admissions.
+for a configured 7,200 seconds. Its conservatively observed common live interval
+was 7,142.92 seconds. All drivers and endpoints exited normally with empty
+unexpected diagnostics; all ten recorded process identities and five groups
+retired, and all 19 source/tool/artifact bindings stayed unchanged.
+
+Six of seven role memory gates passed at the original 16 MiB span and
+0.2 KiB/s slope limits. The original QUIC observer failed with a 0.53843 KiB/s
+slope, so this generation remains NONPASS. TCP target/controller slopes were
+zero; TLS target/controller slopes were 0.14484/0.16042 KiB/s; QUIC target and
+Quinn peer slopes were zero/0.01305 KiB/s. The unchanged native QUIC endpoint
+completed with zero live peers, routes and timers after packet loss and
+reordering. The 58-file raw evidence was independently verified and reviewed.
+The six passing roles remain recorded; the repaired QUIC observer still needs
+long verification. The sanitizer cohort and separate connected-idle and
+UDP-blocked fallback measurements require later admissions.
 
 The deleted scale helper has been rebuilt once with an explicit locked Cargo
 release profile. All eight Rust tests and the product build pass, with stable
