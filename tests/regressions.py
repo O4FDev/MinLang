@@ -26,6 +26,8 @@ LINK_FLAGS = shlex.split(os.environ.get("MINYAR_TEST_LINK_FLAGS", ""))
 # host scheduling the same ceiling already used for sanitized linking.
 COMPILE_TIMEOUT = 30 if LINK_FLAGS else 10
 RUN_TIMEOUT = 30 if LINK_FLAGS else 10
+# Sanitized links of the 100,000-deep peer programs take minutes on slower shared hosts.
+LINK_TIMEOUT = 120 if LINK_FLAGS else 30
 
 class CompilerTestCase(unittest.TestCase):
     def setUp(self):
@@ -64,7 +66,7 @@ class CompilerTestCase(unittest.TestCase):
     def link_program(self, llvm, optimization, exe):
         return self.evidence.run(clang_command([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module',
                                                str(llvm), str(RUNTIME), '-o', str(exe)]),
-                                 capture_output=True, text=True, timeout=30, phase='link')
+                                 capture_output=True, text=True, timeout=LINK_TIMEOUT, phase='link')
 
     def executes(self, source, expected, status=0, stderr='', optimizations=('-O0', '-O2'), arguments=(), file_outputs=()):
         file_outputs = tuple(file_outputs)
