@@ -1199,6 +1199,8 @@ static Type check_expression(Program *program, Function *function, Expression *e
         if (expression->operator == TOKEN_EQUAL_EQUAL || expression->operator == TOKEN_NOT_EQUAL) {
             if (left == TYPE_NOTHING)
                 fail_at(expression->line, expression->column, "Nothing cannot be compared");
+            if (left == TYPE_BYTES)
+                fail_at(expression->line, expression->column, "Bytes cannot be compared");
             return expression->type = TYPE_BOOLEAN;
         }
         if (expression->operator == TOKEN_AND || expression->operator == TOKEN_OR) {
@@ -1593,6 +1595,7 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
             }
             suffix = arguments[0].type == TYPE_INTEGER     ? "integer"
                      : arguments[0].type == TYPE_CHARACTER ? "character"
+                     : arguments[0].type == TYPE_BYTES     ? "bytes"
                                                            : "boolean";
             temporary = new_temporary(emitter);
             fprintf(output, "  %%value.%d = call ptr @minyar_%s_text(%s %s)\n", temporary, suffix,
@@ -2133,6 +2136,7 @@ static void emit_program(FILE *output, Program *program) {
           "declare void @minyar_write_text_parts(ptr, ptr)\n"
           "declare ptr @minyar_bytes_new(i64)\n"
           "declare ptr @minyar_text_bytes(ptr)\n"
+          "declare ptr @minyar_bytes_text(ptr)\n"
           "declare i64 @minyar_bytes_length(ptr)\n"
           "declare i64 @minyar_bytes_get(ptr, i64)\n"
           "declare i64 @minyar_bytes_get_int64(ptr, i64)\n"
