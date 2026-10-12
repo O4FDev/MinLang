@@ -15,6 +15,14 @@ check-callbacks: build/minyarc-callbacks build/closure-compiler-stage3.ll
 check-managed-graphs-profiles:
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/managed-graphs-profiles.py --quick
 
+# Preserve the original allocation-only and continuously growing producer bounds.
+# The existing quick matrix covers bounded heaps at K1/K32, native and sanitizer.
+.PHONY: check-managed-graphs-bakeoff
+CYCLE_BAKEOFF_INPUTS = tests/managed-graphs-bakeoff.c tests/managed-graphs-runtime.c tests/managed-graphs-profiles.py tests/clang_helpers.py tools/cycle_runtime.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
+check-managed-graphs-bakeoff: $(CYCLE_BAKEOFF_INPUTS) | build
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/managed-graphs-profiles.py --quick --fixture managed-graphs-bakeoff.c
+check check-portable check-sanitize check-managed-graphs-profiles: check-managed-graphs-bakeoff
+
 check-callback-domains:
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/callback-domains.py
 

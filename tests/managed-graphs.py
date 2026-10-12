@@ -147,6 +147,57 @@ alias[0].parent = other
 print(p.leaves[0].parent.value)
 ''', '11\n13\n')
 
+    def test_preserved_module_aliases_execute_cycle_writes(self):
+        (self.directory / 'node.min').write_text('''public record Node { children: List<Node> }
+public function empty(): Node { return Node { children: [] } }
+''')
+        (self.directory / 'nested').mkdir()
+        for write in ('children.add(node)', 'children[0] = node'):
+            with self.subTest(write=write):
+                self.executes('''use "./node.min" as a
+use "./nested/../node.min" as b
+let children: List<a.Node> = [a.empty()]
+let node = b.Node { children: children }
+''' + write + '\n', '')
+
+    def test_preserved_nested_list_helper_and_return_alias_cycles(self):
+        cases = ('''record Node { layers: List<List<Node>> }
+function attach(target: List<Node>, node: Node) { target.add(node) }
+let inner: List<Node> = []
+let layers: List<List<Node>> = [inner]
+let node = Node { layers: layers }
+attach(inner, node)
+''', '''record Node { children: List<Node> }
+function identity(values: List<Node>): List<Node> { return values }
+let values: List<Node> = []
+let node = Node { children: values }
+identity(values).add(node)
+''')
+        for source in cases:
+            with self.subTest(source=source.splitlines()[0]):
+                self.executes(source, '')
+
+    def test_preserved_alias_return_and_record_projection_cycles(self):
+        for expression in ('alias.add(node)', 'children(node).add(node)', 'node.children.add(node)'):
+            with self.subTest(expression=expression):
+                self.executes('''record Node { children: List<Node> }
+function children(node: Node): List<Node> { return node.children }
+let items: List<Node> = []
+let node = Node { children: items }
+let alias = items
+''' + expression + '\n', '')
+
+    def test_preserved_record_field_assignment_closes_shared_mutual_cycle(self):
+        self.executes('''record A { next: B }
+record B { back: List<A>; value: Integer }
+let b = B { back: []; value: 41 }
+let a = A { next: b }
+b.back.add(a)
+let alias = a
+a.next = B { back: [a]; value: 42 }
+print(alias.next.back[0].next.value)
+''', '42\n')
+
     def test_unrelated_recursive_types_keep_untraced_allocations(self):
         source = '''record Cyclic { edges: List<Cyclic> }
 record Tree { children: List<Tree> }
@@ -166,7 +217,8 @@ print(acyclic().children.length)
     def test_adapted_graph_churn_temporaries_and_shared_append(self):
         expected = {'graphs': '0\n1\n2\n1\n0\n', 'churn': '100000\n',
                     'dense': '5000\n', 'field': '', 'live-churn': '1\n100000\n',
-                    'appended': '16800\n800\n'}
+                    'appended': '16800\n800\n',
+                    'sol-graphs': '15\n22\n33\n' + ''.join(f'{i}\n' for i in range(0, 20000, 1000))}
         for fixture, stdout in expected.items():
             with self.subTest(fixture=fixture):
                 self.executes((ROOT / 'tests/managed-graphs' / (fixture + '.min')).read_text(), stdout)
