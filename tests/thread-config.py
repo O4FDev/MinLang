@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,6 +14,22 @@ from clang_helpers import native_path
 
 
 class ThreadConfig(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'POSIX depth fixture; Windows runtime qualification is separate')
+    def test_depth_thread_isolation(self):
+        with tempfile.TemporaryDirectory(prefix='minyar-depth-tls-') as temporary:
+            for optimization in ('-O0', '-O2'):
+                with self.subTest(optimization=optimization):
+                    program = Path(temporary) / 'depth'
+                    compiled = subprocess.run([os.environ.get('MINYAR_TEST_CLANG', 'clang'),
+                        optimization, '-DMINYAR_THREADED=1', '-DMINYAR_SYSTEM_HEAP=1',
+                        str(ROOT / 'tests/depth-thread-local.c'), '-pthread', '-lm', '-o', str(program)],
+                        capture_output=True, text=True, timeout=30)
+                    self.assertEqual(compiled.returncode, 0, compiled.stderr)
+                    executed = subprocess.run([str(program)], capture_output=True, text=True, timeout=10)
+                    self.assertEqual(executed.returncode, 0, executed.stderr)
+                    self.assertEqual(executed.stdout, '')
+                    self.assertEqual(executed.stderr, '')
+
     def compile(self, definitions, source=None):
         header_root = Path(os.environ.get('MINYAR_THREAD_CONFIG_ROOT', ROOT / 'runtime'))
         command = [os.environ.get('MINYAR_TEST_CLANG', 'clang'), '-std=c11',

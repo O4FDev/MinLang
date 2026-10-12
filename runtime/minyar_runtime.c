@@ -122,11 +122,11 @@ static MINYAR_COLD MINYAR_NORETURN void minyar_stop(const char *message);
 #ifndef MINYAR_STACK_RESERVE_BYTES
 #define MINYAR_STACK_RESERVE_BYTES (128u * 1024u)
 #endif
-static size_t minyar_call_depth;
-static uintptr_t minyar_stack_low, minyar_stack_high;
-static int minyar_stack_bounds_ready;
+static MINYAR_THREAD_LOCAL size_t minyar_call_depth;
+static MINYAR_THREAD_LOCAL uintptr_t minyar_stack_low, minyar_stack_high;
+static MINYAR_THREAD_LOCAL int minyar_stack_bounds_ready;
 /* The depth at which minyar_stack_enter takes its exact path. */
-static size_t minyar_depth_limit;
+static MINYAR_THREAD_LOCAL size_t minyar_depth_limit;
 
 /* Keep first-use platform queries out of the frequent guard. This also lets
  * LTO inline the check without importing pthread setup into every caller. */
