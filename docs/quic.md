@@ -120,6 +120,15 @@ Early data is disabled by default. `tlstickets.allowEarlyData` and
 `quic.clientEarly` explicitly enable replay-safe operations. Ticket acceptance
 rechecks cached certificate chains against current roots, purpose and time;
 server identity, SNI and ALPN are bound inside authenticated tickets. The server
+also bounds ticket expiry by the earliest server/device certificate expiry and
+checks its own configured identity's current time bounds before resuming.
+A delayed, previously valid PSK ClientHello cannot resume an expired identity.
+The native `currentCertificateExpiry` helper extracts strict RFC 5280 time
+bounds only; it does not establish trust and never replaces `chain` or
+`clientChain`. Its UTC-century, generalized-year, leap/calendar and truncation
+tests use an independent datetime oracle and
+[OpenSSL's ASN.1 time test approach](https://github.com/openssl/openssl/blob/master/test/asn1_time_test.c).
+The server
 also rejects early data when remembered limits decrease. The single-use cache
 holds at most 4096 unexpired ticket fingerprints: saturation rejects early data
 while ordinary resumption remains possible. Early-data acceptance is bound to

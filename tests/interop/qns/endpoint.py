@@ -32,7 +32,7 @@ with tempfile.TemporaryDirectory(prefix='minyar-qns-') as d:
         command=['/opt/minyar/server',str(key),str(root),log,'/www',case,*certificates]
     else:
         urls=[urlsplit(u) for u in os.environ.get('REQUESTS','').split()]
-        if not urls or len(urls)>16 or any(u.scheme!='https' or u.hostname!=urls[0].hostname or u.port!=urls[0].port or u.query or u.fragment or not re.fullmatch('/[a-zA-Z0-9_-]{1,255}',u.path) for u in urls):sys.exit(1)
+        if not urls or len(urls)>64 or any(u.scheme!='https' or u.hostname!=urls[0].hostname or u.port!=urls[0].port or u.query or u.fragment or not re.fullmatch('/[a-zA-Z0-9_-]{1,255}',u.path) for u in urls):sys.exit(1)
         command=['/opt/minyar/client',str(root),urls[0].hostname,str(urls[0].port or 443),log,'/downloads',case,*[u.path[1:] for u in urls]]
     child=subprocess.Popen(command)
     if stopping_signal is not None and child.poll() is None:child.send_signal(stopping_signal)
