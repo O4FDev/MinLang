@@ -15,6 +15,8 @@ CASES = {
     'files-ranges': ['huge', 'invalid', 'pseudo', 'large', 'eof', 'partial-error', 'read-file'],
     'files-prepare': ['preallocate', 'stale', 'active-close', 'saturated', 'write-error', 'short', 'stop',
                       'sync-error', 'allocate-error', 'zero-write', 'capacity', 'cross-kind',
+                      'sparse-tail', 'sparse-middle', 'fresh-preallocate', 'fresh-prepare',
+                      'dense-extension', 'truncate-error', 'prefix-write-error',
                       *[f'setup-fd-{i}' for i in range(1, 11)],
                       'setup-pair', 'setup-mutex', 'setup-condition', 'setup-create'],
 }
@@ -22,7 +24,11 @@ CASES = {
 
 def run(command, environment, cwd=ROOT, expected=None, timeout=60):
     print(shlex.join(map(str, command)), flush=True)
-    result = subprocess.run(command, check=True, cwd=cwd, env=environment, capture_output=True, timeout=timeout)
+    result = subprocess.run(command, cwd=cwd, env=environment, capture_output=True, timeout=timeout)
+    if result.returncode:
+        print(result.stdout.decode(errors='replace'), end='', flush=True)
+        print(result.stderr.decode(errors='replace'), end='', flush=True)
+        result.check_returncode()
     if expected is not None:
         assert (result.stdout, result.stderr) == expected, (command, result.stdout, result.stderr)
     return result

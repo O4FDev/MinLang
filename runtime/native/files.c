@@ -251,23 +251,48 @@ long long minyar_files_preallocate(long long fd, long long length) {
     if (fstat((int)fd, &st) != 0) return -errno;
     if (!S_ISREG(st.st_mode)) return -EINVAL;
     if (!length) return 0;
+    int flags = fcntl((int)fd, F_GETFL);
+    if (flags < 0) return -errno;
+    if ((flags & O_ACCMODE) == O_RDONLY) return -EBADF;
     int rc;
 #if defined(__APPLE__) && defined(F_PREALLOCATE)
-    /* Darwin reserves additional bytes from physical EOF, rather than a logical file range. */
+    /* Darwin's F_PREALLOCATE only reserves from physical EOF; it cannot fill an existing logical hole.
+     * Check the requested existing prefix by extent, rather than counting blocks anywhere in the file.
+     * F_LOG2PHYS_EXT takes an explicit position and leaves the shared descriptor offset unchanged. */
+    long long existing = length < st.st_size ? length : st.st_size;
+    long long at = 0;
+    bool flushed = false;
+    while (at < existing) {
+        struct log2phys mapping = {0};
+        mapping.l2p_devoffset = (off_t)at;
+        mapping.l2p_contigbytes = (off_t)(existing - at);
+        do { rc = fcntl((int)fd, F_LOG2PHYS_EXT, &mapping); } while (rc != 0 && errno == EINTR);
+        if (rc != 0) return -errno;
+        if (mapping.l2p_devoffset < 0 || mapping.l2p_contigbytes <= 0) {
+            /* Delayed allocation can also hide dirty, non-sparse data. Flush once and retry the same extent
+             * before declaring a hole unsupported. This weak fsync is not the stable-storage sync promise. */
+            if (flushed) return -ENOTSUP;
+            do { rc = fsync((int)fd); } while (rc != 0 && errno == EINTR);
+            if (rc != 0) return -errno;
+            flushed = true;
+            continue;
+        }
+        long long mapped = (long long)mapping.l2p_contigbytes;
+        at += mapped < existing - at ? mapped : existing - at;
+    }
+    if (st.st_size >= length) return 0;
+    /* The existing prefix is backed. Reserve the extension from EOF, including a fresh file's whole range.
+     * Do not subtract st_blocks: tail data or other reservations do not establish prefix coverage. */
     fstore_t store = {0};
     store.fst_flags = F_ALLOCATEALL;
 #ifdef F_ALLOCATEPERSIST
     store.fst_flags |= F_ALLOCATEPERSIST;
 #endif
     store.fst_posmode = F_PEOFPOSMODE;
-    long long allocated = st.st_blocks > LLONG_MAX / 512 ? LLONG_MAX : st.st_blocks * 512;
-    if (length > allocated) {
-        store.fst_length = (off_t)(length - allocated);
-        do { rc = fcntl((int)fd, F_PREALLOCATE, &store); } while (rc != 0 && errno == EINTR);
-        if (rc != 0) return -errno;
-    }
-    if (st.st_size < length) return minyar_files_truncate(fd, length);
-    return 0;
+    store.fst_length = (off_t)(length - st.st_size);
+    do { rc = fcntl((int)fd, F_PREALLOCATE, &store); } while (rc != 0 && errno == EINTR);
+    if (rc != 0) return -errno;
+    return minyar_files_truncate(fd, length);
 #elif defined(__linux__)
     /* Use the kernel operation: libc's fallback can overwrite concurrent writes while filling holes. */
     do { rc = fallocate((int)fd, 0, 0, (off_t)length); } while (rc != 0 && errno == EINTR);
