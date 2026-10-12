@@ -3,11 +3,14 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import tempfile
 
 from clang_helpers import clang_command
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'tools'))
+from cycle_runtime import engine_source
 
 
 def run(command):
@@ -80,6 +83,12 @@ def main():
     runtime = ROOT / 'build/minyar-runtime.o'
     with tempfile.TemporaryDirectory(prefix='compiler-behavior-') as temporary:
         directory = Path(temporary)
+        if args.profile != 'core':
+            source = directory / 'runtime.c'
+            source.write_text(engine_source(ROOT))
+            runtime = directory / 'runtime.o'
+            run(clang_command([clang, '-O2', '-D_GNU_SOURCE', '-DMINYAR_SYSTEM_HEAP=1',
+                               '-iquote', ROOT / 'runtime', '-c', source, '-o', runtime]))
         compilers = [path.resolve() for path in args.compiler]
         for index, llvm in enumerate(args.ir):
             compiler = directory / f'compiler-{index}'
