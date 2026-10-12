@@ -46,10 +46,11 @@ in the signing checklist. Continue the Windows idle work independently.
   The unchanged one-second `system-k1024/n2048`, `idle_cpu <= .02`, remains the
   required repro before any optimization; full native/portable gates follow.
 - `ws7/test-signing`, `/tmp/minyar-ws7-signing`: explicit test-certificate
-  pipeline committed as `3ed25bd`; 19 mocked signing contracts and 12 shipping
-  contracts pass. Registration `fe66b86` passes catalogue and Make checks.
-  Independent review blocked core code on unbounded Ed25519 subprocesses and
-  acceptance of a nonexistent CI runner directory; fixes are underway.
+  pipeline and registration corrected at `21fd4e7`; 23 mocked signing contracts,
+  12 shipping contracts and five existing Ed25519 publisher tests pass.
+  Registration `fe66b86` passes catalogue and Make checks. R1's unbounded
+  Ed25519 subprocess and nonexistent CI directory findings are corrected;
+  fresh independent review is underway.
   Actual trusted macOS CI and Windows Boat signing remain unrun.
   Production signing/notarization checks
   remain strict. Native Windows signing waits for a separately admitted slot.
@@ -95,7 +96,10 @@ test store trust and generated keys must be scoped and removed.
 ## Merge queue and remaining acceptance
 
 The independently reviewed stamp-only branch `ws7/ci-stamp`, `0150ba5`, is
-offered to the integrator's queue. No WS7 change has landed on `v2`. Each chunk needs
+offered to the integrator's queue. The independently approved cost plan is also
+queued as `ws7/device-plan`, `b55b235`, containing only
+`docs/device-test-20000.md` with its exact reviewed bytes. This is a written plan,
+not an executed pilot or capacity result. No WS7 change has landed on `v2`. Each chunk needs
 an independent subagent review and platform-appropriate Boat evidence. Merge
 requests include branch, SHA, test commands, source-bound evidence and applicable
 performance results. After Phase 1, rebase onto the pushed `v2` and let the
