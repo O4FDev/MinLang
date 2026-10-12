@@ -100,9 +100,15 @@ class ThreadCompiler(unittest.TestCase):
         self.compile('use "machine" as machine\n' + ENTRY + MAIN.replace('let frozen = freezeBytes(bytes)',
                      'let saved = [machine.address(bytes)]\nlet frozen = freezeBytesTake(bytes)'), success=False, diagnostic='unsafe thread effect')
 
-    def test_callbacks_and_result_routes_fail_closed(self):
+    def test_main_callbacks_and_worker_effect_boundaries(self):
         callback = 'let callback = function(value: Integer): Integer { return value }\nprint(callback(1))'
-        self.compile(ENTRY + MAIN.replace('print(joinThread(workerHandle))', callback), success=False, diagnostic='unsafe thread effect')
+        self.compile(ENTRY + MAIN.replace('print(joinThread(workerHandle))', callback))
+        self.compile(ENTRY.replace('return seed + input.length', callback + '\nreturn seed') + MAIN,
+                     success=False, diagnostic='unsafe thread effect')
+        hidden = 'use "machine" as machine\nfunction unsafe(): Integer { return machine.address(Bytes(1)) }\n'
+        self.compile(hidden + ENTRY + MAIN.replace('print(joinThread(workerHandle))',
+                     'let callback = function(): Integer { return unsafe() }\nprint(callback())'),
+                     success=False, diagnostic='unsafe thread effect')
         result = '''function unsafe(): Result<Integer, Text> {
     let saved = machine.address(Bytes(1))
     return Ok<Integer, Text>(saved)

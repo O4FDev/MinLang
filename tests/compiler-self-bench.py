@@ -11,6 +11,7 @@ def main():
     parser.add_argument('--baseline', type=Path, required=True)
     parser.add_argument('--candidate', type=Path, required=True)
     parser.add_argument('--source', type=Path, required=True)
+    parser.add_argument('--baseline-source', type=Path)
     parser.add_argument('--repeats', type=int, default=31)
     args = parser.parse_args()
     samples = {'baseline': [], 'candidate': []}
@@ -20,7 +21,8 @@ def main():
             order = ('baseline', 'candidate') if repeat % 2 else ('candidate', 'baseline')
             for name in order:
                 start = time.perf_counter_ns()
-                subprocess.run([str(getattr(args, name).resolve()), str(args.source.resolve()), str(output)],
+                source = args.baseline_source if name == 'baseline' and args.baseline_source else args.source
+                subprocess.run([str(getattr(args, name).resolve()), str(source.resolve()), str(output)],
                                check=True, capture_output=True, timeout=60)
                 elapsed = (time.perf_counter_ns() - start) / 1e9
                 if repeat >= 3:

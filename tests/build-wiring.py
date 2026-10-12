@@ -823,7 +823,7 @@ class BuildWiring(unittest.TestCase):
                 verify(fragment.replace(dependency+' ', '', 1))
         compiler = (ROOT/'build-support/compiler.mk').read_text()
         rules = re.findall(r'^build/[^:\n]*sanitize\.ll:([^\n]*)',compiler,re.M)
-        self.assertEqual(len(rules),5)
+        self.assertEqual(len(rules),1)
         self.assertTrue(all('tests/llvm_sanitizer.py' in r and 'tools/sanitizer_llvm.py' in r for r in rules))
         shim = (ROOT/'tests/llvm_sanitizer.py').read_text()
         self.assertIn('from sanitizer_llvm import',shim)

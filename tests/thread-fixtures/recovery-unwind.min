@@ -1,0 +1,36 @@
+use "calldepth" as depth
+use "errors" as errors
+
+thread function publish(seed: Integer, input: FrozenBytes, queue: FrozenBytesChannel): Nothing {
+    let slept = threadSleepNanoseconds(10000000)
+    if slept != 0 { fail("worker sleep failed") }
+    let local = copyFrozenBytes(input)
+    local.setInt64(0, local.getInt64(0) + seed)
+    if !sendFrozen(queue, freezeBytesTake(local)) { fail("worker publication failed") }
+}
+
+thread function parent(seed: Integer, input: FrozenBytes, queue: FrozenBytesChannel): Nothing {
+    let child = startThread(publish, seed, input, queue)
+}
+
+function recurse(): Integer { return recurse() }
+
+function main() {
+    let queue = frozenBytesChannel(64, 2)
+    let failed = depth.run(8, function(): Integer {
+        let local = Bytes(0)
+        local.addInt64(40)
+        let input = freezeBytesTake(local)
+        let worker = startThread(parent, 2, input, queue)
+        return recurse()
+    })
+    if errors.integerOk(failed) || errors.code(errors.integerError(failed)) != 14 {
+        fail("call-depth failure was not recovered")
+    }
+    let message = receiveFrozen(queue)
+    if !message.ok || message.value.getInt64(0) != 42 { fail("child backing did not survive recovery") }
+    let succeeded = depth.run(8, function(): Integer { return 42 })
+    if !errors.integerOk(succeeded) || errors.integerValue(succeeded) != 42 { fail("recovery state did not reset") }
+    closeFrozenChannel(queue)
+    print("recovery and child cleanup passed")
+}

@@ -50,10 +50,10 @@ check-calldepth-reporting-sanitize: build/minyarc-calldepth
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/calldepth.py --case reporting-global --max-depth 2 --sanitize --evidence build/calldepth-global-sanitize-evidence
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/calldepth.py --case reporting-fallback --fallback-depth 16 --sanitize --evidence build/calldepth-fallback-sanitize-evidence
 
-check-calldepth-hooks: build/minyarc build/minyar-compiler-runtime.ll
+check-calldepth-hooks: build/minyarc build/minyarc-modules build/minyar-module-build build/minyar-default-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/calldepth-hooks.py
 
-check-calldepth-hooks-sanitize: build/minyarc build/minyar-compiler-runtime.ll
+check-calldepth-hooks-sanitize: build/minyarc build/minyarc-modules build/minyar-module-build build/minyar-default-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/calldepth-hooks.py --sanitize --evidence build/calldepth-hook-sanitize-evidence
 
 # Recovery is qualified on Linux and macOS; native Windows linking of the test hooks is not yet.
