@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from compiler_output import check_compiler_behavior, validate_compile_output as validate_output
 
 try:
     import resource
@@ -24,7 +25,6 @@ ROOT = Path(__file__).resolve().parent.parent
 COMPILER = ROOT / "build" / "minyarc"
 SOURCE = ROOT / "build" / "compiler.min"
 OUTPUT = ROOT / "build" / "self-compile-budget.ll"
-REFERENCE = ROOT / "build" / "compiler-stage3.ll"
 
 RUNS = 100
 BATCHES = 3
@@ -49,30 +49,21 @@ def compile_once() -> subprocess.CompletedProcess[str]:
     return subprocess.run([str(COMPILER), str(SOURCE), str(OUTPUT)], text=True, capture_output=True)
 
 
-def validate_compile_output(result: subprocess.CompletedProcess[str], expected: bytes,
-                            phase: str = "self-compile") -> None:
-    if result.returncode != 0:
-        raise SystemExit(f"{phase} failed with status {result.returncode}:\n{result.stderr}")
-    if not OUTPUT.is_file():
-        raise SystemExit(f"{phase} produced no LLVM output")
-    if OUTPUT.read_bytes() != expected:
-        raise SystemExit(f"{phase} output differs from the fixed-point compiler")
+def validate_compile_output(result: subprocess.CompletedProcess[str], phase: str = "self-compile") -> None:
+    validate_output(result, OUTPUT, phase)
 
 
 def retired_instructions() -> int | None:
     """Ask /usr/bin/time -l for the retired instruction count (macOS only)."""
     if sys.platform != "darwin" or not Path("/usr/bin/time").exists():
         return None
-    if not REFERENCE.is_file():
-        raise SystemExit("profiled self-compile requires the fixed-point compiler reference")
-    expected = REFERENCE.read_bytes()
     best = None
     for _ in range(5):
         # A stale valid file must not disguise a failed/no-output invocation.
         OUTPUT.unlink(missing_ok=True)
         result = subprocess.run(["/usr/bin/time", "-l", str(COMPILER), str(SOURCE), str(OUTPUT)],
                                 text=True, capture_output=True)
-        validate_compile_output(result, expected, "profiled self-compile")
+        validate_compile_output(result, "profiled self-compile")
         match = re.search(r"(\d+)\s+instructions retired", result.stderr)
         if not match:
             return None
@@ -85,12 +76,9 @@ def main() -> None:
     if not COMPILER.exists():
         raise SystemExit(f"build {COMPILER.relative_to(ROOT)} first (make build/minyarc)")
 
-    if not REFERENCE.is_file():
-        raise SystemExit("self-compile requires the fixed-point compiler reference")
-    expected = REFERENCE.read_bytes()
     OUTPUT.unlink(missing_ok=True)
     warm_up = compile_once()
-    validate_compile_output(warm_up, expected)
+    validate_compile_output(warm_up)
 
     wall_p90 = float("inf")
     cpu_p90: float | None = float("inf") if resource else None
@@ -106,7 +94,7 @@ def main() -> None:
             elapsed_ms = (time.perf_counter() - started) * 1000
             if before:
                 after = resource.getrusage(resource.RUSAGE_CHILDREN)
-            validate_compile_output(result, expected)
+            validate_compile_output(result)
             walls.append(elapsed_ms)
             if before:
                 cpus.append(((after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)) * 1000)
@@ -139,6 +127,7 @@ def main() -> None:
         failures.append(f"{instructions} retired instructions is over the {MAX_INSTRUCTIONS} budget")
     if failures:
         raise SystemExit("self-compile budget exceeded:\n  " + "\n  ".join(failures))
+    check_compiler_behavior(OUTPUT)
     print("self-compile budget met")
 
 

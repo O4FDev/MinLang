@@ -143,10 +143,10 @@ class PerformanceMetrics(unittest.TestCase):
     def test_profiled_failures_and_stale_or_wrong_output_are_rejected(self):
         for mode, message in (('failure', 'failed with status 1'),
                               ('no-output', 'produced no LLVM'),
-                              ('wrong-output', 'differs from the fixed-point')):
+                              ('wrong-output', 'invalid compiler LLVM')):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as name:
                 output, reference = Path(name) / 'output.ll', Path(name) / 'reference.ll'
-                reference.write_bytes(b'fixed point\n')
+                reference.write_bytes(b'define i32 @main(i32 %argc, ptr %argv) { ret i32 0 }\n')
                 output.write_bytes(reference.read_bytes())
 
                 def profiled(command, **kwargs):
@@ -156,17 +156,17 @@ class PerformanceMetrics(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 1 if mode == 'failure' else 0,
                                                        '', '42 instructions retired\n')
 
-                with patch.object(budget, 'OUTPUT', output), patch.object(budget, 'REFERENCE', reference), \
+                with patch.object(budget, 'OUTPUT', output), \
                         patch.object(budget.sys, 'platform', 'darwin'), patch.object(budget.Path, 'exists', return_value=True), \
                         patch.object(budget.subprocess, 'run', side_effect=profiled) as run:
                     with self.assertRaisesRegex(SystemExit, message):
                         budget.retired_instructions()
                     self.assertEqual(run.call_count, 1)
 
-    def test_each_profile_sample_requires_fresh_fixed_point_output(self):
+    def test_each_profile_sample_requires_fresh_compiler_output(self):
         with tempfile.TemporaryDirectory() as name:
             output, reference = Path(name) / 'output.ll', Path(name) / 'reference.ll'
-            reference.write_bytes(b'fixed point\n')
+            reference.write_bytes(b'define i32 @main(i32 %argc, ptr %argv) { ret i32 0 }\n')
             counts = iter((11, 7, 9, 10, 8))
 
             def profiled(command, **kwargs):
@@ -174,13 +174,13 @@ class PerformanceMetrics(unittest.TestCase):
                 output.write_bytes(reference.read_bytes())
                 return subprocess.CompletedProcess(command, 0, '', f'{next(counts)} instructions retired\n')
 
-            with patch.object(budget, 'OUTPUT', output), patch.object(budget, 'REFERENCE', reference), \
+            with patch.object(budget, 'OUTPUT', output), \
                     patch.object(budget.sys, 'platform', 'darwin'), patch.object(budget.Path, 'exists', return_value=True), \
                     patch.object(budget.subprocess, 'run', side_effect=profiled) as run:
                 self.assertEqual(budget.retired_instructions(), 7)
                 self.assertEqual(run.call_count, 5)
 
-    def test_profile_reference_is_required_and_valid_missing_counter_is_unavailable(self):
+    def test_valid_missing_counter_is_unavailable(self):
         with tempfile.TemporaryDirectory() as name:
             output, reference = Path(name) / 'output.ll', Path(name) / 'reference.ll'
 
@@ -188,20 +188,17 @@ class PerformanceMetrics(unittest.TestCase):
                 output.write_bytes(reference.read_bytes())
                 return subprocess.CompletedProcess(command, 0, '', 'no hardware counter on this host\n')
 
-            with patch.object(budget, 'OUTPUT', output), patch.object(budget, 'REFERENCE', reference), \
+            with patch.object(budget, 'OUTPUT', output), \
                     patch.object(budget.sys, 'platform', 'darwin'), patch.object(budget.Path, 'exists', return_value=True), \
                     patch.object(budget.subprocess, 'run', side_effect=profiled) as run:
-                with self.assertRaisesRegex(SystemExit, 'requires the fixed-point'):
-                    budget.retired_instructions()
-                self.assertEqual(run.call_count, 0)
-                reference.write_bytes(b'fixed point\n')
+                reference.write_bytes(b'define i32 @main(i32 %argc, ptr %argv) { ret i32 0 }\n')
                 self.assertIsNone(budget.retired_instructions())
                 self.assertEqual(run.call_count, 1)
 
     def test_later_profile_failure_cannot_reuse_an_earlier_good_sample(self):
         with tempfile.TemporaryDirectory() as name:
             output, reference = Path(name) / 'output.ll', Path(name) / 'reference.ll'
-            reference.write_bytes(b'fixed point\n')
+            reference.write_bytes(b'define i32 @main(i32 %argc, ptr %argv) { ret i32 0 }\n')
             samples = []
 
             def profiled(command, **kwargs):
@@ -212,7 +209,7 @@ class PerformanceMetrics(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 0, '', '7 instructions retired\n')
                 return subprocess.CompletedProcess(command, 1, '', '1 instructions retired\n')
 
-            with patch.object(budget, 'OUTPUT', output), patch.object(budget, 'REFERENCE', reference), \
+            with patch.object(budget, 'OUTPUT', output), \
                     patch.object(budget.sys, 'platform', 'darwin'), patch.object(budget.Path, 'exists', return_value=True), \
                     patch.object(budget.subprocess, 'run', side_effect=profiled):
                 with self.assertRaisesRegex(SystemExit, 'failed with status 1'):
@@ -223,10 +220,10 @@ class PerformanceMetrics(unittest.TestCase):
         # Warm-up and first measured sample succeed. The second measured sample
         # must not reuse their output or disappear behind the earlier timing.
         for mode, message in ((None, None), ('failure', 'failed with status 1'),
-                              ('no-output', 'produced no LLVM'), ('wrong-output', 'differs from the fixed-point')):
+                              ('no-output', 'produced no LLVM'), ('wrong-output', 'invalid compiler LLVM')):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as name:
                 output, reference, compiler = (Path(name) / file for file in ('output.ll', 'reference.ll', 'compiler'))
-                reference.write_bytes(b'fixed point\n')
+                reference.write_bytes(b'define i32 @main(i32 %argc, ptr %argv) { ret i32 0 }\n')
                 compiler.write_bytes(b'controlled fixture')
                 output.write_bytes(reference.read_bytes())
                 state = {'active': False, 'calls': 0, 'unlinks': 0, 'validations': 0}
@@ -252,17 +249,18 @@ class PerformanceMetrics(unittest.TestCase):
                         output.write_bytes(b'wrong output' if bad else reference.read_bytes())
                     return subprocess.CompletedProcess(['compiler'], 1 if bad and mode == 'failure' else 0, '', '')
 
-                def validate(result, expected, phase='self-compile'):
+                def validate(result, phase='self-compile'):
                     self.assertFalse(state['active'], 'correctness I/O entered timed interval')
                     state['validations'] += 1
-                    original_validate(result, expected, phase)
+                    original_validate(result, phase)
 
-                with patch.object(budget, 'OUTPUT', output), patch.object(budget, 'REFERENCE', reference), \
+                with patch.object(budget, 'OUTPUT', output), \
                         patch.object(budget, 'COMPILER', compiler), patch.object(budget, 'resource', None), \
                         patch.object(budget, 'RUNS', 2), patch.object(budget, 'BATCHES', 1), \
                         patch.object(budget, 'compile_once', side_effect=compile_once), \
                         patch.object(budget, 'validate_compile_output', side_effect=validate), \
                         patch.object(budget, 'retired_instructions', return_value=None), \
+                        patch.object(budget, 'check_compiler_behavior'), \
                         patch.object(budget.time, 'perf_counter', side_effect=clock), \
                         patch.object(Path, 'unlink', new=unlink), patch('sys.stdout', new_callable=io.StringIO):
                     if message:

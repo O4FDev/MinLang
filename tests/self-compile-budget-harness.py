@@ -18,13 +18,22 @@ class BudgetHarness(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
-        self.expected = b'; fixed-point compiler\n'
+        self.expected = b'define i32 @main(i32 %argc, ptr %argv) { ret i32 0 }\n'
         reference = root / 'reference.ll'
         reference.write_bytes(self.expected)
-        for name, value in (('REFERENCE', reference), ('OUTPUT', root / 'output.ll')):
+        for name, value in (('OUTPUT', root / 'output.ll'),):
             patch = mock.patch.object(budget, name, value)
             patch.start()
             self.addCleanup(patch.stop)
+
+    def test_valid_compiler_output_may_change_formatting(self):
+        budget.OUTPUT.write_text('define i32 @main(i32 %argc, ptr %argv) {\n  ret i32 0\n}\n')
+        budget.validate_compile_output(subprocess.CompletedProcess([], 0, '', ''))
+
+    def test_structural_output_cannot_replace_compiler_behavior(self):
+        budget.OUTPUT.write_bytes(self.expected)
+        with self.assertRaisesRegex(SystemExit, 'compiler behavior failed'):
+            budget.check_compiler_behavior(budget.OUTPUT)
 
     def counter_runs(self, measurements):
         remaining = iter(measurements)
