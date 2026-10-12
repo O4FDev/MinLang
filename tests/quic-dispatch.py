@@ -13,4 +13,9 @@ def main():
         expected=Path(temporary)/'vectors';fixture=json.loads((ROOT/'tests/fixtures/siphash-vectors.json').read_text());expected.write_bytes(bytes.fromhex(''.join(fixture['vectors'])))
         result=subprocess.run([str(binary),str(expected)],capture_output=True,text=True,timeout=120)
         assert result.returncode==0,(result.returncode,result.stdout,result.stderr);print(result.stdout,end='')
+        routes=Path(temporary)/'routes';fixtures.compile_program(ROOT/'tests/peer-routing.min',routes)
+        result=subprocess.run([str(routes)],capture_output=True,text=True,timeout=120)
+        assert result.returncode==0 and result.stderr=='',(result.returncode,result.stdout,result.stderr)
+        assert result.stdout=='bounded edge routing: 32768 peers, 262144 live IDs, cross-partition collisions, full pools, removal and reuse passed\n',result.stdout
+        print(result.stdout,end='')
 if __name__=='__main__':main()

@@ -104,6 +104,32 @@ class QuicRfcHarness(unittest.TestCase):
                     with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                         RFC.verify_result('vn', dict(vn, **{key:value}), None, binaries, None)
 
+    def test_preferred_address_reports_require_exact_authenticated_tuples(self):
+        with tempfile.TemporaryDirectory() as folder:
+            binaries, _, _ = self.protocol_fixture(Path(folder))
+            tuples = {
+                'preferred': 'QNS authenticated preferred address ipv4=7f000001:44301 ipv6=00000000000000000000000000000000:0',
+                'preferred-ipv6': 'QNS authenticated preferred address ipv4=00000000:0 ipv6=00000000000000000000000000000001:44301',
+            }
+            for case, expected in tuples.items():
+                row = dict(case=case, expected=0, semantic_status=0, client_status=0,
+                    matched=True, files_match=True, reciprocal_epoch_secrets=True,
+                    client_stderr='', server_stderr='', preferred_tuple_match=True,
+                    authenticated_preferred_tuples=[expected], client_stdout=expected+'\n')
+                report = dict(binary_hashes={name:RFC.digest(binaries[name])
+                    for name in ('client','server')}, results=[row])
+                RFC.verify_result('local', report, [case], binaries, None)
+                for changes in ({'preferred_tuple_match':False},
+                                {'preferred_tuple_match':1},
+                                {'authenticated_preferred_tuples':[]},
+                                {'authenticated_preferred_tuples':[expected,expected]},
+                                {'authenticated_preferred_tuples':[expected.replace('44301','0')]},
+                                {'client_stdout':expected.replace('44301','0')+'\n'},
+                                {'client_stdout':expected+'\n'+expected+'\n'}):
+                    mutant=copy.deepcopy(report);mutant['results'][0].update(changes)
+                    with self.subTest(case=case,changes=changes),self.assertRaises(ValueError):
+                        RFC.verify_result('local', mutant, [case], binaries, None)
+
     def link_fixture(self, directory, sanitize=True):
         compiler = directory / 'selected-clang'
         compiler.write_bytes(b'benign selected compiler bytes')
@@ -429,9 +455,10 @@ class QuicRfcHarness(unittest.TestCase):
                 with self.subTest(label=label,command=command),self.assertRaises(ValueError):
                     RFC.verify_case_invocation('migration',label,command,None,roles,directory,binaries)
             mapping={'multiplex1999':'transfer','multiconnect50':'multiconnect',
-                     'ipv6':'transfer','preferred':'connectionmigration',
+                     'ipv6':'transfer','preferred':'connectionmigration','preferred-ipv6':'connectionmigration',
                      'resumption40':'resumption','zerortt40':'zerortt',
                      'keyupdate':'keyupdate','chacha20':'chacha20'}
+            self.assertEqual(set(mapping),set(RFC.declared_cases(ROOT/'tests/quic-qns-local.py','CASES')))
             for case,testcase in mapping.items():
                 count=1999 if case=='multiplex1999' else 50 if case=='multiconnect50' else (
                     40 if case in ('resumption40','zerortt40') else 1)
@@ -440,13 +467,14 @@ class QuicRfcHarness(unittest.TestCase):
                     downloads=['fixtures/'+case+'-downloads/'+name for name in sorted(names)],
                     keylogs=sorted(['fixtures/'+case+'-client.keys','fixtures/'+case+'-server.keys']))
                 client=[str(binaries['client'].resolve()),str(workspace/'root.der'),
-                        '::1' if case=='ipv6' else '127.0.0.1','44300',
+                        '::1' if case in ('ipv6','preferred-ipv6') else '127.0.0.1','44300',
                         str(workspace/(case+'-client.keys')),str(workspace/(case+'-downloads')),
                         testcase,*names]
                 server=[str(binaries['server'].resolve()),str(workspace/'server.pk8'),
                         str(workspace/'root.der'),str(workspace/(case+'-server.keys')),
                         str(workspace/(case+'-www')),testcase,str(workspace/'server.der'),'--port=44300']
                 if case=='preferred':server+=['--preferred-ipv4=7f000001','--preferred-port=44301']
+                if case=='preferred-ipv6':server+=['--preferred-ipv4=00000000','--preferred-ipv6=00000000000000000000000000000001','--preferred-port=44301']
                 RFC.verify_case_invocation('local',case,client,server,local_roles,directory,binaries)
                 for location in (0,1,2,3,4,5,6,7):
                     wrong=list(client);wrong[location]='incorrect'
