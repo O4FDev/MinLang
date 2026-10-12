@@ -105,7 +105,7 @@ check-sanitize: check-cycle-registration-exposure-sanitize
 
 # Every C command takes N OPERATION [ARGS]; these are production-header controls.
 .PHONY: check-cycle-private-retirement check-cycle-private-retirement-sanitize
-CYCLE_PRIVATE_RETIREMENT_INPUTS = tests/cycle-private-retirement.py tests/cycle-idle-invalidation.c tests/cycle-private-retirement-v5.json tests/cycle-additive.c tests/cycle-additive.py tests/clang_helpers.py tests/test_evidence.py tools/cycle_runtime.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
+CYCLE_PRIVATE_RETIREMENT_INPUTS = tests/cycle-private-retirement.py tests/cycle-idle-invalidation.c tests/cycle-private-retirement-v5.json tests/fixtures/cycle-private-retirement-v5-collector.h tests/cycle-additive.c tests/cycle-additive.py tests/clang_helpers.py tests/test_evidence.py tools/cycle_runtime.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
 check-cycle-private-retirement: $(CYCLE_PRIVATE_RETIREMENT_INPUTS) | build
 	@set -e; evidence=$$(mktemp -d "$(abspath build)/cycle-private-retirement-native-XXXXXX"); \
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-private-retirement.py --evidence "$$evidence/run"
@@ -161,3 +161,12 @@ check-cycle-detached-first-insertion: $(CYCLE_DETACHED_FIRST_INSERTION_INPUTS) |
 check-cycle-detached-first-insertion-sanitize: $(CYCLE_DETACHED_FIRST_INSERTION_INPUTS) | build
 	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-additive.py --fixture cycle-detached-first-insertion.c --budgets 1 32 --nodes 512 2048 --sanitize --evidence "$(CURDIR)/build/cycle-detached-first-insertion-sanitize"
 check-managed-graphs-profiles: check-cycle-detached-first-insertion check-cycle-detached-first-insertion-sanitize
+
+# Scanned full-MARK actual-zero retirement and issued-job expiry, bounded profiles only.
+.PHONY: check-cycle-full-mark-retirement check-cycle-full-mark-retirement-sanitize
+CYCLE_FULL_MARK_RETIREMENT_INPUTS = tests/cycle-full-mark-zero.c tests/cycle-detached-first-insertion.c tests/cycle-leaf-churn.c tests/cycle-additive.c tests/cycle-additive.py tools/cycle_runtime.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
+check-cycle-full-mark-retirement: $(CYCLE_FULL_MARK_RETIREMENT_INPUTS) | build
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-additive.py --fixture cycle-full-mark-zero.c --budgets 1 32 --nodes 512 2048 --evidence "$(CURDIR)/build/cycle-full-mark-retirement-native"
+check-cycle-full-mark-retirement-sanitize: $(CYCLE_FULL_MARK_RETIREMENT_INPUTS) | build
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-additive.py --fixture cycle-full-mark-zero.c --budgets 1 32 --nodes 512 2048 --sanitize --evidence "$(CURDIR)/build/cycle-full-mark-retirement-sanitize"
+check-managed-graphs-profiles: check-cycle-full-mark-retirement check-cycle-full-mark-retirement-sanitize

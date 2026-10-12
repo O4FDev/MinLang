@@ -168,7 +168,11 @@ static void rc_cycle_unit_body(void) {
             cycle->marked = 2;
             if (cycle->pinned) {
                 cycle->pinned = 0;
+#ifdef MINYAR_BOUNDED_RC
+                rc_drop_final_mark_pin(rc_cycle_object(cycle));
+#else
                 rc_drop(rc_cycle_object(cycle) + 1);
+#endif
             }
         }
         return;
@@ -189,6 +193,12 @@ static void rc_cycle_unit_body(void) {
                 rc_cycle_proof_valid = rc_cycle_proof_build && rc_cycle_anchor_held();
                 rc_cycle_proof_generation = rc_cycle_generation;
                 rc_cycle_local_generation = rc_cycle_generation;
+                /* Paired dead-edge work can owe a local scan for private
+                 * cycles outside this primary. A completed held proof covers
+                 * the whole registry only if its unknown prefix is empty. */
+                if (rc_cycle_proof_valid && rc_cycle_anchor_held() &&
+                    !rc_cycle_rescan && !rc_cycle_head)
+                    rc_cycle_local_requested = 0;
             }
             rc_cycle_proof_build = 0;
             rc_cycle_phase = RC_CYCLE_IDLE;
