@@ -221,4 +221,89 @@ raise SystemExit('interruption unexpectedly completed')
             if child.poll() is None: os.killpg(child.pid, signal.SIGKILL)
             child.communicate(timeout=2)
 
+
+    def test_streaming_rss_statistics_match_the_retained_reference(self):
+        import math
+        def reference(rows, warmup):
+            warm = [row for row in rows if row.get('elapsed_seconds', 0) >= warmup and 'rss_kib' in row]
+            if not warm:
+                return {'warm_rss_min_kib': None, 'warm_rss_max_kib': None,
+                        'rss_slope_kib_per_second': None}
+            xmean = sum(row['elapsed_seconds'] for row in warm) / len(warm)
+            ymean = sum(row['rss_kib'] for row in warm) / len(warm)
+            numerator = sum((row['elapsed_seconds'] - xmean) * (row['rss_kib'] - ymean) for row in warm)
+            denominator = sum((row['elapsed_seconds'] - xmean) ** 2 for row in warm)
+            return {'warm_rss_min_kib': min(row['rss_kib'] for row in warm),
+                    'warm_rss_max_kib': max(row['rss_kib'] for row in warm),
+                    'rss_slope_kib_per_second': numerator / denominator if denominator else 0}
+        cases = [[], [{'elapsed_seconds': 59, 'rss_kib': 999}],
+                 [{'elapsed_seconds': 60, 'rss_kib': 1000}],
+                 [{'elapsed_seconds': 70, 'rss_kib': y} for y in (1000, 1300, 1100)],
+                 [{'elapsed_seconds': 59, 'rss_kib': 9000}, {'line': 'progress'},
+                  {'elapsed_seconds': 60, 'rss_kib': 1000}, {'elapsed_seconds': 61, 'rss_kib': 1010},
+                  {'elapsed_seconds': float('nan'), 'rss_kib': 9999}],
+                 [{'elapsed_seconds': x, 'rss_kib': y} for x, y in ((100, 1300), (61, 990), (80, 1100), (62, 1030))],
+                 [{'elapsed_seconds': float((i*97)%503 + 60), 'rss_kib': 1000 + (i*53)%997} for i in range(3000)]]
+        for rows in cases:
+            for warmup in (0, 60, 75, 10000):
+                with self.subTest(rows=len(rows), warmup=warmup):
+                    expected = reference(rows, warmup)
+                    # Iterate distinct dictionaries once: no list contract.
+                    actual = observer.memory_summary((dict(row) for row in rows), warmup)
+                    self.assertEqual(actual['warm_rss_min_kib'], expected['warm_rss_min_kib'])
+                    self.assertEqual(actual['warm_rss_max_kib'], expected['warm_rss_max_kib'])
+                    wanted = expected['rss_slope_kib_per_second']
+                    if wanted is None: self.assertIsNone(actual['rss_slope_kib_per_second'])
+                    else: self.assertTrue(math.isclose(actual['rss_slope_kib_per_second'], wanted,
+                                                      rel_tol=1e-9, abs_tol=1e-12), (actual, expected))
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'actual retained Python RSS uses Linux procfs')
+    def test_rss_summary_does_not_retain_generator_rows(self):
+        source = r"""
+import json,os,sys
+sys.path.insert(0,sys.argv[1])
+from soak_observer import memory_summary,process_sample
+class Row(dict):
+    live=0
+    peak=0
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        Row.live+=1
+        Row.peak=max(Row.peak,Row.live)
+    def __del__(self):
+        Row.live-=1
+baseline=process_sample(os.getpid())['rss_kib']
+peak=baseline
+count=16000
+def rows():
+    global peak
+    for index in range(count):
+        if index%128==0:
+            peak=max(peak,process_sample(os.getpid())['rss_kib'])
+        # A bounded diagnostic line is irrelevant to the summary and must not
+        # keep each independent input dictionary alive. Size stays below64KiB.
+        yield Row(elapsed_seconds=float((index*97)%10007+60),
+                  rss_kib=1000+(index*53)%997,
+                  line=str(index)+':'+('x'*2048))
+result=memory_summary(rows(),60)
+print(json.dumps({'pid':os.getpid(),'rows':count,'peak_live_rows':Row.peak,
+                  'remaining_live_rows':Row.live,'rss_base_kib':baseline,
+                  'peak_rss_kib':peak,'retained_growth_kib':peak-baseline,
+                  'summary':result}),flush=True)
+"""
+        run = subprocess.run([sys.executable, '-c', source, str(Path(__file__).parent)],
+                             capture_output=True, text=True, timeout=2, start_new_session=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stderr, '')
+        result = json.loads(run.stdout)
+        print(json.dumps(result), flush=True)
+        self.assertEqual(result['rows'], 16000)
+        self.assertEqual(result['summary']['warm_rss_min_kib'], 1000)
+        self.assertEqual(result['summary']['warm_rss_max_kib'], 1996)
+        self.assertEqual(result['remaining_live_rows'], 0)
+        with self.assertRaises(ProcessLookupError): os.kill(result['pid'], 0)
+        with self.assertRaises(ProcessLookupError): os.killpg(result['pid'], 0)
+        self.assertLessEqual(result['peak_live_rows'], 2, 'summary retained independent input dictionaries')
+        self.assertLessEqual(result['retained_growth_kib'], 16384, 'summary exceeded unchanged16MiB span')
+
 if __name__ == '__main__': unittest.main()
