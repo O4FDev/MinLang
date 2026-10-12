@@ -17,12 +17,15 @@
  * incoming counts owning aggregate slots, so it never exceeds the number of
  * eight-byte slots that fit in the address space; 58 bits cover 2^61 bytes. */
 typedef struct RcCycle {
-    struct RcCycle *previous, *next;
+    /* Registry links are unused after irreversible zero-count unlink. Only
+     * issued full-MARK dead owners reuse them for exact job/anchor identity. */
+    union { struct RcCycle *previous; size_t retired_completed; };
+    union { struct RcCycle *next; uintptr_t retired_anchor_token; };
     uintptr_t gray_next; /* Registered: aligned link, bits0/1 proof tags, bit2 local namespace.
                           * Unregistered: bit2 retains captured incoming-path exposure; bit3
                           * marks private bounded zero-count cleanup; bit4 distinguishes captured
                           * dead owners; bit5 distinguishes fresh local-MARK retirement. None is a
-                          * live certificate. */
+                          * live certificate. Bit6 distinguishes scanned full-MARK retirement. */
     size_t generation : 1, marked : 2, registered : 1, pinned : 1, cleared : 1, record : 1,
         incoming : 57;
 } RcCycle;
@@ -284,10 +287,10 @@ static inline int rc_cycle_unregistered_leaf(RcCycle *cycle) {
 /* Only an irreversibly dead, unregistered object may carry this bit. It is
  * separate from live proof/exposure tags; allocation and registration reset it. */
 enum { RC_CYCLE_PRIVATE_DEAD = 8, RC_CYCLE_CAPTURED_DEAD = 16,
-       RC_CYCLE_FRESH_MARK_DEAD = 32 };
+       RC_CYCLE_FRESH_MARK_DEAD = 32, RC_CYCLE_FULL_MARK_DEAD = 64 };
 /* Actual-zero owners are outside every current owning path. A previously
  * captured owner may retire during a local job without canceling the primary;
- * a full proof under construction still needs the conservative fallback. */
+ * this completed-primary helper never admits full-building work. */
 static inline int rc_cycle_primary_retirement(void) {
     return !rc_cycle_inside && !rc_cycle_rescan &&
            (rc_cycle_phase == RC_CYCLE_IDLE ||
@@ -296,10 +299,28 @@ static inline int rc_cycle_primary_retirement(void) {
            rc_cycle_proof_valid && !rc_cycle_proof_build && rc_cycle_anchor_held() &&
            !rc_cycle_proof_anchor->pinned;
 }
-/* Called only after a real outside-collector RC decrement reached zero, before
+/* Full MARK has already scanned this dead owner's fields. It cannot remain
+ * on an owning path; no gray pin/active field may be discarded. Keep this
+ * separate from completed-primary retirement and recheck it for every field. */
+static inline int rc_cycle_full_mark_retirement(void) {
+    return !rc_cycle_inside && !rc_cycle_local_job && !rc_cycle_rescan &&
+           rc_cycle_phase == RC_CYCLE_MARK && !rc_cycle_proof_valid &&
+           rc_cycle_proof_build && rc_cycle_anchor_held() &&
+           !rc_cycle_proof_anchor->pinned;
+}
+/* Only MARK's completed scan issues this local final-pin context, after
+ * rc_cycle_active is cleared. Queued field cleanup retains its separate
+ * unchanged outside-only retirement predicate. */
+static inline int rc_cycle_final_mark_pin_zero(void) {
+    return rc_cycle_inside && !rc_cycle_active && !rc_cycle_local_job &&
+           !rc_cycle_rescan && rc_cycle_phase == RC_CYCLE_MARK &&
+           !rc_cycle_proof_valid && rc_cycle_proof_build &&
+           rc_cycle_anchor_held() && !rc_cycle_proof_anchor->pinned;
+}
+/* Called only after an actual RC decrement reached zero, before
  * the bounded queue reuses ownership as its link. A fresh uncaptured owner has
  * never contributed an anchor path; retiring it cannot remove a proven edge. */
-static inline void rc_cycle_unregister_zero(RcObject *object) {
+static inline void rc_cycle_unregister_zero(RcObject *object, unsigned mark_pin) {
     RcCycle *cycle = rc_cycle_metadata(object);
     unsigned fresh = cycle->marked == 3 && !(cycle->gray_next & ~(uintptr_t)4) &&
                      cycle != rc_cycle_temporary_anchor && rc_cycle_primary_idle();
@@ -311,9 +332,13 @@ static inline void rc_cycle_unregister_zero(RcObject *object) {
     unsigned fresh_mark = cycle->marked == 3 && cycle->gray_next == 4 &&
                           cycle != rc_cycle_temporary_anchor && rc_cycle_local_job &&
                           rc_cycle_phase == RC_CYCLE_MARK && rc_cycle_primary_retirement();
+    unsigned full_mark = cycle->marked == 2 && !cycle->gray_next &&
+                         !rc_cycle_proven(cycle) && cycle != rc_cycle_temporary_anchor &&
+                          (rc_cycle_full_mark_retirement() ||
+                           (mark_pin && rc_cycle_final_mark_pin_zero()));
     if (object->ownership != RC_TRACED || cycle->incoming || !cycle->registered ||
         cycle->pinned || cycle->cleared || cycle == rc_cycle_proof_anchor ||
-        cycle == rc_cycle_proof_retry || (!fresh && !captured && !fresh_mark)) {
+        cycle == rc_cycle_proof_retry || (!fresh && !captured && !fresh_mark && !full_mark)) {
         rc_cycle_unregister(object);
         return;
     }
@@ -321,10 +346,16 @@ static inline void rc_cycle_unregister_zero(RcObject *object) {
     if (rc_cycle_temporary_anchor == cycle)
         rc_cycle_temporary_anchor = NULL;
     rc_cycle_unlink(cycle);
+    if (full_mark) {
+        cycle->retired_completed = rc_cycle_completed;
+        cycle->retired_anchor_token = (uintptr_t)rc_cycle_proof_anchor;
+        cycle->generation = rc_cycle_generation;
+    }
     /* Distinct issued bits certify irreversible zero-count retirement. The
      * older fresh-private marker retains its original idle-only field rules. */
     cycle->gray_next = RC_CYCLE_PRIVATE_DEAD | (captured ? RC_CYCLE_CAPTURED_DEAD : 0) |
-                      (fresh_mark ? RC_CYCLE_FRESH_MARK_DEAD : 0);
+                      (fresh_mark ? RC_CYCLE_FRESH_MARK_DEAD : 0) |
+                      (full_mark ? RC_CYCLE_FULL_MARK_DEAD : 0);
 }
 #endif
 
@@ -447,6 +478,28 @@ static inline void rc_cycle_after_drop(RcObject *object) {
     if (rc_cycle_enabled)
         rc_cycle_check_external(object);
 }
+#ifdef MINYAR_BOUNDED_RC
+/* Only the matching decrement of one certified dead-owner slot may use this.
+ * Incoming and real count both fell by one: outside ownership did not change.
+ * A captured gray/scanned child is already covered by this finite full MARK;
+ * preserve this full build, but retain a local unknown-cohort debt: a private
+ * cycle may have lost its last external path even though count-incoming did
+ * not change. Completion discards that debt only when no unknown registry
+ * remains. No live proof is issued; ordinary unpaired drops stay unchanged. */
+static inline void rc_cycle_after_paired_drop(RcObject *object) {
+    RcCycle *cycle = rc_cycle_value(object + 1);
+    if (rc_cycle_enabled && cycle && cycle->registered &&
+        (cycle->marked == 1 || cycle->marked == 2) && !rc_cycle_snapshot_new(cycle) &&
+        !cycle->pinned && !cycle->cleared && !rc_cycle_proven(cycle) &&
+        cycle != rc_cycle_proof_anchor && cycle != rc_cycle_proof_retry &&
+        cycle != rc_cycle_temporary_anchor &&
+        (object->ownership >> 3) == cycle->incoming && rc_cycle_full_mark_retirement()) {
+        rc_cycle_request_local();
+        return;
+    }
+    rc_cycle_after_drop(object);
+}
+#endif
 static MINYAR_NOINLINE void rc_cycle_add_incoming(RcObject *parent, RcCycle *cycle,
                                                   unsigned additive) {
     RcCycle *source = rc_cycle_metadata(parent);
@@ -571,26 +624,31 @@ static inline void rc_cycle_edge_remove(void *value) {
 /* The parent's ownership word is already a cleanup link/cursor. Its private
  * marker was established at true RC zero; each field rechecks current proof
  * state, because application calls may run between bounded cleanup units. */
-static inline void rc_cycle_dead_edge_remove(RcObject *parent, void *value) {
+static inline unsigned rc_cycle_dead_edge_remove(RcObject *parent, void *value) {
     RcCycle *child = rc_cycle_value(value);
     if (!child)
-        return;
+        return 0;
     RcCycle *owner = rc_cycle_metadata(parent);
     unsigned captured = owner->gray_next == (RC_CYCLE_PRIVATE_DEAD | RC_CYCLE_CAPTURED_DEAD);
     unsigned fresh_mark = owner->gray_next == (RC_CYCLE_PRIVATE_DEAD | RC_CYCLE_FRESH_MARK_DEAD);
-    unsigned eligible = (captured || fresh_mark) ? rc_cycle_primary_retirement() :
-                                                  rc_cycle_primary_idle();
+    unsigned full_mark = owner->gray_next == (RC_CYCLE_PRIVATE_DEAD | RC_CYCLE_FULL_MARK_DEAD);
+    unsigned eligible = full_mark ?
+        (rc_cycle_full_mark_retirement() && owner->retired_completed == rc_cycle_completed &&
+         owner->generation == rc_cycle_generation && owner->retired_anchor_token == (uintptr_t)rc_cycle_proof_anchor) :
+        ((captured || fresh_mark) ? rc_cycle_primary_retirement() : rc_cycle_primary_idle());
     if (owner->registered ||
-        (!captured && !fresh_mark && owner->gray_next != RC_CYCLE_PRIVATE_DEAD) || owner->pinned ||
+        (!captured && !fresh_mark && !full_mark && owner->gray_next != RC_CYCLE_PRIVATE_DEAD) ||
+        owner->pinned ||
         owner->cleared || owner->incoming || !eligible) {
         rc_cycle_edge_remove(value);
-        return;
+        return 0;
     }
     /* This excluded dead owner is not an anchor-to-child path. The paired
      * incoming decrement and ordinary child RC drop preserve external owners;
      * an unknown surviving child still requests its own bounded work. */
     rc_cycle_temporary_changed();
     child->incoming--;
+    return full_mark; /* Local certificate for only this paired child drop. */
 }
 #endif
 

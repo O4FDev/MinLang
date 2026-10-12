@@ -102,12 +102,17 @@ static void rc_bounded_enqueue(RcObject *object) {
 
 /* Count drop of an RC_TRACED object: the same work as rc_drop, plus the
  * collector's snapshot barriers, gray pinning and registry removal. */
-static inline unsigned rc_drop_traced(RcObject *object) {
+static inline unsigned rc_drop_traced_with_pair(RcObject *object, unsigned paired,
+                                                 unsigned mark_pin) {
     rc_cycle_before_drop(object);
     object->ownership -= 8;
-    if (object->ownership >> 3) { rc_cycle_after_drop(object); return 0; }
+    if (object->ownership >> 3) {
+        if (paired) rc_cycle_after_paired_drop(object);
+        else rc_cycle_after_drop(object);
+        return 0;
+    }
     if (rc_cycle_defer_zero(object)) return 0;
-    rc_cycle_unregister_zero(object);
+    rc_cycle_unregister_zero(object, mark_pin);
     RcCycle *cycle = rc_cycle_metadata(object);
     if (cycle->cleared || !(cycle->record ? ((MinyarRecord *)(object + 1))->length
                                           : ((MinyarList *)(object + 1))->length)) {
@@ -118,6 +123,13 @@ static inline unsigned rc_drop_traced(RcObject *object) {
     return 0;
 }
 
+/* Called only when the collector finishes a pinned MARK node. */
+static inline unsigned rc_drop_final_mark_pin(RcObject *object) {
+    return rc_drop_traced_with_pair(object, 0, 1);
+}
+static inline unsigned rc_drop_traced(RcObject *object) {
+    return rc_drop_traced_with_pair(object, 0, 0); /* Ordinary unpaired path. */
+}
 static unsigned rc_drop(void *value) {
     if (!value) return 0;
     RcObject *object = (RcObject *)value - 1;
@@ -177,7 +189,14 @@ static inline int rc_bounded_traced_visit(RcObject *object, size_t cursor, int r
     }
     if (recent) rc_bounded_save_cursor(object, cursor + 1);
     else rc_bounded_cursor = cursor + 1;
-    rc_cycle_dead_edge_remove(object, child);
+    unsigned paired = rc_cycle_dead_edge_remove(object, child);
+    if (paired && child) {
+        RcObject *target = (RcObject *)child - 1;
+        if (rc_traced(target) && (target->ownership >> 3)) {
+            rc_drop_traced_with_pair(target, 1, 0);
+            return 1;
+        }
+    }
     rc_drop(child);
     return 1;
 }
