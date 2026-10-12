@@ -982,7 +982,9 @@ class BuildWiring(unittest.TestCase):
                     self.assertIn((ROOT / 'build' / ('parallel-signatures-' + suffix)).as_posix(),
                                   commands.replace('\\', '/'))
                 for family in ('compiler', 'closure-compiler', 'errors-compiler'):
-                    self.assertIn(f'cmp build/{family}-stage2.ll build/{family}-stage3.ll', commands)
+                    self.assertIn(f'--ir build/{family}-stage3.ll', commands)
+                self.assertIn('tests/compiler-behavior.py', commands)
+                self.assertNotIn('cmp build/', commands)
 
         verify(source)
         for aggregate in (
