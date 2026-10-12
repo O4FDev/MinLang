@@ -105,6 +105,13 @@ static int child(int argc, char **argv) {
         sleep(1);
 #endif
         return 37;
+    } else if (!strcmp(argv[1], "child-streams")) {
+        assert(fputs("child stdout\n", stdout) >= 0);
+        MinyarText message = test_text("child stderr λ\n");
+        assert(minyar_system_writeStandardError(&message) == 16);
+    } else if (!strcmp(argv[1], "child-long")) {
+        assert(argc == 3 && strlen(argv[2]) == 20000);
+        for (int i = 0; i < 20000; i++) assert(argv[2][i] == 'a');
     } else if (!strcmp(argv[1], "child-credentials")) {
 #ifndef _WIN32
         assert(argc == 4);
@@ -156,6 +163,11 @@ static int process_main(int argc, char **argv) {
     test_cwd(after, sizeof(after));
     assert(!strcmp(previous, after));
     simple[1] = "child-exit"; exited(launch(argv[0], simple, 2, NULL, 0, "", -1, -1, groups, false), 127);
+    simple[1] = "child-streams"; exited(launch(argv[0], simple, 2, NULL, 0, "", -1, -1, groups, false), 0);
+    char *long_argument = malloc(20001); assert(long_argument); memset(long_argument, 'a', 20000); long_argument[20000] = 0;
+    const char *long_args[] = {"custom name", "child-long", long_argument};
+    exited(launch(argv[0], long_args, 3, NULL, 0, "", -1, -1, groups, false), 0); free(long_argument);
+    simple[1] = "child-exit";
     assert(launch("/minyar/no-such-executable", simple, 2, NULL, 0, "", -1, -1, groups, false) == -ENOENT);
     assert(launch(argv[0], simple, 2, NULL, 0, "/minyar/no-such-directory", -1, -1, groups, false) == -ENOENT);
     assert(launch(argv[0], NULL, 0, NULL, 0, "", -1, -1, groups, false) == -EINVAL);

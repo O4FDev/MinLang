@@ -23,6 +23,17 @@ static wchar_t *system_quote(wchar_t *out, const wchar_t *value) {
     }
     *out++ = L'"'; return out;
 }
+static size_t system_quote_length(const wchar_t *value) {
+    size_t length = 2;
+    while (*value) {
+        size_t slashes = 0;
+        while (*value == L'\\') { slashes++; value++; }
+        length += (*value == L'"' || !*value) ? slashes * 2 : slashes;
+        if (*value == L'"') length++;
+        if (*value) { length++; value++; }
+    }
+    return length;
+}
 static int system_env_compare(const void *left, const void *right) {
     int compared = CompareStringOrdinal(*(wchar_t *const *)left, -1, *(wchar_t *const *)right, -1, TRUE);
     return compared == CSTR_LESS_THAN ? -1 : (compared == CSTR_GREATER_THAN ? 1 : 0);
@@ -62,11 +73,11 @@ static int system_windows_spawn(SystemProcess *process, const char *path, System
     size_t command_length = 1;
     for (size_t i = 0; i < argv->count; i++) {
         arguments[i] = system_wide(argv->values[i]); if (!arguments[i]) goto done;
-        size_t length = wcslen(arguments[i]);
         /* argv[0] has different CRT parsing: quote it without slash escaping. */
         if (!i && wcschr(arguments[i], L'"')) { system_error = EINVAL; goto done; }
-        if (length > 16382 || command_length > 32767 - (length * 2 + 3)) { system_error = E2BIG; goto done; }
-        command_length += length * 2 + 3;
+        size_t length = i ? system_quote_length(arguments[i]) + 1 : wcslen(arguments[i]) + 2;
+        if (length >= 32767 || command_length > 32767 - length) { system_error = E2BIG; goto done; }
+        command_length += length;
     }
     command = malloc(command_length * sizeof(*command));
     if (!command) { system_error = ENOMEM; goto done; }

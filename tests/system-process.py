@@ -33,7 +33,7 @@ with tempfile.TemporaryDirectory(prefix='minyar-system-process-') as directory:
         fixture = ['sudo', '-n', 'timeout', '20', *fixture]
     run = subprocess.run(fixture, env=env, capture_output=True, timeout=25)
     assert run.returncode == 0, (run.returncode, run.stdout, run.stderr)
-    assert run.stdout == b'system process: passed\n' and run.stderr == b'', (run.stdout, run.stderr)
+    assert run.stdout == b'child stdout\nsystem process: passed\n' and run.stderr == 'child stderr λ\n'.encode(), (run.stdout, run.stderr)
     print(f'system process {options.mode}: passed', flush=True)
     if options.language:
         language = directory/('language.exe' if windows_host() else 'language')
