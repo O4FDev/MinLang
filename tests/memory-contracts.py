@@ -145,6 +145,8 @@ def main():
             for path in sorted((ROOT / directory).rglob('*')):
                 if path.is_file() and '__pycache__' not in path.parts:
                     snapshot(path, path.relative_to(ROOT))
+        # tests/llvm_sanitizer.py is a shim over this canonical module.
+        snapshot(ROOT / 'tools/sanitizer_llvm.py', Path('tools/sanitizer_llvm.py'))
         if args.level == 'extended':
             for name in ('production-live-oracle', 'production-frame-oracle',
                          'production-idle-service', 'production-virtual-stress'):
