@@ -1,0 +1,126 @@
+// A real mTLS client with an independent bounded post-handshake CID receiver.
+// The ordinary client API advertises two IDs; this fixture advertises 3/8
+// and decodes/ACKs that larger stock itself, without changing peer policy.
+use "quic" as quic
+use "quicwire" as wire
+use "quiccrypto" as protection
+use "crypto" as crypto
+use "net" as net
+use "errors" as errors
+record Id { sequence: Integer; id: Bytes; token: Bytes }
+record Stock { connection: quic.Connection; socket: Integer; ids: List<Id>; next: Integer; minimum: Integer; response: Boolean }
+function number(text: Text): Integer { let value=0;for digit in text { value=value*10+Integer(digit)-48 };return value }
+function add(data: Bytes,value: Integer) { data.addBytes(errors.bytesValue(wire.encode(value))) }
+function equal(a: Bytes,b: Bytes): Boolean { return crypto.hex(a)==crypto.hex(b) }
+function advertise(connection: quic.Connection,limit: Integer): Boolean {
+    let parsed=wire.parameters(connection.clientTLS.transportParameters,false);let data=Bytes();let changed=0
+    if !parsed.valid { return false }
+    for parameter in parsed.parameters {
+        let value=parameter.value
+        if parameter.id==14 { value=errors.bytesValue(wire.encode(limit));changed+=1 }
+        add(data,parameter.id);add(data,value.length);data.addBytes(value)
+    }
+    connection.clientTLS.transportParameters=data
+    return changed==1 && errors.booleanOk(quic.setCipherSuites(connection,connection.clientTLS.allowedSuites))
+}
+function send(st: Stock,destination: Bytes,payload: Bytes): Boolean {
+    let space=st.connection.spaces[2];let pn=space.next;space.next+=1
+    let header=Bytes();header.add(0x43);header.addBytes(destination)
+    for index in 0..4 { header.add((pn>>((3-index)*8))&255) }
+    let encoded=protection.protect(space.write,header,header.length-4,pn,payload)
+    if !errors.bytesOk(encoded) { return false }
+    let packet=errors.bytesValue(encoded);let result=net.write(st.socket,packet)
+    return errors.integerOk(result) && errors.integerValue(result)==packet.length
+}
+function observe(st: Stock,wanted: Bytes): Boolean {
+    net.ready(st.socket,1)
+    let received=net.receiveDatagrams(st.socket,64,65535)
+    if !net.datagramBatchOk(received) { return errors.isWouldBlock(net.datagramBatchError(received)) }
+    for datagram in net.datagrams(received) {
+        let data=net.datagramData(datagram);if !errors.bytesOk(data) { return false }
+        let bytes=errors.bytesValue(data);let header=wire.header(bytes,0,st.connection.local.length)
+        if !header.valid || header.kind!=wire.ONE_RTT || !quic.ownsConnectionId(st.connection,header.destination) { return false }
+        let opened=protection.unprotect(st.connection.spaces[2].read,bytes,header.numberOffset,-1)
+        if !opened.valid { return false }
+        let parsed=wire.frames(opened.payload);if !parsed.valid { return false }
+        let eliciting=false
+        for frame in parsed.frames {
+            if frame.type!=0 && frame.type!=2 && frame.type!=3 { eliciting=true }
+            if frame.type==27 && equal(frame.data,wanted) { st.response=true }
+            if frame.type==28 || frame.type==29 { return false }
+            if frame.type==24 {
+                if frame.data.length<17 || frame.offset!=st.minimum { return false }
+                let id=frame.data.slice(0,frame.data.length-16);let token=frame.data.slice(frame.data.length-16,frame.data.length)
+                let known=false
+                for previous in st.ids {
+                    if previous.sequence==frame.value {
+                        if !equal(previous.id,id) || !equal(previous.token,token) { return false };known=true
+                    } else if equal(previous.id,id) || equal(previous.token,token) { return false }
+                }
+                if frame.value>=st.minimum && !known {
+                    if frame.value!=st.next { return false }
+                    let retained: List<Id> = []
+                    for previous in st.ids { if previous.sequence>=st.minimum { retained.add(previous) } }
+                    retained.add(Id { sequence:frame.value;id:id;token:token });st.ids=retained;st.next+=1
+                }
+            }
+        }
+        if eliciting {
+            let ack=Bytes();add(ack,2);add(ack,opened.number);add(ack,0);add(ack,0);add(ack,0)
+            if !send(st,st.ids[0].id,ack) { return false }
+        }
+    }
+    return true
+}
+function challenge(st: Stock,destination: Bytes,retire: Boolean,wantedCount: Integer): Boolean {
+    let token=randomBytes(8);let payload=Bytes()
+    if retire { add(payload,25);add(payload,0);st.minimum=1 }
+    payload.add(26);payload.addBytes(token);st.response=false
+    if !send(st,destination,payload) { return false }
+    let deadline=net.monotonicMilliseconds()+400
+    while net.monotonicMilliseconds()<deadline && (!st.response || st.ids.length!=wantedCount) {
+        if !observe(st,token) { return false }
+    }
+    return st.response && st.ids.length==wantedCount
+}
+function main(): Integer {
+    let root=readBytesFile(argument(0));let identity=readBytesFile(argument(1));let key=readBytesFile(argument(2));let limit=number(argument(4))
+    let socket=net.udp("127.0.0.1",0)
+    if socket<0 || !net.udpConnect(socket,"127.0.0.1",number(argument(3))) { return 10 }
+    let connection=quic.client("localhost",randomBytes(80),"hearth-peer",[root],[identity],key)
+    if !advertise(connection,limit) { return 11 }
+    let started=net.monotonicMilliseconds()
+    while net.monotonicMilliseconds()-started<4000 && (!connection.confirmed || connection.remoteIds.length!=2) {
+        let now=net.monotonicMilliseconds()-started
+        for packet in quic.poll(connection,now) { let result=net.write(socket,packet);if !errors.integerOk(result) || errors.integerValue(result)!=packet.length { return 12 } }
+        net.ready(socket,1);let batch=net.receiveDatagrams(socket,64,65535)
+        if net.datagramBatchOk(batch) { for datagram in net.datagrams(batch) {
+            let data=net.datagramData(datagram);if !errors.bytesOk(data) { return 12 }
+            quic.receive(connection,errors.bytesValue(data),net.monotonicMilliseconds()-started)
+        } } else if !errors.isWouldBlock(net.datagramBatchError(batch)) { return 12 }
+        if connection.state==quic.FAILED { print(connection.error);return 12 }
+    }
+    if !connection.confirmed || !connection.clientTLS.authenticated || connection.remoteIds.length!=2 { return 13 }
+    let ids: List<Id> = [];for known in connection.remoteIds { ids.add(Id { sequence:known.sequence;id:known.id;token:known.token }) }
+    let st=Stock { connection:connection;socket:socket;ids:ids;next:2;minimum:0;response:false }
+    print("authenticated edge with peer limit "+Text(limit)+" and wire CID0/CID1")
+    let original=st.ids[0].id
+    if !challenge(st,st.ids[1].id,false,3) { print("edge first CID1 use lost peer or wire CID2 without retiring CID0");return 14 }
+    if st.ids[0].sequence!=0 || !equal(st.ids[0].id,original) || st.next!=3 { return 15 }
+    for sequence in 2..limit {
+        let wanted=min(limit,sequence+2)
+        if !challenge(st,st.ids[sequence].id,false,wanted) || st.next!=wanted { return 16 }
+    }
+    for known in st.ids { if !challenge(st,known.id,false,limit) || st.next!=limit { return 17 } }
+    if !challenge(st,st.ids[st.ids.length-1].id,true,limit) || st.next!=limit+1 || st.ids[0].sequence!=1 { return 18 }
+    for known in st.ids { if !challenge(st,known.id,false,limit) || st.next!=limit+1 { return 19 } }
+    let token=randomBytes(8);let payload=Bytes();payload.add(26);payload.addBytes(token);st.response=false
+    if !send(st,original,payload) { return 20 }
+    let deadline=net.monotonicMilliseconds()+400
+    while net.monotonicMilliseconds()<deadline { if !observe(st,token) || st.response { return 21 } }
+    if !challenge(st,st.ids[0].id,false,limit) || st.next!=limit+1 { return 22 }
+    if !send(st,st.ids[0].id,crypto.fromHex("1d00000000")) { return 23 }
+    net.close(socket)
+    print("GREEN actual edge stock limit "+Text(limit)+": all live IDs route, retired CID0 is silent and replacement remains bounded")
+    return 0
+}
