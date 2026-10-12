@@ -36,6 +36,34 @@ def identity(name, default):
     }
 
 
+def publish_stamp(target, content, max_wait=3.0):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Apple's GNU Make 3.81 compares whole seconds. A changed stamp must be
+    # strictly newer than artifacts built earlier in this second; otherwise a
+    # quick toolchain/flag switch can silently keep an incompatible object.
+    # Userspace CLOCK_REALTIME crossing a boundary does not certify the
+    # filesystem clock. Touch with UTIME_NOW and verify the inode itself.
+    # Never assign a future mtime; never replace a stamp on a stalled clock.
+    previous = target.stat().st_mtime_ns // 1_000_000_000 if target.exists() else 0
+    boundary = max(int(time.time()), previous) + 1
+    deadline = time.monotonic() + max_wait
+    descriptor, temporary = tempfile.mkstemp(prefix=target.name + ".", dir=target.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+        while True:
+            os.utime(temporary, None)
+            if Path(temporary).stat().st_mtime_ns // 1_000_000_000 >= boundary:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('filesystem timestamp did not cross the required whole-second boundary')
+            time.sleep(min(remaining, 0.05))
+        os.replace(temporary, target)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
 def main():
     target = Path(sys.argv[1])
     content = json.dumps({
@@ -44,24 +72,7 @@ def main():
     }, sort_keys=True, indent=2).encode() + b"\n"
     if target.is_file() and target.read_bytes() == content:
         return
-    target.parent.mkdir(parents=True, exist_ok=True)
-    # Apple's GNU Make 3.81 compares whole seconds. A changed stamp must be
-    # strictly newer than artifacts built earlier in this second; otherwise a
-    # quick toolchain/flag switch can silently keep an incompatible object.
-    # Wait only on configuration changes, never move mtimes into the future.
-    boundary = int(time.time()) + 1
-    while True:
-        remaining = boundary - time.time()
-        if remaining <= 0:
-            break
-        time.sleep(min(remaining, 1.0))
-    descriptor, temporary = tempfile.mkstemp(prefix=target.name + ".", dir=target.parent)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(content)
-        os.replace(temporary, target)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
+    publish_stamp(target, content)
 
 
 if __name__ == "__main__":

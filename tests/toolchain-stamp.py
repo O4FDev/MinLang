@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Toolchain changes invalidate artifacts; unchanged probes preserve mtimes."""
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from clang_helpers import native_path
 
@@ -50,6 +52,65 @@ class ToolchainStamp(unittest.TestCase):
                 stream.write(b"replacement compiler, same executable path")
             self.assertNotEqual(probe()[0], flags[0])
             self.assertEqual(json.loads(stamp.read_text())["flags"]["LLVM_FLAGS"], "-O3 -g")
+
+
+class StampFilesystemClock(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location('stamp_module', ROOT / 'scripts/toolchain-stamp.py')
+        self.stamp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.stamp)
+
+    def exercise(self, timestamps, max_wait=0.3, prior=100):
+        temporary = tempfile.TemporaryDirectory(prefix='stamp-clock-')
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        target = root / 'stamp.json'
+        target.write_bytes(b'original')
+        real_utime = os.utime
+        real_replace = os.replace
+        real_utime(target, ns=(prior * 1_000_000_000, prior * 1_000_000_000))
+        elapsed = [0.0]
+        wall = [100.9]
+        observed = []
+        values = iter(timestamps)
+        def touch(path, *args, **kwargs):
+            stamp = next(values, timestamps[-1])
+            real_utime(path, ns=(stamp, stamp))
+            observed.append(stamp)
+        def replace(path, destination):
+            self.assertGreaterEqual(Path(path).stat().st_mtime_ns // 1_000_000_000, max(100, prior) + 1)
+            real_replace(path, destination)
+        def sleep(duration):
+            elapsed[0] += duration
+            wall[0] = 101.9
+        # Userspace time has crossed the second; the filesystem initially has
+        # not. Only observing UTIME_NOW on the temporary inode can certify it.
+        with mock.patch.object(self.stamp.time, 'time', side_effect=lambda: wall[0]), \
+             mock.patch.object(self.stamp.time, 'monotonic', side_effect=lambda: elapsed[0]), \
+             mock.patch.object(self.stamp.time, 'sleep', side_effect=sleep), \
+             mock.patch.object(self.stamp.os, 'utime', side_effect=touch), \
+             mock.patch.object(self.stamp.os, 'replace', side_effect=replace):
+            try:
+                self.stamp.publish_stamp(target, b'changed', max_wait=max_wait)
+            except TimeoutError:
+                self.assertEqual(target.read_bytes(), b'original')
+                self.assertEqual(list(root.iterdir()), [target])
+                raise
+        self.assertEqual(target.read_bytes(), b'changed')
+        self.assertEqual(list(root.iterdir()), [target])
+        return observed, elapsed[0]
+
+    def test_userspace_boundary_does_not_certify_filesystem_boundary(self):
+        observed, _ = self.exercise([100_990_000_000, 101_001_000_000])
+        self.assertEqual(observed, [100_990_000_000, 101_001_000_000])
+
+    def test_stalled_filesystem_fails_bounded_without_replacing_stamp(self):
+        with self.assertRaisesRegex(TimeoutError, 'filesystem timestamp'):
+            self.exercise([100_999_999_999], max_wait=0.12)
+
+    def test_clock_rollback_still_requires_newer_than_prior_stamp(self):
+        observed, _ = self.exercise([103_999_999_999, 104_000_000_000], prior=103)
+        self.assertEqual(observed[-1], 104_000_000_000)
 
 
 if __name__ == "__main__":
