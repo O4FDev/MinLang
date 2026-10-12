@@ -17,7 +17,9 @@
 #include "../minyar_native.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -112,4 +114,33 @@ long long minyar_system_drainShutdownSignals(void) {
 
 long long minyar_system_sendSignal(long long pid, long long sig) {
     return kill((pid_t)pid, (int)sig) == 0 ? 0 : -errno;
+}
+
+/* Unbuffered write of text to standard error (diagnostics that must not mix with stdout data). */
+long long minyar_system_writeStandardError(const MinyarText *text) {
+    long long done = 0;
+    while (text && done < text->byte_length) {
+        ssize_t n = write(2, text->bytes + done, (size_t)(text->byte_length - done));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -errno;
+        }
+        done += n;
+    }
+    return done;
+}
+
+/* Raise the soft open-file limit to the hard limit (servers holding many sockets). Returns the new soft limit. */
+long long minyar_system_raiseOpenFileLimit(void) {
+    struct rlimit r;
+    if (getrlimit(RLIMIT_NOFILE, &r) != 0) return -errno;
+    rlim_t want = r.rlim_max;
+#ifdef __APPLE__
+    if (want == RLIM_INFINITY || want > (rlim_t)OPEN_MAX) want = OPEN_MAX; /* macOS rejects larger soft limits */
+#endif
+    if (r.rlim_cur < want) {
+        r.rlim_cur = want;
+        if (setrlimit(RLIMIT_NOFILE, &r) != 0) return -errno;
+    }
+    return r.rlim_cur == RLIM_INFINITY ? 9223372036854775807LL : (long long)r.rlim_cur;
 }
