@@ -5,6 +5,7 @@ MSYS2 requires the compiler and provider to belong to the active MINGW_PREFIX.
 Stable APIs may use a shared library; advanced zstd selection is separate.
 """
 import hashlib
+import json
 import os
 from pathlib import Path
 import platform
@@ -41,9 +42,53 @@ def _dependency_paths(output):
             for value in words]
 
 
-def _probe_source(kind):
+def _image_probe(apis, windows, shared, dll_name):
+    if windows:
+        implementation = '''#include <windows.h>
+#include <stdio.h>
+static int provider_image(const void *address) {
+    HMODULE module;
+    char path[32768];
+    DWORD length;
+    if (!address) return 0;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)address,
+            &module)) return 0;
+    length = GetModuleFileNameA(module, path, sizeof(path));
+    if (!length || length >= sizeof(path)) return 0;
+    return puts(path) >= 0;
+}
+'''
+    else:
+        implementation = '''#include <dlfcn.h>
+#include <stdio.h>
+static int provider_image(const void *address) {
+    Dl_info image;
+    if (!dladdr(address, &image) || !image.dli_fname) return 0;
+    return puts(image.dli_fname) >= 0;
+}
+'''
+    # Non-PIE ELF function addresses may point to the executable's PLT. Look
+    # up dynamic API addresses before dladdr instead of fingerprinting that
+    # trampoline as the provider. Static providers use their executable image.
+    if windows and dll_name:
+        # MinGW headers need not mark these APIs dllimport: &api can address an
+        # executable import thunk. GetModuleHandle does not load/redirect a DLL;
+        # obtain exports from the normally loaded import module, then identify
+        # each export's actual image (including DLL export forwarders).
+        module = f'GetModuleHandleA({json.dumps(dll_name)})'
+        addresses = [f'(const void *)GetProcAddress({module}, "{api}")' for api in apis]
+    else:
+        addresses = [f'dlsym(RTLD_DEFAULT, "{api}")' if shared and not windows else
+                     f'(const void *)&{api}' for api in apis]
+    calls = '\n'.join(f'    if (!provider_image({address})) return 3;'
+                      for address in addresses)
+    return implementation, calls
+
+
+def _probe_source(kind, identify=False, windows=False, shared=False, dll_name=None):
     if kind == 'sha256':
-        return '''#define OPENSSL_SUPPRESS_DEPRECATED
+        source = '''#define OPENSSL_SUPPRESS_DEPRECATED
 #include <openssl/sha.h>
 #include <openssl/crypto.h>
 #include <string.h>
@@ -63,7 +108,9 @@ int main(void) {
     return memcmp(digest, expected, 32) != 0;
 }
 '''
-    return '''#include <archive.h>
+        apis = ('SHA256_Init', 'SHA256_Update', 'SHA256_Final', 'OpenSSL_version_num')
+    else:
+        source = '''#include <archive.h>
 #include <archive_entry.h>
 _Static_assert(sizeof(void *) == 8, "64-bit provider required");
 int main(void) {
@@ -77,10 +124,37 @@ int main(void) {
     return archive_read_free(reader) != ARCHIVE_OK;
 }
 '''
+        apis = ('archive_version_number', 'archive_read_new', 'archive_read_free',
+                'archive_entry_new', 'archive_entry_free')
+    if identify:
+        implementation, calls = _image_probe(apis, windows, shared, dll_name)
+        source = '#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n' + implementation + source
+        source = source.replace('int main(void) {', 'int main(void) {\n' + calls)
+    return source
 
 
-def provider_info(kind, clang='clang', compile_flags=()):
-    """Return literal compile/link argv and a receipt for the selected provider."""
+def _runtime_dll(library, prefix, stem):
+    # A MinGW import archive records the DLL name in its .idata entries. Match
+    # that exact runtime file, rather than fingerprinting every similarly named
+    # DLL and allowing the normal loader to choose a different one.
+    names = {value.decode('ascii') for value in re.findall(
+        re.escape(stem.encode()) + rb'[^\x00/\\\r\n]*?\.dll\x00',
+        library.read_bytes(), re.IGNORECASE)}
+    names = {value.rstrip('\0') for value in names}
+    if len(names) != 1:
+        raise ValueError(f'cannot identify one runtime DLL in import archive {library}')
+    runtime = (prefix / 'bin' / names.pop()).resolve()
+    if not runtime.is_file() or prefix not in runtime.parents:
+        raise ValueError(f'provider runtime DLL is missing from {prefix / "bin"}')
+    return runtime
+
+
+def provider_info(kind, clang='clang', compile_flags=(), link_flags=()):
+    """Validate effective flags; return additive argv and actual input identity.
+
+    The probe inherits the consumer's loader environment unchanged. Its runtime
+    identity is valid for that environment; changing it requires re-resolution.
+    """
     if kind not in CONFIG:
         raise ValueError('unknown format provider: ' + kind)
     package, formula, header, stem = CONFIG[kind]
@@ -109,6 +183,9 @@ def provider_info(kind, clang='clang', compile_flags=()):
                                  f'MINYAR_{kind.upper()}_PREFIX') from None
             prefix = host_path(_output(['brew', '--prefix', formula])).resolve()
             include, lib = prefix / 'include', prefix / 'lib'
+    if not windows and any('\\' in str(path) for path in (prefix, include, lib)):
+        raise ValueError(f'{kind} literal backslash provider paths are unsupported '
+                         'by Clang Make dependencies; use a prefix without backslashes')
     if not (include / header).is_file() or prefix not in include.resolve().parents:
         raise ValueError(f'{kind} headers must belong to provider prefix {prefix}')
     if windows:
@@ -131,71 +208,101 @@ def provider_info(kind, clang='clang', compile_flags=()):
     cflags = ['-I' + str(include)]
     libraries = [str(library), *dependencies]
     shared = not windows and ('.so' in library.name or library.suffix == '.dylib')
+    imported = windows and library.name.endswith('.dll.a')
+    runtime_library = (_runtime_dll(library, prefix, stem) if imported else
+                       library if shared else None)
     if shared:
         libraries += ['-Xlinker', '-rpath', '-Xlinker', str(library.parent)]
     with tempfile.TemporaryDirectory(prefix='minyar-format-provider-') as directory:
         source = Path(directory) / 'probe.c'
         binary = Path(directory) / ('probe.exe' if windows else 'probe')
-        source.write_text(_probe_source(kind))
+        source.write_text(_probe_source(kind, identify=True, windows=windows, shared=shared,
+                                       dll_name=runtime_library.name if imported else None))
         command = [clang, *compile_flags, *cflags]
         output = _output([*command, '-M', '-MT', 'minyar_provider', str(source)])
         # Clang's Make dependency escaping uses backslash-newline and escaped
         # spaces. A stable target name avoids drive-letter colons at the split.
         paths = _dependency_paths(output)
-        headers = sorted({host_path(value).resolve() for value in paths
-                          if host_path(value).resolve() != source.resolve()})
+        headers = set()
+        for value in paths:
+            path = host_path(value)
+            physical = path.resolve()
+            if physical == source.resolve():
+                continue
+            # Check lexical names too: a provider-owned header may be a symlink
+            # whose target no longer has an OpenSSL/archive filename.
+            if kind == 'sha256':
+                owned = ('openssl' in path.parts or 'openssl' in physical.parts
+                         or any(p.name in ('opensslconf.h', 'configuration.h', 'opensslv.h')
+                                for p in (path, physical)))
+            else:
+                owned = any(p.name == 'archive.h' or p.name.startswith('archive_')
+                            for p in (path, physical))
+            if owned and prefix not in physical.parents:
+                raise ValueError(f'{kind} provider-owned header {physical} must '
+                                 f'belong to provider prefix {prefix}')
+            headers.add(physical)
+        headers = sorted(headers)
         primary = (include / header).resolve()
         if primary not in headers:
             raise ValueError(f'{kind} compiler did not select its matched primary header')
-        inputs = [*headers, library]
-        if windows:
-            # An import archive alone is not the runtime identity.
-            runtime_libraries = sorted((prefix / 'bin').glob(stem + '*.dll'))
-            if not runtime_libraries:
-                raise ValueError(f'{kind} provider runtime DLL is missing from {prefix / "bin"}')
-            inputs += runtime_libraries
+        # dladdr needs libdl on older Linux libc. This diagnostic dependency is
+        # probe-only and does not change the consumer's public link policy.
+        identity_flags = ['-ldl'] if not windows and platform.system() != 'Darwin' else []
+        result = subprocess.run([*command, str(source), *link_flags, *libraries,
+                                 *identity_flags, '-o', str(binary)],
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode:
+            raise ValueError(f'{kind} matched provider compile/link probe failed:\n{result.stderr}')
+        result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=30)
+        images = [host_path(value).resolve() for value in result.stdout.splitlines()]
+        expected = runtime_library or binary.resolve()
+        count = 4 if kind == 'sha256' else 5
+        if len(images) != count:
+            raise ValueError(f'{kind} provider image identification/API probe failed '
+                             f'(status {result.returncode})')
+        for actual in images:
+            if actual != expected or (runtime_library and prefix not in actual.parents):
+                raise ValueError(f'{kind} loaded provider image {actual} does not match '
+                                 f'selected library {library} (expected image {expected}); '
+                                 'check install name/SONAME and the consumer loader environment')
+        if result.returncode:
+            raise ValueError(f'{kind} provider version/64-bit API probe failed '
+                             f'(status {result.returncode})')
+        # Only a validated actual image may become runtime/cache identity.
+        actual_library = images[0] if runtime_library else None
+        inputs = sorted(set([*headers, library, *([actual_library] if actual_library else [])]))
         digest = hashlib.sha256()
+        digest.update(json.dumps([kind, clang, list(compile_flags), list(link_flags)],
+                                 separators=(',', ':')).encode() + b'\0')
         receipt = []
         for path in inputs:
             content = path.read_bytes()
             value = hashlib.sha256(content).hexdigest()
             digest.update(str(path).encode() + b'\0' + bytes.fromhex(value))
             receipt.append({'path': str(path), 'sha256': value})
-        result = subprocess.run([*command, str(source), *libraries, '-o', str(binary)],
-                                capture_output=True, text=True, timeout=30)
-        if result.returncode:
-            raise ValueError(f'{kind} matched provider compile/link probe failed:\n{result.stderr}')
-        environment = dict(os.environ)
-        if windows:
-            environment['PATH'] = str(prefix / 'bin') + os.pathsep + environment.get('PATH', '')
-        elif shared:
-            variable = 'DYLD_LIBRARY_PATH' if platform.system() == 'Darwin' else 'LD_LIBRARY_PATH'
-            environment[variable] = str(library.parent) + os.pathsep + environment.get(variable, '')
-        result = subprocess.run([str(binary)], capture_output=True, timeout=30,
-                                env=environment)
-        if result.returncode:
-            raise ValueError(f'{kind} provider version/64-bit API probe failed '
-                             f'(status {result.returncode})')
     fingerprint = digest.hexdigest()
     return {'kind': kind, 'prefix': str(prefix), 'include': str(include),
             'library': str(library), 'inputs': receipt, 'sha256': fingerprint,
-            'clang': clang, 'compile_flags': list(compile_flags),
+            'runtime_library': str(actual_library) if actual_library else None,
+            'clang': clang, 'compile_flags': list(compile_flags), 'link_flags': list(link_flags),
             'cflags': [*cflags, '-DMINYAR_FORMAT_PROVIDER_' + fingerprint[:16].upper() + '=1'],
             'libraries': libraries}
 
 
-def format_provider(kind, clang='clang', compile_flags=()):
-    info = provider_info(kind, clang, compile_flags)
+def format_provider(kind, clang='clang', compile_flags=(), link_flags=()):
+    info = provider_info(kind, clang, compile_flags, link_flags)
     return info['cflags'], info['libraries']
 
 
 if __name__ == '__main__':
     import argparse
-    import json
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('kind', choices=CONFIG)
     parser.add_argument('--clang', default='clang')
     parser.add_argument('--flags', default='')
+    parser.add_argument('--link-flags', default='')
     arguments = parser.parse_args()
     print(json.dumps(provider_info(arguments.kind, arguments.clang,
-                                   shlex.split(arguments.flags)), indent=2))
+                                   shlex.split(arguments.flags),
+                                   shlex.split(arguments.link_flags)), indent=2))

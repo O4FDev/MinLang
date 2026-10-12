@@ -2,5 +2,5 @@
 from format_provider import format_provider
 
 
-def sha256_provider(clang='clang', compile_flags=()):
-    return format_provider('sha256', clang, compile_flags)
+def sha256_provider(clang='clang', compile_flags=(), link_flags=()):
+    return format_provider('sha256', clang, compile_flags, link_flags)
