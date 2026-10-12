@@ -144,6 +144,19 @@ def regressions(port):
         body = bytes(range(256)) * 256
         client.send(request(fields=b'Content-Length: 65536\r\n', body=body, close=True))
         assert client.response()[2] == body
+    # Exact binary replies straddle the packing boundary in an ordered pipeline.
+    # The final borrowed body must remain alive across partial range writes.
+    with peer(port) as client:
+        pattern = bytes(range(256)) * 257
+        bodies = [b''] + [pattern[:length] for length in (65535, 65536, 65537)]
+        for index, body in enumerate(bodies):
+            client.send(request(method='POST', fields=f'Content-Length: {len(body)}\r\n'.encode(),
+                                body=body, close=index == len(bodies)-1))
+        for body in bodies:
+            status, fields, observed = client.response()
+            assert status == 200 and fields[b'content-length'] == str(len(body)).encode()
+            assert observed == body, ('binary packing boundary or pipeline ordering', len(body))
+        client.eof()
     with peer(port) as client:
         client.send(request('/large', close=True))
         assert client.response()[2] == bytes(3145728)
