@@ -19,6 +19,22 @@ SPEC = importlib.util.spec_from_file_location("quic_cid_certificates", CA_SOURCE
 FIXTURES = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(FIXTURES)
 BASELINE = {
+    "response-padding-client": (35, "semantic failure: PATH_RESPONSE padding or admission violated"),
+    "response-padding-server": (35, "semantic failure: PATH_RESPONSE padding or admission violated"),
+    "response-padding-width1": (35, "semantic failure: PATH_RESPONSE padding or admission violated"),
+    "response-padding-width20": (35, "semantic failure: PATH_RESPONSE padding or admission violated"),
+    "response-amp-credit": (35, "semantic failure: PATH_RESPONSE padding or admission violated"),
+    "response-amp-limited": (0, "PATH_RESPONSE wire padding, token, route and admission passed"),
+    "response-amp-blocked": (35, "semantic failure: PATH_RESPONSE padding or admission violated"),
+    "response-pacing": (35, "semantic failure: PATH_RESPONSE padding or admission violated"),
+    "response-congestion": (35, "semantic failure: PATH_RESPONSE padding or admission violated"),
+    "response-pto-client": (36, "semantic failure: PATH_RESPONSE retransmitted after loss or PTO"),
+    "response-pto-server": (36, "semantic failure: PATH_RESPONSE retransmitted after loss or PTO"),
+    "response-loss-client": (36, "semantic failure: PATH_RESPONSE retransmitted after loss or PTO"),
+    "response-loss-server": (36, "semantic failure: PATH_RESPONSE retransmitted after loss or PTO"),
+    "response-mixed-pto": (36, "semantic failure: PATH_RESPONSE retransmitted after loss or PTO"),
+    "response-mixed-loss": (36, "semantic failure: PATH_RESPONSE retransmitted after loss or PTO"),
+    "response-mixed-path-loss": (36, "semantic failure: PATH_RESPONSE retransmitted after loss or PTO"),
     "cid-stock-single-path": (0, "original-CID traffic retained exactly two drained wire IDs"),
     "cid-stock-first-use": (66, "semantic failure: authenticated CID1 use did not supply wire CID2"),
     "cid-stock-first-use-server": (66, "semantic failure: authenticated CID1 use did not supply wire CID2"),
