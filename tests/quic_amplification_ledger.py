@@ -542,7 +542,8 @@ def checked_link_graph(build,root,retention):
     # the consolidated system/sha256/tararchive/zstd/deflate provider dispatch.
     pinned={"clang-driver.py":("c30f69207d809558af9affe4d2a354e759b49b5c6fd74b9c5884a7529baad6af",
                                "52943b71b8b41b85da5cdc78b9a1388699cb4b40d4e86e1bd179714fa48febd6",
-                               "499d439fcb709dad8f1544506491680e48ddef198aa7a7cfbdfdeace65c92e70"),
+                               "499d439fcb709dad8f1544506491680e48ddef198aa7a7cfbdfdeace65c92e70",
+                               "405d334aa09291e429ac5f787447d1dbbd9ae7802b93a1f7df539144c37d7a69"),
             "sanitizer_llvm.py":("4d74874d1119abb31d68af4a733f9e3e90aa7788f2a767678672226592f2c3a2",)}
     tools=build.get("tool_bindings",{})
     if set(tools)!={"clang-driver.py","sanitizer_llvm.py","clang.bin"}:raise CoverageError("complete retained compiler/tool bindings required")
