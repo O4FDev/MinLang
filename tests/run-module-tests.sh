@@ -4,7 +4,8 @@ set -eu
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 compiler=${MINYAR_TEST_COMPILER:-"$project_dir/build/minyarc"}
 clang_command=${MINYAR_TEST_CLANG:-clang}
-build_dir="$project_dir/build/module-tests"
+# Concurrent callers (mutation campaigns) pass their own directory.
+build_dir=${MINYAR_MODULE_TEST_DIR:-"$project_dir/build/module-tests"}
 mkdir -p "$build_dir"
 
 link_module() {

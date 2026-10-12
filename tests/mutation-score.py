@@ -12,6 +12,7 @@ import subprocess
 import signal
 import time
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -170,15 +171,15 @@ def main() -> int:
     gate_failure = ""
     baseline_passed = False
 
-    def execute(command, *, phase, env=None):
+    def execute(command, *, phase, env=None, log=commands):
         started = time.monotonic()
         try:
             result = run(command, env=env)
         except (OSError, subprocess.SubprocessError) as error:
-            commands.append({"phase": phase, "command": command, "error": str(error)})
+            log.append({"phase": phase, "command": command, "error": str(error)})
             raise
         timed_out = result is None or getattr(result, "timed_out", False)
-        commands.append({"phase": phase, "command": command, "timeout_seconds": 45,
+        log.append({"phase": phase, "command": command, "timeout_seconds": 45,
                          "elapsed_seconds": round(time.monotonic() - started, 3),
                          "timed_out": timed_out, "status": result.returncode if result else None,
                          "stdout": result.stdout if result else None, "stderr": result.stderr if result else None,
@@ -187,53 +188,93 @@ def main() -> int:
                          "runtime": env.get("MINYAR_TEST_RUNTIME") if env else None})
         return None if timed_out else result
 
-    def environment_for(compiler, source):
+    def environment_for(compiler, source, scratch):
         environment = dict(os.environ)
         environment.update(MINYAR_TEST_COMPILER=str(compiler), MINYAR_TEST_SOURCE=str(source),
-                           MINYAR_TEST_RUNTIME=str(PROGRAM_RUNTIME))
+                           MINYAR_TEST_RUNTIME=str(PROGRAM_RUNTIME), MINYAR_MODULE_TEST_DIR=str(scratch / "module-tests"))
         return environment
 
-    try:
-        baseline_environment = environment_for(arguments.baseline_compiler.resolve(), SOURCE)
-        for check in CHECKS:
-            result = execute(check, phase="baseline", env=baseline_environment)
-            if result is None or result.returncode != 0:
-                gate_failure = f"baseline failed: {' '.join(check)}"
-                break
-        else:
-            baseline_passed = True
+    def checks_for(scratch):
+        # Concurrent campaigns must not share the fuzz and module-test outputs.
+        return [check + ["--output-dir", str(scratch / "fuzz")] if check[1:2] == ["tests/fuzz.py"] else check
+                for check in CHECKS]
 
-        for number, site in enumerate(selected if baseline_passed else []):
-            replacement = REPLACEMENTS[site.operator]
-            mutated = original[: site.offset] + replacement + original[site.offset + len(site.operator) :]
-            source = temporary / f"mutant-{number}.min"
-            llvm = temporary / f"mutant-{number}.ll"
-            compiler = temporary / f"mutant-{number}"
-            source.write_text(mutated, encoding="utf-8")
-            row = {"site": site.label, "offset": site.offset, "line": site.line, "column": site.column,
-                   "operator": site.operator, "replacement": replacement, "source": str(source)}
-            built = execute([str(STAGE0), str(source), "-o", str(llvm)], phase=site.label + ":build")
-            if built is None or built.returncode != 0:
-                row.update(outcome="build_timeout" if built is None else "stillborn", stage="compile")
+    def build(number, site):
+        log: list[dict[str, object]] = []
+        replacement = REPLACEMENTS[site.operator]
+        mutated = original[: site.offset] + replacement + original[site.offset + len(site.operator) :]
+        source = temporary / f"mutant-{number}.min"
+        llvm = temporary / f"mutant-{number}.ll"
+        compiler = temporary / f"mutant-{number}"
+        source.write_text(mutated, encoding="utf-8")
+        row = {"site": site.label, "offset": site.offset, "line": site.line, "column": site.column,
+               "operator": site.operator, "replacement": replacement, "source": str(source)}
+        built = execute([str(STAGE0), str(source), "-o", str(llvm)], phase=site.label + ":build", log=log)
+        if built is None or built.returncode != 0:
+            row.update(outcome="build_timeout" if built is None else "stillborn", stage="compile")
+            return row, log, None
+        linked = execute([CLANG, "-O0", "-Wno-override-module", str(llvm), str(COMPILER_RUNTIME), *MATH_FLAGS, "-o", str(compiler)],
+                         phase=site.label + ":link", log=log)
+        if linked is None or linked.returncode != 0:
+            row.update(outcome="build_timeout" if linked is None else "stillborn", stage="link")
+            return row, log, None
+        return row, log, (compiler, source)
+
+    def test(number, site, building):
+        row, log, artefacts = building.result()
+        if artefacts is None:
+            return row, log
+        compiler, source = artefacts
+        scratch = temporary / f"mutant-{number}-scratch"
+        killed_by = ""
+        for check in checks_for(scratch):
+            result = execute(check, phase=site.label + ":test", env=environment_for(compiler, source, scratch), log=log)
+            if result is None or result.returncode != 0:
+                killed_by = "timeout: " + " ".join(check) if result is None else " ".join(check)
+                break
+        row.update(outcome="killed" if killed_by else "survived", killed_by=killed_by)
+        print(f"{number + 1}/{len(selected)} {site.label}: {row['outcome']}", flush=True)
+        return row, log
+
+    # Mutants are independent: up to MINYAR_TEST_JOBS build while the baseline
+    # runs, then test concurrently. Rows and commands keep campaign order.
+    jobs = max(1, int(os.environ.get("MINYAR_TEST_JOBS") or 2))
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        builds = []
+        try:
+            baseline_scratch = temporary / "baseline-scratch"
+            baseline_environment = environment_for(arguments.baseline_compiler.resolve(), SOURCE, baseline_scratch)
+            baseline_checks = checks_for(baseline_scratch)
+
+            def run_baseline():
+                for check in baseline_checks:
+                    result = execute(check, phase="baseline", env=baseline_environment)
+                    if result is None or result.returncode != 0:
+                        return check
+                return None
+
+            baseline = pool.submit(run_baseline)
+            # One job keeps the original order: no mutant builds before the baseline passes.
+            builds = [pool.submit(build, number, site) for number, site in enumerate(selected)] if jobs > 1 else []
+            failed_check = baseline.result()
+            if not failed_check and jobs == 1:
+                builds = [pool.submit(build, number, site) for number, site in enumerate(selected)]
+            if failed_check:
+                gate_failure = f"baseline failed: {' '.join(failed_check)}"
+                for future in builds:
+                    future.cancel()
+            else:
+                baseline_passed = True
+            tests = [pool.submit(test, number, site, building)
+                     for (number, site), building in zip(enumerate(selected), builds)] if baseline_passed else []
+            for future in tests:
+                row, log = future.result()
                 outcomes.append(row)
-                continue
-            linked = execute([CLANG, "-O0", "-Wno-override-module", str(llvm), str(COMPILER_RUNTIME), *MATH_FLAGS, "-o", str(compiler)],
-                             phase=site.label + ":link")
-            if linked is None or linked.returncode != 0:
-                row.update(outcome="build_timeout" if linked is None else "stillborn", stage="link")
-                outcomes.append(row)
-                continue
-            killed_by = ""
-            for check in CHECKS:
-                result = execute(check, phase=site.label + ":test", env=environment_for(compiler, source))
-                if result is None or result.returncode != 0:
-                    killed_by = "timeout: " + " ".join(check) if result is None else " ".join(check)
-                    break
-            row.update(outcome="killed" if killed_by else "survived", killed_by=killed_by)
-            outcomes.append(row)
-            print(f"{number + 1}/{len(selected)} {site.label}: {row['outcome']}", flush=True)
-    except (OSError, subprocess.SubprocessError) as error:
-        gate_failure = f"campaign infrastructure failed: {error}"
+                commands.extend(log)
+        except (OSError, subprocess.SubprocessError) as error:
+            gate_failure = f"campaign infrastructure failed: {error}"
+            for future in builds:
+                future.cancel()
 
     viable = [row for row in outcomes if row["outcome"] in ("killed", "survived")]
     killed = [row for row in viable if row["outcome"] == "killed"]
