@@ -4,7 +4,7 @@ from pathlib import Path
 import os,subprocess,tempfile
 from clang_helpers import clang_command
 root=Path(__file__).resolve().parents[1]
-env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0:allocator_may_return_null=1'}
+env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0:allocator_may_return_null=1:symbolize=0'}
 with tempfile.TemporaryDirectory(prefix='minyar-system-configurations-') as temporary:
     for budget in (1,32,1024):
         for sanitized in (False,True):
