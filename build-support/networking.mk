@@ -40,3 +40,30 @@ check-net-udp-offload-sanitize: build/minyarc build/minyar-default-runtime.o
 
 check check-portable check-quic: check-net-udp-offload
 check-sanitize check-quic-sanitize: check-net-udp-offload-sanitize
+
+.PHONY: check-os-tlsverify check-os-tlsverify-sanitize
+# Keep the supported sanitizer override one argument in the caller's namespace.
+OS_TLS_SANITIZER_QUOTE = '$(subst ','"'"',$(1))'
+OS_TLS_SANITIZER_CLANG = $(if $(MINYAR_SANITIZER_CLANG),$(shell python3 -c 'import sys; sys.path.insert(0, "tools"); from host_paths import host_path; print(host_path(sys.argv[1]))' $(call OS_TLS_SANITIZER_QUOTE,$(MINYAR_SANITIZER_CLANG))),$(LLVM_CC))
+OS_TLS_SANITIZER_PATH = $(if $(MINYAR_SANITIZER_CLANG),$(shell python3 -c 'import sys; sys.path.insert(0, "tools"); from host_paths import host_path; print(host_path(sys.argv[1]).parent)' $(call OS_TLS_SANITIZER_QUOTE,$(OS_TLS_SANITIZER_CLANG))):$(PATH),$(PATH))
+check-os-tlsverify: build/minyarc
+	MINYAR_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/os-tlsverify.py
+
+check-os-tlsverify-sanitize: build/minyarc tools/host_paths.py
+	PATH="$(OS_TLS_SANITIZER_PATH)" MINYAR_CLANG=$(call OS_TLS_SANITIZER_QUOTE,$(OS_TLS_SANITIZER_CLANG)) $(SANITIZER_LIMITED) python3 tests/os-tlsverify.py --sanitize
+
+check check-portable: check-os-tlsverify
+check-sanitize: check-os-tlsverify-sanitize
+
+.PHONY: check-os-providers check-os-providers-sanitize
+check-os-providers: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/os-providers.py
+
+check-os-providers-sanitize: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/os-providers.py --sanitize
+
+# The executable vector and inet_pton oracle route is a Linux ELF host gate.
+ifeq ($(shell uname -s),Linux)
+check check-portable: check-os-providers
+check-sanitize: check-os-providers-sanitize
+endif

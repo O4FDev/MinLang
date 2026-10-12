@@ -113,7 +113,12 @@ $(OUT)/runtime.o: $(ROOT)/runtime/freestanding/runtime.c $(wildcard $(ROOT)/runt
 	$(STRIP_CPU) $(OUT)/runtime.ll.tmp | sed -E 's/"no-builtins" ?//g' > $(OUT)/runtime.ll
 	$(CLANG) $(IRFLAGS) -c $(OUT)/runtime.ll -o $@
 
-$(OUT)/freestanding.o: $(ROOT)/runtime/freestanding/freestanding.c $(wildcard $(ROOT)/runtime/freestanding/include/*.h) | $(OUT)
+FREESTANDING_PROVIDER_INPUTS := $(ROOT)/runtime/minyar_freestanding_providers.h \
+	$(ROOT)/runtime/minyar_ip_literal.h $(ROOT)/runtime/minyar_native.h \
+	$(ROOT)/runtime/native/securecrypto.c $(ROOT)/vendor/monocypher/monocypher.c \
+	$(ROOT)/vendor/monocypher/monocypher.h
+
+$(OUT)/freestanding.o: $(ROOT)/runtime/freestanding/freestanding.c $(wildcard $(ROOT)/runtime/freestanding/include/*.h) $(FREESTANDING_PROVIDER_INPUTS) | $(OUT)
 	$(CLANG) $(CFLAGS) -S -emit-llvm $< -o $(OUT)/freestanding.ll.tmp
 	$(STRIP_CPU) $(OUT)/freestanding.ll.tmp > $(OUT)/freestanding.ll
 	$(CLANG) $(IRFLAGS) -c $(OUT)/freestanding.ll -o $@
