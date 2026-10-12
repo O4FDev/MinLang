@@ -34,6 +34,7 @@ typedef int socket_t;
 enum { NET_OK, NET_WOULD_BLOCK, NET_EOF, NET_FAILURE, NET_TRUNCATED };
 enum { NET_MAX_READ = 16 * 1024 * 1024 };
 static _Thread_local char last_error[256];
+static _Thread_local int last_error_code; /* errno / Winsock code of the last failure, 0 after success */
 
 static bool valid_socket(long long connection) {
 #ifdef _WIN32
@@ -47,6 +48,7 @@ static void remember(const char *what, const char *detail) {
     snprintf(last_error, sizeof(last_error), "%s: %s", what, detail);
 }
 static void remember_code(const char *what, int code) {
+    last_error_code = code;
 #ifdef _WIN32
     char detail[48];
     snprintf(detail, sizeof(detail), "Winsock error %d", code);
@@ -178,6 +180,14 @@ static long long open_socket(const MinyarText *host, long long port, int type, b
         int status = -1;
         if (configure(candidate, binding)) {
             if (binding) {
+#ifndef _WIN32
+                /* Like every POSIX server: rebind immediately after a restart even while
+                 * connections from the previous process linger in TIME_WAIT. */
+                if (type == SOCK_STREAM) {
+                    int reuse = 1;
+                    setsockopt(candidate, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+                }
+#endif
                 status = bind(candidate, option->ai_addr, (socklen_t)option->ai_addrlen);
                 if (!status && type == SOCK_STREAM)
                     status = listen(candidate, (int)backlog);
@@ -528,6 +538,63 @@ void minyar_net_close(long long connection) {
     }
     if (close_socket((socket_t)connection))
         remember_code("close", socket_error());
+}
+long long minyar_net_lastErrorCode(void) {
+    return last_error[0] ? -(long long)last_error_code : 0;
+}
+/* Append up to `limit` received bytes to `buffer` in place: no fresh allocation, no zero-fill once the buffer has
+ * capacity, no copy. Returns the count (> 0), 0 at end of stream, -1 if the read would block, -2 on failure. */
+long long minyar_net_readInto(long long connection, MinyarBytes *buffer, long long limit) {
+    last_error[0] = 0;
+    if (!valid_socket(connection) || limit <= 0 || limit > NET_MAX_READ) {
+        remember_code("readInto", BAD_ARGUMENT);
+        return -2;
+    }
+    long long before = buffer->byte_length;
+    unsigned char *target = minyar_native_bytes_append(buffer, limit);
+    long long count;
+    int code;
+    do {
+#ifdef _WIN32
+        count = recv((socket_t)connection, (char *)target, (int)limit, 0);
+#else
+        count = recv((socket_t)connection, target, (size_t)limit, 0);
+#endif
+        code = count < 0 ? socket_error() : 0;
+    } while (count < 0 && interrupted(code));
+    buffer->byte_length = before + (count > 0 ? count : 0);
+    if (count < 0) {
+        if (would_block(code)) return -1;
+        remember_code("readInto", code);
+        return -2;
+    }
+    return count;
+}
+/* Send data[offset, offset + length) once without slicing. Returns the count sent (>= 0), -1 if the socket
+ * would block, -2 on failure. */
+long long minyar_net_writeRange(long long connection, const MinyarBytes *data, long long offset, long long length) {
+    last_error[0] = 0;
+    if (!valid_socket(connection) || offset < 0 || length < 0 || offset > data->byte_length ||
+        length > data->byte_length - offset || length > INT_MAX) {
+        remember_code("writeRange", BAD_ARGUMENT);
+        return -2;
+    }
+    int flags = 0;
+#ifdef MSG_NOSIGNAL
+    flags = MSG_NOSIGNAL;
+#endif
+    long long count;
+    int code;
+    do {
+        count = send((socket_t)connection, (const char *)data->bytes + offset, (int)length, flags);
+        code = count < 0 ? socket_error() : 0;
+    } while (count < 0 && interrupted(code));
+    if (count < 0) {
+        if (would_block(code)) return -1;
+        remember_code("writeRange", code);
+        return -2;
+    }
+    return count;
 }
 MinyarText *minyar_net_lastError(void) {
     return minyar_native_copy_text((const unsigned char *)last_error,
