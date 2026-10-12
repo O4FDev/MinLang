@@ -23,7 +23,8 @@ COMPILER_SUITES = ("diagnostics", "conformance", "regressions", "feature-dispatc
                    "statement-nesting",
                    "peer-research-semantics", "peer-research-reachability",
                    "peer-memory-nim-koka-lean", "peer-memory-nim-koka-followups",
-                   "maps", "list-sort", "text-basics", "text-basics-errors", "collections-integration",
+                   "maps", "list-sort NaturalSort", "text-basics", "text-basics-errors",
+                   "collections-integration CollectionConstants",
                    "module-constants", "octal-literals", "reserved-names", "checked-results")
 
 
@@ -317,8 +318,10 @@ def main() -> int:
             "MINYAR_TEST_RUNTIME": str(runtime_object),
             "MINYAR_TEST_LINK_FLAGS": " ".join(["-fprofile-instr-generate", *math_flags]),
         }
-        for name in COMPILER_SUITES:
-            run([sys.executable, f"tests/{name}.py"], env=suite_env)
+        for suite in COMPILER_SUITES:
+            # Comparator suites select classes; callback frontends are separate compilers.
+            name, *selection = suite.split()
+            run([sys.executable, f"tests/{name}.py", *selection], env=suite_env)
         run([sys.executable, "tests/linkage.py", "LanguageLinkage.test_ordinary_names_do_not_interpose_c_dependencies"], env=suite_env)
         run([sys.executable, "tests/runtime-numeric.py", "--mode", "native", "--cases", "2000",
              "--output-dir", str(directory / "numeric")], env=suite_env)
