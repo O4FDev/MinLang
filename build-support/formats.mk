@@ -10,7 +10,7 @@ check-compression: build/minyarc
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compression-provider.py
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compression-codecs.py --mode native
 
-check-sha256: build/minyarc
+check-sha256: build/minyarc build/minyar-default-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/sha256.py
 
 check-tar: build/minyarc
@@ -52,7 +52,7 @@ bench-compression: build/minyarc
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 benchmarks/compression-bench.py --artifacts build/compression-benchmark --prepare-only --compiler "$(abspath build/minyarc)"
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 benchmarks/compression-bench.py --artifacts build/compression-benchmark --run-only
 
-bench-sha256: build/minyarc
+bench-sha256: build/minyarc build/minyar-default-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/sha256-bench.py
 
 bench-tar: build/minyarc

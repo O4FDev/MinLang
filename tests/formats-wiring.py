@@ -16,7 +16,7 @@ class Dispatch(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='minyar-formats-routing-') as name:
             root = Path(name).resolve()
             (root / 'tests').mkdir(); (root / 'tools').mkdir(); (root / 'build').mkdir()
-            (root / 'build/minyarc').touch()
+            (root / 'build/minyarc').touch(); (root / 'build/minyar-default-runtime.o').touch()
             selected = root / "selected provider's bin" / 'clang'
             selected.parent.mkdir(); selected.touch()
             shutil.copyfile(ROOT / 'tools/host_paths.py', root / 'tools/host_paths.py')
