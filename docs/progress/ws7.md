@@ -50,7 +50,9 @@ in the signing checklist. Continue the Windows idle work independently.
   12 shipping contracts and five existing Ed25519 publisher tests pass.
   Registration `fe66b86` passes catalogue and Make checks. R1's unbounded
   Ed25519 subprocess and nonexistent CI directory findings are corrected;
-  fresh independent review is underway.
+  fresh R2 independently approves the code. Focused Boat checks and the manual
+  workflow's YAML/actionlint checks pass; `21fd4e7` is queued for integrator
+  qualification. This does not establish native certificate signing.
   Actual trusted macOS CI and Windows Boat signing remain unrun.
   Production signing/notarization checks
   remain strict. Native Windows signing waits for a separately admitted slot.
@@ -64,7 +66,8 @@ in the signing checklist. Continue the Windows idle work independently.
   timing sides must use that same disclosed prerequisite. CI sandbox is stopped
   pending focused corrections. Review of `2ff58a3` blocked approval on resume
   accepting newly added inputs and timing comparison accepting incomplete source
-  inventories. Fixes and regressions are in progress; full timing is deferred
+  inventories. Corrections `abc47f1`/`788c032` and provider-only `d8dc0c2` pass
+  22 focused Boat tests and lint; fresh R3 is underway. Full timing is deferred
   until independent approval. Integrator owns distinct Phase 1 macOS
   qualification additions on `unify/macos-ci-qualification`.
 - Parent: device-test cost plan, release Make/catalogue registration, independent
@@ -99,7 +102,9 @@ The independently reviewed stamp-only branch `ws7/ci-stamp`, `0150ba5`, is
 offered to the integrator's queue. The independently approved cost plan is also
 queued as `ws7/device-plan`, `b55b235`, containing only
 `docs/device-test-20000.md` with its exact reviewed bytes. This is a written plan,
-not an executed pilot or capacity result. No WS7 change has landed on `v2`. Each chunk needs
+not an executed pilot or capacity result. Reviewed signing implementation
+`ws7/test-signing`, `21fd4e7`, is queued with focused Boat evidence; native
+qualification remains required. No WS7 change has landed on `v2`. Each chunk needs
 an independent subagent review and platform-appropriate Boat evidence. Merge
 requests include branch, SHA, test commands, source-bound evidence and applicable
 performance results. After Phase 1, rebase onto the pushed `v2` and let the
