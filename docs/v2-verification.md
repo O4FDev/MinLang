@@ -1,7 +1,7 @@
 # v2 implementation and verification map
 
 This checkpoint describes the combined implementation based on
-`01a71560` at 00:10 UTC on 2026-10-12.
+`173de244` at 00:35 UTC on 2026-10-12.
 An implemented API, a passing focused suite and a complete deployment are
 separate claims. Retained results establish only their recorded source and
 configuration. Combined CI, current macOS/Windows gates, ordinary performance
@@ -100,7 +100,7 @@ The fresh 32-device baseline passes; the 4,096-device setup still fails.
 Fresh Windows critical-idle and bridge results are recorded below; the full
 current Windows portable suite remains unqualified.
 
-A new full-MARK zero-count regression is still under development. An actual
+A new full-MARK zero-count regression is in focused qualification. An actual
 per-poll trace shows that removing a scanned dead owner's edge and dropping
 the matching child reference preserves the child's external count, yet requests
 a rescan. The first test also released its independently held primary before
@@ -108,8 +108,8 @@ measuring locality, requiring an unrelated replacement proof. With that fixture
 corrected, payload/count/root-drop and empty-heap assertions pass, and eight
 borrows take eight units under the unchanged 192-unit limit. Initial cleanup
 still reports two aggregate epochs/completions instead of the required one.
-The candidate runtime is isolated and unqualified; expiry and safety controls
-do not substitute for this remaining regression or a capacity pass.
+Those earlier results are retained. The candidate runtime remains isolated;
+focused controls do not substitute for broader qualification or a capacity pass.
 
 A strengthened test separately proves that an ordinary unpaired drop still
 requests a rescan and that losing a private cycle's last owning path reclaims
@@ -121,9 +121,14 @@ trace identifies the same branch reaching real zero inside MARK after its gray
 pin is released, then leaving registration without a retirement marker. Its
 queued field cleanup later cancels the proof build and requests the second
 scan. Reclamation, payloads, root cleanup and eight borrowed units still pass;
-the one-full-job requirement and 192-unit limit remain unchanged. The narrow
-repair is being prepared. No sanitizer, broader qualification or capacity pass
-is claimed for this candidate.
+the one-full-job requirement and 192-unit limit remain unchanged. A narrow
+repair now passes all 18 native cases at system/k32/N512. It issues the existing
+retirement marker only at genuine zero while releasing the final MARK pin,
+using a local call argument and the existing registration/ownership checks.
+The acyclic case completes one full job; the nested private cycle is reclaimed
+with one full job and one seven-unit local job. Live/proven/rescan and marker
+expiry controls retain their original assertions. Native and sanitizer matrices
+are next; no broader qualification or capacity pass is claimed yet.
 
 ## Recoverable errors
 
@@ -275,12 +280,15 @@ establish an unsupported case or a product root cause. Its 80 exported metadata
 files were verified; private decoding and capture material remain on Boat.
 
 A separate continuation with the qualified `49edb0f6` endpoint inputs has now
-passed untouched original indices 46–52: both remaining Minyar-server transfer
-peers, Retry against all four servers, and Minyar-server Retry against quiche.
+passed untouched original indices 46–55: both remaining Minyar-server transfer
+peers and Retry in both directions against all four peers.
 Each literal official verdict, original deadline and owned cleanup remains
-intact. Indices 53–55 are next; 75 original cells remain untouched at this
-checkpoint. These results do not rewrite the historical matrix or certify all
-128 current-source cells.
+intact. All 340 indexed metadata files and their literal verdicts, source
+admission and owned retirement were independently verified. A further serial
+continuation of indices 56–71 has begun: client resumption against quiche and
+Quinn passes; 70 original cells remain untouched at this checkpoint. These
+results do not rewrite the historical matrix or certify all 128 current-source
+cells.
 
 Actual runner failures exposed fixture defects in Docker 29 capability
 spelling, simulator capture writers that had not flushed during shutdown, and
@@ -376,15 +384,20 @@ completion within the same independent deadline; no timeout was increased.
 Both QUIC endpoints exit normally, all 64 peers authenticate, and live routes
 and timers return to zero. The original failure and all six successful controls
 are retained in a 118-file verified metadata archive. Five-second controls do
-not certify warmed memory, connected idle or hours-long stability; missing
-helper-process memory sampling is being addressed before the mixed soak.
+not certify warmed memory, connected idle or hours-long stability.
 Two new process-telemetry controls failed on the old driver, then passed on
 Boat after the repair: they measure a real live child's RSS/CPU and preserve
 normal exit, the exit/read race and unexpected live read failures. The drivers
 now sample their controller processes and the independent Quinn peer; shared
-TLS server/observer and QUIC proxy/observer roles each use one PID. Supplied-
-binary short qualification is in progress. These controls establish telemetry
-behavior, not flat memory or low idle CPU.
+TLS server/observer and QUIC proxy/observer roles each use one PID. All six
+supplied-binary short controls now pass with these observations: five seconds
+for 4,096 TCP connections and twenty seconds for 64 TLS/QUIC peers. Quinn has
+real live RSS/CPU samples followed by normal-exit/null observations, and all
+35 owned process identities are absent after retirement. The 130-file evidence
+index and 12-file terminal annex were verified, then reviewed against the actual
+reports and current driver bytes. These controls establish telemetry behavior,
+not flat memory or low idle CPU. The observers' retained-sample memory is under
+review before starting the hours-long workloads.
 
 ## Desktop and shipping
 
