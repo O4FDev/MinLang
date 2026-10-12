@@ -105,10 +105,25 @@ static int child(int argc, char **argv) {
     } else if (!strcmp(argv[1], "child-credentials")) {
 #ifndef _WIN32
         assert(getuid() == 65534 && geteuid() == 65534 && getgid() == 65534 && getegid() == 65534);
+#ifdef __linux__
+        uid_t real_uid, effective_uid, saved_uid; gid_t real_gid, effective_gid, saved_gid;
+        assert(!getresuid(&real_uid, &effective_uid, &saved_uid) && real_uid == 65534 && effective_uid == 65534 && saved_uid == 65534);
+        assert(!getresgid(&real_gid, &effective_gid, &saved_gid) && real_gid == 65534 && effective_gid == 65534 && saved_gid == 65534);
+#endif
+        assert(setuid(0) == -1 && errno == EPERM);
         gid_t groups[16]; int n = getgroups(16, groups); assert(n >= 0);
         int extras = 0;
         for (int i = 0; i < n; i++) { assert(groups[i] == 777 || groups[i] == 888 || groups[i] == 65534); if (groups[i] != 65534) extras++; }
         assert(extras == 2);
+#endif
+    } else if (!strcmp(argv[1], "child-cleared-groups")) {
+#ifndef _WIN32
+        gid_t groups[16]; int n = getgroups(16, groups); assert(n >= 0);
+#ifdef __APPLE__
+        assert(n == 1 && groups[0] == getegid());
+#else
+        assert(n == 0);
+#endif
 #endif
     } else if (!strcmp(argv[1], "child-exit")) return 127;
     else assert(!"unknown child mode");
@@ -117,6 +132,9 @@ static int child(int argc, char **argv) {
 static int process_main(int argc, char **argv) {
     int result = child(argc, argv); if (result >= 0) return result;
     assert(argc == 3);
+#ifndef _WIN32
+    alarm(20);
+#endif
     MinyarBytes *groups = minyar_bytes_new(0);
     const char *args[] = {"custom name", "child-arguments", "", "with space", "quote\"slash\\", "trail\\", "λ☃", ";$HOME*"};
     const char *env[] = {"EXPLICIT=λ=☃", "EMPTY="};
@@ -197,6 +215,8 @@ static int process_main(int argc, char **argv) {
     if (geteuid()) assert(credential == -EPERM);
     else {
         exited(credential, 127);
+        simple[1] = "child-cleared-groups";
+        exited(launch(argv[0], simple, 2, NULL, 0, "", -1, -1, groups, true), 0);
         MinyarBytes *extras = minyar_bytes_new(16); put64((unsigned char *)extras->bytes, 777); put64((unsigned char *)extras->bytes + 8, 888);
         simple[1] = "child-credentials";
         exited(launch(argv[0], simple, 2, NULL, 0, "", 65534, 65534, extras, true), 0); test_release(extras);
@@ -205,6 +225,7 @@ static int process_main(int argc, char **argv) {
         status = minyar_system_waitNative(handle, false);
         assert(get64(status, 0) == 0 && get64(status, 8) == 2 && get64(status, 24) == SIGPIPE); test_release(status);
         assert(launch("/minyar/no-such-executable", simple, 2, NULL, 0, "", -1, -1, groups, true) == -ENOENT);
+        assert(launch(argv[0], simple, 2, NULL, 0, "/minyar/no-such-directory", -1, -1, groups, true) == -ENOENT);
     }
     assert(!sigaction(SIGPIPE, NULL, &ignored) && ignored.sa_handler == SIG_IGN);
     assert(!sigprocmask(SIG_SETMASK, NULL, &current) && sigismember(&current, SIGPIPE));

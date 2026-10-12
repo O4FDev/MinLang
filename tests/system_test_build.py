@@ -24,8 +24,8 @@ def build_language(root, source, binary, *, prebuilt=False, sanitize=False):
     if sanitize:
         runtime = Path(binary).with_suffix('.runtime.o')
         flags = ['-O1', '-g', '-fsanitize=address,undefined', '-fno-omit-frame-pointer']
-        subprocess.run([os.environ.get('MINYAR_TEST_CLANG', 'clang'), '-std=c11', '-DMINYAR_SYSTEM_HEAP=1',
-                        *flags, '-c', root/'runtime/minyar_runtime.c', '-o', runtime], check=True, timeout=60)
+        subprocess.run([os.environ.get('MINYAR_TEST_CLANG', 'clang'), '-std=c11',
+                        *flags, '-c', root/'runtime/minyar_default_runtime.c', '-o', runtime], check=True, timeout=60)
         env['MINYAR_CLANG_FLAGS'] = ' '.join(flags) + ' -Wno-override-module'
         env['MINYAR_NATIVE_FLAGS'] = ' '.join(flags)
     command = [sys.executable, str(root/'tools/clang-driver.py'), 'link', str(root), str(ir), str(runtime), str(binary), '0']
