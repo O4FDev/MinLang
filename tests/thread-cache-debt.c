@@ -8,6 +8,9 @@
 #include <assert.h>
 int main(void) {
     rc_thread_domain_init();
+    rc_thread_domain_dispose();
+    assert(!rc_object_count && !rc_bytes && !rc_immortal_object_count);
+    rc_thread_domain_init();
     minyar_rc_enter(128);
     MinyarText *integer = minyar_integer_text(12345);
     for (long long i = 0; i < 127; i++) minyar_rc_local(i, integer);
