@@ -31,21 +31,38 @@ DECIMAL_EXPLICIT_DECIMAL = ('0_0_0', '4_2', '1_0000_0000', '0_', '42_',
 DECIMAL_RADIX_TAIL = tuple(sign + radix + '_' for sign in ('', '-', '+')
                    for radix in ('0x', '0o', '0b', '0d'))
 
-def decimal_literal_diagnostic(token):
-    """Decimal and hexadecimal grammar in the exact print(token) context.
+# Integer literal spellings Minyar accepts: hexadecimal, 0o octal, and decimal
+# without a leading zero (GUEST-1). A sign is a separate token.
+DECIMAL_ACCEPTED = r'-?(?:0[xX][0-9a-fA-F]+|0o[0-7]+|0(?![0-9])|[1-9][0-9]*)'
 
-    '+' has no unary production. A bare '-' lacks its expression. Identifiers
-    following an optional numeric prefix remain whole unknown names. These
-    finite tokens cannot contain a second sign or other punctuation.
+def decimal_literal_value(token):
+    sign, body = (-1, token[1:]) if token.startswith('-') else (1, token)
+    base = 16 if body[:2].lower() == '0x' else 8 if body[:2] == '0o' else 10
+    return sign * int(body[2:] if base != 10 else body, base)
+
+def decimal_literal_diagnostic(token):
+    """Decimal, hexadecimal and octal grammar in the exact print(token) context.
+
+    Lexical errors come first and point at the literal after any sign: 0o needs
+    only octal digits up to the next non-identifier character, and a decimal
+    literal cannot start with a zero followed by another digit. '+' has no unary
+    production. A bare '-' lacks its expression. Identifiers following an
+    optional numeric prefix remain whole unknown names. These finite tokens
+    cannot contain a second sign or other punctuation.
     """
-    assert not re.fullmatch(r'-?(?:0[xX][0-9a-fA-F]+|[0-9]+)', token)
+    assert not re.fullmatch(DECIMAL_ACCEPTED, token)
     if not token:
         return 'print expects 1 arguments, but received 0'
+    offset = 1 if token[:1] in '+-' else 0
+    body = token[offset:]
+    if body.startswith('0o') and not re.fullmatch(r'0o[0-7]+', body):
+        return f'line 1, column {7+offset}: an octal Integer literal needs only digits 0 through 7 after 0o'
+    if re.match(r'0[0-9]', body):
+        return f'line 1, column {7+offset}: decimal Integer literals cannot have a leading zero; use 0o for octal'
     if token.startswith('+'):
         return "line 1, column 7: expected an expression, found '+'"
     if token == '-':
         return "line 1, column 8: expected an expression, found ')'"
-    offset = 1 if token.startswith('-') else 0
     number = re.match(r'-?(?:0[xX][0-9a-fA-F]+|[0-9]+)', token)
     if number:
         offset = number.end()
@@ -58,11 +75,11 @@ def decimal_literal_cells():
         for size in range(4):
             for digits in itertools.product(DECIMAL_ALPHABET, repeat=size):
                 token = prefix + ''.join(digits)
-                accept = re.fullmatch(r'-?(?:0[xX][0-9a-fA-F]+|[0-9]+)', token) is not None
+                accept = re.fullmatch(DECIMAL_ACCEPTED, token) is not None
                 yield {'cohort': 'ruby-product', 'prefix': prefix, 'size': size,
                        'digits': list(digits), 'token': token,
                        'source_skips': token == '',
-                       'expected_value': int(token, 16 if 'x' in token.lower() else 10) if accept else None,
+                       'expected_value': decimal_literal_value(token) if accept else None,
                        'diagnostic': None if accept else decimal_literal_diagnostic(token)}
     for token in DECIMAL_EXPLICIT_DECIMAL:
         yield {'cohort': 'python-explicit-decimal', 'token': token,
@@ -590,7 +607,7 @@ while index < marks.length { print(marks[index]); index = index + 1 }
                 with self.subTest(cohort=cell['cohort'], token=token):
                     self.rejects_exact_diagnostic(f'print({token})\n', cell['diagnostic'])
                 rejected += 1
-        self.assertEqual((len(accepted), rejected), (162, 957))
+        self.assertEqual((len(accepted), rejected), (152, 967))
         self.executes(''.join(f'print({token})\n' for token, _ in accepted),
                       ''.join(f'{value}\n' for _, value in accepted))
 
