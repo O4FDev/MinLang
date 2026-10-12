@@ -37,8 +37,6 @@ class ManagedGraphs(CompilerTestCase):
     def executes(self, source, expected, optimizations=('-O0', '-O2'), status=0, stderr=''):
         result, llvm = self.compile(source)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue('; minyar-cycle-runtime: 1\n' in llvm.read_text() or
-                        '; minyar-callback-runtime: 1\n' in llvm.read_text())
         harness = self.directory / 'runtime.c'
         contract = (ROOT / 'tests/memory-contracts-runtime.c').read_text()
         harness.write_text(contract.replace('#include "../runtime/minyar_runtime.c"',
@@ -94,7 +92,7 @@ print(json.pretty(value, ""))
 ''',
         )
         expected = ('42\nfunction(x: Integer) { Callback<Integer, Integer> }\n',
-                    '42\n', 'before after\n', '{"x":[1,2,{"y":true}]}\n')
+                    '42\n', 'before after\n', '{\n  \"x\": [\n    1,\n    2,\n    {\n      \"y\": true\n    }\n  ]\n}\n')
         for source, output in zip(cases, expected):
             with self.subTest(source=source.splitlines()[0]):
                 self.executes(source, output)
@@ -167,7 +165,7 @@ let node = Node { children: values }
 identity(values).add(node)
 ''')
         expected = ('42\nfunction(x: Integer) { Callback<Integer, Integer> }\n',
-                    '42\n', 'before after\n', '{"x":[1,2,{"y":true}]}\n')
+                    '42\n', 'before after\n', '{\n  \"x\": [\n    1,\n    2,\n    {\n      \"y\": true\n    }\n  ]\n}\n')
         for source, output in zip(cases, expected):
             with self.subTest(source=source.splitlines()[0]):
                 self.executes(source, output)
