@@ -416,16 +416,22 @@ static size_t rc_bounded_poll_work(size_t budget) {
     } else {
         while (work < budget && rc_pending_count) {
             unsigned queue = rc_bounded_next_queue;
-            for (unsigned tries = 0; tries < 3; tries++) {
-                if ((queue == 0 && (rc_bounded_active || rc_bounded_head || rc_bounded_recent_head)) ||
-                    (queue == 1 && rc_bounded_frame_head) ||
-                    (queue == 2 && rc_bounded_chunk_head)) break;
-                queue = (queue + 1) % 3;
+            unsigned objects = rc_bounded_active || rc_bounded_head || rc_bounded_recent_head;
+            if (queue == 0) {
+                if (!objects) queue = rc_bounded_frame_head ? 1 : 2;
+            } else if (queue == 1) {
+                if (!rc_bounded_frame_head) queue = rc_bounded_chunk_head ? 2 : 0;
+            } else if (!rc_bounded_chunk_head) queue = objects ? 0 : 1;
+            if (queue == 0) {
+                rc_bounded_next_queue = 1;
+                rc_bounded_object_unit();
+            } else if (queue == 1) {
+                rc_bounded_next_queue = 2;
+                rc_bounded_frame_unit();
+            } else {
+                rc_bounded_next_queue = 0;
+                rc_bounded_chunk_unit();
             }
-            rc_bounded_next_queue = (queue + 1) % 3;
-            if (queue == 0) rc_bounded_object_unit();
-            else if (queue == 1) rc_bounded_frame_unit();
-            else rc_bounded_chunk_unit();
             work++;
         }
     }
