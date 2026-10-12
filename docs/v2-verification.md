@@ -1,7 +1,7 @@
 # v2 implementation and verification map
 
 This checkpoint describes the combined implementation based on
-`f2d8f0e` at 23:49 UTC on 2026-10-11.
+`01a71560` at 00:10 UTC on 2026-10-12.
 An implemented API, a passing focused suite and a complete deployment are
 separate claims. Retained results establish only their recorded source and
 configuration. Combined CI, current macOS/Windows gates, ordinary performance
@@ -115,11 +115,15 @@ A strengthened test separately proves that an ordinary unpaired drop still
 requests a rescan and that losing a private cycle's last owning path reclaims
 that cycle before changing the primary root. The proposed paired-drop repair
 passes those controls: the private case uses one full job and one seven-unit
-local job. Its final acyclic smoke still fails the aggregate completion count.
-Those counters include local jobs, so this result does not establish a second
-full scan. Classification is under review; the 192-unit gate, safety assertions
-and requirement to avoid another full scan remain unchanged. No sanitizer or
-broader qualification is claimed for this candidate.
+local job. Its final acyclic smoke still fails. A subsequent per-unit classifier
+confirms two actual full jobs and no local job in that case. A bounded joined
+trace identifies the same branch reaching real zero inside MARK after its gray
+pin is released, then leaving registration without a retirement marker. Its
+queued field cleanup later cancels the proof build and requests the second
+scan. Reclamation, payloads, root cleanup and eight borrowed units still pass;
+the one-full-job requirement and 192-unit limit remain unchanged. The narrow
+repair is being prepared. No sanitizer, broader qualification or capacity pass
+is claimed for this candidate.
 
 ## Recoverable errors
 
@@ -215,9 +219,9 @@ Pinned-runner exceptions also retain no protocol verdict: an ICMPv6 packet
 caused a migration checker KeyError, and two consecutive large transfers to
 the Minyar server timed out before the runner decoded missing stdout. The
 quiche and Quinn clients received correct but incomplete prefixes of the
-10-MiB workload. The primary sequence remains paused after 46 attempts:
+10-MiB workload. That historical primary sequence stopped after 46 attempts:
 31 passes, five literal unsupported results, seven literal failures and three
-checker errors; 82 primary cells remain unattempted. Subsequent affected-cell
+checker errors; 82 primary cells were then unattempted. Subsequent affected-cell
 passes are recorded separately and do not rewrite those historical outcomes.
 No timeout, protocol checker or completed result has been relaxed or relabeled.
 
@@ -269,6 +273,14 @@ retained authenticated handshake decoding confirms both advertised ports are
 The exact pinned client's preferred-address policy is unproven. This does not
 establish an unsupported case or a product root cause. Its 80 exported metadata
 files were verified; private decoding and capture material remain on Boat.
+
+A separate continuation with the qualified `49edb0f6` endpoint inputs has now
+passed untouched original indices 46–52: both remaining Minyar-server transfer
+peers, Retry against all four servers, and Minyar-server Retry against quiche.
+Each literal official verdict, original deadline and owned cleanup remains
+intact. Indices 53–55 are next; 75 original cells remain untouched at this
+checkpoint. These results do not rewrite the historical matrix or certify all
+128 current-source cells.
 
 Actual runner failures exposed fixture defects in Docker 29 capability
 spelling, simulator capture writers that had not flushed during shutdown, and
@@ -341,8 +353,8 @@ insertions were preserved, and 3,068 issued fresh-MARK retirements preserved
 3,556 fields with zero fallback. All 187 same-call tuples account for 22,191
 remaining invalidations, without misses, overflow or reaching the report cap.
 Full collection accounts for 76.16% of recorded work units. A narrow actual-zero
-FULL MARK case with mark 2, no incoming edges, no pin and no rescan is the next
-regression candidate; full ROOTS graph discovery and rescan cases remain
+FULL MARK case with mark 2, no incoming edges, no pin and no rescan led to the
+isolated regression described above; full ROOTS graph discovery and rescan remain
 conservative. The instrumented cohort also failed setup and provides no
 production capacity result. No steady-state measurement began; 20,000 actual
 QUIC devices and two-hour flat memory remain unqualified.
@@ -366,6 +378,13 @@ and timers return to zero. The original failure and all six successful controls
 are retained in a 118-file verified metadata archive. Five-second controls do
 not certify warmed memory, connected idle or hours-long stability; missing
 helper-process memory sampling is being addressed before the mixed soak.
+Two new process-telemetry controls failed on the old driver, then passed on
+Boat after the repair: they measure a real live child's RSS/CPU and preserve
+normal exit, the exit/read race and unexpected live read failures. The drivers
+now sample their controller processes and the independent Quinn peer; shared
+TLS server/observer and QUIC proxy/observer roles each use one PID. Supplied-
+binary short qualification is in progress. These controls establish telemetry
+behavior, not flat memory or low idle CPU.
 
 ## Desktop and shipping
 
