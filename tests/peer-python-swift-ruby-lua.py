@@ -1570,11 +1570,15 @@ print("done")
                   '0o8', '0o1_', '0o', '0x1_', '0x')
         for token in tokens:
             with self.subTest(token=token):
-                # Binary/octal prefixes and digit separators remain unsupported.
+                # Binary prefixes and digit separators remain unsupported; 0o is
+                # octal and rejects any non-octal digit or separator after it.
                 # The hexadecimal prefix consumes 0x1 before the invalid '_'.
-                column, name = (10, '_') if token == '0x1_' else (8, token[1:])
-                self.rejects_exact_diagnostic(f'print({token})\n',
-                             f"line 1, column {column}: I can't find a value named '{name}'")
+                if token.startswith('0o'):
+                    expected = 'line 1, column 7: an octal Integer literal needs only digits 0 through 7 after 0o'
+                else:
+                    column, name = (10, '_') if token == '0x1_' else (8, token[1:])
+                    expected = f"line 1, column {column}: I can't find a value named '{name}'"
+                self.rejects_exact_diagnostic(f'print({token})\n', expected)
 
 
     def test_exact_prefix_removal_values(self):
@@ -1769,16 +1773,19 @@ print(relativeSlice(a, true, -4, true, -3))
         # These source cells require SyntaxError and no warning, rather than
         # the neighboring successful compile plus warning/filter protocol.
         # Keep the complete original expression, including0or x's final x.
-        for expression, column, name in (
-            ('0xfand x', 11, 'nd'), ('0xfspam', 10, 'spam'),
-            ('0o7spam', 8, 'o7spam'), ('0b1spam', 8, 'b1spam'),
-            ('9spam', 8, 'spam'), ('0or x', 8, 'or'), ('0spam', 8, 'spam'),
+        octal = 'line 1, column 7: an octal Integer literal needs only digits 0 through 7 after 0o'
+        for expression, expected in (
+            ('0xfand x', "line 1, column 11: I can't find a value named 'nd'"),
+            ('0xfspam', "line 1, column 10: I can't find a value named 'spam'"),
+            ('0o7spam', octal), ('0b1spam', "line 1, column 8: I can't find a value named 'b1spam'"),
+            ('9spam', "line 1, column 8: I can't find a value named 'spam'"), ('0or x', octal),
+            ('0spam', "line 1, column 8: I can't find a value named 'spam'"),
         ):
             with self.subTest(expression=expression):
                 # Hexadecimal literals consume valid hex digits before the
-                # unknown name; binary and octal prefixes remain unsupported.
-                self.rejects_exact_diagnostic(f'print({expression})\n',
-                                   f"line 1, column {column}: I can't find a value named '{name}'")
+                # unknown name; binary prefixes remain unsupported, and an
+                # octal literal rejects any trailing name character.
+                self.rejects_exact_diagnostic(f'print({expression})\n', expected)
 
 
     def test_fraction_slash_is_rejected_after_all_eight_numeric_spellings(self):

@@ -2831,8 +2831,12 @@ print(expected[0])
     def test_foreign_multibyte_character_literals_are_single_scalars(self):
         self.executes("print('ñ')\nprint('ሴ')\nprint('ñ')\nprint('ሴ')\n",'ñ\nሴ\nñ\nሴ\n')
 
-    def test_legacy_octal_spellings_retain_minyar_decimal_values(self):
-        self.executes('\n'.join(f'print(0{value})' for value in range(70,78)),''.join(f'{value}\n' for value in range(70,78)))
+    def test_legacy_octal_spellings_are_rejected_and_0o_spells_octal(self):
+        # GUEST-1: a leading zero is neither silently decimal nor C-style octal.
+        for value in range(70,78):
+            with self.subTest(value=f'0{value}'):
+                self.rejects(f'print(0{value})\n','decimal Integer literals cannot have a leading zero; use 0o for octal')
+        self.executes('\n'.join(f'print(0o{value:o})' for value in range(70,78)),''.join(f'{value}\n' for value in range(70,78)))
 
     def test_large_neighbor_equality_keeps_literal_and_parameter_orders(self):
         low=0x1fffffffffffff01;high=0x1fffffffffffff02
