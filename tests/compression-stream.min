@@ -1,0 +1,130 @@
+use "zstd" as zstd
+use "deflate" as deflate
+function check(value: Boolean, message: Text) { if !value { fail(message) } }
+function zstdPack(input: Bytes): Bytes {
+    let owner = zstd.createCompressor(3)
+    check(zstd.isOpenStream(owner), "zstd create compressor")
+    let output = Bytes(5)
+    let packed = Bytes()
+    let position = 0
+    let done = false
+    while !done {
+        let count = input.length - position
+        if count > 3 { count = 3 }
+        let result = zstd.step(owner, input, position, count, output, position + count == input.length)
+        check(result.status == 0, "zstd streaming encode")
+        check(result.consumed >= 0 && result.consumed <= count && result.written >= 0 && result.written <= 5, "zstd encode bounds")
+        check(result.end || result.consumed + result.written > 0, "zstd encode progress")
+        position += result.consumed
+        packed.addBytes(output.slice(0, result.written))
+        done = result.end
+    }
+    check(position == input.length, "zstd consumed input")
+    let alias = owner
+    zstd.closeStream(owner)
+    zstd.closeStream(alias)
+    check(zstd.step(alias, input, 0, 0, output, true).status == zstd.CLOSED, "zstd shared close")
+    return packed
+}
+function zstdUnpack(input: Bytes): Bytes {
+    let owner = zstd.createDecompressor()
+    let output = Bytes(3)
+    let decoded = Bytes()
+    let position = 0
+    let done = false
+    while !done {
+        let count = 0
+        if position < input.length { count = 1 }
+        let result = zstd.step(owner, input, position, count, output, position + count == input.length)
+        check(result.status == 0, "zstd streaming decode")
+        check(result.consumed >= 0 && result.consumed <= count && result.written >= 0 && result.written <= 3, "zstd decode bounds")
+        check(result.end || result.consumed + result.written > 0, "zstd decode progress")
+        position += result.consumed
+        decoded.addBytes(output.slice(0, result.written))
+        done = result.end
+    }
+    check(position == input.length, "zstd decoded input")
+    zstd.closeStream(owner)
+    return decoded
+}
+function deflatePack(input: Bytes, format: Integer): Bytes {
+    let owner = deflate.createCompressor(format, 6)
+    check(deflate.isOpenStream(owner), "deflate create compressor")
+    let output = Bytes(5)
+    let packed = Bytes()
+    let position = 0
+    let done = false
+    while !done {
+        let count = input.length - position
+        if count > 3 { count = 3 }
+        let result = deflate.step(owner, input, position, count, output, position + count == input.length)
+        check(result.status == 0, "deflate streaming encode")
+        check(result.consumed >= 0 && result.consumed <= count && result.written >= 0 && result.written <= 5, "deflate encode bounds")
+        check(result.end || result.consumed + result.written > 0, "deflate encode progress")
+        position += result.consumed
+        packed.addBytes(output.slice(0, result.written))
+        done = result.end
+    }
+    check(position == input.length, "deflate consumed input")
+    let alias = owner
+    deflate.closeStream(owner)
+    deflate.closeStream(alias)
+    check(deflate.step(alias, input, 0, 0, output, true).status == deflate.CLOSED, "deflate shared close")
+    return packed
+}
+function deflateUnpack(input: Bytes, format: Integer): Bytes {
+    let owner = deflate.createDecompressor(format)
+    let output = Bytes(3)
+    let decoded = Bytes()
+    let position = 0
+    let done = false
+    while !done {
+        let count = 0
+        if position < input.length { count = 1 }
+        let result = deflate.step(owner, input, position, count, output, position + count == input.length)
+        check(result.status == 0, "deflate streaming decode")
+        check(result.consumed >= 0 && result.consumed <= count && result.written >= 0 && result.written <= 3, "deflate decode bounds")
+        check(result.end || result.consumed + result.written > 0, "deflate decode progress")
+        position += result.consumed
+        decoded.addBytes(output.slice(0, result.written))
+        done = result.end
+    }
+    check(position == input.length, "deflate decoded input")
+    deflate.closeStream(owner)
+    return decoded
+}
+let source = Bytes("streaming payload abcdefghijklmnopqrstuvwxyz")
+let zpacked = zstdPack(source)
+check(Text(zstdUnpack(zpacked)) == Text(source), "zstd roundtrip")
+check(Text(zstd.data(zstd.decompress(zpacked, source.length))) == Text(source), "zstd whole decoder interop")
+let zconcat = zstdPack(source)
+zconcat.addBytes(zstdPack(Bytes()))
+zconcat.addBytes(zstdPack(source))
+check(Text(zstdUnpack(zconcat)) == Text(source) + Text(source), "zstd concatenation")
+for format in [deflate.GZIP, deflate.ZLIB, deflate.RAW] {
+    let packed = deflatePack(source, format)
+    check(Text(deflateUnpack(packed, format)) == Text(source), "deflate roundtrip")
+    check(Text(deflate.data(deflate.decompress(packed, format, source.length))) == Text(source), "deflate whole decoder interop")
+}
+let concat = deflatePack(source, deflate.GZIP)
+concat.addBytes(deflatePack(Bytes(), deflate.GZIP))
+concat.addBytes(deflatePack(source, deflate.GZIP))
+check(Text(deflateUnpack(concat, deflate.GZIP)) == Text(source) + Text(source), "gzip concatenation")
+for codec in 0..2 {
+    let output = Bytes(512)
+    if codec == 0 {
+        let owner = zstd.createDecompressor()
+        check(zstd.step(owner, zpacked, -1, 1, output, true).status == zstd.INVALID, "zstd invalid range")
+        check(zstd.step(owner, zpacked, 0, zpacked.length - 1, output, true).status == zstd.TRUNCATED, "zstd truncation")
+        check(zstd.step(owner, zpacked, 0, 0, output, true).status == zstd.TRUNCATED, "zstd sticky error")
+        zstd.closeStream(owner)
+    } else {
+        let owner = deflate.createDecompressor(deflate.GZIP)
+        let packed = deflatePack(source, deflate.GZIP)
+        check(deflate.step(owner, packed, -1, 1, output, true).status == deflate.INVALID, "gzip invalid range")
+        check(deflate.step(owner, packed, 0, packed.length - 1, output, true).status == deflate.TRUNCATED, "gzip truncation")
+        check(deflate.step(owner, packed, 0, 0, output, true).status == deflate.TRUNCATED, "gzip sticky error")
+        deflate.closeStream(owner)
+    }
+}
+print("compression-stream: ok")

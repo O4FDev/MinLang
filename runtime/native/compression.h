@@ -22,6 +22,11 @@ static inline int mc_ranges(long long src, long long n, long long dst, long long
     return !n || !cap || (uint64_t)src + (uint64_t)n <= (uint64_t)dst ||
            (uint64_t)dst + (uint64_t)cap <= (uint64_t)src;
 }
+static inline int mc_stream_ranges(long long src, long long n, long long dst, long long cap) {
+    if (!mc_range(src, n) || !mc_range(dst, cap)) return 0;
+    return !n || !cap || (uint64_t)src + (uint64_t)n <= (uint64_t)dst ||
+           (uint64_t)dst + (uint64_t)cap <= (uint64_t)src;
+}
 static inline long long mc_addr(const void *p) { return (long long)(intptr_t)p; }
 static inline size_t mc_chunk(size_t n) {
     return n < MINYAR_COMPRESSION_CHUNK ? n : MINYAR_COMPRESSION_CHUNK;
@@ -40,4 +45,16 @@ long long minyar_zstd_rawCompressDict(long long, long long, long long, long long
 long long minyar_zstd_rawDecompressDict(long long, long long, long long, long long, long long, long long);
 long long minyar_deflate_rawCompress(long long, long long, long long, long long, long long, long long);
 long long minyar_deflate_rawDecompress(long long, long long, long long, long long, long long);
+long long minyar_zstd_newStream(bool, long long);
+void minyar_zstd_freeStream(long long);
+long long minyar_zstd_processStream(long long, const MinyarBytes *, long long, long long, MinyarBytes *, bool);
+long long minyar_zstd_streamConsumed(long long);
+long long minyar_zstd_streamWritten(long long);
+bool minyar_zstd_streamEnded(long long);
+long long minyar_deflate_newStream(bool, long long, long long);
+void minyar_deflate_freeStream(long long);
+long long minyar_deflate_processStream(long long, const MinyarBytes *, long long, long long, MinyarBytes *, bool);
+long long minyar_deflate_streamConsumed(long long);
+long long minyar_deflate_streamWritten(long long);
+bool minyar_deflate_streamEnded(long long);
 #endif
