@@ -7,6 +7,25 @@ from regressions import CompilerTestCase, ROOT
 class PeerLive(CompilerTestCase):
     compiler_arguments = ('--library', str(ROOT / 'library'))
 
+    def test_dialable_edge_endpoint_and_region_are_trusted_fields(self):
+        self.executes('''use "peerlive" as live
+use "errors" as errors
+use "json" as json
+for address in ["edge.example:443","127.0.0.1:9000","[::1]:443","[2001:db8::1]:65535"] {
+    if !live.edgeEndpoint(address) { fail("valid endpoint rejected") }
+}
+for address in ["edge",":443","edge:0","edge:65536","edge:00443","edge:443/path","https://edge:443","user@edge:443","::1:443","[xyz]:443","-edge:443","edge..example:443","edge:443\\n"] {
+    if live.edgeEndpoint(address) { fail("malformed edge endpoint accepted") }
+}
+let input = Bytes("{\\"in_flight\\":0,\\"max_concurrent\\":8,\\"paused\\":false,\\"policy_hash\\":\\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\",\\"public_ip\\":\\"203.0.113.2\\",\\"asn\\":64500,\\"country\\":\\"GB\\"}")
+let health = live.heartbeat(input)
+let result = live.payloadRegion(health,"exit-a","edge.example:443","eu-west","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",1000,0,false,false,1.0)
+if !errors.bytesOk(result) { fail("regional payload rejected") }
+let value = json.parseBytes(errors.bytesValue(result),16384)
+if json.string(value,"edge_instance") != "edge.example:443" || json.string(value,"edge_region") != "eu-west" { fail("missing dial route") }
+print("regional live route verified")
+''', 'regional live route verified\n')
+
     def test_weight_pause_quarantine_and_trusted_connection_epoch(self):
         self.executes('''use "peerlive" as live
 use "errors" as errors
