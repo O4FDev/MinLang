@@ -1,3 +1,6 @@
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
+#endif
 /* Inject each startup mapping failure; check rollback before process exit. */
 #include <sys/mman.h>
 #include <errno.h>
