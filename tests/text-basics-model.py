@@ -87,9 +87,9 @@ def main():
     if args.cycles:
         import sys
         sys.path.insert(0, str(ROOT / 'tools'))
-        from cycle_runtime import engine_source
+        from cycle_runtime import publish_engine
         (ROOT / 'build').mkdir(exist_ok=True)
-        (ROOT / 'build/managed-graphs-engine.c').write_text(engine_source(ROOT))
+        publish_engine(ROOT)
     env = {**os.environ, 'ASAN_OPTIONS': 'detect_leaks=0:halt_on_error=1',
            'UBSAN_OPTIONS': 'halt_on_error=1'}
     with tempfile.TemporaryDirectory(prefix='minyar-text-basics-') as tmp:

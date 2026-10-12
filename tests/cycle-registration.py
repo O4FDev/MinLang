@@ -17,7 +17,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
-from cycle_runtime import engine_source
+from cycle_runtime import publish_engine
 from clang_helpers import asan_leak_options, windows_host
 
 
@@ -53,8 +53,7 @@ def main():
     out = args.evidence.resolve()
     out.mkdir(parents=True, exist_ok=True)
     (ROOT / "build").mkdir(exist_ok=True)
-    generated = ROOT / "build/managed-graphs-engine.c"
-    generated.write_text(engine_source(ROOT))
+    generated = publish_engine(ROOT)
     fixtures = {
         "cycle-registration-exposure.c":
             "registration exposure owning paths and queue integrity exact cleanup zero\n",

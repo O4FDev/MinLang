@@ -9,7 +9,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
-from cycle_runtime import engine_source
+from cycle_runtime import publish_engine
 from clang_helpers import native_path, without_asm_source_locations
 
 
@@ -26,8 +26,7 @@ def main():
     args = parser.parse_args()
     build = ROOT / 'build'
     build.mkdir(exist_ok=True)
-    cycle = build / 'thread-cycle-engine.c'
-    cycle.write_text(engine_source(ROOT))
+    cycle = publish_engine(ROOT, build / 'thread-cycle-engine.c')
     compiler = os.environ.get('MINYAR_TEST_CLANG', 'clang')
     for label, source in [('rc', ROOT / 'runtime/minyar_runtime.c'), ('cycle', cycle)]:
         output = build / ('thread-' + label + '-ownership.ll')

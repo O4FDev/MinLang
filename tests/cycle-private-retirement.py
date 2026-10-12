@@ -19,7 +19,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
-from cycle_runtime import engine_source
+from cycle_runtime import publish_engine
 from clang_helpers import asan_leak_options, clang_command, windows_host
 from test_evidence import Evidence
 
@@ -127,9 +127,7 @@ def main():
         target = out / "input-sources" / p.relative_to(ROOT)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(p.read_bytes())
-    generated = ROOT / "build/managed-graphs-engine.c"
-    generated.parent.mkdir(exist_ok=True)
-    generated.write_text(engine_source(ROOT))
+    generated = publish_engine(ROOT)
     retained_engine = out / "managed-graphs-engine.c"
     retained_engine.write_bytes(generated.read_bytes())
     compiler = Path(shutil.which(os.environ.get("MINYAR_TEST_CLANG", "clang")) or

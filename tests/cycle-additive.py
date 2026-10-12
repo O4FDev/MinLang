@@ -4,7 +4,7 @@ import argparse, hashlib, json, os, platform, signal, subprocess, sys, time
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
-from cycle_runtime import engine_source
+from cycle_runtime import publish_engine
 from clang_helpers import asan_leak_options, windows_host
 from test_evidence import terminate_process_tree
 
@@ -94,7 +94,7 @@ def main():
             p.error("full MARK zero retirement requires --budgets 1 32 and --nodes 512 2048")
     out = args.evidence.resolve(); out.mkdir(parents=True, exist_ok=True)
     (ROOT / "build").mkdir(exist_ok=True)
-    (ROOT / "build/managed-graphs-engine.c").write_text(engine_source(ROOT))
+    publish_engine(ROOT)
     headers = sorted((ROOT / "runtime").glob("*.h"))
     inputs = [ROOT/"tests/cycle-additive.c", ROOT/"tests"/args.fixture, Path(__file__).resolve(),
               ROOT/"tools/cycle_runtime.py", ROOT/"tests/clang_helpers.py",

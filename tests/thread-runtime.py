@@ -9,7 +9,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
-from cycle_runtime import engine_source
+from cycle_runtime import publish_engine
 from clang_helpers import native_path, windows_host, asan_leak_options
 
 
@@ -23,7 +23,7 @@ def main():
     args = parser.parse_args()
     build = ROOT / 'build'
     build.mkdir(exist_ok=True)
-    (build / 'thread-cycle-engine.c').write_text(engine_source(ROOT))
+    publish_engine(ROOT, build / 'thread-cycle-engine.c')
     compiler = os.environ.get('MINYAR_TEST_CLANG', 'clang')
     windows = args.windows_cross or windows_host()
     launch = ['wine'] if args.windows_cross else []

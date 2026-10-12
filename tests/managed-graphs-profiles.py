@@ -15,7 +15,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
-from cycle_runtime import engine_source
+from cycle_runtime import publish_engine
 sys.path.insert(0, str(ROOT / 'tests'))
 from clang_helpers import windows_host
 
@@ -41,7 +41,7 @@ def main():
     output = ROOT / 'build' / ('managed-graphs-profiles' if args.fixture == 'managed-graphs-runtime.c'
                                else 'managed-graphs-bakeoff-profiles')
     output.mkdir(parents=True, exist_ok=True)
-    (ROOT / 'build/managed-graphs-engine.c').write_text(engine_source(ROOT))
+    publish_engine(ROOT)
     clang = os.environ.get('MINYAR_TEST_CLANG', 'clang')
     profiles = {'system': ['-DMINYAR_SYSTEM_HEAP=1'],
                 'fixed': ['-DMINYAR_BOUNDED_HEAP=1'],

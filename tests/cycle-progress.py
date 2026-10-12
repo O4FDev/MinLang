@@ -11,7 +11,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
-from cycle_runtime import engine_source
+from cycle_runtime import publish_engine
 sys.path.insert(0, str(ROOT / 'tests'))
 from clang_helpers import windows_host
 
@@ -27,7 +27,7 @@ def main():
     output = args.evidence or ROOT / 'build/cycle-progress'
     output.mkdir(parents=True, exist_ok=True)
     (ROOT / 'build').mkdir(exist_ok=True)
-    (ROOT / 'build/managed-graphs-engine.c').write_text(engine_source(ROOT))
+    publish_engine(ROOT)
     inputs = [ROOT / 'tests/cycle-progress.c', Path(__file__).resolve(),
               ROOT / 'tools/cycle_runtime.py', ROOT / 'runtime/minyar_runtime.c',
               *sorted((ROOT / 'runtime').glob('*.h'))]
