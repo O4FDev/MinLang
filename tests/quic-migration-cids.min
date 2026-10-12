@@ -990,9 +990,356 @@ function currentPacketThreshold(p: Pair): Integer {
     return 0
 }
 
+// Bounded inventory tests use real authenticated packets and actual poll wire
+// output. They neither call a refill helper nor inspect a proposed use scalar.
+record StockId { sequence: Integer; id: Bytes; token: Bytes; prior: Integer }
+record CidStock {
+    subject: quic.Connection; peer: quic.Connection; now: Integer; limit: Integer
+    observed: List<StockId>; wireFrames: Integer; packets: Integer; baselineNumber: Integer; valid: Boolean
+}
+function stockId(c: quic.Connection, sequence: Integer): Bytes {
+    for known in c.localIds { if known.sequence==sequence { return known.id } }
+    return Bytes()
+}
+function stockSignature(c: quic.Connection): Text {
+    let value=Text(c.nextLocalSequence)+":"+Text(c.connectionIdVersion)
+    for known in c.localIds { value += ":"+Text(known.sequence)+":"+crypto.hex(known.id)+":"+crypto.hex(known.token) }
+    return value
+}
+function stockReceived(c: quic.Connection, number: Integer): Boolean {
+    for range in c.spaces[2].ranges { if number>=range.first && number<=range.last { return true } }
+    return false
+}
+function stockRecord(st: CidStock, data: Bytes): Boolean {
+    let header=wire.header(data,0,st.peer.local.length)
+    if !header.valid { return false }
+    if header.kind!=wire.ONE_RTT { return true }
+    let opened=protection.unprotect(st.peer.spaces[2].read,data,header.numberOffset,-1)
+    if !opened.valid { return false }
+    let parsed=wire.frames(opened.payload);if !parsed.valid { return false }
+    st.packets+=1
+    for frame in parsed.frames { if frame.type==24 {
+        st.wireFrames+=1
+        if frame.data.length<17 { return false }
+        let id=frame.data.slice(0,frame.data.length-16);let token=frame.data.slice(frame.data.length-16,frame.data.length)
+        let prior=-1;let existing=-1;let owned=false
+        for known in st.subject.localIds {
+            if prior<0 || known.sequence<prior { prior=known.sequence }
+            if known.sequence==frame.value && crypto.hex(known.id)==crypto.hex(id) && crypto.hex(known.token)==crypto.hex(token) { owned=true }
+        }
+        for index in 0..st.observed.length { if st.observed[index].sequence==frame.value { existing=index } }
+        if existing>=0 {
+            let previous=st.observed[existing]
+            if crypto.hex(previous.id)!=crypto.hex(id) || crypto.hex(previous.token)!=crypto.hex(token) || previous.prior!=frame.offset { return false }
+        } else {
+            if !owned || frame.value!=st.observed.length || frame.offset!=prior { return false }
+            for known in st.observed { if crypto.hex(known.id)==crypto.hex(id) || (known.token.length==16 && crypto.hex(known.token)==crypto.hex(token)) { return false } }
+            st.observed.add(StockId { sequence:frame.value;id:id;token:token;prior:frame.offset })
+            if frame.value==1 { st.baselineNumber=opened.number }
+        }
+    } }
+    return true
+}
+function stockAck(st: CidStock, number: Integer) {
+    let payload=Bytes();appendInteger(payload,2);appendInteger(payload,number)
+    appendInteger(payload,0);appendInteger(payload,0);appendInteger(payload,0)
+    st.now+=1
+    let packet=authenticatedFrame(st.peer,st.subject,st.subject.localIds[0].id,payload)
+    let header=wire.header(packet,0,st.subject.local.length)
+    let decoded=protection.unprotect(st.subject.spaces[2].read,packet,header.numberOffset,-1)
+    let parsed=wire.frames(decoded.payload)
+    if !decoded.valid || !parsed.valid || parsed.frames.length!=1 || parsed.frames[0].type!=2 || parsed.frames[0].value!=number { st.valid=false;return }
+    quic.receivePath(st.subject,packet,0,st.now)
+    if !stockReceived(st.subject,decoded.number) { st.valid=false }
+}
+function stockDrain(st: CidStock): Boolean {
+    // Thirty-two bounded polls allow normal pacing, and ACK actual packet
+    // numbers. The independent peer never runs its two-CID receive policy
+    // against the larger inventory advertised by this synthetic fixture.
+    if !st.valid { return false }
+    for turn in 0..32 {
+        st.now+=10
+        for packet in quic.pollDatagrams(st.subject,st.now) {
+            let header=wire.header(packet.data,0,st.peer.local.length)
+            if !header.valid || header.kind!=wire.ONE_RTT || !stockRecord(st,packet.data) { st.valid=false;return false }
+            let opened=protection.unprotect(st.peer.spaces[2].read,packet.data,header.numberOffset,-1)
+            let parsed=wire.frames(opened.payload);let eliciting=false
+            for frame in parsed.frames { if frame.type!=0 && frame.type!=2 && frame.type!=3 && frame.type!=28 && frame.type!=29 { eliciting=true } }
+            if eliciting && st.subject.state==quic.ESTABLISHED { stockAck(st,opened.number);if !st.valid { return false } }
+        }
+    }
+    return true
+}
+function stockParameters(data: Bytes, fromServer: Boolean, limit: Integer): Bytes {
+    let parsed=wire.parameters(data,fromServer);let result=Bytes();let replacements=0
+    if !parsed.valid { return result }
+    for parameter in parsed.parameters {
+        let value=parameter.value
+        if parameter.id==14 { value=errors.bytesValue(wire.encode(limit));replacements+=1 }
+        appendInteger(result,parameter.id);appendInteger(result,value.length);result.addBytes(value)
+    }
+    if replacements!=1 { return Bytes() }
+    return result
+}
+function stockPair(root: Bytes, identity: Bytes, key: Bytes, client: Bytes, clientKey: Bytes, limit: Integer, serverSubject: Boolean): CidStock {
+    let c=quic.client("localhost",randomBytes(80),"minyar-test",[root],[client],clientKey)
+    let s=quic.server(randomBytes(80),"minyar-test",c.originalDestination,[identity],key,[root],true)
+    let subject=c;let peer=s
+    if serverSubject { subject=s;peer=c }
+    let st=CidStock { subject:subject;peer:peer;now:0;limit:limit;observed:[StockId { sequence:0;id:subject.local;token:Bytes();prior:0 }];wireFrames:0;packets:0;baselineNumber:-1;valid:true }
+    if serverSubject {
+        c.clientTLS.transportParameters=stockParameters(c.clientTLS.transportParameters,false,limit)
+        if c.clientTLS.transportParameters.length==0 || !errors.booleanOk(quic.setCipherSuites(c,c.clientTLS.allowedSuites)) { st.valid=false;return st }
+    } else {
+        s.serverTLS.transportParameters=stockParameters(s.serverTLS.transportParameters,true,limit)
+        if s.serverTLS.transportParameters.length==0 { st.valid=false;return st }
+    }
+    // Observe actual baseline NEW_CONNECTION_ID frames while the ordinary
+    // peer still processes/ACKs the initial two IDs during authenticated setup.
+    for tick in 0..200 {
+        for packet in quic.pollDatagrams(c,st.now) {
+            if !serverSubject && !stockRecord(st,packet.data) { st.valid=false;return st }
+            quic.receivePath(s,packet.data,packet.pathId,st.now)
+        }
+        for packet in quic.pollDatagrams(s,st.now) {
+            if serverSubject && !stockRecord(st,packet.data) { st.valid=false;return st }
+            quic.receivePath(c,packet.data,packet.pathId,st.now)
+        }
+        st.now+=10
+    }
+    if c.state!=quic.ESTABLISHED || s.state!=quic.ESTABLISHED || !c.confirmed || !s.confirmed ||
+       !c.clientTLS.authenticated || !s.serverTLS.authenticated || !subject.parametersChecked || subject.peerIdLimit!=limit ||
+       subject.localIds.length!=2 || subject.nextLocalSequence!=2 || peer.remoteIds.length!=2 || st.observed.length!=2 || st.wireFrames<1 || st.baselineNumber<0 {
+        st.valid=false;return st
+    }
+    stockAck(st,st.baselineNumber)
+    if !stockDrain(st) || subject.spaces[2].sent.length!=0 { st.valid=false;return st }
+    for pending in subject.pending { for frame in wire.frames(pending.payload).frames { if frame.type==24 { st.valid=false;return st } } }
+    print("inventory setup authenticated both roles; peer limit "+Text(limit)+"; baseline wire IDs 0,1 drained and acknowledged")
+    return st
+}
+function stockReceive(st: CidStock, destination: Bytes, payload: Bytes): Bytes {
+    st.now+=1
+    let packet=authenticatedFrame(st.peer,st.subject,destination,payload)
+    quic.receivePath(st.subject,packet,0,st.now)
+    return packet
+}
+function stockRetire(st: CidStock, destination: Bytes, sequence: Integer): Bytes {
+    let payload=Bytes();appendInteger(payload,25);appendInteger(payload,sequence)
+    while payload.length<5 { payload.add(0) }
+    let packet=stockReceive(st,destination,payload)
+    let header=wire.header(packet,0,st.subject.local.length)
+    let opened=protection.unprotect(st.subject.spaces[2].read,packet,header.numberOffset,-1)
+    if !opened.valid || !stockReceived(st.subject,opened.number) { st.valid=false }
+    return packet
+}
+function stockCheck(st: CidStock, live: Integer, next: Integer, message: Text): Integer {
+    if !st.valid || !stockDrain(st) { print("oracle failure: authenticated poll output or ACK drain failed");return 67 }
+    if st.subject.state!=quic.ESTABLISHED || st.subject.localIds.length!=live || st.subject.nextLocalSequence!=next || st.observed.length!=next || live>min(st.limit,8) {
+        print("semantic failure: "+message+"; live="+Text(st.subject.localIds.length)+" next="+Text(st.subject.nextLocalSequence)+" wire="+Text(st.observed.length));return 66
+    }
+    return 0
+}
+function stockUse(st: CidStock, sequence: Integer): Integer {
+    let id=stockId(st.subject,sequence)
+    if id.length==0 { print("semantic failure: required wire-issued CID unavailable");return 66 }
+    let packet=stockReceive(st,id,crypto.fromHex("0100000000"))
+    let header=wire.header(packet,0,st.subject.local.length)
+    let opened=protection.unprotect(st.subject.spaces[2].read,packet,header.numberOffset,-1)
+    if !opened.valid || st.subject.state!=quic.ESTABLISHED || !stockReceived(st.subject,opened.number) {
+        print("oracle failure: requested CID packet was not authenticated and accepted");return 67
+    }
+    print("inventory accepted CID "+Text(sequence)+" packet "+Text(opened.number))
+    return 0
+}
+function stockUseCheck(st: CidStock, sequence: Integer, live: Integer, next: Integer, message: Text): Integer {
+    let result=stockUse(st,sequence);if result!=0 { return result }
+    return stockCheck(st,live,next,message)
+}
+function stockSinglePath(st: CidStock): Integer {
+    let before=stockSignature(st.subject);let original=st.subject.local
+    for step in 0..16 { stockReceive(st,original,crypto.fromHex("0100000000"));if !stockDrain(st) { return 67 } }
+    if stockSignature(st.subject)!=before { print("semantic failure: original-CID traffic changed the inventory version");return 66 }
+    let result=stockCheck(st,2,2,"single-path stock changed");if result!=0 { return result }
+    print("original-CID traffic retained exactly two drained wire IDs without extra issuance");return 0
+}
+function stockFirstUse(st: CidStock): Integer {
+    let result=stockUseCheck(st,1,3,3,"authenticated CID1 use did not supply wire CID2")
+    if result!=0 { return result }
+    print("fresh authenticated spare-CID use supplied exactly one new wire CID2");return 0
+}
+function stockChain(st: CidStock): Integer {
+    for sequence in 1..5 {
+        let result=stockUseCheck(st,sequence,sequence+2,sequence+2,"consumed CID had no fresh wire-observed spare")
+        if result!=0 { return result }
+    }
+    print("four successive authenticated path CID demands each supplied one wire-observed spare");return 0
+}
+function stockReorder(st: CidStock): Integer {
+    let held=authenticatedFrame(st.peer,st.subject,stockId(st.subject,1),crypto.fromHex("0100000000"))
+    let header=wire.header(held,0,st.subject.local.length)
+    let decoded=protection.unprotect(st.subject.spaces[2].read,held,header.numberOffset,-1)
+    if !decoded.valid || stockReceived(st.subject,decoded.number) { return 67 }
+    let replay=stockReceive(st,stockId(st.subject,1),crypto.fromHex("0100000000"))
+    let result=stockCheck(st,3,3,"first use had no spare before reordering control");if result!=0 { return result }
+    result=stockUseCheck(st,2,4,4,"second use had no spare before reordering control");if result!=0 { return result }
+    let before=stockSignature(st.subject);let largest=st.subject.spaces[2].largest
+    st.now+=1;quic.receivePath(st.subject,held,0,st.now)
+    if st.subject.spaces[2].largest!=largest || !stockReceived(st.subject,decoded.number) { return 68 }
+    st.now+=1;quic.receivePath(st.subject,replay,0,st.now)
+    stockReceive(st,stockId(st.subject,1),crypto.fromHex("0100000000"))
+    if !stockDrain(st) || stockSignature(st.subject)!=before || st.observed.length!=4 { return 68 }
+    print("fresh reordered old-CID packet, actual duplicate and repeated CID use added no extra spare");return 0
+}
+function stockRetiredSpare(st: CidStock): Integer {
+    let old=stockId(st.subject,1)
+    stockRetire(st,st.subject.local,1)
+    let result=stockCheck(st,2,3,"retired unused spare did not get one replacement");if result!=0 { return result }
+    let before=stockSignature(st.subject);let largest=st.subject.spaces[2].largest
+    stockRetire(st,st.subject.local,1)
+    let afterDuplicate=st.subject.spaces[2].largest
+    if afterDuplicate<=largest { return 68 }
+    st.now+=1;quic.receivePath(st.subject,authenticatedFrame(st.peer,st.subject,old,crypto.fromHex("0100000000")),0,st.now)
+    if st.subject.spaces[2].largest!=afterDuplicate || stockSignature(st.subject)!=before { return 68 }
+    result=stockUseCheck(st,2,3,4,"replacement spare first use did not supply the next wire CID");if result!=0 { return result }
+    print("unused-spare retirement, duplicate retirement and retired-destination discard preserved exact replacement ordering");return 0
+}
+function stockRetireOrder(st: CidStock): Integer {
+    stockRetire(st,stockId(st.subject,1),0)
+    let result=stockCheck(st,2,3,"retirement plus first use emitted more or fewer than one replacement");if result!=0 { return result }
+    let before=stockSignature(st.subject)
+    stockRetire(st,stockId(st.subject,1),0)
+    if !stockDrain(st) || stockSignature(st.subject)!=before { return 68 }
+    result=stockUseCheck(st,2,3,4,"later use after retirement had no fresh wire spare");if result!=0 { return result }
+    print("frame retirement supplied one replacement before first-use bookkeeping, without a duplicate refill");return 0
+}
+function stockLimit2(st: CidStock): Integer {
+    let first=stockUseCheck(st,1,2,2,"peer limit2 exceeded on first use");if first!=0 { return first }
+    for turn in 0..16 {
+        let next=st.subject.nextLocalSequence;let current=stockId(st.subject,next-1);let retired=st.subject.localIds[0].sequence
+        stockRetire(st,current,retired)
+        let result=stockCheck(st,2,next+1,"limit2 retirement did not restore exactly two live IDs");if result!=0 { return result }
+        result=stockUseCheck(st,next,2,next+1,"limit2 newest use over-issued");if result!=0 { return result }
+    }
+    print("peer limit2 allowed no extra live CID and sixteen retire-use rounds retained exactly two");return 0
+}
+function stockLimit3(st: CidStock): Integer {
+    let first=stockFirstUse(st);if first!=0 { return first }
+    first=stockUseCheck(st,2,3,3,"peer limit3 exceeded while full");if first!=0 { return first }
+    stockRetire(st,stockId(st.subject,2),0)
+    let result=stockCheck(st,3,4,"limit3 retirement did not restore one spare");if result!=0 { return result }
+    print("peer limit3 capped first-use growth and restored one spare after retirement");return 0
+}
+function stockCap(st: CidStock): Integer {
+    for sequence in 1..8 {
+        let count=min(8,sequence+2)
+        let result=stockUseCheck(st,sequence,count,count,"newest use did not follow bounded live inventory");if result!=0 { return result }
+    }
+    for turn in 0..16 {
+        let next=st.subject.nextLocalSequence;let current=stockId(st.subject,next-1);let retired=st.subject.localIds[0].sequence
+        stockRetire(st,current,retired)
+        let result=stockCheck(st,8,next+1,"full inventory retirement did not restore one spare");if result!=0 { return result }
+        result=stockUseCheck(st,next,8,next+1,"live cap8 exceeded by newest use");if result!=0 { return result }
+    }
+    print("authenticated peer limit "+Text(st.limit)+" respected local cap8 through sixteen retire-use rounds");return 0
+}
+function stockSpoof(st: CidStock): Integer {
+    let before=stockSignature(st.subject);let largest=st.subject.spaces[2].largest;let failed=st.subject.failedAuthentication
+    let data=authenticatedFrame(st.peer,st.subject,stockId(st.subject,1),crypto.fromHex("0100000000"))
+    data[data.length-1]=data[data.length-1]^1
+    st.now+=1;quic.receivePath(st.subject,data,0,st.now)
+    let unknown=Bytes(8)
+    for candidate in 0..9 { unknown[0]=candidate;if !quic.ownsConnectionId(st.subject,unknown) { break } }
+    if quic.ownsConnectionId(st.subject,unknown) { return 65 }
+    stockReceive(st,unknown,crypto.fromHex("0100000000"))
+    st.now+=1;quic.receivePath(st.subject,data.slice(0,8),0,st.now)
+    if st.subject.spaces[2].largest!=largest || st.subject.failedAuthentication!=failed+1 || stockSignature(st.subject)!=before { return 68 }
+    stockReceive(st,st.subject.local,crypto.fromHex("0100000000"))
+    if stockCheck(st,2,2,"spoof generated a local CID")!=0 || stockSignature(st.subject)!=before { return 66 }
+    print("bad-tag, unknown-CID and truncated packets issued no CID; original route still accepted real traffic");return 0
+}
+function stockDiscardedRoute(st: CidStock): Integer {
+    let before=stockSignature(st.subject);let largest=st.subject.spaces[2].largest
+    let packet=authenticatedFrame(st.peer,st.subject,stockId(st.subject,1),crypto.fromHex("0100000000"))
+    st.now+=1;quic.receivePath(st.subject,packet,99,st.now)
+    if st.subject.spaces[2].largest!=largest || stockSignature(st.subject)!=before || stockCheck(st,2,2,"discarded route generated a CID")!=0 { return 68 }
+    print("authenticated packet on an unaccepted client route did not consume the unused local CID");return 0
+}
+function stockWrongResponse(st: CidStock): Integer {
+    if !errors.booleanOk(quic.probePath(st.subject,7,st.now)) { return 65 }
+    if !stockDrain(st) { return 67 }
+    let challenge=Bytes();for path in st.subject.paths { if path.id==7 { challenge=path.challenge } }
+    if challenge.length!=8 { return 65 }
+    let before=stockSignature(st.subject);let largest=st.subject.spaces[2].largest
+    let payload=Bytes();payload.add(27);payload.addBytes(challenge)
+    stockReceive(st,stockId(st.subject,1),payload)
+    if st.subject.spaces[2].largest!=largest || stockSignature(st.subject)!=before || stockCheck(st,2,2,"wrong-route response generated a CID")!=0 { return 68 }
+    print("real candidate challenge answered on the wrong route did not consume a spare CID");return 0
+}
+function stockFailure(st: CidStock, mode: Text): Integer {
+    let before=stockSignature(st.subject);let payload=crypto.fromHex("1f00000000");let expected=7
+    if mode=="cid-stock-forbidden-server" { payload=crypto.fromHex("1e00000000");expected=10 }
+    if mode=="cid-stock-close" { payload=crypto.fromHex("1d00000000");expected=0 }
+    if mode=="cid-stock-retire-current" { payload=Bytes();appendInteger(payload,25);appendInteger(payload,1);expected=10 }
+    if mode=="cid-stock-retire-unissued" { payload=Bytes();appendInteger(payload,25);appendInteger(payload,2);expected=10 }
+    while payload.length<5 { payload.add(0) }
+    stockReceive(st,stockId(st.subject,1),payload)
+    if expected==0 { if st.subject.state!=quic.CLOSED || !st.subject.draining { return 68 } }
+    else { if st.subject.state!=quic.FAILED || st.subject.code!=expected { return 68 } }
+    if stockSignature(st.subject)!=before || !stockDrain(st) || st.observed.length!=2 { return 68 }
+    print("failed or closed authenticated CID1 packet preserved inventory; mode "+mode+" code "+Text(st.subject.code));return 0
+}
+function stockStale(st: CidStock): Integer {
+    let held=authenticatedFrame(st.peer,st.subject,stockId(st.subject,1),crypto.fromHex("0100000000"))
+    let header=wire.header(held,0,st.subject.local.length)
+    let decoded=protection.unprotect(st.subject.spaces[2].read,held,header.numberOffset,-1)
+    if !decoded.valid { return 67 }
+    let before=stockSignature(st.subject)
+    // Real packet-number gaps naturally exercise the maintained256-range
+    // retention bound; no receiveFloor or CID-use bookkeeping is overwritten.
+    for turn in 0..260 {
+        st.peer.spaces[2].next+=1
+        stockReceive(st,st.subject.local,crypto.fromHex("0100000000"))
+        if !stockDrain(st) { return 67 }
+    }
+    if st.subject.spaces[2].receiveFloor<=decoded.number { return 65 }
+    st.now+=1;quic.receivePath(st.subject,held,0,st.now)
+    if !stockDrain(st) || stockSignature(st.subject)!=before || st.observed.length!=2 { return 68 }
+    print("real receive-range pruning discarded an old authenticated unused-CID packet without issuing a spare");return 0
+}
+function stockMode(mode: Text): Boolean {
+    for selected in ["cid-stock-single-path","cid-stock-first-use","cid-stock-first-use-server","cid-stock-chain","cid-stock-reorder","cid-stock-retired-spare","cid-stock-retire-order","cid-stock-limit2","cid-stock-limit3","cid-stock-cap8","cid-stock-large-limit","cid-stock-spoof","cid-stock-discarded-route","cid-stock-wrong-response","cid-stock-malformed","cid-stock-forbidden-server","cid-stock-close","cid-stock-retire-current","cid-stock-retire-unissued","cid-stock-stale"] { if mode==selected { return true } }
+    return false
+}
+function stockCase(st: CidStock, mode: Text): Integer {
+    if !st.valid { print("setup failure: authenticated inventory fixture, baseline wire stock or ACK closure failed");return 65 }
+    if mode=="cid-stock-single-path" { return stockSinglePath(st) }
+    if mode=="cid-stock-first-use" || mode=="cid-stock-first-use-server" { return stockFirstUse(st) }
+    if mode=="cid-stock-chain" { return stockChain(st) }
+    if mode=="cid-stock-reorder" { return stockReorder(st) }
+    if mode=="cid-stock-retired-spare" { return stockRetiredSpare(st) }
+    if mode=="cid-stock-retire-order" { return stockRetireOrder(st) }
+    if mode=="cid-stock-limit2" { return stockLimit2(st) }
+    if mode=="cid-stock-limit3" { return stockLimit3(st) }
+    if mode=="cid-stock-cap8" || mode=="cid-stock-large-limit" { return stockCap(st) }
+    if mode=="cid-stock-spoof" { return stockSpoof(st) }
+    if mode=="cid-stock-discarded-route" { return stockDiscardedRoute(st) }
+    if mode=="cid-stock-wrong-response" { return stockWrongResponse(st) }
+    if mode=="cid-stock-stale" { return stockStale(st) }
+    return stockFailure(st,mode)
+}
+
 function main(): Integer {
     let root = readBytesFile(argument(0)); let identity = readBytesFile(argument(1)); let key = readBytesFile(argument(2))
     let client = readBytesFile(argument(3)); let clientKey = readBytesFile(argument(4)); let mode = argument(5)
+    if stockMode(mode) {
+        let limit=8
+        if mode=="cid-stock-limit2" { limit=2 }
+        if mode=="cid-stock-limit3" { limit=3 }
+        if mode=="cid-stock-large-limit" { limit=wire.MAX_VARINT }
+        let serverSubject=mode=="cid-stock-first-use-server" || mode=="cid-stock-forbidden-server"
+        return stockCase(stockPair(root,identity,key,client,clientKey,limit,serverSubject),mode)
+    }
     if mode == "preferred-address" { return preferredAddress(root, identity, key, client, clientKey) }
     if mode == "preferred-validation" || mode == "preferred-disabled" || mode == "preferred-fallback" || mode == "preferred-api" || mode == "preferred-reciprocal" {
         let preferred=preferredPair(root,identity,key,client,clientKey,mode=="preferred-disabled",mode=="preferred-api")

@@ -69,13 +69,17 @@ public record Connection {
     paceCredit: Float; paceAt: Integer; paceNext: Integer
     ackExponent: Integer; idleTimeout: Integer; failedAuthentication: Integer
     activePath: Integer; incomingPath: Integer; paths: List<Path>; outgoingPaths: List<Integer>; peerDisabledMigration: Boolean
+    highestAuthenticatedLocalSequence: Integer
 }
 function contains(values: List<Integer>, value: Integer): Boolean { for item in values { if item == value { return true } }; return false }
 function add(data: Bytes, value: Integer) { data.addBytes(errors.bytesValue(wire.encode(value))) }
 function equal(left: Bytes, right: Bytes): Boolean { return crypto.hex(left) == crypto.hex(right) }
+function localIdSequence(connection: Connection, id: Bytes): Integer {
+    for known in connection.localIds { if equal(known.id, id) { return known.sequence } }
+    return -1
+}
 public function ownsConnectionId(connection: Connection, id: Bytes): Boolean {
-    for known in connection.localIds { if equal(known.id, id) { return true } }
-    return false
+    return localIdSequence(connection,id) >= 0
 }
 // A retired sequence is remembered as bounded merged ranges; retransmissions
 // share one outstanding retirement until one copy is acknowledged.
@@ -223,8 +227,14 @@ function repairRemotePaths(connection: Connection) {
     if active >= 0 { connection.remote = connection.paths[active].remoteId }
 }
 function issueConnectionIds(connection: Connection) {
+    // Keep the initial two-ID stock. Consumption of the newest live ID or
+    // retirement of an unused spare can make room for one bounded replacement.
+    let newest = -1
+    for known in connection.localIds { newest = max(newest,known.sequence) }
+    let limit = min(connection.peerIdLimit,8); let target = min(2,limit)
+    if newest <= connection.highestAuthenticatedLocalSequence { target = min(limit,max(2,connection.localIds.length + 1)) }
     let attempts = 0
-    while connection.localIds.length < min(2, connection.peerIdLimit) {
+    while connection.localIds.length < target {
         if connection.nextLocalSequence > wire.MAX_VARINT || attempts >= 8 { terminate(connection, 1, "connection ID generation exhausted"); return }
         attempts += 1
         let entropy = randomBytes(24)
@@ -295,6 +305,7 @@ function create(entropy: Bytes, original: Bytes, client: Boolean): Connection {
         paceCredit: 12000.0; paceAt: -1; paceNext: -1
         ackExponent: 3; idleTimeout: 45000; failedAuthentication: 0
         activePath: 0; incomingPath: 0; paths: [Path { id: 0; validated: client; eligible: true; challenge: Bytes(); remoteSequence: 0; remoteId: destination; localId: local; intentional: false; deadline: -1; attempts: 0; received: 0; sent: 0 }]; outgoingPaths: []; peerDisabledMigration: false
+        highestAuthenticatedLocalSequence: 0
     }
     if entropy.length < 80 || destination.length < 1 || destination.length > 20 { terminate(result, 1, "invalid QUIC entropy or destination connection ID") }
     return result
@@ -1257,7 +1268,8 @@ public function receivePath(connection: Connection, datagram: Bytes, pathId: Int
         if header.kind == wire.VERSION_NEGOTIATION { negotiateClient(connection,header); return }
         if header.kind == wire.RETRY { retryClient(connection,datagram.slice(at,header.end),header); return }
         if header.kind != wire.ONE_RTT && header.version != connection.version { return }
-        if !ownsConnectionId(connection, header.destination) && !((header.kind == wire.INITIAL || header.kind == wire.ZERO_RTT) && !connection.clientRole && equal(header.destination, connection.initialDestination)) { return }
+        let localSequence = localIdSequence(connection,header.destination)
+        if localSequence < 0 && !((header.kind == wire.INITIAL || header.kind == wire.ZERO_RTT) && !connection.clientRole && equal(header.destination, connection.initialDestination)) { return }
         if !connection.clientRole && header.kind == wire.INITIAL && datagram.length < 1200 { return }
         let level = 2
         if header.kind == wire.INITIAL { level = 0 }
@@ -1386,6 +1398,15 @@ public function receivePath(connection: Connection, datagram: Bytes, pathId: Int
         if level == 2 && packet.number == space.largest { path.localId = header.destination }
         for frame in parsed.frames {
             processFrame(connection, level, frame, header.destination)
+            if connection.state == FAILED || connection.state == CLOSED { return }
+        }
+        // The ownership lookup alone is not evidence of use: authentication,
+        // route/key-phase validation, replay rejection and every frame must pass.
+        // Reuse its sequence before retirement can change the live-ID list.
+        if localSequence > connection.highestAuthenticatedLocalSequence && header.kind == wire.ONE_RTT &&
+           connection.state == ESTABLISHED && connection.confirmed && !connection.closing && !connection.draining {
+            connection.highestAuthenticatedLocalSequence = localSequence
+            issueConnectionIds(connection)
             if connection.state == FAILED || connection.state == CLOSED { return }
         }
         // A key-phase response can itself contain only ACK frames. Confirm
