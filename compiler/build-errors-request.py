@@ -17,6 +17,15 @@ def replace(source, old, new):
 def assemble():
     closure = runpy.run_path(str(ROOT / 'scripts/build-closure-compiler.py'))
     source = closure['assemble']((ROOT / 'compiler/compiler.min').read_text())
+    # Parse the complete native marker before ordinary native ABI validation.
+    # Recovery must be selected before generic Result requests, even when an
+    # earlier imported module contains Result syntax.
+    signature = re.search(r'^function compileTokens\([^\n]*\{\n', source, re.M).group(0)
+    source = replace(source, signature, signature +
+        '    let depthRequest = 0\n'
+        '    while depthRequest + 1 < tokenTexts.length {\n'
+        '        if tokenKinds[depthRequest] == 1 && tokenTexts[depthRequest] == "native" && tokenKinds[depthRequest + 1] == 3 && tokenTexts[depthRequest + 1] == "calldepth" { exit(88) }\n'
+        '        depthRequest = depthRequest + 1\n    }\n')
     signature = re.search(r'^function takeType\([^\n]*\{\n', source, re.M).group(0)
     source = replace(source, signature + '    let name = tokenTexts[cursor[0]]\n',
                      signature + '    let name = tokenTexts[cursor[0]]\n'

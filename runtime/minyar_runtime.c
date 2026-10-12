@@ -207,6 +207,8 @@ void minyar_stack_leave(void) {
     minyar_call_depth--;
 }
 
+#include "minyar_calldepth.h"
+
 static MINYAR_COLD MINYAR_NORETURN void output_error(void) {
     minyar_stop("standard output could not be written.");
 }
