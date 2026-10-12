@@ -19,7 +19,7 @@ Every proposed integration will receive an independent review subagent before th
 
 ## Merged list and gaps closed
 
-- Independent reviews running for shipping, desktop, Windows, collector preservation and neo-db. No new integration merges yet. Existing candidate contains TLS cleanup `6518ef3` and unqualified QUIC CID WIP `8daa72c`.
+- Reviewed desktop history merged at `00b7fd1`; reviewed Windows history at `0d1d12b`/`5978c73`. All three preserve identical source trees and keep every branch. Source fixes remain pending. Existing candidate contains TLS cleanup `6518ef3` and unqualified QUIC CID WIP `8daa72c`.
 - No Phase 2 gaps claimed closed yet. Owning project code has not been changed.
 
 ## Boat and spending
@@ -27,6 +27,7 @@ Every proposed integration will receive an independent review subagent before th
 - W `bx_w8xs3uwb` and Y `bx_y2vp5byg` extended with included credit until 17:27 UTC.
 - Dedicated Linux `bx_q9mdad57` for QUIC and `bx_3uusc6gg` for preserved collector stress created with included credit, six-hour lifetimes.
 - W reserved for neo-db durable I/O qualification; dedicated Linux box reserved for existing QUIC CID WIP qualification; Y reserved for Windows.
+- Dedicated 8-CPU/16-GiB Linux `bx_utb76q3g` allocated through 17:50 UTC for whole-tree/downstream qualification and Boat-generated Mac artifacts; dependency setup only until source freeze.
 - New paid spend: **$0 / $10**. Other projects' existing Boat boxes are not allocated to this programme.
 - No heavy local builds, long local tests, local Windows execution, force pushes or URL opening.
 
