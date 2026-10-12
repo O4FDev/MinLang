@@ -12,6 +12,17 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def dry_run_commands(stdout):
+    """Return `make -np` commands; GNU Make 3.81 prints its banner before them, 4.x after."""
+    lines = stdout.split('# Make data base', 1)[0].splitlines(keepends=True)
+    start = next((index for index, line in enumerate(lines) if line.startswith('# GNU Make')),
+                 len(lines))
+    end = start
+    while end < len(lines) and (lines[end].startswith('#') or not lines[end].strip()):
+        end += 1
+    return ''.join(lines[:start] + lines[end:])
+
+
 class BuildWiring(unittest.TestCase):
 
     def test_bakeoff_stress_is_mandatory_with_bounded_quick_profiles(self):
@@ -39,7 +50,7 @@ class BuildWiring(unittest.TestCase):
             for source in ('tests/managed-graphs-bakeoff.c', 'tests/managed-graphs-runtime.c',
                            'tests/managed-graphs-profiles.py', 'runtime/minyar_runtime.c'):
                 self.assertIn(source, rules.get(target, set()))
-            commands = result.stdout.split('# GNU Make', 1)[0]
+            commands = dry_run_commands(result.stdout)
             selected = [line for line in commands.splitlines()
                         if 'python3 tests/managed-graphs-profiles.py' in line]
             self.assertEqual(selected, [
@@ -377,7 +388,7 @@ class BuildWiring(unittest.TestCase):
                 for aggregate in aggregates:
                     self.assertIn(target, rules.get(aggregate, set()), aggregate)
                 self.assertTrue(inputs <= rules.get(target, set()))
-                commands = result.stdout.split('# GNU Make', 1)[0]
+                commands = dry_run_commands(result.stdout)
                 self.assertEqual(commands.count('python3 tests/cycle-progress-observability.py'), 1)
                 self.assertEqual(commands.count('python3 tests/cycle-progress-observability-harness.py'), 1)
                 self.assertIn('MINYAR_TEST_CLANG="retained-clang"', commands)
@@ -476,7 +487,7 @@ class BuildWiring(unittest.TestCase):
                              'check-quic-rfc-sanitize', 'check-sanitize'):
                     self.assertIn(target, rules.get(gate, set()), gate)
                 self.assertTrue(inputs <= rules.get(target, set()))
-                commands = result.stdout.split('# GNU Make', 1)[0]
+                commands = dry_run_commands(result.stdout)
                 self.assertEqual(commands.count('python3 -E tests/quic-amplification-ledger.py'), 1)
                 self.assertIn('--artifacts "$artifacts/run"', commands)
                 self.assertIn((ROOT / 'build/quic-ledger.').as_posix(),
@@ -557,7 +568,7 @@ class BuildWiring(unittest.TestCase):
                 for gate in ('check-quic-rfc','check-quic-rfc-sanitize'):
                     self.assertIn(helper,rules.get(gate,set()))
                 self.assertTrue(inputs<=rules.get(helper,set()))
-                commands=result.stdout.split('# GNU Make',1)[0]
+                commands=dry_run_commands(result.stdout)
                 self.assertEqual(commands.count('python3 tests/quic-protocol-artifacts.py'),1)
                 self.assertIn('--artifacts "$artifacts/run"',commands)
                 self.assertIn((ROOT/'build/quic-protocol-artifacts.').as_posix(),commands.replace('\\','/'))
@@ -630,7 +641,7 @@ class BuildWiring(unittest.TestCase):
                     self.assertIn(sanitize, rules.get(gate, set()), gate)
                 for target in (native, sanitize):
                     self.assertTrue(frontends | inputs <= rules.get(target, set()), target)
-                commands = result.stdout.split('# GNU Make', 1)[0]
+                commands = dry_run_commands(result.stdout)
                 self.assertEqual(commands.count('python3 tests/quic-rfc.py'), 2)
                 self.assertEqual(commands.count('--optimization both'), 2)
                 self.assertEqual(commands.count('--sanitize'), 1)
@@ -733,7 +744,7 @@ class BuildWiring(unittest.TestCase):
                 for gate in ('check', 'check-portable', 'check-sanitize'):
                     self.assertIn('check-generated-llvm-sanitizer', rules.get(gate,set()), gate)
                 self.assertTrue(expected <= rules.get('check-generated-llvm-sanitizer',set()))
-                commands = result.stdout.split('# GNU Make',1)[0]
+                commands = dry_run_commands(result.stdout)
                 self.assertIn('python3 tests/generated-llvm-sanitizer.py', commands)
                 command = next(line for line in commands.splitlines()
                                if 'python3 tests/generated-llvm-sanitizer.py' in line)
@@ -958,7 +969,7 @@ class BuildWiring(unittest.TestCase):
                                                 'tests/regressions.py', 'build/minyar-runtime.o'}
                                     <= rules[target], target)
                 self.assertTrue(stage3 <= rules[native])
-                commands = result.stdout.split('# GNU Make', 1)[0]
+                commands = dry_run_commands(result.stdout)
                 self.assertEqual(commands.count('python3 tests/parallel-signatures.py;'), 2)
                 self.assertIn('for frontend in minyarc minyarc-callbacks minyarc-errors;', commands)
                 self.assertIn('for frontend in minyarc-sanitize minyarc-callbacks-sanitize minyarc-errors-sanitize;', commands)
@@ -1055,7 +1066,7 @@ class BuildWiring(unittest.TestCase):
                     self.assertIn('tests/peer-edge-relay.py', rules.get(target, set()))
                     if 'lifetime' in target:
                         self.assertIn('tests/peer-edge-relay-lifetime.py', rules[target])
-                commands = result.stdout.split('# GNU Make', 1)[0]
+                commands = dry_run_commands(result.stdout)
                 self.assertEqual(commands.count('"/selected-pinned/python"'), 6)
                 self.assertEqual(commands.count('mktemp -d "'), 6)
                 self.assertEqual(commands.count('--sanitize'), 3)
@@ -1125,7 +1136,7 @@ class BuildWiring(unittest.TestCase):
                     self.assertTrue({'tests/quic-ack.py', 'tests/quic-ack.min',
                                      'tests/tls-local.py', 'build/minyarc'}
                                     <= rules.get(target, set()), target)
-                commands = result.stdout.split('# GNU Make', 1)[0]
+                commands = dry_run_commands(result.stdout)
                 self.assertEqual(commands.count('tests/quic-ack.py'), 2)
                 self.assertEqual(commands.count('--optimization both'), 2)
                 self.assertEqual(commands.count('--sanitize'), 1)
@@ -1213,7 +1224,7 @@ class BuildWiring(unittest.TestCase):
                 for target in (native, sanitize):
                     self.assertTrue({'tests/quic-pto.py', 'tests/quic-pto.min', 'build/minyarc'}
                                     <= rules.get(target, set()), target)
-                commands = result.stdout.split('# GNU Make', 1)[0]
+                commands = dry_run_commands(result.stdout)
                 self.assertEqual(commands.count('tests/quic-pto.py'), 3)
                 for level in ('0', '1', '2'):
                     self.assertEqual(commands.count('--optimization ' + level), 1)
@@ -1292,7 +1303,7 @@ class BuildWiring(unittest.TestCase):
                     self.assertTrue(fixtures <= rules.get(target, set()), target)
                 self.assertIn('build/minyarc-errors', rules[native])
                 self.assertIn('build/minyarc-errors-sanitize', rules[sanitize])
-                commands = result.stdout.split('# GNU Make', 1)[0]
+                commands = dry_run_commands(result.stdout)
                 self.assertEqual(commands.count('tests/cycle-registration.py'), 2)
                 self.assertEqual(commands.count('--sanitize'), 1)
                 self.assertNotIn('--nodes', commands)
@@ -1377,7 +1388,7 @@ class BuildWiring(unittest.TestCase):
             for target in both:
                 self.assertIn('tests/cycle-registry-growth.c', rules.get(target, set()), target)
                 self.assertIn('tests/cycle-additive.c', rules.get(target, set()), target)
-            commands = result.stdout.split('# GNU Make', 1)[0]
+            commands = dry_run_commands(result.stdout)
             self.assertEqual(commands.count('tests/cycle-additive.py'), 2)
             self.assertEqual(commands.count('--fixture cycle-registry-growth.c'), 2)
             self.assertEqual(commands.count('--sanitize'), 1)
@@ -1620,7 +1631,7 @@ class BuildWiring(unittest.TestCase):
                     match = re.match(r'^([\w./-]+):\s*(.*)$', line)
                     if match:
                         rules.setdefault(match[1], set()).update(match[2].split())
-                commands = result.stdout.split('# GNU Make', 1)[0]
+                commands = dry_run_commands(result.stdout)
                 supported = host == 'Linux' and operating_system != 'Windows_NT'
                 for aggregate in aggregates:
                     if supported:
@@ -1860,7 +1871,7 @@ class BuildWiring(unittest.TestCase):
                 if isinstance(getattr(sys.flags, name), (int, bool))})
             version_flags.safe_path = True
             with patch.object(checker.sys, 'flags', version_flags), \
-                    patch.object(checker.sys, 'pycache_prefix', folder), \
+                    patch.object(checker.sys, 'pycache_prefix', os.path.realpath(folder)), \
                     patch.object(checker.sys, 'dont_write_bytecode', True), \
                     patch.object(checker.importlib.metadata, 'version', return_value='0'):
                 with self.assertRaisesRegex(ValueError, 'PyYAML version differs'):
@@ -1879,7 +1890,7 @@ class BuildWiring(unittest.TestCase):
                 checker.require_supported_python()
         with tempfile.TemporaryDirectory(prefix='controls wheel byte proof ') as folder:
             import base64
-            root = Path(folder)
+            root = Path(folder).resolve()
             module = root/'yaml/__init__.py'
             module.parent.mkdir()
             module.write_bytes(b'retained module fixture\n')
@@ -1937,7 +1948,7 @@ class BuildWiring(unittest.TestCase):
                              {'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull,
                               'GIT_NO_REPLACE_OBJECTS': '1', 'GIT_TERMINAL_PROMPT': '0'})
             with tempfile.TemporaryDirectory(prefix='adapter launch routing ') as folder:
-                root = Path(folder)
+                root = Path(folder).resolve()
                 repository = root/'trusted-repository'
                 repository.mkdir()
                 selections = []
@@ -2000,7 +2011,7 @@ class BuildWiring(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='valid altered adapter bytecode ') as folder:
             import base64
             import py_compile
-            root = Path(folder)
+            root = Path(folder).resolve()
             module = root/'yaml/__init__.py'
             module.parent.mkdir()
             module.write_text("__version__='6.0.2'\nSOURCE_MARKER='verified source'\n")
@@ -2184,7 +2195,7 @@ class BuildWiring(unittest.TestCase):
 
         def verify(candidate):
             with tempfile.TemporaryDirectory(prefix='minyar-os-invalidation-') as temporary:
-                directory = Path(temporary)
+                directory = Path(temporary).resolve()
                 (directory / 'os').mkdir()
                 (directory / 'library').mkdir()
                 (directory / 'os/Makefile').write_text(candidate)
