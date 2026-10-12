@@ -123,11 +123,11 @@ static MINYAR_COLD MINYAR_NORETURN void minyar_stop(const char *message);
 #ifndef MINYAR_STACK_RESERVE_BYTES
 #define MINYAR_STACK_RESERVE_BYTES (128u * 1024u)
 #endif
-static size_t minyar_call_depth;
-static uintptr_t minyar_stack_low, minyar_stack_high;
-static int minyar_stack_bounds_ready;
+static MINYAR_THREAD_LOCAL size_t minyar_call_depth;
+static MINYAR_THREAD_LOCAL uintptr_t minyar_stack_low, minyar_stack_high;
+static MINYAR_THREAD_LOCAL int minyar_stack_bounds_ready;
 /* The depth at which minyar_stack_enter takes its exact path. */
-static size_t minyar_depth_limit;
+static MINYAR_THREAD_LOCAL size_t minyar_depth_limit;
 
 /* Keep first-use platform queries out of the frequent guard. This also lets
  * LTO inline the check without importing pthread setup into every caller. */
@@ -667,7 +667,7 @@ static unsigned int decode_character(const unsigned char *bytes, long long remai
 enum { TEXT_INDEX_STRIDE = 64 };
 
 #ifdef MINYAR_RC_TESTING
-static size_t text_decode_count;
+static MINYAR_THREAD_LOCAL size_t text_decode_count;
 #endif
 
 static uint64_t text_index_load(const MinyarText *text, long long entry) {
@@ -973,10 +973,32 @@ static MINYAR_COLD MinyarText *format_integer_text(long long integer) {
 _Static_assert(MINYAR_INTEGER_TEXT_CACHE_LIMIT >= 0 && MINYAR_INTEGER_TEXT_CACHE_LIMIT <= 32768,
                "Integer Text cache limit must be between 0 and 32768");
 
+#if MINYAR_THREADED
+static MinyarText *integer_text_cached(long long integer, int dispose) {
+    (void)dispose;
+#else
 MinyarText *minyar_integer_text(long long integer) {
+#endif
+#if MINYAR_THREADED && MINYAR_INTEGER_TEXT_CACHE_LIMIT == 0
+    if (dispose) return NULL;
+#endif
 #if MINYAR_INTEGER_TEXT_CACHE_LIMIT > 0
     enum { CACHE_LIMIT = MINYAR_INTEGER_TEXT_CACHE_LIMIT };
-    static MinyarText *integer_cache[CACHE_LIMIT];
+    static MINYAR_THREAD_LOCAL MinyarText *integer_cache[CACHE_LIMIT];
+#if MINYAR_THREADED
+    /* Private cleanup mode after the domain's final owning frame. */
+    if (dispose) {
+        for (size_t i = 0; i < CACHE_LIMIT; i++) {
+            MinyarText *text = integer_cache[i];
+            if (!text) continue;
+            integer_cache[i] = NULL;
+            ((RcObject *)text - 1)->ownership = 8 | RC_TEXT;
+            RC_ACCOUNT(rc_immortal_object_count--);
+            minyar_rc_release(text);
+        }
+        return NULL;
+    }
+#endif
     if ((unsigned long long)integer < CACHE_LIMIT) {
         if (!integer_cache[integer]) {
             integer_cache[integer] = format_integer_text(integer);
@@ -990,6 +1012,12 @@ MinyarText *minyar_integer_text(long long integer) {
 #endif
     return format_integer_text(integer);
 }
+
+#if MINYAR_THREADED
+MinyarText *minyar_integer_text(long long integer) {
+    return integer_text_cached(integer, 0);
+}
+#endif
 
 static long long encode_character(int character, unsigned char *bytes) {
     long long length;
@@ -1031,11 +1059,11 @@ static MINYAR_COLD MinyarText *encode_character_text(int character) {
 }
 
 MinyarText *minyar_character_text(int character) {
-    static struct {
+    static MINYAR_THREAD_LOCAL struct {
         size_t ownership;
         MinyarText text;
     } ascii_texts[128];
-    static unsigned char ascii_bytes[128][2];
+    static MINYAR_THREAD_LOCAL unsigned char ascii_bytes[128][2];
     if ((unsigned int)character < 128) {
         MinyarText *text = &ascii_texts[character].text;
         if (text->byte_length == 0) {
@@ -1247,3 +1275,10 @@ void minyar_write_text_parts(const MinyarText *path_text, const MinyarList *part
 #include "minyar_numbers.h"
 
 #include "minyar_bytes.h"
+
+#if MINYAR_THREADED
+#include "minyar_thread_domain.h"
+#include "minyar_thread_buffers.h"
+#include "minyar_threads.h"
+#include "minyar_thread_os.h"
+#endif

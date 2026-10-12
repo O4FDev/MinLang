@@ -35,19 +35,19 @@ enum { RC_CYCLE_IDLE, RC_CYCLE_ROOTS, RC_CYCLE_MARK, RC_CYCLE_SWEEP };
 #define MINYAR_CYCLE_LOCAL_PROOFS 1
 /* The unknown prefix is scanned; completed certificates wait on a separate
  * list. Cancellation joins both lists in constant time, before any reuse. */
-static RcCycle *rc_cycle_head, *rc_cycle_tail, *rc_cycle_known_head, *rc_cycle_known_tail;
-static RcCycle *rc_cycle_cohort, *rc_cycle_cursor, *rc_cycle_last;
-static unsigned rc_cycle_local_job, rc_cycle_local_requested, rc_cycle_local_generation;
+static MINYAR_THREAD_LOCAL RcCycle *rc_cycle_head, *rc_cycle_tail, *rc_cycle_known_head, *rc_cycle_known_tail;
+static MINYAR_THREAD_LOCAL RcCycle *rc_cycle_cohort, *rc_cycle_cursor, *rc_cycle_last;
+static MINYAR_THREAD_LOCAL unsigned rc_cycle_local_job, rc_cycle_local_requested, rc_cycle_local_generation;
 /* An unchanged unknown cohort may also have one temporary external witness.
  * Its tags use the opposite certificate bit, never the completed anchor's
  * namespace. Every registry/owning-edge change cancels this temporary proof. */
-static RcCycle *rc_cycle_temporary_anchor;
-static unsigned rc_cycle_temporary_valid, rc_cycle_temporary_build, rc_cycle_temporary_covered;
+static MINYAR_THREAD_LOCAL RcCycle *rc_cycle_temporary_anchor;
+static MINYAR_THREAD_LOCAL unsigned rc_cycle_temporary_valid, rc_cycle_temporary_build, rc_cycle_temporary_covered;
 
-static RcCycle *rc_cycle_gray_head, *rc_cycle_gray_tail, *rc_cycle_active;
-static size_t rc_cycle_index, rc_cycle_limit;
-static unsigned rc_cycle_generation, rc_cycle_phase, rc_cycle_requested;
-static unsigned rc_cycle_pending, rc_cycle_inside;
+static MINYAR_THREAD_LOCAL RcCycle *rc_cycle_gray_head, *rc_cycle_gray_tail, *rc_cycle_active;
+static MINYAR_THREAD_LOCAL size_t rc_cycle_index, rc_cycle_limit;
+static MINYAR_THREAD_LOCAL unsigned rc_cycle_generation, rc_cycle_phase, rc_cycle_requested;
+static MINYAR_THREAD_LOCAL unsigned rc_cycle_pending, rc_cycle_inside;
 static inline void rc_cycle_temporary_changed(void) {
     if (!rc_cycle_inside)
         rc_cycle_temporary_valid = rc_cycle_temporary_build = 0;
@@ -55,21 +55,21 @@ static inline void rc_cycle_temporary_changed(void) {
 /* A proof certifies only nodes reached from this still-external anchor.
  * Any owning traced-edge change invalidates it before the store. A failed
  * temporary anchor advances selection through the finite registry. */
-static RcCycle *rc_cycle_proof_anchor, *rc_cycle_proof_retry;
-static unsigned rc_cycle_proof_valid, rc_cycle_proof_build, rc_cycle_proof_generation;
-static unsigned rc_cycle_proof_preserve, rc_cycle_proof_after_retry, rc_cycle_rescan;
+static MINYAR_THREAD_LOCAL RcCycle *rc_cycle_proof_anchor, *rc_cycle_proof_retry;
+static MINYAR_THREAD_LOCAL unsigned rc_cycle_proof_valid, rc_cycle_proof_build, rc_cycle_proof_generation;
+static MINYAR_THREAD_LOCAL unsigned rc_cycle_proof_preserve, rc_cycle_proof_after_retry, rc_cycle_rescan;
 
 /* Completed finite cohorts let reactors distinguish old snapshot work
  * from requests created by their own transient borrowed owners. */
-static size_t rc_cycle_completed;
+static MINYAR_THREAD_LOCAL size_t rc_cycle_completed;
 /* Nonzero exactly in the roots and mark phases, when barriers shade. Hot
  * ownership paths test this one global before touching any object metadata. */
-static unsigned rc_cycle_shading;
+static MINYAR_THREAD_LOCAL unsigned rc_cycle_shading;
 /* Set by the first RC_TRACED allocation; until then no cycle job can exist. */
-static unsigned rc_cycle_present;
+static MINYAR_THREAD_LOCAL unsigned rc_cycle_present;
 /* Raw native clients conservatively trace. Generated main opts into complete
  * compiler mutation hints, before constructing any graph. */
-static unsigned rc_cycle_enabled = 1;
+static MINYAR_THREAD_LOCAL unsigned rc_cycle_enabled = 1;
 void minyar_rc_cycle_policy(void) {
     if (!rc_cycle_head && !rc_cycle_known_head && !rc_cycle_pending)
         rc_cycle_enabled = 0;
@@ -84,7 +84,7 @@ void minyar_rc_enable_cycles(void) {
 #endif
 }
 #ifdef MINYAR_RC_TESTING
-static size_t rc_cycle_units, rc_cycle_epochs, rc_cycle_cached_requests;
+static MINYAR_THREAD_LOCAL size_t rc_cycle_units, rc_cycle_epochs, rc_cycle_cached_requests;
 #endif
 static MINYAR_NOINLINE void rc_cycle_unit(void);
 #ifndef MINYAR_BOUNDED_RC

@@ -28,6 +28,10 @@ void minyar_rc_release(void *value) { (void)value; }
 enum { RC_TEXT = 1, RC_LIST = 2, RC_REFERENCES = 3, RC_RECORD = 4, RC_SCALAR_RECORD = 5, RC_REFERENCES_IMMORTAL = 6 };
 typedef struct { size_t ownership; } RcObject;
 typedef struct { size_t size; } RcData;
+#if MINYAR_THREADED
+/* Private fieldless shell. Kind zero is reserved only in this profile. */
+typedef struct { void *control; void (*release)(void *); } RcThreadLeaf;
+#endif
 _Static_assert(sizeof(RcObject) == 8, "LLVM literal ownership header must match");
 
 #ifdef MINYAR_BOUNDED_RC
@@ -53,13 +57,13 @@ typedef struct RcFrame {
     size_t temporary_count, temporary_capacity;
 #endif
 } RcFrame;
-static RcFrame *rc_frames, *rc_free_frames;
+static MINYAR_THREAD_LOCAL RcFrame *rc_frames, *rc_free_frames;
 #ifdef MINYAR_BOUNDED_RC
-static size_t rc_pending_count;
+static MINYAR_THREAD_LOCAL size_t rc_pending_count;
 #ifdef MINYAR_RC_TESTING
-static size_t rc_bounded_last_work;
+static MINYAR_THREAD_LOCAL size_t rc_bounded_last_work;
 #endif
-static size_t rc_bounded_cached_frame_bytes;
+static MINYAR_THREAD_LOCAL size_t rc_bounded_cached_frame_bytes;
 #ifndef MINYAR_FRAME_CACHE_BYTES
 #define MINYAR_FRAME_CACHE_BYTES (256u * 1024u)
 #endif
@@ -73,11 +77,11 @@ static void *rc_bounded_pending_local_value(RcFrame *frame, size_t position) {
     return rc_bounded_local_value(frame, rc_bounded_local_indices(frame)[position]);
 }
 #else
-static RcObject **rc_pending;
-static size_t rc_pending_count, rc_pending_capacity;
+static MINYAR_THREAD_LOCAL RcObject **rc_pending;
+static MINYAR_THREAD_LOCAL size_t rc_pending_count, rc_pending_capacity;
 #endif
 #ifdef MINYAR_RC_TESTING
-static size_t rc_object_count, rc_bytes, rc_immortal_object_count;
+static MINYAR_THREAD_LOCAL size_t rc_object_count, rc_bytes, rc_immortal_object_count;
 #define RC_ACCOUNT(expression) ((void)(expression))
 #else
 #define RC_ACCOUNT(expression) ((void)0)
@@ -180,6 +184,13 @@ static void rc_drop(void *value) {
     MinyarText *text_backing = NULL;
     /* Leaves can be destroyed immediately, without recursion or queue space.
      * This matters for wide lists of small records and text fragments. */
+#if MINYAR_THREADED
+    if (kind == 0) {
+        RcThreadLeaf *leaf = (RcThreadLeaf *)(object + 1);
+        leaf->release(leaf->control);
+        RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(*leaf));
+    } else
+#endif
     if (kind == RC_TEXT) {
         MinyarText *text = (MinyarText *)(object + 1);
         text_backing = text->backing;

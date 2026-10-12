@@ -3,7 +3,7 @@
  * fixed-capacity bookkeeping contract. Neither backend changes object headers. */
 #ifdef MINYAR_SYSTEM_HEAP
 #ifdef MINYAR_RC_TESTING
-static size_t rc_heap_allocation_count;
+static MINYAR_THREAD_LOCAL size_t rc_heap_allocation_count;
 #endif
 static inline void *rc_heap_allocate(size_t bytes) {
     void *pointer = malloc(bytes);

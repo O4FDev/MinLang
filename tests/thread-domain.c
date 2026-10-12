@@ -1,0 +1,59 @@
+#define MINYAR_RC_TESTING 1
+#ifdef MINYAR_TEST_CYCLES
+#include "../build/thread-cycle-engine.c"
+#else
+#include "../runtime/minyar_runtime.c"
+#endif
+#include <assert.h>
+#include <stdatomic.h>
+#include "thread-test-host.h"
+static _Atomic unsigned destroyed;
+static void release_leaf(void *p) { assert(p == &destroyed); atomic_fetch_add(&destroyed, 1); }
+static void exercise(void) {
+    rc_thread_domain_init();
+    minyar_rc_enter(2);
+    RcThreadLeaf *leaf = rc_allocate_object(sizeof(*leaf), 0);
+    *leaf = (RcThreadLeaf){&destroyed, release_leaf};
+    minyar_rc_local_take(0, leaf);
+    minyar_rc_retain(leaf);
+    minyar_rc_release(leaf);
+    MinyarText *literal = minyar_thread_text_literal(&(MinyarText){
+        .bytes = (const unsigned char *)"λ🐈", .byte_length = 6});
+    assert(minyar_text_length(literal) == 2);
+    MinyarText *fresh = minyar_thread_text_literal(literal);
+    MinyarText *suffix = minyar_thread_text_literal(literal);
+    assert(minyar_text_length(fresh) == 2);
+    MinyarText *grown = minyar_join_text_take_left(fresh, suffix);
+    assert(minyar_text_length(grown) == 4);
+    assert(minyar_text_character_at(grown, 2) == 0x3bb);
+    minyar_rc_release(suffix);
+    minyar_rc_release(grown);
+    minyar_rc_local_take(1, literal);
+    MinyarText *integer = minyar_integer_text(7);
+    minyar_rc_release(integer);
+    (void)minyar_character_text('x');
+#ifdef MINYAR_TEST_CYCLES
+    MinyarRecord *cycle = minyar_record_new_traced(2);
+    minyar_record_set_reference_traced(cycle, 0, (long long)(uintptr_t)cycle);
+    minyar_record_set_reference_traced(cycle, 1, (long long)(uintptr_t)leaf);
+    minyar_rc_release(cycle);
+#endif
+    minyar_rc_leave();
+    /* Force cached immutable headers to remain in bounded retirement debt.
+     * This must be drained before cache destruction, even with poll budget1. */
+    minyar_rc_enter(128);
+    integer = minyar_integer_text(12345);
+    for (long long i = 0; i < 128; i++) minyar_rc_local(i, integer);
+    minyar_rc_release(integer);
+    minyar_rc_leave();
+    rc_thread_domain_dispose();
+    assert(rc_object_count == 0 && rc_bytes == 0);
+}
+static void worker(void *p) { (void)p; exercise(); }
+int main(void) {
+    RcTestThread threads[4];
+    for (unsigned i = 0; i < 4; i++) threads[i] = rc_test_start(worker, NULL);
+    for (unsigned i = 0; i < 4; i++) rc_test_join(threads[i]);
+    assert(atomic_load(&destroyed) == 4);
+    puts("thread domain TLS, leaf destruction and cleanup passed");
+}
