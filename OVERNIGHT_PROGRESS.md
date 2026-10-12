@@ -31,7 +31,7 @@ Owning project code is unchanged. No Phase 2 gap is claimed closed. Every produc
 
 | Stack | State / next gate |
 | --- | --- |
-| Windows `397362d` → `dda5bd1` | R1 path-with-spaces finding accepted and fixed separately. Actual Boat spaced-path RED, path/mutation GREEN, original22-command SAN/public/cache GREEN and adjacent-DLL loader proof. New independent R2 review running; not merged. |
+| Windows `397362d` → `dda5bd1` | New independent R2 APPROVE, R1 path-with-spaces finding closed; merged at `9a23041`. Actual Boat spaced-path RED, path/mutation GREEN, original22-command SAN/public/cache GREEN and adjacent-DLL loader proof retained. Full combined qualification remains pending. |
 | OS `dd71690` → `4fcfaac` → `0fb334e` | Real fail-closed TLS API/provider wiring passed native/SAN/LSan vectors and13580 classifier cases/mode. R1 requested SAN dispatch and provider dependencies; separate third correction passed test-first regressions, full wiring, original TLS native/SAN and both x86/ARM image builds. Exact stack imported by sole Y owner for original native/SAN TLS gates; new independent R2 review follows. Not merged. |
 | Workstream requests | None offered for merge. Early unreviewed WS1 selector/progress and WS4 files commit, plus WS3/WS5 drafts, remain in owning branches outside Phase 1. |
 
