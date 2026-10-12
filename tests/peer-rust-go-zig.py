@@ -1087,7 +1087,9 @@ show(values)
             self.rejects(source, 'Integer literal is outside the supported range')
 
     def test_decimal_leading_zero_and_malformed_tokens(self):
-        self.executes("print(000123)\nprint(01)\nprint(''')\n", "123\n1\n'\n")
+        for literal in ('000123', '01'):
+            self.rejects('print(' + literal + ')\n', 'decimal Integer literals cannot have a leading zero; use 0o for octal')
+        self.executes("print(0o173)\nprint(0o1)\nprint(''')\n", "123\n1\n'\n")
         for token in ('0e.0', '0E.0', '12e.0', '12E.0', '0xp0', '0xP0'):
             self.rejects('let value = ' + token + '\n', 'Minyar stopped:')
 

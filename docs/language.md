@@ -21,7 +21,9 @@ List positions, with the same type rules as the operator itself.
 Arithmetic overflow and division by zero stop the program with an error.
 Integer literals outside this range are rejected.
 The minimum value is spelled `-9223372036854775808`. Hexadecimal literals such
-as `0xFF` are also Integers.
+as `0xFF` and octal literals such as `0o755` are also Integers. Decimal Integer
+literals cannot have a leading zero: `0755` is a compile error, so file modes
+cannot silently become decimal. Use `0o755` (493) or plain decimal `493`.
 
 `Float` is an IEEE 754 double-precision number. A Float literal has digits on
 both sides of its point, with an optional exponent: `1.0`, `0.25`, `6.02e23`.
@@ -63,6 +65,9 @@ Boolean values into numbers. A NaN Float is unequal to everything, itself
 included.
 
 ## Constants
+
+Function declarations cannot use a [reserved built-in name](reserved-names.md).
+The compiler identifies the colliding name and suggests a rename.
 
 `constant` declares a named literal value that every function in the module
 can use. It is a declaration, like a function or record, and `public` exports

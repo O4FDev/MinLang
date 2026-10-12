@@ -34,7 +34,7 @@ class CompilerHardening(CompilerTestCase):
         for name in ('print', 'Text'):
             with self.subTest(name=name):
                 self.rejects(f'function {name}(): Integer {{ return 7 }}\n',
-                             "'" + name + "' is a built-in function; choose another name")
+                             "function '" + name + "' uses a reserved built-in name")
 
     def test_executable_entry_is_not_an_ordinary_callable_function(self):
         for source in ('function main(): Integer { return main() }\n',

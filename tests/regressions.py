@@ -249,8 +249,8 @@ print(slice(1))
         self.assertEqual(executed.stderr, b'Minyar stopped: standard output could not be written.\n')
 
     def test_integer_boundaries(self):
-        self.executes('print(9223372036854775807)\nprint(-9223372036854775808)\nprint(0000042)\n', '9223372036854775807\n-9223372036854775808\n42\n')
-        for literal in ('9223372036854775808', '18446744073709551616', '-9223372036854775809', '0009223372036854775808'):
+        self.executes('print(9223372036854775807)\nprint(-9223372036854775808)\nprint(42)\n', '9223372036854775807\n-9223372036854775808\n42\n')
+        for literal in ('9223372036854775808', '18446744073709551616', '-9223372036854775809'):
             with self.subTest(literal=literal):
                 self.rejects(f'print({literal})\n', 'Integer literal is outside the supported range')
 

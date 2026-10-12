@@ -382,9 +382,9 @@ class StatementNesting(CompilerTestCase):
         keys = [2 * i for i in range(1365)] + [maximum]
         values = [17 * i + 9 for i in range(1365)] + [maximum]
         source = 'function sparse(x: Integer): Integer {\n'
-        # Leading zeros must normalize before ordering and global emission.
+        # Octal spelling must normalize before ordering and global emission.
         for key, value in zip(keys, values):
-            source += f'if x == 00{key} {{ /* pure case */ return 00{value} }} else {{\n'
+            source += f'if x == 0o{key:o} {{ /* pure case */ return 0o{value:o} }} else {{\n'
         source += f'return {maximum - 1}\n' + '}\n' * (len(keys) + 1)
         queries = keys + [-9223372036854775808, -1, 1, 2729, 2730, maximum - 1]
         expected = values + [maximum - 1] * 6

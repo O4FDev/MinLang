@@ -15,7 +15,7 @@ MODULE_COMPILER = Path(os.environ.get('MINYAR_TEST_MODULE_COMPILER', ROOT / 'bui
 class ListLiterals(CompilerTestCase):
     def test_fresh_storage_signed_limits_and_nested_owners(self):
         self.executes('''record Box { values: List<Integer> }
-function make(): List<Integer> { return [-9223372036854775808, -0002, 0, 9223372036854775807] }
+function make(): List<Integer> { return [-9223372036854775808, -0o2, 0, 9223372036854775807] }
 let first = make()
 let alias = first
 let second = make()
