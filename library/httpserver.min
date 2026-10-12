@@ -1,0 +1,602 @@
+// Bounded, single-owner HTTP/1.1 server over the portable event loop.
+// No callbacks: poll/advance returns requests; respond consumes a private ticket.
+// Request transfer codings are deliberately rejected (501 + close). See docs/http-server.md.
+use "net" as net
+use "eventloop" as loop
+use "errors" as errors
+
+public record Limits {
+    maxConnections: Integer
+    maxHeaderBytes: Integer
+    maxHeaders: Integer
+    maxBodyBytes: Integer
+    maxResponseBytes: Integer
+    maxRequestsPerConnection: Integer
+    acceptBudget: Integer
+    ioBudget: Integer
+    maxEvents: Integer
+    idleMilliseconds: Integer
+    headerMilliseconds: Integer
+    bodyMilliseconds: Integer
+    applicationMilliseconds: Integer
+    writeMilliseconds: Integer
+}
+public function defaults(): Limits {
+    return Limits { maxConnections: 1024; maxHeaderBytes: 16384; maxHeaders: 64;
+        maxBodyBytes: 1048576; maxResponseBytes: 16777216; maxRequestsPerConnection: 1000;
+        acceptBudget: 32; ioBudget: 65536; maxEvents: 256; idleMilliseconds: 30000;
+        headerMilliseconds: 5000; bodyMilliseconds: 10000; applicationMilliseconds: 30000;
+        writeMilliseconds: 10000 }
+}
+public record Header { name: Text; value: Text }
+public record Request {
+    method: Text
+    target: Text
+    headers: List<Header>
+    body: Bytes
+    keepAlive: Boolean
+    private owner: Integer
+    private slot: Integer
+    private ticket: Integer
+}
+public record Response { status: Integer; headers: List<Header>; body: Bytes }
+public function response(status: Integer, contentType: Text, body: Bytes): Response {
+    return Response { status: status; headers: [Header { name: "content-type"; value: contentType }]; body: body }
+}
+public function requestId(request: Request): Integer { return request.ticket }
+public function header(request: Request, name: Text): Text {
+    let lower = lowercase(Bytes(name))
+    for field in request.headers { if field.name == lower { return field.value } }
+    return ""
+}
+
+record Head {
+    status: Integer
+    method: Text
+    target: Text
+    headers: List<Header>
+    length: Integer
+    keepAlive: Boolean
+}
+record Connection {
+    active: Boolean
+    socket: Integer
+    registration: Integer
+    // 0 reading, 1 application (unwatched), 2 writing.
+    phase: Integer
+    input: Bytes
+    scan: Integer
+    headerBytes: Integer
+    parsed: Head
+    deadline: Integer
+    started: Boolean
+    needsParse: Boolean
+    eof: Boolean
+    ticket: Integer
+    count: Integer
+    output: Bytes
+    body: Bytes
+    sent: Integer
+    bodySent: Integer
+    closing: Boolean
+}
+public record Server {
+    private handle: Integer
+    private listener: Integer
+    private listenerRegistration: Integer
+    private limits: Limits
+    private connections: List<Connection>
+    private freeSlots: List<Integer>
+    private freeCount: Integer
+    private active: Integer
+    private nextTicket: Integer
+    private closed: Boolean
+    private error: errors.Error
+}
+public record Batch { private requests: List<Request>; private error: errors.Error }
+public function requests(batch: Batch): List<Request> { return batch.requests }
+public function batchError(batch: Batch): errors.Error { return batch.error }
+public function serverError(server: Server): errors.Error { return server.error }
+public function ok(server: Server): Boolean { return !server.closed && !errors.isError(server.error) }
+public function port(server: Server): Integer {
+    if server.closed { return -1 }
+    return net.localPort(server.listener)
+}
+public function loopHandle(server: Server): Integer { return server.handle }
+public function connectionCount(server: Server): Integer { return server.active }
+public function slotCount(server: Server): Integer { return server.connections.length }
+
+function durationValid(value: Integer): Boolean { return value > 0 && value <= 86400000 }
+function validLimits(limits: Limits): Boolean {
+    return limits.maxConnections > 0 && limits.maxConnections <= 65536 &&
+        limits.maxHeaderBytes >= 256 && limits.maxHeaderBytes <= 1048576 &&
+        limits.maxHeaders > 0 && limits.maxHeaders <= 4096 &&
+        limits.maxBodyBytes >= 0 && limits.maxBodyBytes <= 16777216 &&
+        limits.maxResponseBytes >= 0 && limits.maxResponseBytes <= 16777216 &&
+        limits.maxRequestsPerConnection > 0 && limits.maxRequestsPerConnection <= 1000000 &&
+        limits.acceptBudget > 0 && limits.acceptBudget <= 1024 &&
+        limits.ioBudget > 0 && limits.ioBudget <= 1048576 &&
+        limits.maxEvents > 0 && limits.maxEvents <= 4096 &&
+        durationValid(limits.idleMilliseconds) && durationValid(limits.headerMilliseconds) &&
+        durationValid(limits.bodyMilliseconds) && durationValid(limits.applicationMilliseconds) &&
+        durationValid(limits.writeMilliseconds)
+}
+public function listen(host: Text, port: Integer, limits: Limits): Server {
+    // Snapshot mutable Limits so callers cannot raise bounds mid-connection.
+    let copied = Limits { maxConnections: limits.maxConnections; maxHeaderBytes: limits.maxHeaderBytes;
+        maxHeaders: limits.maxHeaders; maxBodyBytes: limits.maxBodyBytes; maxResponseBytes: limits.maxResponseBytes;
+        maxRequestsPerConnection: limits.maxRequestsPerConnection; acceptBudget: limits.acceptBudget;
+        ioBudget: limits.ioBudget; maxEvents: limits.maxEvents; idleMilliseconds: limits.idleMilliseconds;
+        headerMilliseconds: limits.headerMilliseconds; bodyMilliseconds: limits.bodyMilliseconds;
+        applicationMilliseconds: limits.applicationMilliseconds; writeMilliseconds: limits.writeMilliseconds }
+    let server = Server { handle: -1; listener: -1; listenerRegistration: -1; limits: copied;
+        connections: []; freeSlots: []; freeCount: 0; active: 0; nextTicket: 1; closed: false; error: errors.none() }
+    if !validLimits(copied) {
+        server.error = errors.make(errors.invalidDataCode(), 0, "invalid HTTP server limits")
+        server.closed = true
+        return server
+    }
+    let created = loop.create()
+    if !errors.integerOk(created) {
+        server.error = errors.integerError(created); server.closed = true; return server
+    }
+    server.handle = errors.integerValue(created)
+    server.listener = net.listen(host, port, copied.maxConnections)
+    if server.listener < 0 {
+        server.error = errors.make(errors.systemCode(), net.lastErrorCode(), "HTTP listen failed")
+        close(server); return server
+    }
+    let watched = loop.watch(server.handle, server.listener, loop.readableInterest(), -1)
+    if !errors.integerOk(watched) {
+        server.error = errors.integerError(watched); close(server); return server
+    }
+    server.listenerRegistration = errors.integerValue(watched)
+    return server
+}
+
+function badHead(status: Integer): Head {
+    return Head { status: status; method: ""; target: ""; headers: []; length: 0; keepAlive: false }
+}
+function newConnection(socket: Integer, deadline: Integer): Connection {
+    return Connection { active: true; socket: socket; registration: -1; phase: 0; input: Bytes();
+        scan: 0; headerBytes: 0; parsed: badHead(0); deadline: deadline; started: false;
+        needsParse: false; eof: false; ticket: 0; count: 0; output: Bytes(); body: Bytes();
+        sent: 0; bodySent: 0; closing: false }
+}
+function removeWatch(server: Server, connection: Connection) {
+    if connection.registration >= 0 {
+        loop.remove(server.handle, connection.registration)
+        connection.registration = -1
+    }
+}
+function drop(server: Server, slot: Integer) {
+    let connection = server.connections[slot]
+    if !connection.active { return }
+    removeWatch(server, connection)
+    net.close(connection.socket)
+    connection.active = false
+    connection.ticket = 0
+    connection.input = Bytes(); connection.output = Bytes(); connection.body = Bytes()
+    connection.parsed = badHead(0)
+    server.active -= 1
+    if server.freeCount < server.freeSlots.length { server.freeSlots[server.freeCount] = slot }
+    else { server.freeSlots.add(slot) }
+    server.freeCount += 1
+    // Unwatch the full listener (rather than interest=0) to avoid HUP spin.
+    if !server.closed && server.listenerRegistration < 0 {
+        let watched = loop.watch(server.handle, server.listener, loop.readableInterest(), -1)
+        if errors.integerOk(watched) { server.listenerRegistration = errors.integerValue(watched) }
+        else { server.error = errors.integerError(watched) }
+    }
+}
+public function close(server: Server) {
+    if server.closed { return }
+    server.closed = true
+    for slot in 0..server.connections.length { drop(server, slot) }
+    if server.listenerRegistration >= 0 {
+        loop.remove(server.handle, server.listenerRegistration); server.listenerRegistration = -1
+    }
+    if server.listener >= 0 { net.close(server.listener); server.listener = -1 }
+    if server.handle >= 0 { loop.close(server.handle) }
+}
+function watch(server: Server, slot: Integer, interest: Integer): Boolean {
+    let connection = server.connections[slot]
+    if connection.registration >= 0 {
+        if errors.booleanOk(loop.update(server.handle, connection.registration, interest, slot)) { return true }
+    } else {
+        let watched = loop.watch(server.handle, connection.socket, interest, slot)
+        if errors.integerOk(watched) { connection.registration = errors.integerValue(watched); return true }
+    }
+    drop(server, slot)
+    return false
+}
+function acceptReady(server: Server, now: Integer) {
+    for turn in 0..server.limits.acceptBudget {
+        if server.active >= server.limits.maxConnections { break }
+        let socket = net.accept(server.listener)
+        if socket < 0 { break }
+        net.setNoDelay(socket, true)
+        let connection = newConnection(socket, now + server.limits.idleMilliseconds)
+        let slot = server.connections.length
+        if server.freeCount > 0 {
+            server.freeCount -= 1; slot = server.freeSlots[server.freeCount]; server.connections[slot] = connection
+        } else { server.connections.add(connection) }
+        server.active += 1
+        watch(server, slot, loop.readableInterest())
+    }
+    if server.active >= server.limits.maxConnections && server.listenerRegistration >= 0 {
+        loop.remove(server.handle, server.listenerRegistration); server.listenerRegistration = -1
+    }
+}
+
+function tokenByte(byte: Integer): Boolean {
+    return byte >= 48 && byte <= 57 || byte >= 65 && byte <= 90 || byte >= 97 && byte <= 122 ||
+        byte == 33 || byte == 35 || byte == 36 || byte == 37 || byte == 38 || byte == 39 ||
+        byte == 42 || byte == 43 || byte == 45 || byte == 46 || byte == 94 || byte == 95 ||
+        byte == 96 || byte == 124 || byte == 126
+}
+function lowercase(data: Bytes): Text {
+    let result = Bytes()
+    for byte in data {
+        let lower = byte
+        if byte >= 65 && byte <= 90 { lower += 32 }
+        result.add(lower)
+    }
+    return Text(result)
+}
+function findByte(data: Bytes, byte: Integer, start: Integer, end: Integer): Integer {
+    for at in start..end { if data[at] == byte { return at } }
+    return -1
+}
+function decimal(data: Bytes, start: Integer, end: Integer, maximum: Integer): Integer {
+    if start >= end { return -1 }
+    let value = 0
+    for at in start..end {
+        let byte = data[at]
+        if byte < 48 || byte > 57 { return -1 }
+        if value > maximum / 10 || value == maximum / 10 && byte - 48 > maximum % 10 { return -2 }
+        value = value * 10 + byte - 48
+    }
+    return value
+}
+function validHost(data: Bytes): Boolean {
+    if data.length == 0 { return false }
+    let hostEnd = data.length
+    let portAt = -1
+    if data[0] == 91 {
+        let end = findByte(data, 93, 1, data.length)
+        if end < 0 || net.ipVersion(Text(data.slice(1, end))) != 6 { return false }
+        if end + 1 < data.length {
+            if data[end + 1] != 58 { return false }
+            portAt = end + 2
+        }
+    } else {
+        let colon = findByte(data, 58, 0, data.length)
+        if colon >= 0 { hostEnd = colon; portAt = colon + 1 }
+        if hostEnd == 0 { return false }
+        for at in 0..hostEnd {
+            let byte = data[at]
+            if !(byte >= 48 && byte <= 57 || byte >= 65 && byte <= 90 || byte >= 97 && byte <= 122 ||
+                byte == 45 || byte == 46) { return false }
+        }
+    }
+    if portAt >= 0 { if decimal(data, portAt, data.length, 65535) <= 0 { return false } }
+    return true
+}
+function connectionClose(data: Bytes): Integer {
+    let start = 0
+    let closing = 0
+    while start < data.length {
+        let end = findByte(data, 44, start, data.length)
+        if end < 0 { end = data.length }
+        let from = start
+        let to = end
+        while from < to && (data[from] == 32 || data[from] == 9) { from += 1 }
+        while to > from && (data[to - 1] == 32 || data[to - 1] == 9) { to -= 1 }
+        if from == to { return -1 }
+        for at in from..to { if !tokenByte(data[at]) { return -1 } }
+        if lowercase(data.slice(from, to)) == "close" { closing = 1 }
+        start = end + 1
+        if start == data.length { return -1 }
+    }
+    if data.length == 0 { return -1 }
+    return closing
+}
+function parseHead(data: Bytes, end: Integer, limits: Limits): Head {
+    let lineEnd = findByte(data, 13, 0, end)
+    if lineEnd < 0 { return badHead(400) }
+    let first = findByte(data, 32, 0, lineEnd)
+    if first <= 0 { return badHead(400) }
+    let second = findByte(data, 32, first + 1, lineEnd)
+    if second <= first + 1 { return badHead(400) }
+    for at in 0..first { if !tokenByte(data[at]) { return badHead(400) } }
+    for at in first + 1..second { if data[at] <= 32 || data[at] >= 127 || data[at] == 35 { return badHead(400) } }
+    if Text(data.slice(second + 1, lineEnd)) != "HTTP/1.1" { return badHead(400) }
+    let method = Text(data.slice(0, first))
+    let target = Text(data.slice(first + 1, second))
+    if method == "CONNECT" { return badHead(405) }
+    if data[first + 1] != 47 && !(target == "*" && method == "OPTIONS") { return badHead(400) }
+    let fields: List<Header> = []
+    let hostCount = 0
+    let lengthCount = 0
+    let transferCount = 0
+    let length = 0
+    let framingStatus = 0
+    let closing = false
+    let expectation = false
+    let upgrade = false
+    let start = lineEnd + 2
+    while start < end - 2 {
+        let stop = findByte(data, 13, start, end)
+        if stop < 0 { return badHead(400) }
+        let colon = findByte(data, 58, start, stop)
+        if colon <= start { return badHead(400) }
+        for at in start..colon { if !tokenByte(data[at]) { return badHead(400) } }
+        let from = colon + 1
+        let to = stop
+        while from < to && (data[from] == 32 || data[from] == 9) { from += 1 }
+        while to > from && (data[to - 1] == 32 || data[to - 1] == 9) { to -= 1 }
+        let name = lowercase(data.slice(start, colon))
+        let raw = data.slice(from, to)
+        let value = Text(raw)
+        if fields.length >= limits.maxHeaders { return badHead(431) }
+        fields.add(Header { name: name; value: value })
+        if name == "host" { hostCount += 1; if !validHost(raw) { return badHead(400) } }
+        if name == "content-length" {
+            lengthCount += 1
+            length = decimal(data, from, to, limits.maxBodyBytes)
+            if length == -1 { framingStatus = 400 }
+            if length == -2 && framingStatus == 0 { framingStatus = 413 }
+        }
+        if name == "transfer-encoding" { transferCount += 1 }
+        if name == "expect" { expectation = true }
+        if name == "upgrade" { upgrade = true }
+        if name == "connection" {
+            let result = connectionClose(raw)
+            if result < 0 { return badHead(400) }
+            if result == 1 { closing = true }
+        }
+        start = stop + 2
+    }
+    if hostCount != 1 || lengthCount > 1 || transferCount > 1 || transferCount > 0 && lengthCount > 0 {
+        return badHead(400)
+    }
+    if framingStatus != 0 { return badHead(framingStatus) }
+    if transferCount > 0 { return badHead(501) }
+    if expectation { return badHead(417) }
+    if upgrade { return badHead(501) }
+    return Head { status: 0; method: method; target: target; headers: fields; length: length; keepAlive: !closing }
+}
+
+function reason(status: Integer): Text {
+    if status == 200 { return "OK" }
+    if status == 204 { return "No Content" }
+    if status == 205 { return "Reset Content" }
+    if status == 304 { return "Not Modified" }
+    if status == 400 { return "Bad Request" }
+    if status == 404 { return "Not Found" }
+    if status == 405 { return "Method Not Allowed" }
+    if status == 408 { return "Request Timeout" }
+    if status == 413 { return "Content Too Large" }
+    if status == 417 { return "Expectation Failed" }
+    if status == 431 { return "Request Header Fields Too Large" }
+    if status == 501 { return "Not Implemented" }
+    if status == 502 { return "Bad Gateway" }
+    return "Response"
+}
+function flush(server: Server, slot: Integer, now: Integer) {
+    let connection = server.connections[slot]
+    let budget = server.limits.ioBudget
+    while budget > 0 {
+        let data = connection.output
+        let offset = connection.sent
+        let writingHead = true
+        if offset == data.length { data = connection.body; offset = connection.bodySent; writingHead = false }
+        if offset == data.length { break }
+        let count = net.writeRange(connection.socket, data, offset, min(budget, data.length - offset))
+        if count == -1 { return }
+        if count <= 0 { drop(server, slot); return }
+        if writingHead { connection.sent += count } else { connection.bodySent += count }
+        budget -= count
+    }
+    if connection.sent != connection.output.length || connection.bodySent != connection.body.length { return }
+    connection.output.clear(); connection.body = Bytes()
+    if connection.closing { drop(server, slot); return }
+    connection.phase = 0
+    connection.started = connection.input.length > 0
+    connection.needsParse = connection.started
+    connection.scan = 0; connection.headerBytes = 0; connection.parsed = badHead(0)
+    connection.deadline = now + server.limits.idleMilliseconds
+    if connection.started { connection.deadline = now + server.limits.headerMilliseconds }
+    watch(server, slot, loop.readableInterest())
+}
+function startResponse(server: Server, slot: Integer, response: Response, head: Boolean, closing: Boolean): Boolean {
+    let connection = server.connections[slot]
+    let output = Bytes("HTTP/1.1 " + Text(response.status) + " " + reason(response.status) + "\r\n")
+    for field in response.headers { output.addBytes(Bytes(field.name + ": " + field.value + "\r\n")) }
+    let length = response.body.length
+    if response.status == 205 { length = 0 }
+    if response.status != 204 { output.addBytes(Bytes("content-length: " + Text(length) + "\r\n")) }
+    if closing { output.addBytes(Bytes("connection: close\r\n\r\n")) }
+    else { output.addBytes(Bytes("connection: keep-alive\r\n\r\n")) }
+    connection.output = output
+    connection.body = response.body
+    if head || response.status == 204 || response.status == 205 || response.status == 304 { connection.body = Bytes() }
+    connection.sent = 0; connection.bodySent = 0; connection.phase = 2; connection.ticket = 0
+    connection.closing = closing
+    let now = net.monotonicMilliseconds()
+    connection.deadline = now + server.limits.writeMilliseconds
+    if !watch(server, slot, loop.writableInterest()) { return false }
+    flush(server, slot, now)
+    return true
+}
+function reject(server: Server, slot: Integer, status: Integer) {
+    let connection = server.connections[slot]
+    let head = false
+    if connection.input.length >= 5 {
+        head = connection.input[0] == 72 && connection.input[1] == 69 && connection.input[2] == 65 &&
+            connection.input[3] == 68 && connection.input[4] == 32
+    }
+    connection.input.clear(); connection.parsed = badHead(0)
+    startResponse(server, slot, response(status, "text/plain", Bytes(reason(status))), head, true)
+}
+function parseReady(server: Server, slot: Integer, now: Integer, ready: List<Request>) {
+    let connection = server.connections[slot]
+    connection.needsParse = false
+    let data = connection.input
+    if connection.headerBytes == 0 {
+        let at = connection.scan
+        while at < data.length {
+            let byte = data[at]
+            // Validate all header octets before Text conversion, including CRLF.
+            if byte == 13 {
+                if at + 1 == data.length { break }
+                if data[at + 1] != 10 { reject(server, slot, 400); return }
+            } else {
+                if byte == 10 {
+                    if at == 0 || data[at - 1] != 13 { reject(server, slot, 400); return }
+                } else {
+                    if (byte < 32 && byte != 9) || byte >= 127 { reject(server, slot, 400); return }
+                }
+            }
+            if at >= 3 && byte == 10 && data[at - 1] == 13 && data[at - 2] == 10 && data[at - 3] == 13 {
+                connection.headerBytes = at + 1; break
+            }
+            at += 1
+            if at >= server.limits.maxHeaderBytes { reject(server, slot, 431); return }
+        }
+        connection.scan = at
+        if connection.headerBytes == 0 {
+            if connection.eof { reject(server, slot, 400) }
+            return
+        }
+        connection.parsed = parseHead(data, connection.headerBytes, server.limits)
+        if connection.parsed.status != 0 { reject(server, slot, connection.parsed.status); return }
+        connection.deadline = now + server.limits.bodyMilliseconds
+    }
+    let total = connection.headerBytes + connection.parsed.length
+    if data.length < total {
+        if connection.eof { reject(server, slot, 400) }
+        return
+    }
+    let body = Bytes()
+    if connection.parsed.length > 0 { body = data.slice(connection.headerBytes, total) }
+    let parsed = connection.parsed
+    if total == data.length { connection.input.clear() }
+    else { connection.input = data.slice(total, data.length) }
+    if server.nextTicket == 9223372036854775807 { drop(server, slot); return }
+    connection.ticket = server.nextTicket; server.nextTicket += 1
+    connection.count += 1
+    connection.phase = 1
+    connection.deadline = now + server.limits.applicationMilliseconds
+    removeWatch(server, connection)
+    ready.add(Request { method: parsed.method; target: parsed.target; headers: parsed.headers;
+        body: body; keepAlive: parsed.keepAlive; owner: server.handle; slot: slot; ticket: connection.ticket })
+}
+function readReady(server: Server, slot: Integer, now: Integer, ready: List<Request>) {
+    let connection = server.connections[slot]
+    let capacity = server.limits.maxHeaderBytes + server.limits.maxBodyBytes
+    // A single bounded native read per readiness turn; cached headers avoid rescans.
+    let count = net.readInto(connection.socket, connection.input,
+        min(server.limits.ioBudget, capacity - connection.input.length))
+    if count == -1 { return }
+    if count == -2 { drop(server, slot); return }
+    if count == 0 {
+        connection.eof = true
+        if connection.input.length == 0 { drop(server, slot); return }
+    }
+    if !connection.started {
+        connection.started = true; connection.deadline = now + server.limits.headerMilliseconds
+    }
+    parseReady(server, slot, now, ready)
+}
+public function requestActive(server: Server, request: Request): Boolean {
+    if server.closed || request.owner != server.handle || request.slot < 0 || request.slot >= server.connections.length { return false }
+    let connection = server.connections[request.slot]
+    return connection.active && connection.phase == 1 && connection.ticket == request.ticket &&
+        net.monotonicMilliseconds() < connection.deadline
+}
+public function abandon(server: Server, request: Request) {
+    if requestActive(server, request) { drop(server, request.slot) }
+}
+function validResponse(response: Response, limits: Limits): Boolean {
+    if response.status < 200 || response.status > 599 || response.body.length > limits.maxResponseBytes ||
+        response.headers.length > limits.maxHeaders { return false }
+    let bytes = 128
+    for field in response.headers {
+        let name = Bytes(field.name)
+        if name.length == 0 { return false }
+        for byte in name { if !tokenByte(byte) { return false } }
+        let lower = lowercase(name)
+        if lower == "content-length" || lower == "transfer-encoding" || lower == "connection" || lower == "trailer" || lower == "upgrade" { return false }
+        for byte in Bytes(field.value) { if (byte < 32 && byte != 9) || byte >= 127 { return false } }
+        let size = field.name.byteLength + field.value.byteLength + 4
+        if size > limits.maxHeaderBytes - bytes { return false }
+        bytes += size
+    }
+    return true
+}
+public function respond(server: Server, request: Request, response: Response): Boolean {
+    if !requestActive(server, request) || !validResponse(response, server.limits) { return false }
+    let connection = server.connections[request.slot]
+    let closing = !connection.parsed.keepAlive || connection.count >= server.limits.maxRequestsPerConnection ||
+        connection.eof && connection.input.length == 0
+    return startResponse(server, request.slot, response, connection.parsed.method == "HEAD", closing)
+}
+
+// Clamp a shared loop's wait to the earliest deadline and buffered pipeline work.
+public function waitMilliseconds(server: Server, requested: Integer): Integer {
+    if server.closed { return 0 }
+    let now = net.monotonicMilliseconds()
+    let timeout = requested
+    if timeout < 0 { timeout = 86400000 }
+    for connection in server.connections {
+        if connection.active {
+            if connection.needsParse { return 0 }
+            timeout = min(timeout, max(0, connection.deadline - now))
+        }
+    }
+    return timeout
+}
+public function advance(server: Server, batch: loop.Batch): Batch {
+    let ready: List<Request> = []
+    if server.closed { return Batch { requests: ready; error: server.error } }
+    if errors.isError(loop.batchError(batch)) {
+        server.error = loop.batchError(batch); close(server)
+        return Batch { requests: ready; error: server.error }
+    }
+    let now = net.monotonicMilliseconds()
+    // Each connection gets at most one buffered dispatch per batch.
+    for slot in 0..server.connections.length {
+        let connection = server.connections[slot]
+        if connection.active {
+            if now >= connection.deadline {
+                // Application/write deadlines close directly; a parser timeout sends one finite reply.
+                if connection.phase == 0 && connection.started { reject(server, slot, 408) }
+                else { drop(server, slot) }
+            } else {
+                if connection.phase == 0 && connection.needsParse { parseReady(server, slot, now, ready) }
+            }
+        }
+    }
+    for event in loop.events(batch) {
+        if event.registration == server.listenerRegistration && event.token == -1 {
+            acceptReady(server, now)
+        } else {
+            // Negative tokens other than the listener belong to the caller.
+            let slot = event.token
+            if slot >= 0 && slot < server.connections.length {
+                let connection = server.connections[slot]
+                if connection.active && event.registration == connection.registration {
+                    if connection.phase == 0 { readReady(server, slot, now, ready) }
+                    else { if connection.phase == 2 { flush(server, slot, now) } }
+                }
+            }
+        }
+    }
+    return Batch { requests: ready; error: server.error }
+}
+public function poll(server: Server, timeoutMilliseconds: Integer): Batch {
+    if server.closed { return Batch { requests: []; error: server.error } }
+    return advance(server, loop.wait(server.handle, waitMilliseconds(server, timeoutMilliseconds), server.limits.maxEvents))
+}
