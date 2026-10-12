@@ -37,6 +37,11 @@ print("Callback<Integer> function(value: Integer) {}")
         self.assertNotIn('minyar-cycle-runtime', llvm.read_text())
         self.assertNotIn('minyar-callback-runtime', llvm.read_text())
 
+    def test_modifier_names_as_bindings_do_not_enable_frontends(self):
+        llvm = self.executes('let parallel = 1\nlet thread = 2\nprint(parallel + thread)\n', '3\n')
+        self.assertNotIn('minyar-thread-runtime', llvm.read_text())
+        self.assertNotIn('minyar-parallel:', llvm.read_text())
+
     def test_incomplete_typed_headers_remain_source_errors(self):
         for source in ('let callback = function(value) {}\n',
                        'let callback = function(1: Integer) {}\n',
