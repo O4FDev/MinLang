@@ -40,7 +40,7 @@ class CompilerHardening(CompilerTestCase):
         self.executes('print(0o7)\nprint(0o17)\nprint(0o777)\nprint(0o755)\n'
                       'print(0o777777777777777777777)\n', '7\n15\n511\n493\n9223372036854775807\n')
 
-    def test_closure_dependent_list_signatures_and_comparators_request_the_closure_frontend(self):
+    def test_closure_dependent_list_signatures_and_comparators_compile_in_the_primary_frontend(self):
         for source in ('function make(): Callback<List<Integer>> { fail("unused") }\n',
                        'function make(): Callback<Integer, List<Text>> { fail("unused") }\n',
                        'let values = [3, 1, 2]\n'
@@ -49,10 +49,10 @@ class CompilerHardening(CompilerTestCase):
                        'let sorted = values.sortedBy(function(a: Integer, b: Integer): Integer { return a - b })\n'):
             with self.subTest(source=source):
                 result, llvm = self.compile(source)
-                self.assertEqual(result.returncode, 86, result.stderr)
+                self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertFalse(result.stdout)
                 self.assertFalse(result.stderr)
-                self.assertFalse(llvm.exists())
+                self.assertTrue(llvm.exists())
 
     def test_reassignable_record_parameters_are_not_scalar_records(self):
         self.executes('record Point { x: Integer; y: Integer }\n'

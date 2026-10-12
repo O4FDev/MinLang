@@ -5,7 +5,7 @@ from regressions import CompilerTestCase
 
 
 class FeatureDispatch(CompilerTestCase):
-    def test_valid_feature_headers_request_the_extended_frontend(self):
+    def test_valid_feature_headers_compile_in_the_primary_frontend(self):
         sources = (
             'function make(): Callback<Nothing> { fail("unused") }\n',
             'function make(): Callback<Integer, Text, Integer> { fail("unused") }\n',
@@ -21,10 +21,10 @@ class FeatureDispatch(CompilerTestCase):
         for source in sources:
             with self.subTest(source=source):
                 result, llvm = self.compile(source)
-                self.assertEqual(result.returncode, 86, result.stderr)
+                self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertFalse(result.stdout)
                 self.assertFalse(result.stderr)
-                self.assertFalse(llvm.exists())
+                self.assertTrue(llvm.exists())
 
     def test_feature_looking_text_and_ordinary_record_name_do_not_dispatch(self):
         result, llvm = self.compile('''record Callback { value: Integer }

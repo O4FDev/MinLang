@@ -15,9 +15,10 @@ class CallDepthLauncher(CompilerTestCase):
     def request(self, source, status):
         llvm = self.directory / 'request.ll'
         result = self.evidence.run([str(PROBE), str(source), str(llvm), '--library', str(ROOT / 'library')],
-                                  timeout=30, phase='recovery-request')
-        self.assertEqual((result.returncode, result.stdout, result.stderr), (status, b'', b''))
-        self.assertFalse(llvm.exists())
+                                  timeout=30, phase='compile-recovery')
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b'', b''))
+        self.assertTrue(llvm.exists())
+        self.assertEqual('; minyar-calldepth-policy:' in llvm.read_text(), status == 88)
 
     def launch(self, source, expected, options=()):
         environment = os.environ.copy()
@@ -32,12 +33,7 @@ class CallDepthLauncher(CompilerTestCase):
                                      str(source), '-o', str(executable)], cwd=ROOT, env=environment,
                                     timeout=180, phase='recovery-public-launcher')
         self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
-        self.assertIn(b'build/minyarc-calldepth', compiled.stderr)
-        if options:
-            selected = compiled.stderr.split(b'+ selected_status=0\n', 1)
-            self.assertEqual(len(selected), 2, compiled.stderr)
-            self.assertNotIn(b'build/minyar-module-build ', selected[1],
-                             'recovery must compile the flattened graph without module reuse')
+        self.assertIn(b'build/minyarc', compiled.stderr)
         executed = self.evidence.run([str(executable)], timeout=30, phase='recovery-execute')
         self.assertEqual((executed.returncode, executed.stdout, executed.stderr), (0, expected, b''))
 

@@ -254,7 +254,7 @@ print(multiline[1][1])
                     with self.subTest(seed=seed, node=node, depth=depth, mutation=mutation):
                         result, _ = self.compile(source)
                         if cyclic:
-                            self.assertEqual(result.returncode, 86, result.stderr)
+                            self.assertEqual(result.returncode, 0, result.stderr)
                             accepts_managed_graph(self, source)
                         else:
                             self.assertEqual(result.returncode, 0, result.stderr)

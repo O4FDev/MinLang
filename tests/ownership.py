@@ -31,7 +31,7 @@ class Ownership(CompilerTestCase):
                     operation = f'function append(values: List<R{node}>, value: R{node}) {{ values.add(value) }}\n'
                     result, _ = self.compile(source + operation)
                     if reaches[node][node]:
-                        self.assertEqual(result.returncode, 86, result.stderr)
+                        self.assertEqual(result.returncode, 0, result.stderr)
                         accepts_managed_graph(self, source + operation)
                     else:
                         self.assertEqual(result.returncode, 0, result.stderr)

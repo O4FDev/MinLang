@@ -20,8 +20,8 @@ check-smoke: build/minyarc build/minyar-runtime.o
 
 .PHONY: check-memory-contracts check-memory-contracts-harness
 .PHONY: check-foundation-baseline
-check-foundation-baseline:
-	python3 tests/foundation-baseline.py
+check-foundation-baseline: build/minyarc build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --compiler build/minyarc --profile errors
 
 check check-portable: check-foundation-baseline
 

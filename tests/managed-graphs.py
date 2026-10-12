@@ -23,16 +23,6 @@ from cycle_runtime import engine_source
 class ManagedGraphs(CompilerTestCase):
     compiler_arguments = ('--library', str(ROOT / 'library'))
 
-    def compile(self, source):
-        result, llvm = super().compile(source)
-        if result.returncode == 86:
-            default = 'minyarc-callbacks-sanitize' if address_sanitizer_enabled(LINK_FLAGS) else 'minyarc-callbacks'
-            frontend = Path(os.environ.get('MINYAR_CALLBACK_COMPILER', ROOT / 'build' / default))
-            result = self.evidence.run([str(frontend), str(llvm.with_suffix('.min')), str(llvm),
-                                       *self.compiler_arguments], capture_output=True, text=True,
-                                       timeout=30, phase='compile-closure-extension')
-        if result.returncode == 0: prepare_llvm_for_link(llvm, LINK_FLAGS)
-        return result, llvm
 
     def executes(self, source, expected, optimizations=('-O0', '-O2'), status=0, stderr=''):
         result, llvm = self.compile(source)
