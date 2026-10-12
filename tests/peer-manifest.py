@@ -130,8 +130,9 @@ def validate(data, makefile=None):
                 discovered.add(source)
     if set(sources) != discovered:
         raise ValueError('Peer regression suite omitted from catalogue or unknown suite declared')
-    recipe = re.search(r'^check-peer-ownership:[^\n]*\n((?:[\t ].*\n|\n)*)', makefile, re.M)
-    selected = re.findall(r'\b(Peer\w+\.test_\w+)\b', recipe.group(1) if recipe else '')
+    # The gate and its per-suite phony children together hold the selection.
+    recipes = re.findall(r'^check-peer-ownership(?:-[\w-]+)?:[^\n]*\n((?:[\t ].*\n|\n)*)', makefile, re.M)
+    selected = [name for recipe in recipes for name in re.findall(r'\b(Peer\w+\.test_\w+)\b', recipe)]
     if len(selected) != len(set(selected)) or set(selected) != ownership:
         raise ValueError('Ownership Make selection differs from declared methods')
     # Codegen source/oracle pairs are part of the same maintained pilot.
