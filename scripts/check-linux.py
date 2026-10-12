@@ -91,10 +91,7 @@ PEER_GATES = ['check-peer-optimizations', 'check-peer-sanitize']
 QUIC_TARGETS = ['check-quic', 'check-quic-sanitize', 'check-transport-go', 'check-transport-go-sanitize',
                 'check-peer-edge-cids', 'check-peer-edge-cids-sanitize', 'check-peer-edge-relay',
                 'check-peer-edge-relay-sanitize', 'check-peer-edge-relay-lifetime',
-                'check-peer-edge-relay-lifetime-sanitize']
-QUINN_MODES = [('quinn', [], {}), ('quinn-key-update', [], {'MINYAR_QUINN_KEY_UPDATE': '1'}),
-               ('quinn-migration', ['--migration'], {}), ('quinn-resumption', ['--resumption'], {}),
-               ('quinn-early', ['--early'], {})]
+                'check-peer-edge-relay-lifetime-sanitize', 'check-quic-quinn']
 # Scheduling hints only: seconds measured serially on an 8-core Linux host.
 EXPECTED_SECONDS = {
     'check-mutation-score': 215, 'check-calldepth-profiles': 206, 'check-maps-sanitize': 136,
@@ -420,13 +417,6 @@ def main():
                                 '--require', 'runtime-unit-sanitize', '--require', 'memory-profiles-focused'],
                       after=['runtime-unit-sanitize', 'memory-profiles-focused'], tier='sanitize', group='leaks',
                       expected=30))
-        if 'quic' in selected:
-            # Quinn builds once; the five peer runs then share build/interop-quinn read-only.
-            add(Check('quinn-build', ['cargo', 'build', '--locked', '--manifest-path', 'tests/interop/quinn/Cargo.toml',
-                                      '--target-dir', 'build/interop-quinn'], group='quic', expected=90))
-            for label, arguments, extra in QUINN_MODES:
-                add(Check(label, [python, 'tests/quic-quinn.py', *arguments], after=['quinn-build'], extra_env=extra,
-                          goals=['build/minyarc'], group='quic', expected=30))
         if 'formatting' in selected:
             version = re.search(r'^VERSION = "([^"]+)"', (work / 'scripts/format.py').read_text(), re.M).group(1)
             add(Check('formatting', ['sh', '-c', 'set -e; tools=build/format-tools-23; '

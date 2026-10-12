@@ -1083,7 +1083,9 @@ class BuildWiring(unittest.TestCase):
                         self.assertIn('tests/peer-edge-relay-lifetime.py', rules[target])
                 commands = dry_run_commands(result.stdout)
                 self.assertEqual(commands.count('"/selected-pinned/python"'), 6)
-                self.assertEqual(commands.count('mktemp -d "'), 6)
+                # Six evidence directories plus one program cache per relay-lifetime recipe.
+                self.assertEqual(commands.count('mktemp -d "'), 8)
+                self.assertEqual(commands.count('MINYAR_TEST_PROGRAM_CACHE='), 2)
                 self.assertEqual(commands.count('--sanitize'), 3)
                 for mode in ('malformed', 'abrupt'):
                     self.assertEqual(commands.count('--mode ' + mode), 2)

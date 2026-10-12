@@ -31,6 +31,8 @@ ROOT = Path(__file__).resolve().parents[1]
 TIERS = ('full', 'sanitize', 'all')
 # Scheduling hints only: seconds measured serially on an M1 Pro laptop; the longest start first.
 EXPECTED_SECONDS = {
+    'check-peer-regressions-cpp-java-js': 500, 'check-peer-regressions-rust-go-zig': 160,
+    'check-peer-regressions-python-swift-ruby-lua': 130, 'check-peer-regressions-regressions': 100,
     'check-peer-regressions': 905, 'check-maps': 312, 'check-text-basics-models': 125, 'check-build-wiring': 63,
     'check-errors-language-bounded': 63, 'check-managed-graphs-launcher': 60, 'check-errors-review-bounded': 57,
     'check-peer-manifest': 53, 'check-cycle-registration-exposure-sanitize': 47,
