@@ -2020,5 +2020,158 @@ class BuildWiring(unittest.TestCase):
 
 
 
+    def test_os_tlsverify_sanitizer_selects_override_and_complete_directory(self):
+        import json
+        fragment = (ROOT / 'build-support/networking.mk').read_text()
+        with tempfile.TemporaryDirectory(prefix='os sanitizer dispatch ') as temporary:
+            directory = Path(temporary)
+            binaries = directory / 'bin'
+            binaries.mkdir()
+            python = binaries / 'python3'
+            python.write_text('#!' + sys.executable + '\n' +
+                'import json,os,sys\n'
+                'if sys.argv[1:2] == ["tests/os-tlsverify.py"]:\n'
+                ' print(json.dumps({"clang":os.environ.get("MINYAR_CLANG"),'
+                '"path":os.environ["PATH"],"argv":sys.argv[1:]}));sys.exit(0)\n'
+                'if os.environ.get("OS_TLS_PROBE_MSYS") and sys.argv[1:2] == ["-c"]:\n'
+                ' sys.path.insert(0,"tools");import host_paths\n'
+                ' host_paths.platform.system=lambda:"MSYS_NT-10.0"\n'
+                ' code=sys.argv[2];sys.argv=["-c",*sys.argv[3:]]\n'
+                ' exec(code,{"__name__":"__main__"});sys.exit(0)\n'
+                'os.execv(sys.executable,[sys.executable,*sys.argv[1:]])\n')
+            python.chmod(0o755)
+            converter = binaries / 'cygpath'
+            converter.write_text('#!' + sys.executable + '\n' +
+                'import json,os,sys\n'
+                'assert len(sys.argv)==3 and sys.argv[1]=="-u",sys.argv\n'
+                'print(json.loads(os.environ["OS_TLS_PROBE_TRANSLATIONS"])[sys.argv[2]])\n')
+            converter.chmod(0o755)
+            environment = dict(os.environ, PATH=str(binaries) + os.pathsep + os.environ['PATH'])
+            environment.pop('MAKEFLAGS', None)
+            environment.pop('MINYAR_SANITIZER_CLANG', None)
+            ordinary = str(directory / 'ordinary compiler/bin/clang')
+
+            def verify(candidate, sanitizer, selected_compiler=None, selected_directory=None,
+                       msys=False):
+                self.assertIn('check-sanitize: check-os-tlsverify-sanitize', candidate)
+                sanitizer_rule = next(line for line in candidate.splitlines()
+                                      if line.startswith('check-os-tlsverify-sanitize:'))
+                probe = directory / 'probe.mk'
+                probe.write_text('LLVM_CC := ' + ordinary + '\n'
+                    'MINYAR_SANITIZER_CLANG := ' + sanitizer + '\n'
+                    'LIMITED :=\nSANITIZER_LIMITED :=\n' + candidate +
+                    '\n.PHONY: build/minyarc\nbuild/minyarc:\n\t@:\n')
+                selected_environment = environment.copy()
+                if msys:
+                    selected_environment.update(OS_TLS_PROBE_MSYS='1',
+                        OS_TLS_PROBE_TRANSLATIONS=json.dumps({sanitizer: selected_compiler}))
+                for target, expected_compiler, arguments in (
+                        ('check-os-tlsverify', ordinary, []),
+                        ('check-os-tlsverify-sanitize', selected_compiler or sanitizer or ordinary,
+                         ['--sanitize'])):
+                    result = subprocess.run(['make', '--no-print-directory', '-rR', '-s',
+                        '-f', str(probe), target], cwd=ROOT, env=selected_environment,
+                        capture_output=True, text=True, timeout=15)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    selected = json.loads(result.stdout)
+                    self.assertEqual(selected['clang'], expected_compiler)
+                    self.assertEqual(selected['argv'], ['tests/os-tlsverify.py', *arguments])
+                    expected_path = environment['PATH']
+                    if sanitizer and arguments:
+                        expected_path = (selected_directory or str(Path(sanitizer).parent)) + os.pathsep + expected_path
+                    self.assertEqual(selected['path'], expected_path)
+                if sanitizer:
+                    self.assertIn('tools/host_paths.py', sanitizer_rule)
+
+            for value in ('', str(directory / 'sanitizer/bin/clang'),
+                          str(directory / 'LLVM 23/bin/clang'),
+                          str(directory / "LLVM's 23/bin/clang")):
+                with self.subTest(override=value):
+                    verify(fragment, value)
+            for native, selected, parent in (
+                    ('C:/LLVM 23/bin/clang.exe', '/c/LLVM 23/bin/clang.exe', '/c/LLVM 23/bin'),
+                    (r"C:\LLVM's 23\bin\clang.exe", "/c/LLVM's 23/bin/clang.exe", "/c/LLVM's 23/bin"),
+                    (r'\\server\LLVM 23\bin\clang.exe', '//server/LLVM 23/bin/clang.exe', '//server/LLVM 23/bin')):
+                with self.subTest(msys_native_spelling=native):
+                    verify(fragment, native, selected, parent, msys=True)
+            sanitizer_recipe = next(line for line in fragment.splitlines()
+                                    if 'tests/os-tlsverify.py --sanitize' in line)
+            for replacement in (
+                    sanitizer_recipe.replace('$(OS_TLS_SANITIZER_CLANG)', '$(LLVM_CC)'),
+                    sanitizer_recipe.replace('PATH="$(OS_TLS_SANITIZER_PATH)" ', '')):
+                self.assertNotEqual(replacement, sanitizer_recipe)
+                with self.assertRaises(AssertionError):
+                    verify(fragment.replace(sanitizer_recipe, replacement, 1),
+                           str(directory / 'LLVM 23/bin/clang'))
+            path_rule = next(line for line in fragment.splitlines()
+                             if line.startswith('OS_TLS_SANITIZER_PATH ='))
+            for replacement in ('OS_TLS_SANITIZER_PATH = $(PATH)',
+                    'OS_TLS_SANITIZER_PATH = /wrong/runtime:$(PATH)',
+                    'OS_TLS_SANITIZER_PATH = $(dir $(MINYAR_SANITIZER_CLANG)):$(PATH)'):
+                with self.assertRaises(AssertionError):
+                    verify(fragment.replace(path_rule, replacement, 1),
+                           str(directory / 'LLVM 23/bin/clang'))
+            quote_rule = next(line for line in fragment.splitlines()
+                              if line.startswith('OS_TLS_SANITIZER_QUOTE ='))
+            sanitizer_rule = next(line for line in fragment.splitlines()
+                                  if line.startswith('check-os-tlsverify-sanitize:'))
+            for mutant in (
+                    fragment.replace(quote_rule, 'OS_TLS_SANITIZER_QUOTE = $(1)', 1),
+                    fragment.replace('check-sanitize: check-os-tlsverify-sanitize', '', 1),
+                    fragment.replace(sanitizer_rule, sanitizer_rule.replace('tools/host_paths.py', ''), 1)):
+                with self.assertRaises(AssertionError):
+                    verify(mutant, str(directory / "LLVM's 23/bin/clang"))
+
+    def test_os_freestanding_provider_inputs_invalidate_object(self):
+        fragment = (ROOT / 'os/Makefile').read_text()
+        inputs = ('runtime/minyar_freestanding_providers.h', 'runtime/minyar_ip_literal.h',
+                  'runtime/minyar_native.h', 'runtime/native/securecrypto.c',
+                  'vendor/monocypher/monocypher.c', 'vendor/monocypher/monocypher.h')
+
+        def verify(candidate):
+            with tempfile.TemporaryDirectory(prefix='minyar-os-invalidation-') as temporary:
+                directory = Path(temporary)
+                (directory / 'os').mkdir()
+                (directory / 'library').mkdir()
+                (directory / 'os/Makefile').write_text(candidate)
+                binaries = directory / 'llvm-bin'
+                binaries.mkdir()
+                clang = binaries / 'clang'
+                clang.write_text('#!/bin/sh\nprintf "%s\\n" /unused-resource\n')
+                clang.chmod(0o755)
+                for name in (*inputs, 'runtime/freestanding/freestanding.c',
+                             'runtime/freestanding/include/stdio.h'):
+                    path = directory / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b'bound input\n')
+                    os.utime(path, (100, 100))
+                environment = dict(os.environ)
+                environment.pop('MAKEFLAGS', None)
+                for architecture in ('x86_64', 'arm64'):
+                    output = directory / 'build/os' / architecture / 'freestanding.o'
+                    output.parent.mkdir(parents=True)
+                    output.write_bytes(b'cached object\n')
+                    os.utime(output, (200, 200))
+                    argv = ['make', '--no-print-directory', '-q', '-C', str(directory / 'os'),
+                            'LLVM_BIN=' + str(binaries), 'ARCH=' + architecture, str(output)]
+                    def status():
+                        result = subprocess.run(argv, env=environment, capture_output=True,
+                                                text=True, timeout=15)
+                        self.assertIn(result.returncode, (0, 1), result.stderr)
+                        return result.returncode
+                    self.assertEqual(status(), 0, 'Unchanged inputs must reuse the object')
+                    for name in inputs:
+                        path = directory / name
+                        os.utime(path, (300, 300))
+                        self.assertEqual(status(), 1, (architecture, name, 'stale provider object'))
+                        os.utime(path, (100, 100))
+                        self.assertEqual(status(), 0, (architecture, name, 'restored input'))
+        verify(fragment)
+        for name in inputs:
+            self.assertIn('$(ROOT)/' + name, fragment)
+            with self.subTest(missing_dependency=name), self.assertRaises(AssertionError):
+                verify(fragment.replace('$(ROOT)/' + name, '', 1))
+
+
 if __name__ == '__main__':
     unittest.main()
