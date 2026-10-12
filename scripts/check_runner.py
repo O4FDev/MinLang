@@ -345,7 +345,7 @@ class Runner:
                                 running.append((check, self.launch(check, row, locked=True), row, 'builder'))
                             started = True
                             break
-                    while not started and builder_order:
+                    while not started and builder_order and pending:
                         goal = builder_order.pop(0)
                         if goal in self.built or goal in self.failed_goals:
                             continue
