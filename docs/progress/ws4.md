@@ -60,7 +60,10 @@ Implemented chunks, awaiting review/remaining qualification:
   Samples/evidence committed in `bd43f2b`; worst ratio is 1.304x. Fresh independent R1
   review independently reproduced all 16,434 samples/gates, but found a write-phase
   half-close/backpressure HUP spin. The separate fix's combined regression is green;
-  exact qualification and a corrected-source full benchmark rerun are underway.
+  exact source `1751f1e` passes Linux debug/release/sanitizer and Mac native tests.
+  Its full benchmark rerun failed hit p99 at 1.6303x (188.1/115.4 us); all other nine
+  cells pass. All failure samples are retained. A generic bounded small-response
+  buffer optimization is underway before repeating the complete unchanged gate.
   Windows execution pending.
 
 ## Gates and coordination
