@@ -1,7 +1,7 @@
 # Minyar v2 unification progress — 2026-10-12
 
 Brief: `/Users/luke/overnight/briefs/2026-10-12/minyar-unify.md`.
-Current phase: **Phase 1 — inventory and branch reconciliation**. No Phase 2 feature work has started.
+Current phase: **Phase 1 — combined platform and downstream qualification**. No Phase 2 feature work has started.
 Sole integrator: this thread. Candidate: `completion/v2-20261011`, handover base `372d3de`.
 
 ## Preserved and inventoried
@@ -22,6 +22,7 @@ Every proposed integration will receive an independent review subagent before th
 - Reviewed desktop, Windows and shipping history merged at `00b7fd1`, `0d1d12b`/`5978c73`, `5288bc0`, retaining current source. Collector test restoration merged at `fa7c906` after exact GREEN and independent R2 approval; reviewed memory history at `3a5bbb3` preserves that source. Every branch is kept. Existing candidate contains TLS cleanup `6518ef3` and unqualified QUIC CID WIP `8daa72c`.
 - Collector preservation at `4a1732f` passed 30 C native/SAN configurations, eight restored programs at O0/O2 native/SAN/LSan, and 26 exact finite-heap language cells; parent-owned R2 approved and merged at `fa7c906`. No production collector/compiler change.
 - Transport fixes merged at `7edba35`, with reviewed original history at `e297113`. Neo-db durable files/system/net plus all ten R1 repairs merged after R2 approval at `8fc4b60`; original fork history at `a25508a` retains that fixed tree. Every original fork commit is now an ancestor; RC sketch remains outside.
+- Wiring-only `80f2b848` passed focused/full RED-to-GREEN and independent review, then merged. All original107 adapter controls plus six forwarding controls are enforced; existing sanitizer/dependency mutations remain.
 - No Phase 2 gaps claimed closed yet. Owning project code has not been changed.
 
 ## Boat and spending
@@ -38,7 +39,7 @@ Every proposed integration will receive an independent review subagent before th
 - Branch dispositions and final missing-change tests are being audited; nothing is deemed superseded solely by branch age.
 - Transport `cb8fe9f` received independent R2 approval and passed final 172 native + 172 ASan/UBSan/LSan RFC cases, ACK/PTO, yamux/cancel/independent Go/1536/FIN, net-connect and strict edge/full262144-route controls. All1313 input hashes match Git and before/after. Normal integration `7edba35`; reviewed38 original-ref history at `e297113` leaves its source unchanged.
 - Neo-db frozen `34833a6` fixes all ten R1 findings plus actual overflow, APPEND/position, negative-boundary, stderr-progress and in-flight signal rollback RED controls. Final W native/SAN maintained and network suites pass; independent R2 approved and integration is complete. Native Mac and Boat Windows net still require final combined qualification.
-- Existing build-wiring tests expose two baseline fixture failures: isolated Make prerequisite for yamux peer and stale107-case adapter expectation versus113 maintained cases. Narrow test-first repair assigned separately; no threshold/case removal.
+- Both pre-existing build-wiring fixture failures are repaired and independently approved: complete isolated Make prerequisite and fixed107+6 adapter inventory. Full23-method suite passed on Boat. Combined catalogue/format preflight and full platform suites follow on frozen source.
 - Current full Linux/macOS/Windows suites and CI remain unqualified; prior passing commits do not qualify this revision.
 - Native macOS is absent on Boat. Owner directed use of this Mac for native checks; heavy builds/long tests remain on Boat. Offloaded ARM64 generation and bounded serial Apple-native checks are being prepared.
 - Owner added Phase 2 item 0: shared-memory threads; start after Phase 1, with ±1% single-thread performance, Boat multicore scaling, TSan stress and a neo-db design note.
