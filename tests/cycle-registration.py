@@ -107,32 +107,46 @@ def main():
     }
     flags = (["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
              if args.sanitize else ["-O2"])
+    groups = [(fixture, expected, profile, budget)
+              for profile in profiles
+              for budget in ([32] if profile == "eager" else args.budgets)
+              for fixture, expected in fixtures.items()]
+
+    def execute(group):
+        fixture, expected, profile, budget = group
+        label = fixture[:-2] + "-" + profile + "-k" + str(budget)
+        binary = out / (label + (".exe" if windows_host() else ""))
+        command = [
+            str(tool), *flags, "-std=c11", "-Wall", "-Wextra", "-Werror",
+            "-iquote", str(ROOT / "runtime"), *options[profile],
+            "-DMINYAR_BOUNDED_HEAP_BYTES=1048576",
+            "-DMINYAR_RC_POLL_BUDGET=" + str(budget),
+            str(ROOT / "tests" / fixture), "-lm", "-o", str(binary),
+        ]
+        cases, resources = [], []
+        for phase, argv in (("compile", command), ("run-built-in", [str(binary)])):
+            case = additive.run(argv, environment, out, label + "-" + phase, resources)
+            case.update(fixture=fixture, profile=profile, cleanup_budget=budget)
+            if binary.is_file():
+                case["binary_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
+            cases.append(case)
+            print(case["label"] + ": " + str(case["status"]), flush=True)
+            if case["status"]:
+                return cases, resources, case["label"] + ": " + case["stderr"]
+            if phase == "run-built-in" and (case["stdout"] != "" or case["stderr"] != expected):
+                return cases, resources, label + ": stdout " + repr(case["stdout"]) + \
+                    ", stderr " + repr(case["stderr"]) + ", expected " + repr(expected)
+        return cases, resources, None
+
     try:
-        for profile in profiles:
-            for budget in ([32] if profile == "eager" else args.budgets):
-                for fixture, expected in fixtures.items():
-                    label = fixture[:-2] + "-" + profile + "-k" + str(budget)
-                    binary = out / (label + (".exe" if windows_host() else ""))
-                    command = [
-                        str(tool), *flags, "-std=c11", "-Wall", "-Wextra", "-Werror",
-                        "-iquote", str(ROOT / "runtime"), *options[profile],
-                        "-DMINYAR_BOUNDED_HEAP_BYTES=1048576",
-                        "-DMINYAR_RC_POLL_BUDGET=" + str(budget),
-                        str(ROOT / "tests" / fixture), "-lm", "-o", str(binary),
-                    ]
-                    for phase, argv in (("compile", command), ("run-built-in", [str(binary)])):
-                        case = additive.run(argv, environment, out, label + "-" + phase,
-                                            report["resources"])
-                        case.update(fixture=fixture, profile=profile, cleanup_budget=budget)
-                        if binary.is_file():
-                            case["binary_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
-                        report["cases"].append(case)
-                        print(case["label"] + ": " + str(case["status"]), flush=True)
-                        if case["status"]:
-                            raise AssertionError(case["label"] + ": " + case["stderr"])
-                        if phase == "run-built-in":
-                            assert case["stdout"] == "", case["stdout"]
-                            assert case["stderr"] == expected, case["stderr"]
+        failures = []
+        for cases, resources, failed in additive.run_groups(groups, execute):
+            report["cases"] += cases
+            report["resources"] += resources
+            if failed:
+                failures.append(failed)
+        if failures:
+            raise AssertionError("\n".join(failures))
 
         # Reuse the maintained Result allocation/debt ledger, its exact output
         # oracle, and shared process-tree deadlines at both optimization levels.

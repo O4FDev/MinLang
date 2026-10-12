@@ -20,6 +20,11 @@ ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_STDIN = object()
 
 
+def test_jobs():
+    """Concurrent independent cases a harness may run; the runner sets MINYAR_TEST_JOBS."""
+    return max(1, int(os.environ.get('MINYAR_TEST_JOBS') or 2))
+
+
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
