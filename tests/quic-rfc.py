@@ -129,6 +129,18 @@ def verify_result(kind, report, cases, binaries, source):
                     and row.get('reciprocal_epoch_secrets') is True
                     and row.get('client_stderr') == '' and row.get('server_stderr') == '',
                     'local endpoint assertion or sanitizer diagnostic failed')
+            preferred = {
+                'preferred': 'QNS authenticated preferred address ipv4=7f000001:44301 ipv6=00000000000000000000000000000000:0',
+                'preferred-ipv6': 'QNS authenticated preferred address ipv4=00000000:0 ipv6=00000000000000000000000000000001:44301',
+            }
+            if row.get('case') in preferred:
+                expected = [preferred[row['case']]]
+                require(row.get('preferred_tuple_match') is True
+                        and row.get('authenticated_preferred_tuples') == expected
+                        and isinstance(row.get('client_stdout'), str)
+                        and [line for line in row['client_stdout'].splitlines()
+                             if line.startswith('QNS authenticated preferred address ')] == expected,
+                        'authenticated preferred address tuple mismatch')
 
 
 def retained_path(directory, relative):
@@ -272,6 +284,7 @@ def verify_case_invocation(kind, case, command, endpoint, roles, directory, bina
     if kind == 'local':
         mapping = {'multiplex1999': 'transfer', 'multiconnect50': 'multiconnect',
                    'ipv6': 'transfer', 'preferred': 'connectionmigration',
+                   'preferred-ipv6': 'connectionmigration',
                    'resumption40': 'resumption', 'zerortt40': 'zerortt',
                    'keyupdate': 'keyupdate', 'chacha20': 'chacha20'}
         require(case in mapping, 'unknown local endpoint case')
@@ -280,7 +293,7 @@ def verify_case_invocation(kind, case, command, endpoint, roles, directory, bina
             50 if case == 'multiconnect50' else 40 if case in ('resumption40', 'zerortt40') else 1)
         names = ['file' + str(index) for index in range(count)]
         expected = [str(binaries['client'].resolve()), fixture('root.der'),
-                    '::1' if case == 'ipv6' else '127.0.0.1', '44300',
+                    '::1' if case in ('ipv6', 'preferred-ipv6') else '127.0.0.1', '44300',
                     str(workspace / (case + '-client.keys')),
                     str(workspace / (case + '-downloads')), testcase, *names]
         expected_server = [str(binaries['server'].resolve()), fixture('server.pk8'),
@@ -288,6 +301,10 @@ def verify_case_invocation(kind, case, command, endpoint, roles, directory, bina
             str(workspace / (case + '-www')), testcase, fixture('server.der'), '--port=44300']
         if case == 'preferred':
             expected_server += ['--preferred-ipv4=7f000001', '--preferred-port=44301']
+        if case == 'preferred-ipv6':
+            expected_server += ['--preferred-ipv4=00000000',
+                                '--preferred-ipv6=00000000000000000000000000000001',
+                                '--preferred-port=44301']
         require(command == expected and endpoint == expected_server,
                 'local testcase/client-server/fixture argv binding mismatch')
         require(roles['payloads'] == ['fixtures/' + case + '-www/' + name for name in sorted(names)]
