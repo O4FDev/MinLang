@@ -1344,6 +1344,221 @@ function stockCase(st: CidStock, mode: Text): Integer {
     return stockFailure(st,mode)
 }
 
+// RFC9000 8.2.2 / 13.3. Challenges and ACKs are independently encoded and
+// protected with the authenticated peer's keys; every observed poll packet
+// is decrypted. No retry/padding helper from the implementation is an oracle.
+record ResponseWire { valid: Boolean; number: Integer; payload: Bytes; responses: Integer; acknowledgements: Integer }
+function responseWire(peer: quic.Connection, packet: quic.Datagram, token: Bytes, route: Integer): ResponseWire {
+    let result=ResponseWire { valid:false;number:-1;payload:Bytes();responses:0;acknowledgements:0 }
+    let header=wire.header(packet.data,0,peer.local.length)
+    if !header.valid || header.kind!=wire.ONE_RTT || !quic.ownsConnectionId(peer,header.destination) || packet.data.length>1200 { return result }
+    let opened=protection.unprotect(peer.spaces[2].read,packet.data,header.numberOffset,-1)
+    if !opened.valid { return result }
+    let parsed=wire.frames(opened.payload);if !parsed.valid { return result }
+    for frame in parsed.frames {
+        if frame.type==27 {
+            if crypto.hex(frame.data)!=crypto.hex(token) || packet.pathId!=route { return result }
+            result.responses+=1
+        }
+        if frame.type==2 || frame.type==3 { result.acknowledgements+=1 }
+    }
+    result.valid=true;result.number=opened.number;result.payload=opened.payload;return result
+}
+function responseChallenge(peer: quic.Connection, subject: quic.Connection, token: Bytes, size: Integer, route: Integer, now: Integer): Integer {
+    let payload=Bytes();payload.add(26);payload.addBytes(token)
+    // Independently account for the four-byte packet number and AEAD tag.
+    if size>0 { payload.resize(size-1-subject.local.length-4-16) }
+    let number=peer.spaces[2].next
+    let packet=authenticatedFrame(peer,subject,subject.local,payload)
+    if (size>0 && packet.length!=size) || !subject.clientTLS.authenticated && subject.clientRole || !subject.serverTLS.authenticated && !subject.clientRole { return -1 }
+    quic.receivePath(subject,packet,route,now)
+    if subject.state!=quic.ESTABLISHED || !stockReceived(subject,number) { return -1 }
+    return number
+}
+function responseAck(peer: quic.Connection, subject: quic.Connection, number: Integer, now: Integer) {
+    let payload=Bytes();payload.add(2);appendInteger(payload,number);appendInteger(payload,0);appendInteger(payload,0);appendInteger(payload,0)
+    quic.receivePath(subject,authenticatedFrame(peer,subject,subject.local,payload),subject.activePath,now)
+}
+function responsePaddingFailure(): Integer { print("semantic failure: PATH_RESPONSE padding or admission violated");return 35 }
+function responsePadding(p: Pair, mode: Text): Integer {
+    if !ready(p) || !p.client.clientTLS.authenticated || !p.server.serverTLS.authenticated { return 30 }
+    let subject=p.client;let peer=p.server
+    if mode=="response-padding-server" || mode=="response-amp-credit" || mode=="response-amp-limited" || mode=="response-amp-blocked" { subject=p.server;peer=p.client }
+    if subject.pending.length!=0 || subject.spaces[2].sent.length!=0 || subject.paths.length!=1 { print("setup failure: response fixture did not drain");return 30 }
+    let width=8;if mode=="response-padding-width1" { width=1 };if mode=="response-padding-width20" { width=20 }
+    if width!=8 {
+        // Isolate legal short-header widths with consistent peer ownership.
+        let id=randomBytes(width);let sequence=subject.paths[0].remoteSequence
+        for known in peer.localIds { if known.sequence==sequence { known.id=id } }
+        for known in subject.remoteIds { if known.sequence==sequence { known.id=id } }
+        peer.local=id;subject.remote=id;subject.paths[0].remoteId=id
+    }
+    let path=subject.paths[0];path.id=9;subject.activePath=9
+    let unvalidated=mode=="response-amp-credit" || mode=="response-amp-limited" || mode=="response-amp-blocked"
+    if unvalidated { path.validated=false;path.received=0;path.sent=0 }
+    let now=p.now+1;let token=randomBytes(8);let inputSize=1200
+    if mode=="response-amp-limited" || mode=="response-amp-blocked" { inputSize=38 }
+    if mode=="response-amp-blocked" { path.sent=1200 }
+    let occupied=-1
+    if mode=="response-congestion" {
+        // Fill the window with a real, unacknowledged STREAM packet.
+        subject.congestion.window=1200;subject.paceCredit=2400.0;subject.paceAt=now
+        let opened=quic.openStream(subject,false);if !errors.integerOk(opened) { return 30 }
+        quic.writeStream(subject,errors.integerValue(opened),Bytes(1000),true)
+        for packet in quic.pollDatagrams(subject,now) {
+            let observed=responseWire(peer,packet,token,9)
+            if !observed.valid || observed.responses!=0 || occupied>=0 { return 31 }
+            occupied=observed.number
+        }
+        if occupied<0 || subject.flight<=0 || subject.flight>=1200 { return 30 }
+        now+=1
+    }
+    let received=responseChallenge(peer,subject,token,inputSize,9,now);if received<0 { return 30 }
+    if mode=="response-pacing" { subject.paceCredit=0.0;subject.paceAt=now }
+    let blocked=mode=="response-amp-blocked" || mode=="response-pacing" || mode=="response-congestion"
+    if blocked {
+        for turn in 0..4 {
+            for packet in quic.pollDatagrams(subject,now) {
+                let observed=responseWire(peer,packet,token,9)
+                if !observed.valid { return 31 }
+                if observed.responses!=0 { return responsePaddingFailure() }
+            }
+            let queued=0
+            for pending in subject.pending { for frame in wire.frames(pending.payload).frames {
+                if frame.type==27 { if pending.path!=9 || crypto.hex(frame.data)!=crypto.hex(token) || pending.payload.length>=1200 { return 32 };queued+=1 }
+            } }
+            if queued!=1 { print("blocked output discarded or duplicated its pending response");return 32 }
+        }
+        now+=100
+        if mode=="response-amp-blocked" {
+            let padding=Bytes(1171)
+            quic.receivePath(subject,authenticatedFrame(peer,subject,subject.local,padding),9,now)
+        }
+        if occupied>=0 { responseAck(peer,subject,occupied,now) }
+    }
+    let count=0;let acks=0;let transmitted=0;let first=subject.spaces[2].next
+    let beforeSent=path.sent;let beforeCredit=3*path.received-path.sent
+    for packet in quic.pollDatagrams(subject,now) {
+        let observed=responseWire(peer,packet,token,9);if !observed.valid { return 31 }
+        count+=observed.responses;acks+=observed.acknowledgements;transmitted+=packet.data.length
+        for frame in wire.frames(observed.payload).frames { if frame.type!=0 && frame.type!=2 && frame.type!=3 && frame.type!=27 { return 33 } }
+        if observed.responses>0 {
+            print("response wire: route "+Text(packet.pathId)+" CID width "+Text(width)+" UDP bytes "+Text(packet.data.length)+" echoes "+Text(observed.responses)+" ACKs "+Text(observed.acknowledgements)+" token matched; path validated "+Text(path.validated)+" credit "+Text(beforeCredit))
+            if observed.responses!=1 { return 33 }
+            if mode=="response-amp-limited" {
+                if packet.data.length>=1200 || packet.data.length>beforeCredit { return 34 }
+            } else if packet.data.length!=1200 { return responsePaddingFailure() }
+        }
+    }
+    if count!=1 || acks!=1 || subject.spaces[2].next<=first || path.sent-beforeSent!=transmitted ||
+       (unvalidated && path.sent>3*path.received) || subject.activePath!=9 { return 34 }
+    responseAck(peer,subject,subject.spaces[2].next-1,now+1)
+    for packet in quic.pollDatagrams(subject,now+2) { let observed=responseWire(peer,packet,token,9);if !observed.valid || observed.responses!=0 { return 34 } }
+    print("PATH_RESPONSE wire padding, token, route and admission passed; mode "+mode+" width "+Text(width)+" bytes "+Text(transmitted));return 0
+}
+function responseRetry(p: Pair, mode: Text): Integer {
+    if !ready(p) || !p.client.clientTLS.authenticated || !p.server.serverTLS.authenticated { return 30 }
+    let subject=p.client;let peer=p.server
+    if mode=="response-pto-server" || mode=="response-loss-server" || mode=="response-mixed-loss" { subject=p.server;peer=p.client }
+    if subject.pending.length!=0 || subject.spaces[2].sent.length!=0 { return 30 }
+    let mixed=mode=="response-mixed-pto" || mode=="response-mixed-loss" || mode=="response-mixed-path-loss"
+    let loss=mode=="response-loss-client" || mode=="response-loss-server" || mode=="response-mixed-loss" || mode=="response-mixed-path-loss"
+    let route=subject.activePath;let now=p.now+1;let id=-1;let expected=Bytes("reliable data survives a lost response");let control=-1;let cid=Bytes();let cidSequence=-1;let challenge=Bytes()
+    subject.congestion.measured=true;subject.congestion.smoothed=100;subject.congestion.latest=100;subject.congestion.minimum=100;subject.congestion.variance=0
+    if mode=="response-mixed-path-loss" {
+        if !errors.booleanOk(quic.probePath(subject,7,now)) { return 30 }
+        route=7;for path in subject.paths { if path.id==route { challenge=path.challenge } }
+        if challenge.length!=8 { return 30 }
+    }
+    if mixed {
+        let opened=quic.openStream(subject,false);if !errors.integerOk(opened) { return 30 }
+        id=errors.integerValue(opened);quic.writeStream(subject,id,expected,true)
+        // Actual retirement creates a replacement NEW_CONNECTION_ID control.
+        let retirement=Bytes();retirement.add(25);appendInteger(retirement,1)
+        quic.receivePath(subject,authenticatedFrame(peer,subject,subject.local,retirement),subject.activePath,now)
+        subject.receiveMaxData+=1;control=subject.receiveMaxData
+    }
+    let token=randomBytes(8)
+    if responseChallenge(peer,subject,token,1200,route,now)<0 { return 30 }
+    if mixed {
+        // Coalesce real maintained queues into one packet, as in existing
+        // mixed retry fixtures. The reliable bytes are never synthesized.
+        let payload=Bytes();let responseAt=-1
+        for at in 0..subject.pending.length {
+            let pending=subject.pending[at];if pending.acknowledgement { return 30 }
+            for frame in wire.frames(pending.payload).frames {
+                if frame.type==27 { responseAt=at }
+                if frame.type==24 { cidSequence=frame.value;cid=frame.data }
+            }
+            payload.addBytes(pending.payload)
+        }
+        if responseAt<0 || cidSequence<0 { return 30 }
+        payload.add(16);appendInteger(payload,control)
+        let pending=subject.pending[responseAt];pending.payload=payload;subject.pending=[pending]
+    }
+    subject.paceCredit=2400.0;subject.paceAt=now
+    let original=-1;let firstResponses=0;let originals=0
+    for packet in quic.pollDatagrams(subject,now) {
+        let observed=responseWire(peer,packet,token,route);if !observed.valid { return 31 }
+        if observed.responses>0 { original=observed.number;originals+=1 };firstResponses+=observed.responses
+        // Deliberately drop the authenticated output, including reliable data.
+    }
+    if original<0 || firstResponses!=1 || originals!=1 || subject.spaces[2].sent.length!=1 { return 30 }
+    print("response original: PN "+Text(original)+" route "+Text(route)+" echoes "+Text(firstResponses)+" dropped; authenticated both roles")
+    let sent=subject.spaces[2].sent[0];let probes=subject.congestion.probes
+    if loss {
+        for step in 1..4 {
+            quic.ping(subject);subject.paceCredit=2400.0;subject.paceAt=now+step
+            let count=0
+            for packet in quic.pollDatagrams(subject,now+step) {
+                let observed=responseWire(peer,packet,token,route);if !observed.valid || observed.responses!=0 { return 31 };count+=1
+            }
+            if count!=1 { return 30 }
+        }
+        responseAck(peer,subject,subject.spaces[2].next-1,now+4);now+=4
+        // Exercise retained retry filtering while pacing rejects transmission.
+        subject.paceCredit=0.0;subject.paceAt=now
+    } else {
+        let deadline=subject.spaces[2].probe
+        if deadline<=now { return 30 }
+        // Consume any earlier ACK deadline without changing the PTO alarm.
+        for packet in quic.pollDatagrams(subject,deadline-1) {
+            let observed=responseWire(peer,packet,token,route);if !observed.valid || observed.responses!=0 { return 31 }
+        }
+        if quic.nextTimer(subject)!=deadline { return 30 };now=quic.nextTimer(subject)
+    }
+    let responses=0;let streams=0;let controls=0;let cids=0;let challenges=0;let observedPackets=0
+    // All packets from the real loss/PTO poll and following admission turn
+    // are decrypted; the original challenge is not delivered again.
+    for turn in 0..2 {
+        for packet in quic.pollDatagrams(subject,now+turn*10) {
+            let observed=responseWire(peer,packet,token,route);if !observed.valid { return 31 }
+            observedPackets+=1;responses+=observed.responses
+            for frame in wire.frames(observed.payload).frames {
+                if frame.type>=8 && frame.type<=15 {
+                    if frame.stream!=id || frame.offset!=0 || !frame.fin || crypto.hex(frame.data)!=crypto.hex(expected) || packet.pathId!=subject.activePath { return 37 };streams+=1
+                }
+                if frame.type==16 { if frame.value!=control || packet.pathId!=subject.activePath { return 37 };controls+=1 }
+                if frame.type==24 {
+                    if frame.value!=cidSequence || crypto.hex(frame.data)!=crypto.hex(cid) || packet.pathId!=subject.activePath { return 37 };cids+=1
+                }
+                if frame.type==26 { if crypto.hex(frame.data)!=crypto.hex(challenge) || packet.pathId!=route { return 37 };challenges+=1 }
+            }
+        }
+    }
+    print("response recovery: clock "+Text(now)+" loss "+Text(loss)+" packets "+Text(observedPackets)+" echoes "+Text(responses)+" STREAM "+Text(streams)+" MAX_DATA "+Text(controls)+" NEW_CONNECTION_ID "+Text(cids)+" PATH_CHALLENGE "+Text(challenges))
+    if responses!=0 { print("semantic failure: PATH_RESPONSE retransmitted after loss or PTO");return 36 }
+    if loss && sent.status!=2 || !loss && subject.congestion.probes!=probes+1 { return 38 }
+    if mixed && (streams!=1 || controls!=1 || cids!=1) || !mixed && (streams!=0 || controls!=0 || cids!=0) ||
+       (challenge.length==8 && challenges!=1) || (challenge.length==0 && challenges!=0) || (!loss && observedPackets<1) { return 38 }
+    // A distinct authenticated challenge still earns exactly one fresh echo.
+    now+=11;let fresh=randomBytes(8)
+    if responseChallenge(peer,subject,fresh,1200,route,now)<0 { return 30 }
+    let freshResponses=0
+    for packet in quic.pollDatagrams(subject,now) { let observed=responseWire(peer,packet,fresh,route);if !observed.valid { return 31 };freshResponses+=observed.responses }
+    if freshResponses!=1 { return 39 }
+    print("PATH_RESPONSE sent once; reliable STREAM, control, CID and path-challenge retry preserved; mode "+mode);return 0
+}
 function main(): Integer {
     let root = readBytesFile(argument(0)); let identity = readBytesFile(argument(1)); let key = readBytesFile(argument(2))
     let client = readBytesFile(argument(3)); let clientKey = readBytesFile(argument(4)); let mode = argument(5)
@@ -1364,6 +1579,8 @@ function main(): Integer {
     }
     if mode=="early-routes" { return earlyRoutes(root,identity,key,client,clientKey) }
     let p = connected(root, identity, key, client, clientKey)
+    if mode=="response-padding-client" || mode=="response-padding-server" || mode=="response-padding-width1" || mode=="response-padding-width20" || mode=="response-amp-credit" || mode=="response-amp-limited" || mode=="response-amp-blocked" || mode=="response-pacing" || mode=="response-congestion" { return responsePadding(p,mode) }
+    if mode=="response-pto-client" || mode=="response-pto-server" || mode=="response-loss-client" || mode=="response-loss-server" || mode=="response-mixed-pto" || mode=="response-mixed-loss" || mode=="response-mixed-path-loss" { return responseRetry(p,mode) }
     if mode=="old-high-ack" || mode=="old-route-alarm" || mode=="old-high-current-rtt" || mode=="current-route-alarm" { return oldValidationRecovery(p,mode) }
     if mode=="current-packet-threshold" { return currentPacketThreshold(p) }
     if mode=="old-probing-return" { return retainedOldTraffic(p,true) }
