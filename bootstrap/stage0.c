@@ -605,7 +605,12 @@ static Expression *parse_atom(Parser *parser) {
     if (parser->token.kind == '[') {
         expression = new_expression(parser, EXPRESSION_LIST);
         advance(parser);
-        expect(parser, ']', "a closing bracket for this empty list");
+        while (parser->token.kind != ']') {
+            arrput(expression->arguments, parse_expression(parser));
+            if (parser->token.kind != ',') break;
+            advance(parser);
+        }
+        expect(parser, ']', "a closing bracket for this list");
         return expression;
     }
     fail_at(parser->token.line, parser->token.column, "I expected a value or expression here");
@@ -1224,6 +1229,19 @@ static Type check_expression(Program *program, Function *function, Expression *e
                 type_name(left));
         return TYPE_UNKNOWN;
     case EXPRESSION_LIST:
+        if (arrlen(expression->arguments)) {
+            left = check_expression(program, function, expression->arguments[0]);
+            if (left < TYPE_INTEGER || left > TYPE_BOOLEAN)
+                fail_at(expression->line, expression->column, "bootstrap List elements must be scalar or Text");
+            Type inferred = TYPE_LIST_INTEGER + left - TYPE_INTEGER;
+            if (expression->type != TYPE_UNKNOWN && expression->type != inferred)
+                fail_at(expression->line, expression->column, "this List literal has a different element type");
+            expression->type = inferred;
+            for (index = 1; index < (size_t)arrlen(expression->arguments); index++)
+                require_type(expression->arguments[index],
+                             check_expression(program, function, expression->arguments[index]),
+                             left, "a List element");
+        }
         if (expression->type == TYPE_UNKNOWN)
             fail_at(expression->line, expression->column,
                     "an empty list needs a type, such as 'let names: List<Text> = []'");
@@ -1681,10 +1699,21 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
                         llvm_type(element));
             return make_value(element, "%%value.%d", temporary);
         }
-    case EXPRESSION_LIST:
-        temporary = new_temporary(emitter);
-        fprintf(output, "  %%value.%d = call ptr @minyar_list_new()\n", temporary);
-        return make_value(expression->type, "%%value.%d", temporary);
+    case EXPRESSION_LIST: {
+        int object = new_temporary(emitter);
+        fprintf(output, "  %%value.%d = call ptr @minyar_list_new()\n", object);
+        for (index = 0; index < (size_t)arrlen(expression->arguments); index++) {
+            right = emit_expression(emitter, expression->arguments[index]);
+            if (right.type != TYPE_INTEGER) {
+                temporary = new_temporary(emitter);
+                fprintf(output, "  %%value.%d = %s %s %s to i64\n", temporary,
+                        right.type == TYPE_TEXT ? "ptrtoint" : "zext", llvm_type(right.type), right.name);
+                right = make_value(TYPE_INTEGER, "%%value.%d", temporary);
+            }
+            fprintf(output, "  call void @minyar_list_add(ptr %%value.%d, i64 %s)\n", object, right.name);
+        }
+        return make_value(expression->type, "%%value.%d", object);
+    }
     case EXPRESSION_METHOD_CALL:
         left = emit_expression(emitter, expression->left);
         if (expression->left->type == TYPE_TEXT && strcmp(expression->text, "slice")) {

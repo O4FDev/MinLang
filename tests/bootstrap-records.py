@@ -18,8 +18,7 @@ with tempfile.TemporaryDirectory(prefix='minyar-bootstrap-records-') as temporar
     llvm = work / 'records.ll'
     source.write_text('''record Coordinates { values: List<Integer>; title: Text; valid: Boolean; letter: Character; counter: Integer }
 function make(): Coordinates {
-    let values: List<Integer> = []
-    values.add(40)
+    let values: List<Integer> = [40, 41]
     return Coordinates { letter: 'Q', valid: true, title: "source", values: values, counter: 0 }
 }
 function read(location: Coordinates): Integer { return location.values[0] + 2 }
