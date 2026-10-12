@@ -76,6 +76,20 @@ class ComparatorSort(CompilerTestCase):
             run = self.evidence.run([str(exe)], timeout=30, phase='sort-execute')
             self.assertEqual((run.returncode, run.stdout, run.stderr), (status, expected.encode(), stderr.encode()))
 
+    def test_comparator_parameter_without_closure_literal(self):
+        for method in ('sortBy', 'sortedBy'):
+            with self.subTest(method=method):
+                source = '''function order(xs: List<Integer>, cmp: Callback<Integer, Integer, Integer>) {
+    xs.''' + method + '''(cmp)
+}
+print(42)
+'''
+                result, llvm = self.compile(source)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(llvm.read_text().count('declare void @minyar_callback_check(ptr)'), 1)
+                self.assertIn('; minyar-callback-runtime: 1', llvm.read_text())
+                self.executes(source, '42\n')
+
     def test_empty_singleton_and_escaping_closure(self):
         self.executes('''record Box { offset: Integer }
 function factory(): Callback<Integer, Integer, Integer> {
