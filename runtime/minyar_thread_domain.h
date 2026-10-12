@@ -1,12 +1,12 @@
 /* Only included in the numeric thread profile, after the common engine. */
-static void rc_thread_domain_init(void) {
+static inline void rc_thread_domain_init(void) {
     /* A managed worker always begins on a fresh native thread. Never reset an
      * existing domain's live ownership/collector state to simulate isolation. */
     if (rc_frames || rc_free_frames || rc_pending_count)
         minyar_stop("a thread domain was already initialized.");
 }
 
-static void rc_thread_domain_drain(void) {
+static inline void rc_thread_domain_drain(void) {
 #ifdef MINYAR_BOUNDED_RC
     while (rc_pending_count) minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
 #else
@@ -14,7 +14,7 @@ static void rc_thread_domain_drain(void) {
 #endif
 }
 
-static void rc_thread_domain_dispose(void) {
+static inline void rc_thread_domain_dispose(void) {
     if (rc_frames) minyar_stop("a thread returned with live ownership frames.");
     integer_text_cached(0, 1);
     rc_thread_domain_drain();

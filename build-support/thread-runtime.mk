@@ -1,6 +1,9 @@
-.PHONY: check-thread-domain check-thread-runtime check-thread-runtime-sanitize check-thread-runtime-tsan
+.PHONY: check-thread-domain check-thread-buffers check-thread-runtime check-thread-runtime-sanitize check-thread-runtime-tsan
 check-thread-domain:
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/thread-runtime.py --domain-only
+
+check-thread-buffers:
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/thread-runtime.py --buffers-only
 
 check-thread-runtime:
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/thread-runtime.py
