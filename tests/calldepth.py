@@ -100,6 +100,14 @@ MinyarText *minyar_depthtest_bounce(void) {
 }
 extern MinyarRecord *depth_test_run(long long, MinyarRecord *)
     __asm__(DEPTH_SYMBOL(".minyar.fn.minyar_module_1_run")) __attribute__((weak));
+#ifdef __APPLE__
+/* Mach-O cannot leave a weak reference undefined. These weak definitions
+   yield to the program's own functions and abort if a hook runs without one. */
+MinyarText *depth_test_language(void) { abort(); }
+MinyarRecord *depth_test_run(long long depth, MinyarRecord *callback) {
+    (void)depth; (void)callback; abort();
+}
+#endif
 static MinyarDepthScope *depth_expected_scope;
 static size_t depth_expected_count;
 static void depth_domain_exit(void) {
