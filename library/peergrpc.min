@@ -7,6 +7,7 @@ record Call {
     token: Bytes; exit: Text; connection: Text; deadline: Integer; due: Integer; monoDue: Integer
     timeout: Integer; acceptedWall: Integer; acceptedMono: Integer; status: Boolean; accepted: Boolean; ended: Boolean
     explicitTimeout: Boolean; deadlineActive: Boolean
+    closedNotified: Boolean
     error: errors.Error
 }
 public record Server { private transport: h2.Server; private calls: List<Call>; private held: Integer; private mono: Integer }
@@ -14,6 +15,7 @@ public record OpenResult {
     private error: errors.Error; private stream: Integer; private token: Bytes; private exit: Text
     private connection: Text; private deadline: Integer; private due: Integer; private monoDue: Integer
 }
+public record ClosedResult { private error: errors.Error; private stream: Integer; private cause: errors.Error }
 constant LIMIT = 1048576
 constant MAX_MESSAGE = 65540
 public function path(): Text { return "/PeerEdgeDial/OpenExitStream" }
@@ -26,6 +28,33 @@ public function takeOutgoing(server: Server, maximum: Integer): Bytes { return h
 public function connectionError(server: Server): errors.Error { return h2.connectionError(server.transport) }
 public function finish(server: Server): errors.BooleanResult { return h2.finish(server.transport) }
 public function bufferedBytes(server: Server): Integer { return server.held }
+public function retainedCalls(server: Server): Integer { return server.calls.length }
+public function retainedTransportStreams(server: Server): Integer { return h2.retainedStreams(server.transport) }
+public function dynamicTableBytes(server: Server): Integer { return h2.dynamicTableBytes(server.transport) }
+public function activeStreamIDs(server: Server): List<Integer> {
+    let ids: List<Integer> = []; for call in server.calls { if !call.ended && !errors.isError(call.error) { ids.add(call.id) } }; return ids
+}
+public function closed(server: Server): ClosedResult {
+    for call in server.calls {
+        if !call.closedNotified && (call.ended || errors.isError(call.error)) {
+            call.closedNotified = true; return ClosedResult { error: errors.none(); stream: call.id; cause: call.error }
+        }
+    }
+    return ClosedResult { error: problem(errors.wouldBlockCode(), "no ended gRPC call"); stream: 0; cause: errors.none() }
+}
+public function closedOk(value: ClosedResult): Boolean { return !errors.isError(value.error) }
+public function closedError(value: ClosedResult): errors.Error { return value.error }
+function requireClosed(value: ClosedResult) { if !closedOk(value) { fail("cannot read absent gRPC closed notification") } }
+public function closedStreamID(value: ClosedResult): Integer { requireClosed(value); return value.stream }
+public function closedCause(value: ClosedResult): errors.Error { requireClosed(value); return value.cause }
+public function release(server: Server, id: Integer): errors.BooleanResult {
+    let at = position(server, id); if at < 0 { return failure(errors.closedCode(), "unknown gRPC call") }; let call = server.calls[at]
+    if !call.ended || !call.closedNotified { return failure(errors.wouldBlockCode(), "gRPC close not observed or trailers not queued") }
+    let result = h2.release(server.transport, id); if !errors.booleanOk(result) { return result }
+    server.held = server.held - call.buffer.length - call.data.length
+    let kept: List<Call> = []; for old in server.calls { if old.id != id { kept.add(old) } }; server.calls = kept
+    return errors.boolean(true)
+}
 function position(server: Server, id: Integer): Integer { for i in 0..server.calls.length { if server.calls[i].id == id { return i } }; return -1 }
 function varint(cursor: Cursor): Integer {
     let value = 0; let shift = 0
@@ -161,15 +190,17 @@ function drain(server: Server, call: Call): errors.BooleanResult {
 function acceptHeaders(server: Server, nowMillis: Integer) {
     let request = h2.requests(server.transport)
     while h2.requestOk(request) {
+        if server.calls.length >= 64 {
+            h2.resetStream(server.transport, h2.streamID(request), 7)
+            request = h2.requests(server.transport); continue
+        }
         let fields = h2.headers(request); let timeout = timeoutMillis(h2.headerValue(fields, "grpc-timeout"))
         let call = Call { id: h2.streamID(request); buffer: Bytes(); data: Bytes(); opened: false; notified: false
             token: Bytes(); exit: ""; connection: ""; deadline: 0; due: 0; monoDue: 0; timeout: timeout
             acceptedWall: nowMillis; acceptedMono: server.mono; status: false; accepted: false; ended: false; error: errors.none()
-            explicitTimeout: h2.headerValue(fields, "grpc-timeout") != ""; deadlineActive: true }
+            explicitTimeout: h2.headerValue(fields, "grpc-timeout") != ""; deadlineActive: true; closedNotified: false }
         if timeout >= 0 && timeout < 9223372036854775807 - nowMillis { call.due = nowMillis + timeout }
         if server.mono >= 0 && timeout >= 0 && timeout < 9223372036854775807 - server.mono { call.monoDue = server.mono + timeout }
-        let kept: List<Call> = []
-        for old in server.calls { if !(old.ended && old.buffer.length == 0 && old.data.length == 0) { kept.add(old) } }; server.calls = kept
         server.calls.add(call)
         let duplicate = false; let names: List<Text> = []
         for field in fields {
@@ -270,11 +301,12 @@ public function closeStream(server: Server, id: Integer, code: Integer, message:
 }
 function expire(server: Server, call: Call) {
     if call.ended { return }
-    let result = terminate(server, call, 4, "deadline exceeded")
-    if errors.booleanOk(result) {
+    if !errors.isError(call.error) {
         call.error = problem(errors.timedOutCode(), "gRPC deadline exceeded")
         server.held = server.held - call.buffer.length - call.data.length; call.buffer = Bytes(); call.data = Bytes()
+        h2.discardPendingData(server.transport, call.id)
     }
+    let result = terminate(server, call, 4, "deadline exceeded")
 }
 public function tick(server: Server, nowMillis: Integer): errors.BooleanResult {
     if nowMillis < 0 { return failure(errors.invalidDataCode(), "invalid Unix millisecond clock") }
