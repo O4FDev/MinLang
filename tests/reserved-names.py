@@ -22,12 +22,13 @@ class ReservedNames(CompilerTestCase):
                 self.rejects(f'function {name}() {{}}\n', f"function '{name}' uses a reserved built-in name")
 
     def test_methods_fields_and_longer_names_keep_their_namespace(self):
-        self.executes('''record Helpers { joinText: Integer }
+        self.executes('''record Helpers { joinText: Integer; Map: Integer }
 function joinTextLocal(): Integer { return 7 }
-let helpers = Helpers { joinText: 3 }
+let helpers = Helpers { joinText: 3; Map: 4 }
 print(helpers.joinText)
 print(joinTextLocal())
-''', '3\n7\n')
+print(helpers.Map)
+''', '3\n7\n4\n')
 
 
 if __name__ == '__main__': unittest.main(verbosity=2)

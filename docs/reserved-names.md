@@ -16,6 +16,7 @@ their module alias and do not reserve every module's function namespace.
 | `Character` |
 | `Float` |
 | `Integer` |
+| `Map` |
 | `Text` |
 | `abs` |
 | `acos` |
