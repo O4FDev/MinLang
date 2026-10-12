@@ -28,8 +28,8 @@ Every proposed integration will receive an independent review subagent before th
 ## Boat and spending
 
 - W `bx_w8xs3uwb` and Y `bx_y2vp5byg` extended with included credit until 17:27 UTC.
-- Dedicated Linux `bx_q9mdad57` for QUIC and `bx_3uusc6gg` for preserved collector stress created with included credit, six-hour lifetimes.
-- Neo-db released W after final native/SAN qualification; the dedicated transport box completed its frozen-source run and now owns the two existing build-wiring fixture repairs. Y prepares the retained Windows VM.
+- Dedicated transport `bx_q9mdad57` completed its reviewed work and is stopped with a verified snapshot. `bx_3uusc6gg` now owns Mac compiler/codegen offload and bounded serial native qualification.
+- W now belongs to combined LLVM22/23 qualification; Y's retained Windows VM and same-source checkout are prepared under the existing resource guardian. Generic owns full Linux/downstream qualification.
 - Dedicated 8-CPU/16-GiB Linux `bx_utb76q3g` allocated through 17:50 UTC for whole-tree/downstream qualification and Boat-generated Mac artifacts; dependency setup only until source freeze.
 - New paid spend: **$0 / $10**. Other projects' existing Boat boxes are not allocated to this programme.
 - No heavy local builds, long local tests, local Windows execution, force pushes or URL opening.
@@ -40,7 +40,7 @@ Every proposed integration will receive an independent review subagent before th
 - Transport `cb8fe9f` received independent R2 approval and passed final 172 native + 172 ASan/UBSan/LSan RFC cases, ACK/PTO, yamux/cancel/independent Go/1536/FIN, net-connect and strict edge/full262144-route controls. All1313 input hashes match Git and before/after. Normal integration `7edba35`; reviewed38 original-ref history at `e297113` leaves its source unchanged.
 - Neo-db frozen `34833a6` fixes all ten R1 findings plus actual overflow, APPEND/position, negative-boundary, stderr-progress and in-flight signal rollback RED controls. Final W native/SAN maintained and network suites pass; independent R2 approved and integration is complete. Native Mac and Boat Windows net still require final combined qualification.
 - Both pre-existing build-wiring fixture failures are repaired and independently approved: complete isolated Make prerequisite and fixed107+6 adapter inventory. Full23-method suite passed on Boat. Combined catalogue/format preflight and full platform suites follow on frozen source.
-- Frozen `4c060044` passed combined catalogue and full build-wiring preflight; pinned format23.1.2 exposed formatting errors in `runtime/native/net.c`, `runtime/native/windows.c` and `tests/cycle-idle-invalidation.c`. A separate formatting-only correction is being qualified before independent review and a revised freeze. No product builds/tests have started on the three platform routes.
+- Frozen `4c060044` passed combined catalogue and full build-wiring preflight; pinned format23.1.2 exposed three layout errors. Formatting-only `94ebf9c` passed the full pinned formatter, catalogue506/24 and build-wiring23/23 and received independent approval, then merged. Its C tokens, literals, directives and assertions are unchanged. Revised source is admitted to the full platform routes; no old bundle or result is relabelled.
 - Current full Linux/macOS/Windows suites and CI remain unqualified; prior passing commits do not qualify this revision.
 - Native macOS is absent on Boat. Owner directed use of this Mac for native checks; heavy builds/long tests remain on Boat. Offloaded ARM64 generation and bounded serial Apple-native checks are being prepared.
 - Owner added Phase 2 item 0: shared-memory threads; start after Phase 1, with ±1% single-thread performance, Boat multicore scaling, TSan stress and a neo-db design note.
