@@ -55,6 +55,10 @@ def assemble(source):
     source, type_dispatch, atom_dispatch = ordinary_control(source)
     adapt = runpy.run_path(str(ROOT / 'scripts/build-module-compiler.py'))['adapt']
     source = adapt(source, (ROOT / 'compiler/managed-graphs-adapter.patch').read_text())
+    source = replace(source, 'borrowReference(output, state, position, 2)',
+        'borrowReference(output, state, position, 2, functionParameterCounts, functionParameterTypes, functionReturnTypes)')
+    source = replace(source, 'borrowReference(output, state, current, elementType)',
+        'borrowReference(output, state, current, elementType, functionParameterCounts, functionParameterTypes, functionReturnTypes)')
     type_position = source.index('    let code = simpleTypeCode(name)', source.index('function takeType('))
     source = source[:type_position] + type_dispatch + source[type_position:]
     atom_position = source.index('    if kind == 1 {', source.index('function parseAtom('))
@@ -105,8 +109,8 @@ def assemble(source):
         '    finishCycleFixups(')
     source = body(source, 'noteCycleFixup', '''    let baseA = typeA
     let baseB = typeB
-    while isListType(baseA) { baseA = listElementType(baseA) }
-    while isListType(baseB) { baseB = listElementType(baseB) }
+    while isContainerType(baseA) { baseA = containerValueType(baseA) }
+    while isContainerType(baseB) { baseB = containerValueType(baseB) }
     if !isRecordType(baseA) && !isRecordType(baseB) { return }
     returnTypes.add(-2)
     returnTypes.add(-1 - piece)
@@ -115,6 +119,10 @@ def assemble(source):
     source = body(source, 'checkListMutation', '''    if isReferenceType(listElementType(listType)) {
         activateCycleType(returnTypes, listType, counts.length)
     }''')
+    source = replace(source, '                    checkMapMutation(receiverType, functionParameterCounts, functionParameterTypes)\n',
+        '                    functionReturnTypes.add(-5)\n'
+        '                    functionReturnTypes.add(receiverType)\n'
+        '                    checkMapMutation(receiverType, functionParameterCounts, functionParameterTypes)\n')
     source = body(source, 'checkFieldMutation', '''    if isReferenceType(fieldType) {
         activateCycleType(returnTypes, recordType, counts.length)
     }''')
@@ -128,8 +136,8 @@ def assemble(source):
     # have been type checked. Markers are filtered against that final graph.
     source = replace(source, '    if (tokenKinds[atom] == 1 && tokenTexts[atom + 1] == "(") || (tokenKinds[atom] == 4 && tokenTexts[atom] == "[") {',
         '    if tokenTexts[atom] != "function" && ((tokenKinds[atom] == 1 && tokenTexts[atom + 1] == "(") || (tokenKinds[atom] == 4 && tokenTexts[atom] == "[")) {')
-    source = replace(source, 'token != "List" && genericDepth == 0',
-        'token != "List" && (token != "Callback" || tokenTexts[position + 1] != "<") && genericDepth == 0')
+    source = replace(source, 'token != "List" && token != "Map" && genericDepth == 0',
+        'token != "List" && token != "Map" && (token != "Callback" || tokenTexts[position + 1] != "<") && genericDepth == 0')
     # Normalize anonymous header state in the shared module name rewriter.
     source = replace(source, '(token == "record" || token == "function") {',
         '(token == "record" || (token == "function" && tokenTexts[position + 1] != "(")) {')

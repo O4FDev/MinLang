@@ -2,18 +2,18 @@
 +++ b/compiler/compiler.min
 @@ -1469,7 +1469,8 @@
          index = index + 1
-         while isListType(type) {
+         while isContainerType(type) {
              if type == listType {
 -                fail("this List mutation could create a reference cycle; construct a new List instead")
 +                activateCycleType(returnTypes, listType, counts.length)
 +                return
              }
-             type = listElementType(type)
+             type = containerValueType(type)
          }
 @@ -1487,6 +1488,169 @@
          }
      }
-     returnTypes.add(listType)
+     if listType >= 0 { returnTypes.add(listType) }
 +}
 +
 +// The existing positive tail entries cache safe mutation types. Negative
@@ -38,7 +38,7 @@
 +
 +function cycleTypeReaches(from: Integer, target: Integer, counts: List<Integer>, fields: List<Integer>): Boolean {
 +    if from == target { return true }
-+    if !isListType(from) && !isRecordType(from) { return false }
++    if !isContainerType(from) && !isRecordType(from) { return false }
 +    let visited: List<Boolean> = []
 +    let position = 0
 +    while position < counts.length / 2 { visited.add(false)
@@ -49,9 +49,9 @@
 +    while position < pending.length {
 +        let type = pending[position]
 +        position = position + 1
-+        while isListType(type) {
++        while isContainerType(type) {
 +            if type == target { return true }
-+            type = listElementType(type)
++            type = containerValueType(type)
 +        }
 +        if type == target { return true }
 +        if isRecordType(type) && !visited[type - 1000] {
@@ -70,16 +70,22 @@
 +
 +function possibleCycleType(type: Integer, counts: List<Integer>, fields: List<Integer>, returnTypes: List<Integer>): Boolean {
 +    let base = type
-+    while isListType(base) { base = listElementType(base) }
++    while isContainerType(base) { base = containerValueType(base) }
 +    if !isRecordType(base) { return false }
 +    let position = counts.length
 +    while position < returnTypes.length {
-+        if returnTypes[position] == type { return false }
-+        position = position + 1
++        // Signed structural payloads can be positive after fixup encoding.
++        // Only standalone cache entries are types; skip all marker payloads.
++        if returnTypes[position] == -2 { position = position + 4 } else {
++            if returnTypes[position] == -3 || returnTypes[position] == -5 { position = position + 2 } else {
++                if type >= 0 && returnTypes[position] == type { return false }
++                position = position + 1
++            }
++        }
 +    }
 +    let starts: List<Integer> = []
-+    if isListType(type) {
-+        starts.add(listElementType(type))
++    if isContainerType(type) {
++        starts.add(containerValueType(type))
 +    } else {
 +        let record = type - 1000
 +        let first = functionParameterOffset(counts, record)
@@ -92,7 +98,7 @@
 +        if cycleTypeReaches(starts[position], type, counts, fields) { return true }
 +        position = position + 1
 +    }
-+    returnTypes.add(type)
++    if type >= 0 { returnTypes.add(type) }
 +    return false
 +}
 +
@@ -101,8 +107,8 @@
 +    // They cannot form a cycle and need no graph query or fixup allocation.
 +    let baseA = typeA
 +    let baseB = typeB
-+    while isListType(baseA) { baseA = listElementType(baseA) }
-+    while isListType(baseB) { baseB = listElementType(baseB) }
++    while isContainerType(baseA) { baseA = containerValueType(baseA) }
++    while isContainerType(baseB) { baseB = containerValueType(baseB) }
 +    if !isRecordType(baseA) && !isRecordType(baseB) { return }
 +    if possibleCycleType(typeA, counts, fields, returnTypes) || possibleCycleType(typeB, counts, fields, returnTypes) {
 +        returnTypes.add(-2)
@@ -113,7 +119,7 @@
 +}
 +
 +function cycleTypeActive(type: Integer, returnTypes: List<Integer>, counts: List<Integer>, fields: List<Integer>): Boolean {
-+    if !isListType(type) && !isRecordType(type) { return false }
++    if !isContainerType(type) && !isRecordType(type) { return false }
 +    let position = counts.length
 +    while position + 1 < returnTypes.length {
 +        if returnTypes[position] == -3 {
@@ -264,7 +270,7 @@
      output.add(" = call ptr @minyar_list_new()\n")
      let references = false
      if isReferenceType(elementType) {
-+        noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, constructor, 100000 + elementType, 0)
++        noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, constructor, makeListType(elementType), 0)
          output.add("  call void @minyar_list_references(ptr ")
          output.add(value)
          output.add(")\n")
@@ -272,26 +278,17 @@
              fail("all values in a List literal must have the same type")
          }
          if isReferenceType(elementType) && !references {
-+            noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, constructor, 100000 + elementType, 0)
++            noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, constructor, makeListType(elementType), 0)
              output.add("  call void @minyar_list_references(ptr ")
              output.add(value)
              output.add(")\n")
              references = true
          }
          let slot = valueAsListSlot(output, textState, state, item, elementType)
-+        noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, 100000 + elementType, elementType)
++        noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, makeListType(elementType), elementType)
          if takeResult(output, state, item, itemType) {
              output.add("  call void @minyar_list_add_take(ptr ")
          } else {
-@@ -3320,6 +3498,7 @@
-     let kind = tokenKinds[tokenIndex]
-     let token = tokenTexts[tokenIndex]
-     let value = ""
-+
--
-+
-     if kind == 1 {
-         if token == "true" || token == "false" {
 @@ -4014,7 +4193,7 @@
 -
 +
@@ -383,7 +380,9 @@
                      } else {
 @@ -4253,7 +4441,7 @@
                  }
-                 receiver = readListElement(output, textState, state, receiver, position, elementType)
+                 if isMapType(receiverType) { receiver = readMapElement(output, textState, state, receiver, position, elementType) } else {
+                     receiver = readListElement(output, textState, state, receiver, position, elementType)
+                 }
                  receiverType = elementType
 -                borrowReference(output, state, receiver, receiverType)
 +                borrowReference(output, state, receiver, receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes)

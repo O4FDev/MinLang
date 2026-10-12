@@ -33,18 +33,18 @@ def assemble():
         '        requestResultConstructor(tokenKinds, tokenTexts, tokenLines, state)\n    }\n')
     source = source[:start] + tail + source[end:]
     source = replace(source,
-        'texts[position - 1] == "List" || texts[position - 1] == "Callback")',
-        'texts[position - 1] == "List" || texts[position - 1] == "Callback" || texts[position - 1] == "Result")')
+        'texts[position - 1] == "List" || texts[position - 1] == "Map" || texts[position - 1] == "Callback")',
+        'texts[position - 1] == "List" || texts[position - 1] == "Map" || texts[position - 1] == "Callback" || texts[position - 1] == "Result")')
     source = replace(source,
-        'token != "List" && (token != "Callback" || tokenTexts[position + 1] != "<") && genericDepth == 0',
-        'token != "List" && token != "Result" && (token != "Callback" || tokenTexts[position + 1] != "<") && genericDepth == 0')
+        'token != "List" && token != "Map" && (token != "Callback" || tokenTexts[position + 1] != "<") && genericDepth == 0',
+        'token != "List" && token != "Map" && token != "Result" && (token != "Callback" || tokenTexts[position + 1] != "<") && genericDepth == 0')
     source = replace(source,
         '                if kind == 4 && token == ":" && (declarationMode == 1 || functionHeader || letDeclaration) {',
         '                if kind == 1 && (token == "Ok" || token == "Err") && tokenTexts[position + 1] == "<" { typeMode = true; genericDepth = 0 }\n'
         '                if kind == 4 && token == ":" && (declarationMode == 1 || functionHeader || letDeclaration) {')
     source = replace(source,
-        'token != "List" && token != "Result" && (token != "Callback"',
-        'token != "Ok" && token != "Err" && token != "List" && token != "Result" && (token != "Callback"')
+        'token != "List" && token != "Map" && token != "Result" && (token != "Callback"',
+        'token != "Ok" && token != "Err" && token != "List" && token != "Map" && token != "Result" && (token != "Callback"')
     source = replace(source,
         '        let pieces = compileEntryWithLibrary(argument(0), stackOwnerLimit, library)\n',
         '        let pieces = compileEntryWithLibrary(argument(0), stackOwnerLimit, library)\n'

@@ -67,6 +67,18 @@ function callbackTypePositions(kinds: List<Integer>, texts: List<Text>): List<Bo
                 cursor = cursor + 1
             }
         }
+        if kinds[position] == 1 && texts[position] == "Map" && position + 1 < kinds.length && texts[position + 1] == "<" {
+            let cursor = position + 1
+            let depth = 0
+            while cursor < kinds.length && kinds[cursor] != 0 {
+                positions[cursor] = true
+                if texts[cursor] == "<" { depth = depth + 1 }
+                if texts[cursor] == ">" { depth = depth - 1 }
+                if texts[cursor] == ">>" { depth = depth - 2 }
+                cursor = cursor + 1
+                if depth <= 0 { break }
+            }
+        }
         position = position + 1
     }
     return positions
@@ -85,7 +97,7 @@ function normalizeCallbackTokens(kinds: List<Integer>, texts: List<Text>, lines:
         let text = texts[position]
         let origin = sourcePath(outputLines, tokenPath(lines, position))
         if !typePositions[position] { depth = 0 }
-        if kinds[position] == 4 && text == "<" && position > 0 && typePositions[position] && (depth > 0 || texts[position - 1] == "List" || texts[position - 1] == "Callback") { depth = depth + 1 }
+        if kinds[position] == 4 && text == "<" && position > 0 && typePositions[position] && (depth > 0 || texts[position - 1] == "List" || texts[position - 1] == "Map" || texts[position - 1] == "Callback") { depth = depth + 1 }
         if kinds[position] == 4 && text == ">>" && depth >= 2 {
             copyModuleToken(outputKinds, outputTexts, outputLines, 4, ">", lines, position, origin)
             copyModuleToken(outputKinds, outputTexts, outputLines, 4, ">", lines, position, origin)
@@ -126,6 +138,8 @@ function callbackSignatureTypes(name: Text): List<Integer> {
     while position < name.length && name[position] != ':' { position = position + 1 }
     while position < name.length {
         position = position + 1
+        let negative = false
+        if position < name.length && name[position] == '-' { negative = true; position = position + 1 }
         let value = 0
         while position < name.length && name[position] != ':' {
             let digit = findCharacter("0123456789", name[position])
@@ -133,6 +147,7 @@ function callbackSignatureTypes(name: Text): List<Integer> {
             value = value * 10 + digit
             position = position + 1
         }
+        if negative { value = -value }
         types.add(value)
     }
     return types
@@ -337,7 +352,7 @@ function parseClosure(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
     let captured: List<Integer> = []
     let local = 0
     while local < state[3] {
-        if localTypes[local] > 0 && findLocal(localNames, localLengths, state, localNames[local]) == local && findText(parameters, localNames[local]) < 0 && callbackReadsName(tokenKinds, tokenTexts, state[0], end, localNames[local]) {
+        if (localTypes[local] > 0 || isContainerType(localTypes[local])) && findLocal(localNames, localLengths, state, localNames[local]) == local && findText(parameters, localNames[local]) < 0 && callbackReadsName(tokenKinds, tokenTexts, state[0], end, localNames[local]) {
             captured.add(local)
         }
         local = local + 1
@@ -512,6 +527,19 @@ function compileClosureBodies(tokenKinds: List<Integer>, tokenTexts: List<Text>,
 }
 
 function finishCallbackGraph(returns: List<Integer>, counts: List<Integer>, fields: List<Integer>) {
+    // Capture/environment edges can be discovered after a Map store was
+    // lowered, including stores in functions declared before their callers.
+    let mutation = counts.length
+    while mutation + 1 < returns.length {
+        if returns[mutation] == -5 {
+            checkMapMutation(returns[mutation + 1], counts, fields)
+            mutation = mutation + 2
+        } else {
+            if returns[mutation] == -2 { mutation = mutation + 4 } else {
+                if returns[mutation] == -3 { mutation = mutation + 2 } else { mutation = mutation + 1 }
+            }
+        }
+    }
     let position = counts.length
     while position + 1 < returns.length {
         if returns[position] == -3 {

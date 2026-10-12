@@ -62,8 +62,8 @@ def assemble():
     source = replace(source, signature, signature +
         '    if resultPrefix(recordName, "minyar_result_type_") {\n'
         '        fail("Result payloads are only accessible through match or try")\n    }\n')
-    source = replace(source, 'token != "List" && (token != "Callback" || tokenTexts[position + 1] != "<") && genericDepth == 0',
-        'token != "List" && token != "Result" && (token != "Callback" || tokenTexts[position + 1] != "<") && genericDepth == 0')
+    source = replace(source, 'token != "List" && token != "Map" && (token != "Callback" || tokenTexts[position + 1] != "<") && genericDepth == 0',
+        'token != "List" && token != "Map" && token != "Result" && (token != "Callback" || tokenTexts[position + 1] != "<") && genericDepth == 0')
     # The maintained core owns the scalar parallel ABI. Review that complete
     # signature guard exactly once; Result normalization must preserve it.
     parallel_guard = (
@@ -79,8 +79,8 @@ def assemble():
     source = replace(source, '                if kind == 4 && token == ":" && (declarationMode == 1 || functionHeader || letDeclaration) {',
         '                if kind == 1 && (token == "Ok" || token == "Err") && tokenTexts[position + 1] == "<" { typeMode = true; genericDepth = 0 }\n'
         '                if kind == 4 && token == ":" && (declarationMode == 1 || functionHeader || letDeclaration) {')
-    source = replace(source, 'token != "List" && token != "Result" && (token != "Callback"',
-        'token != "Ok" && token != "Err" && token != "List" && token != "Result" && (token != "Callback"')
+    source = replace(source, 'token != "List" && token != "Map" && token != "Result" && (token != "Callback"',
+        'token != "Ok" && token != "Err" && token != "List" && token != "Map" && token != "Result" && (token != "Callback"')
     pos = source.index('\nfunction main(')
     source = source[:pos] + '\n' + (ROOT / 'compiler/errors-compiler.min').read_text() + source[pos:]
     names = re.findall(r'^function (\w+)\(', source, re.M)

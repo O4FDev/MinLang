@@ -16,7 +16,8 @@ def engine_source(project):
         if source.count(directive) != 1:
             raise ValueError('cycle runtime requires exactly one ' + directive)
         source = source.replace(directive, '#include "' + traced + '"')
-    prefix = ('#if defined(__GNUC__) || defined(__clang__)\n'
+    prefix = ('#define MINYAR_MAP_CYCLE_RUNTIME 1\n'
+              '#if defined(__GNUC__) || defined(__clang__)\n'
               '#define MINYAR_NOINLINE __attribute__((noinline))\n'
               '#else\n#define MINYAR_NOINLINE\n#endif\n')
     return '#define MINYAR_SORT_GRAPH 1\n' + prefix + source + '\n#include "minyar_callbacks.h"\n'
