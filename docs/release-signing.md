@@ -141,6 +141,26 @@ registry settings or machine stores. A changed store/key cleanup failure is a
 failed test, not a successful signature. These TEST keys are unrelated to the
 hardware/cloud signer needed for production.
 
+### Maintained gate registration
+
+`make check-release-signing` runs only the Python contract suite and has no
+compiler/build dependency. `check-shipping`, `check` and `check-portable` include
+it. Set `RELEASE_TEST_PYTHON` to an installed interpreter when needed; for example,
+the permitted local contract check is:
+
+```sh
+make check-release-signing RELEASE_TEST_PYTHON=/opt/homebrew/bin/python3.11 \
+  RELEASE_TEST_ENV='env DYLD_LIBRARY_PATH=/opt/homebrew/opt/expat/lib'
+```
+
+`make check-release-pipeline` is an explicit native gate. Supply the complete
+platform, credential-context, tool and fresh TEST output arguments shown above
+in `RELEASE_PIPELINE_ARGS`, and select native Python with `RELEASE_TEST_PYTHON`.
+With no arguments it refuses through the harness's argument parser. This gate
+is not a dependency of shipping or portable checks. Registering a Make target
+does not authorize trusted signing on the owner's Mac or start a Boat guest.
+The manual workflow invokes the same native harness directly.
+
 ## Production: exact owner inputs and commands
 
 Production provisioning below is an **OWNER-RUN checklist**, never an agent
