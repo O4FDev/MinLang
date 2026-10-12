@@ -411,15 +411,27 @@ check-list-access: build/minyarc build/minyar-runtime.o
 check-list-access-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/list-access.py
 
-.PHONY: check-checked-arithmetic check-checked-arithmetic-sanitize
+.PHONY: check-checked-arithmetic check-checked-arithmetic-sanitize check-checked-results check-checked-results-sanitize check-checked-results-frontends check-checked-results-frontends-sanitize
 check-checked-arithmetic: build/minyarc build/minyar-runtime.o
 	$(LIMITED) python3 tests/checked-arithmetic.py
 
 check-checked-arithmetic-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/checked-arithmetic.py
 
-check-portable check: check-checked-arithmetic
-check-sanitize: check-checked-arithmetic-sanitize
+check-checked-results: build/minyarc build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/checked-results.py
+
+check-checked-results-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/checked-results.py
+
+check-checked-results-frontends: build/minyarc-modules build/minyarc-callbacks build/minyarc-errors build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/checked-results-frontends.py
+
+check-checked-results-frontends-sanitize: build/minyarc-modules-sanitize build/minyarc-callbacks-sanitize build/minyarc-errors-sanitize build/minyar-runtime-sanitize.o
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/checked-results-frontends.py
+
+check-portable check: check-checked-arithmetic check-checked-results check-checked-results-frontends
+check-sanitize: check-checked-arithmetic-sanitize check-checked-results-sanitize check-checked-results-frontends-sanitize
 
 .PHONY: check-checked-scalars check-checked-scalars-sanitize
 check-checked-scalars: build/minyarc build/minyar-runtime.o
