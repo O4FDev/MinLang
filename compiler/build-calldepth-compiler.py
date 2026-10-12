@@ -17,13 +17,19 @@ def edit(source, name, transform):
     return source[:start] + transform(source[start:end]) + source[end:]
 
 
-def adapt(source):
+def adapt(source, *, unwind_hook=None):
     """Apply recovery after the closure/Result and optional thread adapters.
 
     The caller supplies the complete assembled frontend. Anchors fail closed;
     this function does not reconstruct or replace another adapter's source.
+    unwind_hook is optional Minyar emitter source, with output/globals/caller
+    available, run only on accepted unwind before ownership/depth leaves.
     See docs/progress/ws2-calldepth-adapter.md for the shared emitter contract.
     """
+    if unwind_hook is not None and (not isinstance(unwind_hook, str) or not unwind_hook.strip()):
+        raise ValueError('unwind_hook must be nonempty Minyar emitter source')
+    hook_parameters = ', caller: Text, globals: List<Text>' if unwind_hook is not None else ''
+    hook_arguments = ', textState[1], globals' if unwind_hook is not None else ''
     source = body(source, 'takeOwner', '    return false')
     source = edit(source, 'parseAtom', lambda s: replace(s,
         '                    if id >= 0 && resultType.length > 3 && resultType[2] == id && resultType[3] == tokenIndex {\n'
@@ -63,7 +69,7 @@ def adapt(source):
     # Structured return metadata covers named, native, callback and main exits.
     source = replace(source,
         'owners: Integer, references: Boolean) {\n    let entry: List<Text> = []',
-        'owners: Integer, references: Boolean, returnedType: Text) {\n    let entry: List<Text> = []')
+        'owners: Integer, references: Boolean, returnedType: Text' + hook_parameters + ') {\n    let entry: List<Text> = []')
     source = edit(source, 'finishFunctionEntry', lambda s: replace(replace(s,
         '    entry.add("  call void @minyar_stack_enter()\\n")\n',
         '    entry.add("  %recovery.accepted = call i32 @minyar_recovery_enter()\\n")\n'
@@ -73,20 +79,21 @@ def adapt(source):
         '    output[slot] = joinText(entry)\n',
         '    output[slot] = joinText(entry)\n'
         '    output.add("\\nrecovery.unwind:\\n")\n'
+        + (''.join('    ' + line + '\n' for line in unwind_hook.strip().splitlines()) if unwind_hook is not None else '') +
         '    if references { output.add("  call void @minyar_rc_leave()\\n") }\n'
         '    output.add("  call void @minyar_stack_leave()\\n")\n'
         '    output.add(recoveryDummy(returnedType))\n'))
     source = replace(source,
         'finishFunctionEntry(output, entrySlot, state[4], parameterNames.length, state[8], state[6] == 1)',
         'if !depthBoundary && !machineIntrinsic {\n'
-        '            finishFunctionEntry(output, entrySlot, state[4], parameterNames.length, state[8], state[6] == 1, emittedReturn)\n'
+        '            finishFunctionEntry(output, entrySlot, state[4], parameterNames.length, state[8], state[6] == 1, emittedReturn' + hook_arguments + ')\n'
         '        }')
     source = replace(source,
         'finishFunctionEntry(output, entrySlot, state[4], 0, state[8], state[6] == 1)',
-        'finishFunctionEntry(output, entrySlot, state[4], 0, state[8], state[6] == 1, "i32")')
+        'finishFunctionEntry(output, entrySlot, state[4], 0, state[8], state[6] == 1, "i32"' + hook_arguments + ')')
     source = replace(source,
         'finishFunctionEntry(output, entry, state[4], parameters.length, state[8], state[6] == 1)',
-        'finishFunctionEntry(output, entry, state[4], parameters.length, state[8], state[6] == 1, llvmType(result))\n'
+        'finishFunctionEntry(output, entry, state[4], parameters.length, state[8], state[6] == 1, llvmType(result)' + hook_arguments + ')\n'
         '            if stackOwnerLimit > 0 && state[14] == 0 && state[6] == 1 && state[8] >= 1 && state[8] <= stackOwnerLimit {\n'
         '                finishStackOwnership(output, entry, state[8])\n            }')
     source = replace(source,
@@ -147,8 +154,8 @@ def adapt(source):
                     'void @minyar_callback_check_environment(ptr)',
                     'i32 @minyar_recovery_enter()', 'i32 @minyar_recovery_pending()',
                     'void @minyar_calldepth_begin(ptr, i64)', 'i32 @minyar_calldepth_end(ptr)',
-                    'i64 @minyar_calldepth_remaining()', 'void @minyar_calldepth_reporting_begin()',
-                    'void @minyar_calldepth_reporting_end()']
+                    'i64 @minyar_calldepth_remaining()', 'i32 @minyar_calldepth_reporting_begin()',
+                    'i32 @minyar_calldepth_reporting_end()']
     source = replace(source, '    output.add("declare void @minyar_stack_enter()\\n")\n',
         '    output.add("; minyar-calldepth-policy: cooperative-v1-full-program\\n")\n' +
         '    output.add("; minyar-callback-runtime: 1\\n")\n' +

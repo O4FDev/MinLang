@@ -33,6 +33,9 @@ EXPECTED = {
     'domain-rejection': 'domain checked before depth state\n',
     'reporting-exhausted': '17\n0\n-1\n',
     'large-dispatch': '1450\nfalse\n',
+    'reporting-global': '14\n17\n0\n42\nalive\n',
+    'reporting-fallback': '85\n14\n17\n42\nalive\n',
+    'reporting-physical': '14\n42\nalive\n',
 }
 
 
@@ -47,6 +50,8 @@ def main():
     parser.add_argument('--small-stack', action='store_true')
     parser.add_argument('--large-dispatch', action='store_true')
     parser.add_argument('--lto', action='store_true', help='Include the Linux ThinLTO/lld gate.')
+    parser.add_argument('--max-depth', type=int)
+    parser.add_argument('--fallback-depth', type=int)
     args = parser.parse_args()
     if args.lto and platform.system() != 'Linux': parser.error('--lto requires Linux/lld')
     if args.small_stack and windows_host(): parser.error('--small-stack requires POSIX setrlimit')
@@ -119,13 +124,15 @@ __attribute__((destructor)) static void depth_exit_contract(void) {
     assert(minyar_depth_scope == NULL);
     assert(minyar_depth_reporting == 0);
 }
-''')
+''' + (ROOT / 'tests/calldepth-reporting-native.c').read_text())
     policy = []
     if args.profile == 'system': policy = ['-DMINYAR_SYSTEM_HEAP=1']
     if args.profile in ('fixed', 'lazy'):
         policy = ['-DMINYAR_BOUNDED_HEAP=1', '-DMINYAR_BOUNDED_HEAP_BYTES=16777216']
     if args.profile == 'lazy': policy += ['-DMINYAR_LAZY_HEAP=1']
     policy += ['-DMINYAR_RC_POLL_BUDGET=' + str(args.budget)]
+    if args.max_depth is not None: policy += ['-DMINYAR_MAX_CALL_DEPTH=' + str(args.max_depth)]
+    if args.fallback_depth is not None: policy += ['-DMINYAR_FALLBACK_CALL_DEPTH=' + str(args.fallback_depth)]
     for fixture in ('calldepth-runtime', 'calldepth-thread-local'):
         if fixture.endswith('thread-local') and windows_host():
             print('pthread scope isolation requires a POSIX host', flush=True)
@@ -136,8 +143,30 @@ __attribute__((destructor)) static void depth_exit_contract(void) {
         run(clang + ['-O2'] + flags + definitions + [ROOT / 'tests' / (fixture + '.c'),
             '-lm'] + ([] if windows_host() else ['-pthread']) + ['-o', executable])
         run([executable], '')
+    for name, definitions, controls in (
+            ('global', ['-DMINYAR_MAX_CALL_DEPTH=2'], ('global', 'bounded', 'physical', 'escape')),
+            ('fallback', ['-DMINYAR_MAX_CALL_DEPTH=1000', '-DMINYAR_FALLBACK_CALL_DEPTH=16'], ('fallback',))):
+        executable = args.evidence / ('reporting-controls-' + name)
+        run(clang + ['-O2'] + flags + ['-DMINYAR_SYSTEM_HEAP=1'] + definitions +
+            [ROOT / 'tests/calldepth-reporting.c', '-lm'] +
+            ([] if windows_host() else ['-pthread']) + ['-o', executable])
+        for control in controls:
+            run([executable, control], 'escaped pending status 2\n' if control == 'escape' else
+                'nested failure; success; alive\n')
     modes = ['O0', 'O2'] + (['LTO'] if args.lto and not args.sanitize else [])
-    cases = args.case or [case for case in EXPECTED if case != 'large-dispatch']
+    cases = args.case or [case for case in EXPECTED if case not in ('large-dispatch', 'reporting-global', 'reporting-fallback')]
+    libraries = ['--library', ROOT / 'library']
+    if any(case.startswith('reporting-') and case != 'reporting-exhausted' for case in cases):
+        # Test-only one-frame inspectors permit MAX=2 without changing the
+        # actual factory bodies or asking the ordinary native ABI for records.
+        overlay = args.evidence / 'library'
+        overlay.mkdir(exist_ok=True)
+        (overlay / 'calldepth.min').write_bytes((ROOT / 'library/calldepth.min').read_bytes())
+        (overlay / 'errors.min').write_text((ROOT / 'library/errors.min').read_text() + '''
+public function depthTestCode(result: IntegerResult): Integer { return result.error.code }
+public function depthTestValue(result: IntegerResult): Integer { return result.value }
+''')
+        libraries = ['--library', overlay] + libraries
     if args.large_dispatch and 'large-dispatch' not in cases: cases += ['large-dispatch']
     generated_dispatch = None
     if 'large-dispatch' in cases:
@@ -162,13 +191,13 @@ __attribute__((destructor)) static void depth_exit_contract(void) {
         for case in cases:
             source = generated_dispatch if case == 'large-dispatch' else ROOT / 'tests/calldepth' / (case + '.min')
             llvm = args.evidence / (case + '.' + mode + '.ll')
-            run([args.compiler, source, llvm, '--library', ROOT / 'library', '--bounded-owners', str(args.budget)])
+            run([args.compiler, source, llvm, *libraries, '--bounded-owners', str(args.budget)])
             assert '; minyar-calldepth-policy: cooperative-v1-full-program' in llvm.read_text()
             if case == 'large-dispatch': assert 'dispatch.found:' not in llvm.read_text()
             if args.sanitize: prepare_llvm_for_link(llvm, flags)
             executable = llvm.with_suffix('.bin')
             run(clang + optimization + flags + ['-Wno-override-module', llvm, runtime, '-lm', '-o', executable])
-            run([executable], EXPECTED[case], stack=args.small_stack and case == 'native-reserve',
+            run([executable], EXPECTED[case], stack=args.small_stack and case in ('native-reserve', 'reporting-physical'),
                 status=1 if case == 'domain-rejection' else 0,
                 stderr='Minyar stopped: callback belongs to a different execution domain.\n' if case == 'domain-rejection' else '')
             print(mode, case, 'passed', flush=True)
@@ -176,7 +205,8 @@ __attribute__((destructor)) static void depth_exit_contract(void) {
              for p in args.evidence.rglob('*') if p.is_file()}
     inputs = {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
         for directory in ('runtime', 'compiler', 'library', 'tests/calldepth') for p in (ROOT / directory).glob('*') if p.is_file()}
-    for name in ('calldepth.py', 'calldepth-runtime.c', 'calldepth-thread-local.c'):
+    for name in ('calldepth.py', 'calldepth-runtime.c', 'calldepth-thread-local.c',
+                 'calldepth-reporting.c', 'calldepth-reporting-native.c', 'memory-contracts-runtime.c', 'clang_helpers.py'):
         p = ROOT / 'tests' / name
         inputs[str(p.relative_to(ROOT))] = hashlib.sha256(p.read_bytes()).hexdigest()
     inputs[str(args.compiler)] = hashlib.sha256(args.compiler.read_bytes()).hexdigest()

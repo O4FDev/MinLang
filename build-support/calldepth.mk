@@ -16,7 +16,7 @@ build/minyarc-calldepth: build/calldepth-compiler-stage2.ll build/minyar-compile
 build/calldepth-compiler-stage3.ll: build/calldepth-compiler.min build/minyarc-calldepth
 	$(LIMITED) ./build/minyarc-calldepth $< $@
 
-.PHONY: check-calldepth check-calldepth-sanitize check-calldepth-profiles check-calldepth-launcher
+.PHONY: check-calldepth check-calldepth-sanitize check-calldepth-profiles check-calldepth-launcher check-calldepth-reporting check-calldepth-reporting-sanitize check-calldepth-hooks check-calldepth-hooks-sanitize
 check-calldepth: build/minyarc-calldepth build/calldepth-compiler-stage3.ll
 	cmp build/calldepth-compiler-stage2.ll build/calldepth-compiler-stage3.ll
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/calldepth.py
@@ -38,5 +38,19 @@ check-calldepth-profiles: build/minyarc-calldepth
 check-calldepth-launcher: build/minyarc-calldepth build/minyarc-errors-request build/minyarc-errors build/minyarc-callbacks build/minyarc-modules build/minyar-module-build $(MANAGED_GRAPH_LAUNCHER_ARTIFACTS)
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/calldepth-launcher.py
 
-check check-portable: check-calldepth check-calldepth-launcher
-check-sanitize: check-calldepth-sanitize
+check-calldepth-reporting: build/minyarc-calldepth
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/calldepth.py --case reporting-global --max-depth 2 --evidence build/calldepth-global-evidence
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/calldepth.py --case reporting-fallback --fallback-depth 16 --evidence build/calldepth-fallback-evidence
+
+check-calldepth-reporting-sanitize: build/minyarc-calldepth
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/calldepth.py --case reporting-global --max-depth 2 --sanitize --evidence build/calldepth-global-sanitize-evidence
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/calldepth.py --case reporting-fallback --fallback-depth 16 --sanitize --evidence build/calldepth-fallback-sanitize-evidence
+
+check-calldepth-hooks: build/minyarc build/minyar-compiler-runtime.ll
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/calldepth-hooks.py
+
+check-calldepth-hooks-sanitize: build/minyarc build/minyar-compiler-runtime.ll
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/calldepth-hooks.py --sanitize --evidence build/calldepth-hook-sanitize-evidence
+
+check check-portable: check-calldepth check-calldepth-launcher check-calldepth-reporting check-calldepth-hooks
+check-sanitize: check-calldepth-sanitize check-calldepth-reporting-sanitize check-calldepth-hooks-sanitize

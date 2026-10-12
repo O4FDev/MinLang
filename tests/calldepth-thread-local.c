@@ -9,6 +9,8 @@ static void *scope_thread(void *argument) {
     size_t limit = (size_t)argument;
     MinyarDepthScope scope;
     assert(minyar_calldepth_remaining() == -1);
+    assert(!minyar_depth_report_base && !minyar_depth_report_parent &&
+           !minyar_depth_report_failed && !minyar_depth_escaped);
     minyar_calldepth_begin(&scope, (long long)limit);
     for (size_t i = 0; i < limit; ++i) assert(minyar_recovery_enter());
     assert(!minyar_recovery_enter());
