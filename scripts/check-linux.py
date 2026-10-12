@@ -23,7 +23,7 @@ BUILD = ['build/minyarc', 'build/compiler-stage3.ll', 'build/minyarc-sanitize',
          'build/minyar-runtime.o', 'build/minyar-runtime-sanitize.o', 'build/ownership-runtime.o',
          'build/runtime-unit', 'build/runtime-unit-sanitize',
          'build/module-compiler-stage3.ll']
-TARGETS = ['check-foundation-baseline', 'check-quic-official-adapter', 'check-quic-amplification-ledger', 'check-quic-rfc', 'check-quic-rfc-sanitize', 'check-generated-llvm-sanitizer', 'check-linux-snapshot', 'check-cycle-private-retirement', 'check-cycle-private-retirement-sanitize', 'check-parallel-signatures', 'check-parallel-signatures-sanitize', 'check-quic-pto', 'check-quic-pto-sanitize', 'check-quic-ack', 'check-quic-ack-sanitize', 'check-quic-interop-results', 'check-toolchain-stamp', 'check-toolchain-portability', 'check-cold-bootstrap',
+TARGETS = ['check-raw-syscall-linux-native', 'check-raw-syscall-sanitize', 'check-raw-syscall-abi', 'check-raw-syscall-frontends', 'check-foundation-baseline', 'check-quic-official-adapter', 'check-quic-amplification-ledger', 'check-quic-rfc', 'check-quic-rfc-sanitize', 'check-generated-llvm-sanitizer', 'check-linux-snapshot', 'check-cycle-private-retirement', 'check-cycle-private-retirement-sanitize', 'check-parallel-signatures', 'check-parallel-signatures-sanitize', 'check-quic-pto', 'check-quic-pto-sanitize', 'check-quic-ack', 'check-quic-ack-sanitize', 'check-quic-interop-results', 'check-toolchain-stamp', 'check-toolchain-portability', 'check-cold-bootstrap',
            'check-bootstrap-policy', 'check-peer-semantics', 'check-memory-regressions',
            'check-bootstrap-portability', 'check-bootstrap-records',
            'check-measurement-stats', 'check-budget-harness', 'check-stack-limits',

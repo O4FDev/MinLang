@@ -1,0 +1,63 @@
+// VMM-1 regression: a regular-file KVM ioctl is deterministic without /dev/kvm.
+// Python supplies Linux ABI numbers and owns the file/data oracle.
+use "machine" as machine
+
+function number(text: Text): Integer {
+    let value = 0
+    for character in text { value = value * 10 + Integer(character) - Integer('0') }
+    return value
+}
+function check(value: Integer, expected: Integer, operation: Text) {
+    if value != expected { fail(operation + ": got " + Text(value) + ", expected " + Text(expected)) }
+}
+let path = Bytes(argument(0))
+path.add(0)
+let missing = Bytes(argument(1))
+missing.add(0)
+let page = number(argument(2))
+let getpid = number(argument(3))
+let openat = number(argument(4))
+let close = number(argument(5))
+let read = number(argument(6))
+let write = number(argument(7))
+let seek = number(argument(8))
+let ioctl = number(argument(9))
+let mmap = number(argument(10))
+let msync = number(argument(11))
+let munmap = number(argument(12))
+let pid = machine.syscall(getpid, 0, 0, 0, 0, 0, 0)
+check(machine.syscall(2147483647, 0, 0, 0, 0, 0, 0), -38, "ENOSYS")
+check(machine.syscall(openat, -100, machine.address(missing), 2, 0, 0, 0), -2, "ENOENT")
+check(machine.syscall(close, -1, 0, 0, 0, 0, 0), -9, "EBADF")
+let fd = machine.syscall(openat, -100, machine.address(path), 2, 0, 0, 0)
+if fd <= 0 { fail("openat needs a real nonzero fd") }
+check(machine.syscall(ioctl, fd, 0xAE00, 0, 0, 0, 0), -25, "KVM ioctl ENOTTY")
+check(machine.syscall(read, fd, 1, 1, 0, 0, 0), -14, "read EFAULT")
+check(machine.syscall(write, fd, 1, 1, 0, 0, 0), -14, "write EFAULT")
+// MAP_SHARED, PROT_READ|PROT_WRITE, a real fd, and NONZERO page offset.
+// Page zero is 0x11; page one is 0x72. Anonymous/offset-zero mmap proves less.
+let mapped = machine.syscall(mmap, 0, page, 3, 1, fd, page)
+if mapped < 0 && mapped >= -4095 { fail("file mmap failed: " + Text(mapped)) }
+check(machine.load8(mapped), 0x72, "mmap arg6 first byte")
+check(machine.load8(mapped + page - 1), 0x72, "mmap arg6 last byte")
+machine.store8(mapped, 90)
+machine.store8(mapped + 1, 91)
+check(machine.syscall(msync, mapped, page, 4, 0, 0, 0), 0, "msync MS_SYNC")
+check(machine.syscall(munmap, mapped, page, 0, 0, 0, 0), 0, "munmap")
+let bytes = Bytes("........")
+let pointer = machine.address(bytes)
+machine.store8(pointer, 65)
+check(bytes[0], 65, "address points to first byte")
+check(machine.load8(pointer), 65, "load owner alive")
+check(machine.syscall(seek, fd, page, 0, 0, 0, 0), page, "lseek read")
+check(machine.syscall(read, fd, pointer, bytes.length, 0, 0, 0), 8, "Bytes read")
+check(bytes[0], 90, "read shared map writeback")
+check(bytes[1], 91, "read shared map writeback second")
+machine.store8(pointer + 2, 67)
+check(bytes[2], 67, "store owner alive")
+check(machine.load32(pointer), 0x72435b5a, "load32 owner alive")
+check(machine.syscall(seek, fd, page + 16, 0, 0, 0, 0), page + 16, "lseek write")
+check(machine.syscall(write, fd, pointer, bytes.length, 0, 0, 0), 8, "Bytes write")
+check(bytes.length, 8, "Bytes owner remains alive")
+check(machine.syscall(close, fd, 0, 0, 0, 0, 0), 0, "close")
+print(pid)
