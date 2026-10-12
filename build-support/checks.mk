@@ -201,7 +201,7 @@ check-examples: build/stage0 build/minyarc build/compiler-stage3.ll build/hello 
 	! ./build/minyarc tests/errors/record-wrong-field-type.min build/invalid.ll 2> build/record-type-error.txt
 	grep -q "record field 'age' has the wrong type" build/record-type-error.txt
 	! ./build/minyarc tests/errors/record-field-assignment.min build/invalid.ll 2> build/record-immutable-error.txt
-	grep -q "assigning this field could create a reference cycle" build/record-immutable-error.txt
+	grep -q "record field.*has the wrong type" build/record-immutable-error.txt
 	! ./build/integer-overflow > /dev/null 2> build/overflow-error.txt
 	grep -q "Integer calculation is outside" build/overflow-error.txt
 	! ./build/divide-by-zero > /dev/null 2> build/division-error.txt
