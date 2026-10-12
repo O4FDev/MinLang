@@ -56,7 +56,7 @@ def check(compiler, directory, clang, runtime, profile):
     for source, diagnostic in (
         ('print(missing)\n', "can't find a value named"),
         ('print(9223372036854775808)\n', 'outside the supported range'),
-        ('let value: Integer = "wrong"\n', 'integer'),
+        ('let value: Integer = "wrong"\n', 'declared type'),
     ):
         path = directory / 'invalid.min'
         path.write_text(source)
