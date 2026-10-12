@@ -2227,5 +2227,133 @@ class BuildWiring(unittest.TestCase):
                 verify(fragment.replace('$(ROOT)/' + name, '', 1))
 
 
+    def test_network_sanitizers_select_override_and_complete_directory(self):
+        import json
+        fragment = (ROOT / 'build-support/networking.mk').read_text()
+        with tempfile.TemporaryDirectory(prefix='network sanitizer dispatch ') as temporary:
+            directory = Path(temporary)
+            binaries = directory / 'bin'
+            binaries.mkdir()
+            python = binaries / 'python3'
+            python.write_text('#!' + sys.executable + '\n' +
+                'import json,os,sys\n'
+                'if sys.argv[1:2] in (["tests/net-connect.py"],["tests/net-udp-offload.py"]):\n'
+                ' key="MINYAR_CLANG" if sys.argv[1]=="tests/net-connect.py" else "MINYAR_TEST_CLANG"\n'
+                ' print(json.dumps({"clang":os.environ.get(key),"path":os.environ["PATH"],'
+                '"limit":os.environ.get("NET_PROBE_LIMIT"),"argv":sys.argv[1:]}));sys.exit(0)\n'
+                'if os.environ.get("NET_PROBE_MSYS") and sys.argv[1:2] == ["-c"]:\n'
+                ' sys.path.insert(0,"tools");import host_paths\n'
+                ' host_paths.platform.system=lambda:"MSYS_NT-10.0"\n'
+                ' code=sys.argv[2];sys.argv=["-c",*sys.argv[3:]]\n'
+                ' exec(code,{"__name__":"__main__"});sys.exit(0)\n'
+                'os.execv(sys.executable,[sys.executable,*sys.argv[1:]])\n')
+            python.chmod(0o755)
+            converter = binaries / 'cygpath'
+            converter.write_text('#!' + sys.executable + '\n' +
+                'import json,os,sys\n'
+                'assert len(sys.argv)==3 and sys.argv[1]=="-u",sys.argv\n'
+                'print(json.loads(os.environ["NET_PROBE_TRANSLATIONS"])[sys.argv[2]])\n')
+            converter.chmod(0o755)
+            for name, limit in (('ordinary-limit', 'ordinary'), ('sanitizer-limit', 'sanitizer')):
+                launcher = binaries / name
+                launcher.write_text('#!/bin/sh\nNET_PROBE_LIMIT=' + limit + ' exec "$@"\n')
+                launcher.chmod(0o755)
+            environment = dict(os.environ, PATH=str(binaries) + os.pathsep + os.environ['PATH'])
+            for name in ('MAKEFLAGS', 'MINYAR_SANITIZER_CLANG', 'MINYAR_CLANG', 'MINYAR_TEST_CLANG'):
+                environment.pop(name, None)
+            ordinary = str(directory / 'ordinary UCRT compiler/bin/clang')
+            targets = (
+                ('check-net-connect', 'tests/net-connect.py', [], {'build/minyarc'}),
+                ('check-net-connect-sanitize', 'tests/net-connect.py', ['--sanitize'], {'build/minyarc'}),
+                ('check-net-udp-offload', 'tests/net-udp-offload.py',
+                 ['--evidence', 'build/net-udp-offload'], {'build/minyarc', 'build/minyar-default-runtime.o'}),
+                ('check-net-udp-offload-sanitize', 'tests/net-udp-offload.py',
+                 ['--sanitize', '--evidence', 'build/net-udp-offload-sanitize'],
+                 {'build/minyarc', 'build/minyar-default-runtime.o'}))
+
+            def verify(candidate, sanitizer='', selected_compiler=None, selected_directory=None,
+                       msys=False):
+                probe = directory / 'probe.mk'
+                probe.write_text('LLVM_CC := ' + ordinary + '\n'
+                    'MINYAR_SANITIZER_CLANG := ' + sanitizer + '\n'
+                    'LIMITED := ordinary-limit\nSANITIZER_LIMITED := sanitizer-limit\n' + candidate +
+                    '\n.PHONY: build/minyarc build/minyar-default-runtime.o\n'
+                    'build/minyarc build/minyar-default-runtime.o:\n'
+                    '\t@NET_PROBE_INPUT=$@ LLVM_CC="$(LLVM_CC)" python3 -c '
+                    "'import json,os;print(json.dumps({\"input\":os.environ[\"NET_PROBE_INPUT\"],"
+                    "\"clang\":os.environ[\"LLVM_CC\"],\"path\":os.environ[\"PATH\"]}))'\n")
+                selected_environment = environment.copy()
+                if msys:
+                    selected_environment.update(NET_PROBE_MSYS='1',
+                        NET_PROBE_TRANSLATIONS=json.dumps({sanitizer: selected_compiler}))
+                for target, script, arguments, prerequisites in targets:
+                    result = subprocess.run(['make', '--no-print-directory', '-j1', '-rR', '-s',
+                        '-f', str(probe), target], cwd=ROOT, env=selected_environment,
+                        capture_output=True, text=True, timeout=15)
+                    self.assertEqual(result.returncode, 0, (target, result.stderr))
+                    records = [json.loads(line) for line in result.stdout.splitlines()]
+                    inputs, selected = records[:-1], records[-1]
+                    self.assertEqual({row['input'] for row in inputs}, prerequisites, target)
+                    for row in inputs:
+                        self.assertEqual(row['clang'], ordinary, (target, row))
+                        self.assertEqual(row['path'], environment['PATH'], (target, row))
+                    sanitize = '--sanitize' in arguments
+                    expected_compiler = (selected_compiler or sanitizer or ordinary) if sanitize else ordinary
+                    expected_path = environment['PATH']
+                    if sanitizer and sanitize:
+                        expected_path = selected_directory + os.pathsep + expected_path
+                    self.assertEqual(selected['clang'], expected_compiler, (target, selected))
+                    self.assertEqual(selected['path'], expected_path, (target, selected))
+                    self.assertEqual(selected['limit'], 'sanitizer' if sanitize else 'ordinary', target)
+                    self.assertEqual(selected['argv'], [script, *arguments], target)
+                    rule = next(line for line in candidate.splitlines() if line.startswith(target + ':'))
+                    if sanitizer or not sanitize:
+                        self.assertEqual(set(rule.split(':', 1)[1].split()), prerequisites |
+                                         ({'tools/host_paths.py'} if sanitize else set()), target)
+
+            # Expected spellings and complete parents are independent of the Make selector.
+            verify(fragment)
+            for compiler, parent in (
+                    ('/clang64/bin/clang.exe', '/clang64/bin'),
+                    ('/opt/LLVM 23/bin/clang.exe', '/opt/LLVM 23/bin'),
+                    ("/opt/LLVM's 23/bin/clang.exe", "/opt/LLVM's 23/bin")):
+                verify(fragment, compiler, selected_directory=parent)
+            for native, selected, parent in (
+                    ('C:/LLVM 23/bin/clang.exe', '/c/LLVM 23/bin/clang.exe', '/c/LLVM 23/bin'),
+                    (r"C:\LLVM's 23\bin\clang.exe", "/c/LLVM's 23/bin/clang.exe", "/c/LLVM's 23/bin"),
+                    (r'\\server\LLVM 23\bin\clang.exe', '//server/LLVM 23/bin/clang.exe', '//server/LLVM 23/bin')):
+                verify(fragment, native, selected, parent, msys=True)
+            compiler, parent = '/opt/LLVM 23/bin/clang.exe', '/opt/LLVM 23/bin'
+            mutants = []
+            for target, script, arguments, _ in targets:
+                if '--sanitize' not in arguments:
+                    continue
+                recipe = next(line for line in fragment.splitlines() if script in line and '--sanitize' in line)
+                rule = next(line for line in fragment.splitlines() if line.startswith(target + ':'))
+                mutants.extend((
+                    (recipe, recipe.replace('$(NET_SANITIZER_CLANG)', '$(LLVM_CC)')),
+                    (recipe, recipe.replace('$(NET_SANITIZER_CLANG)', '/wrong/compiler')),
+                    (recipe, recipe.replace(('MINYAR_CLANG' if script == 'tests/net-connect.py'
+                        else 'MINYAR_TEST_CLANG') + '=$(call NET_SANITIZER_QUOTE,$(NET_SANITIZER_CLANG)) ', '')),
+                    (recipe, recipe.replace('PATH="$(NET_SANITIZER_PATH)" ', '')),
+                    (rule, rule.replace(' tools/host_paths.py', ''))))
+            clang_rule = next(line for line in fragment.splitlines() if line.startswith('NET_SANITIZER_CLANG ='))
+            path_rule = next(line for line in fragment.splitlines() if line.startswith('NET_SANITIZER_PATH ='))
+            mutants.extend((
+                (clang_rule, 'NET_SANITIZER_CLANG = $(LLVM_CC)'),
+                (path_rule, 'NET_SANITIZER_PATH = $(PATH)'),
+                (path_rule, 'NET_SANITIZER_PATH = /wrong/runtime:$(PATH)'),
+                (path_rule, 'NET_SANITIZER_PATH = $(dir $(MINYAR_SANITIZER_CLANG)):$(PATH)'),
+                ('NET_SANITIZER_QUOTE =', 'NET_SANITIZER_QUOTE = $(1) #')))
+            for old, new in mutants:
+                mutant = fragment.replace(old, new, 1)
+                self.assertNotEqual(mutant, fragment)
+                with self.subTest(dispatch=old, replacement=new), self.assertRaises(AssertionError):
+                    verify(mutant, compiler, selected_directory=parent)
+            for assignment in ('LLVM_CC = $(NET_SANITIZER_CLANG)', 'PATH := /wrong/native:$(PATH)'):
+                with self.subTest(global_dispatch=assignment), self.assertRaises(AssertionError):
+                    verify(fragment + '\n' + assignment + '\n', compiler, selected_directory=parent)
+
+
 if __name__ == '__main__':
     unittest.main()
