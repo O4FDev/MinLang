@@ -127,9 +127,9 @@ build/errors-request-sanitize.ll: build/errors-request.ll tests/llvm_sanitizer.p
 build/minyarc-errors-request-sanitize: build/errors-request-sanitize.ll build/minyar-compiler-runtime-sanitize.o
 	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
-# The historical identity control is reconstructed from the current core by
-# removing only reviewed dispatch sites, then checked against its fixed hash.
-build/compiler-baseline-control.min: compiler/compiler.min scripts/build-closure-compiler.py | build
+# The historical comparator has frozen source bytes and an unchanged hash.
+# Current compiler and optional frontends continue to use the maintained core.
+build/compiler-baseline-control.min: compiler/foundation-baseline.min scripts/build-closure-compiler.py | build
 	python3 scripts/build-closure-compiler.py --baseline $@
 
 build/compiler-baseline-control.ll: build/compiler-baseline-control.min build/minyarc

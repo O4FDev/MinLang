@@ -19,6 +19,12 @@ check-smoke: build/minyarc build/minyar-runtime.o
 	$(LIMITED) sh tests/smoke.sh
 
 .PHONY: check-memory-contracts check-memory-contracts-harness
+.PHONY: check-foundation-baseline
+check-foundation-baseline:
+	python3 tests/foundation-baseline.py
+
+check: check-foundation-baseline
+
 check-memory-contracts: build/minyarc
 	$(LIMITED) python3 tests/memory-contracts.py
 
