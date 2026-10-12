@@ -23,7 +23,7 @@ int main(void) {
 #endif
     minyar_rc_release(integer);
     minyar_rc_leave();
-#ifdef MINYAR_BOUNDED_RC
+#if defined(MINYAR_BOUNDED_RC) && MINYAR_RC_POLL_BUDGET < 128
     assert(rc_pending_count); /* The default32 and K1 cannot retire128 slots. */
 #endif
     rc_thread_domain_dispose();

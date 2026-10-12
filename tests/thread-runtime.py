@@ -2,6 +2,7 @@
 """Native managed-thread fixtures; no compiler build or scalar worker substitute."""
 import argparse
 import os
+import shlex
 from pathlib import Path
 import subprocess
 import sys
@@ -23,12 +24,12 @@ def main():
     build = ROOT / 'build'
     build.mkdir(exist_ok=True)
     (build / 'thread-cycle-engine.c').write_text(engine_source(ROOT))
-    compiler = os.environ.get('MINYAR_TEST_CLANG', 'x86_64-w64-mingw32-gcc' if args.windows_cross else 'clang')
+    compiler = os.environ.get('MINYAR_TEST_CLANG', 'clang')
     windows = args.windows_cross or windows_host()
     launch = ['wine'] if args.windows_cross else []
     if args.windows_cross and args.sanitize != 'none':
         parser.error('Windows cross/Wine fixtures do not qualify native sanitizers')
-    sources = ['thread-cache-debt.c'] if args.cache_debt_only else ['thread-buffers.c'] if args.buffers_only else ['thread-domain.c'] if args.domain_only else ['thread-domain.c', 'thread-cache-debt.c', 'thread-buffers.c']
+    sources = ['thread-cache-debt.c'] if args.cache_debt_only else ['thread-buffers.c'] if args.buffers_only else ['thread-domain.c'] if args.domain_only else ['thread-domain.c', 'thread-cache-debt.c', 'thread-buffers.c', 'thread-runtime.c']
     for source in sources:
         for cycles in (False, True):
             for bounded in (False, True):
@@ -36,6 +37,10 @@ def main():
                 output = build / (label + ('.exe' if windows else ''))
                 command = [compiler, '-std=c11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
                            '-DMINYAR_THREADED=1', '-I' + native_path(ROOT / 'runtime')]
+                if args.windows_cross:
+                    library = subprocess.check_output(['x86_64-w64-mingw32-gcc', '-print-libgcc-file-name'], text=True).strip()
+                    command += ['--target=x86_64-w64-windows-gnu', '--sysroot=/usr/x86_64-w64-mingw32',
+                                '-L' + str(Path(library).parent)]
                 if cycles:
                     command += ['-DMINYAR_TEST_CYCLES=1']
                 if bounded:
@@ -48,6 +53,7 @@ def main():
                     command += ['-fsanitize=' + args.sanitize, '-fno-omit-frame-pointer']
                 command += [native_path(ROOT / 'tests' / source), '-o', native_path(output)]
                 command += [] if windows else ['-pthread', '-lm']
+                print('compile: ' + shlex.join(command), flush=True)
                 subprocess.run(command, check=True, timeout=120)
                 environment = dict(os.environ, UBSAN_OPTIONS='halt_on_error=1', TSAN_OPTIONS='halt_on_error=1')
                 environment['ASAN_OPTIONS'] = asan_leak_options()

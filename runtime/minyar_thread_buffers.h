@@ -48,11 +48,18 @@ static void rc_thread_condition_wait(RcThreadCondition *c, RcThreadMutex *m) {
 static _Atomic size_t rc_thread_native_bytes, rc_thread_native_allocations;
 static _Atomic size_t rc_thread_transit_bytes, rc_thread_transit_allocations;
 static _Atomic size_t rc_thread_frozen_destructions;
+static MINYAR_THREAD_LOCAL size_t rc_thread_test_fail_allocation_after = SIZE_MAX;
 #define RC_NATIVE_ACCOUNT(expression) ((void)(expression))
 #else
 #define RC_NATIVE_ACCOUNT(expression) ((void)0)
 #endif
 static void *rc_thread_native_allocate(size_t size) {
+#ifdef MINYAR_RC_TESTING
+    if (rc_thread_test_fail_allocation_after != SIZE_MAX) {
+        if (!rc_thread_test_fail_allocation_after) out_of_memory();
+        rc_thread_test_fail_allocation_after--;
+    }
+#endif
     void *p = malloc(size);
     if (!p) out_of_memory();
     RC_NATIVE_ACCOUNT(atomic_fetch_add(&rc_thread_native_bytes, size));

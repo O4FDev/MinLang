@@ -6,6 +6,7 @@
 #endif
 #include <assert.h>
 #include <stdatomic.h>
+#include "thread-test-host.h"
 static _Atomic unsigned destroyed;
 static void release_leaf(void *p) { assert(p == &destroyed); atomic_fetch_add(&destroyed, 1); }
 static void exercise(void) {
@@ -20,7 +21,8 @@ static void exercise(void) {
         .bytes = (const unsigned char *)"λ🐈", .byte_length = 6});
     assert(minyar_text_length(literal) == 2);
     minyar_rc_local_take(1, literal);
-    (void)minyar_integer_text(7);
+    MinyarText *integer = minyar_integer_text(7);
+    minyar_rc_release(integer);
     (void)minyar_character_text('x');
 #ifdef MINYAR_TEST_CYCLES
     MinyarRecord *cycle = minyar_record_new_traced(2);
@@ -29,21 +31,21 @@ static void exercise(void) {
     minyar_rc_release(cycle);
 #endif
     minyar_rc_leave();
+    /* Force cached immutable headers to remain in bounded retirement debt.
+     * This must be drained before cache destruction, even with poll budget1. */
+    minyar_rc_enter(128);
+    integer = minyar_integer_text(12345);
+    for (long long i = 0; i < 128; i++) minyar_rc_local(i, integer);
+    minyar_rc_release(integer);
+    minyar_rc_leave();
     rc_thread_domain_dispose();
     assert(rc_object_count == 0 && rc_bytes == 0);
 }
-#ifndef _WIN32
-static void *worker(void *p) { (void)p; exercise(); return NULL; }
-#endif
+static void worker(void *p) { (void)p; exercise(); }
 int main(void) {
-#ifndef _WIN32
-    pthread_t threads[4];
-    for (unsigned i = 0; i < 4; i++) assert(!pthread_create(&threads[i], NULL, worker, NULL));
-    for (unsigned i = 0; i < 4; i++) assert(!pthread_join(threads[i], NULL));
+    RcTestThread threads[4];
+    for (unsigned i = 0; i < 4; i++) threads[i] = rc_test_start(worker, NULL);
+    for (unsigned i = 0; i < 4; i++) rc_test_join(threads[i]);
     assert(atomic_load(&destroyed) == 4);
-#else
-    exercise();
-    assert(atomic_load(&destroyed) == 1);
-#endif
     puts("thread domain TLS, leaf destruction and cleanup passed");
 }

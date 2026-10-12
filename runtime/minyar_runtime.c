@@ -1269,4 +1269,6 @@ void minyar_write_text_parts(const MinyarText *path_text, const MinyarList *part
 
 #if MINYAR_THREADED
 #include "minyar_thread_domain.h"
+#include "minyar_thread_buffers.h"
+#include "minyar_threads.h"
 #endif
