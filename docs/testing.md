@@ -316,6 +316,30 @@ The Linux correctness runner includes these three checks and both compiler
 fixed points. Correctness under virtualization or instruction translation is
 not a latency measurement on native deployment hardware.
 
+## Running the suites
+
+`scripts/check-linux.py` (Linux) and `scripts/check-macos.py` (macOS, the
+checks of `make check-portable`) run every check even after failures and end
+with one summary: each failed check, its log path and its last 30 lines. The
+exit status is non-zero if any check failed. A failed check is retried once
+with nothing else running; a pass on that retry is reported as flaky.
+
+```sh
+python3 scripts/check-linux.py --tier full            # landing: no sanitizer checks
+python3 scripts/check-linux.py --tier sanitize        # only the sanitizer checks
+python3 scripts/check-linux.py --tier all --jobs 8    # both, eight checks at once
+python3 scripts/check-linux.py --only check-maps      # one target and its phony prerequisites
+python3 scripts/check-macos.py --tier all LIMITED= SANITIZER_LIMITED=
+```
+
+`--jobs` defaults to the CPU count on Linux and to 1 on macOS, where laptops
+are memory-constrained. The runners split aggregate targets such as
+`check-sanitize` into their phony prerequisites, so each recipe runs once.
+Every file prerequisite is built by one builder before any check that needs
+it starts, so two makes never build the same file at once. Checks with tight
+wall-clock assertions run alone, and checks that share a fixed port or path
+never overlap; both lists live in `scripts/check_runner.py`.
+
 ## Per-commit platform gates
 
 `.github/workflows/ci.yml` runs on every push and pull request. Linux runs the
