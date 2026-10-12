@@ -161,16 +161,21 @@ long long minyar_files_writeStandardOutput(const MinyarText *text) {
 
 /* Read up to length bytes at position into fresh Bytes (shorter at end of file). */
 MinyarBytes *minyar_files_readAt(long long fd, long long position, long long length) {
-    if (!files_valid_fd(fd) || position < 0 || length < 0) return files_empty(-EINVAL);
+    if (!files_valid_fd(fd)) return files_empty(-EBADF);
+    if (position < 0 || length < 0) return files_empty(-EINVAL);
     if ((unsigned long long)length >= SIZE_MAX / 2 || position > LLONG_MAX - length ||
         (long long)(off_t)(position + length) != position + length) return files_empty(-EOVERFLOW);
-    MinyarBytes *b = minyar_bytes_new(length);
-    unsigned char *p = (unsigned char *)b->bytes;
+    /* Validate even a zero-length read. Grow only after bytes arrive: callers may ask for a huge range at
+     * EOF, and procfs/sysfs files can report size zero while still supplying data. */
+    struct stat st;
+    if (fstat((int)fd, &st) != 0) return files_empty(-errno);
+    MinyarBytes *b = minyar_bytes_new(0);
+    unsigned char buffer[65536];
     long long done = 0;
     while (done < length) {
         size_t chunk = (size_t)(length - done);
-        if (chunk > (1u << 30)) chunk = 1u << 30;
-        ssize_t n = pread((int)fd, p + done, chunk, (off_t)(position + done));
+        if (chunk > sizeof(buffer)) chunk = sizeof(buffer);
+        ssize_t n = pread((int)fd, buffer, chunk, (off_t)(position + done));
         if (n < 0) {
             if (errno == EINTR) continue;
             files_last_error = -errno;
@@ -178,6 +183,7 @@ MinyarBytes *minyar_files_readAt(long long fd, long long position, long long len
             return b;
         }
         if (n == 0) break;
+        memcpy(minyar_native_bytes_append(b, n), buffer, (size_t)n);
         done += n;
     }
     b->byte_length = done; /* shrinking keeps capacity in character_length */
@@ -197,7 +203,8 @@ MinyarBytes *minyar_files_readFile(const MinyarText *path) {
         close(fd);
         return files_empty(e);
     }
-    MinyarBytes *b = minyar_files_readAt(fd, 0, (long long)st.st_size);
+    /* st_size is not a reliable bound for pseudo-files. */
+    MinyarBytes *b = minyar_files_readAt(fd, 0, (long long)(SIZE_MAX / 2 - 1));
     int e = files_last_error;
     close(fd);
     files_last_error = e;
