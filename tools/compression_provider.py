@@ -96,7 +96,7 @@ def _static_archive(path, clang, required):
         reject('missing static definitions: ' + ', '.join(sorted(missing)))
 
 
-def codec_provider(codec, clang='clang', compile_flags=(), link_flags=None):
+def codec_provider(codec, clang='clang', compile_flags=(), link_flags=()):
     if codec not in ('zstd', 'deflate'):
         raise ValueError('unknown codec')
     zstd = codec == 'zstd'
@@ -157,16 +157,7 @@ def codec_provider(codec, clang='clang', compile_flags=(), link_flags=None):
     elif selected.suffix == '.a':
         _static_archive(selected, clang, ('zlibVersion', 'deflateInit2_', 'inflateInit2_'))
     cflags = ['-isystem', str(include)]
-    # Force embedded implementation objects into the final program. An earlier
-    # caller/transitive -lzstd could otherwise satisfy advanced symbols from a
-    # DSO before the linker even examines the validated archive.
-    if selected.suffix == '.a':
-        libraries = (['-Xlinker', '-force_load', '-Xlinker', str(selected)]
-                     if platform.system() == 'Darwin' else
-                     ['-Xlinker', '--whole-archive', str(selected), '-Xlinker', '--no-whole-archive'])
-    else:
-        libraries = [str(selected)]
-    libraries += dependencies
+    libraries = [str(selected), *dependencies]
     probe = ('''#define ZSTD_STATIC_LINKING_ONLY
 #include <zstd.h>
 #include <zstd_errors.h>
@@ -193,17 +184,9 @@ int main(void) {
         if trace.returncode:
             raise ValueError(f'{name} provider header probe failed:\n{trace.stderr}')
         words = re.findall(r'(?:\\.|[^\s])+', trace.stdout.replace('\\\n', '').partition(':')[2])
+        headers = sorted({host_path(re.sub(r'\\([ \t#\\])', r'\1', word).replace('$$', '$')).resolve()
+                          for word in words if not word.endswith('probe.c')})
         owned = {'zstd.h', 'zstd_errors.h'} if zstd else {'zlib.h', 'zconf.h'}
-        headers = set()
-        for word in words:
-            lexical = host_path(re.sub(r'\\([ \t#\\])', r'\1', word).replace('$$', '$'))
-            physical = lexical.resolve()
-            if physical == source.resolve():
-                continue
-            if (lexical.name in owned or physical.name in owned) and prefix not in physical.parents:
-                raise ValueError(f'{name} primary and secondary headers must belong to provider prefix {prefix}')
-            headers.add(physical)
-        headers = sorted(headers)
         primary = (include / header).resolve()
         if primary not in headers or any(prefix not in path.parents
                                         for path in headers if path.name in owned):
@@ -213,14 +196,8 @@ int main(void) {
             identity.update(str(path).encode() + b'\0' + path.read_bytes())
         fingerprint = identity.hexdigest()
         cflags += ['-DMINYAR_CODEC_PROVIDER_' + fingerprint[:16].upper() + '=1']
-        obj = Path(tmp) / 'probe.o'
-        result = subprocess.run([clang, *compile_flags, *cflags, '-c', str(source), '-o', str(obj)],
-                                capture_output=True, text=True, timeout=30)
-        if result.returncode:
-            raise ValueError(f'{name} matched static provider ABI probe failed:\n' + result.stderr)
-        effective_link = compile_flags if link_flags is None else link_flags
-        result = subprocess.run([clang, *effective_link, str(obj), *libraries, '-o', str(binary)],
-                                capture_output=True, text=True, timeout=30)
+        result = subprocess.run([clang, *compile_flags, *cflags, str(source), *libraries,
+                                 *link_flags, '-o', str(binary)], capture_output=True, text=True, timeout=30)
         if result.returncode:
             raise ValueError(f'{name} matched static provider ABI probe failed:\n' + result.stderr)
         if subprocess.run([str(binary)], capture_output=True, timeout=30).returncode:

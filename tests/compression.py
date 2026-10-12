@@ -210,8 +210,7 @@ def native_oracles(evidence, clang, cflags, libraries, chunk):
 
 def provider_contracts(clang, provider):
     flags,libraries=provider
-    archive=next(Path(value) for value in libraries if value.endswith('libzstd.a'))
-    assert archive.is_absolute()
+    archive=Path(libraries[0]); assert archive.is_absolute() and archive.name=='libzstd.a'
     include=Path(flags[flags.index('-isystem')+1])
     if platform.system() == 'Windows' or platform.system().startswith(('MSYS','MINGW','CYGWIN')):
         # codec_provider already ran the active-prefix 64-bit/raw-dict probe.
@@ -228,7 +227,7 @@ def provider_contracts(clang, provider):
             except ValueError as error: assert 'same provider' in str(error)
             else: raise AssertionError('missing absolute archive accepted')
             shutil.copyfile(archive,prefix/'lib/libzstd.a')
-            assert str(prefix/'lib/libzstd.a') in codec_provider('zstd',clang)[1]
+            assert codec_provider('zstd',clang)[1][0]==str(prefix/'lib/libzstd.a')
             header=prefix/'include/zstd.h'
             source=header.read_text()
             source=re.sub(r'(#define ZSTD_VERSION_RELEASE\s+)([0-9]+)',lambda m:m[1]+str(int(m[2])+1),source)
