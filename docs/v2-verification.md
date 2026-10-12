@@ -1,7 +1,7 @@
 # v2 implementation and verification map
 
 This checkpoint describes the combined implementation based on
-`b1dfe092` at 01:17 UTC on 2026-10-12.
+`b1dfe092`, with the runner fixture repair at `1fae21e`, on 2026-10-12.
 An implemented API, a passing focused suite and a complete deployment are
 separate claims. Retained results establish only their recorded source and
 configuration. Combined CI, current macOS/Windows gates, ordinary performance
@@ -290,9 +290,27 @@ all four peers, all four client 0-RTT cases and the server 0-RTT quiche case.
 After the affected Windows checks, unchanged endpoint inputs returned to Y.
 Original index 69, server 0-RTT against Quinn, stopped with runner status 1
 before producing a matrix verdict. Its missing-file wrapper error, failed
-cleanup/watch records and raw runner evidence are preserved; process lifetime
-review and diagnosis remain pending. Later cells are suspended. These results
+cleanup/watch records and raw runner evidence are preserved. Independent
+lifetime review established retirement of the recorded processes and groups;
+fresh queries using the actual owner and project labels found no retained
+containers or networks. That absence does not certify the interrupted attached
+workload, identify its SIGKILL issuer or supply a protocol verdict. Later cells
+are suspended. These results
 do not rewrite historical failures or certify all 128 current-source cells.
+
+The owned runner adapter now optionally forwards attached workload output while
+retaining its private copy, so consumers can observe output before command exit.
+Only the workload invocation enables forwarding; creation and JSON inspection
+remain private. Six controls passed after an actual legacy failure, including
+private-copy ordering, exact-once forwarding and bounded backpressure failure.
+The complete 113-case adapter suite also passes with the corrected specialized
+streaming mock. Its earlier 112-of-113 result remains recorded separately.
+The exact two Python fixture files are integrated here at `1fae21e` and on Y
+at `a4f6b406`. The 172 native inputs, three frontends, two endpoint executables
+and six peer/image IDs remain unchanged from qualified `49edb0f6`; no endpoint
+rebuild was needed. A separate changed-fixture diagnostic of original index 69
+is authorized with the original checker and deadlines. It cannot rewrite the
+original result or admit later cells without its actual verdict and retirement.
 
 Actual runner failures exposed fixture defects in Docker 29 capability
 spelling, simulator capture writers that had not flushed during shutdown, and
@@ -409,7 +427,21 @@ after it. Three affected tests and four retained numerical comparisons pass;
 all original memory thresholds remain unchanged. New native TCP and TLS
 short controls pass with real controller telemetry and normal retirement.
 The 90-file archive and 11-file terminal annex were independently verified
-and reviewed. Hours-long workloads remain pending.
+and reviewed.
+
+Twelve harmless Linux lifecycle controls now pass for the supplied-binary
+launcher: normal exits 0/1/7, parent loss before/after arming and after exec,
+signal behavior, wrong-parent/mode refusal and invalid-launch rejection.
+Each selected network driver's actual native child uses the qualified
+parent-death bootstrap. All 25 recorded process identities and 13 groups
+were confirmed retired; an earlier fixture-publication race remains a separate
+nonpass. The native mixed cohort started on W at 04:24 UTC on 2026-10-12,
+with 4,096 TCP sockets, 64 mutual-TLS/HTTP fixture connections and 64 QUIC peers
+running concurrently for a configured 7,200 seconds. It retains the original
+loss, reordering, malformed/slow/half-close scenarios and memory thresholds.
+Completion, actual common overlap, warmed memory and normal retirement remain
+unqualified while it runs. The sanitizer cohort and separate connected-idle
+and UDP-blocked fallback measurements require later admissions.
 
 The deleted scale helper has been rebuilt once with an explicit locked Cargo
 release profile. All eight Rust tests and the product build pass, with stable
