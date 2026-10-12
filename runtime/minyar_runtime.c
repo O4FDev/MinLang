@@ -965,13 +965,20 @@ static MINYAR_COLD MinyarText *format_integer_text(long long integer) {
 _Static_assert(MINYAR_INTEGER_TEXT_CACHE_LIMIT >= 0 && MINYAR_INTEGER_TEXT_CACHE_LIMIT <= 32768,
                "Integer Text cache limit must be between 0 and 32768");
 
+#if MINYAR_THREADED
 static MinyarText *integer_text_cached(long long integer, int dispose) {
     (void)dispose;
+#else
+MinyarText *minyar_integer_text(long long integer) {
+#endif
+#if MINYAR_THREADED && MINYAR_INTEGER_TEXT_CACHE_LIMIT == 0
+    if (dispose) return NULL;
+#endif
 #if MINYAR_INTEGER_TEXT_CACHE_LIMIT > 0
     enum { CACHE_LIMIT = MINYAR_INTEGER_TEXT_CACHE_LIMIT };
     static MINYAR_THREAD_LOCAL MinyarText *integer_cache[CACHE_LIMIT];
 #if MINYAR_THREADED
-    /* Private sentinel, used only after the domain's final owning frame. */
+    /* Private cleanup mode after the domain's final owning frame. */
     if (dispose) {
         for (size_t i = 0; i < CACHE_LIMIT; i++) {
             MinyarText *text = integer_cache[i];
@@ -998,9 +1005,11 @@ static MinyarText *integer_text_cached(long long integer, int dispose) {
     return format_integer_text(integer);
 }
 
+#if MINYAR_THREADED
 MinyarText *minyar_integer_text(long long integer) {
     return integer_text_cached(integer, 0);
 }
+#endif
 
 static long long encode_character(int character, unsigned char *bytes) {
     long long length;
