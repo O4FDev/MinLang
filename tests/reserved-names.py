@@ -11,12 +11,12 @@ spec = importlib.util.spec_from_file_location('reserved_names', ROOT / 'tools/re
 class ReservedNames(CompilerTestCase):
     def test_builtin_collision_suggests_a_rename_and_published_list(self):
         self.rejects('function joinText(parts: List<Text>, separator: Text): Text { return "" }\n',
-                     "function 'joinText' uses a reserved built-in name; rename this function (for example, 'joinTextLocal'); see docs/reserved-names.md")
+                     "function 'joinText' uses a reserved built-in name; rename this function (for example, 'joinTextLocal'); see Reserved function names in docs/language.md")
 
     def test_all_published_names_are_reserved_and_document_is_current(self):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        self.assertEqual((ROOT / 'docs/reserved-names.md').read_text(), module.render())
+        self.assertEqual(module.section((ROOT / 'docs/language.md').read_text()), module.render())
         for name in module.names():
             with self.subTest(name=name):
                 self.rejects(f'function {name}() {{}}\n', f"function '{name}' uses a reserved built-in name")
