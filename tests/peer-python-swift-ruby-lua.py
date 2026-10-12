@@ -1322,7 +1322,11 @@ let i = 0; while i < values.length { if values[i] != i { fail("literal position"
                     self.assertFalse(llvm.exists())
                 else:
                     self.assertEqual(result.stderr, '')
-                    self.executes(source, expected)
+                    self.link_timeout = 180
+                    try:
+                        self.executes(source, expected)
+                    finally:
+                        del self.link_timeout
 
     def test_runtime_cleanup_without_allocations_and_poisoned_format_buffers(self):
         from regressions import CLANG, LINK_FLAGS

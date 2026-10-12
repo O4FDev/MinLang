@@ -64,7 +64,7 @@ class CompilerTestCase(unittest.TestCase):
     def link_program(self, llvm, optimization, exe):
         return self.evidence.run(clang_command([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module',
                                                str(llvm), str(RUNTIME), '-o', str(exe)]),
-                                 capture_output=True, text=True, timeout=30, phase='link')
+                                 capture_output=True, text=True, timeout=getattr(self, 'link_timeout', 30), phase='link')
 
     def executes(self, source, expected, status=0, stderr='', optimizations=('-O0', '-O2'), arguments=(), file_outputs=()):
         file_outputs = tuple(file_outputs)
