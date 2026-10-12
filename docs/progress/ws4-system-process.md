@@ -2,6 +2,11 @@
 
 Frozen base: bf9c0e9; no rebase, v2 merge, push or Boat provisioning by this child.
 
+Current R2 candidate: **96051dedc6c5716819d2f0fcd5a2240ab8d1314f** fixes both
+confirmed R1 P1s. All six pinned Linux qualification cases and the mandatory
+kernel-layout/instrumentation boundary controls passed. Await independent R2;
+Windows, privileged macOS success and native Linux aarch64 proof remain pending.
+
 Environment/resource-limit chunk: copied getenv/environment, missing/empty distinction,
 named portable resources with soft/hard setters, Windows clocks/RSS/stderr and explicit
 unsupported POSIX operations. Test-first `python3 tests/system-services.py` failed on
@@ -37,7 +42,7 @@ signals (including reserved NPTL signals) are blocked across clone. Child resets
 caught dispositions before restoring its inherited mask minus SIGPIPE. Child
 does not share the parent's descriptor table, cwd, or signal dispositions.
 
-Qualified production/test source: **68948fb2182baa100086d76e21a67b1cb80a58cc**.
+Historical author qualification: **68948fb2182baa100086d76e21a67b1cb80a58cc**.
 The parent-turn interruption cancelled task ownership, so the resumed child first
 verified this worktree and found no live remote qualification/fixture processes.
 Earlier remote receipts were for a086d75; a fresh, separately named run qualified
@@ -73,8 +78,9 @@ the canonical default runtime wrapper, preserving its stack-frame ABI.
 Additional audit exited 0: compile system.c with ASan/UBSan, sanitizer coverage,
 profile/coverage mapping and `-fstack-protector-all`, then disassemble
 `system_clone_child`. Its actual x86_64 machine code contains syscalls and **zero
-call instructions**. Coverage/profiling/sanitizer/stack-protector hooks are excluded
-from this child function. This is not execution proof for Linux aarch64.
+call instructions** in that ASan/UBSan configuration. R1 found this did not cover
+TSan function-entry instrumentation or the incorrect aarch64 restorer layout.
+The broader exclusion claim is superseded by the R1 correction below.
 
 Exact source hashes/modes, commands, tool versions, exit codes and verified log
 hashes: [qualification.json](ws4-system-process-evidence/final-68948fb/qualification.json).
@@ -105,3 +111,32 @@ The C fixture has its own 20-second alarm and reaps every successful child.
 Capture source manifest, compiler version, executable hash, command and exit code
 as CI evidence. Missing SPI or privilege must fail this positive proof; no skip
 or fallback to managed/fork child execution is authorized.
+
+R1 response and source-pinned correction receipts:
+[R1-response.md](ws4-system-process-evidence/r1/R1-response.md).
+The kernel action now has handler/flags/restorer/mask on both supported LP64
+targets, size 32 with offsets 0/8/16/24 and alignment 8. Production asserts and
+mandatory freestanding target controls compare the actual declaration with
+hash-pinned Linux v6.8 arm64/x86 UAPIs and the kernel's struct declaration; libc
+SA_RESTORER visibility is irrelevant.
+
+`disable_sanitizer_instrumentation` is required by compiler capability guards,
+with all prior no-sanitize/coverage/profile/stack-protector/function protections
+retained. A missing capability fails compilation. New full-provider x86_64
+objects at O0/O1/O2 under native, ASan/UBSan and TSan all have zero child calls
+and no child instrumentation/TLS references. TSan/ASan symbols elsewhere in the
+same objects prove the sanitizer flags were active. Each audit additionally
+enables sanitizer coverage, profile/coverage mapping, all stack protectors and
+function instrumentation. This is object inspection, not TSan execution proof.
+
+Test-first controls produced eight failures on 163224e, then zero after the fix.
+The six commands listed above were rerun against exact 96051de, all exit 0,
+followed by `python3 tests/system-process-boundary.py --evidence ...`, exit 0.
+Compiler f4f589... and runtime effee319... remained unchanged. Original R1
+report, old code, red probes, source hashes and disassemblies are preserved;
+[qualification.json](ws4-system-process-evidence/r1/r1-final-96051de/qualification.json)
+and [boundary receipt](ws4-system-process-evidence/r1/r1-final-96051de/boundary/receipt.json)
+bind the new source, tool bytes, commands, exit codes and logs.
+
+Driver SHA remains 6997d6e16333c855c2db4fa7d02fd02fffe897e4f69458d8bebc4feb4bd34feb;
+its external QUIC pin receipt remains owner-coordinated, unchanged by this fix.
