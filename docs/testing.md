@@ -325,20 +325,44 @@ exit status is non-zero if any check failed. A failed check is retried once
 with nothing else running; a pass on that retry is reported as flaky.
 
 ```sh
+python3 scripts/check-linux.py --matrix               # the whole Linux matrix (below), one summary
 python3 scripts/check-linux.py --tier full            # landing: no sanitizer checks
 python3 scripts/check-linux.py --tier sanitize        # only the sanitizer checks
 python3 scripts/check-linux.py --tier all --jobs 8    # both, eight checks at once
+python3 scripts/check-linux.py --group llvm22 --group quic   # chosen matrix groups
 python3 scripts/check-linux.py --only check-maps      # one target and its phony prerequisites
 python3 scripts/check-macos.py --tier all LIMITED= SANITIZER_LIMITED=
 ```
 
-`--jobs` defaults to the CPU count on Linux and to 1 on macOS, where laptops
-are memory-constrained. The runners split aggregate targets such as
-`check-sanitize` into their phony prerequisites, so each recipe runs once.
-Every file prerequisite is built by one builder before any check that needs
-it starts, so two makes never build the same file at once. Checks with tight
-wall-clock assertions run alone, and checks that share a fixed port or path
-never overlap; both lists live in `scripts/check_runner.py`.
+`--matrix` runs `--tier all` plus every other Linux group in one run:
+
+| group | what it runs |
+|---|---|
+| `correctness` | the tiered main suite, the fixed points, runtime units, GCC bootstrap and native graphics |
+| `llvm22`, `llvm23` | `check-portable`, release build, launcher isolation, incremental modules, module driver and graphics, plus `llvm-as`/`opt` verification, built with that LLVM release |
+| `peer-testing` | the clang-18 peer ownership, allocation-fault, list and codegen checks |
+| `peer-semantics` | every peer suite under `check-peer-optimizations` and `check-peer-sanitize` with clang-18 |
+| `quic` | `check-quic`, `check-quic-sanitize`, the five Quinn runs, Go transport and peer-edge |
+| `formats`, `redis`, `coverage`, `afl` | `check-formats(-sanitize)`, live Redis, the coverage gates, a 60 s AFL++ campaign |
+| `leaks` | the LeakSanitizer replay, as soon as the checks it replays have passed |
+| `formatting` | `scripts/format.py` with the pinned clang-format |
+
+Each toolchain variant (LLVM 22, LLVM 23, clang-18) builds in its own copy of
+the source snapshot, so variants build and run at the same time as the main
+checks. A target shared by two groups runs once. CI runs the same runner,
+sharded by group (`linux-matrix` in `ci.yml`).
+
+`--jobs` defaults to the CPU count on Linux. On macOS it defaults to one job
+per 8 GB of physical memory (2 on a 16 GB laptop). `check-macos.py` also runs
+the macOS-only network, graphics and desktop checks (`--no-extras` skips them,
+`--keychain` adds the Keychain checks CI runs). The runners split aggregate
+targets such as `check-sanitize` into their phony prerequisites, so each recipe
+runs once. Every file prerequisite is built by one builder per work directory
+before any check that needs it starts, so two makes never build the same file
+at once. Checks with tight wall-clock assertions run only alongside each other,
+and checks that share a fixed port or path never overlap; both lists live in
+`scripts/check_runner.py`. Every result row records wall time and CPU seconds,
+and the summary prints a per-group table.
 
 ## Per-commit platform gates
 
@@ -354,7 +378,7 @@ and incremental-driver probes and run in the Linux matrix and macOS gate.
 The Linux matrix also runs incremental-module correctness natively and with
 sanitizers, temporary-owner admission, compiler slice-cache checks, the memory
 contract harness, ownership mutation checks, and both scalar-constructor modes.
-After correctness passes, `scripts/check-linux-leaks.py` replays the eligible
+Once the checks it replays have passed, `scripts/check-linux-leaks.py` replays the eligible
 runtime fixtures with LeakSanitizer enabled, first verifying that the detector
 rejects a deliberate leak. Compiler arenas remain excluded from leak replay.
 Linux uploads JSON reports and detailed logs on both success and failure;

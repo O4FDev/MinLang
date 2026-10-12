@@ -4,12 +4,6 @@ on:
   push:
   pull_request:
   workflow_dispatch:
-    inputs:
-      linux-tier:
-        description: 'scripts/check-linux.py tier (full leaves out sanitizer checks; the leak replay needs sanitize or all)'
-        type: choice
-        options: [all, full, sanitize]
-        default: all
 
 permissions:
   contents: read
@@ -19,26 +13,42 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  formatting:
-    name: Pinned C formatting
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.12'
-      - name: Install the repository formatter
-        run: python3 -m pip install clang-format==23.1.2
-      - name: Check maintained C components
-        run: python3 scripts/format.py
-
-  linux-correctness:
-    name: Linux correctness and sanitizers
+  linux-matrix:
+    # Every Linux group runs through scripts/check-linux.py, the same runner as
+    # `python3 scripts/check-linux.py --matrix` on one host; CI shards it by group.
+    name: Linux ${{ matrix.shard }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: correctness
+            groups: --group correctness --tier full
+            packages: gcc libglfw3-dev libssl-dev pkg-config
+          - shard: sanitizers, leaks and Redis
+            groups: --group correctness --tier sanitize --group leaks --group redis
+            packages: libglfw3-dev libssl-dev pkg-config redis-server
+          - shard: LLVM 22
+            groups: --group llvm22
+            llvm: '22'
+            packages: libglfw3-dev libssl-dev pkg-config
+          - shard: LLVM 23
+            groups: --group llvm23
+            llvm: '23'
+            packages: libglfw3-dev libssl-dev pkg-config
+          - shard: clang-18 peer testing
+            groups: --group peer-testing
+            packages: clang-18 llvm-18 llvm-18-tools lld-18
+          - shard: clang-18 peer semantics
+            groups: --group peer-semantics
+            packages: clang-18 llvm-18 llvm-18-tools lld-18
+          - shard: QUIC, peers and formats
+            groups: --group quic --group formats
+            packages: libssl-dev openssl redis-server libarchive-dev libzstd-dev zlib1g-dev liblz4-dev liblzma-dev libbz2-dev
+          - shard: coverage, AFL++ and formatting
+            groups: --group coverage --group afl --group formatting
+            packages: llvm afl++
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -46,40 +56,48 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
-      - name: Install LLVM test dependencies
-        run: sudo apt-get update && sudo apt-get install -y clang lld make zsh libglfw3-dev libssl-dev pkg-config redis-server
-      - name: Check native graphics and launcher arguments
-        run: python3 tests/native-graphics.py && python3 tests/toolchain-portability.py
-      - name: Verify GCC bootstrap arithmetic with UBSan
-        run: MINYAR_TEST_BOOTSTRAP_CC=gcc python3 tests/bootstrap-portability.py
-      - name: Run isolated correctness matrix
+      - name: Install official LLVM release branch packages
+        if: matrix.llvm
         env:
-          CHECK_LINUX_TIER: ${{ inputs.linux-tier || 'all' }}
-        run: python3 scripts/check-linux.py --source . --output-dir build/linux-evidence --tier "$CHECK_LINUX_TIER"
-      - name: Check live-state fencing against independent Redis
-        run: make LIMITED= SANITIZER_LIMITED= check-peer-live-redis check-peer-live-redis-sanitize
-      - name: Replay runtime checks with LeakSanitizer
+          LLVM_VERSION: ${{ matrix.llvm }}
         run: |
-          for run in build/linux-evidence/minyar-linux-*; do
-            python3 scripts/check-linux-leaks.py --run-dir "$run"
-          done
-      - name: Upload correctness evidence
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-key.asc
+          sudo gpg --dearmor -o /usr/share/keyrings/llvm-release.gpg /tmp/llvm-key.asc
+          echo "deb [signed-by=/usr/share/keyrings/llvm-release.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-$LLVM_VERSION main" | sudo tee /etc/apt/sources.list.d/llvm-release.list
+          sudo apt-get update
+          sudo apt-get install -y "clang-$LLVM_VERSION" "llvm-$LLVM_VERSION" "lld-$LLVM_VERSION" "libclang-rt-$LLVM_VERSION-dev"
+      - name: Install test dependencies
+        env:
+          PACKAGES: ${{ matrix.packages }}
+        run: |
+          sudo apt-get update
+          # shellcheck disable=SC2086
+          sudo apt-get install -y clang lld make zsh $PACKAGES
+          if command -v afl-fuzz >/dev/null; then sudo sysctl -w kernel.core_pattern=core; fi
+      - name: Run the shard's groups
+        env:
+          GROUPS: ${{ matrix.groups }}
+        # shellcheck disable=SC2086
+        run: python3 scripts/check-linux.py --source . --output-dir build/linux-evidence $GROUPS
+      - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: linux-correctness-evidence
+          name: linux-${{ strategy.job-index }}-evidence
           if-no-files-found: error
           path: |
-            build/linux-evidence/**/*.json
-            build/linux-evidence/**/*.log
+            build/linux-evidence/*/results.json
+            build/linux-evidence/*/logs
             build/linux-evidence/**/build/quic-official-adapter.*
-            build/linux-evidence/**/build/fuzz
-            build/linux-evidence/**/build/mutation
+            build/linux-evidence/**/build/mutation-score.json
+            build/linux-evidence/**/build/coverage
+            build/linux-evidence/**/build/afl-findings
+            build/linux-evidence/**/build/peer-results
 
   macos-portable:
-    name: macOS portable suite
+    name: macOS portable suite, network, graphics and Keychain
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -89,37 +107,16 @@ jobs:
           python-version: '3.12'
       - name: Install GLFW for native renderer checks
         run: brew install glfw pkg-config openssl@3
-      - name: Run compiler, runtime, modules, fuzzing, and fixed point
+      - name: Run check-portable and the macOS-only checks in parallel, including Keychain
         run: |
           export PATH="$(brew --prefix openssl@3)/bin:$PATH"
-          make LIMITED= SANITIZER_LIMITED= check-portable
-      - name: Check status icons and opaque Keychain signatures
-        run: |
-          export PATH="$(brew --prefix openssl@3)/bin:$PATH"
-          python3 tests/macos-services.py
-          python3 tests/keychain-native.py
-          python3 tests/desktop-native.py
-      - name: Check native graphics and launcher arguments
-        run: python3 tests/native-graphics.py && python3 tests/toolchain-portability.py
+          python3 scripts/check-macos.py --tier all --jobs 3 --keychain LIMITED= SANITIZER_LIMITED=
       - name: Upload generated fuzz evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: macos-fuzz-evidence
           path: build/fuzz
-
-  macos-network:
-    name: macOS shared socket and app loop
-    runs-on: macos-15
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Check real kqueue readiness, AppKit wakes and timers
-        run: python3 tests/macos-network.py
-      - name: Check explicit UDP offload absence with native and sanitized providers
-        run: make -j1 LIMITED= SANITIZER_LIMITED= check-net-udp-offload check-net-udp-offload-sanitize
 
   macos-ordinary-performance:
     name: macOS ordinary compiler and runtime budgets
@@ -257,35 +254,6 @@ jobs:
           $env:PATH = "$toolchainBin;$env:PATH"
           python tests/windows-large-file.py
 
-  coverage-guided-fuzzing:
-    name: AFL++ coverage-guided smoke campaign
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Install AFL++ and LLVM
-        run: sudo apt-get update && sudo apt-get install -y afl++ clang lld make zsh
-      - name: Configure direct crash reporting for AFL++
-        run: sudo sysctl -w kernel.core_pattern=core
-      - name: Run coverage-guided compiler fuzzing
-        env:
-          MINYAR_AFL_SECONDS: '60'
-        run: make LIMITED= SANITIZER_LIMITED= CC=clang LLVM_CC=clang COMPILER_LTO_FLAGS='-flto -fuse-ld=lld' check-fuzz-coverage
-      - name: Archive fuzzing findings
-        if: always()
-        run: |
-          if [ -d build/afl-findings ]; then
-            tar -czf build/afl-findings.tar.gz -C build afl-findings
-          fi
-      - name: Upload fuzzing findings
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: afl-findings
-          path: build/afl-findings.tar.gz
-
   windows-isolated-workers:
     name: Windows managed graphs callbacks and copied workers
     runs-on: windows-2025
@@ -328,152 +296,13 @@ jobs:
           name: windows-isolated-workers-evidence
           path: build/test-evidence
 
-  coverage:
-    name: Compiler and runtime coverage gates
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.12'
-      - name: Install LLVM coverage tools
-        run: sudo apt-get update && sudo apt-get install -y clang llvm lld make zsh
-      - name: Measure and enforce coverage
-        run: make LIMITED= SANITIZER_LIMITED= CC=clang LLVM_CC=clang COMPILER_LTO_FLAGS='-flto -fuse-ld=lld' check-coverage
-      - name: Upload coverage evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: coverage-evidence
-          path: build/coverage
-
-  llvm-release-compatibility:
-    name: LLVM ${{ matrix.llvm }} backend and release builds
-    runs-on: ubuntu-24.04
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        llvm: [22, 23]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.12'
-      - name: Install official LLVM release branch packages
-        env:
-          LLVM_VERSION: ${{ matrix.llvm }}
-        run: |
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-key.asc
-          sudo gpg --dearmor -o /usr/share/keyrings/llvm-release.gpg /tmp/llvm-key.asc
-          echo "deb [signed-by=/usr/share/keyrings/llvm-release.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-$LLVM_VERSION main" | sudo tee /etc/apt/sources.list.d/llvm-release.list
-          sudo apt-get update
-          sudo apt-get install -y "clang-$LLVM_VERSION" "llvm-$LLVM_VERSION" "lld-$LLVM_VERSION" make zsh libglfw3-dev libssl-dev pkg-config
-          echo "/usr/lib/llvm-$LLVM_VERSION/bin" >> "$GITHUB_PATH"
-      - name: Verify compiler, opaque IR, native renderer, and release launcher
-        run: |
-          mkdir -p build
-          clang --version | tee build/toolchain-version.txt
-          make LIMITED= SANITIZER_LIMITED= CC=clang LLVM_CC=clang COMPILER_LTO_FLAGS='-flto -fuse-ld=lld' check-portable check-release-build check-launcher-isolation check-incremental-modules
-          llvm-as build/compiler-stage3.ll -o /dev/null
-          opt -passes=verify -disable-output build/compiler-stage3.ll
-          python3 tests/toolchain-portability.py
-          python3 tests/module-driver-options.py
-          python3 tests/native-graphics.py
-      - name: Upload LLVM compatibility evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: llvm-${{ matrix.llvm }}-evidence
-          path: |
-            build/toolchain-version.txt
-            build/fuzz
-            build/mutation
-            build/mutation-score.json
-
-  peer-semantics:
-    name: ${{ matrix.suite }} / ${{ matrix.gate }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        suite: [peer-regressions, peer-cpp-java-js, peer-rust-go-zig, peer-python-swift-ruby-lua]
-        gate: [check-peer-optimizations, check-peer-sanitize]
-    env:
-      MINYAR_TEST_CLANG: clang-18
-      MINYAR_TEST_LTO_FLAGS: -flto -fuse-ld=lld-18
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.12'
-      - name: Install versioned LLVM tools
-        run: sudo apt-get update && sudo apt-get install -y clang-18 lld-18 make zsh
-      - name: Run selected peer suite
-        run: >-
-          make LIMITED= SANITIZER_LIMITED= CC=clang-18 LLVM_CC=clang-18
-          COMPILER_LTO_FLAGS='-flto -fuse-ld=lld-18'
-          PEER_SUITES='tests/${{ matrix.suite }}.py' ${{ matrix.gate }}
-      - name: Upload outcomes and retained failures
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ${{ matrix.suite }}-${{ matrix.gate }}
-          path: |
-            build/peer-results/
-            build/test-evidence/
-
-  peer-testing:
-    name: Peer ownership, allocation faults and LLVM contracts
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    env:
-      MINYAR_LLVM_BIN: /usr/lib/llvm-18/bin
-      MINYAR_TEST_CLANG: clang-18
-      MINYAR_TEST_LTO_FLAGS: -flto -fuse-ld=lld-18
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.12'
-      - name: Install versioned LLVM tools
-        run: sudo apt-get update && sudo apt-get install -y clang-18 llvm-18 llvm-18-tools lld-18 make zsh
-      - name: Run peer-derived correctness and harness checks
-        run: >-
-          make LIMITED= SANITIZER_LIMITED= CC=clang-18 LLVM_CC=clang-18
-          COMPILER_LTO_FLAGS='-flto -fuse-ld=lld-18'
-          check-evidence-harness check-performance-metrics check-peer-ownership check-list-literals check-list-literals-sanitize check-list-literal-runtime check-stateful-lists check-stateful-lists-sanitize check-allocation-faults check-compiler-allocation-faults check-runtime-size-guards check-scalar-cleanup-probes check-codegen check-reduction-harness
-      - name: Upload results and retained failures
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: peer-testing-evidence
-          path: |
-            build/allocation-faults.json
-            build/compiler-allocation-faults.json
-            build/runtime-size-guards.json
-            build/list-literal-runtime-results.json
-            build/scalar-cleanup-probes.json
-            build/codegen-results.json
-            build/peer-results/
-            build/test-evidence/
-
   quic-native:
     name: QUIC native (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15, windows-2025]
+        # Linux QUIC runs in the linux-matrix QUIC shard.
+        os: [macos-15, windows-2025]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -519,69 +348,6 @@ jobs:
           path: |
             build/quic-native-*
             build/quic-official-adapter.*
-
-  quic-sanitize:
-    name: QUIC packet and handshake sanitizers
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: '3.12'
-      - name: Install compiler and crypto dependencies
-        run: sudo apt-get update && sudo apt-get install -y clang lld make zsh libssl-dev
-      - name: Check authenticated transport under ASan, UBSan and leak detection
-        run: make LIMITED= SANITIZER_LIMITED= check-quic-sanitize
-      - name: Upload sanitizer outcomes
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: quic-sanitizer-evidence
-          if-no-files-found: error
-          path: |
-            build/quic-sanitize
-            build/quic-official-adapter.*
-
-  quic-independent-peers:
-    name: QUIC and fallback independent peers
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: '3.12'
-      - name: Install compiler and crypto dependencies
-        run: sudo apt-get update && sudo apt-get install -y clang lld make zsh libssl-dev openssl redis-server
-      - name: Record independent toolchains
-        run: rustc --version && cargo --version && go version
-      - name: Check pinned Quinn over UDP with mutual TLS
-        run: |
-          python3 tests/quic-quinn.py
-          MINYAR_QUINN_KEY_UPDATE=1 python3 tests/quic-quinn.py
-          python3 tests/quic-quinn.py --migration
-          python3 tests/quic-quinn.py --resumption
-          python3 tests/quic-quinn.py --early
-      - name: Check pinned Go TLS and yamux fallback in both roles
-        run: make -j1 LIMITED= SANITIZER_LIMITED= check-transport-go check-transport-go-sanitize
-      - name: Check replacement connection ID routing and exact peer cleanup
-        run: make -j1 LIMITED= SANITIZER_LIMITED= check-peer-edge-cids check-peer-edge-cids-sanitize
-      - name: Check signed relay and malformed or dropped gateway cleanup
-        run: make -j1 LIMITED= SANITIZER_LIMITED= check-peer-edge-relay check-peer-edge-relay-sanitize check-peer-edge-relay-lifetime check-peer-edge-relay-lifetime-sanitize
-      - name: Upload peer-edge integration evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: peer-edge-integration-evidence
-          path: |
-            build/peer-edge-cids-native/
-            build/peer-edge-cids-sanitize/
-            build/peer-edge-relay-*/
 
   macos-phase1-desktop:
     name: macOS complete AppKit HTTP and rendered frames

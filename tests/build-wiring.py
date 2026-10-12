@@ -23,6 +23,23 @@ def dry_run_commands(stdout):
     return ''.join(lines[:start] + lines[end:])
 
 
+
+def literal(path, name):
+    """A module-level literal assignment, read without importing the module."""
+    tree = ast.parse((ROOT / path).read_text())
+    return next(ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id == name for target in node.targets))
+
+
+def assert_ci_runs_quic_group(test, *targets):
+    """CI gates these targets through the runner's QUIC group, run by a linux-matrix shard."""
+    quic = literal('scripts/check-linux.py', 'QUIC_TARGETS')
+    workflow = (ROOT / '.github/workflows/ci.yml').read_text()
+    test.assertIn('python3 scripts/check-linux.py', workflow)
+    test.assertIn('--group quic', workflow)
+    for target in targets:
+        test.assertIn(target, quic)
+
 class BuildWiring(unittest.TestCase):
 
     def test_bakeoff_stress_is_mandatory_with_bounded_quick_profiles(self):
@@ -686,9 +703,7 @@ class BuildWiring(unittest.TestCase):
                                for target in node.targets))
         for target in (native, sanitize):
             self.assertEqual(targets.count(target), 1)
-        workflow = (ROOT/'.github/workflows/ci.yml').read_text()
-        self.assertIn('check-quic\n', workflow)
-        self.assertIn('check-quic-sanitize\n', workflow)
+        assert_ci_runs_quic_group(self, 'check-quic', 'check-quic-sanitize')
         format_tree = ast.parse((ROOT/'scripts/format.py').read_text())
         version = next(ast.literal_eval(node.value) for node in format_tree.body
                        if isinstance(node, ast.Assign)
@@ -1088,10 +1103,9 @@ class BuildWiring(unittest.TestCase):
         tree = ast.parse((ROOT / 'scripts/check-linux.py').read_text())
         targets = next(ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
                        and any(isinstance(x, ast.Name) and x.id == 'TARGETS' for x in node.targets))
-        workflow = (ROOT / '.github/workflows/ci.yml').read_text()
         for target in native | sanitize:
             self.assertEqual(targets.count(target), 1)
-            self.assertIn(target, workflow)
+        assert_ci_runs_quic_group(self, *sorted(native | sanitize))
         spec = importlib.util.spec_from_file_location('relay_catalogue', ROOT / 'tests/suite-catalogue.py')
         catalogue = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(catalogue)
@@ -1172,15 +1186,15 @@ class BuildWiring(unittest.TestCase):
                        and any(isinstance(x, ast.Name) and x.id == 'TARGETS' for x in node.targets))
         for target in (native, sanitize):
             self.assertEqual(targets.count(target), 1)
+        assert_ci_runs_quic_group(self, 'check-quic', 'check-quic-sanitize')
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
-        self.assertIn('check-quic\n', workflow)
-        self.assertIn('check-quic-sanitize\n', workflow)
         format_tree = ast.parse((ROOT / 'scripts/format.py').read_text())
         version = next(ast.literal_eval(node.value) for node in format_tree.body
                        if isinstance(node, ast.Assign)
                        and any(isinstance(x, ast.Name) and x.id == 'VERSION' for x in node.targets))
         self.assertEqual(version, '23.1.2')
-        self.assertIn('clang-format==23.1.2', workflow)
+        # The runner's formatting group installs clang-format==VERSION from scripts/format.py.
+        self.assertIn('--group formatting', workflow)
         spec = importlib.util.spec_from_file_location('ack_catalogue', ROOT / 'tests/suite-catalogue.py')
         catalogue = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(catalogue)
@@ -1253,9 +1267,8 @@ class BuildWiring(unittest.TestCase):
                         namespace['TARGETS'] = ast.literal_eval(node.value)
         for target in (native, sanitize):
             self.assertEqual(namespace['TARGETS'].count(target), 1)
+        assert_ci_runs_quic_group(self, 'check-quic', 'check-quic-sanitize')
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
-        self.assertIn('check-quic\n', workflow)
-        self.assertIn('check-quic-sanitize\n', workflow)
         spec = importlib.util.spec_from_file_location('pto_catalogue', ROOT / 'tests/suite-catalogue.py')
         catalogue = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(catalogue)
@@ -1717,7 +1730,8 @@ class BuildWiring(unittest.TestCase):
         self.assertEqual(targets.count(target), 1)
         workflow = (ROOT/'.github/workflows/ci.yml').read_text()
         self.assertIn('build/linux-evidence/**/build/quic-official-adapter.*', workflow)
-        self.assertEqual(workflow.count('            build/quic-official-adapter.*'), 2)
+        # Linux uploads come from the runner's evidence; macOS and Windows from quic-native.
+        self.assertEqual(workflow.count('            build/quic-official-adapter.*'), 1)
         driver = ast.parse((ROOT/'tests/quic-official-adapter.py').read_text())
         cases = []
         for node in driver.body:
