@@ -1,0 +1,49 @@
+use "sha256" as sha
+use "machine" as machine
+
+// Corpus frame: length, snapshot length, split count, split lengths (LE32), data.
+let corpus = readBytesFile(argument(0))
+let at = 0
+while at < corpus.length {
+    let length = corpus.getUInt32(at)
+    let prefix = corpus.getUInt32(at + 4)
+    let count = corpus.getUInt32(at + 8)
+    let splits = at + 12
+    let start = splits + count * 4
+    // Guard bytes deliberately make the raw-address input unaligned.
+    let data = Bytes(length + 2)
+    data[0] = 0xa5
+    data[length + 1] = 0x5a
+    machine.copy(machine.address(data) + 1, machine.address(corpus) + start, length)
+    let full = sha.hex(sha.digest(data.slice(1, length + 1)))
+    let raw = sha.hex(sha.digestAddress(machine.address(data) + 1, length))
+    let state = sha.new()
+    if !sha.updateAddress(state, machine.address(data) + 1, prefix) { fail("prefix") }
+    let snapshot = sha.hex(sha.finalize(state))
+    let branch = sha.clone(state)
+    let returned = sha.finalize(branch)
+    returned[0] = returned[0] ^ 255
+    if sha.hex(sha.finalize(branch)) != snapshot { fail("returned digest aliased clone") }
+    if !sha.update(branch, Bytes("?")) { fail("clone continuation") }
+    let forked = sha.hex(sha.finalize(branch))
+    let offset = prefix
+    for index in 0..count {
+        let chunk = corpus.getUInt32(splits + index * 4)
+        let valid = false
+        if index % 3 == 0 {
+            valid = sha.updateAddress(state, machine.address(data) + 1 + offset, chunk)
+        } else {
+            if index % 3 == 1 { valid = sha.updateRange(state, data, 1 + offset, chunk) }
+            else { valid = sha.update(state, data.slice(1 + offset, 1 + offset + chunk)) }
+        }
+        if !valid { fail("split") }
+        offset += chunk
+    }
+    if offset != length || sha.bytesHashed(state) != length { fail("split length") }
+    let first = sha.hex(sha.finalize(state))
+    let second = sha.hex(sha.finalize(state))
+    if sha.hex(sha.finalize(branch)) != forked { fail("original update changed clone") }
+    if !sha.update(state, Bytes("!")) { fail("continue after snapshot") }
+    print(full + " " + raw + " " + snapshot + " " + forked + " " + first + " " + second + " " + sha.hex(sha.finalize(state)))
+    at = start + length
+}

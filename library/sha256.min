@@ -1,0 +1,76 @@
+// Standalone streaming SHA-256; runtime/native/sha256.c links OpenSSL libcrypto.
+// State is shared by ordinary record assignment. Use clone for an independent
+// branch. Do not construct State or modify its context/count fields yourself.
+// One thread may operate on a State at a time. Distinct states are independent.
+//
+// update/updateRange borrow Bytes only for the call. updateAddress and
+// digestAddress are unsafe raw-memory entry points: the caller must keep the
+// entire range readable and stable for the call. Numeric checks cannot prove
+// ownership/readability. Addresses and the last input byte must be <= 2^63-1;
+// negative addresses and nonempty null ranges are rejected. Empty null is valid.
+// No update may exceed 2^61-1 cumulative bytes; rejection precedes any input read
+// or mutation. finalize is a nonconsuming snapshot and returns fresh owned Bytes.
+// See docs/sha256.md for the explicit custom-link recipe and provider decision.
+use "machine" as machine
+
+public record State {
+    context: Bytes
+    count: Integer
+}
+function initContext(): Bytes { native "sha256" }
+function cloneContext(context: Bytes): Bytes { native "sha256" }
+function updateContext(context: Bytes, address: Integer, length: Integer, count: Integer): Boolean { native "sha256" }
+function finalizeContext(context: Bytes, count: Integer): Bytes { native "sha256" }
+
+public function new(): State {
+    let context = initContext()
+    if context.length == 0 { fail("SHA-256 initialization failed") }
+    return State { context: context; count: 0 }
+}
+public function clone(state: State): State {
+    let context = cloneContext(state.context)
+    if context.length == 0 { fail("invalid SHA-256 context") }
+    return State { context: context; count: state.count }
+}
+public function bytesHashed(state: State): Integer { return state.count }
+public function update(state: State, input: Bytes): Boolean {
+    return updateRange(state, input, 0, input.length)
+}
+public function updateRange(state: State, input: Bytes, offset: Integer, length: Integer): Boolean {
+    if offset < 0 || length < 0 || offset > input.length { return false }
+    if length > input.length - offset { return false }
+    return updateAddress(state, machine.address(input) + offset, length)
+}
+public function updateAddress(state: State, address: Integer, length: Integer): Boolean {
+    if state.count < 0 || state.count > 2305843009213693951 { return false }
+    if length < 0 || length > 2305843009213693951 - state.count { return false }
+    if address < 0 { return false }
+    if length > 0 {
+        if address == 0 || length - 1 > 9223372036854775807 - address { return false }
+    }
+    if !updateContext(state.context, address, length, state.count) { return false }
+    state.count += length
+    return true
+}
+public function finalize(state: State): Bytes {
+    return finalizeContext(state.context, state.count)
+}
+public function digest(input: Bytes): Bytes {
+    let state = new()
+    if !update(state, input) { return Bytes() }
+    return finalize(state)
+}
+public function digestAddress(address: Integer, length: Integer): Bytes {
+    let state = new()
+    if !updateAddress(state, address, length) { return Bytes() }
+    return finalize(state)
+}
+public function hex(data: Bytes): Text {
+    let digits = Bytes("0123456789abcdef")
+    let out = Bytes()
+    for byte in data {
+        out.add(digits[byte >> 4])
+        out.add(digits[byte & 15])
+    }
+    return Text(out)
+}

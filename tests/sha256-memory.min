@@ -1,0 +1,50 @@
+use "sha256" as sha
+use "sha256test" as fixture
+use "machine" as machine
+
+function check(condition: Boolean, message: Text) { if !condition { fail(message) } }
+
+// Every address alignment modulo 64, over every padding/block/tail boundary.
+let buffer = Bytes(1100)
+for index in 0..buffer.length { buffer[index] = (index * 31 + 17) & 255 }
+for alignment in 0..64 {
+    for length in 0..258 {
+        let address = machine.address(buffer) + alignment
+        let expected = sha.hex(fixture.oracle(address, length))
+        check(sha.hex(sha.digestAddress(address, length)) == expected, "alignment digest")
+        let state = sha.new()
+        check(sha.updateAddress(state, address, length / 2), "alignment prefix")
+        check(sha.updateAddress(state, address + length / 2, length - length / 2), "alignment suffix")
+        check(sha.hex(sha.finalize(state)) == expected, "alignment streaming")
+    }
+}
+// Immediately adjacent inaccessible memory catches under/overreads. All length
+// residues exercise all end alignments; full blocks can end at the guard page.
+for side in 0..2 {
+    for length in 1..258 {
+        let address = fixture.guarded(length, side == 0)
+        let expected = sha.hex(fixture.oracle(address, length))
+        check(sha.hex(sha.digestAddress(address, length)) == expected, "guard digest")
+        let state = sha.new()
+        let prefix = length / 2
+        check(sha.updateAddress(state, address, prefix), "guard prefix")
+        let branch = sha.clone(state)
+        check(sha.updateAddress(state, address + prefix, length - prefix), "guard suffix")
+        check(sha.updateAddress(branch, address + prefix, length - prefix), "guard clone suffix")
+        check(sha.hex(sha.finalize(state)) == expected, "guard streaming")
+        check(sha.hex(sha.finalize(branch)) == expected, "guard cloned tail")
+        fixture.releaseGuard()
+    }
+}
+// Inputs crossing ordinary page boundaries, with inaccessible final pages.
+for length in [4095, 4096, 4097, 8191, 8192] {
+    let address = fixture.guarded(length, false)
+    let expected = sha.hex(fixture.oracle(address, length))
+    check(sha.hex(sha.digestAddress(address, length)) == expected, "multipage digest")
+    let state = sha.new()
+    check(sha.updateAddress(state, address, 63), "multipage tail")
+    check(sha.updateAddress(state, address + 63, length - 63), "multipage full blocks")
+    check(sha.hex(sha.finalize(state)) == expected, "multipage streaming")
+    fixture.releaseGuard()
+}
+print("SHA-256 all 64 alignments and 519 protected-page cases passed")
