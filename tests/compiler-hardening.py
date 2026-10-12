@@ -7,6 +7,7 @@ at O0 and O2. Invalid declarations must fail before LLVM is published.
 import os
 from pathlib import Path
 import random
+import re
 import subprocess
 import unittest
 from regressions import CompilerTestCase, LINK_FLAGS, ROOT, COMPILER
@@ -19,6 +20,21 @@ class CompilerHardening(CompilerTestCase):
                       'print(square(6))\n', '36\n')
         self.rejects('public parallel function bad(value: Text): Integer { return 1 }\n',
                      "parallel function 'bad' may use only Integer, Float, Boolean and Character values")
+
+    def test_depth_analysis_uses_resolved_boolean_and_recursive_calls(self):
+        source = ('function leaf(): Boolean { return true }\n'
+                  'function middle(): Boolean { return leaf() }\n'
+                  'function upper(): Integer { if middle() { return 42 } else { return 0 } }\n'
+                  'function recursive(n: Integer): Integer { if n == 0 { return upper() } else { return recursive(n - 1) } }\n'
+                  'print(recursive(8))\n')
+        result, llvm = self.compile(source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = llvm.read_text()
+        for name in ('leaf', 'middle', 'upper', 'recursive'):
+            body = re.search(r'^define [^\n]*@\.minyar\.fn\.' + name + r'\([^\n]*\) \{\n.*?^\}', text, re.M | re.S)
+            self.assertIsNotNone(body, name)
+            self.assertEqual('call void @minyar_stack_enter()' in body.group(), name == 'recursive')
+        self.executes(source, '42\n')
 
     def test_typed_bytes_methods_require_both_known_verb_and_width(self):
         self.executes('let values = Bytes(0)\nvalues.addInt32(7)\n'
