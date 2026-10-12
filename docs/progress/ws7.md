@@ -34,15 +34,24 @@ in the signing checklist. Continue the Windows idle work independently.
   The original sanitizer, focused cohort, portable suite and signing never ran.
   No runtime/test edits exist. Normal stop and snapshot completed at 15:14:51.
   Snapshot inventory was truncated; actual restored bytes must be verified.
-  The integrator now admits existing-box resume solely for a guarded, single
-  worker immutable relay to WS4, followed by credential retirement and normal
-  stop. Guest restart and product tests require separate resource admission.
+  The admitted relay-only resume also ended NONPASS: the read returned, then a
+  size/mtime/inode assertion failed before saving its SHA. No transfer occurred;
+  all eight restored byte hashes remain unadmitted. Its actual guardian deadline
+  was 10,800 seconds, despite later 1,200-second prose; observed duration was
+  521.94 seconds with zero resource excursions. Owned PIDs/group were proved
+  absent; hydrated=true/error=null was observed. Normal stop completed 15:32:15.
+  A new source verification requires fresh integrator admission, a labeled
+  1,200-second bound and digest persistence before ancillary metadata checks.
+  Guest restart and product tests require separate resource admission.
   The unchanged one-second `system-k1024/n2048`, `idle_cpu <= .02`, remains the
   required repro before any optimization; full native/portable gates follow.
 - `ws7/test-signing`, `/tmp/minyar-ws7-signing`: explicit test-certificate
   pipeline committed as `3ed25bd`; 19 mocked signing contracts and 12 shipping
-  contracts pass. Independent review is underway. Actual trusted macOS CI and
-  Windows Boat signing remain unrun. Production signing/notarization checks
+  contracts pass. Registration `fe66b86` passes catalogue and Make checks.
+  Independent review blocked core code on unbounded Ed25519 subprocesses and
+  acceptance of a nonexistent CI runner directory; fixes are underway.
+  Actual trusted macOS CI and Windows Boat signing remain unrun.
+  Production signing/notarization checks
   remain strict. Native Windows signing waits for a separately admitted slot.
 - `ws7/ci-speed`, `/tmp/minyar-ws7-ci`: owned Boat Linux `bx_ck6a9vnc`,
   4 vCPU/8 GiB. Preserve all 135 current Linux targets and extra gates while
@@ -102,3 +111,5 @@ Public resource-abort evidence is retained at
 `owned-abort-public-evidence.tar` (204,800 bytes, SHA256
 `c693b638c79022d41871c51e0d80728606242e08aaa87ecf210f6a32a8c6fdc0`).
 Private image/profile/key bytes remain entirely remote.
+The separate failed relay record is `ws7-windows-idle/relay-closeout.json`;
+it does not repair or replace the original guard-abort record.
