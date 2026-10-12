@@ -483,6 +483,17 @@ The six passing roles remain recorded; the repaired QUIC observer still needs
 long verification. The sanitizer cohort and separate connected-idle and
 UDP-blocked fallback measurements require later admissions.
 
+A separate TLS fixture cleanup regression now passes eleven Task outcomes.
+The actual handler previously retained completed tasks after a shutdown
+timeout, cancellation during shutdown or an unexpected `close()` error. The
+same control records those three assertion failures before the repair and
+zero retained or pending tasks after it. An outer `finally` now removes peer
+membership; exception propagation, cancellation, response bytes and counters
+remain unchanged. Both generations retire all six recorded process identities
+and groups with stable sources and tools. This qualifies handler cleanup;
+it does not attribute the completed TLS memory slopes to that bug or replace
+the later sanitizer and long measurements.
+
 The deleted scale helper has been rebuilt once with an explicit locked Cargo
 release profile. All eight Rust tests and the product build pass, with stable
 source/tool inputs and a validated x86-64 ELF/loader ABI. An accidental

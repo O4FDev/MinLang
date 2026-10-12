@@ -64,10 +64,12 @@ async def peer(reader,writer):
     except (asyncio.IncompleteReadError,ConnectionError,ssl.SSLError,asyncio.CancelledError): pass
     except BaseException as error: unexpected.append(repr(error))
     finally:
-        writer.close()
-        try: await writer.wait_closed()
-        except (ConnectionError,ssl.SSLError): pass
-        peers.discard(task)
+        try:
+            writer.close()
+            try: await writer.wait_closed()
+            except (ConnectionError,ssl.SSLError): pass
+        finally:
+            peers.discard(task)
 loop=asyncio.new_event_loop(); server_holder=[]
 def serve():
     asyncio.set_event_loop(loop)

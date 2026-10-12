@@ -21,6 +21,229 @@ class ObserverTests(unittest.TestCase):
         return subprocess.Popen([sys.executable, '-c', source], stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, start_new_session=True)
 
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'fixture birth receipts use Linux procfs')
+    def test_tls_peer_releases_membership_on_all_close_outcomes(self):
+        # Compile ONLY the literal maintained peer function, not the public
+        # argparse/certificate/server/soak body. No rewritten peer algorithm.
+        # Outcomes exercise real Tasks with deterministic reader/writer doubles;
+        # they do not claim an authenticated TLS connection or a soak result.
+        source = r'''
+import ast, asyncio, hashlib, json, os, ssl
+from pathlib import Path
+
+def birth():
+    pid = os.getpid()
+    fields = Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()
+    return {'pid': pid, 'pgid': int(fields[2]), 'start_ticks': int(fields[19])}
+
+driver = birth()
+print(json.dumps({'driver_birth': driver, 'helpers': []}, sort_keys=True), flush=True)
+source_path = Path(__TLS_SOURCE__)
+raw = source_path.read_bytes()
+tree = ast.parse(raw, filename=str(source_path))
+definitions = [node for node in tree.body
+               if isinstance(node, ast.AsyncFunctionDef) and node.name == 'peer']
+if len(definitions) != 1:
+    raise RuntimeError('maintained peer extraction was not unique')
+definition = definitions[0]
+fragment = ast.get_source_segment(raw.decode(), definition)
+code = compile(fragment, str(source_path), 'exec')
+
+class Reader:
+    def __init__(self, mode):
+        self.mode = mode
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.reads = 0
+    async def readuntil(self, separator):
+        if separator != b'\r\n\r\n':
+            raise AssertionError('unexpected maintained separator')
+        self.reads += 1
+        self.entered.set()
+        if self.mode == 'cancel_body':
+            await self.release.wait()
+            raise asyncio.IncompleteReadError(b'', None)
+        if self.mode == 'reset_body':
+            raise ConnectionResetError('fixture body reset')
+        if self.mode == 'ssl_body':
+            raise ssl.SSLError('fixture body SSL error')
+        if self.mode == 'unexpected_body':
+            raise RuntimeError('fixture body failed')
+        if self.mode == 'seven_requests':
+            return b'GET /heartbeat HTTP/1.1\r\nHost: fixture\r\n\r\n'
+        raise asyncio.IncompleteReadError(b'', None)
+
+class Writer:
+    def __init__(self, mode):
+        self.mode = mode
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.close_calls = 0
+        self.wait_calls = 0
+        self.writes = []
+    def get_extra_info(self, name):
+        return {'fixture': True} if name == 'peercert' else None
+    def write(self, data):
+        self.writes.append(data)
+    async def drain(self):
+        await asyncio.sleep(0)
+    def close(self):
+        self.close_calls += 1
+        if self.mode == 'unexpected_close':
+            raise RuntimeError('fixture close failed')
+    async def wait_closed(self):
+        self.wait_calls += 1
+        self.entered.set()
+        if self.mode == 'cancel_wait':
+            await self.release.wait()
+        elif self.mode == 'reset_wait':
+            raise ConnectionResetError('fixture close reset')
+        elif self.mode == 'ssl_wait':
+            raise ssl.SSLError('fixture close SSL error')
+        elif self.mode == 'timeout_wait':
+            raise TimeoutError('fixture close timed out')
+
+async def run_case(name, reader_mode, writer_mode, cancellation):
+    peers = set()
+    stats = dict.fromkeys(('connections', 'responses', 'malformed',
+                           'oversized', 'closed', 'slow'), 0)
+    unexpected = []
+    namespace = {'asyncio': asyncio, 'ssl': ssl, 'peers': peers,
+                 'stats': stats, 'unexpected': unexpected}
+    exec(code, namespace)
+    reader, writer = Reader(reader_mode), Writer(writer_mode)
+    task = asyncio.create_task(namespace['peer'](reader, writer), name=name)
+    outcome, cause = None, None
+    membership_before_cancel = None
+    try:
+        if cancellation:
+            entered = reader.entered if cancellation == 'body' else writer.entered
+            await asyncio.wait_for(entered.wait(), .5)
+            membership_before_cancel = task in peers
+            task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), .5)
+            outcome = 'returned'
+        except BaseException as error:
+            outcome, cause = type(error).__name__, str(error)
+            if not task.done():
+                raise RuntimeError('fixture task exceeded its useful bound') from error
+        return {'name': name, 'outcome': outcome, 'cause': cause,
+                'cancelled': task.cancelled(), 'task_done': task.done(),
+                'membership_before_cancel': membership_before_cancel,
+                'retained_peers': len(peers),
+                'retained_done_peers': sum(value.done() for value in peers),
+                'close_calls': writer.close_calls, 'wait_calls': writer.wait_calls,
+                'read_calls': reader.reads, 'write_hex': [value.hex() for value in writer.writes],
+                'stats': stats, 'unexpected': unexpected,
+                'diagnostic_nonpass': bool(unexpected) or outcome in ('TimeoutError', 'RuntimeError')}
+    finally:
+        reader.release.set()
+        writer.release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), .5)
+
+async def main():
+    cases = (
+        ('normal', 'seven_requests', 'normal', None),
+        ('eof', 'eof', 'normal', None),
+        ('reset_body', 'reset_body', 'normal', None),
+        ('ssl_body', 'ssl_body', 'normal', None),
+        ('reset_wait', 'eof', 'reset_wait', None),
+        ('ssl_wait', 'eof', 'ssl_wait', None),
+        ('timeout_wait', 'eof', 'timeout_wait', None),
+        ('cancel_body', 'cancel_body', 'normal', 'body'),
+        ('cancel_wait', 'eof', 'cancel_wait', 'wait'),
+        ('unexpected_close', 'eof', 'unexpected_close', None),
+        ('unexpected_body', 'unexpected_body', 'normal', None),
+    )
+    rows = []
+    for case in cases:
+        rows.append(await run_case(*case))
+    pending = [task.get_name() for task in asyncio.all_tasks()
+               if task is not asyncio.current_task() and not task.done()]
+    return {'driver': driver, 'helpers': [], 'helper_process_scope': 'no helper processes spawned',
+            'source_sha256': hashlib.sha256(raw).hexdigest(),
+            'peer_fragment_sha256': hashlib.sha256(fragment.encode()).hexdigest(),
+            'peer_span': [definition.lineno, definition.end_lineno],
+            'cases': rows, 'pending_tasks': pending,
+            'scope': 'actual peer coroutine lifecycle with bounded doubles; no TLS/protocol/RSS claim'}
+
+result = asyncio.run(main())
+print(json.dumps(result, sort_keys=True), flush=True)
+'''.replace('__TLS_SOURCE__', repr(str(Path(__file__).with_name('tls-soak.py'))))
+        fields = Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()
+        print(json.dumps({'runner': {'pid': os.getpid(), 'pgid': int(fields[2]),
+                                      'start_ticks': int(fields[19])}}), flush=True)
+        child = self.child(source)
+        try:
+            stdout, stderr = child.communicate(timeout=8)
+            # self.child uses binary pipes. Publish all available raw output
+            # before any outer status, stderr, parsing or lifecycle assertion.
+            sys.stdout.buffer.write(stdout)
+            sys.stdout.buffer.flush()
+            self.assertEqual(child.returncode, 0, stderr)
+            self.assertEqual(stderr, b'')
+            output = [json.loads(line) for line in stdout.splitlines()]
+            self.assertEqual(len(output), 2)
+            result = output[1]
+            self.assertEqual(output[0], {'driver_birth': result['driver'], 'helpers': []})
+            self.assertEqual(result['driver']['pid'], child.pid)
+            self.assertEqual(result['driver']['pgid'], child.pid)
+            self.assertEqual(result['helpers'], [])
+            self.assertEqual(result['pending_tasks'], [])
+            expected = {
+                'normal': ('returned', None, False, False),
+                'eof': ('returned', None, False, False),
+                'reset_body': ('returned', None, False, False),
+                'ssl_body': ('returned', None, False, False),
+                'reset_wait': ('returned', None, False, False),
+                'ssl_wait': ('returned', None, False, False),
+                'timeout_wait': ('TimeoutError', 'fixture close timed out', False, True),
+                'cancel_body': ('returned', None, False, False),
+                'cancel_wait': ('CancelledError', '', True, False),
+                'unexpected_close': ('RuntimeError', 'fixture close failed', False, True),
+                'unexpected_body': ('returned', None, False, True),
+            }
+            self.assertEqual([row['name'] for row in result['cases']], list(expected))
+            for row in result['cases']:
+                with self.subTest(case=row['name']):
+                    outcome, cause, cancelled, nonpass = expected[row['name']]
+                    self.assertEqual(row['outcome'], outcome)
+                    self.assertEqual(row['cause'], cause)
+                    self.assertEqual(row['cancelled'], cancelled)
+                    self.assertEqual(row['diagnostic_nonpass'], nonpass)
+                    self.assertTrue(row['task_done'])
+                    self.assertEqual(row['close_calls'], 1)
+                    self.assertEqual(row['wait_calls'], 0 if row['name'] == 'unexpected_close' else 1)
+                    self.assertEqual(row['stats']['connections'], 1)
+                    self.assertEqual(row['unexpected'], ["RuntimeError('fixture body failed')"]
+                                     if row['name'] == 'unexpected_body' else [])
+                    if row['name'].startswith('cancel_'):
+                        self.assertTrue(row['membership_before_cancel'])
+                    if row['name'] == 'normal':
+                        self.assertEqual(row['read_calls'], 7)
+                        self.assertEqual(row['stats'], {'connections': 1, 'responses': 6,
+                                                       'malformed': 0, 'oversized': 0,
+                                                       'closed': 1, 'slow': 0})
+                        fragments = (b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok',)
+                        self.assertEqual(row['write_hex'],
+                                         [part.hex() for response in fragments * 6
+                                          for part in (response[:7], response[7:])])
+                    else:
+                        self.assertEqual(row['write_hex'], [])
+                    # These follow all outcome/counter assertions so baseline
+                    # RED identifies retained completed tasks, not a new API.
+                    self.assertEqual(row['retained_peers'], 0)
+                    self.assertEqual(row['retained_done_peers'], 0)
+            with self.assertRaises(ProcessLookupError): os.kill(child.pid, 0)
+            with self.assertRaises(ProcessLookupError): os.killpg(child.pid, 0)
+        finally:
+            if child.poll() is None:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.communicate(timeout=2)
+
     def test_silent_peer_cannot_hold_the_harness(self):
         child = self.child('import time; time.sleep(10)')
         started = time.monotonic()
