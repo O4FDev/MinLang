@@ -28,7 +28,7 @@ TARGETS = ['check-octal-literals', 'check-reserved-names', 'check-module-constan
            'check-bootstrap-portability', 'check-bootstrap-records',
            'check-measurement-stats', 'check-budget-harness', 'check-stack-limits',
            'check-scalar-study-harness',
-           'check-compiler-hardening', 'check-linkage', 'check-source-map', 'check-symbol-order', 'check-list-access',
+           'check-compiler-hardening', 'check-linkage', 'check-source-map', 'check-symbol-order', 'check-list-access', 'check-list-sort', 'check-list-sort-runtime', 'check-list-sort-profiles', 'check-list-sort-sanitize',
            'check-checked-arithmetic', 'check-checked-scalars',
            'check-runtime-bytes', 'check-runtime-traps', 'check-runtime-numeric',
            'check-shipping', 'check-errors-values', 'check-errors-language', 'check-errors-language-sanitize', 'check-errors-language-bounded', 'check-errors-launcher', 'check-errors-review', 'check-errors-review-sanitize', 'check-errors-review-bounded', 'check-errors-review-bounded-sanitize', 'check-schannel-framing', 'check-schannel-framing-sanitize', 'check-net', 'check-net-loop', 'check-net-udp-offload', 'check-net-udp-offload-sanitize', 'check-tls', 'check-tls-sanitize',

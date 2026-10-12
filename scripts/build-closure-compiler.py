@@ -137,6 +137,10 @@ def assemble(source):
         '                let token = tokenTexts[position]\n                let kind = tokenKinds[position]\n'
         '                if token == "function" && tokenTexts[position + 1] == "(" { functionHeader = true }\n'
         '                if token == "{" && functionHeader { functionHeader = false }\n')
+    source = body(source, 'sortBorrowReference',
+        '    borrowReference(output, state, value, type, counts, fields, returns)')
+    source = body(source, 'sortComparatorThunk',
+        '    return closureSortComparatorThunk(names, type, element, globals)')
     main = source.index('\nfunction main(')
     helpers = (ROOT / 'compiler/closure-compiler.min').read_text()
     source = source[:main] + '\n' + helpers + source[main:]

@@ -19,7 +19,7 @@ def engine_source(project):
     prefix = ('#if defined(__GNUC__) || defined(__clang__)\n'
               '#define MINYAR_NOINLINE __attribute__((noinline))\n'
               '#else\n#define MINYAR_NOINLINE\n#endif\n')
-    return prefix + source + '\n#include "minyar_callbacks.h"\n'
+    return '#define MINYAR_SORT_GRAPH 1\n' + prefix + source + '\n#include "minyar_callbacks.h"\n'
 
 
 def configured_source(project, runtime):

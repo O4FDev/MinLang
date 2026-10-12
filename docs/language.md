@@ -190,6 +190,39 @@ replacements, including those performed by functions. Mutations that could
 create an ownership cycle are rejected, as described below. Reading or writing
 outside a List's bounds stops with a clear error.
 
+`list.sort()` stably orders its elements in place and returns `Nothing`;
+aliases observe the same List. `list.sorted()` returns a fresh shallow copy.
+Natural order supports Integer, Character (code point), Boolean (`false`
+before `true`), Float, and Text (lexicographic unsigned UTF8 bytes). Float
+NaNs come last and compare equal to one another; signed zeros compare equal.
+Equal elements keep their original order. Text sorting does not build its
+lazy character-offset cache.
+
+`list.sortBy(compare)` and `list.sortedBy(compare)` take a
+`Callback<T, T, Integer>`. Its signed three-way result is negative when the
+first element comes earlier, zero when equal, and positive when later:
+
+```minyar
+let values = [3, 1, 2]
+values.sortBy(function(a: Integer, b: Integer): Integer { return a - b })
+```
+
+The callback sees the original slot order throughout comparison. Changes to
+separate captured state and element record fields are allowed. If the List's
+length or slots differ from their original snapshot after comparison, the
+program stops with `the List was mutated during its sort comparator.` before
+publishing any sorted slots. Callback side effects are retained. A transient
+mutation restored exactly before that check is not reported. Rebinding a
+variable or field holding the receiver or comparator keeps the selected
+objects alive for the sort.
+
+All four methods use O(n log n) comparisons and O(n) extra space. Natural
+sorting needs at most ceil(n/2) scratch slots; comparator sorting retains n
+original slots and uses n indices plus ceil(n/2) scratch indices. A copied
+result adds its own List storage. Comparator results should define a
+consistent ordering; subtraction can overflow for distant Integer values,
+so comparisons returning -1, 0, or 1 are safer for general Integers.
+
 `Bytes` holds packed binary data, such as file contents, compact tables or
 vertex data. `Bytes(length)` makes zero-filled Bytes and `Bytes()` makes empty
 ones. Like a List, Bytes is a shared reference value:

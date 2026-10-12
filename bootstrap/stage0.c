@@ -164,6 +164,7 @@ typedef struct {
     Program *program;
     int next_temporary;
     int next_label;
+    int sort_used;
     char current_block[64];
 } Emitter;
 
@@ -1242,6 +1243,11 @@ static Type check_expression(Program *program, Function *function, Expression *e
         if (left < TYPE_LIST_INTEGER || left > TYPE_LIST_BOOLEAN)
             fail_at(expression->line, expression->column, "%s does not provide the '%s' operation",
                     type_name(left), expression->text);
+        if (!strcmp(expression->text, "sort") || !strcmp(expression->text, "sorted")) {
+            if (arrlen(expression->arguments) != 0)
+                fail_at(expression->line, expression->column, "List.%s expects no arguments", expression->text);
+            return expression->type = !strcmp(expression->text, "sorted") ? left : TYPE_NOTHING;
+        }
         if (strcmp(expression->text, "add") != 0)
             fail_at(expression->line, expression->column,
                     "lists do not provide an operation named '%s'", expression->text);
@@ -1646,6 +1652,18 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
                     temporary, left.name, right.name, end.name);
             return make_value(TYPE_TEXT, "%%value.%d", temporary);
         }
+        if (!strcmp(expression->text, "sort") || !strcmp(expression->text, "sorted")) {
+            int kind = TYPE_INTEGER + expression->left->type - TYPE_LIST_INTEGER;
+            emitter->sort_used = 1;
+            if (!strcmp(expression->text, "sort")) {
+                fprintf(output, "  call void @minyar_list_sort(ptr %s, i64 %d)\n", left.name, kind);
+                return make_value(TYPE_NOTHING, "");
+            }
+            temporary = new_temporary(emitter);
+            fprintf(output, "  %%value.%d = call ptr @minyar_list_sorted(ptr %s, i64 %d, i64 %d)\n",
+                    temporary, left.name, kind, kind == TYPE_TEXT);
+            return make_value(expression->type, "%%value.%d", temporary);
+        }
         right = emit_expression(emitter, expression->arguments[0]);
         if (right.type != TYPE_INTEGER) {
             temporary = new_temporary(emitter);
@@ -2022,6 +2040,9 @@ static void emit_program(FILE *output, Program *program) {
         }
         fputs("}\n\n", output);
     }
+    if (emitter.sort_used)
+        fputs("declare void @minyar_list_sort(ptr, i64)\n"
+              "declare ptr @minyar_list_sorted(ptr, i64, i64)\n", output);
 }
 
 static char *read_file(const char *path) {

@@ -380,6 +380,7 @@ MINYAR_HOT unsigned char *new_bytes(long long length) {
 }
 
 #include "minyar_collections.h"
+#include "minyar_sort.h"
 
 static MinyarText *copy_c_text(const char *source) {
     size_t length = strlen(source);
