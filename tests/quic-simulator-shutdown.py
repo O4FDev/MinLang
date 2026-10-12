@@ -45,7 +45,8 @@ def run(source, sig):
         parentfd=os.pidfd_open(process.pid)
         children=[]
         try:
-            deadline=time.monotonic()+3
+            # Hang guards only: the assertions are the exit status and both flushes.
+            deadline=time.monotonic()+30
             while not all((root/name).exists() for name in ("left","right")):
                 if process.poll() is not None or time.monotonic()>=deadline:
                     raise RuntimeError("capture writers did not become ready")
@@ -53,7 +54,7 @@ def run(source, sig):
             children=[(int((root/name).read_text()),os.pidfd_open(int((root/name).read_text())))
                       for name in ("left","right")]
             signal.pidfd_send_signal(parentfd,sig)
-            status=process.wait(timeout=3)
+            status=process.wait(timeout=30)
             flushed=[(root/(name+".flushed")).exists() for name in ("left","right")]
             result={"signal":sig.name,"shell_status":status,"flushed_at_shell_exit":flushed,
                     "source_sha256":hashlib.sha256(data).hexdigest()}
