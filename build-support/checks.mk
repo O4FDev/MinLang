@@ -780,3 +780,24 @@ check-transport-udp-fallback-sanitize: build/minyarc build/yamux-peer | build
 	@set -e; evidence=$$(mktemp -d "$(abspath build)/transport-udp-fallback-sanitize.XXXXXXXX"); $(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/transport-udp-fallback.py --go-binary build/yamux-peer --sanitize --evidence "$$evidence"
 check: check-transport-udp-fallback
 check-sanitize: check-transport-udp-fallback-sanitize
+
+.PHONY: check-raw-syscall check-raw-syscall-linux-native check-raw-syscall-sanitize check-raw-syscall-abi check-raw-syscall-frontends
+check-raw-syscall: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/raw-syscall.py
+
+# Explicit: fails on other hosts, so a portability pass cannot stand in for
+# native Linux kernel execution. Cross ABI checks are compile proof only.
+check-raw-syscall-linux-native: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/raw-syscall.py --linux-native
+
+check-raw-syscall-sanitize: build/minyarc-sanitize
+	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize $(SANITIZER_LIMITED) python3 tests/raw-syscall.py --sanitize
+
+check-raw-syscall-abi: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/raw-syscall.py --abi
+
+check-raw-syscall-frontends: build/minyarc-modules build/minyarc-callbacks build/minyarc-errors
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/raw-syscall.py --frontends
+
+check check-portable: check-raw-syscall
+check-sanitize: check-raw-syscall-sanitize
