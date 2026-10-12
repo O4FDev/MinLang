@@ -294,8 +294,8 @@ cleanup/watch records and raw runner evidence are preserved. Independent
 lifetime review established retirement of the recorded processes and groups;
 fresh queries using the actual owner and project labels found no retained
 containers or networks. That absence does not certify the interrupted attached
-workload, identify its SIGKILL issuer or supply a protocol verdict. Later cells
-are suspended. These results
+workload, identify its SIGKILL issuer or supply a protocol verdict. That sequence
+suspended later cells. These results
 do not rewrite historical failures or certify all 128 current-source cells.
 
 The owned runner adapter now optionally forwards attached workload output while
@@ -317,9 +317,18 @@ files, the raw verdict, all six creation/workload lifetimes and retirement of
 The unknown-test compliance probe retains its expected 127 exit. One polling
 inspection retains status 1 after the owned container was removed, matching the
 controller's existing exact `MissingContainer` contract. Neither receipt was
-normalized. The original index-69 error remains unchanged. Original indices
-70–119 are admitted serially, stopping on the first unexpected nonpass; their
-actual results remain required.
+normalized. The original index-69 error remains unchanged.
+
+The subsequent serial continuation passes original indices 70 and 71: Minyar
+as server accepts 0-RTT from msquic and ngtcp2 under the unchanged official
+criterion. It stops at index 72, Minyar as client with quiche as server during
+port rebinding. The literal verdict is FAILED; quiche panics with
+`cannot probe: InvalidState`, and the attached workload exits 101. The trigger
+remains unresolved. All 3,355 indexed files, 1,323 raw CLI receipts, and
+retirement of the three generations' recorded processes, groups and owned
+containers were independently reviewed. Expected unknown-test exits and
+polling inspections of already removed containers retain their raw nonzero
+statuses. Indices 73–119 remain held; current full interoperability is pending.
 
 Actual runner failures exposed fixture defects in Docker 29 capability
 spelling, simulator capture writers that had not flushed during shutdown, and
