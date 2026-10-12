@@ -576,7 +576,7 @@ def main():
                 native += ['-lcrypto']
         elif library in ('zstd', 'deflate'):
             from compression_provider import codec_provider
-            cflags, archives = codec_provider(library, clang)
+            cflags, archives = codec_provider(library, clang, native_flags, link_flags)
             native += [native_object(project, clang, base, library + '.c', [*native_flags, *cflags]), *archives]
         elif library == 'securecrypto':
             native += [native_object(project, clang, base, 'securecrypto.c', native_flags)]

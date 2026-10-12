@@ -212,6 +212,11 @@ def provider_contracts(clang, provider):
     flags,libraries=provider
     archive=Path(libraries[0]); assert archive.is_absolute() and archive.name=='libzstd.a'
     include=Path(flags[flags.index('-isystem')+1])
+    if platform.system() == 'Windows' or platform.system().startswith(('MSYS','MINGW','CYGWIN')):
+        # codec_provider already ran the active-prefix 64-bit/raw-dict probe.
+        # Copied temp prefixes cannot satisfy the compiler/CRT-prefix rule.
+        print('active MSYS static provider probe: ok; isolated archive negatives in compression-provider.py',flush=True)
+        return
     old=os.environ.get('MINYAR_ZSTD_PREFIX')
     try:
         with tempfile.TemporaryDirectory(prefix='minyar-provider-contract-') as tmp:

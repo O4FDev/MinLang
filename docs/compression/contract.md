@@ -90,6 +90,22 @@ qualification is an integration gate, not established by the Linux evidence.
 Apple SDK zlib may use its absolute stable public API `.tbd` link stub; zstd
 still uses a Homebrew static archive with its own matched headers.
 
+Archive selection verifies embedded ELF/Mach-O/COFF relocatable objects and
+the required static function definitions. Renamed shared libraries, linker
+scripts, thin archives and COFF import members are rejected. `nm` or `llvm-nm`
+must be available. LTO bitcode and universal archive wrappers are unsupported;
+select the matching architecture's regular static archive. The ABI probe
+constructs both advanced RAW/by-copy dictionaries before returning flags.
+
+`codec_provider(codec, clang, compile_flags, link_flags)` accepts the effective
+native compiler and final link flags. Compiler dependencies must resolve both
+primary and secondary codec headers under the chosen provider prefix, including
+forced headers; all dependency files participate in the cache fingerprint.
+Literal backslash provider paths on POSIX are explicitly unsupported because
+Clang rewrites those dependency filenames. Spaces and apostrophes are supported.
+Windows backslashes remain normal path separators. The focused regression
+suite is `python3 tests/compression-provider.py`.
+
 Manual custom link recipe (substitute the provider's exact output):
 
 ```sh
