@@ -19,13 +19,13 @@ build/minyarc-sanitize: build/compiler-stage2-sanitize.ll build/minyar-compiler-
 	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
 build/compiler-stage2.ll: build/compiler.min build/compiler-stage1
-	$(LIMITED) ./build/compiler-stage1 $< $@
+	$(LIMITED) ./build/compiler-stage1 $< $@ --compiler-build
 
 build/minyarc: build/compiler-stage2.ll build/minyar-compiler-runtime.ll
 	$(LIMITED) "$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
 build/compiler-stage3.ll: build/compiler.min build/minyarc
-	$(LIMITED) ./build/minyarc $< $@
+	$(LIMITED) ./build/minyarc $< $@ --compiler-build
 
 build/compiler-bootstrap.ll: build/compiler-stage1.ll
 	cp $< $@
