@@ -226,6 +226,13 @@ public function total(node: Node): Integer {
                 assert 'checked ' in checked.stdout and not checked.stderr,checked
         else:
             first,_=compile(fixture)
+            if not next_state.read_bytes():
+                # Package imports, native linkage and constants take the documented
+                # complete-compiler fallback: no cache state, and none is reused later.
+                assert first[0]==0 and first[4:]==(0,0),first
+                counts,table=compile(fixture)
+                assert counts==first and not table and not next_state.read_bytes(),counts
+                continue
             counts,table=compile(fixture)
             assert counts==(first[1],0,0,first[1],0,0),counts
             assert table
