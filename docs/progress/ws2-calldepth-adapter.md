@@ -15,6 +15,11 @@ actual continuation predecessor before later PHIs. Callback header/domain
 validation precedes the body; boundary domain validation precedes all depth
 scope mutation. `calldepth.run` and `remaining` are dedicated boundaries.
 
+Module constant loaders and `sortBy`/`sortedBy` comparators reenter language
+code, so their call sites checkpoint too; `sortedBy` releases its fresh result
+on the unwind edge. A rejected or unwound constant initializer resets the
+constant to uninitialized, so a later read retries it.
+
 Stack ownership requires `state[14] == 0`, including indirect calls. The
 adapter rewrites only the exact RC entry piece and each exact RC leave piece,
 using stack_v1's matching leave. It preserves callback domain/header metadata

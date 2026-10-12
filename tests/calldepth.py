@@ -36,6 +36,7 @@ EXPECTED = {
     'reporting-global': '14\n17\n0\n42\nalive\n',
     'reporting-fallback': '85\n14\n17\n42\nalive\n',
     'reporting-physical': '14\n42\nalive\n',
+    'ws3-paths': '0\n0\n5\nfalse\nfalse\n0\n1\n',
 }
 
 

@@ -92,12 +92,41 @@ def adapt(source, *, unwind_hook=None):
         '    finishFunctionEntry(output, entrySlot, state[4], 0, state[8], state[6] == 1)\n    output.add("}\\n\\n")\n}\n',
         '    finishFunctionEntry(output, entrySlot, state[4], 0, state[8], state[6] == 1, "i32"' + hook_arguments + ')\n    output.add("}\\n\\n")\n}\n')
     # Module constant loaders own a frame only on their initialization path.
-    # The recovery declarations below already declare minyar_rc_release.
-    source = edit(source, 'compileModuleConstants', lambda s: replace(replace(replace(s,
+    # A rejected or unwound initializer leaves its constant uninitialized, so a
+    # later read retries instead of reporting recursive initialization. The
+    # recovery declarations below already declare minyar_rc_release.
+    source = edit(source, 'compileModuleConstants', lambda s: replace(replace(replace(replace(s,
         '    output.add("declare void @minyar_rc_release(ptr)\\n")\n', ''),
+        '            output.add("  store i8 1, ptr " + flag + "\\n")\n'
+        '            // Only the initialization path owns a frame. Cached reads are loads.\n'
+        '            let entrySlot = output.length\n'
+        '            output.add("")\n',
+        '            // Only the initialization path owns a frame. Cached reads are loads.\n'
+        '            let entrySlot = output.length\n'
+        '            output.add("")\n'
+        '            output.add("  store i8 1, ptr " + flag + "\\n")\n'),
         '            textState.add("initialize")\n', '            textState.add("recovery.body")\n'),
         '            finishFunctionEntry(output, entrySlot, state[4], 0, state[8], state[6] == 1)\n',
-        '            finishFunctionEntry(output, entrySlot, state[4], 0, state[8], state[6] == 1, llvmType(type)' + hook_arguments + ')\n'))
+        '            finishFunctionEntry(output, entrySlot, state[4], 0, state[8], state[6] == 1, llvmType(type)' + hook_arguments + ')\n'
+        '            recoveryResetConstant(output, entrySlot, flag)\n'))
+    source = edit(source, 'parseAtom', lambda s: replace(s,
+        '                            value = emitCall(output, textState, state, type, constantIRName(token, "load"), values, types)\n'
+        '                            state[14] = state[14] + 1\n',
+        '                            value = emitCall(output, textState, state, type, constantIRName(token, "load"), values, types)\n'
+        '                            state[14] = state[14] + 1\n'
+        '                            recoveryCheckpoint(output, textState, state)\n'))
+    # Sort comparators reenter language code through the runtime.
+    source = edit(source, 'parsePrimary', lambda s: replace(s,
+        '                    output.add(")\\n")\n'
+        '                    if copying {\n'
+        '                        setType(resultType, receiverType)\n',
+        '                    output.add(")\\n")\n'
+        '                    if by {\n'
+        '                        state[14] = state[14] + 1\n'
+        '                        if copying { recoveryOwnedCheckpoint(output, textState, state, value) } else { recoveryCheckpoint(output, textState, state) }\n'
+        '                    }\n'
+        '                    if copying {\n'
+        '                        setType(resultType, receiverType)\n'))
     source = replace(source,
         'finishFunctionEntry(output, entry, state[4], parameters.length, state[8], state[6] == 1)',
         'finishFunctionEntry(output, entry, state[4], parameters.length, state[8], state[6] == 1, llvmType(result)' + hook_arguments + ')\n'
