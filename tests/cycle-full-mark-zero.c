@@ -386,6 +386,151 @@ static void full_zero_queued(unsigned n, const char *mode) {
             anchor_at_field == anchor_token, fallback);
     assert(fallback);
 }
+/* Real gray-pin issuance observer. Public allocation/stores/roots are used;
+ * existing collector/object units are parked separately just like the older
+ * issued72 expiry controls. No marks, counts, phases or proof tags are stamped.
+ * The gray pin or parked object queue keeps branch metadata alive until its
+ * actual field unit. Never read branch/private after that field/drain. */
+static void full_zero_pin(unsigned n, const char *mode) {
+    unsigned live = !strcmp(mode, "pin-live");
+    unsigned proven = !strcmp(mode, "pin-proven");
+    unsigned private_cycle = !strcmp(mode, "pin-private-cycle");
+    unsigned pre_rescan = !strcmp(mode, "pin-rescan-before-zero");
+    unsigned expiry_rescan = !strcmp(mode, "pin-expiry-rescan");
+    unsigned expiry_sweep = !strcmp(mode, "pin-expiry-sweep");
+    Churn c = churn_graph(n);
+    MinyarRecord *branch, *private = NULL;
+    if (private_cycle) {
+        private = minyar_record_new_traced(2);
+        minyar_record_set_traced(private, 1, 95001);
+        minyar_record_set_reference_traced(private, 0, slot(private));
+        branch = minyar_record_new_traced(1);
+        minyar_record_set_take_traced(branch, 0, slot(private));
+    } else branch = churn_branch(95001);
+    MinyarRecord *owner = minyar_record_new_traced(3);
+    minyar_record_set_reference_traced(owner, 0, slot(c.g.interior));
+    minyar_record_set_take_traced(owner, 1, slot(branch));
+    minyar_record_set_traced(owner, 2, 95002);
+    MinyarRecord *primary = minyar_record_new_traced(proven ? 2 : 1);
+    minyar_record_set_reference_traced(primary, 0, slot(c.g.root));
+    if (proven) minyar_record_set_reference_traced(primary, 1, slot(branch));
+    if (live) minyar_rc_retain_traced(branch);
+    drain();
+    assert(rc_object_count == 11u + 2u * n);
+    full_phase(c, RC_CYCLE_MARK);
+    RcCycle *source = rc_cycle_value(owner), *child = rc_cycle_value(branch);
+    size_t turns = 0;
+    while (source->marked != 2) {
+        assert(++turns < 4000000 && rc_cycle_phase == RC_CYCLE_MARK);
+        rc_cycle_unit(); /* Only captured scan service, object queue still parked. */
+    }
+    full_zero_contract(primary, owner, 0);
+    assert(child->registered && !child->pinned && !child->cleared);
+    assert(child != rc_cycle_proof_anchor && child != rc_cycle_proof_retry &&
+           child != rc_cycle_temporary_anchor);
+    assert(!rc_cycle_snapshot_new(child));
+    if (proven) assert(rc_cycle_proven(child) && child->incoming == 2);
+    else assert(!rc_cycle_proven(child) && child->incoming == 1);
+    if (!live && !proven) assert(child->marked == 1 && references(branch) == 1);
+    uintptr_t branch_token = (uintptr_t)((RcObject *)branch - 1);
+    rc_drop(owner); /* Genuine scanned outside-owner zero issues existing72. */
+    assert(source->gray_next == 72 && !source->registered && !source->pinned);
+    rc_bounded_object_unit(); /* Owner's Core field. */
+    assert(rc_bounded_active == (RcObject *)owner - 1 && rc_bounded_cursor == 1);
+    rc_bounded_object_unit(); /* Owner's counted edge to branch, then real RC drop. */
+    assert(rc_bounded_active == (RcObject *)owner - 1 && rc_bounded_cursor == 2);
+    assert(rc_cycle_proof_build && !rc_cycle_rescan && !rc_cycle_proof_valid);
+    if (live || proven) {
+        assert(child->registered && !child->pinned && references(branch) == 1);
+        assert(child->incoming == proven);
+    } else {
+        assert(child->registered && child->marked == 1 && child->pinned);
+        assert(!child->incoming && references(branch) == 1); /* Sole gray pin. */
+    }
+    if (pre_rescan) rc_cycle_request(); /* Actual debt before the pin reaches zero. */
+    turns = 0;
+    while ((live || proven) ? child->marked != 2 : child->pinned) {
+        assert(++turns < 4000000 && rc_cycle_phase == RC_CYCLE_MARK);
+        rc_cycle_unit(); /* MARK's real final pin drop, no object cleanup. */
+    }
+    unsigned issued = (unsigned)child->gray_next;
+    unsigned zero_issued = !child->registered && !child->pinned && !child->incoming;
+    if (live || proven) {
+        assert(child->registered && !child->pinned && references(branch) == 1);
+        if (proven) assert(rc_cycle_proven(child));
+        assert(primary->values[0] == slot(c.g.root));
+    } else {
+        assert(zero_issued && !child->cleared && child->marked == 2);
+        assert((uintptr_t)rc_bounded_recent_head == branch_token);
+        /* Metadata belongs to the still parked queue allocation, never RC here. */
+    }
+    if (expiry_rescan) rc_cycle_request();
+    if (expiry_sweep) full_zero_cycle_phase(RC_CYCLE_SWEEP);
+    unsigned build_at_field = rc_cycle_proof_build, rescan_at_field = rc_cycle_rescan;
+    if (!live && !proven) {
+        if (private_cycle) {
+            RcCycle *p = rc_cycle_value(private);
+            assert(p->registered && !rc_cycle_snapshot_new(p) && !p->pinned && !p->cleared);
+            assert(!rc_cycle_proven(p) && p->marked == 1);
+            assert(references(private) == 2 && p->incoming == 2);
+            assert(private->values[0] == slot(private) && private->values[1] == 95001);
+        }
+        rc_bounded_recent_object_unit(); /* Matching queued branch field/drop. */
+    }
+    unsigned kept_at_field = rc_cycle_proof_build && !rc_cycle_rescan;
+    unsigned full_jobs = 1, local_jobs = 0;
+    size_t local_units = 0;
+    turns = 0;
+    while (rc_pending_count) {
+        assert(++turns < 4000000);
+        size_t epochs = rc_cycle_epochs, units = rc_cycle_units;
+        unsigned was_local = rc_cycle_local_job;
+        minyar_rc_poll(1);
+        assert(rc_cycle_epochs - epochs <= 1 && rc_cycle_units - units <= 1);
+        if (rc_cycle_epochs != epochs) {
+            if (rc_cycle_local_job) local_jobs++;
+            else full_jobs++;
+        }
+        if (was_local || rc_cycle_local_job) local_units += rc_cycle_units - units;
+    }
+    /* The private cycle must be gone before changing any primary root. */
+    core_payloads(c, n, 1u + 2u * (live || proven), 0);
+    assert(primary->values[0] == slot(c.g.root));
+    if (live || proven) {
+        MinyarRecord *leaf = (MinyarRecord *)(uintptr_t)branch->values[0];
+        assert(leaf->values[0] == 95001);
+        if (proven) assert(primary->values[1] == slot(branch));
+        if (live) { minyar_rc_release(branch); drain(); core_payloads(c, n, 1, 0); }
+    }
+    size_t units = rc_cycle_units;
+    for (unsigned i = 0; i < 8; i++) {
+        minyar_rc_retain_traced(c.g.interior);
+        minyar_rc_release(c.g.interior);
+        drain();
+        core_payloads(c, n, 1u + 2u * proven, 0);
+    }
+    size_t borrowed = rc_cycle_units - units;
+    minyar_rc_release(primary);
+    drain();
+    churn_check(c, n, 0);
+    minyar_rc_release(c.g.root);
+    empty(); /* Independent values/count/reclamation precede issuance/work assertions. */
+    fprintf(stderr, "FINAL_MARK_PIN n=%u k=%u mode=%s marker=%u zero_issued=%u build_at_field=%u rescan_at_field=%u kept=%u full_jobs=%u local_jobs=%u local_units=%zu borrowed_units=%zu reclaimed=1\n",
+            n, MINYAR_RC_POLL_BUDGET, mode, issued, zero_issued,
+            build_at_field, rescan_at_field, kept_at_field, full_jobs,
+            local_jobs, local_units, borrowed);
+    assert(borrowed <= 16u * 8u + 64u); /* Existing192 after captured work. */
+    if (live || proven) assert(!zero_issued && issued != 72);
+    else if (pre_rescan) assert(zero_issued && issued == 0 && !kept_at_field);
+    else {
+        assert(zero_issued && issued == 72);
+        if (expiry_rescan || expiry_sweep) assert(!kept_at_field);
+        else {
+            assert(kept_at_field && full_jobs == 1 && local_jobs <= 1);
+            assert(local_units <= 16u + 64u); /* Private unknown debt remains bounded. */
+        }
+    }
+}
 #endif
 int main(int argc, char **argv) {
     assert(argc == 3);
@@ -408,6 +553,14 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < sizeof(queued_modes) / sizeof(queued_modes[0]); i++)
         if (!strcmp(mode, "all") || !strcmp(mode, queued_modes[i]))
             full_zero_queued(n, queued_modes[i]);
+    const char *pin_negative_modes[] = { "pin-live", "pin-proven", "pin-rescan-before-zero" };
+    for (size_t i = 0; i < sizeof(pin_negative_modes) / sizeof(pin_negative_modes[0]); i++)
+        if (!strcmp(mode, "all") || !strcmp(mode, "pin-controls") || !strcmp(mode, pin_negative_modes[i]))
+            full_zero_pin(n, pin_negative_modes[i]);
+    const char *pin_modes[] = { "pin-positive", "pin-private-cycle", "pin-expiry-rescan", "pin-expiry-sweep" };
+    for (size_t i = 0; i < sizeof(pin_modes) / sizeof(pin_modes[0]); i++)
+        if (!strcmp(mode, "all") || !strcmp(mode, pin_modes[i]))
+            full_zero_pin(n, pin_modes[i]);
     if (!strcmp(mode, "all") || !strcmp(mode, "positive"))
         full_zero(n, 0); /* Baseline locality RED must be last, after safety. */
 #else
