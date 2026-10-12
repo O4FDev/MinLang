@@ -105,6 +105,12 @@ EXPECTED_SECONDS = {
     # Matrix groups outside the correctness tier.
     'check-quic': 300, 'check-quic-sanitize': 240, 'check-peer-regressions': 340, 'check-peer-optimizations': 200,
     'check-peer-sanitize': 250, 'check-peer-ownership': 140, 'check-coverage': 90, 'check-fuzz-coverage': 75,
+    'check-quic-quinn': 150, 'check-quic-native-O0': 150, 'check-quic-native-O2': 150,
+    # Per-suite peer children: cpp-java-js holds over half the cases.
+    'check-peer-regressions-cpp-java-js': 200, 'check-peer-optimizations-cpp-java-js': 200,
+    'check-peer-sanitize-cpp-java-js': 250, 'check-peer-ownership-cpp-java-js': 120,
+    'check-peer-regressions-rust-go-zig': 90, 'check-peer-optimizations-rust-go-zig': 90,
+    'check-peer-sanitize-rust-go-zig': 120, 'check-peer-sanitize-python-swift-ruby-lua': 110,
 }
 # Built on demand by the `minyar` launcher inside many harnesses; building them
 # early keeps those nested makes no-ops (see scripts/check_runner.py).
