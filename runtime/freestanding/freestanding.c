@@ -619,3 +619,7 @@ double pow(double base, double power) {
     if (base == 0) return power > 0 ? 0 : INFINITY;
     return exp(power * log(base));
 }
+
+/* Reuse the hosted provider's pinned primitives with this C library and heap.
+ * Certificate trust/clock/AES remain the fail-closed architecture adapters. */
+#include "../minyar_freestanding_providers.h"

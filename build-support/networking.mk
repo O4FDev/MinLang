@@ -50,3 +50,16 @@ check-os-tlsverify-sanitize: build/minyarc
 
 check check-portable: check-os-tlsverify
 check-sanitize: check-os-tlsverify-sanitize
+
+.PHONY: check-os-providers check-os-providers-sanitize
+check-os-providers: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/os-providers.py
+
+check-os-providers-sanitize: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/os-providers.py --sanitize
+
+# The executable vector and inet_pton oracle route is a Linux ELF host gate.
+ifeq ($(shell uname -s),Linux)
+check check-portable: check-os-providers
+check-sanitize: check-os-providers-sanitize
+endif
