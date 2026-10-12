@@ -61,10 +61,7 @@ class ErrorsLauncher(CompilerTestCase):
         result = self.evidence.run([str(PROBE), str(path), str(output), *flags,
                                    '--library', str(ROOT / 'library')],
                                   text=True, timeout=30, phase='compile-result')
-        if status == 87:
-            self.assertIn(result.returncode, (0, 1), result.stderr)
-        else:
-            self.assertEqual(result.returncode, status, result.stderr)
+        self.assertEqual(result.returncode, status, result.stderr)
         self.assertFalse(result.stdout)
         self.assertEqual(output.exists(), result.returncode == 0)
         if result.returncode == 0: self.assertFalse(result.stderr)
@@ -101,7 +98,7 @@ class ErrorsLauncher(CompilerTestCase):
         for index, option in enumerate(options):
             if option == '--library':
                 probe_flags.extend((option, options[index + 1]))
-        self.request(path, 87, probe_flags)
+        self.request(path, 0, probe_flags)
         result, executable = self.launcher(path, options=options)
         self.assertEqual(result.stdout, f"built {executable}\n")
         self.assertFalse(result.stderr, 'selected frontend leaked primary diagnostics')
@@ -120,7 +117,7 @@ class ErrorsLauncher(CompilerTestCase):
         self.executes_launcher(IMPORTED.replace('./packet.min', 'packet'), '9\n',
                                ('--library', str(self.directory)))
         root = self.source('use "./packet.min" as packet\nprint("alive")\n')
-        self.request(root, 87)
+        self.request(root, 0)
 
     @unittest.skipIf(windows_host(), 'existing incremental driver requires macOS/Linux')
     def test_incremental_imported_dispatch_is_repeatable(self):
@@ -128,7 +125,7 @@ class ErrorsLauncher(CompilerTestCase):
         for _ in range(2):
             self.executes_launcher(IMPORTED, '9\n', ('--incremental',))
         bad = self.source(IMPORTED.replace('print(v)', 'print(missing)'))
-        self.request(bad, 87)
+        self.request(bad, 1)
         result, _ = self.launcher(bad, options=('--incremental', '--check'), status=1)
         self.assertIn(str(bad), result.stderr)
         self.assertIn("find a value named 'missing'", result.stderr)
@@ -151,7 +148,7 @@ class ErrorsLauncher(CompilerTestCase):
                 ('let r = Ok<Integer, Text>(1)\nmatch r { Ok(v) {} }\n', 'match must handle both Ok and Err')):
             with self.subTest(source=source):
                 path = self.source(source)
-                self.request(path, 87)
+                self.request(path, 1)
                 result, _ = self.launcher(path, options=('--check',), status=1)
                 if diagnostic:
                     self.assertIn(diagnostic, result.stderr)
@@ -197,7 +194,7 @@ print(Err >> 1)
         path = self.source(SIMPLE)
         for budget in (1, 32, 1024):
             with self.subTest(budget=budget):
-                self.request(path, 87, ('--bounded-owners', str(budget), '--freestanding'))
+                self.request(path, 0, ('--bounded-owners', str(budget), '--freestanding'))
                 self.executes_launcher(SIMPLE, '0\n',
                     ('--memory-profile', 'fixed', '--heap-bytes', '1048576',
                      '--cleanup-budget', str(budget)))
