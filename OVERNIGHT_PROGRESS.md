@@ -20,6 +20,7 @@ Every proposed integration will receive an independent review subagent before th
 ## Merged list and gaps closed
 
 - Reviewed desktop history merged at `00b7fd1`; reviewed Windows history at `0d1d12b`/`5978c73`. All three preserve identical source trees and keep every branch. Source fixes remain pending. Existing candidate contains TLS cleanup `6518ef3` and unqualified QUIC CID WIP `8daa72c`.
+- Collector preservation at `4a1732f` passed 30 C native/SAN configurations, eight restored programs at O0/O2 native/SAN/LSan, and 26 exact finite-heap language cells; final parent-owned review R2 pending merge. No production collector/compiler change.
 - No Phase 2 gaps claimed closed yet. Owning project code has not been changed.
 
 ## Boat and spending
