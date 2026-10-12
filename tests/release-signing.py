@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -251,6 +252,184 @@ class TestSigning(unittest.TestCase):
             with self.assertRaises(ValueError):
                 pipeline.require_ephemeral_macos_ci(self.root / 'credentials', explicit=False)
 
+    def test_ci_guard_refuses_missing_or_file_runner_temp_before_any_operations(self):
+        for root in (self.root / 'missing-runner-temp', self.cert):
+            environment = {'GITHUB_ACTIONS': 'true', 'RUNNER_OS': 'macOS',
+                           'RUNNER_ENVIRONMENT': 'github-hosted', 'RUNNER_TEMP': str(root)}
+            output, report_path = root / 'TEST-output', self.root / 'TEST-root-refusal.json'
+            with self.subTest(root=root), patch.dict(os.environ, environment, clear=True), \
+                 patch.object(pipeline.sys, 'platform', 'darwin'), \
+                 patch.object(sys, 'argv', ['pipeline', '--native', 'macos', '--ephemeral-macos-ci',
+                     '--output', str(output), '--report', str(report_path), '--cc', 'mock-clang', '--openssl', 'mock-openssl']), \
+                 patch.object(pipeline, 'run') as tool, patch.object(Path, 'mkdir') as mkdir, \
+                 patch.object(pipeline.tempfile, 'TemporaryDirectory') as stage, \
+                 patch.object(pipeline.tempfile, 'mkdtemp') as generation, \
+                 patch.object(pipeline, 'write_report') as report, redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as result:
+                    pipeline.main()
+                self.assertEqual(result.exception.code, 1)
+                with self.assertRaises((OSError, ValueError)):
+                    with pipeline.macos_credentials(root / 'credentials', 'mock-openssl', {}, ephemeral_ci=True):
+                        self.fail('invalid runner root admitted direct credentials')
+                tool.assert_not_called()
+                mkdir.assert_not_called()
+                stage.assert_not_called()
+                generation.assert_not_called()
+                report.assert_not_called()
+            self.assertFalse(output.exists())
+            self.assertFalse(report_path.exists())
+        self.assertFalse((self.root / 'missing-runner-temp').exists())
+        self.assertEqual(self.cert.read_bytes(), b'contract certificate')
+
+    def signer_timeout(self, native, signing_call, phase):
+        """Exercise real envelope/policy signers with every external call mocked."""
+        output = self.root / f'TEST-timeout-{native}-{signing_call}-{phase}'
+        report_path = output.with_suffix('.json')
+        environment = {'GITHUB_ACTIONS': 'true', 'RUNNER_OS': 'macOS',
+                       'RUNNER_ENVIRONMENT': 'github-hosted', 'RUNNER_TEMP': str(self.root)}
+        signed = pipeline.manifest.signed
+        signer_active, invocation, operation = False, -1, 0
+        signing_processes, commands, windows_scripts = [], [], []
+        def observed_signer(*args, **kwargs):
+            nonlocal signer_active, invocation, operation
+            invocation += 1
+            operation = 0
+            signer_active = True
+            try:
+                return signed(*args, **kwargs)
+            finally:
+                signer_active = False
+        def external(args, **kwargs):
+            nonlocal operation
+            args = [str(value) for value in args]
+            commands.append(args)
+            if signer_active:
+                signing_processes.append(dict(kwargs))
+                current = operation
+                operation += 1
+                if invocation == signing_call and current == phase:
+                    raise subprocess.TimeoutExpired('mock-ed25519', 60)
+            stdout = b''
+            if args[0] == 'mock-openssl':
+                if args[1] == 'version':
+                    stdout = b'OpenSSL 3.0.0'
+                elif args[1] == 'req':
+                    Path(args[args.index('-keyout') + 1]).write_bytes(b'mocked OS private key')
+                    Path(args[args.index('-out') + 1]).write_bytes(b'mocked OS certificate')
+                elif args[1] in ('x509', 'pkcs12', 'genpkey') and '-out' in args:
+                    Path(args[args.index('-out') + 1]).write_bytes(self.cert.read_bytes())
+                elif args[1] == 'x509' and '-subject' in args:
+                    stdout = ('subject=' + self.subject + '\nissuer=' + self.subject + '\n').encode()
+                elif args[1] == 'x509' and '-ext' in args:
+                    stdout = b'X509v3 Extended Key Usage:\n    Code Signing\n'
+                elif args[1] == 'pkey':
+                    stdout = bytes.fromhex('302a300506032b6570032100') + b'P' * 32
+                elif args[1] == 'pkeyutl' and '-sign' in args:
+                    stdout = b'S' * 64
+            elif args[:2] == ['security', 'create-keychain']:
+                Path(args[-1]).touch()
+            elif args[:2] == ['security', 'delete-keychain']:
+                Path(args[-1]).unlink()
+            elif args[:2] == ['security', 'list-keychains']:
+                stdout = b'unchanged search list'
+            elif args[:2] == ['security', 'dump-trust-settings']:
+                stdout = b'unchanged trust'
+            elif args[:2] == ['mock-signtool', 'sign']:
+                path = Path(args[-1])
+                path.write_bytes(path.read_bytes() + b'mocked Authenticode')
+            if kwargs.get('text'):
+                stdout = stdout.decode()
+            return subprocess.CompletedProcess(args, 0, stdout, '' if kwargs.get('text') else b'')
+        def fixture(work, cc, platform):
+            tree = work / 'input'
+            tree.mkdir()
+            if native == 'macos':
+                source = tree / 'TEST-fixture.app'
+                shutil.copytree(self.app, source)
+                (source / 'Contents/MacOS/main').chmod(0o755)
+                return source, source.name + '/Contents/MacOS/main', source.name + '/Contents/Resources/text'
+            source = tree / 'TEST-fixture.exe'
+            shutil.copyfile(self.exe, source)
+            source.chmod(0o755)
+            (tree / 'TEST-resource.txt').write_bytes(b'mocked resource')
+            return source, source.name, 'TEST-resource.txt'
+        def powershell(script, values):
+            windows_scripts.append(script)
+            if script == pipeline.WINDOWS_CREATE:
+                root = Path(values['MINYAR_TEST_CREDENTIALS'])
+                (root / 'signer.der').write_bytes(self.cert.read_bytes())
+                Path(values['MINYAR_TEST_STATE']).write_text(json.dumps({'certificates': [
+                    {'name': 'signer', 'thumbprint': self.thumb}, {'name': 'wrong', 'thumbprint': 'B' * 40}]}))
+        flags = (['--ephemeral-macos-ci'] if native == 'macos' else
+                 ['--owned-boat-windows', '--signtool', 'mock-signtool'])
+        with patch.dict(os.environ, environment, clear=True), patch.object(pipeline, 'require_ephemeral_macos_ci'), \
+             patch.object(sys, 'argv', ['pipeline', '--native', native, '--output', str(output),
+                 '--report', str(report_path), '--cc', 'mock-clang', '--openssl', 'mock-openssl', *flags]), \
+             patch.object(pipeline.platform, 'machine', return_value='x86_64'), \
+             patch.object(pipeline, 'authorize_context'), patch.object(pipeline, 'require_owned_boat_windows'), \
+             patch.object(pipeline, 'native_fixture', side_effect=fixture), \
+             patch.object(pipeline.subprocess, 'run', side_effect=external), \
+             patch.object(pipeline, 'ps', side_effect=powershell), \
+             patch.object(pipeline.manifest, 'signed', side_effect=observed_signer), \
+             patch.object(pipeline, 'verify_envelope'), patch.object(pipeline, 'rejected'), \
+             patch.object(pipeline.release, 'publish_directory', wraps=pipeline.release.publish_directory) as publish, \
+             redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as result:
+                pipeline.main()
+            self.assertEqual(result.exception.code, 1)
+            self.assertFalse(any(name.startswith('MINYAR_TEST_UPDATE_PASSPHRASE_') for name in os.environ))
+        value = json.loads(report_path.read_text())
+        self.assertEqual(invocation, signing_call)
+        self.assertEqual(value['status'], 'FAILED')
+        self.assertEqual(value['errorType'], 'TimeoutExpired')
+        self.assertFalse(value['generationPublished'])
+        self.assertEqual(value['stagingCleanup'], 'verified: removed')
+        self.assertFalse(output.exists())
+        self.assertFalse(any(Path(call.args[1]) == output for call in publish.call_args_list))
+        self.assertEqual(list(self.root.glob('.minyar-test-pipeline-*')), [])
+        self.assertEqual(list(self.root.glob('.minyar-test-generation-*')), [])
+        if native == 'macos':
+            self.assertTrue(any(c[:4] == ['sudo', '-n', 'security', 'remove-trusted-cert'] for c in commands))
+            self.assertTrue(any(c[:2] == ['security', 'delete-keychain'] for c in commands))
+            self.assertEqual(value['macosCredentialCleanup']['status'], 'verified')
+        else:
+            self.assertEqual(windows_scripts, [pipeline.WINDOWS_CREATE, pipeline.WINDOWS_CLEANUP])
+            self.assertTrue(value['windowsCredentialCleanup'].startswith('verified:'))
+        for options in signing_processes:
+            self.assertEqual(options.get('timeout'), 60)
+            self.assertEqual(options.get('stdin'), subprocess.DEVNULL)
+            self.assertTrue(options['check'] and options['capture_output'])
+
+    def test_initial_ed25519_timeouts_clean_credentials_and_never_publish(self):
+        for native in ('macos', 'windows'):
+            for phase in range(3):
+                with self.subTest(native=native, phase=phase):
+                    self.signer_timeout(native, 0, phase)
+
+    def test_signed_policy_ed25519_timeouts_clean_credentials_and_never_publish(self):
+        for native in ('macos', 'windows'):
+            for signing_call in (1, 9):
+                for phase in range(3):
+                    with self.subTest(native=native, signing_call=signing_call, phase=phase):
+                        self.signer_timeout(native, signing_call, phase)
+
+    def test_production_manifest_default_retains_existing_subprocess_options(self):
+        calls = []
+        public = bytes.fromhex('302a300506032b6570032100') + b'P' * 32
+        def openssl(args, **kwargs):
+            calls.append((args, kwargs))
+            stdout = public if args[1] == 'pkey' else b'S' * 64 if '-sign' in args else b''
+            return subprocess.CompletedProcess(args, 0, stdout, b'')
+        with patch.object(pipeline.manifest.subprocess, 'run', side_effect=openssl):
+            signature, key = pipeline.manifest.signed(b'production contract', self.cert, 'mock-openssl', 'OWNER_PASSPHRASE_ENV')
+        self.assertEqual((signature, key), (b'S' * 64, b'P' * 32))
+        self.assertEqual(len(calls), 3)
+        for command, options in calls:
+            self.assertEqual(options, {'check': True, 'capture_output': True})
+            self.assertEqual(command[0], 'mock-openssl')
+        for command, _ in calls[:2]:
+            self.assertEqual(command[command.index('-passin') + 1], 'env:OWNER_PASSPHRASE_ENV')
+
     def test_mac_ci_cleanup_attempts_all_steps_and_refuses_failures_or_drift(self):
         environment = {'GITHUB_ACTIONS': 'true', 'RUNNER_OS': 'macOS',
                        'RUNNER_ENVIRONMENT': 'github-hosted', 'RUNNER_TEMP': str(self.root)}
@@ -374,7 +553,7 @@ class TestSigning(unittest.TestCase):
                     raise OSError('external report failed')
                 write_report(path, value)
             with patch.object(sys, 'argv', ['pipeline', '--native', 'macos', '--output', str(output), '--openssl', 'openssl', '--cc', 'clang', '--ephemeral-macos-ci', '--report', str(report_path)]), \
-                 patch.object(pipeline.sys, 'platform', 'darwin'), patch.object(pipeline.platform, 'machine', return_value='arm64'), \
+                 patch.object(pipeline, 'authorize_context'), patch.object(pipeline.platform, 'machine', return_value='arm64'), \
                  patch.object(pipeline, 'require_ephemeral_macos_ci'), \
                  patch.object(pipeline, 'run', side_effect=subprocess.CalledProcessError(1, 'openssl') if failure == 'openssl' else None,
                      return_value=subprocess.CompletedProcess([], 0, 'OpenSSL 3.6.0', '')), \

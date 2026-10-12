@@ -13,22 +13,26 @@ from urllib.parse import urlsplit
 
 DOMAIN=b'MINYAR-UPDATE-SIGNATURE-V1\0'
 
-def signed(data,key,openssl='openssl',passphrase_env=None):
-    """Use the operator's existing Ed25519 key; no production key generation."""
+def signed(data,key,openssl='openssl',passphrase_env=None,*,run=None):
+    """Use an existing Ed25519 key; an injected runner owns process limits.
+
+    The default retains the production CLI's subprocess behavior.
+    """
     key=Path(key).resolve(strict=True)
     password=['-passin','env:'+passphrase_env] if passphrase_env else []
-    def run(args):
-        return subprocess.run([openssl,*args],check=True,capture_output=True).stdout
-    public=run(['pkey','-in',str(key),*password,'-pubout','-outform','DER'])
+    runner=subprocess.run if run is None else run
+    def execute(args):
+        return runner([openssl,*args],check=True,capture_output=True).stdout
+    public=execute(['pkey','-in',str(key),*password,'-pubout','-outform','DER'])
     if len(public)!=44 or public[:12]!=bytes.fromhex('302a300506032b6570032100'):
         raise ValueError('update signing key must be Ed25519')
     with tempfile.TemporaryDirectory(prefix='minyar-metadata-sign-') as directory:
         root=Path(directory); source=root/'metadata';signature=root/'signature';pub=root/'public.der'
         source.write_bytes(DOMAIN+data);pub.write_bytes(public)
-        value=run(['pkeyutl','-sign','-rawin','-inkey',str(key),*password,'-in',str(source)])
+        value=execute(['pkeyutl','-sign','-rawin','-inkey',str(key),*password,'-in',str(source)])
         if len(value)!=64: raise ValueError('signer returned an invalid Ed25519 signature size')
         signature.write_bytes(value)
-        run(['pkeyutl','-verify','-rawin','-pubin','-inkey',str(pub),'-keyform','DER',
+        execute(['pkeyutl','-verify','-rawin','-pubin','-inkey',str(pub),'-keyform','DER',
              '-in',str(source),'-sigfile',str(signature)])
     return value,public[12:]
 

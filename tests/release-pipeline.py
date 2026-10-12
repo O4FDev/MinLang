@@ -53,7 +53,12 @@ def require_ephemeral_macos_ci(path, *, explicit=False):
             os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted' and
             bool(os.environ.get('RUNNER_TEMP')),
             'automatic Mac credentials require --ephemeral-macos-ci on an ephemeral GitHub-hosted macOS runner; owner Mac is refused')
-    require(Path(path).resolve().is_relative_to(Path(os.environ['RUNNER_TEMP']).resolve()),
+    try:
+        runner_temp = Path(os.environ['RUNNER_TEMP']).resolve(strict=True)
+    except OSError:
+        raise ValueError('ephemeral Mac RUNNER_TEMP must be an existing directory') from None
+    require(runner_temp.is_dir(), 'ephemeral Mac RUNNER_TEMP must be an existing directory')
+    require(Path(path).resolve().is_relative_to(runner_temp),
             'ephemeral Mac credentials/output must be under RUNNER_TEMP')
 
 
@@ -413,7 +418,7 @@ def pipeline(args, work, publication, report):
             static = publication / 'TEST-local-publication'
             plan = manifest.prepare(artifact, static, 'org.minyar.test', TARGET, 'test', 1, '1.0.0',
                 issued, issued + 3600, 100, 'https://updates.invalid',
-                sign=lambda data: manifest.signed(data, key, args.openssl, passphrase_name))
+                sign=lambda data: manifest.signed(data, key, args.openssl, passphrase_name, run=run))
         finally:
             del os.environ[passphrase_name]
         # Trust comes from the independently derived key; not from the upload plan.
@@ -449,7 +454,7 @@ def pipeline(args, work, publication, report):
             metadata = ('\n'.join(fields) + '\n').encode('ascii')
             os.environ[passphrase_name] = environment[passphrase_name]
             try:
-                signature, _ = manifest.signed(metadata, key, args.openssl, passphrase_name)
+                signature, _ = manifest.signed(metadata, key, args.openssl, passphrase_name, run=run)
             finally:
                 del os.environ[passphrase_name]
             rejected(lambda: verify_envelope(signature + metadata, data, public, args.openssl, scratch),

@@ -34,6 +34,10 @@ failure too; a guard refusal creates no tools, output, credential directories or
 report. Private credentials stay in the temporary stage and never in artifacts.
 Any cleanup failure or inventory drift prevents a passing generation. Processes
 have closed stdin and bounded timeouts; no password prompt is accepted.
+Initial envelope signing and signed-policy controls use the same 60-second,
+closed-stdin runner for Ed25519 public-key derivation, signing and verification.
+The manifest tool accepts this runner explicitly; its default production CLI
+process options remain unchanged.
 The internal passing report records staging cleanup before publication. An
 external report-write failure after publication exits nonzero and explicitly
 reports `generationPublished=true`; it never claims that the generation is absent.
@@ -46,6 +50,10 @@ Automatic TEST credential creation requires **all** of:
 - Actual macOS Python, `GITHUB_ACTIONS=true`, `RUNNER_OS=macOS`, and
   `RUNNER_ENVIRONMENT=github-hosted`.
 - Output and temporary credentials beneath the existing `RUNNER_TEMP`.
+
+The runner root is resolved strictly and must already be a directory. A missing
+or file-valued `RUNNER_TEMP` is refused before tools, directories or reports;
+the guard never creates the runner root.
 
 The credential context repeats the check before any security command. CI uses a
 random one-day self-signed TEST certificate/private key, an isolated keychain,
