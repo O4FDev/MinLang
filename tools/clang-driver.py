@@ -21,7 +21,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from host_paths import host_path
-from sanitizer_llvm import address_sanitizer_enabled, instrument_address_sanitizer
+from sanitizer_llvm import address_sanitizer_enabled, thread_sanitizer_enabled, instrument_program_sanitizers
 
 
 def flags(name, default):
@@ -163,6 +163,32 @@ def cycle_runtime_object(project, clang, runtime, release, link_flags):
             os.replace(staged, output)
     return str(output)
 
+
+def thread_runtime_object(project, clang, runtime, release, link_flags, cycles):
+    from thread_runtime import source as thread_source
+    source = thread_source(project, runtime, cycles)
+    options = flags('MINYAR_RUNTIME_FLAGS', '-O2 -Wno-override-module')
+    if release == '1':
+        options += lto_flags(clang, link_flags)[:1]
+    if platform.system() != 'Windows' and not platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
+        options += ['-pthread']
+    identity = clang_identity(clang)
+    identity.update(json.dumps(options).encode() + source.encode())
+    for dependency in sorted((project / 'runtime').rglob('*')):
+        if dependency.is_file() and dependency.suffix in ('.h', '.c'):
+            identity.update(str(dependency.relative_to(project)).encode() + dependency.read_bytes())
+    directory = project / 'build/native'
+    directory.mkdir(parents=True, exist_ok=True)
+    output = directory / ('thread-runtime-' + identity.hexdigest() + '.o')
+    if not output.is_file():
+        with tempfile.TemporaryDirectory(prefix='thread-runtime-', dir=directory) as temporary:
+            temporary = Path(temporary)
+            configured = temporary / 'runtime.c'
+            configured.write_text(source)
+            staged = temporary / 'runtime.o'
+            run([clang, *options, '-iquote', str(project / 'runtime'), '-c', str(configured), '-o', str(staged)])
+            os.replace(staged, output)
+    return str(output)
 
 def graphics(project, clang, base, native_flags):
     cflags, libraries = glfw_flags()
@@ -394,7 +420,9 @@ def link_program(clang, link_flags, lto, llvm, runtime, native, libraries, outpu
     bytes. It does not measure internal runtime compilation counts or promise
     atomic pathname resolution against another same-user process.
     """
-    enabled = address_sanitizer_enabled(link_flags)
+    address_enabled = address_sanitizer_enabled(link_flags)
+    thread_enabled = thread_sanitizer_enabled(link_flags)
+    enabled = address_enabled or thread_enabled
     requested = os.environ.get('MINYAR_LINK_ARTIFACTS')
     if not enabled and not requested:
         publish_executable([clang, *link_flags, *lto, llvm, runtime, *native, *libraries],
@@ -405,11 +433,12 @@ def link_program(clang, link_flags, lto, llvm, runtime, native, libraries, outpu
         artifacts.mkdir(parents=True, exist_ok=False)
     with tempfile.TemporaryDirectory(prefix='minyar-program-sanitize-') as temporary:
         directory = artifacts or Path(temporary)
-        manifest = {'schema': 2, 'address_sanitizer_enabled': enabled,
+        manifest = {'schema': 2, 'address_sanitizer_enabled': address_enabled,
+                    'thread_sanitizer_enabled': thread_enabled,
                     'program_ir_cached': False, 'runtime_reannotated': False,
                     'link_flags': list(link_flags), 'lto_flags': list(lto),
                     'optimization': effective_optimization([*link_flags, *lto]),
-                    'mode': 'asan' if enabled else 'native',
+                    'mode': 'asan' if address_enabled else ('tsan' if thread_enabled else 'native'),
                     'compiler_selected_command': str(clang),
                     'inputs': [], 'tools': {}, 'tool_bindings': {}, 'link_attempted': False,
                     'artifact_directory': str(directory), 'retention_errors': []}
@@ -421,9 +450,9 @@ def link_program(clang, link_flags, lto, llvm, runtime, native, libraries, outpu
             if artifacts:
                 manifest['raw_program_input'] = file_binding(llvm, directory / 'program.raw.ll')
             if enabled:
-                program = str(directory / 'program.asan.ll')
+                program = str(directory / ('program.asan.ll' if address_enabled else 'program.tsan.ll'))
                 try:
-                    Path(program).write_bytes(instrument_address_sanitizer(raw.decode('utf-8')).encode('utf-8'))
+                    Path(program).write_bytes(instrument_program_sanitizers(raw.decode('utf-8'), link_flags).encode('utf-8'))
                 except (UnicodeError, ValueError) as error:
                     manifest.update(phase='program-annotation', error=repr(error))
                     raise
@@ -432,7 +461,7 @@ def link_program(clang, link_flags, lto, llvm, runtime, native, libraries, outpu
                 linked_program_sha256=hashlib.sha256(host_path(program).read_bytes()).hexdigest())
             if artifacts:
                 manifest['program_input'] = file_binding(program, directory /
-                    ('program.asan.ll' if enabled else 'program.raw.ll'))
+                    ('program.asan.ll' if address_enabled else ('program.tsan.ll' if thread_enabled else 'program.raw.ll')))
                 manifest['program_input'].update(role='program', format='llvm')
                 for label, role, path in [('runtime', 'runtime', runtime),
                         *[(f'native-{i}', 'provider', value) for i, value in enumerate(native)]]:
@@ -529,6 +558,7 @@ def main():
     native = []
     libraries = set()
     cycles = False
+    threaded = False
     with host_path(llvm).open() as stream:
         for line in stream:
             if line.startswith('; minyar-native-library: '):
@@ -537,7 +567,13 @@ def main():
                 if library == 'callbackruntime': cycles = True
             if line in ('; minyar-cycle-runtime: 1\n', '; minyar-callback-runtime: 1\n'):
                 cycles = True
-    if cycles:
+            if line == '; minyar-thread-runtime: 1\n':
+                threaded = True
+    if threaded:
+        runtime = thread_runtime_object(project, clang, runtime, release, link_flags, cycles)
+        if platform.system() != 'Windows' and not platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
+            native += ['-pthread']
+    elif cycles:
         runtime = cycle_runtime_object(project, clang, runtime, release, link_flags)
     native_flags = flags('MINYAR_NATIVE_FLAGS', shlex.join(link_flags))
     if cycles and 'macos' in libraries:

@@ -9,11 +9,19 @@ import re
 
 
 def address_sanitizer_enabled(flags):
+    return sanitizer_enabled(flags, 'address')
+
+
+def thread_sanitizer_enabled(flags):
+    return sanitizer_enabled(flags, 'thread')
+
+
+def sanitizer_enabled(flags, sanitizer):
     enabled = False
     for flag in flags:
-        if flag.startswith('-fsanitize=') and 'address' in flag.split('=', 1)[1].split(','):
+        if flag.startswith('-fsanitize=') and sanitizer in flag.split('=', 1)[1].split(','):
             enabled = True
-        elif flag.startswith('-fno-sanitize=') and {'address', 'all'} & set(flag.split('=', 1)[1].split(',')):
+        elif flag.startswith('-fno-sanitize=') and {sanitizer, 'all'} & set(flag.split('=', 1)[1].split(',')):
             enabled = False
     return enabled
 
@@ -41,6 +49,14 @@ def unquoted(text):
 
 
 def instrument_address_sanitizer(llvm):
+    return instrument_sanitizer(llvm, 'sanitize_address')
+
+
+def instrument_thread_sanitizer(llvm):
+    return instrument_sanitizer(llvm, 'sanitize_thread')
+
+
+def instrument_sanitizer(llvm, attribute):
     definitions = 0
     groups = {}
     for line in llvm.splitlines():
@@ -56,8 +72,6 @@ def instrument_address_sanitizer(llvm):
         ending = '\r\n' if line.endswith('\r\n') else ('\n' if line.endswith('\n') else '')
         header = line[:-len(ending)] if ending else line
         masked = unquoted(header)
-        # Names may contain quoted '(' or '{'. Only the global-name token
-        # followed by its real parameter delimiter starts this function.
         function = next((candidate for candidate in re.finditer(
             r'@(?:[-a-zA-Z$._0-9]+|"(?:[^"\\]|\\.)*")\s*\(', header)
                          if masked[candidate.start()] == '@'
@@ -82,25 +96,33 @@ def instrument_address_sanitizer(llvm):
         attributes = masked[closing + 1:brace]
         if any(value in attributes for value in '{}'):
             raise ValueError('generated LLVM function attributes changed')
-        enabled = bool(re.search(r'(?<![\w.@-])sanitize_address(?![\w.-])', attributes))
+        pattern = r'(?<![\w.@-])' + re.escape(attribute) + r'(?![\w.-])'
+        enabled = bool(re.search(pattern, attributes))
         for group in re.findall(r'#(\d+)\b', attributes):
             if group not in groups:
                 raise ValueError('generated LLVM refers to a missing attribute group')
-            enabled |= bool(re.search(r'(?<![\w.@-])sanitize_address(?![\w.-])', groups[group]))
+            enabled |= bool(re.search(pattern, groups[group]))
         if not enabled:
-            lines[index] = header[:brace] + 'sanitize_address ' + header[brace:] + ending
+            lines[index] = header[:brace] + attribute + ' ' + header[brace:] + ending
     if definitions == 0:
         raise ValueError('generated LLVM contains no function definitions; sanitizer coverage cannot be assumed')
     return ''.join(lines)
 
 
 def prepare_llvm_for_link(path, flags):
-    """Compatibility API for tests which own and intentionally rewrite their IR."""
-    if address_sanitizer_enabled(flags):
+    if address_sanitizer_enabled(flags) or thread_sanitizer_enabled(flags):
         source = path.read_bytes().decode('utf-8')
-        instrumented = instrument_address_sanitizer(source)
+        instrumented = instrument_program_sanitizers(source, flags)
         if instrumented != source:
             path.write_bytes(instrumented.encode('utf-8'))
+
+
+def instrument_program_sanitizers(source, flags):
+    if address_sanitizer_enabled(flags):
+        source = instrument_address_sanitizer(source)
+    if thread_sanitizer_enabled(flags):
+        source = instrument_thread_sanitizer(source)
+    return source
 
 
 def main():
