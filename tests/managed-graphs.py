@@ -209,6 +209,8 @@ print(acyclic().children.length)
         self.assertNotIn('_traced', definition)
 
     def test_adapted_graph_churn_temporaries_and_shared_append(self):
+        # The dense fixture runs about 55 s under ASan on a 2.5 GHz shared host; this only bounds hangs.
+        self.run_timeout = 120
         expected = {'graphs': '0\n1\n2\n1\n0\n', 'churn': '100000\n',
                     'dense': '5000\n', 'field': '', 'live-churn': '1\n100000\n',
                     'appended': '16800\n800\n',

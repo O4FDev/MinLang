@@ -84,7 +84,7 @@ class CompilerTestCase(unittest.TestCase):
                 self.assertEqual(link.returncode, 0, link.stderr)
                 for path, _ in file_outputs:
                     Path(path).unlink(missing_ok=True)
-                run = self.evidence.run([str(exe), *arguments], capture_output=True, timeout=RUN_TIMEOUT, phase='execute')
+                run = self.evidence.run([str(exe), *arguments], capture_output=True, timeout=getattr(self, 'run_timeout', RUN_TIMEOUT), phase='execute')
                 self.assertEqual(run.returncode, status, run.stderr)
                 self.assertEqual(run.stdout, expected.encode('utf-8'))
                 self.assertEqual(run.stderr, stderr.encode('utf-8'))
