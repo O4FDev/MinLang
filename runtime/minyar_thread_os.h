@@ -23,6 +23,7 @@ long long minyar_thread_sleep_ns(long long nanoseconds) {
     long long result = 0;
     if (nanoseconds < 0) result = -EINVAL;
     else if (nanoseconds) {
+        rc_thread_domain_drain();
 #ifdef _WIN32
         HANDLE timer = CreateWaitableTimerW(NULL, TRUE, NULL);
         if (!timer) result = -EIO;
@@ -56,6 +57,7 @@ long long minyar_thread_fsync(long long descriptor) {
     long long result;
     if (descriptor < 0 || descriptor > INT_MAX) result = -EINVAL;
     else {
+        rc_thread_domain_drain();
 #ifdef _WIN32
         result = _commit((int)descriptor) ? -(long long)errno : 0;
 #else
@@ -71,6 +73,7 @@ long long minyar_thread_kernel_run(long long descriptor) {
     if (descriptor < 0 || descriptor > INT_MAX) result = -EINVAL;
     else {
 #ifdef __linux__
+        rc_thread_domain_drain();
         /* KVM_RUN's argument is exactly zero. No generic ioctl capability. */
         result = ioctl((int)descriptor, 0xAE80, (void *)0) ? -(long long)errno : 0;
 #else

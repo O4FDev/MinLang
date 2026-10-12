@@ -26,11 +26,20 @@ static long long monotonic_ns(void) {
 #endif
 static long long sleeper(long long duration, void *input, void *channel) {
     (void)input; (void)channel;
+    minyar_rc_enter(128);
+    MinyarText *integer = minyar_integer_text(12345);
+    for (long long i = 0; i < 128; i++) minyar_rc_local(i, integer);
+    minyar_rc_release(integer);
+    minyar_rc_leave();
+#if defined(MINYAR_BOUNDED_RC) && MINYAR_RC_POLL_BUDGET < 128
+    assert(rc_pending_count);
+#endif
     atomic_store(&sleeping, 1);
     rc_test_gate_arrive(&started);
     errno = EDOM;
     assert(minyar_thread_sleep_ns(duration) == 0);
     assert(errno == EDOM);
+    assert(!rc_pending_count);
     atomic_store(&sleeping, 0);
     return 71;
 }
