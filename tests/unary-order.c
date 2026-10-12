@@ -5,15 +5,13 @@
 #include <assert.h>
 static void *tracked[65];
 static size_t freed[65], freed_count, tracked_count;
-static void observe_free(void *pointer) {
+static void observe_release(void *pointer) {
     for(size_t i=0;i<tracked_count;i++)if(pointer==tracked[i]){freed[freed_count++]=i;break;}
-    free(pointer);
 }
-#define free observe_free
+#define MINYAR_RC_OBJECT_RELEASE_OBSERVER observe_release
 #define MINYAR_SYSTEM_HEAP 1
 #define MINYAR_RC_TESTING 1
 #include "../runtime/minyar_runtime.c"
-#undef free
 static size_t completed_units;
 static void drain(void) {
     while(rc_pending_count) {

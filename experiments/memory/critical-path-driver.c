@@ -107,7 +107,7 @@ int main(int argc, char **argv) {
     assert(!rc_pending_count && !rc_frames);
     // Prove that the allocator monitor is live, using a real runtime object.
     critical_active = 1;
-    void *control = minyar_record_new_scalar(2);
+    void *control = minyar_record_new_scalar(128);
     minyar_rc_release(control);
     critical_active = 0;
 #ifdef MINYAR_BOUNDED_HEAP

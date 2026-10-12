@@ -116,7 +116,7 @@ long long minyar_checked_scalars_runScalarStudy(void) {
     assert(!rc_pending_count && rc_frames == frames_before);
     /* Prove the allocation monitor observes a real runtime allocation. */
     scalar_active = 1;
-    void *control = minyar_record_new_scalar(2);
+    void *control = minyar_record_new_scalar(128);
     minyar_rc_release(control);
     scalar_active = 0;
 #ifdef MINYAR_BOUNDED_HEAP

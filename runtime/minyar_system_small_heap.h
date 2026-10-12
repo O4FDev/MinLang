@@ -55,13 +55,13 @@ static MINYAR_COLD RcSystemPage *rc_system_new_page(unsigned index) {
     page->index = index;
     page->stride = 64u << index;
     page->used = RC_SYSTEM_PAGE_PREFIX;
-    
+
     SMALL_HEAP_POISON((unsigned char *)page + RC_SYSTEM_PAGE_PREFIX,
                       RC_SYSTEM_PAGE_BYTES - RC_SYSTEM_PAGE_PREFIX);
     rc_system_link(page);
     return page;
 }
-static inline void *rc_system_allocate(size_t bytes) {
+MINYAR_HOT void *rc_system_allocate(size_t bytes) {
     if (bytes > 1024u - sizeof(RcSystemSlot)) {
         if (bytes > SIZE_MAX - sizeof(RcSystemSlot)) out_of_memory();
         RcSystemSlot *slot = malloc(sizeof(*slot) + bytes);

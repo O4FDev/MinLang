@@ -20,7 +20,7 @@ MINYAR_HOT size_t rc_bounded_saved_cursor(RcObject *object) {
     if ((object->ownership & 7) == RC_TEXT) return 0;
     if ((object->ownership & 7) == RC_REFERENCES)
         return (size_t)((MinyarList *)(object + 1))->capacity;
-#if defined(MINYAR_SYSTEM_SMALL_HEAP) && defined(MINYAR_SYSTEM_HEAP) && !MINYAR_THREADED
+#if defined(MINYAR_SYSTEM_HEAP) && MINYAR_SYSTEM_SMALL_HEAP && !MINYAR_THREADED
     return ((RcSystemSlot *)object - 1)->value.bytes;
 #else
     MinyarRecord *record = (MinyarRecord *)(object + 1);
@@ -40,7 +40,7 @@ MINYAR_HOT void rc_bounded_save_cursor(RcObject *object, size_t cursor) {
         ((MinyarList *)(object + 1))->capacity = (long long)cursor;
         return;
     }
-#if defined(MINYAR_SYSTEM_SMALL_HEAP) && defined(MINYAR_SYSTEM_HEAP) && !MINYAR_THREADED
+#if defined(MINYAR_SYSTEM_HEAP) && MINYAR_SYSTEM_SMALL_HEAP && !MINYAR_THREADED
     ((RcSystemSlot *)object - 1)->value.bytes = cursor;
 #else
     MinyarRecord *record = (MinyarRecord *)(object + 1);
@@ -79,6 +79,9 @@ MINYAR_HOT void *rc_bounded_finish_object(RcObject *object, unsigned kind) {
         RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(MinyarRecord)
                    + (size_t)record->length * (sizeof(long long) + (kind == RC_RECORD)));
     }
+#if defined(MINYAR_RC_TESTING) && defined(MINYAR_RC_OBJECT_RELEASE_OBSERVER)
+    MINYAR_RC_OBJECT_RELEASE_OBSERVER(object);
+#endif
     RC_DEALLOCATE(object);
     RC_ACCOUNT(rc_object_count--);
     return text_backing;
@@ -99,6 +102,10 @@ MINYAR_HOT unsigned rc_drop(void *value) {
     /* Exactly one owner and no child fields: no zero-count store or broad
      * kind dispatch is needed before returning this allocation. Shared scalar
      * records continue through the ordinary checked decrement below. */
+    if (ownership == (8 | RC_LIST)) {
+        rc_bounded_finish_object(object, RC_LIST);
+        return 1;
+    }
     if (ownership == (8 | RC_SCALAR_RECORD)) {
         rc_bounded_finish_object(object, RC_SCALAR_RECORD);
         return 1;
@@ -239,8 +246,9 @@ RC_BOUNDED_INLINE void rc_bounded_object_unit(void) {
          * object unit captures the recent stack and services its head, so
          * recent progress is delayed by at most one object unit here. */
         RcObject *active = rc_bounded_active;
-        if (!rc_bounded_head && active && (active->ownership & 7) == RC_RECORD &&
-            ((MinyarRecord *)(active + 1))->length == 1 && rc_bounded_cursor == 1)
+        if (rc_bounded_cursor == 1 && !rc_bounded_head && active &&
+            (active->ownership & 7) == RC_RECORD &&
+            ((MinyarRecord *)(active + 1))->length == 1)
             rc_bounded_old_object_unit();
         else rc_bounded_recent_object_unit();
     } else rc_bounded_old_object_unit();

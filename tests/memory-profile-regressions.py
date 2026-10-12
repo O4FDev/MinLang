@@ -130,6 +130,8 @@ def main():
             '--profiles', *profiles, '--budgets', *map(str, budgets), '--mode', mode,
             '--fixtures', *selected, '--clang', args.clang,
             '--compile-timeout', str(args.compile_timeout), '--run-timeout', str(args.run_timeout)]
+        for define in args.runtime_define:
+            report['snapshot_replay'].extend(['--runtime-define', define])
         runtime = args.runtime_source.resolve()
         runtime_files = {Path('runtime/minyar_runtime.c'): source(runtime, Path('runtime/minyar_runtime.c'))}
         for header in sorted(runtime.parent.glob('*.h')):
