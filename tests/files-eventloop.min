@@ -1,0 +1,81 @@
+// Portable API regression: independently owned prepare and syncer workers signal the real readiness loop.
+use "files" as files
+use "eventloop" as loop
+use "errors" as errors
+function check(condition: Boolean, what: Text) {
+    if !condition { fail("files-eventloop: " + what) }
+}
+let path = "files-eventloop.tmp"
+let fd = files.open(path, files.WRITE + files.CREATE + files.EXCLUSIVE)
+check(fd >= 0, "exclusive open")
+check(files.write(fd, Bytes("dirty"), 0, 5) == 5, "initial bytes")
+check(files.preallocate(fd, 8192) == 0, "preallocate")
+check(Text(files.readAt(fd, 0, 5)) == "dirty", "preallocate preserves bytes")
+check(files.preallocate(fd, 1) == 0 && files.size(fd) == 8192, "preallocate never shrinks")
+check(files.readAt(fd, 8192, 1099511627776).length == 0 && files.lastError() == 0, "huge read at EOF")
+check(files.readAt(-1, 0, 1).length == 0 && files.lastError() == -9, "invalid descriptor")
+check(files.readAt(fd, -1, 1).length == 0 && files.lastError() == -22, "negative range")
+check(files.readAt(fd, 9223372036854775806, 3).length == 0 && files.lastError() < 0, "overflow range")
+check(files.prepareStart(fd, -1) == -22, "negative prepare size")
+let reactor = errors.integerValue(loop.create())
+let previous = 0
+let round = 0
+while round < 8 {
+    let writer = files.open(path, files.WRITE)
+    check(writer >= 0, "worker descriptor")
+    let job = files.prepareStart(writer, 4096)
+    check(job > 0 && job != previous, "prepare generation")
+    check(files.close(writer) == 0, "close caller while worker owns duplicate")
+    check(files.prepareDone(previous) == -9, "stale done")
+    check(files.prepareError(previous) == -9, "stale error")
+    check(files.prepareNotifySocket(previous) == -9, "stale socket")
+    check(files.prepareDrain(previous) == -9, "stale drain")
+    check(files.prepareWait(previous, 0) == -9, "stale wait")
+    check(files.prepareStop(previous) == -9, "stale stop")
+    check(files.syncerStop(job) == -9, "cross-kind stop")
+    check(files.prepareWait(job, -2) == -22, "invalid timeout")
+    let watch = errors.integerValue(loop.watch(reactor, files.prepareNotifySocket(job), loop.readableInterest(), 42))
+    // Always wait for the readiness event, including jobs that already completed before watch registration.
+    let batch = loop.wait(reactor, 5000, 8)
+    check(!errors.isError(loop.batchError(batch)), "loop error")
+    check(loop.events(batch).length > 0, "prepare completion socket wakes loop")
+    for event in loop.events(batch) {
+        check(event.token == 42 && loop.isReadable(event), "prepare readiness token")
+    }
+    check(files.prepareDrain(job) > 0, "drain readiness")
+    check(files.prepareDone(job) == 1 && files.prepareError(job) == 0, "durable completion")
+    check(files.prepareWait(job, 0) == 1, "completed wait")
+    check(files.size(fd) == 4096, "exact prepared size")
+    let content = files.readAt(fd, 0, 8192)
+    check(content.length == 4096 && files.lastError() == 0, "read prepared bytes")
+    for byte in content { check(byte == 0, "prepared byte is zero") }
+    check(errors.booleanValue(loop.remove(reactor, watch)), "remove prepare watch")
+    check(files.prepareStop(job) == 0, "joined cleanup")
+    check(files.prepareStop(job) == -9, "repeated cleanup")
+    previous = job
+    round += 1
+}
+let syncer = files.syncerStart(fd)
+check(syncer > 0, "syncer")
+check(files.prepareStop(syncer) == -9, "cross-kind prepare stop")
+let syncWatch = errors.integerValue(loop.watch(reactor, files.syncerNotifySocket(syncer), loop.readableInterest(), 43))
+check(files.writeAt(fd, Bytes("WAL"), 0, 3, 0) == 3, "positioned WAL write")
+check(files.syncerRequest(syncer, 3) == 0, "sync request")
+let syncBatch = loop.wait(reactor, 5000, 8)
+check(loop.events(syncBatch).length > 0 && !errors.isError(loop.batchError(syncBatch)), "sync socket wakes loop")
+check(files.syncerDrain(syncer) > 0 && files.syncerSynced(syncer) == 3 && files.syncerError(syncer) == 0, "durable WAL")
+check(errors.booleanValue(loop.remove(reactor, syncWatch)), "remove sync watch")
+check(files.syncerStop(syncer) == 0, "stop syncer")
+check(errors.booleanValue(loop.close(reactor)), "close loop")
+check(files.sync(fd) == 0 && files.syncData(fd) == 0, "durable native entry points")
+check(files.close(fd) == 0, "close")
+check(Text(files.readFile(path).slice(0, 3)) == "WAL", "readFile")
+let reader = files.open(path, files.READ)
+check(files.prepareStart(reader, 4096) < 0, "read-only prepare rejected")
+check(files.close(reader) == 0, "close reader")
+let append = files.open(path, files.WRITE + files.APPEND)
+check(files.prepareStart(append, 4096) == -22, "append prepare rejected")
+check(files.writeAt(append, Bytes("X"), 0, 1, 0) == -22, "append positioned write rejected")
+check(files.close(append) == 0, "close append")
+check(files.remove(path) == 0, "remove")
+print("files-eventloop: ok")

@@ -17,6 +17,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include "files-test-path.h"
 
 static int fd_step, fd_fail, mutex_fail, condition_fail, create_fail;
 static int mutex_live, condition_live, condition_step, directory_mode, directory_reads, directory_closes;
@@ -111,7 +112,7 @@ static int descriptors(void) {
     int count = 0; for (int fd = 0; fd < 256; fd++) if (fcntl(fd, F_GETFD) >= 0) count++; return count;
 }
 static int temporary(void) {
-    char path[] = "/tmp/minyar-review-file-XXXXXX";
+    char path[PATH_MAX]; files_test_path(path,sizeof(path),"minyar-review-file-XXXXXX");
     int fd = mkstemp(path); assert(fd >= 0); assert(!unlink(path)); assert(write(fd, "x", 1) == 1); return fd;
 }
 static void valid_retry(int fd) {
@@ -133,7 +134,7 @@ static void setup(const char *kind, int failure) {
     valid_retry(fd); close(fd);
 }
 static void listing(int mode) {
-    char path[] = "/tmp/minyar-review-directory-XXXXXX"; assert(mkdtemp(path));
+    char path[PATH_MAX]; files_test_path(path,sizeof(path),"minyar-review-directory-XXXXXX"); assert(mkdtemp(path));
     MinyarText p = text(path); directory_mode = mode;
     MinyarBytes *b = minyar_files_listNames(&p);
     if (mode == 1 || mode == 3) {
@@ -147,7 +148,7 @@ static void listing(int mode) {
 }
 static void names(void) {
     const char *entries[] = {"a\nb", "a", "b", "\n", "\nedge", "tail\n", "\xce\xbb"};
-    char directory[] = "/tmp/minyar-review-names-XXXXXX"; assert(mkdtemp(directory));
+    char directory[PATH_MAX]; files_test_path(directory,sizeof(directory),"minyar-review-names-XXXXXX"); assert(mkdtemp(directory));
     char path[PATH_MAX];
     for (size_t i = 0; i < 7; i++) {
         snprintf(path, sizeof(path), "%s/%s", directory, entries[i]);

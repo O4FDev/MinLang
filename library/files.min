@@ -30,6 +30,8 @@ public function writeAt(file: Integer, data: Bytes, offset: Integer, length: Int
 public function writeStandardOutput(text: Text): Integer { native "files" }
 
 // Up to length bytes from position; shorter at end of file.
+// EOF is empty with lastError() == 0. Invalid handles report -EBADF, invalid negative ranges -EINVAL.
+// Allocation grows with the bytes actually read; huge requests at EOF and zero-size pseudo-files are supported.
 public function readAt(file: Integer, position: Integer, length: Integer): Bytes { native "files" }
 public function readFile(path: Text): Bytes { native "files" }
 
@@ -38,6 +40,14 @@ public function sync(file: Integer): Integer { native "files" }       // fsync (
 public function size(file: Integer): Integer { native "files" }
 public function pathSize(path: Text): Integer { native "files" }      // -2 if missing
 public function truncate(file: Integer, length: Integer): Integer { native "files" }
+// Reserve storage for at least length bytes and extend the file when needed. Existing bytes are preserved;
+// the file is never shrunk. Platform/filesystem allocation errors are returned; call syncData for durability.
+// On Darwin existing prefix holes or potentially shared clone backing return -ENOTSUP; missing sharing
+// metadata also fails closed. Fresh files and extensions of a private, physically backed prefix are supported.
+// Linux unshares the existing prefix; unsupported unsharing is accepted only on known non-CoW ext2/3/4.
+// Other filesystems return their allocation error or -ENOTSUP when reservation cannot be established. Keep the file
+// contents/size exclusively owned during this operation so concurrent changes cannot invalidate coverage.
+public function preallocate(file: Integer, length: Integer): Integer { native "files" }
 public function rename(from: Text, to: Text): Integer { native "files" }   // atomic within a file system
 public function remove(path: Text): Integer { native "files" }
 public function makeDirectory(path: Text): Integer { native "files" }      // 0 if created or already a directory
@@ -90,3 +100,21 @@ public function syncerWait(handle: Integer, upTo: Integer, timeoutMs: Integer): 
 public function syncerSwitch(handle: Integer, file: Integer, startOffset: Integer): Integer { native "files" }
 // Final sync of outstanding requests, then stop the thread and close its descriptors. Returns syncerError.
 public function syncerStop(handle: Integer): Integer { native "files" }
+
+// ---- background file preparation ----
+// Exclusively reserve this file for the job until completion: it preallocates, sets the exact size, overwrites
+// every byte with zero and durably syncs. Start duplicates the descriptor, so the caller may close its file.
+// No managed values enter the worker. APPEND or read-only descriptors are rejected. A failed job can leave a
+// partially prepared file; only completion with prepareError == 0 establishes a durable all-zero file.
+public function prepareStart(file: Integer, length: Integer): Integer { native "files" }
+// Borrowed nonblocking completion socket: watch with eventloop; remove the watch before prepareStop.
+// Never close this socket yourself. Completion includes failures; call prepareError after prepareDone == 1.
+public function prepareNotifySocket(handle: Integer): Integer { native "files" }
+public function prepareDone(handle: Integer): Integer { native "files" }     // 0 running, 1 finished, -errno invalid
+public function prepareError(handle: Integer): Integer { native "files" }    // sticky -errno, 0 otherwise
+public function prepareDrain(handle: Integer): Integer { native "files" }    // number of notification bytes
+// Return 1 on durable success, -errno on failure; -ETIMEDOUT on timeout (-1 milliseconds waits forever).
+public function prepareWait(handle: Integer, timeoutMs: Integer): Integer { native "files" }
+// Join without cancelling, close owned file/socket descriptors and invalidate this generation of the handle.
+// Returns the sticky error. Remove eventloop watches first. Repeated stop and stale handles return -EBADF.
+public function prepareStop(handle: Integer): Integer { native "files" }
