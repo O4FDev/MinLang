@@ -10,11 +10,11 @@
  * Pool frees have at most log2(heap/minimum-block) merge steps. System
  * allocator calls have no runtime-imposed execution-time bound.
  * Work bounds exclude startup, data copying and OS scheduling/page faults. */
-static RcObject *rc_bounded_head, *rc_bounded_tail, *rc_bounded_active;
-static size_t rc_bounded_cursor;
+static MINYAR_THREAD_LOCAL RcObject *rc_bounded_head, *rc_bounded_tail, *rc_bounded_active;
+static MINYAR_THREAD_LOCAL size_t rc_bounded_cursor;
 #define MINYAR_RC_RECENT_OBJECTS 1
-static RcObject *rc_bounded_recent_head, *rc_bounded_recent_tail;
-static unsigned rc_bounded_recent_turn;
+static MINYAR_THREAD_LOCAL RcObject *rc_bounded_recent_head, *rc_bounded_recent_tail;
+static MINYAR_THREAD_LOCAL unsigned rc_bounded_recent_turn;
 
 /* Dead List capacity is spare. Dead record map bytes retain their low-bit
  * reference flag and store seven cursor bits each. The loop executes at most
@@ -70,6 +70,13 @@ static void *rc_bounded_finish_object(RcObject *object, unsigned kind) {
         return NULL;
     }
     void *text_backing = NULL;
+#if MINYAR_THREADED
+    if (kind == 0) {
+        RcThreadLeaf *leaf = (RcThreadLeaf *)(object + 1);
+        leaf->release(leaf->control);
+        RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(*leaf));
+    } else
+#endif
     if (kind == RC_TEXT) {
         MinyarText *text = (MinyarText *)(object + 1);
         text_backing = text->backing;
@@ -146,6 +153,12 @@ static unsigned rc_drop(void *value) {
     object->ownership = ownership - 8;
     if (object->ownership >> 3) return 0;
     unsigned kind = object->ownership & 7;
+#if MINYAR_THREADED
+    if (kind == 0) {
+        rc_bounded_finish_object(object, kind);
+        return 1;
+    }
+#endif
     if (kind == RC_TEXT) {
         void *backing = rc_bounded_finish_object(object, kind);
         /* A view owns a direct reference to an owning Text, never another
@@ -201,9 +214,9 @@ static inline int rc_bounded_traced_visit(RcObject *object, size_t cursor, int r
     return 1;
 }
 
-static RcFrame *rc_bounded_frame_head, *rc_bounded_frame_tail;
-static RcTemporaryChunk *rc_bounded_chunk_head, *rc_bounded_chunk_tail;
-static unsigned rc_bounded_next_queue;
+static MINYAR_THREAD_LOCAL RcFrame *rc_bounded_frame_head, *rc_bounded_frame_tail;
+static MINYAR_THREAD_LOCAL RcTemporaryChunk *rc_bounded_chunk_head, *rc_bounded_chunk_tail;
+static MINYAR_THREAD_LOCAL unsigned rc_bounded_next_queue;
 
 static void rc_bounded_retire_temporaries(RcFrame *frame) {
     if (!frame->temporary_head) return;

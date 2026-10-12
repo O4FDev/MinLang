@@ -271,7 +271,7 @@ static MINYAR_NOINLINE void rc_cycle_unit(void) {
 #ifndef MINYAR_BOUNDED_RC
 static void rc_cycle_eager_service(size_t budget) {
     /* Recursive public releases only occur in the eager queue drain. */
-    static unsigned servicing;
+    static MINYAR_THREAD_LOCAL unsigned servicing;
     if (servicing)
         return;
     servicing = 1;
