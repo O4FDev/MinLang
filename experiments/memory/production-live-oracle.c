@@ -47,7 +47,11 @@ static size_t entry(RcObject *object) {
 }
 
 static size_t saved_record_cursor(MinyarRecord *record) {
-#ifdef MINYAR_RC_RECENT_OBJECTS
+#if defined(MINYAR_SYSTEM_SMALL_HEAP) && defined(MINYAR_SYSTEM_HEAP) && !MINYAR_THREADED
+    size_t cursor = ((RcSystemSlot *)((RcObject *)record - 1) - 1)->value.bytes;
+    assert(cursor <= (size_t)record->length);
+    return cursor;
+#elif defined(MINYAR_RC_RECENT_OBJECTS)
     unsigned char *map = (unsigned char *)(record->values + record->length);
     size_t cursor = 0;
     /* Decode individual bits independently of the runtime's digit encoding.
