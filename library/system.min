@@ -62,3 +62,65 @@ public function setResourceLimit(resource: Integer, soft: Integer, hard: Integer
 // Windows supports clocks, identity, memory, environment and raw stderr. POSIX
 // signal socket/ignore/drain and resource-limit operations return -ENOTSUP.
 // sendSignal(pid, 0) checks a positive PID; other Windows signals are -ENOTSUP.
+
+// Launch an executable directly, without a shell or PATH lookup. argv contains
+// argv[0] and at least one element; envp is the complete NAME=value environment
+// (empty means no environment). Empty cwd inherits the parent's directory; a
+// relative executable is resolved in the child's cwd. Texts must contain no NUL.
+// Returns an owned opaque handle > 0, or synchronous -errno for setup/exec failure.
+// Parent signal dispositions/mask/cwd/credentials are preserved. The child has
+// default, unblocked SIGPIPE, retaining the parent's other signal-mask bits.
+// POSIX non-CLOEXEC descriptors inherit; Windows only inheritable std handles do.
+// Serialize all process-handle operations; do not reap these PIDs through raw wait.
+public function spawn(path: Text, argv: List<Text>, envp: List<Text>, cwd: Text): Integer {
+    return spawnNative(path, encodeProcessVector(argv), encodeProcessVector(envp), cwd, -1, -1, Bytes(), false)
+}
+// uid/gid -1 inherit; otherwise set real/effective/saved IDs. The supplementary
+// groups are explicit: [] clears them. Linux uses a separate native clone-vfork
+// stack; macOS 10.15+ uses dynamically discovered credential spawn SPI (requires
+// root; missing SPI returns -ENOTSUP). Neither runs managed code in a child.
+// Windows credentials are -ENOTSUP. Native privilege errors (e.g. -EPERM) remain
+// visible. Explicit macOS groups disable external memberd group expansion.
+public function spawnWithCredentials(path: Text, argv: List<Text>, envp: List<Text>, cwd: Text,
+    uid: Integer, gid: Integer, groups: List<Integer>): Integer {
+    if groups.length > 65536 { return -22 }
+    let encoded = Bytes(groups.length * 8)
+    for index in 0..groups.length { encoded.setInt64(index * 8, groups[index]) }
+    return spawnNative(path, encodeProcessVector(argv), encodeProcessVector(envp), cwd, uid, gid, encoded, true)
+}
+function encodeProcessVector(items: List<Text>): Bytes {
+    let encoded = Bytes(8)
+    encoded.setInt64(0, items.length)
+    for item in items {
+        let bytes = Bytes(item)
+        let length = Bytes(8)
+        length.setInt64(0, bytes.length)
+        encoded.addBytes(length)
+        encoded.addBytes(bytes)
+    }
+    return encoded
+}
+function spawnNative(path: Text, argv: Bytes, envp: Bytes, cwd: Text, uid: Integer,
+    gid: Integer, groups: Bytes, credentials: Boolean): Integer { native "system" }
+public function childProcessId(handle: Integer): Integer { native "system" } // -ECHILD after wait
+public constant PENDING = 0
+public constant EXITED = 1
+public constant SIGNALED = 2
+public constant WAIT_ERROR = 3
+public record ProcessStatus { state: Integer; exitCode: Integer; signal: Integer; error: Integer }
+// wait blocks; poll never blocks. A terminal result consumes the owned handle,
+// including Windows kernel handles. Repeated/invalid waits return -ECHILD in
+// error. Windows exits (including exception DWORD codes) are EXITED, never POSIX
+// SIGNALED. Child exit 127 is distinct from synchronous launch failure.
+public function wait(handle: Integer): ProcessStatus { return decodeProcessStatus(waitNative(handle, false)) }
+public function poll(handle: Integer): ProcessStatus { return decodeProcessStatus(waitNative(handle, true)) }
+function waitNative(handle: Integer, poll: Boolean): Bytes { native "system" }
+function decodeProcessStatus(raw: Bytes): ProcessStatus {
+    return ProcessStatus { error: raw.getInt64(0); state: raw.getInt64(8);
+        exitCode: raw.getInt64(16); signal: raw.getInt64(24) }
+}
+// Windows argv follows C runtime quoting; argv[0] cannot contain a quote. Windows
+// duplicate environment names (case-insensitive) and drive-relative C:foo paths
+// are -EINVAL. Packed argv/env vectors are limited to 16 MiB / 65536 elements;
+// the OS may enforce lower limits (-E2BIG). No automatic child termination on
+// parent exit; wait every successful handle to avoid retained handles/zombies.

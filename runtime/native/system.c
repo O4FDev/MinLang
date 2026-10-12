@@ -311,3 +311,5 @@ long long minyar_system_setResourceLimit(long long resource, long long soft, lon
     return setrlimit(native, &limit) ? system_failure(errno) : 0;
 }
 #endif
+
+#include "system_process.h"

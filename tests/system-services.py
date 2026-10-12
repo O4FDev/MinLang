@@ -10,14 +10,18 @@ from clang_helpers import clang_command, windows_host, launcher_command
 ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--language', action='store_true', help='compile language regression (run on Boat)')
+parser.add_argument('--mode', choices=('native', 'sanitize'), default='native')
 options = parser.parse_args()
 with tempfile.TemporaryDirectory(prefix='minyar-system-services-') as directory:
     binary = Path(directory) / ('services.exe' if windows_host() else 'services')
     command = clang_command([os.environ.get('MINYAR_TEST_CLANG', 'clang'), '-std=c11',
-        '-Wall', '-Wextra', '-Werror', '-O1', ROOT/'tests/system-services.c', '-o', binary])
+        '-Wall', '-Wextra', '-Werror', '-O1',
+        *(['-g', '-fsanitize=address,undefined'] if options.mode == 'sanitize' else []),
+        ROOT/'tests/system-services.c', '-o', binary])
     if windows_host(): command += ['-lpsapi']
     subprocess.run(command, check=True, timeout=30)
     environment = dict(os.environ, MINYAR_SYSTEM_TEST='snowman-☃', MINYAR_SYSTEM_EMPTY='')
+    environment.update(ASAN_OPTIONS='detect_leaks=0', UBSAN_OPTIONS='halt_on_error=1')
     environment.pop('MINYAR_SYSTEM_MISSING', None)
     for case in ('environment', 'limits', 'signals', 'stderr'):
         result = subprocess.run([binary, case], env=environment, capture_output=True, timeout=10)
