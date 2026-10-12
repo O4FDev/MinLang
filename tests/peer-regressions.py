@@ -271,7 +271,11 @@ print(7 / (value.inner.value - 42))
         for value in ('0x', '0X', '0xG', '0b2', '00b0', '0b', '0o8', '00o0', '0o', '123name'):
             with self.subTest(value=value):
                 self.rejects(f'print({value})\n', 'Minyar stopped:')
-        self.executes('\n'.join(f'print(0{value})' for value in range(70, 78)),
+        # A leading zero is never silently decimal or C-style octal (GUEST-1); 0o spells octal.
+        for value in range(70, 78):
+            with self.subTest(value=f'0{value}'):
+                self.rejects(f'print(0{value})\n', 'decimal Integer literals cannot have a leading zero')
+        self.executes('\n'.join(f'print(0o{value:o})' for value in range(70, 78)),
                       ''.join(f'{value}\n' for value in range(70, 78)))
 
     def test_invalid_source_bytes_are_not_hidden_by_comments_or_eof(self):
