@@ -149,4 +149,76 @@ raise SystemExit('interruption unexpectedly completed')
         self.assertLess(abs(observer.memory_summary(plateau, 10)['rss_slope_kib_per_second']), .01)
         self.assertAlmostEqual(observer.memory_summary(growth, 10)['rss_slope_kib_per_second'], 100)
 
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'peer process telemetry uses Linux procfs')
+    def test_peer_telemetry_measures_real_live_child_then_normal_exit(self):
+        spec = importlib.util.spec_from_file_location('quic_soak_telemetry', Path(__file__).with_name('quic-soak.py'))
+        quic = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(quic)
+        sample_peer = quic.peer_observation
+        source = ('import sys,time; data=bytearray(24*1024*1024); '
+                  'start=time.process_time();\n'
+                  'while time.process_time()-start<.03: pass\n'
+                  'print("ready",flush=True); sys.stdin.buffer.readline()')
+        child = subprocess.Popen([sys.executable, '-c', source], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 start_new_session=True)
+        try:
+            with selectors.DefaultSelector() as ready:
+                ready.register(child.stdout, selectors.EVENT_READ)
+                self.assertTrue(ready.select(2), 'telemetry child did not become ready')
+            self.assertEqual(child.stdout.readline(), b'ready\n')
+            status, sample = sample_peer(child)
+            self.assertIsNone(status)
+            self.assertGreaterEqual(sample['rss_bytes'], 24*1024*1024)
+            self.assertGreater(sample['cpu_seconds'], 0)
+            self.assertNotIn(sample['state'], ('Z', 'X', 'x'))
+            child.stdin.write(b'\n'); child.stdin.flush()
+            stdout, stderr = child.communicate(timeout=2)
+            self.assertEqual((child.returncode, stdout, stderr), (0, b'', b''))
+            self.assertEqual(sample_peer(child), (0, None))
+            with self.assertRaises(ProcessLookupError): os.kill(child.pid, 0)
+            with self.assertRaises(ProcessLookupError): os.killpg(child.pid, 0)
+        finally:
+            if child.poll() is None: os.killpg(child.pid, signal.SIGKILL)
+            child.communicate(timeout=2)
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'peer process telemetry uses Linux procfs')
+    def test_peer_telemetry_exit_race_and_unexpected_read_failure(self):
+        from unittest.mock import patch
+        spec = importlib.util.spec_from_file_location('quic_soak_exit_telemetry', Path(__file__).with_name('quic-soak.py'))
+        quic = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(quic)
+        sample_peer = quic.peer_observation
+        child = subprocess.Popen([sys.executable, '-c',
+                                  'import sys; print("ready",flush=True); sys.stdin.buffer.readline()'],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, start_new_session=True)
+        original_sample = quic.process_sample
+        try:
+            with selectors.DefaultSelector() as ready:
+                ready.register(child.stdout, selectors.EVENT_READ)
+                self.assertTrue(ready.select(2), 'telemetry child did not become ready')
+            self.assertEqual(child.stdout.readline(), b'ready\n')
+            # A missing/denied read while the owned child is still alive must
+            # not be converted into successful completion or zero RSS.
+            for error in (FileNotFoundError('unexpected live absence'), PermissionError('denied')):
+                with patch.object(quic, 'process_sample', side_effect=error):
+                    with self.assertRaises(type(error)): sample_peer(child)
+            self.assertIsNone(child.poll())
+            def exit_between_poll_and_sample(pid):
+                self.assertEqual(pid, child.pid)
+                child.stdin.write(b'\n'); child.stdin.flush()
+                self.assertEqual(child.wait(timeout=2), 0)
+                return original_sample(pid)  # Real procfs read after reaping.
+            with patch.object(quic, 'process_sample', side_effect=exit_between_poll_and_sample):
+                self.assertEqual(sample_peer(child), (0, None))
+            stdout, stderr = child.communicate(timeout=2)
+            self.assertEqual((stdout, stderr), (b'', b''))
+            with self.assertRaises(ProcessLookupError): os.kill(child.pid, 0)
+            with self.assertRaises(ProcessLookupError): os.killpg(child.pid, 0)
+        finally:
+            if child.poll() is None: os.killpg(child.pid, signal.SIGKILL)
+            child.communicate(timeout=2)
+
 if __name__ == '__main__': unittest.main()
