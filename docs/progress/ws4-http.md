@@ -1,6 +1,7 @@
 # WS4 HTTP track
 
 Base: frozen unified bf9c0e9; branch ws4/http-server. No rebase, v2 merge or push.
+API/test commit: a1edb5d2fce00bd1d23ce34fb537d3853b1c2327.
 
 Reusable server implemented in library/httpserver.min, separate from the client.
 Batch requests/private tickets, shared-loop integration, strict framing/Host,
@@ -32,6 +33,10 @@ Make wiring is mandatory in check/check-portable/check-sanitize.
 Fresh candidate Linux compiler SHA f4f589328d1b53b8cf92c9aa8b0da1f5168bca1b4e8cf9198ff1b542cc59212b;
 Clang 18.1.3, Python 3.12.3. Input hashes/modes and raw command results are in
 ws4-http-evidence/. No host lifecycle action or paid spend by this child.
+Final remote source/compiler SHA and mode verification passed. The additional
+remote catalogue invocation failed because the parent baseline archive lacks
+.github/workflows/ci.yml; the full local checkout catalogue passes. Its failing
+command result is retained rather than counted as passing qualification.
 
 Pending: independent parent review; actual macOS and Windows execution; cache
 front using this API, Rust/axum comparator and finite 548-query byte/LRU/HoL
