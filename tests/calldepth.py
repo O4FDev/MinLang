@@ -53,11 +53,20 @@ def main():
     parser.add_argument('--lto', action='store_true', help='Include the Linux ThinLTO/lld gate.')
     parser.add_argument('--max-depth', type=int)
     parser.add_argument('--fallback-depth', type=int)
+    parser.add_argument('--fixtures', choices=('all', 'only', 'skip'), default='all',
+        help='The C runtime/reporting fixtures and dispatch control use no profile or budget; '
+             'profile matrices run them once (only) and skip them per combination.')
+    parser.add_argument('--emit-ir', type=Path, metavar='DIR',
+        help='Compile the selected cases once for --budget into DIR and stop.')
+    parser.add_argument('--ir-cache', type=Path, metavar='DIR',
+        help='Link IR written by --emit-ir for the same compiler, budget and sources.')
     args = parser.parse_args()
+    if args.emit_ir: args.evidence, args.fixtures = args.emit_ir, 'skip'
     if args.lto and platform.system() != 'Linux': parser.error('--lto requires Linux/lld')
     if args.small_stack and windows_host(): parser.error('--small-stack requires POSIX setrlimit')
     if args.profile == 'lazy' and windows_host(): parser.error('the lazy heap requires POSIX mmap')
     args.evidence.mkdir(parents=True, exist_ok=True)
+    if args.emit_ir: (args.emit_ir / 'manifest.json').unlink(missing_ok=True)
     commands = []
     clang = shlex.split(os.environ.get('MINYAR_TEST_CLANG', 'clang'))
     flags = ['-g', '-fsanitize=address,undefined', '-fno-omit-frame-pointer'] if args.sanitize else []
@@ -142,7 +151,7 @@ __attribute__((destructor)) static void depth_exit_contract(void) {
     policy += ['-DMINYAR_RC_POLL_BUDGET=' + str(args.budget)]
     if args.max_depth is not None: policy += ['-DMINYAR_MAX_CALL_DEPTH=' + str(args.max_depth)]
     if args.fallback_depth is not None: policy += ['-DMINYAR_FALLBACK_CALL_DEPTH=' + str(args.fallback_depth)]
-    for fixture in ('calldepth-runtime', 'calldepth-thread-local'):
+    for fixture in ('calldepth-runtime', 'calldepth-thread-local') if args.fixtures != 'skip' else ():
         if fixture.endswith('thread-local') and windows_host():
             print('pthread scope isolation requires a POSIX host', flush=True)
             continue
@@ -154,7 +163,8 @@ __attribute__((destructor)) static void depth_exit_contract(void) {
         run([executable], '')
     for name, definitions, controls in (
             ('global', ['-DMINYAR_MAX_CALL_DEPTH=2'], ('global', 'bounded', 'physical', 'escape')),
-            ('fallback', ['-DMINYAR_MAX_CALL_DEPTH=1000', '-DMINYAR_FALLBACK_CALL_DEPTH=16'], ('fallback',))):
+            ('fallback', ['-DMINYAR_MAX_CALL_DEPTH=1000', '-DMINYAR_FALLBACK_CALL_DEPTH=16'], ('fallback',))
+            ) if args.fixtures != 'skip' else ():
         executable = args.evidence / ('reporting-controls-' + name)
         run(clang + ['-O2'] + flags + ['-DMINYAR_SYSTEM_HEAP=1'] + definitions +
             [ROOT / 'tests/calldepth-reporting.c', '-lm'] +
@@ -181,15 +191,51 @@ public function depthTestValue(result: IntegerResult): Integer { return result.v
     if 'large-dispatch' in cases:
         body = 'function dispatch(value: Integer): Integer {\n' + ''.join(
             f'if value == {i} {{ return {i} }} else {{\n' for i in range(1500)) + 'return 9999\n' + '}\n' * 1501
-        control = args.evidence / 'dispatch-control.min'
-        control.write_text(body + 'print(dispatch(1450))\n')
-        control_ir = control.with_suffix('.ll')
-        run([ROOT / 'build/minyarc', control, control_ir])
-        assert 'dispatch.found:' in control_ir.read_text(), 'control did not exercise integer dispatch'
+        if args.fixtures != 'skip':
+            control = args.evidence / 'dispatch-control.min'
+            control.write_text(body + 'print(dispatch(1450))\n')
+            control_ir = control.with_suffix('.ll')
+            run([ROOT / 'build/minyarc', control, control_ir])
+            assert 'dispatch.found:' in control_ir.read_text(), 'control did not exercise integer dispatch'
         generated_dispatch = args.evidence / 'large-dispatch.min'
         generated_dispatch.write_text('use "calldepth" as depth\nuse "errors" as errors\n' + body +
             'let good=depth.run(2, function(): Integer { return dispatch(1450) })\nprint(errors.integerValue(good))\n'
             'let failed=depth.run(1, function(): Integer { return dispatch(1450) })\nprint(errors.integerOk(failed))\n')
+    def sha256(path): return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    def case_source(case):
+        return generated_dispatch if case == 'large-dispatch' else ROOT / 'tests/calldepth' / (case + '.min')
+    def compile_case(case, llvm):
+        if args.ir_cache:
+            # The IR depends only on compiler, budget, libraries and source;
+            # heap profile, optimisation mode and sanitizer flags apply at link.
+            entry = ir_cache['cases'][case]
+            assert entry['source_sha256'] == sha256(case_source(case)), ('stale IR cache', case)
+            shutil.copyfile(args.ir_cache / (case + '.ll'), llvm)
+            assert sha256(llvm) == entry['ir_sha256'], ('IR cache changed', case)
+            commands.append({'argv': entry['argv'], 'status': 0, 'reused_ir': str(args.ir_cache / (case + '.ll')),
+                'ir_sha256': entry['ir_sha256'], 'executable_sha256': ir_cache['compiler_sha256']})
+        else:
+            run([args.compiler, case_source(case), llvm, *libraries, '--bounded-owners', str(args.budget)])
+        text = llvm.read_text()
+        assert '; minyar-calldepth-policy: cooperative-v1-full-program' in text
+        if case == 'large-dispatch': assert 'dispatch.found:' not in text
+    if args.fixtures == 'only': modes = []
+    if args.emit_ir:
+        written = {}
+        for case in cases:
+            llvm = args.emit_ir / (case + '.ll')
+            compile_case(case, llvm)
+            written[case] = {'argv': commands[-1]['argv'], 'source_sha256': sha256(case_source(case)),
+                             'ir_sha256': sha256(llvm)}
+        (args.emit_ir / 'manifest.json').write_text(json.dumps({'budget': args.budget,
+            'compiler': str(args.compiler), 'compiler_sha256': sha256(args.compiler),
+            'cases': written}, indent=2) + '\n')
+        return
+    if args.ir_cache:
+        ir_cache = json.loads((args.ir_cache / 'manifest.json').read_text())
+        assert ir_cache['budget'] == args.budget, ('IR cache budget', ir_cache['budget'])
+        assert ir_cache['compiler_sha256'] == sha256(args.compiler), 'IR cache from another compiler'
+        assert set(cases) <= set(ir_cache['cases']), ('IR cache lacks cases', set(cases) - set(ir_cache['cases']))
     for mode in modes:
         optimization = ['-O0'] if mode == 'O0' else ['-O2']
         if mode == 'LTO': optimization += ['-flto=thin', '-fuse-ld=lld']
@@ -198,11 +244,8 @@ public function depthTestValue(result: IntegerResult): Integer { return result.v
             '-S', '-emit-llvm', harness, '-o', runtime] if mode == 'LTO' else
             clang + optimization + flags + policy + ['-iquote', ROOT / 'runtime', '-c', harness, '-o', runtime])
         for case in cases:
-            source = generated_dispatch if case == 'large-dispatch' else ROOT / 'tests/calldepth' / (case + '.min')
             llvm = args.evidence / (case + '.' + mode + '.ll')
-            run([args.compiler, source, llvm, *libraries, '--bounded-owners', str(args.budget)])
-            assert '; minyar-calldepth-policy: cooperative-v1-full-program' in llvm.read_text()
-            if case == 'large-dispatch': assert 'dispatch.found:' not in llvm.read_text()
+            compile_case(case, llvm)
             if args.sanitize: prepare_llvm_for_link(llvm, flags)
             executable = llvm.with_suffix('.bin')
             run(clang + optimization + flags + ['-Wno-override-module', llvm, runtime, '-lm', '-o', executable])
@@ -219,6 +262,7 @@ public function depthTestValue(result: IntegerResult): Integer { return result.v
         p = ROOT / 'tests' / name
         inputs[str(p.relative_to(ROOT))] = hashlib.sha256(p.read_bytes()).hexdigest()
     inputs[str(args.compiler)] = hashlib.sha256(args.compiler.read_bytes()).hexdigest()
+    if args.ir_cache: inputs[str(args.ir_cache / 'manifest.json')] = sha256(args.ir_cache / 'manifest.json')
     (args.evidence / 'manifest.json').write_text(json.dumps({'status': 'passed', 'files': files,
         'inputs': inputs, 'configuration': vars(args)}, default=str, indent=2) + '\n')
 

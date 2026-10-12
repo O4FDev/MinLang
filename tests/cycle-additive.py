@@ -6,7 +6,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 from cycle_runtime import publish_engine
 from clang_helpers import asan_leak_options, windows_host
-from test_evidence import terminate_process_tree
+from test_evidence import terminate_process_tree, test_jobs
+from concurrent.futures import ThreadPoolExecutor
 
 def profile_selection(requested, windows):
     unsupported = ([{"profile": "lazy",
@@ -25,16 +26,24 @@ def counters():
     # Guest time is already included in user/nice by Linux.
     total = sum(values[:8])
     return total, values[3] + values[4]
+def cpu_guard():
+    """Opt-in courtesy pause for shared hosts (MINYAR_CYCLE_CPU_GUARD=1).
+
+    Runners already bound their own concurrency; under their load the pause
+    only stalls cases against the same wall deadline."""
+    return platform.system() == "Linux" and os.environ.get("MINYAR_CYCLE_CPU_GUARD") == "1"
+
+
 def run(command, environment, output, label, resource):
     proc = subprocess.Popen(command, cwd=ROOT, env=environment, start_new_session=not windows_host(),
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    previous = counters() if platform.system() == "Linux" else None
     started = time.monotonic()
-    stopped = False
-    maximum = 0
-    while proc.poll() is None:
-        time.sleep(.25)
-        if previous:
+    if cpu_guard():
+        previous = counters()
+        stopped = False
+        maximum = 0
+        while proc.poll() is None:
+            time.sleep(.25)
             current = counters()
             delta = current[0] - previous[0]
             usage = 100 * (1 - (current[1] - previous[1]) / delta) if delta else 0
@@ -46,15 +55,32 @@ def run(command, environment, output, label, resource):
             elif stopped and usage < 60:
                 os.killpg(proc.pid, signal.SIGCONT); stopped = False
                 resource.append({"label": label, "action": "resume", "aggregate_cpu_percent": usage})
-        if time.monotonic() - started > 180:
+            if time.monotonic() - started > 180:
+                terminate_process_tree(proc)
+                break
+        stdout, stderr = proc.communicate(timeout=10)
+        resource.append({"label": label, "maximum_aggregate_cpu_percent": maximum})
+    else:
+        try:
+            stdout, stderr = proc.communicate(timeout=180)
+        except subprocess.TimeoutExpired:
             terminate_process_tree(proc)
-            break
-    stdout, stderr = proc.communicate(timeout=10)
+            stdout, stderr = proc.communicate(timeout=10)
+        resource.append({"label": label, "cpu_guard": False})
     (output / (label + ".stdout")).write_text(stdout)
     (output / (label + ".stderr")).write_text(stderr)
-    resource.append({"label": label, "maximum_aggregate_cpu_percent": maximum})
     return {"label": label, "status": proc.returncode, "stdout": stdout, "stderr": stderr,
             "seconds": time.monotonic() - started, "argv": command}
+
+
+def run_groups(groups, execute):
+    """Run independent case groups bounded by test_jobs(); report in plan order.
+
+    Each group is a sequence of dependent phases (compile, then its runs), so
+    only whole groups overlap. The first failing group in plan order raises."""
+    with ThreadPoolExecutor(max_workers=test_jobs()) as pool:
+        futures = [pool.submit(execute, group) for group in groups]
+        return [future.result() for future in futures]
 
 def main():
     p = argparse.ArgumentParser()
@@ -117,41 +143,56 @@ def main():
     historical = "rc_cycle_edge_insert" not in (ROOT/"runtime/minyar_cycles.h").read_text()
     report["historical_barrier_adapter"] = historical
     report["bounded_heap_bytes"] = 4194304 if args.fixture == "cycle-registry-growth.c" else 1048576
+    groups = []
+    for profile in profiles:
+        for budget in ([32] if profile == "eager" else args.budgets):
+            label = profile+"-k"+str(budget)
+            binary = out/(label+(".exe" if windows_host() else ""))
+            command = [os.environ.get("MINYAR_TEST_CLANG","clang"), *flags, "-std=c11",
+                       "-Wall","-Wextra","-Werror","-iquote",str(ROOT/"runtime"),
+                       *options[profile], "-DMINYAR_BOUNDED_HEAP_BYTES="+str(
+                           4194304 if args.fixture == "cycle-registry-growth.c" else 1048576),
+                       "-DMINYAR_RC_POLL_BUDGET="+str(budget)]
+            if historical:
+                command.append("-Drc_cycle_edge_insert=rc_cycle_edge_add")
+            command += [str(ROOT/"tests"/args.fixture),"-lm","-o",str(binary)]
+            phases = [("compile", command)]
+            for n in args.nodes:
+                if args.fixture == "cycle-detached-first-insertion.c":
+                    for phase in (1, 2, 3):
+                        for copied in (0, 1):
+                            phases.append((f"run-n{n}-detached-p{phase}-copy{copied}",
+                                           [str(binary), str(n), "detached", str(phase), str(copied)]))
+                        for mode in ("internal", "exposed", "registered-descendant", "self-cycle"):
+                            phases.append((f"run-n{n}-{mode}-p{phase}",
+                                           [str(binary), str(n), mode, str(phase), "1"]))
+                        if phase >= 2:
+                            phases.append((f"run-n{n}-anchor-take-p{phase}",
+                                           [str(binary), str(n), "anchor-take", str(phase), "0"]))
+                else:
+                    phases.append((f"run-n{n}", [str(binary), str(n), args.case]))
+            groups.append((label, binary, phases))
+
+    def execute(group):
+        label, binary, phases = group
+        cases, resources, binary_sha256 = [], [], None
+        for phase, argv in phases:
+            case = run(argv, environment, out, label+"-"+phase, resources)
+            if binary.is_file():
+                binary_sha256 = binary_sha256 or hashlib.sha256(binary.read_bytes()).hexdigest()
+                case["binary_sha256"] = binary_sha256
+            cases.append(case)
+            print(case["label"]+": "+str(case["status"])+" "+case["stderr"].strip(),flush=True)
+            if case["status"]: return cases, resources, case["label"]
+        return cases, resources, None
+
     try:
-        for profile in profiles:
-            for budget in ([32] if profile == "eager" else args.budgets):
-                label = profile+"-k"+str(budget)
-                binary = out/(label+(".exe" if windows_host() else ""))
-                command = [os.environ.get("MINYAR_TEST_CLANG","clang"), *flags, "-std=c11",
-                           "-Wall","-Wextra","-Werror","-iquote",str(ROOT/"runtime"),
-                           *options[profile], "-DMINYAR_BOUNDED_HEAP_BYTES="+str(
-                               4194304 if args.fixture == "cycle-registry-growth.c" else 1048576),
-                           "-DMINYAR_RC_POLL_BUDGET="+str(budget)]
-                if historical:
-                    command.append("-Drc_cycle_edge_insert=rc_cycle_edge_add")
-                command += [str(ROOT/"tests"/args.fixture),"-lm","-o",str(binary)]
-                phases = [("compile", command)]
-                for n in args.nodes:
-                    if args.fixture == "cycle-detached-first-insertion.c":
-                        for phase in (1, 2, 3):
-                            for copied in (0, 1):
-                                phases.append((f"run-n{n}-detached-p{phase}-copy{copied}",
-                                               [str(binary), str(n), "detached", str(phase), str(copied)]))
-                            for mode in ("internal", "exposed", "registered-descendant", "self-cycle"):
-                                phases.append((f"run-n{n}-{mode}-p{phase}",
-                                               [str(binary), str(n), mode, str(phase), "1"]))
-                            if phase >= 2:
-                                phases.append((f"run-n{n}-anchor-take-p{phase}",
-                                               [str(binary), str(n), "anchor-take", str(phase), "0"]))
-                    else:
-                        phases.append((f"run-n{n}", [str(binary), str(n), args.case]))
-                for phase, argv in phases:
-                    case = run(argv, environment, out, label+"-"+phase, report["resources"])
-                    if binary.is_file():
-                        case["binary_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
-                    report["cases"].append(case)
-                    print(case["label"]+": "+str(case["status"])+" "+case["stderr"].strip(),flush=True)
-                    if case["status"]: raise AssertionError(case["label"])
+        failures = []
+        for cases, resources, failed in run_groups(groups, execute):
+            report["cases"] += cases
+            report["resources"] += resources
+            if failed: failures.append(failed)
+        if failures: raise AssertionError(", ".join(failures))
         report["passed"] = True
     finally:
         (out/"manifest.json").write_text(json.dumps(report,indent=2)+"\n")

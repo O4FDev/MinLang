@@ -35,6 +35,8 @@ class MutationScoreHarness(unittest.TestCase):
                     [subprocess.CompletedProcess([], 0)] * len(mutation_score.CHECKS) + list(outcomes)
                     if baseline else outcomes)),
                 patch.object(sys, "argv", ["mutation-score.py", "--minimum-score", str(minimum)]),
+                # The mocked results are consumed in campaign order, so run one job.
+                patch.dict(mutation_score.os.environ, {"MINYAR_TEST_JOBS": "1"}),
                 contextlib.redirect_stdout(output),
                 contextlib.redirect_stderr(error),
             ):
@@ -143,6 +145,36 @@ class MutationScoreHarness(unittest.TestCase):
                 self.assertTrue(row.get("compiler_source", "").endswith("/compiler.min"))
             elif row["phase"].endswith(":test"):
                 self.assertTrue(row.get("compiler_source", "").endswith("/mutant-0.min"))
+
+    def test_concurrent_mutants_keep_campaign_order_and_private_scratch(self):
+        source = "if 1 == 2 {}\nif 3 == 4 {}\nif 5 == 6 {}"
+        def outcome(command, env=None):
+            if env is None:  # mutant build and link
+                return subprocess.CompletedProcess(command, 0)
+            # Only mutant-1 is killed, by its first suite.
+            return subprocess.CompletedProcess(command, int(env["MINYAR_TEST_COMPILER"].endswith("mutant-1")))
+        with tempfile.TemporaryDirectory(prefix="minyar-mutation-harness-") as directory:
+            root = Path(directory)
+            (root / "compiler.min").write_text(source)
+            with (
+                patch.object(mutation_score, "ROOT", root),
+                patch.object(mutation_score, "SOURCE", root / "compiler.min"),
+                patch.object(mutation_score, "run", side_effect=outcome),
+                patch.object(sys, "argv", ["mutation-score.py"]),
+                patch.dict(mutation_score.os.environ, {"MINYAR_TEST_JOBS": "3"}),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                status = mutation_score.main()
+            report = json.loads((root / "build/mutation-score.json").read_text())
+        self.assertEqual(status, 0)
+        self.assertEqual([row["outcome"] for row in report["outcomes"]], ["survived", "killed", "survived"])
+        self.assertEqual([row["line"] for row in report["outcomes"]], [1, 2, 3])
+        phases = [row["phase"] for row in report["commands"]]
+        self.assertEqual(phases[:len(mutation_score.CHECKS)], ["baseline"] * len(mutation_score.CHECKS))
+        self.assertEqual(sorted(phases[len(mutation_score.CHECKS):], key=lambda phase: phase.split("-")[1]),
+                         phases[len(mutation_score.CHECKS):])
+        fuzz = [row["command"] for row in report["commands"] if row["command"][1:2] == ["tests/fuzz.py"]]
+        self.assertEqual(len({command[-1] for command in fuzz}), len(fuzz))
 
     def test_campaign_includes_internal_units_and_parameter_optimization(self):
         scripts = {command[1] for command in mutation_score.CHECKS}
