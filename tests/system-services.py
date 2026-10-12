@@ -5,12 +5,14 @@ import argparse
 from pathlib import Path
 import subprocess
 import tempfile
-from clang_helpers import clang_command, windows_host, launcher_command
+from clang_helpers import clang_command, windows_host
+from system_test_build import build_language
 
 ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--language', action='store_true', help='compile language regression (run on Boat)')
 parser.add_argument('--mode', choices=('native', 'sanitize'), default='native')
+parser.add_argument('--prebuilt', action='store_true', help='preserve admitted compiler/runtime bytes without bootstrap')
 options = parser.parse_args()
 with tempfile.TemporaryDirectory(prefix='minyar-system-services-') as directory:
     binary = Path(directory) / ('services.exe' if windows_host() else 'services')
@@ -31,7 +33,7 @@ with tempfile.TemporaryDirectory(prefix='minyar-system-services-') as directory:
         print(f'system {case}: passed', flush=True)
     if options.language:
         source = ROOT/'tests/system-services.min'
-        subprocess.run([*launcher_command(ROOT), source, '-o', binary], check=True, timeout=120)
+        build_language(ROOT, source, binary, prebuilt=options.prebuilt, sanitize=options.mode == 'sanitize')
         result = subprocess.run([binary], env=environment, capture_output=True, timeout=10)
         assert result.returncode == 0, result.stderr
         assert result.stdout == b'system services: passed\n', result.stdout

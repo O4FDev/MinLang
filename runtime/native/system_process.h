@@ -295,8 +295,12 @@ static int system_posix_spawn(SystemProcess *process, const char *path, char **a
         SystemSpawnChdir chdir_action = (SystemSpawnChdir)dlsym(RTLD_DEFAULT, "posix_spawn_file_actions_addchdir");
         if (!chdir_action) chdir_action = (SystemSpawnChdir)dlsym(RTLD_DEFAULT, "posix_spawn_file_actions_addchdir_np");
         error = chdir_action ? chdir_action(&actions, cwd) : ENOTSUP;
-#elif defined(__GLIBC__) && __GLIBC_PREREQ(2, 29)
+#elif defined(__GLIBC__) && defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 29)
         error = posix_spawn_file_actions_addchdir_np(&actions, cwd);
+#else
+        error = ENOTSUP;
+#endif
 #else
         error = ENOTSUP;
 #endif
