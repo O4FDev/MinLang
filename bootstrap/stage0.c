@@ -607,7 +607,8 @@ static Expression *parse_atom(Parser *parser) {
         advance(parser);
         while (parser->token.kind != ']') {
             arrput(expression->arguments, parse_expression(parser));
-            if (parser->token.kind != ',') break;
+            if (parser->token.kind != ',')
+                break;
             advance(parser);
         }
         expect(parser, ']', "a closing bracket for this list");
@@ -795,7 +796,8 @@ static Statement parse_statement(Parser *parser) {
             free(statement.expression);
         } else {
             statement.kind = statement.expression->kind == EXPRESSION_INDEX
-                                 ? STATEMENT_INDEX_ASSIGN : STATEMENT_FIELD_ASSIGN;
+                                 ? STATEMENT_INDEX_ASSIGN
+                                 : STATEMENT_FIELD_ASSIGN;
             statement.target = statement.expression;
         }
         advance(parser);
@@ -1234,10 +1236,12 @@ static Type check_expression(Program *program, Function *function, Expression *e
         if (arrlen(expression->arguments)) {
             left = check_expression(program, function, expression->arguments[0]);
             if (left < TYPE_INTEGER || left > TYPE_BOOLEAN)
-                fail_at(expression->line, expression->column, "bootstrap List elements must be scalar or Text");
+                fail_at(expression->line, expression->column,
+                        "bootstrap List elements must be scalar or Text");
             Type inferred = TYPE_LIST_INTEGER + left - TYPE_INTEGER;
             if (expression->type != TYPE_UNKNOWN && expression->type != inferred)
-                fail_at(expression->line, expression->column, "this List literal has a different element type");
+                fail_at(expression->line, expression->column,
+                        "this List literal has a different element type");
             expression->type = inferred;
             for (index = 1; index < (size_t)arrlen(expression->arguments); index++)
                 require_type(expression->arguments[index],
@@ -1365,7 +1369,8 @@ static void check_statements(Program *program, Function *function, Statement *st
         case STATEMENT_FIELD_ASSIGN: {
             Type target = check_expression(program, function, statement->target);
             if (statement->target->left->type < TYPE_RECORD_START)
-                fail_at(statement->line, statement->column, "only record fields can receive a new value");
+                fail_at(statement->line, statement->column,
+                        "only record fields can receive a new value");
             type = check_expression(program, function, statement->expression);
             if (type != target)
                 fail_at(statement->line, statement->column, "this field contains %s, not %s",
@@ -1709,10 +1714,12 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
             if (right.type != TYPE_INTEGER) {
                 temporary = new_temporary(emitter);
                 fprintf(output, "  %%value.%d = %s %s %s to i64\n", temporary,
-                        right.type == TYPE_TEXT ? "ptrtoint" : "zext", llvm_type(right.type), right.name);
+                        right.type == TYPE_TEXT ? "ptrtoint" : "zext", llvm_type(right.type),
+                        right.name);
                 right = make_value(TYPE_INTEGER, "%%value.%d", temporary);
             }
-            fprintf(output, "  call void @minyar_list_add(ptr %%value.%d, i64 %s)\n", object, right.name);
+            fprintf(output, "  call void @minyar_list_add(ptr %%value.%d, i64 %s)\n", object,
+                    right.name);
         }
         return make_value(expression->type, "%%value.%d", object);
     }
