@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real mTLS grpcio -> Minyar edge -> independent signed-grant Go device."""
 import argparse
+import base64
 import hashlib
 import json
 from pathlib import Path
@@ -20,6 +21,11 @@ def rpc(ch):
     return ch.stream_stream(peer.PATH,request_serializer=peer.Request.SerializeToString,response_deserializer=peer.Response.FromString)
 def opened(token,conn,exit='exit-a'):
     return peer.Request(open=peer.Open(dial_grant=token,exit_id=exit,conn_id=conn))
+def corrupt_signature(token):
+    signing,encoded=token.rsplit(b'.',1)
+    signature=bytearray(base64.urlsafe_b64decode(encoded+b'=='))
+    signature[0]^=1
+    return signing+b'.'+base64.urlsafe_b64encode(signature).rstrip(b'=')
 def transfer(lab,r,conn,payload=b'',target='echo.example',timeout=4):
     token=lab.signed(conn,target_host=target);admitted=threading.Event()
     def outgoing():
@@ -53,7 +59,7 @@ def run(lab, rounds=1024):
             ('wrong-exit',lab.signed('wrong-exit',exit_id='exit-b'),'exit-a',1),
             ('wrong-conn',lab.signed('different'),'exit-a',1),
             ('expired',lab.signed('expired',iat=int(time.time())-40,exp=int(time.time())-10),'exit-a',1),
-            ('wrong-key',lab.signed('wrong-key')[:-2]+b'AA', 'exit-a',1),
+            ('wrong-key',corrupt_signature(lab.signed('wrong-key')), 'exit-a',1),
             ('offline',lab.signed('offline',exit_id='exit-b'),'exit-b',2),
         ]:
             request_done=threading.Event()
