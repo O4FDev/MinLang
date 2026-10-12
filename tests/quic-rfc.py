@@ -129,6 +129,9 @@ def verify_result(kind, report, cases, binaries, source):
                     and row.get('reciprocal_epoch_secrets') is True
                     and row.get('client_stderr') == '' and row.get('server_stderr') == '',
                     'local endpoint assertion or sanitizer diagnostic failed')
+            if row.get('case') == 'rebind-routes':
+                require(exact_integer(row.get('rebound_routes'), minimum=12),
+                        'repeated rebinding did not exceed the old route bound')
             preferred = {
                 'preferred': 'QNS authenticated preferred address ipv4=7f000001:44301 ipv6=00000000000000000000000000000000:0',
                 'preferred-ipv6': 'QNS authenticated preferred address ipv4=00000000:0 ipv6=00000000000000000000000000000001:44301',
@@ -285,7 +288,7 @@ def verify_case_invocation(kind, case, command, endpoint, roles, directory, bina
         mapping = {'multiplex1999': 'transfer', 'multiconnect50': 'multiconnect',
                    'ipv6': 'transfer', 'preferred': 'connectionmigration',
                    'preferred-ipv6': 'connectionmigration',
-                   'resumption40': 'resumption', 'zerortt40': 'zerortt',
+                   'resumption40': 'resumption', 'zerortt40': 'zerortt', 'rebind-routes': 'transfer',
                    'keyupdate': 'keyupdate', 'chacha20': 'chacha20'}
         require(case in mapping, 'unknown local endpoint case')
         testcase = mapping[case]
@@ -293,7 +296,8 @@ def verify_case_invocation(kind, case, command, endpoint, roles, directory, bina
             50 if case == 'multiconnect50' else 40 if case in ('resumption40', 'zerortt40') else 1)
         names = ['file' + str(index) for index in range(count)]
         expected = [str(binaries['client'].resolve()), fixture('root.der'),
-                    '::1' if case in ('ipv6', 'preferred-ipv6') else '127.0.0.1', '44300',
+                    '::1' if case in ('ipv6', 'preferred-ipv6') else '127.0.0.1',
+                    '44302' if case == 'rebind-routes' else '44300',
                     str(workspace / (case + '-client.keys')),
                     str(workspace / (case + '-downloads')), testcase, *names]
         expected_server = [str(binaries['server'].resolve()), fixture('server.pk8'),
