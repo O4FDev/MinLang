@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import platform
 import shlex
+import subprocess
 import sys
 import tempfile
 import time
@@ -154,22 +155,123 @@ class PeerResult(unittest.TextTestResult):
                     failures=[dict(test=test.id(), detail=detail) for test, detail in self.failures])
 
 
+def write_report(result, stream):
+    directory = Path(os.environ.get('MINYAR_PEER_RESULTS', ROOT / 'build/peer-results'))
+    directory.mkdir(parents=True, exist_ok=True)
+    # Each invocation owns a separate file, including parallel agent runs.
+    with tempfile.NamedTemporaryFile(mode='w', prefix=Path(sys.argv[0]).stem + '-',
+                                     suffix='.json', dir=directory, delete=False) as output:
+        json.dump(result.report(), output, indent=2)
+        output.write('\n')
+        path = output.name
+    stream.writeln('Peer outcomes: ' + path)
+
+
 class PeerRunner(unittest.TextTestRunner):
     resultclass = PeerResult
 
     def run(self, test):
         result = super().run(test)
-        directory = Path(os.environ.get('MINYAR_PEER_RESULTS', ROOT / 'build/peer-results'))
-        directory.mkdir(parents=True, exist_ok=True)
-        # Each invocation owns a separate file, including parallel agent runs.
-        with tempfile.NamedTemporaryFile(mode='w', prefix=Path(sys.argv[0]).stem + '-',
-                                         suffix='.json', dir=directory, delete=False) as output:
-            json.dump(result.report(), output, indent=2)
-            output.write('\n')
-            path = output.name
-        self.stream.writeln('Peer outcomes: ' + path)
+        write_report(result, self.stream)
         return result
 
 
+class ShardRunner(unittest.TextTestRunner):
+    """Run one shard of a sharded invocation and hand its raw outcomes to the parent."""
+    resultclass = PeerResult
+
+    def run(self, test):
+        result = super().run(test)
+        Path(os.environ['MINYAR_PEER_SHARD']).write_text(json.dumps(dict(
+            observations=result.observations, fixture_skips=result.fixture_skips, tests_run=result.testsRun,
+            errors=[[test.id(), detail] for test, detail in result.errors],
+            failures=[[test.id(), detail] for test, detail in result.failures],
+            unexpected_successes=[test.id() for test in result.unexpectedSuccesses])))
+        return result
+
+
+class _Named:
+    def __init__(self, name):
+        self.name = name
+
+    def id(self):
+        return self.name
+
+    def __str__(self):
+        return self.name
+
+
+def _test_ids(suite):
+    for test in suite:
+        if isinstance(test, unittest.TestSuite):
+            yield from _test_ids(test)
+        else:
+            yield test.id()
+
+
+class ShardedProgram(unittest.TestProgram):
+    """Run the selected tests in up to MINYAR_TEST_JOBS processes and write one merged report.
+
+    Each case is independent (its own evidence workspace), so only wall time changes.
+    Shards are small and dealt round-robin, so slow neighbouring cases spread out.
+    """
+
+    def runTests(self):
+        jobs = int(os.environ.get('MINYAR_TEST_JOBS', '2'))
+        ids = list(_test_ids(self.test))
+        unloadable = [name for name in ids if not name.startswith('__main__.')]
+        if jobs <= 1 or len(ids) < 2 or unloadable:
+            self.testRunner = PeerRunner
+            return super().runTests()
+        stream = unittest.runner._WritelnDecorator(sys.stderr)
+        result = PeerResult(stream, True, self.verbosity)
+        count = min(len(ids), jobs * 4)
+        shards = [[name.split('.', 1)[1] for name in ids[index::count]] for index in range(count)]
+        flags = ['-v'] if self.verbosity > 1 else []
+        with tempfile.TemporaryDirectory(prefix='peer-shards-') as folder:
+            pending, running = list(enumerate(shards)), []
+            while pending or running:
+                while pending and len(running) < jobs:
+                    index, names = pending.pop(0)
+                    path = Path(folder) / f'shard-{index}.json'
+                    log = Path(folder) / f'shard-{index}.log'
+                    env = dict(os.environ, MINYAR_PEER_SHARD=str(path), MINYAR_TEST_JOBS='1')
+                    with log.open('wb') as output:
+                        process = subprocess.Popen([sys.executable, sys.argv[0], *flags, *names], env=env,
+                                                   stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
+                    running.append((index, path, log, process))
+                time.sleep(0.05)
+                for entry in [entry for entry in running if entry[3].poll() is not None]:
+                    running.remove(entry)
+                    index, path, log, process = entry
+                    stream.write(log.read_bytes().decode('utf-8', errors='replace'))
+                    stream.flush()
+                    if not path.is_file():
+                        name = f'{sys.argv[0]} shard {index}'
+                        result.errors.append((_Named(name), f'shard exited with status {process.returncode} '
+                                                            'before writing its outcomes'))
+                        continue
+                    shard = json.loads(path.read_text())
+                    result.observations += shard['observations']
+                    result.fixture_skips += shard['fixture_skips']
+                    result.testsRun += shard['tests_run']
+                    result.errors += [(_Named(name), detail) for name, detail in shard['errors']]
+                    result.failures += [(_Named(name), detail) for name, detail in shard['failures']]
+                    result.unexpectedSuccesses += [_Named(name) for name in shard['unexpected_successes']]
+        order = {name.split('.', 1)[1]: position for position, name in enumerate(ids)}
+        result.observations.sort(key=lambda row: order.get(row['test'].split('.', 1)[1], len(order)))
+        stream.writeln(unittest.TextTestResult.separator2)
+        stream.writeln(f'Ran {result.testsRun} tests in {len(shards)} shards over {jobs} processes '
+                       f'({time.monotonic() - result.started:.3f}s)')
+        stream.writeln('OK' if result.wasSuccessful() else
+                       f'FAILED (failures={len(result.failures)}, errors={len(result.errors)})')
+        write_report(result, stream)
+        self.result = result
+        if self.exit:
+            sys.exit(not result.wasSuccessful())
+
+
 def main():
-    unittest.main(testRunner=PeerRunner)
+    if os.environ.get('MINYAR_PEER_SHARD'):
+        unittest.main(testRunner=ShardRunner)
+    ShardedProgram()
