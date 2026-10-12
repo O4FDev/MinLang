@@ -29,7 +29,7 @@ def main():
     launch = ['wine'] if args.windows_cross else []
     if args.windows_cross and args.sanitize != 'none':
         parser.error('Windows cross/Wine fixtures do not qualify native sanitizers')
-    sources = ['thread-cache-debt.c'] if args.cache_debt_only else ['thread-buffers.c'] if args.buffers_only else ['thread-domain.c'] if args.domain_only else ['thread-domain.c', 'thread-cache-debt.c', 'thread-buffers.c', 'thread-runtime.c']
+    sources = ['thread-cache-debt.c'] if args.cache_debt_only else ['thread-buffers.c'] if args.buffers_only else ['thread-domain.c'] if args.domain_only else ['thread-domain.c', 'thread-cache-debt.c', 'thread-buffers.c', 'thread-runtime.c', 'thread-os.c']
     for source in sources:
         for cycles in (False, True):
             for bounded in (False, True):
