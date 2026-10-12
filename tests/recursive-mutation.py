@@ -86,7 +86,7 @@ def exercise(compiler: Path, name: str) -> subprocess.CompletedProcess[str]:
     environment['MINYAR_TEST_COMPILER'] = str(compiler)
     environment['MINYAR_TEST_RUNTIME'] = str(RUNTIME)
     environment['MINYAR_TEST_LINK_FLAGS'] = '-fsanitize=address,undefined'
-    environment['ASAN_OPTIONS'] = 'detect_leaks=0:halt_on_error=1'
+    environment['ASAN_OPTIONS'] = 'detect_leaks=0:halt_on_error=1:symbolize=0'
     environment['UBSAN_OPTIONS'] = 'halt_on_error=1:print_stacktrace=1'
     return run([sys.executable, str(ROOT / 'tests' / script), test],
                env=environment)
