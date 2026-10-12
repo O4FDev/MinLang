@@ -644,6 +644,12 @@ check-sanitize: check-redis-protocol-sanitize check-redis-pipeline-sanitize
 check-native-cache:
 	$(LIMITED) python3 tests/native-object-cache.py
 
+.PHONY: check-package-native-inputs
+check-package-native-inputs: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/package-native-inputs.py
+
+check check-portable: check-package-native-inputs
+
 check: check-native-cache
 check-portable: check-native-cache
 

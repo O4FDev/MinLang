@@ -5,6 +5,7 @@ Flag environment variables use shell-style quoting; no shell evaluates them.
 The launcher keeps configuration and temporary-file lifetime in one process.
 """
 import hashlib
+import argparse
 import json
 import os
 from pathlib import Path
@@ -103,6 +104,39 @@ def native_object(project, clang, base, name, compile_flags):
         finally:
             Path(temporary).unlink(missing_ok=True)
     return str(output)
+
+
+def package_native_inputs(arguments):
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--native-source', action='append', default=[])
+    parser.add_argument('--native-object', action='append', default=[])
+    options = parser.parse_args(arguments)
+    inputs = {}
+    for kind, values in (('source', options.native_source), ('object', options.native_object)):
+        for value in values:
+            name, separator, filename = value.partition('=')
+            if not separator or not re.fullmatch(r'[A-Za-z0-9_]+', name) or not filename:
+                raise ValueError(f'native {kind} requires NAME=FILE: {value}')
+            path = host_path(filename).resolve()
+            suffixes = ('.c', '.m') if kind == 'source' else ('.o', '.a', '.obj', '.lib')
+            if path.suffix not in suffixes or not path.is_file():
+                raise ValueError(f'native {kind} must be a readable {", ".join(suffixes)} file: {path}')
+            inputs.setdefault(name, []).append((kind, path))
+    return inputs
+
+
+def link_package_inputs(project, clang, native_flags, inputs, libraries, native, link):
+    with tempfile.TemporaryDirectory(prefix='minyar-package-native-') as temporary:
+        for name in sorted(libraries & inputs.keys()):
+            for kind, path in inputs[name]:
+                if kind == 'source':
+                    output = Path(temporary) / f'{len(native)}.o'
+                    run([clang, *native_flags, '-iquote', str(project / 'runtime'),
+                         '-c', str(path), '-o', str(output)])
+                    native.append(str(output))
+                else:
+                    native.append(str(path))
+        link(native)
 
 
 def cycle_runtime_object(project, clang, runtime, release, link_flags):
@@ -478,11 +512,17 @@ def main():
     if len(sys.argv) >= 4 and sys.argv[1] == 'compile':
         run([clang, *flags('MINYAR_RUNTIME_FLAGS', '-O2 -Wno-override-module'), *sys.argv[2:]])
         return
-    if len(sys.argv) not in (7, 8, 9) or sys.argv[1] != 'link':
+    if len(sys.argv) < 7 or sys.argv[1] != 'link':
         raise ValueError('usage: clang-driver.py compile ARGS... | link PROJECT IR RUNTIME OUTPUT RELEASE')
     project, llvm, runtime, output, release = sys.argv[2:7]
     debug = len(sys.argv) >= 8 and sys.argv[7] == '1'
-    source = sys.argv[8] if len(sys.argv) == 9 else None
+    source = sys.argv[8] if len(sys.argv) >= 9 else None
+    package_inputs = package_native_inputs(sys.argv[9:])
+    output_path = host_path(output)
+    for inputs in package_inputs.values():
+        for _, path in inputs:
+            if path == output_path.resolve() or (output_path.exists() and path.samefile(output_path)):
+                raise ValueError(f'refusing to replace a native input; choose a different -o path: {output}')
     project = host_path(project)
     link_flags = flags('MINYAR_CLANG_FLAGS', '-O2 -Wno-override-module' if release == '1'
                        else ('-O0 -g -Wno-override-module' if debug else '-O2 -Wno-override-module'))
@@ -505,10 +545,12 @@ def main():
     if {'macos', 'net'} <= libraries or {'windows', 'net'} <= libraries:
         native_flags = [*native_flags, '-DMINYAR_APP_EVENT_LOOP=1']
     base = clang_identity(clang) if libraries - {'machine', 'machine_arm64'} else None
-    if libraries & {'securecrypto', 'update'}:
+    if (libraries - package_inputs.keys()) & {'securecrypto', 'update'}:
         native += [native_object(project, clang, base, 'update_monocypher.c', native_flags)]
     for library in sorted(libraries):
-        if library == 'graphics':
+        if library in package_inputs:
+            continue
+        elif library == 'graphics':
             native += graphics(project, clang, base, native_flags)
         elif library == 'macos':
             if platform.system() != 'Darwin':
@@ -571,9 +613,9 @@ def main():
             native += [native_object(project, clang, base, 'quicinteropio.c', native_flags)]
         elif library in ('sha256', 'tararchive'):
             from format_provider import format_provider
-            cflags, libraries = format_provider(library, clang, native_flags, link_flags)
+            cflags, provider_libraries = format_provider(library, clang, native_flags, link_flags)
             native += [native_object(project, clang, base, library + '.c',
-                                     [*native_flags, *cflags]), *libraries]
+                                     [*native_flags, *cflags]), *provider_libraries]
         elif library == 'aes':
             native += [native_object(project, clang, base, 'aes.c', native_flags)]
             if platform.system() == 'Windows' or platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
@@ -624,7 +666,9 @@ def main():
             raise ValueError(f'the program uses an unknown native library: {library}')
     lto = lto_flags(clang, link_flags) if release == '1' else []
     math_libraries = [] if platform.system() == 'Darwin' else ['-lm']
-    link_program(clang, link_flags, lto, llvm, runtime, native, math_libraries, output, source)
+    link_package_inputs(project, clang, native_flags, package_inputs, libraries, native,
+                        lambda objects: link_program(clang, link_flags, lto, llvm, runtime,
+                                                     objects, math_libraries, output, source))
 
 
 if __name__ == '__main__':

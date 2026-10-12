@@ -68,6 +68,7 @@ TARGETS = ['check-raw-syscall-linux-native', 'check-raw-syscall-sanitize', 'chec
            'check-ownership-mutation', 'check-scalar-record-initialization',
            'check-incremental-modules', 'check-incremental-modules-sanitize',
            'check-sanitize']
+TARGETS += ['check-package-native-inputs']
 TIERS = ('full', 'sanitize', 'all')
 # Scheduling hints only: seconds measured serially on an 8-core Linux host.
 EXPECTED_SECONDS = {
