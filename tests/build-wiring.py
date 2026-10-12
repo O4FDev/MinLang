@@ -2227,5 +2227,39 @@ class BuildWiring(unittest.TestCase):
                 verify(fragment.replace('$(ROOT)/' + name, '', 1))
 
 
+    def test_relay_wrong_key_changes_decoded_signature_even_with_aa_tail(self):
+        import base64
+        tree = ast.parse((ROOT / 'tests/peer-edge-relay.py').read_text())
+        run = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'run')
+        request = next(node.elts[1] for node in ast.walk(run)
+                       if isinstance(node, ast.Tuple) and len(node.elts) == 4
+                       and isinstance(node.elts[0], ast.Constant) and node.elts[0].value == 'wrong-key')
+        helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                   and node.name == 'corrupt_signature']
+        namespace = {'base64': base64}
+        exec(compile(ast.Module(body=helpers, type_ignores=[]), '<relay helper>', 'exec'), namespace)
+        expression = compile(ast.Expression(body=request), '<wrong-key request>', 'eval')
+        for last in range(256):
+            signature = bytes(range(63)) + bytes([last])
+            token = b'e30.e30.' + base64.urlsafe_b64encode(signature).rstrip(b'=')
+            if last == 0:
+                self.assertTrue(token.endswith(b'AA'))
+            class Lab:
+                def signed(self, connection):
+                    self.assert_connection = connection
+                    return token
+            lab = Lab()
+            changed = eval(expression, namespace, {'lab': lab})
+            with self.subTest(last_signature_byte=last):
+                self.assertEqual(lab.assert_connection, 'wrong-key')
+                self.assertNotEqual(changed, token, 'wrong-key control left a valid grant unchanged')
+                prefix, encoded = changed.rsplit(b'.', 1)
+                self.assertEqual(prefix, token.rsplit(b'.', 1)[0])
+                decoded = base64.urlsafe_b64decode(encoded + b'==')
+                self.assertEqual(len(decoded), len(signature))
+                self.assertNotEqual(decoded, signature)
+                self.assertEqual(encoded, base64.urlsafe_b64encode(decoded).rstrip(b'='))
+
+
 if __name__ == '__main__':
     unittest.main()
