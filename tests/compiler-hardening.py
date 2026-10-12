@@ -404,9 +404,9 @@ return 0
         self.executes("function main() {\nprint(Integer('a'))\nprint(Integer(Character(128578)))\nprint(Integer(42))\nreturn 0\n}\n",
                       '97\n128578\n42\n')
         self.rejects('function main() {\nprint(Integer())\nreturn 0\n}\n',
-                     'Integer expects exactly one Integer or Character value')
-        self.rejects('function main() {\nprint(Integer("text"))\nreturn 0\n}\n',
-                     'Integer expects an Integer or Character value')
+                     'Integer expects exactly one Integer, Character, or Text value')
+        self.rejects('function main() {\nprint(Integer(true))\nreturn 0\n}\n',
+                     'Integer expects an Integer, Character, or Text value')
 
 
 if __name__ == '__main__':

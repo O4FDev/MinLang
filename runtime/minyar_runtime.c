@@ -942,6 +942,8 @@ MinyarText *minyar_text_slice(MinyarText *text, long long start, long long end) 
 #endif
 }
 
+#include "minyar_text.h"
+
 static MINYAR_COLD MinyarText *format_integer_text(long long integer) {
     char buffer[32];
     char *end = buffer + sizeof(buffer);

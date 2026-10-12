@@ -166,6 +166,7 @@ typedef struct {
     int next_label;
     int sort_used;
     char current_block[64];
+    unsigned text_features;
 } Emitter;
 
 typedef struct {
@@ -1081,11 +1082,11 @@ static Type check_expression(Program *program, Function *function, Expression *e
         if (strcmp(expression->text, "Integer") == 0) {
             if (arrlen(expression->arguments) != 1)
                 fail_at(expression->line, expression->column,
-                        "Integer expects exactly one Integer or Character value");
+                        "Integer expects exactly one Integer, Character, or Text value");
             left = check_expression(program, function, expression->arguments[0]);
-            if (left != TYPE_INTEGER && left != TYPE_CHARACTER)
+            if (left != TYPE_INTEGER && left != TYPE_CHARACTER && left != TYPE_TEXT)
                 fail_at(expression->line, expression->column,
-                        "Integer expects an Integer or Character value");
+                        "Integer expects an Integer, Character, or Text value");
             return expression->type = TYPE_INTEGER;
         }
         if (strcmp(expression->text, "joinText") == 0) {
@@ -1227,6 +1228,20 @@ static Type check_expression(Program *program, Function *function, Expression *e
     case EXPRESSION_METHOD_CALL:
         left = check_expression(program, function, expression->left);
         if (left == TYPE_TEXT) {
+            if (!strcmp(expression->text, "trim")) {
+                if (arrlen(expression->arguments))
+                    fail_at(expression->line, expression->column, "Text.trim expects no arguments");
+                return expression->type = TYPE_TEXT;
+            }
+            if (!strcmp(expression->text, "find") || !strcmp(expression->text, "split") ||
+                !strcmp(expression->text, "startsWith") || !strcmp(expression->text, "endsWith")) {
+                if (arrlen(expression->arguments) != 1)
+                    fail_at(expression->line, expression->column, "Text.%s expects one Text argument", expression->text);
+                right = check_expression(program, function, expression->arguments[0]);
+                require_type(expression->arguments[0], right, TYPE_TEXT, "the Text method argument");
+                return expression->type = !strcmp(expression->text, "find") ? TYPE_INTEGER :
+                    !strcmp(expression->text, "split") ? TYPE_LIST_TEXT : TYPE_BOOLEAN;
+            }
             if (strcmp(expression->text, "slice") != 0)
                 fail_at(expression->line, expression->column,
                         "Text does not provide the '%s' operation", expression->text);
@@ -1247,6 +1262,11 @@ static Type check_expression(Program *program, Function *function, Expression *e
             if (arrlen(expression->arguments) != 0)
                 fail_at(expression->line, expression->column, "List.%s expects no arguments", expression->text);
             return expression->type = !strcmp(expression->text, "sorted") ? left : TYPE_NOTHING;
+        }
+        if (!strcmp(expression->text, "clear")) {
+            if (arrlen(expression->arguments))
+                fail_at(expression->line, expression->column, "List.clear expects no arguments");
+            return expression->type = TYPE_NOTHING;
         }
         if (strcmp(expression->text, "add") != 0)
             fail_at(expression->line, expression->column,
@@ -1512,6 +1532,12 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
         }
         if (strcmp(expression->text, "Integer") == 0) {
             Value value = arguments[0];
+            if (value.type == TYPE_TEXT) {
+                emitter->text_features |= 32;
+                temporary = new_temporary(emitter);
+                fprintf(output, "  %%value.%d = call i64 @minyar_text_integer(ptr %s)\n", temporary, value.name);
+                value = make_value(TYPE_INTEGER, "%%value.%d", temporary);
+            }
             if (value.type == TYPE_CHARACTER) {
                 temporary = new_temporary(emitter);
                 fprintf(output, "  %%value.%d = zext i32 %s to i64\n", temporary, value.name);
@@ -1643,6 +1669,19 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
         return make_value(expression->type, "%%value.%d", temporary);
     case EXPRESSION_METHOD_CALL:
         left = emit_expression(emitter, expression->left);
+        if (expression->left->type == TYPE_TEXT && strcmp(expression->text, "slice")) {
+            const char *name = !strcmp(expression->text, "startsWith") ? "starts_with" :
+                               !strcmp(expression->text, "endsWith") ? "ends_with" : expression->text;
+            emitter->text_features |= !strcmp(name, "find") ? 1 : !strcmp(name, "split") ? 2 :
+                                      !strcmp(name, "starts_with") ? 4 : !strcmp(name, "ends_with") ? 8 : 16;
+            if (arrlen(expression->arguments)) right = emit_expression(emitter, expression->arguments[0]);
+            temporary = new_temporary(emitter);
+            fprintf(output, "  %%value.%d = call %s%s @minyar_text_%s(ptr %s", temporary,
+                    expression->type == TYPE_BOOLEAN ? "zeroext " : "", llvm_type(expression->type), name, left.name);
+            if (arrlen(expression->arguments)) fprintf(output, ", ptr %s", right.name);
+            fputs(")\n", output);
+            return make_value(expression->type, "%%value.%d", temporary);
+        }
         if (expression->left->type == TYPE_TEXT) {
             Value end;
             right = emit_expression(emitter, expression->arguments[0]);
@@ -1663,6 +1702,11 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
             fprintf(output, "  %%value.%d = call ptr @minyar_list_sorted(ptr %s, i64 %d, i64 %d)\n",
                     temporary, left.name, kind, kind == TYPE_TEXT);
             return make_value(expression->type, "%%value.%d", temporary);
+        }
+        if (!strcmp(expression->text, "clear")) {
+            emitter->text_features |= 64;
+            fprintf(output, "  call void @minyar_list_clear(ptr %s)\n", left.name);
+            return make_value(TYPE_NOTHING, "");
         }
         right = emit_expression(emitter, expression->arguments[0]);
         if (right.type != TYPE_INTEGER) {
@@ -2043,6 +2087,13 @@ static void emit_program(FILE *output, Program *program) {
     if (emitter.sort_used)
         fputs("declare void @minyar_list_sort(ptr, i64)\n"
               "declare ptr @minyar_list_sorted(ptr, i64, i64)\n", output);
+    if (emitter.text_features & 1) fputs("declare i64 @minyar_text_find(ptr, ptr)\n", output);
+    if (emitter.text_features & 2) fputs("declare ptr @minyar_text_split(ptr, ptr)\n", output);
+    if (emitter.text_features & 4) fputs("declare zeroext i1 @minyar_text_starts_with(ptr, ptr)\n", output);
+    if (emitter.text_features & 8) fputs("declare zeroext i1 @minyar_text_ends_with(ptr, ptr)\n", output);
+    if (emitter.text_features & 16) fputs("declare ptr @minyar_text_trim(ptr)\n", output);
+    if (emitter.text_features & 32) fputs("declare i64 @minyar_text_integer(ptr)\n", output);
+    if (emitter.text_features & 64) fputs("declare void @minyar_list_clear(ptr)\n", output);
 }
 
 static char *read_file(const char *path) {

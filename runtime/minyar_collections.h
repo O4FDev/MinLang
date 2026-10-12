@@ -166,6 +166,22 @@ long long minyar_list_length(const MinyarList *list) {
     return list->length;
 }
 
+/* Keep the mutable List and its backing allocation available to every alias.
+ * Remove each visible slot before release: bounded RC may poll in release. */
+void minyar_list_clear(MinyarList *list) {
+#ifndef MINYAR_COMPILER_ARENA
+    if ((((RcObject *)list - 1)->ownership & 7) == RC_REFERENCES) {
+        while (list->length) {
+            long long value = list->values[--list->length];
+            list->values[list->length] = 0;
+            minyar_rc_release((void *)(uintptr_t)value);
+        }
+        return;
+    }
+#endif
+    list->length = 0;
+}
+
 static MINYAR_COLD MINYAR_NORETURN void list_position_stop(long long position, long long length) {
     char message[128];
     snprintf(message, sizeof(message), "List position %lld is outside its length of %lld.",

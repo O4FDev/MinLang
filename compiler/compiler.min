@@ -2630,6 +2630,63 @@ function sortComparatorThunk(names: List<Text>, type: Integer, element: Integer,
     return ""
 }
 
+function appendTextRuntimeDeclaration(globals: List<Text>, name: Text, returnType: Integer, count: Integer) {
+    let declaration = "declare "
+    if returnType == 4 { declaration = declaration + "zeroext " }
+    declaration = declaration + llvmType(returnType) + " @" + name + "(ptr"
+    if count == 2 { declaration = declaration + ", ptr" }
+    declaration = declaration + ")\n"
+    let position = 0
+    while position < globals.length {
+        if globals[position] == declaration { return }
+        position = position + 1
+    }
+    globals.add(declaration)
+}
+
+function isTextBasicMethod(member: Text): Boolean {
+    return member == "find" || member == "split" || member == "startsWith" || member == "endsWith" || member == "trim"
+}
+
+function parseTextBasicMethod(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, receiver: Text, receiverType: Integer, member: Text, resultType: List<Integer>): Text {
+    let values: List<Text> = []
+    let types: List<Integer> = []
+    values.add(receiver)
+    types.add(receiverType)
+    let runtimeName = "minyar_list_clear"
+    let returnType = 5
+    if receiverType == 2 {
+        runtimeName = "minyar_text_trim"
+        returnType = 2
+        if member != "trim" {
+            let argumentType: List<Integer> = []
+            argumentType.add(0)
+            let argument = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, argumentType)
+            if argumentType[0] != 2 { fail("Text." + member + " expects one Text argument") }
+            values.add(argument)
+            types.add(2)
+            runtimeName = "minyar_text_find"
+            returnType = 1
+            if member == "split" {
+                runtimeName = "minyar_text_split"
+                returnType = 100002
+            }
+            if member == "startsWith" {
+                runtimeName = "minyar_text_starts_with"
+                returnType = 4
+            }
+            if member == "endsWith" {
+                runtimeName = "minyar_text_ends_with"
+                returnType = 4
+            }
+        }
+    }
+    expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
+    setType(resultType, returnType)
+    appendTextRuntimeDeclaration(globals, runtimeName, returnType, values.length)
+    return emitCall(output, textState, state, returnType, runtimeName, values, types)
+}
+
 function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
     let atom = state[0]
     let scalarValues = -1
@@ -2708,6 +2765,10 @@ function parsePrimary(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLi
                 if receiverType == 8 {
                     value = parseBytesMethod(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, receiver, member, memberLocation, resultType)
                     ownsResult = resultType[0] == 8
+                } else {
+                if (receiverType == 2 && member != "slice" && isTextBasicMethod(member)) || (isListType(receiverType) && member == "clear") {
+                    value = parseTextBasicMethod(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, receiver, receiverType, member, resultType)
+                    ownsResult = isReferenceType(resultType[0])
                 } else {
                 let argumentType: List<Integer> = []
                 argumentType.add(0)
@@ -3808,8 +3869,11 @@ function emitNumericBuiltin(output: List<Text>, textState: List<Text>, state: Li
         if types.length == 1 && types[0] == 3 {
             return emitInstruction(output, textState, state, "zext i32 " + values[0] + " to i64")
         }
+        if types.length == 1 && types[0] == 2 {
+            return emitCall(output, textState, state, 1, "minyar_text_integer", values, types)
+        }
         if types.length != 1 || types[0] != 7 {
-            fail("Integer expects one Integer, Float, or Character argument")
+            fail("Integer expects one Integer, Float, Character, or Text argument")
         }
         return emitCall(output, textState, state, 1, ".minyar.float.integer.checked", values, types)
     }
@@ -4010,6 +4074,9 @@ function parseCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines
                             } else {
                                 if isNumericBuiltin(name) {
                                     value = emitNumericBuiltin(output, textState, state, name, argumentValues, argumentTypes, resultType)
+                                    if name == "Integer" && argumentTypes.length == 1 && argumentTypes[0] == 2 {
+                                        appendTextRuntimeDeclaration(globals, "minyar_text_integer", 1, 1)
+                                    }
                                 } else {
                                     let functionIndex = state[5]
                                     if functionIndex < 0 || functionNames[functionIndex] != name {
