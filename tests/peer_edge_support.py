@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import program_cache
 import queue
 import shutil
 import socket
@@ -16,6 +17,7 @@ def load(name,file):
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
 admission=load('edge_admission','peer-edge.py')
 auth=load('edge_signing','peer-auth.py')
+DEVICE=None
 def environment(sanitize=False):
     env=dict(os.environ,MINYAR_CLANG=os.environ.get('MINYAR_TEST_CLANG','clang'),GOMAXPROCS='1',GOFLAGS='-p=1')
     if sanitize:
@@ -28,6 +30,7 @@ def rss(pid):
     return int(next(line.split()[1] for line in text.splitlines() if line.startswith('VmRSS:')))
 class Lab:
     def __init__(self,directory,binary=None,sanitize=False,duration=20000,maximum=128,sanitizer_quarantine=None,pki=False,server_intermediate=True):
+        global DEVICE
         self.directory=Path(directory);self.directory.mkdir(parents=True,exist_ok=True)
         self.env=environment(sanitize)
         if sanitize and sanitizer_quarantine is not None:
@@ -39,9 +42,13 @@ class Lab:
         self.edge=None;self.redis=None;self.client=None
         self.binary=Path(binary) if binary else self.directory/'edge'
         if not binary:
-            subprocess.run([str(ROOT/'minyar'),str(ROOT/'examples/peer-edge.min'),'-o',str(self.binary)],env=self.env,check=True,timeout=240)
+            program_cache.build(ROOT/'examples/peer-edge.min',self.binary,self.env,lambda path:subprocess.run([str(ROOT/'minyar'),str(ROOT/'examples/peer-edge.min'),'-o',str(path)],env=self.env,check=True,timeout=240))
         self.device=self.directory/'device'
-        subprocess.run(['go','build','-trimpath','-o',str(self.device),'.'],cwd=ROOT/'tests/interop/peeredge',env=self.env,check=True,timeout=120)
+        # The Go device ignores Minyar build flags; one build serves every lab in a process.
+        if DEVICE is None or not DEVICE.is_file():
+            subprocess.run(['go','build','-trimpath','-o',str(self.device),'.'],cwd=ROOT/'tests/interop/peeredge',env=self.env,check=True,timeout=120)
+            DEVICE=self.device
+        else:shutil.copy2(DEVICE,self.device)
         self.certs=admission.fixtures.Certificates(self.directory)
         self.certs.root('ca')
         if pki:
@@ -67,7 +74,6 @@ class Lab:
                     registry.write(json.dumps(dict(role='gateway',sha256=hashlib.sha256(self.certs.path('gateway-'+label,'der').read_bytes()).hexdigest()))+'\n')
         (self.directory/'jwks.json').write_bytes(auth.jwks())
         if auth.KEY is None: auth.KEY=auth.OpenSSLSigner(self.directory)
-        with socket.socket() as reserved:reserved.bind(('127.0.0.1',0));self.redis_port=reserved.getsockname()[1]
         # The parent fd soak occupies ephemeral TCP tuples. Reserve a distinct
         # TCP+UDP port below that range, because the device shares both protocols.
         import random
@@ -79,11 +85,7 @@ class Lab:
                 self.listen_port=selected;break
             except OSError:continue
         else:raise AssertionError('no independent TCP/UDP lab port')
-        self.redis=subprocess.Popen(['redis-server','--bind','127.0.0.1','--port',str(self.redis_port),'--save','','--appendonly','no','--dir',str(self.directory)],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
-        def connect():
-            try:return admission.Redis(self.redis_port)
-            except OSError:return None
-        self.client=admission.eventually(connect)
+        self.start_redis()
         config=dict(host='127.0.0.1',device_port=self.listen_port,gateway_port=0,redis_host='127.0.0.1',redis_port=self.redis_port,edge_instance='localhost:0',edge_region='eu-west',max_connections=maximum,certificate=str(self.certs.path('server','der')),private_key=str(self.certs.path('server','pk8')),device_roots=str(self.certs.path('ca','der')),gateway_roots=str(self.certs.path('ca','der')),registry=str(self.registry),jwks=str(self.directory/'jwks.json'))
         if pki:
             config['certificate']=[str(self.certs.path('server','der'))]
@@ -114,6 +116,25 @@ class Lab:
                 if path.is_file() and path.suffix in ('.min','.c','.m','.h','.py'):
                     hashes[str(path.relative_to(ROOT))]=hashlib.sha256(path.read_bytes()).hexdigest()
         (self.directory/'source.json').write_text(json.dumps(dict(commit=commit,commit_source=commit_source if commit else 'git-free snapshot',source_sha256=hashlib.sha256((ROOT/'library/peeredge.min').read_bytes()).hexdigest(),sources_sha256=hashes,binary_sha256=hashlib.sha256(self.binary.read_bytes()).hexdigest(),launcher_sha256=hashlib.sha256((ROOT/'minyar').read_bytes()).hexdigest(),start=time.time(),pid=self.edge.pid,asan_options=self.env.get('ASAN_OPTIONS')),indent=2))
+    def start_redis(self):
+        # Redis cannot report an ephemeral port, so a released free port is
+        # passed in. Another process can take it first; prove the server that
+        # answers is our child, otherwise pick a fresh port.
+        for attempt in range(20):
+            with socket.socket() as reserved:reserved.bind(('127.0.0.1',0));self.redis_port=reserved.getsockname()[1]
+            self.redis=subprocess.Popen(['redis-server','--bind','127.0.0.1','--port',str(self.redis_port),'--save','','--appendonly','no','--dir',str(self.directory)],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+            def connect():
+                if self.redis.poll() is not None:return 'exited'
+                try:return admission.Redis(self.redis_port)
+                except OSError:return None
+            client=admission.eventually(connect)
+            if client!='exited':
+                info=client.command('INFO','server').decode()
+                if f'process_id:{self.redis.pid}\r\n' in info:self.client=client;return
+                client.close()
+            if self.redis.poll() is None:self.redis.terminate()
+            self.redis.communicate(timeout=5);self.redis=None
+        raise AssertionError('no Redis port owned by this lab')
     def diagnostic(self):
         if self.stderr and not self.stderr.closed:self.stderr.flush()
         return (self.directory/'edge.stderr').read_text()

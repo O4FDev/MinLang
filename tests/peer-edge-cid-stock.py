@@ -2,7 +2,7 @@
 """Actual authenticated edge routing for enlarged bounded CID inventories."""
 import argparse
 import json
-import os
+import subprocess
 from pathlib import Path
 import tempfile
 import time
@@ -19,17 +19,17 @@ def main():
         env=environment(args.sanitize);env['MAKEFLAGS']='-j1';client=directory/'client'
         client_env=dict(env,MINYAR_LINK_ARTIFACTS=str(directory/'client-link'))
         commands.command([ROOT/'minyar',ROOT/'tests/peer-edge-cid-stock.min','-o',client],directory,client_env,240)
+        # Cases differ only in edge configuration, so one edge build serves all.
+        binary=args.binary
+        if binary is None:
+            binary=directory/'edge'
+            subprocess.run([str(ROOT/'minyar'),str(ROOT/'examples/peer-edge.min'),'-o',str(binary)],env=dict(env,MINYAR_LINK_ARTIFACTS=str(directory/'edge-link')),check=True,timeout=240)
         results=[]
         for case in args.case or CASES:
             maximum=32768 if case=='maximum32768' else 1;limit=3 if case=='limit3' else 8
             lab=None
             try:
-                previous=os.environ.get('MINYAR_LINK_ARTIFACTS')
-                os.environ['MINYAR_LINK_ARTIFACTS']=str(directory/case/'edge-link')
-                try:lab=Lab(directory/case,args.binary,args.sanitize,duration=8000,maximum=maximum)
-                finally:
-                    if previous is None:os.environ.pop('MINYAR_LINK_ARTIFACTS',None)
-                    else:os.environ['MINYAR_LINK_ARTIFACTS']=previous
+                lab=Lab(directory/case,binary,args.sanitize,duration=8000,maximum=maximum)
                 for session in range(3):
                     output=commands.command([client,lab.certs.path('ca','der'),lab.certs.path('device','der'),
                         lab.certs.path('device','pk8'),lab.udp_port,limit],directory,env,10)

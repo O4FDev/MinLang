@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 from clang_helpers import windows_host
+import program_cache
 
 ROOT = Path(__file__).resolve().parents[1]
 BODY = 'Minyar spoke authenticated TLS 1.3: ' + 'é' * 3 + ' ' + 'x' * 40000
@@ -175,6 +176,10 @@ class Server:
 
 
 def compile_program(source, output):
+    program_cache.build(source, output, os.environ, lambda path: compile_uncached(source, path))
+
+
+def compile_uncached(source, output):
     command = [str(ROOT / 'minyar'), '--library', str(ROOT / 'library'), str(source), '-o', str(output)]
     if os.name == 'nt':
         shell = shutil.which('bash')
