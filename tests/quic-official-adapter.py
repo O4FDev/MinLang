@@ -273,11 +273,13 @@ def unsupported_control(root):
 def late_mutation_control(root):
     owner,_=setup(root);tree=owner.paths["fixture_root"]/"mutable";tree.mkdir()
     (tree/"a").write_bytes(b"original-a");(tree/"b").write_bytes(b"original-b")
-    retention=adapter.TreeRetention(root/"retained");real_copy=adapter.stream_binding
+    retention=adapter.TreeRetention(root/"retained");real_copy=adapter.stream_binding;copied=[]
     def copy(path,*args,**kwargs):
         result=real_copy(path,*args,**kwargs)
         copy_to=kwargs.get("copy_to",args[2] if len(args)>2 else None)
-        if Path(path).name=="b" and copy_to is not None:(tree/"a").write_bytes(b"changed-after-first-copy")
+        if copy_to is not None:
+            if copied:copied[0].write_bytes(b"changed-after-first-copy")
+            else:copied.append(Path(path))
         return result
     adapter.stream_binding=copy
     try:
@@ -508,15 +510,16 @@ def network_control(case,root):
     return {"status":"passed","checks":{"foreign_network_rejected":result["status"]=="failed","no_foreign_mutation":not daemon.read()["events"]}},"passed"
 
 def cli_descendant_control(case,root):
-    records=adapter.RawCommands(root/"commands");marker=root/"delayed-create.json";pidfile=root/"descendant.json";parentfile=root/"parent.json"
+    records=adapter.RawCommands(root/"commands");marker=root/"delayed-create.json";pidfile=root/"descendant.json";parentfile=root/"parent.json";permit=root/"create-permit"
     child=root/"plugin.py"
-    child.write_text("import json,os,sys,time\n"+("os.setsid()\n" if case=="raw-cli-escaped-descendant" else "")+"from pathlib import Path\nPath(sys.argv[2]).write_text(json.dumps({'pid':os.getpid(),'parent_pid':os.getppid()}))\ntime.sleep(.35)\nPath(sys.argv[1]).write_text(json.dumps({'mock_created_id':'2'*64,'owner':'controlled-only'}))\ntime.sleep(.15)\n")
-    argvchild=[sys.executable,str(child),str(marker),str(parentfile)]
+    child.write_text("import json,os,sys,time\n"+("os.setsid()\n" if case=="raw-cli-escaped-descendant" else "")+"from pathlib import Path\nPath(sys.argv[2]).write_text(json.dumps({'pid':os.getpid(),'parent_pid':os.getppid()}))\nend=time.monotonic()+3\nwhile not Path(sys.argv[3]).exists():\n if time.monotonic()>end:raise SystemExit(5)\n time.sleep(.01)\nPath(sys.argv[1]).write_text(json.dumps({'mock_created_id':'2'*64,'owner':'controlled-only'}))\ntime.sleep(.15)\n")
+    argvchild=[sys.executable,str(child),str(marker),str(parentfile),str(permit)]
     source=root/"cli.py"
     source.write_text("import json,subprocess,time\nfrom pathlib import Path\nchild=subprocess.Popen("+repr(argvchild)+")\nPath("+repr(str(pidfile))+").write_text(json.dumps({'pid':child.pid}))\ntime.sleep(.12)\n")
     argv=[sys.executable,str(source)];descendant=None
     try:
         raw=records.run(argv,3)
+        permit.touch()
         pid=json.loads(pidfile.read_bytes())["pid"];descendant=adapter.process_identity(pid)
         time.sleep(.55)
         actual=json.loads(parentfile.read_bytes())
