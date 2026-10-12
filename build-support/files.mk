@@ -6,5 +6,8 @@ check-files: build/minyarc $(FILES_TEST_SOURCES)
 check-files-sanitize: build/minyarc $(FILES_TEST_SOURCES)
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/files-focused.py --sanitize
 
+# The files backend is POSIX-only for now; tests/files-focused.py refuses Windows.
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
 check check-portable: check-files
 check-sanitize: check-files-sanitize
+endif
