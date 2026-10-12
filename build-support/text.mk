@@ -13,9 +13,18 @@ check-text-basics-sanitize: build/minyarc-sanitize build/text-basics-ownership.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/text-basics-callbacks.py
 	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/text-basics-errors.py
 
-check-text-basics-models:
+# Each model configuration is its own phony child, so a parallel runner can
+# schedule them apart; publish_engine writes the shared cycle engine atomically.
+.PHONY: check-text-basics-models-plain check-text-basics-models-cycles check-text-basics-models-cycles-budget1
+check-text-basics-models: check-text-basics-models-plain check-text-basics-models-cycles check-text-basics-models-cycles-budget1
+
+check-text-basics-models-plain:
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/text-basics-model.py
+
+check-text-basics-models-cycles:
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/text-basics-model.py --cycles
+
+check-text-basics-models-cycles-budget1:
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/text-basics-model.py --cycles --budget 1
 
 check check-portable: check-text-basics check-text-basics-models
