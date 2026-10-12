@@ -46,7 +46,7 @@ int main(int argc,char **argv) {
   tokenizer_source=source;tokenizer_source_reads=0;tokenizer_map=lines;tokenizer_map_reads=0;
   tokenize(source,kinds,texts,lines);
   if(argc==3) assert(tokenizer_source_reads <= strtoull(argv[2],NULL,10) && "identifier scanning must read each character once plus one delimiter lookahead");
-  assert(tokenizer_map_reads<=1 && "the lexer must borrow its coordinate buffer once rather than once per token");
+  assert(tokenizer_map_reads<=2 && "the lexer must borrow coordinates and feature flags once rather than once per token");
   tokenizer_source=NULL;tokenizer_map=NULL;
   assert(tokenizer_locations==0 && "successful tokenization must not format diagnostic locations");
   /* Output owners must survive both source retirement and complete deferred cleanup. */
