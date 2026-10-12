@@ -274,10 +274,14 @@ def late_mutation_control(root):
     owner,_=setup(root);tree=owner.paths["fixture_root"]/"mutable";tree.mkdir()
     (tree/"a").write_bytes(b"original-a");(tree/"b").write_bytes(b"original-b")
     retention=adapter.TreeRetention(root/"retained");real_copy=adapter.stream_binding
+    copied=[]
     def copy(path,*args,**kwargs):
         result=real_copy(path,*args,**kwargs)
         copy_to=kwargs.get("copy_to",args[2] if len(args)>2 else None)
-        if Path(path).name=="b" and copy_to is not None:(tree/"a").write_bytes(b"changed-after-first-copy")
+        # Mutate the first copied file once a second one is copied; directory order varies by filesystem.
+        if copy_to is not None:
+            copied.append(Path(path).name)
+            if len(copied)==2:(tree/copied[0]).write_bytes(b"changed-after-first-copy")
         return result
     adapter.stream_binding=copy
     try:
