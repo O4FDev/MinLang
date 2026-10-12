@@ -143,7 +143,8 @@ def main():
             snapshot(header, Path('runtime') / header.name)
         for directory in ('tests', 'examples'):
             for path in sorted((ROOT / directory).rglob('*')):
-                if path.is_file() and '__pycache__' not in path.parts:
+                # tests/data holds peer audit ledgers (~290 MB) that no memory contract reads.
+                if path.is_file() and '__pycache__' not in path.parts and path.relative_to(ROOT).parts[:2] != ('tests', 'data'):
                     snapshot(path, path.relative_to(ROOT))
         # tests/llvm_sanitizer.py is a shim over this canonical module.
         snapshot(ROOT / 'tools/sanitizer_llvm.py', Path('tools/sanitizer_llvm.py'))
