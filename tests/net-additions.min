@@ -1,0 +1,46 @@
+// net additions for servers: SO_REUSEADDR rebinding during TIME_WAIT, readInto/writeRange without copies,
+// numeric error codes. System stderr and rlimit controls live in files-system.min.
+use "net" as net
+
+function check(condition: Boolean, what: Text) {
+    if !condition { fail("net-additions: " + what) }
+}
+
+let listener = net.listen("127.0.0.1", 0, 16)
+check(listener >= 0, "listen")
+let port = net.localPort(listener)
+let client = net.connect("127.0.0.1", port)
+check(client >= 0, "connect")
+let server = net.accept(listener)
+check(server >= 0, "accept")
+
+// writeRange sends a sub-range; readInto appends in place
+let message = Bytes("xxhello worldyy")
+check(net.writeRange(client, message, 2, 11) == 11, "writeRange")
+let buffer = Bytes()
+buffer.add(42)
+let got = 0
+while got < 11 {
+    let n = net.readInto(server, buffer, 64)
+    check(n > 0 || n == -1, "readInto")
+    if n > 0 { got += n }
+}
+check(buffer.length == 12 && buffer[0] == 42, "readInto appends after existing bytes")
+check(Text(buffer.slice(1, 12)) == "hello world", "readInto content")
+net.nonBlocking(server, true)
+check(net.readInto(server, buffer, 64) == -1, "readInto would block")
+check(net.writeRange(client, message, 10, 100) == -2, "writeRange rejects a bad range")
+check(net.lastErrorCode() < 0, "lastErrorCode after failure")
+check(net.writeRange(client, message, 0, 0) == 0, "writeRange empty")
+check(net.lastErrorCode() == 0, "lastErrorCode after success")
+
+// The server closes first, leaving its side in TIME_WAIT; the port must still be rebindable at once.
+net.close(server)
+net.close(client)
+net.close(listener)
+let again = net.listen("127.0.0.1", port, 16)
+check(again >= 0, "rebind during TIME_WAIT (SO_REUSEADDR)")
+net.close(again)
+
+check(net.accept(-5) == -1 && net.lastErrorCode() < 0, "accept error has a numeric code")
+print("net-additions: ok")

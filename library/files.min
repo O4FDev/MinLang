@@ -1,0 +1,92 @@
+// Durable file I/O: open, append and positioned writes, positioned reads, fdatasync/fsync, atomic rename with a
+// directory sync, and a background syncer for group commit.
+//
+// The built-in readBytesFile/writeBytesFile replace whole files and promise nothing after a crash. Programs that
+// must not lose acknowledged data (write-ahead logs, checkpoints, queues) write with this package, call syncData
+// before acknowledging, and publish new files with write → syncData → rename → syncDirectory.
+//
+// Integer results are >= 0 on success and -errno on failure (-2 ENOENT, -17 EEXIST, -28 ENOSPC ...).
+// Bytes results are empty on failure; lastError() then returns the -errno. errorText(code) describes a code.
+// On macOS syncData and sync use F_FULLFSYNC, which reaches stable storage; plain fsync there does not.
+
+public constant READ = 1        // open for reading (the default when WRITE is absent)
+public constant WRITE = 2       // open for reading and writing
+public constant CREATE = 4      // create if missing (mode 0644)
+public constant APPEND = 8      // every write goes to the end of the file
+public constant TRUNCATE = 16   // truncate to zero length on open
+public constant EXCLUSIVE = 32  // with CREATE: fail with -17 if the file exists
+
+public function open(path: Text, flags: Integer): Integer { native "files" }
+public function close(file: Integer): Integer { native "files" }
+
+// Writes ALL of data[offset, offset + length), retrying short writes; returns length or -errno.
+public function write(file: Integer, data: Bytes, offset: Integer, length: Integer): Integer { native "files" }
+// The same at an absolute file position (pwrite); the file position is unchanged. APPEND descriptors return
+// -EINVAL: Linux pwrite appends on them instead of honoring an absolute position. Unrepresentable ranges return
+// -EOVERFLOW before I/O; readAt also reports that error for unrepresentable ranges/allocation sizes.
+public function writeAt(file: Integer, data: Bytes, offset: Integer, length: Integer, position: Integer): Integer { native "files" }
+// Unbuffered write of text to standard output, ordered with respect to other raw writes (e.g. progress records
+// that a supervisor must see before a crash). print() output may still be buffered.
+public function writeStandardOutput(text: Text): Integer { native "files" }
+
+// Up to length bytes from position; shorter at end of file.
+public function readAt(file: Integer, position: Integer, length: Integer): Bytes { native "files" }
+public function readFile(path: Text): Bytes { native "files" }
+
+public function syncData(file: Integer): Integer { native "files" }   // fdatasync
+public function sync(file: Integer): Integer { native "files" }       // fsync (data and metadata)
+public function size(file: Integer): Integer { native "files" }
+public function pathSize(path: Text): Integer { native "files" }      // -2 if missing
+public function truncate(file: Integer, length: Integer): Integer { native "files" }
+public function rename(from: Text, to: Text): Integer { native "files" }   // atomic within a file system
+public function remove(path: Text): Integer { native "files" }
+public function makeDirectory(path: Text): Integer { native "files" }      // 0 if created or already a directory
+public function syncDirectory(path: Text): Integer { native "files" }      // makes renames/creations durable
+
+public function lastError(): Integer { native "files" }
+public function errorText(code: Integer): Text { native "files" }
+// Codes outside the native errno range receive a defined invalid-code diagnostic.
+
+function listNames(path: Text): Bytes { native "files" }
+
+// Entry names in a directory, excluding . and .. (unsorted). Empty on failure; check lastError().
+public function list(path: Text): List<Text> {
+    let raw = listNames(path)
+    let names: List<Text> = []
+    let start = 0
+    let index = 0
+    while index < raw.length {
+        if raw[index] == 0 {
+            names.add(Text(raw.slice(start, index)))
+            start = index + 1
+        }
+        index += 1
+    }
+    return names
+}
+
+// ---- background syncer (group commit) ----
+// syncerStart(file) starts one thread that fdatasyncs a duplicate of `file` whenever a larger offset is requested.
+// Offsets are the caller's positions in a logical stream (e.g. a write-ahead log's LSNs): write the bytes first,
+// then syncerRequest(handle, endOffset). Requests made while a sync runs are covered by the next sync.
+// syncerNotifySocket(handle) is a socket that becomes readable after every completed sync: watch it with
+// `eventloop`, then call syncerDrain and read syncerSynced. A failed fdatasync is sticky (syncerError) and nothing
+// is reported durable after it.
+// The notification socket is borrowed: never close it through files/net. Remove its event-loop watch before
+// syncerStop; stopped handles are invalid even when the underlying slot is reused.
+public function syncerStart(file: Integer): Integer { native "files" }
+public function syncerNotifySocket(handle: Integer): Integer { native "files" }
+public function syncerRequest(handle: Integer, upTo: Integer): Integer { native "files" }
+public function syncerSynced(handle: Integer): Integer { native "files" }
+public function syncerError(handle: Integer): Integer { native "files" }
+public function syncerDrain(handle: Integer): Integer { native "files" }
+// Block until syncerSynced >= upTo (or the timeout in ms, -1 = forever); returns the synced offset or -errno
+// (-110 timeout). For shutdown, checkpoints and tests.
+public function syncerWait(handle: Integer, upTo: Integer, timeoutMs: Integer): Integer { native "files" }
+// Continue on a new file from startOffset (log segment rotation). Every byte below startOffset must already be
+// written to the previous file; the syncer syncs it before switching.
+// Targets are nonnegative. Rotation boundaries cannot regress or precede already requested/durable offsets;
+// invalid boundaries return -EINVAL. A wait timeout is -1 (forever) or nonnegative milliseconds.
+public function syncerSwitch(handle: Integer, file: Integer, startOffset: Integer): Integer { native "files" }
+// Final sync of outstanding requests, then stop the thread and close its descriptors. Returns syncerError.
+public function syncerStop(handle: Integer): Integer { native "files" }

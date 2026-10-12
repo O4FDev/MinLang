@@ -1,0 +1,136 @@
+// Exercises the `files` and `system` packages end to end: durable writes, positioned I/O, atomic replace,
+// directory listing, the background syncer driven through `eventloop`, clocks, and SIGTERM as socket readiness.
+use "files" as files
+use "system" as system
+use "eventloop" as loop
+use "errors" as errors
+
+function check(condition: Boolean, what: Text) {
+    if !condition { fail("files-system: " + what) }
+}
+
+let directory = "/tmp/minyar-files-" + Text(system.processId())
+check(files.makeDirectory(directory) == 0, "makeDirectory")
+check(files.makeDirectory(directory) == 0, "makeDirectory is idempotent")
+
+// write, size, positioned read/write, truncate
+let path = directory + "/log"
+let log = files.open(path, files.WRITE + files.CREATE + files.APPEND)
+check(log >= 0, "open for append")
+let first = Bytes("hello, ")
+let second = Bytes("durable world")
+check(files.write(log, first, 0, first.length) == first.length, "write")
+check(files.write(log, second, 0, 7) == 7, "write a prefix")
+check(files.syncData(log) == 0, "syncData")
+check(files.size(log) == 14, "size after writes")
+check(Text(files.readAt(log, 7, 100)) == "durable", "readAt to end of file")
+check(files.lastError() == 0, "lastError after success")
+check(files.close(log) == 0, "close")
+
+let edit = files.open(path, files.WRITE)
+check(files.writeAt(edit, Bytes("H"), 0, 1, 0) == 1, "writeAt")
+check(files.truncate(edit, 5) == 0, "truncate")
+check(files.sync(edit) == 0, "sync")
+check(files.close(edit) == 0, "close edit")
+check(Text(files.readFile(path)) == "Hello", "readFile sees writeAt + truncate")
+
+// atomic replace: write temp, sync, rename, sync directory
+let temporary = directory + "/snapshot.tmp"
+let snapshot = files.open(temporary, files.WRITE + files.CREATE + files.EXCLUSIVE)
+check(snapshot >= 0, "create exclusive")
+check(files.open(temporary, files.WRITE + files.CREATE + files.EXCLUSIVE) == -17, "exclusive create fails with EEXIST")
+let image = Bytes(4096)
+check(files.write(snapshot, image, 0, image.length) == 4096, "write snapshot")
+check(files.syncData(snapshot) == 0, "sync snapshot")
+check(files.close(snapshot) == 0, "close snapshot")
+check(files.rename(temporary, directory + "/snapshot.db") == 0, "rename")
+check(files.syncDirectory(directory) == 0, "syncDirectory")
+check(files.pathSize(directory + "/snapshot.db") == 4096, "pathSize")
+check(files.pathSize(temporary) == -2, "pathSize of missing file is -ENOENT")
+let names = files.list(directory)
+check(names.length == 2, "list sees two files")
+let oddNames: List<Text> = ["a\nb", "a", "b", "\n", "\nedge", "tail\n", "λ"]
+for name in oddNames {
+    let entry = files.open(directory + "/" + name, files.WRITE + files.CREATE + files.EXCLUSIVE)
+    check(entry >= 0, "create exact filename")
+    let content = Bytes(name)
+    check(files.write(entry, content, 0, content.length) == content.length, "write exact filename")
+    check(files.close(entry) == 0, "close exact filename")
+}
+let exactNames = files.list(directory)
+check(exactNames.length == 9, "newlines and Unicode remain exact directory names")
+for expected in oddNames {
+    let found = 0
+    for actual in exactNames { if actual == expected { found += 1 } }
+    check(found == 1, "listed filename occurs exactly once")
+    check(Text(files.readFile(directory + "/" + expected)) == expected, "round-trip exact filename")
+    check(files.remove(directory + "/" + expected) == 0, "remove exact filename")
+}
+check(files.readFile(directory + "/missing").length == 0 && files.lastError() == -2, "readFile failure sets lastError")
+check(files.errorText(-2).length > 0, "errorText")
+
+// background syncer through the event loop
+let handle = errors.integerValue(loop.create())
+let wal = files.open(directory + "/wal", files.WRITE + files.CREATE + files.APPEND)
+let syncer = files.syncerStart(wal)
+check(syncer > 0, "syncerStart")
+let watch = errors.integerValue(loop.watch(handle, files.syncerNotifySocket(syncer), loop.readableInterest(), 7))
+let written = 0
+let round = 0
+while round < 20 {
+    let record = Bytes(100)
+    check(files.write(wal, record, 0, 100) == 100, "append record")
+    written += 100
+    check(files.syncerRequest(syncer, written) == 0, "syncerRequest")
+    while files.syncerSynced(syncer) < written {
+        let batch = loop.wait(handle, 5000, 16)
+        check(!errors.isError(loop.batchError(batch)), "loop wait")
+        check(loop.events(batch).length > 0, "syncer wakes the loop within 5 s")
+        for event in loop.events(batch) {
+            check(event.token == 7, "event token")
+            files.syncerDrain(syncer)
+        }
+    }
+    round += 1
+}
+check(files.syncerError(syncer) == 0, "no sync error")
+// segment rotation
+let segment = files.open(directory + "/wal2", files.WRITE + files.CREATE + files.APPEND)
+check(files.syncerSwitch(syncer, segment, written) == 0, "syncerSwitch")
+check(files.write(segment, Bytes(10), 0, 10) == 10, "write new segment")
+check(files.syncerWait(syncer, written + 10, 5000) >= written + 10, "syncerWait after switch")
+loop.remove(handle, watch)
+check(files.syncerStop(syncer) == 0, "syncerStop")
+files.close(wal)
+files.close(segment)
+
+// system: clocks, identity, memory, signals
+check(system.wallClockMicroseconds() > 1700000000000000, "wall clock is after 2023")
+let before = system.monotonicNanoseconds()
+check(system.monotonicNanoseconds() >= before, "monotonic clock")
+check(system.residentBytes() > 0, "residentBytes")
+check(system.writeStandardError("net-additions: stderr ok\n") == 25, "writeStandardError")
+check(system.raiseOpenFileLimit() >= 1024, "raiseOpenFileLimit")
+check(system.ignoreBrokenPipes() == 0, "ignoreBrokenPipes")
+let signals = system.shutdownSignalSocket()
+check(signals >= 0, "shutdownSignalSocket")
+check(system.shutdownSignalSocket() == signals, "shutdownSignalSocket is idempotent")
+let signalWatch = errors.integerValue(loop.watch(handle, signals, loop.readableInterest(), 9))
+check(system.sendSignal(system.processId(), 15) == 0, "send SIGTERM to self")
+let signalled = false
+let attempts = 0
+while !signalled && attempts < 10 {
+    for event in loop.events(loop.wait(handle, 1000, 4)) {
+        if event.token == 9 { signalled = true }
+    }
+    attempts += 1
+}
+check(signalled, "SIGTERM became socket readiness")
+check(system.drainShutdownSignals() == 15, "drain reports SIGTERM")
+loop.remove(handle, signalWatch)
+loop.close(handle)
+
+for name in files.list(directory) {
+    check(files.remove(directory + "/" + name) == 0, "remove " + name)
+}
+print("files-system: ok")

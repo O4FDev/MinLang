@@ -3,6 +3,7 @@
  * no peer source is copied. This links the real Minyar ownership runtime. */
 #include "../runtime/minyar_native.h"
 #include <assert.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdint.h>
 #ifdef _WIN32
@@ -24,6 +25,9 @@ bool minyar_net_udpConnect(long long, const MinyarText *, long long);
 bool minyar_net_ready(long long, long long);
 MinyarBytes *minyar_net_readResult(long long, long long, bool);
 MinyarBytes *minyar_net_writeResult(long long, const MinyarBytes *);
+long long minyar_net_readInto(long long, MinyarBytes *, long long);
+long long minyar_net_writeRange(long long, const MinyarBytes *, long long, long long);
+long long minyar_net_lastErrorCode(void);
 void minyar_net_close(long long);
 void minyar_rc_release(void *);
 
@@ -177,10 +181,68 @@ static void failures_are_values(void) {
     minyar_net_close(udp);
 }
 
+static void reusable_stream_buffers(void) {
+    MinyarText host = literal("127.0.0.1");
+    long long listener = minyar_net_listen(&host, 0, 16);
+    assert(listener >= 0);
+    long long port = minyar_net_localPort(listener);
+#ifndef _WIN32
+    int reuse = 0;
+    socklen_t size = sizeof(reuse);
+    assert(!getsockopt((int)listener, SOL_SOCKET, SO_REUSEADDR, &reuse, &size));
+    assert(reuse == 1);
+#endif
+    long long client = minyar_net_connect(&host, port);
+    assert(client >= 0 && minyar_net_ready(listener, 1000));
+    long long server = minyar_net_accept(listener);
+    assert(server >= 0 && minyar_net_nonBlocking(server, true));
+    MinyarBytes message = literal("xxhello worldyy");
+    MinyarBytes *buffer = minyar_bytes_new(256);
+    buffer->byte_length = 1;
+    ((unsigned char *)buffer->bytes)[0] = 42;
+    const unsigned char *storage = buffer->bytes;
+    long long capacity = buffer->character_length;
+    assert(minyar_net_readInto(server, buffer, 64) == -1);
+    assert(buffer->byte_length == 1 && minyar_net_lastErrorCode() == 0);
+    assert(minyar_net_writeRange(client, &message, 2, 11) == 11);
+    while (buffer->byte_length < 12) {
+        assert(minyar_net_ready(server, 1000));
+        assert(minyar_net_readInto(server, buffer, 64) > 0);
+    }
+    assert(buffer->bytes == storage && buffer->character_length == capacity);
+    assert(buffer->byte_length == 12 && buffer->bytes[0] == 42);
+    assert(!memcmp(buffer->bytes + 1, "hello world", 11));
+    assert(minyar_net_writeRange(client, &message, 10, 100) == -2);
+#ifdef _WIN32
+    assert(minyar_net_lastErrorCode() == -WSAEINVAL);
+#else
+    assert(minyar_net_lastErrorCode() == -EINVAL);
+#endif
+    assert(minyar_net_writeRange(client, &message, 0, 0) == 0);
+    assert(minyar_net_lastErrorCode() == 0);
+    assert(minyar_net_readInto(-1, buffer, 64) == -2);
+    assert(buffer->byte_length == 12 && buffer->bytes == storage);
+    minyar_net_close(server);
+    assert(minyar_net_ready(client, 1000));
+    assert(minyar_net_readInto(client, buffer, 64) == 0);
+    assert(buffer->byte_length == 12 && minyar_net_lastErrorCode() == 0);
+    minyar_rc_release(buffer);
+    minyar_net_close(client);
+    minyar_net_close(listener);
+#ifndef _WIN32
+    /* Reading the server FIN before client close establishes server-side
+     * TIME_WAIT, rather than merely closing both sockets simultaneously. */
+    listener = minyar_net_listen(&host, port, 16);
+    assert(listener >= 0);
+    minyar_net_close(listener);
+#endif
+}
+
 int main(void) {
     failures_are_values();
     udp_outcomes();
     tcp_outcomes();
+    reusable_stream_buffers();
     puts("native network outcomes verified");
     return 0;
 }
