@@ -118,6 +118,7 @@ def main():
     parser.add_argument("--expect-old-code", action="store_true")
     parser.add_argument("--case", action="append", choices=tuple(BASELINE))
     parser.add_argument("--artifacts", type=Path)
+    parser.add_argument("--summary", action="store_true")
     options = parser.parse_args()
     binary = options.binary.resolve(strict=True)
     results = []
@@ -141,10 +142,13 @@ def main():
                   "binary_sha256": sha256(binary), "baseline": options.expect_old_code,
                   "compiler_invoked": False, "results": results}
         artifacts.publish(report, all(row["matched"] for row in results))
-    print("QUIC CID/migration cases: " + str(sum(row["matched"] for row in results)) + "/" + str(len(results)) + " passed")
-    for row in results:
-        if not row["matched"]:
-            print(json.dumps(row, indent=2))
+    if options.summary:
+        print("QUIC CID/migration cases: " + str(sum(row["matched"] for row in results)) + "/" + str(len(results)) + " passed")
+        for row in results:
+            if not row["matched"]:
+                print(json.dumps(row, indent=2))
+    else:
+        print(json.dumps(report, indent=2))
     if not all(row["matched"] for row in results):
         raise SystemExit(1)
 

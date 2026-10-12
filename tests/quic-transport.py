@@ -26,7 +26,7 @@ def main():
         if options.migration_cids:
             binary = Path(directory) / 'migration-cids'
             fixtures.compile_program(ROOT / 'tests/quic-migration-cids.min', binary)
-            subprocess.run([sys.executable, str(ROOT / 'tests/quic-migration-cids.py'), '--binary', str(binary)], check=True, timeout=120)
+            subprocess.run([sys.executable, str(ROOT / 'tests/quic-migration-cids.py'), '--binary', str(binary), '--summary'], check=True, timeout=120)
             return
         ca = fixtures.Certificates(directory); ca.root('root'); ca.leaf('server', 'root'); ca.leaf('client', 'root', usage='clientAuth')
         name = 'tests/quic-migration.min' if options.migration else ('tests/quic-key-update.min' if options.key_update else 'tests/quic-transport.min')
