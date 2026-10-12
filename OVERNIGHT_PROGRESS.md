@@ -27,7 +27,7 @@ Every proposed integration will receive an independent review subagent before th
 
 - W `bx_w8xs3uwb` and Y `bx_y2vp5byg` extended with included credit until 17:27 UTC.
 - Dedicated Linux `bx_q9mdad57` for QUIC and `bx_3uusc6gg` for preserved collector stress created with included credit, six-hour lifetimes.
-- W reserved for neo-db durable I/O qualification; dedicated Linux box reserved for existing QUIC CID WIP qualification; Y reserved for Windows.
+- Neo-db released W after final native/SAN qualification; the dedicated transport box completed its frozen-source run and now owns the two existing build-wiring fixture repairs. Y prepares the retained Windows VM.
 - Dedicated 8-CPU/16-GiB Linux `bx_utb76q3g` allocated through 17:50 UTC for whole-tree/downstream qualification and Boat-generated Mac artifacts; dependency setup only until source freeze.
 - New paid spend: **$0 / $10**. Other projects' existing Boat boxes are not allocated to this programme.
 - No heavy local builds, long local tests, local Windows execution, force pushes or URL opening.
@@ -35,8 +35,9 @@ Every proposed integration will receive an independent review subagent before th
 ## Current blockers and required qualification
 
 - Branch dispositions and final missing-change tests are being audited; nothing is deemed superseded solely by branch age.
-- CID RED and corrected 68-case native/cipher GREEN passed; stale IPv6 evidence verifier repaired test-first. Independent R1 now blocks product integration on production peer-edge routing capacity (third live CID can drop a peer); actual-edge RED14 -> native/SAN/LSan GREEN; unchanged generic table cap131072 with <=2 owner partitions supports32768 peers/262144 routes. Frozen `cb8fe9f` stack in independent R2 and final-source full qualification before merge.
-- neo-db review R1 blocks merge on ten concrete durability, directory framing/error, syncer lifetime/setup, signal narrowing/rollback and diagnostic bounds defects. Two already have actual RED; remaining test-first repairs assigned to the same code owner on W. No obsolete-source broad reruns.
+- Transport `cb8fe9f` received independent R2 approval and passed final 172 native + 172 ASan/UBSan/LSan RFC cases, ACK/PTO, yamux/cancel/independent Go/1536/FIN, net-connect and strict edge/full262144-route controls. All1313 input hashes match Git and before/after. Normal integration `7edba35`; reviewed38 original-ref history at `e297113` leaves its source unchanged.
+- Neo-db frozen `34833a6` fixes all ten R1 findings plus actual overflow, APPEND/position, negative-boundary, stderr-progress and in-flight signal rollback RED controls. Final W native/SAN maintained and network suites pass; fresh independent R2 runs before merge. RC sketch remains excluded.
+- Existing build-wiring tests expose two baseline fixture failures: isolated Make prerequisite for yamux peer and stale107-case adapter expectation versus113 maintained cases. Narrow test-first repair assigned separately; no threshold/case removal.
 - Current full Linux/macOS/Windows suites and CI remain unqualified; prior passing commits do not qualify this revision.
 - Native macOS is absent on Boat. Owner directed use of this Mac for native checks; heavy builds/long tests remain on Boat. Offloaded ARM64 generation and bounded serial Apple-native checks are being prepared.
 - Owner added Phase 2 item 0: shared-memory threads; start after Phase 1, with ±1% single-thread performance, Boat multicore scaling, TSan stress and a neo-db design note.
