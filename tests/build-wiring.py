@@ -713,7 +713,8 @@ class BuildWiring(unittest.TestCase):
         def verify(candidate):
             with tempfile.TemporaryDirectory(prefix='actual sanitizer Make rules ') as folder:
                 probe = Path(folder)/'probe.mk'
-                probe.write_text(candidate + '\n.PHONY: build build/minyarc\nbuild build/minyarc:\n')
+                probe.write_text(candidate + '\n.PHONY: build build/minyarc build/yamux-peer\n'
+                                 'build build/minyarc build/yamux-peer:\n')
                 result = subprocess.run(['make', '-rRnp', '-f', str(probe), 'check'],
                                         cwd=ROOT, capture_output=True, text=True, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -1667,8 +1668,15 @@ class BuildWiring(unittest.TestCase):
                     cases.extend(ast.literal_eval(declaration))
                 else:
                     cases.extend(ast.literal_eval(node.value))
-        self.assertEqual(len(cases), 107)
-        self.assertEqual(len(set(cases)), 107)
+        forwarding_cases = ('raw-forward-incremental', 'raw-forward-stderr-status',
+                            'raw-forward-no-duplicate', 'raw-forward-empty',
+                            'raw-forward-private-json', 'raw-forward-backpressure')
+        self.assertEqual(len(cases), 113)
+        self.assertEqual(len(set(cases)), 113)
+        self.assertTrue(set(forwarding_cases) <= set(cases))
+        original_cases = [case for case in cases if case not in forwarding_cases]
+        self.assertEqual(len(original_cases), 107)
+        self.assertEqual(len(set(original_cases)), 107)
         main = next(node for node in driver.body
                     if isinstance(node, ast.FunctionDef) and node.name == 'main')
         selection = next(node.value for node in ast.walk(main)
