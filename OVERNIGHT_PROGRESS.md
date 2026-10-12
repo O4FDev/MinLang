@@ -19,8 +19,8 @@ Every proposed integration will receive an independent review subagent before th
 
 ## Merged list and gaps closed
 
-- Reviewed desktop history merged at `00b7fd1`; reviewed Windows history at `0d1d12b`/`5978c73`. All three preserve identical source trees and keep every branch. Source fixes remain pending. Existing candidate contains TLS cleanup `6518ef3` and unqualified QUIC CID WIP `8daa72c`.
-- Collector preservation at `4a1732f` passed 30 C native/SAN configurations, eight restored programs at O0/O2 native/SAN/LSan, and 26 exact finite-heap language cells; final parent-owned review R2 pending merge. No production collector/compiler change.
+- Reviewed desktop, Windows and shipping history merged at `00b7fd1`, `0d1d12b`/`5978c73`, `5288bc0`, retaining current source. Collector test restoration merged at `fa7c906` after exact GREEN and independent R2 approval; reviewed memory history at `3a5bbb3` preserves that source. Every branch is kept. Existing candidate contains TLS cleanup `6518ef3` and unqualified QUIC CID WIP `8daa72c`.
+- Collector preservation at `4a1732f` passed 30 C native/SAN configurations, eight restored programs at O0/O2 native/SAN/LSan, and 26 exact finite-heap language cells; parent-owned R2 approved and merged at `fa7c906`. No production collector/compiler change.
 - No Phase 2 gaps claimed closed yet. Owning project code has not been changed.
 
 ## Boat and spending
@@ -35,7 +35,7 @@ Every proposed integration will receive an independent review subagent before th
 ## Current blockers and required qualification
 
 - Branch dispositions and final missing-change tests are being audited; nothing is deemed superseded solely by branch age.
-- CID RED and corrected 68-case native/cipher GREEN passed; stale IPv6 evidence verifier repaired test-first. Independent R1 now blocks product integration on production peer-edge routing capacity (third live CID can drop a peer); actual-edge RED and narrow repair assigned before final RFC/SAN qualification.
+- CID RED and corrected 68-case native/cipher GREEN passed; stale IPv6 evidence verifier repaired test-first. Independent R1 now blocks product integration on production peer-edge routing capacity (third live CID can drop a peer); actual-edge RED14 -> native/SAN/LSan GREEN; unchanged generic table cap131072 with <=2 owner partitions supports32768 peers/262144 routes. Frozen `cb8fe9f` stack in independent R2 and final-source full qualification before merge.
 - neo-db review R1 blocks merge on ten concrete durability, directory framing/error, syncer lifetime/setup, signal narrowing/rollback and diagnostic bounds defects. Two already have actual RED; remaining test-first repairs assigned to the same code owner on W. No obsolete-source broad reruns.
 - Current full Linux/macOS/Windows suites and CI remain unqualified; prior passing commits do not qualify this revision.
 - Native macOS is absent on Boat. Owner directed use of this Mac for native checks; heavy builds/long tests remain on Boat. Offloaded ARM64 generation and bounded serial Apple-native checks are being prepared.
