@@ -67,9 +67,11 @@ application attempts to set them are rejected. HEAD sends the hypothetical
 body length and no body. 204 omits Content-Length and sends no body; 205 sends
 Content-Length: 0; 304 may send the supplied representation length and no body.
 There is no informational response, protocol switching, streaming response or
-automatic Date header. Response body storage is retained without concatenating
-or copying; callers must treat supplied Bytes as immutable while the server
-may send them (immutable cache entries work well).
+automatic Date header. Bodies up to 64 KiB are packed with headers in one
+bounded output buffer to avoid separate TCP packets and receiver wakeups.
+Larger response body storage is retained without copying; callers must treat
+supplied Bytes as immutable while the server may send them (immutable cache
+entries work well).
 
 Limits are snapshotted at listen. Defaults bound 1024 live connections, 16 KiB
 headers, 64 fields, 1 MiB request bodies, 16 MiB response bodies, 1000 requests
