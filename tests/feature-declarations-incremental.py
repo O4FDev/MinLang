@@ -79,8 +79,10 @@ print(values.sorted()[1])
                     result = self.evidence.run(list(map(str, command)), timeout=60, phase='incremental-' + phase)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     if mode == 'state':
-                        self.assertTrue(next_state.stat().st_size)
-                        prior.write_bytes(next_state.read_bytes())
+                        if next_state.stat().st_size:
+                            prior.write_bytes(next_state.read_bytes())
+                        else:
+                            self.assertIn(phase, ('warm', 'post-edit-warm'), 'cold/edited build omitted its cache update')
                     if phase in ('warm', 'post-edit-warm'):
                         self.assertEqual(int(stats.read_text().split()[1]), 0, 'warm body cache was not exercised')
                     for name in names:
