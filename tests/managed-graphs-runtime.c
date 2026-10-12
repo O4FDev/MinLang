@@ -219,4 +219,5 @@ int main(void) {
     printf(" peak-pool=%zu", minyar_pool_high_water);
 #endif
     puts("");
+    return 0;
 }

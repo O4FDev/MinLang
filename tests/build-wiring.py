@@ -14,6 +14,38 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class BuildWiring(unittest.TestCase):
 
+    def test_bakeoff_stress_is_mandatory_with_bounded_quick_profiles(self):
+        import re
+        with tempfile.TemporaryDirectory(prefix='minyar bakeoff wiring ') as folder:
+            makefile = Path(folder) / 'probe.mk'
+            makefile.write_text(
+                'LLVM_CC := retained-clang\nSANITIZER_LIMITED := sanitizer-limit\n'
+                'include ' + str(ROOT / 'build-support/managed-graphs.mk').replace(' ', '\\ ') + '\n'
+                '.PHONY: build\nbuild:\n\t@:\n')
+            env = dict(os.environ)
+            env.pop('MAKEFLAGS', None)
+            result = subprocess.run(
+                ['make', '-rRnp', '-f', str(makefile), 'check-managed-graphs-bakeoff'],
+                cwd=ROOT, env=env, text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rules = {}
+            for line in result.stdout.splitlines():
+                match = re.match(r'^([\w./-]+):\s+(.*)$', line)
+                if match:
+                    rules.setdefault(match[1], set()).update(match[2].split())
+            target = 'check-managed-graphs-bakeoff'
+            for gate in ('check', 'check-portable', 'check-sanitize', 'check-managed-graphs-profiles'):
+                self.assertIn(target, rules.get(gate, set()), gate)
+            for source in ('tests/managed-graphs-bakeoff.c', 'tests/managed-graphs-runtime.c',
+                           'tests/managed-graphs-profiles.py', 'runtime/minyar_runtime.c'):
+                self.assertIn(source, rules.get(target, set()))
+            commands = result.stdout.split('# GNU Make', 1)[0]
+            selected = [line for line in commands.splitlines()
+                        if 'python3 tests/managed-graphs-profiles.py' in line]
+            self.assertEqual(selected, [
+                'MINYAR_TEST_CLANG="retained-clang" sanitizer-limit python3 '
+                'tests/managed-graphs-profiles.py --quick --fixture managed-graphs-bakeoff.c'])
+
 
 
 
