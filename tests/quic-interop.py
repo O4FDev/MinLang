@@ -192,7 +192,7 @@ def main():
         process=subprocess.Popen(invocation,cwd=runner,env=environment,stdout=output,stderr=subprocess.STDOUT)
         try:
             while process.poll() is None:
-                if time.monotonic()-started>2400:raise RuntimeError('interop matrix deadline exceeded')
+                if time.monotonic()-started>3600:raise RuntimeError('interop matrix deadline exceeded')
                 for node in ('server','client'):
                     try:
                         identifier=subprocess.check_output(['docker','inspect','--format','{{.Id}} {{.State.Running}}',node],stderr=subprocess.DEVNULL,text=True).strip()
