@@ -4527,7 +4527,7 @@ function assignedValue(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenL
     return emitBinary(output, textState, state, binary, current, type, -1, right, rightType[0], valueType, tokenLines, location)
 }
 
-// Assign through a local, record fields, and List positions. Plain `local = v`
+// Assign through a local or constant receiver, record fields, and List positions. Plain `local = v`
 // keeps its dedicated path in compileStatement for Text append ownership.
 function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, operatorPosition: Integer) {
     let operator = tokenTexts[operatorPosition]
@@ -4539,12 +4539,27 @@ function compileAssignment(tokenKinds: List<Integer>, tokenTexts: List<Text>, to
     let start = state[0]
     let name = tokenTexts[start]
     let local = findLocal(localNames, localLengths, state, name)
-    if local < 0 {
-        fail(describeLocation(tokenLocation(tokenLines, state[0])) + ": I can't find a value named '" + name + "'")
+    let receiverType = 0
+    let receiver = ""
+    if local >= 0 {
+        receiverType = localTypes[local]
+        receiver = loadLocal(output, textState, state, localIds[local], receiverType)
+        state[0] = state[0] + 1
+    } else {
+        let constant = findCompiledSymbol(functionNames, symbolKinds, functionReturnTypes, name, 3)
+        if constant < 0 {
+            fail(describeLocation(tokenLocation(tokenLines, start)) + ": I can't find a value named '" + readableDeclarationName(name) + "'")
+        }
+        if start + 1 == operatorPosition {
+            fail(describeLocation(tokenLocation(tokenLines, start)) + ": constant '" + readableDeclarationName(name) + "' cannot be reassigned")
+        }
+        // Cached getter reads borrow their managed root for the statement,
+        // including when an index or right-hand call replaces nested owners.
+        let type: List<Integer> = []
+        type.add(0)
+        receiver = parseAtom(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, type)
+        receiverType = type[0]
     }
-    let receiverType = localTypes[local]
-    let receiver = loadLocal(output, textState, state, localIds[local], receiverType)
-    state[0] = state[0] + 1
     let valueType: List<Integer> = []
     valueType.add(0)
     if state[0] == operatorPosition {
@@ -5645,6 +5660,9 @@ function compileAtomicStatement(tokenKinds: List<Integer>, tokenTexts: List<Text
                         let name = tokenTexts[state[0]]
                         let local = findLocal(localNames, localLengths, state, name)
                         if local < 0 {
+                            if findCompiledSymbol(functionNames, symbolKinds, functionReturnTypes, name, 3) >= 0 {
+                                fail(describeLocation(tokenLocation(tokenLines, state[0])) + ": constant '" + readableDeclarationName(name) + "' cannot be reassigned")
+                            }
                             fail("I can't find a value named '" + name + "'")
                         }
                         state[0] = state[0] + 2
@@ -6071,6 +6089,7 @@ function compileModuleConstants(tokenKinds: List<Integer>, tokenTexts: List<Text
     }
     output.add("  ret void\n}\n\n")
     output.add("define internal void @.minyar.constants.release() {\nentry:\n")
+    let releasesRoots = false
     symbol = 0
     while symbol < symbolKinds.length {
         if symbolKinds[symbol] == 3 && functionParameterCounts[symbol] < 0 && isReferenceType(functionReturnTypes[symbol]) {
@@ -6078,9 +6097,14 @@ function compileModuleConstants(tokenKinds: List<Integer>, tokenTexts: List<Text
             output.add("  %constant." + Text(symbol) + " = load ptr, ptr " + cell + "\n")
             output.add("  store ptr null, ptr " + cell + "\n")
             output.add("  call void @minyar_rc_release(ptr %constant." + Text(symbol) + ")\n")
+            releasesRoots = true
         }
         symbol = symbol + 1
     }
+    // An unused managed constant can outlive a scalar-only main whose frame
+    // was elided. The existing null release drains eager cycle work; bounded
+    // profiles keep their existing service budget and normal-return contract.
+    if releasesRoots { output.add("  call void @minyar_rc_release(ptr null)\n") }
     output.add("  ret void\n}\n\n")
 }
 

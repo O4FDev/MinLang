@@ -130,6 +130,108 @@ function main(): Integer { ''' + body + ''' }
 parallel function read(index: Integer): Integer { return TABLE[index] }
 ''', "parallel function 'read' may use only Integer, Float, Boolean and Character values")
 
+    def test_direct_constant_receivers_are_mutable_aliases(self):
+        cases = (
+            ('''constant TABLE: List<Integer> = [1]
+let alias = TABLE
+TABLE[0] = 2
+TABLE[0] += 3
+print(alias[0])
+''', '5\n'),
+            ('''constant DATA: Bytes = Bytes("abc")
+let alias = DATA
+DATA[0] = 65
+DATA[1] += 1
+print(Text(alias))
+''', 'Acc\n'),
+            ('''record Box { value: Integer }
+constant BOX: Box = Box { value: 1 }
+let alias = BOX
+BOX.value = 2
+BOX.value *= 3
+print(alias.value)
+''', '6\n'),
+        )
+        for source, expected in cases:
+            with self.subTest(receiver=source.splitlines()[0]):
+                self.executes(source, expected)
+
+    def test_nested_constant_receiver_writes_keep_aliases(self):
+        self.executes('''record Box { values: List<List<Integer>>; data: List<Bytes>; title: Text }
+constant BOXES: List<Box> = [Box { values: [[1]]; data: [Bytes("abc")]; title: "a" + "!" }]
+let alias = BOXES[0]
+BOXES[0].values[0][0] = 4
+BOXES[0].values[0][0] += 2
+BOXES[0].data[0][0] = 65
+BOXES[0].data[0][1] += 1
+BOXES[0].title += "b"
+BOXES[0].title = BOXES[0].title + "c"
+alias.values[0][0] *= 7
+print(BOXES[0].values[0][0])
+print(Text(alias.data[0]))
+print(alias.title)
+''', '42\nAcc\na!bc\n')
+
+    def test_imported_constant_receiver_writes_keep_shared_aliases(self):
+        (self.directory / 'tables.min').write_text('''public record Box { value: Integer; values: List<Integer>; data: Bytes }
+public constant TABLE: List<Integer> = [1]
+public constant DATA: Bytes = Bytes("abc")
+public constant BOX: Box = Box { value: 1; values: [1]; data: DATA }
+''')
+        self.executes('''use "./tables.min" as first
+use "./tables.min" as second
+first.TABLE[0] = 2
+first.TABLE[0] += 3
+first.DATA[0] = 65
+first.DATA[1] += 1
+first.BOX.value = 2
+first.BOX.value *= 3
+first.BOX.values[0] = 42
+first.BOX.data[2] = 68
+print(second.TABLE[0])
+print(Text(second.DATA))
+print(second.BOX.value)
+print(second.BOX.values[0])
+''', '5\nAcD\n6\n42\n')
+
+    def test_constant_bindings_cannot_be_reassigned(self):
+        cases = (
+            ('constant VALUE = 1\n', 'VALUE', '2'),
+            ('constant VALUE: Integer = 1 + 0\n', 'VALUE', '2'),
+            ('constant TABLE: List<Integer> = [1]\n', 'TABLE', '[2]'),
+            ('constant DATA: Bytes = Bytes("a")\n', 'DATA', 'Bytes("b")'),
+            ('record Box { value: Integer }\nconstant BOX: Box = Box { value: 1 }\n', 'BOX', 'Box { value: 2 }'),
+        )
+        for declaration, name, value in cases:
+            with self.subTest(name=name, declaration=declaration):
+                self.rejects(declaration + name + ' = ' + value + '\n',
+                             "constant '" + name + "' cannot be reassigned")
+        for operator in ('+=', '-=', '*=', '/=', '%='):
+            with self.subTest(operator=operator):
+                self.rejects('constant VALUE: Integer = 1 + 0\nVALUE ' + operator + ' 2\n',
+                             "constant 'VALUE' cannot be reassigned")
+        (self.directory / 'constant.min').write_text('public constant VALUE = 1\n')
+        for operator in ('=', '+='):
+            with self.subTest(imported_operator=operator):
+                self.rejects('use "./constant.min" as config\nconfig.VALUE ' + operator + ' 2\n',
+                             "constant 'VALUE' cannot be reassigned")
+
+    def test_local_assignment_receivers_shadow_constants(self):
+        self.executes('''constant TABLE: List<Integer> = [1]
+constant VALUE = 1
+function write(TABLE: List<Integer>, VALUE: Integer) {
+    TABLE[0] = 3
+    TABLE[0] += 4
+    VALUE = 8
+    VALUE += 1
+    print(TABLE[0])
+    print(VALUE)
+}
+write([2], 2)
+print(TABLE[0])
+print(VALUE)
+''', '7\n9\n1\n1\n')
+
     def test_complex_initializer_needs_annotation_and_correct_type(self):
         self.rejects('constant TABLE = [1, 2]\n', 'a nonliteral constant needs a type annotation')
         self.rejects('constant TABLE: List<Integer> = ["wrong"]\n', 'all values in a List literal must have the same type')
