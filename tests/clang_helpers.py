@@ -1,6 +1,7 @@
 """Platform libraries for direct Clang invocations in standalone test scripts."""
 import os
 import platform
+import re
 import shutil
 import subprocess
 
@@ -44,3 +45,18 @@ def launcher_command(root):
             raise RuntimeError('Bash is required for the native Windows launcher')
         command.insert(0, bash)
     return command
+
+
+def without_asm_source_locations(ir):
+    """Blank inline-asm `!srcloc` values: they are raw source offsets, not code.
+
+    Any extra -D option or header line before an asm statement shifts them, so
+    identity checks of LLVM text compare everything else exactly.
+    """
+    text = ir.decode() if isinstance(ir, bytes) else ir
+    ids = set(re.findall(r'!srcloc !(\d+)', text))
+    if ids:
+        text = re.sub(r'^!(\d+) = !\{[^\n]*\}$',
+                      lambda m: '!' + m[1] + ' = !{srcloc}' if m[1] in ids else m[0],
+                      text, flags=re.M)
+    return text.encode() if isinstance(ir, bytes) else text

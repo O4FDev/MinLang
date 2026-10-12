@@ -10,7 +10,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 from cycle_runtime import engine_source
-from clang_helpers import native_path
+from clang_helpers import native_path, without_asm_source_locations
 
 
 def body(ir, name):
@@ -73,7 +73,7 @@ def main():
             if selector is not None:
                 flags.insert(1, '-DMINYAR_THREADED=' + selector)
             subprocess.run(flags, check=True, timeout=60)
-            ordinary.append(plain.read_bytes())
+            ordinary.append(without_asm_source_locations(plain.read_bytes()))
         if ordinary[0] != ordinary[1]:
             raise AssertionError('Zero selector changed ordinary artifact')
         print(label + ': plain local RC, atomic native lifetime, domain TLS, ordinary absent/0 identity passed')

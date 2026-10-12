@@ -10,7 +10,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 from cycle_runtime import engine_source
-from clang_helpers import native_path
+from clang_helpers import native_path, without_asm_source_locations
 
 
 def main():
@@ -37,7 +37,8 @@ def main():
                     command += ['-D' + definition for definition in definitions]
                     command += phase + ['-o', native_path(output)]
                     subprocess.run(command, input=source, text=True, check=True, timeout=60)
-                    artifacts.append(output.read_bytes())
+                    data = output.read_bytes()
+                    artifacts.append(without_asm_source_locations(data) if suffix == 'll' else data)
                 if artifacts[0] != artifacts[1]:
                     raise AssertionError(engine + ' ' + name + ' ' + suffix + ' changed')
                 print(engine, name, suffix, hashlib.sha256(artifacts[1]).hexdigest(), 'identical', flush=True)
