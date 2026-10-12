@@ -1,7 +1,7 @@
 # v2 implementation and verification map
 
 This checkpoint describes the combined implementation based on
-`173de244` at 00:35 UTC on 2026-10-12.
+`b1dfe092` at 01:17 UTC on 2026-10-12.
 An implemented API, a passing focused suite and a complete deployment are
 separate claims. Retained results establish only their recorded source and
 configuration. Combined CI, current macOS/Windows gates, ordinary performance
@@ -100,35 +100,32 @@ The fresh 32-device baseline passes; the 4,096-device setup still fails.
 Fresh Windows critical-idle and bridge results are recorded below; the full
 current Windows portable suite remains unqualified.
 
-A new full-MARK zero-count regression is in focused qualification. An actual
-per-poll trace shows that removing a scanned dead owner's edge and dropping
-the matching child reference preserves the child's external count, yet requests
-a rescan. The first test also released its independently held primary before
-measuring locality, requiring an unrelated replacement proof. With that fixture
-corrected, payload/count/root-drop and empty-heap assertions pass, and eight
-borrows take eight units under the unchanged 192-unit limit. Initial cleanup
-still reports two aggregate epochs/completions instead of the required one.
-Those earlier results are retained. The candidate runtime remains isolated;
-focused controls do not substitute for broader qualification or a capacity pass.
+The full-MARK zero-count repair at `19a40f18` is now integrated. It preserves
+an eligible scanned dead owner's proof build, including genuine zero reached
+when MARK releases its final gray pin. Queued field cleanup rechecks the exact
+job, generation and anchor identity; rescan, phase changes and anchor transfers
+retain conservative fallback. A matching dead-edge decrement preserves the
+child's external count while retaining collection debt for unknown private
+cycles. Ordinary unpaired drops still request a rescan.
 
-A strengthened test separately proves that an ordinary unpaired drop still
-requests a rescan and that losing a private cycle's last owning path reclaims
-that cycle before changing the primary root. The proposed paired-drop repair
-passes those controls: the private case uses one full job and one seven-unit
-local job. Its final acyclic smoke still fails. A subsequent per-unit classifier
-confirms two actual full jobs and no local job in that case. A bounded joined
-trace identifies the same branch reaching real zero inside MARK after its gray
-pin is released, then leaving registration without a retirement marker. Its
-queued field cleanup later cancels the proof build and requests the second
-scan. Reclamation, payloads, root cleanup and eight borrowed units still pass;
-the one-full-job requirement and 192-unit limit remain unchanged. A narrow
-repair now passes all 18 native cases at system/k32/N512. It issues the existing
-retirement marker only at genuine zero while releasing the final MARK pin,
-using a local call argument and the existing registration/ownership checks.
-The acyclic case completes one full job; the nested private cycle is reclaimed
-with one full job and one seven-unit local job. Live/proven/rescan and marker
-expiry controls retain their original assertions. Native and sanitizer matrices
-are next; no broader qualification or capacity pass is claimed yet.
+All 23 standalone Linux C qualification stages passed with stable selected
+inputs: native and ASan/UBSan/LSan full-MARK, prior retirement/safety matrices,
+private-cycle controls, registration, witness and progress. The new regression
+covers 24 configurations and 432 mode checks. Payloads and reclamation precede
+the unchanged 192-unit locality assertion. The acyclic case uses one full job;
+the nested private cycle is reclaimed with one full job and seven local units.
+The original v5 negative control now uses its frozen collector source, keeping
+its expected failure independent of product changes. Every indexed archive
+member and the actual gate/retirement records were independently reviewed.
+
+Ordinary production runtime objects remain byte-identical in native and
+ThinLTO configurations; collector metadata remains 32 bytes. The maintained
+native/sanitizer targets use the qualified budgets 1/32 and sizes 512/2048.
+Their separate Make wiring passed dry-run review; the catalogue covers 498
+sources and rejects all 24 invalid controls. Two small ARM64 C native and
+ASan/UBSan checks also pass all 18 modes with stable inputs. These results do
+not claim macOS LSan, a combined language suite or device capacity. Four
+affected Windows C checks are running separately; long tests remain pending.
 
 ## Recoverable errors
 
@@ -285,8 +282,10 @@ peers and Retry in both directions against all four peers.
 Each literal official verdict, original deadline and owned cleanup remains
 intact. All 340 indexed metadata files and their literal verdicts, source
 admission and owned retirement were independently verified. A further serial
-continuation of indices 56–71 has begun: client resumption against quiche and
-Quinn passes; 70 original cells remain untouched at this checkpoint. These
+continuation has passed indices 56–63: resumption in both directions against
+all four peers. It retired normally and handed Y to the affected Windows
+collector checks. The next untouched cell is 64 (0-RTT); 64 original cells
+remain untouched at this checkpoint. These
 results do not rewrite the historical matrix or certify all 128 current-source
 cells.
 
@@ -396,8 +395,24 @@ real live RSS/CPU samples followed by normal-exit/null observations, and all
 35 owned process identities are absent after retirement. The 130-file evidence
 index and 12-file terminal annex were verified, then reviewed against the actual
 reports and current driver bytes. These controls establish telemetry behavior,
-not flat memory or low idle CPU. The observers' retained-sample memory is under
-review before starting the hours-long workloads.
+not flat memory or low idle CPU.
+
+The streaming-summary repair at `eea09a7` prevents observers from retaining
+all sample dictionaries. Test-first evidence records 16,000 live rows and
+36,992 KiB RSS growth before the repair, versus two live rows and 128 KiB
+after it. Three affected tests and four retained numerical comparisons pass;
+all original memory thresholds remain unchanged. New native TCP and TLS
+short controls pass with real controller telemetry and normal retirement.
+The 90-file archive and 11-file terminal annex were independently verified
+and reviewed. Hours-long workloads remain pending.
+
+The deleted scale helper has been rebuilt once with an explicit locked Cargo
+release profile. All eight Rust tests and the product build pass, with stable
+source/tool inputs and a validated x86-64 ELF/loader ABI. An accidental
+20-second outer command timeout is retained as a separate setup failure;
+no test ran in that interrupted attempt. The successful continuation used
+the original 600-second inner guard. This qualifies the helper needed for
+the next device cohort; it is not a 4,096-device or sustained-capacity pass.
 
 ## Desktop and shipping
 
