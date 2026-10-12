@@ -135,7 +135,8 @@ def copy_source_snapshot(source, work):
     for name in DIRECTORIES:
         shutil.copytree(source / name, work / name,
                         ignore=shutil.ignore_patterns('build', '.git', '__pycache__', '*.pyc'))
-    for name in ('Makefile', 'minyar'):
+    # .clang-format is the style the formatting group checks against.
+    for name in ('Makefile', 'minyar', '.clang-format'):
         shutil.copy2(source / name, work / name)
 
 
@@ -357,7 +358,7 @@ def main():
     try:
         copies = {name: subprocess.Popen(['cp', '-a', str(work), str(evidence / ('source-' + name))])
                   for name in variants if not (evidence / ('source-' + name)).exists()}
-        runner.run_one(Check('toolchain', ['clang', '--version']))
+        runner.run_one(Check('toolchain', ['clang', '--version'], group='setup'))
         for name, copy in copies.items():
             if copy.wait():
                 raise RuntimeError('cannot copy the source snapshot for ' + name)
@@ -431,7 +432,7 @@ def main():
                                      '"$tools/bin/pip" install -q --disable-pip-version-check "clang-format==$1"; }; '
                                      'CLANG_FORMAT="$tools/bin/clang-format" "$0" scripts/format.py', python, version],
                       group='formatting', expected=20))
-        if any(check.variant == '' for check in checks):
+        if main_build:
             prebuild += [name for name in LAUNCHER_ARTIFACTS if name in rules]
         for name, (variant_env, variant_make) in variants.items():
             variant = runner.add_variant(check_runner.Variant(name, evidence / ('source-' + name), variant_env,
