@@ -134,7 +134,7 @@ print(pair())
 
     def test_collision_mutant_fails_with_real_use_after_free(self):
         source_root = COMPILER.parent.parent
-        source = (source_root / 'compiler/compiler.min').read_text()
+        source = (source_root / 'build/compiler.min').read_text()
         site = 'return state[entry + 1]'
         self.assertEqual(source.count(site), 1, 'ownership mapper mutation site changed')
         source = source.replace(site, 'return 0', 1)

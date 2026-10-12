@@ -164,7 +164,7 @@ check: check-temporary-owner-admission
 # Verify that sanitizer coverage exercises the same compiler as the native
 # fixed point, including when a retained build artifact has misleading times.
 check-sanitized-fixed-point: build/minyarc-sanitize build/compiler-stage3.ll build/minyar-runtime.o
-	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/minyarc-sanitize compiler/compiler.min build/compiler-sanitized.ll
+	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/minyarc-sanitize build/compiler.min build/compiler-sanitized.ll
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --ir build/compiler-sanitized.ll --ir build/compiler-stage3.ll
 
 check-sanitize: check-generated-sanitizer check-sanitized-fixed-point check-stack-overflow-sanitize build/minyar-runtime.o build/minyar-runtime-sanitize.o build/runtime-unit-sanitize
@@ -479,7 +479,7 @@ check-fuzz-afl-harness:
 	python3 tests/fuzz-afl-harness.py
 
 .PHONY: check-bootstrap-portability
-check-bootstrap-portability:
+check-bootstrap-portability: build/compiler.min
 	python3 tests/bootstrap-portability.py
 
 check-portable: check-bootstrap-portability

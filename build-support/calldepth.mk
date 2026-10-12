@@ -1,4 +1,4 @@
-build/calldepth-compiler.min: compiler/build-calldepth-compiler.py compiler/calldepth-compiler.min compiler/build-errors-compiler.py compiler/compiler.min compiler/closure-compiler.min compiler/errors-compiler.min compiler/managed-graphs-adapter.patch scripts/build-closure-compiler.py scripts/build-module-compiler.py | build
+build/calldepth-compiler.min: compiler/build-calldepth-compiler.py compiler/calldepth-compiler.min compiler/build-errors-compiler.py build/compiler.min compiler/closure-compiler.min compiler/errors-compiler.min compiler/managed-graphs-adapter.patch scripts/build-closure-compiler.py scripts/build-module-compiler.py | build
 	python3 compiler/build-calldepth-compiler.py $@
 
 build/calldepth-compiler-stage1.ll: build/calldepth-compiler.min build/minyarc

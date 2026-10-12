@@ -7,6 +7,7 @@ match exactly once so core changes cannot silently produce a stale adapter."""
 import argparse
 from pathlib import Path
 import re
+import runpy
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -42,7 +43,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path)
     args = parser.parse_args()
-    core = adapt((ROOT / 'compiler/compiler.min').read_text(),
+    core = adapt(runpy.run_path(str(ROOT / 'compiler/source.py'))['core_source'](),
                  (ROOT / 'compiler/module-compiler-adapter.patch').read_text())
     matches = list(re.finditer(r'^function main\(', core, re.MULTILINE))
     if len(matches) != 1 or re.search(r'^function ', core[matches[0].end():], re.MULTILINE):

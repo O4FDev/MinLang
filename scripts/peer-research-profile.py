@@ -178,7 +178,7 @@ def measure_existing(directory: Path, samples: int) -> None:
 
 
 def workloads(directory: Path) -> list[tuple[str, Path]]:
-    cases = [("self", ROOT / "compiler/compiler.min")]
+    cases = [("self", ROOT / "build/compiler.min")]
     for count in (500, 2000):
         path = directory / f"functions-{count}.min"
         path.write_text("".join(f"function f{i}(x: Integer): Integer {{ return x + {i} }}\n"

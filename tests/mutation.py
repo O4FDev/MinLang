@@ -12,7 +12,7 @@ from clang_helpers import clang_command
 
 
 ROOT = Path(__file__).resolve().parent.parent
-SOURCE = ROOT / "compiler" / "compiler.min"
+SOURCE = ROOT / "build" / "compiler.min"
 RUNTIME_SOURCE = ROOT / "runtime" / "minyar_runtime.c"
 RUNTIME = ROOT / "build" / "minyar-runtime.o"
 if not RUNTIME.exists():

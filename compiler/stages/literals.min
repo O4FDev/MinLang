@@ -1,0 +1,212 @@
+function parseListLiteral(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
+    state[0] = state[0] + 1
+    let elementType = 0
+    if isListType(resultType[0]) {
+        elementType = listElementType(resultType[0])
+    }
+    let temporary = newTemporary(state)
+    let value = valueName(textState, temporary)
+    output.add("  ")
+    output.add(value)
+    output.add(" = call ptr @minyar_list_new()\n")
+    let references = false
+    if isReferenceType(elementType) {
+        output.add("  call void @minyar_list_references(ptr ")
+        output.add(value)
+        output.add(")\n")
+        references = true
+    }
+    skipTerminators(tokenKinds, state)
+    while !tokenIs(tokenKinds, tokenTexts, state, "]") {
+        if (elementType == 0 || elementType == 1) && integerListItemEnd(tokenKinds, tokenTexts, state[0]) > 0 {
+            elementType = 1
+            appendIntegerListRun(tokenKinds, tokenTexts, tokenLines, state, textState, output, globals, value)
+        } else {
+        let itemType: List<Integer> = []
+        itemType.add(elementType)
+        let item = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, itemType)
+        if itemType[0] == 5 || itemType[0] == 6 {
+            fail("Nothing cannot be stored in a List")
+        }
+        if itemType[0] == 100000 {
+            fail("an empty List needs a type, such as List<Text>")
+        }
+        if elementType == 0 {
+            elementType = itemType[0]
+        }
+        if itemType[0] != elementType {
+            fail("all values in a List literal must have the same type")
+        }
+        if isReferenceType(elementType) && !references {
+            output.add("  call void @minyar_list_references(ptr ")
+            output.add(value)
+            output.add(")\n")
+            references = true
+        }
+        let slot = valueAsListSlot(output, textState, state, item, elementType)
+        if takeResult(output, state, item, itemType) {
+            output.add("  call void @minyar_list_add_take(ptr ")
+        } else {
+            output.add("  call void @minyar_list_add(ptr ")
+        }
+        output.add(value)
+        output.add(", i64 ")
+        output.add(slot)
+        output.add(")\n")
+        }
+        skipTerminators(tokenKinds, state)
+        if !tokenIs(tokenKinds, tokenTexts, state, "]") {
+            expectToken(tokenKinds, tokenTexts, tokenLines, state, ",")
+            skipTerminators(tokenKinds, state)
+        }
+    }
+    expectToken(tokenKinds, tokenTexts, tokenLines, state, "]")
+    setType(resultType, makeListType(elementType))
+    return value
+}
+
+function parseAtom(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
+    let tokenIndex = state[0]
+    let kind = tokenKinds[tokenIndex]
+    let token = tokenTexts[tokenIndex]
+    let value = ""
+
+    if token == "function" && tokenTexts[tokenIndex + 1] == "(" {
+        state[0] = tokenIndex + 2
+        while !tokenIs(tokenKinds, tokenTexts, state, ")") {
+            if tokenKinds[state[0]] != 1 { fail("expected a callback parameter name") }
+            state[0] = state[0] + 1
+            expectToken(tokenKinds, tokenTexts, tokenLines, state, ":")
+            takeValueType(tokenKinds, tokenTexts, tokenLines, state, functionNames, symbolKinds)
+            if tokenIs(tokenKinds, tokenTexts, state, ",") { state[0] = state[0] + 1 }
+        }
+        expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
+        if tokenIs(tokenKinds, tokenTexts, state, ":") {
+            state[0] = state[0] + 1
+            takeType(tokenKinds, tokenTexts, tokenLines, state, functionNames, symbolKinds)
+        }
+        expectToken(tokenKinds, tokenTexts, tokenLines, state, "{")
+        exit(86)
+    }
+
+    if kind == 1 {
+        if token == "Map" && (tokenTexts[tokenIndex + 1] == "<" || tokenTexts[tokenIndex + 1] == "(") {
+            declareMapRuntime(globals)
+            let type = resultType[0]
+            if tokenTexts[tokenIndex + 1] == "<" {
+                type = takeType(tokenKinds, tokenTexts, tokenLines, state, functionNames, symbolKinds)
+            } else { state[0] = tokenIndex + 1 }
+            if !isMapType(type) { fail("Map() needs a contextual Map<K, V> type") }
+            expectToken(tokenKinds, tokenTexts, tokenLines, state, "(")
+            expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
+            value = valueName(textState, newTemporary(state))
+            let references = "0"
+            if isReferenceType(mapValueType(type)) { references = "1" }
+            output.add("  " + value + " = call ptr @minyar_map_new(i64 " + Text(mapKeyType(type)) + ", i64 " + references + ")\n")
+            setType(resultType, type)
+            // Contextual Map() follows parsePrimary's ordinary call ownership;
+            // the explicit generic constructor needs its own producer token.
+            if tokenTexts[tokenIndex + 1] == "<" { ownResult(output, state, value, resultType) }
+            return value
+        }
+        if token == "true" || token == "false" {
+            value = token
+            state[0] = tokenIndex + 1
+            setType(resultType, 4)
+        } else {
+            if tokenTexts[tokenIndex + 1] == "(" {
+                value = parseCall(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
+            } else {
+                if tokenKinds[tokenIndex + 1] == 4 && tokenTexts[tokenIndex + 1] == "{" && findCompiledSymbol(functionNames, symbolKinds, functionReturnTypes, token, 2) >= 0 {
+                    value = parseRecord(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
+                } else {
+                    let local = findLocal(localNames, localLengths, state, token)
+                    let constant = -1
+                    if local < 0 {
+                        constant = findCompiledSymbol(functionNames, symbolKinds, functionReturnTypes, token, 3)
+                        if constant < 0 {
+                            fail(describeLocation(tokenLocation(tokenLines, tokenIndex)) + ": I can't find a value named '" + readableDeclarationName(token) + "'")
+                        }
+                    }
+                    if constant >= 0 {
+                        if functionParameterCounts[constant] < 0 {
+                            let values: List<Text> = []
+                            let types: List<Integer> = []
+                            let type = functionReturnTypes[constant]
+                            value = emitCall(output, textState, state, type, constantIRName(token, "load"), values, types)
+                            state[14] = state[14] + 1
+                            setType(resultType, type)
+                            borrowReference(output, state, value, type)
+                        } else {
+                            // Literal constants still substitute at the use site.
+                            state[0] = functionParameterCounts[constant]
+                            value = parseUnary(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
+                        }
+                        state[0] = tokenIndex + 1
+                    } else {
+                    state[0] = tokenIndex + 1
+                    let id = localIds[local]
+                    if id < 0 {
+                        value = output[-id - 1]
+                    } else {
+                        let temporary = newTemporary(state)
+                        value = valueName(textState, temporary)
+                        output.add("  ")
+                        output.add(value)
+                        output.add(" = load ")
+                        output.add(llvmType(localTypes[local]))
+                        output.add(", ptr %local.")
+                        output.add(Text(id))
+                        output.add("\n")
+                    }
+                    setType(resultType, localTypes[local])
+                    if id >= 0 && resultType.length > 3 && resultType[2] == id && resultType[3] == tokenIndex {
+                        let owner = output.length
+                        output.add("  ; minyar-owned-local-transfer\n")
+                        output.add(Text(ownershipSlot(state, id)))
+                        markOwner(resultType, owner)
+                    }
+                    }
+                }
+            }
+        }
+    } else {
+        if kind == 2 {
+            value = checkedIntegerLiteral(token, false, tokenLines, tokenIndex)
+            state[0] = tokenIndex + 1
+            setType(resultType, 1)
+        } else {
+        if kind == 7 {
+            value = checkedFloatLiteral(token, tokenLines, tokenIndex)
+            state[0] = tokenIndex + 1
+            setType(resultType, 7)
+        } else {
+            if kind == 3 {
+                value = "getelementptr (i8, ptr @.text." + Text(tokenIndex) + ", i64 8)"
+                state[0] = tokenIndex + 1
+                setType(resultType, 2)
+            } else {
+                if kind == 5 {
+                    state[0] = tokenIndex + 1
+                    value = Text(Integer(token[0]))
+                    setType(resultType, 3)
+                } else {
+                    if token == "(" {
+                        state[0] = tokenIndex + 1
+                        value = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
+                        expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
+                    } else {
+                        if token == "[" {
+                            value = parseListLiteral(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
+                        } else {
+                            fail(describeLocation(tokenLocation(tokenLines, tokenIndex)) + ": expected an expression, found '" + token + "'")
+                        }
+                    }
+                }
+            }
+        }
+        }
+    }
+    return value
+}
+

@@ -9,7 +9,7 @@ import unittest
 from clang_helpers import clang_command
 from regressions import CLANG, LINK_FLAGS, ROOT, RUNTIME, CompilerTestCase
 
-CORE = Path(os.environ.get('MINYAR_TEST_SOURCE', ROOT / 'compiler/compiler.min'))
+CORE = Path(os.environ.get('MINYAR_TEST_SOURCE', ROOT / 'build/compiler.min'))
 TEXTS = ('', 'a', 'aa', 'ab', 'b', 'A', 'é', 'e\u0301', '界', '🙂', 'é🙂', 'same', 'same')
 SYMBOL_NAMES = ('same', 'a', 'same', '', 'a', '🙂', 'é', 'same', 'A', 'aa', 'é', 'same', 'e\u0301', '界')
 SYMBOL_KINDS = (2, 3, 1, 2, 1, 1, 3, 2, 1, 1, 1, 3, 1, 1)

@@ -1,0 +1,246 @@
+function finishParallelFunction(output: List<Text>, globals: List<Text>, entrySlot: Integer, bodySlot: Integer, name: Text, references: Boolean) {
+    if references {
+        fail("parallel function '" + readableDeclarationName(name) + "' may use only Integer, Float, Boolean and Character values")
+    }
+    dropCallDepthFrame(output, entrySlot, bodySlot)
+    let body: List<Text> = []
+    let piece = bodySlot
+    while piece < output.length {
+        let text = output[piece]
+        if text == "  call void @minyar_rc_leave()\n" || text == "  call void @minyar_rc_step()\n" {
+            output[piece] = ""
+        } else {
+            body.add(text)
+        }
+        piece = piece + 1
+    }
+    // Instructions are emitted in pieces; scan the whole body as one text.
+    let text = joinText(body)
+    let position = 0
+    while position + 8 < text.length {
+        if text[position] == '@' && text.slice(position, position + 8) == "@minyar_" {
+            let end = position + 8
+            while end < text.length && text[end] != '(' && text[end] != ' ' { end = end + 1 }
+            let callee = text.slice(position + 1, end)
+            if !parallelRuntimeAllowed(callee) {
+                fail("parallel function '" + readableDeclarationName(name) + "' cannot use the runtime ('" + callee + "')")
+            }
+        }
+        if text[position] == '@' && position + 12 < text.length && text.slice(position, position + 12) == "@.minyar.fn." {
+            let end = position + 12
+            while end < text.length && text[end] != '(' && text[end] != ' ' { end = end + 1 }
+            globals.add("; minyar-parallel-call: " + name + "|" + text.slice(position + 12, end) + "\n")
+        }
+        position = position + 1
+    }
+}
+
+// Remove the call-depth check from a function's entry and every return.
+function dropCallDepthFrame(output: List<Text>, entrySlot: Integer, bodySlot: Integer) {
+    let enter = "  call void @minyar_stack_enter()\n"
+    let entry = output[entrySlot]
+    if entry.length >= enter.length && entry.slice(0, enter.length) == enter {
+        output[entrySlot] = entry.slice(enter.length, entry.length)
+    }
+    let piece = bodySlot
+    while piece < output.length {
+        if output[piece] == "  call void @minyar_stack_leave()\n" {
+            output[piece] = ""
+        }
+        piece = piece + 1
+    }
+}
+
+// dropCallDepthFrame for a function that is no longer the last one emitted.
+function dropCallDepthFrameBetween(output: List<Text>, entrySlot: Integer, bodySlot: Integer, endSlot: Integer) {
+    let enter = "  call void @minyar_stack_enter()\n"
+    let entry = output[entrySlot]
+    if entry.length >= enter.length && entry.slice(0, enter.length) == enter {
+        output[entrySlot] = entry.slice(enter.length, entry.length)
+    }
+    let piece = bodySlot
+    while piece < endSlot {
+        if output[piece] == "  call void @minyar_stack_leave()\n" {
+            output[piece] = ""
+        }
+        piece = piece + 1
+    }
+}
+
+// A function whose every call goes to a function without a call-depth check
+// cannot recurse: each of those calls returns without calling back. Two
+// levels of such functions above the leaves, each within the leaf limits on
+// locals, temporaries and labels, need at most three frames of about 18 KiB,
+// inside the 128 KiB reserve that their caller's check left
+// (MINYAR_STACK_RESERVE_BYTES). Their checks are removed like a leaf's. The
+// callees are read back from the emitted calls; a function whose calls were
+// not all recognised (fewer than the parser counted) keeps its check.
+function dropTreeGuards(output: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, treeFunctions: List<Integer>, treeKinds: List<Integer>, treeCalls: List<Integer>, treeSlots: List<Integer>) {
+    let recordOf: List<Integer> = []
+    let index = 0
+    while index < functionNames.length {
+        recordOf.add(-1)
+        index = index + 1
+    }
+    let record = 0
+    while record < treeFunctions.length {
+        if treeFunctions[record] >= 0 { recordOf[treeFunctions[record]] = record }
+        record = record + 1
+    }
+    // Callee records of each caller. A caller with a callee that is not a
+    // record can never lose its check: kind 9, and its scan stops there.
+    let calleeStarts: List<Integer> = []
+    let callees: List<Integer> = []
+    record = 0
+    while record < treeFunctions.length {
+        calleeStarts.add(callees.length)
+        if treeKinds[record] == 1 {
+            let found = 0
+            let piece = treeSlots[record * 3 + 1] + 2
+            let end = treeSlots[record * 3 + 2] - 1
+            while piece < end {
+                let marker = output[piece]
+                if output[piece - 2] == "call " && (marker == " @.minyar.fn." || (marker == " @" && output[piece + 1].length > 0 && output[piece + 1][0] == '"')) {
+                    let callee = findFunction(functionNames, symbolKinds, functionReturnTypes, output[piece + 1])
+                    if callee < 0 || recordOf[callee] < 0 {
+                        treeKinds[record] = 9
+                        piece = end
+                    } else {
+                        callees.add(recordOf[callee])
+                        found = found + 1
+                    }
+                }
+                piece = piece + 1
+            }
+            if treeKinds[record] == 1 && found != treeCalls[record] { treeKinds[record] = 9 }
+        }
+        record = record + 1
+    }
+    calleeStarts.add(callees.length)
+    // Kind 1 becomes level 2 or 3 once all its callees sit lower; what is
+    // still 1 or 9 afterwards keeps its check.
+    let level = 2
+    while level <= 3 {
+        record = 0
+        while record < treeFunctions.length {
+            if treeKinds[record] == 1 {
+                let free = true
+                let position = calleeStarts[record]
+                while free && position < calleeStarts[record + 1] {
+                    let callee = callees[position]
+                    if callee == record || treeKinds[callee] == 1 || treeKinds[callee] >= level {
+                        free = false
+                    }
+                    position = position + 1
+                }
+                if free { treeKinds[record] = level }
+            }
+            record = record + 1
+        }
+        level = level + 1
+    }
+    record = 0
+    while record < treeFunctions.length {
+        if treeKinds[record] == 2 || treeKinds[record] == 3 {
+            dropCallDepthFrameBetween(output, treeSlots[record * 3], treeSlots[record * 3 + 1], treeSlots[record * 3 + 2])
+        }
+        record = record + 1
+    }
+}
+
+// Runtime functions that are safe on any processor: failures that stop the
+// machine, and pure mathematics.
+function parallelRuntimeAllowed(callee: Text): Boolean {
+    if callee.length > 11 && callee.slice(0, 11) == "minyar_fail" { return true }
+    return callee == "minyar_tan" || callee == "minyar_asin" || callee == "minyar_acos" || callee == "minyar_atan" || callee == "minyar_atan2"
+}
+
+function markerValue(marker: Text, prefix: Text): Text {
+    return marker.slice(prefix.length, marker.length - 1)
+}
+
+// Every function a parallel function calls must itself be parallel or a
+// machine intrinsic; every parallelEntry must name a parallel function.
+function checkParallelCalls(globals: List<Text>) {
+    let callPrefix = "; minyar-parallel-call: "
+    let entryPrefix = "; minyar-parallel-entry: "
+    let index = 0
+    while index < globals.length {
+        let marker = globals[index]
+        let callee = ""
+        let caller = ""
+        if marker.length > callPrefix.length && marker.slice(0, callPrefix.length) == callPrefix {
+            let pair = markerValue(marker, callPrefix)
+            let separator = findCharacter(pair, '|')
+            caller = pair.slice(0, separator)
+            callee = pair.slice(separator + 1, pair.length)
+        }
+        if marker.length > entryPrefix.length && marker.slice(0, entryPrefix.length) == entryPrefix {
+            callee = markerValue(marker, entryPrefix)
+        }
+        if callee != "" {
+            let parallel = findText(globals, "; minyar-parallel: " + callee + "\n") >= 0
+            let machine = findText(globals, "; minyar-machine: " + callee + "\n") >= 0
+            if !parallel && !(machine && caller != "") {
+                if caller == "" {
+                    fail("parallelEntry needs a parallel function, and '" + readableDeclarationName(callee) + "' is not one")
+                }
+                fail("parallel function '" + readableDeclarationName(caller) + "' can only call parallel functions, not '" + readableDeclarationName(callee) + "'")
+            }
+        }
+        index = index + 1
+    }
+}
+
+function appendNativeDeclarations(output: List<Text>) {
+    let marker = "  ; minyar-native: "
+    let libraries: List<Text> = []
+    let declarations: List<Text> = []
+    let symbols: List<Text> = []
+    let runtimeSymbols: List<Text> = []
+    let count = output.length
+    let piece = 0
+    while piece < count {
+        let text = output[piece]
+        // Read the emitted ABI catalog, including the newline before its first
+        // declaration and bounded-owner declarations appended after bodies.
+        let start = 0
+        while start < text.length && text[start] == '\n' { start = start + 1 }
+        if text.length >= start + 8 && text[start] == 'd' && text.slice(start, start + 8) == "declare " {
+            runtimeSymbols.add(text.slice(findCharacter(text, '@') + 1, findCharacter(text, '(')))
+        }
+        if text.length > marker.length && text[2] == ';' && text.slice(0, marker.length) == marker {
+            let body = text.slice(marker.length, text.length - 1)
+            let separator = findCharacter(body, '|')
+            let library = body.slice(0, separator)
+            let declaration = body.slice(separator + 1, body.length)
+            let symbol = declaration.slice(findCharacter(declaration, '@') + 1, findCharacter(declaration, '('))
+            let existing = findText(symbols, symbol)
+            if existing >= 0 && declarations[existing] != declaration {
+                fail("native symbol has conflicting function signatures: '" + symbol + "'")
+            }
+            if findText(libraries, library) < 0 {
+                libraries.add(library)
+            }
+            if findText(declarations, declaration) < 0 {
+                declarations.add(declaration)
+                symbols.add(symbol)
+            }
+        }
+        piece = piece + 1
+    }
+    piece = 0
+    while piece < declarations.length {
+        if findText(runtimeSymbols, symbols[piece]) >= 0 {
+            fail("native symbol conflicts with a runtime function: '" + symbols[piece] + "'")
+        }
+        output.add(declarations[piece] + "\n")
+        piece = piece + 1
+    }
+    piece = 0
+    while piece < libraries.length {
+        output.add("; minyar-native-library: " + libraries[piece] + "\n")
+        piece = piece + 1
+    }
+}
+

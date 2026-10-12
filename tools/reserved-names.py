@@ -3,6 +3,7 @@
 import argparse
 from pathlib import Path
 import re
+import runpy
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCUMENT = ROOT / 'docs/language.md'
@@ -11,7 +12,7 @@ END = '<!-- reserved-names: end -->\n'
 
 
 def names():
-    source = (ROOT / 'compiler/compiler.min').read_text()
+    source = runpy.run_path(str(ROOT / 'compiler/source.py'))['core_source']()
     found = set()
     for function in ('isBuiltinName', 'isNumericBuiltin', 'isFloatFunction'):
         body = re.search(r'^function ' + function + r'\([^\n]+\{\n(.*?)\n}', source, re.M | re.S)

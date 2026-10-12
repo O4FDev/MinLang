@@ -404,7 +404,7 @@ def main():
     if not args.compiler.is_file() or not args.runtime.is_file():
         parser.error("execution requires existing compiler and runtime files")
     sources = [Path(__file__), args.compiler, args.runtime,
-               ROOT / "compiler/compiler.min", ROOT / "bootstrap/stage0.c", *sorted((ROOT / "runtime").glob("*.[ch]"))]
+               ROOT / "build/compiler.min", ROOT / "bootstrap/stage0.c", *sorted((ROOT / "runtime").glob("*.[ch]"))]
     report["source_hashes_start"] = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in sources}
     report["environment"] = {key: value for key, value in os.environ.items()
                              if key.startswith("MINYAR_") or key in ("CC", "CLANG", "LLVM_OPT")}

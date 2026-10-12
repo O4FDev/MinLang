@@ -1,0 +1,224 @@
+function keepReference(output: List<Text>, state: List<Integer>, value: Text, type: Integer): Integer {
+    let owner = -1
+    if isReferenceType(type) {
+        owner = output.length
+        state[6] = 1
+        state[7] = state[7] + 1
+        output.add("  call void @minyar_rc_keep(ptr ")
+        output.add(value)
+        output.add(")\n")
+    }
+    return owner
+}
+
+function markOwner(resultType: List<Integer>, owner: Integer) {
+    if resultType.length == 1 {
+        resultType.add(owner)
+    } else {
+        resultType[1] = owner
+    }
+}
+
+function ownResult(output: List<Text>, state: List<Integer>, value: Text, resultType: List<Integer>) {
+    if isReferenceType(resultType[0]) {
+        markOwner(resultType, keepReference(output, state, value, resultType[0]))
+    }
+}
+
+// A producer returns one owned reference. A consuming destination can take
+// that exact reference, eliminating temporary registration and a retain/drop
+// pair. Borrowed values never carry this token. No heap uniqueness is assumed.
+function takeResult(output: List<Text>, state: List<Integer>, value: Text, resultType: List<Integer>): Boolean {
+    if isReferenceType(resultType[0]) && resultType.length > 1 {
+        let owner = resultType[1]
+        if takeOwner(output, state, value, owner) {
+            resultType[1] = -1
+            return true
+        }
+    }
+    return false
+}
+
+function takeOwner(output: List<Text>, state: List<Integer>, value: Text, owner: Integer): Boolean {
+    if owner == -1 { return false }
+    if output[owner] == "  ; minyar-owned-local-transfer\n" {
+        // Delay clearing the slot until after the right operand has run. This
+        // preserves expressions such as x = x + x while still handing the
+        // left ownership count to the consuming join.
+        // A local that does not own its value yet (a parameter before its
+        // first assignment) gets one count, so the consumer always takes one.
+        output.add("  call void @minyar_rc_local_move_owner(i64 ")
+        output.add(output[owner + 1])
+        output.add(", ptr ")
+        output.add(value)
+        output.add(")\n")
+        output[owner] = ""
+        output[owner + 1] = ""
+        return true
+    }
+    if output[owner] == "  call void @minyar_rc_keep(ptr " && output[owner + 1] == value {
+        output[owner] = ""
+        output[owner + 1] = ""
+        output[owner + 2] = ""
+        state[7] = state[7] - 1
+        return true
+    }
+    return false
+}
+
+// LLVM local identifiers and runtime ownership slots are independent. Only
+// bindings that acquire an owner need a slot. Generation tags reuse the map
+// between functions without clearing its high-water capacity each time.
+// The first 15 entries hold compiler state, including reachability at index 13
+// and the body's user-call count at index 14.
+function ownershipSlot(state: List<Integer>, id: Integer): Integer {
+    let entry = 15 + id * 2
+    while state.length <= entry + 1 {
+        state.add(-1)
+    }
+    if state[entry] != state[9] {
+        state[entry] = state[9]
+        state[entry + 1] = state[8]
+        state[8] = state[8] + 1
+    }
+    return state[entry + 1]
+}
+
+// Negative ownership-map values identify scalar-replaced records. Their
+// initializer SSA values are kept in harmless output comments, just as owned
+// expression tokens identify editable output pieces elsewhere in this emitter.
+function scalarRecordValues(state: List<Integer>, id: Integer): Integer {
+    if id < 0 { return -1 }
+    let entry = 15 + id * 2
+    if entry + 1 < state.length && state[entry] == state[9] && state[entry + 1] < -1 {
+        return -2 - state[entry + 1]
+    }
+    return -1
+}
+
+function markScalarRecord(state: List<Integer>, id: Integer, values: Integer) {
+    let entry = 15 + id * 2
+    while state.length <= entry + 1 { state.add(-1) }
+    state[entry] = state[9]
+    state[entry + 1] = -2 - values
+}
+
+// A let-bound scalar record can be replaced only when every occurrence of its
+// name in the remaining lexical scope is a field projection. Reject aliases,
+// assignments, argument passing, returns of the object, and shadowing. This is
+// deliberately conservative and does not infer anything from return types.
+function prepareScalarRecord(tokenKinds: List<Integer>, tokenTexts: List<Text>, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, counts: List<Integer>, fields: List<Integer>, state: List<Integer>, name: Text) {
+    let record = findCompiledSymbol(functionNames, symbolKinds, functionReturnTypes, tokenTexts[state[0]], 2)
+    if record < 0 { return }
+    let cost = counts[record] * 8
+    if cost == 0 { cost = 8 }
+    if cost > 512 - state[11] { return }
+    let first = functionParameterOffset(counts, record)
+    let field = 0
+    while field < counts[record] {
+        if isReferenceType(fields[first + field]) { return }
+        field = field + 1
+    }
+    // Charge rejected proofs too, so at most 64 suffix scans run per body.
+    state[11] = state[11] + cost
+    let cursor: List<Integer> = []
+    cursor.add(state[0])
+    skipDeclaration(tokenKinds, tokenTexts, cursor)
+    let position = cursor[0]
+    if tokenKinds[position] != 0 && tokenKinds[position] != 6 && tokenTexts[position] != "}" { return }
+    let depth = 0
+    let done = false
+    while tokenKinds[position] != 0 && !done {
+        if tokenKinds[position] == 1 && tokenTexts[position] == name {
+            if position + 1 >= tokenTexts.length || tokenTexts[position + 1] != "." { return }
+            if position + 3 < tokenTexts.length && tokenKinds[position + 3] == 4 && isAssignmentOperator(tokenTexts[position + 3]) { return }
+        }
+        if tokenKinds[position] == 4 {
+            if tokenTexts[position] == "{" { depth = depth + 1 }
+            if tokenTexts[position] == "}" {
+                if depth == 0 { done = true } else { depth = depth - 1 }
+            }
+        }
+        position = position + 1
+    }
+    state[10] = state[4]
+}
+
+function rootLocal(output: List<Text>, state: List<Integer>, id: Integer, value: Text, type: Integer) {
+    if isReferenceType(type) {
+        let owner = ownershipSlot(state, id)
+        if owner < 0 { return }
+        state[6] = 1
+        output.add("  call void @minyar_rc_local(i64 ")
+        output.add(Text(owner))
+        output.add(", ptr ")
+        output.add(value)
+        output.add(")\n")
+    }
+}
+
+function assignReference(output: List<Text>, state: List<Integer>, id: Integer, value: Text, resultType: List<Integer>) {
+    if takeResult(output, state, value, resultType) {
+        state[6] = 1
+        output.add("  call void @minyar_rc_local_take(i64 ")
+        output.add(Text(ownershipSlot(state, id)))
+        output.add(", ptr ")
+        output.add(value)
+        output.add(")\n")
+    } else {
+        rootLocal(output, state, id, value, resultType[0])
+    }
+}
+function borrowReference(output: List<Text>, state: List<Integer>, value: Text, type: Integer) {
+    if isReferenceType(type) {
+        state[6] = 1
+        state[7] = state[7] + 1
+        output.add("  call void @minyar_rc_borrow(ptr ")
+        output.add(value)
+        output.add(")\n")
+    }
+}
+
+function finishStackOwnership(output: List<Text>, slot: Integer, owners: Integer) {
+    let stackEntry = "  call void @minyar_stack_enter()\n"
+    let prefix = stackEntry + "  call void @minyar_rc_enter(i64 " + Text(owners) + ")\n"
+    let entry = stackEntry + "  %rc.stack.header = alloca [64 x i8], align 8\n"
+    entry = entry + "  %rc.stack.owners = alloca [" + Text(owners * 2) + " x i64], align 8\n"
+    entry = entry + "  call void @minyar_rc_enter_stack_v1(ptr %rc.stack.header, ptr %rc.stack.owners, i64 " + Text(owners) + ")\n"
+    output[slot] = entry + output[slot].slice(prefix.length, output[slot].length)
+    output[slot - 1] = ") noinline {\nentry:\n"
+    let piece = slot + 1
+    while piece < output.length {
+        if output[piece] == "  call void @minyar_rc_leave()\n" {
+            output[piece] = "  call void @minyar_rc_leave_stack_v1(ptr %rc.stack.header)\n"
+        }
+        piece = piece + 1
+    }
+}
+
+function finishFunctionEntry(output: List<Text>, slot: Integer, locals: Integer, parameters: Integer, owners: Integer, references: Boolean) {
+    let entry: List<Text> = []
+    entry.add("  call void @minyar_stack_enter()\n")
+    if references {
+        entry.add("  call void @minyar_rc_enter(i64 ")
+        entry.add(Text(owners))
+        entry.add(")\n")
+    } else {
+        let piece = slot + 1
+        while piece < output.length {
+            if output[piece] == "  call void @minyar_rc_step()\n" || output[piece] == "  call void @minyar_rc_leave()\n" {
+                output[piece] = ""
+            }
+            piece = piece + 1
+        }
+    }
+    let local = parameters
+    while local < locals {
+        entry.add("  %local.")
+        entry.add(Text(local))
+        entry.add(" = alloca i64\n")
+        local = local + 1
+    }
+    output[slot] = joinText(entry)
+}
+

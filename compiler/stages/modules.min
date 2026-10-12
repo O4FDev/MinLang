@@ -1,0 +1,596 @@
+function pathCharacterIsSeparator(character: Character): Boolean {
+    return character == '/' || character == '\\'
+}
+
+function normalizePath(path: Text): Text {
+    let parts: List<Text> = []
+    let activeParts = 0
+    let position = 0
+    let absolute = false
+    let drive = ""
+
+    if path.length >= 2 && path[1] == ':' {
+        drive = Text(path[0]) + ":"
+        position = 2
+        if position < path.length && pathCharacterIsSeparator(path[position]) {
+            absolute = true
+            position = position + 1
+        }
+    } else {
+        if path.length > 0 && pathCharacterIsSeparator(path[0]) {
+            absolute = true
+            position = 1
+        }
+    }
+
+    let part = ""
+    while position <= path.length {
+        let atEnd = position == path.length
+        if atEnd || pathCharacterIsSeparator(path[position]) {
+            if part == ".." {
+                if activeParts > 0 && parts[activeParts - 1] != ".." {
+                    activeParts = activeParts - 1
+                } else {
+                    if !absolute {
+                        if activeParts < parts.length {
+                            parts[activeParts] = part
+                        } else {
+                            parts.add(part)
+                        }
+                        activeParts = activeParts + 1
+                    }
+                }
+            } else {
+                if part != "" && part != "." {
+                    if activeParts < parts.length {
+                        parts[activeParts] = part
+                    } else {
+                        parts.add(part)
+                    }
+                    activeParts = activeParts + 1
+                }
+            }
+            part = ""
+        } else {
+            part = part + Text(path[position])
+        }
+        position = position + 1
+    }
+
+    let result = drive
+    if absolute {
+        result = result + "/"
+    }
+    position = 0
+    while position < activeParts {
+        if result.length > 0 && result[result.length - 1] != '/' {
+            result = result + "/"
+        }
+        result = result + parts[position]
+        position = position + 1
+    }
+    if result == "" {
+        result = "."
+    }
+    return result
+}
+
+function directoryOfPath(path: Text): Text {
+    let normalized = normalizePath(path)
+    let lastSeparator = -1
+    let position = 0
+    while position < normalized.length {
+        if normalized[position] == '/' {
+            lastSeparator = position
+        }
+        position = position + 1
+    }
+    let directory = ""
+    position = 0
+    while position < lastSeparator {
+        directory = directory + Text(normalized[position])
+        position = position + 1
+    }
+    if lastSeparator == 0 {
+        directory = "/"
+    }
+    return directory
+}
+
+function resolveModulePath(importer: Text, specifier: Text): Text {
+    let relative = false
+    if specifier.length >= 2 && specifier[0] == '.' && pathCharacterIsSeparator(specifier[1]) {
+        relative = true
+    }
+    if specifier.length >= 3 && specifier[0] == '.' && specifier[1] == '.' && pathCharacterIsSeparator(specifier[2]) {
+        relative = true
+    }
+    if !relative {
+        fail("package module '" + specifier + "' is not available yet; local modules begin with './' or '../'")
+    }
+    let directory = directoryOfPath(importer)
+    if directory == "" {
+        return normalizePath(specifier)
+    }
+    return normalizePath(directory + "/" + specifier)
+}
+
+// Names without ./ or ../ are standard library packages, found in the
+// directories passed to the compiler with --library. `library` holds them one
+// per line; the first that has the package wins, so a directory such as
+// library/arch/arm64 listed first can replace a package for one processor.
+function resolveImport(importer: Text, specifier: Text, library: Text): Text {
+    let relative = specifier.length >= 2 && specifier[0] == '.' && (pathCharacterIsSeparator(specifier[1]) || specifier[1] == '.')
+    if relative || library == "" {
+        return resolveModulePath(importer, specifier)
+    }
+    let split = findCharacter(library, '\n')
+    if split >= 0 {
+        let first = library.slice(0, split)
+        let candidate = resolveImport(importer, specifier, first)
+        if fileExists(candidate) { return candidate }
+        return resolveImport(importer, specifier, library.slice(split + 1, library.length))
+    }
+    let position = 0
+    while position < specifier.length {
+        let character = specifier[position]
+        if !characterIsLetter(character) && !characterIsDigit(character) && character != '-' && character != '_' {
+            fail("package names use letters, digits, '-', and '_'; found '" + specifier + "'")
+        }
+        position = position + 1
+    }
+    return normalizePath(library + "/" + specifier + ".min")
+}
+
+function findText(values: List<Text>, wanted: Text): Integer {
+    let position = 0
+    let found = -1
+    while position < values.length && found < 0 {
+        if values[position] == wanted {
+            found = position
+        }
+        position = position + 1
+    }
+    return found
+}
+
+function findModuleImport(importOwners: List<Integer>, importAliases: List<Text>, owner: Integer, alias: Text): Integer {
+    let position = 0
+    let found = -1
+    while position < importOwners.length && found < 0 {
+        if importOwners[position] == owner && importAliases[position] == alias {
+            found = position
+        }
+        position = position + 1
+    }
+    return found
+}
+
+function loadModule(library: Text, path: Text, isEntry: Boolean, modulePaths: List<Text>, moduleSources: List<Text>, moduleStates: List<Integer>, modulePublic: List<Integer>, moduleTokenStarts: List<Integer>, allTokenKinds: List<Integer>, allTokenTexts: List<Text>, allTokenLines: SourceMap, importOwners: List<Integer>, importAliases: List<Text>, importTargets: List<Integer>, declarationStarts: List<Integer>, declarationEnds: List<Integer>): Integer {
+    let canonicalPath = normalizePath(path)
+    let existing = findText(modulePaths, canonicalPath)
+    if existing >= 0 {
+        if moduleStates[existing] == 1 {
+            let cycle = ""
+            let position = 0
+            while position < modulePaths.length {
+                if moduleStates[position] == 1 {
+                    if cycle != "" {
+                        cycle = cycle + " -> "
+                    }
+                    cycle = cycle + modulePaths[position]
+                }
+                position = position + 1
+            }
+            fail("module import cycle: " + cycle + " -> " + canonicalPath)
+        }
+        return existing
+    }
+
+    let module = modulePaths.length
+    modulePaths.add(canonicalPath)
+    moduleSources.add(readTextFile(canonicalPath))
+    moduleStates.add(1)
+    modulePublic.add(0)
+
+    moduleTokenStarts.add(allTokenKinds.length)
+    tokenize(moduleSources[module], allTokenKinds, allTokenTexts, allTokenLines)
+    let cursor: List<Integer> = []
+    cursor.add(moduleTokenStarts[module])
+    skipTerminators(allTokenKinds, cursor)
+    while allTokenKinds[cursor[0]] != 0 {
+        if tokenIs(allTokenKinds, allTokenTexts, cursor, "use") {
+            let importLine = cursor[0]
+            cursor[0] = cursor[0] + 1
+            if allTokenKinds[cursor[0]] != 3 {
+                fail(canonicalPath + ":" + tokenLocation(allTokenLines, importLine) + ": use expects a quoted module name")
+            }
+            let specifier = allTokenTexts[cursor[0]]
+            cursor[0] = cursor[0] + 1
+            if !tokenIs(allTokenKinds, allTokenTexts, cursor, "as") {
+                fail(canonicalPath + ":" + tokenLocation(allTokenLines, importLine) + ": use expects 'as' after the module name")
+            }
+            cursor[0] = cursor[0] + 1
+            if allTokenKinds[cursor[0]] != 1 {
+                fail(canonicalPath + ":" + tokenLocation(allTokenLines, importLine) + ": use expects a module alias after 'as'")
+            }
+            let alias = allTokenTexts[cursor[0]]
+            cursor[0] = cursor[0] + 1
+            if findModuleImport(importOwners, importAliases, module, alias) >= 0 {
+                fail(canonicalPath + ":" + tokenLocation(allTokenLines, importLine) + ": module alias '" + alias + "' is already used")
+            }
+            finishStatement(allTokenKinds, allTokenTexts, allTokenLines, cursor)
+            let targetPath = resolveImport(canonicalPath, specifier, library)
+            let target = loadModule(library, targetPath, false, modulePaths, moduleSources, moduleStates, modulePublic, moduleTokenStarts, allTokenKinds, allTokenTexts, allTokenLines, importOwners, importAliases, importTargets, declarationStarts, declarationEnds)
+            importOwners.add(module)
+            importAliases.add(alias)
+            importTargets.add(target)
+        } else {
+            let declarationCursor = cursor[0]
+            let hasPublic = false
+            if tokenIs(allTokenKinds, allTokenTexts, cursor, "public") {
+                hasPublic = true
+                modulePublic[module] = 1
+                declarationCursor = declarationCursor + 1
+            }
+            let marker: List<Integer> = []
+            marker.add(declarationCursor)
+            if tokenIs(allTokenKinds, allTokenTexts, marker, "constant") {
+                declarationStarts.add(declarationCursor)
+                skipTopLevelStatement(allTokenKinds, allTokenTexts, marker)
+                declarationEnds.add(marker[0])
+                cursor[0] = marker[0]
+            } else {
+            if tokenIs(allTokenKinds, allTokenTexts, marker, "record") || tokenIs(allTokenKinds, allTokenTexts, marker, "function") {
+                declarationStarts.add(declarationCursor)
+                skipDeclaration(allTokenKinds, allTokenTexts, marker)
+                declarationEnds.add(marker[0])
+                cursor[0] = marker[0]
+            } else {
+                if hasPublic {
+                    fail(canonicalPath + ":" + tokenLocation(allTokenLines, cursor[0]) + ": public must describe a function, record, or constant declaration")
+                }
+                if !isEntry {
+                    fail(canonicalPath + ":" + tokenLocation(allTokenLines, cursor[0]) + ": imported modules may contain declarations but not executable top-level statements")
+                }
+                declarationStarts.add(-1)
+                skipTopLevelStatement(allTokenKinds, allTokenTexts, cursor)
+            }
+            }
+        }
+        skipTerminators(allTokenKinds, cursor)
+    }
+    moduleStates[module] = 2
+    return module
+}
+
+function qualifiedDeclarationName(module: Integer, name: Text): Text {
+    let qualified = "minyar_module_" + Text(module) + "_" + name
+    if module == 0 && name == "main" {
+        qualified = "main"
+    }
+    return qualified
+}
+
+function findModuleDeclaration(declarationOwners: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, owner: Integer, name: Text, kind: Integer): Integer {
+    let position = 0
+    let found = -1
+    while position < declarationOwners.length && found < 0 {
+        if declarationOwners[position] == owner && declarationNames[position] == name && declarationKinds[position] == kind {
+            found = position
+        }
+        position = position + 1
+    }
+    return found
+}
+
+function findIndexedModuleDeclaration(declarationLookup: List<Integer>, declarationQualifiedNames: List<Text>, declarationKinds: List<Integer>, owner: Integer, name: Text, kind: Integer): Integer {
+    return findIndexedSymbol(declarationLookup, declarationQualifiedNames, declarationKinds, qualifiedDeclarationName(owner, name), kind)
+}
+
+function requireUniqueModuleDeclarations(declarationLookup: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationQualifiedNames: List<Text>, declarationLocations: List<Text>) {
+    let position = 1
+    while position < declarationLookup.length {
+        let previous = declarationLookup[position - 1]
+        let current = declarationLookup[position]
+        if declarationKinds[previous] == declarationKinds[current] && declarationQualifiedNames[previous] == declarationQualifiedNames[current] {
+            let duplicate = current
+            if previous > current { duplicate = previous }
+            fail(describeLocation(declarationLocations[duplicate]) + ": module declares '" + declarationNames[current] + "' more than once")
+        }
+        position = position + 1
+    }
+}
+
+function collectModuleDeclarations(module: Integer, modulePath: Text, tokenStart: Integer, tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, declarationOwners: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationPublic: List<Integer>, declarationQualifiedNames: List<Text>, declarationLocations: List<Text>) {
+    let cursor: List<Integer> = []
+    cursor.add(tokenStart)
+    skipTerminators(tokenKinds, cursor)
+    while tokenKinds[cursor[0]] != 0 {
+        if tokenIs(tokenKinds, tokenTexts, cursor, "use") {
+            skipTopLevelStatement(tokenKinds, tokenTexts, cursor)
+        } else {
+            let isPublic = 0
+            if tokenIs(tokenKinds, tokenTexts, cursor, "public") {
+                isPublic = 1
+                cursor[0] = cursor[0] + 1
+            }
+            let kind = 0
+            if tokenIs(tokenKinds, tokenTexts, cursor, "function") {
+                kind = 1
+            }
+            if tokenIs(tokenKinds, tokenTexts, cursor, "record") {
+                kind = 2
+            }
+            if tokenIs(tokenKinds, tokenTexts, cursor, "constant") {
+                kind = 3
+            }
+            if kind > 0 {
+                let name = tokenTexts[cursor[0] + 1]
+                declarationOwners.add(module)
+                declarationNames.add(name)
+                declarationKinds.add(kind)
+                declarationPublic.add(isPublic)
+                declarationQualifiedNames.add(qualifiedDeclarationName(module, name))
+                declarationLocations.add(modulePath + ":" + tokenLocation(tokenLines, cursor[0] + 1))
+                if kind == 3 {
+                    skipTopLevelStatement(tokenKinds, tokenTexts, cursor)
+                } else {
+                    skipDeclaration(tokenKinds, tokenTexts, cursor)
+                }
+            } else {
+                if isPublic == 1 {
+                    fail("public must describe a function, record, or constant declaration")
+                }
+                skipTopLevelStatement(tokenKinds, tokenTexts, cursor)
+            }
+        }
+        skipTerminators(tokenKinds, cursor)
+    }
+}
+
+function importedDeclarationName(module: Integer, alias: Text, name: Text, kind: Integer, modulePath: Text, tokenLines: SourceMap, location: Integer, importOwners: List<Integer>, importAliases: List<Text>, importTargets: List<Integer>, declarationLookup: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationPublic: List<Integer>, declarationQualifiedNames: List<Text>): Text {
+    let imported = findModuleImport(importOwners, importAliases, module, alias)
+    if imported < 0 {
+        fail(describeLocation(modulePath + ":" + tokenLocation(tokenLines, location)) + ": I can't find an imported module named '" + alias + "'")
+    }
+    let declaration = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, importTargets[imported], name, kind)
+    if declaration < 0 {
+        let declarationKind = "record"
+        if kind == 1 {
+            declarationKind = "function"
+        }
+        if kind == 3 {
+            declarationKind = "constant"
+        }
+        fail(describeLocation(modulePath + ":" + tokenLocation(tokenLines, location)) + ": module '" + alias + "' has no " + declarationKind + " named '" + name + "'")
+    }
+    if declarationPublic[declaration] == 0 {
+        fail(describeLocation(modulePath + ":" + tokenLocation(tokenLines, location)) + ": '" + alias + "." + name + "' is private to its module")
+    }
+    return declarationQualifiedNames[declaration]
+}
+
+function appendModuleTokens(module: Integer, modulePath: Text, tokenStart: Integer, tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, importOwners: List<Integer>, importAliases: List<Text>, importTargets: List<Integer>, declarationLookup: List<Integer>, declarationNames: List<Text>, declarationKinds: List<Integer>, declarationPublic: List<Integer>, declarationQualifiedNames: List<Text>, outputKinds: List<Integer>, outputTexts: List<Text>, outputLines: SourceMap) {
+    let origin = sourcePath(outputLines, modulePath)
+    let position = tokenStart
+    let declarationMode = 0
+    let declarationDepth = 0
+    let functionHeader = false
+    let letDeclaration = false
+    let typeMode = false
+    let genericDepth = 0
+
+    while tokenKinds[position] != 0 {
+        if declarationMode == 0 && tokenKinds[position] == 1 && tokenTexts[position] == "use" {
+            let cursor: List<Integer> = []
+            cursor.add(position)
+            skipTopLevelStatement(tokenKinds, tokenTexts, cursor)
+            // Keep the line breaks after the import, including a `parallel`
+            // modifier the lexer turned into one.
+            while cursor[0] > position + 1 && tokenKinds[cursor[0] - 1] == 6 {
+                cursor[0] = cursor[0] - 1
+            }
+            position = cursor[0]
+        } else {
+            if declarationMode == 0 && tokenKinds[position] == 1 && tokenTexts[position] == "public" {
+                position = position + 1
+            } else {
+                let token = tokenTexts[position]
+                let kind = tokenKinds[position]
+                let rewritten = token
+                // A field/method selector belongs to its receiver. Matching an
+                // import alias or local declaration name must not rewrite it.
+                let memberSelector = position > tokenStart && tokenTexts[position - 1] == "."
+
+                if declarationMode == 0 && kind == 1 && (token == "record" || token == "function") {
+                    if token == "record" {
+                        declarationMode = 1
+                    } else {
+                        declarationMode = 2
+                        functionHeader = true
+                    }
+                } else {
+                    if kind == 1 && (token == "let" || token == "constant") {
+                        letDeclaration = true
+                    }
+                }
+
+                if kind == 1 && token == "Map" && tokenTexts[position + 1] == "<" && !typeMode {
+                    typeMode = true
+                    genericDepth = 0
+                }
+                if kind == 4 && token == ":" && (declarationMode == 1 || functionHeader || letDeclaration) {
+                    typeMode = true
+                    genericDepth = 0
+                }
+
+                if kind == 1 && !memberSelector && position + 2 < tokenKinds.length && tokenTexts[position + 1] == "." {
+                    let imported = findModuleImport(importOwners, importAliases, module, token)
+                    if imported >= 0 {
+                        let wantedKind = 2
+                        if position + 3 < tokenKinds.length && tokenTexts[position + 3] == "(" {
+                            wantedKind = 1
+                        } else {
+                            let importedConstant = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, importTargets[imported], tokenTexts[position + 2], 3)
+                            if !typeMode && importedConstant >= 0 {
+                                wantedKind = 3
+                            }
+                        }
+                        rewritten = importedDeclarationName(module, token, tokenTexts[position + 2], wantedKind, modulePath, tokenLines, position, importOwners, importAliases, importTargets, declarationLookup, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames)
+                        copyModuleToken(outputKinds, outputTexts, outputLines, 1, rewritten, tokenLines, position, origin)
+                        position = position + 3
+                        if typeMode && genericDepth == 0 {
+                            typeMode = false
+                        }
+                    } else {
+                        copyModuleToken(outputKinds, outputTexts, outputLines, kind, rewritten, tokenLines, position, origin)
+                        position = position + 1
+                    }
+                } else {
+                    if kind == 1 && !memberSelector {
+                        let declarationKind = 0
+                        if position > 0 && tokenTexts[position - 1] == "function" {
+                            declarationKind = 1
+                        }
+                        if position > 0 && tokenTexts[position - 1] == "record" {
+                            declarationKind = 2
+                        }
+                        if declarationKind == 0 && position + 1 < tokenKinds.length && tokenTexts[position + 1] == "(" {
+                            declarationKind = 1
+                        }
+                        // parallelEntry(name) names a function without calling it.
+                        if declarationKind == 0 && position >= 2 && tokenTexts[position - 2] == "parallelEntry" && tokenTexts[position - 1] == "(" {
+                            declarationKind = 1
+                        }
+                        if declarationKind == 0 && position + 1 < tokenKinds.length && tokenTexts[position + 1] == "{" {
+                            declarationKind = 2
+                        }
+                        if declarationKind == 0 && typeMode {
+                            declarationKind = 2
+                        }
+                        if position > 0 && tokenTexts[position - 1] == "constant" {
+                            declarationKind = 3
+                        }
+                        // Locals and parameters share a constant's rewritten
+                        // spelling, so parsePrimary can still prefer a local.
+                        // Record field names remain in their receiver namespace.
+                        if declarationKind == 0 && ((position > 0 && (tokenTexts[position - 1] == "let" || tokenTexts[position - 1] == "for")) || (functionHeader && position + 1 < tokenKinds.length && tokenTexts[position + 1] == ":")) {
+                            declarationKind = 3
+                        }
+                        // Other bare names may use a constant of this module;
+                        // a following ':' names a field or parameter instead.
+                        if declarationKind == 0 && !(position + 1 < tokenKinds.length && tokenTexts[position + 1] == ":") {
+                            declarationKind = 3
+                        }
+                        // `NAME {` is a record literal unless NAME is a constant, as in `if x == NAME {`.
+                        if declarationKind == 2 && !typeMode && !(position > 0 && tokenTexts[position - 1] == "record") {
+                            let blockConstant = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, module, token, 3)
+                            if blockConstant >= 0 {
+                                declarationKind = 3
+                            }
+                        }
+                        if declarationKind > 0 {
+                            let declaration = findIndexedModuleDeclaration(declarationLookup, declarationQualifiedNames, declarationKinds, module, token, declarationKind)
+                            if declaration >= 0 {
+                                rewritten = declarationQualifiedNames[declaration]
+                            }
+                        }
+                    }
+                    copyModuleToken(outputKinds, outputTexts, outputLines, kind, rewritten, tokenLines, position, origin)
+
+                    if typeMode && kind == 1 && token != "List" && token != "Map" && genericDepth == 0 {
+                        typeMode = false
+                    }
+                    if kind == 4 && token == "<" && typeMode {
+                        genericDepth = genericDepth + 1
+                    }
+                    if kind == 4 && token == ">" && genericDepth > 0 {
+                        genericDepth = genericDepth - 1
+                        if genericDepth == 0 {
+                            typeMode = false
+                        }
+                    }
+                    if kind == 4 && token == ">>" && genericDepth > 0 {
+                        genericDepth = genericDepth - 2
+                        if genericDepth <= 0 {
+                            genericDepth = 0
+                            typeMode = false
+                        }
+                    }
+                    if kind == 4 && token == "=" || kind == 6 {
+                        letDeclaration = false
+                    }
+                    if kind == 4 && token == "{" && declarationMode > 0 {
+                        declarationDepth = declarationDepth + 1
+                        if declarationMode == 2 && declarationDepth == 1 {
+                            functionHeader = false
+                        }
+                    }
+                    if kind == 4 && token == "}" && declarationMode > 0 {
+                        declarationDepth = declarationDepth - 1
+                        if declarationDepth == 0 {
+                            declarationMode = 0
+                            functionHeader = false
+                            letDeclaration = false
+                        }
+                    }
+                    position = position + 1
+                }
+            }
+        }
+    }
+    copyModuleToken(outputKinds, outputTexts, outputLines, 6, "end of module", tokenLines, position, origin)
+}
+
+function compileEntry(path: Text, stackOwnerLimit: Integer): Text {
+    return joinText(compileEntryWithLibrary(path, stackOwnerLimit, ""))
+}
+
+function compileEntryWithLibrary(path: Text, stackOwnerLimit: Integer, library: Text): List<Text> {
+    let modulePaths: List<Text> = []
+    let moduleSources: List<Text> = []
+    let moduleStates: List<Integer> = []
+    let modulePublic: List<Integer> = []
+    let moduleTokenStarts: List<Integer> = []
+    let moduleTokenKinds: List<Integer> = []
+    let moduleTokenTexts: List<Text> = []
+    let moduleTokenLines = newSourceMap()
+    let importOwners: List<Integer> = []
+    let importAliases: List<Text> = []
+    let importTargets: List<Integer> = []
+    let declarationStarts: List<Integer> = []
+    let declarationEnds: List<Integer> = []
+    let entry = loadModule(library, path, true, modulePaths, moduleSources, moduleStates, modulePublic, moduleTokenStarts, moduleTokenKinds, moduleTokenTexts, moduleTokenLines, importOwners, importAliases, importTargets, declarationStarts, declarationEnds)
+    if modulePaths.length == 1 && modulePublic[0] == 0 {
+        return compileTokens(moduleTokenKinds, moduleTokenTexts, moduleTokenLines, declarationStarts, declarationEnds, stackOwnerLimit)
+    }
+
+    let declarationOwners: List<Integer> = []
+    let declarationNames: List<Text> = []
+    let declarationKinds: List<Integer> = []
+    let declarationPublic: List<Integer> = []
+    let declarationQualifiedNames: List<Text> = []
+    let declarationLocations: List<Text> = []
+    let module = 0
+    while module < modulePaths.length {
+        collectModuleDeclarations(module, modulePaths[module], moduleTokenStarts[module], moduleTokenKinds, moduleTokenTexts, moduleTokenLines, declarationOwners, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames, declarationLocations)
+        module = module + 1
+    }
+    let declarationLookup = buildSymbolLookup(declarationQualifiedNames, declarationKinds)
+    requireUniqueModuleDeclarations(declarationLookup, declarationNames, declarationKinds, declarationQualifiedNames, declarationLocations)
+
+    let tokenKinds: List<Integer> = []
+    let tokenTexts: List<Text> = []
+    let tokenLines = newSourceMap()
+    module = 0
+    while module < modulePaths.length {
+        appendModuleTokens(module, modulePaths[module], moduleTokenStarts[module], moduleTokenKinds, moduleTokenTexts, moduleTokenLines, importOwners, importAliases, importTargets, declarationLookup, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames, tokenKinds, tokenTexts, tokenLines)
+        module = module + 1
+    }
+    addEndToken(tokenKinds, tokenTexts, tokenLines, "end of program")
+    let scannedStarts: List<Integer> = []
+    let scannedEnds: List<Integer> = []
+    return compileTokens(tokenKinds, tokenTexts, tokenLines, scannedStarts, scannedEnds, stackOwnerLimit)
+}
+

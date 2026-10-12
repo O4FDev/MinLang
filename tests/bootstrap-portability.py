@@ -34,7 +34,7 @@ class BootstrapPortability(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_real_compiler_source_has_no_c_undefined_behavior(self):
-        result = subprocess.run([str(self.compiler), str(ROOT / 'compiler/compiler.min'), '-o',
+        result = subprocess.run([str(self.compiler), str(ROOT / 'build/compiler.min'), '-o',
                                  str(self.directory / 'compiler.ll')], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 

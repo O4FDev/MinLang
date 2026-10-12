@@ -58,7 +58,7 @@ def checked(args, purpose):
 def main():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     source_root = COMPILER.parent.parent
-    source = (source_root / 'compiler/compiler.min').read_text()
+    source = (source_root / 'build/compiler.min').read_text()
     changes = {
         'capture': ('raw = output[scalarValues + (field - first) * 3 + 1]',
                     'raw = output[scalarValues + 1]'),

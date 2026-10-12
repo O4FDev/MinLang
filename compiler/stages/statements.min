@@ -1,0 +1,290 @@
+function conditionalBranch(condition: Text, thenTarget: Text, elseTarget: Text): Text {
+    if condition == "true" { return "  br label %" + thenTarget + "\n" }
+    if condition == "false" { return "  br label %" + elseTarget + "\n" }
+    return "  br i1 " + condition + ", label %" + thenTarget + ", label %" + elseTarget + "\n"
+}
+
+function prepareStatementFrame(frames: List<Integer>, conditions: List<Text>, depth: Integer, kind: Integer) {
+    let frame = depth * 8
+    while frames.length < frame + 8 { frames.add(0) }
+    while conditions.length <= depth { conditions.add("") }
+    frames[frame] = kind
+}
+
+function compileStatementSequence(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, returnType: Integer, startsBlock: Boolean): Boolean {
+    let frames: List<Integer> = []
+    let conditions: List<Text> = []
+    let depth = 0
+    // Mode 0 enters a block; 1 reads its next statement; 2 resumes its
+    // caller with the just-completed statement/block's termination result.
+    let mode = 1
+    if startsBlock { mode = 0 }
+    let returns = false
+    let done = false
+    while !done {
+        if mode == 0 {
+            expectToken(tokenKinds, tokenTexts, tokenLines, state, "{")
+            skipTerminators(tokenKinds, state)
+            prepareStatementFrame(frames, conditions, depth, 1)
+            let frame = depth * 8
+            frames[frame + 1] = state[3]
+            frames[frame + 2] = 0
+            frames[frame + 3] = 0
+            frames[frame + 7] = state[13]
+            depth = depth + 1
+            mode = 1
+        } else {
+            if mode == 1 {
+                let inBlock = false
+                let frame = 0
+                if depth > 0 {
+                    frame = (depth - 1) * 8
+                    inBlock = frames[frame] == 1
+                }
+                if inBlock && tokenIs(tokenKinds, tokenTexts, state, "}") {
+                    returns = frames[frame + 2] != 0
+                    if returns && frames[frame + 3] == 0 { output.add("  unreachable\n") }
+                    expectToken(tokenKinds, tokenTexts, tokenLines, state, "}")
+                    let firstScopedLocal = frames[frame + 1]
+                    if !returns {
+                        let local = firstScopedLocal
+                        while local < state[3] {
+                            rootLocal(output, state, localIds[local], "null", localTypes[local])
+                            local = local + 1
+                        }
+                    }
+                    state[13] = frames[frame + 7]
+                    state[3] = firstScopedLocal
+                    depth = depth - 1
+                    mode = 2
+                } else {
+                    if inBlock && frames[frame + 3] != 0 {
+                        textState[0] = "dead." + Text(newLabel(state))
+                        output.add("\n" + textState[0] + ":\n")
+                    }
+                    if tokenIs(tokenKinds, tokenTexts, state, "if") {
+                        let referenceEffects = state[7]
+                        state[0] = state[0] + 1
+                        let conditionType: List<Integer> = []
+                        conditionType.add(0)
+                        let condition = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, conditionType)
+                        requireType(tokenLines, state, conditionType[0], 4, "an if condition must be Boolean")
+                        let thenLabel = newLabel(state)
+                        let elseLabel = newLabel(state)
+                        let endLabel = newLabel(state)
+                        let branchSlot = output.length
+                        output.add("")
+                        textState[0] = "if.then." + Text(thenLabel)
+                        prepareStatementFrame(frames, conditions, depth, 2)
+                        frame = depth * 8
+                        frames[frame + 1] = referenceEffects
+                        frames[frame + 2] = thenLabel
+                        frames[frame + 3] = elseLabel
+                        frames[frame + 4] = endLabel
+                        frames[frame + 5] = branchSlot
+                        conditions[depth] = condition
+                        depth = depth + 1
+                        mode = 0
+                    } else {
+                        if tokenIs(tokenKinds, tokenTexts, state, "while") {
+                            let referenceEffects = state[7]
+                            state[0] = state[0] + 1
+                            let conditionLabel = newLabel(state)
+                            let bodyLabel = newLabel(state)
+                            let endLabel = newLabel(state)
+                            output.add("  br label %while.condition.")
+                            output.add(Text(conditionLabel))
+                            output.add("\n\nwhile.condition.")
+                            output.add(Text(conditionLabel))
+                            output.add(":\n")
+                            textState[0] = "while.condition." + Text(conditionLabel)
+                            let conditionType: List<Integer> = []
+                            conditionType.add(0)
+                            let condition = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, conditionType)
+                            requireType(tokenLines, state, conditionType[0], 4, "a while condition must be Boolean")
+                            output.add(conditionalBranch(condition, "while.body." + Text(bodyLabel), "while.end." + Text(endLabel)))
+                            output.add("\nwhile.body.")
+                            output.add(Text(bodyLabel))
+                            output.add(":\n")
+                            textState[0] = "while.body." + Text(bodyLabel)
+                            prepareStatementFrame(frames, conditions, depth, 4)
+                            frame = depth * 8
+                            frames[frame + 1] = referenceEffects
+                            frames[frame + 2] = conditionLabel
+                            frames[frame + 4] = endLabel
+                            frames[frame + 6] = 0
+                            if condition == "true" { frames[frame + 6] = 1 }
+                            frames[frame + 7] = state[3]
+                            addLocal(localNames, localTypes, localIds, localLengths, state, " loop", -1, conditionLabel)
+                            depth = depth + 1
+                            mode = 0
+                        } else {
+                            returns = compileAtomicStatement(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
+                            mode = 2
+                        }
+                    }
+                }
+            } else {
+                if depth == 0 {
+                    done = true
+                } else {
+                    let frame = (depth - 1) * 8
+                    let kind = frames[frame]
+                    if kind == 1 {
+                        frames[frame + 3] = 0
+                        if returns {
+                            state[13] = 1
+                            frames[frame + 2] = 1
+                            frames[frame + 3] = 1
+                        }
+                        finishStatement(tokenKinds, tokenTexts, tokenLines, state)
+                        mode = 1
+                    } else {
+                        let endLabel = frames[frame + 4]
+                        let referenceEffects = frames[frame + 1]
+                        let statementComplete = true
+                        if kind == 2 {
+                            if !returns {
+                                output.add("  br label %if.end.")
+                                output.add(Text(endLabel))
+                                output.add("\n")
+                            }
+                            let continuation = state[0]
+                            while tokenKinds[continuation] == 6 && tokenTexts[continuation] == "end of line" { continuation = continuation + 1 }
+                            let hasElse = tokenKinds[continuation] == 1 && tokenTexts[continuation] == "else"
+                            if hasElse { state[0] = continuation }
+                            let thenLabel = frames[frame + 2]
+                            let elseLabel = frames[frame + 3]
+                            let falseTarget = "if.end." + Text(endLabel)
+                            if hasElse { falseTarget = "if.else." + Text(elseLabel) }
+                            output[frames[frame + 5]] = conditionalBranch(conditions[depth - 1], "if.then." + Text(thenLabel), falseTarget) + "\nif.then." + Text(thenLabel) + ":\n"
+                            conditions[depth - 1] = ""
+                            if hasElse {
+                                frames[frame] = 3
+                                frames[frame + 6] = 0
+                                if returns { frames[frame + 6] = 1 }
+                                state[0] = state[0] + 1
+                                output.add("\nif.else.")
+                                output.add(Text(elseLabel))
+                                output.add(":\n")
+                                textState[0] = "if.else." + Text(elseLabel)
+                                statementComplete = false
+                                mode = 0
+                                if tokenIs(tokenKinds, tokenTexts, state, "if") { mode = 1 }
+                            } else {
+                                returns = false
+                            }
+                        } else {
+                            if kind == 3 {
+                                if !returns {
+                                    output.add("  br label %if.end.")
+                                    output.add(Text(endLabel))
+                                    output.add("\n")
+                                }
+                                returns = returns && frames[frame + 6] != 0
+                            } else {
+                                if !returns {
+                                    // Scalar loops must service preceding cleanup debt.
+                                    // Scalar-only functions erase this call later.
+                                    output.add("  call void @minyar_rc_step()\n")
+                                    output.add("  br label %while.condition.")
+                                    output.add(Text(frames[frame + 2]))
+                                    output.add("\n")
+                                }
+                                output.add("\nwhile.end.")
+                                output.add(Text(endLabel))
+                                output.add(":\n")
+                                textState[0] = "while.end." + Text(endLabel)
+                                // A reachable break permits a literal-true loop to fall through.
+                                let markerScope = frames[frame + 7]
+                                let canBreak = localTypes[markerScope] == -3
+                                state[3] = markerScope
+                                returns = frames[frame + 6] != 0 && !canBreak
+                                if returns { output.add("  unreachable\n") }
+                            }
+                        }
+                        if statementComplete {
+                            if kind != 4 && !returns {
+                                output.add("\nif.end.")
+                                output.add(Text(endLabel))
+                                output.add(":\n")
+                                textState[0] = "if.end." + Text(endLabel)
+                            }
+                            if !returns && state[7] != referenceEffects { output.add("  call void @minyar_rc_step()\n") }
+                            depth = depth - 1
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return returns
+}
+
+function lowerIntegerDispatch(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, start: Integer, end: Integer, parameter: Text, output: List<Text>, globals: List<Text>, bodySlot: Integer, table: Text): Boolean {
+    let cursor: List<Integer> = []
+    cursor.add(start + 1)
+    let cases: List<Text> = []
+    let results: List<Text> = []
+    skipTerminators(tokenKinds, cursor)
+    while cursor[0] < end && tokenIs(tokenKinds, tokenTexts, cursor, "if") {
+        let position = cursor[0]
+        if position + 5 >= end { return false }
+        if tokenKinds[position + 1] != 1 || tokenTexts[position + 1] != parameter || tokenTexts[position + 2] != "==" || tokenKinds[position + 3] != 2 || tokenTexts[position + 4] != "{" { return false }
+        let value = checkedIntegerLiteral(tokenTexts[position + 3], false, tokenLines, position + 3)
+        if cases.length > 0 {
+            let prior = cases[cases.length - 1]
+            if prior.length > value.length || (prior.length == value.length && compareText(prior, value) >= 0) { return false }
+        }
+        cursor[0] = position + 5
+        skipTerminators(tokenKinds, cursor)
+        position = cursor[0]
+        if position + 2 >= end || tokenTexts[position] != "return" || tokenKinds[position + 1] != 2 { return false }
+        let result = checkedIntegerLiteral(tokenTexts[position + 1], false, tokenLines, position + 1)
+        cursor[0] = position + 2
+        skipTerminators(tokenKinds, cursor)
+        position = cursor[0]
+        if position + 2 >= end || tokenTexts[position] != "}" || tokenTexts[position + 1] != "else" || tokenTexts[position + 2] != "{" { return false }
+        cursor[0] = position + 3
+        skipTerminators(tokenKinds, cursor)
+        cases.add(value)
+        results.add(result)
+    }
+    let position = cursor[0]
+    if cases.length == 0 || position + 2 >= end || tokenTexts[position] != "return" || tokenKinds[position + 1] != 2 { return false }
+    let fallback = checkedIntegerLiteral(tokenTexts[position + 1], false, tokenLines, position + 1)
+    cursor[0] = position + 2
+    skipTerminators(tokenKinds, cursor)
+    let closing = 0
+    while closing <= cases.length {
+        if cursor[0] >= end || !tokenIs(tokenKinds, tokenTexts, cursor, "}") { return false }
+        cursor[0] = cursor[0] + 1
+        // The outer function's closing brace ends this exact body span.
+        if closing < cases.length { skipTerminators(tokenKinds, cursor) }
+        closing = closing + 1
+    }
+    if cursor[0] != end { return false }
+    // A sorted constant table avoids both quadratic CFG simplification and
+    // giant return PHIs. Normal compilation above has already checked every
+    // branch. Binary search only reorders pure comparisons of one stable value.
+    position = bodySlot
+    while position < output.length {
+        output[position] = ""
+        position = position + 1
+    }
+    let count = Text(cases.length)
+    globals.add(table + " = private unnamed_addr constant [" + count + " x { i64, i64 }] [\n")
+    position = 0
+    while position < cases.length {
+        if position > 0 { globals.add(",\n") }
+        globals.add("  { i64, i64 } { i64 " + cases[position] + ", i64 " + results[position] + " }")
+        position = position + 1
+    }
+    globals.add("\n]\n")
+    output.add("  br label %dispatch.search\n\ndispatch.search:\n  %dispatch.low = phi i64 [ 0, %entry ], [ %dispatch.next, %dispatch.upper ], [ %dispatch.low, %dispatch.lower ]\n  %dispatch.high = phi i64 [ " + count + ", %entry ], [ %dispatch.high, %dispatch.upper ], [ %dispatch.mid, %dispatch.lower ]\n  %dispatch.more = icmp ult i64 %dispatch.low, %dispatch.high\n  br i1 %dispatch.more, label %dispatch.probe, label %dispatch.default\n")
+    output.add("\ndispatch.probe:\n  %dispatch.span = sub i64 %dispatch.high, %dispatch.low\n  %dispatch.half = lshr i64 %dispatch.span, 1\n  %dispatch.mid = add i64 %dispatch.low, %dispatch.half\n  %dispatch.key.ptr = getelementptr [" + count + " x { i64, i64 }], ptr " + table + ", i64 0, i64 %dispatch.mid, i32 0\n  %dispatch.key = load i64, ptr %dispatch.key.ptr\n  %dispatch.match = icmp eq i64 %argument.0, %dispatch.key\n  br i1 %dispatch.match, label %dispatch.found, label %dispatch.compare\n")
+    output.add("\ndispatch.compare:\n  %dispatch.less = icmp slt i64 %argument.0, %dispatch.key\n  br i1 %dispatch.less, label %dispatch.lower, label %dispatch.upper\n\ndispatch.lower:\n  br label %dispatch.search\n\ndispatch.upper:\n  %dispatch.next = add i64 %dispatch.mid, 1\n  br label %dispatch.search\n")
+    output.add("\ndispatch.found:\n  %dispatch.result.ptr = getelementptr [" + count + " x { i64, i64 }], ptr " + table + ", i64 0, i64 %dispatch.mid, i32 1\n  %dispatch.result = load i64, ptr %dispatch.result.ptr\n  call void @minyar_stack_leave()\n  ret i64 %dispatch.result\n\ndispatch.default:\n  call void @minyar_stack_leave()\n  ret i64 " + fallback + "\n")
+    return true
+}
+

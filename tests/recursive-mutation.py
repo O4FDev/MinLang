@@ -15,7 +15,7 @@ import tempfile
 from regressions import CLANG, COMPILER, ROOT
 from clang_helpers import clang_command
 
-SOURCE = ROOT / 'compiler/compiler.min'
+SOURCE = ROOT / 'build/compiler.min'
 RUNTIME = ROOT / 'build/ownership-runtime.o'
 TARGETS = {
     'cycle': ('recursive-data.py',
