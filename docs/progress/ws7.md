@@ -27,17 +27,23 @@ in the signing checklist. Continue the Windows idle work independently.
 ## In flight
 
 - `ws7/windows-idle`, `/tmp/minyar-ws7-windows`: owned Boat Windows fork
-  `bx_jbb3dmp3`, provisioning. Reproduce the unchanged one-second
-  `system-k1024/n2048` sanitizer oracle, `idle_cpu <= .02`, before any fix.
-  Snapshot excluded the VM directory through `.boxignore`; direct sparse
-  immutable-base/private-profile transfer is now assigned to the sole Y owner.
-  Require actual source/destination hashes and lengths before boot. Preserve
-  raw CPU/wall endpoints and collector units/epochs. No Windows result is
-  established yet. Full portable and separate native gates remain required.
+  `bx_jbb3dmp3`: all eight immutable base/profile inputs were received and
+  verified. The guest became ready, but the strict host guardian aborted during
+  source binding at 15:09:55 UTC: CPU 77.5% exceeded the unchanged 75% limit.
+  The binding has no receipt; no NT Job closure or product verdict is claimed.
+  The original sanitizer, focused cohort, portable suite and signing never ran.
+  No runtime/test edits exist. Normal stop and snapshot completed at 15:14:51.
+  Snapshot inventory was truncated; actual restored bytes must be verified.
+  The integrator now admits existing-box resume solely for a guarded, single
+  worker immutable relay to WS4, followed by credential retirement and normal
+  stop. Guest restart and product tests require separate resource admission.
+  The unchanged one-second `system-k1024/n2048`, `idle_cpu <= .02`, remains the
+  required repro before any optimization; full native/portable gates follow.
 - `ws7/test-signing`, `/tmp/minyar-ws7-signing`: explicit test-certificate
-  commands and real OS artifact signing, bundle and Ed25519 manifest verification.
-  Production signing/notarization checks must remain strict. A serial Windows
-  signing slot is queued after the primary Windows suite.
+  pipeline committed as `3ed25bd`; 19 mocked signing contracts and 12 shipping
+  contracts pass. Independent review is underway. Actual trusted macOS CI and
+  Windows Boat signing remain unrun. Production signing/notarization checks
+  remain strict. Native Windows signing waits for a separately admitted slot.
 - `ws7/ci-speed`, `/tmp/minyar-ws7-ci`: owned Boat Linux `bx_ck6a9vnc`,
   4 vCPU/8 GiB. Preserve all 135 current Linux targets and extra gates while
   partitioning into isolated serial builds. Measure baseline and candidate on
@@ -46,8 +52,11 @@ in the signing checklist. Continue the Windows idle work independently.
   is retained; cancelled candidate is not a speed result. Narrow stamp fix
   `ca33c6e` passed independent review and four focused Boat tests; both future
   timing sides must use that same disclosed prerequisite. CI sandbox is stopped
-  while review proceeds. Integrator owns distinct Phase 1 macOS qualification
-  additions on `unify/macos-ci-qualification`.
+  pending focused corrections. Review of `2ff58a3` blocked approval on resume
+  accepting newly added inputs and timing comparison accepting incomplete source
+  inventories. Fixes and regressions are in progress; full timing is deferred
+  until independent approval. Integrator owns distinct Phase 1 macOS
+  qualification additions on `unify/macos-ci-qualification`.
 - Parent: device-test cost plan, release Make/catalogue registration, independent
   review rounds, and merge requests. WS5 module Windows checks are queued in a
   separate source/build directory after the primary and signing slots.
@@ -66,8 +75,8 @@ and safety oracles must not change. WS1 cleared narrow opt-in collector work;
 new scheduler state must follow its future thread-local ownership requirement.
 
 Phase 1's sanitizer-path correction (`397362d` plus `dda5bd11`) belongs to its
-owner. Its exact reviewed prerequisite boundary is requested for the future
-full portable run; WS7 must not duplicate or relabel that fix.
+owner. The exact reviewed stack is normally merged onto the owned Windows
+branch as `e563c578`; the immutable `bf9` idle baseline remains separate.
 
 Apple notarization needs actual Developer ID and notary credentials. A generated
 test certificate can establish local signature/bundle/manifest behavior, not
@@ -76,7 +85,8 @@ test store trust and generated keys must be scoped and removed.
 
 ## Merge queue and remaining acceptance
 
-No WS7 implementation change has been offered for merge yet. Each chunk needs
+The independently reviewed stamp-only branch `ws7/ci-stamp`, `0150ba5`, is
+offered to the integrator's queue. No WS7 change has landed on `v2`. Each chunk needs
 an independent subagent review and platform-appropriate Boat evidence. Merge
 requests include branch, SHA, test commands, source-bound evidence and applicable
 performance results. After Phase 1, rebase onto the pushed `v2` and let the
@@ -86,3 +96,9 @@ Remaining: strict Windows idle fix; full Windows suite; actual comparable CI
 before/after and green CI on `v2`; real test-certificate pipeline; exact owner
 checklist; reviewed 20,000-real-device cost plan and <= $10 pilot design; merged
 fixes. None of these is claimed complete by provisioning or design alone.
+
+Public resource-abort evidence is retained at
+`~/overnight/runs/minyar-unify-20261012/ws7-windows-idle/closeout.json` and
+`owned-abort-public-evidence.tar` (204,800 bytes, SHA256
+`c693b638c79022d41871c51e0d80728606242e08aaa87ecf210f6a32a8c6fdc0`).
+Private image/profile/key bytes remain entirely remote.
