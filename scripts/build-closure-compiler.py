@@ -149,31 +149,23 @@ def assemble(source):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path)
-    parser.add_argument('--baseline', action='store_true', help='reconstruct the exact foundation compiler control')
+    parser.add_argument('--baseline', action='store_true', help='verify and emit the frozen foundation compiler control')
     args = parser.parse_args()
-    core = (ROOT / 'compiler/compiler.min').read_text()
     if args.baseline:
-        assembled = ordinary_control(core)[0]
-        # The foundation predates managed parallel-signature rejection.
-        # Reverse that later core change only for this frozen control; current
-        # optional frontends must retain the stricter signature checks.
-        assembled = replace(assembled,
-            '            let parallelReferences = state[6] == 1 || isReferenceType(returnType)\n'
-            '            let parallelParameter = 0\n'
-            '            while parallelParameter < parameterNames.length {\n'
-            '                if isReferenceType(parameterTypes[parallelParameter]) { parallelReferences = true }\n'
-            '                parallelParameter = parallelParameter + 1\n'
-            '            }\n'
-            '            finishParallelFunction(output, globals, entrySlot, bodySlot, name, parallelReferences)\n',
-            '            finishParallelFunction(output, globals, entrySlot, bodySlot, name, state[6] == 1)\n')
+        # This is the exact comparator previously reconstructed from bf9c0e9.
+        # Keep current frontend assembly independent of this frozen source.
+        assembled = (ROOT / 'compiler/foundation-baseline.min').read_bytes()
         expected = 'a5f30a7954381231fbe04a712b72bd9663d1bd7082c667fef851b739ec63c3cf'
-        if hashlib.sha256(assembled.encode()).hexdigest() != expected:
-            raise ValueError('foundation baseline reconstruction drifted; do not update the control silently')
+        if hashlib.sha256(assembled).hexdigest() != expected:
+            raise ValueError('foundation baseline source changed; do not update the control silently')
     else:
-        assembled = assemble(core)
+        assembled = assemble((ROOT / 'compiler/compiler.min').read_text())
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_name(args.output.name + '.tmp')
-    temporary.write_text(assembled)
+    if args.baseline:
+        temporary.write_bytes(assembled)
+    else:
+        temporary.write_text(assembled)
     temporary.replace(args.output)
 
 
