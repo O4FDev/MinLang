@@ -16,11 +16,11 @@ with tempfile.TemporaryDirectory(prefix='minyar-bootstrap-records-') as temporar
     work = Path(temporary)
     source = work / 'records.min'
     llvm = work / 'records.ll'
-    source.write_text('''record Coordinates { values: List<Integer>; title: Text; valid: Boolean; letter: Character }
+    source.write_text('''record Coordinates { values: List<Integer>; title: Text; valid: Boolean; letter: Character; counter: Integer }
 function make(): Coordinates {
     let values: List<Integer> = []
     values.add(40)
-    return Coordinates { letter: 'Q', valid: true, title: "source", values: values }
+    return Coordinates { letter: 'Q', valid: true, title: "source", values: values, counter: 0 }
 }
 function read(location: Coordinates): Integer { return location.values[0] + 2 }
 function main(): Integer {
@@ -29,6 +29,14 @@ function main(): Integer {
     print(location.title)
     print(location.valid)
     print(location.letter)
+    location.title = "changed"
+    location.valid = false
+    location.letter = 'Z'
+    location.counter = 42
+    print(location.title)
+    print(location.valid)
+    print(location.letter)
+    print(location.counter)
     return 0
 }
 ''')
@@ -39,8 +47,9 @@ function main(): Integer {
                                            '-Wno-override-module', llvm, ROOT / 'runtime/minyar_runtime.c',
                                            '-o', executable]), capture_output=True, text=True)
     assert linked.returncode == 0, linked.stderr
-    assert subprocess.check_output([executable], text=True) == '42\nsource\ntrue\nQ\n'
+    assert subprocess.check_output([executable], text=True) == '42\nsource\ntrue\nQ\nchanged\nfalse\nZ\n42\n'
     failures = [
+        ('record Pair { value: Integer }\nfunction main(): Integer { let p = Pair { value: 1 }; p.value = \"bad\"; return 0 }\n', 'this field contains'),
         ('record Pair { value: Integer; value: Text }\n', 'more than once'),
         ('record Pair { value: Integer }\nrecord Pair { value: Integer }\n', 'more than once'),
         ('record Pair { value: Integer }\nfunction main(): Integer { let p = Pair { value: "bad" }; return 0 }\n', 'different type'),
