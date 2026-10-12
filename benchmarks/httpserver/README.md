@@ -92,3 +92,9 @@ host and reports **performance not qualified**. It is never an acceptance run.
 regression while accepting the exact 1.5 boundary. The optional Make target
 `bench-httpserver` accepts HTTP_FRONT_MINYAR, HTTP_FRONT_AXUM, HTTP_FRONT_RESULTS
 and runs full acceptance. Do not infer speed from a correctness-only run.
+
+The 2026-10-12 dedicated Linux run passed every unchanged p50/p99 gate (worst
+ratio 1.304x), with raw corpus identity and exact LRU/HoL checks. Source, tool,
+command, samples and platform qualification receipts are recorded in
+../../docs/progress/ws4-http.md and its adjacent ws4-http-evidence directory.
+Windows execution and independent integration review remain separate gates.
