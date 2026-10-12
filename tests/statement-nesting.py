@@ -410,7 +410,7 @@ class StatementNesting(CompilerTestCase):
             return body + fallback + '\n' + '}\n' * len(keys) + suffix + '}\n'
         cases = [
             ('duplicate', dict(keys=[0, 0] + list(range(2, 1366))), '0', '10\n'),
-            ('leadingZeroDuplicate', dict(keys=[0, '00'] + list(range(2, 1366))), '0', '10\n'),
+            ('octalSpelledDuplicate', dict(keys=[0, '0o0'] + list(range(2, 1366))), '0', '10\n'),
             ('unordered', dict(keys=[1, 0] + list(range(2, 1366))), '0', '11\n'),
             ('effectInBody', dict(first='print(44); return 10'), '0', '44\n10\n'),
             ('effectInCondition', dict(condition='noisy(x) == 0'), '0', '44\n10\n'),

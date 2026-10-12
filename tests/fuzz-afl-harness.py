@@ -15,10 +15,12 @@ class AflHarness(unittest.TestCase):
     def campaign(self, *, validate=True, executions=3, finding=None):
         with tempfile.TemporaryDirectory(prefix='minyar-afl-harness-') as directory:
             root = Path(directory)
-            for name in ['scripts', 'tests/fuzz-corpus/inputs', 'runtime', 'bin']:
+            for name in ['scripts', 'tests/fuzz-corpus/inputs', 'runtime', 'bin', 'tools']:
                 (root / name).mkdir(parents=True)
             shutil.copy2(ROOT / 'scripts/fuzz-afl.sh', root / 'scripts/fuzz-afl.sh')
+            # tests/llvm_sanitizer.py is a shim over the canonical tools module.
             shutil.copy2(ROOT / 'tests/llvm_sanitizer.py', root / 'tests/llvm_sanitizer.py')
+            shutil.copy2(ROOT / 'tools/sanitizer_llvm.py', root / 'tools/sanitizer_llvm.py')
             (root / 'runtime/minyar_runtime.c').write_text('/* stub */\n')
             (root / 'tests/fuzz-corpus/minyar.dict').write_text('"print"\n')
             (root / 'tests/fuzz-corpus/inputs/seed.min').write_text('print(1)\n')
