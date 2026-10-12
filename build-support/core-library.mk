@@ -28,3 +28,13 @@ check-module-constant-graphs-sanitize: build/minyarc-sanitize build/minyarc-call
 
 check check-portable: check-octal-literals check-reserved-names check-module-constants check-module-constant-graphs
 check-sanitize: check-octal-literals-sanitize check-reserved-names-sanitize check-module-constants-sanitize check-module-constant-graphs-sanitize
+
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+.PHONY: check-feature-declarations-incremental check-feature-declarations-incremental-sanitize
+check-feature-declarations-incremental: build/minyarc-modules build/minyar-module-build build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/feature-declarations-incremental.py
+check-feature-declarations-incremental-sanitize: build/minyarc-modules-sanitize build/minyar-module-build-sanitize build/minyar-runtime-sanitize.o
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/feature-declarations-incremental.py
+check check-portable: check-feature-declarations-incremental
+check-sanitize: check-feature-declarations-incremental-sanitize
+endif
