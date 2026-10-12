@@ -4,6 +4,7 @@ import argparse
 from contextlib import ExitStack
 import ctypes
 import errno
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -23,9 +24,12 @@ def checked(run, args):
     return result
 
 
-def notarize(path, profile, run):
-    result = checked(run, ['xcrun', 'notarytool', 'submit', str(path), '--keychain-profile', profile,
-                           '--wait', '--output-format', 'json'])
+def notarize(path, profile, run, *, keychain=None):
+    command = ['xcrun', 'notarytool', 'submit', str(path), '--keychain-profile', profile,
+               '--wait', '--output-format', 'json']
+    if keychain is not None:
+        command += ['--keychain', str(keychain)]
+    result = checked(run, command)
     try:
         status = json.loads(result.stdout)['status']
     except (ValueError, KeyError, TypeError):
@@ -77,10 +81,12 @@ def publish_directory(source, destination):
 
 
 def macos(app, output, identity, profile, *, entitlements=None,
-          signed_app_output=None, run=subprocess.run):
+          signed_app_output=None, keychain=None, notary_keychain=None, run=subprocess.run):
     if not identity.startswith('Developer ID Application: ') or not profile:
         raise ValueError('a Developer ID Application identity and notarytool Keychain profile are required')
     app, output = Path(app).resolve(strict=True), Path(output).absolute()
+    keychain = Path(keychain).resolve(strict=True) if keychain is not None else None
+    notary_keychain = Path(notary_keychain).resolve(strict=True) if notary_keychain is not None else None
     if app.suffix != '.app' or not (app / 'Contents/MacOS').is_dir() or output.suffix != '.dmg':
         raise ValueError('macOS release requires an application bundle and .dmg output')
     retained = None
@@ -120,21 +126,26 @@ def macos(app, output, identity, profile, *, entitlements=None,
                 targets.add(path)
         for target in sorted(targets, key=lambda p: (-len(p.parts), str(p))) + [stage]:
             command = ['codesign', '--force', '--sign', identity, '--options', 'runtime', '--timestamp']
+            if keychain is not None:
+                command += ['--keychain', str(keychain)]
             if entitlements is not None and target == stage:
                 command += ['--entitlements', str(entitlements)]
             checked(run, command + [str(target)])
         checked(run, ['codesign', '--verify', '--deep', '--strict', '--verbose=2', str(stage)])
         archive = temp / 'notarization.zip'
         checked(run, ['ditto', '-c', '-k', '--keepParent', str(stage), str(archive)])
-        notarize(archive, profile, run)
+        notarize(archive, profile, run, keychain=notary_keychain)
         checked(run, ['xcrun', 'stapler', 'staple', str(stage)])
         checked(run, ['xcrun', 'stapler', 'validate', str(stage)])
         checked(run, ['spctl', '--assess', '--type', 'execute', '--verbose=2', str(stage)])
         image = temp / output.name
         checked(run, ['hdiutil', 'create', '-volname', app.stem, '-srcfolder', str(stage),
                       '-format', 'UDZO', '-ov', str(image)])
-        checked(run, ['codesign', '--force', '--sign', identity, '--timestamp', str(image)])
-        notarize(image, profile, run)
+        command = ['codesign', '--force', '--sign', identity, '--timestamp']
+        if keychain is not None:
+            command += ['--keychain', str(keychain)]
+        checked(run, command + [str(image)])
+        notarize(image, profile, run, keychain=notary_keychain)
         checked(run, ['xcrun', 'stapler', 'staple', str(image)])
         checked(run, ['xcrun', 'stapler', 'validate', str(image)])
         checked(run, ['codesign', '--verify', '--strict', str(image)])
@@ -188,6 +199,110 @@ def windows(source, output, signtool, thumbprint, timestamp, *, azure_dlib=None,
         os.replace(stage, output)
 
 
+def test_output(output, suffix):
+    """TEST artifacts are immutable local generations, never release replacements."""
+    output = Path(output).absolute()
+    if not output.name.startswith('TEST-') or output.suffix.lower() != suffix:
+        raise ValueError(f'TEST ONLY output must be named TEST-*{suffix}')
+    if os.path.lexists(output):
+        raise FileExistsError(f'TEST output already exists: {output}')
+    return output
+
+
+def test_certificate(certificate, thumbprint, openssl, run):
+    """Pin a DER self-signed code-signing certificate with the reserved TEST CN."""
+    if not re.fullmatch('[A-Fa-f0-9]{40}', thumbprint):
+        raise ValueError('TEST certificate requires an explicit SHA1 DER thumbprint')
+    certificate = Path(certificate).resolve(strict=True)
+    if hashlib.sha1(certificate.read_bytes()).hexdigest().upper() != thumbprint.upper():
+        raise ValueError('TEST certificate thumbprint mismatch')
+    names = checked(run, [openssl, 'x509', '-inform', 'DER', '-in', str(certificate),
+                          '-noout', '-subject', '-issuer', '-nameopt', 'RFC2253']).stdout.splitlines()
+    if len(names) != 2 or not names[0].startswith('subject=') or not names[1].startswith('issuer='):
+        raise ValueError('cannot inspect TEST certificate names')
+    subject, issuer = names[0][8:].strip(), names[1][7:].strip()
+    if subject != issuer or not re.fullmatch(r'CN=Minyar TEST ONLY [a-f0-9]{32}', subject):
+        raise ValueError('certificate must be self-signed with a randomized Minyar TEST ONLY CN')
+    usage = checked(run, [openssl, 'x509', '-inform', 'DER', '-in', str(certificate),
+                          '-noout', '-ext', 'extendedKeyUsage']).stdout
+    lines = [line.strip() for line in usage.splitlines()]
+    if len(lines) != 2 or lines[0] not in ('X509v3 Extended Key Usage:', 'X509v3 Extended Key Usage: critical') or lines[1] != 'Code Signing':
+        raise ValueError('TEST certificate must have only the Code Signing extended key usage')
+    with tempfile.TemporaryDirectory(prefix='minyar-test-certificate-') as directory:
+        pem = Path(directory) / 'certificate.pem'
+        checked(run, [openssl, 'x509', '-inform', 'DER', '-in', str(certificate), '-out', str(pem)])
+        checked(run, [openssl, 'verify', '-check_ss_sig', '-purpose', 'any', '-CAfile', str(pem), str(pem)])
+    return thumbprint.upper()
+
+
+def verify_test_macos(app, thumbprint, *, run=subprocess.run):
+    checked(run, ['codesign', '--verify', '--deep', '--strict', '--verbose=2',
+                  '-R', f'certificate leaf = H"{thumbprint}"', str(app)])
+
+
+def verify_test_windows(source, signtool, thumbprint, *, run=subprocess.run):
+    # TEST certificates have no RFC3161 timestamp. Production still requires /tw.
+    checked(run, [signtool, 'verify', '/pa', '/all', str(source)])
+    # /pa alone does not pin the selected signer. Check the actual signer too.
+    command = ("$ErrorActionPreference='Stop'; "
+               "$s=Get-AuthenticodeSignature -LiteralPath $env:MINYAR_TEST_SIGNED_FILE; "
+               "if ($s.Status -ne 'Valid' -or $s.SignerCertificate.Thumbprint -ne "
+               "$env:MINYAR_TEST_SIGNER) { throw 'TEST Authenticode signer mismatch' }")
+    environment = dict(os.environ, MINYAR_TEST_SIGNED_FILE=str(Path(source).absolute()),
+                       MINYAR_TEST_SIGNER=thumbprint)
+    result = run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', command],
+                 env=environment, check=True, capture_output=True, text=True)
+    if result.returncode:
+        raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
+
+
+def test_macos(app, output, certificate, thumbprint, keychain, *, openssl='openssl', run=subprocess.run):
+    """CI/OWNER-RUN provisioned TEST signing: no notarization/Gatekeeper claim."""
+    output = test_output(output, '.app')
+    thumbprint = test_certificate(certificate, thumbprint, openssl, run)
+    app, keychain = Path(app).resolve(strict=True), Path(keychain).resolve(strict=True)
+    if app.suffix != '.app' or not (app / 'Contents/MacOS').is_dir() or not keychain.is_file():
+        raise ValueError('TEST macOS signing requires an app and explicit provisioned keychain')
+    for path in app.rglob('*'):
+        if path.is_symlink() and not path.resolve().is_relative_to(app):
+            raise ValueError('TEST bundle symlink escapes the app')
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.minyar-test-sign-', dir=output.parent) as directory:
+        stage = Path(directory) / output.name
+        shutil.copytree(app, stage, symlinks=True)
+        macho = {bytes.fromhex(value) for value in
+                 ('feedface', 'cefaedfe', 'feedfacf', 'cffaedfe', 'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca')}
+        targets = set()
+        for path in stage.rglob('*'):
+            if path.is_file() and not path.is_symlink():
+                with path.open('rb') as stream:
+                    if stream.read(4) in macho:
+                        targets.add(path)
+            if path.is_dir() and not path.is_symlink() and path.suffix in ('.framework', '.xpc', '.appex', '.app'):
+                targets.add(path)
+        for target in sorted(targets, key=lambda p: (-len(p.parts), str(p))) + [stage]:
+            checked(run, ['codesign', '--force', '--sign', thumbprint, '--keychain', str(keychain),
+                          '--options', 'runtime', '--timestamp=none', str(target)])
+        verify_test_macos(stage, thumbprint, run=run)
+        publish_directory(stage, output)
+
+
+def test_windows(source, output, certificate, thumbprint, signtool, *, openssl='openssl', run=subprocess.run):
+    """Real CurrentUser TEST certificate signing ONLY; never production signing."""
+    source = Path(source).resolve(strict=True)
+    if source.suffix.lower() not in ('.exe', '.dll', '.msi'):
+        raise ValueError('TEST Windows source must be .exe/.dll/.msi')
+    output = test_output(output, source.suffix.lower())
+    thumbprint = test_certificate(certificate, thumbprint, openssl, run)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.minyar-test-sign-', dir=output.parent) as directory:
+        stage = Path(directory) / output.name
+        shutil.copyfile(source, stage)
+        checked(run, [signtool, 'sign', '/fd', 'SHA256', '/sha1', thumbprint, '/s', 'My', str(stage)])
+        verify_test_windows(stage, signtool, thumbprint, run=run)
+        publish_directory(stage, output)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_subparsers(dest='mode', required=True)
@@ -198,6 +313,8 @@ def main():
     mac.add_argument('--notary-profile', required=True)
     mac.add_argument('--entitlements')
     mac.add_argument('--signed-app-output', help='retain the exact verified signed/stapled app as a new immutable generation')
+    mac.add_argument('--keychain', help='already-provisioned identity keychain; never created or modified')
+    mac.add_argument('--notary-keychain', help='already-provisioned keychain containing the notarization profile')
     win = modes.add_parser('windows')
     win.add_argument('--input', required=True)
     win.add_argument('--output', required=True)
@@ -207,14 +324,30 @@ def main():
     win.add_argument('--azure-dlib')
     win.add_argument('--azure-metadata')
     win.add_argument('--machine-store', action='store_true')
+    for name in ('test-macos', 'test-windows'):
+        test = modes.add_parser(name, help='TEST ONLY self-signed local artifact; never a production release')
+        test.add_argument('--app' if name == 'test-macos' else '--input', required=True)
+        test.add_argument('--output', required=True, help='new TEST-* output; existing paths are refused')
+        test.add_argument('--certificate', required=True, help='self-signed Minyar TEST ONLY DER certificate')
+        test.add_argument('--thumbprint', required=True, help='pinned SHA1 of DER certificate')
+        test.add_argument('--openssl', default='openssl')
+        test.add_argument('--keychain' if name == 'test-macos' else '--signtool', required=True)
     args = parser.parse_args()
     try:
+        if args.mode in ('macos', 'test-macos') and sys.platform != 'darwin':
+            raise ValueError('macOS release signing requires actual macOS')
+        if args.mode in ('windows', 'test-windows') and (os.name != 'nt' or sys.platform != 'win32'):
+            raise ValueError('Windows release signing requires native Windows Python on Boat')
         if args.mode == 'macos':
             macos(args.app, args.output, args.identity, args.notary_profile, entitlements=args.entitlements,
-                  signed_app_output=args.signed_app_output)
-        else:
+                  signed_app_output=args.signed_app_output, keychain=args.keychain, notary_keychain=args.notary_keychain)
+        elif args.mode == 'windows':
             windows(args.input, args.output, args.signtool, args.thumbprint, args.timestamp,
                     azure_dlib=args.azure_dlib, azure_metadata=args.azure_metadata, machine_store=args.machine_store)
+        elif args.mode == 'test-macos':
+            test_macos(args.app, args.output, args.certificate, args.thumbprint, args.keychain, openssl=args.openssl)
+        else:
+            test_windows(args.input, args.output, args.certificate, args.thumbprint, args.signtool, openssl=args.openssl)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         parser.exit(1, f'release failed: {error}\n')
 

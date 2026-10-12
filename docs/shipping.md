@@ -6,6 +6,9 @@ buy signing certificates, or generate a production update key.
 
 ## Release signing
 
+The manual artifact-only TEST workflow, CI/Boat guards and exact OWNER-RUN
+credential checklist are in [release-signing.md](release-signing.md).
+
 Use Python 3.11 or newer for the release tools. Release signing always copies its
 input and replaces the requested output only after every tool succeeds.
 
