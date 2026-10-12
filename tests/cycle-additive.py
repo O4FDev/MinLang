@@ -28,7 +28,7 @@ def counters():
 def run(command, environment, output, label, resource):
     proc = subprocess.Popen(command, cwd=ROOT, env=environment, start_new_session=not windows_host(),
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    previous = counters() if platform.system() == "Linux" else None
+    previous = counters() if platform.system() == "Linux" and not os.environ.get("MINYAR_TEST_SHARED_HOST") else None
     started = time.monotonic()
     stopped = False
     maximum = 0
