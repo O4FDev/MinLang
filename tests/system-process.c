@@ -7,6 +7,7 @@
 #include <grp.h>
 #else
 #include <io.h>
+#include <fcntl.h>
 #endif
 static void test_cwd(char *out, size_t capacity) {
 #ifdef _WIN32
@@ -264,6 +265,7 @@ static int process_main(int argc, char **argv) {
 }
 #ifdef _WIN32
 int wmain(int argc, wchar_t **wide) {
+    assert(_setmode(_fileno(stdout), _O_BINARY) != -1);
     char **argv = calloc((size_t)argc + 1, sizeof(*argv)); assert(argv);
     for (int i = 0; i < argc; i++) {
         int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide[i], -1, NULL, 0, NULL, NULL); assert(length);
