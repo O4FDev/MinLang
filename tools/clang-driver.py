@@ -565,7 +565,7 @@ def main():
             native += [native_object(project, clang, base, 'quicinteropio.c', native_flags)]
         elif library in ('sha256', 'tararchive'):
             from format_provider import format_provider
-            cflags, libraries = format_provider(library, clang, native_flags)
+            cflags, libraries = format_provider(library, clang, native_flags, link_flags)
             native += [native_object(project, clang, base, library + '.c',
                                      [*native_flags, *cflags]), *libraries]
         elif library == 'aes':
