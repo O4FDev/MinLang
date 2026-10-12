@@ -3,8 +3,10 @@
 `use "eventloop" as loop` provides socket readiness and monotonic timers in
 owned batches. macOS/BSD use kqueue, Linux uses epoll, and Windows uses WSAPoll.
 It is a single-owner API: ordinary Minyar values and registrations are not
-safe to share between threads. It does not implement language closures or
-async/await. Native socket operations use recoverable values from `errors`.
+safe to share between threads. The batch API uses ordinary values; the optional
+`eventcallbacks` dispatcher adds typed closures on their creating domain.
+Async/await is not implemented. Native socket operations use recoverable values
+from `errors`.
 
 `net.read` separates stream EOF, would-block and failure. `net.write` returns
 the number of bytes written in one operation; callers retain any unsent suffix.
@@ -17,8 +19,10 @@ is bounded, and the entire send encoding is checked before transmitting its
 first packet. `net.sendDatagramTo(socket, source, port, data)` replies to a
 numeric IPv4/IPv6 peer without connecting the UDP socket or performing DNS.
 It returns an owned `IntegerResult`, preserves empty datagrams and validates
-the complete address/packet before I/O. UDP GSO/GRO and unconnected batch send
-are not implemented yet. `net.monotonicMilliseconds()` supports absolute
+the complete address/packet before I/O. Linux UDP GSO/GRO is available through
+the explicit [offload API](research/udp-offload.md), including numeric-destination
+segmentation sends and dedicated receive sockets. Ordinary unconnected batch
+send remains unimplemented. `net.monotonicMilliseconds()` supports absolute
 operation deadlines across multiple reads.
 
 ```minyar
@@ -164,9 +168,15 @@ and [Microsoft's WSAPoll reference](https://learn.microsoft.com/en-us/windows/wi
 Mio and libuv repository licenses are MIT/Apache-2.0 and MIT respectively;
 copying actual files would require their applicable notices and provenance.
 
-Remaining work includes callbacks/closures and ownership-domain enforcement,
-macOS AppKit/CFRunLoop integration with a wake source, IOCP, cancellable
-cross-thread wakeups, io_uring evaluation, millions-of-connection memory/idle
-benchmarks and hours-long mixed socket/protocol soaks. Socket batching belongs
-to the `net` module. The basic reactor does not implement QUIC, Linux GSO/GRO,
-connection migration or transparent TCP fallback.
+The optional `eventcallbacks` dispatcher supports closure-backed watches and
+timers with one execution-domain owner. The
+[AppKit adapter](macos.md#shared-socket-and-callback-loop) attaches the
+reactor to the desktop loop; use `eventcallbacks.nativeLoop` for its borrowed
+reactor handle and dispatch callbacks on the owning thread. UDP batching and
+offload belong to `net`; QUIC, migration and fallback belong to the transport
+packages.
+
+Remaining work includes IOCP, cancellable cross-thread wakeups, io_uring
+evaluation, millions-of-connection memory/idle benchmarks and completed
+hours-long mixed socket/protocol measurements. See the
+[verification map](v2-verification.md) for the recorded source and test scope.
