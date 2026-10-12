@@ -101,6 +101,9 @@ long long minyar_net_ipVersion(const MinyarText *address) {
         memchr(address->bytes, 0, (size_t)address->byte_length))
         return 0;
     minyar_native_text(address, name, sizeof(name));
+    /* Strict literals only: Darwin's inet_pton also accepts IPv6 zone suffixes. */
+    if (strchr(name, '%'))
+        return 0;
     if (inet_pton(AF_INET, name, bytes) == 1)
         return 4;
     if (inet_pton(AF_INET6, name, bytes) == 1)
