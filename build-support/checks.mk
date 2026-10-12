@@ -23,7 +23,7 @@ check-smoke: build/minyarc build/minyar-runtime.o
 check-foundation-baseline:
 	python3 tests/foundation-baseline.py
 
-check: check-foundation-baseline
+check check-portable: check-foundation-baseline
 
 check-memory-contracts: build/minyarc
 	$(LIMITED) python3 tests/memory-contracts.py
