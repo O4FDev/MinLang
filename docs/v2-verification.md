@@ -438,14 +438,26 @@ index and 12-file terminal annex were verified, then reviewed against the actual
 reports and current driver bytes. These controls establish telemetry behavior,
 not flat memory or low idle CPU.
 
-The streaming-summary repair at `eea09a7` prevents observers from retaining
-all sample dictionaries. Test-first evidence records 16,000 live rows and
+The streaming-summary repair at `eea09a7` prevents the TCP/TLS summary observer
+from retaining all sample dictionaries. Test-first evidence records 16,000 live rows and
 36,992 KiB RSS growth before the repair, versus two live rows and 128 KiB
 after it. Three affected tests and four retained numerical comparisons pass;
 all original memory thresholds remain unchanged. New native TCP and TLS
 short controls pass with real controller telemetry and normal retirement.
 The 90-file archive and 11-file terminal annex were independently verified
 and reviewed.
+
+The separate QUIC driver now flushes each sample to JSONL and streams the full
+report array from disk, retaining only its previous sample. Its two new controls
+record an actual baseline failure with 16,000 live dictionaries and 54,272 KiB
+RSS growth, then pass with two live dictionaries, one retained row and zero
+measured RSS growth. Complete report/JSONL history, numerical role summaries,
+normal exit 0, rejected exit 7 and absent-peer null observations are preserved.
+Both corrected-fixture generations retire all 12 published process identities
+and five groups normally. An earlier binary/text fixture failure remains recorded separately.
+These accelerated history controls do not establish hours-long performance or
+the exclusive cause of the active cohort's RSS changes. That cohort continues
+with its original QUIC driver and memory gates.
 
 Twelve harmless Linux lifecycle controls now pass for the supplied-binary
 launcher: normal exits 0/1/7, parent loss before/after arming and after exec,

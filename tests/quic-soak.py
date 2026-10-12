@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from soak_observer import memory_summary
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('tls_tests', ROOT / 'tests/tls-local.py')
@@ -104,6 +105,70 @@ def ready_line(process, timeout=15):
         selector.close()
 
 
+def write_report(report_path, report):
+    # Preserve the full on-disk samples array without retaining its dictionaries.
+    # Each checkpoint consumes one already-flushed JSONL row at a time.
+    with report_path.open('w') as output:
+        output.write('{\n')
+        for key, value in report.items():
+            if key != 'samples':
+                output.write(json.dumps(key) + ': ' + json.dumps(value) + ',\n')
+        output.write('"samples": [\n')
+        first = True
+        with report_path.with_name('samples.jsonl').open() as saved:
+            for row in saved:
+                if not first: output.write(',\n')
+                output.write(row.rstrip('\n'))
+                first = False
+        output.write('\n]}\n')
+
+
+def memory_rows(report_path, role):
+    with report_path.with_name('samples.jsonl').open() as saved:
+        for line in saved:
+            row = json.loads(line)
+            selected = row if role == 'server' else row.get(role)
+            if selected is not None:
+                yield {'elapsed_seconds': row['elapsed_seconds'],
+                       'rss_kib': selected['rss_bytes'] / 1024}
+
+
+def observe_samples(server, client, proxy, started, deadline, duration, report_path, report):
+    previous = None
+    report.pop('samples', None)
+    report['sample_count'] = 0
+    report['last_sample'] = None
+    with report_path.with_name('samples.jsonl').open('w') as evidence:
+        while server.poll() is None and (client is None or client.poll() in (None, 0)):
+            if time.monotonic() > deadline:
+                raise TimeoutError('QUIC soak exceeded its independent wall-clock deadline')
+            sample = process_sample(server.pid); sample['elapsed_seconds'] = time.monotonic() - started
+            sample['controller'] = process_sample(os.getpid())
+            sample['peer_status'], sample['peer'] = peer_observation(client) if client else (None, None)
+            sample['host_load_average'] = list(os.getloadavg())
+            sample['proxy_forwarded']=proxy.forwarded;sample['proxy_dropped']=proxy.dropped;sample['proxy_delayed']=proxy.delayed
+            if previous is not None:
+                sample['interval_cpu_percent'] = 100 * (sample['cpu_seconds'] - previous['cpu_seconds']) / (sample['elapsed_seconds'] - previous['elapsed_seconds'])
+            evidence.write(json.dumps(sample) + '\n'); evidence.flush()
+            report['sample_count'] += 1
+            report['last_sample'] = previous = sample
+            write_report(report_path, report)
+            print(json.dumps(sample), flush=True); time.sleep(min(10, duration))
+
+
+def finish_observations(server, client, proxy, report_path, report):
+    stdout, stderr = client.communicate(timeout=30) if client else ('', '')
+    server_stdout, server_stderr = server.communicate(timeout=30)
+    report.update({'client_status': client.returncode if client else None, 'server_status': server.returncode, 'client_stdout': stdout, 'client_stderr': stderr,
+                   'server_stdout': server_stdout, 'server_stderr': server_stderr, 'faults': {'dropped': proxy.dropped, 'reordered': proxy.delayed, 'forwarded': proxy.forwarded}})
+    report['memory_summary_by_role'] = {
+        role: memory_summary(memory_rows(report_path, role))
+        for role in ('server', 'controller', 'peer')}
+    write_report(report_path, report)
+    assert server.returncode == 0 and not server_stderr and (client is None or (client.returncode == 0 and not stderr)), {key:report[key] for key in ('server_status','client_status','server_stdout','server_stderr','client_stdout','client_stderr')}
+    print(stdout, end=''); print(server_stdout, end='')
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--binary', type=Path, help='use a separately built matching native server')
@@ -161,7 +226,7 @@ def main():
             else:
                 peer_command=[str(peer_binary),str(proxy.front.getsockname()[1]),str(ca.path('root','der')),str(ca.path('client','der')),str(ca.path('client','pk8')),str(options.duration),str(options.peers),str(options.interval_ms)]
                 client = subprocess.Popen(peer_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,env=dict(os.environ,MINYAR_QUINN_IDLE_SECONDS=str(options.idle_seconds)))
-            started = time.monotonic(); samples = []
+            started = time.monotonic()
             deadline = started + options.duration + options.setup_grace_seconds + options.idle_seconds + teardown_seconds + 60
             configuration={key:str(value) if isinstance(value,Path) else value for key,value in vars(options).items()}
             versions = {}
@@ -174,31 +239,14 @@ def main():
             report = {'host': socket.gethostname(), 'platform': platform.platform(), 'configuration': configuration,
                       'versions': versions, 'source_sha256': source.hexdigest(), 'server_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
                       'server_pid':server.pid,'controller_pid':os.getpid(),'peer_pid':client.pid if client else None,
-                      'controller_role':'QUIC fault proxy and observer share this process','samples':samples,
+                      'controller_role':'QUIC fault proxy and observer share this process',
                       'command':server_command,'peer_command':peer_command,'compile_command':compile_command,'peer_build_command':peer_build_command,
                       'peer_sha256':hashlib.sha256(peer_binary.read_bytes()).hexdigest() if not options.server_only else None}
             options.report.parent.mkdir(parents=True, exist_ok=True)
             # The server's bounded lifetime includes setup and teardown grace.
             # Keep observing it after a successful peer finishes.
-            while server.poll() is None and (client is None or client.poll() in (None, 0)):
-                if time.monotonic() > deadline:
-                    raise TimeoutError('QUIC soak exceeded its independent wall-clock deadline')
-                sample = process_sample(server.pid); sample['elapsed_seconds'] = time.monotonic() - started
-                sample['controller'] = process_sample(os.getpid())
-                sample['peer_status'], sample['peer'] = peer_observation(client) if client else (None, None)
-                sample['host_load_average'] = list(os.getloadavg())
-                sample['proxy_forwarded']=proxy.forwarded;sample['proxy_dropped']=proxy.dropped;sample['proxy_delayed']=proxy.delayed
-                if samples:
-                    sample['interval_cpu_percent'] = 100 * (sample['cpu_seconds'] - samples[-1]['cpu_seconds']) / (sample['elapsed_seconds'] - samples[-1]['elapsed_seconds'])
-                samples.append(sample); options.report.write_text(json.dumps(report, indent=2) + '\n')
-                print(json.dumps(sample), flush=True); time.sleep(min(10, options.duration))
-            stdout, stderr = client.communicate(timeout=30) if client else ('', '')
-            server_stdout, server_stderr = server.communicate(timeout=30)
-            report.update({'client_status': client.returncode if client else None, 'server_status': server.returncode, 'client_stdout': stdout, 'client_stderr': stderr,
-                           'server_stdout': server_stdout, 'server_stderr': server_stderr, 'faults': {'dropped': proxy.dropped, 'reordered': proxy.delayed, 'forwarded': proxy.forwarded}})
-            options.report.write_text(json.dumps(report, indent=2) + '\n')
-            assert server.returncode == 0 and not server_stderr and (client is None or (client.returncode == 0 and not stderr)), {key:report[key] for key in ('server_status','client_status','server_stdout','server_stderr','client_stdout','client_stderr')}
-            print(stdout, end=''); print(server_stdout, end='')
+            observe_samples(server, client, proxy, started, deadline, options.duration, options.report, report)
+            finish_observations(server, client, proxy, options.report, report)
         finally:
             if proxy: proxy.close()
             for process in (client, server):

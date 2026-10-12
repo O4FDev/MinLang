@@ -306,4 +306,198 @@ print(json.dumps({'pid':os.getpid(),'rows':count,'peak_live_rows':Row.peak,
         self.assertLessEqual(result['peak_live_rows'], 2, 'summary retained independent input dictionaries')
         self.assertLessEqual(result['retained_growth_kib'], 16384, 'summary exceeded unchanged16MiB span')
 
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'QUIC adapter retention uses actual Linux RSS')
+    def test_quic_observer_adapter_bounds_long_sample_history(self):
+        # Exercise the driver adapter with real quiet processes. Virtual sample
+        # times accelerate history only; this is not transport/performance proof.
+        source = 'TEST_DIR=' + repr(str(Path(__file__).parent)) + '\n' + r'''
+import contextlib,importlib.util,json,os,subprocess,sys,tempfile,types
+from pathlib import Path
+sys.path.insert(0,TEST_DIR)
+spec=importlib.util.spec_from_file_location('quic_adapter',Path(TEST_DIR)/'quic-soak.py')
+quic=importlib.util.module_from_spec(spec);spec.loader.exec_module(quic)
+own_fields=Path(f'/proc/{os.getpid()}/stat').read_text().rsplit(')',1)[1].split()
+driver_identity={'pid':os.getpid(),'pgid':int(own_fields[2]),'start_ticks':int(own_fields[19])}
+class Row(dict):
+    live=peak=0
+    def __init__(self,*args,**kwargs):
+        super().__init__(*args,**kwargs);Row.live+=1;Row.peak=max(Row.peak,Row.live)
+    def __del__(self):Row.live-=1
+children=[];births=[]
+def child():
+    p=subprocess.Popen([sys.executable,'-c','import sys; data=bytearray(24*1024*1024); print("ready",flush=True); sys.stdin.buffer.readline()'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+    children.append(p)
+    fields=Path(f'/proc/{p.pid}/stat').read_text().rsplit(')',1)[1].split()
+    births.append({'pid':p.pid,'pgid':int(fields[2]),'start_ticks':int(fields[19])})
+    assert p.stdout.readline()=='ready\n'
+    return p
+try:
+    server=child();peer=child();original=quic.process_sample
+    base=original(os.getpid())['rss_bytes']//1024;peak=base
+    count=0;checkpoints=0;clock={'now':100.0}
+    proxy=types.SimpleNamespace(forwarded=0,dropped=0,delayed=0)
+    def sample(pid):
+        global count,peak
+        result=original(pid)
+        if pid==server.pid:
+            count+=1;clock['now']=100.0+count*10
+            proxy.forwarded=count*5;proxy.dropped=count;proxy.delayed=(count+1)//2
+            # Independent bounded future diagnostic field; not a shared string.
+            return Row(result,detail=str(count)+':'+('x'*2048))
+        if pid==os.getpid():
+            peak=max(peak,result['rss_bytes']//1024)
+            if count==16000:
+                for p in (server,peer):p.stdin.write('\n');p.stdin.flush()
+                for p in (server,peer):assert p.wait(timeout=2)==0
+        return result
+    def checkpoint(*unused):
+        global checkpoints
+        checkpoints+=1
+    quic.process_sample=sample
+    quic.time=types.SimpleNamespace(monotonic=lambda:clock['now'],sleep=lambda delay:None)
+    # Suppress repeated whole-history checkpoint serialization in this stress
+    # control only. The actual adapter's sample ownership remains untouched.
+    quic.write_report=checkpoint
+    with tempfile.TemporaryDirectory() as directory,open(os.devnull,'w') as silent:
+        path=Path(directory)/'report.json';report={'samples':[]}
+        with contextlib.redirect_stdout(silent):
+            quic.observe_samples(server,peer,proxy,0,200000,1,path,report)
+            quic.finish_observations(server,peer,proxy,path,report)
+        result={'pid':os.getpid(),'driver_identity':driver_identity,'births':births,'rows':count,'checkpoints':checkpoints,
+                'peak_live_rows':Row.peak,'remaining_live_rows':Row.live,
+                'rss_base_kib':base,'peak_rss_kib':peak,'retained_growth_kib':peak-base,
+                'server_status':report['server_status'],'client_status':report['client_status'],
+                'server_stderr':report['server_stderr'],'client_stderr':report['client_stderr'],
+                'role_summaries':report.get('memory_summary_by_role')}
+        print(json.dumps(result),flush=True)
+finally:
+    for p in children:
+        if p.poll() is None:p.kill()
+        p.communicate(timeout=2)
+'''
+        child = self.child(source)
+        try:
+            stdout, stderr = child.communicate(timeout=12)
+            sys.stdout.buffer.write(stdout); sys.stdout.buffer.flush()
+            self.assertEqual(child.returncode, 0, stderr)
+            self.assertEqual(stderr, b'')
+            result = json.loads(stdout)
+            self.assertEqual(result['rows'], 16000)
+            self.assertEqual(result['checkpoints'], 16001)
+            self.assertEqual((result['server_status'], result['client_status']), (0, 0))
+            self.assertEqual((result['server_stderr'], result['client_stderr']), ('', ''))
+            for target in [child.pid] + [row['pid'] for row in result['births']]:
+                with self.assertRaises(ProcessLookupError): os.kill(target, 0)
+            with self.assertRaises(ProcessLookupError): os.killpg(child.pid, 0)
+            self.assertLessEqual(result['peak_live_rows'], 2, 'QUIC observer retained sample dictionaries')
+            self.assertLessEqual(result['remaining_live_rows'], 1, 'QUIC report retained history')
+            self.assertLessEqual(result['retained_growth_kib'], 16384, 'observer exceeded unchanged16MiB span')
+            self.assertEqual(set(result['role_summaries']), {'server','controller','peer'})
+            for role, summary in result['role_summaries'].items():
+                self.assertLessEqual(summary['warm_rss_max_kib']-summary['warm_rss_min_kib'], 16384, role)
+                self.assertLessEqual(summary['rss_slope_kib_per_second'], .2, role)
+        finally:
+            if child.poll() is None: os.killpg(child.pid, signal.SIGKILL)
+            child.communicate(timeout=2)
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'QUIC report roles use actual Linux procfs')
+    def test_quic_observer_adapter_preserves_raw_roles_counters_and_exit_status(self):
+        source = 'TEST_DIR=' + repr(str(Path(__file__).parent)) + '\n' + r'''
+import contextlib,importlib.util,json,math,os,subprocess,sys,tempfile,types
+from pathlib import Path
+sys.path.insert(0,TEST_DIR)
+spec=importlib.util.spec_from_file_location('quic_adapter',Path(TEST_DIR)/'quic-soak.py')
+quic=importlib.util.module_from_spec(spec);spec.loader.exec_module(quic)
+own_fields=Path(f'/proc/{os.getpid()}/stat').read_text().rsplit(')',1)[1].split()
+driver_identity={'pid':os.getpid(),'pgid':int(own_fields[2]),'start_ticks':int(own_fields[19])}
+original=quic.process_sample;births=[];outcomes=[]
+def reference(rows,role):
+    points=[(r['elapsed_seconds'],(r if role=='server' else r[role])['rss_bytes']/1024)
+            for r in rows if r['elapsed_seconds']>=60 and (role=='server' or r[role] is not None)]
+    if not points:return {'warm_rss_min_kib':None,'warm_rss_max_kib':None,'rss_slope_kib_per_second':None}
+    x=sum(p[0] for p in points)/len(points);y=sum(p[1] for p in points)/len(points)
+    denominator=sum((a-x)**2 for a,b in points)
+    return {'warm_rss_min_kib':min(b for a,b in points),'warm_rss_max_kib':max(b for a,b in points),
+            'rss_slope_kib_per_second':sum((a-x)*(b-y) for a,b in points)/denominator if denominator else 0}
+for peer_exit in (0,7,None):
+    children=[]
+    def child(status=0):
+        p=subprocess.Popen([sys.executable,'-c',f'import sys; data=bytearray(24*1024*1024); print("ready",flush=True); sys.stdin.buffer.readline(); sys.exit({status})'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        children.append(p)
+        fields=Path(f'/proc/{p.pid}/stat').read_text().rsplit(')',1)[1].split()
+        births.append({'pid':p.pid,'pgid':int(fields[2]),'start_ticks':int(fields[19])})
+        assert p.stdout.readline()=='ready\n';return p
+    try:
+        server=child();peer=child(peer_exit) if peer_exit is not None else None
+        clock={'now':100.0};counter={'rows':0}
+        proxy=types.SimpleNamespace(forwarded=0,dropped=0,delayed=0)
+        def sample(pid):
+            row=original(pid)
+            if pid==server.pid:
+                counter['rows']+=1;clock['now']=100+10*counter['rows']
+                proxy.forwarded=counter['rows']*5;proxy.dropped=counter['rows'];proxy.delayed=(counter['rows']+1)//2
+            if pid==os.getpid():
+                if peer and counter['rows']==3:
+                    peer.stdin.write('\n');peer.stdin.flush();assert peer.wait(timeout=2)==peer_exit
+                if counter['rows']==(3 if peer_exit==7 else 8):
+                    server.stdin.write('\n');server.stdin.flush();assert server.wait(timeout=2)==0
+            return row
+        quic.process_sample=sample
+        quic.time=types.SimpleNamespace(monotonic=lambda:clock['now'],sleep=lambda delay:None)
+        with tempfile.TemporaryDirectory() as directory,open(os.devnull,'w') as silent:
+            path=Path(directory)/'report.json';metadata={'samples':[],'server_pid':server.pid,'controller_pid':os.getpid(),'peer_pid':peer.pid if peer else None}
+            failed=False
+            with contextlib.redirect_stdout(silent):
+                quic.observe_samples(server,peer,proxy,0,1000,1,path,metadata)
+                try:quic.finish_observations(server,peer,proxy,path,metadata)
+                except AssertionError:failed=True
+            report=json.loads(path.read_text());rows=report['samples']
+            assert failed==(peer_exit==7)
+            assert report['server_status']==0 and report['client_status']==peer_exit
+            assert report['server_stderr']==report['client_stderr']==''
+            assert len(rows)==counter['rows'] and len(rows)==(3 if peer_exit==7 else 8)
+            assert report['faults']=={'forwarded':len(rows)*5,'dropped':len(rows),'reordered':(len(rows)+1)//2}
+            for index,row in enumerate(rows):
+                assert row['elapsed_seconds']==110+index*10
+                assert row['rss_bytes']>=24*1024*1024 and row['controller']['rss_bytes']>0
+                if index:assert row['interval_cpu_percent']==100*(row['cpu_seconds']-rows[index-1]['cpu_seconds'])/10
+                if peer and index<2:assert row['peer_status'] is None and row['peer']['rss_bytes']>=24*1024*1024
+                else:assert row['peer'] is None and row['peer_status']==peer_exit
+                assert row['proxy_forwarded']==(index+1)*5 and row['proxy_dropped']==index+1
+            raw=path.with_name('samples.jsonl')
+            if raw.exists():
+                assert [json.loads(line) for line in raw.open()]==rows
+                assert report['sample_count']==len(rows) and report['last_sample']==rows[-1]
+                for role in ('server','controller','peer'):
+                    expected=reference(rows,role);actual=report['memory_summary_by_role'][role]
+                    assert actual['warm_rss_min_kib']==expected['warm_rss_min_kib'] and actual['warm_rss_max_kib']==expected['warm_rss_max_kib']
+                    wanted=expected['rss_slope_kib_per_second'];got=actual['rss_slope_kib_per_second']
+                    assert got is None if wanted is None else math.isclose(got,wanted,rel_tol=1e-9,abs_tol=1e-12)
+                    if wanted is not None:
+                        assert expected['warm_rss_max_kib']-expected['warm_rss_min_kib']<=16384
+            outcomes.append({'peer_exit':peer_exit,'rejected':failed,'rows':len(rows),'statuses':[report['server_status'],report['client_status']]})
+    finally:
+        for p in children:
+            if p.poll() is None:p.kill()
+            p.communicate(timeout=2)
+print(json.dumps({'pid':os.getpid(),'driver_identity':driver_identity,'births':births,'cases':outcomes}),flush=True)
+'''
+        child = self.child(source)
+        try:
+            stdout, stderr = child.communicate(timeout=12)
+            sys.stdout.buffer.write(stdout); sys.stdout.buffer.flush()
+            self.assertEqual(child.returncode, 0, stderr)
+            self.assertEqual(stderr, b'')
+            result=json.loads(stdout)
+            self.assertEqual(result['cases'], [
+                {'peer_exit':0,'rejected':False,'rows':8,'statuses':[0,0]},
+                {'peer_exit':7,'rejected':True,'rows':3,'statuses':[0,7]},
+                {'peer_exit':None,'rejected':False,'rows':8,'statuses':[0,None]}])
+            for target in [child.pid]+[row['pid'] for row in result['births']]:
+                with self.assertRaises(ProcessLookupError): os.kill(target,0)
+            with self.assertRaises(ProcessLookupError): os.killpg(child.pid,0)
+        finally:
+            if child.poll() is None: os.killpg(child.pid,signal.SIGKILL)
+            child.communicate(timeout=2)
+
 if __name__ == '__main__': unittest.main()
