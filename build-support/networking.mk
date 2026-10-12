@@ -40,3 +40,13 @@ check-net-udp-offload-sanitize: build/minyarc build/minyar-default-runtime.o
 
 check check-portable check-quic: check-net-udp-offload
 check-sanitize check-quic-sanitize: check-net-udp-offload-sanitize
+
+.PHONY: check-os-tlsverify check-os-tlsverify-sanitize
+check-os-tlsverify: build/minyarc
+	MINYAR_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/os-tlsverify.py
+
+check-os-tlsverify-sanitize: build/minyarc
+	MINYAR_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/os-tlsverify.py --sanitize
+
+check check-portable: check-os-tlsverify
+check-sanitize: check-os-tlsverify-sanitize
