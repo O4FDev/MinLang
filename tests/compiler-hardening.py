@@ -36,6 +36,49 @@ class CompilerHardening(CompilerTestCase):
                 self.rejects(f'function {name}(): Integer {{ return 7 }}\n',
                              "function '" + name + "' uses a reserved built-in name")
 
+    def test_octal_literals_accept_every_octal_digit(self):
+        self.executes('print(0o7)\nprint(0o17)\nprint(0o777)\nprint(0o755)\n'
+                      'print(0o777777777777777777777)\n', '7\n15\n511\n493\n9223372036854775807\n')
+
+    def test_closure_dependent_list_signatures_and_comparators_request_the_closure_frontend(self):
+        for source in ('function make(): Callback<List<Integer>> { fail("unused") }\n',
+                       'function make(): Callback<Integer, List<Text>> { fail("unused") }\n',
+                       'let values = [3, 1, 2]\n'
+                       'values.sortBy(function(a: Integer, b: Integer): Integer { return a - b })\n',
+                       'let values = [3, 1, 2]\n'
+                       'let sorted = values.sortedBy(function(a: Integer, b: Integer): Integer { return a - b })\n'):
+            with self.subTest(source=source):
+                result, llvm = self.compile(source)
+                self.assertEqual(result.returncode, 86, result.stderr)
+                self.assertFalse(result.stdout)
+                self.assertFalse(result.stderr)
+                self.assertFalse(llvm.exists())
+
+    def test_reassignable_record_parameters_are_not_scalar_records(self):
+        self.executes('record Point { x: Integer; y: Integer }\n'
+                      'function sum(point: Point): Integer {\nlet total = point.x + point.y\n'
+                      'point = Point { x: 0, y: 0 }\nreturn total + point.x\n}\n'
+                      'print(sum(Point { x: 3, y: 4 }))\n', '7\n')
+        # The earlier body scalar-replaces its first local; the later
+        # parameter reuses that local number but must read the real record.
+        self.executes('record Point { x: Integer; y: Integer }\n'
+                      'function first(): Integer {\nlet p = Point { x: 10, y: 20 }\nreturn p.x + p.y\n}\n'
+                      'function second(q: Point): Integer {\nlet product = q.x * q.y\n'
+                      'q = Point { x: 1, y: 1 }\nreturn product + q.x\n}\n'
+                      'print(first())\nprint(second(Point { x: 3, y: 4 }))\n', '30\n13\n')
+
+    def test_only_bounded_ownership_declares_the_stack_owner_runtime(self):
+        source = 'function label(value: Integer): Text { let text = Text(value); return text }\nprint(label(7))\n'
+        result, llvm = self.compile(source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ('@minyar_rc_enter_stack_v1', '@minyar_rc_leave_stack_v1'):
+            self.assertNotIn(name, llvm.read_text())
+        self.compiler_arguments = ['--bounded-owners', '2048']
+        result, llvm = self.compile(source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ('@minyar_rc_enter_stack_v1', '@minyar_rc_leave_stack_v1'):
+            self.assertIn('declare void ' + name + '(', llvm.read_text())
+
     def test_executable_entry_is_not_an_ordinary_callable_function(self):
         for source in ('function main(): Integer { return main() }\n',
                        'function main(): Integer { return 0 }\n'
