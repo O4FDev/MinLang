@@ -1,15 +1,15 @@
-function compileBlock(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, returnType: Integer): Boolean {
+function compileBlock(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: EmitContext, output: List<Text>, globals: List<Text>, returnType: Integer): Boolean {
     return compileStatementSequence(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType, true)
 }
 
-function compileStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, returnType: Integer): Boolean {
+function compileStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: EmitContext, output: List<Text>, globals: List<Text>, returnType: Integer): Boolean {
     if tokenIs(tokenKinds, tokenTexts, state, "if") || tokenIs(tokenKinds, tokenTexts, state, "while") {
         return compileStatementSequence(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType, false)
     }
     return compileAtomicStatement(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
 }
 
-function compileAtomicStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, returnType: Integer): Boolean {
+function compileAtomicStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: EmitContext, output: List<Text>, globals: List<Text>, returnType: Integer): Boolean {
     if tokenIs(tokenKinds, tokenTexts, state, "match") {
         return compileResultMatch(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
     }
@@ -75,16 +75,12 @@ function compileAtomicStatement(tokenKinds: List<Integer>, tokenTexts: List<Text
         let id = nextLocal(state)
         addLocal(localNames, localTypes, localIds, localLengths, state, name, type, id)
         assignReference(output, state, id, value, valueType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
-        output.add("  store ")
-        output.add(llvmType(type))
-        output.add(" ")
-        output.add(value)
-        output.add(", ptr %local.")
-        output.add(Text(id))
-        output.add("\n")
+        if tokenLines.immutableBindings[nameLocation] && scalarRecordValues(state, id) < 0 {
+            setImmutableBinding(textState, id, value)
+        } else { storeLocal(output, id, type, value) }
     } else {
         if tokenIs(tokenKinds, tokenTexts, state, "return") {
-            if textState[1] == "top level" {
+            if textState.caller == "top level" {
                 fail(describeLocation(tokenLocation(tokenLines, state[0])) + ": use exit(status) to finish a top-level program")
             }
             state[0] = state[0] + 1
@@ -105,13 +101,13 @@ function compileAtomicStatement(tokenKinds: List<Integer>, tokenTexts: List<Text
                 output.add(value)
                 output.add(")\n")
             }
-            if textState[1] == "main" {
-                if (state[15] / 4 % 2) != 0 { threadJoinOnReturn(output, globals, textState[1]) }; emitModuleConstantCleanup(output, symbolKinds, functionParameterCounts)
+            if textState.caller == "main" {
+                if (state[15] / 4 % 2) != 0 { threadJoinOnReturn(output, globals, textState.caller) }; emitModuleConstantCleanup(output, symbolKinds, functionParameterCounts)
             }
-            if (state[15] / 4 % 2) != 0 { threadJoinOnReturn(output, globals, textState[1]) }
+            if (state[15] / 4 % 2) != 0 { threadJoinOnReturn(output, globals, textState.caller) }
             output.add("  call void @minyar_rc_leave()\n")
             output.add("  call void @minyar_stack_leave()\n")
-            if textState[1] == "main" {
+            if textState.caller == "main" {
                 let temporary = newTemporary(state)
                 output.add("  %value.")
                 output.add(Text(temporary))
@@ -227,6 +223,7 @@ function markAssignedParameters(tokenKinds: List<Integer>, tokenTexts: List<Text
 }
 
 function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, output: List<Text>, globals: List<Text>, stackOwnerLimit: Integer, literalPrefix: Text, bodyStats: List<Integer>): Boolean {
+    prepareImmutableBindings(tokenKinds, tokenTexts, tokenLines)
     let state: List<Integer> = []
     state.add(0)
     state.add(0)
@@ -249,10 +246,7 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
     let treeCalls: List<Integer> = []
     let treeSlots: List<Integer> = []
     state.add(tokenLines.features)
-    let textState: List<Text> = []
-    textState.add("entry")
-    textState.add("")
-    textState.add(literalPrefix)
+    let textState = newEmitContext("entry", "", literalPrefix)
 
     skipTerminators(tokenKinds, state)
     while tokenKinds[state[0]] != 0 {
@@ -263,7 +257,7 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         expectToken(tokenKinds, tokenTexts, tokenLines, state, "function")
         let name = tokenTexts[state[0]]
         state[0] = state[0] + 1
-        textState[1] = name
+        textState.caller = name
         expectToken(tokenKinds, tokenTexts, tokenLines, state, "(")
         let parameterNames: List<Text> = []
         let parameterTypes: List<Integer> = []
@@ -313,8 +307,10 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         state[13] = 0
         if stackOwnerLimit > 0 { state[5] = -1 }
         state[14] = 0
-        textState[0] = "entry"
-        if recoveryEnabled(state) { textState[0] = "recovery.body" }
+        let bindingValues: List<Text> = []
+        textState.bindings = bindingValues
+        textState.block = "entry"
+        if recoveryEnabled(state) { textState.block = "recovery.body" }
         let localNames: List<Text> = []
         let localTypes: List<Integer> = []
         let localIds: List<Integer> = []
@@ -386,8 +382,8 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
         let bodySlot = output.length
         let returns = compileBlock(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
         if !returns {
-            if name == "main" { if state[15] / 4 % 2 != 0 { threadJoinOnReturn(output, globals, textState[1]) }; emitModuleConstantCleanup(output, symbolKinds, functionParameterCounts) }
-            if (state[15] / 4 % 2) != 0 { threadJoinOnReturn(output, globals, textState[1]) }
+            if name == "main" { if state[15] / 4 % 2 != 0 { threadJoinOnReturn(output, globals, textState.caller) }; emitModuleConstantCleanup(output, symbolKinds, functionParameterCounts) }
+            if (state[15] / 4 % 2) != 0 { threadJoinOnReturn(output, globals, textState.caller) }
             output.add("  call void @minyar_rc_leave()\n")
             output.add("  call void @minyar_stack_leave()\n")
             if name == "main" {
@@ -404,11 +400,11 @@ function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tok
             output[definitionTailSlot] = ") noinline {\nentry:\n"
             if returnType == 1 && parameterNames.length == 1 && parameterTypes[0] == 1 && parameterTypes[1] < 0 {
                 let dispatchTable = "@.dispatch." + Text(bodyStart)
-                if textState[2] != "" { dispatchTable = "@\"minyar.literal|" + textState[2] + "|dispatch|" + Text(bodyStart) + "\"" }
+                if textState.literalPrefix != "" { dispatchTable = "@\"minyar.literal|" + textState.literalPrefix + "|dispatch|" + Text(bodyStart) + "\"" }
                 if !recoveryEnabled(state) { lowerIntegerDispatch(tokenKinds, tokenTexts, tokenLines, bodyStart, state[0], parameterNames[0], output, globals, bodySlot, dispatchTable) }
             }
         }
-        if !depthBoundary && !machineIntrinsic { finishFunctionEntry(output, entrySlot, state[4], parameterNames.length, state[8], state[6] == 1, emittedReturn, state[15], textState[1], globals, name == "main" && hasModuleConstants(symbolKinds, functionParameterCounts)) }
+        if !depthBoundary && !machineIntrinsic { finishFunctionEntry(output, entrySlot, state[4], parameterNames.length, state[8], state[6] == 1, emittedReturn, state[15], textState.caller, globals, name == "main" && hasModuleConstants(symbolKinds, functionParameterCounts)) }
         if parallel {
             let parallelReferences = state[6] == 1 || isReferenceType(returnType)
             let parallelParameter = 0
@@ -510,11 +506,8 @@ function compileModuleConstants(tokenKinds: List<Integer>, tokenTexts: List<Text
             state.add(0)
             state.add(0)
             state.add(tokenLines.features)
-    let textState: List<Text> = []
-            textState.add("initialize")
-            if recoveryEnabled(state) { textState[0] = "recovery.body" }
-            textState.add("constant " + name)
-            textState.add("")
+    let textState = newEmitContext("initialize", "constant " + name, "")
+            if recoveryEnabled(state) { textState.block = "recovery.body" }
             let localNames: List<Text> = []
             let localTypes: List<Integer> = []
             let localIds: List<Integer> = []
@@ -539,7 +532,7 @@ function compileModuleConstants(tokenKinds: List<Integer>, tokenTexts: List<Text
             output.add("  br label %ready\nready:\n")
             output.add("  %constant.value = load " + llvmType(type) + ", ptr " + cell + "\n")
             output.add("  ret " + llvmType(type) + " %constant.value\n")
-            finishFunctionEntry(output, entrySlot, state[4], 0, state[8], state[6] == 1, llvmType(type), state[15], textState[1], globals, false)
+            finishFunctionEntry(output, entrySlot, state[4], 0, state[8], state[6] == 1, llvmType(type), state[15], textState.caller, globals, false)
             if recoveryEnabled(state) { recoveryResetConstant(output, entrySlot, flag) }
             output.add("}\n\n")
         }
@@ -591,11 +584,8 @@ function compileTopLevel(tokenKinds: List<Integer>, tokenTexts: List<Text>, toke
     state.add(0)
     state.add(0)
     state.add(tokenLines.features)
-    let textState: List<Text> = []
-    textState.add("entry")
-    if recoveryEnabled(state) { textState[0] = "recovery.body" }
-    textState.add("top level")
-    textState.add(literalPrefix)
+    let textState = newEmitContext("entry", "top level", literalPrefix)
+    if recoveryEnabled(state) { textState.block = "recovery.body" }
     let localNames: List<Text> = []
     let localTypes: List<Integer> = []
     let localIds: List<Integer> = []
@@ -618,8 +608,8 @@ function compileTopLevel(tokenKinds: List<Integer>, tokenTexts: List<Text>, toke
                 skipTopLevelStatement(tokenKinds, tokenTexts, state)
             } else {
             if terminated {
-                textState[0] = "dead." + Text(newLabel(state))
-            output.add("\n" + textState[0] + ":\n")
+                textState.block = "dead." + Text(newLabel(state))
+            output.add("\n" + textState.block + ":\n")
             }
             terminated = compileStatement(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, 1)
             if terminated { state[13] = 1 }
@@ -629,12 +619,12 @@ function compileTopLevel(tokenKinds: List<Integer>, tokenTexts: List<Text>, toke
         skipTerminators(tokenKinds, state)
     }
     if !terminated {
-        if (state[15] / 4 % 2) != 0 { threadJoinOnReturn(output, globals, textState[1]) }; emitModuleConstantCleanup(output, symbolKinds, functionParameterCounts)
-        if (state[15] / 4 % 2) != 0 { threadJoinOnReturn(output, globals, textState[1]) }
+        if (state[15] / 4 % 2) != 0 { threadJoinOnReturn(output, globals, textState.caller) }; emitModuleConstantCleanup(output, symbolKinds, functionParameterCounts)
+        if (state[15] / 4 % 2) != 0 { threadJoinOnReturn(output, globals, textState.caller) }
             output.add("  call void @minyar_rc_leave()\n")
         output.add("  call void @minyar_stack_leave()\n")
         output.add("  ret i32 0\n")
     }
-    finishFunctionEntry(output, entrySlot, state[4], 0, state[8], state[6] == 1, "i32", state[15], textState[1], globals, hasModuleConstants(symbolKinds, functionParameterCounts))
+    finishFunctionEntry(output, entrySlot, state[4], 0, state[8], state[6] == 1, "i32", state[15], textState.caller, globals, hasModuleConstants(symbolKinds, functionParameterCounts))
     output.add("}\n\n")
 }
