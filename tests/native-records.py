@@ -52,6 +52,22 @@ print(original.label)
             self.assertEqual((executed.returncode, executed.stdout, executed.stderr),
                              (0, '42\n42\n', ''))
 
+    def test_results_remain_outside_the_native_abi(self):
+        for source, diagnostic in (
+            ('function read(value: Result<Integer, Text>): Integer { native "record_abi" }\n', 'native functions accept'),
+            ('function make(): Result<Integer, Text> { native "record_abi" }\n', 'native functions return'),
+        ):
+            with self.subTest(source=source):
+                path = self.directory / 'result.min'
+                llvm = path.with_suffix('.ll')
+                path.write_text(source)
+                llvm.unlink(missing_ok=True)
+                result = self.evidence.run([str(ROOT / 'build/minyarc-errors'), str(path), str(llvm)],
+                                          text=True, timeout=30, phase='compile-native-result-boundary')
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(diagnostic, result.stderr)
+                self.assertFalse(llvm.exists())
+
     def test_lists_remain_outside_the_native_abi(self):
         self.rejects('function read(values: List<Integer>): Integer { native "record_abi" }\n',
                      'not List')

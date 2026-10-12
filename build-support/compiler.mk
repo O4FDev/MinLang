@@ -154,7 +154,7 @@ build/.toolchain.json: FORCE scripts/toolchain-stamp.py tools/host_paths.py | bu
 	@python3 scripts/toolchain-stamp.py $@
 
 .PHONY: check-native-records
-check-native-records: build/minyarc build/minyar-runtime.o
+check-native-records: build/minyarc build/minyarc-errors build/minyar-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/native-records.py
 
 check check-portable: check-native-records
