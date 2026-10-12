@@ -2,21 +2,25 @@
 """Run Linux correctness checks in an isolated source/build snapshot.
 
 Requires clang, lld, make, python3, zsh, sanitizer runtimes, and libc/C++ headers.
-Example: python3 scripts/check-linux.py --source /path/to/project
-Run separately on aarch64 and x86_64. Performance tests are excluded."""
+Example: python3 scripts/check-linux.py --source /path/to/project --tier all
+Run separately on aarch64 and x86_64. Performance tests are excluded.
+
+Checks run in parallel (--jobs, default the CPU count) and keep going past
+failures; the run ends with one summary of every failure. Tiers: `full` (the
+default, for landing) leaves out sanitizer checks, `sanitize` runs only them,
+and `all` runs both. See scripts/check_runner.py for how builds avoid races."""
 import argparse
 import hashlib
 import json
 import os
 from pathlib import Path
 import platform
-import shlex
 import shutil
-import signal
-import subprocess
 import sys
 import tempfile
-import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import check_runner  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ['build/minyarc', 'build/compiler-stage3.ll', 'build/minyarc-sanitize',
@@ -64,6 +68,35 @@ TARGETS = ['check-raw-syscall-linux-native', 'check-raw-syscall-sanitize', 'chec
            'check-ownership-mutation', 'check-scalar-record-initialization',
            'check-incremental-modules', 'check-incremental-modules-sanitize',
            'check-sanitize']
+TIERS = ('full', 'sanitize', 'all')
+# Scheduling hints only: seconds measured serially on an 8-core Linux host.
+EXPECTED_SECONDS = {
+    'check-mutation-score': 215, 'check-calldepth-profiles': 206, 'check-maps-sanitize': 136,
+    'check-transport-go': 131, 'check-transport-go-sanitize': 120, 'check-peer-edge-relay-sanitize': 97,
+    'check-peer-edge-relay': 95, 'check-stack-ownership': 93, 'check-quic-rfc-sanitize': 93,
+    'check-tls-sanitize': 86, 'check-maps': 79, 'check-peer-edge-cids-sanitize': 69, 'check-quic-rfc': 67,
+    'check-managed-graphs-launcher': 62, 'check-tls': 60, 'check-peer-edge-cids': 55,
+    'check-cycle-registration-exposure-sanitize': 53, 'check-list-sort-profiles': 52,
+    'check-peer-grpc-churn-sanitize': 46, 'check-errors-review-bounded': 46, 'check-errors-language-bounded': 45,
+    'check-cycle-progress-sanitize': 40, 'check-errors-language-sanitize': 38,
+}
+# Built on demand by the `minyar` launcher inside many harnesses; building them
+# early keeps those nested makes no-ops (see scripts/check_runner.py).
+LAUNCHER_ARTIFACTS = ['build/minyarc', 'build/minyarc-modules', 'build/minyar-module-build',
+                      'build/minyar-default-runtime.o', 'build/minyar-default-runtime-release.ll',
+                      'build/minyar-runtime-eager.o', 'build/minyar-runtime-eager-release.ll',
+                      'build/minyarc-errors-request', 'build/minyarc-errors', 'build/minyarc-callbacks',
+                      'build/minyarc-calldepth']
+
+
+def tier_of(label):
+    return 'sanitize' if 'sanitiz' in label else 'full'
+
+
+def in_tier(label, tier):
+    return tier == 'all' or tier_of(label) == tier
+
+
 DIRECTORIES = ('.github', 'bootstrap', 'compiler', 'runtime', 'library', 'vendor', 'os', 'examples', 'tests', 'build-support', 'docs',
                'experiments', 'scripts', 'tools')
 
@@ -108,12 +141,20 @@ def main():
     p.add_argument('--clang', default='clang')
     p.add_argument('--cxx', default='clang++')
     p.add_argument('--timeout', type=int, default=1800, help='Maximum seconds for each top-level check.')
-    p.add_argument('--jobs', type=int, choices=(1, 2), default=1, help='Capped make concurrency; use 1 on shared remote hosts.')
+    p.add_argument('--jobs', type=int, default=os.cpu_count() or 1, help='Checks run at once (default: CPU count); use 1 on a memory-constrained laptop.')
+    p.add_argument('--tier', choices=TIERS, default='full', help='full (default) leaves out sanitizer checks; sanitize runs only them; all runs both.')
+    p.add_argument('--only', action='append', default=[], metavar='TARGET', help='Run only these check targets (repeatable), with their phony prerequisites.')
+    p.add_argument('--retries', type=int, default=1, help='Retry each failed check this many times alone; a pass on retry is reported as flaky.')
     p.add_argument('--dry-run', action='store_true', help='Inspect the plan without copying or executing builds; usable on other hosts.')
     a = p.parse_args()
     source = (a.resume.resolve() / 'source') if a.resume else a.source.resolve()
     if a.timeout < 1:
         p.error('timeout must be positive')
+    if a.jobs < 1:
+        p.error('jobs must be positive')
+    unknown = [name for name in a.only if name not in TARGETS]
+    if unknown:
+        p.error('not a Linux correctness target: ' + ', '.join(unknown))
     required = ['Makefile', 'minyar', '.github/workflows/ci.yml', 'runtime/minyar_heap.h',
                 'tests/generated-stack-sanitizer.py', 'tests/llvm_sanitizer.py',
                 'tests/binary-expression-ownership.py',
@@ -123,8 +164,10 @@ def main():
                 'experiments/memory/critical-path-study.py',
                 'tests/data/peer/implementations.jsonl']
     missing = [name for name in required if not (source / name).is_file()]
-    plan = {'source': str(source), 'make_jobs': a.jobs, 'build_targets': BUILD,
-            'correctness_targets': TARGETS,
+    targets = [name for name in TARGETS if in_tier(name, a.tier) and (not a.only or name in a.only)]
+    build = [name for name in BUILD if a.tier != 'full' or tier_of(name) == 'full']
+    plan = {'source': str(source), 'jobs': a.jobs, 'tier': a.tier, 'build_targets': build,
+            'correctness_targets': targets,
             'additional': ['stage2/stage3 LLVM byte equality', 'runtime unit native + ASan/UBSan',
                            'ordinary source regressions with sanitized compiler/runtime',
                            'focused system/fixed/lazy ownership and debt matrix',
@@ -187,6 +230,7 @@ def main():
     runner_history = evidence / 'runners'
     runner_history.mkdir(exist_ok=True)
     (runner_history / (runner_hash + '.py')).write_bytes(runner_bytes)
+    previous_checks = list(report['checks']) if a.resume else None
     execution = {'invocation': sys.argv, 'runner_sha256': runner_hash,
                  'resume': bool(a.resume), 'reused_checks': [], 'plan': plan}
     report.setdefault('executions', []).append(execution)
@@ -214,89 +258,71 @@ def main():
         linker.symlink_to(tools['ld.lld'])
     env = dict(os.environ)
     for name in list(env):
-        if name.startswith('MINYAR_'):
+        if name.startswith('MINYAR_') or name in ('MAKEFLAGS', 'MFLAGS', 'MAKELEVEL', 'TMPDIR'):
             del env[name]
     env.update(PATH=str(bindir) + os.pathsep + env.get('PATH', ''),
                ASAN_OPTIONS='detect_leaks=0:abort_on_error=1',
                UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1',
                CC='clang', CXX='clang++', CLANG='clang', MINYAR_TEST_CLANG='clang',
                LIMITED='', SANITIZER_LIMITED='')
-    make = [tools['make'], '-j' + str(a.jobs), 'LIMITED=', 'SANITIZER_LIMITED=', 'CC=clang', 'LLVM_CC=clang',
+    # Each make is serial; concurrency comes from running several checks at once.
+    make = [tools['make'], '-j1', 'LIMITED=', 'SANITIZER_LIMITED=', 'CC=clang', 'LLVM_CC=clang',
             'COMPILER_LTO_FLAGS=-flto -fuse-ld=lld']
+    temporary = Path(tempfile.mkdtemp(prefix='mc-'))
+    runner = check_runner.Runner(work=work, logs=logs, env=env, make=make, jobs=a.jobs, timeout=a.timeout,
+                                 report=report, save=save, retries=a.retries, previous=previous_checks,
+                                 runner_sha256=runner_hash, temporary=temporary, python=sys.executable)
+    execution['reused_checks'] = runner.reused
+    Check = check_runner.Check
+    python = sys.executable
 
-    def check(label, command, extra_env=None):
-        effective_env = {**env, **(extra_env or {})}
-        # Hash the inherited environment without recording possible secrets.
-        env_hash = hashlib.sha256(json.dumps(effective_env, sort_keys=True).encode()).hexdigest()
-        if a.resume:
-            for index, previous in enumerate(report['checks']):
-                if previous.get('returncode') != 0 or previous.get('command') != command:
-                    continue
-                known_env = previous.get('environment_sha256')
-                same_env = known_env == env_hash if known_env else not extra_env and label != 'regressions-sanitize'
-                if same_env:
-                    execution['reused_checks'].append({'label': label, 'original_index': index,
-                                                       'legacy_environment_unknown': known_env is None})
-                    save()
-                    print(label + ': reused successful identical check', flush=True)
-                    return
-        log = logs / (f'{len(report["checks"]):02d}-' + label + '.log')
-        row = {'label': label, 'command': command, 'log': str(log), 'timeout_seconds': a.timeout,
-               'extra_env': extra_env or {}, 'environment_sha256': env_hash, 'runner_sha256': runner_hash}
-        report['checks'].append(row)
-        save()
-        print(label, flush=True)
-        started = time.monotonic()
-        with log.open('w') as output:
-            output.write('$ ' + shlex.join(command) + '\n')
-            output.flush()
-            child = subprocess.Popen(command, cwd=work, env=effective_env,
-                                     stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
-            try:
-                row['returncode'] = child.wait(timeout=a.timeout)
-            except subprocess.TimeoutExpired:
-                # Kill the whole compiler/test group; never leave timed-out
-                # grandchildren consuming resources during later checks.
-                os.killpg(child.pid, signal.SIGKILL)
-                child.wait()
-                row.update(returncode=None, timed_out=True)
-        row['duration_seconds'] = round(time.monotonic() - started, 3)
-        save()
-        if row['returncode'] != 0:
-            raise RuntimeError(label + ' failed; see ' + str(log))
-        print(f"{label}: passed ({row['duration_seconds']:.3f}s)", flush=True)
+    def fixed_point(prefix):
+        return [python, '-c', 'from pathlib import Path; assert Path("build/' + prefix + '-stage2.ll").read_bytes() == '
+                'Path("build/' + prefix + '-stage3.ll").read_bytes(), "' + prefix.replace('-', ' ') + ' fixed point differs"']
 
     save()
     try:
-        check('toolchain', ['clang', '--version'])
-        check('build', make + BUILD)
-        check('compiler-fixed-point', [sys.executable, '-c',
-              'from pathlib import Path; assert Path("build/compiler-stage2.ll").read_bytes() == Path("build/compiler-stage3.ll").read_bytes(), "compiler fixed point differs"'])
-        check('module-compiler-fixed-point', [sys.executable, '-c',
-              'from pathlib import Path; assert Path("build/module-compiler-stage2.ll").read_bytes() == Path("build/module-compiler-stage3.ll").read_bytes(), "module compiler fixed point differs"'])
-        check('runtime-unit', ['./build/runtime-unit'])
-        check('runtime-unit-sanitize', ['./build/runtime-unit-sanitize'])
-        for target in TARGETS:
-            check(target, make + [target])
-        check('regressions-sanitize', [sys.executable, 'tests/regressions.py'],
-              {'MINYAR_TEST_COMPILER': str(work / 'build/minyarc-sanitize'),
-               'MINYAR_TEST_RUNTIME': str(work / 'build/minyar-runtime-sanitize.o'),
-               'MINYAR_TEST_LINK_FLAGS': '-fsanitize=address,undefined'})
-        check('memory-profiles-focused', [sys.executable, 'tests/memory-profile-regressions.py',
-              '--runtime-source', str(work / 'runtime/minyar_runtime.c'), '--suite', 'focused',
-              '--profiles', 'system', 'fixed', 'lazy', '--clang', 'clang',
-              '--output-dir', str(evidence)])
-        check('critical-path-correctness', [sys.executable, 'experiments/memory/critical-path-study.py',
-              '--compiler', str(work / 'build/minyarc'), '--cc', 'clang', '--cxx', 'clang++',
-              '--output', str(evidence / 'critical-path.json')])
-        check('scalar-path-correctness', [sys.executable, 'experiments/memory/checked-scalars-study.py',
-              '--compiler', str(work / 'build/minyarc'), '--cc', 'clang', '--cxx', 'clang++',
-              '--output', str(evidence / 'scalar-path.json')])
-        report['status'] = 'passed'
+        runner.run_one(Check('toolchain', ['clang', '--version']))
+        if runner.run_one(Check('build', make + build, tier=a.tier)).get('returncode') == 0:
+            runner.built.update(build)
+        # If the shared build failed, each check's own goals are built (or fail) separately.
+        checks = []
+        if a.tier != 'sanitize' and not a.only:
+            checks += [Check('compiler-fixed-point', fixed_point('compiler'), goals=['build/compiler-stage3.ll']),
+                       Check('module-compiler-fixed-point', fixed_point('module-compiler'),
+                             goals=['build/module-compiler-stage3.ll']),
+                       Check('runtime-unit', ['./build/runtime-unit'], goals=['build/runtime-unit'])]
+        if a.tier != 'full' and not a.only:
+            checks.append(Check('runtime-unit-sanitize', ['./build/runtime-unit-sanitize'],
+                                goals=['build/runtime-unit-sanitize'], tier='sanitize'))
+        rules = check_runner.make_database(make, work, env)
+        checks += check_runner.plan_make_checks(rules, targets, make, tier_of, EXPECTED_SECONDS)
+        if a.tier != 'full' and not a.only:
+            checks.append(Check('regressions-sanitize', [python, 'tests/regressions.py'], tier='sanitize',
+                                goals=['build/minyarc-sanitize', 'build/minyar-runtime-sanitize.o'],
+                                extra_env={'MINYAR_TEST_COMPILER': str(work / 'build/minyarc-sanitize'),
+                                           'MINYAR_TEST_RUNTIME': str(work / 'build/minyar-runtime-sanitize.o'),
+                                           'MINYAR_TEST_LINK_FLAGS': '-fsanitize=address,undefined'}))
+        if a.tier != 'sanitize' and not a.only:
+            checks += [
+                Check('memory-profiles-focused', [python, 'tests/memory-profile-regressions.py',
+                      '--runtime-source', str(work / 'runtime/minyar_runtime.c'), '--suite', 'focused',
+                      '--profiles', 'system', 'fixed', 'lazy', '--clang', 'clang',
+                      '--output-dir', str(evidence)]),
+                Check('critical-path-correctness', [python, 'experiments/memory/critical-path-study.py',
+                      '--compiler', str(work / 'build/minyarc'), '--cc', 'clang', '--cxx', 'clang++',
+                      '--output', str(evidence / 'critical-path.json')], goals=['build/minyarc']),
+                Check('scalar-path-correctness', [python, 'experiments/memory/checked-scalars-study.py',
+                      '--compiler', str(work / 'build/minyarc'), '--cc', 'clang', '--cxx', 'clang++',
+                      '--output', str(evidence / 'scalar-path.json')], goals=['build/minyarc'])]
+        runner.run_all(checks, prebuild=[name for name in LAUNCHER_ARTIFACTS if name in rules])
     except (OSError, RuntimeError) as error:
-        report.update(status='failed', error=str(error))
+        report['error'] = str(error)
         print(str(error), file=sys.stderr)
     finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+        passed = check_runner.summarise(report, sys.stdout) and 'error' not in report
+        report['status'] = 'passed' if passed else 'failed'
         save()
     print(str(report_path), flush=True)
     return 0 if report['status'] == 'passed' else 1
