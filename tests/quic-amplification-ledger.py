@@ -309,18 +309,22 @@ def receipt_graph_control(case,target):
     objects=[item("runtime.o",b"mock-runtime",target/"runtime.o","runtime","native_object")]
     objects += [item("native-"+str(n)+".o",("mock-provider-"+str(n)).encode(),target/("provider-"+str(n)+".o"),"provider","native_object") for n in range(6)]
     tools={}
-    for name,path in (("clang-driver.py",root/"tools/clang-driver.py"),("sanitizer_llvm.py",root/"tools/sanitizer_llvm.py"),("clang.bin",Path("/usr/bin/clang-18").resolve())):
+    # Any real compiler binary serves as the mock tool bytes: clang-18 on CI Linux, clang elsewhere.
+    import shutil
+    compiler=shutil.which("clang-18") or shutil.which("clang")
+    if compiler is None:raise RuntimeError("receipt control needs a clang binary on PATH")
+    for name,path in (("clang-driver.py",root/"tools/clang-driver.py"),("sanitizer_llvm.py",root/"tools/sanitizer_llvm.py"),("clang.bin",Path(compiler).resolve())):
         tools[name]=item(name,path.read_bytes(),path.resolve())
     staged_path=target/".minyar-link-control"/"server"
     final=item("program",b"mock-linked-output",target/"server")
     staged=item("program.staged",b"mock-linked-output",staged_path)
     final["path"]=str(target/"server");staged["path"]=str(staged_path)
-    command=["/usr/bin/clang-18","-O2","-Wno-override-module",raw["original"],*[value["original"] for value in objects[:3]],"-lcrypto",*[value["original"] for value in objects[3:]],"-lcrypto","-lm"]
+    command=[compiler,"-O2","-Wno-override-module",raw["original"],*[value["original"] for value in objects[:3]],"-lcrypto",*[value["original"] for value in objects[3:]],"-lcrypto","-lm"]
     build={"schema":2,"mode":"native","optimization":"2","link_attempted":True,"link_status":0,"link_subprocess_status":0,"retention_errors":[],
            "link_flags":["-O2","-Wno-override-module"],"lto_flags":[],"address_sanitizer_enabled":False,"raw_program_input":copy.deepcopy(raw),"program_input":raw,
            "inputs":objects,"tools":{name:value["sha256"] for name,value in tools.items()},"tool_bindings":tools,
-           "raw_sha256":raw["sha256"],"linked_program_sha256":raw["sha256"],"compiler_selected_command":"/usr/bin/clang-18",
-           "compiler_pre_link":{"selected_command":"/usr/bin/clang-18","resolved_path":tools["clang.bin"]["original"],"sha256":tools["clang.bin"]["sha256"]},
+           "raw_sha256":raw["sha256"],"linked_program_sha256":raw["sha256"],"compiler_selected_command":compiler,
+           "compiler_pre_link":{"selected_command":compiler,"resolved_path":tools["clang.bin"]["original"],"sha256":tools["clang.bin"]["sha256"]},
            "command":command,"actual_command":command+["-o",str(staged_path)],"staged_requested_path":str(staged_path),
            "staged_output":staged,"final_output":final,"binary_sha256":final["sha256"]}
     if case=="receipt-schema-float":build["schema"]=2.0
