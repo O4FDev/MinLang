@@ -2,7 +2,9 @@
 """Replay completed Linux runtime checks with LeakSanitizer enabled.
 
 A deliberate standalone leak must be detected first. Compiler arena processes
-are excluded; only normal-exit runtime fixtures are replayed.
+are excluded; only normal-exit runtime fixtures are replayed. With --require,
+the replay runs inside a parallel run as soon as the named checks it replays
+have passed, instead of waiting for the whole run to pass.
 """
 import argparse
 import hashlib
@@ -18,12 +20,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run-dir', type=Path, required=True)
     parser.add_argument('--clang', default='clang')
+    parser.add_argument('--require', action='append', default=[], metavar='LABEL',
+                        help='Require only these checks of the run to have passed (repeatable).')
     args = parser.parse_args()
     if platform.system() != 'Linux':
         parser.error('this supplemental check requires Linux LeakSanitizer')
     run = args.run_dir.resolve()
     report = json.loads((run / 'results.json').read_text())
-    if report['status'] != 'passed':
+    if args.require:
+        latest = {row['label']: row for row in report['checks'] if 'label' in row}
+        unpassed = [label for label in args.require if latest.get(label, {}).get('returncode') != 0]
+        if unpassed:
+            parser.error('the replayed checks must pass first: ' + ', '.join(unpassed))
+    elif report['status'] != 'passed':
         parser.error('the ordinary Linux correctness run must pass first')
     for name, expected in report['source_sha256'].items():
         path = (run / 'source' / name).resolve()

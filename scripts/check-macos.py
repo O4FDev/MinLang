@@ -8,14 +8,18 @@ path and last 30 lines). --tier full (the default) leaves out sanitizer
 checks (including the two sanitizer checks check-portable lists directly),
 --tier sanitize runs only them and --tier all runs everything check-portable
 runs. --jobs
-defaults to 1 because laptops are memory-constrained; on a larger machine pass
---jobs N. Logs and results.json go to build/check-macos/<run>/."""
+defaults to one job per 8 GB of physical memory (2 on a 16 GB laptop), at most
+the CPU count. The macOS-only checks CI runs next to check-portable (kqueue and
+AppKit networking, native graphics, desktop) run too unless --no-extras; the
+Keychain checks need --keychain, because they create temporary keychains.
+Logs and results.json go to build/check-macos/<run>/."""
 import argparse
 import json
 import os
 from pathlib import Path
 import platform
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -25,6 +29,15 @@ import check_runner  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 TIERS = ('full', 'sanitize', 'all')
+# Scheduling hints only: seconds measured serially on an M1 Pro laptop; the longest start first.
+EXPECTED_SECONDS = {
+    'check-peer-regressions': 905, 'check-maps': 312, 'check-text-basics-models': 125, 'check-build-wiring': 63,
+    'check-errors-language-bounded': 63, 'check-managed-graphs-launcher': 60, 'check-errors-review-bounded': 57,
+    'check-peer-manifest': 53, 'check-cycle-registration-exposure-sanitize': 47,
+    'check-cycle-private-retirement-sanitize': 41, 'check-managed-graphs': 39, 'check-peer-semantics': 38,
+    'check-tls-handshake-validity': 36, 'check-update-launch-native': 32, 'check-statement-nesting': 31,
+    'check-cycle-registration-exposure': 31,
+}
 
 
 def tier_of(label):
@@ -35,15 +48,29 @@ def in_tier(label, tier):
     return tier == 'all' or tier_of(label) == tier
 
 
+def default_jobs():
+    """One job per 8 GB of physical memory, at least 1 and at most the CPU count."""
+    try:
+        if platform.system() == 'Darwin':
+            memory = int(subprocess.run(['sysctl', '-n', 'hw.memsize'], capture_output=True, text=True).stdout)
+        else:
+            memory = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
+    except (OSError, ValueError):
+        return 1
+    return max(1, min(os.cpu_count() or 1, memory // (8 << 30)))
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--jobs', type=int, default=1, help='Checks run at once (default 1 for laptops).')
+    p.add_argument('--jobs', type=int, default=default_jobs(), help='Checks run at once (default: one per 8 GB of memory, %(default)s here).')
     p.add_argument('--tier', choices=TIERS, default='full', help='full (default) leaves out sanitizer checks; sanitize runs only them; all runs both.')
     p.add_argument('--only', action='append', default=[], metavar='TARGET', help='Run only these checks (repeatable), with their phony prerequisites.')
     p.add_argument('--target', default='check-portable', help='Aggregate make target whose checks run (default check-portable).')
     p.add_argument('--timeout', type=int, default=1800, help='Maximum seconds for each check.')
     p.add_argument('--retries', type=int, default=1, help='Retry each failed check up to this many times alone; a pass on retry is reported as flaky.')
     p.add_argument('--output-dir', type=Path, default=ROOT / 'build/check-macos', help='Parent for the run directory.')
+    p.add_argument('--extras', action=argparse.BooleanOptionalAction, default=True, help='Also run the macOS-only network, graphics and desktop checks (default on).')
+    p.add_argument('--keychain', action='store_true', help='Also run the Keychain checks; they create temporary keychains (CI only).')
     p.add_argument('--dry-run', action='store_true', help='Print the planned checks without running them.')
     p.add_argument('make_vars', nargs='*', metavar='VAR=VALUE', help='Variables passed to every make call.')
     a = p.parse_args()
@@ -73,9 +100,22 @@ def main():
         p.error(f'not a check in {a.target}: ' + ', '.join(unknown))
     # --only names checks explicitly, whatever their tier.
     roots = [name for name in children if name in a.only] if a.only else [name for name in children if in_tier(name, a.tier)]
-    checks = check_runner.plan_make_checks(rules, roots, make, tier_of, {})
+    checks = check_runner.plan_make_checks(rules, roots, make, tier_of, EXPECTED_SECONDS)
     if a.tier != 'sanitize' and not a.only:
         checks.append(check_runner.aggregate_check(rules, a.target, make, {check.label for check in checks}, 'full'))
+    if a.extras and a.target == 'check-portable' and not a.only:
+        planned = {check.label for check in checks}
+        python = sys.executable
+        if a.tier != 'sanitize':
+            checks += [check_runner.Check('macos-network', [python, 'tests/macos-network.py'], expected=60),
+                       check_runner.Check('desktop-native', [python, 'tests/desktop-native.py'], expected=15)]
+            if 'check-native-graphics' not in planned:
+                checks += check_runner.plan_make_checks(rules, ['check-native-graphics'], make, tier_of, {})
+        if a.tier != 'full' and 'check-net-udp-offload-sanitize' not in planned:
+            checks += check_runner.plan_make_checks(rules, ['check-net-udp-offload-sanitize'], make, tier_of, {})
+        if a.keychain and a.tier != 'sanitize':
+            checks += [check_runner.Check('macos-services', [python, 'tests/macos-services.py']),
+                       check_runner.Check('keychain-native', [python, 'tests/keychain-native.py'])]
     if a.dry_run:
         print(json.dumps({'jobs': a.jobs, 'tier': a.tier, 'make': make,
                           'checks': [{'label': c.label, 'goals': c.goals, 'after': list(c.after)} for c in checks]},

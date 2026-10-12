@@ -1,18 +1,25 @@
 """Run make check targets in parallel, keep going past failures, then summarise.
 
 Shared by scripts/check-linux.py and scripts/check-macos.py. Every check runs
-`make <target>` in one shared work directory, so two makes must never build the
-same file at once. The plan comes from the make database:
+`make <target>` in a work directory, so two makes must never build the same
+file at once. The plan comes from the make database:
 
 - every phony prerequisite of a selected target becomes its own check, and the
   parent runs with `make -o <child>`, so each recipe runs once;
-- file prerequisites are built by a single builder, one goal per make call,
-  before any check that needs them starts. A check whose prerequisites failed
-  to build runs in the builder's lane, so its make never races another build;
+- file prerequisites are built by a single builder per work directory, one
+  goal per make call, before any check that needs them starts. A check whose
+  prerequisites failed to build runs in the builder's lane, so its make never
+  races another build;
 - every builder make holds build/bootstrap.lock, the lock the `minyar`
   launcher takes before its own nested make, so the two never overlap;
-- checks with tight wall-clock assertions (EXCLUSIVE) run with nothing else
-  running, and checks sharing a fixed port or path (GROUPS) never overlap.
+- checks with tight wall-clock assertions (EXCLUSIVE) run only alongside each
+  other, never with ordinary checks, and checks sharing a fixed port or path
+  (GROUPS) never overlap.
+
+A Variant is one work directory with its own toolchain, environment and make
+command (for example a copy of the sources built with LLVM 22). Checks in
+different variants share the job slots but never a build directory, so each
+variant has its own builder lane and they build concurrently.
 
 A failed check is retried once with nothing else running. If the retry passes,
 the check counts as passed and is listed as flaky.
@@ -26,15 +33,17 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import time
 
 RULE = re.compile(r'^([^\s#:=][^:=]*?)::?(?![=])\s*(.*)$')
 TAIL_LINES = 30
 # Wall-clock assertions (a 30 ms readiness window, 400 ms handshake rounds)
-# that fail under load: these run with nothing else running.
+# that fail under load: these never run alongside ordinary checks.
 EXCLUSIVE = frozenset({'check-net-udp-offload', 'check-net-udp-offload-sanitize',
                        'check-peer-edge-cids', 'check-peer-edge-cids-sanitize'})
 # Checks sharing a fixed resource: at most GROUP_LIMITS[group] (default 1) run at once.
+# Groups named after a build path are per work directory; the others (ports) are machine-wide.
 GROUPS = {'check-quic-rfc': 'udp-port-44300', 'check-quic-rfc-sanitize': 'udp-port-44300',
           'check-modules': 'build/module-tests', 'check-sanitize': 'build/module-tests'}
 # peer-edge and redis harnesses pick a free port, close it, then reuse it.
@@ -61,10 +70,16 @@ BUILD_THEN_RUN = ('import fcntl, os, subprocess, sys\n'
                   'os.execvp(command[0], command)\n')
 
 
+def target_of(label):
+    """The make target behind a label; other variants prefix it with `variant:`."""
+    return label.rsplit(':', 1)[-1]
+
+
 def group_of(label):
-    if label in GROUPS:
-        return GROUPS[label]
-    return next((group for prefix, group in GROUP_PREFIXES if label.startswith(prefix)), None)
+    target = target_of(label)
+    if target in GROUPS:
+        return GROUPS[target]
+    return next((group for prefix, group in GROUP_PREFIXES if target.startswith(prefix)), None)
 
 
 class Rule:
@@ -111,18 +126,39 @@ def make_database(make, cwd, env):
     return rules
 
 
+class Variant:
+    """One work directory with its own build directory, environment and make command."""
+
+    def __init__(self, name, work, env, make, python='python3'):
+        self.name, self.work, self.env, self.make = name, Path(work), env, list(make)
+        self.lock = str(self.work / 'build/bootstrap.lock')
+        self.locked = [python, '-c', LOCKED, self.lock]
+        self.built, self.failed_goals = set(), set()
+
+    def label(self, name):
+        return f'{self.name}:{name}' if self.name else name
+
+
 class Check:
     def __init__(self, label, command, *, goals=(), after=(), extra_env=None, exclusive=None,
-                 tier='full', expected=10.0):
+                 tier='full', expected=10.0, variant='', group=None, builds=()):
         self.label, self.command, self.goals, self.after = label, command, list(goals), list(after)
         self.extra_env, self.tier, self.expected = extra_env or {}, tier, expected
-        self.exclusive = label in EXCLUSIVE if exclusive is None else exclusive
-        self.group = group_of(label)
+        self.exclusive = target_of(label) in EXCLUSIVE if exclusive is None else exclusive
+        self.resource = group_of(label)
+        if self.resource and self.resource.startswith('build/'):
+            self.resource = f'{variant}:{self.resource}'
+        # variant names the work directory; group is the matrix group it was planned for.
+        self.variant, self.group = variant, group
+        # builds: goals this check makes; it runs in its variant's builder lane, holding the lock.
+        self.builds = list(builds)
 
 
-def plan_make_checks(rules, roots, make, tier_of, expected):
+def plan_make_checks(rules, roots, make, tier_of, expected, variant=None, group=None):
     """Split roots and their phony prerequisites into checks with build goals."""
     checks, order = {}, []
+    name_of = variant.label if variant else (lambda name: name)
+    where = variant.name if variant else ''
 
     def visit(name):
         if name in checks:
@@ -134,8 +170,9 @@ def plan_make_checks(rules, roots, make, tier_of, expected):
         children = [p for p in prerequisites if p in rules and rules[p].phony]
         goals = [p for p in prerequisites if p not in children and p in rules and rules[p].target]
         skip = [arg for child in dict.fromkeys(children) for arg in ('-o', child)]
-        checks[name] = Check(name, [*make, *skip, name], goals=goals, after=dict.fromkeys(children),
-                             tier=tier_of(name), expected=expected.get(name, 10.0))
+        checks[name] = Check(name_of(name), [*make, *skip, name], goals=goals,
+                             after=[name_of(child) for child in dict.fromkeys(children)],
+                             tier=tier_of(name), expected=expected.get(name, 10.0), variant=where, group=group)
         for child in children:
             visit(child)
         order.append(name)
@@ -156,27 +193,45 @@ def aggregate_check(rules, name, make, planned, tier, expected=1.0):
                  tier=tier, expected=expected)
 
 
+def reap(child):
+    """Reap a finished child with its resource usage (CPU of the whole waited-for tree)."""
+    if child.returncode is not None:
+        return child.returncode, None
+    pid, status, usage = os.wait4(child.pid, os.WNOHANG)
+    if pid == 0:
+        return None, None
+    child.returncode = os.waitstatus_to_exitcode(status)
+    return child.returncode, usage
+
+
 class Runner:
     """Schedule checks over `jobs` slots; the report rows stay in report['checks']."""
 
     def __init__(self, *, work, logs, env, make, jobs, timeout, report, save, retries=1,
                  previous=None, runner_sha256=None, temporary=None, python='python3'):
-        self.work, self.logs, self.env, self.make = work, logs, env, make
-        self.lock = str(Path(work) / 'build/bootstrap.lock')
-        self.locked = [python, '-c', LOCKED, self.lock]
-        self.python = python
+        self.logs, self.python = logs, python
+        self.variants = {'': Variant('', work, env, make, python)}
         self.jobs, self.timeout, self.report, self.save = max(1, jobs), timeout, report, save
         self.retries, self.previous, self.runner_sha256 = retries, previous, runner_sha256
         # Each check gets its own TMPDIR, so tests using fixed names under the
         # temporary directory cannot collide. Keep it short for socket paths.
         self.temporary = temporary
-        self.built, self.failed_goals = set(), set()
         self.results, self.reused = {}, []
+        self.started = time.monotonic()
         # Rows from earlier executions (--resume) are history, not this run's result.
         self.first_row = len(report['checks'])
 
+    # The default variant keeps the attributes callers used before variants existed.
+    @property
+    def built(self):
+        return self.variants[''].built
+
+    def add_variant(self, variant):
+        self.variants[variant.name] = variant
+        return variant
+
     def environment(self, check, index):
-        env = {**self.env, **check.extra_env}
+        env = {**self.variants[check.variant].env, **check.extra_env}
         if self.temporary:
             env['TMPDIR'] = str(self.temporary / str(index))
             shutil.rmtree(env['TMPDIR'], ignore_errors=True)
@@ -185,7 +240,8 @@ class Runner:
 
     def environment_sha256(self, check):
         # Hash the inherited environment without recording possible secrets.
-        return hashlib.sha256(json.dumps({**self.env, **check.extra_env}, sort_keys=True).encode()).hexdigest()
+        env = {**self.variants[check.variant].env, **check.extra_env}
+        return hashlib.sha256(json.dumps(env, sort_keys=True).encode()).hexdigest()
 
     def reuse(self, check, env_hash):
         for index, previous in enumerate(self.previous or ()):
@@ -197,36 +253,46 @@ class Runner:
         return None
 
     # -- processes -------------------------------------------------------
-    def start(self, label, command, env, log, shown=None):
+    def start(self, command, env, log, shown=None, cwd=None):
         output = log.open('a')
         output.write('$ ' + (shown or shlex.join(command)) + '\n')
         output.flush()
-        child = subprocess.Popen(command, cwd=self.work, env=env,
+        child = subprocess.Popen(command, cwd=cwd or self.variants[''].work, env=env,
                                  stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
         return {'child': child, 'output': output, 'started': time.monotonic(), 'log': log}
 
     def finish(self, process, wait=False):
         child = process['child']
-        if wait:
-            try:
-                child.wait(timeout=self.timeout)
-            except subprocess.TimeoutExpired:
-                pass
-        timed_out = child.poll() is None and time.monotonic() - process['started'] > self.timeout
-        if timed_out:
-            # Kill the whole compiler/test group; never leave timed-out
-            # grandchildren consuming resources during later checks.
-            os.killpg(child.pid, signal.SIGKILL)
-            child.wait()
-        elif child.poll() is None:
-            return None
+        timed_out = False
+        while True:
+            code, usage = reap(child)
+            if code is not None:
+                break
+            if time.monotonic() - process['started'] > self.timeout:
+                # Kill the whole compiler/test group; never leave timed-out
+                # grandchildren consuming resources during later checks.
+                os.killpg(child.pid, signal.SIGKILL)
+                _, status, usage = os.wait4(child.pid, 0)
+                child.returncode = os.waitstatus_to_exitcode(status)
+                timed_out = True
+                break
+            if not wait:
+                return None
+            time.sleep(0.2)
         process['output'].close()
-        return {'returncode': None if timed_out else child.returncode, 'timed_out': timed_out,
-                'duration_seconds': round(time.monotonic() - process['started'], 3)}
+        status = {'returncode': None if timed_out else child.returncode, 'timed_out': timed_out,
+                  'duration_seconds': round(time.monotonic() - process['started'], 3),
+                  'started_seconds': round(process['started'] - self.started, 3),
+                  'ended_seconds': round(time.monotonic() - self.started, 3)}
+        if usage is not None:
+            status['cpu_seconds'] = round(usage.ru_utime + usage.ru_stime, 3)
+            # ru_maxrss is KiB on Linux and bytes on macOS.
+            status['max_rss_mib'] = round(usage.ru_maxrss / (1048576 if sys.platform == 'darwin' else 1024), 1)
+        return status
 
     def kill_all(self, processes):
         for process in processes:
-            if process['child'].poll() is None:
+            if process['child'].returncode is None and process['child'].poll() is None:
                 os.killpg(process['child'].pid, signal.SIGKILL)
                 process['child'].wait()
             process['output'].close()
@@ -259,26 +325,36 @@ class Runner:
             print(check.label + ': reused successful identical check', flush=True)
             return None
         index = len(self.report['checks'])
-        log = self.logs / f'{index:03d}-{check.label}.log'
+        log = self.logs / f"{index:03d}-{check.label.replace(':', '-')}.log"
         row = {'label': check.label, 'command': check.command, 'log': str(log), 'tier': check.tier,
                'timeout_seconds': self.timeout, 'extra_env': check.extra_env,
                'environment_sha256': env_hash, 'runner_sha256': self.runner_sha256, 'index': index}
+        if check.variant:
+            row['variant'] = check.variant
+        if check.group:
+            row['group'] = check.group
         self.report['checks'].append(row)
         self.save()
         print(check.label, flush=True)
         return row
 
     def launch(self, check, row, build_first=False):
+        variant = self.variants[check.variant]
         command, shown = check.command, None
-        if build_first and check.goals:
-            build = [*self.make, *check.goals]
-            command = [self.python, '-c', BUILD_THEN_RUN, self.lock, str(len(build)), *build, *command]
+        if check.builds:
+            command = [*variant.locked, *command]
+            shown = shlex.join(check.command) + '  # holding build/bootstrap.lock'
+        elif build_first and check.goals:
+            build = [*variant.make, *check.goals]
+            command = [self.python, '-c', BUILD_THEN_RUN, variant.lock, str(len(build)), *build, *command]
             shown = f'{shlex.join(build)}  # holding build/bootstrap.lock, then:\n$ {shlex.join(check.command)}'
-        return self.start(check.label, command, self.environment(check, row['index']), Path(row['log']), shown)
+        return self.start(command, self.environment(check, row['index']), Path(row['log']), shown, variant.work)
 
     def end(self, check, row):
         passed = row.get('returncode') == 0
         self.results[check.label] = 'passed' if passed else 'failed'
+        if passed and check.builds:
+            self.variants[check.variant].built.update(check.builds)
         self.save()
         if passed:
             print(f"{check.label}: passed ({row['duration_seconds']:.3f}s)", flush=True)
@@ -291,9 +367,14 @@ class Runner:
         index = len(self.report['checks'])
         row = {'label': check.label, 'command': check.command, 'tier': check.tier, 'returncode': None,
                'blocked_by': blockers, 'duration_seconds': 0.0, 'index': index,
-               'log': str(self.logs / f'{index:03d}-{check.label}.log'), 'timeout_seconds': self.timeout,
+               'log': str(self.logs / f"{index:03d}-{check.label.replace(':', '-')}.log"),
+               'timeout_seconds': self.timeout,
                'extra_env': check.extra_env, 'environment_sha256': self.environment_sha256(check),
                'runner_sha256': self.runner_sha256}
+        if check.variant:
+            row['variant'] = check.variant
+        if check.group:
+            row['group'] = check.group
         self.report['checks'].append(row)
         self.results[check.label] = 'failed'
         self.save()
@@ -304,33 +385,41 @@ class Runner:
         """Run checks concurrently; failures never stop the others.
 
         prebuild names artifacts no check declares but harnesses build on
-        demand (through the launcher); the builder makes them early."""
+        demand (through the launcher); each variant's builder makes them early.
+        Pass (variant, goal) pairs to name another variant's artifacts."""
         by_label = {check.label: check for check in checks}
         pending = sorted(checks, key=lambda c: -c.expected)
-        running = []  # (check or goal, process, row, lane)
-        # Build first the goals that unblock the most expected check time.
-        weights = {goal: 1.0 for goal in prebuild}
+        running = []  # (check or goal, process, row, lane, variant name)
+        # Each variant's builder first makes the goals that unblock the most expected check time.
+        weights = {}
+        for item in prebuild:
+            key = tuple(item) if isinstance(item, (tuple, list)) else ('', item)
+            weights[key] = weights.get(key, 0.0) + 1.0
         for check in pending:
             for goal in check.goals:
-                weights[goal] = weights.get(goal, 0.0) + check.expected
-        builder_order = sorted((goal for goal in weights if goal not in self.built), key=lambda goal: -weights[goal])
-        prerequisite_log = self.logs / 'prerequisites.log'
+                weights[(check.variant, goal)] = weights.get((check.variant, goal), 0.0) + check.expected
+        builder_order = {name: [] for name in self.variants}
+        for (name, goal), _ in sorted(weights.items(), key=lambda item: -item[1]):
+            if goal not in self.variants[name].built:
+                builder_order[name].append(goal)
         self.report.setdefault('prerequisites', {})
+        # Checks with tight timing run only with each other, a few at a time.
+        quiet_jobs = max(1, self.jobs // 4)
 
-        def busy(lane=None):
-            return [entry for entry in running if lane is None or entry[3] == lane]
+        def builder_busy(name):
+            return any(lane in ('goal', 'builder') and where == name for _, _, _, lane, where in running)
 
-        def group_full(check):
-            if check.group is None:
+        def resource_full(check):
+            if check.resource is None:
                 return False
-            members = sum(1 for item, _, _, lane in running if lane != 'goal' and item.group == check.group)
-            return members >= GROUP_LIMITS.get(check.group, 1)
+            members = sum(1 for item, _, _, lane, _ in running if lane != 'goal' and item.resource == check.resource)
+            return members >= GROUP_LIMITS.get(check.resource.rsplit(':', 1)[-1], 1)
 
         def goals_ready(check):
-            return all(goal in self.built for goal in check.goals)
+            return all(goal in self.variants[check.variant].built for goal in check.goals)
 
         def goals_failed(check):
-            return any(goal in self.failed_goals for goal in check.goals)
+            return any(goal in self.variants[check.variant].failed_goals for goal in check.goals)
 
         def after_state(check):
             states = [self.results.get(name) for name in check.after if name in by_label]
@@ -339,86 +428,91 @@ class Runner:
             failed = [name for name in check.after if self.results.get(name) == 'failed']
             return failed or 'ready'
 
+        def start_check(check, lane, build_first=False):
+            pending.remove(check)
+            row = self.begin(check)
+            if row is not None:
+                running.append((check, self.launch(check, row, build_first), row, lane, check.variant))
+
         try:
             while pending or running:
                 # Reap finished work.
                 for entry in list(running):
-                    item, process, row, lane = entry
+                    item, process, row, lane, where = entry
                     status = self.finish(process)
                     if status is None:
                         continue
                     running.remove(entry)
                     if lane == 'goal':
+                        variant = self.variants[where]
                         ok = status['returncode'] == 0
-                        (self.built if ok else self.failed_goals).add(item)
-                        self.report['prerequisites'][item] = {**status, 'log': str(prerequisite_log)}
+                        (variant.built if ok else variant.failed_goals).add(item)
+                        self.report['prerequisites'][variant.label(item)] = {**status, 'log': str(process['log'])}
                         self.save()
                         if not ok:
-                            print(f'prerequisite {item}: FAILED to build; see {prerequisite_log}', flush=True)
+                            print(f'prerequisite {variant.label(item)}: FAILED to build; see {process["log"]}',
+                                  flush=True)
                     else:
                         row.update(status)
                         self.end(item, row)
-                exclusive_running = any(lane == 'exclusive' for _, _, _, lane in running)
                 # Blocked checks fail without running, as make would.
                 for check in list(pending):
                     state = after_state(check)
                     if isinstance(state, list):
                         pending.remove(check)
                         self.block(check, state)
-                if exclusive_running:
-                    time.sleep(0.2)
-                    continue
-                # The builder: one make at a time, either a goal or a check whose goals failed.
-                if not busy('goal') and not busy('builder') and len(running) < self.jobs:
-                    started = False
-                    for check in pending:
-                        if (after_state(check) == 'ready' and goals_failed(check) and not check.exclusive
-                                and not group_full(check)):
-                            pending.remove(check)
-                            row = self.begin(check)
-                            if row is not None:
-                                running.append((check, self.launch(check, row, build_first=True), row, 'builder'))
-                            started = True
-                            break
-                    while not started and builder_order and pending:
-                        goal = builder_order.pop(0)
-                        if goal in self.built or goal in self.failed_goals:
+                quiet = any(lane == 'exclusive' for _, _, _, lane, _ in running)
+                if not quiet:
+                    # Each variant's builder: one make at a time, either a check that builds
+                    # shared goals, a check whose goals failed, or the next goal.
+                    for name, variant in self.variants.items():
+                        if builder_busy(name) or len(running) >= self.jobs:
                             continue
-                        print('prerequisite ' + goal, flush=True)
-                        running.append((goal, self.start('prerequisite', [*self.locked, *self.make, goal], self.env,
-                                                         prerequisite_log, shlex.join([*self.make, goal]) +
-                                                         '  # holding build/bootstrap.lock'), None, 'goal'))
-                        started = True
-                # Ordinary checks fill the remaining slots, longest first.
-                for check in list(pending):
-                    if len(running) >= self.jobs:
-                        break
-                    if check.exclusive or after_state(check) != 'ready' or not goals_ready(check) or group_full(check):
-                        continue
-                    pending.remove(check)
-                    row = self.begin(check)
-                    if row is not None:
-                        running.append((check, self.launch(check, row), row, 'check'))
-                # Exclusive checks start only when nothing else runs.
-                if not running:
-                    for check in pending:
-                        if check.exclusive and after_state(check) == 'ready' and (goals_ready(check) or goals_failed(check)):
-                            pending.remove(check)
-                            row = self.begin(check)
-                            if row is not None:
-                                running.append((check, self.launch(check, row), row, 'exclusive'))
+                        ready = [c for c in pending if c.variant == name and not c.exclusive
+                                 and after_state(c) == 'ready' and not resource_full(c)]
+                        check = next((c for c in ready if c.builds), None) or \
+                            next((c for c in ready if goals_failed(c)), None)
+                        if check is not None:
+                            start_check(check, 'builder', build_first=not check.builds)
+                            continue
+                        order = builder_order[name]
+                        while order and any(c.variant == name for c in pending):
+                            goal = order.pop(0)
+                            if goal in variant.built or goal in variant.failed_goals:
+                                continue
+                            print('prerequisite ' + variant.label(goal), flush=True)
+                            log = self.logs / f"prerequisites{'-' + name if name else ''}.log"
+                            running.append((goal, self.start([*variant.locked, *variant.make, goal], variant.env, log,
+                                                             shlex.join([*variant.make, goal]) +
+                                                             '  # holding build/bootstrap.lock', variant.work),
+                                            None, 'goal', name))
                             break
-                    else:
-                        if pending and not builder_order:
-                            # Nothing can start and nothing runs: report what is stuck.
-                            for check in list(pending):
-                                pending.remove(check)
-                                self.block(check, [name for name in check.after if self.results.get(name) != 'passed']
-                                           or ['unbuilt prerequisites'])
+                    # Ordinary checks fill the remaining slots, longest first.
+                    for check in list(pending):
+                        if len(running) >= self.jobs:
+                            break
+                        if (check.exclusive or check.builds or after_state(check) != 'ready'
+                                or not goals_ready(check) or resource_full(check)):
+                            continue
+                        start_check(check, 'check')
+                # Timing-sensitive checks start only when nothing else runs, then share the quiet.
+                if all(lane == 'exclusive' for _, _, _, lane, _ in running):
+                    for check in list(pending):
+                        if len(running) >= quiet_jobs:
+                            break
+                        if (check.exclusive and after_state(check) == 'ready' and not resource_full(check)
+                                and (goals_ready(check) or goals_failed(check))):
+                            start_check(check, 'exclusive', build_first=goals_failed(check))
+                if pending and not running:
+                    # Nothing can start and nothing runs: report what is stuck.
+                    for check in list(pending):
+                        pending.remove(check)
+                        self.block(check, [name for name in check.after if self.results.get(name) != 'passed']
+                                   or ['unbuilt prerequisites'])
                 if running:
                     time.sleep(0.2)
         except BaseException:
-            self.kill_all([process for _, process, _, _ in running])
+            self.kill_all([process for _, process, _, _, _ in running])
             raise
         self.retry_failures(by_label)
 
@@ -469,6 +563,24 @@ def tail(path, lines=TAIL_LINES):
     return '\n'.join(text.splitlines()[-lines:])
 
 
+def group_table(rows):
+    """Per matrix group: checks, failures, wall span, summed check time and CPU."""
+    groups = {}
+    for row in rows:
+        if 'started_seconds' not in row:
+            continue
+        name = row.get('group') or row.get('variant') or 'checks'
+        entry = groups.setdefault(name, {'checks': 0, 'failed': 0, 'first': row['started_seconds'],
+                                         'last': row['ended_seconds'], 'check_seconds': 0.0, 'cpu_seconds': 0.0})
+        entry['checks'] += 1
+        entry['failed'] += row.get('returncode') != 0
+        entry['first'] = min(entry['first'], row['started_seconds'])
+        entry['last'] = max(entry['last'], row['ended_seconds'])
+        entry['check_seconds'] += row.get('duration_seconds') or 0.0
+        entry['cpu_seconds'] += row.get('cpu_seconds') or 0.0
+    return groups
+
+
 def summarise(report, stream, first_row=0):
     """Print one summary of every failure in this execution; return True when everything passed."""
     rows = [row for row in report['checks'][first_row:] if 'label' in row]
@@ -479,6 +591,14 @@ def summarise(report, stream, first_row=0):
     flaky = [row for row in latest.values() if row.get('flaky')]
     broken = {goal: status for goal, status in report.get('prerequisites', {}).items() if status.get('returncode') != 0}
     print('\n' + '=' * 78, file=stream)
+    groups = group_table(latest.values())
+    if len(groups) > 1:
+        print(f'{"group":<16} {"checks":>6} {"failed":>6} {"wall span s":>11} {"check s":>9} {"cpu s":>9}', file=stream)
+        for name, entry in sorted(groups.items(), key=lambda item: item[1]['first']):
+            print(f'{name:<16} {entry["checks"]:>6} {entry["failed"]:>6} {entry["last"] - entry["first"]:>11.0f} '
+                  f'{entry["check_seconds"]:>9.0f} {entry["cpu_seconds"]:>9.0f}', file=stream)
+        print('-' * 78, file=stream)
+    report['groups'] = groups
     print(f'{len(latest)} checks: {len(latest) - len(failed)} passed, {len(failed)} failed, '
           f'{len(flaky)} flaky (passed when retried alone)', file=stream)
     for goal, status in broken.items():
