@@ -22,7 +22,7 @@ CASES=("exact3x","one-byte-over","forged-handshake","invalid-handshake-frame","c
        "pcap-nanoseconds","pcapng-decimal-resolution","pcapng-binary-resolution","pcapng-time-offset","pcap-invalid-subsecond","cli-unbound-policy","cli-retained-input-binding","cli-retained-mutation","cli-original-mutation",
        "cli-missing-input","cli-provider-error","cli-primary-finalization-error","initial-token-policy-unknown",
        "receipt-byte-graph","receipt-runtime-missing","receipt-provider-changed","receipt-extra-link-input","receipt-compiler-mismatch",
-       "receipt-flags-mismatch","receipt-tool-changed","receipt-staging-mismatch","receipt-extra-program","receipt-final-mismatch",
+       "receipt-flags-mismatch","receipt-tool-changed","receipt-unreviewed-link-tool","receipt-staging-mismatch","receipt-extra-program","receipt-final-mismatch",
        "pcap-client-first-equal-time","pcap-server-first-equal-time","receipt-schema-float","receipt-status-bool","receipt-raw-mismatch","receipt-policy-bool",
        "frontend-byte-graph","frontend-status-bool","frontend-status-float","frontend-help-argv","frontend-output-mismatch",
        "endpoint-command-tuple","endpoint-command-mismatch","endpoint-tuple-mismatch")
@@ -332,6 +332,13 @@ def receipt_graph_control(case,target):
     elif case=="receipt-compiler-mismatch":build["compiler_pre_link"]["selected_command"]="/different/compiler"
     elif case=="receipt-flags-mismatch":build["actual_command"].insert(1,"-O0")
     elif case=="receipt-tool-changed":(build_root/"clang-driver.py").write_bytes(b"changed tool")
+    elif case=="receipt-unreviewed-link-tool":
+        data=b"self-consistent but unreviewed canonical tool"
+        (build_root/"clang-driver.py").write_bytes(data);digest=ledger.sha(data)
+        value=tools["clang-driver.py"];value["bytes"]=len(data)
+        for field in ("sha256","source_before_sha256","retained_sha256","source_after_sha256","pre_link_sha256","post_link_sha256"):
+            value[field]=digest
+        build["tools"]["clang-driver.py"]=digest
     elif case=="receipt-staging-mismatch":build["actual_command"][-1]=str(target/"server")
     elif case=="receipt-extra-program":build["actual_command"].insert(-2,raw["original"])
     elif case=="receipt-final-mismatch":(build_root/"program").write_bytes(b"different output")
@@ -351,6 +358,8 @@ def receipt_graph_control(case,target):
         result=ledger.checked_link_graph(build,build_root,retention)
         report={"status":"passed","graph":result}
     except ledger.CoverageError as error:report={"status":"coverage-limited","reason":str(error)}
+    if case=="receipt-unreviewed-link-tool":
+        report["control_checks"]={"exact_canonical_tool_rejection":report.get("reason")=="unreviewed canonical link tool"}
     report["scope"]="mock byte-graph validation only; no endpoint ran and no official policy authority"
     report["retained_inputs"]=retention.inputs
     (target/"retention.json").write_text(json.dumps(retention.inputs,indent=2)+"\n")
