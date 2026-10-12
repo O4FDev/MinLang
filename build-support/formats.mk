@@ -61,5 +61,3 @@ bench-tar: build/minyarc
 
 bench-formats: bench-compression bench-sha256 bench-tar
 
-# Opt-in until CI installs static libzstd, zlib, libcrypto and libarchive providers:
-# run `make check-formats check-formats-sanitize` on a host that has them.
