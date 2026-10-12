@@ -33,7 +33,7 @@ Every proposed integration will receive an independent review subagent before th
 ## Current blockers and required qualification
 
 - Branch dispositions and final missing-change tests are being audited; nothing is deemed superseded solely by branch age.
-- CID RED reproduced on Boat; first-use GREEN passed. The 68-case native driver is GREEN after a fixture deadline setup correction that passes both old/new code; native O2 and sanitizer qualification continue.
+- CID RED and corrected 68-case native/cipher GREEN passed; stale IPv6 evidence verifier repaired test-first. Independent R1 now blocks product integration on production peer-edge routing capacity (third live CID can drop a peer); actual-edge RED and narrow repair assigned before final RFC/SAN qualification.
 - neo-db review R1 blocks merge on ten concrete durability, directory framing/error, syncer lifetime/setup, signal narrowing/rollback and diagnostic bounds defects. Two already have actual RED; remaining test-first repairs assigned to the same code owner on W. No obsolete-source broad reruns.
 - Current full Linux/macOS/Windows suites and CI remain unqualified; prior passing commits do not qualify this revision.
 - Native macOS is absent on Boat. Owner directed use of this Mac for native checks; heavy builds/long tests remain on Boat. Offloaded ARM64 generation and bounded serial Apple-native checks are being prepared.
