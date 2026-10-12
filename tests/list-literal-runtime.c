@@ -146,10 +146,12 @@ static void capacity_parity(void) {
 static MinyarList *failure_list;
 static long long *failure_values;
 static long long failure_length, failure_capacity;
+static size_t failure_bytes;
 static void verify_failure_preserved(void) {
     assert(fault_fired == 1);
     assert(failure_list->values == failure_values);
     assert(failure_list->length == failure_length && failure_list->capacity == failure_capacity);
+    assert(rc_bytes == failure_bytes);
     for (long long i = 0; i < failure_length; ++i) assert(failure_list->values[i] == constants[i]);
     assert(constants[0] == LLONG_MIN && constants[6] == LLONG_MAX);
     puts("old-list-preserved");
@@ -157,10 +159,17 @@ static void verify_failure_preserved(void) {
 static void fail_allocation(int resizing) {
     failure_list = minyar_list_new();
     if (resizing) minyar_list_append_scalars(failure_list, constants, 7);
+    if (resizing == 2) list_reserve(failure_list, 2048);
     failure_values = failure_list->values;
     failure_length = failure_list->length; failure_capacity = failure_list->capacity;
+    failure_bytes = rc_bytes;
     assert(atexit(verify_failure_preserved) == 0);
-    if (resizing) fault_resize_index = fault_resizes + 1;
+    int pooled = 0;
+#if defined(MINYAR_SYSTEM_HEAP) && MINYAR_SYSTEM_SMALL_HEAP && !MINYAR_THREADED
+    if (resizing)
+        pooled = ((RcSystemSlot *)((RcData *)failure_values - 1) - 1)->page != NULL;
+#endif
+    if (resizing && !pooled) fault_resize_index = fault_resizes + 1;
     else fault_allocation_index = fault_allocations + 1;
     minyar_list_append_scalars(failure_list, generated, 100000);
     abort();
@@ -179,6 +188,7 @@ int main(int argc, char **argv) {
 #ifdef LIST_LITERAL_FAULTS
     if (!strcmp(argv[1], "fail-fresh")) fail_allocation(0);
     if (!strcmp(argv[1], "fail-resize")) fail_allocation(1);
+    if (!strcmp(argv[1], "fail-large-resize")) fail_allocation(2);
 #endif
     /* Synthetic headers make arithmetic failure deterministic and avoid any
      * physical huge allocation; each must fail before touching NULL data. */
