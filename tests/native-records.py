@@ -56,7 +56,7 @@ print(original.label)
         self.rejects('function read(values: List<Integer>): Integer { native "record_abi" }\n',
                      'not List')
         self.rejects('function make(): List<Integer> { native "record_abi" }\n',
-                     'not List')
+                     'native functions return')
 
 
 if __name__ == '__main__':
