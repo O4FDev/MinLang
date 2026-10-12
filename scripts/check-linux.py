@@ -144,7 +144,7 @@ def main():
     p.add_argument('--jobs', type=int, default=os.cpu_count() or 1, help='Checks run at once (default: CPU count); use 1 on a memory-constrained laptop.')
     p.add_argument('--tier', choices=TIERS, default='full', help='full (default) leaves out sanitizer checks; sanitize runs only them; all runs both.')
     p.add_argument('--only', action='append', default=[], metavar='TARGET', help='Run only these check targets (repeatable), with their phony prerequisites.')
-    p.add_argument('--retries', type=int, default=1, help='Retry each failed check this many times alone; a pass on retry is reported as flaky.')
+    p.add_argument('--retries', type=int, default=1, help='Retry each failed check up to this many times alone; a pass on retry is reported as flaky.')
     p.add_argument('--dry-run', action='store_true', help='Inspect the plan without copying or executing builds; usable on other hosts.')
     a = p.parse_args()
     source = (a.resume.resolve() / 'source') if a.resume else a.source.resolve()
@@ -164,7 +164,8 @@ def main():
                 'experiments/memory/critical-path-study.py',
                 'tests/data/peer/implementations.jsonl']
     missing = [name for name in required if not (source / name).is_file()]
-    targets = [name for name in TARGETS if in_tier(name, a.tier) and (not a.only or name in a.only)]
+    # --only names targets explicitly, whatever their tier.
+    targets = [name for name in TARGETS if name in a.only] if a.only else [name for name in TARGETS if in_tier(name, a.tier)]
     build = [name for name in BUILD if a.tier != 'full' or tier_of(name) == 'full']
     plan = {'source': str(source), 'jobs': a.jobs, 'tier': a.tier, 'build_targets': build,
             'correctness_targets': targets,
@@ -321,7 +322,7 @@ def main():
         print(str(error), file=sys.stderr)
     finally:
         shutil.rmtree(temporary, ignore_errors=True)
-        passed = check_runner.summarise(report, sys.stdout) and 'error' not in report
+        passed = check_runner.summarise(report, sys.stdout, runner.first_row) and 'error' not in report
         report['status'] = 'passed' if passed else 'failed'
         save()
     print(str(report_path), flush=True)

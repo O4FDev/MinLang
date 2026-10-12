@@ -23,6 +23,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import time
@@ -45,6 +46,19 @@ LOCKED = ('import fcntl, os, sys\n'
           'fcntl.flock(lock, fcntl.LOCK_EX)\n'
           'os.set_inheritable(lock, True)\n'
           'os.execvp(sys.argv[2], sys.argv[2:])\n')
+# Build a check's goals holding the lock, then release it before the check
+# runs: its harnesses call the launcher, which takes the same lock.
+BUILD_THEN_RUN = ('import fcntl, os, subprocess, sys\n'
+                  'count = int(sys.argv[2])\n'
+                  'build, command = sys.argv[3:3 + count], sys.argv[3 + count:]\n'
+                  'os.makedirs(os.path.dirname(sys.argv[1]), exist_ok=True)\n'
+                  'lock = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)\n'
+                  'fcntl.flock(lock, fcntl.LOCK_EX)\n'
+                  'status = subprocess.call(build)\n'
+                  'os.close(lock)\n'
+                  'if status:\n'
+                  '    sys.exit(status)\n'
+                  'os.execvp(command[0], command)\n')
 
 
 def group_of(label):
@@ -78,9 +92,14 @@ def make_database(make, cwd, env):
             elif line.startswith('#'):
                 if rule and line.startswith('#  Phony target'):
                     rule.phony = True
-            elif rule is None and (match := RULE.match(line)):
+            elif match := RULE.match(line):
                 normal, _, order_only = match.group(2).partition('|')
-                rule = Rule(match.group(1).strip(), normal.split(), order_only.split(), target)
+                if rule is None:
+                    rule = Rule(match.group(1).strip(), normal.split(), order_only.split(), target)
+                elif match.group(1).strip() == rule.name:
+                    # Double-colon rules list one rule line per definition.
+                    rule.prerequisites += normal.split()
+                    rule.order_only += order_only.split()
         if rule:
             if rule.name == '.PHONY':
                 phony.update(rule.prerequisites)
@@ -143,7 +162,9 @@ class Runner:
     def __init__(self, *, work, logs, env, make, jobs, timeout, report, save, retries=1,
                  previous=None, runner_sha256=None, temporary=None, python='python3'):
         self.work, self.logs, self.env, self.make = work, logs, env, make
-        self.locked = [python, '-c', LOCKED, str(Path(work) / 'build/bootstrap.lock')]
+        self.lock = str(Path(work) / 'build/bootstrap.lock')
+        self.locked = [python, '-c', LOCKED, self.lock]
+        self.python = python
         self.jobs, self.timeout, self.report, self.save = max(1, jobs), timeout, report, save
         self.retries, self.previous, self.runner_sha256 = retries, previous, runner_sha256
         # Each check gets its own TMPDIR, so tests using fixed names under the
@@ -151,12 +172,15 @@ class Runner:
         self.temporary = temporary
         self.built, self.failed_goals = set(), set()
         self.results, self.reused = {}, []
+        # Rows from earlier executions (--resume) are history, not this run's result.
+        self.first_row = len(report['checks'])
 
     def environment(self, check, index):
         env = {**self.env, **check.extra_env}
         if self.temporary:
             env['TMPDIR'] = str(self.temporary / str(index))
-            Path(env['TMPDIR']).mkdir(parents=True, exist_ok=True)
+            shutil.rmtree(env['TMPDIR'], ignore_errors=True)
+            Path(env['TMPDIR']).mkdir(parents=True)
         return env
 
     def environment_sha256(self, check):
@@ -173,9 +197,9 @@ class Runner:
         return None
 
     # -- processes -------------------------------------------------------
-    def start(self, label, command, env, log):
+    def start(self, label, command, env, log, shown=None):
         output = log.open('a')
-        output.write('$ ' + shlex.join(command) + '\n')
+        output.write('$ ' + (shown or shlex.join(command)) + '\n')
         output.flush()
         child = subprocess.Popen(command, cwd=self.work, env=env,
                                  stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
@@ -213,9 +237,16 @@ class Runner:
         row = self.begin(check)
         if row is None:
             return {'returncode': 0, 'reused': True}
-        process = self.launch(check, row)
-        row.update(self.finish(process, wait=True))
+        row.update(self.wait_alone(check, row))
         return self.end(check, row)
+
+    def wait_alone(self, check, row, build_first=False):
+        process = self.launch(check, row, build_first)
+        try:
+            return self.finish(process, wait=True)
+        except BaseException:
+            self.kill_all([process])
+            raise
 
     def begin(self, check):
         """Record a new report row, or return None when an identical success is reused."""
@@ -237,9 +268,13 @@ class Runner:
         print(check.label, flush=True)
         return row
 
-    def launch(self, check, row, locked=False):
-        command = [*self.locked, *check.command] if locked else check.command
-        return self.start(check.label, command, self.environment(check, row['index']), Path(row['log']))
+    def launch(self, check, row, build_first=False):
+        command, shown = check.command, None
+        if build_first and check.goals:
+            build = [*self.make, *check.goals]
+            command = [self.python, '-c', BUILD_THEN_RUN, self.lock, str(len(build)), *build, *command]
+            shown = f'{shlex.join(build)}  # holding build/bootstrap.lock, then:\n$ {shlex.join(check.command)}'
+        return self.start(check.label, command, self.environment(check, row['index']), Path(row['log']), shown)
 
     def end(self, check, row):
         passed = row.get('returncode') == 0
@@ -342,7 +377,7 @@ class Runner:
                             pending.remove(check)
                             row = self.begin(check)
                             if row is not None:
-                                running.append((check, self.launch(check, row, locked=True), row, 'builder'))
+                                running.append((check, self.launch(check, row, build_first=True), row, 'builder'))
                             started = True
                             break
                     while not started and builder_order and pending:
@@ -351,7 +386,8 @@ class Runner:
                             continue
                         print('prerequisite ' + goal, flush=True)
                         running.append((goal, self.start('prerequisite', [*self.locked, *self.make, goal], self.env,
-                                                         prerequisite_log), None, 'goal'))
+                                                         prerequisite_log, shlex.join([*self.make, goal]) +
+                                                         '  # holding build/bootstrap.lock'), None, 'goal'))
                         started = True
                 # Ordinary checks fill the remaining slots, longest first.
                 for check in list(pending):
@@ -388,21 +424,23 @@ class Runner:
 
     def retry_failures(self, by_label):
         """Retry real failures once, alone, so load-induced timing failures surface as flaky."""
-        rows = {row['label']: row for row in self.report['checks'] if 'label' in row}
+        rows = {row['label']: row for row in self.report['checks'][self.first_row:] if 'label' in row}
         for label, check in by_label.items():
             row = rows.get(label)
-            if self.retries < 1 or row is None or row.get('returncode') == 0 or row.get('blocked_by'):
+            if row is None or row.get('blocked_by'):
                 continue
-            print(f'{label}: retrying alone', flush=True)
-            with open(row['log'], 'a') as log:
-                log.write('\n--- retry with nothing else running ---\n')
-            process = self.launch(check, row)
-            status = self.finish(process, wait=True)
-            row['first_attempt'] = {key: row.get(key) for key in ('returncode', 'timed_out', 'duration_seconds')}
-            row.update(status)
-            if status['returncode'] == 0:
-                row['flaky'] = True
-            self.end(check, row)
+            for attempt in range(self.retries):
+                if row.get('returncode') == 0:
+                    break
+                print(f'{label}: retrying alone', flush=True)
+                with open(row['log'], 'a') as log:
+                    log.write('\n--- retry with nothing else running ---\n')
+                row.setdefault('failed_attempts', []).append(
+                    {key: row.get(key) for key in ('returncode', 'timed_out', 'duration_seconds')})
+                row.update(self.wait_alone(check, row, build_first=bool(check.goals)))
+                if row['returncode'] == 0:
+                    row['flaky'] = True
+                self.end(check, row)
         # A check blocked only by checks that passed on retry now runs alone.
         progress = True
         while progress:
@@ -414,7 +452,7 @@ class Runner:
                 if all(self.results.get(name) == 'passed' for name in row['blocked_by']):
                     print(f"{label}: prerequisites passed on retry; running alone", flush=True)
                     row['was_blocked_by'] = row.pop('blocked_by')
-                    row.update(self.finish(self.launch(check, row), wait=True))
+                    row.update(self.wait_alone(check, row, build_first=bool(check.goals)))
                     self.end(check, row)
                     progress = True
 
@@ -431,9 +469,9 @@ def tail(path, lines=TAIL_LINES):
     return '\n'.join(text.splitlines()[-lines:])
 
 
-def summarise(report, stream):
-    """Print one summary of every failure; return True when everything passed."""
-    rows = [row for row in report['checks'] if 'label' in row]
+def summarise(report, stream, first_row=0):
+    """Print one summary of every failure in this execution; return True when everything passed."""
+    rows = [row for row in report['checks'][first_row:] if 'label' in row]
     latest = {}
     for row in rows:
         latest[row['label']] = row
@@ -446,7 +484,7 @@ def summarise(report, stream):
     for goal, status in broken.items():
         print(f'prerequisite failed to build: {goal} (log {status.get("log")})', file=stream)
     for row in flaky:
-        print(f'flaky: {row["label"]} (first attempt {row["first_attempt"]}; log {row["log"]})', file=stream)
+        print(f'flaky: {row["label"]} (failed attempts {row["failed_attempts"]}; log {row["log"]})', file=stream)
     for row in failed:
         print('-' * 78, file=stream)
         if row.get('blocked_by'):

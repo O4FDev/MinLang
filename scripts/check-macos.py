@@ -5,7 +5,9 @@ Example: python3 scripts/check-macos.py LIMITED= SANITIZER_LIMITED=
 Trailing VAR=VALUE arguments are passed to every make call. Checks keep going
 past failures, and the run ends with one summary of every failure (its log
 path and last 30 lines). --tier full (the default) leaves out sanitizer
-checks, --tier sanitize runs only them and --tier all runs both. --jobs
+checks (including the two sanitizer checks check-portable lists directly),
+--tier sanitize runs only them and --tier all runs everything check-portable
+runs. --jobs
 defaults to 1 because laptops are memory-constrained; on a larger machine pass
 --jobs N. Logs and results.json go to build/check-macos/<run>/."""
 import argparse
@@ -40,7 +42,7 @@ def main():
     p.add_argument('--only', action='append', default=[], metavar='TARGET', help='Run only these checks (repeatable), with their phony prerequisites.')
     p.add_argument('--target', default='check-portable', help='Aggregate make target whose checks run (default check-portable).')
     p.add_argument('--timeout', type=int, default=1800, help='Maximum seconds for each check.')
-    p.add_argument('--retries', type=int, default=1, help='Retry each failed check this many times alone; a pass on retry is reported as flaky.')
+    p.add_argument('--retries', type=int, default=1, help='Retry each failed check up to this many times alone; a pass on retry is reported as flaky.')
     p.add_argument('--output-dir', type=Path, default=ROOT / 'build/check-macos', help='Parent for the run directory.')
     p.add_argument('--dry-run', action='store_true', help='Print the planned checks without running them.')
     p.add_argument('make_vars', nargs='*', metavar='VAR=VALUE', help='Variables passed to every make call.')
@@ -51,6 +53,12 @@ def main():
         p.error('trailing arguments must be make variables (VAR=VALUE)')
     if platform.system() != 'Darwin' and not a.dry_run:
         print('note: this runner is meant for macOS; use scripts/check-linux.py on Linux', file=sys.stderr)
+    if a.jobs > 1 and not any(item.startswith('CC=') for item in a.make_vars):
+        # The Makefile defaults CC to cc, but the minyar launcher's nested make
+        # falls back to clang; each switch rewrites the toolchain stamp and
+        # rebuilds every compiler. Serially that only costs time; in parallel
+        # it would rebuild artifacts other checks are using.
+        a.make_vars.append('CC=clang')
     env = {name: value for name, value in os.environ.items() if name not in ('MAKEFLAGS', 'MFLAGS', 'MAKELEVEL')}
     # Each make is serial; concurrency comes from running several checks at once.
     make = ['make', '-j1', *a.make_vars]
@@ -63,7 +71,8 @@ def main():
     unknown = [name for name in a.only if name not in children]
     if unknown:
         p.error(f'not a check in {a.target}: ' + ', '.join(unknown))
-    roots = [name for name in children if in_tier(name, a.tier) and (not a.only or name in a.only)]
+    # --only names checks explicitly, whatever their tier.
+    roots = [name for name in children if name in a.only] if a.only else [name for name in children if in_tier(name, a.tier)]
     checks = check_runner.plan_make_checks(rules, roots, make, tier_of, {})
     if a.tier != 'sanitize' and not a.only:
         checks.append(check_runner.aggregate_check(rules, a.target, make, {check.label for check in checks}, 'full'))
