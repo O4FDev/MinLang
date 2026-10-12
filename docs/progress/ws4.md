@@ -38,11 +38,16 @@ Implemented chunks, awaiting review/remaining qualification:
   Independent R1 found a sparse-prefix Darwin preallocation false-success bug.
   Separate fix `ab22fb9` (`462c99d` evidence) passes Mac 82 native/41 sanitizer and
   Linux 84 native/42 sanitizer controls, plus retained checks. Fresh independent R2
-  review is running. Windows companion pending.
+  review resolved the sparse-hole finding, but found a mapped APFS clone prefix can
+  still need new overwrite storage. A separate clone/reservation fix and mandatory
+  control are underway. Windows companion pending.
 - System `d3f7b9`, process `055ada54` with qualification companions through `68948fb`:
   environment/rlimits/signals/stderr and safe spawn/waits implemented. Mac unprivileged
   and Linux services/language cases pass; source-pinned process/sanitizer/root cases are
-  running after retained compiler-stamp and canonical runtime ABI helper diagnoses.
+  qualified at exact `68948fb` with all six source-pinned suites and the existing
+  instrumentation audit passing. Fresh independent R1 found two P1s: arm64 kernel
+  signal-action layout is undersized, and TSan inserts a child function-entry call.
+  Separate fixes and expanded mandatory ABI/zero-call controls are underway.
   Native Mac privileged credential success still needs an admitted platform route.
 - HTTP `a1edb5d` + `0f50104` evidence + benchmark `283a5ad`: reusable event-loop server
   and mandatory wire tests pass Linux debug/release and ASan/UBSan/LSan, plus small Mac
@@ -53,7 +58,10 @@ Implemented chunks, awaiting review/remaining qualification:
   Immutable compiler `f4f589` and runtime IR `4119757` were invoked directly; the
   earlier launcher-rebuilt shared correctness compiler `0b8bd2` is recorded separately.
   Samples/evidence committed in `bd43f2b`; worst ratio is 1.304x. Fresh independent R1
-  review is running; Windows execution pending.
+  review independently reproduced all 16,434 samples/gates, but found a write-phase
+  half-close/backpressure HUP spin. The separate fix's combined regression is green;
+  exact qualification and a corrected-source full benchmark rerun are underway.
+  Windows execution pending.
 
 ## Gates and coordination
 
@@ -69,8 +77,10 @@ Implemented chunks, awaiting review/remaining qualification:
   relay from WS7's separate box after its source receipt. No bytes/Windows boot or test
   readiness is claimed yet; WS4 creates and owns its eventual overlay/controller.
   WS7's own task public key is installed with forced receive-only rsync restricted
-  to the recipient root. The integrator admitted relay-only source resume after its
-  binding guard abort; source receipt and destination verification remain distinct.
+  to the recipient root through a serial 75% resource guard. Source verification
+  failed before admitting all eight hashes; no transfer or retry is authorized.
+  Receiver remains empty and is normal-stopped with authorization preserved by
+  integrator order. No binding/Windows boot readiness is claimed.
 - `tools/clang-driver.py` has overlapping minimal files/system routing edits; parent
   resolves them when assembling chunks. WS5 adds zstd/deflate registration separately.
 - Acceptance remains Linux/macOS/Windows suites, HTTP p50 and p99 both at most 1.5x
@@ -83,10 +93,12 @@ Implemented chunks, awaiting review/remaining qualification:
   existing sparse prefix without reserving it. The fix inspects physical extents,
   flushes and retries delayed allocation, and rejects unsupported existing holes
   truthfully. Mandatory punched-hole regressions and fresh/dense extension controls
-  pass on the committed fix; fresh independent R2 review is running.
+  pass on the committed fix; R2 confirmed resolution. R2's shared APFS clone finding
+  remains open; private writable allocation cannot be inferred from physical mapping.
 - Exact system `68948fb` qualification reruns all six native/sanitizer/language/root
   suites. Earlier `a086d75` receipts remain intact. Linux credentials use native-only
-  clone-vfork; the instrumentation audit requires no calls in the child trampoline.
+  clone-vfork; the expanded instrumentation audit must also exclude TSan function
+  entry calls and enforce exact supported kernel signal-action layouts.
 - macOS credential spawn uses Apple's dynamically resolved attributes with explicit
   group semantics. Unprivileged failure/parent-state checks pass; positive privileged
   proof must run on CI, never on this laptop.
