@@ -54,7 +54,7 @@ class OfficialResults(unittest.TestCase):
                     mock.patch.dict(os.environ, {'MINYAR_REMOTE_LOAD': '1'}), \
                     mock.patch.object(interop.subprocess, 'Popen', return_value=process), \
                     mock.patch.object(interop.subprocess, 'run') as cleanup, \
-                    mock.patch.object(interop.subprocess, 'check_output', return_value='frozen-runner\n'), \
+                    mock.patch.object(interop.subprocess, 'check_output', side_effect=lambda args, **kw: 'TShark (Wireshark) 4.6.0\n' if args[0]=='tshark' else 'frozen-runner\n'), \
                     contextlib.redirect_stdout(io.StringIO()):
                 status = interop.main()
             cleanup.assert_called_once()
@@ -75,6 +75,17 @@ class OfficialResults(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertEqual(manifest['result_validation']['status'], 'failed')
         self.assertIn('handshake', manifest['result_validation']['error'])
+
+    def test_old_or_unidentified_tshark_is_rejected(self):
+        for version in ('TShark (Wireshark) 4.2.2', 'unidentified tshark'):
+            with self.subTest(version=version), mock.patch.object(interop.subprocess, 'check_output', return_value=version):
+                with self.assertRaisesRegex(RuntimeError, '4.5.0 or newer'):
+                    interop.require_tshark()
+
+    def test_supported_tshark_is_accepted(self):
+        for version in ('TShark (Wireshark) 4.5.0', 'TShark (Wireshark) 4.6.0'):
+            with self.subTest(version=version), mock.patch.object(interop.subprocess, 'check_output', return_value=version):
+                self.assertEqual(interop.require_tshark(), version)
 
     def test_actual_multipeer_and_ngtcp2_results_succeed(self):
         for filename, servers, clients, cases, count in (

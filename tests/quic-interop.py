@@ -7,6 +7,12 @@ import argparse, hashlib, json, os, platform, re, subprocess, sys, time
 from pathlib import Path
 
 def command(args, **kwargs):return subprocess.run(args,check=True,**kwargs)
+def require_tshark():
+    version=subprocess.check_output(['tshark','--version'],text=True,stderr=subprocess.DEVNULL).splitlines()[0]
+    parsed=re.search(r'\(Wireshark\) (\d+)\.(\d+)',version)
+    if parsed is None or tuple(map(int,parsed.groups()))<(4,5):
+        raise RuntimeError('official interop requires Wireshark 4.5.0 or newer: '+version)
+    return version
 def runner_environment(temporary):
     # Compose v2 validates mounts even for `down`. Upstream's per-case cleanup
     # inherits no inline variables from the earlier `up` command; safe defaults
@@ -159,6 +165,7 @@ def matrix_evidence(path, options, runner_status):
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--runner',required=True);parser.add_argument('--artifacts',required=True);parser.add_argument('--servers',default='minyar');parser.add_argument('--clients',default='minyar,quiche,ngtcp2,msquic');parser.add_argument('--tests',default='handshake,transfer');parser.add_argument('--must-include',default='minyar');parser.add_argument('--temporary',type=Path,default=Path('/home/minyar/lab/quic-runner-tmp'));options=parser.parse_args()
     if platform.system()!='Linux' or os.geteuid()!=0 or os.environ.get('MINYAR_REMOTE_LOAD')!='1':raise RuntimeError('remote Linux admin orchestration required')
+    tshark=require_tshark()
     runner=Path(options.runner).resolve();artifacts=Path(options.artifacts).resolve();artifacts.mkdir(parents=True,exist_ok=True)
     temporary=options.temporary.resolve();temporary.mkdir(parents=True,exist_ok=True)
     # The upstream runner explicitly chooses /tmp at several fixture sites.
@@ -199,7 +206,7 @@ def main():
             if process.poll() is None:process.terminate();process.wait(timeout=20)
             cleanup_environment=dict(environment,SERVER='minyar-interop:development',CLIENT='minyar-interop:development',SERVER_WWW=str(temporary),CLIENT_WWW=str(temporary),SERVER_DOWNLOADS=str(temporary),CLIENT_DOWNLOADS=str(temporary),CERTS=str(temporary))
             subprocess.run(['docker','compose','--env-file','empty.env','down','--timeout','5'],cwd=runner,env=cleanup_environment,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    manifest={'runner_commit':subprocess.check_output(['git','-c',f'safe.directory={runner}','rev-parse','HEAD'],cwd=runner,text=True).strip(),'tshark':subprocess.check_output(['tshark','--version'],text=True,stderr=subprocess.DEVNULL).splitlines()[0],'elapsed_seconds':time.monotonic()-started,'configured_endpoints':len(configured),'tests':options.tests,'servers':options.servers,'clients':options.clients,'must_include':options.must_include,'controller_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+    manifest={'runner_commit':subprocess.check_output(['git','-c',f'safe.directory={runner}','rev-parse','HEAD'],cwd=runner,text=True).strip(),'tshark':tshark,'elapsed_seconds':time.monotonic()-started,'configured_endpoints':len(configured),'tests':options.tests,'servers':options.servers,'clients':options.clients,'must_include':options.must_include,'controller_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
     manifest.update(matrix_evidence(artifacts/'matrix.json',options,status))
     (artifacts/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n');print(json.dumps(manifest))
     return manifest['status']
