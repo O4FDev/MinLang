@@ -35,44 +35,65 @@ Implemented chunks, awaiting review/remaining qualification:
 
 - Files `8283581` + `35c7378` (`6141695` evidence): Linux 70 native and 35 sanitizer
   controls plus retained review/sync-failure cases pass; Mac 68 native/34 sanitizer pass.
-  Independent R1 found a sparse-prefix Darwin preallocation false-success bug; fix and
-  a new mandatory regression are underway before a fresh review. Windows companion pending.
-- System `d3f7b9`, process `055ada54` with qualification companions through `0944f8f`:
+  Independent R1 found a sparse-prefix Darwin preallocation false-success bug.
+  Separate fix `ab22fb9` (`462c99d` evidence) passes Mac 82 native/41 sanitizer and
+  Linux 84 native/42 sanitizer controls, plus retained checks. Fresh independent R2
+  review is running. Windows companion pending.
+- System `d3f7b9`, process `055ada54` with qualification companions through `68948fb`:
   environment/rlimits/signals/stderr and safe spawn/waits implemented. Mac unprivileged
   and Linux services/language cases pass; source-pinned process/sanitizer/root cases are
   running after retained compiler-stamp and canonical runtime ABI helper diagnoses.
   Native Mac privileged credential success still needs an admitted platform route.
-- HTTP `a1edb5d` + `0f50104` evidence: reusable event-loop server API and mandatory wire
-  tests pass Linux debug/release and ASan/UBSan/LSan. The actual library cache-front and
-  equivalent axum benchmark fixture are in progress. Windows/Mac execution pending.
+- HTTP `a1edb5d` + `0f50104` evidence + benchmark `283a5ad`: reusable event-loop server
+  and mandatory wire tests pass Linux debug/release and ASan/UBSan/LSan, plus small Mac
+  wire/cache-front checks. The full cache-front gate passed on exclusive own Boat
+  `bx_8b8ercp7`: three alternating paired rounds, all five cohorts, both p50 and p99
+  within 1.5x axum. Pinned 548-query/raw replay bodies, LRU and causal/concurrent HoL
+  controls passed. Command `cmd_bi3qixj4jzoc`, PID 33738, exited 0 at 15:08:04 UTC.
+  Immutable compiler `f4f589` and runtime IR `4119757` were invoked directly; the
+  earlier launcher-rebuilt shared correctness compiler `0b8bd2` is recorded separately.
+  Samples/evidence committed in `bd43f2b`; worst ratio is 1.304x. Fresh independent R1
+  review is running; Windows execution pending.
 
 ## Gates and coordination
 
 - `PHASE1_DONE` gates integration, not development or tests. Keep branches on the
   frozen candidate until the integrator releases the pushed `v2` base, then rebase.
 - Owner admitted separate WS4 Boat sandboxes on included credit, with $0 paid spend.
-  Linux qualification sandbox `bx_ppv9fjr7` is provisioning (4-hour TTL). Root's
+  Linux qualification sandbox `bx_ppv9fjr7` has a verified read-only baseline and
+  separate files/system/HTTP namespaces. Root's
   Phase 1 boxes and their controllers/VMs remain forbidden to WS4. Windows needs
-  the root-arranged completed snapshot/fork boundary; WS4 will not operate Y.
+  the root-arranged immutable transfer boundary; WS4 will not operate Y.
 - Own Windows recipient `bx_r5nrrwwx` (8 CPUs / 16 GiB, 4-hour TTL) has authenticated
   transfer ingress and 121 GiB free. Root admitted a private verified immutable-base/profile
   relay from WS7's separate box after its source receipt. No bytes/Windows boot or test
   readiness is claimed yet; WS4 creates and owns its eventual overlay/controller.
+  WS7's own task public key is installed with forced receive-only rsync restricted
+  to the recipient root. The integrator admitted relay-only source resume after its
+  binding guard abort; source receipt and destination verification remain distinct.
 - `tools/clang-driver.py` has overlapping minimal files/system routing edits; parent
   resolves them when assembling chunks. WS5 adds zstd/deflate registration separately.
 - Acceptance remains Linux/macOS/Windows suites, HTTP p50 and p99 both at most 1.5x
   equivalent axum, ordinary single-thread workloads within the shared 1% budget,
   reviewed integrator merges and truthful `fixed in v2 <sha>` gap annotations.
 
-## Preserved work and review findings
+## Review and remaining proof
 
-- `ws4/files` has `82835810e2cfef2161636881637a8cd18d1eb45c`: bounded allocation at
-  EOF for ranged reads. Five focused Mac controls passed; no independent review or
-  Linux/Windows qualification yet. The prepare-file prototype and its seven Mac
-  controls remain uncommitted; startup/durability fault injection and real event-loop
-  integration are still required. New tests also need mandatory Make/catalogue wiring.
-- System and HTTP worktrees are fully populated and clean at the frozen base.
-- macOS public `spawn.h` lacks arbitrary credentials, but Apple's XNU private header
-  declares direct uid/gid/groups spawn attributes since 10.15 and the local SDK exports
-  them. Investigate a bound SPI path with permission/lifecycle tests before concluding
-  the feature is unsupported. No working macOS credential-spawn result is claimed.
+- Files independent R1 reproduced Darwin preallocation returning success for an
+  existing sparse prefix without reserving it. The fix inspects physical extents,
+  flushes and retries delayed allocation, and rejects unsupported existing holes
+  truthfully. Mandatory punched-hole regressions and fresh/dense extension controls
+  pass on the committed fix; fresh independent R2 review is running.
+- Exact system `68948fb` qualification reruns all six native/sanitizer/language/root
+  suites. Earlier `a086d75` receipts remain intact. Linux credentials use native-only
+  clone-vfork; the instrumentation audit requires no calls in the child trampoline.
+- macOS credential spawn uses Apple's dynamically resolved attributes with explicit
+  group semantics. Unprivileged failure/parent-state checks pass; positive privileged
+  proof must run on CI, never on this laptop.
+- Windows receipt, private own overlay/controller readiness and actual contract tests
+  remain required. The files backend is still pending. POSIX-only Windows failures
+  require explicit ENOTSUP contract checks, not broad skips.
+- Shared single-thread 1% gates, reviewed integrator merges, and downstream gap
+  annotations remain open. No gap is labelled fixed before its merged v2 SHA exists.
+- No local sudo, admin/authentication, keychain/trust/privacy/firewall/profile changes
+  are permitted. No root Phase 1 host/VM/controller use or paid spend is admitted.
