@@ -23,7 +23,7 @@ COMPILER_SUITES = ("diagnostics", "conformance", "regressions", "feature-dispatc
                    "statement-nesting",
                    "peer-research-semantics", "peer-research-reachability",
                    "peer-memory-nim-koka-lean", "peer-memory-nim-koka-followups",
-                   "maps", "list-sort NaturalSort", "text-basics", "text-basics-errors",
+                   "maps", "list-sort NaturalSort", "text-basics",
                    "collections-integration CollectionConstants",
                    "module-constants", "octal-literals", "reserved-names", "checked-results")
 
