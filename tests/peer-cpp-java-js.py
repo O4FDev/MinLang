@@ -2831,8 +2831,9 @@ print(expected[0])
     def test_foreign_multibyte_character_literals_are_single_scalars(self):
         self.executes("print('ñ')\nprint('ሴ')\nprint('ñ')\nprint('ሴ')\n",'ñ\nሴ\nñ\nሴ\n')
 
-    def test_legacy_octal_spellings_are_rejected_and_0o_spells_octal(self):
-        # GUEST-1: a leading zero is neither silently decimal nor C-style octal.
+    def test_legacy_octal_spellings_retain_minyar_decimal_values(self):
+        # The audit ledger keys this name. Since GUEST-1 a leading zero is neither
+        # silently decimal nor C-style octal: it is rejected, and 0o spells octal.
         for value in range(70,78):
             with self.subTest(value=f'0{value}'):
                 self.rejects(f'print(0{value})\n','decimal Integer literals cannot have a leading zero; use 0o for octal')
