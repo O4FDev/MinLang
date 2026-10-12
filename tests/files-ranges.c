@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "files-test-path.h"
 static int pseudo, calls, partial_failure;
 static MinyarBytes *bounded_new(long long length) {
     assert(length <= 65536); return minyar_bytes_new(length);
@@ -38,7 +39,7 @@ static void expect(long long fd, long long offset, long long length, const char 
 }
 int main(int argc, char **argv) {
     assert(argc == 2);
-    char path[] = "/tmp/minyar-ranges-XXXXXX";
+    char path[PATH_MAX]; files_test_path(path,sizeof(path),"minyar-ranges-XXXXXX");
     int fd = mkstemp(path); assert(fd >= 0); unlink(path);
     assert(write(fd, "abcdef", 6) == 6);
     if (!strcmp(argv[1], "huge")) expect(fd, 2, 1LL<<40, "cdef", 0);
@@ -64,8 +65,7 @@ int main(int argc, char **argv) {
         expect(fd, 0, 64, "", -EIO);
         pseudo = 0; expect(fd, 0, 6, "abcdef", 0);
     } else if (!strcmp(argv[1], "read-file")) {
-        const char name[] = "/tmp/minyar-ranges-path-XXXXXX";
-        char pathname[sizeof(name)]; memcpy(pathname, name, sizeof(name));
+        char pathname[PATH_MAX]; files_test_path(pathname,sizeof(pathname),"minyar-ranges-path-XXXXXX");
         int other = mkstemp(pathname); assert(other >= 0);
         assert(write(other, "contents", 8) == 8); close(other);
         MinyarText pathtext = {(const unsigned char *)pathname, (long long)strlen(pathname), 0, NULL, NULL};

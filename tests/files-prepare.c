@@ -13,10 +13,45 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include "files-test-path.h"
+#ifdef __APPLE__
+#include <sys/attr.h>
+#include <sys/clonefile.h>
+#endif
+#ifdef __linux__
+#include <linux/falloc.h>
+#include <linux/fiemap.h>
+#include <linux/fs.h>
+#include <linux/magic.h>
+#include <sys/ioctl.h>
+#include <sys/vfs.h>
+#endif
 static _Atomic int entered, release_worker, sync_calls, write_calls;
 static int block_worker, write_error, sync_error, short_writes, zero_write, interrupted_write;
 static int fd_fail, fd_step, mutex_fail, condition_fail, create_fail, pair_fail, allocation_error;
 static int mutex_live, condition_live;
+#ifdef __APPLE__
+static int sharing_query_error, sharing_query_missing;
+static int controlled_getattrs(int fd, struct attrlist *list, void *out, size_t size, unsigned long options) {
+    if (sharing_query_error) { errno=sharing_query_error; return -1; }
+    int rc=fgetattrlist(fd,list,out,size,options);
+    if (!rc && sharing_query_missing)
+        ((attribute_set_t *)((unsigned char *)out+sizeof(uint32_t)))->forkattr &= ~ATTR_CMNEXT_EXT_FLAGS;
+    return rc;
+}
+#define fgetattrlist controlled_getattrs
+#endif
+#ifdef __linux__
+static int unshare_error, unshare_success, filesystem_error;
+static long filesystem_type;
+static int unshare_calls, allocation_calls;
+static off_t unshare_length;
+static int controlled_statfs(int fd, struct statfs *st) {
+    if(filesystem_error) { errno=filesystem_error; return -1; }
+    int rc=fstatfs(fd,st); if(!rc && filesystem_type) st->f_type=filesystem_type; return rc;
+}
+#define fstatfs controlled_statfs
+#endif
 static int truncate_error;
 static long long write_error_after = -1;
 static pthread_t managed_owner;
@@ -67,6 +102,11 @@ static int controlled_fcntl(int fd, int command, ...) {
 }
 #ifdef __linux__
 static int controlled_allocate(int fd,int mode,off_t offset,off_t length) {
+    if (mode & FALLOC_FL_UNSHARE_RANGE) {
+        unshare_calls++; unshare_length=length; assert(offset==0);
+        if (unshare_error) { errno=unshare_error; return -1; }
+        if (unshare_success) return 0;
+    } else allocation_calls++;
     if (allocation_error) { errno=allocation_error; return -1; }
     return fallocate(fd,mode,offset,length);
 }
@@ -121,13 +161,17 @@ static int controlled_pair(int domain,int type,int protocol,int sv[2]) {
 #undef pthread_mutex_init
 #ifdef __linux__
 #undef fallocate
+#undef fstatfs
+#endif
+#ifdef __APPLE__
+#undef fgetattrlist
 #endif
 void minyar_rc_release(void *);
 static int descriptors(void) {
     int count=0; for(int i=0;i<512;i++) if(fcntl(i,F_GETFD)>=0) count++; return count;
 }
 static int temporary(bool populate) {
-    char path[]="/tmp/minyar-prepare-XXXXXX"; int fd=mkstemp(path); assert(fd>=0); unlink(path);
+    char path[PATH_MAX]; files_test_path(path,sizeof(path),"minyar-prepare-XXXXXX"); int fd=mkstemp(path); assert(fd>=0); unlink(path);
     if (populate) {
         char dirty[4096]; memset(dirty, 123, sizeof(dirty)); assert(write(fd,dirty,sizeof(dirty))==sizeof(dirty));
     }
@@ -138,7 +182,84 @@ static void verify_zero(int fd, long long length) {
     MinyarBytes *b=minyar_files_readAt(fd,0,length+10); assert(b->byte_length==length);
     for(long long i=0;i<length;i++) assert(!b->bytes[i]); minyar_rc_release(b);
 }
+static void verify_content(int fd, unsigned char value) {
+    unsigned char data[65536]; assert(pread(fd,data,sizeof(data),0)==sizeof(data));
+    for(size_t i=0;i<sizeof(data);i++) assert(data[i]==value);
+}
+#ifdef __linux__
+static bool shared_prefix(int fd) {
+    size_t size=sizeof(struct fiemap)+16*sizeof(struct fiemap_extent);
+    struct fiemap *map=calloc(1,size); assert(map);
+    map->fm_length=65536; map->fm_extent_count=16; map->fm_flags=FIEMAP_FLAG_SYNC;
+    assert(!ioctl(fd,FS_IOC_FIEMAP,map));
+    uint64_t covered=0; bool shared=false;
+    for(uint32_t i=0;i<map->fm_mapped_extents;i++) {
+        struct fiemap_extent *e=&map->fm_extents[i];
+        assert(e->fe_logical<=covered && e->fe_length<=UINT64_MAX-e->fe_logical);
+        covered=e->fe_logical+e->fe_length;
+        if(e->fe_flags&FIEMAP_EXTENT_SHARED) shared=true;
+        if(covered>=65536) break;
+    }
+    assert(covered>=65536); free(map); return shared;
+}
+#endif
+static void clone_prefix(void) {
+    char path[PATH_MAX], copy[PATH_MAX]; files_test_path(path,sizeof(path),"minyar-clone-XXXXXX");
+    int source=mkstemp(path); assert(source>=0);
+    int count=snprintf(copy,sizeof(copy),"%s-copy",path); assert(count>0 && (size_t)count<sizeof(copy));
+    unsigned char data[65536]; memset(data,42,sizeof(data));
+    assert(write(source,data,sizeof(data))==sizeof(data) && !fsync(source));
+    int clone;
+#ifdef __APPLE__
+    assert(!clonefile(path,copy,0)); clone=open(copy,O_RDWR); assert(clone>=0);
+    struct log2phys a={0},b={0}; a.l2p_contigbytes=b.l2p_contigbytes=sizeof(data);
+    assert(!fcntl(source,F_LOG2PHYS_EXT,&a) && !fcntl(clone,F_LOG2PHYS_EXT,&b));
+    assert(a.l2p_devoffset>=0 && b.l2p_devoffset==a.l2p_devoffset);
+    assert(a.l2p_contigbytes>=(off_t)sizeof(data) && b.l2p_contigbytes>=(off_t)sizeof(data));
+    assert(lseek(source,123,SEEK_SET)==123 && lseek(clone,123,SEEK_SET)==123);
+    assert(minyar_files_preallocate(clone,sizeof(data))==-ENOTSUP);
+    assert(minyar_files_preallocate(source,sizeof(data))==-ENOTSUP);
+    assert(minyar_files_preallocate(clone,sizeof(data)*2)==-ENOTSUP);
+    struct log2phys unchanged={0}; unchanged.l2p_contigbytes=sizeof(data);
+    assert(!fcntl(clone,F_LOG2PHYS_EXT,&unchanged) && unchanged.l2p_devoffset==a.l2p_devoffset);
+    printf("clone-prefix: shared physical=%lld, both files rejected -ENOTSUP before mutation\n",
+           (long long)a.l2p_devoffset);
+#elif defined(__linux__)
+    clone=open(copy,O_RDWR|O_CREAT|O_EXCL,0600); assert(clone>=0);
+    if(ioctl(clone,FICLONE,source)<0) {
+        assert(errno==EOPNOTSUPP || errno==ENOTTY);
+        struct statfs filesystem; assert(!fstatfs(source,&filesystem));
+        assert(filesystem.f_type==EXT4_SUPER_MAGIC);
+        assert(lseek(source,123,SEEK_SET)==123);
+        assert(!minyar_files_preallocate(source,sizeof(data)) && unshare_calls>0);
+        assert(lseek(source,0,SEEK_CUR)==123); verify_content(source,42);
+        printf("clone-prefix: admitted ext-family filesystem does not support reflink; private reservation passed\n");
+        close(source); close(clone); assert(!unlink(path) && !unlink(copy)); return;
+    }
+    assert(shared_prefix(clone));
+    assert(lseek(source,123,SEEK_SET)==123 && lseek(clone,123,SEEK_SET)==123);
+    long long result=minyar_files_preallocate(clone,sizeof(data));
+    assert(result==0 || result==-ENOTSUP || result==-EOPNOTSUPP);
+    assert(unshare_calls>0);
+    if(!result) assert(!shared_prefix(clone));
+    printf("clone-prefix: real reflink result=%lld, unshare calls=%d\n",result,unshare_calls);
+#else
+#error "clone-prefix qualification requires Darwin or Linux"
+#endif
+    assert(minyar_files_size(source)==sizeof(data) && minyar_files_size(clone)==sizeof(data));
+    assert(lseek(source,0,SEEK_CUR)==123 && lseek(clone,0,SEEK_CUR)==123);
+    verify_content(source,42); verify_content(clone,42);
+    memset(data,43,sizeof(data)); assert(pwrite(clone,data,sizeof(data),0)==sizeof(data) && !fsync(clone));
+    verify_content(source,42); verify_content(clone,43);
+    assert(!close(source) && !close(clone) && !unlink(path) && !unlink(copy));
+}
 int main(int argc,char **argv) {
+#ifdef __APPLE__
+    (void)controlled_getattrs;
+#endif
+#ifdef __linux__
+    (void)controlled_statfs;
+#endif
     assert(argc==2); managed_owner=pthread_self();
     bool fresh=!strcmp(argv[1],"sparse-tail") || !strcmp(argv[1],"sparse-middle") ||
                !strcmp(argv[1],"fresh-preallocate") || !strcmp(argv[1],"fresh-prepare");
@@ -150,6 +271,41 @@ int main(int argc,char **argv) {
         assert(!minyar_files_preallocate(fd,1)); assert(minyar_files_size(fd)==8192);
         MinyarBytes *b=minyar_files_readAt(fd,0,1); assert(b->bytes[0]==123); minyar_rc_release(b);
         assert(!minyar_files_preallocate(fd,0));
+    } else if (!strcmp(argv[1],"clone-prefix")) {
+        clone_prefix();
+#ifdef __APPLE__
+    } else if (!strcmp(argv[1],"sharing-query-error") || !strcmp(argv[1],"sharing-query-missing")) {
+        int error=ENOTSUP;
+        if(!strcmp(argv[1],"sharing-query-error")) sharing_query_error=error=EIO;
+        else sharing_query_missing=1;
+        assert(minyar_files_preallocate(fd,8192)==-error);
+        assert(minyar_files_size(fd)==4096 && lseek(fd,0,SEEK_CUR)==4096);
+        MinyarBytes *b=minyar_files_readAt(fd,0,4096); assert(b->byte_length==4096);
+        for(long long i=0;i<b->byte_length;i++) assert(b->bytes[i]==123); minyar_rc_release(b);
+#endif
+#ifdef __linux__
+    } else if (!strncmp(argv[1],"unshare-",8)) {
+        int error=0;
+        if(!strcmp(argv[1],"unshare-supported")) unshare_success=1;
+        else if(!strcmp(argv[1],"unshare-error")) unshare_error=error=ENOSPC;
+        else if(!strcmp(argv[1],"unshare-unsupported")) {
+            unshare_error=EOPNOTSUPP; filesystem_type=BTRFS_SUPER_MAGIC; error=ENOTSUP;
+        } else if(!strcmp(argv[1],"unshare-stat-error")) {
+            unshare_error=EOPNOTSUPP; filesystem_error=error=EIO;
+        } else if(!strcmp(argv[1],"unshare-fresh")) {
+            unshare_error=EOPNOTSUPP; filesystem_type=BTRFS_SUPER_MAGIC; assert(!ftruncate(fd,0));
+        } else abort();
+        assert(minyar_files_preallocate(fd,8192)==-error);
+        if(error) assert(minyar_files_size(fd)==4096 && !allocation_calls);
+        else assert(minyar_files_size(fd)==8192 && allocation_calls==1);
+        if(!strcmp(argv[1],"unshare-fresh")) assert(!unshare_calls);
+        else assert(unshare_calls==1 && unshare_length==4096);
+        assert(lseek(fd,0,SEEK_CUR)==4096);
+        if(strcmp(argv[1],"unshare-fresh")) {
+            MinyarBytes *b=minyar_files_readAt(fd,0,4096); assert(b->byte_length==4096);
+            for(long long i=0;i<b->byte_length;i++) assert(b->bytes[i]==123); minyar_rc_release(b);
+        }
+#endif
     } else if (!strcmp(argv[1],"sparse-tail") || !strcmp(argv[1],"sparse-middle")) {
         const off_t size=1048576, tail=size-65536;
         const off_t filled=!strcmp(argv[1],"sparse-middle") ? 65536 : 0;

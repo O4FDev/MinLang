@@ -17,6 +17,7 @@ CASES = {
                       'sync-error', 'allocate-error', 'zero-write', 'capacity', 'cross-kind',
                       'sparse-tail', 'sparse-middle', 'fresh-preallocate', 'fresh-prepare',
                       'dense-extension', 'truncate-error', 'prefix-write-error',
+                      'clone-prefix',
                       *[f'setup-fd-{i}' for i in range(1, 11)],
                       'setup-pair', 'setup-mutex', 'setup-condition', 'setup-create'],
 }
@@ -45,14 +46,21 @@ def main():
     cases = {key: list(value) for key, value in CASES.items()}
     if platform.system() == 'Linux':
         cases['files-ranges'].append('procfs')
+        cases['files-prepare'] += ['unshare-supported', 'unshare-error', 'unshare-unsupported',
+                                  'unshare-stat-error', 'unshare-fresh']
+    if platform.system() == 'Darwin':
+        cases['files-prepare'] += ['sharing-query-error', 'sharing-query-missing']
     clang = os.environ.get('MINYAR_TEST_CLANG', os.environ.get('MINYAR_CLANG', 'clang'))
     environment = dict(os.environ, ASAN_OPTIONS=asan_leak_options()+':halt_on_error=1',
                        UBSAN_OPTIONS='halt_on_error=1')
     configurations = [['-O1', '-g', '-fsanitize=address,undefined', '-fno-omit-frame-pointer']] if options.sanitize else [
         ['-O0'], ['-O2']]
     checks = 0
-    with tempfile.TemporaryDirectory(prefix='minyar-files-focused-') as directory:
+    test_root = Path(os.environ.get('TMPDIR', ROOT/'build/files-tests')).resolve()
+    test_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='minyar-files-focused-', dir=test_root) as directory:
         directory = Path(directory)
+        environment['TMPDIR'] = str(directory)
         for fixture, selected in cases.items():
             for index, flags in enumerate(configurations):
                 exe = directory/(fixture+str(index)+('.exe' if windows else ''))
@@ -61,7 +69,9 @@ def main():
                     ROOT/'runtime/minyar_runtime.c', *(['-lws2_32'] if windows else ['-pthread']), '-o', exe])
                 run(command, environment)
                 for case in selected:
-                    run([exe, case], environment, timeout=10)
+                    result = run([exe, case], environment, timeout=10)
+                    if result.stdout:
+                        print(result.stdout.decode(errors='replace'), end='', flush=True)
                     checks += 1
                     print(f'{fixture} {flags[0]} {case}: passed', flush=True)
         if not options.native_only:

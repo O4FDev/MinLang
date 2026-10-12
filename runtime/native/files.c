@@ -28,6 +28,14 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__APPLE__) && defined(F_PREALLOCATE)
+#include <sys/attr.h>
+#endif
+#ifdef __linux__
+#include <linux/falloc.h>
+#include <linux/magic.h>
+#include <sys/vfs.h>
+#endif
 
 static int files_last_error; /* negative errno of the last Bytes-returning call, 0 on success */
 
@@ -260,6 +268,21 @@ long long minyar_files_preallocate(long long fd, long long length) {
      * Check the requested existing prefix by extent, rather than counting blocks anywhere in the file.
      * F_LOG2PHYS_EXT takes an explicit position and leaves the shared descriptor offset unchanged. */
     long long existing = length < st.st_size ? length : st.st_size;
+    if (existing > 0) {
+        /* A physical mapping does not establish private writable storage: APFS clones share extents.
+         * Require the sharing-status attribute to be explicitly returned; missing metadata is unknown. */
+        struct attrlist attributes = {0};
+        attributes.bitmapcount = ATTR_BIT_MAP_COUNT;
+        attributes.commonattr = ATTR_CMN_RETURNED_ATTRS;
+        attributes.forkattr = ATTR_CMNEXT_EXT_FLAGS;
+        struct { uint32_t length; attribute_set_t returned; uint64_t flags; } sharing = {0};
+        do { rc = fgetattrlist((int)fd, &attributes, &sharing, sizeof(sharing), FSOPT_ATTR_CMN_EXTENDED); }
+        while (rc != 0 && errno == EINTR);
+        if (rc != 0) return -errno;
+        if (sharing.length != sizeof(sharing) || !(sharing.returned.forkattr & ATTR_CMNEXT_EXT_FLAGS))
+            return -ENOTSUP;
+        if (sharing.flags & (EF_MAY_SHARE_BLOCKS | EF_SHARES_ALL_BLOCKS)) return -ENOTSUP;
+    }
     long long at = 0;
     bool flushed = false;
     while (at < existing) {
@@ -294,6 +317,22 @@ long long minyar_files_preallocate(long long fd, long long length) {
     if (rc != 0) return -errno;
     return minyar_files_truncate(fd, length);
 #elif defined(__linux__)
+    /* Reserve private storage for existing CoW data before extending the file. Ordinary allocation alone
+     * does not unshare reflink extents. Unsupported unsharing is safe to omit only on a known non-CoW backend. */
+    long long existing = length < st.st_size ? length : st.st_size;
+    if (existing > 0) {
+        do { rc = fallocate((int)fd, FALLOC_FL_UNSHARE_RANGE | FALLOC_FL_KEEP_SIZE, 0, (off_t)existing); }
+        while (rc != 0 && errno == EINTR);
+        if (rc != 0) {
+            int error = errno;
+            if (error != EOPNOTSUPP) return -error;
+            struct statfs filesystem;
+            if (fstatfs((int)fd, &filesystem) != 0) return -errno;
+            /* ext2/3/4 share this type and do not implement reflink/remap operations. Unknown/Cow-capable
+             * filesystems without UNSHARE support cannot establish this guarantee through mappings. */
+            if (filesystem.f_type != EXT4_SUPER_MAGIC) return -ENOTSUP;
+        }
+    }
     /* Use the kernel operation: libc's fallback can overwrite concurrent writes while filling holes. */
     do { rc = fallocate((int)fd, 0, 0, (off_t)length); } while (rc != 0 && errno == EINTR);
     return rc == 0 ? 0 : -errno;
