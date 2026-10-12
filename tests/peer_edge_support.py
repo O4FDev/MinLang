@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import program_cache
 import queue
 import shutil
 import socket
@@ -16,6 +17,7 @@ def load(name,file):
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
 admission=load('edge_admission','peer-edge.py')
 auth=load('edge_signing','peer-auth.py')
+DEVICE=None
 def environment(sanitize=False):
     env=dict(os.environ,MINYAR_CLANG=os.environ.get('MINYAR_TEST_CLANG','clang'),GOMAXPROCS='1',GOFLAGS='-p=1')
     if sanitize:
@@ -28,6 +30,7 @@ def rss(pid):
     return int(next(line.split()[1] for line in text.splitlines() if line.startswith('VmRSS:')))
 class Lab:
     def __init__(self,directory,binary=None,sanitize=False,duration=20000,maximum=128,sanitizer_quarantine=None,pki=False,server_intermediate=True):
+        global DEVICE
         self.directory=Path(directory);self.directory.mkdir(parents=True,exist_ok=True)
         self.env=environment(sanitize)
         if sanitize and sanitizer_quarantine is not None:
@@ -39,9 +42,13 @@ class Lab:
         self.edge=None;self.redis=None;self.client=None
         self.binary=Path(binary) if binary else self.directory/'edge'
         if not binary:
-            subprocess.run([str(ROOT/'minyar'),str(ROOT/'examples/peer-edge.min'),'-o',str(self.binary)],env=self.env,check=True,timeout=240)
+            program_cache.build(ROOT/'examples/peer-edge.min',self.binary,self.env,lambda path:subprocess.run([str(ROOT/'minyar'),str(ROOT/'examples/peer-edge.min'),'-o',str(path)],env=self.env,check=True,timeout=240))
         self.device=self.directory/'device'
-        subprocess.run(['go','build','-trimpath','-o',str(self.device),'.'],cwd=ROOT/'tests/interop/peeredge',env=self.env,check=True,timeout=120)
+        # The Go device ignores Minyar build flags; one build serves every lab in a process.
+        if DEVICE is None or not DEVICE.is_file():
+            subprocess.run(['go','build','-trimpath','-o',str(self.device),'.'],cwd=ROOT/'tests/interop/peeredge',env=self.env,check=True,timeout=120)
+            DEVICE=self.device
+        else:shutil.copy2(DEVICE,self.device)
         self.certs=admission.fixtures.Certificates(self.directory)
         self.certs.root('ca')
         if pki:
