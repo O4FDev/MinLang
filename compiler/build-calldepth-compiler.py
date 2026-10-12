@@ -47,8 +47,8 @@ def adapt(source, *, unwind_hook=None):
         '    let references = false\n',
         '    let constructionOwner = keepReference(output, state, value, 100001)\n'
         '    let references = false\n'),
-        '    setType(resultType, 100000 + elementType)\n',
-        '    setType(resultType, 100000 + elementType)\n'
+        '    setType(resultType, makeListType(elementType))\n',
+        '    setType(resultType, makeListType(elementType))\n'
         '    markOwner(resultType, constructionOwner)\n'))
     source = edit(source, 'parseCall', lambda s: replace(s,
         '                                    setType(resultType, returnType)\n',
@@ -89,8 +89,15 @@ def adapt(source, *, unwind_hook=None):
         '            finishFunctionEntry(output, entrySlot, state[4], parameterNames.length, state[8], state[6] == 1, emittedReturn' + hook_arguments + ')\n'
         '        }')
     source = replace(source,
-        'finishFunctionEntry(output, entrySlot, state[4], 0, state[8], state[6] == 1)',
-        'finishFunctionEntry(output, entrySlot, state[4], 0, state[8], state[6] == 1, "i32"' + hook_arguments + ')')
+        '    finishFunctionEntry(output, entrySlot, state[4], 0, state[8], state[6] == 1)\n    output.add("}\\n\\n")\n}\n',
+        '    finishFunctionEntry(output, entrySlot, state[4], 0, state[8], state[6] == 1, "i32"' + hook_arguments + ')\n    output.add("}\\n\\n")\n}\n')
+    # Module constant loaders own a frame only on their initialization path.
+    # The recovery declarations below already declare minyar_rc_release.
+    source = edit(source, 'compileModuleConstants', lambda s: replace(replace(replace(s,
+        '    output.add("declare void @minyar_rc_release(ptr)\\n")\n', ''),
+        '            textState.add("initialize")\n', '            textState.add("recovery.body")\n'),
+        '            finishFunctionEntry(output, entrySlot, state[4], 0, state[8], state[6] == 1)\n',
+        '            finishFunctionEntry(output, entrySlot, state[4], 0, state[8], state[6] == 1, llvmType(type)' + hook_arguments + ')\n'))
     source = replace(source,
         'finishFunctionEntry(output, entry, state[4], parameters.length, state[8], state[6] == 1)',
         'finishFunctionEntry(output, entry, state[4], parameters.length, state[8], state[6] == 1, llvmType(result)' + hook_arguments + ')\n'
@@ -141,9 +148,11 @@ def adapt(source, *, unwind_hook=None):
         '    if (library == "machine" || library == "machine_arm64") && readableDeclarationName(name) == "callEntry" {\n'
         '        fail("machine.callEntry is unavailable in recoverable call-depth programs; use a typed language callback")\n    }\n'
         '    if library == "machine" || library == "machine_arm64" {\n'))
+    # Only the external native call can reenter language callbacks; the
+    # integer_overflow intrinsic returns earlier without calling out.
     source = edit(source, 'compileNative', lambda s: replace(s,
-        '    output.add("  call void @minyar_rc_leave()\\n")\n',
-        '    recoveryNativeCheckpoint(output, textState, state, returnType)\n'
+        '    }\n    output.add("  call void @minyar_rc_leave()\\n")\n',
+        '    }\n    recoveryNativeCheckpoint(output, textState, state, returnType)\n'
         '    output.add("  call void @minyar_rc_leave()\\n")\n'))
     source = edit(source, 'compileClosureBodies', lambda s: replace(replace(replace(s,
         '        output.add("declare i64 @minyar_callback_domain()\\n")\n', ''),
