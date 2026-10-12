@@ -165,10 +165,22 @@ static long long rc_thread_join_try(RcManagedThread *t, long long *output) {
     rc_thread_control_release(t);
     return 0;
 }
+static void rc_thread_untrack_joined(RcManagedThread *thread) {
+    /* Only the creator's TLS registry can contain this control. A foreign
+     * joiner has its own list and never reads/writes the creator's links. */
+    RcManagedThread **link = &rc_thread_children;
+    while (*link && *link != thread) link = &(*link)->parent_next;
+    if (*link) {
+        *link = thread->parent_next;
+        thread->parent_next = NULL;
+        rc_thread_control_release(thread);
+    }
+}
 long long minyar_thread_join(const RcThreadLeaf *thread) {
     long long result;
     if (rc_thread_join_try(thread->control, &result))
         minyar_stop("this thread could not be joined.");
+    rc_thread_untrack_joined(thread->control);
     return result;
 }
 void minyar_thread_join_children(void) {
@@ -186,7 +198,9 @@ long long minyar_thread_try_spawn(RcThreadBridge bridge, long long seed,
     return rc_thread_spawn_try(bridge, seed, frozen, channel, output);
 }
 long long minyar_thread_try_join(const RcThreadLeaf *thread, long long *output) {
-    return rc_thread_join_try(thread->control, output);
+    long long status = rc_thread_join_try(thread->control, output);
+    if (!status) rc_thread_untrack_joined(thread->control);
+    return status;
 }
 void *minyar_thread_spawn_result(RcThreadBridge bridge, long long seed,
         const RcThreadLeaf *frozen, const RcThreadLeaf *channel) {

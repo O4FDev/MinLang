@@ -491,6 +491,24 @@ static void multiple_joiners(void) {
     minyar_rc_release(c); minyar_rc_release(f); minyar_rc_release(b);
     assert_native_empty();
 }
+static void repeated_completed_controls(void) {
+    MinyarBytes *b = minyar_bytes_new(0);
+    RcThreadLeaf *f = minyar_frozen_bytes_copy(b);
+    RcThreadLeaf *c = minyar_bytes_channel_new(0, 1);
+    size_t baseline = atomic_load(&rc_thread_native_bytes);
+    for (long long i = 0; i < 64; i++) {
+        RcThreadLeaf *thread = minyar_thread_spawn(no_work, i, f, c);
+        assert(minyar_thread_join(thread) == i);
+        minyar_rc_release(thread);
+        rc_thread_domain_drain();
+        /* Completed, explicitly joined controls must not accumulate until
+         * the creator exits, including when all public handles were dropped. */
+        assert(!rc_thread_children);
+        assert(atomic_load(&rc_thread_native_bytes) == baseline);
+    }
+    minyar_rc_release(c); minyar_rc_release(f); minyar_rc_release(b);
+    assert_native_empty();
+}
 static void fatal_case(const char *name) {
     if (!strcmp(name, "allocation")) {
         rc_thread_test_fail_allocation_after = 0;
@@ -532,6 +550,7 @@ int main(int count, char **arguments) {
     queued_creator_exit();
     closure_waiters();
     multiple_joiners();
+    repeated_completed_controls();
     rc_thread_domain_dispose();
     assert(rc_object_count == 0 && rc_bytes == 0);
 #ifdef MINYAR_BOUNDED_RC

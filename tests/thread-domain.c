@@ -20,6 +20,14 @@ static void exercise(void) {
     MinyarText *literal = minyar_thread_text_literal(&(MinyarText){
         .bytes = (const unsigned char *)"λ🐈", .byte_length = 6});
     assert(minyar_text_length(literal) == 2);
+    MinyarText *fresh = minyar_thread_text_literal(literal);
+    MinyarText *suffix = minyar_thread_text_literal(literal);
+    assert(minyar_text_length(fresh) == 2);
+    MinyarText *grown = minyar_join_text_take_left(fresh, suffix);
+    assert(minyar_text_length(grown) == 4);
+    assert(minyar_text_character_at(grown, 2) == 0x3bb);
+    minyar_rc_release(suffix);
+    minyar_rc_release(grown);
     minyar_rc_local_take(1, literal);
     MinyarText *integer = minyar_integer_text(7);
     minyar_rc_release(integer);
