@@ -11,6 +11,19 @@ class MapCallbacks(CompilerTestCase):
     compile = callbacks.Callbacks.compile
     executes = callbacks.Callbacks.executes
 
+    def test_imported_callback_map_argument_preserves_following_record_type(self):
+        (self.directory / 'factory.min').write_text('''public record Box { value: Integer }
+public function make(): Callback<Map<Integer, Integer>, Box> {
+    return function(row: Map<Integer, Integer>): Box { return Box { value: row[1] } }
+}
+''')
+        self.executes('''use "./factory.min" as factory
+let row = Map<Integer, Integer>()
+row[1] = 42
+let call = factory.make()
+print(call(row).value)
+''', '42\n')
+
     def test_owned_callback_survives_map_clear(self):
         self.executes('''let m = Map<Integer, Callback<Integer, Integer>>()
 let offset = 40
@@ -74,6 +87,16 @@ match saved { Ok(v) { print(v[0]) } Err(e) { print(e) } }
 let r = Ok<Map<Integer, Text>, Text>(Map())
 match r { Ok(v) { v[9] = "result" + "!"; print(v[9]) } Err(e) { print(e) } }
 ''', '42\nresult!\n')
+
+    def test_imported_result_map_argument_preserves_following_record_type(self):
+        (self.directory / 'factory.min').write_text('''public record Box { value: Integer }
+public function make(): Result<Map<Integer, Integer>, Box> {
+    return Err<Map<Integer, Integer>, Box>(Box { value: 42 })
+}
+''')
+        self.executes('''use "./factory.min" as factory
+match factory.make() { Ok(row) { print(row.length) } Err(box) { print(box.value) } }
+''', '42\n')
 
 
 if __name__ == '__main__':

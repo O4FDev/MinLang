@@ -84,15 +84,16 @@ processes after the run.
   both compilers; also run the existing fixed-point and `tests/performance.py`
   resource ceilings. A tiny frozen-foundation throughput diagnostic is a
   separate measurement and cannot substitute for self-compilation.
-- Minyarcraft: use the actual `examples/craft/main.min --benchmark build` and
-  `--benchmark edit` owning application with working GLFW/OpenGL. The existing
+- Minyarcraft: build the actual `examples/craft/main.min` application, then run
+  its executable with `--benchmark build` and `--benchmark edit` using working
+  GLFW/OpenGL. The existing
   `tests/native-research-craft.min` plus GL mock is useful supplemental evidence
   and is explicitly a headless fixture.
 - JSON: use identical `benchmarks/json/history-parse.min`, generated history
   inputs (500 and 5,000 saved runs) and existing JSON benchmark workloads;
   archive independently checked output/checksums and raw paired samples.
 - neo-db: immutable owning `tests/sql/bench.min` with `src/sql/parser.min`,
-  100,000 iterations of each existing statement case. Copy inputs read-only
+  its unchanged 100,000-iteration default (TPC-H Q1 uses `n / 10`). Copy inputs read-only
   to own Boat; record the owning source manifest and preserve all cases.
 
 ## Platform route

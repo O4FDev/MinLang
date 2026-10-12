@@ -24,8 +24,8 @@ supported, including nested Lists, Maps, records, callbacks, and Results.
 - `m.length` returns Integer. `m.clear()` removes all entries.
 
 Aliases share the same dictionary. Saved managed values remain alive after
-replacement, removal, or clear. Maps compare by identity. There is no key
-iteration/order API in this implementation.
+replacement, removal, or clear. Map equality expressions are unsupported.
+There is no key iteration/order API in this implementation.
 
 The runtime uses an ordinary fixed record owning three bucket Lists, with
 open addressing, a 75% growth threshold, and backshift deletion. Existing
