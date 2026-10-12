@@ -52,6 +52,24 @@ Integers also support bitwise `&`, `|`, `^`, `~` and the shifts `<<` and `>>`
 random number generators, `wrappingAdd`, `wrappingSubtract` and
 `wrappingMultiply` wrap around instead of stopping on overflow.
 
+For recoverable signed Integer overflow, import `errors` and use
+`errors.checkedAdd(left, right)`, `errors.checkedSubtract(left, right)` or
+`errors.checkedMultiply(left, right)`. Each returns `errors.IntegerResult`.
+Check `errors.integerOk(result)` before reading `errors.integerValue(result)`;
+reading a failed result still stops the program. Overflow carries
+`errors.overflowCode()` (13), native code 0, and an operation-specific message.
+
+```minyar
+use "errors" as errors
+let result = errors.checkedMultiply(9223372036854775807, 10)
+if errors.integerOk(result) {
+    print(errors.integerValue(result))
+} else {
+    print(errors.message(errors.integerError(result)))
+}
+print("still alive")
+```
+
 Operators bind in this order, tightest first: `*`, `/`, `%`, `<<`, `>>`, `&`;
 then `+`, `-`, `|`, `^`; then `<`, `>`, `<=`, `>=`; then `==`, `!=`; then `&&`
 and finally `||`. So `value & 1 == 0` tests the lowest bit.
