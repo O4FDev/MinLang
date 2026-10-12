@@ -26,14 +26,36 @@ check-calldepth-sanitize: build/minyarc-calldepth
 
 # Linux evidence gate: native/LTO, fake-stack ASan/UBSan, exact RC/debt,
 # 256KiB native stacks, heap policies and all bounded poll budgets.
-check-calldepth-profiles: build/minyarc-calldepth
-	@set -e; for profile in system fixed lazy eager; do \
-	    for budget in 1 32 1024; do \
-	        if test "$$profile" = eager && test "$$budget" != 32; then continue; fi; \
-	        MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/calldepth.py --profile $$profile --budget $$budget --lto --small-stack --large-dispatch --evidence build/calldepth-$$profile-k$$budget-evidence; \
-	        MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/calldepth.py --profile $$profile --budget $$budget --sanitize --small-stack --evidence build/calldepth-$$profile-k$$budget-sanitize-evidence; \
-	    done; \
-	done
+# Each profile/budget/flavour is its own check. The Minyar IR depends only on
+# the budget, so it is compiled once per budget; heap profile, optimisation
+# mode and sanitizer flags all apply when the cached IR is linked. The C
+# fixtures and dispatch control take no profile or budget, so they run once.
+CALLDEPTH_PROFILES = system-k1 system-k32 system-k1024 fixed-k1 fixed-k32 fixed-k1024 lazy-k1 lazy-k32 lazy-k1024 eager-k32
+CALLDEPTH_PROFILE_CHECKS = check-calldepth-profile-fixtures check-calldepth-profile-fixtures-sanitize \
+    $(foreach combination,$(CALLDEPTH_PROFILES),check-calldepth-profile-$(combination) check-calldepth-profile-$(combination)-sanitize)
+CALLDEPTH_IR_INPUTS = build/minyarc-calldepth tests/calldepth.py $(wildcard tests/calldepth/*.min) $(wildcard library/*.min)
+
+define calldepth_ir_rule
+build/calldepth-ir-k$(1)/manifest.json: $$(CALLDEPTH_IR_INPUTS)
+	$$(LIMITED) python3 tests/calldepth.py --budget $(1) --large-dispatch --emit-ir build/calldepth-ir-k$(1)
+endef
+$(foreach budget,1 32 1024,$(eval $(call calldepth_ir_rule,$(budget))))
+
+define calldepth_profile_rule
+check-calldepth-profile-$(1)-k$(2): build/minyarc-calldepth build/calldepth-ir-k$(2)/manifest.json
+	MINYAR_TEST_CLANG="$$(LLVM_CC)" $$(LIMITED) python3 tests/calldepth.py --profile $(1) --budget $(2) --lto --small-stack --large-dispatch --fixtures skip --ir-cache build/calldepth-ir-k$(2) --evidence build/calldepth-$(1)-k$(2)-evidence
+check-calldepth-profile-$(1)-k$(2)-sanitize: build/minyarc-calldepth build/calldepth-ir-k$(2)/manifest.json
+	MINYAR_TEST_CLANG="$$(LLVM_CC)" $$(SANITIZER_LIMITED) python3 tests/calldepth.py --profile $(1) --budget $(2) --sanitize --small-stack --fixtures skip --ir-cache build/calldepth-ir-k$(2) --evidence build/calldepth-$(1)-k$(2)-sanitize-evidence
+endef
+$(foreach combination,$(CALLDEPTH_PROFILES),$(eval $(call calldepth_profile_rule,$(firstword $(subst -k, ,$(combination))),$(lastword $(subst -k, ,$(combination))))))
+
+check-calldepth-profile-fixtures: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/calldepth.py --fixtures only --large-dispatch --evidence build/calldepth-profile-fixtures-evidence
+check-calldepth-profile-fixtures-sanitize:
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/calldepth.py --fixtures only --sanitize --evidence build/calldepth-profile-fixtures-sanitize-evidence
+
+.PHONY: $(CALLDEPTH_PROFILE_CHECKS)
+check-calldepth-profiles: $(CALLDEPTH_PROFILE_CHECKS)
 
 check-calldepth-launcher: build/minyarc-calldepth build/minyarc-errors-request build/minyarc-errors build/minyarc-callbacks build/minyarc-modules build/minyar-module-build $(MANAGED_GRAPH_LAUNCHER_ARTIFACTS)
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/calldepth-launcher.py
