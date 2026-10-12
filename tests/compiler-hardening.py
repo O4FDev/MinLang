@@ -14,6 +14,28 @@ from llvm_sanitizer import prepare_llvm_for_link
 
 
 class CompilerHardening(CompilerTestCase):
+    def test_public_parallel_declarations_preserve_scalar_and_managed_contracts(self):
+        self.executes('public parallel function square(value: Integer): Integer { return value * value }\n'
+                      'print(square(6))\n', '36\n')
+        self.rejects('public parallel function bad(value: Text): Integer { return 1 }\n',
+                     "parallel function 'bad' may use only Integer, Float, Boolean and Character values")
+
+    def test_typed_bytes_methods_require_both_known_verb_and_width(self):
+        self.executes('let values = Bytes(0)\nvalues.addInt32(7)\n'
+                      'print(values.getInt32(0))\nvalues.setInt32(0, 9)\n'
+                      'print(values.getInt32(0))\n', '7\n9\n')
+        for name, arguments in (('popInt32', ''), ('popFloat64', ''),
+                                ('getBogus', '0'), ('addBogus', '7'), ('setBogus', '0, 7')):
+            with self.subTest(method=name):
+                self.rejects(f'let values = Bytes(8)\nvalues.{name}({arguments})\n',
+                             "Bytes has no method named '" + name + "'")
+
+    def test_print_and_text_builtin_names_cannot_be_redeclared(self):
+        for name in ('print', 'Text'):
+            with self.subTest(name=name):
+                self.rejects(f'function {name}(): Integer {{ return 7 }}\n',
+                             "'" + name + "' is a built-in function; choose another name")
+
     def test_executable_entry_is_not_an_ordinary_callable_function(self):
         for source in ('function main(): Integer { return main() }\n',
                        'function main(): Integer { return 0 }\n'
