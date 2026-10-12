@@ -1,0 +1,42 @@
+// Shared-loop observer for FIN plus response backpressure (R1 regression).
+use "httpserver" as http
+use "eventloop" as loop
+use "errors" as errors
+use "net" as net
+
+function main(): Integer {
+    let limits = http.defaults()
+    limits.maxConnections = 4
+    limits.writeMilliseconds = 500
+    let server = http.listen("127.0.0.1", 0, limits)
+    if !http.ok(server) { fail(errors.message(http.serverError(server))) }
+    let timer = loop.timer(http.loopHandle(server), 20, 20, -99)
+    if !errors.integerOk(timer) { fail("external timer") }
+    let body = Bytes(4194304)
+    let waits = 0
+    let closedOnly = 0
+    let ticks = 0
+    print(http.port(server))
+    let start = net.monotonicMilliseconds()
+    while net.monotonicMilliseconds() - start < 700 {
+        let batch = loop.wait(http.loopHandle(server), http.waitMilliseconds(server, 20), 16)
+        waits += 1
+        for event in loop.events(batch) {
+            if event.token >= 0 && loop.isClosed(event) && !loop.isWritable(event) { closedOnly += 1 }
+            if event.token == -99 && loop.isTimer(event) { ticks += 1 }
+        }
+        let ready = http.advance(server, batch)
+        if errors.isError(http.batchError(ready)) { fail(errors.message(http.batchError(ready))) }
+        for request in http.requests(ready) {
+            let responseBody = body
+            if request.target == "/small" { responseBody = Bytes("ok") }
+            if !http.respond(server, request, http.response(200, "application/octet-stream", responseBody)) { fail("respond") }
+        }
+    }
+    print(Text(waits) + ":" + Text(closedOnly) + ":" + Text(ticks) + ":" + Text(http.connectionCount(server)))
+    if !errors.booleanOk(loop.remove(http.loopHandle(server), errors.integerValue(timer))) { fail("timer cleanup") }
+    http.close(server)
+    if http.connectionCount(server) != 0 { fail("connection cleanup") }
+    if !errors.isError(loop.batchError(loop.wait(http.loopHandle(server), 0, 1))) { fail("loop cleanup") }
+    return 0
+}

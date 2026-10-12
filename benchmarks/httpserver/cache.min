@@ -1,0 +1,166 @@
+// Exact index LRU adapted from the read-only brief-serving front_ev.min.
+// Fixture-only Lists/Bytes implementation; no WS3 Map dependency.
+public record Cache {
+    buckets: List<Integer>
+    mask: Integer
+    keys: List<Text>
+    values: List<Bytes>
+    hashes: List<Integer>
+    chain: List<Integer>
+    prev: List<Integer>
+    next: List<Integer>
+    freeHead: Integer
+    head: Integer
+    tail: Integer
+    count: Integer
+    bytes: Integer
+    maxEntries: Integer
+    maxBytes: Integer
+    hits: Integer
+    misses: Integer
+    evictions: Integer
+}
+
+public function newCache(maxEntries: Integer, maxBytes: Integer): Cache {
+    let size = 16
+    while size < maxEntries * 2 { size = size * 2 }
+    let buckets: List<Integer> = []
+    for i in 0..size { buckets.add(-1) }
+    return Cache { buckets: buckets; mask: size - 1; keys: []; values: []; hashes: []; chain: []; prev: []; next: []; freeHead: -1; head: -1; tail: -1; count: 0; bytes: 0; maxEntries: maxEntries; maxBytes: maxBytes; hits: 0; misses: 0; evictions: 0 }
+}
+
+function hashText(key: Text): Integer {
+    // FNV-1a, 64-bit.
+    let h = -3750763034362895579
+    for b in Bytes(key) {
+        h = wrappingMultiply(h ^ b, 1099511628211)
+    }
+    return h
+}
+
+function find(cache: Cache, key: Text, h: Integer): Integer {
+    let slot = cache.buckets[h & cache.mask]
+    while slot >= 0 {
+        if cache.hashes[slot] == h && cache.keys[slot] == key { return slot }
+        slot = cache.chain[slot]
+    }
+    return -1
+}
+
+function unlinkLru(cache: Cache, slot: Integer) {
+    let p = cache.prev[slot]
+    let n = cache.next[slot]
+    if p >= 0 { cache.next[p] = n } else { cache.head = n }
+    if n >= 0 { cache.prev[n] = p } else { cache.tail = p }
+    cache.prev[slot] = -1
+    cache.next[slot] = -1
+}
+
+function pushFront(cache: Cache, slot: Integer) {
+    cache.prev[slot] = -1
+    cache.next[slot] = cache.head
+    if cache.head >= 0 { cache.prev[cache.head] = slot }
+    cache.head = slot
+    if cache.tail < 0 { cache.tail = slot }
+}
+
+public function lookup(cache: Cache, key: Text): Integer {
+    let slot = find(cache, key, hashText(key))
+    if slot >= 0 && cache.head != slot {
+        unlinkLru(cache, slot)
+        pushFront(cache, slot)
+    }
+    return slot
+}
+
+function evict(cache: Cache, slot: Integer) {
+    let b = cache.hashes[slot] & cache.mask
+    if cache.buckets[b] == slot {
+        cache.buckets[b] = cache.chain[slot]
+    } else {
+        let at = cache.buckets[b]
+        while cache.chain[at] != slot { at = cache.chain[at] }
+        cache.chain[at] = cache.chain[slot]
+    }
+    unlinkLru(cache, slot)
+    cache.bytes -= cache.values[slot].length + cache.keys[slot].byteLength
+    cache.keys[slot] = ""
+    cache.values[slot] = Bytes()
+    cache.chain[slot] = cache.freeHead
+    cache.freeHead = slot
+    cache.count -= 1
+    cache.evictions += 1
+}
+
+public function insert(cache: Cache, key: Text, value: Bytes) {
+    let h = hashText(key)
+    let size = value.length + key.byteLength
+    if size > cache.maxBytes { return }
+    let existing = find(cache, key, h)
+    if existing >= 0 { evict(cache, existing) }
+    while cache.count >= cache.maxEntries || cache.bytes + size > cache.maxBytes {
+        evict(cache, cache.tail)
+    }
+    let slot = -1
+    if cache.freeHead >= 0 {
+        slot = cache.freeHead
+        cache.freeHead = cache.chain[slot]
+    } else {
+        slot = cache.keys.length
+        cache.keys.add("")
+        cache.values.add(Bytes())
+        cache.hashes.add(0)
+        cache.chain.add(-1)
+        cache.prev.add(-1)
+        cache.next.add(-1)
+    }
+    cache.keys[slot] = key
+    cache.values[slot] = value
+    cache.hashes[slot] = h
+    let b = h & cache.mask
+    cache.chain[slot] = cache.buckets[b]
+    cache.buckets[b] = slot
+    pushFront(cache, slot)
+    cache.count += 1
+    cache.bytes += size
+}
+
+function indexOf(data: Bytes, byte: Integer, from: Integer, to: Integer): Integer {
+    let i = from
+    while i < to {
+        if data[i] == byte { return i }
+        i += 1
+    }
+    return -1
+}
+
+// Raw value of parameter `name` in the query part of target [from, to); "" if absent.
+function param(t: Bytes, from: Integer, name: Bytes): Text {
+    let i = from
+    while i < t.length {
+        let amp = indexOf(t, 38, i, t.length)
+        let end = t.length
+        if amp >= 0 { end = amp }
+        let eq = indexOf(t, 61, i, end)
+        if eq >= 0 && eq - i == name.length {
+            let same = true
+            for j in 0..name.length { if t[i + j] != name[j] { same = false } }
+            if same { return Text(t.slice(eq + 1, end)) }
+        }
+        i = end + 1
+    }
+    return ""
+}
+
+
+public function key(target: Text): Text {
+    let bytes = Bytes(target)
+    let question = indexOf(bytes, 63, 0, bytes.length)
+    if question < 0 { return Text(Bytes(1)) }
+    // Construct the delimiter as an octet: this baseline does not implement
+    // brace Unicode escapes in Text literals (the reference's escape is four bytes).
+    let result = Bytes(param(bytes, question + 1, Bytes("k")))
+    result.add(0)
+    result.addBytes(Bytes(param(bytes, question + 1, Bytes("q"))))
+    return Text(result)
+}

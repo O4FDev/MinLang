@@ -1,0 +1,61 @@
+use "httpserver" as http
+use "errors" as errors
+use "eventloop" as loop
+
+function main(): Integer {
+    let limits = http.defaults()
+    limits.maxConnections = 4
+    limits.maxHeaderBytes = 1024
+    limits.maxBodyBytes = 65537
+    limits.maxResponseBytes = 4194304
+    limits.idleMilliseconds = 400
+    limits.headerMilliseconds = 200
+    limits.bodyMilliseconds = 200
+    limits.applicationMilliseconds = 200
+    limits.writeMilliseconds = 400
+    let server = http.listen("127.0.0.1", 0, limits)
+    if !http.ok(server) { fail(errors.message(http.serverError(server))) }
+    limits.maxBodyBytes = 1
+    let largeBody = Bytes(3145728)
+    print(http.port(server))
+    let running = true
+    let previous: List<http.Request> = []
+    while running {
+        let batch = http.poll(server, 1000)
+        if errors.isError(http.batchError(batch)) { fail(errors.message(http.batchError(batch))) }
+        for request in http.requests(batch) {
+            let response = http.response(200, "application/octet-stream", request.body)
+            if request.target == "/quit" { running = false }
+            if request.target == "/stats" {
+                response.body = Bytes(Text(http.connectionCount(server)) + ":" + Text(http.slotCount(server)))
+            }
+            if request.target == "/echo-target" { response.body = Bytes(request.target) }
+            if request.target == "/large" { response.body = largeBody }
+            if request.target == "/head" { response.body = Bytes("hello") }
+            if request.target == "/204" { response.status = 204; response.body = Bytes("forbidden") }
+            if request.target == "/205" { response.status = 205; response.body = Bytes("forbidden") }
+            if request.target == "/304" { response.status = 304; response.body = Bytes("hello") }
+            if request.target == "/injection" {
+                response.headers.add(http.Header { name: "x-test"; value: "good\r\nx-bad: evil" })
+                if http.respond(server, request, response) { fail("response injection accepted") }
+                response = http.response(200, "text/plain", Bytes("rejected"))
+            }
+            if request.target == "/stale" {
+                for old in previous {
+                    if http.respond(server, old, response) { fail("stale ticket accepted") }
+                }
+                response.body = Bytes("safe")
+            }
+            if request.target != "/wait" {
+                if !http.respond(server, request, response) { fail("response rejected") }
+                if http.respond(server, request, response) { fail("duplicate response accepted") }
+                previous = [request]
+            }
+        }
+    }
+    http.close(server)
+    http.close(server)
+    if http.connectionCount(server) != 0 { fail("close leaked connections") }
+    if !errors.isError(loop.batchError(loop.wait(http.loopHandle(server), 0, 1))) { fail("close leaked loop") }
+    return 0
+}
