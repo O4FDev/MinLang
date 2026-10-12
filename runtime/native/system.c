@@ -15,6 +15,9 @@
 #include <mach/mach.h>
 #endif
 #include "../minyar_native.h"
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <errno.h>
 #include <limits.h>
 #include <stdint.h>
@@ -217,6 +220,14 @@ long long minyar_system_writeStandardError(const MinyarText *text) {
 }
 
 /* Raise the soft open-file limit to the hard limit (servers holding many sockets). Returns the new soft limit. */
+long long minyar_system_releaseFreeMemory(void) {
+#if defined(__GLIBC__)
+    return malloc_trim(0) ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
 long long minyar_system_raiseOpenFileLimit(void) {
     struct rlimit r;
     if (getrlimit(RLIMIT_NOFILE, &r) != 0) return -errno;

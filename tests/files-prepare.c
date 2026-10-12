@@ -229,7 +229,7 @@ static void clone_prefix(void) {
     if(ioctl(clone,FICLONE,source)<0) {
         assert(errno==EOPNOTSUPP || errno==ENOTTY);
         struct statfs filesystem; assert(!fstatfs(source,&filesystem));
-        assert(filesystem.f_type==EXT4_SUPER_MAGIC);
+        assert(filesystem.f_type==EXT4_SUPER_MAGIC || filesystem.f_type==TMPFS_MAGIC);
         assert(lseek(source,123,SEEK_SET)==123);
         assert(!minyar_files_preallocate(source,sizeof(data)) && unshare_calls>0);
         assert(lseek(source,0,SEEK_CUR)==123); verify_content(source,42);
@@ -290,6 +290,8 @@ int main(int argc,char **argv) {
         else if(!strcmp(argv[1],"unshare-error")) unshare_error=error=ENOSPC;
         else if(!strcmp(argv[1],"unshare-unsupported")) {
             unshare_error=EOPNOTSUPP; filesystem_type=BTRFS_SUPER_MAGIC; error=ENOTSUP;
+        } else if(!strcmp(argv[1],"unshare-tmpfs")) {
+            unshare_error=EOPNOTSUPP; filesystem_type=TMPFS_MAGIC;
         } else if(!strcmp(argv[1],"unshare-stat-error")) {
             unshare_error=EOPNOTSUPP; filesystem_error=error=EIO;
         } else if(!strcmp(argv[1],"unshare-fresh")) {

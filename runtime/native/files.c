@@ -168,6 +168,37 @@ long long minyar_files_writeStandardOutput(const MinyarText *text) {
 }
 
 /* Read up to length bytes at position into fresh Bytes (shorter at end of file). */
+long long minyar_files_readAppend(long long fd, long long position, MinyarBytes *buffer, long long length) {
+    if (!files_valid_fd(fd)) { files_last_error = -EBADF; return -EBADF; }
+    if (!buffer || position < 0 || length < 0) { files_last_error = -EINVAL; return -EINVAL; }
+    if ((unsigned long long)length >= SIZE_MAX / 2 || position > LLONG_MAX - length ||
+        (long long)(off_t)(position + length) != position + length ||
+        buffer->byte_length > LLONG_MAX - length) {
+        files_last_error = -EOVERFLOW;
+        return -EOVERFLOW;
+    }
+    long long before = buffer->byte_length;
+    unsigned char *p = minyar_native_bytes_append(buffer, length);
+    long long done = 0;
+    while (done < length) {
+        size_t chunk = (size_t)(length - done);
+        if (chunk > (1u << 30)) chunk = 1u << 30;
+        ssize_t n = pread((int)fd, p + done, chunk, (off_t)(position + done));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            int e = -errno;
+            buffer->byte_length = before;
+            files_last_error = e;
+            return e;
+        }
+        if (n == 0) break;
+        done += n;
+    }
+    buffer->byte_length = before + done;
+    files_last_error = 0;
+    return done;
+}
+
 MinyarBytes *minyar_files_readAt(long long fd, long long position, long long length) {
     if (!files_valid_fd(fd)) return files_empty(-EBADF);
     if (position < 0 || length < 0) return files_empty(-EINVAL);
@@ -330,7 +361,7 @@ long long minyar_files_preallocate(long long fd, long long length) {
             if (fstatfs((int)fd, &filesystem) != 0) return -errno;
             /* ext2/3/4 share this type and do not implement reflink/remap operations. Unknown/Cow-capable
              * filesystems without UNSHARE support cannot establish this guarantee through mappings. */
-            if (filesystem.f_type != EXT4_SUPER_MAGIC) return -ENOTSUP;
+            if (filesystem.f_type != EXT4_SUPER_MAGIC && filesystem.f_type != TMPFS_MAGIC) return -ENOTSUP;
         }
     }
     /* Use the kernel operation: libc's fallback can overwrite concurrent writes while filling holes. */
@@ -356,6 +387,13 @@ long long minyar_files_remove(const MinyarText *path) {
     int rc = files_path(path, p);
     if (rc) return rc;
     return unlink(p) == 0 ? 0 : -errno;
+}
+
+long long minyar_files_removeDirectory(const MinyarText *path) {
+    char p[PATH_MAX];
+    int rc = files_path(path, p);
+    if (rc) return rc;
+    return rmdir(p) == 0 ? 0 : -errno;
 }
 
 long long minyar_files_makeDirectory(const MinyarText *path) {
@@ -420,7 +458,10 @@ MinyarBytes *minyar_files_listNames(const MinyarText *path) {
  * (covering everything below start, which the caller guarantees it already wrote), publishes start, and continues
  * with the new file. After a failed fdatasync nothing more is ever reported durable (the error is sticky). */
 
-enum { FILES_MAX_SYNCERS = 16, FILES_MAX_PENDING = 64 };
+#ifndef FILES_MAX_SYNCERS
+#define FILES_MAX_SYNCERS 4096
+#endif
+enum { FILES_MAX_PENDING = 64, FILES_SYNCER_STACK = 256 * 1024 };
 
 typedef struct {
     int fd;
@@ -445,13 +486,14 @@ typedef struct {
     int notify_read, notify_write;
 } FilesSyncer;
 
-static FilesSyncer files_syncers[FILES_MAX_SYNCERS];
+static FilesSyncer *files_syncers[FILES_MAX_SYNCERS];
+static uint64_t files_syncer_generations[FILES_MAX_SYNCERS];
 
 static FilesSyncer *files_syncer(long long handle) {
     if (handle <= 0 || !(handle & 1)) return NULL;
     uint64_t identity = (uint64_t)handle / 2;
-    FilesSyncer *s = &files_syncers[identity % FILES_MAX_SYNCERS];
-    return s->used && s->generation == identity / FILES_MAX_SYNCERS ? s : NULL;
+    FilesSyncer *s = files_syncers[identity % FILES_MAX_SYNCERS];
+    return s && s->used && s->generation == identity / FILES_MAX_SYNCERS ? s : NULL;
 }
 
 static void files_notify(FilesSyncer *s) {
@@ -508,7 +550,7 @@ long long minyar_files_syncerStart(long long fd) {
     if (!files_valid_fd(fd)) return -EBADF;
     int slot = -1;
     for (int i = 0; i < FILES_MAX_SYNCERS; i++)
-        if (!files_syncers[i].used && files_syncers[i].generation <
+        if (!files_syncers[i] && files_syncer_generations[i] <
             ((uint64_t)LLONG_MAX / 2 - FILES_MAX_SYNCERS) / FILES_MAX_SYNCERS) {
             slot = i;
             break;
@@ -517,13 +559,13 @@ long long minyar_files_syncerStart(long long fd) {
     /* A closed caller fd must not alias a notification socket allocated here. */
     int dupfd = fcntl((int)fd, F_DUPFD_CLOEXEC, 0);
     if (dupfd < 0) return -errno;
-    FilesSyncer *s = &files_syncers[slot];
-    uint64_t generation = s->generation;
-    memset(s, 0, sizeof(*s));
+    FilesSyncer *s = calloc(1, sizeof(*s));
+    if (!s) { close(dupfd); return -ENOMEM; }
+    uint64_t generation = files_syncer_generations[slot];
     s->generation = generation;
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
-        int error = errno; close(dupfd); return -error;
+        int error = errno; close(dupfd); free(s); return -error;
     }
     int error = files_cloexec_nonblock(sv[0], true);
     if (!error) error = files_cloexec_nonblock(sv[1], true);
@@ -539,9 +581,16 @@ long long minyar_files_syncerStart(long long fd) {
     if (error) goto fail_mutex;
     error = -pthread_cond_init(&s->done, NULL);
     if (error) goto fail_wake;
-    error = -pthread_create(&s->thread, NULL, files_syncer_main, s);
+    pthread_attr_t attr;
+    error = -pthread_attr_init(&attr);
+    if (error) goto fail_done;
+    error = -pthread_attr_setstacksize(&attr, FILES_SYNCER_STACK);
+    if (!error) error = -pthread_create(&s->thread, &attr, files_syncer_main, s);
+    pthread_attr_destroy(&attr);
     if (error) goto fail_done;
     s->generation = generation + 1;
+    files_syncer_generations[slot] = s->generation;
+    files_syncers[slot] = s;
     s->used = true;
     return ((long long)(s->generation * FILES_MAX_SYNCERS) + slot) * 2 + 1;
 fail_done:
@@ -554,6 +603,7 @@ fail_descriptors:
     close(dupfd);
     close(sv[0]);
     close(sv[1]);
+    free(s);
     return error;
 }
 
@@ -689,7 +739,8 @@ long long minyar_files_syncerStop(long long handle) {
     pthread_mutex_destroy(&s->mu);
     pthread_cond_destroy(&s->wake);
     pthread_cond_destroy(&s->done);
-    s->used = false;
+    files_syncers[((uint64_t)handle / 2) % FILES_MAX_SYNCERS] = NULL;
+    free(s);
     return err;
 }
 

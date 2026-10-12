@@ -91,6 +91,7 @@ static ssize_t intercepted_pread(int fd, void *data, size_t count, off_t positio
 #define fdatasync intercepted_datasync
 #define pwrite intercepted_pwrite
 #define pread intercepted_pread
+#define FILES_MAX_SYNCERS 32
 #include "../runtime/native/files.c"
 #undef pread
 #undef pwrite
@@ -130,7 +131,7 @@ static void setup(const char *kind, int failure) {
     if (!strcmp(kind, "create")) create_fail = 1;
     assert(minyar_files_syncerStart(fd) == (!strcmp(kind, "fd") ? -EACCES : -EAGAIN));
     assert(descriptors() == before && mutex_live == 0 && condition_live == 0);
-    for (int i = 0; i < FILES_MAX_SYNCERS; i++) assert(!files_syncers[i].used);
+    for (int i = 0; i < FILES_MAX_SYNCERS; i++) assert(!files_syncers[i]);
     valid_retry(fd); close(fd);
 }
 static void listing(int mode) {
@@ -190,12 +191,12 @@ static void stale(void) {
     assert(!minyar_files_syncerStop(b)); close(fd);
 }
 static void capacity(void) {
-    int fd = temporary(), before = descriptors(); long long prior[16] = {0};
+    int fd = temporary(), before = descriptors(); long long prior[FILES_MAX_SYNCERS] = {0};
     for (int round = 0; round < 2; round++) {
-        long long jobs[16];
-        for (int i = 0; i < 16; i++) { jobs[i] = minyar_files_syncerStart(fd); assert(jobs[i] > 0 && jobs[i] != prior[i]); }
+        long long jobs[FILES_MAX_SYNCERS];
+        for (int i = 0; i < FILES_MAX_SYNCERS; i++) { jobs[i] = minyar_files_syncerStart(fd); assert(jobs[i] > 0 && jobs[i] != prior[i]); }
         assert(minyar_files_syncerStart(fd) == -EMFILE);
-        for (int i = 0; i < 16; i++) { assert(!minyar_files_syncerStop(jobs[i])); prior[i] = jobs[i]; }
+        for (int i = 0; i < FILES_MAX_SYNCERS; i++) { assert(!minyar_files_syncerStop(jobs[i])); prior[i] = jobs[i]; }
     }
     assert(descriptors() == before); close(fd);
 }

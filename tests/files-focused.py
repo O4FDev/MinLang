@@ -47,7 +47,7 @@ def main():
     if platform.system() == 'Linux':
         cases['files-ranges'].append('procfs')
         cases['files-prepare'] += ['unshare-supported', 'unshare-error', 'unshare-unsupported',
-                                  'unshare-stat-error', 'unshare-fresh']
+                                  'unshare-stat-error', 'unshare-fresh', 'unshare-tmpfs']
     if platform.system() == 'Darwin':
         cases['files-prepare'] += ['sharing-query-error', 'sharing-query-missing']
     clang = os.environ.get('MINYAR_TEST_CLANG', os.environ.get('MINYAR_CLANG', 'clang'))
@@ -75,19 +75,21 @@ def main():
                     checks += 1
                     print(f'{fixture} {flags[0]} {case}: passed', flush=True)
         if not options.native_only:
-            llvm = directory/'files-eventloop.ll'
-            run([ROOT/'build/minyarc', ROOT/'tests/files-eventloop.min', llvm,
-                 '--bounded-owners', '32', '--library', ROOT/'library'], environment)
-            if options.sanitize:
-                llvm.write_text(instrument_address_sanitizer(llvm.read_text()))
-            for index, flags in enumerate(configurations):
-                exe = directory/('files-eventloop'+str(index)+('.exe' if windows else ''))
-                command = clang_command([clang, *flags, '-Wno-override-module', '-DMINYAR_SYSTEM_HEAP=1',
-                    llvm, ROOT/'runtime/minyar_runtime.c', ROOT/'runtime/native/files.c',
-                    ROOT/'runtime/native/net.c', *(['-lws2_32'] if windows else ['-pthread']), '-o', exe])
-                run(command, environment)
-                run([exe], environment, cwd=directory, expected=(b'files-eventloop: ok\n', b''), timeout=20)
-                checks += 1
+            for fixture, expected in [('files-eventloop', b'files-eventloop: ok\n'),
+                                      ('files-r2', b'files-r2: ok\nfiles-r2: rmdir and releaseFreeMemory ok\n')]:
+                llvm = directory/(fixture+'.ll')
+                run([ROOT/'build/minyarc', ROOT/'tests'/(fixture+'.min'), llvm,
+                     '--bounded-owners', '32', '--library', ROOT/'library'], environment)
+                if options.sanitize:
+                    llvm.write_text(instrument_address_sanitizer(llvm.read_text()))
+                for index, flags in enumerate(configurations):
+                    exe = directory/(fixture+str(index)+('.exe' if windows else ''))
+                    command = clang_command([clang, *flags, '-Wno-override-module', '-DMINYAR_SYSTEM_HEAP=1',
+                        llvm, ROOT/'runtime/minyar_default_runtime.c', ROOT/'runtime/native/files.c',
+                        ROOT/'runtime/native/net.c', ROOT/'runtime/native/system.c', *(['-lws2_32'] if windows else ['-pthread']), '-o', exe])
+                    run(command, environment)
+                    run([exe], environment, cwd=directory, expected=(expected, b''), timeout=20)
+                    checks += 1
     print(f'{checks} files {"sanitizer" if options.sanitize else "native"} controls passed', flush=True)
 
 
