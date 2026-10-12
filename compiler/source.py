@@ -5,7 +5,6 @@ import re
 ROOT = Path(__file__).resolve().parent
 SOURCES = (
     'stages/source.min',
-    'stages/emission.min',
     'stages/lexer.min',
     'stages/symbols.min',
     'stages/declarations.min',
