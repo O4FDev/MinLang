@@ -1,0 +1,65 @@
+use "files" as files
+use "system" as system
+
+function check(condition: Boolean, what: Text) {
+    if !condition { fail("files-r2: " + what) }
+}
+
+let directory = "/tmp/minyar-files-r2-" + Text(system.processId())
+check(files.makeDirectory(directory) == 0, "makeDirectory")
+let path = directory + "/data"
+let f = files.open(path, files.WRITE + files.CREATE + files.APPEND)
+check(f >= 0, "open")
+let payload = Bytes("0123456789abcdef")
+check(files.write(f, payload, 0, payload.length) == 16, "write")
+
+let buffer = Bytes("xy")
+check(files.readAppend(f, 4, buffer, 6) == 6, "readAppend count")
+check(Text(buffer) == "xy456789", "readAppend appends")
+check(files.readAppend(f, 14, buffer, 10) == 2, "readAppend short at end of file")
+check(Text(buffer) == "xy456789ef", "readAppend short read")
+check(files.readAppend(f, 100, buffer, 4) == 0, "readAppend past end of file")
+check(buffer.length == 10, "length unchanged at end of file")
+buffer.resize(0)
+check(files.readAppend(f, 0, buffer, 3) == 3 && Text(buffer) == "012", "reuse after resize(0)")
+check(files.readAppend(-5, 0, buffer, 3) < 0 && buffer.length == 3, "bad descriptor keeps buffer")
+check(files.readAppend(f, 9223372036854775807, buffer, 3) < 0 && buffer.length == 3, "overflow keeps buffer")
+
+let handles: List<Integer> = []
+let i = 0
+while i < 200 {
+    let h = files.syncerStart(f)
+    check(h > 0, "syncerStart " + Text(i))
+    handles.add(h)
+    i += 1
+}
+for h in handles {
+    check(files.syncerRequest(h, 16) == 0, "syncerRequest")
+    check(files.syncerWait(h, 16, 5000) >= 16, "syncerWait")
+}
+for h in handles { check(files.syncerStop(h) == 0, "syncerStop") }
+check(files.syncerRequest(handles[0], 16) < 0, "stopped handle rejected")
+let again = files.syncerStart(f)
+check(again > 0 && again != handles[0], "syncerStart after stopping all")
+check(files.syncerRequest(handles[0], 16) < 0, "stale handle rejected")
+check(files.syncerStop(again) == 0, "final stop")
+check(files.close(f) == 0, "close")
+check(files.remove(path) == 0, "remove")
+print("files-r2: ok")
+
+let sub = directory + "/sub"
+check(files.makeDirectory(sub) == 0, "makeDirectory sub")
+check(files.removeDirectory(directory) < 0, "removeDirectory refuses a non-empty directory")
+check(files.removeDirectory(sub) == 0, "removeDirectory")
+check(files.removeDirectory(sub) < 0, "removeDirectory of a missing directory fails")
+check(files.removeDirectory(directory) == 0, "removeDirectory now empty")
+let junk: List<Bytes> = []
+let k = 0
+while k < 20000 {
+    junk.add(Bytes(512))
+    k += 1
+}
+junk = []
+let released = system.releaseFreeMemory()
+check(released == 0 || released == 1, "releaseFreeMemory")
+print("files-r2: rmdir and releaseFreeMemory ok")

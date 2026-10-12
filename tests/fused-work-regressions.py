@@ -19,7 +19,7 @@ def main():
     original=(args.runtime_source.parent/'minyar_bounded_rc.h').read_text()
     unfuse=runpy.run_path(str(here/'fused-unary-regressions.py'))['without_fusion']
     variants={'counter-reference':unfuse(original),'counter-candidate':original,'unsafe-shared-mutant':original}
-    marker='static unsigned rc_drop(void *value) {'
+    marker='MINYAR_HOT unsigned rc_drop(void *value) {'
     for name in ['counter-reference','counter-candidate']:
         assert variants[name].count(marker)==1
         variants[name]=variants[name].replace(marker,'static size_t generic_drop_calls;\n'+marker+'\n    generic_drop_calls++;')

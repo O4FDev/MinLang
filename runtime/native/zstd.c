@@ -130,3 +130,72 @@ long long minyar_zstd_bufferCompressDict(long long h,long long dict,const Minyar
 long long minyar_zstd_bufferDecompressDict(long long h,long long dict,const MinyarBytes *s,MinyarBytes *out) {
     return minyar_zstd_rawDecompressDict(h,dict,mc_addr(s->bytes),s->byte_length,mc_addr(out->bytes),out->byte_length);
 }
+
+typedef struct {
+    ZSTD_CCtx *compressor;
+    ZSTD_DCtx *decoder;
+    size_t remaining;
+    long long consumed, written, error;
+    int ending, ended;
+} ZstdStream;
+long long minyar_zstd_newStream(bool compress, long long level) {
+    if (compress && (level < ZSTD_minCLevel() || level > ZSTD_maxCLevel())) return 0;
+    ZstdStream *s = calloc(1, sizeof(*s));
+    if (!s) return 0;
+    s->remaining = 1;
+    if (compress) {
+        s->compressor = ZSTD_createCCtx();
+        if (!s->compressor || ZSTD_isError(ZSTD_CCtx_setParameter(s->compressor, ZSTD_c_compressionLevel, (int)level))) {
+            ZSTD_freeCCtx(s->compressor); free(s); return 0;
+        }
+    } else {
+        s->decoder = ZSTD_createDCtx();
+        if (!s->decoder) { free(s); return 0; }
+    }
+    return mc_addr(s);
+}
+void minyar_zstd_freeStream(long long handle) {
+    ZstdStream *s = (ZstdStream *)(intptr_t)handle;
+    if (!s) return;
+    ZSTD_freeCCtx(s->compressor); ZSTD_freeDCtx(s->decoder); free(s);
+}
+long long minyar_zstd_streamConsumed(long long handle) { return ((ZstdStream *)(intptr_t)handle)->consumed; }
+long long minyar_zstd_streamWritten(long long handle) { return ((ZstdStream *)(intptr_t)handle)->written; }
+bool minyar_zstd_streamEnded(long long handle) { return ((ZstdStream *)(intptr_t)handle)->ended != 0; }
+long long minyar_zstd_processStream(long long handle, const MinyarBytes *input, long long offset,
+                                   long long length, MinyarBytes *output, bool finish) {
+    if (!handle) return MC_CLOSED;
+    ZstdStream *s = (ZstdStream *)(intptr_t)handle;
+    s->consumed = s->written = 0;
+    if (s->error) return s->error;
+    if (!input || !output || offset < 0 || length < 0 || offset > input->byte_length ||
+        length > input->byte_length - offset || output->byte_length < 1 ||
+        !mc_range(mc_addr(input->bytes), input->byte_length) ||
+        !mc_stream_ranges(mc_addr(input->bytes) + offset, length, mc_addr(output->bytes), output->byte_length) ||
+        (s->ending && !finish)) return MC_INVALID;
+    if (s->ended) return length ? MC_TRAILING : 0;
+    s->ending = finish;
+    ZSTD_inBuffer in = {input->bytes + offset, (size_t)length, 0};
+    ZSTD_outBuffer out = {(void *)output->bytes, (size_t)output->byte_length, 0};
+    if (s->compressor) {
+        s->remaining = ZSTD_compressStream2(s->compressor, &out, &in, finish ? ZSTD_e_end : ZSTD_e_continue);
+        if (!ZSTD_isError(s->remaining) && finish && !s->remaining) s->ended = 1;
+    } else {
+        if (!length && finish && !s->remaining) s->ended = 1;
+        while (!s->ended) {
+            size_t before_in = in.pos, before_out = out.pos;
+            s->remaining = ZSTD_decompressStream(s->decoder, &out, &in);
+            if (ZSTD_isError(s->remaining)) break;
+            if (in.pos == in.size && !s->remaining && finish) { s->ended = 1; break; }
+            if (out.pos == out.size) break;
+            if (in.pos == in.size) {
+                if (finish && s->remaining) s->error = MC_TRUNCATED;
+                break;
+            }
+            if (in.pos == before_in && out.pos == before_out) { s->error = MC_CORRUPT; break; }
+        }
+    }
+    s->consumed = (long long)in.pos; s->written = (long long)out.pos;
+    if (ZSTD_isError(s->remaining)) s->error = zerror(s->remaining);
+    return s->error;
+}

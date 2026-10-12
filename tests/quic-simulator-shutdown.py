@@ -41,7 +41,8 @@ def run(source, sig):
         shell.write_text("set -e\n"+command+" "+str(root/"left")+" &\n"+
                          command+" "+str(root/"right")+" &\n"+
                          "PID=$(jobs -p | tr '\\n' ' ')\n"+block)
-        process=subprocess.Popen(["/bin/bash",str(shell)],start_new_session=True)
+        process=subprocess.Popen(["/bin/bash",str(shell)],start_new_session=True,
+                                 preexec_fn=lambda:signal.signal(signal.SIGINT,signal.SIG_DFL))
         parentfd=os.pidfd_open(process.pid)
         children=[]
         try:

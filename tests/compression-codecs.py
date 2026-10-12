@@ -260,7 +260,7 @@ def qualify(options, evidence):
     runtime=evidence.directory/'runtime.o'
     evidence.run(clang_command([clang,*flags,'-DMINYAR_SYSTEM_HEAP=1','-c',ROOT/'runtime/minyar_runtime.c','-o',runtime]))
     binaries=[]
-    for name in ['compression','compression-driver']:
+    for name in ['compression','compression-driver','compression-stream']:
         raw=evidence.directory/(name+'.raw.ll')
         evidence.run([compiler,ROOT/'tests'/(name+'.min'),raw,'--library',ROOT/'library'])
         ir=raw
@@ -274,13 +274,14 @@ def qualify(options, evidence):
         env=dict(evidence.env,MINYAR_CLANG=clang,MINYAR_CLANG_FLAGS=shlex.join(flags),MINYAR_NATIVE_FLAGS=shlex.join(flags))
         normal=evidence.directory/(name+'-driver')
         evidence.run([sys.executable,ROOT/'tools/clang-driver.py','link',ROOT,raw,runtime,normal,'0'],env=env)
-        if name=='compression':
-            evidence.run([binary],expected=b'compression: ok\n'); evidence.run([normal],expected=b'compression: ok\n')
+        if name in ('compression', 'compression-stream'):
+            expected = (name + ': ok\n').encode()
+            evidence.run([binary],expected=expected); evidence.run([normal],expected=expected)
         if compiler == (ROOT/'build/minyarc').resolve():
             launcher=evidence.directory/(name+'-normal')
             env['MINYAR_RUNTIME_FLAGS']=shlex.join(flags)
             evidence.run([*launcher_command(ROOT),ROOT/'tests'/(name+'.min'),'-o',launcher],env=env)
-            if name=='compression': evidence.run([launcher],expected=b'compression: ok\n')
+            if name in ('compression', 'compression-stream'): evidence.run([launcher],expected=(name + ': ok\n').encode())
     driver=binaries[1]
     source=evidence.directory/'input.bin'; output=evidence.directory/'output.bin'
     payload=bytes(range(256))*100
@@ -300,7 +301,7 @@ def qualify(options, evidence):
     manifest={'mode':options.mode,'compiler':str(compiler),'clang_version':evidence.run([clang,'--version']).decode(),
               'providers':providers,'hashes':{}}
     sources=[compiler,*[ROOT/p for p in ['library/zstd.min','library/deflate.min','runtime/native/zstd.c','runtime/native/deflate.c',
-                'runtime/native/compression.h','tools/compression_provider.py','tools/clang-driver.py','tests/compression.py',
+                'runtime/native/compression.h','tools/compression_provider.py','tools/clang-driver.py','tests/compression-codecs.py',
                 'tests/compression.min','tests/compression-driver.min','tests/compression-native.c','tests/compression-reference.c',
                 'runtime/minyar_runtime.c','runtime/minyar_native.h','tests/llvm_sanitizer.py','tools/sanitizer_llvm.py']],
              *evidence.directory.glob('*.ll')]

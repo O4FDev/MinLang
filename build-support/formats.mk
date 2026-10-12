@@ -8,9 +8,9 @@
 
 check-compression: build/minyarc
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compression-provider.py
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compression.py --mode native
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compression-codecs.py --mode native
 
-check-sha256: build/minyarc
+check-sha256: build/minyarc build/minyar-default-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/sha256.py
 
 check-tar: build/minyarc
@@ -25,7 +25,7 @@ FORMATS_SANITIZER_DIRECTORY = $(if $(MINYAR_SANITIZER_CLANG),$(shell python3 -c 
 FORMATS_SANITIZER_ENV = PATH=$(call FORMATS_SANITIZER_QUOTE,$(if $(FORMATS_SANITIZER_DIRECTORY),$(FORMATS_SANITIZER_DIRECTORY):)$(PATH)) MINYAR_TEST_CLANG=$(call FORMATS_SANITIZER_QUOTE,$(FORMATS_SANITIZER_CLANG)) UBSAN_OPTIONS=halt_on_error=1
 
 check-compression-sanitize: build/minyarc
-	$(FORMATS_SANITIZER_ENV) $(SANITIZER_LIMITED) python3 tests/compression.py --mode sanitize
+	$(FORMATS_SANITIZER_ENV) $(SANITIZER_LIMITED) python3 tests/compression-codecs.py --mode sanitize
 
 check-sha256-sanitize: build/minyarc
 	$(FORMATS_SANITIZER_ENV) $(SANITIZER_LIMITED) python3 tests/sha256.py --sanitize
@@ -49,10 +49,10 @@ check-formats: check-formats-wiring check-format-provider check-compression chec
 check-formats-sanitize: check-compression-sanitize check-sha256-sanitize check-tar-sanitize check-formats-pipeline-sanitize
 
 bench-compression: build/minyarc
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 benchmarks/compression.py --artifacts build/compression-benchmark --prepare-only --compiler "$(abspath build/minyarc)"
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 benchmarks/compression.py --artifacts build/compression-benchmark --run-only
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 benchmarks/compression-bench.py --artifacts build/compression-benchmark --prepare-only --compiler "$(abspath build/minyarc)"
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 benchmarks/compression-bench.py --artifacts build/compression-benchmark --run-only
 
-bench-sha256: build/minyarc
+bench-sha256: build/minyarc build/minyar-default-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/sha256-bench.py
 
 bench-tar: build/minyarc
@@ -61,5 +61,3 @@ bench-tar: build/minyarc
 
 bench-formats: bench-compression bench-sha256 bench-tar
 
-# Opt-in until CI installs static libzstd, zlib, libcrypto and libarchive providers:
-# run `make check-formats check-formats-sanitize` on a host that has them.

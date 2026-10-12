@@ -27,11 +27,12 @@ def counters():
     total = sum(values[:8])
     return total, values[3] + values[4]
 def cpu_guard():
-    """Opt-in courtesy pause for shared hosts (MINYAR_CYCLE_CPU_GUARD=1).
+    """The workstation courtesy pause: stop children while the host is busy.
 
-    Runners already bound their own concurrency; under their load the pause
-    only stalls cases against the same wall deadline."""
-    return platform.system() == "Linux" and os.environ.get("MINYAR_CYCLE_CPU_GUARD") == "1"
+    Shared hosts and parallel runners set MINYAR_TEST_SHARED_HOST=1, where
+    the host is always busy and the pause only stalls cases against the same
+    wall deadline."""
+    return platform.system() == "Linux" and not os.environ.get("MINYAR_TEST_SHARED_HOST")
 
 
 def run(command, environment, output, label, resource):

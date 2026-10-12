@@ -79,7 +79,7 @@ int main(int argc,char **argv) {
     for codec,wbits in [('gzip',31),('zlib',15),('raw',-15)]:
         compressor=zlib.compressobj(6,zlib.DEFLATED,wbits)
         (work/(codec+'.bin')).write_bytes(compressor.compress(plain)+compressor.flush())
-    sources=[ROOT/p for p in ['benchmarks/compression.min','benchmarks/compression.py','benchmarks/compression-reference.c',
+    sources=[ROOT/p for p in ['benchmarks/compression.min','benchmarks/compression-bench.py','benchmarks/compression-reference.c',
                              'library/zstd.min','library/deflate.min','runtime/native/zstd.c','runtime/native/deflate.c',
                              'runtime/native/compression.h','runtime/minyar_runtime.c','runtime/native/system.c','tools/compression_provider.py']]
     sources += [Path(options.compiler),raw,work/'minyar',work/'reference',helper,*work.glob('*.bin')]

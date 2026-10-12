@@ -320,6 +320,8 @@ def main():
     for name in list(env):
         if name.startswith('MINYAR_') or name in ('MAKEFLAGS', 'MFLAGS', 'MAKELEVEL', 'TMPDIR'):
             del env[name]
+    # Checks run side by side, so the host is always busy: harnesses must not pause themselves for load.
+    env['MINYAR_TEST_SHARED_HOST'] = '1'
     # Toolchain variants get the plain host environment, as their CI jobs do.
     base = dict(env)
     env.update(PATH=str(bindir) + os.pathsep + env.get('PATH', ''),
