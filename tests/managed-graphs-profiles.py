@@ -31,8 +31,15 @@ def run(command, **kwargs):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--quick', action='store_true')
+    parser.add_argument('--fixture', choices=('managed-graphs-runtime.c', 'managed-graphs-bakeoff.c'),
+                        default='managed-graphs-runtime.c')
+    parser.add_argument('--case', choices=('all', 'growing', 'outgrow', 'producer', 'shared'),
+                        default='all')
     args = parser.parse_args()
-    output = ROOT / 'build/managed-graphs-profiles'
+    if args.fixture == 'managed-graphs-runtime.c' and args.case != 'all':
+        parser.error('--case selects only the bakeoff fixture')
+    output = ROOT / 'build' / ('managed-graphs-profiles' if args.fixture == 'managed-graphs-runtime.c'
+                               else 'managed-graphs-bakeoff-profiles')
     output.mkdir(parents=True, exist_ok=True)
     (ROOT / 'build/managed-graphs-engine.c').write_text(engine_source(ROOT))
     clang = os.environ.get('MINYAR_TEST_CLANG', 'clang')
@@ -40,6 +47,8 @@ def main():
                 'fixed': ['-DMINYAR_BOUNDED_HEAP=1'],
                 'lazy': ['-DMINYAR_BOUNDED_HEAP=1', '-DMINYAR_LAZY_HEAP=1'],
                 'eager': []}
+    if args.fixture == 'managed-graphs-bakeoff.c':
+        profiles.pop('eager')  # Original producer contracts require bounded polls.
     if windows_host():
         profiles.pop('lazy')
     for profile, flags in profiles.items():
@@ -55,12 +64,15 @@ def main():
                 options += ['-std=c11', '-Wall', '-Wextra', '-Werror', '-iquote', str(ROOT / 'runtime'),
                             *flags, '-DMINYAR_BOUNDED_HEAP_BYTES=1048576',
                             '-DMINYAR_RC_POLL_BUDGET=' + str(budget)]
-                run([clang, *options, ROOT / 'tests/managed-graphs-runtime.c', '-lm', '-o', binary])
-                for seed in ((314159, 0xffffffff) if args.quick else (0, 1, 7, 314159, 0xffffffff)):
+                run([clang, *options, ROOT / 'tests' / args.fixture, '-lm', '-o', binary])
+                seeds = ((314159,) if args.fixture == 'managed-graphs-bakeoff.c' else
+                         (314159, 0xffffffff) if args.quick else (0, 1, 7, 314159, 0xffffffff))
+                for seed in seeds:
                     environment = dict(os.environ, MINYAR_GRAPH_SEED=str(seed),
                         ASAN_OPTIONS='detect_leaks=' + ('1' if platform.system() == 'Linux' else '0') + ':halt_on_error=1',
                         UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1')
-                    print(label + ' seed=' + str(seed) + ': ' + run([binary], env=environment), flush=True)
+                    command = [binary, args.case] if args.fixture == 'managed-graphs-bakeoff.c' else [binary]
+                    print(label + ' seed=' + str(seed) + ': ' + run(command, env=environment), flush=True)
 
 
 if __name__ == '__main__':

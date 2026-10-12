@@ -166,7 +166,8 @@ print(acyclic().children.length)
     def test_adapted_graph_churn_temporaries_and_shared_append(self):
         expected = {'graphs': '0\n1\n2\n1\n0\n', 'churn': '100000\n',
                     'dense': '5000\n', 'field': '', 'live-churn': '1\n100000\n',
-                    'appended': '16800\n800\n'}
+                    'appended': '16800\n800\n',
+                    'sol-graphs': '15\n22\n33\n' + ''.join(f'{i}\n' for i in range(0, 20000, 1000))}
         for fixture, stdout in expected.items():
             with self.subTest(fixture=fixture):
                 self.executes((ROOT / 'tests/managed-graphs' / (fixture + '.min')).read_text(), stdout)
