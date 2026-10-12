@@ -49,9 +49,9 @@ check-calldepth-profile-$(1)-k$(2)-sanitize: build/minyarc-calldepth build/calld
 endef
 $(foreach combination,$(CALLDEPTH_PROFILES),$(eval $(call calldepth_profile_rule,$(firstword $(subst -k, ,$(combination))),$(lastword $(subst -k, ,$(combination))))))
 
-check-calldepth-profile-fixtures: build/minyarc
+check-calldepth-profile-fixtures: build/minyarc build/minyarc-calldepth
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/calldepth.py --fixtures only --large-dispatch --evidence build/calldepth-profile-fixtures-evidence
-check-calldepth-profile-fixtures-sanitize:
+check-calldepth-profile-fixtures-sanitize: build/minyarc-calldepth
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/calldepth.py --fixtures only --sanitize --evidence build/calldepth-profile-fixtures-sanitize-evidence
 
 .PHONY: $(CALLDEPTH_PROFILE_CHECKS)
