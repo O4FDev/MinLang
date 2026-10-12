@@ -710,13 +710,20 @@ class BuildWiring(unittest.TestCase):
                     'tests/generated-llvm-sanitizer.min', 'tests/llvm_sanitizer.py',
                     'tools/sanitizer_llvm.py', 'tools/clang-driver.py'}
 
-        def verify(candidate):
+        def verify(candidate, sanitizer=None, selected=None, directory='/clang64/bin'):
             with tempfile.TemporaryDirectory(prefix='actual sanitizer Make rules ') as folder:
                 probe = Path(folder)/'probe.mk'
-                probe.write_text(candidate + '\n.PHONY: build build/minyarc build/yamux-peer\n'
+                probe.write_text('LLVM_CC := retained-native-clang\n'
+                                 'SANITIZER_LIMITED := sanitizer-limit\n'
+                                 'PATH := /retained/native/bin:/usr/bin\n'
+                                 'MINYAR_SANITIZER_CLANG := ' + (sanitizer or '') + '\n'
+                                 + candidate + '\n.PHONY: build build/minyarc build/yamux-peer\n'
                                  'build build/minyarc build/yamux-peer:\n')
+                environment = dict(os.environ)
+                environment.pop('MAKEFLAGS', None)
                 result = subprocess.run(['make', '-rRnp', '-f', str(probe), 'check'],
-                                        cwd=ROOT, capture_output=True, text=True, timeout=15)
+                                        cwd=ROOT, env=environment, capture_output=True,
+                                        text=True, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 rules = {}
                 for line in result.stdout.splitlines():
@@ -728,10 +735,57 @@ class BuildWiring(unittest.TestCase):
                 self.assertTrue(expected <= rules.get('check-generated-llvm-sanitizer',set()))
                 commands = result.stdout.split('# GNU Make',1)[0]
                 self.assertIn('python3 tests/generated-llvm-sanitizer.py', commands)
+                command = next(line for line in commands.splitlines()
+                               if 'python3 tests/generated-llvm-sanitizer.py' in line)
+                fields = shlex.split(command)
+                self.assertIn('MINYAR_TEST_CLANG=' +
+                              (selected or sanitizer or 'retained-native-clang'), fields)
+                self.assertIn('sanitizer-limit', fields)
+                searches = [field[len('PATH='):] for field in fields
+                            if field.startswith('PATH=')]
+                self.assertEqual(len(searches), 1)
+                search = searches[0]
+                if sanitizer:
+                    suffix = ':/retained/native/bin:/usr/bin'
+                    self.assertTrue(search.endswith(suffix), search)
+                    self.assertEqual(search[:-len(suffix)].rstrip('/'), directory)
+                else:
+                    self.assertEqual(search, '/retained/native/bin:/usr/bin')
                 self.assertIn('--artifacts "$artifacts/run"', commands)
                 self.assertIn((ROOT/'build/generated-llvm-sanitizer-').as_posix(),
                               commands.replace('\\','/'))
         verify(fragment)
+        verify(fragment, '/clang64/bin/clang.exe')
+        verify(fragment, '/opt/LLVM 23/bin/clang.exe', directory='/opt/LLVM 23/bin')
+        verify(fragment, "/opt/LLVM's 23/bin/clang.exe", directory="/opt/LLVM's 23/bin")
+        import platform
+        if platform.system().startswith(('MSYS', 'MINGW', 'CYGWIN')):
+            selected = '/c/MinyarUnify-20261012/LLVM 23/bin/clang.exe'
+            for spelling in (selected, 'C:/MinyarUnify-20261012/LLVM 23/bin/clang.exe',
+                             r'C:\MinyarUnify-20261012\LLVM 23\bin\clang.exe'):
+                verify(fragment, spelling, selected, '/c/MinyarUnify-20261012/LLVM 23/bin')
+            selected = '//20.20.20.1/Data/LLVM 23/bin/clang.exe'
+            for spelling in (selected, r'\\20.20.20.1\Data\LLVM 23\bin\clang.exe'):
+                verify(fragment, spelling, selected, '//20.20.20.1/Data/LLVM 23/bin')
+        clang_rule = next(line for line in fragment.splitlines()
+                          if line.startswith('GENERATED_SANITIZER_CLANG ='))
+        path_rule = next(line for line in fragment.splitlines()
+                         if line.startswith('GENERATED_SANITIZER_PATH ='))
+        for old, new, sanitizer, directory in (
+                (clang_rule, 'GENERATED_SANITIZER_CLANG = $(LLVM_CC)',
+                 '/clang64/bin/clang.exe', '/clang64/bin'),
+                ('PATH="$(GENERATED_SANITIZER_PATH)" ', '',
+                 '/clang64/bin/clang.exe', '/clang64/bin'),
+                (path_rule, 'GENERATED_SANITIZER_PATH = $(PATH)',
+                 '/clang64/bin/clang.exe', '/clang64/bin'),
+                (path_rule, 'GENERATED_SANITIZER_PATH = /wrong/runtime:$(PATH)',
+                 '/clang64/bin/clang.exe', '/clang64/bin'),
+                (path_rule, 'GENERATED_SANITIZER_PATH = $(dir $(MINYAR_SANITIZER_CLANG)):$(PATH)',
+                 '/opt/LLVM 23/bin/clang.exe', '/opt/LLVM 23/bin')):
+            mutant = fragment.replace(old, new, 1)
+            self.assertNotEqual(mutant, fragment)
+            with self.subTest(dispatch=old), self.assertRaises(AssertionError):
+                verify(mutant, sanitizer, directory=directory)
         aggregate = 'check check-portable check-sanitize: check-generated-llvm-sanitizer'
         for gate in ('check','check-portable','check-sanitize'):
             missing = fragment.replace(aggregate, ' '.join(x for x in aggregate.split(':')[0].split()
