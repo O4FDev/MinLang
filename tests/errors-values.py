@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Recoverable value results; original semantic adaptations of peer tests.
 
-Peer sources/provenance: docs/research/runtime-concurrency-errors.md.
+Peer sources/provenance: docs/research/runtime-concurrency-errors.md at tag
+archive/docs-before-cleanup-20261012.
 These tests use real module compilation and execute at O0/O2. They exercise
 independent outcome combinations, binary data, retained aliases and caller
 recovery, rather than only comparing factories with their implementations.

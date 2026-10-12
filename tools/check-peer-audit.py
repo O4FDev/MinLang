@@ -79,7 +79,9 @@ def load_generated_domain(path, sha256, cache):
 def check_generated_domain(root, language, row, cache):
     reference = row['generated_domain']
     name = Path(reference['artifact']).name
-    if reference['artifact'] != f'docs/research/exhaustive/{language}/{name}':
+    # Ledgers recorded before the data moved to tests/data/peer name docs/research/exhaustive.
+    if reference['artifact'] not in (f'tests/data/peer/{language}/{name}',
+                                     f'docs/research/exhaustive/{language}/{name}'):
         raise ValueError('Generated domain artifact must be inside its language directory')
     identity = load_generated_domain(root / language / name, reference['sha256'], cache)
     domain = cache[identity][reference['domain_id']]
@@ -262,7 +264,7 @@ def inspect(root, source_root=None):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[1] / 'docs/research/exhaustive')
+    parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[1] / 'tests/data/peer')
     parser.add_argument('--source-root', type=Path)
     parser.add_argument('--require-complete', action='store_true')
     args = parser.parse_args()

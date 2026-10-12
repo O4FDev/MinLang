@@ -2,8 +2,9 @@
 """Independent typed closure cases inspired by Rust/Swift ownership tests.
 
 Scenarios, not peer test code, are adapted. Source/license links are recorded
-in docs/research/runtime-concurrency-errors.md. Every execution uses the
-repository's exact allocation/debt accounting harness at O0 and O2.
+in docs/research/runtime-concurrency-errors.md at tag
+archive/docs-before-cleanup-20261012. Every execution uses the repository's
+exact allocation/debt accounting harness at O0 and O2.
 """
 import unittest
 from pathlib import Path

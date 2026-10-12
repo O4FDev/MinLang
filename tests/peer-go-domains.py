@@ -15,7 +15,7 @@ class GoDomainTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.rows = {}
-        with (ROOT / 'docs/research/exhaustive/go/decisions.jsonl').open() as stream:
+        with (ROOT / 'tests/data/peer/go/decisions.jsonl').open() as stream:
             for line in stream:
                 row = json.loads(line)
                 if (row['path'] in SUPPORTED_DOMAIN_PATHS

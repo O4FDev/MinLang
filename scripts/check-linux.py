@@ -121,7 +121,7 @@ def main():
                 'tests/tokenizer-storage.c', 'tests/tokenizer-storage.py',
                 'tests/recent-cursors.c', 'tests/memory-profile-regressions.py',
                 'experiments/memory/critical-path-study.py',
-                'docs/research/exhaustive/implementations.jsonl']
+                'tests/data/peer/implementations.jsonl']
     missing = [name for name in required if not (source / name).is_file()]
     plan = {'source': str(source), 'make_jobs': a.jobs, 'build_targets': BUILD,
             'correctness_targets': TARGETS,

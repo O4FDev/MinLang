@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Original Minyar adaptations of pinned Rust/Go/Zig audit cases.
 
-Source keys and semantic differences are in docs/research/exhaustive/implementations.jsonl
-and the validated rgz-implementation-round3.jsonl handoff in that directory.
+Source keys and semantic differences are in tests/data/peer/implementations.jsonl; the
+rgz-implementation-round3.jsonl handoff is in docs/research/exhaustive at tag
+archive/docs-before-cleanup-20261012.
 No upstream harness or implementation code is copied.
 """
 from clang_helpers import clang_command
@@ -614,7 +615,7 @@ print(log2(1)); print(log2(15)); print(log2(16))
         import sys
         sys.path.insert(0, str(ROOT / 'tools'))
         from peer_zig_domains import instances, validate_domain
-        artifact = ROOT / 'docs/research/exhaustive/zig/log-int-generated-domain.json'
+        artifact = ROOT / 'tests/data/peer/zig/log-int-generated-domain.json'
         schema = ROOT / 'tools/peer_zig_domains.py'
         self.evidence.inputs[str(artifact)] = digest(artifact)
         self.evidence.inputs[str(schema)] = digest(schema)
@@ -674,7 +675,7 @@ bits = bits + 1
         import sys
         sys.path.insert(0, str(ROOT / 'tools'))
         from peer_zig_domains import instances, validate_domain
-        artifact = ROOT / 'docs/research/exhaustive/zig/log-int-generated-domain.json'
+        artifact = ROOT / 'tests/data/peer/zig/log-int-generated-domain.json'
         schema = ROOT / 'tools/peer_zig_domains.py'
         self.evidence.inputs[str(artifact)] = digest(artifact)
         self.evidence.inputs[str(schema)] = digest(schema)

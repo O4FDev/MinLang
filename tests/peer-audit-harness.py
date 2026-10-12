@@ -125,7 +125,7 @@ class AuditHarness(unittest.TestCase):
                       cohorts=[dict(operation=operation, count=16, disposition='covered', rule='controlled rule')
                                for operation in ('truncating-division', 'remainder', 'floor-division')])
         self.write_rows(artifact, [domain])
-        row['generated_domain'] = dict(artifact='docs/research/exhaustive/python/generated-domains.jsonl',
+        row['generated_domain'] = dict(artifact='tests/data/peer/python/generated-domains.jsonl',
                                        sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
                                        domain_id='controlled-domain', cohort='remainder', instances=16)
         rows = []
@@ -179,7 +179,7 @@ class AuditHarness(unittest.TestCase):
             rows.append(dict(SOURCE, case_id='generated-domain/' + cohort['id'], lines=[1, 1],
                              disposition=cohort['disposition'], reason='Controlled exact domain',
                              implementation_needed=cohort['disposition'] == 'adapt',
-                             generated_domain=dict(artifact='docs/research/exhaustive/zig/' + artifact.name,
+                             generated_domain=dict(artifact='tests/data/peer/zig/' + artifact.name,
                                                    sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
                                                    domain_id=domain['domain_id'], cohort=cohort['id'],
                                                    instances=cohort['instances'])))

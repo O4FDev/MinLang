@@ -2,7 +2,7 @@
 """Compiler-owned generic results, exhaustive handling, propagation and cleanup.
 
 Original scenarios adapted from primary peer tests; provenance is recorded in
-docs/research/errors-language.md. Execution uses the allocation/debt oracle.
+docs/research/errors-language.md at tag archive/docs-before-cleanup-20261012. Execution uses the allocation/debt oracle.
 """
 import hashlib
 import os

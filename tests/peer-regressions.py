@@ -2,7 +2,8 @@
 """Original Minyar regressions derived from the pinned peer-testing audit.
 
 Sources and semantic differences: docs/research/peer-tests-{cpp,javascript-java,
-rust-go-zig,python-swift,ruby-lua}.md. No upstream fixture code is copied.
+rust-go-zig,python-swift,ruby-lua}.md at tag archive/docs-before-cleanup-20261012.
+No upstream fixture code is copied.
 """
 from clang_helpers import clang_command, native_path
 import os
