@@ -1,9 +1,27 @@
 PEER_SUITES ?= tests/peer-regressions.py tests/peer-cpp-java-js.py tests/peer-rust-go-zig.py tests/peer-python-swift-ruby-lua.py
-PEER_DRIVER_ARTIFACTS = build/minyarc build/minyarc-modules build/minyar-default-runtime.o
+PEER_BASE_ARTIFACTS = build/minyarc build/minyarc-modules build/minyar-default-runtime.o
 # Only the extended Rust/Go/Zig suite exercises the POSIX incremental driver.
-ifneq ($(filter tests/peer-rust-go-zig.py,$(PEER_SUITES)),)
-PEER_DRIVER_ARTIFACTS += build/minyar-module-build build/minyarc-errors-request
-endif
+peer_driver_artifacts = $(PEER_BASE_ARTIFACTS) $(if $(filter tests/peer-rust-go-zig.py,$(1)),build/minyar-module-build build/minyarc-errors-request)
+PEER_DRIVER_ARTIFACTS = $(call peer_driver_artifacts,$(PEER_SUITES))
+
+# managed-graphs.mk (read earlier: build-support/*.mk is included sorted) adds
+# the frontends that every peer suite needs to PEER_FEATURE_ARTIFACTS.
+# Each selected suite is its own phony child of each gate, so a parallel runner
+# runs the suites side by side; the gate itself only checks the selection.
+peer_suite_name = $(patsubst peer-%,%,$(basename $(notdir $(1))))
+peer_gate_children = $(foreach suite,$(PEER_SUITES),$(1)-$(call peer_suite_name,$(suite)))
+define PEER_SUITE_CHECKS
+.PHONY: check-peer-regressions-$(2) check-peer-optimizations-$(2) check-peer-sanitize-$(2)
+check-peer-regressions-$(2): check-peer-manifest $(call peer_driver_artifacts,$(1)) build/minyar-runtime.o $(PEER_FEATURE_ARTIFACTS)
+	MINYAR_PEER_GATE=check-peer-regressions $$(LIMITED) python3 $(1)
+
+check-peer-optimizations-$(2): check-peer-manifest $(call peer_driver_artifacts,$(1)) build/minyar-runtime.o $(PEER_FEATURE_ARTIFACTS)
+	MINYAR_PEER_GATE=check-peer-optimizations MINYAR_TEST_EXTENDED_OPT=1 $$(LIMITED) python3 $(1)
+
+check-peer-sanitize-$(2): check-peer-manifest $(call peer_driver_artifacts,$(1)) build/minyarc-sanitize build/minyar-runtime-sanitize.o $(PEER_FEATURE_ARTIFACTS) $(PEER_FEATURE_SANITIZE_ARTIFACTS)
+	MINYAR_PEER_GATE=check-peer-sanitize ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $$(SANITIZER_LIMITED) python3 $(1)
+endef
+$(foreach suite,$(PEER_SUITES),$(eval $(call PEER_SUITE_CHECKS,$(suite),$(call peer_suite_name,$(suite)))))
 
 .PHONY: check-stateful-lists check-stateful-lists-sanitize check-runtime-size-guards check-compiler-allocation-faults check-peer-ownership check-peer-sanitize check-peer-audit-harness check-evidence-harness check-peer-manifest check-peer-regressions check-peer-optimizations check-allocation-faults check-codegen check-reduction-harness
 
@@ -67,17 +85,11 @@ check-performance-metrics:
 
 check: check-performance-metrics
 
-check-peer-regressions: check-peer-manifest $(PEER_DRIVER_ARTIFACTS) build/minyar-runtime.o
+check-peer-regressions: $(call peer_gate_children,check-peer-regressions)
+check-peer-optimizations: $(call peer_gate_children,check-peer-optimizations)
+check-peer-sanitize: $(call peer_gate_children,check-peer-sanitize)
+check-peer-regressions check-peer-optimizations check-peer-sanitize:
 	@test -n "$(strip $(PEER_SUITES))" || { echo "PEER_SUITES must not be empty" >&2; exit 1; }
-	@for suite in $(PEER_SUITES); do MINYAR_PEER_GATE=check-peer-regressions $(LIMITED) python3 "$$suite" || exit $$?; done
-
-check-peer-optimizations: check-peer-manifest $(PEER_DRIVER_ARTIFACTS) build/minyar-runtime.o
-	@test -n "$(strip $(PEER_SUITES))" || { echo "PEER_SUITES must not be empty" >&2; exit 1; }
-	@for suite in $(PEER_SUITES); do MINYAR_PEER_GATE=check-peer-optimizations MINYAR_TEST_EXTENDED_OPT=1 $(LIMITED) python3 "$$suite" || exit $$?; done
-
-check-peer-sanitize: check-peer-manifest $(PEER_DRIVER_ARTIFACTS) build/minyarc-sanitize build/minyar-runtime-sanitize.o
-	@test -n "$(strip $(PEER_SUITES))" || { echo "PEER_SUITES must not be empty" >&2; exit 1; }
-	@for suite in $(PEER_SUITES); do MINYAR_PEER_GATE=check-peer-sanitize ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 "$$suite" || exit $$?; done
 
 # Ownership selects driver regressions independently of PEER_SUITES.
 check-peer-ownership: check-peer-manifest $(PEER_DRIVER_ARTIFACTS) build/minyar-module-build build/minyarc-errors-request build/minyarc-sanitize build/ownership-runtime.o
