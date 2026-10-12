@@ -51,9 +51,14 @@ static int files_fullsync(int fd) {
 #endif
 }
 
-static void files_cloexec_nonblock(int fd, bool nonblock) {
-    fcntl(fd, F_SETFD, FD_CLOEXEC);
-    if (nonblock) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+static int files_cloexec_nonblock(int fd, bool nonblock) {
+    int flags = fcntl(fd, F_GETFD);
+    if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) return -errno;
+    if (nonblock) {
+        flags = fcntl(fd, F_GETFL);
+        if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -errno;
+    }
+    return 0;
 }
 
 /* Copy a path into a NUL-terminated buffer. Rejects empty, too long, or embedded NUL. */
@@ -79,6 +84,10 @@ static MinyarBytes *files_empty(int err) {
 long long minyar_files_lastError(void) { return files_last_error; }
 
 MinyarText *minyar_files_errorText(long long code) {
+    if (code < -(long long)INT_MAX || code > INT_MAX) {
+        const char *invalid = "invalid operating-system error code";
+        return minyar_native_copy_text((const unsigned char *)invalid, (long long)strlen(invalid));
+    }
     const char *s = strerror((int)(code < 0 ? -code : code));
     return minyar_native_copy_text((const unsigned char *)s, (long long)strlen(s));
 }
@@ -135,6 +144,13 @@ long long minyar_files_write(long long fd, const MinyarBytes *data, long long of
 long long minyar_files_writeAt(long long fd, const MinyarBytes *data, long long offset, long long length,
                                long long position) {
     if (position < 0) return -EINVAL;
+    if (!files_valid_fd(fd)) return -EBADF;
+    if (!files_valid_range(data, offset, length)) return -EINVAL;
+    if (position > LLONG_MAX - length || (long long)(off_t)(position + length) != position + length)
+        return -EOVERFLOW;
+    int flags = fcntl((int)fd, F_GETFL);
+    if (flags < 0) return -errno;
+    if (flags & O_APPEND) return -EINVAL;
     return files_write_all(fd, data, offset, length, position);
 }
 
@@ -146,6 +162,8 @@ long long minyar_files_writeStandardOutput(const MinyarText *text) {
 /* Read up to length bytes at position into fresh Bytes (shorter at end of file). */
 MinyarBytes *minyar_files_readAt(long long fd, long long position, long long length) {
     if (!files_valid_fd(fd) || position < 0 || length < 0) return files_empty(-EINVAL);
+    if ((unsigned long long)length >= SIZE_MAX / 2 || position > LLONG_MAX - length ||
+        (long long)(off_t)(position + length) != position + length) return files_empty(-EOVERFLOW);
     MinyarBytes *b = minyar_bytes_new(length);
     unsigned char *p = (unsigned char *)b->bytes;
     long long done = 0;
@@ -253,7 +271,7 @@ long long minyar_files_syncDirectory(const MinyarText *path) {
     return r;
 }
 
-/* Newline-separated entry names (excluding . and ..); the Minyar wrapper splits them. */
+/* NUL-delimited entry names represent every legal POSIX filename. */
 MinyarBytes *minyar_files_listNames(const MinyarText *path) {
     char p[PATH_MAX];
     int rc = files_path(path, p);
@@ -262,15 +280,20 @@ MinyarBytes *minyar_files_listNames(const MinyarText *path) {
     if (!d) return files_empty(-errno);
     MinyarBytes *out = minyar_bytes_new(0);
     struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
+    int error = 0;
+    for (;;) {
+        errno = 0;
+        e = readdir(d);
+        if (!e) { error = errno; break; }
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         size_t n = strlen(e->d_name);
         unsigned char *dst = minyar_native_bytes_append(out, (long long)n + 1);
         memcpy(dst, e->d_name, n);
-        dst[n] = '\n';
+        dst[n] = 0;
     }
-    closedir(d);
-    files_last_error = 0;
+    if (closedir(d) != 0 && !error) error = errno;
+    if (error) out->byte_length = 0;
+    files_last_error = -error;
     return out;
 }
 
@@ -297,6 +320,7 @@ typedef struct {
 
 typedef struct {
     bool used;
+    uint64_t generation;
     pthread_t thread;
     pthread_mutex_t mu;
     pthread_cond_t wake; /* Minyar thread -> syncer: new request, switch or stop */
@@ -305,6 +329,7 @@ typedef struct {
     FilesPendingSegment pending[FILES_MAX_PENDING];
     int npending;
     long long requested; /* protected by mu; only grows */
+    long long last_start; /* largest accepted rotation, including in-flight ones */
     _Atomic long long synced;
     _Atomic int error;
     bool stop;
@@ -314,9 +339,10 @@ typedef struct {
 static FilesSyncer files_syncers[FILES_MAX_SYNCERS];
 
 static FilesSyncer *files_syncer(long long handle) {
-    if (handle < 1 || handle > FILES_MAX_SYNCERS) return NULL;
-    FilesSyncer *s = &files_syncers[handle - 1];
-    return s->used ? s : NULL;
+    if (handle <= 0) return NULL;
+    uint64_t identity = (uint64_t)handle - 1;
+    FilesSyncer *s = &files_syncers[identity % FILES_MAX_SYNCERS];
+    return s->used && s->generation == identity / FILES_MAX_SYNCERS ? s : NULL;
 }
 
 static void files_notify(FilesSyncer *s) {
@@ -373,42 +399,53 @@ long long minyar_files_syncerStart(long long fd) {
     if (!files_valid_fd(fd)) return -EBADF;
     int slot = -1;
     for (int i = 0; i < FILES_MAX_SYNCERS; i++)
-        if (!files_syncers[i].used) {
+        if (!files_syncers[i].used && files_syncers[i].generation <
+            ((uint64_t)LLONG_MAX - FILES_MAX_SYNCERS) / FILES_MAX_SYNCERS) {
             slot = i;
             break;
         }
     if (slot < 0) return -EMFILE;
-    FilesSyncer *s = &files_syncers[slot];
-    memset(s, 0, sizeof(*s));
-    int sv[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -errno;
-    files_cloexec_nonblock(sv[0], true);
-    files_cloexec_nonblock(sv[1], true);
+    /* A closed caller fd must not alias a notification socket allocated here. */
     int dupfd = fcntl((int)fd, F_DUPFD_CLOEXEC, 0);
-    if (dupfd < 0) {
-        int e = -errno;
-        close(sv[0]);
-        close(sv[1]);
-        return e;
+    if (dupfd < 0) return -errno;
+    FilesSyncer *s = &files_syncers[slot];
+    uint64_t generation = s->generation;
+    memset(s, 0, sizeof(*s));
+    s->generation = generation;
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        int error = errno; close(dupfd); return -error;
     }
+    int error = files_cloexec_nonblock(sv[0], true);
+    if (!error) error = files_cloexec_nonblock(sv[1], true);
+    if (error) goto fail_descriptors;
     s->notify_read = sv[0];
     s->notify_write = sv[1];
     s->fd = dupfd;
     atomic_store(&s->synced, 0);
     atomic_store(&s->error, 0);
-    pthread_mutex_init(&s->mu, NULL);
-    pthread_cond_init(&s->wake, NULL);
-    pthread_cond_init(&s->done, NULL);
+    error = -pthread_mutex_init(&s->mu, NULL);
+    if (error) goto fail_descriptors;
+    error = -pthread_cond_init(&s->wake, NULL);
+    if (error) goto fail_mutex;
+    error = -pthread_cond_init(&s->done, NULL);
+    if (error) goto fail_wake;
+    error = -pthread_create(&s->thread, NULL, files_syncer_main, s);
+    if (error) goto fail_done;
+    s->generation = generation + 1;
     s->used = true;
-    int rc = pthread_create(&s->thread, NULL, files_syncer_main, s);
-    if (rc != 0) {
-        s->used = false;
-        close(dupfd);
-        close(sv[0]);
-        close(sv[1]);
-        return -rc;
-    }
-    return slot + 1;
+    return (long long)(s->generation * FILES_MAX_SYNCERS) + slot + 1;
+fail_done:
+    pthread_cond_destroy(&s->done);
+fail_wake:
+    pthread_cond_destroy(&s->wake);
+fail_mutex:
+    pthread_mutex_destroy(&s->mu);
+fail_descriptors:
+    close(dupfd);
+    close(sv[0]);
+    close(sv[1]);
+    return error;
 }
 
 long long minyar_files_syncerNotifySocket(long long handle) {
@@ -419,6 +456,7 @@ long long minyar_files_syncerNotifySocket(long long handle) {
 long long minyar_files_syncerRequest(long long handle, long long upTo) {
     FilesSyncer *s = files_syncer(handle);
     if (!s) return -EBADF;
+    if (upTo < 0) return -EINVAL;
     /* requested only grows and only this thread writes it, so an unlocked read is a safe lower bound. */
     if (upTo <= atomic_load_explicit(&s->synced, memory_order_acquire) || upTo <= s->requested) return 0;
     pthread_mutex_lock(&s->mu);
@@ -460,6 +498,7 @@ long long minyar_files_syncerDrain(long long handle) {
 long long minyar_files_syncerWait(long long handle, long long upTo, long long timeoutMs) {
     FilesSyncer *s = files_syncer(handle);
     if (!s) return -EBADF;
+    if (upTo < 0 || timeoutMs < -1) return -EINVAL;
     struct timespec deadline;
     clock_gettime(CLOCK_REALTIME, &deadline); /* pthread_cond_timedwait default clock (portable to macOS) */
     if (timeoutMs >= 0) {
@@ -501,10 +540,16 @@ long long minyar_files_syncerWait(long long handle, long long upTo, long long ti
 long long minyar_files_syncerSwitch(long long handle, long long newFd, long long startOffset) {
     FilesSyncer *s = files_syncer(handle);
     if (!s) return -EBADF;
+    if (startOffset < 0) return -EINVAL;
     if (!files_valid_fd(newFd)) return -EBADF;
     int dupfd = fcntl((int)newFd, F_DUPFD_CLOEXEC, 0);
     if (dupfd < 0) return -errno;
     pthread_mutex_lock(&s->mu);
+    if (startOffset < s->requested || startOffset < s->last_start || startOffset < atomic_load(&s->synced)) {
+        pthread_mutex_unlock(&s->mu);
+        close(dupfd);
+        return -EINVAL;
+    }
     if (s->npending == FILES_MAX_PENDING) {
         pthread_mutex_unlock(&s->mu);
         close(dupfd);
@@ -512,6 +557,7 @@ long long minyar_files_syncerSwitch(long long handle, long long newFd, long long
     }
     s->pending[s->npending].fd = dupfd;
     s->pending[s->npending].start = startOffset;
+    s->last_start = startOffset;
     s->npending++;
     pthread_cond_signal(&s->wake);
     pthread_mutex_unlock(&s->mu);
