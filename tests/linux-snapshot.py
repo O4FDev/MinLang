@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Keep strict suite consumers inside isolated correctness source snapshots."""
+import hashlib
 import importlib.util
 from pathlib import Path
+import stat
 import tempfile
 import unittest
 from unittest import mock
@@ -13,6 +15,14 @@ SPEC.loader.exec_module(RUNNER)
 CATALOGUE_SPEC = importlib.util.spec_from_file_location('suite_catalogue', ROOT / 'tests/suite-catalogue.py')
 CATALOGUE = importlib.util.module_from_spec(CATALOGUE_SPEC)
 CATALOGUE_SPEC.loader.exec_module(CATALOGUE)
+
+# Independent of the runner's directory list; these are OS library inputs.
+OS_ADAPTERS = {
+    'os/arch/x86_64/tlsverify.min': (b'x86_64 trust\r\n\xff\x00\n', 0o640),
+    'os/arch/arm64/tlsverify.min': (b'arm64 trust\r\n\xfe\x00\n', 0o600),
+    'os/arch/x86_64/aes.min': (b'x86_64 aes\r\n\xfd\x00\n', 0o644),
+    'os/arch/arm64/aes.min': (b'arm64 aes\r\n\xfc\x00\n', 0o755),
+}
 
 
 class LinuxSnapshot(unittest.TestCase):
@@ -68,6 +78,48 @@ class LinuxSnapshot(unittest.TestCase):
             RUNNER.copy_source_snapshot(source, work)
             for name in ('build', '.git', 'tests/__pycache__', 'tests/stale.pyc'):
                 self.assertFalse((work / name).exists(), name)
+
+    def test_os_adapters_retain_bytes_modes_and_manifest_hashes(self):
+        with tempfile.TemporaryDirectory(prefix='minyar-linux-snapshot-') as temporary:
+            source, work, _ = self.snapshot(Path(temporary))
+            for name, (raw, mode) in OS_ADAPTERS.items():
+                adapter = source / name
+                adapter.parent.mkdir(parents=True, exist_ok=True)
+                adapter.write_bytes(raw)
+                adapter.chmod(mode)
+            expected = {path.relative_to(source).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                        for path in source.rglob('*') if path.is_file()}
+            manifest = RUNNER.snapshot_sources(source, work)
+            for name, (raw, mode) in OS_ADAPTERS.items():
+                with self.subTest(adapter=name):
+                    copied = work / name
+                    self.assertTrue(copied.is_file(), name)
+                    self.assertEqual(copied.read_bytes(), raw)
+                    self.assertEqual(stat.S_IMODE(copied.stat().st_mode), mode)
+                    self.assertIn(name, manifest)
+                    self.assertEqual(manifest[name], hashlib.sha256(raw).hexdigest())
+            self.assertEqual(manifest, expected)
+
+    def test_os_build_git_and_python_cache_artifacts_are_not_inherited(self):
+        with tempfile.TemporaryDirectory(prefix='minyar-linux-snapshot-') as temporary:
+            source, work, _ = self.snapshot(Path(temporary))
+            adapter = source / 'os/arch/x86_64/tlsverify.min'
+            adapter.parent.mkdir(parents=True)
+            adapter.write_bytes(b'OS source fixture\n')
+            for name in ('build/os/arm64/kernel.elf', 'os/build/x86_64/kernel.elf',
+                         'os/.git/config', 'os/arch/arm64/__pycache__/adapter.pyc',
+                         'os/arch/x86_64/stale.pyc'):
+                artifact = source / name
+                artifact.parent.mkdir(parents=True, exist_ok=True)
+                artifact.write_bytes(b'host artifact')
+            manifest = RUNNER.snapshot_sources(source, work)
+            self.assertEqual((work / 'os/arch/x86_64/tlsverify.min').read_bytes(), adapter.read_bytes())
+            self.assertEqual(manifest['os/arch/x86_64/tlsverify.min'],
+                             hashlib.sha256(adapter.read_bytes()).hexdigest())
+            for name in ('build', 'os/build', 'os/.git', 'os/arch/arm64/__pycache__',
+                         'os/arch/x86_64/stale.pyc'):
+                self.assertFalse((work / name).exists(), name)
+                self.assertFalse(any(key == name or key.startswith(name + '/') for key in manifest), name)
 
 
 if __name__ == '__main__':

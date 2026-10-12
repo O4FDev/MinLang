@@ -60,7 +60,7 @@ TARGETS = ['check-quic-official-adapter', 'check-quic-amplification-ledger', 'ch
            'check-ownership-mutation', 'check-scalar-record-initialization',
            'check-incremental-modules', 'check-incremental-modules-sanitize',
            'check-sanitize']
-DIRECTORIES = ('.github', 'bootstrap', 'compiler', 'runtime', 'library', 'vendor', 'examples', 'tests', 'build-support', 'docs',
+DIRECTORIES = ('.github', 'bootstrap', 'compiler', 'runtime', 'library', 'vendor', 'os', 'examples', 'tests', 'build-support', 'docs',
                'experiments', 'scripts', 'tools')
 
 
@@ -68,7 +68,7 @@ def copy_source_snapshot(source, work):
     """Copy declared sources without inheriting generated or host artifacts."""
     for name in DIRECTORIES:
         shutil.copytree(source / name, work / name,
-                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+                        ignore=shutil.ignore_patterns('build', '.git', '__pycache__', '*.pyc'))
     for name in ('Makefile', 'minyar'):
         shutil.copy2(source / name, work / name)
 
