@@ -16,7 +16,7 @@ import unittest
 
 HERE = Path(__file__).resolve().parent
 HELPER = HERE / "private-atacama.py"
-BASE_WORKFLOW_SHA = "c06a56f7f544615881043e2d5299aed5e22a6e656a4934e481524f078cc714fd"
+BASE_WORKFLOW_SHA = "627d20dfa0a38855116bd91b684a3f615010372fabc5ecf6ab52c0b5fba274aa"
 SECRET = "MINYAR_PHASE1_ATACAMA_AGE_KEY"
 
 
