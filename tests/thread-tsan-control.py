@@ -1,9 +1,3 @@
-
-
-
-
-
-
 import argparse
 import hashlib
 import json
@@ -11,12 +5,14 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--artifacts', type=Path, required=True)
+parser.add_argument('--artifacts', type=Path)
 args = parser.parse_args()
-directory = args.artifacts.resolve()
+temporary = tempfile.TemporaryDirectory(prefix='minyar-thread-tsan-') if args.artifacts is None else None
+directory = args.artifacts.resolve() if args.artifacts else Path(temporary.name) / 'control'
 directory.mkdir(parents=True, exist_ok=False)
 source = directory / 'race-control.min'
 source.write_text('''thread function writer(seed: Integer, input: FrozenBytes, queue: BytesChannel): Integer {
@@ -50,7 +46,8 @@ def run(label, command, environment=None):
     for path in directory.rglob('*'):
         if path.is_file() and path.name != 'manifest.json':
             manifest['files'][path.relative_to(directory).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
-    (directory / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    if args.artifacts:
+        (directory / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     return result
 
 

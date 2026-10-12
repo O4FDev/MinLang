@@ -12,7 +12,7 @@ check-thread-language: build/minyarc-threads build/minyar-default-runtime.o
 check-thread-language-sanitize: build/minyarc-threads build/minyar-default-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/thread-language.py --sanitizer address
 
-check-thread-tsan-control: build/minyarc-threads
+check-thread-tsan-control: build/minyarc-threads build/minyar-default-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/thread-tsan-control.py
 
 check check-portable: check-thread-compiler check-thread-effects check-thread-language
