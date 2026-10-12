@@ -79,6 +79,8 @@ record Connection {
     sent: Integer
     bodySent: Integer
     closing: Boolean
+    writeHup: Boolean
+    writeProbeAt: Integer
 }
 public record Server {
     private handle: Integer
@@ -161,7 +163,7 @@ function newConnection(socket: Integer, deadline: Integer): Connection {
     return Connection { active: true; socket: socket; registration: -1; phase: 0; input: Bytes();
         scan: 0; headerBytes: 0; parsed: badHead(0); deadline: deadline; started: false;
         needsParse: false; eof: false; ticket: 0; count: 0; output: Bytes(); body: Bytes();
-        sent: 0; bodySent: 0; closing: false }
+        sent: 0; bodySent: 0; closing: false; writeHup: false; writeProbeAt: -1 }
 }
 function removeWatch(server: Server, connection: Connection) {
     if connection.registration >= 0 {
@@ -386,6 +388,7 @@ function reason(status: Integer): Text {
 }
 function flush(server: Server, slot: Integer, now: Integer) {
     let connection = server.connections[slot]
+    connection.writeProbeAt = -1
     let budget = server.limits.ioBudget
     while budget > 0 {
         let data = connection.output
@@ -394,12 +397,26 @@ function flush(server: Server, slot: Integer, now: Integer) {
         if offset == data.length { data = connection.body; offset = connection.bodySent; writingHead = false }
         if offset == data.length { break }
         let count = net.writeRange(connection.socket, data, offset, min(budget, data.length - offset))
-        if count == -1 { return }
+        if count == -1 {
+            // HUP remains ready even with writable-only or zero interest.
+            // Keep the socket/unsent body, but remove the persistent watch and
+            // let shared-loop wait clamping schedule a bounded direct probe.
+            if connection.writeHup {
+                removeWatch(server, connection)
+                connection.writeProbeAt = now + 10
+            }
+            return
+        }
         if count <= 0 { drop(server, slot); return }
         if writingHead { connection.sent += count } else { connection.bodySent += count }
         budget -= count
     }
-    if connection.sent != connection.output.length || connection.bodySent != connection.body.length { return }
+    if connection.sent != connection.output.length || connection.bodySent != connection.body.length {
+        // A paused writer that used its I/O budget made real progress. Give it
+        // one more bounded turn without reinstalling a permanently ready HUP.
+        if connection.registration < 0 { connection.writeProbeAt = now }
+        return
+    }
     connection.output.clear(); connection.body = Bytes()
     if connection.closing { drop(server, slot); return }
     connection.phase = 0
@@ -423,6 +440,7 @@ function startResponse(server: Server, slot: Integer, response: Response, head: 
     connection.body = response.body
     if head || response.status == 204 || response.status == 205 || response.status == 304 { connection.body = Bytes() }
     connection.sent = 0; connection.bodySent = 0; connection.phase = 2; connection.ticket = 0
+    connection.writeHup = false; connection.writeProbeAt = -1
     connection.closing = closing
     let now = net.monotonicMilliseconds()
     connection.deadline = now + server.limits.writeMilliseconds
@@ -554,6 +572,9 @@ public function waitMilliseconds(server: Server, requested: Integer): Integer {
         if connection.active {
             if connection.needsParse { return 0 }
             timeout = min(timeout, max(0, connection.deadline - now))
+            if connection.phase == 2 && connection.writeProbeAt >= 0 {
+                timeout = min(timeout, max(0, connection.writeProbeAt - now))
+            }
         }
     }
     return timeout
@@ -576,6 +597,9 @@ public function advance(server: Server, batch: loop.Batch): Batch {
                 else { drop(server, slot) }
             } else {
                 if connection.phase == 0 && connection.needsParse { parseReady(server, slot, now, ready) }
+                if connection.phase == 2 && connection.writeProbeAt >= 0 && now >= connection.writeProbeAt {
+                    flush(server, slot, now)
+                }
             }
         }
     }
@@ -589,7 +613,18 @@ public function advance(server: Server, batch: loop.Batch): Batch {
                 let connection = server.connections[slot]
                 if connection.active && event.registration == connection.registration {
                     if connection.phase == 0 { readReady(server, slot, now, ready) }
-                    else { if connection.phase == 2 { flush(server, slot, now) } }
+                    else {
+                        if connection.phase == 2 {
+                            if loop.isClosed(event) {
+                                connection.writeHup = true
+                                // Do not wait for another closed-only event:
+                                // each bounded successful write can still leave
+                                // HUP ready, even before the final would-block.
+                                removeWatch(server, connection)
+                            }
+                            flush(server, slot, now)
+                        }
+                    }
                 }
             }
         }

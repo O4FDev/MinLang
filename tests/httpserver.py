@@ -14,9 +14,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class Wire:
-    def __init__(self, port):
-        self.socket = socket.create_connection(('127.0.0.1', port), timeout=2)
+    def __init__(self, port, receive_buffer=None):
+        self.socket = socket.socket()
+        if receive_buffer is not None:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, receive_buffer)
         self.socket.settimeout(2)
+        self.socket.connect(('127.0.0.1', port))
         self.input = b''
 
     def send(self, data):
@@ -198,12 +201,61 @@ def regressions(port):
         assert active == 1 and slots <= 4, (active, slots)
 
 
+def write_wait_regressions(binary, build, environment):
+    import queue
+    import threading
+    observations = []
+    for half_close, resume in ((False, False), (True, False), (True, True)):
+        with (build/'write-wait-stderr.log').open('w+') as log:
+            process = subprocess.Popen([binary], stdout=subprocess.PIPE, stderr=log, text=True, env=environment)
+            client = None
+            try:
+                ready = queue.Queue()
+                threading.Thread(target=lambda: ready.put(process.stdout.readline()), daemon=True).start()
+                port = int(ready.get(timeout=5))
+                client = Wire(port, receive_buffer=4096)
+                client.send(request('/large', close=True))
+                if half_close:
+                    client.socket.shutdown(socket.SHUT_WR)
+                # Keep the response backpressured while another client makes progress.
+                time.sleep(0.05)
+                with peer(port) as fast:
+                    fast.send(request('/small', close=True))
+                    assert fast.response()[2] == b'ok'
+                if resume:
+                    client.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4194304)
+                    assert client.response()[2] == bytes(4194304), 'valid half-close truncated a response'
+                    client.eof()
+                output, _ = process.communicate(timeout=3)
+                assert process.returncode == 0, process.returncode
+                waits, closed_only, ticks, active = map(int, output.strip().split(':'))
+                row = dict(half_close=half_close, resume=resume, waits=waits,
+                           closed_nonwritable_events=closed_only, timer_ticks=ticks, active=active)
+                observations.append(row)
+                assert waits <= 300, ('backpressured writer busy-spun', row)
+                assert closed_only <= 4, ('persistent nonwritable HUP readiness', row)
+                assert ticks >= 5 and active == 0, ('shared timer/deadline/cleanup failed', row)
+            finally:
+                if client is not None:
+                    client.close()
+                if process.poll() is None:
+                    process.terminate(); process.wait(timeout=3)
+                log.seek(0)
+                diagnostics = log.read()
+                assert not diagnostics, diagnostics
+    print('Half-close backpressure observations: ' + repr(observations))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, help='test an already-built fixture')
+    parser.add_argument('--write-binary', type=Path, help='already-built shared-loop writer observer')
+    parser.add_argument('--write-only', action='store_true', help='run the focused backpressure regression')
     parser.add_argument('--mode', choices=('debug', 'release'), default='debug')
     parser.add_argument('--sanitize', action='store_true')
     args = parser.parse_args()
+    if args.binary and not args.write_binary:
+        parser.error('--binary requires --write-binary so the mandatory regression is included')
     environment = os.environ.copy()
     if args.sanitize:
         flags = '-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wno-override-module'
@@ -213,9 +265,17 @@ def main():
     build = ROOT / 'build/httpserver'
     build.mkdir(parents=True, exist_ok=True)
     binary = args.binary or build / ('server-' + args.mode + ('.exe' if windows_host() else ''))
+    write_binary = args.write_binary or build / ('write-wait-' + args.mode + ('.exe' if windows_host() else ''))
     if not args.binary:
-        subprocess.run([*launcher_command(ROOT), '--' + args.mode, ROOT/'tests/httpserver.min',
-                        '-o', binary], check=True, cwd=ROOT, env=environment, timeout=90)
+        sources = [(ROOT/'tests/httpserver-write-wait.min', write_binary)]
+        if not args.write_only:
+            sources.append((ROOT/'tests/httpserver.min', binary))
+        for source, program in sources:
+            subprocess.run([*launcher_command(ROOT), '--' + args.mode, source,
+                            '-o', program], check=True, cwd=ROOT, env=environment, timeout=90)
+    write_wait_regressions(write_binary, build, environment)
+    if args.write_only:
+        return
     with (build / 'stderr.log').open('w+') as log:
         process = subprocess.Popen([binary], stdout=subprocess.PIPE, stderr=log, text=True, env=environment)
         try:

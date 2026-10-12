@@ -37,6 +37,11 @@ application watches before closing their sockets and before `http.close`,
 which closes the shared loop. Application requests have no client watch while
 dispatched, preventing close/HUP notifications from spinning a paused socket.
 Rewatching happens when a response starts. `poll` is the simple owned-loop helper.
+If a writing socket reports HUP, its watch is removed.
+The server retains all unsent bytes and probes writes at 10 ms intervals while
+blocked, using `waitMilliseconds` to clamp the shared loop. Successful probes
+may consume one I/O budget per advance turn; the fixed write deadline is never
+extended. Half-close alone does not discard or truncate a valid response.
 
 Only HTTP/1.1 origin-form targets and OPTIONS `*` are accepted. Syntax requires
 CRLF, ASCII header values, token field names, exactly one nonempty Host, and a
@@ -87,3 +92,8 @@ before socket close, and `close` is idempotent.
 Run `make check-httpserver` for real socket tests at debug/release. The portable
 gate includes it. Windows and sanitizer qualification are recorded separately;
 source portability alone is not execution evidence.
+The mandatory suite combines FIN with a backpressured 4 MiB response, bounds
+wait/HUP wake counts, proves an unrelated client and external timer progress,
+and checks exact-body completion when the half-closed client resumes reading.
+For directly built fixtures, pass both `--binary` and `--write-binary` so this
+shared-loop regression is included.
