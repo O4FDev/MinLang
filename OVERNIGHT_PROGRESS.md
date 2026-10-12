@@ -19,13 +19,13 @@ Every proposed integration will receive an independent review subagent before th
 
 ## Merged list and gaps closed
 
-- No new integration merges yet. Existing candidate contains TLS cleanup `6518ef3` and unqualified QUIC CID WIP `8daa72c`.
+- Independent reviews running for shipping, desktop, Windows, collector preservation and neo-db. No new integration merges yet. Existing candidate contains TLS cleanup `6518ef3` and unqualified QUIC CID WIP `8daa72c`.
 - No Phase 2 gaps claimed closed yet. Owning project code has not been changed.
 
 ## Boat and spending
 
 - W `bx_w8xs3uwb` and Y `bx_y2vp5byg` extended with included credit until 17:27 UTC.
-- Dedicated Linux test box `bx_q9mdad57` created with included credit, six-hour lifetime.
+- Dedicated Linux `bx_q9mdad57` for QUIC and `bx_3uusc6gg` for preserved collector stress created with included credit, six-hour lifetimes.
 - W reserved for neo-db durable I/O qualification; dedicated Linux box reserved for existing QUIC CID WIP qualification; Y reserved for Windows.
 - New paid spend: **$0 / $10**. Other projects' existing Boat boxes are not allocated to this programme.
 - No heavy local builds, long local tests, local Windows execution, force pushes or URL opening.
@@ -33,8 +33,9 @@ Every proposed integration will receive an independent review subagent before th
 ## Current blockers and required qualification
 
 - Branch dispositions and final missing-change tests are being audited; nothing is deemed superseded solely by branch age.
-- CID WIP requires native and sanitizer GREEN before the unified candidate can qualify.
+- CID RED reproduced on Boat; first-use GREEN passed. The 68-case native driver is GREEN after a fixture deadline setup correction that passes both old/new code; native O2 and sanitizer qualification continue.
+- neo-db review R1 blocks merge on ten concrete durability, directory framing/error, syncer lifetime/setup, signal narrowing/rollback and diagnostic bounds defects. Two already have actual RED; remaining test-first repairs assigned to the same code owner on W. No obsolete-source broad reruns.
 - Current full Linux/macOS/Windows suites and CI remain unqualified; prior passing commits do not qualify this revision.
-- Native macOS capability on Boat is being checked; both existing programme hosts are Linux, with a retained Windows VM on Y.
+- Native macOS is absent on Boat. Owner directed use of this Mac for native checks; heavy builds/long tests remain on Boat. Offloaded ARM64 generation and bounded serial Apple-native checks are being prepared.
 - Owner added Phase 2 item 0: shared-memory threads; start after Phase 1, with ±1% single-thread performance, Boat multicore scaling, TSan stress and a neo-db design note.
 - Phase 3 remains queued behind Phase 1: interop 72–119, CID qualification, merged-code two-hour soak, Windows idle gate, real 20,000 devices and signed publishing.
