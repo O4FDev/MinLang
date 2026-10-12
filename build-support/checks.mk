@@ -745,11 +745,13 @@ check-tls-sanitize: check-tls-signing-usage-sanitize
 
 # Real unsafe generated-program accesses must fail after the public link driver.
 .PHONY: check-generated-llvm-sanitizer
-GENERATED_SANITIZER_CLANG = $(or $(MINYAR_SANITIZER_CLANG),$(LLVM_CC))
-GENERATED_SANITIZER_PATH = $(if $(MINYAR_SANITIZER_CLANG),$(dir $(MINYAR_SANITIZER_CLANG)):$(PATH),$(PATH))
+# Keep the override one shell argument and translate native Windows spellings.
+GENERATED_SANITIZER_QUOTE = '$(subst ','"'"',$(1))'
+GENERATED_SANITIZER_CLANG = $(if $(MINYAR_SANITIZER_CLANG),$(shell python3 -c 'import sys; sys.path.insert(0, "tools"); from host_paths import host_path; print(host_path(sys.argv[1]))' $(call GENERATED_SANITIZER_QUOTE,$(MINYAR_SANITIZER_CLANG))),$(LLVM_CC))
+GENERATED_SANITIZER_PATH = $(if $(MINYAR_SANITIZER_CLANG),$(shell python3 -c 'import sys; sys.path.insert(0, "tools"); from host_paths import host_path; print(host_path(sys.argv[1]).parent)' $(call GENERATED_SANITIZER_QUOTE,$(GENERATED_SANITIZER_CLANG))):$(PATH),$(PATH))
 GENERATED_SANITIZER_INPUTS = tests/generated-llvm-sanitizer.py tests/generated-llvm-sanitizer.min tests/llvm_sanitizer.py tests/clang_helpers.py tests/test_evidence.py tools/clang-driver.py tools/sanitizer_llvm.py tools/host_paths.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
 check-generated-llvm-sanitizer: build/minyarc $(GENERATED_SANITIZER_INPUTS) | build
-	@set -e; artifacts=$$(mktemp -d "$(abspath build)/generated-llvm-sanitizer-XXXXXXXX"); PATH="$(GENERATED_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(GENERATED_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/generated-llvm-sanitizer.py --artifacts "$$artifacts/run"
+	@set -e; artifacts=$$(mktemp -d "$(abspath build)/generated-llvm-sanitizer-XXXXXXXX"); PATH="$(GENERATED_SANITIZER_PATH)" MINYAR_TEST_CLANG=$(call GENERATED_SANITIZER_QUOTE,$(GENERATED_SANITIZER_CLANG)) $(SANITIZER_LIMITED) python3 tests/generated-llvm-sanitizer.py --artifacts "$$artifacts/run"
 check check-portable check-sanitize: check-generated-llvm-sanitizer
 
 # Actual UDP blackholes before/mid-session, then independent TCP mTLS/yamux.
