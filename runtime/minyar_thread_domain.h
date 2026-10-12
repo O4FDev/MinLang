@@ -16,6 +16,9 @@ static inline void rc_thread_domain_drain(void) {
 
 static inline void rc_thread_domain_dispose(void) {
     if (rc_frames) minyar_stop("a thread returned with live ownership frames.");
+    /* Retired frames, dead aggregate fields and view backings can still name
+     * immortal integer cache headers. Finish that debt while caches are live. */
+    rc_thread_domain_drain();
     integer_text_cached(0, 1);
     rc_thread_domain_drain();
     while (rc_free_frames) {

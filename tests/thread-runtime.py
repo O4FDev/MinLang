@@ -9,25 +9,31 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 from cycle_runtime import engine_source
-from clang_helpers import native_path
+from clang_helpers import native_path, windows_host, asan_leak_options
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--domain-only', action='store_true')
     parser.add_argument('--buffers-only', action='store_true')
+    parser.add_argument('--cache-debt-only', action='store_true')
+    parser.add_argument('--windows-cross', action='store_true')
     parser.add_argument('--sanitize', choices=['none', 'address,undefined', 'thread'], default='none')
     args = parser.parse_args()
     build = ROOT / 'build'
     build.mkdir(exist_ok=True)
     (build / 'thread-cycle-engine.c').write_text(engine_source(ROOT))
-    compiler = os.environ.get('MINYAR_TEST_CLANG', 'clang')
-    sources = ['thread-buffers.c'] if args.buffers_only else ['thread-domain.c'] if args.domain_only else ['thread-domain.c', 'thread-buffers.c']
+    compiler = os.environ.get('MINYAR_TEST_CLANG', 'x86_64-w64-mingw32-gcc' if args.windows_cross else 'clang')
+    windows = args.windows_cross or windows_host()
+    launch = ['wine'] if args.windows_cross else []
+    if args.windows_cross and args.sanitize != 'none':
+        parser.error('Windows cross/Wine fixtures do not qualify native sanitizers')
+    sources = ['thread-cache-debt.c'] if args.cache_debt_only else ['thread-buffers.c'] if args.buffers_only else ['thread-domain.c'] if args.domain_only else ['thread-domain.c', 'thread-cache-debt.c', 'thread-buffers.c']
     for source in sources:
         for cycles in (False, True):
             for bounded in (False, True):
                 label = f'{Path(source).stem}-{"cycle" if cycles else "rc"}-{"bounded" if bounded else "eager"}'
-                output = build / (label + ('.exe' if os.name == 'nt' else ''))
+                output = build / (label + ('.exe' if windows else ''))
                 command = [compiler, '-std=c11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
                            '-DMINYAR_THREADED=1', '-I' + native_path(ROOT / 'runtime')]
                 if cycles:
@@ -36,20 +42,26 @@ def main():
                     command += ['-DMINYAR_SYSTEM_HEAP=1']
                     if os.environ.get('MINYAR_TEST_RC_BUDGET'):
                         command += ['-DMINYAR_RC_POLL_BUDGET=' + os.environ['MINYAR_TEST_RC_BUDGET']]
+                if os.environ.get('MINYAR_TEST_TEXT_CACHE'):
+                    command += ['-DMINYAR_INTEGER_TEXT_CACHE_LIMIT=' + os.environ['MINYAR_TEST_TEXT_CACHE']]
                 if args.sanitize != 'none':
                     command += ['-fsanitize=' + args.sanitize, '-fno-omit-frame-pointer']
                 command += [native_path(ROOT / 'tests' / source), '-o', native_path(output)]
-                command += [] if os.name == 'nt' else ['-pthread', '-lm']
+                command += [] if windows else ['-pthread', '-lm']
                 subprocess.run(command, check=True, timeout=120)
                 environment = dict(os.environ, UBSAN_OPTIONS='halt_on_error=1', TSAN_OPTIONS='halt_on_error=1')
-                environment['ASAN_OPTIONS'] = 'detect_leaks=' + ('1' if sys.platform.startswith('linux') else '0')
-                subprocess.run([native_path(output)], check=True, timeout=90, env=environment)
+                environment['ASAN_OPTIONS'] = asan_leak_options()
+                if args.windows_cross:
+                    environment['WINEDEBUG'] = '-all'
+                subprocess.run(launch + [native_path(output)], check=True, timeout=90, env=environment)
                 if source == 'thread-runtime.c':
-                    for case, diagnostic in [('capacity', 'capacity'), ('bounds', 'position'),
+                    for case, diagnostic in [('allocation', 'memory'), ('allocation-packet', 'memory'),
+                            ('allocation-detach', 'memory'), ('capacity', 'capacity'), ('bounds', 'position'),
                             ('bounds64', 'position'), ('start-result', 'Result'),
                             ('join-result', 'Result'), ('frozen-result', 'Result')]:
-                        stopped = subprocess.run([native_path(output), case], capture_output=True,
-                                                 timeout=10, env=environment, text=True)
+                        fault_environment = dict(environment)
+                        stopped = subprocess.run(launch + [native_path(output), case], capture_output=True,
+                                                 timeout=10, env=fault_environment, text=True)
                         if stopped.returncode in (0, 99) or diagnostic not in stopped.stderr:
                             raise AssertionError((label, case, stopped.returncode, stopped.stderr))
                 print(label + ' ' + args.sanitize + ' passed', flush=True)
