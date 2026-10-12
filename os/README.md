@@ -96,7 +96,7 @@ empty boot record and no loader; its directory and files are the same.
 Everything above the boot code (x86-64's boot record, entry stub and
 interrupt stubs; Arm's `head.S`) is Minyar. The language runtime underneath it
 is the standard Minyar runtime built freestanding; see
-[freestanding programs](../docs/freestanding.md).
+freestanding programs.
 
 ## Using it
 

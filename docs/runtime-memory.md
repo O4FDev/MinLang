@@ -14,7 +14,7 @@ The following proof describes ordinary untraced allocation. The optional
 managed-graph frontend supports cycle-capable mutation and typed closures.
 Activated type components use a separate traced runtime with exact hidden
 capture edges; they do not use this no-cycles proof. See
-[the graph ownership and execution-domain contract](managed-graphs.md).
+the graph ownership and execution-domain contract.
 The ordinary compiler's cycle checks request that frontend with status 86
 instead of emitting an unsafe edge. Programs that require no such feature
 retain the original LLVM and runtime allocation representation.
@@ -118,10 +118,10 @@ reclamation latency. For a fixed 4,096-node test graph, budget 32 required 470
 batches with at most 4.7 seconds of summed wake deadlines; budget 1 required
 18,332 batches with at most 183.31 seconds. These are deterministic deadline
 sums, not measured wall times or bounds for growing application graphs. See
-[the progress tests and tradeoff](research/cycle-reactor-progress.md).
+the progress tests and tradeoff.
 This wait policy belongs to `eventcallbacks.dispatch`. The separate AppKit
 `macos.nextEvent` hook services one batch and pumps input without sleeping while
-debt remains; see [the AppKit cleanup contract](macos.md#shared-socket-and-callback-loop).
+debt remains; see the AppKit cleanup contract.
 
 Current registration barriers distinguish fresh or newly exposed owning edges
 from an already proven snapshot cohort. Irreversibly dead private owners are
@@ -136,8 +136,8 @@ native and ASan/UBSan/LSan, with exact `42/41` output and empty stderr.
 Typed `Result<T,E>` values use owned records with only the active payload slot
 initialized and owning. Match and early propagation preserve payload lifetimes
 and run scope cleanup; cycles through either payload follow the same optional
-graph analysis. See [the Result language contract](research/errors-language.md)
-and [the independent review](research/errors-review.md).
+graph analysis. See the Result language contract
+and the independent review.
 
 ## Compiler/runtime ownership contract
 
@@ -333,5 +333,5 @@ unchanged 2% idle assertion at `system-k1024/n2048`. That timed failure remains
 unresolved, independently of passing registration and locality controls.
 
 See [runtime profiles](bounded-runtime-contract.md) for incremental cleanup and
-finite-heap configuration, and [the v2 verification map](v2-verification.md)
+finite-heap configuration, and the v2 verification map
 for source-specific evidence and remaining platform checks.

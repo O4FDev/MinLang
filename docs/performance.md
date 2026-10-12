@@ -46,7 +46,7 @@ from 17.733 ms to 7.275 ms; identical-original-source results are recorded
 separately. The independent 3×100-run budget gate also passes: 9.16 ms wall p90, 7.65 ms
 CPU p90, 9.3 MiB maximum RSS, and 71.88 million instructions. Its original
 ceilings and batch method are unchanged. See the
-[hardening report](hardening-report.md) for current evidence.
+hardening report for current evidence.
 
 The budget test runs outside the development limiter because background
 priority changes absolute timings. It takes the 90th percentile across batches;
@@ -120,7 +120,7 @@ that can be made green by discarding inconvenient samples.
 The October final default-build measurements close the earlier arithmetic,
 record, and indexed-List CPU gaps on the maintained workloads. The scalar study
 adds shifts, Unicode scalar conversion, Float-to-Integer and abs/clamp; the
-[hardening report](hardening-report.md) retains ratios and confidence intervals.
+hardening report retains ratios and confidence intervals.
 System-allocation LTO List work still has a measured 1.02% CPU gap and more
 retired instructions. Its disassembly identifies memory-effect/alias information
 as remaining work; faster default CPU measurements do not establish lower

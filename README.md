@@ -26,7 +26,7 @@ executable, and output paths cannot replace the input source.
 
 `./minyar --help` lists options, `--version` identifies the development sources,
 and `--doctor` checks the native toolchain with a real LLVM/LTO link. See
-[native toolchains](docs/toolchain.md) for platform setup and compiler selection.
+native toolchains for platform setup and compiler selection.
 
 Programs use automatic, system-backed incremental reference counting by default.
 Large ownership graphs are reclaimed in budgeted batches, with no tracing
@@ -76,7 +76,7 @@ make -C os run ARCH=arm64   # 64-bit Arm
 ```
 
 The `machine` package and `--freestanding` builds that make it possible are
-described in [freestanding programs](docs/freestanding.md).
+described in freestanding programs.
 
 ## Native macOS apps
 
@@ -89,11 +89,11 @@ open "build/Minyar Notes.app"
 
 The `macos` package provides windows, layout, styling, controls and an event loop
 directly in Minyar, and the `http` and `json` packages talk to web services. See
-the [macOS guide](docs/macos.md) for APIs, ownership, packaging (including
+the macOS guide for APIs, ownership, packaging (including
 `--icon` and `--resources`), and the Swift-to-AppKit ABI investigation.
 
 An experimental native SwiftUI compiler frontend is also available. First build
-the pinned compiler using the [native frontend guide](docs/native-frontend.md), then:
+the pinned compiler using the native frontend guide, then:
 
 ```sh
 ./minyar --backend native --release --app examples/swiftui/main.min -o "build/Minyar Native SwiftUI.app"
@@ -106,7 +106,7 @@ adding a Minyar UI runtime. Native acceptance tests cover
 SwiftUI scenes, macros, module imports, and a differential LLVM comparison.
 It is **not full Minyar/Swift parity**. The older `--backend swift` source prototype
 remains available with the installed Xcode compiler. See the
-[SwiftUI compiler guide](docs/swiftui.md) for tested features, code-generation
+SwiftUI compiler guide for tested features, code-generation
 comparison, language differences and the remaining frontend work.
 
 For an app split into plain `.min` files, use `app.min` at the project root and
@@ -121,7 +121,7 @@ open "build/Project Counter.app"
 ## Native Linux desktop apps
 
 The native frontend also has an experimental GTK 4/libadwaita target. Build the
-compiler inside Fedora using the [Linux desktop guide](docs/linux-desktop.md), then:
+compiler inside Fedora using the Linux desktop guide, then:
 
 ```sh
 ./minyar --backend native --release --pkg-config libadwaita-1 \
@@ -137,12 +137,9 @@ remain unfinished.
 
 ## Documentation
 
-- [Language guide](docs/language.md) and [syntax review](docs/syntax-review.md)
-- [Architecture and coding standards](docs/architecture.md)
-- [Native toolchains and LLVM audit](docs/toolchain.md)
-- [October language hardening review](docs/hardening-report.md)
+- [Language guide](docs/language.md)
 - [Modules](docs/modules.md) and [incremental builds](docs/incremental-builds.md)
-- [Freestanding programs](docs/freestanding.md) and [Minyar OS](os/README.md)
+- [Minyar OS](os/README.md)
 - [Examples](examples/)
 - [Runtime ownership](docs/runtime-memory.md) and [runtime profiles](docs/bounded-runtime-contract.md)
 - [Performance testing](docs/performance.md)

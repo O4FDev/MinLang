@@ -5,7 +5,7 @@ Use `make check-portable` for the cross-platform compiler/runtime gate and
 budgets. `make check-examples` runs the executable examples and rejecting
 diagnostics independently. Coverage, systematic mutation, and AFL++ campaigns
 have separate targets described below. Current results and unmet performance
-targets are recorded in the [hardening review](hardening-report.md).
+targets are recorded in the hardening review.
 
 `make check-cold-bootstrap`, also in the portable gate, exercises the public
 incremental launcher from an empty build directory with default development
@@ -208,8 +208,8 @@ mismatch and required definitions, preserves runnable imports after relocation,
 rejects a non-reproducing baseline, protects existing reports, and checks the
 actual relocated output against the oracle before certifying success.
 
-The [peer roadmap](research/peer-testing-roadmap.md) records the initial research.
-The [exhaustive review ledger](research/exhaustive/README.md) is a separate,
+The peer roadmap records the initial research.
+The exhaustive review ledger is a separate,
 ongoing audit; inventory counts are not claims that all tests were read.
 
 ## Shared memory contract runner
@@ -388,7 +388,7 @@ campaign. The configured regression floor is 85%. The current campaign score
 and denominator are recorded in `build/mutation-score.json`; an earlier 16/16
 result predates candidate-selection and baseline-gate fixes and must not be
 used as evidence for the strengthened campaign. The
-[hardening report](hardening-report.md) records the separate strengthened
+hardening report records the separate strengthened
 campaign and its source-bound evidence.
 
 A campaign with no viable mutants fails even when the score floor is zero,
