@@ -27,7 +27,7 @@ def main():
         if options.state_only:return 0
         for command in commands:
             started=time.monotonic();print('RUN',command,flush=True);log.write('RUN '+str(command)+'\n');log.flush()
-            result=subprocess.run([sys.executable,str(ROOT/'tests'/command[0]),*command[1:],*(['--sanitize'] if options.sanitize else [])],cwd=ROOT,stdout=log,stderr=subprocess.STDOUT,timeout=240 if '--streams' in command else 180)
+            result=subprocess.run([sys.executable,str(ROOT/'tests'/command[0]),*command[1:],*(['--sanitize'] if options.sanitize else [])],cwd=ROOT,stdout=log,stderr=subprocess.STDOUT,timeout=360 if options.sanitize and '--rtt' in command else 240 if '--streams' in command else 180)
             row={'command':command,'status':result.returncode,'seconds':time.monotonic()-started};results.append(row);print(json.dumps(row),flush=True)
             (options.artifacts/'suite.json').write_text(json.dumps(results,indent=2)+'\n')
             if result.returncode:return result.returncode
