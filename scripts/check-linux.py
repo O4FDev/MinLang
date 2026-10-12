@@ -126,7 +126,7 @@ def in_tier(label, tier):
     return tier == 'all' or tier_of(label) == tier
 
 
-DIRECTORIES = ('.github', 'bootstrap', 'compiler', 'runtime', 'library', 'vendor', 'os', 'examples', 'tests', 'build-support', 'docs',
+DIRECTORIES = ('.github', 'benchmarks', 'bootstrap', 'compiler', 'runtime', 'library', 'vendor', 'os', 'examples', 'tests', 'build-support', 'docs',
                'experiments', 'scripts', 'tools')
 
 
