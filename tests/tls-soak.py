@@ -13,7 +13,7 @@ import ssl
 import subprocess
 import threading
 import time
-from soak_observer import observe, memory_summary, require_remote_lab
+from soak_observer import observe, memory_summary, process_sample, require_remote_lab
 
 ROOT=Path(__file__).resolve().parents[1]
 parser=argparse.ArgumentParser(description=__doc__)
@@ -91,6 +91,7 @@ with (temp/'stderr.log').open('w') as errors,(temp/'samples.jsonl').open('w') as
     process=subprocess.Popen(run_command,stdout=subprocess.PIPE,stderr=errors,start_new_session=True,env=environment)
     try:
         for sample in observe(process,args.seconds+120):
+            if 'rss_kib' in sample: sample['controller']=process_sample(os.getpid())
             sample['server']=dict(stats)
             if sample.get('line','').startswith('complete '): complete=True
             evidence.write(json.dumps(sample,sort_keys=True)+'\n'); evidence.flush(); samples.append(sample)
@@ -105,7 +106,7 @@ async def shutdown():
 asyncio.run_coroutine_threadsafe(shutdown(),loop).result(timeout=15)
 loop.call_soon_threadsafe(loop.stop); thread.join(15)
 diagnostics=(temp/'stderr.log').read_text()
-report={'binary_sha256':hashlib.sha256(program.read_bytes()).hexdigest(),'command':run_command,'compile_command':compile_command,'diagnostics_empty':not diagnostics,'status':status,'duration_seconds':time.time()-started,'connections':args.connections,'sanitized':None if args.binary else args.sanitize,'sanitized_requested':args.sanitize,'binary_prebuilt':bool(args.binary),'server':stats,'unexpected_server_errors':unexpected,'observer_failure':failure,'completed':complete,**memory_summary(samples),'scope':'Minyar TLS1.3 mutual TLS and HTTP keep-alive; QUIC not included'}
+report={'binary_sha256':hashlib.sha256(program.read_bytes()).hexdigest(),'command':run_command,'compile_command':compile_command,'diagnostics_empty':not diagnostics,'status':status,'duration_seconds':time.time()-started,'connections':args.connections,'sanitized':None if args.binary else args.sanitize,'sanitized_requested':args.sanitize,'binary_prebuilt':bool(args.binary),'controller_pid':os.getpid(),'target_pid':process.pid,'controller_role':'TLS server and observer share this process','server':stats,'unexpected_server_errors':unexpected,'observer_failure':failure,'completed':complete,**memory_summary(samples),'scope':'Minyar TLS1.3 mutual TLS and HTTP keep-alive; QUIC not included'}
 (temp/'report.json').write_text(json.dumps(report,indent=2)+'\n'); print(json.dumps(report),flush=True)
 assert status==0 and not unexpected and failure is None and not diagnostics, 'soak failed; inspect evidence'
 assert complete, 'client did not complete'

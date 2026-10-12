@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import time
-from soak_observer import observe, memory_summary, require_remote_lab
+from soak_observer import observe, memory_summary, process_sample, require_remote_lab
 
 ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
@@ -43,6 +43,7 @@ with (args.output/'stderr.log').open('w') as errors, (args.output/'samples.jsonl
                                env=dict(os.environ,ASAN_OPTIONS='detect_leaks=1',UBSAN_OPTIONS='halt_on_error=1'))
     try:
         for sample in observe(process, args.seconds + 120):
+            if 'rss_kib' in sample: sample['controller']=process_sample(os.getpid())
             if 'line' in sample:
                 sample['peer'] = json.loads(sample['line'])
                 if sample['peer']['phase'] == 'sample': last_peer = sample['peer']
@@ -55,6 +56,8 @@ with (args.output/'stderr.log').open('w') as errors, (args.output/'samples.jsonl
     status=process.wait(timeout=15)
 diagnostics = (args.output/'stderr.log').read_text()
 report={'binary_sha256':hashlib.sha256(executable.read_bytes()).hexdigest(),
+        'controller_pid':os.getpid(),'target_pid':process.pid,
+        'controller_role':'native socket observer',
         'command':run_command,'compile_command':compile_command,'diagnostics_empty':not diagnostics,
         'seconds_requested':args.seconds,'connections':args.connections,'status':status,
         'samples':len(samples),'wall_seconds':time.time()-started,'sanitized':None if args.binary else args.sanitize,'sanitized_requested':args.sanitize,'binary_prebuilt':bool(args.binary),

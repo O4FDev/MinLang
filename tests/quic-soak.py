@@ -74,8 +74,23 @@ class FaultProxy:
 def process_sample(pid):
     # stat's parenthesized process name can contain spaces.
     fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
-    return {'rss_bytes': int(fields[21]) * os.sysconf('SC_PAGE_SIZE'),
+    return {'state': fields[0], 'rss_bytes': int(fields[21]) * os.sysconf('SC_PAGE_SIZE'),
             'cpu_seconds': (int(fields[11]) + int(fields[12])) / os.sysconf('SC_CLK_TCK')}
+
+
+def peer_observation(process):
+    # A completed peer has no live RSS. Keep its last real sample and exit
+    # status separately; a zombie is not a zero-memory observation.
+    status = process.poll()
+    if status is not None: return status, None
+    try:
+        sample = process_sample(process.pid)
+    except FileNotFoundError:
+        status = process.poll()
+        if status is None: raise
+        return status, None
+    if sample['state'] in ('Z', 'X', 'x'): return process.poll(), None
+    return None, sample
 
 
 def ready_line(process, timeout=15):
@@ -158,7 +173,8 @@ def main():
                 source.update(str(path.relative_to(ROOT)).encode()); source.update(path.read_bytes())
             report = {'host': socket.gethostname(), 'platform': platform.platform(), 'configuration': configuration,
                       'versions': versions, 'source_sha256': source.hexdigest(), 'server_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
-                      'server_pid':server.pid,'controller_pid':os.getpid(),'samples':samples,
+                      'server_pid':server.pid,'controller_pid':os.getpid(),'peer_pid':client.pid if client else None,
+                      'controller_role':'QUIC fault proxy and observer share this process','samples':samples,
                       'command':server_command,'peer_command':peer_command,'compile_command':compile_command,'peer_build_command':peer_build_command,
                       'peer_sha256':hashlib.sha256(peer_binary.read_bytes()).hexdigest() if not options.server_only else None}
             options.report.parent.mkdir(parents=True, exist_ok=True)
@@ -169,6 +185,7 @@ def main():
                     raise TimeoutError('QUIC soak exceeded its independent wall-clock deadline')
                 sample = process_sample(server.pid); sample['elapsed_seconds'] = time.monotonic() - started
                 sample['controller'] = process_sample(os.getpid())
+                sample['peer_status'], sample['peer'] = peer_observation(client) if client else (None, None)
                 sample['host_load_average'] = list(os.getloadavg())
                 sample['proxy_forwarded']=proxy.forwarded;sample['proxy_dropped']=proxy.dropped;sample['proxy_delayed']=proxy.delayed
                 if samples:
