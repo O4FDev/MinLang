@@ -1,9 +1,50 @@
 """Native dictionary gap repros, typed nesting, ownership, and diagnostics."""
+import json
+import os
 import unittest
 import random
-from regressions import CompilerTestCase
+from clang_helpers import clang_command
+from regressions import CompilerTestCase, CLANG, LINK_FLAGS, RUN_TIMEOUT
+from test_evidence import digest
+
+# maps-matrix.py passes every allocation/collector runtime at once, as a JSON
+# list of [name, object] pairs. Each program then compiles and code-generates
+# once per optimization; only the link and the run repeat for each runtime.
+RUNTIMES = json.loads(os.environ.get('MINYAR_MAP_RUNTIMES', 'null'))
+
 
 class Maps(CompilerTestCase):
+    def executes(self, source, expected, status=0, stderr=''):
+        if not RUNTIMES:
+            return super().executes(source, expected, status, stderr)
+        optimizations = ('-O0', '-O2')
+        for _, runtime in RUNTIMES:
+            self.evidence.inputs[runtime] = digest(runtime)
+        self.evidence.controls.setdefault('execution_oracles', []).append({
+            'source': f'case{self.serial + 1}.min', 'stdout': expected, 'stderr': stderr, 'status': status,
+            'optimizations': list(optimizations), 'runtimes': [name for name, _ in RUNTIMES]})
+        result, llvm = self.compile(source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for optimization in optimizations:
+            with self.subTest(optimization=optimization):
+                program = llvm.with_suffix('.' + optimization[1:] + '.o')
+                build = self.evidence.run(clang_command([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module',
+                                                         '-c', str(llvm), '-o', str(program)]),
+                                          capture_output=True, text=True, timeout=30, phase='codegen')
+                self.assertEqual(build.returncode, 0, build.stderr)
+                for name, runtime in RUNTIMES:
+                    with self.subTest(runtime=name):
+                        exe = llvm.with_suffix(f'.{optimization[1:]}.{name}')
+                        link = self.evidence.run(clang_command([CLANG, optimization, *LINK_FLAGS, str(program),
+                                                                runtime, '-o', str(exe)]),
+                                                 capture_output=True, text=True, timeout=30, phase='link')
+                        self.assertEqual(link.returncode, 0, link.stderr)
+                        run = self.evidence.run([str(exe)], capture_output=True, timeout=RUN_TIMEOUT, phase='execute')
+                        self.assertEqual(run.returncode, status, run.stderr)
+                        self.assertEqual(run.stdout, expected.encode('utf-8'))
+                        self.assertEqual(run.stderr, stderr.encode('utf-8'))
+        return llvm
+
     def test_python_dictionary_model(self):
         model = {}
         rng = random.Random(20261012)

@@ -5,6 +5,8 @@ Run heavy verification on the assigned Boat under its serial build lock.
 Every normal language exit checks exact live-object recovery, including cycles.
 """
 import argparse
+import concurrent.futures
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -35,6 +37,7 @@ def main():
                ASAN_OPTIONS='detect_leaks=1', UBSAN_OPTIONS='halt_on_error=1')
     suffix = '-sanitize' if args.sanitize else ''
     frontends = tuple(name + suffix for name in ('minyarc', 'minyarc-modules', 'minyarc-callbacks', 'minyarc-errors'))
+    runtimes = []
     for traced in (False, True):
         for profile, definitions in profiles:
             # Arena has process-lifetime ownership; all others enforce recovery.
@@ -59,11 +62,24 @@ def main():
             runtime = harness.with_suffix('.o')
             subprocess.run([clang, '-O1' if args.sanitize else '-O2', *flags, *definitions,
                             '-iquote', str(ROOT / 'runtime'), '-c', str(harness), '-o', str(runtime)], check=True)
-            for frontend in frontends:
-                print('FRONTEND', name, frontend, flush=True)
-                subprocess.run([sys.executable, str(ROOT / 'tests/maps.py')], check=True,
-                               env=dict(env, MINYAR_TEST_COMPILER=str(ROOT / 'build' / frontend),
-                                        MINYAR_TEST_RUNTIME=str(runtime)))
+            runtimes.append([name, str(runtime)])
+    # Each frontend runs the map suite once against every runtime profile:
+    # programs compile once, and only the link and run repeat per runtime.
+    # Frontends are independent (separate evidence workspaces), so up to
+    # MINYAR_TEST_JOBS of them run at once; each one's output prints whole.
+    def run(frontend):
+        result = subprocess.run([sys.executable, str(ROOT / 'tests/maps.py')], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True,
+                                env=dict(env, MINYAR_TEST_COMPILER=str(ROOT / 'build' / frontend),
+                                         MINYAR_TEST_RUNTIME=runtimes[0][1], MINYAR_MAP_RUNTIMES=json.dumps(runtimes)))
+        print('FRONTEND', frontend, *(name for name, _ in runtimes), flush=True)
+        print(result.stdout, end='', flush=True)
+        return result.returncode
+    jobs = max(1, int(os.environ.get('MINYAR_TEST_JOBS', '2')))
+    with concurrent.futures.ThreadPoolExecutor(jobs) as pool:
+        failed = [frontend for frontend, status in zip(frontends, pool.map(run, frontends)) if status]
+    if failed:
+        sys.exit('Map suite failed for ' + ', '.join(failed))
     print('Map frontend/profile ownership matrix passed', flush=True)
 
 

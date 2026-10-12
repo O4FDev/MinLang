@@ -2,12 +2,20 @@
 """Validate the peer regression catalogue and its required gate declarations."""
 import ast
 import copy
+import functools
 import json
 from pathlib import Path
 import re
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / 'tests/peer-cases.json'
+
+
+@functools.cache
+def parsed(path):
+    # validate() runs once per mutant catalogue, and once per ownership row
+    # inside each run; the suites never change during this process.
+    return ast.parse(path.read_text())
 
 
 def build_wiring():
@@ -31,7 +39,7 @@ def validate(data, makefile=None):
         if not path.is_relative_to(ROOT) or not path.is_file():
             raise ValueError('Case source is missing or outside the repository')
         if row['source'] not in sources:
-            methods = [node for node in ast.walk(ast.parse(path.read_text()))
+            methods = [node for node in ast.walk(parsed(path))
                        if isinstance(node, ast.FunctionDef) and node.name.startswith('test_')]
             sources[row['source']] = {node.name for node in methods}
             for method in methods:
@@ -68,7 +76,7 @@ def validate(data, makefile=None):
         if gates != expected:
             raise ValueError(f'Required configurations mismatch for {identity}: expected {expected}, got {gates}')
         if 'check-peer-ownership' in gates:
-            tree = ast.parse(path.read_text())
+            tree = parsed(path)
             owners = [node.name for node in tree.body if isinstance(node, ast.ClassDef)
                       and any(isinstance(method, ast.FunctionDef) and method.name == row['id']
                               for method in node.body)]
@@ -109,7 +117,7 @@ def validate(data, makefile=None):
     semantic_names = set(semantic_suites[1].split()) if semantic_suites else set()
     discovered = set()
     for path in (ROOT / 'tests').glob('peer-*.py'):
-        tree = ast.parse(path.read_text())
+        tree = parsed(path)
         if any(isinstance(node, ast.ClassDef) and any(
                 isinstance(base, ast.Name) and base.id in {'CompilerTestCase', 'PackageCompilerTestCase'}
                 for base in node.bases) for node in tree.body):
@@ -122,8 +130,9 @@ def validate(data, makefile=None):
                 discovered.add(source)
     if set(sources) != discovered:
         raise ValueError('Peer regression suite omitted from catalogue or unknown suite declared')
-    recipe = re.search(r'^check-peer-ownership:[^\n]*\n((?:[\t ].*\n|\n)*)', makefile, re.M)
-    selected = re.findall(r'\b(Peer\w+\.test_\w+)\b', recipe.group(1) if recipe else '')
+    # The gate and its per-suite phony children together hold the selection.
+    recipes = re.findall(r'^check-peer-ownership(?:-[\w-]+)?:[^\n]*\n((?:[\t ].*\n|\n)*)', makefile, re.M)
+    selected = [name for recipe in recipes for name in re.findall(r'\b(Peer\w+\.test_\w+)\b', recipe)]
     if len(selected) != len(set(selected)) or set(selected) != ownership:
         raise ValueError('Ownership Make selection differs from declared methods')
     # Codegen source/oracle pairs are part of the same maintained pilot.
