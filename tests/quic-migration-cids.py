@@ -39,6 +39,8 @@ BASELINE = {
     "cid-stock-first-use": (66, "semantic failure: authenticated CID1 use did not supply wire CID2"),
     "cid-stock-first-use-server": (66, "semantic failure: authenticated CID1 use did not supply wire CID2"),
     "cid-stock-chain": (66, "semantic failure: consumed CID had no fresh wire-observed spare"),
+    "cid-stock-loss": (66, "semantic failure: consumed CID had no replacement for loss recovery"),
+    "cid-stock-loss-server": (66, "semantic failure: consumed CID had no replacement for loss recovery"),
     "cid-stock-reorder": (66, "semantic failure: first use had no spare before reordering control"),
     "cid-stock-retired-spare": (66, "semantic failure: replacement spare first use did not supply the next wire CID"),
     "cid-stock-retire-order": (66, "semantic failure: later use after retirement had no fresh wire spare"),
@@ -137,7 +139,10 @@ def main():
                   "binary_sha256": sha256(binary), "baseline": options.expect_old_code,
                   "compiler_invoked": False, "results": results}
         artifacts.publish(report, all(row["matched"] for row in results))
-    print(json.dumps(report, indent=2))
+    print("QUIC CID/migration cases: " + str(sum(row["matched"] for row in results)) + "/" + str(len(results)) + " passed")
+    for row in results:
+        if not row["matched"]:
+            print(json.dumps(row, indent=2))
     if not all(row["matched"] for row in results):
         raise SystemExit(1)
 

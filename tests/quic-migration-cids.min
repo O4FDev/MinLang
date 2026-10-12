@@ -1175,6 +1175,33 @@ function stockChain(st: CidStock): Integer {
     }
     print("four successive authenticated path CID demands each supplied one wire-observed spare");return 0
 }
+function stockLoss(st: CidStock): Integer {
+    let used=stockUse(st,1);if used!=0 { return used }
+    if st.subject.localIds.length!=3 || st.subject.nextLocalSequence!=3 {
+        print("semantic failure: consumed CID had no replacement for loss recovery");return 66
+    }
+    let before=stockSignature(st.subject);let first=-1;let copies=0
+    for turn in 0..16 {
+        st.now=max(st.now+1,quic.nextTimer(st.subject))
+        for packet in quic.pollDatagrams(st.subject,st.now) {
+            if !stockRecord(st,packet.data) { return 67 }
+            let header=wire.header(packet.data,0,st.peer.local.length)
+            let opened=protection.unprotect(st.peer.spaces[2].read,packet.data,header.numberOffset,-1)
+            if !opened.valid { return 67 }
+            for frame in wire.frames(opened.payload).frames { if frame.type==24 && frame.value==2 {
+                copies+=1
+                if first<0 { first=opened.number }
+                else if opened.number<=first { return 68 }
+                if copies>=2 { stockAck(st,opened.number) }
+            } }
+        }
+        if copies>=2 { break }
+    }
+    if copies<2 || first<0 || stockSignature(st.subject)!=before { return 68 }
+    stockAck(st,first)
+    if stockCheck(st,3,3,"CID loss recovery changed live inventory")!=0 { return 68 }
+    print("lost replacement CID retransmitted with identical sequence, ID and token; late ACK did not replenish again");return 0
+}
 function stockReorder(st: CidStock): Integer {
     let held=authenticatedFrame(st.peer,st.subject,stockId(st.subject,1),crypto.fromHex("0100000000"))
     let header=wire.header(held,0,st.subject.local.length)
@@ -1323,7 +1350,7 @@ function stockStale(st: CidStock): Integer {
     print("real receive-range pruning discarded an old authenticated unused-CID packet without issuing a spare");return 0
 }
 function stockMode(mode: Text): Boolean {
-    for selected in ["cid-stock-single-path","cid-stock-first-use","cid-stock-first-use-server","cid-stock-chain","cid-stock-reorder","cid-stock-retired-spare","cid-stock-retire-order","cid-stock-limit2","cid-stock-limit3","cid-stock-cap8","cid-stock-large-limit","cid-stock-spoof","cid-stock-discarded-route","cid-stock-wrong-response","cid-stock-malformed","cid-stock-forbidden-server","cid-stock-close","cid-stock-retire-current","cid-stock-retire-unissued","cid-stock-stale"] { if mode==selected { return true } }
+    for selected in ["cid-stock-single-path","cid-stock-first-use","cid-stock-first-use-server","cid-stock-chain","cid-stock-loss","cid-stock-loss-server","cid-stock-reorder","cid-stock-retired-spare","cid-stock-retire-order","cid-stock-limit2","cid-stock-limit3","cid-stock-cap8","cid-stock-large-limit","cid-stock-spoof","cid-stock-discarded-route","cid-stock-wrong-response","cid-stock-malformed","cid-stock-forbidden-server","cid-stock-close","cid-stock-retire-current","cid-stock-retire-unissued","cid-stock-stale"] { if mode==selected { return true } }
     return false
 }
 function stockCase(st: CidStock, mode: Text): Integer {
@@ -1331,6 +1358,7 @@ function stockCase(st: CidStock, mode: Text): Integer {
     if mode=="cid-stock-single-path" { return stockSinglePath(st) }
     if mode=="cid-stock-first-use" || mode=="cid-stock-first-use-server" { return stockFirstUse(st) }
     if mode=="cid-stock-chain" { return stockChain(st) }
+    if mode=="cid-stock-loss" || mode=="cid-stock-loss-server" { return stockLoss(st) }
     if mode=="cid-stock-reorder" { return stockReorder(st) }
     if mode=="cid-stock-retired-spare" { return stockRetiredSpare(st) }
     if mode=="cid-stock-retire-order" { return stockRetireOrder(st) }
@@ -1583,7 +1611,7 @@ function main(): Integer {
         if mode=="cid-stock-limit2" { limit=2 }
         if mode=="cid-stock-limit3" { limit=3 }
         if mode=="cid-stock-large-limit" { limit=wire.MAX_VARINT }
-        let serverSubject=mode=="cid-stock-first-use-server" || mode=="cid-stock-forbidden-server"
+        let serverSubject=mode=="cid-stock-first-use-server" || mode=="cid-stock-loss-server" || mode=="cid-stock-forbidden-server"
         return stockCase(stockPair(root,identity,key,client,clientKey,limit,serverSubject),mode)
     }
     if mode == "preferred-address" { return preferredAddress(root, identity, key, client, clientKey) }
