@@ -20,14 +20,18 @@ MINYAR_HOT size_t rc_bounded_saved_cursor(RcObject *object) {
     if ((object->ownership & 7) == RC_TEXT) return 0;
     if ((object->ownership & 7) == RC_REFERENCES)
         return (size_t)((MinyarList *)(object + 1))->capacity;
+#if defined(MINYAR_SYSTEM_SMALL_HEAP) && defined(MINYAR_SYSTEM_HEAP) && !MINYAR_THREADED
+    return ((RcSystemSlot *)object - 1)->value.bytes;
+#else
     MinyarRecord *record = (MinyarRecord *)(object + 1);
     unsigned char *map = (unsigned char *)(record->values + record->length);
     size_t cursor = 0;
-    
+
     size_t remaining = (size_t)record->length;
     for (size_t i = 0; remaining; i++, remaining >>= 7)
         cursor |= (size_t)(map[i] >> 1) << (i * 7);
     return cursor;
+#endif
 }
 
 MINYAR_HOT void rc_bounded_save_cursor(RcObject *object, size_t cursor) {
@@ -36,6 +40,9 @@ MINYAR_HOT void rc_bounded_save_cursor(RcObject *object, size_t cursor) {
         ((MinyarList *)(object + 1))->capacity = (long long)cursor;
         return;
     }
+#if defined(MINYAR_SYSTEM_SMALL_HEAP) && defined(MINYAR_SYSTEM_HEAP) && !MINYAR_THREADED
+    ((RcSystemSlot *)object - 1)->value.bytes = cursor;
+#else
     MinyarRecord *record = (MinyarRecord *)(object + 1);
     unsigned char *map = (unsigned char *)(record->values + record->length);
     size_t remaining = (size_t)record->length;
@@ -43,6 +50,7 @@ MINYAR_HOT void rc_bounded_save_cursor(RcObject *object, size_t cursor) {
         map[i] = (unsigned char)((map[i] & 1) | ((cursor & 127) << 1));
         cursor >>= 7;
     }
+#endif
 }
 
 MINYAR_HOT void *rc_bounded_finish_object(RcObject *object, unsigned kind) {
@@ -343,7 +351,7 @@ static size_t rc_bounded_poll_work(size_t budget) {
                     }
                 }
             }
-            
+
             if (!rc_bounded_recent_head && rc_bounded_active &&
                 (rc_bounded_active->ownership & 7) == RC_RECORD) {
                 MinyarRecord *record = (MinyarRecord *)(rc_bounded_active + 1);
@@ -360,7 +368,7 @@ static size_t rc_bounded_poll_work(size_t budget) {
                     if (rc_bounded_recent_head) break;
                 }
                 if (count) {
-                    
+
                     if (!rc_bounded_recent_head && rc_bounded_cursor == (size_t)record->length &&
                         work < budget) {
                         RcObject *finished = rc_bounded_active;
