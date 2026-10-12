@@ -23,6 +23,7 @@ def main():
     parser.add_argument("--sanitize", action="store_true")
     args = parser.parse_args()
     cases = [
+        ("small-system-backing", "system-small-heap.c", "-O2", []),
         ("append-system-o0", "memory-research-list-reserve.c", "-O0",
          ["-DMINYAR_SYSTEM_HEAP=1", "-DMINYAR_RC_POLL_BUDGET=32"]),
         ("append-system-o2", "memory-research-list-reserve.c", "-O2",

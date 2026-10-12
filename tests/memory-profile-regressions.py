@@ -54,6 +54,7 @@ def main():
     parser.add_argument('--mode', choices=('native', 'sanitize', 'both'), help='Override suite instrumentation.')
     parser.add_argument('--fixtures', nargs='+', choices=STANDARD + INDEPENDENT + (VIRTUAL,),
                         help='Run only selected fixtures; dependencies are still snapshotted.')
+    parser.add_argument('--runtime-define', action='append', default=[])
     parser.add_argument('--clang', default=os.environ.get('CLANG', 'clang'))
     parser.add_argument('--compile-timeout', type=float, default=60)
     parser.add_argument('--run-timeout', type=float, default=45)
@@ -198,7 +199,7 @@ def main():
                         binary = evidence / 'bin' / label
                         binary.parent.mkdir(exist_ok=True)
                         flags = ['-O2'] if instrumentation == 'native' else ['-O1', '-g', '-fsanitize=address,undefined']
-                        command = [args.clang, '-std=c11', *flags, *backend,
+                        command = [args.clang, '-std=c11', *flags, *backend, *['-D' + define for define in args.runtime_define],
                                    f'-DMINYAR_RC_POLL_BUDGET={budget}', str(stage / relative), '-o', str(binary)]
                         execute(label + '-compile', clang_command(command), args.compile_timeout, environment)
                         phases = PHASES if name == VIRTUAL else (None,)
