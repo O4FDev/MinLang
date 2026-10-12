@@ -107,9 +107,10 @@ class PackageNativeInputs(unittest.TestCase):
 
     def test_builtin_provider_links_with_package_inputs(self):
         self.source.write_text('use "./child.min" as child\nuse "net" as net\n'
-                              'print(child.answer())\nprint(net.ipVersion("127.0.0.1"))\n')
+                              'use "sha256" as hash\nprint(child.answer())\n'
+                              'print(net.ipVersion("127.0.0.1"))\nprint(hash.digest(Bytes()).length)\n')
         self.command(self.inputs())
-        self.execute('42\n4\n')
+        self.execute('42\n4\n32\n')
 
     def test_runtime_native_header_is_available(self):
         self.native.write_text('#include "minyar_native.h"\n'

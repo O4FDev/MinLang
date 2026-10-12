@@ -787,6 +787,10 @@ check: check-transport-udp-fallback
 check-sanitize: check-transport-udp-fallback-sanitize
 
 .PHONY: check-raw-syscall check-raw-syscall-linux-native check-raw-syscall-sanitize check-raw-syscall-abi check-raw-syscall-frontends
+.PHONY: check-raw-syscall-arm64
+check-raw-syscall-arm64: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/raw-syscall-arm64.py
+
 check-raw-syscall: build/minyarc
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/raw-syscall.py
 
