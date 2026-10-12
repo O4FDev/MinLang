@@ -614,6 +614,27 @@ function stableModuleIdentity(path: Text, root: Text): Text {
     return escapeLLVMText(joinText(pieces))
 }
 
+function copyCompilerIntegers(values: List<Integer>): List<Integer> {
+    let copied: List<Integer> = []
+    let position = 0
+    while position < values.length { copied.add(values[position]); position = position + 1 }
+    return copied
+}
+
+function compilerNeedsGraph(returnTypes: List<Integer>, counts: List<Integer>, fields: List<Integer>): Boolean {
+    let position = counts.length
+    while position + 1 < returnTypes.length {
+        if returnTypes[position] == -3 {
+            let root = -1 - returnTypes[position + 1]
+            if possibleCycleType(root, counts, fields, returnTypes) { return true }
+            position = position + 2
+        } else {
+            if returnTypes[position] == -2 { position = position + 4 } else { position = position + 1 }
+        }
+    }
+    return false
+}
+
 function compileModuleEntry(path: Text, inputState: Text, outputState: Text, statsPath: Text, stackOwnerLimit: Integer, library: Text): Text {
     if path.length == 0 || !(path[0] == '/' || (path.length > 2 && path[1] == ':' && pathCharacterIsSeparator(path[2]))) {
         fail("module state requires an absolute entry path")
@@ -755,15 +776,6 @@ function compileModuleEntry(path: Text, inputState: Text, outputState: Text, sta
     }
         table = writeModuleTable(names, kinds, returns, counts, parameters, types, lookup, declarationOwners, declarationNames, declarationKinds, declarationPublic, declarationQualifiedNames, declarationLookup)
     }
-    let ownershipType = 0
-    while ownershipType < names.length {
-        if kinds[ownershipType] == 2 && possibleCycleType(1000 + ownershipType, counts, types, returns) {
-            writeTextFile(outputState, "")
-            writeTextFile(statsPath, "0 " + Text(modulePaths.length) + " " + Text(lexerStats[0]) + " " + Text(lexerStats[1]) + " 0 0 false\n")
-            return joinText(compileEntryWithLibrary(path, stackOwnerLimit, library))
-        }
-        ownershipType = ownershipType + 1
-    }
     let needsInterfaces = !tableReused
     module = 0
     while module < cacheRows.length {
@@ -861,13 +873,25 @@ function compileModuleEntry(path: Text, inputState: Text, outputState: Text, sta
             let pieces: List<Text> = []
             let globals: List<Text> = []
             appendLiteralDeclarations(pieces, localKinds, localTexts, identities[module], false)
-            compileFunctions(newCompilerContext(localKinds, localTexts, localLines, names, kinds, returns, counts, parameters, types), pieces, globals, stackOwnerLimit, identities[module], bodyStats)
+            let bodyReturns = copyCompilerIntegers(returns)
+            let bodyContext = newCompilerContext(localKinds, localTexts, localLines, names, kinds, bodyReturns, counts, parameters, types)
+            compileFunctions(bodyContext, pieces, globals, stackOwnerLimit, identities[module], bodyStats)
             if module == 0 && mainFunction < 0 {
-                compileTopLevel(newCompilerContext(localKinds, localTexts, localLines, names, kinds, returns, counts, parameters, types), pieces, globals, identities[module], bodyStats)
+                compileTopLevel(bodyContext, pieces, globals, identities[module], bodyStats)
+            }
+            if compilerNeedsGraph(bodyReturns, counts, types) {
+                writeTextFile(outputState, "")
+                writeTextFile(statsPath, "0 " + Text(modulePaths.length) + " " + Text(lexerStats[0]) + " " + Text(lexerStats[1]) + " 0 0 false\n")
+                return joinText(compileEntryWithLibrary(path, stackOwnerLimit, library))
             }
             code = joinText(globals) + joinText(pieces)
             if hasGlobalDeclarations(globals) { code = featureMarker + code }
             compiled = compiled + 1
+        }
+        if code.find("\n; minyar-cycle-runtime: 1\n") >= 0 {
+            writeTextFile(outputState, "")
+            writeTextFile(statsPath, "0 " + Text(modulePaths.length) + " " + Text(lexerStats[0]) + " " + Text(lexerStats[1]) + " 0 0 false\n")
+            return joinText(compileEntryWithLibrary(path, stackOwnerLimit, library))
         }
         if code.byteLength >= featureMarker.byteLength && code.slice(0, featureMarker.byteLength) == featureMarker {
             output.add(deduplicateGlobalDeclarations(code, declarations))

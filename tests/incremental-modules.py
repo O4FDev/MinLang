@@ -210,31 +210,17 @@ public function total(node: Node): Integer {
         prior.write_text('')
         feature_output=directory/'feature-probe.ll'
         if feature_output.exists(): feature_output.unlink()
-        feature=run([COMPILER,fixture,feature_output,'--library',ROOT/'library'],allowed=(0,86))
-        if feature.returncode==86:
-            # Parsed callback/cycle packages must preserve the ordinary signal,
-            # then compile through the public incremental fallback twice.
-            assert not feature_output.exists(),'ordinary feature request emitted partial LLVM'
-            ordinary=run([BASE,fixture,feature_output,'--library',ROOT/'library'],allowed=(86,))
-            assert not ordinary.stdout and not ordinary.stderr and not feature_output.exists()
-            extended=CALLBACKS
-            run([extended,fixture,cold,'--library',ROOT/'library'])
-            run([extended,fixture,warm,'--library',ROOT/'library'])
-            assert cold.read_bytes()==warm.read_bytes(),'extended package LLVM changed between cold and warm checks'
-            for _ in range(2):
-                checked=run([ROOT/'minyar','--incremental','--check',fixture])
-                assert 'checked ' in checked.stdout and not checked.stderr,checked
-        else:
-            first,_=compile(fixture)
-            if not next_state.read_bytes():
-                # Package imports, native linkage and constants take the documented
-                # complete-compiler fallback: no cache state, and none is reused later.
-                assert first[0]==0 and first[4:]==(0,0),first
-                counts,table=compile(fixture)
-                assert counts==first and not table and not next_state.read_bytes(),counts
-                continue
+        run([COMPILER,fixture,feature_output,'--library',ROOT/'library'])
+        first,_=compile(fixture)
+        if not next_state.read_bytes():
+            # Package imports, native linkage and constants take the documented
+            # complete-compiler fallback: no cache state, and none is reused later.
+            assert first[0]==0 and first[4:]==(0,0),first
             counts,table=compile(fixture)
-            assert counts==(first[1],0,0,first[1],0,0),counts
-            assert table
+            assert counts==first and not table and not next_state.read_bytes(),counts
+            continue
+        counts,table=compile(fixture)
+        assert counts==(first[1],0,0,first[1],0,0),counts
+        assert table
 
 print('module interfaces: native equivalence, actual body bypass, stable identities, typed private closures, invalidation and source diagnostics verified')
