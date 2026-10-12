@@ -1,60 +1,76 @@
 # Minyar v2 unification progress — 2026-10-12
 
-Brief: `/Users/luke/overnight/briefs/2026-10-12/minyar-unify.md`.
-Current phase: **Phase 1 — combined platform and downstream qualification**. No Phase 2 feature work has started.
-Sole integrator: this thread. Candidate: `completion/v2-20261011`, handover base `372d3de`.
+Current phase: **Phase 1 — finish consolidation and full platform/downstream qualification**.
+Owner's revised scope: this thread finishes Phase 1, writes `PHASE1_DONE` only after pushed v2 and green CI, then continues as the sole serial integrator. Seven separate workstreams own Phase 2/3 outcomes.
+Briefs: `/Users/luke/overnight/briefs/2026-10-12/minyar-unify.md` and `minyar-split/{_shared,launch}.md`.
+Candidate: `completion/v2-20261011`; handover base `372d3de`. Local v2 remains `2fa8320`; origin/v2 remains `30bcee9`. No push or Phase 1 completion marker.
+Evidence, inventories, source manifests, raw RED/GREEN receipts and review reports: `/Users/luke/overnight/runs/minyar-unify-20261012/`.
 
-## Preserved and inventoried
+## Preserved inventory
 
-- Previous programme thread stopped at 09:27 UTC with a clean checkout and no recorded active Boat workloads or pending children.
-- Initial inventory: 39 checkouts, 164 root-repository local/remote refs; one missing prunable worktree.
-- All eight dirty checkouts saved to independent `snapshot/*-20261012` branches before integration. Original files/indexes were left intact.
-- neo-db RC sketch preserved at `fd655b1` in its fork; explicitly excluded from integration pending validation.
-- Inventory, snapshot receipts, delegated task IDs and audit reports: `/Users/luke/overnight/runs/minyar-unify-20261012/`.
+Initial inventory: 39 checkouts and 164 root local/remote refs, plus the neo-db fork. Eight dirty trees were snapshotted before integration; original files/indexes remain intact. Every branch is retained. The neo-db RC sketch `fd655b1` and two unique unqualified Keychain probes remain preserved outside the candidate. Incompatible collector implementations and superseded docs/snapshots have explicit content dispositions, not age-based exclusions. `docs/BRANCHES-20261012.md` records initial and later refs. Clean dead worktrees may be removed only after their commits are verified in final v2; active/dirty workstream trees are excluded from that cleanup.
 
-## Parallel Phase 1 work
+## Reviewed merges
 
-Codex `gpt-6.1-sol` subagents, each in a separate `unify/*-20261012` worktree: neo-db durable files; Windows/CI; transport/QUIC; memory/collectors; desktop/performance; shipping/soak/docs; platform/downstream qualification.
-Every proposed integration will receive an independent review subagent before the integrator merges it.
+| Work | Integrated result / evidence |
+| --- | --- |
+| Desktop, Windows, shipping history | `00b7fd1`, `0d1d12b`/`5978c73`, `5288bc0`; source-preserving reviewed ancestry |
+| Collector preservation | `fa7c906`, history `3a5bbb3`; final `4a1732f`, 30 C configurations, eight restored programs O0/O2 native/SAN/LSan, 26 finite-heap cells; R2 approved |
+| QUIC/transport | `7edba35`, history `e297113`; final `cb8fe9f`, 172 native + 172 genuine SAN RFC cases, ACK/PTO, yamux/cancel/Go/1536/FIN, net-connect; actual edge CID stock and 32768-peer/262144-route boundary native/SAN pass; R2 approved |
+| neo-db durable files/system/net | `8fc4b60`, fork ancestry `a25508a`; final `34833a6`, all ten R1 findings plus overflow/APPEND/negative-boundary/stderr/signal rollback controls; 96 native/48 SAN review controls and language/network suites; R2 approved |
+| Build-wiring fixtures | `3c4e382`; original 107+6 adapter inventory and strict dependency/SAN mutations retained; full 23-method suite passed |
+| Pinned formatting | `fc068f2`; `94ebf9c` changes layout only in three C files; full format23.1.2/catalogue506/24/wiring23 passed and reviewed |
+| Ledger provenance | `90dcfcaf`; reviewed `3c096c1` retains old trusted driver, admits exact reviewed files/system driver and rejects arbitrary self-consistent tools; all74 controls pass |
+| Darwin boolean socket fixture | `5caf47e`; reviewed `b077dcd`, raw and Minyar enabled4/disabled0 diagnostic, native/SAN and omitted-setting mutation; production unchanged |
+| Nonblocking net fixture | `448a02d`; reviewed `5e390fe`, empty-listener negative controls and ready1000 before original accept; four genuine Darwin language modes pass |
+| Mutation semantic coverage | `19ba895`; reviewed `ce544074`, three test-only CompilerHardening cases; native/SAN33/33, harness14/14, unchanged campaign87.5% against85% floor; all16 byte-identical mutants retained |
 
-## Merged list and gaps closed
+Owning project code is unchanged. No Phase 2 gap is claimed closed. Every product/test merge above received an independent review before root integration.
 
-- Reviewed desktop, Windows and shipping history merged at `00b7fd1`, `0d1d12b`/`5978c73`, `5288bc0`, retaining current source. Collector test restoration merged at `fa7c906` after exact GREEN and independent R2 approval; reviewed memory history at `3a5bbb3` preserves that source. Every branch is kept. Existing candidate contains TLS cleanup `6518ef3` and unqualified QUIC CID WIP `8daa72c`.
-- Collector preservation at `4a1732f` passed 30 C native/SAN configurations, eight restored programs at O0/O2 native/SAN/LSan, and 26 exact finite-heap language cells; parent-owned R2 approved and merged at `fa7c906`. No production collector/compiler change.
-- Transport fixes merged at `7edba35`, with reviewed original history at `e297113`. Neo-db durable files/system/net plus all ten R1 repairs merged after R2 approval at `8fc4b60`; original fork history at `a25508a` retains that fixed tree. Every original fork commit is now an ancestor; RC sketch remains outside.
-- Wiring-only `80f2b848` passed focused/full RED-to-GREEN and independent review, then merged. All original107 adapter controls plus six forwarding controls are enforced; existing sanitizer/dependency mutations remain.
-- Darwin boolean-option fixture repair `b077dcd` passed actual native/SAN controls, enabled/disabled diagnostics and an omitted-setting mutation; independent review approved and root merged at `5caf47e`. Production socket code and original buffers/errors/TIME_WAIT assertions are unchanged.
-- Nonblocking readiness fixture `5e390fe` passed four actual Darwin native/SAN language modes and independent review, then merged at `448a02d`. Three semantic mutation-coverage tests `ce544074` passed unchanged87.5%/85% campaign and independent review, then merged at `19ba895`. Both changes are test-only; no production compiler or socket behavior change.
-- No Phase 2 gaps claimed closed yet. Owning project code has not been changed.
+## Phase 1 merge queue
 
-## Boat and spending
+| Stack | State / next gate |
+| --- | --- |
+| Windows `397362d` → `dda5bd1` | R1 path-with-spaces finding accepted and fixed separately. Actual Boat spaced-path RED, path/mutation GREEN, original22-command SAN/public/cache GREEN and adjacent-DLL loader proof. New independent R2 review running; not merged. |
+| OS `dd71690` → `4fcfaac` → `0fb334e` | Real fail-closed TLS API/provider wiring passed native/SAN/LSan vectors and13580 classifier cases/mode. R1 requested SAN dispatch and provider dependencies; separate third correction passed test-first regressions, full wiring, original TLS native/SAN and both x86/ARM image builds. Exact stack imported by sole Y owner for original native/SAN TLS gates; new independent R2 review follows. Not merged. |
+| Workstream requests | None offered for merge. Early unreviewed WS1 selector/progress and WS4 files commit, plus WS3/WS5 drafts, remain in owning branches outside Phase 1. |
 
-- W `bx_w8xs3uwb` and Y `bx_y2vp5byg` extended with included credit until 17:27 UTC.
-- Dedicated transport `bx_q9mdad57` completed its reviewed work and was stopped with a verified snapshot. It is now exclusively reassigned to a new downstream-build subagent, using fresh copies and preserving all transport evidence. `bx_3uusc6gg` owns Mac compiler/codegen offload and bounded serial native qualification.
-- W now belongs to combined LLVM22/23 qualification; Y's retained Windows VM and same-source checkout are prepared under the existing resource guardian. Generic owns full Linux/downstream qualification.
-- Dedicated 8-CPU/16-GiB Linux `bx_utb76q3g` allocated through 17:50 UTC for whole-tree/downstream qualification and Boat-generated Mac artifacts; dependency setup only until source freeze.
-- New paid spend: **$0 / $10**. Other projects' existing Boat boxes are not allocated to this programme.
-- Heavy builds and long tests are assigned to Boat; local Windows execution, force pushes and URL opening remain prohibited. One Mac M6 retry lost its external split hook and compiled the SAN backend locally18.76s; this routing mistake is recorded, and future routes must reject local Monocypher backend commands before launch. Its actual test PASS is retained without offload-route credit.
+After both pending stacks are approved: merge serially, retain stricter tests, run combined pinned preflight, publish one tiny revision over the existing 4c+d1+90 bundle chain, and admit final platform/downstream qualification. Original frozen runs and archives keep their identities.
 
-## Current blockers and required qualification
+## Actual platform state
 
-- Branch dispositions and final missing-change tests are being audited; nothing is deemed superseded solely by branch age.
-- Transport `cb8fe9f` received independent R2 approval and passed final 172 native + 172 ASan/UBSan/LSan RFC cases, ACK/PTO, yamux/cancel/independent Go/1536/FIN, net-connect and strict edge/full262144-route controls. All1313 input hashes match Git and before/after. Normal integration `7edba35`; reviewed38 original-ref history at `e297113` leaves its source unchanged.
-- Neo-db frozen `34833a6` fixes all ten R1 findings plus actual overflow, APPEND/position, negative-boundary, stderr-progress and in-flight signal rollback RED controls. Final W native/SAN maintained and network suites pass; independent R2 approved and integration is complete. Native Mac and Boat Windows net still require final combined qualification.
-- Both pre-existing build-wiring fixture failures are repaired and independently approved: complete isolated Make prerequisite and fixed107+6 adapter inventory. Full23-method suite passed on Boat. Combined catalogue/format preflight and full platform suites follow on frozen source.
-- Frozen `4c060044` passed combined catalogue and full build-wiring preflight; pinned format23.1.2 exposed three layout errors. Formatting-only `94ebf9c` passed the full pinned formatter, catalogue506/24 and build-wiring23/23 and received independent approval, then merged. Its C tokens, literals, directives and assertions are unchanged. Revised source is admitted to the full platform routes; no old bundle or result is relabelled.
-- Revised `d1c1b971` passed combined preflight and ordinary compiler/default-runtime fixed point. Generic correctness and W LLVM22 portable each stopped at the same stale amplification-ledger driver pin; exact REDs and earlier passes are retained. Two-file repair `3c096c1` preserves the historical pin, admits the independently reviewed driver and rejects self-consistent unreviewed tools; all74 cases pass and independent review approved. Integrated freeze `90dcfcaf` is admitted to full qualification. Production sources are unchanged. Generic final90 correctness passed native/SAN Go, CID and later ownership/nesting checks, then stopped at actual `check-mutation-score` RED/log123 at12:00UTC; exact score/setup/survivor diagnosis is pending and no later stages launched. W LLVM22 and full fresh LLVM23 both completed GREEN, with clean exact90 source bindings at closure. LLVM22 explicitly credits its unchanged d1 prefix plus final90 tail; its initial intermittent adapter RED and same unchanged113-case retry GREEN remain separate. Final archive `llvm22-23-90dcfcaf-green-v2.tar.gz` retains distinct22/23 toolchain records. W has no owned workload.
-- Native Mac M1 shared-loop native/SAN, M2 captured-cycle native/SAN, M3 disposable Keychain/status/desktop C native/SAN, M4 exact split-language probes and M5 debug/optimized captured-language probes passed. Supplemental M5 language-SAN preparation hit its120s outer reservation before execution; exact setup NONPASS is retained and diagnosed separately. Boat fixed point/23 ARM64 or ThinLTO artifacts alone do not qualify native Mac execution or the complete suite.
-- Actual Windows portable stopped after1467.359s at `check-generated-llvm-sanitizer`: the native aggregate selected UCRT64 Clang despite the prepared CLANG64 sanitizer override, and ASan import/thunk libraries were missing. This actual RED precedes the old ledger pin. All11656 tracked blobs stayed unchanged; NT Jobs closed with zero active children and the VM/guard retired normally, with no resource excursions. A new isolated final90 worktree is preparing a narrow test-first compiler-dispatch repair; independent review and revised-source qualification are required before further product phases.
-- Windows `397362d` passed focused true-SAN/public-link and mixed Win64 C ABI checks, but independent R1 requested a quoted directory fix for compiler paths containing spaces. It remains unmerged. The same owner is adding a deterministic spaced-path RED and correction; a new review round is mandatory.
-- Mac M8 packaging and all14 update-bundle methods passed; M6/M7 native updater/launch controls passed but SAN construction remains setup NONPASS. The overnight memory guard log directly records suspending M6 outer PID47889 and its whole tree at11:17:21UTC, including the watchdog, matching retained stopped-process evidence. The guard remains unchanged. M5 language-SAN also has a demonstrated Apple17-provider/LLVM22-runtime marker incompatibility; no executable pass is claimed. Complete Mac portable/QUIC/performance/public-bootstrap gates are inventoried in `macos.md` and `full-suite-gates-90dcfcaf.json`; selected native probes do not qualify those aggregates.
-- Mac direct files/net additions and96 native/48 SAN review controls passed; files/system debug/release/SAN language fixtures and net-contract native/SAN passed. The exactly1 reuse fixture correction is reviewed and integrated. Separate unchanged `net-additions.min` debug execution fails at immediate accept; nonblocking readiness/error diagnosis is in progress, with no product defect inferred yet. Full Mac aggregates remain unqualified.
-- Nonblocking readiness diagnosis proved Darwin EAGAIN35 on immediate accept, then successful readiness/accept; the three-line repair is independently approved and integrated. M5 language SAN now passes its original capture oracle through actual Darwin LLVM22 frontend IR, Boat backend, matched LLVM22 runtime and final native link; previous setup NONPASS receipts remain. M9 frozen Atacama parsing, actual ThinLTO app link and fixture bundle/signature inspection passed; its complete public-launcher build remains unqualified.
-- M6 original native/SAN/crash/reopen oracles later passed22.78s, but its hook-reset mistake invalidates any offload-route claim for that attempt. Corrected routing must be validated before future M6/M7 runs. Full Mac aggregates are still held.
-- Frozen neo-db debug/eager-release and original craft debug/release builds passed on the dedicated downstream host; craft's missing GLFW setup is resolved. neo-vm host ELF built, then static guest link failed on an unreachable zstd wrapper; the identical original stage also fails against exact pre-consolidation6518 compiler/runtime. Minyar-OS x86 compile exposed missing fail-closed trust exports; narrow `dd71690` adapter/API rejection repair is test-first and undergoing native/SAN and original x86/ARM qualification before independent review. Original REDs/source hashes are retained, and owning project code is unchanged. Atacama real native app remains the Mac owner's scope.
-- All six neo-vm builds now pass through its unchanged wrapper with explicitly configured `CC='clang -flto -fuse-ld=lld'`; original12-case SHA oracle passes, static guest has no dynamic dependencies/zstd symbol, and a reachable-zstd mutation still fails to link. Default-command and exact6518 baseline REDs remain distinct. OS API controls pass, then image linking exposed missing real crypto/IP providers; separate `4fcfaac` freestanding wiring reuses pinned Monocypher/securecrypto and is qualifying vectors/classifier/x86/ARM images. An earlier test assembly setup failure remains distinct; production hosted providers and owning projects are unchanged.
-- Final OS `dd71690`/`4fcfaac` stack passed both original x86_64 and ARM64 static kernel/image builds, real vectors, native/SAN/LSan and13580 literal classifier controls per mode, catalogue and wiring. A new independent review is running before integration. Images were built; no OS boot is claimed. Dynamic neo-vm programs retain their original zstd shim/library linkage; only static guest and its negative control omit it.
-- Mutation-score repair `ce544074` adds three semantic CompilerHardening tests: native/SAN33/33, harness14/14, unchanged campaign87.5% (14/16) at85% floor. All16 byte-identical selected mutants remain, including two survivors; no stillborn/timeouts or sampling/threshold changes. Independent review approved exact content binding and root integrated it. The original complete-correctness RED remains unqualified pending revised-source checks; no whole-bootstrap or LSan credit is inferred from those focused receipts.
-- Native macOS is absent on Boat. Owner directed use of this Mac for native checks; heavy builds/long tests remain on Boat. Offloaded ARM64 generation and bounded serial Apple-native checks are being prepared.
-- Owner added Phase 2 item 0: shared-memory threads; start after Phase 1, with ±1% single-thread performance, Boat multicore scaling, TSan stress and a neo-db design note.
-- Phase 3 remains queued behind Phase 1: interop 72–119, CID qualification, merged-code two-hour soak, Windows idle gate, real 20,000 devices and signed publishing.
+- **Linux generic:** exact90 preflight/fixed point and long correctness prefix passed, then actual `check-mutation-score` RED at log123 (68.75% <85%). The focused reviewed repair passes87.5%; complete revised-source correctness, leak/coverage/AFL/peer/QUIC/interop stages still require qualification. No later generic stages or downstream builds were admitted after RED.
+- **LLVM22/23 on W:** final90 GREEN with exact clean closure. LLVM23 ran its full fresh portable/release/launcher/incremental/IR/toolchain/module/native-graphics cell. LLVM22 explicitly credits unchanged d1 prefix plus final90 tail. Initial intermittent adapter timing RED and unchanged113-case retry GREEN remain separate. Final archive `llvm22-23-90dcfcaf-green-v2.tar.gz` retains distinct toolchain records. Combined successor input changes still need appropriate checks.
+- **Windows on Y:** original d1 portable stopped after1467s at generated SAN linker selection, before the old ledger pin. Focused Windows two-commit repair now passes true ASan/UBSan with actual spaced-directory DLL binding. All NT Jobs/guard/VM retired normally with no resource excursions. Only original OS TLS native/SAN gates are currently admitted in a new isolated exact0fb copy. Full portable/provider/collector/worker/UDP/net native/SAN qualification awaits the combined freeze.
+- **Native Mac:** bounded M1–M9 results cover shared loop, captures, disposable Keychain/desktop, neo C/language portions, packaging and split Atacama app/link. Final strict M6/M7 whole original updater/launch runners pass2.615s/16.165s with UBSan halt, original child bounds and fail-closed Darwin-frontend/Boat-backend/native-link route. Six schema2 genuine native/SAN links are retained. M5 language SAN also passes through that matched LLVM22 route. Prior setup NONPASS receipts remain; an earlier M6 hook-reset attempt truthfully passed but ran a local backend18.76s, an operating-constraint miss with no offload credit. The resource guard is unchanged.
+- **Complete Mac gates:** portable111 prerequisites, public cold bootstrap/cache/launcher, full QUIC and native performance/PMU remain unqualified. No native Darwin Boat host exists. `macos.md`, gate inventory and executable scheduling record identify genuine Darwin jobs; selected probes cannot certify those aggregates. Full/public construction remains held on this shared laptop.
+
+## Downstream results and remaining scope
+
+- Frozen neo-db debug/eager-release and craft debug/release pass; GLFW host setup was installed for craft.
+- Frozen neo-vm all six original builds and12 SHA checks pass with disclosed supported `CC='clang -flto -fuse-ld=lld'`. Default static guest link RED also reproduces on exact6518 baseline. Static guest has no dynamic dependencies/zstd symbol; reachable-zstd negative still fails. Original dynamic programs retain their existing zstd shim/library linkage. This is a configured-build pass, not default-command PASS.
+- OS both original x86_64 and ARM64 static kernels/images pass on unmerged correction stack. No boot claim. Frozen55-file archive remains unchanged; final overlay has54 equal files and separately bound candidate Makefile so new provider dependencies are retained.
+- Frozen Atacama `v2-stream` parsing, actual LLVM22 ThinLTO native app link, bundle/resources/ad-hoc signature pass. Its complete public `make check test all` build remains pending genuine Darwin scheduling.
+- Final combined-source downstream continuity/build checks remain required; no owning project source was changed.
+
+## Resources, spend and workstream hold
+
+Phase 1 exclusive hosts: W `bx_w8xs3uwb` and Y `bx_y2vp5byg` until17:27UTC; generic `bx_utb76q3g` until17:50; OS/downstream `bx_q9mdad57` until15:27; Mac offload `bx_3uusc6gg` until15:40. No host is admitted to a workstream yet. Y has one owner/controller; WS7 snapshot/fork request is deferred to a closed-job, post-marker admission. New paid spend **$0 / $10** for the whole programme.
+
+Seven workstreams have acknowledged the Phase 1/resource hold and preserved their early work. They may retain read-only preparation, but implementation/builds/tests/provisioning wait for explicit release. Workstream goals may be blocked independently to avoid no-action continuations; the integrator's goal remains active. Recorded callable destinations:
+
+| WS | Owner area | Thread |
+| --- | --- | --- |
+| 1 | Shared-memory concurrency | `mcp:cf2ffdf9-2f57-4ef7-870d-30d8273c1abb` |
+| 2 | Runtime safety/speed | `mcp:0664325c-cd01-40ae-8e89-6d5c4d459414` |
+| 3 | Core library/language | `mcp:7bc5eaaf-91de-4351-a5f4-b4acc6a14893` |
+| 4 | Systems | `mcp:5e893043-b779-436c-8682-86acfc7443e7` |
+| 5 | Formats/crypto | `mcp:9bd59149-31bd-400f-8420-84832e9a24ce` |
+| 6 | QUIC/soak | `mcp:6e621cdd-15de-4662-8188-77cf11e0427c` |
+| 7 | Windows/CI/release | `mcp:28a542ae-0103-497d-956b-fdc56d4a08fb` |
+
+The earlier WS6 proxy ID is not callable; use the destination above. Disk13Gi free and logged guard suspensions prompted a hold on new full worktrees; no guard policy/bypass or unrelated process change by root. Workstream partial edits and stopped/materialized trees are preserved.
+
+## Completion boundary
+
+Only after full final Linux/nativeMac/BoatWindows and downstream gates: fast-forward v2, push only v2 without force, require all CI green, finish branch dispositions/dead clean-tree removal, then write `PHASE1_DONE` with pushed SHA and CI run URL. Wake the seven existing threads with that SHA/URL and explicit budgeted Boat admission; do not launch duplicates. Subsequent reviewed chunks merge serially through this thread, with full platform qualification and v2 push/notification. MORNING.md and html_render are due at completion/deadline; no completion marker or acceptance claim is manufactured.
