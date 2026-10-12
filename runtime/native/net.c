@@ -123,6 +123,14 @@ static bool address(const MinyarText *host, long long port, int type, struct add
     hints.ai_socktype = type;
     int code = getaddrinfo(name, service, &hints, found);
     if (code) {
+#ifdef _WIN32
+        last_error_code = code;
+#else
+        /* Resolver statuses have a different, sometimes negative namespace.
+         * Preserve a genuine errno; otherwise expose EINVAL with the resolver
+         * diagnostic rather than zero or an unrelated preceding socket error. */
+        last_error_code = code == EAI_SYSTEM && errno ? errno : EINVAL;
+#endif
         remember("resolve", gai_strerror(code));
         return false;
     }

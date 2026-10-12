@@ -32,10 +32,10 @@
 static int files_last_error; /* negative errno of the last Bytes-returning call, 0 on success */
 
 /* fdatasync where it exists; macOS needs F_FULLFSYNC to reach stable storage. */
+static int files_fullsync(int fd);
 static int files_datasync(int fd) {
 #ifdef __APPLE__
-    if (fcntl(fd, F_FULLFSYNC) == 0) return 0;
-    return fsync(fd);
+    return files_fullsync(fd);
 #else
     return fdatasync(fd);
 #endif
@@ -43,9 +43,12 @@ static int files_datasync(int fd) {
 
 static int files_fullsync(int fd) {
 #ifdef __APPLE__
-    if (fcntl(fd, F_FULLFSYNC) == 0) return 0;
-#endif
+    int rc;
+    do { rc = fcntl(fd, F_FULLFSYNC); } while (rc != 0 && errno == EINTR);
+    return rc;
+#else
     return fsync(fd);
+#endif
 }
 
 static void files_cloexec_nonblock(int fd, bool nonblock) {
