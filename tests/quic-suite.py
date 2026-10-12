@@ -7,7 +7,7 @@ ROOT=Path(__file__).resolve().parents[1]
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--artifacts',type=Path,required=True);parser.add_argument('--yamux-peer',type=Path);parser.add_argument('--state-only',action='store_true');parser.add_argument('--sanitize',action='store_true');parser.add_argument('--optimization',choices=('0','2'),default='0');options=parser.parse_args()
     commands=[['securecrypto.py'],['quic-crypto.py'],['quic-wire.py'],['quic-dispatch.py'],['tls-server.py'],['tls-server.py','--curve','prime256v1'],['tls-keyshare.py'],['tls-signing-usage.py'],['tls-validity.py'],['yamux-churn.py'],['transport-cancel.py']]
-    commands += [['quic-transport.py',*([mode] if mode else [])] for mode in ('','--key-update','--migration','--server-protocol','--resumption','--quic-resumption','--early','--fallback','--congestion','--stream-control','--stream-churn','--closing','--persistent','--retry','--rtt')]
+    commands += [['quic-transport.py',*([mode] if mode else [])] for mode in ('','--key-update','--migration','--migration-cids','--server-protocol','--resumption','--quic-resumption','--early','--fallback','--congestion','--stream-control','--stream-churn','--closing','--persistent','--retry','--rtt')]
     commands += [['tls-resumption-expiry.py'],['tls-handshake-validity.py']]
     if options.yamux_peer:commands += [['transport-go.py','--peer-binary',str(options.yamux_peer.resolve()),*extra] for extra in ([],['--streams','1536'])]
     if options.yamux_peer:commands += [['transport-go.py','--fin-schedule']]
@@ -26,7 +26,7 @@ def main():
         started=time.monotonic();print('RUN',command,flush=True)
         with (logs/f'{index:02}.log').open('w') as log:
             log.write('RUN '+str(command)+'\n');log.flush()
-            result=subprocess.run([sys.executable,str(ROOT/'tests'/command[0]),*command[1:],*(['--sanitize'] if options.sanitize else [])],cwd=ROOT,stdout=log,stderr=subprocess.STDOUT,timeout=240 if '--streams' in command else 180)
+            result=subprocess.run([sys.executable,str(ROOT/'tests'/command[0]),*command[1:],*(['--sanitize'] if options.sanitize else [])],cwd=ROOT,stdout=log,stderr=subprocess.STDOUT,timeout=360 if options.sanitize and '--rtt' in command else 240 if '--streams' in command else 180)
         row={'command':command,'status':result.returncode,'seconds':time.monotonic()-started};print(json.dumps(row),flush=True);return row
     # Cases are independent (own temporaries, ephemeral ports), so they run
     # MINYAR_TEST_JOBS at a time. Results and logs keep suite order, and the

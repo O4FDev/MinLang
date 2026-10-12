@@ -118,12 +118,16 @@ static void pool_remove(PoolLink *link, unsigned order) {
  * Touching pages does not lock them into physical RAM or prevent preemption. */
 __attribute__((constructor)) static void minyar_pool_initialize(void) {
 #ifdef MINYAR_LAZY_HEAP
+    int mapping_flags = MAP_PRIVATE | MAP_ANON;
+#if defined(__linux__) && defined(MAP_NORESERVE)
+    mapping_flags |= MAP_NORESERVE;
+#endif
     void *heap = mmap(NULL, MINYAR_POOL_BYTES, PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANON, -1, 0);
+                      mapping_flags, -1, 0);
     if (heap == MAP_FAILED)
         minyar_stop("the lazy heap virtual reservation failed.");
     void *map = mmap(NULL, MINYAR_POOL_MAP_BYTES, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANON, -1, 0);
+                     mapping_flags, -1, 0);
     if (map == MAP_FAILED) {
         /* Startup failure: no live graph exists and no runtime owner escapes. */
         int failure = errno;

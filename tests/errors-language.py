@@ -23,7 +23,7 @@ class ErrorsLanguage(CompilerTestCase):
         super().setUp()
         for path in (FRONTEND, ROOT / 'compiler/errors-compiler.min',
                      ROOT / 'compiler/build-errors-compiler.py',
-                     ROOT / 'compiler/compiler.min', ROOT / 'compiler/closure-compiler.min',
+                     ROOT / 'build/compiler.min', ROOT / 'compiler/closure-compiler.min',
                      ROOT / 'scripts/build-closure-compiler.py', ROOT / 'tests/callbacks.py',
                      ROOT / 'tests/errors_evidence.py', ROOT / 'tools/cycle_runtime.py',
                      ROOT / 'library/results.min', ROOT / 'library/errors.min',

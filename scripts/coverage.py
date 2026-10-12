@@ -329,7 +329,7 @@ def main() -> int:
              "--output-dir", str(directory / "fuzz")], env=suite_env)
         # Both instrumentation orders must preserve exact compiler output.
         output = directory / "self.ll"
-        run([str(compiler), "compiler/compiler.min", str(output)], env=suite_env)
+        run([str(compiler), "build/compiler.min", str(output)], env=suite_env)
         self_outputs.append(output.read_bytes())
         compiler_reports[phase] = compiler_edge_coverage(compiler_edges)
     if self_outputs[0] != self_outputs[1] or self_outputs[0] != (ROOT / "build/compiler-stage2.ll").read_bytes():
@@ -367,7 +367,7 @@ def main() -> int:
         "compiler_suites": list(COMPILER_SUITES),
         "compiler": {
             "measurement": "SanitizerCoverage distinct LLVM control-flow edges, IDs assigned before inlining; no function or guard exclusions",
-            "source_sha256": hashlib.sha256((ROOT / "compiler/compiler.min").read_bytes()).hexdigest(),
+            "source_sha256": hashlib.sha256((ROOT / "build/compiler.min").read_bytes()).hexdigest(),
             "ir_sha256": hashlib.sha256((ROOT / "build/compiler-stage2.ll").read_bytes()).hexdigest(),
             "edges": compiler_reports["before-inlining"],
             "after_inlining_edges": compiler_reports["after-inlining"],

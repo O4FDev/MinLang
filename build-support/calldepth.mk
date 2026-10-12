@@ -1,4 +1,4 @@
-build/calldepth-compiler.min: compiler/build-calldepth-compiler.py compiler/calldepth-compiler.min compiler/build-errors-compiler.py compiler/compiler.min compiler/closure-compiler.min compiler/errors-compiler.min compiler/managed-graphs-adapter.patch scripts/build-closure-compiler.py scripts/build-module-compiler.py | build
+build/calldepth-compiler.min: compiler/build-calldepth-compiler.py compiler/calldepth-compiler.min compiler/build-errors-compiler.py build/compiler.min compiler/closure-compiler.min compiler/errors-compiler.min compiler/managed-graphs-adapter.patch scripts/build-closure-compiler.py scripts/build-module-compiler.py | build
 	python3 compiler/build-calldepth-compiler.py $@
 
 build/calldepth-compiler-stage1.ll: build/calldepth-compiler.min build/minyarc
@@ -17,8 +17,8 @@ build/calldepth-compiler-stage3.ll: build/calldepth-compiler.min build/minyarc-c
 	$(LIMITED) ./build/minyarc-calldepth $< $@
 
 .PHONY: check-calldepth check-calldepth-sanitize check-calldepth-profiles check-calldepth-launcher check-calldepth-reporting check-calldepth-reporting-sanitize check-calldepth-hooks check-calldepth-hooks-sanitize
-check-calldepth: build/minyarc-calldepth build/calldepth-compiler-stage3.ll
-	cmp build/calldepth-compiler-stage2.ll build/calldepth-compiler-stage3.ll
+check-calldepth: build/minyarc-calldepth build/calldepth-compiler-stage3.ll build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --profile calldepth --ir build/calldepth-compiler-stage3.ll
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/calldepth.py
 
 check-calldepth-sanitize: build/minyarc-calldepth

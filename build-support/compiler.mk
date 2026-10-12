@@ -1,7 +1,12 @@
+COMPILER_SOURCES = compiler/compiler.min compiler/source.py $(wildcard compiler/stages/*.min)
+
+build/compiler.min: $(COMPILER_SOURCES) | build
+	python3 compiler/source.py $@
+
 build/stage0: bootstrap/stage0.c vendor/stb_ds.h build/.toolchain.json | build
 	"$(CC)" $(CPPFLAGS) $(CFLAGS) $< -o $@
 
-build/compiler-stage1.ll: compiler/compiler.min build/stage0
+build/compiler-stage1.ll: build/compiler.min build/stage0
 	$(LIMITED) ./build/stage0 $< -o $@
 
 build/compiler-stage1: build/compiler-stage1.ll build/minyar-compiler-runtime.ll
@@ -13,13 +18,13 @@ build/compiler-stage2-sanitize.ll: build/compiler-stage2.ll tests/llvm_sanitizer
 build/minyarc-sanitize: build/compiler-stage2-sanitize.ll build/minyar-compiler-runtime-sanitize.o
 	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
-build/compiler-stage2.ll: compiler/compiler.min build/compiler-stage1
+build/compiler-stage2.ll: build/compiler.min build/compiler-stage1
 	$(LIMITED) ./build/compiler-stage1 $< $@
 
 build/minyarc: build/compiler-stage2.ll build/minyar-compiler-runtime.ll
 	$(LIMITED) "$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
-build/compiler-stage3.ll: compiler/compiler.min build/minyarc
+build/compiler-stage3.ll: build/compiler.min build/minyarc
 	$(LIMITED) ./build/minyarc $< $@
 
 build/compiler-bootstrap.ll: build/compiler-stage1.ll
@@ -30,7 +35,7 @@ build/compiler-bootstrap: build/compiler-bootstrap.ll build/minyar-compiler-runt
 
 # The module frontend is optional. Its guarded build adapter is applied to the
 # current core without changing the ordinary compiler or its fixed budgets.
-build/module-compiler.min: compiler/compiler.min compiler/module-compiler.min compiler/module-compiler-adapter.patch scripts/build-module-compiler.py | build
+build/module-compiler.min: build/compiler.min compiler/module-compiler.min compiler/module-compiler-adapter.patch scripts/build-module-compiler.py | build
 	python3 scripts/build-module-compiler.py $@
 
 build/module-compiler-stage1.ll: build/module-compiler.min build/minyarc
@@ -62,7 +67,7 @@ build/minyar-module-build-sanitize: tools/module-build.c build/.toolchain.json |
 
 # Captures and callable types extend the same parser through guarded adapters.
 # Only programs whose parsed syntax requests the extension use this frontend.
-build/closure-compiler.min: compiler/compiler.min compiler/closure-compiler.min compiler/managed-graphs-adapter.patch scripts/build-closure-compiler.py scripts/build-module-compiler.py | build
+build/closure-compiler.min: build/compiler.min compiler/closure-compiler.min compiler/managed-graphs-adapter.patch scripts/build-closure-compiler.py scripts/build-module-compiler.py | build
 	python3 scripts/build-closure-compiler.py $@
 
 build/closure-compiler-stage1.ll: build/closure-compiler.min build/minyarc
@@ -87,7 +92,7 @@ build/minyarc-callbacks-sanitize: build/closure-compiler-sanitize.ll build/minya
 	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
 # Typed Result is an optional frontend assembled from the same guarded core.
-build/errors-compiler.min: compiler/compiler.min compiler/errors-compiler.min compiler/closure-compiler.min compiler/managed-graphs-adapter.patch scripts/build-closure-compiler.py scripts/build-module-compiler.py compiler/build-errors-compiler.py | build
+build/errors-compiler.min: build/compiler.min compiler/errors-compiler.min compiler/closure-compiler.min compiler/managed-graphs-adapter.patch scripts/build-closure-compiler.py scripts/build-module-compiler.py compiler/build-errors-compiler.py | build
 	python3 compiler/build-errors-compiler.py $@
 
 build/errors-compiler-stage1.ll: build/errors-compiler.min build/minyarc
@@ -112,7 +117,7 @@ build/minyarc-errors-sanitize: build/errors-compiler-sanitize.ll build/minyar-co
 	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
 # The request frontend emits only parser status 87; it is never self-hosted.
-build/errors-request.min: compiler/compiler.min compiler/closure-compiler.min compiler/errors-request.min compiler/managed-graphs-adapter.patch scripts/build-closure-compiler.py scripts/build-module-compiler.py compiler/build-errors-request.py | build
+build/errors-request.min: build/compiler.min compiler/closure-compiler.min compiler/errors-request.min compiler/managed-graphs-adapter.patch scripts/build-closure-compiler.py scripts/build-module-compiler.py compiler/build-errors-request.py | build
 	python3 compiler/build-errors-request.py $@
 
 build/errors-request.ll: build/errors-request.min build/minyarc
@@ -147,3 +152,9 @@ FORCE:
 
 build/.toolchain.json: FORCE scripts/toolchain-stamp.py tools/host_paths.py | build
 	@python3 scripts/toolchain-stamp.py $@
+
+.PHONY: check-native-records
+check-native-records: build/minyarc build/minyarc-errors build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/native-records.py
+
+check check-portable: check-native-records

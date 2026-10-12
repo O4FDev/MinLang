@@ -5,11 +5,11 @@
 check-feature-dispatch: build/minyarc
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/feature-dispatch.py
 
-check-managed-graphs: build/minyarc build/minyarc-callbacks build/minyarc-baseline
+check-managed-graphs: build/minyarc build/minyarc-callbacks
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/managed-graphs.py
 
-check-callbacks: build/minyarc-callbacks build/closure-compiler-stage3.ll
-	cmp build/closure-compiler-stage2.ll build/closure-compiler-stage3.ll
+check-callbacks: build/minyarc-callbacks build/closure-compiler-stage3.ll build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --profile callbacks --ir build/closure-compiler-stage3.ll
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/callbacks.py
 
 check-managed-graphs-profiles:
@@ -42,7 +42,7 @@ check-isolated-workers: build/minyarc build/minyar-default-runtime.o
 build/minyar-default-runtime-sanitize.o: runtime/minyar_default_runtime.c runtime/minyar_runtime.c $(RUNTIME_HEADERS) $(BUILD_RULES) | build
 	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) -c $< -o $@
 
-check-managed-graphs-sanitize: build/minyarc-sanitize build/minyarc-callbacks-sanitize build/minyarc-baseline
+check-managed-graphs-sanitize: build/minyarc-sanitize build/minyarc-callbacks-sanitize
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/managed-graphs.py
 
 check-callbacks-sanitize: build/minyarc-callbacks-sanitize

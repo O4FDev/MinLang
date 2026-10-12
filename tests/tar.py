@@ -295,7 +295,7 @@ def malformed():
     yield "metadata-limit", header("long", b"x" * (1048576 + 1), tarfile.GNUTYPE_LONGNAME) + header() + FOOTER
 
 
-def build_program(work, source, name, sanitize=False):
+def build_program(work, source, name, sanitize=False, release=False):
     compiler = Path(os.environ.get("MINYAR_TEST_COMPILER", ROOT / "build/minyarc"))
     clang = os.environ.get("MINYAR_TEST_CLANG", "clang")
     llvm = work / (name + ".ll")
@@ -304,10 +304,13 @@ def build_program(work, source, name, sanitize=False):
         from llvm_sanitizer import instrument_address_sanitizer
         llvm.write_text(instrument_address_sanitizer(llvm.read_text()))
     flags = ["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"] if sanitize else ["-O2"]
+    if release:
+        if sanitize: raise ValueError("release and sanitizer builds are separate")
+        flags += ["-flto", *(["-fuse-ld=lld"] if sys.platform.startswith("linux") else [])]
     runtime = os.environ.get("MINYAR_TEST_RUNTIME")
     if not runtime:
         runtime = work / "runtime.o"
-        subprocess.run(clang_command([clang, *flags, "-DMINYAR_SYSTEM_HEAP=1", "-c",
+        subprocess.run(clang_command([clang, *[f for f in flags if not f.startswith("-fuse-ld=")], "-DMINYAR_SYSTEM_HEAP=1", "-c",
                                      ROOT / "runtime/minyar_runtime.c", "-o", runtime]), check=True, timeout=60)
     elif sanitize:
         raise ValueError("sanitizer run requires a freshly instrumented runtime")

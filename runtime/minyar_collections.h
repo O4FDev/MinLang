@@ -1,5 +1,8 @@
 /* Runtime implementation fragment; included once by minyar_runtime.c. */
 
+#ifdef MINYAR_BOUNDED_RC
+MINYAR_INLINE_ENTRY
+#endif
 MinyarList *minyar_list_new(void) {
     MinyarList *list = object_allocate(sizeof(*list), 2);
     list->values = NULL;
@@ -119,6 +122,9 @@ static inline unsigned list_store_kind(MinyarList *list, long long value, unsign
 }
 #endif
 
+#ifdef MINYAR_BOUNDED_RC
+MINYAR_INLINE_ENTRY
+#endif
 void minyar_list_add(MinyarList *list, long long value) {
     if (list->length == list->capacity)
         list_grow(list);

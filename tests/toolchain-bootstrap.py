@@ -70,7 +70,7 @@ with tempfile.TemporaryDirectory(prefix='minyar cold toolchain ') as temporary:
                                   [('MINYAR_MAX_MEMORY_MIB', '768'), ('MINYAR_MAX_CPU_SECONDS', '240'),
                                    ('MINYAR_MAX_FILE_BLOCKS', '262144'), ('MINYAR_NICE_PRIORITY', '15')]},
               'source_sha256': {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
-                                for name in ('tools/clang-driver.py', 'compiler/compiler.min',
+                                for name in ('tools/clang-driver.py', 'build/compiler.min',
                                              'scripts/with-limits.sh', 'tests/toolchain-bootstrap.py')}}
     if os.environ.get('MINYAR_BOOTSTRAP_EVIDENCE'):
         Path(os.environ['MINYAR_BOOTSTRAP_EVIDENCE']).write_text(json.dumps(report, indent=2) + '\n')

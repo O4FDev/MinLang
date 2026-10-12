@@ -18,7 +18,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "compiler" / "compiler.min"
+SOURCE = ROOT / "build" / "compiler.min"
 STAGE0 = ROOT / "build" / "stage0"
 COMPILER_RUNTIME = ROOT / "build" / "minyar-compiler-runtime.ll"
 PROGRAM_RUNTIME = ROOT / "build" / "minyar-runtime.o"

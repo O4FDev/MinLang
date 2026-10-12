@@ -110,8 +110,8 @@ check-stack-overflow-sanitize: build/minyarc-sanitize build/minyar-runtime-sanit
 check-windows-large-file:
 	python3 tests/windows-large-file.py
 
-check-portable: check-smoke check-regressions check-diagnostics check-conformance check-runtime-unit check-modules check-fuzz check-stack-overflow check-windows-large-file build/compiler-stage3.ll
-	cmp build/compiler-stage2.ll build/compiler-stage3.ll
+check-portable: check-smoke check-regressions check-diagnostics check-conformance check-runtime-unit check-modules check-fuzz check-stack-overflow check-windows-large-file build/compiler-stage3.ll build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --profile core --ir build/compiler-stage3.ll
 
 check-mutation: build/stage0 build/minyarc build/minyar-runtime.o
 	$(LIMITED) python3 tests/mutation.py
@@ -163,10 +163,9 @@ check-temporary-owner-admission:
 check: check-temporary-owner-admission
 # Verify that sanitizer coverage exercises the same compiler as the native
 # fixed point, including when a retained build artifact has misleading times.
-check-sanitized-fixed-point: build/minyarc-sanitize build/compiler-stage3.ll
-	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/minyarc-sanitize compiler/compiler.min build/compiler-sanitized.ll
-	cmp build/compiler-stage2.ll build/compiler-sanitized.ll
-	cmp build/compiler-stage3.ll build/compiler-sanitized.ll
+check-sanitized-fixed-point: build/minyarc-sanitize build/compiler-stage3.ll build/minyar-runtime.o
+	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/minyarc-sanitize build/compiler.min build/compiler-sanitized.ll
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --ir build/compiler-sanitized.ll --ir build/compiler-stage3.ll
 
 check-sanitize: check-generated-sanitizer check-sanitized-fixed-point check-stack-overflow-sanitize build/minyar-runtime.o build/minyar-runtime-sanitize.o build/runtime-unit-sanitize
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize $(SANITIZER_LIMITED) sh tests/run-module-tests.sh
@@ -182,8 +181,8 @@ check-stress: build/minyarc build/minyar-runtime.o
 check: doctor check-smoke check-release-build check-recursive-data check-compact-ownership check-adversarial check-ownership-mutation check-regressions check-memory check-runtime-unit check-modules check-fuzz check-stack-overflow check-mutation check-performance check-scaling check-budget check-sanitize check-ownership check-examples
 
 .PHONY: check-examples
-check-examples: build/stage0 build/minyarc build/compiler-stage3.ll build/hello build/language-tour build/records build/compiler-bootstrap build/hello-self-hosted build/integer-overflow build/divide-by-zero build/text-and-files build/lists build/newlines build/top-level build/top-level-exit build/list-out-of-bounds build/text-indexing build/text-slice-out-of-bounds
-	cmp build/compiler-stage2.ll build/compiler-stage3.ll
+check-examples: build/stage0 build/minyarc build/compiler-stage3.ll build/hello build/language-tour build/records build/compiler-bootstrap build/hello-self-hosted build/integer-overflow build/divide-by-zero build/text-and-files build/lists build/newlines build/top-level build/top-level-exit build/list-out-of-bounds build/text-indexing build/text-slice-out-of-bounds build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --profile core --ir build/compiler-stage3.ll
 	test "$$(./build/hello)" = "hello from LLVM-backed Minyar"
 	test "$$(./build/language-tour | tr '\n' ' ')" = "The answer is 42 3 2 1 "
 	test "$$(./build/records | tr '\n' ' ')" = "Minyar Ada is 36 Grace "
@@ -334,7 +333,7 @@ check-bounded: build/minyarc build/minyar-runtime-bounded.o build/bounded-runtim
 
 .PHONY: check-incremental-modules
 check-incremental-modules: build/minyarc-errors-request build/minyarc-modules build/module-compiler-stage3.ll build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-release.ll build/minyarc-callbacks
-	cmp build/module-compiler-stage2.ll build/module-compiler-stage3.ll
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --profile core --ir build/module-compiler-stage3.ll
 	$(LIMITED) python3 tests/incremental-modules.py
 	$(LIMITED) python3 tests/incremental-module-driver.py
 	$(LIMITED) python3 tests/incremental-module-delta.py
@@ -480,7 +479,7 @@ check-fuzz-afl-harness:
 	python3 tests/fuzz-afl-harness.py
 
 .PHONY: check-bootstrap-portability
-check-bootstrap-portability:
+check-bootstrap-portability: build/compiler.min
 	python3 tests/bootstrap-portability.py
 
 check-portable: check-bootstrap-portability

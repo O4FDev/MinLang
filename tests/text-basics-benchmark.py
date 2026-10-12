@@ -52,7 +52,7 @@ def main():
               'warmup_seconds': samples[0], 'samples_seconds': samples[1:],
               'median_seconds': statistics.median(samples[1:]), 'checksum': checksum}
     if args.baseline_compiler:
-        reference = ROOT / 'compiler/compiler.min'
+        reference = ROOT / 'build/compiler.min'
         samples = {'control': [], 'candidate': []}
         compilers = {'control': args.baseline_compiler, 'candidate': args.compiler}
         outputs = {name: args.output.with_suffix('.' + name + '.ll') for name in compilers}

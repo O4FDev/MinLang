@@ -47,7 +47,7 @@ static size_t entry(RcObject *object) {
 }
 
 static size_t saved_record_cursor(MinyarRecord *record) {
-#if defined(MINYAR_SYSTEM_SMALL_HEAP) && defined(MINYAR_SYSTEM_HEAP) && !MINYAR_THREADED
+#if defined(MINYAR_SYSTEM_HEAP) && MINYAR_SYSTEM_SMALL_HEAP && !MINYAR_THREADED
     size_t cursor = ((RcSystemSlot *)((RcObject *)record - 1) - 1)->value.bytes;
     assert(cursor <= (size_t)record->length);
     return cursor;

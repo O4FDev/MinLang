@@ -1,0 +1,637 @@
+function compileBlock(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, returnType: Integer): Boolean {
+    return compileStatementSequence(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType, true)
+}
+
+function compileStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, returnType: Integer): Boolean {
+    if tokenIs(tokenKinds, tokenTexts, state, "if") || tokenIs(tokenKinds, tokenTexts, state, "while") {
+        return compileStatementSequence(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType, false)
+    }
+    return compileAtomicStatement(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
+}
+
+function compileAtomicStatement(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, returnType: Integer): Boolean {
+    let returns = false
+    let referenceEffects = state[7]
+    if tokenIs(tokenKinds, tokenTexts, state, "else") {
+        fail(describeLocation(tokenLocation(tokenLines, state[0])) + ": 'else' needs a preceding if branch")
+    }
+    if tokenIs(tokenKinds, tokenTexts, state, "native") && tokenKinds[state[0] + 1] == 3 {
+        compileNative(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, returnType)
+        return true
+    }
+    if tokenIs(tokenKinds, tokenTexts, state, "let") {
+        state[0] = state[0] + 1
+        if tokenKinds[state[0]] != 1 {
+            fail(describeLocation(tokenLocation(tokenLines, state[0])) + ": expected a name after let")
+        }
+        let name = tokenTexts[state[0]]
+        let nameLocation = state[0]
+        state[0] = state[0] + 1
+        let declaredType = 0
+        if tokenIs(tokenKinds, tokenTexts, state, ":") {
+            state[0] = state[0] + 1
+            declaredType = takeType(tokenKinds, tokenTexts, tokenLines, state, functionNames, symbolKinds)
+        }
+        expectToken(tokenKinds, tokenTexts, tokenLines, state, "=")
+        if tokenKinds[state[0]] == 1 && state[0] + 1 < tokenTexts.length && tokenTexts[state[0] + 1] == "{" {
+            prepareScalarRecord(tokenKinds, tokenTexts, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterTypes, state, name)
+        }
+        let valueType: List<Integer> = []
+        valueType.add(declaredType)
+        let value = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, valueType)
+        if valueType[0] == 100000 {
+            if !isListType(declaredType) {
+                fail("an empty List needs a type, such as List<Text>")
+            }
+            valueType[0] = declaredType
+            if isReferenceType(listElementType(declaredType)) {
+                output.add("  call void @minyar_list_references(ptr ")
+                output.add(value)
+                output.add(")\n")
+            }
+        }
+        if declaredType != 0 && declaredType != valueType[0] {
+            fail(describeLocation(tokenLocation(tokenLines, nameLocation)) + ": the value for '" + name + "' does not match its declared type")
+        }
+        let type = valueType[0]
+        if type == 5 || type == 6 {
+            fail("Nothing cannot be stored in a binding")
+        }
+        let id = nextLocal(state)
+        addLocal(localNames, localTypes, localIds, localLengths, state, name, type, id)
+        assignReference(output, state, id, value, valueType)
+        output.add("  store ")
+        output.add(llvmType(type))
+        output.add(" ")
+        output.add(value)
+        output.add(", ptr %local.")
+        output.add(Text(id))
+        output.add("\n")
+    } else {
+        if tokenIs(tokenKinds, tokenTexts, state, "return") {
+            if textState[1] == "top level" {
+                fail(describeLocation(tokenLocation(tokenLines, state[0])) + ": use exit(status) to finish a top-level program")
+            }
+            state[0] = state[0] + 1
+            let valueType: List<Integer> = []
+            valueType.add(returnType)
+            let value = ""
+            if tokenKinds[state[0]] != 6 && !tokenIs(tokenKinds, tokenTexts, state, "}") {
+                value = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, valueType)
+            } else {
+                setType(valueType, 5)
+            }
+            if valueType[0] != returnType {
+                fail("a returned value has the wrong type")
+            }
+            if isReferenceType(valueType[0]) && !takeResult(output, state, value, valueType) {
+                output.add("  call void @minyar_rc_retain(ptr ")
+                output.add(value)
+                output.add(")\n")
+            }
+            if textState[1] == "main" {
+                emitModuleConstantCleanup(output, symbolKinds, functionParameterCounts)
+            }
+            output.add("  call void @minyar_rc_leave()\n")
+            output.add("  call void @minyar_stack_leave()\n")
+            if textState[1] == "main" {
+                let temporary = newTemporary(state)
+                output.add("  %value.")
+                output.add(Text(temporary))
+                output.add(" = trunc i64 ")
+                output.add(value)
+                output.add(" to i32\n")
+                output.add("  ret i32 %value.")
+                output.add(Text(temporary))
+                output.add("\n")
+            } else {
+                output.add("  ret ")
+                output.add(llvmType(valueType[0]))
+                output.add(" ")
+                output.add(value)
+                output.add("\n")
+            }
+            returns = true
+        } else {
+
+                if tokenIs(tokenKinds, tokenTexts, state, "for") && tokenKinds[state[0] + 1] == 1 && tokenTexts[state[0] + 2] == "in" {
+                    compileFor(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
+                } else {
+                if (tokenIs(tokenKinds, tokenTexts, state, "break") || tokenIs(tokenKinds, tokenTexts, state, "continue")) && (tokenKinds[state[0] + 1] == 6 || tokenTexts[state[0] + 1] == "}") {
+                    compileLoopJump(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output)
+                    returns = true
+                } else {
+
+                    if tokenKinds[state[0]] == 1 && tokenTexts[state[0] + 1] == "=" {
+                        let name = tokenTexts[state[0]]
+                        let local = findLocal(localNames, localLengths, state, name)
+                        if local < 0 {
+                            if findCompiledSymbol(functionNames, symbolKinds, functionReturnTypes, name, 3) >= 0 {
+                                fail(describeLocation(tokenLocation(tokenLines, state[0])) + ": constant '" + readableDeclarationName(name) + "' cannot be reassigned")
+                            }
+                            fail("I can't find a value named '" + name + "'")
+                        }
+                        state[0] = state[0] + 2
+                        let valueType: List<Integer> = []
+                        valueType.add(localTypes[local])
+                        // For x = x + e and x = x.appended(e), transfer x's
+                        // local owner into the consuming Text join or List
+                        // append. Runtime uniqueness still guards in-place
+                        // growth; aliases take the copying fallback. Not when
+                        // x appears again: a later read would see the change.
+                        if tokenKinds[state[0]] == 1 && tokenTexts[state[0]] == name && ((localTypes[local] == 2 && tokenTexts[state[0] + 1] == "+") || (isListType(localTypes[local]) && tokenTexts[state[0] + 1] == "." && tokenTexts[state[0] + 2] == "appended" && tokenTexts[state[0] + 3] == "(")) && !nameInStatement(tokenKinds, tokenTexts, state[0] + 1, name) {
+                            valueType.add(-1)
+                            valueType.add(localIds[local])
+                            valueType.add(state[0])
+                        }
+                        let value = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, valueType)
+                        if valueType[0] != localTypes[local] {
+                            fail("an assignment to '" + name + "' has the wrong type")
+                        }
+                        assignReference(output, state, localIds[local], value, valueType)
+                        output.add("  store ")
+                        output.add(llvmType(valueType[0]))
+                        output.add(" ")
+                        output.add(value)
+                        output.add(", ptr %local.")
+                        output.add(Text(localIds[local]))
+                        output.add("\n")
+                    } else {
+                        let assignmentOperator = assignmentOperatorPosition(tokenKinds, tokenTexts, state[0])
+                        if assignmentOperator >= 0 {
+                            compileAssignment(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, assignmentOperator)
+                        } else {
+                            let ignoredType: List<Integer> = []
+                            ignoredType.add(0)
+                            let ignored = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, ignoredType)
+                            if ignoredType[0] == 6 {
+                                output.add("  unreachable\n")
+                                returns = true
+                            }
+                        }
+                        }
+
+                    }
+                }
+
+        }
+    }
+    if !returns && state[7] != referenceEffects {
+        output.add("  call void @minyar_rc_step()\n")
+    }
+    return returns
+}
+
+// Parameter bindings that are never assigned retain their incoming SSA value.
+// Scan the body once; same-name assignments in nested scopes conservatively
+// disable replacement. List element writes do not change the binding itself.
+// Limit name matching to 64 parameters so extra analysis remains linear.
+function markAssignedParameters(tokenKinds: List<Integer>, tokenTexts: List<Text>, start: Integer, names: List<Text>, types: List<Integer>) {
+    let count = names.length
+    let parameter = 0
+    while parameter < count {
+        if count > 64 { types.add(1) } else { types.add(0) }
+        parameter = parameter + 1
+    }
+    if count == 0 || count > 64 { return }
+    let position = start
+    let depth = 0
+    let done = false
+    while tokenKinds[position] != 0 && !done {
+        if tokenKinds[position] == 1 && tokenKinds[position + 1] == 4 && isAssignmentOperator(tokenTexts[position + 1]) {
+            parameter = 0
+            while parameter < count {
+                if tokenTexts[position] == names[parameter] { types[count + parameter] = 1 }
+                parameter = parameter + 1
+            }
+        }
+        if tokenKinds[position] == 4 {
+            if tokenTexts[position] == "{" { depth = depth + 1 }
+            if tokenTexts[position] == "}" {
+                depth = depth - 1
+                if depth == 0 { done = true }
+            }
+        }
+        position = position + 1
+    }
+}
+
+function compileFunctions(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, output: List<Text>, globals: List<Text>, stackOwnerLimit: Integer): Boolean {
+    let state: List<Integer> = []
+    state.add(0)
+    state.add(0)
+    state.add(0)
+    state.add(0)
+    state.add(0)
+    state.add(-1)
+    state.add(0)
+    state.add(0)
+    state.add(0)
+    state.add(1)
+    state.add(-1)
+    state.add(0)
+    state.add(-1)
+    state.add(0)
+    // 14: user-function calls emitted in the current body (leaf detection).
+    state.add(0)
+    let hasNative = false
+    // Functions that dropTreeGuards may free of their call-depth check: per
+    // record its function, kind (0 leaf, 1 small caller), user-call count,
+    // and entry, body and end slots.
+    let treeFunctions: List<Integer> = []
+    let treeKinds: List<Integer> = []
+    let treeCalls: List<Integer> = []
+    let treeSlots: List<Integer> = []
+    let textState: List<Text> = []
+    textState.add("entry")
+    textState.add("")
+
+    skipTerminators(tokenKinds, state)
+    while tokenKinds[state[0]] != 0 {
+        if tokenIs(tokenKinds, tokenTexts, state, "record") {
+            skipDeclaration(tokenKinds, tokenTexts, state)
+        } else {
+        if tokenIs(tokenKinds, tokenTexts, state, "function") {
+        expectToken(tokenKinds, tokenTexts, tokenLines, state, "function")
+        let name = tokenTexts[state[0]]
+        state[0] = state[0] + 1
+        textState[1] = name
+        expectToken(tokenKinds, tokenTexts, tokenLines, state, "(")
+        let parameterNames: List<Text> = []
+        let parameterTypes: List<Integer> = []
+        while !tokenIs(tokenKinds, tokenTexts, state, ")") {
+            parameterNames.add(tokenTexts[state[0]])
+            state[0] = state[0] + 1
+            expectToken(tokenKinds, tokenTexts, tokenLines, state, ":")
+            parameterTypes.add(takeType(tokenKinds, tokenTexts, tokenLines, state, functionNames, symbolKinds))
+            if tokenIs(tokenKinds, tokenTexts, state, ",") {
+                state[0] = state[0] + 1
+            }
+        }
+        expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
+        let returnType = 5
+        if name == "main" {
+            returnType = 1
+        }
+        if tokenIs(tokenKinds, tokenTexts, state, ":") {
+            state[0] = state[0] + 1
+            returnType = takeType(tokenKinds, tokenTexts, tokenLines, state, functionNames, symbolKinds)
+        }
+
+        markAssignedParameters(tokenKinds, tokenTexts, state[0], parameterNames, parameterTypes)
+        // Remember the exact first statement for native whole-body validation.
+        state[12] = state[0] + 1
+        while tokenKinds[state[12]] == 6 { state[12] = state[12] + 1 }
+        let machineIntrinsic = false
+        if tokenKinds[state[12]] == 1 && tokenTexts[state[12]] == "native" && tokenKinds[state[12] + 1] == 3 {
+            hasNative = true
+            machineIntrinsic = tokenTexts[state[12] + 1] == "machine" || tokenTexts[state[12] + 1] == "machine_arm64"
+        }
+        if machineIntrinsic {
+            globals.add("; minyar-machine: " + name + "\n")
+        }
+        let parallel = findText(globals, "; minyar-parallel: " + name + "\n") >= 0
+        state[1] = 0
+        state[2] = 0
+        state[3] = 0
+        state[4] = parameterNames.length
+        state[6] = 0
+        state[7] = 0
+        state[8] = 0
+        state[9] = state[9] + 1
+        state[10] = -1
+        state[11] = 0
+        state[13] = 0
+        // Only parseCall writes a resolved user-function index into this cache.
+        // Reset it per body in bounded mode: -1 at finish proves no user call.
+        // Ordinary mode retains its existing cross-body cache behavior.
+        if stackOwnerLimit > 0 { state[5] = -1 }
+        state[14] = 0
+        textState[0] = "entry"
+        let localNames: List<Text> = []
+        let localTypes: List<Integer> = []
+        let localIds: List<Integer> = []
+        let localLengths: List<Integer> = []
+
+        let emittedReturn = llvmType(returnType)
+        if name == "main" {
+            emittedReturn = "i32"
+        }
+        let defineSlot = output.length
+        output.add("define ")
+        output.add(emittedReturn)
+        if name == "main" || name[0] == '"' {
+            output.add(" @")
+        } else {
+            output.add(" @.minyar.fn.")
+        }
+        output.add(name)
+        output.add("(")
+        if name == "main" {
+            output.add("i32 %minyar.argument.count, ptr %minyar.argument.values")
+        } else {
+            let parameter = 0
+            while parameter < parameterNames.length {
+                if parameter > 0 {
+                    output.add(", ")
+                }
+                output.add(llvmType(parameterTypes[parameter]))
+                output.add(" ")
+                let id = parameter
+                if parameterTypes[parameterNames.length + parameter] == 0 {
+                    id = -output.length - 1
+                }
+                parameterTypes[parameterNames.length + parameter] = id
+                output.add("%argument." + Text(parameter))
+                parameter = parameter + 1
+            }
+        }
+        let definitionTailSlot = output.length
+        output.add(") {\nentry:\n")
+        let entrySlot = output.length
+        output.add("")
+        if name == "main" {
+            output.add("  call void @minyar_initialize_arguments(i32 %minyar.argument.count, ptr %minyar.argument.values)\n")
+            if hasModuleConstants(symbolKinds, functionParameterCounts) { output.add("  call void @.minyar.constants.initialize()\n") }
+        }
+        let parameter = 0
+        while parameter < parameterNames.length {
+            let id = parameterTypes[parameterNames.length + parameter]
+            addLocal(localNames, localTypes, localIds, localLengths, state, parameterNames[parameter], parameterTypes[parameter], id)
+            if id >= 0 {
+            // Synchronous calls borrow arguments protected by the caller. The
+            // ownership slot starts null; assignment establishes a local owner.
+            output.add("  %local.")
+            output.add(Text(parameter))
+            output.add(" = alloca ")
+            output.add(llvmType(parameterTypes[parameter]))
+            output.add("\n")
+            output.add("  store ")
+            output.add(llvmType(parameterTypes[parameter]))
+            output.add(" %argument.")
+            output.add(Text(parameter))
+            output.add(", ptr %local.")
+            output.add(Text(parameter))
+            output.add("\n")
+            }
+            parameter = parameter + 1
+        }
+        let bodyStart = state[0]
+        let bodySlot = output.length
+        let returns = compileBlock(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
+        if !returns {
+            if name == "main" { emitModuleConstantCleanup(output, symbolKinds, functionParameterCounts) }
+            output.add("  call void @minyar_rc_leave()\n")
+            output.add("  call void @minyar_stack_leave()\n")
+            if name == "main" {
+                output.add("  ret i32 0\n")
+            } else {
+                if returnType == 5 {
+                    output.add("  ret void\n")
+                } else {
+                    fail("function '" + readableDeclarationName(name) + "' must return a value on every path")
+                }
+            }
+        }
+        // A label budget bounds LLVM's constant-call cloning cost. It counts
+        // reserved labels too; ordinary functions remain inline-eligible.
+        if state[2] >= 4096 {
+            output[definitionTailSlot] = ") noinline {\nentry:\n"
+            if returnType == 1 && parameterNames.length == 1 && parameterTypes[0] == 1 && parameterTypes[1] < 0 {
+                let dispatchTable = "@.dispatch." + Text(bodyStart)
+                lowerIntegerDispatch(tokenKinds, tokenTexts, tokenLines, bodyStart, state[0], parameterNames[0], output, globals, bodySlot, dispatchTable)
+            }
+        }
+        finishFunctionEntry(output, entrySlot, state[4], parameterNames.length, state[8], state[6] == 1)
+        if parallel {
+            let parallelReferences = state[6] == 1 || isReferenceType(returnType)
+            let parallelParameter = 0
+            while parallelParameter < parameterNames.length {
+                if isReferenceType(parameterTypes[parallelParameter]) { parallelReferences = true }
+                parallelParameter = parallelParameter + 1
+            }
+            finishParallelFunction(output, globals, entrySlot, bodySlot, name, parallelReferences)
+        }
+        if machineIntrinsic {
+            // Intrinsic bodies are bare instructions: no call-depth or ownership frame.
+            output[entrySlot] = ""
+            output[defineSlot] = "define internal "
+            output[definitionTailSlot] = ") alwaysinline {\nentry:\n"
+        }
+        let stackOwned = stackOwnerLimit > 0 && name != "main" && state[5] == -1 && state[6] == 1 && state[8] >= 1 && state[8] <= stackOwnerLimit
+        let smallFrame = !parallel && !machineIntrinsic && name != "main" && state[4] <= 256 && state[1] <= 1024 && state[2] <= 1024
+        if stackOwned {
+            finishStackOwnership(output, entrySlot, state[8])
+        } else if smallFrame {
+            if state[14] == 0 {
+                // A leaf (no user call, state[14]) cannot deepen recursion. With at
+                // most 256 locals and 1,024 temporaries its frame stays within
+                // about 18 KiB even unoptimized, inside the 128 KiB reserve its
+                // caller's check left (MINYAR_STACK_RESERVE_BYTES). Without the
+                // check, LLVM can inline small accessors. Dispatch lowering, which
+                // embeds a stack leave in a larger piece, needs 4,096 labels.
+                dropCallDepthFrame(output, entrySlot, bodySlot)
+            }
+            treeFunctions.add(findFunction(functionNames, symbolKinds, functionReturnTypes, name))
+            // Callers with many calls rarely qualify; skipping them bounds the scan.
+            if state[14] == 0 { treeKinds.add(0) } else { if state[14] <= 16 { treeKinds.add(1) } else { treeKinds.add(9) } }
+            treeCalls.add(state[14])
+            treeSlots.add(entrySlot)
+            treeSlots.add(bodySlot)
+            treeSlots.add(output.length)
+        }
+        output.add("}\n\n")
+        } else {
+            skipTopLevelStatement(tokenKinds, tokenTexts, state)
+        }
+        }
+        skipTerminators(tokenKinds, state)
+    }
+    dropTreeGuards(output, functionNames, symbolKinds, functionReturnTypes, treeFunctions, treeKinds, treeCalls, treeSlots)
+    return hasNative
+}
+
+function constantIRName(name: Text, suffix: Text): Text {
+    return "\"minyar.constant|" + escapeLLVMText(name) + "|" + suffix + "\""
+}
+
+function hasModuleConstants(kinds: List<Integer>, counts: List<Integer>): Boolean {
+    let symbol = 0
+    while symbol < kinds.length {
+        if kinds[symbol] == 3 && counts[symbol] < 0 { return true }
+        symbol = symbol + 1
+    }
+    return false
+}
+
+function emitModuleConstantCleanup(output: List<Text>, kinds: List<Integer>, counts: List<Integer>) {
+    if hasModuleConstants(kinds, counts) { output.add("  call void @.minyar.constants.release()\n") }
+}
+
+function compileModuleConstants(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, output: List<Text>, globals: List<Text>) {
+    if !hasModuleConstants(symbolKinds, functionParameterCounts) { return }
+    output.add("declare void @minyar_rc_release(ptr)\n")
+    output.add("declare void @minyar_constant_initialization_fail() cold noreturn\n")
+    let symbol = 0
+    while symbol < symbolKinds.length {
+        if symbolKinds[symbol] == 3 && functionParameterCounts[symbol] < 0 {
+            let name = functionNames[symbol]
+            let type = functionReturnTypes[symbol]
+            let cell = "@" + constantIRName(name, "value")
+            let flag = "@" + constantIRName(name, "state")
+            globals.add(cell + " = internal global " + llvmType(type) + " zeroinitializer\n")
+            globals.add(flag + " = internal global i8 0\n")
+            let effect = "scalar"
+            if isReferenceType(type) { effect = "managed" }
+            globals.add("; minyar-module-constant: " + escapeLLVMText(name) + "|" + effect + "\n")
+            let emittedType = llvmType(type)
+            if type == 4 { emittedType = "zeroext " + emittedType }
+            output.add("define internal " + emittedType + " @" + constantIRName(name, "load") + "() {\nentry:\n")
+            output.add("  %constant.state = load i8, ptr " + flag + "\n")
+            output.add("  %constant.ready = icmp eq i8 %constant.state, 2\n")
+            output.add("  br i1 %constant.ready, label %ready, label %check\ncheck:\n")
+            output.add("  %constant.busy = icmp eq i8 %constant.state, 1\n")
+            output.add("  br i1 %constant.busy, label %recursive, label %initialize\nrecursive:\n")
+            output.add("  call void @minyar_constant_initialization_fail()\n  unreachable\ninitialize:\n")
+            output.add("  store i8 1, ptr " + flag + "\n")
+            // Only the initialization path owns a frame. Cached reads are loads.
+            let entrySlot = output.length
+            output.add("")
+            let state: List<Integer> = []
+            state.add(-1 - functionParameterCounts[symbol])
+            state.add(0)
+            state.add(0)
+            state.add(0)
+            state.add(0)
+            state.add(-1)
+            state.add(0)
+            state.add(0)
+            state.add(0)
+            state.add(1)
+            state.add(-1)
+            state.add(0)
+            state.add(-1)
+            state.add(0)
+            state.add(0)
+            let textState: List<Text> = []
+            textState.add("initialize")
+            textState.add("constant " + name)
+            let localNames: List<Text> = []
+            let localTypes: List<Integer> = []
+            let localIds: List<Integer> = []
+            let localLengths: List<Integer> = []
+            let valueType: List<Integer> = []
+            valueType.add(type)
+            let value = parseExpression(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, valueType)
+            if valueType[0] != type {
+                fail(describeLocation(tokenLocation(tokenLines, -1 - functionParameterCounts[symbol])) + ": the initializer for constant '" + readableDeclarationName(name) + "' has the wrong type")
+            }
+            if tokenKinds[state[0]] != 6 && tokenKinds[state[0]] != 0 {
+                fail(describeLocation(tokenLocation(tokenLines, state[0])) + ": expected the end of the constant initializer")
+            }
+            if isReferenceType(type) { output.add("  call void @minyar_rc_retain(ptr " + value + ")\n") }
+            output.add("  store " + llvmType(type) + " " + value + ", ptr " + cell + "\n")
+            output.add("  store i8 2, ptr " + flag + "\n")
+            // Frame elision matches individual pieces, as in normal functions.
+            output.add("  call void @minyar_rc_leave()\n")
+            output.add("  call void @minyar_stack_leave()\n")
+            output.add("  br label %ready\nready:\n")
+            output.add("  %constant.value = load " + llvmType(type) + ", ptr " + cell + "\n")
+            output.add("  ret " + llvmType(type) + " %constant.value\n")
+            finishFunctionEntry(output, entrySlot, state[4], 0, state[8], state[6] == 1)
+            output.add("}\n\n")
+        }
+        symbol = symbol + 1
+    }
+    output.add("define internal void @.minyar.constants.initialize() {\nentry:\n")
+    symbol = 0
+    while symbol < symbolKinds.length {
+        if symbolKinds[symbol] == 3 && functionParameterCounts[symbol] < 0 {
+            let emittedType = llvmType(functionReturnTypes[symbol])
+            if functionReturnTypes[symbol] == 4 { emittedType = "zeroext " + emittedType }
+            output.add("  call " + emittedType + " @" + constantIRName(functionNames[symbol], "load") + "()\n")
+        }
+        symbol = symbol + 1
+    }
+    output.add("  ret void\n}\n\n")
+    output.add("define internal void @.minyar.constants.release() {\nentry:\n")
+    let releasesRoots = false
+    symbol = 0
+    while symbol < symbolKinds.length {
+        if symbolKinds[symbol] == 3 && functionParameterCounts[symbol] < 0 && isReferenceType(functionReturnTypes[symbol]) {
+            let cell = "@" + constantIRName(functionNames[symbol], "value")
+            output.add("  %constant." + Text(symbol) + " = load ptr, ptr " + cell + "\n")
+            output.add("  store ptr null, ptr " + cell + "\n")
+            output.add("  call void @minyar_rc_release(ptr %constant." + Text(symbol) + ")\n")
+            releasesRoots = true
+        }
+        symbol = symbol + 1
+    }
+    // An unused managed constant can outlive a scalar-only main whose frame
+    // was elided. The existing null release drains eager cycle work; bounded
+    // profiles keep their existing service budget and normal-return contract.
+    if releasesRoots { output.add("  call void @minyar_rc_release(ptr null)\n") }
+    output.add("  ret void\n}\n\n")
+}
+
+function compileTopLevel(tokenKinds: List<Integer>, tokenTexts: List<Text>, tokenLines: SourceMap, functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, functionParameterTypes: List<Integer>, output: List<Text>, globals: List<Text>) {
+    let state: List<Integer> = []
+    state.add(0)
+    state.add(0)
+    state.add(0)
+    state.add(0)
+    state.add(0)
+    state.add(-1)
+    state.add(0)
+    state.add(0)
+    state.add(0)
+    state.add(1)
+    state.add(-1)
+    state.add(0)
+    state.add(-1)
+    state.add(0)
+    state.add(0)
+    let textState: List<Text> = []
+    textState.add("entry")
+    textState.add("top level")
+    let localNames: List<Text> = []
+    let localTypes: List<Integer> = []
+    let localIds: List<Integer> = []
+    let localLengths: List<Integer> = []
+
+    output.add("define i32 @main(i32 %minyar.argument.count, ptr %minyar.argument.values) {\nentry:\n")
+    let entrySlot = output.length
+    output.add("")
+    output.add("  call void @minyar_initialize_arguments(i32 %minyar.argument.count, ptr %minyar.argument.values)\n")
+    if hasModuleConstants(symbolKinds, functionParameterCounts) { output.add("  call void @.minyar.constants.initialize()\n") }
+
+    skipTerminators(tokenKinds, state)
+    let terminated = false
+    while tokenKinds[state[0]] != 0 {
+        if tokenIs(tokenKinds, tokenTexts, state, "record") || tokenIs(tokenKinds, tokenTexts, state, "function") {
+            skipDeclaration(tokenKinds, tokenTexts, state)
+        } else {
+            if tokenIs(tokenKinds, tokenTexts, state, "constant") {
+                skipTopLevelStatement(tokenKinds, tokenTexts, state)
+            } else {
+            if terminated {
+                textState[0] = "dead." + Text(newLabel(state))
+            output.add("\n" + textState[0] + ":\n")
+            }
+            terminated = compileStatement(tokenKinds, tokenTexts, tokenLines, functionNames, symbolKinds, functionReturnTypes, functionParameterCounts, functionParameterNames, functionParameterTypes, localNames, localTypes, localIds, localLengths, state, textState, output, globals, 1)
+            if terminated { state[13] = 1 }
+            finishStatement(tokenKinds, tokenTexts, tokenLines, state)
+            }
+        }
+        skipTerminators(tokenKinds, state)
+    }
+    if !terminated {
+        emitModuleConstantCleanup(output, symbolKinds, functionParameterCounts)
+        output.add("  call void @minyar_rc_leave()\n")
+        output.add("  call void @minyar_stack_leave()\n")
+        output.add("  ret i32 0\n")
+    }
+    finishFunctionEntry(output, entrySlot, state[4], 0, state[8], state[6] == 1)
+    output.add("}\n\n")
+}
+

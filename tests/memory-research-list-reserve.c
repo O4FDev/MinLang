@@ -59,6 +59,9 @@ static void check_scalar(long long length) {
     for (long long i = 0; i < length; i++)
         minyar_list_add(source, i * 37 - 11);
     size_t allocations = allocation_calls, resizes = resize_calls;
+#ifdef MINYAR_SYSTEM_HEAP
+    size_t heap_allocations = rc_heap_allocation_count;
+#endif
     MinyarList *result = minyar_list_appended(source, -313, 0, 0);
     size_t append_allocations = allocation_calls - allocations;
     size_t append_resizes = resize_calls - resizes;
@@ -72,8 +75,14 @@ static void check_scalar(long long length) {
     assert(result->values[length] == -313 && source->length == length);
 #if !defined(MINYAR_BOUNDED_HEAP)
     /* One List header, one backing buffer; no intermediate reallocations. */
-    if (!getenv("MINYAR_RESEARCH_MEASURE_COUNTS"))
+    if (!getenv("MINYAR_RESEARCH_MEASURE_COUNTS")) {
+#ifdef MINYAR_SYSTEM_HEAP
+        assert(rc_heap_allocation_count == heap_allocations + 2);
+        assert(append_allocations <= 2 && append_resizes == 0);
+#else
         assert(append_allocations == 2 && append_resizes == 0);
+#endif
+    }
 #endif
     minyar_rc_release(source);
     minyar_rc_release(result);
@@ -168,7 +177,11 @@ static void check_debt_schedule(void) {
     assert(result->length == 32 && result->values[31] == 313);
 #ifdef MINYAR_SYSTEM_HEAP
     /* Pending retirement retains the original four realloc service hooks. */
+#if defined(MINYAR_SYSTEM_HEAP) && MINYAR_SYSTEM_SMALL_HEAP && !MINYAR_THREADED
+    assert(resize_calls - resizes <= 4);
+#else
     assert(resize_calls - resizes == 4);
+#endif
 #else
     (void)resizes;
 #endif
@@ -186,6 +199,11 @@ int main(int argc, char **argv) {
             list_grow(&empty);
         } else if (!strcmp(argv[1], "oom-object") || !strcmp(argv[1], "oom-data")) {
             MinyarList *source = minyar_list_new();
+#if defined(MINYAR_SYSTEM_HEAP) && MINYAR_SYSTEM_SMALL_HEAP && !MINYAR_THREADED
+            for (long long i = 0; i < 257; i++) minyar_list_add(source, i);
+            while (rc_system_available[0])
+                (void)rc_heap_allocate(sizeof(RcObject) + sizeof(MinyarList));
+#endif
             fail_allocation = allocation_calls + (!strcmp(argv[1], "oom-object") ? 1 : 2);
             minyar_list_appended(source, 1, 0, 0);
         }

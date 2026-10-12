@@ -17,7 +17,7 @@ class ScalarLookaheadBudget(unittest.TestCase):
         cls.temporary = tempfile.TemporaryDirectory(prefix='minyar-lookahead-proof-')
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.directory = Path(cls.temporary.name)
-        source = (COMPILER.parent.parent / 'compiler/compiler.min').read_text()
+        source = (COMPILER.parent.parent / 'build/compiler.min').read_text()
         begin = source.index('function prepareScalarRecord(')
         end = source.index('\nfunction rootLocal(', begin)
         helper = source[begin:end]

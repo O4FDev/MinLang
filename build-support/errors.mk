@@ -1,7 +1,7 @@
 .PHONY: check-errors-language check-errors-language-sanitize check-errors-language-bounded
 
-check-errors-language: build/minyarc-errors build/errors-compiler-stage3.ll
-	cmp build/errors-compiler-stage2.ll build/errors-compiler-stage3.ll
+check-errors-language: build/minyarc-errors build/errors-compiler-stage3.ll build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --profile errors --ir build/errors-compiler-stage3.ll
 	MINYAR_ERRORS_COMPILER=./build/minyarc-errors MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/errors-language.py
 
 check-errors-language-sanitize: build/minyarc-errors-sanitize
@@ -27,8 +27,8 @@ check check-portable: check-errors-launcher
 
 .PHONY: check-errors-review check-errors-review-sanitize check-errors-review-bounded check-errors-review-bounded-sanitize
 
-check-errors-review: build/minyarc-errors build/errors-compiler-stage3.ll
-	cmp build/errors-compiler-stage2.ll build/errors-compiler-stage3.ll
+check-errors-review: build/minyarc-errors build/errors-compiler-stage3.ll build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --profile errors --ir build/errors-compiler-stage3.ll
 	MINYAR_ERRORS_COMPILER=./build/minyarc-errors MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/errors-review.py
 
 check-errors-review-sanitize: build/minyarc-errors-sanitize

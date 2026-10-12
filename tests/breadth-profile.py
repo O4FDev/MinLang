@@ -156,7 +156,7 @@ def main():
         sources = work / 'sources'
         for directory in ('examples/craft', 'library', 'runtime'):
             shutil.copytree(ROOT / directory, sources / directory)
-        for relative in ('compiler/compiler.min', 'compiler/module-compiler.min', 'tools/module-build.c',
+        for relative in ('build/compiler.min', 'compiler/module-compiler.min', 'tools/module-build.c',
                          'tools/clang-driver.py', 'minyar'):
             target = sources / relative
             target.parent.mkdir(parents=True, exist_ok=True)

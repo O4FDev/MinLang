@@ -62,6 +62,7 @@ typedef enum {
     STATEMENT_LET,
     STATEMENT_ASSIGN,
     STATEMENT_INDEX_ASSIGN,
+    STATEMENT_FIELD_ASSIGN,
     STATEMENT_EXPRESSION,
     STATEMENT_RETURN,
     STATEMENT_IF,
@@ -604,7 +605,13 @@ static Expression *parse_atom(Parser *parser) {
     if (parser->token.kind == '[') {
         expression = new_expression(parser, EXPRESSION_LIST);
         advance(parser);
-        expect(parser, ']', "a closing bracket for this empty list");
+        while (parser->token.kind != ']') {
+            arrput(expression->arguments, parse_expression(parser));
+            if (parser->token.kind != ',')
+                break;
+            advance(parser);
+        }
+        expect(parser, ']', "a closing bracket for this list");
         return expression;
     }
     fail_at(parser->token.line, parser->token.column, "I expected a value or expression here");
@@ -712,8 +719,10 @@ static Expression *parse_expression(Parser *parser) {
 }
 
 static void finish_simple_statement(Parser *parser) {
-    if (parser->token.kind == ';')
+    if (parser->token.kind == ';') {
         advance(parser);
+        return;
+    }
     if (parser->token.kind == TOKEN_NEWLINE) {
         skip_separators(parser);
         return;
@@ -778,14 +787,17 @@ static Statement parse_statement(Parser *parser) {
     statement = new_statement(parser, STATEMENT_EXPRESSION);
     statement.expression = parse_expression(parser);
     if ((statement.expression->kind == EXPRESSION_NAME ||
-         statement.expression->kind == EXPRESSION_INDEX) &&
+         statement.expression->kind == EXPRESSION_INDEX ||
+         statement.expression->kind == EXPRESSION_MEMBER) &&
         parser->token.kind == '=') {
         if (statement.expression->kind == EXPRESSION_NAME) {
             statement.kind = STATEMENT_ASSIGN;
             statement.name = statement.expression->text;
             free(statement.expression);
         } else {
-            statement.kind = STATEMENT_INDEX_ASSIGN;
+            statement.kind = statement.expression->kind == EXPRESSION_INDEX
+                                 ? STATEMENT_INDEX_ASSIGN
+                                 : STATEMENT_FIELD_ASSIGN;
             statement.target = statement.expression;
         }
         advance(parser);
@@ -1221,6 +1233,21 @@ static Type check_expression(Program *program, Function *function, Expression *e
                 type_name(left));
         return TYPE_UNKNOWN;
     case EXPRESSION_LIST:
+        if (arrlen(expression->arguments)) {
+            left = check_expression(program, function, expression->arguments[0]);
+            if (left < TYPE_INTEGER || left > TYPE_BOOLEAN)
+                fail_at(expression->line, expression->column,
+                        "bootstrap List elements must be scalar or Text");
+            Type inferred = TYPE_LIST_INTEGER + left - TYPE_INTEGER;
+            if (expression->type != TYPE_UNKNOWN && expression->type != inferred)
+                fail_at(expression->line, expression->column,
+                        "this List literal has a different element type");
+            expression->type = inferred;
+            for (index = 1; index < (size_t)arrlen(expression->arguments); index++)
+                require_type(expression->arguments[index],
+                             check_expression(program, function, expression->arguments[index]),
+                             left, "a List element");
+        }
         if (expression->type == TYPE_UNKNOWN)
             fail_at(expression->line, expression->column,
                     "an empty list needs a type, such as 'let names: List<Text> = []'");
@@ -1339,6 +1366,17 @@ static void check_statements(Program *program, Function *function, Statement *st
                         statement->name, type_name(function->locals[statement->local_index].type),
                         type_name(type));
             break;
+        case STATEMENT_FIELD_ASSIGN: {
+            Type target = check_expression(program, function, statement->target);
+            if (statement->target->left->type < TYPE_RECORD_START)
+                fail_at(statement->line, statement->column,
+                        "only record fields can receive a new value");
+            type = check_expression(program, function, statement->expression);
+            if (type != target)
+                fail_at(statement->line, statement->column, "this field contains %s, not %s",
+                        type_name(target), type_name(type));
+            break;
+        }
         case STATEMENT_INDEX_ASSIGN: {
             Type target = check_expression(program, function, statement->target);
             if (statement->target->left->type < TYPE_LIST_INTEGER ||
@@ -1668,10 +1706,23 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
                         llvm_type(element));
             return make_value(element, "%%value.%d", temporary);
         }
-    case EXPRESSION_LIST:
-        temporary = new_temporary(emitter);
-        fprintf(output, "  %%value.%d = call ptr @minyar_list_new()\n", temporary);
-        return make_value(expression->type, "%%value.%d", temporary);
+    case EXPRESSION_LIST: {
+        int object = new_temporary(emitter);
+        fprintf(output, "  %%value.%d = call ptr @minyar_list_new()\n", object);
+        for (index = 0; index < (size_t)arrlen(expression->arguments); index++) {
+            right = emit_expression(emitter, expression->arguments[index]);
+            if (right.type != TYPE_INTEGER) {
+                temporary = new_temporary(emitter);
+                fprintf(output, "  %%value.%d = %s %s %s to i64\n", temporary,
+                        right.type == TYPE_TEXT ? "ptrtoint" : "zext", llvm_type(right.type),
+                        right.name);
+                right = make_value(TYPE_INTEGER, "%%value.%d", temporary);
+            }
+            fprintf(output, "  call void @minyar_list_add(ptr %%value.%d, i64 %s)\n", object,
+                    right.name);
+        }
+        return make_value(expression->type, "%%value.%d", object);
+    }
     case EXPRESSION_METHOD_CALL:
         left = emit_expression(emitter, expression->left);
         if (expression->left->type == TYPE_TEXT && strcmp(expression->text, "slice")) {
@@ -1855,6 +1906,24 @@ static int emit_statement(Emitter *emitter, Statement *statement) {
         fprintf(output, "  store %s %s, ptr %%local.%d\n", llvm_type(value.type), value.name,
                 statement->local_index);
         return 0;
+    case STATEMENT_FIELD_ASSIGN: {
+        Value record = emit_expression(emitter, statement->target->left);
+        value = emit_expression(emitter, statement->expression);
+        int reference = !strcmp(llvm_type(value.type), "ptr");
+        if (value.type != TYPE_INTEGER) {
+            int converted = new_temporary(emitter);
+            fprintf(output, "  %%value.%d = %s %s %s to i64\n", converted,
+                    reference ? "ptrtoint" : "zext", llvm_type(value.type), value.name);
+            value = make_value(TYPE_INTEGER, "%%value.%d", converted);
+        }
+        if (reference)
+            fprintf(output, "  call void @minyar_record_replace(ptr %s, i64 %lld, i64 %s, i64 0)\n",
+                    record.name, (long long)statement->target->integer, value.name);
+        else
+            fprintf(output, "  call void @minyar_record_set(ptr %s, i64 %lld, i64 %s)\n",
+                    record.name, (long long)statement->target->integer, value.name);
+        return 0;
+    }
     case STATEMENT_INDEX_ASSIGN: {
         Value list = emit_expression(emitter, statement->target->left);
         Value position = emit_expression(emitter, statement->target->right);
@@ -2000,6 +2069,7 @@ static void emit_program(FILE *output, Program *program) {
           "declare i64 @minyar_record_get(ptr, i64)\n"
           "declare void @minyar_record_set(ptr, i64, i64)\n"
           "declare void @minyar_record_set_reference(ptr, i64, i64)\n"
+          "declare void @minyar_record_replace(ptr, i64, i64, i64)\n"
           "declare void @minyar_check_integer_overflow(i1 zeroext)\n"
           "declare void @minyar_check_integer_division(i64, i64)\n"
           "declare void @minyar_fail_integer_overflow() cold noreturn\n"

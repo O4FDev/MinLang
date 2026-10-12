@@ -22,7 +22,7 @@ except ImportError:  # Windows
 
 ROOT = Path(__file__).resolve().parent.parent
 COMPILER = ROOT / "build" / "minyarc"
-SOURCE = ROOT / "compiler" / "compiler.min"
+SOURCE = ROOT / "build" / "compiler.min"
 OUTPUT = ROOT / "build" / "self-compile-budget.ll"
 REFERENCE = ROOT / "build" / "compiler-stage3.ll"
 

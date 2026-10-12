@@ -171,7 +171,7 @@ def main():
         if hashlib.sha256(assembled).hexdigest() != expected:
             raise ValueError('foundation baseline source changed; do not update the control silently')
     else:
-        assembled = assemble((ROOT / 'compiler/compiler.min').read_text())
+        assembled = assemble(runpy.run_path(str(ROOT / 'compiler/source.py'))['core_source']())
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_name(args.output.name + '.tmp')
     if args.baseline:

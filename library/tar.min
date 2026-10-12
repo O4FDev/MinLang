@@ -19,23 +19,27 @@ public record Entry {
     attributes: List<Attribute>
     private start: Integer; private header: Integer; private offset: Integer; private end: Integer
     private sourceAddress: Integer; private sourceLength: Integer; private payloadLength: Integer
+    private nativeStatus: Integer
 }
 public record NextResult { entry: Entry; end: Boolean; error: errors.Error }
 public record Reader { private source: Bytes; private handle: Integer; private error: errors.Error; private ended: Boolean }
 public record Writer { private handle: Integer; private error: errors.Error; private ended: Boolean; private output: Bytes }
 function openReader(source: Bytes, maximumPath: Integer, maximumMetadata: Integer, maximumChain: Integer, maximumHeaders: Integer): Integer { native "tararchive" }
-function readNext(handle: Integer): Bytes { native "tararchive" }
+function readValue(handle: Integer): Entry { native "tararchive" }
+function readerMessage(handle: Integer): Bytes { native "tararchive" }
+function copyRange(source: Bytes, offset: Integer, length: Integer): Bytes { native "tararchive" }
 function freeReader(handle: Integer) { native "tararchive" }
 function openWriter(maximumBytes: Integer): Integer { native "tararchive" }
-function writeEntry(handle: Integer, info: Bytes, data: Bytes): Bytes { native "tararchive" }
-function endWriter(handle: Integer): Bytes { native "tararchive" }
+function writeStatus(handle: Integer, value: Entry, data: Bytes): Integer { native "tararchive" }
+function finishData(handle: Integer): Bytes { native "tararchive" }
+function writerStatus(handle: Integer): Bytes { native "tararchive" }
 function freeWriter(handle: Integer) { native "tararchive" }
 public function providerVersion(): Text { native "tararchive" }
 function invalid(message: Text): errors.Error { return errors.make(errors.invalidDataCode(), 0, message) }
 public function entry(path: Bytes, type: Integer): Entry {
     return Entry { path: path; link: Bytes(); mode: 420; uid: 0; gid: 0; mtime: 0; mtimeNanos: 0
         type: type; size: 0; deviceMajor: 0; deviceMinor: 0; uname: Bytes(); gname: Bytes(); attributes: []
-        start: -1; header: -1; offset: -1; end: -1; sourceAddress: 0; sourceLength: 0; payloadLength: 0 }
+        start: -1; header: -1; offset: -1; end: -1; sourceAddress: 0; sourceLength: 0; payloadLength: 0; nativeStatus: 0 }
 }
 public function reader(source: Bytes, maximumBytes: Integer, maximumPath: Integer): Reader {
     return readerWithLimits(source, maximumBytes, maximumPath, 1048576, 64, 1000000)
@@ -65,41 +69,23 @@ public function payload(cursor: Reader, value: Entry): errors.BytesResult {
     if value.sourceAddress != machine.address(cursor.source) || value.sourceLength != cursor.source.length || value.offset < 0 || value.payloadLength < 0 || value.offset > cursor.source.length - value.payloadLength {
         return errors.bytesFailure(invalid("tar entry does not belong to reader"))
     }
-    return errors.bytes(cursor.source.slice(value.offset,value.offset + value.payloadLength))
+    return errors.bytes(copyRange(cursor.source,value.offset,value.payloadLength))
 }
 public function memberBytes(cursor: Reader, value: Entry): errors.BytesResult {
     if value.sourceAddress != machine.address(cursor.source) || value.sourceLength != cursor.source.length || value.start < 0 || value.end < value.start || value.end > cursor.source.length {
         return errors.bytesFailure(invalid("tar entry does not belong to reader"))
     }
-    return errors.bytes(cursor.source.slice(value.start,value.end))
-}
-function take(raw: Bytes, at: List<Integer>): Bytes {
-    let length = raw.getInt64(at[0]); at[0] += 8
-    let result = raw.slice(at[0],at[0] + length); at[0] += length
-    return result
+    return errors.bytes(copyRange(cursor.source,value.start,value.end - value.start))
 }
 public function next(cursor: Reader): NextResult {
-    let empty = entry(Bytes(),REGULAR)
-    if errors.isError(cursor.error) { return NextResult { entry: empty; end: false; error: cursor.error } }
-    if cursor.ended { return NextResult { entry: empty; end: true; error: errors.none() } }
-    let raw = readNext(cursor.handle)
-    let status = raw.getInt64(0)
-    if status != 1 {
-        if status == 2 { cursor.ended = true } else { cursor.error = invalid(Text(raw.slice(8,raw.length))) }
+    if errors.isError(cursor.error) { return NextResult { entry: entry(Bytes(),REGULAR); end: false; error: cursor.error } }
+    if cursor.ended { return NextResult { entry: entry(Bytes(),REGULAR); end: true; error: errors.none() } }
+    let raw = readValue(cursor.handle)
+    if raw.nativeStatus != 1 {
+        if raw.nativeStatus == 2 { cursor.ended = true } else { cursor.error = invalid(Text(readerMessage(cursor.handle))) }
         close(cursor)
-        return NextResult { entry: empty; end: cursor.ended; error: cursor.error }
     }
-    let value = entry(Bytes(),raw.getInt64(8))
-    value.mode = raw.getInt64(16); value.uid = raw.getInt64(24); value.gid = raw.getInt64(32)
-    value.mtime = raw.getInt64(40); value.mtimeNanos = raw.getInt64(48); value.size = raw.getInt64(56)
-    value.deviceMajor = raw.getInt64(64); value.deviceMinor = raw.getInt64(72)
-    value.start = raw.getInt64(80); value.header = raw.getInt64(88); value.offset = raw.getInt64(96); value.end = raw.getInt64(104)
-    value.payloadLength = value.size; value.sourceAddress = machine.address(cursor.source); value.sourceLength = cursor.source.length
-    let at = [112]
-    value.path = take(raw,at); value.link = take(raw,at); value.uname = take(raw,at); value.gname = take(raw,at)
-    let count = raw.getInt64(at[0]); at[0] += 8
-    for i in 0..count { let name = take(raw,at); let data = take(raw,at); value.attributes.add(Attribute { key: name; value: data }) }
-    return NextResult { entry: value; end: false; error: errors.none() }
+    return NextResult { entry: raw; end: cursor.ended; error: cursor.error }
 }
 public function writer(maximumBytes: Integer): Writer {
     let output = Writer { handle: 0; error: errors.none(); ended: false; output: Bytes() }
@@ -108,44 +94,34 @@ public function writer(maximumBytes: Integer): Writer {
     if output.handle == 0 { output.error = invalid("cannot initialize tar writer") }
     return output
 }
-function addField(raw: Bytes, data: Bytes) { let length = Bytes(8); length.setInt64(0,data.length); raw.addBytes(length); raw.addBytes(data) }
+public function writerError(output: Writer): errors.Error {
+    if errors.isError(output.error) { return output.error }
+    if output.ended { return invalid("tar writer is finished") }
+    return output.error
+}
+public function appendStatus(output: Writer, value: Entry, data: Bytes): Integer {
+    if errors.isError(output.error) { return errors.code(output.error) }
+    if output.ended { return errors.invalidDataCode() }
+    if writeStatus(output.handle,value,data) != 0 {
+        let status = writerStatus(output.handle)
+        output.error = invalid(Text(status.slice(8,status.length))); closeWriter(output)
+        return errors.code(output.error)
+    }
+    return 0
+}
 public function append(output: Writer, value: Entry, data: Bytes): errors.BooleanResult {
-    if errors.isError(output.error) { return errors.booleanFailure(output.error) }
-    if output.ended { return errors.booleanFailure(invalid("tar writer is finished")) }
-    let metadataBytes = 0
-    if value.path.length > 4096 || value.link.length > 4096 || value.uname.length > 4096 || value.gname.length > 4096 || value.attributes.length > 4096 {
-        output.error = invalid("tar writer name/attribute limit exceeded"); closeWriter(output); return errors.booleanFailure(output.error)
-    }
-    for attr in value.attributes {
-        if attr.key.length > 1048576 - metadataBytes || attr.value.length > 1048576 - metadataBytes - attr.key.length {
-            output.error = invalid("tar writer metadata limit exceeded"); closeWriter(output); return errors.booleanFailure(output.error)
-        }
-        metadataBytes += attr.key.length + attr.value.length
-    }
-    let raw = Bytes(72)
-    raw.setInt64(0,value.type); raw.setInt64(8,value.mode); raw.setInt64(16,value.uid); raw.setInt64(24,value.gid)
-    raw.setInt64(32,value.mtime); raw.setInt64(40,value.mtimeNanos); raw.setInt64(48,data.length)
-    raw.setInt64(56,value.deviceMajor); raw.setInt64(64,value.deviceMinor)
-    addField(raw,value.path); addField(raw,value.link); addField(raw,value.uname); addField(raw,value.gname)
-    let count = Bytes(8); count.setInt64(0,value.attributes.length); raw.addBytes(count)
-    for attr in value.attributes { addField(raw,attr.key); addField(raw,attr.value) }
-    let result = writeEntry(output.handle,raw,data)
-    if result.getInt64(0) != 0 {
-        output.error = invalid(Text(result.slice(8,result.length))); closeWriter(output)
-        return errors.booleanFailure(output.error)
-    }
+    if appendStatus(output,value,data) != 0 { return errors.booleanFailure(writerError(output)) }
     return errors.boolean(true)
 }
 public function finish(output: Writer): errors.BytesResult {
     if errors.isError(output.error) { return errors.bytesFailure(output.error) }
     if !output.ended {
-        let result = endWriter(output.handle)
-        if result.getInt64(0) != 0 { output.error = invalid(Text(result.slice(8,result.length))); closeWriter(output); return errors.bytesFailure(output.error) }
-        // Retain the owned native status packet directly. Only the fresh
-        // caller result below needs a full-output slice; no bytes escape here.
-        output.output = result; output.ended = true; closeWriter(output)
+        let bytes = finishData(output.handle)
+        let status = writerStatus(output.handle)
+        if status.getInt64(0) != 0 { output.error = invalid(Text(status.slice(8,status.length))); closeWriter(output); return errors.bytesFailure(output.error) }
+        output.output = bytes; output.ended = true; closeWriter(output)
     }
-    return errors.bytes(output.output.slice(8,output.output.length))
+    return errors.bytes(output.output.slice(0,output.output.length))
 }
 
 public record AttributesResult { attributes: List<Attribute>; error: errors.Error }
@@ -228,4 +204,20 @@ function byteEqual(a: Bytes, b: Bytes): Boolean {
     if a.length != b.length { return false }
     for i in 0..a.length { if a[i] != b[i] { return false } }
     return true
+}
+
+public function finishOwned(output: Writer): errors.BytesResult {
+    if errors.isError(output.error) { return errors.bytesFailure(output.error) }
+    if output.ended {
+        let bytes = output.output
+        output.output = Bytes()
+        output.error = errors.make(errors.closedCode(),0,"tar writer ownership transferred")
+        return errors.bytes(bytes)
+    }
+    let bytes = finishData(output.handle)
+    let status = writerStatus(output.handle)
+    if status.getInt64(0) != 0 { output.error = invalid(Text(status.slice(8,status.length))); closeWriter(output); return errors.bytesFailure(output.error) }
+    output.ended = true; closeWriter(output)
+    output.error = errors.make(errors.closedCode(),0,"tar writer ownership transferred")
+    return errors.bytes(bytes)
 }

@@ -18,7 +18,7 @@ def replace(source, old, new):
 
 def assemble():
     closure = runpy.run_path(str(ROOT / 'scripts/build-closure-compiler.py'))
-    source = closure['assemble']((ROOT / 'compiler/compiler.min').read_text())
+    source = closure['assemble'](runpy.run_path(str(ROOT / 'compiler/source.py'))['core_source']())
     signature = re.search(r'^function compileTokens\([^\n]*\{\n', source, re.M).group(0)
     source = replace(source, signature, signature +
         '    let resultTokens = normalizeResultTypes(tokenKinds, tokenTexts, tokenLines)\n'

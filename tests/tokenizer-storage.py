@@ -12,7 +12,7 @@ parser.add_argument('--source',type=Path)
 parser.add_argument('--clang',default=os.environ.get('MINYAR_TEST_CLANG','clang'))
 args=parser.parse_args();ROOT=args.root.resolve()
 compiler=(args.compiler or Path(os.environ.get('MINYAR_TEST_COMPILER',ROOT/'build/minyarc'))).resolve()
-source=(args.source or ROOT/'compiler/compiler.min').resolve()
+source=(args.source or ROOT/'build/compiler.min').resolve()
 temporary=tempfile.TemporaryDirectory(prefix='minyar-tokenizer-storage-');D=Path(temporary.name)
 environment={**os.environ,'ASAN_OPTIONS':'detect_leaks=0:halt_on_error=1','UBSAN_OPTIONS':'halt_on_error=1:print_stacktrace=0'}
 def run(command):

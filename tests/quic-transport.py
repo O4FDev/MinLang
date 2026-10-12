@@ -5,6 +5,7 @@ import importlib.util
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,13 +16,18 @@ fixtures = importlib.util.module_from_spec(spec); spec.loader.exec_module(fixtur
 def main():
     parser = argparse.ArgumentParser(); parser.add_argument('--sanitize', action='store_true')
     modes = parser.add_mutually_exclusive_group()
-    for mode in ('key-update','migration','server-protocol','resumption','quic-resumption','early','fallback','congestion','stream-control','stream-churn','closing','persistent','retry','rtt'):
+    for mode in ('key-update','migration','migration-cids','server-protocol','resumption','quic-resumption','early','fallback','congestion','stream-control','stream-churn','closing','persistent','retry','rtt'):
         modes.add_argument('--'+mode,action='store_true')
     options = parser.parse_args()
     if options.sanitize:
         for name in ('MINYAR_CLANG_FLAGS', 'MINYAR_NATIVE_FLAGS', 'MINYAR_RUNTIME_FLAGS'):
             os.environ[name] = '-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wno-override-module'
     with tempfile.TemporaryDirectory(prefix='minyar-quic-pair-') as directory:
+        if options.migration_cids:
+            binary = Path(directory) / 'migration-cids'
+            fixtures.compile_program(ROOT / 'tests/quic-migration-cids.min', binary)
+            subprocess.run([sys.executable, str(ROOT / 'tests/quic-migration-cids.py'), '--binary', str(binary), '--summary'], check=True, timeout=120)
+            return
         ca = fixtures.Certificates(directory); ca.root('root'); ca.leaf('server', 'root'); ca.leaf('client', 'root', usage='clientAuth')
         name = 'tests/quic-migration.min' if options.migration else ('tests/quic-key-update.min' if options.key_update else 'tests/quic-transport.min')
         if options.server_protocol: name = 'tests/tls-server-protocol.min'
@@ -38,7 +44,7 @@ def main():
         if options.rtt: name='tests/quic-rtt.min'
         binary = Path(directory) / 'transport.exe'; fixtures.compile_program(ROOT / name, binary)
         result = subprocess.run([str(binary), str(ca.path('root', 'der')), str(ca.path('server', 'der')), str(ca.path('server', 'pk8')),
-                                 str(ca.path('client', 'der')), str(ca.path('client', 'pk8'))], capture_output=True, text=True, timeout=120)
+                                 str(ca.path('client', 'der')), str(ca.path('client', 'pk8'))], capture_output=True, text=True, timeout=240 if options.sanitize and options.rtt else 120)
         assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
         print(result.stdout, end='')
 

@@ -5,7 +5,7 @@ from regressions import CompilerTestCase, ROOT
 
 
 def helpers():
-    source = (ROOT / 'compiler/compiler.min').read_text()
+    source = (ROOT / 'build/compiler.min').read_text()
     result = []
     for name in ('findText', 'startsDeclaration', 'hasGlobalDeclarations', 'deduplicateGlobalDeclarations'):
         start = source.index('function ' + name + '(')

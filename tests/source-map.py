@@ -9,7 +9,7 @@ from clang_helpers import clang_command, native_path
 from llvm_sanitizer import prepare_llvm_for_link
 from regressions import CompilerTestCase, COMPILER, CLANG, RUNTIME, ROOT, LINK_FLAGS
 
-CORE = Path(os.environ.get('MINYAR_TEST_SOURCE', ROOT / 'compiler/compiler.min'))
+CORE = Path(os.environ.get('MINYAR_TEST_SOURCE', ROOT / 'build/compiler.min'))
 MODULE_COMPILER = Path(os.environ.get('MINYAR_TEST_MODULE_COMPILER', ROOT / 'build/minyarc-modules'))
 
 

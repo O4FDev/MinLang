@@ -49,8 +49,8 @@ class ParallelSignatures(CompilerTestCase):
         self.ir_control = os.environ.get('MINYAR_PARALLEL_IR_CONTROL')
         if self.ir_record and self.ir_control:
             raise ValueError('record and control modes are mutually exclusive')
-        self.evidence.inputs[str(ROOT / 'compiler/compiler.min')] = hashlib.sha256(
-            (ROOT / 'compiler/compiler.min').read_bytes()).hexdigest()
+        self.evidence.inputs[str(ROOT / 'build/compiler.min')] = hashlib.sha256(
+            (ROOT / 'build/compiler.min').read_bytes()).hexdigest()
 
     def compile_fixture(self, name):
         if name == 'existing-parallel':

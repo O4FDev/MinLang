@@ -1,0 +1,272 @@
+function readableDeclarationName(name: Text): Text {
+    let prefix = "minyar_module_"
+    let matches = name.length > prefix.length
+    let position = 0
+    while position < prefix.length && matches {
+        if name[position] != prefix[position] {
+            matches = false
+        }
+        position = position + 1
+    }
+    if matches {
+        while position < name.length && name[position] != '_' {
+            position = position + 1
+        }
+        if position < name.length {
+            position = position + 1
+            let readable = ""
+            while position < name.length {
+                readable = readable + Text(name[position])
+                position = position + 1
+            }
+            return readable
+        }
+    }
+    return name
+}
+
+function isListType(type: Integer): Boolean {
+    return type >= 100000 || (type < -8 && (-type % 8) == 0)
+}
+
+function isRecordType(type: Integer): Boolean {
+    return type >= 1000 && type < 100000
+}
+
+function listElementType(type: Integer): Integer {
+    if type < 0 { return structuralChild(type) }
+    return type - 100000
+}
+
+function isReferenceType(type: Integer): Boolean {
+    return type == 2 || type == 8 || type >= 1000 || type < -8
+}
+
+function llvmType(type: Integer): Text {
+    let result = "void"
+    if type == 1 {
+        result = "i64"
+    } else {
+        if isReferenceType(type) {
+            result = "ptr"
+        } else {
+            if type == 3 {
+                result = "i32"
+            } else {
+                if type == 4 {
+                    result = "i1"
+                }
+                if type == 7 {
+                    result = "double"
+                }
+            }
+        }
+    }
+    return result
+}
+
+function valueName(textState: List<Text>, temporary: Integer): Text {
+    let slot = temporary + 2
+    while textState.length <= slot {
+        textState.add("%value." + Text(textState.length - 2))
+    }
+    return textState[slot]
+}
+
+function newTemporary(state: List<Integer>): Integer {
+    let temporary = state[1]
+    state[1] = temporary + 1
+    return temporary
+}
+
+function newLabel(state: List<Integer>): Integer {
+    let label = state[2]
+    state[2] = label + 1
+    return label
+}
+
+function setType(resultType: List<Integer>, type: Integer) {
+    resultType[0] = type
+    if resultType.length > 1 {
+        resultType[1] = -1
+    }
+}
+
+function findLocal(localNames: List<Text>, localLengths: List<Integer>, state: List<Integer>, name: Text): Integer {
+    let position = state[3] - 1
+    let length = name.byteLength
+    let found = -1
+    while position >= 0 && found == -1 {
+        if localLengths[position] == length && localNames[position] == name {
+            found = position
+        }
+        position = position - 1
+    }
+    return found
+}
+
+function addLocal(localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, name: Text, type: Integer, id: Integer) {
+    let position = state[3]
+    if position < localNames.length {
+        localNames[position] = name
+        localTypes[position] = type
+        localIds[position] = id
+        localLengths[position] = name.byteLength
+    } else {
+        localNames.add(name)
+        localTypes.add(type)
+        localIds.add(id)
+        localLengths.add(name.byteLength)
+    }
+    state[3] = position + 1
+}
+
+function findFunction(functionNames: List<Text>, symbolKinds: List<Integer>, functionReturnTypes: List<Integer>, name: Text): Integer {
+    return findCompiledSymbol(functionNames, symbolKinds, functionReturnTypes, name, 1)
+}
+
+function functionParameterOffset(functionParameterCounts: List<Integer>, functionIndex: Integer): Integer {
+    return functionParameterCounts[functionParameterCounts.length / 2 + functionIndex]
+}
+
+function appendParameterOffsets(functionParameterCounts: List<Integer>, parameterStarts: List<Integer>) {
+    let position = 0
+    while position < parameterStarts.length {
+        functionParameterCounts.add(parameterStarts[position])
+        position = position + 1
+    }
+}
+
+function findRecordField(functionParameterCounts: List<Integer>, functionParameterNames: List<Text>, recordType: Integer, fieldName: Text): Integer {
+    let record = recordType - 1000
+    let first = functionParameterOffset(functionParameterCounts, record)
+    let position = 0
+    let found = -1
+    while position < functionParameterCounts[record] && found == -1 {
+        if isFieldNamed(functionParameterNames[first + position], fieldName) {
+            found = first + position
+        }
+        position = position + 1
+    }
+    return found
+}
+
+// New records and List literals cannot refer to themselves before construction
+// finishes. A first heap cycle therefore needs a mutable List edge L -> T with
+// an existing path T -> L. Reject exactly the mutations whose declared types
+// permit that return path; immutable recursive construction remains legal.
+// The first two symbol-count blocks of returnTypes hold return types and the
+// lookup index. Its tail caches proven-safe List types for this compilation.
+function checkListMutation(listType: Integer, counts: List<Integer>, fields: List<Integer>, returnTypes: List<Integer>) {
+    let base = listElementType(listType)
+    while isContainerType(base) {
+        base = containerValueType(base)
+    }
+    if !isRecordType(base) {
+        return
+    }
+    let recordCount = counts.length / 2
+    let cached = recordCount * 2
+    while cached < returnTypes.length {
+        if listType >= 0 && returnTypes[cached] == listType {
+            return
+        }
+        cached = cached + 1
+    }
+    let visited: List<Boolean> = []
+    let index = 0
+    while index < recordCount {
+        visited.add(false)
+        index = index + 1
+    }
+    let pending: List<Integer> = []
+    pending.add(listElementType(listType))
+    index = 0
+    while index < pending.length {
+        let type = pending[index]
+        index = index + 1
+        while isContainerType(type) {
+            if type == listType {
+                exit(86)
+            }
+            type = containerValueType(type)
+        }
+        if isRecordType(type) {
+            let record = type - 1000
+            if !visited[record] {
+                visited[record] = true
+                let first = functionParameterOffset(counts, record)
+                let field = 0
+                while field < counts[record] {
+                    pending.add(fields[first + field])
+                    field = field + 1
+                }
+            }
+        }
+    }
+    if listType >= 0 { returnTypes.add(listType) }
+}
+
+function requireType(tokenLines: SourceMap, state: List<Integer>, actual: Integer, expected: Integer, explanation: Text) {
+    if actual != expected {
+        fail(describeLocation(tokenLocation(tokenLines, state[0])) + ": " + explanation)
+    }
+}
+
+function valueAsListSlot(output: List<Text>, textState: List<Text>, state: List<Integer>, value: Text, type: Integer): Text {
+    let result = value
+    if type != 1 {
+        let temporary = newTemporary(state)
+        if isReferenceType(type) {
+            output.add("  %value.")
+            output.add(Text(temporary))
+            output.add(" = ptrtoint ptr ")
+            output.add(value)
+            output.add(" to i64\n")
+        } else {
+            output.add("  %value.")
+            output.add(Text(temporary))
+            if type == 7 {
+                output.add(" = bitcast double ")
+            } else {
+                output.add(" = zext ")
+                output.add(llvmType(type))
+                output.add(" ")
+            }
+            output.add(value)
+            output.add(" to i64\n")
+        }
+        result = valueName(textState, temporary)
+    }
+    return result
+}
+
+// List elements and record fields are stored in i64 slots. Recover the typed
+// SSA value that valueAsListSlot encoded.
+function slotAsValue(output: List<Text>, textState: List<Text>, state: List<Integer>, raw: Text, type: Integer): Text {
+    if type == 1 {
+        return raw
+    }
+    let value = valueName(textState, newTemporary(state))
+    output.add("  ")
+    output.add(value)
+    if isReferenceType(type) {
+        output.add(" = inttoptr i64 ")
+        output.add(raw)
+        output.add(" to ptr\n")
+    } else {
+        if type == 7 {
+            output.add(" = bitcast i64 ")
+            output.add(raw)
+            output.add(" to double\n")
+        } else {
+            output.add(" = trunc i64 ")
+            output.add(raw)
+            output.add(" to ")
+            output.add(llvmType(type))
+            output.add("\n")
+        }
+    }
+    return value
+}
+

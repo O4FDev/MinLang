@@ -2,6 +2,7 @@
 # Routing is configured by the trusted host orchestrator. Peer binaries have
 # no NET_ADMIN/NET_RAW capabilities and execute as the unprivileged image user.
 while [ ! -f /tmp/network-ready ]; do sleep 0.05; done
+export CLIENT_LOGS=${CLIENT_LOGS:-/logs} SERVER_LOGS=${SERVER_LOGS:-/logs}
 if [ "$(pwd)" = /quiche ] || [ -x /usr/local/bin/wsslhqclient ]; then
     # Upstream clients write session.bin or session.txt/tp.txt relative to cwd.
     # Keep its binaries read-only and give the nonroot peer ephemeral state.
@@ -11,4 +12,5 @@ if [ "$(pwd)" = /quiche ] || [ -x /usr/local/bin/wsslhqclient ]; then
     cd "$state" || exit 1
     exec "$script"
 fi
+if [ -x /run_endpoint.sh ]; then exec /run_endpoint.sh; fi
 exec ./run_endpoint.sh

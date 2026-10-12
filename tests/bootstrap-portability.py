@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check bootstrap C semantics with the selected compiler and UBSan."""
 import os
+import runpy
 from pathlib import Path
 import subprocess
 import tempfile
@@ -17,6 +18,8 @@ class BootstrapPortability(unittest.TestCase):
         cls.temporary = tempfile.TemporaryDirectory(prefix='minyar-bootstrap-')
         cls.directory = Path(cls.temporary.name)
         cls.compiler = cls.directory / 'stage0'
+        cls.source = cls.directory / 'compiler.min'
+        cls.source.write_text(runpy.run_path(str(ROOT / 'compiler/source.py'))['core_source']())
         cc = os.environ.get('MINYAR_TEST_BOOTSTRAP_CC', os.environ.get('CC', 'clang'))
         subprocess.run([cc, '-std=c11', '-O2', '-g', '-fsanitize=undefined',
                         '-fno-sanitize-recover=all', '-isystem', str(ROOT / 'vendor'),
@@ -34,7 +37,7 @@ class BootstrapPortability(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_real_compiler_source_has_no_c_undefined_behavior(self):
-        result = subprocess.run([str(self.compiler), str(ROOT / 'compiler/compiler.min'), '-o',
+        result = subprocess.run([str(self.compiler), str(self.source), '-o',
                                  str(self.directory / 'compiler.ll')], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 

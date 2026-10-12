@@ -90,7 +90,7 @@ def main():
     compiler_bytes = compiler.read_bytes()
     report = {'platform': platform.platform(), 'machine': platform.machine(),
               'compiler_sha256': hashlib.sha256(compiler_bytes).hexdigest(),
-              'workspace_source_sha256': hashlib.sha256((ROOT/'compiler/compiler.min').read_bytes()).hexdigest(),
+              'workspace_source_sha256': hashlib.sha256((ROOT/'build/compiler.min').read_bytes()).hexdigest(),
               'method': __doc__, 'config': {k: str(v) if isinstance(v, Path) else v for k,v in vars(args).items()},
               'results': [], 'scaling': []}
     with tempfile.TemporaryDirectory(prefix='minyar-module-perf-') as name:
