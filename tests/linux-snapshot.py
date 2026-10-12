@@ -42,7 +42,8 @@ class LinuxSnapshot(unittest.TestCase):
 
     def test_explicit_llvm_uses_its_matching_linker_instead_of_path_linker(self):
         with tempfile.TemporaryDirectory(prefix='minyar-selected-llvm-') as temporary:
-            work = Path(temporary)
+            # resolve_toolchain reports resolved paths; macOS temp dirs sit behind /var -> /private/var.
+            work = Path(temporary).resolve()
             chosen = work / 'llvm23'
             old = work / 'llvm18'
             chosen.mkdir()
