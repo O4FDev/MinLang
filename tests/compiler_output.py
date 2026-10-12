@@ -16,7 +16,7 @@ def validate_compile_output(result, output, phase='self-compile'):
 
 def check_compiler_behavior(output):
     script = Path(__file__).with_name('compiler-behavior.py')
-    result = subprocess.run([sys.executable, str(script), '--ir', str(output), '--profile', 'errors'],
+    result = subprocess.run([sys.executable, str(script), '--ir', str(output), '--profile', 'core'],
                             capture_output=True, text=True, timeout=180)
     if result.returncode != 0:
         raise SystemExit(f'self-compiled compiler behavior failed:\n{result.stdout}{result.stderr}')
