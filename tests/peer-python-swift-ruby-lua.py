@@ -993,7 +993,7 @@ print(alias[299])
             self.assertGreater(row['byte_budget_failures'],0)
             self.assertEqual(row['byte_budget_successes'],2)
             if row['case'] in ('peer-record-growth','peer-join100','peer-join300'):
-                self.assertGreater(row['forced_moves'],0)
+                self.assertGreater(row['storage_moves'],0)
         self.evidence.controls['peer_allocation_results']=report
 
 
@@ -1410,7 +1410,13 @@ print(joined.length); print(joined)
         self.assertEqual(len(report['cases']), 4)
         self.assertEqual({row['case'] for row in report['cases']}, set(campaign.CASES))
         for row in report['cases']:
-            self.assertGreaterEqual(row['allocation_failures'], 101 if row['case'] == 'peer-owned-recursion' else 1)
+            self.assertGreaterEqual(row['allocation_failures'], 1)
+            self.assertEqual(row['frame_entries'], row['frame_leaves'])
+            if row['case'] == 'peer-owned-recursion':
+                self.assertGreaterEqual(row['frame_entries'], 101)
+                self.assertGreaterEqual(row['peak_frames'], 101)
+                self.assertGreaterEqual(row['released_objects'], 101)
+                self.assertLessEqual(row['allocation_failures'], 8 * row['frame_entries'])
             self.assertGreater(row['byte_budget_failures'], 0)
             self.assertEqual(row['byte_budget_successes'], 2)
         self.evidence.controls['campaign_configurations'] = report['configurations']

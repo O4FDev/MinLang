@@ -308,6 +308,8 @@ def campaign(args):
                     rows.append({'case': name, 'mode': mode, 'budget': budget,
                                  'allocation_failures': baseline['allocations'],
                                  'resize_failures': baseline['resizes'], 'forced_moves': baseline['moved'],
+                                 **{key: baseline[key] for key in ('frame_entries', 'frame_leaves', 'peak_frames',
+                                                                  'released_objects', 'storage_moves')},
                                  **byte_results})
                     print(label + ': ' + json.dumps(rows[-1]), flush=True)
         args.output.parent.mkdir(parents=True, exist_ok=True)
