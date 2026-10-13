@@ -203,3 +203,19 @@ int main(void) {
         if subprocess.run([str(binary)], capture_output=True, timeout=30).returncode:
             raise ValueError(f'{name} header/static archive version mismatch')
     return cflags, libraries
+
+
+if __name__ == '__main__':
+    import argparse
+    import json
+    from host_paths import pinned_llvm
+    parser = argparse.ArgumentParser()
+    parser.add_argument('kind', choices=('zstd', 'deflate'))
+    parser.add_argument('--clang', required=True)
+    parser.add_argument('--compile-flag', action='append', default=[])
+    parser.add_argument('--link-flag', action='append', default=[])
+    arguments = parser.parse_args()
+    pinned_llvm(arguments.clang)
+    cflags, libraries = codec_provider(arguments.kind, arguments.clang,
+                                      arguments.compile_flag, arguments.link_flag)
+    print(json.dumps({'cflags': cflags, 'libraries': libraries}))
