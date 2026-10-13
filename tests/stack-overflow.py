@@ -67,8 +67,8 @@ def main() -> None:
             assert unary_result.stderr == "", unary_result
             prepare_llvm_for_link(unary_llvm, LINK_FLAGS)
             unary_executable = temporary / "unary"
-            linked = run([CLANG, "-O0", *LINK_FLAGS, "-Wno-override-module", str(unary_llvm),
-                          str(RUNTIME), "-o", str(unary_executable)], timeout=60)
+            linked = run(clang_command([CLANG, "-O0", *LINK_FLAGS, "-Wno-override-module", str(unary_llvm),
+                                        str(RUNTIME), "-o", str(unary_executable)]), timeout=60)
             assert linked.returncode == 0, linked.stderr
             result = run([str(unary_executable)])
             assert (result.returncode, result.stdout, result.stderr) == (0, "1\n", ""), result
