@@ -5,6 +5,7 @@ use "quicrecovery" as recovery
 use "quicretry" as retry
 use "tlstickets" as tickets
 use "errors" as errors
+use "crypto" as crypto
 record Pair { client: quic.Connection; server: quic.Connection; acknowledgement: Bytes; valid: Boolean }
 function drive(c: quic.Connection, s: quic.Connection, now: Integer) {
     for packet in quic.poll(c, now) { quic.receive(s, packet, now) }
@@ -471,6 +472,57 @@ function serverPaired(root: Bytes,identity: Bytes,key: Bytes,certificate: Bytes,
     if c.state!=quic.ESTABLISHED || s.state!=quic.ESTABLISHED || !c.confirmed || !s.confirmed || !s.addressValidated || s.spaces[0].active || s.spaces[1].active { return 119 }
     return 0
 }
+function confirmedDelivery(root: Bytes, identity: Bytes, key: Bytes, certificate: Bytes, clientKey: Bytes): Integer {
+    let c=quic.client("localhost",randomBytes(80),"minyar-test",[root],[certificate],clientKey)
+    let s=quic.server(randomBytes(80),"minyar-test",c.originalDestination,[identity],key,[root],true)
+    let now=0;let control=0
+    for tick in 0..100 {
+        now=tick*10
+        for packet in quic.poll(c,now) {
+            let header=wire.header(packet,0,s.local.length)
+            if header.kind==wire.ONE_RTT {
+                let opened=protection.unprotect(s.spaces[2].read,packet,header.numberOffset,-1)
+                if !opened.valid { return 121 }
+                for frame in wire.frames(opened.payload).frames { if frame.type==24 { control+=1 } }
+            } else { quic.receive(s,packet,now) }
+        }
+        for packet in quic.poll(s,now) { quic.receive(c,packet,now) }
+        if c.confirmed { break }
+    }
+    if !c.confirmed || !s.confirmed || control!=1 || c.spaces[2].sent.length!=1 { return 121 }
+    let opened=quic.openStream(c,false);if !errors.integerOk(opened) { return 121 }
+    let id=errors.integerValue(opened);let request=Bytes("GET /lost-request\r\n")
+    if !errors.integerOk(quic.writeStream(c,id,request,true)) { return 121 }
+    now+=1;quic.poll(c,now)
+    if c.spaces[2].sent.length!=2 { return 121 }
+    let due=c.spaces[2].probe;let before=c.congestion.probes
+    if due<=now || due>=now+30000 { return 121 }
+    let controls=0;let streams=0;let probes=0
+    for packet in quic.poll(c,due) {
+        let header=wire.header(packet,0,s.local.length)
+        if header.kind!=wire.ONE_RTT { return 122 }
+        let unprotected=protection.unprotect(s.spaces[2].read,packet,header.numberOffset,-1)
+        if !unprotected.valid { return 122 }
+        let stream=false;let eliciting=false
+        for frame in wire.frames(unprotected.payload).frames {
+            if frame.type!=0 && frame.type!=2 && frame.type!=3 { eliciting=true }
+            if frame.type==24 { controls+=1 }
+            if frame.type>=8 && frame.type<=15 {
+                if frame.stream!=id || frame.offset!=0 || !frame.fin || crypto.hex(frame.data)!=crypto.hex(request) { return 122 }
+                streams+=1;stream=true
+            }
+        }
+        if eliciting { probes+=1 }
+        if stream { quic.receive(s,packet,due) }
+    }
+    if controls!=1 || streams!=1 || probes!=2 { print("confirmed PTO starved the lost request behind an unacknowledged CID");return 120 }
+    if c.congestion.probes!=before+1 || c.spaces[2].probe!=due+recovery.pto(c.congestion,true) { return 122 }
+    let received=quic.readStream(s,id)
+    if !errors.bytesOk(received) || crypto.hex(errors.bytesValue(received))!=crypto.hex(request) { return 122 }
+    let next=c.spaces[2].next;quic.poll(c,due)
+    if c.spaces[2].next!=next || c.congestion.probes!=before+1 { return 122 }
+    return 0
+}
 function main(): Integer {
     let root = readBytesFile(argument(0)); let identity = readBytesFile(argument(1)); let key = readBytesFile(argument(2))
     let certificate = readBytesFile(argument(3)); let clientKey = readBytesFile(argument(4)); let mode = argument(5)
@@ -492,6 +544,7 @@ function main(): Integer {
     else if mode == "initial-burst" { result = initialBurst(root, identity, key, certificate, clientKey) }
     else if mode == "server-credit" { result = serverCredit(root, identity, key, certificate, clientKey) }
     else if mode == "server-paired" { result = serverPaired(root, identity, key, certificate, clientKey) }
+    else if mode == "confirmed-delivery" { result = confirmedDelivery(root, identity, key, certificate, clientKey) }
     if result == 0 { print("QUIC PTO " + mode + " passed") }
     return result
 }
