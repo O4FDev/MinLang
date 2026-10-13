@@ -1,0 +1,472 @@
+use "../tools/testing.min" as test
+use "./evidence-support.min" as evidence
+use "system" as system
+use "files" as files
+use "json" as json
+use "sha256" as sha
+
+function bytes(values: List<Integer>, suffix: Text): Bytes {
+    let result = Bytes()
+    for value in values { result.add(value) }
+    result.addBytes(Bytes(suffix))
+    return result
+}
+function same(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+function exists(path: Text): Boolean { return files.pathSize(path) >= 0 }
+function shell(script: Text, arguments: List<Text>, seconds: Float): evidence.Command {
+    let command = ["/bin/sh", "-c", script, "sh"]
+    for item in arguments { command.add(item) }
+    return evidence.command(command, seconds)
+}
+function manifest(path: Text): json.Value {
+    let value = json.parse(readTextFile(path + "/evidence.json"))
+    test.check(value.kind == json.OBJECT, "evidence.json is not a JSON object")
+    test.check(json.member(value, "schema_version").text == "1" && json.string(value, "status") == "failed", "evidence.json schema/status")
+    test.check(json.string(value, "workspace") == path, "evidence.json workspace")
+    return value
+}
+function commandRow(report: json.Value, index: Integer): json.Value { return json.member(report, "commands").items[index] }
+function retainedPath(diagnostics: Text): Text {
+    let prefix = "Test failure evidence retained: "
+    for line in test.lines(diagnostics) {
+        let raw = Bytes(line)
+        if raw.length > Bytes(prefix).length && Text(raw.slice(0, Bytes(prefix).length)) == prefix {
+            return Text(raw.slice(Bytes(prefix).length, raw.length))
+        }
+    }
+    fail("missing retained evidence notice\n" + diagnostics)
+    return ""
+}
+function makeExecutable(driver: evidence.Evidence, path: Text) {
+    let request = evidence.command(["/bin/chmod", "755", path], 5.0)
+    request.check = true
+    evidence.run(driver, request)
+}
+function pause(driver: evidence.Evidence, seconds: Text) {
+    let request = evidence.command(["/bin/sleep", seconds], 5.0)
+    request.check = true
+    evidence.run(driver, request)
+}
+function child(self: Text, mode: Text, arguments: List<Text>, input: Bytes): evidence.Outcome {
+    let driver = evidence.open("child-driver", [])
+    let command = [self, mode]
+    for item in arguments { command.add(item) }
+    let request = evidence.command(command, 60.0)
+    request.input = input
+    let result = evidence.run(driver, request)
+    evidence.close(driver, false)
+    return result
+}
+function replayCommand(replay: Text, path: Text, input: Text): evidence.Outcome {
+    let driver = evidence.open("replay-driver", [])
+    let request = evidence.command([replay, path + "/evidence.json"], 30.0)
+    request.input = Bytes(input)
+    let result = evidence.run(driver, request)
+    evidence.close(driver, false)
+    return result
+}
+function removeAll(path: Text) {
+    let handle = system.spawn("/bin/rm", ["rm", "-rf", "--", path], system.environment(), "")
+    test.check(handle > 0 && system.wait(handle).exitCode == 0, "cannot remove " + path)
+}
+
+function successRemovesWorkspace() {
+    let opened = evidence.open("success", [])
+    let result = evidence.run(opened, shell("echo 42", [], 5.0))
+    test.check(result.status == 0 && Text(result.stdout) == "42\n" && result.stderr.length == 0, "successful command output")
+    let path = opened.path
+    test.check(exists(path), "open workspace exists")
+    evidence.close(opened, false)
+    test.check(!exists(path) && !exists(path + ".io"), "successful evidence workspace was not removed")
+}
+function inputsAreDigested(work: Text) {
+    let source = work + "/digested.txt"
+    writeTextFile(source, "digest me\n")
+    let opened = evidence.open("inputs", [source, work + "/missing.txt"])
+    test.check(opened.inputPaths.length == 1 && opened.inputPaths[0] == evidence.resolve(source), "regular input paths are resolved and missing inputs skipped")
+    test.check(opened.inputDigests[0] == sha.hex(sha.digest(Bytes("digest me\n"))), "input digest")
+    evidence.close(opened, false)
+}
+function defaultStdinIsEof(self: Text) {
+    for payload in [Bytes("parent one\n"), bytes([0, 255], "parent two")] {
+        let result = child(self, "--child-stdin", [], payload)
+        test.check(result.status == 0 && result.stderr.length == 0, "stdin child failed\n" + Text(result.stderr))
+        let observed = test.lines(Text(result.stdout))
+        test.check(observed.length == 3, "stdin child report")
+        test.check(observed[0] == "", "default stdin was not EOF")
+        test.check(observed[1] == evidence.base64(payload), "explicit inherited stdin did not see the parent pipe")
+        test.check(observed[2] == "eof inherited", "stdin modes " + observed[2])
+    }
+}
+function childStdin() {
+    let opened = evidence.open("stdin-parent", [])
+    let first = evidence.run(opened, evidence.command(["/bin/cat"], 5.0))
+    let request = evidence.command(["/bin/cat"], 5.0)
+    request.stdin = "inherited"
+    let second = evidence.run(opened, request)
+    print(evidence.base64(first.stdout))
+    print(evidence.base64(second.stdout))
+    print(opened.rows[0].stdinMode + " " + opened.rows[1].stdinMode)
+    evidence.close(opened, false)
+}
+function textNewlines(work: Text) {
+    let payload = bytes([], "one\r\ntwo\rthree\n")
+    payload.add(0)
+    payload.addBytes(Bytes("tail"))
+    let source = work + "/newlines.bin"
+    writeBytesFile(source, payload)
+    let opened = evidence.open("text-newlines", [])
+    let observed = evidence.run(opened, shell("cat \"$1\"; cat \"$1\" >&2", [source], 5.0))
+    let expected = "one\ntwo\nthree\n\0tail"
+    test.check(observed.status == 0 && evidence.text(observed.stdout) == expected && evidence.text(observed.stderr) == expected, "text newline translation")
+    let row = opened.rows[opened.rows.length - 1]
+    test.check(same(row.stdout, payload) && same(row.stderr, payload), "raw evidence bytes changed by text translation")
+    let binary = evidence.run(opened, shell("cat \"$1\"; cat \"$1\" >&2", [source], 5.0))
+    test.check(same(binary.stdout, payload) && same(binary.stderr, payload), "binary output bytes")
+    evidence.close(opened, true)
+    let report = manifest(opened.path)
+    test.check(json.string(commandRow(report, 0), "stdout_base64") == evidence.base64(payload), "recorded stdout base64")
+    test.check(json.string(commandRow(report, 0), "stderr_base64") == evidence.base64(payload), "recorded stderr base64")
+}
+function explicitInputReplayed(replay: Text) {
+    for payload in [bytes([0, 255], "binary\n"), bytes([], "é🙂\0\n")] {
+        let opened = evidence.open("stdin-payload", [])
+        let request = evidence.command(["/bin/cat"], 5.0)
+        request.input = payload
+        let observed = evidence.run(opened, request)
+        test.check(same(observed.stdout, payload), "explicit input bytes")
+        test.check(opened.rows[0].stdinMode == "input", "explicit input mode")
+        evidence.close(opened, true)
+        let stdin = json.member(commandRow(manifest(opened.path), 0), "stdin")
+        test.check(json.string(stdin, "mode") == "input" && json.string(stdin, "base64") == evidence.base64(payload), "recorded stdin payload")
+        let replayed = replayCommand(replay, opened.path, "wrong inherited input")
+        test.check(replayed.status == 0 && same(replayed.stdout, payload) && replayed.stderr.length == 0, "explicit input replay\n" + Text(replayed.stderr))
+    }
+}
+function fileInputOffset(work: Text, replay: Text) {
+    let opened = evidence.open("stdin-file", [])
+    let path = work + "/input.bin"
+    let payload = bytes([], "ignored prefix")
+    payload.add(0)
+    payload.add(255)
+    payload.addBytes(Bytes("kept tail\n"))
+    writeBytesFile(path, payload)
+    let offset = Bytes("ignored prefix").length
+    let request = evidence.command(["/bin/cat"], 5.0)
+    request.stdin = "file"
+    request.stdinPath = path
+    request.stdinOffset = offset
+    let observed = evidence.run(opened, request)
+    let tail = payload.slice(offset, payload.length)
+    test.check(same(observed.stdout, tail), "file stdin offset")
+    evidence.close(opened, true)
+    let stdin = json.member(commandRow(manifest(opened.path), 0), "stdin")
+    test.check(json.string(stdin, "mode") == "file" && json.string(stdin, "path") == evidence.resolve(path), "file stdin record")
+    test.check(Integer(json.member(stdin, "offset").number) == offset && json.string(stdin, "sha256") == sha.hex(sha.digest(payload)), "file stdin offset/hash record")
+    test.check(json.member(stdin, "offset").text == Text(offset), "file stdin offset is an integer")
+    let replayed = replayCommand(replay, opened.path, "wrong parent input")
+    test.check(replayed.status == 0 && same(replayed.stdout, tail) && replayed.stderr.length == 0, "file stdin replay\n" + Text(replayed.stderr))
+    writeTextFile(path, "changed file\n")
+    let refused = evidence.replay(opened.path + "/evidence.json", 0)
+    test.check(test.contains(refused.error, "Replay input changed"), "changed stdin file was replayed: " + refused.error)
+    let cli = replayCommand(replay, opened.path, "")
+    test.check(cli.status == 1 && test.contains(Text(cli.stderr), "Replay input changed"), "replay command accepted a changed input")
+}
+function conflictingInput() {
+    let opened = evidence.open("stdin-conflict", [])
+    for mode in ["inherited", "eof", "file"] {
+        let request = shell("wc -c | tr -d ' '", [], 5.0)
+        request.input = Bytes("payload")
+        request.stdin = mode
+        request.stdinPath = "/dev/null"
+        let rejected = evidence.run(opened, request)
+        test.check(test.contains(rejected.error, "input cannot be combined"), "conflicting stdin " + mode + " accepted")
+    }
+    let unknown = shell("true", [], 5.0)
+    unknown.stdin = "pipe"
+    test.check(test.contains(evidence.run(opened, unknown).error, "unknown stdin mode"), "unknown stdin mode accepted")
+    test.check(opened.rows.length == 0, "rejected requests were recorded")
+    let request = shell("wc -c | tr -d ' '", [], 5.0)
+    request.stdin = "input"
+    let observed = evidence.run(opened, request)
+    test.check(Text(observed.stdout) == "0\n", "explicit empty input was not EOF")
+    test.check(opened.rows[0].stdinMode == "input" && opened.rows[0].stdinInput.length == 0, "explicit empty input record")
+    evidence.close(opened, true)
+    let stdin = json.member(commandRow(manifest(opened.path), 0), "stdin")
+    test.check(stdin.keys.length == 2 && json.string(stdin, "mode") == "input" && json.member(stdin, "base64").kind == json.STRING && json.string(stdin, "base64") == "", "empty input JSON record")
+}
+function replayRefusesInheritedStdin() {
+    let opened = evidence.open("stdin-unreplayable", [])
+    let request = shell(":", [], 5.0)
+    request.stdin = "inherited"
+    evidence.run(opened, request)
+    evidence.close(opened, true)
+    let path = opened.path + "/evidence.json"
+    let inherited = evidence.replay(path, 0)
+    test.check(inherited.error == "Replay stdin requires the original test scenario: inherited", "inherited stdin replay: " + inherited.error)
+    let source = readTextFile(path)
+    let stripped = test.replace(source, "      \"stdin\": {\n        \"mode\": \"inherited\"\n      },\n", "")
+    test.check(stripped != source, "stdin record layout")
+    writeTextFile(path, stripped)
+    let unrecorded = evidence.replay(path, 0)
+    test.check(unrecorded.error == "Replay stdin requires the original test scenario: unrecorded", "unrecorded stdin replay: " + unrecorded.error)
+}
+function timeoutRetainsInput(self: Text) {
+    let result = child(self, "--child-timeout", [], Bytes())
+    test.check(result.status != 0, "timed out command did not fail the test")
+    let diagnostics = Text(result.stderr)
+    test.check(test.contains(diagnostics, "TimeoutExpired"), "timeout diagnostic\n" + diagnostics)
+    let row = commandRow(manifest(retainedPath(diagnostics)), 0)
+    test.check(json.member(row, "timed_out").truth, "timeout was not recorded")
+    let payload = Bytes()
+    for index in 0..(512 * 1024) { payload.add(120) }
+    test.check(json.string(json.member(row, "stdin"), "base64") == evidence.base64(payload), "unconsumed input bytes were not retained")
+    test.check(json.string(row, "stdout_base64") == evidence.base64(Bytes("ready\n")), "timed out output was not retained")
+    test.check(json.member(row, "returncode").text == "-9", "timed out process status " + json.member(row, "returncode").text)
+    test.check(test.contains(json.string(row, "exception"), "TimeoutExpired"), "timeout exception record")
+}
+function childTimeout() {
+    let opened = evidence.open("stdin-timeout", [])
+    let payload = Bytes()
+    for index in 0..(512 * 1024) { payload.add(120) }
+    let request = shell("echo ready; sleep 30", [], 0.5)
+    request.input = payload
+    evidence.run(opened, request)
+    evidence.close(opened, false)
+}
+function toleratedTimeout() {
+    let opened = evidence.open("tolerated-timeout", [])
+    let request = shell("echo partial; sleep 30", [], 0.5)
+    request.allowTimeout = true
+    let start = system.monotonicNanoseconds()
+    let result = evidence.run(opened, request)
+    test.check(result.timedOut && Text(result.stdout) == "partial\n" && test.contains(result.error, "timed out after 0.5 seconds"), "tolerated timeout outcome")
+    test.check(system.monotonicNanoseconds() - start < 20000000000, "timeout did not stop the command promptly")
+    test.check(opened.rows[0].timedOut && opened.rows[0].returncode == -9, "tolerated timeout record")
+    evidence.close(opened, false)
+}
+function referencePriority() {
+    let opened = evidence.open("reference-output", [])
+    let original = opened.path + "/case.stdout"
+    let variants = ["big-endian.small", "small", "big-endian", "test-os", "default"]
+    let paths: List<Text> = []
+    for variant in variants {
+        let path = original
+        if variant != "default" { path = original + "." + variant }
+        paths.add(path)
+        writeTextFile(path, variant)
+    }
+    writeTextFile(original + ".other-os", "wrong system")
+    writeTextFile(original + ".little-endian.small", "wrong byte order")
+    for index in 0..variants.length {
+        let observed = evidence.referenceOutput(opened, original, "small", "big", "test-os")
+        test.check(Text(observed) == variants[index], "reference priority selected " + Text(observed))
+        let items = evidence.controlItems(opened, "output_references")
+        let selected = json.parse(items[items.length - 1])
+        test.check(json.string(selected, "variant") == variants[index] && json.string(selected, "selected") == paths[index], "reference record")
+        test.check(json.string(selected, "default") == original && json.string(selected, "byte_order") == "big" && json.string(selected, "system") == "test-os" && json.string(selected, "size") == "small", "reference context")
+        let digest = ""
+        for position in 0..opened.inputPaths.length { if opened.inputPaths[position] == paths[index] { digest = opened.inputDigests[position] } }
+        test.check(digest != "" && json.string(selected, "sha256") == digest, "reference input digest")
+        test.check(files.remove(paths[index]) == 0, "remove reference")
+    }
+    test.check(evidence.selectReference(opened, original, "small", "big", "test-os") == "", "missing reference was selected")
+    evidence.close(opened, true)
+    let controls = json.member(manifest(opened.path), "controls")
+    test.check(json.member(controls, "output_references").items.length == variants.length, "reference controls in evidence.json")
+    test.check(json.member(json.member(controls, "output_references").items[0], "size").text == "small", "reference size in evidence.json")
+    let defaults = evidence.open("reference-defaults", [])
+    writeTextFile(defaults.path + "/plain.stdout", "plain")
+    test.check(Text(evidence.referenceOutput(defaults, defaults.path + "/plain.stdout", "", "", "")) == "plain", "default reference")
+    let record = json.parse(evidence.controlItems(defaults, "output_references")[0])
+    test.check(json.member(record, "size").kind == json.NULL && json.string(record, "variant") == "default", "default reference record")
+    test.check(json.string(record, "byte_order") == "little" || json.string(record, "byte_order") == "big", "host byte order")
+    test.check(json.string(record, "system") != "", "host system")
+    evidence.close(defaults, false)
+}
+function missingReference(self: Text) {
+    let result = child(self, "--child-reference", [], Bytes())
+    let diagnostics = Text(result.stderr)
+    test.check(result.status != 0 && test.contains(diagnostics, "No expected-output reference for"), "missing reference did not fail\n" + diagnostics)
+    manifest(retainedPath(diagnostics))
+}
+function childReference() {
+    let opened = evidence.open("reference-missing", [])
+    evidence.referenceOutput(opened, opened.path + "/absent.stdout", "", "", "")
+    evidence.close(opened, false)
+}
+function failureRetainsBytes(self: Text) {
+    let result = child(self, "--child-check", [], Bytes())
+    let diagnostics = Text(result.stderr)
+    test.check(result.status != 0 && test.contains(diagnostics, "CalledProcessError"), "checked failure did not fail\n" + diagnostics)
+    let report = manifest(retainedPath(diagnostics))
+    let row = commandRow(report, 0)
+    test.check(json.string(row, "stderr_base64") == evidence.base64(bytes([255], "broken")), "raw stderr bytes")
+    test.check(json.member(row, "returncode").text == "23", "recorded returncode")
+    test.check(json.member(json.member(report, "files"), "case.min").kind == json.STRING, "workspace source was not retained")
+    test.check(json.member(row, "timed_out").kind == json.BOOLEAN && !json.member(row, "timed_out").truth, "not timed out")
+    test.check(json.string(row, "phase") == "command" && json.member(row, "timeout").text == "5", "phase/timeout record")
+    test.check(json.member(report, "tools").keys.length == 1 && json.member(report, "tools").items[0].text == json.string(row, "executable_sha256"), "tool hash record")
+}
+function childCheck() {
+    let opened = evidence.open("binary", [])
+    writeTextFile(opened.path + "/case.min", "print(42)\n")
+    let request = shell("printf '\\377broken' >&2; exit 23", [], 5.0)
+    request.check = true
+    evidence.run(opened, request)
+    evidence.close(opened, false)
+}
+function replayChangedArtifact() {
+    let opened = evidence.open("reproduction", [])
+    let source = opened.path + "/program.sh"
+    writeTextFile(source, "exit 23\n")
+    evidence.run(opened, evidence.command(["/bin/sh", source], 5.0))
+    evidence.close(opened, true)
+    let path = opened.path + "/evidence.json"
+    let first = evidence.replay(path, -1)
+    test.check(first.error == "" && first.status == 23, "replayed status " + Text(first.status) + " " + first.error)
+    writeTextFile(source, "exit 0\n")
+    let changed = evidence.replay(path, -1)
+    test.check(test.contains(changed.error, "Replay artifact changed"), "changed artifact replayed: " + changed.error)
+}
+function descendantTimeout(self: Text, work: Text) {
+    let heartbeat = work + "/heartbeat"
+    let result = child(self, "--child-descendant", [heartbeat], Bytes())
+    let diagnostics = Text(result.stderr)
+    test.check(result.status != 0 && test.contains(diagnostics, "TimeoutExpired"), "descendant timeout did not fail\n" + diagnostics)
+    test.check(exists(heartbeat), "descendant did not start")
+    let driver = evidence.open("heartbeat", [])
+    let before = readTextFile(heartbeat)
+    pause(driver, "0.15")
+    test.check(readTextFile(heartbeat) == before, "descendant survived the timeout")
+    let row = commandRow(manifest(retainedPath(diagnostics)), 0)
+    test.check(json.member(row, "timed_out").truth, "descendant timeout record")
+    test.check(json.string(row, "stdout_base64") == evidence.base64(Bytes("started\n")), "started output record")
+    let following = evidence.run(driver, evidence.command(["/bin/echo", "7"], 5.0))
+    test.check(Text(following.stdout) == "7\n", "following command")
+    evidence.close(driver, false)
+}
+function childDescendant(heartbeat: Text) {
+    let opened = evidence.open("timeout", [])
+    evidence.run(opened, shell("(i=0; while :; do i=$((i+1)); echo $i > \"$1\"; sleep 0.03; done) & echo started; sleep 30", [heartbeat], 0.5))
+    evidence.close(opened, false)
+}
+function executableResolution(work: Text) {
+    let directory = work + "/command-directory"
+    test.check(files.makeDirectory(directory) == 0, "command directory")
+    let probe = directory + "/probe"
+    writeTextFile(probe, "#!/bin/sh\nexit 23\n")
+    let opened = evidence.open("relative-executable", [])
+    makeExecutable(opened, probe)
+    for name in ["./probe", "probe"] {
+        let request = evidence.command([name], 5.0)
+        request.cwd = directory
+        request.inherit = false
+        request.environment = ["PATH=."]
+        test.check(evidence.run(opened, request).status == 23, "resolved executable " + name)
+    }
+    test.check(opened.rows[1].executable == evidence.resolve(probe) && opened.rows[2].executable == evidence.resolve(probe), "resolved executable records")
+    evidence.close(opened, true)
+    let path = opened.path + "/evidence.json"
+    let report = manifest(opened.path)
+    test.check(json.member(json.member(report, "tools"), evidence.resolve(probe)).kind == json.STRING, "probe tool hash")
+    let row = commandRow(report, 1)
+    test.check(!json.member(row, "empty_environment").truth && json.string(json.member(row, "environment"), "PATH") == ".", "explicit PATH record")
+    test.check(json.member(row, "removed_environment").items.length > 0, "removed environment record")
+    test.check(evidence.replay(path, 1).status == 23 && evidence.replay(path, 2).status == 23, "executable replay")
+    writeTextFile(probe, "#!/bin/sh\nexit 0\n")
+    let changed = evidence.replay(path, 1)
+    test.check(test.contains(changed.error, "Replay input changed"), "changed executable replayed: " + changed.error)
+}
+function emptyEnvironment() {
+    let opened = evidence.open("empty-environment", [])
+    let request = shell("echo ${MINYAR_TEST_EVIDENCE:-absent}", [], 5.0)
+    request.inherit = false
+    let result = evidence.run(opened, request)
+    test.check(Text(result.stdout) == "absent\n", "empty environment inherited " + Text(result.stdout))
+    test.check(opened.rows[0].environment.length == 0 && opened.rows[0].emptyEnvironment && opened.rows[0].removedEnvironment.length == 0, "empty environment record")
+    let inherited = evidence.run(opened, shell("echo ${MINYAR_TEST_EVIDENCE:-absent}", [], 5.0))
+    test.check(Text(inherited.stdout) == system.getenv("MINYAR_TEST_EVIDENCE") + "\n", "inherited environment")
+    test.check(!opened.rows[1].emptyEnvironment && opened.rows[1].environment.length >= 1, "inherited MINYAR_ environment record")
+    evidence.close(opened, false)
+}
+function environmentDelta() {
+    test.check(system.getenv("PEER_REMOVED") == "must not survive", "harness parent environment control")
+    let opened = evidence.open("environment-delta", [])
+    let helper = opened.path + "/peer-helper"
+    writeTextFile(helper, "#!/bin/sh\necho \"helper found\"\n")
+    makeExecutable(opened, helper)
+    let environment: List<Text> = []
+    for entry in system.environment() { if !test.contains(entry, "PEER_REMOVED=") { environment.add(entry) } }
+    environment = evidence.setVariable(environment, "PATH", opened.path)
+    environment = evidence.setVariable(environment, "LC_ALL", "C")
+    let request = shell("[ -z \"${PEER_REMOVED+x}\" ] || exit 3; [ \"$LC_ALL\" = C ] || exit 4; peer-helper", [], 5.0)
+    request.inherit = false
+    request.environment = environment
+    let result = evidence.run(opened, request)
+    test.check(result.status == 0 && Text(result.stdout) == "helper found\n" && result.stderr.length == 0, "environment delta command " + Text(result.status) + Text(result.stderr))
+    evidence.close(opened, true)
+    let path = opened.path + "/evidence.json"
+    let row = commandRow(manifest(opened.path), 1)
+    test.check(json.string(json.member(row, "environment"), "PATH") == opened.path, "recorded PATH")
+    test.check(json.string(json.member(row, "environment"), "LC_ALL") == "C" || system.getenv("LC_ALL") == "C", "recorded locale")
+    let removed = false
+    for item in json.member(row, "removed_environment").items { if item.text == "PEER_REMOVED" { removed = true } }
+    test.check(removed, "removed environment was not recorded")
+    let replayed = evidence.replay(path, 1)
+    test.check(replayed.error == "" && replayed.status == 0 && Text(replayed.stdout) == "helper found\n", "environment replay " + Text(replayed.status) + replayed.error + Text(replayed.stderr))
+}
+
+function cases(self: Text, replay: Text) {
+    test.check(system.getenv("MINYAR_TEST_EVIDENCE") != "", "harness evidence base")
+    let work = system.getenv("MINYAR_TEST_EVIDENCE") + "/harness-work"
+    test.check(files.makeDirectory(work) == 0, "harness work directory")
+    successRemovesWorkspace()
+    inputsAreDigested(work)
+    defaultStdinIsEof(self)
+    textNewlines(work)
+    explicitInputReplayed(replay)
+    fileInputOffset(work, replay)
+    conflictingInput()
+    replayRefusesInheritedStdin()
+    timeoutRetainsInput(self)
+    toleratedTimeout()
+    referencePriority()
+    missingReference(self)
+    failureRetainsBytes(self)
+    replayChangedArtifact()
+    descendantTimeout(self, work)
+    executableResolution(work)
+    emptyEnvironment()
+    environmentDelta()
+    test.check(evidence.jobs() >= 1, "test jobs")
+    print("evidence harness: 18 cases passed")
+}
+
+test.check(argumentCount() >= 1, "usage: evidence-harness SELF REPLAY")
+let mode = argument(0)
+if mode == "--child-stdin" { childStdin() }
+else if mode == "--child-timeout" { childTimeout() }
+else if mode == "--child-reference" { childReference() }
+else if mode == "--child-check" { childCheck() }
+else if mode == "--child-descendant" { childDescendant(argument(1)) }
+else if mode == "--cases" { cases(argument(1), argument(2)) }
+else {
+    test.check(argumentCount() == 2, "usage: evidence-harness SELF REPLAY")
+    let base = test.scratch()
+    let environment: List<Text> = []
+    for entry in system.environment() {
+        if !test.contains(entry, "MINYAR_TEST_EVIDENCE=") && !test.contains(entry, "PEER_REMOVED=") { environment.add(entry) }
+    }
+    environment.add("MINYAR_TEST_EVIDENCE=" + base)
+    environment.add("PEER_REMOVED=must not survive")
+    let handle = system.spawn(argument(0), [argument(0), "--cases", argument(0), argument(1)], environment, "")
+    test.check(handle > 0, "cannot start evidence harness cases")
+    let status = system.wait(handle)
+    removeAll(base)
+    test.check(status.state == system.EXITED && status.exitCode == 0, "evidence harness cases failed")
+}

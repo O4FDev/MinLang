@@ -1,0 +1,782 @@
+use "system" as system
+use "files" as files
+use "json" as json
+use "sha256" as sha
+
+public record Command {
+    arguments: List<Text>
+    cwd: Text
+    timeout: Float
+    phase: Text
+    inherit: Boolean
+    environment: List<Text>
+    stdin: Text
+    input: Bytes
+    stdinPath: Text
+    stdinOffset: Integer
+    captureOutput: Boolean
+    captureErrors: Boolean
+    executable: Text
+    check: Boolean
+    allowTimeout: Boolean
+}
+public record Outcome { status: Integer; stdout: Bytes; stderr: Bytes; timedOut: Boolean; error: Text }
+public record Row {
+    command: List<Text>
+    cwd: Text
+    timeout: Float
+    phase: Text
+    stdoutCaptured: Boolean
+    stderrCaptured: Boolean
+    stdinMode: Text
+    stdinInput: Bytes
+    stdinPath: Text
+    stdinOffset: Integer
+    stdinSha256: Text
+    executable: Text
+    executableSha256: Text
+    emptyEnvironment: Boolean
+    environment: List<Text>
+    removedEnvironment: List<Text>
+    timedOut: Boolean
+    terminationError: Text
+    finished: Boolean
+    returncode: Integer
+    stdout: Bytes
+    stderr: Bytes
+    exception: Text
+    elapsed: Float
+}
+public record Control { name: Text; value: Text; items: List<Text>; listed: Boolean }
+public record Evidence {
+    path: Text
+    rows: List<Row>
+    inputPaths: List<Text>
+    inputDigests: List<Text>
+    controls: List<Control>
+    closed: Boolean
+    private toolKeys: List<Text>
+    private toolDigests: List<Text>
+    private serial: Integer
+}
+public record Replay { error: Text; status: Integer; stdout: Bytes; stderr: Bytes }
+record Status { error: Integer; kind: Integer; size: Integer; modified: Integer; inode: Integer; mode: Integer }
+record Decoded { valid: Boolean; bytes: Bytes }
+
+function launch(path: Text, arguments: Bytes, environment: Bytes, cwd: Text, input: Integer, inputPath: Text,
+    inputOffset: Integer, outputPath: Text, errorPath: Text): Integer { native "evidencesupport" }
+function reap(processId: Integer, nanoseconds: Integer): Bytes { native "evidencesupport" }
+function terminate(processId: Integer, group: Boolean): Integer { native "evidencesupport" }
+function resolveNative(path: Text): Text { native "evidencesupport" }
+function inspect(path: Text, follow: Boolean): Bytes { native "evidencesupport" }
+function platform(): Text { native "evidencesupport" }
+function byteOrder(): Text { native "evidencesupport" }
+
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let bytes = Bytes(prefix)
+    return raw.length >= bytes.length && Text(raw.slice(0, bytes.length)) == prefix
+}
+function ends(source: Text, suffix: Text): Boolean {
+    let raw = Bytes(source)
+    let bytes = Bytes(suffix)
+    return raw.length >= bytes.length && Text(raw.slice(raw.length - bytes.length, raw.length)) == suffix
+}
+function lastSlash(source: Text): Integer {
+    let raw = Bytes(source)
+    let index = raw.length - 1
+    while index >= 0 && raw[index] != 47 { index -= 1 }
+    return index
+}
+function split(source: Text, separator: Integer): List<Text> {
+    let raw = Bytes(source)
+    let result: List<Text> = []
+    let start = 0
+    for index in 0..raw.length {
+        if raw[index] == separator { result.add(Text(raw.slice(start, index))); start = index + 1 }
+    }
+    result.add(Text(raw.slice(start, raw.length)))
+    return result
+}
+function entryName(entry: Text): Text {
+    let raw = Bytes(entry)
+    for index in 0..raw.length { if raw[index] == 61 { return Text(raw.slice(0, index)) } }
+    return entry
+}
+function entryValue(entry: Text): Text {
+    let raw = Bytes(entry)
+    for index in 0..raw.length { if raw[index] == 61 { return Text(raw.slice(index + 1, raw.length)) } }
+    return ""
+}
+function lookup(entries: List<Text>, name: Text): Integer {
+    for index in 0..entries.length { if entryName(entries[index]) == name { return index } }
+    return -1
+}
+public function setVariable(entries: List<Text>, name: Text, value: Text): List<Text> {
+    let result: List<Text> = []
+    for entry in entries { if entryName(entry) != name { result.add(entry) } }
+    result.add(name + "=" + value)
+    return result
+}
+public function jobs(): Integer {
+    let configured = system.getenv("MINYAR_TEST_JOBS")
+    if configured == "" { return 2 }
+    return max(1, Integer(configured))
+}
+
+function status(path: Text, follow: Boolean): Status {
+    let raw = inspect(path, follow)
+    return Status { error: raw.getInt64(0); kind: raw.getInt64(8); size: raw.getInt64(16); modified: raw.getInt64(24);
+        inode: raw.getInt64(32); mode: raw.getInt64(40) }
+}
+function isFile(path: Text): Boolean {
+    let found = status(path, true)
+    return found.error == 0 && found.kind == 1
+}
+public function resolve(path: Text): Text {
+    if path == "" { return resolve(".") }
+    let resolved = resolveNative(path)
+    if resolved != "" { return resolved }
+    let slash = lastSlash(path)
+    let raw = Bytes(path)
+    let parent = "."
+    if slash == 0 { parent = "/" } else if slash > 0 { parent = Text(raw.slice(0, slash)) }
+    let name = Text(raw.slice(slash + 1, raw.length))
+    let base = resolve(parent)
+    if name == "" || name == "." { return base }
+    if name == ".." {
+        let cut = lastSlash(base)
+        if cut <= 0 { return "/" }
+        return Text(Bytes(base).slice(0, cut))
+    }
+    if base == "/" { return "/" + name }
+    return base + "/" + name
+}
+function join(directory: Text, path: Text): Text {
+    if starts(path, "/") { return path }
+    if path == "" { return directory }
+    return directory + "/" + path
+}
+function makeDirectories(path: Text) {
+    let parts = split(path, 47)
+    let current = ""
+    for index in 0..parts.length {
+        if index > 0 { current += "/" }
+        current += parts[index]
+        if parts[index] != "" && parts[index] != "." && parts[index] != ".." {
+            if files.makeDirectory(current) != 0 { fail("cannot create test evidence directory " + current) }
+        }
+    }
+}
+public function digest(path: Text): Text {
+    let file = files.open(path, files.READ)
+    if file < 0 { fail("cannot read " + path + " for SHA-256: " + files.errorText(file)) }
+    let state = sha.new()
+    let position = 0
+    while true {
+        let chunk = files.readAt(file, position, 1048576)
+        if chunk.length == 0 {
+            let error = files.lastError()
+            if error != 0 { files.close(file); fail("cannot read " + path + " for SHA-256: " + files.errorText(error)) }
+            break
+        }
+        if !sha.update(state, chunk) { fail("SHA-256 update failed for " + path) }
+        position += chunk.length
+    }
+    files.close(file)
+    return sha.hex(sha.finalize(state))
+}
+
+public function base64(raw: Bytes): Text {
+    let alphabet = Bytes("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+    let encoded = Bytes()
+    let index = 0
+    while index < raw.length {
+        let remaining = raw.length - index
+        let bits = raw[index] << 16
+        if remaining > 1 { bits = bits | (raw[index + 1] << 8) }
+        if remaining > 2 { bits = bits | raw[index + 2] }
+        encoded.add(alphabet[(bits >> 18) & 63])
+        encoded.add(alphabet[(bits >> 12) & 63])
+        if remaining > 1 { encoded.add(alphabet[(bits >> 6) & 63]) } else { encoded.add(61) }
+        if remaining > 2 { encoded.add(alphabet[bits & 63]) } else { encoded.add(61) }
+        index += 3
+    }
+    return Text(encoded)
+}
+function sextet(byte: Integer): Integer {
+    if byte >= 65 && byte <= 90 { return byte - 65 }
+    if byte >= 97 && byte <= 122 { return byte - 71 }
+    if byte >= 48 && byte <= 57 { return byte + 4 }
+    if byte == 43 { return 62 }
+    if byte == 47 { return 63 }
+    return -1
+}
+function unbase64(source: Text): Decoded {
+    let raw = Bytes(source)
+    let result = Bytes()
+    if raw.length % 4 != 0 { return Decoded { valid: false; bytes: result } }
+    let index = 0
+    while index < raw.length {
+        let padding = 0
+        let bits = 0
+        for offset in 0..4 {
+            let byte = raw[index + offset]
+            let value = sextet(byte)
+            if byte == 61 && index + 4 == raw.length && offset >= 2 { padding += 1; value = 0 }
+            else if value < 0 || padding > 0 { return Decoded { valid: false; bytes: result } }
+            bits = (bits << 6) | value
+        }
+        result.add((bits >> 16) & 255)
+        if padding < 2 { result.add((bits >> 8) & 255) }
+        if padding < 1 { result.add(bits & 255) }
+        index += 4
+    }
+    return Decoded { valid: true; bytes: result }
+}
+public function text(raw: Bytes): Text {
+    let result = Bytes()
+    let index = 0
+    while index < raw.length {
+        if raw[index] == 13 {
+            result.add(10)
+            if index + 1 < raw.length && raw[index + 1] == 10 { index += 1 }
+        } else { result.add(raw[index]) }
+        index += 1
+    }
+    return Text(result)
+}
+
+function quote(source: Text): Text {
+    let raw = Bytes(source)
+    let hex = Bytes("0123456789abcdef")
+    let result = Bytes("\"")
+    for byte in raw {
+        if byte == 34 { result.addBytes(Bytes("\\\"")) }
+        else if byte == 92 { result.addBytes(Bytes("\\\\")) }
+        else if byte == 10 { result.addBytes(Bytes("\\n")) }
+        else if byte == 13 { result.addBytes(Bytes("\\r")) }
+        else if byte == 9 { result.addBytes(Bytes("\\t")) }
+        else if byte < 32 || byte == 127 {
+            result.addBytes(Bytes("\\u00"))
+            result.add(hex[byte >> 4])
+            result.add(hex[byte & 15])
+        } else { result.add(byte) }
+    }
+    result.add(34)
+    return Text(result)
+}
+function renderObject(keys: List<Text>, values: List<Text>, indent: Text): Text {
+    if keys.length == 0 { return "{}" }
+    let parts: List<Text> = ["{\n"]
+    for index in 0..keys.length {
+        parts.add(indent + "  " + quote(keys[index]) + ": " + values[index])
+        if index + 1 < keys.length { parts.add(",") }
+        parts.add("\n")
+    }
+    parts.add(indent + "}")
+    return joinText(parts)
+}
+function renderArray(values: List<Text>, indent: Text): Text {
+    if values.length == 0 { return "[]" }
+    let parts: List<Text> = ["[\n"]
+    for index in 0..values.length {
+        parts.add(indent + "  " + values[index])
+        if index + 1 < values.length { parts.add(",") }
+        parts.add("\n")
+    }
+    parts.add(indent + "]")
+    return joinText(parts)
+}
+function renderStrings(values: List<Text>, indent: Text): Text {
+    let quoted: List<Text> = []
+    for value in values { quoted.add(quote(value)) }
+    return renderArray(quoted, indent)
+}
+function renderValue(value: json.Value, indent: Text): Text {
+    if value.kind == json.STRING { return quote(value.text) }
+    if value.kind == json.NUMBER { return value.text }
+    if value.kind == json.BOOLEAN { if value.truth { return "true" }; return "false" }
+    if value.kind == json.ARRAY {
+        let items: List<Text> = []
+        for item in value.items { items.add(renderValue(item, indent + "  ")) }
+        return renderArray(items, indent)
+    }
+    if value.kind == json.OBJECT {
+        let items: List<Text> = []
+        for item in value.items { items.add(renderValue(item, indent + "  ")) }
+        return renderObject(value.keys, items, indent)
+    }
+    return "null"
+}
+function renderJson(source: Text, indent: Text): Text {
+    let value = json.parse(source)
+    if value.kind == json.INVALID { fail("invalid evidence control JSON: " + value.text) }
+    return renderValue(value, indent)
+}
+function nullable(value: Text): Text {
+    if value == "" { return "null" }
+    return quote(value)
+}
+function boolean(value: Boolean): Text {
+    if value { return "true" }
+    return "false"
+}
+
+public function open(label: Text, inputs: List<Text>): Evidence {
+    let base = system.getenv("MINYAR_TEST_EVIDENCE")
+    if base == "" { base = "build/test-evidence" }
+    makeDirectories(base)
+    let parent = resolve(base)
+    let alphabet = Bytes("abcdefghijklmnopqrstuvwxyz0123456789_")
+    let path = ""
+    while path == "" {
+        let name = Bytes(label + "-")
+        for byte in randomBytes(8) { name.add(alphabet[byte % alphabet.length]) }
+        let candidate = parent + "/" + Text(name)
+        if status(candidate, false).error == -2 {
+            if files.makeDirectory(candidate) != 0 { fail("cannot create test evidence workspace " + candidate) }
+            path = candidate
+        }
+    }
+    let evidence = Evidence { path: path; rows: []; inputPaths: []; inputDigests: []; controls: []; closed: false;
+        toolKeys: []; toolDigests: []; serial: 0 }
+    for input in inputs { if isFile(input) { recordInput(evidence, resolve(input)) } }
+    return evidence
+}
+function recordInput(evidence: Evidence, path: Text): Text {
+    let hash = digest(path)
+    for index in 0..evidence.inputPaths.length {
+        if evidence.inputPaths[index] == path { evidence.inputDigests[index] = hash; return hash }
+    }
+    evidence.inputPaths.add(path)
+    evidence.inputDigests.add(hash)
+    return hash
+}
+public function control(evidence: Evidence, name: Text, value: Text) {
+    for item in evidence.controls { if item.name == name { item.value = value; item.listed = false; return } }
+    evidence.controls.add(Control { name: name; value: value; items: []; listed: false })
+}
+public function appendControl(evidence: Evidence, name: Text, value: Text) {
+    for item in evidence.controls {
+        if item.name == name {
+            if !item.listed { fail("evidence control " + name + " is not a list") }
+            item.items.add(value)
+            return
+        }
+    }
+    evidence.controls.add(Control { name: name; value: ""; items: [value]; listed: true })
+}
+public function controlItems(evidence: Evidence, name: Text): List<Text> {
+    for item in evidence.controls { if item.name == name { return item.items } }
+    return []
+}
+
+public function command(arguments: List<Text>, timeout: Float): Command {
+    return Command { arguments: arguments; cwd: ""; timeout: timeout; phase: "command"; inherit: true; environment: [];
+        stdin: ""; input: Bytes(); stdinPath: ""; stdinOffset: 0; captureOutput: true; captureErrors: true;
+        executable: ""; check: false; allowTimeout: false }
+}
+function pythonList(values: List<Text>): Text {
+    let parts: List<Text> = []
+    for value in values { parts.add("'" + value + "'") }
+    let result: List<Text> = ["["]
+    for index in 0..parts.length { if index > 0 { result.add(", ") }; result.add(parts[index]) }
+    result.add("]")
+    return joinText(result)
+}
+function seconds(value: Float): Text {
+    if value == floor(value) && abs(value) < 1000000000000.0 { return Text(Integer(value)) }
+    return Text(value)
+}
+function pack(values: List<Text>): Bytes {
+    let packed = Bytes()
+    for value in values { packed.addBytes(Bytes(value)); packed.add(0) }
+    return packed
+}
+function executableMode(path: Text): Boolean {
+    let found = status(path, true)
+    return found.error == 0 && found.kind == 1 && (found.mode & 73) != 0
+}
+function locate(requested: Text, cwd: Text, environment: List<Text>): Text {
+    if lastSlash(requested) >= 0 { return resolve(join(cwd, requested)) }
+    let search = "/bin:/usr/bin"
+    let index = lookup(environment, "PATH")
+    if index >= 0 { search = entryValue(environment[index]) }
+    for entry in split(search, 58) {
+        let candidate = resolve(join(cwd, entry)) + "/" + requested
+        if executableMode(candidate) { return candidate }
+    }
+    return ""
+}
+function toolDigest(evidence: Evidence, executable: Text): Text {
+    let found = status(executable, true)
+    let key = executable + "\n" + Text(found.size) + "\n" + Text(found.modified) + "\n" + Text(found.inode)
+    for index in 0..evidence.toolKeys.length { if evidence.toolKeys[index] == key { return evidence.toolDigests[index] } }
+    let hash = digest(executable)
+    evidence.toolKeys.add(key)
+    evidence.toolDigests.add(hash)
+    return hash
+}
+function invalid(message: Text): Outcome {
+    return Outcome { status: -1; stdout: Bytes(); stderr: Bytes(); timedOut: false; error: "ValueError: " + message }
+}
+function scratch(evidence: Evidence): Text {
+    let directory = evidence.path + ".io"
+    if files.makeDirectory(directory) != 0 { fail("cannot create evidence capture directory " + directory) }
+    return directory
+}
+function captured(path: Text): Bytes {
+    if path == "" { return Bytes() }
+    let contents = files.readFile(path)
+    if files.lastError() != 0 { fail("cannot read captured process output " + path) }
+    files.remove(path)
+    return contents
+}
+public function expect(evidence: Evidence, condition: Boolean, message: Text) {
+    if !condition {
+        close(evidence, true)
+        fail(message)
+    }
+}
+public function run(evidence: Evidence, request: Command): Outcome {
+    if request.arguments.length == 0 { return invalid("empty command") }
+    let mode = request.stdin
+    if request.input.length > 0 && mode != "" && mode != "input" { return invalid("input cannot be combined with explicit stdin") }
+    if mode == "" {
+        mode = "eof"
+        if request.input.length > 0 { mode = "input" }
+    }
+    if mode != "eof" && mode != "input" && mode != "inherited" && mode != "file" { return invalid("unknown stdin mode " + mode) }
+    let stdinPath = ""
+    let stdinSha = ""
+    if mode == "file" {
+        if request.stdinPath == "" { return invalid("file stdin requires a path") }
+        stdinPath = resolve(request.stdinPath)
+        if isFile(stdinPath) { stdinSha = recordInput(evidence, stdinPath) } else { mode = "stream" }
+    }
+    let cwd = resolve(request.cwd)
+    let current = system.environment()
+    let effective = current
+    if !request.inherit { effective = request.environment }
+    let requested = request.executable
+    if requested == "" { requested = request.arguments[0] }
+    let executable = locate(requested, cwd, effective)
+    let toolHash = ""
+    if executable != "" && isFile(executable) { toolHash = toolDigest(evidence, executable) }
+    let recorded: List<Text> = []
+    for entry in effective {
+        let name = entryName(entry)
+        let keep = starts(name, "MINYAR_") || name == "ASAN_OPTIONS" || name == "UBSAN_OPTIONS" || name == "MSYS2_ARG_CONV_EXCL"
+        if !keep && !request.inherit {
+            let index = lookup(current, name)
+            keep = index < 0 || current[index] != entry
+        }
+        if keep { recorded.add(entry) }
+    }
+    let removed: List<Text> = []
+    if !request.inherit && effective.length > 0 {
+        for entry in current { if lookup(effective, entryName(entry)) < 0 { removed.add(entryName(entry)) } }
+        removed.sort()
+    }
+    let input = Bytes()
+    if mode == "input" { input = request.input }
+    let row = Row { command: request.arguments; cwd: cwd; timeout: request.timeout; phase: request.phase;
+        stdoutCaptured: request.captureOutput; stderrCaptured: request.captureErrors; stdinMode: mode; stdinInput: input;
+        stdinPath: stdinPath; stdinOffset: request.stdinOffset; stdinSha256: stdinSha; executable: executable;
+        executableSha256: toolHash; emptyEnvironment: !request.inherit && effective.length == 0; environment: recorded;
+        removedEnvironment: removed; timedOut: false; terminationError: ""; finished: false; returncode: 0;
+        stdout: Bytes(); stderr: Bytes(); exception: ""; elapsed: 0.0 }
+    evidence.rows.add(row)
+    let directory = scratch(evidence)
+    evidence.serial += 1
+    let prefix = directory + "/" + Text(evidence.serial)
+    let outputPath = ""
+    let errorPath = ""
+    if request.captureOutput { outputPath = prefix + ".out" }
+    if request.captureErrors { errorPath = prefix + ".err" }
+    let stdinKind = 0
+    let launchInput = ""
+    let offset = 0
+    if mode == "input" { launchInput = prefix + ".in"; writeBytesFile(launchInput, input); stdinKind = 1 }
+    if mode == "inherited" { stdinKind = 2 }
+    if mode == "file" || mode == "stream" { launchInput = stdinPath; offset = request.stdinOffset; stdinKind = 1 }
+    let program = executable
+    if program == "" || !isFile(program) {
+        program = ""
+        if lastSlash(requested) >= 0 { program = join(cwd, requested) }
+    }
+    let start = system.monotonicNanoseconds()
+    let processId = -2
+    if program != "" { processId = launch(program, pack(request.arguments), pack(effective), cwd, stdinKind, launchInput, offset, outputPath, errorPath) }
+    if launchInput != "" && mode == "input" { files.remove(launchInput) }
+    if processId < 0 {
+        row.exception = "OSError: [Errno " + Text(-processId) + "] " + files.errorText(processId) + ": " + quote(requested)
+        row.elapsed = Float(system.monotonicNanoseconds() - start) / 1000000000.0
+        expect(evidence, false, row.exception)
+    }
+    let limit = Integer(request.timeout * 1000000000.0)
+    let waited = reap(processId, limit)
+    if waited.getInt64(0) == 0 {
+        row.timedOut = true
+        let terminated = terminate(processId, true)
+        if terminated < 0 { row.terminationError = "[Errno " + Text(-terminated) + "] " + files.errorText(terminated) }
+        waited = reap(processId, 10000000000)
+        if waited.getInt64(0) == 0 {
+            terminate(processId, false)
+            waited = reap(processId, -1)
+        }
+    }
+    row.elapsed = Float(system.monotonicNanoseconds() - start) / 1000000000.0
+    let state = waited.getInt64(0)
+    if state == 3 { row.exception = "ChildProcessError: [Errno " + Text(waited.getInt64(8)) + "]"; expect(evidence, false, row.exception) }
+    let code = waited.getInt64(8)
+    if state == 2 { code = -code }
+    row.returncode = code
+    row.stdout = captured(outputPath)
+    row.stderr = captured(errorPath)
+    row.finished = true
+    let outcome = Outcome { status: code; stdout: row.stdout; stderr: row.stderr; timedOut: row.timedOut; error: "" }
+    if row.timedOut {
+        row.exception = "TimeoutExpired: Command '" + pythonList(request.arguments) + "' timed out after " + seconds(request.timeout) + " seconds"
+        outcome.error = row.exception
+        if !request.allowTimeout { expect(evidence, false, row.exception) }
+        return outcome
+    }
+    if request.check && code != 0 {
+        row.exception = "CalledProcessError: Command '" + pythonList(request.arguments) + "' returned non-zero exit status " + Text(code) + "."
+        outcome.error = row.exception
+        expect(evidence, false, row.exception + "\n" + Text(row.stderr))
+    }
+    return outcome
+}
+
+function renderStdin(row: Row, indent: Text): Text {
+    if row.stdinMode == "input" { return renderObject(["mode", "base64"], [quote("input"), quote(base64(row.stdinInput))], indent) }
+    if row.stdinMode == "file" {
+        return renderObject(["mode", "path", "offset", "sha256"], [quote("file"), quote(row.stdinPath), Text(row.stdinOffset), quote(row.stdinSha256)], indent)
+    }
+    return renderObject(["mode"], [quote(row.stdinMode)], indent)
+}
+function renderRow(row: Row, indent: Text): Text {
+    let inner = indent + "  "
+    let environmentNames: List<Text> = []
+    let environmentValues: List<Text> = []
+    for entry in row.environment { environmentNames.add(entryName(entry)); environmentValues.add(quote(entryValue(entry))) }
+    let keys = ["command", "cwd", "timeout", "phase", "stdout_captured", "stderr_captured", "stdin", "executable",
+        "executable_sha256", "empty_environment", "environment", "removed_environment", "timed_out"]
+    let values = [renderStrings(row.command, inner), quote(row.cwd), seconds(row.timeout), quote(row.phase),
+        boolean(row.stdoutCaptured), boolean(row.stderrCaptured), renderStdin(row, inner), nullable(row.executable),
+        nullable(row.executableSha256), boolean(row.emptyEnvironment), renderObject(environmentNames, environmentValues, inner),
+        renderStrings(row.removedEnvironment, inner), boolean(row.timedOut)]
+    if row.terminationError != "" { keys.add("tree_termination_error"); values.add(quote(row.terminationError)) }
+    if row.finished {
+        keys.add("returncode"); values.add(Text(row.returncode))
+        keys.add("stdout_base64"); values.add(quote(base64(row.stdout)))
+        keys.add("stderr_base64"); values.add(quote(base64(row.stderr)))
+    }
+    if row.exception != "" { keys.add("exception"); values.add(quote(row.exception)) }
+    keys.add("elapsed_seconds"); values.add(Text(row.elapsed))
+    return renderObject(keys, values, indent)
+}
+function retained(directory: Text, relative: Text, names: List<Text>, hashes: List<Text>) {
+    for name in files.list(directory) {
+        let path = directory + "/" + name
+        let item = name
+        if relative != "" { item = relative + "/" + name }
+        let found = status(path, false)
+        if found.kind == 2 { retained(path, item, names, hashes) }
+        else if found.kind == 1 { names.add(item); hashes.add(quote(digest(path))) }
+    }
+}
+function versioned(path: Text): Boolean {
+    let name = Text(Bytes(path).slice(lastSlash(path) + 1, Bytes(path).length))
+    if ends(name, ".exe") { name = Text(Bytes(name).slice(0, Bytes(name).length - 4)) }
+    for prefix in ["clang++", "clang", "opt", "FileCheck", "python"] {
+        if starts(name, prefix) {
+            let rest = Bytes(name).slice(Bytes(prefix).length, Bytes(name).length)
+            let valid = true
+            for byte in rest { if byte != 45 && byte != 46 && (byte < 48 || byte > 57) { valid = false } }
+            if valid { return true }
+        }
+    }
+    return false
+}
+function version(evidence: Evidence, executable: Text): Text {
+    let directory = scratch(evidence)
+    let output = directory + "/version.out"
+    let errors = directory + "/version.err"
+    let processId = launch(executable, pack([executable, "--version"]), pack(system.environment()), "", 0, "", 0, output, errors)
+    if processId < 0 { return "[Errno " + Text(-processId) + "] " + files.errorText(processId) + ": " + quote(executable) }
+    let waited = reap(processId, 5000000000)
+    if waited.getInt64(0) == 0 {
+        terminate(processId, true)
+        reap(processId, -1)
+        captured(output)
+        captured(errors)
+        return "Command '" + pythonList([executable, "--version"]) + "' timed out after 5 seconds"
+    }
+    return Text(captured(output)) + Text(captured(errors))
+}
+function removeTree(path: Text) {
+    for name in files.list(path) {
+        let item = path + "/" + name
+        if status(item, false).kind == 2 { removeTree(item) }
+        else if files.remove(item) != 0 { fail("cannot remove " + item) }
+    }
+    if files.removeDirectory(path) != 0 { fail("cannot remove directory " + path) }
+}
+public function close(evidence: Evidence, failed: Boolean) {
+    if evidence.closed { return }
+    evidence.closed = true
+    if !failed {
+        removeTree(evidence.path)
+        if status(evidence.path + ".io", false).kind == 2 { removeTree(evidence.path + ".io") }
+        return
+    }
+    let fileNames: List<Text> = []
+    let fileHashes: List<Text> = []
+    retained(evidence.path, "", fileNames, fileHashes)
+    let toolNames: List<Text> = []
+    let toolHashes: List<Text> = []
+    for row in evidence.rows {
+        if row.executable != "" && row.executableSha256 != "" {
+            let index = -1
+            for position in 0..toolNames.length { if toolNames[position] == row.executable { index = position } }
+            if index < 0 { toolNames.add(row.executable); toolHashes.add(quote(row.executableSha256)) }
+            else { toolHashes[index] = quote(row.executableSha256) }
+        }
+    }
+    let versionNames: List<Text> = []
+    let versionValues: List<Text> = []
+    for tool in toolNames {
+        if versioned(tool) { versionNames.add(tool); versionValues.add(quote(version(evidence, tool))) }
+    }
+    let inputHashes: List<Text> = []
+    for hash in evidence.inputDigests { inputHashes.add(quote(hash)) }
+    let controlNames: List<Text> = []
+    let controlValues: List<Text> = []
+    for item in evidence.controls {
+        controlNames.add(item.name)
+        if item.listed {
+            let rendered: List<Text> = []
+            for value in item.items { rendered.add(renderJson(value, "      ")) }
+            controlValues.add(renderArray(rendered, "    "))
+        } else { controlValues.add(renderJson(item.value, "    ")) }
+    }
+    let rows: List<Text> = []
+    for row in evidence.rows { rows.add(renderRow(row, "    ")) }
+    let report = renderObject(["schema_version", "status", "workspace", "inputs", "files", "tools", "tool_versions", "controls", "commands"],
+        ["1", quote("failed"), quote(evidence.path), renderObject(evidence.inputPaths, inputHashes, "  "),
+        renderObject(fileNames, fileHashes, "  "), renderObject(toolNames, toolHashes, "  "),
+        renderObject(versionNames, versionValues, "  "), renderObject(controlNames, controlValues, "  "), renderArray(rows, "  ")], "")
+    writeTextFile(evidence.path + "/evidence.json", report + "\n")
+    if status(evidence.path + ".io", false).kind == 2 { removeTree(evidence.path + ".io") }
+    system.writeStandardError("Test failure evidence retained: " + evidence.path + "\n")
+}
+
+public function selectReference(evidence: Evidence, path: Text, size: Text, endian: Text, platformName: Text): Text {
+    let original = resolve(path)
+    if endian == "" { endian = byteOrder() }
+    if platformName == "" { platformName = platform() }
+    let variants: List<Text> = []
+    if size != "" { variants.add(endian + "-endian." + size); variants.add(size) }
+    variants.add(endian + "-endian")
+    variants.add(platformName)
+    variants.add("default")
+    for variant in variants {
+        let selected = original
+        if variant != "default" { selected = original + "." + variant }
+        if isFile(selected) {
+            let hash = recordInput(evidence, selected)
+            appendControl(evidence, "output_references", renderObject(["default", "selected", "variant", "byte_order", "system", "size", "sha256"],
+                [quote(original), quote(selected), quote(variant), quote(endian), quote(platformName), nullable(size), quote(hash)], ""))
+            return selected
+        }
+    }
+    return ""
+}
+public function referenceOutput(evidence: Evidence, path: Text, size: Text, endian: Text, platformName: Text): Bytes {
+    let selected = selectReference(evidence, path, size, endian, platformName)
+    expect(evidence, selected != "", "No expected-output reference for " + resolve(path))
+    return readBytesFile(selected)
+}
+
+function replayFailure(message: Text): Replay { return Replay { error: message; status: 1; stdout: Bytes(); stderr: Bytes() } }
+function strings(value: json.Value): List<Text> {
+    let result: List<Text> = []
+    for item in value.items { result.add(item.text) }
+    return result
+}
+public function replay(manifest: Text, index: Integer): Replay {
+    let data = json.parse(readTextFile(manifest))
+    if data.kind != json.OBJECT { return replayFailure("Replay manifest is invalid: " + manifest) }
+    for group in ["inputs", "tools"] {
+        let section = json.member(data, group)
+        for position in 0..section.keys.length {
+            let path = section.keys[position]
+            if !isFile(path) || digest(path) != section.items[position].text { return replayFailure("Replay input changed: " + path) }
+        }
+    }
+    let workspace = json.string(data, "workspace")
+    let retainedFiles = json.member(data, "files")
+    for position in 0..retainedFiles.keys.length {
+        let source = workspace + "/" + retainedFiles.keys[position]
+        if !isFile(source) || digest(source) != retainedFiles.items[position].text { return replayFailure("Replay artifact changed: " + source) }
+    }
+    let commands = json.member(data, "commands")
+    let selected = index
+    if selected < 0 { selected += commands.items.length }
+    if selected < 0 || selected >= commands.items.length { return replayFailure("Replay command index out of range: " + Text(index)) }
+    let row = commands.items[selected]
+    if !json.member(row, "stdout_captured").truth || !json.member(row, "stderr_captured").truth {
+        return replayFailure("Replay of redirected streams requires the original test scenario")
+    }
+    let stdin = json.member(row, "stdin")
+    let mode = "unrecorded"
+    if stdin.kind == json.OBJECT { mode = json.string(stdin, "mode") }
+    if mode != "eof" && mode != "input" && mode != "file" { return replayFailure("Replay stdin requires the original test scenario: " + mode) }
+    let executable = json.member(row, "executable")
+    if executable.kind == json.STRING && (!isFile(executable.text) || digest(executable.text) != json.string(row, "executable_sha256")) {
+        return replayFailure("Replay command executable changed: " + executable.text)
+    }
+    let environment: List<Text> = []
+    if !json.member(row, "empty_environment").truth {
+        let removed = strings(json.member(row, "removed_environment"))
+        for entry in system.environment() {
+            let name = entryName(entry)
+            let drop = starts(name, "MINYAR_") || name == "ASAN_OPTIONS" || name == "UBSAN_OPTIONS"
+            for item in removed { if item == name { drop = true } }
+            if !drop { environment.add(entry) }
+        }
+    }
+    let recorded = json.member(row, "environment")
+    for position in 0..recorded.keys.length {
+        environment = setVariable(environment, recorded.keys[position], recorded.items[position].text)
+    }
+    let request = command(strings(json.member(row, "command")), json.member(row, "timeout").number)
+    request.cwd = json.string(row, "cwd")
+    request.inherit = false
+    request.environment = environment
+    if executable.kind == json.STRING { request.executable = executable.text }
+    if mode == "eof" { request.stdin = "eof" }
+    if mode == "input" {
+        let decoded = unbase64(json.string(stdin, "base64"))
+        if !decoded.valid { return replayFailure("Replay stdin base64 is invalid") }
+        request.stdin = "input"
+        request.input = decoded.bytes
+    }
+    if mode == "file" {
+        let path = json.string(stdin, "path")
+        if !isFile(path) || digest(path) != json.string(stdin, "sha256") { return replayFailure("Replay stdin changed: " + path) }
+        request.stdin = "file"
+        request.stdinPath = path
+        request.stdinOffset = Integer(json.member(stdin, "offset").number)
+    }
+    let evidence = open("replay", [])
+    control(evidence, "source_manifest", quote(manifest))
+    control(evidence, "command_index", Text(index))
+    let outcome = run(evidence, request)
+    close(evidence, false)
+    return Replay { error: ""; status: outcome.status; stdout: outcome.stdout; stderr: outcome.stderr }
+}
