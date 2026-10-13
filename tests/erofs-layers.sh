@@ -15,6 +15,12 @@ MINYAR_CLANG="$clang" './minyar' 'tests/erofs-layer-driver.min' -o "$work/writer
 tar --format=pax --xattrs --acls --numeric-owner --owner=70000 --group=80000 -cf "$work/base.tar" -C "$work/source" .
 "$work/fixtures" "$work"
 test ! -e "$work/invalid.erofs"
+"$work/writer" none "$work/unicode.erofs" "$work/unicode.tar"
+"$fsck" --extract="$work/unicode" --no-preserve-owner "$work/unicode.erofs"
+printf '%s' unicode-cert > "$work/unicode.expected"
+cmp "$work/unicode.expected" "$work/unicode/Főtanúsítvány.pem"
+test "$(readlink "$work/unicode/unicode-link")" = 'Főtanúsítvány.pem'
+test "$(stat -c %i "$work/unicode/Főtanúsítvány.pem")" = "$(stat -c %i "$work/unicode/unicode-hard")"
 for kind in worker helper legacy legacy-helper; do
     if './build/minyarc' "tests/erofs-layers-thread-$kind.min" "$work/$kind.ll" --library "$PWD/library" > "$work/$kind.log" 2>&1; then cat "$work/$kind.log"; exit 1; fi
     grep -F "native 'minyar_erofs_layersStatus' 8(8,2,1,1,1)" "$work/$kind.log"
