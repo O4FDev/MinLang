@@ -1,0 +1,116 @@
+use "./study-support.min" as support
+use "./measurement-stats.min" as stats
+use "../../tests/cpython-random.min" as random
+use "json" as json
+record Oracle { result: Integer; values: List<Integer> }
+function oracle(kind: Text, count: Integer, seed: Integer): Oracle {
+    let state = seed; let total = 0; let values: List<Integer> = []
+    for value in 0..257 { values.add(value) }
+    for unused in 0..count {
+        state = (state * 17 + 23) % 1000003
+        if kind == "book" {
+            let index = state % values.length
+            values[index] = state
+            total = (total + values[index]) % 1000003
+        } else { total = (total + state) % 1000003 }
+    }
+    return Oracle { result: total; values: values }
+}
+function oracleJSON(expected: Oracle): json.Value {
+    return support.object(["result", "values"], [support.integer(expected.result), support.integerArray(expected.values)])
+}
+function checkResult(context: support.Context, row: json.Value, expected: json.Value, label: Text) {
+    support.expect(context, support.number(row, "result") == support.number(expected, "result"), "independent critical result oracle " + label)
+    let actual = json.member(row, "values"); let values = json.member(expected, "values")
+    support.expect(context, actual.kind == json.ARRAY && values.kind == json.ARRAY && actual.items.length == 257 && values.items.length == 257, "full critical storage oracle " + label)
+    for index in 0..257 {
+        support.expect(context, actual.items[index].kind == json.NUMBER && values.items[index].kind == json.NUMBER && Integer(actual.items[index].text) == Integer(values.items[index].text), "critical prepared storage position " + Text(index) + " " + label)
+    }
+}
+function cpuValues(rows: List<json.Value>): List<Integer> {
+    let result: List<Integer> = []
+    for row in rows { result.add(support.number(row, "cpu_ns")) }
+    return result
+}
+let options = support.options(21, 1000000, "critical-path-study")
+let limitations = [
+    "Only the function is timed; setup and full teardown are outside timing.",
+    "A 257-entry prepared integer List is not a complete trading system.",
+    "No OS isolation, hard deadline, physical memory residency or embedded ABI is proved.",
+    "C++ arithmetic and indexing retain corresponding overflow/bounds checks.",
+    "Bootstrap intervals resample observed pairs as independent; host trends require separate analysis."
+]
+let context = support.begin(options, "critical-path", limitations)
+let kinds = ["arithmetic", "book", "records"]
+if !context.prepared {
+    support.prepare(context, ["criticalArithmetic", "criticalBook", "criticalRecords"])
+    if options.measure { for kind in kinds { support.set(context.expected, kind, oracleJSON(oracle(kind, options.count, 271828))) } }
+    else {
+        let counts = [0, 1, 257, 1027]; let seeds = [0, 1000002, 1, 999983]
+        let generator = random.seeded("9102026")
+        for unused in 0..4 { counts.add(2 + random.below(generator, 1498)); seeds.add(random.below(generator, 1000003)) }
+        let cases: List<json.Value> = []
+        for kind in kinds {
+            for index in 0..counts.length {
+                let expected = oracleJSON(oracle(kind, counts[index], seeds[index]))
+                support.set(expected, "kind", support.text(kind)); support.set(expected, "index", support.integer(index)); support.set(expected, "count", support.integer(counts[index])); support.set(expected, "seed", support.integer(seeds[index]))
+                cases.add(expected)
+            }
+        }
+        support.expect(context, counts.length == 8 && cases.length == 24, "all original seeded critical path cases")
+        support.set(context.expected, "cases", support.array(cases))
+    }
+    support.finishPreparation(context)
+    exit(0)
+}
+let configurations = json.member(context.report, "configurations")
+if options.measure {
+    for name in context.executables.keys {
+        let entries = support.object([], [])
+        support.set(configurations, name, entries)
+        for kind in kinds {
+            let minyar: List<json.Value> = []; let cpp: List<json.Value> = []
+            let samples = support.object(["cpp", "minyar"], [support.array(cpp), support.array(minyar)])
+            let warmup = support.object([], [])
+            support.set(entries, kind, support.object(["samples", "warmup_samples"], [samples, warmup]))
+            let expected = json.member(context.expected, kind)
+            for index in 0..(options.samples + 1) {
+                let languages = ["minyar", "cpp"]
+                if index % 2 != 0 { languages = ["cpp", "minyar"] }
+                for language in languages {
+                    let row = support.observe(context, name, kind, language, options.count, 271828, index)
+                    checkResult(context, row, expected, name + " " + kind + " " + language)
+                    if index == 0 { support.set(warmup, language, row) }
+                    else if language == "minyar" { minyar.add(row) }
+                    else { cpp.add(row) }
+                }
+            }
+            support.expect(context, minyar.length == options.samples && cpp.length == options.samples && warmup.keys.length == 2, "retain all critical adjacent sample pairs and warmups")
+            let result = stats.integerSummary(cpuValues(minyar), cpuValues(cpp), stats.DEFAULT_BOOTSTRAP_SEED, stats.DEFAULT_BOOTSTRAP_RESAMPLES)
+            support.expect(context, result.ok, result.error)
+            let paired = stats.summaryJSON(result.summary)
+            support.set(paired, "numerator", support.text("minyar")); support.set(paired, "denominator", support.text("cpp"))
+            let medians = support.object(["cpp", "minyar"], [support.cpuMedian(cpp), support.cpuMedian(minyar)])
+            support.set(entries, kind, support.object(["samples", "warmup_samples", "median_cpu_ns", "paired_cpu_ratio"], [samples, warmup, medians, paired]))
+            print(name + " " + kind + " " + json.pretty(medians, ""))
+        }
+    }
+} else {
+    let cases = json.member(context.expected, "cases")
+    support.expect(context, cases.kind == json.ARRAY && cases.items.length == 24, "complete critical prepared oracle domain")
+    for name in context.executables.keys {
+        let entries: List<json.Value> = []
+        support.set(configurations, name, support.array(entries))
+        for item in cases.items {
+            let kind = json.string(item, "kind"); let count = support.number(item, "count"); let seed = support.number(item, "seed")
+            for language in ["minyar", "cpp"] {
+                let row = support.observe(context, name, kind, language, count, seed, support.number(item, "index"))
+                checkResult(context, row, item, name + " " + kind + " " + language)
+                entries.add(support.object(["kind", "language", "count", "system_operations", "pool_allocations"], [support.text(kind), support.text(language), support.integer(count), json.member(row, "system_operations"), json.member(row, "pool_allocations")]))
+            }
+        }
+        support.expect(context, entries.length == 48, "all critical result/storage/allocator fixture checks")
+        print(name + ": 48 oracle/allocator checks passed")
+    }
+}
+support.finish(context)

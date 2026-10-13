@@ -1,0 +1,118 @@
+use "./study-support.min" as support
+use "./measurement-stats.min" as stats
+use "../../tests/cpython-random.min" as random
+use "json" as json
+function oracle(kind: Text, count: Integer, seed: Integer): Integer {
+    let state = seed; let total = 0
+    for unused in 0..count {
+        if kind == "shift" {
+            let amount = state & 31
+            state = ((state << amount) ^ (state >> (31 - amount))) & 2147483647
+            state = wrappingAdd(state, 17) & 2147483647
+            total = wrappingAdd(total, state)
+        } else {
+            state = (state * 17 + 23) % 1000003
+            if kind == "character" { total = (total + state % 55296) % 1000003 }
+            else if kind == "float" { total = wrappingAdd(total, (state - 500001) / 4) }
+            else {
+                let amplitude = state - 500001
+                if amplitude < 0 { amplitude = -amplitude }
+                if amplitude > 250000 { amplitude = 250000 }
+                total = wrappingAdd(total, amplitude)
+            }
+        }
+    }
+    return total
+}
+function cpuValues(rows: List<json.Value>): List<Integer> {
+    let result: List<Integer> = []
+    for row in rows { result.add(support.number(row, "cpu_ns")) }
+    return result
+}
+let options = support.options(31, 5000000, "checked-scalars-study")
+let limitations = [
+    "Only the selected function is timed; setup and complete teardown are outside timing.",
+    "Workloads exercise shifts, Unicode scalar conversion, Float projection, and amplitude clamping.",
+    "C++ retains corresponding overflow, shift, Unicode, conversion, and clamp checks.",
+    "C++20 bit_cast and unsigned arithmetic define wrapping additions and left shifts.",
+    "Allocation monitors count runtime allocator operations, with an independent live allocation control.",
+    "Bootstrap intervals resample observed pairs as independent; host trends require separate analysis.",
+    "Local measurements do not establish universal performance or hard deadlines."
+]
+let context = support.begin(options, "checked-scalars", limitations)
+let kinds = ["shift", "character", "float", "abs-clamp"]
+if !context.prepared {
+    support.prepare(context, ["checkedScalarShift", "checkedScalarCharacter", "checkedScalarFloat", "checkedScalarAbsClamp"])
+    if options.measure {
+        for kind in kinds { support.set(context.expected, kind, support.integer(oracle(kind, options.count, 271828))) }
+        support.set(context.report, "count", support.integer(options.count))
+        support.set(context.report, "sample_pairs", support.integer(options.samples))
+        support.set(context.report, "seed", support.integer(271828))
+    } else {
+        let counts = [0, 1, 1, 1027]; let seeds = [0, 0, 1000002, 999983]
+        let generator = random.seeded("20261002")
+        for unused in 0..8 { counts.add(1 + random.below(generator, 1499)); seeds.add(random.below(generator, 1000003)) }
+        let cases: List<json.Value> = []
+        for kind in kinds {
+            for index in 0..counts.length {
+                cases.add(support.object(["kind", "index", "count", "seed", "result"], [support.text(kind), support.integer(index), support.integer(counts[index]), support.integer(seeds[index]), support.integer(oracle(kind, counts[index], seeds[index]))]))
+            }
+        }
+        support.expect(context, counts.length == 12 && cases.length == 48, "all original seeded checked scalar cases")
+        support.set(context.expected, "cases", support.array(cases))
+    }
+    support.finishPreparation(context)
+    exit(0)
+}
+let configurations = json.member(context.report, "configurations")
+if options.measure {
+    for name in context.executables.keys {
+        let entries = support.object([], [])
+        support.set(configurations, name, entries)
+        for kind in kinds {
+            let minyar: List<json.Value> = []; let cpp: List<json.Value> = []
+            let samples = support.object(["cpp", "minyar"], [support.array(cpp), support.array(minyar)])
+            let warmup = support.object([], [])
+            support.set(entries, kind, support.object(["samples", "warmup_samples"], [samples, warmup]))
+            let expected = support.number(context.expected, kind)
+            for index in 0..(options.samples + 1) {
+                let languages = ["minyar", "cpp"]
+                if index % 2 != 0 { languages = ["cpp", "minyar"] }
+                for language in languages {
+                    let row = support.observe(context, name, kind, language, options.count, 271828, index)
+                    if index == 0 { support.set(warmup, language, row) }
+                    else if language == "minyar" { minyar.add(row) }
+                    else { cpp.add(row) }
+                    support.expect(context, support.number(row, "result") == expected, "checked scalar independent measurement oracle " + name + " " + kind + " " + language)
+                }
+            }
+            support.expect(context, minyar.length == options.samples && cpp.length == options.samples && warmup.keys.length == 2, "retain all adjacent sample pairs and warmups")
+            let result = stats.integerSummary(cpuValues(minyar), cpuValues(cpp), stats.DEFAULT_BOOTSTRAP_SEED, stats.DEFAULT_BOOTSTRAP_RESAMPLES)
+            support.expect(context, result.ok, result.error)
+            let paired = stats.summaryJSON(result.summary)
+            support.set(paired, "numerator", support.text("minyar")); support.set(paired, "denominator", support.text("cpp"))
+            let medians = support.object(["cpp", "minyar"], [support.cpuMedian(cpp), support.cpuMedian(minyar)])
+            support.set(entries, kind, support.object(["samples", "warmup_samples", "median_cpu_ns", "paired_cpu_ratio"], [samples, warmup, medians, paired]))
+            print(name + " " + kind + " paired ratio " + Text(result.summary.median))
+        }
+    }
+} else {
+    let cases = json.member(context.expected, "cases")
+    support.expect(context, cases.kind == json.ARRAY && cases.items.length == 48, "complete checked scalar prepared oracle domain")
+    for name in context.executables.keys {
+        let entries: List<json.Value> = []
+        support.set(configurations, name, support.array(entries))
+        for item in cases.items {
+            let kind = json.string(item, "kind"); let count = support.number(item, "count"); let seed = support.number(item, "seed")
+            for language in ["minyar", "cpp"] {
+                let row = support.observe(context, name, kind, language, count, seed, support.number(item, "index"))
+                entries.add(support.object(["kind", "language", "count", "seed", "result", "system_operations", "pool_allocations"], [support.text(kind), support.text(language), support.integer(count), support.integer(seed), json.member(row, "result"), json.member(row, "system_operations"), json.member(row, "pool_allocations")]))
+                support.expect(context, support.number(row, "result") == support.number(item, "result"), "checked scalar independent result oracle " + name + " " + kind + " " + language)
+                support.expect(context, support.number(row, "system_operations") == 0 && support.number(row, "pool_allocations") == 0, "checked scalar exact allocator contract " + name + " " + kind + " " + language)
+            }
+        }
+        support.expect(context, entries.length == 96, "all checked scalar oracle/allocation checks")
+        print(name + ": 96 oracle/allocation checks passed")
+    }
+}
+support.finish(context)

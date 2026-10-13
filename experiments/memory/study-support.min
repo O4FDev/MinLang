@@ -1,0 +1,344 @@
+use "../../tools/testing.min" as test
+use "system" as system
+use "files" as files
+use "json" as json
+public function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source); let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+public function ends(source: Text, suffix: Text): Boolean {
+    let raw = Bytes(source); let pattern = Bytes(suffix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[raw.length - pattern.length + index] != pattern[index] { return false } }
+    return true
+}
+public function parent(path: Text): Text {
+    let raw = Bytes(path); let ending = -1
+    for index in 0..raw.length { if raw[index] == 47 { ending = index } }
+    if ending < 0 { return "." }
+    if ending == 0 { return "/" }
+    return Text(raw.slice(0, ending))
+}
+function absolute(path: Text, root: Text): Text { if starts(path, "/") { return path }; return root + "/" + path }
+public function text(value: Text): json.Value { return json.Value { kind: json.STRING; text: value; number: 0.0; truth: false; items: []; keys: [] } }
+public function integer(value: Integer): json.Value { return json.Value { kind: json.NUMBER; text: Text(value); number: Float(value); truth: false; items: []; keys: [] } }
+public function decimal(value: Float): json.Value { return json.Value { kind: json.NUMBER; text: Text(value); number: value; truth: false; items: []; keys: [] } }
+public function boolean(value: Boolean): json.Value { return json.Value { kind: json.BOOLEAN; text: Text(value); number: 0.0; truth: value; items: []; keys: [] } }
+public function nullValue(): json.Value { return json.Value { kind: json.NULL; text: "null"; number: 0.0; truth: false; items: []; keys: [] } }
+public function array(values: List<json.Value>): json.Value { return json.Value { kind: json.ARRAY; text: ""; number: 0.0; truth: false; items: values; keys: [] } }
+public function object(keys: List<Text>, values: List<json.Value>): json.Value {
+    test.check(keys.length == values.length, "study object field count")
+    return json.Value { kind: json.OBJECT; text: ""; number: 0.0; truth: false; items: values; keys: keys }
+}
+public function strings(values: List<Text>): json.Value { let result: List<json.Value> = []; for value in values { result.add(text(value)) }; return array(result) }
+public function integerArray(values: List<Integer>): json.Value { let result: List<json.Value> = []; for value in values { result.add(integer(value)) }; return array(result) }
+public function set(value: json.Value, name: Text, item: json.Value) {
+    for index in 0..value.keys.length { if value.keys[index] == name { value.items[index] = item; return } }
+    value.keys.add(name); value.items.add(item)
+}
+public function number(value: json.Value, name: Text): Integer {
+    let field = json.member(value, name); test.check(field.kind == json.NUMBER, "missing integral study field " + name)
+    return Integer(field.text)
+}
+public record Options { measure: Boolean; samples: Integer; count: Integer; output: Text; cc: Text; cxx: Text; compiler: Text; prepareOnly: Boolean; prepared: Text; samplesSet: Boolean; countSet: Boolean }
+public function options(samples: Integer, count: Integer, study: Text): Options {
+    let result = Options { measure: false; samples: samples; count: count; output: ""; cc: "/usr/lib/llvm-23/bin/clang"; cxx: "/usr/lib/llvm-23/bin/clang++"; compiler: test.setting("MINYAR_TEST_COMPILER", "build/minyarc"); prepareOnly: false; prepared: ""; samplesSet: false; countSet: false }
+    let index = 0
+    while index < argumentCount() {
+        let option = argument(index)
+        if option == "--help" || option == "-h" { print(study + " [--measure] [--samples N] [--count N] [--output PATH] [--cc PATH] [--cxx PATH] [--compiler PATH] --prepare-only | --run-prepared PATH"); exit(0) }
+        if option == "--measure" { result.measure = true }
+        else if option == "--prepare-only" { result.prepareOnly = true }
+        else {
+            let name = option; let value = ""; let equals = -1; let raw = Bytes(option)
+            for position in 0..raw.length { if raw[position] == 61 { equals = position; break } }
+            if equals >= 0 { name = Text(raw.slice(0, equals)); value = Text(raw.slice(equals + 1, raw.length)) }
+            else { index += 1; test.check(index < argumentCount(), "missing value for " + option); value = argument(index) }
+            if name == "--samples" { result.samples = Integer(value); result.samplesSet = true }
+            else if name == "--count" { result.count = Integer(value); result.countSet = true }
+            else if name == "--output" { result.output = value }
+            else if name == "--cc" { result.cc = value }
+            else if name == "--cxx" { result.cxx = value }
+            else if name == "--compiler" { result.compiler = value }
+            else if name == "--run-prepared" { result.prepared = value }
+            else { fail("unknown study option " + name) }
+        }
+        index += 1
+    }
+    test.check(result.samples >= 3 && result.samples <= 101 && result.count > 0 && result.count <= 100000000, "samples must be 3..101 and count must be 1..100000000")
+    test.check(!(result.prepareOnly && result.prepared != ""), "study phase must be singular")
+    test.check(result.prepareOnly || result.prepared != "", "use --prepare-only on minyar-linux and --run-prepared on minyar-bench-2")
+    return result
+}
+public record Context { options: Options; study: Text; work: Text; root: Text; report: json.Value; commands: List<json.Value>; normalizations: List<json.Value>; executables: json.Value; hashes: json.Value; expected: json.Value; prepared: Boolean }
+function query(work: Text, label: Text, command: List<Text>): Text {
+    let result = test.run(command, system.environment(), "", work + "/" + label, 30)
+    test.require(result, "study metadata " + label)
+    return result.output
+}
+public function hash(context: Context, path: Text): Text {
+    let fields = test.words(query(context.work, "sha256", ["sha256sum", "--", path]))
+    test.check(fields.length > 0 && Bytes(fields[0]).length == 64, "study artifact SHA256")
+    return fields[0]
+}
+public function save(context: Context) {
+    let destination = context.options.output
+    if destination == "" { destination = context.work + "/results.json" }
+    test.require(test.run(["mkdir", "-p", "--", parent(destination)], system.environment(), "", context.work + "/report-parent", 30), "study report directory")
+    writeTextFile(destination, json.pretty(context.report, "") + "\n")
+}
+public function expect(context: Context, condition: Boolean, message: Text) {
+    if !condition {
+        set(context.report, "status", text("failed")); set(context.report, "error", object(["type", "message"], [text("AssertionError"), text(message)]))
+        save(context); fail(message)
+    }
+}
+public function invoke(context: Context, label: Text, command: List<Text>, environment: List<Text>): test.Result {
+    let observation = object(["label", "argv", "returncode"], [text(label), strings(command), nullValue()])
+    context.commands.add(observation)
+    let result = test.run(command, environment, "", context.work + "/" + label + ".stdout", 240)
+    writeTextFile(context.work + "/" + label + ".log", result.output + result.errorOutput)
+    set(observation, "returncode", integer(result.status))
+    if result.status != 0 {
+        let type = "RuntimeError"; let message = label + " failed: " + result.output + result.errorOutput
+        if result.status == 124 || result.status == 137 { type = "TimeoutExpired"; set(observation, "error", text("timeout")) }
+        set(context.report, "status", text("failed")); set(context.report, "error", object(["type", "message"], [text(type), text(message)]))
+        save(context); fail(message)
+    }
+    return result
+}
+public function build(context: Context, label: Text, command: List<Text>) { invoke(context, label, command, system.environment()) }
+function rebased(path: Text, before: Text, after: Text): Text {
+    if starts(path, before + "/") { return after + Text(Bytes(path).slice(Bytes(before).length, Bytes(path).length)) }
+    return path
+}
+public function begin(options: Options, study: Text, limitations: List<Text>): Context {
+    let temporary = test.scratch()
+    let root = test.lines(query(temporary, "root", ["pwd", "-P"]))[0]
+    if options.prepared != "" {
+        let manifestPath = absolute(options.prepared, root)
+        let manifest = json.parse(readTextFile(manifestPath))
+        test.check(manifest.kind == json.OBJECT && json.string(manifest, "schema") == "minyar-native-study-v1" && json.string(manifest, "study") == study, "incompatible prepared study")
+        let work = parent(manifestPath)
+        let measure = json.member(manifest, "measure")
+        test.check(measure.kind == json.BOOLEAN, "prepared study mode")
+        if options.measure { test.check(measure.truth, "prepared study is not a measurement cohort") }
+        options.measure = measure.truth
+        let samples = number(manifest, "samples"); let count = number(manifest, "count")
+        if options.samplesSet { test.check(options.samples == samples, "prepared study sample count changed") }
+        if options.countSet { test.check(options.count == count, "prepared study workload count changed") }
+        options.samples = samples; options.count = count
+        let report = json.member(manifest, "report")
+        let commands = json.member(report, "commands"); let normalizations = json.member(report, "native_ir_normalizations")
+        test.check(report.kind == json.OBJECT && commands.kind == json.ARRAY && normalizations.kind == json.ARRAY, "prepared report schema")
+        let executables = json.member(manifest, "executables"); let hashes = json.member(manifest, "binary_sha256")
+        test.check(executables.kind == json.OBJECT && hashes.kind == json.OBJECT, "prepared executable identities")
+        let before = json.string(report, "directory")
+        for index in 0..executables.items.length { executables.items[index] = text(rebased(executables.items[index].text, before, work)) }
+        let context = Context { options: options; study: study; work: work; root: root; report: report; commands: commands.items; normalizations: normalizations.items; executables: executables; hashes: hashes; expected: json.member(manifest, "expected"); prepared: true }
+        let hostname = test.lines(query(work, "execution-host", ["hostname"]))[0]
+        expect(context, hostname == "5xnqjvps.vm", "prebuilt study peer runs require quiet exclusive minyar-bench-2")
+        for index in 0..executables.keys.length { expect(context, hash(context, executables.items[index].text) == json.string(hashes, executables.keys[index]), "prepared executable checksum " + executables.keys[index]) }
+        let llvmHash = json.string(manifest, "fixture_sha256")
+        expect(context, llvmHash != "" && hash(context, work + "/fixture.ll") == llvmHash, "prepared generated LLVM identity")
+        set(report, "directory", text(work)); set(report, "status", text("running"))
+        test.removeTree(temporary)
+        return context
+    }
+    let hostname = test.lines(query(temporary, "preparation-host", ["hostname"]))[0]
+    test.check(hostname == "seipnxmg.vm", "study preparation requires minyar-linux")
+    options.compiler = absolute(options.compiler, root)
+    let commands: List<json.Value> = []; let normalizations: List<json.Value> = []
+    let mode = "correctness"; if options.measure { mode = "measurement" }
+    let report = object(["directory", "mode", "compiler_executable", "compiler_sha256", "source_sha256", "commands", "native_ir_normalizations", "configurations", "limitations", "status"], [text(temporary), text(mode), text(options.compiler), nullValue(), object([], []), array(commands), array(normalizations), object([], []), strings(limitations), text("running")])
+    let context = Context { options: options; study: study; work: temporary; root: root; report: report; commands: commands; normalizations: normalizations; executables: object([], []); hashes: object([], []); expected: object([], []); prepared: false }
+    let ccVersion = query(temporary, "cc-version", [options.cc, "--version"]); let cxxVersion = query(temporary, "cxx-version", [options.cxx, "--version"])
+    expect(context, test.contains(ccVersion, "clang version 23.") && test.contains(cxxVersion, "clang version 23."), "Minyar supports exactly LLVM23")
+    let linker = "/usr/lib/llvm-23/bin/ld.lld"
+    let linkerVersion = query(temporary, "linker-version", [linker, "--version"])
+    expect(context, test.contains(linkerVersion, "LLD 23."), "LLVM23 linker required")
+    set(report, "toolchain", object(["cc", "cxx", "linker", "cc_version", "cxx_version", "linker_version", "linker_threads"], [text(options.cc), text(options.cxx), text(linker), text(ccVersion), text(cxxVersion), text(linkerVersion), integer(1)]))
+    set(report, "compiler_sha256", text(hash(context, options.compiler)))
+    let sources = ["compiler/compiler.min", "runtime/minyar_runtime.c", "experiments/memory/" + study + ".min", "experiments/memory/" + study + "-driver.c", "experiments/memory/" + study + "-cpp.cpp", "experiments/memory/" + study + "-study.min", "experiments/memory/measurement-stats.min", "experiments/memory/study-support.min", "tests/cpython-random.min", "tests/llvm_symbols.h", "tools/testing.min"]
+    let headers = files.list(root + "/runtime"); test.check(files.lastError() == 0, "study runtime headers"); headers.sort()
+    for name in headers { if ends(name, ".h") { sources.add("runtime/" + name) } }
+    let sourceHashes = json.member(report, "source_sha256")
+    for path in sources { set(sourceHashes, path, text(hash(context, root + "/" + path))) }
+    let compilerSource = test.setting("MINYAR_TEST_COMPILER_SOURCE", "build/compiler.min")
+    set(sourceHashes, compilerSource, text(hash(context, absolute(compilerSource, root))))
+    if study == "checked-scalars" { set(report, "allocation_monitoring", boolean(!options.measure)); set(report, "generated_llvm_sha256", nullValue()) }
+    print(temporary)
+    return context
+}
+function at(raw: Bytes, pattern: Bytes, position: Integer): Boolean {
+    if position + pattern.length > raw.length { return false }
+    for index in 0..pattern.length { if raw[position + index] != pattern[index] { return false } }
+    return true
+}
+function stripAttributes(source: Text): Text {
+    let raw = Bytes(source)
+    let patterns = [Bytes("\"target-cpu\"=\""), Bytes("\"target-features\"=\""), Bytes("\"tune-cpu\"=\"")]
+    let position = 0; let cursor = 0; let pieces: List<Text> = []
+    while position < raw.length {
+        let skipped = false
+        if raw[position] == 34 {
+            for pattern in patterns {
+                if at(raw, pattern, position) {
+                    let ending = position + pattern.length
+                    while ending < raw.length && raw[ending] != 34 { ending += 1 }
+                    test.check(ending < raw.length, "unterminated native target attribute")
+                    ending += 1; if ending < raw.length && raw[ending] == 32 { ending += 1 }
+                    pieces.add(Text(raw.slice(cursor, position))); cursor = ending; position = ending; skipped = true; break
+                }
+            }
+        }
+        if !skipped { position += 1 }
+    }
+    pieces.add(Text(raw.slice(cursor, raw.length)))
+    return joinText(pieces)
+}
+function nameByte(byte: Integer): Boolean { return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 95 }
+function normalize(context: Context, path: Text, expected: List<Text>) {
+    let before = readTextFile(path)
+    let rawPath = Bytes(path); let beforePath = Text(rawPath.slice(0, rawPath.length - 3)) + ".before-normalization.ll"
+    writeTextFile(beforePath, before)
+    let raw = Bytes(stripAttributes(before)); let prefix = Bytes("@\"\\01"); let symbol = Bytes(".minyar.fn.")
+    let cursor = 0; let position = 0; let pieces: List<Text> = []; let aliases: List<Text> = []; let replaced = 0
+    while position < raw.length {
+        let matched = false
+        if raw[position] == 64 && at(raw, prefix, position) {
+            let start = position + prefix.length
+            if start < raw.length && raw[start] == 95 { start += 1 }
+            if at(raw, symbol, start) {
+                let nameStart = start + symbol.length; let ending = nameStart
+                while ending < raw.length && nameByte(raw[ending]) { ending += 1 }
+                if ending > nameStart && ending < raw.length && raw[ending] == 34 {
+                    aliases.add(Text(raw.slice(nameStart, ending)))
+                    pieces.add(Text(raw.slice(cursor, position))); pieces.add("@" + Text(raw.slice(start, ending)))
+                    position = ending + 1; cursor = position; replaced += 1; matched = true
+                }
+            }
+        }
+        if !matched { position += 1 }
+    }
+    pieces.add(Text(raw.slice(cursor, raw.length)))
+    let seen: List<Integer> = []; for unused in expected { seen.add(0) }
+    for name in aliases {
+        let found = -1; for index in 0..expected.length { if expected[index] == name { found = index } }
+        expect(context, found >= 0, "unexpected native C asm language alias " + name)
+        seen[found] += 1
+    }
+    for occurrences in seen { expect(context, occurrences > 0, "missing expected native language alias") }
+    expect(context, replaced == aliases.length, "native alias replacement count")
+    writeTextFile(path, joinText(pieces))
+    let names = expected.sorted()
+    context.normalizations.add(object(["before", "after", "before_sha256", "after_sha256", "alias_replacements", "alias_names", "method"], [text(beforePath), text(path), text(hash(context, beforePath)), text(hash(context, path)), integer(replaced), strings(names), text("Remove generic target attributes and canonicalize only C asm language aliases for LLVM LTO resolution.")]))
+}
+function functionBody(source: Text, name: Text): Text {
+    let found = false; let pieces: List<Text> = []
+    for line in test.lines(source) {
+        if !found && starts(line, "define ") && test.contains(line, "@.minyar.fn." + name + "(") { found = true; pieces.add(line + "\n") }
+        else if found { pieces.add(line); if line == "}" { return joinText(pieces) }; pieces.add("\n") }
+    }
+    return ""
+}
+public record Configuration { name: Text; optimization: Text; bounded: Boolean; lto: Boolean }
+public function prepare(context: Context, functions: List<Text>) {
+    let options = context.options; let fixture = context.root + "/experiments/memory/" + context.study
+    let ir = context.work + "/fixture.ll"
+    build(context, "compile-fixture", [options.compiler, fixture + ".min", ir])
+    let source = readTextFile(ir)
+    if context.study == "checked-scalars" { set(context.report, "generated_llvm_sha256", text(hash(context, ir))) }
+    for name in functions {
+        if !(context.study == "critical-path" && options.measure && name == "criticalRecords") {
+            let body = functionBody(source, name)
+            expect(context, body != "" && !test.contains(body, "@minyar_rc_"), "critical scalar LLVM must omit RC " + name)
+        }
+    }
+    if context.study == "checked-scalars" { expect(context, test.contains(source, "@minyar_checked_scalars_runScalarStudy("), "ordinary generated entry must use native package ABI") }
+    else {
+        let raw = Bytes(source); let marker = Bytes("@main("); let replacements = 0
+        for index in 0..raw.length { if at(raw, marker, index) { replacements += 1 } }
+        expect(context, replacements == 1, "critical fixture main rename must occur exactly once")
+        writeTextFile(ir, test.replace(source, "@main(", "@fixtureMain("))
+    }
+    let configurations: List<Configuration> = []
+    if options.measure {
+        configurations = [Configuration { name: "system"; optimization: "-O2"; bounded: false; lto: false }, Configuration { name: "system-lto"; optimization: "-O2"; bounded: false; lto: true }, Configuration { name: "eager"; optimization: "-O2"; bounded: false; lto: false }, Configuration { name: "eager-lto"; optimization: "-O2"; bounded: false; lto: true }, Configuration { name: "bounded-lto"; optimization: "-O2"; bounded: true; lto: true }]
+    } else {
+        if context.study == "checked-scalars" { configurations.add(Configuration { name: "system-o2"; optimization: "-O2"; bounded: false; lto: false }) }
+        for name in ["eager-o0", "eager-o2", "bounded-o2", "eager-sanitize", "bounded-sanitize"] {
+            let optimization = "-O2"; if name == "eager-o0" { optimization = "-O0" }; if ends(name, "sanitize") { optimization = "-O1" }
+            configurations.add(Configuration { name: name; optimization: optimization; bounded: starts(name, "bounded"); lto: false })
+        }
+    }
+    for configuration in configurations {
+        let flags = [configuration.optimization, "-Wno-override-module"]
+        if ends(configuration.name, "sanitize") { for flag in ["-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"] { flags.add(flag) } }
+        let linkIR = ir
+        if ends(configuration.name, "sanitize") { linkIR = context.work + "/" + configuration.name + "-fixture.ll"; writeTextFile(linkIR, test.instrument(readTextFile(ir))) }
+        let defines: List<Text> = []
+        if configuration.bounded { defines.add("-DMINYAR_BOUNDED_HEAP=1") }
+        if starts(configuration.name, "system") { defines.add("-DMINYAR_SYSTEM_HEAP=1") }
+        if !options.measure { if context.study == "checked-scalars" { defines.add("-DMINYAR_SCALAR_ACCOUNTING=1") } else { defines.add("-DMINYAR_CRITICAL_ACCOUNTING=1") } }
+        let objects: List<Text> = []
+        for language in ["driver", "cpp"] {
+            let compiler = options.cc; let extension = ".c"; if language == "cpp" { compiler = options.cxx; extension = ".cpp" }
+            let nativeSource = fixture + "-" + language + extension
+            let destination = context.work + "/" + configuration.name + "-" + language + ".o"
+            let command = [compiler]; for flag in flags { command.add(flag) }
+            if context.study == "checked-scalars" && language == "cpp" { command.add("-std=c++20") }
+            if configuration.lto || context.study == "checked-scalars" || language == "driver" { for define in defines { command.add(define) } }
+            let label = configuration.name + "-" + context.study + "-" + language
+            if configuration.lto {
+                let nativeIR = context.work + "/" + configuration.name + "-" + language + ".ll"
+                for item in ["-S", "-emit-llvm", nativeSource, "-o", nativeIR] { command.add(item) }
+                build(context, label + "-ir", command)
+                let expected: List<Text> = []; if language == "driver" { expected = functions }
+                normalize(context, nativeIR, expected)
+                let objectCommand = [compiler]; for flag in flags { objectCommand.add(flag) }; for item in ["-flto", "-c", nativeIR, "-o", destination] { objectCommand.add(item) }
+                build(context, label + "-object", objectCommand)
+            } else {
+                for item in ["-c", nativeSource, "-o", destination] { command.add(item) }
+                if context.study == "critical-path" { label = configuration.name + "-" + language; build(context, label, command) }
+                else { build(context, label + "-object", command) }
+            }
+            objects.add(destination)
+        }
+        let executable = context.work + "/" + configuration.name
+        let command = [options.cxx]; for flag in flags { command.add(flag) }
+        if configuration.lto { for flag in ["-flto", "--ld-path=/usr/lib/llvm-23/bin/ld.lld", "-Wl,--threads=1"] { command.add(flag) } }
+        command.add(linkIR); for object in objects { command.add(object) }; command.add("-o"); command.add(executable)
+        build(context, configuration.name + "-link", command)
+        set(context.executables, configuration.name, text(executable)); set(context.hashes, configuration.name, text(hash(context, executable)))
+    }
+    let count = 5; if !options.measure && context.study == "checked-scalars" { count = 6 }
+    expect(context, context.executables.keys.length == count, "complete study configuration matrix")
+}
+public function finishPreparation(context: Context) {
+    set(context.report, "status", text("prepared"))
+    let manifest = object(["schema", "study", "measure", "samples", "count", "report", "executables", "binary_sha256", "fixture_sha256", "expected"], [text("minyar-native-study-v1"), text(context.study), boolean(context.options.measure), integer(context.options.samples), integer(context.options.count), context.report, context.executables, context.hashes, text(hash(context, context.work + "/fixture.ll")), context.expected])
+    writeTextFile(context.work + "/prepared.json", json.pretty(manifest, "") + "\n")
+    save(context); print(context.work + "/prepared.json")
+}
+public function observe(context: Context, name: Text, kind: Text, language: Text, count: Integer, seed: Integer, index: Integer): json.Value {
+    expect(context, context.prepared, "peer execution is only available through run-prepared")
+    let environment: List<Text> = []
+    for entry in system.environment() { if !starts(entry, "ASAN_OPTIONS=") { environment.add(entry) } }
+    environment.add("ASAN_OPTIONS=detect_leaks=0")
+    let executable = json.string(context.executables, name)
+    let result = invoke(context, name + "-" + kind + "-" + language + "-" + Text(index), [executable, language, kind, Text(count), Text(seed)], environment)
+    let row = json.parse(result.output)
+    expect(context, row.kind == json.OBJECT, "peer must return its complete raw JSON observation")
+    return row
+}
+public function cpuMedian(rows: List<json.Value>): json.Value {
+    let values: List<Integer> = []
+    for row in rows { values.add(number(row, "cpu_ns")) }
+    values.sort(); let middle = values.length / 2
+    if values.length % 2 != 0 { return integer(values[middle]) }
+    return decimal((Float(values[middle - 1]) + Float(values[middle])) / 2.0)
+}
+public function finish(context: Context) { set(context.report, "status", text("passed")); save(context); let path = context.options.output; if path == "" { path = context.work + "/results.json" }; print(path) }
