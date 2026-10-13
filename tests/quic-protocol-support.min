@@ -1,0 +1,188 @@
+use "../tools/testing.min" as test
+use "./quic-test-support.min" as quic
+use "system" as system
+use "files" as files
+
+public record Artifacts { root: Text; label: Text; path: Text; workspace: Text; scratch: Text; inputs: Text; declared: List<Text>; ledger: quic.Evidence; shared: List<Text>; passed: Boolean; environment: List<Text> }
+
+public function absolute(path: Text, root: Text): Text {
+    if quic.starts(path, "/") { return path }
+    return root + "/" + path
+}
+public function open(label: Text, requested: Text, inputs: List<Text>, declared: List<Text>): Artifacts {
+    let root = quic.root()
+    let paths: List<Text> = []
+    for input in inputs { paths.add(absolute(input, root)) }
+    if requested == "" {
+        let scratch = test.scratch()
+        let digests = quic.fileDigests(paths, scratch + "/.inputs")
+        return Artifacts { root: root; label: label; path: ""; workspace: scratch; scratch: scratch; inputs: quic.digestObject(digests); declared: declared;
+            ledger: quic.unrecorded(scratch); shared: []; passed: false; environment: system.environment() }
+    }
+    test.check(quic.starts(requested, "/") && files.pathSize(requested) < 0, "--artifacts requires a fresh absolute path")
+    test.check(files.makeDirectory(requested) == 0, "cannot create protocol artifacts")
+    test.check(files.makeDirectory(requested + "/fixtures") == 0, "cannot create protocol fixture workspace")
+    let scratch = test.scratch()
+    let digests = quic.fileDigests(paths, scratch + "/.inputs")
+    return Artifacts { root: root; label: label; path: requested; workspace: requested + "/fixtures"; scratch: scratch; inputs: quic.digestObject(digests); declared: declared;
+        ledger: quic.evidence(requested); shared: []; passed: false; environment: system.environment() }
+}
+public function authority(owner: Artifacts): quic.Authority { return quic.recorded(owner.workspace, owner.ledger) }
+public function certificatesReady(owner: Artifacts) {
+    let names = files.list(owner.workspace)
+    names.sort()
+    for name in names {
+        if !quic.starts(name, ".") { owner.shared.add(owner.workspace + "/" + name) }
+    }
+}
+public function run(owner: Artifacts, command: List<Text>, limit: Integer, label: Text): test.Result {
+    owner.ledger.label[0] = label
+    let result = quic.observe(owner.ledger, "protocol-case", command, owner.environment, "", limit)
+    owner.ledger.label[0] = ""
+    return result
+}
+function relative(owner: Artifacts, path: Text): Text { return quic.after(path, owner.path + "/") }
+function regular(owner: Artifacts, paths: List<Text>): List<Text> {
+    let found: List<Text> = []
+    for path in paths {
+        let listed = test.run(["find", path, "-type", "f"], owner.environment, "", owner.scratch + "/.find", 30)
+        test.check(files.remove(owner.scratch + "/.find") == 0 && files.remove(owner.scratch + "/.find.err") == 0, "cannot remove inventory log")
+        if listed.status == 0 { for line in test.lines(listed.output) { found.add(relative(owner, line)) } }
+    }
+    return unique(found)
+}
+function unique(values: List<Text>): List<Text> {
+    let sorted = values.sorted()
+    let result: List<Text> = []
+    for value in sorted { if result.length == 0 || result[result.length - 1] != value { result.add(value) } }
+    return result
+}
+public function caseInventory(owner: Artifacts): Text {
+    let rows: List<Text> = []
+    for label in owner.declared {
+        let commands: List<Text> = []
+        let raw: List<Text> = []
+        for index in 0..owner.ledger.commands.length {
+            let item = owner.ledger.commands[index]
+            if item.label == label || item.phase == "certificate-fixture" {
+                commands.add(Text(index))
+                raw.add(relative(owner, item.stdoutPath))
+                raw.add(relative(owner, item.stderrPath))
+            }
+        }
+        let certificates = regular(owner, owner.shared)
+        let outputs = unique(raw)
+        let all: List<Text> = []
+        for value in certificates { all.add(value) }
+        for value in outputs { all.add(value) }
+        rows.add("{\"case\": " + quic.string(label) + ", \"command_indices\": [" + quic.joined(commands, ", ") + "], \"endpoint_indices\": []" +
+            ", \"fixture_workspace\": " + quic.string(owner.workspace) + ", \"file_roles\": {\"certificates\": " + quic.quoted(certificates) +
+            ", \"raw_output\": " + quic.quoted(outputs) + "}, \"files\": " + quic.quoted(unique(all)) + "}")
+    }
+    return "[" + quic.joined(rows, ",\n    ") + "]"
+}
+public function publish(owner: Artifacts, fields: List<Text>, passed: Boolean): Text {
+    owner.passed = passed
+    let parts: List<Text> = []
+    for field in fields { parts.add(field) }
+    if owner.path != "" {
+        parts.add("\"artifacts\": " + quic.string(owner.path))
+        parts.add("\"declared_cases\": " + quic.quoted(owner.declared))
+        parts.add("\"case_inventory\": " + caseInventory(owner))
+    }
+    let report = "{\n  " + quic.joined(parts, ",\n  ") + "\n}\n"
+    if owner.path != "" { writeTextFile(owner.path + "/results.json", report) }
+    return report
+}
+public function close(owner: Artifacts): Boolean {
+    let passed = owner.passed
+    if owner.path == "" {
+        test.removeTree(owner.scratch)
+        return passed
+    }
+    let listed = test.run(["find", ".", "-type", "f", "!", "-name", "manifest.json"], owner.environment, owner.path, owner.scratch + "/.inventory", 60)
+    test.require(listed, "artifact inventory")
+    let names: List<Text> = []
+    for line in test.lines(listed.output) { names.add(quic.after(line, "./")) }
+    names.sort()
+    let paths: List<Text> = []
+    for name in names { paths.add(owner.path + "/" + name) }
+    let hashes = quic.digests(paths, owner.scratch + "/.hashes")
+    let entries: List<Text> = []
+    let sizes: List<Text> = []
+    for index in 0..names.length {
+        entries.add(quic.string(names[index]) + ": " + quic.string(hashes[index]))
+        sizes.add(quic.string(names[index]) + ": " + Text(files.pathSize(paths[index])))
+    }
+    let status = "failed"
+    if passed { status = "passed" }
+    writeTextFile(owner.path + "/manifest.json", ["{\n  \"schema_version\": 1,\n  \"status\": ", quic.string(status), ",\n  \"workspace\": ", quic.string(owner.workspace),
+        ",\n  \"inputs\": ", owner.inputs, ",\n  \"commands\": ", quic.commandRecords(owner.ledger), ",\n  \"endpoint_commands\": [],\n  \"declared_cases\": ", quic.quoted(owner.declared), ",\n  \"case_inventory\": ", caseInventory(owner), ",\n  \"files\": {", quic.joined(entries, ", "),
+        "},\n  \"file_bytes\": {", quic.joined(sizes, ", "), "},\n  \"finalization_errors\": [],\n  \"unhashed_files\": []\n}\n"])
+    test.removeTree(owner.scratch)
+    return passed
+}
+public function baseline(label: Text, summary: Text, driver: Text, source: Text, names: List<Text>, codes: List<Integer>, messages: List<Text>) {
+    let binary = ""
+    let expectOld = false
+    let requested: List<Text> = []
+    let directory = ""
+    let printSummary = false
+    let index = 0
+    while index < argumentCount() {
+        let name = argument(index)
+        if name == "--expect-old-code" { expectOld = true; index += 1; continue }
+        if name == "--summary" { printSummary = true; index += 1; continue }
+        test.check(index + 1 < argumentCount(), "missing option value: " + name)
+        let value = argument(index + 1)
+        if name == "--binary" { binary = value }
+        else if name == "--artifacts" { directory = value }
+        else if name == "--case" {
+            let known = false
+            for candidate in names { if candidate == value { known = true } }
+            test.check(known, "invalid case: " + value)
+            requested.add(value)
+        } else { fail("unknown option: " + name) }
+        index += 2
+    }
+    test.check(binary != "", "--binary is required")
+    binary = absolute(binary, quic.root())
+    test.check(files.pathSize(binary) >= 0, "binary does not exist: " + binary)
+    let cases = names
+    if requested.length > 0 { cases = requested }
+    let owner = open(label, directory, [driver, source, "tests/quic-protocol-support.min", "tests/quic-test-support.min", "tools/testing.min", binary], cases)
+    let ca = authority(owner)
+    quic.rootCertificate(ca, "root")
+    quic.leaf(ca, "server", "root", "DNS:localhost,IP:127.0.0.1", "serverAuth")
+    quic.leaf(ca, "client", "root", "DNS:localhost,IP:127.0.0.1", "clientAuth")
+    certificatesReady(owner)
+    let rows: List<Text> = []
+    let unmatched: List<Text> = []
+    let matchedCount = 0
+    for name in cases {
+        let command = [binary]
+        for value in quic.peerArguments(ca) { command.add(value) }
+        command.add(name)
+        let completed = run(owner, command, 60, name)
+        let expectedCode = 0
+        let required = ""
+        if expectOld {
+            for position in 0..names.length { if names[position] == name { expectedCode = codes[position]; required = messages[position] } }
+        }
+        let matched = completed.status == expectedCode && test.contains(completed.output, required)
+        if matched { matchedCount += 1 }
+        let row = "{\"case\": " + quic.string(name) + ", \"returncode\": " + Text(completed.status) + ", \"expected_returncode\": " + Text(expectedCode) +
+            ", \"matched\": " + Text(matched) + ", \"stdout\": " + quic.string(completed.output) + ", \"stderr\": " + quic.string(completed.errorOutput) + "}"
+        rows.add(row)
+        if !matched { unmatched.add(row) }
+    }
+    let hashes = quic.digests([source, binary], owner.scratch + "/.report")
+    let report = publish(owner, ["\"test_source_sha256\": " + quic.string(hashes[0]), "\"binary_sha256\": " + quic.string(hashes[1]),
+        "\"baseline\": " + Text(expectOld), "\"compiler_invoked\": false", "\"results\": [\n    " + quic.joined(rows, ",\n    ") + "\n  ]"], unmatched.length == 0)
+    let closed = close(owner)
+    if printSummary {
+        print(summary + ": " + Text(matchedCount) + "/" + Text(cases.length) + " passed")
+        for row in unmatched { print(row) }
+    } else { files.writeStandardOutput(report) }
+    if unmatched.length > 0 || !closed { exit(1) }
+}

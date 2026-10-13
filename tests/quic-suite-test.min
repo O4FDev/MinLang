@@ -1,0 +1,168 @@
+use "../tools/testing.min" as test
+use "./quic-test-support.min" as quic
+use "system" as system
+use "files" as files
+
+record Case { index: Integer; label: List<Text>; command: List<Text>; limit: Integer; state: Boolean; started: Integer; handle: Integer; log: Text; status: Integer; row: Text }
+
+function padded(index: Integer): Text {
+    if index < 10 { return "0" + Text(index) }
+    return Text(index)
+}
+function item(index: Integer, label: List<Text>, command: List<Text>, limit: Integer, state: Boolean): Case {
+    return Case { index: index; label: label; command: command; limit: limit; state: state; started: 0; handle: 0; log: ""; status: -1; row: "" }
+}
+function native(name: Text, arguments: List<Text>): List<Text> {
+    let command = ["./build/tooling/tests/" + name + "-test"]
+    for value in arguments { command.add(value) }
+    return command
+}
+function script(name: Text, arguments: List<Text>): List<Text> {
+    let command = ["python3", "tests/" + name]
+    for value in arguments { command.add(value) }
+    return command
+}
+function launch(entry: Case, environment: List<Text>, logs: Text) {
+    entry.log = logs + "/" + padded(entry.index) + ".raw"
+    entry.started = system.monotonicNanoseconds()
+    let command = ["/bin/sh", "-c", "exec \"$@\" 2>&1", "sh"]
+    for value in entry.command { command.add(value) }
+    if !entry.state { print("RUN " + quic.quoted(entry.label)) }
+    entry.handle = test.start(command, environment, "", entry.log, entry.limit)
+    test.check(entry.handle > 0, "suite child launch failed")
+}
+function complete(entry: Case, code: Integer, logs: Text) {
+    entry.status = code
+    let header = ""
+    if !entry.state { header = "RUN " + quic.quoted(entry.label) + "\n" }
+    writeTextFile(logs + "/" + padded(entry.index) + ".log", header + readTextFile(entry.log) + readTextFile(entry.log + ".err"))
+    test.check(files.remove(entry.log) == 0 && files.remove(entry.log + ".err") == 0, "cannot remove raw suite log")
+    entry.row = "{\"command\": " + quic.quoted(entry.label) + ", \"status\": " + Text(code)
+    if entry.state { entry.row = entry.row + "}" }
+    else {
+        entry.row = entry.row + ", \"seconds\": " + quic.seconds(entry.started) + "}"
+        print(entry.row)
+    }
+}
+function phase(cases: List<Case>, environment: List<Text>, logs: Text, jobs: Integer): List<Case> {
+    let finished: List<Case> = []
+    let running: List<Case> = []
+    let next = 0
+    let failed = false
+    while (next < cases.length && !failed) || running.length > 0 {
+        while running.length < jobs && next < cases.length && !failed {
+            launch(cases[next], environment, logs)
+            running.add(cases[next])
+            next += 1
+        }
+        let remaining: List<Case> = []
+        let progressed = false
+        for entry in running {
+            let observed = system.poll(entry.handle)
+            if observed.state == system.PENDING { remaining.add(entry); continue }
+            test.check(observed.error == 0, "suite child wait failed")
+            let code = observed.exitCode
+            if observed.state == system.SIGNALED { code = 128 + observed.signal }
+            complete(entry, code, logs)
+            if code != 0 { failed = true }
+            progressed = true
+        }
+        running = remaining
+        if !progressed { quic.pause(50) }
+    }
+    for entry in cases { if entry.status >= 0 { finished.add(entry) } }
+    return finished
+}
+function compileState(source: Text, binary: Text, environment: List<Text>): List<Text> {
+    let script = "set -e; ./minyar --library library \"$1\" -o \"$2\" >/dev/null; exec \"$2\""
+    return ["/bin/sh", "-c", script, "sh", source, binary]
+}
+
+let artifacts = ""
+let yamux = ""
+let stateOnly = false
+let sanitize = false
+let optimization = "0"
+let index = 0
+while index < argumentCount() {
+    let name = argument(index)
+    if name == "--state-only" { stateOnly = true; index += 1; continue }
+    if name == "--sanitize" { sanitize = true; index += 1; continue }
+    test.check(index + 1 < argumentCount(), "missing QUIC suite option value: " + name)
+    let value = argument(index + 1)
+    if name == "--artifacts" { artifacts = value }
+    else if name == "--yamux-peer" { yamux = value }
+    else if name == "--optimization" { test.check(value == "0" || value == "2", "invalid QUIC suite optimization: " + value); optimization = value }
+    else { fail("unknown QUIC suite option: " + name) }
+    index += 2
+}
+test.check(artifacts != "", "--artifacts is required")
+let root = quic.root()
+if !quic.starts(artifacts, "/") { artifacts = root + "/" + artifacts }
+test.check(files.makeDirectory(artifacts) == 0, "cannot create QUIC suite artifacts")
+let logs = artifacts + "/logs"
+if files.pathSize(logs) >= 0 {
+    let cleared = system.spawn("/bin/rm", ["rm", "-rf", "--", logs], system.environment(), "")
+    test.check(cleared > 0 && system.wait(cleared).exitCode == 0, "cannot clear QUIC suite logs")
+}
+test.check(files.makeDirectory(logs) == 0, "cannot create QUIC suite logs")
+let flags = "-O" + optimization + " -Wno-override-module"
+if sanitize { flags = "-O1 " + quic.SANITIZER_FLAGS + " -Wno-override-module" }
+let environment = quic.nativeFlags(system.environment(), flags)
+let leaks = "0"
+if files.pathSize("/proc/self/stat") >= 0 { leaks = "1" }
+environment = quic.setting(environment, "ASAN_OPTIONS", "detect_leaks=" + leaks)
+environment = quic.setting(environment, "UBSAN_OPTIONS", "halt_on_error=1")
+let jobs = Integer(test.setting("MINYAR_TEST_JOBS", "2"))
+if jobs < 1 { jobs = 1 }
+let extra: List<Text> = []
+if sanitize { extra.add("--sanitize") }
+let work = test.scratch()
+if system.getenv("MINYAR_TEST_PROGRAM_CACHE") == "" {
+    test.check(files.makeDirectory(work + "/program-cache") == 0, "cannot create program cache")
+    environment = quic.setting(environment, "MINYAR_TEST_PROGRAM_CACHE", work + "/program-cache")
+}
+let cases: List<Case> = []
+for source in ["quic-state.min", "tls-tickets.min", "yamux.min", "quic-dispatch.min"] {
+    cases.add(item(cases.length, [source], compileState("tests/" + source, work + "/state-" + Text(cases.length), environment), 240, true))
+}
+let labels = [script("securecrypto.py", []), native("quic-crypto", []), native("quic-wire", []), native("quic-dispatch", []),
+    script("tls-server.py", []), script("tls-server.py", ["--curve", "prime256v1"]), script("tls-keyshare.py", []), script("tls-signing-usage.py", []),
+    script("tls-validity.py", []), script("yamux-churn.py", []), script("transport-cancel.py", []), native("quic-transport", [])]
+for mode in ["--key-update", "--migration", "--migration-cids", "--server-protocol", "--resumption", "--quic-resumption", "--early", "--fallback", "--congestion", "--stream-control", "--stream-churn", "--closing", "--persistent", "--retry", "--rtt"] {
+    labels.add(native("quic-transport", [mode]))
+}
+labels.add(script("tls-resumption-expiry.py", []))
+labels.add(script("tls-handshake-validity.py", []))
+if yamux != "" {
+    if !quic.starts(yamux, "/") { yamux = root + "/" + yamux }
+    labels.add(script("transport-go.py", ["--peer-binary", yamux]))
+    labels.add(script("transport-go.py", ["--peer-binary", yamux, "--streams", "1536"]))
+    labels.add(script("transport-go.py", ["--fin-schedule"]))
+}
+let commands: List<Case> = []
+for label in labels {
+    let command: List<Text> = []
+    for value in label { command.add(value) }
+    for value in extra { command.add(value) }
+    let limit = 180
+    for value in label { if value == "--streams" { limit = 240 } }
+    if sanitize { for value in label { if value == "--rtt" { limit = 360 } } }
+    commands.add(item(cases.length + commands.length, label, command, limit, false))
+}
+let results = phase(cases, environment, logs, jobs)
+let failed = false
+for entry in results { if entry.status != 0 { failed = true } }
+if !stateOnly && !failed {
+    for entry in phase(commands, environment, logs, jobs) { results.add(entry) }
+}
+let combined: List<Text> = []
+let names = files.list(logs)
+names.sort()
+for name in names { if quic.ends(name, ".log") { combined.add(readTextFile(logs + "/" + name)) } }
+writeTextFile(artifacts + "/suite.log", combined)
+let rows: List<Text> = []
+for entry in results { rows.add(entry.row) }
+writeTextFile(artifacts + "/suite.json", "[\n  " + quic.joined(rows, ",\n  ") + "\n]\n")
+test.removeTree(work)
+for entry in results { if entry.status != 0 { exit(entry.status) } }

@@ -1,0 +1,335 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+
+public constant SANITIZER_FLAGS = "-g -fsanitize=address,undefined -fno-omit-frame-pointer"
+
+public function setting(environment: List<Text>, name: Text, value: Text): List<Text> {
+    let result: List<Text> = []
+    let prefix = name + "="
+    for entry in environment {
+        let raw = Bytes(entry)
+        if raw.length < prefix.byteLength || Text(raw.slice(0, prefix.byteLength)) != prefix { result.add(entry) }
+    }
+    result.add(prefix + value)
+    return result
+}
+public function nativeFlags(environment: List<Text>, flags: Text): List<Text> {
+    let result = environment
+    for name in ["MINYAR_CLANG_FLAGS", "MINYAR_NATIVE_FLAGS", "MINYAR_RUNTIME_FLAGS"] { result = setting(result, name, flags) }
+    return result
+}
+public function sanitized(environment: List<Text>): List<Text> {
+    let result = nativeFlags(environment, "-O1 " + SANITIZER_FLAGS + " -Wno-override-module")
+    result = setting(result, "ASAN_OPTIONS", "detect_leaks=1")
+    return setting(result, "UBSAN_OPTIONS", "halt_on_error=1")
+}
+public function flags(optimization: Text, sanitize: Boolean): Text {
+    let value = "-O" + optimization + " -Wno-override-module"
+    if sanitize { value = value + " " + SANITIZER_FLAGS }
+    return value
+}
+public function root(): Text {
+    let work = test.scratch()
+    let location = test.run(["/bin/pwd", "-P"], system.environment(), "", work + "/root", 10)
+    test.require(location, "project location")
+    test.removeTree(work)
+    return test.lines(location.output)[0]
+}
+public function compile(source: Text, output: Text, environment: List<Text>, seconds: Integer): test.Result {
+    let result = test.run(["./minyar", "--library", "library", source, "-o", output], environment, "", output + ".compile", seconds)
+    test.check(result.status == 0, "compile " + source + " failed (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+    return result
+}
+public function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    return raw.length >= prefix.byteLength && Text(raw.slice(0, prefix.byteLength)) == prefix
+}
+public function ends(source: Text, suffix: Text): Boolean {
+    let raw = Bytes(source)
+    return raw.length >= suffix.byteLength && Text(raw.slice(raw.length - suffix.byteLength, raw.length)) == suffix
+}
+public function after(source: Text, prefix: Text): Text {
+    let raw = Bytes(source)
+    return Text(raw.slice(prefix.byteLength, raw.length))
+}
+public function split(source: Text, separator: Integer): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(source)
+    let start = 0
+    for index in 0..raw.length {
+        if raw[index] == separator { result.add(Text(raw.slice(start, index))); start = index + 1 }
+    }
+    result.add(Text(raw.slice(start, raw.length)))
+    return result
+}
+public function joined(values: List<Text>, separator: Text): Text {
+    let parts: List<Text> = []
+    for index in 0..values.length {
+        if index > 0 { parts.add(separator) }
+        parts.add(values[index])
+    }
+    return joinText(parts)
+}
+public function hex(data: Bytes): Text {
+    let digits = Bytes("0123456789abcdef")
+    let result = Bytes()
+    for byte in data { result.add(digits[byte >> 4]); result.add(digits[byte & 15]) }
+    return Text(result)
+}
+function nibble(value: Integer): Integer {
+    if value >= 48 && value <= 57 { return value - 48 }
+    if value >= 97 && value <= 102 { return value - 87 }
+    if value >= 65 && value <= 70 { return value - 55 }
+    fail("invalid hexadecimal digit")
+}
+public function fromHex(text: Text): Bytes {
+    let raw = Bytes(text)
+    test.check(raw.length % 2 == 0, "odd hexadecimal length")
+    let result = Bytes()
+    let index = 0
+    while index < raw.length { result.add(nibble(raw[index]) * 16 + nibble(raw[index + 1])); index += 2 }
+    return result
+}
+public function digests(paths: List<Text>, log: Text): List<Text> {
+    let result: List<Text> = []
+    if paths.length == 0 { return result }
+    let command = ["sha256sum", "--"]
+    for path in paths { command.add(path) }
+    let observed = test.run(command, system.environment(), "", log, 120)
+    test.require(observed, "sha256sum")
+    test.check(files.remove(log) == 0 && files.remove(log + ".err") == 0, "cannot remove digest log")
+    for line in test.lines(observed.output) { result.add(test.words(line)[0]) }
+    test.check(result.length == paths.length, "incomplete digest inventory")
+    return result
+}
+public function digest(path: Text, log: Text): Text { return digests([path], log)[0] }
+public function treeDigests(directories: List<Text>, suffixes: List<Text>, log: Text): Text {
+    let script = "set -e; dirs=$1; shift; pattern=''; for suffix in \"$@\"; do if [ -n \"$pattern\" ]; then pattern=\"$pattern -o\"; fi; pattern=\"$pattern -name *$suffix\"; done; set -f; find $dirs -type f \\( $pattern \\) -print0 | LC_ALL=C sort -z | xargs -0 sha256sum --"
+    let command = ["/bin/sh", "-c", script, "minyar", joined(directories, " ")]
+    for suffix in suffixes { command.add(suffix) }
+    let observed = test.run(command, system.environment(), "", log, 120)
+    test.require(observed, "source digest inventory")
+    test.check(files.remove(log) == 0 && files.remove(log + ".err") == 0, "cannot remove digest log")
+    test.check(observed.output != "", "empty source digest inventory")
+    return observed.output
+}
+public function fileDigests(paths: List<Text>, log: Text): Text {
+    let command = ["sha256sum", "--"]
+    for path in paths { command.add(path) }
+    let observed = test.run(command, system.environment(), "", log, 120)
+    test.require(observed, "sha256sum")
+    test.check(files.remove(log) == 0 && files.remove(log + ".err") == 0, "cannot remove digest log")
+    return observed.output
+}
+public function digestObject(inventory: Text): Text {
+    let parts: List<Text> = []
+    for line in test.lines(inventory) {
+        let raw = Bytes(line)
+        test.check(raw.length > 66 && raw[64] == 32 && raw[65] == 32, "unexpected sha256sum line")
+        parts.add(string(Text(raw.slice(66, raw.length))) + ": " + string(Text(raw.slice(0, 64))))
+    }
+    return "{" + joined(parts, ", ") + "}"
+}
+public function quoted(values: List<Text>): Text {
+    let parts: List<Text> = []
+    for value in values { parts.add(string(value)) }
+    return "[" + joined(parts, ", ") + "]"
+}
+public function seconds(start: Integer): Text {
+    let elapsed = system.monotonicNanoseconds() - start
+    let micros = elapsed / 1000
+    let fraction = Text(1000000 + micros % 1000000)
+    return Text(micros / 1000000) + "." + after(fraction, "1")
+}
+
+function two(value: Integer): Text {
+    if value < 10 { return "0" + Text(value) }
+    return Text(value)
+}
+public function utc(microseconds: Integer): Text {
+    let total = microseconds / 1000000
+    let days = total / 86400
+    let clock = total % 86400
+    let z = days + 719468
+    let era = z / 146097
+    let day = z - era * 146097
+    let yoe = (day - day / 1460 + day / 36524 - day / 146096) / 365
+    let year = yoe + era * 400
+    let doy = day - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let dayOfMonth = doy - (153 * mp + 2) / 5 + 1
+    let month = mp + 3
+    if mp >= 10 { month = mp - 9 }
+    if month <= 2 { year += 1 }
+    return two(year % 100) + two(month) + two(dayOfMonth) + two(clock / 3600) + two(clock / 60 % 60) + two(clock % 60) + "Z"
+}
+
+public record Authority { directory: Text; serial: List<Integer>; environment: List<Text>; ledger: Evidence }
+public function authority(directory: Text): Authority {
+    test.check(files.makeDirectory(directory) == 0, "cannot create certificate directory")
+    return Authority { directory: directory; serial: [1]; environment: system.environment(); ledger: unrecorded(directory) }
+}
+public function recorded(directory: Text, ledger: Evidence): Authority {
+    let ca = authority(directory)
+    ca.ledger = ledger
+    return ca
+}
+public function path(ca: Authority, name: Text, suffix: Text): Text { return ca.directory + "/" + name + "." + suffix }
+public function openssl(ca: Authority, arguments: List<Text>) {
+    let command = ["openssl"]
+    for value in arguments { command.add(value) }
+    let previous = ca.ledger.label[0]
+    ca.ledger.label[0] = ""
+    let result = observe(ca.ledger, "certificate-fixture", command, ca.environment, "", 30)
+    ca.ledger.label[0] = previous
+    test.check(result.status == 0, "openssl failed\n" + result.errorOutput)
+}
+function der(ca: Authority, name: Text) {
+    openssl(ca, ["x509", "-in", path(ca, name, "pem"), "-outform", "DER", "-out", path(ca, name, "der")])
+}
+public function rootCertificate(ca: Authority, name: Text) {
+    openssl(ca, ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=" + name,
+        "-addext", "basicConstraints=critical,CA:TRUE,pathlen:2", "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+        "-keyout", path(ca, name, "key"), "-out", path(ca, name, "pem")])
+    der(ca, name)
+}
+function configured(value: Text): Text {
+    let raw = Bytes(value)
+    for byte in raw { test.check(byte != 10 && byte != 13 && byte != 0, "OpenSSL fixture path contains a line break or NUL") }
+    return "\"" + test.replace(test.replace(test.replace(value, "\\", "\\\\"), "\"", "\\\""), "$", "\\$") + "\""
+}
+public function leaf(ca: Authority, name: Text, issuer: Text, san: Text, usage: Text) {
+    openssl(ca, ["genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", path(ca, name, "key")])
+    openssl(ca, ["req", "-new", "-key", path(ca, name, "key"), "-subj", "/CN=localhost", "-out", path(ca, name, "csr")])
+    writeTextFile(path(ca, name, "index"), "")
+    let serial = Text(ca.serial[0])
+    if ca.serial[0] < 16 { serial = "0" + serial }
+    test.check(ca.serial[0] < 10, "certificate serial range exhausted")
+    writeTextFile(path(ca, name, "serial"), serial + "\n")
+    ca.serial[0] += 1
+    let extensions = "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=" + usage + "\n"
+    if san != "" { extensions = extensions + "subjectAltName=" + san + "\n" }
+    writeTextFile(path(ca, name, "cnf"), "[ca]\ndefault_ca=issuer\n[issuer]\ndatabase=" + configured(path(ca, name, "index")) +
+        "\nserial=" + configured(path(ca, name, "serial")) + "\nnew_certs_dir=" + configured(ca.directory) +
+        "\ncertificate=" + configured(path(ca, issuer, "pem")) + "\nprivate_key=" + configured(path(ca, issuer, "key")) +
+        "\ndefault_md=sha256\ndefault_days=2\npolicy=policy\nx509_extensions=extensions\n[policy]\ncommonName=supplied\n[extensions]\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n" + extensions)
+    let now = system.wallClockMicroseconds()
+    openssl(ca, ["ca", "-batch", "-notext", "-config", path(ca, name, "cnf"), "-startdate", utc(now - 3600000000),
+        "-enddate", utc(now + 86400000000), "-in", path(ca, name, "csr"), "-out", path(ca, name, "pem")])
+    der(ca, name)
+    openssl(ca, ["pkcs8", "-topk8", "-nocrypt", "-in", path(ca, name, "key"), "-outform", "DER", "-out", path(ca, name, "pk8")])
+}
+public function mutual(directory: Text): Authority {
+    let ca = authority(directory)
+    rootCertificate(ca, "root")
+    leaf(ca, "server", "root", "DNS:localhost,IP:127.0.0.1", "serverAuth")
+    leaf(ca, "client", "root", "DNS:localhost,IP:127.0.0.1", "clientAuth")
+    return ca
+}
+public function peerArguments(ca: Authority): List<Text> {
+    return [path(ca, "root", "der"), path(ca, "server", "der"), path(ca, "server", "pk8"), path(ca, "client", "der"), path(ca, "client", "pk8")]
+}
+
+public record Command { argv: List<Text>; cwd: Text; timeout: Integer; phase: Text; label: Text; executable: Text; executableHash: Text; status: Integer; seconds: Text; stdoutPath: Text; stderrPath: Text; stdoutHash: Text; stderrHash: Text; stdoutBytes: Integer; stderrBytes: Integer; output: Text; errorOutput: Text }
+public record Evidence { directory: Text; scratch: Text; root: Text; commands: List<Command>; label: List<Text> }
+public function evidence(directory: Text): Evidence {
+    test.check(files.makeDirectory(directory) == 0, "cannot create raw evidence directory")
+    return Evidence { directory: directory; scratch: directory; root: root(); commands: []; label: [""] }
+}
+public function unrecorded(scratch: Text): Evidence { return Evidence { directory: ""; scratch: scratch; root: ""; commands: []; label: [""] } }
+public function resolve(name: Text, cwd: Text, environment: List<Text>, base: Text): Text {
+    if contains(name, "/") {
+        if starts(name, "/") { return name }
+        if cwd == "" { return base + "/" + name }
+        return cwd + "/" + name
+    }
+    let search = "/usr/bin:/bin"
+    for entry in environment { if starts(entry, "PATH=") { search = after(entry, "PATH=") } }
+    for directory in split(search, 58) {
+        if directory != "" && files.pathSize(directory + "/" + name) >= 0 { return directory + "/" + name }
+    }
+    return ""
+}
+function contains(source: Text, needle: Text): Boolean { return test.contains(source, needle) }
+public function observe(ledger: Evidence, phase: Text, command: List<Text>, environment: List<Text>, cwd: Text, limit: Integer): test.Result {
+    if ledger.directory == "" {
+        let log = ledger.scratch + "/.unrecorded-" + Text(system.monotonicNanoseconds())
+        let result = test.run(command, environment, cwd, log, limit)
+        test.check(files.remove(log) == 0 && files.remove(log + ".err") == 0, "cannot remove command log")
+        return result
+    }
+    let serial = Text(1000 + ledger.commands.length)
+    let stem = ledger.directory + "/command-" + after(serial, "1")
+    let started = system.monotonicNanoseconds()
+    let result = test.run(command, environment, cwd, stem + ".stdout.bin", limit)
+    test.check(files.rename(stem + ".stdout.bin.err", stem + ".stderr.bin") == 0, "cannot retain raw diagnostics")
+    let elapsed = seconds(started)
+    let executable = resolve(command[0], cwd, environment, ledger.root)
+    let inventory = [stem + ".stdout.bin", stem + ".stderr.bin"]
+    if executable != "" { inventory.add(executable) }
+    let hashes = digests(inventory, stem + ".digest")
+    let executableHash = ""
+    if executable != "" { executableHash = hashes[2] }
+    let directory = cwd
+    if directory == "" { directory = ledger.root }
+    ledger.commands.add(Command { argv: command; cwd: directory; timeout: limit; phase: phase; label: ledger.label[0]; executable: executable;
+        executableHash: executableHash; status: result.status; seconds: elapsed; stdoutPath: stem + ".stdout.bin"; stderrPath: stem + ".stderr.bin";
+        stdoutHash: hashes[0]; stderrHash: hashes[1]; stdoutBytes: files.pathSize(stem + ".stdout.bin"); stderrBytes: files.pathSize(stem + ".stderr.bin");
+        output: result.output; errorOutput: result.errorOutput })
+    return result
+}
+public function commandJSON(item: Command): Text {
+    let executable = "null"
+    if item.executable != "" { executable = string(item.executable) }
+    let hash = "null"
+    if item.executableHash != "" { hash = string(item.executableHash) }
+    let label = "null"
+    if item.label != "" { label = string(item.label) }
+    return "{\"command\": " + quoted(item.argv) + ", \"cwd\": " + string(item.cwd) + ", \"timeout\": " + Text(item.timeout) +
+        ", \"phase\": " + string(item.phase) + ", \"case\": " + label + ", \"executable\": " + executable + ", \"executable_sha256\": " + hash +
+        ", \"returncode\": " + Text(item.status) + ", \"status\": " + Text(item.status) + ", \"timed_out\": " + Text(item.status == 124) +
+        ", \"elapsed_seconds\": " + item.seconds + ", \"stdout_path\": " + string(item.stdoutPath) + ", \"stdout_sha256\": " + string(item.stdoutHash) +
+        ", \"stdout_bytes\": " + Text(item.stdoutBytes) + ", \"stderr_path\": " + string(item.stderrPath) + ", \"stderr_sha256\": " + string(item.stderrHash) +
+        ", \"stderr_bytes\": " + Text(item.stderrBytes) + "}"
+}
+public function commandRecords(ledger: Evidence): Text {
+    let rows: List<Text> = []
+    for item in ledger.commands { rows.add(commandJSON(item)) }
+    return "[" + joined(rows, ",\n    ") + "]"
+}
+public function string(text: Text): Text {
+    let digits = Bytes("0123456789abcdef")
+    let result = Bytes("\"")
+    for byte in Bytes(text) {
+        if byte == 34 || byte == 92 { result.add(92); result.add(byte) }
+        else if byte == 10 { result.add(92); result.add(110) }
+        else if byte == 13 { result.add(92); result.add(114) }
+        else if byte == 9 { result.add(92); result.add(116) }
+        else if byte < 32 || byte == 127 { for value in Bytes("\\u00") { result.add(value) }; result.add(digits[byte >> 4]); result.add(digits[byte & 15]) }
+        else { result.add(byte) }
+    }
+    result.add(34)
+    return Text(result)
+}
+public function output(result: test.Result, phase: Text): List<Text> {
+    test.check(result.status == 0, phase + " exited " + Text(result.status) + ":\n" + result.output + "\n" + result.errorOutput)
+    let raw = Bytes(result.output)
+    let begin = 0
+    let end = raw.length
+    while begin < end && raw[begin] <= 32 { begin += 1 }
+    while end > begin && raw[end - 1] <= 32 { end -= 1 }
+    if begin == end { return [] }
+    return test.lines(Text(raw.slice(begin, end)))
+}
+public function program(source: Text, output: Text, sanitize: Boolean): Text {
+    let environment = system.environment()
+    if sanitize { environment = sanitized(environment) }
+    compile(source, output, environment, 120)
+    return output
+}
+public function pause(milliseconds: Integer) {
+    let fraction = Text(1000 + milliseconds % 1000)
+    let handle = system.spawn("/bin/sleep", ["sleep", Text(milliseconds / 1000) + "." + after(fraction, "1")], system.environment(), "")
+    test.check(handle > 0 && system.wait(handle).exitCode == 0, "cannot pause")
+}

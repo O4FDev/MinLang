@@ -1,0 +1,49 @@
+use "../tools/testing.min" as test
+use "./quic-test-support.min" as quic
+use "system" as system
+use "json" as json
+
+function run(binary: Text, arguments: List<Text>, log: Text): List<Text> {
+    let command = [binary]
+    for value in arguments { command.add(value) }
+    return quic.output(test.run(command, system.environment(), "", log, 120), binary)
+}
+function one(lines: List<Text>, expected: Text, message: Text) {
+    test.check(lines.length == 1 && lines[0] == expected, message)
+}
+
+let sanitize = false
+for index in 0..argumentCount() {
+    test.check(argument(index) == "--sanitize", "unknown QUIC crypto option: " + argument(index))
+    sanitize = true
+}
+let work = test.scratch()
+let binary = quic.program("tests/quic-crypto.min", work + "/quic-crypto.exe", sanitize)
+let log = work + "/run"
+for rfc in ["9001", "9369"] {
+    let fixture = json.parse(readTextFile("tests/fixtures/quic-rfc" + rfc + ".json"))
+    test.check(fixture.kind == json.OBJECT, "invalid RFC " + rfc + " fixture")
+    let version = json.string(fixture, "version")
+    for role in ["client", "server"] {
+        let vector = json.member(fixture, role)
+        let payload = quic.fromHex(json.string(vector, "payload"))
+        let number = "1"
+        if role == "client" { number = "2"; payload.resize(1162) }
+        one(run(binary, [role, version, json.string(vector, "header"), quic.hex(payload), number, "18"], log), json.string(vector, "packet"), "RFC " + rfc + " " + role + " mismatch")
+    }
+    one(run(binary, ["chacha", version, json.string(fixture, "chacha_header"), "01", "654360564", "1"], log), json.string(fixture, "chacha_packet"), "RFC " + rfc + " ChaCha mismatch")
+    let retry = json.string(fixture, "retry")
+    let dcid = json.string(fixture, "dcid")
+    one(run(binary, ["retry", version, retry, dcid], log), "true", "RFC " + rfc + " Retry rejected")
+    let raw = Bytes(retry)
+    one(run(binary, ["retry-tag", version, retry, dcid], log), Text(raw.slice(raw.length - 32, raw.length)), "RFC " + rfc + " Retry tag mismatch")
+    one(run(binary, ["retry", version, retry, "8394c8f03e515709"], log), "false", "RFC " + rfc + " Retry accepted another DCID")
+    let bad = quic.fromHex(retry)
+    for position in 0..bad.length {
+        let changed = bad.slice(0, bad.length)
+        changed[position] = changed[position] ^ 1
+        one(run(binary, ["retry", version, quic.hex(changed), dcid], log), "false", "RFC " + rfc + " tampered Retry accepted at " + Text(position))
+    }
+    print("RFC " + rfc + ": Initial client/server, ChaCha, Retry, all-byte tamper/truncation passed")
+}
+test.removeTree(work)

@@ -1,0 +1,108 @@
+use "../tools/testing.min" as test
+use "./quic-test-support.min" as quic
+use "system" as system
+use "files" as files
+use "json" as json
+function inventory(directory: Text, sourceFiles: List<Text>, suffixes: List<Text>, log: Text): Text {
+    return quic.fileDigests(sourceFiles, log + "-files") + quic.treeDigests(["library", "runtime", "compiler", "tools"], suffixes, log + "-trees")
+}
+function save(directory: Text, before: Text, sanitize: Boolean, commands: List<Text>, cases: List<Text>, overrides: Text, after: Text, passed: Boolean) {
+    let parts = ["{\n  \"sources\": ", quic.digestObject(before), ",\n  \"sanitize\": ", Text(sanitize),
+        ",\n  \"commands\": [", quic.joined(commands, ", "), "],\n  \"cases\": [", quic.joined(cases, ",\n    "), "]"]
+    if overrides != "" { parts.add(",\n  \"override_sources\": " + quic.digestObject(overrides)) }
+    if after != "" { parts.add(",\n  \"source_after\": " + quic.digestObject(after)) }
+    parts.add(",\n  \"passed\": " + Text(passed) + "\n}\n")
+    writeTextFile(directory + "/manifest.json", parts)
+}
+
+let sanitize = false
+let modes: List<Integer> = []
+let directory = ""
+let library = ""
+let optimization = "both"
+let index = 0
+while index < argumentCount() {
+    let name = argument(index)
+    if name == "--sanitize" { sanitize = true; index += 1; continue }
+    test.check(index + 1 < argumentCount(), "missing ACK option value: " + name)
+    let value = argument(index + 1)
+    if name == "--mode" {
+        let mode = Integer(value)
+        test.check(Text(mode) == value && mode >= 0 && mode < 53, "invalid ACK mode: " + value)
+        modes.add(mode)
+    } else if name == "--artifacts" { directory = value }
+    else if name == "--library" { library = value }
+    else if name == "--optimization" {
+        test.check(value == "0" || value == "2" || value == "both", "invalid ACK optimization: " + value)
+        optimization = value
+    } else { fail("unknown ACK option: " + name) }
+    index += 2
+}
+if modes.length == 0 { for mode in 0..53 { modes.add(mode) } }
+if directory == "" { directory = test.scratch() }
+test.check(files.makeDirectory(directory) == 0, "cannot create ACK artifacts")
+let root = quic.root()
+let ca = quic.mutual(directory)
+let sourceFiles = ["tests/quic-ack.min", "tests/quic-ack-test.min", "tests/quic-test-support.min", "tools/testing.min", "minyar"]
+let suffixes = [".min", ".c", ".h", ".py", ".sh"]
+let before = inventory(directory, sourceFiles, suffixes, directory + "/.sources-before")
+let overrides = ""
+let override = library != "" && library != root + "/library" && library != "library"
+if override { overrides = quic.treeDigests([library], [""], directory + "/.override") }
+let commands: List<Text> = []
+let cases: List<Text> = []
+let allPassed = [true]
+save(directory, before, sanitize, commands, cases, overrides, "", false)
+let levels = ["0", "2"]
+if optimization != "both" { levels = [optimization] }
+let leaks = "0"
+if files.pathSize("/proc/self/stat") >= 0 { leaks = "1" }
+for level in levels {
+    let flags = quic.flags(level, sanitize)
+    let environment = quic.nativeFlags(system.environment(), flags)
+    environment = quic.setting(environment, "MAKEFLAGS", "-j1")
+    environment = quic.setting(environment, "ASAN_OPTIONS", "detect_leaks=" + leaks)
+    environment = quic.setting(environment, "UBSAN_OPTIONS", "halt_on_error=1")
+    let binary = directory + "/ack-O" + level + ".exe"
+    let command = ["./minyar"]
+    if override { command.add("--library"); command.add(library) }
+    for value in ["--library", "library", "tests/quic-ack.min", "-o", binary] { command.add(value) }
+    let started = system.monotonicNanoseconds()
+    let prefix = directory + "/compile-O" + level
+    let result = test.run(command, environment, "", prefix + ".stdout", 180)
+    test.check(files.rename(prefix + ".stdout.err", prefix + ".stderr") == 0, "cannot retain ACK compiler diagnostics")
+    let row = "{\"argv\": " + quic.quoted(command) + ", \"status\": " + Text(result.status) + ", \"seconds\": " + quic.seconds(started) +
+        ", \"flags\": " + json.quote(flags) + ", \"stdout_sha256\": " + json.quote(quic.digest(prefix + ".stdout", prefix + ".digest")) +
+        ", \"stderr_sha256\": " + json.quote(quic.digest(prefix + ".stderr", prefix + ".digest"))
+    if result.status != 0 {
+        commands.add(row + "}")
+        save(directory, before, sanitize, commands, cases, overrides, "", false)
+        print("ACK compiler failed " + level + " " + Text(result.status) + " " + result.errorOutput)
+        exit(1)
+    }
+    commands.add(row + ", \"binary_sha256\": " + json.quote(quic.digest(binary, prefix + ".digest")) + "}")
+    save(directory, before, sanitize, commands, cases, overrides, "", false)
+    for mode in modes {
+        let argv = [binary]
+        for value in quic.peerArguments(ca) { argv.add(value) }
+        argv.add(Text(mode))
+        let caseStarted = system.monotonicNanoseconds()
+        let stem = directory + "/O" + level + "-case-" + Text(mode)
+        let observed = test.run(argv, environment, "", stem + ".stdout", 30)
+        test.check(files.rename(stem + ".stdout.err", stem + ".stderr") == 0, "cannot retain ACK case diagnostics")
+        let passed = observed.status == 0 && observed.output == "ACK case " + Text(mode) + "\n" && observed.errorOutput == ""
+        if !passed { allPassed[0] = false }
+        cases.add("{\"optimization\": " + json.quote(level) + ", \"mode\": " + Text(mode) + ", \"argv\": " + quic.quoted(argv) +
+            ", \"status\": " + Text(observed.status) + ", \"passed\": " + Text(passed) + ", \"seconds\": " + quic.seconds(caseStarted) +
+            ", \"stdout_sha256\": " + json.quote(quic.digest(stem + ".stdout", stem + ".digest")) +
+            ", \"stderr_sha256\": " + json.quote(quic.digest(stem + ".stderr", stem + ".digest")) + "}")
+        save(directory, before, sanitize, commands, cases, overrides, "", false)
+        let verdict = "FAIL"
+        if passed { verdict = "PASS" }
+        print("ACK " + level + " " + Text(mode) + " " + Text(observed.status) + " " + verdict)
+    }
+}
+let after = inventory(directory, sourceFiles, suffixes, directory + "/.sources-after")
+let complete = allPassed[0] && after == before
+save(directory, before, sanitize, commands, cases, overrides, after, complete)
+if !complete { exit(1) }

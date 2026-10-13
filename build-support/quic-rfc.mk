@@ -4,8 +4,9 @@ QUIC_RFC_FRONTENDS = build/minyarc build/minyarc-callbacks build/minyarc-errors-
 QUIC_RFC_INPUTS = minyar tools/clang-driver.py tools/sanitizer_llvm.py \
     tests/quic-rfc.py tests/quic-rfc-harness.py tests/test_evidence.py tests/clang_helpers.py \
     tests/tls-local.py tests/quic_protocol_artifacts.py tests/quic-protocol-artifacts.py tests/interop/qns/endpoint.py library/quic.min library/tls.min library/tlsserver.min \
-    tests/quic-migration-cids.py tests/quic-migration-cids.min \
-    tests/quic-cipher-policy.py tests/quic-cipher-policy.min \
+    build/tooling/tests/quic-migration-cids-test tests/quic-migration-cids-test.min tests/quic-migration-cids.min \
+    build/tooling/tests/quic-cipher-policy-test tests/quic-cipher-policy-test.min tests/quic-cipher-policy.min \
+    tests/quic-protocol-support.min tests/quic-test-support.min tools/testing.min \
     tests/quic-qns-local.py tests/quic-vn-probe.py \
     tests/interop/qns/client.min tests/interop/qns/server.min \
     $(wildcard compiler/*.patch scripts/*compiler*.py runtime/*.h runtime/native/*.h)

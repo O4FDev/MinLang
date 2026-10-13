@@ -1,0 +1,106 @@
+use "../tools/testing.min" as test
+use "./quic-test-support.min" as quic
+use "system" as system
+use "files" as files
+use "json" as json
+
+constant MODES: List<Text> = ["initial", "handshake", "handshake-ack", "application", "confirmed", "close", "drain", "retry", "blocked-probe", "application-ack", "shared", "shared-late", "idle-send", "idle-pto", "initial-burst", "server-credit", "server-paired", "confirmed-delivery"]
+
+function known(name: Text): Boolean {
+    for mode in MODES { if mode == name { return true } }
+    return false
+}
+function inventory(sourceFiles: List<Text>, library: Text, log: Text): Text {
+    let result = quic.fileDigests(sourceFiles, log + "-files") + quic.treeDigests(["library", "runtime", "compiler", "tools"], [".min", ".c", ".h", ".py", ".sh"], log + "-trees")
+    if library != "" { result = result + quic.treeDigests([library], [""], log + "-override") }
+    return result
+}
+function save(output: Text, fields: List<Text>, cases: List<Text>, state: Text) {
+    let parts = ["{\n"]
+    for field in fields { parts.add("  " + field + ",\n") }
+    parts.add("  \"cases\": [" + quic.joined(cases, ",\n    ") + "],\n  \"state\": " + json.quote(state) + "\n}\n")
+    writeTextFile(output + "/results.json", parts)
+}
+
+let output = ""
+let sanitize = false
+let optimization = "0"
+let modes: List<Text> = []
+let library = ""
+let index = 0
+while index < argumentCount() {
+    let name = argument(index)
+    if name == "--sanitize" { sanitize = true; index += 1; continue }
+    test.check(index + 1 < argumentCount(), "missing PTO option value: " + name)
+    let value = argument(index + 1)
+    if name == "--artifacts" { output = value }
+    else if name == "--optimization" { test.check(value == "0" || value == "1" || value == "2", "invalid PTO optimization: " + value); optimization = value }
+    else if name == "--mode" { test.check(known(value), "invalid PTO mode: " + value); modes.add(value) }
+    else if name == "--library" { library = value }
+    else { fail("unknown PTO option: " + name) }
+    index += 2
+}
+test.check(output != "", "--artifacts is required")
+test.check(quic.starts(output, "/"), "PTO evidence path must be absolute")
+test.check(files.makeDirectory(output) == 0, "cannot create PTO artifacts")
+if modes.length == 0 { modes = MODES }
+let root = quic.root()
+if library == root + "/library" || library == "library" { library = "" }
+let flags = quic.flags(optimization, sanitize)
+let environment = quic.nativeFlags(system.environment(), flags)
+environment = quic.setting(environment, "MINYAR_TEST_EVIDENCE", output)
+environment = quic.setting(environment, "MAKEFLAGS", "-j1")
+if sanitize {
+    let leaks = "0"
+    if files.pathSize("/proc/self/stat") >= 0 { leaks = "1" }
+    environment = quic.setting(environment, "ASAN_OPTIONS", "detect_leaks=" + leaks)
+    environment = quic.setting(environment, "UBSAN_OPTIONS", "halt_on_error=1")
+}
+let sourceFiles = ["tests/quic-pto.min", "tests/quic-pto-test.min", "tests/quic-test-support.min", "tools/testing.min", "minyar"]
+let before = inventory(sourceFiles, library, output + "/.sources-before")
+let fields = ["\"optimization\": " + json.quote(optimization), "\"sanitize\": " + Text(sanitize), "\"sources\": " + quic.digestObject(before)]
+let cases: List<Text> = []
+save(output, fields, cases, "running")
+let raw = quic.evidence(output + "/raw")
+let version = quic.observe(raw, "openssl-version", ["openssl", "version"], environment, "", 10)
+if version.status != 0 { save(output, fields, cases, "failed"); fail("OpenSSL unavailable") }
+let certificates = output + "/certificates"
+let ca = quic.mutual(certificates)
+let names: List<Text> = []
+for name in files.list(certificates) { names.add(certificates + "/" + name) }
+names.sort()
+fields.add("\"certificate_hashes\": " + quic.digestObject(quic.fileDigests(names, output + "/.certificates")))
+let binary = output + "/quic-pto"
+let command = ["./minyar"]
+if library != "" { command.add("--library"); command.add(library) }
+for value in ["--library", "library", "tests/quic-pto.min", "-o", binary] { command.add(value) }
+let compiled = quic.observe(raw, "compile", command, environment, "", 240)
+fields.add("\"compiler_status\": " + Text(compiled.status))
+save(output, fields, cases, "running")
+if compiled.status != 0 { save(output, fields, cases, "failed"); fail("PTO compile failed (" + Text(compiled.status) + ")\n" + compiled.output + compiled.errorOutput) }
+fields.add("\"binary_sha256\": " + json.quote(quic.digest(binary, output + "/.binary")))
+let passed = true
+for mode in modes {
+    let argv = [binary]
+    for value in quic.peerArguments(ca) { argv.add(value) }
+    argv.add(mode)
+    let result = quic.observe(raw, "runtime-" + mode, argv, environment, "", 120)
+    let ok = result.status == 0 && result.output == "QUIC PTO " + mode + " passed\n" && result.errorOutput == ""
+    let observed = raw.commands[raw.commands.length - 1]
+    let row = "{\"mode\": " + json.quote(mode) + ", \"status\": " + Text(result.status) + ", \"passed\": " + Text(ok) +
+        ", \"stdout_sha256\": " + json.quote(observed.stdoutHash) + ", \"stderr_sha256\": " + json.quote(observed.stderrHash) + "}"
+    cases.add(row)
+    print(row)
+    passed = passed && ok
+    save(output, fields, cases, "running")
+}
+let after = inventory(sourceFiles, library, output + "/.sources-after")
+let unchanged = after == before
+fields.add("\"source_after_unchanged\": " + Text(unchanged))
+fields.add("\"raw_command_records\": {\"schema_version\": 2, \"workspace\": " + json.quote(raw.directory) + ", \"controls\": {\"modes\": " + quic.quoted(modes) + ", \"flags\": " + json.quote(flags) + ", \"library\": " + json.quote(library) + "}, \"commands\": " + quic.commandRecords(raw) + "}")
+fields.add("\"raw_command_records_retained\": true")
+let state = "passed"
+if !passed || !unchanged { state = "failed" }
+save(output, fields, cases, state)
+test.check(unchanged, "source changed during verification")
+if !passed { exit(1) }

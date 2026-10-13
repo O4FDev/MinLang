@@ -628,9 +628,11 @@ class BuildWiring(unittest.TestCase):
                   'tests/test_evidence.py', 'tests/clang_helpers.py',
                   'tests/tls-local.py', 'tests/quic_protocol_artifacts.py', 'tests/quic-protocol-artifacts.py',
                   'tests/interop/qns/endpoint.py', 'library/quic.min', 'library/tls.min',
-                  'library/tlsserver.min', 'tests/quic-migration-cids.py',
-                  'tests/quic-migration-cids.min', 'tests/quic-cipher-policy.py',
-                  'tests/quic-cipher-policy.min', 'tests/quic-qns-local.py',
+                  'library/tlsserver.min', 'build/tooling/tests/quic-migration-cids-test',
+                  'tests/quic-migration-cids-test.min', 'tests/quic-migration-cids.min',
+                  'build/tooling/tests/quic-cipher-policy-test', 'tests/quic-cipher-policy-test.min',
+                  'tests/quic-cipher-policy.min', 'tests/quic-protocol-support.min',
+                  'tests/quic-test-support.min', 'tools/testing.min', 'tests/quic-qns-local.py',
                   'tests/quic-vn-probe.py', 'tests/interop/qns/client.min',
                   'tests/interop/qns/server.min'}
 
@@ -716,9 +718,12 @@ class BuildWiring(unittest.TestCase):
         spec.loader.exec_module(catalogue)
         data = json.loads((ROOT/'tests/suite-catalogue.json').read_text())
         catalogue.validate(data, ROOT)
-        for name in sorted(inputs - {'minyar', 'tools/clang-driver.py',
-                                     'tools/sanitizer_llvm.py', 'library/quic.min',
-                                     'library/tls.min', 'library/tlsserver.min'}):
+        native = {'build/tooling/tests/quic-migration-cids-test', 'tests/quic-migration-cids-test.min',
+                  'build/tooling/tests/quic-cipher-policy-test', 'tests/quic-cipher-policy-test.min',
+                  'tests/quic-protocol-support.min', 'tests/quic-test-support.min', 'tools/testing.min'}
+        for name in sorted(inputs - native - {'minyar', 'tools/clang-driver.py',
+                                              'tools/sanitizer_llvm.py', 'library/quic.min',
+                                              'library/tls.min', 'library/tlsserver.min'}):
             self.assertIn(name, catalogue.discover(ROOT))
             with self.subTest(missing_source=name), self.assertRaises(ValueError):
                 catalogue.validate(dict(data, sources=[row for row in data['sources']
@@ -1133,12 +1138,13 @@ class BuildWiring(unittest.TestCase):
         end = text.index('# Handshake PTO virtual-clock modes', begin)
         source = text[begin:end]
         native, sanitize = 'check-quic-ack', 'check-quic-ack-sanitize'
+        tool = 'build/tooling/tests/quic-ack-test'
 
         def verify(fragment):
             with tempfile.TemporaryDirectory(prefix='minyar ACK wiring ') as folder:
                 makefile = Path(folder) / 'probe.mk'
-                makefile.write_text(fragment + '\n.PHONY: build/minyarc build\n'
-                                   'build/minyarc build:\n\t@echo ARTIFACT $@\n')
+                makefile.write_text(fragment + '\n.PHONY: build/minyarc build ' + tool + '\n'
+                                   'build/minyarc build ' + tool + ':\n\t@echo ARTIFACT $@\n')
                 env = dict(os.environ)
                 env.pop('MAKEFLAGS', None)
                 result = subprocess.run(['make', '-np', '-f', str(makefile), native, sanitize],
@@ -1154,11 +1160,10 @@ class BuildWiring(unittest.TestCase):
                 for gate in ('check-sanitize', 'check-quic-sanitize'):
                     self.assertIn(sanitize, rules.get(gate, set()), gate)
                 for target in (native, sanitize):
-                    self.assertTrue({'tests/quic-ack.py', 'tests/quic-ack.min',
-                                     'tests/tls-local.py', 'build/minyarc'}
+                    self.assertTrue({tool, 'tests/quic-ack.min', 'build/minyarc'}
                                     <= rules.get(target, set()), target)
                 commands = dry_run_commands(result.stdout)
-                self.assertEqual(commands.count('tests/quic-ack.py'), 2)
+                self.assertEqual(commands.count('./' + tool + ' '), 2)
                 self.assertEqual(commands.count('--optimization both'), 2)
                 self.assertEqual(commands.count('--sanitize'), 1)
                 self.assertEqual(commands.count('mktemp -d "'), 2)
@@ -1207,7 +1212,7 @@ class BuildWiring(unittest.TestCase):
         spec.loader.exec_module(catalogue)
         data = json.loads((ROOT / 'tests/suite-catalogue.json').read_text())
         catalogue.validate(data, ROOT)
-        for fixture in ('tests/quic-ack.py', 'tests/quic-ack.min'):
+        for fixture in ('tests/quic-ack.min',):
             self.assertIn(fixture, catalogue.discover(ROOT))
             with self.subTest(missing_source=fixture), self.assertRaises(ValueError):
                 catalogue.validate(dict(data, sources=[x for x in data['sources']
@@ -1222,12 +1227,13 @@ class BuildWiring(unittest.TestCase):
         end = text.index('# Pure controller regression', begin)
         source = text[begin:end]
         native, sanitize = 'check-quic-pto', 'check-quic-pto-sanitize'
+        tool = 'build/tooling/tests/quic-pto-test'
 
         def verify(fragment):
             with tempfile.TemporaryDirectory(prefix='minyar PTO wiring ') as folder:
                 makefile = Path(folder) / 'probe.mk'
-                makefile.write_text(fragment + '\n.PHONY: build/minyarc build\n'
-                                   'build/minyarc build:\n\t@echo ARTIFACT $@\n')
+                makefile.write_text(fragment + '\n.PHONY: build/minyarc build ' + tool + '\n'
+                                   'build/minyarc build ' + tool + ':\n\t@echo ARTIFACT $@\n')
                 env = dict(os.environ)
                 env.pop('MAKEFLAGS', None)
                 result = subprocess.run(['make', '-np', '-f', str(makefile), native, sanitize],
@@ -1243,10 +1249,10 @@ class BuildWiring(unittest.TestCase):
                 for gate in ('check-sanitize', 'check-quic-sanitize'):
                     self.assertIn(sanitize, rules.get(gate, set()), gate)
                 for target in (native, sanitize):
-                    self.assertTrue({'tests/quic-pto.py', 'tests/quic-pto.min', 'build/minyarc'}
+                    self.assertTrue({tool, 'tests/quic-pto.min', 'build/minyarc'}
                                     <= rules.get(target, set()), target)
                 commands = dry_run_commands(result.stdout)
-                self.assertEqual(commands.count('tests/quic-pto.py'), 3)
+                self.assertEqual(commands.count('./' + tool + ' '), 3)
                 for level in ('0', '1', '2'):
                     self.assertEqual(commands.count('--optimization ' + level), 1)
                 self.assertEqual(commands.count('--sanitize'), 1)
@@ -1281,7 +1287,7 @@ class BuildWiring(unittest.TestCase):
         spec.loader.exec_module(catalogue)
         data = json.loads((ROOT / 'tests/suite-catalogue.json').read_text())
         catalogue.validate(data, ROOT)
-        for fixture in ('tests/quic-pto.py', 'tests/quic-pto.min'):
+        for fixture in ('tests/quic-pto.min',):
             self.assertIn(fixture, catalogue.discover(ROOT))
             with self.subTest(missing_source=fixture), self.assertRaises(ValueError):
                 catalogue.validate(dict(data, sources=[x for x in data['sources'] if x['path'] != fixture]), ROOT)

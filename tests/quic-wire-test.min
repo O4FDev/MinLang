@@ -1,0 +1,188 @@
+use "../tools/testing.min" as test
+use "./quic-test-support.min" as quic
+use "./cpython-random.min" as random
+use "system" as system
+use "json" as json
+
+record WireCase { data: Bytes; wanted: Text }
+
+function vi(value: Integer, length: Integer): Bytes {
+    let result = Bytes(length)
+    let remaining = value
+    for index in 0..length {
+        result[length - 1 - index] = remaining & 255
+        remaining = remaining >> 8
+    }
+    let tag = 0
+    if length == 2 { tag = 1 }
+    if length == 4 { tag = 2 }
+    if length == 8 { tag = 3 }
+    result[0] = result[0] | (tag << 6)
+    return result
+}
+function varint(value: Integer): Bytes {
+    if value < 64 { return vi(value, 1) }
+    if value < 16384 { return vi(value, 2) }
+    if value < 1073741824 { return vi(value, 4) }
+    return vi(value, 8)
+}
+function join(parts: List<Bytes>): Bytes {
+    let result = Bytes()
+    for part in parts { result.addBytes(part) }
+    return result
+}
+function byte(value: Integer): Bytes {
+    let result = Bytes(1)
+    result[0] = value
+    return result
+}
+function large(state: random.State, bound: Integer): Integer {
+    let value = bound
+    while value >= bound {
+        let low = random.word(state)
+        let high = random.word(state) >> 1
+        value = low | (high << 32)
+    }
+    return value
+}
+function noise(state: random.State, bound: Integer): Bytes {
+    let length = random.below(state, bound)
+    let result = Bytes(length)
+    for index in 0..length { result[index] = random.below(state, 256) }
+    return result
+}
+function prefixes(cases: List<WireCase>, data: Bytes, first: Integer) {
+    for index in first..data.length { cases.add(WireCase { data: data.slice(0, index); wanted: "rejected" }) }
+}
+function check(binary: Text, work: Text, mode: Text, cases: List<WireCase>) {
+    let corpus = Bytes()
+    for item in cases {
+        let length = item.data.length
+        for shift in [24, 16, 8, 0] { corpus.add((length >> shift) & 255) }
+        corpus.addBytes(item.data)
+    }
+    let path = work + "/" + mode + ".bin"
+    writeBytesFile(path, corpus)
+    let actual = quic.output(test.run([binary, mode, path], system.environment(), "", work + "/" + mode + ".log", 120), mode)
+    test.check(actual.length == cases.length, mode + " " + Text(actual.length) + " " + Text(cases.length))
+    for index in 0..cases.length {
+        let wanted = cases[index].wanted
+        let output = actual[index]
+        let context = mode + " " + Text(index) + " " + quic.hex(cases[index].data) + " " + wanted + " " + output
+        if wanted == "accepted" { test.check(quic.starts(output, "ok "), context) }
+        else if wanted != "" { test.check(output == wanted, context) }
+    }
+}
+
+let sanitize = false
+for index in 0..argumentCount() {
+    test.check(argument(index) == "--sanitize", "unknown QUIC wire option: " + argument(index))
+    sanitize = true
+}
+let state = random.seeded("9000")
+let work = test.scratch()
+let binary = quic.program("tests/quic-wire.min", work + "/wire.exe", sanitize)
+
+let ints = [0, 1, 63, 64, 16383, 16384, 1073741823, 1073741824, 4611686018427387903]
+for unused in 0..2000 { ints.add(large(state, 4611686018427387904)) }
+let cases = [WireCase { data: Bytes(); wanted: "rejected" }]
+for value in ints {
+    for length in [1, 2, 4, 8] {
+        if value >= (1 << (8 * length - 2)) { continue }
+        let data = vi(value, length)
+        cases.add(WireCase { data: join([data, byte(255)]); wanted: Text(value) + " " + Text(length) })
+        prefixes(cases, data, 0)
+    }
+}
+check(binary, work, "varint", cases)
+
+let hello = Bytes("hello")
+let frames = [byte(1), join([byte(2), varint(9), varint(0), varint(1), varint(2), varint(1), varint(1)]),
+    join([byte(3), varint(9), varint(0), varint(0), varint(2), varint(1), varint(2), varint(3)]),
+    join([byte(4), varint(0), varint(4), varint(19)]), join([byte(5), varint(0), varint(7)]),
+    join([byte(6), varint(12), varint(5), hello]), join([byte(7), varint(5), Bytes("token")])]
+for kind in [10, 11, 14, 15] {
+    let offset = Bytes()
+    if (kind & 4) != 0 { offset = varint(9) }
+    frames.add(join([byte(kind), varint(4), offset, varint(5), hello]))
+}
+for kind in [16, 18, 19, 20, 22, 23, 25] { frames.add(join([byte(kind), varint(1000)])) }
+for kind in [17, 21] { frames.add(join([byte(kind), varint(4), varint(1000)])) }
+let sixteen = Bytes(16)
+for index in 0..16 { sixteen[index] = index }
+frames.add(join([byte(24), varint(2), varint(1), byte(8), Bytes("abcdefgh"), sixteen]))
+frames.add(join([byte(26), Bytes("12345678")]))
+frames.add(join([byte(27), Bytes("12345678")]))
+frames.add(join([byte(28), varint(10), varint(6), varint(3), Bytes("bye")]))
+frames.add(join([byte(29), varint(10), varint(3), Bytes("bye")]))
+frames.add(byte(30))
+cases = []
+for frame in frames { cases.add(WireCase { data: frame; wanted: "accepted" }) }
+for frame in frames { prefixes(cases, frame, 1) }
+for frame in frames { cases.add(WireCase { data: join([vi(frame[0], 2), frame.slice(1, frame.length)]); wanted: "rejected" }) }
+let invalid = [join([byte(2), byte(0), byte(0), byte(0), byte(1)]), join([byte(2), byte(1), byte(0), byte(1), byte(0), byte(0), byte(0)]),
+    join([byte(6), varint(4611686018427387903), varint(1), Bytes("a")]), join([byte(18), varint(1152921504606846977)]),
+    join([byte(24), byte(1), byte(2), byte(8), Bytes("abcdefgh"), Bytes(16)]), join([byte(24), byte(1), byte(0), byte(0), Bytes(16)]),
+    join([byte(7), byte(0)]), byte(31)]
+for data in invalid { cases.add(WireCase { data: data; wanted: "rejected" }) }
+for unused in 0..10000 { cases.add(WireCase { data: noise(state, 512); wanted: "" }) }
+cases.add(WireCase { data: Bytes(65535); wanted: "ok 0:0:0:false:0:;" })
+cases.add(WireCase { data: Bytes(65536); wanted: "rejected" })
+check(binary, work, "frames", cases)
+
+cases = []
+for rfc in ["9001", "9369"] {
+    let fixture = json.parse(readTextFile("tests/fixtures/quic-rfc" + rfc + ".json"))
+    let server = quic.fromHex(json.string(json.member(fixture, "server"), "packet"))
+    for role in ["client", "server"] {
+        let packet = quic.fromHex(json.string(json.member(fixture, role), "packet"))
+        let wanted = "0 " + Text(packet.length) + " 18"
+        cases.add(WireCase { data: packet; wanted: wanted })
+        cases.add(WireCase { data: join([packet, server]); wanted: wanted })
+        prefixes(cases, packet, 0)
+    }
+    let retry = quic.fromHex(json.string(fixture, "retry"))
+    cases.add(WireCase { data: retry; wanted: "3 " + Text(retry.length) + " 0" })
+}
+let negotiation = Bytes(11)
+negotiation[0] = 128
+negotiation[10] = 1
+cases.add(WireCase { data: negotiation; wanted: "5 11 0" })
+let short = Bytes(8)
+short[0] = 128
+short[7] = 1
+cases.add(WireCase { data: short; wanted: "rejected" })
+cases.add(WireCase { data: join([quic.fromHex("c00000000115"), Bytes(100)]); wanted: "rejected" })
+for unused in 0..10000 { cases.add(WireCase { data: noise(state, 512); wanted: "" }) }
+check(binary, work, "header", cases)
+
+let identifier = Bytes("abcdefgh")
+let prefix = join([quic.fromHex("c00000000108"), identifier])
+cases = [WireCase { data: prefix; wanted: quic.hex(identifier) }, WireCase { data: join([byte(64), identifier]); wanted: quic.hex(identifier) }]
+for index in 0..8 { cases.add(WireCase { data: join([byte(64), identifier.slice(0, index)]); wanted: "rejected" }) }
+prefixes(cases, prefix, 0)
+cases.add(WireCase { data: join([byte(0), identifier]); wanted: "rejected" })
+cases.add(WireCase { data: join([quic.fromHex("c00000000015"), Bytes(21)]); wanted: "rejected" })
+check(binary, work, "destination", cases)
+
+let unsupported = join([quic.fromHex("c05741495408"), identifier, byte(4), Bytes("peer")])
+cases = [WireCase { data: join([unsupported, Bytes(1200 - unsupported.length)]); wanted: "00000000047065657208616263646566676800000001" }]
+prefixes(cases, unsupported, 0)
+cases.add(WireCase { data: join([prefix, Bytes(1200 - prefix.length)]); wanted: "rejected" })
+check(binary, work, "negotiate", cases)
+
+let parameters = join([varint(15), varint(8), Bytes("abcdefgh")])
+cases = [WireCase { data: parameters; wanted: "ok 1" }]
+prefixes(cases, parameters, 0)
+let keys = [3, 10, 11, 14, 8]
+let values = [1199, 21, 16384, 1, 1152921504606846977]
+for index in 0..keys.length {
+    let body = varint(values[index])
+    cases.add(WireCase { data: join([parameters, varint(keys[index]), varint(body.length), body]); wanted: "rejected" })
+}
+cases.add(WireCase { data: join([parameters, parameters]); wanted: "rejected" })
+cases.add(WireCase { data: join([parameters, quic.fromHex("0c0161")]); wanted: "rejected" })
+for unused in 0..10000 { cases.add(WireCase { data: noise(state, 256); wanted: "" }) }
+check(binary, work, "parameters", cases)
+test.removeTree(work)
+print("QUIC wire: independent varints, RFC headers, all frame prefixes, constraints, 30,000 seeded parser mutations passed")

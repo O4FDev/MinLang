@@ -628,25 +628,31 @@ check-tls-sanitize: build/minyarc
 
 check check-portable: check-tls
 
+QUIC_TEST_TOOLS = quic-ack-test quic-pto-test quic-suite-test quic-crypto-test quic-wire-test quic-dispatch-test \
+    quic-transport-test quic-migration-cids-test quic-cipher-policy-test
+$(QUIC_TEST_TOOLS:%=build/tooling/tests/%.ll): tests/quic-test-support.min
+build/tooling/tests/quic-migration-cids-test.ll build/tooling/tests/quic-cipher-policy-test.ll: tests/quic-protocol-support.min
+build/tooling/tests/quic-wire-test.ll: tests/cpython-random.min
+
 # ACK scheduling gates retain both native and sanitizer optimizations.
 .PHONY: check-quic-ack check-quic-ack-sanitize
-check-quic-ack: build/minyarc tests/quic-ack.py tests/quic-ack.min tests/tls-local.py | build
-	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-ack-native.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/quic-ack.py --optimization both --artifacts "$$artifacts"
+check-quic-ack: build/minyarc tests/quic-ack.min build/tooling/tests/quic-ack-test | build
+	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-ack-native.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/quic-ack-test --optimization both --artifacts "$$artifacts"
 
-check-quic-ack-sanitize: build/minyarc tests/quic-ack.py tests/quic-ack.min tests/tls-local.py | build
-	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-ack-sanitize.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/quic-ack.py --optimization both --sanitize --artifacts "$$artifacts"
+check-quic-ack-sanitize: build/minyarc tests/quic-ack.min build/tooling/tests/quic-ack-test | build
+	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-ack-sanitize.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-ack-test --optimization both --sanitize --artifacts "$$artifacts"
 
 check check-portable check-quic: check-quic-ack
 check-sanitize check-quic-sanitize: check-quic-ack-sanitize
 
 # Handshake PTO virtual-clock modes use fresh absolute evidence directories.
 .PHONY: check-quic-pto check-quic-pto-sanitize
-check-quic-pto: build/minyarc tests/quic-pto.py tests/quic-pto.min | build
-	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-pto-native-O0.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/quic-pto.py --optimization 0 --artifacts "$$artifacts"
-	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-pto-native-O2.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/quic-pto.py --optimization 2 --artifacts "$$artifacts"
+check-quic-pto: build/minyarc tests/quic-pto.min build/tooling/tests/quic-pto-test | build
+	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-pto-native-O0.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/quic-pto-test --optimization 0 --artifacts "$$artifacts"
+	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-pto-native-O2.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/quic-pto-test --optimization 2 --artifacts "$$artifacts"
 
-check-quic-pto-sanitize: build/minyarc tests/quic-pto.py tests/quic-pto.min | build
-	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-pto-sanitize-O1.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/quic-pto.py --optimization 1 --sanitize --artifacts "$$artifacts"
+check-quic-pto-sanitize: build/minyarc tests/quic-pto.min build/tooling/tests/quic-pto-test | build
+	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-pto-sanitize-O1.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-pto-test --optimization 1 --sanitize --artifacts "$$artifacts"
 
 check check-portable check-quic: check-quic-pto
 check-sanitize check-quic-sanitize: check-quic-pto-sanitize
@@ -660,16 +666,19 @@ check check-portable check-quic check-quic-sanitize: check-quic-interop-results
 
 # Native suite levels are independent children so a parallel runner overlaps them.
 .PHONY: check-quic check-quic-sanitize check-quic-native-O0 check-quic-native-O2 check-quic-native-sanitize
-check-quic-native-O0: build/minyarc
-	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/quic-suite.py --artifacts build/quic-native-O0
+QUIC_SUITE_TOOLS = build/tooling/tests/quic-suite-test build/tooling/tests/quic-crypto-test build/tooling/tests/quic-wire-test \
+    build/tooling/tests/quic-dispatch-test build/tooling/tests/quic-transport-test build/tooling/tests/quic-migration-cids-test
 
-check-quic-native-O2: build/minyarc
-	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/quic-suite.py --optimization 2 --artifacts build/quic-native-O2
+check-quic-native-O0: build/minyarc $(QUIC_SUITE_TOOLS)
+	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/quic-suite-test --artifacts build/quic-native-O0
+
+check-quic-native-O2: build/minyarc $(QUIC_SUITE_TOOLS)
+	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/quic-suite-test --optimization 2 --artifacts build/quic-native-O2
 
 check-quic: build/minyarc check-quic-native-O0 check-quic-native-O2
 
-check-quic-native-sanitize: build/minyarc
-	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/quic-suite.py --sanitize --artifacts build/quic-sanitize
+check-quic-native-sanitize: build/minyarc $(QUIC_SUITE_TOOLS)
+	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-suite-test --sanitize --artifacts build/quic-sanitize
 
 check-quic-sanitize: build/minyarc check-quic-native-sanitize
 

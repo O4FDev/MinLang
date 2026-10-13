@@ -34,14 +34,15 @@ BINARIES = {
     'server': 'tests/interop/qns/server.min',
 }
 DRIVERS = (
-    ('migration', 'tests/quic-migration-cids.py', 'BASELINE',
+    ('migration', 'tests/quic-migration-cids-test.min', 'NAMES',
      ('--binary', 'migration')),
-    ('cipher', 'tests/quic-cipher-policy.py', 'BASELINE',
+    ('cipher', 'tests/quic-cipher-policy-test.min', 'NAMES',
      ('--binary', 'cipher')),
     ('local', 'tests/quic-qns-local.py', 'CASES',
      ('--client', 'client', '--server', 'server', '--port', str(PORT))),
     ('vn', 'tests/quic-vn-probe.py', None, ('--server', 'server', '--port', str(PORT))),
 )
+NATIVE_SUPPORT = ('tests/quic-protocol-support.min', 'tests/quic-test-support.min', 'tools/testing.min')
 OPTIMIZATIONS = ('0', '2')
 
 
@@ -69,16 +70,22 @@ def normalized_text(raw):
 
 
 def declared_cases(path, symbol):
-    tree = ast.parse(Path(path).read_text())
-    nodes = [node.value for node in tree.body if isinstance(node, ast.Assign)
-             and any(isinstance(target, ast.Name) and target.id == symbol
-                     for target in node.targets)]
-    require(len(nodes) == 1, 'case inventory must have one literal declaration')
-    node = nodes[0]
-    if isinstance(node, ast.Dict):
-        keys = [ast.literal_eval(key) for key in node.keys]
-        require(len(keys) == len(set(keys)), 'duplicate literal case key')
-    value = ast.literal_eval(node)
+    if Path(path).suffix == '.min':
+        literals = re.findall(r'^constant ' + re.escape(symbol) + r': List<Text> = (\[.*?\])$',
+                              Path(path).read_text(), re.M | re.S)
+        require(len(literals) == 1, 'case inventory must have one literal declaration')
+        value = json.loads(literals[0])
+    else:
+        tree = ast.parse(Path(path).read_text())
+        nodes = [node.value for node in tree.body if isinstance(node, ast.Assign)
+                 and any(isinstance(target, ast.Name) and target.id == symbol
+                         for target in node.targets)]
+        require(len(nodes) == 1, 'case inventory must have one literal declaration')
+        node = nodes[0]
+        if isinstance(node, ast.Dict):
+            keys = [ast.literal_eval(key) for key in node.keys]
+            require(len(keys) == len(set(keys)), 'duplicate literal case key')
+        value = ast.literal_eval(node)
     require(isinstance(value, (dict, tuple, list)), 'case inventory must be a literal collection')
     cases = list(value)
     require(cases and all(isinstance(case, str) and case for case in cases)
@@ -449,6 +456,10 @@ def verify_link(directory, binary, sanitize, optimization='0', compiler_identity
     return report
 
 
+def driver_tool(source):
+    return ROOT / 'build/tooling' / Path(source).with_suffix('')
+
+
 def snapshot_inputs():
     paths = [ROOT / 'minyar', ROOT / 'Makefile']
     for name in ('bootstrap', 'compiler', 'library', 'runtime', 'tools',
@@ -460,6 +471,7 @@ def snapshot_inputs():
     paths += [path for path in sorted((ROOT / 'vendor').rglob('*')) if path.is_file()]
     paths += [ROOT / name for name in BINARIES.values()]
     paths += [ROOT / row[1] for row in DRIVERS]
+    paths += [ROOT / name for name in NATIVE_SUPPORT]
     paths += [Path(__file__), ROOT / 'tests/quic-rfc-harness.py',
               ROOT / 'tests/tls-local.py', ROOT / 'tests/test_evidence.py',
               ROOT / 'tests/clang_helpers.py', ROOT / 'tests/quic_protocol_artifacts.py',
@@ -516,9 +528,12 @@ def verify_driver_artifacts(directory, kind, parsed, cases, binaries, source_inp
         key in expected and value == expected[key] for key, value in inputs.items()),
         'author source/binary input binding mismatch')
     required = {str((ROOT / row[1]).resolve()) for row in DRIVERS if row[0] == kind}
-    required |= {str((ROOT / 'tests/quic_protocol_artifacts.py').resolve()),
-                 str((ROOT / 'tests/test_evidence.py').resolve())}
-    required |= {str((ROOT / 'tests/tls-local.py').resolve())}
+    if kind in ('migration', 'cipher'):
+        required |= {str((ROOT / name).resolve()) for name in NATIVE_SUPPORT}
+    else:
+        required |= {str((ROOT / 'tests/quic_protocol_artifacts.py').resolve()),
+                     str((ROOT / 'tests/test_evidence.py').resolve())}
+        required |= {str((ROOT / 'tests/tls-local.py').resolve())}
     required |= {str((ROOT / BINARIES[name]).resolve()) for name in (
         (kind,) if kind in ('migration', 'cipher') else ('client', 'server') if kind == 'local'
         else ('server',))}
@@ -807,6 +822,10 @@ def run_gate(directory, sanitize, source_commit=None):
             row['version_stdout'] = result.stdout.decode(errors='replace')
             row['version_stderr'] = result.stderr.decode(errors='replace')
             report['external_tools'][name] = row
+        for kind, source, symbol, arguments in DRIVERS:
+            if source.endswith('.min'):
+                report['external_tools'][kind + '-driver'] = bound_copy(
+                    driver_tool(source), directory / 'tools' / (kind + '-driver.bin'))
         import shlex
         for opt in OPTIMIZATIONS:
             flags = requested_flags(opt, sanitize)
@@ -826,7 +845,8 @@ def run_gate(directory, sanitize, source_commit=None):
                 report['links'].append(dict(name=name, optimization=opt, manifest=link_report))
             for kind, source, symbol, arguments in DRIVERS:
                 child_artifacts = directory / ('driver-' + kind + '-O' + opt)
-                command = [sys.executable, str(ROOT / source)]
+                command = ([str(driver_tool(source))] if source.endswith('.min')
+                           else [sys.executable, str(ROOT / source)])
                 for argument in arguments:
                     command.append(str(binaries[argument]) if argument in binaries else argument)
                 command += ['--artifacts', str(child_artifacts)]

@@ -73,6 +73,23 @@ class QuicRfcHarness(unittest.TestCase):
                 with self.subTest(content=content), self.assertRaises((ValueError, TypeError)):
                     RFC.declared_cases(source, 'BASELINE')
 
+    def test_native_case_inventory_requires_one_text_literal(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / 'cases.min'
+            source.write_text('constant NAMES: List<Text> = [\n    "a",\n    "b"]\n'
+                              'constant CODES: List<Integer> = [0, 1]\n')
+            self.assertEqual(RFC.declared_cases(source, 'NAMES'), ['a', 'b'])
+            for content in ('constant NAMES: List<Text> = []\n',
+                            'constant NAMES: List<Text> = ["a", "a"]\n',
+                            'constant NAMES: List<Text> = [""]\n',
+                            'constant NAMES: List<Text> = [1]\n',
+                            'constant NAMES: List<Text> = names()\n',
+                            'constant NAMES: List<Integer> = [0]\n',
+                            'constant NAMES: List<Text> = ["a"]\nconstant NAMES: List<Text> = ["b"]\n'):
+                source.write_text(content)
+                with self.subTest(content=content), self.assertRaises((ValueError, TypeError)):
+                    RFC.declared_cases(source, 'NAMES')
+
     def test_numeric_fields_exclude_boolean_float_and_string_values(self):
         for value in (True, False, 0.0, 2.0, '0', None):
             self.assertFalse(RFC.exact_integer(value))
@@ -344,8 +361,8 @@ class QuicRfcHarness(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             base=Path(folder);project=base/'project';artifacts=base/'artifacts'
             project.mkdir();artifacts.mkdir();(artifacts/'fixtures').mkdir()
-            names=('tests/quic-migration-cids.py','tests/quic-migration-cids.min',
-                   'tests/quic_protocol_artifacts.py','tests/test_evidence.py','tests/tls-local.py')
+            names=('tests/quic-migration-cids-test.min','tests/quic-migration-cids.min',
+                   'tests/quic-protocol-support.min','tests/quic-test-support.min','tools/testing.min')
             sources={}
             for name in names:
                 path=project/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(name.encode())
@@ -436,6 +453,7 @@ class QuicRfcHarness(unittest.TestCase):
                    'vendor/monocypher/NOTICE','runtime/native/abi.h'}
             names.update(RFC.BINARIES.values())
             names.update(row[1] for row in RFC.DRIVERS)
+            names.update(RFC.NATIVE_SUPPORT)
             for name in names:
                 path=project/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_text(name)
             with patch.object(RFC,'ROOT',project),patch.object(RFC,'__file__',str(project/'tests/quic-rfc.py')):
