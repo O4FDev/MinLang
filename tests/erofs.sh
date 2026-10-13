@@ -11,6 +11,17 @@ MINYAR_CLANG="$clang" ./minyar tests/erofs-api.min -o "$work/api"
 "$work/tree" create "$work/source"
 "$work/api" "$work/source" "$work/api.erofs"
 test ! -e "$work/api.erofs"
+for kind in worker helper legacy legacy-helper; do
+    if ./build/minyarc "tests/erofs-thread-$kind.min" "$work/$kind.ll" --library "$PWD/library" > "$work/$kind.log" 2>&1; then
+        cat "$work/$kind.log"
+        exit 1
+    fi
+    grep -F "native 'minyar_erofs_directoryStatus' 8(2,2,1,1,1)" "$work/$kind.log"
+    test ! -e "$work/$kind.ll"
+done
+MINYAR_CLANG="$clang" ./minyar tests/erofs-thread-main.min -o "$work/thread-main"
+"$work/thread-main" "$work/source" "$work/thread-main.erofs"
+/usr/bin/fsck.erofs --extract "$work/thread-main.erofs"
 "$work/writer" "$work/source" "$work/plain.erofs"
 /usr/bin/fsck.erofs --extract "$work/plain.erofs"
 "$work/writer" "$work/source" "$work/lz4.erofs" 17592186040320 lz4
