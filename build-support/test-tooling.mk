@@ -21,12 +21,13 @@ build/testing/cycle-runtime.o: build/testing/cycle-runtime.c $(wildcard runtime/
 
 
 .PHONY: check-minyar-runner
-check-minyar-runner: build/tooling/tests/runner build/tooling/tests/linux-runner build/tooling/tests/testing-inputs build/tooling/tests/test-clang build/tooling/tests/clang-cache build/tooling/scripts/check-linux build/tooling/tools/test-clang build/tooling/tools/clang-cache
+check-minyar-runner: build/tooling/tests/toolchain-cache build/tooling/tests/runner build/tooling/tests/linux-runner build/tooling/tests/testing-inputs build/tooling/tests/test-clang build/tooling/tests/clang-cache build/tooling/scripts/check-linux build/tooling/tools/test-clang build/tooling/tools/clang-cache
 	$(LIMITED) ./build/tooling/tests/runner
 	$(LIMITED) ./build/tooling/tests/linux-runner "$(CURDIR)/build/tooling/scripts/check-linux"
 	$(LIMITED) ./build/tooling/tests/testing-inputs "$(CURDIR)/build/tooling/tests/testing-inputs"
 	$(SANITIZER_LIMITED) ./build/tooling/tests/clang-cache "$(LLVM_CC)" "$(CURDIR)/build/tooling/tools/clang-cache"
 	$(SANITIZER_LIMITED) ./build/tooling/tests/test-clang "$(CURDIR)/build/tooling/tools/test-clang" "$(CURDIR)/build/tooling/tools/clang-cache" "$$(command -v $(LLVM_CC))" "$$(command -v ld.lld)"
+	$(SANITIZER_LIMITED) ./build/tooling/tests/toolchain-cache "$(CURDIR)" "$$(command -v $(LLVM_CC))" "$$(command -v clang++)" "$$(command -v ld.lld)"
 
 check: check-minyar-runner
 
