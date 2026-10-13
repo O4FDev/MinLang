@@ -1,0 +1,126 @@
+use "./net-fixtures.min" as fixtures
+use "./cpython-random.min" as random
+use "../tools/testing.min" as test
+
+record Frame { kind: Integer; stream: Integer; payload: Bytes }
+record Probe { context: fixtures.Context; binary: Text }
+
+function encode(kind: Integer, stream: Integer, payload: Bytes): Bytes {
+    let result = Bytes("HPW1")
+    result.add(kind)
+    for index in 0..3 { result.add(0) }
+    for value in [stream, payload.length] { for shift in [24, 16, 8, 0] { result.add((value >> shift) & 255) } }
+    result.addBytes(payload)
+    return result
+}
+function word(raw: Bytes, at: Integer): Integer { return (raw[at] << 24) | (raw[at + 1] << 16) | (raw[at + 2] << 8) | raw[at + 3] }
+function decode(raw: Bytes): Text {
+    let lines: List<Text> = []
+    let at = 0
+    let error = 4
+    while at < raw.length {
+        if raw.length - at < 16 { error = 12; break }
+        let kind = raw[at + 4]
+        let stream = word(raw, at + 8)
+        let size = word(raw, at + 12)
+        if Text(raw.slice(at, at + 4)) != "HPW1" || raw[at + 5] != 0 || raw[at + 6] != 0 || raw[at + 7] != 0 || kind < 1 || kind > 7 { error = 10; break }
+        if (kind == 1 || kind == 2) != (stream == 0) { error = 10; break }
+        let maximum = 16384
+        if kind == 5 { maximum = 65536 }
+        if kind == 6 { maximum = 0 }
+        if kind == 4 { maximum = 16 }
+        if size > maximum || (kind != 6 && size == 0) { error = 10; break }
+        if raw.length - at - 16 < size { error = 12; break }
+        lines.add("FRAME " + Text(kind) + " " + Text(stream) + " " + Text(size) + "\n")
+        at += 16 + size
+    }
+    lines.add("FRAME_ERROR " + Text(error) + "\n")
+    return joinText(lines)
+}
+function run(probe: Probe, raw: Bytes, piece: Integer): Text {
+    writeBytesFile(probe.context.work + "/wire", raw)
+    let result = fixtures.run(probe.context, [probe.binary, "frames", probe.context.work + "/wire", Text(piece)], 60)
+    test.check(result.status == 0 && result.errorOutput == "", "frames " + Text(result.status) + "\n" + result.errorOutput)
+    return result.output
+}
+function check(probe: Probe, raw: Bytes, piece: Integer) {
+    let expected = decode(raw)
+    let actual = run(probe, raw, piece)
+    test.check(actual == expected, fixtures.hex(raw.slice(0, min(64, raw.length))) + " piece " + Text(piece) + "\nexpected\n" + expected + "actual\n" + actual)
+}
+function repeated(byte: Integer, count: Integer): Bytes {
+    let result = Bytes()
+    for index in 0..count { result.add(byte) }
+    return result
+}
+
+fixtures.arguments(["--red", "--sanitize"], [])
+let context = fixtures.context(fixtures.flag("--sanitize"))
+context.environment = fixtures.withSetting(context.environment, "MINYAR_CLANG", fixtures.valueOr(context.environment, "MINYAR_TEST_CLANG", "clang"))
+if fixtures.flag("--sanitize") { context.environment = fixtures.withSetting(fixtures.withSetting(context.environment, "ASAN_OPTIONS", "detect_leaks=1"), "UBSAN_OPTIONS", "halt_on_error=1") }
+let binary = context.work + "/probe"
+fixtures.execute(context, [context.root + "/minyar", context.root + "/tests/peer-wire.min", "-o", binary], 240, "compile peer-wire probe")
+let probe = Probe { context: context; binary: binary }
+if fixtures.flag("--red") {
+    let raw = encode(4, 1, Bytes("ok"))
+    test.check(decode(raw) == "FRAME 4 1 2\nFRAME_ERROR 4\n", "independent model")
+    let actual = run(probe, raw, 1)
+    test.check(actual != "FRAME 4 1 2\nFRAME_ERROR 4\n" && test.contains(actual, "FRAME_ERROR 10"), actual)
+    print("RED: independent valid HPW1 status rejected by initial stub")
+    fixtures.finish(context)
+    exit(0)
+}
+let counting = Bytes()
+for round in 0..256 { for byte in 0..256 { counting.add(byte) } }
+let data = Bytes("hello")
+data.add(0)
+data.addBytes(Bytes("world"))
+let frames = [Frame { kind: 1; stream: 0; payload: Bytes("{\"device_id\":\"device-a\",\"exit_id\":\"exit-a\"}") },
+    Frame { kind: 2; stream: 0; payload: Bytes("{\"in_flight\":1,\"max_concurrent\":5,\"paused\":false}") },
+    Frame { kind: 3; stream: 1; payload: Bytes("{\"dial_grant_bytes\":\"fixture.jwt.signature\",\"exit_id\":\"exit-a\",\"conn_id\":\"conn-1\",\"deadline\":1060}") },
+    Frame { kind: 4; stream: 1; payload: Bytes("ok") }, Frame { kind: 5; stream: 1; payload: data }, Frame { kind: 6; stream: 1; payload: Bytes() },
+    Frame { kind: 7; stream: 1; payload: Bytes("{\"exit_id\":\"exit-a\",\"conn_id\":\"conn-1\",\"target_host\":\"example.com\",\"port\":443,\"expires\":1060}") },
+    Frame { kind: 5; stream: 4294967295; payload: counting }]
+let prefixes = 0
+let combined = Bytes()
+for frame in frames {
+    let raw = encode(frame.kind, frame.stream, frame.payload)
+    combined.addBytes(raw)
+    check(probe, raw, 1)
+    check(probe, raw, 7)
+    check(probe, raw, raw.length + 1)
+    writeBytesFile(context.work + "/wire", raw)
+    writeBytesFile(context.work + "/payload", frame.payload)
+    let result = fixtures.run(context, [binary, "prefixes", context.work + "/wire", Text(frame.kind), Text(frame.stream), context.work + "/payload"], 120)
+    test.check(result.status == 0 && result.output == "PREFIXES " + Text(raw.length + 1) + "\n" && result.errorOutput == "", "prefixes " + Text(frame.kind) + " " + Text(result.status) + "\n" + result.output + result.errorOutput)
+    prefixes += raw.length + 1
+}
+for piece in [1, 7, 16, 65536, combined.length] { check(probe, combined, piece) }
+let x = Bytes("x")
+let bad = encode(5, 1, x)
+let renamed = Bytes("BAD1")
+renamed.addBytes(bad.slice(4, bad.length))
+for raw in [encode(0, 1, x), encode(255, 1, x), encode(1, 1, Bytes("{}")), encode(5, 0, x), encode(6, 1, x), encode(5, 1, repeated(120, 65537)),
+        encode(3, 1, repeated(120, 16385)), encode(4, 1, repeated(120, 17)), encode(4, 1, Bytes()), renamed] { check(probe, raw, 1) }
+for offset in [5, 6, 7] {
+    let raw = encode(5, 1, x)
+    raw[offset] = 1
+    check(probe, raw, 1)
+}
+let rng = random.seeded("1213224753")
+for index in 0..500 {
+    let chosen = frames[random.below(rng, 7)]
+    let raw = encode(chosen.kind, chosen.stream, chosen.payload)
+    if index % 4 == 0 {
+        raw = raw.slice(0, random.below(rng, raw.length + 1))
+    } else {
+        for round in 0..(1 + index % 3) {
+            let at = random.below(rng, raw.length)
+            raw[at] = raw[at] ^ (1 << random.below(rng, 8))
+        }
+    }
+    let pieces = [1, 7, raw.length + 1]
+    check(probe, raw, pieces[random.below(rng, 3)])
+}
+print("Peer wire framing: " + Text(prefixes) + " complete all-prefix controls + 500 seeded independent model mutations passed")
+fixtures.finish(context)

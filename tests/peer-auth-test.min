@@ -1,0 +1,287 @@
+use "./net-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+use "./peer-grants.min" as grants
+
+record Run { context: fixtures.Context; signer: grants.Signer; binary: Text; count: Integer }
+record Check { explicit: Boolean; raw: Bytes; bundle: Bytes; accepted: Boolean; now: Integer; deadline: Integer; authenticated: Text; requested: Text; connection: Text; trap: Boolean; expected: Text }
+
+function options(): Check {
+    return Check { explicit: false; raw: Bytes(); bundle: Bytes(); accepted: false; now: 1000; deadline: 1060; authenticated: "exit-a"; requested: "exit-a"; connection: "conn-1"; trap: false; expected: "" }
+}
+function grant(raw: Bytes): Check {
+    let result = options()
+    result.explicit = true
+    result.raw = raw
+    return result
+}
+function accepted(raw: Bytes, expected: Text): Check {
+    let result = grant(raw)
+    result.accepted = true
+    result.expected = expected
+    return result
+}
+function keys(value: Bytes, accepting: Boolean): Check {
+    let result = options()
+    result.bundle = value
+    result.accepted = accepting
+    return result
+}
+function check(run: Run, name: Text, item: Check) {
+    run.count += 1
+    let directory = run.context.work
+    let keyBundle = item.bundle
+    if keyBundle.length == 0 { keyBundle = grants.jwks(grants.goodKey()) }
+    let raw = item.raw
+    if !item.explicit { raw = grants.token(run.signer) }
+    writeBytesFile(directory + "/keys", keyBundle)
+    writeBytesFile(directory + "/grant", raw)
+    let mode = "grant"
+    if item.trap { mode = "trap" }
+    let result = fixtures.run(run.context, [run.binary, mode, directory + "/keys", directory + "/grant", item.authenticated, item.requested, item.connection, Text(item.now), Text(item.deadline)], 10)
+    if item.trap {
+        test.check(result.status != 0 && test.contains(result.errorOutput, "cannot read a rejected grant"), name + ": " + Text(result.status) + "\n" + result.output + result.errorOutput)
+        return
+    }
+    test.check(result.status == 0, name + ": status " + Text(result.status) + "\n" + result.errorOutput)
+    if item.accepted {
+        let expected = item.expected
+        if expected == "" { expected = "OK exit-a conn-1 example.com  443 1060" }
+        test.check(fixtures.strip(result.output) == expected, name + ": " + result.output + result.errorOutput)
+    } else {
+        test.check(fixtures.starts(result.output, "GRANT_ERROR ") || fixtures.starts(result.output, "KEY_ERROR "), name + ": " + result.output)
+        let words = test.words(result.output)
+        let code = words[words.length - 1]
+        test.check(code == "6" || code == "8" || code == "10" || code == "11", name + ": " + result.output)
+    }
+}
+function repeat(text: Text, count: Integer): Text {
+    let parts: List<Text> = []
+    for index in 0..count { parts.add(text) }
+    return joinText(parts)
+}
+function bytesOf(values: List<Integer>): Bytes {
+    let result = Bytes()
+    for value in values { result.add(value) }
+    return result
+}
+function replaceAll(source: Bytes, needle: Bytes, replacement: Bytes, limit: Integer): Bytes {
+    let result = Bytes()
+    let index = 0
+    let replaced = 0
+    while index < source.length {
+        let equal = index + needle.length <= source.length && (limit < 0 || replaced < limit)
+        if equal { for offset in 0..needle.length { if source[index + offset] != needle[offset] { equal = false; break } } }
+        if equal { result.addBytes(replacement); index += needle.length; replaced += 1 } else { result.add(source[index]); index += 1 }
+    }
+    return result
+}
+function splitBytes(source: Bytes, separator: Integer): List<Bytes> {
+    let result: List<Bytes> = []
+    let start = 0
+    for index in 0..source.length {
+        if source[index] == separator { result.add(source.slice(start, index)); start = index + 1 }
+    }
+    result.add(source.slice(start, source.length))
+    return result
+}
+function valid(expected: Text): Check {
+    let result = options()
+    result.accepted = true
+    result.expected = expected
+    return result
+}
+function openBrace(source: Bytes): Bytes { return source.slice(0, source.length - 1) }
+
+fixtures.arguments(["--sanitize", "--red", "--openssl-signer"], ["--library"])
+let sanitize = fixtures.flag("--sanitize")
+let context = fixtures.context(sanitize)
+for pair in [["monocypher.c", "f1f838cdd483bdebe0df0ff5c5ed60535e496f769c6a2f933ac4c0b114207123"], ["monocypher-ed25519.c", "ce0d2f8e32ca8f66398ba5b3456cc74327c3eff14e7b950ce7d57be9025cc453"]] {
+    let digest = fixtures.execute(context, ["sha256sum", context.root + "/vendor/monocypher/" + pair[0]], 10, "hash vendored Monocypher")
+    test.check(fixtures.split(digest.output, 32)[0] == pair[1], "vendored " + pair[0] + " changed")
+}
+context.environment = fixtures.withSetting(context.environment, "MINYAR_CLANG", fixtures.valueOr(context.environment, "MINYAR_TEST_CLANG", "clang"))
+if sanitize { context.environment = fixtures.withSetting(context.environment, "ASAN_OPTIONS", "detect_leaks=1") }
+let binary = context.work + "/probe"
+let compiler = [context.root + "/minyar"]
+if fixtures.option("--library", "") != "" {
+    compiler.add("--library")
+    compiler.add(fixtures.option("--library", ""))
+}
+for item in [context.root + "/tests/peer-auth.min", "-o", binary] { compiler.add(item) }
+fixtures.execute(context, compiler, 240, "compile peer-auth probe")
+let run = Run { context: context; signer: grants.signer(context); binary: binary; count: 0 }
+if fixtures.flag("--red") {
+    check(run, "independent valid grant is rejected by initial stub", options())
+    print("RED: independent valid grant rejected by verifier stub")
+    fixtures.finish(context)
+    exit(0)
+}
+let base = grants.claims()
+check(run, "independent valid grant", valid(""))
+check(run, "minimum port", accepted(grants.withClaims(run.signer, grants.put(base, "port", "1")), "OK exit-a conn-1 example.com  1 1060"))
+check(run, "maximum port", accepted(grants.withClaims(run.signer, grants.put(base, "port", "65535")), "OK exit-a conn-1 example.com  65535 1060"))
+check(run, "issued at positive skew boundary", accepted(grants.withClaims(run.signer, grants.put(base, "iat", "1030")), ""))
+let padded = grants.render(grants.put(base, "padding", grants.quote("")))
+let exactPayload = Bytes(grants.render(grants.put(base, "padding", grants.quote(repeat("x", 4096 - padded.byteLength)))))
+test.check(exactPayload.length == 4096, "exact payload fixture length")
+check(run, "exact payload byte limit", accepted(grants.withPayload(run.signer, exactPayload), ""))
+check(run, "payload one byte over limit", grant(grants.withPayload(run.signer, grants.join([exactPayload, Bytes(" ")]))))
+let compactHeader = Bytes(grants.render(grants.header()))
+let exactHeader = grants.join([compactHeader, Bytes(repeat(" ", 1024 - compactHeader.length))])
+check(run, "exact protected header byte limit", accepted(grants.withRawHeader(run.signer, exactHeader), ""))
+check(run, "protected header one byte over limit", grant(grants.withRawHeader(run.signer, grants.join([exactHeader, Bytes(" ")]))))
+check(run, "paired Unicode escape remains valid metadata", accepted(grants.withPayload(run.signer, grants.join([openBrace(Bytes(grants.render(base))), Bytes(",\"extra\":\"\\ud83d\\ude00\"}")])), ""))
+let longestHost = repeat("a", 63) + "." + repeat("b", 63) + "." + repeat("c", 63) + "." + repeat("d", 61)
+check(run, "maximum DNS name", accepted(grants.withClaims(run.signer, grants.put(base, "target_host", grants.quote(longestHost))), "OK exit-a conn-1 " + longestHost + "  443 1060"))
+check(run, "DNS name one byte too long", grant(grants.withClaims(run.signer, grants.put(base, "target_host", grants.quote(longestHost + "d")))))
+check(run, "DNS label one byte too long", grant(grants.withClaims(run.signer, grants.put(base, "target_host", grants.quote(repeat("a", 64) + ".example")))))
+let skew = valid("")
+skew.now = 970
+check(run, "iat skew boundary", skew)
+let late = options()
+late.now = 969
+check(run, "iat beyond skew", late)
+for pair in [["expiry boundary remains an establishment deadline", "1060"], ["expiry skew boundary is still too late to establish", "1090"], ["expiry beyond skew", "1091"],
+        ["overflow time is recoverable", "9223372036854775807"], ["maximum safe time is recoverable", "9223372036854775777"]] {
+    let item = options()
+    item.now = fixtures.number(pair[1])
+    item.deadline = item.now
+    check(run, pair[0], item)
+}
+let afterExpiry = options()
+afterExpiry.deadline = 1061
+check(run, "deadline after expiry", afterExpiry)
+let current = options()
+current.deadline = 1000
+check(run, "deadline at current time", current)
+let wrongAuthenticated = options()
+wrongAuthenticated.authenticated = "exit-b"
+check(run, "wrong authenticated exit", wrongAuthenticated)
+let wrongRequested = options()
+wrongRequested.requested = "exit-b"
+check(run, "wrong requested exit", wrongRequested)
+let wrongConnection = options()
+wrongConnection.connection = "conn-2"
+check(run, "wrong connection", wrongConnection)
+check(run, "claim key ID mismatch", grant(grants.withClaims(run.signer, grants.put(base, "kid", grants.quote("other")))))
+for pair in [["alg", "none"], ["alg", "HS256"], ["typ", "JWT"], ["kid", "unknown"]] {
+    check(run, "header " + pair[0] + " " + pair[1], grant(grants.withHeader(run.signer, grants.put(grants.header(), pair[0], grants.quote(pair[1])))))
+}
+for field in ["alg", "typ", "kid"] { check(run, "missing header " + field, grant(grants.withHeader(run.signer, grants.without(grants.header(), field)))) }
+for pair in [["crit", "[\"x\"]"], ["b64", "false"], ["jwk", "{}"], ["jku", grants.quote("https://example.com/keys")]] {
+    check(run, "unsupported protected header", grant(grants.withHeader(run.signer, grants.put(grants.header(), pair[0], pair[1]))))
+}
+for triple in [["iss", grants.quote("hearth-control"), "'hearth-control'"], ["exit_id", grants.quote("exit-b"), "'exit-b'"], ["conn_id", grants.quote("conn-2"), "'conn-2'"],
+        ["target_host", grants.quote(""), "''"], ["target_host", grants.quote("a..b"), "'a..b'"], ["target_host", grants.quote("-bad.example"), "'-bad.example'"],
+        ["target_host", grants.quote("127.0.0.1"), "'127.0.0.1'"], ["target_host", grants.quote("example.com" + Text(bytesOf([0])) + "evil"), "'example.com\\x00evil'"],
+        ["target_host", grants.quote("é.example"), "'é.example'"], ["port", "0", "0"], ["port", "65536", "65536"], ["port", grants.quote("443"), "'443'"],
+        ["port", "443.0", "443.0"], ["iat", "-1", "-1"], ["iat", "1031", "1031"], ["exp", "1061", "1061"], ["exp", "1000", "1000"],
+        ["exp", "999", "999"], ["exp", "9223372036854775807", "9223372036854775807"]] {
+    check(run, "claim " + triple[0] + " " + triple[2], grant(grants.withClaims(run.signer, grants.put(base, triple[0], triple[1]))))
+}
+for field in base.keys { check(run, "missing claim " + field, grant(grants.withClaims(run.signer, grants.without(base, field)))) }
+check(run, "two targets", grant(grants.withClaims(run.signer, grants.put(base, "target_ip", grants.quote("192.0.2.1")))))
+let ipClaims = grants.put(grants.without(base, "target_host"), "target_ip", grants.quote("192.0.2.1"))
+check(run, "IPv4 target", accepted(grants.withClaims(run.signer, ipClaims), "OK exit-a conn-1  192.0.2.1 443 1060"))
+ipClaims = grants.put(ipClaims, "target_ip", grants.quote("2001:db8::1"))
+check(run, "IPv6 target", accepted(grants.withClaims(run.signer, ipClaims), "OK exit-a conn-1  2001:db8::1 443 1060"))
+for ip in ["::", "::1", "::ffff:192.0.2.1", "1:2:3:4:5:6:192.0.2.1", "1:2:3:4:5:6:7:8"] {
+    check(run, "valid IPv6 " + ip, accepted(grants.withClaims(run.signer, grants.put(ipClaims, "target_ip", grants.quote(ip))), "OK exit-a conn-1  " + ip + " 443 1060"))
+}
+for bad in ["192.0.2.256", "192.000.2.1", "[::1]", "fe80::1%eth0", "::::", "2001:db8::1::2", "1:2:3:4:5:6:7:8:9", "example.com"] {
+    check(run, "bad IP " + bad, grant(grants.withClaims(run.signer, grants.put(ipClaims, "target_ip", grants.quote(bad)))))
+}
+let signed = grants.token(run.signer)
+let malformed = [Bytes("a"), Bytes("a.b.c.d"), Bytes(".a.b"), Bytes("a..b"), Bytes("a.b."), grants.join([signed, Bytes("=")]), grants.join([bytesOf([255]), signed]), replaceAll(signed, Bytes("."), Bytes(".\n"), 1)]
+check(run, "malformed compact JWS", grant(Bytes()))
+for raw in malformed { check(run, "malformed compact JWS", grant(raw)) }
+let segments = splitBytes(signed, 46)
+let signingInput = grants.join([segments[0], grants.dot(), segments[1]])
+let signature = grants.sign(run.signer, signingInput)
+let flipped = signature.slice(0, signature.length)
+flipped[0] = flipped[0] ^ 1
+check(run, "signature bit mutation", grant(grants.join([signingInput, grants.dot(), grants.b64(flipped)])))
+let payload = segments[1]
+let changedPayload = payload.slice(0, payload.length - 1)
+if payload[payload.length - 1] != 65 { changedPayload.add(65) } else { changedPayload.add(66) }
+check(run, "payload bit mutation", grant(grants.join([segments[0], grants.dot(), changedPayload, grants.dot(), segments[2]])))
+let alphabet = Bytes("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+let encoded = segments[2]
+let last = 0
+for index in 0..alphabet.length { if alphabet[index] == encoded[encoded.length - 1] { last = index } }
+let noncanonical = encoded.slice(0, encoded.length - 1)
+noncanonical.add(alphabet[last | 1])
+check(run, "noncanonical signature pad bits", grant(grants.join([signingInput, grants.dot(), noncanonical])))
+for raw in ["{\"alg\":\"EdDSA\",\"typ\":\"hearth-dial-grant\",\"kid\":\"pop-1\",\"k\\u0069d\":\"pop-1\"}", "{\"alg\":\"EdDSA\",\"typ\":\"hearth-dial-grant\",\"kid\":\"pop-1\",\"kid\":\"pop-1\"}"] {
+    check(run, "duplicate decoded header key", grant(grants.withRawHeader(run.signer, Bytes(raw))))
+}
+let compactClaims = Bytes(grants.render(base))
+let nested = grants.join([openBrace(compactClaims), Bytes(",\"extra\":" + repeat("[", 65) + "0" + repeat("]", 65) + "}")])
+let invalidMetadata = [grants.join([openBrace(compactClaims), Bytes(",\"exit\\u005fid\":\"exit-a\"}")]), grants.join([openBrace(compactClaims), Bytes(",\"extra\":{\"x\":1,\"\\u0078\":2}}")]),
+    replaceAll(compactClaims, Bytes("example.com"), bytesOf([255]), -1), replaceAll(compactClaims, Bytes("example.com"), Bytes("\\ud800"), -1),
+    grants.join([Bytes("["), compactClaims, Bytes("]")]), Bytes("{"), grants.join([compactClaims, Bytes(" null")]), replaceAll(compactClaims, Bytes("1000"), Bytes("1e3"), -1), nested]
+for raw in invalidMetadata { check(run, "invalid strict grant metadata", grant(grants.withPayload(run.signer, raw))) }
+check(run, "token size bound", grant(Bytes(repeat("a", 8193))))
+let good = grants.goodKey()
+let many = [good]
+for index in 0..63 { many.add(grants.put(good, "kid", grants.quote("extra-" + Text(index)))) }
+check(run, "maximum key count", keys(grants.bundle(many), true))
+check(run, "verify-only key operations", keys(grants.jwks(grants.put(good, "key_ops", "[\"verify\"]")), true))
+for pair in [["kty", grants.quote("EC")], ["crv", grants.quote("X25519")], ["alg", grants.quote("HS256")], ["use", grants.quote("enc")], ["x", grants.quote(Text(grants.b64(Bytes(32))))], ["x", grants.quote("A")], ["kid", grants.quote("")]] {
+    check(run, "key policy " + pair[0], keys(grants.jwks(grants.put(good, pair[0], pair[1])), false))
+}
+let counting = Bytes()
+for index in 0..32 { counting.add(index) }
+check(run, "wrong key", keys(grants.jwks(grants.put(good, "x", grants.quote(Text(grants.b64(counting))))), false))
+let lowOrder: List<Bytes> = []
+let first = Bytes(32)
+first[0] = 1
+lowOrder.add(first)
+let second = Bytes(32)
+second[0] = 1
+second[31] = 128
+lowOrder.add(second)
+for leading in [237, 236] {
+    let candidate = Bytes()
+    candidate.add(leading)
+    for index in 0..30 { candidate.add(255) }
+    candidate.add(127)
+    lowOrder.add(candidate)
+}
+for candidate in lowOrder { check(run, "low-order or noncanonical key", keys(grants.jwks(grants.put(good, "x", grants.quote(Text(grants.b64(candidate))))), false)) }
+check(run, "private key rejected", keys(grants.jwks(grants.put(good, "d", grants.quote(Text(grants.b64(grants.seed()))))), false))
+check(run, "wrong key operations", keys(grants.jwks(grants.put(good, "key_ops", "[\"sign\"]")), false))
+check(run, "duplicate key ID", keys(grants.bundle([good, good]), false))
+check(run, "duplicate decoded JWKS key", keys(grants.join([openBrace(grants.jwks(good)), Bytes(",\"k\\u0065ys\":[]}")]), false))
+check(run, "JWKS UTF-8 invalid", keys(grants.join([Bytes("{\"keys\":[],\"x\":\""), bytesOf([255]), Bytes("\"}")]), false))
+check(run, "JWKS size bound", keys(Bytes(repeat(" ", 65537)), false))
+check(run, "empty key list", keys(Bytes("{\"keys\":[]}"), false))
+let tooMany: List<grants.Fields> = []
+for index in 0..65 { tooMany.add(grants.put(good, "kid", grants.quote("pop-" + Text(index)))) }
+check(run, "too many keys", keys(grants.bundle(tooMany), false))
+let trap = grant(Bytes("bad"))
+trap.trap = true
+check(run, "wrong use of failed result traps", trap)
+writeBytesFile(context.work + "/keys", grants.jwks(good))
+writeBytesFile(context.work + "/grant", signed)
+let forwarded = fixtures.execute(context, [binary, "forward", context.work + "/keys", context.work + "/grant", "exit-a", "exit-a", "conn-1", "1000", "1060"], 10, "forward verified token")
+test.check(fixtures.strip(forwarded.output) == "FORWARDED " + Text(signed), "verified token was not forwarded byte-exact with copy isolation")
+writeBytesFile(context.work + "/grant", Bytes("bad"))
+let rejected = fixtures.run(context, [binary, "trap-token", context.work + "/keys", context.work + "/grant", "exit-a", "exit-a", "conn-1", "1000", "1060"], 10)
+test.check(rejected.status != 0 && test.contains(rejected.errorOutput, "cannot read a rejected grant"), "failed token getter must remain a programmer trap")
+let rfc = Bytes("eyJhbGciOiJFZERTQSJ9.RXhhbXBsZSBvZiBFZDI1NTE5IHNpZ25pbmc")
+let rfcSignature = fixtures.unhex("860c98d2297f3060a33f42739672d61b53cf3adefed3d3c672f320dc021b411e9d59b8628dc351e248b88b29468e0e41855b0fb7d83bb15be902bfccb8cd0a02")
+test.check(fixtures.hex(grants.sign(run.signer, rfc)) == fixtures.hex(rfcSignature), "independent signer disagrees with fixed RFC 8037 fixture")
+writeBytesFile(context.work + "/message", rfc)
+writeBytesFile(context.work + "/signature", rfcSignature)
+writeBytesFile(context.work + "/public", grants.publicKey())
+let crypto = [binary, "crypto", context.work + "/message", context.work + "/signature", context.work + "/public"]
+test.check(fixtures.strip(fixtures.execute(context, crypto, 10, "RFC 8037 verification").output) == "OK", "RFC 8037 signature rejected")
+for offset in 0..64 {
+    let mutation = rfcSignature.slice(0, rfcSignature.length)
+    mutation[offset] = mutation[offset] ^ 1
+    writeBytesFile(context.work + "/signature", mutation)
+    test.check(fixtures.strip(fixtures.execute(context, crypto, 10, "mutated signature").output) == "ERROR", "signature mutation accepted at " + Text(offset))
+}
+print("Peer auth: " + Text(run.count) + " policy cases + RFC 8037 signature + 64 signature mutations passed")
+fixtures.finish(context)

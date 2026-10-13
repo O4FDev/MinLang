@@ -16,8 +16,10 @@ check-macos: build/minyarc build/minyar-default-runtime.o build/tooling/tests/ma
 
 # HTTP requests through NSURLSession against a local server.
 .PHONY: check-http
-check-http: build/minyarc build/minyar-default-runtime.o
-	$${MINYAR_PYTHON:-python3} tests/http-package.py
+build/tooling/tests/http-package-test: TOOL_NATIVE = runtime/native/net.c
+build/tooling/tests/http-package-test: runtime/native/net.c
+check-http: build/minyarc build/minyar-default-runtime.o build/tooling/tests/http-package-test
+	./build/tooling/tests/http-package-test
 
 .PHONY: check-swiftui
 check-swiftui: build/tooling/tests/swiftui build/tooling/scripts/native-swift

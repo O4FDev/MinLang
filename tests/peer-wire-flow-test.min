@@ -1,0 +1,172 @@
+use "./net-fixtures.min" as fixtures
+use "./peer-grants.min" as grants
+use "../tools/testing.min" as test
+use "json" as json
+
+record Flow { context: fixtures.Context; binary: Text }
+record Scenario { raw: Bytes; received: Bytes; expected: Text }
+record Metadata { raw: Bytes; expected: Text }
+
+function encode(kind: Integer, stream: Integer, payload: Bytes): Bytes {
+    let result = Bytes("HPW1")
+    result.add(kind)
+    for index in 0..3 { result.add(0) }
+    for value in [stream, payload.length] { for shift in [24, 16, 8, 0] { result.add((value >> shift) & 255) } }
+    result.addBytes(payload)
+    return result
+}
+function run(flow: Flow, mode: Text, raw: Bytes, extra: Bytes, trap: Boolean): Text {
+    let directory = flow.context.work
+    writeBytesFile(directory + "/frames", raw)
+    writeBytesFile(directory + "/extra", extra)
+    let result = fixtures.run(flow.context, [flow.binary, mode, directory + "/grant", directory + "/keys", directory + "/frames", directory + "/extra"], 60)
+    if trap {
+        test.check(result.status != 0 && test.contains(result.errorOutput, "cannot read a rejected wire frame"), mode + " " + Text(result.status) + "\n" + result.errorOutput)
+    } else {
+        test.check(result.status == 0 && result.errorOutput == "", mode + " " + Text(result.status) + "\n" + result.output + result.errorOutput)
+    }
+    return result.output
+}
+function frame(flow: Flow, mode: Text, kind: Integer, payload: Bytes): Text { return run(flow, mode, encode(kind, 1, payload), Bytes(), false) }
+function status(name: Text): Bytes { return encode(4, 1, Bytes(name)) }
+function data(payload: Bytes, stream: Integer): Bytes { return encode(5, stream, payload) }
+function join(parts: List<Bytes>): Bytes {
+    let result = Bytes()
+    for part in parts { result.addBytes(part) }
+    return result
+}
+function bytesOf(values: List<Integer>): Bytes {
+    let result = Bytes()
+    for value in values { result.add(value) }
+    return result
+}
+function repeated(byte: Integer, count: Integer): Bytes {
+    let result = Bytes()
+    for index in 0..count { result.add(byte) }
+    return result
+}
+
+fixtures.arguments(["--sanitize"], [])
+let context = fixtures.context(fixtures.flag("--sanitize"))
+context.environment = fixtures.withSetting(context.environment, "MINYAR_CLANG", fixtures.valueOr(context.environment, "MINYAR_TEST_CLANG", "clang"))
+if fixtures.flag("--sanitize") { context.environment = fixtures.withSetting(fixtures.withSetting(context.environment, "ASAN_OPTIONS", "detect_leaks=1"), "UBSAN_OPTIONS", "halt_on_error=1") }
+let signer = grants.signer(context)
+let jwt = grants.token(signer)
+writeBytesFile(context.work + "/grant", jwt)
+writeBytesFile(context.work + "/keys", grants.jwks(grants.goodKey()))
+let binary = context.work + "/flow"
+fixtures.execute(context, [context.root + "/minyar", context.root + "/tests/peer-wire-flow.min", "-o", binary], 240, "compile peer-wire-flow probe")
+let flow = Flow { context: context; binary: binary }
+let parsed = json.parseUnique(run(flow, "start", Bytes(), Bytes(), false))
+test.check(parsed.kind == json.OBJECT && parsed.keys.length == 6, "start metadata shape")
+let start = grants.fields()
+for index in 0..parsed.keys.length {
+    let name = parsed.keys[index]
+    let item = parsed.items[index]
+    if item.kind == json.STRING { start = grants.put(start, name, grants.quote(item.text)) } else {
+        test.check(item.kind == json.NUMBER, "start metadata value kind " + name)
+        start = grants.put(start, name, Text(Integer(item.number)))
+    }
+}
+let expected = grants.put(grants.put(grants.put(grants.put(grants.put(grants.put(grants.fields(), "dial_grant_bytes", grants.quote(Text(jwt))), "exit_id", grants.quote("exit-a")),
+    "conn_id", grants.quote("conn-1")), "target_host", grants.quote("example.com")), "port", "443"), "expires", "1060")
+for index in 0..expected.keys.length {
+    let found = false
+    for position in 0..start.keys.length {
+        if start.keys[position] == expected.keys[index] { found = true; test.check(start.values[position] == expected.values[index], "start field " + expected.keys[index]) }
+    }
+    test.check(found, "start field missing " + expected.keys[index])
+}
+let signed = grants.claims()
+for pair in [["exit_id", "exit_id"], ["conn_id", "conn_id"], ["target_host", "target_host"], ["port", "port"], ["expires", "exp"]] {
+    let mine = ""
+    let theirs = ""
+    for position in 0..start.keys.length { if start.keys[position] == pair[0] { mine = start.values[position] } }
+    for position in 0..signed.keys.length { if signed.keys[position] == pair[1] { theirs = signed.values[position] } }
+    test.check(mine != "" && mine == theirs, "start field differs from signed claim " + pair[0])
+}
+test.check(frame(flow, "verify-start", 7, Bytes(grants.render(start))) == "VERIFIED example.com 443\n", "verified start")
+for pair in [["exit_id", grants.quote("exit-b")], ["conn_id", grants.quote("conn-2")], ["target_host", grants.quote("evil.example")], ["port", "80"], ["expires", "1061"], ["dial_grant_bytes", grants.quote("bad")]] {
+    test.check(frame(flow, "verify-start", 7, Bytes(grants.render(grants.put(start, pair[0], pair[1])))) == "ERROR 8\n", "start field " + pair[0])
+}
+test.check(frame(flow, "verify-start", 7, Bytes(grants.render(grants.put(start, "target_ip", grants.quote("192.0.2.1"))))) == "ERROR 8\n", "start with two targets")
+let openJson = grants.put(grants.put(grants.put(grants.put(grants.fields(), "dial_grant_bytes", grants.quote(Text(jwt))), "exit_id", grants.quote("exit-a")), "conn_id", grants.quote("conn-1")), "deadline", "1060")
+test.check(frame(flow, "open", 3, Bytes(grants.render(openJson))) == "OPEN exit-a conn-1 1060 " + Text(jwt) + "\n", "open metadata")
+let metadataCases = 0
+let metadata = [Metadata { raw: Bytes("{}"); expected: "OK\n" }, Metadata { raw: Bytes("[]"); expected: "ERROR 6\n" }, Metadata { raw: Bytes("{"); expected: "ERROR 6\n" },
+    Metadata { raw: Bytes("{\"in_flight\":0,\"in_flight\":1}"); expected: "ERROR 6\n" }, Metadata { raw: Bytes("{\"x\":{\"a\":1,\"\\u0061\":2}}"); expected: "ERROR 6\n" },
+    Metadata { raw: join([Bytes("{\"x\":\""), bytesOf([255]), Bytes("\"}")]); expected: "ERROR 6\n" }, Metadata { raw: Bytes("{\"x\":\"\\ud800\"}"); expected: "ERROR 6\n" },
+    Metadata { raw: Bytes("{\"x\":\"\\ud83d\\ude00\"}"); expected: "OK\n" }, Metadata { raw: Bytes("{\"x\":true}"); expected: "OK\n" },
+    Metadata { raw: Bytes("{\"in_flight\":1,\"max_concurrent\":5,\"paused\":false}"); expected: "OK\n" }]
+for item in metadata {
+    test.check(run(flow, "heartbeat", encode(2, 0, item.raw), Bytes(), false) == item.expected, "heartbeat metadata " + Text(item.raw))
+    metadataCases += 1
+}
+for pair in [["exit_id", grants.quote("")], ["conn_id", grants.quote("conn/a")], ["deadline", "0"], ["deadline", grants.quote("1060")], ["deadline", "1060.0"],
+        ["deadline", "9223372036854775808"], ["dial_grant_bytes", "\"\\u00ff\""]] {
+    test.check(frame(flow, "open", 3, Bytes(grants.render(grants.put(openJson, pair[0], pair[1])))) == "ERROR 6\n", "open field " + pair[0] + " " + pair[1])
+    metadataCases += 1
+}
+for field in openJson.keys {
+    test.check(frame(flow, "open", 3, Bytes(grants.render(grants.without(openJson, field)))) == "ERROR 6\n", "open missing " + field)
+    metadataCases += 1
+}
+let compactOpen = Bytes(grants.render(openJson))
+let trimmed = compactOpen.slice(0, compactOpen.length - 1)
+for suffix in [",\"exit\\u005fid\":\"exit-a\"}", ",\"target_host\":\"evil.example\"}"] {
+    test.check(frame(flow, "open", 3, join([trimmed, Bytes(suffix)])) == "ERROR 6\n", "open extension " + suffix)
+    metadataCases += 1
+}
+let ca = fixtures.authority(context, context.work + "/ca")
+fixtures.root(ca, "root")
+let device = fixtures.ec("clientAuth")
+device.san = "URI:hearth://device/device-a"
+fixtures.leaf(ca, "device", "root", device)
+let certificate = readBytesFile(fixtures.path(ca, "device", "der"))
+let hello = encode(1, 0, Bytes("{\"device_id\":\"device-a\",\"exit_id\":\"exit-a\"}"))
+let heartbeat = encode(2, 0, Bytes("{\"in_flight\":0}"))
+test.check(run(flow, "device", join([hello, heartbeat]), certificate, false) == "READY true\n", "device hello")
+test.check(run(flow, "device", heartbeat, certificate, false) == "ERROR 10\n", "heartbeat before hello")
+test.check(run(flow, "device", join([hello, hello]), certificate, false) == "ERROR 10\n", "repeated hello")
+for raw in ["{\"device_id\":\"device-b\",\"exit_id\":\"exit-a\"}", "{\"device_id\":\"device-a\",\"exit_id\":\"exit-b\"}", "{\"device_id\":\"device-a\"}"] {
+    test.check(run(flow, "device", encode(1, 0, Bytes(raw)), certificate, false) == "ERROR 11\n", "device identity " + raw)
+}
+let close = encode(6, 1, Bytes())
+let nul = bytesOf([0])
+let scenarios = [Scenario { raw: join([status("ok"), data(Bytes("ab"), 1), data(join([nul, Bytes("cd")]), 1)]); received: join([Bytes("ab"), nul, Bytes("cd")]); expected: "STATE true false ok 5\n" },
+    Scenario { raw: join([status("ok"), data(Bytes("ab"), 1), close]); received: Bytes("ab"); expected: "STATE false true ok 2\n" },
+    Scenario { raw: data(Bytes("x"), 1); received: Bytes(); expected: "ERROR 10\nSTATE false false  0\n" },
+    Scenario { raw: close; received: Bytes(); expected: "ERROR 10\nSTATE false false  0\n" },
+    Scenario { raw: join([status("ok"), status("ok")]); received: Bytes(); expected: "ERROR 10\nSTATE false false ok 0\n" },
+    Scenario { raw: join([status("ok"), data(Bytes("x"), 2)]); received: Bytes(); expected: "ERROR 10\nSTATE false false ok 0\n" },
+    Scenario { raw: join([status("ok"), close, data(Bytes("x"), 1)]); received: Bytes(); expected: "ERROR 10\nSTATE false false ok 0\n" },
+    Scenario { raw: status("garbage"); received: Bytes(); expected: "ERROR 10\nSTATE false false  0\n" }]
+for rejected in ["grant_invalid", "exit_offline", "policy_denied"] {
+    scenarios.add(Scenario { raw: status(rejected); received: Bytes(); expected: "STATE false true " + rejected + " 0\n" })
+    scenarios.add(Scenario { raw: join([status(rejected), data(Bytes("x"), 1)]); received: Bytes(); expected: "ERROR 10\nSTATE false false " + rejected + " 0\n" })
+}
+let relayCases = 0
+for item in scenarios {
+    test.check(run(flow, "relay", item.raw, item.received, false) == item.expected, "relay scenario " + item.expected)
+    relayCases += 1
+}
+let left = Bytes()
+for round in 0..41 { for byte in 0..256 { left.add(byte) } }
+left.addBytes(Bytes("LEFT-END"))
+let right = Bytes()
+for round in 0..37 { for byte in 0..256 { right.add(255 - byte) } }
+right.addBytes(Bytes("RIGHT-END"))
+test.check(run(flow, "bidirectional", left, right, false) == "BIDIRECTIONAL OK\n", "bidirectional relay")
+let remaining = Bytes()
+for index in 1..17 {
+    remaining.add(index)
+    remaining.addBytes(Bytes(65535))
+}
+let exactBuffer = Bytes()
+let chunk = encode(5, 1, repeated(120, 65520))
+for index in 0..16 { exactBuffer.addBytes(chunk) }
+test.check(exactBuffer.length == 1048576, "exact buffer fixture")
+test.check(run(flow, "backpressure", remaining, exactBuffer, false) == "BACKPRESSURE OK\n", "backpressure")
+run(flow, "trap", Bytes(), Bytes(), true)
+print("Peer wire flow: " + Text(metadataCases) + " independent metadata cases, " + Text(relayCases) + " order/identity cases, exact JWT/target forwarding, cert-bound hello, two-sided bytes and 1MiB retry bounds passed")
+fixtures.finish(context)

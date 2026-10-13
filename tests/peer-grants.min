@@ -1,0 +1,121 @@
+use "./net-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+
+public record Fields { keys: List<Text>; values: List<Text> }
+public record Signer { context: fixtures.Context; key: Text }
+
+public function seed(): Bytes { return fixtures.unhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60") }
+public function publicKey(): Bytes { return fixtures.unhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a") }
+public function signer(context: fixtures.Context): Signer {
+    let key = fixtures.unhex("302e020100300506032b657004220420")
+    key.addBytes(seed())
+    writeBytesFile(context.work + "/fixture-key.der", key)
+    return Signer { context: context; key: context.work + "/fixture-key.der" }
+}
+public function quote(value: Text): Text {
+    let raw = Bytes(value)
+    let result = Bytes()
+    let digits = Bytes("0123456789abcdef")
+    result.add(34)
+    for byte in raw {
+        if byte == 34 { result.addBytes(Bytes("\\\"")) }
+        else if byte == 92 { result.addBytes(Bytes("\\\\")) }
+        else if byte == 10 { result.addBytes(Bytes("\\n")) }
+        else if byte == 13 { result.addBytes(Bytes("\\r")) }
+        else if byte == 9 { result.addBytes(Bytes("\\t")) }
+        else if byte == 8 { result.addBytes(Bytes("\\b")) }
+        else if byte == 12 { result.addBytes(Bytes("\\f")) }
+        else if byte < 32 { result.addBytes(Bytes("\\u00")); result.add(digits[byte >> 4]); result.add(digits[byte & 15]) }
+        else { result.add(byte) }
+    }
+    result.add(34)
+    return Text(result)
+}
+public function fields(): Fields { return Fields { keys: []; values: [] } }
+public function put(fields: Fields, key: Text, value: Text): Fields {
+    let result = Fields { keys: []; values: [] }
+    let replaced = false
+    for index in 0..fields.keys.length {
+        result.keys.add(fields.keys[index])
+        if fields.keys[index] == key { result.values.add(value); replaced = true } else { result.values.add(fields.values[index]) }
+    }
+    if !replaced { result.keys.add(key); result.values.add(value) }
+    return result
+}
+public function without(fields: Fields, key: Text): Fields {
+    let result = Fields { keys: []; values: [] }
+    for index in 0..fields.keys.length {
+        if fields.keys[index] != key { result.keys.add(fields.keys[index]); result.values.add(fields.values[index]) }
+    }
+    return result
+}
+public function render(fields: Fields): Text {
+    let parts = ["{"]
+    for index in 0..fields.keys.length {
+        if index > 0 { parts.add(",") }
+        parts.add(quote(fields.keys[index]) + ":" + fields.values[index])
+    }
+    parts.add("}")
+    return joinText(parts)
+}
+public function header(): Fields { return put(put(put(fields(), "alg", quote("EdDSA")), "typ", quote("hearth-dial-grant")), "kid", quote("pop-1")) }
+public function claims(): Fields {
+    let result = put(put(put(fields(), "iss", quote("proxy-gateway")), "exit_id", quote("exit-a")), "conn_id", quote("conn-1"))
+    return put(put(put(put(result, "target_host", quote("example.com")), "port", "443"), "iat", "1000"), "exp", "1060")
+}
+public function b64(data: Bytes): Bytes {
+    let alphabet = Bytes("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+    let result = Bytes()
+    let index = 0
+    while index < data.length {
+        let remaining = data.length - index
+        let value = data[index] << 16
+        if remaining > 1 { value = value | (data[index + 1] << 8) }
+        if remaining > 2 { value = value | data[index + 2] }
+        result.add(alphabet[(value >> 18) & 63])
+        result.add(alphabet[(value >> 12) & 63])
+        if remaining > 1 { result.add(alphabet[(value >> 6) & 63]) }
+        if remaining > 2 { result.add(alphabet[value & 63]) }
+        index += 3
+    }
+    return result
+}
+public function join(parts: List<Bytes>): Bytes {
+    let result = Bytes()
+    for part in parts { result.addBytes(part) }
+    return result
+}
+public function dot(): Bytes { return Bytes(".") }
+public function sign(signer: Signer, data: Bytes): Bytes {
+    writeBytesFile(signer.context.work + "/fixture-message", data)
+    let openssl = fixtures.valueOr(signer.context.environment, "MINYAR_TEST_OPENSSL", "openssl")
+    let result = fixtures.run(signer.context, [openssl, "pkeyutl", "-sign", "-rawin", "-keyform", "DER", "-inkey", signer.key, "-in", signer.context.work + "/fixture-message"], 10)
+    let signature = Bytes(result.output)
+    test.check(result.status == 0 && signature.length == 64, "fixture signer failed: " + result.errorOutput)
+    return signature
+}
+public function tokenParts(signer: Signer, rawHeader: Bytes, payload: Bytes): Bytes {
+    let signing = join([b64(rawHeader), dot(), b64(payload)])
+    return join([signing, dot(), b64(sign(signer, signing))])
+}
+public function token(signer: Signer): Bytes { return tokenParts(signer, Bytes(render(header())), Bytes(render(claims()))) }
+public function withClaims(signer: Signer, value: Fields): Bytes { return tokenParts(signer, Bytes(render(header())), Bytes(render(value))) }
+public function withHeader(signer: Signer, value: Fields): Bytes { return tokenParts(signer, Bytes(render(value)), Bytes(render(claims()))) }
+public function withPayload(signer: Signer, payload: Bytes): Bytes { return tokenParts(signer, Bytes(render(header())), payload) }
+public function withRawHeader(signer: Signer, raw: Bytes): Bytes { return tokenParts(signer, raw, Bytes(render(claims()))) }
+public function goodKey(): Fields {
+    let result = put(put(put(fields(), "kty", quote("OKP")), "crv", quote("Ed25519")), "kid", quote("pop-1"))
+    return put(put(put(result, "alg", quote("EdDSA")), "use", quote("sig")), "x", quote(Text(b64(publicKey()))))
+}
+public function bundle(keys: List<Fields>): Bytes {
+    let rendered: List<Text> = []
+    for key in keys { rendered.add(render(key)) }
+    let parts = ["{\"keys\":["]
+    for index in 0..rendered.length {
+        if index > 0 { parts.add(",") }
+        parts.add(rendered[index])
+    }
+    parts.add("]}")
+    return Bytes(joinText(parts))
+}
+public function jwks(key: Fields): Bytes { return bundle([key]) }
