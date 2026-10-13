@@ -58,7 +58,7 @@ class ManagedGraphs(CompilerTestCase):
                             timeout=30, phase='link-exact-ownership')
                 self.assertEqual(linked.returncode, 0, linked.stderr)
                 run = self.evidence.run([str(executable)], capture_output=True,
-                                       timeout=30, phase='execute-exact-ownership')
+                                       timeout=getattr(self, 'run_timeout', 30), phase='execute-exact-ownership')
                 self.assertEqual(run.returncode, status, run.stderr)
                 self.assertEqual(run.stdout, expected.encode())
                 self.assertEqual(run.stderr, stderr.encode())
