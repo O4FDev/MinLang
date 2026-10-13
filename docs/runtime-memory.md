@@ -322,7 +322,7 @@ because the underlying arena storage remains alive.
 
 The optional graph and callback checks additionally include
 `tests/managed-graphs.py`, `tests/managed-graphs-profiles.py`,
-`tests/callbacks.py`, `tests/callback-domains.py` and `tests/cycle-progress.py`.
+`tests/callbacks.py`, `tests/callback-domains.py` and `tests/cycle-progress.min`.
 Their exact reachability, object/debt and work-budget assertions complement
 application soaks; short collector tests do not establish a server's idle CPU
 or large-connection behavior. Windows supports system, fixed and eager heaps;
