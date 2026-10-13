@@ -145,43 +145,43 @@ static void *rc_native_region_atomic(const RcThreadLeaf *leaf, long long offset,
 }
 
 long long minyar_native_region_load_u8(const RcThreadLeaf *leaf, long long offset) {
-    _Atomic uint8_t *p = rc_native_region_atomic(leaf, offset, sizeof(*p), _Alignof(*p), 1);
+    _Atomic uint8_t *p = rc_native_region_atomic(leaf, offset, sizeof(*p), _Alignof(_Atomic uint8_t), 1);
     return atomic_load_explicit(p, memory_order_acquire);
 }
 void minyar_native_region_store_u8(const RcThreadLeaf *leaf, long long offset, long long value) {
     if ((unsigned long long)value > UINT8_MAX) minyar_stop("this atomic value does not fit in UInt8.");
-    _Atomic uint8_t *p = rc_native_region_atomic(leaf, offset, sizeof(*p), _Alignof(*p), 2);
+    _Atomic uint8_t *p = rc_native_region_atomic(leaf, offset, sizeof(*p), _Alignof(_Atomic uint8_t), 2);
     atomic_store_explicit(p, (uint8_t)value, memory_order_release);
 }
 long long minyar_native_region_load_u32(const RcThreadLeaf *leaf, long long offset) {
-    _Atomic uint32_t *p = rc_native_region_atomic(leaf, offset, sizeof(*p), _Alignof(*p), 1);
+    _Atomic uint32_t *p = rc_native_region_atomic(leaf, offset, sizeof(*p), _Alignof(_Atomic uint32_t), 1);
     return atomic_load_explicit(p, memory_order_acquire);
 }
 void minyar_native_region_store_u32(const RcThreadLeaf *leaf, long long offset, long long value) {
     if ((unsigned long long)value > UINT32_MAX) minyar_stop("this atomic value does not fit in UInt32.");
-    _Atomic uint32_t *p = rc_native_region_atomic(leaf, offset, sizeof(*p), _Alignof(*p), 2);
+    _Atomic uint32_t *p = rc_native_region_atomic(leaf, offset, sizeof(*p), _Alignof(_Atomic uint32_t), 2);
     atomic_store_explicit(p, (uint32_t)value, memory_order_release);
 }
 long long minyar_native_region_cas_u32(const RcThreadLeaf *leaf, long long offset,
         long long expected, long long value) {
     if ((unsigned long long)expected > UINT32_MAX || (unsigned long long)value > UINT32_MAX)
         minyar_stop("this atomic value does not fit in UInt32.");
-    _Atomic uint32_t *p = rc_native_region_atomic(leaf, offset, sizeof(*p), _Alignof(*p), 3);
+    _Atomic uint32_t *p = rc_native_region_atomic(leaf, offset, sizeof(*p), _Alignof(_Atomic uint32_t), 3);
     uint32_t old = (uint32_t)expected;
     atomic_compare_exchange_strong_explicit(p, &old, (uint32_t)value,
                                           memory_order_acq_rel, memory_order_acquire);
     return old;
 }
 long long minyar_native_region_load_i64(const RcThreadLeaf *leaf, long long offset) {
-    _Atomic uint64_t *p = rc_native_region_atomic(leaf, offset, sizeof(*p), _Alignof(*p), 1);
+    _Atomic uint64_t *p = rc_native_region_atomic(leaf, offset, sizeof(*p), _Alignof(_Atomic uint64_t), 1);
     return (long long)atomic_load_explicit(p, memory_order_acquire);
 }
 void minyar_native_region_store_i64(const RcThreadLeaf *leaf, long long offset, long long value) {
-    _Atomic uint64_t *p = rc_native_region_atomic(leaf, offset, sizeof(*p), _Alignof(*p), 2);
+    _Atomic uint64_t *p = rc_native_region_atomic(leaf, offset, sizeof(*p), _Alignof(_Atomic uint64_t), 2);
     atomic_store_explicit(p, (uint64_t)value, memory_order_release);
 }
 long long minyar_native_region_add_i64(const RcThreadLeaf *leaf, long long offset, long long value) {
-    _Atomic uint64_t *p = rc_native_region_atomic(leaf, offset, sizeof(*p), _Alignof(*p), 3);
+    _Atomic uint64_t *p = rc_native_region_atomic(leaf, offset, sizeof(*p), _Alignof(_Atomic uint64_t), 3);
     return (long long)atomic_fetch_add_explicit(p, (uint64_t)value, memory_order_acq_rel);
 }
 

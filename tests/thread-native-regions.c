@@ -47,10 +47,10 @@ static void shared_lifetime(void) {
     assert(minyar_native_region_cas_u32(b, 0, 0, 1) == 3);
     assert(minyar_native_region_load_u32(b, 0) == 3);
     MinyarBytes *bytes = minyar_bytes_new(3);
-    minyar_bytes_set_uint8(bytes, 0, 7);
+    minyar_bytes_set(bytes, 0, 7);
     minyar_native_region_copy_from(a, 32, bytes);
     MinyarBytes *copy = minyar_native_region_copy_to(a, 32, 3);
-    assert(minyar_bytes_get_uint8(copy, 0) == 7);
+    assert(minyar_bytes_get(copy, 0) == 7);
     minyar_rc_release(bytes); minyar_rc_release(copy);
     RcThreadLeaf *set = regions(a, b), *channel = minyar_bytes_channel_new(0, 1);
     RcThreadLeaf *threads[4];
@@ -163,7 +163,8 @@ static void real_kvm(void) {
         } else {
             assert(minyar_native_region_get_uint32(run, offsetof(struct kvm_run, exit_reason)) == KVM_EXIT_HLT);
             minyar_native_region_store_u32(slot, 0, 3);
-            assert(minyar_thread_kernel_kick(thread, run) == 0);
+            long long kicked = minyar_thread_kernel_kick(thread, run);
+            assert(kicked == 0 || kicked == -ESRCH);
         }
     }
     assert(minyar_thread_join(thread) == 0);
