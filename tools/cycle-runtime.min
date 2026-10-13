@@ -1,0 +1,62 @@
+use "./testing.min" as test
+use "./test-runtime.min" as runtime
+use "system" as system
+use "files" as files
+
+public function engineSource(project: Text): Text {
+    return runtime.cycleSource(readTextFile(project + "/runtime/minyar_runtime.c"))
+}
+function parent(path: Text): Text {
+    let raw = Bytes(path)
+    let index = raw.length - 1
+    while index >= 0 && raw[index] != 47 { index -= 1 }
+    if index < 0 { return "." }
+    if index == 0 { return "/" }
+    return Text(raw.slice(0, index))
+}
+function name(path: Text): Text {
+    let raw = Bytes(path)
+    let index = raw.length - 1
+    while index >= 0 && raw[index] != 47 { index -= 1 }
+    return Text(raw.slice(index + 1, raw.length))
+}
+function starts(value: Text, prefix: Text): Boolean {
+    let raw = Bytes(value)
+    let bytes = Bytes(prefix)
+    return raw.length >= bytes.length && Text(raw.slice(0, bytes.length)) == prefix
+}
+public function publishEngine(project: Text, requested: Text): Text {
+    let target = requested
+    if target == "" { target = project + "/build/managed-graphs-engine.c" }
+    test.check(files.makeDirectory(parent(target)) == 0, "cannot create engine directory")
+    let data = engineSource(project)
+    if files.pathSize(target) >= 0 && readTextFile(target) == data { return target }
+    let temporary = target + "." + Text(system.processId()) + "-" + Text(system.monotonicNanoseconds())
+    writeTextFile(temporary, data)
+    test.check(files.rename(temporary, target) == 0, "cannot publish cycle engine")
+    return target
+}
+function configuration(project: Text, runtimePath: Text, purpose: Text): Text {
+    let file = name(runtimePath)
+    let local = parent(runtimePath) + "/runtime.c"
+    if (file == "runtime.o" || file == "runtime.ll") && files.pathSize(local) >= 0 { return readTextFile(local) }
+    if starts(file, "minyar-default-runtime") { return readTextFile(project + "/runtime/minyar_default_runtime.c") }
+    if starts(file, "minyar-runtime-eager") { return "#include \"minyar_runtime.c\"\n" }
+    fail("cannot select " + purpose + " for " + runtimePath)
+}
+public function configuredSource(project: Text, runtimePath: Text): Text {
+    let selected = configuration(project, runtimePath, "cycle runtime policy")
+    let directive = "#include \"minyar_runtime.c\""
+    let replaced = test.replace(selected, directive, engineSource(project))
+    test.check(Bytes(selected).length - Bytes(directive).length == Bytes(test.replace(selected, directive, "")).length, "cycle runtime configuration must include the engine once")
+    return replaced
+}
+public function threadSource(project: Text, runtimePath: Text, cycles: Boolean): Text {
+    let selected = configuration(project, runtimePath, "thread memory policy")
+    for macro in ["MINYAR_COMPILER_ARENA", "MINYAR_BOUNDED_HEAP", "MINYAR_LAZY_HEAP"] {
+        test.check(!test.contains(selected, "#define " + macro), "managed threads require system or eager memory profile; pools/arena are unsupported")
+    }
+    test.check(files.pathSize(project + "/runtime/minyar_thread_domain.h") >= 0, "checked thread runtime dependency is missing: minyar_thread_domain.h")
+    if cycles { selected = configuredSource(project, runtimePath) }
+    return "#undef MINYAR_THREADED\n#define MINYAR_THREADED 1\n" + selected
+}
