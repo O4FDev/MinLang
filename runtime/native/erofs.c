@@ -327,6 +327,7 @@ static int e_compress(EWriter *w, EInode *i) {
             hint = (size_t)(next > 1048576 ? 1048576 : next) & ~(size_t)4095;
             if (hint < 4096) hint = 4096;
         }
+        if (w->compression == 1) hint = 1048576;
         unsigned clusters = (unsigned)e_align(size, 4096) / 4096;
         unsigned blocks = packed > 0 ? (unsigned)e_align((unsigned)packed, 4096) / 4096 : clusters;
         int compressed = blocks < clusters;
