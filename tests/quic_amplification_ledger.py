@@ -540,7 +540,8 @@ def checked_link_graph(build,root,retention):
         retained(item)
     # Preserve the reviewed legacy tool, the files/system dispatch integration and
     # the consolidated system/sha256/tararchive/zstd/deflate provider dispatch.
-    pinned={"clang-driver.py":("e224037d69907368d9c6bf322c27540c37e423bd7e6dec4df88a2d64af9ef9ec",
+    pinned={"clang-driver.py":("10ecea17bf9671b3b35ecf20851b1171bbe37fcd6ca2919680718c6bd7448f6d",
+                               "e224037d69907368d9c6bf322c27540c37e423bd7e6dec4df88a2d64af9ef9ec",
                                "960fc3fd3b8f0e767c8ca67c047e8e548df271b6cbcd583f502e4fe9b9da2c19",
                                "8134c634f6a7bba1960780313f2bbafd6b88d9a59d35739f26426f2c03cb8b64",
                                "901ea49499bf4390003d5ecf29bb647e05d0d73de7d6624f391608f13d378abb",
