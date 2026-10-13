@@ -6,12 +6,9 @@
 .PHONY: check-formats-pipeline check-formats-pipeline-sanitize
 .PHONY: bench-formats bench-compression bench-sha256 bench-tar
 
-build/tooling/tests/compression-codecs: private TOOL_NATIVE = tests/compression-codecs-oracle-runtime.c
-build/tooling/tests/compression-codecs: private TOOL_LIBS = -lz -ldl
-build/tooling/tests/compression-codecs: tests/compression-codecs-oracle-runtime.c
-check-compression: build/minyarc build/tooling/tests/compression-codecs build/tooling/tests/compression-provider
+check-compression: build/minyarc build/tooling/tests/compression-provider
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compression-provider
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compression-codecs --mode native
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compression-codecs.py --mode native
 
 check-sha256: build/minyarc build/minyar-default-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/sha256.py
@@ -27,8 +24,8 @@ FORMATS_SANITIZER_CLANG = $(if $(MINYAR_SANITIZER_CLANG),$(shell python3 -c 'imp
 FORMATS_SANITIZER_DIRECTORY = $(if $(MINYAR_SANITIZER_CLANG),$(shell python3 -c 'import sys; sys.path.insert(0, "tools"); from host_paths import host_path; print(host_path(sys.argv[1]).parent)' $(call FORMATS_SANITIZER_QUOTE,$(MINYAR_SANITIZER_CLANG))))
 FORMATS_SANITIZER_ENV = PATH=$(call FORMATS_SANITIZER_QUOTE,$(if $(FORMATS_SANITIZER_DIRECTORY),$(FORMATS_SANITIZER_DIRECTORY):)$(PATH)) MINYAR_TEST_CLANG=$(call FORMATS_SANITIZER_QUOTE,$(FORMATS_SANITIZER_CLANG)) UBSAN_OPTIONS=halt_on_error=1
 
-check-compression-sanitize: build/minyarc build/tooling/tests/compression-codecs
-	$(FORMATS_SANITIZER_ENV) $(SANITIZER_LIMITED) ./build/tooling/tests/compression-codecs --mode sanitize
+check-compression-sanitize: build/minyarc
+	$(FORMATS_SANITIZER_ENV) $(SANITIZER_LIMITED) python3 tests/compression-codecs.py --mode sanitize
 
 check-sha256-sanitize: build/minyarc
 	$(FORMATS_SANITIZER_ENV) $(SANITIZER_LIMITED) python3 tests/sha256.py --sanitize

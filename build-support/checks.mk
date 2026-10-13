@@ -358,11 +358,8 @@ check-incremental-modules: build/minyarc-errors-request build/minyarc-modules bu
 check: check-incremental-modules
 
 .PHONY: check-incremental-module-performance
-build/tooling/tests/incremental-module-performance: private TOOL_RUNTIME = build/testing/cycle-runtime.o
-build/tooling/tests/incremental-module-performance: private TOOL_NATIVE = tests/performance-resources.c runtime/native/net.c
-build/tooling/tests/incremental-module-performance: build/testing/cycle-runtime.o tests/performance-resources.c runtime/native/net.c
-check-incremental-module-performance: build/minyarc-modules build/minyar-module-build build/minyar-runtime.o build/tooling/tests/incremental-module-performance
-	$(LIMITED) ./build/tooling/tests/incremental-module-performance --enforce
+check-incremental-module-performance: build/minyarc-modules build/minyar-module-build build/minyar-runtime.o
+	$(LIMITED) python3 tests/incremental-module-performance.py --enforce
 
 check: check-incremental-module-performance
 
