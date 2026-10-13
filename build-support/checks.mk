@@ -120,7 +120,7 @@ check-mutation: build/stage0 build/minyarc build/minyar-runtime.o
 check-mutation-score-harness:
 	python3 tests/mutation-score-harness.py
 
-check-mutation-score: check-mutation-score-harness build/stage0 build/minyarc build/minyarc-modules build/minyar-compiler-runtime.ll build/minyar-runtime.o build/tooling/tests/diagnostics build/tooling/tests/conformance
+check-mutation-score: check-mutation-score-harness build/tooling/tests/mutation-coverage build/stage0 build/minyarc build/minyarc-modules build/minyar-compiler-runtime.ll build/minyar-runtime.o build/tooling/tests/diagnostics build/tooling/tests/conformance
 	MINYAR_MIN_MUTATION_SCORE=$(MIN_MUTATION_SCORE) $(LIMITED) python3 tests/mutation-score.py
 
 check-performance: build/minyarc build/minyar-runtime.o build/compiler-stage3.ll
@@ -841,3 +841,8 @@ check-map-basics-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/map-basics.py
 check check-portable: check-list-basics check-map-basics
 check-sanitize: check-list-basics-sanitize check-map-basics-sanitize
+
+.PHONY: check-mutation-coverage
+check-mutation-coverage: build/minyarc build/minyar-runtime.o build/tooling/tests/mutation-coverage
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/mutation-coverage
+check check-portable: check-mutation-coverage

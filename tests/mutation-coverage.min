@@ -1,0 +1,35 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+let compiler = test.compiler()
+function rejection(compiler: test.Compiler, source: Text, diagnostic: Text) {
+    test.rejects(compiler, source, diagnostic)
+}
+rejection(compiler, "print(0.", "expected a field or method name after '.'")
+rejection(compiler, "for 1 in 0..1 {}\n", "I can't find a value named 'for'")
+test.executes(compiler, "function main() { print(42) }\n", "42\n")
+let work = compiler.directory
+writeTextFile(work + "/entry.min", "public thread function worker(seed: Integer, input: FrozenBytes, channel: BytesChannel): Integer { return seed }\n")
+writeTextFile(work + "/shadow.min", "use \"./entry.min\" as entry\nfunction main() {\nlet worker = 7\nlet bytes = Bytes(1)\nlet frozen = freezeBytes(bytes)\nlet channel = bytesChannel(4096, 8)\nlet handle = startThread(entry.worker, 0, frozen, channel)\nprint(joinThread(handle))\n}\n")
+let shadow = test.run([compiler.executable, work + "/shadow.min", work + "/shadow.ll", "--library", "library"], system.environment(), "", work + "/shadow-result", 30)
+test.check(shadow.status == 1 && shadow.output == "" && test.contains(shadow.errorOutput, "startThread requires a named thread entry") && files.pathSize(work + "/shadow.ll") < 0, "a readable local binding cannot shadow a qualified thread entry\n" + shadow.output + shadow.errorOutput)
+writeTextFile(work + "/boundary.min", "function echo(value: Text): Text { value = value + \"!\"; return value }\nprint(echo(\"alive\"))\n")
+for budget in [1, 2] {
+    let path = work + "/boundary-" + Text(budget)
+    test.require(test.run([compiler.executable, work + "/boundary.min", path + ".ll", "--bounded-owners", Text(budget)], system.environment(), "", path + ".compile", 30), "ownership boundary compilation")
+    let llvm = readTextFile(path + ".ll")
+    let stacked = test.contains(llvm, "call void @minyar_rc_enter_stack_v1(ptr %rc.stack.header, ptr %rc.stack.owners, i64 1)")
+    test.check(stacked == (budget == 2), "one owner is admitted exactly below the cleanup budget")
+    test.check(test.contains(llvm, "define ptr @.minyar.fn.echo(ptr %argument.0) noinline {") == (budget == 2), "stack ownership retains the noinline frame lifetime boundary")
+    if test.addressEnabled(compiler.flags) { writeTextFile(path + ".ll", test.instrument(llvm)) }
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization, "-Wno-override-module"]
+        for flag in compiler.flags { command.add(flag) }
+        for item in [path + ".ll", compiler.runtime, "-lm", "-o", path] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".link", compiler.linkTimeout), "ownership boundary link")
+        let result = test.run([path], system.environment(), "", path + ".run", compiler.runTimeout)
+        test.check(result.status == 0 && result.output == "alive!\n" && result.errorOutput == "", "ownership boundary preserves reference lifetime at " + optimization)
+    }
+}
+test.removeTree(work)
+print("mutation boundary coverage: passed")
