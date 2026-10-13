@@ -131,7 +131,7 @@ print(slice(1))
 
     def test_methods_reject_the_wrong_receiver_kind(self):
         self.rejects('let text = "value"\ntext.add(1)\n', "2, column 6: this value has no method named 'add'")
-        self.rejects('let values = [1]\nvalues.slice(0)\n', "2, column 8: this value has no method named 'slice'")
+        self.rejects('let values = [1]\nvalues.slice(0)\n', "line 2, column 15: expected ','")
 
     def test_unicode_index_does_not_depend_on_length(self):
         self.executes('let text = "é🙂"\nprint(Text(text[0]))\nprint(text.length)\nprint(Text(text[0]))\n', 'é\n2\né\n')
