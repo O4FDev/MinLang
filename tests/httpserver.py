@@ -208,10 +208,17 @@ def regressions(port):
     finally:
         for client in occupied:
             client.close()
-    with peer(port) as client:
-        client.send(request('/stats', close=True))
-        active, slots = map(int, client.response()[2].split(b':'))
-        assert active == 1 and slots <= 4, (active, slots)
+    # Closed peers are observed by the loop asynchronously; wait (bounded) for
+    # them before checking that only the stats request itself is active.
+    deadline = time.monotonic() + 2.0
+    while True:
+        with peer(port) as client:
+            client.send(request('/stats', close=True))
+            active, slots = map(int, client.response()[2].split(b':'))
+        if active == 1 or time.monotonic() >= deadline:
+            break
+        time.sleep(0.01)
+    assert active == 1 and slots <= 4, (active, slots)
 
 
 def write_wait_regressions(binary, build, environment):
