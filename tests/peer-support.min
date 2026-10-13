@@ -1,0 +1,1066 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+use "json" as json
+use "sha256" as sha256
+use "./cpython-random.min" as random
+
+public constant OVERFLOW = "Minyar stopped: this Integer calculation is outside the supported range.\n"
+public constant ZERO = "Minyar stopped: an Integer cannot be divided by zero.\n"
+public constant DIVISION = "Minyar stopped: this Integer division is outside the supported range.\n"
+public constant MINIMUM = -9223372036854775808
+public constant MAXIMUM = 9223372036854775807
+
+public record Suite { family: Text; source: Text; names: List<Text>; selected: List<Text>; root: Text; child: Boolean }
+public record Case {
+    suite: Suite
+    name: Text
+    directory: Text
+    compiler: test.Compiler
+    serial: Integer
+    commands: List<json.Value>
+    controls: json.Value
+    inputs: json.Value
+    skips: List<json.Value>
+    outcome: Text
+    declared: List<Text>
+    environment: List<Text>
+    variants: List<Text>
+    compilerArguments: List<Text>
+    linkTimeout: Integer
+    runTimeout: Integer
+    started: Integer
+    closed: Boolean
+}
+
+public function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let bytes = Bytes(prefix)
+    if raw.length < bytes.length { return false }
+    for index in 0..bytes.length { if raw[index] != bytes[index] { return false } }
+    return true
+}
+public function ends(source: Text, suffix: Text): Boolean {
+    let raw = Bytes(source)
+    let bytes = Bytes(suffix)
+    if raw.length < bytes.length { return false }
+    let offset = raw.length - bytes.length
+    for index in 0..bytes.length { if raw[offset + index] != bytes[index] { return false } }
+    return true
+}
+public function find(source: Text, needle: Text, begin: Integer): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if begin < 0 || raw.length < pattern.length { return -1 }
+    for index in begin..(raw.length - pattern.length + 1) {
+        let same = true
+        for offset in 0..pattern.length { if raw[index + offset] != pattern[offset] { same = false; break } }
+        if same { return index }
+    }
+    return -1
+}
+public function contains(source: Text, needle: Text): Boolean { return find(source, needle, 0) >= 0 }
+public function count(source: Text, needle: Text): Integer {
+    let matches = 0
+    let begin = 0
+    while true {
+        let index = find(source, needle, begin)
+        if index < 0 { return matches }
+        matches += 1
+        begin = index + Bytes(needle).length
+    }
+}
+public function compareText(left: Text, right: Text): Integer {
+    let a = Bytes(left)
+    let b = Bytes(right)
+    let length = a.length
+    if b.length < length { length = b.length }
+    for index in 0..length {
+        if a[index] != b[index] { return a[index] - b[index] }
+    }
+    return a.length - b.length
+}
+public function sortTexts(values: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for value in values {
+        result.add(value)
+        let index = result.length - 1
+        while index > 0 && compareText(result[index - 1], result[index]) > 0 {
+            let previous = result[index - 1]
+            result[index - 1] = result[index]
+            result[index] = previous
+            index -= 1
+        }
+    }
+    return result
+}
+public function sortIntegers(values: List<Integer>): List<Integer> {
+    let result: List<Integer> = []
+    for value in values { result.add(value) }
+    let width = 1
+    let scratch: List<Integer> = []
+    for value in result { scratch.add(value) }
+    while width < result.length {
+        let start = 0
+        while start < result.length {
+            let middle = start + width
+            if middle > result.length { middle = result.length }
+            let end = start + 2 * width
+            if end > result.length { end = result.length }
+            let left = start
+            let right = middle
+            let out = start
+            while left < middle || right < end {
+                if right >= end || (left < middle && result[left] <= result[right]) { scratch[out] = result[left]; left += 1 }
+                else { scratch[out] = result[right]; right += 1 }
+                out += 1
+            }
+            start = end
+        }
+        for index in 0..result.length { result[index] = scratch[index] }
+        width *= 2
+    }
+    return result
+}
+public function hasText(values: List<Text>, value: Text): Boolean {
+    for item in values { if item == value { return true } }
+    return false
+}
+public function hasInteger(values: List<Integer>, value: Integer): Boolean {
+    for item in values { if item == value { return true } }
+    return false
+}
+public function unique(values: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for value in values { if !hasText(result, value) { result.add(value) } }
+    return result
+}
+public function lines(parts: List<Text>): Text {
+    let pieces: List<Text> = []
+    for part in parts { pieces.add(part); pieces.add("\n") }
+    return joinText(pieces)
+}
+public function joined(parts: List<Text>, separator: Text): Text {
+    let pieces: List<Text> = []
+    for index in 0..parts.length {
+        if index > 0 { pieces.add(separator) }
+        pieces.add(parts[index])
+    }
+    return joinText(pieces)
+}
+public function repeat(value: Text, count: Integer): Text {
+    let pieces: List<Text> = []
+    for unused in 0..count { pieces.add(value) }
+    return joinText(pieces)
+}
+public function repeated(values: List<Text>, count: Integer): List<Text> {
+    let result: List<Text> = []
+    for unused in 0..count { for value in values { result.add(value) } }
+    return result
+}
+public function extend(target: List<Text>, values: List<Text>) { for value in values { target.add(value) } }
+public function texts(values: List<Integer>): List<Text> {
+    let result: List<Text> = []
+    for value in values { result.add(Text(value)) }
+    return result
+}
+public function integers(values: List<Integer>): Text { return lines(texts(values)) }
+public function range(begin: Integer, end: Integer): List<Integer> {
+    let result: List<Integer> = []
+    for value in begin..end { result.add(value) }
+    return result
+}
+public function boolean(value: Boolean): Text {
+    if value { return "true" }
+    return "false"
+}
+public function character(code: Integer): Text { return Text(Character(code)) }
+public function scalars(value: Text): List<Text> {
+    let result: List<Text> = []
+    for item in value { result.add(Text(item)) }
+    return result
+}
+public function codepoints(points: List<Integer>): Text {
+    let pieces: List<Text> = []
+    for point in points { pieces.add(Text(Character(point))) }
+    return joinText(pieces)
+}
+public function bytes(values: List<Integer>): Bytes {
+    let raw = Bytes()
+    for value in values { raw.add(value) }
+    return raw
+}
+public function concat(left: Bytes, right: Bytes): Bytes {
+    let raw = Bytes()
+    raw.addBytes(left)
+    raw.addBytes(right)
+    return raw
+}
+public function bytesEqual(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+public function literal(value: Text): Text {
+    let raw = Bytes(value)
+    let pieces: List<Text> = ["\""]
+    let start = 0
+    for index in 0..raw.length {
+        let byte = raw[index]
+        if byte == 92 || byte == 34 || byte == 10 || byte == 13 || byte == 9 {
+            pieces.add(Text(raw.slice(start, index)))
+            if byte == 92 { pieces.add("\\\\") }
+            if byte == 34 { pieces.add("\\\"") }
+            if byte == 10 { pieces.add("\\n") }
+            if byte == 13 { pieces.add("\\r") }
+            if byte == 9 { pieces.add("\\t") }
+            start = index + 1
+        }
+    }
+    pieces.add(Text(raw.slice(start, raw.length)))
+    pieces.add("\"")
+    return joinText(pieces)
+}
+public function absolute(value: Integer): Integer {
+    if value < 0 { return -value }
+    return value
+}
+public function quotient(left: Integer, right: Integer): Integer { return left / right }
+public function remainder(left: Integer, right: Integer): Integer { return left % right }
+public function floorDivide(left: Integer, right: Integer): Integer {
+    let result = left / right
+    if left % right != 0 && ((left < 0) != (right < 0)) { result -= 1 }
+    return result
+}
+public function modulo(left: Integer, right: Integer): Integer { return left - floorDivide(left, right) * right }
+public function octal(value: Integer): Text {
+    if value == 0 { return "0" }
+    let digits: List<Text> = []
+    let remaining = value
+    while remaining > 0 { digits.add(Text(remaining % 8)); remaining /= 8 }
+    let pieces: List<Text> = []
+    let index = digits.length - 1
+    while index >= 0 { pieces.add(digits[index]); index -= 1 }
+    return joinText(pieces)
+}
+public function hexadecimal(value: Integer, width: Integer): Text {
+    let alphabet = "0123456789abcdef"
+    let pieces: List<Text> = []
+    let remaining = value
+    while remaining > 0 || pieces.length < width {
+        pieces.add(Text(alphabet[remaining & 15]))
+        remaining = remaining >> 4
+        if remaining == 0 && pieces.length >= width { break }
+    }
+    let result: List<Text> = []
+    let index = pieces.length - 1
+    while index >= 0 { result.add(pieces[index]); index -= 1 }
+    return joinText(result)
+}
+public function hexBytes(raw: Bytes): Text {
+    let pieces: List<Text> = []
+    for byte in raw { pieces.add(hexadecimal(byte, 2)) }
+    return joinText(pieces)
+}
+public function fromHex(source: Text): Bytes {
+    let raw = Bytes(source)
+    let result = Bytes()
+    let index = 0
+    while index + 1 < raw.length {
+        result.add(nibble(raw[index]) * 16 + nibble(raw[index + 1]))
+        index += 2
+    }
+    return result
+}
+function nibble(byte: Integer): Integer {
+    if byte >= 48 && byte <= 57 { return byte - 48 }
+    if byte >= 97 && byte <= 102 { return byte - 87 }
+    if byte >= 65 && byte <= 70 { return byte - 55 }
+    fail("invalid hexadecimal digit")
+}
+public function validUTF8(raw: Bytes): Boolean {
+    let index = 0
+    while index < raw.length {
+        let lead = raw[index]
+        let length = 0
+        let minimum = 0
+        let value = 0
+        if lead < 128 { index += 1; continue }
+        else if lead >= 194 && lead <= 223 { length = 2; minimum = 128; value = lead & 31 }
+        else if lead >= 224 && lead <= 239 { length = 3; minimum = 2048; value = lead & 15 }
+        else if lead >= 240 && lead <= 244 { length = 4; minimum = 65536; value = lead & 7 }
+        else { return false }
+        if index + length > raw.length { return false }
+        for offset in 1..length {
+            let next = raw[index + offset]
+            if (next & 192) != 128 { return false }
+            value = (value << 6) | (next & 63)
+        }
+        if value < minimum || value > 1114111 || (value >= 55296 && value <= 57343) { return false }
+        index += length
+    }
+    return true
+}
+public function quote(source: Text): Text {
+    let raw = Bytes(source)
+    let pieces: List<Text> = ["\""]
+    let start = 0
+    for index in 0..raw.length {
+        let byte = raw[index]
+        if byte == 34 || byte == 92 || byte < 32 {
+            pieces.add(Text(raw.slice(start, index)))
+            if byte == 34 { pieces.add("\\\"") }
+            else if byte == 92 { pieces.add("\\\\") }
+            else if byte == 10 { pieces.add("\\n") }
+            else { pieces.add("\\u00" + hexadecimal(byte, 2)) }
+            start = index + 1
+        }
+    }
+    pieces.add(Text(raw.slice(start, raw.length)))
+    pieces.add("\"")
+    return joinText(pieces)
+}
+public function encode(value: json.Value): Text {
+    if value.kind == json.STRING { return quote(value.text) }
+    if value.kind == json.NULL { return "null" }
+    if value.kind == json.BOOLEAN { return boolean(value.truth) }
+    if value.kind == json.ARRAY {
+        let pieces: List<Text> = ["["]
+        for index in 0..value.items.length {
+            if index > 0 { pieces.add(", ") }
+            pieces.add(encode(value.items[index]))
+        }
+        pieces.add("]")
+        return joinText(pieces)
+    }
+    if value.kind == json.OBJECT {
+        let pieces: List<Text> = ["{"]
+        for index in 0..value.keys.length {
+            if index > 0 { pieces.add(", ") }
+            pieces.add(quote(value.keys[index]) + ": " + encode(value.items[index]))
+        }
+        pieces.add("}")
+        return joinText(pieces)
+    }
+    return value.text
+}
+public function jsonText(value: Text): json.Value { return json.Value { kind: json.STRING; text: value; number: 0.0; truth: false; items: []; keys: [] } }
+public function jsonInteger(value: Integer): json.Value { return json.Value { kind: json.NUMBER; text: Text(value); number: Float(value); truth: false; items: []; keys: [] } }
+public function jsonFloat(value: Float): json.Value { return json.Value { kind: json.NUMBER; text: Text(value); number: value; truth: false; items: []; keys: [] } }
+public function jsonBoolean(value: Boolean): json.Value { return json.Value { kind: json.BOOLEAN; text: boolean(value); number: 0.0; truth: value; items: []; keys: [] } }
+public function jsonNull(): json.Value { return json.Value { kind: json.NULL; text: "null"; number: 0.0; truth: false; items: []; keys: [] } }
+public function jsonArray(values: List<json.Value>): json.Value { return json.Value { kind: json.ARRAY; text: ""; number: 0.0; truth: false; items: values; keys: [] } }
+public function jsonObject(): json.Value { return json.Value { kind: json.OBJECT; text: ""; number: 0.0; truth: false; items: []; keys: [] } }
+public function jsonTexts(values: List<Text>): json.Value {
+    let items: List<json.Value> = []
+    for value in values { items.add(jsonText(value)) }
+    return jsonArray(items)
+}
+public function jsonIntegers(values: List<Integer>): json.Value {
+    let items: List<json.Value> = []
+    for value in values { items.add(jsonInteger(value)) }
+    return jsonArray(items)
+}
+public function put(target: json.Value, name: Text, value: json.Value) {
+    for index in 0..target.keys.length {
+        if target.keys[index] == name { target.items[index] = value; return }
+    }
+    target.keys.add(name)
+    target.items.add(value)
+}
+public function member(value: json.Value, name: Text): json.Value { return json.member(value, name) }
+public function has(value: json.Value, name: Text): Boolean {
+    if value.kind != json.OBJECT { return false }
+    for key in value.keys { if key == name { return true } }
+    return false
+}
+public function number(value: json.Value): Integer {
+    test.check(value.kind == json.NUMBER, "expected a JSON number")
+    return Integer(value.text)
+}
+public function field(value: json.Value, name: Text): Integer { return number(json.member(value, name)) }
+public function textField(value: json.Value, name: Text): Text {
+    let found = json.member(value, name)
+    test.check(found.kind == json.STRING, "expected JSON text field " + name)
+    return found.text
+}
+public function load(path: Text): json.Value {
+    let value = json.parse(readTextFile(path))
+    test.check(value.kind != json.INVALID, "invalid JSON fixture " + path + ": " + value.text)
+    return value
+}
+public function digest(path: Text): Text { return sha256.hex(sha256.digest(readBytesFile(path))) }
+
+function setting(name: Text, fallback: Text): Text { return test.setting(name, fallback) }
+public function extended(): Boolean { return system.getenv("MINYAR_TEST_EXTENDED_OPT") == "1" }
+public function variants(): List<Text> {
+    if extended() { return ["-O0", "-O2", "-O3", "-Os"] }
+    return ["-O0", "-O2"]
+}
+function capture(command: List<Text>, directory: Text, label: Text): Text {
+    let result = test.run(command, system.environment(), "", directory + "/" + label, 10)
+    test.require(result, label)
+    return result.output
+}
+function firstLine(value: Text): Text {
+    let all = test.lines(value)
+    if all.length == 0 { return "" }
+    return all[0]
+}
+function workingDirectory(): Text {
+    let directory = test.scratch()
+    let root = firstLine(capture(["/bin/pwd", "-P"], directory, "root"))
+    test.removeTree(directory)
+    return root
+}
+function knownSelector(suite: Suite, value: Text): Boolean {
+    if value == suite.family { return true }
+    for name in suite.names { if value == name || value == suite.family + "." + name { return true } }
+    return false
+}
+function selects(value: Text, family: Text, name: Text): Boolean { return value == family || value == name || value == family + "." + name }
+public function suite(family: Text, source: Text, names: List<Text>): Suite {
+    test.check(unique(names).length == names.length, "duplicate peer test name")
+    let selectors: List<Text> = []
+    for index in 0..argumentCount() {
+        let value = argument(index)
+        if value == "-v" || value == "--verbose" || value == "-q" || value == "--quiet" { continue }
+        selectors.add(value)
+    }
+    let result = Suite { family: family; source: source; names: names; selected: []; root: workingDirectory(); child: system.getenv("MINYAR_PEER_OBSERVATION") != "" }
+    for value in selectors { test.check(knownSelector(result, value), "unknown " + family + " selector: " + value) }
+    for name in names {
+        let chosen = selectors.length == 0
+        for value in selectors { if selects(value, family, name) { chosen = true } }
+        if chosen { result.selected.add(name) }
+    }
+    return result
+}
+function childEnvironment(): List<Text> {
+    let result: List<Text> = []
+    for entry in system.environment() { if !starts(entry, "MINYAR_PEER_OBSERVATION=") { result.add(entry) } }
+    return result
+}
+public function environment(c: Case): List<Text> { return c.environment }
+public function withEnvironment(source: List<Text>, name: Text, value: Text): List<Text> {
+    let result: List<Text> = []
+    for entry in source { if !starts(entry, name + "=") { result.add(entry) } }
+    result.add(name + "=" + value)
+    return result
+}
+public function withoutEnvironment(source: List<Text>, name: Text): List<Text> {
+    let result: List<Text> = []
+    for entry in source { if !starts(entry, name + "=") { result.add(entry) } }
+    return result
+}
+function remember(c: Case, path: Text) {
+    let file = path
+    if !starts(path, "/") { file = c.suite.root + "/" + path }
+    if files.pathSize(file) >= 0 { put(c.inputs, file, jsonText(digest(file))) }
+}
+public function input(c: Case, path: Text) { remember(c, path) }
+function newCase(suite: Suite, name: Text): Case {
+    let compiler = test.compiler()
+    compiler.flags = test.words(setting("MINYAR_TEST_LINK_FLAGS", ""))
+    let base = setting("MINYAR_TEST_EVIDENCE", suite.root + "/build/test-evidence")
+    test.require(test.run(["/bin/mkdir", "-p", "--", base], system.environment(), "", compiler.directory + "/base", 10), "test workspace parent")
+    let directory = base + "/minyar-tests-regression-" + Text(system.processId()) + "-" + Text(system.monotonicNanoseconds())
+    test.check(files.makeDirectory(directory) == 0, "peer test workspace")
+    test.removeTree(compiler.directory)
+    compiler.directory = directory
+    if starts(compiler.executable, "./") { compiler.executable = Text(Bytes(compiler.executable).slice(2, Bytes(compiler.executable).length)) }
+    if starts(compiler.runtime, "./") { compiler.runtime = Text(Bytes(compiler.runtime).slice(2, Bytes(compiler.runtime).length)) }
+    if !starts(compiler.executable, "/") { compiler.executable = suite.root + "/" + compiler.executable }
+    if !starts(compiler.runtime, "/") { compiler.runtime = suite.root + "/" + compiler.runtime }
+    let controls = jsonObject()
+    put(controls, "test", jsonText(suite.family + "." + name))
+    put(controls, "link_flags", jsonTexts(compiler.flags))
+    let result = Case { suite: suite; name: name; directory: directory; compiler: compiler; serial: 0; commands: []; controls: controls; inputs: jsonObject(); skips: []; outcome: "running"; declared: []; environment: childEnvironment(); variants: variants(); compilerArguments: []; linkTimeout: compiler.linkTimeout; runTimeout: compiler.runTimeout; started: system.monotonicNanoseconds(); closed: false }
+    for path in [compiler.executable, compiler.runtime, suite.source, "tests/peer-support.min"] { remember(result, path) }
+    return result
+}
+function retain(c: Case) {
+    if c.closed { return }
+    c.closed = true
+    let report = jsonObject()
+    put(report, "schema_version", jsonInteger(1))
+    put(report, "status", jsonText("failed"))
+    put(report, "workspace", jsonText(c.directory))
+    put(report, "inputs", c.inputs)
+    put(report, "controls", c.controls)
+    put(report, "commands", jsonArray(c.commands))
+    writeTextFile(c.directory + "/evidence.json", encode(report) + "\n")
+    system.writeStandardError("Test failure workspace retained: " + c.directory + "\n")
+}
+public function expect(c: Case, condition: Boolean, message: Text) {
+    if !condition {
+        retain(c)
+        fail(c.suite.family + "." + c.name + ": " + message)
+    }
+}
+public function equal(c: Case, actual: Text, expected: Text, label: Text) {
+    expect(c, actual == expected, label + " differs\nactual:\n" + actual + "\nexpected:\n" + expected)
+}
+public function equalInteger(c: Case, actual: Integer, expected: Integer, label: Text) {
+    expect(c, actual == expected, label + ": expected " + Text(expected) + ", got " + Text(actual))
+}
+public function control(c: Case, name: Text, value: json.Value) { put(c.controls, name, value) }
+public function appendControl(c: Case, name: Text, value: json.Value) {
+    let existing = json.member(c.controls, name)
+    if existing.kind != json.ARRAY {
+        existing = jsonArray([])
+        put(c.controls, name, existing)
+    }
+    existing.items.add(value)
+}
+public function campaign(c: Case, configurations: List<Text>) {
+    test.check(configurations.length > 0 && unique(configurations).length == configurations.length, "Empty or duplicate campaign configurations")
+    for item in configurations { test.check(hasText(["O0", "O1", "O2", "O3", "Os", "harness"], item), "Unknown campaign configuration") }
+    c.declared = configurations
+}
+public function skip(c: Case, reason: Text) {
+    let row = jsonObject()
+    put(row, "test", jsonText(c.suite.family + "." + c.name))
+    put(row, "reason", jsonText(reason))
+    c.skips.add(row)
+    if c.outcome == "running" { c.outcome = "skipped" }
+}
+public function path(c: Case, name: Text): Text { return c.directory + "/" + name }
+public function writeFile(c: Case, name: Text, contents: Text): Text {
+    let file = path(c, name)
+    writeTextFile(file, contents)
+    return file
+}
+public function writeBytes(c: Case, name: Text, contents: Bytes): Text {
+    let file = path(c, name)
+    writeBytesFile(file, contents)
+    return file
+}
+public function launch(c: Case, command: List<Text>, phase: Text, timeout: Integer, environment: List<Text>, cwd: Text, stdin: Text): test.Result {
+    c.serial += 1
+    let directory = cwd
+    if directory == "" { directory = c.suite.root }
+    let row = jsonObject()
+    put(row, "command", jsonTexts(command))
+    put(row, "cwd", jsonText(directory))
+    put(row, "timeout", jsonInteger(timeout))
+    put(row, "phase", jsonText(phase))
+    let mode = "eof"
+    if stdin != "" { mode = "file" }
+    put(row, "stdin", jsonText(mode))
+    c.commands.add(row)
+    let source = stdin
+    if source == "" { source = "/dev/null" }
+    let actual = ["/bin/sh", "-c", "input=$1; shift; exec \"$@\" <\"$input\"", "minyar", source]
+    for item in command { actual.add(item) }
+    let log = c.directory + "/command" + Text(c.serial)
+    let started = system.monotonicNanoseconds()
+    let result = test.run(actual, environment, directory, log, timeout)
+    put(row, "returncode", jsonInteger(result.status))
+    put(row, "stdout", jsonText(log))
+    put(row, "stderr", jsonText(log + ".err"))
+    put(row, "elapsed_seconds", jsonFloat(Float(system.monotonicNanoseconds() - started) / 1000000000.0))
+    if result.status == 124 {
+        put(row, "timed_out", jsonBoolean(true))
+        expect(c, false, phase + " timed out after " + Text(timeout) + " seconds: " + joined(command, " "))
+    }
+    return result
+}
+public function run(c: Case, command: List<Text>, phase: Text, timeout: Integer): test.Result { return launch(c, command, phase, timeout, c.environment, "", "") }
+public function runChecked(c: Case, command: List<Text>, phase: Text, timeout: Integer): test.Result {
+    let result = run(c, command, phase, timeout)
+    expect(c, result.status == 0, phase + " failed with status " + Text(result.status) + "\n" + result.output + result.errorOutput)
+    return result
+}
+public function observe(c: Case, result: test.Result, status: Integer, stdout: Text, stderr: Text, label: Text) {
+    expect(c, result.status == status && result.output == stdout && result.errorOutput == stderr,
+        label + " differs\nstatus " + Text(result.status) + " expected " + Text(status) + "\nstdout:\n" + result.output + "\nexpected stdout:\n" + stdout + "\nstderr:\n" + result.errorOutput + "\nexpected stderr:\n" + stderr)
+}
+public record Compiled { result: test.Result; llvm: Text; base: Text }
+public function compileAt(c: Case, file: Text): Compiled {
+    let raw = Bytes(file)
+    let base = Text(raw.slice(0, raw.length - 4))
+    let llvm = base + ".ll"
+    let command = [c.compiler.executable, file, llvm]
+    for item in c.compilerArguments { command.add(item) }
+    let result = run(c, command, "compile", c.compiler.compileTimeout)
+    if result.status == 0 && test.addressEnabled(c.compiler.flags) { writeTextFile(llvm, test.instrument(readTextFile(llvm))) }
+    return Compiled { result: result; llvm: llvm; base: base }
+}
+public function compile(c: Case, source: Text): Compiled {
+    c.compiler.serial += 1
+    let file = c.directory + "/case" + Text(c.compiler.serial) + ".min"
+    writeTextFile(file, source)
+    return compileAt(c, file)
+}
+public function compiles(c: Case, source: Text): Compiled {
+    let compiled = compile(c, source)
+    expect(c, compiled.result.status == 0, "compilation failed\n" + compiled.result.errorOutput)
+    return compiled
+}
+public function rejects(c: Case, source: Text, diagnostic: Text) {
+    let compiled = compile(c, source)
+    let result = compiled.result
+    expect(c, result.status == 1, "expected compiler rejection status 1, got " + Text(result.status) + "\n" + result.errorOutput)
+    expect(c, result.output == "", "rejected source unexpectedly wrote standard output")
+    expect(c, contains(result.errorOutput, diagnostic), "missing diagnostic: " + diagnostic + "\n" + result.errorOutput)
+    expect(c, files.pathSize(compiled.llvm) < 0, "invalid source left LLVM output behind")
+    expect(c, !contains(result.errorOutput, "List position"), "compiler rejection used a List-position failure")
+}
+public function linkCommand(c: Case, llvm: Text, optimization: Text, executable: Text): List<Text> {
+    let command = [c.compiler.clang, optimization]
+    for flag in c.compiler.flags { command.add(flag) }
+    for item in ["-Wno-override-module", llvm, c.compiler.runtime, "-o", executable, "-lm"] { command.add(item) }
+    return command
+}
+public function link(c: Case, llvm: Text, optimization: Text, executable: Text) {
+    let result = run(c, linkCommand(c, llvm, optimization, executable), "link", c.linkTimeout)
+    expect(c, result.status == 0, "link failed at " + optimization + "\n" + result.errorOutput)
+}
+public function executable(base: Text, optimization: Text): Text {
+    let raw = Bytes(optimization)
+    return base + "." + Text(raw.slice(1, raw.length))
+}
+public record Output { path: Text; contents: Bytes }
+public function executesFull(c: Case, source: Text, expected: Text, status: Integer, stderr: Text, arguments: List<Text>, outputs: List<Output>, optimizations: List<Text>): Text {
+    let rows: List<json.Value> = []
+    for output in outputs {
+        let row = jsonObject()
+        put(row, "path", jsonText(output.path))
+        put(row, "bytes", jsonInteger(output.contents.length))
+        put(row, "sha256", jsonText(sha256.hex(sha256.digest(output.contents))))
+        rows.add(row)
+    }
+    let oracle = jsonObject()
+    put(oracle, "source", jsonText("case" + Text(c.compiler.serial + 1) + ".min"))
+    put(oracle, "stdout", jsonText(expected))
+    put(oracle, "stderr", jsonText(stderr))
+    put(oracle, "status", jsonInteger(status))
+    put(oracle, "optimizations", jsonTexts(optimizations))
+    put(oracle, "arguments", jsonTexts(arguments))
+    put(oracle, "file_outputs", jsonArray(rows))
+    appendControl(c, "execution_oracles", oracle)
+    let compiled = compile(c, source)
+    expect(c, compiled.result.status == 0, "compilation failed\n" + compiled.result.errorOutput)
+    for optimization in optimizations {
+        let program = executable(compiled.base, optimization)
+        link(c, compiled.llvm, optimization, program)
+        for output in outputs { if files.pathSize(output.path) >= 0 { expect(c, files.remove(output.path) == 0, "cannot clear file output") } }
+        let command = [program]
+        for item in arguments { command.add(item) }
+        let result = run(c, command, "execute", c.runTimeout)
+        observe(c, result, status, expected, stderr, "execution at " + optimization)
+        for output in outputs {
+            expect(c, files.pathSize(output.path) >= 0, "program did not create " + output.path)
+            expect(c, bytesEqual(readBytesFile(output.path), output.contents), "program file bytes differ: " + output.path)
+        }
+    }
+    return compiled.base
+}
+public function executesWith(c: Case, source: Text, expected: Text, status: Integer, stderr: Text, arguments: List<Text>): Text {
+    return executesFull(c, source, expected, status, stderr, arguments, [], c.variants)
+}
+public function executesStatus(c: Case, source: Text, expected: Text, status: Integer, stderr: Text): Text {
+    return executesFull(c, source, expected, status, stderr, [], [], c.variants)
+}
+public function executes(c: Case, source: Text, expected: Text): Text {
+    return executesFull(c, source, expected, 0, "", [], [], c.variants)
+}
+public function executesBase(c: Case, source: Text, expected: Text): Text {
+    return executesFull(c, source, expected, 0, "", [], [], ["-O0", "-O2"])
+}
+public function rerun(c: Case, base: Text, arguments: List<Text>, phase: Text, status: Integer, stdout: Text, stderr: Text) {
+    for optimization in c.variants {
+        let command = [executable(base, optimization)]
+        for item in arguments { command.add(item) }
+        observe(c, run(c, command, phase, 10), status, stdout, stderr, phase + " " + joined(arguments, " ") + " at " + optimization)
+    }
+}
+
+function configurations(c: Case): List<Text> {
+    let result: List<Text> = []
+    for row in c.commands {
+        let phase = json.member(row, "phase").text
+        let command: List<Text> = []
+        for item in json.member(row, "command").items { command.add(item.text) }
+        let output = hasText(command, "-o") && !hasText(command, "-c") && !hasText(command, "-S")
+        if !starts(phase, "link") && !output { continue }
+        let lto = false
+        for item in command { if starts(item, "-flto") { lto = true } }
+        for item in command {
+            if item == "-O0" || item == "-O1" || item == "-O2" || item == "-O3" || item == "-Os" {
+                let raw = Bytes(item)
+                let name = Text(raw.slice(1, raw.length))
+                if lto { name += "-LTO" }
+                if !hasText(result, name) { result.add(name) }
+            }
+        }
+    }
+    let campaign = json.member(c.controls, "campaign_configurations")
+    if campaign.kind == json.ARRAY { for item in campaign.items { if !hasText(result, item.text) { result.add(item.text) } } }
+    return sortTexts(result)
+}
+function arrayControl(c: Case, name: Text): json.Value {
+    let value = json.member(c.controls, name)
+    if value.kind == json.ARRAY { return value }
+    return jsonArray([])
+}
+public function finish(c: Case) {
+    if c.outcome == "running" { c.outcome = "passed" }
+    let phases: List<Text> = []
+    for row in c.commands { let phase = json.member(row, "phase").text; if !hasText(phases, phase) { phases.add(phase) } }
+    let exclusions = arrayControl(c, "platform_exclusions")
+    let domainExclusions = arrayControl(c, "domain_exclusions")
+    if (exclusions.items.length > 0 || domainExclusions.items.length > 0) && c.outcome == "passed" { c.outcome = "partial" }
+    let observed = configurations(c)
+    if c.declared.length == 1 && c.declared[0] == "harness" && c.outcome == "passed" { observed = ["harness"] }
+    let row = jsonObject()
+    put(row, "test", jsonText(c.suite.family + "." + c.name))
+    put(row, "outcome", jsonText(c.outcome))
+    put(row, "skips", jsonArray(c.skips))
+    put(row, "elapsed_seconds", jsonFloat(Float(system.monotonicNanoseconds() - c.started) / 1000000000.0))
+    put(row, "source", jsonText(c.suite.source))
+    put(row, "configurations", jsonTexts(observed))
+    put(row, "phases", jsonTexts(sortTexts(phases)))
+    put(row, "exclusions", exclusions)
+    put(row, "domain_exclusions", domainExclusions)
+    put(row, "inputs", c.inputs)
+    let coverage = json.member(c.controls, "domain_coverage")
+    if coverage.kind == json.NULL { coverage = jsonObject() }
+    put(row, "domain_coverage", coverage)
+    put(row, "output_references", arrayControl(c, "output_references"))
+    put(row, "command_count", jsonInteger(c.commands.length))
+    writeTextFile(system.getenv("MINYAR_PEER_OBSERVATION"), encode(row) + "\n")
+    c.closed = true
+    test.removeTree(c.directory)
+}
+
+record Child { name: Text; handle: Integer; log: Text; observation: Text; started: Integer }
+function pause() {
+    let handle = system.spawn("/bin/sleep", ["sleep", "0.05"], system.environment(), "")
+    if handle > 0 { system.wait(handle) }
+}
+function gate(): Text {
+    let named = system.getenv("MINYAR_PEER_GATE")
+    if named != "" { return named }
+    if test.addressEnabled(test.words(setting("MINYAR_TEST_LINK_FLAGS", ""))) || contains(setting("MINYAR_TEST_LINK_FLAGS", ""), "-fsanitize=") { return "check-peer-sanitize" }
+    if extended() { return "check-peer-optimizations" }
+    return "check-peer-regressions"
+}
+function uname(flag: Text): Text {
+    let directory = test.scratch()
+    let value = firstLine(capture(["/usr/bin/uname", flag], directory, "uname"))
+    test.removeTree(directory)
+    return value
+}
+function failedRow(suite: Suite, name: Text, elapsed: Float): json.Value {
+    let row = jsonObject()
+    put(row, "test", jsonText(suite.family + "." + name))
+    put(row, "outcome", jsonText("failed"))
+    put(row, "skips", jsonArray([]))
+    put(row, "elapsed_seconds", jsonFloat(elapsed))
+    put(row, "source", jsonText(suite.source))
+    put(row, "configurations", jsonArray([]))
+    put(row, "phases", jsonArray([]))
+    put(row, "exclusions", jsonArray([]))
+    put(row, "domain_exclusions", jsonArray([]))
+    return row
+}
+function names(value: json.Value): List<Text> {
+    let result: List<Text> = []
+    if value.kind == json.ARRAY { for item in value.items { result.add(item.text) } }
+    return result
+}
+function orchestrate(suite: Suite) {
+    let started = system.monotonicNanoseconds()
+    let jobs = Integer(setting("MINYAR_TEST_JOBS", "2"))
+    if jobs < 1 { jobs = 1 }
+    let scratch = test.scratch()
+    let program = suite.root + "/build/tooling/" + Text(Bytes(suite.source).slice(0, Bytes(suite.source).length - 4))
+    let pending: List<Text> = []
+    for name in suite.selected { pending.add(name) }
+    let running: List<Child> = []
+    let rows: List<json.Value> = []
+    let failures: List<json.Value> = []
+    let next = 0
+    while next < pending.length || running.length > 0 {
+        while next < pending.length && running.length < jobs {
+            let name = pending[next]
+            let log = scratch + "/case" + Text(next) + ".log"
+            let observation = scratch + "/case" + Text(next) + ".json"
+            let environment = withEnvironment(system.environment(), "MINYAR_PEER_OBSERVATION", observation)
+            let handle = test.start([program, suite.family + "." + name], environment, suite.root, log, 86400)
+            test.check(handle > 0, "cannot start peer case " + name)
+            running.add(Child { name: name; handle: handle; log: log; observation: observation; started: system.monotonicNanoseconds() })
+            next += 1
+        }
+        let progressed = false
+        let remaining: List<Child> = []
+        for child in running {
+            let status = system.poll(child.handle)
+            if status.state == system.PENDING { remaining.add(child); continue }
+            progressed = true
+            let code = status.exitCode
+            if status.state == system.SIGNALED { code = 128 + status.signal }
+            let output = Text(files.readFile(child.log)) + Text(files.readFile(child.log + ".err"))
+            let elapsed = Float(system.monotonicNanoseconds() - child.started) / 1000000000.0
+            let label = child.name + " (" + suite.family + "." + child.name + ")"
+            if code == 0 && files.pathSize(child.observation) > 0 {
+                let row = json.parse(readTextFile(child.observation))
+                test.check(row.kind == json.OBJECT, "invalid peer observation for " + child.name)
+                rows.add(row)
+                let outcome = json.member(row, "outcome").text
+                if outcome == "passed" { print(label + " ... ok") } else { print(label + " ... " + outcome) }
+            } else {
+                rows.add(failedRow(suite, child.name, elapsed))
+                let failure = jsonObject()
+                put(failure, "test", jsonText(suite.family + "." + child.name))
+                put(failure, "detail", jsonText("case exited with status " + Text(code) + "\n" + output))
+                failures.add(failure)
+                print(label + " ... FAIL")
+                system.writeStandardError(output)
+            }
+        }
+        running = remaining
+        if !progressed && running.length > 0 { pause() }
+    }
+    let ordered: List<json.Value> = []
+    for name in suite.selected {
+        for row in rows { if json.member(row, "test").text == suite.family + "." + name { ordered.add(row) } }
+    }
+    let current = gate()
+    let manifest = load(suite.root + "/tests/peer-cases.json")
+    let omitted: List<json.Value> = []
+    let allDeclared = true
+    for row in ordered {
+        let identity = json.member(row, "test").text
+        let name = Text(Bytes(identity).slice(Bytes(suite.family).length + 1, Bytes(identity).length))
+        let declaration = jsonNull()
+        for item in json.member(manifest, "cases").items {
+            if json.member(item, "source").text == suite.source && json.member(item, "id").text == name { declaration = item }
+        }
+        let gates = json.member(declaration, "gates")
+        let required = json.member(gates, current)
+        put(row, "declared", jsonBoolean(declaration.kind == json.OBJECT && required.kind == json.ARRAY))
+        let requiredNames = names(required)
+        put(row, "required_configurations", jsonTexts(requiredNames))
+        let observed = names(json.member(row, "configurations"))
+        for phase in names(json.member(row, "phases")) { if starts(phase, "compile") && !hasText(observed, "frontend") { observed.add("frontend") } }
+        let missing: List<Text> = []
+        for item in requiredNames { if !hasText(observed, item) { missing.add(item) } }
+        put(row, "missing_configurations", jsonTexts(sortTexts(missing)))
+        if !json.member(row, "declared").truth || json.member(row, "outcome").text != "passed" || missing.length > 0 { allDeclared = false }
+    }
+    for item in json.member(manifest, "cases").items {
+        if json.member(item, "source").text != suite.source { continue }
+        if json.member(json.member(item, "gates"), current).kind != json.ARRAY { continue }
+        if hasText(suite.selected, json.member(item, "id").text) { continue }
+        let row = jsonObject()
+        put(row, "source", jsonText(suite.source))
+        put(row, "test", jsonText(json.member(item, "id").text))
+        put(row, "reason", jsonText("not selected in this invocation"))
+        omitted.add(row)
+    }
+    let successful = failures.length == 0
+    let allPassed = ordered.length > 0
+    for row in ordered { if json.member(row, "outcome").text != "passed" { allPassed = false } }
+    let report = jsonObject()
+    put(report, "schema_version", jsonInteger(1))
+    put(report, "successful", jsonBoolean(successful))
+    put(report, "gate", jsonText(current))
+    put(report, "complete_selection", jsonBoolean(successful && allPassed))
+    put(report, "required_coverage_observed", jsonBoolean(successful && ordered.length > 0 && omitted.length == 0 && allDeclared))
+    put(report, "scope", jsonText("Selected tests only; observed link configurations do not prove every domain cell ran"))
+    put(report, "platform", jsonText(uname("-s")))
+    put(report, "machine", jsonText(uname("-m")))
+    put(report, "extended_optimizations", jsonBoolean(extended()))
+    put(report, "link_flags", jsonText(setting("MINYAR_TEST_LINK_FLAGS", "")))
+    let elapsed = Float(system.monotonicNanoseconds() - started) / 1000000000.0
+    put(report, "elapsed_seconds", jsonFloat(elapsed))
+    put(report, "tests_run", jsonInteger(ordered.length))
+    put(report, "selected", jsonArray(ordered))
+    put(report, "omitted", jsonArray(omitted))
+    put(report, "fixture_skips", jsonArray([]))
+    put(report, "errors", jsonArray([]))
+    put(report, "failures", jsonArray(failures))
+    let directory = setting("MINYAR_PEER_RESULTS", suite.root + "/build/peer-results")
+    test.require(test.run(["/bin/mkdir", "-p", "--", directory], system.environment(), "", scratch + "/results", 10), "peer results directory")
+    let raw = Bytes(suite.source)
+    let stem = Text(raw.slice(6, raw.length - 4))
+    let output = directory + "/" + stem + "-" + Text(system.processId()) + "-" + Text(system.monotonicNanoseconds()) + ".json"
+    writeTextFile(output, encode(report) + "\n")
+    test.removeTree(scratch)
+    print("----------------------------------------------------------------------")
+    print("Ran " + Text(ordered.length) + " tests over " + Text(jobs) + " processes (" + Text(elapsed) + "s)")
+    if successful { print("OK") } else { print("FAILED (failures=" + Text(failures.length) + ")") }
+    print("Peer outcomes: " + output)
+    if successful { exit(0) }
+    exit(1)
+}
+public function begin(suite: Suite): Case {
+    if !suite.child { orchestrate(suite) }
+    test.check(suite.selected.length == 1, "a peer case process runs exactly one case")
+    return newCase(suite, suite.selected[0])
+}
+
+public record Big { negative: Boolean; limbs: List<Integer> }
+function trimmed(limbs: List<Integer>): List<Integer> {
+    let result: List<Integer> = []
+    for limb in limbs { result.add(limb) }
+    while result.length > 0 && result[result.length - 1] == 0 {
+        let shorter: List<Integer> = []
+        for index in 0..(result.length - 1) { shorter.add(result[index]) }
+        result = shorter
+    }
+    return result
+}
+public function bigParse(source: Text): Big {
+    let raw = Bytes(source)
+    let negative = raw.length > 0 && raw[0] == 45
+    let start = 0
+    if negative || (raw.length > 0 && raw[0] == 43) { start = 1 }
+    let limbs: List<Integer> = []
+    let end = raw.length
+    while end > start {
+        let begin = end - 4
+        if begin < start { begin = start }
+        let value = 0
+        for index in begin..end {
+            test.check(raw[index] >= 48 && raw[index] <= 57, "invalid big integer " + source)
+            value = value * 10 + raw[index] - 48
+        }
+        limbs.add(value)
+        end = begin
+    }
+    let result = trimmed(limbs)
+    return Big { negative: negative && result.length > 0; limbs: result }
+}
+public function big(value: Integer): Big { return bigParse(Text(value)) }
+public function bigText(value: Big): Text {
+    if value.limbs.length == 0 { return "0" }
+    let pieces: List<Text> = []
+    if value.negative { pieces.add("-") }
+    let index = value.limbs.length - 1
+    pieces.add(Text(value.limbs[index]))
+    index -= 1
+    while index >= 0 {
+        let digits = Text(value.limbs[index])
+        pieces.add(repeat("0", 4 - Bytes(digits).length) + digits)
+        index -= 1
+    }
+    return joinText(pieces)
+}
+function compareMagnitude(left: List<Integer>, right: List<Integer>): Integer {
+    if left.length != right.length { return left.length - right.length }
+    let index = left.length - 1
+    while index >= 0 {
+        if left[index] != right[index] { return left[index] - right[index] }
+        index -= 1
+    }
+    return 0
+}
+function addMagnitude(left: List<Integer>, right: List<Integer>): List<Integer> {
+    let result: List<Integer> = []
+    let carry = 0
+    let length = left.length
+    if right.length > length { length = right.length }
+    for index in 0..length {
+        let sum = carry
+        if index < left.length { sum += left[index] }
+        if index < right.length { sum += right[index] }
+        result.add(sum % 10000)
+        carry = sum / 10000
+    }
+    if carry > 0 { result.add(carry) }
+    return trimmed(result)
+}
+function subtractMagnitude(left: List<Integer>, right: List<Integer>): List<Integer> {
+    let result: List<Integer> = []
+    let borrow = 0
+    for index in 0..left.length {
+        let value = left[index] - borrow
+        if index < right.length { value -= right[index] }
+        borrow = 0
+        if value < 0 { value += 10000; borrow = 1 }
+        result.add(value)
+    }
+    return trimmed(result)
+}
+public function bigCompare(left: Big, right: Big): Integer {
+    if left.negative != right.negative {
+        if left.negative { return -1 }
+        return 1
+    }
+    let order = compareMagnitude(left.limbs, right.limbs)
+    if left.negative { return -order }
+    return order
+}
+public function bigNegate(value: Big): Big { return Big { negative: !value.negative && value.limbs.length > 0; limbs: value.limbs } }
+public function bigAdd(left: Big, right: Big): Big {
+    if left.negative == right.negative { return Big { negative: left.negative; limbs: addMagnitude(left.limbs, right.limbs) } }
+    let order = compareMagnitude(left.limbs, right.limbs)
+    if order == 0 { return Big { negative: false; limbs: [] } }
+    if order > 0 { return Big { negative: left.negative; limbs: subtractMagnitude(left.limbs, right.limbs) } }
+    return Big { negative: right.negative; limbs: subtractMagnitude(right.limbs, left.limbs) }
+}
+public function bigSubtract(left: Big, right: Big): Big { return bigAdd(left, bigNegate(right)) }
+public function bigMultiply(left: Big, right: Big): Big {
+    if left.limbs.length == 0 || right.limbs.length == 0 { return Big { negative: false; limbs: [] } }
+    let result: List<Integer> = []
+    for unused in 0..(left.limbs.length + right.limbs.length + 1) { result.add(0) }
+    for i in 0..left.limbs.length {
+        let carry = 0
+        for j in 0..right.limbs.length {
+            let value = result[i + j] + left.limbs[i] * right.limbs[j] + carry
+            result[i + j] = value % 10000
+            carry = value / 10000
+        }
+        let position = i + right.limbs.length
+        while carry > 0 {
+            let value = result[position] + carry
+            result[position] = value % 10000
+            carry = value / 10000
+            position += 1
+        }
+    }
+    return Big { negative: left.negative != right.negative; limbs: trimmed(result) }
+}
+public function bigFits(value: Big): Boolean { return bigCompare(value, big(MINIMUM)) >= 0 && bigCompare(value, big(MAXIMUM)) <= 0 }
+public function bigValue(value: Big): Integer {
+    test.check(bigFits(value), "big integer outside Integer: " + bigText(value))
+    return Integer(bigText(value))
+}
+public function product(left: Integer, right: Integer): Big { return bigMultiply(big(left), big(right)) }
+public function productFits(left: Integer, right: Integer): Boolean { return bigFits(product(left, right)) }
+public function bigMagnitude(value: Big): Big { return Big { negative: false; limbs: value.limbs } }
+public record Division { quotient: Integer; remainder: Integer }
+public function division(left: Integer, right: Integer): Division {
+    test.check(right != 0 && !(left == MINIMUM && right == -1), "undefined division oracle")
+    let result = Division { quotient: left / right; remainder: left % right }
+    let identity = bigAdd(bigMultiply(big(result.quotient), big(right)), big(result.remainder))
+    test.check(bigCompare(identity, big(left)) == 0, "division oracle identity failed")
+    test.check(bigCompare(bigMagnitude(big(result.remainder)), bigMagnitude(big(right))) < 0, "division oracle remainder bound failed")
+    test.check(result.remainder == 0 || (result.remainder < 0) == (left < 0), "division oracle remainder sign failed")
+    return result
+}
+public function linux(): Boolean { return uname("-s") == "Linux" }
+public function ltoFlags(): List<Text> {
+    for entry in system.environment() { if entry == "MINYAR_TEST_LTO_FLAGS=" { return [] } }
+    return test.words(setting("MINYAR_TEST_LTO_FLAGS", "-flto"))
+}
+public function shuffle(state: random.State, values: List<Integer>) {
+    let index = values.length - 1
+    while index > 0 {
+        let other = random.below(state, index + 1)
+        let value = values[index]
+        values[index] = values[other]
+        values[other] = value
+        index -= 1
+    }
+}
+public function bigHex(source: Text): Big {
+    let result = big(0)
+    for character in source { result = bigAdd(bigMultiply(result, big(16)), big(nibble(Integer(character)))) }
+    return result
+}
+public function replace(source: Text, needle: Text, replacement: Text): Text { return test.replace(source, needle, replacement) }

@@ -1,4 +1,9 @@
-PEER_SUITES ?= tests/peer-regressions.py tests/peer-cpp-java-js.py tests/peer-rust-go-zig.py tests/peer-python-swift-ruby-lua.py
+PEER_PROGRAMS = build/tooling/tests/peer-regressions
+$(PEER_PROGRAMS): TOOL_NATIVE = runtime/native/sha256.c
+$(PEER_PROGRAMS): TOOL_LIBS = $(TOOL_CRYPTO)
+$(PEER_PROGRAMS): TOOL_RUNTIME = build/testing/cycle-runtime.o
+$(PEER_PROGRAMS): runtime/native/sha256.c build/testing/cycle-runtime.o
+PEER_SUITES ?= tests/peer-regressions.min tests/peer-cpp-java-js.py tests/peer-rust-go-zig.py tests/peer-python-swift-ruby-lua.py
 PEER_BASE_ARTIFACTS = build/minyarc build/minyarc-modules build/minyar-default-runtime.o
 # Only the extended Rust/Go/Zig suite exercises the POSIX incremental driver.
 peer_driver_artifacts = $(PEER_BASE_ARTIFACTS) $(if $(filter tests/peer-rust-go-zig.py,$(1)),build/minyar-module-build build/minyarc-errors-request)
@@ -10,16 +15,18 @@ PEER_DRIVER_ARTIFACTS = $(call peer_driver_artifacts,$(PEER_SUITES))
 # runs the suites side by side; the gate itself only checks the selection.
 peer_suite_name = $(patsubst peer-%,%,$(basename $(notdir $(1))))
 peer_gate_children = $(foreach suite,$(PEER_SUITES),$(1)-$(call peer_suite_name,$(suite)))
+peer_program = $(if $(filter %.py,$(1)),python3 $(1),./build/tooling/$(basename $(1)))
+peer_program_artifact = $(if $(filter %.min,$(1)),build/tooling/$(basename $(1)))
 define PEER_SUITE_CHECKS
 .PHONY: check-peer-regressions-$(2) check-peer-optimizations-$(2) check-peer-sanitize-$(2)
-check-peer-regressions-$(2): check-peer-manifest $(call peer_driver_artifacts,$(1)) build/minyar-runtime.o $(PEER_FEATURE_ARTIFACTS)
-	MINYAR_PEER_GATE=check-peer-regressions $$(LIMITED) python3 $(1)
+check-peer-regressions-$(2): check-peer-manifest $(call peer_program_artifact,$(1)) $(call peer_driver_artifacts,$(1)) build/minyar-runtime.o $(PEER_FEATURE_ARTIFACTS)
+	MINYAR_PEER_GATE=check-peer-regressions $$(LIMITED) $(call peer_program,$(1))
 
-check-peer-optimizations-$(2): check-peer-manifest $(call peer_driver_artifacts,$(1)) build/minyar-runtime.o $(PEER_FEATURE_ARTIFACTS)
-	MINYAR_PEER_GATE=check-peer-optimizations MINYAR_TEST_EXTENDED_OPT=1 $$(LIMITED) python3 $(1)
+check-peer-optimizations-$(2): check-peer-manifest $(call peer_program_artifact,$(1)) $(call peer_driver_artifacts,$(1)) build/minyar-runtime.o $(PEER_FEATURE_ARTIFACTS)
+	MINYAR_PEER_GATE=check-peer-optimizations MINYAR_TEST_EXTENDED_OPT=1 $$(LIMITED) $(call peer_program,$(1))
 
-check-peer-sanitize-$(2): check-peer-manifest $(call peer_driver_artifacts,$(1)) build/minyarc-sanitize build/minyar-runtime-sanitize.o $(PEER_FEATURE_ARTIFACTS) $(PEER_FEATURE_SANITIZE_ARTIFACTS)
-	MINYAR_PEER_GATE=check-peer-sanitize ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $$(SANITIZER_LIMITED) python3 $(1)
+check-peer-sanitize-$(2): check-peer-manifest $(call peer_program_artifact,$(1)) $(call peer_driver_artifacts,$(1)) build/minyarc-sanitize build/minyar-runtime-sanitize.o $(PEER_FEATURE_ARTIFACTS) $(PEER_FEATURE_SANITIZE_ARTIFACTS)
+	MINYAR_PEER_GATE=check-peer-sanitize ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $$(SANITIZER_LIMITED) $(call peer_program,$(1))
 endef
 $(foreach suite,$(PEER_SUITES),$(eval $(call PEER_SUITE_CHECKS,$(suite),$(call peer_suite_name,$(suite)))))
 
@@ -76,8 +83,10 @@ check-scalar-cleanup-probes: build/tooling/tests/scalar-cleanup-probes
 
 check: check-scalar-cleanup-probes
 
-check-peer-manifest: check-peer-audit check-suite-catalogue
-	python3 tests/peer-manifest.py
+build/tooling/tests/peer-manifest: TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/peer-manifest: build/testing/cycle-runtime.o
+check-peer-manifest: check-peer-audit check-suite-catalogue build/tooling/tests/peer-manifest
+	./build/tooling/tests/peer-manifest
 
 build/tooling/tests/evidence-harness.ll build/tooling/tests/evidence-replay.ll: tests/evidence-support.min
 build/tooling/tests/evidence-harness build/tooling/tests/evidence-replay: TOOL_NATIVE = tests/evidence-support-native.c runtime/native/sha256.c
@@ -106,12 +115,12 @@ check-peer-regressions check-peer-optimizations check-peer-sanitize:
 # suite's selection is its own phony child, and only the Rust/Go/Zig selection
 # runs the incremental driver.
 PEER_OWNERSHIP_ARTIFACTS = check-peer-manifest $(PEER_BASE_ARTIFACTS) build/minyarc-sanitize build/ownership-runtime.o $(PEER_FEATURE_ARTIFACTS) $(PEER_FEATURE_SANITIZE_ARTIFACTS)
-PEER_OWNERSHIP_RUN = MINYAR_PEER_GATE=check-peer-ownership ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3
+PEER_OWNERSHIP_RUN = MINYAR_PEER_GATE=check-peer-ownership ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED)
 .PHONY: check-peer-ownership-regressions check-peer-ownership-cpp-java-js check-peer-ownership-rust-go-zig check-peer-ownership-python-swift-ruby-lua
 check-peer-ownership: check-peer-ownership-regressions check-peer-ownership-cpp-java-js check-peer-ownership-rust-go-zig check-peer-ownership-python-swift-ruby-lua
 
-check-peer-ownership-regressions: $(PEER_OWNERSHIP_ARTIFACTS)
-	$(PEER_OWNERSHIP_RUN) tests/peer-regressions.py \
+check-peer-ownership-regressions: $(PEER_OWNERSHIP_ARTIFACTS) build/tooling/tests/peer-regressions
+	$(PEER_OWNERSHIP_RUN) ./build/tooling/tests/peer-regressions \
 		PeerRegressions.test_mixed_width_boundary_views_survive_nonsequential_access \
 		PeerRegressions.test_self_join_keeps_old_alias_across_growth \
 		PeerRegressions.test_ignored_call_result_preserves_live_argument \
@@ -143,7 +152,7 @@ check-peer-ownership-regressions: $(PEER_OWNERSHIP_ARTIFACTS)
 		PeerRegressions.test_earlier_text_argument_survives_later_slot_replacement
 
 check-peer-ownership-cpp-java-js: $(PEER_OWNERSHIP_ARTIFACTS)
-	$(PEER_OWNERSHIP_RUN) tests/peer-cpp-java-js.py \
+	$(PEER_OWNERSHIP_RUN) python3 tests/peer-cpp-java-js.py \
 		PeerCppJavaJs.test_five_fill_loops_all_1024_lengths \
 		PeerCppJavaJs.test_four_stores_reverse_fill_all_cells \
 		PeerCppJavaJs.test_hex_digit_fold_mutates_accumulator_in_order \
@@ -189,7 +198,7 @@ check-peer-ownership-cpp-java-js: $(PEER_OWNERSHIP_ARTIFACTS)
 		PeerCppJavaJs.test_seeded_int_fill_generator_and_boundary_supplements
 
 check-peer-ownership-rust-go-zig: $(PEER_OWNERSHIP_ARTIFACTS) build/minyar-module-build build/minyarc-errors-request
-	$(PEER_OWNERSHIP_RUN) tests/peer-rust-go-zig.py \
+	$(PEER_OWNERSHIP_RUN) python3 tests/peer-rust-go-zig.py \
 		PeerRustGoZig.test_returned_lists_branch_alias_and_fresh_result \
 		PeerRustGoZig.test_record_list_literal_helper_and_direct_elements \
 		PeerRustGoZig.test_repeated_record_branch_returns_and_original_copy \
@@ -274,7 +283,7 @@ check-peer-ownership-rust-go-zig: $(PEER_OWNERSHIP_ARTIFACTS) build/minyar-modul
 		PeerRustGoZig.test_unicode_validators_preserve_all_shared_valid_inputs
 
 check-peer-ownership-python-swift-ruby-lua: $(PEER_OWNERSHIP_ARTIFACTS)
-	$(PEER_OWNERSHIP_RUN) tests/peer-python-swift-ruby-lua.py \
+	$(PEER_OWNERSHIP_RUN) python3 tests/peer-python-swift-ruby-lua.py \
 		PeerPythonSwiftRubyLua.test_three_hundred_positional_parameters_and_values \
 		PeerPythonSwiftRubyLua.test_five_module_cycle_shapes_and_acyclic_controls \
 		PeerPythonSwiftRubyLua.test_python_literal_payloads_match_independent_utf8_files \

@@ -1,0 +1,682 @@
+use "../tools/testing.min" as test
+use "files" as files
+use "json" as json
+
+record Suite { path: Text; methods: List<Text>; contractMethods: List<Text>; contracts: List<List<Text>>; ownerMethods: List<Text>; owners: List<Text>; compiler: Boolean; error: Text }
+record Cache { paths: List<Text>; suites: List<Suite> }
+record Literals { values: List<Text>; valid: Boolean }
+record Recipe { found: Boolean; body: Text }
+
+function isWord(byte: Integer): Boolean {
+    return (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+}
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let bytes = Bytes(prefix)
+    if raw.length < bytes.length { return false }
+    for index in 0..bytes.length { if raw[index] != bytes[index] { return false } }
+    return true
+}
+function ends(source: Text, suffix: Text): Boolean {
+    let raw = Bytes(source)
+    let bytes = Bytes(suffix)
+    if raw.length < bytes.length { return false }
+    let offset = raw.length - bytes.length
+    for index in 0..bytes.length { if raw[offset + index] != bytes[index] { return false } }
+    return true
+}
+function find(source: Text, needle: Text, begin: Integer): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if begin < 0 || raw.length < pattern.length { return -1 }
+    for index in begin..(raw.length - pattern.length + 1) {
+        let same = true
+        for offset in 0..pattern.length { if raw[index + offset] != pattern[offset] { same = false; break } }
+        if same { return index }
+    }
+    return -1
+}
+function contains(source: Text, needle: Text): Boolean { return find(source, needle, 0) >= 0 }
+function cut(source: Text, begin: Integer, end: Integer): Text { return Text(Bytes(source).slice(begin, end)) }
+function wordAt(source: Text, begin: Integer): Text {
+    let raw = Bytes(source)
+    let end = begin
+    while end < raw.length && isWord(raw[end]) { end += 1 }
+    return Text(raw.slice(begin, end))
+}
+function trim(source: Text): Text {
+    let raw = Bytes(source)
+    let begin = 0
+    let end = raw.length
+    while begin < end && (raw[begin] == 32 || raw[begin] == 9) { begin += 1 }
+    while end > begin && (raw[end - 1] == 32 || raw[end - 1] == 9) { end -= 1 }
+    return Text(raw.slice(begin, end))
+}
+function split(source: Text, separator: Integer): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(source)
+    let begin = 0
+    for index in 0..raw.length {
+        if raw[index] == separator {
+            result.add(Text(raw.slice(begin, index)))
+            begin = index + 1
+        }
+    }
+    result.add(Text(raw.slice(begin, raw.length)))
+    return result
+}
+function hasText(values: List<Text>, value: Text): Boolean {
+    for item in values { if item == value { return true } }
+    return false
+}
+function sameTexts(left: List<Text>, right: List<Text>): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+function sameSet(left: List<Text>, right: List<Text>): Boolean {
+    for item in left { if !hasText(right, item) { return false } }
+    for item in right { if !hasText(left, item) { return false } }
+    return true
+}
+function texts(value: json.Value): List<Text> {
+    let result: List<Text> = []
+    for item in value.items { result.add(item.text) }
+    return result
+}
+function present(value: json.Value): Boolean {
+    if value.kind == json.NULL { return false }
+    if value.kind == json.BOOLEAN { return value.truth }
+    if value.kind == json.STRING { return value.text != "" }
+    if value.kind == json.NUMBER { return value.number != 0.0 }
+    return value.items.length > 0
+}
+function textArray(values: List<Text>): json.Value {
+    let items: List<json.Value> = []
+    for value in values { items.add(json.Value { kind: json.STRING; text: value; number: 0.0; truth: false; items: []; keys: [] }) }
+    return json.Value { kind: json.ARRAY; text: ""; number: 0.0; truth: false; items: items; keys: [] }
+}
+function object(keys: List<Text>, items: List<json.Value>): json.Value {
+    return json.Value { kind: json.OBJECT; text: ""; number: 0.0; truth: false; items: items; keys: keys }
+}
+function array(items: List<json.Value>): json.Value {
+    return json.Value { kind: json.ARRAY; text: ""; number: 0.0; truth: false; items: items; keys: [] }
+}
+function replaced(source: json.Value, name: Text, value: json.Value): json.Value {
+    let keys: List<Text> = []
+    let items: List<json.Value> = []
+    let found = false
+    for index in 0..source.keys.length {
+        keys.add(source.keys[index])
+        if source.keys[index] == name { items.add(value); found = true } else { items.add(source.items[index]) }
+    }
+    if !found { keys.add(name); items.add(value) }
+    return object(keys, items)
+}
+function removed(source: json.Value, name: Text): json.Value {
+    let keys: List<Text> = []
+    let items: List<json.Value> = []
+    for index in 0..source.keys.length {
+        if source.keys[index] != name { keys.add(source.keys[index]); items.add(source.items[index]) }
+    }
+    return object(keys, items)
+}
+function withCase(data: json.Value, position: Integer, row: json.Value): json.Value {
+    let rows: List<json.Value> = []
+    let all = json.member(data, "cases").items
+    for index in 0..all.length { if index == position { rows.add(row) } else { rows.add(all[index]) } }
+    return replaced(data, "cases", array(rows))
+}
+function withGate(data: json.Value, position: Integer, gate: Text, variants: List<Text>): json.Value {
+    let row = json.member(data, "cases").items[position]
+    return withCase(data, position, replaced(row, "gates", replaced(json.member(row, "gates"), gate, textArray(variants))))
+}
+function stem(path: Text): Text {
+    let raw = Bytes(path)
+    let begin = 0
+    for index in 0..raw.length { if raw[index] == 47 { begin = index + 1 } }
+    let end = raw.length
+    for index in begin..raw.length { if raw[index] == 46 { end = index } }
+    return Text(raw.slice(begin, end))
+}
+
+function pythonLineStarts(source: Text): List<Boolean> {
+    let raw = Bytes(source)
+    let result: List<Boolean> = [true]
+    let state = 0
+    let quote = 0
+    let depth = 0
+    let index = 0
+    while index < raw.length {
+        let byte = raw[index]
+        if state == 0 {
+            if byte == 35 {
+                while index < raw.length && raw[index] != 10 { index += 1 }
+                continue
+            }
+            if byte == 39 || byte == 34 {
+                quote = byte
+                if index + 2 < raw.length && raw[index + 1] == byte && raw[index + 2] == byte { state = 2; index += 3 } else { state = 1; index += 1 }
+                continue
+            }
+            if byte == 40 || byte == 91 || byte == 123 { depth += 1 }
+            if (byte == 41 || byte == 93 || byte == 125) && depth > 0 { depth -= 1 }
+            if byte == 92 && index + 1 < raw.length && raw[index + 1] == 10 {
+                result.add(false)
+                index += 2
+                continue
+            }
+            if byte == 10 { result.add(depth == 0) }
+            index += 1
+            continue
+        }
+        if byte == 92 {
+            if index + 1 < raw.length && raw[index + 1] == 10 { result.add(false) }
+            index += 2
+            continue
+        }
+        if state == 1 {
+            if byte == quote || byte == 10 { state = 0 }
+            if byte == 10 { result.add(depth == 0) }
+            index += 1
+            continue
+        }
+        if byte == quote && index + 2 < raw.length && raw[index + 1] == quote && raw[index + 2] == quote {
+            state = 0
+            index += 3
+            continue
+        }
+        if byte == 10 { result.add(false) }
+        index += 1
+    }
+    return result
+}
+function minyarLineStarts(source: Text): List<Boolean> {
+    let raw = Bytes(source)
+    let result: List<Boolean> = [true]
+    let state = 0
+    let index = 0
+    while index < raw.length {
+        let byte = raw[index]
+        if state == 0 {
+            if byte == 47 && index + 1 < raw.length && raw[index + 1] == 47 {
+                while index < raw.length && raw[index] != 10 { index += 1 }
+                continue
+            }
+            if byte == 47 && index + 1 < raw.length && raw[index + 1] == 42 { state = 3; index += 2; continue }
+            if byte == 34 { state = 1; index += 1; continue }
+            if byte == 39 { state = 2; index += 1; continue }
+            if byte == 10 { result.add(true) }
+            index += 1
+            continue
+        }
+        if state == 3 {
+            if byte == 42 && index + 1 < raw.length && raw[index + 1] == 47 { state = 0; index += 2; continue }
+            if byte == 10 { result.add(false) }
+            index += 1
+            continue
+        }
+        if byte == 92 {
+            if index + 1 < raw.length && raw[index + 1] == 10 { result.add(false) }
+            index += 2
+            continue
+        }
+        if (state == 1 && byte == 34) || (state == 2 && byte == 39) { state = 0 }
+        if byte == 10 {
+            if state == 0 { result.add(true) } else { result.add(false) }
+        }
+        index += 1
+    }
+    return result
+}
+function literals(source: Text): Literals {
+    let result = Literals { values: []; valid: true }
+    let body = trim(source)
+    if body == "" { return result }
+    for part in split(body, 44) {
+        let item = trim(part)
+        let raw = Bytes(item)
+        if raw.length < 2 || (raw[0] != 39 && raw[0] != 34) || raw[raw.length - 1] != raw[0] { result.valid = false; return result }
+        for index in 1..(raw.length - 1) { if raw[index] == 39 || raw[index] == 34 || raw[index] == 92 { result.valid = false; return result } }
+        result.values.add(Text(raw.slice(1, raw.length - 1)))
+    }
+    return result
+}
+function addMethod(suite: Suite, name: Text) { if !hasText(suite.methods, name) { suite.methods.add(name) } }
+function parsePython(path: Text, source: Text): Suite {
+    let suite = Suite { path: path; methods: []; contractMethods: []; contracts: []; ownerMethods: []; owners: []; compiler: false; error: "" }
+    let all = test.lines(source)
+    let normal = pythonLineStarts(source)
+    let pending: List<List<Text>> = []
+    let current = ""
+    for number in 0..all.length {
+        if !normal[number] { continue }
+        let line = all[number]
+        let stripped = trim(line)
+        if stripped == "" || starts(stripped, "#") { continue }
+        if starts(line, "class ") {
+            current = wordAt(line, 6)
+            let open = find(line, "(", 0)
+            let close = find(line, ")", open + 1)
+            if open >= 0 && close > open {
+                for base in split(cut(line, open + 1, close), 44) {
+                    let name = trim(base)
+                    if name == "CompilerTestCase" || name == "PackageCompilerTestCase" { suite.compiler = true }
+                }
+            }
+            pending = []
+            continue
+        }
+        if starts(stripped, "@peer_configurations(") {
+            let open = Bytes("@peer_configurations(").length
+            let raw = Bytes(stripped)
+            let close = raw.length - 1
+            while close > open && raw[close] != 41 { close -= 1 }
+            let values = literals(cut(stripped, open, close))
+            if close <= open || !values.valid { suite.error = "Campaign configurations must be literal" }
+            pending.add(values.values)
+            continue
+        }
+        if starts(stripped, "@") { continue }
+        if starts(stripped, "def ") || starts(stripped, "async def ") {
+            let offset = find(stripped, "def ", 0) + 4
+            let name = wordAt(stripped, offset)
+            if starts(name, "test_") {
+                addMethod(suite, name)
+                for values in pending { suite.contractMethods.add(name); suite.contracts.add(values) }
+                if current != "" && starts(line, "    def ") && !starts(line, "     ") { suite.ownerMethods.add(name); suite.owners.add(current) }
+            }
+            pending = []
+            if !starts(line, " ") && !starts(line, "\t") { current = "" }
+            continue
+        }
+        pending = []
+        if !starts(line, " ") && !starts(line, "\t") { current = "" }
+    }
+    return suite
+}
+function parseMinyar(path: Text, source: Text): Suite {
+    let suite = Suite { path: path; methods: []; contractMethods: []; contracts: []; ownerMethods: []; owners: []; compiler: false; error: "" }
+    let all = test.lines(source)
+    let normal = minyarLineStarts(source)
+    let family = ""
+    let campaigns = 0
+    for number in 0..all.length {
+        if !normal[number] { continue }
+        let line = all[number]
+        if starts(line, "let ") && contains(line, "peer.begin(") { suite.compiler = true }
+        let named = find(line, "peer.suite(\"", 0)
+        if named >= 0 {
+            let begin = named + Bytes("peer.suite(\"").length
+            let end = find(line, "\"", begin)
+            if end > begin { family = cut(line, begin, end) }
+        }
+        if contains(line, "peer.campaign(") { campaigns += 1 }
+    }
+    let declared = 0
+    for number in 0..all.length {
+        if !normal[number] { continue }
+        let line = all[number]
+        if !starts(line, "function test_") { continue }
+        let name = wordAt(line, Bytes("function ").length)
+        addMethod(suite, name)
+        if family != "" { suite.ownerMethods.add(name); suite.owners.add(family) }
+        if number + 1 < all.length && normal[number + 1] && starts(trim(all[number + 1]), "peer.campaign(") {
+            declared += 1
+            let next = trim(all[number + 1])
+            let open = find(next, "[", 0)
+            let close = find(next, "])", open + 1)
+            let values = Literals { values: []; valid: false }
+            if starts(next, "peer.campaign(c, [") && close > open { values = literals(cut(next, open + 1, close)) }
+            if !values.valid { suite.error = "Campaign configurations must be literal" }
+            suite.contractMethods.add(name)
+            suite.contracts.add(values.values)
+        }
+    }
+    if declared != campaigns { suite.error = "Campaign configurations must be declared first in their test" }
+    return suite
+}
+function suiteFor(cache: Cache, path: Text): Suite {
+    for index in 0..cache.paths.length { if cache.paths[index] == path { return cache.suites[index] } }
+    let source = readTextFile(path)
+    let suite = Suite { path: path; methods: []; contractMethods: []; contracts: []; ownerMethods: []; owners: []; compiler: false; error: "" }
+    if ends(path, ".min") { suite = parseMinyar(path, source) } else { suite = parsePython(path, source) }
+    cache.paths.add(path)
+    cache.suites.add(suite)
+    return suite
+}
+
+function buildWiring(): Text {
+    let parts: List<Text> = [readTextFile("Makefile")]
+    let names: List<Text> = []
+    for name in files.list("build-support") { if ends(name, ".mk") { names.add(name) } }
+    let pieces: List<Text> = []
+    for name in names.sorted() { pieces.add(readTextFile("build-support/" + name)) }
+    let joined: List<Text> = []
+    for index in 0..pieces.length {
+        if index > 0 { joined.add("\n") }
+        joined.add(pieces[index])
+    }
+    parts.add("\n")
+    parts.add(joinText(joined))
+    return joinText(parts)
+}
+function indented(line: Text): Boolean { return line == "" || starts(line, "\t") || starts(line, " ") }
+function recipe(makefile: Text, target: Text): Recipe {
+    let all = split(makefile, 10)
+    for index in 0..(all.length - 1) {
+        if !starts(all[index], target + ":") { continue }
+        let body: List<Text> = []
+        let next = index + 1
+        while next < all.length - 1 && indented(all[next]) {
+            body.add(all[next])
+            body.add("\n")
+            next += 1
+        }
+        return Recipe { found: true; body: joinText(body) }
+    }
+    return Recipe { found: false; body: "" }
+}
+function ownershipRecipes(makefile: Text): List<Text> {
+    let result: List<Text> = []
+    let all = split(makefile, 10)
+    for index in 0..(all.length - 1) {
+        let line = all[index]
+        if !starts(line, "check-peer-ownership") { continue }
+        let raw = Bytes(line)
+        let position = Bytes("check-peer-ownership").length
+        if position < raw.length && raw[position] == 45 {
+            let end = position + 1
+            while end < raw.length && (isWord(raw[end]) || raw[end] == 45) { end += 1 }
+            if end == position + 1 { continue }
+            position = end
+        }
+        if position >= raw.length || raw[position] != 58 { continue }
+        let body: List<Text> = []
+        let next = index + 1
+        while next < all.length - 1 && indented(all[next]) {
+            body.add(all[next])
+            body.add("\n")
+            next += 1
+        }
+        result.add(joinText(body))
+    }
+    return result
+}
+function removeRecipes(makefile: Text, target: Text): Text {
+    let all = split(makefile, 10)
+    let kept: List<Text> = []
+    let index = 0
+    while index < all.length {
+        if index < all.length - 1 && starts(all[index], target + ":") {
+            index += 1
+            while index < all.length - 1 && indented(all[index]) { index += 1 }
+            continue
+        }
+        kept.add(all[index])
+        index += 1
+    }
+    let parts: List<Text> = []
+    for position in 0..kept.length {
+        if position > 0 { parts.add("\n") }
+        parts.add(kept[position])
+    }
+    return joinText(parts)
+}
+function assignment(makefile: Text, name: Text): List<Text> {
+    for line in split(makefile, 10) {
+        if !starts(line, name) { continue }
+        let rest = trim(cut(line, Bytes(name).length, Bytes(line).length))
+        if starts(rest, "=") { return test.words(cut(rest, 1, Bytes(rest).length)) }
+    }
+    return []
+}
+function selections(source: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(source)
+    let index = 0
+    while index + 4 <= raw.length {
+        let begins = raw[index] == 80 && raw[index + 1] == 101 && raw[index + 2] == 101 && raw[index + 3] == 114
+        if !begins || (index > 0 && isWord(raw[index - 1])) { index += 1; continue }
+        let end = index + 4
+        while end < raw.length && isWord(raw[end]) { end += 1 }
+        let prefix = Bytes(".test_")
+        let matches = end > index + 4 && end + prefix.length < raw.length
+        if matches { for offset in 0..prefix.length { if raw[end + offset] != prefix[offset] { matches = false } } }
+        if matches && isWord(raw[end + prefix.length]) {
+            let finish = end + prefix.length
+            while finish < raw.length && isWord(raw[finish]) { finish += 1 }
+            result.add(Text(raw.slice(index, finish)))
+            index = finish
+            continue
+        }
+        index = end
+    }
+    return result
+}
+
+function independentSuites(): List<Text> {
+    return ["tests/peer-research-semantics.py", "tests/peer-research-reachability.py", "tests/peer-research-semantics.min", "tests/peer-research-reachability.min", "tests/peer-memory-nim-koka-lean.min", "tests/peer-memory-nim-koka-followups.min"]
+}
+function manualResearch(): List<Text> {
+    return ["tests/peer-research-swift-statements.py", "tests/peer-breadth-semantics.py", "tests/peer-research-swift-statements.min", "tests/peer-breadth-semantics.min"]
+}
+function dedicatedGates(): List<Text> { return ["check-peer-live", "check-peer-live-redis"] }
+function dedicatedSource(gate: Text): Text {
+    if gate == "check-peer-live" { return "tests/peer-live-test.min" }
+    return "tests/peer-live-redis-test.min"
+}
+function dedicated(): List<Text> {
+    let result: List<Text> = []
+    for gate in dedicatedGates() { result.add(dedicatedSource(gate)) }
+    return result
+}
+function exists(path: Text): Boolean { return files.pathSize(path) >= 0 }
+function dedicatedFailure(source: Text, makefile: Text, target: Text): Text {
+    if !exists(source) { return "Dedicated peer suite source is missing: " + source }
+    let tool = "build/tooling/" + cut(source, 0, Bytes(source).length - 4)
+    for gate in [target, target + "-sanitize"] {
+        let found = recipe(makefile, gate)
+        if !found.found || !contains(found.body, tool) { return "Dedicated peer suite lost its build gate: " + gate }
+        if ends(gate, "-sanitize") && !contains(found.body, "MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined") {
+            return "Dedicated peer suite lost sanitizer instrumentation: " + gate
+        }
+    }
+    return ""
+}
+function allowedGates(): List<Text> { return ["check-peer-regressions", "check-peer-optimizations", "check-peer-sanitize", "check-peer-ownership"] }
+function allowedVariants(): List<Text> { return ["frontend", "harness", "O0", "O1", "O2", "O3", "Os", "O2-LTO"] }
+
+function validate(cache: Cache, data: json.Value, wiring: Text): Text {
+    let version = json.member(data, "schema_version")
+    let cases = json.member(data, "cases")
+    if version.kind != json.NUMBER || version.number != 1.0 || cases.kind != json.ARRAY || cases.items.length == 0 {
+        return "Missing schema or empty case selection"
+    }
+    let seenSources: List<Text> = []
+    let seenIds: List<Text> = []
+    let suites: List<Suite> = []
+    let ownership: List<Text> = []
+    for row in cases.items {
+        let source = json.member(row, "source")
+        let id = json.member(row, "id")
+        if source.kind != json.STRING || id.kind != json.STRING { return "Case lacks source or id" }
+        for index in 0..seenSources.length {
+            if seenSources[index] == source.text && seenIds[index] == id.text { return "Duplicate case identity" }
+        }
+        seenSources.add(source.text)
+        seenIds.add(id.text)
+        if starts(source.text, "/") || contains(source.text, "..") || !exists(source.text) {
+            return "Case source is missing or outside the repository"
+        }
+        let suite = suiteFor(cache, source.text)
+        if suite.error != "" { return suite.error }
+        let known = false
+        for item in suites { if item.path == suite.path { known = true } }
+        if !known { suites.add(suite) }
+        if !hasText(suite.methods, id.text) { return "Unknown test method" }
+        if !present(json.member(row, "origins")) || !present(json.member(row, "feature")) || !present(json.member(row, "phases")) {
+            return "Case lacks provenance, feature or phase"
+        }
+        let gates = json.member(row, "gates")
+        if gates.kind != json.OBJECT || gates.keys.length == 0 { return "Unknown or missing required gate" }
+        for key in gates.keys { if !hasText(allowedGates(), key) { return "Unknown or missing required gate" } }
+        for value in gates.items {
+            let variants = texts(value)
+            let duplicate = false
+            for index in 0..variants.length { for other in 0..index { if variants[index] == variants[other] { duplicate = true } } }
+            let unsupported = false
+            for variant in variants { if !hasText(allowedVariants(), variant) { unsupported = true } }
+            if value.kind != json.ARRAY || variants.length == 0 || duplicate || unsupported {
+                return "Empty, duplicate or unsupported configurations"
+            }
+        }
+        let expectedGates: List<Text> = []
+        let expectedVariants: List<List<Text>> = []
+        let contract = -1
+        for index in 0..suite.contractMethods.length { if suite.contractMethods[index] == id.text { contract = index } }
+        let phases = texts(json.member(row, "phases"))
+        let frontend = true
+        for phase in phases { if phase != "compile" && phase != "compile-reject" { frontend = false } }
+        if contract >= 0 {
+            expectedGates = ["check-peer-regressions", "check-peer-optimizations"]
+            expectedVariants = [suite.contracts[contract], suite.contracts[contract]]
+        } else {
+            if starts(id.text, "test_lto_") {
+                expectedGates = ["check-peer-optimizations"]
+                expectedVariants = [["O2-LTO"]]
+            } else {
+                if frontend {
+                    expectedGates = ["check-peer-regressions", "check-peer-optimizations"]
+                    expectedVariants = [["frontend"], ["frontend"]]
+                } else {
+                    expectedGates = ["check-peer-regressions", "check-peer-optimizations"]
+                    expectedVariants = [["O0", "O2"], ["O0", "O2", "O3", "Os"]]
+                }
+            }
+        }
+        for gate in ["check-peer-sanitize", "check-peer-ownership"] {
+            if !hasText(gates.keys, gate) { continue }
+            if !hasText(expectedGates, "check-peer-regressions") { return "LTO pilot cannot claim a sanitizer configuration" }
+            expectedGates.add(gate)
+            expectedVariants.add(expectedVariants[0])
+        }
+        let matches = sameSet(gates.keys, expectedGates) && gates.keys.length == expectedGates.length
+        if matches {
+            for index in 0..expectedGates.length {
+                if !sameTexts(texts(json.member(gates, expectedGates[index])), expectedVariants[index]) { matches = false }
+            }
+        }
+        if !matches {
+            let expected: List<Text> = []
+            for index in 0..expectedGates.length { expected.add(expectedGates[index] + ": " + joinWords(expectedVariants[index])) }
+            return "Required configurations mismatch for (" + source.text + ", " + id.text + "): expected " + joinWords(expected) + ", got " + json.pretty(gates, "")
+        }
+        if hasText(gates.keys, "check-peer-ownership") {
+            let owners: List<Text> = []
+            for index in 0..suite.ownerMethods.length {
+                if suite.ownerMethods[index] == id.text && !hasText(owners, suite.owners[index]) { owners.add(suite.owners[index]) }
+            }
+            if owners.length != 1 { return "Ownership method must belong to one test class" }
+            ownership.add(owners[0] + "." + id.text)
+        }
+    }
+    for suite in suites {
+        let declared: List<Text> = []
+        for index in 0..seenSources.length { if seenSources[index] == suite.path { declared.add(seenIds[index]) } }
+        if !sameSet(declared, suite.methods) { return "Executable test omitted from catalogue" }
+    }
+    for gate in dedicatedGates() {
+        let failure = dedicatedFailure(dedicatedSource(gate), wiring, gate)
+        if failure != "" { return failure }
+    }
+    let semanticNames = assignment(wiring, "PEER_SEMANTIC_SUITES")
+    let semanticTools = assignment(wiring, "PEER_SEMANTIC_TOOLS")
+    let semantics = recipe(wiring, "check-peer-semantics")
+    let discovered: List<Text> = []
+    for name in files.list("tests") {
+        if !starts(name, "peer-") || !(ends(name, ".py") || ends(name, ".min")) { continue }
+        let path = "tests/" + name
+        if hasText(independentSuites(), path) {
+            if ends(path, ".py") && !suiteFor(cache, path).compiler { continue }
+            let wired = semantics.found && contains(semantics.body, "$(PEER_SEMANTIC_SUITES)") && hasText(semanticNames, stem(path))
+            if ends(path, ".min") {
+                wired = semantics.found && contains(semantics.body, "$(PEER_SEMANTIC_TOOLS)") && hasText(semanticTools, "build/tooling/tests/" + stem(path))
+            }
+            if !wired { return "Independent peer suite lost its build gate: " + path }
+            continue
+        }
+        if hasText(manualResearch(), path) || hasText(dedicated(), path) || !suiteFor(cache, path).compiler { continue }
+        discovered.add(path)
+    }
+    let catalogued: List<Text> = []
+    for suite in suites { catalogued.add(suite.path) }
+    if !sameSet(catalogued, discovered) { return "Peer regression suite omitted from catalogue or unknown suite declared" }
+    let selected: List<Text> = []
+    for body in ownershipRecipes(wiring) { for name in selections(body) { selected.add(name) } }
+    for index in 0..selected.length { for other in 0..index { if selected[index] == selected[other] { return "Ownership Make selection differs from declared methods" } } }
+    if !sameSet(selected, ownership) { return "Ownership Make selection differs from declared methods" }
+    let sources: List<Text> = []
+    let oracles: List<Text> = []
+    for name in files.list("tests/codegen") {
+        if ends(name, ".min") { sources.add(cut(name, 0, Bytes(name).length - 4)) }
+        if ends(name, ".stdout") { oracles.add(cut(name, 0, Bytes(name).length - 7)) }
+    }
+    if sources.length == 0 || !sameSet(sources, oracles) { return "Missing or orphan codegen oracle" }
+    return ""
+}
+function joinWords(values: List<Text>): Text {
+    let parts: List<Text> = ["["]
+    for index in 0..values.length {
+        if index > 0 { parts.add(", ") }
+        parts.add(values[index])
+    }
+    parts.add("]")
+    return joinText(parts)
+}
+
+let manifest = readTextFile("tests/peer-cases.json")
+let cache = Cache { paths: []; suites: [] }
+let wiring = buildWiring()
+let data = json.parse(manifest)
+test.check(data.kind == json.OBJECT, "tests/peer-cases.json is not a JSON object")
+let failure = validate(cache, data, wiring)
+test.check(failure == "", failure)
+let rows = json.member(data, "cases").items
+let mutations: List<json.Value> = []
+mutations.add(replaced(data, "cases", array([])))
+let duplicate: List<json.Value> = []
+for row in rows { duplicate.add(row) }
+duplicate.add(rows[0])
+mutations.add(replaced(data, "cases", array(duplicate)))
+let missing: List<json.Value> = []
+for index in 0..(rows.length - 1) { missing.add(rows[index]) }
+mutations.add(replaced(data, "cases", array(missing)))
+mutations.add(withGate(data, 0, "check-peer-regressions", ["O0"]))
+mutations.add(withCase(data, 0, replaced(rows[0], "id", json.Value { kind: json.STRING; text: "test_does_not_exist"; number: 0.0; truth: false; items: []; keys: [] })))
+let omittedSource = json.member(rows[0], "source").text
+let remaining: List<json.Value> = []
+for row in rows { if json.member(row, "source").text != omittedSource { remaining.add(row) } }
+mutations.add(replaced(data, "cases", array(remaining)))
+let campaign = -1
+for index in 0..rows.length { if campaign < 0 && json.member(rows[index], "id").text == "test_reviewed_allocator_workloads" { campaign = index } }
+test.check(campaign >= 0, "campaign control case test_reviewed_allocator_workloads is missing")
+mutations.add(withGate(data, campaign, "check-peer-regressions", ["O0", "O2"]))
+let owned = -1
+for index in 0..rows.length { if owned < 0 && hasText(json.member(rows[index], "gates").keys, "check-peer-ownership") { owned = index } }
+test.check(owned >= 0, "no case declares check-peer-ownership")
+mutations.add(withCase(data, owned, replaced(rows[owned], "gates", removed(json.member(rows[owned], "gates"), "check-peer-ownership"))))
+for mutant in mutations {
+    test.check(validate(cache, mutant, wiring) != "", "Manifest gate accepted an invalid catalogue")
+}
+let controls = 0
+for gate in ["check-peer-live", "check-peer-live-sanitize", "check-peer-live-redis", "check-peer-live-redis-sanitize"] {
+    test.check(validate(cache, data, removeRecipes(wiring, gate)) != "", "Dedicated peer suite accepted a missing build gate: " + gate)
+    controls += 1
+}
+test.check(validate(cache, data, test.replace(wiring, "MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined", "")) != "", "Dedicated peer suite accepted missing sanitizer instrumentation")
+controls += 1
+let sourceNames: List<Text> = []
+for row in rows { let source = json.member(row, "source").text; if !hasText(sourceNames, source) { sourceNames.add(source) } }
+print(Text(controls) + " invalid dedicated peer build gates rejected")
+print(Text(rows.length) + " peer case declarations across " + Text(sourceNames.length) + " suites and codegen oracles valid; " + Text(mutations.length) + " invalid catalogues rejected")

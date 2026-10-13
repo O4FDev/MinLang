@@ -1,0 +1,2191 @@
+use "./peer-support.min" as peer
+use "system" as system
+use "files" as files
+use "json" as json
+use "./cpython-random.min" as random
+
+function test_index_assignment_ignores_brackets_inside_literals(c: peer.Case) {
+    let kinds = ["Text", "Character"]
+    let quotes = ["\"", "'"]
+    let receivers = ["values", "values", "holder.values", "holder.values"]
+    let brackets = ["[", "]", "[", "]"]
+    for kind in 0..2 {
+        let source = "record Holder { values: List<Integer> }\nfunction position(value: " + kinds[kind] + ", calls: List<Integer>): Integer {\nprint(value)\ncalls[0] = calls[0] + 1\nreturn 0\n}\nlet calls = [0]\nlet values = [0]\nlet holder = Holder { values: values }\n"
+        for index in 0..4 {
+            source += receivers[index] + "[position(" + quotes[kind] + brackets[index] + quotes[kind] + ", calls)] = " + Text(index + 1) + "\n"
+            source += "print(values[0])\n"
+        }
+        source += "print(calls[0])\nprint(holder.values[0])\n"
+        peer.executes(c, source, "[\n1\n]\n2\n[\n3\n]\n4\n4\n4\n")
+    }
+}
+function test_final_statement_without_newline_and_incomplete_input(c: peer.Case) {
+    for ending in ["", ";", " // comment at EOF", " /* comment at EOF */", "\n ", "\n//" + peer.repeat("x", 10000), "\n//" + peer.repeat("x", 10002)] {
+        peer.executes(c, "print(42)" + ending, "42\n")
+    }
+    peer.executes(c, "let value = 42\r\nprint(value)", "42\n")
+    peer.rejects(c, "let a = 42\rlet b = -13\rprint(a)\rprint(b)", "unexpected 'let'; start the next statement on a new line")
+    peer.executes(c, "let value = 1 // comment ending in \\\nvalue = 2\nprint(value)\n", "2\n")
+    for incomplete in ["print(42", "let value =", "if true { print(42)", "function f(): Integer { return 42"] {
+        peer.rejects(c, incomplete, "Minyar stopped:")
+    }
+}
+function test_wide_argument_positions_survive_register_stack_boundary(c: peer.Case) {
+    let parameters: List<Text> = []
+    let terms: List<Text> = []
+    let arguments: List<Text> = []
+    let total = 0
+    for index in 0..41 {
+        parameters.add("value" + Text(index) + ": Integer")
+        terms.add("value" + Text(index) + " * " + Text(index + 1))
+        if index == 39 { arguments.add("input") } else { arguments.add(Text(index)) }
+        total += index * (index + 1)
+    }
+    peer.executes(c, "function wide(" + peer.joined(parameters, ", ") + "): Integer { return " + peer.joined(terms, " + ") + " }\nfunction caller(input: Integer): Integer {\nlet result = wide(" + peer.joined(arguments, ", ") + ")\nprint(input)\nreturn result\n}\nprint(caller(39))\n", "39\n" + Text(total) + "\n")
+}
+function operandValue(item: json.Value, name: Text): Integer { return peer.field(item, name) }
+function test_associative_products_preserve_checked_intermediates(c: peer.Case) {
+    let fixture = c.suite.root + "/tests/peer-associative-vectors.json"
+    peer.input(c, fixture)
+    let data = peer.load(fixture)
+    peer.equalInteger(c, peer.field(data, "schema_version"), 1, "associative schema")
+    let cases = json.member(data, "cases").items
+    peer.equalInteger(c, cases.length, 96, "associative case count")
+    let source: List<Text> = []
+    let expected: List<Text> = []
+    let failureChoices: List<Text> = []
+    let failureExpressions: List<Text> = []
+    for index in 0..cases.length {
+        let item = cases[index]
+        let expression = peer.textField(item, "expression")
+        let raw = Bytes(expression)
+        let shaped = raw.length == 7
+        if shaped {
+            for position in [0, 2, 4, 6] { if raw[position] < 97 || raw[position] > 99 { shaped = false } }
+            if raw[1] != 42 || raw[5] != 42 || (raw[3] != 43 && raw[3] != 45) { shaped = false }
+        }
+        peer.expect(c, shaped, "unexpected associative expression " + expression)
+        let left = peer.product(operandValue(item, Text(raw.slice(0, 1))), operandValue(item, Text(raw.slice(2, 3))))
+        let right = peer.product(operandValue(item, Text(raw.slice(4, 5))), operandValue(item, Text(raw.slice(6, 7))))
+        let result = peer.bigAdd(left, right)
+        if raw[3] == 45 { result = peer.bigSubtract(left, right) }
+        let overflow = ""
+        if !peer.bigFits(left) { overflow = "left product" }
+        else if !peer.bigFits(right) { overflow = "right product" }
+        else if !peer.bigFits(result) { overflow = "final result" }
+        peer.equal(c, peer.bigText(result), json.member(item, "result").text, "associative result " + Text(index))
+        let stage = json.member(item, "overflow_stage")
+        if overflow == "" { peer.expect(c, stage.kind == json.NULL, "associative stage " + Text(index)) }
+        else { peer.expect(c, stage.kind == json.STRING && stage.text == overflow, "associative stage " + Text(index)) }
+        source.add("function calculate" + Text(index) + "(a: Integer, b: Integer, c: Integer): Integer { return " + expression + " }")
+        let constant: List<Text> = []
+        for character in expression {
+            if character == 'a' || character == 'b' || character == 'c' { constant.add("(" + json.member(item, Text(character)).text + ")") }
+            else { constant.add(Text(character)) }
+        }
+        let call = "calculate" + Text(index) + "(" + json.member(item, "a").text + ", " + json.member(item, "b").text + ", " + json.member(item, "c").text + ")"
+        if overflow != "" {
+            failureChoices.add(Text(index) + "-literal"); failureExpressions.add(joinText(constant))
+            failureChoices.add(Text(index) + "-parameter"); failureExpressions.add(call)
+        } else {
+            source.add("print(" + joinText(constant) + ")")
+            source.add("print(" + call + ")")
+            expected.add(peer.bigText(result)); expected.add(peer.bigText(result))
+        }
+    }
+    peer.equalInteger(c, failureChoices.length, 80, "associative failure count")
+    source.add("let choice = argument(0)")
+    for index in 0..failureChoices.length {
+        source.add("if choice == \"" + failureChoices[index] + "\" { print(\"before\"); print(" + failureExpressions[index] + ") }")
+    }
+    source.add("print(\"ready\")")
+    let prefix = peer.joined(expected, "\n") + "\n"
+    let base = peer.executesWith(c, peer.lines(source), prefix + "ready\n", 0, "", ["probe"])
+    for optimization in c.variants {
+        for choice in failureChoices {
+            peer.observe(c, peer.run(c, [peer.executable(base, optimization), choice], "execute-associative-overflow", 10), 1, prefix + "before\n", peer.OVERFLOW, choice + " at " + optimization)
+        }
+    }
+}
+function test_intermediate_overflow_cannot_be_reassociated_away(c: peer.Case) {
+    let expressions = ["(x + 13) - 7", "(x - 13) + 7"]
+    let values = ["9223372036854775797", "-9223372036854775798"]
+    for index in 0..2 {
+        peer.executesStatus(c, "function calculate(x: Integer): Integer { return " + expressions[index] + " }\nprint(\"before\")\nprint(calculate(" + values[index] + "))\n", "before\n", 1, peer.OVERFLOW)
+    }
+    peer.executes(c, "function calculate(x: Integer): Integer { return (x + 13) - 7 }
+print(calculate(9223372036854775794))
+", "9223372036854775800\n")
+}
+function test_unused_dynamic_arithmetic_must_still_trap(c: peer.Case) {
+    let expressions = ["x + 1", "x - 1", "x * 2", "-x", "7 / x", "7 % x"]
+    let values = ["9223372036854775807", "-9223372036854775808", "4611686018427387904", "-9223372036854775808", "0", "0"]
+    let errors = [peer.OVERFLOW, peer.OVERFLOW, peer.OVERFLOW, peer.OVERFLOW, peer.ZERO, peer.ZERO]
+    for index in 0..6 {
+        peer.executesStatus(c, "function calculate(x: Integer) {\nlet unused = " + expressions[index] + "\nprint(\"incorrectly survived\")\n}\ncalculate(" + values[index] + ")\n", "", 1, errors[index])
+    }
+}
+function test_unreachable_traps_and_safe_neighbors(c: peer.Case) {
+    peer.executes(c, "function calculate(x: Integer, execute: Boolean): Integer {
+if execute { return x + 1 } else { return 42 }
+}
+print(calculate(9223372036854775807, false))
+print(calculate(9223372036854775806, true))
+function division(x: Integer, execute: Boolean): Integer {
+if execute { return 7 / x } else { return 9 }
+}
+print(division(0, false))
+print(division(1, true))
+", "42\n9223372036854775807\n9\n7\n")
+}
+function test_huge_indices_fail_before_scaled_address_or_reference_update(c: peer.Case) {
+    for index in ["-9223372036854775808", "-1", "2305843009213693952", "4611686018427387904", "9223372036854775807"] {
+        for operation in ["print(values[index])", "values[index] = \"replacement\""] {
+            peer.executesStatus(c, "function access(values: List<Text>, index: Integer) {\n" + operation + "\n}\nlet values = [\"retained\"]\naccess(values, " + index + ")\n", "", 1, "Minyar stopped: List position " + index + " is outside its length of 1.\n")
+        }
+    }
+}
+function test_module_alias_reload_after_calls_and_loops(c: peer.Case) {
+    peer.writeFile(c, "mutation.min", "public function mutate(write: List<Integer>, read: List<Integer>): Integer {
+let index = 0
+while index < 7 {
+write[0] = write[0] + 1
+index = index + 1
+}
+return read[0]
+}
+")
+    peer.executes(c, "use \"./mutation.min\" as mutation
+let values = [10]
+let other = [20]
+print(mutation.mutate(values, values))
+print(mutation.mutate(values, other))
+print(values[0])
+print(other[0])
+", "17\n20\n24\n20\n")
+}
+function test_terminal_operand_stops_later_effects(c: peer.Case) {
+    peer.executesStatus(c, "function left(): Integer { print(\"left\"); fail(\"stopped\") }
+function right(): Integer { print(\"right\"); return 2 }
+print(left() + right())
+", "left\n", 1, "Minyar stopped: stopped\n")
+}
+function test_dead_boolean_operands_still_require_valid_names(c: peer.Case) {
+    for expression in ["false && missing", "true || missing"] { peer.rejects(c, "print(" + expression + ")\n", "missing") }
+}
+function test_integer_equality_keeps_all_64_bits(c: peer.Case) {
+    peer.executes(c, "function same(left: Integer, right: Integer): Boolean { return left == right }
+print(same(2305843009213693697, 2305843009213693698))
+print(same(-2305843009213693697, -2305843009213693698))
+print(same(2305843009213693697, 2305843009213693697))
+", "false\nfalse\ntrue\n")
+}
+function test_unused_bounds_check_and_reversed_slice_still_fail(c: peer.Case) {
+    peer.executesStatus(c, "function discard(value: Text) {}
+function get(values: List<Text>, index: Integer): Text { return values[index] }
+discard(get([\"safe\"], 1))
+", "", 1, "Minyar stopped: List position 1 is outside its length of 1.\n")
+    peer.executesStatus(c, "function slice(text: Text, start: Integer, end: Integer): Text { return text.slice(start, end) }
+print(slice(\"abcd\", 3, 1))
+", "", 1, "Minyar stopped: a Text slice must stay within the Text and end after it starts.\n")
+}
+function test_selected_record_survives_reassignment_of_both_sources(c: peer.Case) {
+    peer.executes(c, "record Box { text: Text }
+function choose(left: Box, right: Box, first: Boolean): Box {
+if first { return left } else { return right }
+}
+let left = Box { text: \"left\" + \"!\" }
+let right = Box { text: \"right\" + \"!\" }
+let chosen = choose(left, right, false)
+left = Box { text: \"replacement left\" }
+right = Box { text: \"replacement right\" }
+print(chosen.text)
+", "right!\n")
+}
+function test_trailing_boolean_constant_preserves_prior_effects(c: peer.Case) {
+    peer.executes(c, "function mark(value: Boolean, events: List<Integer>): Boolean {
+events.add(events.length)
+return value
+}
+let andEvents: List<Integer> = []
+print(mark(true, andEvents) && mark(true, andEvents) && false && mark(true, andEvents))
+print(andEvents.length)
+let orEvents: List<Integer> = []
+print(mark(false, orEvents) || mark(false, orEvents) || true || mark(false, orEvents))
+print(orEvents.length)
+", "false\n2\ntrue\n2\n")
+}
+function test_division_record_result_and_multiply_boundary(c: peer.Case) {
+    peer.executes(c, "record Division { quotient: Integer; remainder: Integer }
+function divide(left: Integer, right: Integer): Division {
+return Division { quotient: left / right; remainder: left % right }
+}
+let result = divide(1152921504606846976, 34359738365)
+print(result.quotient)
+print(result.remainder)
+function multiply(left: Integer, right: Integer): Integer { return left * right }
+print(multiply(3, -3074457345618258602))
+", "33554432\n100663296\n-9223372036854775806\n")
+    peer.executesStatus(c, "function multiply(left: Integer, right: Integer): Integer { return left * right }
+print(multiply(3, -3074457345618258603))
+", "", 1, peer.OVERFLOW)
+}
+function test_scalar_record_fields_feed_required_division_check(c: peer.Case) {
+    peer.executesStatus(c, "record Number { value: Integer }
+record Outer { inner: Number }
+let value = Outer { inner: Number { value: 42 } }
+print(7 / (value.inner.value - 42))
+", "", 1, peer.ZERO)
+}
+function test_malformed_radix_like_literals_do_not_accept_valid_prefix(c: peer.Case) {
+    for value in ["0x", "0X", "0xG", "0b2", "00b0", "0b", "0o8", "00o0", "0o", "123name"] { peer.rejects(c, "print(" + value + ")\n", "Minyar stopped:") }
+    for value in 70..78 { peer.rejects(c, "print(0" + Text(value) + ")\n", "decimal Integer literals cannot have a leading zero") }
+    let source: List<Text> = []
+    let expected: List<Text> = []
+    for value in 70..78 { source.add("print(0o" + peer.octal(value) + ")"); expected.add(Text(value) + "\n") }
+    peer.executes(c, peer.joined(source, "\n"), joinText(expected))
+}
+function test_invalid_source_bytes_are_not_hidden_by_comments_or_eof(c: peer.Case) {
+    let invalid = [peer.bytes([239]), peer.bytes([239, 187]), peer.bytes([128]), peer.bytes([192, 175]), peer.bytes([237, 160, 128]), peer.bytes([244, 144, 128, 128])]
+    let prefixes = [Bytes(""), Bytes("// "), Bytes("/* ")]
+    let suffixes = [Bytes(""), Bytes("\nprint(42)\n"), Bytes(" */\nprint(42)\n")]
+    let programs: List<Bytes> = []
+    for value in invalid {
+        for index in 0..3 { programs.add(peer.concat(peer.concat(prefixes[index], value), suffixes[index])) }
+    }
+    programs.add(peer.concat(peer.concat(Bytes("print(42)"), peer.bytes([0])), Bytes("print(99)\n")))
+    programs.add(peer.concat(peer.concat(Bytes("print(42)"), peer.bytes([26])), Bytes("print(99)\n")))
+    for index in 0..programs.length {
+        let source = peer.writeBytes(c, "bytes" + Text(index) + ".min", programs[index])
+        let llvm = peer.path(c, "bytes" + Text(index) + ".ll")
+        let result = peer.run(c, [c.compiler.executable, source, llvm], "compile-reject", 10)
+        peer.expect(c, result.status == 1, "invalid source bytes status " + Text(result.status) + "\n" + result.errorOutput)
+        peer.expect(c, peer.contains(result.errorOutput, "Minyar stopped:"), "invalid source bytes diagnostic")
+        peer.expect(c, result.output == "", "invalid source bytes wrote standard output")
+        peer.expect(c, files.pathSize(llvm) < 0, "invalid source bytes emitted LLVM")
+    }
+}
+function test_algebraic_simplification_preserves_inner_overflow(c: peer.Case) {
+    let expressions = ["0 * (x + 1)", "(x + 1) * 0", "x * 2 * 0", "(x * 2) * 0", "(x + 1) - x", "(x * 100) / 10"]
+    let values = ["9223372036854775807", "9223372036854775807", "9223372036854775807", "9223372036854775807", "9223372036854775807", "92233720368547759"]
+    for index in 0..6 {
+        peer.executesStatus(c, "function calculate(x: Integer): Integer { return " + expressions[index] + " }\nprint(\"before\")\nprint(calculate(" + values[index] + "))\n", "before\n", 1, peer.OVERFLOW)
+    }
+    for expression in ["9223372036854775807 * 2 * 0", "(9223372036854775807 * 2) * 0"] { peer.executesStatus(c, "print(" + expression + ")\n", "", 1, peer.OVERFLOW) }
+    peer.executes(c, "function safe(x: Integer): Integer { return x * (2 * 0) }\nprint(safe(9223372036854775807))\nprint(9223372036854775807 * (2 * 0))\n", "0\n0\n")
+    peer.executesStatus(c, "function greater(x: Integer): Boolean { return x + 1 > x }\nprint(greater(9223372036854775807))\n", "", 1, peer.OVERFLOW)
+    peer.executes(c, "function greater(x: Integer): Boolean { return x + 1 > x }\nprint(greater(9223372036854775806))\n", "true\n")
+    peer.executesStatus(c, "function count(start: Integer): Integer {
+let index = start
+let count = 0
+while index <= start + 4 { count = count + 1; index = index + 2 }
+return count
+}
+print(count(9223372036854775804))
+", "", 1, peer.OVERFLOW)
+}
+record Pair { left: Integer; right: Integer }
+function pairBefore(a: Pair, b: Pair): Boolean { return a.left < b.left || (a.left == b.left && a.right < b.right) }
+function addPair(pairs: List<Pair>, left: Integer, right: Integer) {
+    for pair in pairs { if pair.left == left && pair.right == right { return } }
+    pairs.add(Pair { left: left; right: right })
+}
+function sortedPairs(pairs: List<Pair>): List<Pair> {
+    let result: List<Pair> = []
+    for pair in pairs {
+        result.add(pair)
+        let index = result.length - 1
+        while index > 0 && pairBefore(result[index], result[index - 1]) {
+            let previous = result[index - 1]
+            result[index - 1] = result[index]
+            result[index] = previous
+            index -= 1
+        }
+    }
+    return result
+}
+function test_signed_division_remainder_and_operand_placement_grid(c: peer.Case) {
+    let pairs: List<Pair> = []
+    for a in -6..7 { for b in -6..7 { if b != 0 { addPair(pairs, a, b) } } }
+    let boundaries = [peer.MINIMUM, -9223372036854775807, -2, -1, 0, 1, 2, 9223372036854775806, peer.MAXIMUM]
+    let lua = [-16, -15, -3, -2, -1, 0, 1, 2, 3, 15]
+    for a in lua { for b in lua { if b != 0 { addPair(pairs, a, b) } } }
+    for a in boundaries { for b in boundaries { if b != 0 && !(a == peer.MINIMUM && b == -1) { addPair(pairs, a, b) } } }
+    let source = ["function divide(a: Integer, b: Integer): Integer { return a / b }", "function remainder(a: Integer, b: Integer): Integer { return a % b }"]
+    let expected: List<Text> = []
+    let ordered = sortedPairs(pairs)
+    for index in 0..ordered.length {
+        let a = ordered[index].left
+        let b = ordered[index].right
+        let result = peer.division(a, b)
+        let name = Text(index)
+        source.add("let a" + name + " = " + Text(a))
+        source.add("let b" + name + " = " + Text(b))
+        let lefts = [Text(a), "a" + name, Text(a), "a" + name]
+        let rights = [Text(b), Text(b), "b" + name, "b" + name]
+        for placement in 0..4 {
+            source.add("print(" + lefts[placement] + " / " + rights[placement] + ")")
+            source.add("print(" + lefts[placement] + " % " + rights[placement] + ")")
+            expected.add(Text(result.quotient)); expected.add(Text(result.remainder))
+        }
+        source.add("print(divide(a" + name + ", b" + name + "))")
+        source.add("print(remainder(a" + name + ", b" + name + "))")
+        expected.add(Text(result.quotient)); expected.add(Text(result.remainder))
+    }
+    peer.executes(c, peer.lines(source), peer.lines(expected))
+}
+function test_negation_literal_and_parameter_paths(c: peer.Case) {
+    peer.executes(c, "print(-2 == 0 - 2)\n", "true\n")
+    peer.executes(c, "function negate(value: Integer): Integer { return -value }\nprint(negate(2305843009213693697))\nprint(-(2305843009213693697))\nprint(negate(2305843009213693697) != -2305843009213693696)\n", "-2305843009213693697\n-2305843009213693697\ntrue\n")
+    for operator in ["/", "%"] {
+        for expression in ["-9223372036854775808 " + operator + " -1", "calculate(-9223372036854775808, -1)"] {
+            peer.executesStatus(c, "function calculate(a: Integer, b: Integer): Integer { return a " + operator + " b }\nprint(" + expression + ")\n", "", 1, peer.DIVISION)
+        }
+    }
+    peer.executes(c, "function negate(value: Integer): Integer { return -value }\nprint(-0)\nprint(--2)\nprint(negate(0))\nprint(negate(negate(2)))\nprint(negate(-9223372036854775807))\n", "0\n2\n0\n2\n9223372036854775807\n")
+    peer.executesStatus(c, "print(-(-9223372036854775808))\n", "", 1, peer.OVERFLOW)
+    for expression in ["0 * (1 / 0)", "0 * (1 % 0)"] { peer.executesStatus(c, "print(" + expression + ")\n", "", 1, peer.ZERO) }
+}
+function test_thirty_distinct_program_arguments(c: peer.Case) {
+    let arguments = ["", "é🙂", "two words", "--option", "-1", "quote\"slash\\"]
+    for index in 0..24 { arguments.add("argument-" + Text(index)) }
+    peer.executesWith(c, "print(argumentCount())\nlet index = 0\nwhile index < argumentCount() { print(argument(index)); index = index + 1 }\n", "30\n" + peer.lines(arguments), 0, "", arguments)
+}
+function test_large_unicode_nul_file_roundtrip(c: peer.Case) {
+    let value = peer.repeat("abé🙂" + peer.character(0) + "\n", 11000) + "last🙂"
+    let original = peer.writeFile(c, "large-input.txt", value)
+    let output = peer.path(c, "large-output.txt")
+    peer.executesFull(c, "let text = readTextFile(argument(0))\nprint(text.length)\nwriteTextFile(argument(1), text)\nprint(readTextFile(argument(1)) == text)\n", Text(value.length) + "\ntrue\n", 0, "", [original, output], [peer.Output { path: output; contents: Bytes(value) }], c.variants)
+}
+function test_unicode_composition_vectors_indices_slices_and_files(c: peer.Case) {
+    let vectors = [[27721, 23383, 47, 28450, 23383], [0, 97, 98, 99, 1], [0, 127, 128, 2047, 2048, 65535, 65536, 1114111], [26085, 26412, 35486, 97, 45, 52, 0, 233, 243], [0x23CB7, 0x2070E, 0x20C53, 0x2107B, 0x20D7C, 97, 98, 0x20EA2], [0x28CCA, 0x29D98, 0x269FA, 0x28CD2, 0x2512B, 0x244D3, 0x10FFFF], [0xC7, 0x2202, 0xE9, 0x192, 0x67], [0x8987], [0x24B62]]
+    for number in 0..vectors.length {
+        let points = vectors[number]
+        let value = peer.codepoints(points)
+        let original = peer.writeFile(c, "composition" + Text(number) + "-input.txt", value)
+        let output = peer.path(c, "composition" + Text(number) + "-output.txt")
+        let source = ["let text = readTextFile(argument(0))", "print(text.length)", "print(text.byteLength)", "print(text == " + peer.literal(value) + ")", "let parts: List<Text> = []"]
+        let expected = [Text(points.length), Text(Bytes(value).length), "true"]
+        for index in 0..points.length {
+            source.add("print(text[" + Text(index) + "])")
+            source.add("parts.add(Text(text[" + Text(index) + "]))")
+            expected.add(peer.character(points[index]))
+        }
+        for begin in 0..(points.length + 1) {
+            for end in begin..(points.length + 1) {
+                source.add("print(text.slice(" + Text(begin) + ", " + Text(end) + "))")
+                let slice: List<Integer> = []
+                for index in begin..end { slice.add(points[index]) }
+                expected.add(peer.codepoints(slice))
+            }
+        }
+        peer.extend(source, ["let joined = joinText(parts)", "text = \"released\"", "print(joined)", "writeTextFile(argument(1), joined)", "print(readTextFile(argument(1)))"])
+        expected.add(value); expected.add(value)
+        peer.executesFull(c, peer.lines(source), peer.lines(expected), 0, "", [original, output], [peer.Output { path: output; contents: Bytes(value) }], c.variants)
+    }
+}
+function test_text_equality_compares_bytes_after_nul(c: peer.Case) {
+    let nul = peer.character(0)
+    let left = "abc" + nul + "def"
+    let right = "abc" + nul + "xyz"
+    let paths = [peer.writeFile(c, "nul-left.txt", left), peer.writeFile(c, "nul-right.txt", right)]
+    let source = ["function compare(left: Text, right: Text) {", "print(left == right)", "print(left != right)", "}",
+        "compare(" + peer.literal(left) + ", " + peer.literal(right) + ")",
+        "let left = readTextFile(argument(0))", "let right = readTextFile(argument(1))",
+        "compare(left, right)", "compare(right, left)",
+        "compare(left, " + peer.literal(left) + ")",
+        "compare(right, " + peer.literal(right) + ")",
+        "compare(left.slice(3, 7), right.slice(3, 7))",
+        "compare(joinText([left.slice(0, 4), \"def\"]), left)",
+        "compare(joinText([left.slice(0, 4), \"xyz\"]), left)",
+        "compare(\"a\", " + peer.literal("a" + nul) + ")",
+        "compare(" + peer.literal("a" + nul) + ", \"a\")",
+        "compare(left.slice(0, 1), left.slice(0, 1) + " + peer.literal(nul) + ")",
+        "compare(joinText([\"a\", " + peer.literal(nul) + "]), \"a\")"]
+    peer.executesWith(c, peer.lines(source), peer.repeat("false\ntrue\n", 3) + peer.repeat("true\nfalse\n", 2) + "false\ntrue\ntrue\nfalse\nfalse\ntrue\n" + peer.repeat("false\ntrue\n", 4), 0, "", paths)
+}
+function test_identical_mutable_constructor_calls_remain_independent(c: peer.Case) {
+    peer.executes(c, "function make(): List<Integer> { return [0] }
+function makeEmpty(): List<Integer> { return [] }
+let first = make()
+let second = make()
+first[0] = 10
+print(second[0])
+second[0] = 20
+print(first[0])
+let third = make()
+print(third[0])
+third[0] = 30
+let fourth = make()
+print(fourth[0])
+print(first[0])
+print(second[0])
+print(third[0])
+let emptyFirst = makeEmpty()
+let emptySecond = makeEmpty()
+emptyFirst.add(10)
+print(emptySecond.length)
+emptySecond.add(20)
+print(emptyFirst.length)
+print(emptySecond.length)
+print(emptyFirst[0])
+print(emptySecond[0])
+emptyFirst.add(30)
+print(emptySecond.length)
+", "0\n10\n0\n0\n10\n20\n30\n0\n1\n1\n10\n20\n1\n")
+}
+function test_long_record_fields_and_late_diagnostic_line(c: peer.Case) {
+    let prefix = "field" + peer.repeat("x", 300)
+    peer.executes(c, "record Wide { " + prefix + "0: Integer; " + prefix + "1: Integer }\nfunction read(value: Wide): Integer { return value." + prefix + "0 * 100 + value." + prefix + "1 }\nprint(read(Wide { " + prefix + "0: 12; " + prefix + "1: 34 }))\n", "1234\n")
+    peer.rejects(c, peer.repeat("\n", 300) + "print(missingName)\n", "line 301, column 7:")
+}
+function leafExpression(identity: Integer, value: Boolean): Text { return "mark(" + peer.boolean(value) + ", " + Text(identity) + ", trace)" }
+function leafValue(identity: Integer, value: Boolean, trace: List<Integer>): Boolean { trace.add(identity); return value }
+function nestedExpression(operator: Text, negate: Boolean, firstIdentity: Integer, firstValue: Boolean, secondIdentity: Integer, secondValue: Boolean): Text {
+    let body = "(" + leafExpression(firstIdentity, firstValue) + " " + operator + " " + leafExpression(secondIdentity, secondValue) + ")"
+    if negate { return "!" + body }
+    return body
+}
+function nestedValue(operator: Text, negate: Boolean, firstIdentity: Integer, firstValue: Boolean, secondIdentity: Integer, secondValue: Boolean, trace: List<Integer>): Boolean {
+    let first = leafValue(firstIdentity, firstValue, trace)
+    let result = first
+    if operator == "&&" { if first { result = leafValue(secondIdentity, secondValue, trace) } }
+    else { if !first { result = leafValue(secondIdentity, secondValue, trace) } }
+    if negate { return !result }
+    return result
+}
+function test_boolean_tree_values_and_short_circuit_trace(c: peer.Case) {
+    let source = ["function mark(value: Boolean, identity: Integer, trace: List<Integer>): Boolean { trace.add(identity); return value }", "let trace: List<Integer> = []"]
+    let expected: List<Text> = []
+    for bits in 0..8 {
+        let values = [(bits & 1) != 0, (bits & 2) != 0, (bits & 4) != 0]
+        for outer in ["&&", "||"] {
+            for inner in ["&&", "||"] {
+                for negations in 0..4 {
+                    let innerNegate = (negations & 1) != 0
+                    let outerNegate = (negations & 2) != 0
+                    for shape in 0..2 {
+                        let trace: List<Integer> = []
+                        let expression = ""
+                        let result = false
+                        if shape == 0 {
+                            let nested = nestedExpression(inner, innerNegate, 1, values[0], 2, values[1])
+                            expression = "(" + nested + " " + outer + " " + leafExpression(3, values[2]) + ")"
+                            let first = nestedValue(inner, innerNegate, 1, values[0], 2, values[1], trace)
+                            result = first
+                            if outer == "&&" { if first { result = leafValue(3, values[2], trace) } }
+                            else { if !first { result = leafValue(3, values[2], trace) } }
+                        } else {
+                            let nested = nestedExpression(inner, innerNegate, 2, values[1], 3, values[2])
+                            expression = "(" + leafExpression(1, values[0]) + " " + outer + " " + nested + ")"
+                            let first = leafValue(1, values[0], trace)
+                            result = first
+                            if outer == "&&" { if first { result = nestedValue(inner, innerNegate, 2, values[1], 3, values[2], trace) } }
+                            else { if !first { result = nestedValue(inner, innerNegate, 2, values[1], 3, values[2], trace) } }
+                        }
+                        if outerNegate { expression = "!" + expression; result = !result }
+                        source.add("trace = []")
+                        source.add("print(" + expression + ")")
+                        source.add("print(trace.length)")
+                        for index in 0..trace.length { source.add("print(trace[" + Text(index) + "])") }
+                        expected.add(peer.boolean(result))
+                        expected.add(Text(trace.length))
+                        for identity in trace { expected.add(Text(identity)) }
+                    }
+                }
+            }
+        }
+    }
+    peer.executes(c, peer.lines(source), peer.lines(expected))
+    for invalid in ["true * false", "1 && 2"] { peer.rejects(c, "print(" + invalid + ")\n", "Minyar stopped:") }
+}
+function test_character_integer_arithmetic_never_coerces(c: peer.Case) {
+    let parameters = ["Integer", "Character"]
+    let arguments = ["\"x\"[0]", "120"]
+    for index in 0..2 {
+        peer.rejects(c, "function accept(value: " + parameters[index] + ") { print(value) }\naccept(" + arguments[index] + ")\n", "an argument passed to accept has the wrong type")
+    }
+    for operator in ["+", "-", "*", "/"] {
+        peer.rejects(c, "print(\"x\"[0] " + operator + " 1)\n", "Minyar stopped:")
+        peer.rejects(c, "print(1 " + operator + " \"x\"[0])\n", "Minyar stopped:")
+        peer.rejects(c, "function mixed(character: Character, integer: Integer) { print(character " + operator + " integer) }\n", "Minyar stopped:")
+        peer.rejects(c, "function mixed(character: Character, integer: Integer) { print(integer " + operator + " character) }\n", "Minyar stopped:")
+    }
+}
+function test_record_operators_initializers_and_boolean_indexing_reject(c: peer.Case) {
+    let declaration = "record Box { field: Integer }\nlet left = Box { field: 1 }\nlet right = Box { field: 2 }\n"
+    for operator in ["+", "-", "*", "/", "%", "==", "!=", "<", "<=", ">", ">="] {
+        let diagnostic = "needs Integer or Float operands"
+        if operator == "==" || operator == "!=" { diagnostic = "records, Lists, and Bytes do not yet support equality" }
+        else if operator == "<" || operator == "<=" || operator == ">" || operator == ">=" { diagnostic = "ordered comparison needs Integer, Float, or Character operands" }
+        peer.rejects(c, declaration + "print(left " + operator + " right)\n", diagnostic)
+    }
+    peer.rejects(c, "record Box { field: Integer }\nlet value = Box { field: 10; field: 20 }\n", "record field 'field' was provided twice")
+    peer.rejects(c, "let bad = true\nprint(bad[0])\n", "indexing needs Text, a List, or Bytes")
+    peer.rejects(c, "let bad = true\nbad[0] = bad[0]\n", "indexed assignment needs a List")
+}
+function test_file_paths_reject_embedded_nul_without_touching_prefix(c: peer.Case) {
+    let contents = Bytes("original contents\n")
+    let file = peer.writeBytes(c, "existing-prefix.txt", contents)
+    for operation in ["print(readTextFile(path))", "writeTextFile(path, \"overwritten\")"] {
+        let source = "let path = argument(0) + " + peer.literal(peer.character(0) + "suffix") + "\n" + operation + "\n"
+        peer.executesWith(c, source, "", 1, "Minyar stopped: a file path cannot contain a zero byte.\n", [file])
+        peer.expect(c, peer.bytesEqual(readBytesFile(file), contents), "embedded NUL path touched its prefix")
+    }
+}
+function test_malformed_utf8_file_corpus(c: peer.Case) {
+    let corpus = [peer.bytes([0xe3]), peer.concat(Bytes("abc"), peer.concat(peer.bytes([0xe3]), Bytes("def"))), peer.bytes([0xf4, 0x9f, 0xbf]), peer.bytes([0xf4, 0x9f, 0xbf, 0xbf]),
+        peer.concat(Bytes("ab"), peer.bytes([0xff])), peer.bytes([0xf4, 0x90, 0x80, 0x80]), peer.concat(Bytes("in"), peer.concat(peer.bytes([0x80]), Bytes("valid"))), peer.concat(peer.bytes([0xbf]), Bytes("invalid")),
+        peer.concat(Bytes("αλφ"), peer.concat(peer.bytes([0xbf]), Bytes("α"))),
+        peer.bytes([0xed, 0xa0, 0x80]), peer.bytes([0xed, 0xbf, 0xbf]), peer.bytes([0xc0, 0x80]), peer.bytes([0xc1, 0xbf]),
+        peer.bytes([0xe0, 0x9f, 0xbf]), peer.bytes([0xf0, 0x8f, 0xbf, 0xbf]), peer.bytes([0x80]), peer.bytes([0xbf]), peer.bytes([0xfe]), peer.bytes([0xff]),
+        peer.bytes([0xff, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80])]
+    for invalid in [peer.bytes([0x80]), peer.bytes([0xbf])] {
+        corpus.add(peer.concat(Bytes("汉字"), invalid))
+        corpus.add(peer.concat(invalid, Bytes("hello")))
+        corpus.add(peer.concat(Bytes("hel"), peer.concat(invalid, Bytes("lo"))))
+    }
+    let paths: List<Text> = []
+    for index in 0..corpus.length { paths.add(peer.writeBytes(c, "invalid-" + Text(index) + ".txt", corpus[index])) }
+    let error = "Minyar stopped: Text contained invalid UTF-8.\n"
+    let base = peer.executesWith(c, "let text = readTextFile(argument(0))\nprint(text.byteLength)\nprint(text.length)\n", Text(corpus[0].length) + "\n", 1, error, [paths[0]])
+    for optimization in c.variants {
+        for index in 1..corpus.length {
+            peer.observe(c, peer.run(c, [peer.executable(base, optimization), paths[index]], "execute-invalid-utf8", 10), 1, Text(corpus[index].length) + "\n", error, paths[index] + " at " + optimization)
+        }
+    }
+}
+record Vector { path: Text; status: Integer; stdout: Text; stderr: Text }
+function test_utf8_lead_continuation_and_endpoint_vectors(c: peer.Case) {
+    let fixture = c.suite.root + "/tests/peer-utf8-vectors.json"
+    peer.input(c, fixture)
+    let data = peer.load(fixture)
+    peer.equalInteger(c, peer.field(data, "schema_version"), 1, "UTF-8 vector schema")
+    let vectors = json.member(data, "vectors").items
+    peer.equalInteger(c, vectors.length, 83, "UTF-8 vector count")
+    let cases: List<Vector> = []
+    for index in 0..vectors.length {
+        let vector = vectors[index]
+        let raw = peer.fromHex(peer.textField(vector, "hex"))
+        let file = peer.writeBytes(c, "utf8-vector-" + Text(index) + ".txt", raw)
+        if json.member(vector, "valid").truth {
+            let points: List<Integer> = []
+            for point in json.member(vector, "codepoints").items { points.add(peer.number(point)) }
+            peer.expect(c, peer.bytesEqual(Bytes(peer.codepoints(points)), raw), "UTF-8 vector encoding " + Text(index))
+            let expected = Text(raw.length) + "\n" + Text(points.length) + "\n" + Text(raw.length) + "\n" + Text(raw) + "\n"
+            for point in points { expected += peer.character(point) + "\n" }
+            cases.add(Vector { path: file; status: 0; stdout: expected; stderr: "" })
+        } else {
+            peer.expect(c, !peer.validUTF8(raw), "invalid UTF-8 vector decoded " + Text(index))
+            cases.add(Vector { path: file; status: 1; stdout: Text(raw.length) + "\n"; stderr: "Minyar stopped: Text contained invalid UTF-8.\n" })
+        }
+    }
+    let source = "let text = readTextFile(argument(0))
+print(text.byteLength)
+print(text.length)
+print(text.byteLength)
+print(text)
+let index = 0
+while index < text.length { print(text[index]); index = index + 1 }
+"
+    let base = peer.executesWith(c, source, cases[0].stdout, cases[0].status, cases[0].stderr, [cases[0].path])
+    for optimization in c.variants {
+        for index in 1..cases.length {
+            let item = cases[index]
+            peer.observe(c, peer.run(c, [peer.executable(base, optimization), item.path], "execute-utf8-vector", 10), item.status, item.stdout, item.stderr, item.path + " at " + optimization)
+        }
+    }
+}
+function scalarSlice(value: Text, start: Integer, end: Integer): Text {
+    let parts = peer.scalars(value)
+    let pieces: List<Text> = []
+    for index in start..end { pieces.add(parts[index]) }
+    return joinText(pieces)
+}
+function test_unicode_width_compositions_and_cached_append_queries(c: peer.Case) {
+    let fixture = c.suite.root + "/tests/peer-unicode-compositions.json"
+    peer.input(c, fixture)
+    let data = peer.load(fixture)
+    peer.equalInteger(c, peer.field(data, "schema_version"), 1, "composition schema")
+    let cases = json.member(data, "cases").items
+    peer.equalInteger(c, cases.length, 167, "composition case count")
+    let source = ["function compareCompositions(left: Text, right: Text) {", "print(left == right)", "print(right == left)", "print(left != right)", "print(right != left)", "}"]
+    let expected: List<Text> = []
+    let scalarsSeen: List<Integer> = []
+    for index in 0..cases.length {
+        let item = cases[index]
+        let kind = peer.textField(item, "kind")
+        if kind == "incremental_append" {
+            let scalar = peer.field(item, "scalar")
+            if !peer.hasInteger(scalarsSeen, scalar) { scalarsSeen.add(scalar) }
+            continue
+        }
+        source.add("function case" + Text(index) + "() {")
+        if kind == "concat" {
+            let left = peer.textField(item, "left")
+            let right = peer.textField(item, "right")
+            let value = peer.textField(item, "expected")
+            peer.expect(c, value == left + right, "composition concat " + Text(index))
+            peer.extend(source, ["let left = " + peer.literal(left), "let right = " + peer.literal(right), "let alias = left", "left = left + right", "right = \"released\"", "print(left)", "print(left.length)", "print(left.byteLength)", "print(alias)"])
+            peer.extend(expected, [value, Text(peer.scalars(value).length), Text(Bytes(value).length), left])
+        } else if kind == "slice" {
+            let text = peer.textField(item, "text")
+            let start = peer.field(item, "start")
+            let end = peer.field(item, "end")
+            let value = peer.textField(item, "expected")
+            peer.expect(c, value == scalarSlice(text, start, end), "composition slice " + Text(index))
+            peer.extend(source, ["let root = " + peer.literal(text), "let view = root.slice(" + Text(start) + ", " + Text(end) + ")", "root = \"released\"", "print(view)", "print(view.length)", "print(view.byteLength)"])
+            peer.extend(expected, [value, Text(peer.scalars(value).length), Text(Bytes(value).length)])
+        } else {
+            peer.expect(c, kind == "equality", "unknown composition kind " + kind)
+            let left = peer.textField(item, "left")
+            let right = peer.textField(item, "right")
+            let equal = json.member(item, "expected").truth
+            peer.expect(c, equal == peer.bytesEqual(Bytes(left), Bytes(right)), "composition equality " + Text(index))
+            let leftPath = peer.writeFile(c, "composition-left-" + Text(index) + ".txt", left)
+            let rightPath = peer.writeFile(c, "composition-right-" + Text(index) + ".txt", right)
+            peer.extend(source, ["let left = " + peer.literal(left), "let right = " + peer.literal(right), "print(left == right)", "print(right == left)", "print(left != right)", "print(right != left)", "compareCompositions(left, right)", "compareCompositions(readTextFile(" + peer.literal(leftPath) + "), readTextFile(" + peer.literal(rightPath) + "))"])
+            for unused in 0..3 { peer.extend(expected, [peer.boolean(equal), peer.boolean(equal), peer.boolean(!equal), peer.boolean(!equal)]) }
+        }
+        source.add("}")
+        source.add("case" + Text(index) + "()")
+    }
+    for scalar in scalarsSeen {
+        let counts: List<Integer> = []
+        source.add("function append" + Text(scalar) + "() {")
+        source.add("let text = \"\"")
+        for item in cases {
+            if peer.textField(item, "kind") != "incremental_append" || peer.field(item, "scalar") != scalar { continue }
+            let total = peer.field(item, "count")
+            counts.add(total)
+            let value = peer.textField(item, "expected")
+            peer.expect(c, value == peer.repeat(peer.character(scalar), total), "composition append " + Text(scalar))
+            source.add("text = text + " + peer.literal(peer.character(scalar)))
+            for unused in 0..2 {
+                peer.extend(source, ["print(text)", "print(text.length)", "print(text.byteLength)"])
+                peer.extend(expected, [value, Text(total), Text(Bytes(value).length)])
+                for index in 0..total { source.add("print(text[" + Text(index) + "])") }
+                peer.extend(expected, peer.scalars(value))
+            }
+        }
+        peer.expect(c, peer.joined(peer.texts(counts), ",") == "1,2,3,4,5", "composition append counts " + Text(scalar))
+        source.add("}")
+        source.add("append" + Text(scalar) + "()")
+    }
+    peer.executes(c, peer.lines(source), peer.lines(expected))
+}
+function test_signed_comparisons_preserve_boolean_values(c: peer.Case) {
+    let values = [peer.MINIMUM, -9223372036854775807, -4611686018427387904, -123, -1, 0, 1, 123, 4294967295, 4611686018427387903, 9223372036854775806, peer.MAXIMUM]
+    let symbols = ["==", "!=", "<", "<=", ">", ">="]
+    let source = ["function identity(value: Boolean): Boolean { return value }"]
+    let expected: List<Text> = []
+    for index in 0..symbols.length {
+        let symbol = symbols[index]
+        source.add("function compare" + Text(index) + "(a: Integer, b: Integer): Boolean { return a " + symbol + " b }")
+        for a in values {
+            for b in values {
+                source.add("print(identity(" + Text(a) + " " + symbol + " " + Text(b) + "))")
+                source.add("print(identity(compare" + Text(index) + "(" + Text(a) + ", " + Text(b) + ")))")
+                let order = peer.bigCompare(peer.big(a), peer.big(b))
+                let result = order == 0
+                if symbol == "!=" { result = order != 0 }
+                if symbol == "<" { result = order < 0 }
+                if symbol == "<=" { result = order <= 0 }
+                if symbol == ">" { result = order > 0 }
+                if symbol == ">=" { result = order >= 0 }
+                expected.add(peer.boolean(result)); expected.add(peer.boolean(result))
+            }
+        }
+    }
+    peer.extend(source, ["function atMost(a: Integer, b: Integer): Boolean { return a < b || a == b }", "function greater(a: Integer, b: Integer): Boolean { return a > b && a != b }", "function negatedRange(a: Integer, b: Integer): Boolean { return !(a < b || a == b) }"])
+    for a in values {
+        for b in values {
+            source.add("print(atMost(" + Text(a) + ", " + Text(b) + "))")
+            source.add("print(greater(" + Text(a) + ", " + Text(b) + "))")
+            source.add("print(negatedRange(" + Text(a) + ", " + Text(b) + "))")
+            let order = peer.bigCompare(peer.big(a), peer.big(b))
+            peer.extend(expected, [peer.boolean(order <= 0), peer.boolean(order > 0), peer.boolean(order > 0)])
+        }
+    }
+    peer.executes(c, peer.lines(source), peer.lines(expected))
+}
+function test_signed64_arithmetic_runtime_matrix(c: peer.Case) {
+    let values = [0, 1, 2, -1, -2, peer.MAXIMUM, peer.MAXIMUM - 1, peer.MINIMUM, peer.MINIMUM + 1]
+    let source = ["function operand(value: Text): Integer {"]
+    for value in values { source.add("if value == \"" + Text(value) + "\" { return " + Text(value) + " }") }
+    peer.extend(source, ["fail(\"unknown matrix operand\")", "}", "let operation = argument(0)", "let a = operand(argument(1))", "let b = operand(argument(2))"])
+    for symbol in ["+", "-", "*", "/", "%"] { source.add("if operation == \"" + symbol + "\" { print(a " + symbol + " b) }") }
+    source.add("if operation == \"negate\" { print(-a) }")
+    let base = peer.executesWith(c, peer.lines(source), "0\n", 0, "", ["+", "0", "0"])
+    let arguments: List<List<Text>> = []
+    let outputs: List<Text> = []
+    let errors: List<Text> = []
+    for symbol in ["+", "-", "*", "/", "%"] {
+        for a in values {
+            for b in values {
+                let error = ""
+                let result = peer.big(0)
+                if (symbol == "/" || symbol == "%") && b == 0 { error = peer.ZERO }
+                else if (symbol == "/" || symbol == "%") && a == peer.MINIMUM && b == -1 { error = peer.DIVISION }
+                else if symbol == "+" { result = peer.bigAdd(peer.big(a), peer.big(b)) }
+                else if symbol == "-" { result = peer.bigSubtract(peer.big(a), peer.big(b)) }
+                else if symbol == "*" { result = peer.product(a, b) }
+                else {
+                    let division = peer.division(a, b)
+                    result = peer.big(division.quotient)
+                    if symbol == "%" { result = peer.big(division.remainder) }
+                }
+                if error == "" && !peer.bigFits(result) { error = peer.OVERFLOW }
+                arguments.add([symbol, Text(a), Text(b)])
+                if error == "" { outputs.add(peer.bigText(result) + "\n") } else { outputs.add("") }
+                errors.add(error)
+            }
+        }
+    }
+    for a in values {
+        let error = ""
+        if a == peer.MINIMUM { error = peer.OVERFLOW }
+        arguments.add(["negate", Text(a), "0"])
+        if error == "" { outputs.add(Text(-a) + "\n") } else { outputs.add("") }
+        errors.add(error)
+    }
+    let oracles: List<json.Value> = []
+    for index in 0..arguments.length {
+        let row = peer.jsonObject()
+        peer.put(row, "arguments", peer.jsonTexts(arguments[index]))
+        peer.put(row, "stdout", peer.jsonText(outputs[index]))
+        peer.put(row, "stderr", peer.jsonText(errors[index]))
+        let status = 0
+        if errors[index] != "" { status = 1 }
+        peer.put(row, "status", peer.jsonInteger(status))
+        oracles.add(row)
+    }
+    peer.control(c, "integer_matrix_oracles", peer.jsonArray(oracles))
+    let environment = peer.withEnvironment(c.environment, "MSYS2_ARG_CONV_EXCL", "*")
+    for optimization in c.variants {
+        for index in 0..arguments.length {
+            let command = [peer.executable(base, optimization)]
+            for item in arguments[index] { command.add(item) }
+            let status = 0
+            if errors[index] != "" { status = 1 }
+            peer.observe(c, peer.launch(c, command, "execute-integer-matrix", 10, environment, "", ""), status, outputs[index], errors[index], peer.joined(arguments[index], " ") + " at " + optimization)
+        }
+    }
+}
+function test_ascii_identifier_policy_rejects_confusables(c: peer.Case) {
+    let nbsp = peer.character(0xa0)
+    let ideographic = peer.character(0x3000)
+    let joiner = peer.character(0x200d)
+    let wordJoiner = peer.character(0x2060)
+    let bom = peer.character(0xfeff)
+    let zeroWidth = peer.character(0x200b)
+    let greekQuestion = peer.character(0x37e)
+    let fragments = ["let $ = 1", "let $$ = 1", "let Σ$ = 1", "let $Σ = 1", "let" + nbsp + "x = 1", "let" + ideographic + "x = 1",
+        "let ༀ = 1", "let 𑩐 = 1", "let 𐠈 = 1", "let ꙮ = 1", "let 𝛛 = 1", "let ₉ = 1", "let a¹b₍₄₂₎∇ = 1",
+        "let 🌹 = 1", "let 🫎 = 1", "let 👷 = 1", "let 👷" + joiner + "♀ = 1", "let 🌵 = 1", "let 🌻 = 1", "let 🌷 = 1",
+        "let n" + greekQuestion + " = 1", "let n꞉꞉v = 1", "let v＝［＝］（auto）｛return～x；｝（） = 1", "let " + wordJoiner + "x" + bom + "x" + joiner + " = 1",
+        "let ∣foo = 1", "let foo" + zeroWidth + "bar = 1", "let a" + nbsp + "b = 1", "let a¹b = 1", "let a" + greekQuestion + "b = 1", "let aΣb = 1",
+        "let aༀb = 1", "let a" + zeroWidth + "b = 1", "let a" + joiner + "b = 1", "let a" + wordJoiner + "b = 1", "let a₂b = 1",
+        "let a₄b = 1", "let a₉b = 1", "let a₍b = 1", "let a₎b = 1", "let a∇b = 1", "let a∣b = 1", "let a♀b = 1",
+        "let a" + ideographic + "b = 1", "let aꙮb = 1", "let a꞉b = 1", "let a" + bom + "b = 1", "let a（b = 1", "let a）b = 1",
+        "let a；b = 1", "let a＝b = 1", "let a［b = 1", "let a］b = 1", "let a｛b = 1", "let a｝b = 1", "let a～b = 1",
+        "let a𐠈b = 1", "let a𑩐b = 1", "let a𝛛b = 1", "let a🌵b = 1", "let a🌷b = 1", "let a🌹b = 1", "let a🌻b = 1",
+        "let a👷b = 1", "let a🫎b = 1"]
+    peer.equalInteger(c, fragments.length, 64, "confusable fragment count")
+    for fragment in fragments { peer.rejects(c, fragment + "\n", "Minyar stopped:") }
+    peer.rejects(c, "let foobar = 1\nprint(foo" + zeroWidth + "bar)\n", "names must use ASCII")
+}
+function test_character_literal_requires_one_scalar(c: peer.Case) {
+    let values = peer.scalars("က⌘Ø👿👽")
+    let source: List<Text> = []
+    for value in values { source.add("print('" + value + "')\n") }
+    peer.executes(c, joinText(source), peer.lines(values))
+    for value in ["ab", "aက", "APPS"] { peer.rejects(c, "print('" + value + "')\n", "Character literal must contain exactly one character") }
+}
+function test_logical_not_types_values_and_whitespace(c: peer.Case) {
+    peer.executes(c, "record Box { prop: Boolean }
+let value = Box { prop: true }
+let x = true
+print(!true)
+print(!(!true))
+print(!x)
+print(!(!x))
+print(!value.prop)
+print(!false)
+", "false\ntrue\nfalse\ntrue\nfalse\ntrue\n")
+    for whitespace in ["\t", " ", "\n", "\r"] { peer.executes(c, "print(!" + whitespace + "true)\n", "false\n") }
+    let vertical = peer.character(11)
+    let feed = peer.character(12)
+    let nbsp = peer.character(0xa0)
+    let line = peer.character(0x2028)
+    let paragraph = peer.character(0x2029)
+    for whitespace in [vertical, feed, nbsp, line, paragraph, "\t" + vertical + feed + " " + nbsp + "\n\r" + line + paragraph] { peer.rejects(c, "print(!" + whitespace + "true)\n", "Minyar stopped:") }
+    for operand in ["missing", "0", "(-0)", "13", "(-13)", "1", "-1", "\"1\"", "\"x\"", "\"\"", "\" \"", "\"Nonempty String\""] { peer.rejects(c, "print(!" + operand + ")\n", "Minyar stopped:") }
+}
+function test_power_of_two_neighbor_cancellation(c: peer.Case) {
+    let start = 2
+    while start < 63 {
+        let source = ["function localPair(left: Integer, right: Integer) {", "print(left + right)", "print(-left - right)", "}"]
+        let expected: List<Text> = []
+        let last = start + 8
+        if last > 63 { last = 63 }
+        for exponent in start..last {
+            let power = 1 << exponent
+            for small in -3..4 {
+                let other = power - small
+                let name = Text(exponent) + "_" + Text(small + 3)
+                peer.extend(source, ["print(" + Text(small) + " + " + Text(other) + ")", "print(-(" + Text(small) + ") - " + Text(other) + ")",
+                    "localPair(" + Text(small) + ", " + Text(other) + ")",
+                    "let left" + name + " = " + Text(small), "let right" + name + " = " + Text(other),
+                    "print(left" + name + " + " + Text(other) + ")", "print(-left" + name + " - " + Text(other) + ")",
+                    "print(" + Text(small) + " + right" + name + ")", "print(-(" + Text(small) + ") - right" + name + ")"])
+                for unused in 0..4 { expected.add(Text(power)); expected.add(Text(-power)) }
+            }
+        }
+        peer.executes(c, peer.lines(source), peer.lines(expected))
+        start += 8
+    }
+}
+function test_full_int32_constant_divisor_domain(c: peer.Case) {
+    let values = [-2147483648, 715827883, 1431655766, -1431655765, -1431655764, 123, -1234, 12345, -123456, 1234567, -12345678, 123456789]
+    let positive: List<Integer> = []
+    for shift in 6..31 { positive.add(1 << shift) }
+    for value in 1..33 { positive.add(value) }
+    let magnitude = 100
+    for unused in 2..10 {
+        for offset in 0..10 { positive.add(magnitude + offset) }
+        magnitude *= 10
+    }
+    for value in positive { values.add(value); values.add(-value) }
+    let distinct: List<Integer> = []
+    for value in values { if !peer.hasInteger(distinct, value) { distinct.add(value) } }
+    peer.equalInteger(c, values.length, 286, "division domain length")
+    peer.equalInteger(c, distinct.length, 286, "division domain distinct values")
+    let domain = peer.jsonObject()
+    peer.put(domain, "values", peer.jsonIntegers(values))
+    peer.put(domain, "excluded_pair", peer.jsonIntegers([-2147483648, -1]))
+    peer.put(domain, "pairs", peer.jsonInteger(81795))
+    peer.put(domain, "operations", peer.jsonTexts(["division", "remainder"]))
+    peer.put(domain, "placements", peer.jsonTexts(["constant-divisor", "parameter-divisor"]))
+    peer.control(c, "division_domain", domain)
+    let valueList: List<Text> = []
+    for value in values { valueList.add(Text(value)) }
+    let checked = 0
+    let start = 0
+    while start < values.length {
+        let end = start + 16
+        if end > values.length { end = values.length }
+        let source = ["function divide(a: Integer, b: Integer): Integer { return a / b }", "function remainder(a: Integer, b: Integer): Integer { return a % b }"]
+        for offset in 0..(end - start) {
+            peer.extend(source, ["function constant" + Text(offset) + "(a: Integer) {", "print(a / (" + Text(values[start + offset]) + "))", "print(a % (" + Text(values[start + offset]) + "))", "}"])
+        }
+        source.add("let values = [" + peer.joined(valueList, ", ") + "]")
+        let expected: List<Text> = []
+        for offset in 0..(end - start) {
+            let divisor = values[start + offset]
+            peer.extend(source, ["let index = 0", "while index < values.length {", "let value = values[index]"])
+            if divisor == -1 { source.add("if value != -2147483648 {") }
+            peer.extend(source, ["constant" + Text(offset) + "(value)", "print(divide(value, " + Text(divisor) + "))", "print(remainder(value, " + Text(divisor) + "))"])
+            if divisor == -1 { source.add("}") }
+            peer.extend(source, ["index = index + 1", "}"])
+            for value in values {
+                if value == -2147483648 && divisor == -1 { continue }
+                let result = peer.division(value, divisor)
+                for unused in 0..2 { expected.add(Text(result.quotient)); expected.add(Text(result.remainder)) }
+                checked += 1
+            }
+        }
+        peer.executes(c, peer.lines(source), peer.lines(expected))
+        start += 16
+    }
+    peer.equalInteger(c, checked, 81795, "division domain pairs")
+}
+function test_long_near_identical_identifiers(c: peer.Case) {
+    let first = peer.repeat("a", 15000) + "1"
+    let second = peer.repeat("a", 15000) + "2"
+    peer.executes(c, "let " + first + " = 5\nlet " + second + " = 6\nprint(" + first + ")\nprint(" + second + ")\nprint(" + first + " - " + second + ")\n", "5\n6\n-1\n")
+}
+function test_ignored_call_result_preserves_live_argument(c: peer.Case) {
+    peer.executes(c, "function ignored(trace: List<Integer>): Integer {
+trace.add(23)
+return 23
+}
+function consume(value: Integer, trace: List<Integer>) {
+print(value)
+print(trace.length)
+print(trace[0])
+}
+function caller(value: Integer, trace: List<Integer>) {
+ignored(trace)
+consume(value, trace)
+}
+let trace: List<Integer> = []
+caller(42, trace)
+", "42\n1\n23\n")
+}
+function test_repeated_and_shifted_call_arguments(c: peer.Case) {
+    peer.executes(c, "function weighted(a: Integer, b: Integer, c: Integer): Integer {
+return 100 * a + 10 * b + c
+}
+function caller(a: Integer, b: Integer) {
+print(weighted(1, a, b))
+print(weighted(b, b, b))
+print(a)
+print(b)
+}
+caller(42, 7)
+caller(7, 42)
+", "527\n777\n42\n7\n212\n4662\n7\n42\n")
+}
+function test_loop_sentinels_nested_state_and_dead_inner_loop(c: peer.Case) {
+    peer.executes(c, "let line = \"\"
+let index = 0
+while line != \"exit\" {
+if index == 9 { line = \"exit\" } else { line = \"notexit\" }
+index = index + 1
+}
+print(index)
+print(line)
+let ones: List<Integer> = []
+let twos: List<Integer> = []
+index = 0
+while index < 100 { ones.add(1); twos.add(2); index = index + 1 }
+let p = 0
+let q = 0
+index = 0
+while index < ones.length {
+let inner = 0
+while inner < twos.length { p = p + twos[inner]; inner = inner + 1 }
+q = q + ones[index] + p
+index = index + 1
+}
+print(p)
+print(q)
+let y = 42
+let z = 42
+let iterations = 0
+while z < 50 {
+z = z + 1
+iterations = iterations + 1
+while false { y = 0 }
+}
+print(y)
+print(z)
+print(iterations)
+", "10\nexit\n20000\n1010100\n42\n50\n8\n")
+}
+function test_owned_condition_temporaries_include_final_false_check(c: peer.Case) {
+    peer.executes(c, "function condition(counter: List<Integer>): Text {
+let value = counter[0]
+counter[0] = value + 1
+return Text(value) + \"!\"
+}
+function leave(counter: List<Integer>) {
+let text = Text(counter[0]) + \"hej\"
+while text != condition(counter) { return }
+fail(\"unexpected equal condition\")
+}
+let counter = [0]
+let iterations = 0
+while condition(counter) != \"9!\" { iterations = iterations + 1 }
+print(iterations)
+print(counter[0])
+if condition(counter) == \"10!\" { print(\"matched\") }
+if condition(counter) == \"12!\" { print(\"unexpected\") }
+print(counter[0])
+leave(counter)
+print(counter[0])
+print(\"returned\")
+", "9\n10\nmatched\n12\n13\nreturned\n")
+}
+function test_euclidean_gcd_and_lcm_integer_workloads(c: peer.Case) {
+    let gcd = [[0, 5, 5], [5, 0, 5], [8, 12, 4], [12, 8, 4], [33, 77, 11], [77, 33, 11], [49865, 69811, 9973], [300000, 2300000, 100000]]
+    let lcm = [[0, 0, 0], [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [7, 1, 7], [7, -1, 7], [8, 12, 24], [-23, 15, 345], [120, 84, 840], [84, -120, 840]]
+    let source = ["function gcd(first: Integer, second: Integer): Integer {
+let a = first
+let b = second
+while b != 0 { let remainder = a % b; a = b; b = remainder }
+return a
+}
+function lcm(first: Integer, second: Integer): Integer {
+if first == 0 || second == 0 { return 0 }
+let a = first
+let b = second
+if a < 0 { a = -a }
+if b < 0 { b = -b }
+return (a / gcd(a, b)) * b
+}
+"]
+    let expected: List<Text> = []
+    for row in gcd { source.add("print(gcd(" + Text(row[0]) + ", " + Text(row[1]) + "))"); expected.add(Text(row[2])) }
+    for row in lcm { source.add("print(lcm(" + Text(row[0]) + ", " + Text(row[1]) + "))"); expected.add(Text(row[2])) }
+    peer.executes(c, peer.lines(source), peer.lines(expected))
+}
+function test_discarded_owned_results_and_temporary_record_arguments(c: peer.Case) {
+    peer.executes(c, "record Wrapper { text: Text }
+function makeText(index: Integer): Text { return Text(index) + \"!\" }
+function makeRecord(index: Integer): Wrapper { return Wrapper { text: makeText(index) } }
+function discard() {
+let named = makeRecord(1)
+makeRecord(3)
+let text = makeText(2)
+makeText(4)
+}
+function say(value: Wrapper) { print(value.text) }
+function paths(index: Integer) {
+let text = Text(index) + \"!\"
+if index == 1 { print(\"early\"); return }
+print(text)
+}
+discard()
+let named = Wrapper { text: \"B\" + \"ob\" }
+say(named)
+say(Wrapper { text: \"B\" + \"ob\" })
+let index = 0
+while index < 2 { paths(index); index = index + 1 }
+print(\"done\")
+", "Bob\nBob\n0!\nearly\ndone\n")
+}
+function test_changing_index_short_circuit_loop_and_blank_output(c: peer.Case) {
+    peer.executes(c, "let values = [0, 1, 2]
+let index = 1
+while index > 0 && values[index] != 2 { index = index + 1 }
+print(index)
+index = -1
+while index > 0 && values[index] != 2 { fail(\"unexpected\") }
+print(index)
+print(\"A\")
+print(\"\")
+print(\"B\")
+", "2\n-1\nA\n\nB\n")
+}
+function test_induction_indexed_division_and_remainder_cancellation(c: peer.Case) {
+    let expected = ["1", "1"]
+    for n in 1..20 { expected.add(Text(n)); expected.add(Text(peer.division(peer.MAXIMUM, n).remainder)) }
+    peer.executes(c, "let index = 1
+let count = 0
+while index <= 11 {
+if index - 6 > 4 { count = count + 1 }
+index = index + 1
+}
+print(count)
+let values = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+index = 0
+let numerator = 10
+let denominator = 7
+values[index] = numerator / denominator
+print(values[0])
+function rounded(n: Integer): Integer { return 9223372036854775807 - 9223372036854775807 % n }
+index = 1
+while index < 20 {
+print(index)
+print(9223372036854775807 - rounded(index))
+index = index + 1
+}
+", peer.lines(expected))
+}
+function test_descending_list_shift_pretested_and_posttested_loops(c: peer.Case) {
+    let source = ["function shift(bound: Integer, posttested: Boolean) {
+let values = [5, 6, 7, 8]
+let index = 3
+if posttested { values[index] = values[index - 1]; index = index - 1 }
+while index > bound { values[index] = values[index - 1]; index = index - 1 }
+print(bound)
+index = 0
+while index < values.length { print(values[index]); index = index + 1 }
+}
+"]
+    let expected: List<Text> = []
+    let initial = [5, 6, 7, 8]
+    for posttested in [false, true] {
+        for bound in [0, 1, 2, 3, 4, 4294967295] {
+            source.add("shift(" + Text(bound) + ", " + peer.boolean(posttested) + ")")
+            expected.add(Text(bound))
+            for index in 0..4 {
+                if index > bound || (posttested && index == 3) { expected.add(Text(initial[index - 1])) } else { expected.add(Text(initial[index])) }
+            }
+        }
+    }
+    source.add("function observe(value: Integer): Integer { print(value); return value }
+let values = [0, 0, 0, 0]
+let index = 3
+while index >= 0 { values[index] = observe(5 + index); index = index - 1 }
+index = 0
+while index < values.length { observe(values[index]); index = index + 1 }
+")
+    peer.extend(expected, peer.texts([8, 7, 6, 5, 5, 6, 7, 8]))
+    peer.executes(c, peer.lines(source), peer.lines(expected))
+}
+function test_parameterized_nested_list_dimensions_and_cells(c: peer.Case) {
+    let expected = peer.integers(peer.range(1, 13)) + peer.integers(peer.range(1, 25))
+    peer.executes(c, "function fill2(values: List<List<Integer>>, width: Integer) {
+let number = 1
+let i = 0
+while i < values.length {
+let row = values[i]
+let j = 0
+while j < width { row[j] = number; number = number + 1; j = j + 1 }
+i = i + 1
+}
+}
+function fill3(values: List<List<List<Integer>>>, width: Integer, depth: Integer) {
+let number = 1
+let i = 0
+while i < values.length {
+let j = 0
+while j < width {
+let row = values[i][j]
+let k = 0
+while k < depth { row[k] = number; number = number + 1; k = k + 1 }
+j = j + 1
+}
+i = i + 1
+}
+}
+let matrix: List<List<Integer>> = []
+let i = 0
+while i < 4 { matrix.add([0, 0, 0]); i = i + 1 }
+let cube: List<List<List<Integer>>> = []
+i = 0
+while i < 2 {
+let plane: List<List<Integer>> = []
+let j = 0
+while j < 3 { plane.add([0, 0, 0, 0]); j = j + 1 }
+cube.add(plane)
+i = i + 1
+}
+fill2(matrix, 3)
+fill3(cube, 3, 4)
+i = 0
+while i < matrix.length {
+let j = 0
+while j < matrix[i].length { print(matrix[i][j]); j = j + 1 }
+i = i + 1
+}
+i = 0
+while i < cube.length {
+let j = 0
+while j < cube[i].length {
+let k = 0
+while k < cube[i][j].length { print(cube[i][j][k]); k = k + 1 }
+j = j + 1
+}
+i = i + 1
+}
+", expected)
+}
+function test_nested_branch_keeps_text_live_across_join(c: peer.Case) {
+    peer.executes(c, "function branch(enabled: Boolean, kind: Integer, nested: Boolean, text: Text, trace: List<Text>) {
+if kind == 1 {
+if enabled {
+let output = text
+if nested { print(\"unexpected\") }
+trace.add(output)
+}
+}
+}
+let trace: List<Text> = []
+let text = \"ao\" + \"eu\"
+branch(true, 2, false, text, trace)
+print(trace.length)
+branch(false, 1, false, text, trace)
+print(trace.length)
+branch(true, 1, false, text, trace)
+text = \"replaced\"
+print(trace.length)
+print(trace[0])
+", "0\n0\n1\naoeu\n")
+}
+function test_fresh_allocation_is_consumed_and_dropped_each_iteration(c: peer.Case) {
+    let expected = 0
+    for index in 0..100000 { expected += Bytes(Text(index)).length + 1 }
+    peer.executes(c, "function consume(index: Integer): Integer {
+let text = Text(index) + \"!\"
+return text.length
+}
+let index = 0
+let checksum = 0
+while index < 100000 {
+checksum = checksum + consume(index)
+index = index + 1
+}
+print(index)
+print(checksum)
+", "100000\n" + Text(expected) + "\n")
+}
+function test_alternating_retained_and_discarded_large_allocations(c: peer.Case) {
+    let padding = peer.literal(peer.repeat("x", 1024))
+    let expected: List<Text> = []
+    for round in 0..10 {
+        expected.add("50\n")
+        for index in 0..50 { expected.add(Text(round * 100 + index * 2) + "\ntrue\n") }
+    }
+    peer.executes(c, "record Payload { id: Integer, text: Text }
+function populate(round: Integer, retained: List<Payload>) {
+let index = 0
+while index < 100 {
+let id = round * 100 + index
+let payload = Payload { id: id, text: Text(id) + " + padding + " }
+if index % 2 == 0 { retained.add(payload) }
+index = index + 1
+}
+}
+function churn(round: Integer) {
+let index = 0
+while index < 100 {
+let transient = Text(round * 100 + index) + " + peer.literal(peer.repeat("y", 1024)) + "
+if transient.length < 1025 { print(\"bad transient\") }
+index = index + 1
+}
+}
+let round = 0
+while round < 10 {
+let retained: List<Payload> = []
+populate(round, retained)
+churn(round)
+churn(round)
+print(retained.length)
+let index = 0
+while index < retained.length {
+let expected = round * 100 + index * 2
+let payload = retained[index]
+print(payload.id)
+print(payload.text == Text(expected) + " + padding + ")
+index = index + 1
+}
+round = round + 1
+}
+", joinText(expected))
+}
+function test_record_returns_recursive_results_and_argument_permutations(c: peer.Case) {
+    let parameters: List<Text> = []
+    let reverse: List<Text> = []
+    let prints: List<Text> = []
+    let arguments: List<Text> = []
+    for index in 0..26 {
+        parameters.add("v" + Text(index) + ": Integer")
+        reverse.add("v" + Text(25 - index))
+        prints.add("print(v" + Text(index) + ")")
+        arguments.add(Text(index + 1))
+    }
+    let source = "function output(" + peer.joined(parameters, ", ") + ") { " + peer.joined(prints, "\n") + " }\n"
+    source += "function reverse(" + peer.joined(parameters, ", ") + ") { output(" + peer.joined(reverse, ", ") + ") }\n"
+    source += "reverse(" + peer.joined(arguments, ", ") + ")\n"
+    source += "record Four { a: Integer, b: Integer, c: Integer, d: Integer }
+function arithmetic(x: Four): Four {
+let ab = x.a + x.b
+let bc = x.b + x.c
+let cd = x.c + x.d
+let ad = x.a + x.d
+let ba = x.a - x.b
+let cb = x.b - x.c
+let dc = x.c - x.d
+let da = x.a - x.d
+return Four { a: ab * bc + da, b: cd * ad + cb, c: ba * cb + ad, d: dc * da + bc }
+}
+let result = arithmetic(Four { a: 1, b: 2, c: 3, d: 4 })
+print(result.a)
+print(result.b)
+print(result.c)
+print(result.d)
+record Five { a: Integer, b: Integer, c: Integer, d: Integer, e: Integer }
+function make(): Five { return Five { a: 1, b: 2, c: 3, d: 4, e: 5 } }
+function compare(s: Five, t: Five) {
+print(s.a == t.a && s.b == t.b && s.c == t.c && s.d == t.d && s.e == t.e)
+}
+let a = make()
+let b = make()
+compare(b, b)
+compare(a, make())
+if a.a == 1 { a = make() }
+compare(a, a)
+function store(x: Integer, y: Integer, values: List<Integer>) {
+if x < 0 { print(\"unexpected\") }
+values.add(x)
+values.add(y)
+values.add(x)
+values.add(y)
+}
+let values: List<Integer> = []
+store(1, 2, values)
+print(values[0])
+print(values[1])
+print(values[2])
+print(values[3])
+record Words { a: Text, b: Text, c: Text }
+function join(words: Words): Text { return words.a + \" \" + words.b + \" \" + words.c }
+print(join(Words { a: \"Hel\" + \"lo\", b: \"the\" + \"re,\", c: \"Wor\" + \"ld\" }))
+record Pair { a: Integer, b: Integer }
+function recursive(x: Integer): Pair {
+if x < 3 { return Pair { a: 0, b: x } }
+let first = recursive(x - 2)
+let second = recursive(x - 1)
+return Pair { a: first.a + second.b, b: first.b + second.a }
+}
+let small = recursive(12)
+print(small.a)
+print(small.b)
+let larger = recursive(20)
+print(larger.a)
+print(larger.b)
+"
+    let firsts = [0, 0, 0]
+    let seconds = [0, 1, 2]
+    for index in 3..21 {
+        firsts.add(firsts[index - 2] + seconds[index - 1])
+        seconds.add(seconds[index - 2] + firsts[index - 1])
+    }
+    let expected: List<Text> = []
+    for value in 0..26 { expected.add(Text(26 - value)) }
+    peer.extend(expected, ["12", "34", "6", "8", "true", "true", "true", "1", "2", "1", "2", "Hello there, World", Text(firsts[12]), Text(seconds[12]), Text(firsts[20]), Text(seconds[20])])
+    peer.executes(c, source, peer.lines(expected))
+}
+function test_integer_power_algorithms(c: peer.Case) {
+    peer.executes(c, "function powerOfTwo(value: Integer): Boolean {
+if value <= 0 { return false }
+let remaining = value
+while remaining > 1 {
+if remaining % 2 != 0 { return false }
+remaining = remaining / 2
+}
+return true
+}
+function power(base: Integer, exponent: Integer): Integer {
+let result = 1
+let index = 0
+while index < exponent { result = result * base; index = index + 1 }
+return result
+}
+function nextPowerOfTwo(value: Integer): Integer {
+let result = 1
+while result < value { result = result * 2 }
+return result
+}
+print(powerOfTwo(0))
+print(powerOfTwo(32))
+print(powerOfTwo(33))
+print(power(3, 5))
+print(nextPowerOfTwo(3))
+", "false\ntrue\nfalse\n243\n4\n")
+}
+function test_recursive_hanoi_argument_permutation_trace(c: peer.Case) {
+    let moves = [[1, 3], [1, 2], [3, 2], [1, 3], [2, 1], [2, 3], [1, 3], [1, 2], [3, 2], [3, 1], [2, 1], [3, 2], [1, 3], [1, 2], [3, 2]]
+    let expected = "Towers of Hanoi, 4 disks\n"
+    for move in moves { expected += "Move disk from pole " + Text(move[0]) + " to pole " + Text(move[1]) + "\n" }
+    peer.executes(c, "function hanoi(disks: Integer, start: Integer, end: Integer, via: Integer) {
+if disks == 1 {
+print(\"Move disk from pole \" + Text(start) + \" to pole \" + Text(end))
+} else {
+hanoi(disks - 1, start, via, end)
+hanoi(1, start, end, via)
+hanoi(disks - 1, via, end, start)
+}
+}
+print(\"Towers of Hanoi, 4 disks\")
+hanoi(4, 1, 2, 3)
+", expected)
+}
+function test_decimal_and_boolean_text_conversion_widths(c: peer.Case) {
+    let values = [peer.MINIMUM, -9223372036854775807, -4294967297, -4294967296, -4294967295, -2147483649, -2147483648, -2147483647, -987654321, -1, 0, 1, 12, 123, 1234, 12345, 123456, 1234567, 12345678, 123456789, 1234567890, 2147483647, 2147483648, 2147483649, 4294967295, 4294967296, 4294967297, 12345678901, 123456789012, 1234567890123, 12345678901234, 123456789012345, 1125899906842624, 1234567890123456, 12345678901234567, 123456789012345678, 1234567890123456789, peer.MAXIMUM]
+    let source = ["function integerText(value: Integer) {
+let converted = Text(value)
+let prefixed = \"abc\" + converted
+print(converted)
+print(converted.length)
+print(converted.byteLength)
+print(prefixed)
+print(prefixed.length)
+}
+function booleanText(value: Boolean) {
+let converted = Text(value)
+let prefixed = \"foo \" + converted
+print(converted)
+print(converted.length)
+print(prefixed)
+print(prefixed.length)
+}
+"]
+    let expected: List<Text> = []
+    for value in values {
+        source.add("integerText(" + Text(value) + ")")
+        let text = peer.bigText(peer.big(value))
+        let length = Bytes(text).length
+        peer.extend(expected, [text, Text(length), Text(length), "abc" + text, Text(length + 3)])
+    }
+    for text in ["false", "true"] {
+        source.add("booleanText(" + text + ")")
+        let length = Bytes(text).length
+        peer.extend(expected, [text, Text(length), "foo " + text, Text(length + 4)])
+    }
+    peer.executes(c, peer.lines(source), peer.lines(expected))
+}
+function test_nested_text_record_returns_and_field_permutations(c: peer.Case) {
+    peer.executes(c, "record Pair { a: Text, b: Text }
+record Nested { x: Pair, y: Pair }
+function make(a: Text, b: Text, c: Text, d: Text): Nested {
+return Nested { x: Pair { a: a, b: b }, y: Pair { a: c, b: d } }
+}
+function makeReverse(d: Text, c: Text, b: Text, a: Text): Nested { return make(a, b, c, d) }
+function reverse(value: Nested): Nested {
+return make(value.y.b, value.y.a, value.x.b, value.x.a)
+}
+function join(value: Nested): Text { return value.x.a + \" \" + value.x.b + \" \" + value.y.a + \" \" + value.y.b }
+print(join(make(\"th\" + \"is\", \"i\" + \"s\", \"\" + \"a\", \"te\" + \"st\")))
+let original = makeReverse(\"th\" + \"is\", \"i\" + \"s\", \"\" + \"a\", \"te\" + \"st\")
+let reordered = reverse(original)
+print(join(reordered))
+print(join(original))
+original = make(\"gone\", \"gone\", \"gone\", \"gone\")
+print(join(reordered))
+record Words { a: Text, b: Text, c: Text }
+function words(a: Text, b: Text, c: Text): Words { return Words { a: a, b: b, c: c } }
+function sentence(value: Words): Text { return value.a + \" \" + value.b + \" \" + value.c }
+print(sentence(words(\"Ah\" + \"oy\", \"the\" + \"re,\", \"Ma\" + \"tey\")))
+", "this is a test\nthis is a test\ntest a is this\nthis is a test\nAhoy there, Matey\n")
+}
+function test_prime_filter_pipeline_with_owned_lists(c: peer.Case) {
+    let primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97]
+    peer.executes(c, "function filter(values: List<Integer>, divisor: Integer): List<Integer> {
+let result: List<Integer> = []
+let index = 0
+while index < values.length {
+if values[index] % divisor != 0 { result.add(values[index]) }
+index = index + 1
+}
+return result
+}
+let candidates: List<Integer> = []
+let value = 2
+while value < 100 { candidates.add(value); value = value + 1 }
+let primes: List<Integer> = []
+while candidates.length > 0 {
+let prime = candidates[0]
+primes.add(prime)
+candidates = filter(candidates, prime)
+}
+print(primes.length)
+let index = 0
+while index < primes.length { print(primes[index]); index = index + 1 }
+", "25\n" + peer.integers(primes))
+}
+function test_smooth_number_merge_suppresses_duplicate_candidates(c: peer.Case) {
+    let expected = [2, 3, 4, 5, 6, 8, 9, 10, 12, 15, 16, 18, 20, 24, 25, 27, 30, 32, 36, 40, 45, 48, 50, 54, 60, 64, 72, 75, 80, 81, 90, 96, 100, 108, 120, 125, 128, 135, 144, 150, 160, 162, 180, 192, 200, 216, 225, 240, 243, 250, 256, 270, 288, 300, 320, 324, 360, 375, 384, 400, 405, 432, 450, 480, 486, 500, 512, 540, 576, 600, 625, 640, 648, 675, 720, 729, 750, 768, 800, 810, 864, 900, 960, 972, 1000, 1024, 1080, 1125, 1152, 1200, 1215, 1250, 1280, 1296, 1350, 1440, 1458, 1500, 1536, 1600]
+    peer.executes(c, "let values: List<Integer> = [1]
+let two = 0
+let three = 0
+let five = 0
+let count = 0
+while count < 100 {
+let a = values[two] * 2
+let b = values[three] * 3
+let c = values[five] * 5
+let next = a
+if b < next { next = b }
+if c < next { next = c }
+values.add(next)
+print(next)
+if a == next { two = two + 1 }
+if b == next { three = three + 1 }
+if c == next { five = five + 1 }
+count = count + 1
+}
+", peer.integers(expected))
+}
+function test_returned_text_observes_alias_mutation_without_clobbering_local(c: peer.Case) {
+    let texts = ["OKAY! Aloha! Hello World! !!!!!!!!!!!!!!!", "Aloha! Hello Pal!", "OKAY! Aloha! Hello World!", "Aloha! Hello Pal!"]
+    let expected = ["1", "6", "27", "21"]
+    for text in texts { expected.add(Text(text.length)); expected.add(text) }
+    peer.executes(c, "function observe(value: Integer, state: List<Integer>) {
+state[0] = state[0] + value
+print(state[0])
+}
+function total(a: Integer, b: Integer, c: Integer, state: List<Integer>): Integer {
+let result = a
+observe(result, state)
+result = result + b
+observe(result, state)
+result = result + c
+observe(result, state)
+return result
+}
+function mutate(cell: List<Text>) { cell[0] = cell[0] + \" !!!!!!!!!!!!!!!\" }
+function shared(s: Text, t: Text, cell: List<Text>): Text {
+cell[0] = \"Aloha! \" + s + \" \" + t
+let prefix = \"\"
+if s.length <= t.length { prefix = \"OKAY! \"; mutate(cell) }
+return prefix + cell[0]
+}
+function separate(s: Text, t: Text, cell: List<Text>): Text {
+let result = \"Aloha! \" + s + \" \" + t
+let prefix = \"\"
+if s.length <= t.length { prefix = \"OKAY! \"; mutate(cell) }
+return prefix + result
+}
+function show(text: Text) { print(text.length); print(text) }
+let state: List<Integer> = [0]
+print(total(1, 4, 16, state))
+let cell: List<Text> = [\"\"]
+show(shared(\"Hello\", \"World!\", cell))
+show(shared(\"Hello\", \"Pal!\", cell))
+show(separate(\"Hello\", \"World!\", cell))
+show(separate(\"Hello\", \"Pal!\", cell))
+", peer.lines(expected))
+}
+function test_oversized_decimal_literals_reject_cleanly(c: peer.Case) {
+    for length in [512, 513, 9998, 9999] { peer.rejects(c, "let value = " + peer.repeat("9", length) + "\n", "Integer literal is outside the supported range") }
+}
+function test_record_initializers_evaluate_in_source_order(c: peer.Case) {
+    peer.executes(c, "record Fields { first: Integer, second: Integer, third: Integer }
+function next(expected: Integer, counter: List<Integer>): Integer {
+if counter[0] != expected { fail(\"initializer order changed\") }
+counter[0] = counter[0] + 1
+return counter[0]
+}
+function make(counter: List<Integer>): Fields {
+return Fields { first: next(0, counter), third: next(1, counter), second: next(2, counter) }
+}
+let counter: List<Integer> = [0]
+let fields = make(counter)
+print(fields.first)
+print(fields.second)
+print(fields.third)
+print(counter[0])
+", "1\n3\n2\n3\n")
+}
+function test_text_call_arguments_and_concatenations_keep_evaluation_order(c: peer.Case) {
+    peer.executes(c, "function next(index: Integer, counter: List<Integer>): Text {
+let lower = \"abcdefghi\"
+let upper = \"ABCDEFGHI\"
+let text = Text(lower[counter[0]]) + Text(upper[index - 1])
+counter[0] = counter[0] + 1
+return text
+}
+function join(left: Text, right: Text): Text { return left + right }
+let counter: List<Integer> = [0]
+let first = next(1, counter) + next(2, counter)
+let second = join(next(3, counter), next(4, counter))
+let third = next(5, counter) + next(6, counter) + next(7, counter) + next(8, counter) + next(9, counter)
+print(first)
+print(second)
+print(third)
+print(counter[0])
+", "aAbB\ncCdD\neEfFgGhHiI\n9\n")
+}
+function test_earlier_text_argument_survives_later_slot_replacement(c: peer.Case) {
+    peer.executes(c, "function dynamic(value: Integer): Text {
+let text = \"x\" + Text(value)
+return text.slice(1, text.length)
+}
+function rewrite(holder: List<Text>): Text {
+holder[0] = dynamic(22)
+return holder[0]
+}
+function churn() {
+let i = 0
+while i < 100 {
+let text = \"allocation-\" + Text(i)
+if text.length < 12 { fail(\"short allocation\") }
+i = i + 1
+}
+}
+function consume(first: Text, second: Text) {
+churn()
+print(first)
+print(second)
+}
+function replaceInside(first: Text, holder: List<Text>) {
+holder[0] = dynamic(22)
+churn()
+print(first)
+print(holder[0])
+}
+let holder: List<Text> = [dynamic(1)]
+consume(holder[0], rewrite(holder))
+print(holder[0])
+holder[0] = dynamic(1)
+replaceInside(holder[0], holder)
+print(holder[0])
+", "1\n22\n22\n1\n22\n22\n")
+}
+function test_incomplete_list_call_index_slice_and_grouping_prefixes(c: peer.Case) {
+    let numbers = "let a = 1\nlet b = 2\nlet c = 3\n"
+    let call = "function a(b: Integer, c: Integer, d: Integer): Integer { return b + c + d }\nlet b = 1\nlet c = 2\n"
+    let indexing = "let a: List<Integer> = [1, 2, 3]\nlet b = 0\n"
+    let slicing = "let a = \"abc\"\nlet b = 0\nlet c = 1\n"
+    for prefix in ["(", "(a", "[", "[a", "[a,", "[a,b", "[a,b,"] { peer.rejects(c, numbers + "let value = " + prefix, "Minyar stopped: line ") }
+    for prefix in ["a(", "a(b", "a(b,", "a(b,c", "a(b,c,"] { peer.rejects(c, call + "let value = " + prefix, "Minyar stopped: line ") }
+    for prefix in ["a[", "a[b"] { peer.rejects(c, indexing + "let value = " + prefix, "Minyar stopped: line ") }
+    for prefix in ["a.slice(b,", "a.slice(b,c"] { peer.rejects(c, slicing + "let value = " + prefix, "Minyar stopped: line ") }
+}
+function test_argument_bounds_failure_precedes_callee_entry(c: peer.Case) {
+    let declarations = "function first(value: Integer): Integer {
+print(\"entered\")
+return value + 1
+}
+function second(prefix: Integer, value: Integer): Integer {
+print(\"entered\")
+return prefix + value
+}
+let values: List<Integer> = []
+"
+    for call in ["first(values[0])", "second(1, values[0])"] {
+        peer.executesStatus(c, declarations + "print(" + call + ")\n", "", 1, "Minyar stopped: List position 0 is outside its length of 0.\n")
+    }
+}
+function test_loop_carried_swaps_preserve_both_previous_values(c: peer.Case) {
+    let source: List<Text> = []
+    let expected: List<Text> = []
+    let names = ["literal", "parameter"]
+    let bounds = ["3", "a"]
+    let counts = [3, 8]
+    for item in 0..2 {
+        let name = names[item]
+        source.add("function " + name + "(a: Integer, b: Integer): Integer {
+let i = a
+let j = b
+let sum = 0
+let c = 0
+while c < " + bounds[item] + " {
+print(i)
+sum = sum + i + j
+c = c + 1
+let previous = i
+i = j
+j = previous
+}
+print(i)
+print(j)
+return sum
+}
+print(" + name + "(8, 3))
+")
+        let total = counts[item]
+        for index in 0..total { if index % 2 == 0 { expected.add("8") } else { expected.add("3") } }
+        if total % 2 != 0 { peer.extend(expected, ["3", "8"]) } else { peer.extend(expected, ["8", "3"]) }
+        expected.add(Text(total * 11))
+    }
+    peer.executes(c, joinText(source), peer.lines(expected))
+}
+function test_doubled_integer_guards_keep_exact_large_results(c: peer.Case) {
+    peer.executes(c, "function multiply(a: Integer, b: Integer): Integer {
+a = a * 2
+b = b * 2
+if a < 1 && b < 1 { return a * b }
+return 0
+}
+function add(a: Integer, b: Integer): Integer {
+a = a * 2
+b = b * 2
+if a < 1 && b < 1 { return a + b }
+return 0
+}
+function subtract(a: Integer, b: Integer): Integer {
+a = a * 2
+b = b * 2
+if b == 2 { print(a); print(b) }
+if a < 1 && b < 3 { return a - b }
+return 0
+}
+let count = 0
+while count < 5 { print(multiply(0, 0)); count = count + 1 }
+print(multiply(-1073741824, -1073741824))
+count = 0
+while count < 5 { print(add(0, 0)); count = count + 1 }
+print(add(-1073741824, -1073741824))
+count = 0
+while count < 5 { print(subtract(0, 0)); count = count + 1 }
+print(subtract(-1073741824, 1))
+", peer.repeat("0\n", 5) + "4611686018427387904\n" + peer.repeat("0\n", 5) + "-4294967296\n" + peer.repeat("0\n", 5) + "-2147483648\n2\n-2147483650\n")
+}
+function test_loop_counter_boundaries_and_condition_side_effects(c: peer.Case) {
+    let expected = [1073741824, -1073741825, 1073741824, -1073741825, 1073741825, 1073741825, 1073741826, 42, 0, 1, 2, 3, 4, 120, 1, -1]
+    for value in 1..11 { expected.add(value) }
+    expected.add(6)
+    peer.executes(c, "function first(): Integer { let x = 1073741823; x = x + 1; return x }
+function second(): Integer { let x = -1073741824; x = x - 1; return x }
+function fourth(): Integer {
+let i = 1073741822
+while i <= 1073741823 { i = i + 1 }
+return i
+}
+function fifth(): Integer {
+let i = -1073741823
+while i >= -1073741824 { i = i - 1 }
+return i
+}
+function sixth(): Integer { let x = 1073741823; x = x + 1; return x + 1 }
+function seventh(): Integer {
+let i = 1073741821
+while i <= 1073741822 { i = i + 1 }
+i = i + 1
+i = i + 1
+return i
+}
+function eighth(): Integer {
+let i = 1073741821
+while i <= 1073741823 { i = i + 1 }
+i = i + 1
+i = i + 1
+return i
+}
+function ninth(): Integer {
+let i = 0
+while i < 42 { return 42 }
+return 0
+}
+function tenth(x: Integer): Integer {
+x = 0
+while x < 4 { print(x); x = x + 1 }
+return x
+}
+print(first())
+print(second())
+print(fourth())
+print(fifth())
+print(sixth())
+print(seventh())
+print(eighth())
+print(ninth())
+print(tenth(42))
+let n = 1
+let i = 1
+while (6 - i) != 0 { n = n * i; i = i + 1 }
+print(n)
+function decrement(cell: List<Integer>): Boolean { cell[0] = cell[0] - 1; return cell[0] >= 0 }
+let cell: List<Integer> = [42]
+i = 0
+while decrement(cell) { i = cell[0] + 1 }
+print(i)
+print(cell[0])
+function posttest(bound: Integer): Integer {
+let x = 1
+let count = 0
+if x >= 5 { count = count + 1 }
+print(x)
+while x < bound {
+x = x + 1
+if x >= 5 { count = count + 1 }
+print(x)
+}
+return count
+}
+print(posttest(10))
+", peer.integers(expected))
+}
+function previousSpaces(value: Text): List<Integer> {
+    let characters = peer.scalars(value)
+    let starts: List<Integer> = []
+    for index in 0..characters.length {
+        if characters[index] == " " && (index == 0 || characters[index - 1] != " ") { starts.add(index) }
+    }
+    let result: List<Integer> = []
+    for seek in 0..characters.length {
+        let best = 0
+        for start in starts { if start < seek && start > best { best = start } }
+        result.add(best)
+    }
+    return result
+}
+function test_previous_space_scanner_all_positions(c: peer.Case) {
+    let phrase = "I am the very model of a modern major general\n"
+    let text = peer.repeat(phrase, 100)
+    let extra = "ab   cd"
+    let source = "function previousSpace(text: Text, seek: Integer): Integer {
+seek = seek - 1
+while seek > 0 {
+if text[seek] == ' ' {
+while seek > 0 && text[seek - 1] == ' ' { seek = seek - 1 }
+return seek
+}
+seek = seek - 1
+}
+return 0
+}
+function scan(text: Text) {
+let seek = 0
+while seek < text.length { print(previousSpace(text, seek)); seek = seek + 1 }
+}
+let text = \"\"
+let repeat = 0
+"
+    source += "while repeat < 100 { text = text + " + peer.literal(phrase) + "; repeat = repeat + 1 }\n"
+    source += "scan(text)\nscan(" + peer.literal(extra) + ")\n"
+    peer.executes(c, source, peer.integers(previousSpaces(text)) + peer.integers(previousSpaces(extra)))
+}
+function test_repeated_sequential_list_shifts_preserve_alias_reads(c: peer.Case) {
+    let expected: List<Integer> = []
+    let state = [1, 2, 3, 4]
+    for unused in 0..4 {
+        for step in 0..80000 { state = [state[1], state[2], state[3], state[1]] }
+        for value in state { expected.add(value) }
+        expected.add(10000)
+    }
+    expected.add(0)
+    let shifts = peer.joined(peer.repeated(["values[0] = values[1]", "values[1] = values[2]", "values[2] = values[3]", "values[3] = values[0]"], 8), "\n")
+    let source = "function done(counter: List<Integer>): Boolean {
+counter[0] = counter[0] - 1
+return counter[0] > 0
+}
+let values: List<Integer> = [1, 2, 3, 4]
+let counter: List<Integer> = [5]
+while done(counter) {
+let i = 0
+while i < 10000 {
+" + shifts + "
+i = i + 1
+}
+print(values[0])
+print(values[1])
+print(values[2])
+print(values[3])
+print(i)
+}
+print(counter[0])
+"
+    peer.executes(c, source, peer.integers(expected))
+}
+function test_buffered_and_large_file_writes_report_device_failure(c: peer.Case) {
+    if !peer.linux() { peer.skip(c, "/dev/full transport check requires Linux"); return }
+    let device = peer.runChecked(c, ["/usr/bin/stat", "-L", "-c", "%F %t %T", "/dev/full"], "device-stat", 10)
+    peer.equal(c, device.output, "character special file 1 7\n", "/dev/full device identity")
+    for length in [1, 65536] {
+        let source = "let text = \"x\"\nwhile text.byteLength < " + Text(length) + " { text = text + text }\nprint(\"before\")\nwriteTextFile(\"/dev/full\", text)\nprint(\"unexpected success\")\n"
+        peer.executesStatus(c, source, "before\n", 1, "Minyar stopped: a requested text file could not be written.\n")
+    }
+}
+function test_iteration_rechecks_list_length_after_append(c: peer.Case) {
+    peer.executes(c, "let values: List<Integer> = [1, 2, 3, 4, 5]
+let index = 0
+while index < values.length {
+let value = values[index]
+print(value)
+if value % 2 == 0 { values.add(value + 5) }
+index = index + 1
+}
+print(values.length)
+let zeros: List<Integer> = [2]
+index = 0
+while index < zeros.length {
+let value = zeros[index]
+print(value)
+let count = 0
+while count < value { zeros.add(0); count = count + 1 }
+index = index + 1
+}
+print(zeros.length)
+", "1\n2\n3\n4\n5\n7\n9\n7\n2\n0\n0\n3\n")
+}
+function test_wide_record_construction_preserves_every_field(c: peer.Case) {
+    let fields: List<Text> = []
+    let values: List<Text> = []
+    for index in 1..258 { fields.add("foo" + Text(index) + ": Integer"); values.add("foo" + Text(index) + ": " + Text(index)) }
+    let source = ["record Wide { " + peer.joined(fields, ", ") + " }", "function construct(): Wide { return Wide { " + peer.joined(values, ", ") + " } }", "function forward(): Wide { return construct() }", "let first = forward()", "let second = forward()", "let third = forward()", "let direct = construct()"]
+    for name in ["first", "second", "third", "direct"] { for index in 1..258 { source.add("print(" + name + ".foo" + Text(index) + ")") } }
+    peer.executes(c, peer.lines(source), peer.repeat(peer.integers(peer.range(1, 258)), 4))
+}
+function test_every_contiguous_source_substring(c: peer.Case) {
+    let program = "let x = 1\nprint(x)\n"
+    let characters = peer.scalars(program)
+    let domain = peer.jsonObject()
+    peer.put(domain, "source", peer.jsonText(program))
+    peer.put(domain, "rule", peer.jsonText("all 0 <= begin <= end <= length, including empty spans"))
+    peer.put(domain, "count", peer.jsonInteger((characters.length + 1) * (characters.length + 2) / 2))
+    peer.control(c, "substring_domain", domain)
+    for begin in 0..(characters.length + 1) {
+        for end in begin..(characters.length + 1) {
+            let compiled = peer.compile(c, scalarSlice(program, begin, end))
+            let result = compiled.result
+            let label = "substring " + Text(begin) + ".." + Text(end)
+            peer.expect(c, result.status == 0 || result.status == 1, label + " status " + Text(result.status) + "\n" + result.errorOutput)
+            peer.expect(c, result.output == "", label + " wrote standard output")
+            if result.status == 0 {
+                peer.expect(c, result.errorOutput == "", label + " wrote diagnostics")
+                peer.expect(c, files.pathSize(compiled.llvm) >= 0, label + " emitted no LLVM")
+            } else {
+                peer.expect(c, peer.starts(result.errorOutput, "Minyar stopped:"), label + " diagnostic\n" + result.errorOutput)
+                peer.expect(c, !peer.contains(result.errorOutput, "List position"), label + " List-position failure")
+                peer.expect(c, !peer.contains(result.errorOutput, "outside the supported range"), label + " range failure")
+                peer.expect(c, files.pathSize(compiled.llvm) < 0, label + " left LLVM")
+            }
+        }
+    }
+}
+function test_arithmetic_grouping_and_invalid_assignment_targets(c: peer.Case) {
+    peer.executes(c, "function grouping(a: Integer, b: Integer, c: Integer) {
+print(a / (b / c))
+print((a / b) / c)
+print(a / b / c)
+}
+grouping(16, 4, 2)
+print(16 / (4 / 2))
+print((16 / 4) / 2)
+print(16 / 4 / 2)
+print(-1*1/1 + 1*1 - ---1*1)
+", "8\n2\n2\n8\n2\n2\n1\n")
+    for assignment in ["x + 1 = 1", "x + 1 = y + 2"] { peer.rejects(c, "let x = 1\nlet y = 2\n" + assignment + "\n", "Minyar stopped:") }
+}
+function test_wide_products_and_square_overflow_boundary(c: peer.Case) {
+    peer.executes(c, "function product(a: Integer, b: Integer): Integer { return a * b }
+print(product(4608, 1024) * 1024)
+print(product(3037000499, 3037000499))
+print(product(-3037000499, 3037000499))
+", "4831838208\n9223372030926249001\n-9223372030926249001\n")
+    for pair in [[3037000500, 3037000500], [-3037000500, 3037000500], [4831838208, 4831838208], [peer.MINIMUM, 7]] {
+        peer.executesStatus(c, "function product(a: Integer, b: Integer): Integer { return a * b }\nprint(product(" + Text(pair[0]) + ", " + Text(pair[1]) + "))\n", "", 1, peer.OVERFLOW)
+    }
+}
+function test_subtraction_table_and_mutation_order(c: peer.Case) {
+    let values = [-4275878552, -4275878551, -4660, -3, -2, -1, 0, 1, 2, 3, 4660, 4275878551, 4275878552]
+    let source = ["function subtract(a: Integer, b: Integer): Integer { return a - b }", "function add(a: Integer, b: Integer): Integer { return a + b }", "function divide(a: Integer, b: Integer): Integer { return a / b }", "function remainder(a: Integer, b: Integer): Integer { return a % b }", "function multiply(a: Integer, b: Integer): Integer { return a * b }"]
+    let expected: List<Text> = []
+    let overflowLeft: List<Integer> = []
+    let overflowRight: List<Integer> = []
+    for a in values {
+        for b in values {
+            let x = Text(a)
+            let y = Text(b)
+            peer.extend(source, ["print(subtract(" + x + ", " + y + "))", "print(" + x + " - " + y + ")", "print(add(" + x + ", " + y + "))", "print(" + x + " + " + y + ")"])
+            let difference = peer.bigText(peer.bigSubtract(peer.big(a), peer.big(b)))
+            let sum = peer.bigText(peer.bigAdd(peer.big(a), peer.big(b)))
+            peer.extend(expected, [difference, difference, sum, sum])
+            if b != 0 {
+                let result = peer.division(a, b)
+                peer.extend(source, ["print(divide(" + x + ", " + y + "))", "print(" + x + " / " + y + ")"])
+                peer.extend(expected, [Text(result.quotient), Text(result.quotient)])
+                peer.extend(source, ["print(remainder(" + x + ", " + y + "))", "print(" + x + " % " + y + ")"])
+                peer.extend(expected, [Text(result.remainder), Text(result.remainder)])
+            }
+            if peer.productFits(a, b) {
+                peer.extend(source, ["print(multiply(" + x + ", " + y + "))", "print(" + x + " * " + y + ")"])
+                let product = peer.bigText(peer.product(a, b))
+                peer.extend(expected, [product, product])
+            } else { overflowLeft.add(a); overflowRight.add(b) }
+        }
+    }
+    let pairs = [[4923, 2], [1342177, 800], [65536, 65536]]
+    for index in 0..3 {
+        let a = Text(pairs[index][0])
+        let b = Text(pairs[index][1])
+        peer.extend(source, ["let a" + Text(index) + " = " + a, "let b" + Text(index) + " = " + b, "print(" + a + " * " + b + ")", "print(a" + Text(index) + " * b" + Text(index) + ")", "print(multiply(" + a + ", " + b + "))"])
+        let product = peer.bigText(peer.product(pairs[index][0], pairs[index][1]))
+        peer.extend(expected, [product, product, product])
+    }
+    peer.extend(source, ["function change(values: List<Integer>): Integer { values[0] = 1; return 1 }", "function changeTwo(values: List<Integer>): Integer { values[0] = 2; return 2 }",
+        "let values = [0]", "print(change(values) - values[0])",
+        "values[0] = 0", "print(values[0] - change(values))",
+        "values[0] = 0", "print(change(values) + values[0])",
+        "values[0] = 0", "print(values[0] + change(values))",
+        "values[0] = 0", "print(change(values) % values[0])",
+        "values[0] = 1", "print(values[0] % changeTwo(values))",
+        "values[0] = 0", "print(change(values) * values[0])",
+        "values[0] = 0", "print(values[0] * change(values))",
+        "values[0] = 0", "print(change(values) / values[0])",
+        "values[0] = 1", "print(values[0] / changeTwo(values))",
+        "values[0] = 0", "print(values[0] / change(values))"])
+    peer.extend(expected, ["0", "-1", "2", "1", "0", "1", "1", "0", "1", "0", "0"])
+    for pair in [[101, 51], [101, -51], [-101, 51], [-101, -51]] {
+        peer.extend(source, ["print(remainder(" + Text(pair[0]) + ", " + Text(pair[1]) + "))", "print(" + Text(pair[0]) + " % " + Text(pair[1]) + ")"])
+        let value = "-50"
+        if pair[0] > 0 { value = "50" }
+        peer.extend(expected, [value, value])
+    }
+    peer.executes(c, peer.lines(source), peer.lines(expected))
+    let overflow = ["function multiply(a: Integer, b: Integer): Integer { return a * b }", "let choice = argument(0)"]
+    let choices: List<Text> = []
+    let rows: List<json.Value> = []
+    for index in 0..overflowLeft.length {
+        let a = Text(overflowLeft[index])
+        let b = Text(overflowRight[index])
+        rows.add(peer.jsonIntegers([overflowLeft[index], overflowRight[index]]))
+        let kinds = ["literal", "parameter"]
+        let expressions = [a + " * " + b, "multiply(" + a + ", " + b + ")"]
+        for kind in 0..2 {
+            let choice = Text(index) + "-" + kinds[kind]
+            choices.add(choice)
+            overflow.add("if choice == \"" + choice + "\" { print(" + expressions[kind] + ") }")
+        }
+    }
+    overflow.add("print(\"ready\")")
+    let base = peer.executesWith(c, peer.lines(overflow), "ready\n", 0, "", ["probe"])
+    peer.control(c, "multiplication_overflow_pairs", peer.jsonArray(rows))
+    for optimization in c.variants {
+        for choice in choices {
+            peer.observe(c, peer.run(c, [peer.executable(base, optimization), choice], "execute-multiplication-overflow", 10), 1, "", peer.OVERFLOW, choice + " at " + optimization)
+        }
+    }
+}
+function test_loop_exit_zero_is_not_used_as_divisor(c: peer.Case) {
+    let total = 0
+    let divisor = 50
+    while divisor > 0 {
+        let result = peer.division(20, divisor)
+        total += result.quotient + result.remainder
+        divisor -= 2
+    }
+    peer.executes(c, "function calculate(start: Integer): Integer {
+let divisor = start
+let total = 0
+while divisor > 0 {
+total = total + 20 / divisor + 20 % divisor
+divisor = divisor - 2
+}
+return total
+}
+print(calculate(50))
+print(calculate(0))
+", Text(total) + "\n0\n")
+}
+function test_negative_remainder_remains_invalid_list_index(c: peer.Case) {
+    for divisor in [999, 1000, 1001] {
+        peer.executesStatus(c, "function access(value: Integer) { let values: List<Integer> = []; let index = 0; while index < 1000 { values.add(index); index = index + 1 }; print(values[value % " + Text(divisor) + "]) }\naccess(-1)\n", "", 1, "Minyar stopped: List position -1 is outside its length of 1000.\n")
+    }
+}
+function test_repeated_old_value_concatenation_and_unaligned_views(c: peer.Case) {
+    let value = ""
+    for unused in 0..3 { value = "a" + value + "b" + value + "c" }
+    let payload = peer.repeat("0123456789é🙂", 100)
+    peer.executes(c, "let text = \"\"\nlet index = 0\nwhile index < 3 { text = \"a\" + text + \"b\" + text + \"c\"; index = index + 1 }\nprint(text)\n" + "let root = \"12345\" + " + peer.literal(payload) + "\n" + "let view = root.slice(5, root.length)\nroot = \"gone\"\n" + "print(view == " + peer.literal(payload) + ")\n", value + "\ntrue\n")
+}
+function test_lto_preserves_checked_arithmetic_and_list_aliases(c: peer.Case) {
+    if !peer.extended() { peer.skip(c, "extended LTO lane"); return }
+    let flags = peer.ltoFlags()
+    let sources = ["function calculate(x: Integer): Integer { return (x + 13) - 7 }\nprint(calculate(9223372036854775797))\n", "function change(write: List<Integer>, read: List<Integer>): Integer {
+write[0] = 42
+return read[0]
+}
+let values = [1]
+print(change(values, values))
+"]
+    let outputs = ["", "42\n"]
+    let statuses = [1, 0]
+    let errors = [peer.OVERFLOW, ""]
+    for index in 0..2 {
+        let compiled = peer.compiles(c, sources[index])
+        let program = compiled.base + ".lto"
+        let command = [c.compiler.clang, "-O2"]
+        peer.extend(command, flags)
+        peer.extend(command, ["-DMINYAR_SYSTEM_HEAP=1", "-Wno-override-module", compiled.llvm, c.suite.root + "/runtime/minyar_runtime.c", "-o", program, "-lm"])
+        let linked = peer.run(c, command, "link-lto", 60)
+        peer.expect(c, linked.status == 0, "LTO link failed\n" + linked.errorOutput)
+        peer.observe(c, peer.run(c, [program], "execute-lto", 10), statuses[index], outputs[index], errors[index], "LTO execution")
+    }
+}
+function test_mixed_width_boundary_views_survive_nonsequential_access(c: peer.Case) {
+    let scalars = peer.codepoints([0, 0x7f, 0x80, 0x7ff, 0x800, 0xd7ff, 0xe000, 0xffff, 0x10000, 0x10ffff])
+    let value = peer.repeat(scalars, 14) + "e" + peer.character(0x301) + "🙂"
+    let characters = peer.scalars(value)
+    let source = ["let text = " + peer.literal(value) + " + \"\"", "let parts: List<Text> = []"]
+    let expected: List<Text> = []
+    let indices = peer.range(0, characters.length)
+    peer.shuffle(random.seeded("1346717010"), indices)
+    for index in indices {
+        source.add("print(text[" + Text(index) + "] == " + peer.literal(characters[index]) + "[0])")
+        expected.add("true")
+    }
+    peer.extend(source, ["let index = 0", "while index < text.length {", "parts.add(text.slice(index, index + 1))", "index = index + 1", "}", "print(joinText(parts) == text)", "let view = text.slice(61, 132).slice(2, 68)", "text = \"released root binding\"", "print(view == " + peer.literal(scalarSlice(value, 63, 129)) + ")", "print(view.length)"])
+    peer.extend(expected, ["true", "true", "66"])
+    peer.executes(c, peer.lines(source), peer.lines(expected))
+}
+function test_self_join_keeps_old_alias_across_growth(c: peer.Case) {
+    let value = "A" + peer.character(0) + "é🙂"
+    let source = ["let text = " + peer.literal(value) + " + \"\""]
+    let expected: List<Text> = []
+    for index in 0..8 {
+        peer.extend(source, ["let old" + Text(index) + " = text", "text = text + text", "print(old" + Text(index) + " == " + peer.literal(value) + ")", "print(text == " + peer.literal(value + value) + ")"])
+        peer.extend(expected, ["true", "true"])
+        value += value
+    }
+    peer.executes(c, peer.lines(source), peer.lines(expected))
+}
+
+let names = ["test_index_assignment_ignores_brackets_inside_literals", "test_final_statement_without_newline_and_incomplete_input", "test_wide_argument_positions_survive_register_stack_boundary", "test_associative_products_preserve_checked_intermediates", "test_intermediate_overflow_cannot_be_reassociated_away", "test_unused_dynamic_arithmetic_must_still_trap", "test_unreachable_traps_and_safe_neighbors", "test_huge_indices_fail_before_scaled_address_or_reference_update", "test_module_alias_reload_after_calls_and_loops", "test_terminal_operand_stops_later_effects", "test_dead_boolean_operands_still_require_valid_names", "test_integer_equality_keeps_all_64_bits", "test_unused_bounds_check_and_reversed_slice_still_fail", "test_selected_record_survives_reassignment_of_both_sources", "test_trailing_boolean_constant_preserves_prior_effects", "test_division_record_result_and_multiply_boundary", "test_scalar_record_fields_feed_required_division_check", "test_malformed_radix_like_literals_do_not_accept_valid_prefix", "test_invalid_source_bytes_are_not_hidden_by_comments_or_eof", "test_algebraic_simplification_preserves_inner_overflow", "test_signed_division_remainder_and_operand_placement_grid", "test_negation_literal_and_parameter_paths", "test_thirty_distinct_program_arguments", "test_large_unicode_nul_file_roundtrip", "test_unicode_composition_vectors_indices_slices_and_files", "test_text_equality_compares_bytes_after_nul", "test_identical_mutable_constructor_calls_remain_independent", "test_long_record_fields_and_late_diagnostic_line", "test_boolean_tree_values_and_short_circuit_trace", "test_character_integer_arithmetic_never_coerces", "test_record_operators_initializers_and_boolean_indexing_reject", "test_file_paths_reject_embedded_nul_without_touching_prefix", "test_malformed_utf8_file_corpus", "test_utf8_lead_continuation_and_endpoint_vectors", "test_unicode_width_compositions_and_cached_append_queries", "test_signed_comparisons_preserve_boolean_values", "test_signed64_arithmetic_runtime_matrix", "test_ascii_identifier_policy_rejects_confusables", "test_character_literal_requires_one_scalar", "test_logical_not_types_values_and_whitespace", "test_power_of_two_neighbor_cancellation", "test_full_int32_constant_divisor_domain", "test_long_near_identical_identifiers", "test_ignored_call_result_preserves_live_argument", "test_repeated_and_shifted_call_arguments", "test_loop_sentinels_nested_state_and_dead_inner_loop", "test_owned_condition_temporaries_include_final_false_check", "test_euclidean_gcd_and_lcm_integer_workloads", "test_discarded_owned_results_and_temporary_record_arguments", "test_changing_index_short_circuit_loop_and_blank_output", "test_induction_indexed_division_and_remainder_cancellation", "test_descending_list_shift_pretested_and_posttested_loops", "test_parameterized_nested_list_dimensions_and_cells", "test_nested_branch_keeps_text_live_across_join", "test_fresh_allocation_is_consumed_and_dropped_each_iteration", "test_alternating_retained_and_discarded_large_allocations", "test_record_returns_recursive_results_and_argument_permutations", "test_integer_power_algorithms", "test_recursive_hanoi_argument_permutation_trace", "test_decimal_and_boolean_text_conversion_widths", "test_nested_text_record_returns_and_field_permutations", "test_prime_filter_pipeline_with_owned_lists", "test_smooth_number_merge_suppresses_duplicate_candidates", "test_returned_text_observes_alias_mutation_without_clobbering_local", "test_oversized_decimal_literals_reject_cleanly", "test_record_initializers_evaluate_in_source_order", "test_text_call_arguments_and_concatenations_keep_evaluation_order", "test_earlier_text_argument_survives_later_slot_replacement", "test_incomplete_list_call_index_slice_and_grouping_prefixes", "test_argument_bounds_failure_precedes_callee_entry", "test_loop_carried_swaps_preserve_both_previous_values", "test_doubled_integer_guards_keep_exact_large_results", "test_loop_counter_boundaries_and_condition_side_effects", "test_previous_space_scanner_all_positions", "test_repeated_sequential_list_shifts_preserve_alias_reads", "test_buffered_and_large_file_writes_report_device_failure", "test_iteration_rechecks_list_length_after_append", "test_wide_record_construction_preserves_every_field", "test_every_contiguous_source_substring", "test_arithmetic_grouping_and_invalid_assignment_targets", "test_wide_products_and_square_overflow_boundary", "test_subtraction_table_and_mutation_order", "test_loop_exit_zero_is_not_used_as_divisor", "test_negative_remainder_remains_invalid_list_index", "test_repeated_old_value_concatenation_and_unaligned_views", "test_lto_preserves_checked_arithmetic_and_list_aliases", "test_mixed_width_boundary_views_survive_nonsequential_access", "test_self_join_keeps_old_alias_across_growth"]
+let c = peer.begin(peer.suite("PeerRegressions", "tests/peer-regressions.min", names))
+if c.name == "test_index_assignment_ignores_brackets_inside_literals" { test_index_assignment_ignores_brackets_inside_literals(c) }
+if c.name == "test_final_statement_without_newline_and_incomplete_input" { test_final_statement_without_newline_and_incomplete_input(c) }
+if c.name == "test_wide_argument_positions_survive_register_stack_boundary" { test_wide_argument_positions_survive_register_stack_boundary(c) }
+if c.name == "test_associative_products_preserve_checked_intermediates" { test_associative_products_preserve_checked_intermediates(c) }
+if c.name == "test_intermediate_overflow_cannot_be_reassociated_away" { test_intermediate_overflow_cannot_be_reassociated_away(c) }
+if c.name == "test_unused_dynamic_arithmetic_must_still_trap" { test_unused_dynamic_arithmetic_must_still_trap(c) }
+if c.name == "test_unreachable_traps_and_safe_neighbors" { test_unreachable_traps_and_safe_neighbors(c) }
+if c.name == "test_huge_indices_fail_before_scaled_address_or_reference_update" { test_huge_indices_fail_before_scaled_address_or_reference_update(c) }
+if c.name == "test_module_alias_reload_after_calls_and_loops" { test_module_alias_reload_after_calls_and_loops(c) }
+if c.name == "test_terminal_operand_stops_later_effects" { test_terminal_operand_stops_later_effects(c) }
+if c.name == "test_dead_boolean_operands_still_require_valid_names" { test_dead_boolean_operands_still_require_valid_names(c) }
+if c.name == "test_integer_equality_keeps_all_64_bits" { test_integer_equality_keeps_all_64_bits(c) }
+if c.name == "test_unused_bounds_check_and_reversed_slice_still_fail" { test_unused_bounds_check_and_reversed_slice_still_fail(c) }
+if c.name == "test_selected_record_survives_reassignment_of_both_sources" { test_selected_record_survives_reassignment_of_both_sources(c) }
+if c.name == "test_trailing_boolean_constant_preserves_prior_effects" { test_trailing_boolean_constant_preserves_prior_effects(c) }
+if c.name == "test_division_record_result_and_multiply_boundary" { test_division_record_result_and_multiply_boundary(c) }
+if c.name == "test_scalar_record_fields_feed_required_division_check" { test_scalar_record_fields_feed_required_division_check(c) }
+if c.name == "test_malformed_radix_like_literals_do_not_accept_valid_prefix" { test_malformed_radix_like_literals_do_not_accept_valid_prefix(c) }
+if c.name == "test_invalid_source_bytes_are_not_hidden_by_comments_or_eof" { test_invalid_source_bytes_are_not_hidden_by_comments_or_eof(c) }
+if c.name == "test_algebraic_simplification_preserves_inner_overflow" { test_algebraic_simplification_preserves_inner_overflow(c) }
+if c.name == "test_signed_division_remainder_and_operand_placement_grid" { test_signed_division_remainder_and_operand_placement_grid(c) }
+if c.name == "test_negation_literal_and_parameter_paths" { test_negation_literal_and_parameter_paths(c) }
+if c.name == "test_thirty_distinct_program_arguments" { test_thirty_distinct_program_arguments(c) }
+if c.name == "test_large_unicode_nul_file_roundtrip" { test_large_unicode_nul_file_roundtrip(c) }
+if c.name == "test_unicode_composition_vectors_indices_slices_and_files" { test_unicode_composition_vectors_indices_slices_and_files(c) }
+if c.name == "test_text_equality_compares_bytes_after_nul" { test_text_equality_compares_bytes_after_nul(c) }
+if c.name == "test_identical_mutable_constructor_calls_remain_independent" { test_identical_mutable_constructor_calls_remain_independent(c) }
+if c.name == "test_long_record_fields_and_late_diagnostic_line" { test_long_record_fields_and_late_diagnostic_line(c) }
+if c.name == "test_boolean_tree_values_and_short_circuit_trace" { test_boolean_tree_values_and_short_circuit_trace(c) }
+if c.name == "test_character_integer_arithmetic_never_coerces" { test_character_integer_arithmetic_never_coerces(c) }
+if c.name == "test_record_operators_initializers_and_boolean_indexing_reject" { test_record_operators_initializers_and_boolean_indexing_reject(c) }
+if c.name == "test_file_paths_reject_embedded_nul_without_touching_prefix" { test_file_paths_reject_embedded_nul_without_touching_prefix(c) }
+if c.name == "test_malformed_utf8_file_corpus" { test_malformed_utf8_file_corpus(c) }
+if c.name == "test_utf8_lead_continuation_and_endpoint_vectors" { test_utf8_lead_continuation_and_endpoint_vectors(c) }
+if c.name == "test_unicode_width_compositions_and_cached_append_queries" { test_unicode_width_compositions_and_cached_append_queries(c) }
+if c.name == "test_signed_comparisons_preserve_boolean_values" { test_signed_comparisons_preserve_boolean_values(c) }
+if c.name == "test_signed64_arithmetic_runtime_matrix" { test_signed64_arithmetic_runtime_matrix(c) }
+if c.name == "test_ascii_identifier_policy_rejects_confusables" { test_ascii_identifier_policy_rejects_confusables(c) }
+if c.name == "test_character_literal_requires_one_scalar" { test_character_literal_requires_one_scalar(c) }
+if c.name == "test_logical_not_types_values_and_whitespace" { test_logical_not_types_values_and_whitespace(c) }
+if c.name == "test_power_of_two_neighbor_cancellation" { test_power_of_two_neighbor_cancellation(c) }
+if c.name == "test_full_int32_constant_divisor_domain" { test_full_int32_constant_divisor_domain(c) }
+if c.name == "test_long_near_identical_identifiers" { test_long_near_identical_identifiers(c) }
+if c.name == "test_ignored_call_result_preserves_live_argument" { test_ignored_call_result_preserves_live_argument(c) }
+if c.name == "test_repeated_and_shifted_call_arguments" { test_repeated_and_shifted_call_arguments(c) }
+if c.name == "test_loop_sentinels_nested_state_and_dead_inner_loop" { test_loop_sentinels_nested_state_and_dead_inner_loop(c) }
+if c.name == "test_owned_condition_temporaries_include_final_false_check" { test_owned_condition_temporaries_include_final_false_check(c) }
+if c.name == "test_euclidean_gcd_and_lcm_integer_workloads" { test_euclidean_gcd_and_lcm_integer_workloads(c) }
+if c.name == "test_discarded_owned_results_and_temporary_record_arguments" { test_discarded_owned_results_and_temporary_record_arguments(c) }
+if c.name == "test_changing_index_short_circuit_loop_and_blank_output" { test_changing_index_short_circuit_loop_and_blank_output(c) }
+if c.name == "test_induction_indexed_division_and_remainder_cancellation" { test_induction_indexed_division_and_remainder_cancellation(c) }
+if c.name == "test_descending_list_shift_pretested_and_posttested_loops" { test_descending_list_shift_pretested_and_posttested_loops(c) }
+if c.name == "test_parameterized_nested_list_dimensions_and_cells" { test_parameterized_nested_list_dimensions_and_cells(c) }
+if c.name == "test_nested_branch_keeps_text_live_across_join" { test_nested_branch_keeps_text_live_across_join(c) }
+if c.name == "test_fresh_allocation_is_consumed_and_dropped_each_iteration" { test_fresh_allocation_is_consumed_and_dropped_each_iteration(c) }
+if c.name == "test_alternating_retained_and_discarded_large_allocations" { test_alternating_retained_and_discarded_large_allocations(c) }
+if c.name == "test_record_returns_recursive_results_and_argument_permutations" { test_record_returns_recursive_results_and_argument_permutations(c) }
+if c.name == "test_integer_power_algorithms" { test_integer_power_algorithms(c) }
+if c.name == "test_recursive_hanoi_argument_permutation_trace" { test_recursive_hanoi_argument_permutation_trace(c) }
+if c.name == "test_decimal_and_boolean_text_conversion_widths" { test_decimal_and_boolean_text_conversion_widths(c) }
+if c.name == "test_nested_text_record_returns_and_field_permutations" { test_nested_text_record_returns_and_field_permutations(c) }
+if c.name == "test_prime_filter_pipeline_with_owned_lists" { test_prime_filter_pipeline_with_owned_lists(c) }
+if c.name == "test_smooth_number_merge_suppresses_duplicate_candidates" { test_smooth_number_merge_suppresses_duplicate_candidates(c) }
+if c.name == "test_returned_text_observes_alias_mutation_without_clobbering_local" { test_returned_text_observes_alias_mutation_without_clobbering_local(c) }
+if c.name == "test_oversized_decimal_literals_reject_cleanly" { test_oversized_decimal_literals_reject_cleanly(c) }
+if c.name == "test_record_initializers_evaluate_in_source_order" { test_record_initializers_evaluate_in_source_order(c) }
+if c.name == "test_text_call_arguments_and_concatenations_keep_evaluation_order" { test_text_call_arguments_and_concatenations_keep_evaluation_order(c) }
+if c.name == "test_earlier_text_argument_survives_later_slot_replacement" { test_earlier_text_argument_survives_later_slot_replacement(c) }
+if c.name == "test_incomplete_list_call_index_slice_and_grouping_prefixes" { test_incomplete_list_call_index_slice_and_grouping_prefixes(c) }
+if c.name == "test_argument_bounds_failure_precedes_callee_entry" { test_argument_bounds_failure_precedes_callee_entry(c) }
+if c.name == "test_loop_carried_swaps_preserve_both_previous_values" { test_loop_carried_swaps_preserve_both_previous_values(c) }
+if c.name == "test_doubled_integer_guards_keep_exact_large_results" { test_doubled_integer_guards_keep_exact_large_results(c) }
+if c.name == "test_loop_counter_boundaries_and_condition_side_effects" { test_loop_counter_boundaries_and_condition_side_effects(c) }
+if c.name == "test_previous_space_scanner_all_positions" { test_previous_space_scanner_all_positions(c) }
+if c.name == "test_repeated_sequential_list_shifts_preserve_alias_reads" { test_repeated_sequential_list_shifts_preserve_alias_reads(c) }
+if c.name == "test_buffered_and_large_file_writes_report_device_failure" { test_buffered_and_large_file_writes_report_device_failure(c) }
+if c.name == "test_iteration_rechecks_list_length_after_append" { test_iteration_rechecks_list_length_after_append(c) }
+if c.name == "test_wide_record_construction_preserves_every_field" { test_wide_record_construction_preserves_every_field(c) }
+if c.name == "test_every_contiguous_source_substring" { test_every_contiguous_source_substring(c) }
+if c.name == "test_arithmetic_grouping_and_invalid_assignment_targets" { test_arithmetic_grouping_and_invalid_assignment_targets(c) }
+if c.name == "test_wide_products_and_square_overflow_boundary" { test_wide_products_and_square_overflow_boundary(c) }
+if c.name == "test_subtraction_table_and_mutation_order" { test_subtraction_table_and_mutation_order(c) }
+if c.name == "test_loop_exit_zero_is_not_used_as_divisor" { test_loop_exit_zero_is_not_used_as_divisor(c) }
+if c.name == "test_negative_remainder_remains_invalid_list_index" { test_negative_remainder_remains_invalid_list_index(c) }
+if c.name == "test_repeated_old_value_concatenation_and_unaligned_views" { test_repeated_old_value_concatenation_and_unaligned_views(c) }
+if c.name == "test_lto_preserves_checked_arithmetic_and_list_aliases" { test_lto_preserves_checked_arithmetic_and_list_aliases(c) }
+if c.name == "test_mixed_width_boundary_views_survive_nonsequential_access" { test_mixed_width_boundary_views_survive_nonsequential_access(c) }
+if c.name == "test_self_join_keeps_old_alias_across_growth" { test_self_join_keeps_old_alias_across_growth(c) }
+peer.finish(c)

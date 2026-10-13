@@ -1497,12 +1497,18 @@ class BuildWiring(unittest.TestCase):
                 'build/minyar-default-runtime.o', 'build/minyar-module-build',
                 'build/minyarc-errors-request', 'build/minyar-runtime.o',
                 'build/minyarc-sanitize', 'build/minyar-runtime-sanitize.o',
-                'build/ownership-runtime.o', 'build/tooling/tests/suite-catalogue')
+                'build/ownership-runtime.o', 'build/tooling/tests/suite-catalogue',
+                'build/testing/cycle-runtime.o', 'runtime/native/sha256.c',
+                'build/tooling/tests/peer-manifest', 'build/tooling/tools/check-peer-audit',
+                'build/tooling/tests/peer-audit-harness', 'build/tooling/tests/peer-go-domains',
+                'build/tooling/tests/peer-zig-domains', 'build/tooling/tests/peer-regressions',
+                'build/tooling/tests/peer-cpp-java-js', 'build/tooling/tests/peer-rust-go-zig',
+                'build/tooling/tests/peer-python-swift-ruby-lua')
             makefile.write_text(
                 'include ' + str(ROOT / 'build-support/peer-tests.mk').replace(' ', '\\ ') + '\n'
                 '.PHONY: ' + ' '.join(targets) + '\n' +
                 ' '.join(targets) + ':\n\t@echo ARTIFACT $@\n')
-            for suite in ('tests/peer-rust-go-zig.py', 'tests/peer-regressions.py'):
+            for suite in ('tests/peer-rust-go-zig.py', 'tests/peer-regressions.min'):
                 for gate in ('check-peer-regressions', 'check-peer-optimizations',
                              'check-peer-sanitize', 'check-peer-ownership'):
                     with self.subTest(suite=suite, gate=gate):
