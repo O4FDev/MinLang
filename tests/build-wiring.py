@@ -2209,6 +2209,7 @@ class BuildWiring(unittest.TestCase):
             directory = Path(temporary)
             binaries = directory / 'bin'
             binaries.mkdir()
+            (directory / 'tools').symlink_to(ROOT / 'tools')
             python = binaries / 'python3'
             python.write_text('#!' + sys.executable + '\n' +
                 'import json,os,sys\n'
