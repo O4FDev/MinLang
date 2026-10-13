@@ -1,0 +1,34 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+let work = test.scratch()
+let compiler = test.setting("MINYAR_TEST_COMPILER", "./build/minyarc")
+let runtime = test.setting("MINYAR_TEST_RUNTIME", "build/minyar-runtime.o")
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let flags = test.words(test.setting("MINYAR_TEST_LINK_FLAGS", ""))
+let names = files.list("tests/conformance")
+test.check(files.lastError() == 0, "cannot list conformance cases")
+names.sort()
+let checked = 0
+for name in names {
+    let source = "tests/conformance/" + name + "/program.min"
+    if files.pathSize(source) >= 0 {
+        let expected = Text(files.readFile("tests/conformance/" + name + "/expected.stdout"))
+        test.check(files.lastError() == 0, "missing conformance output: " + name)
+        let llvm = work + "/case" + Text(checked) + ".ll"
+        test.require(test.run([compiler, source, llvm], system.environment(), "", work + "/compile", 15), name + " compilation")
+        if test.addressEnabled(flags) { writeTextFile(llvm, test.instrument(readTextFile(llvm))) }
+        for optimization in ["-O0", "-O2"] {
+            let command = [clang, optimization]
+            for flag in flags { command.add(flag) }
+            for item in ["-Wno-override-module", llvm, runtime, "-lm", "-o", work + "/program"] { command.add(item) }
+            test.require(test.run(command, system.environment(), "", work + "/link", 30), name + " " + optimization + " link")
+            let result = test.run([work + "/program"], system.environment(), "", work + "/run", 10)
+            test.check(result.status == 0 && result.output == expected && result.errorOutput == "", name + " " + optimization + " conformance failed\n" + result.output + result.errorOutput)
+        }
+        checked += 1
+    }
+}
+test.check(checked > 0, "conformance tree is empty")
+test.removeScratch(work)
+print(Text(checked) + " feature-indexed conformance programs passed at O0 and O2")

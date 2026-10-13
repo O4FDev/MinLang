@@ -48,13 +48,13 @@ check-critical-path: build/minyarc
 check-regressions: build/minyarc build/minyar-runtime.o
 	$(LIMITED) python3 tests/regressions.py
 
-check-diagnostics: build/minyarc
-	$(LIMITED) python3 tests/diagnostics.py
+check-diagnostics: build/minyarc build/tooling/tests/diagnostics
+	$(LIMITED) ./build/tooling/tests/diagnostics
 
 check: check-diagnostics
 
-check-conformance: build/minyarc build/minyar-runtime.o
-	$(LIMITED) python3 tests/conformance.py
+check-conformance: build/minyarc build/minyar-runtime.o build/tooling/tests/conformance
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/conformance
 
 check: check-conformance
 
@@ -120,7 +120,7 @@ check-mutation: build/stage0 build/minyarc build/minyar-runtime.o
 check-mutation-score-harness:
 	python3 tests/mutation-score-harness.py
 
-check-mutation-score: check-mutation-score-harness build/stage0 build/minyarc build/minyarc-modules build/minyar-compiler-runtime.ll build/minyar-runtime.o
+check-mutation-score: check-mutation-score-harness build/stage0 build/minyarc build/minyarc-modules build/minyar-compiler-runtime.ll build/minyar-runtime.o build/tooling/tests/diagnostics build/tooling/tests/conformance
 	MINYAR_MIN_MUTATION_SCORE=$(MIN_MUTATION_SCORE) $(LIMITED) python3 tests/mutation-score.py
 
 check-performance: build/minyarc build/minyar-runtime.o build/compiler-stage3.ll
