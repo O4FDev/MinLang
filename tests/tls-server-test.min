@@ -1,0 +1,46 @@
+use "./net-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+
+record Case { name: Text; accepted: Boolean }
+
+fixtures.arguments(["--sanitize"], ["--curve"])
+let curve = fixtures.option("--curve", "-")
+test.check(curve == "-" || curve == "X25519" || curve == "prime256v1", "invalid curve: " + curve)
+let context = fixtures.context(fixtures.flag("--sanitize"))
+let ca = fixtures.authority(context, context.work + "/ca")
+fixtures.root(ca, "root")
+fixtures.root(ca, "untrusted")
+fixtures.leaf(ca, "server", "root", fixtures.options())
+fixtures.leaf(ca, "client", "root", fixtures.usage("clientAuth"))
+fixtures.leaf(ca, "ec-client", "root", fixtures.ec("clientAuth"))
+fixtures.leaf(ca, "unknown", "untrusted", fixtures.usage("clientAuth"))
+fixtures.leaf(ca, "expired", "root", fixtures.expired(fixtures.usage("clientAuth")))
+fixtures.leaf(ca, "future", "root", fixtures.future(fixtures.usage("clientAuth")))
+fixtures.leaf(ca, "wrong-usage", "root", fixtures.usage("serverAuth"))
+let binary = context.work + "/server.exe"
+fixtures.compileProgram(context, "tests/tls-server.min", binary)
+let peer = fixtures.opensslPeer(context)
+for item in [Case { name: "client"; accepted: true }, Case { name: "ec-client"; accepted: true }, Case { name: "unknown"; accepted: false },
+        Case { name: "expired"; accepted: false }, Case { name: "future"; accepted: false }, Case { name: "wrong-usage"; accepted: false }, Case { name: ""; accepted: false }] {
+    let server = fixtures.launch(context, [binary, fixtures.path(ca, "server", "der"), fixtures.path(ca, "server", "pk8"), fixtures.path(ca, "root", "der")], 20)
+    let port = fixtures.ready(context, server)
+    let certificate = "-"
+    let key = "-"
+    if item.name != "" { certificate = fixtures.path(ca, item.name, "pem"); key = fixtures.path(ca, item.name, "key") }
+    let client = fixtures.run(context, [peer, "client", Text(port), fixtures.path(ca, "root", "pem"), "localhost", "http/1.1", curve, certificate, key, "ping"], 15)
+    let got = ""
+    if client.status == 0 { got = client.output }
+    let served = fixtures.collect(server)
+    let name = item.name
+    if name == "" { name = "absent" }
+    let verified = test.contains(served.output, "verified client certificate")
+    if item.accepted {
+        test.check(served.status == 0 && got == "pong" && verified, name + ": " + got + "\n" + served.output + served.errorOutput + client.output + client.errorOutput)
+        print("TLS server " + name + ": accepted")
+    } else {
+        test.check(served.status != 0 && served.status != 124 && got == "" && !verified, name + ": " + got + "\n" + served.output + served.errorOutput + client.output + client.errorOutput)
+        print("TLS server " + name + ": rejected")
+    }
+}
+print("TLS server: independent OpenSSL client mTLS cases passed")
+fixtures.finish(context)

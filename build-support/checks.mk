@@ -777,13 +777,13 @@ check-tls-keyshare: build/minyarc build/tooling/tests/tls-keyshare-test
 check-tls-keyshare-sanitize: build/minyarc build/tooling/tests/tls-keyshare-test
 	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-keyshare-test --sanitize
 
-check-tls-server: build/minyarc
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/tls-server.py
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/tls-server.py --curve prime256v1
+check-tls-server: build/minyarc build/tooling/tests/tls-server-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/tls-server-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/tls-server-test --curve prime256v1
 
-check-tls-server-sanitize: build/minyarc
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/tls-server.py --sanitize
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/tls-server.py --sanitize --curve prime256v1
+check-tls-server-sanitize: build/minyarc build/tooling/tests/tls-server-test
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-server-test --sanitize
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-server-test --sanitize --curve prime256v1
 
 check-tls: check-tls-keyshare check-tls-server
 check-tls-sanitize: check-tls-keyshare-sanitize check-tls-server-sanitize
