@@ -328,6 +328,7 @@ def main() -> int:
                 run([str(ROOT / 'build/tooling/tests' / name), *selection], env=suite_env)
             else:
                 run([sys.executable, f"tests/{name}.py", *selection], env=suite_env)
+        run([sys.executable, "tests/coverage-programs/check.py"], env=suite_env, timeout=600)
         run([sys.executable, "tests/linkage.py", "LanguageLinkage.test_ordinary_names_do_not_interpose_c_dependencies"], env=suite_env)
         run([sys.executable, "tests/runtime-numeric.py", "--mode", "native", "--cases", "2000",
              "--output-dir", str(directory / "numeric")], env=suite_env)
