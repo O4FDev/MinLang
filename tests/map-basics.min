@@ -1,0 +1,51 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+
+function rejects(compiler: test.Compiler, source: Text, diagnostic: Text) {
+    let result = test.compile(compiler, source)
+    test.check(result.status == 1, "expected compiler rejection\n" + result.errorOutput)
+    test.check(result.output == "", "rejected source wrote standard output")
+    test.check(test.contains(result.errorOutput, diagnostic), "missing diagnostic: " + diagnostic + "\n" + result.errorOutput)
+    test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "invalid source left LLVM output")
+    test.check(!test.contains(result.errorOutput, "List position"), "compiler rejection reported a runtime List trap")
+}
+
+let compiler = test.compiler()
+compiler.linkTimeout = 60
+let engine = readTextFile("runtime/minyar_runtime.c")
+for header in ["minyar_rc.h", "minyar_collections.h"] {
+    let replacement = "minyar_cycle_rc.h"
+    if header == "minyar_collections.h" { replacement = "minyar_cycle_collections.h" }
+    let directive = "#include \"" + header + "\""
+    test.check(test.contains(engine, directive), "missing managed graph runtime header")
+    engine = test.replace(engine, directive, "#include \"" + replacement + "\"")
+}
+engine = "#define MINYAR_SORT_GRAPH 1\n#define MINYAR_MAP_CYCLE_RUNTIME 1\n#if defined(__GNUC__) || defined(__clang__)\n#define MINYAR_NOINLINE __attribute__((noinline))\n#else\n#define MINYAR_NOINLINE\n#endif\n" + engine + "\n#include \"minyar_callbacks.h\"\n"
+let harness = test.replace(readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", engine)
+let runtimeSource = compiler.directory + "/runtime.c"
+writeTextFile(runtimeSource, harness)
+compiler.runtime = compiler.directory + "/runtime.o"
+let optimization = "-O2"
+if compiler.flags.length > 0 { optimization = "-O1" }
+let command = [compiler.clang, optimization]
+for flag in compiler.flags { command.add(flag) }
+for item in ["-DMINYAR_SYSTEM_HEAP=1", "-iquote", "runtime", "-c", runtimeSource, "-o", compiler.runtime] { command.add(item) }
+test.require(test.run(command, system.environment(), "", compiler.directory + "/ownership-runtime", 60), "ownership contract runtime")
+test.executes(compiler, "print('{'); print(\"{\")\nlet braces = {\"{\": '}', \"}\": '{'}\nprint(braces[\"}\"])\nlet inferred = {\"é\": 1, \"🙂\": 2, \"é\": 3,}\nprint(inferred.length); print(inferred[\"é\"])\nlet typed = Map<Integer, Text> {1: Text(11), 2: Text(22)}\nlet contextual: Map<Integer, List<Integer>> = Map {1: [3, 4], 2: []}\nprint(typed[1]); print(contextual[1].pop()); print(contextual[2].length)\nlet empty: Map<Text, Integer> = {}\nprint(empty.length)\nfunction consume(value: Map<Text, Integer>): Integer { return value.length }\nprint(consume({})); print(consume(Map {}))\nlet nested = {1: {\"key\": Text(42)}}\nprint(nested[1][\"key\"])\n", "{\n{\n{\n2\n3\n11\n4\n0\n0\n0\n0\n42\n")
+test.executes(compiler, "record Holder { key: Text; calls: Integer }\nfunction key(holder: Holder): Text { holder.calls += 1; print(holder.calls); return holder.key }\nfunction value(holder: Holder): Text { holder.calls += 1; print(holder.calls); holder.key = Text(holder.calls); return Text(holder.calls) }\nlet holder = Holder { key: Text(100); calls: 0 }\nlet map = {key(holder): value(holder), key(holder): value(holder)}\nprint(map[\"100\"]); print(map[\"2\"]); print(holder.calls)\nlet duplicates = {true: 1, true: 2}\nprint(duplicates.length); print(duplicates[true])\n", "1\n2\n3\n4\n2\n4\n4\n1\n2\n")
+test.executes(compiler, "let left = {1: Text(11), 2: Text(22)}\nlet right = {2: Text(22), 1: Text(11)}\nprint(left == right); print(left != right)\nright[2] = Text(33)\nprint(left == right); print(left != right)\nright.remove(2); right[3] = Text(22)\nprint(left == right)\nlet empty = Map<Integer, Text>()\nprint(empty == Map<Integer, Text> {})\nprint({true: '🙂'} == {true: '🙂'})\nprint({1.0: -0.0} == {1.0: 0.0})\nlet nan = sqrt(-1.0)\nprint({1: nan} == {1: nan})\nprint({1: {\"a\": 2}} == {1: {\"a\": 2}})\nprint({1: {\"a\": 2}} != {1: {\"a\": 3}})\n", "true\nfalse\nfalse\ntrue\nfalse\ntrue\ntrue\ntrue\nfalse\ntrue\ntrue\n")
+test.executes(compiler, "record Holder { value: Map<Text, Integer> }\nfunction replace(holder: Holder): Map<Text, Integer> { holder.value = {}; return {\"key\": 7} }\nlet holder = Holder { value: {\"key\": 7} }\nprint(holder.value == replace(holder))\nprint(holder.value.length)\n", "true\n0\n")
+test.executes(compiler, "let map = {Text(1): 1, Text(2): 2, Text(3): 3}\nlet visited = Map<Text, Boolean>()\nfor key in map {\n    map.clear()\n    for n in 0..64 { map[Text(n + 100)] = n }\n    visited[key] = true\n}\nprint(visited.length)\nprint(visited.has(\"1\") && visited.has(\"2\") && visited.has(\"3\"))\nlet total = 0\nfor key in {1: 9, 2: 8, 3: 7} { if key == 2 { continue }; total += key }\nprint(total)\nfor key in {Text(4): Text(5)} { print(key); break }\nfor key in Map<Integer, Integer> {} { fail(\"empty map iterated\") }\n", "3\ntrue\n4\n4\n")
+writeTextFile(compiler.directory + "/table.min", "public record Node { values: List<Node>; text: Text }\npublic function make(): Map<Text, Node> {\n    let node = Node { values: []; text: Text(9) }\n    node.values.add(node)\n    return {\"node\": node}\n}\n")
+test.executes(compiler, "use \"./table.min\" as table\nlet map = table.make()\nfor key in map { print(map[key].text) }\nlet saved = map[\"node\"]\nmap.clear()\nprint(saved.text)\n", "9\n9\n")
+rejects(compiler, "let map = {}\n", "an empty Map literal needs a type")
+rejects(compiler, "let map = {1: 2, \"x\": 3}\n", "Map literal key has the wrong type")
+rejects(compiler, "let map = {1: 2, 3: true}\n", "Map literal value has the wrong type")
+rejects(compiler, "let map = {[1]: 2}\n", "Map keys must be Integer, Text, Character, Boolean, or Float")
+rejects(compiler, "record Node { children: Map<Integer, Node> }\nlet node = Node { children: Map<Integer, Node>() }\nnode.children = {1: node}\n", "Map mutation could create a reference cycle")
+rejects(compiler, "print({1: [2]} == {1: [2]})\n", "Map equality needs comparable values")
+rejects(compiler, "print({1: 2} == {1: true})\n", "the two sides of '==' have different types")
+rejects(compiler, "print({1: 2} < {1: 3})\n", "ordered comparison needs Integer, Float, or Character operands")
+test.removeTree(compiler.directory)
+print("map basics: passed")

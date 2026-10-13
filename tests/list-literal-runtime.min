@@ -1,0 +1,86 @@
+use "../tools/testing.min" as test
+use "system" as system
+
+record Profile { name: Text; defines: List<Text> }
+function startsWith(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    return Text(raw.slice(0, pattern.length)) == prefix
+}
+function checked(executable: Text, mode: Text, environment: List<Text>, log: Text, status: Integer, output: Text, diagnostics: Text) {
+    let result = test.run([executable, mode], environment, "", log, 30)
+    test.check(result.status == status, mode + " returned " + Text(result.status) + "\n" + result.errorOutput)
+    test.check(result.output == output, mode + " output changed\n" + result.output)
+    test.check(result.errorOutput == diagnostics, mode + " diagnostics changed\n" + result.errorOutput)
+}
+
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let requestedMode = "both"
+let argumentIndex = 0
+while argumentIndex < argumentCount() {
+    let option = argument(argumentIndex)
+    test.check(argumentIndex + 1 < argumentCount(), "missing campaign option value")
+    argumentIndex += 1
+    if option == "--clang" { clang = argument(argumentIndex) }
+    else if option == "--mode" { requestedMode = argument(argumentIndex) }
+    else { fail("unknown campaign option: " + option) }
+    argumentIndex += 1
+}
+test.check(requestedMode == "both" || requestedMode == "native" || requestedMode == "sanitize", "invalid campaign mode")
+let modes: List<Text> = []
+if requestedMode == "both" || requestedMode == "native" { modes.add("native") }
+if requestedMode == "both" || requestedMode == "sanitize" { modes.add("sanitize") }
+let profiles = [
+    Profile { name: "arena"; defines: ["-DMINYAR_COMPILER_ARENA=1"] },
+    Profile { name: "eager"; defines: [] },
+    Profile { name: "system"; defines: ["-DMINYAR_SYSTEM_HEAP=1"] },
+    Profile { name: "bounded"; defines: ["-DMINYAR_BOUNDED_HEAP=1"] },
+    Profile { name: "lazy"; defines: ["-DMINYAR_BOUNDED_HEAP=1", "-DMINYAR_LAZY_HEAP=1"] },
+    Profile { name: "fault-system"; defines: ["-DLIST_LITERAL_FAULTS=1"] }
+]
+let invalid = ["negative-count", "negative-length", "count-overflow", "byte-overflow", "negative-capacity", "negative-reserve", "growth-overflow", "reserve-byte-overflow", "grow-maximum"]
+let environment: List<Text> = []
+for entry in system.environment() {
+    let discard = false
+    for prefix in ["MINYAR_FAIL_", "MINYAR_ALLOCATION_", "MINYAR_FORCE_MOVE", "ASAN_OPTIONS=", "UBSAN_OPTIONS="] {
+        if startsWith(entry, prefix) { discard = true }
+    }
+    if !discard { environment.add(entry) }
+}
+environment.add("ASAN_OPTIONS=detect_leaks=0:halt_on_error=1")
+environment.add("UBSAN_OPTIONS=halt_on_error=1")
+let work = test.scratch()
+let campaigns = 0
+for mode in modes {
+    let flags: List<Text> = []
+    let optimizations = ["-O0", "-O2", "-O3", "-Os"]
+    if mode == "sanitize" {
+        flags = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"]
+        optimizations = ["-O0", "-O2"]
+    }
+    for optimization in optimizations {
+        for profile in profiles {
+            let executable = work + "/" + mode + "-" + optimization + "-" + profile.name
+            let command = [clang, "-std=c11", optimization]
+            for flag in flags { command.add(flag) }
+            for define in profile.defines { command.add(define) }
+            for item in ["-DMINYAR_BOUNDED_HEAP_BYTES=33554432", "tests/list-literal-runtime.c", "-o", executable, "-lm"] { command.add(item) }
+            test.require(test.run(command, environment, "", executable + ".build", 30), "compile-link-" + profile.name)
+            checked(executable, "normal", environment, executable + ".normal", 0, "copies-prefixes-capacities-ok\n", "")
+            checked(executable, "one-reserve", environment, executable + ".one-reserve", 0, "one-reserve-ok\n", "")
+            for header in invalid {
+                checked(executable, header, environment, executable + "." + header, 1, "", "Minyar stopped: this List became too large.\n")
+            }
+            if profile.name == "fault-system" {
+                for failure in ["fail-fresh", "fail-resize", "fail-large-resize"] {
+                    checked(executable, failure, environment, executable + "." + failure, 1, "old-list-preserved\n", "Minyar stopped: the computer ran out of memory.\n")
+                }
+            }
+            campaigns += 1
+            print(mode + " " + optimization + " " + profile.name + " passed")
+        }
+    }
+}
+test.removeTree(work)
+print(Text(campaigns) + " profile/configuration campaigns passed")

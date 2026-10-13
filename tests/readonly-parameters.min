@@ -1,0 +1,100 @@
+use "../tools/testing.min" as test
+function body(compiler: test.Compiler, source: Text, name: Text): Text {
+    test.require(test.compile(compiler, source), "compile " + name)
+    let ir = readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+    let parts: List<Text> = []
+    let found = false
+    let complete = false
+    for line in test.lines(ir) {
+        if !found && test.contains(line, "define ") && test.contains(line, "@.minyar.fn." + name + "(") { found = true }
+        else if found {
+            if line == "}" { complete = true; break }
+            parts.add(line + "\n")
+        }
+    }
+    test.check(found && complete, "missing function body " + name)
+    return joinText(parts)
+}
+function occurrences(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let count = 0
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { count += 1 }
+    }
+    return count
+}
+let compiler = test.compiler()
+if true {
+    let source = "function values(number: Integer, flag: Boolean, letter: Character): Integer {\nif flag { print(letter) }\nreturn number + number\n}\nprint(values(7, true, 'é'))\n"
+    let ir = body(compiler, source, "values")
+    for index in 0..3 { test.check(!test.contains(ir, "%local." + Text(index)), "readonly scalar storage") }
+    test.executes(compiler, source, "é\n14\n")
+}
+if true {
+    let source = "function advance(counter: Integer, step: Integer): Integer {\nwhile counter < 5 { counter = counter + step }\nreturn counter\n}\nprint(advance(1, 2))\n"
+    let ir = body(compiler, source, "advance")
+    test.check(test.contains(ir, "%local.0"), "test_writable_parameter_retains_its_original_slot assertIn %local.0")
+    test.check(!test.contains(ir, "%local.1"), "test_writable_parameter_retains_its_original_slot assertNotIn %local.1")
+    test.executes(compiler, source, "5\n")
+}
+if true {
+    let source = "function update(values: List<Integer>, delta: Integer): Integer {\nvalues[0] = values[0] + delta\nvalues.add(values[0])\nreturn values.length\n}\nlet values = [2]\nprint(update(values, 4))\nprint(values[0])\nprint(values[1])\n"
+    let ir = body(compiler, source, "update")
+    test.check(!test.contains(ir, "%local.0"), "test_shared_list_contents_remain_mutable_through_ssa_parameter assertNotIn %local.0")
+    test.check(!test.contains(ir, "%local.1"), "test_shared_list_contents_remain_mutable_through_ssa_parameter assertNotIn %local.1")
+    test.executes(compiler, source, "2\n6\n6\n")
+}
+if true {
+    let source = "function shadow(value: Text): Text {\nif true {\nlet value: Text = value + \"inner\"\nprint(value)\n}\nreturn value\n}\nprint(shadow(\"outer\"))\n"
+    let ir = body(compiler, source, "shadow")
+    test.check(!test.contains(ir, "%local.0"), "test_typed_shadow_initializer_reads_incoming_value assertNotIn %local.0")
+    test.executes(compiler, source, "outerinner\nouter\n")
+}
+if true {
+    let source = "function shadow(value: Text): Text {\nif true {\nlet value = value + \"inner\"\nvalue = value\nprint(value)\n}\nreturn value\n}\nprint(shadow(\"outer\"))\n"
+    test.executes(compiler, source, "outerinner\nouter\n")
+}
+if true {
+    let source = "record Label { text: Text }\nfunction choose(value: Text, flag: Boolean): Text {\nif flag {\nlet label = Label { text: \"}\" }\nprint(label.text)\nif true { value = value + \"!\" }\n}\nreturn value\n}\nprint(choose(\"first\", true))\nprint(choose(\"second\", false))\n"
+    let ir = body(compiler, source, "choose")
+    test.check(test.contains(ir, "%local.0"), "test_late_nested_write_is_not_hidden_by_braces_or_strings assertIn %local.0")
+    test.check(!test.contains(ir, "%local.1"), "test_late_nested_write_is_not_hidden_by_braces_or_strings assertNotIn %local.1")
+    test.executes(compiler, source, "}\nfirst!\nsecond\n")
+}
+if true {
+    let source = "record Pair { x: Integer; y: Integer }\nfunction inspect(pair: Pair): Integer {\nlet local = Pair { x: pair.x; y: pair.y }\nreturn local.x + local.y\n}\nprint(inspect(Pair { x: 3; y: 4 }))\n"
+    let ir = body(compiler, source, "inspect")
+    test.check(!test.contains(ir, "%local.0"), "test_record_parameter_ids_cannot_alias_scalar_replacement_metadata assertNotIn %local.0")
+    test.check(!test.contains(ir, "@minyar_record_new"), "test_record_parameter_ids_cannot_alias_scalar_replacement_metadata assertNotIn @minyar_record_new")
+    test.check(occurrences(ir, "@minyar_record_get") == 2, "record field reads")
+    test.executes(compiler, source, "7\n")
+}
+if true {
+    test.executes(compiler, "function echo(value: Text, depth: Integer): Text {\nif depth == 0 { return value }\nreturn later(value, depth - 1)\n}\nfunction later(value: Text, depth: Integer): Text { return echo(value, depth) }\nprint(echo(\"alive\" + \"!\", 30))\n", "alive!\n")
+}
+if true {
+    writeTextFile(compiler.directory + "/helper.min", "public function decorate(value: Text): Text { return value + \"!\" }\n")
+    test.executes(compiler, "use \"./helper.min\" as helper\nprint(helper.decorate(\"module\"))\n", "module!\n")
+}
+if true {
+    let parameters: List<Text> = []
+    let arguments: List<Text> = []
+    for index in 0..65 {
+        if index > 0 { parameters.add(", "); arguments.add(", ") }
+        parameters.add("a" + Text(index) + ": Integer")
+        arguments.add(Text(index))
+    }
+    let source = "function many(" + joinText(parameters) + "): Integer { return a0 + a64 }\nprint(many(" + joinText(arguments) + "))\n"
+    let ir = body(compiler, source, "many")
+    test.check(test.contains(ir, "%local.0"), "fallback first slot")
+    test.check(test.contains(ir, "%local.64"), "fallback last slot")
+    test.executes(compiler, source, "64\n")
+}
+if true {
+    test.executes(compiler, "function replace(values: List<Text>): Integer { values[0] = \"after\"; return 0 }\nfunction keep(value: Text, ignored: Integer): Text { return value }\nlet values = [\"before\" + \"\"]\nprint(keep(values[0], replace(values)))\nprint(values[0])\n", "before\nafter\n")
+}
+test.removeTree(compiler.directory)
+print("Readonly parameters: passed")
