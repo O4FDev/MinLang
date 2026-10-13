@@ -77,11 +77,13 @@ check-modules: build/minyarc build/minyar-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) sh tests/run-module-tests.sh
 
 .PHONY: check-json-parser check-json-parser-sanitize
-check-json-parser: build/minyarc
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/json-parser.py
+build/tooling/tests/json-parser-test: private TOOL_NATIVE = runtime/native/sha256.c
+build/tooling/tests/json-parser-test: private TOOL_LIBS = -lcrypto
+check-json-parser: build/minyarc build/tooling/tests/json-parser-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/json-parser-test
 
-check-json-parser-sanitize: build/minyarc
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/json-parser.py --sanitize
+check-json-parser-sanitize: build/minyarc build/tooling/tests/json-parser-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/json-parser-test --sanitize
 
 check check-portable: check-json-parser
 check-sanitize: check-json-parser-sanitize
