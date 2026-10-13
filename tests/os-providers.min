@@ -1,0 +1,187 @@
+use "../tools/testing.min" as test
+use "./release-support.min" as support
+use "./cpython-random.min" as random
+use "system" as system
+
+constant DRIVER = "#include <stdio.h>\n#include <string.h>\n#include \"minyar_native.h\"\nextern long long minyar_net_ipVersion(const MinyarText *address);\nstatic int hex(int c) { return c <= '9' ? c - '0' : c - 'a' + 10; }\nint main(void) {\n    unsigned char bytes[1024]; char line[2048];\n    MinyarText invalid = {NULL, -1, 0, NULL, NULL};\n    if (minyar_net_ipVersion(&invalid) != 0) return 1;\n    invalid.byte_length = 0;\n    if (minyar_net_ipVersion(&invalid) != 0) return 2;\n    invalid.byte_length = 256;\n    if (minyar_net_ipVersion(&invalid) != 0) return 3;\n    while (fgets(line, sizeof(line), stdin)) {\n        size_t count = strcspn(line, \"\\n\");\n        if (count % 2 || count > sizeof(bytes) * 2) return 4;\n        for (size_t i = 0; i < count / 2; i++) bytes[i] = (unsigned char)(hex(line[i * 2]) * 16 + hex(line[i * 2 + 1]));\n        MinyarText text = {bytes, (long long)count / 2, 0, NULL, NULL};\n        printf(\"%lld\\n\", minyar_net_ipVersion(&text));\n    }\n    return 0;\n}\n"
+
+function version(value: Bytes): Integer { native "osproviderstest" }
+function text(address: Bytes): Text { native "osproviderstest" }
+
+record Context { directory: Text; environment: List<Text>; serial: Integer }
+
+function run(context: Context, argv: List<Text>, input: Text): Text {
+    context.serial += 1
+    print(support.join(argv, " "))
+    let log = context.directory + "/step" + Text(context.serial)
+    let command = argv
+    if input != "" { command = ["/bin/sh", "-c", "input=$1; shift; exec \"$@\" < \"$input\"", "minyar", input]; for item in argv { command.add(item) } }
+    let result = test.run(command, context.environment, "", log, 180)
+    test.check(result.status == 0, support.join(argv, " ") + " failed (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+    return result.output
+}
+function expect(context: Context, argv: List<Text>, input: Text, expected: Text) {
+    context.serial += 1
+    print(support.join(argv, " "))
+    let log = context.directory + "/step" + Text(context.serial)
+    let command = argv
+    if input != "" { command = ["/bin/sh", "-c", "input=$1; shift; exec \"$@\" < \"$input\"", "minyar", input]; for item in argv { command.add(item) } }
+    let result = test.run(command, context.environment, "", log, 180)
+    test.check(result.status == 0, support.join(argv, " ") + " failed (" + Text(result.status) + ")\n" + result.errorOutput)
+    test.check(result.errorOutput == "", support.join(argv, " ") + " wrote diagnostics\n" + result.errorOutput)
+    test.check(result.output == expected, support.join(argv, " ") + " output differs\n" + result.output)
+}
+function hex(value: Bytes): Text {
+    let digits = Bytes("0123456789abcdef")
+    let out = Bytes()
+    for byte in value { out.add(digits[byte >> 4]); out.add(digits[byte & 15]) }
+    return Text(out)
+}
+function repeated(byte: Integer, count: Integer): Bytes {
+    let result = Bytes()
+    for index in 0..count { result.add(byte) }
+    return result
+}
+function digit(byte: Integer): Integer {
+    if byte <= 57 { return byte - 48 }
+    return byte - 87
+}
+function unhex(value: Text): Bytes {
+    let raw = Bytes(value)
+    let result = Bytes()
+    let index = 0
+    while index < raw.length {
+        result.add(digit(raw[index]) * 16 + digit(raw[index + 1]))
+        index += 2
+    }
+    return result
+}
+function cases(): List<Text> {
+    let values: List<Bytes> = []
+    for item in ["", "localhost", "example.com", "127.0.0.1", "0.0.0.0", "255.255.255.255",
+            "01.2.3.4", "1.02.3.4", "1.2.3.004", "256.0.0.1", "1.2.3", "1.2.3.4."] { values.add(Bytes(item)) }
+    let embedded = Bytes("1.2.3.4")
+    embedded.add(0)
+    embedded.addBytes(Bytes("x"))
+    values.add(embedded)
+    for item in ["::", "::1", "2001:db8::1", "::ffff:192.0.2.1", "::192.0.2.1",
+            "1:2:3:4:5:6:192.0.2.1", "1:2:3:4:5:192.0.2.1", "::ffff:192.00.2.1",
+            "1:2:3:4:5:6:7:8", "1:2:3:4:5:6:7:8::", "1:2:3:4:5:6:7", "1:2:3:4:5:6:7:8:9",
+            "1::2::3", ":::", ":1", "1:", "::fffff", "[::1]", "fe80::1%eth0", " ::1",
+            "::1 ", "é"] { values.add(Bytes(item)) }
+    values.add(repeated(97, 255))
+    values.add(repeated(97, 256))
+    values.add(repeated(48, 300))
+    let rng = random.seeded("20261012")
+    for index in 0..1000 {
+        values.add(Bytes(text(random.bytes(rng, 4))))
+        values.add(Bytes(text(random.bytes(rng, 16))))
+    }
+    for omitted in 1..9 {
+        for start in 0..(9 - omitted) {
+            let left: List<Text> = []
+            for index in 0..start { left.add("abcd") }
+            let right: List<Text> = []
+            for index in 0..(8 - start - omitted) { right.add("1234") }
+            values.add(Bytes(support.join(left, ":") + "::" + support.join(right, ":")))
+        }
+    }
+    let originals: List<Bytes> = []
+    for value in values { originals.add(value) }
+    let alphabet = Bytes("0123456789abcdefABCDEF:.%[]xyz -+")
+    alphabet.add(0)
+    for index in 0..12000 {
+        let value = originals[random.below(rng, originals.length)]
+        let at = random.below(rng, value.length + 1)
+        let operation = random.below(rng, 3)
+        let character = alphabet[random.below(rng, alphabet.length)]
+        let mutated = value.slice(0, at)
+        if operation != 1 { mutated.add(character) }
+        let resume = at
+        if operation != 0 { resume = at + 1 }
+        if resume < value.length { mutated.addBytes(value.slice(resume, value.length)) }
+        values.add(mutated)
+    }
+    let seen = Map<Text, Boolean>()
+    let keys: List<Text> = []
+    for value in values {
+        let key = hex(value)
+        if !seen.has(key) { seen[key] = true; keys.add(key) }
+    }
+    keys.sort()
+    return keys
+}
+
+let sanitize = false
+for index in 0..argumentCount() {
+    if argument(index) == "--sanitize" { sanitize = true }
+    else { test.check(false, "unknown os providers option " + argument(index)) }
+}
+let directory = test.scratch()
+let source = test.lines(support.output(["pwd", "-P"], directory + "/root"))[0]
+let clang = test.setting("MINYAR_TEST_CLANG", test.setting("MINYAR_CLANG", "clang"))
+let context = Context { directory: directory; environment: support.environment(["ASAN_OPTIONS=detect_leaks=1:halt_on_error=1", "UBSAN_OPTIONS=halt_on_error=1"]); serial: 0 }
+let resource = test.lines(run(context, [clang, "-print-resource-dir"], ""))[0]
+let common = ["-O2", "-flto", "-ffreestanding", "-fno-builtin", "-nostdinc", "-isystem", resource + "/include", "-isystem", source + "/runtime/freestanding/include", "-fno-stack-protector", "-fno-pic", "-Wall", "-Wno-unused-function"]
+let required = ["minyar_net_ipVersion", "minyar_securecrypto_x25519", "minyar_securecrypto_chacha20", "minyar_securecrypto_poly1305", "minyar_securecrypto_seal", "minyar_securecrypto_open", "minyar_securecrypto_equal"]
+for target in [["x86_64", "x86_64-unknown-none-elf", "-march=x86-64-v2", "-mno-red-zone"], ["arm64", "aarch64-unknown-none-elf"]] {
+    let object = directory + "/" + target[0] + ".o"
+    let command = [clang, "--target=" + target[1]]
+    for index in 2..target.length { command.add(target[index]) }
+    for item in common { command.add(item) }
+    for item in ["-c", source + "/runtime/freestanding/freestanding.c", "-o", object] { command.add(item) }
+    run(context, command, "")
+    let names: List<Text> = []
+    for line in test.lines(run(context, ["llvm-nm", "--defined-only", object], "")) {
+        let words = test.words(line)
+        if words.length > 0 { names.add(words[words.length - 1]) }
+    }
+    for name in required { test.check(support.has(names, name), target[0] + " missing freestanding provider " + name) }
+}
+let flags = ["-O2"]
+if sanitize { flags = ["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"] }
+let provider = directory + "/providers.o"
+let providerCommand = [clang]
+for item in common { providerCommand.add(item) }
+for item in flags { providerCommand.add(item) }
+for item in ["-c", source + "/runtime/freestanding/providers.c", "-o", provider] { providerCommand.add(item) }
+run(context, providerCommand, "")
+let runtime = directory + "/runtime.o"
+let runtimeCommand = [clang]
+for item in flags { runtimeCommand.add(item) }
+for item in ["-c", source + "/runtime/minyar_default_runtime.c", "-o", runtime] { runtimeCommand.add(item) }
+run(context, runtimeCommand, "")
+let ir = directory + "/crypto.ll"
+run(context, [source + "/build/minyarc", source + "/tests/securecrypto.min", ir, "--bounded-owners", "32", "--library", source + "/library"], "")
+if sanitize {
+    let instrumented = directory + "/crypto-sanitize.ll"
+    writeTextFile(instrumented, test.instrument(readTextFile(ir)))
+    ir = instrumented
+}
+let vectors = directory + "/vectors"
+let vectorCommand = [clang]
+for item in flags { vectorCommand.add(item) }
+for item in ["-Wno-override-module", "-fuse-ld=lld", "-no-pie", ir, runtime, provider, "-lm", "-o", vectors] { vectorCommand.add(item) }
+run(context, vectorCommand, "")
+let crypto = "Native crypto: RFC 7748/8439, low-order X25519 rejection, tag tampering, empty messages, invalid lengths and counter bounds passed\n"
+expect(context, [vectors], "", crypto)
+print(Text(Bytes(crypto).slice(0, Bytes(crypto).length - 1)))
+let driver = directory + "/ip.c"
+writeTextFile(driver, DRIVER)
+let ip = directory + "/ip"
+let ipCommand = [clang]
+for item in flags { ipCommand.add(item) }
+for item in ["-fuse-ld=lld", "-no-pie", "-I", source + "/runtime", driver, runtime, provider, "-lm", "-o", ip] { ipCommand.add(item) }
+run(context, ipCommand, "")
+let selected = cases()
+let expected: List<Text> = []
+let input: List<Text> = []
+for key in selected {
+    expected.add(Text(version(unhex(key))) + "\n")
+    input.add(key + "\n")
+}
+let inputPath = directory + "/ip-input"
+writeTextFile(inputPath, input)
+expect(context, [ip], inputPath, joinText(expected))
+test.removeTree(directory)
+print("IP literal contract: " + Text(selected.length) + " canonical/malformed/NUL/hostname controls match inet_pton")

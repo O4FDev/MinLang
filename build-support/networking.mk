@@ -57,12 +57,14 @@ check-os-tlsverify-sanitize: build/minyarc tools/toolchain.sh build/tooling/test
 check check-portable: check-os-tlsverify
 check-sanitize: check-os-tlsverify-sanitize
 
+build/tooling/tests/os-providers: TOOL_NATIVE = tests/os-providers-runtime.c
+build/tooling/tests/os-providers: tests/os-providers-runtime.c
 .PHONY: check-os-providers check-os-providers-sanitize
-check-os-providers: build/minyarc
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/os-providers.py
+check-os-providers: build/minyarc build/tooling/tests/os-providers
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/os-providers
 
-check-os-providers-sanitize: build/minyarc
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/os-providers.py --sanitize
+check-os-providers-sanitize: build/minyarc build/tooling/tests/os-providers
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/os-providers --sanitize
 
 # The executable vector and inet_pton oracle route is a Linux ELF host gate.
 ifeq ($(shell uname -s),Linux)
