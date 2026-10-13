@@ -61,7 +61,7 @@ second")
     assert linked.returncode == 0, linked.stderr
     assert subprocess.check_output([executable], text=True) == '42\nsource\ntrue\nQ\nchanged\nfalse\nZ\n42\n7\n65\n195\n3\nABC\n-42\n42\nfirst\nsecond\n'
     failures = [
-        ('function main(): Integer { let text = "first\nsecond"\n    print(missing)\nreturn 0 }\n', 'line 3, column 11'),
+        ('function main(): Integer { let text = "first\nsecond"\n    print(missing)\nreturn 0 }\n', ':3:11: error:'),
         ('function main(): Integer { let bytes = Bytes(0); print(bytes == bytes); return 0 }\n', 'Bytes cannot be compared'),
         ('function main(): Integer { let bytes = Bytes(true); return 0 }\n', 'Bytes expects one Integer or Text value'),
         ('record Pair { value: Integer }\nfunction main(): Integer { let p = Pair { value: 1 }; p.value = \"bad\"; return 0 }\n', 'this field contains'),
