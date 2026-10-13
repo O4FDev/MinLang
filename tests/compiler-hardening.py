@@ -31,7 +31,7 @@ class CompilerHardening(CompilerTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         text = llvm.read_text()
         for name in ('leaf', 'middle', 'upper', 'recursive'):
-            body = re.search(r'^define [^\n]*@\.minyar\.fn\.' + name + r'\([^\n]*\) \{\n.*?^\}', text, re.M | re.S)
+            body = re.search(r'^define [^\n]*@\.minyar\.fn\.' + name + r'\([^\n]*\) [^{\n]*\{\n.*?^\}', text, re.M | re.S)
             self.assertIsNotNone(body, name)
             self.assertEqual('call void @minyar_stack_enter()' in body.group(), name == 'recursive')
         self.executes(source, '42\n')
