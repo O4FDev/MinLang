@@ -102,11 +102,63 @@ static void ownership(const char *path, uid_t uid, gid_t gid) {
     for (int n = 0; n < count; ++n) { char *p = join(path,entries[n]->d_name); ownership(p,uid,gid); free(p);free(entries[n]); }
     free(entries);
 }
+static void layer_metadata(const char *path, mode_t mode, uid_t uid, gid_t gid) {
+    require(!lchown(path,uid,gid), "layer ownership");
+    struct stat st; require(!lstat(path,&st), "layer stat");
+    if (!S_ISLNK(st.st_mode)) require(!chmod(path,mode), "layer mode");
+    struct timespec times[2] = {{-2,750000000},{1700000500,123456789}};
+    require(!utimensat(AT_FDCWD,path,times,AT_SYMLINK_NOFOLLOW), "layer time");
+}
+static void layer_file(const char *root, const char *name, const char *data, mode_t mode) {
+    char *path = join(root,name); int fd = open(path,O_CREAT | O_EXCL | O_WRONLY,mode);
+    require(fd >= 0 && write(fd,data,strlen(data)) == (ssize_t)strlen(data) && !close(fd), "layer content");
+    layer_metadata(path,mode,70000,80000);free(path);
+}
+static void layer_acl(const char *path, const char *key, int defaults) {
+    unsigned char value[44] = {2};
+    const unsigned tags[] = {1,2,4,16,32}, access[] = {6,4,4,4,0}, directory[] = {7,7,5,7,1};
+    for (unsigned n = 0; n < 5; ++n) {
+        value[4 + n * 8] = (unsigned char)tags[n]; value[6 + n * 8] = (unsigned char)(defaults ? directory[n] : access[n]);
+        uint32_t id = n == 1 ? 1234 : UINT32_MAX;
+        for (unsigned b = 0; b < 4; ++b) value[8 + n * 8 + b] = (unsigned char)(id >> (b * 8));
+    }
+    require(!lsetxattr(path,key,value,sizeof(value),0), "layer ACL");
+}
+static void layered(const char *root) {
+    char *many = join(root,"many"); struct dirent **entries;
+    int count = scandir(many,&entries,visible,order); require(count >= 0, "opaque directory");
+    for (int n = 0; n < count; ++n) { char *path = join(many,entries[n]->d_name); require(!unlink(path), "opaque removal"); free(path);free(entries[n]); }
+    free(entries);
+    layer_file(root,"many/new-first","before",0641); layer_file(root,"many/new-last","after",0641);
+    layer_file(root,"dir-to-file","now-file",0641);
+    char *switch_dir = join(root,"switch"); require(!mkdir(switch_dir,0751), "replacement directory");
+    layer_file(root,"switch/new","new",0641); layer_metadata(switch_dir,0751,70000,80000);free(switch_dir);
+    layer_file(root,"new-data","layer-data",0640);
+    char *data = join(root,"new-data"); unsigned char binary[] = {0,255,61,10,0};
+    require(!lsetxattr(data,"user.layer",binary,sizeof(binary),0) && !lsetxattr(data,"trusted.layer","trusted",7,0), "layer xattrs");
+    layer_acl(data,"system.posix_acl_access",0);
+    const char *aliases[] = {"forward-one","forward-two"};
+    for (unsigned n = 0; n < 2; ++n) { char *path = join(root,aliases[n]); require(!link(data,path), "forward hardlink"); free(path); }
+    free(data);
+    char *hard = join(root,"hard"), *kept = join(root,"kept"); require(!link(hard,kept), "retained lower hardlink");free(hard);free(kept);
+    char *sym = join(root,"symlink"); require(!unlink(sym) && !symlink("./hard",sym), "replaced symlink"); layer_metadata(sym,0777,1234,2345);free(sym);
+    char *fifo = join(root,"fifo"); require(!unlink(fifo) && !mkfifo(fifo,0640), "replaced fifo"); layer_metadata(fifo,0640,1234,2345);free(fifo);
+    const char *devices[] = {"char","block"};
+    for (unsigned n = 0; n < 2; ++n) {
+        char *path = join(root,devices[n]); mode_t mode = n ? 0640 : 0600;
+        require(!mknod(path,(n ? S_IFBLK : S_IFCHR) | mode,makedev(n ? 259 : 4095,1048575)), "layer device");
+        layer_metadata(path,mode,1234,2345);free(path);
+    }
+    require(!lsetxattr(root,"user.root",binary,sizeof(binary),0), "root xattr");layer_acl(root,"system.posix_acl_default",1);
+    struct timespec times[2] = {{-2,750000000},{-2,750000000}};
+    require(!utimensat(AT_FDCWD,many,times,AT_SYMLINK_NOFOLLOW) && !utimensat(AT_FDCWD,root,times,AT_SYMLINK_NOFOLLOW), "layer directory time");free(many);
+}
 static int guest(void) {
     require(!mount("proc","/proc","proc",0,NULL) && !mount("sysfs","/sys","sysfs",0,NULL) && !mount("devtmpfs","/dev","devtmpfs",0,NULL), "guest mounts");
     require(!mount("tmpfs","/scratch","tmpfs",0,NULL), "guest scratch");
     unsigned uid = 0, gid = 0; FILE *owner = fopen("/owner","r"); require(owner && fscanf(owner,"%u %u",&uid,&gid) == 2, "guest owner"); fclose(owner);
     create("/scratch/source"); ownership("/scratch/source",uid,gid);
+    if (!access("/layers",F_OK)) layered("/scratch/source");
     unsigned ma = 0, mi = 0;
     for (int n = 0; n < 100 && !ma; ++n) { FILE *dev = fopen("/sys/class/block/vdb/dev","r"); if (dev) { require(fscanf(dev,"%u:%u",&ma,&mi) == 2, "block device");fclose(dev); } else usleep(100000); }
     require(ma && !mknod("/dev/erofs-test",S_IFBLK | 0600,makedev(ma,mi)), "guest block node");
