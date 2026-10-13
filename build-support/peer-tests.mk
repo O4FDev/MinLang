@@ -55,7 +55,7 @@ check-stateful-lists-sanitize: build/minyarc-sanitize build/ownership-runtime.o 
 	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/stateful-lists
 
 check-sanitize: check-stateful-lists-sanitize
-PEER_AUDIT_PROGRAMS = build/tooling/tools/check-peer-audit build/tooling/tests/peer-audit-harness build/tooling/tests/peer-go-domains build/tooling/tests/peer-zig-domains
+PEER_AUDIT_PROGRAMS = build/tooling/tools/check-peer-audit build/tooling/tests/peer-audit-harness build/tooling/tests/peer-go-domains build/tooling/tests/peer-zig-domains build/tooling/tests/peer-breadth-semantics
 $(PEER_AUDIT_PROGRAMS): TOOL_NATIVE = runtime/native/sha256.c
 $(PEER_AUDIT_PROGRAMS): TOOL_LIBS = $(TOOL_CRYPTO)
 $(PEER_AUDIT_PROGRAMS): TOOL_RUNTIME = build/testing/cycle-runtime.o
