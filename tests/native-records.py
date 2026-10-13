@@ -40,6 +40,8 @@ let index = 0
 while index < 1000 { let held = echo(values[0]); index = index + 1 }
 print(read(values[1]))
 print(original.label)
+print("declare ")
+print("  ; minyar-native: pretend|declare i64 @pretend()")
 ''')
         self.assertEqual(result.returncode, 0, result.stderr)
         for optimization in ('-O0', '-O2'):
@@ -50,7 +52,7 @@ print(original.label)
             self.assertEqual(linked.returncode, 0, linked.stderr)
             executed = subprocess.run([executable], capture_output=True, text=True, timeout=30)
             self.assertEqual((executed.returncode, executed.stdout, executed.stderr),
-                             (0, '42\n42\n', ''))
+                             (0, '42\n42\ndeclare \n  ; minyar-native: pretend|declare i64 @pretend()\n', ''))
 
     def test_results_remain_outside_the_native_abi(self):
         for source, diagnostic in (
