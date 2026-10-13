@@ -1,0 +1,50 @@
+use "../tools/testing.min" as test
+use "system" as system
+
+function engineSource(): Text {
+    let engine = readTextFile("runtime/minyar_runtime.c")
+    for header in ["minyar_rc.h", "minyar_collections.h"] {
+        let replacement = "minyar_cycle_rc.h"
+        if header == "minyar_collections.h" { replacement = "minyar_cycle_collections.h" }
+        let directive = "#include \"" + header + "\""
+        test.check(engine.byteLength - test.replace(engine, directive, "").byteLength == directive.byteLength, "managed graph runtime requires exactly one ownership header")
+        engine = test.replace(engine, directive, "#include \"" + replacement + "\"")
+    }
+    return "#define MINYAR_SORT_GRAPH 1\n#define MINYAR_MAP_CYCLE_RUNTIME 1\n#if defined(__GNUC__) || defined(__clang__)\n#define MINYAR_NOINLINE __attribute__((noinline))\n#else\n#define MINYAR_NOINLINE\n#endif\n" + engine + "\n#include \"minyar_callbacks.h\"\n"
+}
+
+function executes(compiler: test.Compiler, source: Text, expected: Text) {
+    compiler.serial += 1
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    writeTextFile(path + ".min", source)
+    let compiled = test.run([compiler.executable, path + ".min", path + ".ll", "--library", "library"], system.environment(), "", path + ".compile", 30)
+    test.require(compiled, "callback frontend compile")
+    if test.addressEnabled(compiler.flags) { writeTextFile(path + ".ll", test.instrument(readTextFile(path + ".ll"))) }
+    let harness = test.replace(readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", engineSource())
+    writeTextFile(path + ".runtime.c", harness)
+    let optimization = "-O2"
+    if compiler.flags.length > 0 { optimization = "-O1" }
+    let command = [compiler.clang, optimization]
+    for flag in compiler.flags { command.add(flag) }
+    for item in ["-DMINYAR_SYSTEM_HEAP=1", "-iquote", "runtime", "-c", path + ".runtime.c", "-o", path + ".runtime.o"] { command.add(item) }
+    test.require(test.run(command, system.environment(), "", path + ".runtime-build", 30), "callback ownership runtime compile")
+    for level in ["-O0", "-O2"] {
+        command = [compiler.clang, level]
+        for flag in compiler.flags { command.add(flag) }
+        for item in ["-Wno-override-module", path + ".ll", path + ".runtime.o", "-o", path + ".exe", "-lm"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".link", 30), "callback ownership link")
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", 30)
+        test.require(result, "callback ownership execution")
+        test.check(result.output == expected, "callback output changed at " + level + "\n" + result.output)
+        test.check(result.errorOutput == "", "callback wrote execution diagnostics\n" + result.errorOutput)
+    }
+}
+
+let compiler = test.compiler()
+let frontend = "./build/minyarc-callbacks"
+if test.addressEnabled(compiler.flags) { frontend = "./build/minyarc-callbacks-sanitize" }
+compiler.executable = test.setting("MINYAR_CALLBACK_COMPILER", frontend)
+executes(compiler, "record Node { children: List<Node>; label: Text }\nlet children: List<Node> = []\nlet node = Node { children: children; label: \"alive\" }\nchildren.add(node)\nlet captured = function(): Text {\n    children.clear()\n    return node.label.trim()\n}\nprint(captured())\nprint(children.length)\nchildren.add(node)\nchildren.clear()\nprint(node.label)\n", "alive\n0\nalive\n")
+executes(compiler, "function make(): Callback<List<Text>> {\n    let source = \"  é:🍊:零　\"\n    return function(): List<Text> { return source.trim().split(\":\") }\n}\nlet callback = make()\nlet parts = callback()\nlet middle = parts[1]\nparts.clear()\nprint(middle)\nprint(middle.find(\"🍊\"))\nprint(middle.startsWith(\"\"))\nprint(middle.endsWith(\"🍊\"))\n", "🍊\n0\ntrue\ntrue\n")
+test.removeTree(compiler.directory)
+print("text basics callbacks: passed")

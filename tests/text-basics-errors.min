@@ -1,0 +1,39 @@
+use "../tools/testing.min" as test
+use "../tools/test-runtime.min" as runtime
+use "system" as system
+let compiler = test.compiler()
+let frontend = "./build/minyarc-errors"
+if test.addressEnabled(compiler.flags) { frontend += "-sanitize" }
+compiler.executable = test.setting("MINYAR_ERRORS_COMPILER", frontend)
+let source = "function pieces(source: Text): Result<List<Text>, Text> {\n    return Ok<List<Text>, Text>(source.trim().split(\":\"))\n}\nmatch pieces(\" é:42:🍊　\") {\n    Ok(values) {\n        let last = values[2]\n        print(Integer(values[1]))\n        values.clear()\n        print(last)\n        print(last.find(\"🍊\"))\n    }\n    Err(error) { print(error) }\n}\n"
+let input = compiler.directory + "/case.min"
+let llvm = compiler.directory + "/case.ll"
+writeTextFile(input, source)
+test.require(test.run([compiler.executable, input, llvm, "--library", "library"], system.environment(), "", compiler.directory + "/compile", 30), "compile Text Result")
+if test.addressEnabled(compiler.flags) { writeTextFile(llvm, test.instrument(readTextFile(llvm))) }
+let engine = runtime.cycleSource(readTextFile("runtime/minyar_runtime.c"))
+let contract = test.replace(readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", engine)
+let runtimeSource = compiler.directory + "/runtime.c"
+writeTextFile(runtimeSource, contract)
+compiler.runtime = compiler.directory + "/runtime.o"
+let optimization = "-O2"
+if compiler.flags.length > 0 { optimization = "-O1" }
+let command = [compiler.clang, optimization]
+for flag in compiler.flags { command.add(flag) }
+let runtimeFlags = test.words(test.setting("MINYAR_ERRORS_RUNTIME_FLAGS", ""))
+if runtimeFlags.length == 0 { command.add("-DMINYAR_SYSTEM_HEAP=1") }
+for flag in runtimeFlags { command.add(flag) }
+for item in ["-iquote", "runtime", "-c", runtimeSource, "-o", compiler.runtime] { command.add(item) }
+test.require(test.run(command, system.environment(), "", compiler.directory + "/runtime-compile", 30), "compile allocation contract runtime")
+for level in ["-O0", "-O2"] {
+    let link = [compiler.clang, level]
+    for flag in compiler.flags { link.add(flag) }
+    for item in ["-Wno-override-module", llvm, compiler.runtime, "-lm", "-o", compiler.directory + "/program"] { link.add(item) }
+    test.require(test.run(link, system.environment(), "", compiler.directory + "/link", 30), "link Text Result " + level)
+    let result = test.run([compiler.directory + "/program"], system.environment(), "", compiler.directory + "/run", 30)
+    test.check(result.status == 0, "Text Result allocation contract status " + level + "\n" + result.errorOutput)
+    test.check(result.output == "42\n🍊\n0\n", "Text Result output " + level)
+    test.check(result.errorOutput == "", "Text Result diagnostics " + level + "\n" + result.errorOutput)
+}
+test.removeTree(compiler.directory)
+print("Text Result basics: passed")

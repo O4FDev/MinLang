@@ -1,0 +1,74 @@
+use "../tools/testing.min" as test
+use "../tools/check-runner.min" as runner
+use "system" as system
+let selectedMode = "both"
+let selectedProfile = "all"
+let index = 0
+while index < argumentCount() {
+    test.check(index + 1 < argumentCount(), "size guard option needs a value")
+    let option = argument(index)
+    let value = argument(index + 1)
+    if option == "--mode" { selectedMode = value }
+    else if option == "--profile" { selectedProfile = value }
+    else { fail("unknown size guard option: " + option) }
+    index += 2
+}
+test.check(selectedMode == "both" || selectedMode == "native" || selectedMode == "sanitize", "invalid size guard mode")
+let profiles = ["system", "eager", "arena", "bounded", "lazy"]
+test.check(selectedProfile == "all" || selectedProfile == "system" || selectedProfile == "eager" || selectedProfile == "arena" || selectedProfile == "bounded" || selectedProfile == "lazy", "invalid size guard profile")
+let work = test.scratch()
+let env = runner.environment(system.environment(), "ASAN_OPTIONS", "detect_leaks=0")
+env = runner.environment(env, "UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1")
+let finitePrefixes: List<Text> = ["", ""]
+let controls = 0
+let rejections = 0
+for mode in ["native", "sanitize"] {
+    if selectedMode != "both" && selectedMode != mode { continue }
+    for profile in profiles {
+        if selectedProfile != "all" && selectedProfile != profile { continue }
+        let command = [test.setting("CLANG", test.setting("MINYAR_TEST_CLANG", "clang")), "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror"]
+        if mode == "sanitize" {
+            command.add("-fsanitize=address,undefined")
+            command.add("-fno-omit-frame-pointer")
+        }
+        if profile == "system" { command.add("-DMINYAR_SYSTEM_HEAP=1") }
+        if profile == "arena" { command.add("-DMINYAR_COMPILER_ARENA") }
+        if profile == "bounded" || profile == "lazy" { command.add("-DMINYAR_BOUNDED_HEAP=1") }
+        if profile == "lazy" { command.add("-DMINYAR_LAZY_HEAP=1") }
+        let executable = work + "/" + mode + "-" + profile
+        let normalCommand = command.slice(0, command.length)
+        for item in ["tests/runtime-size-guards.c", "-lm", "-o", executable] { normalCommand.add(item) }
+        test.require(test.run(normalCommand, env, "", work + "/compile", 60), "size guard compile")
+        let normal = test.run([executable], env, "", work + "/normal", 15)
+        test.check(normal.status == 0 && normal.output == "" && normal.errorOutput == "", "normal growth changed")
+        for operation in ["add", "take", "appended"] {
+            let count = 6
+            if operation == "appended" { count = 1 }
+            for position in 0..count {
+                let result = test.run([executable, operation, Text(position)], env, "", work + "/rejected", 15)
+                test.check(result.status == 1 && result.output == "" && result.errorOutput == "Minyar stopped: this List became too large.\n", profile + " " + operation + " " + Text(position) + ": size rejection changed\n" + result.output + result.errorOutput)
+                rejections += 1
+            }
+        }
+        if profile == "bounded" || profile == "lazy" {
+            let finite = executable + "-finite"
+            command.add("-DMINYAR_BOUNDED_HEAP_BYTES=16384")
+            for item in ["tests/runtime-size-guards.c", "-lm", "-o", finite] { command.add(item) }
+            test.require(test.run(command, env, "", work + "/finite-compile", 60), "finite size guard compile")
+            let result = test.run([finite, "exhaust"], env, "", work + "/finite", 15)
+            test.check(result.status == 1 && result.errorOutput == "Minyar stopped: the bounded heap is exhausted (including pending cleanup and fragmentation).\n", "finite growth exhaustion changed\n" + result.errorOutput)
+            let prefix = test.lines(result.output)
+            test.check(prefix.length > 5 && prefix.length < 4097, "finite growth prefix length changed")
+            let expected: List<Text> = []
+            for position in 0..prefix.length { expected.add(Text(position) + "\n") }
+            test.check(result.output == joinText(expected), "finite growth prefix changed")
+            let slot = 0
+            if profile == "lazy" { slot = 1 }
+            if finitePrefixes[slot] != "" { test.check(result.output == finitePrefixes[slot], "sanitizer changed finite growth prefix") }
+            finitePrefixes[slot] = result.output
+        }
+        controls += 1
+    }
+}
+test.removeTree(work)
+print(Text(rejections) + " size rejections and " + Text(controls) + " normal-growth controls passed")

@@ -1,0 +1,59 @@
+use "../tools/testing.min" as test
+use "system" as system
+let compiler = test.compiler()
+compiler.compileTimeout = 30
+compiler.linkTimeout = 60
+compiler.runTimeout = 15
+let index = 0
+while index < argumentCount() {
+    let option = argument(index)
+    if option == "--sanitize" { compiler.flags = ["-g", "-fsanitize=address,undefined"] }
+    else {
+        test.check(index + 1 < argumentCount(), "missing scalar initializer option value")
+        let value = argument(index + 1)
+        if option == "--compiler" { compiler.executable = value }
+        else if option == "--runtime" { compiler.runtime = value }
+        else if option == "--clang" { compiler.clang = value }
+        else { fail("unknown scalar initializer option: " + option) }
+        index += 1
+    }
+    index += 1
+}
+function count(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let matches = 0
+    if raw.length < pattern.length { return 0 }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { matches += 1 }
+    }
+    return matches
+}
+function checkCase(compiler: test.Compiler, name: Text, source: Text, expected: Text, scalar: Integer, generic: Integer) {
+    test.require(test.compile(compiler, source), name + " compile")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    let ir = readTextFile(path + ".ll")
+    test.check(count(ir, "call void @minyar_record_set_scalar(") == scalar, name + " scalar initialization path")
+    test.check(count(ir, "call void @minyar_record_set(") == generic, name + " generic initialization path")
+    let environment: List<Text> = []
+    for entry in system.environment() {
+        if !test.contains(entry, "ASAN_OPTIONS=") { environment.add(entry) }
+    }
+    environment.add("ASAN_OPTIONS=detect_leaks=0:abort_on_error=1")
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization]
+        for flag in compiler.flags { command.add(flag) }
+        for item in ["-Wno-override-module", path + ".ll", compiler.runtime, "-lm", "-o", path + ".exe"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".link", compiler.linkTimeout), name + " link " + optimization)
+        let result = test.run([path + ".exe"], environment, "", path + ".run", compiler.runTimeout)
+        test.check(result.status == 0 && result.output == expected, name + " execution " + optimization + "\n" + result.output + result.errorOutput)
+    }
+    print(name + ": scalar/mixed selection and execution passed")
+}
+checkCase(compiler, "scalar", "record Value { x: Integer; flag: Boolean; letter: Character }\nfunction make(n: Integer): Value { return Value { letter: 'z'; flag: true; x: n } }\nlet value = make(37)\nprint(value.x)\nprint(value.flag)\nprint(value.letter)\n", "37\ntrue\nz\n", 3, 0)
+checkCase(compiler, "mixed", "record Value { x: Integer; label: Text }\nfunction make(n: Integer): Value { return Value { x: n; label: \"mixed\" } }\nlet value = make(41)\nprint(value.x)\nprint(value.label)\n", "41\nmixed\n", 0, 1)
+checkCase(compiler, "nested", "record Leaf { x: Integer }\nrecord Parent { tag: Integer; child: Leaf }\nfunction make(n: Integer): Parent { return Parent { child: Leaf { x: n }; tag: 8 } }\nlet value = make(13)\nprint(value.tag)\nprint(value.child.x)\n", "8\n13\n", 1, 1)
+checkCase(compiler, "effects", "record Value { x: Integer; y: Integer }\nfunction next(values: List<Integer>): Integer { values[0] = values[0] + 1; return values[0] }\nfunction make(values: List<Integer>): Value { return Value { y: next(values); x: next(values) } }\nlet state = [10]\nlet value = make(state)\nprint(value.x)\nprint(value.y)\nprint(state[0])\n", "12\n11\n12\n", 2, 0)
+test.removeTree(compiler.directory)

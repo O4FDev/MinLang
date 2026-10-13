@@ -1,0 +1,55 @@
+use "../tools/testing.min" as test
+use "../tools/check-runner.min" as runner
+use "system" as system
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let sanitize = false
+let legacyOnly = false
+let index = 0
+while index < argumentCount() {
+    let option = argument(index)
+    if option == "--sanitize" { sanitize = true }
+    else if option == "--legacy-only" { legacyOnly = true }
+    else if option == "--clang" {
+        index += 1
+        test.check(index < argumentCount(), "--clang needs a value")
+        clang = argument(index)
+    } else { fail("unknown runtime trap option: " + option) }
+    index += 1
+}
+let work = test.scratch()
+let environment = runner.environment(system.environment(), "ASAN_OPTIONS", "detect_leaks=0:halt_on_error=1")
+environment = runner.environment(environment, "UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1")
+let names = ["overflow", "zero", "division"]
+let diagnostics = ["this Integer calculation is outside the supported range.", "an Integer cannot be divided by zero.", "this Integer division is outside the supported range."]
+for profile in ["eager", "arena", "system", "fixed", "lazy"] {
+    let executable = work + "/" + profile
+    let command = [clang, "-std=c11", "-Wall", "-Wextra", "-Werror"]
+    if sanitize {
+        for flag in ["-O1", "-g", "-fsanitize=address,undefined"] { command.add(flag) }
+    } else { command.add("-O2") }
+    if !legacyOnly { command.add("-DMINYAR_TEST_EXPLICIT_TRAPS") }
+    if profile == "arena" { command.add("-DMINYAR_COMPILER_ARENA") }
+    if profile == "system" { command.add("-DMINYAR_SYSTEM_HEAP=1") }
+    if profile == "fixed" || profile == "lazy" { command.add("-DMINYAR_BOUNDED_HEAP=1") }
+    if profile == "lazy" { command.add("-DMINYAR_LAZY_HEAP=1") }
+    for item in ["tests/runtime-traps.c", "-lm", "-o", executable] { command.add(item) }
+    test.require(test.run(command, system.environment(), "", work + "/compile", 60), "runtime trap compile")
+    let valid = test.run([executable, "valid"], environment, "", work + "/valid", 10)
+    test.check(valid.status == 0 && valid.output == "valid checks return\n" && valid.errorOutput == "", "valid runtime guards changed")
+    let cases = 5
+    for position in 0..names.length {
+        let variants = [names[position]]
+        if !legacyOnly { variants.add("fail-" + names[position]) }
+        for variant in variants {
+            let result = test.run([executable, variant], environment, "", work + "/trap", 10)
+            test.check(result.status == 1 && result.output == "" && result.errorOutput == "Minyar stopped: " + diagnostics[position] + "\n", profile + " " + variant + ": arithmetic trap changed\n" + result.output + result.errorOutput)
+            cases += 1
+        }
+    }
+    for capacity in ["-9223372036854775808", "-1", "2305843009213693952", "4611686018427387904", "9223372036854775807"] {
+        let result = test.run([executable, "growth", capacity], environment, "", work + "/growth", 10)
+        test.check(result.status == 1 && result.output == "" && result.errorOutput == "Minyar stopped: this List became too large.\n", profile + " " + capacity + ": capacity trap changed\n" + result.output + result.errorOutput)
+    }
+    print(profile + ": valid arithmetic and " + Text(cases) + " exact failure paths passed")
+}
+test.removeTree(work)

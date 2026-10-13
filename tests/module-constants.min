@@ -1,0 +1,109 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+function rejects(compiler: test.Compiler, source: Text, diagnostic: Text) {
+    let result = test.compile(compiler, source)
+    test.check(result.status == 1, "expected compiler rejection\n" + result.errorOutput)
+    test.check(result.output == "", "rejected source wrote standard output")
+    test.check(test.contains(result.errorOutput, diagnostic), "missing diagnostic: " + diagnostic + "\n" + result.errorOutput)
+    test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "invalid source left LLVM output")
+    test.check(!test.contains(result.errorOutput, "List position"), "compiler rejection reported a runtime List trap")
+}
+function recursive(compiler: test.Compiler, source: Text) {
+    test.require(test.compile(compiler, source), "compile recursive constants")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization]
+        for flag in compiler.flags { command.add(flag) }
+        for item in ["-Wno-override-module", path + ".ll", compiler.runtime, "-lm", "-o", path + ".exe"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".link", compiler.linkTimeout), "link recursive constants")
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", compiler.runTimeout)
+        test.check(result.status == 1, "recursive initializer status")
+        test.check(result.output == "", "recursive initializer stdout")
+        test.check(result.errorOutput == "Minyar stopped: module constant initialization is recursive.\n", "recursive initializer diagnostic")
+    }
+}
+let compiler = test.compiler()
+if true {
+    let expected: List<Integer> = []
+    for index in 0..256 {
+        let value = index
+        for bit in 0..8 {
+            if value % 2 == 1 { value = (value / 2) ^ 0x82F63B78 }
+            else { value = value / 2 }
+        }
+        expected.add(value)
+    }
+    for group in 1..8 {
+        for index in 0..256 {
+            let value = expected[(group - 1) * 256 + index]
+            expected.add((value / 256) ^ expected[value % 256])
+        }
+    }
+    let pieces: List<Text> = []
+    for index in 0..expected.length {
+        if index > 0 { pieces.add(",") }
+        pieces.add(Text(expected[index]))
+    }
+    test.executes(compiler, "constant POLYNOMIAL = 0x82F63B78\nconstant TABLE: List<Integer> = makeTable()\nfunction makeTable(): List<Integer> {\n    print(\"crc init\")\n    let table: List<Integer> = []\n    for i in 0..256 {\n        let value = i\n        for bit in 0..8 {\n            if value & 1 == 1 { value = (value >> 1) ^ POLYNOMIAL } else { value = value >> 1 }\n        }\n        table.add(value)\n    }\n    for group in 1..8 {\n        for i in 0..256 {\n            let value = table[(group - 1) * 256 + i]\n            table.add((value >> 8) ^ table[value & 255])\n        }\n    }\n    return table\n}\nfunction cell(i: Integer): Integer { return TABLE[i] }\nlet oracle = [" + joinText(pieces) + "]\nfor i in 0..2048 { if cell(i) != oracle[i] { fail(\"CRC32C table\") } }\nprint(TABLE.length)\nprint(cell(1))\n", "crc init\n2048\n4067132163\n")
+}
+if true {
+    test.executes(compiler, "constant TABLE: List<Integer> = makeTable()\nfunction makeTable(): List<Integer> {\n    print(\"init\")\n    let table: List<Integer> = []\n    for i in 0..2048 { table.add(i * 7) }\n    return table\n}\nfunction item(i: Integer): Integer { return TABLE[i] }\nfunction main(): Integer {\n    print(\"main\")\n    print(item(2047))\n    print(item(1))\n    print(TABLE.length)\n    return 0\n}\n", "init\nmain\n14329\n7\n2048\n")
+}
+if true {
+    writeTextFile(compiler.directory + "/table.min", "public constant TABLE: List<Text> = make()\nfunction make(): List<Text> { print(\"table init\"); return [\"a\" + \"!\", \"b\" + \"!\"] }\npublic function first(): Text { return TABLE[0] }\n")
+    for name in ["left", "right"] { writeTextFile(compiler.directory + "/" + name + ".min", "use \"./table.min\" as table\npublic function value(): Text { return table.first() }\n") }
+    test.executes(compiler, "use \"./left.min\" as left\nuse \"./right.min\" as right\nprint(left.value())\nprint(right.value())\n", "table init\na!\na!\n")
+}
+if true {
+    test.executes(compiler, "record Table { values: List<Integer>; title: Text }\nconstant ROW: Table = Table { values: [1, 2, 3]; title: \"row\" + \"!\" }\nconstant DATA: Bytes = Bytes(\"abc\")\nconstant ANSWER: Integer = BASE + ROW.values[1]\nconstant BASE: Integer = 40 + 0\nconstant FLAGS: List<Boolean> = [true, false]\nconstant EMPTY: List<Integer> = []\nlet first = ROW\nlet second = ROW\nprint(first.title)\nprint(second.values[2])\nprint(DATA.length)\nprint(ANSWER)\nprint(FLAGS[0])\nprint(EMPTY.length)\n", "row!\n3\n3\n42\ntrue\n0\n")
+}
+if true {
+    writeTextFile(compiler.directory + "/config.min", "public record Table { values: List<Integer> }\npublic constant DATA: Table = Table { values: [7, 9] }\npublic function local(DATA: Integer): Integer { return DATA }\n")
+    test.executes(compiler, "use \"./config.min\" as config\nconstant LOCAL: Integer = 40 + 2\nfunction shadow(LOCAL: Integer): Integer { return LOCAL }\nprint(config.DATA.values[1])\nprint(config.local(3))\nprint(shadow(4))\nprint(LOCAL)\n", "9\n3\n4\n42\n")
+}
+if true {
+    recursive(compiler, "constant FIRST: Integer = second()\nconstant SECOND: Integer = first()\nfunction first(): Integer { return FIRST }\nfunction second(): Integer { return SECOND }\nprint(FIRST)\n")
+}
+if true {
+    for body in ["return 0", "if argumentCount() == 0 { return 0 }; return 1"] {
+    test.executes(compiler, "constant TABLE: List<Text> = make()\nfunction make(): List<Text> { print(\"unused init\"); return [\"value\" + \"!\"] }\nfunction main(): Integer { " + body + " }\n", "unused init\n")
+    }
+}
+if true {
+    rejects(compiler, "constant TABLE: List<Integer> = [1, 2]\nparallel function read(index: Integer): Integer { return TABLE[index] }\n", "parallel function 'read' may use only Integer, Float, Boolean and Character values")
+}
+if true {
+    test.executes(compiler, "constant TABLE: List<Integer> = [1]\nlet alias = TABLE\nTABLE[0] = 2\nTABLE[0] += 3\nprint(alias[0])\n", "5\n")
+    test.executes(compiler, "constant DATA: Bytes = Bytes(\"abc\")\nlet alias = DATA\nDATA[0] = 65\nDATA[1] += 1\nprint(Text(alias))\n", "Acc\n")
+    test.executes(compiler, "record Box { value: Integer }\nconstant BOX: Box = Box { value: 1 }\nlet alias = BOX\nBOX.value = 2\nBOX.value *= 3\nprint(alias.value)\n", "6\n")
+}
+if true {
+    test.executes(compiler, "record Box { values: List<List<Integer>>; data: List<Bytes>; title: Text }\nconstant BOXES: List<Box> = [Box { values: [[1]]; data: [Bytes(\"abc\")]; title: \"a\" + \"!\" }]\nlet alias = BOXES[0]\nBOXES[0].values[0][0] = 4\nBOXES[0].values[0][0] += 2\nBOXES[0].data[0][0] = 65\nBOXES[0].data[0][1] += 1\nBOXES[0].title += \"b\"\nBOXES[0].title = BOXES[0].title + \"c\"\nalias.values[0][0] *= 7\nprint(BOXES[0].values[0][0])\nprint(Text(alias.data[0]))\nprint(alias.title)\n", "42\nAcc\na!bc\n")
+}
+if true {
+    writeTextFile(compiler.directory + "/tables.min", "public record Box { value: Integer; values: List<Integer>; data: Bytes }\npublic constant TABLE: List<Integer> = [1]\npublic constant DATA: Bytes = Bytes(\"abc\")\npublic constant BOX: Box = Box { value: 1; values: [1]; data: DATA }\n")
+    test.executes(compiler, "use \"./tables.min\" as first\nuse \"./tables.min\" as second\nfirst.TABLE[0] = 2\nfirst.TABLE[0] += 3\nfirst.DATA[0] = 65\nfirst.DATA[1] += 1\nfirst.BOX.value = 2\nfirst.BOX.value *= 3\nfirst.BOX.values[0] = 42\nfirst.BOX.data[2] = 68\nprint(second.TABLE[0])\nprint(Text(second.DATA))\nprint(second.BOX.value)\nprint(second.BOX.values[0])\n", "5\nAcD\n6\n42\n")
+}
+if true {
+    rejects(compiler, "constant VALUE = 1\nVALUE = 2\n", "constant 'VALUE' cannot be reassigned")
+    rejects(compiler, "constant VALUE: Integer = 1 + 0\nVALUE = 2\n", "constant 'VALUE' cannot be reassigned")
+    rejects(compiler, "constant TABLE: List<Integer> = [1]\nTABLE = [2]\n", "constant 'TABLE' cannot be reassigned")
+    rejects(compiler, "constant DATA: Bytes = Bytes(\"a\")\nDATA = Bytes(\"b\")\n", "constant 'DATA' cannot be reassigned")
+    rejects(compiler, "record Box { value: Integer }\nconstant BOX: Box = Box { value: 1 }\nBOX = Box { value: 2 }\n", "constant 'BOX' cannot be reassigned")
+    for operator in ["+=", "-=", "*=", "/=", "%="] { rejects(compiler, "constant VALUE: Integer = 1 + 0\nVALUE " + operator + " 2\n", "constant 'VALUE' cannot be reassigned") }
+    writeTextFile(compiler.directory + "/constant.min", "public constant VALUE = 1\n")
+    for operator in ["=", "+="] { rejects(compiler, "use \"./constant.min\" as config\nconfig.VALUE " + operator + " 2\n", "constant 'VALUE' cannot be reassigned") }
+}
+if true {
+    test.executes(compiler, "constant TABLE: List<Integer> = [1]\nconstant VALUE = 1\nfunction write(TABLE: List<Integer>, VALUE: Integer) {\n    TABLE[0] = 3\n    TABLE[0] += 4\n    VALUE = 8\n    VALUE += 1\n    print(TABLE[0])\n    print(VALUE)\n}\nwrite([2], 2)\nprint(TABLE[0])\nprint(VALUE)\n", "7\n9\n1\n1\n")
+}
+if true {
+    rejects(compiler, "constant TABLE = [1, 2]\n", "a nonliteral constant needs a type annotation")
+    rejects(compiler, "constant TABLE: List<Integer> = [\"wrong\"]\n", "all values in a List literal must have the same type")
+    rejects(compiler, "constant TABLE: List<Integer> = 1\n", "the value for constant 'TABLE' is Integer, not List<Integer>")
+    rejects(compiler, "constant TABLE: List<Integer> = value()\nfunction value(): Integer { return 1 }\n", "the initializer for constant 'TABLE' has the wrong type")
+    rejects(compiler, "constant EMPTY: Nothing = 1\n", "Nothing cannot be used as a value type")
+}
+test.removeTree(compiler.directory)
+print("Module constants: passed")
