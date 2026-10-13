@@ -95,5 +95,34 @@ for budget in [1, 2] {
         test.check(result.status == 0 && result.output == "alive!\n" && result.errorOutput == "", "ownership boundary preserves reference lifetime at " + optimization)
     }
 }
+rejection(compiler, "constant G: Integer = 1\nfunction k() {}\nfunction f() {}\nfunction f() {}\nfunction f() {}\nprint(1)\n", "line 4, column 10: module declares 'f' more than once")
+rejection(compiler, "print(\"abc\".size)\n", "this value does not provide a field named 'size'")
+rejection(compiler, "let items = [1, 2]\nprint(items.byteLength)\n", "this value does not provide a field named 'byteLength'")
+test.require(test.compile(compiler, "print(Integer(7.9))\n"), "Float to Integer conversion compiles")
+test.check(!test.contains(readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll"), "minyar_text_integer"), "only Text conversions declare the Text integer parser")
+test.require(test.compile(compiler, "print(Integer(\"42\"))\n"), "Text to Integer conversion compiles")
+test.check(test.contains(readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll"), "minyar_text_integer"), "Text conversions declare the Text integer parser")
+writeTextFile(work + "/joined.min", "constant VALUES: List<Integer> = [7]\nthread function worker(seed: Integer, input: FrozenBytes, channel: BytesChannel): Integer { return seed }\nfunction main() {\nlet frozen = freezeBytes(Bytes(8))\nlet channel = bytesChannel(4096, 8)\nlet handle = startThread(worker, VALUES[0], frozen, channel)\nprint(joinThread(handle))\n}\n")
+test.require(test.run([compiler.executable, work + "/joined.min", work + "/joined.ll", "--library", "library"], system.environment(), "", work + "/joined.compile", 30), "threaded main with module constants compiles")
+let joinedFunction = ""
+let joined = false
+let released = false
+for line in test.lines(readTextFile(work + "/joined.ll")) {
+    if test.contains(line, "define ") { joinedFunction = line; joined = false }
+    if test.contains(joinedFunction, "@main(") && test.contains(line, "call void @minyar_thread_join_children()") { joined = true }
+    if test.contains(joinedFunction, "@main(") && test.contains(line, "call void @.minyar.constants.release()") {
+        test.check(joined, "main joins child threads before releasing module constants")
+        released = true
+    }
+}
+test.check(released, "threaded main releases module constants")
+writeTextFile(work + "/quoted.min", "public constant GREETING: Text = \"hi \\\"there\\\"\"\npublic function shout(value: Text): Text { return value + \"!\" }\n")
+writeTextFile(work + "/quoting.min", "use \"./quoted.min\" as quoted\nfunction main() { print(quoted.shout(quoted.GREETING)) }\n")
+for mode in ["cold", "warm"] {
+    let input = work + "/empty-state"
+    if mode == "warm" { input = work + "/quoting-cold.state" }
+    let prefix = work + "/quoting-" + mode
+    test.require(test.run([compiler.executable, work + "/quoting.min", prefix + ".ll", "--module-state", input, prefix + ".state", prefix + ".stats"], system.environment(), "", prefix + ".compile", 30), "cached module interface with quoted Text compiles " + mode)
+}
 test.removeTree(work)
 print("mutation boundary coverage: passed")
