@@ -37,7 +37,10 @@ def main():
     environment = dict(os.environ, MINYAR_CALLBACK_COMPILER=str(COMPILER),
         MINYAR_ERRORS_COMPILER=str(COMPILER), MINYAR_TEST_MODULE_COMPILER=str(COMPILER),
         MINYAR_MODULE_CALLBACK_COMPILER=str(COMPILER))
-    for suite in SUITES:
+    suites = list(SUITES)
+    if (ROOT / 'compiler/stages/c-layout.min').is_file():
+        suites.append('c-layout-records')
+    for suite in suites:
         result = checked([sys.executable, str(ROOT / 'tests' / (suite + '.py'))],
                          cwd=ROOT, env=environment)
         print(suite + ': passed', flush=True)

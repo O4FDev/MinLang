@@ -11,6 +11,7 @@ VERSION = "23.1.2"
 FILES = (
     "bootstrap/stage0.c", "tools/module-build.c",
     "runtime/minyar_bytes.h", "runtime/minyar_collections.h", "runtime/minyar_numbers.h",
+    "runtime/minyar_c_layout.h", "tests/c-layout-records.c", "tests/c-layout-storage.c",
     "runtime/native/net.c", "runtime/native/net_datagrams.h", "runtime/native/net_loop.h",
     "runtime/native/net_udp_offload.h",
     "runtime/native/app_net_loop.h",
