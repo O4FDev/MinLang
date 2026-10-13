@@ -102,9 +102,9 @@ void minyar_test_http_identity(const MinyarBytes *reference) { @autoreleasepool 
     const char *url=getenv("MINYAR_TEST_OS_TLS_URL");
     if (url) {
         SEL selector=@selector(URLSession:task:didReceiveChallenge:completionHandler:);
-        Method method=class_getInstanceMethod([MHDelegate class],selector);
-        assert(method);
-        class_replaceMethod([MHDelegate class],selector,(IMP)http_fixture_challenge,method_getTypeEncoding(method));
+        Method challengeMethod=class_getInstanceMethod([MHDelegate class],selector);
+        assert(challengeMethod);
+        class_replaceMethod([MHDelegate class],selector,(IMP)http_fixture_challenge,method_getTypeEncoding(challengeMethod));
         MinyarText method=http_test_text("GET"),address=http_test_text(url),blank=http_test_text("");
         long long handle=minyar_http_beginWithIdentity(&method,&address,&blank,&blank,reference,&empty);
         assert(minyar_http_wait(handle,10));
