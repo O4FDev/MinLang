@@ -329,7 +329,8 @@ def main():
     env.update(PATH=str(bindir) + os.pathsep + env.get('PATH', ''),
                ASAN_OPTIONS='detect_leaks=0:abort_on_error=1',
                UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1',
-               CC='clang', CXX='clang++', CLANG='clang', MINYAR_TEST_CLANG='clang',
+               CC='clang', LLVM_CC='clang', CXX='clang++', CLANG='clang', MINYAR_TEST_CLANG='clang',
+               COMPILER_LTO_FLAGS='-flto -fuse-ld=lld',
                LIMITED='', SANITIZER_LIMITED='')
     # Each make is serial; concurrency comes from running several checks at once.
     make = [tools['make'], '-j1', 'LIMITED=', 'SANITIZER_LIMITED=', 'CC=clang', 'LLVM_CC=clang',
