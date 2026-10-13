@@ -1,0 +1,164 @@
+use "../tools/testing.min" as test
+use "../tools/cycle-runtime.min" as cycle
+use "./thread-port-support.min" as support
+use "./cycle-port-support.min" as groups
+use "system" as system
+use "files" as files
+use "json" as json
+
+function contains(values: List<Text>, wanted: Text): Boolean {
+    for value in values { if value == wanted { return true } }
+    return false
+}
+function numbers(values: List<Integer>): Text {
+    let parts: List<Text> = []
+    for value in values { parts.add(Text(value)) }
+    return "[" + support.joined(parts, ", ") + "]"
+}
+function usage(message: Text) {
+    system.writeStandardError("cycle-additive: error: " + message + "\n")
+    exit(2)
+}
+
+let fixtures = ["cycle-additive.c", "cycle-registry-growth.c", "cycle-leaf-churn.c", "cycle-captured-retirement.c", "cycle-fresh-mark-retirement.c", "cycle-detached-first-insertion.c", "cycle-full-mark-zero.c"]
+let sanitize = false
+let fixture = "cycle-additive.c"
+let selectedCase = "all"
+let requested: List<Text> = []
+let profilesGiven = false
+let budgets = [1, 32, 1024]
+let nodes = [32, 256, 2048]
+let evidence = ""
+let index = 0
+while index < argumentCount() {
+    let option = argument(index)
+    if option == "--sanitize" { sanitize = true; index += 1; continue }
+    test.check(index + 1 < argumentCount(), "option needs a value: " + option)
+    if option == "--fixture" {
+        fixture = argument(index + 1)
+        if !contains(fixtures, fixture) { usage("invalid fixture: " + fixture) }
+        index += 2
+    } else if option == "--case" {
+        selectedCase = argument(index + 1)
+        if !contains(["all", "registered", "callbacks", "streaming", "safety", "active"], selectedCase) { usage("invalid case: " + selectedCase) }
+        index += 2
+    } else if option == "--evidence" {
+        evidence = argument(index + 1)
+        index += 2
+    } else if option == "--profiles" || option == "--budgets" || option == "--nodes" {
+        let values: List<Text> = []
+        index += 1
+        while index < argumentCount() && !support.starts(argument(index), "--") { values.add(argument(index)); index += 1 }
+        if values.length == 0 { usage(option + " needs values") }
+        if option == "--profiles" {
+            for value in values { if !contains(["system", "fixed", "lazy", "eager"], value) { usage("invalid profile: " + value) } }
+            requested = values
+            profilesGiven = true
+        } else {
+            let parsed: List<Integer> = []
+            let choices = ["32", "256", "512", "2048"]
+            if option == "--budgets" { choices = ["1", "32", "1024"] }
+            for value in values {
+                if !contains(choices, value) { usage("invalid " + option + " choice: " + value) }
+                parsed.add(groups.parseInteger(value))
+            }
+            if option == "--budgets" { budgets = parsed } else { nodes = parsed }
+        }
+    } else { usage("unknown option: " + option) }
+}
+if evidence == "" { usage("the following arguments are required: --evidence") }
+let profiles = ["system", "fixed", "lazy", "eager"]
+if profilesGiven { profiles = requested }
+let unsupported: List<Text> = []
+if fixture == "cycle-captured-retirement.c" || fixture == "cycle-fresh-mark-retirement.c" || fixture == "cycle-full-mark-zero.c" {
+    if selectedCase != "all" { usage("dead-owner retirement owns its complete C schedule") }
+    if profilesGiven && contains(requested, "eager") { usage("dead-owner retirement certifies bounded cleanup; eager RC is unchanged") }
+    let kept: List<Text> = []
+    for profile in profiles { if profile != "eager" { kept.add(profile) } }
+    profiles = kept
+    unsupported.add("{\"profile\": \"eager\", \"reason\": \"Dead-owner certificates use bounded cleanup; eager RC is unchanged.\"}")
+}
+if fixture == "cycle-detached-first-insertion.c" {
+    if selectedCase != "all" { usage("detached first insertion owns its full positive and negative schedule") }
+    let bad = false
+    for budget in budgets { if budget > 32 { bad = true } }
+    for count in nodes { if count < 512 { bad = true } }
+    if bad { usage("detached first insertion requires --budgets 1 32 and --nodes 512 2048") }
+    if profilesGiven && contains(requested, "eager") { usage("detached first insertion observes bounded full-build phases") }
+    let kept: List<Text> = []
+    for profile in profiles { if profile != "eager" { kept.add(profile) } }
+    profiles = kept
+    unsupported.add("{\"profile\": \"eager\", \"reason\": \"Detached first insertion observes bounded full-build phases.\"}")
+}
+if fixture == "cycle-full-mark-zero.c" {
+    let bad = false
+    for budget in budgets { if budget > 32 { bad = true } }
+    for count in nodes { if count < 512 { bad = true } }
+    if bad { usage("full MARK zero retirement requires --budgets 1 32 and --nodes 512 2048") }
+}
+let logs = test.scratch()
+test.require(test.run(["mkdir", "-p", "--", evidence], system.environment(), "", logs + "/mkdir", 10), "create evidence directory")
+let out = test.lines(test.run(["sh", "-c", "cd \"$1\" && pwd -P", "minyar", evidence], system.environment(), "", logs + "/resolve", 10).output)[0]
+test.removeScratch(logs)
+test.check(files.makeDirectory("build") == 0, "cannot create build directory")
+cycle.publishEngine(".", "")
+let inputs = ["tests/cycle-additive.c", "tests/" + fixture, "tests/cycle-additive.min", "tests/cycle-port-support.min", "tools/cycle-runtime.min", "runtime/minyar_runtime.c"]
+for path in support.treeFiles(["runtime"]) {
+    let raw = Bytes(path)
+    if Text(raw.slice(raw.length - 2, raw.length)) == ".h" && support.find(Text(raw.slice(8, raw.length)), "/", 0) < 0 { inputs.add(path) }
+}
+if fixture == "cycle-captured-retirement.c" || fixture == "cycle-fresh-mark-retirement.c" || fixture == "cycle-detached-first-insertion.c" || fixture == "cycle-full-mark-zero.c" { inputs.add("tests/cycle-leaf-churn.c") }
+if fixture == "cycle-full-mark-zero.c" { inputs.add("tests/cycle-detached-first-insertion.c") }
+let environment = support.environment(system.environment(), ["ASAN_OPTIONS", "UBSAN_OPTIONS"], [support.asanLeakOptions() + ":halt_on_error=1", "halt_on_error=1:print_stacktrace=1"])
+let flags = ["-O2"]
+if sanitize { flags = ["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"] }
+let historical = !test.contains(readTextFile("runtime/minyar_cycles.h"), "rc_cycle_edge_insert")
+let heapBytes = 1048576
+if fixture == "cycle-registry-growth.c" { heapBytes = 4194304 }
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let plan: List<groups.Group> = []
+for profile in profiles {
+    let selectedBudgets = budgets
+    if profile == "eager" { selectedBudgets = [32] }
+    for budget in selectedBudgets {
+        let label = profile + "-k" + Text(budget)
+        let binary = out + "/" + label
+        let command = [clang]
+        for flag in flags { command.add(flag) }
+        for item in ["-std=c11", "-Wall", "-Wextra", "-Werror", "-iquote", "runtime"] { command.add(item) }
+        if profile == "system" { command.add("-DMINYAR_SYSTEM_HEAP=1") }
+        if profile == "fixed" || profile == "lazy" { command.add("-DMINYAR_BOUNDED_HEAP=1") }
+        if profile == "lazy" { command.add("-DMINYAR_LAZY_HEAP=1") }
+        command.add("-DMINYAR_BOUNDED_HEAP_BYTES=" + Text(heapBytes))
+        command.add("-DMINYAR_RC_POLL_BUDGET=" + Text(budget))
+        if historical { command.add("-Drc_cycle_edge_insert=rc_cycle_edge_add") }
+        for item in ["tests/" + fixture, "-lm", "-o", binary] { command.add(item) }
+        let phases = [groups.Phase { label: "compile"; argv: command }]
+        for count in nodes {
+            if fixture == "cycle-detached-first-insertion.c" {
+                for phase in [1, 2, 3] {
+                    for copied in [0, 1] { phases.add(groups.Phase { label: "run-n" + Text(count) + "-detached-p" + Text(phase) + "-copy" + Text(copied); argv: [binary, Text(count), "detached", Text(phase), Text(copied)] }) }
+                    for mode in ["internal", "exposed", "registered-descendant", "self-cycle"] { phases.add(groups.Phase { label: "run-n" + Text(count) + "-" + mode + "-p" + Text(phase); argv: [binary, Text(count), mode, Text(phase), "1"] }) }
+                    if phase >= 2 { phases.add(groups.Phase { label: "run-n" + Text(count) + "-anchor-take-p" + Text(phase); argv: [binary, Text(count), "anchor-take", Text(phase), "0"] }) }
+                }
+            } else {
+                phases.add(groups.Phase { label: "run-n" + Text(count); argv: [binary, Text(count), selectedCase] })
+            }
+        }
+        plan.add(groups.Group { label: label; binary: binary; phases: phases })
+    }
+}
+let quotedProfiles: List<Text> = []
+for profile in profiles { quotedProfiles.add(json.quote(profile)) }
+let sources = support.digestMembers(inputs)
+let outcomes = groups.runGroups(plan, environment, out, groups.testJobs(), groups.cpuGuard(), true)
+let cases: List<Text> = []
+let resources: List<Text> = []
+let failures: List<Text> = []
+for outcome in outcomes {
+    for item in outcome.cases { cases.add(item) }
+    for item in outcome.resources { resources.add(item) }
+    if outcome.failed != "" { failures.add(outcome.failed) }
+}
+writeTextFile(out + "/manifest.json", "{\n  \"passed\": " + Text(failures.length == 0) + ",\n  \"sanitize\": " + Text(sanitize) + ",\n  \"cases\": [" + support.joined(cases, ", ") + "],\n  \"resources\": [" + support.joined(resources, ", ") + "],\n  \"profiles\": [" + support.joined(quotedProfiles, ", ") + "],\n  \"unsupported_profiles\": [" + support.joined(unsupported, ", ") + "],\n  \"source_sha256\": {" + support.joined(sources, ", ") + "},\n  \"historical_barrier_adapter\": " + Text(historical) + ",\n  \"bounded_heap_bytes\": " + Text(heapBytes) + "\n}\n")
+test.check(failures.length == 0, support.joined(failures, ", "))

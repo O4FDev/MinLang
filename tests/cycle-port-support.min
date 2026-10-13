@@ -121,3 +121,122 @@ public function trimmed(text: Text): Text {
     while end > start && raw[end - 1] <= 32 { end -= 1 }
     return Text(raw.slice(start, end))
 }
+public record Phase { label: Text; argv: List<Text> }
+public record Group { label: Text; binary: Text; phases: List<Phase> }
+public record Outcome { cases: List<Text>; resources: List<Text>; failed: Text; digest: Text }
+record Slot { group: Integer; phase: Integer; handle: Integer; started: Integer; total: Integer; idle: Integer; stopped: Boolean; maximum: Float }
+public function testJobs(): Integer {
+    let value = system.getenv("MINYAR_TEST_JOBS")
+    if value == "" { return 2 }
+    let parsed = 0
+    for byte in Bytes(value) {
+        test.check(byte >= 48 && byte <= 57, "MINYAR_TEST_JOBS must be a decimal Integer")
+        parsed = parsed * 10 + byte - 48
+    }
+    return max(1, parsed)
+}
+public function cpuGuard(): Boolean {
+    return support.host() == "Linux" && system.getenv("MINYAR_TEST_SHARED_HOST") == ""
+}
+function counters(): List<Integer> {
+    let fields = test.words(test.lines(readTextFile("/proc/stat"))[0])
+    let total = 0
+    for index in 1..9 { total += parseInteger(fields[index]) }
+    return [total, parseInteger(fields[4]) + parseInteger(fields[5])]
+}
+public function parseInteger(value: Text): Integer {
+    let result = 0
+    for byte in Bytes(value) {
+        test.check(byte >= 48 && byte <= 57, "invalid decimal Integer: " + value)
+        result = result * 10 + byte - 48
+    }
+    return result
+}
+function pause() {
+    let handle = system.spawn("/bin/sleep", ["sleep", "0.25"], system.environment(), "")
+    test.check(handle > 0, "cannot pause")
+    system.wait(handle)
+}
+function seconds(started: Integer): Text {
+    return Text(Float(system.monotonicNanoseconds() - started) / 1000000000.0)
+}
+public function runGroups(groups: List<Group>, environment: List<Text>, output: Text, jobs: Integer, guard: Boolean, progress: Boolean): List<Outcome> {
+    let outcomes: List<Outcome> = []
+    for unused in groups { outcomes.add(Outcome { cases: []; resources: []; failed: ""; digest: "" }) }
+    let slots: List<Slot> = []
+    let next = 0
+    while next < groups.length || slots.length > 0 {
+        while slots.length < jobs && next < groups.length {
+            slots.add(launch(groups, next, 0, environment, output))
+            next += 1
+        }
+        let remaining: List<Slot> = []
+        for slot in slots {
+            let group = groups[slot.group]
+            let phase = group.phases[slot.phase]
+            let log = output + "/" + group.label + "-" + phase.label
+            let status = system.poll(slot.handle)
+            if status.state == system.PENDING {
+                if guard {
+                    let current = counters()
+                    let delta = current[0] - slot.total
+                    let usage = 0.0
+                    if delta != 0 { usage = 100.0 * (1.0 - Float(current[1] - slot.idle) / Float(delta)) }
+                    if usage > slot.maximum { slot.maximum = usage }
+                    slot.total = current[0]
+                    slot.idle = current[1]
+                    let pid = system.childProcessId(slot.handle)
+                    if usage >= 75.0 && !slot.stopped {
+                        system.sendSignal(-pid, 19)
+                        slot.stopped = true
+                        outcomes[slot.group].resources.add("{\"label\": " + json.quote(group.label + "-" + phase.label) + ", \"action\": \"pause\", \"aggregate_cpu_percent\": " + Text(usage) + "}")
+                    } else if slot.stopped && usage < 60.0 {
+                        system.sendSignal(-pid, 18)
+                        slot.stopped = false
+                        outcomes[slot.group].resources.add("{\"label\": " + json.quote(group.label + "-" + phase.label) + ", \"action\": \"resume\", \"aggregate_cpu_percent\": " + Text(usage) + "}")
+                    }
+                }
+                remaining.add(slot)
+                continue
+            }
+            test.check(status.error == 0 && (status.state == system.EXITED || status.state == system.SIGNALED), "process wait failed")
+            let code = status.exitCode
+            if status.state == system.SIGNALED { code = 128 + status.signal }
+            let stdout = readTextFile(log + ".stdout")
+            let stderr = readTextFile(log + ".stdout.err")
+            files.remove(log + ".stdout.err")
+            writeTextFile(log + ".stderr", stderr)
+            if guard { outcomes[slot.group].resources.add("{\"label\": " + json.quote(group.label + "-" + phase.label) + ", \"maximum_aggregate_cpu_percent\": " + Text(slot.maximum) + "}") }
+            else { outcomes[slot.group].resources.add("{\"label\": " + json.quote(group.label + "-" + phase.label) + ", \"cpu_guard\": false}") }
+            let entry = "{\"label\": " + json.quote(group.label + "-" + phase.label) + ", \"status\": " + Text(code) + ", \"stdout\": " + json.quote(stdout) + ", \"stderr\": " + json.quote(stderr) + ", \"seconds\": " + seconds(slot.started) + ", \"argv\": " + support.quotedList(phase.argv)
+            if files.pathSize(group.binary) >= 0 {
+                if outcomes[slot.group].digest == "" { outcomes[slot.group].digest = support.digest(group.binary) }
+                entry = entry + ", \"binary_sha256\": " + json.quote(outcomes[slot.group].digest)
+            }
+            outcomes[slot.group].cases.add(entry + "}")
+            if progress { print(group.label + "-" + phase.label + ": " + Text(code) + " " + trimmed(stderr)) }
+            if code != 0 {
+                outcomes[slot.group].failed = group.label + "-" + phase.label
+            } else if slot.phase + 1 < group.phases.length {
+                remaining.add(launch(groups, slot.group, slot.phase + 1, environment, output))
+            }
+        }
+        slots = remaining
+        if slots.length > 0 { pause() }
+    }
+    return outcomes
+}
+function launch(groups: List<Group>, group: Integer, phase: Integer, environment: List<Text>, output: Text): Slot {
+    let selected = groups[group]
+    let log = output + "/" + selected.label + "-" + selected.phases[phase].label
+    let handle = test.start(selected.phases[phase].argv, environment, "", log + ".stdout", 180)
+    test.check(handle > 0, "process launch failed: " + Text(handle))
+    let total = 0
+    let idle = 0
+    if files.pathSize("/proc/stat") >= 0 {
+        let current = counters()
+        total = current[0]
+        idle = current[1]
+    }
+    return Slot { group: group; phase: phase; handle: handle; started: system.monotonicNanoseconds(); total: total; idle: idle; stopped: false; maximum: 0.0 }
+}

@@ -91,26 +91,29 @@ check-sanitize: check-cycle-witness-sanitize
 check-managed-graphs-profiles: check-cycle-witness check-cycle-witness-sanitize
 
 .PHONY: check-cycle-additive check-cycle-additive-sanitize
-check-cycle-additive:
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-additive.py --evidence build/cycle-additive-native
-check-cycle-additive-sanitize:
-	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-additive.py --sanitize --evidence build/cycle-additive-sanitize
+build/tooling/tests/cycle-additive: TOOL_NATIVE = runtime/native/sha256.c
+build/tooling/tests/cycle-additive: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/cycle-additive: runtime/native/sha256.c
+check-cycle-additive: build/tooling/tests/cycle-additive
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/cycle-additive --evidence build/cycle-additive-native
+check-cycle-additive-sanitize: build/tooling/tests/cycle-additive
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-additive --sanitize --evidence build/cycle-additive-sanitize
 check check-portable: check-cycle-additive check-cycle-additive-sanitize
 check-sanitize: check-cycle-additive-sanitize
 check-managed-graphs-profiles: check-cycle-additive check-cycle-additive-sanitize
 
 .PHONY: check-cycle-registry-growth check-cycle-registry-growth-sanitize
-check-cycle-registry-growth: tests/cycle-registry-growth.c tests/cycle-additive.c tests/cycle-additive.py tools/cycle_runtime.py
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-additive.py --fixture cycle-registry-growth.c --evidence "$(CURDIR)/build/cycle-registry-growth-native"
-check-cycle-registry-growth-sanitize: tests/cycle-registry-growth.c tests/cycle-additive.c tests/cycle-additive.py tools/cycle_runtime.py
-	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-additive.py --fixture cycle-registry-growth.c --sanitize --evidence "$(CURDIR)/build/cycle-registry-growth-sanitize"
+check-cycle-registry-growth: tests/cycle-registry-growth.c tests/cycle-additive.c tests/cycle-additive.min tools/cycle_runtime.py build/tooling/tests/cycle-additive
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/cycle-additive --fixture cycle-registry-growth.c --evidence "$(CURDIR)/build/cycle-registry-growth-native"
+check-cycle-registry-growth-sanitize: tests/cycle-registry-growth.c tests/cycle-additive.c tests/cycle-additive.min tools/cycle_runtime.py build/tooling/tests/cycle-additive
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-additive --fixture cycle-registry-growth.c --sanitize --evidence "$(CURDIR)/build/cycle-registry-growth-sanitize"
 check check-portable: check-cycle-registry-growth check-cycle-registry-growth-sanitize
 check-sanitize: check-cycle-registry-growth-sanitize
 check-managed-graphs-profiles: check-cycle-registry-growth check-cycle-registry-growth-sanitize
 
 # Both C mains own their complete schedules; no --nodes arguments apply.
 .PHONY: check-cycle-registration-exposure check-cycle-registration-exposure-sanitize
-CYCLE_REGISTRATION_INPUTS = tests/cycle-registration.py tests/cycle-registration-exposure.c tests/cycle-late-registration.c tests/cycle-late-registration.min tests/cycle-additive.c tests/cycle-additive.py tests/errors-language.py tests/callbacks.py tests/errors_evidence.py tests/test_evidence.py tools/cycle_runtime.py $(RUNTIME_HEADERS)
+CYCLE_REGISTRATION_INPUTS = tests/cycle-registration.py tests/cycle-registration-exposure.c tests/cycle-late-registration.c tests/cycle-late-registration.min tests/cycle-additive.c tests/cycle-additive.min tests/errors-language.py tests/callbacks.py tests/errors_evidence.py tests/test_evidence.py tools/cycle_runtime.py $(RUNTIME_HEADERS)
 check-cycle-registration-exposure: build/minyarc-errors $(CYCLE_REGISTRATION_INPUTS)
 	MINYAR_ERRORS_COMPILER=./build/minyarc-errors MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-registration.py --evidence "$(CURDIR)/build/cycle-registration-exposure-native"
 check-cycle-registration-exposure-sanitize: build/minyarc-errors-sanitize $(CYCLE_REGISTRATION_INPUTS)
@@ -122,7 +125,7 @@ check-sanitize: check-cycle-registration-exposure-sanitize
 
 # Every C command takes N OPERATION [ARGS]; these are production-header controls.
 .PHONY: check-cycle-private-retirement check-cycle-private-retirement-sanitize
-CYCLE_PRIVATE_RETIREMENT_INPUTS = tests/cycle-private-retirement.py tests/cycle-idle-invalidation.c tests/cycle-private-retirement-v5.json tests/fixtures/cycle-private-retirement-v5-collector.h tests/cycle-additive.c tests/cycle-additive.py tests/clang_helpers.py tests/test_evidence.py tools/cycle_runtime.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
+CYCLE_PRIVATE_RETIREMENT_INPUTS = tests/cycle-private-retirement.py tests/cycle-idle-invalidation.c tests/cycle-private-retirement-v5.json tests/fixtures/cycle-private-retirement-v5-collector.h tests/cycle-additive.c tests/cycle-additive.min tests/clang_helpers.py tests/test_evidence.py tools/cycle_runtime.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
 check-cycle-private-retirement: $(CYCLE_PRIVATE_RETIREMENT_INPUTS) | build
 	@set -e; evidence=$$(mktemp -d "$(abspath build)/cycle-private-retirement-native-XXXXXX"); \
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-private-retirement.py --evidence "$$evidence/run"
@@ -145,47 +148,47 @@ check check-cycle-progress check-cycle-progress-sanitize check-managed-graphs-pr
 
 # Leaf churn uses the existing rooted-graph driver and its complete C schedule.
 .PHONY: check-cycle-leaf-churn check-cycle-leaf-churn-sanitize
-check-cycle-leaf-churn: tests/cycle-leaf-churn.c tests/cycle-additive.c tests/cycle-additive.py tools/cycle_runtime.py
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-additive.py --fixture cycle-leaf-churn.c --evidence "$(CURDIR)/build/cycle-leaf-churn-native"
-check-cycle-leaf-churn-sanitize: tests/cycle-leaf-churn.c tests/cycle-additive.c tests/cycle-additive.py tools/cycle_runtime.py
-	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-additive.py --fixture cycle-leaf-churn.c --sanitize --evidence "$(CURDIR)/build/cycle-leaf-churn-sanitize"
+check-cycle-leaf-churn: tests/cycle-leaf-churn.c tests/cycle-additive.c tests/cycle-additive.min tools/cycle_runtime.py build/tooling/tests/cycle-additive
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/cycle-additive --fixture cycle-leaf-churn.c --evidence "$(CURDIR)/build/cycle-leaf-churn-native"
+check-cycle-leaf-churn-sanitize: tests/cycle-leaf-churn.c tests/cycle-additive.c tests/cycle-additive.min tools/cycle_runtime.py build/tooling/tests/cycle-additive
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-additive --fixture cycle-leaf-churn.c --sanitize --evidence "$(CURDIR)/build/cycle-leaf-churn-sanitize"
 check check-portable: check-cycle-leaf-churn check-cycle-leaf-churn-sanitize
 check-managed-graphs-profiles: check-cycle-leaf-churn check-cycle-leaf-churn-sanitize
 check-sanitize: check-cycle-leaf-churn-sanitize
 
 # Captured-zero locality uses the existing driver and only bounded profiles.
 .PHONY: check-cycle-captured-retirement check-cycle-captured-retirement-sanitize
-CYCLE_CAPTURED_RETIREMENT_INPUTS = tests/cycle-captured-retirement.c tests/cycle-leaf-churn.c tests/cycle-additive.c tests/cycle-additive.py tools/cycle_runtime.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
-check-cycle-captured-retirement: $(CYCLE_CAPTURED_RETIREMENT_INPUTS) | build
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-additive.py --fixture cycle-captured-retirement.c --evidence "$(CURDIR)/build/cycle-captured-retirement-native"
-check-cycle-captured-retirement-sanitize: $(CYCLE_CAPTURED_RETIREMENT_INPUTS) | build
-	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-additive.py --fixture cycle-captured-retirement.c --sanitize --evidence "$(CURDIR)/build/cycle-captured-retirement-sanitize"
+CYCLE_CAPTURED_RETIREMENT_INPUTS = tests/cycle-captured-retirement.c tests/cycle-leaf-churn.c tests/cycle-additive.c tests/cycle-additive.min tools/cycle_runtime.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
+check-cycle-captured-retirement: $(CYCLE_CAPTURED_RETIREMENT_INPUTS) build/tooling/tests/cycle-additive | build
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/cycle-additive --fixture cycle-captured-retirement.c --evidence "$(CURDIR)/build/cycle-captured-retirement-native"
+check-cycle-captured-retirement-sanitize: $(CYCLE_CAPTURED_RETIREMENT_INPUTS) build/tooling/tests/cycle-additive | build
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-additive --fixture cycle-captured-retirement.c --sanitize --evidence "$(CURDIR)/build/cycle-captured-retirement-sanitize"
 check-managed-graphs-profiles: check-cycle-captured-retirement check-cycle-captured-retirement-sanitize
 
 # Fresh local-MARK zero retirement and issued-marker expiry, bounded profiles only.
 .PHONY: check-cycle-fresh-mark-retirement check-cycle-fresh-mark-retirement-sanitize
-CYCLE_FRESH_MARK_RETIREMENT_INPUTS = tests/cycle-fresh-mark-retirement.c tests/cycle-leaf-churn.c tests/cycle-additive.c tests/cycle-additive.py tools/cycle_runtime.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
-check-cycle-fresh-mark-retirement: $(CYCLE_FRESH_MARK_RETIREMENT_INPUTS) | build
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-additive.py --fixture cycle-fresh-mark-retirement.c --evidence "$(CURDIR)/build/cycle-fresh-mark-retirement-native"
-check-cycle-fresh-mark-retirement-sanitize: $(CYCLE_FRESH_MARK_RETIREMENT_INPUTS) | build
-	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-additive.py --fixture cycle-fresh-mark-retirement.c --sanitize --evidence "$(CURDIR)/build/cycle-fresh-mark-retirement-sanitize"
+CYCLE_FRESH_MARK_RETIREMENT_INPUTS = tests/cycle-fresh-mark-retirement.c tests/cycle-leaf-churn.c tests/cycle-additive.c tests/cycle-additive.min tools/cycle_runtime.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
+check-cycle-fresh-mark-retirement: $(CYCLE_FRESH_MARK_RETIREMENT_INPUTS) build/tooling/tests/cycle-additive | build
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/cycle-additive --fixture cycle-fresh-mark-retirement.c --evidence "$(CURDIR)/build/cycle-fresh-mark-retirement-native"
+check-cycle-fresh-mark-retirement-sanitize: $(CYCLE_FRESH_MARK_RETIREMENT_INPUTS) build/tooling/tests/cycle-additive | build
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-additive --fixture cycle-fresh-mark-retirement.c --sanitize --evidence "$(CURDIR)/build/cycle-fresh-mark-retirement-sanitize"
 check-managed-graphs-profiles: check-cycle-fresh-mark-retirement check-cycle-fresh-mark-retirement-sanitize
 
 .PHONY: check-cycle-detached-first-insertion check-cycle-detached-first-insertion-sanitize
-CYCLE_DETACHED_FIRST_INSERTION_INPUTS = tests/cycle-detached-first-insertion.c tests/cycle-leaf-churn.c tests/cycle-additive.c tests/cycle-additive.py tools/cycle_runtime.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
-check-cycle-detached-first-insertion: $(CYCLE_DETACHED_FIRST_INSERTION_INPUTS) | build
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-additive.py --fixture cycle-detached-first-insertion.c --budgets 1 32 --nodes 512 2048 --evidence "$(CURDIR)/build/cycle-detached-first-insertion-native"
-check-cycle-detached-first-insertion-sanitize: $(CYCLE_DETACHED_FIRST_INSERTION_INPUTS) | build
-	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-additive.py --fixture cycle-detached-first-insertion.c --budgets 1 32 --nodes 512 2048 --sanitize --evidence "$(CURDIR)/build/cycle-detached-first-insertion-sanitize"
+CYCLE_DETACHED_FIRST_INSERTION_INPUTS = tests/cycle-detached-first-insertion.c tests/cycle-leaf-churn.c tests/cycle-additive.c tests/cycle-additive.min tools/cycle_runtime.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
+check-cycle-detached-first-insertion: $(CYCLE_DETACHED_FIRST_INSERTION_INPUTS) build/tooling/tests/cycle-additive | build
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/cycle-additive --fixture cycle-detached-first-insertion.c --budgets 1 32 --nodes 512 2048 --evidence "$(CURDIR)/build/cycle-detached-first-insertion-native"
+check-cycle-detached-first-insertion-sanitize: $(CYCLE_DETACHED_FIRST_INSERTION_INPUTS) build/tooling/tests/cycle-additive | build
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-additive --fixture cycle-detached-first-insertion.c --budgets 1 32 --nodes 512 2048 --sanitize --evidence "$(CURDIR)/build/cycle-detached-first-insertion-sanitize"
 check-managed-graphs-profiles: check-cycle-detached-first-insertion check-cycle-detached-first-insertion-sanitize
 
 # Scanned full-MARK actual-zero retirement and issued-job expiry, bounded profiles only.
 .PHONY: check-cycle-full-mark-zero check-cycle-full-mark-zero-sanitize
-CYCLE_FULL_MARK_ZERO_INPUTS = tests/cycle-full-mark-zero.c tests/cycle-detached-first-insertion.c tests/cycle-leaf-churn.c tests/cycle-additive.c tests/cycle-additive.py tests/clang_helpers.py tests/test_evidence.py tools/cycle_runtime.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
-check-cycle-full-mark-zero: $(CYCLE_FULL_MARK_ZERO_INPUTS) | build
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-additive.py --fixture cycle-full-mark-zero.c --budgets 1 32 --nodes 512 2048 --evidence "$(CURDIR)/build/cycle-full-mark-zero-native"
-check-cycle-full-mark-zero-sanitize: $(CYCLE_FULL_MARK_ZERO_INPUTS) | build
-	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-additive.py --fixture cycle-full-mark-zero.c --budgets 1 32 --nodes 512 2048 --sanitize --evidence "$(CURDIR)/build/cycle-full-mark-zero-sanitize"
+CYCLE_FULL_MARK_ZERO_INPUTS = tests/cycle-full-mark-zero.c tests/cycle-detached-first-insertion.c tests/cycle-leaf-churn.c tests/cycle-additive.c tests/cycle-additive.min tests/clang_helpers.py tests/test_evidence.py tools/cycle_runtime.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
+check-cycle-full-mark-zero: $(CYCLE_FULL_MARK_ZERO_INPUTS) build/tooling/tests/cycle-additive | build
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/cycle-additive --fixture cycle-full-mark-zero.c --budgets 1 32 --nodes 512 2048 --evidence "$(CURDIR)/build/cycle-full-mark-zero-native"
+check-cycle-full-mark-zero-sanitize: $(CYCLE_FULL_MARK_ZERO_INPUTS) build/tooling/tests/cycle-additive | build
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-additive --fixture cycle-full-mark-zero.c --budgets 1 32 --nodes 512 2048 --sanitize --evidence "$(CURDIR)/build/cycle-full-mark-zero-sanitize"
 check-managed-graphs-profiles: check-cycle-full-mark-zero check-cycle-full-mark-zero-sanitize
 
 check-sanitize: check-cycle-full-mark-zero-sanitize
