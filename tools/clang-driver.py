@@ -559,8 +559,11 @@ def main():
     libraries = set()
     cycles = False
     threaded = False
+    c_layout_metadata = []
     with host_path(llvm).open() as stream:
         for line in stream:
+            if line.startswith(('; minyar-c-layout: ', '; minyar-c-value: ')):
+                c_layout_metadata.append(line)
             if line.startswith('; minyar-native-library: '):
                 library = line.removeprefix('; minyar-native-library: ').strip()
                 libraries.add(library)
@@ -576,6 +579,11 @@ def main():
     elif cycles:
         runtime = cycle_runtime_object(project, clang, runtime, release, link_flags)
     native_flags = flags('MINYAR_NATIVE_FLAGS', shlex.join(link_flags))
+    if c_layout_metadata:
+        from c_layout_abi import native_object as c_layout_object
+        bridge = c_layout_object(project, clang, native_flags, c_layout_metadata, clang_identity(clang), run)
+        if bridge:
+            native.append(bridge)
     if cycles and 'macos' in libraries:
         native_flags = [*native_flags, '-DMINYAR_APP_MANAGED_CLEANUP=1']
     if {'macos', 'net'} <= libraries or {'windows', 'net'} <= libraries:

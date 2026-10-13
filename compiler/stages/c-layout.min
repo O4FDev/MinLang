@@ -1,0 +1,304 @@
+function cScalarKind(name: Text): Integer {
+    if name == "Int8" { return 1 }
+    if name == "UInt8" { return 2 }
+    if name == "Int16" { return 3 }
+    if name == "UInt16" { return 4 }
+    if name == "Int32" { return 5 }
+    if name == "UInt32" { return 6 }
+    if name == "Int64" || name == "Integer" { return 7 }
+    if name == "UInt64" || name == "Pointer" { return 8 }
+    if name == "Float32" { return 9 }
+    if name == "Float64" || name == "Float" { return 10 }
+    if name == "Boolean" { return 11 }
+    if name == "Character" { return 12 }
+    return 0
+}
+
+function cScalarSize(kind: Integer): Integer {
+    if kind <= 2 || kind == 11 { return 1 }
+    if kind <= 4 { return 2 }
+    if kind <= 6 || kind == 9 || kind == 12 { return 4 }
+    return 8
+}
+
+function takeCValueType(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, cursor: List<Integer>, names: List<Text>, symbols: List<Integer>): Integer {
+    let kind = cScalarKind(texts[cursor[0]])
+    if kind > 0 {
+        cursor[0] = cursor[0] + 1
+        if kind == 9 || kind == 10 { return 7 }
+        if kind == 11 { return 4 }
+        if kind == 12 { return 3 }
+        return 1
+    }
+    if texts[cursor[0]] == "Bytes" {
+        cursor[0] = cursor[0] + 1
+        expectToken(kinds, texts, lines, cursor, "[")
+        if kinds[cursor[0]] != 2 { fail("a C-layout byte array needs a constant positive length") }
+        let length = Integer(checkedIntegerLiteral(texts[cursor[0]], false, lines, cursor[0]))
+        if length <= 0 || length > 1073741824 { fail("a C-layout byte array length must be between 1 and 1073741824") }
+        cursor[0] = cursor[0] + 1
+        expectToken(kinds, texts, lines, cursor, "]")
+        return 8
+    }
+    let type = takeValueType(kinds, texts, lines, cursor, names, symbols)
+    if !isRecordType(type) { fail("C-layout fields require fixed-width scalars, fixed Bytes arrays, or C-layout records") }
+    return type
+}
+
+function isCRecord(context: CompilerContext, type: Integer): Boolean {
+    if !isRecordType(type) { return false }
+    let index = (type - 1000) * 3
+    return index < context.cLayouts.length && context.cLayouts[index] > 0
+}
+
+function cRecordSize(context: CompilerContext, type: Integer): Integer {
+    return context.cLayouts[(type - 1000) * 3 + 1]
+}
+
+function cRecordAlignment(context: CompilerContext, type: Integer): Integer {
+    return context.cLayouts[(type - 1000) * 3 + 2]
+}
+
+function discoverCLayouts(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, names: List<Text>, symbols: List<Integer>, returns: List<Integer>, counts: List<Integer>, types: List<Integer>, layouts: List<Integer>, fields: List<Integer>) {
+    let index = 0
+    while index < names.length * 3 { layouts.add(0); index = index + 1 }
+    index = 0
+    while index < types.length * 3 { fields.add(0); index = index + 1 }
+    let cursor: List<Integer> = [0]
+    let pending = 0
+    skipTerminators(kinds, cursor)
+    while kinds[cursor[0]] != 0 {
+        let start = cursor[0]
+        if texts[start] == "record" && texts[start + 2] == "native" {
+            let record = findCompiledSymbol(names, symbols, returns, texts[start + 1], 2)
+            let mode = 1
+            if texts[start + 3] == "c_packed" { mode = 2 }
+            layouts[record * 3] = mode
+            layouts[record * 3 + 1] = -1
+            pending = pending + 1
+            cursor[0] = start + 5
+            skipTerminators(kinds, cursor)
+            let first = functionParameterOffset(counts, record)
+            let field = 0
+            while texts[cursor[0]] != "}" {
+                if texts[cursor[0]] == "private" { cursor[0] = cursor[0] + 1 }
+                cursor[0] = cursor[0] + 2
+                let kind = cScalarKind(texts[cursor[0]])
+                let length = 0
+                if kind == 0 && texts[cursor[0]] == "Bytes" { length = Integer(checkedIntegerLiteral(texts[cursor[0] + 2], false, lines, cursor[0] + 2)) }
+                let ignored = takeCValueType(kinds, texts, lines, cursor, names, symbols)
+                if isRecordType(ignored) { kind = ignored }
+                fields[(first + field) * 3] = kind
+                fields[(first + field) * 3 + 2] = length
+                field = field + 1
+                if texts[cursor[0]] == "," { cursor[0] = cursor[0] + 1 }
+                skipTerminators(kinds, cursor)
+            }
+            if field == 0 { fail("C-layout records must contain at least one field") }
+        }
+        cursor[0] = start
+        if texts[start] == "record" || texts[start] == "function" { skipDeclaration(kinds, texts, cursor) } else { skipTopLevelStatement(kinds, texts, cursor) }
+        skipTerminators(kinds, cursor)
+    }
+    while pending > 0 {
+        let progress = false
+        index = 0
+        while index < names.length {
+            if layouts[index * 3 + 1] == -1 {
+                let first = functionParameterOffset(counts, index)
+                let size = 0
+                let alignment = 1
+                let field = 0
+                let ready = true
+                while field < counts[index] && ready {
+                    let slot = (first + field) * 3
+                    let kind = fields[slot]
+                    let width = fields[slot + 2]
+                    let align = 1
+                    if kind > 0 && kind < 1000 { width = cScalarSize(kind); align = width }
+                    if kind >= 1000 {
+                        let nested = (kind - 1000) * 3
+                        if layouts[nested] == 0 { fail("a C-layout field cannot contain a managed record") }
+                        width = layouts[nested + 1]
+                        align = layouts[nested + 2]
+                        if width < 0 { ready = false }
+                    }
+                    if layouts[index * 3] == 2 { align = 1 }
+                    if ready {
+                        if align > alignment { alignment = align }
+                        size = (size + align - 1) / align * align
+                        fields[slot + 1] = size
+                        fields[slot + 2] = width
+                        if width > 1073741824 - size { fail("a C-layout record is too large") }
+                        size = size + width
+                    }
+                    field = field + 1
+                }
+                if ready {
+                    layouts[index * 3 + 1] = (size + alignment - 1) / alignment * alignment
+                    layouts[index * 3 + 2] = alignment
+                    pending = pending - 1
+                    progress = true
+                }
+            }
+            index = index + 1
+        }
+        if !progress { fail("C-layout records cannot contain recursive inline fields") }
+    }
+}
+
+function appendCLayoutDeclarations(output: List<Text>) {
+    output.add("declare ptr @minyar_c_record_new(i64)\ndeclare ptr @minyar_c_record_view(ptr, i64, i64)\ndeclare ptr @minyar_c_record_at(i64, i64)\ndeclare ptr @minyar_c_record_copy(ptr, i64)\ndeclare void @minyar_c_record_store(ptr, i64, ptr, i64)\ndeclare void @minyar_c_record_check_integer(i64, i64, i64)\ndeclare ptr @minyar_c_record_pointer(ptr, i64)\n")
+}
+
+function cRecordData(output: List<Text>, textState: List<Text>, state: List<Integer>, value: Text): Text {
+    return emitInstruction(output, textState, state, "load ptr, ptr " + value + ", align 8")
+}
+
+function readCField(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, value: Text, field: Integer): Text {
+    let spec = context.cFields[field * 3]
+    let offset = context.cFields[field * 3 + 1]
+    let size = context.cFields[field * 3 + 2]
+    if spec == 0 || spec >= 1000 {
+        let view = emitInstruction(output, textState, state, "call ptr @minyar_c_record_view(ptr " + value + ", i64 " + Text(offset) + ", i64 " + Text(size) + ")")
+        keepReference(output, state, view, 8)
+        return view
+    }
+    let data = cRecordData(output, textState, state, value)
+    let address = emitInstruction(output, textState, state, "getelementptr i8, ptr " + data + ", i64 " + Text(offset))
+    let storage = "i" + Text(size * 8)
+    if spec == 9 { storage = "float" }
+    if spec == 10 { storage = "double" }
+    let raw = emitInstruction(output, textState, state, "load " + storage + ", ptr " + address + ", align 1")
+    if spec == 9 { return emitInstruction(output, textState, state, "fpext float " + raw + " to double") }
+    if spec == 11 { return emitInstruction(output, textState, state, "icmp ne i8 " + raw + ", 0") }
+    if spec == 12 || size == 8 { return raw }
+    let extension = "zext"
+    if spec % 2 == 1 { extension = "sext" }
+    return emitInstruction(output, textState, state, extension + " " + storage + " " + raw + " to i64")
+}
+
+function writeCField(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, record: Text, field: Integer, value: Text) {
+    let spec = context.cFields[field * 3]
+    let offset = context.cFields[field * 3 + 1]
+    let size = context.cFields[field * 3 + 2]
+    if spec == 0 || spec >= 1000 {
+        output.add("  call void @minyar_c_record_store(ptr " + record + ", i64 " + Text(offset) + ", ptr " + value + ", i64 " + Text(size) + ")\n")
+        return
+    }
+    let data = cRecordData(output, textState, state, record)
+    let address = emitInstruction(output, textState, state, "getelementptr i8, ptr " + data + ", i64 " + Text(offset))
+    let storage = "i" + Text(size * 8)
+    let narrowed = value
+    if spec <= 6 {
+        let signed = "0"
+        if spec % 2 == 1 { signed = "1" }
+        output.add("  call void @minyar_c_record_check_integer(i64 " + value + ", i64 " + Text(size * 8) + ", i64 " + signed + ")\n")
+        narrowed = emitInstruction(output, textState, state, "trunc i64 " + value + " to " + storage)
+    }
+    if spec == 9 { storage = "float"; narrowed = emitInstruction(output, textState, state, "fptrunc double " + value + " to float") }
+    if spec == 10 { storage = "double" }
+    if spec == 11 { narrowed = emitInstruction(output, textState, state, "zext i1 " + value + " to i8") }
+    output.add("  store " + storage + " " + narrowed + ", ptr " + address + ", align 1\n")
+}
+
+function isCLayoutTypeBuiltin(name: Text): Boolean {
+    return name == "sizeOf" || name == "alignOf" || name == "offsetOf" || name == "cView" || name == "cAt"
+}
+
+function isCLayoutBuiltin(name: Text): Boolean {
+    if name.byteLength < 3 || name.byteLength > 8 { return false }
+    if name[0] != 'c' && name[0] != 's' && name[0] != 'a' && name[0] != 'o' { return false }
+    return isCLayoutTypeBuiltin(name) || name == "cAddress" || name == "cBytes"
+}
+
+function parseCLayoutBuiltin(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
+    let kinds = context.tokenKinds
+    let texts = context.tokenTexts
+    let lines = context.tokenLines
+    let name = texts[state[0]]
+    if state[15] / 4 % 2 != 0 && (name == "cAt" || name == "cAddress") { threadNote(output, textState[1], "indirect", name, "raw C-layout address") }
+    state[0] = state[0] + 1
+    expectToken(kinds, texts, lines, state, "(")
+    if !isCLayoutTypeBuiltin(name) {
+        let type: List<Integer> = [0]
+        let value = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, type)
+        expectToken(kinds, texts, lines, state, ")")
+        if !isCRecord(context, type[0]) { fail(name + " requires a C-layout record") }
+        if name == "cBytes" { output.add("  call void @minyar_rc_retain(ptr " + value + ")\n"); setType(resultType, 8); return value }
+        let data = cRecordData(output, textState, state, value)
+        setType(resultType, 1)
+        return emitInstruction(output, textState, state, "ptrtoint ptr " + data + " to i64")
+    }
+    let record = findCompiledSymbol(context.functionNames, context.symbolKinds, context.functionReturnTypes, texts[state[0]], 2)
+    if record < 0 || !isCRecord(context, 1000 + record) { fail(name + " requires the name of a C-layout record") }
+    let type = 1000 + record
+    state[0] = state[0] + 1
+    if name == "sizeOf" || name == "alignOf" {
+        expectToken(kinds, texts, lines, state, ")")
+        setType(resultType, 1)
+        if name == "alignOf" { return Text(cRecordAlignment(context, type)) }
+        return Text(cRecordSize(context, type))
+    }
+    expectToken(kinds, texts, lines, state, ",")
+    if name == "offsetOf" {
+        let location = state[0]
+        if kinds[location] != 3 { fail("offsetOf requires a literal field name") }
+        let field = findRecordField(context.functionParameterCounts, context.functionParameterNames, type, texts[location])
+        if field < 0 { fail("offsetOf cannot find field '" + texts[location] + "'") }
+        checkFieldAccess(lines, context.functionParameterNames[field], context.functionNames[record], location)
+        state[0] = state[0] + 1
+        expectToken(kinds, texts, lines, state, ")")
+        setType(resultType, 1)
+        return Text(context.cFields[field * 3 + 1])
+    }
+    let valueType: List<Integer> = [0]
+    let value = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, valueType)
+    let result = ""
+    if name == "cAt" {
+        if valueType[0] != 1 { fail("cAt requires an Integer address") }
+        expectToken(kinds, texts, lines, state, ")")
+        result = emitInstruction(output, textState, state, "call ptr @minyar_c_record_at(i64 " + value + ", i64 " + Text(cRecordSize(context, type)) + ")")
+    } else {
+        if valueType[0] != 8 { fail("cView requires Bytes backing storage") }
+        expectToken(kinds, texts, lines, state, ",")
+        let offsetType: List<Integer> = [0]
+        let offset = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, offsetType)
+        if offsetType[0] != 1 { fail("cView requires an Integer byte offset") }
+        expectToken(kinds, texts, lines, state, ")")
+        result = emitInstruction(output, textState, state, "call ptr @minyar_c_record_view(ptr " + value + ", i64 " + offset + ", i64 " + Text(cRecordSize(context, type)) + ")")
+    }
+    setType(resultType, type)
+    return result
+}
+
+function cABIType(context: CompilerContext, type: Integer): Text {
+    if isCRecord(context, type) { return "C" + Text(type - 1000) }
+    if isReferenceType(type) { return "p" }
+    return Text(type)
+}
+
+function appendCValueABI(context: CompilerContext, output: List<Text>, callee: Text, returnType: Integer, types: List<Integer>, count: Integer) {
+    let record = 0
+    while record * 3 < context.cLayouts.length {
+        if context.cLayouts[record * 3] > 0 {
+            let description = "; minyar-c-layout: " + Text(record) + "|" + Text(context.cLayouts[record * 3]) + "|" + Text(context.cLayouts[record * 3 + 1]) + "|" + Text(context.cLayouts[record * 3 + 2])
+            let first = functionParameterOffset(context.functionParameterCounts, record)
+            let field = 0
+            while field < context.functionParameterCounts[record] {
+                let slot = (first + field) * 3
+                description = description + "|" + Text(context.cFields[slot]) + "," + Text(context.cFields[slot + 1]) + "," + Text(context.cFields[slot + 2])
+                field = field + 1
+            }
+            output.add(description + "\n")
+        }
+        record = record + 1
+    }
+    let signature = "; minyar-c-value: " + callee + "|" + cABIType(context, returnType)
+    let parameter = 0
+    while parameter < count {
+        signature = signature + "|" + cABIType(context, types[parameter])
+        parameter = parameter + 1
+    }
+    output.add(signature + "\n")
+}

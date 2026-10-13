@@ -1,10 +1,10 @@
 function isNativeType(type: Integer): Boolean {
-    return type == 1 || type == 2 || type == 3 || type == 4 || type == 7 || type == 8 || (type >= 1000 && type < 2000)
+    return type == 1 || type == 2 || type == 3 || type == 4 || type == 7 || type == 8 || isRecordType(type)
 }
 
 function isNativeABIType(type: Integer, names: List<Text>): Boolean {
     if !isNativeType(type) { return false }
-    if type >= 1000 && type < 2000 {
+    if isRecordType(type) {
         let name = names[type - 1000]
         if name.length >= 19 && name.slice(0, 19) == "minyar_result_type_" { return false }
     }
@@ -44,6 +44,8 @@ function compileNative(context: CompilerContext, localNames: List<Text>, localTy
     }
     let library = tokenTexts[state[0] + 1]
     let after: List<Integer> = [state[0] + 2]
+    let cValueABI = tokenTexts[after[0]] == "value"
+    if cValueABI { after[0] = after[0] + 1 }
     skipTerminators(tokenKinds, after)
     if state[0] != state[12] || !tokenIs(tokenKinds, tokenTexts, after, "}") {
         fail(describeLocation(tokenLocation(tokenLines, location)) + ": native must be the only statement in its function")
@@ -61,8 +63,10 @@ function compileNative(context: CompilerContext, localNames: List<Text>, localTy
         fail(describeLocation(tokenLocation(tokenLines, location)) + ": native library names must use ASCII letters, digits, and '_'")
     }
     state[0] = state[0] + 2
+    if cValueABI { state[0] = state[0] + 1 }
     let function = findFunction(functionNames, symbolKinds, functionReturnTypes, name)
     let count = functionParameterCounts[function]
+    if cValueABI && (library == "machine" || library == "machine_arm64" || library == "calldepth" || library == "integer_overflow") { fail("native value is unavailable for compiler intrinsics") }
     if state[3] != count {
         fail(describeLocation(tokenLocation(tokenLines, location)) + ": native must be the only statement in its function")
     }
@@ -120,6 +124,14 @@ function compileNative(context: CompilerContext, localNames: List<Text>, localTy
         return
     }
     let callee = "minyar_" + library + "_" + readableDeclarationName(name)
+    if cValueABI {
+        let hasCRecord = isCRecord(context, returnType)
+        let parameter = 0
+        while parameter < count { if isCRecord(context, localTypes[parameter]) { hasCRecord = true }; parameter = parameter + 1 }
+        if !hasCRecord { fail("native value requires a C-layout parameter or return") }
+        appendCValueABI(context, output, callee, returnType, localTypes, count)
+        callee = "minyar_c_value_" + callee
+    }
     let signature = ""
     let arguments = ""
     let parameter = 0
@@ -133,7 +145,15 @@ function compileNative(context: CompilerContext, localNames: List<Text>, localTy
             arguments = arguments + ", "
         }
         signature = signature + nativeType(type)
-        arguments = arguments + nativeType(type) + " %argument." + Text(parameter)
+        let argument = "%argument." + Text(parameter)
+        if state[15] / 32 % 2 != 0 && isCRecord(context, type) {
+            let pointer = "%c.argument." + Text(parameter)
+            if cValueABI { output.add("  " + pointer + " = load ptr, ptr " + argument + ", align 8\n") } else {
+                output.add("  " + pointer + " = call ptr @minyar_c_record_pointer(ptr " + argument + ", i64 " + Text(cRecordAlignment(context, type)) + ")\n")
+            }
+            argument = pointer
+        }
+        arguments = arguments + nativeType(type) + " " + argument
         parameter = parameter + 1
     }
     if returnType != 5 && !isNativeABIType(returnType, functionNames) {
@@ -150,15 +170,21 @@ function compileNative(context: CompilerContext, localNames: List<Text>, localTy
     if returnType == 5 {
         output.add("  call void @" + callee + "(" + arguments + ")\n")
     } else {
-        output.add("  %native.result = call " + result + " @" + callee + "(" + arguments + ")\n")
+        let resultName = "%native.result"
+        if !cValueABI && state[15] / 32 % 2 != 0 && isCRecord(context, returnType) { resultName = "%c.native.pointer" }
+        output.add("  " + resultName + " = call " + result + " @" + callee + "(" + arguments + ")\n")
     }
-    recoveryNativeCheckpoint(output, textState, state, returnType)
+    let returned = "%native.result"
+    if !cValueABI && state[15] / 32 % 2 != 0 && isCRecord(context, returnType) {
+        recoveryNativeCheckpoint(output, textState, state, 5)
+        output.add("  %native.result = call ptr @minyar_c_record_copy(ptr %c.native.pointer, i64 " + Text(cRecordSize(context, returnType)) + ")\n")
+    } else { recoveryNativeCheckpoint(output, textState, state, returnType) }
     output.add("  call void @minyar_rc_leave()\n")
     output.add("  call void @minyar_stack_leave()\n")
     if returnType == 5 {
         output.add("  ret void\n")
     } else {
-        output.add("  ret " + llvmType(returnType) + " %native.result\n")
+        output.add("  ret " + llvmType(returnType) + " " + returned + "\n")
     }
 }
 
