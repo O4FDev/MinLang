@@ -77,7 +77,7 @@ TARGETS = ['check-native-records', 'check-thread-compiler', 'check-thread-effect
            'check-ownership-mutation', 'check-scalar-record-initialization',
            'check-incremental-modules', 'check-incremental-modules-sanitize',
            'check-sanitize']
-TARGETS += ['check-package-native-inputs', 'check-clang-cache']
+TARGETS += ['check-package-native-inputs', 'check-clang-cache', 'check-list-basics', 'check-list-basics-sanitize', 'check-map-basics', 'check-map-basics-sanitize']
 TIERS = ('full', 'sanitize', 'all')
 # Matrix groups. correctness is the tiered main suite; the others match CI jobs.
 GROUPS = ('correctness', 'formatting', 'llvm22', 'llvm23', 'peer-testing', 'peer-semantics', 'quic',

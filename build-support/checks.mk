@@ -829,3 +829,15 @@ check-raw-syscall-frontends: build/minyarc-modules build/minyarc-callbacks build
 
 check check-portable: check-raw-syscall
 check-sanitize: check-raw-syscall-sanitize
+
+.PHONY: check-list-basics check-list-basics-sanitize check-map-basics check-map-basics-sanitize
+check-list-basics: build/minyarc build/minyar-runtime.o tests/list-basics.py tests/list-basics.c $(RUNTIME_HEADERS)
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/list-basics.py
+check-list-basics-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o tests/list-basics.py tests/list-basics.c $(RUNTIME_HEADERS)
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/list-basics.py
+check-map-basics: build/minyarc build/minyar-runtime.o tests/map-basics.py tests/list-basics.py $(RUNTIME_HEADERS)
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/map-basics.py
+check-map-basics-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o tests/map-basics.py tests/list-basics.py $(RUNTIME_HEADERS)
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/map-basics.py
+check check-portable: check-list-basics check-map-basics
+check-sanitize: check-list-basics-sanitize check-map-basics-sanitize
