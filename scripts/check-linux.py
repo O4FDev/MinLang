@@ -330,7 +330,7 @@ def main():
                ASAN_OPTIONS='detect_leaks=0:abort_on_error=1',
                UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1',
                CC='clang', LLVM_CC='clang', CXX='clang++', CLANG='clang', MINYAR_TEST_CLANG='clang',
-               COMPILER_LTO_FLAGS='-flto -fuse-ld=lld',
+               COMPILER_LTO_FLAGS='-flto -fuse-ld=lld', MINYAR_TEST_SHARED_HOST='1',
                LIMITED='', SANITIZER_LIMITED='')
     # Each make is serial; concurrency comes from running several checks at once.
     make = [tools['make'], '-j1', 'LIMITED=', 'SANITIZER_LIMITED=', 'CC=clang', 'LLVM_CC=clang',

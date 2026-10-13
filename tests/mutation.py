@@ -60,24 +60,30 @@ def compiler_mutations(temporary: Path) -> None:
             "let symbol = symbolReturnTypes[count]",
         ),
         "widen-inline-list-get-bounds": (
-            "%get.valid = icmp ult i64 %position, %length\\n",
-            "%get.valid = icmp ule i64 %position, %length\\n",
+            "%get.valid = icmp ult i64 %position, %length\n",
+            "%get.valid = icmp ule i64 %position, %length\n",
         ),
         "widen-inline-list-set-bounds": (
-            "%set.valid = icmp ult i64 %position, %length\\n",
-            "%set.valid = icmp ule i64 %position, %length\\n",
+            "%set.valid = icmp ult i64 %position, %length\n",
+            "%set.valid = icmp ule i64 %position, %length\n",
         ),
         "reject-valid-inline-overflow": (
-            "br i1 %overflow, label %bad, label %good\\n",
-            "br i1 %overflow, label %good, label %bad\\n",
+            "br i1 %overflow, label %bad, label %good\n",
+            "br i1 %overflow, label %good, label %bad\n",
         ),
         "reject-valid-inline-division": (
-            "%zero = icmp eq i64 %right, 0\\n",
-            "%zero = icmp ne i64 %right, 0\\n",
+            "%zero = icmp eq i64 %right, 0\n",
+            "%zero = icmp ne i64 %right, 0\n",
         ),
     }
     for name, (before, after) in mutations.items():
-        source = replace_once(original, before, after, name)
+        if name == 'allow-cycles':
+            start = original.index('function loadModule(')
+            end = original.index('\nfunction ', start)
+            body = replace_once(original[start:end], before, after, name)
+            source = original[:start] + body + original[end:]
+        else:
+            source = replace_once(original, before, after, name)
         mutant_source = temporary / f"compiler-{name}.min"
         mutant_llvm = temporary / f"compiler-{name}.ll"
         mutant = temporary / f"compiler-{name}"

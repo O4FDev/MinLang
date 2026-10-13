@@ -21,7 +21,7 @@ class ScalarLookaheadBudget(unittest.TestCase):
         begin = source.index('function prepareScalarRecord(')
         end = source.index('\nfunction rootLocal(', begin)
         helper = source[begin:end]
-        before = '    let cursor: List<Integer> = []'
+        before = '    let cursor: List<Integer> = [state[0]]'
         assert helper.count(before) == 1
         helper = helper.replace(before, f'    print("{MARKER}")\n' + before, 1)
         source = source[:begin] + helper + source[end:]

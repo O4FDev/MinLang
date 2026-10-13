@@ -111,7 +111,7 @@ def main() -> None:
             output = result.stdout + result.stderr
             test_name = TARGETS[name][1].split('.')[-1]
             expected = {
-                'cycle': 'AssertionError: 0 != 86',
+                'cycle': "AssertionError: '; minyar-cycle-runtime: 1\\n' not found",
                 'literal-owner': 'AddressSanitizer: heap-use-after-free',
                 'context': 'an argument passed to nodes has the wrong type',
             }[name]
