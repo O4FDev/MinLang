@@ -10,10 +10,10 @@ check-errors-language-sanitize: build/minyarc-errors-sanitize build/tooling/test
 check check-portable: check-errors-language
 check-sanitize: check-errors-language-sanitize
 
-check-errors-language-bounded: build/minyarc-errors
+check-errors-language-bounded: build/minyarc-errors build/tooling/tests/errors-language
 	@set -e; for budget in 1 32 1024; do \
 	    echo "typed Result bounded 1MiB cleanup budget $$budget"; \
-	    MINYAR_ERRORS_RUNTIME_FLAGS="-DMINYAR_BOUNDED_HEAP=1 -DMINYAR_BOUNDED_HEAP_BYTES=1048576 -DMINYAR_RC_POLL_BUDGET=$$budget" MINYAR_ERRORS_COMPILER=./build/minyarc-errors MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/errors-language.py; \
+	    MINYAR_ERRORS_RUNTIME_FLAGS="-DMINYAR_BOUNDED_HEAP=1 -DMINYAR_BOUNDED_HEAP_BYTES=1048576 -DMINYAR_RC_POLL_BUDGET=$$budget" MINYAR_ERRORS_COMPILER=./build/minyarc-errors MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/errors-language; \
 	done
 
 check check-portable: check-errors-language-bounded

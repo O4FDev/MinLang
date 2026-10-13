@@ -47,10 +47,8 @@ check-launcher-isolation: build/minyarc build/minyarc-errors-request build/minya
 check-release-build: build/minyarc build/minyar-runtime.o build/minyar-runtime-release.ll
 	$(LIMITED) python3 tests/release-build.py
 
-build/tooling/experiments/memory/critical-path-study: private TOOL_RUNTIME = build/testing/cycle-runtime.o
-build/tooling/experiments/memory/critical-path-study: build/testing/cycle-runtime.o
-check-critical-path: build/minyarc build/tooling/experiments/memory/critical-path-study
-	$(LIMITED) ./build/tooling/experiments/memory/critical-path-study
+check-critical-path: build/minyarc
+	$(LIMITED) python3 experiments/memory/critical-path-study.py
 
 build/tooling/tests/regressions: private TOOL_RUNTIME = build/testing/cycle-runtime.o
 build/tooling/tests/regressions: build/testing/cycle-runtime.o
@@ -100,7 +98,7 @@ check-fuzz: check-fuzz-harness build/minyarc build/minyar-runtime.o
 check-fuzz-coverage: check-fuzz-afl-harness build/minyarc
 	sh scripts/fuzz-afl.sh
 
-check-coverage: check-coverage-harness check-coverage-inlining build/minyarc build/minyarc-modules build/minyar-runtime.o
+check-coverage: check-coverage-harness check-coverage-inlining build/minyarc build/minyarc-modules build/minyar-runtime.o build/tooling/tests/text-basics-model
 	MINYAR_MIN_COMPILER_EDGE_COVERAGE=$(MIN_COMPILER_EDGE_COVERAGE) \
 	MINYAR_MIN_RUNTIME_LINE_COVERAGE=$(MIN_RUNTIME_LINE_COVERAGE) \
 	MINYAR_MIN_RUNTIME_BRANCH_COVERAGE=$(MIN_RUNTIME_BRANCH_COVERAGE) \
@@ -140,7 +138,8 @@ check-scaling: build/minyarc
 	$(LIMITED) python3 tests/scaling.py
 
 build/tooling/tests/self-compile-budget: private TOOL_RUNTIME = build/testing/cycle-runtime.o
-build/tooling/tests/self-compile-budget: build/testing/cycle-runtime.o
+build/tooling/tests/self-compile-budget: private TOOL_NATIVE = tests/performance-resources.c
+build/tooling/tests/self-compile-budget: build/testing/cycle-runtime.o tests/performance-resources.c
 # Run absolute self-compilation checks without background scheduling.
 check-budget: build/minyarc build/compiler-stage3.ll build/tooling/tests/self-compile-budget
 	./build/tooling/tests/self-compile-budget
@@ -359,6 +358,9 @@ check-incremental-modules: build/minyarc-errors-request build/minyarc-modules bu
 check: check-incremental-modules
 
 .PHONY: check-incremental-module-performance
+build/tooling/tests/incremental-module-performance: private TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/incremental-module-performance: private TOOL_NATIVE = tests/performance-resources.c runtime/native/net.c
+build/tooling/tests/incremental-module-performance: build/testing/cycle-runtime.o tests/performance-resources.c runtime/native/net.c
 check-incremental-module-performance: build/minyarc-modules build/minyar-module-build build/minyar-runtime.o build/tooling/tests/incremental-module-performance
 	$(LIMITED) ./build/tooling/tests/incremental-module-performance --enforce
 
@@ -507,6 +509,8 @@ check-bootstrap-records: build/stage0 build/tooling/tests/bootstrap-records
 check-portable check: check-bootstrap-records
 
 .PHONY: check-measurement-stats
+build/tooling/tests/measurement-stats: private TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/measurement-stats: build/testing/cycle-runtime.o
 check-measurement-stats: build/tooling/tests/measurement-stats
 	./build/tooling/tests/measurement-stats
 
@@ -514,7 +518,8 @@ check-portable check: check-measurement-stats
 
 .PHONY: check-budget-harness
 build/tooling/tests/self-compile-budget-harness: private TOOL_RUNTIME = build/testing/cycle-runtime.o
-build/tooling/tests/self-compile-budget-harness: build/testing/cycle-runtime.o
+build/tooling/tests/self-compile-budget-harness: private TOOL_NATIVE = tests/performance-resources.c
+build/tooling/tests/self-compile-budget-harness: build/testing/cycle-runtime.o tests/performance-resources.c
 check-budget-harness: build/tooling/tests/self-compile-budget-harness
 	./build/tooling/tests/self-compile-budget-harness
 
@@ -532,11 +537,11 @@ check-portable check: check-source-map
 check-sanitize: check-source-map-sanitize
 
 .PHONY: check-scalar-path check-scalar-study-harness
-check-scalar-study-harness: build/tooling/tests/scalar-study-harness
-	./build/tooling/tests/scalar-study-harness
+check-scalar-study-harness:
+	python3 tests/scalar-study-harness.py
 
-check-scalar-path: check-scalar-study-harness build/minyarc build/tooling/experiments/memory/checked-scalars-study
-	$(LIMITED) ./build/tooling/experiments/memory/checked-scalars-study
+check-scalar-path: check-scalar-study-harness build/minyarc
+	$(LIMITED) python3 experiments/memory/checked-scalars-study.py
 
 check: check-scalar-path
 check-portable: check-scalar-study-harness

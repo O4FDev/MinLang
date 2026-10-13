@@ -80,6 +80,9 @@ check-evidence-harness: build/minyarc build/minyar-runtime.o
 	python3 tests/evidence-harness.py
 
 .PHONY: check-performance-metrics
+build/tooling/tests/performance-metrics: private TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/performance-metrics: private TOOL_NATIVE = tests/performance-resources.c
+build/tooling/tests/performance-metrics: build/testing/cycle-runtime.o tests/performance-resources.c
 check-performance-metrics: build/tooling/tests/performance-metrics
 	./build/tooling/tests/performance-metrics
 
@@ -323,6 +326,8 @@ check-runtime-size-guards: build/tooling/tests/runtime-size-guards
 check-compiler-allocation-faults: build/minyarc build/compiler-stage2.ll build/minyar-runtime.o
 	$(SANITIZER_LIMITED) python3 tests/allocation-faults.py --scope compiler --output build/compiler-allocation-faults.json
 
+build/tooling/tests/codegen: private TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/codegen: build/testing/cycle-runtime.o
 check-codegen: build/minyarc build/tooling/tests/codegen
 	$(LIMITED) ./build/tooling/tests/codegen
 

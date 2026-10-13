@@ -1,5 +1,8 @@
 .PHONY: check-system-services check-system-services-sanitize check-system-process check-system-process-sanitize
 .PHONY: check-system-process-boundary
+build/tooling/tests/system-process-boundary: private TOOL_NATIVE = tests/sha256-test-native.c tests/system-test-path-native.c
+build/tooling/tests/system-process-boundary: private TOOL_LIBS = -lcrypto
+build/tooling/tests/system-process-boundary: tests/sha256-test-native.c tests/system-test-path-native.c
 check-system-process-boundary: build/tooling/tests/system-process-boundary
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/system-process-boundary
 

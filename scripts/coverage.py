@@ -135,10 +135,7 @@ def run_feature_harnesses(run_dir: Path, *, clang: str, link_flags: list[str],
                   stderr="Minyar stopped: Map key is absent.\n")
 
     text = build("text-basics.c", "runtime-text")
-    spec = importlib.util.spec_from_file_location("text_basics_model", ROOT / "tests/text-basics-model.py")
-    text_model = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(text_model)
-    text_model.check(text, env)
+    run([str(ROOT / "build/tooling/tests/text-basics-model"), "--executable", str(text)], env=env)
 
     sort = build("list-sort-runtime.c", "runtime-sort")
     run_expecting([str(sort)], env=env, returncode=0,
@@ -311,7 +308,7 @@ def main() -> int:
     feature_harnesses = run_feature_harnesses(run_dir, clang=clang, link_flags=[*math_flags, *thread_flags],
                                               env=env)
 
-    native_suites = ('octal-literals', 'reserved-names', 'diagnostics', 'conformance', 'list-access', 'checked-arithmetic', 'readonly-parameters', 'checked-scalars', 'module-constants', 'statement-nesting', 'compiler-hardening', 'checked-results', 'feature-dispatch', 'errors-values', 'c-layout-records')
+    native_suites = ('octal-literals', 'reserved-names', 'diagnostics', 'conformance', 'list-access', 'checked-arithmetic', 'readonly-parameters', 'checked-scalars', 'module-constants', 'statement-nesting', 'compiler-hardening', 'checked-results', 'feature-dispatch', 'errors-values', 'c-layout-records', 'maps', 'list-sort', 'text-basics', 'collections-integration', 'linkage')
     run(['make', '-s', *['build/tooling/tests/' + name for name in native_suites]], env=env)
 
     compiler_reports = {}
@@ -334,7 +331,7 @@ def main() -> int:
                 commands.append(([str(ROOT / 'build/tooling/tests' / name), *selection], suite_env, 180))
             else:
                 commands.append(([sys.executable, f"tests/{name}.py", *selection], suite_env, 180))
-        commands.append(([sys.executable, "tests/linkage.py", "LanguageLinkage.test_ordinary_names_do_not_interpose_c_dependencies"], suite_env, 180))
+        commands.append(([str(ROOT / "build/tooling/tests/linkage"), "LanguageLinkage.test_ordinary_names_do_not_interpose_c_dependencies"], suite_env, 180))
         commands.append(([sys.executable, "tests/runtime-numeric.py", "--mode", "native", "--cases", "2000",
                           "--output-dir", str(directory / "numeric")], suite_env, 180))
         commands.append(([sys.executable, "tests/fuzz.py", "--cases", "200", "--program-cases", "40",
