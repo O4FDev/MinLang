@@ -76,6 +76,9 @@ check-erofs-reference:
 check-formats: check-formats-wiring check-format-provider check-compression check-sha256 check-tar check-formats-pipeline
 check-formats-sanitize: check-compression-sanitize check-sha256-sanitize check-tar-sanitize check-formats-pipeline-sanitize
 
+build/tooling/benchmarks/compression-bench: private TOOL_NATIVE = tests/compression-codecs-oracle-runtime.c tests/sha256-test-native.c runtime/native/sha256.c
+build/tooling/benchmarks/compression-bench: private TOOL_LIBS = -lz -ldl -lcrypto
+build/tooling/benchmarks/compression-bench: tests/compression-codecs-oracle-runtime.c tests/sha256-test-native.c runtime/native/sha256.c
 bench-compression: build/minyarc build/tooling/benchmarks/compression-bench
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/benchmarks/compression-bench --artifacts build/compression-benchmark --prepare-only --compiler "$(abspath build/minyarc)"
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/benchmarks/compression-bench --artifacts build/compression-benchmark --run-only
@@ -91,7 +94,7 @@ build/tooling/benchmarks/tar/run: private TOOL_LIBS = -lcrypto
 build/tooling/benchmarks/tar/run: tests/text-basics-benchmark-runtime.c tests/sha256-test-native.c
 bench-tar: build/minyarc build/tooling/benchmarks/tar/run
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/benchmarks/tar/run --prepare
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/benchmarks/tar/run --measure
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/benchmarks/tar/run --measure --output build/tar-native-benchmark/results.json
 
 bench-formats: bench-compression bench-sha256 bench-tar
 

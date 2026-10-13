@@ -16,3 +16,7 @@ check-list-sort-sanitize: build/minyarc build/minyarc-callbacks-sanitize build/m
 
 check check-portable: check-list-sort
 check-sanitize: check-list-sort-runtime check-list-sort-sanitize
+
+build/tooling/benchmarks/list-sort/run: private TOOL_NATIVE = benchmarks/list-sort/driver-native.c tests/maps-baseline-runtime.c tests/sha256-test-native.c runtime/native/sha256.c
+build/tooling/benchmarks/list-sort/run: private TOOL_LIBS = -lcrypto
+build/tooling/benchmarks/list-sort/run: benchmarks/list-sort/driver-native.c tests/maps-baseline-runtime.c tests/sha256-test-native.c runtime/native/sha256.c
