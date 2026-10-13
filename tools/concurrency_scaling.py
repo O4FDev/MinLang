@@ -141,9 +141,32 @@ def register(arguments: argparse.Namespace) -> None:
                   "steal_fraction_max": .005, "no_post_result_sample_exclusion": True},
         "gates": {"median_eight_min": 7.2, "lower_95_eight_min": 6.4},
     }
+    if arguments.control_executable:
+        control = arguments.control_executable.resolve(strict=True)
+        protocol['single_thread_control'] = {'executable': str(control),
+            'sha256': digest(control), 'source_sha': arguments.control_sha,
+            'upper_95_ratio_max': 1.01}
     protocol["protocol_sha256"] = hashlib.sha256(canonical(protocol)).hexdigest()
     write_new(arguments.protocol, protocol)
     print(f"frozen {arguments.protocol}; no timed qualification has run")
+
+
+def observe_control(protocol):
+    before = cpu_ticks()
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    started = time.perf_counter_ns()
+    completed = subprocess.run([protocol['single_thread_control']['executable'], '1'],
+                               capture_output=True, text=True, timeout=120)
+    seconds = (time.perf_counter_ns() - started) / 1e9
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu = after.ru_utime + after.ru_stime - usage.ru_utime - usage.ru_stime
+    sample = {'seconds': seconds, 'child_cpu_seconds': cpu,
+              'activity': cpu_activity(before, cpu_ticks(), protocol['affinity'], cpu),
+              'returncode': completed.returncode, 'stdout': completed.stdout,
+              'stderr': completed.stderr}
+    if (completed.returncode, completed.stdout, completed.stderr) != (0, protocol['expected_stdout'], ''):
+        raise RuntimeError('incorrect original single-thread control result')
+    return sample
 
 
 def run(arguments: argparse.Namespace) -> None:
@@ -175,6 +198,10 @@ def run(arguments: argparse.Namespace) -> None:
         raise RuntimeError("original frozen workload changed")
     if protocol['gates'] != {'median_eight_min': 7.2, 'lower_95_eight_min': 6.4}:
         raise RuntimeError('original scaling gates changed')
+    control = protocol.get('single_thread_control')
+    if control and (digest(Path(control['executable'])) != control['sha256'] or
+                    control['upper_95_ratio_max'] != 1.01):
+        raise RuntimeError('single-thread control or original CPU gate changed')
     item = getattr(arguments, 'item', None)
     rounds = [(phase, index, order)
               for phase, orders in (("warmup", protocol["warmup_order"]),
@@ -189,9 +216,11 @@ def run(arguments: argparse.Namespace) -> None:
         actual = [(s['phase'], s['round'], s['threads']) for s in result['samples']]
         if actual != expected or len(result['preflights']) != item:
             raise RuntimeError("items must run exactly once in the original order")
+        if control and len(result['single_thread_pairs']) != item:
+            raise RuntimeError('single-thread pairs must be retained in original order')
     else:
         result = {"protocol_sha256": seal, "started_unix_ns": time.time_ns(),
-                  "samples": [], "preflights": [], "qualified": False}
+                  "samples": [], "preflights": [], "single_thread_pairs": [], "qualified": False}
     before = cpu_ticks()
     time.sleep(5)
     activity = cpu_activity(before, cpu_ticks(), protocol["affinity"])
@@ -214,6 +243,9 @@ def run(arguments: argparse.Namespace) -> None:
             selected = rounds if item is None else rounds[item:item + 1]
             for phase, round_index, order in selected:
                 for width in order:
+                    control_sample = None
+                    if control and width == 1 and round_index % 2 == 0:
+                        control_sample = observe_control(protocol)
                     before = cpu_ticks()
                     usage = resource.getrusage(resource.RUSAGE_CHILDREN)
                     started = time.perf_counter_ns()
@@ -233,6 +265,11 @@ def run(arguments: argparse.Namespace) -> None:
                     if (completed.returncode, completed.stdout, completed.stderr) != (
                             0, protocol["expected_stdout"], ""):
                         raise RuntimeError("incorrect workload result; retained unqualified run")
+                    if control and width == 1:
+                        if control_sample is None: control_sample = observe_control(protocol)
+                        result['single_thread_pairs'].append({'phase': phase, 'round': round_index,
+                            'candidate': sample, 'control': control_sample})
+                        save()
             if item is not None and item < len(rounds) - 1:
                 result['last_item'] = item
                 save()
@@ -252,6 +289,16 @@ def run(arguments: argparse.Namespace) -> None:
                                            and all(quiet(a) for a in result['preflights']))
             result["qualified"] = (result["quiet_all_samples"] and eight["median"] >= 7.2
                                    and eight["interval_95"][0] >= 6.4)
+            if control:
+                pairs = [p for p in result['single_thread_pairs'] if p['phase'] == 'paired']
+                cpu_ratios = [p['candidate']['child_cpu_seconds'] / p['control']['child_cpu_seconds']
+                              for p in pairs]
+                interval = bootstrap_interval(cpu_ratios)
+                clean = all(quiet(p['control']['activity']) for p in result['single_thread_pairs'])
+                result['single_thread_cpu'] = {'ratios': cpu_ratios,
+                    'median': statistics.median(cpu_ratios), 'interval_95': interval,
+                    'qualified': clean and interval[1] <= 1.01}
+                result['qualified'] = result['qualified'] and result['single_thread_cpu']['qualified']
         except BaseException as error:
             result["failure"] = str(error)
             save()
@@ -274,11 +321,15 @@ def main() -> None:
         freeze.add_argument("--" + name, required=True)
     freeze.add_argument("--memory-profile", choices=("system", "eager"), required=True)
     freeze.add_argument("--clang", default="clang")
+    freeze.add_argument('--control-executable', type=Path)
+    freeze.add_argument('--control-sha')
     campaign = commands.add_parser("run")
     campaign.add_argument("protocol", type=Path)
     campaign.add_argument("results", type=Path)
     campaign.add_argument('--item', type=int, choices=range(WARMUPS + ROUNDS))
     arguments = parser.parse_args()
+    if arguments.command == 'register' and arguments.control_executable and not arguments.control_sha:
+        parser.error('--control-sha is required with --control-executable')
     (register if arguments.command == "register" else run)(arguments)
 
 

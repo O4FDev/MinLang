@@ -48,14 +48,15 @@ class ScalingProtocol(unittest.TestCase):
                 ('cpu_ticks', lambda: {}),
                 ('cpu_activity', lambda *a: dict(self.activity)),
                 ('time.sleep', lambda _: None)):
-            mock = patch.object(scaling, target, replacement) if '.' not in target else patch(
-                'scaling.' + target, replacement)
+            mock = patch.object(scaling, target, replacement) if '.' not in target else None
             if '.' in target:
                 owner, attribute = target.split('.')
                 mock = patch.object(getattr(scaling, owner), attribute, replacement)
             mock.start()
             self.addCleanup(mock.stop)
         self.clock = 0
+        self.observed_clock = 0
+        self.control_seconds = 8
         self.width_seconds = {1: 8, 2: 4, 4: 2, 8: 1}
 
     def publish(self):
@@ -67,12 +68,32 @@ class ScalingProtocol(unittest.TestCase):
         phase = 'warmup_order' if index < 3 else 'paired_order'
         order = self.value[phase][index if index < 3 else index - 3]
         ticks = []
+        def append(seconds):
+            ticks.append(self.clock)
+            self.clock += int(seconds * 1e9)
+            ticks.append(self.clock)
         for width in order:
-            ticks.append(self.clock)
-            self.clock += int(self.width_seconds[width] * 1e9)
-            ticks.append(self.clock)
-        with patch.object(scaling.time, 'perf_counter_ns', side_effect=ticks), contextlib.redirect_stdout(io.StringIO()):
+            if width == 1 and 'single_thread_control' in self.value and (index if index < 3 else index - 3) % 2 == 0:
+                append(self.control_seconds)
+            append(self.width_seconds[width])
+            if width == 1 and 'single_thread_control' in self.value and (index if index < 3 else index - 3) % 2 != 0:
+                append(self.control_seconds)
+        clock = iter(ticks)
+        def tick():
+            self.observed_clock = next(clock)
+            return self.observed_clock
+        def usage(_):
+            return argparse.Namespace(ru_utime=self.observed_clock / 1e9, ru_stime=0)
+        with patch.object(scaling.time, 'perf_counter_ns', side_effect=tick), \
+                patch.object(scaling.resource, 'getrusage', side_effect=usage), \
+                contextlib.redirect_stdout(io.StringIO()):
             scaling.run(argparse.Namespace(protocol=self.protocol, results=self.results, item=index))
+
+    def control(self):
+        self.value['single_thread_control'] = {'executable': self.value['executable'],
+            'sha256': self.value['executable_sha256'], 'source_sha': 'fixed',
+            'upper_95_ratio_max': 1.01}
+        self.publish()
 
     def test_complete_original_campaign(self):
         for index in range(43): self.item(index)
@@ -104,6 +125,27 @@ class ScalingProtocol(unittest.TestCase):
     def test_lower_interval_gate(self):
         self.assertEqual(scaling.bootstrap_interval([5] * 20 + [10] * 20), (5, 10))
         with self.assertRaises(ValueError): scaling.bootstrap_interval([8] * 39)
+
+    def test_paired_cpu_improvement_passes(self):
+        self.control()
+        self.control_seconds = 9
+        for index in range(43): self.item(index)
+        result = json.loads(self.results.read_text())
+        self.assertTrue(result['qualified'])
+        self.assertEqual(len(result['samples']), 172)
+        self.assertEqual(len(result['single_thread_pairs']), 43)
+        self.assertEqual(len(result['single_thread_cpu']['ratios']), 40)
+        self.assertLess(result['single_thread_cpu']['interval_95'][1], .99)
+
+    def test_paired_cpu_regression_fails(self):
+        self.control()
+        self.control_seconds = 8 / 1.02
+        for index in range(42): self.item(index)
+        with self.assertRaises(SystemExit): self.item(42)
+        result = json.loads(self.results.read_text())
+        self.assertFalse(result['qualified'])
+        self.assertFalse(result['single_thread_cpu']['qualified'])
+        self.assertGreater(result['single_thread_cpu']['interval_95'][1], 1.01)
 
     def test_changed_workload_or_gate_rejected(self):
         self.value['workload_sha256'] = 'changed'
