@@ -1,0 +1,271 @@
+use "../tools/testing.min" as test
+use "./compiler-port-support.min" as source
+use "./sha256-support.min" as arguments
+use "./calldepth-test-support.min" as depth
+use "system" as system
+use "files" as files
+use "json" as json
+
+record Configuration { compiler: Text; directory: Text; sanitize: Boolean; profile: Text; budget: Integer; cases: List<Text>; smallStack: Boolean; largeDispatch: Boolean; lto: Boolean; maxDepth: Text; fallbackDepth: Text; fixtures: Text; emit: Text; cache: Text }
+function fixtureSource(context: depth.Context, name: Text): Text {
+    if name == "large-dispatch" { return context.directory + "/large-dispatch.min" }
+    return context.root + "/tests/calldepth/" + name + ".min"
+}
+function compileCase(context: depth.Context, config: Configuration, name: Text, llvm: Text, libraries: List<Text>, cache: json.Value) {
+    let input = fixtureSource(context, name)
+    if config.cache != "" {
+        let entry = depth.fields(depth.fields(cache, "cases"), name)
+        test.check(json.string(entry, "source_sha256") == depth.digest(input), "stale call-depth IR cache source: " + name)
+        let cached = config.cache + "/" + name + ".ll"
+        writeBytesFile(llvm, readBytesFile(cached))
+        test.check(depth.digest(llvm) == json.string(entry, "ir_sha256"), "call-depth IR cache changed: " + name)
+        context.commands.add("{\"argv\":" + depth.serialize(json.member(entry, "argv")) + ",\"status\":0,\"reused_ir\":" + depth.quote(cached) + ",\"ir_sha256\":" + depth.quote(json.string(entry, "ir_sha256")) + ",\"executable_sha256\":" + depth.quote(json.string(cache, "compiler_sha256")) + "}")
+        depth.commandLog(context)
+    } else {
+        let command = [config.compiler, input, llvm]
+        for item in libraries { command.add(item) }
+        for item in ["--bounded-owners", Text(config.budget)] { command.add(item) }
+        depth.success(context, command)
+    }
+    let ir = readTextFile(llvm)
+    test.check(test.contains(ir, "; minyar-calldepth-policy: cooperative-v1-full-program"), "call-depth IR omitted full-program cooperative policy")
+    if name == "large-dispatch" { test.check(!test.contains(ir, "dispatch.found:"), "cooperative program retained integer dispatch lowering") }
+}
+function generatedDispatch(context: depth.Context, config: Configuration, compiler: Text, cases: List<Text>) {
+    let selected = false
+    for name in cases { if name == "large-dispatch" { selected = true } }
+    if !selected { return }
+    let body = "function dispatch(value: Integer): Integer {\n"
+    for index in 0..1500 { body += "if value == " + Text(index) + " { return " + Text(index) + " } else {\n" }
+    body += "return 9999\n"
+    for unused in 0..1501 { body += "}\n" }
+    if config.fixtures != "skip" {
+        let control = context.directory + "/dispatch-control.min"
+        writeTextFile(control, body + "print(dispatch(1450))\n")
+        let llvm = context.directory + "/dispatch-control.ll"
+        depth.success(context, [compiler, control, llvm])
+        test.check(test.contains(readTextFile(llvm), "dispatch.found:"), "ordinary control did not exercise integer dispatch")
+    }
+    writeTextFile(context.directory + "/large-dispatch.min", "use \"calldepth\" as depth\nuse \"errors\" as errors\n" + body + "let good=depth.run(2, function(): Integer { return dispatch(1450) })\nprint(errors.integerValue(good))\nlet failed=depth.run(1, function(): Integer { return dispatch(1450) })\nprint(errors.integerOk(failed))\n")
+}
+function fixtures(context: depth.Context, config: Configuration, clang: List<Text>, flags: List<Text>, windows: Boolean) {
+    if config.fixtures == "skip" { return }
+    for fixture in ["calldepth-runtime", "calldepth-thread-local"] {
+        if fixture == "calldepth-thread-local" && windows { print("pthread scope isolation requires a POSIX host"); continue }
+        let executable = context.directory + "/" + fixture
+        let command = clang.slice(0, clang.length)
+        command.add("-O2")
+        for flag in flags { command.add(flag) }
+        for flag in ["-DMINYAR_SYSTEM_HEAP=1", "-DMINYAR_FALLBACK_CALL_DEPTH=16"] { command.add(flag) }
+        if fixture == "calldepth-thread-local" { command.add("-DMINYAR_THREADED=1") }
+        for item in [context.root + "/tests/" + fixture + ".c", "-lm"] { command.add(item) }
+        if !windows { command.add("-pthread") }
+        for item in ["-o", executable] { command.add(item) }
+        depth.success(context, command)
+        depth.run(context, [executable], true, "", 0, "", false)
+    }
+    for name in ["global", "fallback"] {
+        let executable = context.directory + "/reporting-controls-" + name
+        let command = clang.slice(0, clang.length)
+        command.add("-O2")
+        for flag in flags { command.add(flag) }
+        command.add("-DMINYAR_SYSTEM_HEAP=1")
+        let controls = ["global", "bounded", "physical", "escape"]
+        if name == "global" { command.add("-DMINYAR_MAX_CALL_DEPTH=2") }
+        else {
+            command.add("-DMINYAR_MAX_CALL_DEPTH=1000")
+            command.add("-DMINYAR_FALLBACK_CALL_DEPTH=16")
+            controls = ["fallback"]
+        }
+        for item in [context.root + "/tests/calldepth-reporting.c", "-lm"] { command.add(item) }
+        if !windows { command.add("-pthread") }
+        for item in ["-o", executable] { command.add(item) }
+        depth.success(context, command)
+        for control in controls {
+            let expected = "nested failure; success; alive\n"
+            if control == "escape" { expected = "escaped pending status 2\n" }
+            depth.run(context, [executable, control], true, expected, 0, "", false)
+        }
+    }
+}
+function nullable(value: Text, number: Boolean): Text {
+    if value == "" { return "null" }
+    if number { return value }
+    return depth.quote(value)
+}
+function configurationJSON(config: Configuration): Text {
+    let cases = "null"
+    if config.cases.length > 0 { cases = depth.strings(config.cases) }
+    return "{\"compiler\":" + depth.quote(config.compiler) + ",\"evidence\":" + depth.quote(config.directory) + ",\"sanitize\":" + Text(config.sanitize) + ",\"profile\":" + depth.quote(config.profile) + ",\"budget\":" + Text(config.budget) + ",\"case\":" + cases + ",\"small_stack\":" + Text(config.smallStack) + ",\"large_dispatch\":" + Text(config.largeDispatch) + ",\"lto\":" + Text(config.lto) + ",\"max_depth\":" + nullable(config.maxDepth, true) + ",\"fallback_depth\":" + nullable(config.fallbackDepth, true) + ",\"fixtures\":" + depth.quote(config.fixtures) + ",\"emit_ir\":" + nullable(config.emit, false) + ",\"ir_cache\":" + nullable(config.cache, false) + "}"
+}
+function retain(context: depth.Context, config: Configuration) {
+    let outputs = depth.inventory(context, [context.directory], true)
+    let inputs = depth.inventory(context, [context.root + "/runtime", context.root + "/compiler", context.root + "/library", context.root + "/tests/calldepth"], false)
+    for name in ["calldepth.min", "calldepth-test-support.min", "calldepth-native-adapter.c", "calldepth-runtime.c", "calldepth-thread-local.c", "calldepth-reporting.c", "calldepth-reporting-native.c", "memory-contracts-runtime.c", "sha256-support.min", "compiler-port-support.min", "tar-benchmark-support.min", "tar-test-support.min", "sha256test.min", "sha256-test-native.c", "text-basics-oracles.min"] { inputs.add(context.root + "/tests/" + name) }
+    let inputJSON = depth.hashes(inputs, context.root)
+    inputJSON = Text(Bytes(inputJSON).slice(0, inputJSON.byteLength - 1)) + "," + depth.quote(config.compiler) + ":" + depth.quote(depth.digest(config.compiler))
+    if config.cache != "" { inputJSON += "," + depth.quote(config.cache + "/manifest.json") + ":" + depth.quote(depth.digest(config.cache + "/manifest.json")) }
+    inputJSON += "}"
+    writeTextFile(context.directory + "/manifest.json", "{\"status\":\"passed\",\"files\":" + depth.hashes(outputs, context.directory) + ",\"inputs\":" + inputJSON + ",\"configuration\":" + configurationJSON(config) + "}\n")
+}
+
+let names = ["g14-recovered", "limits", "nested", "ownership", "control-flow", "native-reserve", "results-imports", "native-callback", "domain-rejection", "reporting-exhausted", "large-dispatch", "reporting-global", "reporting-fallback", "reporting-physical", "ws3-paths"]
+let outputs = ["false\ntrue\n1000\nalive\n", "-1\n0\n14\n14\n0\nfalse\n42\n-1\n", "7\n-1\n", "0\nfresh text\n3\n", "42\nfalse\nfalse\n10\n", "false\n10\n", "12\nfalse\n", "false\n42\n", "domain checked before depth state\n", "17\n0\n-1\n", "1450\nfalse\n", "14\n17\n0\n42\nalive\n", "85\n14\n17\n42\nalive\n", "14\n42\nalive\n", "5\nfalse\nfalse\n0\n1\n"]
+let expected = Map<Text, Text>()
+for index in 0..names.length { expected[names[index]] = outputs[index] }
+let config = Configuration { compiler: "./build/minyarc-calldepth"; directory: "build/calldepth-evidence"; sanitize: false; profile: "system"; budget: 32; cases: []; smallStack: false; largeDispatch: false; lto: false; maxDepth: ""; fallbackDepth: ""; fixtures: "all"; emit: ""; cache: "" }
+let optionIndex = 0
+while optionIndex < argumentCount() {
+    let option = argument(optionIndex)
+    let equals = source.find(option, "=", 0)
+    let inline = false
+    let value = ""
+    if equals >= 0 { value = Text(Bytes(option).slice(equals + 1, option.byteLength)); option = Text(Bytes(option).slice(0, equals)); inline = true }
+    if option == "--sanitize" || option == "--small-stack" || option == "--large-dispatch" || option == "--lto" {
+        test.check(!inline, "call-depth flag does not take a value: " + option)
+        if option == "--sanitize" { config.sanitize = true }
+        if option == "--small-stack" { config.smallStack = true }
+        if option == "--large-dispatch" { config.largeDispatch = true }
+        if option == "--lto" { config.lto = true }
+    } else {
+        if !inline { test.check(optionIndex + 1 < argumentCount(), "missing call-depth option value"); optionIndex += 1; value = argument(optionIndex) }
+        if option == "--compiler" { config.compiler = value }
+        else if option == "--evidence" { config.directory = value }
+        else if option == "--profile" { config.profile = value }
+        else if option == "--budget" { config.budget = Integer(value) }
+        else if option == "--case" { test.check(expected.has(value), "unknown call-depth case: " + value); config.cases.add(value) }
+        else if option == "--max-depth" { config.maxDepth = Text(Integer(value)) }
+        else if option == "--fallback-depth" { config.fallbackDepth = Text(Integer(value)) }
+        else if option == "--fixtures" { config.fixtures = value }
+        else if option == "--emit-ir" { config.emit = value }
+        else if option == "--ir-cache" { config.cache = value }
+        else { fail("unknown call-depth option: " + option) }
+    }
+    optionIndex += 1
+}
+test.check(config.profile == "system" || config.profile == "eager" || config.profile == "fixed" || config.profile == "lazy", "unknown call-depth heap profile")
+test.check(config.budget == 1 || config.budget == 32 || config.budget == 1024, "call-depth budget must be 1, 32 or 1024")
+test.check(config.fixtures == "all" || config.fixtures == "only" || config.fixtures == "skip", "unknown call-depth fixture selection")
+test.check(config.emit == "" || config.cache == "", "call-depth emission and IR-cache reuse cannot be combined")
+let scratch = test.scratch()
+let rootResult = test.run(["pwd", "-P"], system.environment(), "", scratch + "/root", 10)
+test.require(rootResult, "call-depth project directory")
+let root = test.lines(rootResult.output)[0]
+let platform = test.run(["uname", "-s"], system.environment(), "", scratch + "/platform", 10)
+test.require(platform, "call-depth platform")
+let windows = system.getenv("OS") == "Windows_NT" || test.contains(platform.output, "Windows") || test.contains(platform.output, "MSYS") || test.contains(platform.output, "MINGW") || test.contains(platform.output, "CYGWIN")
+test.check(!config.lto || platform.output == "Linux\n", "--lto requires Linux/lld")
+test.check(!config.smallStack || !windows, "--small-stack requires POSIX setrlimit")
+test.check(config.profile != "lazy" || !windows, "the lazy heap requires POSIX mmap")
+if config.emit != "" { config.directory = config.emit; config.fixtures = "skip" }
+test.require(test.run(["mkdir", "-p", "--", config.directory], system.environment(), "", scratch + "/mkdir", 10), "call-depth retained directory")
+config.directory = depth.absolute(config.directory, scratch)
+config.compiler = depth.absolute(config.compiler, scratch)
+if config.emit != "" {
+    config.emit = config.directory
+    if files.pathSize(config.emit + "/manifest.json") >= 0 { test.check(files.remove(config.emit + "/manifest.json") == 0, "cannot clear prior call-depth IR manifest") }
+}
+if config.cache != "" { config.cache = depth.absolute(config.cache, scratch) }
+let environment = system.environment()
+let flags: List<Text> = []
+if config.sanitize {
+    flags = ["-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
+    let leaks = "0"
+    if platform.output == "Linux\n" { leaks = "1" }
+    environment = arguments.environment(environment, "ASAN_OPTIONS", "detect_leaks=" + leaks + ":detect_stack_use_after_return=1:halt_on_error=1")
+    environment = arguments.environment(environment, "UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1")
+}
+let context = depth.Context { root: root; directory: config.directory; environment: environment; commands: []; serial: [0] }
+let clang = arguments.shellWords(test.setting("MINYAR_TEST_CLANG", "clang"))
+test.check(clang.length > 0, "missing call-depth clang command")
+let harness = context.directory + "/runtime.c"
+let contract = readTextFile(root + "/tests/memory-contracts-runtime.c")
+let directive = "#include \"../runtime/minyar_runtime.c\""
+test.check(source.count(contract, directive) == 1, "call-depth memory contract must include exactly one engine")
+writeTextFile(harness, test.replace(contract, directive, depth.graphSource(root) + "\n#include \"minyar_stack_frames.h\"\n") + "\n" + readTextFile(root + "/tests/calldepth-native-adapter.c") + readTextFile(root + "/tests/calldepth-reporting-native.c"))
+let policy: List<Text> = []
+if config.profile == "system" { policy.add("-DMINYAR_SYSTEM_HEAP=1") }
+if config.profile == "fixed" || config.profile == "lazy" { for value in ["-DMINYAR_BOUNDED_HEAP=1", "-DMINYAR_BOUNDED_HEAP_BYTES=16777216"] { policy.add(value) } }
+if config.profile == "lazy" { policy.add("-DMINYAR_LAZY_HEAP=1") }
+policy.add("-DMINYAR_RC_POLL_BUDGET=" + Text(config.budget))
+if config.maxDepth != "" { policy.add("-DMINYAR_MAX_CALL_DEPTH=" + config.maxDepth) }
+if config.fallbackDepth != "" { policy.add("-DMINYAR_FALLBACK_CALL_DEPTH=" + config.fallbackDepth) }
+fixtures(context, config, clang, flags, windows)
+let modes = ["O0", "O2"]
+if config.lto && !config.sanitize { modes.add("LTO") }
+if config.fixtures == "only" { modes = [] }
+let cases = config.cases.slice(0, config.cases.length)
+if cases.length == 0 { for name in names { if name != "large-dispatch" && name != "reporting-global" && name != "reporting-fallback" { cases.add(name) } } }
+let libraries = ["--library", root + "/library"]
+let overlay = false
+for name in cases { if source.starts(name, "reporting-") && name != "reporting-exhausted" { overlay = true } }
+if overlay {
+    let library = context.directory + "/library"
+    test.check(files.makeDirectory(library) == 0, "cannot create call-depth reporting overlay")
+    writeBytesFile(library + "/calldepth.min", readBytesFile(root + "/library/calldepth.min"))
+    writeTextFile(library + "/errors.min", readTextFile(root + "/library/errors.min") + "\npublic function depthTestCode(result: IntegerResult): Integer { return result.error.code }\npublic function depthTestValue(result: IntegerResult): Integer { return result.value }\n")
+    libraries = ["--library", library, "--library", root + "/library"]
+}
+if config.largeDispatch {
+    let found = false
+    for name in cases { if name == "large-dispatch" { found = true } }
+    if !found { cases.add("large-dispatch") }
+}
+generatedDispatch(context, config, root + "/build/minyarc", cases)
+let cache = json.parse("null")
+if config.cache != "" {
+    cache = depth.parsed(config.cache + "/manifest.json")
+    test.check(depth.number(cache, "budget") == config.budget, "call-depth IR cache budget changed")
+    test.check(json.string(cache, "compiler_sha256") == depth.digest(config.compiler), "call-depth IR cache came from another compiler")
+    let entries = depth.fields(cache, "cases")
+    for name in cases { test.check(json.member(entries, name).kind == json.OBJECT, "call-depth IR cache lacks case: " + name) }
+}
+if config.emit != "" {
+    let written = Map<Text, Text>()
+    let order: List<Text> = []
+    for name in cases {
+        let llvm = config.emit + "/" + name + ".ll"
+        compileCase(context, config, name, llvm, libraries, cache)
+        let invocation = json.parse(context.commands[context.commands.length - 1])
+        if !written.has(name) { order.add(name) }
+        written[name] = "{\"argv\":" + depth.serialize(json.member(invocation, "argv")) + ",\"source_sha256\":" + depth.quote(depth.digest(fixtureSource(context, name))) + ",\"ir_sha256\":" + depth.quote(depth.digest(llvm)) + "}"
+    }
+    let entries: List<Text> = []
+    for name in order { entries.add(depth.quote(name) + ":" + written[name]) }
+    writeTextFile(config.emit + "/manifest.json", "{\"budget\":" + Text(config.budget) + ",\"compiler\":" + depth.quote(config.compiler) + ",\"compiler_sha256\":" + depth.quote(depth.digest(config.compiler)) + ",\"cases\":{" + depth.joined(entries) + "}}\n")
+} else {
+    for mode in modes {
+        let optimization = ["-O2"]
+        if mode == "O0" { optimization = ["-O0"] }
+        if mode == "LTO" { for flag in ["-flto=thin", "-fuse-ld=lld"] { optimization.add(flag) } }
+        let extension = ".o"
+        if mode == "LTO" { extension = ".ll" }
+        let runtime = context.directory + "/runtime." + mode + extension
+        let command = clang.slice(0, clang.length)
+        if mode == "LTO" { command.add("-O2") } else { for flag in optimization { command.add(flag) } }
+        for flag in flags { command.add(flag) }
+        for flag in policy { command.add(flag) }
+        for item in ["-iquote", root + "/runtime"] { command.add(item) }
+        if mode == "LTO" { for flag in ["-S", "-emit-llvm"] { command.add(flag) } } else { command.add("-c") }
+        for item in [harness, "-o", runtime] { command.add(item) }
+        depth.success(context, command)
+        for name in cases {
+            let llvm = context.directory + "/" + name + "." + mode + ".ll"
+            compileCase(context, config, name, llvm, libraries, cache)
+            if config.sanitize { writeTextFile(llvm, test.instrument(readTextFile(llvm))) }
+            let executable = context.directory + "/" + name + "." + mode + ".bin"
+            command = clang.slice(0, clang.length)
+            for flag in optimization { command.add(flag) }
+            for flag in flags { command.add(flag) }
+            for item in ["-Wno-override-module", llvm, runtime, "-lm", "-o", executable] { command.add(item) }
+            depth.success(context, command)
+            let status = 0
+            let diagnostics = ""
+            if name == "domain-rejection" { status = 1; diagnostics = "Minyar stopped: callback belongs to a different execution domain.\n" }
+            depth.run(context, [executable], true, expected[name], status, diagnostics, config.smallStack && (name == "native-reserve" || name == "reporting-physical"))
+            print(mode + " " + name + " passed")
+        }
+    }
+    retain(context, config)
+}
+test.removeTree(scratch)

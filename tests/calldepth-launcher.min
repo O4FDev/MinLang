@@ -1,0 +1,73 @@
+use "../tools/testing.min" as test
+use "./compiler-port-support.min" as support
+use "./sha256-support.min" as arguments
+use "system" as system
+use "files" as files
+
+function request(context: test.Compiler, root: Text, source: Text, recovery: Boolean) {
+    let llvm = context.directory + "/request.ll"
+    let result = test.run([root + "/build/minyarc-errors-request", source, llvm, "--library", root + "/library"], system.environment(), root, llvm + ".compile", 30)
+    test.check(result.status == 0 && result.output == "" && result.errorOutput == "", "parsed call-depth request compiler output changed\n" + result.output + result.errorOutput)
+    test.check(files.pathSize(llvm) >= 0, "parsed call-depth request omitted LLVM")
+    test.check(test.contains(readTextFile(llvm), "; minyar-calldepth-policy:") == recovery, "parsed recovery policy did not match the source request")
+}
+function launch(context: test.Compiler, root: Text, source: Text, expected: Text, incremental: Boolean) {
+    let environment: List<Text> = []
+    for entry in system.environment() {
+        let keep = true
+        for name in ["MINYAR_CLANG", "MINYAR_RUNTIME_FLAGS", "MINYAR_CLANG_FLAGS", "MFLAGS"] { if support.starts(entry, name + "=") { keep = false } }
+        if keep { environment.add(entry) }
+    }
+    environment = arguments.environment(environment, "LLVM_CC", context.clang)
+    environment = arguments.environment(environment, "CC", context.clang)
+    environment = arguments.environment(environment, "MAKEFLAGS", "-j1")
+    environment = arguments.environment(environment, "MINYAR_CLANG_FLAGS", "-O0 -Wno-override-module")
+    let shell = test.run(["/bin/sh", "-c", "command -v sh"], system.environment(), root, context.directory + "/shell", 10)
+    test.check(shell.status == 0 && test.lines(shell.output).length > 0, "production recovery launcher requires sh")
+    let executable = context.directory + "/recovery"
+    if system.getenv("OS") == "Windows_NT" { executable += ".exe" }
+    let command = [test.lines(shell.output)[0], "-x", root + "/minyar", "--debug"]
+    if incremental { command.add("--incremental") }
+    for item in [source, "-o", executable] { command.add(item) }
+    let compiled = test.run(command, environment, root, context.directory + "/launcher", 180)
+    test.check(compiled.status == 0, "production recovery launcher failed\n" + compiled.output + compiled.errorOutput)
+    test.check(test.contains(compiled.errorOutput, "build/minyarc"), "production launcher trace omitted the maintained compiler")
+    let executed = test.run([executable], system.environment(), root, context.directory + "/execution", 30)
+    test.check(executed.status == 0 && executed.output == expected && executed.errorOutput == "", "production recovery executable output changed\n" + executed.output + executed.errorOutput)
+}
+function probe(root: Text, index: Integer, windows: Boolean) {
+    if index == 1 && windows { print("Incremental recovery driver requires macOS/Linux: skipped"); return }
+    let context = support.compiler()
+    if index == 0 {
+        let source = root + "/tests/calldepth/g14-recovered.min"
+        request(context, root, source, true)
+        launch(context, root, source, "false\ntrue\n1000\nalive\n", false)
+    } else if index == 1 {
+        writeTextFile(context.directory + "/result.min", "public function value(): Result<Integer, Text> { return Ok<Integer, Text>(42) }\n")
+        let source = context.directory + "/root.min"
+        writeTextFile(source, "use \"./result.min\" as result\nuse \"calldepth\" as depth\nuse \"errors\" as errors\nlet answer = depth.run(2, function(): Integer {\n    match result.value() { Ok(number) { return number } Err(error) { return 0 } }\n})\nprint(errors.integerValue(answer))\n")
+        request(context, root, source, true)
+        for iteration in 0..2 { launch(context, root, source, "42\n", true) }
+    } else {
+        let source = context.directory + "/ordinary.min"
+        writeTextFile(source, "// native \"calldepth\"\nprint(\"native \\\"calldepth\\\"\")\n")
+        request(context, root, source, false)
+    }
+    test.removeTree(context.directory)
+}
+
+let names = ["test_million_failure_then_thousand_success", "test_results_before_recovery_and_repeated_incremental_request", "test_text_and_comments_do_not_request_recovery"]
+let selectors = support.selectors("CallDepthLauncher", names)
+let work = test.scratch()
+let rootResult = test.run(["pwd", "-P"], system.environment(), "", work + "/root", 10)
+test.require(rootResult, "call-depth launcher project directory")
+let root = test.lines(rootResult.output)[0]
+let windows = system.getenv("OS") == "Windows_NT"
+if !windows {
+    let platform = test.run(["uname", "-s"], system.environment(), "", work + "/platform", 10)
+    test.require(platform, "call-depth launcher platform")
+    windows = test.contains(platform.output, "Windows") || test.contains(platform.output, "MSYS") || test.contains(platform.output, "MINGW") || test.contains(platform.output, "CYGWIN")
+}
+for index in 0..names.length { if support.selected(selectors, "CallDepthLauncher", names[index]) { probe(root, index, windows) } }
+test.removeTree(work)
+print("Parsed recovery selection and public incremental launcher: passed")

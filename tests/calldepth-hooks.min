@@ -1,0 +1,44 @@
+use "../tools/testing.min" as test
+use "./sha256-support.min" as arguments
+use "system" as system
+
+let sanitize = false
+let optionIndex = 0
+while optionIndex < argumentCount() {
+    let option = argument(optionIndex)
+    if option == "--sanitize" { sanitize = true }
+    else if option == "--evidence" {
+        test.check(optionIndex + 1 < argumentCount(), "missing call-depth hook evidence option")
+        optionIndex += 1
+    } else { fail("unknown call-depth hook option: " + option) }
+    optionIndex += 1
+}
+let work = test.scratch()
+let rootResult = test.run(["pwd", "-P"], system.environment(), "", work + "/root", 10)
+test.require(rootResult, "call-depth hook project directory")
+let root = test.lines(rootResult.output)[0]
+let environment = arguments.environment(system.environment(), "LIMITED", "")
+environment = arguments.environment(environment, "SANITIZER_LIMITED", "")
+if sanitize {
+    let platform = test.run(["uname", "-s"], system.environment(), "", work + "/platform", 10)
+    test.require(platform, "call-depth hook platform")
+    let leaks = "0"
+    if platform.output == "Linux\n" { leaks = "1" }
+    environment = arguments.environment(environment, "ASAN_OPTIONS", "detect_leaks=" + leaks + ":detect_stack_use_after_return=1:halt_on_error=1")
+    environment = arguments.environment(environment, "UBSAN_OPTIONS", "halt_on_error=1")
+}
+for profile in ["system", "eager"] {
+    for optimization in ["-O0", "-O2"] {
+        let flags = optimization + " -Wno-override-module"
+        if sanitize { flags += " -g -fsanitize=address,undefined -fno-omit-frame-pointer" }
+        environment = arguments.environment(environment, "MINYAR_CLANG_FLAGS", flags)
+        environment = arguments.environment(environment, "MINYAR_RUNTIME_FLAGS", flags)
+        let executable = work + "/" + profile + optimization
+        let compiled = test.run([root + "/minyar", "--memory-profile", profile, root + "/tests/thread-fixtures/recovery-unwind.min", "-o", executable], environment, root, executable + ".compile", 300)
+        test.check(compiled.status == 0, "call-depth child cleanup launcher failed\n" + compiled.output + compiled.errorOutput)
+        let executed = test.run([executable], environment, root, executable + ".run", 30)
+        test.check(executed.status == 0 && executed.output == "recovery and child cleanup passed\n" && executed.errorOutput == "", "call-depth recovery and child cleanup output changed\n" + executed.output + executed.errorOutput)
+        print(profile + "/" + optimization + ": recovery and child cleanup passed")
+    }
+}
+test.removeTree(work)
