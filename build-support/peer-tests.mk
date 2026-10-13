@@ -39,6 +39,7 @@ check: check-list-literals check-list-literal-runtime
 check-sanitize: check-list-literals-sanitize
 
 build/tooling/tests/stateful-lists: TOOL_NATIVE = tests/sha256-test-native.c
+build/tooling/tests/stateful-lists: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/stateful-lists: tests/sha256-test-native.c
 check-stateful-lists: build/minyarc build/minyar-runtime.o build/tooling/tests/stateful-lists
 	MINYAR_TEST_EXTENDED_OPT=1 $(LIMITED) ./build/tooling/tests/stateful-lists

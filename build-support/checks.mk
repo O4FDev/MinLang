@@ -267,6 +267,7 @@ check-examples: build/stage0 build/minyarc build/compiler-stage3.ll build/hello 
 	@echo "Minyar -> LLVM IR -> native executable verified"
 
 build/tooling/tests/ownership: TOOL_NATIVE = tests/sha256-test-native.c
+build/tooling/tests/ownership: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/ownership: tests/sha256-test-native.c
 check-ownership: build/minyarc build/minyar-runtime.o build/ownership-runtime.o build/tooling/tests/memory build/tooling/tests/ownership
 	$(LIMITED) ./build/tooling/tests/ownership
@@ -274,6 +275,7 @@ check-ownership: build/minyarc build/minyar-runtime.o build/ownership-runtime.o 
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/memory --shared
 
 build/tooling/tests/adversarial: TOOL_NATIVE = tests/sha256-test-native.c
+build/tooling/tests/adversarial: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/adversarial: tests/sha256-test-native.c
 check-adversarial: build/minyarc build/minyar-runtime.o build/minyarc-sanitize build/ownership-runtime.o build/tooling/tests/adversarial
 	$(LIMITED) ./build/tooling/tests/adversarial
