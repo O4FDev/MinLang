@@ -97,8 +97,12 @@ check-module-performance: build/minyarc build/minyar-runtime.o
 
 check: check-module-performance
 
-check-fuzz: check-fuzz-harness build/minyarc build/minyar-runtime.o
-	$(LIMITED) python3 tests/fuzz.py
+build/tooling/tests/fuzz.ll: tests/evidence-support.min
+build/tooling/tests/fuzz: TOOL_NATIVE = tests/evidence-support-native.c runtime/native/sha256.c
+build/tooling/tests/fuzz: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/fuzz: tests/evidence-support-native.c runtime/native/sha256.c
+check-fuzz: check-fuzz-harness build/minyarc build/minyar-runtime.o build/tooling/tests/fuzz
+	$(LIMITED) ./build/tooling/tests/fuzz
 
 # Explicit because AFL++ is an optional developer/CI dependency and campaigns
 # are duration-based. MINYAR_AFL_SECONDS controls the bounded run length.
@@ -193,16 +197,16 @@ check-sanitized-fixed-point: build/minyarc-sanitize build/compiler-stage3.ll bui
 .PHONY: check-sanitize-core
 check-sanitize: check-generated-sanitizer check-sanitized-fixed-point check-stack-overflow-sanitize check-sanitize-core
 
-check-sanitize-core: build/tooling/tests/memory build/minyarc-sanitize build/minyar-runtime.o build/minyar-runtime-sanitize.o build/runtime-unit-sanitize build/tooling/tests/regressions build/tooling/tools/clang-driver build/tooling/tests/ownership
+check-sanitize-core: build/tooling/tests/memory build/minyarc-sanitize build/minyar-runtime.o build/minyar-runtime-sanitize.o build/runtime-unit-sanitize build/tooling/tests/regressions build/tooling/tools/clang-driver build/tooling/tests/ownership build/tooling/tests/fuzz
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize $(SANITIZER_LIMITED) sh tests/run-module-tests.sh
-	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) python3 tests/fuzz.py --compiler build/minyarc-sanitize --cases 100 --hostile-timeout 15
+	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/tooling/tests/fuzz --compiler build/minyarc-sanitize --cases 100 --hostile-timeout 15
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/runtime-unit-sanitize
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/regressions
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/ownership
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/memory --shared
 
-check-stress: build/minyarc build/minyar-runtime.o
-	MINYAR_FUZZ_CASES=2000 $(LIMITED) python3 tests/fuzz.py
+check-stress: build/minyarc build/minyar-runtime.o build/tooling/tests/fuzz
+	MINYAR_FUZZ_CASES=2000 $(LIMITED) ./build/tooling/tests/fuzz
 
 check: doctor check-smoke check-release-build check-recursive-data check-compact-ownership check-adversarial check-ownership-mutation check-regressions check-memory check-runtime-unit check-modules check-fuzz check-stack-overflow check-mutation check-performance check-scaling check-budget check-sanitize check-ownership check-examples
 
@@ -416,8 +420,8 @@ check-module-driver-options: build/tooling/tests/module-driver-options
 check-native-graphics: build/tooling/tests/native-graphics
 	./build/tooling/tests/native-graphics
 
-check-fuzz-harness:
-	python3 tests/fuzz-harness.py
+check-fuzz-harness: build/tooling/tests/fuzz-harness build/tooling/tests/fuzz
+	./build/tooling/tests/fuzz-harness "$(CURDIR)/build/tooling/tests/fuzz"
 
 check-coverage-harness:
 	python3 tests/coverage-harness.py
