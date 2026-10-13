@@ -1,0 +1,246 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+function ends(source: Text, suffix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(suffix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[raw.length - pattern.length + index] != pattern[index] { return false } }
+    return true
+}
+function parent(path: Text): Text {
+    let raw = Bytes(path)
+    let ending = -1
+    for index in 0..raw.length { if raw[index] == 47 { ending = index } }
+    if ending < 0 { return "." }
+    if ending == 0 { return "/" }
+    return Text(raw.slice(0, ending))
+}
+function basename(path: Text): Text {
+    let raw = Bytes(path)
+    let start = 0
+    for index in 0..raw.length { if raw[index] == 47 { start = index + 1 } }
+    return Text(raw.slice(start, raw.length))
+}
+function absolute(path: Text, root: Text): Text {
+    if starts(path, "/") { return path }
+    return root + "/" + path
+}
+function has(values: List<Text>, expected: Text): Boolean {
+    for value in values { if value == expected { return true } }
+    return false
+}
+function chosen(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "RuntimeCache." + name { return true } }
+    return false
+}
+if argumentCount() > 0 && argument(0) == "--trace" {
+    let pieces = [Text(argumentCount() - 1) + "\n"]
+    for index in 1..argumentCount() { pieces.add(argument(index) + "\n") }
+    let data = Bytes(joinText(pieces))
+    let file = files.open(system.getenv("CACHE_TEST_CLANG_LOG"), files.WRITE | files.CREATE | files.APPEND)
+    test.check(file >= 0, "open native runtime cache trace")
+    test.check(files.write(file, data, 0, data.length) == data.length && files.close(file) == 0, "write native runtime cache trace")
+    let command = ["clang"]
+    for index in 1..argumentCount() { command.add(argument(index)) }
+    let handle = system.spawn(system.getenv("CACHE_TEST_REAL_CLANG"), command, system.environment(), "")
+    test.check(handle > 0, "launch actual runtime cache Clang")
+    let result = system.wait(handle)
+    test.check(result.error == 0, "wait for actual runtime cache Clang")
+    if result.state == system.SIGNALED { exit(128 + result.signal) }
+    test.check(result.state == system.EXITED, "runtime cache Clang exit state")
+    exit(result.exitCode)
+}
+record Fixture { work: Text; project: Text; source: Text; output: Text; log: Text; wrapper: Text; environment: List<Text>; serial: Integer }
+record Call { arguments: List<Text> }
+record Signature { modified: Text; hash: Text }
+function setup(): Fixture {
+    let work = test.scratch()
+    let rootResult = test.run(["pwd", "-P"], system.environment(), "", work + "/root", 10)
+    test.require(rootResult, "resolve runtime cache fixture root")
+    let root = test.lines(rootResult.output)[0]
+    let snapshot = absolute(test.setting("MINYAR_RUNTIME_CACHE_SNAPSHOT", root), root)
+    let project = work + "/project with spaces"
+    for directory in [project, project + "/build", work + "/tools"] { test.check(files.makeDirectory(directory) == 0, "runtime cache fixture directories") }
+    for name in ["minyar", "Makefile"] {
+        test.require(test.run(["cp", "-p", snapshot + "/" + name, project + "/" + name], system.environment(), "", work + "/copy-file", 30), "copy actual runtime cache snapshot " + name)
+    }
+    for name in ["runtime", "tools", "scripts", "build-support"] {
+        test.require(test.run(["cp", "-RLp", root + "/" + name, project + "/" + name], system.environment(), "", work + "/copy-tree", 30), "copy actual runtime cache production tree " + name)
+    }
+    test.require(test.run(["cp", "-p", absolute(test.setting("MINYAR_TEST_COMPILER", "build/minyarc"), root), project + "/build/minyarc"], system.environment(), "", work + "/copy-compiler", 30), "copy prebuilt runtime cache compiler")
+    let make = test.run(["/bin/sh", "-c", "command -v make"], system.environment(), "", work + "/make", 10)
+    test.require(make, "find actual runtime cache Make")
+    let clang = test.run(["/bin/sh", "-c", "command -v \"$1\"", "minyar", test.setting("MINYAR_TEST_CLANG", "clang")], system.environment(), "", work + "/clang", 10)
+    test.require(clang, "find actual runtime cache Clang")
+    let self = test.run(["readlink", "/proc/" + Text(system.processId()) + "/exe"], system.environment(), "", work + "/self", 10)
+    test.require(self, "locate native runtime cache tracer")
+    let tools = work + "/tools"
+    writeTextFile(tools + "/make", "#!/bin/sh\nexec \"$CACHE_TEST_REAL_MAKE\" -o build/minyarc \"$@\"\n")
+    writeTextFile(tools + "/clang", "#!/bin/sh\nexec \"$CACHE_TEST_TRACER\" --trace \"$@\"\n")
+    test.require(test.run(["chmod", "700", tools + "/make", tools + "/clang"], system.environment(), "", work + "/shim-mode", 10), "set native runtime cache dispatch modes")
+    let environment: List<Text> = []
+    let removed = ["PATH", "MINYAR_CLANG", "MINYAR_CLANG_FLAGS", "MINYAR_RUNTIME_FLAGS", "MINYAR_MODULE_CACHE", "MAKEFLAGS", "MFLAGS", "LIMITED", "SANITIZER_LIMITED", "LLVM_CC"]
+    for entry in system.environment() {
+        let retain = !starts(entry, "CACHE_TEST_")
+        for name in removed { if starts(entry, name + "=") { retain = false } }
+        if retain { environment.add(entry) }
+    }
+    let log = work + "/clang.log"
+    environment.add("PATH=" + tools + ":" + system.getenv("PATH"))
+    environment.add("CACHE_TEST_CLANG_LOG=" + log)
+    environment.add("CACHE_TEST_REAL_MAKE=" + test.lines(make.output)[0])
+    environment.add("CACHE_TEST_REAL_CLANG=" + test.lines(clang.output)[0])
+    environment.add("CACHE_TEST_TRACER=" + test.lines(self.output)[0])
+    environment.add("LIMITED=")
+    environment.add("SANITIZER_LIMITED=")
+    environment.add("LLVM_CC=clang")
+    let source = work + "/source with spaces.min"
+    writeTextFile(source, "function value(n: Integer): Text {\nlet text = Text(n)\nreturn text\n}\nprint(value(42))\n")
+    return Fixture { work: work; project: project; source: source; output: work + "/output program"; log: log; wrapper: tools + "/clang"; environment: environment; serial: 0 }
+}
+function merged(environment: List<Text>, extra: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for entry in environment {
+        let keep = true
+        for override in extra {
+            let raw = Bytes(override)
+            let ending = 0
+            while ending < raw.length && raw[ending] != 61 { ending += 1 }
+            test.check(ending < raw.length, "runtime cache environment override syntax")
+            if starts(entry, Text(raw.slice(0, ending + 1))) { keep = false }
+        }
+        if keep { result.add(entry) }
+    }
+    for entry in extra { result.add(entry) }
+    return result
+}
+function launch(fixture: Fixture, options: List<Text>, extra: List<Text>): List<Call> {
+    fixture.serial += 1
+    let prefix = fixture.work + "/launch" + Text(fixture.serial)
+    writeTextFile(fixture.log, "")
+    let command = [fixture.project + "/minyar"]
+    for option in options { command.add(option) }
+    command.add(fixture.source)
+    command.add("-o")
+    command.add(fixture.output)
+    test.require(test.run(command, merged(fixture.environment, extra), fixture.work, prefix, 120), "actual public runtime cache launcher")
+    let result = test.run([fixture.output], system.environment(), "", prefix + ".program", 10)
+    test.check(result.status == 0 && result.output == "42\n" && result.errorOutput == "", "runtime cache launcher output contract\n" + result.output + result.errorOutput)
+    let calls: List<Call> = []
+    let lines = test.lines(readTextFile(fixture.log))
+    let position = 0
+    while position < lines.length {
+        let size = Integer(lines[position])
+        position += 1
+        test.check(size >= 0 && position + size <= lines.length, "runtime cache complete native trace")
+        let arguments: List<Text> = []
+        for index in 0..size { arguments.add(lines[position + index]) }
+        let metadata = arguments.length == 1 && (arguments[0] == "--version" || arguments[0] == "-print-prog-name=ld.lld")
+        if !metadata { calls.add(Call { arguments: arguments }) }
+        position += size
+    }
+    return calls
+}
+function signature(fixture: Fixture, path: Text): Signature {
+    test.require(test.run(["test", "-f", path], system.environment(), "", fixture.work + "/signature-file", 10), "standard system/K32 launch must create its shared runtime target")
+    let modified = test.run(["stat", "--format=%y", "--", path], system.environment(), "", fixture.work + "/signature-time", 10)
+    test.require(modified, "runtime cache nanosecond modification identity")
+    let hash = test.run(["sha256sum", "--", path], system.environment(), "", fixture.work + "/signature-hash", 10)
+    test.require(hash, "runtime cache SHA256 identity")
+    let fields = test.words(hash.output)
+    test.check(fields.length >= 1 && Bytes(fields[0]).length == 64, "runtime cache complete SHA256 signature")
+    return Signature { modified: modified.output; hash: fields[0] }
+}
+function identical(actual: Signature, expected: Signature) {
+    test.check(actual.modified == expected.modified && actual.hash == expected.hash, "runtime cache exact timestamp/SHA256 identity")
+}
+let names = ["test_standard_runtime_is_reused", "test_stack_header_change_rebuilds_runtime", "test_backend_path_and_flags_invalidate_cached_runtime", "test_custom_runtime_flags_use_invocation_storage"]
+for index in 0..argumentCount() {
+    let valid = false
+    for name in names { if argument(index) == name || argument(index) == "RuntimeCache." + name { valid = true } }
+    test.check(valid, "unknown runtime cache case " + argument(index))
+}
+if chosen("test_standard_runtime_is_reused") {
+    let fixture = setup()
+    for release in [false, true] {
+        let options: List<Text> = []
+        let target = fixture.project + "/build/minyar-default-runtime.o"
+        if release { options.add("--release"); target = fixture.project + "/build/minyar-default-runtime-release.ll" }
+        launch(fixture, options, [])
+        let before = signature(fixture, target)
+        let selected: List<Text> = []
+        for option in options { selected.add(option) }
+        for option in ["--memory-profile", "system", "--cleanup-budget", "00032"] { selected.add(option) }
+        let calls = launch(fixture, selected, [])
+        identical(signature(fixture, target), before)
+        test.check(calls.length == 1, "second runtime cache build must link only")
+        test.check(has(calls[0].arguments, target), "runtime cache warm link must use shared target")
+        test.check(!has(calls[0].arguments, "-c") && !has(calls[0].arguments, "-emit-llvm"), "runtime cache warm build must not compile runtime")
+    }
+    test.removeTree(fixture.work)
+}
+if chosen("test_stack_header_change_rebuilds_runtime") {
+    let fixture = setup()
+    let target = fixture.project + "/build/minyar-default-runtime.o"
+    launch(fixture, [], [])
+    let before = signature(fixture, target)
+    let header = fixture.project + "/runtime/minyar_stack_frames.h"
+    writeTextFile(header, readTextFile(header) + "\n\n")
+    test.require(test.run(["touch", "-d", "+2 seconds", "--", header], system.environment(), "", fixture.work + "/header-time", 10), "future header dependency invalidation timestamp")
+    let calls = launch(fixture, [], [])
+    test.check(signature(fixture, target).modified != before.modified, "stack header edit must rebuild runtime timestamp")
+    let compiled = false
+    for call in calls { if has(call.arguments, "-c") { compiled = true } }
+    test.check(compiled, "header edit must compile a fresh runtime")
+    test.check(calls.length > 0 && has(calls[calls.length - 1].arguments, target), "header edit final link must use shared target")
+    test.removeTree(fixture.work)
+}
+if chosen("test_backend_path_and_flags_invalidate_cached_runtime") {
+    let fixture = setup()
+    let target = fixture.project + "/build/minyar-default-runtime.o"
+    launch(fixture, [], [])
+    let original = signature(fixture, target)
+    let selected = ["LLVM_CC=" + fixture.wrapper, "LLVM_FLAGS=-O1 -Wno-override-module"]
+    let calls = launch(fixture, [], selected)
+    test.check(signature(fixture, target).modified != original.modified, "backend path/flags must invalidate cached runtime")
+    let compiled = false
+    for call in calls { if has(call.arguments, "-c") && has(call.arguments, "-O1") { compiled = true } }
+    test.check(compiled, "backend flags must compile matching O1 runtime")
+    let updated = signature(fixture, target)
+    launch(fixture, [], selected)
+    identical(signature(fixture, target), updated)
+    test.removeTree(fixture.work)
+}
+if chosen("test_custom_runtime_flags_use_invocation_storage") {
+    let fixture = setup()
+    let target = fixture.project + "/build/minyar-default-runtime.o"
+    launch(fixture, [], [])
+    let before = signature(fixture, target)
+    let calls = launch(fixture, [], ["MINYAR_RUNTIME_FLAGS=-O1 -Wno-override-module"])
+    identical(signature(fixture, target), before)
+    let runtimeCall: List<Text> = []
+    for call in calls { if runtimeCall.length == 0 && has(call.arguments, "-c") { runtimeCall = call.arguments } }
+    test.check(runtimeCall.length > 0 && has(runtimeCall, "-O1"), "custom runtime flags must compile selected O1 invocation runtime")
+    let source = ""
+    for argument in runtimeCall { if source == "" && ends(argument, ".c") { source = argument } }
+    test.check(source != "" && starts(basename(parent(source)), "invocation."), "custom runtime source must be invocation-local")
+    test.check(parent(parent(source)) == fixture.project + "/build/programs", "custom runtime source must live in project invocation storage")
+    test.check(calls.length > 0 && !has(calls[calls.length - 1].arguments, target), "custom runtime link must not use shared runtime target")
+    let selectedRuntime = false
+    for argument in calls[calls.length - 1].arguments { if basename(argument) == "runtime.o" { selectedRuntime = true } }
+    test.check(selectedRuntime, "custom runtime link must use invocation runtime.o")
+    let remaining = files.list(fixture.project + "/build/programs")
+    test.check(files.lastError() == 0, "runtime cache invocation storage")
+    for name in remaining { test.check(!starts(name, "invocation."), "custom runtime invocation storage must be removed") }
+    test.removeTree(fixture.work)
+}
+print("Runtime cache: passed")

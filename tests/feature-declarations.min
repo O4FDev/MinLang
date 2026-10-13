@@ -1,0 +1,86 @@
+use "../tools/testing.min" as test
+
+function find(source: Text, needle: Text, begin: Integer): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if raw.length < pattern.length { return -1 }
+    for index in begin..(raw.length - pattern.length + 1) {
+        let equal = true
+        for offset in 0..pattern.length { if raw[index + offset] != pattern[offset] { equal = false; break } }
+        if equal { return index }
+    }
+    return -1
+}
+function quoted(source: Text): Text {
+    let result = Bytes("\"")
+    for byte in Bytes(source) {
+        if byte == 34 || byte == 92 { result.add(92); result.add(byte) }
+        else if byte == 10 { result.add(92); result.add(110) }
+        else if byte == 13 { result.add(92); result.add(114) }
+        else if byte == 9 { result.add(92); result.add(116) }
+        else { result.add(byte) }
+    }
+    result.add(34)
+    return Text(result)
+}
+function helpers(): Text {
+    let source = readTextFile(test.setting("MINYAR_TEST_COMPILER_SOURCE", "build/compiler.min"))
+    let raw = Bytes(source)
+    let result = ""
+    for name in ["findText", "startsDeclaration", "hasGlobalDeclarations", "deduplicateGlobalDeclarations"] {
+        let begin = find(source, "function " + name + "(", 0)
+        test.check(begin >= 0, "missing maintained declaration helper " + name)
+        let end = find(source, "\n}\n", begin)
+        test.check(end >= 0, "unterminated maintained declaration helper " + name)
+        result += Text(raw.slice(begin, end + 3)) + "\n"
+    }
+    return result
+}
+function selected(selectors: List<Text>, name: Text): Boolean {
+    if selectors.length == 0 { return true }
+    for selector in selectors { if selector == "FeatureDeclarations" || selector == name || selector == "FeatureDeclarations." + name { return true } }
+    return false
+}
+let names = ["test_combined_and_individual_blocks_share_program_declarations", "test_definition_body_and_ordinary_globals_are_preserved"]
+let selectors: List<Text> = []
+for index in 0..argumentCount() {
+    let selector = argument(index)
+    if selector == "-v" || selector == "--verbose" || selector == "-q" || selector == "--quiet" { continue }
+    let known = selector == "FeatureDeclarations"
+    for name in names { if selector == name || selector == "FeatureDeclarations." + name { known = true } }
+    test.check(known, "unknown feature declaration selector: " + selector)
+    selectors.add(selector)
+}
+let compiler = test.compiler()
+if selected(selectors, names[0]) {
+    let combined = ""
+    for index in 0..4 { combined += "declare void @feature" + Text(index) + "(ptr)\n" }
+    let sources = [combined]
+    for index in 0..10 { sources.add("declare void @feature" + Text(index) + "(ptr)\n") }
+    sources.add(combined)
+    let seen = Map<Text, Boolean>()
+    let expected = ""
+    let program = helpers() + "\nlet seen: List<Text> = []\n"
+    for block in sources {
+        let kept = ""
+        for line in test.lines(block) {
+            if !seen.has(line) { seen[line] = true; kept += line + "\n" }
+        }
+        expected += kept + "\n"
+        program += "print(deduplicateGlobalDeclarations(" + quoted(block) + ", seen))\n"
+    }
+    test.executes(compiler, program, expected)
+}
+if selected(selectors, names[1]) {
+    let declaration = "declare void @shared(ptr)\n"
+    let body = "define void @f() {\n; λ unchanged body\n}\n" + declaration
+    let source = helpers() + "\nlet seen: List<Text> = []\n"
+    source += "deduplicateGlobalDeclarations(" + quoted(declaration) + ", seen)\n"
+    source += "print(deduplicateGlobalDeclarations(" + quoted(declaration + body) + ", seen))\n"
+    source += "print(hasGlobalDeclarations([" + quoted("@literal = constant [9 x i8] c\"declare \"\n") + "]))\n"
+    source += "print(hasGlobalDeclarations([" + quoted(body) + "]))\n"
+    source += "print(hasGlobalDeclarations([" + quoted("; λ feature header\n" + declaration) + "]))\n"
+    test.executes(compiler, source, body + "\nfalse\nfalse\ntrue\n")
+}
+test.removeTree(compiler.directory)
+print("Shared feature declarations: passed")

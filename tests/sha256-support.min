@@ -1,0 +1,145 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+
+public record Context { directory: Text; root: Text; compiler: Text; runtime: Text; clang: Text; environment: List<Text>; timeout: Integer; commands: List<List<Text>> }
+public function shellWords(source: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(source)
+    let token = Bytes()
+    let quote = 0
+    let active = false
+    let index = 0
+    while index < raw.length {
+        let byte = raw[index]
+        if quote == 39 {
+            if byte == 39 { quote = 0 } else { token.add(byte) }
+        } else if quote == 34 {
+            if byte == 34 { quote = 0 }
+            else if byte == 92 && index + 1 < raw.length && (raw[index + 1] == 34 || raw[index + 1] == 92) { index += 1; token.add(raw[index]) }
+            else { token.add(byte) }
+        } else if byte == 39 || byte == 34 { quote = byte; active = true }
+        else if byte == 92 { test.check(index + 1 < raw.length, "unterminated command flag escape"); index += 1; token.add(raw[index]); active = true }
+        else if byte == 32 || byte == 9 || byte == 10 || byte == 13 {
+            if active { result.add(Text(token)); token = Bytes(); active = false }
+        } else { token.add(byte); active = true }
+        index += 1
+    }
+    test.check(quote == 0, "unterminated command flag quote")
+    if active { result.add(Text(token)) }
+    return result
+}
+public function environment(source: List<Text>, name: Text, value: Text): List<Text> {
+    let result: List<Text> = []
+    let prefix = name + "="
+    for entry in source {
+        let raw = Bytes(entry)
+        if raw.length < prefix.byteLength || Text(raw.slice(0, prefix.byteLength)) != prefix { result.add(entry) }
+    }
+    result.add(prefix + value)
+    return result
+}
+public function hasEnvironment(source: List<Text>, name: Text): Boolean {
+    let prefix = name + "="
+    for entry in source {
+        let raw = Bytes(entry)
+        if raw.length >= prefix.byteLength && Text(raw.slice(0, prefix.byteLength)) == prefix { return true }
+    }
+    return false
+}
+public function context(directory: Text, sanitize: Boolean): Context {
+    let location = test.run(["/bin/pwd", "-P"], system.environment(), "", directory + "/root", 10)
+    test.require(location, "SHA project location")
+    let root = test.lines(location.output)[0]
+    let env = system.environment()
+    if sanitize && !hasEnvironment(env, "ASAN_OPTIONS") { env = environment(env, "ASAN_OPTIONS", "detect_leaks=0") }
+    let timeout = Integer(test.setting("MINYAR_TEST_TIMEOUT", "120"))
+    test.check(timeout > 0, "SHA process timeout must be positive")
+    return Context { directory: directory; root: root; compiler: test.setting("MINYAR_TEST_COMPILER", root + "/build/minyarc"); runtime: test.setting("MINYAR_TEST_RUNTIME", root + "/build/minyar-default-runtime.o"); clang: test.setting("MINYAR_TEST_CLANG", "clang"); environment: env; timeout: timeout; commands: [] }
+}
+public function run(context: Context, command: List<Text>): test.Result {
+    context.commands.add(command)
+    let result = test.run(command, context.environment, "", context.directory + "/command-" + Text(context.commands.length), context.timeout)
+    test.require(result, "standalone SHA command")
+    return result
+}
+public function stem(source: Text): Text {
+    let raw = Bytes(source)
+    let begin = 0
+    let end = raw.length
+    for index in 0..raw.length { if raw[index] == 47 { begin = index + 1 } }
+    for index in begin..raw.length { if raw[index] == 46 { end = index } }
+    return Text(raw.slice(begin, end))
+}
+public function compile(context: Context, source: Text, module: Text, optimization: Text, sanitize: Boolean): Text {
+    let base = context.directory + "/" + stem(source) + "-" + module
+    let staged = base + ".min"
+    writeTextFile(staged, test.replace(readTextFile(source), "use \"sha256\" as sha", "use \"" + module + "\" as sha"))
+    let library = context.directory + "/library"
+    test.check(files.makeDirectory(library) == 0, "cannot create focused SHA library")
+    for name in files.list(context.root + "/library") {
+        if files.pathSize(library + "/" + name) < 0 { run(context, ["/bin/ln", "-s", "--", context.root + "/library/" + name, library + "/" + name]) }
+    }
+    for name in ["sha256test", "sha256pure"] {
+        let fixture = context.root + "/tests/" + name + ".min"
+        if files.pathSize(fixture) >= 0 && files.pathSize(library + "/" + name + ".min") < 0 { run(context, ["/bin/ln", "-s", "--", fixture, library + "/" + name + ".min"]) }
+    }
+    let llvm = base + ".ll"
+    run(context, [context.compiler, staged, llvm, "--library", library])
+    let ir = readTextFile(llvm)
+    test.check(!test.contains(ir, "securecrypto") && !test.contains(ir, "monocypher"), "standalone SHA unexpectedly depends on securecrypto")
+    let flags = shellWords(system.getenv("MINYAR_TEST_LINK_FLAGS"))
+    let runtime = context.runtime
+    if sanitize {
+        optimization = "-O1"
+        for flag in ["-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"] { flags.add(flag) }
+        runtime = context.directory + "/sha256-runtime-sanitize.o"
+        if files.pathSize(runtime) < 0 {
+            let command = [context.clang, optimization]
+            for flag in flags { command.add(flag) }
+            for item in ["-c", context.root + "/runtime/minyar_default_runtime.c", "-o", runtime] { command.add(item) }
+            run(context, command)
+        }
+    }
+    if test.addressEnabled(flags) { writeTextFile(llvm, test.instrument(ir)) }
+    if sanitize {
+        let annotated = readTextFile(llvm)
+        test.check(test.contains(annotated, "sanitize_address"), "generated Minyar IR was not ASan-annotated")
+        let count = 0
+        for line in test.lines(annotated) {
+            let raw = Bytes(line)
+            if raw.length >= 7 && Text(raw.slice(0, 7)) == "define " {
+                test.check(test.contains(line, "sanitize_address"), "not every Minyar function was ASan-annotated")
+                count += 1
+            }
+        }
+        print("ASan annotated all " + Text(count) + " generated functions; sanitized runtime/native sources: " + stem(source) + ".min")
+    }
+    let providers: List<Text> = []
+    if module == "sha256" && files.pathSize(context.root + "/runtime/native/sha256.c") >= 0 { providers.add(context.root + "/runtime/native/sha256.c") }
+    if test.contains(ir, "minyar_sha256test_") { providers.add(context.root + "/tests/sha256-test-native.c") }
+    let objects: List<Text> = []
+    if providers.length > 0 {
+        let cflags = shellWords(run(context, ["pkg-config", "--cflags", "libcrypto"]).output)
+        for flag in shellWords(run(context, ["pkg-config", "--libs", "libcrypto"]).output) { flags.add(flag) }
+        for provider in providers {
+            let suffix = ""
+            if sanitize { suffix = "-sanitize" }
+            let object = context.directory + "/" + stem(provider) + suffix + ".o"
+            if files.pathSize(object) < 0 {
+                let command = [context.clang, optimization]
+                for flag in cflags { command.add(flag) }
+                for flag in flags { command.add(flag) }
+                for item in ["-c", provider, "-o", object] { command.add(item) }
+                run(context, command)
+            }
+            objects.add(object)
+        }
+    }
+    let command = [context.clang, optimization, "-Wno-override-module", llvm, runtime]
+    for object in objects { command.add(object) }
+    for flag in flags { command.add(flag) }
+    for item in ["-lm", "-o", base] { command.add(item) }
+    run(context, command)
+    return base
+}
