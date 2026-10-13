@@ -1,5 +1,6 @@
 #include <archive.h>
 #include <archive_entry.h>
+#include <locale.h>
 
 typedef struct {
     char *path, *target;
@@ -413,6 +414,10 @@ static int e_apply_layer(EWriter *w, const char *path, uint64_t generation) {
     int error = e_spool_tar(w,path,&start,&end); if (error) return error;
     struct archive *reader = archive_read_new();
     if (!reader) return ENOMEM;
+    locale_t utf8 = newlocale(LC_CTYPE_MASK,"C.UTF-8",(locale_t)0);
+    if (!utf8) { error = errno; archive_read_free(reader); return error; }
+    locale_t previous = uselocale(utf8);
+    if (!previous) { error = errno; freelocale(utf8); archive_read_free(reader); return error; }
     int fd = dup(w->data_fd);
     if (fd < 0) error = errno;
     if (!error && lseek(fd,(off_t)start,SEEK_SET) < 0) error = errno;
@@ -495,6 +500,8 @@ static int e_apply_layer(EWriter *w, const char *path, uint64_t generation) {
     free(layer.links);free(buffer);
     if (archive_read_free(reader) != ARCHIVE_OK && !error) error = EINVAL;
     if (fd >= 0) close(fd);
+    if (!uselocale(previous) && !error) error = errno;
+    freelocale(utf8);
     return error;
 }
 static int e_count_tree(ENode *node) {
