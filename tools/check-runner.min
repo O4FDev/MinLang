@@ -323,22 +323,26 @@ function slots(label: Text, jobs: Integer): Integer {
     return 1
 }
 function monitored(plan: Plan, variant: Integer, args: List<Text>, log: Text, tmp: Text, label: Text): Integer {
-    test.check(files.makeDirectory(tmp) == 0, "cannot create private process scratch")
-    let alias = "/tmp/minyar-tests-" + Text(system.processId()) + "-" + Text(system.monotonicNanoseconds())
-    test.require(test.run(["/bin/ln", "-s", tmp, alias], system.environment(), "", log + ".scratch-link", 10), "create short private scratch alias")
-    writeTextFile(log + ".scratch-alias", alias)
-    let env = environment(plan.variants[variant].environment, "TMPDIR", alias)
+    let scratch = test.setting("MINYAR_TEST_SCRATCH", "/tmp") + "/minyar-tests-" + Text(system.processId()) + "-" + Text(system.monotonicNanoseconds())
+    test.check(files.makeDirectory(scratch) == 0, "cannot create private process scratch")
+    test.require(test.run(["/bin/ln", "-s", scratch, tmp], system.environment(), "", log + ".scratch-link", 10), "link private scratch into the run")
+    writeTextFile(log + ".scratch-alias", scratch)
+    writeTextFile(log + ".scratch-home", tmp)
+    let env = environment(plan.variants[variant].environment, "TMPDIR", scratch)
     env = environment(env, "MINYAR_CHECK_LABEL", label)
     if slots(label, plan.jobs) > 1 || label == "check-mutation-score" { env = environment(env, "MINYAR_TEST_JOBS", Text(slots(label, plan.jobs))) }
     return test.monitoredStart(args, env, plan.variants[variant].cwd, log, plan.timeout)
 }
-function removeAlias(log: Text) {
-    let alias = readTextFile(log + ".scratch-alias")
-    test.check(begins(alias, "/tmp/minyar-tests-") && files.remove(alias) == 0, "remove private scratch alias")
+function settle(log: Text, passed: Boolean) {
+    let scratch = readTextFile(log + ".scratch-alias")
+    let home = readTextFile(log + ".scratch-home")
+    test.check(test.contains(scratch, "/minyar-tests-") && files.remove(home) == 0, "unlink private scratch")
+    if passed { test.removeTree(scratch) }
+    else { test.require(test.run(["/bin/mv", "--", scratch, home], system.environment(), "", log + ".scratch-retain", 600), "retain failed check scratch") }
 }
 function showResult(label: Text, log: Text, status: system.ProcessStatus, started: Integer): Boolean {
-    removeAlias(log)
     let passed = status.error == 0 && status.state == system.EXITED && status.exitCode == 0
+    settle(log, passed)
     let elapsed = (system.monotonicNanoseconds() - started) / 1000000
     let outcome = "FAILED"
     if passed { outcome = "passed" }
@@ -509,8 +513,8 @@ function execute(plan: Plan): Boolean {
     }
     if interrupted {
         plan.interrupted = true
-        for check in plan.checks { if check.state == 1 { system.sendSignal(system.childProcessId(check.handle), 15); system.wait(check.handle); removeAlias(check.log) } }
-        for goal in plan.goals { if goal.state == 1 { system.sendSignal(system.childProcessId(goal.handle), 15); system.wait(goal.handle); removeAlias(goal.log) } }
+        for check in plan.checks { if check.state == 1 { system.sendSignal(system.childProcessId(check.handle), 15); system.wait(check.handle); settle(check.log, false) } }
+        for goal in plan.goals { if goal.state == 1 { system.sendSignal(system.childProcessId(goal.handle), 15); system.wait(goal.handle); settle(goal.log, false) } }
         return false
     }
     let passed = true
