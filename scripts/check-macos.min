@@ -1,0 +1,218 @@
+use "../tools/testing.min" as test
+use "../tools/check-runner.min" as runner
+use "../tools/test-toolchain.min" as toolchain
+use "./linux-plan.min" as catalogue
+use "system" as system
+use "text" as text
+use "errors" as errors
+use "files" as files
+use "json" as json
+function number(value: Text): Integer {
+    let parsed = text.parseInteger(value)
+    test.check(errors.integerOk(parsed), "expected an integer: " + value)
+    return errors.integerValue(parsed)
+}
+function member(values: List<Text>, value: Text): Boolean {
+    for item in values { if item == value { return true } }
+    return false
+}
+function probe(command: List<Text>, work: Text): Integer {
+    let result = test.run(command, system.environment(), "", work + "/probe", 10)
+    let lines = test.lines(result.output)
+    if result.status != 0 || lines.length == 0 { return -1 }
+    let parsed = text.parseInteger(lines[0])
+    if !errors.integerOk(parsed) { return -1 }
+    return errors.integerValue(parsed)
+}
+function darwin(work: Text): Boolean {
+    let result = test.run(["uname", "-s"], system.environment(), "", work + "/uname", 10)
+    return result.status == 0 && test.lines(result.output).length > 0 && test.lines(result.output)[0] == "Darwin"
+}
+function defaultJobs(work: Text): Integer {
+    let memory = -1
+    let processors = -1
+    if darwin(work) {
+        memory = probe(["sysctl", "-n", "hw.memsize"], work)
+        processors = probe(["sysctl", "-n", "hw.ncpu"], work)
+    } else {
+        let pages = probe(["getconf", "_PHYS_PAGES"], work)
+        let size = probe(["getconf", "PAGESIZE"], work)
+        if pages > 0 && size > 0 { memory = pages * size }
+        processors = probe(["getconf", "_NPROCESSORS_ONLN"], work)
+    }
+    if memory < 0 || processors < 1 { return 1 }
+    return max(1, min(min(processors, 16), memory / 8589934592))
+}
+function tierOf(label: Text): Text {
+    if test.contains(label, "sanitiz") { return "sanitize" }
+    return "full"
+}
+function findCheck(plan: runner.Plan, label: Text): Integer {
+    for index in 0..plan.checks.length { if plan.checks[index].label == label { return index } }
+    return -1
+}
+function quoted(values: List<Text>): Text {
+    let parts: List<Text> = []
+    for value in values { parts.add(json.quote(value)) }
+    let result = "["
+    for index in 0..parts.length {
+        if index > 0 { result += ", " }
+        result += parts[index]
+    }
+    return result + "]"
+}
+let source = "."
+let jobs = -1
+let tier = "full"
+let only: List<Text> = []
+let target = "check-portable"
+let timeout = 1800
+let retries = 1
+let output = ""
+let extras = true
+let keychain = false
+let dryRun = false
+let variables: List<Text> = []
+let index = 0
+while index < argumentCount() {
+    let option = argument(index)
+    if option == "--extras" { extras = true; index += 1; continue }
+    if option == "--no-extras" { extras = false; index += 1; continue }
+    if option == "--keychain" { keychain = true; index += 1; continue }
+    if option == "--dry-run" { dryRun = true; index += 1; continue }
+    if !runner.begins(option, "--") {
+        test.check(test.contains(option, "="), "trailing arguments must be make variables (VAR=VALUE)")
+        variables.add(option)
+        index += 1
+        continue
+    }
+    test.check(index + 1 < argumentCount(), "option requires a value: " + option)
+    let value = argument(index + 1)
+    if option == "--source" { source = value }
+    else if option == "--jobs" { jobs = number(value) }
+    else if option == "--tier" { tier = value }
+    else if option == "--only" { only.add(value) }
+    else if option == "--target" { target = value }
+    else if option == "--timeout" { timeout = number(value) }
+    else if option == "--retries" { retries = number(value) }
+    else if option == "--output-dir" { output = value }
+    else { fail("unknown option: " + option) }
+    index += 2
+}
+test.check(tier == "full" || tier == "sanitize" || tier == "all", "unknown tier: " + tier)
+test.check(timeout >= 1 && retries >= 0, "jobs and timeout must be positive")
+let probes = test.scratch()
+if jobs < 0 { jobs = defaultJobs(probes) }
+let host = darwin(probes)
+test.removeTree(probes)
+let plan = runner.plan(jobs, timeout, retries)
+source = toolchain.absolute(source, plan.scratch)
+if !dryRun {
+    if !host { system.writeStandardError("note: this runner is meant for macOS; use build/tooling/scripts/check-linux on Linux\n") }
+    if output == "" { output = source + "/build/check-macos" }
+    test.require(test.run(["mkdir", "-p", "--", output], system.environment(), source, plan.scratch + "/output-directory", 10), "run directory")
+    output = toolchain.absolute(output, plan.scratch)
+    let retained = output + "/minyar-tests-macos-" + Text(system.monotonicNanoseconds())
+    test.require(test.run(["mv", "--", plan.scratch, retained], system.environment(), source, output + "/move-run", 10), "retained process scratch")
+    plan.scratch = retained
+}
+let environment: List<Text> = []
+for entry in system.environment() {
+    if !runner.begins(entry, "MAKEFLAGS=") && !runner.begins(entry, "MFLAGS=") && !runner.begins(entry, "MAKELEVEL=") { environment.add(entry) }
+}
+let make = ["make", "-j1"]
+for variable in variables { make.add(variable) }
+let main = runner.addVariant(plan, "", source, environment, make)
+let rules = plan.variants[main].rules
+let aggregate = runner.findRule(rules, target)
+test.check(aggregate >= 0 && rules[aggregate].phony, "not a phony make target: " + target)
+let children: List<Text> = []
+let goals: List<Text> = []
+for name in rules[aggregate].prerequisites {
+    let rule = runner.findRule(rules, name)
+    if rule < 0 { continue }
+    if rules[rule].phony { if !member(children, name) { children.add(name) } }
+    else if rules[rule].target { goals.add(name) }
+}
+for name in only { test.check(member(children, name), "not a check in " + target + ": " + name) }
+for name in children {
+    if (only.length > 0 && member(only, name)) || (only.length == 0 && (tier == "all" || tierOf(name) == tier)) { runner.addCheck(plan, main, name) }
+}
+if tier != "sanitize" && only.length == 0 {
+    let arguments: List<Text> = []
+    for item in make { arguments.add(item) }
+    for child in children { arguments.add("-o"); arguments.add(child) }
+    arguments.add(target)
+    let planned: List<Integer> = []
+    for child in children {
+        let found = findCheck(plan, child)
+        if found >= 0 { planned.add(found) }
+    }
+    let aggregateCheck = runner.addCommand(plan, main, target, arguments, goals)
+    for child in planned { plan.checks[aggregateCheck].children.add(child) }
+}
+if extras && target == "check-portable" && only.length == 0 {
+    if tier != "sanitize" {
+        runner.addCommand(plan, main, "macos-network", ["python3", "tests/macos-network.py"], [])
+        runner.addCommand(plan, main, "desktop-native", ["python3", "tests/desktop-native.py"], [])
+        if findCheck(plan, "check-native-graphics") < 0 { runner.addCheck(plan, main, "check-native-graphics") }
+    }
+    if tier != "full" && findCheck(plan, "check-net-udp-offload-sanitize") < 0 { runner.addCheck(plan, main, "check-net-udp-offload-sanitize") }
+    if keychain && tier != "sanitize" {
+        runner.addCommand(plan, main, "macos-services", ["python3", "tests/macos-services.py"], [])
+        runner.addCommand(plan, main, "keychain-native", ["python3", "tests/keychain-native.py"], [])
+    }
+}
+if dryRun {
+    let planRows: List<Text> = []
+    for check in plan.checks {
+        let names: List<Text> = []
+        for goal in check.goals { names.add(plan.goals[goal].name) }
+        let after: List<Text> = []
+        for child in check.children { after.add(plan.checks[child].label) }
+        planRows.add("    {\"label\": " + json.quote(check.label) + ", \"goals\": " + quoted(names) + ", \"after\": " + quoted(after) + "}")
+    }
+    let body = ""
+    for row in 0..planRows.length {
+        if row > 0 { body += ",\n" }
+        body += planRows[row]
+    }
+    print("{\n  \"jobs\": " + Text(jobs) + ",\n  \"tier\": " + json.quote(tier) + ",\n  \"make\": " + quoted(make) + ",\n  \"checks\": [\n" + body + "\n  ]\n}")
+    test.removeTree(plan.scratch)
+    exit(0)
+}
+for goal in catalogue.launcherArtifacts() {
+    if runner.findRule(rules, goal) >= 0 { runner.addGoal(plan, main, goal, 300) }
+}
+print(Text(plan.checks.length) + " checks from " + target + " (tier " + tier + ", jobs " + Text(jobs) + "); logs in " + plan.scratch + "/logs")
+let started = system.monotonicNanoseconds()
+let history = source + "/build/tooling/check-durations"
+runner.prioritize(plan, history)
+let passed = runner.run(plan)
+runner.remember(plan, history)
+let rows = ""
+let separator = ""
+let failed: List<Text> = []
+for check in plan.checks {
+    let outcome = "failed"
+    if check.state == 2 { outcome = "passed" } else { failed.add(check.label) }
+    let cpu = ""
+    if check.log != "" { cpu = Text(files.readFile(check.log + ".cpu")) }
+    rows += separator + "{\"label\":" + json.quote(check.label) + ",\"status\":" + json.quote(outcome) + ",\"log\":" + json.quote(check.log) + ",\"cpu_user_system_rss_kib\":" + json.quote(cpu) + "}"
+    separator = ","
+}
+let status = "failed"
+if passed { status = "passed" }
+writeTextFile(plan.scratch + "/results.json", "{\"status\":" + json.quote(status) + ",\"target\":" + json.quote(target) + ",\"tier\":" + json.quote(tier) + ",\"jobs\":" + Text(jobs) + ",\"checks\":[" + rows + "]}\n")
+print(Text(plan.checks.length) + " checks: " + Text(plan.checks.length - failed.length) + " passed, " + Text(failed.length) + " failed")
+if failed.length > 0 {
+    let joined = ""
+    for item in 0..failed.length {
+        if item > 0 { joined += " " }
+        joined += failed[item]
+    }
+    print("Failed checks: " + joined)
+}
+print("macOS run: " + plan.scratch)
+print("full suite wall_ms=" + Text((system.monotonicNanoseconds() - started) / 1000000))
+if !passed { exit(1) }

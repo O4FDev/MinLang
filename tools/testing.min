@@ -50,10 +50,13 @@ public function setting(name: Text, fallback: Text): Text {
     return value
 }
 public record Result { status: Integer; output: Text; errorOutput: Text }
+function portableScript(): Text {
+    return "log=$1; limit=$2; shift 2; exec 2>\"$log.err\"; monitor=$$; set -m; /usr/bin/env -- \"$@\" >\"$log\" & child=$!; (set +m; /bin/sleep \"$limit\" & sleeper=$!; while kill -0 \"$sleeper\" 2>/dev/null && kill -0 \"$monitor\" 2>/dev/null; do /bin/sleep 0.1; done; kill -TERM \"$sleeper\" 2>/dev/null || :; wait \"$sleeper\" 2>/dev/null; printf 'timeout\\n' >\"$log.timeout\"; kill -TERM -- -\"$child\" 2>/dev/null || :; /bin/sleep 2; kill -KILL -- -\"$child\" 2>/dev/null || :) & timer=$!; set +m; trap 'kill -TERM -- -\"$child\" -\"$timer\" 2>/dev/null || :; /bin/sleep 2; kill -KILL -- -\"$child\" 2>/dev/null || :; wait \"$child\" 2>/dev/null; wait \"$timer\" 2>/dev/null; exit 143' TERM INT; wait \"$child\"; status=$?; if [ -f \"$log.timeout\" ]; then wait \"$timer\" 2>/dev/null; status=124; else kill -TERM -- -\"$timer\" 2>/dev/null || :; wait \"$timer\" 2>/dev/null; fi; trap - TERM INT; exit \"$status\""
+}
 public function portableStart(command: List<Text>, environment: List<Text>, cwd: Text, log: Text, seconds: Integer): Integer {
     check(command.length > 0 && seconds > 0, "invalid process request")
     if files.pathSize(log + ".timeout") >= 0 { check(files.remove(log + ".timeout") == 0, "cannot clear private timeout marker") }
-    let script = "log=$1; limit=$2; shift 2; exec 2>\"$log.err\"; monitor=$$; set -m; /usr/bin/env -- \"$@\" >\"$log\" & child=$!; (set +m; /bin/sleep \"$limit\" & sleeper=$!; while kill -0 \"$sleeper\" 2>/dev/null && kill -0 \"$monitor\" 2>/dev/null; do /bin/sleep 0.1; done; kill -TERM \"$sleeper\" 2>/dev/null || :; wait \"$sleeper\" 2>/dev/null; printf 'timeout\\n' >\"$log.timeout\"; kill -TERM -- -\"$child\" 2>/dev/null || :; /bin/sleep 2; kill -KILL -- -\"$child\" 2>/dev/null || :) & timer=$!; set +m; trap 'kill -TERM -- -\"$child\" -\"$timer\" 2>/dev/null || :; /bin/sleep 2; kill -KILL -- -\"$child\" 2>/dev/null || :; wait \"$child\" 2>/dev/null; wait \"$timer\" 2>/dev/null; exit 143' TERM INT; wait \"$child\"; status=$?; if [ -f \"$log.timeout\" ]; then wait \"$timer\" 2>/dev/null; status=124; else kill -TERM -- -\"$timer\" 2>/dev/null || :; wait \"$timer\" 2>/dev/null; fi; trap - TERM INT; exit \"$status\""
+    let script = portableScript()
     let argv = ["bash", "-c", script, "minyar", log, Text(seconds)]
     for item in command { argv.add(item) }
     return system.spawn("/bin/bash", argv, environment, cwd)
@@ -238,7 +241,17 @@ public function executes(test: Compiler, source: Text, expected: Text) {
         check(result.output == expected, "unexpected output at " + optimization + "\n" + result.output + "expected\n" + expected)
     }
 }
+function portableMonitoredStart(command: List<Text>, environment: List<Text>, cwd: Text, log: Text, seconds: Integer): Integer {
+    check(command.length > 0 && seconds > 0, "invalid process request")
+    if files.pathSize(log + ".timeout") >= 0 { check(files.remove(log + ".timeout") == 0, "cannot clear private timeout marker") }
+    let usage = "usage() { /usr/bin/awk '$2 == \"real\" && $4 == \"user\" && $6 == \"sys\" { user = $3; kernel = $5 } /maximum resident set size/ { rss = int($1 / 1024) } END { if (user != \"\") printf \"%s %s %d\\n\", user, kernel, rss }' \"$log.time\" >\"$log.cpu\" 2>/dev/null || :; }"
+    let script = "inner=$1; log=$2; shift; " + usage + "; trap 'if [ -s \"$log.pid\" ]; then kill -TERM \"$(cat \"$log.pid\")\" 2>/dev/null || :; fi; wait \"$waiter\"; usage; exit 143' TERM INT; /usr/bin/time -l -o \"$log.time\" /bin/bash -c \"$inner\" minyar \"$@\" & waiter=$!; wait \"$waiter\"; status=$?; trap - TERM INT; usage; exit \"$status\""
+    let argv = ["sh", "-c", script, "minyar", "echo \"$$\" >\"$1.pid\"; " + portableScript(), log, Text(seconds)]
+    for item in command { argv.add(item) }
+    return system.spawn("/bin/sh", argv, environment, cwd)
+}
 public function monitoredStart(command: List<Text>, environment: List<Text>, cwd: Text, log: Text, seconds: Integer): Integer {
+    if files.pathSize("/usr/bin/timeout") < 0 { return portableMonitoredStart(command, environment, cwd, log, seconds) }
     let script = "log=$1; limit=$2; shift 2; trap 'if [ -s \"$log.pid\" ]; then group=$(cat \"$log.pid\"); /bin/kill -TERM -- -\"$group\" 2>/dev/null || :; fi; wait \"$waiter\"; exit 143' TERM INT; /usr/bin/time -o \"$log.cpu\" -f '%U %S %M' /usr/bin/timeout --kill-after=2 \"$limit\" /bin/sh -c 'echo \"$PPID\" > \"$1.pid\"; shift; exec \"$@\"' minyar \"$log\" /usr/bin/env -- \"$@\" >\"$log\" 2>\"$log.err\" & waiter=$!; wait \"$waiter\"; status=$?; trap - TERM INT; exit \"$status\""
     let argv = ["sh", "-c", script, "minyar", log, Text(seconds)]
     for item in command { argv.add(item) }
