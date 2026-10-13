@@ -580,11 +580,11 @@ check-peer-semantics: build/minyarc build/minyar-runtime.o
 check-peer-semantics-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o
 	@set -e; for suite in $(PEER_SEMANTIC_SUITES); do ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 "tests/$$suite.py"; done
 
-check-memory-regressions:
-	$(LIMITED) python3 tests/memory-research-regressions.py --clang "$(LLVM_CC)"
+check-memory-regressions: build/tooling/tests/memory-research-regressions
+	$(LIMITED) ./build/tooling/tests/memory-research-regressions --clang "$(LLVM_CC)"
 
-check-memory-regressions-sanitize:
-	$(SANITIZER_LIMITED) python3 tests/memory-research-regressions.py --clang "$(LLVM_CC)" --sanitize
+check-memory-regressions-sanitize: build/tooling/tests/memory-research-regressions
+	$(SANITIZER_LIMITED) ./build/tooling/tests/memory-research-regressions --clang "$(LLVM_CC)" --sanitize
 
 check-bootstrap-policy:
 	python3 tests/launcher-bootstrap-policy.py
