@@ -1,0 +1,131 @@
+use "../tools/testing.min" as test
+use "./performance-support.min" as budget
+use "../experiments/memory/study-support.min" as data
+use "system" as system
+use "files" as files
+use "json" as json
+function selected(name: Text): Boolean {
+    let selectors = 0
+    for index in 0..argumentCount() {
+        let value = argument(index); if data.starts(value, "-") { continue }
+        selectors += 1
+        if value == "BudgetHarness" || value == name || value == "BudgetHarness." + name { return true }
+    }
+    return selectors == 0
+}
+function rejects(result: budget.Outcome, message: Text) { test.check(!result.ok && test.contains(result.error, message), "required budget failure: " + message) }
+function paired(): json.Value {
+    let values: List<json.Value> = []
+    for clock in ["wall", "cpu"] { values.add(data.object(["median", "confidence_interval"], [data.decimal(1.01), data.object(["upper"], [data.decimal(1.05)])])) }
+    return data.object(["summaries"], [data.object(["wall", "cpu"], values)])
+}
+function main(): Integer {
+    if argumentCount() > 0 && argument(0) == "--ir" { system.writeStandardError("structural fixture is not a compiler\n"); return 1 }
+    if argumentCount() == 3 && argument(0) == "--behavior-check" {
+        let context = budget.fixtureComparison(argument(2), 2, 2); context.control.fixture = false
+        let result = budget.behavior(context, argument(1))
+        if !result.ok { system.writeStandardError(result.error); return 1 }
+        return 0
+    }
+    let names = ["test_valid_compiler_output_may_change_formatting", "test_structural_output_cannot_replace_compiler_behavior", "test_failed_counter_run_cannot_win_the_instruction_budget", "test_successful_counter_batch_keeps_existing_minimum_policy", "test_wall_pairs_share_input_alternate_and_retain_every_observation", "test_wall_comparison_rejects_changed_input_runtime_compiler_and_toolchain", "test_failed_wall_pair_retains_failure_and_cannot_be_a_fast_measurement", "test_both_paired_limits_are_inclusive_and_independent", "test_zero_wall_or_cpu_measurements_cannot_pass"]
+    for index in 0..argumentCount() {
+        let value = argument(index)
+        let valid = value == "BudgetHarness" || value == "-v" || value == "--verbose" || value == "-q" || value == "--quiet" || value == "-f" || value == "--failfast" || value == "-b" || value == "--buffer" || value == "-c" || value == "--catch"
+        for name in names { if value == name || value == "BudgetHarness." + name { valid = true } }
+        test.check(valid, "unknown BudgetHarness selector: " + value)
+    }
+    if selected("test_valid_compiler_output_may_change_formatting") {
+        let work = test.scratch(); let output = work + "/output.ll"
+        writeTextFile(output, "define i32 @main(i32 %argc, ptr %argv) {\n  ret i32 0\n}\n")
+        test.check(budget.validate(test.Result { status: 0; output: ""; errorOutput: "" }, output, "self-compile").ok, "valid compiler output formatting may change")
+        test.removeTree(work)
+    }
+    if selected("test_structural_output_cannot_replace_compiler_behavior") {
+        let work = test.scratch(); let output = work + "/output.ll"; writeTextFile(output, budget.compilerLLVM())
+        let selfResult = budget.capture(["/usr/bin/readlink", "/proc/" + Text(system.processId()) + "/exe"], work + "/self"); test.require(selfResult, "native harness executable")
+        let self = test.lines(selfResult.output)[0]; let environment: List<Text> = []
+        for entry in system.environment() { if !data.starts(entry, "MINYAR_COMPILER_BEHAVIOR=") { environment.add(entry) } }
+        environment.add("MINYAR_COMPILER_BEHAVIOR=" + self)
+        let result = test.run([self, "--behavior-check", output, work], environment, "", work + "/behavior-check", 180)
+        test.check(result.status != 0 && test.contains(result.errorOutput, "compiler behavior failed"), "structural LLVM cannot replace actual compiler behavior")
+        test.removeTree(work)
+    }
+    if selected("test_failed_counter_run_cannot_win_the_instruction_budget") {
+        for failedAt in [0, 2, 4] {
+            let work = test.scratch(); let control = budget.backend(true)
+            control.profileCounts = [100000000, 100000000, 100000000, 100000000, 100000000]
+            control.profileCounts[failedAt] = 10; control.profileFailureAt = failedAt
+            control.failureDiagnostic = "Minyar stopped: incomplete compilation\n"
+            rejects(budget.profile(control, "", "", work + "/output.ll", work + "/profile", true), "incomplete compilation")
+            test.check(control.profileCalls == failedAt + 1, "cheap failed profile rejected at original sample0/2/4")
+            test.removeTree(work)
+        }
+    }
+    if selected("test_successful_counter_batch_keeps_existing_minimum_policy") {
+        let work = test.scratch(); let control = budget.backend(true); control.profileCounts = [91, 87, 93, 89, 90]
+        let result = budget.profile(control, "", "", work + "/output.ll", work + "/profile", true)
+        test.check(result.ok && result.value.number == 87.0 && control.profileCalls == 5, "all successful counter samples keep original minimum87")
+        test.removeTree(work)
+    }
+    if selected("test_wall_pairs_share_input_alternate_and_retain_every_observation") {
+        let work = test.scratch(); let context = budget.fixtureComparison(work, 2, 2)
+        let result = budget.comparison(context); test.check(result.ok, result.error)
+        let expected = ["current", "previous", "current", "previous", "previous", "current", "current", "previous", "previous", "current"]
+        test.check(context.control.events.length == expected.length, "all original ten compiler invocations retained")
+        for index in 0..expected.length { test.check(context.control.events[index] == expected[index], "exact original warmup/adjacent pair call sequence") }
+        let pairs = json.member(result.value, "pairs"); test.check(pairs.items.length == 4, "all original four paired observations")
+        for pair in pairs.items { test.check(budget.equal(json.member(pair, "ratios"), json.parse("{\"wall\":1.0,\"cpu\":1.0}")), "same-input wall and CPU ratios independent") }
+        for clock in ["wall", "cpu"] {
+            let summary = json.member(json.member(result.value, "summaries"), clock)
+            test.check(json.member(summary, "median").number == 1.0 && json.member(json.member(summary, "confidence_interval"), "upper").number == 1.0, "all original paired medians/95 percent uppers")
+        }
+        test.check(budget.equal(json.parse(readTextFile(context.report)), result.value), "durable report exactly matches returned result")
+        test.check(context.control.behaviorCalls == 2, "both resulting compiler outputs receive behavior checks")
+        test.removeTree(work)
+    }
+    if selected("test_wall_comparison_rejects_changed_input_runtime_compiler_and_toolchain") {
+        for changed in ["current", "previous", "input", "runtime", "clang", "configuration"] {
+            let work = test.scratch(); let context = budget.fixtureComparison(work, 2, 2)
+            if changed == "configuration" { writeTextFile(work + "/build/.toolchain.json", "{}") }
+            else if changed == "runtime" { writeTextFile(context.runtime, "changed") }
+            else { writeTextFile(work + "/" + changed, "changed") }
+            test.check(!budget.comparison(context).ok && context.control.commands.length == 0, "changed original artifact/toolchain rejected before any compiler launch")
+            test.removeTree(work)
+        }
+    }
+    if selected("test_failed_wall_pair_retains_failure_and_cannot_be_a_fast_measurement") {
+        let work = test.scratch(); let context = budget.fixtureComparison(work, budget.RUNS, budget.BATCHES)
+        context.control.globalFailureAt = 4; context.control.failureDiagnostic = "incomplete compilation"
+        rejects(budget.comparison(context), "incomplete compilation")
+        let retained = json.parse(readTextFile(context.report)); let pairs = json.member(retained, "pairs")
+        test.check(json.string(retained, "status") == "failed" && pairs.items.length == 1, "failed fourth compile preserves incomplete first pair")
+        let hasRatios = false; for key in pairs.items[0].keys { if key == "ratios" { hasRatios = true } }
+        test.check(!hasRatios && context.control.commands.length == 4, "failed wall pair cannot become fast ratio or launch later samples")
+        test.removeTree(work)
+    }
+    if selected("test_both_paired_limits_are_inclusive_and_independent") {
+        test.check(budget.pairedBudget(paired()).ok, "both wall/CPU limits inclusive")
+        let zero = Float(argumentCount() - argumentCount()); let nan = zero / zero; let infinity = 1.0 / zero
+        for clock in ["wall", "cpu"] {
+            for index in 0..5 {
+                let candidate = paired(); let entry = json.member(json.member(candidate, "summaries"), clock); let expected = "paired median"
+                if index == 0 { data.set(entry, "median", data.decimal(1.010001)) }
+                if index == 1 { data.set(entry, "median", data.decimal(1.02)) }
+                if index == 2 { data.set(json.member(entry, "confidence_interval"), "upper", data.decimal(1.050001)); expected = "paired 95% upper" }
+                if index == 3 { data.set(entry, "median", data.decimal(nan)) }
+                if index == 4 { data.set(json.member(entry, "confidence_interval"), "upper", data.decimal(infinity)); expected = "paired 95% upper" }
+                rejects(budget.pairedBudget(candidate), expected)
+            }
+        }
+        test.check(budget.RUNS == 100 && budget.BATCHES == 3, "all original three100-pair batches")
+        test.check(budget.MAX_PEAK_RSS_MIB == 17.0 && budget.MAX_INSTRUCTIONS == 75000000, "original exact memory/instruction budgets")
+    }
+    if selected("test_zero_wall_or_cpu_measurements_cannot_pass") {
+        for clock in ["wall", "cpu"] {
+            let work = test.scratch(); let context = budget.fixtureComparison(work, budget.RUNS, budget.BATCHES); context.control.zeroClock = clock
+            rejects(budget.comparison(context), "invalid same-input compiler duration"); test.removeTree(work)
+        }
+    }
+    print("self-compile budget harness passed")
+    return 0
+}
