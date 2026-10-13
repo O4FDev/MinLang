@@ -67,12 +67,14 @@ public record Variant { name: Text; cwd: Text; environment: List<Text>; make: Li
 public record Goal { name: Text; variant: Integer; state: Integer; weight: Integer; handle: Integer; log: Text; started: Integer; members: Map<Text, Boolean> }
 public record Check { label: Text; target: Text; arguments: List<Text>; variant: Integer; children: List<Integer>; goals: List<Integer>;
     state: Integer; resource: Text; exclusive: Boolean; weight: Integer; handle: Integer; log: Text; started: Integer; retry: Integer; builder: Boolean; wall: Integer; cpu: Integer; cost: Integer }
-public record Plan { variants: List<Variant>; checks: List<Check>; goals: List<Goal>; scratch: Text; jobs: Integer; timeout: Integer; retries: Integer; interrupted: Boolean }
+public record Plan { variants: List<Variant>; checks: List<Check>; goals: List<Goal>; scratch: Text; jobs: Integer; timeout: Integer; retries: Integer; interrupted: Boolean;
+    elastic: Boolean; limit: Integer; busy: Integer; total: Integer; sampled: Integer }
 public function plan(jobs: Integer, timeout: Integer, retries: Integer): Plan {
     test.check(jobs >= 1 && jobs <= 16 && timeout > 0 && retries >= 0, "invalid runner limits")
     let scratch = test.scratch()
     test.check(files.makeDirectory(scratch + "/logs") == 0, "cannot create process log directory")
-    return Plan { variants: []; checks: []; goals: []; scratch: scratch; jobs: jobs; timeout: timeout; retries: retries; interrupted: false }
+    return Plan { variants: []; checks: []; goals: []; scratch: scratch; jobs: jobs; timeout: timeout; retries: retries; interrupted: false;
+        elastic: false; limit: jobs; busy: 0; total: 0; sampled: 0 }
 }
 public function environment(base: List<Text>, key: Text, value: Text): List<Text> {
     let result: List<Text> = []
@@ -347,6 +349,38 @@ function showResult(label: Text, log: Text, status: system.ProcessStatus, starte
     if !passed { files.writeStandardOutput(Text(files.readFile(log)) + Text(files.readFile(log + ".err"))) }
     return passed
 }
+function counter(value: Text): Integer {
+    let parsed = text.parseInteger(value)
+    if errors.integerOk(parsed) { return errors.integerValue(parsed) }
+    return -1
+}
+function sample(plan: Plan) {
+    if !plan.elastic || plan.jobs <= 1 { plan.limit = plan.jobs; return }
+    let now = system.monotonicNanoseconds()
+    if plan.sampled != 0 && now - plan.sampled < 1000000000 { return }
+    plan.sampled = now
+    let result = test.run(["/bin/cat", "/proc/stat"], system.environment(), "", plan.scratch + "/load", 10)
+    let lines = test.lines(result.output)
+    if result.status != 0 || lines.length == 0 { plan.limit = plan.jobs; return }
+    let fields = test.words(lines[0])
+    if fields.length < 9 || fields[0] != "cpu" { plan.limit = plan.jobs; return }
+    let busy = 0
+    let total = 0
+    for index in 1..9 {
+        let value = counter(fields[index])
+        if value < 0 { plan.limit = plan.jobs; return }
+        total += value
+        if index != 4 && index != 5 { busy += value }
+    }
+    let processors = 0
+    for line in lines { if begins(line, "cpu") && !begins(line, "cpu ") { processors += 1 } }
+    if plan.total > 0 && total > plan.total && processors > 0 {
+        let cores = (busy - plan.busy) * processors / (total - plan.total)
+        plan.limit = max(plan.jobs, min(2 * plan.jobs, 2 * plan.jobs - cores))
+    }
+    plan.busy = busy
+    plan.total = total
+}
 function pause() {
     let handle = system.spawn("/usr/bin/sleep", ["sleep", "0.05"], system.environment(), "")
     test.check(handle > 0 && system.wait(handle).exitCode == 0, "scheduler sleep failed")
@@ -408,7 +442,8 @@ function execute(plan: Plan): Boolean {
             }
         }
         let launched = false
-        while active < plan.jobs {
+        sample(plan)
+        while active < plan.limit {
             let chosenGoal = -1
             let chosenCheck = -1
             let best = -1
@@ -431,7 +466,7 @@ function execute(plan: Plan): Boolean {
                 let blockedByBuilder = false
                 for running in plan.checks { if running.state == 1 && running.builder { blockedByBuilder = true } }
                 if blockedByBuilder { continue }
-                if active + admission(plan, check) > plan.jobs {
+                if active + admission(plan, check) > plan.limit {
                     if check.weight > waiting { waiting = check.weight }
                     continue
                 }
