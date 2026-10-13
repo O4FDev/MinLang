@@ -19,7 +19,7 @@ check-conformance`. Rejection wording is indexed separately by
 | for loops, break, continue, and compound assignment | `loops-and-assignment/program.min` | `tests/errors/record-field-assignment.min` |
 | Top-level order, functions, returns, branches, loops, and explicit main | `programs-and-entry-points/program.min`, `explicit-main/program.min` | `tests/errors/top-level-*.min`, `tests/errors/mixed-entry-points.min`, `tests/regressions.py` |
 | Arguments, file reads/writes, invalid UTF-8, and I/O failures | `explicit-main/program.min` | `tests/regressions.py` |
-| Modules, visibility, identity, paths, packages, and import cycles | `tests/modules/` | `tests/run-module-tests.sh`, `tests/incremental-modules.py` |
+| Modules, visibility, identity, paths, packages, and import cycles | `tests/modules/` | `tests/run-module-tests.sh`, `tests/incremental-modules.min` |
 | Statement termination, continuations, comments, and literal lexing | `programs-and-entry-points/program.min` | `tests/errors/statements-on-one-line.min`, `tests/fuzz-regressions/`, `tests/diagnostics.py` |
 
 When the language specification gains a requirement, update this table and add

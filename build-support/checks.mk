@@ -513,8 +513,8 @@ check-checked-scalars-sanitize: build/minyarc-sanitize build/minyar-runtime-sani
 check-portable check: check-checked-scalars
 check-sanitize: check-checked-scalars-sanitize
 
-check-incremental-language-hardening: build/minyarc-modules build/minyar-module-build build/minyar-runtime.o
-	$(LIMITED) python3 tests/incremental-language-hardening.py
+check-incremental-language-hardening: build/minyarc-modules build/minyar-module-build build/minyar-runtime.o build/tooling/tests/incremental-language-hardening
+	$(LIMITED) ./build/tooling/tests/incremental-language-hardening
 
 check-portable: check-toolchain-stamp check-toolchain-portability check-cold-bootstrap check-runtime-bytes check-runtime-traps check-compiler-hardening check-list-access
 check-incremental-modules: check-incremental-language-hardening check-module-driver-options

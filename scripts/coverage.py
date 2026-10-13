@@ -308,7 +308,7 @@ def main() -> int:
     feature_harnesses = run_feature_harnesses(run_dir, clang=clang, link_flags=[*math_flags, *thread_flags],
                                               env=env)
 
-    native_suites = ('octal-literals', 'reserved-names', 'diagnostics', 'conformance', 'list-access', 'checked-arithmetic', 'readonly-parameters', 'checked-scalars', 'module-constants', 'statement-nesting', 'compiler-hardening', 'checked-results', 'feature-dispatch', 'errors-values', 'c-layout-records', 'maps', 'list-sort', 'text-basics', 'collections-integration', 'linkage', 'peer-research-semantics', 'peer-research-reachability', 'fuzz')
+    native_suites = ('octal-literals', 'reserved-names', 'diagnostics', 'conformance', 'list-access', 'checked-arithmetic', 'readonly-parameters', 'checked-scalars', 'module-constants', 'statement-nesting', 'compiler-hardening', 'checked-results', 'feature-dispatch', 'errors-values', 'c-layout-records', 'maps', 'list-sort', 'text-basics', 'collections-integration', 'linkage', 'peer-research-semantics', 'peer-research-reachability', 'fuzz', 'coverage-programs/check', 'callbacks', 'errors-language', 'thread-compiler', 'incremental-language-hardening', 'incremental-modules')
     run(['make', '-s', *['build/tooling/tests/' + name for name in native_suites]], env=env)
 
     compiler_reports = {}
@@ -323,7 +323,7 @@ def main() -> int:
             "MINYAR_TEST_LINK_FLAGS": " ".join(["-fprofile-instr-generate", *math_flags]),
             "MINYAR_TEST_JOBS": "1",
         }
-        commands.append(([sys.executable, "tests/coverage-programs/check.py"], suite_env, 600))
+        commands.append(([str(ROOT / "build/tooling/tests/coverage-programs/check")], suite_env, 600))
         for suite in COMPILER_SUITES:
             # Comparator suites select classes; callback frontends are separate compilers.
             name, *selection = suite.split()
