@@ -54,8 +54,11 @@ function main() {
             assert compiled.returncode == 0, compiled.stdout + compiled.stderr
             text = raw.read_text()
             assert 'declare i32 @minyar_calldepth_reporting_begin()' in text
-            bridge = re.search(r'define internal i64 @\.minyar\.thread\.bridge\.worker\([^\n]*\{\nentry:\n', text)
-            worker = re.search(r'define (?:i64|void) @\.minyar\.fn\.worker\([^\n]*\{', text)
+            entry = re.search(r'^; minyar-thread-entry: ([^\n]+)$', text, re.M)
+            assert entry
+            name = re.escape(entry[1])
+            bridge = re.search(r'define internal i64 @\.minyar\.thread\.bridge\.' + name + r'\([^\n]*\{\nentry:\n', text)
+            worker = re.search(r'define (?:i64|void) @\.minyar\.fn\.' + name + r'\([^\n]*\{', text)
             assert bridge and worker
             for case in ([args.case] if args.case else ('normal', 'bridge-reject', 'target-reject', 'accepted-unwind')):
                 changed = text
