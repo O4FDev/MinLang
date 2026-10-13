@@ -1,0 +1,87 @@
+use "../tools/testing.min" as test
+use "./compiler-port-support.min" as support
+use "system" as system
+use "files" as files
+
+function probe(family: Text) {
+    let context = support.compiler()
+    let leaf = context.directory + "/leaf.min"
+    let helper = context.directory + "/helper.min"
+    let entry = context.directory + "/main.min"
+    let source = "record Hidden { value: Integer; label: Text }\npublic function make(): Hidden { return Hidden { value: 40; label: \" 1:x \" } }\n"
+    let names: List<Text> = []
+    let expected = ""
+    if family == "text" {
+        writeTextFile(helper, "use \"./leaf.min\" as leaf\npublic function answer(): Integer {\n    let item = leaf.make()\n    let text = item.label.trim()\n    let pieces = text.split(\":\")\n    let value = Integer(pieces[0]) + text.find(\"x\")\n    let numbers = [1, 2]\n    numbers.clear()\n    if text.startsWith(\"1\") && text.endsWith(\"x\") { value += item.value }\n    return value\n}\n")
+        writeTextFile(entry, "use \"./helper.min\" as helper\nlet text = \" 1:x \".trim()\nlet pieces = text.split(\":\")\nlet value = Integer(pieces[0]) + text.find(\"x\")\nlet numbers = [1, 2]\nnumbers.clear()\nif text.startsWith(\"1\") && text.endsWith(\"x\") { value += helper.answer() }\nprint(value)\n")
+        for suffix in ["find", "split", "starts_with", "ends_with", "trim", "integer"] { names.add("minyar_text_" + suffix) }
+        names.add("minyar_list_clear")
+        expected = "46\n"
+    } else {
+        writeTextFile(helper, "use \"./leaf.min\" as leaf\npublic function answer(): Integer {\n    let values = [3, 1, 2]\n    values.sort()\n    let copy = values.sorted()\n    return leaf.make().value + values[0] + copy[1]\n}\n")
+        writeTextFile(entry, "use \"./helper.min\" as helper\nprint(helper.answer())\nlet values = [3, 2, 1]\nvalues.sort()\nprint(values.sorted()[1])\n")
+        for suffix in ["sort", "sorted", "sort_by", "sorted_by"] { names.add("minyar_list_" + suffix) }
+        expected = "43\n2\n"
+    }
+    let sanitized = context.flags.length > 0
+    let frontend = "./build/minyarc-modules"
+    let driver = "./build/minyar-module-build"
+    if sanitized { frontend += "-sanitize"; driver += "-sanitize" }
+    frontend = test.setting("MINYAR_MODULE_COMPILER", frontend)
+    for mode in ["state", "driver"] {
+        writeTextFile(leaf, source)
+        let prior = context.directory + "/" + mode + ".state"
+        writeTextFile(prior, "")
+        let next = context.directory + "/" + mode + ".next.state"
+        let stats = context.directory + "/" + mode + ".stats"
+        for phase in ["cold", "warm", "private-field-edit", "post-edit-warm"] {
+            if phase == "private-field-edit" { writeTextFile(leaf, test.replace(source, "value: Integer; label: Text", "label: Text; value: Integer")) }
+            let llvm = context.directory + "/" + mode + "-" + phase + ".ll"
+            let command = [frontend, entry, llvm, "--module-state", prior, next, stats]
+            if mode == "driver" { command = [driver, frontend, entry, llvm, context.directory + "/cache", stats] }
+            let result = test.run(command, system.environment(), "", llvm + ".compile", 60)
+            test.check(result.status == 0, "incremental feature " + family + " " + mode + " " + phase + " compilation failed\n" + result.errorOutput)
+            if mode == "state" {
+                let size = files.pathSize(next)
+                test.check(size >= 0, "incremental frontend omitted its next state artifact")
+                if size > 0 { writeBytesFile(prior, readBytesFile(next)) }
+                else { test.check(phase == "warm" || phase == "post-edit-warm", "cold/edited build omitted its cache update") }
+            }
+            if phase == "warm" || phase == "post-edit-warm" {
+                let fields = test.words(readTextFile(stats))
+                test.check(fields.length >= 2 && Integer(fields[1]) == 0, "warm body cache was not exercised")
+            }
+            let ir = readTextFile(llvm)
+            for name in names {
+                let count = 0
+                for line in test.lines(ir) { if support.starts(line, "declare ") && support.find(line, "@" + name + "(", 0) >= 0 { count += 1 } }
+                test.check(count == 1, "incremental program feature declaration must occur exactly once: " + name)
+            }
+            if test.addressEnabled(context.flags) { writeTextFile(llvm, test.instrument(ir)) }
+            for optimization in ["-O0", "-O2"] {
+                let executable = llvm + "." + optimization
+                support.link(context, llvm, optimization, executable, 60)
+                let observed = test.run([executable], system.environment(), "", executable + ".run", 30)
+                test.check(observed.status == 0 && observed.output == expected && observed.errorOutput == "", "incremental feature execution differs for " + family + " " + mode + " " + phase + " " + optimization + "\n" + observed.output + observed.errorOutput)
+            }
+        }
+    }
+    test.removeTree(context.directory)
+}
+
+let names = ["test_text_clear_and_integer_declarations", "test_stable_sort_declarations"]
+let selectors = support.selectors("FeatureDeclarations", names)
+let windows = system.getenv("OS") == "Windows_NT"
+if !windows {
+    let work = test.scratch()
+    let platform = test.run(["uname", "-s"], system.environment(), "", work + "/platform", 10)
+    test.require(platform, "incremental module platform query")
+    windows = test.contains(platform.output, "Windows") || test.contains(platform.output, "MSYS") || test.contains(platform.output, "MINGW") || test.contains(platform.output, "CYGWIN")
+    test.removeTree(work)
+}
+if windows { print("Incremental module caching is a POSIX frontend: skipped") }
+else {
+    if support.selected(selectors, "FeatureDeclarations", names[0]) { probe("text") }
+    if support.selected(selectors, "FeatureDeclarations", names[1]) { probe("sort") }
+    print("Incremental program-wide feature declarations: passed")
+}

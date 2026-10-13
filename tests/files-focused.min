@@ -1,0 +1,107 @@
+use "../tools/testing.min" as test
+use "./sha256-support.min" as arguments
+use "system" as system
+use "files" as files
+
+record Fixture { name: Text; cases: List<Text> }
+function quote(source: Text): Text {
+    if source == "" { return "''" }
+    let safe = true
+    for byte in Bytes(source) {
+        if !((byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 95 || byte == 64 || byte == 37 || byte == 43 || byte == 61 || byte == 58 || byte == 44 || byte == 46 || byte == 47 || byte == 45) { safe = false }
+    }
+    if safe { return source }
+    return "'" + test.replace(source, "'", "'\"'\"'") + "'"
+}
+function run(command: List<Text>, environment: List<Text>, cwd: Text, log: Text, timeout: Integer): test.Result {
+    let rendered = ""
+    for index in 0..command.length { if index > 0 { rendered += " " }; rendered += quote(command[index]) }
+    files.writeStandardOutput(rendered + "\n")
+    let result = test.run(command, environment, cwd, log, timeout)
+    if result.status != 0 {
+        files.writeStandardOutput(result.output)
+        files.writeStandardOutput(result.errorOutput)
+    }
+    test.require(result, "files-only bounded control")
+    return result
+}
+
+let sanitize = false
+let nativeOnly = false
+for index in 0..argumentCount() {
+    let option = argument(index)
+    if option == "--sanitize" { sanitize = true }
+    else if option == "--native-only" { nativeOnly = true }
+    else { fail("unknown files-focused option: " + option) }
+}
+let work = test.scratch()
+let platform = test.run(["uname", "-s"], system.environment(), "", work + "/platform", 10)
+test.require(platform, "files backend platform query")
+let name = test.lines(platform.output)[0]
+test.check(name != "Windows" && !test.contains(name, "MSYS") && !test.contains(name, "MINGW") && !test.contains(name, "CYGWIN"), "Windows files backend is pending; this POSIX chunk cannot qualify Windows")
+let fixtures = [
+    Fixture { name: "files-ranges"; cases: ["huge", "invalid", "pseudo", "large", "eof", "partial-error", "read-file"] },
+    Fixture { name: "files-prepare"; cases: ["preallocate", "stale", "active-close", "saturated", "write-error", "short", "stop", "sync-error", "allocate-error", "zero-write", "capacity", "cross-kind", "sparse-tail", "sparse-middle", "fresh-preallocate", "fresh-prepare", "dense-extension", "truncate-error", "prefix-write-error", "clone-prefix"] }
+]
+for descriptor in 1..11 { fixtures[1].cases.add("setup-fd-" + Text(descriptor)) }
+for selected in ["setup-pair", "setup-mutex", "setup-condition", "setup-create"] { fixtures[1].cases.add(selected) }
+if name == "Linux" {
+    fixtures[0].cases.add("procfs")
+    for selected in ["unshare-supported", "unshare-error", "unshare-unsupported", "unshare-stat-error", "unshare-fresh", "unshare-tmpfs"] { fixtures[1].cases.add(selected) }
+}
+if name == "Darwin" { for selected in ["sharing-query-error", "sharing-query-missing"] { fixtures[1].cases.add(selected) } }
+let clang = test.setting("MINYAR_TEST_CLANG", test.setting("MINYAR_CLANG", "clang"))
+let environment = system.environment()
+let leaks = "0"
+if name == "Linux" { leaks = "1" }
+environment = arguments.environment(environment, "ASAN_OPTIONS", "detect_leaks=" + leaks + ":halt_on_error=1")
+environment = arguments.environment(environment, "UBSAN_OPTIONS", "halt_on_error=1")
+environment = arguments.environment(environment, "TMPDIR", work)
+let configurations = [["-O0"], ["-O2"]]
+if sanitize { configurations = [["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"]] }
+let rootResult = test.run(["pwd", "-P"], system.environment(), "", work + "/root", 10)
+test.require(rootResult, "files-focused project directory")
+let root = test.lines(rootResult.output)[0]
+let checks = 0
+for fixture in fixtures {
+    for index in 0..configurations.length {
+        let flags = configurations[index]
+        let executable = work + "/" + fixture.name + Text(index)
+        let command = [clang, "-std=c11", "-D_GNU_SOURCE", "-DMINYAR_SYSTEM_HEAP=1", "-Wall", "-Wextra", "-Werror"]
+        for flag in flags { command.add(flag) }
+        for value in [root + "/tests/" + fixture.name + ".c", root + "/runtime/minyar_runtime.c", "-pthread", "-o", executable] { command.add(value) }
+        if name != "Darwin" { command.add("-lm") }
+        run(command, environment, root, executable + ".build", 60)
+        for selected in fixture.cases {
+            let result = run([executable, selected], environment, root, executable + "." + selected, 10)
+            if result.output != "" { files.writeStandardOutput(result.output) }
+            checks += 1
+            print(fixture.name + " " + flags[0] + " " + selected + ": passed")
+        }
+    }
+}
+if !nativeOnly {
+    let names = ["files-eventloop", "files-r2"]
+    let expected = ["files-eventloop: ok\n", "files-r2: ok\nfiles-r2: rmdir and releaseFreeMemory ok\n"]
+    for fixture in 0..names.length {
+        let llvm = work + "/" + names[fixture] + ".ll"
+        run([root + "/build/minyarc", root + "/tests/" + names[fixture] + ".min", llvm, "--bounded-owners", "32", "--library", root + "/library"], environment, root, llvm + ".compile", 60)
+        if sanitize { writeTextFile(llvm, test.instrument(readTextFile(llvm))) }
+        for index in 0..configurations.length {
+            let flags = configurations[index]
+            let executable = work + "/" + names[fixture] + Text(index)
+            let command = [clang]
+            for flag in flags { command.add(flag) }
+            for value in ["-Wno-override-module", "-DMINYAR_SYSTEM_HEAP=1", llvm, root + "/runtime/minyar_default_runtime.c", root + "/runtime/native/files.c", root + "/runtime/native/net.c", root + "/runtime/native/system.c", "-pthread", "-o", executable] { command.add(value) }
+            if name != "Darwin" { command.add("-lm") }
+            run(command, environment, root, executable + ".build", 60)
+            let result = run([executable], environment, work, executable + ".run", 20)
+            test.check(result.output == expected[fixture] && result.errorOutput == "", "files Minyar integration output changed\n" + result.output + result.errorOutput)
+            checks += 1
+        }
+    }
+}
+test.removeTree(work)
+let profile = "native"
+if sanitize { profile = "sanitizer" }
+print(Text(checks) + " files " + profile + " controls passed")

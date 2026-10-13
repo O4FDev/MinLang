@@ -1,0 +1,85 @@
+use "../tools/testing.min" as test
+use "./sha256-support.min" as arguments
+use "system" as system
+use "files" as files
+
+public function compiler(): test.Compiler {
+    let context = test.compiler()
+    context.flags = arguments.shellWords(test.setting("MINYAR_TEST_LINK_FLAGS", ""))
+    context.compileTimeout = 10
+    context.linkTimeout = 30
+    context.runTimeout = 10
+    if context.flags.length > 0 { context.compileTimeout = 30; context.linkTimeout = 120; context.runTimeout = 30 }
+    return context
+}
+public function selectors(family: Text, names: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for index in 0..argumentCount() {
+        let value = argument(index)
+        if value == "-v" || value == "--verbose" || value == "-q" || value == "--quiet" { continue }
+        let known = value == family
+        for name in names { if value == name || value == family + "." + name { known = true } }
+        test.check(known, "unknown " + family + " selector: " + value)
+        result.add(value)
+    }
+    return result
+}
+public function selected(selectors: List<Text>, family: Text, name: Text): Boolean {
+    if selectors.length == 0 { return true }
+    for value in selectors { if value == family || value == name || value == family + "." + name { return true } }
+    return false
+}
+public function find(source: Text, needle: Text, begin: Integer): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if begin < 0 || raw.length < pattern.length { return -1 }
+    for index in begin..(raw.length - pattern.length + 1) {
+        let same = true
+        for offset in 0..pattern.length { if raw[index + offset] != pattern[offset] { same = false; break } }
+        if same { return index }
+    }
+    return -1
+}
+public function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let bytes = Bytes(prefix)
+    return raw.length >= bytes.length && Text(raw.slice(0, bytes.length)) == prefix
+}
+public function count(source: Text, needle: Text): Integer {
+    let matches = 0
+    let begin = 0
+    while begin <= source.byteLength {
+        let index = find(source, needle, begin)
+        if index < 0 { break }
+        matches += 1
+        begin = index + needle.byteLength
+    }
+    return matches
+}
+public function link(context: test.Compiler, llvm: Text, optimization: Text, executable: Text, timeout: Integer) {
+    let command = [context.clang, optimization]
+    for flag in context.flags { command.add(flag) }
+    for value in ["-Wno-override-module", llvm, context.runtime, "-o", executable, "-lm"] { command.add(value) }
+    let result = test.run(command, system.environment(), "", executable + ".link", timeout)
+    test.check(result.status == 0, "compiler fixture link status changed\n" + result.errorOutput)
+}
+public function executes(context: test.Compiler, source: Text, expected: Text, status: Integer, diagnostics: Text): Text {
+    let result = test.compile(context, source)
+    test.check(result.status == 0, "compiler fixture compilation failed\n" + result.errorOutput)
+    let llvm = context.directory + "/case" + Text(context.serial) + ".ll"
+    for optimization in ["-O0", "-O2"] {
+        let executable = llvm + "." + optimization
+        link(context, llvm, optimization, executable, context.linkTimeout)
+        let observed = test.run([executable], system.environment(), "", executable + ".run", context.runTimeout)
+        test.check(observed.status == status && observed.output == expected && observed.errorOutput == diagnostics, "compiler fixture execution differs at " + optimization + "\n" + observed.output + observed.errorOutput)
+    }
+    return readTextFile(llvm)
+}
+public function rejects(context: test.Compiler, source: Text, diagnostic: Text) {
+    let result = test.compile(context, source)
+    test.check(result.status == 1, "compiler fixture rejection status changed\n" + result.errorOutput)
+    test.check(result.output == "", "rejected source unexpectedly wrote standard output")
+    test.check(test.contains(result.errorOutput, diagnostic), "missing compiler fixture diagnostic: " + diagnostic + "\n" + result.errorOutput)
+    test.check(files.pathSize(context.directory + "/case" + Text(context.serial) + ".ll") < 0, "invalid source left LLVM output behind")
+    test.check(!test.contains(result.errorOutput, "List position"), "compiler rejection used a List-position failure")
+}

@@ -1,0 +1,109 @@
+use "../tools/testing.min" as test
+use "./compiler-port-support.min" as support
+use "system" as system
+use "files" as files
+
+function mainBody(source: Text): Text {
+    let start = support.find(source, "define i32 @main(", 0)
+    test.check(start >= 0, "literal LLVM omitted main")
+    start += Bytes("define i32 @main(").length
+    let end = support.find(source, "\n}", start)
+    test.check(end >= 0, "literal LLVM main was unterminated")
+    return Text(Bytes(source).slice(start, end))
+}
+function instructionCount(body: Text): Integer {
+    let count = 0
+    for line in test.lines(body) {
+        let assignment = false
+        if support.starts(line, "  %") {
+            let equals = support.find(line, "=", 3)
+            let marker = support.find(line, " = ", 3)
+            assignment = marker >= 3 && equals == marker + 1
+        }
+        if assignment || support.starts(line, "  call ") || support.starts(line, "  br ") || support.starts(line, "  ret ") { count += 1 }
+    }
+    return count
+}
+function moduleCases(context: test.Compiler) {
+    let frontend = test.setting("MINYAR_TEST_MODULE_COMPILER", "./build/minyarc-modules")
+    writeTextFile(context.directory + "/first.min", "public function make(): List<Integer> { return [1, 2, 3] }\n")
+    writeTextFile(context.directory + "/second.min", "public function make(): List<Integer> { return [4, 5, 6] }\n")
+    let entry = context.directory + "/main.min"
+    writeTextFile(entry, "use \"./first.min\" as first\nuse \"./second.min\" as second\nlet a = first.make()\nlet b = first.make()\na[0] = 99\nprint(a[0])\nprint(b[0])\nprint(second.make()[0])\n")
+    let prior = context.directory + "/empty"
+    writeTextFile(prior, "")
+    for iteration in 0..2 {
+        let llvm = context.directory + "/modules-" + Text(iteration) + ".ll"
+        let next = context.directory + "/state-" + Text(iteration)
+        let stats = context.directory + "/stats-" + Text(iteration)
+        let result = test.run([frontend, entry, llvm, "--module-state", prior, next, stats], system.environment(), "", llvm + ".compile", 30)
+        test.check(result.status == 0, "literal module compilation failed\n" + result.errorOutput)
+        let declarations = Map<Text, Boolean>()
+        for line in test.lines(readTextFile(llvm)) {
+            if !support.starts(line, "@") { continue }
+            let marker = support.find(line, " = private unnamed_addr constant [3 x i64]", 1)
+            if marker >= 1 { declarations[Text(Bytes(line).slice(0, marker))] = true }
+        }
+        test.check(declarations.length == 2, "identical module token positions did not retain two distinct literal globals")
+        if test.addressEnabled(context.flags) { writeTextFile(llvm, test.instrument(readTextFile(llvm))) }
+        for optimization in ["-O0", "-O2"] {
+            let executable = llvm + "." + optimization
+            support.link(context, llvm, optimization, executable, 30)
+            let observed = test.run([executable], system.environment(), "", executable + ".run", 30)
+            test.check(observed.status == 0 && observed.output == "99\n1\n4\n" && observed.errorOutput == "", "cached literal module execution differs at " + optimization + "\n" + observed.output + observed.errorOutput)
+        }
+        if iteration == 0 {
+            prior = context.directory + "/state"
+            writeBytesFile(prior, readBytesFile(next))
+        } else {
+            let fields = test.words(readTextFile(stats))
+            test.check(fields.length >= 2 && fields[0] == "3" && fields[1] == "0", "literal warm module cache did not reuse three unchanged fragments")
+        }
+    }
+}
+
+let names = ["test_fresh_storage_signed_limits_and_nested_owners", "test_constants_flush_before_dynamic_effects", "test_user_functions_cannot_interpose_runtime_or_system_symbols", "test_empty_singleton_comments_and_type_errors", "test_large_literal_has_bounded_instruction_count", "test_module_literal_names_and_cached_fragments"]
+let selectors = support.selectors("ListLiterals", names)
+let context = support.compiler()
+if support.selected(selectors, "ListLiterals", names[0]) {
+    let source = "record Box { values: List<Integer> }\nfunction make(): List<Integer> { return [-9223372036854775808, -0o2, 0, 9223372036854775807] }\nlet first = make()\nlet alias = first\nlet second = make()\nalias[0] = 99\nprint(first[0])\nprint(second[0])\nprint(second[1])\nprint(second[3])\nlet boxes = [Box { values: [10, 11] }, Box { values: [20, 21] }]\nlet nested = [[1, 2], [3, 4]]\nlet boxValues = boxes[0].values\nlet inner = nested[0]\nboxValues[0] = 42\ninner[0] = 8\nprint(boxes[0].values[0])\nprint(nested[0][0])\nprint(boxes[1].values[0])\nprint(nested[1][0])\nlet pass = 0\nwhile pass < 2 {\nlet local = [5, 6]\nprint(local[0])\nlocal[0] = 0\npass = pass + 1\n}\n"
+    support.executes(context, source, "99\n-9223372036854775808\n-2\n9223372036854775807\n42\n8\n20\n3\n5\n5\n", 0, "")
+}
+if support.selected(selectors, "ListLiterals", names[1]) {
+    let source = "function observe(value: Integer): Integer { print(value); return value }\nlet values = [1, 2, observe(3), 4, 5, observe(6), -7, 8]\nlet i = 0\nwhile i < values.length { print(values[i]); i = i + 1 }\nlet folded = [10, 20, 1 + observe(2), (4), 5 * 2, -3 + 1]\nprint(folded[2])\nprint(folded[3])\nprint(folded[4])\nprint(folded[5])\n"
+    let ir = support.executes(context, source, "3\n6\n1\n2\n3\n4\n5\n6\n-7\n8\n2\n3\n4\n10\n-2\n", 0, "")
+    let main = mainBody(ir)
+    let append = support.find(main, "call void @minyar_list_append_scalars", 0)
+    let observe = support.find(main, "call i64 @.minyar.fn.observe", 0)
+    test.check(append >= 0 && observe >= 0 && append < observe, "effectful literal expression moved before its preceding constant run")
+    support.executes(context, "function stop(): Integer { fail(\"literal stop\") }\nfunction later(): Integer { print(999); return 9 }\nlet values = [1, 2, stop(), 3, 4, later()]\nprint(values.length)\n", "", 1, "Minyar stopped: literal stop\n")
+}
+if support.selected(selectors, "ListLiterals", names[2]) {
+    let symbols = ["minyar_list_append_scalars", "minyar_list_new", "minyar_rc_enter", "malloc", "realloc", "free", "memcpy", "printf"]
+    let source = ""
+    let expected = "4\n"
+    for index in 0..symbols.length { source += "function " + symbols[index] + "(): Integer { return " + Text(index) + " }\n" }
+    source += "let values = [1, 2, 3]\nvalues.add(4)\nprint(values.length)\n"
+    for index in 0..symbols.length { source += "print(" + symbols[index] + "())\n"; expected += Text(index) + "\n" }
+    support.executes(context, source, expected, 0, "")
+}
+if support.selected(selectors, "ListLiterals", names[3]) {
+    support.executes(context, "let empty: List<Integer> = []\nlet one = [-0]\nlet pair = [1 // first\n, // separator\n2,\n]\nprint(empty.length)\nprint(one[0])\nprint(pair[1])\n", "0\n0\n2\n", 0, "")
+    let sources = ["let a = [1, 9223372036854775808]", "let a = [1, -9223372036854775809]", "let a = [1, 2, true]", "let a: List<Boolean> = [1, 2]", "let a = [1, 2 3]", "let a = [1, 2"]
+    let diagnostics = ["Integer literal is outside the supported range", "Integer literal is outside the supported range", "all values in a List literal must have the same type", "all values in a List literal must have the same type", "expected ','", "expected ','"]
+    for index in 0..sources.length { support.rejects(context, sources[index], diagnostics[index]) }
+}
+if support.selected(selectors, "ListLiterals", names[4]) {
+    let count = 16384
+    let source = "let values = ["
+    for index in 0..count { if index > 0 { source += "," }; source += Text(index) }
+    source += "]\nlet i = 0\nwhile i < values.length { if values[i] != i { fail(\"literal position\") }; i = i + 1 }\nprint(i)\n"
+    let ir = support.executes(context, source, Text(count) + "\n", 0, "")
+    test.check(support.count(ir, "call void @minyar_list_append_scalars(") == 1, "large literal did not lower to one constant run")
+    test.check(!test.contains(ir, "call void @minyar_list_add("), "large literal lowered to per-element append")
+    test.check(test.contains(ir, "private unnamed_addr constant [" + Text(count) + " x i64]"), "large literal constant storage shape changed")
+    test.check(instructionCount(mainBody(ir)) < 100, "large literal main instruction count was not bounded")
+}
+if support.selected(selectors, "ListLiterals", names[5]) { moduleCases(context) }
+test.removeTree(context.directory)
+print("List literal semantics, effects, diagnostics and cached module identity: passed")
