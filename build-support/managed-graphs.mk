@@ -113,11 +113,14 @@ check-managed-graphs-profiles: check-cycle-registry-growth check-cycle-registry-
 
 # Both C mains own their complete schedules; no --nodes arguments apply.
 .PHONY: check-cycle-registration-exposure check-cycle-registration-exposure-sanitize
-CYCLE_REGISTRATION_INPUTS = tests/cycle-registration.py tests/cycle-registration-exposure.c tests/cycle-late-registration.c tests/cycle-late-registration.min tests/cycle-additive.c tests/cycle-additive.min tests/errors-language.py tests/callbacks.py tests/errors_evidence.py tests/test_evidence.py tools/cycle_runtime.py $(RUNTIME_HEADERS)
+CYCLE_REGISTRATION_INPUTS = build/tooling/tests/cycle-registration tests/cycle-registration-exposure.c tests/cycle-late-registration.c tests/cycle-late-registration.min tests/cycle-additive.c tests/memory-contracts-runtime.c $(RUNTIME_HEADERS)
+build/tooling/tests/cycle-registration: TOOL_NATIVE = runtime/native/sha256.c
+build/tooling/tests/cycle-registration: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/cycle-registration: runtime/native/sha256.c
 check-cycle-registration-exposure: build/minyarc-errors $(CYCLE_REGISTRATION_INPUTS)
-	MINYAR_ERRORS_COMPILER=./build/minyarc-errors MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/cycle-registration.py --evidence "$(CURDIR)/build/cycle-registration-exposure-native"
+	MINYAR_ERRORS_COMPILER=./build/minyarc-errors MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/cycle-registration --evidence "$(CURDIR)/build/cycle-registration-exposure-native"
 check-cycle-registration-exposure-sanitize: build/minyarc-errors-sanitize $(CYCLE_REGISTRATION_INPUTS)
-	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_ERRORS_COMPILER=./build/minyarc-errors-sanitize MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) python3 tests/cycle-registration.py --sanitize --evidence "$(CURDIR)/build/cycle-registration-exposure-sanitize"
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_ERRORS_COMPILER=./build/minyarc-errors-sanitize MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-registration --sanitize --evidence "$(CURDIR)/build/cycle-registration-exposure-sanitize"
 check: check-cycle-registration-exposure check-cycle-registration-exposure-sanitize
 check-portable: check-cycle-registration-exposure check-cycle-registration-exposure-sanitize
 check-managed-graphs-profiles: check-cycle-registration-exposure check-cycle-registration-exposure-sanitize
