@@ -34,7 +34,7 @@ MANAGED_GRAPH_LAUNCHER_ARTIFACTS += build/minyarc-modules build/minyar-module-bu
 endif
 
 check-managed-graphs-launcher: $(MANAGED_GRAPH_LAUNCHER_ARTIFACTS)
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/managed-graphs-launcher.py
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/managed-graphs-launcher.py
 
 check-isolated-workers: build/minyarc build/minyar-default-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/isolated-workers.py
