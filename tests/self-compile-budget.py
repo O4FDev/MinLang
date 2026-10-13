@@ -30,7 +30,8 @@ BATCHES = 3
 
 MAX_PEAK_RSS_MIB = 17.0
 MAX_INSTRUCTIONS = 75_000_000
-MAX_PAIRED_RATIO = 1.02
+MAX_PAIRED_MEDIAN = 1.01
+MAX_PAIRED_UPPER = 1.05
 
 
 def file_identity(path: Path) -> dict:
@@ -128,10 +129,13 @@ def enforce_paired_budget(result: dict) -> None:
     failures = []
     for clock in ("wall", "cpu"):
         summary = result["summaries"][clock]
+        median = summary["median"]
         upper = summary["confidence_interval"]["upper"]
-        print(f"  same-input {clock} current/previous median {summary['median']:.6f}, 95% upper {upper:.6f} (limit {MAX_PAIRED_RATIO:.2f})")
-        if not math.isfinite(upper) or upper > MAX_PAIRED_RATIO:
-            failures.append(f"{clock} paired 95% upper {upper:.6f} exceeds {MAX_PAIRED_RATIO:.2f}")
+        print(f"  same-input {clock} current/previous median {median:.6f} (limit {MAX_PAIRED_MEDIAN:.2f}), 95% upper {upper:.6f} (limit {MAX_PAIRED_UPPER:.2f})")
+        if not math.isfinite(median) or median > MAX_PAIRED_MEDIAN:
+            failures.append(f"{clock} paired median {median:.6f} exceeds {MAX_PAIRED_MEDIAN:.2f}")
+        if not math.isfinite(upper) or upper > MAX_PAIRED_UPPER:
+            failures.append(f"{clock} paired 95% upper {upper:.6f} exceeds {MAX_PAIRED_UPPER:.2f}")
     if failures:
         raise SystemExit("same-input compiler budget exceeded:\n  " + "\n  ".join(failures))
 

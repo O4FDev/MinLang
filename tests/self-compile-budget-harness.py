@@ -149,14 +149,24 @@ class BudgetHarness(unittest.TestCase):
             self.assertEqual(len(retained['pairs']), 1)
             self.assertNotIn('ratios', retained['pairs'][0])
 
-    def test_both_paired_upper_limits_are_inclusive_and_independent(self):
-        def result(wall, cpu):
-            return {'summaries': {clock: budget.paired_cpu_ratio_summary([ratio] * 31, [1] * 31)
-                                 for clock, ratio in (('wall', wall), ('cpu', cpu))}}
-        budget.enforce_paired_budget(result(1.02, 1.02))
-        for wall, cpu in ((1.020001, 1.0), (1.0, 1.020001)):
-            with self.subTest(wall=wall, cpu=cpu), self.assertRaisesRegex(SystemExit, 'paired 95% upper'):
-                budget.enforce_paired_budget(result(wall, cpu))
+    def test_both_paired_limits_are_inclusive_and_independent(self):
+        def result(median=1.01, upper=1.05):
+            return {'summaries': {clock: {'median': median, 'confidence_interval': {'upper': upper}}
+                                 for clock in ('wall', 'cpu')}}
+        budget.enforce_paired_budget(result())
+        for clock in ('wall', 'cpu'):
+            for field, invalid in (('median', 1.010001), ('median', 1.02),
+                                   ('upper', 1.050001), ('median', float('nan')),
+                                   ('upper', float('inf'))):
+                candidate = result()
+                if field == 'median':
+                    candidate['summaries'][clock]['median'] = invalid
+                    expected = 'paired median'
+                else:
+                    candidate['summaries'][clock]['confidence_interval']['upper'] = invalid
+                    expected = 'paired 95% upper'
+                with self.subTest(clock=clock, field=field, invalid=invalid), self.assertRaisesRegex(SystemExit, expected):
+                    budget.enforce_paired_budget(candidate)
         self.assertEqual((budget.RUNS, budget.BATCHES), (100, 3))
         self.assertEqual(budget.MAX_PEAK_RSS_MIB, 17.0)
         self.assertEqual(budget.MAX_INSTRUCTIONS, 75_000_000)
