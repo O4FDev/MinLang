@@ -1619,7 +1619,7 @@ class BuildWiring(unittest.TestCase):
 
         def verify(candidate, host='Linux', operating_system='', ready=False):
             with tempfile.TemporaryDirectory(prefix='owned adapter Make rules ') as folder:
-                directory = Path(folder)
+                directory = Path(folder).resolve()
                 for name in inputs:
                     path = directory/name
                     path.parent.mkdir(parents=True, exist_ok=True)
