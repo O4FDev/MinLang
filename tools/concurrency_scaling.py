@@ -282,14 +282,14 @@ def run(arguments: argparse.Namespace) -> None:
     if resources:
         result.setdefault('resource_snapshots', []).append(resources)
     checks = []
-    for attempt in range(10):
+    for attempt in range(11):
         before = cpu_ticks()
         time.sleep(5)
         activity = cpu_activity(before, cpu_ticks(), protocol["affinity"])
         checks.append(activity)
         if quiet(activity):
             break
-        if attempt < 9:
+        if attempt < 10:
             time.sleep(30)
     result.setdefault('preflight_waits', []).append({'item': item, 'checks': checks})
     result['preflights'].append(activity)

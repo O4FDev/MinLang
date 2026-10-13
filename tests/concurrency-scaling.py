@@ -112,7 +112,10 @@ class ScalingProtocol(unittest.TestCase):
         with self.assertRaises(RuntimeError): self.item(2)
         self.assertEqual(self.results.read_bytes(), original)
         self.activity['other_busy_fraction'] = .021
-        with self.assertRaises(RuntimeError): self.item(1)
+        with patch.object(scaling.time, 'sleep') as sleep:
+            with self.assertRaises(RuntimeError): self.item(1)
+        self.assertEqual(sum(call.args == (30,) for call in sleep.call_args_list), 10)
+        self.assertEqual(len(json.loads(self.results.read_text())['preflight_waits'][-1]['checks']), 11)
         with self.assertRaises(RuntimeError): self.item(1)
         self.assertIn('failure', json.loads(self.results.read_text()))
 
