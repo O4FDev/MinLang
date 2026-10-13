@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import random
+import re
 import resource
 import shutil
 import statistics
@@ -94,6 +95,57 @@ def write_new(path: Path, value: object) -> None:
         stream.write("\n")
 
 
+def resource_identity(membership: str | None = None, root: Path = Path('/sys/fs/cgroup')) -> dict:
+    if membership is None:
+        membership = Path('/proc/self/cgroup').read_text()
+    groups = []
+    for line in membership.splitlines():
+        hierarchy, controllers, location = line.split(':', 2)
+        relative = Path(location)
+        if not relative.is_absolute() or '..' in relative.parts:
+            raise RuntimeError('invalid CPU cgroup membership')
+        parts = list(relative.parts[1:])
+        canonical_parts = list(parts)
+        if parts and re.fullmatch(r'session-[0-9]+\.scope', parts[-1]):
+            canonical_parts[-1] = 'session.scope'
+        if controllers and not {'cpu', 'cpuset'}.intersection(controllers.split(',')):
+            groups.append({'hierarchy': hierarchy, 'controllers': controllers,
+                           'path': '/' + '/'.join(canonical_parts)})
+            continue
+        base = root if not controllers else root / controllers
+        limits = []
+        for depth in range(len(parts) + 1):
+            directory = base.joinpath(*parts[:depth])
+            values = {}
+            for name in ('cpu.max', 'cpu.max.burst', 'cpu.weight', 'cpu.cfs_quota_us', 'cpu.cfs_period_us',
+                         'cpuset.cpus', 'cpuset.cpus.effective'):
+                try:
+                    values[name] = {'availability': 'exposed', 'value': (directory / name).read_text()}
+                except FileNotFoundError:
+                    values[name] = {'availability': 'not exposed in guest'}
+                except OSError as error:
+                    values[name] = {'availability': 'unreadable', 'errno': error.errno}
+            limits.append({'path': '/' + '/'.join(canonical_parts[:depth]), 'values': values})
+        groups.append({'hierarchy': hierarchy, 'controllers': controllers,
+                       'path': '/' + '/'.join(canonical_parts), 'ancestors': limits})
+    return {'version': 2, 'cpu_count': os.cpu_count(),
+            'affinity': sorted(os.sched_getaffinity(0)), 'groups': groups}
+
+
+def resource_snapshot() -> dict:
+    membership = Path('/proc/self/cgroup').read_text()
+    paths = []
+    for line in membership.splitlines():
+        _, controllers, location = line.split(':', 2)
+        if controllers and not {'cpu', 'cpuset'}.intersection(controllers.split(',')):
+            continue
+        base = Path('/sys/fs/cgroup') if not controllers else Path('/sys/fs/cgroup') / controllers
+        parts = Path(location).parts[1:]
+        paths.extend(str(base.joinpath(*parts[:depth])) for depth in range(len(parts) + 1))
+    return {'raw_membership': membership, 'raw_ancestor_paths': paths,
+            'identity': resource_identity(membership)}
+
+
 def register(arguments: argparse.Namespace) -> None:
     if sys.platform != "linux":
         raise RuntimeError("qualification requires the admitted Linux Boat host")
@@ -126,7 +178,8 @@ def register(arguments: argparse.Namespace) -> None:
             [arguments.clang, "--version"], text=True),
         "clang_path": str(clang), "clang_sha256": digest(clang), "kernel": list(os.uname()),
         "guest_topology": subprocess.check_output(["lscpu", "-J"], text=True),
-        "affinity": cpus, "quota": quota,
+        "affinity": cpus, "quota": quota, "resource_identity": resource_identity(),
+        "resource_snapshot": resource_snapshot(),
         "work": {"blocks": 131072, "dependent_steps_per_block": 4096,
                  "seed": 20261012, "input_bytes": 1048576,
                  "kernel": "x = x * 48271 % 2147483647; sum final x per block"},
@@ -187,9 +240,14 @@ def run(arguments: argparse.Namespace) -> None:
     if subprocess.check_output(['lscpu', '-J'], text=True) != protocol['guest_topology']:
         raise RuntimeError('CPU topology changed since registration')
     for name, expected in protocol['quota'].items():
+        if name == '/proc/self/cgroup' and 'resource_identity' in protocol:
+            continue
         path = Path(name)
         if (path.read_text() if path.exists() else 'not exposed in guest') != expected:
             raise RuntimeError('CPU quota/cgroup configuration changed since registration')
+    resources = resource_snapshot() if 'resource_identity' in protocol else None
+    if resources and resources['identity'] != protocol['resource_identity']:
+        raise RuntimeError('CPU cgroup ancestry, limits or availability changed since registration')
     if protocol["paired_order"] != schedule(ROUNDS, ORDER_SEED):
         raise RuntimeError("paired order or sample count changed")
     if protocol["warmup_order"] != schedule(WARMUPS, ORDER_SEED + 1):
@@ -221,6 +279,8 @@ def run(arguments: argparse.Namespace) -> None:
     else:
         result = {"protocol_sha256": seal, "started_unix_ns": time.time_ns(),
                   "samples": [], "preflights": [], "single_thread_pairs": [], "qualified": False}
+    if resources:
+        result.setdefault('resource_snapshots', []).append(resources)
     before = cpu_ticks()
     time.sleep(5)
     activity = cpu_activity(before, cpu_ticks(), protocol["affinity"])

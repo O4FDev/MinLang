@@ -151,10 +151,65 @@ class ScalingProtocol(unittest.TestCase):
         self.value['workload_sha256'] = 'changed'
         self.publish()
         with self.assertRaises(RuntimeError): self.item(0)
+
         self.value['workload_sha256'] = scaling.WORKLOAD_SHA256
         self.value['gates']['median_eight_min'] = 7.1
         self.publish()
         with self.assertRaises(RuntimeError): self.item(0)
+
+    def resources(self, session='100', parent='user-1000.slice'):
+        root = self.directory / 'cgroup'
+        leaf = root / 'user.slice' / parent / ('session-' + session + '.scope')
+        leaf.mkdir(parents=True, exist_ok=True)
+        for directory in (root, root / 'user.slice', leaf.parent, leaf):
+            (directory / 'cpu.max').write_text('max 100000\n')
+            (directory / 'cpu.max.burst').write_text('0\n')
+            (directory / 'cpu.weight').write_text('100\n')
+            (directory / 'cpuset.cpus.effective').write_text('0-7\n')
+        membership = '0::/user.slice/' + parent + '/session-' + session + '.scope\n'
+        return root, leaf, membership
+
+    def test_resource_session_change_only(self):
+        root, _, first = self.resources()
+        _, _, second = self.resources('101')
+        self.assertEqual(scaling.resource_identity(first, root), scaling.resource_identity(second, root))
+
+    def test_resource_guard_rejects_before_measurement(self):
+        root, leaf, membership = self.resources()
+        original = scaling.resource_identity(membership, root)
+        self.value['resource_identity'] = original
+        self.publish()
+        (leaf / 'cpu.max').write_text('400000 100000\n')
+        changed = scaling.resource_identity(membership, root)
+        with patch.object(scaling, 'resource_snapshot', return_value={'identity': changed}), \
+                patch.object(scaling, 'cpu_ticks', side_effect=AssertionError('measurement started')):
+            with self.assertRaisesRegex(RuntimeError, 'ancestry, limits or availability'):
+                self.item(0)
+        self.assertFalse(self.results.exists())
+
+    def test_resource_parent_quota_cpuset_and_availability(self):
+        root, leaf, first = self.resources()
+        original = scaling.resource_identity(first, root)
+        _, _, moved = self.resources('102', 'other.slice')
+        self.assertNotEqual(original, scaling.resource_identity(moved, root))
+        for name, value in (('cpu.max', '400000 100000\n'), ('cpu.max.burst', '1000\n'),
+                            ('cpu.weight', '200\n'), ('cpuset.cpus.effective', '0-3\n')):
+            path = leaf.parent / name
+            before = path.read_text()
+            path.write_text(value)
+            self.assertNotEqual(original, scaling.resource_identity(first, root))
+            path.write_text(before)
+            path.unlink()
+            self.assertNotEqual(original, scaling.resource_identity(first, root))
+            path.write_text(before)
+        with patch.object(scaling.os, 'sched_getaffinity', return_value={0, 1, 2, 3}):
+            self.assertNotEqual(original, scaling.resource_identity(first, root))
+        real_read = Path.read_text
+        def unreadable(path, *args, **kwargs):
+            if path == leaf / 'cpu.max': raise PermissionError(13, 'denied')
+            return real_read(path, *args, **kwargs)
+        with patch.object(Path, 'read_text', unreadable):
+            self.assertNotEqual(original, scaling.resource_identity(first, root))
 
 
 if __name__ == '__main__':
