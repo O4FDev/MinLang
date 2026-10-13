@@ -118,24 +118,25 @@ class BuildWiring(unittest.TestCase):
                 makefile = directory/'probe.mk'
                 makefile.write_text('LLVM_CC := retained-clang\nLIMITED := ordinary-limit\n'
                     'SANITIZER_LIMITED := sanitizer-limit\n'+candidate
-                    +'\n.PHONY: build/minyarc\nbuild/minyarc:\n\t@echo INPUT $@\n')
+                    +'\n.PHONY: build/minyarc build/tooling/tests/net-loop-test\n'
+                    'build/minyarc build/tooling/tests/net-loop-test:\n\t@echo INPUT $@\n')
                 env = dict(os.environ, PATH=str(directory)+os.pathsep+os.environ['PATH'],
                            OS=operating_system);env.pop('MAKEFLAGS',None)
                 result = subprocess.run(['make','-rRn','-f',str(makefile),'check-net-loop'],
                     cwd=ROOT,env=env,capture_output=True,text=True,timeout=15)
                 self.assertEqual(result.returncode,0,result.stderr)
                 commands=[line for line in result.stdout.splitlines()
-                          if 'python3 tests/net-loop.py' in line]
+                          if './build/tooling/tests/net-loop-test' in line]
                 windows=operating_system=='Windows_NT' or host.startswith(('MSYS','MINGW','CYGWIN'))
                 self.assertEqual(len(commands),1 if windows else 2)
                 native=next(line for line in commands if '--mode native' in line)
-                self.assertIn('ordinary-limit python3 tests/net-loop.py --mode native',native)
+                self.assertIn('ordinary-limit ./build/tooling/tests/net-loop-test --mode native',native)
                 self.assertNotIn('sanitizer-limit',native)
                 self.assertIn('--evidence "$evidence"',native)
                 self.assertIn(str(ROOT/'build/net-loop.'),native.replace('\\','/'))
                 if not windows:
                     sanitize=next(line for line in commands if '--mode sanitize' in line)
-                    self.assertIn('sanitizer-limit python3 tests/net-loop.py --mode sanitize',sanitize)
+                    self.assertIn('sanitizer-limit ./build/tooling/tests/net-loop-test --mode sanitize',sanitize)
                     self.assertNotIn('ordinary-limit',sanitize)
                     self.assertIn('--evidence "$evidence"',sanitize)
                     self.assertIn(str(ROOT/'build/net-loop-sanitize.'),sanitize.replace('\\','/'))
@@ -143,8 +144,8 @@ class BuildWiring(unittest.TestCase):
         for host, operating_system in (('Darwin',''),('Linux','Windows_NT'),
                 ('MSYS_NT-10.0',''),('MINGW64_NT-10.0',''),('CYGWIN_NT-10.0','')):
             verify(fragment,host,operating_system)
-        native=next(line for line in fragment.splitlines() if 'tests/net-loop.py --mode native' in line)
-        sanitize=next(line for line in fragment.splitlines() if 'tests/net-loop.py --mode sanitize' in line)
+        native=next(line for line in fragment.splitlines() if 'tests/net-loop-test --mode native' in line)
+        sanitize=next(line for line in fragment.splitlines() if 'tests/net-loop-test --mode sanitize' in line)
         for old,new in ((native,''),(sanitize,''),
                 (native,native.replace('$(LIMITED)','$(SANITIZER_LIMITED)')),
                 (sanitize,sanitize.replace('$(SANITIZER_LIMITED)','$(LIMITED)')),
@@ -307,7 +308,8 @@ class BuildWiring(unittest.TestCase):
                 makefile.write_text(
                     'LLVM_CC := retained-clang\nLIMITED := ordinary-limit\n'
                     'SANITIZER_LIMITED := sanitizer-limit\n' + candidate
-                    + '\n.PHONY: build/minyarc\nbuild/minyarc:\n\t@echo INPUT $@\n')
+                    + '\n.PHONY: build/minyarc build/tooling/tests/net-native-test\n'
+                    'build/minyarc build/tooling/tests/net-native-test:\n\t@echo INPUT $@\n')
                 env = dict(os.environ, PATH=str(directory)+os.pathsep+os.environ['PATH'],
                            OS=operating_system)
                 env.pop('MAKEFLAGS', None)
@@ -316,19 +318,19 @@ class BuildWiring(unittest.TestCase):
                     cwd=ROOT, env=env, capture_output=True, text=True, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 commands = [line for line in result.stdout.splitlines()
-                            if 'python3 tests/net-native.py' in line]
+                            if './build/tooling/tests/net-native-test' in line]
                 windows = operating_system == 'Windows_NT' or host.startswith(
                     ('MSYS', 'MINGW', 'CYGWIN'))
                 self.assertEqual(len(commands), 1 if windows else 2)
                 native = next(line for line in commands if '--mode native' in line)
-                self.assertIn('ordinary-limit python3 tests/net-native.py --mode native', native)
+                self.assertIn('ordinary-limit ./build/tooling/tests/net-native-test --mode native', native)
                 self.assertNotIn('sanitizer-limit', native)
                 self.assertIn('MINYAR_TEST_CLANG="retained-clang"', native)
                 self.assertIn('--evidence "$evidence"', native)
                 self.assertIn(str(ROOT/'build/net-native.'), native.replace('\\', '/'))
                 if not windows:
                     sanitize = next(line for line in commands if '--mode sanitize' in line)
-                    self.assertIn('sanitizer-limit python3 tests/net-native.py --mode sanitize',
+                    self.assertIn('sanitizer-limit ./build/tooling/tests/net-native-test --mode sanitize',
                                   sanitize)
                     self.assertNotIn('ordinary-limit', sanitize)
                     self.assertIn('MINYAR_TEST_CLANG="retained-clang"', sanitize)
@@ -344,9 +346,9 @@ class BuildWiring(unittest.TestCase):
             with self.subTest(host=host, operating_system=operating_system):
                 verify(fragment, host, operating_system)
         native = next(line for line in fragment.splitlines()
-                      if 'tests/net-native.py --mode native' in line)
+                      if 'tests/net-native-test --mode native' in line)
         sanitize = next(line for line in fragment.splitlines()
-                        if 'tests/net-native.py --mode sanitize' in line)
+                        if 'tests/net-native-test --mode sanitize' in line)
         for name, old, new in (
                 ('missing native', native, ''),
                 ('missing POSIX sanitizer', sanitize, ''),
@@ -1429,7 +1431,7 @@ class BuildWiring(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     expected = f'ASAN_OPTIONS=detect_leaks={leaks} UBSAN_OPTIONS=halt_on_error=1'
                     self.assertEqual(result.stdout.count(expected), 2, result.stdout)
-                    self.assertIn('tests/tls-validity.py --sanitize', result.stdout)
+                    self.assertIn('build/tooling/tests/tls-validity-test --sanitize', result.stdout)
                     if not os_value or system == 'Windows':
                         with patch('clang_helpers.platform.system', return_value=system):
                             self.assertEqual(asan_leak_options(), f'detect_leaks={leaks}')
@@ -2192,9 +2194,6 @@ class BuildWiring(unittest.TestCase):
             python = binaries / 'python3'
             python.write_text('#!' + sys.executable + '\n' +
                 'import json,os,sys\n'
-                'if sys.argv[1:2] == ["tests/os-tlsverify.py"]:\n'
-                ' print(json.dumps({"clang":os.environ.get("MINYAR_CLANG"),'
-                '"path":os.environ["PATH"],"argv":sys.argv[1:]}));sys.exit(0)\n'
                 'os.execv(sys.executable,[sys.executable,*sys.argv[1:]])\n')
             python.chmod(0o755)
             converter = binaries / 'cygpath'
@@ -2207,6 +2206,14 @@ class BuildWiring(unittest.TestCase):
             environment.pop('MAKEFLAGS', None)
             environment.pop('MINYAR_SANITIZER_CLANG', None)
             ordinary = str(directory / 'ordinary compiler/bin/clang')
+            verifier = 'build/tooling/tests/os-tlsverify-test'
+            native = directory / verifier
+            native.parent.mkdir(parents=True)
+            native.write_text('#!' + sys.executable + '\n' +
+                'import json,os,sys\n'
+                'print(json.dumps({"clang":os.environ.get("MINYAR_CLANG"),"path":os.environ["PATH"],'
+                '"argv":["' + verifier + '",*sys.argv[1:]]}))\n')
+            native.chmod(0o755)
 
             def verify(candidate, sanitizer, selected_compiler=None, selected_directory=None,
                        msys=False):
@@ -2232,7 +2239,7 @@ class BuildWiring(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     selected = json.loads(result.stdout)
                     self.assertEqual(selected['clang'], expected_compiler)
-                    self.assertEqual(selected['argv'], ['tests/os-tlsverify.py', *arguments])
+                    self.assertEqual(selected['argv'], [verifier, *arguments])
                     expected_path = environment['PATH']
                     if sanitizer and arguments:
                         expected_path = (selected_directory or str(Path(sanitizer).parent)) + os.pathsep + expected_path
@@ -2252,7 +2259,7 @@ class BuildWiring(unittest.TestCase):
                 with self.subTest(msys_native_spelling=native):
                     verify(fragment, native, selected, parent, msys=True)
             sanitizer_recipe = next(line for line in fragment.splitlines()
-                                    if 'tests/os-tlsverify.py --sanitize' in line)
+                                    if 'tests/os-tlsverify-test --sanitize' in line)
             for replacement in (
                     sanitizer_recipe.replace('$(OS_TLS_SANITIZER_CLANG)', '$(LLVM_CC)'),
                     sanitizer_recipe.replace('PATH="$(OS_TLS_SANITIZER_PATH)" ', '')):
@@ -2372,9 +2379,6 @@ class BuildWiring(unittest.TestCase):
             python = binaries / 'python3'
             python.write_text('#!' + sys.executable + '\n' +
                 'import json,os,sys\n'
-                'if sys.argv[1:2] == ["tests/net-udp-offload.py"]:\n'
-                ' print(json.dumps({"clang":os.environ.get("MINYAR_TEST_CLANG"),"path":os.environ["PATH"],'
-                '"limit":os.environ.get("NET_PROBE_LIMIT"),"argv":sys.argv[1:]}));sys.exit(0)\n'
                 'os.execv(sys.executable,[sys.executable,*sys.argv[1:]])\n')
             python.chmod(0o755)
             converter = binaries / 'cygpath'
@@ -2392,20 +2396,22 @@ class BuildWiring(unittest.TestCase):
                 environment.pop(name, None)
             ordinary = str(directory / 'ordinary UCRT compiler/bin/clang')
             connect = 'build/tooling/tests/net-connect-test'
+            offload = 'build/tooling/tests/net-udp-offload-test'
             (directory / 'tools').symlink_to(ROOT / 'tools')
-            native = directory / connect
-            native.parent.mkdir(parents=True)
-            native.write_text('#!' + sys.executable + '\n' +
-                'import json,os,sys\n'
-                'print(json.dumps({"clang":os.environ.get("MINYAR_CLANG"),"path":os.environ["PATH"],'
-                '"limit":os.environ.get("NET_PROBE_LIMIT"),"argv":["' + connect + '",*sys.argv[1:]]}))\n')
-            native.chmod(0o755)
+            for tool, key in ((connect, 'MINYAR_CLANG'), (offload, 'MINYAR_TEST_CLANG')):
+                native = directory / tool
+                native.parent.mkdir(parents=True, exist_ok=True)
+                native.write_text('#!' + sys.executable + '\n' +
+                    'import json,os,sys\n'
+                    'print(json.dumps({"clang":os.environ.get("' + key + '"),"path":os.environ["PATH"],'
+                    '"limit":os.environ.get("NET_PROBE_LIMIT"),"argv":["' + tool + '",*sys.argv[1:]]}))\n')
+                native.chmod(0o755)
             targets = (
                 ('check-net-connect', connect, [], {'build/minyarc'}),
                 ('check-net-connect-sanitize', connect, ['--sanitize'], {'build/minyarc'}),
-                ('check-net-udp-offload', 'tests/net-udp-offload.py',
+                ('check-net-udp-offload', offload,
                  ['--evidence', 'build/net-udp-offload'], {'build/minyarc', 'build/minyar-default-runtime.o'}),
-                ('check-net-udp-offload-sanitize', 'tests/net-udp-offload.py',
+                ('check-net-udp-offload-sanitize', offload,
                  ['--sanitize', '--evidence', 'build/net-udp-offload-sanitize'],
                  {'build/minyarc', 'build/minyar-default-runtime.o'}))
 
@@ -2448,7 +2454,7 @@ class BuildWiring(unittest.TestCase):
                     if sanitizer or not sanitize:
                         self.assertEqual(set(rule.split(':', 1)[1].split()), prerequisites |
                                          ({'tools/toolchain.sh'} if sanitize else set()) |
-                                         ({connect} if script == connect else set()), target)
+                                         {script}, target)
 
             # Expected spellings and complete parents are independent of the Make selector.
             verify(fragment)
