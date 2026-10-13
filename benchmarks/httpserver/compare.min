@@ -1,0 +1,312 @@
+use "../../tools/testing.min" as test
+use "../../tests/net-fixtures.min" as fixtures
+use "./front-oracle.min" as oracle
+use "system" as system
+use "files" as files
+use "json" as json
+
+record Corpus { queries: List<Text>; bodies: List<Bytes>; delays: List<Integer> }
+record Row { latency: Float; body: Bytes; cache: Text }
+record Measured { round: oracle.Round; samples: Text; command: List<Text> }
+record Results { output: Text; mode: Text; corpus: Text; replay: Text; binaries: List<Text>; digests: List<Text>; commands: List<Text> }
+
+constant CORPUS_SHA = "74f31164ecbcb19c8911870510fd7fb56f58d79930d39fc0c3aebd9c1e1fb6f6"
+constant REPLAY_SHA = "6233b7f0e13c9c5563d65d892d750d1ab6357ddddc5d39cc91dd530d35d660bb"
+
+function digest(context: fixtures.Context, path: Text): Text {
+    return fixtures.split(fixtures.execute(context, ["sha256sum", "--", path], 30, "hash " + path).output, 32)[0]
+}
+function hexValue(byte: Integer): Integer {
+    if byte >= 48 && byte <= 57 { return byte - 48 }
+    if byte >= 97 && byte <= 102 { return byte - 87 }
+    if byte >= 65 && byte <= 70 { return byte - 55 }
+    fail("invalid JSON unicode escape")
+    return 0
+}
+function utf8(out: Bytes, code: Integer) {
+    if code < 128 { out.add(code); return }
+    if code < 2048 { out.add(192 | (code >> 6)); out.add(128 | (code & 63)); return }
+    if code < 65536 { out.add(224 | (code >> 12)); out.add(128 | ((code >> 6) & 63)); out.add(128 | (code & 63)); return }
+    out.add(240 | (code >> 18)); out.add(128 | ((code >> 12) & 63)); out.add(128 | ((code >> 6) & 63)); out.add(128 | (code & 63))
+}
+function unit(raw: Bytes, at: Integer): Integer {
+    test.check(at + 5 < raw.length + 1 && raw[at] == 92 && raw[at + 1] == 117, "JSON unicode escape")
+    return (hexValue(raw[at + 2]) << 12) | (hexValue(raw[at + 3]) << 8) | (hexValue(raw[at + 4]) << 4) | hexValue(raw[at + 5])
+}
+function jsonString(line: Text): Bytes {
+    let raw = Bytes(line)
+    test.check(raw.length >= 2 && raw[0] == 34 && raw[raw.length - 1] == 34, "recorded body is not a JSON string")
+    let out = Bytes()
+    let at = 1
+    while at < raw.length - 1 {
+        let byte = raw[at]
+        if byte != 92 { out.add(byte); at += 1; continue }
+        let kind = raw[at + 1]
+        if kind == 117 {
+            let code = unit(raw, at)
+            at += 6
+            if code >= 55296 && code < 56320 && at + 5 < raw.length && raw[at] == 92 && raw[at + 1] == 117 {
+                let low = unit(raw, at)
+                if low >= 56320 && low < 57344 {
+                    utf8(out, 65536 + ((code - 55296) << 10) + (low - 56320))
+                    at += 6
+                    continue
+                }
+            }
+            if code >= 56448 && code < 56576 { out.add(code - 56320) } else {
+                test.check(code < 55296 || code >= 57344, "unescapable lone surrogate in recorded body")
+                utf8(out, code)
+            }
+            continue
+        }
+        let simple = -1
+        if kind == 34 { simple = 34 }
+        if kind == 92 { simple = 92 }
+        if kind == 47 { simple = 47 }
+        if kind == 98 { simple = 8 }
+        if kind == 102 { simple = 12 }
+        if kind == 110 { simple = 10 }
+        if kind == 114 { simple = 13 }
+        if kind == 116 { simple = 9 }
+        test.check(simple >= 0, "invalid JSON escape")
+        out.add(simple)
+        at += 2
+    }
+    return out
+}
+function totalMicroseconds(body: Bytes): Integer {
+    let parsed = json.parse(Text(body))
+    if parsed.kind == json.OBJECT {
+        let total = json.member(parsed, "total_us")
+        test.check(total.kind == json.NUMBER && total.number >= 0.0 && total.number < 5000000.0, "recorded total_us")
+        return Integer(total.number)
+    }
+    let marker = Bytes("\"total_us\":")
+    let found = -1
+    for start in 0..(body.length - marker.length + 1) {
+        let equal = true
+        for offset in 0..marker.length { if body[start + offset] != marker[offset] { equal = false; break } }
+        if equal { test.check(found < 0, "recorded body repeats total_us"); found = start }
+    }
+    test.check(found >= 0, "recorded body lacks total_us")
+    let raw = Bytes(fixtures.strip(Text(body.slice(found + marker.length, min(body.length, found + marker.length + 40)))))
+    let end = 0
+    while end < raw.length && ((raw[end] >= 48 && raw[end] <= 57) || raw[end] == 46) { end += 1 }
+    let number = Text(raw.slice(0, end))
+    let pieces = fixtures.split(number, 46)
+    let micros = fixtures.number(pieces[0])
+    test.check(micros < 5000000, "recorded delay outside 0..5s")
+    return micros
+}
+function corpus(context: fixtures.Context, queries: Text, recording: Text): Corpus {
+    test.check(digest(context, queries) == CORPUS_SHA, "548-query corpus bytes changed")
+    test.check(digest(context, recording) == REPLAY_SHA, "recorded body input bytes changed")
+    let rows = test.lines(readTextFile(queries))
+    let header = fixtures.split(rows[0], 9)
+    let column = -1
+    for index in 0..header.length { if header[index] == "query" { column = index } }
+    test.check(column >= 0, "query column missing")
+    let result = Corpus { queries: []; bodies: []; delays: [] }
+    for index in 1..rows.length { result.queries.add(fixtures.split(rows[index], 9)[column]) }
+    let unique = result.queries.sorted()
+    for index in 1..unique.length { test.check(unique[index] != unique[index - 1], "duplicate corpus query") }
+    test.check(result.queries.length == 548, "corpus must hold 548 queries")
+    let decompressed = fixtures.execute(context, ["gzip", "-dc", recording], 60, "decompress recorded bodies")
+    for line in test.lines(decompressed.output) {
+        let body = jsonString(line)
+        result.bodies.add(body)
+        result.delays.add(totalMicroseconds(body))
+    }
+    test.check(result.bodies.length == 548, "recording must hold 548 bodies")
+    return result
+}
+function digests(context: fixtures.Context, bodies: List<Bytes>): List<Text> {
+    let directory = fixtures.logPath(context, "bodies")
+    test.check(files.makeDirectory(directory) == 0, "create body digest directory")
+    let command = ["sha256sum", "--"]
+    for index in 0..bodies.length {
+        writeBytesFile(directory + "/" + Text(index), bodies[index])
+        command.add(directory + "/" + Text(index))
+    }
+    let result: List<Text> = []
+    for line in test.lines(fixtures.execute(context, command, 120, "hash response bodies").output) { result.add(fixtures.split(line, 32)[0]) }
+    return result
+}
+function samples(context: fixtures.Context, rows: List<oracle.Fetched>): Text {
+    let bodies: List<Bytes> = []
+    for row in rows { bodies.add(row.body) }
+    let hashes = digests(context, bodies)
+    let parts: List<Text> = []
+    for index in 0..rows.length {
+        parts.add("{\"index\": " + Text(index) + ", \"latency_us\": " + Text(rows[index].latency) + ", \"body_sha256\": " + json.quote(hashes[index]) + ", \"status\": 200, \"cache\": " + json.quote(rows[index].cache) + "}")
+    }
+    return "[" + fixtures.joinWords(withCommas(parts)) + "]"
+}
+function withCommas(items: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for index in 0..items.length {
+        if index + 1 < items.length { result.add(items[index] + ",") } else { result.add(items[index]) }
+    }
+    return result
+}
+function sequential(port: Integer, paths: List<Text>, bodies: List<Bytes>, state: Text, deadline: Integer): List<oracle.Fetched> {
+    let rows: List<oracle.Fetched> = []
+    for index in 0..paths.length { rows.add(oracle.fetch(port, paths[index], bodies[index], true, state, deadline)) }
+    return rows
+}
+function latencies(rows: List<oracle.Fetched>): List<Float> {
+    let result: List<Float> = []
+    for row in rows { result.add(row.latency) }
+    return result
+}
+function statuses(rows: List<oracle.Fetched>): List<Integer> {
+    let result: List<Integer> = []
+    for row in rows { result.add(200) }
+    return result
+}
+function measureRound(context: fixtures.Context, binary: Text, upstream: oracle.Replay, data: Corpus, output: Text, deadline: Integer): Measured {
+    let paths: List<Text> = []
+    for query in data.queries { paths.add(oracle.target(query, "10")) }
+    let served = oracle.front(context, binary, upstream.port, 100000, 268435456)
+    for index in 0..16 { oracle.stats(served.port) }
+    let miss = sequential(served.port, paths, data.bodies, "miss", deadline)
+    let used = 0
+    for index in 0..paths.length { used += oracle.rawKey(paths[index]).length + data.bodies[index].length }
+    let observed = oracle.stats(served.port)
+    test.check(oracle.statsText(observed) == oracle.statsText([0, 548, 548, used, 0, 548]), "miss cohort stats " + oracle.statsText(observed))
+    let hit = sequential(served.port, paths, data.bodies, "hit", deadline)
+    let snapshot = oracle.stats(served.port)
+    test.check(snapshot[0] == 548 && snapshot[1] == 548, "hit cohort stats " + oracle.statsText(snapshot))
+    let statsPaths: List<Text> = []
+    let statsBodies: List<Bytes> = []
+    for index in 0..548 { statsPaths.add("/stats"); statsBodies.add(Bytes(oracle.statsText(snapshot))) }
+    let stats = sequential(served.port, statsPaths, statsBodies, "none", deadline)
+    oracle.closeFront(served, output + "/sequential.log")
+    let concurrent = oracle.front(context, binary, upstream.port, 100000, 268435456)
+    oracle.fetch(concurrent.port, paths[0], data.bodies[0], true, "miss", deadline)
+    oracle.calls(upstream)
+    let restPaths: List<Text> = []
+    let restBodies: List<Bytes> = []
+    for index in 1..paths.length { restPaths.add(paths[index]); restBodies.add(data.bodies[index]) }
+    let remaining = (deadline - system.monotonicNanoseconds()) / 1000000
+    test.check(remaining > 0, "finite run deadline exceeded")
+    let worker = oracle.startBatch(context, upstream, concurrent.port, restPaths, 6000, remaining)
+    test.check(oracle.waitCall(upstream, 2000), "concurrent misses did not start")
+    let hitPaths: List<Text> = []
+    let hitBodies: List<Bytes> = []
+    for index in 0..548 { hitPaths.add(paths[0]); hitBodies.add(data.bodies[0]) }
+    let holHit = sequential(concurrent.port, hitPaths, hitBodies, "hit", deadline)
+    test.check(oracle.batchRunning(worker), "HoL cohort did not overlap misses")
+    test.check(oracle.settleBatch(worker, max(10, min(60000, (deadline - system.monotonicNanoseconds()) / 1000000))), "finite miss worker did not finish")
+    let holMiss = oracle.finishBatch(worker, restBodies, "miss")
+    let final = oracle.stats(concurrent.port)
+    test.check(final[0] == 548 && final[1] == 548, "concurrent stats " + oracle.statsText(final))
+    oracle.closeFront(concurrent, output + "/concurrent.log")
+    let cohorts = [miss, hit, stats, holMiss, holHit]
+    let names = oracle.cohorts()
+    let measured = oracle.Round { latencies: []; statuses: [] }
+    let parts: List<Text> = []
+    for index in 0..cohorts.length {
+        measured.latencies.add(latencies(cohorts[index]))
+        measured.statuses.add(statuses(cohorts[index]))
+        parts.add(json.quote(names[index]) + ": " + samples(context, cohorts[index]))
+    }
+    return Measured { round: measured; samples: "{" + fixtures.joinWords(withCommas(parts)) + "}\n"; command: served.command }
+}
+function quoted(items: List<Text>): Text {
+    let parts: List<Text> = []
+    for item in items { parts.add(json.quote(item)) }
+    return "[" + fixtures.joinWords(withCommas(parts)) + "]"
+}
+
+fixtures.arguments(["--verify-only", "--self-test"], ["--minyar", "--axum", "--queries", "--replay", "--output"])
+oracle.controls()
+if fixtures.flag("--self-test") {
+    print("Fixed 1.5x p50/p99 gate rejects regression and missing samples")
+    exit(0)
+}
+for name in ["--minyar", "--axum", "--queries", "--replay", "--output"] { test.check(fixtures.option(name, "") != "", name + " is required") }
+let context = fixtures.context(false)
+function absolute(context: fixtures.Context, path: Text): Text {
+    if fixtures.starts(path, "/") { return path }
+    return context.root + "/" + path
+}
+function results(ledger: Results, status: Text, summary: Text, extra: Text) {
+    let text = "{\n  \"schema_version\": 1,\n  \"threshold\": 1.5,\n  \"mode\": " + json.quote(ledger.mode) + ",\n  \"status\": " + json.quote(status) + ",\n  \"corpus_sha256\": " + json.quote(ledger.corpus) +
+        ",\n  \"replay_sha256\": " + json.quote(ledger.replay) + ",\n  \"binaries\": {\"minyar\": {\"path\": " + json.quote(ledger.binaries[0]) + ", \"sha256\": " + json.quote(ledger.digests[0]) +
+        "}, \"axum\": {\"path\": " + json.quote(ledger.binaries[1]) + ", \"sha256\": " + json.quote(ledger.digests[1]) + "}},\n  \"commands\": [" + fixtures.joinWords(withCommas(ledger.commands)) + "],\n  \"results\": {" + summary + "}" + extra + "\n}\n"
+    writeTextFile(ledger.output + "/results.json", text)
+}
+function incomplete(ledger: Results, phase: Text) { results(ledger, "failed", "", ",\n  \"error\": " + json.quote("incomplete: " + phase + "; see standard error")) }
+let output = absolute(context, fixtures.option("--output", ""))
+fixtures.execute(context, ["mkdir", "-p", output], 10, "create output")
+test.check(files.list(output).length == 0, "output must be empty")
+let verifyOnly = fixtures.flag("--verify-only")
+let binaries = [absolute(context, fixtures.option("--minyar", "")), absolute(context, fixtures.option("--axum", ""))]
+let names = ["minyar", "axum"]
+let queriesPath = absolute(context, fixtures.option("--queries", ""))
+let replayPath = absolute(context, fixtures.option("--replay", ""))
+let data = corpus(context, queriesPath, replayPath)
+let mode = "acceptance"
+if verifyOnly { mode = "verify-only" }
+let rounds = 3
+if verifyOnly { rounds = 1 }
+let seconds = 600
+if verifyOnly { seconds = 180 }
+let deadline = system.monotonicNanoseconds() + seconds * 1000000000
+let ledger = Results { output: output; mode: mode; corpus: digest(context, queriesPath); replay: digest(context, replayPath); binaries: binaries; digests: [digest(context, binaries[0]), digest(context, binaries[1])]; commands: [] }
+let minyarRounds: List<oracle.Round> = []
+let axumRounds: List<oracle.Round> = []
+incomplete(ledger, "replay upstream startup")
+let upstream = oracle.replay(context, data.queries, data.bodies, data.delays)
+for index in 0..2 {
+    let directory = output + "/" + names[index]
+    test.check(files.makeDirectory(directory) == 0, "create " + names[index] + " output")
+    incomplete(ledger, names[index] + " LRU verification")
+    oracle.verifyLru(context, binaries[index], upstream.port, data.queries, data.bodies, directory)
+    incomplete(ledger, names[index] + " HoL verification")
+    oracle.verifyHol(context, binaries[index], upstream, data.queries, data.bodies, directory)
+}
+for number in 0..rounds {
+    let order = [0, 1]
+    if number % 2 == 1 { order = [1, 0] }
+    for index in order {
+        let directory = output + "/" + names[index] + "/round-" + Text(number)
+        test.check(files.makeDirectory(directory) == 0, "create round output")
+        incomplete(ledger, names[index] + " round " + Text(number))
+        let measured = measureRound(context, binaries[index], upstream, data, directory, deadline)
+        if index == 0 { minyarRounds.add(measured.round) } else { axumRounds.add(measured.round) }
+        ledger.commands.add(quoted(measured.command))
+        writeTextFile(directory + "/samples.json", measured.samples)
+    }
+}
+writeTextFile(output + "/upstream-targets.json", quoted(oracle.allCalls(upstream)) + "\n")
+oracle.closeReplay(upstream)
+if verifyOnly {
+    results(ledger, "correctness_passed", "", ",\n  \"performance\": \"not_qualified\"")
+} else {
+    let checked = oracle.gate(minyarRounds, axumRounds)
+    if checked.error != "" {
+        results(ledger, "failed", "", ",\n  \"error\": " + json.quote("AssertionError: " + checked.error))
+        test.check(false, checked.error)
+    }
+    let groups: List<Text> = []
+    for name in oracle.cohorts() {
+        let cells: List<Text> = []
+        for cell in checked.cells {
+            if cell.cohort == name { cells.add(json.quote("p" + Text(cell.percentile)) + ": {\"minyar_us\": " + Text(cell.minyar) + ", \"axum_us\": " + Text(cell.axum) + ", \"ratio\": " + Text(cell.ratio) + ", \"passed\": " + fixtures.truth(cell.passed) + "}") }
+        }
+        groups.add(json.quote(name) + ": {" + fixtures.joinWords(withCommas(cells)) + "}")
+    }
+    let summary = fixtures.joinWords(withCommas(groups))
+    if checked.passed {
+        results(ledger, "passed", summary, "")
+    } else {
+        results(ledger, "failed", summary, ",\n  \"error\": " + json.quote("AssertionError: fixed <=1.5x p50 AND p99 gate failed; inspect results.json"))
+    }
+    test.check(checked.passed, "fixed <=1.5x p50 AND p99 gate failed; inspect results.json")
+}
+let qualified = "all fixed p50/p99 gates passed"
+if verifyOnly { qualified = "performance not qualified" }
+print("548-query raw identity, exact LRU and async HoL verified; " + qualified)
+fixtures.finish(context)

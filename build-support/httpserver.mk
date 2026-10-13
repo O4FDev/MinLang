@@ -18,13 +18,17 @@ check-sanitize: check-httpserver-sanitize
 endif
 
 .PHONY: check-httpserver-front bench-httpserver
-check-httpserver-front: build/minyarc build/minyar-default-runtime-release.ll
-	MINYAR_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/httpserver-front.py
+build/tooling/tests/httpserver-front-test: TOOL_NATIVE = runtime/native/net.c tests/net-wire-native.c
+build/tooling/tests/httpserver-front-test: runtime/native/net.c tests/net-wire-native.c
+check-httpserver-front: build/minyarc build/minyar-default-runtime-release.ll build/tooling/tests/httpserver-front-test
+	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/httpserver-front-test
 
 ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
 check check-portable: check-httpserver-front
 endif
 
 # Opt-in heavy qualification. Supply prebuilt binaries and an empty output path.
-bench-httpserver:
-	python3 benchmarks/httpserver/compare.py --minyar "$(HTTP_FRONT_MINYAR)" --axum "$(HTTP_FRONT_AXUM)" --queries benchmarks/httpserver/inputs/queries.tsv --replay benchmarks/httpserver/inputs/bodies.jsonl.gz --output "$(HTTP_FRONT_RESULTS)"
+build/tooling/benchmarks/httpserver/compare: TOOL_NATIVE = runtime/native/net.c tests/net-wire-native.c
+build/tooling/benchmarks/httpserver/compare: runtime/native/net.c tests/net-wire-native.c
+bench-httpserver: build/tooling/benchmarks/httpserver/compare
+	MINYAR_TEST_CLANG="$(LLVM_CC)" ./build/tooling/benchmarks/httpserver/compare --minyar "$(HTTP_FRONT_MINYAR)" --axum "$(HTTP_FRONT_AXUM)" --queries benchmarks/httpserver/inputs/queries.tsv --replay benchmarks/httpserver/inputs/bodies.jsonl.gz --output "$(HTTP_FRONT_RESULTS)"

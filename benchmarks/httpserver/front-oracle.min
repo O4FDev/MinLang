@@ -1,0 +1,386 @@
+use "../../tools/testing.min" as test
+use "../../tests/net-fixtures.min" as fixtures
+use "../../tests/net-wire.min" as wire
+use "system" as system
+use "files" as files
+use "json" as json
+
+public record Replay { context: fixtures.Context; process: fixtures.Process; port: Integer; control: Text; helper: Text; seen: Integer }
+public record Front { process: fixtures.Process; port: Integer; command: List<Text> }
+public record Fetched { latency: Float; body: Bytes; cache: Text }
+public record Round { latencies: List<List<Float>>; statuses: List<List<Integer>> }
+public record Cell { cohort: Text; percentile: Integer; minyar: Float; axum: Float; ratio: Float; passed: Boolean }
+public record Gate { cells: List<Cell>; passed: Boolean; error: Text }
+
+public function cohorts(): List<Text> { return ["miss", "hit", "stats", "hol_miss", "hol_hit"] }
+public function threshold(): Float { return 1.5 }
+
+public function quote(query: Text): Text {
+    let digits = Bytes("0123456789ABCDEF")
+    let result = Bytes()
+    for byte in Bytes(query) {
+        let plain = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 95 || byte == 46 || byte == 45 || byte == 126
+        if plain { result.add(byte) } else {
+            result.add(37)
+            result.add(digits[byte >> 4])
+            result.add(digits[byte & 15])
+        }
+    }
+    return Text(result)
+}
+public function target(query: Text, k: Text): Text { return "/api/search?q=" + quote(query) + "&k=" + k }
+public function rawKey(path: Text): Bytes {
+    let parts = fixtures.split(path, 63)
+    let query = ""
+    if parts.length > 1 { query = Text(Bytes(path).slice(Bytes(parts[0]).length + 1, path.byteLength)) }
+    let k = ""
+    let q = ""
+    let foundK = false
+    let foundQ = false
+    for part in fixtures.split(query, 38) {
+        let raw = Bytes(part)
+        let equals = 0
+        while equals < raw.length && raw[equals] != 61 { equals += 1 }
+        if equals < raw.length {
+            let name = Text(raw.slice(0, equals))
+            let value = Text(raw.slice(equals + 1, raw.length))
+            if name == "k" && !foundK { k = value; foundK = true }
+            if name == "q" && !foundQ { q = value; foundQ = true }
+        }
+    }
+    let key = Bytes(k)
+    key.add(0)
+    key.addBytes(Bytes(q))
+    return key
+}
+
+public function replay(context: fixtures.Context, queries: List<Text>, bodies: List<Bytes>, delays: List<Integer>): Replay {
+    let helper = fixtures.helper(context, "benchmarks/httpserver/replay.c", "replay", "")
+    let table = Bytes()
+    for shift in [24, 16, 8, 0] { table.add((queries.length >> shift) & 255) }
+    for index in 0..queries.length {
+        let query = Bytes(queries[index])
+        for shift in [24, 16, 8, 0] { table.add((query.length >> shift) & 255) }
+        table.addBytes(query)
+        for shift in [56, 48, 40, 32, 24, 16, 8, 0] { table.add((delays[index] >> shift) & 255) }
+        for shift in [24, 16, 8, 0] { table.add((bodies[index].length >> shift) & 255) }
+        table.addBytes(bodies[index])
+    }
+    let path = fixtures.logPath(context, "replay-table")
+    writeBytesFile(path, table)
+    let control = fixtures.logPath(context, "replay-control")
+    test.check(files.makeDirectory(control) == 0, "create replay control directory")
+    let process = fixtures.launch(context, [helper, "serve", path, control], 3600)
+    return Replay { context: context; process: process; port: fixtures.ready(context, process); control: control; helper: helper; seen: 1 }
+}
+public function calls(replay: Replay): List<Text> {
+    let lines = test.lines(Text(files.readFile(replay.process.log)))
+    let result: List<Text> = []
+    for index in replay.seen..lines.length { result.add(Text(Bytes(lines[index]).slice(5, lines[index].byteLength))) }
+    replay.seen = lines.length
+    return result
+}
+public function allCalls(replay: Replay): List<Text> {
+    let lines = test.lines(Text(files.readFile(replay.process.log)))
+    let result: List<Text> = []
+    for index in 1..lines.length { result.add(Text(Bytes(lines[index]).slice(5, lines[index].byteLength))) }
+    return result
+}
+public function hold(replay: Replay, query: Text) {
+    if files.pathSize(replay.control + "/release") >= 0 { test.check(files.remove(replay.control + "/release") == 0, "clear replay release") }
+    writeTextFile(replay.control + "/block", query)
+}
+public function release(replay: Replay) {
+    writeTextFile(replay.control + "/release", "")
+    if files.pathSize(replay.control + "/block") >= 0 { test.check(files.remove(replay.control + "/block") == 0, "clear replay block") }
+}
+public function closeReplay(replay: Replay) {
+    release(replay)
+    fixtures.stop(replay.process)
+}
+public function waitCall(replay: Replay, milliseconds: Integer): Boolean {
+    let deadline = system.monotonicNanoseconds() + milliseconds * 1000000
+    while system.monotonicNanoseconds() < deadline {
+        if calls(replay).length > 0 { return true }
+        fixtures.pause("0.005")
+    }
+    return false
+}
+
+public function front(context: fixtures.Context, binary: Text, upstream: Integer, entries: Integer, byteLimit: Integer): Front {
+    let command = [binary, "0", "127.0.0.1", Text(upstream), Text(entries), Text(byteLimit)]
+    let process = fixtures.launch(context, command, 3600)
+    let line = fixtures.firstLine(context, process, 10000)
+    let digits = line != ""
+    for byte in Bytes(line) { if byte < 48 || byte > 57 { digits = false } }
+    test.check(digits, "front startup failed: " + joinText(command) + " " + line + "\n" + Text(files.readFile(process.log + ".err")))
+    return Front { process: process; port: fixtures.number(line); command: command }
+}
+public function closeFront(front: Front, log: Text) {
+    test.check(system.poll(front.process.handle).state == system.PENDING, "front died")
+    let result = fixtures.stop(front.process)
+    if log != "" {
+        writeTextFile(log + ".stdout", result.output)
+        writeTextFile(log, result.errorOutput)
+    }
+    test.check(result.errorOutput == "", "front diagnostics: " + result.errorOutput)
+}
+public function fetch(port: Integer, path: Text, expected: Bytes, compare: Boolean, state: Text, deadline: Integer): Fetched {
+    let timeout = 6000
+    if deadline > 0 {
+        let remaining = (deadline - system.monotonicNanoseconds()) / 1000000
+        test.check(remaining > 0, "finite run deadline exceeded")
+        if remaining < timeout { timeout = remaining }
+    }
+    let started = system.monotonicNanoseconds()
+    let client = wire.open(port)
+    client.timeout = timeout
+    wire.send(client, Bytes("GET " + path + " HTTP/1.1\r\nHost: 127.0.0.1:" + Text(port) + "\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"))
+    let response = wire.response(client, false)
+    wire.close(client)
+    let latency = Float(system.monotonicNanoseconds() - started) / 1000.0
+    test.check(response.status == 200, path + " status " + Text(response.status))
+    test.check(fixtures.number(wire.field(response, "content-length")) == response.body.length, path + " content-length")
+    let cache = wire.field(response, "x-cache")
+    if !wire.has(response, "x-cache") { cache = "-" }
+    if state != "" { test.check(cache == state, path + " cache state " + cache + " expected " + state) }
+    if compare { test.check(wire.same(response.body, expected), "raw byte identity failed " + path) }
+    return Fetched { latency: latency; body: response.body; cache: cache }
+}
+public function stats(port: Integer): List<Integer> {
+    let fetched = fetch(port, "/stats", Bytes(), false, "none", 0)
+    let value = json.parseUnique(Text(fetched.body))
+    let names = ["hits", "misses", "entries", "bytes", "evictions", "upstream_connects"]
+    test.check(value.kind == json.OBJECT && value.keys.length == names.length, "stats shape " + Text(fetched.body))
+    let result: List<Integer> = []
+    for name in names {
+        let item = json.member(value, name)
+        test.check(item.kind == json.NUMBER, "stats field " + name)
+        result.add(Integer(item.number))
+    }
+    return result
+}
+public function statsText(values: List<Integer>): Text {
+    return "{\"hits\":" + Text(values[0]) + ",\"misses\":" + Text(values[1]) + ",\"entries\":" + Text(values[2]) + ",\"bytes\":" + Text(values[3]) + ",\"evictions\":" + Text(values[4]) + ",\"upstream_connects\":" + Text(values[5]) + "}"
+}
+function sameList(left: List<Integer>, right: List<Integer>): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+
+record Entry { key: Bytes; size: Integer }
+record Access { path: Text; body: Bytes }
+public function verifyLru(context: fixtures.Context, binary: Text, upstream: Integer, queries: List<Text>, bodies: List<Bytes>, output: Text) {
+    let paths: List<Text> = []
+    for index in 0..4 { paths.add(target(queries[index], "10")) }
+    let first = target(queries[0], "10")
+    let rawVariant = first + "&k=ignored"
+    if test.contains(first, "%20") { rawVariant = test.replace(first, "%20", "+") }
+    let largest = 0
+    for index in 0..4 {
+        let size = bodies[index].length + rawKey(paths[index]).length
+        if size > largest { largest = size }
+    }
+    let limits = [268435456, largest * 2, 1]
+    let sequences = [[0, 1, 2, 0, 3, 0, 2, 3, 1, 0], [0, 1, 0, 2, 3, 0], [0, 0]]
+    for round in 0..3 {
+        let byteLimit = limits[round]
+        let model: List<Entry> = []
+        let hits = 0
+        let misses = 0
+        let evictions = 0
+        let used = 0
+        let served = front(context, binary, upstream, 3, byteLimit)
+        let accesses: List<Access> = []
+        for index in sequences[round] { accesses.add(Access { path: paths[index]; body: bodies[index] }) }
+        if round == 0 {
+            accesses.add(Access { path: rawVariant; body: bodies[0] })
+            accesses.add(Access { path: paths[0] + "&q=ignored"; body: bodies[0] })
+            accesses.add(Access { path: target(queries[0], "11"); body: bodies[0] })
+        }
+        for access in accesses {
+            let key = rawKey(access.path)
+            let position = -1
+            for index in 0..model.length { if wire.same(model[index].key, key) { position = index } }
+            let state = "miss"
+            if position >= 0 { state = "hit" }
+            fetch(served.port, access.path, access.body, true, state, 0)
+            if position >= 0 {
+                hits += 1
+                let entry = model[position]
+                let reordered: List<Entry> = []
+                for index in 0..model.length { if index != position { reordered.add(model[index]) } }
+                reordered.add(entry)
+                model = reordered
+            } else {
+                misses += 1
+                let size = key.length + access.body.length
+                if size <= byteLimit {
+                    while model.length >= 3 || used + size > byteLimit {
+                        used -= model[0].size
+                        evictions += 1
+                        let remaining: List<Entry> = []
+                        for index in 1..model.length { remaining.add(model[index]) }
+                        model = remaining
+                    }
+                    model.add(Entry { key: key; size: size })
+                    used += size
+                }
+            }
+            let observed = stats(served.port)
+            let expected = [hits, misses, model.length, used, evictions, misses]
+            test.check(sameList(observed, expected), "LRU case " + Text(round) + " " + access.path + " observed " + statsText(observed) + " expected " + statsText(expected))
+        }
+        closeFront(served, output + "/lru-" + Text(round) + ".log")
+    }
+}
+public record Batch { process: fixtures.Process; directory: Text; count: Integer; settled: Boolean; result: test.Result }
+public function startBatch(context: fixtures.Context, replay: Replay, port: Integer, paths: List<Text>, timeout: Integer, budget: Integer): Batch {
+    let directory = fixtures.logPath(context, "batch")
+    test.check(files.makeDirectory(directory) == 0, "create fetch batch directory")
+    let list: List<Text> = []
+    for path in paths { list.add(path + "\n") }
+    writeTextFile(directory + "/paths", list)
+    let process = fixtures.launch(context, [replay.helper, "fetch", Text(port), directory + "/paths", directory, Text(timeout), Text(budget)], 3600)
+    return Batch { process: process; directory: directory; count: paths.length; settled: false; result: test.Result { status: 0; output: ""; errorOutput: "" } }
+}
+public function batchRunning(batch: Batch): Boolean { return system.poll(batch.process.handle).state == system.PENDING }
+public function batchPending(batch: Batch): Boolean { return batchRunning(batch) && files.readFile(batch.process.log).length == 0 }
+public function settleBatch(batch: Batch, milliseconds: Integer): Boolean {
+    let deadline = system.monotonicNanoseconds() + milliseconds * 1000000
+    while true {
+        let state = system.poll(batch.process.handle)
+        if state.state != system.PENDING {
+            test.check(state.error == 0 && (state.state == system.EXITED || state.state == system.SIGNALED), "process wait failed")
+            let code = state.exitCode
+            if state.state == system.SIGNALED { code = 128 + state.signal }
+            batch.result = test.Result { status: code; output: Text(files.readFile(batch.process.log)); errorOutput: Text(files.readFile(batch.process.log + ".err")) }
+            batch.settled = true
+            return true
+        }
+        if system.monotonicNanoseconds() >= deadline { return false }
+        fixtures.pause("0.01")
+    }
+    return false
+}
+public function finishBatch(batch: Batch, bodies: List<Bytes>, state: Text): List<Fetched> {
+    let result = batch.result
+    if !batch.settled { result = fixtures.collect(batch.process) }
+    test.check(result.status == 0, "fetch batch failed (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+    let lines = test.lines(result.output)
+    test.check(lines.length == batch.count + 1 && lines[batch.count] == "DONE", "fetch batch incomplete\n" + result.output)
+    let rows: List<Fetched> = []
+    for index in 0..batch.count {
+        let fields = fixtures.split(lines[index], 32)
+        test.check(fields.length == 6 && fields[1] == "200", "fetch batch status " + lines[index])
+        let body = readBytesFile(batch.directory + "/" + Text(index) + ".body")
+        test.check(fields[3] == Text(body.length), "fetch batch content-length " + lines[index])
+        test.check(fields[5] == state, "fetch batch cache state " + lines[index])
+        test.check(wire.same(body, bodies[index]), "raw byte identity failed in fetch batch " + Text(index))
+        rows.add(Fetched { latency: Float(fixtures.number(fields[2])); body: body; cache: fields[5] })
+    }
+    return rows
+}
+public function verifyHol(context: fixtures.Context, binary: Text, replay: Replay, queries: List<Text>, bodies: List<Bytes>, output: Text) {
+    let served = front(context, binary, replay.port, 100000, 268435456)
+    fetch(served.port, target(queries[0], "10"), bodies[0], true, "miss", 0)
+    calls(replay)
+    hold(replay, queries[1])
+    let worker = startBatch(context, replay, served.port, [target(queries[1], "10")], 6000, 0)
+    test.check(waitCall(replay, 2000), "upstream miss never started")
+    test.check(batchPending(worker), "miss finished before HoL control")
+    fetch(served.port, target(queries[0], "10"), bodies[0], true, "hit", 0)
+    test.check(batchPending(worker), "cached hit waited for held upstream miss")
+    release(replay)
+    test.check(settleBatch(worker, 6000), "HoL miss worker did not finish")
+    finishBatch(worker, [bodies[1]], "miss")
+    let observed = stats(served.port)
+    test.check(observed[0] == 1 && observed[1] == 2, "HoL stats " + statsText(observed))
+    closeFront(served, output + "/hol-control.log")
+}
+
+function percentile(samples: List<Float>, p: Integer): Float {
+    let sorted = samples.sorted()
+    let rank = (samples.length * p + 99) / 100 - 1
+    if rank < 0 { rank = 0 }
+    return sorted[rank]
+}
+function median(values: List<Float>): Float {
+    let sorted = values.sorted()
+    if sorted.length % 2 == 1 { return sorted[sorted.length / 2] }
+    return (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2.0
+}
+public function gate(minyar: List<Round>, axum: List<Round>): Gate {
+    let names = cohorts()
+    let failed = Gate { cells: []; passed: false; error: "" }
+    if minyar.length != 3 || axum.length != 3 { failed.error = "acceptance requires exactly three paired rounds"; return failed }
+    for rounds in [minyar, axum] {
+        for run in rounds {
+            if run.latencies.length != names.length { failed.error = "cohort set changed"; return failed }
+            for cohort in 0..names.length {
+                let expected = 548
+                if names[cohort] == "hol_miss" { expected = 547 }
+                if run.latencies[cohort].length != expected || run.statuses[cohort].length != expected { failed.error = "missing samples in " + names[cohort]; return failed }
+                for index in 0..expected {
+                    let latency = run.latencies[cohort][index]
+                    if run.statuses[cohort][index] != 200 || !(latency > 0.0) || latency != latency || latency > 1.0e300 { failed.error = "invalid sample in " + names[cohort]; return failed }
+                }
+            }
+        }
+    }
+    let cells: List<Cell> = []
+    let passed = true
+    for cohort in 0..names.length {
+        for p in [50, 99] {
+            let measured: List<Float> = []
+            for rounds in [minyar, axum] {
+                let values: List<Float> = []
+                for run in rounds { values.add(percentile(run.latencies[cohort], p)) }
+                measured.add(median(values))
+            }
+            let ratio = measured[0] / measured[1]
+            let cell = Cell { cohort: names[cohort]; percentile: p; minyar: measured[0]; axum: measured[1]; ratio: ratio; passed: ratio <= threshold() }
+            if !cell.passed { passed = false }
+            cells.add(cell)
+        }
+    }
+    return Gate { cells: cells; passed: passed; error: "" }
+}
+function dataset(latency: Float): List<Round> {
+    let result: List<Round> = []
+    for round in 0..3 {
+        let latencies: List<List<Float>> = []
+        let statuses: List<List<Integer>> = []
+        for name in cohorts() {
+            let count = 548
+            if name == "hol_miss" { count = 547 }
+            let values: List<Float> = []
+            let codes: List<Integer> = []
+            for index in 0..count { values.add(latency); codes.add(200) }
+            latencies.add(values)
+            statuses.add(codes)
+        }
+        result.add(Round { latencies: latencies; statuses: statuses })
+    }
+    return result
+}
+public function controls() {
+    let accepted = gate(dataset(150.0), dataset(100.0))
+    test.check(accepted.error == "" && accepted.passed, "1.5x gate rejected the boundary")
+    let regressed = gate(dataset(150.001), dataset(100.0))
+    test.check(regressed.error == "" && !regressed.passed, "1.5x gate accepted a regression")
+    let tail = dataset(100.0)
+    for run in tail {
+        for values in run.latencies { for index in (values.length - 6)..values.length { values[index] = 200.0 } }
+    }
+    let tailed = gate(tail, dataset(100.0))
+    test.check(tailed.error == "" && !tailed.passed, "tail regression accepted")
+    for cell in tailed.cells { test.check(cell.passed == (cell.percentile == 50), "tail regression cell " + cell.cohort + " p" + Text(cell.percentile)) }
+    let missing = dataset(100.0)
+    let shortened: List<Float> = []
+    let hit = missing[0].latencies[1]
+    for index in 0..(hit.length - 1) { shortened.add(hit[index]) }
+    missing[0].latencies[1] = shortened
+    test.check(gate(missing, dataset(100.0)).error != "", "gate accepted missing samples")
+}

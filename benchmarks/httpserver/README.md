@@ -52,7 +52,7 @@ CARGO_HOME="$PWD/build/cargo-home" CARGO_TARGET_DIR="$PWD/build/axum-target" car
 
 `make check-httpserver-front` is mandatory in check/check-portable. It compiles
 the actual API fixture, checks its Minyar LRU directly, compares wire accounting
-against an independent Python OrderedDict, and causally proves a cache hit can
+against an independent LRU model, and causally proves a cache hit can
 finish while an upstream miss is deliberately held. It requires no Rust build
 or external input/download and is suitable for Linux/macOS/Windows qualification.
 
@@ -60,7 +60,8 @@ The full **acceptance** harness requires a quiet, dedicated admitted benchmark
 host. No other child builds/test jobs may overlap performance timing:
 
 ```
-python3 benchmarks/httpserver/compare.py \
+make build/tooling/benchmarks/httpserver/compare
+./build/tooling/benchmarks/httpserver/compare \
   --minyar build/httpserver-front \
   --axum build/axum-target/release/minyar-httpserver-axum-front \
   --queries benchmarks/httpserver/inputs/queries.tsv \
