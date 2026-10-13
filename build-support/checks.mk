@@ -47,9 +47,13 @@ check-launcher-isolation: build/minyarc build/minyarc-errors-request build/minya
 check-release-build: build/minyarc build/minyar-runtime.o build/minyar-runtime-release.ll
 	$(LIMITED) python3 tests/release-build.py
 
+build/tooling/experiments/memory/critical-path-study: private TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/experiments/memory/critical-path-study: build/testing/cycle-runtime.o
 check-critical-path: build/minyarc build/tooling/experiments/memory/critical-path-study
 	$(LIMITED) ./build/tooling/experiments/memory/critical-path-study
 
+build/tooling/tests/regressions: private TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/regressions: build/testing/cycle-runtime.o
 check-regressions: build/minyarc build/minyar-runtime.o build/tooling/tests/regressions
 	$(LIMITED) ./build/tooling/tests/regressions
 
@@ -135,6 +139,8 @@ check-performance: build/minyarc build/minyar-runtime.o build/compiler-stage3.ll
 check-scaling: build/minyarc
 	$(LIMITED) python3 tests/scaling.py
 
+build/tooling/tests/self-compile-budget: private TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/self-compile-budget: build/testing/cycle-runtime.o
 # Run absolute self-compilation checks without background scheduling.
 check-budget: build/minyarc build/compiler-stage3.ll build/tooling/tests/self-compile-budget
 	./build/tooling/tests/self-compile-budget
@@ -507,6 +513,8 @@ check-measurement-stats: build/tooling/tests/measurement-stats
 check-portable check: check-measurement-stats
 
 .PHONY: check-budget-harness
+build/tooling/tests/self-compile-budget-harness: private TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/self-compile-budget-harness: build/testing/cycle-runtime.o
 check-budget-harness: build/tooling/tests/self-compile-budget-harness
 	./build/tooling/tests/self-compile-budget-harness
 
