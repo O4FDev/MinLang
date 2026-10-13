@@ -200,8 +200,23 @@ int main(void) {
                                  *link_flags, '-o', str(binary)], capture_output=True, text=True, timeout=30)
         if result.returncode:
             raise ValueError(f'{name} matched static provider ABI probe failed:\n' + result.stderr)
-        if subprocess.run([str(binary)], capture_output=True, timeout=30).returncode:
-            raise ValueError(f'{name} header/static archive version mismatch')
+        runtime_result = subprocess.run([str(binary)], capture_output=True, timeout=30)
+        if runtime_result.returncode:
+            retained = Path(tempfile.mkdtemp(prefix='minyar-codec-provider-failed-')).resolve()
+            shutil.copy2(source, retained / 'probe.c')
+            shutil.copy2(binary, retained / binary.name)
+            (retained / 'stdout').write_bytes(runtime_result.stdout)
+            (retained / 'stderr').write_bytes(runtime_result.stderr)
+            import json
+            (retained / 'result.json').write_text(json.dumps({
+                'command': [str(binary)], 'returncode': runtime_result.returncode,
+                'compile_command': [clang, *compile_flags, *cflags, str(source), *libraries,
+                                    *link_flags, '-o', str(binary)]}, indent=2) + '\n')
+            output = runtime_result.stdout.decode(errors='replace')
+            error = runtime_result.stderr.decode(errors='replace')
+            raise ValueError(f'{name} provider runtime verification failed (exit {runtime_result.returncode}); '
+                             f'header/static archive version equality not established; retained {retained}\n'
+                             + output + error)
     return cflags, libraries
 
 
