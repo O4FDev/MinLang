@@ -1,0 +1,138 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+
+let message = "Minyar stopped: the program exceeded the maximum call depth.\n"
+let compiler = test.setting("MINYAR_TEST_COMPILER", "./build/minyarc")
+let runtime = test.setting("MINYAR_TEST_RUNTIME", "build/minyar-runtime.o")
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let flags = test.words(system.getenv("MINYAR_TEST_LINK_FLAGS"))
+let work = test.scratch()
+
+function repeated(piece: Text, count: Integer): Text {
+    let parts: List<Text> = []
+    for index in 0..count { parts.add(piece) }
+    return joinText(parts)
+}
+function run(command: List<Text>, log: Text, seconds: Integer): test.Result {
+    return test.run(command, system.environment(), "", log, seconds)
+}
+function prepare(llvm: Text, flags: List<Text>) {
+    if test.addressEnabled(flags) { writeTextFile(llvm, test.instrument(readTextFile(llvm))) }
+}
+function link(clang: Text, flags: List<Text>, llvm: Text, runtime: Text, executable: Text, seconds: Integer) {
+    let command = [clang, "-O0"]
+    for flag in flags { command.add(flag) }
+    for item in ["-Wno-override-module", llvm, runtime, "-o", executable, "-lm"] { command.add(item) }
+    let linked = run(command, executable + ".link", seconds)
+    test.check(linked.status == 0, linked.errorOutput)
+}
+function starts(value: Text, prefix: Text): Boolean {
+    let raw = Bytes(value)
+    let bytes = Bytes(prefix)
+    return raw.length >= bytes.length && Text(raw.slice(0, bytes.length)) == prefix
+}
+function named(line: Text, name: Text): Boolean {
+    if !starts(line, "define ") { return false }
+    let raw = Bytes(line)
+    let marker = Bytes("@.minyar.fn.")
+    for index in 0..(raw.length - marker.length + 1) {
+        if Text(raw.slice(index, index + marker.length)) == "@.minyar.fn." {
+            let rest = Text(raw.slice(index + marker.length, raw.length))
+            if starts(rest, name + "(") { return true }
+            if starts(rest, "minyar_module_") {
+                let tail = Bytes(rest)
+                let position = 14
+                while position < tail.length && tail[position] >= 48 && tail[position] <= 57 { position += 1 }
+                if position > 14 && position < tail.length && tail[position] == 95 && starts(Text(tail.slice(position + 1, tail.length)), name + "(") { return true }
+            }
+            return false
+        }
+    }
+    return false
+}
+function body(ir: Text, name: Text): Text {
+    let parts: List<Text> = []
+    let inside = false
+    for line in test.lines(ir) {
+        if !inside && named(line, name) { inside = true }
+        if inside {
+            parts.add(line + "\n")
+            if line == "}" { return joinText(parts) }
+        }
+    }
+    fail("missing generated function " + name)
+}
+function calls(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let count = 0
+    let index = 0
+    while index + pattern.length <= raw.length {
+        if Text(raw.slice(index, index + pattern.length)) == needle { count += 1; index += pattern.length } else { index += 1 }
+    }
+    return count
+}
+
+writeTextFile(work + "/nested.min", "print(" + repeated("(", 10000) + "1" + repeated(")", 10000) + ")\n")
+let nested = run([compiler, work + "/nested.min", work + "/nested.ll"], work + "/nested", 20)
+test.check(nested.status == 0 || nested.status == 1, "nested compiler status " + Text(nested.status) + "\n" + nested.errorOutput)
+if nested.status == 1 { test.check(nested.errorOutput == message, nested.errorOutput) }
+else { test.check(nested.errorOutput == "", nested.errorOutput) }
+
+writeTextFile(work + "/exhausting.min", "print(" + repeated("(", 100000) + "1" + repeated(")", 100000) + ")\n")
+let exhausted = run([compiler, work + "/exhausting.min", work + "/exhausting.ll"], work + "/exhausting", 20)
+test.check(exhausted.status == 1, "exhausting compiler input returned " + Text(exhausted.status) + ": " + exhausted.errorOutput)
+test.check(exhausted.errorOutput == message, exhausted.errorOutput)
+
+writeTextFile(work + "/unary.min", "print(" + repeated("-", 100000) + "1)\n")
+let unary = run([compiler, work + "/unary.min", work + "/unary.ll"], work + "/unary", 20)
+test.check(unary.status == 0 || unary.status == 1, "unary compiler status " + Text(unary.status) + "\n" + unary.errorOutput)
+test.check(unary.output == "", unary.output)
+if unary.status == 1 {
+    test.check(unary.errorOutput == message, unary.errorOutput)
+    test.check(files.pathSize(work + "/unary.ll") < 0, "unary overflow left LLVM output")
+} else {
+    test.check(unary.errorOutput == "", unary.errorOutput)
+    prepare(work + "/unary.ll", flags)
+    link(clang, flags, work + "/unary.ll", runtime, work + "/unary", 60)
+    let result = run([work + "/unary"], work + "/unary-run", 20)
+    test.check(result.status == 0 && result.output == "1\n" && result.errorOutput == "", "unary program result\n" + result.output + result.errorOutput)
+}
+
+let safe = 5000
+writeTextFile(work + "/recursive.min", "function descend(depth: Integer): Integer {\n    if depth == 0 { return 0 }\n    return 1 + descend(depth - 1)\n}\nprint(descend(" + Text(safe) + "))\nprint(descend(100000000))\n")
+let compiled = run([compiler, work + "/recursive.min", work + "/recursive.ll"], work + "/recursive", 20)
+test.check(compiled.status == 0, compiled.errorOutput)
+prepare(work + "/recursive.ll", flags)
+link(clang, flags, work + "/recursive.ll", runtime, work + "/recursive", 20)
+let program = run([work + "/recursive"], work + "/recursive-run", 20)
+test.check(program.status == 1, "deep program returned " + Text(program.status) + ": " + program.errorOutput)
+test.check(program.output == Text(safe) + "\n", program.output)
+test.check(program.errorOutput == message, program.errorOutput)
+
+writeTextFile(work + "/helpers.min", "public function twice(value: Integer): Integer { return value * 2 }\n")
+let terms: List<Text> = []
+for index in 0..600 {
+    if index > 0 { terms.add(" + ") }
+    terms.add("value * 3")
+}
+writeTextFile(work + "/leaves.min", "use \"./helpers.min\" as helpers\nfunction leaf(value: Integer): Integer {\n    let text = \"value \" + Text(value) + \" \" + Text(value * 3)\n    return text.length\n}\nfunction caller(value: Integer): Integer { return helpers.twice(value) }\nfunction middle(value: Integer): Integer { return caller(value) + leaf(value) }\nfunction top(value: Integer): Integer { return middle(value) + 1 }\nfunction ping(value: Integer): Integer {\n    if value == 0 { return 0 }\n    return pong(value - 1)\n}\nfunction pong(value: Integer): Integer { return ping(value) }\nfunction callsLarge(value: Integer): Integer { return large(value) + 1 }\nfunction large(value: Integer): Integer { return " + joinText(terms) + " }\nfunction descend(depth: Integer): Integer {\n    if depth == 0 { return leaf(7) }\n    return leaf(depth) - leaf(depth) + descend(depth - 1)\n}\nprint(descend(" + Text(safe) + ") + caller(1) + large(0) + top(0) * 0 + ping(3) + callsLarge(0) - 1)\nprint(descend(100000000))\n")
+let leaves = run([compiler, work + "/leaves.min", work + "/leaves.ll"], work + "/leaves", 20)
+test.check(leaves.status == 0, leaves.errorOutput)
+let ir = readTextFile(work + "/leaves.ll")
+for name in ["leaf", "caller", "middle"] {
+    let found = body(ir, name)
+    test.check(!test.contains(found, "@minyar_stack_enter") && !test.contains(found, "@minyar_stack_leave"), found)
+}
+test.check(calls(body(ir, "descend"), "call void @minyar_stack_enter()") == 1, body(ir, "descend"))
+for name in ["top", "ping", "pong", "callsLarge"] {
+    test.check(calls(body(ir, name), "call void @minyar_stack_enter()") == 1, body(ir, name))
+}
+test.check(calls(body(ir, "large"), "call void @minyar_stack_enter()") == 1, "a large leaf keeps its check")
+prepare(work + "/leaves.ll", flags)
+link(clang, flags, work + "/leaves.ll", runtime, work + "/leaves", 20)
+let result = run([work + "/leaves"], work + "/leaves-run", 20)
+test.check(result.status == 1 && result.output == "12\n" && result.errorOutput == message, "leaf program result\n" + Text(result.status) + "\n" + result.output + result.errorOutput)
+test.removeTree(work)
+print("compiler and generated-program stack overflows stop cleanly")

@@ -1,0 +1,84 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+use "json" as json
+
+let control = "define ptr @escaped() noinline {\nentry:\n  %slot = alloca i64, align 8\n  store volatile i64 7, ptr %slot\n  ret ptr %slot\n}\ndefine i32 @main() {\nentry:\n  %p = call ptr @escaped()\n  %read = load volatile i64, ptr %p\n  ret i32 0\n}\n"
+let valid = "define i32 @main() {\nentry:\n  %slot = alloca i64, align 8\n  store volatile i64 7, ptr %slot\n  %read = load volatile i64, ptr %slot\n  ret i32 0\n}\n"
+let clang = "clang"
+let output = ""
+let index = 0
+while index < argumentCount() {
+    test.check(index + 1 < argumentCount(), "option needs a value: " + argument(index))
+    if argument(index) == "--clang" { clang = argument(index + 1) }
+    else if argument(index) == "--output-dir" { output = argument(index + 1) }
+    else { fail("unknown option: " + argument(index)) }
+    index += 2
+}
+let logs = test.scratch()
+let parent = test.setting("TMPDIR", "/tmp")
+if output != "" {
+    test.require(test.run(["mkdir", "-p", "--", output], system.environment(), "", logs + "/mkdir", 10), "create output directory")
+    parent = output
+}
+let created = test.run(["mktemp", "-d", parent + "/minyar-generated-asan-XXXXXXXX"], system.environment(), "", logs + "/mktemp", 10)
+test.require(created, "create evidence directory")
+test.removeScratch(logs)
+let evidence = test.lines(created.output)[0]
+print(evidence)
+let environment: List<Text> = []
+for item in system.environment() {
+    let raw = Bytes(item)
+    if raw.length < 13 || Text(raw.slice(0, 13)) != "ASAN_OPTIONS=" { environment.add(item) }
+}
+environment.add("ASAN_OPTIONS=detect_stack_use_after_return=1:detect_leaks=0:abort_on_error=1")
+let checks: List<Text> = []
+function report(evidence: Text, status: Text, checks: List<Text>) {
+    let parts: List<Text> = ["{\n  \"status\": ", json.quote(status), ",\n  \"checks\": ["]
+    for index in 0..checks.length {
+        if index > 0 { parts.add(",") }
+        parts.add("\n    " + checks[index])
+    }
+    if checks.length > 0 { parts.add("\n  ") }
+    parts.add("]\n}\n")
+    writeTextFile(evidence + "/results.json", joinText(parts))
+}
+report(evidence, "running", checks)
+test.check(!test.addressEnabled([]), "empty flags enabled address sanitizer")
+test.check(test.addressEnabled(["-fsanitize=address,undefined"]), "address sanitizer flag was not detected")
+test.check(!test.addressEnabled(["-fsanitize=address", "-fno-sanitize=all"]), "disabled address sanitizer was detected")
+test.check(test.instrument(test.instrument(valid)) == test.instrument(valid), "sanitizer annotation is not idempotent")
+writeTextFile(evidence + "/changed-header.ll", "define i32 @main(\n) {\n ret i32 0\n}\n")
+let refused = test.run(["./build/tooling/tools/sanitize-llvm", evidence + "/changed-header.ll", evidence + "/changed-header.asan.ll"], system.environment(), "", evidence + "/changed-header.log", 30)
+test.check(refused.status != 0 && refused.status != 124 && files.pathSize(evidence + "/changed-header.asan.ll") < 0, "changed header layout silently lost sanitizer coverage")
+let names = ["unmarked", "marked", "marked-named", "valid"]
+let sources = [control, test.instrument(control), test.instrument(test.replace(control, "@escaped", "@sanitize_address")), test.instrument(valid)]
+for position in 0..names.length {
+    let name = names[position]
+    let ir = evidence + "/" + name + ".ll"
+    writeTextFile(ir, sources[position])
+    for optimization in ["-O0", "-O2"] {
+        let binary = evidence + "/" + name + optimization
+        let command = [clang, optimization, "-fsanitize=address", "-Wno-override-module", ir, "-o", binary, "-lm"]
+        let built = test.run(command, system.environment(), "", binary + "-compile.out", 60)
+        writeTextFile(binary + "-compile.log", built.output + built.errorOutput)
+        test.check(built.status == 0, built.errorOutput)
+        let checked = test.run([binary], environment, "", binary + ".out", 30)
+        writeTextFile(binary + ".log", checked.output + checked.errorOutput)
+        let quoted: List<Text> = []
+        for item in command { quoted.add(json.quote(item)) }
+        let joined: List<Text> = []
+        for item in 0..quoted.length {
+            if item > 0 { joined.add(", ") }
+            joined.add(quoted[item])
+        }
+        checks.add("{\"name\": " + json.quote(name) + ", \"optimization\": " + json.quote(optimization) + ", \"command\": [" + joinText(joined) + "], \"returncode\": " + Text(checked.status) + "}")
+        report(evidence, "running", checks)
+        if name == "marked" || name == "marked-named" {
+            test.check(checked.status != 0 && test.contains(checked.errorOutput, "stack-use-after-return"), checked.errorOutput)
+        } else {
+            test.check(checked.status == 0, checked.errorOutput)
+        }
+    }
+}
+report(evidence, "passed", checks)

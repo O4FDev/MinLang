@@ -111,13 +111,13 @@ check-coverage: check-coverage-harness check-coverage-inlining build/minyarc bui
 	MINYAR_MIN_RUNTIME_BRANCH_COVERAGE=$(MIN_RUNTIME_BRANCH_COVERAGE) \
 	python3 scripts/coverage.py
 
-check-stack-overflow: build/minyarc build/minyar-runtime.o
-	$(LIMITED) python3 tests/stack-overflow.py
+check-stack-overflow: build/minyarc build/minyar-runtime.o build/tooling/tests/stack-overflow
+	$(LIMITED) ./build/tooling/tests/stack-overflow
 
 .PHONY: check-stack-overflow-sanitize
-check-stack-overflow-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o runtime/minyar_runtime.c $(RUNTIME_HEADERS)
-	$(SANITIZER_LIMITED) python3 tests/stack-guard-sanitizer.py --clang "$(LLVM_CC)"
-	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/stack-overflow.py
+check-stack-overflow-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o runtime/minyar_runtime.c $(RUNTIME_HEADERS) build/tooling/tests/stack-guard-sanitizer build/tooling/tests/stack-overflow
+	$(SANITIZER_LIMITED) ./build/tooling/tests/stack-guard-sanitizer --clang "$(LLVM_CC)"
+	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/stack-overflow
 
 # Cross-platform per-commit gate. Heavier memory-profile and performance
 # matrices remain in the Linux evidence runner and the full `make check` gate.
@@ -157,8 +157,8 @@ build/minyarc-budget-previous: build/compiler-budget-previous.ll build/minyar-co
 	"$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
 .PHONY: check-sanitized-fixed-point check-generated-sanitizer
-check-generated-sanitizer:
-	$(SANITIZER_LIMITED) python3 tests/generated-stack-sanitizer.py --clang "$(LLVM_CC)"
+check-generated-sanitizer: build/tooling/tests/generated-stack-sanitizer build/tooling/tools/sanitize-llvm
+	$(SANITIZER_LIMITED) ./build/tooling/tests/generated-stack-sanitizer --clang "$(LLVM_CC)"
 
 .PHONY: check-binary-expressions
 check-binary-expressions: build/minyarc build/minyarc-sanitize build/minyar-runtime.o build/ownership-runtime.o build/tooling/tests/binary-expression-ownership
@@ -328,8 +328,11 @@ check-fused-unary: build/tooling/tests/fused-unary-regressions build/tooling/tes
 	$(SANITIZER_LIMITED) ./build/tooling/tests/fused-unary-regressions --clang "$(LLVM_CC)"
 	$(SANITIZER_LIMITED) ./build/tooling/tests/fused-work-regressions --clang "$(LLVM_CC)"
 
-check-unary-pairs: check-fused-unary
-	$(SANITIZER_LIMITED) python3 tests/unary-pair-regressions.py --clang "$(LLVM_CC)"
+build/tooling/tests/unary-pair-regressions: TOOL_NATIVE = runtime/native/sha256.c
+build/tooling/tests/unary-pair-regressions: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/unary-pair-regressions: runtime/native/sha256.c
+check-unary-pairs: check-fused-unary build/tooling/tests/unary-pair-regressions
+	$(SANITIZER_LIMITED) ./build/tooling/tests/unary-pair-regressions --clang "$(LLVM_CC)"
 
 check-memory-profiles: build/minyar-runtime-system.o check-unary-pairs check-text-view-budget build/tooling/tests/system-configurations build/tooling/tests/lazy-configurations build/tooling/tests/memory-profile-regressions
 	$(SANITIZER_LIMITED) ./build/tooling/tests/memory-profile-regressions --runtime-source runtime/minyar_runtime.c --suite focused --clang "$(LLVM_CC)"

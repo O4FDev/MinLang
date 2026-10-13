@@ -1,0 +1,44 @@
+use "../tools/testing.min" as test
+use "system" as system
+
+let message = "Minyar stopped: the program exceeded the maximum call depth.\n"
+let harness = "\nvoid minyar_stack_enter(void);\nvoid minyar_stack_leave(void);\n\nstatic volatile unsigned long long observed;\n\n__attribute__((noinline)) static void descend(unsigned long long depth) {\n    volatile unsigned long long local = depth;\n    observed += local;\n    minyar_stack_enter();\n    if (depth != ~0ULL) descend(depth + 1);\n    minyar_stack_leave();\n    observed += local;\n}\n\nint main(void) {\n    descend(0);\n    return observed == 0;\n}\n"
+let clang = "clang"
+let index = 0
+while index < argumentCount() {
+    test.check(argument(index) == "--clang" && index + 1 < argumentCount(), "usage: stack-guard-sanitizer [--clang CLANG]")
+    clang = argument(index + 1)
+    index += 2
+}
+let work = test.scratch()
+writeTextFile(work + "/harness.c", harness)
+let environment: List<Text> = []
+for item in system.environment() {
+    let raw = Bytes(item)
+    let asan = raw.length >= 13 && Text(raw.slice(0, 13)) == "ASAN_OPTIONS="
+    let ubsan = raw.length >= 14 && Text(raw.slice(0, 14)) == "UBSAN_OPTIONS="
+    if !asan && !ubsan { environment.add(item) }
+}
+environment.add("ASAN_OPTIONS=detect_stack_use_after_return=1:detect_leaks=0:abort_on_error=1")
+environment.add("UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1")
+let linux = test.run(["uname", "-s"], system.environment(), "", work + "/uname", 10)
+test.require(linux, "host system")
+let lld = test.run(["sh", "-c", "command -v ld.lld"], system.environment(), "", work + "/lld", 10)
+let lto = ["-O2", "-flto"]
+if test.lines(linux.output)[0] == "Linux" && lld.status == 0 { lto.add("-fuse-ld=lld") }
+let names = ["ordinary", "lto"]
+let optimizations = [["-O1"], lto]
+for position in 0..names.length {
+    let executable = work + "/stack-guard-" + names[position]
+    let command = [clang, "-std=c11"]
+    for flag in optimizations[position] { command.add(flag) }
+    for item in ["-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-DMINYAR_SYSTEM_HEAP=1", work + "/harness.c", "runtime/minyar_runtime.c", "-o", executable, "-lm"] { command.add(item) }
+    let built = test.run(command, system.environment(), "", executable + ".build", 60)
+    test.check(built.status == 0, names[position] + "\n" + built.errorOutput)
+    let checked = test.run([executable], environment, "", executable + ".run", 30)
+    test.check(checked.status == 1, names[position] + "\n" + checked.errorOutput)
+    test.check(checked.output == "", names[position] + "\n" + checked.output)
+    test.check(checked.errorOutput == message, names[position] + "\n" + checked.errorOutput)
+}
+test.removeTree(work)
+print("ASan fake-stack mode preserves the native stack guard with and without LTO")
