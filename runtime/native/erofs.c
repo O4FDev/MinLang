@@ -45,6 +45,7 @@ typedef struct {
     uint64_t maximum, position;
     int compression;
     int level;
+    size_t lz4_hint;
     ZSTD_CCtx *codec;
 } EWriter;
 
@@ -282,7 +283,7 @@ static int e_compress(EWriter *w, EInode *i) {
     if (!error && w->compression == 1 && (ZSTD_isError(ZSTD_CCtx_setParameter(w->codec, ZSTD_c_compressionLevel, w->level)) || ZSTD_isError(ZSTD_CCtx_setParameter(w->codec, ZSTD_c_windowLog, 19)))) error = EINVAL;
     if (!error) { e16(map + 4, 7); map[6] = w->compression == 1 ? 3 : 0; }
     uint64_t at = 0, first_block = w->position / 4096;
-    size_t buffered = 0, hint = 1048576;
+    size_t buffered = 0, hint = w->compression == 2 && w->lz4_hint ? w->lz4_hint : 1048576;
     while (!error && at < i->size) {
         size_t size = i->size - at > hint ? hint : (size_t)(i->size - at);
         while (buffered < size) {
@@ -328,6 +329,7 @@ static int e_compress(EWriter *w, EInode *i) {
             if (hint < 4096) hint = 4096;
         }
         if (w->compression == 1) hint = 1048576;
+        else if (at + size < i->size) w->lz4_hint = hint;
         unsigned clusters = (unsigned)e_align(size, 4096) / 4096;
         unsigned blocks = packed > 0 ? (unsigned)e_align((unsigned)packed, 4096) / 4096 : clusters;
         int compressed = blocks < clusters;
