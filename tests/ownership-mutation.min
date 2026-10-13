@@ -1,0 +1,69 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+function parent(path: Text): Text {
+    let raw = Bytes(path)
+    let ending = -1
+    for index in 0..raw.length { if raw[index] == 47 { ending = index } }
+    if ending < 0 { return "." }
+    if ending == 0 { return "/" }
+    return Text(raw.slice(0, ending))
+}
+function count(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let found = 0
+    if raw.length < pattern.length { return 0 }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { found += 1 }
+    }
+    return found
+}
+record Mutation { name: Text; file: Text; before: Text; after: Text }
+let work = test.scratch()
+test.check(system.setResourceLimit(system.CORE_SIZE, 0, 0) == 0, "disable ownership mutation core files")
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let source = test.setting("MINYAR_OWNERSHIP_RUNTIME_SOURCE", "runtime/minyar_runtime.c")
+let runtime = parent(source)
+let names = ["minyar_runtime.c"]
+let headers = files.list(runtime)
+test.check(files.lastError() == 0, "list selected ownership runtime headers")
+for name in headers {
+    let raw = Bytes(name)
+    if raw.length >= 2 && raw[raw.length - 2] == 46 && raw[raw.length - 1] == 104 { names.add(name) }
+}
+test.check(files.makeDirectory(work + "/runtime") == 0 && files.makeDirectory(work + "/tests") == 0, "ownership mutation fixture directories")
+test.require(test.run(["cp", "tests/runtime-unit.c", work + "/tests/runtime-unit.c"], system.environment(), "", work + "/copy", 30), "copy exact ownership runtime unit model")
+let mutations: List<Mutation> = [
+    Mutation { name: "control"; file: ""; before: ""; after: "" },
+    Mutation { name: "local retains transferred ownership"; file: "minyar_rc.h"; before: "void minyar_rc_local_take(long long index, void *value) {\n"; after: "void minyar_rc_local_take(long long index, void *value) {\n    minyar_rc_retain(value);\n" },
+    Mutation { name: "local replacement forgets previous owner"; file: "minyar_rc.h"; before: "    minyar_rc_release(previous);"; after: "    (void)previous;" },
+    Mutation { name: "list retains transferred ownership"; file: "minyar_collections.h"; before: "void minyar_list_add_take(MinyarList *list, long long value) {"; after: "void minyar_list_add_take(MinyarList *list, long long value) {\n    minyar_rc_retain((void *)(intptr_t)value);" },
+    Mutation { name: "record retains transferred ownership"; file: "minyar_collections.h"; before: "void minyar_record_set_take(MinyarRecord *record, long long field, long long value) {"; after: "void minyar_record_set_take(MinyarRecord *record, long long field, long long value) {\n    minyar_rc_retain((void *)(intptr_t)value);" }
+]
+
+for mutation in mutations {
+    for name in names {
+        let path = runtime + "/" + name
+        if name == "minyar_runtime.c" { path = source }
+        let text = readTextFile(path)
+        if name == mutation.file {
+            test.check(count(text, mutation.before) == 1, mutation.name + ": mutation site changed")
+            text = test.replace(text, mutation.before, mutation.after)
+        }
+        writeTextFile(work + "/runtime/" + name, text)
+    }
+    let executable = work + "/unit"
+    test.require(test.run([clang, "-std=c11", "-O2", work + "/tests/runtime-unit.c", "-lm", "-o", executable], system.environment(), "", work + "/build", 30), "build viable ownership mutation " + mutation.name)
+    let result = test.run([executable], system.environment(), "", work + "/run", 15)
+    if mutation.file == "" { test.check(result.status == 0, "ownership mutation control\n" + result.errorOutput) }
+    else { test.check(result.status != 0 && test.contains(result.errorOutput, "Assertion"), "ownership exact accounting did not detect " + mutation.name + "\n" + result.errorOutput) }
+    let state = "detected"
+    if mutation.file == "" { state = "passed" }
+    print(mutation.name + ": " + state)
+}
+test.check(mutations.length == 5, "ownership control/four mutant domain")
+test.removeTree(work)
+print("All 4 ownership mutants detected")

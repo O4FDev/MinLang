@@ -1,0 +1,108 @@
+use "../tools/testing.min" as test
+use "unary-fusion-fixture.min" as fusion
+use "system" as system
+use "files" as files
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+function parent(path: Text): Text {
+    let raw = Bytes(path)
+    let ending = -1
+    for index in 0..raw.length { if raw[index] == 47 { ending = index } }
+    if ending < 0 { return "." }
+    if ending == 0 { return "/" }
+    return Text(raw.slice(0, ending))
+}
+function optionValue(option: Text, name: Text): Text {
+    let raw = Bytes(option)
+    return Text(raw.slice(Bytes(name).length + 1, raw.length))
+}
+function count(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let found = 0
+    if raw.length < pattern.length { return 0 }
+    for position in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[position + index] != pattern[index] { equal = false; break } }
+        if equal { found += 1 }
+    }
+    return found
+}
+record Variant { name: Text; header: Text; fixture: Text; diagnostic: Text }
+let runtime = test.setting("MINYAR_FUSED_RUNTIME_SOURCE", "runtime/minyar_runtime.c")
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let outputDirectory = ""
+let index = 0
+while index < argumentCount() {
+    let option = argument(index)
+    if option == "--help" || option == "-h" {
+        print("fused-work-regressions [--runtime-source PATH] [--clang CLANG] [--output-dir PATH]")
+        exit(0)
+    }
+    if option == "--runtime-source" || option == "--clang" || option == "--output-dir" {
+        index += 1
+        test.check(index < argumentCount(), "missing value for " + option)
+        if option == "--runtime-source" { runtime = argument(index) }
+        else if option == "--clang" { clang = argument(index) }
+        else { outputDirectory = argument(index) }
+    } else if starts(option, "--runtime-source=") { runtime = optionValue(option, "--runtime-source") }
+    else if starts(option, "--clang=") { clang = optionValue(option, "--clang") }
+    else if starts(option, "--output-dir=") { outputDirectory = optionValue(option, "--output-dir") }
+    else { fail("unknown fused work argument " + option) }
+    index += 1
+}
+test.check(runtime != "" && clang != "", "fused work runtime/clang must be set")
+test.check(system.setResourceLimit(system.CORE_SIZE, 0, 0) == 0, "disable fused work mutant core files")
+let environment: List<Text> = []
+for entry in system.environment() {
+    if !starts(entry, "ASAN_OPTIONS=") && !starts(entry, "UBSAN_OPTIONS=") { environment.add(entry) }
+}
+environment.add("ASAN_OPTIONS=detect_leaks=0:abort_on_error=1")
+environment.add("UBSAN_OPTIONS=halt_on_error=1")
+let work = ""
+if outputDirectory == "" { work = test.scratch() }
+else {
+    let log = test.scratch()
+    test.require(test.run(["mkdir", "-p", "--", outputDirectory], system.environment(), "", log + "/mkdir", 120), "create fused work output directory")
+    test.removeTree(log)
+    work = outputDirectory + "/minyar-tests-fused-work-" + Text(system.processId()) + "-" + Text(system.monotonicNanoseconds())
+    test.check(files.makeDirectory(work) == 0, "create fused work selected scratch")
+}
+print(work)
+let original = readTextFile(parent(runtime) + "/minyar_bounded_rc.h")
+let marker = "MINYAR_HOT unsigned rc_drop(void *value) {"
+let counter = "static size_t generic_drop_calls;\n" + marker + "\n    generic_drop_calls++;"
+let reference = fusion.withoutFusion(original)
+test.check(count(reference, marker) == 1, "counter-reference generic drop mutation site must occur once")
+test.check(count(original, marker) == 1, "counter-candidate generic drop mutation site must occur once")
+let guard = "child->ownership == (8 | RC_RECORD)"
+test.check(count(original, guard) == 1, "unsafe-shared-mutant ownership guard mutation site must occur once")
+let variants = [
+    Variant { name: "counter-reference"; header: test.replace(reference, marker, counter); fixture: "fused-drop-work.c"; diagnostic: "generic_drop_calls-before==1" },
+    Variant { name: "counter-candidate"; header: test.replace(original, marker, counter); fixture: "fused-drop-work.c"; diagnostic: "" },
+    Variant { name: "unsafe-shared-mutant"; header: test.replace(original, guard, "(child->ownership & 7) == RC_RECORD"); fixture: "unary-order.c"; diagnostic: "freed_count" }
+]
+let checked = 0
+for variant in variants {
+    let directory = work + "/" + variant.name
+    test.check(files.makeDirectory(directory) == 0 && files.makeDirectory(directory + "/tests") == 0, "create fused work variant directories")
+    test.require(test.run(["cp", "-RL", "--", parent(runtime), directory + "/runtime"], system.environment(), "", directory + "/copy-runtime", 120), "copy selected fused work runtime")
+    writeTextFile(directory + "/runtime/minyar_bounded_rc.h", variant.header)
+    let fixture = directory + "/tests/" + variant.fixture
+    test.require(test.run(["cp", "--", "tests/" + variant.fixture, fixture], system.environment(), "", directory + "/copy-fixture", 120), "copy exact fused work runtime fixture")
+    let executable = directory + "/test"
+    test.require(test.run([clang, "-O2", "-fsanitize=address,undefined", fixture, "-o", executable, "-lm"], environment, "", directory + "/compile", 120), variant.name + " compile failure is not mutation detection")
+    let result = test.run([executable], environment, "", directory + "/run", 120)
+    if variant.name == "counter-candidate" { test.check(result.status == 0, variant.name + ": expected successful counter runtime\n" + result.errorOutput) }
+    else { test.check(result.status != 0 && test.contains(result.errorOutput, variant.diagnostic), variant.name + ": intended runtime assertion was not detected\n" + result.errorOutput) }
+    checked += 1
+    print(variant.name + " expected result verified")
+}
+test.check(checked == 3, "complete fused work candidate/reference/shared-owner mutation checks")
+if outputDirectory == "" { test.removeTree(work) }
+print("Fused work regressions: passed")
