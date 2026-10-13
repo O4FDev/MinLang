@@ -165,6 +165,10 @@ int main(void) {
                                              static=static)
         source = '#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n' + implementation + source
         source = source.replace('int main(void) {', 'int main(void) {\n' + calls)
+    if static and kind == 'tararchive':
+        source = source.replace('if (!reader || !entry) return 2;',
+                                'if (!reader || !entry) return 2;\n'
+                                '    if (archive_read_support_format_all(reader) != ARCHIVE_OK) return 2;')
     return source
 
 
@@ -237,6 +241,10 @@ def provider_info(kind, clang='clang', compile_flags=(), link_flags=()):
             dependencies = [value for value in shlex.split(
                 _output(['pkg-config', '--libs', '--static', package]))
                 if value != '-l' + stem.removeprefix('lib') and not value.startswith('-L')]
+            if static and '-lxml2' in dependencies:
+                dependencies += shlex.split(_output(['pkg-config', '--libs', '--static', 'libxml-2.0']))
+                if any(value.startswith('-licu') for value in dependencies):
+                    dependencies.append('-lstdc++')
         except (FileNotFoundError, subprocess.CalledProcessError):
             if platform.system() != 'Darwin' or not shutil.which('brew'):
                 raise ValueError(f'install the {package} development package or set '
@@ -269,6 +277,8 @@ def provider_info(kind, clang='clang', compile_flags=(), link_flags=()):
         _static_archive(library, clang, APIS[kind])
     cflags = ['-I' + str(include)]
     libraries = [str(library), *dependencies]
+    if static:
+        libraries = ['-Wl,--start-group', *libraries, '-Wl,--end-group']
     shared = not windows and ('.so' in library.name or library.suffix == '.dylib')
     imported = windows and library.name.endswith('.dll.a')
     runtime_library = (_runtime_dll(library, prefix, stem) if imported else
