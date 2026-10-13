@@ -1,0 +1,275 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+function selected(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "LanguageLinkage." + name { return true } }
+    return false
+}
+function count(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let found = 0
+    if raw.length < pattern.length { return 0 }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { found += 1 }
+    }
+    return found
+}
+function namespace(ir: Text, expected: List<Text>) {
+    let definitions: List<Text> = []
+    let userNames: List<Text> = []
+    let entries = 0
+    for line in test.lines(ir) {
+        if starts(line, "define ") {
+            let raw = Bytes(line)
+            let global = -1
+            for index in 7..raw.length { if raw[index] == 64 { global = index; break } }
+            test.check(global >= 0 && global + 1 < raw.length, "malformed LLVM definition")
+            let attributes = Text(raw.slice(7, global))
+            let start = global + 1
+            let end = start
+            let quoted = raw[start] == 34
+            if quoted {
+                start += 1; end = start
+                while end < raw.length && raw[end] != 34 { end += 1 }
+                test.check(end + 1 < raw.length && raw[end + 1] == 40, "quoted LLVM definition name")
+            } else {
+                while end < raw.length && raw[end] != 40 && raw[end] > 32 { end += 1 }
+                test.check(end < raw.length && raw[end] == 40, "LLVM definition name")
+            }
+            let name = Text(raw.slice(start, end))
+            let spelling = name
+            if quoted { spelling = "\"" + name + "\"" }
+            for existing in definitions { test.check(existing != spelling, "LLVM definition collision " + spelling) }
+            definitions.add(spelling)
+            if starts(attributes, "internal ") { test.check(starts(name, ".minyar."), "internal function escaped language namespace " + name) }
+            else {
+                test.check(name == "main" || starts(name, ".minyar.fn."), "user function interposes C namespace " + name)
+                if name == "main" { entries += 1 }
+                else { test.check(count(name, ".minyar.fn.") == 1, "nested language namespace " + name); userNames.add(name) }
+            }
+        }
+    }
+    test.check(definitions.length > 0, "no LLVM definitions")
+    test.check(entries == 1, "exactly one C entry main must be emitted")
+    test.check(userNames.length == expected.length, "language function count")
+    for name in expected {
+        let occurrences = 0
+        for actual in userNames { if actual == name { occurrences += 1 } }
+        test.check(occurrences == 1, "expected distinct language symbol " + name)
+    }
+}
+function nativeCallee(ir: Text) {
+    let declarations = 0
+    for line in test.lines(ir) {
+        let raw = Bytes(line)
+        let ending = raw.length
+        while ending > 0 && raw[ending - 1] <= 32 { ending -= 1 }
+        if Text(raw.slice(0, ending)) == "declare i64 @minyar_probe_sample(i64)" { declarations += 1 }
+    }
+    test.check(declarations == 1, "native callee declaration count")
+    test.check(count(ir, "call i64 @minyar_probe_sample(i64 %argument.0)") == 1, "native callee actual C call")
+}
+function execute(compiler: test.Compiler, llvm: Text, expected: Text, symbols: List<Text>, native: List<Text>) {
+    let ir = readTextFile(llvm)
+    namespace(ir, symbols)
+    if test.addressEnabled(compiler.flags) { writeTextFile(llvm, test.instrument(ir)) }
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization]
+        for flag in compiler.flags { command.add(flag) }
+        for item in ["-Wno-override-module", llvm, compiler.runtime] { command.add(item) }
+        for source in native { command.add(source) }
+        for item in ["-lm", "-o", compiler.directory + "/linked"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", llvm + ".link", 60), "link language namespace " + optimization)
+        let result = test.run([compiler.directory + "/linked"], system.environment(), "", llvm + ".run", 30)
+        test.check(result.status == 0 && result.output == expected && result.errorOutput == "", "language namespace execution " + optimization + "\n" + result.output + result.errorOutput)
+    }
+}
+function declarations(names: List<Text>, publicNames: Boolean): Text {
+    let source: List<Text> = []
+    for index in 0..names.length {
+        let prefix = ""
+        if publicNames { prefix = "public " }
+        source.add(prefix + "function " + names[index] + "(value: Integer): Integer { return value + " + Text(index + 1) + " }\n")
+    }
+    return joinText(source)
+}
+function calls(names: List<Text>, prefix: Text): Text {
+    let source: List<Text> = []
+    for index in 0..names.length { source.add("print(" + prefix + names[index] + "(" + Text(index * 7) + "))\n") }
+    return joinText(source)
+}
+function moduleSymbols(filename: Text, names: List<Text>): List<Text> {
+    let source = "local:" + filename
+    let identity = ""
+    for index in 0..source.length { identity = Text(source[index]) + identity }
+    let symbols: List<Text> = []
+    for name in names { symbols.add(".minyar.fn.minyar.module|" + name + "|" + identity) }
+    return symbols
+}
+function fields(source: Text): List<Text> {
+    let values: List<Text> = []
+    let position = 0
+    while position < source.length {
+        let newline = position
+        while newline < source.length && source[newline] != '\n' { newline += 1 }
+        test.check(newline < source.length, "truncated module state field length")
+        let size = Integer(source.slice(position, newline))
+        position = newline + 1
+        test.check(size >= 0 && size <= source.length - position, "module state field bounds")
+        values.add(source.slice(position, position + size))
+        position += size
+    }
+    return values
+}
+function pack(values: List<Text>): Text {
+    let source: List<Text> = []
+    for value in values { source.add(Text(value.length) + "\n" + value) }
+    return joinText(source)
+}
+function statistics(path: Text, first: Text, second: Text) {
+    let values = test.words(readTextFile(path))
+    test.check(values.length >= 2 && values[0] == first && values[1] == second, "module reuse counts " + readTextFile(path))
+}
+function publish(prior: Text, following: Text) {
+    let size = files.pathSize(following)
+    test.check(size >= 0, "missing module state publication")
+    if size > 0 { writeTextFile(prior, readTextFile(following)) }
+}
+let compiler = test.compiler()
+let stage0 = test.setting("MINYAR_TEST_STAGE0", "./build/stage0")
+let modules = test.setting("MINYAR_TEST_MODULE_COMPILER", "./build/minyarc-modules")
+let names = ["malloc", "free", "calloc", "realloc", "printf", "fprintf", "memcpy", "strlen", "stdout", "stderr", "environ", "minyar_stack_enter", "minyar_rc_enter", "minyar_fail_integer_overflow", "minyar_fail_integer_division"]
+let expectedParts: List<Text> = []
+let symbols: List<Text> = []
+for index in 0..names.length { expectedParts.add(Text(index * 8 + 1) + "\n"); symbols.add(".minyar.fn." + names[index]) }
+let expected = joinText(expectedParts)
+let allowed = ["test_ordinary_names_do_not_interpose_c_dependencies", "test_bootstrap_uses_the_same_language_namespace", "test_local_modules_and_cached_fragments_keep_names_separate", "test_native_callee_keeps_its_c_symbol", "test_native_module_fallback_keeps_c_and_language_symbols_separate", "test_same_name_in_two_modules_and_entry_stays_distinct"]
+for index in 0..argumentCount() {
+    let valid = false
+    for name in allowed { if argument(index) == name || argument(index) == "LanguageLinkage." + name { valid = true } }
+    test.check(valid, "unknown linkage case " + argument(index))
+}
+if selected("test_ordinary_names_do_not_interpose_c_dependencies") {
+    test.require(test.compile(compiler, declarations(names, false) + calls(names, "")), "compile ordinary C-like language names")
+    execute(compiler, compiler.directory + "/case" + Text(compiler.serial) + ".ll", expected, symbols, [])
+}
+if selected("test_bootstrap_uses_the_same_language_namespace") {
+    let source = compiler.directory + "/bootstrap.min"
+    let llvm = compiler.directory + "/bootstrap.ll"
+    writeTextFile(source, declarations(names, false) + "function main() {\n" + calls(names, "") + "}\n")
+    test.require(test.run([stage0, source, "-o", llvm], system.environment(), "", llvm + ".compile", 30), "compile bootstrap language namespace")
+    execute(compiler, llvm, expected, symbols, [])
+}
+if selected("test_local_modules_and_cached_fragments_keep_names_separate") {
+    let library = compiler.directory + "/lib.min"
+    writeTextFile(library, declarations(names, true))
+    let entry = compiler.directory + "/main.min"
+    writeTextFile(entry, "use \"./lib.min\" as lib\n" + calls(names, "lib."))
+    let llvm = compiler.directory + "/program.ll"
+    test.require(test.run([compiler.executable, entry, llvm], system.environment(), "", llvm + ".compile", 30), "compile direct local linkage graph")
+    let directSymbols: List<Text> = []
+    for name in names { directSymbols.add(".minyar.fn.minyar_module_1_" + name) }
+    execute(compiler, llvm, expected, directSymbols, [])
+    let prior = compiler.directory + "/prior.state"
+    let following = compiler.directory + "/following.state"
+    let stats = compiler.directory + "/stats"
+    writeTextFile(prior, "")
+    let first = ["0", "2", "1"]
+    let second = ["2", "0", "1"]
+    let moduleNames = moduleSymbols("lib.min", names)
+    for phase in 0..3 {
+        if phase == 2 { writeTextFile(library, "// changed dependency\n" + declarations(names, true)) }
+        test.require(test.run([modules, entry, llvm, "--module-state", prior, following, stats], system.environment(), "", llvm + ".modules", 30), "compile cached linkage phase " + Text(phase))
+        statistics(stats, first[phase], second[phase])
+        execute(compiler, llvm, expected, moduleNames, [])
+        publish(prior, following)
+    }
+    let legacy = fields(readTextFile(following))
+    test.check(legacy.length > 0 && legacy[0] == "minyar-module-interface-v5", "linkage cache current schema")
+    legacy[0] = "minyar-module-interface-v4"
+    writeTextFile(prior, pack(legacy))
+    test.require(test.run([modules, entry, llvm, "--module-state", prior, following, stats], system.environment(), "", llvm + ".legacy", 30), "rebuild intact old linkage ABI cache")
+    statistics(stats, "0", "2")
+    execute(compiler, llvm, expected, moduleNames, [])
+}
+if selected("test_native_callee_keeps_its_c_symbol") {
+    test.require(test.compile(compiler, "function sample(value: Integer): Integer { native \"probe\" }\nfunction minyar_probe_sample(value: Integer): Integer { return value + 200 }\nprint(sample(7))\nprint(minyar_probe_sample(7))\n"), "compile native C versus language symbol")
+    let llvm = compiler.directory + "/case" + Text(compiler.serial) + ".ll"
+    nativeCallee(readTextFile(llvm))
+    let native = compiler.directory + "/probe.c"
+    writeTextFile(native, "long long minyar_probe_sample(long long value) { return value + 100; }\n")
+    execute(compiler, llvm, "107\n207\n", [".minyar.fn.sample", ".minyar.fn.minyar_probe_sample"], [native])
+}
+if selected("test_native_module_fallback_keeps_c_and_language_symbols_separate") {
+    let library = compiler.directory + "/probe.min"
+    let librarySource = "public function sample(value: Integer): Integer { native \"probe\" }\n"
+    writeTextFile(library, librarySource)
+    let entry = compiler.directory + "/main.min"
+    writeTextFile(entry, "use \"./probe.min\" as probe\nfunction minyar_probe_sample(value: Integer): Integer { return value + 200 }\nprint(probe.sample(7))\nprint(minyar_probe_sample(7))\n")
+    let llvm = compiler.directory + "/program.ll"
+    let moduleNames = [".minyar.fn.minyar_module_0_minyar_probe_sample", ".minyar.fn.minyar_module_1_sample"]
+    let native = compiler.directory + "/probe.c"
+    writeTextFile(native, "long long minyar_probe_sample(long long value) { return value + 100; }\n")
+    test.require(test.run([compiler.executable, entry, llvm], system.environment(), "", llvm + ".compile", 30), "compile direct native module linkage")
+    nativeCallee(readTextFile(llvm))
+    execute(compiler, llvm, "107\n207\n", moduleNames, [native])
+    let prior = compiler.directory + "/prior.state"
+    let following = compiler.directory + "/following.state"
+    let stats = compiler.directory + "/stats"
+    writeTextFile(prior, "")
+    for phase in 0..3 {
+        if phase == 2 { writeTextFile(library, "// changed native dependency\n" + librarySource) }
+        test.require(test.run([modules, entry, llvm, "--module-state", prior, following, stats], system.environment(), "", llvm + ".modules", 30), "native module whole graph fallback phase " + Text(phase))
+        let values = test.words(readTextFile(stats))
+        let counts = ["0", "2", "2", "0", "0", "0", "false"]
+        test.check(values.length == counts.length, "native fallback statistic width")
+        for index in 0..counts.length { test.check(values[index] == counts[index], "native fallback statistic value") }
+        test.check(readTextFile(following) == "", "native fallback published incremental state")
+        nativeCallee(readTextFile(llvm))
+        execute(compiler, llvm, "107\n207\n", moduleNames, [native])
+        publish(prior, following)
+    }
+}
+if selected("test_same_name_in_two_modules_and_entry_stays_distinct") {
+    let left = compiler.directory + "/left.min"
+    let right = compiler.directory + "/right.min"
+    let leftSource = "public function malloc(value: Integer): Integer { return value + 1 }\n"
+    writeTextFile(left, leftSource)
+    writeTextFile(right, "public function malloc(value: Integer): Integer { return value + 2 }\n")
+    let entry = compiler.directory + "/main.min"
+    writeTextFile(entry, "use \"./left.min\" as left\nuse \"./right.min\" as right\nfunction malloc(value: Integer): Integer { return value + 3 }\nprint(left.malloc(10))\nprint(right.malloc(10))\nprint(malloc(10))\n")
+    let llvm = compiler.directory + "/program.ll"
+    test.require(test.run([compiler.executable, entry, llvm], system.environment(), "", llvm + ".compile", 30), "compile repeated nominal language name")
+    let directSymbols: List<Text> = []
+    for module in 0..3 { directSymbols.add(".minyar.fn.minyar_module_" + Text(module) + "_malloc") }
+    execute(compiler, llvm, "11\n12\n13\n", directSymbols, [])
+    let moduleNames: List<Text> = []
+    for filename in ["main.min", "left.min", "right.min"] { for name in moduleSymbols(filename, ["malloc"]) { moduleNames.add(name) } }
+    let prior = compiler.directory + "/prior.state"
+    let following = compiler.directory + "/following.state"
+    let stats = compiler.directory + "/stats"
+    writeTextFile(prior, "")
+    let first = ["0", "3", "2"]
+    let second = ["3", "0", "1"]
+    for phase in 0..3 {
+        let output = "11\n12\n13\n"
+        if phase == 2 { writeTextFile(left, test.replace(leftSource, "value + 1", "value + 4")); output = "14\n12\n13\n" }
+        test.require(test.run([modules, entry, llvm, "--module-state", prior, following, stats], system.environment(), "", llvm + ".modules", 30), "same-name module cache phase " + Text(phase))
+        statistics(stats, first[phase], second[phase])
+        execute(compiler, llvm, output, moduleNames, [])
+        publish(prior, following)
+    }
+}
+test.removeTree(compiler.directory)
+print("Language linkage namespace, cached fragments and native C ABI: passed")

@@ -1,0 +1,75 @@
+use "../tools/testing.min" as test
+use "system" as system
+
+function engineSource(): Text {
+    let engine = readTextFile("runtime/minyar_runtime.c")
+    for header in ["minyar_rc.h", "minyar_collections.h"] {
+        let replacement = "minyar_cycle_rc.h"
+        if header == "minyar_collections.h" { replacement = "minyar_cycle_collections.h" }
+        let directive = "#include \"" + header + "\""
+        test.check(engine.byteLength - test.replace(engine, directive, "").byteLength == directive.byteLength, "managed graph runtime requires exactly one ownership header")
+        engine = test.replace(engine, directive, "#include \"" + replacement + "\"")
+    }
+    return "#define MINYAR_SORT_GRAPH 1\n#define MINYAR_MAP_CYCLE_RUNTIME 1\n#if defined(__GNUC__) || defined(__clang__)\n#define MINYAR_NOINLINE __attribute__((noinline))\n#else\n#define MINYAR_NOINLINE\n#endif\n" + engine + "\n#include \"minyar_callbacks.h\"\n"
+}
+
+function callbackExecutes(compiler: test.Compiler, source: Text, expected: Text) {
+    compiler.serial += 1
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    writeTextFile(path + ".min", source)
+    let compiled = test.run([compiler.executable, path + ".min", path + ".ll", "--library", "library"], system.environment(), "", path + ".compile", 30)
+    test.require(compiled, "callback frontend compile")
+    if test.addressEnabled(compiler.flags) { writeTextFile(path + ".ll", test.instrument(readTextFile(path + ".ll"))) }
+    let harness = test.replace(readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", engineSource())
+    writeTextFile(path + ".runtime.c", harness)
+    let optimization = "-O2"
+    if compiler.flags.length > 0 { optimization = "-O1" }
+    let command = [compiler.clang, optimization]
+    for flag in compiler.flags { command.add(flag) }
+    for item in ["-DMINYAR_SYSTEM_HEAP=1", "-iquote", "runtime", "-c", path + ".runtime.c", "-o", path + ".runtime.o"] { command.add(item) }
+    test.require(test.run(command, system.environment(), "", path + ".runtime-build", 30), "callback ownership runtime compile")
+    for level in ["-O0", "-O2"] {
+        command = [compiler.clang, level]
+        for flag in compiler.flags { command.add(flag) }
+        for item in ["-Wno-override-module", path + ".ll", path + ".runtime.o", "-o", path + ".exe", "-lm"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".link", 30), "callback ownership link")
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", 30)
+        test.require(result, "callback ownership execution")
+        test.check(result.output == expected, "callback output changed at " + level + "\n" + result.output)
+        test.check(result.errorOutput == "", "callback wrote execution diagnostics\n" + result.errorOutput)
+    }
+}
+
+function selected(selectors: List<Text>, group: Text, name: Text): Boolean {
+    if selectors.length == 0 { return true }
+    for selector in selectors { if selector == group || selector == name || selector == group + "." + name { return true } }
+    return false
+}
+let selectors: List<Text> = []
+let names = ["CollectionConstants.test_constant_map_nested_lists_and_text_operations", "CollectionConstants.test_imported_constant_map_receiver_writes", "MapComparator.test_stable_comparator_over_negative_structural_slots"]
+for index in 0..argumentCount() {
+    let selector = argument(index)
+    if selector == "-v" || selector == "--verbose" || selector == "-q" || selector == "--quiet" { continue }
+    let known = selector == "CollectionConstants" || selector == "MapComparator"
+    for name in names { if selector == name || selector == name.split(".")[1] { known = true } }
+    test.check(known, "unknown collections integration selector: " + selector)
+    selectors.add(selector)
+}
+let compiler = test.compiler()
+let callback = test.compiler()
+let frontend = "./build/minyarc-callbacks"
+if test.addressEnabled(callback.flags) { frontend += "-sanitize" }
+callback.executable = test.setting("MINYAR_CALLBACK_COMPILER", frontend)
+if selected(selectors, "CollectionConstants", "test_constant_map_nested_lists_and_text_operations") {
+    test.executes(compiler, "constant TABLE: Map<Text, List<Integer>> = makeTable()\nfunction makeTable(): Map<Text, List<Integer>> {\n    print(\"init\")\n    let table = Map<Text, List<Integer>>()\n    table[\"é\"] = [3, 1, 2]\n    return table\n}\nlet alias = TABLE\nlet copy = TABLE[\"é\"].sorted()\nTABLE[\"é\"].sort()\nTABLE[\"é\"][0] += 6\nprint(alias[\"é\"][0])\nprint(copy[0])\nlet fields = \"　é: +42 :🍊 \".trim().split(\":\")\nlet names = Map<Text, Integer>()\nnames[fields[0]] = Integer(fields[1])\nprint(names[\"é\"])\nprint(fields[2].find(\"🍊\"))\nprint(fields[0].startsWith(\"é\"))\nprint(fields[2].endsWith(\"🍊\"))\nTABLE[\"é\"].clear()\nprint(alias[\"é\"].length)\nTABLE.clear()\nprint(alias.length)\n", "init\n7\n1\n42\n0\ntrue\ntrue\n0\n0\n")
+}
+if selected(selectors, "CollectionConstants", "test_imported_constant_map_receiver_writes") {
+    writeTextFile(compiler.directory + "/table.min", "public constant TABLE: Map<Integer, List<Text>> = make()\nfunction make(): Map<Integer, List<Text>> {\n    let table = Map<Integer, List<Text>>()\n    table[1] = [\"b\" + \"!\", \"a\" + \"!\"]\n    return table\n}\n")
+    test.executes(compiler, "use \"./table.min\" as first\nuse \"./table.min\" as second\nfirst.TABLE[1].sort()\nfirst.TABLE[1][0] = \"changed\" + \"!\"\nprint(second.TABLE[1][0])\nlet saved = second.TABLE[1]\nfirst.TABLE.clear()\nprint(saved[1])\nprint(second.TABLE.length)\n", "changed!\nb!\n0\n")
+}
+if selected(selectors, "MapComparator", "test_stable_comparator_over_negative_structural_slots") {
+    callbackExecutes(callback, "function make(rank: Integer, serial: Integer): Map<Integer, Integer> {\n    let row = Map<Integer, Integer>()\n    row[0] = rank\n    row[1] = serial\n    return row\n}\nlet rows = [make(2, 0), make(1, 1), make(2, 2), make(1, 3)]\nlet compare = function(a: Map<Integer, Integer>, b: Map<Integer, Integer>): Integer {\n    if a[0] < b[0] { return -1 }\n    if a[0] > b[0] { return 1 }\n    return 0\n}\nlet copy = rows.sortedBy(compare)\nrows.sortBy(compare)\nfor i in 0..rows.length {\n    print(rows[i][1])\n    print(copy[i][1])\n}\ncopy.clear()\nprint(rows[0][1])\n", "1\n1\n3\n3\n0\n0\n2\n2\n1\n")
+}
+test.removeTree(compiler.directory)
+test.removeTree(callback.directory)
+print("Collection constants and Map comparators: passed")

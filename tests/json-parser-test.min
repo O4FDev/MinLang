@@ -1,0 +1,144 @@
+use "../tools/testing.min" as test
+use "./text-basics-oracles.min" as hex
+use "system" as system
+use "files" as files
+use "json" as json
+use "sha256" as sha
+
+record Corpus { data: Bytes; count: Integer }
+function frame(corpus: Corpus, expected: Integer, payload: Bytes) {
+    corpus.data.add(expected)
+    corpus.data.add((payload.length >> 24) & 255)
+    corpus.data.add((payload.length >> 16) & 255)
+    corpus.data.add((payload.length >> 8) & 255)
+    corpus.data.add(payload.length & 255)
+    corpus.data.addBytes(payload)
+    corpus.count += 1
+}
+function quoted(raw: Bytes): Bytes {
+    let result = Bytes()
+    result.add(34)
+    result.addBytes(raw)
+    result.add(34)
+    return result
+}
+function stringAccepts(raw: Bytes): Boolean {
+    let index = 0
+    while index < raw.length {
+        let value = raw[index]
+        if value < 32 || value == 34 { return false }
+        if value == 92 {
+            if index + 1 >= raw.length { return false }
+            let escaped = raw[index + 1]
+            if escaped != 34 && escaped != 92 && escaped != 47 && escaped != 98 && escaped != 102 && escaped != 110 && escaped != 114 && escaped != 116 { return false }
+            index += 2
+            continue
+        }
+        if value < 128 { index += 1; continue }
+        let count = 0
+        let minimum = 0
+        if value >= 194 && value <= 223 { count = 2; minimum = 128; value = value & 31 }
+        else if value >= 224 && value <= 239 { count = 3; minimum = 2048; value = value & 15 }
+        else if value >= 240 && value <= 244 { count = 4; minimum = 65536; value = value & 7 }
+        else { return false }
+        if index + count > raw.length { return false }
+        for extra in 1..count {
+            let byte = raw[index + extra]
+            if byte < 128 || byte > 191 { return false }
+            value = value * 64 + (byte & 63)
+        }
+        if value < minimum || value > 1114111 || (value >= 55296 && value <= 57343) { return false }
+        index += count
+    }
+    return true
+}
+function classified(corpus: Corpus, raw: Bytes) {
+    let expected = 0
+    if stringAccepts(raw) { expected = 1 }
+    frame(corpus, expected, quoted(raw))
+}
+function setting(environment: List<Text>, name: Text, value: Text): List<Text> {
+    let result: List<Text> = []
+    let prefix = name + "="
+    for entry in environment {
+        let raw = Bytes(entry)
+        if raw.length < prefix.byteLength || Text(raw.slice(0, prefix.byteLength)) != prefix { result.add(entry) }
+    }
+    result.add(prefix + value)
+    return result
+}
+
+let sanitize = false
+test.check(argumentCount() <= 1, "unexpected JSON parser option")
+if argumentCount() == 1 { test.check(argument(0) == "--sanitize", "unknown JSON parser option"); sanitize = true }
+let work = test.scratch()
+let corpus = Corpus { data: Bytes(); count: 0 }
+let root = "tests/fixtures/json-parser"
+let manifest = json.parse(readTextFile(root + "/manifest.json"))
+let hashes = json.member(manifest, "sha256")
+test.check(hashes.kind == json.OBJECT && hashes.keys.length == 318, "pinned JSON parser manifest changed")
+let names: List<Text> = []
+for name in files.list(root + "/test_parsing") { if name.endsWith(".json") { names.add(name) } }
+names.sort()
+test.check(names.length == 318, "pinned JSON parser fixture count changed")
+for name in names {
+    let digest = json.member(hashes, name)
+    test.check(digest.kind == json.STRING, "JSON parser fixture is absent from manifest: " + name)
+    let payload = readBytesFile(root + "/test_parsing/" + name)
+    test.check(sha.hex(sha.digest(payload)) == digest.text, "JSON parser fixture hash changed: " + name)
+    let expected = 2
+    if name[0] == 'y' { expected = 1 }
+    else if name[0] == 'n' { expected = 0 }
+    else { test.check(name[0] == 'i', "unclassified JSON parser fixture") }
+    frame(corpus, expected, payload)
+}
+for first in 0..256 {
+    let raw = Bytes()
+    raw.add(first)
+    classified(corpus, raw)
+    for second in 0..256 {
+        let pair = Bytes()
+        pair.add(first)
+        pair.add(second)
+        classified(corpus, pair)
+    }
+}
+for encoded in ["e09fbf", "e0a080", "ed9fbf", "eda080", "efbfbf", "f08fbfbf", "f0908080", "f48fbfbf", "f4908080", "f5808080"] {
+    let sequence = hex.fromHex(encoded)
+    for cut in 0..(sequence.length + 1) { classified(corpus, sequence.slice(0, cut)) }
+}
+let seeded = test.lines(readTextFile(root + "/seeded-cases.tsv"))
+test.check(seeded.length == 13500, "seeded JSON parser corpus changed")
+for row in seeded {
+    let fields = test.words(row)
+    test.check(fields.length == 3, "invalid seeded JSON parser corpus row")
+    frame(corpus, Integer(fields[1]), hex.fromHex(fields[2]))
+}
+test.check(corpus.count == 79655, "JSON parser case count changed")
+let framing = work + "/corpus.bin"
+writeBytesFile(framing, corpus.data)
+let compiler = test.setting("MINYAR_TEST_COMPILER", "./build/minyarc")
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let flags: List<Text> = []
+if sanitize { flags = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"] }
+let environment = setting(system.environment(), "ASAN_OPTIONS", "detect_leaks=1")
+environment = setting(environment, "UBSAN_OPTIONS", "halt_on_error=1")
+let llvm = work + "/parser.ll"
+test.require(test.run([compiler, "tests/json-parser.min", llvm, "--library", "library"], system.environment(), "", work + "/compile", 60), "JSON parser fixture compile")
+if test.addressEnabled(flags) { writeTextFile(llvm, test.instrument(readTextFile(llvm))) }
+for optimization in ["-O0", "-O2"] {
+    let runtime = work + "/runtime" + optimization + ".o"
+    let executable = work + "/parser" + optimization
+    let command = [clang, optimization]
+    for flag in flags { command.add(flag) }
+    for item in ["-DMINYAR_SYSTEM_HEAP=1", "-c", "runtime/minyar_runtime.c", "-o", runtime] { command.add(item) }
+    test.require(test.run(command, system.environment(), "", runtime + ".compile", 60), "JSON parser runtime compile")
+    command = [clang, optimization]
+    for flag in flags { command.add(flag) }
+    for item in ["-Wno-override-module", llvm, runtime, "-o", executable, "-lm"] { command.add(item) }
+    test.require(test.run(command, system.environment(), "", executable + ".link", 60), "JSON parser fixture link")
+    let result = test.run([executable, framing], environment, "", executable + ".run", 60)
+    test.check(result.status == 0 && result.errorOutput == "" && result.output == Text(corpus.count) + "\n", "JSON parser disagreed with independent corpus at " + optimization + "\n" + result.output + result.errorOutput)
+}
+test.removeTree(work)
+print("JSON parser: " + Text(corpus.count) + " independent corpus/mutation/UTF-8 cases at O0/O2")

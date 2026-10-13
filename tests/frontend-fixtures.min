@@ -1,0 +1,80 @@
+use "../tools/testing.min" as test
+use "../tools/test-runtime.min" as runtime
+use "system" as system
+use "files" as files
+public record Frontend { compiler: test.Compiler; helpers: Text; sources: List<Text>; runtimeFlags: List<Text> }
+public function fixture(variable: Text, fallback: Text): Frontend {
+    let compiler = test.compiler()
+    if test.addressEnabled(compiler.flags) { fallback += "-sanitize" }
+    compiler.executable = test.setting(variable, fallback)
+    compiler.compileTimeout = 30
+    return Frontend { compiler: compiler; helpers: ""; sources: []; runtimeFlags: [] }
+}
+public function selected(className: Text, name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == className + "." + name { return true } }
+    return false
+}
+public function validate(className: Text, names: List<Text>) {
+    for index in 0..argumentCount() {
+        let valid = false
+        for name in names { if argument(index) == name || argument(index) == className + "." + name { valid = true } }
+        test.check(valid, "unknown " + className + " case " + argument(index))
+    }
+}
+public function compile(frontend: Frontend, source: Text): test.Result {
+    let compiler = frontend.compiler
+    compiler.serial += 1
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    writeTextFile(path + ".min", source)
+    let result = test.run([compiler.executable, path + ".min", path + ".ll", "--library", "library"], system.environment(), "", path + ".compile", compiler.compileTimeout)
+    if result.status == 0 && test.addressEnabled(compiler.flags) { writeTextFile(path + ".ll", test.instrument(readTextFile(path + ".ll"))) }
+    return result
+}
+public function executes(frontend: Frontend, source: Text, expected: Text, optimizations: List<Text>, status: Integer, diagnostic: Text, ownership: Boolean) {
+    let compiler = frontend.compiler
+    test.require(compile(frontend, source), "compile frontend fixture")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    let object = compiler.runtime
+    let linkTimeout = compiler.linkTimeout
+    let runTimeout = compiler.runTimeout
+    if ownership {
+        let engine = runtime.cycleSource(readTextFile("runtime/minyar_runtime.c"))
+        let contract = test.replace(readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", engine)
+        writeTextFile(path + "-runtime.c", contract + frontend.helpers)
+        object = path + "-runtime.o"
+        let optimization = "-O2"
+        if compiler.flags.length > 0 { optimization = "-O1" }
+        let command = [compiler.clang]
+        for flag in frontend.runtimeFlags { command.add(flag) }
+        command.add(optimization)
+        for flag in compiler.flags { command.add(flag) }
+        if frontend.runtimeFlags.length == 0 { command.add("-DMINYAR_SYSTEM_HEAP=1") }
+        for item in ["-iquote", "runtime", "-c", path + "-runtime.c", "-o", object] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".runtime-build", 30), "compile exact frontend allocation/debt runtime")
+        linkTimeout = 30
+        runTimeout = 30
+    }
+    for optimization in optimizations {
+        let command = [compiler.clang, optimization]
+        for flag in compiler.flags { command.add(flag) }
+        for item in ["-Wno-override-module", path + ".ll", object] { command.add(item) }
+        for native in frontend.sources { command.add(native) }
+        for item in ["-lm", "-o", path + ".exe"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".link", linkTimeout), "link frontend fixture " + optimization)
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", runTimeout)
+        test.check(result.status == status, "frontend fixture status " + optimization + "\n" + result.errorOutput)
+        test.check(result.output == expected, "frontend fixture output " + optimization + "\n" + result.output)
+        test.check(result.errorOutput == diagnostic, "frontend fixture diagnostics " + optimization + "\n" + result.errorOutput)
+    }
+}
+public function rejects(frontend: Frontend, source: Text, diagnostic: Text, strict: Boolean) {
+    let result = compile(frontend, source)
+    test.check(result.status == 1, "frontend rejection status")
+    test.check(test.contains(result.errorOutput, diagnostic), "frontend rejection diagnostic\n" + result.errorOutput)
+    test.check(files.pathSize(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll") < 0, "frontend rejection emitted LLVM")
+    if strict {
+        test.check(result.output == "", "frontend rejection stdout")
+        test.check(!test.contains(result.errorOutput, "List position"), "frontend rejection internal List fault")
+    }
+}

@@ -1,0 +1,95 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+
+function setting(environment: List<Text>, name: Text, value: Text): List<Text> {
+    let result: List<Text> = []
+    let prefix = name + "="
+    for entry in environment {
+        let raw = Bytes(entry)
+        if raw.length < prefix.byteLength || Text(raw.slice(0, prefix.byteLength)) != prefix { result.add(entry) }
+    }
+    result.add(prefix + value)
+    return result
+}
+function remove(environment: List<Text>, name: Text): List<Text> {
+    let result: List<Text> = []
+    let prefix = name + "="
+    for entry in environment {
+        let raw = Bytes(entry)
+        if raw.length < prefix.byteLength || Text(raw.slice(0, prefix.byteLength)) != prefix { result.add(entry) }
+    }
+    return result
+}
+function runRecipe(target: Text, sanitizer: Boolean) {
+    let root = test.scratch()
+    for path in ["tests", "tools", "build", "bin", "build/tooling", "build/tooling/tests", "selected provider's bin"] {
+        test.check(files.makeDirectory(root + "/" + path) == 0, "cannot create isolated format routing directory")
+    }
+    writeTextFile(root + "/build/minyarc", "")
+    writeTextFile(root + "/build/minyar-default-runtime.o", "")
+    let selected = root + "/selected provider's bin/clang"
+    writeTextFile(selected, "")
+    writeTextFile(root + "/tools/host_paths.py", readTextFile("tools/host_paths.py"))
+    writeTextFile(root + "/formats.mk", readTextFile("build-support/formats.mk"))
+    writeTextFile(root + "/Makefile", "LLVM_CC := native-clang\nLIMITED :=\nSANITIZER_LIMITED :=\ninclude formats.mk\n")
+    let lookup = test.run(["/bin/sh", "-c", "command -v python3"], system.environment(), "", root + "/python", 10)
+    test.require(lookup, "production path-selector Python resolution")
+    let realPython = test.lines(lookup.output)[0]
+    let spy = "#!/bin/sh\ncase \"$0\" in */python3) if [ \"$1\" = -c ]; then exec \"$MINYAR_FORMATS_REAL_PYTHON\" \"$@\"; fi; shift;; esac\nprintf '%s\\n' \"${MINYAR_TEST_CLANG-}\" \"$PATH\" \"${UBSAN_OPTIONS+x}\" \"${UBSAN_OPTIONS-}\" \"$@\"\n"
+    let spies = [root + "/bin/python3"]
+    for name in ["compression-codecs", "sha256", "tar", "formats", "formats-test", "formats-driver"] { spies.add(root + "/build/tooling/tests/" + name) }
+    for path in spies {
+        writeTextFile(path, spy)
+        test.require(test.run(["/bin/chmod", "+x", path], system.environment(), "", root + "/permissions", 10), "format launch spy permissions")
+    }
+    let environment = system.environment()
+    for name in ["MAKEFLAGS", "MFLAGS", "MAKEOVERRIDES", "UBSAN_OPTIONS", "MINYAR_SANITIZER_CLANG"] { environment = remove(environment, name) }
+    environment = setting(environment, "MINYAR_FORMATS_REAL_PYTHON", realPython)
+    let originalPath = root + "/bin:" + system.getenv("PATH")
+    environment = setting(environment, "PATH", originalPath)
+    if sanitizer { environment = setting(environment, "MINYAR_SANITIZER_CLANG", selected) }
+    let result = test.run(["make", "-s", target], environment, root, root + "/make", 30)
+    test.require(result, "actual format Make recipe")
+    let receipt = test.lines(result.output)
+    test.check(receipt.length >= 4, "format launch spy returned incomplete environment")
+    if target.endsWith("-sanitize") {
+        let expected = "native-clang"
+        if sanitizer { expected = selected }
+        test.check(receipt[0] == expected, "sanitizer recipe selected the wrong compiler")
+        test.check(receipt[2] == "x" && receipt[3] == "halt_on_error=1", "sanitizer recipe lost UBSan fatal setting")
+        if sanitizer { test.check(receipt[1].split(":")[0] == root + "/selected provider's bin", "sanitizer provider directory was not first in PATH") }
+        let marker = "--sanitize"
+        if target == "check-compression-sanitize" { marker = "sanitize" }
+        let found = false
+        for index in 4..receipt.length { if receipt[index] == marker { found = true } }
+        test.check(found, "sanitizer recipe lost its original argument marker")
+    } else {
+        test.check(receipt[0] == "native-clang", "native recipe changed its compiler")
+        test.check(receipt[1] == originalPath, "native recipe changed PATH")
+        test.check(receipt[2] == "", "native recipe added a UBSan setting")
+    }
+    test.removeTree(root)
+}
+function selected(selectors: List<Text>, name: Text): Boolean {
+    if selectors.length == 0 { return true }
+    for selector in selectors { if selector == "Dispatch" || selector == name || selector == "Dispatch." + name { return true } }
+    return false
+}
+
+let names = ["test_explicit_sanitizer_compiler_space_apostrophe_and_path", "test_sanitizer_default_uses_native_compiler", "test_native_recipe_keeps_native_toolchain"]
+let selectors: List<Text> = []
+for index in 0..argumentCount() {
+    let selector = argument(index)
+    if selector == "-v" || selector == "--verbose" || selector == "-q" || selector == "--quiet" { continue }
+    let known = selector == "Dispatch"
+    for name in names { if selector == name || selector == "Dispatch." + name { known = true } }
+    test.check(known, "unknown format wiring test selector")
+    selectors.add(selector)
+}
+if selected(selectors, "test_explicit_sanitizer_compiler_space_apostrophe_and_path") {
+    for target in ["check-compression-sanitize", "check-sha256-sanitize", "check-tar-sanitize", "check-formats-pipeline-sanitize"] { runRecipe(target, true) }
+}
+if selected(selectors, "test_sanitizer_default_uses_native_compiler") { runRecipe("check-sha256-sanitize", false) }
+if selected(selectors, "test_native_recipe_keeps_native_toolchain") { runRecipe("check-sha256", true) }
+print("Format Make launch environment: passed")
