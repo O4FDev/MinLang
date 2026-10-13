@@ -103,6 +103,30 @@ with tempfile.TemporaryDirectory(prefix='minyar-native-regions-') as temporary:
         ran = subprocess.run([binary], capture_output=True, text=True, timeout=60, env=environment)
         assert (ran.returncode, ran.stdout, ran.stderr) == (7, expected_stdout, ''), ran
         print('main-exit-' + variant, args.sanitizer, 'joined status passed', flush=True)
+    for compile_only in (False, True):
+        source = directory / 'main-machine.min'
+        controls = 'machine.out8(244, 7)' if compile_only else 'machine.pause()\n    machine.fence()\n    controls()'
+        text = entry + main.replace('    nativeThreadSetup()', '    nativeThreadSetup()\n    ' + controls)
+        if not compile_only:
+            text = 'function controls() { machine.pause(); machine.fence() }\n' + text
+        source.write_text('use "machine" as machine\n' + text)
+        llvm = directory / 'main-machine.ll'
+        compiled = subprocess.run([str(selected), str(source), str(llvm), '--library', str(ROOT / 'library'),
+            '--bounded-owners', '32'], capture_output=True, text=True, timeout=90, env=environment)
+        assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+        symbols = ('out8',) if compile_only else ('pause', 'fence')
+        assert all('@minyar_machine_' + name in llvm.read_text() for name in symbols)
+        binary = directory / 'main-machine'
+        linked = subprocess.run(['python3', str(ROOT / 'tools/clang-driver.py'), 'link', str(ROOT), str(llvm),
+            str(ROOT / 'build/minyar-default-runtime.o'), str(binary), '0'],
+            capture_output=True, text=True, timeout=240, env=environment)
+        assert linked.returncode == 0, linked.stdout + linked.stderr
+        if compile_only:
+            print('main-out8', args.sanitizer, 'compile-only passed; not executed', flush=True)
+        else:
+            ran = subprocess.run([binary], capture_output=True, text=True, timeout=60, env=environment)
+            assert (ran.returncode, ran.stdout, ran.stderr) == (0, '', ''), ran
+            print('main-pause-fence', args.sanitizer, 'bounded direct and helper calls passed', flush=True)
     cases = {
         'legacy-main-address': entry + main.replace('    nativeThreadSetup()\n', '').replace(
             '    let input =', '    let local = Bytes(8)\n    let raw = machine.address(local)\n    let input ='),
@@ -133,6 +157,12 @@ with tempfile.TemporaryDirectory(prefix='minyar-native-regions-') as temporary:
         'unreviewed-extern-main': 'function dangerous(): Integer { native "not_reviewed" }\n' +
             entry + main.replace('    nativeThreadSetup()', '    nativeThreadSetup()\n    dangerous()'),
     }
+    for operation, call in (('pause', 'machine.pause()'), ('fence', 'machine.fence()'),
+                            ('out8', 'machine.out8(244, 7)')):
+        cases['worker-machine-' + operation] = entry.replace('return input.getInt64(0)', call + '\n    return 0') + main
+        cases['worker-machine-' + operation + '-helper'] = 'function unsafe() { ' + call + ' }\n' + \
+            entry.replace('return input.getInt64(0)', 'unsafe()\n    return 0') + main
+        cases['legacy-main-machine-' + operation] = entry + main.replace('    nativeThreadSetup()', '    ' + call)
     library = directory / 'library'
     library.mkdir()
     (library / 'machine.min').write_bytes((ROOT / 'library/machine.min').read_bytes())
@@ -157,5 +187,9 @@ with tempfile.TemporaryDirectory(prefix='minyar-native-regions-') as temporary:
         if provider: assert provider in rejected.stderr + rejected.stdout, (label, rejected)
         if label in ('legacy-main-exit', 'worker-exit', 'worker-exit-helper'):
             assert "builtin 'exit' 0(1)" in rejected.stderr + rejected.stdout, (label, rejected)
+        if '-machine-' in label:
+            operation = label.split('-machine-', 1)[1].removesuffix('-helper')
+            signature = '5(1,1)' if operation == 'out8' else '5()'
+            assert "native 'minyar_machine_" + operation + "' " + signature in rejected.stderr + rejected.stdout, (label, rejected)
         assert 'AddressSanitizer:' not in rejected.stderr and 'runtime error:' not in rejected.stderr, (label, rejected)
         print(label, args.sanitizer, 'rejected before IR publication', flush=True)
