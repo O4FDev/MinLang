@@ -2252,7 +2252,7 @@ class BuildWiring(unittest.TestCase):
                         ('check-os-tlsverify-sanitize', selected_compiler or sanitizer or ordinary,
                          ['--sanitize'])):
                     result = subprocess.run(['make', '--no-print-directory', '-rR', '-s',
-                        '-f', str(probe), target], cwd=ROOT, env=selected_environment,
+                        '-f', str(probe), target], cwd=directory, env=selected_environment,
                         capture_output=True, text=True, timeout=15)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     selected = json.loads(result.stdout)
@@ -2397,9 +2397,8 @@ class BuildWiring(unittest.TestCase):
             python = binaries / 'python3'
             python.write_text('#!' + sys.executable + '\n' +
                 'import json,os,sys\n'
-                'if sys.argv[1:2] in (["tests/net-connect.py"],["tests/net-udp-offload.py"]):\n'
-                ' key="MINYAR_CLANG" if sys.argv[1]=="tests/net-connect.py" else "MINYAR_TEST_CLANG"\n'
-                ' print(json.dumps({"clang":os.environ.get(key),"path":os.environ["PATH"],'
+                'if sys.argv[1:2] == ["tests/net-udp-offload.py"]:\n'
+                ' print(json.dumps({"clang":os.environ.get("MINYAR_TEST_CLANG"),"path":os.environ["PATH"],'
                 '"limit":os.environ.get("NET_PROBE_LIMIT"),"argv":sys.argv[1:]}));sys.exit(0)\n'
                 'if os.environ.get("NET_PROBE_MSYS") and sys.argv[1:2] == ["-c"]:\n'
                 ' sys.path.insert(0,"tools");import host_paths\n'
@@ -2422,9 +2421,18 @@ class BuildWiring(unittest.TestCase):
             for name in ('MAKEFLAGS', 'MINYAR_SANITIZER_CLANG', 'MINYAR_CLANG', 'MINYAR_TEST_CLANG'):
                 environment.pop(name, None)
             ordinary = str(directory / 'ordinary UCRT compiler/bin/clang')
+            connect = 'build/tooling/tests/net-connect-test'
+            (directory / 'tools').symlink_to(ROOT / 'tools')
+            native = directory / connect
+            native.parent.mkdir(parents=True)
+            native.write_text('#!' + sys.executable + '\n' +
+                'import json,os,sys\n'
+                'print(json.dumps({"clang":os.environ.get("MINYAR_CLANG"),"path":os.environ["PATH"],'
+                '"limit":os.environ.get("NET_PROBE_LIMIT"),"argv":["' + connect + '",*sys.argv[1:]]}))\n')
+            native.chmod(0o755)
             targets = (
-                ('check-net-connect', 'tests/net-connect.py', [], {'build/minyarc'}),
-                ('check-net-connect-sanitize', 'tests/net-connect.py', ['--sanitize'], {'build/minyarc'}),
+                ('check-net-connect', connect, [], {'build/minyarc'}),
+                ('check-net-connect-sanitize', connect, ['--sanitize'], {'build/minyarc'}),
                 ('check-net-udp-offload', 'tests/net-udp-offload.py',
                  ['--evidence', 'build/net-udp-offload'], {'build/minyarc', 'build/minyar-default-runtime.o'}),
                 ('check-net-udp-offload-sanitize', 'tests/net-udp-offload.py',
@@ -2448,7 +2456,7 @@ class BuildWiring(unittest.TestCase):
                         NET_PROBE_TRANSLATIONS=json.dumps({sanitizer: selected_compiler}))
                 for target, script, arguments, prerequisites in targets:
                     result = subprocess.run(['make', '--no-print-directory', '-j1', '-rR', '-s',
-                        '-f', str(probe), target], cwd=ROOT, env=selected_environment,
+                        '-f', str(probe), target], cwd=directory, env=selected_environment,
                         capture_output=True, text=True, timeout=15)
                     self.assertEqual(result.returncode, 0, (target, result.stderr))
                     records = [json.loads(line) for line in result.stdout.splitlines()]
@@ -2469,7 +2477,8 @@ class BuildWiring(unittest.TestCase):
                     rule = next(line for line in candidate.splitlines() if line.startswith(target + ':'))
                     if sanitizer or not sanitize:
                         self.assertEqual(set(rule.split(':', 1)[1].split()), prerequisites |
-                                         ({'tools/host_paths.py'} if sanitize else set()), target)
+                                         ({'tools/host_paths.py'} if sanitize else set()) |
+                                         ({connect} if script == connect else set()), target)
 
             # Expected spellings and complete parents are independent of the Make selector.
             verify(fragment)
@@ -2493,7 +2502,7 @@ class BuildWiring(unittest.TestCase):
                 mutants.extend((
                     (recipe, recipe.replace('$(NET_SANITIZER_CLANG)', '$(LLVM_CC)')),
                     (recipe, recipe.replace('$(NET_SANITIZER_CLANG)', '/wrong/compiler')),
-                    (recipe, recipe.replace(('MINYAR_CLANG' if script == 'tests/net-connect.py'
+                    (recipe, recipe.replace(('MINYAR_CLANG' if script == connect
                         else 'MINYAR_TEST_CLANG') + '=$(call NET_SANITIZER_QUOTE,$(NET_SANITIZER_CLANG)) ', '')),
                     (recipe, recipe.replace('PATH="$(NET_SANITIZER_PATH)" ', '')),
                     (rule, rule.replace(' tools/host_paths.py', ''))))
