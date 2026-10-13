@@ -1556,12 +1556,31 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
         // Application Data has no PTO before confirmation (RFC9002 6.2.1).
         if connection.clientRole && !connection.confirmed && !connection.handshakeAcknowledged &&
            connection.spaces[1].active && connection.spaces[1].write.key.length > 0 { probeLevel = 1 }
+        let smallHandshakeProbe = false
+        let active = pathIndex(connection,connection.activePath)
+        if !connection.clientRole && !connection.addressValidated && active >= 0 &&
+           connection.spaces[1].active && connection.spaces[1].write.key.length > 0 {
+            let path = connection.paths[active]
+            let credit = min(3 * connection.receivedBytes - connection.sentBytes,3 * path.received - path.sent)
+            let minimum = packetHeaderLengthPath(connection,1,1,path.id) + 17
+            if credit >= minimum && credit < 1200 { probeLevel = 1; smallHandshakeProbe = true }
+        }
         let space = connection.spaces[probeLevel]
-        if !probeCrypto(connection,probeLevel) {
+        if smallHandshakeProbe { enqueue(connection,probeLevel,crypto.fromHex("01"),true) }
+        else if !probeCrypto(connection,probeLevel) {
             if space.sent.length > 0 {
                 let sent = space.sent[0]
                 if !retryPacket(connection,sent,true) { enqueue(connection,probeLevel,crypto.fromHex("01"),true) }
             } else { enqueue(connection,probeLevel,crypto.fromHex("01"),true) }
+        }
+        if connection.clientRole && !connection.confirmed {
+            let copied = false
+            for pending in connection.pending {
+                if pending.level == probeLevel && pending.probe {
+                    enqueuePath(connection,probeLevel,pending.payload,true,pending.path); copied = true; break
+                }
+            }
+            if !copied { enqueue(connection,probeLevel,crypto.fromHex("01"),true) }
         }
         connection.congestion.probes += 1
         // One timeout changes the shared backoff for every scheduled space.
