@@ -415,7 +415,7 @@ def verify_link(directory, binary, sanitize, optimization='0', compiler_identity
                      and value.endswith(('.o', '.obj', '.a', '.lib', '.so', '.dylib'))]
     require(actual_native == native_originals, 'unrepresented or unused native link input')
     tools, bindings = report.get('tools'), report.get('tool_bindings')
-    names = {'clang-driver.py', 'sanitizer_llvm.py', 'clang.bin'}
+    names = {'clang-driver', 'clang.bin'}
     require(isinstance(tools, dict) and set(tools) == names
             and isinstance(bindings, dict) and set(bindings) == names,
             'canonical helper or compiler evidence missing')
@@ -423,8 +423,8 @@ def verify_link(directory, binary, sanitize, optimization='0', compiler_identity
         verify_binding(directory, bindings[name])
         require(bindings[name]['retained'] == name and tools[name] == digest(directory / name),
                 'retained tool binding mismatch')
-    for name in ('clang-driver.py', 'sanitizer_llvm.py'):
-        require(tools[name] == digest(ROOT / 'tools' / name), 'canonical link helper mismatch')
+    require(tools['clang-driver'] == digest(ROOT / 'build/tooling/tools/clang-driver'),
+            'canonical link helper mismatch')
     compiler = report.get('compiler_pre_link')
     require(isinstance(compiler, dict)
             and compiler.get('selected_command') == command[0]

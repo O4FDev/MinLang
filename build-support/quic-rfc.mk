@@ -1,7 +1,7 @@
 # Public launcher builds every RFC fixture at O0/O2; each author driver runs all cases.
 .PHONY: check-quic-rfc check-quic-rfc-sanitize check-quic-protocol-artifacts
 QUIC_RFC_FRONTENDS = build/minyarc build/minyarc-callbacks build/minyarc-errors-request build/minyarc-errors
-QUIC_RFC_INPUTS = minyar tools/clang-driver.py tools/sanitizer_llvm.py \
+QUIC_RFC_INPUTS = minyar build/tooling/tools/clang-driver tools/sanitizer_llvm.py \
     tests/quic-rfc.py tests/quic-rfc-harness.py tests/test_evidence.py tests/clang_helpers.py \
     tests/tls-local.py tests/quic_protocol_artifacts.py tests/quic-protocol-artifacts.py tests/interop/qns/endpoint.py library/quic.min library/tls.min library/tlsserver.min \
     build/tooling/tests/quic-migration-cids-test tests/quic-migration-cids-test.min tests/quic-migration-cids.min \

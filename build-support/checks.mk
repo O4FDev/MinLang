@@ -1,7 +1,7 @@
 .PHONY: all check check-portable check-smoke check-regressions check-diagnostics check-conformance check-coverage check-memory check-runtime-unit check-ownership check-adversarial check-ownership-mutation check-ownership-stress check-budget check-fuzz check-fuzz-coverage check-stack-overflow check-windows-large-file check-modules check-mutation check-mutation-score check-performance check-scaling check-sanitize check-stress doctor emit run clean
 
 .PHONY: check-runtime-cache
-check-runtime-cache: build/minyarc build/tooling/tests/runtime-cache
+check-runtime-cache: build/minyarc build/tooling/tests/runtime-cache build/tooling/tools/clang-driver
 	$(LIMITED) ./build/tooling/tests/runtime-cache
 
 check: check-runtime-cache
@@ -43,7 +43,7 @@ check: check-memory-contracts-harness
 .PHONY: check-release-build check-critical-path check-launcher-isolation
 check: check-launcher-isolation
 
-check-launcher-isolation: build/minyarc build/minyarc-errors-request build/minyar-runtime.o build/minyar-runtime-release.ll
+check-launcher-isolation: build/minyarc build/minyarc-errors-request build/minyar-runtime.o build/minyar-runtime-release.ll build/tooling/tools/clang-driver
 	$(LIMITED) python3 tests/launcher-isolation.py
 
 check-release-build: build/minyarc build/minyar-runtime.o build/minyar-runtime-release.ll
@@ -361,7 +361,7 @@ check-bounded: build/minyarc build/minyar-runtime-bounded.o build/bounded-runtim
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/bounded-ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/production-memory
 
 .PHONY: check-incremental-modules
-check-incremental-modules: build/minyarc-errors-request build/minyarc-modules build/module-compiler-stage2.ll build/module-compiler-stage3.ll build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-release.ll build/minyarc-callbacks build/tooling/tests/recursive-data
+check-incremental-modules: build/minyarc-errors-request build/minyarc-modules build/module-compiler-stage2.ll build/module-compiler-stage3.ll build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-release.ll build/minyarc-callbacks build/tooling/tests/recursive-data build/tooling/tools/clang-driver
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --profile core --ir build/module-compiler-stage3.ll
 	$(LIMITED) python3 tests/incremental-modules.py
 	$(LIMITED) python3 tests/incremental-module-driver.py
@@ -394,7 +394,7 @@ check-incremental-module-mutation: build/minyarc-modules build/module-compiler.m
 check-toolchain-stamp:
 	python3 tests/toolchain-stamp.py
 
-check-toolchain-portability:
+check-toolchain-portability: build/tooling/tools/clang-driver
 	python3 tests/toolchain-portability.py
 
 .PHONY: check-cold-bootstrap

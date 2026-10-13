@@ -32,7 +32,10 @@ class ToolchainPortability(unittest.TestCase):
         shutil.copy2(ROOT / 'minyar', self.project / 'minyar')
         shutil.copytree(ROOT / 'runtime', self.project / 'runtime')
         shutil.copytree(ROOT / 'tools', self.project / 'tools')
-        (self.project / 'Makefile').write_text('.PHONY: build/minyarc\nbuild/minyarc:\n\t@:\n')
+        (self.project / 'Makefile').write_text('.PHONY: build/minyarc build/tooling/tools/clang-driver\n'
+                                               'build/minyarc build/tooling/tools/clang-driver:\n\t@:\n')
+        (build / 'tooling/tools').mkdir(parents=True)
+        shutil.copy2(ROOT / 'build/tooling/tools/clang-driver', build / 'tooling/tools/clang-driver')
         self.write_executable(build / 'minyarc', '''import os, sys
 from pathlib import Path
 Path(sys.argv[2]).write_text('; minyar-native-library: graphics\\n' if os.environ.get('TEST_GRAPHICS') else '; test IR\\n')
@@ -63,7 +66,8 @@ if '--libs' in sys.argv: print('-lglfw')
         self.env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ['PATH'],
                         MINYAR_CLANG=str(self.clang), TEST_CLANG_LOG=str(self.log),
                         TEST_GLFW_INCLUDE=str(self.include), LIMITED='', SANITIZER_LIMITED='')
-        for name in ('MINYAR_CLANG_FLAGS', 'MINYAR_RUNTIME_FLAGS', 'MINYAR_MAKE_FLAGS', 'MAKEFLAGS', 'MFLAGS'):
+        for name in ('MINYAR_CLANG_FLAGS', 'MINYAR_RUNTIME_FLAGS', 'MINYAR_MAKE_FLAGS', 'MAKEFLAGS', 'MFLAGS',
+                     'MINYAR_NATIVE_FLAGS', 'MINYAR_LINK_ARTIFACTS', 'MINYAR_TEST_HOST_SYSTEM'):
             self.env.pop(name, None)
         self.source = self.work / 'source file.min'
         self.write_executable(self.clang.parent / 'ld.lld', 'print("LLD 23.1.2")\n')
@@ -133,20 +137,29 @@ Path(os.environ['TEST_MAKE_LOG']).write_text(json.dumps({name: os.environ.get(na
         chosen = json.loads(log.read_text())
         self.assertEqual(chosen, {'CC': str(self.clang), 'LLVM_CC': str(self.clang)})
 
+    def bootstrap(self, environment, targets=('build/minyarc-modules',)):
+        log = self.work / 'make call.json'
+        log.unlink(missing_ok=True)
+        self.write_executable(self.bin / 'make', 'import json,os,sys\n'
+                              'open(os.environ["TEST_MAKE_CALL"],"w").write(json.dumps('
+                              '{"argv":sys.argv[1:],"env":dict(os.environ)}))\n')
+        result = subprocess.run(['sh', str(self.project / 'tools/toolchain.sh'), 'bootstrap',
+                                 str(self.project), *targets],
+                                cwd=self.work, env=dict(environment, TEST_MAKE_CALL=str(log)),
+                                capture_output=True, text=True, timeout=30)
+        (self.bin / 'make').unlink()
+        if result.returncode:
+            self.assertFalse(log.exists(), 'rejected bootstrap configuration must not run make')
+            raise ValueError(result.stderr)
+        return json.loads(log.read_text())
+
     def bootstrap_environment(self, extra=None, system='Linux'):
-        spec = importlib.util.spec_from_file_location('driver', ROOT / 'tools/clang-driver.py')
-        driver = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(driver)
-        environment = dict(self.env, **(extra or {}))
+        environment = dict(self.env, **(extra or {}), MINYAR_TEST_HOST_SYSTEM=system)
         if not extra or 'COMPILER_LTO_FLAGS' not in extra:
             environment.pop('COMPILER_LTO_FLAGS', None)
         if not extra or 'LLVM_FLAGS' not in extra:
             environment.pop('LLVM_FLAGS', None)
-        with patch.dict(driver.os.environ, environment, clear=True), \
-             patch.object(driver.platform, 'system', return_value=system), \
-             patch.object(driver, 'run') as run:
-            driver.bootstrap(self.project, ['build/minyarc-modules'])
-        return run.call_args.kwargs['env']
+        return self.bootstrap(environment)['env']
 
     def test_linux_bootstrap_bounds_matching_lld_threads_with_literal_paths(self):
         linker = self.clang.parent / 'ld.lld'
@@ -166,31 +179,17 @@ Path(os.environ['TEST_MAKE_LOG']).write_text(json.dumps({name: os.environ.get(na
             self.bootstrap_environment()
 
     def test_bootstrap_make_options_are_literal_and_default_argv_is_unchanged(self):
-        spec = importlib.util.spec_from_file_location('driver', ROOT / 'tools/clang-driver.py')
-        driver = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(driver)
         for extra, expected in (('', []), ('-j4 -o "build/compiler stage2.ll"',
                                          ['-j4', '-o', 'build/compiler stage2.ll'])):
-            with patch.dict(driver.os.environ, dict(self.env, MINYAR_MAKE_FLAGS=extra), clear=True), \
-                 patch.object(driver, 'run') as run:
-                driver.bootstrap(self.project, ['build/minyarc-modules'])
-            self.assertEqual(run.call_args.args[0],
+            call = self.bootstrap(dict(self.env, MINYAR_MAKE_FLAGS=extra))
+            self.assertEqual(['make', *call['argv']],
                              ['make', '-s', '-C', str(self.project), *expected, 'build/minyarc-modules'])
 
     def test_bootstrap_rejects_malformed_make_options_before_make(self):
-        spec = importlib.util.spec_from_file_location('driver', ROOT / 'tools/clang-driver.py')
-        driver = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(driver)
-        with patch.dict(driver.os.environ, dict(self.env, MINYAR_MAKE_FLAGS='-o "unterminated'), clear=True), \
-             patch.object(driver, 'run') as run:
-            with self.assertRaisesRegex(ValueError, 'MINYAR_MAKE_FLAGS'):
-                driver.bootstrap(self.project, ['build/minyarc-modules'])
-        run.assert_not_called()
+        with self.assertRaisesRegex(ValueError, 'MINYAR_MAKE_FLAGS'):
+            self.bootstrap(dict(self.env, MINYAR_MAKE_FLAGS='-o "unterminated'))
 
     def test_bootstrap_assume_old_keeps_compiler_and_rebuilds_current_runtime(self):
-        spec = importlib.util.spec_from_file_location('driver', ROOT / 'tools/clang-driver.py')
-        driver = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(driver)
         compiler = self.project / 'build/compiler-stage2.ll'
         runtime = self.project / 'build/runtime.o'
         header = self.project / 'current-runtime.h'
@@ -205,35 +204,57 @@ Path(os.environ['TEST_MAKE_LOG']).write_text(json.dumps({name: os.environ.get(na
             header.write_text(value)
             if runtime.exists():
                 os.utime(runtime, (1, 1))
-            with patch.dict(driver.os.environ,
-                            dict(self.env, MINYAR_MAKE_FLAGS='-j4 -o build/compiler-stage2.ll'), clear=True):
-                driver.bootstrap(self.project, ['check'])
+            result = subprocess.run(['sh', str(self.project / 'tools/toolchain.sh'), 'bootstrap',
+                                     str(self.project), 'check'],
+                                    cwd=self.work, env=dict(self.env, MINYAR_MAKE_FLAGS='-j4 -o build/compiler-stage2.ll'),
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(compiler.read_text(), 'verified compiler bytes\n')
             self.assertEqual(runtime.read_text(), value)
 
+    def driver_link(self, llvm, runtime, environment, release='0', clang=None):
+        return subprocess.run([str(self.project / 'build/tooling/tools/clang-driver'), 'link', str(self.project),
+                               str(llvm), str(runtime), str(self.output), release],
+                              cwd=self.work, env=dict(self.env, MINYAR_CLANG=str(clang or self.clang), **environment),
+                              capture_output=True, text=True, timeout=60)
+
     def test_windows_release_discovers_native_lld_exe_without_changing_explicit_linker(self):
-        spec = importlib.util.spec_from_file_location('driver', ROOT / 'tools/clang-driver.py')
-        driver = importlib.util.module_from_spec(spec); spec.loader.exec_module(driver)
         linker = self.clang.parent / 'ld.lld.exe'
         self.write_executable(linker, 'pass\n')
+        llvm = self.work / 'release.ll'
+        llvm.write_text('; no native package\n')
         for system in ('Windows', 'MSYS_NT-10.0', 'MINGW64_NT-10.0'):
-            with self.subTest(system=system), patch.object(driver.platform,'system',return_value=system), \
-                 patch.object(driver.shutil,'which',side_effect=lambda name: str(self.clang) if name=='clang' else None):
-                self.assertEqual(driver.lto_flags('clang', []),
-                    ['-flto=thin', '-fuse-ld=lld', '--ld-path=' + str(linker.resolve())])
-                self.assertEqual(driver.lto_flags('clang', ['-fuse-ld=/chosen/linker']), ['-flto=thin'])
-                self.assertEqual(driver.lto_flags('clang', ['--ld-path=/chosen/linker']), ['-flto=thin'])
+            for flags, expected in (('', ['-flto=thin', '-fuse-ld=lld', '--ld-path=' + str(linker.resolve())]),
+                                    ('-fuse-ld=/chosen/linker', ['-flto=thin']),
+                                    ('--ld-path=/chosen/linker', ['-flto=thin'])):
+                with self.subTest(system=system, flags=flags):
+                    self.log.write_text('')
+                    environment = {'MINYAR_TEST_HOST_SYSTEM': system}
+                    if flags:
+                        environment['MINYAR_CLANG_FLAGS'] = flags
+                    result = self.driver_link(llvm, self.work / 'runtime.o', environment, release='1')
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    link = json.loads(self.log.read_text().splitlines()[-1])
+                    chosen = [flags] if flags else ['-O2', '-Wno-override-module']
+                    self.assertEqual(link[:len(chosen)], chosen)
+                    self.assertEqual(link[len(chosen):len(chosen) + len(expected)], expected)
+                    self.assertNotIn('-flto=thin', link[len(chosen) + len(expected):])
 
     @unittest.skipUnless(windows_host(), 'requires native Windows Clang')
     def test_windows_release_links_real_bitcode_with_discovered_linker(self):
-        spec = importlib.util.spec_from_file_location('driver', ROOT / 'tools/clang-driver.py')
-        driver = importlib.util.module_from_spec(spec); spec.loader.exec_module(driver)
         clang = os.environ.get('MINYAR_TEST_CLANG', 'clang')
         source = self.project / 'real-release.c'
         source.write_text('int main(void) { return 0; }\n')
+        llvm = self.project / 'real-release.ll'
+        runtime = self.project / 'real-runtime.o'
+        (self.project / 'real-runtime.c').write_text('int minyar_release_fixture;\n')
+        for command in ([clang, '-S', '-emit-llvm', str(source), '-o', str(llvm)],
+                        [clang, '-c', str(self.project / 'real-runtime.c'), '-o', str(runtime)]):
+            self.assertEqual(subprocess.run(command, capture_output=True, text=True, timeout=30).returncode, 0)
         executable = self.project / 'real-release.exe'
-        result = subprocess.run([clang, *driver.lto_flags(clang, []), str(source), '-o', str(executable)],
-                                capture_output=True, text=True, timeout=30)
+        result = subprocess.run([str(self.project / 'build/tooling/tools/clang-driver'), 'link', str(self.project),
+                                 str(llvm), str(runtime), str(executable), '1'],
+                                env=dict(self.env, MINYAR_CLANG=clang), capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(executable.is_file())
 
@@ -465,28 +486,26 @@ output.write_bytes(b'complete executable')
         self.assertFalse(self.log.exists())
 
     def test_unix_links_math_even_without_graphics(self):
-        spec = importlib.util.spec_from_file_location('driver', ROOT / 'tools/clang-driver.py')
-        driver = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(driver)
         llvm = self.work / 'program.ll'
         llvm.write_text('; no native package\n')
-        argv = ['clang-driver.py', 'link', str(self.project), str(llvm), 'runtime.o', str(self.output), '0']
-        def link(command):
-            Path(command[command.index('-o') + 1]).write_text('complete executable')
-
-        with patch.object(driver.platform, 'system', return_value='Linux'), \
-             patch.object(driver.sys, 'argv', argv), patch.object(driver, 'run', side_effect=link) as run:
-            driver.main()
-        self.assertIn('-lm', run.call_args.args[0])
+        self.write_executable(self.clang, '''import json, os, sys
+from pathlib import Path
+if '--version' in sys.argv:
+    print('clang version 23.1.2')
+    sys.exit(0)
+with open(os.environ['TEST_CLANG_LOG'], 'a') as f:
+    f.write(json.dumps(sys.argv[1:]) + '\\n')
+Path(sys.argv[sys.argv.index('-o') + 1]).write_text('complete executable')
+''')
+        self.log.write_text('')
+        result = self.driver_link(llvm, self.work / 'runtime.o', {'MINYAR_TEST_HOST_SYSTEM': 'Linux'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('-lm', json.loads(self.log.read_text().splitlines()[-1]))
         self.assertEqual(self.output.read_text(), 'complete executable')
 
     def test_appkit_managed_cleanup_selection_and_native_cache(self):
-        spec = importlib.util.spec_from_file_location('driver', ROOT / 'tools/clang-driver.py')
-        driver = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(driver)
         llvm = self.work / 'app.ll'
-        argv = ['clang-driver.py', 'link', str(self.project), str(llvm),
-                'runtime.o', str(self.output), '0']
+        runtime = self.project / 'build/minyar-default-runtime.o'
         macro = '-DMINYAR_APP_MANAGED_CLEANUP=1'
         variants = {}
         cases = [
@@ -498,22 +517,20 @@ output.write_bytes(b'complete executable')
             ('cycle-without-appkit', ['net'], '; minyar-cycle-runtime: 1\n', False),
             ('plain', [], '', False),
         ]
-        environment = dict(self.env, MINYAR_CLANG_FLAGS='-O0',
-                           MINYAR_NATIVE_FLAGS='-O1 -DCONTROL=1')
+        environment = {'MINYAR_CLANG_FLAGS': '-O0', 'MINYAR_NATIVE_FLAGS': '-O1 -DCONTROL=1',
+                       'MINYAR_TEST_HOST_SYSTEM': 'Darwin'}
         for label, libraries, marker, managed_app in cases:
             with self.subTest(case=label):
                 llvm.write_text(marker + ''.join('; minyar-native-library: ' + name + '\n'
                                                 for name in libraries))
                 self.log.write_text('')
-                with patch.dict(driver.os.environ, environment, clear=True), \
-                     patch.object(driver.platform, 'system', return_value='Darwin'), \
-                     patch.object(driver.sys, 'argv', argv), \
-                     patch.object(driver, 'cycle_runtime_object', return_value='managed-runtime.o') as runtime:
-                    driver.main()
+                result = self.driver_link(llvm, runtime, environment)
+                self.assertEqual(result.returncode, 0, result.stderr)
                 calls = [json.loads(line) for line in self.log.read_text().splitlines()]
                 link = calls[-1]
                 self.assertNotIn(macro, link, 'cleanup hooks belong only in native objects')
-                self.assertEqual(runtime.call_count, int(bool(marker or 'callbackruntime' in libraries)))
+                self.assertEqual(any('/native/cycle-runtime-' in arg for arg in link),
+                                 bool(marker or 'callbackruntime' in libraries))
                 app_objects = [arg for arg in link if '/native/macos-' in arg]
                 if 'macos' in libraries:
                     self.assertEqual(len(app_objects), 1)
@@ -574,18 +591,36 @@ output.write_bytes(b'complete executable')
         self.assertEqual(len(self.native_calls(self.launch(base))), 1)
 
     def test_graphics_cache_does_not_read_entire_compiler(self):
-        spec = importlib.util.spec_from_file_location('driver', ROOT / 'tools/clang-driver.py')
-        driver = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(driver)
-        read_bytes = Path.read_bytes
-
-        def bounded_read(path):
-            self.assertNotEqual(path.resolve(), self.clang.resolve(),
-                                'warm native builds must not hash a whole compiler binary')
-            return read_bytes(path)
-
-        with patch.dict(os.environ, self.env), patch.object(Path, 'read_bytes', bounded_read):
-            driver.graphics(self.project, str(self.clang), driver.clang_identity(str(self.clang)), ['-O2'])
+        selected = (shutil.which(os.environ.get('MINYAR_TEST_CLANG', 'clang')) or shutil.which('clang-23')
+                    or shutil.which('cc'))
+        self.assertIsNotNone(selected, 'a C compiler is required for the execute-only Clang fixture')
+        source = self.work / 'execute-only-clang.c'
+        source.write_text('''#include <stdio.h>
+#include <string.h>
+int main(int count, char **arguments) {
+    for (int index = 1; index < count; index++) {
+        if (!strcmp(arguments[index], "--version")) { puts("clang version 23.1.2"); return 0; }
+    }
+    for (int index = 1; index + 1 < count; index++) {
+        if (!strcmp(arguments[index], "-o")) {
+            FILE *output = fopen(arguments[index + 1], "w");
+            if (!output) return 1;
+            fputs("; output\\n", output);
+            return fclose(output) != 0;
+        }
+    }
+    return 2;
+}
+''')
+        compiler = self.work / 'execute only clang'
+        built = subprocess.run([selected, str(source), '-o', str(compiler)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        compiler.chmod(0o111)
+        llvm = self.work / 'graphics.ll'
+        llvm.write_text('; minyar-native-library: graphics\n')
+        result = self.driver_link(llvm, self.work / 'runtime.o', {'MINYAR_TEST_HOST_SYSTEM': 'Linux'}, clang=compiler)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(list((self.project / 'build/native').glob('graphics-*.o'))), 1)
 
     def test_graphics_cache_tracks_compiler_replacement_with_preserved_mtime(self):
         base = {'TEST_GRAPHICS': '1'}

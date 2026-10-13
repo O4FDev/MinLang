@@ -32,7 +32,7 @@ build:
 	mkdir -p build
 
 doctor:
-	@MINYAR_CLANG="$(LLVM_CC)" python3 tools/clang-driver.py doctor
+	@MINYAR_CLANG="$(LLVM_CC)" sh tools/toolchain.sh doctor
 
 clean:
 	rm -rf build

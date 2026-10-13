@@ -634,7 +634,7 @@ class BuildWiring(unittest.TestCase):
         native, sanitize = 'check-quic-rfc', 'check-quic-rfc-sanitize'
         frontends = {'build/minyarc', 'build/minyarc-callbacks',
                      'build/minyarc-errors-request', 'build/minyarc-errors'}
-        inputs = {'minyar', 'tools/clang-driver.py', 'tools/sanitizer_llvm.py',
+        inputs = {'minyar', 'build/tooling/tools/clang-driver', 'tools/sanitizer_llvm.py',
                   'tests/quic-rfc.py', 'tests/quic-rfc-harness.py',
                   'tests/test_evidence.py', 'tests/clang_helpers.py',
                   'tests/tls-local.py', 'tests/quic_protocol_artifacts.py', 'tests/quic-protocol-artifacts.py',
@@ -725,7 +725,7 @@ class BuildWiring(unittest.TestCase):
         native = {'build/tooling/tests/quic-migration-cids-test', 'tests/quic-migration-cids-test.min',
                   'build/tooling/tests/quic-cipher-policy-test', 'tests/quic-cipher-policy-test.min',
                   'tests/quic-protocol-support.min', 'tests/quic-test-support.min', 'tools/testing.min'}
-        for name in sorted(inputs - native - {'minyar', 'tools/clang-driver.py',
+        for name in sorted(inputs - native - {'minyar', 'build/tooling/tools/clang-driver',
                                               'tools/sanitizer_llvm.py', 'library/quic.min',
                                               'library/tls.min', 'library/tlsserver.min'}):
             self.assertIn(name, catalogue.discover(ROOT))
@@ -834,9 +834,10 @@ class BuildWiring(unittest.TestCase):
             with self.subTest(dependency=dependency), self.assertRaises(AssertionError):
                 verify(fragment.replace(dependency+' ', '', 1))
         compiler = (ROOT/'build-support/compiler.mk').read_text()
-        rules = re.findall(r'^build/[^:\n]*sanitize\.ll:([^\n]*)',compiler,re.M)
+        rules = re.findall(r'^build/[^:\n]*sanitize\.ll:([^\n]*)\n\t([^\n]*)',compiler,re.M)
         self.assertEqual(len(rules),1)
-        self.assertTrue(all('tests/llvm_sanitizer.py' in r and 'tools/sanitizer_llvm.py' in r for r in rules))
+        self.assertTrue(all('build/tooling/tools/clang-driver' in r and 'clang-driver sanitize-llvm' in c
+                            for r, c in rules))
         shim = (ROOT/'tests/llvm_sanitizer.py').read_text()
         self.assertIn('from sanitizer_llvm import',shim)
         self.assertNotIn('def instrument_address_sanitizer',shim)

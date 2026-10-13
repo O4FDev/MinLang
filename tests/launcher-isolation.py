@@ -26,11 +26,13 @@ class LauncherIsolation(unittest.TestCase):
         build = self.project / 'build'
         build.mkdir(parents=True)
         shutil.copy2(ROOT / 'minyar', self.project / 'minyar')
-        for name in ('minyarc', 'minyarc-errors-request', 'minyar-runtime.o', 'minyar-runtime-release.ll'):
+        for name in ('minyarc', 'minyarc-errors-request', 'minyar-runtime.o', 'minyar-runtime-release.ll',
+                     'tooling/tools/clang-driver'):
+            (build / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / 'build' / name, build / name)
         (self.project / 'Makefile').write_text(
-            '.PHONY: build/minyarc build/minyarc-errors-request build/minyar-runtime.o build/minyar-runtime-release.ll\n'
-            'build/minyarc build/minyarc-errors-request build/minyar-runtime.o build/minyar-runtime-release.ll:\n\t@:\n')
+            '.PHONY: build/minyarc build/minyarc-errors-request build/minyar-runtime.o build/minyar-runtime-release.ll build/tooling/tools/clang-driver\n'
+            'build/minyarc build/minyarc-errors-request build/minyar-runtime.o build/minyar-runtime-release.ll build/tooling/tools/clang-driver:\n\t@:\n')
         shutil.copytree(ROOT / 'runtime', self.project / 'runtime')
         shutil.copytree(ROOT / 'tools', self.project / 'tools')
         # Keep this path space-free for the race-only regression on the old launcher.

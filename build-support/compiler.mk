@@ -37,8 +37,8 @@ build/compiler-stage1.ll: build/compiler.min build/stage0
 build/compiler-stage1: build/compiler-stage1.ll build/minyar-compiler-runtime.ll
 	$(LIMITED) "$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
-build/compiler-stage2-sanitize.ll: build/compiler-stage2.ll tests/llvm_sanitizer.py tools/sanitizer_llvm.py
-	$(SANITIZER_LIMITED) python3 tests/llvm_sanitizer.py $< $@
+build/compiler-stage2-sanitize.ll: build/compiler-stage2.ll build/tooling/tools/clang-driver
+	$(SANITIZER_LIMITED) ./build/tooling/tools/clang-driver sanitize-llvm $< $@
 
 build/minyarc-sanitize: build/compiler-stage2-sanitize.ll build/minyar-compiler-runtime-sanitize.o
 	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@

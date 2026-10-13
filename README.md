@@ -4,8 +4,8 @@ A small, statically typed language that compiles to native code through LLVM.
 
 ## Get started
 
-Requires Clang, a C compiler, Make, Python 3.9+, zsh, and system C development
-headers. The compiler and runtime build on first use.
+Requires Clang, a C compiler, Make, zsh, and system C development headers.
+The compiler, runtime and link driver build on first use.
 
 ```sh
 ./minyar examples/hello.min -o hello

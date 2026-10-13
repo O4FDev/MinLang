@@ -5,7 +5,10 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
+import shutil
 import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -24,7 +27,41 @@ def module(name, path):
 
 
 RFC = module('quic_rfc', ROOT / 'tests/quic-rfc.py')
-DRIVER = module('quic_rfc_clang', ROOT / 'tools/clang-driver.py')
+DRIVER = ROOT / 'build/tooling/tools/clang-driver'
+
+
+def selected_clang(directory, status=0, hook=''):
+    compiler = directory / 'selected-clang'
+    compiler.write_text('#!' + sys.executable + '\nimport json,os,sys\n'
+        'if "--version" in sys.argv:\n print("benign clang version 23.1.2")\n sys.exit(0)\n'
+        'open(os.environ["HARNESS_CLANG_LOG"],"a").write(json.dumps(sys.argv)+"\\n")\n' + hook +
+        ('sys.exit(%d)\n' % status if status else
+         'open(sys.argv[sys.argv.index("-o")+1],"wb").write(b"benign staged native binary")\n'))
+    compiler.chmod(0o755)
+    return compiler
+
+
+def driver_link(directory, compiler, flags, raw, runtime, binary, artifacts, extra=(), executable=DRIVER):
+    environment = dict(os.environ, MINYAR_CLANG=str(compiler), MINYAR_CLANG_FLAGS=shlex.join(flags),
+                       MINYAR_LINK_ARTIFACTS=str(artifacts), HARNESS_CLANG_LOG=str(directory / 'clang.jsonl'))
+    for name in ('MINYAR_NATIVE_FLAGS', 'MINYAR_RUNTIME_FLAGS'):
+        environment.pop(name, None)
+    return subprocess.run([str(executable), 'link', str(directory), str(raw), str(runtime), str(binary),
+                           '0', '0', '', *extra], env=environment, capture_output=True, text=True, timeout=120)
+
+
+def link_optimization(flags):
+    with tempfile.TemporaryDirectory() as folder:
+        directory = Path(folder)
+        compiler = selected_clang(directory)
+        raw = directory / 'raw.ll'
+        raw.write_bytes(b'define i32 @main() {\nentry:\n  ret i32 0\n}\n')
+        runtime = directory / 'runtime.o'
+        runtime.write_bytes(b'runtime')
+        result = driver_link(directory, compiler, flags, raw, runtime, directory / 'output', directory / 'link')
+        if result.returncode:
+            raise ValueError(result.stderr)
+        return json.loads((directory / 'link/manifest.json').read_text())['optimization']
 
 
 class QuicRfcHarness(unittest.TestCase):
@@ -97,11 +134,11 @@ class QuicRfcHarness(unittest.TestCase):
             self.assertTrue(RFC.exact_integer(value))
         self.assertFalse(RFC.exact_integer(-1, minimum=0))
         self.assertFalse(RFC.exact_integer(5, maximum=4))
-        self.assertEqual(DRIVER.effective_optimization(['-O0', '-ObjC']), '0')
-        self.assertEqual(DRIVER.effective_optimization(['-O2', '-O']), '1')
-        self.assertEqual(DRIVER.effective_optimization(['-O0', '-Ofast', '-O2']), '2')
+        self.assertEqual(link_optimization(['-O0', '-ObjC']), '0')
+        self.assertEqual(link_optimization(['-O2', '-O']), '1')
+        self.assertEqual(link_optimization(['-O0', '-Ofast', '-O2']), '2')
         for flag in ('-ObjC', '-ObjC++', '-Other', '-O2garbage'):
-            self.assertIsNone(DRIVER.effective_optimization([flag]))
+            self.assertIsNone(link_optimization([flag]))
 
     def protocol_fixture(self, directory):
         binaries = {name: directory / name for name in RFC.BINARIES}
@@ -181,28 +218,19 @@ class QuicRfcHarness(unittest.TestCase):
                         RFC.verify_result('local', mutant, [case], binaries, None)
 
     def link_fixture(self, directory, sanitize=True):
-        compiler = directory / 'selected-clang'
-        compiler.write_bytes(b'benign selected compiler bytes')
+        compiler = selected_clang(directory)
         raw = directory / 'transient-program.ll'
-        raw.write_bytes(b'define i32 @main() {\nentry:\n  ret i32 0\n}\n')
+        raw.write_bytes(b'; minyar-native-library: provider\ndefine i32 @main() {\nentry:\n  ret i32 0\n}\n')
         runtime = directory / 'actual-runtime.o'
         runtime.write_bytes(b'unchanged native runtime object')
         provider = directory / 'actual-provider.o'
         provider.write_bytes(b'provider object bytes')
         binary = directory / 'endpoint'
         artifacts = directory / 'link'
-        observed = []
-        def ordinary_link(command, **kwargs):
-            observed.append(list(command))
-            self.assertEqual(command[-2], '-o')
-            Path(command[-1]).write_bytes(b'benign staged native binary')
-            return SimpleNamespace(returncode=0)
-        with patch.dict(os.environ, {'MINYAR_LINK_ARTIFACTS':str(artifacts)}), \
-                patch.object(DRIVER.subprocess, 'run', side_effect=ordinary_link), \
-                patch.object(DRIVER.subprocess, 'check_output', return_value='benign Clang version\n'):
-            DRIVER.link_program(str(compiler), RFC.requested_flags('0', sanitize), [],
-                                str(raw), str(runtime), [str(provider)], ['-lcrypto'],
-                                str(binary), None)
+        result = driver_link(directory, compiler, RFC.requested_flags('0', sanitize), raw, runtime, binary,
+                             artifacts, ('--native-object', 'provider=' + str(provider)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        observed = [json.loads(line) for line in (directory / 'clang.jsonl').read_text().splitlines()]
         report = json.loads((artifacts/'manifest.json').read_text())
         self.assertEqual(report['actual_command'], observed[0])
         self.assertEqual(len(observed), 1)  # Mocked link calls, not runtime compile counts.
@@ -281,32 +309,26 @@ class QuicRfcHarness(unittest.TestCase):
     def test_producer_retains_child_failure_without_retention_masking(self):
         with tempfile.TemporaryDirectory() as folder:
             directory = Path(folder)
-            compiler, raw, runtime = (directory/name for name in ('compiler','raw.ll','runtime.o'))
-            compiler.write_bytes(b'tool'); raw.write_bytes(b'define i32 @main() {\n ret i32 0\n}\n')
+            raw, runtime = directory/'raw.ll', directory/'runtime.o'
+            raw.write_bytes(b'define i32 @main() {\n ret i32 0\n}\n')
             runtime.write_bytes(b'runtime')
+            compiler = selected_clang(directory, status=37)
             artifacts = directory/'evidence'
-            original_copy = DRIVER.shutil.copyfile
-            def failed_copy(source, target):
-                if Path(target).name == 'sanitizer_llvm.py':
-                    raise OSError('retention intentionally unavailable')
-                return original_copy(source,target)
-            with patch.dict(os.environ, {'MINYAR_LINK_ARTIFACTS':str(artifacts)}), \
-                    patch.object(DRIVER.subprocess,'run',return_value=SimpleNamespace(returncode=37)), \
-                    patch.object(DRIVER.subprocess,'check_output',return_value='version'):
-                with self.assertRaises(SystemExit) as status:
-                    DRIVER.link_program(str(compiler), RFC.requested_flags('0',False), [],
-                        str(raw),str(runtime),[],[],str(directory/'output'),None)
-            self.assertEqual(status.exception.code,37)
+            status = driver_link(directory, compiler, RFC.requested_flags('0',False), raw, runtime,
+                                 directory/'output', artifacts)
+            self.assertEqual(status.returncode,37)
             report=json.loads((artifacts/'manifest.json').read_text())
             self.assertEqual(report['link_subprocess_status'],37)
             self.assertIn('SystemExit',report['link_error'])
             # A separate setup failure also produces a manifest, before link.
+            unreadable = directory/'execute-only-driver'
+            shutil.copy2(DRIVER, unreadable)
+            unreadable.chmod(0o111)
             second=directory/'setup-failure'
-            with patch.dict(os.environ, {'MINYAR_LINK_ARTIFACTS':str(second)}), \
-                    patch.object(DRIVER.shutil,'copyfile',side_effect=failed_copy):
-                with self.assertRaises(OSError):
-                    DRIVER.link_program(str(compiler),RFC.requested_flags('0',False),[],
-                        str(raw),str(runtime),[],[],str(directory/'second-output'),None)
+            failed = driver_link(directory, selected_clang(directory), RFC.requested_flags('0',False), raw,
+                                 runtime, directory/'second-output', second, executable=unreadable)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn('Permission denied', failed.stderr)
             setup=json.loads((second/'manifest.json').read_text())
             self.assertFalse(setup['link_attempted'])
             self.assertTrue(setup['retention_errors'])
@@ -465,23 +487,15 @@ class QuicRfcHarness(unittest.TestCase):
     def test_original_child_status_survives_manifest_retention_failure(self):
         with tempfile.TemporaryDirectory() as folder:
             directory=Path(folder)
-            compiler,raw,runtime=(directory/name for name in ('compiler','raw.ll','runtime.o'))
-            compiler.write_bytes(b'compiler');runtime.write_bytes(b'runtime')
+            raw,runtime=(directory/name for name in ('raw.ll','runtime.o'))
+            runtime.write_bytes(b'runtime')
             raw.write_bytes(b'define i32 @main() {\n ret i32 0\n}\n')
-            original_write=Path.write_text
-            def fail_primary(path,*args,**kwargs):
-                if path.name=='manifest.json':
-                    raise OSError('intentional finalization failure')
-                return original_write(path,*args,**kwargs)
             artifacts=directory/'failed-link'
-            with patch.dict(os.environ,{'MINYAR_LINK_ARTIFACTS':str(artifacts)}), \
-                    patch.object(DRIVER.subprocess,'run',return_value=SimpleNamespace(returncode=37)), \
-                    patch.object(DRIVER.subprocess,'check_output',return_value='version'), \
-                    patch.object(Path,'write_text',new=fail_primary):
-                with self.assertRaises(SystemExit) as observed:
-                    DRIVER.link_program(str(compiler),RFC.requested_flags('0',False),[],
-                                        str(raw),str(runtime),[],[],str(directory/'output'),None)
-            self.assertEqual(observed.exception.code,37)
+            compiler = selected_clang(directory, status=37,
+                hook='os.mkdir(os.path.join(os.environ["MINYAR_LINK_ARTIFACTS"],"manifest.json"))\n')
+            observed = driver_link(directory, compiler, RFC.requested_flags('0',False), raw, runtime,
+                                   directory/'output', artifacts)
+            self.assertEqual(observed.returncode,37)
             report=json.loads((artifacts/'manifest-retention-error.json').read_text())
             self.assertEqual(report['link_subprocess_status'],37)
             self.assertIn('SystemExit',report['link_error'])

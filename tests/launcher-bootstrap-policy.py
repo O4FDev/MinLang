@@ -122,26 +122,34 @@ os.execvp(args[0],args)
     def test_public_launcher_scopes_context_to_bootstrap(self):
         project = self.work / "project with spaces"
         (project / "tools").mkdir(parents=True)
-        (project / "build").mkdir()
+        (project / "build/tooling/tools").mkdir(parents=True)
         shutil.copy2(ROOT / "minyar", project / "minyar")
+        shutil.copy2(ROOT / "tools/toolchain.sh", project / "tools/toolchain.sh")
         compiler = project / "build/minyarc"
         compiler.write_text("#!" + sys.executable + "\nimport pathlib,sys\n"
                             "pathlib.Path(sys.argv[2]).write_text('; mock IR\\n')\n")
         compiler.chmod(0o755)
-        (project / "tools/clang-driver.py").write_text("""import json,os,sys
-from pathlib import Path
-with Path(os.environ['POLICY_LOG']).open('a') as stream:
-    stream.write(json.dumps({'command':sys.argv[1],
-      'context':os.environ.get('MINYAR_INTERACTIVE_BOOTSTRAP')})+'\\n')
-if sys.argv[1]=='link': Path(sys.argv[5]).write_text('fake output')
-""")
+        record = ("import json,os,sys\nfrom pathlib import Path\n"
+                  "with Path(os.environ['POLICY_LOG']).open('a') as stream:\n"
+                  "    stream.write(json.dumps({'command':COMMAND,"
+                  "'context':os.environ.get('MINYAR_INTERACTIVE_BOOTSTRAP')})+'\\n')\n")
+        driver = project / "build/tooling/tools/clang-driver"
+        driver.write_text("#!" + sys.executable + "\n" + record.replace("COMMAND", "sys.argv[1]") +
+                          "if sys.argv[1]=='link': Path(sys.argv[5]).write_text('fake output')\n")
+        driver.chmod(0o755)
+        tools = self.work / "fake tools"
+        tools.mkdir()
+        make = tools / "make"
+        make.write_text("#!" + sys.executable + "\n" + record.replace("COMMAND", "'build'"))
+        make.chmod(0o755)
+        environment = dict(self.environment, PATH=str(tools) + os.pathsep + self.environment["PATH"])
         source = project / "source with spaces.min"
         source.write_text("print(42)\n")
         for options in (("--check",), ("--release", "--memory-profile", "eager")):
             with self.subTest(options=options):
                 self.log.unlink(missing_ok=True)
                 result = subprocess.run([str(project / "minyar"), *options, str(source)],
-                    cwd=self.work, env=self.environment, capture_output=True, text=True, timeout=10)
+                    cwd=self.work, env=environment, capture_output=True, text=True, timeout=30)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 rows = [json.loads(line) for line in self.log.read_text().splitlines()]
                 self.assertEqual(rows[0], {"command": "build", "context": "1"})
