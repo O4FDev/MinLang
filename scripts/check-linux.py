@@ -79,6 +79,7 @@ TARGETS = ['check-native-records', 'check-thread-compiler', 'check-thread-effect
            'check-sanitize']
 TARGETS += ['check-package-native-inputs', 'check-clang-cache', 'check-mutation-coverage', 'check-list-basics', 'check-list-basics-sanitize', 'check-map-basics', 'check-map-basics-sanitize']
 TARGETS += ['check-thread-scaling-protocol', 'check-thread-language-tsan', 'check-thread-generated-recovery', 'check-thread-generated-recovery-sanitize', 'check-thread-generated-recovery-tsan']
+TARGETS += ['check-thread-native-regions', 'check-thread-native-regions-sanitize', 'check-thread-native-regions-tsan']
 TIERS = ('full', 'sanitize', 'all')
 # Matrix groups. correctness is the tiered main suite; the others match CI jobs.
 GROUPS = ('correctness', 'formatting', 'llvm22', 'llvm23', 'peer-testing', 'peer-semantics', 'quic',
@@ -124,7 +125,7 @@ LAUNCHER_ARTIFACTS = ['build/minyarc', 'build/minyarc-modules', 'build/minyar-mo
 
 
 def tier_of(label):
-    return 'sanitize' if 'sanitiz' in label or label in ('check-thread-language-tsan', 'check-thread-generated-recovery-tsan') else 'full'
+    return 'sanitize' if 'sanitiz' in label or label in ('check-thread-language-tsan', 'check-thread-generated-recovery-tsan', 'check-thread-native-regions-tsan') else 'full'
 
 
 def in_tier(label, tier):
