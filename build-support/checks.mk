@@ -1,8 +1,8 @@
 .PHONY: all check check-portable check-smoke check-regressions check-diagnostics check-conformance check-coverage check-memory check-runtime-unit check-ownership check-adversarial check-ownership-mutation check-ownership-stress check-budget check-fuzz check-fuzz-coverage check-stack-overflow check-windows-large-file check-modules check-mutation check-mutation-score check-performance check-scaling check-sanitize check-stress doctor emit run clean
 
 .PHONY: check-runtime-cache
-check-runtime-cache: build/minyarc
-	$(LIMITED) python3 tests/runtime-cache.py
+check-runtime-cache: build/minyarc build/tooling/tests/runtime-cache
+	$(LIMITED) ./build/tooling/tests/runtime-cache
 
 check: check-runtime-cache
 
@@ -488,8 +488,8 @@ check-fuzz-afl-harness:
 	python3 tests/fuzz-afl-harness.py
 
 .PHONY: check-bootstrap-portability
-check-bootstrap-portability: build/compiler.min
-	python3 tests/bootstrap-portability.py
+check-bootstrap-portability: build/compiler.min build/tooling/tests/bootstrap-portability
+	MINYAR_TEST_CLANG="$(LLVM_CC)" ./build/tooling/tests/bootstrap-portability
 
 check-portable: check-bootstrap-portability
 check: check-bootstrap-portability
@@ -534,8 +534,8 @@ check: check-scalar-path
 check-portable: check-scalar-study-harness
 
 .PHONY: check-stack-limits
-check-stack-limits:
-	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/stack-limits.py
+check-stack-limits: build/tooling/tests/stack-limits tests/stack-limits.c
+	MINYAR_TEST_CLANG="$(LLVM_CC)" ./build/tooling/tests/stack-limits
 
 check-portable check: check-stack-limits
 
