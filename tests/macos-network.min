@@ -1,0 +1,185 @@
+use "./macos-native-gate.min" as gate
+use "../tools/testing.min" as test
+use "../tools/test-runtime.min" as runtime
+use "system" as system
+
+function contractSource(): Text {
+    return joinText([
+        "use \"macos\" as macos\n",
+        "use \"eventloop\" as loop\n",
+        "use \"errors\" as errors\n",
+        "macos.initialize(\"shared loop contract\")\n",
+        "macos.accessory(true)\n",
+        "let reactor = errors.integerValue(loop.create())\n",
+        "let shared = macos.shareNetworkLoop(reactor)\n",
+        "print(errors.integerOk(shared))\n",
+        "let timer = errors.integerValue(loop.timer(reactor, 10, 0, 77))\n",
+        "macos.nextEvent(0.5)\n",
+        "let batch = loop.wait(reactor, 0, 16)\n",
+        "print(!errors.isError(loop.batchError(batch)))\n",
+        "print(loop.events(batch).length == 1)\n",
+        "print(loop.events(batch)[0].token == 77)\n",
+        "print(errors.booleanOk(loop.close(reactor)))\n"
+    ])
+}
+function captureSource(): Text {
+    return joinText([
+        "use \"macos\" as macos\n",
+        "use \"net\" as net\n",
+        "record Node { value: Integer; callbacks: List<Callback<Integer, Integer>> }\n",
+        "function abandonCapturedCycles() {\n",
+        "    let held: List<Node> = []\n",
+        "    for index in 0..4096 {\n",
+        "        let node = Node { value: index; callbacks: [] }\n",
+        "        let callback = function(delta: Integer): Integer { return node.value + delta }\n",
+        "        node.callbacks.add(callback)\n",
+        "        held.add(node)\n",
+        "        if callback(1) != index + 1 { fail(\"capture value changed\") }\n",
+        "    }\n",
+        "}\n",
+        "macos.initialize(\"public captured cycle cleanup\")\n",
+        "macos.accessory(true)\n",
+        "for index in 0..16 { macos.nextEvent(0.0) }\n",
+        "abandonCapturedCycles()\n",
+        "let started = net.monotonicMilliseconds()\n",
+        "if !macos.nextEvent(0.4) { fail(\"AppKit stopped before cleanup\") }\n",
+        "let elapsed = net.monotonicMilliseconds() - started\n",
+        "if elapsed >= 200 { fail(\"AppKit blocked with dropped captures\") }\n",
+        "print(\"public launcher services captured cycles before AppKit sleep\")\n"
+    ])
+}
+function idleHelpers(): Text {
+    return joinText([
+        "\n",
+        "long long minyar_idle_pending(void) {\n",
+        "    return (long long)(rc_pending_count + rc_cycle_pending);\n",
+        "}\n",
+        "long long minyar_idle_objects(void) {\n",
+        "    return (long long)(rc_object_count - rc_immortal_object_count);\n",
+        "}\n",
+        "long long minyar_idle_units(void) { return (long long)rc_cycle_units; }\n",
+        "void minyar_idle_capture_graph(void) {\n",
+        "    enum { COUNT = 1024 };\n",
+        "    MinyarRecord *nodes[COUNT];\n",
+        "    for (unsigned i = 0; i < COUNT; i++)\n",
+        "        nodes[i] = minyar_record_new_traced(1);\n",
+        "    for (unsigned i = 0; i + 1 < COUNT; i++)\n",
+        "        minyar_record_set_reference_traced(nodes[i], 0, (long long)(uintptr_t)nodes[i+1]);\n",
+        "    /* The closure owns its captured environment; the environment retains the\n",
+        "     * first node. This is the runtime's actual three-word callback layout. */\n",
+        "    MinyarRecord *environment = minyar_record_new_traced(2);\n",
+        "    minyar_record_set_scalar(environment, 0, minyar_callback_domain());\n",
+        "    minyar_record_set_reference_traced(environment, 1, (long long)(uintptr_t)nodes[0]);\n",
+        "    MinyarRecord *callback = minyar_record_new_traced(3);\n",
+        "    minyar_record_set_scalar(callback, 0, 0); /* Never invoked. */\n",
+        "    minyar_record_set_reference_traced(callback, 1, (long long)(uintptr_t)environment);\n",
+        "    minyar_record_set_scalar(callback, 2, minyar_callback_domain());\n",
+        "    minyar_record_set_reference_traced(nodes[COUNT-1], 0, (long long)(uintptr_t)callback);\n",
+        "    minyar_rc_release(environment);\n",
+        "    minyar_rc_release(callback);\n",
+        "    for (unsigned i = 0; i < COUNT; i++)\n",
+        "        minyar_rc_release(nodes[i]);\n",
+        "}\n"
+    ])
+}
+function idleFixture(): Text {
+    return joinText([
+        "\n",
+        "#include <assert.h>\n",
+        "#include <time.h>\n",
+        "extern long long minyar_idle_pending(void);\n",
+        "extern long long minyar_idle_objects(void);\n",
+        "extern long long minyar_idle_units(void);\n",
+        "extern void minyar_idle_capture_graph(void);\n",
+        "static double idle_now(void) {\n",
+        "    struct timespec now;\n",
+        "    assert(!clock_gettime(CLOCK_MONOTONIC, &now));\n",
+        "    return now.tv_sec + now.tv_nsec / 1.0e9;\n",
+        "}\n",
+        "static void idle_native_drain(void) {\n",
+        "    while ([NSApp nextEventMatchingMask:NSEventMaskAny untilDate:NSDate.distantPast\n",
+        "            inMode:NSDefaultRunLoopMode dequeue:YES]) {}\n",
+        "}\n",
+        "int main(void) { @autoreleasepool {\n",
+        "    MinyarText name={(const unsigned char *)\"Minyar idle captures\",20,-1,NULL,NULL};\n",
+        "    minyar_macos_initialize(&name);\n",
+        "    assert(minyar_macos_accessory(true));\n",
+        "    idle_native_drain();\n",
+        "    long long baseline = minyar_idle_objects();\n",
+        "    minyar_idle_capture_graph();\n",
+        "    assert(minyar_idle_pending() && minyar_idle_objects() > baseline);\n",
+        "    long long before = minyar_idle_units();\n",
+        "    double start = idle_now();\n",
+        "    assert(minyar_macos_nextEvent(.4));\n",
+        "    assert(idle_now() - start < .2);\n",
+        "    assert(minyar_idle_units() > before);\n",
+        "    assert(minyar_idle_units() - before <= IDLE_BUDGET);\n",
+        "    unsigned batches = 0;\n",
+        "    while (minyar_idle_pending()) {\n",
+        "        before = minyar_idle_units();\n",
+        "        start = idle_now();\n",
+        "        assert(minyar_macos_nextEvent(.4));\n",
+        "        if (minyar_idle_pending()) assert(idle_now() - start < .2);\n",
+        "        assert(minyar_idle_units() - before <= IDLE_BUDGET);\n",
+        "        assert(++batches < 20000);\n",
+        "    }\n",
+        "    assert(minyar_idle_objects() == baseline);\n",
+        "    idle_native_drain();\n",
+        "    start = idle_now();\n",
+        "    assert(minyar_macos_nextEvent(.1));\n",
+        "    assert(idle_now() - start >= .05);\n",
+        "    puts(\"AppKit reclaims idle captured cycles in bounded batches, then sleeps\");\n",
+        "} return 0; }\n"
+    ])
+}
+
+let context = gate.open("macos-network-", "this mandatory macOS gate requires AppKit and kqueue")
+let root = context.root
+let temp = context.temp
+for sanitized in [false, true] {
+    let mode = "native"
+    if sanitized { mode = "sanitize" }
+    let flags = gate.flags(sanitized)
+    let runtimeObject = temp + "/" + mode + "-runtime.o"
+    let net = temp + "/" + mode + "-net.o"
+    let executable = temp + "/" + mode
+    gate.compile(context, gate.joined(gate.joined([context.clang], flags), ["-DMINYAR_SYSTEM_HEAP=1", "-c", root + "/runtime/minyar_runtime.c", "-o", runtimeObject]))
+    gate.compile(context, gate.joined(gate.joined([context.clang, "-std=c11", "-Wall", "-Wextra", "-Werror"], flags), ["-DMINYAR_APP_EVENT_LOOP=1", "-c", root + "/runtime/native/net.c", "-o", net]))
+    gate.compile(context, gate.joined(gate.joined([context.clang, "-fobjc-arc", "-fmodules", "-Wall", "-Wextra", "-Werror"], flags), ["-DMINYAR_APP_EVENT_LOOP=1", root + "/tests/macos-network.m", runtimeObject, net, "-framework", "AppKit", "-o", executable]))
+    gate.step(context, [executable], gate.sanitizerEnvironment(), 30)
+}
+let source = temp + "/contract.min"
+writeTextFile(source, contractSource())
+for mode in ["--debug", "--release"] {
+    let executable = temp + "/contract-" + test.replace(mode, "--", "")
+    gate.step(context, [root + "/minyar", mode, source, "-o", executable], system.environment(), 120)
+    let result = gate.attempt(context, [executable], system.environment(), 15)
+    test.check(result.status == 0 && result.output == "true\ntrue\ntrue\ntrue\ntrue\n", "shared loop contract " + mode + " (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+}
+let engine = runtime.cycleSource(readTextFile(root + "/runtime/minyar_runtime.c"))
+let fixture = temp + "/idle.m"
+writeTextFile(fixture, "#include \"" + root + "/runtime/native/macos.m\"\n" + idleFixture())
+for sanitized in [false, true] {
+    for budget in [1, 32] {
+        let label = "native-idle-" + Text(budget)
+        if sanitized { label = "sanitize-idle-" + Text(budget) }
+        let flags = gate.flags(sanitized)
+        let runtimeSource = temp + "/" + label + "-runtime.c"
+        writeTextFile(runtimeSource, "#define MINYAR_RC_TESTING 1\n#define MINYAR_INTEGER_TEXT_CACHE_LIMIT 0\n" + engine + idleHelpers())
+        let runtimeObject = temp + "/" + label + "-runtime.o"
+        let executable = temp + "/" + label
+        gate.compile(context, gate.joined(gate.joined([context.clang], flags), ["-DMINYAR_SYSTEM_HEAP=1", "-DMINYAR_RC_POLL_BUDGET=" + Text(budget), "-iquote", root + "/runtime", "-c", runtimeSource, "-o", runtimeObject]))
+        gate.compile(context, gate.joined(gate.joined([context.clang, "-fobjc-arc", "-fmodules", "-Wall", "-Wextra", "-Werror"], flags), ["-DMINYAR_APP_MANAGED_CLEANUP=1", "-DIDLE_BUDGET=" + Text(budget), fixture, runtimeObject, "-framework", "AppKit", "-o", executable]))
+        gate.step(context, [executable], gate.sanitizerEnvironment(), 30)
+    }
+}
+let captureFile = temp + "/capture-contract.min"
+writeTextFile(captureFile, captureSource())
+for mode in ["--debug", "--release"] {
+    let executable = temp + "/capture-contract-" + test.replace(mode, "--", "")
+    gate.step(context, [root + "/minyar", mode, "--cleanup-budget", "1", captureFile, "-o", executable], system.environment(), 180)
+    let result = gate.attempt(context, [executable], system.environment(), 30)
+    test.check(result.status == 0, "capture contract " + mode + " (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+    test.check(result.output == "public launcher services captured cycles before AppKit sleep\n", "capture contract output " + mode + "\n" + result.output)
+}
+gate.close(context)

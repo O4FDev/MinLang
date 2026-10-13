@@ -1,11 +1,13 @@
 NATIVE_HOST_SOURCES = scripts/native-host.min
 NATIVE_SWIFT_SOURCES = $(NATIVE_HOST_SOURCES) scripts/native_project.min scripts/macos-app.min scripts/native-swift.min
+MACOS_GATE_SOURCES = $(NATIVE_HOST_SOURCES) tests/macos-native-gate.min
 build/tooling/scripts/native-swift.ll build/tooling/scripts/native-frontend.ll build/tooling/tests/swiftui.ll build/tooling/tests/native-swift/compiler.ll: $(NATIVE_SWIFT_SOURCES)
 build/tooling/scripts/macos-app.ll build/tooling/tests/macos-packaging.ll: $(NATIVE_HOST_SOURCES) scripts/macos-app.min
 build/tooling/tests/native-swift/project.ll: $(NATIVE_HOST_SOURCES) scripts/native_project.min
 build/tooling/scripts/native-toolchain.ll: $(NATIVE_HOST_SOURCES)
 build/tooling/scripts/native-syntax-check.ll: $(NATIVE_HOST_SOURCES) scripts/native-toolchain.min
 build/tooling/tests/macos.ll build/tooling/tests/native-graphics.ll build/tooling/tests/graphics-render.ll build/tooling/tests/native-swift/linux.ll: $(NATIVE_HOST_SOURCES)
+build/tooling/tests/macos-network.ll build/tooling/tests/macos-services.ll build/tooling/tests/desktop-native.ll build/tooling/tests/keychain-native.ll: $(MACOS_GATE_SOURCES)
 
 # Native GUI integration needs a logged-in macOS desktop session.
 .PHONY: check-macos
@@ -43,6 +45,20 @@ check-native-linux: check-native-project build/tooling/tests/native-swift/linux 
 .PHONY: check-graphics-render
 check-graphics-render: build/minyarc build/tooling/tests/graphics-render
 	./build/tooling/tests/graphics-render
+
+# AppKit with kqueue networking, desktop services, status items and Keychain identities, in native and sanitizer builds.
+.PHONY: check-macos-network check-desktop-native check-macos-services check-keychain-native
+check-macos-network: build/minyarc build/minyar-default-runtime.o build/tooling/tests/macos-network
+	./build/tooling/tests/macos-network
+
+check-desktop-native: build/minyarc build/minyar-default-runtime.o build/tooling/tests/desktop-native
+	./build/tooling/tests/desktop-native
+
+check-macos-services: build/minyarc build/minyar-default-runtime.o build/tooling/tests/macos-services
+	./build/tooling/tests/macos-services
+
+check-keychain-native: build/tooling/tests/keychain-native
+	./build/tooling/tests/keychain-native
 
 .PHONY: check-schannel-framing check-schannel-framing-sanitize
 

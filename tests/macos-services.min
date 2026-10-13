@@ -1,0 +1,24 @@
+use "./macos-native-gate.min" as gate
+use "../tools/testing.min" as test
+use "system" as system
+
+let context = gate.open("macos-services-", "this mandatory macOS gate requires AppKit")
+let root = context.root
+let temp = context.temp
+for sanitized in [false, true] {
+    let flags = gate.flags(sanitized)
+    let runtime = temp + "/runtime.o"
+    gate.compile(context, gate.joined(gate.joined([context.clang], flags), ["-DMINYAR_SYSTEM_HEAP=1", "-c", root + "/runtime/minyar_runtime.c", "-o", runtime]))
+    let executable = temp + "/native"
+    if sanitized { executable = temp + "/sanitize" }
+    gate.compile(context, gate.joined(gate.joined([context.clang, "-fobjc-arc", "-fmodules", "-Wall", "-Wextra", "-Werror"], flags), [root + "/tests/macos-services.m", runtime, "-framework", "AppKit", "-o", executable]))
+    gate.step(context, [executable], gate.sanitizerEnvironment(), 30)
+}
+let source = temp + "/keychain-probe.min"
+writeTextFile(source, "use \"keychain\" as keychain\nuse \"errors\" as errors\nlet result = keychain.findIdentity(\"missing identity\", argument(0))\nprint(!keychain.found(result))\nprint(errors.isError(keychain.lookupError(result)))\n")
+let program = temp + "/probe"
+let compiled = gate.attempt(context, [root + "/minyar", source, "-o", program], system.environment(), 600)
+test.check(compiled.status == 0, "compile keychain probe\n" + compiled.errorOutput)
+let result = gate.attempt(context, [program, temp + "/missing.keychain-db"], system.environment(), 15)
+test.check(result.status == 0 && result.output == "true\ntrue\n", "keychain probe (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+gate.close(context)

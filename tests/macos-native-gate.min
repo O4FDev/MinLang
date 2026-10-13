@@ -1,0 +1,62 @@
+use "../tools/testing.min" as test
+use "../scripts/native-host.min" as host
+use "system" as system
+
+public record Gate { root: Text; temp: Text; clang: Text; serial: Integer }
+
+public function open(prefix: Text, requirement: Text): Gate {
+    if host.strip(host.capture(["uname", "-s"]).output) != "Darwin" { fail(requirement) }
+    let root = host.currentDirectory()
+    test.check(host.makeDirectories(root + "/build") == "", "create build directory")
+    let made = host.temporaryDirectory(root + "/build", prefix)
+    test.check(made.status == 0, made.output)
+    let clang = system.getenv("MINYAR_TEST_CLANG")
+    if clang == "" && system.lastError() != 0 { clang = "clang" }
+    return Gate { root: root; temp: made.output; clang: clang; serial: 0 }
+}
+public function flags(sanitized: Boolean): List<Text> {
+    if sanitized { return ["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"] }
+    return ["-O2"]
+}
+public function withVariable(environment: List<Text>, name: Text, value: Text): List<Text> {
+    let result: List<Text> = []
+    for entry in environment { if !host.starts(entry, name + "=") { result.add(entry) } }
+    result.add(name + "=" + value)
+    return result
+}
+public function without(environment: List<Text>, name: Text): List<Text> {
+    let result: List<Text> = []
+    for entry in environment { if !host.starts(entry, name + "=") { result.add(entry) } }
+    return result
+}
+public function sanitizerEnvironment(): List<Text> {
+    return withVariable(withVariable(system.environment(), "ASAN_OPTIONS", "detect_leaks=0"), "UBSAN_OPTIONS", "halt_on_error=1")
+}
+public function spaced(command: List<Text>): Text {
+    let result = ""
+    for index in 0..command.length {
+        if index > 0 { result += " " }
+        result += command[index]
+    }
+    return result
+}
+public function attempt(gate: Gate, command: List<Text>, environment: List<Text>, seconds: Integer): test.Result {
+    gate.serial += 1
+    let log = gate.temp + "/step-" + Text(gate.serial) + ".log"
+    let result = test.run(command, environment, gate.root, log, seconds)
+    if result.output != "" { print(host.strip(result.output)) }
+    if result.errorOutput != "" { host.standardError(result.errorOutput) }
+    return result
+}
+public function step(gate: Gate, command: List<Text>, environment: List<Text>, seconds: Integer) {
+    let result = attempt(gate, command, environment, seconds)
+    test.check(result.status == 0, "command failed (" + Text(result.status) + "): " + spaced(command))
+}
+public function compile(gate: Gate, command: List<Text>) { step(gate, command, system.environment(), 600) }
+public function joined(first: List<Text>, second: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for item in first { result.add(item) }
+    for item in second { result.add(item) }
+    return result
+}
+public function close(gate: Gate) { host.removeTree(gate.temp) }

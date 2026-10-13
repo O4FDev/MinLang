@@ -1,0 +1,117 @@
+use "./macos-native-gate.min" as gate
+use "../tools/testing.min" as test
+use "../scripts/native-host.min" as host
+use "system" as system
+use "files" as files
+
+record Peer { handle: Integer; log: Text; url: Text; anchor: Text }
+
+function quiet(context: gate.Gate, command: List<Text>, seconds: Integer, label: Text): test.Result {
+    context.serial += 1
+    let log = context.temp + "/quiet-" + Text(context.serial) + ".log"
+    let result = test.run(command, system.environment(), context.root, log, seconds)
+    test.check(result.status == 0, label + " (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+    return result
+}
+function openssl(context: gate.Gate, arguments: List<Text>) {
+    quiet(context, gate.joined(["openssl"], arguments), 30, "openssl " + arguments[0])
+}
+function opensslFlags(context: gate.Gate): List<Text> {
+    let probe = test.run(["pkg-config", "--cflags", "--libs", "openssl"], system.environment(), context.root, context.temp + "/openssl-flags.log", 30)
+    if probe.status == 0 { return host.shellWords(probe.output) }
+    let prefix = quiet(context, ["brew", "--prefix", "openssl@3"], 60, "locate OpenSSL")
+    let directory = host.strip(prefix.output)
+    return ["-I" + directory + "/include", "-L" + directory + "/lib", "-lssl", "-lcrypto"]
+}
+function count(log: Text, event: Text): Integer {
+    let total = 0
+    for line in host.lines(Text(files.readFile(log))) { if line == event { total += 1 } }
+    return total
+}
+function startPeer(context: gate.Gate, clientCertificate: Text): Peer {
+    let directory = context.temp
+    let root = directory + "/os-root.pem"
+    let anchor = directory + "/os-root.der"
+    openssl(context, ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=Minyar disposable OS TLS root", "-keyout", directory + "/os-root.key", "-out", root])
+    openssl(context, ["x509", "-in", root, "-outform", "DER", "-out", anchor])
+    openssl(context, ["req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost", "-keyout", directory + "/os-server.key", "-out", directory + "/os-server.csr"])
+    let extensions = directory + "/os-server.ext"
+    writeTextFile(extensions, "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1\n")
+    openssl(context, ["x509", "-req", "-in", directory + "/os-server.csr", "-CA", root, "-CAkey", directory + "/os-root.key", "-CAcreateserial", "-days", "1", "-extfile", extensions, "-out", directory + "/os-server.pem"])
+    let program = directory + "/tls-peer"
+    let build = [context.clang, "-O2", "-Wall", "-Wextra", "-Werror", context.root + "/tests/keychain-tls-peer.c"]
+    for flag in opensslFlags(context) { build.add(flag) }
+    build.add("-o")
+    build.add(program)
+    quiet(context, build, 120, "build the TLS peer")
+    let log = directory + "/tls-peer.log"
+    let handle = system.spawn("/bin/sh", ["sh", "-c", "log=$1; shift; exec \"$@\" >\"$log\" 2>\"$log.err\" </dev/null", "sh", log, program, directory + "/os-server.pem", directory + "/os-server.key", clientCertificate], system.environment(), context.root)
+    test.check(handle > 0, "launch the TLS peer")
+    let started = system.monotonicNanoseconds()
+    while true {
+        for line in host.lines(Text(files.readFile(log))) {
+            let fields = host.words(line)
+            if fields.length == 3 && fields[0] == "READY" {
+                return Peer { handle: handle; log: log; url: "https://127.0.0.1:" + fields[1] + "/"; anchor: anchor }
+            }
+        }
+        test.check(system.poll(handle).state == system.PENDING, "the TLS peer stopped\n" + Text(files.readFile(log + ".err")))
+        test.check(system.monotonicNanoseconds() - started < 30000000000, "the TLS peer did not start")
+        host.run(["/bin/sleep", "0.05"])
+    }
+}
+function explicitAnchor(peer: Peer): Text {
+    let hosted = host.systemName() == "darwin" && system.getenv("GITHUB_ACTIONS") == "true" && system.getenv("RUNNER_ENVIRONMENT") == "github-hosted" && system.getenv("RUNNER_OS") == "macOS"
+    if !hosted { fail("explicit OS TLS fixture anchors require a disposable GitHub macOS runner") }
+    return peer.anchor
+}
+function stopPeer(peer: Peer) {
+    let pid = system.childProcessId(peer.handle)
+    if pid > 0 { system.sendSignal(pid, 15) }
+    system.wait(peer.handle)
+}
+function execute(context: gate.Gate, executable: Text, keychain: Text, peers: List<Peer>, rejected: Boolean, anchor: Text) {
+    let environment = gate.withVariable(gate.sanitizerEnvironment(), "MINYAR_TEST_SYSTEM_ROOT_CHAIN", context.root + "/tests/fixtures/system-root-public-chain.bin")
+    environment = gate.without(gate.without(environment, "MINYAR_TEST_OS_TLS_CA"), "MINYAR_TEST_OS_TLS_REJECT")
+    if peers.length > 0 {
+        environment = gate.withVariable(environment, "MINYAR_TEST_OS_TLS_URL", peers[0].url)
+        environment = gate.withVariable(environment, "MINYAR_TEST_OS_TLS_REDIRECT", peers[0].url + "redirect")
+    }
+    if rejected { environment = gate.withVariable(environment, "MINYAR_TEST_OS_TLS_REJECT", "1") }
+    if anchor != "" { environment = gate.withVariable(environment, "MINYAR_TEST_OS_TLS_CA", anchor) }
+    gate.step(context, [executable, context.temp + "/identity.p12", keychain], environment, 30)
+}
+
+let context = gate.open("minyar-keychain-", "this mandatory macOS gate requires Security.framework")
+let root = context.root
+let temp = context.temp
+quiet(context, ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=Minyar key test", "-keyout", temp + "/key.pem", "-out", temp + "/cert.pem"], 30, "create the test identity")
+quiet(context, ["openssl", "pkcs12", "-export", "-legacy", "-name", "Minyar key test", "-in", temp + "/cert.pem", "-inkey", temp + "/key.pem", "-passout", "pass:minyar-test", "-out", temp + "/identity.p12"], 30, "export the test identity")
+let peers: List<Peer> = []
+if system.getenv("GITHUB_ACTIONS") == "true" { peers.add(startPeer(context, temp + "/cert.pem")) }
+let digest = quiet(context, ["shasum", "-a", "256", root + "/tests/fixtures/system-root-public-chain.bin"], 30, "hash the public chain fixture")
+test.check(host.words(digest.output)[0] == "1026800ed0440b976845a5046779c7601b13f349c0e32df710b7d23f3382d6b7", "the public chain fixture changed")
+for sanitized in [false, true] {
+    let mode = "native"
+    if sanitized { mode = "sanitize" }
+    let flags = gate.flags(sanitized)
+    let executable = temp + "/" + mode
+    let runtime = temp + "/" + mode + "-runtime.o"
+    let objc = temp + "/" + mode + "-http.o"
+    gate.compile(context, gate.joined(gate.joined([context.clang], flags), ["-DMINYAR_SYSTEM_HEAP=1", "-c", root + "/runtime/minyar_runtime.c", "-o", runtime]))
+    gate.compile(context, gate.joined(gate.joined([context.clang, "-fobjc-arc", "-fmodules", "-Wall", "-Wextra", "-Werror"], flags), ["-c", root + "/tests/http-identity-native.m", "-o", objc]))
+    let link = gate.joined(gate.joined([context.clang, "-std=c11", "-Wall", "-Wextra", "-Werror", "-DMINYAR_SYSTEM_HEAP=1", "-DMINYAR_TEST_HTTP=1"], flags), [root + "/tests/keychain-native.c", root + "/runtime/native/keychain.c", root + "/runtime/native/tlsverify.c", runtime, objc])
+    gate.compile(context, gate.joined(link, ["-framework", "Security", "-framework", "AppKit", "-framework", "CoreFoundation", "-o", executable]))
+    if peers.length > 0 {
+        execute(context, executable, temp + "/" + mode + "-untrusted.keychain-db", peers, true, "")
+        let before = count(peers[0].log, "ACCEPTED")
+        execute(context, executable, temp + "/" + mode + ".keychain-db", peers, false, explicitAnchor(peers[0]))
+        let accepted = count(peers[0].log, "ACCEPTED")
+        let spied = count(peers[0].log, "SPIED")
+        test.check(accepted == before + 2 && spied == 0, "TLS peer saw accepted=" + Text(accepted) + " (expected " + Text(before + 2) + ") spied=" + Text(spied) + "\n" + Text(files.readFile(peers[0].log)))
+    } else {
+        execute(context, executable, temp + "/" + mode + ".keychain-db", peers, false, "")
+    }
+}
+for peer in peers { stopPeer(peer) }
+gate.close(context)

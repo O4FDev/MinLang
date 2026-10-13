@@ -1,0 +1,29 @@
+use "./macos-native-gate.min" as gate
+use "../tools/testing.min" as test
+use "system" as system
+
+let context = gate.open("desktop-native-", "this macOS correctness gate requires Apple frameworks")
+let root = context.root
+let temp = context.temp
+let frameworks: List<Text> = []
+for name in ["AppKit", "UserNotifications", "ServiceManagement", "Network", "IOKit"] {
+    frameworks.add("-framework")
+    frameworks.add(name)
+}
+for sanitized in [false, true] {
+    let flags = gate.flags(sanitized)
+    let runtime = temp + "/runtime.o"
+    gate.compile(context, gate.joined(gate.joined([context.clang], flags), ["-DMINYAR_SYSTEM_HEAP=1", "-c", root + "/runtime/minyar_runtime.c", "-o", runtime]))
+    let executable = temp + "/native"
+    if sanitized { executable = temp + "/sanitize" }
+    let link = gate.joined(gate.joined([context.clang, "-fobjc-arc", "-fmodules", "-Wall", "-Wextra", "-Werror"], flags), [root + "/tests/desktop-native.m", runtime])
+    gate.compile(context, gate.joined(gate.joined(link, frameworks), ["-o", executable]))
+    gate.step(context, [executable], gate.sanitizerEnvironment(), 30)
+}
+let source = temp + "/desktop-contract.min"
+writeTextFile(source, "use \"desktop\" as desktop\nuse \"errors\" as errors\nlet login = desktop.launchAtLoginStatus()\nprint(!errors.integerOk(login))\nprint(errors.code(errors.integerError(login)) == errors.unavailableCode())\nlet notification = desktop.notify(\"test\", \"body\")\nprint(!errors.integerOk(notification))\nlet stopped = desktop.networkStop()\nprint(errors.integerOk(stopped))\n")
+let contract = temp + "/contract"
+gate.step(context, [root + "/minyar", source, "-o", contract], system.environment(), 60)
+let result = gate.attempt(context, [contract], system.environment(), 15)
+test.check(result.status == 0 && result.output == "true\ntrue\ntrue\ntrue\n", "desktop contract (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+gate.close(context)
