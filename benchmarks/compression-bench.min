@@ -1,0 +1,231 @@
+use "../tools/testing.min" as test
+use "../tests/benchmark-phases.min" as phase
+use "../tests/tar-benchmark-support.min" as benchmark
+use "../tests/tar-test-support.min" as text
+use "../tests/cpython-random.min" as random
+use "system" as system
+use "files" as files
+use "json" as json
+
+function compress(input: Bytes, format: Integer, level: Integer, dictionary: Bytes): Bytes { native "codecoracle" }
+record Provider { flags: List<Text>; libraries: List<Text> }
+record Context { directory: Text; root: Text; compiler: Text; clang: Text; serial: List<Integer>; commands: List<List<Text>> }
+function run(context: Context, command: List<Text>): test.Result {
+    context.serial[0] += 1
+    let result = test.run(command, system.environment(), "", context.directory + "/operation-" + Text(context.serial[0]), 600)
+    test.require(result, "compression benchmark command")
+    return result
+}
+function build(context: Context, command: List<Text>) { context.commands.add(command); run(context, command) }
+function provider(context: Context, codec: Text): Provider {
+    let result = run(context, ["python3", context.root + "/tools/compression_provider.py", codec, "--clang", context.clang])
+    let value = json.parse(result.output)
+    let compile = json.member(value, "cflags")
+    let link = json.member(value, "libraries")
+    test.check(compile.kind == json.ARRAY && link.kind == json.ARRAY, "invalid compression benchmark provider arguments")
+    let flags: List<Text> = []
+    let libraries: List<Text> = []
+    for item in compile.items { test.check(item.kind == json.STRING, "invalid compression provider C flag"); flags.add(item.text) }
+    for item in link.items { test.check(item.kind == json.STRING, "invalid compression provider library"); libraries.add(item.text) }
+    return Provider { flags: flags; libraries: libraries }
+}
+function fixtureSource(): Text {
+    return "#define ZSTD_STATIC_LINKING_ONLY\n#include <zstd.h>\n#include <assert.h>\n#include <stdio.h>\n#include <stdlib.h>\nint main(int argc,char **argv) {\n assert(argc==4); FILE *f=fopen(argv[1],\"rb\"); assert(f); fseek(f,0,SEEK_END); size_t n=(size_t)ftell(f); rewind(f);\n unsigned char *in=malloc(n+1),*out=malloc(ZSTD_compressBound(n)); assert(in&&out); assert(fread(in,1,n,f)==n); fclose(f);\n f=fopen(argv[2],\"rb\"); assert(f); fseek(f,0,SEEK_END); size_t dn=(size_t)ftell(f); rewind(f);\n unsigned char *dict=malloc(dn+1); assert(dict); assert(fread(dict,1,dn,f)==dn); fclose(f);\n ZSTD_CCtx *c=ZSTD_createCCtx(); assert(c);\n size_t r=ZSTD_compressCCtx(c,out,ZSTD_compressBound(n),in,n,3); assert(!ZSTD_isError(r));\n f=fopen(argv[3],\"wb\"); assert(f); fwrite(out,1,r,f); fclose(f);\n ZSTD_CDict *cd=ZSTD_createCDict_advanced(dict,dn,ZSTD_dlm_byCopy,ZSTD_dct_rawContent,ZSTD_getCParams(3,0,dn),ZSTD_defaultCMem); assert(cd);\n r=ZSTD_compress_usingCDict(c,out,ZSTD_compressBound(n),in,n,cd); assert(!ZSTD_isError(r));\n f=fopen(\"dict.zst\",\"wb\"); assert(f); fwrite(out,1,r,f); fclose(f);\n ZSTD_freeCDict(cd); ZSTD_freeCCtx(c); free(in); free(out); free(dict);\n}"
+}
+function prepare(context: Context, length: Integer) {
+    let providers = [provider(context, "zstd"), provider(context, "deflate")]
+    let cflags: List<Text> = []
+    let libraries: List<Text> = []
+    for selected in providers { for flag in selected.flags { cflags.add(flag) }; for library in selected.libraries { libraries.add(library) } }
+    let raw = context.directory + "/minyar.ll"
+    let runtime = context.directory + "/runtime.o"
+    build(context, [context.compiler, context.root + "/benchmarks/compression.min", raw, "--library", context.root + "/library"])
+    build(context, [context.clang, "-O2", "-DMINYAR_SYSTEM_HEAP=1", "-c", context.root + "/runtime/minyar_runtime.c", "-o", runtime])
+    let command = [context.clang, "-O2", "-Wno-override-module"]
+    for flag in cflags { command.add(flag) }
+    for source in [raw, runtime, context.root + "/runtime/native/zstd.c", context.root + "/runtime/native/deflate.c", context.root + "/runtime/native/system.c"] { command.add(source) }
+    for library in libraries { command.add(library) }
+    for item in ["-o", context.directory + "/minyar", "-lm"] { command.add(item) }
+    build(context, command)
+    command = [context.clang, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"]
+    for flag in cflags { command.add(flag) }
+    command.add(context.root + "/benchmarks/compression-reference.c")
+    for library in libraries { command.add(library) }
+    for item in ["-o", context.directory + "/reference"] { command.add(item) }
+    build(context, command)
+    let helper = context.directory + "/fixtures.c"
+    writeTextFile(helper, fixtureSource())
+    command = [context.clang, "-O2"]
+    for flag in providers[0].flags { command.add(flag) }
+    command.add(helper)
+    for library in providers[0].libraries { command.add(library) }
+    for item in ["-o", context.directory + "/fixtures"] { command.add(item) }
+    build(context, command)
+    let logRecord = Bytes("{\"timestamp\":1720000000,\"path\":\"/layers/chunks\",\"status\":200,\"bytes\":65536}\n")
+    let records = Bytes()
+    for index in 0..100 { records.addBytes(logRecord) }
+    let block = records.slice(0, records.length)
+    block.addBytes(random.bytes(random.seeded("5005"), 2048))
+    let plain = Bytes()
+    while plain.length < length { plain.addBytes(block) }
+    plain = plain.slice(0, length)
+    writeBytesFile(context.directory + "/plain.bin", plain)
+    let dictionary = Bytes()
+    for byte in [0x37, 0xa4, 0x30, 0xec] { dictionary.add(byte) }
+    dictionary.addBytes(records.slice(0, 4092))
+    writeBytesFile(context.directory + "/dictionary.bin", dictionary)
+    context.serial[0] += 1
+    let fixtureLog = context.directory + "/fixture-builder"
+    let argv = ["sh", "-c", "log=$1; shift; exec /usr/bin/env -- \"$@\" >\"$log\" 2>\"$log.err\"", "minyar", fixtureLog, context.directory + "/fixtures", context.directory + "/plain.bin", context.directory + "/dictionary.bin", context.directory + "/zstd.bin"]
+    test.require(test.finish(system.spawn("/bin/sh", argv, system.environment(), context.directory), fixtureLog), "independent maintained zstd fixture generation")
+    writeBytesFile(context.directory + "/dict.bin", readBytesFile(context.directory + "/dict.zst"))
+    let codecs = ["gzip", "zlib", "raw"]
+    for format in 0..3 { writeBytesFile(context.directory + "/" + codecs[format] + ".bin", compress(plain, format, 6, Bytes())) }
+    let sourceNames = ["benchmarks/compression.min", "benchmarks/compression-bench.min", "benchmarks/compression-reference.c", "library/zstd.min", "library/deflate.min", "runtime/native/zstd.c", "runtime/native/deflate.c", "runtime/native/compression.h", "runtime/minyar_runtime.c", "runtime/native/system.c", "tools/compression_provider.py", "tests/cpython-random.min", "tests/benchmark-phases.min", "tests/tar-benchmark-support.min", "tests/tar-test-support.min", "tests/sha256-support.min", "tests/sha256test.min", "tests/sha256-test-native.c", "tests/text-basics-oracles.min", "tests/compression-codecs-oracle-runtime.c", "library/sha256.min", "runtime/native/sha256.c"]
+    let sources: List<Text> = []
+    for source in sourceNames { sources.add(context.root + "/" + source) }
+    for source in [context.compiler, raw, runtime, context.directory + "/minyar", context.directory + "/reference", helper] { sources.add(source) }
+    for name in files.list(context.directory) { let bytes = Bytes(name); if bytes.length >= 4 && Text(bytes.slice(bytes.length - 4, bytes.length)) == ".bin" { sources.add(context.directory + "/" + name) } }
+    let providerJSON: List<Text> = []
+    for selected in providers {
+        providerJSON.add("[" + benchmark.strings(selected.flags) + "," + benchmark.strings(selected.libraries) + "]")
+        for library in selected.libraries { if files.pathSize(library) >= 0 { sources.add(library) } }
+        let include = ""
+        for index in 0..selected.flags.length { if selected.flags[index] == "-isystem" && index + 1 < selected.flags.length { include = selected.flags[index + 1]; break } }
+        test.check(include != "", "missing compression provider header identity")
+        for name in ["zstd.h", "zstd_errors.h", "zlib.h", "zconf.h"] { if files.pathSize(include + "/" + name) >= 0 { sources.add(include + "/" + name) } }
+    }
+    let commands: List<Text> = []
+    for invocation in context.commands { commands.add(benchmark.strings(invocation)) }
+    let seen = Map<Text, Boolean>()
+    let unique: List<Text> = []
+    for source in sources { if !seen.has(source) { seen[source] = true; unique.add(source) } }
+    let manifest = "{\"provider\":[" + text.joined(providerJSON, ",") + "],\"clang_version\":" + benchmark.quote(run(context, [context.clang, "--version"]).output) + ",\"architecture\":" + benchmark.quote(benchmark.trim(run(context, ["uname", "-m"]).output)) + ",\"bytes\":" + Text(plain.length) + ",\"commands\":[" + text.joined(commands, ",") + "],\"driver_binary_sha256\":" + benchmark.quote(benchmark.digest("/proc/self/exe")) + ",\"hashes\":" + benchmark.hashes(unique) + "}"
+    writeTextFile(context.directory + "/prepare.json", manifest + "\n")
+    print("compression benchmark: prepared (no timings)")
+}
+record Median { value: Float; json: Text }
+function median(samples: List<Integer>): Median {
+    test.check(samples.length > 0, "missing compression timing samples")
+    let values = samples.slice(0, samples.length)
+    for index in 1..values.length {
+        let position = index
+        while position > 0 && values[position] < values[position - 1] { let previous = values[position - 1]; values[position - 1] = values[position]; values[position] = previous; position -= 1 }
+    }
+    let middle = values.length / 2
+    if values.length % 2 == 1 { return Median { value: Float(values[middle]); json: Text(values[middle]) } }
+    let value = (Float(values[middle - 1]) + Float(values[middle])) / 2.0
+    return Median { value: value; json: Text(value) }
+}
+function fixed(value: Float, places: Integer): Text {
+    let scale = 1
+    for index in 0..places { scale *= 10 }
+    let scaled = value * Float(scale)
+    let integer = Integer(floor(scaled))
+    let fraction = scaled - Float(integer)
+    if fraction > 0.5 || (fraction == 0.5 && integer % 2 != 0) { integer += 1 }
+    if places == 0 { return Text(integer) }
+    let suffix = Text(integer % scale)
+    while suffix.length < places { suffix = "0" + suffix }
+    return Text(integer / scale) + "." + suffix
+}
+record Case { codec: Text; operation: Text; style: Text }
+function sample(context: Context, sampleCount: Integer, requestedRounds: Integer) {
+    let manifest = benchmark.parsed(context.directory + "/prepare.json")
+    let hashes = json.member(manifest, "hashes")
+    test.check(hashes.kind == json.OBJECT, "missing prepared compression input identities")
+    for path in hashes.keys { test.check(benchmark.digest(path) == json.string(hashes, path), "prepared compression input changed: " + path) }
+    test.check(benchmark.digest("/proc/self/exe") == json.string(manifest, "driver_binary_sha256"), "prepared compression driver binary changed")
+    let length = phase.integer(manifest, "bytes")
+    let cases: List<Case> = []
+    for codec in ["zstd", "dict", "gzip", "zlib", "raw"] {
+        for operation in ["compress", "decompress"] {
+            let styles = ["into", "buffer"]
+            if codec == "zstd" { styles = ["into", "raw", "buffer"] }
+            else if codec == "dict" { styles = ["into"] }
+            for style in styles { cases.add(Case { codec: codec; operation: operation; style: style }) }
+        }
+    }
+    cases.add(Case { codec: "dict"; operation: "build"; style: "into" })
+    let rows: List<Text> = []
+    for entry in cases {
+        let input = context.directory + "/plain.bin"
+        if entry.operation == "decompress" { input = context.directory + "/" + entry.codec + ".bin" }
+        let capacity = length
+        if entry.operation == "compress" { capacity += 1024 }
+        let rounds = requestedRounds
+        if entry.operation == "build" && rounds < 1000 { rounds = 1000 }
+        let args = [entry.codec, entry.operation, entry.style, input, context.directory + "/dictionary.bin", Text(capacity), Text(rounds)]
+        let samples: List<Text> = []
+        let native: List<Integer> = []
+        let reference: List<Integer> = []
+        for index in 0..sampleCount {
+            let order = ["minyar", "reference"]
+            if index % 2 == 1 { order = ["reference", "minyar"] }
+            let pair: List<Text> = []
+            let nativeTotal = 0
+            let referenceTotal = 0
+            for name in order {
+                let command = [context.directory + "/" + name]
+                for arg in args { command.add(arg) }
+                let values = test.lines(run(context, command).output)
+                test.check(values.length == 2, "compression benchmark protocol must contain two integer rows")
+                let elapsed = Integer(values[0])
+                let total = Integer(values[1])
+                if name == "minyar" { native.add(elapsed); nativeTotal = total }
+                else { reference.add(elapsed); referenceTotal = total }
+                pair.add(benchmark.quote(name) + ":{\"nanoseconds\":" + Text(elapsed) + ",\"result_total\":" + Text(total) + ",\"argv\":" + benchmark.strings(command) + "}")
+            }
+            test.check(nativeTotal == referenceTotal, "native/reference compression complete-operation checksums differ")
+            samples.add("{" + text.joined(pair, ",") + "}")
+        }
+        let nativeMedian = median(native)
+        let referenceMedian = median(reference)
+        test.check(referenceMedian.value != 0.0, "zero independent compression timing median")
+        let ratio = nativeMedian.value / referenceMedian.value
+        rows.add("{\"codec\":" + benchmark.quote(entry.codec) + ",\"operation\":" + benchmark.quote(entry.operation) + ",\"style\":" + benchmark.quote(entry.style) + ",\"rounds\":" + Text(rounds) + ",\"input\":" + benchmark.quote(input) + ",\"samples\":[" + text.joined(samples, ",") + "],\"minyar_median_ns\":" + nativeMedian.json + ",\"c_median_ns\":" + referenceMedian.json + ",\"minyar_over_c\":" + Text(ratio) + "}")
+        writeTextFile(context.directory + "/results.json", "{\"schema\":1,\"kind\":\"native binding / maintained C full operation\",\"pure_candidate\":null,\"preparation\":" + benchmark.serialize(manifest) + ",\"rows\":[" + text.joined(rows, ",") + "]}\n")
+        files.writeStandardOutput(entry.codec + " " + entry.operation + " " + entry.style + ": Minyar/C " + fixed(ratio, 3) + "x, " + fixed(nativeMedian.value / Float(rounds), 0) + "/" + fixed(referenceMedian.value / Float(rounds), 0) + " ns/op\n")
+    }
+}
+
+let artifacts = ""
+let prepareOnly = false
+let runPrepared = false
+let sampleCount = 5
+let rounds = 128
+let length = 65536
+let compiler = test.setting("MINYAR_TEST_COMPILER", "./build/minyarc")
+let clang = test.setting("MINYAR_TEST_CLANG", test.setting("MINYAR_CLANG", "clang"))
+let optionIndex = 0
+while optionIndex < argumentCount() {
+    let option = argument(optionIndex)
+    if option == "--prepare-only" { prepareOnly = true }
+    else if option == "--run-only" || option == "--run-prepared" { runPrepared = true }
+    else {
+        test.check(optionIndex + 1 < argumentCount(), "missing compression benchmark option value")
+        optionIndex += 1
+        let value = argument(optionIndex)
+        if option == "--artifacts" { artifacts = value }
+        else if option == "--samples" { sampleCount = Integer(value) }
+        else if option == "--rounds" { rounds = Integer(value) }
+        else if option == "--bytes" { length = Integer(value) }
+        else if option == "--compiler" { compiler = value }
+        else if option == "--clang" { clang = value }
+        else { fail("unknown compression benchmark option: " + option) }
+    }
+    optionIndex += 1
+}
+test.check(artifacts != "" && prepareOnly != runPrepared, "compression benchmark requires --artifacts and exactly one preparation/run phase")
+test.check(sampleCount > 0 && rounds > 0 && length > 0 && length <= 16777216, "compression benchmark samples/rounds/bytes bounds changed")
+let scratch = test.scratch()
+let hostname = "seipnxmg.vm"
+if runPrepared { hostname = "5xnqjvps.vm" }
+phase.requireHost(hostname, scratch)
+test.require(test.run(["mkdir", "-p", "--", artifacts], system.environment(), "", scratch + "/mkdir", 10), "compression benchmark artifact directory")
+let directory = phase.absolute(artifacts, scratch)
+let project = test.run(["pwd", "-P"], system.environment(), "", scratch + "/project", 10)
+test.require(project, "compression benchmark project location")
+let context = Context { directory: directory; root: test.lines(project.output)[0]; compiler: compiler; clang: clang; serial: [0]; commands: [] }
+if prepareOnly { prepare(context, length) } else { sample(context, sampleCount, rounds) }
+test.removeTree(scratch)
