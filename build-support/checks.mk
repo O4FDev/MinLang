@@ -127,8 +127,8 @@ check-windows-large-file:
 check-portable: check-smoke check-regressions check-diagnostics check-conformance check-runtime-unit check-modules check-fuzz check-stack-overflow check-windows-large-file build/compiler-stage3.ll build/minyar-runtime.o build/tooling/tests/compiler-behavior
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile core --ir build/compiler-stage3.ll
 
-check-mutation: build/stage0 build/minyarc build/minyar-runtime.o build/tooling/tests/list-access build/tooling/tests/checked-arithmetic build/tooling/tools/clang-driver
-	$(LIMITED) python3 tests/mutation.py
+check-mutation: build/stage0 build/minyarc build/minyar-runtime.o build/tooling/tests/list-access build/tooling/tests/checked-arithmetic build/tooling/tools/clang-driver build/tooling/tests/mutation
+	$(LIMITED) ./build/tooling/tests/mutation
 
 .PHONY: check-mutation-score-harness
 check-mutation-score-harness: build/tooling/tests/mutation-score-harness build/tooling/tests/mutation-score

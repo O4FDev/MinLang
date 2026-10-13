@@ -1,0 +1,122 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+
+function replaceOnce(source: Text, before: Text, after: Text, name: Text): Text {
+    let replaced = test.replace(source, before, after)
+    let removed = Bytes(source).length - Bytes(test.replace(source, before, "")).length
+    let occurrences = removed / Bytes(before).length
+    test.check(occurrences == 1, "mutation '" + name + "' expected one source location, found " + Text(occurrences))
+    return replaced
+}
+function find(source: Text, needle: Text, begin: Integer): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let index = begin
+    while index + pattern.length <= raw.length {
+        if Text(raw.slice(index, index + pattern.length)) == needle { return index }
+        index += 1
+    }
+    return -1
+}
+function environment(name: Text, value: Text): List<Text> {
+    let prefix = Bytes(name + "=")
+    let result: List<Text> = []
+    for item in system.environment() {
+        let raw = Bytes(item)
+        if raw.length < prefix.length || Text(raw.slice(0, prefix.length)) != name + "=" { result.add(item) }
+    }
+    result.add(name + "=" + value)
+    return result
+}
+function run(command: List<Text>, log: Text, seconds: Integer): test.Result {
+    return test.run(command, system.environment(), "", log, seconds)
+}
+function compilerMutations(work: Text, clang: Text, runtime: Text) {
+    let original = readTextFile("build/compiler.min")
+    let names = ["allow-cycles", "invert-visibility", "allow-module-side-effects", "break-parent-paths", "reject-valid-entry-points",
+        "break-indexed-lookups", "widen-inline-list-get-bounds", "widen-inline-list-set-bounds", "reject-valid-inline-overflow", "reject-valid-inline-division"]
+    let befores = ["if moduleStates[existing] == 1 {", "if declarationPublic[declaration] == 0 {", "if !isEntry {\n                    fail(canonicalPath",
+        "activeParts = activeParts - 1", "if topLevelStatements && mainFunction >= 0 {", "let symbol = symbolReturnTypes[count + middle]",
+        "%get.valid = icmp ult i64 %position, %length\n", "%set.valid = icmp ult i64 %position, %length\n",
+        "br i1 %overflow, label %bad, label %good\n", "%zero = icmp eq i64 %right, 0\n"]
+    let afters = ["if moduleStates[existing] == 2 {", "if declarationPublic[declaration] != 0 {", "if isEntry {\n                    fail(canonicalPath",
+        "activeParts = activeParts + 1", "if topLevelStatements || mainFunction >= 0 {", "let symbol = symbolReturnTypes[count]",
+        "%get.valid = icmp ule i64 %position, %length\n", "%set.valid = icmp ule i64 %position, %length\n",
+        "br i1 %overflow, label %good, label %bad\n", "%zero = icmp ne i64 %right, 0\n"]
+    for index in 0..names.length {
+        let name = names[index]
+        let source = ""
+        if name == "allow-cycles" || name == "allow-module-side-effects" {
+            let start = find(original, "function loadModule(", 0)
+            test.check(start >= 0, "loadModule is missing")
+            let end = find(original, "\nfunction ", start)
+            test.check(end >= 0, "loadModule end is missing")
+            let raw = Bytes(original)
+            source = Text(raw.slice(0, start)) + replaceOnce(Text(raw.slice(start, end)), befores[index], afters[index], name) + Text(raw.slice(end, raw.length))
+        } else {
+            source = replaceOnce(original, befores[index], afters[index], name)
+        }
+        let mutant = work + "/compiler-" + name
+        writeTextFile(mutant + ".min", source)
+        let seeded = run(["./build/stage0", mutant + ".min", "-o", mutant + ".ll"], mutant + ".seed", 30)
+        test.check(seeded.status == 0, "could not build compiler mutant '" + name + "':\n" + seeded.errorOutput)
+        let linked = run([clang, "-O0", "-Wno-override-module", mutant + ".ll", runtime, "-o", mutant, "-lm"], mutant + ".link", 30)
+        test.check(linked.status == 0, "could not link compiler mutant '" + name + "':\n" + linked.errorOutput)
+        let command = ["sh", "tests/run-module-tests.sh"]
+        if test.contains(name, "widen-inline-list-") { command = ["./build/tooling/tests/list-access", "ListAccess.test_inline_access_helpers_preserve_checked_fallback"] }
+        else if test.contains(name, "reject-valid-inline-") { command = ["./build/tooling/tests/checked-arithmetic", "CheckedArithmetic.test_checks_are_visible_without_lto"] }
+        let tested = test.run(command, environment("MINYAR_TEST_COMPILER", mutant), "", mutant + ".test", 45)
+        test.check(tested.status != 0, "compiler mutant survived: " + name)
+        print("killed compiler mutant: " + name)
+    }
+}
+function runtimeMutations(work: Text, clang: Text) {
+    let compiler = test.setting("MINYAR_TEST_COMPILER", "build/minyarc")
+    let names = ["list-boundary", "reject-valid-arithmetic", "reject-valid-division", "break-text-equality", "reject-valid-text-slice"]
+    let programs = ["tests/runtime/lists.min", "examples/language-tour.min", "tests/runtime/division-valid.min", "examples/language-tour.min", "tests/runtime/text-indexing.min"]
+    let headers = ["minyar_collections.h", "minyar_numbers.h", "minyar_numbers.h", "minyar_runtime.c", "minyar_runtime.c"]
+    let befores = ["long long minyar_list_get(const MinyarList *list, long long position) {\n    if ((unsigned long long)position >= (unsigned long long)list->length)",
+        "if (overflowed)\n", "if (right == 0 || (left == LLONG_MIN && right == -1))", "left->byte_length == right->byte_length",
+        "if (start < 0 || end < start || end > text->character_length)"]
+    let afters = ["long long minyar_list_get(const MinyarList *list, long long position) {\n    if ((unsigned long long)position >= (unsigned long long)(list->length - 1))",
+        "if (!overflowed)\n", "if (right != 0 || (left == LLONG_MIN && right == -1))", "left->byte_length != right->byte_length",
+        "if (start < 0 || end < start || end >= text->character_length)"]
+    for index in 0..names.length {
+        let name = names[index]
+        let llvm = work + "/runtime-" + name + ".ll"
+        let compiled = run([compiler, programs[index], llvm], llvm + ".compile", 30)
+        test.check(compiled.status == 0, "could not prepare runtime mutant '" + name + "':\n" + compiled.errorOutput)
+        if name == "list-boundary" {
+            writeTextFile(llvm, test.replace(readTextFile(llvm), "call i64 @.minyar.list.get.checked(", "call i64 @minyar_list_get("))
+        }
+        if name == "reject-valid-arithmetic" || name == "reject-valid-division" {
+            let text = test.replace(readTextFile(llvm), "call void @.minyar.integer.overflow.checked(", "call void @minyar_check_integer_overflow(")
+            writeTextFile(llvm, test.replace(text, "call void @.minyar.integer.division.checked(", "call void @minyar_check_integer_division("))
+        }
+        let mutated = replaceOnce(readTextFile("runtime/" + headers[index]), befores[index], afters[index], name)
+        let directory = work + "/runtime-" + name
+        let copied = run(["cp", "-R", "runtime", directory], directory + ".copy", 30)
+        test.check(copied.status == 0, "could not copy runtime for '" + name + "'")
+        writeTextFile(directory + "/" + headers[index], mutated)
+        let executable = work + "/runtime-" + name + "-program"
+        let linked = run([clang, "-O0", "-Wno-override-module", llvm, directory + "/minyar_runtime.c", "-I", "runtime", "-o", executable, "-lm"], executable + ".link", 30)
+        test.check(linked.status == 0, "could not link runtime mutant '" + name + "':\n" + linked.errorOutput)
+        let result = run([executable], executable + ".run", 30)
+        let survived = result.status == 0
+        if name == "list-boundary" { survived = result.status == 0 && result.output == "42\nMinyar\n" }
+        else if name == "reject-valid-division" { survived = result.status == 0 && result.output == "21\n2\n" }
+        else if name == "break-text-equality" || name == "reject-valid-arithmetic" { survived = result.status == 0 && result.output == "The answer is\n42\n3\n2\n1\n" }
+        test.check(!survived, "runtime mutant survived: " + name)
+        print("killed runtime mutant: " + name)
+    }
+}
+
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let runtime = "build/minyar-runtime.o"
+if files.pathSize(runtime) < 0 { runtime = "runtime/minyar_runtime.c" }
+let work = test.scratch()
+compilerMutations(work, clang, runtime)
+runtimeMutations(work, clang)
+test.removeTree(work)
+print("all seeded compiler and runtime mutants were killed")
