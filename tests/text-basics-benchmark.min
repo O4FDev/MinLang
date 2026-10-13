@@ -1,0 +1,192 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "sha256" as sha
+
+function suffix(path: Text, replacement: Text): Text {
+    let raw = Bytes(path)
+    let slash = -1
+    let dot = -1
+    for index in 0..raw.length {
+        if raw[index] == 47 { slash = index; dot = -1 }
+        else if raw[index] == 46 { dot = index }
+    }
+    if dot > slash + 1 { return Text(raw.slice(0, dot)) + replacement }
+    return path + replacement
+}
+function parent(path: Text): Text {
+    let raw = Bytes(path)
+    let slash = -1
+    for index in 0..raw.length { if raw[index] == 47 { slash = index } }
+    if slash < 0 { return "." }
+    if slash == 0 { return "/" }
+    return Text(raw.slice(0, slash))
+}
+function median(samples: List<Float>): Float {
+    let values = samples.slice(0, samples.length)
+    test.check(values.length > 0, "missing benchmark samples")
+    for index in 1..values.length {
+        let position = index
+        while position > 0 && values[position] < values[position - 1] {
+            let earlier = values[position - 1]
+            values[position - 1] = values[position]
+            values[position] = earlier
+            position -= 1
+        }
+    }
+    let middle = values.length / 2
+    if values.length % 2 == 1 { return values[middle] }
+    return (values[middle - 1] + values[middle]) / 2.0
+}
+function samplesJSON(samples: List<Float>): Text {
+    let result = "["
+    for index in 0..samples.length {
+        if index > 0 { result += "," }
+        result += Text(samples[index])
+    }
+    return result + "]"
+}
+function affinityJSON(): Text {
+    let result = "["
+    let count = 0
+    for line in test.lines(readTextFile("/proc/self/status")) {
+        let fields = test.words(line)
+        if fields.length != 2 || fields[0] != "Cpus_allowed_list:" { continue }
+        for part in fields[1].split(",") {
+            let bounds = part.split("-")
+            let first = Integer(bounds[0])
+            let last = first
+            if bounds.length == 2 { last = Integer(bounds[1]) }
+            for cpu in first..(last + 1) {
+                if count > 0 { result += "," }
+                result += Text(cpu)
+                count += 1
+            }
+        }
+    }
+    test.check(count > 0, "cannot read benchmark CPU affinity")
+    return result + "]"
+}
+function digest(path: Text): Text { return sha.hex(sha.digest(readBytesFile(path))) }
+function seconds(start: Integer): Float { return Float(system.monotonicNanoseconds() - start) / 1000000000.0 }
+function startCapture(path: Text): Bytes { native "textbenchmark" }
+function finishCapture(token: Bytes): Integer { native "textbenchmark" }
+function waitForExit(pid: Integer, milliseconds: Integer): Integer { native "textbenchmark" }
+function sameBytes(left: Bytes, right: Bytes): Boolean { native "textbenchmark" }
+record Measurement { result: test.Result; seconds: Float }
+function measured(command: List<Text>, log: Text, timeout: Integer): Measurement {
+    let start = system.monotonicNanoseconds()
+    let token = startCapture(log)
+    test.check(token.length == 16, "cannot capture measured process output")
+    let handle = system.spawn(command[0], command, system.environment(), "")
+    if handle <= 0 {
+        finishCapture(token)
+        fail("cannot launch measured process")
+    }
+    let waited = waitForExit(system.childProcessId(handle), timeout * 1000)
+    if waited != 1 {
+        system.sendSignal(system.childProcessId(handle), 9)
+        system.wait(handle)
+        finishCapture(token)
+        fail("measured process exceeded its timeout or wait failed")
+    }
+    let status = system.wait(handle)
+    let elapsed = seconds(start)
+    test.check(finishCapture(token) == 0, "cannot restore benchmark process output")
+    test.check(status.error == 0 && (status.state == system.EXITED || status.state == system.SIGNALED), "measured process wait failed")
+    let code = status.exitCode
+    if status.state == system.SIGNALED { code = 128 + status.signal }
+    return Measurement { result: test.Result { status: code; output: readTextFile(log); errorOutput: readTextFile(log + ".err") }; seconds: elapsed }
+}
+
+let compiler = "./build/minyarc"
+let runtime = "build/minyar-runtime.o"
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let output = ""
+let repeats = 9
+let fixture = "text-basics"
+let baselineCompiler = ""
+let batchSize = 16
+let optionIndex = 0
+while optionIndex < argumentCount() {
+    let option = argument(optionIndex)
+    test.check(optionIndex + 1 < argumentCount(), "missing Text benchmark option value")
+    optionIndex += 1
+    let value = argument(optionIndex)
+    if option == "--compiler" { compiler = value }
+    else if option == "--runtime" { runtime = value }
+    else if option == "--clang" { clang = value }
+    else if option == "--output" { output = value }
+    else if option == "--repeats" { repeats = Integer(value) }
+    else if option == "--fixture" { fixture = value }
+    else if option == "--baseline-compiler" { baselineCompiler = value }
+    else if option == "--batch-size" { batchSize = Integer(value) }
+    else { fail("unknown Text benchmark option: " + option) }
+    optionIndex += 1
+}
+test.check(output != "", "Text benchmark requires --output")
+test.check(repeats >= 1 && batchSize >= 1, "invalid Text benchmark work bounds")
+test.check(fixture == "text-basics" || fixture == "text-find-prefixes", "unsupported Text benchmark fixture")
+let source = "benchmarks/" + fixture + ".min"
+let checksum = 11200000
+if fixture == "text-find-prefixes" { checksum = -64 }
+let llvm = suffix(output, ".ll")
+let executable = suffix(output, ".exe")
+let work = test.scratch()
+test.require(test.run(["/bin/mkdir", "-p", "--", parent(output)], system.environment(), "", work + "/mkdir", 10), "benchmark output directory")
+test.require(test.run([compiler, source, llvm], system.environment(), "", work + "/compile", 30), "Text benchmark compile")
+let command = [clang, "-O2", "-Wno-override-module"]
+for flag in test.words(test.setting("MINYAR_TEST_LINK_FLAGS", "")) { command.add(flag) }
+for item in [llvm, runtime, "-o", executable, "-lm"] { command.add(item) }
+test.require(test.run(command, system.environment(), "", work + "/link", 60), "Text benchmark link")
+let samples: List<Float> = []
+for repetition in 0..(repeats + 1) {
+    let observation = measured([executable], work + "/workload", 30)
+    let result = observation.result
+    let elapsed = observation.seconds
+    test.check(result.status == 0 && result.output == Text(checksum) + "\n" && result.errorOutput == "", "Text benchmark checksum or execution changed\n" + result.output + result.errorOutput)
+    samples.add(elapsed)
+}
+let measured = samples.slice(1, samples.length)
+let record = "{\"source_sha256\":\"" + digest(source) + "\",\"compiler_sha256\":\"" + digest(compiler) + "\",\"runtime_sha256\":\"" + digest(runtime) + "\",\"cpu_affinity\":" + affinityJSON() + ",\"warmup_seconds\":" + Text(samples[0]) + ",\"samples_seconds\":" + samplesJSON(measured) + ",\"median_seconds\":" + Text(median(measured)) + ",\"checksum\":" + Text(checksum)
+let passed = true
+if baselineCompiler != "" {
+    let reference = "build/compiler.min"
+    let control: List<Float> = []
+    let candidate: List<Float> = []
+    let compilers = [baselineCompiler, compiler]
+    let outputs = [suffix(output, ".control.ll"), suffix(output, ".candidate.ll")]
+    let expected = Bytes()
+    let first = true
+    for repetition in 0..32 {
+        let order = [0, 1]
+        if repetition % 2 != 0 { order = [1, 0] }
+        for index in order {
+            let elapsed = 0.0
+            for batch in 0..batchSize {
+                let observation = measured([compilers[index], reference, outputs[index]], work + "/selfcompile", 30)
+                let result = observation.result
+                elapsed += observation.seconds
+                test.check(result.status == 0 && result.errorOutput == "", "paired selfcompile failed\n" + result.output + result.errorOutput)
+                let emitted = readBytesFile(outputs[index])
+                if first { expected = emitted; first = false }
+                test.check(emitted.length == expected.length, "same-source LLVM size changed")
+                test.check(sameBytes(emitted, expected), "same-source LLVM changed")
+            }
+            if repetition > 0 {
+                if index == 0 { control.add(elapsed / Float(batchSize)) }
+                else { candidate.add(elapsed / Float(batchSize)) }
+            }
+        }
+    }
+    let controlMedian = median(control)
+    let candidateMedian = median(candidate)
+    test.check(controlMedian > 0.0, "selfcompile control median is zero")
+    let ratio = candidateMedian / controlMedian
+    passed = ratio <= 1.01
+    record += ",\"self_compile\":{\"source_sha256\":\"" + digest(reference) + "\",\"baseline_compiler_sha256\":\"" + digest(baselineCompiler) + "\",\"batch_size\":" + Text(batchSize) + ",\"samples_seconds\":{\"control\":" + samplesJSON(control) + ",\"candidate\":" + samplesJSON(candidate) + "},\"medians_seconds\":{\"control\":" + Text(controlMedian) + ",\"candidate\":" + Text(candidateMedian) + "},\"candidate_control_ratio\":" + Text(ratio) + ",\"maximum_ratio\":1.01,\"passed\":" + Text(passed) + "}"
+}
+record += "}"
+writeTextFile(output, record + "\n")
+print(record)
+test.check(passed, "self-compile exceeded the unchanged 1% gate")
+test.removeTree(work)

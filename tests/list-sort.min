@@ -1,0 +1,208 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+
+function engineSource(): Text {
+    let engine = readTextFile("runtime/minyar_runtime.c")
+    for header in ["minyar_rc.h", "minyar_collections.h"] {
+        let replacement = "minyar_cycle_rc.h"
+        if header == "minyar_collections.h" { replacement = "minyar_cycle_collections.h" }
+        let directive = "#include \"" + header + "\""
+        test.check(engine.byteLength - test.replace(engine, directive, "").byteLength == directive.byteLength, "managed graph runtime requires exactly one ownership header")
+        engine = test.replace(engine, directive, "#include \"" + replacement + "\"")
+    }
+    return "#define MINYAR_SORT_GRAPH 1\n#define MINYAR_MAP_CYCLE_RUNTIME 1\n#if defined(__GNUC__) || defined(__clang__)\n#define MINYAR_NOINLINE __attribute__((noinline))\n#else\n#define MINYAR_NOINLINE\n#endif\n" + engine + "\n#include \"minyar_callbacks.h\"\n"
+}
+
+function callbackCompile(compiler: test.Compiler, source: Text): test.Result {
+    compiler.serial += 1
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    writeTextFile(path + ".min", source)
+    let result = test.run([compiler.executable, path + ".min", path + ".ll", "--library", "library"], system.environment(), "", path + ".compile", 30)
+    if result.status == 0 && test.addressEnabled(compiler.flags) { writeTextFile(path + ".ll", test.instrument(readTextFile(path + ".ll"))) }
+    return result
+}
+function rejects(compiler: test.Compiler, source: Text, diagnostic: Text, callback: Boolean) {
+    let result = test.Result { status: 0; output: ""; errorOutput: "" }
+    if callback { result = callbackCompile(compiler, source) } else { result = test.compile(compiler, source) }
+    test.check(result.status == 1, "expected compiler rejection\n" + result.errorOutput)
+    test.check(result.output == "", "rejected source wrote standard output")
+    test.check(test.contains(result.errorOutput, diagnostic), "missing diagnostic: " + diagnostic + "\n" + result.errorOutput)
+    test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "invalid source left LLVM output")
+    test.check(!test.contains(result.errorOutput, "List position"), "compiler rejection reported a runtime List trap")
+}
+function executes(compiler: test.Compiler, source: Text, expected: Text, status: Integer, diagnostics: Text, callback: Boolean) {
+    let runtime = compiler.runtime
+    if callback {
+        test.require(callbackCompile(compiler, source), "comparator sort compile")
+        let engine = engineSource()
+        let profile = system.getenv("MINYAR_SORT_RUNTIME_FLAGS")
+        if system.lastError() != 0 { profile = "-DMINYAR_SYSTEM_HEAP=1" }
+        let definitions = test.words(profile)
+        let arena = false
+        for define in definitions { if test.contains(define, "MINYAR_COMPILER_ARENA") { arena = true } }
+        let harness = engine
+        if !arena { harness = test.replace(readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", engine) }
+        let path = compiler.directory + "/case" + Text(compiler.serial)
+        writeTextFile(path + ".runtime.c", harness)
+        runtime = path + ".runtime.o"
+        let optimization = "-O2"
+        if compiler.flags.length > 0 { optimization = "-O1" }
+        let command = [compiler.clang, optimization]
+        for flag in compiler.flags { command.add(flag) }
+        for define in definitions { command.add(define) }
+        for item in ["-iquote", "runtime", "-c", path + ".runtime.c", "-o", runtime] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".runtime-build", 60), "comparator ownership runtime")
+    } else { test.require(test.compile(compiler, source), "natural sort compile") }
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization]
+        for flag in compiler.flags { command.add(flag) }
+        for item in ["-Wno-override-module", path + ".ll", runtime, "-o", path + ".exe", "-lm"] { command.add(item) }
+        let linkTimeout = compiler.linkTimeout
+        let runTimeout = compiler.runTimeout
+        if callback { linkTimeout = 60; runTimeout = 30 }
+        test.require(test.run(command, system.environment(), "", path + ".link", linkTimeout), "List sort link")
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", runTimeout)
+        test.check(result.status == status && result.output == expected && result.errorOutput == diagnostics, "List sort execution changed\n" + result.output + result.errorOutput)
+    }
+}
+function selected(selectors: List<Text>, group: Text, name: Text): Boolean {
+    if selectors.length == 0 { return true }
+    for selector in selectors { if selector == group || selector == group + "." + name || selector == name { return true } }
+    return false
+}
+record Program { source: Text; expected: Text }
+record Row { key: Integer; id: Integer }
+function naturalModel(): Program {
+    let cases = test.lines(readTextFile("tests/list-sort-natural-cases.tsv"))
+    test.check(cases.length == 12, "seeded natural sort corpus changed")
+    let programs: List<Text> = []
+    let expected = ""
+    for row in cases {
+        let values: List<Integer> = []
+        if row != "-" { for value in test.words(row) { values.add(Integer(value)) } }
+        let literals = ""
+        for index in 0..values.length { if index > 0 { literals += "," }; literals += Text(values[index]) }
+        programs.add("if true {\nlet values: List<Integer> = [" + literals + "]\nlet copy = values.sorted()\nvalues.sort()\nlet i = 0\nwhile i < values.length { print(values[i]); print(copy[i]); i = i + 1 }\n}")
+        for index in 1..values.length {
+            let position = index
+            while position > 0 && values[position] < values[position - 1] {
+                let earlier = values[position - 1]
+                values[position - 1] = values[position]
+                values[position] = earlier
+                position -= 1
+            }
+        }
+        for value in values { expected += Text(value) + "\n" + Text(value) + "\n" }
+    }
+    let source = ""
+    for program in programs { source += program + "\n" }
+    return Program { source: source; expected: expected }
+}
+function recordModel(): Program {
+    let cases = test.lines(readTextFile("tests/list-sort-record-cases.tsv"))
+    test.check(cases.length == 81, "seeded comparator stability corpus changed")
+    let rows: List<Row> = []
+    let literals = ""
+    for index in 0..cases.length {
+        let fields = test.words(cases[index])
+        test.check(fields.length == 2, "invalid comparator stability corpus row")
+        let key = Integer(fields[0])
+        let id = Integer(fields[1])
+        rows.add(Row { key: key; id: id })
+        if index > 0 { literals += "," }
+        literals += "Row { key: " + Text(key) + "; id: " + Text(id) + " }"
+    }
+    let source = "record Row { key: Integer; id: Integer }\nlet rows = [" + literals + "]\nlet compare = function(a: Row, b: Row): Integer { return a.key - b.key }\nlet ordered = rows.sortedBy(compare)\nrows.sortBy(compare)\nlet i = 0\nwhile i < rows.length { print(rows[i].id); print(ordered[i].id); i = i + 1 }\n"
+    for index in 1..rows.length {
+        let position = index
+        while position > 0 && rows[position].key < rows[position - 1].key {
+            let earlier = rows[position - 1]
+            rows[position - 1] = rows[position]
+            rows[position] = earlier
+            position -= 1
+        }
+    }
+    let expected = ""
+    for row in rows { expected += Text(row.id) + "\n" + Text(row.id) + "\n" }
+    return Program { source: source; expected: expected }
+}
+let selectors: List<Text> = []
+let names = ["NaturalSort.test_gap_image_and_content_hash_byte_order", "NaturalSort.test_independent_random_models_and_boundaries", "NaturalSort.test_other_natural_types_and_fresh_empty_copy", "NaturalSort.test_unordered_types_and_arguments_rejected", "ComparatorSort.test_comparator_parameter_without_closure_literal", "ComparatorSort.test_empty_singleton_and_escaping_closure", "ComparatorSort.test_slot_mutation_and_growth_rejected_before_publication", "ComparatorSort.test_stable_records_shallow_copy_and_captured_side_effects", "ComparatorSort.test_independent_random_record_stability", "ComparatorSort.test_receiver_rebinding_and_unpermuted_callback_observation", "ComparatorSort.test_comparator_kept_when_selected_field_is_rebound", "ComparatorSort.test_float_boolean_character_and_text_thunks", "ComparatorSort.test_cyclic_record_list_publication", "ComparatorSort.test_signature_rejected"]
+for index in 0..argumentCount() {
+    let selector = argument(index)
+    if selector == "-v" || selector == "--verbose" || selector == "-q" || selector == "--quiet" { continue }
+    let known = selector == "NaturalSort" || selector == "ComparatorSort"
+    for name in names { if selector == name || selector == name.split(".")[1] { known = true } }
+    test.check(known, "unknown List sort test selector: " + selector)
+    selectors.add(selector)
+}
+let natural = test.compiler()
+let callback = test.compiler()
+let frontend = "./build/minyarc-callbacks"
+if test.addressEnabled(callback.flags) { frontend += "-sanitize" }
+callback.executable = test.setting("MINYAR_CALLBACK_COMPILER", frontend)
+if selected(selectors, "NaturalSort", "test_gap_image_and_content_hash_byte_order") {
+    executes(natural, "let hashes = [\"ff\", \"00\", \"é\", \"aa\", \"a\", \"00\"]\nlet ordered = hashes.sorted()\nprint(hashes[0])\nlet alias = hashes\nhashes.sort()\nlet i = 0\nwhile i < ordered.length { print(ordered[i]); print(alias[i]); i = i + 1 }\n", "ff\n00\n00\n00\n00\na\na\naa\naa\nff\nff\né\né\n", 0, "", false)
+}
+if selected(selectors, "NaturalSort", "test_independent_random_models_and_boundaries") {
+    let program = naturalModel()
+    executes(natural, program.source, program.expected, 0, "", false)
+}
+if selected(selectors, "NaturalSort", "test_other_natural_types_and_fresh_empty_copy") {
+    executes(natural, "let flags = [true, false, true, false]\nflags.sort()\nprint(flags[0]); print(flags[3])\nlet chars = ['😀', 'a', 'é']\nlet ordered = chars.sorted()\nprint(ordered[0]); print(ordered[1]); print(ordered[2])\nlet floats = [3.5, -0.0, 0.0, -8.5]\nfloats.sort()\nprint(floats[0]); print(floats[3])\nlet empty: List<Integer> = []\nlet copy = empty.sorted()\ncopy.add(1)\nprint(empty.length)\n", "false\ntrue\na\né\n😀\n-8.5\n3.5\n0\n", 0, "", false)
+}
+if selected(selectors, "NaturalSort", "test_unordered_types_and_arguments_rejected") {
+    rejects(natural, "record Box { value: Integer }\nlet xs = [Box { value: 1 }]\nxs.sort()\n", "no natural order", false)
+    rejects(natural, "let xs = [1]\nxs.sorted(2)\n", "expected ')'", false)
+}
+if selected(selectors, "ComparatorSort", "test_comparator_parameter_without_closure_literal") {
+    for operation in ["sortBy", "sortedBy"] {
+        let source = "function order(xs: List<Integer>, cmp: Callback<Integer, Integer, Integer>) {\n    xs." + operation + "(cmp)\n}\nprint(42)\n"
+        test.require(callbackCompile(callback, source), "comparator parameter compile")
+        let generated = readTextFile(callback.directory + "/case" + Text(callback.serial) + ".ll")
+        let declaration = "declare void @minyar_callback_check(ptr)"
+        test.check(generated.byteLength - test.replace(generated, declaration, "").byteLength == declaration.byteLength, "callback check declaration count changed")
+        test.check(test.contains(generated, "; minyar-callback-runtime: 1"), "callback runtime marker missing")
+        executes(callback, source, "42\n", 0, "", true)
+    }
+}
+if selected(selectors, "ComparatorSort", "test_empty_singleton_and_escaping_closure") {
+    executes(callback, "record Box { offset: Integer }\nfunction factory(): Callback<Integer, Integer, Integer> {\n    let box = Box { offset: 0 }\n    return function(a: Integer, b: Integer): Integer { return a - b + box.offset }\n}\nlet compare = factory()\nlet empty: List<Integer> = []\nempty.sortBy(compare)\nlet copy = empty.sortedBy(compare)\ncopy.add(9)\nprint(empty.length)\nlet one = [42]\none.sortBy(compare)\nprint(one.sortedBy(compare)[0])\n", "0\n42\n", 0, "", true)
+}
+if selected(selectors, "ComparatorSort", "test_slot_mutation_and_growth_rejected_before_publication") {
+    for operation in ["sortBy", "sortedBy"] {
+        for mutation in ["values[0] = 99", "values.add(99)"] {
+            let source = "let values = [3, 1, 2]\nlet compare = function(a: Integer, b: Integer): Integer {\n    " + mutation + "\n    return a - b\n}\nvalues." + operation + "(compare)\n"
+            executes(callback, source, "", 1, "Minyar stopped: the List was mutated during its sort comparator.\n", true)
+        }
+    }
+}
+if selected(selectors, "ComparatorSort", "test_stable_records_shallow_copy_and_captured_side_effects") {
+    executes(callback, "record Row { key: Integer; tag: Text }\nrecord Counter { calls: Integer }\nlet counter = Counter { calls: 0 }\nlet rows = [Row { key: 2; tag: \"a\" }, Row { key: 1; tag: \"b\" }, Row { key: 2; tag: \"c\" }, Row { key: 1; tag: \"d\" }]\nlet compare: Callback<Row, Row, Integer> = function(a: Row, b: Row): Integer {\n    counter.calls = counter.calls + 1\n    if a.key < b.key { return -99 }\n    if a.key > b.key { return 99 }\n    return 0\n}\nlet sorted = rows.sortedBy(compare)\nprint(rows[0].tag)\nrows.sortBy(compare)\nlet i = 0\nwhile i < rows.length { print(rows[i].tag); print(sorted[i].tag); i = i + 1 }\nsorted[0].tag = \"shared\"\nprint(rows[0].tag)\nprint(counter.calls > 0)\n", "a\nb\nb\nd\nd\na\na\nc\nc\nshared\ntrue\n", 0, "", true)
+}
+if selected(selectors, "ComparatorSort", "test_independent_random_record_stability") {
+    let program = recordModel()
+    executes(callback, program.source, program.expected, 0, "", true)
+}
+if selected(selectors, "ComparatorSort", "test_receiver_rebinding_and_unpermuted_callback_observation") {
+    executes(callback, "record Holder { values: List<Integer> }\nlet holder = Holder { values: [3, 1, 2] }\nlet alias = holder.values\nlet compare = function(a: Integer, b: Integer): Integer {\n    if alias[0] != 3 || alias[1] != 1 || alias[2] != 2 { fail(\"permuted during comparison\") }\n    holder.values = []\n    return a - b\n}\nholder.values.sortBy(compare)\nprint(holder.values.length)\nprint(alias[0]); print(alias[1]); print(alias[2])\n", "0\n1\n2\n3\n", 0, "", true)
+}
+if selected(selectors, "ComparatorSort", "test_comparator_kept_when_selected_field_is_rebound") {
+    executes(callback, "record Holder { compare: Callback<Integer, Integer, Integer> }\nlet holder = Holder { compare: function(a: Integer, b: Integer): Integer { return a - b } }\nholder.compare = function(a: Integer, b: Integer): Integer {\n    holder.compare = function(x: Integer, y: Integer): Integer { return 0 }\n    return a - b\n}\nlet values = [3, 2, 1]\nvalues.sortBy(holder.compare)\nprint(values[0]); print(values[1]); print(values[2])\n", "1\n2\n3\n", 0, "", true)
+}
+if selected(selectors, "ComparatorSort", "test_float_boolean_character_and_text_thunks") {
+    executes(callback, "let fs = [1.5, -2.5]\nfs.sortBy(function(a: Float, b: Float): Integer { if a < b { return -1 }; if a > b { return 1 }; return 0 })\nprint(fs[0])\nlet bs = [true, false]\nbs.sortBy(function(a: Boolean, b: Boolean): Integer { if a == b { return 0 }; if a { return 1 }; return -1 })\nprint(bs[0])\nlet cs = ['z', 'a']\ncs.sortBy(function(a: Character, b: Character): Integer { return Integer(a) - Integer(b) })\nprint(cs[0])\nlet ts = [\"long\", \"a\"]\nts.sortBy(function(a: Text, b: Text): Integer { return a.length - b.length })\nprint(ts[0])\n", "-2.5\nfalse\na\na\n", 0, "", true)
+}
+if selected(selectors, "ComparatorSort", "test_cyclic_record_list_publication") {
+    executes(callback, "record Node { key: Integer; links: List<Node> }\nlet a = Node { key: 2; links: [] }\nlet b = Node { key: 1; links: [] }\nlet nodes = [a, b]\na.links = nodes\nb.links = nodes\nlet compare = function(x: Node, y: Node): Integer { return x.key - y.key }\nlet copy = nodes.sortedBy(compare)\nnodes.sortBy(compare)\nprint(nodes[0].key); print(nodes[1].key)\nprint(copy[0].links[0].key)\n", "1\n2\n1\n", 0, "", true)
+}
+if selected(selectors, "ComparatorSort", "test_signature_rejected") {
+    for header in ["a: Integer, b: Integer): Boolean { return true", "a: Text, b: Text): Integer { return 0", "a: Integer): Integer { return a"] {
+        rejects(callback, "let values = [2,1]\nvalues.sortBy(function(" + header + " })\n", "Callback<T, T, Integer>", true)
+    }
+}
+test.removeTree(natural.directory)
+test.removeTree(callback.directory)
+print("Natural and comparator List sort: passed")

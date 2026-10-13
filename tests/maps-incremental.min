@@ -1,0 +1,88 @@
+use "../tools/testing.min" as test
+use "system" as system
+
+function equal(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+function compile(compiler: test.Compiler, source: Text): test.Result {
+    compiler.serial += 1
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    writeTextFile(path + ".min", source)
+    let command = ["./build/minyar-module-build", "./build/minyarc-modules", path + ".min", path + ".ll", compiler.directory + "/cache"]
+    let result = test.run(command, system.environment(), "", path + ".cold", 30)
+    if result.status == 0 {
+        let first = readBytesFile(path + ".ll")
+        test.require(test.run(command, system.environment(), "", path + ".warm", 30), "Map module warm compile")
+        test.check(equal(first, readBytesFile(path + ".ll")), "Map cold/warm LLVM changed")
+        if test.addressEnabled(compiler.flags) { writeTextFile(path + ".ll", test.instrument(readTextFile(path + ".ll"))) }
+    }
+    return result
+}
+function executes(compiler: test.Compiler, source: Text, expected: Text) {
+    test.require(compile(compiler, source), "Map module cold compile")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization]
+        for flag in compiler.flags { command.add(flag) }
+        for item in ["-Wno-override-module", path + ".ll", compiler.runtime, "-o", path + ".exe", "-lm"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".link", compiler.linkTimeout), "Map module link")
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", compiler.runTimeout)
+        test.require(result, "Map module execution")
+        test.check(result.output == expected, "Map module output changed\n" + result.output)
+        test.check(result.errorOutput == "", "Map module wrote execution diagnostics\n" + result.errorOutput)
+    }
+}
+function selected(selectors: List<Text>, name: Text): Boolean {
+    if selectors.length == 0 { return true }
+    for selector in selectors { if selector == "MapModuleDriver" || selector == name || selector == "MapModuleDriver." + name { return true } }
+    return false
+}
+
+let names = ["test_signed_nested_types_reuse_the_compiled_type_table", "test_contained_private_record_type_changes_invalidate_importer"]
+let selectors: List<Text> = []
+for index in 0..argumentCount() {
+    let selector = argument(index)
+    if selector == "-v" || selector == "--verbose" || selector == "-q" || selector == "--quiet" { continue }
+    let known = selector == "MapModuleDriver"
+    for name in names { if selector == name || selector == "MapModuleDriver." + name { known = true } }
+    test.check(known, "unknown incremental Map test selector: " + selector)
+    selectors.add(selector)
+}
+let compiler = test.compiler()
+if selected(selectors, "test_signed_nested_types_reuse_the_compiled_type_table") {
+    let valueType = "Map<Integer, List<Map<Text, Map<Float, List<Integer>>>>>"
+    let path = compiler.directory + "/nested.min"
+    writeTextFile(path, "function size(m: " + valueType + "): Integer { return m.length }\nlet m: " + valueType + " = Map()\nprint(size(m))\n")
+    let prior = compiler.directory + "/prior"
+    let next = compiler.directory + "/next"
+    let stats = compiler.directory + "/stats"
+    writeTextFile(prior, "")
+    let outputs: List<Bytes> = []
+    for phase in ["cold", "warm"] {
+        let llvm = compiler.directory + "/" + phase + ".ll"
+        test.require(test.run(["./build/minyarc-modules", path, llvm, "--module-state", prior, next, stats], system.environment(), "", llvm + ".compile", 30), "Map type table " + phase)
+        outputs.add(readBytesFile(llvm))
+        if phase == "cold" { writeBytesFile(prior, readBytesFile(next)) }
+        else {
+            let fields = test.words(readTextFile(stats))
+            test.check(fields.length >= 5, "Map module statistics missing fields")
+            test.check(fields[fields.length - 1] == "true", "warm Map type table was not reused")
+            test.check(Integer(fields[0]) > 0, "warm Map type table reported no reuse")
+            test.check(Integer(fields[1]) == 0 && Integer(fields[4]) == 0, "warm Map type table recompiled modules")
+        }
+    }
+    test.check(equal(outputs[0], outputs[1]), "signed nested Map cold/warm LLVM changed")
+}
+if selected(selectors, "test_contained_private_record_type_changes_invalidate_importer") {
+    let module = compiler.directory + "/values.min"
+    writeTextFile(module, "record Value { value: Text }\npublic function make(): Map<Text, List<Value>> {\nlet m = Map<Text, List<Value>>()\nm[\"a\"] = [Value { value: \"typed\" + \"!\" }]\nreturn m\n}\n")
+    let source = "use \"./values.min\" as values\nlet m = values.make()\nprint(m[\"a\"][0].value)\n"
+    executes(compiler, source, "typed!\n")
+    compiler.serial = 0
+    writeTextFile(module, "record Value { value: Integer }\npublic function make(): Map<Text, List<Value>> {\nlet m = Map<Text, List<Value>>()\nm[\"a\"] = [Value { value: 42 }]\nreturn m\n}\n")
+    executes(compiler, source, "42\n")
+}
+test.removeTree(compiler.directory)
+print("Incremental Map cache and private types: passed")

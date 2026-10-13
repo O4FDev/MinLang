@@ -1,0 +1,158 @@
+use "../tools/testing.min" as test
+use "./maps.min" as maps
+use "system" as system
+use "json" as json
+
+function engineSource(): Text {
+    let engine = readTextFile("runtime/minyar_runtime.c")
+    for header in ["minyar_rc.h", "minyar_collections.h"] {
+        let replacement = "minyar_cycle_rc.h"
+        if header == "minyar_collections.h" { replacement = "minyar_cycle_collections.h" }
+        let directive = "#include \"" + header + "\""
+        test.check(engine.byteLength - test.replace(engine, directive, "").byteLength == directive.byteLength, "managed graph runtime requires exactly one ownership header")
+        engine = test.replace(engine, directive, "#include \"" + replacement + "\"")
+    }
+    return "#define MINYAR_SORT_GRAPH 1\n#define MINYAR_MAP_CYCLE_RUNTIME 1\n#if defined(__GNUC__) || defined(__clang__)\n#define MINYAR_NOINLINE __attribute__((noinline))\n#else\n#define MINYAR_NOINLINE\n#endif\n" + engine + "\n#include \"minyar_callbacks.h\"\n"
+}
+
+function setting(environment: List<Text>, name: Text, value: Text): List<Text> {
+    let result: List<Text> = []
+    let prefix = name + "="
+    for entry in environment {
+        let raw = Bytes(entry)
+        if raw.length < prefix.byteLength || Text(raw.slice(0, prefix.byteLength)) != prefix { result.add(entry) }
+    }
+    result.add(prefix + value)
+    return result
+}
+
+record Profile { name: Text; defines: List<Text> }
+function checked(command: List<Text>, environment: List<Text>) {
+    let arguments = ["env", "--"]
+    for item in command { arguments.add(item) }
+    let handle = system.spawn("/usr/bin/env", arguments, environment, "")
+    test.check(handle > 0, "cannot launch Map profile command")
+    let status = system.wait(handle)
+    test.check(status.error == 0 && status.state == system.EXITED && status.exitCode == 0, "Map profile command failed")
+}
+function main(): Integer {
+    let sanitize = false
+    let frontend = ""
+    let optionIndex = 0
+    while optionIndex < argumentCount() {
+        let option = argument(optionIndex)
+        if option == "--sanitize" { sanitize = true }
+        else if option == "--frontend" {
+            test.check(optionIndex + 1 < argumentCount(), "missing Map frontend value")
+            optionIndex += 1
+            frontend = argument(optionIndex)
+        } else { fail("unknown Map matrix option: " + option) }
+        optionIndex += 1
+    }
+    let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+    let flags: List<Text> = []
+    if sanitize { flags = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"] }
+    let suffix = ""
+    if sanitize { suffix = "-sanitize" }
+    let frontends = ["minyarc" + suffix, "minyarc-modules" + suffix, "minyarc-callbacks" + suffix, "minyarc-errors" + suffix]
+    if frontend != "" {
+        let known = false
+        for name in frontends { if frontend == name { known = true } }
+        test.check(known, "unsupported Map matrix frontend")
+        let compiler = test.compiler()
+        compiler.executable = "./build/" + frontend
+        maps.run(compiler, maps.runtimes(), [])
+        test.removeTree(compiler.directory)
+        print("FRONTEND " + frontend + " passed")
+        return 0
+    }
+    let work = test.scratch()
+    let cycle = work + "/cycle-engine.c"
+    writeTextFile(cycle, engineSource())
+    let profiles = [
+        Profile { name: "eager"; defines: [] },
+        Profile { name: "system-1"; defines: ["-DMINYAR_SYSTEM_HEAP=1", "-DMINYAR_RC_POLL_BUDGET=1"] },
+        Profile { name: "system-32"; defines: ["-DMINYAR_SYSTEM_HEAP=1"] },
+        Profile { name: "fixed-1"; defines: ["-DMINYAR_BOUNDED_HEAP=1", "-DMINYAR_RC_POLL_BUDGET=1"] },
+        Profile { name: "arena"; defines: ["-DMINYAR_COMPILER_ARENA=1"] },
+        Profile { name: "lazy"; defines: ["-DMINYAR_BOUNDED_HEAP=1", "-DMINYAR_LAZY_HEAP=1"] }
+    ]
+    let flagText = ""
+    for index in 0..flags.length { if index > 0 { flagText += " " }; flagText += flags[index] }
+    let environment = setting(system.environment(), "MINYAR_TEST_CLANG", clang)
+    environment = setting(environment, "MINYAR_TEST_LINK_FLAGS", flagText)
+    environment = setting(environment, "ASAN_OPTIONS", "detect_leaks=1")
+    environment = setting(environment, "UBSAN_OPTIONS", "halt_on_error=1")
+    let objects: List<maps.Runtime> = []
+    for traced in [false, true] {
+        for profile in profiles {
+            if traced && profile.name == "arena" { continue }
+            let name = profile.name
+            if traced { name = "cycle-" + name }
+            print("PROFILE " + name)
+            let native = work + "/" + name + "-native"
+            let level = "-O0"
+            if sanitize { level = "-O1" }
+            let command = [clang, level]
+            for flag in flags { command.add(flag) }
+            for item in ["-std=c11", "-Wall", "-Wextra", "-Werror", "-iquote", "runtime"] { command.add(item) }
+            for define in profile.defines { command.add(define) }
+            if traced { command.add("-DMINYAR_MAP_TEST_ENGINE=\"" + cycle + "\"") }
+            for item in ["tests/map-runtime.c", "-lm", "-o", native] { command.add(item) }
+            checked(command, system.environment())
+            let nativeEnvironment = environment
+            if profile.name == "arena" { nativeEnvironment = setting(environment, "ASAN_OPTIONS", "detect_leaks=0") }
+            checked([native], nativeEnvironment)
+            if profile.name == "arena" { continue }
+            let source = work + "/" + name + ".c"
+            let replacement = "#include \"minyar_runtime.c\""
+            if traced { replacement = engineSource() }
+            writeTextFile(source, test.replace(readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", replacement))
+            let object = work + "/" + name + ".o"
+            level = "-O2"
+            if sanitize { level = "-O1" }
+            command = [clang, level]
+            for flag in flags { command.add(flag) }
+            for define in profile.defines { command.add(define) }
+            for item in ["-iquote", "runtime", "-c", source, "-o", object] { command.add(item) }
+            checked(command, system.environment())
+            objects.add(maps.Runtime { name: name; object: object })
+        }
+    }
+    let matrix = "["
+    for index in 0..objects.length {
+        if index > 0 { matrix += "," }
+        matrix += "[" + json.quote(objects[index].name) + "," + json.quote(objects[index].object) + "]"
+    }
+    matrix += "]"
+    environment = setting(environment, "MINYAR_MAP_RUNTIMES", matrix)
+    environment = setting(environment, "MINYAR_TEST_RUNTIME", objects[0].object)
+    let jobs = Integer(test.setting("MINYAR_TEST_JOBS", "2"))
+    if jobs < 1 { jobs = 1 }
+    if jobs > 8 { jobs = 8 }
+    let cursor = 0
+    let failed: List<Text> = []
+    while cursor < frontends.length {
+        let handles: List<Integer> = []
+        let names: List<Text> = []
+        while cursor < frontends.length && handles.length < jobs {
+            let invocation = ["maps-matrix", "--frontend", frontends[cursor]]
+            if sanitize { invocation.add("--sanitize") }
+            let handle = system.spawn("/proc/self/exe", invocation, environment, "")
+            test.check(handle > 0, "cannot launch Map frontend worker")
+            handles.add(handle)
+            names.add(frontends[cursor])
+            cursor += 1
+        }
+        for index in 0..handles.length {
+            let status = system.wait(handles[index])
+            if status.error != 0 || status.state != system.EXITED || status.exitCode != 0 { failed.add(names[index]) }
+        }
+    }
+    let failure = ""
+    for name in failed { failure += " " + name }
+    test.check(failed.length == 0, "Map suite failed for" + failure)
+    test.removeTree(work)
+    print("Map frontend/profile ownership matrix passed")
+    return 0
+}

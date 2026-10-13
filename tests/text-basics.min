@@ -1,0 +1,92 @@
+use "../tools/testing.min" as test
+use "./text-basics-oracles.min" as oracle
+use "system" as system
+use "files" as files
+
+function compile(compiler: test.Compiler, source: Text): test.Result {
+    compiler.serial += 1
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    writeTextFile(path + ".min", source)
+    let result = test.run([compiler.executable, path + ".min", path + ".ll", "--library", "library"], system.environment(), "", path + ".compile", compiler.compileTimeout)
+    if result.status == 0 && test.addressEnabled(compiler.flags) { writeTextFile(path + ".ll", test.instrument(readTextFile(path + ".ll"))) }
+    return result
+}
+function rejects(compiler: test.Compiler, source: Text, diagnostic: Text) {
+    let result = compile(compiler, source)
+    test.check(result.status == 1, "expected compiler rejection\n" + result.errorOutput)
+    test.check(result.output == "", "rejected source wrote standard output")
+    test.check(test.contains(result.errorOutput, diagnostic), "missing diagnostic: " + diagnostic + "\n" + result.errorOutput)
+    test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "invalid source left LLVM output")
+    test.check(!test.contains(result.errorOutput, "List position"), "compiler rejection reported a runtime List trap")
+}
+function executes(compiler: test.Compiler, source: Text, expected: Text) {
+    test.require(compile(compiler, source), "Text frontend compile")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    for level in ["-O0", "-O2"] {
+        let command = [compiler.clang, level]
+        for flag in compiler.flags { command.add(flag) }
+        for item in ["-Wno-override-module", path + ".ll", compiler.runtime, "-o", path + ".exe", "-lm"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".link", compiler.linkTimeout), "Text frontend link")
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", compiler.runTimeout)
+        test.require(result, "Text frontend execution")
+        test.check(result.output == expected, "Text frontend output changed\n" + result.output)
+        test.check(result.errorOutput == "", "Text frontend wrote execution diagnostics\n" + result.errorOutput)
+    }
+}
+
+record Invalid { source: Text; diagnostic: Text }
+let compiler = test.compiler()
+test.require(compile(compiler, "print(\"value\".slice(0, 1))\n"), "unused Text methods compile")
+let generated = readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+for name in ["find", "split", "starts_with", "ends_with", "trim", "integer"] {
+    test.check(!test.contains(generated, "@minyar_text_" + name + "("), "unused Text method emitted")
+}
+test.check(!test.contains(generated, "@minyar_list_clear("), "unused List clear emitted")
+test.require(compile(compiler, "print(\"x\".find(\"x\"))\nprint(\"y\".find(\"y\"))\n"), "repeated Text method compile")
+generated = readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+let declaration = "declare i64 @minyar_text_find("
+test.check(generated.byteLength - test.replace(generated, declaration, "").byteLength == declaration.byteLength, "Text find declaration count changed")
+executes(compiler, "let fields = \"postgres:x:70:70:PostgreSQL:/var/lib/postgresql:/bin/sh\".split(\":\")\nprint(Integer(fields[2]))\nlet pieces = \":a::\".split(\":\")\nprint(pieces.length)\nprint(pieces[0] == \"\")\nprint(pieces[2] == \"\")\nprint(pieces[3] == \"\")\nprint(\"\".split(\"\").length)\nprint(\"\".split(\":\").length)\nprint(\"é🍊é零\".split(\"\").length)\nprint(\"é🍊é零\".find(\"零\"))\nprint(\"é🍊é零\".find(\"é\"))\nprint(\"é🍊é零\".find(\"missing\"))\nprint(\"é🍊\".find(\"\"))\nprint(\"é🍊\".startsWith(\"é\"))\nprint(\"é🍊\".endsWith(\"🍊\"))\nprint(\"\".startsWith(\"\"))\nprint(\"\".endsWith(\"\"))\nprint(\" \t 🍊　\".trim())\nprint(\"​﻿\".trim().length)\n", "70\n4\ntrue\ntrue\ntrue\n0\n1\n5\n4\n2\n-1\n0\ntrue\ntrue\ntrue\ntrue\n🍊\n2\n")
+executes(compiler, "function main() {\nlet values: List<Integer> = [1, 2, 3]\nlet alias = values\nvalues.clear()\nprint(alias.length)\nvalues.clear()\nvalues.add(42)\nprint(alias[0])\nlet words = \"a:b\".split(\":\")\nlet first = words[0]\nwords.clear()\nprint(first)\nwords.add(\"again\")\nprint(words[0])\nlet lists: List<List<Text>> = [[\"owned\"]]\nlists.clear()\nprint(lists.length)\n}\n", "0\n42\na\nagain\n0\n")
+executes(compiler, "let floats = [1.5, -0.0]\nlet flags = [true, false]\nlet scalars = ['é', '🍊']\nfloats.clear()\nflags.clear()\nscalars.clear()\nfloats.add(2.5)\nflags.add(false)\nscalars.add('零')\nprint(floats[0])\nprint(flags[0])\nprint(scalars[0])\n", "2.5\nfalse\n零\n")
+executes(compiler, "print(Integer(\"0\"))\nprint(Integer(\"-0\"))\nprint(Integer(\" \t+00042\r\n\"))\nprint(Integer(\"-9223372036854775808\"))\nprint(Integer(\"9223372036854775807\"))\n", "0\n0\n42\n-9223372036854775808\n9223372036854775807\n")
+for member in ["find", "startsWith", "endsWith", "split"] {
+    rejects(compiler, "print(\"value\"." + member + "(42))\n", "Text." + member + " expects one Text argument")
+}
+rejects(compiler, "print(\"value\".trim(1))\n", "expected ')'")
+rejects(compiler, "let values: List<Integer> = []\nvalues.clear(1)\n", "expected ')'")
+let invalid = [
+    Invalid { source: ""; diagnostic: "signed decimal ASCII integer" },
+    Invalid { source: "1x"; diagnostic: "signed decimal ASCII integer" },
+    Invalid { source: "9223372036854775808"; diagnostic: "signed 64-bit range" },
+    Invalid { source: "-9223372036854775809"; diagnostic: "signed 64-bit range" }
+]
+for entry in invalid {
+    test.require(compile(compiler, "print(Integer(\"" + entry.source + "\"))\n"), "fatal Integer compile")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    let command = [compiler.clang, "-O2"]
+    for flag in compiler.flags { command.add(flag) }
+    for item in ["-Wno-override-module", path + ".ll", compiler.runtime, "-o", path + ".exe", "-lm"] { command.add(item) }
+    test.require(test.run(command, system.environment(), "", path + ".link", compiler.linkTimeout), "fatal Integer link")
+    let result = test.run([path + ".exe"], system.environment(), "", path + ".run", 10)
+    test.check(result.status == 1, "invalid Integer did not exit with status 1")
+    test.check(test.contains(result.errorOutput, entry.diagnostic), "invalid Integer diagnostic changed\n" + result.errorOutput)
+}
+executes(compiler, "use \"text\" as text\nuse \"errors\" as errors\nlet zero = text.parseInteger(\"0\")\nprint(errors.integerOk(zero))\nprint(errors.integerValue(zero))\nprint(errors.integerValue(text.parseInteger(\"-9223372036854775808\")))\nprint(errors.integerValue(text.parseInteger(\" +9223372036854775807 \")))\nprint(errors.integerOk(text.parseInteger(\"9223372036854775808\")))\nprint(errors.integerOk(text.parseInteger(\"-9223372036854775809\")))\nprint(errors.integerOk(text.parseInteger(\"1x\")))\nprint(errors.code(errors.integerError(text.parseInteger(\" 1\"))))\nlet bad = Bytes()\nbad.add(255)\nprint(text.validUTF8(bad))\nprint(errors.code(errors.integerError(text.parseIntegerBytes(bad))))\nprint(errors.integerOk(text.parseInteger(Text(bad))))\nprint(errors.integerOk(text.parseIntegerBytes(Bytes(\"0\"))))\n", "true\n0\n-9223372036854775808\n9223372036854775807\nfalse\nfalse\nfalse\n6\nfalse\n6\nfalse\ntrue\n")
+let corpus = test.lines(readTextFile("tests/text-basics-parser-cases.txt"))
+test.check(corpus.length == 67, "seeded Integer parser corpus changed")
+let program = ["use \"text\" as text", "use \"errors\" as errors", "function show(raw: Bytes) {", "let result = text.parseIntegerBytes(raw)", "if errors.integerOk(result) { print(errors.integerValue(result)) }", "else { print(\"invalid\") }", "}"]
+let expected = ""
+for index in 0..corpus.length {
+    let raw = oracle.fromHex(corpus[index])
+    expected += oracle.integerModel(raw) + "\n"
+    let name = "raw" + Text(index)
+    program.add("let " + name + " = Bytes()")
+    for byte in raw { program.add(name + ".add(" + Text(byte) + ")") }
+    program.add("show(" + name + ")")
+}
+let source = ""
+for line in program { source += line + "\n" }
+executes(compiler, source, expected)
+test.removeTree(compiler.directory)
+print("Text basics: passed")

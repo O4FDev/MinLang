@@ -1,0 +1,105 @@
+public function fromHex(source: Text): Bytes {
+    if source == "-" { return Bytes() }
+    let raw = Bytes(source)
+    if raw.length % 2 != 0 { fail("invalid corpus hex width") }
+    let result = Bytes()
+    for index in 0..(raw.length / 2) {
+        result.add(nibble(raw[index * 2]) * 16 + nibble(raw[index * 2 + 1]))
+    }
+    return result
+}
+function nibble(value: Integer): Integer {
+    if value >= 48 && value <= 57 { return value - 48 }
+    if value >= 97 && value <= 102 { return value - 87 }
+    fail("invalid corpus hex digit")
+}
+public function hex(raw: Bytes): Text {
+    let digits = Bytes("0123456789abcdef")
+    let result = Bytes()
+    for byte in raw { result.add(digits[byte / 16]); result.add(digits[byte % 16]) }
+    return Text(result)
+}
+record Scalars { raw: Bytes; values: List<Integer>; offsets: List<Integer> }
+function scalars(raw: Bytes): Scalars {
+    let values: List<Integer> = []
+    let offsets: List<Integer> = []
+    let index = 0
+    while index < raw.length {
+        offsets.add(index)
+        let value = raw[index]
+        let count = 1
+        if value >= 240 { count = 4; value = value & 7 }
+        else if value >= 224 { count = 3; value = value & 15 }
+        else if value >= 192 { count = 2; value = value & 31 }
+        for extra in 1..count { value = value * 64 + (raw[index + extra] & 63) }
+        values.add(value)
+        index += count
+    }
+    offsets.add(raw.length)
+    return Scalars { raw: raw; values: values; offsets: offsets }
+}
+function matches(source: Scalars, needle: Scalars, position: Integer): Boolean {
+    if position < 0 || position + needle.values.length > source.values.length { return false }
+    for index in 0..needle.values.length { if source.values[position + index] != needle.values[index] { return false } }
+    return true
+}
+function search(source: Scalars, needle: Scalars, start: Integer): Integer {
+    if needle.values.length > source.values.length - start { return -1 }
+    for position in start..(source.values.length - needle.values.length + 1) {
+        if matches(source, needle, position) { return position }
+    }
+    return -1
+}
+function whitespace(value: Integer): Boolean {
+    return (value >= 9 && value <= 13) || value == 32 || value == 133 || value == 160 || value == 5760 || (value >= 8192 && value <= 8202) || value == 8232 || value == 8233 || value == 8239 || value == 8287 || value == 12288
+}
+public function textModel(sourceHex: Text, needleHex: Text): Text {
+    let source = scalars(fromHex(sourceHex))
+    let needle = scalars(fromHex(needleHex))
+    let begins = 0
+    if matches(source, needle, 0) { begins = 1 }
+    let ends = 0
+    if matches(source, needle, source.values.length - needle.values.length) { ends = 1 }
+    let left = 0
+    let right = source.values.length
+    while left < right && whitespace(source.values[left]) { left += 1 }
+    while right > left && whitespace(source.values[right - 1]) { right -= 1 }
+    let trimmed = source.raw.slice(source.offsets[left], source.offsets[right])
+    let pieces: List<Bytes> = []
+    if needle.values.length == 0 {
+        for index in 0..source.values.length { pieces.add(source.raw.slice(source.offsets[index], source.offsets[index + 1])) }
+    } else {
+        let start = 0
+        while true {
+            let found = search(source, needle, start)
+            if found < 0 { pieces.add(source.raw.slice(source.offsets[start], source.raw.length)); break }
+            pieces.add(source.raw.slice(source.offsets[start], source.offsets[found]))
+            start = found + needle.values.length
+        }
+    }
+    let result = Text(search(source, needle, 0)) + " " + Text(begins) + " " + Text(ends) + " " + hex(trimmed) + "|" + Text(pieces.length)
+    for piece in pieces { result += "|" + hex(piece) }
+    return result
+}
+function asciiSpace(value: Integer): Boolean { return value == 32 || (value >= 9 && value <= 13) }
+public function integerModel(raw: Bytes): Text {
+    let left = 0
+    let right = raw.length
+    while left < right && asciiSpace(raw[left]) { left += 1 }
+    while right > left && asciiSpace(raw[right - 1]) { right -= 1 }
+    if left == right { return "invalid" }
+    let negative = false
+    if raw[left] == 43 || raw[left] == 45 { negative = raw[left] == 45; left += 1 }
+    if left == right { return "invalid" }
+    let last = 7
+    if negative { last = 8 }
+    let value = 0
+    for position in left..right {
+        let digit = raw[position] - 48
+        if digit < 0 || digit > 9 { return "invalid" }
+        if value < -922337203685477580 || (value == -922337203685477580 && digit > last) { return "invalid" }
+        value = value * 10 - digit
+    }
+    if negative { return Text(value) }
+    return Text(-value)
+}
