@@ -83,20 +83,6 @@ function fakePeer(): Integer {
     print(json.pretty(row, ""))
     return 0
 }
-function count(source: Text, needle: Text): Integer {
-    let raw = Bytes(source); let pattern = Bytes(needle); let found = 0
-    if raw.length < pattern.length { return 0 }
-    for start in 0..(raw.length - pattern.length + 1) {
-        let equal = true
-        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
-        if equal { found += 1 }
-    }
-    return found
-}
-function replaceOnce(source: Text, before: Text, after: Text): Text {
-    test.check(count(source, before) == 1, "functional study instrumentation site")
-    return test.replace(source, before, after)
-}
 function environment(fault: Text, self: Text, counter: Text): List<Text> {
     let result: List<Text> = []
     for entry in system.environment() { if !support.starts(entry, "SCALAR_STUDY_TEST_") { result.add(entry) } }
@@ -110,21 +96,22 @@ function report(path: Text): json.Value {
     test.check(value.kind == json.OBJECT, "durable scalar study report")
     return value
 }
-record Fixture { executable: Text; compiler: Text; clang: Text; work: Text; self: Text; counter: Text; serial: Integer; directories: List<Text> }
+function absolute(path: Text, root: Text): Text { if support.starts(path, "/") { return path }; return root + "/" + path }
+function dispatch(path: Text, mode: Text) { writeTextFile(path, "#!/bin/sh\nexec \"$SCALAR_STUDY_TEST_SELF\" " + mode + " \"$@\"\n") }
+record Fixture { executable: Text; compiler: Text; clang: Text; linker: Text; work: Text; self: Text; counter: Text; serial: Integer; directories: List<Text> }
 function invoke(fixture: Fixture, command: List<Text>, fault: Text): test.Result {
     fixture.serial += 1
     return test.run(command, environment(fault, fixture.self, fixture.counter), "", fixture.work + "/run" + Text(fixture.serial), 300)
 }
-function prepare(fixture: Fixture, output: Text, fault: Text, measure: Boolean): test.Result {
+function study(fixture: Fixture, output: Text, fault: Text, measure: Boolean, extra: List<Text>): test.Result {
     writeTextFile(fixture.counter, "0")
-    let command = [fixture.executable, "--prepare-only", "--samples", "3", "--count", "1", "--compiler", fixture.compiler, "--cc", fixture.clang, "--cxx", fixture.clang, "--output", output]
+    let command = [fixture.executable, "--samples", "3", "--count", "1", "--compiler", fixture.compiler, "--cc", fixture.clang, "--cxx", fixture.clang, "--linker", fixture.linker, "--output", output]
     if measure { command.add("--measure") }
+    for item in extra { command.add(item) }
     return invoke(fixture, command, fault)
 }
 function execute(fixture: Fixture, output: Text, fault: Text): test.Result {
-    let before = report(output)
-    let directory = json.string(before, "directory")
-    fixture.directories.add(directory)
+    let directory = json.string(report(output), "directory")
     return invoke(fixture, [fixture.executable, "--run-prepared", directory + "/prepared.json", "--output", output], fault)
 }
 function failedResult(result: test.Result) { test.check(result.status != 0 && result.status != 124 && result.status != 137, "functional study failure must complete with a durable report") }
@@ -132,56 +119,22 @@ function main(): Integer {
     if argumentCount() > 0 {
         if argument(0) == "--fake-compiler" { return fakeCompiler() }
         if argument(0) == "--fake-clang" { return fakeClang() }
+        if argument(0) == "--fake-linker" { print("LLD 23.1.2 functional fixture"); return 0 }
         if argument(0) == "--fake-peer" { return fakePeer() }
-        fail("unknown scalar study harness argument")
     }
-    let compiler = test.compiler()
-    let work = compiler.directory
+    test.check(argumentCount() == 2, "usage: scalar-study-harness HARNESS STUDY")
+    let work = test.scratch()
     let rootResult = test.run(["pwd", "-P"], system.environment(), "", work + "/root", 10)
     test.require(rootResult, "scalar study harness root")
     let root = test.lines(rootResult.output)[0]
-    let selfResult = test.run(["readlink", "/proc/" + Text(system.processId()) + "/exe"], system.environment(), "", work + "/self", 10)
-    test.require(selfResult, "native scalar study functional fixture executable")
-    let self = test.lines(selfResult.output)[0]
-    let relativeResult = test.run(["realpath", "--relative-to", work, root], system.environment(), "", work + "/imports", 10)
-    test.require(relativeResult, "private scalar study relative imports")
-    let imports = test.lines(relativeResult.output)[0]
-    if !support.starts(imports, ".") { imports = "./" + imports }
-    let privateSupport = readTextFile("experiments/memory/study-support.min")
-    privateSupport = replaceOnce(privateSupport, "use \"../../tools/testing.min\" as test", "use " + json.quote(imports + "/tools/testing.min") + " as test")
-    privateSupport = replaceOnce(privateSupport, "expect(context, hostname == \"5xnqjvps.vm\"", "expect(context, hostname == \"seipnxmg.vm\"")
-    privateSupport = replaceOnce(privateSupport, "context.work + \"/\" + label + \".stdout\", 240)", "context.work + \"/\" + label + \".stdout\", 1)")
-    writeTextFile(work + "/study-support.min", privateSupport)
-    let privateDriver = readTextFile("experiments/memory/checked-scalars-study.min")
-    privateDriver = replaceOnce(privateDriver, "use \"./measurement-stats.min\" as stats", "use " + json.quote(imports + "/experiments/memory/measurement-stats.min") + " as stats")
-    privateDriver = replaceOnce(privateDriver, "use \"../../tests/cpython-random.min\" as random", "use " + json.quote(imports + "/tests/cpython-random.min") + " as random")
-    let source = work + "/study.min"
-    let llvm = work + "/study.ll"
-    let executable = work + "/study"
-    writeTextFile(source, privateDriver)
-    test.require(test.run([compiler.executable, source, llvm, "--library", root + "/library"], system.environment(), "", work + "/private-compile", 60), "compile private native study controller")
-    if test.addressEnabled(compiler.flags) { writeTextFile(llvm, test.instrument(readTextFile(llvm))) }
-    let flags = "-O1 -Wno-override-module"
-    for flag in compiler.flags { flags += " " + flag }
-    let linkEnvironment: List<Text> = []
-    for entry in system.environment() {
-        if !support.starts(entry, "MINYAR_CLANG=") && !support.starts(entry, "MINYAR_CLANG_FLAGS=") && !support.starts(entry, "MINYAR_NATIVE_FLAGS=") && !support.starts(entry, "MINYAR_RUNTIME_FLAGS=") { linkEnvironment.add(entry) }
-    }
-    linkEnvironment.add("MINYAR_CLANG=" + test.setting("MINYAR_TEST_CLANG", "/usr/lib/llvm-23/bin/clang"))
-    linkEnvironment.add("MINYAR_CLANG_FLAGS=" + flags)
-    linkEnvironment.add("MINYAR_NATIVE_FLAGS=" + flags)
-    linkEnvironment.add("MINYAR_RUNTIME_FLAGS=" + flags)
-    let driverRuntime = test.setting("MINYAR_TEST_DRIVER_RUNTIME", "build/minyar-default-runtime.o")
-    let link = ["python3", root + "/tools/clang-driver.py", "link", root, llvm, driverRuntime, executable, "0"]
-    test.require(test.run(link, linkEnvironment, "", work + "/private-link", 120), "link private native study controller")
-    let compilerDispatch = work + "/compiler"
-    let clangDispatch = work + "/clang"
-    writeTextFile(compilerDispatch, "#!/bin/sh\nexec \"$SCALAR_STUDY_TEST_SELF\" --fake-compiler \"$@\"\n")
-    writeTextFile(clangDispatch, "#!/bin/sh\nexec \"$SCALAR_STUDY_TEST_SELF\" --fake-clang \"$@\"\n")
-    test.require(test.run(["chmod", "700", compilerDispatch, clangDispatch], system.environment(), "", work + "/fixture-mode", 10), "native functional compiler dispatch")
-    let fixture = Fixture { executable: executable; compiler: compilerDispatch; clang: clangDispatch; work: work; self: self; counter: work + "/counter"; serial: 0; directories: [] }
+    let self = absolute(argument(0), root)
+    let executable = absolute(argument(1), root)
+    test.check(files.pathSize(self) > 0 && files.pathSize(executable) > 0, "native scalar study harness and study executables")
+    let fixture = Fixture { executable: executable; compiler: work + "/compiler"; clang: work + "/clang"; linker: work + "/ld.lld"; work: work; self: self; counter: work + "/counter"; serial: 0; directories: [] }
+    dispatch(fixture.compiler, "--fake-compiler"); dispatch(fixture.clang, "--fake-clang"); dispatch(fixture.linker, "--fake-linker")
+    test.require(test.run(["chmod", "700", fixture.compiler, fixture.clang, fixture.linker], system.environment(), "", work + "/fixture-mode", 10), "native functional toolchain dispatch")
     let output = work + "/compile-failed.json"
-    failedResult(prepare(fixture, output, "compile", false))
+    failedResult(study(fixture, output, "compile", false, []))
     let failed = report(output)
     let commands = json.member(failed, "commands")
     test.check(json.string(failed, "status") == "failed" && commands.kind == json.ARRAY && commands.items.length == 1 && support.number(commands.items[0], "returncode") != 0, "compile failure report/command status retained")
@@ -189,55 +142,70 @@ function main(): Integer {
     test.check(files.pathSize(directory + "/compile-fixture.log") >= 0, "compile failure exact command log retained")
     print("GREEN: compile failure report and command log retained")
     output = work + "/partial-measurement.json"
-    test.require(prepare(fixture, output, "partial", true), "prepare functional partial-pair cohort")
-    failedResult(execute(fixture, output, "partial"))
+    failedResult(study(fixture, output, "partial", true, []))
     let partial = report(output)
+    fixture.directories.add(json.string(partial, "directory"))
     let entry = json.member(json.member(json.member(partial, "configurations"), "system"), "shift")
     let warmup = json.member(entry, "warmup_samples")
     let samples = json.member(entry, "samples")
     let cpp = json.member(samples, "cpp"); let minyar = json.member(samples, "minyar")
     commands = json.member(partial, "commands")
     test.check(json.string(partial, "status") == "failed" && warmup.kind == json.OBJECT && warmup.keys.length == 2, "partial failure retains both complete warmups")
+    test.check(json.string(json.member(partial, "error"), "type") == "RuntimeError", "partial failure durable error type")
     test.check(cpp.kind == json.ARRAY && cpp.items.length == 1 && minyar.kind == json.ARRAY && minyar.items.length == 0, "partial failure retains unmatched completed cpp row")
     test.check(commands.kind == json.ARRAY && commands.items.length > 0 && support.number(commands.items[commands.items.length - 1], "returncode") == 7, "partial failure retains exact failing command")
     test.check(Integer(readTextFile(fixture.counter)) == 4, "partial failure occurs at fourth adjacent peer invocation")
     print("GREEN: failure preserves both warmups, completed unmatched pair row, failing command, exact log")
     output = work + "/timeout.json"
-    failedResult(prepare(fixture, output, "timeout", false))
+    failedResult(study(fixture, output, "timeout", false, ["--timeout", "1"]))
     let timeout = report(output); commands = json.member(timeout, "commands")
     test.check(json.string(timeout, "status") == "failed" && commands.items.length == 1 && json.string(commands.items[0], "error") == "timeout", "timeout durable status/command error")
+    test.check(json.string(json.member(timeout, "error"), "type") == "TimeoutExpired", "timeout durable error type")
     directory = json.string(timeout, "directory"); fixture.directories.add(directory)
     test.check(readTextFile(directory + "/compile-fixture.log") == "partial stdoutpartial stderr", "timeout retains exact partial stdout/stderr bytes")
     print("GREEN: timeout preserves partial subprocess output and durable error report")
-    for measure in [false, true] {
-        output = work + "/successful-correctness.json"
-        if measure { output = work + "/successful-measure.json" }
-        test.require(prepare(fixture, output, "success", measure), "prepare functional happy cohort")
-        test.require(execute(fixture, output, "success"), "execute functional happy cohort")
-        let successful = report(output)
-        let configurations = json.member(successful, "configurations")
-        let expected = 6; if measure { expected = 5 }
-        test.check(json.string(successful, "status") == "passed" && configurations.kind == json.OBJECT && configurations.keys.length == expected, "complete successful functional study configurations")
-        let rows = 0; let summaries = 0
-        for configuration in configurations.items {
-            if measure {
-                test.check(configuration.kind == json.OBJECT && configuration.keys.length == 4, "all functional measured scalar kinds")
-                for measured in configuration.items {
-                    let paired = json.member(measured, "paired_cpu_ratio")
-                    test.check(json.member(paired, "median").number == 1.0 && support.number(paired, "sample_count") == 3, "all functional complete paired summaries")
-                    summaries += 1
+    for prepared in [false, true] {
+        for measure in [false, true] {
+            output = work + "/successful-correctness.json"
+            if measure { output = work + "/successful-measure.json" }
+            if prepared {
+                output = test.replace(output, ".json", "-prepared.json")
+                test.require(study(fixture, output, "success", measure, ["--prepare-only"]), "prepare functional happy cohort")
+                let preparation = report(output)
+                let pending = json.member(preparation, "configurations")
+                test.check(json.string(preparation, "status") == "prepared" && pending.kind == json.OBJECT && pending.keys.length == 0, "preparation defers every peer observation")
+                test.check(Integer(readTextFile(fixture.counter)) == 0, "preparation must not execute a functional peer")
+                test.require(execute(fixture, output, "success"), "execute prepared functional happy cohort")
+            } else { test.require(study(fixture, output, "success", measure, []), "functional happy cohort") }
+            let successful = report(output)
+            fixture.directories.add(json.string(successful, "directory"))
+            let configurations = json.member(successful, "configurations")
+            let expected = 6; if measure { expected = 5 }
+            test.check(json.string(successful, "status") == "passed" && configurations.kind == json.OBJECT && configurations.keys.length == expected, "complete successful functional study configurations")
+            let rows = 0; let summaries = 0
+            for configuration in configurations.items {
+                if measure {
+                    test.check(configuration.kind == json.OBJECT && configuration.keys.length == 4, "all functional measured scalar kinds")
+                    for measured in configuration.items {
+                        let paired = json.member(measured, "paired_cpu_ratio")
+                        test.check(json.member(paired, "median").number == 1.0 && support.number(paired, "sample_count") == 3, "all functional complete paired summaries")
+                        summaries += 1
+                    }
+                } else {
+                    test.check(configuration.kind == json.ARRAY, "functional correctness entries")
+                    rows += configuration.items.length
                 }
-            } else {
-                test.check(configuration.kind == json.ARRAY, "functional correctness entries")
-                rows += configuration.items.length
             }
+            let calls = 576; if measure { calls = 160 }
+            if measure { test.check(summaries == 20, "all twenty paired scalar summaries") }
+            else { test.check(rows == 576, "all576 independent oracle entries") }
+            test.check(Integer(readTextFile(fixture.counter)) == calls, "every functional peer observation runs exactly once")
         }
-        if measure { test.check(summaries == 20, "all twenty paired scalar summaries") }
-        else { test.check(rows == 576, "all576 independent oracle entries") }
+        if prepared { print("GREEN: prepared cohorts execute from their manifests with the same 576 oracle entries and 20 paired summaries") }
+        else { print("GREEN: mock happy paths preserve all 576 oracle entries and 20 complete paired summaries") }
     }
-    print("GREEN: mock happy paths preserve all 576 oracle entries and 20 complete paired summaries")
     output = work + "/missing-linkage-alias.json"
-    failedResult(prepare(fixture, output, "aliases", true))
+    failedResult(study(fixture, output, "aliases", true, []))
     let missing = report(output)
     test.check(json.string(missing, "status") == "failed" && json.string(json.member(missing, "error"), "type") == "AssertionError", "missing aliases must produce exact assertion failure")
     let configurations = json.member(missing, "configurations")

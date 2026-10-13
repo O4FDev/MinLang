@@ -42,13 +42,13 @@ public function number(value: json.Value, name: Text): Integer {
     let field = json.member(value, name); test.check(field.kind == json.NUMBER, "missing integral study field " + name)
     return Integer(field.text)
 }
-public record Options { measure: Boolean; samples: Integer; count: Integer; output: Text; cc: Text; cxx: Text; compiler: Text; prepareOnly: Boolean; prepared: Text; samplesSet: Boolean; countSet: Boolean }
+public record Options { measure: Boolean; samples: Integer; count: Integer; output: Text; cc: Text; cxx: Text; linker: Text; compiler: Text; timeout: Integer; prepareOnly: Boolean; prepared: Text; samplesSet: Boolean; countSet: Boolean }
 public function options(samples: Integer, count: Integer, study: Text): Options {
-    let result = Options { measure: false; samples: samples; count: count; output: ""; cc: "/usr/lib/llvm-23/bin/clang"; cxx: "/usr/lib/llvm-23/bin/clang++"; compiler: test.setting("MINYAR_TEST_COMPILER", "build/minyarc"); prepareOnly: false; prepared: ""; samplesSet: false; countSet: false }
+    let result = Options { measure: false; samples: samples; count: count; output: ""; cc: "clang"; cxx: "clang++"; linker: "ld.lld"; compiler: test.setting("MINYAR_TEST_COMPILER", "build/minyarc"); timeout: 240; prepareOnly: false; prepared: ""; samplesSet: false; countSet: false }
     let index = 0
     while index < argumentCount() {
         let option = argument(index)
-        if option == "--help" || option == "-h" { print(study + " [--measure] [--samples N] [--count N] [--output PATH] [--cc PATH] [--cxx PATH] [--compiler PATH] --prepare-only | --run-prepared PATH"); exit(0) }
+        if option == "--help" || option == "-h" { print(study + " [--measure] [--samples N] [--count N] [--output PATH] [--cc PATH] [--cxx PATH] [--linker PATH] [--compiler PATH] [--timeout SECONDS] [--prepare-only | --run-prepared PATH]"); exit(0) }
         if option == "--measure" { result.measure = true }
         else if option == "--prepare-only" { result.prepareOnly = true }
         else {
@@ -61,15 +61,17 @@ public function options(samples: Integer, count: Integer, study: Text): Options 
             else if name == "--output" { result.output = value }
             else if name == "--cc" { result.cc = value }
             else if name == "--cxx" { result.cxx = value }
+            else if name == "--linker" { result.linker = value }
             else if name == "--compiler" { result.compiler = value }
+            else if name == "--timeout" { result.timeout = Integer(value) }
             else if name == "--run-prepared" { result.prepared = value }
             else { fail("unknown study option " + name) }
         }
         index += 1
     }
     test.check(result.samples >= 3 && result.samples <= 101 && result.count > 0 && result.count <= 100000000, "samples must be 3..101 and count must be 1..100000000")
+    test.check(result.timeout > 0, "timeout must be positive")
     test.check(!(result.prepareOnly && result.prepared != ""), "study phase must be singular")
-    test.check(result.prepareOnly || result.prepared != "", "use --prepare-only on minyar-linux and --run-prepared on minyar-bench-2")
     return result
 }
 public record Context { options: Options; study: Text; work: Text; root: Text; report: json.Value; commands: List<json.Value>; normalizations: List<json.Value>; executables: json.Value; hashes: json.Value; expected: json.Value; prepared: Boolean }
@@ -98,12 +100,13 @@ public function expect(context: Context, condition: Boolean, message: Text) {
 public function invoke(context: Context, label: Text, command: List<Text>, environment: List<Text>): test.Result {
     let observation = object(["label", "argv", "returncode"], [text(label), strings(command), nullValue()])
     context.commands.add(observation)
-    let result = test.run(command, environment, "", context.work + "/" + label + ".stdout", 240)
+    let result = test.run(command, environment, "", context.work + "/" + label + ".stdout", context.options.timeout)
     writeTextFile(context.work + "/" + label + ".log", result.output + result.errorOutput)
-    set(observation, "returncode", integer(result.status))
+    let timedOut = result.status == 124 || result.status == 137
+    if timedOut { set(observation, "error", text("timeout")) } else { set(observation, "returncode", integer(result.status)) }
     if result.status != 0 {
         let type = "RuntimeError"; let message = label + " failed: " + result.output + result.errorOutput
-        if result.status == 124 || result.status == 137 { type = "TimeoutExpired"; set(observation, "error", text("timeout")) }
+        if timedOut { type = "TimeoutExpired"; message = label + " timed out after " + Text(context.options.timeout) + " seconds: " + result.output + result.errorOutput }
         set(context.report, "status", text("failed")); set(context.report, "error", object(["type", "message"], [text(type), text(message)]))
         save(context); fail(message)
     }
@@ -138,8 +141,6 @@ public function begin(options: Options, study: Text, limitations: List<Text>): C
         let before = json.string(report, "directory")
         for index in 0..executables.items.length { executables.items[index] = text(rebased(executables.items[index].text, before, work)) }
         let context = Context { options: options; study: study; work: work; root: root; report: report; commands: commands.items; normalizations: normalizations.items; executables: executables; hashes: hashes; expected: json.member(manifest, "expected"); prepared: true }
-        let hostname = test.lines(query(work, "execution-host", ["hostname"]))[0]
-        expect(context, hostname == "5xnqjvps.vm", "prebuilt study peer runs require quiet exclusive minyar-bench-2")
         for index in 0..executables.keys.length { expect(context, hash(context, executables.items[index].text) == json.string(hashes, executables.keys[index]), "prepared executable checksum " + executables.keys[index]) }
         let llvmHash = json.string(manifest, "fixture_sha256")
         expect(context, llvmHash != "" && hash(context, work + "/fixture.ll") == llvmHash, "prepared generated LLVM identity")
@@ -147,8 +148,6 @@ public function begin(options: Options, study: Text, limitations: List<Text>): C
         test.removeTree(temporary)
         return context
     }
-    let hostname = test.lines(query(temporary, "preparation-host", ["hostname"]))[0]
-    test.check(hostname == "seipnxmg.vm", "study preparation requires minyar-linux")
     options.compiler = absolute(options.compiler, root)
     let commands: List<json.Value> = []; let normalizations: List<json.Value> = []
     let mode = "correctness"; if options.measure { mode = "measurement" }
@@ -156,10 +155,16 @@ public function begin(options: Options, study: Text, limitations: List<Text>): C
     let context = Context { options: options; study: study; work: temporary; root: root; report: report; commands: commands; normalizations: normalizations; executables: object([], []); hashes: object([], []); expected: object([], []); prepared: false }
     let ccVersion = query(temporary, "cc-version", [options.cc, "--version"]); let cxxVersion = query(temporary, "cxx-version", [options.cxx, "--version"])
     expect(context, test.contains(ccVersion, "clang version 23.") && test.contains(cxxVersion, "clang version 23."), "Minyar supports exactly LLVM23")
-    let linker = "/usr/lib/llvm-23/bin/ld.lld"
-    let linkerVersion = query(temporary, "linker-version", [linker, "--version"])
-    expect(context, test.contains(linkerVersion, "LLD 23."), "LLVM23 linker required")
-    set(report, "toolchain", object(["cc", "cxx", "linker", "cc_version", "cxx_version", "linker_version", "linker_threads"], [text(options.cc), text(options.cxx), text(linker), text(ccVersion), text(cxxVersion), text(linkerVersion), integer(1)]))
+    let toolchain = object(["cc", "cxx", "cc_version", "cxx_version"], [text(options.cc), text(options.cxx), text(ccVersion), text(cxxVersion)])
+    if options.measure {
+        let located = test.lines(query(temporary, "linker-path", ["/bin/sh", "-c", "command -v \"$1\"", "minyar", options.linker]))
+        expect(context, located.length == 1 && starts(located[0], "/"), "LTO linker " + options.linker + " not found")
+        options.linker = located[0]
+        let linkerVersion = query(temporary, "linker-version", [options.linker, "--version"])
+        expect(context, test.contains(linkerVersion, "LLD 23."), "LLVM23 linker required")
+        set(toolchain, "linker", text(options.linker)); set(toolchain, "linker_version", text(linkerVersion)); set(toolchain, "linker_threads", integer(1))
+    }
+    set(report, "toolchain", toolchain)
     set(report, "compiler_sha256", text(hash(context, options.compiler)))
     let sources = ["compiler/compiler.min", "runtime/minyar_runtime.c", "experiments/memory/" + study + ".min", "experiments/memory/" + study + "-driver.c", "experiments/memory/" + study + "-cpp.cpp", "experiments/memory/" + study + "-study.min", "experiments/memory/measurement-stats.min", "experiments/memory/study-support.min", "tests/cpython-random.min", "tests/llvm_symbols.h", "tools/testing.min"]
     let headers = files.list(root + "/runtime"); test.check(files.lastError() == 0, "study runtime headers"); headers.sort()
@@ -167,7 +172,7 @@ public function begin(options: Options, study: Text, limitations: List<Text>): C
     let sourceHashes = json.member(report, "source_sha256")
     for path in sources { set(sourceHashes, path, text(hash(context, root + "/" + path))) }
     let compilerSource = test.setting("MINYAR_TEST_COMPILER_SOURCE", "build/compiler.min")
-    set(sourceHashes, compilerSource, text(hash(context, absolute(compilerSource, root))))
+    if files.pathSize(absolute(compilerSource, root)) >= 0 { set(sourceHashes, compilerSource, text(hash(context, absolute(compilerSource, root)))) }
     if study == "checked-scalars" { set(report, "allocation_monitoring", boolean(!options.measure)); set(report, "generated_llvm_sha256", nullValue()) }
     print(temporary)
     return context
@@ -309,7 +314,7 @@ public function prepare(context: Context, functions: List<Text>) {
         }
         let executable = context.work + "/" + configuration.name
         let command = [options.cxx]; for flag in flags { command.add(flag) }
-        if configuration.lto { for flag in ["-flto", "--ld-path=/usr/lib/llvm-23/bin/ld.lld", "-Wl,--threads=1"] { command.add(flag) } }
+        if configuration.lto { for flag in ["-flto", "--ld-path=" + options.linker, "-Wl,--threads=1"] { command.add(flag) } }
         command.add(linkIR); for object in objects { command.add(object) }; command.add("-o"); command.add(executable)
         build(context, configuration.name + "-link", command)
         set(context.executables, configuration.name, text(executable)); set(context.hashes, configuration.name, text(hash(context, executable)))
@@ -324,7 +329,6 @@ public function finishPreparation(context: Context) {
     save(context); print(context.work + "/prepared.json")
 }
 public function observe(context: Context, name: Text, kind: Text, language: Text, count: Integer, seed: Integer, index: Integer): json.Value {
-    expect(context, context.prepared, "peer execution is only available through run-prepared")
     let environment: List<Text> = []
     for entry in system.environment() { if !starts(entry, "ASAN_OPTIONS=") { environment.add(entry) } }
     environment.add("ASAN_OPTIONS=detect_leaks=0")

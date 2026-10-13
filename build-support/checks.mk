@@ -49,8 +49,11 @@ check-launcher-isolation: build/minyarc build/minyarc-errors-request build/minya
 check-release-build: build/minyarc build/minyar-runtime.o build/minyar-runtime-release.ll
 	$(LIMITED) python3 tests/release-build.py
 
-check-critical-path: build/minyarc
-	$(LIMITED) python3 experiments/memory/critical-path-study.py
+build/tooling/experiments/memory/critical-path-study.ll: experiments/memory/study-support.min experiments/memory/measurement-stats.min tests/cpython-random.min
+build/tooling/experiments/memory/critical-path-study: private TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/experiments/memory/critical-path-study: build/testing/cycle-runtime.o
+check-critical-path: build/minyarc build/tooling/experiments/memory/critical-path-study
+	$(LIMITED) ./build/tooling/experiments/memory/critical-path-study
 
 build/tooling/tests/regressions: TOOL_RUNTIME = build/testing/cycle-runtime.o
 build/tooling/tests/regressions: build/testing/cycle-runtime.o
@@ -545,11 +548,17 @@ check-portable check: check-source-map
 check-sanitize: check-source-map-sanitize
 
 .PHONY: check-scalar-path check-scalar-study-harness
-check-scalar-study-harness:
-	python3 tests/scalar-study-harness.py
+build/tooling/experiments/memory/checked-scalars-study.ll: experiments/memory/study-support.min experiments/memory/measurement-stats.min tests/cpython-random.min
+build/tooling/experiments/memory/checked-scalars-study: private TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/experiments/memory/checked-scalars-study: build/testing/cycle-runtime.o
+build/tooling/tests/scalar-study-harness.ll: experiments/memory/study-support.min
+build/tooling/tests/scalar-study-harness: private TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/scalar-study-harness: build/testing/cycle-runtime.o
+check-scalar-study-harness: build/tooling/tests/scalar-study-harness build/tooling/experiments/memory/checked-scalars-study
+	./build/tooling/tests/scalar-study-harness "$(CURDIR)/build/tooling/tests/scalar-study-harness" "$(CURDIR)/build/tooling/experiments/memory/checked-scalars-study"
 
-check-scalar-path: check-scalar-study-harness build/minyarc
-	$(LIMITED) python3 experiments/memory/checked-scalars-study.py
+check-scalar-path: check-scalar-study-harness build/minyarc build/tooling/experiments/memory/checked-scalars-study
+	$(LIMITED) ./build/tooling/experiments/memory/checked-scalars-study
 
 check: check-scalar-path
 check-portable: check-scalar-study-harness
