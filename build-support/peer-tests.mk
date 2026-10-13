@@ -1,12 +1,12 @@
-PEER_PROGRAMS = build/tooling/tests/peer-regressions
+PEER_PROGRAMS = build/tooling/tests/peer-regressions build/tooling/tests/peer-cpp-java-js build/tooling/tests/peer-python-swift-ruby-lua
 $(PEER_PROGRAMS): TOOL_NATIVE = runtime/native/sha256.c
 $(PEER_PROGRAMS): TOOL_LIBS = $(TOOL_CRYPTO)
 $(PEER_PROGRAMS): TOOL_RUNTIME = build/testing/cycle-runtime.o
 $(PEER_PROGRAMS): runtime/native/sha256.c build/testing/cycle-runtime.o
-PEER_SUITES ?= tests/peer-regressions.min tests/peer-cpp-java-js.py tests/peer-rust-go-zig.py tests/peer-python-swift-ruby-lua.py
+PEER_SUITES ?= tests/peer-regressions.min tests/peer-cpp-java-js.min tests/peer-rust-go-zig.py tests/peer-python-swift-ruby-lua.min
 PEER_BASE_ARTIFACTS = build/minyarc build/minyarc-modules build/minyar-default-runtime.o
 # Only the extended Rust/Go/Zig suite exercises the POSIX incremental driver.
-peer_driver_artifacts = $(PEER_BASE_ARTIFACTS) $(if $(filter tests/peer-rust-go-zig.py,$(1)),build/minyar-module-build build/minyarc-errors-request)
+peer_driver_artifacts = $(PEER_BASE_ARTIFACTS) $(if $(filter tests/peer-rust-go-zig.py tests/peer-rust-go-zig.min,$(1)),build/minyar-module-build build/minyarc-errors-request)
 PEER_DRIVER_ARTIFACTS = $(call peer_driver_artifacts,$(PEER_SUITES))
 
 # managed-graphs.mk (read earlier: build-support/*.mk is included sorted) adds
@@ -156,8 +156,8 @@ check-peer-ownership-regressions: $(PEER_OWNERSHIP_ARTIFACTS) build/tooling/test
 		PeerRegressions.test_wide_record_construction_preserves_every_field \
 		PeerRegressions.test_earlier_text_argument_survives_later_slot_replacement
 
-check-peer-ownership-cpp-java-js: $(PEER_OWNERSHIP_ARTIFACTS)
-	$(PEER_OWNERSHIP_RUN) python3 tests/peer-cpp-java-js.py \
+check-peer-ownership-cpp-java-js: $(PEER_OWNERSHIP_ARTIFACTS) build/tooling/tests/peer-cpp-java-js
+	$(PEER_OWNERSHIP_RUN) ./build/tooling/tests/peer-cpp-java-js \
 		PeerCppJavaJs.test_five_fill_loops_all_1024_lengths \
 		PeerCppJavaJs.test_four_stores_reverse_fill_all_cells \
 		PeerCppJavaJs.test_hex_digit_fold_mutates_accumulator_in_order \
@@ -287,8 +287,8 @@ check-peer-ownership-rust-go-zig: $(PEER_OWNERSHIP_ARTIFACTS) build/minyar-modul
 		PeerRustGoZig.test_unicode_single_scalar_decoder_keeps_all_numeric_boundaries \
 		PeerRustGoZig.test_unicode_validators_preserve_all_shared_valid_inputs
 
-check-peer-ownership-python-swift-ruby-lua: $(PEER_OWNERSHIP_ARTIFACTS)
-	$(PEER_OWNERSHIP_RUN) python3 tests/peer-python-swift-ruby-lua.py \
+check-peer-ownership-python-swift-ruby-lua: $(PEER_OWNERSHIP_ARTIFACTS) build/tooling/tests/peer-python-swift-ruby-lua
+	$(PEER_OWNERSHIP_RUN) ./build/tooling/tests/peer-python-swift-ruby-lua \
 		PeerPythonSwiftRubyLua.test_three_hundred_positional_parameters_and_values \
 		PeerPythonSwiftRubyLua.test_five_module_cycle_shapes_and_acyclic_controls \
 		PeerPythonSwiftRubyLua.test_python_literal_payloads_match_independent_utf8_files \

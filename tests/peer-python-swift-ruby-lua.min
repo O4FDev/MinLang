@@ -1,0 +1,2695 @@
+use "./peer-support.min" as peer
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+use "json" as json
+use "errors" as errors
+use "sha256" as sha256
+
+constant INVALID_UTF8 = "Minyar stopped: Text contained invalid UTF-8.\n"
+constant OOM = "Minyar stopped: the computer ran out of memory.\n"
+
+function isDigit(byte: Integer): Boolean { return byte >= 48 && byte <= 57 }
+function isOctal(byte: Integer): Boolean { return byte >= 48 && byte <= 55 }
+function isHex(byte: Integer): Boolean { return isDigit(byte) || (byte >= 97 && byte <= 102) || (byte >= 65 && byte <= 70) }
+function isIdentifierStart(byte: Integer): Boolean { return (byte >= 97 && byte <= 122) || (byte >= 65 && byte <= 90) || byte == 95 }
+function digitValue(byte: Integer): Integer {
+    if isDigit(byte) { return byte - 48 }
+    if byte >= 97 && byte <= 102 { return byte - 87 }
+    return byte - 55
+}
+function hexPrefix(raw: Bytes, start: Integer): Boolean { return raw.length - start >= 2 && raw[start] == 48 && (raw[start + 1] == 120 || raw[start + 1] == 88) }
+function octalPrefix(raw: Bytes, start: Integer): Boolean { return raw.length - start >= 2 && raw[start] == 48 && raw[start + 1] == 111 }
+function octalBody(raw: Bytes, start: Integer): Boolean {
+    if !octalPrefix(raw, start) || raw.length - start < 3 { return false }
+    for index in (start + 2)..raw.length { if !isOctal(raw[index]) { return false } }
+    return true
+}
+function identifierShape(name: Text): Boolean {
+    let raw = Bytes(name)
+    if raw.length == 0 || !isIdentifierStart(raw[0]) { return false }
+    for index in 1..raw.length { if !isIdentifierStart(raw[index]) && !isDigit(raw[index]) { return false } }
+    return true
+}
+function decimalAccepted(token: Text): Boolean {
+    let raw = Bytes(token)
+    let start = 0
+    if raw.length > 0 && raw[0] == 45 { start = 1 }
+    let size = raw.length - start
+    if size <= 0 { return false }
+    if hexPrefix(raw, start) && size >= 3 {
+        let hex = true
+        for index in (start + 2)..raw.length { if !isHex(raw[index]) { hex = false } }
+        if hex { return true }
+    }
+    if octalBody(raw, start) { return true }
+    if size == 1 && raw[start] == 48 { return true }
+    if raw[start] >= 49 && raw[start] <= 57 {
+        for index in (start + 1)..raw.length { if !isDigit(raw[index]) { return false } }
+        return true
+    }
+    return false
+}
+function decimalValue(token: Text): Integer {
+    let raw = Bytes(token)
+    let sign = 1
+    let start = 0
+    if raw.length > 0 && raw[0] == 45 { sign = -1; start = 1 }
+    let base = 10
+    if hexPrefix(raw, start) { base = 16 } else if octalPrefix(raw, start) { base = 8 }
+    let begin = start
+    if base != 10 { begin = start + 2 }
+    let value = 0
+    for index in begin..raw.length { value = value * base + digitValue(raw[index]) }
+    return sign * value
+}
+function numberPrefix(raw: Bytes): Integer {
+    let starts: List<Integer> = []
+    if raw.length > 0 && raw[0] == 45 { starts.add(1) }
+    starts.add(0)
+    for start in starts {
+        if hexPrefix(raw, start) && raw.length - start >= 3 && isHex(raw[start + 2]) {
+            let end = start + 3
+            while end < raw.length && isHex(raw[end]) { end += 1 }
+            return end
+        }
+        if start < raw.length && isDigit(raw[start]) {
+            let end = start + 1
+            while end < raw.length && isDigit(raw[end]) { end += 1 }
+            return end
+        }
+    }
+    return -1
+}
+function decimalDiagnostic(c: peer.Case, token: Text): Text {
+    peer.expect(c, !decimalAccepted(token), "diagnostic requested for accepted token " + token)
+    if token == "" { return "print expects 1 arguments, but received 0" }
+    let raw = Bytes(token)
+    let offset = 0
+    if raw[0] == 43 || raw[0] == 45 { offset = 1 }
+    if octalPrefix(raw, offset) && !octalBody(raw, offset) { return "line 1, column " + Text(7 + offset) + ": an octal Integer literal needs only digits 0 through 7 after 0o" }
+    if raw.length - offset >= 2 && raw[offset] == 48 && isDigit(raw[offset + 1]) { return "line 1, column " + Text(7 + offset) + ": decimal Integer literals cannot have a leading zero; use 0o for octal" }
+    if raw[0] == 43 { return "line 1, column 7: expected an expression, found '+'" }
+    if token == "-" { return "line 1, column 8: expected an expression, found ')'" }
+    let number = numberPrefix(raw)
+    if number >= 0 { offset = number }
+    let name = Text(raw.slice(offset, raw.length))
+    peer.expect(c, identifierShape(name), "decimal diagnostic name is not an identifier: " + name)
+    return "line 1, column " + Text(7 + offset) + ": I can't find a value named '" + name + "'"
+}
+record DecimalCell { cohort: Text; token: Text; accepted: Boolean; value: Integer; diagnostic: Text }
+function rejectedCell(c: peer.Case, cohort: Text, token: Text): DecimalCell {
+    return DecimalCell { cohort: cohort; token: token; accepted: false; value: 0; diagnostic: decimalDiagnostic(c, token) }
+}
+function decimalCells(c: peer.Case): List<DecimalCell> {
+    let cells: List<DecimalCell> = []
+    let alphabet = ["0", "1", "_", "9", "f"]
+    for prefix in ["", "0x", "0o", "0b", "0d", "-", "+"] {
+        for size in 0..4 {
+            let total = 1
+            for power in 0..size { total *= 5 }
+            for number in 0..total {
+                let digits: List<Text> = []
+                let remaining = number
+                for place in 0..size { digits.add(alphabet[remaining % 5]); remaining = remaining / 5 }
+                let pieces = [prefix]
+                let index = digits.length - 1
+                while index >= 0 { pieces.add(digits[index]); index -= 1 }
+                let token = joinText(pieces)
+                if decimalAccepted(token) { cells.add(DecimalCell { cohort: "ruby-product"; token: token; accepted: true; value: decimalValue(token); diagnostic: "" }) }
+                else { cells.add(rejectedCell(c, "ruby-product", token)) }
+            }
+        }
+    }
+    for token in ["0_0_0", "4_2", "1_0000_0000", "0_", "42_", "0_b0", "0_xf", "0_o5", "0_7", "09_99", "4_______2"] { cells.add(rejectedCell(c, "python-explicit-decimal", token)) }
+    for sign in ["", "-", "+"] {
+        for radix in ["0x", "0o", "0b", "0d"] { cells.add(rejectedCell(c, "ruby-bug2407-tail", sign + radix + "_")) }
+    }
+    for token in ["0o5_", "0b1001__0100", "0xffff__ffff", "0o5__77"] { cells.add(rejectedCell(c, "python-additional-integer-underscores", token)) }
+    return cells
+}
+
+function suffix(optimization: Text): Text {
+    let raw = Bytes(optimization)
+    return Text(raw.slice(1, raw.length))
+}
+function literals(values: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for value in values { result.add(peer.literal(value)) }
+    return result
+}
+function repeatText(value: Text, count: Integer): Text {
+    let result = ""
+    let piece = value
+    let remaining = count
+    while remaining > 0 {
+        if remaining % 2 == 1 { result = result + piece }
+        remaining = remaining / 2
+        if remaining > 0 { piece = piece + piece }
+    }
+    return result
+}
+function lowercase(value: Text): Text {
+    let result = Bytes()
+    for byte in Bytes(value) {
+        if byte >= 65 && byte <= 90 { result.add(byte + 32) } else { result.add(byte) }
+    }
+    return Text(result)
+}
+function sameTexts(left: List<Text>, right: List<Text>): Boolean {
+    let first = peer.sortTexts(left)
+    let second = peer.sortTexts(right)
+    if first.length != second.length { return false }
+    for index in 0..first.length { if first[index] != second[index] { return false } }
+    return true
+}
+function darwin(): Boolean {
+    let directory = test.scratch()
+    let result = test.run(["/usr/bin/uname", "-s"], system.environment(), "", directory + "/uname", 10)
+    test.removeTree(directory)
+    test.require(result, "uname")
+    return result.output == "Darwin\n"
+}
+function currentDirectory(): Text {
+    let directory = test.scratch()
+    let result = test.run(["/bin/pwd", "-P"], system.environment(), "", directory + "/pwd", 10)
+    test.removeTree(directory)
+    test.require(result, "pwd")
+    return result.output
+}
+function clangCommand(arguments: List<Text>): List<Text> {
+    for argument in arguments {
+        if argument == "-c" || argument == "-S" || argument == "-E" || argument == "-fsyntax-only" || argument == "--version" || argument == "-v" { return arguments }
+    }
+    if darwin() { return arguments }
+    let result: List<Text> = []
+    for argument in arguments { if argument != "-lm" { result.add(argument) } }
+    result.add("-lm")
+    return result
+}
+function clangWith(c: peer.Case, before: List<Text>, after: List<Text>): List<Text> {
+    let command = [c.compiler.clang]
+    peer.extend(command, before)
+    peer.extend(command, c.compiler.flags)
+    peer.extend(command, after)
+    return command
+}
+function runtimeInputs(c: peer.Case, first: List<Text>) {
+    for path in first { peer.input(c, path) }
+    let names: List<Text> = []
+    for name in files.list(c.suite.root + "/runtime") { if peer.ends(name, ".h") && !peer.starts(name, ".") { names.add(name) } }
+    for name in peer.sortTexts(names) { peer.input(c, c.suite.root + "/runtime/" + name) }
+}
+function requireSuccess(c: peer.Case, result: test.Result, phase: Text) {
+    peer.expect(c, result.status == 0, phase + " failed with status " + Text(result.status) + "\n" + result.errorOutput)
+}
+function vectors(c: peer.Case): json.Value {
+    let path = c.suite.root + "/tests/peer-pyswru-vectors.json"
+    peer.input(c, path)
+    let data = peer.load(path)
+    peer.equalInteger(c, peer.field(data, "schema_version"), 1, "vector schema")
+    return data
+}
+
+function test_three_hundred_positional_parameters_and_values(c: peer.Case) {
+    let parameters: List<Text> = []
+    let body = ["let checksum = 0"]
+    let arguments: List<Text> = []
+    let total = 0
+    for i in 0..300 {
+        parameters.add("p" + Text(i) + ": Integer")
+        body.add("checksum = checksum + p" + Text(i) + " * " + Text(i + 1))
+        arguments.add(Text(i))
+        total += i * (i + 1)
+    }
+    peer.extend(body, ["print(p0)", "print(p149)", "print(p299)", "return checksum"])
+    let source = "function wide(" + peer.joined(parameters, ", ") + "): Integer {\n" + peer.joined(body, "\n") + "\n}\n"
+    source += "print(wide(" + peer.joined(arguments, ", ") + "))\n"
+    peer.executes(c, source, "0\n149\n299\n" + Text(total) + "\n")
+}
+function test_ten_five_hundred_and_thousand_positional_arguments(c: peer.Case) {
+    for count in [10, 500, 1000] {
+        let declared: List<Text> = []
+        let values: List<Text> = []
+        let prints: List<Text> = []
+        for i in 0..count {
+            declared.add("p" + Text(i) + ": Integer")
+            values.add(Text(i))
+            prints.add("print(p" + Text(i) + ")\n")
+        }
+        let parameters = peer.joined(declared, ", ")
+        let arguments = peer.joined(values, ", ")
+        let source = "function middle(" + parameters + "): Integer { return p" + Text(count / 2) + " }\n"
+        source += "function every(" + parameters + "): Nothing {\n"
+        source += joinText(prints) + "}\n"
+        source += "print(middle(" + arguments + "))\nevery(" + arguments + ")\n"
+        let expected = [Text(count / 2)]
+        peer.extend(expected, values)
+        peer.executes(c, source, peer.joined(expected, "\n") + "\n")
+    }
+}
+function test_filtered_iteration_preserves_present_payload_order(c: peer.Case) {
+    let source = "record Item { present: Boolean; value: Integer }
+let items: List<Item> = [
+Item { present: true, value: 1 }, Item { present: false, value: 91 },
+Item { present: true, value: 2 }, Item { present: false, value: 92 },
+Item { present: true, value: 3 }, Item { present: false, value: 93 },
+Item { present: false, value: 94 }, Item { present: false, value: 95 },
+Item { present: true, value: 4 }, Item { present: true, value: 5 },
+]
+let i = 0
+while i <= 6 {
+    if i % 2 == 0 { print(i) }
+    i = i + 1
+}
+print(\"present\")
+i = 0
+while i < items.length {
+    if items[i].present { print(items[i].value) }
+    i = i + 1
+}
+print(\"filtered\")
+i = 0
+while i < items.length {
+    if items[i].present && items[i].value != 3 { print(items[i].value) }
+    i = i + 1
+}
+"
+    peer.executes(c, source, "0\n2\n4\n6\npresent\n1\n2\n3\n4\n5\nfiltered\n1\n2\n4\n5\n")
+}
+function test_text_suffix_candidates_use_scalar_boundaries(c: peer.Case) {
+    let nul = peer.character(0)
+    let values = ["hello", "hello", "hello", "hello", "", "hello", "hello", "céréale", "hello", "", "hello", "céréale", "a🙂é", "a🙂é", "a" + nul + "🙂", "a" + nul + "🙂"]
+    let suffixes: List<List<Text>> = [["o"], ["llo"], ["ll"], [""], [""], ["x", "y", "llo", "z"], [], ["réale"], ["hello!"], ["o"], ["x", "y"], ["réal"], ["🙂é"], ["a🙂"], [nul + "🙂"], [nul]]
+    let answers = [true, true, false, true, true, true, false, true, false, false, false, false, true, false, true, false]
+    let source = "function endsWithAny(value: Text, suffixes: List<Text>): Boolean {
+    let i = 0
+    while i < suffixes.length {
+        let suffix = suffixes[i]
+        if suffix.length <= value.length {
+            if value.slice(value.length - suffix.length, value.length) == suffix {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+"
+    let expected: List<Text> = []
+    for index in 0..values.length {
+        let found = false
+        for candidate in suffixes[index] { if peer.ends(values[index], candidate) { found = true } }
+        peer.expect(c, found == answers[index], "suffix oracle " + Text(index))
+        source += "print(endsWithAny(" + peer.literal(values[index]) + ", [" + peer.joined(literals(suffixes[index]), ", ") + "]))\n"
+        expected.add(peer.boolean(answers[index]) + "\n")
+    }
+    peer.executes(c, source, joinText(expected))
+}
+function graphNodes(keys: List<Integer>, edges: List<List<Integer>>): List<Integer> {
+    let nodes: List<Integer> = []
+    for key in keys { if !peer.hasInteger(nodes, key) { nodes.add(key) } }
+    for targets in edges { for target in targets { if !peer.hasInteger(nodes, target) { nodes.add(target) } } }
+    return peer.sortIntegers(nodes)
+}
+function writeGraph(c: peer.Case, folder: Text, nodes: List<Integer>, keys: List<Integer>, edges: List<List<Integer>>, acyclic: Boolean) {
+    for node in nodes {
+        let targets: List<Integer> = []
+        for index in 0..keys.length { if keys[index] == node { targets = edges[index] } }
+        let source = ""
+        for target in targets {
+            if !acyclic || target > node { source += "use \"./node" + Text(target) + ".min\" as n" + Text(target) + "\n" }
+        }
+        source += "public function value(): Integer { return " + Text(node) + " }\n"
+        writeTextFile(folder + "/node" + Text(node) + ".min", source)
+    }
+}
+function test_five_module_cycle_shapes_and_acyclic_controls(c: peer.Case) {
+    let keys = [[1], [1, 2, 3], [1, 2, 3, 5, 4], [1, 2, 3, 4, 6, 7], [1, 2, 3, 4]]
+    let edges = [[[1]], [[2], [3], [1]], [[2], [3], [1], [4], [6]], [[2], [1], [4], [5], [7], [6]], [[2], [3], [2, 4], [5]]]
+    for index in 0..keys.length {
+        let nodes = graphNodes(keys[index], edges[index])
+        let folder = peer.path(c, "graph" + Text(index))
+        peer.expect(c, files.makeDirectory(folder) == 0, "cannot create " + folder)
+        let entry = ""
+        let calls: List<Text> = []
+        let total = 0
+        for node in nodes {
+            entry += "use \"./graph" + Text(index) + "/node" + Text(node) + ".min\" as n" + Text(node) + "\n"
+            calls.add("n" + Text(node) + ".value()")
+            total += node
+        }
+        entry += "print(" + peer.joined(calls, " + ") + ")\n"
+        writeGraph(c, folder, nodes, keys[index], edges[index], false)
+        peer.rejects(c, entry, "module import cycle:")
+        writeGraph(c, folder, nodes, keys[index], edges[index], true)
+        peer.executes(c, entry, Text(total) + "\n")
+    }
+}
+function test_unicode_filename_read_write_and_missing_path_guards(c: peer.Case) {
+    let rows = json.member(vectors(c), "filenames").items
+    peer.equalInteger(c, rows.length, 19, "filename vector count")
+    let prefixes = [16, 17, 18]
+    let spaces = [0x2000, 0x2001, 0x2003]
+    for index in 0..3 {
+        peer.equal(c, peer.textField(rows[prefixes[index] - 1], "filename"), Text(prefixes[index]) + "_" + peer.repeat(peer.character(spaces[index]), 3) + "A", "filename vector " + Text(prefixes[index]))
+    }
+    for row in rows { peer.expect(c, !peer.contains(peer.textField(row, "filename"), "\\u"), "filename contains an unevaluated Unicode escape") }
+    let source: List<Text> = []
+    let expected: List<Text> = []
+    let outputs: List<peer.Output> = []
+    let arguments: List<Text> = []
+    let inputs = peer.path(c, "inputs")
+    let outputDirectory = peer.path(c, "outputs")
+    peer.expect(c, files.makeDirectory(inputs) == 0, "cannot create inputs")
+    peer.expect(c, files.makeDirectory(outputDirectory) == 0, "cannot create outputs")
+    let apple = darwin()
+    for index in 0..rows.length {
+        let row = rows[index]
+        let filename = peer.textField(row, "filename")
+        if json.member(row, "non_apple_only").truth && apple {
+            peer.appendControl(c, "platform_exclusions", peer.jsonText(filename))
+            continue
+        }
+        let path = inputs + "/" + filename
+        let output = outputDirectory + "/" + filename
+        let payload = "file" + Text(index) + ":é" + peer.character(0) + "🙂"
+        writeBytesFile(path, Bytes(payload))
+        let argumentIndex = arguments.length
+        arguments.add(path)
+        arguments.add(output)
+        let name = Text(index)
+        peer.extend(source, ["let path" + name + " = argument(" + Text(argumentIndex) + ")", "let output" + name + " = argument(" + Text(argumentIndex + 1) + ")",
+            "let text" + name + " = readTextFile(path" + name + ")", "print(text" + name + ")",
+            "writeTextFile(output" + name + ", text" + name + " + \"!\")",
+            "print(readTextFile(output" + name + "))"])
+        peer.extend(expected, [payload, payload + "!"])
+        outputs.add(peer.Output { path: output; contents: Bytes(payload + "!") })
+    }
+    for optimization in c.variants {
+        for output in outputs {
+            if files.pathSize(output.path) >= 0 { peer.expect(c, files.remove(output.path) == 0, "cannot clear " + output.path) }
+        }
+        peer.executesFull(c, peer.lines(source), peer.lines(expected), 0, "", arguments, [], [optimization])
+        for output in outputs {
+            peer.expect(c, files.pathSize(output.path) >= 0, "program did not create " + output.path)
+            peer.expect(c, peer.bytesEqual(readBytesFile(output.path), output.contents), "file bytes differ at " + optimization + ": " + output.path)
+        }
+    }
+    let missing = peer.path(c, "absent-Γειά-🙂")
+    peer.executesWith(c, "print(readTextFile(argument(0)))\n", "", 1, "Minyar stopped: the file '" + missing + "' could not be opened.\n", [missing])
+}
+function checkLiteralPayloads(c: peer.Case, texts: List<Text>) {
+    let source: List<Text> = []
+    let expected: List<Text> = []
+    for index in 0..texts.length {
+        let text = texts[index]
+        let name = Text(index)
+        let path = peer.writeBytes(c, "payload" + name + ".txt", Bytes(text))
+        peer.extend(source, ["let text" + name + " = " + peer.literal(text), "let disk" + name + " = readTextFile(" + peer.literal(path) + ")",
+            "print(text" + name + " == disk" + name + ")", "print(text" + name + ".length)", "print(text" + name + ".byteLength)",
+            "print(text" + name + ")"])
+        peer.extend(expected, ["true", Text(text.length), Text(Bytes(text).length), text])
+        let scalars = peer.scalars(text)
+        for position in 0..scalars.length {
+            let at = "[" + Text(position) + "]"
+            peer.extend(source, ["print(Text(text" + name + at + "))", "print(text" + name + at + " == disk" + name + at + ")"])
+            peer.extend(expected, [scalars[position], "true"])
+        }
+        for begin in 0..(text.length + 1) {
+            for end in begin..(text.length + 1) {
+                source.add("print(text" + name + ".slice(" + Text(begin) + ", " + Text(end) + "))")
+                expected.add(text.slice(begin, end))
+            }
+        }
+    }
+    peer.executes(c, peer.lines(source), peer.lines(expected))
+}
+function test_python_literal_payloads_match_independent_utf8_files(c: peer.Case) {
+    let rows = json.member(vectors(c), "python_literals").items
+    peer.equalInteger(c, rows.length, 7, "Python literal vector count")
+    let texts: List<Text> = []
+    for row in rows { texts.add(peer.textField(row, "text")) }
+    checkLiteralPayloads(c, texts)
+}
+function test_swift_flag_and_mathematical_scalar_literals(c: peer.Case) {
+    let rows = json.member(vectors(c), "swift_literals").items
+    peer.equalInteger(c, rows.length, 6, "Swift literal vector count")
+    let payloads: List<Text> = []
+    for row in rows { payloads.add(peer.textField(row, "payload")) }
+    let texts = peer.unique(payloads)
+    peer.expect(c, texts.length == 2 && texts[0] == peer.codepoints([0x1f1e6, 0x1f1fa]) && texts[1] == peer.codepoints([0x1d539]), "Swift literal payloads differ: " + peer.joined(texts, ", "))
+    checkLiteralPayloads(c, texts)
+}
+function test_zig_and_ruby_malformed_utf8_ingress_vectors(c: peer.Case) {
+    let rows = json.member(vectors(c), "invalid_utf8").items
+    peer.equalInteger(c, rows.length, 35, "invalid UTF-8 vector count")
+    let hexes: List<Text> = []
+    for row in rows { hexes.add(peer.textField(row, "hex")) }
+    peer.equalInteger(c, peer.unique(hexes).length, 35, "distinct invalid UTF-8 vectors")
+    let paths: List<Text> = []
+    let lengths: List<Integer> = []
+    for index in 0..rows.length {
+        let raw = peer.fromHex(hexes[index])
+        peer.expect(c, !peer.validUTF8(raw), "invalid UTF-8 vector decoded: " + hexes[index])
+        paths.add(peer.writeBytes(c, "invalid" + Text(index) + ".txt", raw))
+        lengths.add(raw.length)
+    }
+    let source = "let text = readTextFile(argument(0))\nprint(text.byteLength)\nprint(text.length)\n"
+    let base = peer.executesWith(c, source, Text(lengths[0]) + "\n", 1, INVALID_UTF8, [paths[0]])
+    for optimization in c.variants {
+        for index in 1..rows.length {
+            peer.observe(c, peer.run(c, [peer.executable(base, optimization), paths[index]], "execute-peer-malformed-utf8", c.runTimeout), 1, Text(lengths[index]) + "\n", INVALID_UTF8, hexes[index] + " at " + optimization)
+        }
+    }
+}
+function test_ruby_quotient_remainder_operand_placements(c: peer.Case) {
+    let numerators = [13, 4, -200, -1000]
+    let divisors = [4, 13, -256, -512]
+    let quotients = [3, 0, 0, 1]
+    let remainders = [1, 4, -200, -488]
+    let source = ["function quotient(a: Integer, b: Integer): Integer { return a / b }", "function remainder(a: Integer, b: Integer): Integer { return a % b }"]
+    let expected: List<Text> = []
+    for index in 0..4 {
+        peer.expect(c, numerators[index] == quotients[index] * divisors[index] + remainders[index], "quotient identity " + Text(index))
+        let name = Text(index)
+        let a = Text(numerators[index])
+        let b = Text(divisors[index])
+        peer.extend(source, ["let a" + name + " = " + a, "let b" + name + " = " + b])
+        let lefts = [a, "a" + name, a, "a" + name]
+        let rights = [b, b, "b" + name, "b" + name]
+        for placement in 0..4 {
+            peer.extend(source, ["print(" + lefts[placement] + " / " + rights[placement] + ")", "print(" + lefts[placement] + " % " + rights[placement] + ")"])
+            peer.extend(expected, [Text(quotients[index]), Text(remainders[index])])
+        }
+        peer.extend(source, ["print(quotient(a" + name + ", b" + name + "))", "print(remainder(a" + name + ", b" + name + "))"])
+        peer.extend(expected, [Text(quotients[index]), Text(remainders[index])])
+    }
+    peer.executes(c, peer.lines(source), peer.lines(expected))
+}
+function test_ruby_negation_at_signed32_transition(c: peer.Case) {
+    let source = ["function negate(n: Integer): Integer { return -n }"]
+    let expected: List<Text> = []
+    let values = [100, -100, 2147483648, -2147483648]
+    for index in 0..values.length {
+        let name = Text(index)
+        let value = Text(values[index])
+        peer.extend(source, ["let n" + name + " = " + value, "print(-(" + value + "))", "print(-n" + name + ")", "print(negate(n" + name + "))"])
+        for repetition in 0..3 { expected.add(Text(-values[index])) }
+    }
+    peer.executes(c, peer.lines(source), peer.lines(expected))
+}
+function test_iterative_fibonacci_uses_previous_pair(c: peer.Case) {
+    peer.executes(c, "function fib() {
+let a = 0
+let b = 1
+while b < 10 {
+print(b)
+let previous = a
+a = b
+b = previous + b
+}
+}
+fib()
+", "1\n1\n2\n3\n5\n8\n")
+}
+function test_parenthesized_division_and_mixed_unary_precedence(c: peer.Case) {
+    peer.executes(c, "function grouped(a: Integer, b: Integer, c: Integer) {
+print(a / (b / c))
+print((a / b) / c)
+print(a / b / c)
+}
+function mixed(one: Integer): Integer { return -one * one / one + one * one - ---one * one }
+print(16 / (4 / 2))
+print((16 / 4) / 2)
+print(16 / 4 / 2)
+grouped(16, 4, 2)
+print(-1 * 1 / 1 + 1 * 1 - ---1 * 1)
+print(mixed(1))
+", "8\n2\n2\n8\n2\n2\n1\n1\n")
+}
+function test_utf8_program_arguments_in_c_and_posix_locales(c: peer.Case) {
+    let output = "hé€\n3\n6\nh\né\n€\n"
+    let source = "let value = argument(0)\nprint(value)\nprint(value.length)\nprint(value.byteLength)\nprint(value[0])\nprint(value[1])\nprint(value[2])\n"
+    let base = peer.executesWith(c, source, output, 0, "", ["hé€"])
+    for optimization in c.variants {
+        for locale in ["C", "POSIX"] {
+            let environment = peer.withEnvironment(peer.withEnvironment(c.environment, "LC_ALL", locale), "LANG", locale)
+            peer.observe(c, peer.launch(c, [peer.executable(base, optimization), "hé€"], "execute-peer-locale", c.runTimeout, environment, "", ""), 0, output, "", locale + " at " + optimization)
+        }
+    }
+}
+function test_integer_conditions_never_coerce_to_boolean(c: peer.Case) {
+    for value in ["0", "(0)", "1", "(1)", "12", "(12)"] { peer.rejects(c, "if " + value + " { print(1) }\n", "an if condition must be Boolean") }
+}
+function test_numeric_values_and_minus_are_not_types(c: peer.Case) {
+    for spelling in ["123", "-123", "-Integer"] {
+        for template in ["let value: TYPE = 1\n", "let value: List<TYPE> = []\n"] { peer.rejects(c, peer.replace(template, "TYPE", spelling), "unknown type") }
+    }
+}
+function test_declaration_names_reject_numeric_tokens(c: peer.Case) {
+    let keywords = ["function", "record"]
+    let names = [["1"], ["13"]]
+    let tails = ["() {}", " {}"]
+    for index in 0..2 {
+        for name in names[index] { peer.rejects(c, keywords[index] + " " + name + tails[index] + "\n", "Minyar stopped: line 1,") }
+    }
+}
+function test_declaration_names_reject_float_and_digit_prefix_tokens(c: peer.Case) {
+    let keywords = ["function", "record"]
+    let names = [["2.0", "3func"], ["14.0", "15struct"]]
+    let tails = ["() {}", " {}"]
+    for index in 0..2 {
+        for name in names[index] { peer.rejects(c, keywords[index] + " " + name + tails[index] + "\n", "Minyar stopped: line 1,") }
+    }
+}
+function test_unresolved_git_and_perforce_conflicts(c: peer.Case) {
+    let variants = ["<<<<<<< HEAD\nlet a = \"A\"\n=======\nlet a = \"B\"\n>>>>>>> branch\n",
+        "<<<<<<< HEAD\n=======\nlet d = \"D\"\n>>>>>>> branch\n",
+        ">>>> ORIGINAL\nlet a = \"A\"\n==== THEIRS\nlet a = \"B\"\n==== YOURS\nlet a = \"C\"\n<<<<\n",
+        ">>>> ORIGINAL\n==== THEIRS\n==== YOURS\nlet d = \"D\"\n<<<<\n"]
+    for source in variants { peer.rejects(c, source, "Minyar stopped: line 1,") }
+}
+function test_consecutive_statements_require_a_separator(c: peer.Case) {
+    for source in ["let a = 1 let b = 2\n", "let a = 1\nlet b = 2\na = 3 b = 4\n"] {
+        for wrapped in [false, true] {
+            let text = source
+            if wrapped { text = "function probe() {\n" + source + "}\nprobe()\n" }
+            peer.rejects(c, text, "start the next statement on a new line")
+        }
+    }
+    peer.executes(c, "function probe() { let a = 1; let b = 2; a = 3; b = 4; print(a + b) }\nprobe()\n", "7\n")
+}
+function test_comments_preserve_fixed_operator_boundaries(c: peer.Case) {
+    let expressions = ["/* */!true", "1/**/+ 2", "1 /**/+ 2", "1 +/*hi*/2", "1 +/**/ 2", "1 +/* hi */2", "1/**/+2", "1+/**/2", "!/* */true", "1+/* */2"]
+    let values = ["false", "3", "3", "3", "3", "3", "3", "3", "false", "3"]
+    let prints: List<Text> = []
+    for expression in expressions { prints.add("print(" + expression + ")") }
+    let source = peer.joined(prints, "\n") + "\nlet after =/**/2\nlet before/**/= 2\nprint(after)\nprint(before)\n"
+    peer.executes(c, source, peer.joined(values, "\n") + "\n2\n2\n")
+}
+function test_boolean_list_toggle_keeps_other_elements(c: peer.Case) {
+    peer.executes(c, "let flags = [false, true, true]\nflags[0] = !flags[0]\nflags[1] = !flags[1]\nprint(flags.length)\nprint(flags[0])\nprint(flags[1])\nprint(flags[2])\n", "3\ntrue\nfalse\ntrue\n")
+}
+function test_computed_assignment_and_unescaped_quote_reject(c: peer.Case) {
+    for assignment in ["x + 1 = 1", "x + 1 = y + 2"] { peer.rejects(c, "let x = 1\nlet y = 2\n" + assignment + "\n", "unexpected '='") }
+    peer.rejects(c, "let x = \"doesn't \"shrink\", does it\"\n", "unexpected 'shrink'")
+}
+function test_million_digit_decimal_tokens_are_bounded_rejections(c: peer.Case) {
+    for count in [133700, 1200000] { peer.rejects(c, "print(" + repeatText("9", count) + ")\n", "outside the supported range") }
+}
+function test_supplementary_scalar_23456_has_exact_utf8(c: peer.Case) {
+    let scalar = peer.character(0x23456)
+    peer.expect(c, peer.bytesEqual(Bytes(scalar), peer.fromHex("f0a39196")), "U+23456 UTF-8 encoding differs")
+    checkLiteralPayloads(c, [scalar])
+}
+function test_f1_followed_by_ascii_is_invalid_utf8(c: peer.Case) {
+    let path = peer.writeBytes(c, "f1-ascii.txt", peer.fromHex("f161626364"))
+    for operation in [".length", "[0]", ".slice(0, 1)"] {
+        peer.executesWith(c, "let text = readTextFile(argument(0))\nprint(text.byteLength)\nprint(text" + operation + ")\n", "5\n", 1, INVALID_UTF8, [path])
+    }
+}
+function test_nul_prefix_slices_and_control_fragment_join(c: peer.Case) {
+    let nul = peer.character(0)
+    peer.executes(c, "let value = \"" + nul + "123456789\"\nprint(value.slice(2,5))\nprint(value.slice(7,10))\n", "234\n789\n")
+    let fragments = [nul + "." + nul + ".", nul + peer.character(1) + "." + nul + ".", nul + peer.character(1) + peer.character(2)]
+    let text = joinText(fragments)
+    let source = "let parts = [" + peer.joined(literals(fragments), ", ") + "]\nlet text = joinText(parts)\n"
+    source += "print(text)\nprint(text.length)\n"
+    let expected = text + "\n" + Text(text.length) + "\n"
+    let scalars = peer.scalars(text)
+    for index in 0..scalars.length {
+        source += "print(Text(text[" + Text(index) + "]))\n"
+        expected += scalars[index] + "\n"
+    }
+    peer.executes(c, source, expected)
+}
+function test_nested_triangular_loops_preserve_outer_binding(c: peer.Case) {
+    peer.executes(c, "let i = 3
+let count = 0
+let marks: List<Integer> = []
+let init = 0
+while init < 100 { marks.add(0); init = init + 1 }
+let row = 1
+while row <= 100 {
+let i = row
+while i > 0 { count = count + 1; marks[i - 1] = 1; i = i - 1 }
+row = row + 1
+}
+print(i)
+print(count)
+let index = 0
+while index < marks.length { print(marks[index]); index = index + 1 }
+", "3\n5050\n" + peer.repeat("1\n", 100))
+}
+function test_truncated_bom_source_inputs_reject(c: peer.Case) {
+    let prefixes = [peer.bytes([0xef]), peer.bytes([0xef, 0xbb])]
+    let followings = [Bytes(), Bytes("print(42)\n")]
+    for index in 0..2 {
+        for following in followings {
+            let name = "bom-" + Text(index) + "-" + Text(following.length)
+            let path = peer.writeBytes(c, name + ".min", peer.concat(prefixes[index], following))
+            let llvm = peer.path(c, name + ".ll")
+            peer.observe(c, peer.run(c, [c.compiler.executable, path, llvm], "compile-invalid-bom", c.compiler.compileTimeout), 1, "", INVALID_UTF8, name)
+            peer.expect(c, files.pathSize(llvm) < 0, name + " left LLVM output behind")
+        }
+    }
+}
+function integerValues(c: peer.Case): List<Integer> {
+    let path = c.suite.root + "/tests/peer-pyswru-integer-values.json"
+    peer.input(c, path)
+    let values: List<Integer> = []
+    for item in json.member(peer.load(path), "values").items { values.add(peer.number(item)) }
+    peer.equalInteger(c, values.length, 79, "integer value count")
+    for index in 1..values.length { peer.expect(c, values[index - 1] < values[index], "integer values are not sorted and unique at " + Text(index)) }
+    return values
+}
+function fitsOperation(symbol: Text, a: Integer, b: Integer): Boolean {
+    if symbol == "+" { return errors.integerOk(errors.checkedAdd(a, b)) }
+    if symbol == "-" { return errors.integerOk(errors.checkedSubtract(a, b)) }
+    return errors.integerOk(errors.checkedMultiply(a, b))
+}
+function contiguousRange(c: peer.Case, positions: List<Integer>, label: Text) {
+    for index in 0..positions.length { peer.expect(c, positions[index] == positions[0] + index, label + " positions are not contiguous") }
+}
+function test_signed_integer_peer_corpus_safe_arithmetic_and_boolean_storage(c: peer.Case) {
+    let values = integerValues(c)
+    let source = ["let values = [" + peer.joined(peer.texts(values), ",") + "]"]
+    let expected: List<Text> = []
+    let labels = ["add", "sub", "mul"]
+    let symbols = ["+", "-", "*"]
+    for operation in 0..3 {
+        let label = labels[operation]
+        let symbol = symbols[operation]
+        let lower: List<Integer> = []
+        let upper: List<Integer> = []
+        for a in values {
+            let positions: List<Integer> = []
+            for j in 0..values.length { if fitsOperation(symbol, a, values[j]) { positions.add(j) } }
+            peer.expect(c, positions.length > 0, label + " has no safe operand for " + Text(a))
+            contiguousRange(c, positions, label + " " + Text(a))
+            lower.add(positions[0])
+            upper.add(positions[positions.length - 1] + 1)
+        }
+        source.add("let " + label + "Low = [" + peer.joined(peer.texts(lower), ",") + "]")
+        source.add("let " + label + "High = [" + peer.joined(peer.texts(upper), ",") + "]")
+        peer.extend(source, ["let i = 0", "while i < values.length {", "let a = values[i]",
+            "let j = " + label + "Low[i]", "while j < " + label + "High[i] {",
+            "let b = values[j]", "let c = a " + symbol + " b", "print(c)"])
+        if symbol == "+" { peer.extend(source, ["print(b + a)", "print(c - b)"]) }
+        else if symbol == "-" { peer.extend(source, ["print(c + b)", "print(c - a)", "print(-b)"]) }
+        else { peer.extend(source, ["print(b * a)", "if a != 0 { print(c / a) }"]) }
+        peer.extend(source, ["j = j + 1", "}", "i = i + 1", "}"])
+        for i in 0..values.length {
+            let a = values[i]
+            for j in lower[i]..upper[i] {
+                let b = values[j]
+                if symbol == "+" {
+                    let result = a + b
+                    peer.extend(expected, [Text(result), Text(result), Text(a)])
+                } else if symbol == "-" {
+                    let result = a - b
+                    peer.extend(expected, [Text(result), Text(a), Text(-b), Text(-b)])
+                } else {
+                    let result = a * b
+                    peer.extend(expected, [Text(result), Text(result)])
+                    if a != 0 { expected.add(Text(b)) }
+                }
+            }
+        }
+    }
+    peer.extend(source, ["function carry(value: Boolean): Boolean { return value }",
+        "let i = 0", "while i < values.length {", "let a = values[i]",
+        "print(a)", "print(-a)", "print(0 - a)", "print(a + -a)",
+        "let j = 0", "while j < values.length {", "let b = values[j]",
+        "let comparisons = [carry(a < b), carry(a <= b), carry(a > b), carry(a >= b), carry(a == b), carry(a != b)]",
+        "let k = 0", "while k < comparisons.length { print(comparisons[k]); k = k + 1 }",
+        "print(b == a)", "if b != 0 {", "let q = a / b", "let r = a % b",
+        "print(q)", "print(r)", "print(b * q + r)", "}",
+        "j = j + 1", "}", "i = i + 1", "}"])
+    for i in 0..values.length {
+        let a = values[i]
+        peer.extend(expected, [Text(a), Text(-a), Text(-a), "0"])
+        for j in 0..values.length {
+            let b = values[j]
+            for truth in [i < j, i <= j, i > j, i >= j, i == j, i != j, j == i] { expected.add(peer.boolean(truth)) }
+            if b != 0 {
+                let division = peer.division(a, b)
+                peer.extend(expected, [Text(division.quotient), Text(division.remainder), Text(a)])
+            }
+        }
+    }
+    peer.executes(c, peer.lines(source), peer.lines(expected))
+}
+function test_signed_integer_peer_corpus_overflow_and_zero_divisors(c: peer.Case) {
+    let values = integerValues(c)
+    let source = ["function operand(text: Text): Integer {"]
+    for value in values { source.add("if text == \"" + Text(value) + "\" { return " + Text(value) + " }") }
+    peer.extend(source, ["return 0", "}", "let op = argument(0)", "let a = operand(argument(1))", "let b = operand(argument(2))"])
+    for op in ["+", "-", "*", "/", "%"] { source.add("if op == \"" + op + "\" { print(a " + op + " b) }") }
+    let base = peer.executesWith(c, peer.lines(source), "0\n", 0, "", ["+", "0", "0"])
+    let cases: List<List<Text>> = []
+    let failures: List<Text> = []
+    for op in ["+", "-", "*"] {
+        for a in values {
+            for b in values {
+                if !fitsOperation(op, a, b) {
+                    cases.add([op, Text(a), Text(b)])
+                    failures.add(peer.OVERFLOW)
+                }
+            }
+        }
+    }
+    for a in values {
+        for op in ["/", "%"] {
+            cases.add([op, Text(a), "0"])
+            failures.add(peer.ZERO)
+        }
+    }
+    peer.equalInteger(c, cases.length, 1486, "integer failure case count")
+    let rows: List<json.Value> = []
+    for item in cases { rows.add(peer.jsonTexts(item)) }
+    peer.control(c, "peer_integer_failure_cases", peer.jsonArray(rows))
+    for optimization in c.variants {
+        for index in 0..cases.length {
+            let command = [peer.executable(base, optimization)]
+            peer.extend(command, cases[index])
+            peer.observe(c, peer.run(c, command, "peer-integer-failure", c.runTimeout), 1, "", failures[index], peer.joined(cases[index], " ") + " at " + optimization)
+        }
+    }
+}
+function test_decimal_prefix_and_separator_finite_lexical_product(c: peer.Case) {
+    let acceptedTokens: List<Text> = []
+    let acceptedValues: List<Integer> = []
+    let rejected = 0
+    for cell in decimalCells(c) {
+        if cell.accepted {
+            acceptedTokens.add(cell.token)
+            acceptedValues.add(cell.value)
+        } else {
+            rejectsExactDiagnostic(c, "print(" + cell.token + ")\n", cell.diagnostic)
+            rejected += 1
+        }
+    }
+    peer.expect(c, acceptedTokens.length == 152 && rejected == 967, "decimal cells: " + Text(acceptedTokens.length) + " accepted and " + Text(rejected) + " rejected")
+    let source: List<Text> = []
+    let expected: List<Text> = []
+    for index in 0..acceptedTokens.length {
+        source.add("print(" + acceptedTokens[index] + ")\n")
+        expected.add(Text(acceptedValues[index]) + "\n")
+    }
+    peer.executes(c, joinText(source), joinText(expected))
+}
+function test_long_ascii_literal_and_supported_escapes(c: peer.Case) {
+    let path = c.suite.root + "/tests/peer-pyswru-long-literal.json"
+    peer.input(c, path)
+    let value = peer.textField(peer.load(path), "value")
+    peer.equalInteger(c, value.length, 960, "long literal length")
+    for payload in [value, "\n\r\t\"\\", "\\n\\r\\t", "quote\"middle\\end"] {
+        let scalars = peer.scalars(payload)
+        let source: List<Text> = ["let value = " + peer.literal(payload) + "\nprint(value)\nprint(value.length)\nprint(value.byteLength)\n"]
+        let expected: List<Text> = [payload + "\n" + Text(payload.length) + "\n" + Text(Bytes(payload).length) + "\n"]
+        for index in 0..scalars.length {
+            source.add("print(value[" + Text(index) + "])\n")
+            expected.add(scalars[index] + "\n")
+        }
+        peer.executes(c, joinText(source), joinText(expected))
+    }
+}
+function test_list_literal_capacity_boundaries_and_computed_elements(c: peer.Case) {
+    let source: List<Text> = []
+    let expected: List<Text> = []
+    for size in [0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 30, 31, 32, 33, 34, 254, 255, 256, 257, 500, 1001] {
+        let name = "values" + Text(size)
+        let elements = peer.texts(peer.range(0, size))
+        peer.extend(source, ["let " + name + ": List<Integer> = [" + peer.joined(elements, ",") + "]", "print(" + name + ".length)", "let i = 0", "while i < " + name + ".length { print(" + name + "[i]); i = i + 1 }"])
+        expected.add(Text(size))
+        peer.extend(expected, elements)
+        if size > 0 {
+            peer.extend(source, [name + "[" + Text(size - 1) + "] = -1", "print(" + name + "[" + Text(size - 1) + "])"])
+            expected.add("-1")
+        }
+    }
+    source.add("record Box { value: Text }")
+    for size in [0, 1, 2, 5, 33, 257] {
+        let name = "boxes" + Text(size)
+        let boxes: List<Text> = []
+        for i in 0..size { boxes.add("Box { value: Text(" + Text(i) + ") + \"é\" }") }
+        peer.extend(source, ["let " + name + ": List<Box> = [" + peer.joined(boxes, ",") + "]", "print(" + name + ".length)", "let i = 0", "while i < " + name + ".length { print(" + name + "[i].value); i = i + 1 }"])
+        expected.add(Text(size))
+        for i in 0..size { expected.add(Text(i) + "é") }
+    }
+    peer.extend(source, ["let computed = [1 + 2, 3 + 4, 5 + 6]", "print(computed.length)", "print(computed[0])", "print(computed[1])", "print(computed[2])", "computed[1] = computed[0] + computed[2]", "print(computed[1])"])
+    peer.extend(expected, ["3", "3", "7", "11", "14"])
+    peer.executes(c, peer.lines(source), peer.lines(expected))
+}
+function test_three_hundred_owned_fragments_join_after_reassignment(c: peer.Case) {
+    peer.executes(c, "let pieces: List<Text> = []
+let i = 0
+while i < 300 { pieces.add(\"xuxu\" + Text(123)); i = i + 1 }
+let alias = pieces
+let joined = joinText(pieces)
+pieces = []
+alias[0] = \"changed\"
+print(joined)
+print(joined.length)
+print(joined.byteLength)
+print(joined.slice(0, 7))
+print(joined.slice(2093, 2100))
+print(alias[299])
+", peer.repeat("xuxu123", 300) + "\n2100\n2100\nxuxu123\nxuxu123\nxuxu123\n")
+}
+function test_dead_zero_division_and_power_neighbor_cancellation(c: peer.Case) {
+    let source = ["if false { print(3 / 0) }", "if false { print(3 % 0) }", "function cancel(a: Integer, b: Integer): Integer { return a + b }"]
+    let expected: List<Text> = []
+    for value in [8388607, 8388608, 8388609] {
+        for pair in [[value, -value], [-value, value]] {
+            let a = Text(pair[0])
+            let b = Text(pair[1])
+            peer.extend(source, ["let a = " + a, "let b = " + b, "print(" + a + " + (" + b + "))", "print(a + (" + b + "))", "print((" + a + ") + b)", "print(a + b)", "print(cancel(a,b))"])
+            for repetition in 0..5 { expected.add("0") }
+        }
+    }
+    source.add("print(42)")
+    expected.add("42")
+    peer.executes(c, peer.lines(source), peer.lines(expected))
+}
+function test_control_byte_and_adjacent_identifier_have_source_locations(c: peer.Case) {
+    peer.rejects(c, "let value = 1name\n", "line 1, column 14:")
+    peer.rejects(c, "let a = 1\nlet b = a" + peer.character(1) + "a\n", "line 2, column 10:")
+}
+function test_every_byte_in_identifier_start_and_continuation(c: peer.Case) {
+    let accepted: List<Text> = []
+    for position in ["start", "continuation"] {
+        for byte in 0..256 {
+            let name = peer.bytes([byte])
+            if position == "continuation" { name = peer.bytes([97, byte, 49]) }
+            let valid = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95 || (position == "continuation" && byte >= 48 && byte <= 57)
+            let source = peer.concat(peer.concat(Bytes("let "), name), Bytes(" = 1\n"))
+            let stem = "identifier-" + position + "-" + Text(byte)
+            let path = peer.writeBytes(c, stem + ".min", source)
+            let llvm = peer.path(c, stem + ".ll")
+            let result = peer.run(c, [c.compiler.executable, path, llvm], "compile-identifier-byte", c.compiler.compileTimeout)
+            let status = 1
+            if valid { status = 0 }
+            peer.expect(c, result.status == status, stem + " status " + Text(result.status) + "\n" + result.errorOutput)
+            peer.equal(c, result.output, "", stem + " stdout")
+            peer.expect(c, (files.pathSize(llvm) >= 0) == valid, stem + " LLVM presence")
+            if valid {
+                peer.equal(c, result.errorOutput, "", stem + " stderr")
+                accepted.add(Text(source) + "print(" + Text(name) + ")\n")
+            } else {
+                peer.expect(c, peer.validUTF8(Bytes(result.errorOutput)), stem + " diagnostic is not UTF-8")
+                peer.expect(c, peer.starts(result.errorOutput, "Minyar stopped:"), stem + " diagnostic prefix\n" + result.errorOutput)
+                if byte >= 128 { peer.expect(c, peer.contains(result.errorOutput, "Text contained invalid UTF-8"), stem + " invalid UTF-8 diagnostic\n" + result.errorOutput) }
+            }
+        }
+    }
+    peer.equalInteger(c, accepted.length, 116, "accepted identifier count")
+    peer.executes(c, joinText(accepted), peer.repeat("1\n", accepted.length))
+}
+function operatorValue(symbol: Text, a: Integer, b: Integer): Text {
+    if symbol == "+" { return Text(a + b) }
+    if symbol == "-" { return Text(a - b) }
+    if symbol == "*" { return Text(a * b) }
+    if symbol == "/" { return Text(peer.quotient(a, b)) }
+    if symbol == "%" { return Text(peer.remainder(a, b)) }
+    if symbol == "==" { return peer.boolean(a == b) }
+    if symbol == "!=" { return peer.boolean(a != b) }
+    if symbol == "<" { return peer.boolean(a < b) }
+    if symbol == ">" { return peer.boolean(a > b) }
+    if symbol == "<=" { return peer.boolean(a <= b) }
+    return peer.boolean(a >= b)
+}
+function test_seven_operands_all_supported_operator_placements(c: peer.Case) {
+    let values = [3, 100, 5, -10, -5, 10000, -10000]
+    for symbol in ["+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">="] {
+        let resultType = "Integer"
+        if symbol == "==" || symbol == "!=" || symbol == "<" || symbol == ">" || symbol == "<=" || symbol == ">=" { resultType = "Boolean" }
+        let source = ["function apply(a: Integer,b: Integer): " + resultType + " { return a " + symbol + " b }"]
+        let expected: List<Text> = []
+        for a in values {
+            for b in values {
+                let value = operatorValue(symbol, a, b)
+                peer.extend(source, ["let a = " + Text(a), "let b = " + Text(b)])
+                let lefts = [Text(a), "a", Text(a), "a"]
+                let rights = [Text(b), Text(b), "b", "b"]
+                for placement in 0..4 { source.add("print((" + lefts[placement] + ") " + symbol + " (" + rights[placement] + "))") }
+                source.add("print(apply(a,b))")
+                for repetition in 0..5 { expected.add(value) }
+            }
+        }
+        peer.executes(c, peer.lines(source), peer.lines(expected))
+    }
+}
+function test_demorgan_truth_and_short_circuit_effect_traces(c: peer.Case) {
+    for a in [false, true] {
+        for b in [false, true] {
+            let source = ["function left(value: Boolean): Boolean { print(\"left\"); return value }",
+                "function right(value: Boolean): Boolean { print(\"right\"); return value }",
+                "let a = " + peer.boolean(a), "let b = " + peer.boolean(b)]
+            let expected: List<Text> = []
+            let expressions = ["!(left(a) && right(b))", "!left(a) || !right(b)", "!(left(a) || right(b))", "!left(a) && !right(b)"]
+            let answers = [!(a && b), !(a && b), !(a || b), !(a || b)]
+            let visits = [a, a, !a, !a]
+            for index in 0..4 {
+                source.add("print(" + expressions[index] + ")")
+                expected.add("left")
+                if visits[index] { expected.add("right") }
+                expected.add(peer.boolean(answers[index]))
+            }
+            peer.executes(c, peer.lines(source), peer.lines(expected))
+        }
+    }
+}
+function test_checked_negation_square_and_cube_never_wrap(c: peer.Case) {
+    let expressions = ["0 - (-9223372036854775808)", "(-9223372036854775808) * (-9223372036854775808)", "9223372036854775807 * 9223372036854775807 * 9223372036854775807"]
+    let helpers = ["function calculate(a: Integer): Integer { return 0 - a }", "function calculate(a: Integer): Integer { return a * a }", "function calculate(a: Integer): Integer { return a * a * a }"]
+    let arguments = ["-9223372036854775808", "-9223372036854775808", "9223372036854775807"]
+    for index in 0..3 {
+        peer.executesStatus(c, "print(" + expressions[index] + ")\n", "", 1, peer.OVERFLOW)
+        peer.executesStatus(c, helpers[index] + "\nprint(calculate(" + arguments[index] + "))\n", "", 1, peer.OVERFLOW)
+    }
+}
+record Forest { leaf: List<Integer>; operation: List<Integer>; negated: List<Boolean>; left: List<Integer>; right: List<Integer> }
+function forestLeaf(forest: Forest, leaf: Integer): Integer {
+    forest.leaf.add(leaf)
+    forest.operation.add(0)
+    forest.negated.add(false)
+    forest.left.add(-1)
+    forest.right.add(-1)
+    return forest.leaf.length - 1
+}
+function forestNode(forest: Forest, operation: Integer, negated: Boolean, left: Integer, right: Integer): Integer {
+    forest.leaf.add(-1)
+    forest.operation.add(operation)
+    forest.negated.add(negated)
+    forest.left.add(left)
+    forest.right.add(right)
+    return forest.leaf.length - 1
+}
+function renderTree(forest: Forest, tree: Integer, glob: Integer, probe: Boolean, position: List<Integer>): Text {
+    if forest.leaf[tree] >= 0 {
+        let index = position[0]
+        position[0] = index + 1
+        let expression = "true"
+        if forest.leaf[tree] == 0 {
+            if glob == 0 { expression = "F" } else { expression = "false" }
+        } else if forest.leaf[tree] == 2 { expression = "(0 == glob)" }
+        if probe { return "visit(" + expression + "," + Text(index) + ")" }
+        return expression
+    }
+    let symbol = "&&"
+    if forest.operation[tree] == 1 { symbol = "||" }
+    let left = renderTree(forest, forest.left[tree], glob, probe, position)
+    let right = renderTree(forest, forest.right[tree], glob, probe, position)
+    let expression = "(" + left + " " + symbol + " " + right + ")"
+    if forest.negated[tree] { return "!" + expression }
+    return expression
+}
+function treeOracle(forest: Forest, tree: Integer, glob: Integer, position: List<Integer>, trace: List<Integer>): Boolean {
+    if forest.leaf[tree] >= 0 {
+        let index = position[0]
+        position[0] = index + 1
+        trace.add(index)
+        if forest.leaf[tree] == 0 { return false }
+        if forest.leaf[tree] == 1 { return true }
+        return glob == 0
+    }
+    let leftValue = treeOracle(forest, forest.left[tree], glob, position, trace)
+    let rightTrace: List<Integer> = []
+    let rightValue = treeOracle(forest, forest.right[tree], glob, position, rightTrace)
+    let conjunction = forest.operation[tree] == 0
+    let useRight = !leftValue
+    if conjunction { useRight = leftValue }
+    if useRight { for item in rightTrace { trace.add(item) } }
+    let value = leftValue || rightValue
+    if conjunction { value = leftValue && rightValue }
+    if forest.negated[tree] { return !value }
+    return value
+}
+function test_all_boolean_trees_through_four_leaves(c: peer.Case) {
+    let forest = Forest { leaf: []; operation: []; negated: []; left: []; right: [] }
+    let cases: List<List<Integer>> = [[]]
+    cases.add([forestLeaf(forest, 0), forestLeaf(forest, 1), forestLeaf(forest, 2)])
+    for size in 2..5 {
+        let built: List<Integer> = []
+        for split in 1..size {
+            for left in cases[split] {
+                for right in cases[size - split] {
+                    for operation in [0, 1] {
+                        for negated in [false, true] { built.add(forestNode(forest, operation, negated, left, right)) }
+                    }
+                }
+            }
+        }
+        cases.add(built)
+    }
+    let trees: List<Integer> = []
+    for size in 1..5 { for tree in cases[size] { trees.add(tree) } }
+    peer.expect(c, cases[1].length == 3 && cases[2].length == 36 && cases[3].length == 864 && cases[4].length == 25920, "boolean tree counts differ")
+    let domain = peer.jsonObject()
+    peer.put(domain, "trees", peer.jsonInteger(trees.length))
+    peer.put(domain, "global_values", peer.jsonIntegers([0, 1]))
+    let bindings = peer.jsonObject()
+    peer.put(bindings, "0", peer.jsonText("local F=false"))
+    peer.put(bindings, "1", peer.jsonText("literal false"))
+    peer.put(domain, "false_bindings", bindings)
+    peer.put(domain, "leaves", peer.jsonTexts(["false", "true", "0==glob"]))
+    peer.put(domain, "chunk_size", peer.jsonInteger(192))
+    peer.control(c, "boolean_tree_domain", domain)
+    let offset = 0
+    while offset < trees.length {
+        let end = min(offset + 192, trees.length)
+        let source = ["function visit(value: Boolean, position: Integer): Boolean { print(position); return value }"]
+        let expected: List<Text> = []
+        for glob in [0, 1] {
+            peer.extend(source, ["function run" + Text(glob) + "(glob: Integer) {", "let F = false"])
+            for index in offset..end {
+                let tree = trees[index]
+                let expression = renderTree(forest, tree, glob, false, [0])
+                let probe = renderTree(forest, tree, glob, true, [0])
+                peer.extend(source, ["let branch = false", "if " + expression + " { branch = true }", "print(branch)", "print(" + expression + ")", "print(" + probe + ")"])
+                let trace: List<Integer> = []
+                let word = peer.boolean(treeOracle(forest, tree, glob, [0], trace))
+                peer.extend(expected, [word, word])
+                peer.extend(expected, peer.texts(trace))
+                expected.add(word)
+            }
+            source.add("}")
+        }
+        peer.extend(source, ["run0(0)", "run1(1)"])
+        peer.executes(c, peer.lines(source), peer.lines(expected))
+        offset += 192
+    }
+}
+function test_runner_cwd_environment_and_output_isolation(c: peer.Case) {
+    let beforeDirectory = currentDirectory()
+    let beforeEnvironment = system.environment()
+    let original = peer.path(c, "original.txt")
+    let base = peer.executesWith(c, "writeTextFile(argument(0),argument(1))\nprint(readTextFile(argument(0)))\n", "baseline\n", 0, "", [original, "baseline"])
+    for optimization in c.variants {
+        let directories = [peer.path(c, suffix(optimization) + "-left"), peer.path(c, suffix(optimization) + "-right")]
+        for directory in directories { peer.expect(c, files.makeDirectory(directory) == 0, "cannot create " + directory) }
+        for index in 0..2 {
+            let directory = directories[index]
+            let payload = optimization + "-" + Text(index) + "-é"
+            let sibling = directories[1 - index] + "/result.txt"
+            let siblingExisted = files.pathSize(sibling) >= 0
+            let siblingBefore = Bytes()
+            if siblingExisted { siblingBefore = readBytesFile(sibling) }
+            let environment = peer.withEnvironment(c.environment, "MINYAR_PEER_ISOLATION", payload)
+            let result = peer.launch(c, [peer.executable(base, optimization), "result.txt", payload], "isolated-execute", c.runTimeout, environment, directory, "")
+            peer.observe(c, result, 0, payload + "\n", "", "isolated execution " + payload)
+            peer.expect(c, files.pathSize(directory + "/result.txt") >= 0, payload + " did not write its own result")
+            peer.expect(c, peer.bytesEqual(readBytesFile(directory + "/result.txt"), Bytes(payload)), payload + " result bytes differ")
+            peer.expect(c, (files.pathSize(sibling) >= 0) == siblingExisted, payload + " changed its sibling's presence")
+            if siblingExisted { peer.expect(c, peer.bytesEqual(readBytesFile(sibling), siblingBefore), payload + " changed its sibling's bytes") }
+            peer.expect(c, peer.bytesEqual(readBytesFile(original), Bytes("baseline")), payload + " changed the original output")
+            peer.equal(c, currentDirectory(), beforeDirectory, "runner working directory")
+            peer.expect(c, sameTexts(system.environment(), beforeEnvironment), "runner environment changed")
+        }
+    }
+    let probe = peer.launch(c, ["/bin/sh", "-c", "printf '%s\\n' \"$MINYAR_PEER_ISOLATION\"; pwd -P"], "isolated-environment-probe", c.runTimeout, ["MINYAR_PEER_ISOLATION=fresh"], c.directory, "")
+    peer.expect(c, probe.status == 0, probe.errorOutput)
+    peer.equal(c, probe.output, "fresh\n" + c.directory + "\n", "isolated environment probe")
+    peer.expect(c, sameTexts(system.environment(), beforeEnvironment), "runner environment changed")
+}
+function test_ascii_and_empty_scalar_sequence_assembly(c: peer.Case) {
+    let values = ["hello World", "", peer.codepoints([27721, 23383, 47, 28450, 23383]),
+        peer.codepoints([0, 127, 128, 2047, 2048, 65535, 65536, 1114111]),
+        peer.codepoints([26085, 26412, 35486, 97, 45, 52, 0, 233, 243]),
+        peer.codepoints([0x23cb7, 0x2070e, 0x20c53, 0x2107b, 0x20d7c, 97, 98, 0x20ea2]),
+        peer.codepoints([0x28cca, 0x29d98, 0x269fa, 0x28cd2, 0x2512b, 0x244d3, 0x10ffff]),
+        peer.codepoints([0, 97, 98, 99, 1])]
+    for value in values {
+        let scalars = peer.scalars(value)
+        let source = ["let value = " + peer.literal(value), "let parts: List<Text> = []",
+            "print(value.length)", "print(value.byteLength)", "let i = 0",
+            "while i < value.length { print(value[i]); parts.add(Text(value[i])); i = i + 1 }",
+            "print(i)", "print(joinText(parts) == value)", "print(joinText(parts))"]
+        let expected = [Text(scalars.length), Text(Bytes(value).length)]
+        peer.extend(expected, scalars)
+        peer.extend(expected, [Text(scalars.length), "true", value])
+        peer.executes(c, peer.lines(source), peer.lines(expected))
+    }
+}
+function test_signed_integer_corpus_decimal_text_conversion(c: peer.Case) {
+    let source = ["function render(value: Integer): Text { return Text(value) }"]
+    let expected: List<Text> = []
+    for value in integerValues(c) {
+        let text = Text(value)
+        peer.extend(source, ["let text = render(" + text + ")", "let held = [text]",
+            "text = \"replaced\"", "print(held[0])",
+            "print(held[0].length)", "print(held[0].byteLength)",
+            "print(\"prefix:\" + held[0])"])
+        peer.extend(expected, [text, Text(text.length), Text(text.length), "prefix:" + text])
+    }
+    peer.executes(c, peer.lines(source), peer.lines(expected))
+}
+function productStepsFit(a: Integer, b: Integer, offset: Integer): Boolean {
+    if !errors.integerOk(errors.checkedMultiply(a, b)) { return false }
+    let shiftedA = errors.checkedAdd(a, offset)
+    let shiftedB = errors.checkedAdd(b, offset)
+    if !errors.integerOk(shiftedA) || !errors.integerOk(shiftedB) { return false }
+    let x = errors.integerValue(shiftedA)
+    let y = errors.integerValue(shiftedB)
+    let product = errors.checkedMultiply(x, y)
+    let left = errors.checkedMultiply(x, 100)
+    let right = errors.checkedMultiply(y, 100)
+    if !errors.integerOk(product) || !errors.integerOk(left) || !errors.integerOk(right) { return false }
+    let first = errors.checkedSubtract(errors.integerValue(product), errors.integerValue(left))
+    if offset < 0 { first = errors.checkedAdd(errors.integerValue(product), errors.integerValue(left)) }
+    if !errors.integerOk(first) { return false }
+    let second = errors.checkedSubtract(errors.integerValue(first), errors.integerValue(right))
+    if offset < 0 { second = errors.checkedAdd(errors.integerValue(first), errors.integerValue(right)) }
+    if !errors.integerOk(second) { return false }
+    return errors.integerOk(errors.checkedAdd(errors.integerValue(second), 10000))
+}
+function test_integer_product_expansions_only_when_every_intermediate_fits(c: peer.Case) {
+    let values = integerValues(c)
+    let offsets = [-100, 100]
+    let counts = [4843, 4829]
+    for which in 0..2 {
+        let offset = offsets[which]
+        let lower: List<Integer> = []
+        let upper: List<Integer> = []
+        let expected: List<Text> = []
+        for a in values {
+            let positions: List<Integer> = []
+            for j in 0..values.length {
+                let b = values[j]
+                if productStepsFit(a, b, offset) {
+                    let x = a + offset
+                    let y = b + offset
+                    let product = x * y
+                    let left = x * 100
+                    let right = y * 100
+                    let first = 0
+                    if offset < 0 { first = product + left } else { first = product - left }
+                    let second = 0
+                    if offset < 0 { second = first + right } else { second = first - right }
+                    let result = second + 10000
+                    peer.equalInteger(c, result, a * b, "product expansion of " + Text(a) + " and " + Text(b))
+                    positions.add(j)
+                    expected.add(Text(a * b))
+                    expected.add(Text(a * b))
+                }
+            }
+            if positions.length > 0 {
+                contiguousRange(c, positions, "product expansion " + Text(a))
+                lower.add(positions[0])
+                upper.add(positions[positions.length - 1] + 1)
+            } else {
+                lower.add(0)
+                upper.add(0)
+            }
+        }
+        peer.equalInteger(c, expected.length / 2, counts[which], "product expansion count for offset " + Text(offset))
+        let sign = "-"
+        if offset < 0 { sign = "+" }
+        let source = ["let values = [" + peer.joined(peer.texts(values), ",") + "]",
+            "let low = [" + peer.joined(peer.texts(lower), ",") + "]",
+            "let high = [" + peer.joined(peer.texts(upper), ",") + "]",
+            "let i = 0", "while i < values.length {", "let a = values[i]",
+            "let j = low[i]", "while j < high[i] {", "let b = values[j]",
+            "let x = a + (" + Text(offset) + ")", "let y = b + (" + Text(offset) + ")",
+            "print(x*y " + sign + " x*100 " + sign + " y*100 + 10000)",
+            "print(a*b)", "j = j + 1", "}", "i = i + 1", "}"]
+        peer.executes(c, peer.lines(source), peer.lines(expected))
+    }
+}
+function test_extreme_integer_relations_all_operand_placements(c: peer.Case) {
+    let values = [peer.MINIMUM, peer.MINIMUM + 1, peer.MAXIMUM - 1, peer.MAXIMUM]
+    for symbol in ["<", "<=", ">", ">="] {
+        let source = ["function compare(a: Integer,b: Integer): Boolean { return a " + symbol + " b }"]
+        let expected: List<Text> = []
+        for a in values {
+            for b in values {
+                peer.extend(source, ["let a = " + Text(a), "let b = " + Text(b)])
+                let lefts = [Text(a), "a", Text(a), "a"]
+                let rights = [Text(b), Text(b), "b", "b"]
+                for placement in 0..4 { source.add("print((" + lefts[placement] + ") " + symbol + " (" + rights[placement] + "))") }
+                source.add("print(compare(a,b))")
+                for repetition in 0..5 { expected.add(operatorValue(symbol, a, b)) }
+            }
+        }
+        peer.executes(c, peer.lines(source), peer.lines(expected))
+    }
+}
+function test_file_write_and_buffered_close_failures(c: peer.Case) {
+    let probe = c.suite.root + "/tests/peer-pyswru-write-failures.c"
+    runtimeInputs(c, [probe, c.suite.root + "/runtime/minyar_runtime.c"])
+    let runtime = peer.path(c, "write-failure-runtime.o")
+    let build = peer.run(c, clangCommand(clangWith(c, ["-std=c11", "-O2"], ["-DMINYAR_SYSTEM_HEAP=1", "-c", probe, "-o", runtime])), "compile-write-failure-runtime", 60)
+    requireSuccess(c, build, "write-failure runtime build")
+    let compiled = peer.compile(c, "let text = readTextFile(argument(0))\nwriteTextFile(argument(1),text)\nprint(\"complete\")\n")
+    requireSuccess(c, compiled.result, "compilation")
+    let payloadFile = peer.path(c, "payload.txt")
+    let output = peer.path(c, "written.txt")
+    let error = "Minyar stopped: a requested text file could not be written.\n"
+    for optimization in c.variants {
+        let program = peer.executable(compiled.base, optimization)
+        let link = peer.run(c, clangCommand(clangWith(c, [optimization], ["-Wno-override-module", compiled.llvm, runtime, "-o", program])), "link-write-failure", 30)
+        requireSuccess(c, link, "write-failure link at " + optimization)
+        for payload in [Bytes("abcd"), Bytes(repeatText("abcd", 50000))] {
+            writeBytesFile(payloadFile, payload)
+            for failure in ["", "write", "write-zero", "close"] {
+                if files.pathSize(output) >= 0 { peer.expect(c, files.remove(output) == 0, "cannot clear " + output) }
+                let environment = peer.withEnvironment(c.environment, "MINYAR_PEER_WRITE_FAILURE", failure)
+                let result = peer.launch(c, [program, payloadFile, output], "execute-write-failure", c.runTimeout, environment, "", "")
+                let label = "failure '" + failure + "' with " + Text(payload.length) + " bytes at " + optimization
+                if failure == "" { peer.observe(c, result, 0, "complete\n", "", label) } else { peer.observe(c, result, 1, "", error, label) }
+                let written = payload
+                if failure == "write-zero" { written = Bytes() } else if failure == "write" { written = payload.slice(0, payload.length / 2) }
+                peer.expect(c, files.pathSize(output) >= 0, label + ": output file is missing")
+                peer.expect(c, peer.bytesEqual(readBytesFile(output), written), label + ": written bytes differ")
+                peer.expect(c, peer.bytesEqual(readBytesFile(payloadFile), payload), label + ": payload file changed")
+            }
+        }
+    }
+}
+record AllocationCase { name: Text; source: Text; expected: Text }
+record Report { raw: Text; scalars: json.Value; events: List<Integer>; peaks: List<Integer> }
+record Execution { result: test.Result; report: Report }
+record Campaign { workspace: Text; environment: List<Text>; configurations: List<Text> }
+function integerIs(value: json.Value, expected: Integer): Boolean { return value.kind == json.NUMBER && Integer(value.text) == expected }
+function reportIntegers(raw: Bytes, begin: Integer, end: Integer): List<Integer> {
+    let values: List<Integer> = []
+    let index = begin
+    while index < end {
+        if raw[index] >= 48 && raw[index] <= 57 {
+            let value = 0
+            while index < end && raw[index] >= 48 && raw[index] <= 57 {
+                value = value * 10 + (raw[index] - 48)
+                index += 1
+            }
+            values.add(value)
+        } else { index += 1 }
+    }
+    return values
+}
+function parseReport(c: peer.Case, text: Text, label: Text): Report {
+    let raw = Bytes(text)
+    let events = peer.find(text, ",\"events\":[", 0)
+    let peaks = peer.find(text, "],\"peaks\":[", 0)
+    peer.expect(c, events > 0 && peaks > events, "invalid allocation report " + label + ": " + text)
+    let scalars = json.parse(Text(raw.slice(0, events)) + "}")
+    peer.expect(c, scalars.kind == json.OBJECT, "invalid allocation report " + label + ": " + text)
+    let eventValues = reportIntegers(raw, events + 11, peaks)
+    let peakValues = reportIntegers(raw, peaks + 11, raw.length)
+    peer.expect(c, eventValues.length % 3 == 0 && peakValues.length % 4 == 0, "malformed allocation trace in " + label)
+    return Report { raw: text; scalars: scalars; events: eventValues; peaks: peakValues }
+}
+function prefixEqual(values: List<Integer>, reference: List<Integer>, count: Integer): Boolean {
+    if values.length != count || reference.length < count { return false }
+    for index in 0..count { if values[index] != reference[index] { return false } }
+    return true
+}
+function encodeEvents(events: List<Integer>): Text {
+    let parts: List<Text> = ["["]
+    let index = 0
+    while index < events.length {
+        if index > 0 { parts.add(", ") }
+        parts.add("[" + Text(events[index]) + ", " + Text(events[index + 1]) + ", " + Text(events[index + 2]) + "]")
+        index += 3
+    }
+    parts.add("]")
+    return joinText(parts)
+}
+function faultProblem(status: Integer, errorOutput: Text, report: json.Value): Text {
+    if !integerIs(json.member(report, "fired"), 1) { return "Requested allocation failpoint did not fire exactly once" }
+    if status != 1 || errorOutput != OOM || !integerIs(json.member(report, "fatal_exit"), 1) { return "Uncontrolled OOM: " + Text(status) + ", " + errorOutput + ", " + peer.encode(report) }
+    return ""
+}
+function requireFault(c: peer.Case, execution: Execution, label: Text) {
+    let problem = faultProblem(execution.result.status, execution.result.errorOutput, execution.report.scalars)
+    peer.expect(c, problem == "", label + ": " + problem)
+}
+function campaignRun(c: peer.Case, campaign: Campaign, command: List<Text>, environment: List<Text>): test.Result {
+    if peer.hasText(command, "-o") && !peer.hasText(command, "-c") {
+        for flag in command {
+            if flag == "-O0" || flag == "-O1" || flag == "-O2" || flag == "-O3" || flag == "-Os" {
+                if !peer.hasText(campaign.configurations, suffix(flag)) { campaign.configurations.add(suffix(flag)) }
+            }
+        }
+    }
+    return peer.launch(c, command, "command", 60, environment, "", "")
+}
+function campaignChecked(c: peer.Case, campaign: Campaign, command: List<Text>) {
+    let result = campaignRun(c, campaign, command, c.environment)
+    peer.expect(c, result.status == 0, "allocation campaign command failed with status " + Text(result.status) + ": " + peer.joined(command, " ") + "\n" + result.output + result.errorOutput)
+}
+function campaignExecute(c: peer.Case, campaign: Campaign, executable: Text, label: Text, environment: List<Text>): Execution {
+    let reportPath = campaign.workspace + "/" + label + ".json"
+    if files.pathSize(reportPath) >= 0 { peer.expect(c, files.remove(reportPath) == 0, "cannot clear " + reportPath) }
+    let result = campaignRun(c, campaign, [executable], peer.withEnvironment(environment, "MINYAR_ALLOCATION_REPORT", reportPath))
+    peer.expect(c, files.pathSize(reportPath) >= 0, "Missing allocation instrumentation: " + label + ": " + result.errorOutput)
+    return Execution { result: result; report: parseReport(c, readTextFile(reportPath), label) }
+}
+function byteSweep(c: peer.Case, campaign: Campaign, executable: Text, label: Text, baseline: Report, expected: Text): json.Value {
+    let events = baseline.events
+    let live = 0
+    let high = 0
+    let allocations = 0
+    let resizes = 0
+    let peaks: List<Integer> = []
+    let required: List<Integer> = []
+    let peakEvents: List<Integer> = []
+    let peakAllocations: List<Integer> = []
+    let peakResizes: List<Integer> = []
+    let count = events.length / 3
+    for index in 0..count {
+        let kind = events[3 * index]
+        let size = events[3 * index + 1]
+        let previous = events[3 * index + 2]
+        peer.expect(c, previous == live && size >= 0, label + " trace event " + Text(index) + " records live " + Text(previous) + ", reconstructed " + Text(live))
+        if kind == 1 || kind == 2 {
+            if kind == 1 { allocations += 1 } else { resizes += 1 }
+            live += size
+            if live > high {
+                high = live
+                required.add(high)
+                peakEvents.add(index + 1)
+                peakAllocations.add(allocations)
+                peakResizes.add(resizes)
+                for value in [high, index + 1, allocations, resizes] { peaks.add(value) }
+            }
+        } else {
+            peer.expect(c, kind == 3 && size <= live, label + " trace event " + Text(index) + " is not a valid release")
+            live -= size
+        }
+    }
+    peer.expect(c, peaks.length > 0 && prefixEqual(peaks, baseline.peaks, baseline.peaks.length), label + " recorded peaks differ from the reconstructed trace")
+    peer.expect(c, live == peer.field(baseline.scalars, "live_bytes") && high == peer.field(baseline.scalars, "peak_required") && allocations == peer.field(baseline.scalars, "allocations") && resizes == peer.field(baseline.scalars, "resizes"), label + " trace totals differ from the baseline report")
+    let candidates = [0, high, high + 1]
+    for value in required { candidates.add(value - 1) }
+    let budgets: List<Integer> = []
+    for value in peer.sortIntegers(candidates) { if budgets.length == 0 || budgets[budgets.length - 1] != value { budgets.add(value) } }
+    let failures = 0
+    let successes = 0
+    for budget in budgets {
+        let name = label + " byte budget " + Text(budget)
+        let execution = campaignExecute(c, campaign, executable, label + "-bytes-" + Text(budget), peer.withEnvironment(campaign.environment, "MINYAR_FAIL_BYTES", Text(budget)))
+        let report = execution.report
+        let first = -1
+        for index in 0..required.length { if first < 0 && required[index] > budget { first = index } }
+        if first >= 0 {
+            requireFault(c, execution, name)
+            peer.expect(c, peer.starts(expected, execution.result.output), name + " stdout is not a prefix of the expected output")
+            peer.expect(c, integerIs(json.member(report.scalars, "failed_required"), required[first]), name + " failed_required differs")
+            peer.expect(c, integerIs(json.member(report.scalars, "allocations"), peakAllocations[first]) && integerIs(json.member(report.scalars, "resizes"), peakResizes[first]), name + " counters differ")
+            peer.expect(c, prefixEqual(report.events, baseline.events, 3 * peakEvents[first]), "Byte-budget run diverged from baseline trace prefix: " + name)
+            peer.expect(c, integerIs(json.member(report.scalars, "live_bytes"), report.events[report.events.length - 1]), name + " live_bytes differs from its last event")
+            peer.expect(c, integerIs(json.member(report.scalars, "peak_required"), required[first]), name + " peak_required differs")
+            peer.expect(c, prefixEqual(report.peaks, peaks, 4 * (first + 1)), name + " peaks differ")
+            let moved = 0
+            for index in 0..(report.events.length / 3 - 1) { if report.events[3 * index] == 2 { moved += 1 } }
+            peer.expect(c, integerIs(json.member(report.scalars, "moved"), moved), name + " moved count differs")
+            failures += 1
+        } else {
+            peer.observe(c, execution.result, 0, expected, "", name)
+            peer.expect(c, report.raw == baseline.raw, "Byte-budget success changed allocation/free schedule: " + name)
+            successes += 1
+        }
+    }
+    let result = peer.jsonObject()
+    peer.put(result, "byte_budget_failures", peer.jsonInteger(failures))
+    peer.put(result, "byte_budget_successes", peer.jsonInteger(successes))
+    peer.put(result, "byte_boundary_classes", peer.jsonInteger(peaks.length / 4))
+    peer.put(result, "byte_budgets", peer.jsonIntegers(budgets))
+    peer.put(result, "peak_payload_bytes", peer.jsonInteger(high))
+    peer.put(result, "trace_events", peer.jsonInteger(count))
+    peer.put(result, "trace_sha256", peer.jsonText(sha256.hex(sha256.digest(Bytes(encodeEvents(baseline.events))))))
+    return result
+}
+function allocationCampaign(c: peer.Case, cases: List<AllocationCase>, mode: Text, output: Text) {
+    let root = c.suite.root
+    let faultRuntime = root + "/tests/allocation-fault-runtime.c"
+    runtimeInputs(c, [faultRuntime, root + "/runtime/minyar_runtime.c"])
+    let workspace = peer.path(c, "allocation-faults")
+    peer.expect(c, files.makeDirectory(workspace) == 0, "cannot create " + workspace)
+    let flags: List<Text> = []
+    if mode == "sanitize" { flags = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"] }
+    let environment = c.environment
+    for name in ["MINYAR_FAIL_ALLOCATION", "MINYAR_FAIL_RESIZE", "MINYAR_ALLOCATION_REPORT", "MINYAR_FAULT_CORRUPT_SUFFIX", "MINYAR_FAULT_CORRUPT_BYTE", "MINYAR_FAULT_CORRUPT_ARENA", "MINYAR_FAIL_BYTES"] {
+        environment = peer.withoutEnvironment(environment, name)
+    }
+    environment = peer.withEnvironment(environment, "ASAN_OPTIONS", "detect_leaks=0")
+    environment = peer.withEnvironment(environment, "UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1")
+    let campaign = Campaign { workspace: workspace; environment: environment; configurations: [] }
+    let probe = workspace + "/probe-" + mode
+    let probeCommand = [c.compiler.clang, "-std=c11", "-O1", "-g"]
+    peer.extend(probeCommand, flags)
+    peer.extend(probeCommand, ["-DMINYAR_FAULT_SELF_TEST", faultRuntime, "-o", probe])
+    campaignChecked(c, campaign, clangCommand(probeCommand))
+    let labels = ["normal", "allocate", "calloc", "resize", "shrink", "bytes-zero", "bytes-grow", "bytes-before-peak", "bytes-peak", "bytes-above"]
+    let variables = ["", "MINYAR_FAIL_ALLOCATION", "MINYAR_FAIL_ALLOCATION", "MINYAR_FAIL_RESIZE", "MINYAR_FAIL_RESIZE", "MINYAR_FAIL_BYTES", "MINYAR_FAIL_BYTES", "MINYAR_FAIL_BYTES", "MINYAR_FAIL_BYTES", "MINYAR_FAIL_BYTES"]
+    let settings = ["", "1", "2", "1", "2", "0", "16", "47", "48", "49"]
+    let statuses = [0, 91, 93, 92, 96, 91, 92, 92, 0, 0]
+    let fired = [0, 1, 1, 1, 1, 1, 1, 1, 0, 0]
+    let moved = [2, 0, 2, 0, 1, 0, 0, 0, 2, 2]
+    let probeEvents = [1, 16, 0, 2, 32, 16, 3, 16, 48, 2, 8, 32, 3, 32, 40, 3, 8, 8, 1, 16, 0, 3, 16, 16]
+    let probePeaks = [16, 1, 1, 0, 48, 2, 1, 1]
+    for index in 0..labels.length {
+        let probeEnvironment = environment
+        if variables[index] != "" { probeEnvironment = peer.withEnvironment(environment, variables[index], settings[index]) }
+        let execution = campaignExecute(c, campaign, probe, "probe-" + mode + "-" + labels[index], probeEnvironment)
+        let report = execution.report
+        let name = "probe " + labels[index]
+        peer.expect(c, execution.result.status == statuses[index] && execution.result.errorOutput == "", name + " status " + Text(execution.result.status) + "\n" + execution.result.errorOutput)
+        peer.expect(c, integerIs(json.member(report.scalars, "fired"), fired[index]) && integerIs(json.member(report.scalars, "moved"), moved[index]), name + " report " + report.raw)
+        if labels[index] == "normal" || labels[index] == "bytes-peak" || labels[index] == "bytes-above" {
+            peer.expect(c, prefixEqual(report.events, probeEvents, probeEvents.length), name + " events " + report.raw)
+            peer.expect(c, integerIs(json.member(report.scalars, "allocations"), 2) && integerIs(json.member(report.scalars, "resizes"), 2) && integerIs(json.member(report.scalars, "live_bytes"), 0) && integerIs(json.member(report.scalars, "peak_required"), 48), name + " totals " + report.raw)
+            peer.expect(c, prefixEqual(report.peaks, probePeaks, probePeaks.length), name + " peaks " + report.raw)
+        }
+        if labels[index] == "bytes-before-peak" { peer.expect(c, integerIs(json.member(report.scalars, "failed_required"), 48), name + " failed_required " + report.raw) }
+    }
+    for operation in ["free", "resize"] {
+        for byte in [0, 15] {
+            let corruptEnvironment = environment
+            if byte != 0 { corruptEnvironment = peer.withEnvironment(corruptEnvironment, "MINYAR_FAULT_CORRUPT_BYTE", "15") }
+            corruptEnvironment = peer.withEnvironment(corruptEnvironment, "MINYAR_FAULT_CORRUPT_SUFFIX", operation)
+            let execution = campaignExecute(c, campaign, probe, "probe-" + mode + "-corrupt-" + operation + "-" + Text(byte), corruptEnvironment)
+            let name = "probe corrupt " + operation + " " + Text(byte)
+            peer.observe(c, execution.result, 94, "", "allocation suffix corrupted\n", name)
+            peer.expect(c, integerIs(json.member(execution.report.scalars, "fatal_exit"), 1) && integerIs(json.member(execution.report.scalars, "fired"), 0), name + " report " + execution.report.raw)
+        }
+    }
+    let ordinals = ["0", "-1", " -1", "+1", "1junk", "18446744073709551616"]
+    for index in 0..ordinals.length {
+        let execution = campaignExecute(c, campaign, probe, "probe-" + mode + "-invalid-ordinal-" + Text(index), peer.withEnvironment(environment, "MINYAR_FAIL_ALLOCATION", ordinals[index]))
+        peer.observe(c, execution.result, 90, "", "invalid allocation fault ordinal\n", "probe invalid ordinal '" + ordinals[index] + "'")
+    }
+    peer.expect(c, faultProblem(1, OOM, json.parse("{\"fired\":0}")) != "", "Fault oracle accepted an ineffective or swallowed failpoint")
+    peer.expect(c, faultProblem(0, "", json.parse("{\"fired\":1,\"fatal_exit\":0}")) != "", "Fault oracle accepted an ineffective or swallowed failpoint")
+    let rows: List<json.Value> = []
+    for budget in [1, 32] {
+        let runtime = workspace + "/runtime-" + mode + "-system-" + Text(budget) + ".o"
+        let runtimeCommand = [c.compiler.clang, "-std=c11", "-O1", "-g"]
+        peer.extend(runtimeCommand, flags)
+        peer.extend(runtimeCommand, ["-DMINYAR_RC_POLL_BUDGET=" + Text(budget), "-c", faultRuntime, "-o", runtime])
+        campaignChecked(c, campaign, clangCommand(runtimeCommand))
+        for item in cases {
+            let label = item.name + "-" + mode + "-k" + Text(budget)
+            let path = workspace + "/" + label + ".min"
+            let llvm = workspace + "/" + label + ".ll"
+            let executable = workspace + "/" + label
+            writeTextFile(path, item.source)
+            campaignChecked(c, campaign, [c.compiler.executable, path, llvm])
+            if test.addressEnabled(flags) { writeTextFile(llvm, test.instrument(readTextFile(llvm))) }
+            let linkCommand = [c.compiler.clang, "-O2", "-g"]
+            peer.extend(linkCommand, flags)
+            peer.extend(linkCommand, ["-Wno-override-module", llvm, runtime, "-o", executable])
+            campaignChecked(c, campaign, clangCommand(linkCommand))
+            let baseline = campaignExecute(c, campaign, executable, label + "-baseline", environment)
+            let report = baseline.report.scalars
+            peer.observe(c, baseline.result, 0, item.expected, "", label + " baseline")
+            peer.expect(c, integerIs(json.member(report, "fired"), 0) && peer.field(report, "allocations") > 0 && integerIs(json.member(report, "fatal_exit"), 0), label + " baseline report " + peer.encode(json.member(report, "fired")))
+            peer.expect(c, peer.field(report, "resizes") == peer.field(report, "moved"), label + " baseline resizes and moves differ")
+            if item.name == "list" || item.name == "text" { peer.expect(c, peer.field(report, "moved") > 0, "Moving-resize stress did not execute") }
+            let counters = ["allocations", "resizes"]
+            let failpoints = ["MINYAR_FAIL_ALLOCATION", "MINYAR_FAIL_RESIZE"]
+            for counter in 0..2 {
+                let count = peer.field(report, counters[counter])
+                for ordinal in 1..(count + 1) {
+                    let execution = campaignExecute(c, campaign, executable, label + "-" + counters[counter] + "-" + Text(ordinal), peer.withEnvironment(environment, failpoints[counter], Text(ordinal)))
+                    requireFault(c, execution, label + " " + counters[counter] + " " + Text(ordinal))
+                    peer.expect(c, peer.starts(item.expected, execution.result.output), label + " " + counters[counter] + " " + Text(ordinal) + " stdout is not a prefix of the expected output")
+                }
+                let beyond = campaignExecute(c, campaign, executable, label + "-" + counters[counter] + "-beyond", peer.withEnvironment(environment, failpoints[counter], Text(count + 1)))
+                peer.observe(c, beyond.result, 0, item.expected, "", label + " " + counters[counter] + " beyond the baseline")
+                peer.expect(c, beyond.report.raw == baseline.report.raw, "Nondeterministic allocation path: " + label + " " + counters[counter])
+            }
+            let sweep = byteSweep(c, campaign, executable, label, baseline.report, item.expected)
+            let row = peer.jsonObject()
+            peer.put(row, "case", peer.jsonText(item.name))
+            peer.put(row, "mode", peer.jsonText(mode))
+            peer.put(row, "budget", peer.jsonInteger(budget))
+            peer.put(row, "allocation_failures", json.member(report, "allocations"))
+            peer.put(row, "resize_failures", json.member(report, "resizes"))
+            peer.put(row, "forced_moves", json.member(report, "moved"))
+            for key in ["frame_entries", "frame_leaves", "peak_frames", "released_objects", "storage_moves"] {
+                peer.expect(c, peer.has(report, key), label + " baseline lacks " + key)
+                peer.put(row, key, json.member(report, key))
+            }
+            for index in 0..sweep.keys.length { peer.put(row, sweep.keys[index], sweep.items[index]) }
+            rows.add(row)
+            print(label + ": " + peer.encode(row))
+        }
+    }
+    let summary = peer.jsonObject()
+    peer.put(summary, "status", peer.jsonText("passed"))
+    peer.put(summary, "cases", peer.jsonArray(rows))
+    peer.put(summary, "configurations", peer.jsonTexts(peer.sortTexts(campaign.configurations)))
+    writeTextFile(output, peer.encode(summary) + "\n")
+}
+function allocationMode(c: peer.Case): Text {
+    if c.compiler.flags.length > 0 { return "sanitize" }
+    return "native"
+}
+function test_reviewed_allocator_workloads(c: peer.Case) {
+    peer.campaign(c, ["O2"])
+    let fixture = c.suite.root + "/tests/peer-pyswru-allocation-cases.json"
+    peer.input(c, fixture)
+    let data = peer.load(fixture)
+    let inputPath = peer.path(c, "allocation-input.txt")
+    let inputBytes = Bytes(peer.textField(data, "input"))
+    writeBytesFile(inputPath, inputBytes)
+    let table = json.member(data, "cases")
+    let cases: List<AllocationCase> = []
+    for index in 0..table.keys.length {
+        let row = table.items[index]
+        cases.add(AllocationCase { name: table.keys[index]; source: peer.replace(peer.textField(row, "source"), "__INPUT_PATH__", peer.literal(inputPath)); expected: peer.textField(row, "stdout") })
+    }
+    let output = peer.path(c, "allocation-results.json")
+    let mode = allocationMode(c)
+    allocationCampaign(c, cases, mode, output)
+    peer.expect(c, peer.bytesEqual(readBytesFile(inputPath), inputBytes), "allocation input file changed")
+    let report = peer.load(output)
+    peer.equal(c, peer.textField(report, "status"), "passed", "allocation campaign status")
+    let configurations: List<Text> = []
+    for item in json.member(report, "configurations").items { configurations.add(item.text) }
+    peer.expect(c, peer.hasText(configurations, "O2"), "allocation campaign configurations lack O2: " + peer.joined(configurations, ", "))
+    peer.control(c, "campaign_configurations", json.member(report, "configurations"))
+    let rows = json.member(report, "cases").items
+    peer.equalInteger(c, rows.length, 12, "allocation campaign rows")
+    for row in rows {
+        let name = peer.textField(row, "case")
+        peer.equal(c, peer.textField(row, "mode"), mode, name + " mode")
+        peer.expect(c, peer.field(row, "allocation_failures") > 0, name + " has no allocation failures")
+        peer.expect(c, peer.field(row, "byte_budget_failures") > 0, name + " has no byte budget failures")
+        peer.equalInteger(c, peer.field(row, "byte_budget_successes"), 2, name + " byte budget successes")
+        if name == "peer-record-growth" || name == "peer-join100" || name == "peer-join300" { peer.expect(c, peer.field(row, "storage_moves") > 0, name + " has no storage moves") }
+    }
+    peer.control(c, "peer_allocation_results", report)
+}
+function test_small_runtime_capacity_pairwise_configurations(c: peer.Case) {
+    peer.campaign(c, ["O2"])
+    let probe = c.suite.root + "/tests/integer-text-cache.c"
+    runtimeInputs(c, [probe, c.suite.root + "/runtime/minyar_runtime.c"])
+    let heaps: List<Integer> = []
+    let caches: List<Integer> = []
+    let budgets: List<Integer> = []
+    for heap in [4096, 8 * 1024 * 1024] {
+        for cache in [0, 1] {
+            for budget in [1, 32] {
+                heaps.add(heap)
+                caches.add(cache)
+                budgets.add(budget)
+            }
+        }
+    }
+    heaps.add(8 * 1024 * 1024)
+    caches.add(32768)
+    budgets.add(32)
+    for profile in ["fixed", "lazy"] {
+        for index in 0..heaps.length {
+            let heap = Text(heaps[index])
+            let cache = Text(caches[index])
+            let budget = Text(budgets[index])
+            let label = profile + "-" + heap + "-" + cache + "-" + budget
+            let program = peer.path(c, label)
+            let after = ["-DMINYAR_BOUNDED_HEAP=1", "-DMINYAR_BOUNDED_HEAP_BYTES=" + heap, "-DMINYAR_INTEGER_TEXT_CACHE_LIMIT=" + cache, "-DEXPECTED_CACHE_LIMIT=" + cache, "-DMINYAR_RC_POLL_BUDGET=" + budget]
+            if profile == "lazy" { after.add("-DMINYAR_LAZY_HEAP=1") }
+            peer.extend(after, [probe, "-o", program])
+            let build = peer.run(c, clangCommand(clangWith(c, ["-std=c11", "-O2"], after)), "compile-capacity-probe", 60)
+            requireSuccess(c, build, label + " build")
+            peer.observe(c, peer.run(c, [program], "execute-capacity-probe", 30), 0, "cache limit " + cache + ": values, aliases and retained storage passed\n", "", label)
+        }
+    }
+    let program = peer.path(c, "system-defaults")
+    let build = peer.run(c, clangCommand(clangWith(c, ["-std=c11", "-O2"], ["-DMINYAR_SYSTEM_HEAP=1", "-DEXPECTED_CACHE_LIMIT=32768", probe, "-o", program])), "compile-default-probe", 60)
+    requireSuccess(c, build, "system default probe build")
+    peer.observe(c, peer.run(c, [program], "execute-default-probe", 30), 0, "cache limit 32768: values, aliases and retained storage passed\n", "", "system defaults")
+}
+function test_zero_divisors_literal_and_parameter_pairs(c: peer.Case) {
+    let numerators = [3, 0, -4, 1, 3]
+    let operators = ["/", "%", "/", "%", "%"]
+    for index in 0..numerators.length {
+        let numerator = Text(numerators[index])
+        let helper = "function calculate(a: Integer,b: Integer): Integer { return a " + operators[index] + " b }\n"
+        for expression in ["(" + numerator + ") " + operators[index] + " 0", "calculate(" + numerator + ",0)"] {
+            peer.executesStatus(c, helper + "print(" + expression + ")\n", "", 1, peer.ZERO)
+        }
+    }
+}
+function test_incompatible_compiler_and_runtime_fail_required_suite(c: peer.Case) {
+    peer.campaign(c, ["harness"])
+    let built = peer.compile(c, "print(0)\n")
+    requireSuccess(c, built.result, "compilation")
+    let fakeSource = peer.path(c, "wrong-compiler.c")
+    let fake = peer.path(c, "wrong-compiler")
+    writeTextFile(fakeSource, joinText(["#include <stdio.h>\nint main(int argc,char **argv) {\n",
+        "if (argc != 3) return 2;\n",
+        "FILE *in=fopen(" + peer.quote(built.llvm) + ",\"rb\");\n",
+        "FILE *out=fopen(argv[2],\"wb\");\n",
+        "if (!in || !out) return 3;\n",
+        "int c; while ((c=fgetc(in)) != EOF) { if (fputc(c,out)==EOF) return 4; }\n",
+        "if (ferror(in) || fclose(in) || fclose(out)) return 5;\n",
+        "return 0; }\n"]))
+    let fakeBuild = peer.run(c, clangCommand([c.compiler.clang, "-std=c11", fakeSource, "-o", fake]), "build-incompatible-compiler", 30)
+    requireSuccess(c, fakeBuild, "incompatible compiler build")
+    let copied = peer.path(c, "wrong-copy.ll")
+    peer.observe(c, peer.run(c, [fake, "ignored.min", copied], "verify-incompatible-compiler", c.runTimeout), 0, "", "", "incompatible compiler control")
+    peer.expect(c, files.pathSize(copied) >= 0 && peer.bytesEqual(readBytesFile(copied), readBytesFile(built.llvm)), "incompatible compiler did not copy the wrong IR")
+    let empty = peer.writeFile(c, "wrong-runtime.c", "int peer_wrong_runtime_abi_marker;\n")
+    let wrongRuntime = peer.path(c, "wrong-runtime.o")
+    let build = peer.run(c, clangCommand(clangWith(c, ["-c"], [empty, "-o", wrongRuntime])), "build-incompatible-runtime", 30)
+    requireSuccess(c, build, "incompatible runtime build")
+    let target = "PeerPythonSwiftRubyLua.test_iterative_fibonacci_uses_previous_pair"
+    let raw = Bytes(c.suite.source)
+    let program = c.suite.root + "/build/tooling/" + Text(raw.slice(0, raw.length - 4))
+    let kinds = ["compiler", "runtime"]
+    let compilers = [fake, c.compiler.executable]
+    let runtimes = [c.compiler.runtime, wrongRuntime]
+    for index in 0..2 {
+        let environment = peer.withEnvironment(peer.withEnvironment(c.environment, "MINYAR_TEST_COMPILER", compilers[index]), "MINYAR_TEST_RUNTIME", runtimes[index])
+        let result = peer.launch(c, [program, target, "-v"], "incompatible-required-suite", 60, environment, "", "")
+        let label = "incompatible " + kinds[index]
+        peer.expect(c, result.status == 1, label + " suite status " + Text(result.status) + "\n" + result.errorOutput)
+        peer.expect(c, peer.contains(result.output, "FAILED ("), label + " suite did not report FAILED\n" + result.output)
+        peer.expect(c, !peer.contains(result.output, "skipped") && !peer.contains(result.errorOutput, "skipped"), label + " suite skipped its case\n" + result.output + result.errorOutput)
+        if kinds[index] == "compiler" {
+            peer.expect(c, peer.contains(result.errorOutput, "Minyar stopped: " + target + ": "), label + " suite failure was not a harness assertion\n" + result.errorOutput)
+        } else {
+            let lowered = lowercase(result.errorOutput)
+            peer.expect(c, peer.contains(lowered, "undefined") || peer.contains(lowered, "unresolved"), label + " suite failure was not a link failure\n" + result.errorOutput)
+        }
+    }
+}
+function test_demorgan_signed_range_equivalence(c: peer.Case) {
+    let values = [peer.MINIMUM, peer.MINIMUM + 1, -1, 0, 1, peer.MAXIMUM - 1, peer.MAXIMUM]
+    let source = ["function direct(a: Integer, limit: Integer): Boolean { return 0 <= a && a <= limit }",
+        "function negated(a: Integer, limit: Integer): Boolean { return !(!(a >= 0) || !(a <= limit)) }"]
+    let expected: List<Text> = []
+    for a in values {
+        for limit in values {
+            let value = Text(a)
+            let bound = Text(limit)
+            peer.extend(source, ["print(0 <= (" + value + ") && (" + value + ") <= (" + bound + "))",
+                "print(!(!((" + value + ") >= 0) || !((" + value + ") <= (" + bound + "))))",
+                "print(direct(" + value + "," + bound + "))", "print(negated(" + value + "," + bound + "))"])
+            for repetition in 0..4 { expected.add(peer.boolean(0 <= a && a <= limit)) }
+        }
+    }
+    peer.executes(c, peer.lines(source), peer.lines(expected))
+}
+function test_multiline_operator_and_call_diagnostics_have_locations(c: peer.Case) {
+    let path = c.suite.root + "/tests/peer-pyswru-multiline-diagnostics.json"
+    peer.input(c, path)
+    for item in json.member(peer.load(path), "cases").items {
+        let compiled = peer.compile(c, peer.textField(item, "source"))
+        let expected = "Minyar stopped: line " + Text(peer.field(item, "line")) + ", column " + Text(peer.field(item, "column")) + ": " + peer.textField(item, "message") + "\n"
+        peer.observe(c, compiled.result, 1, "", expected, peer.textField(item, "id"))
+        peer.expect(c, files.pathSize(compiled.llvm) < 0, peer.textField(item, "id") + " left LLVM output behind")
+    }
+}
+function test_lua_comparison_results_and_ordinary_recursion_depths(c: peer.Case) {
+    let source = "let a = 10; let b = 1
+print(a < b == false && a > b == true)
+function deep(n: Integer, visits: List<Integer>) {
+    visits[0] = visits[0] + 1
+    if n > 0 { deep(n - 1, visits) }
+    print(n)
+}
+let visits = [0]; deep(10, visits); print(visits[0])
+visits[0] = 0; deep(180, visits); print(visits[0])
+"
+    let expected = "true\n" + peer.integers(peer.range(0, 11)) + "11\n"
+    expected += peer.integers(peer.range(0, 181)) + "181\n"
+    peer.executes(c, source, expected)
+}
+function test_empty_semicolons_sibling_scopes_and_typed_shadowing(c: peer.Case) {
+    let source = ";;print(\"start\");;
+if true { ;;; }; if true { ; let a = 3; print(a) };
+let i = 10
+if true { let i = 100; print(i) }
+if true { let i = 1000; print(i) }
+print(i)
+if i != 10 { let i = 20; print(i) } else { let i = 30; print(i) }
+print(i)
+let x = 1
+function shadow(a: Integer) {
+    let d0 = 0; let d1 = 1; let d2 = 2; let d3 = 3; let d4 = 4
+    let d5 = 5; let d6 = 6; let d7 = 7; let d8 = 8; let d9 = 9
+    let x = 3; let b = a; let c = a; let d = b
+    if d == b {
+        let x = \"q\"; print(x)
+        if true { let x = b; print(x) }
+        print(x)
+    } else { fail(\"wrong branch\") }
+    print(x); print(a); print(b); print(c); print(d)
+    print(d0); print(d1); print(d2); print(d3); print(d4)
+    print(d5); print(d6); print(d7); print(d8); print(d9)
+    let shadow = 10; print(shadow)
+}
+shadow(2); print(x);;
+"
+    peer.executes(c, source, "start\n3\n100\n1000\n10\n30\n10\nq\n2\nq\n3\n" + peer.repeat("2\n", 4) + peer.integers(peer.range(0, 10)) + "10\n1\n")
+}
+function test_boolean_false_values_and_dense_lengths_zero_through_forty(c: peer.Case) {
+    let source = "let booleans = [true, false, true, false]
+let expected = false; let index = 0
+while index < booleans.length { expected = !expected; print(booleans[index]); print(booleans[index] == expected); index = index + 1 }
+print(index)
+let size = 0
+while size <= 40 {
+    let values: List<Integer> = []; let value = 1
+    while value <= size { values.add(value); value = value + 1 }
+    print(values.length); index = 0
+    while index < values.length { print(values[index]); index = index + 1 }
+    size = size + 1
+}
+"
+    let expected = "true\ntrue\nfalse\ntrue\ntrue\ntrue\nfalse\ntrue\n4\n"
+    for size in 0..41 { expected += Text(size) + "\n" + peer.integers(peer.range(1, size + 1)) }
+    peer.executes(c, source, expected)
+}
+function test_three_hundred_eighty_character_concatenations(c: peer.Case) {
+    let fragment = peer.repeat("0123456789", 8)
+    let source = "let fragment = " + peer.literal(fragment) + "\nlet result = \"\"\nlet n = 1\n"
+    source += "while n <= 300 { result = result + fragment; let temporary = Text(n); n = n + 1 }
+print(result.length); print(result.byteLength); print(result)
+let prefix = result.slice(0, 10000); result = \"replaced\"
+print(prefix.length); print(prefix); print(fragment)
+"
+    let joined = peer.repeat(fragment, 300)
+    peer.executes(c, source, "24000\n24000\n" + joined + "\n10000\n" + joined.slice(0, 10000) + "\n" + fragment + "\n")
+}
+function test_five_thousand_transient_empty_lists(c: peer.Case) {
+    peer.executes(c, "function temporary() { let values: List<Integer> = []; if values.length != 0 { fail(\"nonempty fresh List\") } }
+let count = 0; while count < 5000 { temporary(); count = count + 1 }; print(count)
+", "5000\n")
+}
+function test_flat_list_literal_preserves_all_263145_positions(c: peer.Case) {
+    let last = (1 << 18) + 1000
+    let source = "let values = [" + peer.joined(peer.texts(peer.range(0, last + 1)), ",") + "]\n"
+    source += "print(values.length)
+print(values[263142]); print(values[263143]); print(values[263144])
+let i = 0; while i < values.length { if values[i] != i { fail(\"literal position\") }; i = i + 1 }; print(i)
+"
+    let expected = "263145\n263142\n263143\n263144\n263145\n"
+    let compiled = peer.compile(c, source)
+    peer.observe(c, compiled.result, 0, "", "", "large literal compilation")
+    let control = peer.jsonObject()
+    peer.put(control, "elements", peer.jsonInteger(last + 1))
+    peer.put(control, "stdout", peer.jsonText(expected))
+    peer.put(control, "link_timeout_seconds", peer.jsonInteger(180))
+    peer.put(control, "all_positions_checked", peer.jsonBoolean(true))
+    peer.control(c, "large_literal", control)
+    for optimization in c.variants {
+        let program = peer.executable(compiled.base, optimization)
+        let link = peer.run(c, clangCommand(clangWith(c, [optimization], ["-Wno-override-module", compiled.llvm, c.compiler.runtime, "-o", program])), "link-large-literal", 180)
+        requireSuccess(c, link, "large literal link at " + optimization)
+        peer.observe(c, peer.run(c, [program], "execute-large-literal", 30), 0, expected, "", "large literal at " + optimization)
+    }
+}
+function test_documented_whitespace_and_raw_nul_literal(c: peer.Case) {
+    let nul = peer.character(0)
+    for code in [11, 12] {
+        let character = peer.character(code)
+        let compiled = peer.compile(c, "let x " + character + " = \"a" + nul + "a\"\n")
+        peer.observe(c, compiled.result, 1, "", "Minyar stopped: line 1, column 7: expected '=', found '" + character + "'\n", "whitespace character " + Text(code))
+        peer.expect(c, files.pathSize(compiled.llvm) < 0, "whitespace character " + Text(code) + " left LLVM output behind")
+    }
+    peer.executes(c, "let x \t\r = \"a" + nul + "a\" \t\r\nprint(x)\nprint(x.length)\nprint(x.byteLength)\nprint(x[1] == \"" + nul + "\"[0])\n", "a" + nul + "a\n3\n3\ntrue\n")
+}
+function test_four_line_endings_keep_documented_diagnostic_positions(c: peer.Case) {
+    for ending in ["\n", "\r", "\n\r", "\r\n"] {
+        let prefix = "let a = 1;" + ending + "let b = 2;" + ending
+        peer.executes(c, prefix + "print(a + b)\n", "3\n")
+        let commented = "let value = 1;\n// value = 2;" + ending + "value = 3;\nprint(value)\n"
+        if peer.contains(ending, "\n") { peer.executes(c, commented, "3\n") } else { peer.executes(c, commented, "1\n") }
+        let value = "hi" + ending + "there"
+        let raw = "let text = \"" + value + "\"\nprint(text)\nprint(text.length)\nprint(text.byteLength)\n"
+        peer.executes(c, raw, value + "\n" + Text(value.length) + "\n" + Text(Bytes(value).length) + "\n")
+        let source = prefix + "print(missing)\n"
+        let bytes = Bytes(source)
+        let offset = peer.find(source, "missing", 0)
+        let line = 1
+        let lastNewline = -1
+        for index in 0..offset {
+            if bytes[index] == 10 {
+                line += 1
+                lastNewline = index
+            }
+        }
+        let column = offset - lastNewline
+        let compiled = peer.compile(c, source)
+        peer.observe(c, compiled.result, 1, "", "Minyar stopped: line " + Text(line) + ", column " + Text(column) + ": I can't find a value named 'missing'\n", "missing name after line ending " + peer.hexBytes(Bytes(ending)))
+        peer.expect(c, files.pathSize(compiled.llvm) < 0, "missing name left LLVM output behind")
+    }
+}
+function test_missing_list_delimiter_after_blank_lines_has_eof_location(c: peer.Case) {
+    let compiled = peer.compile(c, "let a = [4\n\n")
+    peer.observe(c, compiled.result, 1, "", "Minyar stopped: line 3, column 1: expected ',', found ''\n", "missing list delimiter")
+    peer.expect(c, files.pathSize(compiled.llvm) < 0, "missing list delimiter left LLVM output behind")
+}
+function test_nested_branch_errors_keep_exact_compile_time_locations(c: peer.Case) {
+    for depth in [1, 3] {
+        let source = "let b = false\n" + peer.repeat("if !b {\n", depth) + "print(missing)\n" + peer.repeat("}\n", depth)
+        let compiled = peer.compile(c, source)
+        peer.observe(c, compiled.result, 1, "", "Minyar stopped: line " + Text(depth + 2) + ", column 7: I can't find a value named 'missing'\n", "nested branch depth " + Text(depth))
+        peer.expect(c, files.pathSize(compiled.llvm) < 0, "nested branch error left LLVM output behind")
+    }
+}
+function test_ff_at_source_start_is_rejected_as_invalid_utf8(c: peer.Case) {
+    let source = peer.writeBytes(c, "ff.min", peer.concat(peer.bytes([0xff]), Bytes("let a = 1\n")))
+    let llvm = peer.path(c, "ff.ll")
+    peer.observe(c, peer.run(c, [c.compiler.executable, source, llvm], "compile-invalid-encoding", c.compiler.compileTimeout), 1, "", INVALID_UTF8, "leading FF byte")
+    peer.expect(c, files.pathSize(llvm) < 0, "leading FF byte left LLVM output behind")
+}
+function test_two_source_gap_axes_keep_all_256_diagnostic_locations(c: peer.Case) {
+    let gaps = [1, 2, 3, 10, 124, 125, 126, 127, 128, 129, 130, 255, 256, 257, 500, 1000]
+    for first in gaps {
+        for second in gaps {
+            for operand in ["missing", "\"wrong\""] {
+                let source = "let b = 10\nprint(b +" + peer.repeat("\n", first) + " b +" + peer.repeat("\n", second) + " " + operand + ")\n"
+                let line = 2 + first
+                let column = 4
+                let message = "the two sides of '+' have different types (Integer and Text)"
+                if operand == "missing" {
+                    line = 2 + first + second
+                    column = 2
+                    message = "I can't find a value named 'missing'"
+                }
+                let compiled = peer.compile(c, source)
+                peer.observe(c, compiled.result, 1, "", "Minyar stopped: line " + Text(line) + ", column " + Text(column) + ": " + message + "\n", "gaps " + Text(first) + " and " + Text(second) + " with " + operand)
+                peer.expect(c, files.pathSize(compiled.llvm) < 0, "gap diagnostic left LLVM output behind")
+            }
+        }
+    }
+}
+function test_integer_exit_zero_and_one_suppress_following_statements(c: peer.Case) {
+    for status in [0, 1] { peer.executesStatus(c, "print(\"before\")\nexit(" + Text(status) + ")\nprint(\"after\")\n", "before\n", status, "") }
+}
+function depthProgram(shape: Text, depth: Integer): List<Text> {
+    if shape == "constructor" { return ["let value = " + repeatText("[", depth) + "0" + repeatText("]", depth) + "\nprint(value" + repeatText("[0]", depth) + ")\n", "0\n"] }
+    if shape == "parentheses" { return ["print(" + repeatText("(", depth) + "2" + repeatText(")", depth) + ")\n", "2\n"] }
+    if shape == "call" { return ["function identity(x: Text): Text { return x }\nprint(" + repeatText("identity(", depth) + "\"2.2\"" + repeatText(")", depth) + ")\n", "2.2\n"] }
+    if shape == "block" { return [repeatText("if true { ", depth) + "print(\"done\")" + repeatText(" }", depth) + "\n", "done\n"] }
+    if shape == "while" { return [repeatText("while false { ", depth) + "fail(\"inner ran\")" + repeatText(" }", depth) + "\nprint(\"done\")\n", "done\n"] }
+    if shape == "if-else" { return [repeatText("if false { fail(\"wrong branch\") } else { ", depth) + "print(\"done\")" + repeatText(" }", depth) + "\n", "done\n"] }
+    return ["let a = \"\"\nprint(" + repeatText("a + ", depth) + "\"a\")\n", "a\n"]
+}
+function test_supported_syntax_depth_shapes_and_controlled_limits(c: peer.Case) {
+    for shape in ["constructor", "parentheses", "call", "block", "while", "if-else", "concat"] {
+        for depth in [100, 500] {
+            let program = depthProgram(shape, depth)
+            peer.executes(c, program[0], program[1])
+        }
+        if shape == "concat" { continue }
+        let program = depthProgram(shape, 100000)
+        let compiled = peer.compile(c, program[0])
+        peer.expect(c, compiled.result.status == 0 || compiled.result.status == 1, shape + " depth 100000 compiler status " + Text(compiled.result.status) + "\n" + compiled.result.errorOutput)
+        peer.equal(c, compiled.result.output, "", shape + " depth 100000 compiler stdout")
+        if compiled.result.status != 0 {
+            peer.equal(c, compiled.result.errorOutput, "Minyar stopped: the program exceeded the maximum call depth.\n", shape + " depth 100000 diagnostic")
+            peer.expect(c, files.pathSize(compiled.llvm) < 0, shape + " depth 100000 left LLVM output behind")
+        } else {
+            peer.equal(c, compiled.result.errorOutput, "", shape + " depth 100000 compiler stderr")
+            let saved = c.linkTimeout
+            c.linkTimeout = 180
+            peer.executes(c, program[0], program[1])
+            c.linkTimeout = saved
+        }
+    }
+}
+function test_runtime_cleanup_without_allocations_and_poisoned_format_buffers(c: peer.Case) {
+    let probe = c.suite.root + "/tests/peer-pyswru-runtime-probes.c"
+    runtimeInputs(c, [probe, c.suite.root + "/runtime/minyar_runtime.c"])
+    let cases = ["chain", "format"]
+    let outputs = ["200001 objects released; zero allocation attempts, live objects, bytes and blocks\n", "16 integer formatting boundary strings and terminators passed\n"]
+    for initialization in ["zero", "pattern"] {
+        for optimization in c.variants {
+            let program = peer.path(c, "runtime-" + initialization + "-" + suffix(optimization))
+            let compiled = peer.run(c, clangCommand(clangWith(c, ["-std=c11", optimization, "-UNDEBUG"], ["-ftrivial-auto-var-init=" + initialization, probe, "-o", program])), "compile-runtime-probe", 60)
+            requireSuccess(c, compiled, "runtime probe build " + initialization + " " + optimization)
+            for index in 0..cases.length {
+                peer.observe(c, peer.run(c, [program, cases[index]], "execute-runtime-probe", 30), 0, outputs[index], "", cases[index] + " " + initialization + " at " + optimization)
+            }
+        }
+    }
+}
+function test_runtime_applicable_strict_warning_profiles(c: peer.Case) {
+    peer.campaign(c, ["O2"])
+    let source = c.suite.root + "/runtime/minyar_runtime.c"
+    runtimeInputs(c, [source])
+    let warnings = ["-Wall", "-Wextra", "-Werror", "-Wshadow", "-Wundef", "-Wwrite-strings", "-Wredundant-decls", "-Wdouble-promotion", "-Wstrict-prototypes", "-Wold-style-definition"]
+    let profiles = ["default", "system", "bounded", "compiler"]
+    let defines = ["", "-DMINYAR_SYSTEM_HEAP=1", "-DMINYAR_BOUNDED_HEAP=1", "-DMINYAR_COMPILER_ARENA=1"]
+    let configurations: List<Text> = []
+    for index in 0..profiles.length {
+        let before = ["-std=c11", "-O2"]
+        peer.extend(before, warnings)
+        let after: List<Text> = []
+        if defines[index] != "" { after.add(defines[index]) }
+        peer.extend(after, ["-c", source, "-o", peer.path(c, profiles[index] + ".o")])
+        let command = clangCommand(clangWith(c, before, after))
+        peer.observe(c, peer.run(c, command, "compile-strict-warnings", 60), 0, "", "", profiles[index] + " strict warnings")
+        for flag in command {
+            if flag == "-O0" || flag == "-O1" || flag == "-O2" || flag == "-O3" || flag == "-Os" {
+                if !peer.hasText(configurations, suffix(flag)) { configurations.add(suffix(flag)) }
+            }
+        }
+    }
+    peer.control(c, "campaign_configurations", peer.jsonTexts(peer.sortTexts(configurations)))
+}
+function test_owned_recursion_allocator_growth_campaign(c: peer.Case) {
+    peer.campaign(c, ["O2"])
+    let source = "function grow(n: Integer): Integer {
+    let label = \"frame\" + Text(40000 + n)
+    if n == 0 { print(label); return 1 }
+    let result = 1 + grow(n - 1)
+    if label.length != 10 { fail(\"lost caller Text\") }
+    return result
+}
+print(grow(100))
+"
+    let inputPath = peer.path(c, "large-pair.txt")
+    let inputBytes = Bytes(peer.repeat("a", 10000))
+    writeBytesFile(inputPath, inputBytes)
+    let pairSource = "let text = readTextFile(" + peer.literal(inputPath) + ")\n"
+    pairSource += "let parts = [text, text]
+let joined = joinText(parts)
+parts = []; text = \"replaced\"
+print(joined.length); print(joined)
+"
+    let cases = [AllocationCase { name: "peer-owned-recursion"; source: source; expected: "frame40000\n101\n" },
+        AllocationCase { name: "peer-large-pair"; source: pairSource; expected: "20000\n" + peer.repeat("a", 20000) + "\n" }]
+    let output = peer.path(c, "recursive-allocation-results.json")
+    let mode = allocationMode(c)
+    allocationCampaign(c, cases, mode, output)
+    let report = peer.load(output)
+    peer.equal(c, peer.textField(report, "status"), "passed", "allocation campaign status")
+    let configurations: List<Text> = []
+    for item in json.member(report, "configurations").items { configurations.add(item.text) }
+    peer.expect(c, peer.hasText(configurations, "O2"), "allocation campaign configurations lack O2: " + peer.joined(configurations, ", "))
+    peer.expect(c, peer.bytesEqual(readBytesFile(inputPath), inputBytes), "large pair input file changed")
+    let rows = json.member(report, "cases").items
+    peer.equalInteger(c, rows.length, 4, "allocation campaign rows")
+    let names: List<Text> = []
+    for row in rows { names.add(peer.textField(row, "case")) }
+    peer.expect(c, sameTexts(peer.unique(names), ["peer-owned-recursion", "peer-large-pair"]), "allocation campaign cases differ: " + peer.joined(names, ", "))
+    for row in rows {
+        let name = peer.textField(row, "case")
+        peer.expect(c, peer.field(row, "allocation_failures") >= 1, name + " has no allocation failures")
+        peer.equalInteger(c, peer.field(row, "frame_entries"), peer.field(row, "frame_leaves"), name + " frame entries and leaves")
+        if name == "peer-owned-recursion" {
+            peer.expect(c, peer.field(row, "frame_entries") >= 101, name + " frame entries")
+            peer.expect(c, peer.field(row, "peak_frames") >= 101, name + " peak frames")
+            peer.expect(c, peer.field(row, "released_objects") >= 101, name + " released objects")
+            peer.expect(c, peer.field(row, "allocation_failures") <= 8 * peer.field(row, "frame_entries"), name + " allocation failures exceed eight per frame")
+        }
+        peer.expect(c, peer.field(row, "byte_budget_failures") > 0, name + " has no byte budget failures")
+        peer.equalInteger(c, peer.field(row, "byte_budget_successes"), 2, name + " byte budget successes")
+    }
+    peer.control(c, "campaign_configurations", json.member(report, "configurations"))
+    peer.control(c, "peer_allocation_results", report)
+}
+function rejectsExactDiagnostic(c: peer.Case, source: Text, diagnostic: Text) {
+    let expected = "Minyar stopped: " + diagnostic + "\n"
+    let oracle = peer.jsonObject()
+    peer.put(oracle, "source", peer.jsonText("case" + Text(c.compiler.serial + 1) + ".min"))
+    peer.put(oracle, "status", peer.jsonInteger(1))
+    peer.put(oracle, "stdout", peer.jsonText(""))
+    peer.put(oracle, "stderr", peer.jsonText(expected))
+    peer.put(oracle, "llvm_created", peer.jsonBoolean(false))
+    peer.appendControl(c, "rejection_oracles", oracle)
+    let compiled = peer.compile(c, source)
+    peer.expect(c, compiled.result.status == 1, "expected compiler rejection status 1, got " + Text(compiled.result.status) + "\n" + compiled.result.errorOutput)
+    peer.equal(c, compiled.result.output, "", "rejected source stdout")
+    peer.equal(c, compiled.result.errorOutput, expected, "rejection diagnostic")
+    peer.expect(c, files.pathSize(compiled.llvm) < 0, "invalid source left LLVM output behind")
+}
+function test_integer_total_order_1001_and_1002(c: peer.Case) {
+    let source = "function observe(a: Integer, b: Integer): Nothing {
+print(a == b); print(b == a)
+print(a != b); print(b != a)
+print(a < b); print(b > a)
+print(a <= b); print(b >= a)
+print(a > b); print(b < a)
+print(a >= b); print(b <= a)
+}
+observe(1001, 1001)
+observe(1001, 1002)
+"
+    let expected = [true, true, false, false, false, false, true, true,
+        false, false, true, true,
+        false, false, true, true, true, true, true, true,
+        false, false, false, false]
+    let words: List<Text> = []
+    for value in expected { words.add(peer.boolean(value) + "\n") }
+    peer.executes(c, source, joinText(words))
+}
+function gcdMagnitude(first: Integer, second: Integer): Integer {
+    let a = peer.absolute(first)
+    let b = peer.absolute(second)
+    while b != 0 {
+        let next = a % b
+        a = b
+        b = next
+    }
+    return a
+}
+function test_euclidean_gcd_full_signed_one_through_nineteen_domain(c: peer.Case) {
+    let source = "function floorRemainder(left: Integer, right: Integer): Integer {
+let remainder = left % right
+if remainder != 0 && ((remainder < 0) != (right < 0)) {
+return remainder + right
+}
+return remainder
+}
+function gcd(first: Integer, second: Integer): Integer {
+let a = first
+let b = second
+while a != 0 {
+let next = floorRemainder(b, a)
+b = a
+a = next
+}
+return b
+}
+function observe(index: Integer, a: Integer, b: Integer): Nothing {
+print(index); print(a); print(b); print(gcd(a, b))
+}
+"
+    let firsts = [10, 10, 10, 100, -10, 10, -10]
+    let seconds = [12, 15, 11, 15, 2, -2, -2]
+    let answers = [2, 5, 1, 5, -2, 2, -2]
+    for i in 1..20 {
+        for j in 1..20 {
+            for pair in [[i, j], [-i, j], [i, -j], [-i, -j]] {
+                firsts.add(pair[0])
+                seconds.add(pair[1])
+                let sign = -1
+                if pair[0] > 0 { sign = 1 }
+                answers.add(gcdMagnitude(pair[0], pair[1]) * sign)
+            }
+        }
+    }
+    peer.equalInteger(c, firsts.length, 1451, "gcd case count")
+    let calls: List<Text> = [source]
+    let expected: List<Text> = []
+    for index in 0..firsts.length {
+        calls.add("observe(" + Text(index) + ", " + Text(firsts[index]) + ", " + Text(seconds[index]) + ")\n")
+        for value in [index, firsts[index], seconds[index], answers[index]] { expected.add(Text(value) + "\n") }
+    }
+    let coverage = peer.jsonObject()
+    peer.put(coverage, "calls", peer.jsonInteger(1451))
+    peer.put(coverage, "explicit_examples", peer.jsonInteger(7))
+    peer.put(coverage, "signed_grid", peer.jsonInteger(1444))
+    peer.control(c, "domain_coverage", coverage)
+    peer.executes(c, joinText(calls), joinText(expected))
+}
+function test_uppercase_true_is_an_identifier(c: peer.Case) {
+    peer.executes(c, "let TRUE: Integer = 42\nprint(TRUE)\n", "42\n")
+}
+function test_five_ordinary_quote_payloads(c: peer.Case) {
+    let payloads = ["", "'", "\"", "doesn't \"shrink\" does it", "does \"shrink\" doesn't it"]
+    let lengths = [0, 1, 1, 24, 24]
+    let source: List<Text> = []
+    let expected: List<Text> = []
+    for index in 0..payloads.length {
+        let value = payloads[index]
+        let length = lengths[index]
+        peer.equalInteger(c, value.length, length, "quote payload " + Text(index) + " length")
+        let name = Text(index)
+        peer.extend(source, ["let x" + name + ": Text = " + peer.literal(value), "let y" + name + ": Text = " + peer.literal(value),
+            "print(x" + name + ")", "print(x" + name + ".length)", "print(x" + name + " == y" + name + ")"])
+        peer.extend(expected, [value, Text(length), "true"])
+        if length == 1 {
+            source.add("print(x" + name + "[0])")
+            expected.add(value)
+        }
+    }
+    peer.executes(c, peer.lines(source), peer.lines(expected))
+}
+function test_four_if_chain_shapes(c: peer.Case) {
+    peer.executes(c, "if true { print(1) }
+if true { print(2) } else { print(20) }
+if false { print(30) } else { if false { print(31) } }
+if false { print(40) } else {
+if false { print(41) } else {
+if false { print(42) } else {
+if false { print(43) } else { print(4) }
+}
+}
+}
+print(\"done\")
+", "1\n2\n4\ndone\n")
+}
+function test_six_unparenthesized_boolean_expressions(c: peer.Case) {
+    let expressions = ["!true", "true && true", "true || true", "!!!true", "!true && true && true", "true && true || true && true && true || !true && true"]
+    let answers = [false, true, true, false, false, true]
+    let source: List<Text> = []
+    let expected: List<Text> = []
+    for index in 0..expressions.length {
+        peer.extend(source, ["print(" + expressions[index] + ")", "if " + expressions[index] + " { print(" + Text(index) + ") }"])
+        expected.add(peer.boolean(answers[index]))
+        if answers[index] { expected.add(Text(index)) }
+    }
+    source.add("print(\"done\")")
+    expected.add("done")
+    peer.executes(c, peer.lines(source), peer.lines(expected))
+}
+function test_comparison_result_and_all_six_branch_forms(c: peer.Case) {
+    peer.executes(c, "if true { print(\"atom\") }
+let x = (1 == 1)
+print(x)
+if 1 == 1 { print(\"equal\") }
+if 1 != 1 { print(\"unequal\") }
+if 1 < 1 { print(\"less\") }
+if 1 > 1 { print(\"greater\") }
+if 1 <= 1 { print(\"lessEqual\") }
+if 1 >= 1 { print(\"greaterEqual\") }
+print(\"done\")
+", "atom\ntrue\nequal\nlessEqual\ngreaterEqual\ndone\n")
+}
+function test_all_additive_and_multiplicative_expression_shapes(c: peer.Case) {
+    let expressions = ["1", "1 + 1", "1 - 1 - 1", "1 - 1 + 1 - 1 + 1", "1 * 1", "1 / 1", "1 % 1", "1 / 1 * 1 % 1"]
+    let answers = [1, 2, -1, 1, 1, 1, 0, 0]
+    let source: List<Text> = []
+    let expected: List<Text> = []
+    for index in 0..expressions.length {
+        source.add("print(" + expressions[index] + ")\n")
+        expected.add(Text(answers[index]) + "\n")
+    }
+    peer.executes(c, joinText(source), joinText(expected))
+}
+function test_negating_text_rejects_before_llvm(c: peer.Case) {
+    peer.rejects(c, "print(-\"a\")\n", "line 1, column 11: negation needs an Integer or Float")
+}
+function test_incomplete_function_three_newline_placements(c: peer.Case) {
+    for source in ["function foo(", "\nfunction foo(", "function foo(\n"] { peer.rejects(c, source, "a declaration is missing its '{ ... }' body") }
+}
+function test_all_twelve_bad_radix_tokens_reject(c: peer.Case) {
+    for token in ["0b12", "0b1_2", "0b2", "0b1_", "0b", "0o18", "0o1_8", "0o8", "0o1_", "0o", "0x1_", "0x"] {
+        let expected = "line 1, column 7: an octal Integer literal needs only digits 0 through 7 after 0o"
+        if !peer.starts(token, "0o") {
+            let raw = Bytes(token)
+            let column = 8
+            let name = Text(raw.slice(1, raw.length))
+            if token == "0x1_" {
+                column = 10
+                name = "_"
+            }
+            expected = "line 1, column " + Text(column) + ": I can't find a value named '" + name + "'"
+        }
+        rejectsExactDiagnostic(c, "print(" + token + ")\n", expected)
+    }
+}
+function test_exact_prefix_removal_values(c: peer.Case) {
+    peer.executes(c, "function deletePrefix(value: Text, prefix: Text): Text {
+if prefix.length <= value.length {
+if value.slice(0, prefix.length) == prefix {
+return value.slice(prefix.length, value.length)
+}
+}
+return value
+}
+let first = deletePrefix(\"hello\", \"hell\")
+let second = deletePrefix(\"hello\", \"hello\")
+print(first); print(first.length)
+print(second); print(second.length)
+", "o\n1\n\n0\n")
+}
+function test_exact_suffix_removal_values(c: peer.Case) {
+    peer.executes(c, "function deleteSuffix(value: Text, suffix: Text): Text {
+if suffix.length <= value.length {
+if value.slice(value.length - suffix.length, value.length) == suffix {
+return value.slice(0, value.length - suffix.length)
+}
+}
+return value
+}
+let first = deleteSuffix(\"hello\", \"ello\")
+let second = deleteSuffix(\"hello\", \"hello\")
+print(first); print(first.length)
+print(second); print(second.length)
+", "h\n1\n\n0\n")
+}
+function test_binary_enumerator_size_uses_bytes_for_all_three_inputs(c: peer.Case) {
+    let source = "record BinaryEnumerator { value: Text }
+function binaryEnumerator(value: Text): BinaryEnumerator {
+return BinaryEnumerator { value: value }
+}
+function size(iterator: BinaryEnumerator): Integer { return iterator.value.byteLength }
+function observe(value: Text) {
+let iterator = binaryEnumerator(value)
+print(size(iterator)); print(value.byteLength)
+print(size(iterator) == value.byteLength)
+print(iterator.value)
+print(iterator.value.length)
+}
+observe(\"hello\")
+observe(\"ola\")
+observe(\"Ç∂éƒg\")
+"
+    peer.executes(c, source, "5\n5\ntrue\nhello\n5\n3\n3\ntrue\nola\n3\n10\n10\ntrue\nÇ∂éƒg\n5\n")
+}
+function test_ascii_codepoints_form_complete_numeric_scalar_list(c: peer.Case) {
+    let fixture = c.suite.root + "/tests/peer-pyswru-codepoints-runtime.c"
+    peer.input(c, fixture)
+    let coverage = peer.jsonObject()
+    peer.put(coverage, "input_hex", peer.jsonText("616263"))
+    peer.put(coverage, "numeric_scalars", peer.jsonIntegers([97, 98, 99]))
+    peer.put(coverage, "array_length", peer.jsonInteger(3))
+    peer.control(c, "domain_coverage", coverage)
+    for optimization in c.variants {
+        let program = peer.path(c, "codepoints." + suffix(optimization))
+        let result = peer.run(c, clangCommand(clangWith(c, ["-std=c11", optimization], ["-Wall", "-Wextra", "-Werror", fixture, c.compiler.runtime, "-o", program])), "link-c-runtime-probe", 30)
+        requireSuccess(c, result, "codepoint probe link at " + optimization)
+        peer.observe(c, peer.run(c, [program, "abc"], "execute", c.runTimeout), 0, "3\n97\n98\n99\n", "", "codepoint probe at " + optimization)
+    }
+}
+function executesWithCleanCompilation(c: peer.Case, source: Text, expected: Text) {
+    let oracle = peer.jsonObject()
+    peer.put(oracle, "source", peer.jsonText("case" + Text(c.compiler.serial + 1) + ".min"))
+    peer.put(oracle, "stdout", peer.jsonText(expected))
+    peer.put(oracle, "stderr", peer.jsonText(""))
+    peer.put(oracle, "status", peer.jsonInteger(0))
+    peer.put(oracle, "optimizations", peer.jsonTexts(c.variants))
+    peer.put(oracle, "arguments", peer.jsonTexts([]))
+    peer.put(oracle, "file_outputs", peer.jsonArray([]))
+    peer.appendControl(c, "execution_oracles", oracle)
+    let compiled = peer.compile(c, source)
+    if compiled.result.status == 0 {
+        peer.equal(c, compiled.result.output, "", "clean compilation stdout")
+        peer.equal(c, compiled.result.errorOutput, "", "clean compilation stderr")
+    }
+    peer.expect(c, compiled.result.status == 0, "compilation failed\n" + compiled.result.errorOutput)
+    for optimization in c.variants {
+        let program = peer.executable(compiled.base, optimization)
+        peer.link(c, compiled.llvm, optimization, program)
+        peer.observe(c, peer.run(c, [program], "execute", c.runTimeout), 0, expected, "", "execution at " + optimization)
+    }
+}
+function test_ordinary_positional_calls_keep_repetitions_and_trailing_commas(c: peer.Case) {
+    peer.executes(c, "function f1(): Nothing { print(\"f1\") }
+f1()
+function f2(one_argument: Integer): Nothing { print(one_argument) }
+function f3(two: Integer, arguments: Integer): Nothing {
+print(two); print(arguments)
+}
+function a1(one_arg: Integer,): Nothing { }
+function a2(two: Integer, args: Integer,): Nothing { }
+f1()
+f2(1)
+f2(1,)
+f3(1, 2)
+f3(1, 2,)
+", "f1\nf1\n1\n1\n1\n2\n1\n2\n")
+}
+function test_one_positional_parameter_declaration_accepts_trailing_comma(c: peer.Case) {
+    peer.executes(c, "function f(a: Integer,): Nothing { print(a) }\nf(1)\n", "1\n")
+}
+function test_bare_and_integer_returns_keep_actual_callers(c: peer.Case) {
+    peer.executes(c, "function g1(): Nothing { return }
+function g2(): Integer { return 1 }
+g1()
+print(\"g1 returned\")
+let x = g2()
+print(x)
+", "g1 returned\n1\n")
+}
+function test_parenthesized_integer_and_all_three_plain_list_atoms(c: peer.Case) {
+    peer.executes(c, "let scalar = (1)
+print(scalar)
+let values: List<Integer> = []
+print(values.length)
+values = [1]
+print(values.length); print(values[0])
+values = []
+print(values.length)
+", "1\n0\n1\n1\n0\n")
+}
+function test_all_nine_text_selectors_keep_relative_indices_and_omitted_bounds(c: peer.Case) {
+    peer.executes(c, "function relativeIndex(value: Text, index: Integer): Character {
+let position = index
+if position < 0 { position = value.length + position }
+return value[position]
+}
+function relativeSlice(value: Text, hasStart: Boolean, start: Integer, hasEnd: Boolean, end: Integer): Text {
+let first = 0
+if hasStart {
+first = start
+if first < 0 { first = value.length + first }
+}
+let last = value.length
+if hasEnd {
+last = end
+if last < 0 { last = value.length + last }
+}
+return value.slice(first, last)
+}
+let a = \"01234\"
+print(relativeIndex(a, 0))
+print(relativeIndex(a, -1))
+print(relativeSlice(a, true, 0, true, 5))
+print(relativeSlice(a, false, 0, true, 5))
+print(relativeSlice(a, true, 0, false, 0))
+print(relativeSlice(a, false, 0, false, 0))
+print(relativeSlice(a, true, -5, false, 0))
+print(relativeSlice(a, false, 0, true, -1))
+print(relativeSlice(a, true, -4, true, -3))
+", "0\n4\n01234\n01234\n01234\n01234\n01234\n0123\n1\n")
+}
+function test_seven_integer_literal_adjacencies_reject(c: peer.Case) {
+    let octal = "line 1, column 7: an octal Integer literal needs only digits 0 through 7 after 0o"
+    let expressions = ["0xfand x", "0xfspam", "0o7spam", "0b1spam", "9spam", "0or x", "0spam"]
+    let diagnostics = ["line 1, column 11: I can't find a value named 'nd'", "line 1, column 10: I can't find a value named 'spam'",
+        octal, "line 1, column 8: I can't find a value named 'b1spam'",
+        "line 1, column 8: I can't find a value named 'spam'", octal,
+        "line 1, column 8: I can't find a value named 'spam'"]
+    for index in 0..expressions.length { rejectsExactDiagnostic(c, "print(" + expressions[index] + ")\n", diagnostics[index]) }
+}
+function test_fraction_slash_is_rejected_after_all_eight_numeric_spellings(c: peer.Case) {
+    let slash = peer.character(0x2044)
+    for number in ["0xf", "0o7", "0b1", "9", "0", "1.", "1e3", "1j"] {
+        rejectsExactDiagnostic(c, "print(" + number + slash + "7)\n", "line 1, column " + Text(7 + number.length) + ": names must use ASCII letters, digits, and '_'; found non-ASCII character '" + slash + "'")
+    }
+}
+function test_indexed_list_literal_keeps_the_outer_list(c: peer.Case) {
+    executesWithCleanCompilation(c, "let result = [[1, 2][0]]
+print(result.length)
+print(result[0])
+", "1\n1\n")
+}
+function test_sliced_list_literal_keeps_both_collection_levels(c: peer.Case) {
+    executesWithCleanCompilation(c, "function listSlice(value: List<Integer>, start: Integer, end: Integer): List<Integer> {
+let result: List<Integer> = []
+let position = start
+while position < end {
+result.add(value[position])
+position = position + 1
+}
+return result
+}
+let result = [listSlice([1, 2], 1, 2)]
+print(result.length)
+print(result[0].length)
+print(result[0][0])
+", "1\n1\n2\n")
+}
+function test_reference_self_assignment_preserves_all_specialized_set_values(c: peer.Case) {
+    for withAlias in [false, true] {
+        let source = "let x = [2, 3, 4]\n"
+        if withAlias { source += "let alias = x\n" }
+        source += "x = x\nprint(x.length)\nprint(x[0]); print(x[1]); print(x[2])\n"
+        let expected = "3\n2\n3\n4\n"
+        if withAlias {
+            source += "alias.add(5)\nprint(x.length); print(x[3])\n"
+            expected += "4\n5\n"
+        }
+        peer.executes(c, source, expected)
+    }
+}
+function pythonSlice(text: Text, start: Integer, end: Integer): Text {
+    let first = min(start, text.length)
+    let last = min(end, text.length)
+    if last <= first { return "" }
+    return text.slice(first, last)
+}
+function test_missing_nonnegative_clipped_substring_matrix(c: peer.Case) {
+    let source = ["function clippedSlice(value: Text, start: Integer, end: Integer): Text {
+let first = start
+let last = end
+if first > value.length { first = value.length }
+if last > value.length { last = value.length }
+if last < first { return \"\" }
+return value.slice(first, last)
+}"]
+    let expected: List<Text> = []
+    let cells: List<json.Value> = []
+    let total = 0
+    for text in ["ab", "ab¡¢", "ab¡¢你好", "ab¡¢你好😀😁"] {
+        let starts = peer.range(0, text.length + 2)
+        starts.add(peer.MAXIMUM)
+        for start in starts {
+            let ends: List<Integer> = []
+            let lowest = start - 1
+            if lowest < 0 { lowest = 0 }
+            if lowest < text.length + 2 { ends = peer.range(lowest, text.length + 2) }
+            ends.add(peer.MAXIMUM)
+            for end in ends {
+                total += 1
+                if 0 <= start && start <= end && end <= text.length { continue }
+                let result = pythonSlice(text, start, end)
+                let cell = Text(cells.length)
+                let row = peer.jsonObject()
+                peer.put(row, "text", peer.jsonText(text))
+                peer.put(row, "start", peer.jsonInteger(start))
+                peer.put(row, "end", peer.jsonInteger(end))
+                peer.put(row, "expected", peer.jsonText(result))
+                cells.add(row)
+                peer.extend(source, ["function case" + cell + "() {", "let root = " + peer.literal(text),
+                    "let view = clippedSlice(root, " + Text(start) + ", " + Text(end) + ")",
+                    "root = \"released\"", "print(view)", "print(view.length)",
+                    "print(view.byteLength)", "}", "case" + cell + "()"])
+                peer.extend(expected, [result, Text(result.length), Text(Bytes(result).length)])
+            }
+        }
+    }
+    peer.equalInteger(c, total, 178, "clipped substring source pairs")
+    peer.equalInteger(c, cells.length, 84, "clipped substring new cells")
+    let domain = peer.jsonObject()
+    peer.put(domain, "total", peer.jsonInteger(total))
+    peer.put(domain, "new_cells", peer.jsonArray(cells))
+    peer.put(domain, "existing_strict_spans", peer.jsonInteger(94))
+    peer.put(domain, "adaptation", peer.jsonText("explicit nonnegative clipping adapter; native slice is strict"))
+    peer.control(c, "source_domain", domain)
+    peer.executes(c, peer.lines(source), peer.lines(expected))
+}
+function test_utf8_constructor_value_projections_keep_complete_bytes(c: peer.Case) {
+    let raws = [Bytes("abc"), Bytes("abc"), peer.concat(Bytes("abc"), peer.concat(peer.bytes([0]), Bytes("def"))),
+        peer.fromHex("c2a1c2a2"), peer.fromHex("e4bda0"), peer.fromHex("f09f9880"), Bytes()]
+    let counts = [-1, 2, -1, -1, -1, -1, -1]
+    let source: List<Text> = []
+    let expected: List<Text> = []
+    let domain: List<json.Value> = []
+    for index in 0..raws.length {
+        let raw = raws[index]
+        let name = Text(index)
+        let path = peer.writeBytes(c, "constructor-" + name + ".bin", raw)
+        let projected = raw
+        if counts[index] >= 0 { projected = raw.slice(0, counts[index]) }
+        peer.expect(c, peer.validUTF8(projected), "constructor cell " + name + " is not UTF-8")
+        let value = Text(projected)
+        let selection = "let value = original"
+        if counts[index] >= 0 { selection = "let value = original.slice(0, 2)" }
+        peer.extend(source, ["function case" + name + "() {", "let original = readTextFile(" + peer.literal(path) + ")",
+            "print(original.byteLength)", selection,
+            "print(value.length)", "print(value.byteLength)", "print(value)"])
+        let scalars = peer.scalars(value)
+        for position in 0..scalars.length { source.add("print(value[" + Text(position) + "])") }
+        peer.extend(source, ["}", "case" + name + "()"])
+        peer.extend(expected, [Text(raw.length), Text(scalars.length), Text(Bytes(value).length), value])
+        peer.extend(expected, scalars)
+        let row = peer.jsonObject()
+        peer.put(row, "hex", peer.jsonText(peer.hexBytes(raw)))
+        if counts[index] >= 0 { peer.put(row, "count", peer.jsonInteger(counts[index])) } else { peer.put(row, "count", peer.jsonNull()) }
+        peer.put(row, "expected", peer.jsonText(value))
+        domain.add(row)
+    }
+    peer.control(c, "source_domain", peer.jsonArray(domain))
+    peer.executes(c, peer.lines(source), peer.lines(expected))
+}
+function test_lone_a1_decoder_view_rejects_at_scalar_operation(c: peer.Case) {
+    let path = peer.writeBytes(c, "lone-a1.bin", peer.fromHex("a1"))
+    peer.executesStatus(c, "let value = readTextFile(" + peer.literal(path) + ")\nprint(value.length)\n", "", 1, INVALID_UTF8)
+}
+function test_invalid_a1_and_c2_preserve_raw_ingress_and_complete_byte_roundtrip(c: peer.Case) {
+    let source: List<Text> = []
+    let outputs: List<peer.Output> = []
+    let raws = [peer.fromHex("a1"), peer.fromHex("c2")]
+    for index in 0..raws.length {
+        let name = Text(index)
+        let incoming = peer.writeBytes(c, "raw-invalid-" + name + ".bin", raws[index])
+        let outgoing = peer.path(c, "raw-preserved-" + name + ".bin")
+        peer.extend(source, ["let value" + name + " = readTextFile(" + peer.literal(incoming) + ")",
+            "print(value" + name + ".byteLength)",
+            "writeTextFile(" + peer.literal(outgoing) + ", value" + name + ")"])
+        outputs.add(peer.Output { path: outgoing; contents: raws[index] })
+    }
+    peer.executesFull(c, peer.lines(source), "1\n1\n", 0, "", [], outputs, c.variants)
+}
+function unicodeProbe(c: peer.Case, optimization: Text): Text {
+    let fixture = c.suite.root + "/tests/peer-pyswru-unicode-runtime.c"
+    peer.input(c, fixture)
+    let program = peer.path(c, "unicode-probe." + suffix(optimization))
+    let result = peer.run(c, clangCommand(clangWith(c, ["-std=c11", optimization], ["-Wall", "-Wextra", "-Werror", fixture, c.compiler.runtime, "-o", program])), "link-c-runtime-probe", 30)
+    requireSuccess(c, result, "unicode probe link at " + optimization)
+    return program
+}
+function test_valid_scalar_lengths_and_numeric_character_reads(c: peer.Case) {
+    let lengthTexts = ["", "abc", "¡¢", "你好", "a😀"]
+    let lengthValues = [0, 3, 2, 2, 2]
+    let positionTexts: List<Text> = []
+    let positionIndices: List<Integer> = []
+    let positionValues: List<Integer> = []
+    for text in ["abc", "¡¢", "你好", "a😀"] {
+        let index = 0
+        for character in text {
+            positionTexts.add(text)
+            positionIndices.add(index)
+            positionValues.add(Integer(character))
+            index += 1
+        }
+    }
+    peer.equalInteger(c, positionTexts.length, 9, "numeric character read count")
+    let lengths: List<json.Value> = []
+    for index in 0..lengthTexts.length { lengths.add(peer.jsonArray([peer.jsonText(lengthTexts[index]), peer.jsonInteger(lengthValues[index])])) }
+    let reads: List<json.Value> = []
+    for index in 0..positionTexts.length { reads.add(peer.jsonArray([peer.jsonText(positionTexts[index]), peer.jsonInteger(positionIndices[index]), peer.jsonInteger(positionValues[index])])) }
+    let first = peer.jsonObject()
+    peer.put(first, "source_codepoints", peer.jsonIntegers([97, 55296, 98, 57343, 99]))
+    peer.put(first, "source_length", peer.jsonInteger(5))
+    let second = peer.jsonObject()
+    peer.put(second, "source_codepoints", peer.jsonIntegers([55348, 56606]))
+    peer.put(second, "source_length", peer.jsonInteger(2))
+    let domain = peer.jsonObject()
+    peer.put(domain, "lengths", peer.jsonArray(lengths))
+    peer.put(domain, "numeric_character_reads", peer.jsonArray(reads))
+    peer.put(domain, "excluded_surrogate_strings", peer.jsonArray([first, second]))
+    peer.control(c, "source_domain", domain)
+    for optimization in c.variants {
+        let program = unicodeProbe(c, optimization)
+        for index in 0..lengthTexts.length {
+            peer.observe(c, peer.run(c, [program, lengthTexts[index], "length"], "execute", c.runTimeout), 0, Text(lengthValues[index]) + "\n", "", "length of '" + lengthTexts[index] + "' at " + optimization)
+        }
+        for index in 0..positionTexts.length {
+            peer.observe(c, peer.run(c, [program, positionTexts[index], Text(positionIndices[index])], "execute", c.runTimeout), 0, Text(positionValues[index]) + "\n", "", "scalar " + Text(positionIndices[index]) + " of '" + positionTexts[index] + "' at " + optimization)
+        }
+    }
+}
+function test_checked_numeric_scalar_reads_reject_all_four_invalid_positions(c: peer.Case) {
+    let cellTexts: List<Text> = []
+    let cellPositions: List<Integer> = []
+    for text in ["abc", "¡¢", "你好", "a😀"] {
+        for position in [text.length, peer.MAXIMUM, -1, peer.MINIMUM] {
+            cellTexts.add(text)
+            cellPositions.add(position)
+        }
+    }
+    peer.equalInteger(c, cellTexts.length, 16, "invalid scalar read count")
+    let cells: List<json.Value> = []
+    for index in 0..cellTexts.length { cells.add(peer.jsonArray([peer.jsonText(cellTexts[index]), peer.jsonInteger(cellPositions[index])])) }
+    peer.control(c, "source_domain", peer.jsonArray(cells))
+    for optimization in c.variants {
+        let program = unicodeProbe(c, optimization)
+        for index in 0..cellTexts.length {
+            let message = "a Text position was outside the Text."
+            if cellPositions[index] < 0 { message = "a Text position cannot be negative." }
+            peer.observe(c, peer.run(c, [program, cellTexts[index], Text(cellPositions[index])], "execute", c.runTimeout), 1, "", "Minyar stopped: " + message + "\n", "position " + Text(cellPositions[index]) + " of '" + cellTexts[index] + "' at " + optimization)
+        }
+    }
+}
+
+let names = ["test_three_hundred_positional_parameters_and_values", "test_ten_five_hundred_and_thousand_positional_arguments", "test_filtered_iteration_preserves_present_payload_order", "test_text_suffix_candidates_use_scalar_boundaries", "test_five_module_cycle_shapes_and_acyclic_controls", "test_unicode_filename_read_write_and_missing_path_guards", "test_python_literal_payloads_match_independent_utf8_files", "test_swift_flag_and_mathematical_scalar_literals", "test_zig_and_ruby_malformed_utf8_ingress_vectors", "test_ruby_quotient_remainder_operand_placements", "test_ruby_negation_at_signed32_transition", "test_iterative_fibonacci_uses_previous_pair", "test_parenthesized_division_and_mixed_unary_precedence", "test_utf8_program_arguments_in_c_and_posix_locales", "test_integer_conditions_never_coerce_to_boolean", "test_numeric_values_and_minus_are_not_types", "test_declaration_names_reject_numeric_tokens", "test_declaration_names_reject_float_and_digit_prefix_tokens", "test_unresolved_git_and_perforce_conflicts", "test_consecutive_statements_require_a_separator", "test_comments_preserve_fixed_operator_boundaries", "test_boolean_list_toggle_keeps_other_elements", "test_computed_assignment_and_unescaped_quote_reject", "test_million_digit_decimal_tokens_are_bounded_rejections", "test_supplementary_scalar_23456_has_exact_utf8", "test_f1_followed_by_ascii_is_invalid_utf8", "test_nul_prefix_slices_and_control_fragment_join", "test_nested_triangular_loops_preserve_outer_binding", "test_truncated_bom_source_inputs_reject", "test_signed_integer_peer_corpus_safe_arithmetic_and_boolean_storage", "test_signed_integer_peer_corpus_overflow_and_zero_divisors", "test_decimal_prefix_and_separator_finite_lexical_product", "test_long_ascii_literal_and_supported_escapes", "test_list_literal_capacity_boundaries_and_computed_elements", "test_three_hundred_owned_fragments_join_after_reassignment", "test_dead_zero_division_and_power_neighbor_cancellation", "test_control_byte_and_adjacent_identifier_have_source_locations", "test_every_byte_in_identifier_start_and_continuation", "test_seven_operands_all_supported_operator_placements", "test_demorgan_truth_and_short_circuit_effect_traces", "test_checked_negation_square_and_cube_never_wrap", "test_all_boolean_trees_through_four_leaves", "test_runner_cwd_environment_and_output_isolation", "test_ascii_and_empty_scalar_sequence_assembly", "test_signed_integer_corpus_decimal_text_conversion", "test_integer_product_expansions_only_when_every_intermediate_fits", "test_extreme_integer_relations_all_operand_placements", "test_file_write_and_buffered_close_failures", "test_reviewed_allocator_workloads", "test_small_runtime_capacity_pairwise_configurations", "test_zero_divisors_literal_and_parameter_pairs", "test_incompatible_compiler_and_runtime_fail_required_suite", "test_demorgan_signed_range_equivalence", "test_multiline_operator_and_call_diagnostics_have_locations", "test_lua_comparison_results_and_ordinary_recursion_depths", "test_empty_semicolons_sibling_scopes_and_typed_shadowing", "test_boolean_false_values_and_dense_lengths_zero_through_forty", "test_three_hundred_eighty_character_concatenations", "test_five_thousand_transient_empty_lists", "test_flat_list_literal_preserves_all_263145_positions", "test_documented_whitespace_and_raw_nul_literal", "test_four_line_endings_keep_documented_diagnostic_positions", "test_missing_list_delimiter_after_blank_lines_has_eof_location", "test_nested_branch_errors_keep_exact_compile_time_locations", "test_ff_at_source_start_is_rejected_as_invalid_utf8", "test_two_source_gap_axes_keep_all_256_diagnostic_locations", "test_integer_exit_zero_and_one_suppress_following_statements", "test_supported_syntax_depth_shapes_and_controlled_limits", "test_runtime_cleanup_without_allocations_and_poisoned_format_buffers", "test_runtime_applicable_strict_warning_profiles", "test_owned_recursion_allocator_growth_campaign", "test_integer_total_order_1001_and_1002", "test_euclidean_gcd_full_signed_one_through_nineteen_domain", "test_uppercase_true_is_an_identifier", "test_five_ordinary_quote_payloads", "test_four_if_chain_shapes", "test_six_unparenthesized_boolean_expressions", "test_comparison_result_and_all_six_branch_forms", "test_all_additive_and_multiplicative_expression_shapes", "test_negating_text_rejects_before_llvm", "test_incomplete_function_three_newline_placements", "test_all_twelve_bad_radix_tokens_reject", "test_exact_prefix_removal_values", "test_exact_suffix_removal_values", "test_binary_enumerator_size_uses_bytes_for_all_three_inputs", "test_ascii_codepoints_form_complete_numeric_scalar_list", "test_ordinary_positional_calls_keep_repetitions_and_trailing_commas", "test_one_positional_parameter_declaration_accepts_trailing_comma", "test_bare_and_integer_returns_keep_actual_callers", "test_parenthesized_integer_and_all_three_plain_list_atoms", "test_all_nine_text_selectors_keep_relative_indices_and_omitted_bounds", "test_seven_integer_literal_adjacencies_reject", "test_fraction_slash_is_rejected_after_all_eight_numeric_spellings", "test_indexed_list_literal_keeps_the_outer_list", "test_sliced_list_literal_keeps_both_collection_levels", "test_reference_self_assignment_preserves_all_specialized_set_values", "test_missing_nonnegative_clipped_substring_matrix", "test_utf8_constructor_value_projections_keep_complete_bytes", "test_lone_a1_decoder_view_rejects_at_scalar_operation", "test_invalid_a1_and_c2_preserve_raw_ingress_and_complete_byte_roundtrip", "test_valid_scalar_lengths_and_numeric_character_reads", "test_checked_numeric_scalar_reads_reject_all_four_invalid_positions"]
+let c = peer.begin(peer.suite("PeerPythonSwiftRubyLua", "tests/peer-python-swift-ruby-lua.min", names))
+if c.name == "test_three_hundred_positional_parameters_and_values" { test_three_hundred_positional_parameters_and_values(c) }
+if c.name == "test_ten_five_hundred_and_thousand_positional_arguments" { test_ten_five_hundred_and_thousand_positional_arguments(c) }
+if c.name == "test_filtered_iteration_preserves_present_payload_order" { test_filtered_iteration_preserves_present_payload_order(c) }
+if c.name == "test_text_suffix_candidates_use_scalar_boundaries" { test_text_suffix_candidates_use_scalar_boundaries(c) }
+if c.name == "test_five_module_cycle_shapes_and_acyclic_controls" { test_five_module_cycle_shapes_and_acyclic_controls(c) }
+if c.name == "test_unicode_filename_read_write_and_missing_path_guards" { test_unicode_filename_read_write_and_missing_path_guards(c) }
+if c.name == "test_python_literal_payloads_match_independent_utf8_files" { test_python_literal_payloads_match_independent_utf8_files(c) }
+if c.name == "test_swift_flag_and_mathematical_scalar_literals" { test_swift_flag_and_mathematical_scalar_literals(c) }
+if c.name == "test_zig_and_ruby_malformed_utf8_ingress_vectors" { test_zig_and_ruby_malformed_utf8_ingress_vectors(c) }
+if c.name == "test_ruby_quotient_remainder_operand_placements" { test_ruby_quotient_remainder_operand_placements(c) }
+if c.name == "test_ruby_negation_at_signed32_transition" { test_ruby_negation_at_signed32_transition(c) }
+if c.name == "test_iterative_fibonacci_uses_previous_pair" { test_iterative_fibonacci_uses_previous_pair(c) }
+if c.name == "test_parenthesized_division_and_mixed_unary_precedence" { test_parenthesized_division_and_mixed_unary_precedence(c) }
+if c.name == "test_utf8_program_arguments_in_c_and_posix_locales" { test_utf8_program_arguments_in_c_and_posix_locales(c) }
+if c.name == "test_integer_conditions_never_coerce_to_boolean" { test_integer_conditions_never_coerce_to_boolean(c) }
+if c.name == "test_numeric_values_and_minus_are_not_types" { test_numeric_values_and_minus_are_not_types(c) }
+if c.name == "test_declaration_names_reject_numeric_tokens" { test_declaration_names_reject_numeric_tokens(c) }
+if c.name == "test_declaration_names_reject_float_and_digit_prefix_tokens" { test_declaration_names_reject_float_and_digit_prefix_tokens(c) }
+if c.name == "test_unresolved_git_and_perforce_conflicts" { test_unresolved_git_and_perforce_conflicts(c) }
+if c.name == "test_consecutive_statements_require_a_separator" { test_consecutive_statements_require_a_separator(c) }
+if c.name == "test_comments_preserve_fixed_operator_boundaries" { test_comments_preserve_fixed_operator_boundaries(c) }
+if c.name == "test_boolean_list_toggle_keeps_other_elements" { test_boolean_list_toggle_keeps_other_elements(c) }
+if c.name == "test_computed_assignment_and_unescaped_quote_reject" { test_computed_assignment_and_unescaped_quote_reject(c) }
+if c.name == "test_million_digit_decimal_tokens_are_bounded_rejections" { test_million_digit_decimal_tokens_are_bounded_rejections(c) }
+if c.name == "test_supplementary_scalar_23456_has_exact_utf8" { test_supplementary_scalar_23456_has_exact_utf8(c) }
+if c.name == "test_f1_followed_by_ascii_is_invalid_utf8" { test_f1_followed_by_ascii_is_invalid_utf8(c) }
+if c.name == "test_nul_prefix_slices_and_control_fragment_join" { test_nul_prefix_slices_and_control_fragment_join(c) }
+if c.name == "test_nested_triangular_loops_preserve_outer_binding" { test_nested_triangular_loops_preserve_outer_binding(c) }
+if c.name == "test_truncated_bom_source_inputs_reject" { test_truncated_bom_source_inputs_reject(c) }
+if c.name == "test_signed_integer_peer_corpus_safe_arithmetic_and_boolean_storage" { test_signed_integer_peer_corpus_safe_arithmetic_and_boolean_storage(c) }
+if c.name == "test_signed_integer_peer_corpus_overflow_and_zero_divisors" { test_signed_integer_peer_corpus_overflow_and_zero_divisors(c) }
+if c.name == "test_decimal_prefix_and_separator_finite_lexical_product" { test_decimal_prefix_and_separator_finite_lexical_product(c) }
+if c.name == "test_long_ascii_literal_and_supported_escapes" { test_long_ascii_literal_and_supported_escapes(c) }
+if c.name == "test_list_literal_capacity_boundaries_and_computed_elements" { test_list_literal_capacity_boundaries_and_computed_elements(c) }
+if c.name == "test_three_hundred_owned_fragments_join_after_reassignment" { test_three_hundred_owned_fragments_join_after_reassignment(c) }
+if c.name == "test_dead_zero_division_and_power_neighbor_cancellation" { test_dead_zero_division_and_power_neighbor_cancellation(c) }
+if c.name == "test_control_byte_and_adjacent_identifier_have_source_locations" { test_control_byte_and_adjacent_identifier_have_source_locations(c) }
+if c.name == "test_every_byte_in_identifier_start_and_continuation" { test_every_byte_in_identifier_start_and_continuation(c) }
+if c.name == "test_seven_operands_all_supported_operator_placements" { test_seven_operands_all_supported_operator_placements(c) }
+if c.name == "test_demorgan_truth_and_short_circuit_effect_traces" { test_demorgan_truth_and_short_circuit_effect_traces(c) }
+if c.name == "test_checked_negation_square_and_cube_never_wrap" { test_checked_negation_square_and_cube_never_wrap(c) }
+if c.name == "test_all_boolean_trees_through_four_leaves" { test_all_boolean_trees_through_four_leaves(c) }
+if c.name == "test_runner_cwd_environment_and_output_isolation" { test_runner_cwd_environment_and_output_isolation(c) }
+if c.name == "test_ascii_and_empty_scalar_sequence_assembly" { test_ascii_and_empty_scalar_sequence_assembly(c) }
+if c.name == "test_signed_integer_corpus_decimal_text_conversion" { test_signed_integer_corpus_decimal_text_conversion(c) }
+if c.name == "test_integer_product_expansions_only_when_every_intermediate_fits" { test_integer_product_expansions_only_when_every_intermediate_fits(c) }
+if c.name == "test_extreme_integer_relations_all_operand_placements" { test_extreme_integer_relations_all_operand_placements(c) }
+if c.name == "test_file_write_and_buffered_close_failures" { test_file_write_and_buffered_close_failures(c) }
+if c.name == "test_reviewed_allocator_workloads" { test_reviewed_allocator_workloads(c) }
+if c.name == "test_small_runtime_capacity_pairwise_configurations" { test_small_runtime_capacity_pairwise_configurations(c) }
+if c.name == "test_zero_divisors_literal_and_parameter_pairs" { test_zero_divisors_literal_and_parameter_pairs(c) }
+if c.name == "test_incompatible_compiler_and_runtime_fail_required_suite" { test_incompatible_compiler_and_runtime_fail_required_suite(c) }
+if c.name == "test_demorgan_signed_range_equivalence" { test_demorgan_signed_range_equivalence(c) }
+if c.name == "test_multiline_operator_and_call_diagnostics_have_locations" { test_multiline_operator_and_call_diagnostics_have_locations(c) }
+if c.name == "test_lua_comparison_results_and_ordinary_recursion_depths" { test_lua_comparison_results_and_ordinary_recursion_depths(c) }
+if c.name == "test_empty_semicolons_sibling_scopes_and_typed_shadowing" { test_empty_semicolons_sibling_scopes_and_typed_shadowing(c) }
+if c.name == "test_boolean_false_values_and_dense_lengths_zero_through_forty" { test_boolean_false_values_and_dense_lengths_zero_through_forty(c) }
+if c.name == "test_three_hundred_eighty_character_concatenations" { test_three_hundred_eighty_character_concatenations(c) }
+if c.name == "test_five_thousand_transient_empty_lists" { test_five_thousand_transient_empty_lists(c) }
+if c.name == "test_flat_list_literal_preserves_all_263145_positions" { test_flat_list_literal_preserves_all_263145_positions(c) }
+if c.name == "test_documented_whitespace_and_raw_nul_literal" { test_documented_whitespace_and_raw_nul_literal(c) }
+if c.name == "test_four_line_endings_keep_documented_diagnostic_positions" { test_four_line_endings_keep_documented_diagnostic_positions(c) }
+if c.name == "test_missing_list_delimiter_after_blank_lines_has_eof_location" { test_missing_list_delimiter_after_blank_lines_has_eof_location(c) }
+if c.name == "test_nested_branch_errors_keep_exact_compile_time_locations" { test_nested_branch_errors_keep_exact_compile_time_locations(c) }
+if c.name == "test_ff_at_source_start_is_rejected_as_invalid_utf8" { test_ff_at_source_start_is_rejected_as_invalid_utf8(c) }
+if c.name == "test_two_source_gap_axes_keep_all_256_diagnostic_locations" { test_two_source_gap_axes_keep_all_256_diagnostic_locations(c) }
+if c.name == "test_integer_exit_zero_and_one_suppress_following_statements" { test_integer_exit_zero_and_one_suppress_following_statements(c) }
+if c.name == "test_supported_syntax_depth_shapes_and_controlled_limits" { test_supported_syntax_depth_shapes_and_controlled_limits(c) }
+if c.name == "test_runtime_cleanup_without_allocations_and_poisoned_format_buffers" { test_runtime_cleanup_without_allocations_and_poisoned_format_buffers(c) }
+if c.name == "test_runtime_applicable_strict_warning_profiles" { test_runtime_applicable_strict_warning_profiles(c) }
+if c.name == "test_owned_recursion_allocator_growth_campaign" { test_owned_recursion_allocator_growth_campaign(c) }
+if c.name == "test_integer_total_order_1001_and_1002" { test_integer_total_order_1001_and_1002(c) }
+if c.name == "test_euclidean_gcd_full_signed_one_through_nineteen_domain" { test_euclidean_gcd_full_signed_one_through_nineteen_domain(c) }
+if c.name == "test_uppercase_true_is_an_identifier" { test_uppercase_true_is_an_identifier(c) }
+if c.name == "test_five_ordinary_quote_payloads" { test_five_ordinary_quote_payloads(c) }
+if c.name == "test_four_if_chain_shapes" { test_four_if_chain_shapes(c) }
+if c.name == "test_six_unparenthesized_boolean_expressions" { test_six_unparenthesized_boolean_expressions(c) }
+if c.name == "test_comparison_result_and_all_six_branch_forms" { test_comparison_result_and_all_six_branch_forms(c) }
+if c.name == "test_all_additive_and_multiplicative_expression_shapes" { test_all_additive_and_multiplicative_expression_shapes(c) }
+if c.name == "test_negating_text_rejects_before_llvm" { test_negating_text_rejects_before_llvm(c) }
+if c.name == "test_incomplete_function_three_newline_placements" { test_incomplete_function_three_newline_placements(c) }
+if c.name == "test_all_twelve_bad_radix_tokens_reject" { test_all_twelve_bad_radix_tokens_reject(c) }
+if c.name == "test_exact_prefix_removal_values" { test_exact_prefix_removal_values(c) }
+if c.name == "test_exact_suffix_removal_values" { test_exact_suffix_removal_values(c) }
+if c.name == "test_binary_enumerator_size_uses_bytes_for_all_three_inputs" { test_binary_enumerator_size_uses_bytes_for_all_three_inputs(c) }
+if c.name == "test_ascii_codepoints_form_complete_numeric_scalar_list" { test_ascii_codepoints_form_complete_numeric_scalar_list(c) }
+if c.name == "test_ordinary_positional_calls_keep_repetitions_and_trailing_commas" { test_ordinary_positional_calls_keep_repetitions_and_trailing_commas(c) }
+if c.name == "test_one_positional_parameter_declaration_accepts_trailing_comma" { test_one_positional_parameter_declaration_accepts_trailing_comma(c) }
+if c.name == "test_bare_and_integer_returns_keep_actual_callers" { test_bare_and_integer_returns_keep_actual_callers(c) }
+if c.name == "test_parenthesized_integer_and_all_three_plain_list_atoms" { test_parenthesized_integer_and_all_three_plain_list_atoms(c) }
+if c.name == "test_all_nine_text_selectors_keep_relative_indices_and_omitted_bounds" { test_all_nine_text_selectors_keep_relative_indices_and_omitted_bounds(c) }
+if c.name == "test_seven_integer_literal_adjacencies_reject" { test_seven_integer_literal_adjacencies_reject(c) }
+if c.name == "test_fraction_slash_is_rejected_after_all_eight_numeric_spellings" { test_fraction_slash_is_rejected_after_all_eight_numeric_spellings(c) }
+if c.name == "test_indexed_list_literal_keeps_the_outer_list" { test_indexed_list_literal_keeps_the_outer_list(c) }
+if c.name == "test_sliced_list_literal_keeps_both_collection_levels" { test_sliced_list_literal_keeps_both_collection_levels(c) }
+if c.name == "test_reference_self_assignment_preserves_all_specialized_set_values" { test_reference_self_assignment_preserves_all_specialized_set_values(c) }
+if c.name == "test_missing_nonnegative_clipped_substring_matrix" { test_missing_nonnegative_clipped_substring_matrix(c) }
+if c.name == "test_utf8_constructor_value_projections_keep_complete_bytes" { test_utf8_constructor_value_projections_keep_complete_bytes(c) }
+if c.name == "test_lone_a1_decoder_view_rejects_at_scalar_operation" { test_lone_a1_decoder_view_rejects_at_scalar_operation(c) }
+if c.name == "test_invalid_a1_and_c2_preserve_raw_ingress_and_complete_byte_roundtrip" { test_invalid_a1_and_c2_preserve_raw_ingress_and_complete_byte_roundtrip(c) }
+if c.name == "test_valid_scalar_lengths_and_numeric_character_reads" { test_valid_scalar_lengths_and_numeric_character_reads(c) }
+if c.name == "test_checked_numeric_scalar_reads_reject_all_four_invalid_positions" { test_checked_numeric_scalar_reads_reject_all_four_invalid_positions(c) }
+peer.finish(c)
