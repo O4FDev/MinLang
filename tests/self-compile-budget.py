@@ -37,11 +37,16 @@ def file_identity(path: Path) -> dict:
     return {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
+def configuration_environment() -> dict:
+    return {name: os.environ.get(name, "") for name in ("SDKROOT", "MACOSX_DEPLOYMENT_TARGET")}
+
+
 def record_comparison(previous: Path, source: Path, manifest: Path) -> None:
     toolchain = json.loads((ROOT / "build/.toolchain.json").read_text())
     configuration = {"previous_ref": os.environ["MINYAR_BUDGET_PREVIOUS_REF"],
                      "current_ref": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
                      "toolchain": toolchain,
+                     "environment": configuration_environment(),
                      "clang": file_identity(Path(toolchain["llvm_cc"]["path"])),
                      "artifacts": {name: file_identity(path) for name, path in {
                          "current": COMPILER, "previous": previous, "input": source,
@@ -63,7 +68,8 @@ def wall_comparison(previous: Path, source: Path, manifest: Path, report: Path) 
         raise SystemExit("same-input compiler comparison requires LLVM 23.1.2")
     stamp = ROOT / "build/.toolchain.json"
     clang = Path(configuration["toolchain"]["llvm_cc"]["path"])
-    if json.loads(stamp.read_text()) != configuration["toolchain"] or file_identity(clang) != configuration["clang"]:
+    if (json.loads(stamp.read_text()) != configuration["toolchain"] or file_identity(clang) != configuration["clang"]
+            or configuration_environment() != configuration["environment"]):
         raise SystemExit("same-input compiler comparison toolchain changed")
     result = {"configuration": configuration, "pairs": [], "status": "running"}
     outputs = {name: OUTPUT.with_name("wall-comparison-" + name + ".ll")
@@ -98,7 +104,8 @@ def wall_comparison(previous: Path, source: Path, manifest: Path, report: Path) 
                                   for clock in ("wall", "cpu")}
         if {name: file_identity(path) for name, path in paths.items()} != identities:
             raise SystemExit("same-input compiler comparison artifacts changed")
-        if json.loads(stamp.read_text()) != configuration["toolchain"] or file_identity(clang) != configuration["clang"]:
+        if (json.loads(stamp.read_text()) != configuration["toolchain"] or file_identity(clang) != configuration["clang"]
+                or configuration_environment() != configuration["environment"]):
             raise SystemExit("same-input compiler comparison toolchain changed")
         for output in outputs.values():
             check_compiler_behavior(output)

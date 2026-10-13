@@ -79,6 +79,7 @@ class BudgetHarness(unittest.TestCase):
         (root / 'build/.toolchain.json').write_text(json.dumps(toolchain))
         manifest = root / 'configuration.json'
         manifest.write_text(json.dumps({'toolchain': toolchain,
+            'environment': budget.configuration_environment(),
             'clang': budget.file_identity(paths['clang']),
             'artifacts': {name: budget.file_identity(path) for name, path in paths.items() if name != 'clang'}}))
         return paths, manifest, root / 'pairs.json'
@@ -113,11 +114,14 @@ class BudgetHarness(unittest.TestCase):
             self.assertEqual(behavior.call_count, 2)
 
     def test_wall_comparison_rejects_changed_input_runtime_compiler_and_toolchain(self):
-        for changed in ('current', 'previous', 'input', 'runtime', 'clang'):
+        for changed in ('current', 'previous', 'input', 'runtime', 'clang', 'configuration'):
             with self.subTest(changed=changed), tempfile.TemporaryDirectory() as folder:
                 root = Path(folder)
                 paths, manifest, report = self.comparison_fixture(root)
-                paths[changed].write_text('changed')
+                if changed == 'configuration':
+                    (root / 'build/.toolchain.json').write_text('{}')
+                else:
+                    paths[changed].write_text('changed')
                 with mock.patch.object(budget, 'ROOT', root), mock.patch.object(budget, 'COMPILER', paths['current']), \
                      mock.patch.object(budget.subprocess, 'run') as launched, self.assertRaises(SystemExit):
                     budget.wall_comparison(paths['previous'], paths['input'], manifest, report)

@@ -601,6 +601,7 @@ output.write_bytes(b'complete executable')
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
         script = ''.join(line[10:] + '\n' for line in blocks[0].splitlines()).replace(published, digest)
         for name, body in (('uname', 'printf "%s\\n" "${TEST_ARCH:-arm64}"'),
+                           ('xcrun', 'printf "%s\\n" "$RUNNER_TEMP/sdk"'),
                            ('curl', 'while [ "$1" != -o ]; do shift; done; cp "$MINYAR_ASSET_FIXTURE" "$2"')):
             path = self.bin / name
             path.write_text('#!/bin/sh\n' + body + '\n')
@@ -623,7 +624,8 @@ output.write_bytes(b'complete executable')
                     self.assertEqual(result.stdout.splitlines()[-1], str(selected))
                     self.assertEqual((directory / 'path').read_text(), str(selected.parent) + '\n')
                     self.assertEqual((directory / 'env').read_text().splitlines(),
-                                     [name + '=' + str(selected) for name in ('CC', 'LLVM_CC', 'MINYAR_CLANG', 'MINYAR_TEST_CLANG')])
+                                     [name + '=' + str(selected) for name in ('CC', 'LLVM_CC', 'MINYAR_CLANG', 'MINYAR_TEST_CLANG')]
+                                     + ['SDKROOT=' + str(directory / 'sdk')])
                 else:
                     self.assertNotEqual(result.returncode, 0)
                     self.assertFalse(selected.exists())
