@@ -11,7 +11,10 @@ class MapBasics(CompilerTestCase):
     link_program = list_basics.ListBasics.link_program
 
     def test_inferred_typed_contextual_nested_and_duplicate_literals(self):
-        self.executes('''let inferred = {"é": 1, "🙂": 2, "é": 3,}
+        self.executes('''print('{'); print("{")
+let braces = {"{": '}', "}": '{'}
+print(braces["}"])
+let inferred = {"é": 1, "🙂": 2, "é": 3,}
 print(inferred.length); print(inferred["é"])
 let typed = Map<Integer, Text> {1: Text(11), 2: Text(22)}
 let contextual: Map<Integer, List<Integer>> = Map {1: [3, 4], 2: []}
@@ -22,7 +25,7 @@ function consume(value: Map<Text, Integer>): Integer { return value.length }
 print(consume({})); print(consume(Map {}))
 let nested = {1: {"key": Text(42)}}
 print(nested[1]["key"])
-''', '2\n3\n11\n4\n0\n0\n0\n0\n42\n')
+''', '{\n{\n{\n2\n3\n11\n4\n0\n0\n0\n0\n42\n')
 
     def test_literal_evaluation_order_and_key_lifetime(self):
         self.executes('''record Holder { key: Text; calls: Integer }

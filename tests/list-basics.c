@@ -81,7 +81,8 @@ int main(int argc, char **argv) {
     minyar_rc_release(removed);
     drain();
     MinyarRecord *map = minyar_map_new(2, 1), *other = minyar_map_new(2, 1);
-    MinyarText *key = minyar_integer_text(100), *value = minyar_integer_text(200);
+    MinyarText *key = minyar_native_copy_text((const unsigned char *)"100", 3);
+    MinyarText *value = minyar_native_copy_text((const unsigned char *)"200", 3);
     minyar_map_set(map, (long long)(uintptr_t)key, (long long)(uintptr_t)value);
     minyar_map_set(other, (long long)(uintptr_t)key, (long long)(uintptr_t)value);
     minyar_rc_release(key); minyar_rc_release(value);
