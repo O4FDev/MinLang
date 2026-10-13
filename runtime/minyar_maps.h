@@ -191,3 +191,43 @@ void minyar_map_clear(MinyarRecord *map) {
     /* In bounded profiles array scans run through the existing cleanup budget. */
     for (unsigned f = 0; f < 3; f++) minyar_rc_release(old[f]);
 }
+
+MinyarList *minyar_map_keys(const MinyarRecord *map) {
+    MinyarList *result = minyar_list_new();
+    if (map->values[MAP_KEY_KIND] == 2)
+        minyar_list_references(result);
+    list_reserve(result, map->values[MAP_LENGTH]);
+    MinyarList *hashes = map_array(map, MAP_HASHES), *keys = map_array(map, MAP_KEYS);
+    for (long long bucket = 0; bucket < hashes->length; bucket++)
+        if (hashes->values[bucket])
+            minyar_list_add(result, keys->values[bucket]);
+    return result;
+}
+
+_Bool minyar_maps_are_equal(const MinyarRecord *left, const MinyarRecord *right,
+                            long long value_type) {
+    if (left->values[MAP_LENGTH] != right->values[MAP_LENGTH] ||
+        left->values[MAP_KEY_KIND] != right->values[MAP_KEY_KIND])
+        return 0;
+    MinyarList *hashes = map_array(left, MAP_HASHES), *keys = map_array(left, MAP_KEYS);
+    MinyarList *values = map_array(left, MAP_VALUES), *other_values = map_array(right, MAP_VALUES);
+    for (long long bucket = 0; bucket < hashes->length; bucket++) {
+        if (!hashes->values[bucket]) continue;
+        size_t other = map_find(right, keys->values[bucket], (uint64_t)hashes->values[bucket]);
+        if (other == SIZE_MAX || !map_array(right, MAP_HASHES)->values[other]) return 0;
+        long long a = values->values[bucket], b = other_values->values[other];
+        if (value_type == 2) {
+            if (!map_key_equal(2, a, b)) return 0;
+        } else if (value_type == 7) {
+            double x, y;
+            memcpy(&x, &a, sizeof(x)); memcpy(&y, &b, sizeof(y));
+            if (!(x == y)) return 0;
+        } else if (value_type < -8 && (-value_type % 8) != 0) {
+            long long payload = -value_type / 8;
+            long long child = payload % 2 ? -(payload / 2) - 1 : payload / 2;
+            if (!minyar_maps_are_equal((const MinyarRecord *)(uintptr_t)a,
+                                      (const MinyarRecord *)(uintptr_t)b, child)) return 0;
+        } else if (a != b) return 0;
+    }
+    return 1;
+}

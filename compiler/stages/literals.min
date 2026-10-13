@@ -77,6 +77,55 @@ function parseListLiteral(context: CompilerContext, localNames: List<Text>, loca
     return value
 }
 
+function parseMapLiteral(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
+    let tokenKinds = context.tokenKinds
+    let tokenTexts = context.tokenTexts
+    let tokenLines = context.tokenLines
+    declareMapRuntime(globals)
+    let keyType = 0
+    let valueType = 0
+    if isMapType(resultType[0]) {
+        keyType = mapKeyType(resultType[0])
+        valueType = mapValueType(resultType[0])
+    }
+    expectToken(tokenKinds, tokenTexts, tokenLines, state, "{")
+    let map = valueName(textState, newTemporary(state))
+    let constructor = output.length
+    output.add("")
+    let owner = keepReference(output, state, map, structuralType(1, 1))
+    skipTerminators(tokenKinds, state)
+    while !tokenIs(tokenKinds, tokenTexts, state, "}") {
+        let keyResult: List<Integer> = [keyType]
+        let key = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, keyResult)
+        if keyType == 0 { keyType = keyResult[0] }
+        if keyType != 1 && keyType != 2 && keyType != 3 && keyType != 4 && keyType != 7 { fail("Map keys must be Integer, Text, Character, Boolean, or Float") }
+        requireType(tokenLines, state, keyResult[0], keyType, "Map literal key has the wrong type")
+        borrowReference(output, state, key, keyType, context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes)
+        expectToken(tokenKinds, tokenTexts, tokenLines, state, ":")
+        let itemResult: List<Integer> = [valueType]
+        let item = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, itemResult)
+        if valueType == 0 { valueType = itemResult[0] }
+        if valueType == 5 || valueType == 6 || valueType == 100000 { fail("a Map literal needs a concrete value type") }
+        requireType(tokenLines, state, itemResult[0], valueType, "Map literal value has the wrong type")
+        let keySlot = valueAsListSlot(output, textState, state, key, keyType)
+        let valueSlot = valueAsListSlot(output, textState, state, item, valueType)
+        output.add("  call void @minyar_map_set(ptr " + map + ", i64 " + keySlot + ", i64 " + valueSlot + ")\n")
+        skipTerminators(tokenKinds, state)
+        if !tokenIs(tokenKinds, tokenTexts, state, "}") {
+            expectToken(tokenKinds, tokenTexts, tokenLines, state, ",")
+            skipTerminators(tokenKinds, state)
+        }
+    }
+    expectToken(tokenKinds, tokenTexts, tokenLines, state, "}")
+    if keyType == 0 || valueType == 0 { fail("an empty Map literal needs a type, such as Map<Text, Integer>") }
+    let references = "0"
+    if isReferenceType(valueType) { references = "1" }
+    output[constructor] = "  " + map + " = call ptr @minyar_map_new(i64 " + Text(keyType) + ", i64 " + references + ")\n"
+    setType(resultType, structuralType(keyType, valueType))
+    markOwner(resultType, owner)
+    return map
+}
+
 function parseAtom(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
     let tokenKinds = context.tokenKinds
     let tokenTexts = context.tokenTexts
@@ -91,6 +140,8 @@ function parseAtom(context: CompilerContext, localNames: List<Text>, localTypes:
     let token = tokenTexts[tokenIndex]
     let value = ""
 
+    if token == "{" { return parseMapLiteral(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType) }
+
     if token == "function" && tokenTexts[tokenIndex + 1] == "(" {
         return parseClosure(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
     }
@@ -100,12 +151,16 @@ function parseAtom(context: CompilerContext, localNames: List<Text>, localTypes:
         return parseResultConstructor(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
     }
     if kind == 1 {
-        if token == "Map" && (tokenTexts[tokenIndex + 1] == "<" || tokenTexts[tokenIndex + 1] == "(") {
+        if token == "Map" && (tokenTexts[tokenIndex + 1] == "<" || tokenTexts[tokenIndex + 1] == "(" || tokenTexts[tokenIndex + 1] == "{") {
             declareMapRuntime(globals)
             let type = resultType[0]
             if tokenTexts[tokenIndex + 1] == "<" {
                 type = takeType(tokenKinds, tokenTexts, tokenLines, state, functionNames, symbolKinds)
             } else { state[0] = tokenIndex + 1 }
+            if tokenIs(tokenKinds, tokenTexts, state, "{") {
+                setType(resultType, type)
+                return parseMapLiteral(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
+            }
             if !isMapType(type) { fail("Map() needs a contextual Map<K, V> type") }
             expectToken(tokenKinds, tokenTexts, tokenLines, state, "(")
             expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
