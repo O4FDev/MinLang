@@ -129,7 +129,7 @@ check-mutation: build/stage0 build/minyarc build/minyar-runtime.o build/tooling/
 check-mutation-score-harness: build/tooling/tests/mutation-score-harness build/tooling/tests/mutation-score
 	$(LIMITED) ./build/tooling/tests/mutation-score-harness "$(CURDIR)/build/tooling/tests/mutation-score"
 
-check-mutation-score: check-mutation-score-harness build/tooling/tests/mutation-score build/tooling/tests/mutation-coverage build/stage0 build/minyarc build/minyarc-modules build/minyar-compiler-runtime.ll build/minyar-runtime.o build/tooling/tests/diagnostics build/tooling/tests/conformance build/tooling/tests/list-access build/tooling/tests/readonly-parameters build/tooling/tests/symbol-order build/tooling/tools/test-clang build/tooling/tools/clang-cache build/tooling/tests/compiler-contracts build/tooling/tests/compiler-hardening build/tooling/tests/binary-expression-ownership build/tooling/tests/source-map
+check-mutation-score: check-mutation-score-harness build/tooling/tests/regressions build/tooling/tests/list-literals build/tooling/tests/linkage build/tooling/tests/mutation-score build/tooling/tests/mutation-coverage build/stage0 build/minyarc build/minyarc-modules build/minyar-compiler-runtime.ll build/minyar-runtime.o build/tooling/tests/diagnostics build/tooling/tests/conformance build/tooling/tests/list-access build/tooling/tests/readonly-parameters build/tooling/tests/symbol-order build/tooling/tools/test-clang build/tooling/tools/clang-cache build/tooling/tests/compiler-contracts build/tooling/tests/compiler-hardening build/tooling/tests/binary-expression-ownership build/tooling/tests/source-map
 	MINYAR_MIN_MUTATION_SCORE=$(MIN_MUTATION_SCORE) $(LIMITED) ./build/tooling/tests/mutation-score
 
 
