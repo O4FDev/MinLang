@@ -350,7 +350,7 @@ check-incremental-module-performance: build/minyarc-modules build/minyar-module-
 check: check-incremental-module-performance
 
 .PHONY: check-incremental-modules-sanitize
-check-incremental-modules-sanitize: build/minyarc-modules-sanitize build/minyar-module-build-sanitize build/minyarc-modules build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-sanitize.o build/ownership-runtime.o build/minyarc-callbacks-sanitize
+check-incremental-modules-sanitize: build/minyarc-modules-sanitize build/minyar-module-build-sanitize build/minyarc-modules build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-sanitize.o build/ownership-runtime.o build/minyarc-callbacks-sanitize build/module-compiler-stage2.ll build/minyar-compiler-runtime.ll
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-modules-sanitize MINYAR_MODULE_CALLBACK_COMPILER=./build/minyarc-callbacks-sanitize $(SANITIZER_LIMITED) python3 tests/incremental-modules.py
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_MODULE_DRIVER=./build/minyar-module-build-sanitize $(SANITIZER_LIMITED) python3 tests/incremental-module-driver.py
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-modules-sanitize MINYAR_MODULE_DRIVER=./build/minyar-module-build-sanitize $(SANITIZER_LIMITED) python3 tests/incremental-module-delta.py
