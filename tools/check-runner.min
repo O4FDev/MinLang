@@ -2,7 +2,7 @@ use "./testing.min" as test
 use "system" as system
 use "files" as files
 
-public record Rule { name: Text; prerequisites: List<Text>; phony: Boolean; recipe: Boolean; target: Boolean }
+public record Rule { name: Text; prerequisites: List<Text>; phony: Boolean; recipe: Boolean; target: Boolean; stale: Boolean }
 public function begins(source: Text, prefix: Text): Boolean {
     let raw = Bytes(source)
     let pattern = Bytes(prefix)
@@ -32,6 +32,7 @@ public function database(source: Text): List<Rule> {
         }
         if begins(line, "#") {
             if current >= 0 && begins(line, "#  Phony target") { rules[current].phony = true }
+            if current >= 0 && begins(line, "#  Needs to be updated") { rules[current].stale = true }
             continue
         }
         let raw = Bytes(line)
@@ -47,7 +48,7 @@ public function database(source: Text): List<Rule> {
         if name == ".PHONY" { for item in prerequisites { phony.add(item) }; continue }
         current = findRule(rules, name)
         if current < 0 {
-            rules.add(Rule { name: name; prerequisites: prerequisites; phony: false; recipe: false; target: target })
+            rules.add(Rule { name: name; prerequisites: prerequisites; phony: false; recipe: false; target: target; stale: false })
             current = rules.length - 1
         } else {
             for item in prerequisites { rules[current].prerequisites.add(item) }
@@ -60,8 +61,8 @@ public function database(source: Text): List<Rule> {
     }
     return rules
 }
-public record Variant { name: Text; cwd: Text; environment: List<Text>; make: List<Text>; rules: List<Rule>; builder: Boolean }
-public record Goal { name: Text; variant: Integer; state: Integer; weight: Integer; handle: Integer; log: Text; started: Integer }
+public record Variant { name: Text; cwd: Text; environment: List<Text>; make: List<Text>; rules: List<Rule>; builder: Boolean; built: Map<Text, Boolean> }
+public record Goal { name: Text; variant: Integer; state: Integer; weight: Integer; handle: Integer; log: Text; started: Integer; members: Map<Text, Boolean> }
 public record Check { label: Text; target: Text; arguments: List<Text>; variant: Integer; children: List<Integer>; goals: List<Integer>;
     state: Integer; resource: Text; exclusive: Boolean; weight: Integer; handle: Integer; log: Text; started: Integer; retry: Integer; builder: Boolean }
 public record Plan { variants: List<Variant>; checks: List<Check>; goals: List<Goal>; scratch: Text; jobs: Integer; timeout: Integer; retries: Integer; interrupted: Boolean }
@@ -85,7 +86,7 @@ public function addVariant(plan: Plan, name: Text, cwd: Text, env: List<Text>, m
     for item in ["-pq", "FORCE"] { command.add(item) }
     let result = test.run(command, env, cwd, log, plan.timeout)
     test.check(result.status <= 1, "make database failed\n" + result.errorOutput)
-    plan.variants.add(Variant { name: name; cwd: cwd; environment: env; make: make; rules: database(result.output); builder: false })
+    plan.variants.add(Variant { name: name; cwd: cwd; environment: env; make: make; rules: database(result.output); builder: false; built: Map<Text, Boolean>() })
     return plan.variants.length - 1
 }
 function resource(target: Text, variant: Integer): Text {
@@ -112,7 +113,7 @@ public function addGoal(plan: Plan, variant: Integer, name: Text, weight: Intege
             return index
         }
     }
-    plan.goals.add(Goal { name: name; variant: variant; state: 0; weight: weight; handle: 0; log: ""; started: 0 })
+    plan.goals.add(Goal { name: name; variant: variant; state: 0; weight: weight; handle: 0; log: ""; started: 0; members: Map<Text, Boolean>() })
     return plan.goals.length - 1
 }
 public function addCheck(plan: Plan, variant: Integer, target: Text): Integer {
@@ -150,6 +151,45 @@ public function addCommand(plan: Plan, variant: Integer, label: Text, arguments:
         resource: resource(label, variant); exclusive: exclusive(label); weight: weight(label);
         handle: 0; log: ""; started: 0; retry: 0; builder: false })
     return plan.checks.length - 1
+}
+function closure(rules: List<Rule>, positions: Map<Text, Integer>, name: Text, members: Map<Text, Boolean>) {
+    if members.has(name) || !positions.has(name) { return }
+    let rule = rules[positions[name]]
+    if rule.phony || !rule.stale { return }
+    members[name] = rule.recipe
+    for item in rule.prerequisites { closure(rules, positions, item, members) }
+}
+function prepare(plan: Plan) {
+    for variant in 0..plan.variants.length {
+        let names: List<Text> = []
+        for goal in plan.goals { if goal.variant == variant && goal.state == 0 { names.add(goal.name) } }
+        if names.length == 0 { continue }
+        let where = plan.variants[variant]
+        let command: List<Text> = []
+        for item in where.make { command.add(item) }
+        command.add("-pq")
+        for name in names { command.add(name) }
+        let result = test.run(command, where.environment, where.cwd, plan.scratch + "/question-" + Text(variant), plan.timeout)
+        if result.status > 1 {
+            for goal in plan.goals { if goal.variant == variant { goal.members["*"] = true } }
+            continue
+        }
+        let rules = database(result.output)
+        let positions = Map<Text, Integer>()
+        for index in 0..rules.length { positions[rules[index].name] = index }
+        for goal in plan.goals { if goal.variant == variant { closure(rules, positions, goal.name, goal.members) } }
+    }
+}
+function conflicts(plan: Plan, index: Integer): Boolean {
+    let goal = plan.goals[index]
+    let built = plan.variants[goal.variant].built
+    for other in plan.goals {
+        if other.state != 1 || other.variant != goal.variant { continue }
+        for name in goal.members {
+            if goal.members[name] && !built.has(name) && other.members.has(name) && other.members[name] { return true }
+        }
+    }
+    return false
 }
 function ready(plan: Plan, check: Check): Boolean {
     for goal in plan.goals {
@@ -238,8 +278,10 @@ function execute(plan: Plan): Boolean {
                 if status.state != system.PENDING {
                     let ok = showResult("prerequisite " + goal.name, goal.log, status, goal.started)
                     goal.state = 3
-                    if ok { goal.state = 2 }
-                    plan.variants[goal.variant].builder = false
+                    if ok {
+                        goal.state = 2
+                        for name in goal.members { if name != "*" { plan.variants[goal.variant].built[name] = true } }
+                    }
                     remaining -= 1
                 } else { active += 1; ordinary = true }
             }
@@ -278,7 +320,7 @@ function execute(plan: Plan): Boolean {
             if !quiet {
                 for index in 0..plan.goals.length {
                     let goal = plan.goals[index]
-                    if goal.state == 0 && !plan.variants[goal.variant].builder && goal.weight > best {
+                    if goal.state == 0 && !plan.variants[goal.variant].builder && goal.weight > best && !conflicts(plan, index) {
                         chosenGoal = index; best = goal.weight
                     }
                 }
@@ -303,13 +345,13 @@ function execute(plan: Plan): Boolean {
             if chosenGoal >= 0 {
                 let goal = plan.goals[chosenGoal]
                 let where = plan.variants[goal.variant]
-                let args = ["/usr/bin/flock", "-F", "build/bootstrap.lock"]
+                let args = ["/usr/bin/flock", "-s", "-F", "build/bootstrap.lock"]
                 for item in where.make { args.add(item) }
                 args.add(goal.name)
                 goal.handle = monitored(plan, goal.variant, args, log, tmp, goal.name)
                 test.check(goal.handle > 0, "cannot launch builder")
                 goal.state = 1; goal.log = log; goal.started = system.monotonicNanoseconds()
-                plan.variants[goal.variant].builder = true; ordinary = true
+                ordinary = true
             } else {
                 let check = plan.checks[chosenCheck]
                 check.builder = failedGoal(plan, check)
@@ -343,6 +385,7 @@ function execute(plan: Plan): Boolean {
 }
 
 public function run(plan: Plan): Boolean {
+    prepare(plan)
     let passed = execute(plan)
     let jobs = plan.jobs
     for attempt in 0..plan.retries {
