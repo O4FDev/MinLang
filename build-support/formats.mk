@@ -46,7 +46,7 @@ check-formats-pipeline-sanitize: build/minyarc
 	$(FORMATS_SANITIZER_ENV) $(SANITIZER_LIMITED) python3 tests/formats.py --sanitize
 
 .PHONY: check-erofs check-erofs-reference
-check-erofs: build/minyarc
+check-erofs: build/minyarc tests/erofs.min tests/erofs-api.min tests/erofs-thread-main.min tests/erofs-thread-worker.min tests/erofs-thread-helper.min tests/erofs-thread-legacy.min tests/erofs-thread-legacy-helper.min
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) bash tests/erofs.sh
 
 check-erofs-reference:
