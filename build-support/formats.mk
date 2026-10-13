@@ -10,22 +10,22 @@ check-compression: build/minyarc build/tooling/tests/compression-provider
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compression-provider
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compression-codecs.py --mode native
 
-build/tooling/tests/sha256-test: private TOOL_NATIVE = tests/sha256-test-native.c
-build/tooling/tests/sha256-test: private TOOL_LIBS = -lcrypto
+build/tooling/tests/sha256-test: TOOL_NATIVE = tests/sha256-test-native.c
+build/tooling/tests/sha256-test: TOOL_LIBS = -lcrypto
 build/tooling/tests/sha256-test: tests/sha256-test-native.c
 check-sha256: build/minyarc build/minyar-default-runtime.o build/tooling/tests/sha256-test
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/sha256-test
 
-build/tooling/tests/tar-test: private TOOL_NATIVE = tests/sha256-test-native.c
-build/tooling/tests/tar-test: private TOOL_LIBS = -lcrypto
+build/tooling/tests/tar-test: TOOL_NATIVE = tests/sha256-test-native.c
+build/tooling/tests/tar-test: TOOL_LIBS = -lcrypto
 build/tooling/tests/tar-test: tests/sha256-test-native.c
-build/tooling/tests/tar-review-test: private TOOL_NATIVE = tests/sha256-test-native.c
-build/tooling/tests/tar-review-test: private TOOL_LIBS = -lcrypto
+build/tooling/tests/tar-review-test: TOOL_NATIVE = tests/sha256-test-native.c
+build/tooling/tests/tar-review-test: TOOL_LIBS = -lcrypto
 build/tooling/tests/tar-review-test: tests/sha256-test-native.c
-build/tooling/tests/tar-copy-count: private TOOL_NATIVE = tests/sha256-test-native.c
-build/tooling/tests/tar-copy-count: private TOOL_LIBS = -lcrypto
+build/tooling/tests/tar-copy-count: TOOL_NATIVE = tests/sha256-test-native.c
+build/tooling/tests/tar-copy-count: TOOL_LIBS = -lcrypto
 build/tooling/tests/tar-copy-count: tests/sha256-test-native.c
-build/tooling/tests/tar-copy-count: private TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/tar-copy-count: TOOL_RUNTIME = build/testing/cycle-runtime.o
 build/tooling/tests/tar-copy-count: build/testing/cycle-runtime.o
 check-tar: build/minyarc build/tooling/tests/tar-test
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/tar-test
@@ -53,8 +53,8 @@ check-format-provider:
 check-formats-wiring: build/tooling/tests/formats-wiring
 	$(LIMITED) ./build/tooling/tests/formats-wiring
 
-build/tooling/tests/formats-test: private TOOL_NATIVE = tests/formats-oracles-runtime.c
-build/tooling/tests/formats-test: private TOOL_LIBS = -lcrypto -lz -lzstd
+build/tooling/tests/formats-test: TOOL_NATIVE = tests/formats-oracles-runtime.c
+build/tooling/tests/formats-test: TOOL_LIBS = -lcrypto -lz -lzstd
 build/tooling/tests/formats-test: tests/formats-oracles-runtime.c
 check-formats-pipeline: build/minyarc build/tooling/tests/formats-test
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/formats-test
@@ -76,21 +76,21 @@ check-erofs-reference:
 check-formats: check-formats-wiring check-format-provider check-compression check-sha256 check-tar check-formats-pipeline
 check-formats-sanitize: check-compression-sanitize check-sha256-sanitize check-tar-sanitize check-formats-pipeline-sanitize
 
-build/tooling/benchmarks/compression-bench: private TOOL_NATIVE = tests/compression-codecs-oracle-runtime.c tests/sha256-test-native.c runtime/native/sha256.c
-build/tooling/benchmarks/compression-bench: private TOOL_LIBS = -lz -ldl -lcrypto
+build/tooling/benchmarks/compression-bench: TOOL_NATIVE = tests/compression-codecs-oracle-runtime.c tests/sha256-test-native.c runtime/native/sha256.c
+build/tooling/benchmarks/compression-bench: TOOL_LIBS = -lz -ldl -lcrypto
 build/tooling/benchmarks/compression-bench: tests/compression-codecs-oracle-runtime.c tests/sha256-test-native.c runtime/native/sha256.c
 bench-compression: build/minyarc build/tooling/benchmarks/compression-bench
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/benchmarks/compression-bench --artifacts build/compression-benchmark --prepare-only --compiler "$(abspath build/minyarc)"
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/benchmarks/compression-bench --artifacts build/compression-benchmark --run-only
 
-build/tooling/tests/sha256-bench-driver: private TOOL_NATIVE = tests/sha256-test-native.c
-build/tooling/tests/sha256-bench-driver: private TOOL_LIBS = -lcrypto
+build/tooling/tests/sha256-bench-driver: TOOL_NATIVE = tests/sha256-test-native.c
+build/tooling/tests/sha256-bench-driver: TOOL_LIBS = -lcrypto
 build/tooling/tests/sha256-bench-driver: tests/sha256-test-native.c
 bench-sha256: build/minyarc build/minyar-default-runtime.o build/tooling/tests/sha256-bench-driver
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/sha256-bench-driver
 
-build/tooling/benchmarks/tar/run: private TOOL_NATIVE = tests/text-basics-benchmark-runtime.c tests/sha256-test-native.c
-build/tooling/benchmarks/tar/run: private TOOL_LIBS = -lcrypto
+build/tooling/benchmarks/tar/run: TOOL_NATIVE = tests/text-basics-benchmark-runtime.c tests/sha256-test-native.c
+build/tooling/benchmarks/tar/run: TOOL_LIBS = -lcrypto
 build/tooling/benchmarks/tar/run: tests/text-basics-benchmark-runtime.c tests/sha256-test-native.c
 bench-tar: build/minyarc build/tooling/benchmarks/tar/run
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/benchmarks/tar/run --prepare

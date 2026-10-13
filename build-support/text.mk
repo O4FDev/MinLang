@@ -30,8 +30,8 @@ check-text-basics-models-cycles-budget1: build/tooling/tests/text-basics-model
 check check-portable: check-text-basics check-text-basics-models
 check-sanitize: check-text-basics-sanitize
 
-build/tooling/tests/text-basics-benchmark: private TOOL_NATIVE = tests/text-basics-benchmark-runtime.c runtime/native/sha256.c
-build/tooling/tests/text-basics-benchmark: private TOOL_LIBS = -lcrypto
+build/tooling/tests/text-basics-benchmark: TOOL_NATIVE = tests/text-basics-benchmark-runtime.c runtime/native/sha256.c
+build/tooling/tests/text-basics-benchmark: TOOL_LIBS = -lcrypto
 build/tooling/tests/text-basics-benchmark: tests/text-basics-benchmark-runtime.c runtime/native/sha256.c
 benchmark-text-basics: build/minyarc build/minyar-runtime.o build/minyarc-baseline build/tooling/tests/text-basics-benchmark
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/text-basics-benchmark --baseline-compiler build/minyarc-baseline --output build/text-basics-benchmark.json

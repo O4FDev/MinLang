@@ -50,7 +50,7 @@ check-release-build: build/minyarc build/minyar-runtime.o build/minyar-runtime-r
 	$(LIMITED) python3 tests/release-build.py
 
 build/tooling/experiments/memory/critical-path-study.ll: experiments/memory/study-support.min experiments/memory/measurement-stats.min tests/cpython-random.min
-build/tooling/experiments/memory/critical-path-study: private TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/experiments/memory/critical-path-study: TOOL_RUNTIME = build/testing/cycle-runtime.o
 build/tooling/experiments/memory/critical-path-study: build/testing/cycle-runtime.o
 check-critical-path: build/minyarc build/tooling/experiments/memory/critical-path-study
 	$(LIMITED) ./build/tooling/experiments/memory/critical-path-study
@@ -80,8 +80,8 @@ check-modules: build/minyarc build/minyar-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) sh tests/run-module-tests.sh
 
 .PHONY: check-json-parser check-json-parser-sanitize
-build/tooling/tests/json-parser-test: private TOOL_NATIVE = runtime/native/sha256.c
-build/tooling/tests/json-parser-test: private TOOL_LIBS = -lcrypto
+build/tooling/tests/json-parser-test: TOOL_NATIVE = runtime/native/sha256.c
+build/tooling/tests/json-parser-test: TOOL_LIBS = -lcrypto
 check-json-parser: build/minyarc build/tooling/tests/json-parser-test
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/json-parser-test
 
@@ -138,7 +138,7 @@ check-mutation-score: check-mutation-score-harness build/tooling/tests/regressio
 	MINYAR_MIN_MUTATION_SCORE=$(MIN_MUTATION_SCORE) $(LIMITED) ./build/tooling/tests/mutation-score
 
 
-build/tooling/tests/performance-test build/tooling/tests/scaling-test: private TOOL_NATIVE = tests/performance-resources.c tests/performance-test-runtime.c
+build/tooling/tests/performance-test build/tooling/tests/scaling-test: TOOL_NATIVE = tests/performance-resources.c tests/performance-test-runtime.c
 build/tooling/tests/performance-test build/tooling/tests/scaling-test: tests/performance-resources.c tests/performance-test-runtime.c
 check-performance: build/minyarc build/minyar-runtime.o build/compiler-stage3.ll build/minyar-compiler-runtime.ll build/tooling/tests/compiler-behavior build/tooling/tests/performance-test
 	$(LIMITED) ./build/tooling/tests/performance-test
@@ -549,10 +549,10 @@ check-sanitize: check-source-map-sanitize
 
 .PHONY: check-scalar-path check-scalar-study-harness
 build/tooling/experiments/memory/checked-scalars-study.ll: experiments/memory/study-support.min experiments/memory/measurement-stats.min tests/cpython-random.min
-build/tooling/experiments/memory/checked-scalars-study: private TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/experiments/memory/checked-scalars-study: TOOL_RUNTIME = build/testing/cycle-runtime.o
 build/tooling/experiments/memory/checked-scalars-study: build/testing/cycle-runtime.o
 build/tooling/tests/scalar-study-harness.ll: experiments/memory/study-support.min
-build/tooling/tests/scalar-study-harness: private TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/scalar-study-harness: TOOL_RUNTIME = build/testing/cycle-runtime.o
 build/tooling/tests/scalar-study-harness: build/testing/cycle-runtime.o
 check-scalar-study-harness: build/tooling/tests/scalar-study-harness build/tooling/experiments/memory/checked-scalars-study
 	./build/tooling/tests/scalar-study-harness "$(CURDIR)/build/tooling/tests/scalar-study-harness" "$(CURDIR)/build/tooling/experiments/memory/checked-scalars-study"
