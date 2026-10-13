@@ -1,0 +1,120 @@
+use "../tools/testing.min" as test
+use "./net-fixtures.min" as fixtures
+use "net" as net
+
+function connectBuffered(port: Integer, receiveBuffer: Integer): Integer { native "netwire" }
+function receiveBufferNative(connection: Integer, bytes: Integer): Integer { native "netwire" }
+function shutdownWriteNative(connection: Integer): Integer { native "netwire" }
+
+public record Wire { connection: Integer; input: Bytes; timeout: Integer }
+public record Response { status: Integer; names: List<Text>; values: List<Text>; body: Bytes }
+
+public function open(port: Integer): Wire { return buffered(port, 0) }
+public function buffered(port: Integer, receiveBuffer: Integer): Wire {
+    let connection = connectBuffered(port, receiveBuffer)
+    test.check(connection >= 0, "connect to 127.0.0.1:" + Text(port))
+    return Wire { connection: connection; input: Bytes(); timeout: 2000 }
+}
+public function receiveBuffer(wire: Wire, bytes: Integer) { test.check(receiveBufferNative(wire.connection, bytes) == 0, "set receive buffer") }
+public function shutdownWrite(wire: Wire) { test.check(shutdownWriteNative(wire.connection) == 0, "shutdown write") }
+public function close(wire: Wire) { net.close(wire.connection) }
+public function send(wire: Wire, data: Bytes) {
+    let offset = 0
+    while offset < data.length {
+        let written = net.writeRange(wire.connection, data, offset, data.length - offset)
+        test.check(written > 0, "send failed: " + net.lastError())
+        offset += written
+    }
+}
+public function trySend(wire: Wire, data: Bytes): Boolean {
+    let offset = 0
+    while offset < data.length {
+        let written = net.writeRange(wire.connection, data, offset, data.length - offset)
+        if written <= 0 { return false }
+        offset += written
+    }
+    return true
+}
+public function receive(wire: Wire, limit: Integer): Bytes {
+    test.check(net.ready(wire.connection, wire.timeout), "socket receive timed out")
+    return net.receive(wire.connection, limit)
+}
+function find(data: Bytes, pattern: Bytes): Integer {
+    if data.length < pattern.length { return -1 }
+    for start in 0..(data.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if data[start + index] != pattern[index] { equal = false; break } }
+        if equal { return start }
+    }
+    return -1
+}
+function lower(text: Text): Text {
+    let raw = Bytes(text)
+    let result = raw.slice(0, raw.length)
+    for index in 0..raw.length { if raw[index] >= 65 && raw[index] <= 90 { result[index] = raw[index] + 32 } }
+    return Text(result)
+}
+public function field(response: Response, name: Text): Text {
+    for index in 0..response.names.length { if response.names[index] == name { return response.values[index] } }
+    return ""
+}
+public function has(response: Response, name: Text): Boolean {
+    for item in response.names { if item == name { return true } }
+    return false
+}
+public function response(wire: Wire, head: Boolean): Response {
+    let separator = Bytes("\r\n\r\n")
+    let ending = find(wire.input, separator)
+    while ending < 0 {
+        let part = receive(wire, 65536)
+        test.check(part.length > 0, "EOF before headers: " + Text(wire.input))
+        wire.input.addBytes(part)
+        ending = find(wire.input, separator)
+    }
+    let header = Text(wire.input.slice(0, ending))
+    wire.input = wire.input.slice(ending + 4, wire.input.length)
+    let lines = fixtures.split(test.replace(header, "\r\n", "\n"), 10)
+    let status = fixtures.number(fixtures.split(lines[0], 32)[1])
+    let names: List<Text> = []
+    let values: List<Text> = []
+    for index in 1..lines.length {
+        let raw = Bytes(lines[index])
+        let colon = 0
+        while colon < raw.length && raw[colon] != 58 { colon += 1 }
+        test.check(colon < raw.length, "malformed response field")
+        let name = lower(Text(raw.slice(0, colon)))
+        for existing in names { test.check(existing != name, "duplicate response field " + name) }
+        names.add(name)
+        values.add(fixtures.strip(Text(raw.slice(colon + 1, raw.length))))
+    }
+    let result = Response { status: status; names: names; values: values; body: Bytes() }
+    test.check(!has(result, "transfer-encoding"), "transfer-encoding response")
+    let length = 0
+    if !head && status != 204 && status != 205 && status != 304 { length = fixtures.number(field(result, "content-length")) }
+    while wire.input.length < length {
+        let part = receive(wire, 65536)
+        test.check(part.length > 0, "truncated response")
+        wire.input.addBytes(part)
+    }
+    result.body = wire.input.slice(0, length)
+    wire.input = wire.input.slice(length, wire.input.length)
+    return result
+}
+public function eof(wire: Wire) {
+    test.check(wire.input.length == 0, "unexpected trailing bytes")
+    test.check(receive(wire, 1).length == 0, "socket remained open or sent extra bytes")
+}
+public function request(target: Text, method: Text, fields: Bytes, body: Bytes, close: Boolean): Bytes {
+    let result = Bytes(method + " " + target + " HTTP/1.1\r\nHost: localhost\r\n")
+    result.addBytes(fields)
+    if close { result.addBytes(Bytes("Connection: close\r\n")) }
+    result.addBytes(Bytes("\r\n"))
+    result.addBytes(body)
+    return result
+}
+public function get(target: Text, close: Boolean): Bytes { return request(target, "GET", Bytes(), Bytes(), close) }
+public function same(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}

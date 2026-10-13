@@ -1,15 +1,17 @@
 .PHONY: check-httpserver check-httpserver-sanitize
 # Aggregate hooks are POSIX-only until the server is qualified on Windows.
-check-httpserver: build/minyarc build/minyar-default-runtime.o
-	MINYAR_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/httpserver.py --mode debug
-	MINYAR_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/httpserver.py --mode release
+build/tooling/tests/httpserver-test: TOOL_NATIVE = runtime/native/net.c tests/net-wire-native.c
+build/tooling/tests/httpserver-test: runtime/native/net.c tests/net-wire-native.c
+check-httpserver: build/minyarc build/minyar-default-runtime.o build/tooling/tests/httpserver-test
+	MINYAR_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/httpserver-test --mode debug
+	MINYAR_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/httpserver-test --mode release
 
 ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
 check check-portable: check-httpserver
 endif
 
-check-httpserver-sanitize: build/minyarc
-	MINYAR_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/httpserver.py --sanitize
+check-httpserver-sanitize: build/minyarc build/tooling/tests/httpserver-test
+	MINYAR_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/httpserver-test --sanitize
 
 ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
 check-sanitize: check-httpserver-sanitize

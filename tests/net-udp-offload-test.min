@@ -1,0 +1,178 @@
+use "./net-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+use "json" as json
+
+record Report { output: Text; cases: List<Text>; context: fixtures.Context; failure: Text; sanitize: Boolean; platform: Text; linux: Boolean; digests: List<Text>; compiler: Text; version: Text }
+
+function digest(context: fixtures.Context, path: Text): Text {
+    let result = fixtures.run(context, ["sha256sum", "--", path], 30)
+    test.check(result.status == 0, "hash " + path)
+    return fixtures.split(result.output, 32)[0]
+}
+function recorded(report: Report, path: Text): Text {
+    let result = fixtures.run(report.context, ["sha256sum", "--", path], 30)
+    if result.status != 0 {
+        expect(report, false, "hash " + path)
+        return ""
+    }
+    return fixtures.split(result.output, 32)[0]
+}
+function manifest(report: Report) {
+    let commit = system.getenv("MINYAR_SOURCE_COMMIT")
+    let source = "null"
+    if commit != "" { source = json.quote(commit) }
+    let parts = ["{\n  \"passed\": ", fixtures.truth(report.failure == ""), ",\n  \"sanitize\": ", fixtures.truth(report.sanitize), ",\n  \"platform\": ", json.quote(report.platform),
+        ",\n  \"linux_feature_required\": ", fixtures.truth(report.linux), ",\n  \"source_commit\": ", source, ",\n  \"inputs\": {", joinComma(report.digests), "},\n  \"cases\": [", joinComma(report.cases), "]",
+        report.compiler, report.version, "\n}\n"]
+    writeTextFile(report.output + "/manifest.json", joinText(parts))
+}
+function expect(report: Report, condition: Boolean, message: Text): Boolean {
+    if !condition && report.failure == "" { report.failure = message }
+    return condition
+}
+function digits(text: Text): Boolean {
+    let raw = Bytes(text)
+    if raw.length == 0 || raw.length > 18 { return false }
+    for byte in raw { if byte < 48 || byte > 57 { return false } }
+    return true
+}
+function unix(text: Text, windows: Boolean): Text {
+    if windows { return test.replace(text, "\r\n", "\n") }
+    return text
+}
+function decimalMilliseconds(text: Text): Integer {
+    let parts = fixtures.split(text, 46)
+    if parts.length != 2 || Bytes(parts[1]).length != 3 || !digits(parts[0]) || !digits(parts[1]) { return -1 }
+    return fixtures.number(parts[0]) * 1000 + fixtures.number(parts[1])
+}
+function deadline(report: Report, errorOutput: Text, linux: Boolean): Text {
+    if !linux {
+        expect(report, errorOutput == "", errorOutput)
+        return ""
+    }
+    let prefix = "UDP readiness deadline: 30ms requested, "
+    if !expect(report, fixtures.starts(errorOutput, prefix) && fixtures.ends(errorOutput, " signals\n") && fixtures.count(errorOutput, "\n") == 1, errorOutput) { return "" }
+    let rest = Text(Bytes(errorOutput).slice(Bytes(prefix).length, errorOutput.byteLength - 9))
+    let words = fixtures.split(rest, 32)
+    if !expect(report, words.length == 3 && words[1] == "observed," && fixtures.ends(words[0], "ms") && digits(words[2]), errorOutput) { return "" }
+    let observed = decimalMilliseconds(Text(Bytes(words[0]).slice(0, words[0].byteLength - 2)))
+    let signals = fixtures.number(words[2])
+    if !expect(report, observed >= 20000 && observed < 100000 && signals > 0, errorOutput) { return "" }
+    return "{\"requested_ms\": 30, \"observed_ms\": " + Text(Float(observed) / 1000.0) + ", \"signals\": " + Text(signals) + "}"
+}
+function run(report: Report, label: Text, command: List<Text>, environment: List<Text>, binary: Text, seconds: Integer, extra: Text): test.Result {
+    let context = report.context
+    let started = system.monotonicNanoseconds()
+    let log = report.output + "/." + label
+    let result = test.run(command, environment, context.root, log, seconds)
+    let elapsed = Float(system.monotonicNanoseconds() - started) / 1000000000.0
+    if files.rename(log, report.output + "/" + label + ".stdout") != 0 || files.rename(log + ".err", report.output + "/" + label + ".stderr") != 0 {
+        expect(report, false, "retain " + label + " output")
+        manifest(report)
+        test.check(false, report.failure)
+    }
+    let argv: List<Text> = []
+    for item in command { argv.add(json.quote(item)) }
+    let row = ["{\"label\": ", json.quote(label), ", \"argv\": [", joinComma(argv), "], \"status\": ", Text(result.status), ", \"seconds\": ", Text(elapsed),
+        ", \"stdout_sha256\": ", json.quote(recorded(report, report.output + "/" + label + ".stdout")), ", \"stderr_sha256\": ", json.quote(recorded(report, report.output + "/" + label + ".stderr"))]
+    if binary != "" && files.pathSize(binary) >= 0 { row.add(", \"binary_sha256\": " + json.quote(recorded(report, binary))) }
+    row.add(extra)
+    row.add("}")
+    report.cases.add(joinText(row))
+    if result.status != 0 && report.failure == "" { report.failure = label + ": status " + Text(result.status) + "\n" + result.output + result.errorOutput }
+    return result
+}
+function joinComma(items: List<Text>): Text {
+    let parts: List<Text> = []
+    for item in items {
+        if parts.length > 0 { parts.add(", ") }
+        parts.add(item)
+    }
+    return joinText(parts)
+}
+
+fixtures.arguments(["--sanitize"], ["--evidence"])
+let sanitize = fixtures.flag("--sanitize")
+let context = fixtures.context(false)
+let output = fixtures.option("--evidence", "")
+if output == "" {
+    output = "build/net-udp-offload"
+    if sanitize { output = output + "-sanitize" }
+}
+if !fixtures.starts(output, "/") { output = context.root + "/" + output }
+fixtures.execute(context, ["mkdir", "-p", output], 10, "create evidence directory")
+let kernel = fixtures.strip(fixtures.execute(context, ["uname", "-s"], 10, "uname").output)
+let linux = kernel == "Linux"
+let windows = kernel == "Windows" || fixtures.starts(kernel, "MSYS") || fixtures.starts(kernel, "MINGW") || fixtures.starts(kernel, "CYGWIN")
+let suffix = ""
+if windows { suffix = ".exe" }
+let platform = fixtures.strip(fixtures.execute(context, ["uname", "-srvm"], 10, "uname").output)
+let clang = fixtures.value(context.environment, "MINYAR_TEST_CLANG")
+if clang == "" { clang = "clang" }
+let inputs = ["tests/net-udp-offload-test.min", "tests/net-fixtures.min", "tools/testing.min", "tests/net-udp-offload.c", "tests/net-udp-offload.min", "runtime/native/net.c", "runtime/minyar_runtime.c",
+    "library/net.min", "library/errors.min", "library/eventloop.min", "minyar", "tools/clang-driver.min", "tools/clang-driver-host.c"]
+let headers = fixtures.execute(context, ["find", context.root + "/runtime", "-name", "*.h", "-type", "f"], 30, "list runtime headers")
+let sortedHeaders: List<Text> = []
+for line in test.lines(headers.output) { sortedHeaders.add(Text(Bytes(line).slice(context.root.byteLength + 1, line.byteLength))) }
+for name in sortedHeaders.sorted() { inputs.add(name) }
+let digests: List<Text> = []
+for name in inputs { digests.add(json.quote(name) + ": " + json.quote(digest(context, context.root + "/" + name))) }
+let compilerPath = fixtures.run(context, ["/bin/sh", "-c", "command -v \"$1\"", "minyar", clang], 10)
+let compilerDigest = ""
+if compilerPath.status == 0 && fixtures.starts(compilerPath.output, "/") { compilerDigest = ", \"compiler_sha256\": " + json.quote(digest(context, fixtures.strip(compilerPath.output))) }
+let environment = fixtures.withSetting(fixtures.withSetting(context.environment, "MAKEFLAGS", "-j1"), "MINYAR_CLANG", clang)
+let leaks = "0"
+if linux { leaks = "1" }
+if sanitize {
+    environment = fixtures.withSetting(fixtures.withSetting(environment, "ASAN_OPTIONS", "detect_leaks=" + leaks + ":halt_on_error=1"), "UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1")
+}
+let report = Report { output: output; cases: []; context: context; failure: ""; sanitize: sanitize; platform: platform; linux: linux; digests: digests; compiler: compilerDigest; version: "" }
+let version = run(report, "compiler-version", [clang, "--version"], environment, "", 120, "")
+if report.failure == "" { report.version = ",\n  \"compiler_version\": " + json.quote(version.output) }
+for optimization in ["-O0", "-O2"] {
+    if report.failure != "" { break }
+    let label = Text(Bytes(optimization).slice(1, 3))
+    let flags = [optimization]
+    if sanitize { for flag in ["-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"] { flags.add(flag) } }
+    let binary = output + "/native-" + label + suffix
+    let command = [clang, "-std=c11", "-Wall", "-Wextra", "-Werror", "-DMINYAR_SYSTEM_HEAP=1"]
+    for flag in flags { command.add(flag) }
+    for item in [context.root + "/tests/net-udp-offload.c", context.root + "/runtime/minyar_runtime.c", "-lm", "-o", binary] { command.add(item) }
+    if windows { command.add("-lws2_32") }
+    run(report, "native-build-" + label, command, environment, binary, 120, "")
+    if report.failure != "" { break }
+    let native = run(report, "native-run-" + label, [binary], environment, binary, 30, "")
+    if report.failure != "" { break }
+    if linux {
+        if !expect(report, !test.contains(native.output, "UDP offload explicitly unavailable") && test.contains(native.output, "GRO"), native.output) { break }
+        if !expect(report, test.contains(native.output, "signal-interrupted UDP readiness retains its original deadline\n"), native.output) { break }
+    } else {
+        if !expect(report, unix(native.output, windows) == "UDP offload explicitly unavailable on this OS\n", native.output) { break }
+    }
+    let measured = deadline(report, native.errorOutput, linux)
+    if report.failure != "" { break }
+    if measured != "" {
+        let last = report.cases[report.cases.length - 1]
+        report.cases[report.cases.length - 1] = Text(Bytes(last).slice(0, last.byteLength - 1)) + ", \"readiness_deadline\": " + measured + "}"
+    }
+    let typed = output + "/typed-" + label + suffix
+    let typedFlags = flags
+    typedFlags.add("-Wno-override-module")
+    let typedEnvironment = environment
+    for name in ["MINYAR_CLANG_FLAGS", "MINYAR_RUNTIME_FLAGS", "MINYAR_NATIVE_FLAGS"] { typedEnvironment = fixtures.withSetting(typedEnvironment, name, fixtures.joinWords(typedFlags)) }
+    run(report, "typed-build-" + label, [context.root + "/minyar", context.root + "/tests/net-udp-offload.min", "-o", typed], typedEnvironment, typed, 120, "")
+    if report.failure != "" { break }
+    let result = run(report, "typed-run-" + label, [typed], typedEnvironment, typed, 30, "")
+    if report.failure != "" { break }
+    let expected = "UDP offload unavailable\n"
+    if linux { expected = "typed UDP offload boundaries verified\n" }
+    if !expect(report, unix(result.output, windows) == expected && result.errorOutput == "", "typed " + label + " (" + Text(result.status) + ")\n" + result.output + result.errorOutput) { break }
+    let scope = "explicit unavailable contracts"
+    if linux { scope = "Linux offload" }
+    print(label + ": native and typed " + scope + " passed")
+}
+manifest(report)
+test.check(report.failure == "", report.failure)
+fixtures.finish(context)

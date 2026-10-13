@@ -34,11 +34,11 @@ NET_SANITIZER_QUOTE = '$(subst ','"'"',$(1))'
 NET_SANITIZER_CLANG = $(if $(MINYAR_SANITIZER_CLANG),$(shell sh tools/toolchain.sh host-path $(call NET_SANITIZER_QUOTE,$(MINYAR_SANITIZER_CLANG))),$(LLVM_CC))
 NET_SANITIZER_PATH = $(if $(MINYAR_SANITIZER_CLANG),$(shell sh tools/toolchain.sh host-directory $(call NET_SANITIZER_QUOTE,$(NET_SANITIZER_CLANG))):$(PATH),$(PATH))
 
-check-net-udp-offload: build/minyarc build/minyar-default-runtime.o
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/net-udp-offload.py --evidence build/net-udp-offload
+check-net-udp-offload: build/minyarc build/minyar-default-runtime.o build/tooling/tests/net-udp-offload-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/net-udp-offload-test --evidence build/net-udp-offload
 
-check-net-udp-offload-sanitize: build/minyarc build/minyar-default-runtime.o tools/toolchain.sh
-	PATH="$(NET_SANITIZER_PATH)" MINYAR_TEST_CLANG=$(call NET_SANITIZER_QUOTE,$(NET_SANITIZER_CLANG)) $(SANITIZER_LIMITED) python3 tests/net-udp-offload.py --sanitize --evidence build/net-udp-offload-sanitize
+check-net-udp-offload-sanitize: build/minyarc build/minyar-default-runtime.o tools/toolchain.sh build/tooling/tests/net-udp-offload-test
+	PATH="$(NET_SANITIZER_PATH)" MINYAR_TEST_CLANG=$(call NET_SANITIZER_QUOTE,$(NET_SANITIZER_CLANG)) $(SANITIZER_LIMITED) ./build/tooling/tests/net-udp-offload-test --sanitize --evidence build/net-udp-offload-sanitize
 
 check check-portable check-quic: check-net-udp-offload
 check-sanitize check-quic-sanitize: check-net-udp-offload-sanitize

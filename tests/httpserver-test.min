@@ -1,0 +1,274 @@
+use "./net-fixtures.min" as fixtures
+use "./net-wire.min" as wire
+use "../tools/testing.min" as test
+use "system" as system
+
+record Invalid { raw: Bytes; status: Integer }
+
+function text(value: Text): Bytes { return Bytes(value) }
+function pattern(count: Integer): Bytes {
+    let result = Bytes()
+    for round in 0..count { for byte in 0..256 { result.add(byte) } }
+    return result
+}
+function repeated(byte: Integer, count: Integer): Bytes {
+    let result = Bytes()
+    for index in 0..count { result.add(byte) }
+    return result
+}
+function joined(parts: List<Bytes>): Bytes {
+    let result = Bytes()
+    for part in parts { result.addBytes(part) }
+    return result
+}
+function plain(fields: Text): Bytes { return wire.request("/", "GET", text(fields), Bytes(), false) }
+function elapsedSeconds(started: Integer): Float { return Float(system.monotonicNanoseconds() - started) / 1000000000.0 }
+function drain(client: wire.Wire) {
+    while true {
+        let part = wire.receive(client, 65536)
+        if part.length == 0 { return }
+    }
+}
+function regressions(port: Integer) {
+    let client = wire.open(port)
+    let binary = Bytes()
+    binary.add(0)
+    binary.add(255)
+    binary.addBytes(text("\r\nbody"))
+    let data = wire.request("/", "GET", text("Content-Length: 8\r\n"), binary, false)
+    for byte in data {
+        let piece = Bytes(1)
+        piece[0] = byte
+        wire.send(client, piece)
+    }
+    test.check(wire.same(wire.response(client, false).body, binary), "fragmented binary body")
+    wire.send(client, joined([wire.request("/head", "HEAD", Bytes(), Bytes(), false), wire.get("/204", false), wire.get("/205", false), wire.get("/304", false), wire.get("/stale", true)]))
+    let head = wire.response(client, true)
+    test.check(head.status == 200 && wire.field(head, "content-length") == "5" && head.body.length == 0, "HEAD response")
+    let empty = wire.response(client, false)
+    test.check(empty.status == 204 && !wire.has(empty, "content-length") && empty.body.length == 0, "204 response")
+    let reset = wire.response(client, false)
+    test.check(reset.status == 205 && wire.field(reset, "content-length") == "0" && reset.body.length == 0, "205 response")
+    test.check(wire.response(client, false).status == 304, "304 response")
+    test.check(Text(wire.response(client, false).body) == "safe", "stale response")
+    wire.eof(client)
+    wire.close(client)
+    let large = text("X-Large: ")
+    large.addBytes(repeated(120, 1024))
+    large.addBytes(text("\r\n"))
+    let invalid = [Invalid { raw: text("GET / HTTP/1.1\r\n\r\n"); status: 400 }, Invalid { raw: plain("Host: duplicate\r\n"); status: 400 },
+        Invalid { raw: text("GET / HTTP/1.1\r\nHost: bad host\r\n\r\n"); status: 400 }, Invalid { raw: text("GET / HTTP/1.1\r\nHost: [not-ipv6]\r\n\r\n"); status: 400 },
+        Invalid { raw: text("GET / HTTP/1.1\r\nHost: local:999999999999999999999\r\n\r\n"); status: 400 },
+        Invalid { raw: plain("Content-Length: 0\r\nContent-Length: 0\r\n"); status: 400 }, Invalid { raw: plain("Content-Length: 0, 0\r\n"); status: 400 },
+        Invalid { raw: plain("Content-Length: +1\r\n"); status: 400 }, Invalid { raw: plain("Content-Length: 999999999999999999999\r\n"); status: 413 },
+        Invalid { raw: plain("Transfer-Encoding: chunked\r\nContent-Length: 0\r\n"); status: 400 },
+        Invalid { raw: plain("Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n"); status: 400 },
+        Invalid { raw: wire.request("/", "GET", text("Transfer-Encoding: chunked\r\n"), text("0\r\n\r\n"), false); status: 501 },
+        Invalid { raw: plain("Expect: 100-continue\r\nContent-Length: 5\r\n"); status: 417 }, Invalid { raw: plain("Content-Length : 0\r\n"); status: 400 },
+        Invalid { raw: plain(" folded: x\r\n"); status: 400 }, Invalid { raw: joined([text("GET / HTTP/1.1\r\nHost: localhost\r\nX-Bad: "), repeated(255, 1), text("\r\n\r\n")]); status: 400 },
+        Invalid { raw: joined([text("GET / HTTP/1.1\r\nHost: localhost\r\nX-Bad: "), repeated(0, 1), text("\r\n\r\n")]); status: 400 },
+        Invalid { raw: text("GET / HTTP/1.1\nHost: localhost\n\n"); status: 400 }, Invalid { raw: wire.request("/", "GET", large, Bytes(), false); status: 431 }]
+    for item in invalid {
+        let peer = wire.open(port)
+        wire.send(peer, joined([item.raw, wire.get("/stale", false)]))
+        let response = wire.response(peer, false)
+        test.check(response.status == item.status, "invalid request status " + Text(response.status) + " expected " + Text(item.status) + ": " + Text(item.raw.slice(0, min(100, item.raw.length))))
+        test.check(wire.field(response, "connection") == "close", "invalid request keeps connection")
+        wire.eof(peer)
+        wire.close(peer)
+    }
+    let chunkedHead = wire.open(port)
+    wire.send(chunkedHead, wire.request("/", "HEAD", text("Transfer-Encoding: chunked\r\n"), Bytes(), false))
+    test.check(wire.response(chunkedHead, true).status == 501, "chunked HEAD")
+    wire.eof(chunkedHead)
+    wire.close(chunkedHead)
+    let options = wire.open(port)
+    wire.send(options, text("OPTIONS * HTTP/1.1\r\nHost: [::1]:80\r\nConnection: close\r\n\r\n"))
+    test.check(wire.response(options, false).status == 200, "OPTIONS asterisk")
+    wire.close(options)
+    let slowHeader = wire.open(port)
+    wire.send(slowHeader, text("GET / HTTP/1.1\r\nHost: localhost\r\nX-Slow: "))
+    for round in 0..7 {
+        fixtures.pause("0.035")
+        if !wire.trySend(slowHeader, text("a")) { break }
+    }
+    test.check(wire.response(slowHeader, false).status == 408, "header deadline")
+    wire.eof(slowHeader)
+    wire.close(slowHeader)
+    let injection = wire.open(port)
+    wire.send(injection, wire.get("/injection", true))
+    test.check(Text(wire.response(injection, false).body) == "rejected", "header injection")
+    wire.close(injection)
+    let echo = wire.open(port)
+    let body = pattern(256)
+    wire.send(echo, wire.request("/", "GET", text("Content-Length: 65536\r\n"), body, true))
+    test.check(wire.same(wire.response(echo, false).body, body), "64KiB echo")
+    wire.close(echo)
+    let pipeline = wire.open(port)
+    let source = pattern(257)
+    let bodies = [Bytes(), source.slice(0, 65535), source.slice(0, 65536), source.slice(0, 65537)]
+    for index in 0..bodies.length {
+        wire.send(pipeline, wire.request("/", "POST", text("Content-Length: " + Text(bodies[index].length) + "\r\n"), bodies[index], index == bodies.length - 1))
+    }
+    for expected in bodies {
+        let response = wire.response(pipeline, false)
+        test.check(response.status == 200 && wire.field(response, "content-length") == Text(expected.length), "pipeline length")
+        test.check(wire.same(response.body, expected), "binary packing boundary or pipeline ordering " + Text(expected.length))
+    }
+    wire.eof(pipeline)
+    wire.close(pipeline)
+    let bulk = wire.open(port)
+    wire.send(bulk, wire.get("/large", true))
+    let largeBody = wire.response(bulk, false).body
+    test.check(largeBody.length == 3145728, "large body length")
+    for byte in largeBody { test.check(byte == 0, "large body content") }
+    wire.close(bulk)
+    let truncated = wire.open(port)
+    wire.send(truncated, wire.request("/", "GET", text("Content-Length: 10\r\n"), text("short"), false))
+    wire.shutdownWrite(truncated)
+    test.check(wire.response(truncated, false).status == 400, "truncated body")
+    wire.eof(truncated)
+    wire.close(truncated)
+    let halfClosed = wire.open(port)
+    wire.send(halfClosed, wire.get("/head", true))
+    wire.shutdownWrite(halfClosed)
+    test.check(Text(wire.response(halfClosed, false).body) == "hello", "half-closed request")
+    wire.close(halfClosed)
+    let slow = wire.open(port)
+    wire.receiveBuffer(slow, 4096)
+    wire.send(slow, wire.get("/large", true))
+    let fast = wire.open(port)
+    wire.send(fast, wire.get("/head", true))
+    test.check(Text(wire.response(fast, false).body) == "hello", "slow receiver blocks small reply")
+    wire.close(fast)
+    wire.close(slow)
+    for prefix in [text("GET / HTTP/1.1\r\nHost: loca"), wire.request("/", "GET", text("Content-Length: 10\r\n"), text("one"), false), wire.get("/wait", false)] {
+        let stalled = wire.open(port)
+        wire.send(stalled, prefix)
+        let other = wire.open(port)
+        wire.send(other, wire.get("/head", true))
+        test.check(Text(wire.response(other, false).body) == "hello", "stalled peer blocks reply")
+        wire.close(other)
+        let started = system.monotonicNanoseconds()
+        drain(stalled)
+        test.check(elapsedSeconds(started) < 1.5, "deadline did not terminate client")
+        wire.close(stalled)
+    }
+    for round in 0..20 {
+        let reuse = wire.open(port)
+        wire.send(reuse, wire.get("/head", true))
+        test.check(Text(wire.response(reuse, false).body) == "hello", "slot reuse")
+        wire.close(reuse)
+    }
+    let occupied: List<wire.Wire> = []
+    for index in 0..4 { occupied.add(wire.open(port)) }
+    for item in occupied { wire.send(item, wire.get("/wait", false)) }
+    fixtures.pause("0.025")
+    let queued = wire.open(port)
+    wire.send(queued, wire.get("/head", true))
+    test.check(Text(wire.response(queued, false).body) == "hello", "queued backlog")
+    wire.close(queued)
+    for item in occupied { wire.close(item) }
+    let deadline = system.monotonicNanoseconds() + 2000000000
+    let active = 0
+    let slots = 0
+    while true {
+        let stats = wire.open(port)
+        wire.send(stats, wire.get("/stats", true))
+        let values = fixtures.split(Text(wire.response(stats, false).body), 58)
+        wire.close(stats)
+        active = fixtures.number(values[0])
+        slots = fixtures.number(values[1])
+        if active == 1 || system.monotonicNanoseconds() >= deadline { break }
+        fixtures.pause("0.01")
+    }
+    test.check(active == 1 && slots <= 4, "active " + Text(active) + " slots " + Text(slots))
+}
+function writeWait(context: fixtures.Context, binary: Text) {
+    let observations: List<Text> = []
+    for variant in 0..3 {
+        let halfClose = variant > 0
+        let resume = variant == 2
+        let process = fixtures.launch(context, [binary], 30)
+        let port = fixtures.number(fixtures.firstLine(context, process, 5000))
+        let client = wire.buffered(port, 4096)
+        wire.send(client, wire.get("/large", true))
+        if halfClose { wire.shutdownWrite(client) }
+        fixtures.pause("0.05")
+        let fast = wire.open(port)
+        wire.send(fast, wire.get("/small", true))
+        test.check(Text(wire.response(fast, false).body) == "ok", "backpressured writer blocked another client")
+        wire.close(fast)
+        if resume {
+            wire.receiveBuffer(client, 4194304)
+            let body = wire.response(client, false).body
+            test.check(body.length == 4194304, "valid half-close truncated a response")
+            for byte in body { test.check(byte == 0, "half-close response content") }
+            wire.eof(client)
+        }
+        let result = fixtures.collect(process)
+        wire.close(client)
+        test.check(result.status == 0, "write wait observer status " + Text(result.status) + "\n" + result.errorOutput)
+        test.check(result.errorOutput == "", result.errorOutput)
+        let values = fixtures.split(fixtures.strip(Text(Bytes(result.output).slice(process.line.byteLength + 1, result.output.byteLength))), 58)
+        let waits = fixtures.number(values[0])
+        let closedOnly = fixtures.number(values[1])
+        let ticks = fixtures.number(values[2])
+        let active = fixtures.number(values[3])
+        let row = "{'half_close': " + pythonBoolean(halfClose) + ", 'resume': " + pythonBoolean(resume) + ", 'waits': " + Text(waits) + ", 'closed_nonwritable_events': " + Text(closedOnly) + ", 'timer_ticks': " + Text(ticks) + ", 'active': " + Text(active) + "}"
+        observations.add(row)
+        test.check(waits <= 300, "backpressured writer busy-spun " + row)
+        test.check(closedOnly <= 4, "persistent nonwritable HUP readiness " + row)
+        test.check(ticks >= 5 && active == 0, "shared timer/deadline/cleanup failed " + row)
+    }
+    print("Half-close backpressure observations: [" + fixtures.joinWords(commaTerminated(observations)) + "]")
+}
+function pythonBoolean(value: Boolean): Text {
+    if value { return "True" }
+    return "False"
+}
+function commaTerminated(items: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for index in 0..items.length {
+        if index + 1 < items.length { result.add(items[index] + ",") } else { result.add(items[index]) }
+    }
+    return result
+}
+
+fixtures.arguments(["--write-only", "--sanitize"], ["--binary", "--write-binary", "--mode"])
+let mode = fixtures.option("--mode", "debug")
+test.check(mode == "debug" || mode == "release", "invalid mode: " + mode)
+test.check(fixtures.option("--binary", "") == "" || fixtures.option("--write-binary", "") != "", "--binary requires --write-binary so the mandatory regression is included")
+let sanitize = fixtures.flag("--sanitize")
+let context = fixtures.context(sanitize)
+if sanitize {
+    let leaks = "0"
+    if fixtures.strip(fixtures.execute(context, ["uname", "-s"], 10, "uname").output) == "Linux" { leaks = "1" }
+    context.environment = fixtures.withSetting(fixtures.withSetting(context.environment, "ASAN_OPTIONS", "detect_leaks=" + leaks), "UBSAN_OPTIONS", "halt_on_error=1")
+}
+let build = context.root + "/build/httpserver"
+fixtures.execute(context, ["mkdir", "-p", build], 10, "create build directory")
+let binary = fixtures.option("--binary", build + "/server-" + mode)
+let writeBinary = fixtures.option("--write-binary", build + "/write-wait-" + mode)
+if fixtures.option("--binary", "") == "" {
+    let built = test.run([context.root + "/minyar", "--" + mode, context.root + "/tests/httpserver-write-wait.min", "-o", writeBinary], context.environment, context.root, fixtures.logPath(context, "build"), 600)
+    test.require(built, "build write-wait observer")
+    if !fixtures.flag("--write-only") {
+        test.require(test.run([context.root + "/minyar", "--" + mode, context.root + "/tests/httpserver.min", "-o", binary], context.environment, context.root, fixtures.logPath(context, "build"), 600), "build HTTP server fixture")
+    }
+}
+writeWait(context, writeBinary)
+if !fixtures.flag("--write-only") {
+    let process = fixtures.launch(context, [binary], 120)
+    let port = fixtures.number(fixtures.firstLine(context, process, 5000))
+    regressions(port)
+    let quit = wire.open(port)
+    wire.send(quit, wire.get("/quit", true))
+    test.check(wire.response(quit, false).status == 200, "quit request")
+    wire.close(quit)
+    let result = fixtures.collect(process)
+    test.check(result.status == 0, "server exit " + Text(result.status) + "\n" + result.errorOutput)
+    test.check(result.errorOutput == "", result.errorOutput)
+    print("HTTP server framing, pipeline, deadlines, fairness and cleanup verified")
+}
+fixtures.finish(context)
