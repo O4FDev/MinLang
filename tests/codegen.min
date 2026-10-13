@@ -1,0 +1,68 @@
+use "../tools/testing.min" as test
+use "./native-evidence.min" as evidence
+use "./compiler-port-support.min" as port
+use "../experiments/memory/study-support.min" as data
+use "system" as system
+use "files" as files
+use "json" as json
+function tool(context: evidence.Context, name: Text): Text {
+    let directory = system.getenv("MINYAR_LLVM_BIN"); let candidate = name
+    if directory != "" { candidate = directory + "/" + name }
+    else { candidate = "/usr/lib/llvm-23/bin/" + name }
+    let found = test.run(["/bin/sh", "-c", "command -v \"$1\"", "minyar", candidate], system.environment(), "", context.path + "/tool-" + name, 10)
+    evidence.expect(context, found.status == 0 && found.output != "", "Required LLVM tool " + name + " unavailable; set MINYAR_LLVM_BIN")
+    return evidence.absolute(context, test.lines(found.output)[0])
+}
+let context = evidence.context("codegen", "codegen", "tests/codegen.min")
+context.compiler.flags = []
+let opt = tool(context, "opt"); let check = tool(context, "FileCheck")
+context.compiler.clang = test.setting("MINYAR_TEST_CLANG", "/usr/lib/llvm-23/bin/clang")
+data.set(context.controls, "opt", data.text(opt)); data.set(context.controls, "FileCheck", data.text(check))
+let names: List<Text> = []
+for name in files.list("tests/codegen") { if data.ends(name, ".min") { names.add(name) } }
+names.sort()
+evidence.expect(context, names.length == 5, "Pilot fixture inventory changed; review coverage explicitly")
+for name in names { let source = evidence.absolute(context, "tests/codegen/" + name); data.set(context.inputs, source, data.text(evidence.digest(context, source))) }
+let versions = data.object([], [])
+let tools = [opt, check, context.compiler.clang]; let labels = ["opt", "FileCheck", "clang"]
+for index in 0..tools.length {
+    let version = evidence.run(context, [tools[index], "--version"], "capability", 60, true)
+    evidence.expect(context, test.contains(version.output, "version 23."), "LLVM exactly23 required for " + labels[index])
+    data.set(versions, labels[index], data.text(version.output))
+}
+let runtime = context.path + "/runtime.o"
+evidence.run(context, [context.compiler.clang, "-O2", "-c", context.root + "/runtime/minyar_default_runtime.c", "-o", runtime], "runtime-build", 60, true)
+let rows: List<json.Value> = []
+for name in names {
+    let raw = Bytes(name); let stem = Text(raw.slice(0, raw.length - 4)); let source = context.root + "/tests/codegen/" + name; let llvm = context.path + "/" + stem + ".ll"
+    evidence.run(context, [context.compiler.executable, source, llvm, "--bounded-owners", "32"], "compile", 60, true)
+    evidence.run(context, [opt, "-passes=verify", "-disable-output", llvm], "verify", 60, true)
+    evidence.run(context, [check, source, "--input-file=" + llvm], "filecheck", 60, true)
+    let expected = evidence.reference(context, context.root + "/tests/codegen/" + stem + ".stdout")
+    for optimization in ["-O0", "-O2"] {
+        let executable = context.path + "/" + stem + optimization
+        evidence.run(context, [context.compiler.clang, optimization, "-Wno-override-module", llvm, runtime, "-o", executable, "-lm"], "link", 60, true)
+        let result = evidence.run(context, [executable], "execute", 60, false)
+        evidence.expect(context, result.status == 0 && result.output == expected && result.errorOutput == "", "codegen native output/status/stderr changed at " + optimization)
+    }
+    let references = json.member(context.controls, "output_references")
+    rows.add(data.object(["case", "variants", "verified", "checked", "output_reference"], [data.text(stem), data.strings(["O0", "O2"]), data.boolean(true), data.boolean(true), references.items[references.items.length - 1]]))
+}
+let source = context.root + "/tests/codegen/checked-arithmetic.min"; let llvm = context.path + "/checked-arithmetic.ll"
+let text = readTextFile(llvm); let lines = test.lines(text); let retained: List<Text> = []
+for line in lines { if !test.contains(line, "call void @.minyar.integer.overflow.checked") { retained.add(line + "\n") } }
+evidence.expect(context, retained.length == lines.length - 1, "Controlled mutation did not apply exactly once")
+let mutant = context.path + "/missing-guard.ll"; writeTextFile(mutant, joinText(retained))
+let rejected = evidence.run(context, [check, source, "--input-file=" + mutant], "harness-negative-control", 60, false)
+evidence.expect(context, rejected.status != 0 && test.contains(rejected.errorOutput, "CHECK"), "FileCheck accepted a removed required guard")
+let malformedNames = ["dominance", "forward-definition", "phi-target-definition", "phi-wrong-predecessor"]
+let malformed = ["define i32 @bad(i1 %condition) {\nentry:\n  br i1 %condition, label %left, label %right\nleft:\n  %value = add i32 1, 2\n  br label %right\nright:\n  ret i32 %value\n}\n", "define i64 @forward(i64 %input) {\nentry:\n  %answer = add i64 %later, 3\n  %later = add i64 %input, 5\n  ret i64 %answer\n}\n", "define i64 @loop(i1 %again) {\nentry:\n  br label %repeat\nrepeat:\n  %current = phi i64 [ %next, %entry ], [ %next, %repeat ]\n  %next = add i64 %current, 1\n  br i1 %again, label %repeat, label %done\ndone:\n  ret i64 %next\n}\n", "define i64 @joined() {\nentry:\n  br label %merge\nmerge:\n  %first = phi i64 [ 7, %entry ]\n  %second = phi i64 [ %first, %entry ]\n  ret i64 %second\n}\n"]
+for index in 0..malformedNames.length {
+    let invalid = context.path + "/" + malformedNames[index] + ".ll"; writeTextFile(invalid, malformed[index])
+    rejected = evidence.run(context, [opt, "-passes=verify", "-disable-output", invalid], "verifier-negative-" + malformedNames[index], 60, false)
+    evidence.expect(context, rejected.status != 0 && test.contains(rejected.errorOutput, "does not dominate"), "Verifier did not reject " + malformedNames[index])
+}
+let report = data.object(["status", "tools", "cases", "negative_controls"], [data.text("passed"), versions, data.array(rows), data.strings(["missing-overflow-guard", "branch-dominance", "forward-definition", "phi-target-definition", "phi-wrong-predecessor"])])
+writeTextFile(context.root + "/build/codegen-results.json", evidence.serialize(report) + "\n")
+evidence.close(context, false)
+print("Five LLVM contracts verified, FileChecked and executed at O0/O2; negative controls rejected")
