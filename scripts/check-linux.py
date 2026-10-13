@@ -30,6 +30,8 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import check_runner  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from host_paths import pinned_llvm, LLVM_VERSION
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ['build/minyarc', 'build/compiler-stage3.ll', 'build/minyarc-sanitize',
@@ -82,7 +84,7 @@ TARGETS += ['check-thread-scaling-protocol', 'check-thread-language-tsan', 'chec
 TARGETS += ['check-thread-native-regions', 'check-thread-native-regions-sanitize', 'check-thread-native-regions-tsan']
 TIERS = ('full', 'sanitize', 'all')
 # Matrix groups. correctness is the tiered main suite; the others match CI jobs.
-GROUPS = ('correctness', 'formatting', 'llvm22', 'llvm23', 'peer-testing', 'peer-semantics', 'quic',
+GROUPS = ('correctness', 'formatting', 'llvm23', 'peer-testing', 'peer-semantics', 'quic',
           'formats', 'redis', 'leaks', 'coverage', 'afl')
 LLVM_TARGETS = ['check-portable', 'check-release-build', 'check-launcher-isolation', 'check-incremental-modules']
 PEER_TESTING_TARGETS = ['check-evidence-harness', 'check-performance-metrics', 'check-peer-ownership',
@@ -162,12 +164,16 @@ def snapshot_sources(source, work):
 
 
 def resolve_toolchain(clang, cxx):
-    tools = {name: shutil.which(command) for name, command in
-             [('clang', clang), ('clang++', cxx), ('make', 'make'), ('ld.lld', 'ld.lld')]}
-    if tools['clang']:
-        matching = Path(tools['clang']).resolve().parent / 'ld.lld'
-        if matching.is_file():
-            tools['ld.lld'] = str(matching)
+    tools = {'clang': pinned_llvm(clang), 'clang++': pinned_llvm(cxx),
+             'make': shutil.which('make')}
+    matching = Path(tools['clang']).resolve().parent / 'ld.lld'
+    linker = str(matching) if matching.is_file() else shutil.which('ld.lld-23')
+    if not linker:
+        raise ValueError('Minyar requires LLVM ' + LLVM_VERSION + '; matching LLD was not found')
+    result = subprocess.run([linker, '--version'], capture_output=True, text=True, timeout=10)
+    if result.returncode or not re.search(r'\bLLD ' + re.escape(LLVM_VERSION) + r'(?=\s|$)', result.stdout):
+        raise ValueError('Minyar requires LLVM ' + LLVM_VERSION + '; unsupported linker: ' + linker)
+    tools['ld.lld'] = linker
     return tools
 
 
@@ -176,8 +182,8 @@ def main():
     p.add_argument('--source', type=Path, default=ROOT)
     p.add_argument('--resume', type=Path, help='Resume an existing run after verifying its original source snapshot; completed identical checks are reused.')
     p.add_argument('--output-dir', type=Path, help='Parent for the uniquely named retained run directory.')
-    p.add_argument('--clang', default='clang')
-    p.add_argument('--cxx', default='clang++')
+    p.add_argument('--clang', default='clang-23')
+    p.add_argument('--cxx', default='clang++-23')
     p.add_argument('--timeout', type=int, default=1800, help='Maximum seconds for each top-level check.')
     p.add_argument('--jobs', type=int, default=os.cpu_count() or 1, help='Checks run at once (default: CPU count); use 1 on a memory-constrained laptop.')
     p.add_argument('--tier', choices=TIERS, default='full', help='full (default) leaves out sanitizer checks; sanitize runs only them; all runs both.')
@@ -217,7 +223,7 @@ def main():
     if 'correctness' not in groups:
         targets = []
     # Groups other than these run in their own variant snapshots (or need no build).
-    main_build = bool(set(groups) & {'correctness', 'quic', 'formats', 'redis', 'leaks', 'coverage', 'afl'})
+    main_build = bool(set(groups) & {'correctness', 'quic', 'formats', 'redis', 'leaks', 'coverage', 'afl', 'llvm23', 'peer-testing', 'peer-semantics'})
     build = [name for name in BUILD if (a.tier != 'full' or tier_of(name) == 'full') and main_build]
     plan = {'source': str(source), 'jobs': a.jobs, 'tier': a.tier, 'groups': groups, 'build_targets': build,
             'correctness_targets': targets,
@@ -241,10 +247,9 @@ def main():
     if not all(tools.values()):
         p.error('missing tools: ' + ', '.join(name for name, path in tools.items() if not path))
     # Fail before any work when a selected group's toolchain is missing; never skip it quietly.
-    needs = {'llvm22': ['/usr/lib/llvm-22/bin/clang', '/usr/lib/llvm-22/bin/ld.lld'],
-             'llvm23': ['/usr/lib/llvm-23/bin/clang', '/usr/lib/llvm-23/bin/ld.lld'],
-             'peer-testing': ['clang-18', 'ld.lld-18', '/usr/lib/llvm-18/bin/FileCheck'],
-             'peer-semantics': ['clang-18', 'ld.lld-18'], 'quic': ['cargo', 'go', 'openssl'],
+    needs = {'llvm23': ['/usr/lib/llvm-23/bin/clang', '/usr/lib/llvm-23/bin/ld.lld'],
+             'peer-testing': ['/usr/lib/llvm-23/bin/FileCheck'],
+             'peer-semantics': ['/usr/lib/llvm-23/bin/ld.lld'], 'quic': ['cargo', 'go', 'openssl'],
              'redis': ['redis-server'], 'afl': ['afl-fuzz', 'afl-clang-fast'],
              'coverage': ['llvm-profdata', 'llvm-cov']}
     absent = sorted({tool for group in groups for tool in needs.get(group, ())
@@ -326,6 +331,8 @@ def main():
             del env[name]
     # Checks run side by side, so the host is always busy: harnesses must not pause themselves for load.
     env['MINYAR_TEST_SHARED_HOST'] = '1'
+    env['PATH'] = '/usr/lib/llvm-23/bin' + os.pathsep + env.get('PATH', '')
+    env['MINYAR_LLVM_BIN'] = '/usr/lib/llvm-23/bin'
     # Toolchain variants get the plain host environment, as their CI jobs do.
     base = dict(env)
     env.update(PATH=str(bindir) + os.pathsep + env.get('PATH', ''),
@@ -354,16 +361,6 @@ def main():
     correctness = 'correctness' in selected
     # Toolchain variants: own snapshot copy and build directory, run concurrently with the main checks.
     variants = {}
-    for version in ('22', '23'):
-        if 'llvm' + version in selected:
-            # As CI's LLVM jobs: the release's bin directory first on PATH, nothing else changed.
-            variants['llvm' + version] = ({**base, 'PATH': f'/usr/lib/llvm-{version}/bin' + os.pathsep + base['PATH']},
-                                          [tools['make'], *make[1:]])
-    if selected & {'peer-testing', 'peer-semantics'}:
-        variants['clang18'] = ({**base, 'MINYAR_TEST_CLANG': 'clang-18', 'MINYAR_TEST_LTO_FLAGS': '-flto -fuse-ld=lld-18',
-                                'MINYAR_LLVM_BIN': '/usr/lib/llvm-18/bin'},
-                               [tools['make'], '-j1', 'LIMITED=', 'SANITIZER_LIMITED=', 'CC=clang-18', 'LLVM_CC=clang-18',
-                                'COMPILER_LTO_FLAGS=-flto -fuse-ld=lld-18'])
     plan['variants'] = {name: shlex.join(variant_make) for name, (_, variant_make) in variants.items()}
 
     save()
@@ -442,23 +439,16 @@ def main():
                       group='formatting', expected=20))
         if main_build:
             prebuild += [name for name in LAUNCHER_ARTIFACTS if name in rules]
-        for name, (variant_env, variant_make) in variants.items():
-            variant = runner.add_variant(check_runner.Variant(name, evidence / ('source-' + name), variant_env,
-                                                              variant_make, python))
-            variant_rules = check_runner.make_database(variant_make, variant.work, variant_env)
-            if name.startswith('llvm'):
-                add(*check_runner.plan_make_checks(variant_rules, [*LLVM_TARGETS, 'check-module-driver-options',
-                                                                   'check-native-graphics'],
-                                                   variant_make, tier_of, EXPECTED_SECONDS, variant, name))
-                add(Check(variant.label('ir-verify'), ['sh', '-c', 'llvm-as build/compiler-stage3.ll -o /dev/null && '
-                                                       'opt -passes=verify -disable-output build/compiler-stage3.ll'],
-                          goals=['build/compiler-stage3.ll'], variant=name, group=name))
-            else:
-                for group, roots in (('peer-testing', PEER_TESTING_TARGETS), ('peer-semantics', PEER_GATES)):
-                    if group in selected:
-                        add(*check_runner.plan_make_checks(variant_rules, roots, variant_make, tier_of,
-                                                           EXPECTED_SECONDS, variant, group))
-            prebuild += [(name, goal) for goal in LAUNCHER_ARTIFACTS if goal in variant_rules]
+        if 'llvm23' in selected:
+            add(*check_runner.plan_make_checks(rules, [*LLVM_TARGETS, 'check-module-driver-options',
+                                                       'check-native-graphics'],
+                                               make, tier_of, EXPECTED_SECONDS, group='llvm23'))
+            add(Check('ir-verify', ['sh', '-c', 'llvm-as build/compiler-stage3.ll -o /dev/null && '
+                       'opt -passes=verify -disable-output build/compiler-stage3.ll'],
+                      goals=['build/compiler-stage3.ll'], group='llvm23'))
+        for group, roots in (('peer-testing', PEER_TESTING_TARGETS), ('peer-semantics', PEER_GATES)):
+            if group in selected:
+                add(*check_runner.plan_make_checks(rules, roots, make, tier_of, EXPECTED_SECONDS, group=group))
         plan['checks'] = len(checks)
         runner.run_all(checks, prebuild=prebuild)
     except (OSError, RuntimeError) as error:

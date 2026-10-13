@@ -49,16 +49,17 @@ class LinuxSnapshot(unittest.TestCase):
             chosen.mkdir()
             old.mkdir()
             for path in (chosen / 'clang', chosen / 'clang++', chosen / 'ld.lld', old / 'ld.lld'):
-                path.write_bytes(b'tool fixture')
+                path.write_text('#!/bin/sh\nprintf \'%s\\n\' \'clang version 23.1.2\'\n' if path.name != 'ld.lld' else '#!/bin/sh\nprintf \'%s\\n\' \'LLD 23.1.2\'\n')
+                path.chmod(0o755)
             commands = {'chosen-clang': str(chosen / 'clang'), 'chosen-cxx': str(chosen / 'clang++'),
-                        'make': 'make', 'ld.lld': str(old / 'ld.lld')}
+                        'make': 'make', 'ld.lld': str(old / 'ld.lld'), 'ld.lld-23': None}
             with mock.patch.object(RUNNER.shutil, 'which', side_effect=commands.get):
                 tools = RUNNER.resolve_toolchain('chosen-clang', 'chosen-cxx')
             self.assertEqual(tools['ld.lld'], str(chosen / 'ld.lld'))
             (chosen / 'ld.lld').unlink()
             with mock.patch.object(RUNNER.shutil, 'which', side_effect=commands.get):
-                tools = RUNNER.resolve_toolchain('chosen-clang', 'chosen-cxx')
-            self.assertEqual(tools['ld.lld'], str(old / 'ld.lld'))
+                with self.assertRaisesRegex(ValueError, 'matching LLD was not found'):
+                    RUNNER.resolve_toolchain('chosen-clang', 'chosen-cxx')
 
     def test_workflow_consumers_remain_reviewable_and_catalogue_valid(self):
         with tempfile.TemporaryDirectory(prefix='minyar-linux-snapshot-') as temporary:

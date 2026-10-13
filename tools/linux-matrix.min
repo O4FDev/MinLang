@@ -18,9 +18,11 @@ function targets(plan: runner.Plan, variant: Integer, names: List<Text>, tier: T
 function env(base: List<Text>, key: Text, value: Text): List<Text> { return runner.environment(base, key, value) }
 public function populate(plan: runner.Plan, source: Text, groups: List<Text>, tier: Text, roots: List<Text>, clang: Text, cxx: Text, dryRun: Boolean) {
     let base = toolchain.cleanEnvironment()
-    let compiler = toolchain.resolve(clang, base, source, plan.scratch)
-    let cxxCompiler = toolchain.resolve(cxx, base, source, plan.scratch)
-    let linker = toolchain.resolve("ld.lld", base, source, plan.scratch)
+    let bin = "/usr/lib/llvm-23/bin"
+    base = env(base, "PATH", bin + ":" + test.setting("PATH", "/usr/bin:/bin"))
+    let compiler = toolchain.pinned(clang, "clang", base, source, plan.scratch)
+    let cxxCompiler = toolchain.pinned(cxx, "clang", base, source, plan.scratch)
+    let linker = toolchain.pinned(bin + "/ld.lld", "lld", base, source, plan.scratch)
     let make = toolchain.resolve("make", base, source, plan.scratch)
     let python = toolchain.resolve("python3", base, source, plan.scratch)
     test.check(files.makeDirectory(source + "/build") == 0, "cannot create build directory")
@@ -30,7 +32,7 @@ public function populate(plan: runner.Plan, source: Text, groups: List<Text>, ti
     test.check(files.makeDirectory(cache + "/inputs") == 0, "cannot create immutable source input cache")
     let wrapper = plan.scratch + "/main-bin"
     if !dryRun { wrapper = toolchain.wrap(source, wrapper, compiler, cxxCompiler, linker, cache, plan.scratch) }
-    let environment = env(base, "PATH", wrapper + ":" + test.setting("PATH", "/usr/bin:/bin"))
+    let environment = env(base, "PATH", wrapper + ":" + bin + ":" + test.setting("PATH", "/usr/bin:/bin"))
     for key in ["CC", "LLVM_CC", "CLANG", "MINYAR_TEST_CLANG"] { environment = env(environment, key, "clang") }
     environment = env(environment, "CXX", "clang++")
     environment = env(environment, "ASAN_OPTIONS", "detect_leaks=0:abort_on_error=1")
@@ -38,6 +40,7 @@ public function populate(plan: runner.Plan, source: Text, groups: List<Text>, ti
     environment = env(environment, "COMPILER_LTO_FLAGS", "-flto -fuse-ld=lld")
     environment = env(environment, "MINYAR_AFL_SECONDS", "60")
     environment = env(environment, "MINYAR_TEST_INPUT_ROOT", cache + "/inputs")
+    environment = env(environment, "MINYAR_LLVM_BIN", bin)
     let makeArguments = [make, "-j1", "LIMITED=", "SANITIZER_LIMITED=", "CC=clang", "LLVM_CC=clang", "COMPILER_LTO_FLAGS=-flto -fuse-ld=lld"]
     let main = runner.addVariant(plan, "", source, environment, makeArguments)
     if selected(groups, "correctness") {
@@ -81,42 +84,14 @@ public function populate(plan: runner.Plan, source: Text, groups: List<Text>, ti
         plan.checks[replay].children.add(unit)
     }
     if selected(groups, "formatting") { runner.addCommand(plan, main, "formatting", [source + "/build/tooling/scripts/format"], ["build/tooling/scripts/format"]) }
-    for name in ["llvm22", "llvm23", "clang18"] {
-        let requested = selected(groups, name)
-        if name == "clang18" { requested = selected(groups, "peer-testing") || selected(groups, "peer-semantics") }
-        if !requested { continue }
-        let version = "18"
-        if name == "llvm22" { version = "22" }
-        if name == "llvm23" { version = "23" }
-        let bin = "/usr/lib/llvm-" + version + "/bin"
-        let variantEnvironment = env(base, "PATH", bin + ":" + test.setting("PATH", "/usr/bin:/bin"))
-        let variantCompiler = toolchain.resolve(bin + "/clang", variantEnvironment, source, plan.scratch)
-        let variantCxx = toolchain.resolve(bin + "/clang++", variantEnvironment, source, plan.scratch)
-        let variantLinker = toolchain.resolve(bin + "/ld.lld", variantEnvironment, source, plan.scratch)
-        let directory = plan.scratch + "/source-" + name
-        if dryRun { directory = source }
-        else { toolchain.snapshot(source, directory, plan.scratch) }
-        let variantBin = plan.scratch + "/bin-" + name
-        if !dryRun { variantBin = toolchain.wrap(source, variantBin, variantCompiler, variantCxx, variantLinker, cache, plan.scratch) }
-        variantEnvironment = env(variantEnvironment, "PATH", variantBin + ":" + bin + ":" + test.setting("PATH", "/usr/bin:/bin"))
-        variantEnvironment = env(variantEnvironment, "MINYAR_TEST_CLANG", "clang")
-        variantEnvironment = env(variantEnvironment, "MINYAR_TEST_LTO_FLAGS", "-flto -fuse-ld=lld")
-        variantEnvironment = env(variantEnvironment, "MINYAR_LLVM_BIN", bin)
-        variantEnvironment = env(variantEnvironment, "MINYAR_TEST_INPUT_ROOT", cache + "/inputs")
-        let variant = runner.addVariant(plan, name, directory, variantEnvironment, makeArguments)
-        if name == "clang18" {
-            if selected(groups, "peer-testing") { targets(plan, variant, catalogue.peerTesting(), "all") }
-            if selected(groups, "peer-semantics") { targets(plan, variant, catalogue.peerGates(), "all") }
-        } else {
-            targets(plan, variant, catalogue.llvm(), "all")
-            targets(plan, variant, ["check-module-driver-options", "check-native-graphics"], "all")
-            runner.addCommand(plan, variant, "ir-verify", ["/bin/sh", "-c", "llvm-as build/compiler-stage3.ll -o /dev/null && opt -passes=verify -disable-output build/compiler-stage3.ll"], ["build/compiler-stage3.ll"])
-        }
-        for goal in catalogue.launcherArtifacts() {
-            if runner.findRule(plan.variants[variant].rules, goal) >= 0 { runner.addGoal(plan, variant, goal, 300) }
-        }
+    if selected(groups, "llvm23") {
+        targets(plan, main, catalogue.llvm(), "all")
+        targets(plan, main, ["check-module-driver-options", "check-native-graphics"], "all")
+        runner.addCommand(plan, main, "ir-verify", ["/bin/sh", "-c", "llvm-as build/compiler-stage3.ll -o /dev/null && opt -passes=verify -disable-output build/compiler-stage3.ll"], ["build/compiler-stage3.ll"])
     }
-    let mainBuild = roots.length == 0 && (selected(groups, "correctness") || selected(groups, "quic") || selected(groups, "formats") || selected(groups, "redis") || selected(groups, "leaks") || selected(groups, "coverage") || selected(groups, "afl"))
+    if selected(groups, "peer-testing") { targets(plan, main, catalogue.peerTesting(), "all") }
+    if selected(groups, "peer-semantics") { targets(plan, main, catalogue.peerGates(), "all") }
+    let mainBuild = roots.length == 0 && (selected(groups, "correctness") || selected(groups, "quic") || selected(groups, "formats") || selected(groups, "redis") || selected(groups, "leaks") || selected(groups, "coverage") || selected(groups, "afl") || selected(groups, "llvm23") || selected(groups, "peer-testing") || selected(groups, "peer-semantics"))
     if mainBuild {
         for goal in catalogue.launcherArtifacts() {
             if runner.findRule(plan.variants[main].rules, goal) >= 0 { runner.addGoal(plan, main, goal, 300) }
