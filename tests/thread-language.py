@@ -52,6 +52,7 @@ with tempfile.TemporaryDirectory(prefix='minyar-thread-language-') as temporary:
         for fixture, expected in (('creator-exit', 'creator-exit shared frozen passed\n'),
                                   ('transfer-local', 'managed local transfer passed\n'),
                                   ('nothing-nested', 'Nothing and nested joins passed\n'),
+                                  ('recovery-unwind', 'recovery and child cleanup passed\n'),
                                   ('result-guard', None)):
             label = fixture + '-' + profile
             output = directory / label

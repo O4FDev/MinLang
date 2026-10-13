@@ -1,5 +1,6 @@
 .PHONY: check-thread-compiler check-thread-effects check-thread-language check-thread-language-sanitize check-thread-tsan-control
 .PHONY: check-thread-scaling-protocol
+.PHONY: check-thread-language-tsan
 
 check-thread-scaling-protocol:
 	$(LIMITED) python3 tests/concurrency-scaling.py
@@ -16,8 +17,11 @@ check-thread-language: build/minyarc-threads build/minyar-default-runtime.o
 check-thread-language-sanitize: build/minyarc-threads build/minyar-default-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/thread-language.py --sanitizer address
 
+check-thread-language-tsan: build/minyarc-threads build/minyar-default-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/thread-language.py --sanitizer thread
+
 check-thread-tsan-control: build/minyarc-threads build/minyar-default-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/thread-tsan-control.py
 
 check check-portable: check-thread-compiler check-thread-effects check-thread-language check-thread-scaling-protocol
-check-sanitize: check-thread-language-sanitize check-thread-tsan-control
+check-sanitize: check-thread-language-sanitize check-thread-language-tsan check-thread-tsan-control
