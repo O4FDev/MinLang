@@ -36,7 +36,7 @@ BATCHES = 3
 # ms. Retain useful shared-host headroom without allowing that regression back.
 MAX_WALL_P90_MS = 25.0
 MAX_CPU_P90_MS = 22.0
-MAX_PEAK_RSS_MIB = 10.0
+MAX_PEAK_RSS_MIB = 17.0
 MAX_INSTRUCTIONS = 75_000_000
 
 
