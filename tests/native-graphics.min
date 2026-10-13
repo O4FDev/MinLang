@@ -1,0 +1,53 @@
+use "../tools/testing.min" as test
+use "../scripts/native-host.min" as host
+use "system" as system
+
+function glfwFlags(): List<List<Text>> {
+    let exists = host.captureIn(["pkg-config", "--exists", "glfw3"], system.environment(), "", "quiet")
+    if exists.status == 0 {
+        let cflags = host.capture(["pkg-config", "--cflags", "glfw3"])
+        let libs = host.capture(["pkg-config", "--libs", "glfw3"])
+        test.check(cflags.status == 0 && libs.status == 0, "pkg-config could not describe glfw3")
+        return [host.shellWords(cflags.output), host.shellWords(libs.output)]
+    }
+    let brew = host.captureIn(["brew", "--prefix", "glfw"], system.environment(), "", "quiet")
+    let prefix = host.strip(brew.output)
+    if brew.status == 0 && host.isDirectory(prefix + "/include") {
+        return [["-I" + prefix + "/include"], ["-L" + prefix + "/lib", "-lglfw"]]
+    }
+    fail("the graphics package needs GLFW: 'brew install glfw' on macOS, 'sudo apt install libglfw3-dev' on Debian/Ubuntu, or 'pacman -S mingw-w64-ucrt-x86_64-glfw' in MSYS2 UCRT64")
+}
+function clangCommand(arguments: List<Text>, darwin: Boolean): List<Text> {
+    for option in ["-c", "-S", "-E", "-fsyntax-only", "--version", "-v"] {
+        if host.has(arguments, option) { return arguments }
+    }
+    if darwin { return arguments }
+    let result: List<Text> = []
+    for item in arguments { if item != "-lm" { result.add(item) } }
+    result.add("-lm")
+    return result
+}
+
+let cflags = glfwFlags()[0]
+let clang = system.getenv("MINYAR_TEST_CLANG")
+if clang == "" { clang = system.getenv("LLVM_CC") }
+if clang == "" { clang = "clang" }
+let darwin = host.systemName() == "darwin"
+let root = host.currentDirectory()
+let scratch = test.scratch()
+let work = scratch + "/minyar native graphics"
+test.check(host.makeDirectories(work) == "", "create graphics scratch")
+let output = work + "/loader"
+let common = [clang, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"]
+for flag in cflags { common.add(flag) }
+let loader: List<Text> = []
+for item in common { loader.add(item) }
+for item in [root + "/tests/graphics-loader.c", "-o", output] { loader.add(item) }
+test.require(test.run(clangCommand(loader, darwin), system.environment(), "", scratch + "/loader-build", 600), "compile the graphics loader")
+test.require(test.run([output], system.environment(), "", scratch + "/loader-run", 10), "run the graphics loader")
+let renderer: List<Text> = []
+for item in common { renderer.add(item) }
+for item in ["-DMINYAR_GRAPHICS_LOAD_GL=1", "-c", root + "/runtime/native/graphics.c", "-o", work + "/graphics.o"] { renderer.add(item) }
+test.require(test.run(clangCommand(renderer, darwin), system.environment(), "", scratch + "/renderer-build", 600), "compile the renderer with GL entry loading")
+test.removeTree(scratch)
+print("test_platform_headers_renderer_and_entry_loading ... ok")

@@ -1,16 +1,16 @@
 NATIVE_HOST_SOURCES = scripts/native-host.min
 NATIVE_SWIFT_SOURCES = $(NATIVE_HOST_SOURCES) scripts/native_project.min scripts/macos-app.min scripts/native-swift.min
 build/tooling/scripts/native-swift.ll build/tooling/scripts/native-frontend.ll build/tooling/tests/swiftui.ll build/tooling/tests/native-swift/compiler.ll: $(NATIVE_SWIFT_SOURCES)
-build/tooling/scripts/macos-app.ll: $(NATIVE_HOST_SOURCES) scripts/macos-app.min
+build/tooling/scripts/macos-app.ll build/tooling/tests/macos-packaging.ll: $(NATIVE_HOST_SOURCES) scripts/macos-app.min
 build/tooling/tests/native-swift/project.ll: $(NATIVE_HOST_SOURCES) scripts/native_project.min
 build/tooling/scripts/native-toolchain.ll: $(NATIVE_HOST_SOURCES)
 build/tooling/scripts/native-syntax-check.ll: $(NATIVE_HOST_SOURCES) scripts/native-toolchain.min
-build/tooling/tests/native-swift/linux.ll: $(NATIVE_HOST_SOURCES)
+build/tooling/tests/macos.ll build/tooling/tests/native-graphics.ll build/tooling/tests/graphics-render.ll build/tooling/tests/native-swift/linux.ll: $(NATIVE_HOST_SOURCES)
 
 # Native GUI integration needs a logged-in macOS desktop session.
 .PHONY: check-macos
-check-macos: build/minyarc build/minyar-default-runtime.o
-	$${MINYAR_PYTHON:-/usr/bin/python3} tests/macos.py
+check-macos: build/minyarc build/minyar-default-runtime.o build/tooling/tests/macos build/tooling/tests/macos-packaging build/tooling/scripts/macos-app
+	./build/tooling/tests/macos "$(CURDIR)/build/tooling/scripts/macos-app" "$(CURDIR)/build/tooling/tests/macos-packaging"
 
 # HTTP requests through NSURLSession against a local server.
 .PHONY: check-http
@@ -41,8 +41,8 @@ check-native-linux: check-native-project build/tooling/tests/native-swift/linux 
 
 # Real renders through the graphics package (needs a macOS desktop session).
 .PHONY: check-graphics-render
-check-graphics-render: build/minyarc
-	$${MINYAR_PYTHON:-/usr/bin/python3} tests/graphics-render.py
+check-graphics-render: build/minyarc build/tooling/tests/graphics-render
+	./build/tooling/tests/graphics-render
 
 .PHONY: check-schannel-framing check-schannel-framing-sanitize
 

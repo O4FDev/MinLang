@@ -404,8 +404,8 @@ check-cold-bootstrap:
 check-module-driver-options: build/tooling/tests/module-driver-options
 	./build/tooling/tests/module-driver-options
 
-check-native-graphics:
-	python3 tests/native-graphics.py
+check-native-graphics: build/tooling/tests/native-graphics
+	./build/tooling/tests/native-graphics
 
 check-fuzz-harness:
 	python3 tests/fuzz-harness.py

@@ -1,0 +1,147 @@
+use "../tools/testing.min" as test
+use "../scripts/native-host.min" as host
+use "system" as system
+use "files" as files
+
+record Image { width: Integer; height: Integer; pixels: Bytes }
+record Expectation { name: Text; x: Float; y: Float; red: Integer; green: Integer; blue: Integer }
+record Context { root: Text; work: Text; serial: Integer }
+
+function run(context: Context, command: List<Text>): test.Result {
+    context.serial += 1
+    let log = context.work + "/command-" + Text(context.serial)
+    return test.run(command, system.environment(), context.root, log, 120)
+}
+function bigEndian(data: Bytes, offset: Integer): Integer {
+    return (data[offset] << 24) | (data[offset + 1] << 16) | (data[offset + 2] << 8) | data[offset + 3]
+}
+function inflateStored(data: Bytes): Bytes {
+    test.check(data.length >= 6 && data[0] & 15 == 8 && (data[0] * 256 + data[1]) % 31 == 0 && data[1] & 32 == 0, "invalid zlib header")
+    let output = Bytes()
+    let position = 2
+    let last = false
+    while !last {
+        test.check(position + 5 <= data.length, "truncated deflate block")
+        let header = data[position]
+        last = header & 1 == 1
+        test.check((header >> 1) & 3 == 0, "the PNG does not use stored deflate blocks")
+        let length = data[position + 1] | (data[position + 2] << 8)
+        let complement = data[position + 3] | (data[position + 4] << 8)
+        test.check(length ^ 0xFFFF == complement, "corrupt stored block length")
+        test.check(position + 5 + length <= data.length, "truncated stored block")
+        output.addBytes(data.slice(position + 5, position + 5 + length))
+        position += 5 + length
+    }
+    test.check(position + 4 <= data.length, "missing zlib checksum")
+    let a = 1
+    let b = 0
+    for byte in output {
+        a = (a + byte) % 65521
+        b = (b + a) % 65521
+    }
+    test.check(bigEndian(data, position) == (b << 16) | a, "zlib checksum mismatch")
+    return output
+}
+function readPng(data: Bytes): Image {
+    let signature = [137, 80, 78, 71, 13, 10, 26, 10]
+    test.check(data.length >= 8, "PNG too short")
+    for index in 0..8 { test.check(data[index] == signature[index], "missing PNG signature") }
+    let position = 8
+    let compressed = Bytes()
+    let width = -1
+    let height = -1
+    while position < data.length {
+        let length = bigEndian(data, position)
+        let kind = Text(data.slice(position + 4, position + 8))
+        let body = data.slice(position + 8, position + 8 + length)
+        if kind == "IHDR" {
+            width = bigEndian(body, 0)
+            height = bigEndian(body, 4)
+        } else if kind == "IDAT" { compressed.addBytes(body) }
+        position += 12 + length
+    }
+    test.check(width > 0 && height > 0, "missing PNG header")
+    let raw = inflateStored(compressed)
+    let row = width * 3 + 1
+    test.check(raw.length == row * height, "unexpected PNG data length")
+    let pixels = Bytes()
+    for y in 0..height {
+        test.check(raw[y * row] == 0, "PNG row filter is not none")
+        pixels.addBytes(raw.slice(y * row + 1, (y + 1) * row))
+    }
+    return Image { width: width; height: height; pixels: pixels }
+}
+function sameBytes(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+function probe(image: Image, halfWidth: Float, halfHeight: Float, x: Float, y: Float): List<Integer> {
+    let column = Integer((x / halfWidth + 1.0) / 2.0 * Float(image.width))
+    let row = Integer((1.0 - y / halfHeight) / 2.0 * Float(image.height))
+    let offset = (row * image.width + column) * 3
+    return [image.pixels[offset], image.pixels[offset + 1], image.pixels[offset + 2]]
+}
+function shown(colour: List<Integer>): Text { return "(" + Text(colour[0]) + ", " + Text(colour[1]) + ", " + Text(colour[2]) + ")" }
+
+if host.strip(host.capture(["uname", "-s"]).output) != "Darwin" {
+    print("graphics render tests skipped: they need a macOS desktop session")
+    exit(0)
+}
+let root = host.currentDirectory()
+test.check(host.makeDirectories(root + "/build") == "", "create build directory")
+let made = host.temporaryDirectory(root + "/build", "graphics-render-")
+test.check(made.status == 0, made.output)
+let context = Context { root: root; work: made.output; serial: 0 }
+let work = context.work
+let program = work + "/render-check"
+let built = run(context, [root + "/minyar", root + "/benchmarks/desktop/render-check.min", "-o", program])
+test.check(built.status == 0, "build render-check\n" + built.errorOutput)
+let names = ["triangles", "triangles-again", "quads"]
+let images: List<Bytes> = []
+for name in names {
+    let image = work + "/" + name + ".png"
+    let command = [program, image]
+    if name == "quads" { command.add("quads") }
+    let result = run(context, command)
+    test.check(result.status == 0 && files.pathSize(image) >= 0, name + "\n" + result.errorOutput)
+    images.add(files.readFile(image))
+}
+test.check(sameBytes(images[0], images[1]), "the same scene rendered differently twice")
+test.check(sameBytes(images[2], images[0]), "quads drew something other than their two triangles")
+
+program = work + "/render-states"
+built = run(context, [root + "/minyar", root + "/benchmarks/desktop/render-states.min", "-o", program])
+test.check(built.status == 0, "build render-states\n" + built.errorOutput)
+let statesImage = work + "/states.png"
+let rendered = run(context, [program, statesImage])
+test.check(rendered.status == 0 && files.pathSize(statesImage) >= 0, "render states\n" + rendered.errorOutput)
+let image = readPng(files.readFile(statesImage))
+let halfHeight = 5.0 * tan(35.0 * (3.141592653589793 / 180.0))
+let halfWidth = halfHeight * Float(image.width) / Float(image.height)
+let expected = [
+    Expectation { name: "light 0.25"; x: -3.25; y: 1.75; red: 64; green: 64; blue: 64 },
+    Expectation { name: "light 1.0 after 0.25"; x: -1.25; y: 1.75; red: 255; green: 255; blue: 255 },
+    Expectation { name: "fog after a light change"; x: 0.75; y: 1.75; red: 255; green: 0; blue: 0 },
+    Expectation { name: "translucent at half opacity"; x: 2.75; y: 1.75; red: 128; green: 128; blue: 179 },
+    Expectation { name: "back face culled after translucency"; x: -3.25; y: -1.75; red: 0; green: 0; blue: 102 },
+    Expectation { name: "depth written after translucency"; x: -1.25; y: -1.75; red: 0; green: 255; blue: 0 }
+]
+for entry in expected {
+    let actual = probe(image, halfWidth, halfHeight, entry.x, entry.y)
+    let colour = [entry.red, entry.green, entry.blue]
+    for channel in 0..3 {
+        test.check(abs(actual[channel] - colour[channel]) <= 3, entry.name + ": " + shown(actual) + " expected " + shown(colour))
+    }
+}
+let corner = probe(image, halfWidth, halfHeight, -halfWidth * 0.99, halfHeight * 0.99)
+test.check(corner[0] == 255 && corner[1] == 255 && corner[2] == 0, "the overlay rectangle is missing: " + shown(corner))
+
+let broken = work + "/broken.min"
+writeTextFile(broken, "use \"graphics\" as graphics\ngraphics.openWindow(64, 64, \"Broken\")\nlet mesh = graphics.createMesh()\nlet vertices = Bytes()\nfor corner in 0..3 { graphics.addVertex(vertices, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0) }\ngraphics.updateQuads(mesh, vertices)\n")
+built = run(context, [root + "/minyar", broken, "-o", work + "/broken"])
+test.check(built.status == 0, "build broken quads\n" + built.errorOutput)
+let result = run(context, [work + "/broken"])
+test.check(result.status != 0 && test.contains(result.errorOutput, "four vertices per quad"), "incomplete quads were accepted (" + Text(result.status) + ")\n" + result.errorOutput)
+host.removeTree(work)
+print("graphics renders are deterministic, quads match their triangles, state changes between draws take effect, and incomplete quads stop")

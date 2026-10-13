@@ -1,0 +1,153 @@
+use "../tools/testing.min" as test
+use "../scripts/native-host.min" as host
+use "../scripts/macos-app.min" as app
+use "system" as system
+use "files" as files
+
+record Snapshot { paths: List<Text>; contents: List<Bytes> }
+
+function environmentWith(name: Text, value: Text): List<Text> {
+    let result: List<Text> = []
+    for entry in system.environment() { if !host.starts(entry, name + "=") { result.add(entry) } }
+    result.add(name + "=" + value)
+    return result
+}
+function execute(command: List<Text>, environment: List<Text>, log: Text, seconds: Integer): test.Result {
+    let result = test.run(command, environment, "", log, seconds)
+    files.remove(log)
+    files.remove(log + ".err")
+    return result
+}
+function snapshot(root: Text, log: Text): Snapshot {
+    let listing = execute(["/bin/sh", "-c", "cd \"$1\" && find . -type f | LC_ALL=C sort", "sh", root], system.environment(), log, 30)
+    test.require(listing, "list " + root)
+    let result = Snapshot { paths: []; contents: [] }
+    for path in host.lines(listing.output) {
+        result.paths.add(path)
+        let data = files.readFile(root + "/" + path)
+        test.check(files.lastError() == 0, "read " + root + "/" + path)
+        result.contents.add(data)
+    }
+    return result
+}
+function sameBytes(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+function sameSnapshot(left: Snapshot, right: Snapshot): Boolean {
+    if left.paths.length != right.paths.length { return false }
+    for index in 0..left.paths.length {
+        if left.paths[index] != right.paths[index] || !sameBytes(left.contents[index], right.contents[index]) { return false }
+    }
+    return true
+}
+function plist(path: Text, key: Text, log: Text): Text {
+    let result = execute(["plutil", "-extract", key, "raw", "-o", "-", path], system.environment(), log, 30)
+    test.require(result, "read " + key + " from " + path)
+    return host.strip(result.output)
+}
+function temporaries(directory: Text): List<Text> {
+    let found: List<Text> = []
+    for name in files.list(directory) { if host.starts(name, ".minyar-app-") { found.add(directory + "/" + name) } }
+    return found
+}
+
+if host.strip(host.capture(["uname", "-s"]).output) != "Darwin" {
+    print("macOS packaging tests skipped")
+    exit(0)
+}
+let tool = host.absolute("build/tooling/scripts/macos-app")
+if argumentCount() > 0 { tool = host.absolute(argument(0)) }
+let scratch = test.scratch()
+let resolved = host.resolve(scratch, true)
+test.check(resolved.status == 0, "resolve packaging scratch")
+let temp = resolved.output
+let logs = temp + "/logs"
+test.check(host.makeDirectories(logs) == "", "create log directory")
+let log = logs + "/command"
+let binary = temp + "/hello"
+writeTextFile(temp + "/hello.c", "int main(void) { return 0; }")
+test.require(execute([test.setting("MINYAR_TEST_CLANG", "clang"), "-x", "c", temp + "/hello.c", "-o", binary], system.environment(), log, 120), "compile packaged executable")
+let bundle = temp + "/App & Unicode é.app"
+function package(tool: Text, binary: Text, output: Text, identifier: Text, environment: List<Text>, extra: List<Text>, log: Text): test.Result {
+    let command = [tool, "--binary", binary, "--output", output, "--identifier", identifier]
+    for item in extra { command.add(item) }
+    return execute(command, environment, log, 30)
+}
+let result = package(tool, binary, bundle, "org.minyar.packaging", system.environment(), [], log)
+test.check(result.status == 0, "initial packaging failed\n" + result.errorOutput)
+test.check(plist(bundle + "/Contents/Info.plist", "CFBundleDisplayName", log) == "App & Unicode é", "display name")
+test.check(plist(bundle + "/Contents/Info.plist", "CFBundleExecutable", log) == "application", "executable name")
+test.require(execute(["codesign", "--verify", "--strict", bundle], system.environment(), log, 60), "verify the initial signature")
+
+let before = snapshot(bundle, log)
+let fake = temp + "/tools"
+test.check(host.makeDirectories(fake) == "", "create fake tool directory")
+writeTextFile(fake + "/codesign", "#!/bin/sh\necho \"injected signing failure\" >&2\nexit 1\n")
+test.check(host.makeExecutable(fake + "/codesign") == "", "make the fake signer executable")
+result = package(tool, binary, bundle, "org.minyar.packaging", environmentWith("PATH", fake + ":" + system.getenv("PATH")), [], log)
+test.check(result.status != 0 && test.contains(result.errorOutput, "injected signing failure"), "signing failure was not reported\n" + result.errorOutput)
+test.check(sameSnapshot(before, snapshot(bundle, log)), "an unsigned replacement was installed")
+
+let installFailure = app.packageWith(binary, bundle, "org.minyar.replacement", "", "", [host.RenameFault { source: host.basename(bundle); destination: bundle; message: "injected installation failure" }])
+test.check(test.contains(installFailure, "injected installation failure"), "installation failure was not propagated: " + installFailure)
+test.check(sameSnapshot(before, snapshot(bundle, log)), "a failed installation changed the bundle")
+test.check(temporaries(temp).length == 0, "a failed installation left its staging directory")
+
+let rollbackFailure = app.packageWith(binary, bundle, "org.minyar.replacement", "", "", [host.RenameFault { source: ""; destination: bundle; message: "injected installation and rollback failure" }])
+test.check(test.contains(rollbackFailure, "previous app preserved at"), "rollback failure was not propagated: " + rollbackFailure)
+let preserved: List<Text> = []
+for directory in temporaries(temp) { if host.isDirectory(directory + "/previous.app") { preserved.add(directory + "/previous.app") } }
+test.check(preserved.length == 1, "expected one preserved previous app")
+test.check(sameSnapshot(before, snapshot(preserved[0], log)), "the preserved app differs from the previous bundle")
+test.check(host.rename(preserved[0], bundle, []) == "", "restore the preserved app")
+test.check(host.removeTree(host.parent(preserved[0])) == "", "remove the preserved staging directory")
+
+let lock = bundle + ".minyar-lock"
+writeTextFile(lock, "")
+result = package(tool, binary, bundle, "org.minyar.packaging", system.environment(), [], log)
+test.check(result.status != 0 && test.contains(result.errorOutput, "locked"), "a locked output was replaced\n" + result.errorOutput)
+test.check(files.pathSize(lock) >= 0, "the lock of another build was removed")
+test.check(files.remove(lock) == 0, "remove the test lock")
+
+let alias = temp + "/Alias.app"
+test.check(host.run(["ln", "-s", bundle, alias]) == 0, "create app symlink")
+result = package(tool, binary, alias, "org.minyar.packaging", system.environment(), [], log)
+test.check(result.status != 0 && test.contains(result.errorOutput, "refusing to replace"), "a symbolic link was replaced\n" + result.errorOutput)
+test.check(host.isSymlink(alias), "the symbolic link was removed")
+
+let foreign = temp + "/Foreign.app"
+test.check(host.makeDirectories(foreign) == "", "create foreign app")
+writeTextFile(foreign + "/keep", "untouched")
+result = package(tool, binary, foreign, "org.minyar.packaging", system.environment(), [], log)
+test.check(result.status != 0 && test.contains(result.errorOutput, "refusing to replace"), "a foreign app was replaced\n" + result.errorOutput)
+test.check(readTextFile(foreign + "/keep") == "untouched", "the foreign app changed")
+
+result = package(tool, binary, bundle, "invalid/id", system.environment(), [], log)
+test.check(result.status != 0 && test.contains(result.errorOutput, "bundle ID"), "an invalid bundle ID was accepted\n" + result.errorOutput)
+result = package(tool, binary, bundle, "org.minyar.updated", system.environment(), [], log)
+test.check(result.status == 0, "updated packaging failed\n" + result.errorOutput)
+test.check(plist(bundle + "/Contents/Info.plist", "CFBundleIdentifier", log) == "org.minyar.updated", "updated bundle identifier")
+test.require(execute(["codesign", "--verify", "--strict", bundle], system.environment(), log, 60), "verify the updated signature")
+
+let icon = temp + "/Icon.icns"
+test.require(execute(["sips", "-s", "format", "icns", "/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/GenericApplicationIcon.icns", "--out", icon], system.environment(), log, 60), "create an icon")
+let resources = temp + "/resources"
+test.check(host.makeDirectories(resources + "/fonts") == "", "create resources")
+writeTextFile(resources + "/fonts/Note.txt", "bundled é")
+result = package(tool, binary, bundle, "org.minyar.resources", system.environment(), ["--icon", icon, "--resources", resources], log)
+test.check(result.status == 0, "packaging with an icon and resources failed\n" + result.errorOutput)
+test.check(plist(bundle + "/Contents/Info.plist", "CFBundleIconFile", log) == "Icon.icns", "icon file name")
+test.check(sameBytes(files.readFile(bundle + "/Contents/Resources/Icon.icns"), files.readFile(icon)), "bundled icon differs")
+test.check(readTextFile(bundle + "/Contents/Resources/fonts/Note.txt") == "bundled é", "bundled resource differs")
+test.require(execute(["codesign", "--verify", "--strict", bundle], system.environment(), log, 60), "verify the signature with resources")
+writeBytesFile(temp + "/icon.png", Bytes("png"))
+result = package(tool, binary, bundle, "org.minyar.resources", system.environment(), ["--icon", temp + "/icon.png"], log)
+test.check(result.status != 0 && test.contains(result.errorOutput, ".icns"), "a non-icns icon was accepted\n" + result.errorOutput)
+writeBytesFile(resources + "/Icon.icns", Bytes("clash"))
+result = package(tool, binary, bundle, "org.minyar.resources", system.environment(), ["--icon", icon, "--resources", resources], log)
+test.check(result.status != 0 && test.contains(result.errorOutput, "would replace"), "a clashing resource was accepted\n" + result.errorOutput)
+test.check(readTextFile(bundle + "/Contents/Resources/fonts/Note.txt") == "bundled é", "a rejected package changed the bundle")
+test.removeTree(scratch)
+print("macOS bundle replacement, signing failure, locks, symlinks, icons, resources and Unicode metadata verified")

@@ -1,0 +1,147 @@
+use "../tools/testing.min" as test
+use "../scripts/native-host.min" as host
+use "system" as system
+use "files" as files
+
+record Runner { root: Text; logs: Text; serial: Integer }
+record Failure { mode: Text; message: Text }
+
+function environmentWith(name: Text, value: Text): List<Text> {
+    let result: List<Text> = []
+    for entry in system.environment() { if !host.starts(entry, name + "=") { result.add(entry) } }
+    result.add(name + "=" + value)
+    return result
+}
+function spaced(command: List<Text>): Text {
+    let result = ""
+    for index in 0..command.length {
+        if index > 0 { result += " " }
+        result += command[index]
+    }
+    return result
+}
+function execute(runner: Runner, command: List<Text>, environment: List<Text>, ok: Boolean): test.Result {
+    runner.serial += 1
+    let log = runner.logs + "/" + Text(runner.serial)
+    let result = test.run(command, environment, runner.root, log, 600)
+    if ok { test.check(result.status == 0, spaced(command) + "\n" + result.output + "\n" + result.errorOutput) }
+    else { test.check(result.status != 0, "expected failure: " + spaced(command)) }
+    return result
+}
+function run(runner: Runner, command: List<Text>): test.Result { return execute(runner, command, system.environment(), true) }
+function plist(runner: Runner, path: Text, key: Text): Text {
+    return host.strip(run(runner, ["plutil", "-extract", key, "raw", "-o", "-", path]).output)
+}
+function sameBytes(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+function listed(flags: List<Text>): Text {
+    if flags.length == 0 { return "['debug']" }
+    let result = "["
+    for index in 0..flags.length {
+        if index > 0 { result += ", " }
+        result += "'" + flags[index] + "'"
+    }
+    return result + "]"
+}
+
+if host.strip(host.capture(["uname", "-s"]).output) != "Darwin" {
+    print("macOS desktop tests skipped: requires macOS with a GUI session")
+    exit(0)
+}
+let root = host.currentDirectory()
+test.check(host.makeDirectories(root + "/build") == "", "create build directory")
+let made = host.temporaryDirectory(root + "/build", "macos-test-")
+test.check(made.status == 0, made.output)
+let temp = made.output
+let runner = Runner { root: root; logs: temp + "/logs"; serial: 0 }
+test.check(host.makeDirectories(runner.logs) == "", "create log directory")
+let packager = root + "/build/tooling/scripts/macos-app"
+let packagingTest = root + "/build/tooling/tests/macos-packaging"
+if argumentCount() > 0 { packager = host.absolute(argument(0)) }
+if argumentCount() > 1 { packagingTest = host.absolute(argument(1)) }
+print(host.strip(run(runner, [packagingTest, packager]).output))
+run(runner, ["make", "-s", "build/minyarc", "build/minyar-default-runtime.o"])
+let clang = "clang"
+let probe = temp + "/swift-appkit.ll"
+run(runner, ["xcrun", "swiftc", "-parse-as-library", "-emit-ir", "-Onone", root + "/tests/macos-swift-probe.swift", "-o", probe])
+let ir = readTextFile(probe)
+for symbol in ["objc_msgSend", "initWithContentRect:styleMask:backing:defer:", "setTitle:", "buttonWithTitle:target:action:", "addSubview:"] {
+    test.check(test.contains(ir, symbol), "Swift probe IR lacks " + symbol)
+}
+print("Swift-to-AppKit selector lowering verified")
+let failures = [
+    Failure { mode: "stale"; message: "invalid or destroyed" }, Failure { mode: "wrong-type"; message: "requires a checkbox" },
+    Failure { mode: "range"; message: "outside its range" }, Failure { mode: "timeout"; message: "event timeout" },
+    Failure { mode: "parent"; message: "parent must be" }, Failure { mode: "duplicate-init"; message: "only be called once" },
+    Failure { mode: "dimension"; message: "dimensions" }, Failure { mode: "thread"; message: "main thread" },
+    Failure { mode: "overflow"; message: "event queue is full" }, Failure { mode: "uninitialized"; message: "call macos.initialize" },
+    Failure { mode: "hover"; message: "requires a button, row, or column" }, Failure { mode: "shape"; message: "shape paths support" },
+    Failure { mode: "color"; message: "0xRRGGBB" }, Failure { mode: "list-line"; message: "list lines are 0" },
+    Failure { mode: "list-type"; message: "wrong object type" }, Failure { mode: "append-type"; message: "requires a textView or textEditor" }
+]
+let sanitizerEnvironment = environmentWith("ASAN_OPTIONS", "detect_leaks=0")
+for sanitized in [false, true] {
+    let harness = temp + "/native"
+    let flags: List<Text> = []
+    if sanitized {
+        harness = temp + "/native-sanitize"
+        flags = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
+    }
+    let runtime = temp + "/runtime.o"
+    let compile = [clang, "-O1"]
+    for flag in flags { compile.add(flag) }
+    for item in ["-c", root + "/runtime/minyar_default_runtime.c", "-o", runtime] { compile.add(item) }
+    run(runner, compile)
+    let link = [clang, "-fobjc-arc", "-fmodules", "-Wall", "-Wextra", "-Werror", "-O1"]
+    for flag in flags { link.add(flag) }
+    for item in [root + "/tests/macos-native.m", runtime, "-framework", "AppKit", "-o", harness] { link.add(item) }
+    run(runner, link)
+    print(host.strip(execute(runner, [harness], sanitizerEnvironment, true).output))
+    for failure in failures {
+        let result = execute(runner, [harness, failure.mode], sanitizerEnvironment, false)
+        test.check(result.status == 1 && test.contains(result.errorOutput, failure.message), failure.mode + " (" + Text(result.status) + ")\n" + result.errorOutput)
+        test.check(!test.contains(result.errorOutput, "ERROR: AddressSanitizer") && !test.contains(result.errorOutput, "runtime error:"), failure.mode + " sanitizer report\n" + result.errorOutput)
+    }
+}
+let bundle = temp + "/Minyar Notes & Unicode é.app"
+let binary = ""
+let profiles: List<List<Text>> = [[], ["--release"], ["--memory-profile", "eager"], ["--memory-profile", "fixed"], ["--memory-profile", "lazy"]]
+for flags in profiles {
+    let command = [root + "/minyar"]
+    for flag in flags { command.add(flag) }
+    for item in ["--app", "--bundle-id", "org.minyar.desktop-test", root + "/examples/macos/main.min", "-o", bundle] { command.add(item) }
+    run(runner, command)
+    let info = bundle + "/Contents/Info.plist"
+    test.check(plist(runner, info, "CFBundleIdentifier") == "org.minyar.desktop-test", "bundle identifier")
+    test.check(plist(runner, info, "CFBundleName") == "Minyar Notes & Unicode é", "bundle name")
+    test.check(plist(runner, info, "CFBundlePackageType") == "APPL", "bundle package type")
+    binary = bundle + "/Contents/MacOS/" + plist(runner, info, "CFBundleExecutable")
+    let smoke = run(runner, [binary, "--smoke"])
+    test.check(smoke.output == "Minyar → AppKit 🙂\n", "smoke output\n" + smoke.output + smoke.errorOutput)
+    test.check(!test.contains(smoke.errorOutput, "Unable to simultaneously satisfy constraints"), "layout constraints\n" + smoke.errorOutput)
+    run(runner, ["codesign", "--verify", "--strict", bundle])
+    let contract = temp + "/language-contract"
+    let build = [root + "/minyar"]
+    for flag in flags { build.add(flag) }
+    for item in [root + "/tests/macos-contract.min", "-o", contract] { build.add(item) }
+    run(runner, build)
+    test.check(run(runner, [contract]).output == "Minyar desktop ABI and Text ownership verified\n", "language contract output")
+    let dependencies = run(runner, ["otool", "-L", binary]).output
+    test.check(test.contains(dependencies, "AppKit.framework"), "application does not link AppKit")
+    test.check(!test.contains(dependencies, "libswift"), "application links the Swift runtime")
+    print("app and language ownership verified: " + listed(flags))
+}
+let before = files.readFile(bundle + "/Contents/Info.plist")
+let rejected = execute(runner, [packager, "--binary", binary, "--output", bundle, "--identifier", "bad/id"], system.environment(), false)
+test.check(test.contains(rejected.errorOutput, "bundle ID") && sameBytes(files.readFile(bundle + "/Contents/Info.plist"), before), "a bad ID replaced the previous build\n" + rejected.errorOutput)
+let foreign = temp + "/Unrelated.app"
+test.check(host.makeDirectories(foreign) == "", "create unrelated app")
+writeTextFile(foreign + "/keep", "keep")
+rejected = execute(runner, [packager, "--binary", binary, "--output", foreign, "--identifier", "org.minyar.test"], system.environment(), false)
+test.check(test.contains(rejected.errorOutput, "refusing to replace") && readTextFile(foreign + "/keep") == "keep", "an unrelated app was replaced\n" + rejected.errorOutput)
+print("debug/release and all memory profiles: Minyar app builds, Unicode, signatures and safe replacement verified")
+host.removeTree(temp)
+print("macOS desktop integration passed")
