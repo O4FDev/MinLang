@@ -16,12 +16,19 @@ import subprocess
 import tempfile
 
 from host_paths import host_path
+from compression_provider import _static_archive
 
 
 CONFIG = {
     'sha256': ('libcrypto', 'openssl@3', 'openssl/sha.h', 'libcrypto'),
     'tararchive': ('libarchive', 'libarchive', 'archive.h', 'libarchive'),
     'lz4': ('liblz4', 'lz4', 'lz4.h', 'liblz4'),
+}
+APIS = {
+    'sha256': ('SHA256_Init', 'SHA256_Update', 'SHA256_Final', 'OpenSSL_version_num'),
+    'tararchive': ('archive_version_number', 'archive_read_new', 'archive_read_free',
+                   'archive_entry_new', 'archive_entry_free'),
+    'lz4': ('LZ4_versionNumber', 'LZ4_compress_default', 'LZ4_decompress_safe'),
 }
 
 
@@ -43,8 +50,24 @@ def _dependency_paths(output):
             for value in words]
 
 
-def _image_probe(apis, windows, shared, dll_name):
-    if windows:
+def _image_probe(apis, windows, shared, dll_name, static=False):
+    if static:
+        implementation = '''#include <stdint.h>
+#include <unistd.h>
+#include <stdio.h>
+extern const char __executable_start[], _end[];
+static int provider_image(const void *address) {
+    char path[4096];
+    uintptr_t value = (uintptr_t)address;
+    ssize_t length;
+    if (value < (uintptr_t)__executable_start || value >= (uintptr_t)_end) return 0;
+    length = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (length <= 0 || length >= (ssize_t)sizeof(path) - 1) return 0;
+    path[length] = 0;
+    return puts(path) >= 0;
+}
+'''
+    elif windows:
         implementation = '''#include <windows.h>
 #include <stdio.h>
 static int provider_image(const void *address) {
@@ -87,7 +110,8 @@ static int provider_image(const void *address) {
     return implementation, calls
 
 
-def _probe_source(kind, identify=False, windows=False, shared=False, dll_name=None):
+def _probe_source(kind, identify=False, windows=False, shared=False, dll_name=None,
+                  static=False):
     if kind == 'sha256':
         source = '''#define OPENSSL_SUPPRESS_DEPRECATED
 #include <openssl/sha.h>
@@ -109,7 +133,6 @@ int main(void) {
     return memcmp(digest, expected, 32) != 0;
 }
 '''
-        apis = ('SHA256_Init', 'SHA256_Update', 'SHA256_Final', 'OpenSSL_version_num')
     elif kind == 'lz4':
         source = '''#include <lz4.h>
 #include <string.h>
@@ -122,7 +145,6 @@ int main(void) {
     return memcmp(plain, "erofs", 5) != 0;
 }
 '''
-        apis = ('LZ4_versionNumber', 'LZ4_compress_default', 'LZ4_decompress_safe')
     else:
         source = '''#include <archive.h>
 #include <archive_entry.h>
@@ -138,10 +160,9 @@ int main(void) {
     return archive_read_free(reader) != ARCHIVE_OK;
 }
 '''
-        apis = ('archive_version_number', 'archive_read_new', 'archive_read_free',
-                'archive_entry_new', 'archive_entry_free')
     if identify:
-        implementation, calls = _image_probe(apis, windows, shared, dll_name)
+        implementation, calls = _image_probe(APIS[kind], windows, shared, dll_name,
+                                             static=static)
         source = '#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n' + implementation + source
         source = source.replace('int main(void) {', 'int main(void) {\n' + calls)
     return source
@@ -163,6 +184,29 @@ def _runtime_dll(library, prefix, stem):
     return runtime
 
 
+def _static_inputs(result, library, apis, clang, binary):
+    for api in apis:
+        definitions = [line for line in result.stderr.splitlines() if re.search(
+            r': definition of (?:symbol )?' + re.escape(api) + r'\s*$', line)]
+        if len(definitions) != 1 or not re.search(
+                r'^(?:[^\n]*?: )?' + re.escape(str(library)) + r'\([^)]*\):',
+                definitions[0]):
+            raise ValueError(f'static provider API {api} must be defined by selected archive {library}')
+    readelf = _output([clang, '-print-prog-name=llvm-readelf'])
+    metadata = _output([readelf, '--program-headers', '--dynamic', str(binary)])
+    if re.search(r'\b(?:INTERP|NEEDED)\b', metadata):
+        raise ValueError('static provider probe must not load dynamic dependencies')
+    paths = set()
+    for line in result.stdout.splitlines():
+        value = re.sub(r'\([^)]*\)$', '', line.strip())
+        path = host_path(value)
+        if path.suffix == '.a' and path.is_file():
+            paths.add(path.resolve())
+    if library not in paths:
+        raise ValueError('static provider linker did not identify selected archive')
+    return sorted(paths)
+
+
 def provider_info(kind, clang='clang', compile_flags=(), link_flags=()):
     """Validate effective flags; return additive argv and actual input identity.
 
@@ -175,6 +219,8 @@ def provider_info(kind, clang='clang', compile_flags=(), link_flags=()):
     override = os.environ.get('MINYAR_' + kind.upper() + '_PREFIX')
     active = os.environ.get('MINGW_PREFIX')
     windows = _windows()
+    static = platform.system() == 'Linux' and any(
+        flag in ('-static', '-static-pie') for flag in [*compile_flags, *link_flags])
     dependencies = []
     if override or windows:
         value = override or active
@@ -207,7 +253,7 @@ def provider_info(kind, clang='clang', compile_flags=(), link_flags=()):
         active_prefix = host_path(active).resolve() if active else prefix
         if active_prefix != prefix or active_prefix not in executable.parents:
             raise ValueError('format provider and compiler must use the same MSYS2 prefix/CRT')
-    names = ([stem + '.dll.a', stem + '.a'] if windows else
+    names = ([stem + '.a'] if static else [stem + '.dll.a', stem + '.a'] if windows else
              [stem + '.dylib', stem + '.a'] if platform.system() == 'Darwin' else
              [stem + '.so', stem + '.a'])
     candidates = [lib / name for name in names]
@@ -219,6 +265,8 @@ def provider_info(kind, clang='clang', compile_flags=(), link_flags=()):
     library = next((path.resolve() for path in candidates if path.is_file()), None)
     if library is None or prefix not in library.parents:
         raise ValueError(f'{kind} library and headers must come from one provider prefix {prefix}')
+    if static:
+        _static_archive(library, clang, APIS[kind])
     cflags = ['-I' + str(include)]
     libraries = [str(library), *dependencies]
     shared = not windows and ('.so' in library.name or library.suffix == '.dylib')
@@ -231,7 +279,8 @@ def provider_info(kind, clang='clang', compile_flags=(), link_flags=()):
         source = Path(directory) / 'probe.c'
         binary = Path(directory) / ('probe.exe' if windows else 'probe')
         source.write_text(_probe_source(kind, identify=True, windows=windows, shared=shared,
-                                       dll_name=runtime_library.name if imported else None))
+                                       dll_name=runtime_library.name if imported else None,
+                                       static=static))
         command = [clang, *compile_flags, *cflags]
         output = _output([*command, '-M', '-MT', 'minyar_provider', str(source)])
         # Clang's Make dependency escaping uses backslash-newline and escaped
@@ -264,12 +313,15 @@ def provider_info(kind, clang='clang', compile_flags=(), link_flags=()):
             raise ValueError(f'{kind} compiler did not select its matched primary header')
         # dladdr needs libdl on older Linux libc. This diagnostic dependency is
         # probe-only and does not change the consumer's public link policy.
-        identity_flags = ['-ldl'] if not windows and platform.system() != 'Darwin' else []
+        identity_flags = (['-Wl,-t', *['-Wl,--trace-symbol=' + api for api in APIS[kind]]]
+                          if static else
+                          ['-ldl'] if not windows and platform.system() != 'Darwin' else [])
         result = subprocess.run([*command, str(source), *link_flags, *libraries,
                                  *identity_flags, '-o', str(binary)],
                                 capture_output=True, text=True, timeout=30)
         if result.returncode:
             raise ValueError(f'{kind} matched provider compile/link probe failed:\n{result.stderr}')
+        static_inputs = _static_inputs(result, library, APIS[kind], clang, binary) if static else []
         result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=30)
         images = [host_path(value).resolve() for value in result.stdout.splitlines()]
         expected = runtime_library or binary.resolve()
@@ -287,7 +339,8 @@ def provider_info(kind, clang='clang', compile_flags=(), link_flags=()):
                              f'(status {result.returncode})')
         # Only a validated actual image may become runtime/cache identity.
         actual_library = images[0] if runtime_library else None
-        inputs = sorted(set([*headers, library, *([actual_library] if actual_library else [])]))
+        inputs = sorted(set([*headers, library, *static_inputs,
+                             *([actual_library] if actual_library else [])]))
         digest = hashlib.sha256()
         digest.update(json.dumps([kind, clang, list(compile_flags), list(link_flags)],
                                  separators=(',', ':')).encode() + b'\0')

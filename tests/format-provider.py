@@ -211,6 +211,53 @@ class Providers(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'compile/link probe failed'):
             provider_info('sha256', self.clang, ['-DOPENSSL_NO_DEPRECATED'])
 
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux static provider contract')
+    def test_full_static_providers_preserve_archives_and_input_identity(self):
+        flags = ['-O2', '-pthread', '-static', '-Wno-override-module']
+        for kind in ('sha256', 'tararchive', 'lz4'):
+            with self.subTest(kind=kind):
+                info = provider_info(kind, self.clang, flags)
+                again = provider_info(kind, self.clang, flags)
+                self.assertTrue(info['library'].endswith('.a'))
+                self.assertIsNone(info['runtime_library'])
+                self.assertEqual(info['sha256'], again['sha256'])
+                self.assertEqual(info['compile_flags'], flags)
+                archives = [row for row in info['inputs'] if row['path'].endswith('.a')]
+                self.assertTrue(any(Path(row['path']).name == 'libc.a' for row in archives))
+                self.assertIn(info['library'], [row['path'] for row in archives])
+                for row in info['inputs']:
+                    self.assertEqual(row['sha256'], hashlib.sha256(Path(row['path']).read_bytes()).hexdigest())
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux static provider contract')
+    def test_static_provider_rejects_shared_object_disguised_as_archive(self):
+        with tempfile.TemporaryDirectory(prefix='minyar-static-provider-') as name:
+            prefix = self.copy_sha_prefix(name, shared=True)
+            library = prefix / 'lib/libcrypto.so'
+            library.rename(prefix / 'lib/libcrypto.a')
+            with patch.dict(os.environ, {'MINYAR_SHA256_PREFIX': str(prefix)}):
+                with self.assertRaisesRegex(ValueError, 'real static archive'):
+                    provider_info('sha256', self.clang, ['-static'])
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux static provider contract')
+    def test_static_link_cannot_interpose_matching_version_api(self):
+        with tempfile.TemporaryDirectory(prefix='minyar-static-interposition-') as name:
+            work = Path(name)
+            source, object_file = work / 'shadow.c', work / 'shadow.o'
+            source.write_text('#include <archive.h>\nint archive_version_number(void) { return ARCHIVE_VERSION_NUMBER; }\n')
+            subprocess.run([self.clang, '-O2', '-c', str(source), '-o', str(object_file)],
+                           check=True, capture_output=True, timeout=30)
+            with self.assertRaisesRegex(ValueError, 'static provider API.*selected archive'):
+                provider_info('tararchive', self.clang, ['-static'], [str(object_file)])
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux static provider contract')
+    def test_static_provider_still_rejects_header_library_version_mismatch(self):
+        source = _probe_source('lz4', identify=True, static=True)
+        source = source.replace('LZ4_versionNumber() != LZ4_VERSION_NUMBER',
+                                'LZ4_versionNumber() != LZ4_VERSION_NUMBER + 1')
+        with patch('format_provider._probe_source', return_value=source):
+            with self.assertRaisesRegex(ValueError, 'version/64-bit API probe failed'):
+                provider_info('lz4', self.clang, ['-static'])
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
