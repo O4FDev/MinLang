@@ -122,11 +122,12 @@ check-mutation: build/stage0 build/minyarc build/minyar-runtime.o build/tooling/
 	$(LIMITED) python3 tests/mutation.py
 
 .PHONY: check-mutation-score-harness
-check-mutation-score-harness:
-	python3 tests/mutation-score-harness.py
+check-mutation-score-harness: build/tooling/tests/mutation-score-harness build/tooling/tests/mutation-score
+	$(LIMITED) ./build/tooling/tests/mutation-score-harness "$(CURDIR)/build/tooling/tests/mutation-score"
 
-check-mutation-score: check-mutation-score-harness build/tooling/tests/mutation-coverage build/stage0 build/minyarc build/minyarc-modules build/minyar-compiler-runtime.ll build/minyar-runtime.o build/tooling/tests/diagnostics build/tooling/tests/conformance build/tooling/tests/list-access build/tooling/tests/readonly-parameters
-	MINYAR_MIN_MUTATION_SCORE=$(MIN_MUTATION_SCORE) $(LIMITED) python3 tests/mutation-score.py
+check-mutation-score: check-mutation-score-harness build/tooling/tests/mutation-score build/tooling/tests/mutation-coverage build/stage0 build/minyarc build/minyarc-modules build/minyar-compiler-runtime.ll build/minyar-runtime.o build/tooling/tests/diagnostics build/tooling/tests/conformance build/tooling/tests/list-access build/tooling/tests/readonly-parameters
+	MINYAR_MIN_MUTATION_SCORE=$(MIN_MUTATION_SCORE) $(LIMITED) ./build/tooling/tests/mutation-score
+
 
 check-performance: build/minyarc build/minyar-runtime.o build/compiler-stage3.ll
 	$(LIMITED) python3 tests/performance.py
