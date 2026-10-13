@@ -1,4 +1,4 @@
-MINYAR_TOOL_SOURCES = tools/testing.min library/system.min library/files.min
+MINYAR_TOOL_SOURCES = $(wildcard tools/*.min) library/system.min library/files.min
 MINYAR_TOOL_NATIVE = runtime/native/system.c runtime/native/files.c
 
 build/tooling/%.ll: %.min $(MINYAR_TOOL_SOURCES) build/minyarc-modules

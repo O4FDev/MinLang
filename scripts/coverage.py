@@ -308,6 +308,9 @@ def main() -> int:
     feature_harnesses = run_feature_harnesses(run_dir, clang=clang, link_flags=[*math_flags, *thread_flags],
                                               env=env)
 
+    native_suites = ('octal-literals', 'reserved-names')
+    run(['make', '-s', *['build/tooling/tests/' + name for name in native_suites]], env=env)
+
     compiler_reports = {}
     self_outputs = []
     for phase, directory, compiler, compiler_edges in compiler_runs:
@@ -321,7 +324,10 @@ def main() -> int:
         for suite in COMPILER_SUITES:
             # Comparator suites select classes; callback frontends are separate compilers.
             name, *selection = suite.split()
-            run([sys.executable, f"tests/{name}.py", *selection], env=suite_env)
+            if name in native_suites:
+                run([str(ROOT / 'build/tooling/tests' / name), *selection], env=suite_env)
+            else:
+                run([sys.executable, f"tests/{name}.py", *selection], env=suite_env)
         run([sys.executable, "tests/linkage.py", "LanguageLinkage.test_ordinary_names_do_not_interpose_c_dependencies"], env=suite_env)
         run([sys.executable, "tests/runtime-numeric.py", "--mode", "native", "--cases", "2000",
              "--output-dir", str(directory / "numeric")], env=suite_env)

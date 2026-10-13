@@ -91,18 +91,79 @@ public function addressEnabled(flags: List<Text>): Boolean {
     }
     return enabled
 }
+function unquoted(source: Text): Bytes {
+    let raw = Bytes(source)
+    let masked = raw.slice(0, raw.length)
+    let quoted = false
+    let escaped = false
+    for index in 0..raw.length {
+        let byte = raw[index]
+        if quoted {
+            masked[index] = 32
+            if escaped { escaped = false }
+            else if byte == 92 { escaped = true }
+            else if byte == 34 { quoted = false }
+        } else if byte == 34 { masked[index] = 32; quoted = true }
+    }
+    check(!quoted, "unterminated LLVM header token")
+    return masked
+}
+record AttributeGroup { name: Text; source: Text }
+function enabled(attributes: Text): Boolean {
+    for token in words(attributes) { if token == "sanitize_address" { return true } }
+    return false
+}
 public function instrument(source: Text): Text {
+    let groups: List<AttributeGroup> = []
+    let headers = lines(source)
+    for line in headers {
+        let tokens = words(line)
+        if tokens.length >= 5 && tokens[0] == "attributes" && tokens[2] == "=" && tokens[3] == "{" {
+            groups.add(AttributeGroup { name: tokens[1]; source: Text(unquoted(line)) })
+        }
+    }
     let result: List<Text> = []
     let count = 0
-    for line in lines(source) {
+    for line in headers {
         let tokens = words(line)
         if tokens.length > 0 && tokens[0] == "define" {
             let raw = Bytes(line)
-            check(raw.length > 0 && raw[raw.length - 1] == 123, "unsupported LLVM function header")
-            check(contains(line, "@") && contains(line, ")"), "invalid LLVM function header")
-            if !contains(line, "sanitize_address") {
-                line = Text(raw.slice(0, raw.length - 1)) + "sanitize_address {"
+            let masked = unquoted(line)
+            let brace = raw.length - 1
+            while brace >= 0 && raw[brace] <= 32 { brace -= 1 }
+            check(brace >= 0 && masked[brace] == 123, "unsupported LLVM function header")
+            let global = -1
+            for index in 0..brace { if masked[index] == 64 { global = index; break } }
+            check(global >= 0, "missing LLVM function name")
+            let opening = -1
+            for index in (global + 1)..brace { if masked[index] == 40 { opening = index; break } }
+            check(opening >= 0, "missing LLVM function parameters")
+            let depth = 0
+            let closing = -1
+            for index in opening..brace {
+                if masked[index] == 40 { depth += 1 }
+                if masked[index] == 41 { depth -= 1; if depth == 0 { closing = index; break } }
             }
+            check(closing >= 0, "unterminated LLVM parameter list")
+            let attributes = Text(masked.slice(closing + 1, brace))
+            check(!contains(attributes, "{") && !contains(attributes, "}"), "unsupported LLVM function attributes")
+            let annotated = enabled(attributes)
+            let index = closing + 1
+            while index < brace {
+                if masked[index] == 35 {
+                    let end = index + 1
+                    while end < brace && masked[end] >= 48 && masked[end] <= 57 { end += 1 }
+                    let name = Text(masked.slice(index, end))
+                    let found = false
+                    for group in groups {
+                        if group.name == name { found = true; if enabled(group.source) { annotated = true } }
+                    }
+                    check(found, "missing LLVM attribute group " + name)
+                    index = end - 1
+                }
+                index += 1
+            }
+            if !annotated { line = Text(raw.slice(0, brace)) + "sanitize_address " + Text(raw.slice(brace, raw.length)) }
             count += 1
         }
         result.add(line + "\n")
@@ -110,18 +171,23 @@ public function instrument(source: Text): Text {
     check(count > 0, "LLVM contains no functions")
     return joinText(result)
 }
-public record Compiler { directory: Text; serial: Integer; executable: Text; runtime: Text; clang: Text; flags: List<Text> }
+public record Compiler { directory: Text; serial: Integer; executable: Text; runtime: Text; clang: Text; flags: List<Text>; compileTimeout: Integer; linkTimeout: Integer; runTimeout: Integer }
 public function compiler(): Compiler {
+    let flags = words(setting("MINYAR_TEST_LINK_FLAGS", ""))
+    let compileTimeout = 10
+    let linkTimeout = 30
+    let runTimeout = 10
+    if flags.length > 0 { compileTimeout = 30; linkTimeout = 120; runTimeout = 30 }
     return Compiler { directory: scratch(); serial: 0;
         executable: setting("MINYAR_TEST_COMPILER", "./build/minyarc");
         runtime: setting("MINYAR_TEST_RUNTIME", "build/minyar-runtime.o");
-        clang: setting("MINYAR_TEST_CLANG", "clang"); flags: words(setting("MINYAR_TEST_LINK_FLAGS", "")) }
+        clang: setting("MINYAR_TEST_CLANG", "clang"); flags: flags; compileTimeout: compileTimeout; linkTimeout: linkTimeout; runTimeout: runTimeout }
 }
 public function compile(test: Compiler, source: Text): Result {
     test.serial += 1
     let path = test.directory + "/case" + Text(test.serial)
     writeTextFile(path + ".min", source)
-    let result = run([test.executable, path + ".min", path + ".ll"], system.environment(), "", path + ".compile", 30)
+    let result = run([test.executable, path + ".min", path + ".ll"], system.environment(), "", path + ".compile", test.compileTimeout)
     if result.status == 0 && addressEnabled(test.flags) {
         writeTextFile(path + ".ll", instrument(readTextFile(path + ".ll")))
     }
@@ -140,10 +206,39 @@ public function executes(test: Compiler, source: Text, expected: Text) {
         let command = [test.clang, optimization, "-Wno-override-module"]
         for flag in test.flags { command.add(flag) }
         for item in [path + ".ll", test.runtime, "-lm", "-o", path + ".exe"] { command.add(item) }
-        require(run(command, system.environment(), "", path + ".link", 120), "link")
-        let result = run([path + ".exe"], system.environment(), "", path + ".run", 30)
+        require(run(command, system.environment(), "", path + ".link", test.linkTimeout), "link")
+        let result = run([path + ".exe"], system.environment(), "", path + ".run", test.runTimeout)
         require(result, "execution")
         check(result.errorOutput == "", "unexpected execution diagnostics\n" + result.errorOutput)
         check(result.output == expected, "unexpected output at " + optimization + "\n" + result.output + "expected\n" + expected)
     }
+}
+public function monitoredStart(command: List<Text>, environment: List<Text>, cwd: Text, log: Text, seconds: Integer): Integer {
+    let script = "log=$1; limit=$2; shift 2; trap 'if [ -s \"$log.pid\" ]; then group=$(cat \"$log.pid\"); /bin/kill -TERM -- -\"$group\" 2>/dev/null || :; fi; wait \"$waiter\"; exit 143' TERM INT; /usr/bin/time -o \"$log.cpu\" -f '%U %S %M' /usr/bin/timeout --kill-after=2 \"$limit\" /bin/sh -c 'echo \"$PPID\" > \"$1.pid\"; shift; exec \"$@\"' minyar \"$log\" /usr/bin/env -- \"$@\" >\"$log\" 2>\"$log.err\" & waiter=$!; wait \"$waiter\"; status=$?; trap - TERM INT; exit \"$status\""
+    let argv = ["sh", "-c", script, "minyar", log, Text(seconds)]
+    for item in command { argv.add(item) }
+    return system.spawn("/bin/sh", argv, environment, cwd)
+}
+public function removeTree(path: Text) {
+    check(contains(path, "/minyar-tests-"), "invalid private scratch path")
+    let handle = system.spawn("/bin/rm", ["rm", "-rf", "--", path], system.environment(), "")
+    check(handle > 0 && system.wait(handle).exitCode == 0, "cannot remove private scratch")
+}
+public function replace(source: Text, needle: Text, replacement: Text): Text {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    check(pattern.length > 0, "empty replacement pattern")
+    let parts: List<Text> = []
+    let start = 0
+    let index = 0
+    while index + pattern.length <= raw.length {
+        let equal = true
+        for offset in 0..pattern.length { if raw[index + offset] != pattern[offset] { equal = false; break } }
+        if equal {
+            parts.add(Text(raw.slice(start, index))); parts.add(replacement)
+            index += pattern.length; start = index
+        } else { index += 1 }
+    }
+    parts.add(Text(raw.slice(start, raw.length)))
+    return joinText(parts)
 }

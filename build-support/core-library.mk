@@ -6,12 +6,11 @@ check-octal-literals: build/minyarc build/minyar-runtime.o build/tooling/tests/o
 check-octal-literals-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/octal-literals
 	$(SANITIZER_LIMITED) env MINYAR_TEST_COMPILER=build/minyarc-sanitize MINYAR_TEST_RUNTIME=build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS="$(SANITIZER_FLAGS)" ./build/tooling/tests/octal-literals
 
-check-reserved-names: build/minyarc build/minyar-runtime.o
-	python3 tools/reserved-names.py --check
-	$(LIMITED) python3 tests/reserved-names.py
+check-reserved-names: build/minyarc build/minyar-runtime.o build/tooling/tests/reserved-names
+	$(LIMITED) ./build/tooling/tests/reserved-names
 
-check-reserved-names-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o
-	$(SANITIZER_LIMITED) env MINYAR_TEST_COMPILER=build/minyarc-sanitize MINYAR_TEST_RUNTIME=build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS="$(SANITIZER_FLAGS)" python3 tests/reserved-names.py
+check-reserved-names-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/reserved-names
+	$(SANITIZER_LIMITED) env MINYAR_TEST_COMPILER=build/minyarc-sanitize MINYAR_TEST_RUNTIME=build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS="$(SANITIZER_FLAGS)" ./build/tooling/tests/reserved-names
 
 .PHONY: check-module-constants check-module-constants-sanitize check-module-constant-graphs check-module-constant-graphs-sanitize
 check-module-constants: build/minyarc build/minyar-runtime.o
