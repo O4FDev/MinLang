@@ -27,8 +27,8 @@ MINYAR_CLANG="$clang" ./minyar tests/erofs-thread-main.min -o "$work/thread-main
 "$fsck" --extract "$work/thread-main.erofs"
 "$work/writer" "$work/source" "$work/plain.erofs"
 "$fsck" --extract "$work/plain.erofs"
-if test -d /dev/shm && test -w /dev/shm && test "$(stat -c %d /dev/shm)" != "$(stat -c %d "$work")"; then
-    fallback=$(mktemp -d /dev/shm/minyar-erofs.XXXXXXXX)
+if test -d '/dev/shm' && test -w '/dev/shm' && test "$(stat -c %d '/dev/shm')" != "$(stat -c %d "$work")"; then
+    fallback=$(mktemp -d '/dev/shm/minyar-erofs.XXXXXXXX')
     "$work/tree" create "$fallback/source"
     "$work/writer" "$fallback/source" "$work/fallback.erofs"
     "$fsck" --extract "$work/fallback.erofs"
