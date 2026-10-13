@@ -1,12 +1,13 @@
 MINYAR_TOOL_SOURCES = $(wildcard tools/*.min) library/system.min library/files.min
 MINYAR_TOOL_NATIVE = runtime/native/system.c runtime/native/files.c
+TOOL_RUNTIME = build/minyar-runtime.o
 
 build/tooling/%.ll: %.min $(MINYAR_TOOL_SOURCES) build/minyarc-modules
 	mkdir -p $(@D)
 	$(LIMITED) ./build/minyarc-modules $< $@ --library library
 
 build/tooling/%: build/tooling/%.ll build/minyar-runtime.o $(MINYAR_TOOL_NATIVE)
-	$(LLVM_CC) $(LLVM_FLAGS) $< build/minyar-runtime.o $(MINYAR_TOOL_NATIVE) -pthread -lm -o $@
+	$(LLVM_CC) $(LLVM_FLAGS) $< $(TOOL_RUNTIME) $(MINYAR_TOOL_NATIVE) $(TOOL_NATIVE) -pthread -lm $(TOOL_LIBS) -o $@
 
 .PRECIOUS: build/tooling/%.ll
 
