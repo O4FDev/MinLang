@@ -126,8 +126,9 @@ public function finish(context: Context) { test.removeTree(context.work) }
 public function run(context: Context, command: List<Text>, seconds: Integer): test.Result {
     return test.run(command, context.environment, "", logPath(context, "run"), seconds)
 }
-public function nap(context: Context, seconds: Text) {
-    let handle = system.spawn("/bin/sleep", ["sleep", seconds], context.environment, "")
+public function nap(context: Context, seconds: Text) { pause(seconds) }
+public function pause(seconds: Text) {
+    let handle = system.spawn("/bin/sleep", ["sleep", seconds], system.environment(), "")
     test.check(handle > 0 && system.wait(handle).exitCode == 0, "sleep failed")
 }
 public function fingerprint(source: Bytes): Text {
@@ -380,3 +381,92 @@ public function strip(source: Text): Text {
     while end > begin && raw[end - 1] <= 32 { end -= 1 }
     return Text(raw.slice(begin, end))
 }
+
+public function selectors(family: Text, names: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for index in 0..argumentCount() {
+        let item = argument(index)
+        if item == "-v" || item == "--verbose" || item == "-q" || item == "--quiet" { continue }
+        let known = item == family
+        for name in names { if item == name || item == family + "." + name { known = true } }
+        test.check(known, "unknown " + family + " selector: " + item)
+        result.add(item)
+    }
+    return result
+}
+public function selected(selectors: List<Text>, family: Text, name: Text): Boolean {
+    if selectors.length == 0 { return true }
+    for item in selectors { if item == family || item == name || item == family + "." + name { return true } }
+    return false
+}
+public record Cases { compiler: test.Compiler; root: Text; package: Boolean; sanitized: Boolean }
+public function cases(package: Boolean): Cases {
+    let compiler = test.compiler()
+    let resolved = test.run(["pwd", "-P"], system.environment(), "", compiler.directory + "/root", 10)
+    test.require(resolved, "resolve repository root")
+    return Cases { compiler: compiler; root: test.lines(resolved.output)[0]; package: package; sanitized: test.addressEnabled(compiler.flags) }
+}
+public function compileCase(cases: Cases, source: Text): test.Result {
+    let compiler = cases.compiler
+    compiler.serial += 1
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    writeTextFile(path + ".min", source)
+    let library = cases.root + "/library"
+    let result = test.run([compiler.executable, path + ".min", path + ".ll", "--library", library], system.environment(), "", path + ".compile", compiler.compileTimeout)
+    if cases.package && result.status == 86 {
+        test.check(files.pathSize(path + ".ll") < 0, "ordinary compiler emitted an unsafe graph")
+        let frontend = cases.root + "/build/minyarc-callbacks"
+        if cases.sanitized { frontend = frontend + "-sanitize" }
+        frontend = test.setting("MINYAR_CALLBACK_COMPILER", frontend)
+        result = test.run([frontend, path + ".min", path + ".ll", "--library", library], system.environment(), "", path + ".callbacks", 30)
+        if result.status == 0 { test.check(test.contains(readTextFile(path + ".ll"), "; minyar-cycle-runtime: 1\n"), "callback frontend omitted cycle runtime marker") }
+    }
+    if result.status == 0 && cases.sanitized { writeTextFile(path + ".ll", test.instrument(readTextFile(path + ".ll"))) }
+    return result
+}
+public function linkCase(cases: Cases, llvm: Text, optimization: Text, executable: Text): test.Result {
+    let compiler = cases.compiler
+    if !cases.package {
+        let command = [compiler.clang, optimization]
+        for flag in compiler.flags { command.add(flag) }
+        for item in ["-Wno-override-module", llvm, compiler.runtime, "-o", executable, "-lm"] { command.add(item) }
+        return test.run(command, system.environment(), "", executable + ".link", compiler.linkTimeout)
+    }
+    let runtime = cases.root + "/build/minyar-default-runtime.o"
+    let level = "-O2"
+    if cases.sanitized { runtime = cases.root + "/build/minyar-default-runtime-sanitize.o"; level = "-O1" }
+    let flags = [optimization]
+    for flag in compiler.flags { flags.add(flag) }
+    flags.add("-Wno-override-module")
+    let runtimeFlags = [level]
+    for flag in compiler.flags { runtimeFlags.add(flag) }
+    runtimeFlags.add("-Wno-override-module")
+    let environment = withSetting(system.environment(), "MINYAR_CLANG", compiler.clang)
+    environment = withSetting(environment, "MINYAR_CLANG_FLAGS", joinWords(flags))
+    environment = withSetting(environment, "MINYAR_NATIVE_FLAGS", joinWords(flags))
+    environment = withSetting(environment, "MINYAR_RUNTIME_FLAGS", joinWords(runtimeFlags))
+    return test.run([cases.root + "/build/tooling/tools/clang-driver", "link", cases.root, llvm, runtime, executable, "0"], environment, "", executable + ".link", 30)
+}
+public function joinWords(items: List<Text>): Text {
+    let parts: List<Text> = []
+    for item in items {
+        if parts.length > 0 { parts.add(" ") }
+        parts.add(item)
+    }
+    return joinText(parts)
+}
+public function executesCase(cases: Cases, source: Text, expected: Text, arguments: List<Text>) {
+    let compiled = compileCase(cases, source)
+    test.check(compiled.status == 0, "case compilation failed\n" + compiled.output + compiled.errorOutput)
+    let llvm = cases.compiler.directory + "/case" + Text(cases.compiler.serial) + ".ll"
+    for optimization in ["-O0", "-O2"] {
+        let executable = llvm + "." + Text(Bytes(optimization).slice(1, 3))
+        let linked = linkCase(cases, llvm, optimization, executable)
+        test.check(linked.status == 0, "case link failed at " + optimization + "\n" + linked.output + linked.errorOutput)
+        let command = [executable]
+        for item in arguments { command.add(item) }
+        let observed = test.run(command, system.environment(), "", executable + ".run", cases.compiler.runTimeout)
+        test.check(observed.status == 0 && observed.output == expected && observed.errorOutput == "", "case execution differs at " + optimization + " (" + Text(observed.status) + ")\n" + observed.output + "expected\n" + expected + observed.errorOutput)
+    }
+}
+public function finishCases(cases: Cases) { test.removeTree(cases.compiler.directory) }

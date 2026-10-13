@@ -1,0 +1,108 @@
+use "../tools/testing.min" as test
+use "./net-fixtures.min" as fixtures
+use "system" as system
+use "net" as net
+
+public record Server { process: fixtures.Process; port: Integer }
+public record Client { connection: Integer; buffer: Bytes }
+public record Reply { kind: Integer; integer: Integer; data: Bytes }
+public constant INTEGER = 1
+public constant SIMPLE = 2
+public constant BULK = 3
+public constant NULL = 4
+public constant ERROR = 5
+
+public function reservePort(): Integer {
+    let listener = net.listen("127.0.0.1", 0, 1)
+    test.check(listener >= 0, "reserve loopback port: " + net.lastError())
+    let port = net.localPort(listener)
+    net.close(listener)
+    return port
+}
+public function start(context: fixtures.Context, directory: Text): Server {
+    let port = reservePort()
+    let process = fixtures.launch(context, ["redis-server", "--bind", "127.0.0.1", "--port", Text(port), "--save", "", "--appendonly", "no", "--protected-mode", "yes", "--dir", directory], 3600)
+    return Server { process: process; port: port }
+}
+public function connect(server: Server): Client {
+    let deadline = system.monotonicNanoseconds() + 5000000000
+    while true {
+        let connection = net.connect("127.0.0.1", server.port)
+        if connection >= 0 { return Client { connection: connection; buffer: Bytes() } }
+        test.check(system.poll(server.process.handle).state == system.PENDING, "Redis failed to start")
+        test.check(system.monotonicNanoseconds() < deadline, "Redis startup timed out")
+        fixtures.pause("0.01")
+    }
+    return Client { connection: -1; buffer: Bytes() }
+}
+public function stop(server: Server): test.Result {
+    if system.poll(server.process.handle).state == system.PENDING {
+        let pid = system.childProcessId(server.process.handle)
+        if pid > 0 { system.sendSignal(pid, 15) }
+    }
+    return fixtures.collect(server.process)
+}
+function fill(client: Client) {
+    test.check(net.ready(client.connection, 10000), "Redis reply timed out")
+    let data = net.receive(client.connection, 65536)
+    test.check(data.length > 0, "Redis closed the connection")
+    client.buffer.addBytes(data)
+}
+function line(client: Client): Bytes {
+    while true {
+        for index in 1..client.buffer.length {
+            if client.buffer[index - 1] == 13 && client.buffer[index] == 10 {
+                let result = client.buffer.slice(0, index - 1)
+                client.buffer = client.buffer.slice(index + 1, client.buffer.length)
+                return result
+            }
+        }
+        fill(client)
+    }
+    return Bytes()
+}
+function decimal(raw: Bytes): Integer {
+    let negative = raw.length > 0 && raw[0] == 45
+    let start = 0
+    if negative { start = 1 }
+    let value = fixtures.number(Text(raw.slice(start, raw.length)))
+    if negative { return -value }
+    return value
+}
+public function read(client: Client): Reply {
+    let head = line(client)
+    test.check(head.length > 0, "empty Redis reply line")
+    let rest = head.slice(1, head.length)
+    if head[0] == 58 { return Reply { kind: INTEGER; integer: decimal(rest); data: Bytes() } }
+    if head[0] == 43 { return Reply { kind: SIMPLE; integer: 0; data: rest } }
+    if head[0] == 45 { return Reply { kind: ERROR; integer: 0; data: rest } }
+    test.check(head[0] == 36, "unexpected Redis response " + Text(head))
+    let size = decimal(rest)
+    if size == -1 { return Reply { kind: NULL; integer: 0; data: Bytes() } }
+    while client.buffer.length < size + 2 { fill(client) }
+    let data = client.buffer.slice(0, size)
+    test.check(client.buffer[size] == 13 && client.buffer[size + 1] == 10, "bulk reply terminator")
+    client.buffer = client.buffer.slice(size + 2, client.buffer.length)
+    return Reply { kind: BULK; integer: 0; data: data }
+}
+public function sendRaw(client: Client, data: Bytes): Reply {
+    test.check(net.send(client.connection, data) == data.length, "Redis send failed")
+    return read(client)
+}
+public function encode(parts: List<Bytes>): Bytes {
+    let result = Bytes("*" + Text(parts.length) + "\r\n")
+    for part in parts {
+        result.addBytes(Bytes("$" + Text(part.length) + "\r\n"))
+        result.addBytes(part)
+        result.addBytes(Bytes("\r\n"))
+    }
+    return result
+}
+public function command(client: Client, parts: List<Text>): Reply {
+    let encoded: List<Bytes> = []
+    for part in parts { encoded.add(Bytes(part)) }
+    return sendRaw(client, encode(encoded))
+}
+public function close(client: Client) { net.close(client.connection) }
+public function isText(reply: Reply, expected: Text): Boolean { return (reply.kind == SIMPLE || reply.kind == BULK) && Text(reply.data) == expected }
+public function isInteger(reply: Reply, expected: Integer): Boolean { return reply.kind == INTEGER && reply.integer == expected }

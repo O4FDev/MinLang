@@ -697,17 +697,17 @@ check-quic-quinn: build/minyarc | build
 	$(LIMITED) python3 tests/quic-quinn.py --early
 
 .PHONY: check-redis-protocol check-redis-protocol-sanitize check-redis-pipeline check-redis-pipeline-sanitize
-check-redis-protocol: build/minyarc build/minyar-runtime.o
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/redis-protocol.py
+check-redis-protocol: build/minyarc build/minyar-runtime.o build/tooling/tests/redis-protocol-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/redis-protocol-test
 
-check-redis-protocol-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/redis-protocol.py
+check-redis-protocol-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/redis-protocol-test
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/redis-protocol-test
 
-check-redis-pipeline: build/minyarc build/minyar-runtime.o
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/redis-pipeline.py
+check-redis-pipeline: build/minyarc build/minyar-runtime.o build/tooling/tests/redis-pipeline-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/redis-pipeline-test
 
-check-redis-pipeline-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/redis-pipeline.py
+check-redis-pipeline-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/redis-pipeline-test
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/redis-pipeline-test
 
 check check-portable: check-redis-protocol check-redis-pipeline
 check-sanitize: check-redis-protocol-sanitize check-redis-pipeline-sanitize

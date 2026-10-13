@@ -1,0 +1,131 @@
+use "./net-fixtures.min" as fixtures
+use "./cpython-random.min" as random
+use "../tools/testing.min" as test
+
+record Model { kind: Text; data: Bytes; integer: Integer; children: List<Model> }
+record Case { mode: Integer; packet: Bytes; expected: Bytes }
+
+function choose(rng: random.State, count: Integer): Integer { return random.below(rng, count) }
+function wideInteger(rng: random.State): Integer {
+    while true {
+        let low = random.word(rng)
+        let high = random.word(rng)
+        let extra = random.word(rng) >> 31
+        if extra == 0 { return wrappingAdd((high << 32) | low, -9223372036854775807 - 1) }
+    }
+    return 0
+}
+function model(rng: random.State, depth: Integer): Model {
+    let kinds = ["integer", "bulk", "null-bulk"]
+    if depth < 4 { kinds = ["simple", "error", "integer", "bulk", "null-bulk", "null-array", "array"] }
+    let kind = kinds[choose(rng, kinds.length)]
+    let data = Bytes()
+    let integer = 0
+    let children: List<Model> = []
+    if kind == "simple" || kind == "error" {
+        let length = choose(rng, 24)
+        for index in 0..length {
+            let value = choose(rng, 254)
+            if value >= 10 { value += 1 }
+            if value >= 13 { value += 1 }
+            data.add(value)
+        }
+    }
+    if kind == "integer" {
+        let wide = wideInteger(rng)
+        let options = [-9223372036854775807 - 1, 9223372036854775807, 0, wide]
+        integer = options[choose(rng, 4)]
+    }
+    if kind == "bulk" { data = random.bytes(rng, choose(rng, 65)) }
+    if kind == "array" {
+        let count = choose(rng, 6)
+        for index in 0..count { children = children.appended(model(rng, depth + 1)) }
+    }
+    return Model { kind: kind; data: data; integer: integer; children: children }
+}
+function encode(value: Model, out: Bytes) {
+    if value.kind == "simple" || value.kind == "error" {
+        if value.kind == "simple" { out.add(43) } else { out.add(45) }
+        out.addBytes(value.data)
+        out.addBytes(Bytes("\r\n"))
+    }
+    if value.kind == "integer" { out.addBytes(Bytes(":" + Text(value.integer) + "\r\n")) }
+    if value.kind == "bulk" {
+        out.addBytes(Bytes("$" + Text(value.data.length) + "\r\n"))
+        out.addBytes(value.data)
+        out.addBytes(Bytes("\r\n"))
+    }
+    if value.kind == "array" {
+        out.addBytes(Bytes("*" + Text(value.children.length) + "\r\n"))
+        for child in value.children { encode(child, out) }
+    }
+    if value.kind == "null-bulk" { out.addBytes(Bytes("$-1\r\n")) }
+    if value.kind == "null-array" { out.addBytes(Bytes("*-1\r\n")) }
+}
+function corpus(path: Text): Integer {
+    let rng = random.seeded("353350406194")
+    let cases: List<Case> = []
+    for first in 0..256 {
+        let packet = Bytes(1)
+        packet[0] = first
+        cases.add(Case { mode: 0; packet: packet; expected: Bytes() })
+    }
+    for first in 0..256 {
+        for second in 0..256 {
+            let packet = Bytes(2)
+            packet[0] = first
+            packet[1] = second
+            cases.add(Case { mode: 0; packet: packet; expected: Bytes() })
+        }
+    }
+    for round in 0..200 {
+        let packet = Bytes()
+        encode(model(rng, 0), packet)
+        cases.add(Case { mode: 1; packet: packet; expected: packet })
+        for cut in 0..packet.length { cases.add(Case { mode: 3; packet: packet.slice(0, cut); expected: Bytes() }) }
+        for mutation in 0..8 {
+            let changed = packet.slice(0, packet.length)
+            let position = choose(rng, changed.length)
+            changed[position] = changed[position] ^ (1 << choose(rng, 8))
+            cases.add(Case { mode: 2; packet: changed; expected: Bytes() })
+        }
+    }
+    for index in 0..5000 { cases.add(Case { mode: 2; packet: random.bytes(rng, choose(rng, 65)); expected: Bytes() }) }
+    let encoded = Bytes()
+    for item in cases {
+        encoded.add(item.mode)
+        for length in [item.packet.length, item.expected.length] {
+            for shift in [24, 16, 8, 0] { encoded.add((length >> shift) & 255) }
+        }
+        encoded.addBytes(item.packet)
+        encoded.addBytes(item.expected)
+    }
+    writeBytesFile(path, encoded)
+    return cases.length
+}
+
+let family = "RedisProtocol"
+let selectors = fixtures.selectors(family, ["test_independent_models_all_short_inputs_and_seeded_mutations", "test_binary_bulk_null_and_error_replies_are_distinct", "test_every_prefix_and_coalesced_reply_boundary", "test_malformed_numbers_and_delimiters_are_recoverable", "test_encoded_commands_use_byte_lengths_and_preserve_empty_data", "test_parser_bounds_and_repeated_recovery"])
+let cases = fixtures.cases(false)
+if fixtures.selected(selectors, family, "test_independent_models_all_short_inputs_and_seeded_mutations") {
+    let path = cases.compiler.directory + "/resp-corpus.bin"
+    let count = corpus(path)
+    print("DEBUG-COUNT " + Text(count) + " " + fixtures.fingerprint(readBytesFile(path)))
+    fixtures.executesCase(cases, readTextFile(cases.root + "/tests/redis-protocol-corpus.min"), Text(count) + "\n", [path])
+}
+if fixtures.selected(selectors, family, "test_binary_bulk_null_and_error_replies_are_distinct") {
+    fixtures.executesCase(cases, "use \"resp2\" as resp\nuse \"errors\" as errors\nlet data = Bytes(\"$4\\r\\n\")\ndata.add(0); data.add(255); data.add(13); data.add(10)\ndata.addBytes(Bytes(\"\\r\\n+tail\\r\\n\"))\nlet result = resp.parse(data)\nprint(resp.ok(result)); print(resp.consumed(result))\nlet value = resp.value(result)\nprint(resp.kind(value) == resp.BULK)\nprint(resp.data(value).length); print(resp.data(value)[1])\nprint(resp.kind(resp.value(resp.parse(Bytes(\"$-1\\r\\n\")))) == resp.NULL_BULK)\nprint(resp.kind(resp.value(resp.parse(Bytes(\"*-1\\r\\n\")))) == resp.NULL_ARRAY)\nprint(resp.kind(resp.value(resp.parse(Bytes(\"$0\\r\\n\\r\\n\")))) == resp.BULK)\nprint(resp.kind(resp.value(resp.parse(Bytes(\"*0\\r\\n\")))) == resp.ARRAY)\nlet error = resp.parse(Bytes(\"-ERR rejected\\r\\n\"))\nprint(resp.ok(error)); print(resp.kind(resp.value(error)) == resp.ERROR)\nprint(Text(resp.data(resp.value(error))))\n", "true\n10\ntrue\n4\n255\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\nERR rejected\n", [])
+}
+if fixtures.selected(selectors, family, "test_every_prefix_and_coalesced_reply_boundary") {
+    fixtures.executesCase(cases, "use \"resp2\" as resp\nuse \"errors\" as errors\nlet packet = Bytes(\"*3\\r\\n+OK\\r\\n$4\\r\\nhé!\\r\\n:9223372036854775807\\r\\n\")\nfor length in 0..packet.length {\n    let result = resp.parse(packet.slice(0, length))\n    if resp.ok(result) || !resp.incomplete(result) || resp.consumed(result) != 0 { fail(\"prefix accepted\") }\n}\nlet result = resp.parse(packet)\nprint(resp.ok(result)); print(resp.consumed(result) == packet.length)\nlet values = resp.items(resp.value(result))\nprint(values.length); print(Text(resp.data(values[1]))); print(resp.integer(values[2]))\npacket.addBytes(Bytes(\"+NEXT\\r\\n\"))\nlet first = resp.parse(packet)\nlet second = resp.parse(packet.slice(resp.consumed(first), packet.length))\nprint(Text(resp.data(resp.value(second))))\n", "true\ntrue\n3\nhé!\n9223372036854775807\nNEXT\n", [])
+}
+if fixtures.selected(selectors, family, "test_malformed_numbers_and_delimiters_are_recoverable") {
+    fixtures.executesCase(cases, "use \"resp2\" as resp\nuse \"errors\" as errors\nfor packet in [\":9223372036854775808\\r\\n\", \":-9223372036854775809\\r\\n\", \":\\r\\n\", \":+\\r\\n\", \": 1\\r\\n\", \":1x\\r\\n\",\n               \"$-2\\r\\n\", \"*+1\\r\\n\", \"*-2\\r\\n\", \"$1048577\\r\\n\", \"*1025\\r\\n\", \"$3\\r\\nabcXX\", \"+bad\\n\", \"+bad\\rX\", \"?unknown\\r\\n\"] {\n    let result = resp.parse(Bytes(packet))\n    if resp.ok(result) || resp.incomplete(result) || resp.consumed(result) != 0 { fail(\"malformed RESP accepted\") }\n    if errors.code(resp.error(result)) != errors.invalidDataCode() { fail(\"wrong RESP error\") }\n}\nlet minimum = resp.parse(Bytes(\":-9223372036854775808\\r\\n\"))\nprint(resp.integer(resp.value(minimum)))\nprint(resp.integer(resp.value(resp.parse(Bytes(\":+1\\r\\n\")))))\nprint(\"still alive\")\n", "-9223372036854775808\n1\nstill alive\n", [])
+}
+if fixtures.selected(selectors, family, "test_encoded_commands_use_byte_lengths_and_preserve_empty_data") {
+    fixtures.executesCase(cases, "use \"resp2\" as resp\nuse \"errors\" as errors\nlet binary = Bytes(3); binary[0] = 0; binary[1] = 255; binary[2] = 10\nlet encoded = resp.command([Bytes(\"SET\"), Bytes(\"é🙂\"), Bytes(), binary])\nlet result = resp.parse(errors.bytesValue(encoded))\nlet items = resp.items(resp.value(result))\nprint(items.length); print(resp.data(items[1]).length); print(Text(resp.data(items[1])))\nprint(resp.data(items[2]).length); print(resp.data(items[3])[1])\nprint(errors.bytesOk(resp.command([])))\n", "4\n6\né🙂\n0\n255\nfalse\n", [])
+}
+if fixtures.selected(selectors, family, "test_parser_bounds_and_repeated_recovery") {
+    fixtures.executesCase(cases, "use \"resp2\" as resp\nlet nested = Bytes()\nfor i in 0..18 { nested.addBytes(Bytes(\"*1\\r\\n\")) }\nnested.addBytes(Bytes(\"+x\\r\\n\"))\nprint(resp.ok(resp.parse(nested)))\nlet longLine = Bytes(\"+\")\nfor i in 0..4097 { longLine.add(120) }\nprint(resp.incomplete(resp.parse(longLine)))\nlet complete = 0\nfor i in 0..10000 {\n    let invalid = resp.parse(Bytes(\"$999999999999999999999999999999\\r\\n\"))\n    if resp.ok(invalid) || resp.incomplete(invalid) { fail(\"overflow accepted\") }\n    let valid = resp.parse(Bytes(\"*2\\r\\n:1\\r\\n$0\\r\\n\\r\\n\"))\n    if resp.items(resp.value(valid)).length != 2 { fail(\"recovery changed reply\") }\n    complete += 1\n}\nprint(complete)\n", "false\nfalse\n10000\n", [])
+}
+fixtures.finishCases(cases)
