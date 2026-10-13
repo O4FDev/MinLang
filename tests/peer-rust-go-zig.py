@@ -1989,8 +1989,11 @@ print(first[0]); print(second[0])
             self.assertEqual((run.returncode, run.stdout, run.stderr),
                              (0, ''.join(f'{value}\n' for value in expected).encode(), b''))
             report = json.loads(report_path.read_text())
-            self.assertGreater(report['resizes'], 0)
+            self.assertGreaterEqual(report['storage_moves'], 4)
+            self.assertGreater(report['allocations'], 0)
             self.assertEqual(report['moved'], report['resizes'])
+            self.assertEqual(report['frame_entries'], report['frame_leaves'])
+            self.assertGreaterEqual(report['released_objects'], 2)
             self.assertEqual((report['fired'], report['live_bytes']), (0, 0))
 
 
