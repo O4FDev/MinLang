@@ -22,7 +22,7 @@ CASES = {
     'text': ('''function grow(text: Text): Text {
 let result = text
 let index = 0
-while index < 12 { result = result + text; index = index + 1 }
+while index < 320 { result = result + text; index = index + 1 }
 return result
 }
 let source = grow("é🙂")
@@ -31,19 +31,20 @@ let parts = [view, source, view]
 let result = joinText(parts)
 print(result.length == view.length * 2 + source.length)
 print(source.length)
-''', b'true\n26\n'),
+''', b'true\n642\n'),
     'list': ('''function append(values: List<Text>, alias: List<Text>) {
 let index = 0
-while index < 40 { values.add("value" + Text(index)); index = index + 1 }
+while index < 129 { values.add("value" + Text(index)); index = index + 1 }
 print(alias[0])
 print(alias[39])
+print(alias[128])
 }
 let values: List<Text> = []
 append(values, values)
 let alias = values
 values[0] = values[39]
 print(alias[0])
-''', b'value0\nvalue39\nvalue39\n'),
+''', b'value0\nvalue39\nvalue128\nvalue39\n'),
     'records': ('''record Leaf { label: Text; values: List<Integer> }
 record Tree { leaf: Leaf; children: List<Leaf> }
 function make(index: Integer): Leaf { return Leaf { label: "leaf" + Text(index); values: [index, index + 1] } }
