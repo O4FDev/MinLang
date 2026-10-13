@@ -15,7 +15,7 @@ typedef struct RcManagedThread {
     pthread_t thread;
 #endif
     unsigned joining, joined;
-    long long result;
+    long long result, status;
     /* Accessed only by the creator domain, never by the worker/destructor. */
     struct RcManagedThread *parent_next;
 } RcManagedThread;
@@ -54,6 +54,7 @@ static void *rc_thread_entry(void *pointer) {
     RcThreadLeaf *channel = rc_thread_wrap(launch.channel);
     minyar_rc_local_take(1, channel);
     long long result = launch.bridge(launch.seed, frozen, channel);
+    long long status = minyar_recovery_pending() ? 2 : 0;
     minyar_thread_join_children();
     minyar_rc_leave();
     rc_thread_domain_dispose();
@@ -61,6 +62,7 @@ static void *rc_thread_entry(void *pointer) {
     RcManagedThread *t = launch.thread;
     rc_thread_mutex_lock(&t->mutex);
     t->result = result;
+    t->status = status;
     rc_thread_mutex_unlock(&t->mutex);
     rc_thread_current = NULL;
     rc_thread_control_release(t); /* Running share survives all local teardown. */
@@ -160,10 +162,11 @@ static long long rc_thread_join_try(RcManagedThread *t, long long *output) {
             return 2;
         }
     }
-    *output = t->result;
+    long long status = t->status;
+    if (!status) *output = t->result;
     rc_thread_mutex_unlock(&t->mutex);
     rc_thread_control_release(t);
-    return 0;
+    return status ? 3 : 0;
 }
 static void rc_thread_untrack_joined(RcManagedThread *thread) {
     /* Only the creator's TLS registry can contain this control. A foreign
@@ -178,16 +181,18 @@ static void rc_thread_untrack_joined(RcManagedThread *thread) {
 }
 long long minyar_thread_join(const RcThreadLeaf *thread) {
     long long result;
-    if (rc_thread_join_try(thread->control, &result))
+    long long status = rc_thread_join_try(thread->control, &result);
+    if (!status || status == 3) rc_thread_untrack_joined(thread->control);
+    if (status)
         minyar_stop("this thread could not be joined.");
-    rc_thread_untrack_joined(thread->control);
     return result;
 }
 void minyar_thread_join_children(void) {
     while (rc_thread_children) {
         RcManagedThread *t = rc_thread_children;
         long long result;
-        if (rc_thread_join_try(t, &result)) minyar_stop("a child thread could not be joined.");
+        long long status = rc_thread_join_try(t, &result);
+        if (status && status != 3) minyar_stop("a child thread could not be joined.");
         rc_thread_children = t->parent_next;
         rc_thread_control_release(t);
     }
@@ -199,8 +204,8 @@ long long minyar_thread_try_spawn(RcThreadBridge bridge, long long seed,
 }
 long long minyar_thread_try_join(const RcThreadLeaf *thread, long long *output) {
     long long status = rc_thread_join_try(thread->control, output);
-    if (!status) rc_thread_untrack_joined(thread->control);
-    return status;
+    if (!status || status == 3) rc_thread_untrack_joined(thread->control);
+    return status == 3 ? 2 : status;
 }
 void *minyar_thread_spawn_result(RcThreadBridge bridge, long long seed,
         const RcThreadLeaf *frozen, const RcThreadLeaf *channel) {
