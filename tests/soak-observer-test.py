@@ -268,8 +268,25 @@ print(json.dumps(result, sort_keys=True), flush=True)
 
     def test_exited_parent_with_stdout_held_by_descendant_times_out(self):
         child = self.child('import subprocess,sys; subprocess.Popen([sys.executable,"-c","import time; time.sleep(10)"])')
+        self.assertEqual(child.wait(timeout=5), 0)
         with self.assertRaises(TimeoutError): list(observer.observe(child, .15, .02))
         self.assertEqual(child.poll(), 0)
+
+    def test_interrupt_between_samples_reaps_child_and_restores_handlers(self):
+        for value in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=value):
+                child = self.child('import time; time.sleep(10)')
+                previous = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+                events = observer.observe(child, 2, .01)
+                try:
+                    next(events)
+                    with self.assertRaises(KeyboardInterrupt): signal.raise_signal(value)
+                    self.assertIsNotNone(child.poll())
+                    self.assertTrue(all(signal.getsignal(sig) == handler
+                                        for sig, handler in previous.items()))
+                finally:
+                    events.close()
+                    if child.poll() is None: child.kill(); child.wait()
 
 
     @unittest.skipUnless(sys.platform.startswith('linux'), 'owned orphan reaping uses Linux subreaper')

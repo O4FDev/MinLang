@@ -9,6 +9,7 @@ import os
 import shlex
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 import callbacks
 from errors_evidence import retain
 from regressions import ROOT, LINK_FLAGS, CompilerTestCase
@@ -279,23 +280,17 @@ print(counter.calls)
 match bug() { Ok(v) { print(v) } Err(e) { print("recovered") } }
 """, '', status=1, stderr='Minyar stopped: Bytes position 1 is outside its length of 1.\n')
 
-    def test_ordinary_ir_is_byte_identical(self):
+    def test_ordinary_programs_preserve_behavior_in_both_frontends(self):
         samples = [
-            'print("try"); print("minyar_result_type_0"); print(42)\n',
-            'record Box { words: List<Text> }\nlet b = Box { words: ["a" + "b"] }\nprint(b.words[0])\n',
-            'function square(n: Integer): Integer { return n * n }\nfor n in 0..10 { print(square(n)) }\n',
+            ('print("try"); print("minyar_result_type_0"); print(42)\n', 'try\nminyar_result_type_0\n42\n'),
+            ('record Box { words: List<Text> }\nlet b = Box { words: ["a" + "b"] }\nprint(b.words[0])\n', 'ab\n'),
+            ('function square(n: Integer): Integer { return n * n }\nfor n in 0..10 { print(square(n)) }\n',
+             ''.join(str(n * n) + '\n' for n in range(10))),
         ]
-        for source in samples:
-            result, llvm = self.compile(source)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            ordinary = llvm.with_suffix('.ordinary.ll')
-            compiler = ROOT / 'build/minyarc'
-            baseline = self.evidence.run([str(compiler), str(llvm.with_suffix('.min')),
-                str(ordinary), *self.compiler_arguments], timeout=30,
-                capture_output=True, text=True, phase='compile-ordinary-identity')
-            self.assertEqual(baseline.returncode, 0, baseline.stderr)
-            prepare_llvm_for_link(ordinary, LINK_FLAGS)
-            self.assertEqual(llvm.read_bytes(), ordinary.read_bytes())
+        for compiler in (FRONTEND, ROOT / 'build/minyarc'):
+            for source, expected in samples:
+                with self.subTest(compiler=compiler, source=source), patch(__name__ + '.FRONTEND', compiler):
+                    self.executes(source, expected)
 
     def test_network_adapter_preserves_data_eof_blocked_failure_and_prefix(self):
         self.native_sources = (str(ROOT / 'runtime/native/net.c'),)

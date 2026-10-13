@@ -34,6 +34,8 @@ Build a native program; the compiler and runtime build on first use.
   --release                Optimize across the program and runtime with LTO
   --incremental            Reuse unchanged local module compilation
   --library DIR            Search DIR for packages before the standard ones
+  --native-source NAME=FILE Compile a package's C or Objective-C source
+  --native-object NAME=FILE Link a package's object file or static archive
   --memory-profile PROFILE system (default), eager, fixed, or lazy
   --cleanup-budget N       Reclamation work budget, 1..1024 (default: 32)
   --heap-bytes N           Power-of-two capacity for fixed/lazy heaps
@@ -73,6 +75,7 @@ budget_requested=0
 heap_bytes=
 # Package directories from --library, searched before the standard ones.
 libraries=
+native_inputs=
 while :; do
     case "${1-}" in
         --release) [ "$optimization_requested" -eq 0 ] && [ "$check_only" -eq 0 ] || usage; release=1; optimization_requested=1; shift ;;
@@ -92,6 +95,19 @@ while :; do
         --library)
             [ "$#" -ge 2 ] && [ -d "$2" ] || usage
             libraries="$libraries
+$2"; shift 2 ;;
+        --native-source|--native-object)
+            [ "$#" -ge 2 ] || usage
+            case "$2" in *=*) ;; *) usage ;; esac
+            native_name=${2%%=*}
+            native_file=${2#*=}
+            case "$native_name" in ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_]*) usage ;; esac
+            [ -f "$native_file" ] && [ -r "$native_file" ] || {
+                echo "minyar: cannot read native input: $native_file" >&2
+                exit 1
+            }
+            native_inputs="$native_inputs
+$1
 $2"; shift 2 ;;
         --memory-profile)
             [ "$#" -ge 2 ] && [ "$profile_requested" -eq 0 ] || usage
@@ -115,6 +131,7 @@ $2"; shift 2 ;;
         *) break ;;
     esac
 done
+if [ "$check_only" -eq 1 ] && [ -n "$native_inputs" ]; then usage; fi
 if [ "$memory_profile" = eager ] && [ "$budget_requested" -ne 0 ]; then usage; fi
 if [ -n "$heap_bytes" ]; then
     case "$memory_profile" in fixed|lazy) ;; *) usage ;; esac
@@ -284,7 +301,15 @@ CONFIG
 fi
 binary_file=$output_file
 if [ "$app" -eq 1 ]; then binary_file="$llvm_dir/application"; fi
-python3 "$project_dir/tools/clang-driver.py" link "$project_dir" "$llvm_file" "$runtime_file" "$binary_file" "$release" "$debug" "$source_file"
+set -- link "$project_dir" "$llvm_file" "$runtime_file" "$binary_file" "$release" "$debug" "$source_file"
+old_ifs=$IFS
+IFS='
+'
+set -f
+for native_input in $native_inputs; do set -- "$@" "$native_input"; done
+set +f
+IFS=$old_ifs
+python3 "$project_dir/tools/clang-driver.py" "$@"
 if [ "$app" -eq 1 ]; then
     set -- --binary "$binary_file" --output "$output_file" --identifier "$bundle_id"
     if [ -n "$icon_file" ]; then set -- "$@" --icon "$icon_file"; fi

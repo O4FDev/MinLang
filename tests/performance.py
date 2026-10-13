@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Measure compiler and generated-program performance.
 
-1. Self-compilation checks resource ceilings and compiler fixed-point output.
+1. Self-compilation checks resource ceilings and compiler behavior.
 2. Scaling checks compare workloads at two sizes, the second four times larger.
 3. Measurements are saved to build/performance.json and compared against
    build/performance-baseline.json when it exists. Use --save-baseline to create
@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 from clang_helpers import clang_command
+from compiler_output import check_compiler_behavior, validate_compile_output
 
 try:
     import resource
@@ -32,7 +33,6 @@ ROOT = Path(__file__).resolve().parent.parent
 COMPILER = ROOT / "build" / "minyarc"
 SOURCE = ROOT / "build" / "compiler.min"
 OUTPUT = ROOT / "build" / "compiler-performance-check.ll"
-REFERENCE = ROOT / "build" / "compiler-stage3.ll"
 RUNTIME = ROOT / "build" / "minyar-runtime.o"
 if not RUNTIME.exists():
     RUNTIME = ROOT / "runtime" / "minyar_runtime.c"
@@ -86,6 +86,7 @@ def link(clang: str, llvm: Path, executable: Path) -> None:
 
 
 def check_self_compile(results: dict[str, float]) -> None:
+    OUTPUT.unlink(missing_ok=True)
     before = resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None
     started = time.monotonic()
     result = run([str(COMPILER), str(SOURCE), str(OUTPUT)], timeout=MAX_SECONDS)
@@ -95,8 +96,7 @@ def check_self_compile(results: dict[str, float]) -> None:
         raise SystemExit(f"self-compile failed during performance check:\n{result.stderr}")
     if elapsed > MAX_SECONDS:
         raise SystemExit(f"self-compile took {elapsed:.2f}s; limit is {MAX_SECONDS:.2f}s")
-    if REFERENCE.exists() and OUTPUT.read_bytes() != REFERENCE.read_bytes():
-        raise SystemExit("performance-check compiler output differs from the fixed-point compiler")
+    validate_compile_output(result, OUTPUT, "performance-check self-compile")
     results["self-compile.wall"] = elapsed
     details = f"wall {elapsed:.3f}s"
     if before and after:
@@ -110,6 +110,7 @@ def check_self_compile(results: dict[str, float]) -> None:
         results["self-compile.cpu"] = cpu
         results["self-compile.rss-mib"] = rss_mib
         details += f", CPU {cpu:.3f}s, peak {rss_mib:.1f} MiB"
+    check_compiler_behavior(OUTPUT)
     print(f"self-compile: {details}")
 
 

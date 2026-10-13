@@ -63,7 +63,7 @@ public record Connection {
     sentData: Integer; receivedData: Integer; consumedData: Integer; receiveMaxData: Integer; parametersChecked: Boolean
     congestion: recovery.State; recoveryGeneration: Integer; flight: Integer; receivedBytes: Integer; sentBytes: Integer
     history: List<Sent>; lossFirst: Integer; lossLast: Integer; lossAfter: Integer; emptySince: Integer
-    addressValidated: Boolean; confirmed: Boolean; handshakeAcknowledged: Boolean; handshakeProbe: Integer; lastActivity: Integer; now: Integer
+    addressValidated: Boolean; confirmed: Boolean; handshakeAcknowledged: Boolean; handshakeProbe: Integer; lastActivity: Integer; idleSendAllowed: Boolean; now: Integer
     earlyWrite: protection.Keys; earlyRead: protection.Keys; earlyRejected: Boolean; earlyStreams: List<Integer>; earlyData: Integer; earlyPackets: Integer
     closing: Boolean; draining: Boolean; closeUntil: Integer; closeResponseAt: Integer; closeInterval: Integer; closeAttempts: Integer; closeFrame: Bytes; closeLevel: Integer
     paceCredit: Float; paceAt: Integer; paceNext: Integer
@@ -299,7 +299,7 @@ function create(entropy: Bytes, original: Bytes, client: Boolean): Connection {
         sentData: 0; receivedData: 0; consumedData: 0; receiveMaxData: 262144; parametersChecked: false
         congestion: recovery.create(1200); recoveryGeneration: 0; flight: 0; receivedBytes: 0; sentBytes: 0
         history: []; lossFirst: -1; lossLast: -1; lossAfter: -1; emptySince: -1
-        addressValidated: client; confirmed: false; handshakeAcknowledged: false; handshakeProbe: -1; lastActivity: -1; now: -1
+        addressValidated: client; confirmed: false; handshakeAcknowledged: false; handshakeProbe: -1; lastActivity: -1; idleSendAllowed: true; now: -1
         earlyWrite: protection.traffic(1, 0, Bytes()); earlyRead: protection.traffic(1, 0, Bytes()); earlyRejected: false; earlyStreams: []; earlyData: 0; earlyPackets: 0
         closing: false; draining: false; closeUntil: -1; closeResponseAt: -1; closeInterval: 0; closeAttempts: 0; closeFrame: Bytes(); closeLevel: 0
         paceCredit: 12000.0; paceAt: -1; paceNext: -1
@@ -1237,7 +1237,7 @@ function retryClient(connection: Connection, packet: Bytes, header: wire.Header)
     space.sendCrypto = 0; space.writePackets = 0
     connection.remote = header.source; connection.initialDestination = header.source; connection.retrySource = header.source; connection.retryToken = header.token; connection.retryAccepted = true
     connection.congestion = recovery.create(1200); connection.flight = 0; connection.paceCredit = 12000.0; connection.paceAt = -1; connection.handshakeProbe = -1; connection.handshakeAcknowledged = false
-    connection.receivedBytes = 0; connection.sentBytes = 0; connection.lastActivity = connection.now
+    connection.receivedBytes = 0; connection.sentBytes = 0; connection.lastActivity = connection.now; connection.idleSendAllowed = true
     cryptoData(connection,0,connection.initialHandshake)
 }
 function negotiateClient(connection: Connection, header: wire.Header) {
@@ -1362,6 +1362,7 @@ public function receivePath(connection: Connection, datagram: Bytes, pathId: Int
         let path = connection.paths[pathAt]
         if !countedPath { path.received += datagram.length; countedPath = true }
         connection.lastActivity = now
+        connection.idleSendAllowed = true
         let parsed = wire.frames(packet.payload)
         if !parsed.valid || parsed.frames.length == 0 { terminate(connection, 7, "malformed or empty QUIC payload"); return }
         if packet.number > space.largest {
@@ -1482,6 +1483,9 @@ function ackPayloadLimit(connection: Connection, level: Integer, pathId: Integer
     // Reserve the AEAD tag separately. Each retained range is visited once.
     return 1200 - packetHeaderLengthPath(connection,level,1200,pathId) - 16
 }
+function idleDeadline(connection: Connection): Integer {
+    return connection.lastActivity + max(connection.idleTimeout, 3 * recovery.pto(connection.congestion, connection.confirmed))
+}
 public function poll(connection: Connection, now: Integer): List<Bytes> {
     let outgoing: List<Bytes> = []
     connection.outgoingPaths = []
@@ -1503,7 +1507,7 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
             else { abandonPath(connection,path) }
         }
     }
-    if !connection.closing && now - connection.lastActivity >= connection.idleTimeout {
+    if !connection.closing && now >= idleDeadline(connection) {
         // RFC9000 idle expiry discards the connection without a close packet.
         connection.state = CLOSED; connection.pending = []; connection.closing = false; connection.handshakeProbe = -1; for space in connection.spaces { clearAck(space) }; return outgoing
     }
@@ -1675,6 +1679,7 @@ public function poll(connection: Connection, now: Integer): List<Bytes> {
             connection.closeAttempts += 1
         }
         if ackEliciting {
+            if connection.idleSendAllowed { connection.lastActivity = now; connection.idleSendAllowed = false }
             if recoveryFlight(connection) == 0 && connection.emptySince >= 0 { recovery.idle(connection.congestion,now - connection.emptySince) }
             connection.emptySince = -1
             connection.paceCredit = max(0.0,connection.paceCredit - Float(size))
@@ -1729,7 +1734,7 @@ public function nextTimer(connection: Connection): Integer {
     if connection.closing || connection.draining { if connection.closeUntil < 0 { return max(0,connection.now) }; return connection.closeUntil }
     if connection.state == FAILED || connection.state == CLOSED { return -1 }
     if connection.now < 0 { return 0 }
-    let deadline = connection.lastActivity + connection.idleTimeout
+    let deadline = idleDeadline(connection)
     if connection.paceNext >= 0 { deadline = min(deadline,connection.paceNext) }
     if connection.handshakeProbe >= 0 { deadline = min(deadline,connection.handshakeProbe) }
     for level in 0..3 {
@@ -1768,7 +1773,7 @@ function candidatePath(connection: Connection, id: Integer, local: Boolean): Int
     let retained: List<Path> = []
     for path in connection.paths {
         if path.id == connection.activePath { retained.add(path) }
-        else if path.challenge.length == 8 { return -1 }
+        else if path.challenge.length == 8 && !path.validated { return -1 }
     }
     let path = Path { id: id; validated: false; eligible: local && connection.clientRole; challenge: randomBytes(8); remoteSequence: sequence; remoteId: destination; localId: connection.local; intentional: local; deadline: -1; attempts: 0; received: 0; sent: 0 }
     retained.add(path); connection.paths = retained

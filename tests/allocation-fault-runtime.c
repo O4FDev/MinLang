@@ -23,6 +23,8 @@ typedef union FaultHeader {
 #define FAULT_FREED_BYTE 0xdd
 #define FAULT_SUFFIX_BYTE 0xe7
 static size_t fault_allocations, fault_resizes, fault_moved, fault_fired;
+static size_t fault_frame_entries, fault_frame_leaves, fault_frames, fault_peak_frames;
+static size_t fault_released_objects, fault_storage_moves;
 static size_t fault_allocation_index, fault_resize_index;
 static int fault_initialized, fault_explicit_exit;
 typedef struct { size_t kind, size, live; } FaultEvent;
@@ -174,6 +176,16 @@ static void *fault_calloc(size_t count, size_t size) {
 #define exit fault_exit
 #define MINYAR_SYSTEM_HEAP 1
 #define MINYAR_RC_TESTING 1
+#ifndef MINYAR_COMPILER_ARENA
+#define minyar_rc_enter fault_rc_enter_impl
+#define minyar_rc_leave fault_rc_leave_impl
+#define minyar_rc_enter_stack_v1 fault_rc_enter_stack_impl
+#define minyar_rc_leave_stack_v1 fault_rc_leave_stack_impl
+#define minyar_list_add fault_list_add_impl
+#define minyar_list_add_take fault_list_add_take_impl
+static void fault_object_release(void *object);
+#define MINYAR_RC_OBJECT_RELEASE_OBSERVER(object) fault_object_release(object)
+#endif
 #include "../runtime/minyar_runtime.c"
 #include "../runtime/minyar_stack_frames.h"
 #undef malloc
@@ -181,6 +193,63 @@ static void *fault_calloc(size_t count, size_t size) {
 #undef realloc
 #undef free
 #undef exit
+
+#ifndef MINYAR_COMPILER_ARENA
+#undef minyar_rc_enter
+#undef minyar_rc_leave
+#undef minyar_rc_enter_stack_v1
+#undef minyar_rc_leave_stack_v1
+#undef minyar_list_add
+#undef minyar_list_add_take
+
+static void fault_frame_enter(void) {
+    fault_frame_entries++;
+    if (++fault_frames > fault_peak_frames) fault_peak_frames = fault_frames;
+}
+
+static void fault_frame_leave(void) {
+    assert(fault_frames > 0);
+    fault_frames--;
+    fault_frame_leaves++;
+}
+
+void minyar_rc_enter(long long locals) {
+    fault_frame_enter();
+    fault_rc_enter_impl(locals);
+}
+
+void minyar_rc_leave(void) {
+    fault_rc_leave_impl();
+    fault_frame_leave();
+}
+
+void minyar_rc_enter_stack_v1(void *header, void *storage, long long locals) {
+    fault_frame_enter();
+    fault_rc_enter_stack_impl(header, storage, locals);
+}
+
+void minyar_rc_leave_stack_v1(void *header) {
+    fault_rc_leave_stack_impl(header);
+    fault_frame_leave();
+}
+
+void minyar_list_add(MinyarList *list, long long value) {
+    uintptr_t previous = (uintptr_t)list->values;
+    fault_list_add_impl(list, value);
+    if (previous && previous != (uintptr_t)list->values) fault_storage_moves++;
+}
+
+void minyar_list_add_take(MinyarList *list, long long value) {
+    uintptr_t previous = (uintptr_t)list->values;
+    fault_list_add_take_impl(list, value);
+    if (previous && previous != (uintptr_t)list->values) fault_storage_moves++;
+}
+
+static void fault_object_release(void *object) {
+    (void)object;
+    fault_released_objects++;
+}
+#endif
 
 static _Noreturn void fault_exit(int status) {
     fault_explicit_exit = 1;
@@ -204,6 +273,7 @@ __attribute__((destructor)) static void fault_report(void) {
 #else
     if (!fault_explicit_exit) {
         assert(rc_frames == NULL);
+        assert(fault_frames == 0 && fault_frame_entries == fault_frame_leaves);
         while (rc_pending_count) assert(minyar_rc_poll(32) > 0);
         assert(rc_object_count == rc_immortal_object_count);
     }
@@ -214,10 +284,13 @@ __attribute__((destructor)) static void fault_report(void) {
         if (!file) abort();
         if (fprintf(file, "{\"allocations\":%zu,\"resizes\":%zu,\"moved\":%zu,"
                     "\"fired\":%zu,\"fatal_exit\":%d,\"live_bytes\":%zu,"
-                    "\"peak_required\":%zu,\"failed_required\":%zu,\"events\":[",
+                    "\"peak_required\":%zu,\"failed_required\":%zu,"
+                    "\"frame_entries\":%zu,\"frame_leaves\":%zu,\"peak_frames\":%zu,"
+                    "\"released_objects\":%zu,\"storage_moves\":%zu,\"events\":[",
                     fault_allocations, fault_resizes, fault_moved, fault_fired,
                     fault_explicit_exit, fault_live_bytes, fault_peak_required,
-                    fault_failed_required) < 0) abort();
+                    fault_failed_required, fault_frame_entries, fault_frame_leaves,
+                    fault_peak_frames, fault_released_objects, fault_storage_moves) < 0) abort();
         for (size_t index = 0; index < fault_event_count; index++) {
             FaultEvent event = fault_events[index];
             if (fprintf(file, "%s[%zu,%zu,%zu]", index ? "," : "", event.kind, event.size, event.live) < 0) abort();

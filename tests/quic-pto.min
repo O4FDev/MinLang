@@ -336,6 +336,41 @@ function blockedProbe(root: Bytes, identity: Bytes, key: Bytes, certificate: Byt
     if handshake == 0 || !s.addressValidated { return 84 }
     return 0
 }
+function idle(root: Bytes, identity: Bytes, key: Bytes, certificate: Bytes, clientKey: Bytes, slow: Boolean): Integer {
+    let c = quic.client("localhost", randomBytes(80), "minyar-test", [root], [certificate], clientKey)
+    let s = quic.server(randomBytes(80), "minyar-test", c.originalDestination, [identity], key, [root], true)
+    for tick in 0..100 { drive(c, s, tick * 10) }
+    if !c.confirmed || c.spaces[2].sent.length != 0 || c.pending.length != 0 { return 100 }
+    c.congestion.measured = true; c.congestion.smoothed = 2000; c.congestion.variance = 1000; c.congestion.probes = 0
+    if slow {
+        c.idleTimeout = 1000
+        let deadline = c.lastActivity + 3 * recovery.pto(c.congestion, true)
+        if quic.nextTimer(c) != deadline { return 101 }
+        if quic.poll(c, deadline - 1).length != 0 || c.state != quic.ESTABLISHED { return 102 }
+        if quic.poll(c, deadline).length != 0 || c.state != quic.CLOSED || quic.nextTimer(c) != -1 { return 103 }
+        return 0
+    }
+    quic.ping(s)
+    for packet in quic.poll(s, 1100) { quic.receive(c, packet, 1100) }
+    if c.lastActivity != 1100 { return 104 }
+    let acknowledgements = quic.poll(c, 1130)
+    if acknowledgements.length == 0 || c.lastActivity != 1100 || c.spaces[2].sent.length != 0 { return 104 }
+    for packet in acknowledgements { quic.receive(s, packet, 1130) }
+    quic.ping(c)
+    let first = quic.poll(c, 1200)
+    if first.length == 0 || c.lastActivity != 1200 { return 105 }
+    quic.ping(c)
+    if quic.poll(c, 1300).length == 0 || c.lastActivity != 1200 { return 106 }
+    for packet in first { quic.receive(s, packet, 1400) }
+    for packet in quic.poll(s, 1430) { quic.receive(c, packet, 1430) }
+    if c.lastActivity != 1430 { return 107 }
+    c.congestion.window = 0
+    quic.ping(c)
+    if quic.poll(c, 1500).length != 0 || c.lastActivity != 1430 { return 108 }
+    c.congestion.window = 12000
+    if quic.poll(c, 1600).length == 0 || c.lastActivity != 1600 { return 109 }
+    return 0
+}
 function main(): Integer {
     let root = readBytesFile(argument(0)); let identity = readBytesFile(argument(1)); let key = readBytesFile(argument(2))
     let certificate = readBytesFile(argument(3)); let clientKey = readBytesFile(argument(4)); let mode = argument(5)
@@ -352,6 +387,8 @@ function main(): Integer {
     else if mode == "drain" { result = closing(root, identity, key, certificate, clientKey, true) }
     else if mode == "retry" { result = retried(root, identity, key, certificate, clientKey) }
     else if mode == "blocked-probe" { result = blockedProbe(root, identity, key, certificate, clientKey) }
+    else if mode == "idle-send" { result = idle(root, identity, key, certificate, clientKey, false) }
+    else if mode == "idle-pto" { result = idle(root, identity, key, certificate, clientKey, true) }
     if result == 0 { print("QUIC PTO " + mode + " passed") }
     return result
 }

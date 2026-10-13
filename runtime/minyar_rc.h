@@ -150,13 +150,16 @@ static void *rc_reallocate_data(void *pointer, size_t size) {
 #endif
     if (size > SIZE_MAX - sizeof(RcData)) out_of_memory();
     RcData *data = (RcData *)pointer - 1;
-    RC_ACCOUNT(rc_bytes -= data->size);
+#ifdef MINYAR_RC_TESTING
+    size_t previous_size = data->size;
+#endif
 #ifdef MINYAR_BOUNDED_RC
     data = rc_heap_resize(data, sizeof(*data) + data->size, sizeof(*data) + size);
 #else
     data = realloc(data, sizeof(*data) + size);
 #endif
     if (!data) out_of_memory();
+    RC_ACCOUNT(rc_bytes -= previous_size);
     data->size = size;
     RC_ACCOUNT(rc_bytes += size);
     return data + 1;

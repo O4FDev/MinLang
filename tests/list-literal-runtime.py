@@ -62,7 +62,7 @@ def run_campaign(args):
                         checked(executable, invalid, 1, b'', OVERFLOW)
                     failures = []
                     if profile == 'fault-system':
-                        for failure in ('fail-fresh', 'fail-resize'):
+                        for failure in ('fail-fresh', 'fail-resize', 'fail-large-resize'):
                             checked(executable, failure, 1, b'old-list-preserved\n', OOM)
                             failures.append(failure)
                     observations.append(dict(mode=mode, optimization=optimization, profile=profile,
