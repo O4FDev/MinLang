@@ -1,0 +1,173 @@
+use "../tools/testing.min" as test
+use "./compiler-port-support.min" as port
+use "./cpython-random.min" as random
+use "files" as files
+
+function compiled(context: test.Compiler, source: Text): Text {
+    let result = test.compile(context, source)
+    test.check(result.status == 0, result.errorOutput)
+    let llvm = context.directory + "/case" + Text(context.serial) + ".ll"
+    test.check(files.pathSize(llvm) >= 0, "compiler produced no LLVM")
+    return readTextFile(llvm)
+}
+function acceptsManagedGraph(context: test.Compiler, source: Text) {
+    test.check(test.contains(compiled(context, source), "; minyar-cycle-runtime: 1\n"), "managed graph did not select the cycle runtime")
+}
+function count(name: Text, fallback: Integer): Integer {
+    let value = test.setting(name, "")
+    if value == "" { return fallback }
+    let parsed = 0
+    for byte in Bytes(value) {
+        test.check(byte >= 48 && byte <= 57, name + " must be a decimal Integer")
+        parsed = parsed * 10 + byte - 48
+    }
+    return max(fallback, parsed)
+}
+function graphExample(context: test.Compiler) {
+    port.executes(context, readTextFile("examples/graph.min"), "second\nfirst\n", 0, "")
+}
+function recursiveMutationChecker(context: test.Compiler) {
+    for seed in 0..count("MINYAR_OWNERSHIP_GRAPHS", 40) {
+        let rng = random.seeded(Text(seed))
+        let edges: List<List<Integer>> = []
+        for row in 0..8 {
+            let targets: List<Integer> = []
+            for column in 0..8 { if random.uniform(rng) < 0.13 { targets.add(column) } }
+            edges.add(targets)
+        }
+        let reaches: List<List<Boolean>> = []
+        for row in 0..8 {
+            let cells: List<Boolean> = []
+            for column in 0..8 {
+                let found = false
+                for target in edges[row] { if target == column { found = true } }
+                cells.add(found)
+            }
+            reaches.add(cells)
+        }
+        for middle in 0..8 {
+            for start in 0..8 {
+                for end in 0..8 {
+                    if reaches[start][middle] && reaches[middle][end] { reaches[start][end] = true }
+                }
+            }
+        }
+        let lines: List<Text> = []
+        for row in 0..8 {
+            let fields: List<Text> = []
+            for index in 0..edges[row].length {
+                if index > 0 { fields.add("; ") }
+                fields.add("f" + Text(edges[row][index]) + ": List<R" + Text(edges[row][index]) + ">")
+            }
+            if row > 0 { lines.add("\n") }
+            lines.add("record R" + Text(row) + " { " + joinText(fields) + " }")
+        }
+        let source = joinText(lines) + "\n"
+        compiled(context, source)
+        for node in 0..8 {
+            let operation = "function append(values: List<R" + Text(node) + ">, value: R" + Text(node) + ") { values.add(value) }\n"
+            compiled(context, source + operation)
+            if reaches[node][node] { acceptsManagedGraph(context, source + operation) }
+        }
+    }
+}
+function generatedAliasPrograms(context: test.Compiler) {
+    for seed in 0..count("MINYAR_OWNERSHIP_SEEDS", 8) {
+        let rng = random.seeded(Text(seed))
+        let source = ["record Box { text: Text; number: Integer }",
+            "function box(n: Integer): Box { return Box { text: Text(n) + \"!\"; number: n } }",
+            "function fetch(items: List<Box>, n: Integer): Box { return items[n] }",
+            "let items: List<Box> = []", "let alias = items"]
+        let model = [0, 1, 2, 3, 4, 5]
+        let snapshotSteps: List<Integer> = []
+        let snapshotValues: List<Integer> = []
+        let expected: List<Text> = []
+        for index in 0..6 { source.add("items.add(box(" + Text(index) + "))") }
+        for step in 0..40 {
+            let target = random.below(rng, 6)
+            let other = random.below(rng, 6)
+            let operation = random.below(rng, 3)
+            if operation == 0 {
+                source.add("alias[" + Text(target) + "] = items[" + Text(other) + "]")
+                model[target] = model[other]
+            } else if operation == 1 {
+                source.add("items[" + Text(target) + "] = box(" + Text(step + 10) + ")")
+                model[target] = step + 10
+            } else {
+                source.add("let saved" + Text(step) + " = fetch(alias, " + Text(target) + ")")
+                snapshotSteps.add(step)
+                snapshotValues.add(model[target])
+            }
+        }
+        for index in 0..snapshotSteps.length {
+            source.add("print(saved" + Text(snapshotSteps[index]) + ".text)")
+            expected.add(Text(snapshotValues[index]) + "!")
+        }
+        for index in 0..model.length {
+            source.add("print(items[" + Text(index) + "].number)")
+            expected.add(Text(model[index]))
+        }
+        let program: List<Text> = []
+        for line in source { program.add(line + "\n") }
+        let output: List<Text> = []
+        for line in expected { output.add(line + "\n") }
+        port.executes(context, joinText(program), joinText(output), 0, "")
+    }
+}
+function recursiveShapes(context: test.Compiler) {
+    for declarations in ["record Node { children: List<Node> }", "record Node { next: Node }",
+        "record A { b: List<B> }\nrecord B { a: A }", "record A { b: List<List<B>> }\nrecord B { a: List<A> }"] {
+        compiled(context, declarations + "\n")
+    }
+}
+function unfinishedFieldRead(context: test.Compiler) {
+    port.rejects(context, "record Point { x: Integer }\nlet points: List<Point> = []\nprint(points[0].", "expected a field or method name after '.'")
+}
+function nativeOwnership(context: test.Compiler) {
+    let llvm = compiled(context, "let words: List<Text> = []\nwords.add(\"a\" + \"b\")\nprint(words[0])\n")
+    test.check(!test.contains(llvm, "minyar_gc_"), "native output used tracing")
+    test.check(test.contains(llvm, "minyar_rc_"), "native output lost reference counting")
+}
+function aliasAndSelfAssignment(context: test.Compiler) {
+    port.executes(context, "let words: List<Text> = []\nwords.add(\"old\" + \"!\")\nlet alias = words\nlet saved = words[0]\nwords[0] = words[0]\nwords = words\nalias[0] = \"new\" + \"!\"\nprint(saved)\nprint(words[0])\n", "old!\nnew!\n", 0, "")
+}
+function scalarFieldRead(context: test.Compiler) {
+    let llvm = compiled(context, "record Point { x: Integer }\nlet points: List<Point> = []\npoints.add(Point { x: 42 })\nprint(points[0].x)\n")
+    test.check(!test.contains(llvm, "call void @minyar_rc_retain"), "scalar field read retained an owner")
+    test.check(!test.contains(llvm, "call void @minyar_rc_borrow"), "scalar field read borrowed an owner")
+    test.check(test.contains(llvm, "call ptr @minyar_record_new_scalar"), "scalar record allocation changed")
+}
+function borrowSurvivesMutation(context: test.Compiler) {
+    port.executes(context, "record Box { text: Text }\nfunction replace(boxes: List<Box>): Text {\nboxes[0] = Box { text: \"new\" + \"!\" }\nreturn \"tail\" + \"!\"\n}\nfunction combine(first: Text, second: Text): Text { return first + second }\nlet boxes: List<Box> = []\nboxes.add(Box { text: \"old\" + \"!\" })\nprint(combine(boxes[0].text, replace(boxes)))\nprint(boxes[0].text)\n", "old!tail!\nnew!\n", 0, "")
+}
+function returnsAndIdentity(context: test.Compiler) {
+    port.executes(context, "function identity(text: Text): Text { return Text(text) }\nfunction choose(left: Text, right: Text, flag: Boolean): Text {\nif flag { return left } else { return right }\n}\nlet text = \"start\" + \"!\"\nlet index = 0\nwhile index < 1000 {\ntext = identity(choose(text, \"other\", true))\nindex = index + 1\n}\nprint(text)\n", "start!\n", 0, "")
+}
+function nestedShared(context: test.Compiler) {
+    port.executes(context, "record Leaf { text: Text; number: Integer }\nrecord Pair { left: Leaf; right: Leaf }\nfunction make(): List<List<Pair>> {\nlet leaf = Leaf { text: \"shared\" + \"!\"; number: 42 }\nlet pair = Pair { left: leaf; right: leaf }\nlet inner: List<Pair> = []\ninner.add(pair)\nlet outer: List<List<Pair>> = []\nouter.add(inner)\nouter.add(inner)\nreturn outer\n}\nlet values = make()\nprint(values[1][0].left.text)\nprint(values[0][0].right.number)\n", "shared!\n42\n", 0, "")
+}
+
+let names = ["test_graph_example", "test_recursive_mutation_checker_against_independent_model", "test_generated_alias_programs",
+    "test_recursive_shapes_without_mutations_are_supported", "test_unfinished_field_read_has_a_language_diagnostic",
+    "test_native_output_uses_ownership_not_tracing", "test_alias_and_self_assignment", "test_scalar_field_read_needs_no_extra_owner",
+    "test_borrow_survives_mutating_argument", "test_returns_reassignments_and_identity_conversion", "test_nested_shared_lists_and_records"]
+let selectors = port.selectors("Ownership", names)
+let context = port.compiler()
+let ran = 0
+for name in names {
+    if !port.selected(selectors, "Ownership", name) { continue }
+    if name == names[0] { graphExample(context) }
+    else if name == names[1] { recursiveMutationChecker(context) }
+    else if name == names[2] { generatedAliasPrograms(context) }
+    else if name == names[3] { recursiveShapes(context) }
+    else if name == names[4] { unfinishedFieldRead(context) }
+    else if name == names[5] { nativeOwnership(context) }
+    else if name == names[6] { aliasAndSelfAssignment(context) }
+    else if name == names[7] { scalarFieldRead(context) }
+    else if name == names[8] { borrowSurvivesMutation(context) }
+    else if name == names[9] { returnsAndIdentity(context) }
+    else { nestedShared(context) }
+    ran += 1
+}
+test.removeTree(context.directory)
+print("Ownership: " + Text(ran) + " checks passed")

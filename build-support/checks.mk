@@ -193,12 +193,12 @@ check-sanitized-fixed-point: build/minyarc-sanitize build/compiler-stage3.ll bui
 .PHONY: check-sanitize-core
 check-sanitize: check-generated-sanitizer check-sanitized-fixed-point check-stack-overflow-sanitize check-sanitize-core
 
-check-sanitize-core: build/tooling/tests/memory build/minyarc-sanitize build/minyar-runtime.o build/minyar-runtime-sanitize.o build/runtime-unit-sanitize build/tooling/tests/regressions build/tooling/tools/clang-driver
+check-sanitize-core: build/tooling/tests/memory build/minyarc-sanitize build/minyar-runtime.o build/minyar-runtime-sanitize.o build/runtime-unit-sanitize build/tooling/tests/regressions build/tooling/tools/clang-driver build/tooling/tests/ownership
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize $(SANITIZER_LIMITED) sh tests/run-module-tests.sh
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) python3 tests/fuzz.py --compiler build/minyarc-sanitize --cases 100 --hostile-timeout 15
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/runtime-unit-sanitize
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/regressions
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/ownership.py
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/ownership
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/memory --shared
 
 check-stress: build/minyarc build/minyar-runtime.o
@@ -266,9 +266,11 @@ check-examples: build/stage0 build/minyarc build/compiler-stage3.ll build/hello 
 	grep -q "block comment is missing its closing" build/comment-error.txt
 	@echo "Minyar -> LLVM IR -> native executable verified"
 
-check-ownership: build/minyarc build/minyar-runtime.o build/ownership-runtime.o build/tooling/tests/memory
-	$(LIMITED) python3 tests/ownership.py
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/ownership.py
+build/tooling/tests/ownership: TOOL_NATIVE = tests/sha256-test-native.c
+build/tooling/tests/ownership: tests/sha256-test-native.c
+check-ownership: build/minyarc build/minyar-runtime.o build/ownership-runtime.o build/tooling/tests/memory build/tooling/tests/ownership
+	$(LIMITED) ./build/tooling/tests/ownership
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/ownership
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/memory --shared
 
 check-adversarial: build/minyarc build/minyar-runtime.o build/minyarc-sanitize build/ownership-runtime.o
@@ -278,9 +280,9 @@ check-adversarial: build/minyarc build/minyar-runtime.o build/minyarc-sanitize b
 check-ownership-mutation: build/tooling/tests/ownership-mutation
 	$(LIMITED) ./build/tooling/tests/ownership-mutation
 
-check-ownership-stress: build/minyarc build/minyarc-sanitize build/minyar-runtime.o build/ownership-runtime.o
-	MINYAR_OWNERSHIP_GRAPHS=256 MINYAR_OWNERSHIP_SEEDS=32 $(LIMITED) python3 tests/ownership.py
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_OWNERSHIP_GRAPHS=256 MINYAR_OWNERSHIP_SEEDS=32 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/ownership.py
+check-ownership-stress: build/minyarc build/minyarc-sanitize build/minyar-runtime.o build/ownership-runtime.o build/tooling/tests/ownership
+	MINYAR_OWNERSHIP_GRAPHS=256 MINYAR_OWNERSHIP_SEEDS=32 $(LIMITED) ./build/tooling/tests/ownership
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_OWNERSHIP_GRAPHS=256 MINYAR_OWNERSHIP_SEEDS=32 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/ownership
 
 .PHONY: check-recursive-data check-bounded check-compact-ownership
 
