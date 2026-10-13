@@ -623,7 +623,7 @@ check-quic-interop-results:
 check check-portable check-quic check-quic-sanitize: check-quic-interop-results
 
 # Native suite levels are independent children so a parallel runner overlaps them.
-.PHONY: check-quic check-quic-sanitize check-quic-native-O0 check-quic-native-O2
+.PHONY: check-quic check-quic-sanitize check-quic-native-O0 check-quic-native-O2 check-quic-native-sanitize
 check-quic-native-O0: build/minyarc
 	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/quic-suite.py --artifacts build/quic-native-O0
 
@@ -632,8 +632,10 @@ check-quic-native-O2: build/minyarc
 
 check-quic: build/minyarc check-quic-native-O0 check-quic-native-O2
 
-check-quic-sanitize: build/minyarc
+check-quic-native-sanitize: build/minyarc
 	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/quic-suite.py --sanitize --artifacts build/quic-sanitize
+
+check-quic-sanitize: build/minyarc check-quic-native-sanitize
 
 check: check-quic
 check-sanitize: check-quic-sanitize
