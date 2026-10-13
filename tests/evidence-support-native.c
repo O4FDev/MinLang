@@ -141,7 +141,7 @@ long long minyar_evidencesupport_terminate(long long pid, bool group) {
     return -errno;
 }
 
-MinyarText *minyar_evidencesupport_resolve(const MinyarText *path) {
+MinyarText *minyar_evidencesupport_resolveNative(const MinyarText *path) {
     char *name = copy_text(path);
     char *resolved = name ? realpath(name, NULL) : NULL;
     MinyarText *result = resolved ? minyar_native_copy_text((const unsigned char *)resolved, (long long)strlen(resolved))
