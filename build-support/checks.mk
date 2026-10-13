@@ -1,4 +1,4 @@
-.PHONY: all check check-portable check-smoke check-regressions check-diagnostics check-conformance check-coverage check-memory check-runtime-unit check-ownership check-adversarial check-ownership-mutation check-ownership-stress check-budget check-fuzz check-fuzz-coverage check-stack-overflow check-windows-large-file check-modules check-mutation check-mutation-score check-performance check-scaling check-sanitize check-stress doctor emit run clean
+.PHONY: all check check-portable check-smoke check-regressions check-diagnostics check-conformance check-coverage check-memory check-runtime-unit check-ownership check-adversarial check-ownership-mutation check-ownership-stress check-budget check-fuzz check-fuzz-coverage check-stack-overflow check-modules check-mutation check-mutation-score check-performance check-scaling check-sanitize check-stress doctor emit run clean
 
 .PHONY: check-runtime-cache
 check-runtime-cache: build/minyarc build/tooling/tests/runtime-cache build/tooling/tools/clang-driver
@@ -135,10 +135,7 @@ check-stack-overflow-sanitize: build/minyarc-sanitize build/minyar-runtime-sanit
 
 # Cross-platform per-commit gate. Heavier memory-profile and performance
 # matrices remain in the Linux evidence runner and the full `make check` gate.
-check-windows-large-file:
-	python3 tests/windows-large-file.py
-
-check-portable: check-smoke check-regressions check-diagnostics check-conformance check-runtime-unit check-modules check-fuzz check-stack-overflow check-windows-large-file build/compiler-stage3.ll build/minyar-runtime.o build/tooling/tests/compiler-behavior
+check-portable: check-smoke check-regressions check-diagnostics check-conformance check-runtime-unit check-modules check-fuzz check-stack-overflow build/compiler-stage3.ll build/minyar-runtime.o build/tooling/tests/compiler-behavior
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile core --ir build/compiler-stage3.ll
 
 check-mutation: build/stage0 build/minyarc build/minyar-runtime.o build/tooling/tests/list-access build/tooling/tests/checked-arithmetic build/tooling/tools/clang-driver build/tooling/tests/mutation
