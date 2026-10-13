@@ -659,11 +659,11 @@ def partial_cli_control(root):
 def timeout_cli_control(root):
     records=adapter.RawCommands(root/"commands");marker=root/"delayed-create.json";parent=root/"actual-parent.json"
     child=root/"escaped.py"
-    child.write_text("import json,os,sys,time\nfrom pathlib import Path\nos.setsid()\nPath(sys.argv[2]).write_text(json.dumps({'pid':os.getpid(),'parent_pid':os.getppid()}))\ntime.sleep(.6)\nPath(sys.argv[1]).write_text('delayed mock create')\ntime.sleep(10)\n")
+    child.write_text("import json,os,sys,time\nfrom pathlib import Path\nos.setsid()\nPath(sys.argv[2]).write_text(json.dumps({'pid':os.getpid(),'parent_pid':os.getppid()}))\ntime.sleep(5)\nPath(sys.argv[1]).write_text('delayed mock create')\ntime.sleep(10)\n")
     root_cli=root/"cli.py"
     root_cli.write_text("import subprocess,time\nsubprocess.Popen("+repr([sys.executable,str(child),str(marker),str(parent)])+")\ntime.sleep(10)\n")
     argv=[sys.executable,str(root_cli)];prior=subreaper_value();caught=None
-    try:records.run(argv,.2)
+    try:records.run(argv,2)
     except subprocess.TimeoutExpired as error:caught=error
     row=records.rows[0];actual=json.loads(parent.read_bytes())
     receipts=row["lifetime"]["receipts"]
