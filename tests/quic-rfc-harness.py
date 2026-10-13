@@ -28,6 +28,37 @@ DRIVER = module('quic_rfc_clang', ROOT / 'tools/clang-driver.py')
 
 
 class QuicRfcHarness(unittest.TestCase):
+    def test_rebinding_pacing_recovers_from_coalesced_waits(self):
+        qns = module('quic_qns_pacing', ROOT / 'tests/quic-qns-local.py')
+        for quantum in (.019, .024):
+            proxy = qns.RebindingProxy.__new__(qns.RebindingProxy)
+            proxy.delay = .003
+            proxy.delivery_at = None
+            now = 0
+            for _ in range(300):
+                delay = proxy.delivery_delay(now)
+                self.assertGreaterEqual(delay, 0)
+                if delay > 0:
+                    now += quantum
+                now += .0001
+            with self.subTest(quantum=quantum):
+                self.assertGreaterEqual(now, .9)
+                self.assertLess(now, .9 + quantum + .001)
+
+    def test_rebinding_pacing_bounds_catchup_after_idle(self):
+        qns = module('quic_qns_idle_pacing', ROOT / 'tests/quic-qns-local.py')
+        proxy = qns.RebindingProxy.__new__(qns.RebindingProxy)
+        proxy.delay = .003
+        proxy.delivery_at = None
+        self.assertAlmostEqual(proxy.delivery_delay(0), .003)
+        delays = [proxy.delivery_delay(60) for _ in range(9)]
+        self.assertTrue(all(delay >= 0 for delay in delays))
+        self.assertGreater(delays[-1], 0)
+        proxy.delay = 0
+        proxy.delivery_at = None
+        for now in (0, 1, 60):
+            self.assertEqual(proxy.delivery_delay(now), 0)
+
     def test_literal_inventory_rejects_duplicate_dictionary_keys(self):
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder) / 'cases.py'
