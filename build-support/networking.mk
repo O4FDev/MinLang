@@ -1,8 +1,8 @@
 # Portable networking foundations have their own gates so protocol tests can
 # grow without mixing native desktop prerequisites into the portable suite.
 .PHONY: check-errors-values check-net check-net-loop check-net-connect check-net-connect-sanitize
-check-errors-values: build/minyarc build/minyar-runtime.o
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/errors-values.py
+check-errors-values: build/minyarc build/minyar-runtime.o build/tooling/tests/errors-values
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/errors-values
 
 check-net: build/minyarc tests/network_evidence.py
 	python3 tests/soak-observer-test.py

@@ -68,8 +68,8 @@ check-linux-snapshot:
 check check-portable: check-linux-snapshot
 
 .PHONY: check-scalar-cleanup-probes
-check-scalar-cleanup-probes:
-	$(SANITIZER_LIMITED) python3 tests/scalar-cleanup-probes.py
+check-scalar-cleanup-probes: build/tooling/tests/scalar-cleanup-probes
+	$(SANITIZER_LIMITED) ./build/tooling/tests/scalar-cleanup-probes
 
 check: check-scalar-cleanup-probes
 
