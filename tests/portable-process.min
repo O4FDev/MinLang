@@ -1,0 +1,39 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+function pause(seconds: Text) {
+    let handle = system.spawn("/bin/sleep", ["sleep", seconds], system.environment(), "")
+    test.check(handle > 0 && system.wait(handle).exitCode == 0, "control pause")
+}
+function gone(path: Text, log: Text) {
+    let pid = test.words(readTextFile(path))[0]
+    let result = test.run(["/bin/ps", "-p", pid, "-o", "stat="], system.environment(), "", log, 10)
+    test.check(result.status != 0 || test.contains(result.output, "Z"), "owned descendant must not remain active: " + result.output)
+}
+let work = test.scratch()
+let success = test.finish(test.portableStart(["/bin/sh", "-c", "printf 'out\\n'; printf 'err\\n' >&2; exit 7"], system.environment(), "", work + "/success", 10), work + "/success")
+test.check(success.status == 7 && success.output == "out\n" && success.errorOutput == "err\n", "portable supervision preserves exact exit/stdout/stderr")
+let child = work + "/child.pid"
+let command = ["/bin/sh", "-c", "trap '' TERM; printf 'partial\\n'; printf 'diagnostic\\n' >&2; /bin/sleep 30 & echo $! >\"$1\"; wait", "minyar", child]
+let started = system.monotonicNanoseconds()
+let timeout = test.finish(test.portableStart(command, system.environment(), "", work + "/timeout", 1), work + "/timeout")
+test.check(timeout.status == 124 && timeout.output == "partial\n" && test.contains(timeout.errorOutput, "diagnostic\n"), "timeout preserves partial diagnostics and distinguished status")
+test.check(system.monotonicNanoseconds() - started < 5000000000, "TERM-ignoring process group is killed within the existing grace period")
+gone(child, work + "/timeout-children")
+let cancelled = test.portableStart(command, system.environment(), "", work + "/cancelled", 30)
+pause("0.2")
+started = system.monotonicNanoseconds()
+test.check(system.sendSignal(system.childProcessId(cancelled), 15) == 0, "cancel private supervisor")
+let cancellation = test.finish(cancelled, work + "/cancelled")
+test.check(cancellation.status == 143 && test.contains(cancellation.output, "partial\n"), "cancellation forwards signals and reaps owned work")
+test.check(system.monotonicNanoseconds() - started < 4000000000, "cancellation terminates descendants promptly")
+gone(child, work + "/cancelled-children")
+let killed = test.portableStart(command, system.environment(), "", work + "/killed", 30)
+pause("0.2")
+test.check(system.sendSignal(system.childProcessId(killed), 9) == 0, "kill private supervisor")
+let killedStatus = system.wait(killed)
+test.check(killedStatus.state == system.SIGNALED && killedStatus.signal == 9, "forced parent death remains a signal result")
+pause("3")
+gone(child, work + "/killed-children")
+test.removeTree(work)
+print("Minyar portable process supervision controls: passed")

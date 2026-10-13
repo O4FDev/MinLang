@@ -17,3 +17,9 @@ build/testing/cycle-runtime.c: runtime/minyar_runtime.c build/tooling/tools/buil
 build/testing/cycle-runtime.o: build/testing/cycle-runtime.c $(wildcard runtime/minyar_*.h)
 	$(LLVM_CC) -O2 -D_GNU_SOURCE -DMINYAR_SYSTEM_HEAP=1 -iquote runtime -c $< -o $@
 
+
+.PHONY: check-portable-process
+check-portable-process: build/tooling/tests/portable-process
+	$(LIMITED) ./build/tooling/tests/portable-process
+
+check check-portable: check-portable-process
