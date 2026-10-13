@@ -6,7 +6,7 @@ use "files" as files
 use "json" as json
 use "sha256" as sha
 public record Command { arguments: List<Text> }
-public record Campaign { root: Text; source: Text; baseline: Text; seed: Text; compilerRuntime: Text; runtime: Text; clang: Text; minimum: Float; limit: Integer; jobs: Integer; timeout: Integer; checks: List<Command>; work: Text }
+public record Campaign { root: Text; source: Text; baseline: Text; seed: Text; compilerRuntime: Text; runtime: Text; clang: Text; minimum: Float; limit: Integer; jobs: Integer; timeout: Integer; checks: List<Command>; work: Text; workerExecutable: Text }
 function join(values: List<Text>, separator: Text): Text {
     let parts: List<Text> = []
     for index in 0..values.length {
@@ -38,7 +38,7 @@ public function checks(root: Text): List<Command> {
     result.add(Command { arguments: ["sh", "tests/run-module-tests.sh"] })
     return result
 }
-function arguments(command: Command, scratch: Text): List<Text> {
+public function arguments(command: Command, scratch: Text): List<Text> {
     let result: List<Text> = []
     for item in command.arguments { result.add(item) }
     if result.length > 1 && result[1] == "tests/fuzz.py" { result.add("--output-dir"); result.add(scratch + "/fuzz") }
@@ -72,8 +72,92 @@ function offset(source: Text, bytes: Integer): Integer {
     for index in 0..bytes { if raw[index] < 128 || raw[index] >= 192 { count += 1 } }
     return count
 }
+public record Mutant { outcome: mutation.Outcome; row: Text; commands: List<Text> }
+public function save(campaign: Campaign, path: Text) {
+    let commands: List<Text> = []
+    for command in campaign.checks { commands.add(encoded(command.arguments)) }
+    writeTextFile(path, "{\"root\":" + json.quote(campaign.root) + ",\"source\":" + json.quote(campaign.source) + ",\"baseline\":" + json.quote(campaign.baseline) + ",\"seed\":" + json.quote(campaign.seed) + ",\"compilerRuntime\":" + json.quote(campaign.compilerRuntime) + ",\"runtime\":" + json.quote(campaign.runtime) + ",\"clang\":" + json.quote(campaign.clang) + ",\"minimum\":" + Text(campaign.minimum) + ",\"limit\":" + Text(campaign.limit) + ",\"jobs\":" + Text(campaign.jobs) + ",\"timeout\":" + Text(campaign.timeout) + ",\"work\":" + json.quote(campaign.work) + ",\"workerExecutable\":" + json.quote(campaign.workerExecutable) + ",\"checks\":[" + join(commands, ",") + "]}")
+}
+public function read(path: Text): Campaign {
+    let value = json.parse(readTextFile(path))
+    test.check(value.kind == json.OBJECT, "invalid campaign worker configuration")
+    let commands: List<Command> = []
+    for command in json.member(value, "checks").items {
+        let args: List<Text> = []
+        for arg in command.items { test.check(arg.kind == json.STRING, "invalid worker command"); args.add(arg.text) }
+        commands.add(Command { arguments: args })
+    }
+    return Campaign { root: json.string(value, "root"); source: json.string(value, "source"); baseline: json.string(value, "baseline"); seed: json.string(value, "seed"); compilerRuntime: json.string(value, "compilerRuntime"); runtime: json.string(value, "runtime"); clang: json.string(value, "clang"); minimum: json.member(value, "minimum").number; limit: Integer(json.member(value, "limit").number); jobs: Integer(json.member(value, "jobs").number); timeout: Integer(json.member(value, "timeout").number); work: json.string(value, "work"); workerExecutable: json.string(value, "workerExecutable"); checks: commands }
+}
+public function publish(campaign: Campaign, index: Integer) {
+    let result = worker(campaign, index)
+    writeTextFile(campaign.work + "/worker-" + Text(index) + ".json", "{\"kind\":" + json.quote(result.outcome.kind) + ",\"stage\":" + json.quote(result.outcome.stage) + ",\"row\":" + json.quote(result.row) + ",\"commands\":[" + join(result.commands, ",") + "]}")
+}
+function collect(campaign: Campaign, index: Integer): Mutant {
+    let path = campaign.work + "/worker-" + Text(index) + ".json"
+    if files.pathSize(path) < 0 { return Mutant { outcome: mutation.Outcome { kind: "infrastructure"; stage: "worker" }; row: "{\"outcome\":\"infrastructure\",\"stage\":\"worker\"}"; commands: [] } }
+    let source = readTextFile(path)
+    let value = json.parse(source)
+    test.check(value.kind == json.OBJECT, "invalid mutant worker result")
+    let commandRows = ""
+    let raw = Bytes(source)
+    let marker = Bytes(",\"commands\":[")
+    for position in 0..raw.length {
+        if position + marker.length <= raw.length && Text(raw.slice(position, position + marker.length)) == Text(marker) {
+            commandRows = Text(raw.slice(position + marker.length, raw.length - 2)); break
+        }
+    }
+    let commands: List<Text> = []
+    if commandRows != "" { commands.add(commandRows) }
+    return Mutant { outcome: mutation.Outcome { kind: json.string(value, "kind"); stage: json.string(value, "stage") }; row: json.string(value, "row"); commands: commands }
+}
+public function worker(campaign: Campaign, index: Integer): Mutant {
+    let original = readTextFile(campaign.source)
+    let selected = mutation.select(mutation.discover(original), campaign.limit)
+    test.check(index >= 0 && index < selected.length, "invalid mutant worker index")
+    let commands: List<Text> = []
+    let site = selected[index]
+    let name = label(site)
+    let prefix = campaign.work + "/mutant-" + Text(index)
+    let source = prefix + ".min"
+    let llvm = prefix + ".ll"
+    let scratch = prefix + "-scratch"
+    test.check(files.makeDirectory(scratch) == 0, "cannot create private mutant scratch")
+    writeTextFile(source, mutation.mutate(original, site))
+    let kind = "stillborn"
+    let stage = "compile"
+    let killedBy = ""
+    let built = invoke(campaign, [campaign.seed, source, "-o", llvm], name + ":build", system.environment(), prefix + ".build", commands, "", source)
+    if built.status == 124 || built.status == 137 { kind = "build_timeout" }
+    else if built.status == 126 || built.status == 127 { kind = "infrastructure" }
+    else if built.status == 0 {
+        stage = "link"
+        let linked = invoke(campaign, [campaign.clang, "-O0", "-Wno-override-module", llvm, campaign.compilerRuntime, "-lm", "-o", prefix], name + ":link", system.environment(), prefix + ".link", commands, "", source)
+        if linked.status == 124 || linked.status == 137 { kind = "build_timeout" }
+        else if linked.status == 126 || linked.status == 127 { kind = "infrastructure" }
+        else if linked.status == 0 {
+            kind = "survived"
+            stage = "test"
+            let env = environment(campaign, prefix, source, scratch)
+            for check in 0..campaign.checks.length {
+                let args = arguments(campaign.checks[check], scratch)
+                let result = invoke(campaign, args, name + ":test", env, prefix + ".test-" + Text(check), commands, prefix, source)
+                if result.status != 0 {
+                    kind = "killed"
+                    if result.status == 126 || result.status == 127 { kind = "infrastructure" }
+                    killedBy = join(args, " ")
+                    if result.status == 124 || result.status == 137 { killedBy = "timeout: " + killedBy }
+                    break
+                }
+            }
+        }
+    }
+    let row = "{\"site\":" + json.quote(name) + ",\"offset\":" + Text(offset(original, site.offset)) + ",\"line\":" + Text(site.line) + ",\"column\":" + Text(site.column) + ",\"operator\":" + json.quote(site.operator) + ",\"replacement\":" + json.quote(mutation.replacement(site.operator)) + ",\"source\":" + json.quote(source) + ",\"outcome\":" + json.quote(kind) + ",\"stage\":" + json.quote(stage) + ",\"killed_by\":" + json.quote(killedBy) + "}"
+    print(Text(index + 1) + "/" + Text(selected.length) + " " + name + ": " + kind)
+    return Mutant { outcome: mutation.Outcome { kind: kind; stage: stage }; row: row; commands: commands }
+}
 public function run(campaign: Campaign): Boolean {
-    test.check(campaign.jobs >= 1 && campaign.jobs <= 8 && campaign.timeout > 0, "invalid campaign limits")
+    test.check(campaign.jobs >= 1 && campaign.jobs <= 8 && campaign.timeout > 0 && campaign.checks.length > 0, "invalid campaign limits")
     test.check(files.makeDirectory(campaign.work) == 0, "cannot create mutation campaign")
     let original = readTextFile(campaign.source)
     let discovered = mutation.discover(original)
@@ -97,50 +181,30 @@ public function run(campaign: Campaign): Boolean {
     let stillborn = 0
     let timeouts = 0
     if baseline {
-        for index in 0..selected.length {
-            let site = selected[index]
-            let name = label(site)
-            let prefix = campaign.work + "/mutant-" + Text(index)
-            let source = prefix + ".min"
-            let llvm = prefix + ".ll"
-            let scratch = prefix + "-scratch"
-            test.check(files.makeDirectory(scratch) == 0, "cannot create private mutant scratch")
-            writeTextFile(source, mutation.mutate(original, site))
-            let kind = "stillborn"
-            let stage = "compile"
-            let killedBy = ""
-            let built = invoke(campaign, [campaign.seed, source, "-o", llvm], name + ":build", system.environment(), prefix + ".build", commands, "", source)
-            if built.status == 124 || built.status == 137 { kind = "build_timeout" }
-            else if built.status == 126 || built.status == 127 { kind = "infrastructure" }
-            else if built.status == 0 {
-                stage = "link"
-                let linked = invoke(campaign, [campaign.clang, "-O0", "-Wno-override-module", llvm, campaign.compilerRuntime, "-lm", "-o", prefix], name + ":link", system.environment(), prefix + ".link", commands, "", source)
-                if linked.status == 124 || linked.status == 137 { kind = "build_timeout" }
-                else if linked.status == 126 || linked.status == 127 { kind = "infrastructure" }
-                else if linked.status == 0 {
-                    kind = "survived"
-                    stage = "test"
-                    let env = environment(campaign, prefix, source, scratch)
-                    for check in 0..campaign.checks.length {
-                        let args = arguments(campaign.checks[check], scratch)
-                        let result = invoke(campaign, args, name + ":test", env, prefix + ".test-" + Text(check), commands, prefix, source)
-                        if result.status != 0 {
-                            kind = "killed"
-                            if result.status == 126 || result.status == 127 { kind = "infrastructure" }
-                            killedBy = join(args, " ")
-                            if result.status == 124 || result.status == 137 { killedBy = "timeout: " + killedBy }
-                            break
-                        }
-                    }
-                }
+        if campaign.jobs > 1 {
+            test.check(campaign.workerExecutable != "", "parallel campaign needs its native worker")
+            let path = campaign.work + "/campaign.json"
+            save(campaign, path)
+            let plan = runner.plan(campaign.jobs, campaign.timeout * (campaign.checks.length + 2) + 30, 0)
+            plan.variants.add(runner.Variant { name: ""; cwd: campaign.root; environment: system.environment(); make: []; rules: []; builder: false })
+            for index in 0..selected.length {
+                runner.addCommand(plan, 0, "mutant-" + Text(index), [campaign.workerExecutable, "--worker", path, Text(index)], [])
             }
-            outcomes.add(mutation.Outcome { kind: kind; stage: stage })
+            if !runner.run(plan) { failure = "campaign is incomplete" }
+            test.removeTree(plan.scratch)
+        }
+        for index in 0..selected.length {
+            let result = Mutant { outcome: mutation.Outcome { kind: "infrastructure"; stage: "worker" }; row: ""; commands: [] }
+            if campaign.jobs == 1 { result = worker(campaign, index) }
+            else { result = collect(campaign, index) }
+            let kind = result.outcome.kind
+            outcomes.add(result.outcome)
+            rows.add(result.row)
+            for command in result.commands { commands.add(command) }
             if kind == "killed" || kind == "survived" { viable += 1 }
             if kind == "killed" { killed += 1 }
             if kind == "stillborn" { stillborn += 1 }
             if kind == "build_timeout" { timeouts += 1 }
-            rows.add("{\"site\":" + json.quote(name) + ",\"offset\":" + Text(offset(original, site.offset)) + ",\"line\":" + Text(site.line) + ",\"column\":" + Text(site.column) + ",\"operator\":" + json.quote(site.operator) + ",\"replacement\":" + json.quote(mutation.replacement(site.operator)) + ",\"source\":" + json.quote(source) + ",\"outcome\":" + json.quote(kind) + ",\"stage\":" + json.quote(stage) + ",\"killed_by\":" + json.quote(killedBy) + "}")
-            print(Text(index + 1) + "/" + Text(selected.length) + " " + name + ": " + kind)
         }
     }
     if failure == "" { failure = mutation.gate(baseline, selected.length, outcomes, 0) }
