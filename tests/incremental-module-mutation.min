@@ -1,0 +1,36 @@
+use "../tools/testing.min" as test
+use "./thread-port-support.min" as support
+use "system" as system
+use "json" as json
+
+let source = readTextFile("build/module-compiler.min")
+let before = "if owner != module { exported[symbol] = stamp }"
+let after = "if owner != module { exported[symbol] = 0 }"
+test.check(Bytes(source).length - Bytes(test.replace(source, before, "")).length == Bytes(before).length, "visibility identity mutation site changed")
+let work = test.scratch()
+writeTextFile(work + "/compiler.min", test.replace(source, before, after))
+let compiled = test.run(["build/minyarc", work + "/compiler.min", work + "/compiler.ll"], system.environment(), "", work + "/compile", 60)
+test.check(compiled.status == 0, compiled.errorOutput)
+let linked = test.run(["clang", "-O2", "-Wno-override-module", "-flto", work + "/compiler.ll", "build/minyar-compiler-runtime.ll", "-o", work + "/mutant", "-lm"], system.environment(), "", work + "/link", 60)
+test.check(linked.status == 0, linked.errorOutput)
+writeTextFile(work + "/main.min", "use \"./leaf.min\" as leaf\nfunction main() {\n    let value = leaf.Hidden { value: 7 }\n    print(value.value)\n}\n")
+writeTextFile(work + "/empty", "")
+let exported = "public record Hidden { value: Integer }\npublic function make(): Hidden { return Hidden { value: 40 } }\n"
+let labels = ["control", "mutant"]
+let compilers = ["build/minyarc-modules", work + "/mutant"]
+let statuses: List<Integer> = []
+let diagnostics: List<Text> = []
+for index in 0..2 {
+    writeTextFile(work + "/leaf.min", exported)
+    let first = test.run([compilers[index], work + "/main.min", work + "/out.ll", "--module-state", work + "/empty", work + "/state", work + "/stats"], system.environment(), "", work + "/" + labels[index] + "-first", 60)
+    test.check(first.status == 0, first.errorOutput)
+    writeTextFile(work + "/leaf.min", test.replace(exported, "public record", "record"))
+    let second = test.run([compilers[index], work + "/main.min", work + "/out.ll", "--module-state", work + "/state", work + "/next", work + "/stats"], system.environment(), "", work + "/" + labels[index] + "-second", 60)
+    statuses.add(second.status)
+    diagnostics.add(second.errorOutput)
+}
+test.check(statuses[0] != 0 && test.contains(diagnostics[0], "private to its module"), "control did not reject withdrawn visibility\n" + diagnostics[0])
+test.check(statuses[1] == 0, "mutant was not weakened\n" + diagnostics[1])
+writeTextFile("build/incremental-module-mutation.json", "{\n  \"mutation\": \"Remove exported visibility from interface identity\",\n  \"outcome\": \"oracle detects the weakened invalidation\",\n  \"source_sha256\": " + json.quote(support.digest("build/module-compiler.min")) + ",\n  \"compiler_sha256\": " + json.quote(support.digest("build/minyarc-modules")) + ",\n  \"results\": {\n    \"control\": {\"exit_code\": " + Text(statuses[0]) + ", \"stderr\": " + json.quote(diagnostics[0]) + "},\n    \"mutant\": {\"exit_code\": " + Text(statuses[1]) + ", \"stderr\": " + json.quote(diagnostics[1]) + "}\n  }\n}\n")
+test.removeTree(work)
+print("interface visibility oracle rejects the weakened invalidation mutant")

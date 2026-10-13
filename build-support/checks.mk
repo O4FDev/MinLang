@@ -373,15 +373,39 @@ check-bounded: build/minyarc build/minyar-runtime-bounded.o build/bounded-runtim
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/bounded-ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/recursive-data
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/bounded-ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/production-memory
 
+build/tooling/tests/incremental-modules.ll: tests/thread-port-support.min tests/cycle-port-support.min
+build/tooling/tests/incremental-modules: TOOL_NATIVE = runtime/native/sha256.c
+build/tooling/tests/incremental-modules: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/incremental-modules: runtime/native/sha256.c
+build/tooling/tests/incremental-module-driver.ll: tests/thread-port-support.min tests/cycle-port-support.min
+build/tooling/tests/incremental-module-driver: TOOL_NATIVE = runtime/native/sha256.c
+build/tooling/tests/incremental-module-driver: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/incremental-module-driver: runtime/native/sha256.c
+build/tooling/tests/incremental-module-delta.ll: tests/thread-port-support.min tests/cycle-port-support.min
+build/tooling/tests/incremental-module-delta: TOOL_NATIVE = runtime/native/sha256.c
+build/tooling/tests/incremental-module-delta: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/incremental-module-delta: runtime/native/sha256.c
+build/tooling/tests/incremental-module-artifacts.ll: tests/thread-port-support.min tests/cycle-port-support.min tests/evidence-support.min
+build/tooling/tests/incremental-module-artifacts: TOOL_NATIVE = tests/evidence-support-native.c runtime/native/sha256.c
+build/tooling/tests/incremental-module-artifacts: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/incremental-module-artifacts: tests/evidence-support-native.c runtime/native/sha256.c
+build/tooling/tests/incremental-module-regressions.ll: tests/thread-port-support.min
+build/tooling/tests/incremental-module-regressions: TOOL_NATIVE = runtime/native/sha256.c
+build/tooling/tests/incremental-module-regressions: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/incremental-module-regressions: runtime/native/sha256.c
+build/tooling/tests/incremental-module-mutation.ll: tests/thread-port-support.min
+build/tooling/tests/incremental-module-mutation: TOOL_NATIVE = runtime/native/sha256.c
+build/tooling/tests/incremental-module-mutation: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/incremental-module-mutation: runtime/native/sha256.c
 .PHONY: check-incremental-modules
-check-incremental-modules: build/minyarc-errors-request build/minyarc-modules build/module-compiler-stage2.ll build/module-compiler-stage3.ll build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-release.ll build/minyarc-callbacks build/tooling/tests/recursive-data build/tooling/tools/clang-driver build/tooling/tests/compiler-behavior build/tooling/tests/ownership
+check-incremental-modules: build/minyarc-errors-request build/minyarc-modules build/module-compiler-stage2.ll build/module-compiler-stage3.ll build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-release.ll build/minyarc-callbacks build/tooling/tests/recursive-data build/tooling/tools/clang-driver build/tooling/tests/compiler-behavior build/tooling/tests/ownership build/tooling/tests/incremental-modules build/tooling/tests/incremental-module-driver build/tooling/tests/incremental-module-delta build/tooling/tests/incremental-module-artifacts build/tooling/tests/incremental-module-regressions build/tooling/tests/regressions
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile core --ir build/module-compiler-stage3.ll
-	$(LIMITED) python3 tests/incremental-modules.py
-	$(LIMITED) python3 tests/incremental-module-driver.py
-	$(LIMITED) python3 tests/incremental-module-delta.py
-	$(LIMITED) python3 tests/incremental-module-artifacts.py
+	$(LIMITED) ./build/tooling/tests/incremental-modules
+	$(LIMITED) ./build/tooling/tests/incremental-module-driver
+	$(LIMITED) ./build/tooling/tests/incremental-module-delta
+	$(LIMITED) ./build/tooling/tests/incremental-module-artifacts
 	$(LIMITED) python3 tests/incremental-launcher.py
-	$(LIMITED) python3 tests/incremental-module-regressions.py
+	$(LIMITED) ./build/tooling/tests/incremental-module-regressions
 
 check: check-incremental-modules
 
@@ -392,16 +416,16 @@ check-incremental-module-performance: build/minyarc-modules build/minyar-module-
 check: check-incremental-module-performance
 
 .PHONY: check-incremental-modules-sanitize
-check-incremental-modules-sanitize: build/minyarc-modules-sanitize build/minyar-module-build-sanitize build/minyarc-modules build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-sanitize.o build/ownership-runtime.o build/minyarc-callbacks-sanitize build/module-compiler-stage2.ll build/minyar-compiler-runtime.ll build/tooling/tests/recursive-data build/tooling/tests/ownership
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-modules-sanitize MINYAR_MODULE_CALLBACK_COMPILER=./build/minyarc-callbacks-sanitize $(SANITIZER_LIMITED) python3 tests/incremental-modules.py
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_MODULE_DRIVER=./build/minyar-module-build-sanitize $(SANITIZER_LIMITED) python3 tests/incremental-module-driver.py
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-modules-sanitize MINYAR_MODULE_DRIVER=./build/minyar-module-build-sanitize $(SANITIZER_LIMITED) python3 tests/incremental-module-delta.py
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-modules-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/incremental-module-artifacts.py
-	$(SANITIZER_LIMITED) python3 tests/incremental-module-regressions.py --sanitize
+check-incremental-modules-sanitize: build/minyarc-modules-sanitize build/minyar-module-build-sanitize build/minyarc-modules build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-sanitize.o build/ownership-runtime.o build/minyarc-callbacks-sanitize build/module-compiler-stage2.ll build/minyar-compiler-runtime.ll build/tooling/tests/incremental-modules build/tooling/tests/incremental-module-driver build/tooling/tests/incremental-module-delta build/tooling/tests/incremental-module-artifacts build/tooling/tests/incremental-module-regressions build/tooling/tests/regressions build/tooling/tests/ownership build/tooling/tests/recursive-data
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-modules-sanitize MINYAR_MODULE_CALLBACK_COMPILER=./build/minyarc-callbacks-sanitize $(SANITIZER_LIMITED) ./build/tooling/tests/incremental-modules
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_MODULE_DRIVER=./build/minyar-module-build-sanitize $(SANITIZER_LIMITED) ./build/tooling/tests/incremental-module-driver
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-modules-sanitize MINYAR_MODULE_DRIVER=./build/minyar-module-build-sanitize $(SANITIZER_LIMITED) ./build/tooling/tests/incremental-module-delta
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-modules-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/incremental-module-artifacts
+	$(SANITIZER_LIMITED) ./build/tooling/tests/incremental-module-regressions --sanitize
 
 .PHONY: check-incremental-module-mutation
-check-incremental-module-mutation: build/minyarc-modules build/module-compiler.min
-	$(LIMITED) python3 tests/incremental-module-mutation.py
+check-incremental-module-mutation: build/minyarc-modules build/module-compiler.min build/minyarc build/minyar-compiler-runtime.ll build/tooling/tests/incremental-module-mutation
+	$(LIMITED) ./build/tooling/tests/incremental-module-mutation
 
 .PHONY: check-toolchain-stamp check-toolchain-portability check-fuzz-harness check-coverage-harness check-runtime-bytes check-runtime-bytes-sanitize check-compiler-hardening check-incremental-language-hardening check-module-driver-options check-native-graphics
 check-toolchain-stamp:

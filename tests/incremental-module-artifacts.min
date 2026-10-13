@@ -1,0 +1,309 @@
+use "../tools/testing.min" as test
+use "./thread-port-support.min" as support
+use "./cycle-port-support.min" as groups
+use "./evidence-support.min" as evidence
+use "system" as system
+use "files" as files
+
+record Context { trail: evidence.Evidence; directory: Text; compiler: Text; clang: Text; runtime: Text; flags: List<Text>; lto: List<Text> }
+function run(context: Context, command: List<Text>): Text {
+    let request = evidence.command(command, 60.0)
+    request.phase = "module-artifact"
+    let outcome = evidence.run(context.trail, request)
+    evidence.expect(context.trail, outcome.status == 0, support.joined(command, " ") + "\n" + Text(outcome.stderr))
+    evidence.expect(context.trail, outcome.stderr.length == 0, Text(outcome.stderr))
+    return Text(outcome.stdout)
+}
+function fields(source: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(source)
+    let position = 0
+    while position < raw.length {
+        let newline = position
+        while raw[newline] != 10 { newline += 1 }
+        let count = groups.parseInteger(Text(raw.slice(position, newline)))
+        let piece = Text(raw.slice(newline + 1, raw.length)).slice(0, count)
+        result.add(piece)
+        position = newline + 1 + Bytes(piece).length
+    }
+    return result
+}
+function pack(values: List<Text>): Text {
+    let parts: List<Text> = []
+    for value in values { parts.add(Text(value.length) + "\n" + value) }
+    return joinText(parts)
+}
+function runtimePrelude(source: Text): Text {
+    let lines = test.lines(source)
+    let pieces: List<Text> = []
+    let position = 0
+    while position < lines.length {
+        let line = lines[position]
+        if support.starts(line, "declare ") { pieces.add(line + "\n") }
+        else if support.starts(line, "define internal ") && test.contains(line, "@.minyar.") {
+            pieces.add(line + "\n")
+            position += 1
+            while position < lines.length && groups.trimmed(lines[position]) != "}" {
+                test.check(!support.starts(lines[position], "define "), "incomplete compiler helper")
+                pieces.add(lines[position] + "\n")
+                position += 1
+            }
+            test.check(position < lines.length, "unterminated compiler helper")
+            pieces.add(lines[position] + "\n")
+        }
+        position += 1
+    }
+    return joinText(pieces) + "\n"
+}
+function overlay(base: List<Text>, delta: List<Text>, identity: Text): List<Text> {
+    test.check(delta[0] == "minyar-module-delta-v3" && delta[1] == identity, "delta header changed")
+    let paths: List<Text> = []
+    let rows: List<List<Text>> = []
+    let row = 3
+    while row < base.length {
+        paths.add(base[row])
+        rows.add(slice(base, row, row + 10))
+        row += 10
+    }
+    row = 4
+    while row < delta.length {
+        let found = -1
+        for index in 0..paths.length { if paths[index] == delta[row] { found = index } }
+        if found >= 0 { rows[found] = slice(delta, row, row + 10) } else { paths.add(delta[row]); rows.add(slice(delta, row, row + 10)) }
+        row += 10
+    }
+    let table = delta[3]
+    if table == "" { table = base[2] }
+    let result = ["minyar-module-interface-v5", delta[2], table]
+    let order = fields(delta[2])
+    let index = 0
+    while index < order.length {
+        let found = -1
+        for candidate in 0..paths.length { if paths[candidate] == order[index] { found = candidate } }
+        test.check(found >= 0, "overlay lacks module " + order[index])
+        for value in rows[found] { result.add(value) }
+        index += 2
+    }
+    return result
+}
+function slice(values: List<Text>, start: Integer, end: Integer): List<Text> {
+    let result: List<Text> = []
+    for index in start..end { result.add(values[index]) }
+    return result
+}
+function prepare(context: Context, module: Text) {
+    if test.addressEnabled(context.flags) { writeTextFile(module, test.instrument(readTextFile(module))) }
+}
+function command(context: Context, prefix: List<Text>, suffix: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for item in prefix { result.add(item) }
+    for item in context.flags { result.add(item) }
+    for item in suffix { result.add(item) }
+    return result
+}
+function linkLto(context: Context, modules: List<Text>, binary: Text) {
+    let bitcode: List<Text> = []
+    for module in modules {
+        let bc = Text(Bytes(module).slice(0, Bytes(module).length - 3)) + ".bc"
+        run(context, command(context, [context.clang, "-O2"], ["-Wno-override-module", "-flto", "-Xclang", "-disable-llvm-passes", "-c", module, "-o", bc]))
+        bitcode.add(bc)
+    }
+    let suffix: List<Text> = []
+    for item in context.lto { suffix.add(item) }
+    suffix.add("-flto")
+    for item in bitcode { suffix.add(item) }
+    for item in [context.runtime, "-o", binary, "-lm"] { suffix.add(item) }
+    let linked = run(context, command(context, [context.clang, "-O2"], suffix))
+    test.check(!test.contains(linked, "Redundant instrumentation detected"), linked)
+}
+function checkLtoSanitizer(context: Context) {
+    if !test.addressEnabled(context.flags) { return }
+    let reader = context.directory + "/asan-reader.ll"
+    writeTextFile(reader, "define i8 @artifact_probe(ptr %memory, i64 %index) noinline {\nentry:\n  %address = getelementptr i8, ptr %memory, i64 %index\n  %value = load volatile i8, ptr %address\n  ret i8 %value\n}\n")
+    let entry = context.directory + "/asan-entry.ll"
+    writeTextFile(entry, "declare ptr @malloc(i64)\ndeclare void @free(ptr)\ndeclare i8 @artifact_probe(ptr, i64)\ndefine i32 @main() {\nentry:\n  %memory = call ptr @malloc(i64 8)\n  %value = call i8 @artifact_probe(ptr %memory, i64 8)\n  call void @free(ptr %memory)\n  ret i32 0\n}\n")
+    prepare(context, reader)
+    prepare(context, entry)
+    let binary = context.directory + "/asan-probe"
+    linkLto(context, [reader, entry], binary)
+    let result = test.run([binary], system.environment(), "", context.directory + "/asan-probe-run", 60)
+    test.check(result.status != 0 && test.contains(result.errorOutput, "AddressSanitizer: heap-buffer-overflow"), "LTO-generated load was not checked by ASan: " + result.errorOutput)
+}
+function checkArtifacts(context: Context, llvm: Text, saved: List<Text>, expected: Text, label: Text) {
+    let prelude = runtimePrelude(readTextFile(llvm))
+    for helper in ["get.checked", "set.scalar.checked", "length"] { test.check(test.contains(prelude, "@.minyar.list." + helper), "prelude lacks " + helper) }
+    let modules: List<Text> = []
+    let binary = context.directory + "/" + label + "-program"
+    for optimization in ["-O0", "-O2"] {
+        let objects: List<Text> = []
+        modules = []
+        let index = 0
+        let row = 3
+        while row < saved.length {
+            let module = context.directory + "/" + label + "-" + Text(index) + ".ll"
+            let object = context.directory + "/" + label + "-" + Text(index) + ".o"
+            writeTextFile(module, prelude + saved[row + 9] + "\n" + saved[row + 5])
+            modules.add(module)
+            prepare(context, module)
+            run(context, command(context, [context.clang, optimization], ["-Wno-override-module", "-c", module, "-o", object]))
+            objects.add(object)
+            index += 1
+            row += 10
+        }
+        let link = command(context, [context.clang], objects)
+        for item in [context.runtime, "-o", binary, "-lm"] { link.add(item) }
+        run(context, link)
+        test.check(run(context, [binary]) == expected, label + " " + optimization + " fragment program output changed")
+    }
+    linkLto(context, modules, binary)
+    test.check(run(context, [binary]) == expected, label + " LTO program output changed")
+}
+function statsPrefix(path: Text, count: Integer): Text {
+    let words = test.words(readTextFile(path))
+    let parts: List<Text> = []
+    for index in 0..count { parts.add(words[index]) }
+    return support.joined(parts, " ")
+}
+
+let compiler = test.setting("MINYAR_TEST_COMPILER", "build/minyarc-modules")
+let inputs = [compiler, "tests/incremental-module-artifacts.min", "build/minyar-runtime.o"]
+for path in support.treeFiles(["tests/modules"]) {
+    let raw = Bytes(path)
+    if Text(raw.slice(raw.length - 4, raw.length)) == ".min" { inputs.add(path) }
+}
+let trail = evidence.open("module-artifacts", inputs)
+let lto: List<Text> = []
+if support.host() == "Linux" && test.run(["sh", "-c", "command -v ld.lld"], system.environment(), "", trail.path + "/.lld", 10).status == 0 { lto = ["-fuse-ld=lld", "-Wl,--threads=1"] }
+let context = Context { trail: trail; directory: trail.path; compiler: compiler; clang: test.setting("MINYAR_TEST_CLANG", "clang"); runtime: test.setting("MINYAR_TEST_RUNTIME", "build/minyar-runtime.o"); flags: test.words(system.getenv("MINYAR_TEST_LINK_FLAGS")); lto: lto }
+let d = trail.path
+checkLtoSanitizer(context)
+writeTextFile(d + "/empty", "")
+let indexed = d + "/indexed"
+test.check(files.makeDirectory(indexed) == 0, "cannot create indexed fixture")
+writeTextFile(indexed + "/leaf.min", "public record Value { value: Integer }\npublic function make(): Value { return Value { value: 40 } }\n")
+writeTextFile(indexed + "/bridge.min", "use \"./leaf.min\" as leaf\npublic function get(): leaf.Value { return leaf.make() }\n")
+writeTextFile(indexed + "/middle.min", "use \"./bridge.min\" as bridge\npublic function answer(): Integer { return bridge.get().value }\n")
+writeTextFile(indexed + "/main.min", "use \"./leaf.min\" as first\nuse \"./leaf.min\" as second\nuse \"./middle.min\" as middle\nprint(first.make().value + second.make().value + middle.answer())\n")
+let lists = d + "/lists"
+test.check(files.makeDirectory(lists) == 0, "cannot create list fixture")
+let leaf = lists + "/leaf.min"
+let leafSource = "public function floatValue(values: List<Float>): Float {\nvalues[0] += 0.5\nreturn values[0]\n}\npublic function grow(values: List<Integer>): Integer { values.add(9); return values.length }\npublic function textValue(values: List<Text>): Text { values[0] = Text(42); return values[0] }\n"
+writeTextFile(leaf, leafSource)
+writeTextFile(lists + "/bridge.min", "use \"./leaf.min\" as leaf\npublic function report() {\nlet floats = [1.0]\nprint(leaf.floatValue(floats))\nlet integers = [1]\nprint(leaf.grow(integers))\nlet words = [Text(7)]\nprint(leaf.textValue(words))\n}\n")
+writeTextFile(lists + "/main.min", "use \"./bridge.min\" as bridge\nbridge.report()\nlet flags = [false]\nflags[0] = true\nprint(flags[0])\nlet characters = ['a']\ncharacters[0] = '🙂'\nprint(characters[0])\n")
+let entries: List<Text> = []
+let outputs: List<Text> = []
+let caseNames = ["basic", "diamond", "explicit-main", "windows-path"]
+let caseOutputs = ["Hello, Ada\n42\nAda\n", "42\n", "42\n", "42\n"]
+for index in 0..caseNames.length { entries.add("tests/modules/" + caseNames[index] + "/main.min"); outputs.add(caseOutputs[index]) }
+entries.add(indexed + "/main.min"); outputs.add("120\n")
+entries.add(lists + "/main.min"); outputs.add("1.5\n2\n42\ntrue\n🙂\n")
+let aliases = d + "/aliases"
+test.check(files.makeDirectory(aliases) == 0, "cannot create alias fixture")
+writeTextFile(aliases + "/worker.min", "public function reload(write: List<Integer>, read: List<Integer>): Integer {\nwrite[0] = 1\nread[0] = 2\nreturn write[0]\n}\npublic function loop(write: List<Integer>, read: List<Integer>, forward: Boolean): Integer {\nlet index = 0\nlet total = 0\nwhile index < 3 {\nif forward { write[0] = index + 1; read[0] = index + 10 } else { read[0] = index + 1; write[0] = index + 10 }\ntotal = total + write[0]\nindex = index + 1\n}\nreturn total\n}\n")
+let source = ["use \"./worker.min\" as worker"]
+let expected: List<Text> = []
+for shared in [false, true] {
+    for forward in [false, true] {
+        let second = "let second = [0]"
+        if shared { second = "let second = first" }
+        for line in ["let first = [0]", second, "print(worker.reload(first, second))", "print(first[0])", "print(second[0])", "print(worker.loop(first, second, " + Text(forward) + "))", "print(first[0])", "print(second[0])"] { source.add(line) }
+        let reloaded = "1"
+        if shared { reloaded = "2" }
+        expected.add(reloaded); expected.add(reloaded); expected.add("2")
+        if shared || !forward { expected.add("33"); expected.add("12") } else { expected.add("6"); expected.add("3") }
+        if shared || forward { expected.add("12") } else { expected.add("3") }
+    }
+}
+writeTextFile(aliases + "/main.min", support.joined(source, "\n") + "\n")
+entries.add(aliases + "/main.min")
+outputs.add(support.joined(expected, "\n") + "\n")
+for position in 0..entries.length {
+    let entry = entries[position]
+    let expectedOutput = outputs[position]
+    let llvm = d + "/combined.ll"
+    let state = d + "/state"
+    run(context, [compiler, entry, llvm, "--module-state", d + "/empty", state, d + "/stats"])
+    let saved = fields(readTextFile(state))
+    test.check(saved[0] == "minyar-module-interface-v5", "module state version changed")
+    if support.starts(entry, indexed + "/") {
+        let names: List<Text> = []
+        let visibility: List<List<Text>> = []
+        let kinds: List<List<Text>> = []
+        let symbolsPerModule: List<List<Text>> = []
+        let row = 3
+        while row < saved.length {
+            let raw = Bytes(saved[row])
+            let slash = raw.length - 1
+            while raw[slash] != 47 { slash -= 1 }
+            names.add(Text(raw.slice(slash + 1, raw.length)))
+            let context4 = fields(saved[row + 4])
+            let symbols: List<Text> = []
+            let visible: List<Text> = []
+            let kind: List<Text> = []
+            let cursor = 0
+            while cursor < context4.length {
+                symbols.add(context4[cursor]); visible.add(context4[cursor + 1]); kind.add(context4[cursor + 2])
+                let count = groups.parseInteger(context4[cursor + 4])
+                let width = 1
+                if context4[cursor + 2] == "2" { width = 2 }
+                cursor += 5 + count * width
+            }
+            symbolsPerModule.add(symbols); visibility.add(visible); kinds.add(kind)
+            let declarations = test.lines(saved[row + 9])
+            for first in 0..declarations.length { for other in (first + 1)..declarations.length { test.check(declarations[first] != declarations[other], "duplicate declaration " + declarations[first]) } }
+            row += 10
+        }
+        test.check(names.length == 4, "aliases duplicated modules")
+        let recordName = ""
+        for index in 0..names.length {
+            if names[index] == "leaf.min" {
+                for symbol in 0..symbolsPerModule[index].length {
+                    if kinds[index][symbol] == "2" { test.check(recordName == "", "leaf exports several records"); recordName = symbolsPerModule[index][symbol] }
+                }
+            }
+        }
+        test.check(recordName != "", "leaf record is missing")
+        let wanted = ["main.min", "leaf.min", "middle.min", "bridge.min"]
+        let states = ["exported", "private-type", "private-type", "exported"]
+        for index in 0..wanted.length {
+            let found = ""
+            for module in 0..names.length {
+                if names[module] == wanted[index] {
+                    for symbol in 0..symbolsPerModule[module].length { if symbolsPerModule[module][symbol] == recordName { found = visibility[module][symbol] } }
+                }
+            }
+            test.check(found == states[index], wanted[index] + " record visibility " + found)
+        }
+        run(context, [compiler, entry, d + "/warm.ll", "--module-state", state, d + "/next", d + "/stats"])
+        test.check(readTextFile(d + "/warm.ll") == readTextFile(llvm), "warm indexed LLVM differs")
+        test.check(statsPrefix(d + "/stats", 6) == "4 0 0 4 0 0", "indexed warm counters changed")
+    }
+    checkArtifacts(context, llvm, saved, expectedOutput, "cold")
+    if support.starts(entry, lists + "/") {
+        let warm = d + "/warm.ll"
+        run(context, [compiler, entry, warm, "--module-state", state, d + "/next", d + "/stats"])
+        test.check(readTextFile(warm) == readTextFile(llvm), "warm list LLVM differs")
+        test.check(readTextFile(d + "/next") == "", "unchanged warm build wrote new state")
+        test.check(statsPrefix(d + "/stats", 6) == "3 0 0 3 0 0", "list warm counters changed")
+        checkArtifacts(context, warm, saved, expectedOutput, "warm")
+        let delta = d + "/delta"
+        writeTextFile(delta, "")
+        let plan = d + "/plan"
+        let identity = "artifact-base-generation"
+        writeTextFile(plan, pack(["minyar-module-plan-v1", state, delta, identity]))
+        writeTextFile(leaf, test.replace(leafSource, "+= 0.5", "+= 1.5"))
+        let edited = d + "/edited.ll"
+        run(context, [compiler, entry, edited, "--module-state", plan, delta, d + "/stats"])
+        test.check(statsPrefix(d + "/stats", 2) == "2 1", "delta counters changed")
+        let updated = overlay(saved, fields(readTextFile(delta)), identity)
+        let edit = test.replace(expectedOutput, "1.5\n", "2.5\n")
+        checkArtifacts(context, edited, updated, edit, "delta")
+        run(context, [compiler, entry, warm, "--module-state", plan, d + "/next", d + "/stats"])
+        test.check(readTextFile(warm) == readTextFile(edited), "delta replay LLVM differs")
+        test.check(statsPrefix(d + "/stats", 6) == "3 0 0 3 0 0", "delta replay counters changed")
+        checkArtifacts(context, warm, updated, edit, "delta-replay")
+    }
+}
+evidence.close(trail, false)
+print("module artifacts: independent LLVM object compilation, native linking and LTO preserve fixture behavior")

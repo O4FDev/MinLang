@@ -1,0 +1,195 @@
+use "../tools/testing.min" as test
+use "./thread-port-support.min" as support
+use "./cycle-port-support.min" as groups
+use "system" as system
+use "files" as files
+
+record Context { temp: Text; root: Text; driver: Text; entry: Text; cache: Text; output: Text; stats: Text; serial: Integer }
+function run(context: Context, command: List<Text>, success: Boolean): test.Result {
+    context.serial += 1
+    let result = test.run(command, system.environment(), "", context.temp + "/.log-" + Text(context.serial), 60)
+    test.check((result.status == 0) == success, support.joined(command, " ") + "\n" + result.errorOutput)
+    return result
+}
+function names(directory: Text, suffix: Text, prefix: Text): List<Text> {
+    let result: List<Text> = []
+    for name in files.list(directory) {
+        let raw = Bytes(name)
+        let tail = Bytes(suffix)
+        let matched = support.starts(name, prefix)
+        if suffix != "" { matched = matched && raw.length >= tail.length && Text(raw.slice(raw.length - tail.length, raw.length)) == suffix }
+        if matched { result.add(directory + "/" + name) }
+    }
+    result.sort()
+    return result
+}
+function counters(path: Text): List<Integer> {
+    let fields = test.words(readTextFile(path))
+    let result: List<Integer> = []
+    for index in 0..6 { result.add(groups.parseInteger(fields[index])) }
+    return result
+}
+function same(values: List<Integer>, expected: List<Integer>): Boolean {
+    for index in 0..6 { if values[index] != expected[index] { return false } }
+    return true
+}
+function show(values: List<Integer>): Text {
+    let parts: List<Text> = []
+    for value in values { parts.add(Text(value)) }
+    return "(" + support.joined(parts, ", ") + ")"
+}
+function build(context: Context, tool: Text, target: Text, success: Boolean): test.Result {
+    let result = run(context, [context.driver, tool, context.entry, target, context.cache, context.stats], success)
+    test.check(names(context.cache, "", "invocation.").length == 0, "invocation files leaked")
+    return result
+}
+function expect(context: Context, tool: Text, expected: List<Integer>, message: Text) {
+    build(context, tool, context.output, true)
+    let measured = counters(context.stats)
+    test.check(same(measured, expected), message + " " + show(measured) + " != " + show(expected))
+}
+function unpack(text: Text): List<Text> {
+    let fields: List<Text> = []
+    let raw = Bytes(text)
+    let position = 0
+    while position < raw.length {
+        let newline = position
+        while raw[newline] != 10 { newline += 1 }
+        let count = groups.parseInteger(Text(raw.slice(position, newline)))
+        let start = newline + 1
+        let content = Text(raw.slice(start, raw.length))
+        let piece = content.slice(0, count)
+        fields.add(piece)
+        position = start + Bytes(piece).length
+    }
+    return fields
+}
+function pack(fields: List<Text>): Text {
+    let parts: List<Text> = []
+    for field in fields { parts.add(Text(field.length) + "\n" + field) }
+    return joinText(parts)
+}
+function bumpModified(context: Context, path: Text) {
+    let stamp = test.lines(run(context, ["stat", "-c", "%.9Y", path], true).output)[0]
+    let raw = Bytes(stamp)
+    let dot = support.find(stamp, ".", 0)
+    let seconds = groups.parseInteger(Text(raw.slice(0, dot)))
+    let nanos = groups.parseInteger(Text(raw.slice(dot + 1, raw.length))) + 1
+    if nanos == 1000000000 { seconds += 1; nanos = 0 }
+    let fraction = Text(nanos)
+    while fraction.length < 9 { fraction = "0" + fraction }
+    run(context, ["touch", "-m", "-d", "@" + Text(seconds) + "." + fraction, path], true)
+}
+function concurrent(context: Context, tools: List<Text>, prefix: Text): List<Text> {
+    let handles: List<Integer> = []
+    for index in 0..tools.length {
+        let log = context.temp + "/" + prefix + "-" + Text(index) + ".log"
+        handles.add(test.start([context.driver, tools[index], context.entry, context.temp + "/" + prefix + "-" + Text(index) + ".ll", context.cache, context.temp + "/" + prefix + "-" + Text(index) + ".stats"], system.environment(), "", log, 60))
+    }
+    let outputs: List<Text> = []
+    for index in 0..tools.length {
+        let result = test.finish(handles[index], context.temp + "/" + prefix + "-" + Text(index) + ".log")
+        test.check(result.status == 0, prefix + " build failed\n" + result.errorOutput)
+        outputs.add(readTextFile(context.temp + "/" + prefix + "-" + Text(index) + ".ll"))
+    }
+    return outputs
+}
+
+let work = test.scratch()
+let root = test.lines(test.run(["pwd", "-P"], system.environment(), "", work + "/.root", 10).output)[0]
+let resolved = test.run(["realpath", "--", test.setting("MINYAR_MODULE_DRIVER", root + "/build/minyar-module-build")], system.environment(), "", work + "/.driver", 10)
+test.require(resolved, "resolve module driver")
+let context = Context { temp: work; root: root; driver: test.lines(resolved.output)[0]; entry: work + "/main.min"; cache: work + "/cache"; output: work + "/program.ll"; stats: work + "/stats.txt"; serial: 0 }
+let compiler = work + "/compiler"
+run(context, ["cp", "-p", root + "/build/minyarc-modules", compiler], true)
+let library = work + "/library.min"
+writeTextFile(library, "public function answer(): Integer { return 40 }\n")
+let source = "use \"./library.min\" as library\nprint(library.answer() + 2)\n"
+writeTextFile(context.entry, source)
+let cold = [0, 2, 2, 0, 1, 1]
+let warm = [2, 0, 0, 2, 0, 0]
+expect(context, compiler, cold, "first build")
+expect(context, compiler, warm, "second build")
+let cacheFile = names(context.cache, ".cache", "")[0]
+bumpModified(context, compiler)
+expect(context, compiler, warm, "mtime changed compiler identity")
+run(context, ["touch", "-r", library, work + "/library.stamp"], true)
+writeTextFile(library, test.replace(readTextFile(library), "40", "41"))
+run(context, ["touch", "-r", work + "/library.stamp", library], true)
+expect(context, compiler, [1, 1, 1, 1, 1, 0], "same-time library edit")
+run(context, ["clang", "-O0", "-Wno-override-module", context.output, root + "/build/minyar-runtime.o", "-o", work + "/program", "-lm"], true)
+test.check(run(context, [work + "/program"], true).output == "43\n", "edited program output changed")
+let good = readBytesFile(cacheFile)
+let flipped = good.slice(0, good.length)
+flipped[0] = flipped[0] ^ 1
+let late = good.slice(0, good.length)
+late[good.length - 40] = late[good.length - 40] ^ 1
+let corrupt: List<Bytes> = [Bytes(), Bytes("not an artifact"), good.slice(0, 100), good.slice(0, good.length - 1), flipped, late]
+for bad in corrupt {
+    writeBytesFile(cacheFile, bad)
+    expect(context, compiler, cold, "corrupt artifact")
+}
+writeBytesFile(cacheFile, Bytes())
+run(context, ["truncate", "-s", "67108865", cacheFile], true)
+expect(context, compiler, cold, "oversized artifact")
+let checksum = work + "/checksum"
+run(context, ["clang", "-std=c11", "-O2", root + "/tests/module-cache-checksum.c", "-o", checksum, "-lm"], true)
+for payload in ["broken state", "table"] {
+    let envelope = unpack(readTextFile(cacheFile))
+    let content = payload
+    if payload == "table" {
+        let stateFields = unpack(envelope[4])
+        stateFields[2] = "invalid checked type table"
+        content = pack(stateFields)
+    }
+    writeTextFile(work + "/payload", content)
+    envelope[3] = test.lines(run(context, [checksum, work + "/payload"], true).output)[0]
+    envelope[4] = content
+    writeTextFile(cacheFile, pack(envelope))
+    expect(context, compiler, cold, "checksummed malformed metadata")
+}
+let images = context.cache + "/compiler-images"
+writeTextFile(names(images, "", "")[0], "corrupt executable")
+expect(context, compiler, warm, "corrupt compiler image")
+let validImage = ""
+for image in names(images, "", "") { if validImage == "" && readTextFile(image) == readTextFile(compiler) { validImage = image } }
+test.check(validImage != "", "valid compiler image is missing")
+run(context, ["chmod", "600", validImage], true)
+expect(context, compiler, warm, "non-executable compiler image")
+let saved = readTextFile(cacheFile)
+let lastOutput = readTextFile(context.output)
+expect(context, root + "/build/minyarc", warm, "production compiler identity")
+build(context, root + "/build/stage0", context.output, false)
+test.check(readTextFile(cacheFile) == saved && readTextFile(context.output) == lastOutput, "failed stage0 build changed state")
+writeTextFile(context.entry, test.replace(source, "library.answer()", "library.missing()"))
+let failure = build(context, compiler, context.output, false)
+test.check(test.contains(failure.errorOutput, "has no function named"), failure.errorOutput)
+test.check(readTextFile(cacheFile) == saved, "failed build changed cache")
+test.check(readTextFile(context.output) == lastOutput, "failed build replaced a successful output")
+writeTextFile(context.entry, source)
+expect(context, compiler, warm, "restored source")
+writeTextFile(context.entry, source + "\nprint(5)\n")
+build(context, compiler, work + "/absent-directory/out.ll", false)
+test.check(readTextFile(cacheFile) == saved, "publication failure changed cache")
+writeTextFile(context.entry, source)
+for data in concurrent(context, [compiler, compiler, compiler, compiler], "parallel") { test.check(data == lastOutput, "overlapping build output differs") }
+test.check(names(context.cache, "", "invocation.").length == 0, "invocation files leaked")
+expect(context, compiler, warm, "after overlapping builds")
+let alternative = work + "/compiler-O1"
+run(context, ["clang", "-O1", "-Wno-override-module", "-flto", root + "/build/module-compiler-stage2.ll", root + "/build/minyar-compiler-runtime.ll", "-o", alternative, "-lm"], true)
+test.check(readTextFile(alternative) != readTextFile(compiler), "alternative compiler is identical")
+expect(context, alternative, cold, "alternative compiler cold")
+expect(context, alternative, warm, "alternative compiler warm")
+expect(context, compiler, cold, "original compiler after alternative")
+for data in concurrent(context, [alternative, compiler], "mixed") { test.check(data == lastOutput, "mixed compiler output differs") }
+test.check(names(context.cache, "", "invocation.").length == 0, "invocation files leaked")
+let odd = work + "/space λ \"quote\" | suffix"
+test.check(files.makeDirectory(odd) == 0, "cannot create unusual directory")
+writeTextFile(odd + "/main.min", "print(\"héllo λ\")\n")
+run(context, [context.driver, compiler, odd + "/main.min", odd + "/program.ll", odd + "/cache", odd + "/stats"], true)
+run(context, [context.driver, compiler, odd + "/main.min", odd + "/program.ll", odd + "/cache", odd + "/stats"], true)
+test.check(same(counters(odd + "/stats"), [1, 0, 0, 1, 0, 0]), "unusual path was not reused")
+run(context, ["clang", "-O0", "-Wno-override-module", odd + "/program.ll", root + "/build/minyar-runtime.o", "-o", odd + "/program", "-lm"], true)
+test.check(run(context, [odd + "/program"], true).output == "héllo λ\n", "unusual path program output changed")
+test.removeTree(work)
+print("native module driver: identity, same-time source edits, corruption, failure atomicity, overlapping builds and Unicode paths verified")
