@@ -140,6 +140,11 @@ static void bytes_reserve(MinyarBytes *bytes, long long extra) {
     long long needed = bytes->byte_length + extra;
     if (needed <= capacity)
         return;
+    if (capacity < 0) {
+        if (extra == 0)
+            return;
+        minyar_stop("Bytes storage with C-layout views cannot grow.");
+    }
     long long grown = capacity < 16 ? 16 : capacity * 2;
     if (grown < needed)
         grown = needed;
