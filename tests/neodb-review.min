@@ -1,0 +1,55 @@
+use "../tools/testing.min" as test
+use "./release-support.min" as support
+use "system" as system
+
+record Fixture { name: Text; source: Text; cases: List<List<Text>> }
+
+let mode = "native"
+let index = 0
+while index < argumentCount() {
+    if argument(index) == "--mode" && index + 1 < argumentCount() && (argument(index + 1) == "native" || argument(index + 1) == "sanitize") { mode = argument(index + 1); index += 2 }
+    else { test.check(false, "usage: neodb-review [--mode native|sanitize]") }
+}
+let filesCases = [["names"]]
+for value in 0..4 { filesCases.add(["listing", Text(value)]) }
+for item in [["diagnostic"], ["closed-fd"], ["stale"], ["capacity"]] { filesCases.add(item) }
+for value in 1..10 { filesCases.add(["setup", "fd", Text(value)]) }
+for item in [["setup", "mutex", "1"], ["setup", "condition", "1"], ["setup", "condition", "2"], ["setup", "create", "1"], ["sticky"], ["sticky", "rotation"], ["borrowed"],
+        ["saturated"], ["bounds"], ["append-position"], ["boundaries"], ["child-fds"]] { filesCases.add(item) }
+let systemCases = [["aliases"]]
+for value in 1..9 { systemCases.add(["setup", "fd", Text(value)]) }
+for value in 1..4 { systemCases.add(["setup", "action", Text(value)]) }
+for item in [["setup", "mask", "1"], ["setup", "mask", "2"], ["rollback-in-flight"], ["stderr"], ["saturated"], ["child-fds"]] { systemCases.add(item) }
+let fixtures = [Fixture { name: "files-review"; source: "tests/files-review.c"; cases: filesCases }, Fixture { name: "system-review"; source: "tests/system-review.c"; cases: systemCases }]
+let directory = test.scratch()
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let leaks = "detect_leaks=0"
+if support.kernel(directory + "/kernel") == "Linux" { leaks = "detect_leaks=1" }
+let environment = support.environment(["ASAN_OPTIONS=" + leaks + ":halt_on_error=1", "UBSAN_OPTIONS=halt_on_error=1"])
+let configurations = [["-O0"], ["-O2"]]
+if mode == "sanitize" { configurations = [["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"]] }
+let checks = 0
+for fixture in fixtures {
+    for configuration in 0..configurations.length {
+        let flags = configurations[configuration]
+        let executable = directory + "/" + fixture.name + Text(configuration)
+        let command = [clang, "-std=c11", "-D_GNU_SOURCE", "-DMINYAR_SYSTEM_HEAP=1", "-Wall", "-Wextra", "-Werror"]
+        for flag in flags { command.add(flag) }
+        for item in [fixture.source, "runtime/minyar_runtime.c", "-pthread", "-o", executable] { command.add(item) }
+        if support.kernel(directory + "/kernel") != "Darwin" { command.add("-lm") }
+        print(support.shellJoin(command))
+        let built = test.run(command, environment, "", executable + ".build", 60)
+        test.check(built.status == 0, "neodb review build failed\n" + built.errorOutput)
+        for arguments in fixture.cases {
+            let argv = [executable]
+            for argument in arguments { argv.add(argument) }
+            let result = test.run(argv, environment, "", executable + ".run", 10)
+            test.check(result.status == 0, fixture.name + " " + flags[0] + " " + support.shellJoin(arguments) + " exited " + Text(result.status) + "\n" + result.output + result.errorOutput)
+            test.check(result.errorOutput == "", fixture.name + " " + support.shellJoin(arguments) + " wrote diagnostics\n" + result.errorOutput)
+            checks += 1
+            print(fixture.name + " " + flags[0] + " " + support.shellJoin(arguments) + ": exit 0")
+        }
+    }
+}
+test.removeTree(directory)
+print(Text(checks) + " " + mode + " review controls passed")

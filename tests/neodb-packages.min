@@ -1,0 +1,117 @@
+use "../tools/testing.min" as test
+use "./release-support.min" as support
+use "system" as system
+
+record Context { directory: Text; serial: Integer }
+
+function run(context: Context, command: List<Text>, environment: List<Text>, checked: Boolean, output: Text, errorOutput: Text, timeout: Integer) {
+    context.serial += 1
+    print(support.shellJoin(command))
+    let result = test.run(command, environment, "", context.directory + "/step" + Text(context.serial), timeout)
+    let matches = !checked || (result.output == output && result.errorOutput == errorOutput)
+    test.check(result.status == 0 && matches, support.shellJoin(command) + " exited " + Text(result.status) + "\n" + result.output + result.errorOutput)
+    print("exit " + Text(result.status) + ": " + trimmed(result.output))
+}
+function trimmed(text: Text): Text {
+    let raw = Bytes(text)
+    let begin = 0
+    let end = raw.length
+    while begin < end && raw[begin] <= 32 { begin += 1 }
+    while end > begin && raw[end - 1] <= 32 { end -= 1 }
+    return Text(raw.slice(begin, end))
+}
+function value(environment: List<Text>, name: Text, fallback: Text): Text {
+    for entry in environment { if support.starts(entry, name + "=") { return Text(Bytes(entry).slice(Bytes(name).length + 1, Bytes(entry).length)) } }
+    return fallback
+}
+function defined(environment: List<Text>, name: Text): Boolean {
+    for entry in environment { if support.starts(entry, name + "=") { return true } }
+    return false
+}
+
+let suite = "all"
+let mode = "native"
+let nativeOnly = false
+let index = 0
+while index < argumentCount() {
+    if argument(index) == "--suite" && index + 1 < argumentCount() && (argument(index + 1) == "files-system" || argument(index + 1) == "net-additions" || argument(index + 1) == "all") { suite = argument(index + 1); index += 2 }
+    else if argument(index) == "--mode" && index + 1 < argumentCount() && (argument(index + 1) == "native" || argument(index + 1) == "sanitize") { mode = argument(index + 1); index += 2 }
+    else if argument(index) == "--native-only" { nativeOnly = true; index += 1 }
+    else { test.check(false, "usage: neodb-packages [--suite files-system|net-additions|all] [--mode native|sanitize] [--native-only]") }
+}
+let suites = [suite]
+if suite == "all" { suites = ["files-system", "net-additions"] }
+let directory = test.scratch()
+let context = Context { directory: directory; serial: 0 }
+let root = test.lines(support.output(["pwd", "-P"], directory + "/root"))[0]
+let kernel = support.kernel(directory + "/kernel")
+let clang = test.setting("MINYAR_TEST_CLANG", test.setting("MINYAR_CLANG", "clang"))
+let leaks = "detect_leaks=0"
+if kernel == "Linux" { leaks = "detect_leaks=1" }
+let environment = support.environment(["MINYAR_CLANG=" + clang, "ASAN_OPTIONS=" + leaks + ":halt_on_error=1", "UBSAN_OPTIONS=halt_on_error=1"])
+let flags = ["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
+let configurations = [["-O0"], ["-O2"]]
+if mode == "sanitize" { configurations = [flags] }
+for selected in suites {
+    let fixture = "net-resolver-errors"
+    let fixtureSource = "tests/net-resolver-errors.c"
+    if selected == "files-system" { fixture = "files-sync-failures"; fixtureSource = "tests/files-sync-failures.c" }
+    for configuration in 0..configurations.length {
+        let output = directory + "/" + fixture + "-" + Text(configuration)
+        let command = [clang, "-std=c11", "-D_GNU_SOURCE", "-DMINYAR_SYSTEM_HEAP=1", "-Wall", "-Wextra", "-Werror"]
+        for flag in configurations[configuration] { command.add(flag) }
+        command.add(root + "/" + fixtureSource)
+        if selected == "net-additions" { command.add(root + "/runtime/minyar_runtime.c") } else { command.add("-pthread") }
+        command.add("-o")
+        command.add(output)
+        if kernel != "Darwin" { command.add("-lm") }
+        run(context, command, environment, false, "", "", 180)
+        run(context, [output], environment, false, "", "", 10)
+    }
+    if nativeOnly { continue }
+    if mode == "sanitize" {
+        let selectedFlags = support.copy(flags)
+        selectedFlags.add("-Wno-override-module")
+        let joined = support.shellJoin(selectedFlags)
+        environment = support.merge(environment, ["MINYAR_CLANG_FLAGS=" + joined, "MINYAR_NATIVE_FLAGS=" + joined, "MINYAR_RUNTIME_FLAGS=" + joined])
+    }
+    for optimization in ["--debug", "--release"] {
+        let output = directory + "/" + selected
+        let programEnvironment = support.copy(environment)
+        if optimization == "--release" && kernel == "Linux" {
+            let linkFlags = support.shellWords(value(environment, "MINYAR_CLANG_FLAGS", "-O2 -Wno-override-module"))
+            let linker = ""
+            for option in linkFlags {
+                if linker == "" && support.starts(option, "-fuse-ld=") { linker = Text(Bytes(option).slice(9, Bytes(option).length)) }
+                if linker == "" && support.starts(option, "--ld-path=") { linker = Text(Bytes(option).slice(10, Bytes(option).length)) }
+            }
+            let lld = false
+            if linker != "" {
+                let parts = support.split(linker, "/")
+                let name = parts[parts.length - 1]
+                lld = name == "lld" || name == "ld.lld"
+            } else {
+                let resolvedClang = support.which(clang, directory + "/which-clang")
+                if resolvedClang == "" { resolvedClang = clang }
+                let parts = support.split(support.resolve(resolvedClang, directory + "/resolve-clang"), "/")
+                parts[parts.length - 1] = "ld.lld"
+                lld = support.isFile(support.join(parts, "/"), directory + "/sibling-lld") || support.which("ld.lld", directory + "/which-lld") != ""
+            }
+            let threaded = false
+            for option in linkFlags { if test.contains(option, "--threads") { threaded = true } }
+            if lld && !threaded {
+                let joined = support.shellJoin(linkFlags)
+                if !defined(programEnvironment, "MINYAR_NATIVE_FLAGS") { programEnvironment.add("MINYAR_NATIVE_FLAGS=" + joined) }
+                let threadedFlags = support.copy(linkFlags)
+                threadedFlags.add("-Wl,--threads=1")
+                programEnvironment = support.merge(programEnvironment, ["MINYAR_CLANG_FLAGS=" + support.shellJoin(threadedFlags)])
+            }
+        }
+        run(context, [root + "/minyar", optimization, root + "/tests/" + selected + ".min", "-o", output], programEnvironment, false, "", "", 180)
+        let errorOutput = ""
+        if selected == "files-system" { errorOutput = "net-additions: stderr ok\n" }
+        run(context, [output], programEnvironment, true, selected + ": ok\n", errorOutput, 30)
+    }
+}
+test.removeTree(directory)
+print(suite + " " + mode + ": all selected contracts passed")
