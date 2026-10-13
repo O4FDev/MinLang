@@ -233,7 +233,7 @@ def provider_contracts(clang, provider):
             source=re.sub(r'(#define ZSTD_VERSION_RELEASE\s+)([0-9]+)',lambda m:m[1]+str(int(m[2])+1),source)
             header.write_text(source)
             try: codec_provider('zstd',clang)
-            except ValueError as error: assert 'version mismatch' in str(error)
+            except ValueError as error: assert 'version equality not established' in str(error)
             else: raise AssertionError('mismatched header/archive version accepted')
     finally:
         if old is None: os.environ.pop('MINYAR_ZSTD_PREFIX',None)
