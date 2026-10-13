@@ -330,9 +330,6 @@ static Token next_token(Lexer *lexer) {
         take(lexer);
         while (peek(lexer) && peek(lexer) != '"') {
             int c;
-            if (peek(lexer) == '\n')
-                fail_at(token.line, token.column,
-                        "text literals cannot continue onto the next line yet");
             c = take(lexer);
             if (c == '\\')
                 c = escaped_character(lexer, token.line, token.column);
