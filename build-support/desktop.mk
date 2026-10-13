@@ -1,3 +1,8 @@
+NATIVE_HOST_SOURCES = scripts/native-host.min
+NATIVE_SWIFT_SOURCES = $(NATIVE_HOST_SOURCES) scripts/native_project.min scripts/macos-app.min scripts/native-swift.min
+build/tooling/scripts/native-swift.ll build/tooling/scripts/native-frontend.ll: $(NATIVE_SWIFT_SOURCES)
+build/tooling/scripts/macos-app.ll: $(NATIVE_HOST_SOURCES) scripts/macos-app.min
+
 # Native GUI integration needs a logged-in macOS desktop session.
 .PHONY: check-macos
 check-macos: build/minyarc build/minyar-default-runtime.o

@@ -1,0 +1,712 @@
+use "system" as system
+use "json" as json
+use "./native-host.min" as host
+use "./native_project.min" as project
+use "./macos-app.min" as app
+
+public record Token { kind: Text; text: Text }
+public record Lexed { tokens: List<Token>; error: Text }
+public record Lowered { text: Text; error: Text }
+record Scan { end: Integer; error: Text }
+
+function at(raw: Bytes, index: Integer, pattern: Text): Boolean {
+    let expected = Bytes(pattern)
+    if index < 0 || index + expected.length > raw.length { return false }
+    for offset in 0..expected.length { if raw[index + offset] != expected[offset] { return false } }
+    return true
+}
+function indexOf(raw: Bytes, byte: Integer, from: Integer): Integer {
+    let index = from
+    while index < raw.length {
+        if raw[index] == byte { return index }
+        index += 1
+    }
+    return -1
+}
+function spaceLength(raw: Bytes, index: Integer): Integer {
+    let byte = raw[index]
+    if byte == 32 || (byte >= 9 && byte <= 13) || (byte >= 28 && byte <= 31) { return 1 }
+    if byte < 0xC2 { return 0 }
+    let point = -1
+    let length = 0
+    if byte < 0xE0 && index + 1 < raw.length { point = ((byte & 0x1F) << 6) | (raw[index + 1] & 0x3F); length = 2 }
+    else if byte >= 0xE0 && byte < 0xF0 && index + 2 < raw.length { point = ((byte & 0x0F) << 12) | ((raw[index + 1] & 0x3F) << 6) | (raw[index + 2] & 0x3F); length = 3 }
+    if length == 0 { return 0 }
+    for offset in 1..length { if raw[index + offset] & 0xC0 != 0x80 { return 0 } }
+    if point == 0x85 || point == 0xA0 || point == 0x1680 || (point >= 0x2000 && point <= 0x200A) || point == 0x2028 || point == 0x2029 || point == 0x202F || point == 0x205F || point == 0x3000 { return length }
+    return 0
+}
+function letter(byte: Integer): Boolean { return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95 }
+function digit(byte: Integer): Boolean { return byte >= 48 && byte <= 57 }
+function identifierPart(raw: Bytes, index: Integer): Boolean {
+    let byte = raw[index]
+    if letter(byte) || digit(byte) { return true }
+    return byte >= 0x80 && spaceLength(raw, index) == 0
+}
+function hashCount(raw: Bytes, index: Integer): Integer {
+    let end = index
+    while end < raw.length && raw[end] == 35 { end += 1 }
+    return end - index
+}
+function stringStart(raw: Bytes, index: Integer): Boolean {
+    let hashes = hashCount(raw, index)
+    let next = index + hashes
+    if next >= raw.length { return false }
+    return raw[next] == 34 || (hashes > 0 && raw[next] == 47)
+}
+function repeated(text: Text, count: Integer): Text {
+    let result = ""
+    for index in 0..count { result += text }
+    return result
+}
+function quoteAt(raw: Bytes, index: Integer): Text {
+    if at(raw, index, "\"\"\"") { return "\"\"\"" }
+    return Text(raw.slice(index, index + 1))
+}
+function skipComment(raw: Bytes, start: Integer): Integer {
+    let index = start + 2
+    let depth = 1
+    while index < raw.length && depth > 0 {
+        if at(raw, index, "/*") { depth += 1; index += 2 }
+        else if at(raw, index, "*/") { depth -= 1; index += 2 }
+        else { index += 1 }
+    }
+    if depth > 0 { return -1 }
+    return index
+}
+function interpolationEnd(raw: Bytes, start: Integer): Scan {
+    let index = start
+    let depth = 1
+    while index < raw.length {
+        if at(raw, index, "//") {
+            let end = indexOf(raw, 10, index)
+            if end < 0 { index = raw.length } else { index = end }
+        } else if at(raw, index, "/*") {
+            let end = skipComment(raw, index)
+            if end < 0 { index = raw.length } else { index = end }
+        } else if stringStart(raw, index) {
+            let hashes = hashCount(raw, index)
+            index += hashes
+            let quote = quoteAt(raw, index)
+            index += host.size(quote)
+            let close = quote + repeated("#", hashes)
+            let escape = "\\" + repeated("#", hashes)
+            let escapeLength = host.size(escape)
+            while index < raw.length && !at(raw, index, close) {
+                if at(raw, index, escape + "(") {
+                    index += escapeLength + 1
+                    let inner = interpolationEnd(raw, index)
+                    if inner.error != "" { return inner }
+                    if inner.end < 0 { index = raw.length } else { index = inner.end }
+                } else if at(raw, index, escape) { index += escapeLength + 1 }
+                else { index += 1 }
+            }
+            if !at(raw, index, close) { return Scan { end: -1; error: "unterminated nested string" } }
+            index += host.size(close)
+        } else {
+            if raw[index] == 40 { depth += 1 }
+            else if raw[index] == 41 { depth -= 1 }
+            index += 1
+            if depth == 0 { return Scan { end: index; error: "" } }
+        }
+    }
+    return Scan { end: -1; error: "" }
+}
+function regexContext(tokens: List<Token>): Boolean {
+    let index = tokens.length - 1
+    while index >= 0 && tokens[index].kind == "trivia" { index -= 1 }
+    if index < 0 { return false }
+    let text = tokens[index].text
+    return text == "=" || text == "(" || text == "[" || text == "{" || text == "," || text == ":" || text == "return" || text == "case"
+}
+function lexFailure(message: Text): Lexed { return Lexed { tokens: []; error: message } }
+
+public function lex(source: Text): Lexed {
+    let raw = Bytes(source)
+    let tokens: List<Token> = []
+    let index = 0
+    while index < raw.length {
+        let start = index
+        let kind = "symbol"
+        if spaceLength(raw, index) > 0 {
+            while index < raw.length && spaceLength(raw, index) > 0 { index += spaceLength(raw, index) }
+            kind = "trivia"
+        } else if at(raw, index, "//") {
+            let end = indexOf(raw, 10, index)
+            if end < 0 { index = raw.length } else { index = end }
+            kind = "trivia"
+        } else if at(raw, index, "/*") {
+            index = skipComment(raw, index)
+            if index < 0 { return lexFailure("unterminated block comment") }
+            kind = "trivia"
+        } else if stringStart(raw, index) {
+            let hashes = hashCount(raw, index)
+            index += hashes
+            let quote = quoteAt(raw, index)
+            index += host.size(quote)
+            let close = quote + repeated("#", hashes)
+            let escape = "\\" + repeated("#", hashes)
+            let escapeLength = host.size(escape)
+            let pieces = [Text(raw.slice(start, index))]
+            let segment = index
+            let closed = false
+            while index < raw.length {
+                if at(raw, index, close) {
+                    index += host.size(close)
+                    pieces.add(Text(raw.slice(segment, index)))
+                    closed = true
+                    break
+                }
+                if at(raw, index, escape + "(") {
+                    pieces.add(Text(raw.slice(segment, index + escapeLength + 1)))
+                    index += escapeLength + 1
+                    let expressionStart = index
+                    let scan = interpolationEnd(raw, index)
+                    if scan.error != "" { return lexFailure(scan.error) }
+                    if scan.end < 0 { return lexFailure("unterminated string interpolation") }
+                    index = scan.end
+                    let lowered = lowerSource(Text(raw.slice(expressionStart, index - 1)), true)
+                    if lowered.error != "" { return lexFailure(lowered.error) }
+                    pieces.add(lowered.text)
+                    pieces.add(")")
+                    segment = index
+                } else if at(raw, index, escape) { index += escapeLength + 1 }
+                else { index += 1 }
+            }
+            if !closed { return lexFailure("unterminated string literal") }
+            tokens.add(Token { kind: "string"; text: joinText(pieces) })
+            continue
+        } else if raw[index] == 47 && index + 1 < raw.length && spaceLength(raw, index + 1) == 0 && regexContext(tokens) {
+            return lexFailure("use extended regex literals #/.../# in the native frontend")
+        } else if raw[index] == 96 {
+            let close = indexOf(raw, 96, index + 1)
+            if close < 0 { return lexFailure("unterminated escaped identifier") }
+            index = close + 1
+            kind = "escaped"
+        } else if letter(raw[index]) || raw[index] >= 0x80 {
+            index += 1
+            while index < raw.length && identifierPart(raw, index) { index += 1 }
+            kind = "identifier"
+        } else { index += 1 }
+        tokens.add(Token { kind: kind; text: Text(raw.slice(start, index)) })
+    }
+    return Lexed { tokens: tokens; error: "" }
+}
+
+function moduleName(token: Text): Boolean {
+    let raw = Bytes(token)
+    if raw.length < 3 || raw[0] != 34 || raw[raw.length - 1] != 34 { return false }
+    for segment in host.split(Text(raw.slice(1, raw.length - 1)), 46) {
+        let bytes = Bytes(segment)
+        if bytes.length == 0 || !letter(bytes[0]) { return false }
+        for byte in bytes { if !letter(byte) && !digit(byte) { return false } }
+    }
+    return true
+}
+function opener(word: Text): Text {
+    if word == ")" { return "(" }
+    if word == "]" { return "[" }
+    if word == ">" { return "<" }
+    return ""
+}
+function lowerFailure(message: Text): Lowered { return Lowered { text: ""; error: message } }
+public function lower(source: Text): Lowered { return lowerSource(source, false) }
+function lowerSource(source: Text, fragment: Boolean): Lowered {
+    let lexed = lex(source)
+    if lexed.error != "" { return lowerFailure(lexed.error) }
+    let tokens = lexed.tokens
+    let significant: List<Integer> = []
+    for index in 0..tokens.length { if tokens[index].kind != "trivia" { significant.add(index) } }
+    let output: List<Text> = []
+    for token in tokens { output.add(token.text) }
+    let words: List<Text> = []
+    for index in significant { words.add(tokens[index].text) }
+    for p in 0..significant.length {
+        let index = significant[p]
+        let token = tokens[index]
+        if token.kind != "identifier" { continue }
+        if token.text == "use" {
+            if fragment || p + 1 >= words.length { return lowerFailure("expected use \"ModuleName\"") }
+            let module = words[p + 1]
+            if !moduleName(module) { return lowerFailure("native imports require an SDK/module name; local Minyar packages are not supported") }
+            if p + 2 < words.length && words[p + 2] == "as" { return lowerFailure("native imports do not support aliases; use \"ModuleName\" and ModuleName.Type") }
+            output[index] = "import"
+            output[significant[p + 1]] = host.cut(module, 1, host.size(module) - 1)
+        } else if token.text == "record" { output[index] = "struct" }
+        else if token.text == "constant" { output[index] = "let" }
+        else if token.text == "let" { output[index] = "var" }
+        else if token.text == "function" {
+            output[index] = "func"
+            let q = p + 1
+            while q < words.length && words[q] != "(" { q += 1 }
+            if q == words.length { return lowerFailure("function declaration is missing its parameter list") }
+            let stack: List<Text> = []
+            let parameterStart = q + 1
+            q += 1
+            while q < words.length {
+                let word = words[q]
+                if stack.length == 0 && (word == "," || word == ")") {
+                    if q > parameterStart + 1 && words[parameterStart + 1] == ":" {
+                        let position = significant[parameterStart]
+                        output[position] = "_ " + output[position]
+                    }
+                    parameterStart = q + 1
+                    if word == ")" { break }
+                } else if word == "(" || word == "[" || word == "<" { stack.add(word) }
+                else if stack.length > 0 && opener(word) == stack[stack.length - 1] { stack.truncate(stack.length - 1) }
+                q += 1
+            }
+            q += 1
+            while q < words.length && (words[q] == "async" || words[q] == "throws" || words[q] == "rethrows") { q += 1 }
+            if q < words.length && words[q] == ":" { output[significant[q]] = "->" }
+        }
+    }
+    return Lowered { text: joinText(output); error: "" }
+}
+
+public function installLibrary(source: Text, output: Text): Text { return installLibraryWith(source, output, []) }
+public function installLibraryWith(source: Text, output: Text, faults: List<host.RenameFault>): Text {
+    let parent = host.parent(output)
+    let made = host.makeDirectories(parent)
+    if made != "" { return made }
+    let lock = host.withName(output, host.basename(output) + ".minyar-lock")
+    let locked = host.createExclusive(lock)
+    if locked == -17 { return "[Errno 17] File exists: '" + lock + "'" }
+    if locked != 0 { return host.errorText(locked) + ": '" + lock + "'" }
+    let preserve: List<Boolean> = [false]
+    let temporary: List<Text> = [""]
+    let error = replaceLibrary(source, output, faults, temporary, preserve)
+    if temporary[0] != "" && !preserve[0] { host.removeTree(temporary[0]) }
+    host.removeFile(lock)
+    return error
+}
+function replaceLibrary(source: Text, output: Text, faults: List<host.RenameFault>, temporary: List<Text>, preserve: List<Boolean>): Text {
+    let marker = ".minyar-native-library"
+    if host.isSymlink(output) || (host.exists(output) && (!host.isDirectory(output) || !host.isFile(host.child(output, marker)))) {
+        return "refusing to replace a directory not generated as a Minyar native library: " + output
+    }
+    let directory = host.temporaryDirectory(host.parent(output), ".minyar-library-")
+    if directory.status != 0 { return directory.output }
+    temporary[0] = directory.output
+    let stage = host.child(directory.output, "next")
+    let copied = host.copyTree(source, stage)
+    if copied != "" { return copied }
+    let written = host.writeFile(host.child(stage, marker), "Minyar native library v1\n")
+    if written != "" { return written }
+    let backup = host.child(directory.output, "previous")
+    if host.exists(output) {
+        let moved = host.rename(output, backup, faults)
+        if moved != "" { return moved }
+    }
+    let installed = host.rename(stage, output, faults)
+    if installed != "" {
+        if host.exists(backup) {
+            let restored = host.rename(backup, output, faults)
+            if restored != "" {
+                preserve[0] = true
+                return "library installation and rollback failed; previous library preserved at " + backup
+            }
+        }
+        return installed
+    }
+    return ""
+}
+
+record Options {
+    sources: List<Text>; output: Text; release: Boolean; app: Boolean; library: Boolean
+    bundleId: Text; moduleName: Text; emitSwift: Text; emitSil: Text; emitIr: Text; swiftFlags: List<Text>
+    targetPlatform: Text; pkgConfig: List<Text>; compiler: Text; parseAsLibrary: Boolean
+    help: Boolean; error: Text
+}
+record Context { direct: Boolean; program: Text; system: Text; root: Text; label: Text }
+
+function usageLine(context: Context): Text {
+    if context.direct {
+        return "usage: " + context.program + " [-h] [-o OUTPUT] [--release] [--app] [--library] [--bundle-id BUNDLE_ID] [--module-name MODULE_NAME] [--emit-sil EMIT_SIL] [--emit-ir EMIT_IR] [--swift-flag SWIFT_FLAG] [--target-platform {mac,ios,windows,linux,android,web}] [--pkg-config PACKAGE] [--compiler COMPILER] [--parse-as-library] sources [sources ...]\n"
+    }
+    return "usage: " + context.program + " [-h] [-o OUTPUT] [--release] [--app] [--library] [--bundle-id BUNDLE_ID] [--module-name MODULE_NAME] [--emit-swift EMIT_SWIFT] [--emit-sil EMIT_SIL] [--emit-ir EMIT_IR] [--swift-flag SWIFT_FLAG] sources [sources ...]\n"
+}
+function helpText(context: Context): Text {
+    let lines = [usageLine(context), "\n"]
+    if context.direct { lines.add("Experimental direct Minyar compiler frontend; original source files are compiled without Swift source lowering.\n") }
+    else { lines.add("Launcher for the experimental native frontend and older Swift source prototype. The swift backend lowers source for Xcode on macOS; the native backend passes original files directly to the pinned compiler on macOS or Linux.\n") }
+    lines.add("\npositional arguments:\n  sources\n\noptions:\n  -h, --help            show this help message and exit\n  -o, --output OUTPUT\n  --release\n  --app\n  --library             emit a native shared library, module and resilient interface into the output directory\n  --bundle-id BUNDLE_ID\n  --module-name MODULE_NAME\n")
+    if !context.direct { lines.add("  --emit-swift EMIT_SWIFT\n                        save lowered source files to a directory\n") }
+    lines.add("  --emit-sil EMIT_SIL   save optimized SIL for inspection (not reparsed)\n  --emit-ir EMIT_IR     save LLVM IR for inspection\n  --swift-flag SWIFT_FLAG\n                        one additional compiler argument; use --swift-flag=-FLAG\n")
+    if context.direct {
+        lines.add("  --target-platform {mac,ios,windows,linux,android,web}\n                        select platform-specific files; native macOS and Linux hosts are supported\n  --pkg-config PACKAGE  import compile and link flags for a Linux system library\n  --compiler COMPILER\n  --parse-as-library    use for an @main executable; implied by --app and --library\n")
+    }
+    return joinText(lines)
+}
+function optionError(options: Options, message: Text): Options {
+    options.error = message
+    return options
+}
+function parse(context: Context): Options {
+    let platform = "mac"
+    if context.system == "linux" { platform = "linux" }
+    let compiler = ""
+    if context.direct {
+        compiler = system.getenv("MINYAR_NATIVE_SWIFTC")
+        if compiler == "" && system.lastError() != 0 {
+            let hostKind = "macosx-"
+            if context.system == "linux" { hostKind = "linux-" }
+            compiler = context.root + "/build/native-toolchain/build/Ninja-ReleaseAssert/swift-" + hostKind + host.machine() + "/bin/swiftc"
+        }
+    }
+    let options = Options { sources: []; output: ""; release: false; app: false; library: false
+        bundleId: ""; moduleName: "MinyarApp"; emitSwift: ""; emitSil: ""; emitIr: ""; swiftFlags: []
+        targetPlatform: platform; pkgConfig: []; compiler: compiler; parseAsLibrary: false; help: false; error: "" }
+    let flags = ["--release", "--app", "--library"]
+    let valued = ["-o", "--output", "--bundle-id", "--module-name", "--emit-swift", "--emit-sil", "--emit-ir", "--swift-flag"]
+    if context.direct {
+        flags.add("--parse-as-library")
+        for name in ["--target-platform", "--pkg-config", "--compiler"] { valued.add(name) }
+    }
+    let unknown: List<Text> = []
+    let positional = false
+    let index = 0
+    while index < argumentCount() {
+        let item = argument(index)
+        index += 1
+        if positional || item == "-" || !host.starts(item, "-") {
+            options.sources.add(item)
+            continue
+        }
+        if item == "--" { positional = true; continue }
+        if item == "-h" || item == "--help" { options.help = true; return options }
+        let option = item
+        let value = ""
+        let inline = false
+        let equals = host.find(item, "=", 0)
+        if equals > 0 {
+            option = host.cut(item, 0, equals)
+            value = host.cut(item, equals + 1, host.size(item))
+            inline = true
+        } else if host.starts(item, "-o") && item != "-o" && !host.starts(item, "--") {
+            option = "-o"
+            value = host.cut(item, 2, host.size(item))
+            inline = true
+        }
+        if host.has(flags, option) {
+            if inline { return optionError(options, "argument " + option + ": ignored explicit argument '" + value + "'") }
+            if option == "--release" { options.release = true }
+            if option == "--app" { options.app = true }
+            if option == "--library" { options.library = true }
+            if option == "--parse-as-library" { options.parseAsLibrary = true }
+            continue
+        }
+        if !host.has(valued, option) { unknown.add(item); continue }
+        if !inline {
+            if index >= argumentCount() || (host.starts(argument(index), "-") && argument(index) != "-") {
+                let shown = option
+                if option == "-o" || option == "--output" { shown = "-o/--output" }
+                return optionError(options, "argument " + shown + ": expected one argument")
+            }
+            value = argument(index)
+            index += 1
+        }
+        if option == "-o" || option == "--output" { options.output = value }
+        else if option == "--bundle-id" { options.bundleId = value }
+        else if option == "--module-name" { options.moduleName = value }
+        else if option == "--emit-swift" { options.emitSwift = value }
+        else if option == "--emit-sil" { options.emitSil = value }
+        else if option == "--emit-ir" { options.emitIr = value }
+        else if option == "--swift-flag" { options.swiftFlags.add(value) }
+        else if option == "--pkg-config" { options.pkgConfig.add(value) }
+        else if option == "--compiler" { options.compiler = value }
+        else if option == "--target-platform" {
+            if !project.isPlatform(value) { return optionError(options, "argument --target-platform: invalid choice: '" + value + "' (choose from 'mac', 'ios', 'windows', 'linux', 'android', 'web')") }
+            options.targetPlatform = value
+        }
+    }
+    if options.sources.length == 0 { return optionError(options, "the following arguments are required: sources") }
+    if unknown.length > 0 {
+        let joined = ""
+        for position in 0..unknown.length {
+            if position > 0 { joined += " " }
+            joined += unknown[position]
+        }
+        return optionError(options, "unrecognized arguments: " + joined)
+    }
+    return options
+}
+function identifier(name: Text): Boolean {
+    let raw = Bytes(name)
+    if raw.length == 0 || !letter(raw[0]) { return false }
+    for byte in raw { if !letter(byte) && !digit(byte) { return false } }
+    return true
+}
+function packageName(name: Text): Boolean {
+    let raw = Bytes(name)
+    if raw.length == 0 || !(letter(raw[0]) || digit(raw[0])) || raw[0] == 95 { return false }
+    for byte in raw {
+        if !(letter(byte) || digit(byte) || byte == 46 || byte == 43 || byte == 45) { return false }
+    }
+    return true
+}
+
+function invoke(command: List<Text>): Text {
+    let status = host.run(command)
+    if status != 0 { return host.commandFailure(command, status) }
+    return ""
+}
+function captureOutput(command: List<Text>, values: List<Text>): Text {
+    let result = host.capture(command)
+    if result.status != 0 { return host.commandFailure(command, result.status) }
+    values.add(result.output)
+    return ""
+}
+
+function build(context: Context, options: Options, temporary: Text): Text {
+    let direct = context.direct
+    let darwin = context.system == "darwin"
+    let sourcePaths: List<Text> = []
+    let projectRoot = ""
+    if direct {
+        let selection = project.resolveSources(options.sources, options.targetPlatform)
+        if selection.error != "" { return selection.error }
+        sourcePaths = selection.sources
+        projectRoot = selection.project
+        if projectRoot != "" {
+            if options.library { return "an app.min project cannot be built with --library; pass library source files explicitly" }
+            options.app = true
+        }
+    } else {
+        for source in options.sources {
+            let resolved = host.resolve(source, true)
+            if resolved.status != 0 { return resolved.output }
+            sourcePaths.add(resolved.output)
+        }
+    }
+    if options.bundleId != "" && !options.app { return "--bundle-id requires --app or an app.min project" }
+    if options.bundleId != "" && !darwin { return "--bundle-id is macOS bundle metadata; set the Linux application ID in the app entry point" }
+    for first in 0..sourcePaths.length {
+        for second in (first + 1)..sourcePaths.length {
+            if sourcePaths[first] == sourcePaths[second] { return "duplicate source file" }
+        }
+    }
+    let target = options.output
+    if target == "" {
+        if projectRoot != "" { target = host.basename(projectRoot) } else { target = host.stem(host.basename(sourcePaths[0])) }
+    }
+    let outputPath = host.absolute(target)
+    let macApp = options.app && darwin
+    if macApp && host.suffix(host.basename(outputPath)) != ".app" { outputPath = outputPath + ".app" }
+    let artifacts: List<Text> = []
+    if options.emitSil != "" { artifacts.add(host.absolute(options.emitSil)) }
+    if options.emitIr != "" { artifacts.add(host.absolute(options.emitIr)) }
+    let checked = [outputPath]
+    for artifact in artifacts {
+        if host.has(checked, artifact) { return "output and inspection artifacts must have distinct paths" }
+        checked.add(artifact)
+    }
+    for path in checked {
+        if host.has(sourcePaths, host.resolved(path)) || host.isSymlink(path) { return "refusing to overwrite source or symbolic link: " + path }
+    }
+    if options.library {
+        let root = host.resolved(outputPath)
+        let inside: List<Text> = []
+        for path in sourcePaths { inside.add(path) }
+        for path in artifacts { inside.add(path) }
+        if options.emitSwift != "" { inside.add(options.emitSwift) }
+        for path in inside {
+            let location = host.resolved(path)
+            if location == root || host.starts(location, root + "/") || root == "/" {
+                return "library output must not contain an input or inspection path: " + path
+            }
+        }
+    }
+    let inputs: List<Text> = []
+    let hasMain = false
+    if !direct {
+        for n in 0..sourcePaths.length {
+            let source = sourcePaths[n]
+            let lowered = lower(readTextFile(source))
+            if lowered.error != "" { return lowered.error }
+            let relexed = lex(lowered.text)
+            if relexed.error != "" { return relexed.error }
+            let previous = ""
+            for token in relexed.tokens {
+                if token.kind == "trivia" { continue }
+                if previous == "@" && token.text == "main" { hasMain = true }
+                previous = token.text
+            }
+            let name = "main.swift"
+            if n > 0 { name = "input" + Text(n) + ".swift" }
+            let path = host.child(temporary, name)
+            let written = host.writeFile(path, "#sourceLocation(file: " + host.jsonString(source) + ", line: 1)\n" + lowered.text)
+            if written != "" { return written }
+            inputs.add(path)
+        }
+    }
+    let common = ["xcrun", "swiftc"]
+    if direct {
+        common = [host.absolute(options.compiler)]
+        if darwin {
+            let captured: List<Text> = []
+            let failed = captureOutput(["xcrun", "swiftc", "-print-target-info"], captured)
+            if failed != "" { return failed }
+            failed = captureOutput(["xcrun", "--sdk", "macosx", "--show-sdk-path"], captured)
+            if failed != "" { return failed }
+            let info = json.parse(captured[0])
+            if info.kind != json.OBJECT { return "cannot read the Swift target information" }
+            let resources = json.string(json.member(info, "paths"), "runtimeResourcePath")
+            let triple = json.string(json.member(info, "target"), "triple")
+            if resources == "" || triple == "" { return "cannot read the Swift target information" }
+            for item in ["-resource-dir", resources, "-sdk", host.strip(captured[1]), "-target", triple] { common.add(item) }
+        }
+        inputs = sourcePaths
+    }
+    let optimization = "-Onone"
+    if options.release { optimization = "-O" }
+    for item in ["-swift-version", "6", "-module-name", options.moduleName, "-whole-module-optimization", optimization] { common.add(item) }
+    if direct && context.system == "linux" {
+        common.add("-I")
+        common.add(context.root + "/library/native/linux")
+    }
+    if hasMain && options.library { return "a native library cannot contain an @main entry point" }
+    if hasMain || options.library || (direct && (options.app || options.parseAsLibrary)) { common.add("-parse-as-library") }
+    if options.library { common.add("-enable-library-evolution") }
+    for flag in options.swiftFlags { common.add(flag) }
+    if direct && options.pkgConfig.length > 0 {
+        for name in options.pkgConfig {
+            if !packageName(name) { return "invalid pkg-config package name: " + name }
+        }
+        let captured: List<Text> = []
+        let query = ["pkg-config", "--cflags"]
+        for name in options.pkgConfig { query.add(name) }
+        let failed = captureOutput(query, captured)
+        if failed != "" { return failed }
+        for flag in host.shellWords(captured[0]) {
+            common.add("-Xcc")
+            common.add(flag)
+        }
+        query = ["pkg-config", "--libs"]
+        for name in options.pkgConfig { query.add(name) }
+        failed = captureOutput(query, captured)
+        if failed != "" { return failed }
+        for flag in host.shellWords(captured[1]) {
+            if host.starts(flag, "-l") || host.starts(flag, "-L") { common.add(flag) }
+            else if host.starts(flag, "-Wl,") {
+                for item in host.split(host.cut(flag, 4, host.size(flag)), 44) {
+                    common.add("-Xlinker")
+                    common.add(item)
+                }
+            } else if flag == "-pthread" { common.add("-lpthread") }
+            else { return "unsupported pkg-config linker flag: " + flag }
+        }
+    }
+    let binary = host.child(temporary, "application")
+    let products = host.child(temporary, "library")
+    if options.library {
+        let made = host.makeDirectories(products)
+        if made != "" { return made }
+        let name = options.moduleName
+        let extension = "so"
+        if darwin { extension = "dylib" }
+        binary = host.child(products, "lib" + name + "." + extension)
+        let command: List<Text> = []
+        for item in common { command.add(item) }
+        for item in ["-emit-library", "-emit-module", "-emit-module-path", host.child(products, name + ".swiftmodule"), "-emit-module-interface-path", host.child(products, name + ".swiftinterface")] { command.add(item) }
+        if darwin {
+            for item in ["-Xlinker", "-install_name", "-Xlinker", "@rpath/lib" + name + ".dylib"] { command.add(item) }
+        } else {
+            for item in ["-Xlinker", "-soname", "-Xlinker", "lib" + name + ".so"] { command.add(item) }
+        }
+        for item in inputs { command.add(item) }
+        command.add("-o")
+        command.add(binary)
+        let failed = invoke(command)
+        if failed != "" { return failed }
+    } else {
+        let command: List<Text> = []
+        for item in common { command.add(item) }
+        for item in inputs { command.add(item) }
+        command.add("-o")
+        command.add(binary)
+        let failed = invoke(command)
+        if failed != "" { return failed }
+    }
+    let inspections: List<Text> = []
+    let paths: List<Text> = []
+    if options.emitSil != "" { inspections.add("-emit-sil"); paths.add(options.emitSil) }
+    if options.emitIr != "" { inspections.add("-emit-ir"); paths.add(options.emitIr) }
+    for position in 0..inspections.length {
+        let made = host.makeDirectories(host.parent(paths[position]))
+        if made != "" { return made }
+        let command: List<Text> = []
+        for item in common { command.add(item) }
+        command.add(inspections[position])
+        for item in inputs { command.add(item) }
+        command.add("-o")
+        command.add(paths[position])
+        let failed = invoke(command)
+        if failed != "" { return failed }
+    }
+    if options.emitSwift != "" {
+        let made = host.makeDirectories(options.emitSwift)
+        if made != "" { return made }
+        for input in inputs {
+            let destination = host.child(options.emitSwift, host.basename(input))
+            if host.isSymlink(destination) || host.has(sourcePaths, host.resolved(destination)) { return "refusing to overwrite source or symbolic link: " + destination }
+            let copied = host.copyFile(input, destination)
+            if copied != "" { return copied }
+        }
+    }
+    let made = host.makeDirectories(host.parent(outputPath))
+    if made != "" { return made }
+    if options.library { return installLibrary(products, outputPath) }
+    if macApp {
+        let bundle = options.bundleId
+        if bundle == "" { bundle = "org.minyar.application" }
+        return app.package(binary, outputPath, bundle, "", "")
+    }
+    let staged = host.temporaryFile(host.parent(outputPath), ".minyar-native-")
+    if staged.status != 0 { return staged.output }
+    let error = host.copyFile(binary, staged.output)
+    if error == "" { error = host.makeExecutable(staged.output) }
+    if error == "" { error = host.rename(staged.output, outputPath, []) }
+    if host.exists(staged.output) || host.isSymlink(staged.output) { host.removeFile(staged.output) }
+    return error
+}
+
+function usageError(context: Context, message: Text): Integer {
+    host.standardError(usageLine(context) + context.program + ": error: " + message + "\n")
+    return 2
+}
+public function drive(direct: Boolean): Integer {
+    let program = "native-swift"
+    let label = "native Swift backend"
+    if direct { program = "native-frontend"; label = "native Minyar frontend" }
+    let context = Context { direct: direct; program: program; system: host.systemName(); root: host.projectRoot(); label: label }
+    let options = parse(context)
+    if options.help { print(helpText(context)); return 0 }
+    if options.error != "" { return usageError(context, options.error) }
+    if context.system != "darwin" && !(direct && context.system == "linux") { return usageError(context, "the experimental SwiftUI backend currently requires macOS and Xcode") }
+    if !identifier(options.moduleName) { return usageError(context, "--module-name must be an identifier") }
+    if options.library && options.app { return usageError(context, "--library and --app are mutually exclusive") }
+    if direct && options.emitSwift != "" { return usageError(context, "the direct frontend does not generate Swift source; use --emit-sil or --emit-ir") }
+    if direct && !host.isFile(options.compiler) { return usageError(context, "native compiler is not built; run make build/tooling/scripts/native-toolchain && build/tooling/scripts/native-toolchain native, or select --compiler PATH") }
+    if direct {
+        let hostPlatform = "mac"
+        if context.system == "linux" { hostPlatform = "linux" }
+        if options.targetPlatform != hostPlatform {
+            return usageError(context, "target platform " + options.targetPlatform + " requires its native build host; this host builds " + hostPlatform + ". Cross-compilation SDKs are not configured yet")
+        }
+        if options.pkgConfig.length > 0 && hostPlatform != "linux" { return usageError(context, "--pkg-config is currently supported only on Linux") }
+    }
+    let temporary = host.temporaryDirectory(host.temporaryRoot(), "minyar-native-")
+    if temporary.status != 0 {
+        host.standardError(label + ": " + temporary.output + "\n")
+        return 1
+    }
+    let error = build(context, options, temporary.output)
+    host.removeTree(temporary.output)
+    if error != "" {
+        host.standardError(label + ": " + error + "\n")
+        return 1
+    }
+    return 0
+}
+function main(): Integer { return drive(false) }

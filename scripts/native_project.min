@@ -1,0 +1,153 @@
+use "files" as files
+use "./native-host.min" as host
+
+public record Identity { logical: Text; platform: Text }
+public record Selection { sources: List<Text>; project: Text; error: Text }
+
+public function platforms(): List<Text> { return ["mac", "ios", "windows", "linux", "android", "web"] }
+public function isPlatform(name: Text): Boolean { return host.has(platforms(), name) }
+function ignoredDirectory(name: Text): Boolean {
+    return name == "build" || name == "dist" || name == "target" || name == "node_modules" || name == "__pycache__"
+}
+function failed(message: Text): Selection { return Selection { sources: []; project: ""; error: message } }
+
+public function sourceIdentity(path: Text): Identity {
+    let name = host.basename(path)
+    let stem = host.stem(name)
+    let dot = host.lastByte(stem, 46)
+    if dot >= 0 {
+        let platform = host.cut(stem, dot + 1, host.size(stem))
+        if isPlatform(platform) {
+            return Identity { logical: host.withName(path, host.cut(stem, 0, dot) + host.suffix(name)); platform: platform }
+        }
+    }
+    return Identity { logical: path; platform: "" }
+}
+
+public function selectVariants(paths: List<Text>, platform: Text): Selection {
+    if !isPlatform(platform) { return failed("unknown target platform: " + platform) }
+    let seen: List<Text> = []
+    let logicals: List<Text> = []
+    let variants: List<List<Text>> = []
+    let members: List<List<Text>> = []
+    for path in paths {
+        if host.has(seen, path) { return failed("duplicate source file: " + path) }
+        seen.add(path)
+        let identity = sourceIdentity(path)
+        let group = -1
+        for index in 0..logicals.length { if logicals[index] == identity.logical { group = index } }
+        if group < 0 {
+            logicals.add(identity.logical)
+            variants.add([])
+            members.add([])
+            group = logicals.length - 1
+        }
+        variants[group].add(identity.platform)
+        members[group].add(path)
+    }
+    let order: List<Integer> = []
+    for group in 0..logicals.length {
+        order.add(group)
+        let index = order.length - 1
+        while index > 0 && host.comparePaths(logicals[order[index - 1]], logicals[group]) > 0 {
+            order[index] = order[index - 1]
+            index -= 1
+        }
+        order[index] = group
+    }
+    let selected: List<Text> = []
+    for group in order {
+        let chosen = ""
+        for index in 0..variants[group].length { if variants[group][index] == platform { chosen = members[group][index] } }
+        if chosen == "" {
+            for index in 0..variants[group].length { if variants[group][index] == "" { chosen = members[group][index] } }
+        }
+        if chosen != "" { selected.add(chosen) }
+    }
+    return Selection { sources: selected; project: ""; error: "" }
+}
+
+record Entries { directories: List<Text>; regular: List<Text>; links: List<Text>; error: Text }
+function entries(directory: Text): Entries {
+    let names = files.list(directory)
+    let result = Entries { directories: []; regular: []; links: []; error: "" }
+    if files.lastError() != 0 || names.length == 0 { return result }
+    let command = ["/bin/sh", "-c", "cd -- \"$1\" || exit 1; shift; for name do kind=f; [ -d \"$name\" ] && kind=d; link=-; [ -L \"$name\" ] && link=l; printf '%s%s\\n' \"$kind\" \"$link\"; done", "sh", directory]
+    for name in names { command.add(name) }
+    let classified = host.capture(command)
+    let kinds = host.lines(classified.output)
+    if classified.status != 0 || kinds.length != names.length { return result }
+    for index in 0..names.length {
+        if host.starts(kinds[index], "d") { result.directories.add(names[index]) } else { result.regular.add(names[index]) }
+        if host.ends(kinds[index], "l") { result.links.add(names[index]) }
+    }
+    result.directories.sort()
+    result.regular.sort()
+    return result
+}
+function walk(root: Text, directory: Text, sources: List<Text>): Text {
+    let found = entries(directory)
+    if found.error != "" { return found.error }
+    if directory != root {
+        for name in found.regular {
+            if host.basename(sourceIdentity(name).logical) == "app.min" { return "" }
+        }
+    }
+    for name in found.regular {
+        let suffix = host.suffix(name)
+        if host.starts(name, ".") || (suffix != ".min" && suffix != ".swift") { continue }
+        let path = host.child(directory, name)
+        if host.has(found.links, name) { return "project source must not be a symbolic link: " + path }
+        sources.add(path)
+    }
+    for name in found.directories {
+        if host.starts(name, ".") || ignoredDirectory(name) || host.ends(name, ".app") || host.ends(name, ".framework") || host.ends(name, ".bundle") || host.has(found.links, name) { continue }
+        let error = walk(root, host.child(directory, name), sources)
+        if error != "" { return error }
+    }
+    return ""
+}
+public function discover(root: Text): Selection {
+    let sources: List<Text> = []
+    let error = walk(root, root, sources)
+    if error != "" { return failed(error) }
+    return Selection { sources: sources; project: root; error: "" }
+}
+
+public function resolveSources(inputs: List<Text>, platform: Text): Selection {
+    let paths: List<Text> = []
+    for input in inputs {
+        let resolved = host.resolve(input, true)
+        if resolved.status != 0 { return failed(resolved.output) }
+        paths.add(resolved.output)
+    }
+    let selected: List<Text> = []
+    let project = ""
+    if paths.length == 1 && (host.isDirectory(paths[0]) || host.basename(paths[0]) == "app.min") {
+        project = paths[0]
+        if !host.isDirectory(project) { project = host.parent(project) }
+        let discovered = discover(project)
+        if discovered.error != "" { return discovered }
+        let chosen = selectVariants(discovered.sources, platform)
+        if chosen.error != "" { return chosen }
+        let entry = host.child(project, "app.min")
+        let entryPaths: List<Text> = []
+        for path in chosen.sources { if sourceIdentity(path).logical == entry { entryPaths.add(path) } }
+        if entryPaths.length != 1 {
+            return failed("project requires app.min or app." + platform + ".min at its root: " + project + "; select an individual app directory or its app.min")
+        }
+        selected.add(entryPaths[0])
+        for path in chosen.sources { if path != entryPaths[0] { selected.add(path) } }
+    } else {
+        for path in paths { if !host.isFile(path) { return failed("pass a single app directory, or a list of source files") } }
+        for path in paths {
+            let suffix = host.suffix(host.basename(path))
+            if suffix != ".min" && suffix != ".swift" { return failed("native sources must have a .min or .swift extension") }
+        }
+        let chosen = selectVariants(paths, platform)
+        if chosen.error != "" { return chosen }
+        for path in paths { if host.has(chosen.sources, path) { selected.add(path) } }
+    }
+    if selected.length == 0 { return failed("no sources for target platform " + platform) }
+    return Selection { sources: selected; project: project; error: "" }
+}
