@@ -1,0 +1,174 @@
+use "../tools/testing.min" as test
+use "files" as files
+function selected(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "RecursiveData." + name { return true } }
+    return false
+}
+function acceptsGraph(compiler: test.Compiler, source: Text) {
+    test.require(test.compile(compiler, source), "compile accepted managed graph")
+    let llvm = compiler.directory + "/case" + Text(compiler.serial) + ".ll"
+    test.check(files.pathSize(llvm) >= 0, "accepted graph did not emit LLVM")
+    test.check(test.contains(readTextFile(llvm), "; minyar-cycle-runtime: 1\n"), "accepted graph did not select collector")
+}
+function rejects(compiler: test.Compiler, source: Text, diagnostic: Text) {
+    let result = test.compile(compiler, source)
+    test.check(result.status == 1, "recursive data rejection status")
+    test.check(result.output == "", "recursive data rejection stdout")
+    test.check(test.contains(result.errorOutput, diagnostic), "recursive data rejection diagnostic\n" + result.errorOutput)
+    test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "recursive data rejection emitted LLVM")
+    test.check(!test.contains(result.errorOutput, "List position"), "recursive data rejection internal List fault")
+}
+function typeName(node: Integer, depth: Integer): Text {
+    let name = "R" + Text(node)
+    for index in 0..depth { name = "List<" + name + ">" }
+    return name
+}
+record Edge { owner: Integer; node: Integer; depth: Integer }
+record Graph { edges: List<Edge> }
+let compiler = test.compiler()
+let allowed = ["test_tree_construction_recursion_and_shared_subtrees", "test_persistent_chain_loop_and_returned_borrow", "test_mutually_recursive_records_with_terminating_list", "test_mutable_payloads_and_external_worklists_keep_alias_semantics", "test_outer_list_is_mutable_when_its_exact_type_is_not_on_a_cycle", "test_recursive_children_can_be_built_with_fresh_appended_lists", "test_direct_self_cycle_add_and_overwrite_use_collector", "test_alias_return_and_record_projection_select_collector", "test_nested_list_edges_select_collector", "test_mutual_cycle_through_different_mutable_type_selects_collector", "test_recursive_declarations_without_values_are_legal", "test_list_literals_infer_types_and_evaluate_left_to_right", "test_literal_retains_earlier_projection_before_later_mutation", "test_list_literals_reject_invalid_types_and_separators", "test_contextual_empty_list_returns_and_reassignment", "test_type_edge_mutations_against_independent_reachability_model"]
+for index in 0..argumentCount() {
+    let valid = false
+    for name in allowed { if argument(index) == name || argument(index) == "RecursiveData." + name { valid = true } }
+    test.check(valid, "unknown recursive data case " + argument(index))
+}
+if selected("test_tree_construction_recursion_and_shared_subtrees") {
+    test.executes(compiler, "record Node { value: Integer; children: List<Node> }\nfunction tree(depth: Integer): Node {\n    if depth == 0 { return Node { value: 1; children: [] } }\n    let child = tree(depth - 1)\n    return Node { value: 1; children: [child, child] }\n}\nfunction size(node: Node): Integer {\n    let total = node.value\n    let i = 0\n    while i < node.children.length {\n        total = total + size(node.children[i])\n        i = i + 1\n    }\n    return total\n}\nlet root = tree(12)\nprint(size(root))\nprint(root.children[0].children.length)\n", "8191\n2\n")
+}
+if selected("test_persistent_chain_loop_and_returned_borrow") {
+    test.executes(compiler, "record Link { value: Integer; next: List<Link> }\nfunction first(links: List<Link>): Link { return links[0] }\nlet chain = Link { value: 0; next: [] }\nlet i = 1\nwhile i < 4000 {\n    chain = Link { value: i; next: [chain] }\n    i = i + 1\n}\nlet saved = first(chain.next)\nlet total = 0\nwhile chain.next.length > 0 {\n    total = total + chain.value\n    chain = chain.next[0]\n}\nprint(total)\nprint(saved.value)\n", "7998000\n3998\n")
+}
+if selected("test_mutually_recursive_records_with_terminating_list") {
+    test.executes(compiler, "record Branch { leaves: List<Leaf> }\nrecord Leaf { parentShape: Branch; value: Integer }\nfunction grow(n: Integer): Branch {\n    if n == 0 { return Branch { leaves: [] } }\n    return Branch { leaves: [Leaf { parentShape: grow(n - 1); value: n }] }\n}\nlet branch = grow(20)\nprint(branch.leaves[0].parentShape.leaves[0].value)\n", "19\n")
+}
+if selected("test_mutable_payloads_and_external_worklists_keep_alias_semantics") {
+    test.executes(compiler, "record Node { children: List<Node>; payload: List<Integer> }\nrecord Job { node: Node }\nlet payload: List<Integer> = [1]\nlet leaf = Node { children: []; payload: payload }\nlet root = Node { children: [leaf]; payload: payload }\nlet jobs: List<Job> = []\nlet alias = jobs\nalias.add(Job { node: root })\njobs[0] = Job { node: leaf }\npayload[0] = 42\npayload.add(7)\nprint(alias[0].node.payload[0])\nprint(root.payload.length)\n", "42\n2\n")
+}
+if selected("test_outer_list_is_mutable_when_its_exact_type_is_not_on_a_cycle") {
+    test.executes(compiler, "record Node { children: List<Node> }\nlet leaf = Node { children: [] }\nlet childLists: List<List<Node>> = []\nlet alias = childLists\nalias.add([leaf])\nchildLists[0] = [leaf, leaf]\nprint(alias[0].length)\n", "2\n")
+}
+if selected("test_recursive_children_can_be_built_with_fresh_appended_lists") {
+    test.executes(compiler, "record Node { value: Integer; children: List<Node> }\nlet children: List<Node> = []\nlet i = 1\nwhile i <= 20 {\n    children = children.appended(Node { value: i; children: [] })\n    i = i + 1\n}\nlet root = Node { value: 0; children: children }\nprint(root.children.length)\nprint(root.children[0].value)\nprint(root.children[19].value)\n", "20\n1\n20\n")
+}
+if selected("test_direct_self_cycle_add_and_overwrite_use_collector") {
+    acceptsGraph(compiler, "record Node { children: List<Node> }\nlet children: List<Node> = []\nlet node = Node { children: children }\nchildren.add(node)\n")
+    acceptsGraph(compiler, "record Node { children: List<Node> }\nlet leaf = Node { children: [] }\nlet children: List<Node> = [leaf]\nlet node = Node { children: children }\nchildren[0] = node\n")
+    acceptsGraph(compiler, "record Node { children: List<Node> }\nfunction attach(children: List<Node>, node: Node) { children.add(node) }\n")
+    acceptsGraph(compiler, "record Node { children: List<Node> }\nfunction replace(children: List<Node>, node: Node) { children[0] = node }\n")
+}
+if selected("test_alias_return_and_record_projection_select_collector") {
+    acceptsGraph(compiler, "record Node { children: List<Node> }\nfunction children(node: Node): List<Node> { return node.children }\nlet items: List<Node> = []\nlet node = Node { children: items }\nlet alias = items\nalias.add(node)\n")
+    acceptsGraph(compiler, "record Node { children: List<Node> }\nfunction children(node: Node): List<Node> { return node.children }\nlet items: List<Node> = []\nlet node = Node { children: items }\nlet alias = items\nchildren(node).add(node)\n")
+    acceptsGraph(compiler, "record Node { children: List<Node> }\nfunction children(node: Node): List<Node> { return node.children }\nlet items: List<Node> = []\nlet node = Node { children: items }\nlet alias = items\nnode.children.add(node)\n")
+}
+if selected("test_nested_list_edges_select_collector") {
+    acceptsGraph(compiler, "record Node { groups: List<List<Node>> }\nfunction inner(items: List<Node>, node: Node) { items.add(node) }\n")
+    acceptsGraph(compiler, "record Node { groups: List<List<Node>> }\nfunction outer(groups: List<List<Node>>, items: List<Node>) { groups.add(items) }\n")
+    acceptsGraph(compiler, "record Node { groups: List<List<Node>> }\nfunction overwrite(groups: List<List<Node>>, items: List<Node>) { groups[0] = items }\n")
+}
+if selected("test_mutual_cycle_through_different_mutable_type_selects_collector") {
+    acceptsGraph(compiler, "record A { links: List<B> }\nrecord B { back: A }\nfunction attach(links: List<B>, owner: A) {\n    links.add(B { back: owner })\n}\n")
+}
+if selected("test_recursive_declarations_without_values_are_legal") {
+    test.require(test.compile(compiler, "record Loop { next: Loop }\nrecord Tree { children: List<Tree> }\n"), "compile recursive declarations without values")
+}
+if selected("test_list_literals_infer_types_and_evaluate_left_to_right") {
+    test.executes(compiler, "function bump(state: List<Integer>): Integer {\n    state[0] = state[0] + 1\n    return state[0]\n}\nfunction mixed(numbers: List<Integer>, words: List<Text>) {\n    print(numbers[0])\n    print(words[0])\n}\nlet state = [0]\nlet values = [bump(state), bump(state), bump(state)]\nprint(values[0])\nprint(values[1])\nprint(values[2])\nmixed([7], [\"seven\"])\nlet flags = [true, false]\nlet characters = ['a', 'b']\nprint(flags[1])\nprint(characters[1])\nlet nested: List<List<Text>> = [[], [\"é\" + \"🙂\"], []]\nprint(nested[0].length)\nprint(nested[1][0])\nprint(nested[2].length)\n", "1\n2\n3\n7\nseven\nfalse\nb\n0\né🙂\n0\n")
+}
+if selected("test_literal_retains_earlier_projection_before_later_mutation") {
+    test.executes(compiler, "record Box { text: Text }\nfunction replace(boxes: List<Box>): Box {\n    boxes[0] = Box { text: \"new\" + \"!\" }\n    return boxes[0]\n}\nlet boxes = [Box { text: \"old\" + \"!\" }]\nlet captured = [boxes[0], replace(boxes)]\nprint(captured[0].text)\nprint(captured[1].text)\nprint(boxes[0].text)\n", "old!\nnew!\nnew!\n")
+}
+if selected("test_list_literals_reject_invalid_types_and_separators") {
+    rejects(compiler, "let bad = [1, true]\n", "all values in a List literal must have the same type")
+    rejects(compiler, "let bad = [[], []]\n", "an empty List needs a type")
+    rejects(compiler, "let bad = [print(1)]\n", "Nothing cannot be stored in a List")
+    rejects(compiler, "let bad = [1 2]\n", "expected ','")
+    rejects(compiler, "let bad = [1,\n", "expected an expression")
+    rejects(compiler, "let bad: List<Integer> = [true]\n", "all values in a List literal must have the same type")
+    rejects(compiler, "function bad(): List<Integer> { return }\n", "a returned value has the wrong type")
+}
+if selected("test_contextual_empty_list_returns_and_reassignment") {
+    test.executes(compiler, "record Node { children: List<Node> }\nfunction empty(): List<Node> { return [] }\nlet items: List<Node> = [Node { children: empty() }]\nitems = []\nprint(items.length)\nlet multiline: List<List<Integer>> = [\n    [],\n    [1, 2,],\n]\nprint(multiline[1][1])\n", "0\n2\n")
+}
+if selected("test_type_edge_mutations_against_independent_reachability_model") {
+    let graphs: List<Graph> = [
+        Graph { edges: [] },
+        Graph { edges: [Edge { owner: 0; node: 0; depth: 0 }, Edge { owner: 1; node: 1; depth: 0 }, Edge { owner: 3; node: 0; depth: 1 }, Edge { owner: 3; node: 1; depth: 0 }, Edge { owner: 3; node: 3; depth: 1 }] },
+        Graph { edges: [Edge { owner: 0; node: 2; depth: 0 }, Edge { owner: 0; node: 4; depth: 2 }, Edge { owner: 1; node: 2; depth: 0 }, Edge { owner: 1; node: 4; depth: 1 }, Edge { owner: 4; node: 4; depth: 0 }] },
+        Graph { edges: [Edge { owner: 1; node: 0; depth: 0 }, Edge { owner: 1; node: 4; depth: 2 }, Edge { owner: 2; node: 4; depth: 2 }, Edge { owner: 3; node: 0; depth: 2 }, Edge { owner: 3; node: 2; depth: 0 }, Edge { owner: 3; node: 3; depth: 2 }, Edge { owner: 3; node: 4; depth: 0 }] },
+        Graph { edges: [Edge { owner: 0; node: 1; depth: 1 }, Edge { owner: 0; node: 3; depth: 0 }, Edge { owner: 1; node: 3; depth: 2 }, Edge { owner: 2; node: 4; depth: 2 }, Edge { owner: 3; node: 2; depth: 1 }] },
+        Graph { edges: [Edge { owner: 1; node: 1; depth: 1 }, Edge { owner: 1; node: 4; depth: 0 }, Edge { owner: 2; node: 0; depth: 1 }, Edge { owner: 2; node: 3; depth: 0 }, Edge { owner: 2; node: 4; depth: 0 }, Edge { owner: 3; node: 1; depth: 1 }, Edge { owner: 3; node: 2; depth: 0 }, Edge { owner: 3; node: 3; depth: 2 }, Edge { owner: 4; node: 0; depth: 0 }, Edge { owner: 4; node: 1; depth: 0 }, Edge { owner: 4; node: 3; depth: 0 }] },
+        Graph { edges: [Edge { owner: 0; node: 4; depth: 2 }, Edge { owner: 1; node: 4; depth: 1 }, Edge { owner: 3; node: 0; depth: 2 }, Edge { owner: 4; node: 0; depth: 1 }, Edge { owner: 4; node: 2; depth: 1 }] },
+        Graph { edges: [Edge { owner: 0; node: 1; depth: 2 }, Edge { owner: 0; node: 2; depth: 2 }, Edge { owner: 0; node: 3; depth: 2 }, Edge { owner: 0; node: 4; depth: 2 }, Edge { owner: 1; node: 0; depth: 0 }, Edge { owner: 1; node: 2; depth: 0 }, Edge { owner: 1; node: 4; depth: 2 }, Edge { owner: 2; node: 0; depth: 0 }, Edge { owner: 2; node: 3; depth: 2 }, Edge { owner: 3; node: 1; depth: 0 }, Edge { owner: 3; node: 3; depth: 0 }, Edge { owner: 4; node: 2; depth: 2 }] },
+        Graph { edges: [Edge { owner: 0; node: 0; depth: 1 }, Edge { owner: 0; node: 1; depth: 2 }, Edge { owner: 0; node: 2; depth: 0 }, Edge { owner: 1; node: 0; depth: 2 }, Edge { owner: 1; node: 1; depth: 1 }, Edge { owner: 1; node: 4; depth: 1 }, Edge { owner: 2; node: 0; depth: 0 }, Edge { owner: 3; node: 3; depth: 0 }, Edge { owner: 4; node: 1; depth: 0 }] },
+        Graph { edges: [Edge { owner: 0; node: 2; depth: 2 }, Edge { owner: 0; node: 3; depth: 2 }, Edge { owner: 2; node: 0; depth: 1 }, Edge { owner: 2; node: 3; depth: 0 }, Edge { owner: 2; node: 4; depth: 2 }, Edge { owner: 3; node: 2; depth: 2 }, Edge { owner: 4; node: 0; depth: 1 }, Edge { owner: 4; node: 1; depth: 0 }, Edge { owner: 4; node: 4; depth: 1 }] },
+        Graph { edges: [Edge { owner: 0; node: 3; depth: 1 }, Edge { owner: 1; node: 1; depth: 2 }, Edge { owner: 1; node: 3; depth: 2 }, Edge { owner: 2; node: 0; depth: 0 }, Edge { owner: 3; node: 3; depth: 0 }, Edge { owner: 4; node: 1; depth: 0 }, Edge { owner: 4; node: 3; depth: 1 }] },
+        Graph { edges: [Edge { owner: 1; node: 1; depth: 2 }, Edge { owner: 1; node: 4; depth: 1 }, Edge { owner: 2; node: 1; depth: 2 }, Edge { owner: 4; node: 0; depth: 0 }, Edge { owner: 4; node: 1; depth: 0 }] },
+        Graph { edges: [Edge { owner: 0; node: 3; depth: 0 }, Edge { owner: 1; node: 4; depth: 0 }, Edge { owner: 2; node: 1; depth: 1 }, Edge { owner: 2; node: 4; depth: 2 }, Edge { owner: 3; node: 1; depth: 2 }, Edge { owner: 4; node: 0; depth: 0 }, Edge { owner: 4; node: 3; depth: 1 }] },
+        Graph { edges: [Edge { owner: 0; node: 4; depth: 0 }, Edge { owner: 1; node: 3; depth: 0 }, Edge { owner: 2; node: 0; depth: 1 }, Edge { owner: 2; node: 1; depth: 0 }, Edge { owner: 2; node: 4; depth: 1 }, Edge { owner: 3; node: 1; depth: 1 }] },
+        Graph { edges: [Edge { owner: 0; node: 0; depth: 2 }, Edge { owner: 1; node: 1; depth: 1 }, Edge { owner: 2; node: 1; depth: 0 }, Edge { owner: 3; node: 3; depth: 2 }, Edge { owner: 4; node: 0; depth: 2 }, Edge { owner: 4; node: 1; depth: 2 }, Edge { owner: 4; node: 3; depth: 0 }] },
+        Graph { edges: [Edge { owner: 0; node: 1; depth: 2 }, Edge { owner: 0; node: 2; depth: 0 }, Edge { owner: 0; node: 3; depth: 2 }, Edge { owner: 0; node: 4; depth: 2 }, Edge { owner: 2; node: 1; depth: 0 }, Edge { owner: 2; node: 4; depth: 2 }, Edge { owner: 3; node: 4; depth: 2 }] },
+        Graph { edges: [Edge { owner: 1; node: 3; depth: 1 }, Edge { owner: 2; node: 3; depth: 0 }, Edge { owner: 3; node: 4; depth: 1 }] },
+        Graph { edges: [Edge { owner: 1; node: 2; depth: 0 }, Edge { owner: 3; node: 1; depth: 2 }, Edge { owner: 3; node: 2; depth: 0 }, Edge { owner: 3; node: 3; depth: 2 }, Edge { owner: 4; node: 3; depth: 2 }] },
+        Graph { edges: [Edge { owner: 0; node: 0; depth: 2 }, Edge { owner: 1; node: 0; depth: 1 }, Edge { owner: 3; node: 4; depth: 2 }] },
+        Graph { edges: [Edge { owner: 1; node: 2; depth: 1 }, Edge { owner: 1; node: 3; depth: 1 }, Edge { owner: 2; node: 1; depth: 1 }, Edge { owner: 2; node: 3; depth: 2 }, Edge { owner: 2; node: 4; depth: 0 }, Edge { owner: 3; node: 1; depth: 1 }, Edge { owner: 4; node: 1; depth: 2 }] },
+        Graph { edges: [Edge { owner: 1; node: 4; depth: 1 }, Edge { owner: 2; node: 1; depth: 0 }, Edge { owner: 3; node: 0; depth: 1 }, Edge { owner: 3; node: 4; depth: 2 }, Edge { owner: 4; node: 2; depth: 2 }, Edge { owner: 4; node: 4; depth: 0 }] },
+        Graph { edges: [Edge { owner: 0; node: 0; depth: 2 }, Edge { owner: 1; node: 2; depth: 2 }, Edge { owner: 1; node: 4; depth: 1 }, Edge { owner: 2; node: 2; depth: 0 }] },
+        Graph { edges: [Edge { owner: 0; node: 1; depth: 0 }, Edge { owner: 1; node: 3; depth: 1 }, Edge { owner: 3; node: 1; depth: 0 }, Edge { owner: 3; node: 4; depth: 0 }] },
+        Graph { edges: [Edge { owner: 0; node: 3; depth: 2 }, Edge { owner: 1; node: 4; depth: 2 }, Edge { owner: 2; node: 1; depth: 0 }, Edge { owner: 2; node: 4; depth: 2 }, Edge { owner: 3; node: 2; depth: 0 }] },
+        Graph { edges: [Edge { owner: 0; node: 2; depth: 0 }, Edge { owner: 0; node: 3; depth: 2 }, Edge { owner: 2; node: 0; depth: 1 }, Edge { owner: 2; node: 3; depth: 2 }, Edge { owner: 2; node: 4; depth: 1 }, Edge { owner: 3; node: 4; depth: 1 }, Edge { owner: 4; node: 1; depth: 1 }, Edge { owner: 4; node: 3; depth: 2 }] },
+        Graph { edges: [Edge { owner: 0; node: 3; depth: 1 }, Edge { owner: 1; node: 0; depth: 1 }, Edge { owner: 1; node: 1; depth: 2 }, Edge { owner: 1; node: 4; depth: 2 }, Edge { owner: 2; node: 1; depth: 2 }] },
+        Graph { edges: [Edge { owner: 0; node: 1; depth: 0 }, Edge { owner: 0; node: 4; depth: 1 }, Edge { owner: 1; node: 0; depth: 2 }, Edge { owner: 1; node: 2; depth: 1 }, Edge { owner: 2; node: 4; depth: 0 }, Edge { owner: 3; node: 0; depth: 0 }, Edge { owner: 4; node: 1; depth: 2 }, Edge { owner: 4; node: 4; depth: 0 }] },
+        Graph { edges: [Edge { owner: 0; node: 3; depth: 0 }, Edge { owner: 3; node: 3; depth: 1 }, Edge { owner: 4; node: 0; depth: 2 }, Edge { owner: 4; node: 2; depth: 1 }, Edge { owner: 4; node: 4; depth: 2 }] },
+        Graph { edges: [Edge { owner: 0; node: 0; depth: 0 }, Edge { owner: 0; node: 3; depth: 2 }, Edge { owner: 1; node: 1; depth: 1 }, Edge { owner: 1; node: 2; depth: 0 }, Edge { owner: 1; node: 4; depth: 1 }, Edge { owner: 2; node: 1; depth: 1 }, Edge { owner: 2; node: 4; depth: 2 }, Edge { owner: 4; node: 1; depth: 1 }] },
+        Graph { edges: [Edge { owner: 1; node: 3; depth: 1 }, Edge { owner: 2; node: 1; depth: 1 }, Edge { owner: 3; node: 2; depth: 1 }] },
+        Graph { edges: [Edge { owner: 0; node: 2; depth: 2 }, Edge { owner: 1; node: 0; depth: 1 }, Edge { owner: 2; node: 2; depth: 0 }] },
+        Graph { edges: [Edge { owner: 0; node: 0; depth: 0 }, Edge { owner: 0; node: 2; depth: 0 }, Edge { owner: 0; node: 3; depth: 0 }, Edge { owner: 1; node: 1; depth: 2 }, Edge { owner: 1; node: 2; depth: 0 }, Edge { owner: 1; node: 3; depth: 2 }, Edge { owner: 2; node: 1; depth: 2 }, Edge { owner: 2; node: 2; depth: 0 }, Edge { owner: 3; node: 1; depth: 1 }, Edge { owner: 3; node: 4; depth: 0 }, Edge { owner: 4; node: 2; depth: 0 }] }
+    ]
+    test.check(graphs.length == 32, "recursive graph seed domain")
+    let checked = 0
+    for seed in 0..graphs.length {
+        let graph = graphs[seed]
+        let declarations: List<Text> = []
+        for owner in 0..5 {
+            declarations.add("record R" + Text(owner) + " { ")
+            let field = 0
+            for edge in graph.edges {
+                if edge.owner == owner {
+                    if field > 0 { declarations.add("; ") }
+                    declarations.add("f" + Text(field) + ": " + typeName(edge.node, edge.depth))
+                    field += 1
+                }
+            }
+            declarations.add(" }\n")
+        }
+        let reach: List<Boolean> = []
+        for start in 0..15 { for end in 0..15 { reach.add(start == end) } }
+        for edge in graph.edges { reach[edge.owner * 3 * 15 + edge.node * 3 + edge.depth] = true }
+        for owner in 0..5 {
+            for depth in [1, 2] { reach[(owner * 3 + depth) * 15 + owner * 3 + depth - 1] = true }
+        }
+        for middle in 0..15 {
+            for start in 0..15 {
+                for end in 0..15 {
+                    if reach[start * 15 + middle] && reach[middle * 15 + end] { reach[start * 15 + end] = true }
+                }
+            }
+        }
+        for target in 0..2 {
+            let node = (seed + target) % 5
+            let depth = target + 1
+            let cyclic = reach[(node * 3 + depth - 1) * 15 + node * 3 + depth]
+            for mutation in ["items.add(value)", "items[0] = value"] {
+                let source = joinText(declarations) + "function mutate(items: " + typeName(node, depth) + ", value: " + typeName(node, depth - 1) + ") { " + mutation + " }\n"
+                test.require(test.compile(compiler, source), "compile independently classified recursive mutation seed " + Text(seed))
+                if cyclic { acceptsGraph(compiler, source) }
+                checked += 1
+            }
+        }
+    }
+    test.check(checked == 128, "recursive seeded mutation domain")
+}
+test.removeTree(compiler.directory)
+print("Recursive data and independent type reachability: passed")

@@ -1,0 +1,60 @@
+use "../tools/testing.min" as test
+function selected(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "ProductionScalarStorage." + name { return true } }
+    return false
+}
+function body(compiler: test.Compiler, source: Text, name: Text): Text {
+    test.require(test.compile(compiler, source), "compile production scalar storage")
+    let ir = readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+    let found = false
+    let complete = false
+    let parts: List<Text> = []
+    for line in test.lines(ir) {
+        if !found && test.contains(line, "define") && test.contains(line, "@.minyar.fn." + name + "(") { found = true }
+        else if found {
+            if line == "}" { complete = true; break }
+            parts.add(line + "\n")
+        }
+    }
+    test.check(found && complete, "missing production scalar function " + name)
+    return joinText(parts)
+}
+let compiler = test.compiler()
+let allowed = ["test_nested_control_flow_does_not_end_escape_proof", "test_nested_container_and_parenthesized_escapes_remain_managed", "test_short_circuit_fields_keep_effect_order_and_scalar_snapshots", "test_shadow_initializers_and_field_names_resolve_independently", "test_generation_reuse_does_not_replace_managed_parameters", "test_branch_and_loop_scalar_values_dominate_all_uses"]
+for index in 0..argumentCount() {
+    let valid = false
+    for name in allowed { if argument(index) == name || argument(index) == "ProductionScalarStorage." + name { valid = true } }
+    test.check(valid, "unknown production scalar case " + argument(index))
+}
+if selected("test_nested_control_flow_does_not_end_escape_proof") {
+    let source = "record Cell { value: Integer }\nfunction save(flag: Boolean, values: List<Cell>): Integer {\nlet cell = Cell { value: 71 }\nif flag {\nif cell.value > 0 { print(cell.value) }\n}\nvalues.add(cell)\nreturn cell.value\n}\nlet values: List<Cell> = []\nprint(save(true, values))\nprint(values[0].value)\nprint(save(false, values))\nprint(values[1].value)\n"
+    test.check(test.contains(body(compiler, source, "save"), "@minyar_record_new_scalar"), "test_nested_control_flow_does_not_end_escape_proof @minyar_record_new_scalar")
+    test.executes(compiler, source, "71\n71\n71\n71\n71\n")
+}
+if selected("test_nested_container_and_parenthesized_escapes_remain_managed") {
+    let source = "record Cell { value: Integer }\nrecord Box { cells: List<Cell> }\nfunction make(): Box {\nlet cell = Cell { value: 83 }\nlet boxes = [Box { cells: [(cell)] }]\nreturn boxes[0]\n}\nlet result = make()\nprint(result.cells[0].value)\n"
+    test.check(test.contains(body(compiler, source, "make"), "@minyar_record_new_scalar"), "test_nested_container_and_parenthesized_escapes_remain_managed @minyar_record_new_scalar")
+    test.executes(compiler, source, "83\n")
+}
+if selected("test_short_circuit_fields_keep_effect_order_and_scalar_snapshots") {
+    let source = "record Flags { first: Boolean; second: Boolean; before: Integer; after: Integer }\nfunction bump(state: List<Integer>): Boolean {\nstate[0] = state[0] + 1\nreturn true\n}\nfunction work(flag: Boolean, state: List<Integer>): Integer {\nlet item = Flags {\nbefore: state[0]\nfirst: flag && bump(state)\nsecond: !flag || bump(state)\nafter: state[0]\n}\nstate[0] = 99\nif item.first { print(1) } else { print(0) }\nif item.second { print(1) } else { print(0) }\nreturn item.before * 100 + item.after\n}\nlet state = [4]\nprint(work(true, state))\nstate[0] = 4\nprint(work(false, state))\n"
+    test.check(!test.contains(body(compiler, source, "work"), "@minyar_record_"), "test_short_circuit_fields_keep_effect_order_and_scalar_snapshots @minyar_record_")
+    test.executes(compiler, source, "1\n1\n406\n0\n1\n404\n")
+}
+if selected("test_shadow_initializers_and_field_names_resolve_independently") {
+    test.executes(compiler, "record Pair { item: Integer; value: Integer }\nfunction work(): Integer {\nlet item = Pair { item: 3; value: 7 }\nif item.item > 0 {\nlet item = Pair { value: item.item; item: item.value }\nprint(item.item)\nprint(item.value)\n}\nlet second = Pair { item: item.item; value: item.value }\nreturn second.item * 10 + second.value\n}\nprint(work())\n", "7\n3\n37\n")
+}
+if selected("test_generation_reuse_does_not_replace_managed_parameters") {
+    let source = "record Cell { value: Integer }\nfunction first(input: Integer): Integer {\nlet cell = Cell { value: input + 1 }\nreturn cell.value\n}\nfunction second(cell: Cell): Integer { return cell.value }\nfunction third(input: Integer): Integer {\nlet cell = Cell { value: input * 3 }\nreturn cell.value\n}\nfunction fourth(input: Integer): Cell {\nlet cell = Cell { value: input + 9 }\nreturn cell\n}\nprint(first(4))\nprint(second(fourth(2)))\nprint(third(7))\nprint(second(fourth(8)))\n"
+    test.check(test.contains(body(compiler, source, "second"), "@minyar_record_get"), "test_generation_reuse_does_not_replace_managed_parameters @minyar_record_get")
+    test.check(test.contains(body(compiler, source, "fourth"), "@minyar_record_new_scalar"), "test_generation_reuse_does_not_replace_managed_parameters @minyar_record_new_scalar")
+    test.executes(compiler, source, "5\n11\n21\n17\n")
+}
+if selected("test_branch_and_loop_scalar_values_dominate_all_uses") {
+    let source = "record Cell { value: Integer }\nfunction work(count: Integer, stop: Boolean): Integer {\nlet total = 0\nlet index = 0\nwhile index < count {\nif index % 2 == 0 {\nlet cell = Cell { value: index + 10 }\nif stop && index == 2 { return cell.value }\ntotal = total + cell.value\n} else {\nlet cell = Cell { value: index * 2 }\ntotal = total + cell.value\n}\nindex = index + 1\n}\nreturn total\n}\nprint(work(0, false))\nprint(work(5, false))\nprint(work(5, true))\n"
+    test.check(!test.contains(body(compiler, source, "work"), "@minyar_record_"), "test_branch_and_loop_scalar_values_dominate_all_uses @minyar_record_")
+    test.executes(compiler, source, "0\n44\n12\n")
+}
+test.removeTree(compiler.directory)
+print("Production scalar storage: passed")

@@ -1,0 +1,73 @@
+use "../tools/testing.min" as test
+use "system" as system
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+function count(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let found = 0
+    if raw.length < pattern.length { return 0 }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { found += 1 }
+    }
+    return found
+}
+record Mutation { name: Text; before: Text; after: Text; program: Text; expected: Text }
+let compiler = test.setting("MINYAR_TEST_COMPILER", "./build/minyarc")
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let source = readTextFile(test.setting("MINYAR_TEST_COMPILER_SOURCE", "build/compiler.min"))
+let runtime = test.setting("MINYAR_TEST_MUTATION_RUNTIME", "build/ownership-runtime.o")
+test.check(system.setResourceLimit(system.CORE_SIZE, 0, 0) == 0, "disable mutation crash cores")
+let environment: List<Text> = []
+for entry in system.environment() {
+    if !starts(entry, "ASAN_OPTIONS=") && !starts(entry, "UBSAN_OPTIONS=") { environment.add(entry) }
+}
+environment.add("ASAN_OPTIONS=detect_leaks=0:halt_on_error=1")
+environment.add("UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=0")
+let work = test.scratch()
+let mutations: List<Mutation> = [
+    Mutation { name: "capture"; before: "raw = output[scalarValues + (field - first) * 3 + 1]"; after: "raw = output[scalarValues + 1]"; program: "record Pair { x: Integer; y: Integer }\nfunction bump(state: List<Integer>, delta: Integer): Integer {\nstate[0] = state[0] + delta\nreturn state[0]\n}\nfunction work(state: List<Integer>): Integer {\nlet p = Pair { y: bump(state, 10); x: bump(state, 1) }\nreturn p.x * 100 + p.y\n}\nlet state = [0]\nprint(work(state))\nprint(state[0])\n"; expected: "1110\n11\n" },
+    Mutation { name: "escape"; before: "if position + 1 >= tokenTexts.length || tokenTexts[position + 1] != \".\" { return }"; after: "if position + 1 >= tokenTexts.length { return }"; program: "record Pair { x: Integer; y: Integer }\nfunction save(p: Pair, values: List<Pair>): Integer {\nvalues.add(p)\nreturn p.x\n}\nfunction work(values: List<Pair>): Integer {\nlet p = Pair { x: 9; y: 4 }\nreturn save(p, values)\n}\nlet values: List<Pair> = []\nprint(work(values))\nprint(values[0].y)\n"; expected: "9\n4\n" }
+]
+let compilers = [compiler]
+for mutation in mutations {
+    test.check(count(source, mutation.before) == 1, mutation.name + ": mutation site changed")
+    let path = work + "/" + mutation.name
+    writeTextFile(path + ".min", test.replace(source, mutation.before, mutation.after))
+    test.require(test.run([compiler, path + ".min", path + ".ll"], system.environment(), "", path + ".compiler-build", 120), mutation.name + " compiler build")
+    test.require(test.run([clang, "-O1", "-DMINYAR_COMPILER_ARENA", "-Wno-override-module", path + ".ll", "runtime/minyar_runtime.c", "-lm", "-o", path], system.environment(), "", path + ".compiler-link", 120), mutation.name + " compiler link")
+    compilers.add(path)
+}
+for index in 0..mutations.length {
+    let mutation = mutations[index]
+    for mode in ["control", mutation.name] {
+        let candidate = compilers[0]
+        if mode != "control" { candidate = compilers[index + 1] }
+        let path = work + "/" + mutation.name + "-" + mode
+        writeTextFile(path + ".min", mutation.program)
+        test.require(test.run([candidate, path + ".min", path + ".ll"], system.environment(), "", path + ".compile", 120), mutation.name + "/" + mode + " program compile")
+        writeTextFile(path + ".ll", test.instrument(readTextFile(path + ".ll")))
+        for optimization in ["-O0", "-O2"] {
+            let executable = path + ".exe"
+            test.require(test.run([clang, optimization, "-fsanitize=address,undefined", "-Wno-override-module", path + ".ll", runtime, "-lm", "-o", executable], system.environment(), "", path + ".link", 120), mutation.name + "/" + mode + " program link")
+            let result = test.run([executable], environment, "", path + ".run", 120)
+            if mode == "control" {
+                test.check(result.status == 0 && result.output == mutation.expected, "scalar mutation viable control " + mutation.name + " " + optimization + "\n" + result.output + result.errorOutput)
+            } else if mutation.name == "capture" {
+                test.check(result.status == 0 && result.output == "1111\n11\n", "scalar capture intended wrong result " + optimization + "\n" + result.output + result.errorOutput)
+            } else {
+                test.check(result.status != 0 && (test.contains(result.errorOutput, "runtime error: member access within null pointer") || test.contains(result.errorOutput, "AddressSanitizer: SEGV")), "scalar escape intended memory fault " + optimization + "\n" + result.errorOutput)
+            }
+        }
+    }
+    print(mutation.name + ": intended fault detected at O0 and O2")
+}
+test.removeTree(work)
+print("Both scalar-record compiler mutants detected")

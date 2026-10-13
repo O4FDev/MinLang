@@ -1,0 +1,167 @@
+use "../tools/testing.min" as test
+use "system" as system
+function selected(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "CompactOwnership." + name { return true } }
+    return false
+}
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+function find(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if raw.length < pattern.length { return -1 }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { return start }
+    }
+    return -1
+}
+function count(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let found = 0
+    if raw.length < pattern.length { return 0 }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { found += 1 }
+    }
+    return found
+}
+function argumentValue(source: Text, needle: Text): Integer {
+    let position = find(source, needle)
+    if position < 0 { return -1 }
+    position += Bytes(needle).length
+    let raw = Bytes(source)
+    let first = position
+    while position < raw.length && raw[position] >= 48 && raw[position] <= 57 { position += 1 }
+    test.check(position > first, "missing ownership slot literal")
+    return Integer(Text(raw.slice(first, position)))
+}
+record Frame { slots: Integer; indices: List<Integer>; body: Text }
+function frame(compiler: test.Compiler, source: Text, name: Text): Frame {
+    test.require(test.compile(compiler, source), "compile compact ownership frame")
+    let ir = readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+    let found = false
+    let complete = false
+    let parts: List<Text> = []
+    for line in test.lines(ir) {
+        if !found && starts(line, "define ") && test.contains(line, "@.minyar.fn." + name + "(") { found = true }
+        else if found {
+            if line == "}" { complete = true; break }
+            parts.add(line + "\n")
+        }
+    }
+    test.check(found && complete, "missing compact ownership function " + name)
+    let body = joinText(parts)
+    let slots = argumentValue(body, "call void @minyar_rc_enter(i64 ")
+    test.check(slots >= 0, "missing compact ownership frame entry")
+    let indices: List<Integer> = []
+    for line in parts {
+        for needle in ["call void @minyar_rc_local(i64 ", "call void @minyar_rc_local_take(i64 "] {
+            let value = argumentValue(line, needle)
+            if value >= 0 {
+                let duplicate = false
+                for index in indices { if index == value { duplicate = true } }
+                if !duplicate { indices.add(value) }
+            }
+        }
+    }
+    return Frame { slots: slots; indices: indices; body: body }
+}
+function checkFrame(value: Frame, slots: Integer) {
+    test.check(value.slots == slots, "compact ownership frame slot count")
+    test.check(value.indices.length == slots, "compact ownership distinct local slot set")
+    for index in value.indices { test.check(index >= 0 && index < slots, "compact ownership local slot domain") }
+}
+let compiler = test.compiler()
+let allowed = ["test_scalars_do_not_reserve_ownership_slots", "test_readonly_borrowed_parameters_need_no_local_owners", "test_assigned_parameter_gets_one_stable_slot_across_branches", "test_shadowing_scope_cleanup_and_escaping_alias", "test_generation_reset_between_functions", "test_early_returns_and_recursive_parameter_reassignment", "test_distinct_owners_cannot_share_one_slot", "test_collision_mutant_fails_with_real_use_after_free"]
+for index in 0..argumentCount() {
+    let valid = false
+    for name in allowed { if argument(index) == name || argument(index) == "CompactOwnership." + name { valid = true } }
+    test.check(valid, "unknown compact ownership case " + argument(index))
+}
+if selected("test_scalars_do_not_reserve_ownership_slots") {
+    let parts = ["function mixed(seed: Integer): Integer {\n"]
+    for index in 0..200 { parts.add("let number" + Text(index) + " = seed + " + Text(index) + "\n") }
+    parts.add("let text = Text(number199) + \"!\"\nreturn text.length\n}\nprint(mixed(1))\n")
+    let source = joinText(parts)
+    let value = frame(compiler, source, "mixed")
+    checkFrame(value, 1)
+    test.check(test.contains(value.body, "%local.201"), "LLVM local identifiers must stay independent of owner slots")
+    test.executes(compiler, source, "4\n")
+}
+if selected("test_readonly_borrowed_parameters_need_no_local_owners") {
+    let source = "function decorate(a: Text, b: Text, c: List<Integer>, n: Integer): Text {\nlet length = c.length + n\nreturn a + b + Text(length)\n}\nprint(decorate(\"a\", \"b\", [1], 2))\n"
+    checkFrame(frame(compiler, source, "decorate"), 0)
+    test.executes(compiler, source, "ab3\n")
+}
+if selected("test_assigned_parameter_gets_one_stable_slot_across_branches") {
+    let source = "function select(a: Text, b: Text, flag: Boolean): Text {\nlet number = 1\nif flag { a = b } else { a = a }\nlet i = 0\nwhile i < 3 {\nif flag { a = a + \"!\" }\ni = i + 1\n}\nreturn a\n}\nlet original = \"old\" + \"\"\nlet replacement = \"new\" + \"\"\nprint(select(original, replacement, false))\nprint(select(original, replacement, true))\nprint(original)\n"
+    checkFrame(frame(compiler, source, "select"), 1)
+    test.executes(compiler, source, "old\nnew!!!\nold\n")
+}
+if selected("test_shadowing_scope_cleanup_and_escaping_alias") {
+    test.executes(compiler, "function preserve(original: Text, flag: Boolean): Text {\nlet saved = original\nlet number = 3\nif flag {\nlet saved = original + \" inner\"\nprint(saved)\noriginal = \"replacement\" + \"!\"\n} else {\nlet saved = original + \" other\"\nprint(saved)\n}\nlet result = saved + original\nreturn result\n}\nlet original = \"root\" + \"!\"\nprint(preserve(original, true))\nprint(preserve(original, false))\nprint(original)\n", "root! inner\nroot!replacement!\nroot! other\nroot!root!\nroot!\n")
+}
+if selected("test_generation_reset_between_functions") {
+    let pieces: List<Text> = []
+    let expected: List<Text> = []
+    for index in 0..12 {
+        pieces.add("function f" + Text(index) + "(text: Text): Text {\n")
+        for number in 0..(index % 4) { pieces.add("let n" + Text(number) + " = " + Text(number) + "\n") }
+        pieces.add("let value = text + \"" + Text(index) + "\"\n")
+        if index % 2 == 1 { pieces.add("text = value\n") }
+        pieces.add("return value\n}\n")
+        expected.add("x" + Text(index) + "\n")
+    }
+    for index in 0..12 { pieces.add("print(f" + Text(index) + "(\"x\"))\n") }
+    let source = joinText(pieces)
+    for index in 0..12 { checkFrame(frame(compiler, source, "f" + Text(index)), 1 + index % 2) }
+    test.executes(compiler, source, joinText(expected))
+}
+if selected("test_early_returns_and_recursive_parameter_reassignment") {
+    test.executes(compiler, "record Box { text: Text }\nfunction walk(box: Box, depth: Integer, replace: Boolean): Box {\nlet scalar = depth + 1\nif depth == 0 { return box }\nlet saved = box\nif replace { box = Box { text: box.text + \"!\" } }\nlet child = walk(box, depth - 1, replace)\nif replace { return child }\nreturn saved\n}\nlet root = Box { text: \"a\" + \"\" }\nlet same = walk(root, 12, false)\nlet changed = walk(root, 3, true)\nprint(same.text)\nprint(changed.text)\nprint(root.text)\n", "a\na!!!\na\n")
+}
+if selected("test_distinct_owners_cannot_share_one_slot") {
+    test.executes(compiler, "function pair(): Text {\nlet a = \"first\" + \"!\"\nlet scalar = 42\nlet b = \"second\" + \"!\"\nreturn a + b\n}\nprint(pair())\n", "first!second!\n")
+}
+let collisionProgram = "function pair(): Text {\nlet a = \"first\" + \"!\"\nlet scalar = 42\nlet b = \"second\" + \"!\"\nreturn a + b\n}\nprint(pair())\n"
+if selected("test_collision_mutant_fails_with_real_use_after_free") {
+    let source = readTextFile(test.setting("MINYAR_TEST_COMPILER_SOURCE", "build/compiler.min"))
+    let site = "return state[entry + 1]"
+    test.check(count(source, site) == 1, "ownership mapper mutation site changed")
+    let path = compiler.directory + "/collision"
+    writeTextFile(path + ".min", test.replace(source, site, "return 0"))
+    test.require(test.run([compiler.executable, path + ".min", path + ".ll"], system.environment(), "", path + ".compile", 30), "compile collision mutant")
+    let mutant = compiler.directory + "/collision-compiler"
+    let compilerRuntime = test.setting("MINYAR_COMPILER_RUNTIME_LL", "build/minyar-compiler-runtime.ll")
+    test.require(test.run([compiler.clang, "-O1", "-Wno-override-module", path + ".ll", compilerRuntime, "-lm", "-o", mutant], system.environment(), "", path + ".link", 60), "link collision mutant")
+    let environment: List<Text> = []
+    for entry in system.environment() { if !starts(entry, "ASAN_OPTIONS=") { environment.add(entry) } }
+    environment.add("ASAN_OPTIONS=detect_leaks=0:halt_on_error=1")
+    let candidate = test.compiler()
+    candidate.executable = mutant
+    candidate.runtime = test.setting("MINYAR_TEST_MUTATION_RUNTIME", "build/ownership-runtime.o")
+    candidate.flags = ["-fsanitize=address,undefined"]
+    candidate.compileTimeout = 30
+    test.require(test.compile(candidate, collisionProgram), "compile collision ownership oracle")
+    let llvm = candidate.directory + "/case" + Text(candidate.serial) + ".ll"
+    for optimization in ["-O0", "-O2"] {
+        let executable = candidate.directory + "/collision"
+        test.require(test.run([candidate.clang, optimization, "-fsanitize=address,undefined", "-Wno-override-module", llvm, candidate.runtime, "-lm", "-o", executable], system.environment(), "", llvm + ".link", 120), "link viable collision oracle " + optimization)
+        let result = test.run([executable], environment, "", llvm + ".run", 30)
+        test.check(result.status == 1, "collision oracle failure status " + optimization)
+        test.check(test.contains(result.errorOutput, "AddressSanitizer: heap-use-after-free"), "collision oracle intended use-after-free " + optimization + "\n" + result.errorOutput)
+    }
+    test.removeTree(candidate.directory)
+}
+test.removeTree(compiler.directory)
+print("Compact ownership slots and collision oracle: passed")

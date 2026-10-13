@@ -1,0 +1,457 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+record Context { compiler: test.Compiler; arguments: List<Text>; bootstrap: Boolean; root: Text }
+function selected(className: Text, name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == className + "." + name || argument(index) == className { return true } }
+    return false
+}
+function context(bootstrap: Boolean): Context {
+    let compiler = test.compiler()
+    if bootstrap { compiler.executable = test.setting("MINYAR_TEST_BOOTSTRAP", "./build/stage0"); compiler.compileTimeout = 10 }
+    return Context { compiler: compiler; arguments: []; bootstrap: bootstrap; root: compiler.directory }
+}
+function compile(context: Context, source: Text): test.Result {
+    let compiler = context.compiler
+    compiler.serial += 1
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    writeTextFile(path + ".min", source)
+    let command = [compiler.executable, path + ".min"]
+    if context.bootstrap { command.add("-o") }
+    command.add(path + ".ll")
+    if !context.bootstrap { for argument in context.arguments { command.add(argument) } }
+    let result = test.run(command, system.environment(), "", path + ".compile", compiler.compileTimeout)
+    if result.status == 0 && test.addressEnabled(compiler.flags) { writeTextFile(path + ".ll", test.instrument(readTextFile(path + ".ll"))) }
+    return result
+}
+function generated(context: Context, source: Text): Text {
+    test.require(compile(context, source), "compile hardening source")
+    return readTextFile(context.compiler.directory + "/case" + Text(context.compiler.serial) + ".ll")
+}
+function executes(context: Context, source: Text, expected: Text): Text {
+    let ir = generated(context, source)
+    let compiler = context.compiler
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization]
+        for flag in compiler.flags { command.add(flag) }
+        for item in ["-Wno-override-module", path + ".ll", compiler.runtime, "-lm", "-o", path + ".exe"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".link", compiler.linkTimeout), "link hardening source " + optimization)
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", compiler.runTimeout)
+        test.check(result.status == 0 && result.output == expected && result.errorOutput == "", "hardening execution " + optimization + "\n" + result.output + result.errorOutput)
+    }
+    return ir
+}
+function rejects(context: Context, source: Text, diagnostic: Text) {
+    let result = compile(context, source)
+    test.check(result.status == 1 && result.output == "", "hardening rejection status/stdout")
+    test.check(test.contains(result.errorOutput, diagnostic), "hardening rejection diagnostic\n" + result.errorOutput)
+    test.check(files.pathSize(context.compiler.directory + "/case" + Text(context.compiler.serial) + ".ll") < 0, "hardening rejection emitted LLVM")
+    test.check(!test.contains(result.errorOutput, "List position"), "hardening rejection internal List fault")
+}
+function body(ir: Text, name: Text): Text {
+    let found = false
+    let complete = false
+    let pieces: List<Text> = []
+    for line in test.lines(ir) {
+        if !found && test.contains(line, "define ") && test.contains(line, "@.minyar.fn." + name + "(") { found = true; pieces.add(line + "\n") }
+        else if found {
+            pieces.add(line + "\n")
+            if line == "}" { complete = true; break }
+        }
+    }
+    test.check(found && complete, "missing hardening function " + name)
+    return joinText(pieces)
+}
+let allowed = ["CompilerHardening.test_public_parallel_declarations_preserve_scalar_and_managed_contracts", "CompilerHardening.test_depth_analysis_uses_resolved_boolean_and_recursive_calls", "CompilerHardening.test_typed_bytes_methods_require_both_known_verb_and_width", "CompilerHardening.test_print_and_text_builtin_names_cannot_be_redeclared", "CompilerHardening.test_octal_literals_accept_every_octal_digit", "CompilerHardening.test_closure_dependent_list_signatures_and_comparators_compile_in_the_primary_frontend", "CompilerHardening.test_reassignable_record_parameters_are_not_scalar_records", "CompilerHardening.test_only_bounded_ownership_declares_the_stack_owner_runtime", "CompilerHardening.test_executable_entry_is_not_an_ordinary_callable_function", "CompilerHardening.test_imported_main_uses_the_language_calling_convention", "CompilerHardening.test_runtime_names_have_distinct_language_symbols", "CompilerHardening.test_imported_runtime_named_functions_are_safe", "CompilerHardening.test_package_names_keep_hyphens_and_underscores", "CompilerHardening.test_module_declarations_may_precede_imports", "CompilerHardening.test_parent_imports_remain_relative_when_a_library_is_selected", "CompilerHardening.test_character_literals_emit_scalar_constants", "CompilerHardening.test_hex_integer_boundaries_match_decimal_literals", "CompilerHardening.test_hex_literals_cannot_enter_the_decimal_float_parser", "CompilerHardening.test_float_normalization_matches_independent_decimal_conversion", "CompilerHardening.test_large_float_mantissas_keep_their_exponent", "CompilerHardening.test_float_literals_reject_the_exact_overflow_boundary", "CompilerHardening.test_wrapped_calls_and_lists_need_no_trailing_comma", "CompilerHardening.test_else_if_can_follow_a_newline", "CompilerHardening.test_unused_constants_validate_their_literals", "CompilerHardening.test_native_library_names_cannot_inject_llvm", "CompilerHardening.test_native_must_be_the_entire_function_body", "CompilerHardening.test_valid_native_signature", "CompilerHardening.test_native_bindings_cannot_redeclare_any_emitted_runtime_symbol", "CompilerHardening.test_imported_runtime_native_bindings_fail_direct_and_module_fallback", "CompilerHardening.test_conflicting_native_signatures_are_rejected_before_llvm", "CompilerHardening.test_native_symbols_are_distinct_from_language_names", "CompilerHardening.test_module_constant_shadowing_matches_single_module", "CompilerHardening.test_compound_assignment_captures_targets_before_side_effects", "CompilerHardening.test_constant_boundaries_and_else_if", "BootstrapHardening.test_bootstrap_wrapping_and_else_if_match_the_language", "BootstrapHardening.test_bootstrap_entry_is_not_an_ordinary_callable_function", "BootstrapHardening.test_bootstrap_checked_character_conversion", "BootstrapHardening.test_bootstrap_integer_accepts_character_code_points"]
+for index in 0..argumentCount() {
+    let valid = argument(index) == "CompilerHardening" || argument(index) == "BootstrapHardening"
+    for name in allowed {
+        let parts = test.words(test.replace(name, ".", " "))
+        if argument(index) == name || argument(index) == parts[1] { valid = true }
+    }
+    test.check(valid, "unknown compiler hardening case " + argument(index))
+}
+if selected("CompilerHardening", "test_public_parallel_declarations_preserve_scalar_and_managed_contracts") {
+    let ctx = context(false)
+    executes(ctx, "public parallel function square(value: Integer): Integer { return value * value }\nprint(square(6))\n", "36\n")
+    rejects(ctx, "public parallel function bad(value: Text): Integer { return 1 }\n", "parallel function 'bad' may use only Integer, Float, Boolean and Character values")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_depth_analysis_uses_resolved_boolean_and_recursive_calls") {
+    let ctx = context(false)
+    let source = "function leaf(): Boolean { return true }\nfunction middle(): Boolean { return leaf() }\nfunction upper(): Integer { if middle() { return 42 } else { return 0 } }\nfunction recursive(n: Integer): Integer { if n == 0 { return upper() } else { return recursive(n - 1) } }\nprint(recursive(8))\n"
+    let ir = generated(ctx, source)
+    for name in ["leaf", "middle", "upper", "recursive"] { test.check(test.contains(body(ir, name), "call void @minyar_stack_enter()") == (name == "recursive"), "resolved depth/recursion stack guard " + name) }
+    executes(ctx, source, "42\n")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_typed_bytes_methods_require_both_known_verb_and_width") {
+    let ctx = context(false)
+    executes(ctx, "let values = Bytes(0)\nvalues.addInt32(7)\nprint(values.getInt32(0))\nvalues.setInt32(0, 9)\nprint(values.getInt32(0))\n", "7\n9\n")
+    rejects(ctx, "let values = Bytes(8)\nvalues.popInt32()\n", "Bytes has no method named 'popInt32'")
+    rejects(ctx, "let values = Bytes(8)\nvalues.popFloat64()\n", "Bytes has no method named 'popFloat64'")
+    rejects(ctx, "let values = Bytes(8)\nvalues.getBogus(0)\n", "Bytes has no method named 'getBogus'")
+    rejects(ctx, "let values = Bytes(8)\nvalues.addBogus(7)\n", "Bytes has no method named 'addBogus'")
+    rejects(ctx, "let values = Bytes(8)\nvalues.setBogus(0, 7)\n", "Bytes has no method named 'setBogus'")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_print_and_text_builtin_names_cannot_be_redeclared") {
+    let ctx = context(false)
+    rejects(ctx, "function print(): Integer { return 7 }\n", "function 'print' uses a reserved built-in name")
+    rejects(ctx, "function Text(): Integer { return 7 }\n", "function 'Text' uses a reserved built-in name")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_octal_literals_accept_every_octal_digit") {
+    let ctx = context(false)
+    executes(ctx, "print(0o7)\nprint(0o17)\nprint(0o777)\nprint(0o755)\nprint(0o777777777777777777777)\n", "7\n15\n511\n493\n9223372036854775807\n")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_closure_dependent_list_signatures_and_comparators_compile_in_the_primary_frontend") {
+    let ctx = context(false)
+    let result = compile(ctx, "function make(): Callback<List<Integer>> { fail(\"unused\") }\n")
+    test.check(result.status == 0 && result.output == "" && result.errorOutput == "", "closure-dependent primary frontend compilation")
+    test.check(files.pathSize(ctx.compiler.directory + "/case" + Text(ctx.compiler.serial) + ".ll") >= 0, "closure-dependent source did not emit LLVM")
+    result = compile(ctx, "function make(): Callback<Integer, List<Text>> { fail(\"unused\") }\n")
+    test.check(result.status == 0 && result.output == "" && result.errorOutput == "", "closure-dependent primary frontend compilation")
+    test.check(files.pathSize(ctx.compiler.directory + "/case" + Text(ctx.compiler.serial) + ".ll") >= 0, "closure-dependent source did not emit LLVM")
+    result = compile(ctx, "let values = [3, 1, 2]\nvalues.sortBy(function(a: Integer, b: Integer): Integer { return a - b })\n")
+    test.check(result.status == 0 && result.output == "" && result.errorOutput == "", "closure-dependent primary frontend compilation")
+    test.check(files.pathSize(ctx.compiler.directory + "/case" + Text(ctx.compiler.serial) + ".ll") >= 0, "closure-dependent source did not emit LLVM")
+    result = compile(ctx, "let values = [3, 1, 2]\nlet sorted = values.sortedBy(function(a: Integer, b: Integer): Integer { return a - b })\n")
+    test.check(result.status == 0 && result.output == "" && result.errorOutput == "", "closure-dependent primary frontend compilation")
+    test.check(files.pathSize(ctx.compiler.directory + "/case" + Text(ctx.compiler.serial) + ".ll") >= 0, "closure-dependent source did not emit LLVM")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_reassignable_record_parameters_are_not_scalar_records") {
+    let ctx = context(false)
+    executes(ctx, "record Point { x: Integer; y: Integer }\nfunction sum(point: Point): Integer {\nlet total = point.x + point.y\npoint = Point { x: 0, y: 0 }\nreturn total + point.x\n}\nprint(sum(Point { x: 3, y: 4 }))\n", "7\n")
+    executes(ctx, "record Point { x: Integer; y: Integer }\nfunction first(): Integer {\nlet p = Point { x: 10, y: 20 }\nreturn p.x + p.y\n}\nfunction second(q: Point): Integer {\nlet product = q.x * q.y\nq = Point { x: 1, y: 1 }\nreturn product + q.x\n}\nprint(first())\nprint(second(Point { x: 3, y: 4 }))\n", "30\n13\n")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_only_bounded_ownership_declares_the_stack_owner_runtime") {
+    let ctx = context(false)
+    let source = "function label(value: Integer): Text { let text = Text(value); return text }\nprint(label(7))\n"
+    let ir = generated(ctx, source)
+    for name in ["@minyar_rc_enter_stack_v1", "@minyar_rc_leave_stack_v1"] { test.check(!test.contains(ir, name), "unbounded compiler emitted stack ownership ABI") }
+    ctx.arguments = ["--bounded-owners", "2048"]
+    ir = generated(ctx, source)
+    for name in ["@minyar_rc_enter_stack_v1", "@minyar_rc_leave_stack_v1"] { test.check(test.contains(ir, "declare void " + name + "("), "bounded ownership missing stack ABI") }
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_executable_entry_is_not_an_ordinary_callable_function") {
+    let ctx = context(false)
+    rejects(ctx, "function main(): Integer { return main() }\n", "the executable entry main cannot be called")
+    rejects(ctx, "function main(): Integer { return 0 }\nfunction invoke(): Integer { return main() }\n", "the executable entry main cannot be called")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_imported_main_uses_the_language_calling_convention") {
+    let ctx = context(false)
+    writeTextFile(ctx.compiler.directory + "/entry-name.min", "public function main(): Integer { return 42 }\n")
+    executes(ctx, "use \"./entry-name.min\" as lib\nprint(lib.main())\n", "42\n")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_runtime_names_have_distinct_language_symbols") {
+    let ctx = context(false)
+    let names = ["minyar_fail_integer_overflow", "minyar_fail_integer_division", "minyar_print_integer", "minyar_list_get", "minyar_stack_enter", "minyar_rc_enter_stack_v1", "minyar_future_helper", "minyar_"]
+    let pieces: List<Text> = []
+    for name in names { pieces.add("function " + name + "(): Integer { return 42 }\n") }
+    for name in names { pieces.add("print(" + name + "())\n") }
+    let source = joinText(pieces)
+    let ir = generated(ctx, source)
+    for name in names { test.check(test.contains(ir, "define i64 @.minyar.fn." + name + "(") && !test.contains(ir, "define i64 @" + name + "("), "distinct runtime-named language symbol " + name) }
+    executes(ctx, source, "42\n42\n42\n42\n42\n42\n42\n42\n")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_imported_runtime_named_functions_are_safe") {
+    let ctx = context(false)
+    writeTextFile(ctx.compiler.directory + "/reserved.min", "public function minyar_fail_integer_overflow(): Integer { return 42 }\n")
+    executes(ctx, "use \"./reserved.min\" as lib\nprint(lib.minyar_fail_integer_overflow())\n", "42\n")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_package_names_keep_hyphens_and_underscores") {
+    let ctx = context(false)
+    let library = ctx.compiler.directory + "/library with spaces"
+    test.check(files.makeDirectory(library) == 0, "private package search directory")
+    ctx.arguments = ["--library", library]
+    for name in ["valid-name", "under_score", "a1"] {
+        writeTextFile(library + "/" + name + ".min", "public function answer(): Integer { return 42 }\n")
+        executes(ctx, "use \"" + name + "\" as package\nprint(package.answer())\n", "42\n")
+    }
+    for name in ["bad.name", "bad/name", "bad name"] { rejects(ctx, "use \"" + name + "\" as package\n", "package names use letters, digits, '-', and '_'") }
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_module_declarations_may_precede_imports") {
+    let ctx = context(false)
+    writeTextFile(ctx.compiler.directory + "/empty.min", "public function value(): Integer { return 1 }\n")
+    let declaration = "function answer(): Integer { return 42 }\n"
+    let imported = "use \"./empty.min\" as empty\n"
+    for source in [declaration + imported, imported + declaration] { executes(ctx, source + "print(answer() + empty.value())\n", "43\n") }
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_parent_imports_remain_relative_when_a_library_is_selected") {
+    let ctx = context(false)
+    let project = ctx.compiler.directory + "/project with spaces"
+    let nested = project + "/nested"
+    let library = ctx.compiler.directory + "/library with spaces"
+    for directory in [project, nested, library] { test.check(files.makeDirectory(directory) == 0, "nested relative import directory") }
+    writeTextFile(project + "/shared.min", "public function value(): Integer { return 42 }\n")
+    writeTextFile(nested + "/local.min", "public function value(): Integer { return 7 }\n")
+    writeTextFile(library + "/shared.min", "public function value(): Integer { return 13 }\n")
+    ctx.compiler.directory = nested
+    ctx.arguments = ["--library", library]
+    executes(ctx, "use \"../shared.min\" as parent\nuse \"./local.min\" as local\nuse \"shared\" as package\nprint(parent.value())\nprint(local.value())\nprint(package.value())\n", "42\n7\n13\n")
+    rejects(ctx, "use \".shared\" as invalid\n", "package names use letters, digits, '-', and '_'")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_character_literals_emit_scalar_constants") {
+    let ctx = context(false)
+    let ir = executes(ctx, "constant LETTER = 'é'\nprint(Integer('a'))\nprint(Integer(LETTER))\nprint(Integer('中'))\nprint(Integer('🙂'))\nprint(Integer('\\n'))\nprint(Integer('\\t'))\nprint(Integer('\\\\'))\n", "97\n233\n20013\n128578\n10\n9\n92\n")
+    test.check(!test.contains(ir, "call i32 @minyar_text_character_at"), "validated Character literals still perform runtime Text reads")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_hex_integer_boundaries_match_decimal_literals") {
+    let ctx = context(false)
+    executes(ctx, "constant LOW = -0x000000008000000000000000\nprint(0x7FFFFFFFFFFFFFFF)\nprint(-0x7FFFFFFFFFFFFFFF)\nprint(-0x8000000000000000)\nprint(LOW)\n", "9223372036854775807\n-9223372036854775807\n-9223372036854775808\n-9223372036854775808\n")
+    rejects(ctx, "print(0x8000000000000000)\n", "Integer literal is outside the supported range")
+    rejects(ctx, "print(-0x8000000000000001)\n", "Integer literal is outside the supported range")
+    rejects(ctx, "print(-0xFFFFFFFFFFFFFFFF)\n", "Integer literal is outside the supported range")
+    rejects(ctx, "print(-0x80000000000000000)\n", "Integer literal is outside the supported range")
+    rejects(ctx, "print(1 - 0x8000000000000000)\n", "Integer literal is outside the supported range")
+    rejects(ctx, "constant UNUSED = 0x8000000000000000\n", "Integer literal is outside the supported range")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_hex_literals_cannot_enter_the_decimal_float_parser") {
+    let ctx = context(false)
+    rejects(ctx, "print(0x1.5)\n", "hexadecimal literals are Integers and cannot have a decimal point")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_float_normalization_matches_independent_decimal_conversion") {
+    let ctx = context(false)
+    let lines: List<Text> = [
+        "print(02.400000e-256 == 2.39999999999999995e-256)\n",
+        "print(2.000000e85 == 2.00000000000000003e+85)\n",
+        "print(16723.00661103393996700e20 == 1.67230066110339404e+24)\n",
+        "print(0069198490200071.5156869850619060e87 == 6.91984902000715170e+100)\n",
+        "print(0000004285255415129.00e-310 == 4.28525541512900036e-298)\n",
+        "print(0006794835974.8377902288000e-168 == 6.79483597483779013e-159)\n",
+        "print(000078741.2427046060e215 == 7.87412427046060028e+219)\n",
+        "print(0838.3559403e15 == 8.38355940300000000e+17)\n",
+        "print(0000000483973607797043505.830000000e-254 == 4.83973607797043533e-237)\n",
+        "print(000000005350.9116200877800e54 == 5.35091162008778007e+57)\n",
+        "print(000058115.3400e-184 == 5.81153400000000001e-180)\n",
+        "print(1154277130.0e26 == 1.15427712999999998e+35)\n",
+        "print(0000562860236833.77094837141900000e-16 == 5.62860236833770939e-05)\n",
+        "print(00000000173776112432.94405000000e-328 == 1.73776128601674955e-317)\n",
+        "print(000000020051891737370.610000e-104 == 2.00518917373706097e-91)\n",
+        "print(55622.906800000000e192 == 5.56229068000000018e+196)\n",
+        "print(000000196148955.036385283000000e-163 == 1.96148955036385293e-155)\n",
+        "print(06.035010000000e172 == 6.03501000000000013e+172)\n",
+        "print(00000045850825439908166180020529.00e202 == 4.58508254399081661e+227)\n",
+        "print(000076.29e99 == 7.62899999999999988e+100)\n",
+        "print(082547728.80800000e86 == 8.25477288080000021e+93)\n",
+        "print(0853.965000e99 == 8.53964999999999993e+101)\n",
+        "print(00000000452005307926131405.5576133109e-263 == 4.52005307926131410e-246)\n",
+        "print(000009.0000000e53 == 9.00000000000000036e+53)\n",
+        "print(00264.36614843300000000e-21 == 2.64366148432999982e-19)\n",
+        "print(0000001.4000e-151 == 1.40000000000000005e-151)\n",
+        "print(0254111103301.190e18 == 2.54111103301190010e+29)\n",
+        "print(079258205392.7771247894500000000e-314 == 7.92582053927771214e-304)\n",
+        "print(00022278836.60000e168 == 2.22788365999999998e+175)\n",
+        "print(0000004.0000e-271 == 3.99999999999999985e-271)\n",
+        "print(0009.69715466060772000e-44 == 9.69715466060772063e-44)\n",
+        "print(000063553.80761000000e160 == 6.35538076100000013e+164)\n",
+        "print(0004.560e-196 == 4.56000000000000034e-196)\n",
+        "print(00050177.376729416220000e255 == 5.01773767294162170e+259)\n",
+        "print(00082.415000000e-73 == 8.24149999999999978e-72)\n",
+        "print(000004796047776363.99600000e-226 == 4.79604777636399567e-214)\n",
+        "print(000000086596921865863507.6515610000000e12 == 8.65969218658635129e+28)\n",
+        "print(000000060.320233000e168 == 6.03202330000000013e+169)\n",
+        "print(00755672437226210282082.901676600000e-108 == 7.55672437226210266e-88)\n",
+        "print(00000045438710491335964759605675386.00000000e-299 == 4.54387104913359652e-271)\n",
+        "print(0005934964342.1000000e152 == 5.93496434209999987e+161)\n",
+        "print(0000060336.930000e269 == 6.03369299999999990e+273)\n",
+        "print(759.06000e-34 == 7.59060000000000021e-32)\n",
+        "print(000379446463.24485000000e155 == 3.79446463244849978e+163)\n",
+        "print(000004.20750000e-233 == 4.20749999999999997e-233)\n",
+        "print(0471933510945809.362199000e160 == 4.71933510945809376e+174)\n",
+        "print(0000997269.42815000000e-68 == 9.97269428150000070e-63)\n",
+        "print(049877857.04794732810960100000e167 == 4.98778570479473272e+174)\n",
+        "print(000089.400e74 == 8.94000000000000050e+75)\n",
+        "print(00000062389811947.67476878440700e-202 == 6.23898119476747694e-192)\n",
+        "print(00086703245784.155410e173 == 8.67032457841554059e+183)\n",
+        "print(000000049.2566679400e-66 == 4.92566679400000029e-65)\n",
+        "print(003840314673649108.94443140000000e17 == 3.84031467364910905e+32)\n",
+        "print(00048.09700e140 == 4.80970000000000031e+141)\n",
+        "print(0031674.98670900000000e-14 == 3.16749867090000016e-10)\n",
+        "print(0000237268377076.185630000000e-122 == 2.37268377076185647e-111)\n",
+        "print(02577075.569837025626666673800e230 == 2.57707556983702574e+236)\n",
+        "print(0255958679.396574e-127 == 2.55958679396573992e-119)\n",
+        "print(000000873267887698483131860.09891824e-246 == 8.73267887698483091e-226)\n",
+        "print(7100792.350620e-249 == 7.10079235062000006e-243)\n",
+        "print(00050121.92277167664000000e-246 == 5.01219227716766368e-242)\n",
+        "print(00000035414.1600e262 == 3.54141599999999997e+266)\n",
+        "print(0088162405409428.5580000000e149 == 8.81624054094285622e+162)\n",
+        "print(0000000026.000e-278 == 2.60000000000000025e-277)\n"
+    ]
+    test.check(lines.length == 64, "float normalization exact seed domain")
+    executes(ctx, joinText(lines), "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n")
+    executes(ctx, "print(-0.0)\nprint(0.0e999999999999999999999)\n", "-0.0\n0.0\n")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_large_float_mantissas_keep_their_exponent") {
+    let ctx = context(false)
+    let zeros: List<Text> = []
+    for index in 0..100010 { zeros.add("0") }
+    executes(ctx, "print(0." + joinText(zeros) + "1e100011)\n", "1.0\n")
+    rejects(ctx, "print(0." + joinText(zeros) + "1e100400)\n", "Float literal is larger than the largest Float")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_float_literals_reject_the_exact_overflow_boundary") {
+    let ctx = context(false)
+    rejects(ctx, "print(1.8e308)\n", "Float literal is larger than the largest Float")
+    rejects(ctx, "print(-1.8e308)\n", "Float literal is larger than the largest Float")
+    rejects(ctx, "print(1.7976931348623159e308)\n", "Float literal is larger than the largest Float")
+    rejects(ctx, "print(179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497792.0)\n", "Float literal is larger than the largest Float")
+    executes(ctx, "print(1.7976931348623158e308 == 1.7976931348623157e308)\n", "true\n")
+    executes(ctx, "print(179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497791.0 == 1.7976931348623157e308)\n", "true\n")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_wrapped_calls_and_lists_need_no_trailing_comma") {
+    let ctx = context(false)
+    executes(ctx, "function add(\nleft: Integer,\nright: Integer\n): Integer { return left + right }\nlet values = [\nadd(\n20,\n22\n),\n(\n3 +\n4\n)\n]\nprint(values[\n0\n])\nprint(values[1])\n", "42\n7\n")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_else_if_can_follow_a_newline") {
+    let ctx = context(false)
+    executes(ctx, "function category(value: Integer): Integer {\nif value < 0 { return 1 }\n// A branch may continue after whitespace and comments.\nelse if value == 0 { return 2 }\nelse { return 3 }\n}\nif false { print(0) }\nprint(category(-1))\nprint(category(0))\nprint(category(1))\n", "1\n2\n3\n")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_unused_constants_validate_their_literals") {
+    let ctx = context(false)
+    rejects(ctx, "constant UNUSED = 9223372036854775808\nprint(42)\n", "Integer literal is outside the supported range")
+    rejects(ctx, "constant UNUSED = -9223372036854775809\nprint(42)\n", "Integer literal is outside the supported range")
+    rejects(ctx, "constant UNUSED = 1.0e309\nprint(42)\n", "Float literal is larger than the largest Float")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_native_library_names_cannot_inject_llvm") {
+    let ctx = context(false)
+    rejects(ctx, "function draw() { native \"\" }\n", "native library names must use ASCII letters, digits, and")
+    rejects(ctx, "function draw() { native \"../graphics\" }\n", "native library names must use ASCII letters, digits, and")
+    rejects(ctx, "function draw() { native \"bad-name\" }\n", "native library names must use ASCII letters, digits, and")
+    rejects(ctx, "function draw() { native \"bad|name\" }\n", "native library names must use ASCII letters, digits, and")
+    rejects(ctx, "function draw() { native \"bad\\nname\" }\n", "native library names must use ASCII letters, digits, and")
+    rejects(ctx, ("function draw() { native \"bad" + Text(Character(0)) + "name\" }\n"), "native library names must use ASCII letters, digits, and")
+    rejects(ctx, "function draw() { native \"é\" }\n", "native library names must use ASCII letters, digits, and")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_native_must_be_the_entire_function_body") {
+    let ctx = context(false)
+    rejects(ctx, "function draw() { print(1); native \"graphics\" }\n", "native must be the only statement in its function")
+    rejects(ctx, "function draw() { native \"graphics\"; print(1) }\n", "native must be the only statement in its function")
+    rejects(ctx, "function draw() { if true { native \"graphics\" } }\n", "native must be the only statement in its function")
+    rejects(ctx, "function draw() { if true {} else { native \"graphics\" } }\n", "native must be the only statement in its function")
+    rejects(ctx, "function draw() { while true { native \"graphics\" } }\n", "native must be the only statement in its function")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_valid_native_signature") {
+    let ctx = context(false)
+    let ir = generated(ctx, "function draw(value: Float, ready: Boolean): Boolean {\nnative \"graphics\"\n}\n")
+    test.check(test.contains(ir, "declare zeroext i1 @minyar_graphics_draw(double, i1 zeroext)"), "native Boolean argument/result ABI")
+    test.check(test.contains(ir, "; minyar-native-library: graphics"), "native graphics library metadata")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_native_bindings_cannot_redeclare_any_emitted_runtime_symbol") {
+    let ctx = context(false)
+    rejects(ctx, "function enter(): Integer { native \"rc\" }\n", "native symbol conflicts with a runtime function")
+    rejects(ctx, "function enter(value: Integer) { native \"rc\" }\n", "native symbol conflicts with a runtime function")
+    rejects(ctx, "function enter() { native \"stack\" }\n", "native symbol conflicts with a runtime function")
+    rejects(ctx, "function integer(value: Integer) { native \"print\" }\n", "native symbol conflicts with a runtime function")
+    rejects(ctx, "function length(value: Bytes): Integer { native \"bytes\" }\n", "native symbol conflicts with a runtime function")
+    rejects(ctx, "function division(value: Integer) { native \"fail_integer\" }\n", "native symbol conflicts with a runtime function")
+    rejects(ctx, "function overflow() { native \"fail_integer\" }\n", "native symbol conflicts with a runtime function")
+    ctx.arguments = ["--bounded-owners", "2048"]
+    rejects(ctx, "function enter_stack_v1(slots: Text, frame: Text, count: Integer) { native \"rc\" }\n", "native symbol conflicts with a runtime function")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_imported_runtime_native_bindings_fail_direct_and_module_fallback") {
+    let ctx = context(false)
+    let modules = test.setting("MINYAR_TEST_MODULE_COMPILER", "./build/minyarc-modules")
+    for declaration in ["function enter(): Integer { native \"rc\" }", "function enter(value: Integer) { native \"rc\" }", "function division(value: Integer) { native \"fail_integer\" }"] {
+        writeTextFile(ctx.compiler.directory + "/collision.min", "public " + declaration + "\n")
+        let entry = ctx.compiler.directory + "/entry.min"
+        writeTextFile(entry, "use \"./collision.min\" as collision\n")
+        for compiler in [ctx.compiler.executable, modules] {
+            let llvm = ctx.compiler.directory + "/collision.ll"
+            let prior = ctx.compiler.directory + "/prior.state"
+            writeTextFile(prior, "")
+            let command = [compiler, entry, llvm]
+            if compiler != ctx.compiler.executable { for option in ["--module-state", prior, ctx.compiler.directory + "/next.state", ctx.compiler.directory + "/stats"] { command.add(option) } }
+            let result = test.run(command, system.environment(), "", ctx.compiler.directory + "/collision-build", 30)
+            test.check(result.status == 1, "imported native collision rejection status")
+            test.check(test.contains(result.errorOutput, "native symbol conflicts with a runtime function"), "imported native collision diagnostic")
+            test.check(files.pathSize(llvm) < 0, "invalid native ABI left LLVM output behind")
+        }
+    }
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_conflicting_native_signatures_are_rejected_before_llvm") {
+    let ctx = context(false)
+    writeTextFile(ctx.compiler.directory + "/integer.min", "public function sample(value: Integer): Integer { native \"graphics\" }\n")
+    writeTextFile(ctx.compiler.directory + "/float.min", "public function sample(value: Float): Float { native \"graphics\" }\n")
+    rejects(ctx, "use \"./integer.min\" as integer\nuse \"./float.min\" as float\n", "native symbol has conflicting function signatures")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_native_symbols_are_distinct_from_language_names") {
+    let ctx = context(false)
+    let ir = generated(ctx, "function sample(): Integer { native \"graphics\" }\nfunction minyar_graphics_sample(): Integer { return 42 }\n")
+    test.check(test.contains(ir, "declare i64 @minyar_graphics_sample()"), "distinct native/language symbol")
+    test.check(test.contains(ir, "define i64 @.minyar.fn.sample()"), "distinct native/language symbol")
+    test.check(test.contains(ir, "define i64 @.minyar.fn.minyar_graphics_sample()"), "distinct native/language symbol")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_module_constant_shadowing_matches_single_module") {
+    let ctx = context(false)
+    writeTextFile(ctx.compiler.directory + "/empty.min", "public constant SENTINEL = 0\n")
+    let source = "constant VALUE = 99\nfunction typed(VALUE: Integer): Integer { return VALUE }\nlet VALUE: Integer = 7\nprint(VALUE)\nprint(typed(12))\n"
+    executes(ctx, source, "7\n12\n")
+    executes(ctx, "use \"./empty.min\" as empty\n" + source, "7\n12\n")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_compound_assignment_captures_targets_before_side_effects") {
+    let ctx = context(false)
+    executes(ctx, "record Cell { number: Float; label: Text; bytes: Bytes }\nrecord Holder { cell: Cell }\nfunction replacement(holder: Holder): Float {\nholder.cell = Cell { number: 99.0; label: \"new\"; bytes: Bytes(1) }\nreturn 2.5\n}\nfunction replacementText(holder: Holder): Text {\nholder.cell = Cell { number: 88.0; label: \"latest\"; bytes: Bytes(1) }\nreturn \"!\"\n}\nfunction position(holder: Holder, visits: List<Integer>): Integer {\nvisits[0] += 1\nholder.cell = Cell { number: 77.0; label: \"bytes\"; bytes: Bytes(1) }\nreturn 0\n}\nlet holder = Holder { cell: Cell { number: 1.5; label: \"old\"; bytes: Bytes(1) } }\nholder.cell.number += replacement(holder)\nprint(holder.cell.number)\nholder.cell.label += replacementText(holder)\nprint(holder.cell.label)\nlet visits = [0]\nholder.cell.bytes[position(holder, visits)] += 1\nprint(holder.cell.bytes[0])\nprint(visits[0])\nlet values = [1.25]\nvalues[0] *= 4.0\nprint(values[0])\n", "99.0\nlatest\n0\n1\n5.0\n")
+    test.removeTree(ctx.root)
+}
+if selected("CompilerHardening", "test_constant_boundaries_and_else_if") {
+    let ctx = context(false)
+    executes(ctx, "constant LOW = -9223372036854775808\nconstant HIGH = 9223372036854775807\nconstant SMALL: Float = -0.25\nconstant WORD = \"é\"\nfunction category(value: Integer): Text {\nif value < 0 { return \"negative\" } else if value == 0 { return WORD } else { return \"positive\" }\n}\nprint(LOW)\nprint(HIGH)\nprint(SMALL)\nprint(category(-1))\nprint(category(0))\nprint(category(1))\n", "-9223372036854775808\n9223372036854775807\n-0.25\nnegative\né\npositive\n")
+    test.removeTree(ctx.root)
+}
+if selected("BootstrapHardening", "test_bootstrap_wrapping_and_else_if_match_the_language") {
+    let ctx = context(true)
+    executes(ctx, "function category(\nvalue: Integer\n): Integer {\nif value < 0 { return 1 }\nelse if value == 0 { return 2 }\nelse { return 3 }\n}\nfunction main() {\nprint(category(\n0\n))\nreturn 0\n}\n", "2\n")
+    test.removeTree(ctx.root)
+}
+if selected("BootstrapHardening", "test_bootstrap_entry_is_not_an_ordinary_callable_function") {
+    let ctx = context(true)
+    rejects(ctx, "function main(): Integer { return main() }\n", "the executable entry main cannot be called")
+    rejects(ctx, "function main(): Integer { return 0 }\nfunction invoke(): Integer { return main() }\n", "the executable entry main cannot be called")
+    test.removeTree(ctx.root)
+}
+if selected("BootstrapHardening", "test_bootstrap_checked_character_conversion") {
+    let ctx = context(true)
+    executes(ctx, "function main() {\nprint(Character(128578))\nreturn 0\n}\n", "🙂\n")
+    rejects(ctx, "function main() {\nprint(Character())\nreturn 0\n}\n", "Character expects exactly one Integer code point")
+    rejects(ctx, "function main() {\nprint(Character(\"text\"))\nreturn 0\n}\n", "a Character code point needs Integer")
+    test.removeTree(ctx.root)
+}
+if selected("BootstrapHardening", "test_bootstrap_integer_accepts_character_code_points") {
+    let ctx = context(true)
+    executes(ctx, "function main() {\nprint(Integer('a'))\nprint(Integer(Character(128578)))\nprint(Integer(42))\nreturn 0\n}\n", "97\n128578\n42\n")
+    rejects(ctx, "function main() {\nprint(Integer())\nreturn 0\n}\n", "Integer expects exactly one Integer, Character, or Text value")
+    rejects(ctx, "function main() {\nprint(Integer(true))\nreturn 0\n}\n", "Integer expects an Integer, Character, or Text value")
+    test.removeTree(ctx.root)
+}
+print("Compiler and bootstrap hardening contracts: passed")

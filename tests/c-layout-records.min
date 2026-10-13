@@ -1,0 +1,411 @@
+use "../tools/testing.min" as test
+use "../tools/test-runtime.min" as runtime
+use "system" as system
+use "files" as files
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+function selected(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "CLayoutRecords." + name { return true } }
+    return false
+}
+function split(source: Text, delimiter: Integer): List<Text> {
+    let parts: List<Text> = []
+    let raw = Bytes(source)
+    let start = 0
+    for index in 0..(raw.length + 1) {
+        if index == raw.length { parts.add(Text(raw.slice(start, index))) }
+        else if raw[index] == delimiter { parts.add(Text(raw.slice(start, index))); start = index + 1 }
+    }
+    return parts
+}
+function shellWords(source: Text): List<Text> {
+    let words: List<Text> = []
+    let raw = Bytes(source)
+    let current = Bytes(0)
+    let quote = 0
+    let active = false
+    let index = 0
+    while index < raw.length {
+        let byte = raw[index]
+        if quote == 39 {
+            if byte == 39 { quote = 0 } else { current.add(byte) }
+        } else if quote == 34 {
+            if byte == 34 { quote = 0 }
+            else if byte == 92 && index + 1 < raw.length && (raw[index + 1] == 34 || raw[index + 1] == 92) { index += 1; current.add(raw[index]) }
+            else { current.add(byte) }
+        } else if byte == 39 || byte == 34 { quote = byte; active = true }
+        else if byte == 92 { test.check(index + 1 < raw.length, "unterminated quoted flag"); index += 1; current.add(raw[index]); active = true }
+        else if byte == 32 || byte == 9 || byte == 10 || byte == 13 {
+            if active { words.add(Text(current)); current = Bytes(0); active = false }
+        } else { current.add(byte); active = true }
+        index += 1
+    }
+    test.check(quote == 0, "unterminated quoted flag")
+    if active { words.add(Text(current)) }
+    return words
+}
+function joinFlags(flags: List<Text>): Text {
+    let parts: List<Text> = []
+    for index in 0..flags.length {
+        if index > 0 { parts.add(" ") }
+        parts.add("'" + test.replace(flags[index], "'", "'\\''") + "'")
+    }
+    return joinText(parts)
+}
+function decimal(source: Text): Integer {
+    let raw = Bytes(source)
+    test.check(raw.length > 0, "empty C ABI integer")
+    for byte in raw { test.check(byte >= 48 && byte <= 57, "invalid C ABI integer") }
+    return Integer(source)
+}
+record Field { kind: Integer; offset: Integer; width: Integer }
+record Layout { key: Integer; mode: Integer; size: Integer; alignment: Integer; fields: List<Field>; state: Integer }
+record Call { name: Text; signature: List<Text> }
+record Bridge { layouts: List<Layout>; calls: List<Call>; pieces: List<Text> }
+function scalar(kind: Integer): Text {
+    let names = ["", "int8_t", "uint8_t", "int16_t", "uint16_t", "int32_t", "uint32_t", "int64_t", "uint64_t", "float", "double", "bool", "uint32_t"]
+    test.check(kind >= 1 && kind <= 12, "invalid C-layout scalar representation")
+    return names[kind]
+}
+function recordSource(bridge: Bridge, key: Integer) {
+    let index = -1
+    for position in 0..bridge.layouts.length { if bridge.layouts[position].key == key { index = position } }
+    test.check(index >= 0, "missing inline C-layout record dependency")
+    let layout = bridge.layouts[index]
+    if layout.state == 2 { return }
+    test.check(layout.state == 0, "recursive inline C-layout record dependency")
+    layout.state = 1
+    for field in layout.fields { if field.kind >= 1000 { recordSource(bridge, field.kind - 1000) } }
+    let name = "minyar_c_record_" + Text(key)
+    let packed = ""
+    if layout.mode == 2 { packed = " __attribute__((packed))" }
+    bridge.pieces.add("struct" + packed + " " + name + " {\n")
+    for position in 0..layout.fields.length {
+        let field = layout.fields[position]
+        let declaration = ""
+        if field.kind == 0 { declaration = "unsigned char field" + Text(position) + "[" + Text(field.width) + "]" }
+        else if field.kind >= 1000 { declaration = "struct minyar_c_record_" + Text(field.kind - 1000) + " field" + Text(position) }
+        else { declaration = scalar(field.kind) + " field" + Text(position) }
+        bridge.pieces.add(declaration + ";\n")
+    }
+    bridge.pieces.add("};\n_Static_assert(sizeof(struct " + name + ") == " + Text(layout.size) + ", \"C-layout size mismatch\");\n")
+    bridge.pieces.add("_Static_assert(_Alignof(struct " + name + ") == " + Text(layout.alignment) + ", \"C-layout alignment mismatch\");\n")
+    for position in 0..layout.fields.length { bridge.pieces.add("_Static_assert(offsetof(struct " + name + ", field" + Text(position) + ") == " + Text(layout.fields[position].offset) + ", \"C-layout offset mismatch\");\n") }
+    layout.state = 2
+}
+function valueType(bridge: Bridge, kind: Text): Text {
+    if starts(kind, "C") {
+        let key = decimal(Text(Bytes(kind).slice(1, Bytes(kind).length)))
+        recordSource(bridge, key)
+        return "struct minyar_c_record_" + Text(key)
+    }
+    if kind == "1" { return "long long" }
+    if kind == "3" { return "uint32_t" }
+    if kind == "4" { return "bool" }
+    if kind == "5" { return "void" }
+    if kind == "7" { return "double" }
+    test.check(kind == "p", "invalid C native value type")
+    return "void *"
+}
+function bridgeSource(ir: Text): Text {
+    let bridge = Bridge { layouts: []; calls: []; pieces: ["#include <stdint.h>\n#include <stddef.h>\n#include <stdbool.h>\n#include <string.h>\n", "extern void *minyar_c_record_copy(const void *, long long);\n"] }
+    for line in test.lines(ir) {
+        if starts(line, "; minyar-c-layout: ") {
+            let parts = split(Text(Bytes(line).slice(Bytes("; minyar-c-layout: ").length, Bytes(line).length)), 124)
+            test.check(parts.length >= 5, "invalid C-layout ABI metadata")
+            let fields: List<Field> = []
+            let key = decimal(parts[0]); let mode = decimal(parts[1]); let size = decimal(parts[2]); let alignment = decimal(parts[3])
+            test.check((mode == 1 || mode == 2) && size > 0 && (alignment == 1 || alignment == 2 || alignment == 4 || alignment == 8), "invalid C-layout ABI fields")
+            for index in 4..parts.length {
+                let values = split(parts[index], 44)
+                test.check(values.length == 3, "invalid C-layout field tuple")
+                let field = Field { kind: decimal(values[0]); offset: decimal(values[1]); width: decimal(values[2]) }
+                test.check(field.width > 0 && field.offset + field.width <= size, "invalid C-layout field bounds")
+                fields.add(field)
+            }
+            let duplicate = false
+            for layout in bridge.layouts {
+                if layout.key == key {
+                    duplicate = true
+                    test.check(layout.mode == mode && layout.size == size && layout.alignment == alignment && layout.fields.length == fields.length, "conflicting C-layout metadata")
+                    for index in 0..fields.length { test.check(layout.fields[index].kind == fields[index].kind && layout.fields[index].offset == fields[index].offset && layout.fields[index].width == fields[index].width, "conflicting C-layout field metadata") }
+                }
+            }
+            if !duplicate { bridge.layouts.add(Layout { key: key; mode: mode; size: size; alignment: alignment; fields: fields; state: 0 }) }
+        } else if starts(line, "; minyar-c-value: ") {
+            let parts = split(Text(Bytes(line).slice(Bytes("; minyar-c-value: ").length, Bytes(line).length)), 124)
+            test.check(parts.length >= 2 && starts(parts[0], "minyar_") && Bytes(parts[0]).length > 7, "invalid C native signature")
+            let raw = Bytes(parts[0])
+            for index in 7..raw.length { let byte = raw[index]; test.check((byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95, "invalid C native symbol") }
+            let signature: List<Text> = []
+            for index in 1..parts.length {
+                let kind = parts[index]
+                if starts(kind, "C") { decimal(Text(Bytes(kind).slice(1, Bytes(kind).length))) }
+                else { test.check(kind == "1" || kind == "3" || kind == "4" || kind == "5" || kind == "7" || kind == "p", "invalid C native signature type") }
+                test.check(index == 1 || kind != "5", "Nothing cannot be a C ABI parameter")
+                signature.add(kind)
+            }
+            let duplicate = false
+            for call in bridge.calls {
+                if call.name == parts[0] {
+                    duplicate = true
+                    test.check(call.signature.length == signature.length, "conflicting C native signatures")
+                    for index in 0..signature.length { test.check(call.signature[index] == signature[index], "conflicting C native signature type") }
+                }
+            }
+            if !duplicate { bridge.calls.add(Call { name: parts[0]; signature: signature }) }
+        }
+    }
+    if bridge.calls.length == 0 { return "" }
+    let names: List<Text> = []
+    for call in bridge.calls { names.add(call.name) }
+    names.sort()
+    for name in names {
+        let index = -1
+        for position in 0..bridge.calls.length { if bridge.calls[position].name == name { index = position } }
+        let call = bridge.calls[index]
+        let result = call.signature[0]
+        let returnType = valueType(bridge, result)
+        let types: List<Text> = []
+        for position in 1..call.signature.length { types.add(valueType(bridge, call.signature[position])) }
+        let arguments: List<Text> = []
+        let parameters: List<Text> = []
+        let values: List<Text> = []
+        for position in 0..types.length {
+            if position > 0 { arguments.add(", "); parameters.add(", "); values.add(", ") }
+            parameters.add(types[position])
+            if starts(call.signature[position + 1], "C") { arguments.add("const void *argument" + Text(position)); values.add("value" + Text(position)) }
+            else { arguments.add(types[position] + " argument" + Text(position)); values.add("argument" + Text(position)) }
+        }
+        if types.length == 0 { parameters.add("void"); arguments.add("void") }
+        bridge.pieces.add("extern " + returnType + " " + call.name + "(" + joinText(parameters) + ");\n")
+        let bridgeReturn = returnType
+        if starts(result, "C") { bridgeReturn = "void *" }
+        bridge.pieces.add(bridgeReturn + " minyar_c_value_" + call.name + "(" + joinText(arguments) + ") {\n")
+        for position in 0..types.length {
+            if starts(call.signature[position + 1], "C") { bridge.pieces.add(types[position] + " value" + Text(position) + ";\nmemcpy(&value" + Text(position) + ", argument" + Text(position) + ", sizeof(value" + Text(position) + "));\n") }
+        }
+        let invocation = call.name + "(" + joinText(values) + ")"
+        if starts(result, "C") { bridge.pieces.add(returnType + " value = " + invocation + ";\nreturn minyar_c_record_copy(&value, sizeof(value));\n") }
+        else if result == "5" { bridge.pieces.add(invocation + ";\n") }
+        else { bridge.pieces.add("return " + invocation + ";\n") }
+        bridge.pieces.add("}\n")
+    }
+    return joinText(bridge.pieces)
+}
+record Context { compiler: test.Compiler; target: List<Text>; runner: List<Text>; control: Text; root: Text }
+function compile(context: Context, source: Text): test.Result {
+    let compiler = context.compiler
+    compiler.serial += 1
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    writeTextFile(path + ".min", source)
+    return test.run([compiler.executable, path + ".min", path + ".ll", "--library", context.root + "/library"], system.environment(), "", path + ".compile", 60)
+}
+function executes(context: Context, source: Text, expected: Text, status: Integer, diagnostic: Text) {
+    test.require(compile(context, source), "compile C-layout source")
+    let compiler = context.compiler
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    let raw = readTextFile(path + ".ll")
+    let generated = bridgeSource(raw)
+    let objects = [context.control]
+    if generated != "" {
+        writeTextFile(path + "-bridge.c", generated)
+        let command = [compiler.clang]
+        for flag in context.target { command.add(flag) }
+        command.add("-O2")
+        for flag in compiler.flags { command.add(flag) }
+        for item in ["-Wno-unused-command-line-argument", "-c", path + "-bridge.c", "-o", path + "-bridge.o"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".bridge", 180), "compile aggregate native adapter")
+        objects.add(path + "-bridge.o")
+    }
+    let object = compiler.runtime
+    if test.contains(raw, "; minyar-callback-runtime:") || test.contains(raw, "; minyar-cycle-runtime:") {
+        let engine = runtime.cycleSource(readTextFile("runtime/minyar_runtime.c"))
+        writeTextFile(path + "-graph.c", test.replace(readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", engine))
+        object = path + "-graph.o"
+        let command = [compiler.clang]
+        for flag in context.target { command.add(flag) }
+        command.add("-O2")
+        for flag in compiler.flags { command.add(flag) }
+        for item in ["-DMINYAR_SYSTEM_HEAP=1", "-iquote", context.root + "/runtime", "-c", path + "-graph.c", "-o", object] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".graph", 180), "compile C-layout exact graph ownership")
+    }
+    if test.addressEnabled(compiler.flags) { writeTextFile(path + ".ll", test.instrument(raw)) }
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang]
+        for flag in context.target { command.add(flag) }
+        command.add(optimization)
+        for flag in compiler.flags { command.add(flag) }
+        for item in ["-Wno-override-module", path + ".ll", object] { command.add(item) }
+        for item in objects { command.add(item) }
+        for item in ["-lm", "-o", path + ".exe"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".link", 180), "link C-layout " + optimization)
+        command = []
+        for item in context.runner { command.add(item) }
+        command.add(path + ".exe")
+        let result = test.run(command, system.environment(), "", path + ".run", 30)
+        test.check(result.status == status && result.output == expected && result.errorOutput == diagnostic, "C-layout " + optimization + "\n" + result.output + result.errorOutput)
+    }
+}
+let compiler = test.compiler()
+compiler.flags = shellWords(test.setting("MINYAR_TEST_LINK_FLAGS", ""))
+let rootResult = test.run(["pwd", "-P"], system.environment(), "", compiler.directory + "/root", 10)
+test.require(rootResult, "resolve C-layout package root")
+let root = test.lines(rootResult.output)[0]
+let context = Context { compiler: compiler; target: shellWords(test.setting("MINYAR_C_LAYOUT_TARGET_FLAGS", "")); runner: shellWords(test.setting("MINYAR_C_LAYOUT_RUNNER", "")); control: compiler.directory + "/control.o"; root: root }
+let control = [compiler.clang]
+for flag in context.target { control.add(flag) }
+control.add("-O2")
+for flag in compiler.flags { control.add(flag) }
+for item in ["-Wno-unused-command-line-argument", "-c", "-I", root + "/runtime", root + "/tests/c-layout-records.c", "-o", context.control] { control.add(item) }
+test.require(test.run(control, system.environment(), "", compiler.directory + "/control-build", 180), "build actual C-layout control provider")
+let allowed = ["test_native_package_driver_builds_and_reuses_aggregate_adapters", "test_storage_owner_counts_and_nested_cleanup", "test_c_fields_padding_pointer_calls_and_return_copy", "test_all_integer_widths_pointer_character_and_aliases", "test_by_value_integer_sse_hfa_memory_and_register_pressure", "test_by_value_packed_large_and_nested_results", "test_packed_epoll_layout", "test_nested_views_survive_scope_and_write_through", "test_external_address_is_borrowed", "test_pin_rejects_growth_and_regrowth_after_shrink", "test_native_append_cannot_move_pinned_storage", "test_bounds_integer_width_null_return_and_alignment_diagnostics", "test_managed_holders_callbacks_and_results_keep_C_owners", "test_recovery_preserves_pointer_and_value_native_ownership", "test_native_layout_past_the_first_thousand_nominal_types", "test_ordinary_functions_can_use_layout_builtin_names", "test_invalid_layouts_and_managed_record_diagnostics"]
+for index in 0..argumentCount() {
+    let valid = false
+    for name in allowed { if argument(index) == name || argument(index) == "CLayoutRecords." + name { valid = true } }
+    test.check(valid, "unknown C-layout case " + argument(index))
+}
+if selected("test_c_fields_padding_pointer_calls_and_return_copy") {
+    executes(context, "record Mixed native \"c\" {\n    tag: UInt8; delta: Int16; count: UInt32; mask: UInt64\n    narrow: Float32; wide: Float64; enabled: Boolean; bytes: Bytes[3]\n}\nfunction verify(value: Mixed): Integer { native \"layout\" }\nfunction echo(value: Mixed): Mixed { native \"layout\" }\nlet bytes = Bytes(3)\nbytes[0] = 7; bytes[1] = 8; bytes[2] = 9\nlet value = Mixed { tag: 255; delta: -32768; count: 4294967295; mask: -1\n    narrow: 1.25; wide: -3.5; enabled: true; bytes: bytes }\nprint(sizeOf(Mixed)); print(alignOf(Mixed)); print(offsetOf(Mixed, \"wide\"))\nprint(verify(value)); print(value.delta); print(value.count)\nlet copied = echo(value)\nvalue.count = 10\nprint(copied.count); print(copied.mask); print(copied.narrow); print(copied.enabled)\n", "40\n8\n24\n1\n32767\n42\n42\n-1\n1.25\ntrue\n", 0, "")
+}
+if selected("test_all_integer_widths_pointer_character_and_aliases") {
+    executes(context, "record Widths native \"c\" {\n    s8: Int8; u8: UInt8; s16: Int16; u16: UInt16; s32: Int32; u32: UInt32\n    s64: Int64; u64: UInt64; pointer: Pointer; integer: Integer; floating: Float; character: Character\n}\nfunction widths(value: Widths): Integer { native \"layout\" }\nfunction widthsSize(): Integer { native \"layout\" }\nlet value = Widths { s8: -128; u8: 255; s16: -32768; u16: 65535; s32: -2147483648\n    u32: 4294967295; s64: -9223372036854775808; u64: -1; pointer: 0; integer: 42\n    floating: 1.5; character: '🙂' }\nprint(sizeOf(Widths) == widthsSize()); print(widths(value))\nprint(value.s8); print(value.s16); print(value.s32); print(value.s64); print(value.character)\n", "true\n1\n127\n32767\n2147483647\n-9223372036854775808\n🙂\n", 0, "")
+}
+if selected("test_by_value_integer_sse_hfa_memory_and_register_pressure") {
+    executes(context, "record Pair native \"c\" { bits: UInt64; value: Float64 }\nrecord HFA native \"c\" { x: Float64; y: Float64; z: Float64 }\nrecord FloatHFA native \"c\" { x: Float32; y: Float32; z: Float32; w: Float32 }\nrecord IntPair native \"c\" { first: Int64; second: Int64 }\nfunction pair(value: Pair, add: Integer, scale: Float): Pair { native \"layout\" value }\nfunction hfa(value: HFA): HFA { native \"layout\" value }\nfunction floatHfa(value: FloatHFA): FloatHFA { native \"layout\" value }\nfunction many(a: Integer, b: Integer, c: Integer, d: Integer, e: Integer, f: Integer,\n    value: IntPair, g: Integer, h: Integer): IntPair { native \"layout\" value }\nfunction zero(): Pair { native \"layout\" value }\nlet original = Pair { bits: -1; value: 2.5 }\nlet shifted = pair(original, 3, 2.0)\nprint(shifted.bits); print(shifted.value); print(original.bits); print(original.value)\nlet floats = hfa(HFA { x: 1.0; y: 2.0; z: 3.0 })\nprint(floats.x); print(floats.y); print(floats.z)\nlet singles = floatHfa(FloatHFA { x: 1.0; y: 2.0; z: 3.0; w: 4.0 })\nprint(singles.x); print(singles.y); print(singles.z); print(singles.w)\nlet integers = many(1, 2, 3, 4, 5, 6, IntPair { first: 10; second: 20 }, 7, 8)\nprint(integers.first); print(integers.second)\nlet returned = zero()\nprint(returned.bits); print(returned.value)\nlet unaligned = cView(Pair, Bytes(17), 1)\nunaligned.bits = 40; unaligned.value = 1.5\nlet aligned = pair(unaligned, 2, 2.0)\nprint(aligned.bits); print(aligned.value)\n", "2\n5.0\n-1\n2.5\n4.0\n3.0\n5.0\n4.0\n3.0\n2.0\n1.0\n20\n46\n-1\n4.5\n42\n3.0\n", 0, "")
+}
+if selected("test_by_value_packed_large_and_nested_results") {
+    executes(context, "record Mixed native \"c\" {\n    tag: UInt8; delta: Int16; count: UInt32; mask: UInt64\n    narrow: Float32; wide: Float64; enabled: Boolean; bytes: Bytes[3]\n}\nrecord Segment native \"c\" { selector: UInt16; base: UInt64 }\nrecord Outer native \"c\" { tag: UInt8; segment: Segment; limit: UInt32 }\nrecord Event native \"c_packed\" { events: UInt32; data: UInt64 }\nfunction packedValue(value: Event): Event { native \"layout\" value }\nfunction large(value: Mixed): Mixed { native \"layout\" value }\nfunction nestedValue(value: Outer): Outer { native \"layout\" value }\nlet event = packedValue(Event { events: 40; data: -1 })\nprint(event.events); print(event.data)\nlet value = large(Mixed { tag: 2; delta: 4; count: 6; mask: -1\n    narrow: 1.25; wide: 2.5; enabled: true; bytes: Bytes(3) })\nprint(value.tag); print(value.delta); print(value.count); print(value.wide); print(value.enabled)\nlet nested = nestedValue(Outer { tag: 3; segment: Segment { selector: 4; base: 5 }; limit: 6 })\nprint(nested.tag); print(nested.segment.selector); print(nested.segment.base)\n", "42\n0\n1\n-7\n7\n3.75\nfalse\n3\n4\n11\n", 0, "")
+}
+if selected("test_packed_epoll_layout") {
+    executes(context, "record Event native \"c_packed\" { events: UInt32; data: UInt64 }\nfunction event(value: Event): Integer { native \"layout\" }\nlet value = Event { events: 4294967295; data: -1 }\nprint(sizeOf(Event)); print(alignOf(Event)); print(offsetOf(Event, \"data\")); print(event(value))\n", "12\n1\n4\n1\n", 0, "")
+}
+if selected("test_nested_views_survive_scope_and_write_through") {
+    executes(context, "record Segment native \"c\" { selector: UInt16; base: UInt64 }\nrecord Outer native \"c\" { tag: UInt8; segment: Segment; limit: UInt32 }\nfunction outer(value: Outer): Integer { native \"layout\" }\nfunction make(): Segment {\n    let bytes = Bytes(sizeOf(Outer))\n    let value = cView(Outer, bytes, 0)\n    value.tag = 3; value.segment.selector = 65535; value.segment.base = 42; value.limit = 99\n    print(outer(value))\n    return value.segment\n}\nlet segment = make()\nprint(segment.selector); print(segment.base)\nsegment.base += 8\nprint(segment.base)\nlet alias = cView(Segment, cBytes(segment), 0)\nalias.selector = 20\nprint(segment.selector)\n", "1\n65535\n42\n50\n20\n", 0, "")
+}
+if selected("test_external_address_is_borrowed") {
+    executes(context, "record Segment native \"c\" { selector: UInt16; base: UInt64 }\nrecord Outer native \"c\" { tag: UInt8; segment: Segment; limit: UInt32 }\nfunction address(): Integer { native \"layout\" }\nlet value = cAt(Segment, address())\nprint(value.selector); print(value.base)\nvalue.base = 99\nlet nested = cView(Segment, cBytes(value), 0)\nprint(nested.base)\n", "10\n42\n99\n", 0, "")
+}
+if selected("test_pin_rejects_growth_and_regrowth_after_shrink") {
+    executes(context, "record Segment native \"c\" { selector: UInt16; base: UInt64 }\nrecord Outer native \"c\" { tag: UInt8; segment: Segment; limit: UInt32 }\nlet bytes = Bytes(16)\nlet value = cView(Segment, bytes, 0)\nvalue.base = 42\nbytes.resize(17)\n", "", 1, "Minyar stopped: Bytes storage with C-layout views cannot grow.\n")
+    executes(context, "record Segment native \"c\" { selector: UInt16; base: UInt64 }\nrecord Outer native \"c\" { tag: UInt8; segment: Segment; limit: UInt32 }\nlet bytes = Bytes(16)\nlet value = cView(Segment, bytes, 0)\nvalue.base = 42\nbytes.resize(0); bytes.resize(16)\n", "", 1, "Minyar stopped: Bytes storage with C-layout views cannot grow.\n")
+    executes(context, "record Segment native \"c\" { selector: UInt16; base: UInt64 }\nrecord Outer native \"c\" { tag: UInt8; segment: Segment; limit: UInt32 }\nlet bytes = Bytes(16)\nlet value = cView(Segment, bytes, 0)\nvalue.base = 42\nbytes.add(1)\n", "", 1, "Minyar stopped: Bytes storage with C-layout views cannot grow.\n")
+}
+if selected("test_native_append_cannot_move_pinned_storage") {
+    executes(context, "record Segment native \"c\" { selector: UInt16; base: UInt64 }\nrecord Outer native \"c\" { tag: UInt8; segment: Segment; limit: UInt32 }\nfunction appendZero(bytes: Bytes): Integer { native \"layout\" }\nfunction append(bytes: Bytes): Integer { native \"layout\" }\nlet bytes = Bytes(16)\nlet value = cView(Segment, bytes, 0)\nvalue.base = 42\nprint(appendZero(bytes)); print(value.base)\nbytes.resize(8)\nprint(appendZero(bytes)); print(value.base)\nprint(append(bytes))\n", "1\n42\n1\n42\n", 1, "Minyar stopped: Bytes storage with C-layout views cannot grow.\n")
+}
+if selected("test_bounds_integer_width_null_return_and_alignment_diagnostics") {
+    executes(context, "record R native \"c\" { value: UInt8 }\nlet value = R { value: 256 }\n", "", 1, "Minyar stopped: an Integer does not fit in its C-layout field.\n")
+    executes(context, "record Segment native \"c\" { selector: UInt16; base: UInt64 }\nrecord Outer native \"c\" { tag: UInt8; segment: Segment; limit: UInt32 }\nlet value = cView(Segment, Bytes(16), 1)\n", "", 1, "Minyar stopped: a C-layout view must fit within its backing Bytes.\n")
+    executes(context, "record Mixed native \"c\" {\n    tag: UInt8; delta: Int16; count: UInt32; mask: UInt64\n    narrow: Float32; wide: Float64; enabled: Boolean; bytes: Bytes[3]\n}\nfunction null(): Mixed { native \"layout\" }\nlet value = null()\n", "", 1, "Minyar stopped: a native C-layout record returned a null pointer.\n")
+    executes(context, "record Mixed native \"c\" {\n    tag: UInt8; delta: Int16; count: UInt32; mask: UInt64\n    narrow: Float32; wide: Float64; enabled: Boolean; bytes: Bytes[3]\n}\nfunction verify(value: Mixed): Integer { native \"layout\" }\nlet value = cView(Mixed, Bytes(41), 1)\nprint(verify(value))\n", "", 1, "Minyar stopped: a native C-layout record pointer is not correctly aligned.\n")
+}
+if selected("test_managed_holders_callbacks_and_results_keep_C_owners") {
+    executes(context, "record Segment native \"c\" { selector: UInt16; base: UInt64 }\nrecord Outer native \"c\" { tag: UInt8; segment: Segment; limit: UInt32 }\nrecord Holder { segment: Segment; label: Text }\nfunction make(): Callback<Integer, Segment> {\n    let holder = Holder { segment: Segment { selector: 7; base: 40 }; label: \"held\" }\n    return function(delta: Integer): Segment {\n        holder.segment.base += delta\n        return holder.segment\n    }\n}\nfunction success(value: Segment): Result<Segment, Text> { return Ok<Segment, Text>(value) }\nlet callback = make()\nlet value = callback(2)\nlet values: List<Segment> = [value, callback(1)]\nprint(value.base); print(values[1].base)\nlet result = success(value)\nmatch result { Ok(held) { print(held.base); print(held.selector) } Err(error) { fail(error) } }\n", "43\n43\n43\n7\n", 0, "")
+}
+if selected("test_recovery_preserves_pointer_and_value_native_ownership") {
+    executes(context, "use \"calldepth\" as depth\nuse \"errors\" as errors\nrecord Single native \"c\" { bits: UInt64 }\nfunction pendingPointer(): Single { native \"layout\" }\nfunction pendingValue(): Single { native \"layout\" value }\nlet pointer = depth.run(4, function(): Integer { let value = pendingPointer(); return value.bits })\nlet value = depth.run(4, function(): Integer { let record = pendingValue(); return record.bits })\nprint(errors.integerOk(pointer)); print(errors.integerOk(value)); print(\"alive\")\n", "false\nfalse\nalive\n", 0, "")
+}
+if selected("test_native_layout_past_the_first_thousand_nominal_types") {
+    let records: List<Text> = []
+    for index in 0..1001 { records.add("record R" + Text(index) + " {}\n") }
+    executes(context, joinText(records) + "record Single native \"c\" { bits: UInt64 }\nfunction nominal(value: Single): Integer { native \"layout\" }\nprint(nominal(Single { bits: 42 }))\n", "1\n", 0, "")
+}
+if selected("test_ordinary_functions_can_use_layout_builtin_names") {
+    executes(context, "function sizeOf(): Integer { return 42 }\nfunction answer(): Integer { native \"c\" }\nrecord Plain { value: Integer }\nprint(sizeOf()); print(answer()); print(Plain { value: 21 }.value)\n", "42\n7\n21\n", 0, "")
+}
+if selected("test_invalid_layouts_and_managed_record_diagnostics") {
+    let result = compile(context, "record R native \"c\" { value: Text }\n")
+    test.check(result.status == 1, "invalid C-layout rejection status")
+    test.check(test.contains(result.errorOutput, "C-layout fields require"), "invalid C-layout diagnostic")
+    test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "invalid C-layout emitted LLVM")
+    result = compile(context, "record R native \"c\" { value: Bytes }\n")
+    test.check(result.status == 1, "invalid C-layout rejection status")
+    test.check(test.contains(result.errorOutput, "expected '['"), "invalid C-layout diagnostic")
+    test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "invalid C-layout emitted LLVM")
+    result = compile(context, "record R native \"c\" {}\n")
+    test.check(result.status == 1, "invalid C-layout rejection status")
+    test.check(test.contains(result.errorOutput, "must contain at least one field"), "invalid C-layout diagnostic")
+    test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "invalid C-layout emitted LLVM")
+    result = compile(context, "record R native \"c\" { value: R }\n")
+    test.check(result.status == 1, "invalid C-layout rejection status")
+    test.check(test.contains(result.errorOutput, "recursive inline fields"), "invalid C-layout diagnostic")
+    test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "invalid C-layout emitted LLVM")
+    result = compile(context, "record M { value: Integer }\nrecord R native \"c\" { value: M }\n")
+    test.check(result.status == 1, "invalid C-layout rejection status")
+    test.check(test.contains(result.errorOutput, "cannot contain a managed record"), "invalid C-layout diagnostic")
+    test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "invalid C-layout emitted LLVM")
+    result = compile(context, "record R native \"c\" { value: UInt8 }\nlet value = R {}\n")
+    test.check(result.status == 1, "invalid C-layout rejection status")
+    test.check(test.contains(result.errorOutput, "missing field 'value'"), "invalid C-layout diagnostic")
+    test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "invalid C-layout emitted LLVM")
+    result = compile(context, "record R native \"c\" { value: UInt8 }\nlet value = R { value: true }\n")
+    test.check(result.status == 1, "invalid C-layout rejection status")
+    test.check(test.contains(result.errorOutput, "wrong type"), "invalid C-layout diagnostic")
+    test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "invalid C-layout emitted LLVM")
+    result = compile(context, "record R { value: UInt8 }\n")
+    test.check(result.status == 1, "invalid C-layout rejection status")
+    test.check(test.contains(result.errorOutput, "unknown type 'UInt8'"), "invalid C-layout diagnostic")
+    test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "invalid C-layout emitted LLVM")
+}
+if selected("test_native_package_driver_builds_and_reuses_aggregate_adapters") {
+    writeTextFile(compiler.directory + "/layout.min", "public record Pair native \"c\" { bits: UInt64; value: Float64 }\npublic function pair(value: Pair, add: Integer, scale: Float): Pair { native \"layout\" value }\n")
+    test.require(compile(context, "use \"./layout.min\" as layout\nlet value = layout.pair(layout.Pair { bits: 40; value: 1.5 }, 2, 2.0)\nprint(value.bits); print(value.value); print(sizeOf(layout.Pair))\n"), "compile native package adapter")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    for optimization in ["-O0", "-O2"] {
+        let executable = compiler.directory + "/package-" + optimization
+        let options: List<Text> = []
+        for flag in context.target { options.add(flag) }
+        for flag in compiler.flags { options.add(flag) }
+        options.add(optimization)
+        let nativeFlags = joinFlags(options)
+        options.add("-Wno-override-module")
+        let environment: List<Text> = []
+        for entry in system.environment() {
+            if !starts(entry, "MINYAR_CLANG=") && !starts(entry, "MINYAR_CLANG_FLAGS=") && !starts(entry, "MINYAR_NATIVE_FLAGS=") && !starts(entry, "MINYAR_LINK_ARTIFACTS=") { environment.add(entry) }
+        }
+        environment.add("MINYAR_CLANG=" + compiler.clang)
+        environment.add("MINYAR_CLANG_FLAGS=" + joinFlags(options))
+        environment.add("MINYAR_NATIVE_FLAGS=" + nativeFlags)
+        let command = ["python3", root + "/tools/clang-driver.py", "link", root, path + ".ll", compiler.runtime, executable, "0", "0", path + ".min", "--native-source", "layout=" + root + "/tests/c-layout-records.c"]
+        for repeat in 0..2 {
+            test.require(test.run(command, environment, "", path + ".package-link", 180), "production native adapter build/reuse")
+            let run: List<Text> = []
+            for item in context.runner { run.add(item) }
+            run.add(executable)
+            let result = test.run(run, system.environment(), "", path + ".package-run", 180)
+            test.check(result.status == 0 && result.output == "42\n3.0\n16\n" && result.errorOutput == "", "native aggregate adapter execution")
+        }
+    }
+}
+if selected("test_storage_owner_counts_and_nested_cleanup") {
+    for optimization in ["-O0", "-O2"] {
+        let executable = compiler.directory + "/storage-" + optimization
+        let command = [compiler.clang]
+        for flag in context.target { command.add(flag) }
+        command.add(optimization)
+        for flag in compiler.flags { command.add(flag) }
+        for item in ["-DMINYAR_SYSTEM_HEAP=1", "tests/c-layout-storage.c", "-pthread", "-lm", "-o", executable] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", executable + ".build", 180), "compile C-layout storage ownership")
+        command = []
+        for item in context.runner { command.add(item) }
+        command.add(executable)
+        let result = test.run(command, system.environment(), "", executable + ".run", 180)
+        test.check(result.status == 0 && result.output == "C-layout roots, nested views, borrowed addresses and ordinary Bytes passed\n" && result.errorOutput == "", "C-layout storage ownership")
+        for state in ["pinned", "shrunk"] {
+            let rejection: List<Text> = []
+            for item in command { rejection.add(item) }
+            rejection.add(state)
+            result = test.run(rejection, system.environment(), "", executable + ".reject", 30)
+            test.check(result.status == 1 && result.output == "" && result.errorOutput == "Minyar stopped: these Bytes cannot be detached.\n", "C-layout detach rejection " + state)
+        }
+    }
+}
+test.removeTree(compiler.directory)
+print("C-layout records, aggregate ABI and ownership: passed")

@@ -1,0 +1,148 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+function find(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if raw.length < pattern.length { return -1 }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { return start }
+    }
+    return -1
+}
+function count(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let occurrences = 0
+    if raw.length < pattern.length { return 0 }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { occurrences += 1 }
+    }
+    return occurrences
+}
+function selected(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "SourceMaps." + name { return true } }
+    return false
+}
+function rejects(compiler: test.Compiler, source: Text, diagnostic: Text) {
+    let result = test.compile(compiler, source)
+    test.check(result.status == 1 && result.output == "", "source map rejection status/stdout")
+    test.check(test.contains(result.errorOutput, diagnostic), "source map exact origin diagnostic\n" + result.errorOutput)
+    test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "source map rejection emitted LLVM")
+    test.check(!test.contains(result.errorOutput, "List position"), "source map rejection internal List fault")
+}
+function incremental(compiler: test.Compiler, modules: Text, entry: Text, output: Text, prior: Text, following: Text, stats: Text): test.Result {
+    return test.run([modules, entry, output, "--module-state", prior, following, stats], system.environment(), "", compiler.directory + "/incremental", 30)
+}
+let compiler = test.compiler()
+let source = test.setting("MINYAR_TEST_SOURCE", test.setting("MINYAR_TEST_COMPILER_SOURCE", "build/compiler.min"))
+let original = readTextFile(source)
+let main = find(original, "\nfunction main(")
+let core = original
+if main >= 0 { core = Text(Bytes(original).slice(0, main)) }
+let modules = test.setting("MINYAR_TEST_MODULE_COMPILER", "./build/minyarc-modules")
+let allowed = ["test_default_source_uses_two_coordinates_per_token_at_large_sizes", "test_path_indices_are_sparse_and_preserve_gaps_resets_and_named_eof", "test_full_integer_positions_shared_paths_and_sparse_legacy_origins", "test_successful_parser_does_not_format_per_expression_locations", "test_imported_unicode_diagnostic_retains_exact_original_coordinates", "test_cold_warm_and_changed_import_diagnostics_match_direct_compilation"]
+for index in 0..argumentCount() {
+    let valid = false
+    for name in allowed { if argument(index) == name || argument(index) == "SourceMaps." + name { valid = true } }
+    test.check(valid, "unknown source map case " + argument(index))
+}
+if selected("test_default_source_uses_two_coordinates_per_token_at_large_sizes") {
+    test.executes(compiler, core + "\nfunction main() {\n    let pieces: List<Text> = []\n    let count = 0\n    while count < 50000 { pieces.add(\"value \"); count = count + 1 }\n    let kinds: List<Integer> = []\n    let texts: List<Text> = []\n    let locations = newSourceMap()\n    tokenize(joinText(pieces), kinds, texts, locations)\n    print(kinds.length)\n    print(locations.coordinates.length)\n}\n", "50001\n100002\n")
+}
+if selected("test_path_indices_are_sparse_and_preserve_gaps_resets_and_named_eof") {
+    test.executes(compiler, core + "\nfunction main() {\n    let kinds: List<Integer> = []\n    let texts: List<Text> = []\n    let source = newSourceMap()\n    let position = 0\n    while position < 50000 {\n        addToken(kinds, texts, source.coordinates, 1, \"value\", 4294967297, 9223372036854775807)\n        position = position + 1\n    }\n    print(source.pathIndices.length)\n    print(tokenLocation(source, 49999))\n    let path = sourcePath(source, \"folder/é🙂.min\")\n    setTokenPath(source, 3, path)\n    print(source.pathIndices.length)\n    print(tokenLocation(source, 2))\n    print(tokenLocation(source, 3))\n    print(tokenLocation(source, 49999))\n    setTokenPath(source, 3, 0)\n    print(tokenLocation(source, 3))\n    setTokenOrigin(source, 49999, \"8, column 13\")\n    setTokenPath(source, 49999, path)\n    print(tokenLocation(source, 49999))\n    addEndToken(kinds, texts, source, \"end of interfaces\")\n    print(tokenLocation(source, 50000))\n}\n", "0\n4294967297, column 9223372036854775807\n4\n4294967297, column 9223372036854775807\nfolder/é🙂.min:4294967297, column 9223372036854775807\n4294967297, column 9223372036854775807\n4294967297, column 9223372036854775807\nfolder/é🙂.min:8, column 13\nend of interfaces\n")
+}
+if selected("test_full_integer_positions_shared_paths_and_sparse_legacy_origins") {
+    test.executes(compiler, core + "\nfunction main() {\n    let kinds: List<Integer> = []\n    let texts: List<Text> = []\n    let source = newSourceMap()\n    print(source.paths.length)\n    print(sourcePath(source, \"\") == 0)\n    print(sourcePath(source, \"\") == 0)\n    print(source.paths.length)\n    addToken(kinds, texts, source.coordinates, 1, \"first\", 4294967297, 9223372036854775807)\n    addToken(kinds, texts, source.coordinates, 1, \"second\", 2, 7)\n    addToken(kinds, texts, source.coordinates, 1, \"third\", 3, 11)\n    print(tokenLocation(source, 0))\n    print(source.origins.length)\n    setTokenOrigin(source, 2, \"8, column 13\")\n    print(tokenLocation(source, 1))\n    print(tokenLocation(source, 2))\n    print(source.origins.length)\n    print(source.origins[0] == \"\" && source.origins[1] == \"\")\n    let copiedKinds: List<Integer> = []\n    let copiedTexts: List<Text> = []\n    let copied = newSourceMap()\n    let path = sourcePath(copied, \"folder/é🙂.min\")\n    print(path == sourcePath(copied, \"folder/é🙂.min\"))\n    copyModuleToken(copiedKinds, copiedTexts, copied, 1, \"second\", source, 1, path)\n    copyModuleToken(copiedKinds, copiedTexts, copied, 1, \"third\", source, 2, path)\n    print(path == 1)\n    print(sourcePath(copied, \"\") == 0)\n    print(copied.paths.length)\n    print(tokenLocation(copied, 0))\n    print(tokenLocation(copied, 1))\n    addEndToken(copiedKinds, copiedTexts, copied, \"end of interfaces\")\n    print(tokenLocation(copied, 2))\n}\n", "1\ntrue\ntrue\n1\n4294967297, column 9223372036854775807\n0\n2, column 7\n8, column 13\n3\ntrue\ntrue\ntrue\ntrue\n2\nfolder/é🙂.min:2, column 7\nfolder/é🙂.min:8, column 13\nend of interfaces\n")
+}
+if selected("test_successful_parser_does_not_format_per_expression_locations") {
+    let llvm = compiler.directory + "/compiler.ll"
+    test.require(test.run([compiler.executable, source, llvm], system.environment(), "", compiler.directory + "/compiler-build", 30), "compile source location probe compiler")
+    let ir = readTextFile(llvm)
+    let parts: List<Text> = []
+    let renamed = 0
+    for line in test.lines(ir) {
+        if starts(line, "define ptr @.minyar.fn.sourceLocation(") { line = test.replace(line, "@.minyar.fn.sourceLocation(", "@original_source_location("); renamed += 1 }
+        else if starts(line, "  ") && test.contains(line, "call ptr @.minyar.fn.sourceLocation(") { line = test.replace(line, "call ptr @.minyar.fn.sourceLocation(", "call ptr @probe_source_location(") }
+        parts.add(line + "\n")
+    }
+    test.check(renamed == 1, "source location definition rename count")
+    parts.add("\ndeclare ptr @probe_source_location(i64, i64)\n")
+    ir = joinText(parts)
+    if test.addressEnabled(compiler.flags) { ir = test.instrument(ir) }
+    writeTextFile(llvm, ir)
+    let probe = compiler.directory + "/probe.c"
+    writeTextFile(probe, "#include <stdio.h>\nstatic unsigned long long formats;\nextern void *original_source_location(long long, long long);\nvoid *probe_source_location(long long line, long long column) {\n    ++formats; return original_source_location(line, column);\n}\n__attribute__((destructor)) static void report(void) {\n    fprintf(stderr, \"LOCATION_FORMATS=%llu\\n\", formats);\n}\n")
+    let executable = compiler.directory + "/compiler-probe"
+    let command = [compiler.clang, "-O2"]
+    for flag in compiler.flags { command.add(flag) }
+    for item in ["-Wno-override-module", llvm, probe, compiler.runtime, "-lm", "-o", executable] { command.add(item) }
+    test.require(test.run(command, system.environment(), "", compiler.directory + "/link", 30), "link source location probe compiler")
+    let expressions = compiler.directory + "/expressions.min"
+    let lines = ["function identity(value: Integer): Integer { return value }\n"]
+    for index in 0..1000 { lines.add("print(identity(" + Text(index) + ") + " + Text(index) + ")\n") }
+    writeTextFile(expressions, lines)
+    let result = test.run([executable, expressions, compiler.directory + "/expressions.ll"], system.environment(), "", compiler.directory + "/probe-run", 30)
+    test.require(result, "parse successful expression workload")
+    let marker = "LOCATION_FORMATS="
+    let position = find(result.errorOutput, marker)
+    test.check(position >= 0, "source location count probe output")
+    position += Bytes(marker).length
+    let raw = Bytes(result.errorOutput)
+    let ending = position
+    while ending < raw.length && raw[ending] >= 48 && raw[ending] <= 57 { ending += 1 }
+    test.check(ending > position, "source location count probe integer")
+    test.check(Integer(Text(raw.slice(position, ending))) <= 4, "successful expressions eagerly formatted source locations")
+}
+if selected("test_imported_unicode_diagnostic_retains_exact_original_coordinates") {
+    let library = compiler.directory + "/unicode é🙂.min"
+    writeTextFile(library, "﻿public function answer(): Integer {\n    let text = \"é🙂\"\n    return text + 2\n}\n")
+    rejects(compiler, "use \"./unicode é🙂.min\" as lib\nprint(lib.answer())\n", library + ":3, column 17: the two sides of")
+}
+if selected("test_cold_warm_and_changed_import_diagnostics_match_direct_compilation") {
+    let library = compiler.directory + "/library.min"
+    let entry = compiler.directory + "/main.min"
+    writeTextFile(library, "public function answer(): Integer { return 42 }\n")
+    writeTextFile(entry, "use \"./library.min\" as lib\nprint(lib.answer())\n")
+    let prior = compiler.directory + "/prior.state"
+    let following = compiler.directory + "/next.state"
+    let stats = compiler.directory + "/stats"
+    let output = compiler.directory + "/output.ll"
+    writeTextFile(prior, "")
+    for repeat in 0..2 {
+        test.require(incremental(compiler, modules, entry, output, prior, following, stats), "warm source map module control")
+        let size = files.pathSize(following)
+        test.check(size >= 0, "missing source map state publication")
+        if size > 0 { writeTextFile(prior, readTextFile(following)) }
+    }
+    let counts = test.words(readTextFile(stats))
+    test.check(counts.length > 0 && counts[0] == "2", "control failed to reuse both cached modules")
+    test.check(files.pathSize(prior) > 0, "warm no-change marker discarded cached origins")
+    let bodies = ["public function answer(): Integer { return 42 }\n", "public function answer(): Integer {\n    return \"é🙂\" + 2\n}\n"]
+    let entries = ["use \"./library.min\" as lib\nprint(lib.missing())\n", "use \"./library.min\" as lib\nprint(lib.answer())\n"]
+    let locations = [entry + ":2, column 7", library + ":2, column 17"]
+    for index in 0..2 {
+        writeTextFile(library, bodies[index]); writeTextFile(entry, entries[index])
+        let direct = test.run([compiler.executable, entry, compiler.directory + "/direct.ll"], system.environment(), "", compiler.directory + "/direct", 30)
+        let cached = incremental(compiler, modules, entry, output, prior, following, stats)
+        test.check(direct.status == 1 && cached.status == 1, "direct/incremental source map rejection status")
+        test.check(cached.errorOutput == direct.errorOutput, "cached diagnostic source origin differs from direct compilation")
+        test.check(test.contains(direct.errorOutput, locations[index]), "original source coordinates lost")
+        test.check(count(direct.errorOutput, library) == index, "diagnostic imported path count")
+    }
+}
+test.removeTree(compiler.directory)
+print("Source maps, lazy locations and incremental origin parity: passed")

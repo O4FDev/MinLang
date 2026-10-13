@@ -1,0 +1,73 @@
+use "../tools/testing.min" as test
+use "system" as system
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+record Probe { name: Text; expected: Text; transcript: Boolean }
+record Transcript { budget: Integer; output: Text }
+let probes = [Probe { name: "batched-transcript"; expected: ""; transcript: true },
+    Probe { name: "inline-scalar-leaf"; expected: "inlined List leaf free preserves shared aliases and one-unit visits\n"; transcript: false },
+    Probe { name: "scalar-record-set"; expected: "scalar-only setter preserves bounds/values; mixed-record scalar fields still service pending work\n"; transcript: false },
+    Probe { name: "unique-scalar-leaf"; expected: "unique scalar fast free preserves1..8owners, mixed parents and exact units\n"; transcript: false }]
+let work = test.scratch()
+let clang = test.setting("CLANG", test.setting("MINYAR_TEST_CLANG", "clang"))
+let environment: List<Text> = []
+for entry in system.environment() { if !starts(entry, "ASAN_OPTIONS=") && !starts(entry, "UBSAN_OPTIONS=") { environment.add(entry) } }
+environment.add("ASAN_OPTIONS=detect_leaks=0")
+environment.add("UBSAN_OPTIONS=halt_on_error=1")
+let native: List<Transcript> = []
+let checked = 0
+let bounds = 0
+for mode in ["native", "sanitize"] {
+    for budget in [1, 32, 1024] {
+        for probe in probes {
+            let executable = work + "/case"
+            let command = [clang, "-std=c11", "-O2", "-g", "-UNDEBUG"]
+            if mode == "sanitize" { command.add("-fsanitize=address,undefined"); command.add("-fno-omit-frame-pointer") }
+            for item in ["-DMINYAR_RC_POLL_BUDGET=" + Text(budget), "tests/" + probe.name + ".c", "-lm", "-o", executable] { command.add(item) }
+            test.require(test.run(command, system.environment(), "", work + "/build", 60), "compile cleanup probe " + probe.name + " " + mode + " " + Text(budget))
+            let result = test.run([executable], environment, "", work + "/run", 30)
+            test.check(result.status == 0 && result.errorOutput == "", "cleanup probe status and diagnostics " + probe.name + "\n" + result.errorOutput)
+            if !probe.transcript { test.check(result.output == probe.expected, "cleanup probe output " + probe.name) }
+            else {
+                let rows = test.lines(result.output)
+                test.check(rows.length > 0, "empty cleanup work transcript")
+                let last: List<Integer> = []
+                for index in 0..rows.length {
+                    let row: List<Integer> = []
+                    for token in test.words(rows[index]) { row.add(Integer(token)) }
+                    test.check(row.length == 9, "cleanup transcript field count")
+                    test.check(row[0] == index && row[1] >= 0 && row[1] <= budget, "cleanup transcript index and work ceiling")
+                    last = row
+                }
+                test.check(last[2] == 0 && last[3] == 1, "cleanup final pending and object counts")
+                test.check(last[8] == 1, "cleanup final shared owner count")
+                if mode == "native" { native.add(Transcript { budget: budget; output: result.output }) }
+                else {
+                    let found = false
+                    for transcript in native {
+                        if transcript.budget == budget { found = true; test.check(result.output == transcript.output, "Sanitizer changed cleanup transcript") }
+                    }
+                    test.check(found, "missing native cleanup transcript")
+                }
+            }
+            if probe.name == "scalar-record-set" {
+                let arguments = ["negative", "upper"]
+                let positions = [-1, 3]
+                for index in 0..2 {
+                    let rejection = test.run([executable, arguments[index]], environment, "", work + "/bounds", 15)
+                    test.check(rejection.status == 1 && rejection.output == "" && rejection.errorOutput == "Minyar stopped: List position " + Text(positions[index]) + " is outside its length of 3.\n", "scalar setter exact bounds rejection " + arguments[index] + "\n" + rejection.errorOutput)
+                    bounds += 1
+                }
+            }
+            checked += 1
+        }
+    }
+}
+test.check(checked == 24 && bounds == 12, "cleanup probe original matrix")
+test.removeTree(work)
+print(Text(checked) + " scalar cleanup probes and " + Text(bounds) + " bounds rejections passed")

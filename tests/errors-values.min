@@ -1,0 +1,89 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+function selected(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "ErrorValues." + name { return true } }
+    return false
+}
+function compile(compiler: test.Compiler, source: Text): test.Result {
+    compiler.serial += 1
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    writeTextFile(path + ".min", source)
+    let result = test.run([compiler.executable, path + ".min", path + ".ll", "--library", "library"], system.environment(), "", path + ".compile", compiler.compileTimeout)
+    if result.status == 0 && test.addressEnabled(compiler.flags) { writeTextFile(path + ".ll", test.instrument(readTextFile(path + ".ll"))) }
+    return result
+}
+function executes(compiler: test.Compiler, source: Text, expected: Text, status: Integer, diagnostic: Text) {
+    test.require(compile(compiler, source), "compile error values")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization]
+        for flag in compiler.flags { command.add(flag) }
+        for item in ["-Wno-override-module", path + ".ll", compiler.runtime, "-lm", "-o", path + ".exe"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".link", compiler.linkTimeout), "link error values " + optimization)
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", compiler.runTimeout)
+        test.check(result.status == status && result.output == expected && result.errorOutput == diagnostic, "error values " + optimization + "\n" + result.output + result.errorOutput)
+    }
+}
+function rejects(compiler: test.Compiler, source: Text, diagnostic: Text) {
+    let result = compile(compiler, source)
+    test.check(result.status == 1 && result.output == "", "error values rejection status/stdout")
+    test.check(test.contains(result.errorOutput, diagnostic), "error values diagnostic\n" + result.errorOutput)
+    test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "error values rejection emitted LLVM")
+    test.check(!test.contains(result.errorOutput, "List position"), "error values rejection internal List fault")
+}
+let compiler = test.compiler()
+let allowed = ["test_recoverable_failure_does_not_stop_program", "test_error_classes_and_native_codes_are_independent", "test_data_eof_wouldblock_failure_and_truncation_are_distinct", "test_binary_payload_and_error_survive_other_operations", "test_boolean_false_and_integer_zero_are_success_values", "test_repeated_recovery_and_alias_lifetimes", "test_invalid_programmer_contracts_remain_fatal", "test_private_fields_prevent_forged_or_mutated_result_tags"]
+for index in 0..argumentCount() {
+    let valid = false
+    for name in allowed { if argument(index) == name || argument(index) == "ErrorValues." + name { valid = true } }
+    test.check(valid, "unknown error value case " + argument(index))
+}
+if selected("test_recoverable_failure_does_not_stop_program") {
+    executes(compiler, "use \"errors\" as errors\nfunction parse(packet: Bytes): errors.IntegerResult {\n    if packet.length < 2 {\n        return errors.integerFailure(errors.make(errors.invalidDataCode(), 0, \"short packet\"))\n    }\n    return errors.integer(packet[0] * 256 + packet[1])\n}\nlet failed = parse(Bytes(1))\nprint(errors.integerOk(failed))\nprint(errors.code(errors.integerError(failed)))\nprint(errors.message(errors.integerError(failed)))\nlet valid = Bytes(2)\nvalid[0] = 1; valid[1] = 2\nprint(errors.integerValue(parse(valid)))\nprint(\"still alive\")\n", "false\n6\nshort packet\n258\nstill alive\n", 0, "")
+}
+if selected("test_error_classes_and_native_codes_are_independent") {
+    let statements = ["use \"errors\" as errors\n"]
+    let expected: List<Text> = []
+    let index = 0
+    for code in [1, 2, 6, 7, 11, 12, 999] {
+        for native in [-1, 0, 13, 10035, 9223372036854775807] {
+            let name = "e" + Text(index)
+            let message = "é🙂-" + Text(index)
+            statements.add("let " + name + " = errors.make(" + Text(code) + ", " + Text(native) + ", \"" + message + "\")\nprint(errors.code(" + name + "))\nprint(errors.nativeCode(" + name + "))\nprint(errors.message(" + name + "))\nprint(errors.isError(" + name + "))\n")
+            for value in [Text(code), Text(native), message, "true"] { expected.add(value + "\n") }
+            index += 1
+        }
+    }
+    test.check(index == 35, "error class/native code original domain")
+    executes(compiler, joinText(statements), joinText(expected), 0, "")
+}
+if selected("test_data_eof_wouldblock_failure_and_truncation_are_distinct") {
+    executes(compiler, "use \"errors\" as errors\nlet data = errors.bytes(Bytes())\nlet eof = errors.endOfStream()\nlet blocked = errors.wouldBlock(10035)\nlet failed = errors.bytesFailure(errors.make(errors.systemCode(), 9, \"bad socket\"))\nlet cut = errors.truncated(Bytes(\"abc\"), 90)\nprint(errors.bytesStatus(data)); print(errors.bytesValue(data).length)\nprint(errors.bytesStatus(eof)); print(errors.bytesValue(eof).length)\nprint(errors.bytesStatus(blocked)); print(errors.nativeCode(errors.bytesError(blocked)))\nprint(errors.bytesStatus(failed)); print(errors.nativeCode(errors.bytesError(failed)))\nprint(errors.bytesStatus(cut)); print(Text(errors.bytesValue(cut)))\nprint(errors.bytesOk(data)); print(errors.bytesOk(eof)); print(errors.bytesOk(blocked))\nprint(errors.bytesOk(failed)); print(errors.bytesOk(cut))\nprint(errors.isWouldBlock(errors.bytesError(blocked)))\n", "0\n0\n2\n0\n1\n10035\n3\n9\n4\nabc\ntrue\ntrue\nfalse\nfalse\nfalse\ntrue\n", 0, "")
+}
+if selected("test_binary_payload_and_error_survive_other_operations") {
+    executes(compiler, "use \"errors\" as errors\nfunction create(): errors.BytesResult {\n    let data = Bytes(3)\n    data[0] = 0; data[1] = 255; data[2] = 128\n    return errors.bytes(data)\n}\nlet first = errors.bytesFailure(errors.make(errors.systemCode(), 13, \"first\"))\nlet second = errors.bytesFailure(errors.make(errors.systemCode(), 10054, \"second\"))\nlet payload = create()\nlet alias = payload\nlet data = errors.bytesValue(payload)\nprint(data[0]); print(data[1]); print(data[2])\nprint(errors.bytesValue(alias).length)\nprint(errors.nativeCode(errors.bytesError(first)))\nprint(errors.message(errors.bytesError(first)))\nprint(errors.nativeCode(errors.bytesError(second)))\nprint(errors.message(errors.bytesError(second)))\n", "0\n255\n128\n3\n13\nfirst\n10054\nsecond\n", 0, "")
+}
+if selected("test_boolean_false_and_integer_zero_are_success_values") {
+    executes(compiler, "use \"errors\" as errors\nlet b = errors.boolean(false)\nlet n = errors.integer(0)\nprint(errors.booleanOk(b)); print(errors.booleanValue(b))\nprint(errors.integerOk(n)); print(errors.integerValue(n))\nprint(errors.code(errors.booleanError(b)))\nprint(errors.code(errors.integerError(n)))\nlet bad = errors.booleanFailure(errors.make(errors.cancelledCode(), 0, \"cancelled\"))\nprint(errors.booleanOk(bad)); print(errors.message(errors.booleanError(bad)))\n", "true\nfalse\ntrue\n0\n0\n0\nfalse\ncancelled\n", 0, "")
+}
+if selected("test_repeated_recovery_and_alias_lifetimes") {
+    executes(compiler, "use \"errors\" as errors\nlet survivor = errors.bytesFailure(errors.make(errors.systemCode(), 17, \"survivor\"))\nlet successes = 0\nfor i in 0..10000 {\n    let result = errors.bytesFailure(errors.make(errors.invalidDataCode(), i, Text(i)))\n    if errors.code(errors.bytesError(result)) == errors.invalidDataCode() {\n        successes = successes + 1\n    }\n    let recovered = errors.bytes(Bytes(\"ok\"))\n    if errors.bytesValue(recovered).length != 2 { fail(\"payload changed\") }\n}\nprint(successes)\nprint(errors.nativeCode(errors.bytesError(survivor)))\nprint(errors.message(errors.bytesError(survivor)))\n", "10000\n17\nsurvivor\n", 0, "")
+}
+if selected("test_invalid_programmer_contracts_remain_fatal") {
+    executes(compiler, "use \"errors\" as errors\nerrors.make(0, 0, \"bad\")\nprint(\"after\")\n", "", 1, "Minyar stopped: an error code must be positive\n")
+    executes(compiler, "use \"errors\" as errors\nerrors.make(-1, 0, \"bad\")\nprint(\"after\")\n", "", 1, "Minyar stopped: an error code must be positive\n")
+    executes(compiler, "use \"errors\" as errors\nerrors.integerFailure(errors.none())\nprint(\"after\")\n", "", 1, "Minyar stopped: a failure result requires an error\n")
+    executes(compiler, "use \"errors\" as errors\nerrors.bytesFailure(errors.none())\nprint(\"after\")\n", "", 1, "Minyar stopped: a failure result requires an error\n")
+    executes(compiler, "use \"errors\" as errors\nerrors.booleanFailure(errors.none())\nprint(\"after\")\n", "", 1, "Minyar stopped: a failure result requires an error\n")
+    executes(compiler, "use \"errors\" as errors\nerrors.integerValue(errors.integerFailure(errors.make(7, 9, \"bad\")))\nprint(\"after\")\n", "", 1, "Minyar stopped: cannot read the value of a failed IntegerResult\n")
+    executes(compiler, "use \"errors\" as errors\nerrors.booleanValue(errors.booleanFailure(errors.make(7, 9, \"bad\")))\nprint(\"after\")\n", "", 1, "Minyar stopped: cannot read the value of a failed BooleanResult\n")
+    executes(compiler, "use \"errors\" as errors\nerrors.bytesValue(errors.wouldBlock(11))\nprint(\"after\")\n", "", 1, "Minyar stopped: this BytesResult has no readable data\n")
+}
+if selected("test_private_fields_prevent_forged_or_mutated_result_tags") {
+    rejects(compiler, "use \"errors\" as errors\nlet result = errors.bytes(Bytes())\nresult.status = 2\n", "private")
+    rejects(compiler, "use \"errors\" as errors\nlet bad = errors.Error { code: 0; nativeCode: 9; message: \"forged\" }\n", "private")
+}
+test.removeTree(compiler.directory)
+print("Error values: passed")

@@ -1,0 +1,100 @@
+use "../tools/testing.min" as test
+use "files" as files
+function count(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let found = 0
+    if raw.length < pattern.length { return 0 }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { found += 1 }
+    }
+    return found
+}
+function find(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if raw.length < pattern.length { return -1 }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { return start }
+    }
+    return -1
+}
+function selected(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "BinaryExpressionOwnership." + name { return true } }
+    return false
+}
+function rejects(compiler: test.Compiler, source: Text, diagnostic: Text) {
+    let result = test.compile(compiler, source)
+    test.check(result.status == 1, "binary expression rejection status")
+    test.check(result.output == "", "binary expression rejection stdout")
+    test.check(test.contains(result.errorOutput, diagnostic), "binary expression rejection diagnostic\n" + result.errorOutput)
+    test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "binary expression rejection emitted LLVM")
+    test.check(!test.contains(result.errorOutput, "List position"), "binary expression rejection internal List fault")
+}
+function compiled(compiler: test.Compiler, source: Text): Text {
+    test.require(test.compile(compiler, source), "compile binary ownership IR")
+    return readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+}
+let compiler = test.compiler()
+let allowed = ["test_operand_lifetimes_and_evaluation_order", "test_right_operand_context_and_diagnostics", "test_owned_text_chain_uses_consuming_join", "test_text_self_reassignment_moves_the_local_owner", "test_owned_list_replacement_transfers_only_fresh_results", "test_aliases_survive_replacement_and_self_reads_at_varied_text_sizes"]
+for index in 0..argumentCount() {
+    let valid = false
+    for name in allowed { if argument(index) == name || argument(index) == "BinaryExpressionOwnership." + name { valid = true } }
+    test.check(valid, "unknown binary ownership case " + argument(index))
+}
+if selected("test_operand_lifetimes_and_evaluation_order") {
+    test.executes(compiler, "function replace(values: List<Text>, result: Text): Text {\n values[0] = \"changed\" + \"!\"\n return result + \"!\"\n}\nlet values: List<Text> = [\"left\" + \"!\"]\nlet joined = values[0] + replace(values, \"right\")\nprint(joined)\nprint(values[0])\nvalues[0] = \"same\" + \"!\"\nprint(values[0] == replace(values, \"same\"))\nprint(values[0])\n", "left!right!\nchanged!\ntrue\nchanged!\n")
+    test.executes(compiler, "record Holder { text: Text }\nfunction replace(values: List<Holder>): Text {\n values[0] = Holder { text: \"changed\" + \"!\" }\n return \"right\" + \"!\"\n}\nlet values: List<Holder> = [Holder { text: \"left\" + \"!\" }]\nprint(values[0].text + (\"/\" + replace(values)))\nprint(values[0].text)\n", "left!/right!\nchanged!\n")
+    test.executes(compiler, "record Saved { text: Text }\nfunction make(tag: Text): Text { return tag + \"!\" }\nlet values: List<Text> = []\nvalues.add(make(\"A\") + (make(\"B\") + \"tail\"))\nlet saved = Saved { text: make(\"C\") + (make(\"D\") + \"tail\") }\nprint(values[0])\nprint(saved.text)\nprint((make(\"X\") + make(\"Y\")) == (make(\"X\") + make(\"Y\")))\n", "A!B!tail\nC!D!tail\ntrue\n")
+    test.executes(compiler, "function unexpected(): Boolean { fail(\"a short-circuited operand ran\") }\nprint(1 + 2 * 3 == 7)\nprint((1 < 2) == true)\nprint(10 - 6 / 2)\nprint(20 / 2 / 2)\nprint(2 * 3 + 4 < 11 == true)\nprint((\"a\" + \"b\" == \"ab\") && !(2 * 3 == 7) || false)\nprint(false && unexpected() || true)\nprint(true || unexpected())\n", "true\ntrue\n7\n5\ntrue\ntrue\ntrue\ntrue\n")
+}
+if selected("test_right_operand_context_and_diagnostics") {
+    rejects(compiler, "print([1] == [])\n", "the two sides of '==' have different types")
+    rejects(compiler, "print(\"x\" + 1)\n", "the two sides of '+' have different types")
+    rejects(compiler, "print([1] == [2])\n", "records, Lists, and Bytes do not yet support equality")
+    rejects(compiler, "let values: List<Integer> = []\nprint(values == [])\n", "the two sides of '==' have different types")
+    rejects(compiler, "print(('a' < 'b') == 1)\n", "the two sides of '==' have different types")
+    rejects(compiler, "print((1 + 2) * true)\n", "the two sides of '*' have different types")
+}
+if selected("test_owned_text_chain_uses_consuming_join") {
+    let generated = compiled(compiler, "function piece(value: Text): Text {\n return value + \"!\"\n}\nprint((piece(\"a\") + piece(\"b\")) + piece(\"c\"))\n")
+    test.check(count(generated, "call ptr @minyar_join_text_take_left(") >= 2, "test_owned_text_chain_uses_consuming_join call ptr @minyar_join_text_take_left(")
+    test.executes(compiler, "function piece(value: Text): Text { return value + \"!\" }\nprint((piece(\"a\") + piece(\"b\")) + piece(\"c\"))\n", "a!b!c!\n")
+}
+if selected("test_text_self_reassignment_moves_the_local_owner") {
+    let generated = compiled(compiler, "let text = Text(0)\nlet position = 0\nwhile position < 4096 {\n text = text + \"abcdefgh\"\n position = position + 1\n}\nlet alias = text\ntext = text + \"!\"\nprint(alias.length)\nprint(text.length)\nlet doubled = \"ab\"\ndoubled = doubled + doubled\nprint(doubled)\n")
+    test.check(count(generated, "call void @minyar_rc_local_move_owner(") == 2, "test_text_self_reassignment_moves_the_local_owner call void @minyar_rc_local_move_owner(")
+    test.check(count(generated, "call ptr @minyar_join_text_take_left(") == 2, "test_text_self_reassignment_moves_the_local_owner call ptr @minyar_join_text_take_left(")
+    test.check(count(generated, "call ptr @minyar_join_text(") == 1, "test_text_self_reassignment_moves_the_local_owner call ptr @minyar_join_text(")
+    test.executes(compiler, "let text = Text(0)\nlet position = 0\nwhile position < 4096 {\n text = text + \"abcdefgh\"\n position = position + 1\n}\nlet alias = text\ntext = text + \"!\"\nprint(alias.length)\nprint(text.length)\nlet doubled = \"ab\"\ndoubled = doubled + doubled\nprint(doubled)\n", "32769\n32770\nabab\n")
+}
+if selected("test_owned_list_replacement_transfers_only_fresh_results") {
+    let generated = compiled(compiler, "function make(value: Text): Text { return value + \"!\" }\nlet values: List<Text> = [\"old\"]\nvalues[0] = make(\"fresh\")\nlet borrowed = make(\"borrowed\")\nvalues[0] = borrowed\nprint(values[0])\n")
+    let start = find(generated, "define i32 @main(")
+    test.check(start >= 0, "missing binary ownership main")
+    generated = Text(Bytes(generated).slice(start + Bytes("define i32 @main(").length, Bytes(generated).length))
+    test.check(count(generated, "call void @minyar_list_set_take(") == 1, "test_owned_list_replacement_transfers_only_fresh_results call void @minyar_list_set_take(")
+    test.check(count(generated, "call void @minyar_list_set(") == 1, "test_owned_list_replacement_transfers_only_fresh_results call void @minyar_list_set(")
+    test.executes(compiler, "function make(value: Text): Text { return value + \"!\" }\nlet values: List<Text> = [\"old\"]\nvalues[0] = make(\"fresh\")\nlet borrowed = make(\"borrowed\")\nvalues[0] = borrowed\nprint(values[0])\n", "borrowed!\n")
+}
+if selected("test_aliases_survive_replacement_and_self_reads_at_varied_text_sizes") {
+    let sources = ["function overwrite(values: List<Text>, replacement: Text): Text {\n let prior = values[0]\n values[0] = replacement\n return prior\n}\n"]
+    let expected: List<Text> = []
+    for size in [1, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256, 1024] {
+        let pieces: List<Text> = []
+        for index in 0..size { pieces.add("x") }
+        let text = joinText(pieces)
+        let prior = text + "!"
+        let replacement = "new" + Text(size)
+        sources.add("if true {\n let values: List<Text> = [\"" + text + "\" + \"!\"]\n let alias = values[0]\n let joined = values[0] + overwrite(values, \"new\" + Text(" + Text(size) + "))\n print(joined)\n print(alias)\n values[0] = values[0] + values[0]\n print(values[0])\n print(alias)\n}\n")
+        for value in [prior + prior, prior, replacement + replacement, prior] { expected.add(value + "\n") }
+    }
+    test.executes(compiler, joinText(sources), joinText(expected))
+}
+test.removeTree(compiler.directory)
+print("Binary expression ownership: passed")

@@ -1,0 +1,255 @@
+use "../tools/testing.min" as test
+use "../tools/test-runtime.min" as runtime
+use "system" as system
+use "files" as files
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+function find(source: Text, needle: Text, start: Integer): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if raw.length < pattern.length { return -1 }
+    for position in start..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[position + index] != pattern[index] { equal = false; break } }
+        if equal { return position }
+    }
+    return -1
+}
+function selected(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "ResultReview." + name { return true } }
+    return false
+}
+record Review { compiler: test.Compiler; helpers: Text; sources: List<Text>; slots: Boolean }
+function compile(review: Review, source: Text): test.Result {
+    let compiler = review.compiler
+    compiler.serial += 1
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    writeTextFile(path + ".min", source)
+    let result = test.run([compiler.executable, path + ".min", path + ".ll", "--library", "library"], system.environment(), "", path + ".compile", 30)
+    if result.status == 0 {
+        let ir = readTextFile(path + ".ll")
+        if test.addressEnabled(compiler.flags) { ir = test.instrument(ir) }
+        if review.slots {
+            let parts: List<Text> = []
+            let count = 0
+            for line in test.lines(ir) {
+                let opening = find(line, " = call i64 @minyar_record_get(ptr ", 0)
+                if starts(line, "  %") && opening >= 0 {
+                    let raw = Bytes(line)
+                    let name = Text(raw.slice(2, opening))
+                    let operand = opening + Bytes(" = call i64 @minyar_record_get(ptr ").length
+                    let closing = find(line, ", i64 0)", operand)
+                    if closing >= 0 && !test.contains(name, " ") {
+                        parts.add("  call void @review_result_slots(ptr " + Text(raw.slice(operand, closing)) + ")\n")
+                        count += 1
+                    }
+                }
+                parts.add(line + "\n")
+            }
+            test.check(count == 2, "instrumentation must cover both active slots")
+            parts.add("\ndeclare void @review_result_slots(ptr)\n")
+            ir = joinText(parts)
+        }
+        writeTextFile(path + ".ll", ir)
+    }
+    return result
+}
+function executes(review: Review, source: Text, expected: Text) {
+    test.require(compile(review, source), "compile Result review")
+    let compiler = review.compiler
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    let engine = runtime.cycleSource(readTextFile("runtime/minyar_runtime.c"))
+    let contract = test.replace(readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", engine)
+    writeTextFile(path + "-runtime.c", contract + review.helpers)
+    let object = path + "-runtime.o"
+    let optimization = "-O2"
+    if compiler.flags.length > 0 { optimization = "-O1" }
+    let command = [compiler.clang, optimization]
+    let runtimeFlags = test.words(test.setting("MINYAR_ERRORS_RUNTIME_FLAGS", ""))
+    for flag in runtimeFlags { command.add(flag) }
+    for flag in compiler.flags { command.add(flag) }
+    if runtimeFlags.length == 0 { command.add("-DMINYAR_SYSTEM_HEAP=1") }
+    for item in ["-iquote", "runtime", "-c", path + "-runtime.c", "-o", object] { command.add(item) }
+    test.require(test.run(command, system.environment(), "", path + ".runtime-build", 30), "compile exact Result ownership runtime")
+    for level in ["-O0", "-O2"] {
+        command = [compiler.clang, level]
+        for flag in compiler.flags { command.add(flag) }
+        for item in ["-Wno-override-module", path + ".ll", object] { command.add(item) }
+        for native in review.sources { command.add(native) }
+        for item in ["-lm", "-o", path + ".exe"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".link", 30), "link Result review " + level)
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", 30)
+        test.check(result.status == 0 && result.output == expected && result.errorOutput == "", "Result ownership review " + level + "\n" + result.output + result.errorOutput)
+    }
+}
+function rejects(review: Review, source: Text, diagnostic: Text) {
+    let result = compile(review, source)
+    test.check(result.status == 1 && result.output == "", "Result review rejection status/stdout")
+    test.check(test.contains(result.errorOutput, diagnostic), "Result review rejection diagnostic\n" + result.errorOutput)
+    test.check(files.pathSize(review.compiler.directory + "/case" + Text(review.compiler.serial) + ".ll") < 0, "Result review rejection emitted LLVM")
+    test.check(!test.contains(result.errorOutput, "List position"), "Result review rejection internal List fault")
+}
+function malformed(review: Review, source: Text, callback: Boolean) {
+    let result = compile(review, source)
+    test.check(result.status == 1, "malformed Result review rejection status")
+    test.check(files.pathSize(review.compiler.directory + "/case" + Text(review.compiler.serial) + ".ll") < 0, "malformed Result review emitted LLVM")
+    test.check(!test.contains(result.errorOutput, "List position"), "malformed Result review internal List fault")
+    if callback { test.check(!test.contains(result.errorOutput, "callback body"), "truncated Result review callback fault") }
+}
+let compiler = test.compiler()
+let frontend = "./build/minyarc-errors"
+if test.addressEnabled(compiler.flags) { frontend += "-sanitize" }
+compiler.executable = test.setting("MINYAR_ERRORS_COMPILER", frontend)
+let review = Review { compiler: compiler; helpers: ""; sources: []; slots: false }
+let allowed = ["test_review_nested_match_shadowing_and_mixed_returns", "test_review_loop_jumps_and_match_followthrough", "test_review_try_owns_extracted_value_after_input_replacement", "test_review_callback_early_error_is_local_to_inner_callback", "test_review_same_record_spelling_in_distinct_modules_is_not_same_error", "test_review_module_alias_diamond_nested_callback_result_identity", "test_review_match_inside_module_with_constant_named_payload", "test_review_result_names_remain_values_in_ordinary_comparisons", "test_review_quoted_generic_delimiters_are_rejected", "test_review_truncated_headers_reject_without_runtime_fault", "test_review_results_preserve_nested_reference_errors", "test_review_callback_mutation_removes_last_container_owner", "test_review_each_result_generic_delimiter_keeps_lexical_kind", "test_review_collect_short_circuits_before_fatal_callback", "test_review_match_and_try_evaluate_input_once", "test_review_udp_truncation_empty_packet_wouldblock_and_recovery", "test_review_tcp_short_reads_and_eof_are_distinct", "test_review_tcp_deferred_accept_short_reads_and_eof", "test_review_inactive_reference_slots_are_null_and_unowned", "test_review_early_return_reclaims_cycles_before_next_iteration", "test_review_quoted_double_close_is_not_type_punctuation", "test_review_callback_type_commas_are_punctuation", "test_review_results_cannot_cross_scalar_parallel_or_native_abi"]
+for index in 0..argumentCount() {
+    let valid = false
+    for name in allowed { if argument(index) == name || argument(index) == "ResultReview." + name { valid = true } }
+    test.check(valid, "unknown Result review case " + argument(index))
+}
+if selected("test_review_nested_match_shadowing_and_mixed_returns") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    executes(review, "function choose(input: Result<Text, Text>, good: Boolean): Text {\n    let payload = \"outer\" + \"!\"\n    match input {\n        Err(payload) {\n            if good { return payload + \" early\" }\n            print(payload)\n        }\n        Ok(payload) {\n            match Err<Integer, Text>(payload) {\n                Ok(payload) { print(payload) }\n                Err(payload) { print(payload + \" inner\") }\n            }\n        }\n    }\n    return payload\n}\nprint(choose(Ok<Text, Text>(\"yes\" + \"!\"), false))\nprint(choose(Err<Text, Text>(\"no\" + \"!\"), false))\nprint(choose(Err<Text, Text>(\"no\" + \"!\"), true))\n", "yes! inner\nouter!\nno!\nouter!\nno! early\n")
+}
+if selected("test_review_loop_jumps_and_match_followthrough") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    executes(review, "function scan(): Integer {\n    let count = 0\n    for i in 0..100 {\n        let local = Bytes(\"loop\")\n        match Ok<Integer, Text>(i) {\n            Err(error) { return error.length }\n            Ok(value) {\n                if value == 3 { break }\n                if value == 1 { continue }\n                count = count + local.length\n            }\n        }\n    }\n    let i = 0\n    while i < 5 {\n        i = i + 1\n        match Err<Text, Integer>(i) {\n            Ok(value) { print(value) }\n            Err(code) {\n                if code == 2 { continue }\n                if code == 4 { break }\n                count = count + code\n            }\n        }\n    }\n    return count\n}\nprint(scan())\n", "12\n")
+}
+if selected("test_review_try_owns_extracted_value_after_input_replacement") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    executes(review, "record Store { values: List<Result<Text, Text>> }\nfunction extract(store: Store): Result<Text, Text> {\n    let text: Text = try store.values[0]\n    store.values[0] = Err<Text, Text>(\"replaced\" + \"!\")\n    return Ok<Text, Text>(text + \" kept\")\n}\nlet store = Store { values: [Ok<Text, Text>(\"original\" + \"!\")] }\nmatch extract(store) { Ok(v) { print(v) } Err(e) { print(e) } }\nmatch store.values[0] { Ok(v) { print(v) } Err(e) { print(e) } }\n", "original! kept\nreplaced!\n")
+}
+if selected("test_review_callback_early_error_is_local_to_inner_callback") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    executes(review, "function maker(): Callback<Boolean, Result<Text, Text>> {\n    let counter = [0]\n    return function(good: Boolean): Result<Text, Text> {\n        let nested: Callback<Boolean, Result<Integer, Text>> = function(ok: Boolean): Result<Integer, Text> {\n            let guard = Bytes(\"guard\")\n            if !ok { return Err<Integer, Text>(\"inner\" + Text(guard.length)) }\n            return Ok<Integer, Text>(42)\n        }\n        let n = try nested(good)\n        counter[0] = counter[0] + 1\n        return Ok<Text, Text>(Text(n) + \":\" + Text(counter[0]))\n    }\n}\nlet call = maker()\nmatch call(false) { Ok(v) { print(v) } Err(e) { print(e) } }\nmatch call(true) { Ok(v) { print(v) } Err(e) { print(e) } }\n", "inner5\n42:1\n")
+}
+if selected("test_review_same_record_spelling_in_distinct_modules_is_not_same_error") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    writeTextFile(compiler.directory + "/left.min", "public record Failure { text: Text }\npublic function failRead(): Result<Integer, Failure> {\n    return Err<Integer, Failure>(Failure { text: \"left\" })\n}\n")
+    writeTextFile(compiler.directory + "/right.min", "public record Failure { text: Text }\n")
+    rejects(review, "use \"./left.min\" as left\nuse \"./right.min\" as right\nfunction wrong(): Result<Integer, right.Failure> {\n    let n = try left.failRead()\n    return Ok<Integer, right.Failure>(n)\n}\n", "try error type must match")
+}
+if selected("test_review_module_alias_diamond_nested_callback_result_identity") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    writeTextFile(compiler.directory + "/shared.min", "public record Payload { text: Text }\npublic function make(): Result<Payload, Text> {\n    return Ok<Payload, Text>(Payload { text: \"diamond\" + \"!\" })\n}\n")
+    writeTextFile(compiler.directory + "/bridge.min", "use \"./shared.min\" as source\npublic function callback(): Callback<Result<source.Payload, Text>> {\n    return function(): Result<source.Payload, Text> { return source.make() }\n}\n")
+    executes(review, "use \"./shared.min\" as first\nuse \"./shared.min\" as second\nuse \"./bridge.min\" as bridge\nfunction run(): Result<Text, Text> {\n    let call = bridge.callback()\n    let result: Result<second.Payload, Text> = call()\n    let payload: first.Payload = try result\n    return Ok<Text, Text>(payload.text)\n}\nmatch run() { Ok(v) { print(v) } Err(e) { print(e) } }\n", "diamond!\n")
+}
+if selected("test_review_match_inside_module_with_constant_named_payload") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    writeTextFile(compiler.directory + "/worker.min", "constant payload: Integer = 999\npublic function process(input: Result<Text, Text>): Text {\n    match input {\n        Ok(payload) { return payload + \" good\" }\n        Err(payload) { return payload + \" bad\" }\n    }\n}\n")
+    executes(review, "use \"./worker.min\" as worker\nprint(worker.process(Ok<Text, Text>(\"value\" + \"!\")))\nprint(worker.process(Err<Text, Text>(\"error\" + \"!\")))\n", "value! good\nerror! bad\n")
+}
+if selected("test_review_result_names_remain_values_in_ordinary_comparisons") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    executes(review, "let Result = 1\nlet Ok = 2\nlet Err = 3\nprint(Result < 2)\nprint(Ok < Err)\nprint(Err < 4)\n", "true\ntrue\ntrue\n")
+}
+if selected("test_review_quoted_generic_delimiters_are_rejected") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    malformed(review, "let x: Result\"<\"Integer, Text> = Ok<Integer, Text>(1)\n", false)
+    malformed(review, "let x: Result<Integer \",\" Text> = Ok<Integer, Text>(1)\n", false)
+    malformed(review, "let x: Result<Integer, Text\">\" = Ok<Integer, Text>(1)\n", false)
+    malformed(review, "let x = Ok\"<\"Integer, Text>(1)\n", false)
+    malformed(review, "let x = Ok<Integer \",\" Text>(1)\n", false)
+    malformed(review, "let x = Ok<Integer, Text\">\"(1)\n", false)
+}
+if selected("test_review_truncated_headers_reject_without_runtime_fault") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    malformed(review, "let x = Result<\n", true)
+    malformed(review, "let x = Result<Integer,\n", true)
+    malformed(review, "let x = Result<Result<Integer, Text>\n", true)
+    malformed(review, "let x = Ok<Integer, Text>(\n", true)
+    malformed(review, "let x = Err<List<Text>, Result<Integer,\n", true)
+}
+if selected("test_review_results_preserve_nested_reference_errors") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    executes(review, "function first(good: Boolean): Result<Bytes, Result<List<Text>, Bytes>> {\n    if good { return Ok<Bytes, Result<List<Text>, Bytes>>(Bytes(\"abc\")) }\n    return Err<Bytes, Result<List<Text>, Bytes>>(Ok<List<Text>, Bytes>([\"nested\" + \"!\"]))\n}\nfunction second(good: Boolean): Result<Integer, Result<List<Text>, Bytes>> {\n    let bytes = try first(good)\n    return Ok<Integer, Result<List<Text>, Bytes>>(bytes.length)\n}\nfor good in [false, true] {\n    match second(good) {\n        Ok(n) { print(n) }\n        Err(error) { match error {\n            Ok(words) { print(words[0]) }\n            Err(bytes) { print(Text(bytes)) }\n        } }\n    }\n}\n", "nested!\n3\n")
+}
+if selected("test_review_callback_mutation_removes_last_container_owner") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    executes(review, "record Node { values: List<Result<Callback<Text>, Callback<Text>>> }\nfunction make(): Node {\n    let node = Node { values: [] }\n    let callback = function(): Text {\n        node.values = []\n        return \"alive\" + \"!\"\n    }\n    node.values.add(Ok<Callback<Text>, Callback<Text>>(callback))\n    node.values.add(Err<Callback<Text>, Callback<Text>>(callback))\n    return node\n}\nlet first = make()\nmatch first.values[0] { Ok(call) { print(call()) } Err(call) { print(call()) } }\nlet second = make()\nmatch second.values[1] { Ok(call) { print(call()) } Err(call) { print(call()) } }\nprint(first.values.length); print(second.values.length)\n", "alive!\nalive!\n0\n0\n")
+}
+if selected("test_review_each_result_generic_delimiter_keeps_lexical_kind") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    for constructor in ["Ok<Integer, Text>(1)", "Err<Integer, Text>(\"bad\")", "Ok<List<Integer>, Text>([1])", "Ok<Result<Integer, Text>, Bytes>(Ok<Integer, Text>(1))"] {
+        let raw = Bytes(constructor)
+        let index = 0
+        while index < raw.length {
+            if raw[index] == 60 || raw[index] == 44 || raw[index] == 62 {
+                let width = 1
+                if raw[index] == 62 && index + 1 < raw.length && raw[index + 1] == 62 { width = 2 }
+                let mutated = Text(raw.slice(0, index)) + "\"" + Text(raw.slice(index, index + width)) + "\"" + Text(raw.slice(index + width, raw.length))
+                malformed(review, "let result = " + mutated + "\n", false)
+                index += width
+            } else { index += 1 }
+        }
+    }
+}
+if selected("test_review_collect_short_circuits_before_fatal_callback") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    executes(review, "function collect(calls: List<Callback<Result<Integer, Text>>>): Result<List<Integer>, Text> {\n    let collected: List<Integer> = []\n    for call in calls {\n        let value = try call()\n        collected.add(value)\n    }\n    return Ok<List<Integer>, Text>(collected)\n}\nlet first = function(): Result<Integer, Text> { return Ok<Integer, Text>(42) }\nlet error = function(): Result<Integer, Text> { return Err<Integer, Text>(\"stop\" + \"!\") }\nlet fatal = function(): Result<Integer, Text> { fail(\"must never run\"); return Ok<Integer, Text>(0) }\nmatch collect([first, error, fatal]) {\n    Ok(values) { print(values.length) }\n    Err(error) { print(error) }\n}\nmatch collect([first, first]) {\n    Ok(values) { print(values[0] + values[1]) }\n    Err(error) { print(error) }\n}\n", "stop!\n84\n")
+}
+if selected("test_review_match_and_try_evaluate_input_once") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    executes(review, "record Counter { calls: Integer }\nfunction next(counter: Counter): Result<Integer, Text> {\n    counter.calls = counter.calls + 1\n    return Ok<Integer, Text>(counter.calls)\n}\nfunction twice(counter: Counter): Result<Integer, Text> {\n    let first = try next(counter)\n    match next(counter) {\n        Ok(second) { return Ok<Integer, Text>(first + second) }\n        Err(error) { return Err<Integer, Text>(error) }\n    }\n}\nlet counter = Counter { calls: 0 }\nmatch twice(counter) { Ok(value) { print(value) } Err(error) { print(error) } }\nprint(counter.calls)\n", "3\n2\n")
+}
+if selected("test_review_udp_truncation_empty_packet_wouldblock_and_recovery") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    review.sources = ["runtime/native/net.c"]
+    executes(review, "use \"results\" as results\nuse \"errors\" as errors\nuse \"net\" as net\nlet receiver = net.udp(\"127.0.0.1\", 0)\nlet sender = net.udp(\"127.0.0.1\", 0)\nprint(receiver >= 0 && sender >= 0)\nprint(net.udpConnect(sender, \"127.0.0.1\", net.localPort(receiver)))\nmatch results.receiveDatagram(receiver, 16) {\n    Ok(read) { print(\"unexpected initial packet\") }\n    Err(error) { print(errors.code(results.error(error)) == errors.wouldBlockCode()) }\n}\nmatch results.write(sender, Bytes(\"abcdef\")) { Ok(n) { print(n) } Err(e) { print(errors.message(e)) } }\nprint(net.ready(receiver, 1000))\nlet failed = results.receiveDatagram(receiver, 3)\nmatch failed {\n    Ok(read) { print(\"unexpected full packet\") }\n    Err(error) {\n        print(errors.code(results.error(error)) == errors.truncatedCode())\n        print(Text(results.prefix(error)))\n    }\n}\nmatch results.write(sender, Bytes()) { Ok(n) { print(n) } Err(e) { print(errors.message(e)) } }\nprint(net.ready(receiver, 1000))\nmatch results.receiveDatagram(receiver, 16) {\n    Ok(read) { print(results.ended(read)); print(results.data(read).length) }\n    Err(error) { print(errors.message(results.error(error))) }\n}\nmatch failed { Ok(read) { print(\"unexpected\") } Err(error) { print(Text(results.prefix(error))) } }\nnet.close(sender); net.close(receiver)\n", "true\ntrue\ntrue\n6\ntrue\ntrue\nabc\n0\ntrue\nfalse\n0\nabc\n")
+}
+if selected("test_review_tcp_short_reads_and_eof_are_distinct") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    review.sources = ["runtime/native/net.c"]
+    executes(review, "use \"net\" as net\nuse \"results\" as results\nuse \"errors\" as errors\nlet listener = net.listen(\"127.0.0.1\", 0, 4)\nlet sender = net.connect(\"127.0.0.1\", net.localPort(listener))\nlet written = results.write(sender, Bytes(\"abc\"))\nif !net.ready(listener, 1000) { fail(\"TCP listener did not become ready\") }\nlet receiver = net.accept(listener)\nprint(listener >= 0 && sender >= 0 && receiver >= 0)\nmatch written { Ok(n) { print(n) } Err(e) { print(errors.message(e)) } }\nnet.close(sender)\nprint(net.ready(receiver, 1000))\nmatch results.read(receiver, 2) {\n    Ok(read) { print(Text(results.data(read))); print(results.ended(read)) }\n    Err(error) { print(errors.message(results.error(error))) }\n}\nif !net.ready(receiver, 1000) { fail(\"TCP suffix did not become ready\") }\nmatch results.read(receiver, 16) {\n    Ok(read) { print(Text(results.data(read))); print(results.ended(read)) }\n    Err(error) { print(errors.message(results.error(error))) }\n}\nif !net.ready(receiver, 1000) { fail(\"TCP EOF did not become ready\") }\nmatch results.read(receiver, 16) {\n    Ok(read) { print(results.data(read).length); print(results.ended(read)) }\n    Err(error) { print(errors.message(results.error(error))) }\n}\nnet.close(receiver); net.close(listener)\n", "true\n3\ntrue\nab\nfalse\nc\nfalse\n0\ntrue\n")
+}
+if selected("test_review_tcp_deferred_accept_short_reads_and_eof") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    let rootResult = test.run(["pwd", "-P"], system.environment(), "", compiler.directory + "/root", 10)
+    test.require(rootResult, "resolve deferred TCP provider")
+    let provider = test.lines(rootResult.output)[0] + "/runtime/native/net.c"
+    let wrapper = compiler.directory + "/deferred-net.c"
+    writeTextFile(wrapper, "#define minyar_net_listen review_actual_listen\n#include \"" + provider + "\"\n#undef minyar_net_listen\n#include <assert.h>\n#include <netinet/in.h>\n#include <netinet/tcp.h>\nlong long minyar_net_listen(const MinyarText *host, long long port, long long backlog) {\n    long long handle = review_actual_listen(host, port, backlog);\n    if (handle >= 0) {\n        int seconds = 10;\n        assert(setsockopt((int)handle, IPPROTO_TCP, TCP_DEFER_ACCEPT,\n                         &seconds, sizeof(seconds)) == 0);\n    }\n    return handle;\n}\n")
+    review.sources = [wrapper]
+    executes(review, "use \"net\" as net\nuse \"results\" as results\nuse \"errors\" as errors\nlet listener = net.listen(\"127.0.0.1\", 0, 4)\nlet sender = net.connect(\"127.0.0.1\", net.localPort(listener))\nlet written = results.write(sender, Bytes(\"abc\"))\nif !net.ready(listener, 1000) { fail(\"TCP listener did not become ready\") }\nlet receiver = net.accept(listener)\nprint(listener >= 0 && sender >= 0 && receiver >= 0)\nmatch written { Ok(n) { print(n) } Err(e) { print(errors.message(e)) } }\nnet.close(sender)\nprint(net.ready(receiver, 1000))\nmatch results.read(receiver, 2) {\n    Ok(read) { print(Text(results.data(read))); print(results.ended(read)) }\n    Err(error) { print(errors.message(results.error(error))) }\n}\nif !net.ready(receiver, 1000) { fail(\"TCP suffix did not become ready\") }\nmatch results.read(receiver, 16) {\n    Ok(read) { print(Text(results.data(read))); print(results.ended(read)) }\n    Err(error) { print(errors.message(results.error(error))) }\n}\nif !net.ready(receiver, 1000) { fail(\"TCP EOF did not become ready\") }\nmatch results.read(receiver, 16) {\n    Ok(read) { print(results.data(read).length); print(results.ended(read)) }\n    Err(error) { print(errors.message(results.error(error))) }\n}\nnet.close(receiver); net.close(listener)\n", "true\n3\ntrue\nab\nfalse\nc\nfalse\n0\ntrue\n")
+}
+if selected("test_review_inactive_reference_slots_are_null_and_unowned") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    review.helpers = "\nvoid review_result_slots(MinyarRecord *result) {\n    assert(result->length == 3);\n    long long good = result->values[0];\n    assert(good == 0 || good == 1);\n    unsigned char *references = (unsigned char *)(result->values + result->length);\n    long long active = good ? 1 : 2, inactive = good ? 2 : 1;\n    assert(references[0] == 0);\n    assert(references[active] == 1);\n    assert(references[inactive] == 0);\n    assert(result->values[active] != 0);\n    assert(result->values[inactive] == 0);\n}\n"
+    review.slots = true
+    executes(review, "let ok = Ok<Text, Text>(\"active\" + \" success\")\nlet error = Err<Text, Text>(\"active\" + \" error\")\nmatch ok { Ok(value) { print(value) } Err(error) { print(error) } }\nmatch error { Ok(value) { print(value) } Err(error) { print(error) } }\n", "active success\nactive error\n")
+}
+if selected("test_review_early_return_reclaims_cycles_before_next_iteration") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    review.helpers = "\nlong long minyar_reviewcleanup_live(void) {\n    while (rc_pending_count) assert(minyar_rc_poll(1) > 0);\n    return (long long)(rc_object_count - rc_immortal_object_count);\n}\n"
+    executes(review, "function live(): Integer { native \"reviewcleanup\" }\nrecord Node { results: List<Result<Callback<Integer>, Callback<Integer>>> }\nfunction leaf(good: Boolean): Result<Integer, Integer> {\n    if good { return Ok<Integer, Integer>(42) }\n    return Err<Integer, Integer>(7)\n}\nfunction work(good: Boolean): Result<Integer, Integer> {\n    let node = Node { results: [] }\n    let callback = function(): Integer { return node.results.length }\n    node.results.add(Ok<Callback<Integer>, Callback<Integer>>(callback))\n    node.results.add(Err<Callback<Integer>, Callback<Integer>>(callback))\n    let local = Bytes(256)\n    let value = try leaf(good)\n    return Ok<Integer, Integer>(value + local.length)\n}\nlet baseline = live()\nfor i in 0..64 {\n    match work(i % 2 == 0) {\n        Ok(value) { if value != 298 { fail(\"wrong success\") } }\n        Err(error) { if error != 7 { fail(\"wrong error\") } }\n    }\n    if live() != baseline { fail(\"early return retained an owner\") }\n}\nprint(\"clean each iteration\")\n", "clean each iteration\n")
+}
+if selected("test_review_quoted_double_close_is_not_type_punctuation") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    malformed(review, "let x: Result<Text, Result<Integer, Bytes\">>\" = Err<Text, Result<Integer, Bytes>>(Err<Integer, Bytes>(Bytes()))\n", false)
+    malformed(review, "let x: Result<Result<Integer, Bytes>, Text\">\" = Err<Result<Integer, Bytes>, Text>(\"bad\")\n", false)
+}
+if selected("test_review_callback_type_commas_are_punctuation") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    for comma in ["\",\"", "','"] {
+        let callback = "Callback<Integer " + comma + " Integer>"
+        for declaration in ["let result: Result<" + callback + ", Text> = Ok<Callback<Integer, Integer>, Text>(function(n: Integer): Integer { return n })\n", "let results: List<Result<" + callback + ", Text>> = []\n", "record Box { result: Result<" + callback + ", Text> }\n"] { malformed(review, declaration, false) }
+    }
+}
+if selected("test_review_results_cannot_cross_scalar_parallel_or_native_abi") {
+    review.helpers = ""; review.sources = []; review.slots = false
+    for type in ["Result<Integer, Text>", "List<Result<Integer, Text>>", "Callback<Result<Integer, Text>>", "Text", "Bytes", "Box"] {
+        for suffix in ["", "let entry = parallelEntry(bad)\n"] { rejects(review, "record Box { value: Integer }\nparallel function bad(result: " + type + "): Integer { return 1 }\n" + suffix, "may use only Integer") }
+    }
+    rejects(review, "parallel function bad(result: Result<Integer, Text>): Integer { return 1 }\n", "may use only Integer")
+    rejects(review, "parallel function bad(): Result<Integer, Integer> { return Ok<Integer, Integer>(1) }\n", "may use only Integer")
+    rejects(review, "function bad(result: Result<Integer, Text>): Integer { native \"review\" }\n", "native functions accept")
+}
+test.removeTree(compiler.directory)
+print("Result review ownership, syntax and networking: passed")

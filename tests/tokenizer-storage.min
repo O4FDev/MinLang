@@ -1,0 +1,266 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+function count(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let found = 0
+    if raw.length < pattern.length { return 0 }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { found += 1 }
+    }
+    return found
+}
+function hex(source: Text): Text {
+    let digits = "0123456789abcdef"
+    let parts: List<Text> = []
+    for byte in Bytes(source) { parts.add(Text(digits[byte / 16])); parts.add(Text(digits[byte % 16])) }
+    return joinText(parts)
+}
+record Case { name: Text; source: Text; expected: Text; error: Text; lists: Integer }
+function append(rows: List<Text>, kind: Integer, source: Text, line: Integer, column: Integer) {
+    rows.add(Text(kind) + "\t" + Text(line) + ", column " + Text(column) + "\t" + hex(source) + "\n")
+}
+function letter(value: Character): Boolean {
+    return (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') || value == '_'
+}
+function oracle(case: Case) {
+    let source = case.source
+    let rows: List<Text> = []
+    let index = 0
+    let line = 1
+    let lineStart = 0
+    let last = -1
+    let escapedLiterals = 0
+    while index < source.length {
+        let value = source[index]
+        if value == ' ' || value == '\t' || value == '\r' || value == '\n' {
+            if value == '\n' {
+                if last == 1 || last == 2 || last == 3 || last == 5 { append(rows, 6, "end of line", line, index - lineStart + 1); last = 6 }
+                line += 1; lineStart = index + 1
+            }
+            index += 1
+        } else if value == '"' {
+            let startLine = line
+            let startColumn = index - lineStart + 1
+            index += 1
+            let text: List<Text> = []
+            let escaped = false
+            while index < source.length && source[index] != '"' {
+                let character = source[index]
+                if character == '\\' && index + 1 < source.length {
+                    escaped = true
+                    character = source[index + 1]
+                    if character == '\n' { line += 1; lineStart = index + 2 }
+                    if character == 'n' { text.add("\n") }
+                    else if character == 'r' { text.add("\r") }
+                    else if character == 't' { text.add("\t") }
+                    else { text.add(Text(character)) }
+                    index += 2
+                } else {
+                    if character == '\n' { line += 1; lineStart = index + 1 }
+                    text.add(Text(character)); index += 1
+                }
+            }
+            if index == source.length {
+                case.error = "line " + Text(startLine) + ", column " + Text(startColumn) + ": Text literal is missing its closing quote"
+                case.lists = 0
+                return
+            }
+            index += 1
+            if escaped { escapedLiterals += 1 }
+            append(rows, 3, joinText(text), startLine, startColumn)
+            last = 3
+        } else {
+            test.check(letter(value), "invalid independent tokenizer case character")
+            let start = index
+            while index < source.length && (letter(source[index]) || (source[index] >= '0' && source[index] <= '9')) { index += 1 }
+            append(rows, 1, source.slice(start, index), line, start - lineStart + 1)
+            last = 1
+        }
+    }
+    append(rows, 0, "", line, index - lineStart + 1)
+    case.expected = joinText(rows)
+    case.lists = escapedLiterals
+}
+function fixture(name: Text, source: Text): Case { return Case { name: name; source: source; expected: ""; error: ""; lists: 0 } }
+function find(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if raw.length < pattern.length { return -1 }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { return start }
+    }
+    return -1
+}
+function absolute(path: Text, work: Text): Text {
+    let process = test.run(["realpath", "-m", "--", path], system.environment(), "", work + "/resolve", 10)
+    test.require(process, "resolve tokenizer input path")
+    return test.lines(process.output)[0]
+}
+let work = test.scratch()
+let rootResult = test.run(["pwd", "-P"], system.environment(), "", work + "/root", 10)
+test.require(rootResult, "resolve tokenizer root")
+let root = test.lines(rootResult.output)[0]
+let compiler = ""
+let source = ""
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let index = 0
+while index < argumentCount() {
+    let option = argument(index)
+    let name = option
+    let value = ""
+    let equals = find(option, "=")
+    if equals >= 0 { name = Text(Bytes(option).slice(0, equals)); value = Text(Bytes(option).slice(equals + 1, Bytes(option).length)) }
+    else { test.check(index + 1 < argumentCount(), "missing tokenizer option value"); index += 1; value = argument(index) }
+    if name == "--root" { root = absolute(value, work) }
+    else if name == "--compiler" { compiler = absolute(value, work) }
+    else if name == "--source" { source = absolute(value, work) }
+    else if name == "--clang" { clang = value }
+    else { fail("unknown tokenizer option " + name) }
+    index += 1
+}
+if compiler == "" { compiler = absolute(test.setting("MINYAR_TEST_COMPILER", root + "/build/minyarc"), work) }
+if source == "" { source = absolute(test.setting("MINYAR_TEST_COMPILER_SOURCE", root + "/build/compiler.min"), work) }
+let environment: List<Text> = []
+for entry in system.environment() { if !starts(entry, "ASAN_OPTIONS=") && !starts(entry, "UBSAN_OPTIONS=") { environment.add(entry) } }
+environment.add("ASAN_OPTIONS=detect_leaks=0:halt_on_error=1")
+environment.add("UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=0")
+let cases: List<Case> = []
+let identifiers: List<Text> = []
+let names = ["alpha", "_a2", "Z9_", "function"]
+for index in 0..256 { if index > 0 { identifiers.add(" ") }; identifiers.add(names[index % 4]) }
+cases.add(fixture("identifiers", joinText(identifiers)))
+cases.add(fixture("prefix", "\r\nalpha \"plain\" beta\r\n\"é🙂\" tail\n"))
+cases.add(fixture("nul", ("head \"a" + Text(Character(0)) + "b\" next\n\"\\" + Text(Character(0)) + "\" end")))
+cases.add(fixture("lines", "\n\nhead \"before\r\n\\\nafter\\nlast\" tail\r\nend"))
+cases.add(fixture("quote_boundary", "\"\\\"\"\"next\" tail"))
+cases.add(fixture("slash_parity", "\"\\\\\" \"\\\\\\\"end\" next"))
+cases.add(fixture("empty", "\n\"\" next \"\\q\\é\\🙂\"\n"))
+let longParts = ["before \""]
+for index in 0..1024 { longParts.add("é") }
+longParts.add("\\n")
+for index in 0..4096 { longParts.add("a") }
+longParts.add("\" after\n")
+cases.add(fixture("long", joinText(longParts)))
+cases.add(fixture("missing_plain", "\r\nhead\n\"plain\nunterminated"))
+cases.add(fixture("missing_escape", "\n\n\"prefix\\nlast"))
+cases.add(fixture("trailing_slash", "\nhead\n\"abc\\"))
+cases.add(fixture("consumed_quote", "\n\n\"abc\\\""))
+let growth: List<Text> = []
+for index in 0..44000 { if index > 0 { growth.add(" ") }; growth.add("value") }
+cases.add(fixture("coordinate_growth", joinText(growth)))
+let atoms = ["a", "é", "🙂", "\n", "\r", "\t", "\\n", "\\r", "\\t", "\\\\", "\\\"", "\\q", "\\é", "\\🙂", "\\\n"]
+let composed = [""]
+for atom in atoms { composed.add(atom) }
+for left in atoms { for right in atoms { composed.add(left + right) } }
+let literals: List<Text> = []
+for index in 0..composed.length { if index > 0 { literals.add(" ") }; literals.add("\"" + composed[index] + "\"") }
+cases.add(fixture("composed", joinText(literals)))
+test.check(cases.length == 14 && composed.length == 241, "tokenizer original case domain")
+for case in cases { oracle(case); writeTextFile(work + "/" + case.name + ".min", case.source) }
+let llvm = work + "/compiler.ll"
+test.require(test.run([compiler, source, llvm], environment, "", work + "/compile", 120), "compile tokenizer probe compiler")
+let ir = readTextFile(llvm)
+let parts: List<Text> = []
+let mainDefinitions = 0
+let tokenizerDefinitions = 0
+let inside = false
+let body: List<Text> = []
+for line in test.lines(ir) {
+    if starts(line, "define i32 @main(") {
+        line = test.replace(line, "define i32 @main(", "define i32 @compiler_main(")
+        mainDefinitions += 1
+    }
+    if starts(line, "define void @.minyar.fn.tokenize(") {
+        let raw = Bytes(line)
+        test.check(raw.length >= 3 && Text(raw.slice(raw.length - 3, raw.length)) == ") {", "tokenizer function header")
+        inside = true
+        body = [line + "\n"]
+        tokenizerDefinitions += 1
+    } else if inside {
+        body.add(line + "\n")
+        if line == "}" {
+            inside = false
+            let original = joinText(body)
+            test.check(count(original, "call ptr @minyar_list_new()") == 1, "tokenizer scratch List allocation site count")
+            parts.add(test.replace(original, "call ptr @minyar_list_new()", "call ptr @probe_tokenizer_list()"))
+        }
+    } else { parts.add(line + "\n") }
+}
+test.check(mainDefinitions == 1 && tokenizerDefinitions == 1 && !inside, "compiler tokenizer probe definitions")
+parts.add("\ndeclare ptr @probe_tokenizer_list()\n")
+ir = joinText(parts)
+parts = []
+let locations = 0
+for line in test.lines(ir) {
+    if starts(line, "define ptr @.minyar.fn.sourceLocation(") {
+        line = test.replace(line, "@.minyar.fn.sourceLocation(", "@original_source_location(")
+        locations += 1
+    }
+    line = test.replace(line, "call ptr @.minyar.fn.sourceLocation(", "call ptr @probe_source_location(")
+    if starts(line, "  ") {
+        line = test.replace(line, "call i32 @minyar_text_character_at(", "call i32 @probe_source_character(")
+        line = test.replace(line, "call i64 @minyar_record_get(", "call i64 @probe_source_map_field(")
+    }
+    parts.add(line + "\n")
+}
+test.check(locations == 1, "tokenizer source location definition rename count")
+parts.add("\ndeclare ptr @probe_source_location(i64, i64)\ndeclare i32 @probe_source_character(ptr, i64)\ndeclare i64 @probe_source_map_field(ptr, i64)\n")
+ir = joinText(parts)
+writeTextFile(llvm, ir)
+let sanitized = work + "/sanitized.ll"
+writeTextFile(sanitized, test.instrument(ir))
+let checks = 0
+for profile in ["eager", "system"] {
+    for optimization in ["-O0", "-O2"] {
+        for mode in ["native", "sanitize"] {
+            let command = [clang, optimization]
+            if profile == "system" { command.add("-DMINYAR_SYSTEM_HEAP=1") }
+            let input = llvm
+            if mode == "sanitize" {
+                for flag in ["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"] { command.add(flag) }
+                input = sanitized
+            }
+            let executable = work + "/tokenizer"
+            for item in ["-Wno-override-module", "-I", root, input, root + "/tests/tokenizer-storage.c", "-lm", "-o", executable] { command.add(item) }
+            test.require(test.run(command, environment, "", work + "/link", 120), "build tokenizer " + profile + " " + optimization + " " + mode)
+            for case in cases {
+                let arguments = [executable, work + "/" + case.name + ".min"]
+                if case.name == "identifiers" { arguments.add(Text(case.source.length + 257)) }
+                let result = test.run(arguments, environment, "", work + "/run", 120)
+                let context = profile + " " + optimization + " " + mode + " " + case.name
+                if case.error != "" {
+                    test.check(result.status == 1 && test.contains(result.errorOutput, case.error), "tokenizer missing literal diagnostic " + context + "\n" + result.errorOutput)
+                } else {
+                    test.check(result.status == 0 && test.contains(result.errorOutput, "OWNERS clean=1"), "tokenizer exact owner cleanup " + context + "\n" + result.errorOutput)
+                    test.check(result.output == case.expected, "independent tokenizer kinds/texts/coordinates " + context)
+                    let marker = "TOKEN_LISTS="
+                    let start = find(result.errorOutput, marker)
+                    test.check(start >= 0, "tokenizer scratch List count " + context)
+                    start += Bytes(marker).length
+                    let raw = Bytes(result.errorOutput)
+                    let ending = start
+                    while ending < raw.length && raw[ending] >= 48 && raw[ending] <= 57 { ending += 1 }
+                    test.check(ending > start, "tokenizer scratch List integer " + context)
+                    test.check(Integer(Text(raw.slice(start, ending))) <= 3 * case.lists, "unexpected tokenizer scratch Lists " + context)
+                }
+                checks += 1
+            }
+        }
+    }
+}
+test.check(checks == 112, "tokenizer original successful/failing profile matrix")
+test.removeTree(work)
+print("Tokenizer storage passed: " + Text(checks) + " checks, including " + Text(composed.length) + " composed literals per successful matrix run.")

@@ -1,0 +1,35 @@
+use "../tools/testing.min" as test
+use "../tools/check-runner.min" as runner
+use "system" as system
+test.check(argumentCount() == 0, "unexpected system configuration option")
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let work = test.scratch()
+let environment = runner.environment(system.environment(), "ASAN_OPTIONS", "detect_leaks=0:allocator_may_return_null=1:symbolize=0")
+for budget in [1, 32, 1024] {
+    for mode in ["native", "sanitize"] {
+        let executable = work + "/system-" + Text(budget) + "-" + mode
+        let optimization = "-O2"
+        if mode == "sanitize" { optimization = "-O1" }
+        let command = [clang, "-std=c11", "-Wall", "-Wextra", "-Werror", optimization, "-DMINYAR_RC_POLL_BUDGET=" + Text(budget)]
+        if mode == "sanitize" { command.add("-g"); command.add("-fsanitize=address,undefined") }
+        for item in ["tests/system-bounded-runtime.c", "-lm", "-o", executable] { command.add(item) }
+        test.require(test.run(command, environment, "", work + "/compile", 120), "system configuration compile")
+        test.require(test.run([executable], environment, "", work + "/normal", 120), "system allocation and bounded traversal")
+        let oom = test.run([executable, "oom"], environment, "", work + "/oom", 120)
+        test.check(oom.status != 0 && oom.status != 124 && test.contains(oom.errorOutput, "ran out of memory"), "system OOM diagnostic changed\n" + oom.errorOutput)
+        if mode == "sanitize" {
+            let stale = test.run([executable, "stale"], environment, "", work + "/stale", 120)
+            test.check(stale.status != 0 && stale.status != 124 && test.contains(stale.errorOutput, "heap-use-after-free"), "system stale reference diagnostic changed\n" + stale.errorOutput)
+        }
+        print("budget" + Text(budget) + " " + mode + ": 80MiB, graph/frame recovery, OOM/stale passed")
+    }
+}
+for other in ["MINYAR_BOUNDED_HEAP", "MINYAR_LAZY_HEAP"] {
+    let command = [clang, "-std=c11", "-DMINYAR_SYSTEM_HEAP=1", "-D" + other + "=1", "-fsyntax-only", "runtime/minyar_runtime.c"]
+    let conflict = test.run(command, system.environment(), "", work + "/conflict", 30)
+    test.check(conflict.status != 0 && conflict.status != 124 && (test.contains(conflict.errorOutput, "not both") || test.contains(conflict.errorOutput, "cannot be combined")), "conflicting backends were accepted\n" + conflict.errorOutput)
+    command.add("-DMINYAR_COMPILER_ARENA=1")
+    test.require(test.run(command, system.environment(), "", work + "/arena", 30), "compiler arena ignores allocator profiles")
+}
+test.removeTree(work)
+print("conflicting backends rejected; compiler arena ignores allocator profiles")
