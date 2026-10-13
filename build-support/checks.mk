@@ -319,8 +319,8 @@ check-fused-unary: build/tooling/tests/fused-unary-regressions build/tooling/tes
 check-unary-pairs: check-fused-unary
 	$(SANITIZER_LIMITED) python3 tests/unary-pair-regressions.py --clang "$(LLVM_CC)"
 
-check-memory-profiles: build/minyar-runtime-system.o check-unary-pairs check-text-view-budget build/tooling/tests/system-configurations build/tooling/tests/lazy-configurations
-	$(SANITIZER_LIMITED) python3 tests/memory-profile-regressions.py --runtime-source runtime/minyar_runtime.c --suite focused --clang "$(LLVM_CC)"
+check-memory-profiles: build/minyar-runtime-system.o check-unary-pairs check-text-view-budget build/tooling/tests/system-configurations build/tooling/tests/lazy-configurations build/tooling/tests/memory-profile-regressions
+	$(SANITIZER_LIMITED) ./build/tooling/tests/memory-profile-regressions --runtime-source runtime/minyar_runtime.c --suite focused --clang "$(LLVM_CC)"
 	$(SANITIZER_LIMITED) ./build/tooling/tests/system-configurations
 	$(SANITIZER_LIMITED) ./build/tooling/tests/lazy-configurations --clang "$(LLVM_CC)"
 

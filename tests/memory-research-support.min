@@ -1,0 +1,166 @@
+use "../tools/testing.min" as test
+use "./sha256pure.min" as sha
+use "system" as system
+use "files" as files
+use "json" as json
+
+public record Row { label: Text; command: List<Text>; log: Text; cwd: Text; timeout: Integer; returncode: Integer; timedOut: Boolean; environment: List<Text>; output: Text; errorOutput: Text }
+public function root(scratch: Text): Text {
+    let location = test.run(["/bin/pwd", "-P"], system.environment(), "", scratch + "/root", 10)
+    test.require(location, "project location")
+    return test.lines(location.output)[0]
+}
+public function starts(value: Text, prefix: Text): Boolean {
+    let raw = Bytes(value)
+    return raw.length >= prefix.byteLength && Text(raw.slice(0, prefix.byteLength)) == prefix
+}
+public function ends(value: Text, suffix: Text): Boolean {
+    let raw = Bytes(value)
+    return raw.length >= suffix.byteLength && Text(raw.slice(raw.length - suffix.byteLength, raw.length)) == suffix
+}
+public function absolute(path: Text, base: Text): Text {
+    if starts(path, "/") { return path }
+    return base + "/" + path
+}
+public function parent(path: Text): Text {
+    let raw = Bytes(path)
+    let index = raw.length - 1
+    while index > 0 && raw[index] != 47 { index -= 1 }
+    if index <= 0 { return "/" }
+    return Text(raw.slice(0, index))
+}
+public function name(path: Text): Text {
+    let raw = Bytes(path)
+    let index = raw.length - 1
+    while index >= 0 && raw[index] != 47 { index -= 1 }
+    return Text(raw.slice(index + 1, raw.length))
+}
+public function makeDirectories(path: Text) {
+    if files.pathSize(path) >= 0 { return }
+    let up = parent(path)
+    if up != path && up != "/" { makeDirectories(up) }
+    test.check(files.makeDirectory(path) == 0, "cannot create directory " + path)
+}
+public function utf8(raw: Bytes): Text {
+    let result = Bytes()
+    let index = 0
+    while index < raw.length {
+        let lead = raw[index]
+        let width = 0
+        let low = 128
+        let high = 191
+        if lead < 128 { width = 1 }
+        else if lead >= 194 && lead <= 223 { width = 2 }
+        else if lead >= 224 && lead <= 239 { width = 3; if lead == 224 { low = 160 }; if lead == 237 { high = 159 } }
+        else if lead >= 240 && lead <= 244 { width = 4; if lead == 240 { low = 144 }; if lead == 244 { high = 143 } }
+        let valid = width > 0 && index + width <= raw.length
+        if valid && width > 1 {
+            if raw[index + 1] < low || raw[index + 1] > high { valid = false }
+            for offset in 2..width { if valid && (raw[index + offset] < 128 || raw[index + offset] > 191) { valid = false } }
+        }
+        if valid {
+            for offset in 0..width { result.add(raw[index + offset]) }
+            index += width
+        } else {
+            result.add(239); result.add(191); result.add(189)
+            index += 1
+        }
+    }
+    return Text(result)
+}
+public function readText(path: Text): Text {
+    if files.pathSize(path) < 0 { return "" }
+    return utf8(files.readFile(path))
+}
+public function quote(value: Text): Text {
+    if value == "" { return "''" }
+    let safe = true
+    for byte in Bytes(value) {
+        let ok = (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+        for allowed in [95, 64, 37, 43, 61, 58, 44, 46, 47, 45] { if byte == allowed { ok = true } }
+        if !ok { safe = false }
+    }
+    if safe { return value }
+    return "'" + test.replace(value, "'", "'\"'\"'") + "'"
+}
+public function join(command: List<Text>): Text {
+    let parts: List<Text> = []
+    for index in 0..command.length { if index > 0 { parts.add(" ") }; parts.add(quote(command[index])) }
+    return joinText(parts)
+}
+public function clangCommand(command: List<Text>): List<Text> {
+    let result: List<Text> = []
+    let compileOnly = false
+    for item in command {
+        for option in ["-c", "-S", "-E", "-fsyntax-only", "--version", "-v"] { if item == option { compileOnly = true } }
+    }
+    for item in command { if compileOnly || item != "-lm" { result.add(item) } }
+    if !compileOnly { result.add("-lm") }
+    return result
+}
+public function setEnvironment(source: List<Text>, key: Text, value: Text): List<Text> {
+    let result: List<Text> = []
+    for entry in source { if !starts(entry, key + "=") { result.add(entry) } }
+    result.add(key + "=" + value)
+    return result
+}
+public function execute(label: Text, command: List<Text>, environment: List<Text>, cwd: Text, log: Text, seconds: Integer): Row {
+    let capture = log + ".capture"
+    let began = system.monotonicNanoseconds()
+    let handle = test.start(command, environment, cwd, capture, seconds)
+    let code = -1
+    let timedOut = false
+    if handle > 0 {
+        let status = system.wait(handle)
+        code = status.exitCode
+        if status.state == system.SIGNALED { code = -status.signal }
+        let elapsed = system.monotonicNanoseconds() - began
+        timedOut = (code == 124 || code == 137) && elapsed >= seconds * 1000000000
+    }
+    let output = readText(capture)
+    let errorOutput = readText(capture + ".err")
+    if handle <= 0 { errorOutput = "cannot start " + join(command) }
+    if timedOut { errorOutput = errorOutput + "\nTimed out after " + Text(seconds) + " seconds: " + join(command) + "\n" }
+    for path in [capture, capture + ".err", capture + ".timeout"] { if files.pathSize(path) >= 0 { let removed = files.remove(path) } }
+    writeTextFile(log, "$ " + join(command) + "\n\nSTDOUT\n" + output + "\nSTDERR\n" + errorOutput)
+    let kept: List<Text> = []
+    for entry in environment { if starts(entry, "MINYAR_") || starts(entry, "ASAN_") || starts(entry, "UBSAN_") { kept.add(entry) } }
+    return Row { label: label; command: command; log: log; cwd: cwd; timeout: seconds; returncode: code; timedOut: timedOut; environment: kept; output: output; errorOutput: errorOutput }
+}
+public function digest(path: Text): Text {
+    if files.pathSize(path) < 0 { return "" }
+    return sha.hex(sha.digest(files.readFile(path)))
+}
+public function texts(values: List<Text>): Text {
+    let parts: List<Text> = []
+    for index in 0..values.length { if index > 0 { parts.add(", ") }; parts.add(json.quote(values[index])) }
+    return "[" + joinText(parts) + "]"
+}
+public function object(keys: List<Text>, values: List<Text>): Text {
+    let parts: List<Text> = []
+    for index in 0..keys.length { if index > 0 { parts.add(",\n  ") }; parts.add(json.quote(keys[index]) + ": " + values[index]) }
+    return "{\n  " + joinText(parts) + "\n}"
+}
+public function array(values: List<Text>): Text {
+    let parts: List<Text> = []
+    for index in 0..values.length { if index > 0 { parts.add(",\n") }; parts.add(values[index]) }
+    return "[" + joinText(parts) + "]"
+}
+public function rowJSON(row: Row): Text {
+    let environment: List<Text> = []
+    for entry in row.environment {
+        let raw = Bytes(entry)
+        let split = 0
+        while split < raw.length && raw[split] != 61 { split += 1 }
+        environment.add(json.quote(Text(raw.slice(0, split))) + ": " + json.quote(Text(raw.slice(split + 1, raw.length))))
+    }
+    let parts: List<Text> = []
+    for index in 0..environment.length { if index > 0 { parts.add(", ") }; parts.add(environment[index]) }
+    return object(["label", "command", "log", "cwd", "timeout_seconds", "timed_out", "returncode", "environment"],
+        [json.quote(row.label), texts(row.command), json.quote(row.log), json.quote(row.cwd), Text(row.timeout), Text(row.timedOut), Text(row.returncode), "{" + joinText(parts) + "}"])
+}
+public function lastBytes(value: Text, count: Integer): Text {
+    let raw = Bytes(value)
+    if raw.length <= count { return value }
+    return utf8(raw.slice(raw.length - count, raw.length))
+}

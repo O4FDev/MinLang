@@ -1,0 +1,286 @@
+use "../tools/testing.min" as test
+use "./memory-research-support.min" as support
+use "system" as system
+use "files" as files
+use "json" as json
+
+constant STANDARD: List<Text> = ["recent-cursors", "recent-fairness", "immortal-reference-lists", "scalar-list-hotpath", "idle-service", "dead-frame-growth"]
+constant INDEPENDENT: List<Text> = ["production-live-oracle", "production-frame-oracle", "production-idle-service"]
+constant VIRTUAL = "production-virtual-stress"
+constant POOL_ONLY = "dead-frame-growth"
+constant PHASES: List<Text> = ["shared", "frames", "records", "temporaries", "graphs", "bytes", "wrapped-bytes", "frame-cache"]
+constant BACKEND_DEFINES: List<Text> = ["#define MINYAR_SYSTEM_HEAP 1", "#define MINYAR_BOUNDED_HEAP 1", "#define MINYAR_LAZY_HEAP 1"]
+
+function member(values: List<Text>, value: Text): Boolean {
+    for item in values { if item == value { return true } }
+    return false
+}
+function unique(values: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for value in values { if !member(result, value) { result.add(value) } }
+    return result
+}
+function identifier(byte: Integer): Boolean {
+    return (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+}
+record Replaced { text: Text; count: Integer }
+function replaceWord(source: Text, word: Text, replacement: Text): Replaced {
+    let raw = Bytes(source)
+    let pattern = Bytes(word)
+    let parts: List<Text> = []
+    let start = 0
+    let index = 0
+    let count = 0
+    while index + pattern.length <= raw.length {
+        let equal = true
+        for offset in 0..pattern.length { if raw[index + offset] != pattern[offset] { equal = false; break } }
+        if equal && index > 0 && identifier(raw[index - 1]) { equal = false }
+        if equal && index + pattern.length < raw.length && identifier(raw[index + pattern.length]) { equal = false }
+        if equal {
+            parts.add(Text(raw.slice(start, index))); parts.add(replacement)
+            index += pattern.length; start = index; count += 1
+        } else { index += 1 }
+    }
+    parts.add(Text(raw.slice(start, raw.length)))
+    return Replaced { text: joinText(parts); count: count }
+}
+function trimmed(line: Text): Text {
+    let raw = Bytes(line)
+    let begin = 0
+    let end = raw.length
+    while begin < end && raw[begin] <= 32 { begin += 1 }
+    while end > begin && raw[end - 1] <= 32 { end -= 1 }
+    return Text(raw.slice(begin, end))
+}
+function stripBackends(source: Text): Text {
+    let raw = Bytes(source)
+    let parts: List<Text> = []
+    let start = 0
+    for index in 0..(raw.length + 1) {
+        if index == raw.length || raw[index] == 10 {
+            let end = index
+            if index < raw.length { end = index + 1 }
+            if start < end {
+                let line = Text(raw.slice(start, end))
+                if !member(BACKEND_DEFINES, trimmed(line)) { parts.add(line) }
+            }
+            start = index + 1
+        }
+    }
+    return joinText(parts)
+}
+
+function optionValues(start: Integer): List<Text> {
+    let result: List<Text> = []
+    let position = start
+    while position < argumentCount() && !support.starts(argument(position), "--") { result.add(argument(position)); position += 1 }
+    test.check(result.length > 0, "option needs a value: " + argument(start - 1))
+    return result
+}
+function save(status: Text, failure: Text, rows: List<Text>, sources: List<Text>, staged: List<Text>, skipped: List<Text>, compiled: Integer, checks: Integer, evidence: Text, suite: Text) {
+    let keys = ["status", "suite", "sources", "staged_sources", "checks", "skipped"]
+    let values = [json.quote(status), json.quote(suite), support.array(sources), support.array(staged), support.array(rows), support.array(skipped)]
+    if status == "passed" { keys.add("compiled_fixtures"); values.add(Text(compiled)); keys.add("runtime_checks"); values.add(Text(checks - compiled - 1)) }
+    if failure != "" { keys.add("failure"); values.add(json.quote(failure)) }
+    writeTextFile(evidence + "/results.json", support.object(keys, values) + "\n")
+}
+
+let work = test.scratch()
+let root = support.root(work)
+let runtimeSource = root + "/runtime/minyar_runtime.c"
+let fixtureDirectory = ""
+let suite = "focused"
+let profiles = ["system", "fixed", "lazy"]
+let budgets: List<Integer> = []
+let mode = ""
+let fixtures: List<Text> = []
+let defines: List<Text> = []
+let clang = test.setting("CLANG", "clang")
+let compileTimeout = 60
+let runTimeout = 45
+let outputDirectory = ""
+let index = 0
+while index < argumentCount() {
+    let option = argument(index)
+    test.check(index + 1 < argumentCount(), "option needs a value: " + option)
+    let given = optionValues(index + 1)
+    if option == "--runtime-source" { runtimeSource = support.absolute(given[0], root) }
+    else if option == "--fixture-dir" { fixtureDirectory = support.absolute(given[0], root) }
+    else if option == "--suite" { suite = given[0]; test.check(suite == "focused" || suite == "full", "unknown suite " + suite) }
+    else if option == "--profiles" { profiles = given; for profile in given { test.check(member(["system", "fixed", "lazy"], profile), "unknown profile " + profile) } }
+    else if option == "--budgets" { for value in given { budgets.add(Integer(value)) } }
+    else if option == "--mode" { mode = given[0]; test.check(member(["native", "sanitize", "both"], mode), "unknown mode " + mode) }
+    else if option == "--fixtures" { fixtures = given; for fixture in given { test.check(member(STANDARD, fixture) || member(INDEPENDENT, fixture) || fixture == VIRTUAL, "unknown fixture " + fixture) } }
+    else if option == "--runtime-define" { defines.add(given[0]) }
+    else if option == "--clang" { clang = given[0] }
+    else if option == "--compile-timeout" { compileTimeout = Integer(given[0]) }
+    else if option == "--run-timeout" { runTimeout = Integer(given[0]) }
+    else if option == "--output-dir" { outputDirectory = support.absolute(given[0], root) }
+    else { fail("unknown memory profile option: " + option) }
+    index += 1 + given.length
+}
+test.check(compileTimeout > 0 && runTimeout > 0, "timeouts must be positive")
+if budgets.length == 0 { budgets = [32]; if suite == "full" { budgets = [1, 32, 1024] } }
+let distinctBudgets: List<Integer> = []
+for budget in budgets {
+    test.check(budget >= 1 && budget <= 1024, "cleanup budgets must be between 1 and 1024")
+    let seen = false
+    for existing in distinctBudgets { if existing == budget { seen = true } }
+    if !seen { distinctBudgets.add(budget) }
+}
+profiles = unique(profiles)
+if mode == "" { mode = "sanitize"; if suite == "full" { mode = "both" } }
+let modes = [mode]
+if mode == "both" { modes = ["native", "sanitize"] }
+if fixtures.length == 0 {
+    for name in STANDARD { fixtures.add(name) }
+    for name in INDEPENDENT { fixtures.add(name) }
+    fixtures.add(VIRTUAL)
+}
+let selected = unique(fixtures)
+let parentDirectory = test.setting("TMPDIR", "/tmp")
+if outputDirectory != "" { support.makeDirectories(outputDirectory); parentDirectory = outputDirectory }
+let evidence = parentDirectory + "/minyar-memory-profiles-" + Text(system.processId()) + "-" + Text(system.monotonicNanoseconds())
+support.makeDirectories(evidence + "/logs")
+let rows: List<Text> = []
+let sources: List<Text> = []
+let staged: List<Text> = []
+let skipped: List<Text> = []
+let checks = 0
+let compiled = 0
+let environment = support.setEnvironment(support.setEnvironment(system.environment(), "ASAN_OPTIONS", "detect_leaks=0:abort_on_error=1"), "UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1")
+print("Evidence retained at " + evidence)
+let failure = ""
+let originals: List<Text> = ["runtime/minyar_runtime.c"]
+let originalPaths: List<Text> = [runtimeSource]
+let runtimeDirectory = support.parent(runtimeSource)
+let headers = files.list(runtimeDirectory)
+headers.sort()
+for header in headers { if support.ends(header, ".h") { originals.add("runtime/" + header); originalPaths.add(runtimeDirectory + "/" + header) } }
+let needed: List<Text> = []
+for name in selected { needed.add(name) }
+if member(needed, "production-frame-oracle") && !member(needed, "production-live-oracle") { needed.add("production-live-oracle") }
+needed.sort()
+let fixtureRelatives: List<Text> = []
+for name in needed {
+    let relative = "tests/" + name + ".c"
+    let path = ""
+    if member(INDEPENDENT, name) || name == VIRTUAL { relative = "experiments/memory/" + name + ".c"; path = root + "/" + relative }
+    else {
+        let roots = [support.parent(runtimeDirectory) + "/tests", root + "/tests"]
+        if fixtureDirectory != "" { roots = [fixtureDirectory] }
+        for directory in roots { if path == "" && files.pathSize(directory + "/" + name + ".c") >= 0 { path = directory + "/" + name + ".c" } }
+        if path == "" { failure = "Missing fixture " + name + ".c; use --fixture-dir after preserving originals." }
+    }
+    originals.add(relative)
+    originalPaths.add(path)
+    fixtureRelatives.add(relative)
+}
+let contents: List<Text> = []
+if failure == "" {
+    for position in 0..originals.length {
+        let path = originalPaths[position]
+        if files.pathSize(path) < 0 { failure = "Cannot snapshot " + path; break }
+        let data = files.readFile(path)
+        let target = evidence + "/originals/" + originals[position]
+        support.makeDirectories(support.parent(target))
+        writeBytesFile(target, data)
+        sources.add(support.object(["path", "snapshot_path", "sha256"], [json.quote(path), json.quote(originals[position]), json.quote(support.digest(target))]))
+        contents.add(support.utf8(data))
+    }
+}
+if failure == "" {
+    let version = support.execute("compiler-version", support.clangCommand([clang, "--version"]), environment, root, evidence + "/logs/0000-compiler-version.log", compileTimeout)
+    rows.add(support.rowJSON(version)); checks += 1
+    if version.returncode != 0 { failure = "compiler-version: failed\n" + support.lastBytes(version.output + version.errorOutput, 5000) }
+}
+for profile in profiles {
+    if failure != "" { break }
+    let stage = evidence + "/profiles/" + profile
+    for position in 0..originals.length {
+        let relative = originals[position]
+        let text = contents[position]
+        let transformations: List<Text> = []
+        if member(fixtureRelatives, relative) {
+            text = stripBackends(text)
+            transformations.add("Backend defines selected by compile flags; original assertions otherwise retained.")
+            let stem = test.replace(support.name(relative), ".c", "")
+            if member(STANDARD, stem) {
+                if profile == "system" {
+                    let replaced = replaceWord(text, "minyar_pool_used", "rc_heap_allocation_count")
+                    text = replaced.text
+                    if replaced.count > 0 { transformations.add(Text(replaced.count) + " pool-empty counter reference(s) use outstanding system allocations.") }
+                } else {
+                    let replaced = replaceWord(text, "rc_heap_allocation_count", "minyar_pool_used")
+                    text = replaced.text
+                    if replaced.count > 0 { transformations.add(Text(replaced.count) + " system-empty counter reference(s) use outstanding pool bytes.") }
+                }
+            }
+        }
+        let target = stage + "/" + relative
+        support.makeDirectories(support.parent(target))
+        writeTextFile(target, text)
+        staged.add(support.object(["profile", "path", "sha256", "transformations"], [json.quote(profile), json.quote(target), json.quote(support.digest(target)), support.texts(transformations)]))
+    }
+    let backend = ["-DMINYAR_BOUNDED_HEAP=1"]
+    if profile == "system" { backend = ["-DMINYAR_SYSTEM_HEAP=1"] }
+    if profile == "lazy" { backend.add("-DMINYAR_LAZY_HEAP=1") }
+    if profile == "system" && member(selected, VIRTUAL) {
+        skipped.add(support.object(["profile", "fixture", "reason"], [json.quote(profile), json.quote(VIRTUAL), json.quote("Pool byte/capacity and coalescing assertions require a pool; system uses exact object/byte ownership and allocation-count recovery checks.")]))
+    }
+    if profile == "system" && member(selected, POOL_ONLY) {
+        skipped.add(support.object(["profile", "fixture", "reason"], [json.quote(profile), json.quote(POOL_ONLY), json.quote("Buddy-region admission and pool recovery require fixed or lazy allocation.")]))
+    }
+    for budget in distinctBudgets {
+        if failure != "" { break }
+        for instrumentation in modes {
+            if failure != "" { break }
+            for name in selected {
+                if failure != "" { break }
+                if profile == "system" && (name == VIRTUAL || name == POOL_ONLY) { continue }
+                let relative = "experiments/memory/" + name + ".c"
+                if member(STANDARD, name) { relative = "tests/" + name + ".c" }
+                let label = profile + "-k" + Text(budget) + "-" + instrumentation + "-" + name
+                let binary = evidence + "/bin/" + label
+                support.makeDirectories(evidence + "/bin")
+                let command = [clang, "-std=c11"]
+                if instrumentation == "native" { command.add("-O2") } else { for flag in ["-O1", "-g", "-fsanitize=address,undefined"] { command.add(flag) } }
+                for flag in backend { command.add(flag) }
+                for define in defines { command.add("-D" + define) }
+                for item in ["-DMINYAR_RC_POLL_BUDGET=" + Text(budget), stage + "/" + relative, "-o", binary] { command.add(item) }
+                let build = support.execute(label + "-compile", support.clangCommand(command), environment, root, evidence + "/logs/" + Text(checks) + "-" + label + "-compile.log", compileTimeout)
+                rows.add(support.rowJSON(build)); checks += 1; compiled += 1
+                if build.returncode != 0 { failure = label + "-compile: failed\n" + support.lastBytes(build.output + build.errorOutput, 5000); break }
+                let phases = [""]
+                if name == VIRTUAL { phases = PHASES }
+                for phase in phases {
+                    let argv = [binary]
+                    let suffix = ""
+                    if phase != "" { argv.add(phase); suffix = "-" + phase }
+                    let result = support.execute(label + suffix, argv, environment, root, evidence + "/logs/" + Text(checks) + "-" + label + suffix + ".log", runTimeout)
+                    rows.add(support.rowJSON(result)); checks += 1
+                    if result.returncode != 0 {
+                        let reason = "failed"
+                        if result.timedOut { reason = "timeout" }
+                        failure = label + suffix + ": " + reason + "\n" + support.lastBytes(result.output + result.errorOutput, 5000) + "\nFull log: " + result.log
+                        break
+                    }
+                }
+                if failure == "" {
+                    let note = ""
+                    if name == VIRTUAL { note = " (8 retention phases)" }
+                    print("PASS " + label + note)
+                }
+            }
+        }
+    }
+}
+let status = "passed"
+if failure != "" { status = "failed" }
+save(status, failure, rows, sources, staged, skipped, compiled, checks, evidence, suite)
+test.removeTree(work)
+if failure != "" {
+    let written = system.writeStandardError("FAIL: " + failure + "\nSnapshot and diagnostics retained: " + evidence + "\n")
+    exit(1)
+}
+print("PASS: " + Text(checks - compiled - 1) + " runtime checks; reproducible commands, hashes and logs: " + evidence + "/results.json")
