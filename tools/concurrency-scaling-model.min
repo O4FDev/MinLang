@@ -1,0 +1,706 @@
+use "./testing.min" as test
+use "../tests/performance-test-support.min" as timing
+use "../tests/cpython-random.min" as random
+use "system" as system
+use "files" as files
+use "sha256" as sha
+use "json" as json
+
+public constant ROUNDS = 40
+public constant WARMUPS = 3
+public constant ORDER_SEED = 20261012
+public constant BOOTSTRAP_SEED = 424242
+public constant BOOTSTRAPS = 20000
+public constant WORKLOAD = "benchmarks/concurrency/frozen-lcg.min"
+public constant WORKLOAD_SHA256 = "6b6f61b85c92b491375172b57781b282dec16f59351e8b85ca8216ab834a97f3"
+public constant SAMPLER = "tools/concurrency-scaling-model.min"
+
+public record Activity { other: Float; steal: Float }
+public record Host { fake: Boolean; directory: Text; serial: List<Integer>; affinity: List<Integer>; activity: Activity; sleeps: List<Integer>; ticks: List<Integer>; tickIndex: List<Integer>; observed: List<Integer>; expected: Text; tickCalls: List<Integer>; snapshot: List<json.Value>; denied: Text }
+public record Interval { low: Float; high: Float }
+public record Outcome { error: Text; gate: Boolean }
+record Measured { seconds: Float; cpu: Float; status: Integer; output: Text; errorOutput: Text }
+record Sample { phase: Text; round: Integer; threads: Integer; seconds: Float; cpu: Float; activity: Activity; status: Integer; output: Text; errorOutput: Text }
+record Pair { phase: Text; round: Integer; candidate: Sample; control: Sample }
+record Wait { item: Integer; checks: List<Activity> }
+record Result { seal: Text; started: Integer; samples: List<Sample>; preflights: List<Activity>; pairs: List<Pair>; qualified: Boolean; snapshots: List<json.Value>; hasSnapshots: Boolean; waits: List<Wait>; preflight: List<Activity>; lastItem: List<Integer>; failure: List<Text>; tail: List<Text> }
+
+public function realHost(): Host {
+    return Host { fake: false; directory: test.scratch(); serial: [0]; affinity: []; activity: Activity { other: 0.0; steal: 0.0 }; sleeps: []; ticks: []; tickIndex: [0]; observed: [0]; expected: ""; tickCalls: [0]; snapshot: []; denied: "" }
+}
+public function fakeHost(expected: Text): Host {
+    return Host { fake: true; directory: test.scratch(); serial: [0]; affinity: [0, 1, 2, 3, 4, 5, 6, 7]; activity: Activity { other: 0.0; steal: 0.0 }; sleeps: []; ticks: []; tickIndex: [0]; observed: [0]; expected: expected; tickCalls: [0]; snapshot: []; denied: "" }
+}
+function space(byte: Integer): Boolean { return byte == 32 || byte == 9 || byte == 10 || byte == 13 || byte == 11 || byte == 12 }
+function strip(source: Text): Text {
+    let raw = Bytes(source)
+    let begin = 0
+    let end = raw.length
+    while begin < end && space(raw[begin]) { begin += 1 }
+    while end > begin && space(raw[end - 1]) { end -= 1 }
+    return Text(raw.slice(begin, end))
+}
+function pythonQuote(text: Text): Text {
+    let digits = "0123456789abcdef"
+    let parts: List<Text> = ["\""]
+    for c in text {
+        let code = Integer(c)
+        if c == '"' { parts.add("\\\"") }
+        else if c == '\\' { parts.add("\\\\") }
+        else if c == '\n' { parts.add("\\n") }
+        else if code == 13 { parts.add("\\r") }
+        else if code == 9 { parts.add("\\t") }
+        else if code == 8 { parts.add("\\b") }
+        else if code == 12 { parts.add("\\f") }
+        else if code < 32 || code > 126 {
+            let units: List<Integer> = [code]
+            if code > 65535 { units = [55296 + ((code - 65536) >> 10), 56320 + ((code - 65536) & 1023)] }
+            for unit in units {
+                let escape = "\\u"
+                for shift in [12, 8, 4, 0] { let digit = (unit >> shift) & 15; escape += Text(Bytes(digits).slice(digit, digit + 1)) }
+                parts.add(escape)
+            }
+        } else { parts.add(Text(c)) }
+    }
+    parts.add("\"")
+    return joinText(parts)
+}
+function launch(host: Host, command: List<Text>, seconds: Integer): test.Result {
+    host.serial[0] += 1
+    return test.run(command, system.environment(), "", host.directory + "/command-" + Text(host.serial[0]), seconds)
+}
+function checkOutput(host: Host, command: List<Text>): Text {
+    if host.fake { return "fixed" }
+    let result = launch(host, command, 60)
+    if result.status != 0 { fail("command failed: " + command[0] + "\n" + result.errorOutput) }
+    return result.output
+}
+public function digest(path: Text): Text {
+    let data = files.readFile(path)
+    if files.lastError() != 0 { fail("cannot read " + path) }
+    return sha.hex(sha.digest(data))
+}
+function readable(path: Text): Boolean { return files.pathSize(path) >= 0 }
+public function number(text: Text): json.Value { return json.Value { kind: json.NUMBER; text: text; number: 0.0; truth: false; items: []; keys: [] } }
+public function integer(value: Integer): json.Value { return number(Text(value)) }
+public function real(value: Float): json.Value { return number(Text(value)) }
+public function string(value: Text): json.Value { return json.Value { kind: json.STRING; text: value; number: 0.0; truth: false; items: []; keys: [] } }
+public function boolean(value: Boolean): json.Value { return json.Value { kind: json.BOOLEAN; text: Text(value); number: 0.0; truth: value; items: []; keys: [] } }
+public function nothing(): json.Value { return json.Value { kind: json.NULL; text: "null"; number: 0.0; truth: false; items: []; keys: [] } }
+public function array(items: List<json.Value>): json.Value { return json.Value { kind: json.ARRAY; text: ""; number: 0.0; truth: false; items: items; keys: [] } }
+public function object(keys: List<Text>, items: List<json.Value>): json.Value { return json.Value { kind: json.OBJECT; text: ""; number: 0.0; truth: false; items: items; keys: keys } }
+public function texts(values: List<Text>): json.Value { let items: List<json.Value> = []; for value in values { items.add(string(value)) }; return array(items) }
+public function integers(values: List<Integer>): json.Value { let items: List<json.Value> = []; for value in values { items.add(integer(value)) }; return array(items) }
+function leafText(value: json.Value): Text {
+    if value.kind == json.STRING { return pythonQuote(value.text) }
+    if value.kind == json.NULL { return "null" }
+    if value.kind == json.BOOLEAN { if value.truth { return "true" }; return "false" }
+    return value.text
+}
+public function pretty(value: json.Value, indent: Text): Text {
+    if value.kind == json.OBJECT || value.kind == json.ARRAY {
+        if value.items.length == 0 { if value.kind == json.OBJECT { return "{}" }; return "[]" }
+        let parts: List<Text> = ["["]
+        if value.kind == json.OBJECT { parts = ["{"] }
+        for index in 0..value.items.length {
+            parts.add("\n" + indent + "  ")
+            if value.kind == json.OBJECT { parts.add(pythonQuote(value.keys[index]) + ": ") }
+            parts.add(pretty(value.items[index], indent + "  "))
+            if index + 1 < value.items.length { parts.add(",") }
+        }
+        parts.add("\n" + indent)
+        if value.kind == json.OBJECT { parts.add("}") } else { parts.add("]") }
+        return joinText(parts)
+    }
+    return leafText(value)
+}
+public function canonical(value: json.Value): Text {
+    if value.kind == json.ARRAY {
+        let parts: List<Text> = ["["]
+        for index in 0..value.items.length { if index > 0 { parts.add(",") }; parts.add(canonical(value.items[index])) }
+        parts.add("]")
+        return joinText(parts)
+    }
+    if value.kind == json.OBJECT {
+        let keys = value.keys.sorted()
+        let parts: List<Text> = ["{"]
+        for index in 0..keys.length {
+            if index > 0 { parts.add(",") }
+            parts.add(pythonQuote(keys[index]) + ":")
+            for position in 0..value.keys.length { if value.keys[position] == keys[index] { parts.add(canonical(value.items[position])) } }
+        }
+        parts.add("}")
+        return joinText(parts)
+    }
+    return leafText(value)
+}
+public function sealOf(value: json.Value): Text { return sha.hex(sha.digest(Bytes(canonical(value)))) }
+function without(value: json.Value, name: Text): json.Value {
+    let keys: List<Text> = []
+    let items: List<json.Value> = []
+    for index in 0..value.keys.length { if value.keys[index] != name { keys.add(value.keys[index]); items.add(value.items[index]) } }
+    return object(keys, items)
+}
+function has(value: json.Value, name: Text): Boolean { for key in value.keys { if key == name { return true } }; return false }
+public function oracle(): Text {
+    let modulus = 2147483647
+    let factor = 1
+    let base = 48271
+    let exponent = 4096
+    while exponent > 0 {
+        if exponent % 2 == 1 { factor = factor * base % modulus }
+        base = base * base % modulus
+        exponent = exponent / 2
+    }
+    let total = 0
+    for block in 0..131072 { total += ((block * 104729 + 20261012) % modulus) * factor % modulus }
+    return Text(total) + "\n"
+}
+public function schedule(rounds: Integer, seed: Integer): List<List<Integer>> {
+    let generator = random.seeded(Text(seed))
+    let result: List<List<Integer>> = []
+    for unused in 0..rounds {
+        let order = [1, 2, 4, 8]
+        let index = order.length - 1
+        while index > 0 {
+            let other = random.below(generator, index + 1)
+            let old = order[index]
+            order[index] = order[other]
+            order[other] = old
+            index -= 1
+        }
+        result.add(order)
+    }
+    return result
+}
+public function scheduleValue(rounds: Integer, seed: Integer): json.Value {
+    let items: List<json.Value> = []
+    for order in schedule(rounds, seed) { items.add(integers(order)) }
+    return array(items)
+}
+function median(values: List<Float>): Float {
+    let sorted = values.sorted()
+    let middle = sorted.length / 2
+    if sorted.length % 2 == 1 { return sorted[middle] }
+    return (sorted[middle - 1] + sorted[middle]) / 2.0
+}
+public function bootstrapInterval(values: List<Float>): Interval {
+    if !bootstrapValid(values) { fail("all 40 paired rounds are required") }
+    let generator = random.seeded(Text(BOOTSTRAP_SEED))
+    let estimates: List<Float> = []
+    for unused in 0..BOOTSTRAPS {
+        let chosen: List<Float> = []
+        for draw in 0..values.length { chosen.add(values[Integer(random.uniform(generator) * Float(values.length))]) }
+        estimates.add(median(chosen))
+    }
+    estimates.sort()
+    let lower = 0.025 * Float(BOOTSTRAPS - 1)
+    let upper = 0.975 * Float(BOOTSTRAPS - 1)
+    let high = Integer(upper)
+    if Float(high) < upper { high += 1 }
+    return Interval { low: estimates[Integer(lower)]; high: estimates[high] }
+}
+public function bootstrapValid(values: List<Float>): Boolean { return values.length == ROUNDS }
+function cpuTicks(host: Host): Map<Integer, List<Integer>> {
+    host.tickCalls[0] += 1
+    let result = Map<Integer, List<Integer>>()
+    if host.fake { return result }
+    for line in test.lines(Text(files.readFile("/proc/stat"))) {
+        let fields = test.words(line)
+        if fields.length == 0 { continue }
+        let raw = Bytes(fields[0])
+        if raw.length <= 3 || !fields[0].startsWith("cpu") { continue }
+        let digits = true
+        for index in 3..raw.length { if raw[index] < 48 || raw[index] > 57 { digits = false } }
+        if !digits { continue }
+        let values: List<Integer> = []
+        for index in 1..fields.length { if index <= 8 { values.add(Integer(fields[index])) } }
+        result[Integer(Text(raw.slice(3, raw.length)))] = values
+    }
+    return result
+}
+function clockTicks(host: Host): Integer {
+    if host.fake { return 100 }
+    return Integer(strip(checkOutput(host, ["getconf", "CLK_TCK"])))
+}
+function cpuActivity(host: Host, before: Map<Integer, List<Integer>>, after: Map<Integer, List<Integer>>, cpus: List<Integer>, child: Float): Activity {
+    if host.fake { return Activity { other: host.activity.other; steal: host.activity.steal } }
+    let ticks: List<Integer> = []
+    for index in 0..8 { let sum = 0; for cpu in cpus { sum += after[cpu][index] - before[cpu][index] }; ticks.add(sum) }
+    let total = 0
+    for value in ticks { total += value }
+    if total <= 0 { fail("CPU accounting interval is too short") }
+    let busy = total - ticks[3] - ticks[4] - ticks[7]
+    let childTicks = child * Float(clockTicks(host))
+    let other = Float(busy) - childTicks
+    if other < 0.0 { other = 0.0 }
+    return Activity { other: other / Float(total); steal: Float(ticks[7]) / Float(total) }
+}
+public function quiet(activity: Activity): Boolean { return activity.other <= 0.02 && activity.steal <= 0.005 }
+function sleep(host: Host, seconds: Integer) {
+    host.sleeps.add(seconds)
+    if !host.fake { launch(host, ["sleep", Text(seconds)], seconds + 10) }
+}
+public function affinity(host: Host): List<Integer> {
+    if host.fake { return host.affinity.sorted() }
+    let result: List<Integer> = []
+    for line in test.lines(Text(files.readFile("/proc/self/status"))) {
+        if !line.startsWith("Cpus_allowed_list:") { continue }
+        let raw = Bytes(line)
+        let value = strip(Text(raw.slice(18, raw.length)))
+        for span in value.split(",") {
+            let bounds = span.split("-")
+            let low = Integer(bounds[0])
+            let high = low
+            if bounds.length == 2 { high = Integer(bounds[1]) }
+            for cpu in low..(high + 1) { result.add(cpu) }
+        }
+    }
+    return result.sorted()
+}
+function cpuCount(host: Host): Integer {
+    let result = launch(host, ["getconf", "_NPROCESSORS_ONLN"], 10)
+    if result.status != 0 { fail("getconf failed") }
+    return Integer(strip(result.output))
+}
+public function kernel(host: Host): List<Text> {
+    let result: List<Text> = []
+    for flag in ["-s", "-n", "-r", "-v", "-m"] {
+        let value = launch(host, ["uname", flag], 10)
+        if value.status != 0 { fail("uname failed") }
+        let raw = Bytes(value.output)
+        let end = raw.length
+        if end > 0 && raw[end - 1] == 10 { end -= 1 }
+        result.add(Text(raw.slice(0, end)))
+    }
+    return result
+}
+function lines(source: Text): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(source)
+    let start = 0
+    for index in 0..raw.length {
+        if raw[index] == 10 || raw[index] == 13 {
+            result.add(Text(raw.slice(start, index)))
+            if raw[index] == 13 && index + 1 < raw.length && raw[index + 1] == 10 { start = index + 2 } else { start = index + 1 }
+        }
+    }
+    if start < raw.length { result.add(Text(raw.slice(start, raw.length))) }
+    return result
+}
+function splitLimit(source: Text): List<Text> {
+    let raw = Bytes(source)
+    let result: List<Text> = []
+    let start = 0
+    for index in 0..raw.length { if raw[index] == 58 && result.length < 2 { result.add(Text(raw.slice(start, index))); start = index + 1 } }
+    result.add(Text(raw.slice(start, raw.length)))
+    return result
+}
+function pathParts(location: Text): List<Text> {
+    let result: List<Text> = []
+    for part in location.split("/") { if part != "" && part != "." { result.add(part) } }
+    return result
+}
+function sessionScope(name: Text): Boolean {
+    let raw = Bytes(name)
+    let prefix = Bytes("session-")
+    let suffix = Bytes(".scope")
+    if raw.length <= prefix.length + suffix.length { return false }
+    if !name.startsWith("session-") || !name.endsWith(".scope") { return false }
+    for index in prefix.length..(raw.length - suffix.length) { if raw[index] < 48 || raw[index] > 57 { return false } }
+    return true
+}
+function cpuController(controllers: Text): Boolean { for item in controllers.split(",") { if item == "cpu" || item == "cpuset" { return true } }; return false }
+function joinedPath(parts: List<Text>, count: Integer): Text {
+    let output = ""
+    for index in 0..count { if index > 0 { output += "/" }; output += parts[index] }
+    return "/" + output
+}
+function readLimit(host: Host, path: Text): json.Value {
+    if host.denied != "" && path == host.denied { return object(["availability", "errno"], [string("unreadable"), integer(13)]) }
+    let data = files.readFile(path)
+    let code = files.lastError()
+    if code == 0 { return object(["availability", "value"], [string("exposed"), string(Text(data))]) }
+    if code < 0 { code = -code }
+    if code == 2 { return object(["availability"], [string("not exposed in guest")]) }
+    return object(["availability", "errno"], [string("unreadable"), integer(code)])
+}
+public function resourceIdentity(host: Host, membership: Text, root: Text): json.Value {
+    let groups: List<json.Value> = []
+    for line in lines(membership) {
+        let fields = splitLimit(line)
+        if fields.length != 3 { fail("not enough values to unpack (expected 3)") }
+        let location = fields[2]
+        let parts = pathParts(location)
+        let parent = false
+        for part in parts { if part == ".." { parent = true } }
+        if !location.startsWith("/") || parent { fail("invalid CPU cgroup membership") }
+        let canonicalParts = parts.slice(0, parts.length)
+        if parts.length > 0 && sessionScope(parts[parts.length - 1]) { canonicalParts[canonicalParts.length - 1] = "session.scope" }
+        if fields[1] != "" && !cpuController(fields[1]) {
+            groups.add(object(["hierarchy", "controllers", "path"], [string(fields[0]), string(fields[1]), string(joinedPath(canonicalParts, canonicalParts.length))]))
+            continue
+        }
+        let base = root
+        if fields[1] != "" { base = root + "/" + fields[1] }
+        let limits: List<json.Value> = []
+        for depth in 0..(parts.length + 1) {
+            let directory = base
+            for index in 0..depth { directory += "/" + parts[index] }
+            let names = ["cpu.max", "cpu.max.burst", "cpu.weight", "cpu.cfs_quota_us", "cpu.cfs_period_us", "cpuset.cpus", "cpuset.cpus.effective"]
+            let values: List<json.Value> = []
+            for name in names { values.add(readLimit(host, directory + "/" + name)) }
+            limits.add(object(["path", "values"], [string(joinedPath(canonicalParts, depth)), object(names, values)]))
+        }
+        groups.add(object(["hierarchy", "controllers", "path", "ancestors"], [string(fields[0]), string(fields[1]), string(joinedPath(canonicalParts, canonicalParts.length)), array(limits)]))
+    }
+    return object(["version", "cpu_count", "affinity", "groups"], [integer(2), integer(cpuCount(host)), integers(affinity(host)), array(groups)])
+}
+function resourceSnapshot(host: Host): json.Value {
+    if host.snapshot.length > 0 { return host.snapshot[0] }
+    let membership = Text(files.readFile("/proc/self/cgroup"))
+    let paths: List<Text> = []
+    for line in lines(membership) {
+        let fields = splitLimit(line)
+        if fields.length != 3 { fail("not enough values to unpack (expected 3)") }
+        if fields[1] != "" && !cpuController(fields[1]) { continue }
+        let base = "/sys/fs/cgroup"
+        if fields[1] != "" { base = base + "/" + fields[1] }
+        let parts = pathParts(fields[2])
+        for depth in 0..(parts.length + 1) { let directory = base; for index in 0..depth { directory += "/" + parts[index] }; paths.add(directory) }
+    }
+    return object(["raw_membership", "raw_ancestor_paths", "identity"], [string(membership), texts(paths), resourceIdentity(host, membership, "/sys/fs/cgroup")])
+}
+function resolveStrict(host: Host, path: Text): Text {
+    let result = launch(host, ["readlink", "-e", "--", path], 10)
+    if result.status != 0 { fail("[Errno 2] No such file or directory: '" + path + "'") }
+    return strip(result.output)
+}
+public function register(host: Host, executablePath: Text, protocolPath: Text, loweredPath: Text, candidate: Text, compiler: Text, runtime: Text, flags: Text, memory: Text, clang: Text, controlPath: Text, controlSha: Text) {
+    let platform = launch(host, ["uname", "-s"], 10)
+    if platform.status != 0 || strip(platform.output) != "Linux" { fail("qualification requires the admitted Linux Boat host") }
+    let cpus = affinity(host)
+    if digest(WORKLOAD) != WORKLOAD_SHA256 { fail("original frozen workload changed") }
+    if cpus.length != 8 { fail("exactly eight available CPUs required, found [" + joinedIntegers(cpus) + "]") }
+    let executable = resolveStrict(host, executablePath)
+    let lowered = resolveStrict(host, loweredPath)
+    let llvm = readTextFile(lowered)
+    if !test.contains(llvm, "; minyar-thread-runtime: 1") || !test.contains(llvm, "@minyar_thread_spawn") || !test.contains(llvm, "@minyar_frozen_bytes_take") { fail("lowered program must use the checked managed thread/shared-value API") }
+    let located = launch(host, ["/bin/sh", "-c", "command -v -- \"$1\"", "minyar", clang], 10)
+    let clangPath = clang
+    if located.status == 0 { clangPath = strip(located.output) }
+    clangPath = resolveStrict(host, clangPath)
+    let quotaNames = ["/sys/fs/cgroup/cpu.max", "/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu/cpu.cfs_period_us", "/proc/self/cgroup"]
+    let quotaValues: List<json.Value> = []
+    for name in quotaNames { if readable(name) { quotaValues.add(string(readTextFile(name))) } else { quotaValues.add(string("not exposed in guest")) } }
+    let keys = ["frozen_at_unix_ns", "executable", "executable_sha256", "workload_sha256", "lowered_llvm", "lowered_llvm_sha256", "sampler_sha256", "expected_stdout", "source_shas", "build_flags", "memory_profile", "toolchain", "clang_path", "clang_sha256", "kernel", "guest_topology", "affinity", "quota", "resource_identity", "resource_snapshot", "work", "timing", "warmup_order", "paired_order", "estimator", "interval", "quiet", "gates"]
+    let items = [integer(system.wallClockMicroseconds() * 1000), string(executable), string(digest(executable)), string(digest(WORKLOAD)), string(lowered), string(digest(lowered)), string(digest(SAMPLER)), string(oracle()),
+        object(["candidate", "compiler", "runtime"], [string(candidate), string(compiler), string(runtime)]), string(flags), string(memory), string(checkOutput(host, [clang, "--version"])),
+        string(clangPath), string(digest(clangPath)), texts(kernel(host)), string(checkOutput(host, ["lscpu", "-J"])), integers(cpus), object(quotaNames, quotaValues), resourceIdentity(host, Text(files.readFile("/proc/self/cgroup")), "/sys/fs/cgroup"), resourceSnapshot(host),
+        object(["blocks", "dependent_steps_per_block", "seed", "input_bytes", "kernel"], [integer(131072), integer(4096), integer(20261012), integer(1048576), string("x = x * 48271 % 2147483647; sum final x per block")]),
+        string("whole executable wall time: input creation, publication, launch, work, join, output"), scheduleValue(WARMUPS, ORDER_SEED + 1), scheduleValue(ROUNDS, ORDER_SEED), string("median of 40 within-round T1/Tn ratios"),
+        object(["method", "replicates", "seed", "bounds"], [string("paired percentile bootstrap of median ratios"), integer(BOOTSTRAPS), integer(BOOTSTRAP_SEED), string("floor(.025*(B-1)), ceil(.975*(B-1))")]),
+        object(["preflight_seconds", "other_busy_fraction_max", "steal_fraction_max", "no_post_result_sample_exclusion"], [integer(5), number("0.02"), number("0.005"), boolean(true)]),
+        object(["median_eight_min", "lower_95_eight_min"], [number("7.2"), number("6.4")])]
+    if controlPath != "" {
+        let control = resolveStrict(host, controlPath)
+        keys.add("single_thread_control")
+        items.add(object(["executable", "sha256", "source_sha", "upper_95_ratio_max"], [string(control), string(digest(control)), string(controlSha), number("1.01")]))
+    }
+    let protocol = object(keys, items)
+    keys.add("protocol_sha256")
+    items.add(string(sealOf(protocol)))
+    if files.pathSize(protocolPath) >= 0 { fail("[Errno 17] File exists: '" + protocolPath + "'") }
+    writeTextFile(protocolPath, pretty(object(keys, items), "") + "\n")
+    print("frozen " + protocolPath + "; no timed qualification has run")
+}
+function measure(host: Host, command: List<Text>): Measured {
+    if host.fake {
+        let before = host.observed[0]
+        let started = host.ticks[host.tickIndex[0]]
+        let ended = host.ticks[host.tickIndex[0] + 1]
+        host.tickIndex[0] += 2
+        host.observed[0] = ended
+        return Measured { seconds: Float(ended - started) / 1000000000.0; cpu: Float(ended) / 1000000000.0 - Float(before) / 1000000000.0; status: 0; output: host.expected; errorOutput: "" }
+    }
+    host.serial[0] += 1
+    let log = host.directory + "/sample-" + Text(host.serial[0])
+    let usage = timing.childCpu()
+    let started = system.monotonicNanoseconds()
+    let result = test.run(command, system.environment(), "", log, 120)
+    let seconds = Float(system.monotonicNanoseconds() - started) / 1000000000.0
+    return Measured { seconds: seconds; cpu: timing.childCpu() - usage; status: result.status; output: result.output; errorOutput: result.errorOutput }
+}
+function activityFrom(value: json.Value): Activity { return Activity { other: json.member(value, "other_busy_fraction").number; steal: json.member(value, "steal_fraction").number } }
+function sampleFrom(value: json.Value): Sample {
+    let phase = json.string(value, "phase")
+    let round = 0
+    let threads = 0
+    if has(value, "round") { round = Integer(json.member(value, "round").text); threads = Integer(json.member(value, "threads").text) }
+    return Sample { phase: phase; round: round; threads: threads; seconds: json.member(value, "seconds").number; cpu: json.member(value, "child_cpu_seconds").number; activity: activityFrom(json.member(value, "activity")); status: Integer(json.member(value, "returncode").text); output: json.string(value, "stdout"); errorOutput: json.string(value, "stderr") }
+}
+function truth(value: Boolean): Text { if value { return "true" }; return "false" }
+function member(name: Text, value: Text): Text { return pythonQuote(name) + ": " + value }
+function members(fields: List<Text>, indent: Text): Text {
+    if fields.length == 0 { return "{}" }
+    let parts: List<Text> = ["{"]
+    for index in 0..fields.length {
+        parts.add("\n" + indent + "  " + fields[index])
+        if index + 1 < fields.length { parts.add(",") }
+    }
+    parts.add("\n" + indent + "}")
+    return joinText(parts)
+}
+function elements(items: List<Text>, indent: Text): Text {
+    if items.length == 0 { return "[]" }
+    let parts: List<Text> = ["["]
+    for index in 0..items.length {
+        parts.add("\n" + indent + "  " + items[index])
+        if index + 1 < items.length { parts.add(",") }
+    }
+    parts.add("\n" + indent + "]")
+    return joinText(parts)
+}
+function activityText(activity: Activity, indent: Text): Text { return members([member("other_busy_fraction", Text(activity.other)), member("steal_fraction", Text(activity.steal))], indent) }
+function activitiesText(values: List<Activity>, indent: Text): Text {
+    let items: List<Text> = []
+    for value in values { items.add(activityText(value, indent + "  ")) }
+    return elements(items, indent)
+}
+function sampleText(sample: Sample, control: Boolean, indent: Text): Text {
+    let fields: List<Text> = []
+    if !control { fields = [member("phase", pythonQuote(sample.phase)), member("round", Text(sample.round)), member("threads", Text(sample.threads))] }
+    for field in [member("seconds", Text(sample.seconds)), member("child_cpu_seconds", Text(sample.cpu)), member("activity", activityText(sample.activity, indent + "  ")), member("returncode", Text(sample.status)), member("stdout", pythonQuote(sample.output)), member("stderr", pythonQuote(sample.errorOutput))] { fields.add(field) }
+    return members(fields, indent)
+}
+function resultText(result: Result): Text {
+    let inner = "  "
+    let samples: List<Text> = []
+    for sample in result.samples { samples.add(sampleText(sample, false, inner + "  ")) }
+    let pairs: List<Text> = []
+    for pair in result.pairs { pairs.add(members([member("phase", pythonQuote(pair.phase)), member("round", Text(pair.round)), member("candidate", sampleText(pair.candidate, false, inner + "    ")), member("control", sampleText(pair.control, true, inner + "    "))], inner + "  ")) }
+    let fields = [member("protocol_sha256", pythonQuote(result.seal)), member("started_unix_ns", Text(result.started)), member("samples", elements(samples, inner)), member("preflights", activitiesText(result.preflights, inner)), member("single_thread_pairs", elements(pairs, inner)), member("qualified", truth(result.qualified))]
+    if result.hasSnapshots { fields.add(member("resource_snapshots", pretty(array(result.snapshots), inner))) }
+    let waits: List<Text> = []
+    for wait in result.waits {
+        let item = "null"
+        if wait.item >= 0 { item = Text(wait.item) }
+        waits.add(members([member("item", item), member("checks", activitiesText(wait.checks, inner + "    "))], inner + "  "))
+    }
+    fields.add(member("preflight_waits", elements(waits, inner)))
+    if result.preflight.length > 0 { fields.add(member("preflight", activityText(result.preflight[0], inner))) }
+    if result.lastItem.length > 0 { fields.add(member("last_item", Text(result.lastItem[0]))) }
+    if result.failure.length > 0 { fields.add(member("failure", pythonQuote(result.failure[0]))) }
+    for index in 0..(result.tail.length / 2) { fields.add(member(result.tail[index * 2], pretty(json.parse(result.tail[index * 2 + 1]), inner))) }
+    return members(fields, "")
+}
+function save(path: Text, result: Result) { writeTextFile(path, resultText(result) + "\n") }
+function resultFrom(value: json.Value): Result {
+    let samples: List<Sample> = []
+    for item in json.member(value, "samples").items { samples.add(sampleFrom(item)) }
+    let preflights: List<Activity> = []
+    for item in json.member(value, "preflights").items { preflights.add(activityFrom(item)) }
+    let pairs: List<Pair> = []
+    for item in json.member(value, "single_thread_pairs").items { pairs.add(Pair { phase: json.string(item, "phase"); round: Integer(json.member(item, "round").text); candidate: sampleFrom(json.member(item, "candidate")); control: sampleFrom(json.member(item, "control")) }) }
+    let waits: List<Wait> = []
+    for item in json.member(value, "preflight_waits").items {
+        let checks: List<Activity> = []
+        for check in json.member(item, "checks").items { checks.add(activityFrom(check)) }
+        let index = -1
+        if json.member(item, "item").kind == json.NUMBER { index = Integer(json.member(item, "item").text) }
+        waits.add(Wait { item: index; checks: checks })
+    }
+    let preflight: List<Activity> = []
+    if has(value, "preflight") { preflight.add(activityFrom(json.member(value, "preflight"))) }
+    let lastItem: List<Integer> = []
+    if has(value, "last_item") { lastItem.add(Integer(json.member(value, "last_item").text)) }
+    let failure: List<Text> = []
+    if has(value, "failure") { failure.add(json.string(value, "failure")) }
+    let snapshots: List<json.Value> = []
+    for item in json.member(value, "resource_snapshots").items { snapshots.add(item) }
+    let qualified = json.member(value, "qualified")
+    return Result { seal: json.string(value, "protocol_sha256"); started: Integer(json.member(value, "started_unix_ns").text); samples: samples; preflights: preflights; pairs: pairs; qualified: qualified.kind == json.BOOLEAN && qualified.truth; snapshots: snapshots; hasSnapshots: has(value, "resource_snapshots"); waits: waits; preflight: preflight; lastItem: lastItem; failure: failure; tail: [] }
+}
+function canonicalOrders(orders: List<List<Integer>>): Text {
+    let items: List<json.Value> = []
+    for order in orders { items.add(integers(order)) }
+    return canonical(array(items))
+}
+function intervalValue(interval: Interval): json.Value { return array([real(interval.low), real(interval.high)]) }
+function outcome(error: Text): Outcome { return Outcome { error: error; gate: false } }
+function observeControl(host: Host, protocol: json.Value): Sample {
+    let before = cpuTicks(host)
+    let measured = measure(host, [json.string(json.member(protocol, "single_thread_control"), "executable"), "1"])
+    if !host.fake && measured.status == 124 { measured.errorOutput = "timed out after 120 seconds" }
+    let sample = Sample { phase: ""; round: 0; threads: 1; seconds: measured.seconds; cpu: measured.cpu; activity: cpuActivity(host, before, cpuTicks(host), affinityFrom(protocol), measured.cpu); status: measured.status; output: measured.output; errorOutput: measured.errorOutput }
+    return sample
+}
+function joinedIntegers(values: List<Integer>): Text { let output = ""; for index in 0..values.length { if index > 0 { output += ", " }; output += Text(values[index]) }; return output }
+function affinityFrom(protocol: json.Value): List<Integer> { let result: List<Integer> = []; for item in json.member(protocol, "affinity").items { result.add(Integer(item.text)) }; return result }
+public function run(host: Host, protocolPath: Text, resultsPath: Text, item: Integer): Outcome {
+    let protocol = json.parse(readTextFile(protocolPath))
+    let seal = json.string(protocol, "protocol_sha256")
+    let unsealed = without(protocol, "protocol_sha256")
+    if sealOf(unsealed) != seal { return outcome("frozen protocol changed") }
+    let checks = [[json.string(protocol, "executable"), "executable_sha256"], [WORKLOAD, "workload_sha256"], [SAMPLER, "sampler_sha256"], [json.string(protocol, "lowered_llvm"), "lowered_llvm_sha256"], [json.string(protocol, "clang_path"), "clang_sha256"]]
+    for pair in checks { if digest(pair[0]) != json.string(protocol, pair[1]) { return outcome("frozen artifact changed: " + pair[0]) } }
+    let current = affinity(host)
+    if joinedIntegers(current) != joinedIntegers(affinityFrom(protocol)) { return outcome("affinity changed since registration") }
+    if canonical(texts(kernel(host))) != canonical(json.member(protocol, "kernel")) { return outcome("kernel changed since registration") }
+    if checkOutput(host, ["lscpu", "-J"]) != json.string(protocol, "guest_topology") { return outcome("CPU topology changed since registration") }
+    let quota = json.member(protocol, "quota")
+    for index in 0..quota.keys.length {
+        let name = quota.keys[index]
+        if name == "/proc/self/cgroup" && has(protocol, "resource_identity") { continue }
+        let value = "not exposed in guest"
+        if readable(name) { value = readTextFile(name) }
+        if value != quota.items[index].text { return outcome("CPU quota/cgroup configuration changed since registration") }
+    }
+    let identified = has(protocol, "resource_identity")
+    let snapshot = nothing()
+    if identified {
+        snapshot = resourceSnapshot(host)
+        if canonical(json.member(snapshot, "identity")) != canonical(json.member(protocol, "resource_identity")) { return outcome("CPU cgroup ancestry, limits or availability changed since registration") }
+    }
+    let paired = schedule(ROUNDS, ORDER_SEED)
+    let warmup = schedule(WARMUPS, ORDER_SEED + 1)
+    if canonicalOrders(paired) != canonical(json.member(protocol, "paired_order")) { return outcome("paired order or sample count changed") }
+    if canonicalOrders(warmup) != canonical(json.member(protocol, "warmup_order")) { return outcome("warmup order changed") }
+    if json.string(protocol, "workload_sha256") != WORKLOAD_SHA256 { return outcome("original frozen workload changed") }
+    let gates = json.member(protocol, "gates")
+    if gates.kind != json.OBJECT || gates.keys.length != 2 || json.member(gates, "median_eight_min").kind != json.NUMBER || json.member(gates, "median_eight_min").number != 7.2 || json.member(gates, "lower_95_eight_min").kind != json.NUMBER || json.member(gates, "lower_95_eight_min").number != 6.4 { return outcome("original scaling gates changed") }
+    let control = has(protocol, "single_thread_control")
+    if control {
+        let entry = json.member(protocol, "single_thread_control")
+        if digest(json.string(entry, "executable")) != json.string(entry, "sha256") || json.member(entry, "upper_95_ratio_max").number != 1.01 { return outcome("single-thread control or original CPU gate changed") }
+    }
+    let phases: List<Text> = []
+    let indexes: List<Integer> = []
+    let orders: List<List<Integer>> = []
+    for index in 0..warmup.length { phases.add("warmup"); indexes.add(index); orders.add(warmup[index]) }
+    for index in 0..paired.length { phases.add("paired"); indexes.add(index); orders.add(paired[index]) }
+    let resumed = item > 0
+    let result = Result { seal: seal; started: system.wallClockMicroseconds() * 1000; samples: []; preflights: []; pairs: []; qualified: false; snapshots: []; hasSnapshots: false; waits: []; preflight: []; lastItem: []; failure: []; tail: [] }
+    if resumed {
+        result = resultFrom(json.parse(readTextFile(resultsPath)))
+        if result.seal != seal || result.failure.length > 0 || result.qualified { return outcome("cannot resume a different, failed or completed campaign") }
+        let expected: List<Text> = []
+        for position in 0..item { for width in orders[position] { expected.add(phases[position] + "|" + Text(indexes[position]) + "|" + Text(width)) } }
+        let actual: List<Text> = []
+        for sample in result.samples { actual.add(sample.phase + "|" + Text(sample.round) + "|" + Text(sample.threads)) }
+        if joinText(actual) != joinText(expected) || actual.length != expected.length || result.preflights.length != item { return outcome("items must run exactly once in the original order") }
+        if control && result.pairs.length != item { return outcome("single-thread pairs must be retained in original order") }
+    }
+    if identified { result.snapshots.add(snapshot); result.hasSnapshots = true }
+    let attempts: List<Activity> = []
+    let activity = Activity { other: 0.0; steal: 0.0 }
+    for attempt in 0..11 {
+        let before = cpuTicks(host)
+        sleep(host, 5)
+        activity = cpuActivity(host, before, cpuTicks(host), affinityFrom(protocol), 0.0)
+        attempts.add(activity)
+        if quiet(activity) { break }
+        if attempt < 10 { sleep(host, 30) }
+    }
+    let waitItem = item
+    result.waits.add(Wait { item: waitItem; checks: attempts })
+    result.preflights.add(activity)
+    if !resumed { result.preflight.add(activity) }
+    if resumed { if files.pathSize(resultsPath) < 0 { return outcome("[Errno 2] No such file or directory: '" + resultsPath + "'") } }
+    else if files.pathSize(resultsPath) >= 0 { return outcome("[Errno 17] File exists: '" + resultsPath + "'") }
+    save(resultsPath, result)
+    if !quiet(activity) {
+        result.failure.add("host failed frozen quiet criterion")
+        save(resultsPath, result)
+        return outcome("host failed frozen quiet criterion; retained unqualified run")
+    }
+    let first = 0
+    let last = phases.length
+    if item >= 0 { first = item; last = item + 1 }
+    let expectedOutput = json.string(protocol, "expected_stdout")
+    let executable = json.string(protocol, "executable")
+    let cpus = affinityFrom(protocol)
+    for position in first..last {
+        for width in orders[position] {
+            let controlSample: List<Sample> = []
+            if control && width == 1 && indexes[position] % 2 == 0 {
+                let observed = observeControl(host, protocol)
+                if observed.status != 0 || observed.output != expectedOutput || observed.errorOutput != "" { return failed(resultsPath, result, "incorrect original single-thread control result") }
+                controlSample.add(observed)
+            }
+            let before = cpuTicks(host)
+            let measured = measure(host, [executable, Text(width)])
+            if !host.fake && measured.status == 124 { return failed(resultsPath, result, "Command '" + executable + " " + Text(width) + "' timed out after 120 seconds") }
+            let sample = Sample { phase: phases[position]; round: indexes[position]; threads: width; seconds: measured.seconds; cpu: measured.cpu; activity: cpuActivity(host, before, cpuTicks(host), cpus, measured.cpu); status: measured.status; output: measured.output; errorOutput: measured.errorOutput }
+            result.samples.add(sample)
+            save(resultsPath, result)
+            if measured.status != 0 || measured.output != expectedOutput || measured.errorOutput != "" { return failed(resultsPath, result, "incorrect workload result; retained unqualified run") }
+            if control && width == 1 {
+                if controlSample.length == 0 {
+                    let observed = observeControl(host, protocol)
+                    if observed.status != 0 || observed.output != expectedOutput || observed.errorOutput != "" { return failed(resultsPath, result, "incorrect original single-thread control result") }
+                    controlSample.add(observed)
+                }
+                result.pairs.add(Pair { phase: phases[position]; round: indexes[position]; candidate: sample; control: controlSample[0] })
+                save(resultsPath, result)
+            }
+        }
+    }
+    if item >= 0 && item < phases.length - 1 {
+        result.lastItem.add(item)
+        save(resultsPath, result)
+        print("item " + Text(item) + " retained; campaign incomplete")
+        return outcome("")
+    }
+    let widths = [1, 2, 4, 8]
+    let scalingKeys: List<Text> = []
+    let scalingItems: List<json.Value> = []
+    let eightMedian = 0.0
+    let eightLow = 0.0
+    for width in widths {
+        let ratios: List<Float> = []
+        for round in 0..ROUNDS {
+            let one = 0.0
+            let other = 0.0
+            for sample in result.samples { if sample.phase == "paired" && sample.round == round { if sample.threads == 1 { one = sample.seconds }; if sample.threads == width { other = sample.seconds } } }
+            ratios.add(one / other)
+        }
+        let interval = bootstrapInterval(ratios)
+        let middle = median(ratios)
+        if width == 8 { eightMedian = middle; eightLow = interval.low }
+        scalingKeys.add(Text(width))
+        scalingItems.add(object(["median", "interval_95"], [real(middle), intervalValue(interval)]))
+    }
+    let scaling = object(scalingKeys, scalingItems)
+    let quietAll = true
+    for sample in result.samples { if !quiet(sample.activity) { quietAll = false } }
+    for check in result.preflights { if !quiet(check) { quietAll = false } }
+    let qualified = quietAll && eightMedian >= 7.2 && eightLow >= 6.4
+    result.tail.add("scaling"); result.tail.add(canonical(scaling))
+    result.tail.add("quiet_all_samples"); result.tail.add(leafText(boolean(quietAll)))
+    if control {
+        let ratios: List<Float> = []
+        for pair in result.pairs { if pair.phase == "paired" { ratios.add(pair.candidate.cpu / pair.control.cpu) } }
+        if !bootstrapValid(ratios) { return failed(resultsPath, result, "all 40 paired rounds are required") }
+        let interval = bootstrapInterval(ratios)
+        let clean = true
+        for pair in result.pairs { if !quiet(pair.control.activity) { clean = false } }
+        let cpuQualified = clean && interval.high <= 1.01
+        let ratioValues: List<json.Value> = []
+        for ratio in ratios { ratioValues.add(real(ratio)) }
+        result.tail.add("single_thread_cpu")
+        result.tail.add(canonical(object(["ratios", "median", "interval_95", "qualified"], [array(ratioValues), real(median(ratios)), intervalValue(interval), boolean(cpuQualified)])))
+        qualified = qualified && cpuQualified
+    }
+    result.qualified = qualified
+    result.tail.add("finished_unix_ns"); result.tail.add(Text(system.wallClockMicroseconds() * 1000))
+    save(resultsPath, result)
+    print(pretty(object(["qualified", "scaling"], [boolean(qualified), scaling]), ""))
+    if !qualified { return Outcome { error: "frozen scaling gate failed; diagnose without changing thresholds"; gate: true } }
+    return outcome("")
+}
+function failed(path: Text, result: Result, error: Text): Outcome {
+    result.failure.add(error)
+    save(path, result)
+    return outcome(error)
+}

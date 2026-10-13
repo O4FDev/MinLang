@@ -1,0 +1,262 @@
+use "../tools/testing.min" as test
+use "../tools/concurrency-scaling-model.min" as scaling
+use "json" as json
+use "files" as files
+
+record Fixture { directory: Text; protocol: Text; results: Text; host: scaling.Host; keys: List<Text>; items: List<json.Value>; clock: List<Integer>; controlSeconds: List<Float>; widths: List<Float>; control: List<Boolean> }
+record Groups { root: Text; leaf: Text; membership: Text }
+
+function set(fixture: Fixture, key: Text, value: json.Value) {
+    for index in 0..fixture.keys.length { if fixture.keys[index] == key { fixture.items[index] = value; return } }
+    fixture.keys.add(key)
+    fixture.items.add(value)
+}
+function publish(fixture: Fixture) {
+    let value = scaling.object(fixture.keys.slice(0, fixture.keys.length), fixture.items.slice(0, fixture.items.length))
+    let keys = fixture.keys.slice(0, fixture.keys.length)
+    let items = fixture.items.slice(0, fixture.items.length)
+    keys.add("protocol_sha256")
+    items.add(scaling.string(scaling.sealOf(value)))
+    writeTextFile(fixture.protocol, scaling.canonical(scaling.object(keys, items)))
+}
+function gates(median: Text): json.Value { return scaling.object(["median_eight_min", "lower_95_eight_min"], [scaling.number(median), scaling.number("6.4")]) }
+function setUp(): Fixture {
+    let directory = test.scratch()
+    let artifact = directory + "/artifact"
+    writeTextFile(artifact, "fixed")
+    let host = scaling.fakeHost(scaling.oracle())
+    let digest = scaling.digest(artifact)
+    let fixture = Fixture { directory: directory; protocol: directory + "/protocol.json"; results: directory + "/results.json"; host: host; keys: []; items: []; clock: [0]; controlSeconds: [8.0]; widths: [8.0, 4.0, 2.0, 1.0]; control: [false] }
+    let keys = ["executable", "executable_sha256", "lowered_llvm", "lowered_llvm_sha256", "clang_path", "clang_sha256", "workload_sha256", "sampler_sha256", "affinity", "kernel", "guest_topology", "quota", "warmup_order", "paired_order", "expected_stdout", "gates"]
+    let items = [scaling.string(artifact), scaling.string(digest), scaling.string(artifact), scaling.string(digest), scaling.string(artifact), scaling.string(digest), scaling.string(scaling.WORKLOAD_SHA256), scaling.string(scaling.digest(scaling.SAMPLER)), scaling.integers([0, 1, 2, 3, 4, 5, 6, 7]), scaling.texts(scaling.kernel(host)), scaling.string("fixed"), scaling.object([], []), scaling.scheduleValue(3, scaling.ORDER_SEED + 1), scaling.scheduleValue(40, scaling.ORDER_SEED), scaling.string(scaling.oracle()), gates("7.2")]
+    for index in 0..keys.length { set(fixture, keys[index], items[index]) }
+    publish(fixture)
+    return fixture
+}
+function tearDown(fixture: Fixture) { test.removeTree(fixture.host.directory); test.removeTree(fixture.directory) }
+function widthSeconds(fixture: Fixture, width: Integer): Float {
+    if width == 1 { return fixture.widths[0] }
+    if width == 2 { return fixture.widths[1] }
+    if width == 4 { return fixture.widths[2] }
+    return fixture.widths[3]
+}
+function append(fixture: Fixture, ticks: List<Integer>, seconds: Float) {
+    ticks.add(fixture.clock[0])
+    fixture.clock[0] += Integer(seconds * 1000000000.0)
+    ticks.add(fixture.clock[0])
+}
+function item(fixture: Fixture, index: Integer): scaling.Outcome {
+    let round = index
+    let orders = scaling.schedule(3, scaling.ORDER_SEED + 1)
+    if index >= 3 { round = index - 3; orders = scaling.schedule(40, scaling.ORDER_SEED) }
+    let ticks: List<Integer> = []
+    for width in orders[round] {
+        if width == 1 && fixture.control[0] && round % 2 == 0 { append(fixture, ticks, fixture.controlSeconds[0]) }
+        append(fixture, ticks, widthSeconds(fixture, width))
+        if width == 1 && fixture.control[0] && round % 2 != 0 { append(fixture, ticks, fixture.controlSeconds[0]) }
+    }
+    fixture.host.ticks.truncate(0)
+    for tick in ticks { fixture.host.ticks.add(tick) }
+    fixture.host.tickIndex[0] = 0
+    return scaling.run(fixture.host, fixture.protocol, fixture.results, index)
+}
+function passes(fixture: Fixture, index: Integer) { let outcome = item(fixture, index); test.check(outcome.error == "", "scaling item " + Text(index) + " failed: " + outcome.error) }
+function raises(outcome: scaling.Outcome, message: Text) { test.check(outcome.error != "" && !outcome.gate, message) }
+function control(fixture: Fixture) {
+    set(fixture, "single_thread_control", scaling.object(["executable", "sha256", "source_sha", "upper_95_ratio_max"], [scaling.string(fixture.directory + "/artifact"), scaling.string(scaling.digest(fixture.directory + "/artifact")), scaling.string("fixed"), scaling.number("1.01")]))
+    fixture.control[0] = true
+    publish(fixture)
+}
+function results(fixture: Fixture): json.Value { return json.parse(readTextFile(fixture.results)) }
+function count(value: json.Value, name: Text): Integer { return json.member(value, name).items.length }
+function exists(path: Text): Boolean { return files.pathSize(path) >= 0 }
+function same(left: json.Value, right: json.Value): Boolean { return scaling.canonical(left) == scaling.canonical(right) }
+function makeTree(path: Text) {
+    let raw = Bytes(path)
+    for index in 1..(raw.length + 1) { if index == raw.length || raw[index] == 47 { test.check(files.makeDirectory(Text(raw.slice(0, index))) == 0, "cannot create cgroup fixture directory") } }
+}
+function resources(fixture: Fixture, session: Text, parent: Text): Groups {
+    let root = fixture.directory + "/cgroup"
+    let leaf = root + "/user.slice/" + parent + "/session-" + session + ".scope"
+    makeTree(leaf)
+    for directory in [root, root + "/user.slice", root + "/user.slice/" + parent, leaf] {
+        writeTextFile(directory + "/cpu.max", "max 100000\n")
+        writeTextFile(directory + "/cpu.max.burst", "0\n")
+        writeTextFile(directory + "/cpu.weight", "100\n")
+        writeTextFile(directory + "/cpuset.cpus.effective", "0-7\n")
+    }
+    return Groups { root: root; leaf: leaf; membership: "0::/user.slice/" + parent + "/session-" + session + ".scope\n" }
+}
+function parentOf(path: Text): Text {
+    let raw = Bytes(path)
+    let slash = 0
+    for index in 0..raw.length { if raw[index] == 47 { slash = index } }
+    return Text(raw.slice(0, slash))
+}
+
+function testCompleteOriginalCampaign() {
+    let fixture = setUp()
+    for index in 0..43 { passes(fixture, index) }
+    let result = results(fixture)
+    test.check(json.member(result, "qualified").truth, "complete campaign did not qualify")
+    test.check(count(result, "samples") == 172 && count(result, "preflights") == 43, "complete campaign sample counts changed")
+    let eight = json.member(json.member(result, "scaling"), "8")
+    test.check(json.member(eight, "median").number == 8.0, "eight-thread median changed")
+    let interval = json.member(eight, "interval_95").items
+    test.check(interval.length == 2 && interval[0].number == 8.0 && interval[1].number == 8.0, "eight-thread interval changed")
+    tearDown(fixture)
+}
+function testDuplicateSkipAndFailedResume() {
+    let fixture = setUp()
+    passes(fixture, 0)
+    let original = readTextFile(fixture.results)
+    let duplicate = item(fixture, 0)
+    test.check(duplicate.error.startsWith("[Errno 17]"), "duplicate first item did not refuse existing results")
+    raises(item(fixture, 2), "skipped item was accepted")
+    test.check(readTextFile(fixture.results) == original, "rejected items changed retained results")
+    fixture.host.activity.other = 0.021
+    fixture.host.sleeps.truncate(0)
+    raises(item(fixture, 1), "noisy host was accepted")
+    let waits = 0
+    for seconds in fixture.host.sleeps { if seconds == 30 { waits += 1 } }
+    test.check(waits == 10, "noisy host did not wait ten times")
+    let retained = json.member(results(fixture), "preflight_waits").items
+    test.check(json.member(retained[retained.length - 1], "checks").items.length == 11, "noisy host did not retain eleven checks")
+    raises(item(fixture, 1), "failed campaign resumed")
+    test.check(json.member(results(fixture), "failure").kind == json.STRING, "failed campaign did not retain its failure")
+    tearDown(fixture)
+}
+function testOriginalThresholdAndAllSamples() {
+    let fixture = setUp()
+    fixture.widths[3] = 8.0 / 7.19
+    for index in 0..42 { passes(fixture, index) }
+    let last = item(fixture, 42)
+    test.check(last.error != "" && last.gate, "below-threshold campaign did not fail its gate")
+    let result = results(fixture)
+    test.check(!json.member(result, "qualified").truth && count(result, "samples") == 172, "below-threshold campaign lost samples or qualified")
+    tearDown(fixture)
+}
+function testLowerIntervalGate() {
+    let values: List<Float> = []
+    for index in 0..20 { values.add(5.0) }
+    for index in 0..20 { values.add(10.0) }
+    let interval = scaling.bootstrapInterval(values)
+    test.check(interval.low == 5.0 && interval.high == 10.0, "bootstrap interval changed")
+    let short: List<Float> = []
+    for index in 0..39 { short.add(8.0) }
+    test.check(!scaling.bootstrapValid(short), "bootstrap accepted fewer than forty rounds")
+}
+function testPairedCpuImprovementPasses() {
+    let fixture = setUp()
+    control(fixture)
+    fixture.controlSeconds[0] = 9.0
+    for index in 0..43 { passes(fixture, index) }
+    let result = results(fixture)
+    test.check(json.member(result, "qualified").truth, "improved control campaign did not qualify")
+    test.check(count(result, "samples") == 172 && count(result, "single_thread_pairs") == 43, "control campaign counts changed")
+    let cpu = json.member(result, "single_thread_cpu")
+    test.check(count(cpu, "ratios") == 40, "control ratio count changed")
+    test.check(json.member(cpu, "interval_95").items[1].number < 0.99, "improved control interval too high")
+    tearDown(fixture)
+}
+function testPairedCpuRegressionFails() {
+    let fixture = setUp()
+    control(fixture)
+    fixture.controlSeconds[0] = 8.0 / 1.02
+    for index in 0..42 { passes(fixture, index) }
+    let last = item(fixture, 42)
+    test.check(last.error != "" && last.gate, "regressed control campaign did not fail its gate")
+    let result = results(fixture)
+    let cpu = json.member(result, "single_thread_cpu")
+    test.check(!json.member(result, "qualified").truth && !json.member(cpu, "qualified").truth, "regressed control campaign qualified")
+    test.check(json.member(cpu, "interval_95").items[1].number > 1.01, "regressed control interval too low")
+    tearDown(fixture)
+}
+function testChangedWorkloadOrGateRejected() {
+    let fixture = setUp()
+    set(fixture, "workload_sha256", scaling.string("changed"))
+    publish(fixture)
+    raises(item(fixture, 0), "changed workload was accepted")
+    set(fixture, "workload_sha256", scaling.string(scaling.WORKLOAD_SHA256))
+    set(fixture, "gates", gates("7.1"))
+    publish(fixture)
+    raises(item(fixture, 0), "changed gate was accepted")
+    tearDown(fixture)
+}
+function testResourceSessionChangeOnly() {
+    let fixture = setUp()
+    let first = resources(fixture, "100", "user-1000.slice")
+    let second = resources(fixture, "101", "user-1000.slice")
+    test.check(same(scaling.resourceIdentity(fixture.host, first.membership, first.root), scaling.resourceIdentity(fixture.host, second.membership, second.root)), "session-only change altered resource identity")
+    tearDown(fixture)
+}
+function testResourceGuardRejectsBeforeMeasurement() {
+    let fixture = setUp()
+    let groups = resources(fixture, "100", "user-1000.slice")
+    let original = scaling.resourceIdentity(fixture.host, groups.membership, groups.root)
+    set(fixture, "resource_identity", original)
+    publish(fixture)
+    writeTextFile(groups.leaf + "/cpu.max", "400000 100000\n")
+    let changed = scaling.resourceIdentity(fixture.host, groups.membership, groups.root)
+    fixture.host.snapshot.add(scaling.object(["identity"], [changed]))
+    fixture.host.tickCalls[0] = 0
+    let outcome = item(fixture, 0)
+    test.check(test.contains(outcome.error, "ancestry, limits or availability"), "changed resource identity was accepted: " + outcome.error)
+    test.check(fixture.host.tickCalls[0] == 0, "measurement started before the resource guard")
+    test.check(!exists(fixture.results), "resource guard created results")
+    tearDown(fixture)
+}
+function testResourceParentQuotaCpusetAndAvailability() {
+    let fixture = setUp()
+    let first = resources(fixture, "100", "user-1000.slice")
+    let original = scaling.resourceIdentity(fixture.host, first.membership, first.root)
+    let moved = resources(fixture, "102", "other.slice")
+    test.check(!same(original, scaling.resourceIdentity(fixture.host, moved.membership, first.root)), "parent move kept resource identity")
+    let names = ["cpu.max", "cpu.max.burst", "cpu.weight", "cpuset.cpus.effective"]
+    let values = ["400000 100000\n", "1000\n", "200\n", "0-3\n"]
+    for index in 0..names.length {
+        let path = parentOf(first.leaf) + "/" + names[index]
+        let before = readTextFile(path)
+        writeTextFile(path, values[index])
+        test.check(!same(original, scaling.resourceIdentity(fixture.host, first.membership, first.root)), "parent limit change kept resource identity: " + names[index])
+        writeTextFile(path, before)
+        test.check(files.remove(path) == 0, "cannot remove parent limit fixture")
+        test.check(!same(original, scaling.resourceIdentity(fixture.host, first.membership, first.root)), "parent limit removal kept resource identity: " + names[index])
+        writeTextFile(path, before)
+    }
+    fixture.host.affinity.truncate(0)
+    for cpu in [0, 1, 2, 3] { fixture.host.affinity.add(cpu) }
+    test.check(!same(original, scaling.resourceIdentity(fixture.host, first.membership, first.root)), "affinity change kept resource identity")
+    fixture.host.affinity.truncate(0)
+    for cpu in 0..8 { fixture.host.affinity.add(cpu) }
+    fixture.host.denied = first.leaf + "/cpu.max"
+    test.check(!same(original, scaling.resourceIdentity(fixture.host, first.membership, first.root)), "unreadable limit kept resource identity")
+    tearDown(fixture)
+}
+function selected(selectors: List<Text>, name: Text): Boolean {
+    if selectors.length == 0 { return true }
+    for selector in selectors { if selector == "ScalingProtocol" || selector == name || selector == "ScalingProtocol." + name { return true } }
+    return false
+}
+
+let names = ["test_complete_original_campaign", "test_duplicate_skip_and_failed_resume", "test_original_threshold_and_all_samples", "test_lower_interval_gate", "test_paired_cpu_improvement_passes", "test_paired_cpu_regression_fails", "test_changed_workload_or_gate_rejected", "test_resource_session_change_only", "test_resource_guard_rejects_before_measurement", "test_resource_parent_quota_cpuset_and_availability"]
+let selectors: List<Text> = []
+for index in 0..argumentCount() {
+    let selector = argument(index)
+    if selector == "-v" || selector == "--verbose" || selector == "-q" || selector == "--quiet" { continue }
+    let known = selector == "ScalingProtocol"
+    for name in names { if selector == name || selector == "ScalingProtocol." + name { known = true } }
+    test.check(known, "unknown scaling protocol test selector: " + selector)
+    selectors.add(selector)
+}
+if selected(selectors, names[0]) { testCompleteOriginalCampaign() }
+if selected(selectors, names[1]) { testDuplicateSkipAndFailedResume() }
+if selected(selectors, names[2]) { testOriginalThresholdAndAllSamples() }
+if selected(selectors, names[3]) { testLowerIntervalGate() }
+if selected(selectors, names[4]) { testPairedCpuImprovementPasses() }
+if selected(selectors, names[5]) { testPairedCpuRegressionFails() }
+if selected(selectors, names[6]) { testChangedWorkloadOrGateRejected() }
+if selected(selectors, names[7]) { testResourceSessionChangeOnly() }
+if selected(selectors, names[8]) { testResourceGuardRejectsBeforeMeasurement() }
+if selected(selectors, names[9]) { testResourceParentQuotaCpusetAndAvailability() }
+print("concurrency scaling protocol: passed")

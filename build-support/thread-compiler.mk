@@ -22,8 +22,12 @@ check-thread-generated-recovery-sanitize: build/minyarc-threads build/minyar-def
 check-thread-generated-recovery-tsan: build/minyarc-threads build/minyar-default-runtime.o build/minyar-runtime-eager.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/thread-generated-recovery.py --sanitizer thread
 
-check-thread-scaling-protocol:
-	$(LIMITED) python3 tests/concurrency-scaling.py
+build/tooling/tests/concurrency-scaling-test build/tooling/tools/concurrency-scaling: private TOOL_NATIVE = runtime/native/sha256.c tests/performance-resources.c tests/performance-test-runtime.c
+build/tooling/tests/concurrency-scaling-test build/tooling/tools/concurrency-scaling: private TOOL_LIBS = -lcrypto
+build/tooling/tests/concurrency-scaling-test build/tooling/tools/concurrency-scaling: private TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/concurrency-scaling-test build/tooling/tools/concurrency-scaling: tests/performance-resources.c tests/performance-test-runtime.c build/testing/cycle-runtime.o
+check-thread-scaling-protocol: build/tooling/tests/concurrency-scaling-test build/tooling/tools/concurrency-scaling
+	$(LIMITED) ./build/tooling/tests/concurrency-scaling-test
 
 check-thread-compiler: build/minyarc-threads
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/thread-compiler.py
