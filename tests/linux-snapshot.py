@@ -2,6 +2,7 @@
 """Keep strict suite consumers inside isolated correctness source snapshots."""
 import hashlib
 import importlib.util
+import os
 from pathlib import Path
 import stat
 import tempfile
@@ -60,6 +61,22 @@ class LinuxSnapshot(unittest.TestCase):
             with mock.patch.object(RUNNER.shutil, 'which', side_effect=commands.get):
                 with self.assertRaisesRegex(ValueError, 'matching LLD was not found'):
                     RUNNER.resolve_toolchain('chosen-clang', 'chosen-cxx')
+
+    def test_frontend_checks_wait_for_the_complete_shared_build(self):
+        with tempfile.TemporaryDirectory(prefix='minyar-shared-frontends-') as temporary:
+            root = Path(temporary)
+            (root / 'logs').mkdir()
+            (root / 'build').mkdir()
+            (root / 'Makefile').write_text('early:\n\t@printf early >build/minyarc; touch early\n'
+                'late:\n\t@sleep 0.3; printf final >build/minyarc; touch late\n')
+            runner = RUNNER.check_runner.Runner(work=root, logs=root / 'logs', env=dict(os.environ),
+                make=['make', '-j1'], jobs=2, timeout=5, report={'checks': []}, save=lambda: None,
+                retries=0)
+            checks = [RUNNER.check_runner.Check('frontend-identity',
+                ['sh', '-c', 'test -f late && test "$(cat build/minyarc)" = final'], goals=['early'], expected=20),
+                RUNNER.check_runner.Check('late-input', ['test', '-f', 'late'], goals=['late'], expected=10)]
+            runner.run_all(checks)
+            self.assertEqual(runner.results, {'frontend-identity': 'passed', 'late-input': 'passed'})
 
     def test_workflow_consumers_remain_reviewable_and_catalogue_valid(self):
         with tempfile.TemporaryDirectory(prefix='minyar-linux-snapshot-') as temporary:

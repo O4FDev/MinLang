@@ -144,7 +144,13 @@ def main():
                                  python=sys.executable)
     save()
     try:
-        runner.run_all(checks)
+        prebuild = [name for name in (
+            "build/minyarc", "build/minyarc-modules", "build/minyar-module-build",
+            "build/minyar-default-runtime.o", "build/minyar-default-runtime-release.ll",
+            "build/minyar-runtime-eager.o", "build/minyar-runtime-eager-release.ll",
+            "build/minyarc-errors-request", "build/minyarc-errors",
+            "build/minyarc-callbacks", "build/minyarc-calldepth") if name in rules]
+        runner.run_all(checks, prebuild=prebuild)
     except (OSError, RuntimeError) as error:
         report['error'] = str(error)
         print(str(error), file=sys.stderr)

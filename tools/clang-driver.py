@@ -207,7 +207,9 @@ def bootstrap(project, targets):
     project = host_path(project)
     (project / 'build').mkdir(parents=True, exist_ok=True)
     environment = dict(os.environ)
-    environment['LLVM_CC'] = pinned_llvm(environment.get('MINYAR_CLANG', environment.get('LLVM_CC')))
+    selected = environment.get('MINYAR_CLANG', environment.get('LLVM_CC'))
+    resolved = pinned_llvm(selected)
+    environment['LLVM_CC'] = selected or resolved
     if 'CC' not in environment:
         environment['CC'] = environment.get('LLVM_CC', 'clang')
     if 'COMPILER_LTO_FLAGS' not in environment:

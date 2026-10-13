@@ -3,6 +3,9 @@ CC ?= cc
 CPPFLAGS ?= -isystem vendor
 CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Werror
 LLVM_CC ?= $(if $(filter Darwin,$(shell uname -s)),clang,clang-23)
+ifeq ($(origin CC),default)
+CC = $(LLVM_CC)
+endif
 LLVM_FLAGS ?= -O2 -Wno-override-module
 LDLIBS ?= -lm
 SANITIZER_FLAGS ?= -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wno-override-module

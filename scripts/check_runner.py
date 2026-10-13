@@ -416,7 +416,8 @@ class Runner:
             return members >= GROUP_LIMITS.get(check.resource.rsplit(':', 1)[-1], 1)
 
         def goals_ready(check):
-            return all(goal in self.variants[check.variant].built for goal in check.goals)
+            return (not builder_busy(check.variant) and not builder_order[check.variant]
+                    and all(goal in self.variants[check.variant].built for goal in check.goals))
 
         def goals_failed(check):
             return any(goal in self.variants[check.variant].failed_goals for goal in check.goals)
