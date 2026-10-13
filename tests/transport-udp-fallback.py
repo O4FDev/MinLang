@@ -11,6 +11,7 @@ import socket
 import subprocess
 import threading
 import time
+from clang_helpers import asan_leak_options
 
 ROOT = Path(__file__).resolve().parents[1]
 def module(name, path):
@@ -142,7 +143,7 @@ def main():
     if options.sanitize:
         for name in ('MINYAR_CLANG_FLAGS','MINYAR_NATIVE_FLAGS','MINYAR_RUNTIME_FLAGS'):
             os.environ[name]='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wno-override-module'
-        os.environ['ASAN_OPTIONS']='detect_leaks=1'; os.environ['UBSAN_OPTIONS']='halt_on_error=1'
+        os.environ['ASAN_OPTIONS']=asan_leak_options(); os.environ['UBSAN_OPTIONS']='halt_on_error=1'
     native=options.binary.resolve() if options.binary else options.evidence.resolve()/'native'
     quinn=options.peer_binary.resolve() if options.peer_binary else ROOT/'build/interop-quinn/release/minyar-quinn-interop'
     go=options.go_binary.resolve() if options.go_binary else ROOT/'build/yamux-peer'
