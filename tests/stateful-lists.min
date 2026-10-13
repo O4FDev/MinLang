@@ -1,0 +1,128 @@
+use "../tools/testing.min" as test
+use "./compiler-port-support.min" as port
+use "./cpython-random.min" as random
+use "system" as system
+
+record Sequence { source: List<Text>; expected: List<Text>; operations: Integer; names: List<Text>; model: List<List<Integer>> }
+function checkpoint(state: Sequence, lines: List<Text>) {
+    state.operations += 1
+    for line in lines { state.source.add(line) }
+    state.source.add("print(" + Text(state.operations - 1) + ")")
+    state.expected.add(Text(state.operations - 1))
+    for index in 0..3 {
+        state.source.add("observe(" + state.names[index] + ")")
+        let values = state.model[index]
+        state.expected.add(Text(values.length))
+        for value in values { state.expected.add(Text(value)) }
+    }
+}
+function integers(values: List<Integer>): Text {
+    let parts: List<Text> = []
+    for index in 0..values.length {
+        if index > 0 { parts.add(", ") }
+        parts.add(Text(values[index]))
+    }
+    return joinText(parts)
+}
+function sequence(seed: Integer, steps: Integer): Sequence {
+    let rng = random.seeded(Text(seed))
+    let names = ["first", "second", "third"]
+    let source = ["function observe(values: List<Integer>) {", "print(values.length)", "let index = 0",
+        "while index < values.length { print(values[index]); index = index + 1 }", "}"]
+    for name in names { source.add("let " + name + ": List<Integer> = []") }
+    let state = Sequence { source: source; expected: []; operations: 0; names: names; model: [[], [], []] }
+    checkpoint(state, [])
+    state.model[1] = state.model[0]
+    checkpoint(state, ["second = first"])
+    for value in 0..65 {
+        state.model[0].add(value)
+        checkpoint(state, ["first.add(" + Text(value) + ")"])
+    }
+    let boundary = state.model[0][0]
+    state.model[0][0] = state.model[0][64]
+    state.model[0][64] = boundary
+    checkpoint(state, ["let boundary = first[0]", "first[0] = first[64]", "first[64] = boundary"])
+    state.model[2] = state.model[0].appended(-1)
+    checkpoint(state, ["third = first.appended(-1)"])
+    state.model[0][0] = 9999
+    checkpoint(state, ["first[0] = 9999"])
+    state.model[0] = []
+    checkpoint(state, ["first = []"])
+    state.model[1][64] = -8888
+    checkpoint(state, ["second[64] = -8888"])
+    let operations = ["add", "write", "alias", "fork", "rebind", "swap"]
+    for step in 0..steps {
+        let target = random.below(rng, 3)
+        let other = random.below(rng, 3)
+        let name = names[target]
+        let otherName = names[other]
+        let operation = operations[random.below(rng, 6)]
+        let value = -10000 + random.below(rng, 20001)
+        let sized = target
+        if operation == "fork" { sized = other }
+        if (operation == "add" || operation == "fork") && state.model[sized].length >= 128 { operation = "rebind" }
+        if (operation == "write" || operation == "swap") && state.model[target].length == 0 { operation = "add" }
+        let lines: List<Text> = []
+        if operation == "add" {
+            state.model[target].add(value)
+            lines.add(name + ".add(" + Text(value) + ")")
+        } else if operation == "write" {
+            let index = random.below(rng, state.model[target].length)
+            state.model[target][index] = value
+            lines.add(name + "[" + Text(index) + "] = " + Text(value))
+        } else if operation == "alias" {
+            state.model[target] = state.model[other]
+            lines.add(name + " = " + otherName)
+        } else if operation == "fork" {
+            state.model[target] = state.model[other].appended(value)
+            lines.add(name + " = " + otherName + ".appended(" + Text(value) + ")")
+        } else if operation == "rebind" {
+            let count = random.below(rng, 4)
+            let values: List<Integer> = []
+            for unused in 0..count { values.add(-100 + random.below(rng, 201)) }
+            state.model[target] = values
+            lines.add(name + " = [" + integers(values) + "]")
+        } else {
+            let left = random.below(rng, state.model[target].length)
+            let right = random.below(rng, state.model[target].length)
+            let saved = state.model[target][left]
+            state.model[target][left] = state.model[target][right]
+            state.model[target][right] = saved
+            lines.add("let saved" + Text(step) + " = " + name + "[" + Text(left) + "]")
+            lines.add(name + "[" + Text(left) + "] = " + name + "[" + Text(right) + "]")
+            lines.add(name + "[" + Text(right) + "] = saved" + Text(step))
+        }
+        checkpoint(state, lines)
+    }
+    return state
+}
+function text(lines: List<Text>): Text {
+    let parts: List<Text> = []
+    for line in lines { parts.add(line + "\n") }
+    return joinText(parts)
+}
+
+let names = ["test_seeded_alias_and_fork_model"]
+let selectors = port.selectors("StatefulLists", names)
+let context = port.compiler()
+let variants = ["-O0", "-O2"]
+if system.getenv("MINYAR_TEST_EXTENDED_OPT") == "1" { variants = ["-O0", "-O2", "-O3", "-Os"] }
+if port.selected(selectors, "StatefulLists", names[0]) {
+    for seed in [0, 1, 0xC0DE, 0x4D494E] {
+        let state = sequence(seed, 96)
+        let source = text(state.source)
+        let expected = text(state.expected)
+        let result = test.compile(context, source)
+        test.check(result.status == 0, "seed " + Text(seed) + " compilation failed\n" + result.errorOutput)
+        let llvm = context.directory + "/case" + Text(context.serial) + ".ll"
+        for optimization in variants {
+            let executable = llvm + optimization
+            port.link(context, llvm, optimization, executable, context.linkTimeout)
+            let observed = test.run([executable], system.environment(), "", executable + ".run", context.runTimeout)
+            test.check(observed.status == 0 && observed.errorOutput == "", "seed " + Text(seed) + " " + optimization + " failed\n" + observed.errorOutput)
+            test.check(observed.output == expected, "seed " + Text(seed) + " " + optimization + " transcript differs")
+        }
+    }
+}
+test.removeTree(context.directory)
+print("StatefulLists: seeded alias and fork model passed")

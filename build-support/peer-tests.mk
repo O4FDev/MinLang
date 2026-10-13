@@ -38,11 +38,13 @@ check-list-literal-runtime: build/tooling/tests/list-literal-runtime
 check: check-list-literals check-list-literal-runtime
 check-sanitize: check-list-literals-sanitize
 
-check-stateful-lists: build/minyarc build/minyar-runtime.o
-	MINYAR_TEST_EXTENDED_OPT=1 $(LIMITED) python3 tests/stateful-lists.py
+build/tooling/tests/stateful-lists: TOOL_NATIVE = tests/sha256-test-native.c
+build/tooling/tests/stateful-lists: tests/sha256-test-native.c
+check-stateful-lists: build/minyarc build/minyar-runtime.o build/tooling/tests/stateful-lists
+	MINYAR_TEST_EXTENDED_OPT=1 $(LIMITED) ./build/tooling/tests/stateful-lists
 
-check-stateful-lists-sanitize: build/minyarc-sanitize build/ownership-runtime.o
-	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/stateful-lists.py
+check-stateful-lists-sanitize: build/minyarc-sanitize build/ownership-runtime.o build/tooling/tests/stateful-lists
+	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/stateful-lists
 
 check-sanitize: check-stateful-lists-sanitize
 check-peer-audit-harness:
