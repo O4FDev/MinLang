@@ -1,0 +1,97 @@
+use "../tools/testing.min" as test
+
+public record State { words: List<Integer>; position: List<Integer> }
+public function seeded(source: Text): State {
+    let raw = Bytes(source)
+    let begin = 0
+    let end = raw.length
+    while begin < end && raw[begin] <= 32 { begin += 1 }
+    while end > begin && raw[end - 1] <= 32 { end -= 1 }
+    if begin < end && (raw[begin] == 43 || raw[begin] == 45) { begin += 1 }
+    test.check(begin < end, "empty random seed")
+    let key = [0]
+    let digit = false
+    for index in begin..end {
+        if raw[index] == 95 {
+            test.check(digit && index + 1 < end && raw[index + 1] >= 48 && raw[index + 1] <= 57, "invalid random seed separator")
+            digit = false
+        } else {
+            test.check(raw[index] >= 48 && raw[index] <= 57, "invalid decimal random seed")
+            let carry = raw[index] - 48
+            for word in 0..key.length {
+                let value = key[word] * 10 + carry
+                key[word] = value & 0xffffffff
+                carry = value >> 32
+            }
+            if carry > 0 { key.add(carry) }
+            digit = true
+        }
+    }
+    test.check(digit, "invalid random seed")
+    let words = [19650218]
+    for index in 1..624 {
+        let previous = words[index - 1]
+        words.add((1812433253 * (previous ^ (previous >> 30)) + index) & 0xffffffff)
+    }
+    let index = 1
+    let keyIndex = 0
+    let rounds = 624
+    if key.length > rounds { rounds = key.length }
+    for unused in 0..rounds {
+        let previous = words[index - 1]
+        words[index] = ((words[index] ^ ((previous ^ (previous >> 30)) * 1664525)) + key[keyIndex] + keyIndex) & 0xffffffff
+        index += 1
+        keyIndex += 1
+        if index == 624 { words[0] = words[623]; index = 1 }
+        if keyIndex == key.length { keyIndex = 0 }
+    }
+    for unused in 0..623 {
+        let previous = words[index - 1]
+        words[index] = ((words[index] ^ ((previous ^ (previous >> 30)) * 1566083941)) - index) & 0xffffffff
+        index += 1
+        if index == 624 { words[0] = words[623]; index = 1 }
+    }
+    words[0] = 0x80000000
+    return State { words: words; position: [624] }
+}
+public function word(state: State): Integer {
+    if state.position[0] >= 624 {
+        for index in 0..624 {
+            let bits = (state.words[index] & 0x80000000) | (state.words[(index + 1) % 624] & 0x7fffffff)
+            let value = state.words[(index + 397) % 624] ^ (bits >> 1)
+            if (bits & 1) != 0 { value = value ^ 0x9908b0df }
+            state.words[index] = value
+        }
+        state.position[0] = 0
+    }
+    let value = state.words[state.position[0]]
+    state.position[0] += 1
+    value = value ^ (value >> 11)
+    value = value ^ ((value << 7) & 0x9d2c5680)
+    value = value ^ ((value << 15) & 0xefc60000)
+    value = value ^ (value >> 18)
+    return value
+}
+public function below(state: State, bound: Integer): Integer {
+    test.check(bound > 0 && bound <= 2147483647, "unsupported random integer bound")
+    let remaining = bound
+    let bits = 0
+    while remaining > 0 { bits += 1; remaining = remaining >> 1 }
+    let value = word(state) >> (32 - bits)
+    while value >= bound { value = word(state) >> (32 - bits) }
+    return value
+}
+public function bytes(state: State, length: Integer): Bytes {
+    test.check(length >= 0, "negative random byte length")
+    let result = Bytes(length)
+    let index = 0
+    while index < length {
+        let count = length - index
+        if count > 4 { count = 4 }
+        let value = word(state)
+        if count < 4 { value = value >> (32 - count * 8) }
+        for offset in 0..count { result[index + offset] = (value >> (offset * 8)) & 255 }
+        index += count
+    }
+    return result
+}

@@ -1,0 +1,198 @@
+use "../tools/testing.min" as test
+use "./sha256-support.min" as support
+use "./sha256test.min" as oracle
+use "./text-basics-oracles.min" as hex
+use "system" as system
+use "files" as files
+use "machine" as machine
+use "json" as json
+
+function quote(source: Text): Text {
+    let output = Bytes("\"")
+    let digits = Bytes("0123456789abcdef")
+    for byte in Bytes(source) {
+        if byte == 34 || byte == 92 { output.add(92); output.add(byte) }
+        else if byte < 32 { for item in Bytes("\\u00") { output.add(item) }; output.add(digits[byte / 16]); output.add(digits[byte % 16]) }
+        else { output.add(byte) }
+    }
+    output.add(34)
+    return Text(output)
+}
+function strings(values: List<Text>): Text {
+    let output = "["
+    for index in 0..values.length { if index > 0 { output += "," }; output += quote(values[index]) }
+    return output + "]"
+}
+function digest(path: Text): Text {
+    let data = readBytesFile(path)
+    return hex.hex(oracle.oracle(machine.address(data), data.length))
+}
+function resolved(context: support.Context, path: Text): Text { return test.lines(support.run(context, ["readlink", "-f", "--", path]).output)[0] }
+function stringMap(values: Map<Text, Text>, names: List<Text>): Text {
+    let output = "{"
+    for index in 0..names.length { if index > 0 { output += "," }; output += quote(names[index]) + ":" + quote(values[names[index]]) }
+    return output + "}"
+}
+function hashes(paths: List<Text>): Text {
+    let output = "{"
+    for index in 0..paths.length { if index > 0 { output += "," }; output += quote(paths[index]) + ":" + quote(digest(paths[index])) }
+    return output + "}"
+}
+function prepare(context: support.Context): Text {
+    let binaries = Map<Text, Text>()
+    let names = ["sha256pure", "sha256", "openssl_evp", "openssl_sha", "openssl_no_hw"]
+    for module in ["sha256pure", "sha256"] { binaries[module] = support.compile(context, "tests/sha256-bench.min", module, "-O3", false) }
+    let openssl = context.directory + "/openssl-reference"
+    let command = [context.clang, "-O3", "-Wno-deprecated-declarations", "tests/sha256-bench.c"]
+    for flag in support.shellWords(support.run(context, ["pkg-config", "--cflags", "--libs", "libcrypto"]).output) { command.add(flag) }
+    for item in ["-o", openssl] { command.add(item) }
+    support.run(context, command)
+    for name in ["openssl_evp", "openssl_sha", "openssl_no_hw"] { binaries[name] = openssl }
+    let portableSources: List<Text> = []
+    let portable = system.getenv("MINYAR_SHA256_PORTABLE_PREFIX")
+    if portable != "" {
+        writeTextFile(context.directory + "/portable-config.h", "#define MBEDTLS_SHA256_C\n")
+        portableSources = [portable + "/library/sha256.c", portable + "/library/platform_util.c"]
+        let executable = context.directory + "/portable-reference"
+        command = [context.clang, "-O3", "-DSHA256_PORTABLE_MBEDTLS", "-DMBEDTLS_CONFIG_FILE=\"portable-config.h\"", "-I" + context.directory, "-I" + portable + "/include", "-I" + portable + "/library", "tests/sha256-bench.c"]
+        for source in portableSources { command.add(source) }
+        for flag in support.shellWords(support.run(context, ["pkg-config", "--cflags", "--libs", "libcrypto"]).output) { command.add(flag) }
+        for item in ["-o", executable] { command.add(item) }
+        support.run(context, command)
+        names.add("portable_c")
+        binaries["portable_c"] = executable
+    }
+    let libdir = test.words(support.run(context, ["pkg-config", "--variable=libdir", "libcrypto"]).output)[0]
+    let providers: List<Text> = []
+    for suffix in ["libcrypto.so", "libcrypto.dylib"] { if files.pathSize(libdir + "/" + suffix) >= 0 { providers.add(resolved(context, libdir + "/" + suffix)) } }
+    let sourcePaths = ["library/sha256.min", "tests/sha256pure.min", "tests/sha256-bench.min", "tests/sha256-bench.c", "tests/sha256-bench-driver.min", "tests/sha256-support.min", "tests/sha256-test-native.c"]
+    if files.pathSize("runtime/native/sha256.c") >= 0 { sourcePaths.add("runtime/native/sha256.c") }
+    let binaryHashes = Map<Text, Text>()
+    for name in names { binaries[name] = resolved(context, binaries[name]); binaryHashes[name] = digest(binaries[name]) }
+    let host = support.run(context, ["uname", "-a"]).output
+    let clang = support.run(context, [context.clang, "--version"]).output
+    let opensslVersion = support.run(context, ["openssl", "version", "-a"]).output
+    let cpu = support.run(context, ["sh", "-c", "lscpu 2>/dev/null || sysctl -n machdep.cpu.brand_string"]).output
+    let commands = "["
+    for index in 0..context.commands.length { if index > 0 { commands += "," }; commands += strings(context.commands[index]) }
+    commands += "]"
+    let manifest = "{\"binaries\":" + stringMap(binaries, names) + ",\"host\":" + quote(host) + ",\"clang\":" + quote(clang) + ",\"openssl\":" + quote(opensslVersion) + ",\"cpu\":" + quote(cpu) + ",\"source_hashes\":" + hashes(sourcePaths) + ",\"portable_source_hashes\":" + hashes(portableSources) + ",\"provider_hashes\":" + hashes(providers) + ",\"toolchain_hashes\":" + hashes([context.compiler, context.runtime]) + ",\"binary_hashes\":" + stringMap(binaryHashes, names) + ",\"preparation_commands\":" + commands + "}"
+    writeTextFile(context.directory + "/manifest.json", manifest + "\n")
+    return manifest
+}
+record Observation { mode: Text; provider: Text; elapsed: Float }
+function median(observations: List<Observation>, mode: Text, provider: Text): Float {
+    let values: List<Float> = []
+    for item in observations { if item.mode == mode && item.provider == provider { values.add(item.elapsed) } }
+    test.check(values.length > 0, "missing SHA benchmark observations")
+    for index in 1..values.length {
+        let position = index
+        while position > 0 && values[position] < values[position - 1] { let old = values[position - 1]; values[position - 1] = values[position]; values[position] = old; position -= 1 }
+    }
+    let middle = values.length / 2
+    if values.length % 2 == 1 { return values[middle] }
+    return (values[middle - 1] + values[middle]) / 2.0
+}
+
+let samples = 5
+let length = 1048576
+let iterations = 64
+let output = ""
+let buildDirectory = ""
+let prepareOnly = false
+let runPrepared = false
+let optionIndex = 0
+while optionIndex < argumentCount() {
+    let option = argument(optionIndex)
+    if option == "--prepare-only" { prepareOnly = true }
+    else if option == "--run-prepared" { runPrepared = true }
+    else if option == "--samples" || option == "--bytes" || option == "--iterations" || option == "--output" || option == "--build-dir" {
+        test.check(optionIndex + 1 < argumentCount(), "missing SHA benchmark option value")
+        optionIndex += 1
+        if option == "--samples" { samples = Integer(argument(optionIndex)) }
+        else if option == "--bytes" { length = Integer(argument(optionIndex)) }
+        else if option == "--iterations" { iterations = Integer(argument(optionIndex)) }
+        else if option == "--output" { output = argument(optionIndex) }
+        else { buildDirectory = argument(optionIndex) }
+    } else { fail("unknown SHA benchmark option: " + option) }
+    optionIndex += 1
+}
+test.check(samples > 0 && length >= 0 && iterations > 0, "samples/iterations must be positive and bytes nonnegative")
+test.check((!prepareOnly && !runPrepared) || buildDirectory != "", "--prepare-only/--run-prepared requires --build-dir")
+let scratch = test.scratch()
+let context = support.context(scratch, false)
+if buildDirectory != "" {
+    support.run(context, ["mkdir", "-p", "--", buildDirectory])
+    context.directory = resolved(context, buildDirectory)
+    context.commands.truncate(0)
+}
+let manifest = ""
+if runPrepared { manifest = readTextFile(context.directory + "/manifest.json") }
+else { manifest = prepare(context) }
+if prepareOnly { print("Prepared SHA benchmark binaries: " + context.directory) }
+else {
+    let parsed = json.parse(manifest)
+    test.check(parsed.kind == json.OBJECT, "invalid prepared SHA benchmark manifest")
+    let binaries = json.member(parsed, "binaries")
+    let binaryHashes = json.member(parsed, "binary_hashes")
+    test.check(binaries.kind == json.OBJECT && binaryHashes.kind == json.OBJECT, "missing prepared SHA benchmark binaries")
+    test.check(json.member(binaries, "portable_c").kind == json.STRING, "portable C reference required: set MINYAR_SHA256_PORTABLE_PREFIX during preparation")
+    for name in binaries.keys { test.check(digest(json.string(binaries, name)) == json.string(binaryHashes, name), "prepared binary changed: " + name) }
+    let observations: List<Observation> = []
+    let records: List<Text> = []
+    for mode in ["oneshot", "lifecycle"] {
+        for sample in (-1)..samples {
+            let offset = ((sample % binaries.keys.length) + binaries.keys.length) % binaries.keys.length
+            let expected = 0
+            let first = true
+            for index in 0..binaries.keys.length {
+                let name = binaries.keys[(offset + index) % binaries.keys.length]
+                let command = [json.string(binaries, name), Text(length), Text(iterations), mode]
+                if name == "openssl_evp" { command.add("evp") }
+                else if name == "openssl_sha" || name == "openssl_no_hw" || name == "portable_c" { command.add("sha") }
+                let original = context.environment
+                if name == "openssl_no_hw" { context.environment = support.environment(original, "OPENSSL_ia32cap", "0") }
+                let result = support.run(context, command)
+                context.environment = original
+                let fields = test.words(result.output)
+                test.check(fields.length == 2, "invalid SHA benchmark protocol")
+                let elapsed = Integer(fields[0])
+                let checksum = Integer(fields[1])
+                if first { expected = checksum; first = false }
+                test.check(checksum == expected, "mismatched complete-operation digests: " + mode + " sample " + Text(sample))
+                if sample >= 0 {
+                    observations.add(Observation { mode: mode; provider: name; elapsed: Float(elapsed) })
+                    let env = "{}"
+                    if name == "openssl_no_hw" { env = "{\"OPENSSL_ia32cap\":\"0\"}" }
+                    let row = "{\"mode\":" + quote(mode) + ",\"sample\":" + Text(sample) + ",\"provider\":" + quote(name) + ",\"elapsed_ns\":" + Text(elapsed) + ",\"checksum\":" + Text(checksum) + ",\"command\":" + strings(command) + ",\"environment\":" + env + "}"
+                    records.add(row)
+                    files.writeStandardOutput(row + "\n")
+                }
+            }
+        }
+    }
+    let medians = "{"
+    let ratios = "{"
+    let modes = ["oneshot", "lifecycle"]
+    for modeIndex in 0..modes.length {
+        let mode = modes[modeIndex]
+        if modeIndex > 0 { medians += ","; ratios += "," }
+        medians += quote(mode) + ":{"
+        for nameIndex in 0..binaries.keys.length { if nameIndex > 0 { medians += "," }; let name = binaries.keys[nameIndex]; medians += quote(name) + ":" + Text(median(observations, mode, name)) }
+        medians += "}"
+        let reference = median(observations, mode, "openssl_evp")
+        test.check(reference != 0.0, "zero EVP benchmark median")
+        ratios += quote(mode) + ":" + Text(median(observations, mode, "sha256pure") / reference)
+    }
+    medians += "}"
+    ratios += "}"
+    let recordJSON = "["
+    for index in 0..records.length { if index > 0 { recordJSON += "," }; recordJSON += records[index] }
+    recordJSON += "]"
+    let report = json.pretty(parsed, "")
+    let raw = Bytes(report)
+    report = Text(raw.slice(0, raw.length - 1)) + ",\"bytes\":" + Text(length) + ",\"iterations\":" + Text(iterations) + ",\"samples\":" + Text(samples) + ",\"records\":" + recordJSON + ",\"median_ns\":" + medians + ",\"pure_vs_evp\":" + ratios + "}"
+    if output != "" { writeTextFile(output, report + "\n") }
+    print("{\"median_ns\":" + medians + ",\"pure_vs_evp\":" + ratios + "}")
+}
+test.removeTree(scratch)

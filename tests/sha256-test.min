@@ -1,0 +1,85 @@
+use "../tools/testing.min" as test
+use "./sha256-support.min" as support
+use "./cpython-random.min" as random
+use "./sha256test.min" as oracle
+use "./text-basics-oracles.min" as hex
+use "machine" as machine
+use "files" as files
+
+function little32(output: Bytes, value: Integer) {
+    for shift in 0..4 { output.add((value >> (shift * 8)) & 255) }
+}
+function digest(input: Bytes): Text { return hex.hex(oracle.oracle(machine.address(input), input.length)) }
+function appendCase(frames: Bytes, expected: List<Text>, data: Bytes, prefix: Integer, splits: List<Integer>) {
+    little32(frames, data.length)
+    little32(frames, prefix)
+    little32(frames, splits.length)
+    for count in splits { little32(frames, count) }
+    for byte in data { frames.add(byte) }
+    let full = digest(data)
+    let snapshot = data.slice(0, prefix)
+    let branch = snapshot.slice(0, snapshot.length)
+    branch.add(63)
+    let extended = data.slice(0, data.length)
+    extended.add(33)
+    expected.add(full + " " + full + " " + digest(snapshot) + " " + digest(branch) + " " + full + " " + full + " " + digest(extended))
+}
+
+let module = "sha256"
+let cases = 256
+let seed = Text(0x5A256)
+let sanitize = false
+let optionIndex = 0
+while optionIndex < argumentCount() {
+    let option = argument(optionIndex)
+    if option == "--sanitize" { sanitize = true }
+    else if option == "--module" || option == "--cases" || option == "--seed" {
+        test.check(optionIndex + 1 < argumentCount(), "missing SHA option value")
+        optionIndex += 1
+        if option == "--module" { module = argument(optionIndex) }
+        else if option == "--cases" { cases = Integer(argument(optionIndex)) }
+        else { seed = argument(optionIndex) }
+    } else { fail("unknown SHA option: " + option) }
+    optionIndex += 1
+}
+test.check(module == "sha256" || module == "sha256pure", "unknown SHA module")
+test.check(cases >= 0, "--cases must be nonnegative")
+let directory = test.scratch()
+let context = support.context(directory, sanitize)
+let focused = support.compile(context, "tests/sha256.min", module, "-O2", sanitize)
+files.writeStandardOutput(support.run(context, [focused]).output)
+let rng = random.seeded(seed)
+let frames = Bytes()
+let expected: List<Text> = []
+for length in [0, 1, 2, 3, 7, 31, 55, 56, 57, 63, 64, 65, 119, 120, 127, 128, 129, 255, 256, 257, 1024] {
+    for prefix in 0..(length + 1) {
+        let splits: List<Integer> = []
+        for index in prefix..length { splits.add(1) }
+        appendCase(frames, expected, random.bytes(rng, length), prefix, splits)
+    }
+}
+for index in 0..cases {
+    let length = random.below(rng, 8193)
+    let prefix = random.below(rng, length + 1)
+    let remaining = length - prefix
+    let splits = [0]
+    while remaining > 0 {
+        let choices = [1, 7, 55, 56, 63, 64, 65, 128, random.below(rng, 1024) + 1]
+        let chunk = choices[random.below(rng, choices.length)]
+        if chunk > remaining { chunk = remaining }
+        splits.add(chunk)
+        splits.add(0)
+        remaining -= chunk
+    }
+    appendCase(frames, expected, random.bytes(rng, length), prefix, splits)
+}
+let path = directory + "/corpus.bin"
+writeBytesFile(path, frames)
+let executable = support.compile(context, "tests/sha256-splits.min", module, "-O2", sanitize)
+let actual = test.lines(support.run(context, [executable, path]).output)
+test.check(actual.length == expected.length, "SHA split output count differs: " + Text(actual.length) + " versus " + Text(expected.length))
+for index in 0..actual.length { test.check(actual[index] == expected[index], "SHA split differential mismatch at " + Text(index) + ": " + actual[index] + " versus " + expected[index]) }
+let memory = support.compile(context, "tests/sha256-memory.min", module, "-O2", sanitize)
+files.writeStandardOutput(support.run(context, [memory]).output)
+print(Text(expected.length) + " seeded split cases passed; seed=" + seed + "; direct custom link passed")
+test.removeTree(directory)
