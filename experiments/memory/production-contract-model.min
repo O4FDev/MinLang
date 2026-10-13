@@ -1,0 +1,134 @@
+use "../../tools/testing.min" as test
+
+function reachable(edges: List<Integer>, start: Integer, goal: Integer): Boolean {
+    let pending = [start]
+    let seen = 0
+    while pending.length > 0 {
+        let node = pending[pending.length - 1]
+        pending.truncate(pending.length - 1)
+        if node == goal { return true }
+        if (seen & (1 << node)) == 0 {
+            seen = seen | (1 << node)
+            for target in 0..edges.length { if (edges[node] & (1 << target)) != 0 { pending.add(target) } }
+        }
+    }
+    return false
+}
+function acyclic(edges: List<Integer>): Boolean {
+    let counts: List<Integer> = []
+    let pending: List<Integer> = []
+    for target in 0..edges.length {
+        let count = 0
+        for row in edges { if (row & (1 << target)) != 0 { count += 1 } }
+        counts.add(count)
+        if count == 0 { pending.add(target) }
+    }
+    let visited = 0
+    while pending.length > 0 {
+        let node = pending[pending.length - 1]
+        pending.truncate(pending.length - 1)
+        visited += 1
+        for target in 0..edges.length {
+            if (edges[node] & (1 << target)) != 0 {
+                counts[target] -= 1
+                if counts[target] == 0 { pending.add(target) }
+            }
+        }
+    }
+    return visited == edges.length
+}
+function selected(selectors: List<Text>, name: Text): Boolean {
+    if selectors.length == 0 { return true }
+    for selector in selectors { if selector == "ProductionContracts" || selector == name || selector == "ProductionContracts." + name { return true } }
+    return false
+}
+let names = ["test_constructor_and_type_guard_preserve_acyclicity", "test_only_checking_direct_types_is_unsound", "test_automatic_weak_cycle_edge_loses_observable_object", "test_fixed_cleanup_slice_does_not_bound_retained_bytes", "test_fixed_pool_fragmentation_is_a_capacity_limit", "test_constant_per_drop_does_not_bound_frame_leave"]
+let selectors: List<Text> = []
+for index in 0..argumentCount() {
+    let selector = argument(index)
+    if selector == "-v" || selector == "--verbose" || selector == "-q" || selector == "--quiet" { continue }
+    let known = selector == "ProductionContracts"
+    for name in names { if selector == name || selector == "ProductionContracts." + name { known = true } }
+    test.check(known, "unknown production contract selector: " + selector)
+    selectors.add(selector)
+}
+if selected(selectors, names[0]) {
+    let checked = 0
+    for bits in 0..512 {
+        let types: List<Integer> = []
+        for index in 0..3 { types.add((bits >> (index * 3)) & 7) }
+        let returns: List<Integer> = []
+        for receiver in 0..3 {
+            let row = 0
+            for element in 0..3 { if reachable(types, element, receiver) { row = row | (1 << element) } }
+            returns.add(row)
+        }
+        for mutableBits in 0..8 {
+            for first in 0..3 { for second in 0..3 { for third in 0..3 {
+                let objectTypes = [first, second, third]
+                let graph = [0, 0, 0]
+                for source in 0..3 {
+                    let sourceType = objectTypes[source]
+                    for target in 0..3 {
+                        let targetType = objectTypes[target]
+                        if (types[sourceType] & (1 << targetType)) == 0 { continue }
+                        let construction = target < source
+                        let mutation = (mutableBits & (1 << sourceType)) != 0 && (returns[sourceType] & (1 << targetType)) == 0
+                        if construction || mutation { graph[source] = graph[source] | (1 << target) }
+                    }
+                }
+                test.check(acyclic(graph), "constructor/type guard admitted a cycle: " + Text(bits) + "/" + Text(mutableBits) + "/" + Text(first) + Text(second) + Text(third))
+                checked += 1
+            } } }
+        }
+    }
+    test.check(checked == 110592, "finite production graph case count changed")
+}
+if selected(selectors, names[1]) {
+    let types = [2, 4, 8, 1]
+    test.check((types[1] & 1) == 0, "direct type counterexample changed")
+    test.check(reachable(types, 1, 0), "indirect receiver type must be reachable")
+    test.check(!acyclic(types), "indirect type counterexample must contain a cycle")
+}
+if selected(selectors, names[2]) {
+    let semanticEdges = [2, 1]
+    let owningEdges = [0, 1]
+    let roots = 1
+    let counts: List<Integer> = []
+    for index in 0..2 {
+        let count = 0
+        if (roots & (1 << index)) != 0 { count += 1 }
+        for row in owningEdges { if (row & (1 << index)) != 0 { count += 1 } }
+        counts.add(count)
+    }
+    test.check(reachable(semanticEdges, 0, 1), "semantic weak-edge object must remain reachable")
+    test.check(counts[1] == 0, "weak-edge counterexample must lose a reachable object")
+}
+if selected(selectors, names[3]) {
+    let budget = 32
+    let sizes = [100, 10000, 1000000]
+    let expected = [68, 9968, 999968]
+    for index in 0..sizes.length {
+        let debt = sizes[index] - budget
+        if debt < 0 { debt = 0 }
+        test.check(debt == expected[index], "cleanup slice retained-byte counterexample changed")
+    }
+}
+if selected(selectors, names[4]) {
+    let free = [0, 2, 4, 6]
+    test.check(free.length == 4, "fragmented pool free count changed")
+    for base in [0, 2, 4, 6] {
+        let first = false
+        let second = false
+        for block in free { if block == base { first = true }; if block == base + 1 { second = true } }
+        test.check(!(first && second), "fragmented pool unexpectedly coalesces two blocks")
+    }
+}
+if selected(selectors, names[5]) {
+    let slots = [1, 1024, 1048576]
+    let work: List<Integer> = []
+    for count in slots { work.add(count * 32) }
+    test.check(work[2] == 33554432, "frame leave work counterexample changed")
+    test.check(work[2] > work[0], "constant drop work must permit unbounded frame work")
+}
+print("Production ownership graph model: passed")
