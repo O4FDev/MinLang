@@ -10,7 +10,8 @@ extern MinyarBytes *minyar_keychain_identity(const MinyarText *, const MinyarTex
 extern MinyarBytes *minyar_tlsverify_sign(const MinyarBytes *, long long, const MinyarBytes *);
 extern bool minyar_tlsverify_signature(const MinyarBytes *, long long, const MinyarBytes *,
                                        const MinyarBytes *);
-extern MinyarText *minyar_tlsverify_chain(const MinyarText *, const MinyarBytes *, const MinyarBytes *);
+extern MinyarText *minyar_tlsverify_chain(const MinyarText *, const MinyarBytes *,
+                                          const MinyarBytes *);
 extern void minyar_rc_release(void *);
 #ifdef MINYAR_TEST_HTTP
 extern void minyar_test_http_identity(const MinyarBytes *);
@@ -22,31 +23,37 @@ static uint32_t word(const unsigned char *p) {
     return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
 static void system_root_chain(void) {
-    const char *path=getenv("MINYAR_TEST_SYSTEM_ROOT_CHAIN");
+    const char *path = getenv("MINYAR_TEST_SYSTEM_ROOT_CHAIN");
     assert(path);
-    FILE *file=fopen(path,"rb");
-    assert(file && !fseek(file,0,SEEK_END));
-    long size=ftell(file);
-    assert(size>0 && size<65536);
+    FILE *file = fopen(path, "rb");
+    assert(file && !fseek(file, 0, SEEK_END));
+    long size = ftell(file);
+    assert(size > 0 && size < 65536);
     rewind(file);
-    unsigned char *bytes=malloc((size_t)size);
-    assert(bytes && fread(bytes,1,(size_t)size,file)==(size_t)size);
+    unsigned char *bytes = malloc((size_t)size);
+    assert(bytes && fread(bytes, 1, (size_t)size, file) == (size_t)size);
     fclose(file);
-    MinyarBytes chain={bytes,size,0,NULL,NULL},empty={NULL,0,0,NULL,NULL};
-    MinyarText host=literal("github.com"),wrong=literal("github.com.attacker.example");
-    MinyarText *result=minyar_tlsverify_chain(&host,&chain,&empty);
-    if (result->byte_length) fprintf(stderr,"system root chain failed: %.*s\n",(int)result->byte_length,result->bytes);
+    MinyarBytes chain = {bytes, size, 0, NULL, NULL}, empty = {NULL, 0, 0, NULL, NULL};
+    MinyarText host = literal("github.com"), wrong = literal("github.com.attacker.example");
+    MinyarText *result = minyar_tlsverify_chain(&host, &chain, &empty);
+    if (result->byte_length)
+        fprintf(stderr, "system root chain failed: %.*s\n", (int)result->byte_length,
+                result->bytes);
     assert(!result->byte_length);
     minyar_rc_release(result);
-    result=minyar_tlsverify_chain(&wrong,&chain,&empty);
-    assert(result->byte_length); minyar_rc_release(result);
-    bytes[3]^=1;
-    result=minyar_tlsverify_chain(&host,&chain,&empty);
-    assert(result->byte_length); minyar_rc_release(result);
-    result=minyar_tlsverify_chain(&host,&empty,&empty);
-    assert(result->byte_length); minyar_rc_release(result);
+    result = minyar_tlsverify_chain(&wrong, &chain, &empty);
+    assert(result->byte_length);
+    minyar_rc_release(result);
+    bytes[3] ^= 1;
+    result = minyar_tlsverify_chain(&host, &chain, &empty);
+    assert(result->byte_length);
+    minyar_rc_release(result);
+    result = minyar_tlsverify_chain(&host, &empty, &empty);
+    assert(result->byte_length);
+    minyar_rc_release(result);
     free(bytes);
-    puts("pinned public chain validates with read-only system roots and rejects wrong host, corrupt and empty chains");
+    puts("pinned public chain validates with read-only system roots and rejects wrong host, "
+         "corrupt and empty chains");
 }
 int main(int argc, char **argv) {
     assert(argc == 3);
