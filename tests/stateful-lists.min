@@ -3,17 +3,41 @@ use "./compiler-port-support.min" as port
 use "./cpython-random.min" as random
 use "system" as system
 
-record Sequence { source: List<Text>; expected: List<Text>; operations: Integer; names: List<Text>; model: List<List<Integer>> }
+record Sequence { source: List<Text>; expected: List<Text>; operations: Integer; names: List<Text>; slots: List<Integer>; stores: List<List<Integer>> }
+function store(state: Sequence, values: List<Integer>): Integer {
+    let fresh: List<Integer> = []
+    for index in 0..values.length { fresh.add(values[index]) }
+    state.stores.add(fresh)
+    return state.stores.length - 1
+}
+function fork(state: Sequence, source: Integer, extra: Integer): Integer {
+    let fresh: List<Integer> = []
+    for index in 0..state.stores[source].length { fresh.add(state.stores[source][index]) }
+    fresh.add(extra)
+    state.stores.add(fresh)
+    return state.stores.length - 1
+}
+function size(state: Sequence, slot: Integer): Integer {
+    return state.stores[state.slots[slot]].length
+}
+function read(state: Sequence, slot: Integer, index: Integer): Integer {
+    return state.stores[state.slots[slot]][index]
+}
+function write(state: Sequence, slot: Integer, index: Integer, value: Integer) {
+    state.stores[state.slots[slot]][index] = value
+}
+function append(state: Sequence, slot: Integer, value: Integer) {
+    state.stores[state.slots[slot]].add(value)
+}
 function checkpoint(state: Sequence, lines: List<Text>) {
     state.operations += 1
     for line in lines { state.source.add(line) }
     state.source.add("print(" + Text(state.operations - 1) + ")")
     state.expected.add(Text(state.operations - 1))
-    for index in 0..3 {
-        state.source.add("observe(" + state.names[index] + ")")
-        let values = state.model[index]
-        state.expected.add(Text(values.length))
-        for value in values { state.expected.add(Text(value)) }
+    for slot in 0..3 {
+        state.source.add("observe(" + state.names[slot] + ")")
+        state.expected.add(Text(size(state, slot)))
+        for index in 0..size(state, slot) { state.expected.add(Text(read(state, slot, index))) }
     }
 }
 function integers(values: List<Integer>): Text {
@@ -30,25 +54,25 @@ function sequence(seed: Integer, steps: Integer): Sequence {
     let source = ["function observe(values: List<Integer>) {", "print(values.length)", "let index = 0",
         "while index < values.length { print(values[index]); index = index + 1 }", "}"]
     for name in names { source.add("let " + name + ": List<Integer> = []") }
-    let state = Sequence { source: source; expected: []; operations: 0; names: names; model: [[], [], []] }
+    let state = Sequence { source: source; expected: []; operations: 0; names: names; slots: [0, 1, 2]; stores: [[], [], []] }
     checkpoint(state, [])
-    state.model[1] = state.model[0]
+    state.slots[1] = state.slots[0]
     checkpoint(state, ["second = first"])
     for value in 0..65 {
-        state.model[0].add(value)
+        append(state, 0, value)
         checkpoint(state, ["first.add(" + Text(value) + ")"])
     }
-    let boundary = state.model[0][0]
-    state.model[0][0] = state.model[0][64]
-    state.model[0][64] = boundary
+    let boundary = read(state, 0, 0)
+    write(state, 0, 0, read(state, 0, 64))
+    write(state, 0, 64, boundary)
     checkpoint(state, ["let boundary = first[0]", "first[0] = first[64]", "first[64] = boundary"])
-    state.model[2] = state.model[0].appended(-1)
+    state.slots[2] = fork(state, state.slots[0], -1)
     checkpoint(state, ["third = first.appended(-1)"])
-    state.model[0][0] = 9999
+    write(state, 0, 0, 9999)
     checkpoint(state, ["first[0] = 9999"])
-    state.model[0] = []
+    state.slots[0] = store(state, [])
     checkpoint(state, ["first = []"])
-    state.model[1][64] = -8888
+    write(state, 1, 64, -8888)
     checkpoint(state, ["second[64] = -8888"])
     let operations = ["add", "write", "alias", "fork", "rebind", "swap"]
     for step in 0..steps {
@@ -60,34 +84,34 @@ function sequence(seed: Integer, steps: Integer): Sequence {
         let value = -10000 + random.below(rng, 20001)
         let sized = target
         if operation == "fork" { sized = other }
-        if (operation == "add" || operation == "fork") && state.model[sized].length >= 128 { operation = "rebind" }
-        if (operation == "write" || operation == "swap") && state.model[target].length == 0 { operation = "add" }
+        if (operation == "add" || operation == "fork") && size(state, sized) >= 128 { operation = "rebind" }
+        if (operation == "write" || operation == "swap") && size(state, target) == 0 { operation = "add" }
         let lines: List<Text> = []
         if operation == "add" {
-            state.model[target].add(value)
+            append(state, target, value)
             lines.add(name + ".add(" + Text(value) + ")")
         } else if operation == "write" {
-            let index = random.below(rng, state.model[target].length)
-            state.model[target][index] = value
+            let index = random.below(rng, size(state, target))
+            write(state, target, index, value)
             lines.add(name + "[" + Text(index) + "] = " + Text(value))
         } else if operation == "alias" {
-            state.model[target] = state.model[other]
+            state.slots[target] = state.slots[other]
             lines.add(name + " = " + otherName)
         } else if operation == "fork" {
-            state.model[target] = state.model[other].appended(value)
+            state.slots[target] = fork(state, state.slots[other], value)
             lines.add(name + " = " + otherName + ".appended(" + Text(value) + ")")
         } else if operation == "rebind" {
             let count = random.below(rng, 4)
             let values: List<Integer> = []
             for unused in 0..count { values.add(-100 + random.below(rng, 201)) }
-            state.model[target] = values
+            state.slots[target] = store(state, values)
             lines.add(name + " = [" + integers(values) + "]")
         } else {
-            let left = random.below(rng, state.model[target].length)
-            let right = random.below(rng, state.model[target].length)
-            let saved = state.model[target][left]
-            state.model[target][left] = state.model[target][right]
-            state.model[target][right] = saved
+            let left = random.below(rng, size(state, target))
+            let right = random.below(rng, size(state, target))
+            let saved = read(state, target, left)
+            write(state, target, left, read(state, target, right))
+            write(state, target, right, saved)
             lines.add("let saved" + Text(step) + " = " + name + "[" + Text(left) + "]")
             lines.add(name + "[" + Text(left) + "] = " + name + "[" + Text(right) + "]")
             lines.add(name + "[" + Text(right) + "] = saved" + Text(step))
