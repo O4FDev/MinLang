@@ -25,8 +25,25 @@ function main(): Integer {
             let id=errors.integerValue(opened);let remoteId=id&0xffffffff
             if previous>=0 && id<=previous { return 3 }
             let size=1;if cycle==0 { size=65536;if !udp { size=262144 } }
-            if !errors.integerOk(transport.write(c,id,Bytes(size),false)) { return 4 }
+            let written=0
+            for attempt in 0..1000 {
+                if written==size { break }
+                let count=size-written
+                if udp { count=min(count,quic.writableStreamBytes(c.udp,remoteId)) }
+                if count>0 {
+                    let result=transport.write(c,id,Bytes(count),false)
+                    if errors.integerOk(result) { written+=errors.integerValue(result) }
+                    else if !errors.isWouldBlock(errors.integerError(result)) { return 4 }
+                }
+                if written<size { move(c,s,now,udp);now+=1 }
+            }
+            if written!=size { print("cancel setup did not exhaust send credit");return 4 }
             for round in 0..5 { move(c,s,now,udp);now+=1 }
+            if udp && cycle==0 {
+                let exhausted=false
+                for input in c.udp.streams { if input.id==remoteId && input.sendOffset==size && input.sendLimit==size { exhausted=true } }
+                if !exhausted || c.udp.pending.length==0 { print("cancel setup lost exhausted credit or queued data");return 4 }
+            }
             if errors.booleanOk(transport.cancelStream(c,id^(1<<32))) { return 5 }
             if !errors.booleanOk(transport.cancelStream(c,id)) { return 6 }
             if errors.integerOk(transport.write(c,id,Bytes("forbidden"),false)) { return 7 }
