@@ -39,6 +39,7 @@ function observe(gate: Gate, label: Text, argv: List<Text>, binary: Text, expect
 }
 function compileFixture(gate: Gate, label: Text, profile: Text, budget: Integer, include: Text): Text {
     let binary = gate.out + "/" + label
+    if groups.windowsHost() { binary = binary + ".exe" }
     let command = [gate.compiler]
     for flag in gate.flags { command.add(flag) }
     for item in ["-std=c11", "-Wall", "-Wextra", "-Werror", "-iquote", include] { command.add(item) }
@@ -117,7 +118,8 @@ function validateFailureControl(status: Integer, stdout: Text, stderr: Text, tim
 }
 
 let sanitize = false
-let profiles = ["system", "fixed", "lazy", "eager"]
+let requested: List<Text> = []
+let profilesGiven = false
 let budgets = [1, 32, 1024]
 let target = ""
 let index = 0
@@ -135,7 +137,8 @@ while index < argumentCount() {
         if values.length == 0 { usage(option + " needs values") }
         if option == "--profiles" {
             for value in values { if !contains(["system", "fixed", "lazy", "eager"], value) { usage("invalid profile: " + value) } }
-            profiles = values
+            requested = values
+            profilesGiven = true
         } else {
             let parsed: List<Integer> = []
             for value in values {
@@ -147,6 +150,9 @@ while index < argumentCount() {
     } else { usage("unknown option: " + option) }
 }
 if target == "" { usage("the following arguments are required: --evidence") }
+let selection = groups.profileSelection(requested, profilesGiven, groups.windowsHost())
+if selection.error != "" { usage(selection.error) }
+let profiles = selection.profiles
 let logs = test.scratch()
 test.check(files.pathSize(target) < 0, "evidence directory already exists: " + target)
 test.require(test.run(["mkdir", "-p", "--", target], system.environment(), "", logs + "/mkdir", 10), "create evidence directory")
@@ -185,7 +191,7 @@ let budgetTexts: List<Text> = []
 for budget in budgets { budgetTexts.add(Text(budget)) }
 let locality = "[]"
 if contains(profiles, "system") && contains(budgetTexts, "1") { locality = "[32, 256, 2048]" }
-let header = "{\n  \"schema_version\": 1,\n  \"sanitize\": " + Text(sanitize) + ",\n  \"profiles\": [" + support.joined(quoted, ", ") + "],\n  \"unsupported_profiles\": [],\n  \"heap_bytes\": 4194304,\n  \"source_sha256\": {" + support.joined(fingerprints, ", ") + "},\n  \"engine_sha256\": " + json.quote(support.digest(out + "/managed-graphs-engine.c")) + ",\n  \"compiler\": {\"path\": " + json.quote(compiler) + ", \"sha256\": " + json.quote(support.digest(compiler)) + "},\n  \"environment\": {\"ASAN_OPTIONS\": " + json.quote(support.asanLeakOptions() + ":halt_on_error=1") + ", \"UBSAN_OPTIONS\": \"halt_on_error=1:print_stacktrace=1\"},\n  \"broad_nodes\": 32,\n  \"private_locality_nodes\": " + locality + ",\n  \"budgets\": [" + support.joined(budgetTexts, ", ") + "],\n  \"scope\": \"Deterministic phase/work/cleanup; no CPU idle certification\""
+let header = "{\n  \"schema_version\": 1,\n  \"sanitize\": " + Text(sanitize) + ",\n  \"profiles\": [" + support.joined(quoted, ", ") + "],\n  \"unsupported_profiles\": [" + support.joined(selection.unsupported, ", ") + "],\n  \"heap_bytes\": 4194304,\n  \"source_sha256\": {" + support.joined(fingerprints, ", ") + "},\n  \"engine_sha256\": " + json.quote(support.digest(out + "/managed-graphs-engine.c")) + ",\n  \"compiler\": {\"path\": " + json.quote(compiler) + ", \"sha256\": " + json.quote(support.digest(compiler)) + "},\n  \"environment\": {\"ASAN_OPTIONS\": " + json.quote(support.asanLeakOptions() + ":halt_on_error=1") + ", \"UBSAN_OPTIONS\": \"halt_on_error=1:print_stacktrace=1\"},\n  \"broad_nodes\": 32,\n  \"private_locality_nodes\": " + locality + ",\n  \"budgets\": [" + support.joined(budgetTexts, ", ") + "],\n  \"scope\": \"Deterministic phase/work/cleanup; no CPU idle certification\""
 let trail = evidence.openIn(out + "/commands", "private-retirement", inputs)
 evidence.control(trail, "sanitize", Text(sanitize))
 evidence.control(trail, "heap_bytes", "4194304")

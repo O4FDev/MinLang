@@ -124,7 +124,7 @@ public function trimmed(text: Text): Text {
 public record Phase { label: Text; argv: List<Text> }
 public record Group { label: Text; binary: Text; phases: List<Phase> }
 public record Outcome { cases: List<Text>; resources: List<Text>; failed: Text; digest: Text }
-record Slot { group: Integer; phase: Integer; handle: Integer; started: Integer; total: Integer; idle: Integer; stopped: Boolean; maximum: Float }
+record Slot { group: Integer; phase: Integer; handle: Integer; started: Integer; total: Integer; idle: Integer; stopped: Boolean; maximum: Float; killed: Boolean }
 public function testJobs(): Integer {
     let value = system.getenv("MINYAR_TEST_JOBS")
     if value == "" { return 2 }
@@ -134,6 +134,22 @@ public function testJobs(): Integer {
         parsed = parsed * 10 + byte - 48
     }
     return max(1, parsed)
+}
+public function windowsHost(): Boolean {
+    let host = support.host()
+    return host == "Windows" || support.starts(host, "MSYS") || support.starts(host, "MINGW") || support.starts(host, "CYGWIN")
+}
+public record Selection { profiles: List<Text>; unsupported: List<Text>; error: Text }
+public function profileSelection(requested: List<Text>, given: Boolean, windows: Boolean): Selection {
+    let reason = "The lazy heap profile requires a POSIX mmap backend; Windows is not supported."
+    let selection = Selection { profiles: ["system", "fixed", "lazy", "eager"]; unsupported: []; error: "" }
+    if windows {
+        selection.profiles = ["system", "fixed", "eager"]
+        selection.unsupported.add("{\"profile\": \"lazy\", \"reason\": " + json.quote(reason) + "}")
+        if given { for profile in requested { if profile == "lazy" { selection.error = reason } } }
+    }
+    if given { selection.profiles = requested }
+    return selection
 }
 public function cpuGuard(): Boolean {
     return support.host() == "Linux" && system.getenv("MINYAR_TEST_SHARED_HOST") == ""
@@ -177,7 +193,18 @@ public function runGroups(groups: List<Group>, environment: List<Text>, output: 
             let log = output + "/" + group.label + "-" + phase.label
             let status = system.poll(slot.handle)
             if status.state == system.PENDING {
-                if guard {
+                if !slot.killed && system.monotonicNanoseconds() - slot.started > 180000000000 {
+                    let pid = system.childProcessId(slot.handle)
+                    if slot.stopped { system.sendSignal(-pid, 18) }
+                    system.sendSignal(-pid, 9)
+                    system.sendSignal(pid, 9)
+                    slot.stopped = false
+                    slot.killed = true
+                    outcomes[slot.group].resources.add("{\"label\": " + json.quote(group.label + "-" + phase.label) + ", \"action\": \"deadline\", \"seconds\": 180}")
+                    remaining.add(slot)
+                    continue
+                }
+                if guard && !slot.killed {
                     let current = counters()
                     let delta = current[0] - slot.total
                     let usage = 0.0
@@ -238,5 +265,5 @@ function launch(groups: List<Group>, group: Integer, phase: Integer, environment
         total = current[0]
         idle = current[1]
     }
-    return Slot { group: group; phase: phase; handle: handle; started: system.monotonicNanoseconds(); total: total; idle: idle; stopped: false; maximum: 0.0 }
+    return Slot { group: group; phase: phase; handle: handle; started: system.monotonicNanoseconds(); total: total; idle: idle; stopped: false; maximum: 0.0; killed: false }
 }
