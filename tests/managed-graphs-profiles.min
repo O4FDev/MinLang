@@ -1,0 +1,76 @@
+use "../tools/testing.min" as test
+use "../tools/cycle-runtime.min" as cycle
+use "./thread-port-support.min" as support
+use "system" as system
+use "files" as files
+
+function usage(message: Text) {
+    system.writeStandardError("managed-graphs-profiles: error: " + message + "\n")
+    exit(2)
+}
+
+let quick = false
+let fixture = "managed-graphs-runtime.c"
+let selectedCase = "all"
+let index = 0
+while index < argumentCount() {
+    let option = argument(index)
+    if option == "--quick" { quick = true; index += 1; continue }
+    if index + 1 >= argumentCount() { usage(option + " needs a value") }
+    if option == "--fixture" {
+        fixture = argument(index + 1)
+        if fixture != "managed-graphs-runtime.c" && fixture != "managed-graphs-bakeoff.c" { usage("invalid fixture: " + fixture) }
+    } else if option == "--case" {
+        selectedCase = argument(index + 1)
+        if selectedCase != "all" && selectedCase != "growing" && selectedCase != "outgrow" && selectedCase != "producer" && selectedCase != "shared" { usage("invalid case: " + selectedCase) }
+    } else { usage("unknown option: " + option) }
+    index += 2
+}
+let bakeoff = fixture == "managed-graphs-bakeoff.c"
+if !bakeoff && selectedCase != "all" { usage("--case selects only the bakeoff fixture") }
+let output = "build/managed-graphs-profiles"
+if bakeoff { output = "build/managed-graphs-bakeoff-profiles" }
+let logs = test.scratch()
+test.require(test.run(["mkdir", "-p", "--", output], system.environment(), "", logs + "/mkdir", 10), "create profile output")
+cycle.publishEngine(".", "")
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let profiles = ["system", "fixed", "lazy", "eager"]
+if bakeoff { profiles = ["system", "fixed", "lazy"] }
+for profile in profiles {
+    let budgets = [1, 2, 7, 32, 1024]
+    if quick { budgets = [1, 32] }
+    if profile == "eager" { budgets = [32] }
+    for budget in budgets {
+        for sanitize in [false, true] {
+            let label = profile + "-k" + Text(budget) + "-native"
+            if sanitize { label = profile + "-k" + Text(budget) + "-sanitize" }
+            let binary = output + "/" + label
+            let command = [clang]
+            if sanitize { for flag in ["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"] { command.add(flag) } } else { command.add("-O2") }
+            for item in ["-std=c11", "-Wall", "-Wextra", "-Werror", "-iquote", "runtime"] { command.add(item) }
+            if profile == "system" { command.add("-DMINYAR_SYSTEM_HEAP=1") }
+            if profile == "fixed" || profile == "lazy" { command.add("-DMINYAR_BOUNDED_HEAP=1") }
+            if profile == "lazy" { command.add("-DMINYAR_LAZY_HEAP=1") }
+            for item in ["-DMINYAR_BOUNDED_HEAP_BYTES=1048576", "-DMINYAR_RC_POLL_BUDGET=" + Text(budget), "tests/" + fixture, "-lm", "-o", binary] { command.add(item) }
+            let built = test.run(command, system.environment(), "", logs + "/" + label + ".build", 120)
+            test.check(built.status == 0, support.joined(command, " ") + "\n" + built.output + built.errorOutput)
+            let seeds = ["0", "1", "7", "314159", "4294967295"]
+            if quick { seeds = ["314159", "4294967295"] }
+            if bakeoff { seeds = ["314159"] }
+            for seed in seeds {
+                let environment = support.environment(system.environment(), ["MINYAR_GRAPH_SEED", "ASAN_OPTIONS", "UBSAN_OPTIONS"], [seed, support.asanLeakOptions() + ":halt_on_error=1", "halt_on_error=1:print_stacktrace=1"])
+                let argv = [binary]
+                if bakeoff { argv.add(selectedCase) }
+                let result = test.run(argv, environment, "", logs + "/" + label + "-" + seed, 120)
+                test.check(result.status == 0, support.joined(argv, " ") + "\n" + result.output + result.errorOutput)
+                let raw = Bytes(result.output)
+                let start = 0
+                let end = raw.length
+                while start < end && raw[start] <= 32 { start += 1 }
+                while end > start && raw[end - 1] <= 32 { end -= 1 }
+                print(label + " seed=" + seed + ": " + Text(raw.slice(start, end)))
+            }
+        }
+    }
+}
+test.removeTree(logs)

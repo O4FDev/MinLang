@@ -5,22 +5,32 @@
 check-feature-dispatch: build/minyarc build/minyar-runtime.o build/tooling/tests/feature-dispatch
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/feature-dispatch
 
-check-managed-graphs: build/minyarc build/minyarc-callbacks
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/managed-graphs.py
+build/tooling/tests/managed-graphs: TOOL_NATIVE = tests/sha256-test-native.c
+build/tooling/tests/managed-graphs: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/managed-graphs: tests/sha256-test-native.c
+build/tooling/tests/managed-graphs-profiles: TOOL_NATIVE = runtime/native/sha256.c
+build/tooling/tests/managed-graphs-profiles: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/managed-graphs-profiles: runtime/native/sha256.c
+build/tooling/tests/managed-graphs-launcher: TOOL_NATIVE = tests/sha256-test-native.c runtime/native/sha256.c
+build/tooling/tests/managed-graphs-launcher: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/managed-graphs-launcher: tests/sha256-test-native.c runtime/native/sha256.c
+build/tooling/tests/managed-graphs-profiles.ll build/tooling/tests/managed-graphs-launcher.ll: tests/thread-port-support.min
+check-managed-graphs: build/minyarc build/minyarc-callbacks build/tooling/tests/managed-graphs
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/managed-graphs
 
 check-callbacks: build/minyarc-callbacks build/closure-compiler-stage3.ll build/minyar-runtime.o build/tooling/tests/callbacks build/testing/cycle-runtime.o build/tooling/tests/compiler-behavior
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile callbacks --ir build/closure-compiler-stage3.ll
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/callbacks
 
-check-managed-graphs-profiles:
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/managed-graphs-profiles.py --quick
+check-managed-graphs-profiles: build/tooling/tests/managed-graphs-profiles
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/managed-graphs-profiles --quick
 
 # Preserve the original allocation-only and continuously growing producer bounds.
 # The existing quick matrix covers bounded heaps at K1/K32, native and sanitizer.
 .PHONY: check-managed-graphs-bakeoff
-CYCLE_BAKEOFF_INPUTS = tests/managed-graphs-bakeoff.c tests/managed-graphs-runtime.c tests/managed-graphs-profiles.py tests/clang_helpers.py tools/cycle_runtime.py runtime/minyar_runtime.c $(RUNTIME_HEADERS)
+CYCLE_BAKEOFF_INPUTS = tests/managed-graphs-bakeoff.c tests/managed-graphs-runtime.c build/tooling/tests/managed-graphs-profiles runtime/minyar_runtime.c $(RUNTIME_HEADERS)
 check-managed-graphs-bakeoff: $(CYCLE_BAKEOFF_INPUTS) | build
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/managed-graphs-profiles.py --quick --fixture managed-graphs-bakeoff.c
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/managed-graphs-profiles --quick --fixture managed-graphs-bakeoff.c
 check check-portable check-sanitize check-managed-graphs-profiles: check-managed-graphs-bakeoff
 
 check-callback-domains: build/tooling/tests/callback-domains
@@ -33,8 +43,8 @@ ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s))
 MANAGED_GRAPH_LAUNCHER_ARTIFACTS += build/minyarc-modules build/minyar-module-build
 endif
 
-check-managed-graphs-launcher: $(MANAGED_GRAPH_LAUNCHER_ARTIFACTS)
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/managed-graphs-launcher.py
+check-managed-graphs-launcher: $(MANAGED_GRAPH_LAUNCHER_ARTIFACTS) build/tooling/tests/managed-graphs-launcher
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/managed-graphs-launcher
 
 check-isolated-workers: build/minyarc build/minyar-default-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/isolated-workers.py
@@ -42,8 +52,8 @@ check-isolated-workers: build/minyarc build/minyar-default-runtime.o
 build/minyar-default-runtime-sanitize.o: runtime/minyar_default_runtime.c runtime/minyar_runtime.c $(RUNTIME_HEADERS) $(BUILD_RULES) | build
 	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) -c $< -o $@
 
-check-managed-graphs-sanitize: build/minyarc-sanitize build/minyarc-callbacks-sanitize
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/managed-graphs.py
+check-managed-graphs-sanitize: build/minyarc-sanitize build/minyarc-callbacks-sanitize build/tooling/tests/managed-graphs
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/managed-graphs
 
 check-callbacks-sanitize: build/minyarc-callbacks-sanitize build/tooling/tests/callbacks
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/callbacks

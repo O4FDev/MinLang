@@ -1,0 +1,85 @@
+use "../tools/testing.min" as test
+use "./compiler-port-support.min" as port
+use "./thread-port-support.min" as support
+use "system" as system
+use "files" as files
+
+constant SOURCE = "'use \"eventcallbacks\" as callbacks\nuse \"eventloop\" as eventloop\nuse \"errors\" as errors\nrecord Node { value: Integer; callbacks: List<Callback<Integer, Integer>> }\nfunction make(): Callback<List<Text>> {\n    return function(): List<Text> { return [\"kept\"] }\n}\nlet node = Node { value: 40; callbacks: [] }\nlet callback = function(delta: Integer): Integer { return node.value + delta }\nnode.callbacks.add(callback)\nprint(callback(2))\nlet factory = make()\nlet words = factory()\nprint(words[0])\nlet dispatcher = callbacks.value(callbacks.create())\nlet calls = callbacks.timer(dispatcher, 0, 0, 2, function(event: eventloop.Event) {\n    print(callback(event.token))\n})\nif !errors.integerOk(calls) { fail(\"timer failed\") }\nif errors.integerValue(callbacks.dispatch(dispatcher, 0, 8)) != 1 { fail(\"missing callback\") }\nif !errors.booleanOk(callbacks.close(dispatcher)) { fail(\"close failed\") }\n"
+record Context { work: Text; root: Text; clang: Text; serial: Integer }
+function launcher(context: Context, source: Text, options: List<Text>, execute: Boolean, expected: Text, sanitize: Boolean) {
+    context.serial += 1
+    let path = context.work + "/program-" + Text(context.serial) + ".min"
+    let output = context.work + "/program-" + Text(context.serial)
+    writeTextFile(path, source)
+    let environment = support.environment(support.without(system.environment(), ["MINYAR_CLANG", "MINYAR_RUNTIME_FLAGS", "MINYAR_CLANG_FLAGS"]), ["LLVM_CC", "CC"], [context.clang, context.clang])
+    if sanitize {
+        let flags = "-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wno-override-module"
+        environment = support.environment(environment, ["MINYAR_RUNTIME_FLAGS", "MINYAR_CLANG_FLAGS", "ASAN_OPTIONS", "UBSAN_OPTIONS"], [flags, flags, support.asanLeakOptions() + ":halt_on_error=1", "halt_on_error=1:print_stacktrace=1"])
+    }
+    let command = [context.root + "/minyar"]
+    for option in options { command.add(option) }
+    command.add(path)
+    if execute { command.add("-o"); command.add(output) }
+    let built = test.run(command, environment, context.root, path + ".build", 60)
+    test.check(built.status == 0, built.output + built.errorOutput)
+    if execute {
+        test.check(files.pathSize(output) >= 0, "launcher produced no program")
+        let result = test.run([output], environment, "", output + ".run", 10)
+        test.check(result.status == 0, result.errorOutput)
+        test.check(result.output == expected, "launched program output changed\n" + result.output)
+        test.check(result.errorOutput == "", result.errorOutput)
+    } else {
+        test.check(files.pathSize(output) < 0, "check mode produced a program")
+        test.check(test.contains(built.output, "checked "), "check mode did not report its source\n" + built.output)
+    }
+}
+function checkProfiles(context: Context, profiles: List<List<Text>>) {
+    for profile in profiles {
+        for optimization in ["--debug", "--release"] {
+            let options: List<Text> = []
+            for item in profile { options.add(item) }
+            options.add(optimization)
+            launcher(context, SOURCE, options, true, "42\nkept\n42\n", false)
+        }
+    }
+}
+
+let names = ["test_debug_and_release_preserve_selected_heap_and_owner_abi", "test_debug_and_release_preserve_lazy_heap_policy",
+    "test_incremental_driver_preserves_parsed_fallback_and_check_mode", "test_preserved_bakeoff_workload_on_selected_heap_profiles"]
+let selectors = port.selectors("ManagedGraphLauncher", names)
+let work = test.scratch()
+let root = test.lines(test.run(["pwd", "-P"], system.environment(), "", work + "/root", 10).output)[0]
+let context = Context { work: work; root: root; clang: test.setting("MINYAR_TEST_CLANG", "clang"); serial: 0 }
+if port.selected(selectors, "ManagedGraphLauncher", names[0]) {
+    checkProfiles(context, [["--memory-profile", "system"], ["--memory-profile", "system", "--cleanup-budget", "1"], ["--memory-profile", "fixed", "--heap-bytes", "1048576"], ["--memory-profile", "eager"]])
+}
+if port.selected(selectors, "ManagedGraphLauncher", names[1]) {
+    checkProfiles(context, [["--memory-profile", "lazy", "--cleanup-budget", "1", "--heap-bytes", "1048576"]])
+}
+if port.selected(selectors, "ManagedGraphLauncher", names[2]) {
+    launcher(context, SOURCE, ["--incremental", "--debug"], true, "42\nkept\n42\n", false)
+    launcher(context, SOURCE, ["--incremental", "--check"], false, "", false)
+}
+if port.selected(selectors, "ManagedGraphLauncher", names[3]) {
+    let source = readTextFile("tests/managed-graphs/sol-graphs.min")
+    let lines = ["15\n", "22\n", "33\n"]
+    for value in 0..20 { lines.add(Text(value * 1000) + "\n") }
+    let expected = joinText(lines)
+    let profiles: List<List<Text>> = [["--memory-profile", "system", "--cleanup-budget", "1"], ["--memory-profile", "system", "--cleanup-budget", "32"],
+        ["--memory-profile", "fixed", "--heap-bytes", "1048576", "--cleanup-budget", "1"], ["--memory-profile", "fixed", "--heap-bytes", "1048576", "--cleanup-budget", "32"],
+        ["--memory-profile", "eager"], ["--memory-profile", "lazy", "--heap-bytes", "1048576", "--cleanup-budget", "1"], ["--memory-profile", "lazy", "--heap-bytes", "1048576", "--cleanup-budget", "32"]]
+    for profile in profiles {
+        for optimization in ["--debug", "--release"] {
+            let modes = [false, true]
+            if profile[1] == "eager" { modes = [false] }
+            for sanitize in modes {
+                let options: List<Text> = []
+                for item in profile { options.add(item) }
+                options.add(optimization)
+                launcher(context, source, options, true, expected, sanitize)
+            }
+        }
+    }
+}
+test.removeTree(work)
+print("ManagedGraphLauncher: passed")

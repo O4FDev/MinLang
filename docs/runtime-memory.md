@@ -321,7 +321,7 @@ because the underlying arena storage remains alive.
 | `make check-cycle-progress` / `-sanitize` | Live-cohort progress, exact reclamation and the separate strict idle CPU assertion |
 
 The optional graph and callback checks additionally include
-`tests/managed-graphs.py`, `tests/managed-graphs-profiles.py`,
+`tests/managed-graphs.min`, `tests/managed-graphs-profiles.min`,
 `tests/callbacks.py`, `tests/callback-domains.py` and `tests/cycle-progress.min`.
 Their exact reachability, object/debt and work-budget assertions complement
 application soaks; short collector tests do not establish a server's idle CPU
