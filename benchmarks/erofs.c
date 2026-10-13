@@ -39,15 +39,17 @@ static uint64_t run(char **arguments, const char *output) {
 int main(int argc, char **argv) {
     require(argc >= 3,"benchmark arguments");
     if (!strcmp(argv[1],"prepare")) { prepare(argv[2]); return 0; }
-    require(argc == 6,"benchmark compare arguments");
-    char *writer[] = {argv[2],argv[4],argv[5],NULL};
-    char *mkfs[] = {argv[3],"--quiet","--preserve-mtime",argv[5],argv[4],NULL};
+    require(argc == 6 || argc == 7,"benchmark compare arguments");
+    const char *mode = argc == 7 ? argv[6] : "none";
+    char *writer[] = {argv[2],argv[4],argv[5],"17592186040320",(char *)mode,NULL};
+    char *mkfs[] = {argv[3],"--quiet","--preserve-mtime",argv[5],argv[4],NULL,NULL};
+    if (!strcmp(mode,"lz4")) { mkfs[3] = "-zlz4"; mkfs[4] = argv[5]; mkfs[5] = argv[4]; }
     run(writer,argv[5]); run(mkfs,argv[5]);
     for (int n = 0; n < 5; ++n) {
         uint64_t a, b;
         if (n & 1) { b = run(mkfs,argv[5]); a = run(writer,argv[5]); }
         else { a = run(writer,argv[5]); b = run(mkfs,argv[5]); }
-        printf("NONE repeat=%d minyar_ns=%llu mkfs_ns=%llu ratio=%.4f\n",n+1,(unsigned long long)a,(unsigned long long)b,(double)a/(double)b);fflush(stdout);
+        printf("%s repeat=%d minyar_ns=%llu mkfs_ns=%llu ratio=%.4f\n",mode,n+1,(unsigned long long)a,(unsigned long long)b,(double)a/(double)b);fflush(stdout);
     }
     return 0;
 }
