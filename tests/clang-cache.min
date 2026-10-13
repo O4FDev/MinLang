@@ -79,5 +79,76 @@ test.check(test.lines(readTextFile(work + "/calls")).length == 13, "budget measu
 writeTextFile(fixture, "#include <stdio.h>\nint main(void) { puts(__TIME__); return 0; }\n")
 for suffix in ["one", "two"] { test.require(compileC(cacheTool, real, cache, fixture, work + "/volatile-" + suffix, ["-O0"], system.environment(), work + "/volatile-link-" + suffix), "volatile preprocessor input bypass") }
 test.check(test.lines(readTextFile(work + "/calls")).length == 15, "volatile time macros cannot publish an artifact cache hit")
+let multiMain = work + "/multi-main.c"
+let left = work + "/left.c"
+let right = work + "/right.c"
+let privateHeader = work + "/multi-private.h"
+writeTextFile(privateHeader, "#define VALUE 2\nstatic int hidden;\nstatic _Thread_local int local;\nstatic int step(void) { hidden++; local++; return hidden + local; }\n")
+for name in ["left", "right"] {
+    writeTextFile(work + "/" + name + ".c", "#include \"multi-private.h\"\nint (*" + name + "_callback(void))(void) { return step; }\nint " + name + "_value(void) { return VALUE; }\n")
+}
+writeTextFile(multiMain, "#include <stdio.h>\nextern int (*left_callback(void))(void), (*right_callback(void))(void);\nextern int left_value(void), right_value(void);\nint main(void) { int (*a)(void) = left_callback(), (*b)(void) = right_callback(); if (a == b || a != left_callback() || b != right_callback() || a() != 2 || b() != 2 || a() != 4 || b() != 4) return 9; printf(\"%d %d\\n\", left_value(), right_value()); return 0; }\n")
+function compileMany(tool: Text, real: Text, cache: Text, sources: List<Text>, flags: List<Text>, output: Text, log: Text): test.Result {
+    let command = [tool, tool, cache, real]
+    for flag in flags { command.add(flag) }
+    for source in sources { command.add(source) }
+    for item in ["-o", output] { command.add(item) }
+    return test.run(command, system.environment(), "", log, 30)
+}
+let multiSources = [multiMain, left, right]
+let before = test.lines(readTextFile(work + "/calls")).length
+for name in ["one", "two"] {
+    test.require(compileMany(cacheTool, real, cache, multiSources, ["-O0", "-std=c11"], work + "/multi-" + name, work + "/multi-link-" + name), "unchanged original multi-TU compiler command")
+    let result = test.run([work + "/multi-" + name], system.environment(), "", work + "/multi-run-" + name, 10)
+    test.check(result.status == 0 && result.output == "2 2\n" && result.errorOutput == "", "separate TUs retain independent private static/TLS state and callback identities")
+}
+test.check(test.lines(readTextFile(work + "/calls")).length == before + 1, "complete multi-TU invocation compiles once")
+test.require(test.run(["/usr/bin/cmp", "-s", work + "/multi-one", work + "/multi-two"], system.environment(), "", work + "/multi-identical", 10), "whole multi-TU artifact is reused byte for byte")
+writeTextFile(privateHeader, test.replace(readTextFile(privateHeader), "VALUE 2", "VALUE 3"))
+test.require(compileMany(cacheTool, real, cache, multiSources, ["-O0", "-std=c11"], work + "/multi-header", work + "/multi-header-link"), "multi-TU included-header invalidation")
+test.check(test.lines(readTextFile(work + "/calls")).length == before + 2, "headers in each original TU participate in the key")
+test.check(test.run([work + "/multi-header"], system.environment(), "", work + "/multi-header-run", 10).output == "3 3\n", "changed multi-TU header reaches the original compiler command")
+writeTextFile(right, test.replace(readTextFile(right), "return VALUE;", "return VALUE + 1;"))
+test.require(compileMany(cacheTool, real, cache, multiSources, ["-O0", "-std=c11"], work + "/multi-source", work + "/multi-source-link"), "non-first TU input invalidation")
+test.check(test.lines(readTextFile(work + "/calls")).length == before + 3, "every original TU input participates in the key")
+test.check(test.run([work + "/multi-source"], system.environment(), "", work + "/multi-source-run", 10).output == "3 4\n", "non-first TU change reaches the original compiler command")
+let manySanFlags = ["-O1", "-g", "-std=c11", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
+for name in ["one", "two"] {
+    test.require(compileMany(cacheTool, real, cache, multiSources, manySanFlags, work + "/multi-san-" + name, work + "/multi-san-link-" + name), "original multi-TU sanitizer compile/link command")
+    let result = test.run([work + "/multi-san-" + name], system.environment(), "", work + "/multi-san-run-" + name, 10)
+    test.check(result.status == 0 && result.output == "3 4\n" && result.errorOutput == "", "multi-TU SAN cache preserves private identities and assertions")
+}
+test.check(test.lines(readTextFile(work + "/calls")).length == before + 4, "multi-TU sanitizer configuration has its own exact cached artifact")
+let negativeHelper = work + "/negative-helper.c"
+let negativeMain = work + "/negative-main.c"
+writeTextFile(negativeHelper, "#include <stdlib.h>\nint broken(void) { volatile int *pointer = malloc(sizeof(int)); *pointer = 42; free((void *)pointer); return *pointer; }\n")
+writeTextFile(negativeMain, "extern int broken(void); int main(void) { return broken(); }\n")
+for name in ["one", "two"] {
+    test.require(compileMany(cacheTool, real, cache, [negativeMain, negativeHelper], manySanFlags, work + "/multi-negative-" + name, work + "/multi-negative-link-" + name), "original multi-TU instrumented negative link")
+    let result = test.run([work + "/multi-negative-" + name], system.environment(), "", work + "/multi-negative-run-" + name, 10)
+    test.check(result.status != 0 && test.contains(result.errorOutput, "heap-use-after-free"), "multi-TU cache miss and hit retain genuine ASan instrumentation")
+}
+test.check(test.lines(readTextFile(work + "/calls")).length == before + 5, "multi-TU negative cache reuses only the identical instrumented artifact")
+let archiveSource = work + "/archive.c"
+let archiveObject = work + "/archive.o"
+let archive = work + "/provider.a"
+writeTextFile(archiveSource, "int archive_value(void) { return 7; }\n")
+function makeArchive(compiler: Text, source: Text, object: Text, archive: Text, log: Text) {
+    test.require(test.run([compiler, "-O0", "-c", source, "-o", object], system.environment(), "", log + ".compile", 30), "build explicit fixture archive input")
+    test.require(test.run(["/usr/bin/ar", "rcs", archive, object], system.environment(), "", log + ".archive", 10), "construct explicit fixture archive input")
+}
+makeArchive(compiler, archiveSource, archiveObject, archive, work + "/archive-first")
+let archiveMain = work + "/archive-main.c"
+writeTextFile(archiveMain, "extern int archive_value(void); int main(void) { return archive_value(); }\n")
+for name in ["one", "two"] {
+    test.require(compileMany(cacheTool, real, cache, [archiveMain, archive], ["-O0"], work + "/archive-" + name, work + "/archive-link-" + name), "original explicit-archive compiler link")
+    test.check(test.run([work + "/archive-" + name], system.environment(), "", work + "/archive-run-" + name, 10).status == 7, "explicit archive executable semantics")
+}
+test.check(test.lines(readTextFile(work + "/calls")).length == before + 6, "explicit archive links reuse only the identical whole artifact")
+writeTextFile(archiveSource, "int archive_value(void) { return 8; }\n")
+makeArchive(compiler, archiveSource, archiveObject, archive, work + "/archive-changed")
+test.require(compileMany(cacheTool, real, cache, [archiveMain, archive], ["-O0"], work + "/archive-changed", work + "/archive-changed-link"), "explicit archive content invalidation")
+test.check(test.lines(readTextFile(work + "/calls")).length == before + 7, "changed archive bytes invalidate the whole-artifact key")
+test.check(test.run([work + "/archive-changed"], system.environment(), "", work + "/archive-changed-run", 10).status == 8, "changed archive content reaches the original link")
 test.removeTree(work)
 print("Minyar compiler cache: passed")
