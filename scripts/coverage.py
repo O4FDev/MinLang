@@ -67,12 +67,14 @@ def toolchain_identity(tools: dict[str, str], env: dict[str, str]) -> dict:
     identities = {}
     for name, path in tools.items():
         version = run([path, "--version"], env=env).stdout.strip()
-        match = re.search(r"\b(?:clang|LLVM)\s+version\s+(\d+)\b", version, re.IGNORECASE)
+        match = re.search(r"\b(?:clang|LLVM)\s+version\s+(\d+\.\d+\.\d+)(?=\s|$)", version, re.IGNORECASE)
         if not match:
             raise ValueError(f"cannot identify LLVM version for {name}: {path}")
-        identities[name] = {"path": path, "version": version, "major": int(match.group(1))}
+        identities[name] = {"path": path, "version": version, "major": int(match.group(1).split(".")[0]), "release": match.group(1)}
     if len({identity["major"] for identity in identities.values()}) != 1:
         raise ValueError("coverage requires matching LLVM major versions for Clang, opt, llvm-cov and llvm-profdata")
+    if any(identity["release"] != "23.1.2" for identity in identities.values()):
+        raise ValueError("coverage requires pinned LLVM 23.1.2 for Clang, opt, llvm-cov and llvm-profdata")
     return identities
 
 

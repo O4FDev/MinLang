@@ -27,17 +27,24 @@ class CoverageHarness(unittest.TestCase):
         tools = {"clang": "chosen clang", "opt": "chosen opt",
                  "llvm_cov": "chosen cov", "profdata": "chosen profdata"}
         def version(command, **kwargs):
-            return subprocess.CompletedProcess(command, 0, "LLVM version 22.1.5\n", "")
+            return subprocess.CompletedProcess(command, 0, "LLVM version 23.1.2\n", "")
         with mock.patch.object(coverage, "run", side_effect=version):
             identities = coverage.toolchain_identity(tools, {})
         self.assertEqual(identities["clang"]["path"], "chosen clang")
-        self.assertEqual(identities["opt"]["major"], 22)
+        self.assertEqual(identities["opt"]["major"], 23)
         def mismatch(command, **kwargs):
-            major = 17 if command[0] == "chosen cov" else 22
+            major = 17 if command[0] == "chosen cov" else 23
             return subprocess.CompletedProcess(command, 0, f"LLVM version {major}.0.0\n", "")
         with mock.patch.object(coverage, "run", side_effect=mismatch):
             with self.assertRaisesRegex(ValueError, "matching LLVM"):
                 coverage.toolchain_identity(tools, {})
+
+    def test_matching_unsupported_release_is_rejected(self):
+        for release in ('18.1.8', '22.1.8', '23.1.3', '24.0.0'):
+            with self.subTest(release=release), mock.patch.object(coverage, "run", return_value=
+                    subprocess.CompletedProcess([], 0, 'LLVM version ' + release + '\n', '')):
+                with self.assertRaisesRegex(ValueError, 'pinned LLVM 23.1.2'):
+                    coverage.toolchain_identity({'clang': 'clang', 'opt': 'opt'}, {})
 
     def test_pre_inlining_instrumentation_uses_the_selected_backend_target(self):
         for triple in ("arm64-apple-darwin25.0.0", "x86_64-unknown-linux-gnu"):
