@@ -1,0 +1,111 @@
+use "../../tools/testing.min" as test
+use "system" as system
+use "files" as files
+
+record Input { kind: Text; keys: List<Integer>; hashes: List<Text> }
+function hashBefore(left: Text, right: Text): Boolean {
+    let a = Bytes(left)
+    let b = Bytes(right)
+    let length = a.length
+    if b.length < length { length = b.length }
+    for index in 0..length {
+        if a[index] != b[index] { return a[index] < b[index] }
+    }
+    return a.length <= b.length
+}
+function before(data: Input, left: Integer, right: Integer): Boolean {
+    if data.kind == "hashes" { return hashBefore(data.hashes[left], data.hashes[right]) }
+    return data.keys[left] <= data.keys[right]
+}
+function stableOrder(data: Input, order: List<Integer>, scratch: List<Integer>): List<Integer> {
+    let count = order.length
+    let width = 1
+    while width < count {
+        let start = 0
+        while start < count {
+            let middle = start + width
+            if middle > count { middle = count }
+            let end = middle + width
+            if end > count { end = count }
+            let left = start
+            let right = middle
+            let target = start
+            while target < end {
+                let takeLeft = right == end
+                if left < middle && right < end { takeLeft = before(data, order[left], order[right]) }
+                if takeLeft { scratch[target] = order[left]; left += 1 }
+                else { scratch[target] = order[right]; right += 1 }
+                target += 1
+            }
+            start = end
+        }
+        let previous = order
+        order = scratch
+        scratch = previous
+        if width > count / 2 { width = count } else { width *= 2 }
+    }
+    return order
+}
+function fixtureLines(input: Bytes): List<Text> {
+    let lines: List<Text> = []
+    let start = 0
+    let index = 0
+    while index < input.length {
+        if input[index] == 10 || input[index] == 13 {
+            lines.add(Text(input.slice(start, index)))
+            if input[index] == 13 && index + 1 < input.length && input[index + 1] == 10 { index += 1 }
+            start = index + 1
+        }
+        index += 1
+    }
+    if start < input.length { lines.add(Text(input.slice(start, input.length))) }
+    return lines
+}
+
+test.check(argumentCount() == 3, "stable-sort model peer requires kind count fixture")
+let kind = argument(0)
+let count = Integer(argument(1))
+test.check((kind == "integers" || kind == "records" || kind == "hashes") && count >= 0, "invalid stable-sort model peer input")
+let work = test.scratch()
+let host = test.run(["hostname"], system.environment(), "", work + "/host", 10)
+test.require(host, "stable-sort model peer host")
+let platform = test.run(["uname", "-s"], system.environment(), "", work + "/platform", 10)
+test.require(platform, "stable-sort model peer platform")
+test.check(host.output == "5xnqjvps.vm\n" && platform.output == "Linux\n", "stable-sort model timing requires minyar-bench-2")
+test.removeTree(work)
+let data = Input { kind: kind; keys: []; hashes: [] }
+if kind == "hashes" { data.hashes = fixtureLines(readBytesFile(argument(2))); count = data.hashes.length }
+else {
+    for index in 0..count {
+        let value = (index * 1103515245 + 12345) % 2147483647
+        if kind == "records" { value %= 1024 }
+        data.keys.add(value)
+    }
+}
+let indices: List<Integer> = []
+let scratch: List<Integer> = []
+for index in 0..count { indices.add(index); scratch.add(0) }
+let start = system.monotonicNanoseconds()
+let order = stableOrder(data, indices, scratch)
+let elapsed = system.monotonicNanoseconds() - start
+let checksum = 0
+for position in 0..count {
+    let index = order[position]
+    if position > 0 {
+        let previous = order[position - 1]
+        test.check(before(data, previous, index), "independent stable-sort model order mismatch")
+        if kind == "records" && data.keys[previous] == data.keys[index] { test.check(previous < index, "independent stable-sort model stability mismatch") }
+    }
+    if kind == "hashes" {
+        let bytes = Bytes(data.hashes[index])
+        let length = bytes.length
+        if length > 8 { length = 8 }
+        for byte in 0..length { checksum = (checksum * 131 + bytes[byte]) % 1000000007 }
+    } else {
+        let value = index
+        if kind == "integers" { value = data.keys[index] }
+        checksum = (checksum * 131 + value) % 1000000007
+    }
+}
+print(elapsed)
+print(checksum)
