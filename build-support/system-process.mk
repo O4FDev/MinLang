@@ -1,7 +1,7 @@
 .PHONY: check-system-services check-system-services-sanitize check-system-process check-system-process-sanitize
 .PHONY: check-system-process-boundary
-check-system-process-boundary:
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/system-process-boundary.py
+check-system-process-boundary: build/tooling/tests/system-process-boundary
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/system-process-boundary
 
 ifeq ($(shell uname -s),Linux)
 check-system-process check-system-process-sanitize: check-system-process-boundary

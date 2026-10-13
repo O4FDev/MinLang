@@ -1,11 +1,11 @@
 .PHONY: check-errors-language check-errors-language-sanitize check-errors-language-bounded
 
-check-errors-language: build/minyarc-errors build/errors-compiler-stage3.ll build/minyar-runtime.o
+check-errors-language: build/minyarc-errors build/errors-compiler-stage3.ll build/minyar-runtime.o build/tooling/tests/errors-language
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --profile errors --ir build/errors-compiler-stage3.ll
-	MINYAR_ERRORS_COMPILER=./build/minyarc-errors MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/errors-language.py
+	MINYAR_ERRORS_COMPILER=./build/minyarc-errors MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/errors-language
 
-check-errors-language-sanitize: build/minyarc-errors-sanitize
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_ERRORS_COMPILER=./build/minyarc-errors-sanitize MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/errors-language.py
+check-errors-language-sanitize: build/minyarc-errors-sanitize build/tooling/tests/errors-language
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_ERRORS_COMPILER=./build/minyarc-errors-sanitize MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/errors-language
 
 check check-portable: check-errors-language
 check-sanitize: check-errors-language-sanitize

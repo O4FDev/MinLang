@@ -8,9 +8,9 @@ check-feature-dispatch: build/minyarc build/minyar-runtime.o build/tooling/tests
 check-managed-graphs: build/minyarc build/minyarc-callbacks
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/managed-graphs.py
 
-check-callbacks: build/minyarc-callbacks build/closure-compiler-stage3.ll build/minyar-runtime.o
+check-callbacks: build/minyarc-callbacks build/closure-compiler-stage3.ll build/minyar-runtime.o build/tooling/tests/callbacks
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --profile callbacks --ir build/closure-compiler-stage3.ll
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/callbacks.py
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/callbacks
 
 check-managed-graphs-profiles:
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/managed-graphs-profiles.py --quick
@@ -45,8 +45,8 @@ build/minyar-default-runtime-sanitize.o: runtime/minyar_default_runtime.c runtim
 check-managed-graphs-sanitize: build/minyarc-sanitize build/minyarc-callbacks-sanitize
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/managed-graphs.py
 
-check-callbacks-sanitize: build/minyarc-callbacks-sanitize
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/callbacks.py
+check-callbacks-sanitize: build/minyarc-callbacks-sanitize build/tooling/tests/callbacks
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/callbacks
 
 check-isolated-workers-sanitize: build/minyarc-sanitize build/minyar-default-runtime-sanitize.o
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_WORKER_RUNTIME=./build/minyar-default-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/isolated-workers.py

@@ -7,8 +7,8 @@ check-runtime-cache: build/minyarc build/tooling/tests/runtime-cache
 check: check-runtime-cache
 
 .PHONY: check-ownership-policy check-stack-ownership
-check-ownership-policy: build/minyarc build/minyarc-modules build/minyar-module-build
-	$(LIMITED) python3 tests/ownership-policy.py
+check-ownership-policy: build/minyarc build/minyarc-modules build/minyar-module-build build/tooling/tests/ownership-policy
+	$(LIMITED) ./build/tooling/tests/ownership-policy
 
 STACK_OWNERSHIP_BOUNDED = $(foreach profile,system fixed lazy,$(foreach budget,1 2 8 9 32 1024,$(foreach mode,native sanitize,check-stack-ownership-$(profile)-$(budget)-$(mode))))
 STACK_OWNERSHIP_FALLBACK = $(foreach profile,eager arena,$(foreach mode,native sanitize,check-stack-ownership-$(profile)-32-$(mode)))
@@ -47,11 +47,11 @@ check-launcher-isolation: build/minyarc build/minyarc-errors-request build/minya
 check-release-build: build/minyarc build/minyar-runtime.o build/minyar-runtime-release.ll
 	$(LIMITED) python3 tests/release-build.py
 
-check-critical-path: build/minyarc
-	$(LIMITED) python3 experiments/memory/critical-path-study.py
+check-critical-path: build/minyarc build/tooling/experiments/memory/critical-path-study
+	$(LIMITED) ./build/tooling/experiments/memory/critical-path-study
 
-check-regressions: build/minyarc build/minyar-runtime.o
-	$(LIMITED) python3 tests/regressions.py
+check-regressions: build/minyarc build/minyar-runtime.o build/tooling/tests/regressions
+	$(LIMITED) ./build/tooling/tests/regressions
 
 check-diagnostics: build/minyarc build/tooling/tests/diagnostics
 	$(LIMITED) ./build/tooling/tests/diagnostics
@@ -136,8 +136,8 @@ check-scaling: build/minyarc
 	$(LIMITED) python3 tests/scaling.py
 
 # Run absolute self-compilation checks without background scheduling.
-check-budget: build/minyarc build/compiler-stage3.ll
-	python3 tests/self-compile-budget.py
+check-budget: build/minyarc build/compiler-stage3.ll build/tooling/tests/self-compile-budget
+	./build/tooling/tests/self-compile-budget
 
 build/minyarc-budget-previous: build/compiler-budget-previous.ll build/minyar-compiler-runtime.ll
 	"$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
@@ -176,11 +176,11 @@ check-sanitized-fixed-point: build/minyarc-sanitize build/compiler-stage3.ll bui
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/minyarc-sanitize build/compiler.min build/compiler-sanitized.ll
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --ir build/compiler-sanitized.ll --ir build/compiler-stage3.ll
 
-check-sanitize: build/tooling/tests/memory check-generated-sanitizer check-sanitized-fixed-point check-stack-overflow-sanitize build/minyar-runtime.o build/minyar-runtime-sanitize.o build/runtime-unit-sanitize
+check-sanitize: build/tooling/tests/memory check-generated-sanitizer check-sanitized-fixed-point check-stack-overflow-sanitize build/minyar-runtime.o build/minyar-runtime-sanitize.o build/runtime-unit-sanitize build/tooling/tests/regressions
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize $(SANITIZER_LIMITED) sh tests/run-module-tests.sh
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) python3 tests/fuzz.py --compiler build/minyarc-sanitize --cases 100 --hostile-timeout 15
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/runtime-unit-sanitize
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/regressions.py
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/regressions
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/ownership.py
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/memory --shared
 
@@ -258,8 +258,8 @@ check-adversarial: build/minyarc build/minyar-runtime.o build/minyarc-sanitize b
 	$(LIMITED) python3 tests/adversarial.py
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/adversarial.py
 
-check-ownership-mutation:
-	$(LIMITED) python3 tests/ownership-mutation.py
+check-ownership-mutation: build/tooling/tests/ownership-mutation
+	$(LIMITED) ./build/tooling/tests/ownership-mutation
 
 check-ownership-stress: build/minyarc build/minyarc-sanitize build/minyar-runtime.o build/ownership-runtime.o
 	MINYAR_OWNERSHIP_GRAPHS=256 MINYAR_OWNERSHIP_SEEDS=32 $(LIMITED) python3 tests/ownership.py
@@ -307,34 +307,34 @@ check: check-text-view-budget
 # These matrices compile many sanitizer variants and reserve large virtual
 # heaps. Keep them explicitly requested, outside the ordinary check target.
 .PHONY: check-memory-profiles check-unary-pairs check-fused-unary
-check-fused-unary:
-	$(SANITIZER_LIMITED) python3 tests/fused-unary-regressions.py --clang "$(LLVM_CC)"
-	$(SANITIZER_LIMITED) python3 tests/fused-work-regressions.py --clang "$(LLVM_CC)"
+check-fused-unary: build/tooling/tests/fused-unary-regressions build/tooling/tests/fused-work-regressions
+	$(SANITIZER_LIMITED) ./build/tooling/tests/fused-unary-regressions --clang "$(LLVM_CC)"
+	$(SANITIZER_LIMITED) ./build/tooling/tests/fused-work-regressions --clang "$(LLVM_CC)"
 
 check-unary-pairs: check-fused-unary
 	$(SANITIZER_LIMITED) python3 tests/unary-pair-regressions.py --clang "$(LLVM_CC)"
 
-check-memory-profiles: build/minyar-runtime-system.o check-unary-pairs check-text-view-budget build/tooling/tests/system-configurations
+check-memory-profiles: build/minyar-runtime-system.o check-unary-pairs check-text-view-budget build/tooling/tests/system-configurations build/tooling/tests/lazy-configurations
 	$(SANITIZER_LIMITED) python3 tests/memory-profile-regressions.py --runtime-source runtime/minyar_runtime.c --suite focused --clang "$(LLVM_CC)"
 	$(SANITIZER_LIMITED) ./build/tooling/tests/system-configurations
-	$(SANITIZER_LIMITED) python3 tests/lazy-configurations.py --clang "$(LLVM_CC)"
+	$(SANITIZER_LIMITED) ./build/tooling/tests/lazy-configurations --clang "$(LLVM_CC)"
 
-check-recursive-data: build/minyarc build/minyarc-sanitize build/minyar-runtime.o build/ownership-runtime.o build/tooling/tests/recursive-data build/tooling/tests/recursive-mutation
+check-recursive-data: build/minyarc build/minyarc-sanitize build/minyar-runtime.o build/ownership-runtime.o build/tooling/tests/recursive-data build/tooling/experiments/memory/production-contract-model build/tooling/tests/recursive-mutation
 	$(LIMITED) ./build/tooling/tests/recursive-data
 	$(LIMITED) python3 tests/production-memory.py
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/recursive-data
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/production-memory.py
-	$(LIMITED) python3 experiments/memory/production-contract-model.py
+	$(LIMITED) ./build/tooling/experiments/memory/production-contract-model
 	$(SANITIZER_LIMITED) ./build/tooling/tests/recursive-mutation
 
-check-bounded: build/minyarc build/minyar-runtime-bounded.o build/bounded-runtime build/bounded-runtime-sanitize build/bounded-ownership-runtime.o build/production-live-oracle build/production-frame-oracle build/bounded-list-capacity build/bounded-list-capacity-sanitize build/tooling/tests/recursive-data
+check-bounded: build/minyarc build/minyar-runtime-bounded.o build/bounded-runtime build/bounded-runtime-sanitize build/bounded-ownership-runtime.o build/production-live-oracle build/production-frame-oracle build/bounded-list-capacity build/bounded-list-capacity-sanitize build/tooling/tests/recursive-data build/tooling/tests/bounded-configurations
 	$(LIMITED) ./build/bounded-runtime
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/bounded-runtime-sanitize
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/production-live-oracle
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/production-frame-oracle
 	$(LIMITED) ./build/bounded-list-capacity
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/bounded-list-capacity-sanitize
-	$(LIMITED) python3 tests/bounded-configurations.py
+	$(LIMITED) ./build/tooling/tests/bounded-configurations
 	MINYAR_TEST_RUNTIME=./build/minyar-runtime-bounded.o $(LIMITED) ./build/tooling/tests/recursive-data
 	MINYAR_TEST_RUNTIME=./build/minyar-runtime-bounded.o $(LIMITED) python3 tests/production-memory.py
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/bounded-ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/recursive-data
@@ -353,8 +353,8 @@ check-incremental-modules: build/minyarc-errors-request build/minyarc-modules bu
 check: check-incremental-modules
 
 .PHONY: check-incremental-module-performance
-check-incremental-module-performance: build/minyarc-modules build/minyar-module-build build/minyar-runtime.o
-	$(LIMITED) python3 tests/incremental-module-performance.py --enforce
+check-incremental-module-performance: build/minyarc-modules build/minyar-module-build build/minyar-runtime.o build/tooling/tests/incremental-module-performance
+	$(LIMITED) ./build/tooling/tests/incremental-module-performance --enforce
 
 check: check-incremental-module-performance
 
@@ -438,11 +438,11 @@ check-checked-results: build/minyarc build/minyar-runtime.o build/tooling/tests/
 check-checked-results-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/checked-results
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/checked-results
 
-check-checked-results-frontends: build/minyarc-modules build/minyarc-callbacks build/minyarc-errors build/minyar-runtime.o
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/checked-results-frontends.py
+check-checked-results-frontends: build/minyarc-modules build/minyarc-callbacks build/minyarc-errors build/minyar-runtime.o build/tooling/tests/checked-results-frontends
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/checked-results-frontends
 
-check-checked-results-frontends-sanitize: build/minyarc-modules-sanitize build/minyarc-callbacks-sanitize build/minyarc-errors-sanitize build/minyar-runtime-sanitize.o
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/checked-results-frontends.py
+check-checked-results-frontends-sanitize: build/minyarc-modules-sanitize build/minyarc-callbacks-sanitize build/minyarc-errors-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/checked-results-frontends
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/checked-results-frontends
 
 check-portable check: check-checked-arithmetic check-checked-results check-checked-results-frontends
 check-sanitize: check-checked-arithmetic-sanitize check-checked-results-sanitize check-checked-results-frontends-sanitize
@@ -501,14 +501,14 @@ check-bootstrap-records: build/stage0 build/tooling/tests/bootstrap-records
 check-portable check: check-bootstrap-records
 
 .PHONY: check-measurement-stats
-check-measurement-stats:
-	python3 tests/measurement-stats.py
+check-measurement-stats: build/tooling/tests/measurement-stats
+	./build/tooling/tests/measurement-stats
 
 check-portable check: check-measurement-stats
 
 .PHONY: check-budget-harness
-check-budget-harness:
-	python3 tests/self-compile-budget-harness.py
+check-budget-harness: build/tooling/tests/self-compile-budget-harness
+	./build/tooling/tests/self-compile-budget-harness
 
 check-portable check: check-budget-harness
 check-budget: check-budget-harness
@@ -524,11 +524,11 @@ check-portable check: check-source-map
 check-sanitize: check-source-map-sanitize
 
 .PHONY: check-scalar-path check-scalar-study-harness
-check-scalar-study-harness:
-	python3 tests/scalar-study-harness.py
+check-scalar-study-harness: build/tooling/tests/scalar-study-harness
+	./build/tooling/tests/scalar-study-harness
 
-check-scalar-path: check-scalar-study-harness build/minyarc
-	$(LIMITED) python3 experiments/memory/checked-scalars-study.py
+check-scalar-path: check-scalar-study-harness build/minyarc build/tooling/experiments/memory/checked-scalars-study
+	$(LIMITED) ./build/tooling/experiments/memory/checked-scalars-study
 
 check: check-scalar-path
 check-portable: check-scalar-study-harness
@@ -540,11 +540,11 @@ check-stack-limits: build/tooling/tests/stack-limits tests/stack-limits.c
 check-portable check: check-stack-limits
 
 .PHONY: check-linkage check-linkage-sanitize
-check-linkage: build/stage0 build/minyarc build/minyarc-modules build/minyar-runtime.o
-	$(LIMITED) python3 tests/linkage.py
+check-linkage: build/stage0 build/minyarc build/minyarc-modules build/minyar-runtime.o build/tooling/tests/linkage
+	$(LIMITED) ./build/tooling/tests/linkage
 
-check-linkage-sanitize: build/stage0 build/minyarc-sanitize build/minyarc-modules-sanitize build/minyar-runtime-sanitize.o
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_MODULE_COMPILER=./build/minyarc-modules-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/linkage.py
+check-linkage-sanitize: build/stage0 build/minyarc-sanitize build/minyarc-modules-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/linkage
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_MODULE_COMPILER=./build/minyarc-modules-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/linkage
 
 check-portable check: check-linkage
 check-sanitize: check-linkage-sanitize

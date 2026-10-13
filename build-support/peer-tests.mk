@@ -26,11 +26,11 @@ $(foreach suite,$(PEER_SUITES),$(eval $(call PEER_SUITE_CHECKS,$(suite),$(call p
 .PHONY: check-stateful-lists check-stateful-lists-sanitize check-runtime-size-guards check-compiler-allocation-faults check-peer-ownership check-peer-sanitize check-peer-audit-harness check-evidence-harness check-peer-manifest check-peer-regressions check-peer-optimizations check-allocation-faults check-codegen check-reduction-harness
 
 .PHONY: check-list-literals check-list-literals-sanitize check-list-literal-runtime
-check-list-literals: build/minyarc build/minyarc-modules build/minyar-runtime.o
-	$(LIMITED) python3 tests/list-literals.py
+check-list-literals: build/minyarc build/minyarc-modules build/minyar-runtime.o build/tooling/tests/list-literals
+	$(LIMITED) ./build/tooling/tests/list-literals
 
-check-list-literals-sanitize: build/minyarc-sanitize build/minyarc-modules-sanitize build/minyar-runtime-sanitize.o
-	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_MODULE_COMPILER=./build/minyarc-modules-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/list-literals.py
+check-list-literals-sanitize: build/minyarc-sanitize build/minyarc-modules-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/list-literals
+	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_MODULE_COMPILER=./build/minyarc-modules-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/list-literals
 
 check-list-literal-runtime: build/tooling/tests/list-literal-runtime
 	$(SANITIZER_LIMITED) ./build/tooling/tests/list-literal-runtime --clang "$(LLVM_CC)"
@@ -80,8 +80,8 @@ check-evidence-harness: build/minyarc build/minyar-runtime.o
 	python3 tests/evidence-harness.py
 
 .PHONY: check-performance-metrics
-check-performance-metrics:
-	python3 tests/performance-metrics.py
+check-performance-metrics: build/tooling/tests/performance-metrics
+	./build/tooling/tests/performance-metrics
 
 check: check-performance-metrics
 
@@ -323,8 +323,8 @@ check-runtime-size-guards: build/tooling/tests/runtime-size-guards
 check-compiler-allocation-faults: build/minyarc build/compiler-stage2.ll build/minyar-runtime.o
 	$(SANITIZER_LIMITED) python3 tests/allocation-faults.py --scope compiler --output build/compiler-allocation-faults.json
 
-check-codegen: build/minyarc
-	$(LIMITED) python3 tests/codegen.py
+check-codegen: build/minyarc build/tooling/tests/codegen
+	$(LIMITED) ./build/tooling/tests/codegen
 
 check-reduction-harness: build/minyarc build/minyar-runtime.o
 	$(LIMITED) python3 tests/reduction-harness.py
