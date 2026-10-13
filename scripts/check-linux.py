@@ -197,9 +197,9 @@ def main():
     groups = [name for name in GROUPS if name in a.group] if a.group else ['correctness']
     if a.only and groups != ['correctness']:
         p.error('--only selects correctness targets; leave out --group')
-    unknown = [name for name in a.only if name not in TARGETS]
+    unknown = [name for name in a.only if not name.startswith('check-')]
     if unknown:
-        p.error('not a Linux correctness target: ' + ', '.join(unknown))
+        p.error('not a check target: ' + ', '.join(unknown))
     required = ['Makefile', 'minyar', '.github/workflows/ci.yml', 'runtime/minyar_heap.h',
                 'tests/generated-stack-sanitizer.py', 'tests/llvm_sanitizer.py',
                 'tests/binary-expression-ownership.py',
@@ -210,7 +210,8 @@ def main():
                 'tests/data/peer/implementations.jsonl']
     missing = [name for name in required if not (source / name).is_file()]
     # --only names targets explicitly, whatever their tier.
-    targets = [name for name in TARGETS if name in a.only] if a.only else [name for name in TARGETS if in_tier(name, a.tier)]
+    # --only may name any phony check, including a child of an aggregate (checked against make later).
+    targets = list(dict.fromkeys(a.only)) if a.only else [name for name in TARGETS if in_tier(name, a.tier)]
     if 'correctness' not in groups:
         targets = []
     # Groups other than these run in their own variant snapshots (or need no build).
@@ -393,6 +394,9 @@ def main():
             add(Check('runtime-unit-sanitize', ['./build/runtime-unit-sanitize'], goals=['build/runtime-unit-sanitize'],
                       tier='sanitize', group='correctness'))
         rules = check_runner.make_database(make, work, env)
+        missing_targets = [name for name in a.only if name not in rules or not rules[name].phony]
+        if missing_targets:
+            raise RuntimeError('not a phony make target: ' + ', '.join(missing_targets))
         main_roots = [('correctness', targets + (['check-native-graphics'] if full and correctness else [])),
                       ('quic', QUIC_TARGETS), ('formats', ['check-formats', 'check-formats-sanitize']),
                       ('redis', ['check-peer-live-redis', 'check-peer-live-redis-sanitize']),
