@@ -16,7 +16,7 @@ COMPILER = Path(os.environ.get('MINYAR_TEST_COMPILER', ROOT / 'build/minyarc-mod
 CLANG = os.environ.get('MINYAR_TEST_CLANG', 'clang')
 RUNTIME = Path(os.environ.get('MINYAR_TEST_RUNTIME', ROOT / 'build/minyar-runtime.o'))
 LINK_FLAGS = shlex.split(os.environ.get('MINYAR_TEST_LINK_FLAGS', ''))
-LTO_LINK_FLAGS = ['-fuse-ld=lld'] if platform.system() == 'Linux' and shutil.which('ld.lld') else []
+LTO_LINK_FLAGS = ['-fuse-ld=lld', '-Wl,--threads=1'] if platform.system() == 'Linux' and shutil.which('ld.lld') else []
 
 
 def run(command):
