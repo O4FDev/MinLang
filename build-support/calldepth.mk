@@ -2,8 +2,8 @@
 build/tooling/tests/calldepth: TOOL_NATIVE = tests/sha256-test-native.c
 build/tooling/tests/calldepth: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/calldepth: tests/sha256-test-native.c
-check-calldepth: build/minyarc-calldepth build/calldepth-compiler-stage3.ll build/minyar-runtime.o build/tooling/tests/calldepth
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --profile calldepth --ir build/calldepth-compiler-stage3.ll
+check-calldepth: build/minyarc-calldepth build/calldepth-compiler-stage3.ll build/minyar-runtime.o build/tooling/tests/calldepth build/testing/cycle-runtime.o build/tooling/tests/compiler-behavior
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile calldepth --ir build/calldepth-compiler-stage3.ll
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/calldepth
 
 check-calldepth-sanitize: build/minyarc-calldepth build/tooling/tests/calldepth

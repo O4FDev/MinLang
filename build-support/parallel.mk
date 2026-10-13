@@ -24,10 +24,10 @@ PARALLEL_SIGNATURE_FIXTURES = tests/parallel-signatures/managed-after-scalars.mi
     tests/parallel-signatures/unused-text.min
 PARALLEL_SIGNATURE_INPUTS = tests/parallel-signatures.py tests/regressions.py tests/test_evidence.py tests/clang_helpers.py tests/llvm_sanitizer.py tools/sanitizer_llvm.py $(PARALLEL_SIGNATURE_FIXTURES) $(wildcard tests/parallel/*.min tests/parallel/errors/*.min)
 
-check-parallel-signatures: $(addprefix build/,$(PARALLEL_SIGNATURE_FRONTENDS)) build/minyar-runtime.o build/compiler-stage3.ll build/closure-compiler-stage3.ll build/errors-compiler-stage3.ll $(PARALLEL_SIGNATURE_INPUTS) | build
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --profile core --ir build/compiler-stage3.ll
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --profile callbacks --ir build/closure-compiler-stage3.ll
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --profile errors --ir build/errors-compiler-stage3.ll
+check-parallel-signatures: $(addprefix build/,$(PARALLEL_SIGNATURE_FRONTENDS)) build/minyar-runtime.o build/compiler-stage3.ll build/closure-compiler-stage3.ll build/errors-compiler-stage3.ll $(PARALLEL_SIGNATURE_INPUTS) build/testing/cycle-runtime.o build/tooling/tests/compiler-behavior | build
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile core --ir build/compiler-stage3.ll
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile callbacks --ir build/closure-compiler-stage3.ll
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile errors --ir build/errors-compiler-stage3.ll
 	@set -e; evidence=$$(mktemp -d "$(abspath build)/parallel-signatures-native-XXXXXX"); \
 	for frontend in $(PARALLEL_SIGNATURE_FRONTENDS); do \
 	    MINYAR_TEST_COMPILER="./build/$$frontend" MINYAR_PARALLEL_OBSERVATIONS="$$evidence/$$frontend" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/parallel-signatures.py; \

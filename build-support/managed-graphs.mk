@@ -8,8 +8,8 @@ check-feature-dispatch: build/minyarc build/minyar-runtime.o build/tooling/tests
 check-managed-graphs: build/minyarc build/minyarc-callbacks
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/managed-graphs.py
 
-check-callbacks: build/minyarc-callbacks build/closure-compiler-stage3.ll build/minyar-runtime.o build/tooling/tests/callbacks
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --profile callbacks --ir build/closure-compiler-stage3.ll
+check-callbacks: build/minyarc-callbacks build/closure-compiler-stage3.ll build/minyar-runtime.o build/tooling/tests/callbacks build/testing/cycle-runtime.o build/tooling/tests/compiler-behavior
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile callbacks --ir build/closure-compiler-stage3.ll
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/callbacks
 
 check-managed-graphs-profiles:
