@@ -177,7 +177,7 @@ class MutationScoreHarness(unittest.TestCase):
         self.assertEqual(len({command[-1] for command in fuzz}), len(fuzz))
 
     def test_campaign_includes_internal_units_and_parameter_optimization(self):
-        scripts = {command[1] for command in mutation_score.CHECKS}
+        scripts = {command[1] if len(command) > 1 else command[0] for command in mutation_score.CHECKS}
         self.assertIn("tests/source-map.py", scripts)
         self.assertIn("tests/symbol-order.py", scripts)
         self.assertIn("tests/readonly-parameters.py", scripts)
