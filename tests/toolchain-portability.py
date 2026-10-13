@@ -71,6 +71,8 @@ if '--libs' in sys.argv: print('-lglfw')
         self.output = self.work / 'output program'
 
     def write_executable(self, path, code):
+        if path == getattr(self, 'clang', None):
+            code = 'import sys\nif "-print-prog-name=ld.lld" in sys.argv:\n    print(' + repr(str(path.parent / 'ld.lld')) + ')\n    sys.exit(0)\n' + code
         path.write_text('#!' + sys.executable + '\n' + code)
         path.chmod(0o755)
 
