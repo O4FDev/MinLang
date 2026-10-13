@@ -1,6 +1,8 @@
 use "./testing.min" as test
 use "system" as system
 use "files" as files
+use "text" as text
+use "errors" as errors
 
 public record Rule { name: Text; prerequisites: List<Text>; phony: Boolean; recipe: Boolean; target: Boolean; stale: Boolean }
 public function begins(source: Text, prefix: Text): Boolean {
@@ -64,7 +66,7 @@ public function database(source: Text): List<Rule> {
 public record Variant { name: Text; cwd: Text; environment: List<Text>; make: List<Text>; rules: List<Rule>; builder: Boolean; built: Map<Text, Boolean> }
 public record Goal { name: Text; variant: Integer; state: Integer; weight: Integer; handle: Integer; log: Text; started: Integer; members: Map<Text, Boolean> }
 public record Check { label: Text; target: Text; arguments: List<Text>; variant: Integer; children: List<Integer>; goals: List<Integer>;
-    state: Integer; resource: Text; exclusive: Boolean; weight: Integer; handle: Integer; log: Text; started: Integer; retry: Integer; builder: Boolean }
+    state: Integer; resource: Text; exclusive: Boolean; weight: Integer; handle: Integer; log: Text; started: Integer; retry: Integer; builder: Boolean; wall: Integer }
 public record Plan { variants: List<Variant>; checks: List<Check>; goals: List<Goal>; scratch: Text; jobs: Integer; timeout: Integer; retries: Integer; interrupted: Boolean }
 public function plan(jobs: Integer, timeout: Integer, retries: Integer): Plan {
     test.check(jobs >= 1 && jobs <= 16 && timeout > 0 && retries >= 0, "invalid runner limits")
@@ -128,7 +130,7 @@ public function addCheck(plan: Plan, variant: Integer, target: Text): Integer {
     let index = plan.checks.length
     plan.checks.add(Check { label: label; target: target; arguments: []; variant: variant; children: []; goals: []; state: 0;
         resource: resource(target, variant); exclusive: exclusive(target); weight: weight(target);
-        handle: 0; log: ""; started: 0; retry: 0; builder: false })
+        handle: 0; log: ""; started: 0; retry: 0; builder: false; wall: 0 })
     for prerequisite in rule.prerequisites {
         let child = findRule(where.rules, prerequisite)
         if child >= 0 {
@@ -149,8 +151,50 @@ public function addCommand(plan: Plan, variant: Integer, label: Text, arguments:
     for goal in goals { dependencies.add(addGoal(plan, variant, goal, weight(label))) }
     plan.checks.add(Check { label: label; target: ""; arguments: arguments; variant: variant; children: []; goals: dependencies; state: 0;
         resource: resource(label, variant); exclusive: exclusive(label); weight: weight(label);
-        handle: 0; log: ""; started: 0; retry: 0; builder: false })
+        handle: 0; log: ""; started: 0; retry: 0; builder: false; wall: 0 })
     return plan.checks.length - 1
+}
+function durations(history: Text): Map<Text, Integer> {
+    let result = Map<Text, Integer>()
+    if files.pathSize(history) <= 0 { return result }
+    for line in test.lines(readTextFile(history)) {
+        let fields = test.words(line)
+        if fields.length != 2 { continue }
+        let parsed = text.parseInteger(fields[1])
+        if errors.integerOk(parsed) { result[fields[0]] = errors.integerValue(parsed) }
+    }
+    return result
+}
+public function prioritize(plan: Plan, history: Text) {
+    let known = durations(history)
+    let base: List<Integer> = []
+    let priority: List<Integer> = []
+    for check in plan.checks {
+        let estimate = check.weight * 1000
+        if known.has(check.label) { estimate = known[check.label] }
+        base.add(estimate)
+        priority.add(estimate)
+    }
+    let changed = true
+    while changed {
+        changed = false
+        for index in 0..plan.checks.length {
+            for child in plan.checks[index].children {
+                if base[child] + priority[index] > priority[child] { priority[child] = base[child] + priority[index]; changed = true }
+            }
+        }
+    }
+    for index in 0..plan.checks.length { plan.checks[index].weight = priority[index] }
+}
+public function remember(plan: Plan, history: Text) {
+    let known = durations(history)
+    for check in plan.checks { if check.wall > 0 { known[check.label] = check.wall } }
+    let rows: List<Text> = []
+    for label in known { rows.add(label + " " + Text(known[label]) + "\n") }
+    rows.sort()
+    let temporary = history + ".tmp-" + Text(system.processId())
+    writeTextFile(temporary, joinText(rows))
+    test.check(files.rename(temporary, history) == 0, "cannot record check durations")
 }
 function closure(rules: List<Rule>, positions: Map<Text, Integer>, name: Text, members: Map<Text, Boolean>) {
     if members.has(name) || !positions.has(name) { return }
@@ -290,6 +334,7 @@ function execute(plan: Plan): Boolean {
             if check.state == 1 {
                 let status = system.poll(check.handle)
                 if status.state != system.PENDING {
+                    check.wall = (system.monotonicNanoseconds() - check.started) / 1000000
                     let ok = showResult(check.label, check.log, status, check.started)
                     check.state = 3
                     if ok { check.state = 2 }
