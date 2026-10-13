@@ -1,0 +1,75 @@
+use "../tools/testing.min" as test
+use "system" as system
+
+function usage(message: Text) {
+    system.writeStandardError("usage: compiler-self-bench --baseline BASELINE --candidate CANDIDATE --source SOURCE [--candidate-arg ARGUMENT] [--repeats N]\ncompiler-self-bench: error: " + message + "\n")
+    exit(2)
+}
+function absolute(path: Text, work: Text): Text {
+    let result = test.run(["/bin/sh", "-c", "cd \"$(dirname -- \"$1\")\" && printf '%s/%s' \"$(pwd -P)\" \"$(basename -- \"$1\")\"", "sh", path], system.environment(), "", work + "/resolve", 10)
+    test.require(result, "resolve " + path)
+    return result.output
+}
+function median(values: List<Float>): Float {
+    let sorted = values.sorted()
+    let middle = sorted.length / 2
+    if sorted.length % 2 == 1 { return sorted[middle] }
+    return (sorted[middle - 1] + sorted[middle]) / 2.0
+}
+function fixed(value: Float, digits: Integer, signed: Boolean): Text {
+    let scale = 1
+    for unused in 0..digits { scale *= 10 }
+    let scaled = Integer(round(abs(value) * Float(scale)))
+    let fraction = Text(scaled % scale)
+    while Bytes(fraction).length < digits { fraction = "0" + fraction }
+    let sign = ""
+    if value < 0.0 && scaled != 0 { sign = "-" } else if signed { sign = "+" }
+    return sign + Text(scaled / scale) + "." + fraction
+}
+
+let baseline = ""
+let candidate = ""
+let source = ""
+let candidateArguments: List<Text> = []
+let repeats = 31
+let position = 0
+while position < argumentCount() {
+    let option = argument(position)
+    if position + 1 >= argumentCount() { usage("argument " + option + ": expected one argument") }
+    let value = argument(position + 1)
+    if option == "--baseline" { baseline = value }
+    else if option == "--candidate" { candidate = value }
+    else if option == "--source" { source = value }
+    else if option == "--candidate-arg" { candidateArguments.add(value) }
+    else if option == "--repeats" { repeats = Integer(value) }
+    else { usage("unrecognized arguments: " + option) }
+    position += 2
+}
+if baseline == "" || candidate == "" || source == "" { usage("the following arguments are required: --baseline, --candidate, --source") }
+let work = test.scratch()
+let compilers = [absolute(baseline, work), absolute(candidate, work)]
+let input = absolute(source, work)
+let output = work + "/compiler.ll"
+let samples: List<List<Float>> = [[], []]
+let names = ["baseline", "candidate"]
+for repeat in 0..(repeats + 3) {
+    let order = [1, 0]
+    if repeat % 2 == 1 { order = [0, 1] }
+    for index in order {
+        let command = [compilers[index], input, output]
+        if index == 1 { for item in candidateArguments { command.add(item) } }
+        let start = system.monotonicNanoseconds()
+        test.require(test.run(command, system.environment(), "", work + "/compile", 60), names[index] + " compile")
+        let elapsed = Float(system.monotonicNanoseconds() - start) / 1000000000.0
+        if repeat >= 3 { samples[index].add(elapsed) }
+    }
+}
+for index in 0..2 {
+    let values = samples[index]
+    let sorted = values.sorted()
+    print(names[index] + ": median=" + fixed(median(values), 6, false) + "s min=" + fixed(sorted[0], 6, false) + "s max=" + fixed(sorted[sorted.length - 1], 6, false) + "s n=" + Text(values.length))
+}
+let ratio = median(samples[1]) / median(samples[0])
+print("same-source compile change: " + fixed((ratio - 1.0) * 100.0, 3, true) + "%")
+test.removeTree(work)
+test.check(ratio <= 1.01, "same-source compile exceeded the 1% limit")
