@@ -69,7 +69,8 @@ class RuntimeCache(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         ran = subprocess.run([str(self.output)], capture_output=True, text=True, timeout=10)
         self.assertEqual((ran.returncode, ran.stdout, ran.stderr), (0, '42\n', ''))
-        return [json.loads(line) for line in self.clang_log.read_text().splitlines()]
+        calls = [json.loads(line) for line in self.clang_log.read_text().splitlines()]
+        return [call for call in calls if call not in (['--version'], ['-print-prog-name=ld.lld'])]
 
     def signature(self, path):
         return path.stat().st_mtime_ns, hashlib.sha256(path.read_bytes()).hexdigest()

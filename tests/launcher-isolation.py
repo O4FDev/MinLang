@@ -41,6 +41,8 @@ class LauncherIsolation(unittest.TestCase):
         self.wrapper.write_text('''#!/usr/bin/env python3
 import json, os, signal, sys, time
 from pathlib import Path
+if sys.argv[1:] in (['--version'], ['-print-prog-name=ld.lld']):
+    os.execv(os.environ['LAUNCHER_TEST_REAL_CLANG'], ['clang', *sys.argv[1:]])
 work = Path(os.environ['LAUNCHER_TEST_WORK'])
 identity = os.environ['LAUNCHER_TEST_ID']
 mode = os.environ.get('LAUNCHER_TEST_MODE', '')

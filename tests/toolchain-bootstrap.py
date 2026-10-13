@@ -32,8 +32,10 @@ with tempfile.TemporaryDirectory(prefix='minyar cold toolchain ') as temporary:
     selected.write_text('#!' + sys.executable + '\nimport os,sys\n'
                         'os.execv(' + repr(clang) + ',[' + repr(clang) + ',*sys.argv[1:]])\n')
     selected.chmod(0o755)
-    matching = Path(clang).resolve().parent / 'ld.lld'
-    linker = matching if matching.is_file() else Path(shutil.which('ld.lld') or '')
+    sys.path.insert(0, str(ROOT / 'tools'))
+    from host_paths import pinned_lld
+    selected_linker = subprocess.check_output([clang, '-print-prog-name=ld.lld'], text=True).strip()
+    linker = Path(pinned_lld(selected_linker))
     if linker.is_file():
         (work / 'ld.lld').symlink_to(linker)
     environment = dict(os.environ)
