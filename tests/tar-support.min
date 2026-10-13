@@ -1,0 +1,329 @@
+use "./text-basics-oracles.min" as hex
+
+public record Time { seconds: Integer; nanos: Integer }
+public record Member { start: Integer; header: Integer; payloadOffset: Integer; end: Integer; path: Bytes; link: Bytes; mode: Integer; uid: Integer; gid: Integer; time: Time; type: Integer; size: Integer; major: Integer; minor: Integer; payload: Bytes; uname: Bytes; gname: Bytes; attributes: Map<Text, Bytes> }
+public record Scan { entries: List<Member>; reason: Text }
+public record Numeric { value: Integer; reason: Text }
+function check(condition: Boolean, reason: Text, error: List<Text>): Boolean { if !condition && error[0] == "" { error[0] = reason }; return condition }
+public function same(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+public function sameAttributes(left: Map<Text, Bytes>, right: Map<Text, Bytes>): Boolean {
+    if left.length != right.length { return false }
+    for key in left { if !right.has(key) || !same(left[key], right[key]) { return false } }
+    return true
+}
+function terminated(source: Bytes, start: Integer, length: Integer): Bytes { let end = start; while end < start + length && source[end] != 0 { end += 1 }; return source.slice(start, end) }
+function number(source: Bytes, start: Integer, length: Integer, error: List<Text>): Integer {
+    let value = 0
+    if (source[start] & 128) != 0 {
+        value = source[start] & 127
+        if (source[start] & 64) != 0 { value -= 128 }
+        for index in (start + 1)..(start + length) {
+            if !check(value >= -36028797018963968 && value <= 36028797018963967, "numeric overflow", error) { return 0 }
+            value = value * 256 + source[index]
+        }
+        return value
+    }
+    let left = start
+    let right = start + length
+    while left < right && (source[left] == 0 || source[left] == 32) { left += 1 }
+    while right > left && (source[right - 1] == 0 || source[right - 1] == 32) { right -= 1 }
+    for index in left..right {
+        if !check(source[index] >= 48 && source[index] <= 55, "checksum or numeric grammar", error) { return 0 }
+        if !check(value <= 1152921504606846975, "numeric overflow", error) { return 0 }
+        value = value * 8 + source[index] - 48
+    }
+    return value
+}
+public function numeric(field: Bytes): Numeric {
+    if field.length == 0 { return Numeric { value: 0; reason: "numeric grammar" } }
+    let error = [""]
+    let value = number(field, 0, field.length, error)
+    return Numeric { value: value; reason: error[0] }
+}
+function decimal(raw: Bytes, negativeAllowed: Boolean, error: List<Text>): Integer {
+    if !check(raw.length > 0, "PAX integer grammar", error) { return 0 }
+    let begin = 0
+    let negative = negativeAllowed && raw[0] == 45
+    if negative { begin = 1 }
+    if !check(begin < raw.length, "PAX integer grammar", error) { return 0 }
+    let limit = 7
+    if negative { limit = 8 }
+    let value = 0
+    for index in begin..raw.length {
+        let digit = raw[index] - 48
+        if !check(digit >= 0 && digit <= 9, "PAX integer grammar", error) { return 0 }
+        if !check(value > -922337203685477580 || (value == -922337203685477580 && digit <= limit), "PAX integer overflow", error) { return 0 }
+        value = value * 10 - digit
+    }
+    if negative { return value }
+    return -value
+}
+public function timestamp(raw: Bytes): Time {
+    let error = [""]
+    return stamp(raw, error)
+}
+function stamp(raw: Bytes, error: List<Text>): Time {
+    let failed = Time { seconds: 0; nanos: 0 }
+    if !check(raw.length > 0, "PAX timestamp grammar", error) { return failed }
+    let begin = 0
+    let negative = raw[0] == 45
+    if negative { begin = 1 }
+    let dot = raw.length
+    for index in begin..raw.length {
+        if raw[index] == 46 { if !check(dot == raw.length, "PAX timestamp grammar", error) { return failed }; dot = index }
+        else if !check(raw[index] >= 48 && raw[index] <= 57, "PAX timestamp grammar", error) { return failed }
+    }
+    if !check(dot > begin && (dot == raw.length || dot + 1 < raw.length), "PAX timestamp grammar", error) { return failed }
+    let seconds = decimal(raw.slice(0, dot), true, error)
+    if error[0] != "" { error[0] = "timestamp precision/range"; return failed }
+    let fraction = 0
+    if dot < raw.length {
+        for index in (dot + 1)..raw.length {
+            if index - dot <= 9 { fraction = fraction * 10 + raw[index] - 48 }
+            else if !check(raw[index] == 48, "timestamp precision/range", error) { return failed }
+        }
+        let digits = raw.length - dot - 1
+        while digits < 9 { fraction *= 10; digits += 1 }
+    }
+    if negative && fraction > 0 {
+        if !check(seconds > -9223372036854775808, "timestamp precision/range", error) { return failed }
+        return Time { seconds: seconds - 1; nanos: 1000000000 - fraction }
+    }
+    return Time { seconds: seconds; nanos: fraction }
+}
+function metadata(attributes: Map<Text, Bytes>, maximum: Integer, reason: Text, error: List<Text>): Boolean {
+    if !check(attributes.length <= 4096, reason, error) { return false }
+    let size = 0
+    for key in attributes {
+        if !check(key.byteLength <= maximum - size && attributes[key].length <= maximum - size - key.byteLength, reason, error) { return false }
+        size += key.byteLength + attributes[key].length
+    }
+    return true
+}
+function records(data: Bytes, attributes: Map<Text, Bytes>, global: Boolean, maximum: Integer, error: List<Text>) {
+    let at = 0
+    while at < data.length {
+        let stop = at
+        let size = 0
+        while stop < data.length && data[stop] != 32 {
+            if !check(data[stop] >= 48 && data[stop] <= 57, "PAX length syntax", error) { return }
+            if !check(size <= data.length, "PAX record span", error) { return }
+            size = size * 10 + data[stop] - 48
+            stop += 1
+        }
+        if !check(stop < data.length && stop > at, "PAX length syntax", error) { return }
+        if !check(size >= stop - at + 4 && size <= data.length - at && data[at + size - 1] == 10, "PAX record span", error) { return }
+        let end = at + size
+        let equals = stop + 1
+        while equals < end - 1 && data[equals] != 61 { equals += 1 }
+        if !check(equals > stop + 1 && equals < end - 1, "PAX keyword", error) { return }
+        for index in (stop + 1)..equals { if !check(data[index] >= 33 && data[index] <= 126 && data[index] != 61, "PAX keyword", error) { return } }
+        let key = Text(data.slice(stop + 1, equals))
+        let value = data.slice(equals + 1, end - 1)
+        if !check(!key.startsWith("GNU.sparse.") && key != "SCHILY.realsize" && !(key == "SCHILY.filetype" && same(value, Bytes("sparse"))), "unsupported sparse attributes", error) { return }
+        if global && value.length == 0 { attributes.remove(key) } else { attributes[key] = value }
+        at = end
+    }
+    metadata(attributes, maximum, "attribute count/metadata limit", error)
+}
+function noNull(value: Bytes): Boolean { for byte in value { if byte == 0 { return false } }; return true }
+public function scan(source: Bytes, maxMetadata: Integer, maxChain: Integer, maxHeaders: Integer, maxPath: Integer): Scan {
+    let at = 0
+    let start = 0
+    let result: List<Member> = []
+    let globals = Map<Text, Bytes>()
+    let local = Map<Text, Bytes>()
+    let chain = 0
+    let extensions = 0
+    let headers = 0
+    let longPath = Bytes()
+    let longLink = Bytes()
+    let error = [""]
+    while true {
+        if !check(source.length - at >= 512, "missing/truncated header/footer", error) { break }
+        let zero = true
+        for index in at..(at + 512) { if source[index] != 0 { zero = false; break } }
+        if zero {
+            if !check(chain == 0, "dangling extension", error) { break }
+            if !check(source.length - at >= 1024 && (source.length - at) % 512 == 0, "two end blocks/zero record padding", error) { break }
+            for index in at..source.length { if source[index] != 0 { error[0] = "two end blocks/zero record padding"; break } }
+            break
+        }
+        headers += 1
+        if !check(headers <= maxHeaders, "header limit", error) { break }
+        let unsignedSum = 0
+        let signedSum = 0
+        for offset in 0..512 {
+            let byte = source[at + offset]
+            if offset >= 148 && offset < 156 { byte = 32 }
+            unsignedSum += byte
+            if byte >= 128 { signedSum += byte - 256 } else { signedSum += byte }
+        }
+        let checksum = number(source, at + 148, 8, error)
+        if error[0] != "" { break }
+        if !check(checksum == unsignedSum || checksum == signedSum, "checksum or numeric grammar", error) { break }
+        let magic = source.slice(at + 257, at + 265)
+        let emptyMagic = true
+        for byte in magic { if byte != 0 { emptyMagic = false } }
+        let ustar = same(magic.slice(0, 5), Bytes("ustar")) && magic[5] == 0 && magic[6] == 48 && magic[7] == 48
+        let gnu = same(magic.slice(0, 7), Bytes("ustar  ")) && magic[7] == 0
+        if !check(emptyMagic || ustar || gnu, "magic/version", error) { break }
+        let mode = number(source, at + 100, 8, error)
+        let uid = number(source, at + 108, 8, error)
+        let gid = number(source, at + 116, 8, error)
+        let size = number(source, at + 124, 12, error)
+        let time = Time { seconds: number(source, at + 136, 12, error); nanos: 0 }
+        let major = number(source, at + 329, 8, error)
+        let minor = number(source, at + 337, 8, error)
+        if error[0] != "" { break }
+        if !check(mode >= 0 && size >= 0 && major >= 0 && minor >= 0, "negative mode/size/device", error) { break }
+        let type = source[at + 156]
+        if type == 0 { type = 48 }
+        let extension = type == 120 || type == 103 || type == 76 || type == 75
+        let attributes = Map<Text, Bytes>()
+        let path = terminated(source, at, 100)
+        let prefix = terminated(source, at + 345, 155)
+        if prefix.length > 0 && ustar { prefix.add(47); prefix.addBytes(path); path = prefix }
+        let link = terminated(source, at + 157, 100)
+        let uname = terminated(source, at + 265, 32)
+        let gname = terminated(source, at + 297, 32)
+        if extension {
+            chain += 1
+            if !check(chain <= maxChain && size <= maxMetadata - extensions, "extension chain/metadata limit", error) { break }
+            extensions += size
+        } else {
+            if !check(type >= 48 && type <= 54, "unsupported member type/sparse", error) { break }
+            for key in globals { attributes[key] = globals[key] }
+            for key in local { attributes[key] = local[key] }
+            let erase: List<Text> = []
+            for key in attributes { if attributes[key].length == 0 { erase.add(key) } }
+            for key in erase { attributes.remove(key) }
+            if !metadata(attributes, maxMetadata, "effective attribute count/metadata limit", error) { break }
+            for key in attributes {
+                let value = attributes[key]
+                if key == "size" || key == "uid" || key == "gid" || key == "SCHILY.devmajor" || key == "SCHILY.devminor" {
+                    let integer = decimal(value, key != "size", error)
+                    if key == "size" { size = integer }
+                    else if key == "uid" { uid = integer }
+                    else if key == "gid" { gid = integer }
+                    else if key == "SCHILY.devmajor" { major = integer }
+                    else { minor = integer }
+                }
+                if key == "mtime" { time = stamp(value, error) }
+            }
+            if error[0] != "" { break }
+            if longPath.length > 0 { path = longPath }
+            if longLink.length > 0 { link = longLink }
+            if attributes.has("path") { path = attributes["path"] }
+            if attributes.has("linkpath") { link = attributes["linkpath"] }
+            if attributes.has("uname") { uname = attributes["uname"] }
+            if attributes.has("gname") { gname = attributes["gname"] }
+            if !check(path.length > 0 && path.length <= maxPath && noNull(path) && link.length <= maxPath && noNull(link), "byte name limit/NUL", error) { break }
+            if !check(uname.length <= maxPath && noNull(uname) && gname.length <= maxPath && noNull(gname), "byte name limit/NUL", error) { break }
+            if !check(type == 48 || size == 0, "nonregular payload", error) { break }
+        }
+        let payload = at + 512
+        let padding = (512 - size % 512) % 512
+        if !check(size <= source.length - payload && padding <= source.length - payload - size, "payload/padding truncation", error) { break }
+        let end = payload + size + padding
+        if extension {
+            let data = source.slice(payload, payload + size)
+            if type == 120 || type == 103 {
+                if type == 103 { records(data, globals, true, maxMetadata, error) } else { records(data, local, false, maxMetadata, error) }
+            } else {
+                if data.length > 0 && data[data.length - 1] == 0 { data = data.slice(0, data.length - 1) }
+                if !check(data.length > 0 && data.length <= maxPath && noNull(data), "GNU byte name limit/NUL", error) { break }
+                if type == 76 { longPath = data } else { longLink = data }
+            }
+            if error[0] != "" { break }
+        } else {
+            result.add(Member { start: start; header: at; payloadOffset: payload; end: end; path: path; link: link; mode: mode; uid: uid; gid: gid; time: time; type: type; size: size; major: major; minor: minor; payload: source.slice(payload, payload + size); uname: uname; gname: gname; attributes: attributes })
+            chain = 0; extensions = 0; local.clear(); longPath = Bytes(); longLink = Bytes(); start = end
+        }
+        at = end
+    }
+    return Scan { entries: result; reason: error[0] }
+}
+public function strictScan(source: Bytes): Scan { return scan(source, 1048576, 64, 1000000, 4096) }
+public function row(entry: Member): Text {
+    return hex.hex(entry.path) + "|" + hex.hex(entry.link) + "|" + Text(entry.mode) + "|" + Text(entry.uid) + "|" + Text(entry.gid) + "|" + Text(entry.time.seconds) + "|" + Text(entry.time.nanos) + "|" + Text(entry.type) + "|" + Text(entry.size) + "|" + Text(entry.major) + "|" + Text(entry.minor) + "|" + hex.hex(entry.payload) + "|" + hex.hex(entry.uname) + "|" + hex.hex(entry.gname)
+}
+public record Xattrs { attributes: Map<Text, Bytes>; invalid: Boolean }
+record Decoded { value: Bytes; invalid: Boolean }
+function digit(value: Integer): Integer {
+    if value >= 48 && value <= 57 { return value - 48 }
+    if value >= 65 && value <= 70 { return value - 55 }
+    if value >= 97 && value <= 102 { return value - 87 }
+    return -1
+}
+function unquote(source: Bytes): Decoded {
+    let result = Bytes()
+    let index = 0
+    while index < source.length {
+        if source[index] == 37 {
+            if index + 2 >= source.length { return Decoded { value: result; invalid: true } }
+            let high = digit(source[index + 1])
+            let low = digit(source[index + 2])
+            if high < 0 || low < 0 { return Decoded { value: result; invalid: true } }
+            result.add(high * 16 + low)
+            index += 3
+        } else { result.add(source[index]); index += 1 }
+    }
+    return Decoded { value: result; invalid: false }
+}
+function six(value: Integer): Integer {
+    if value >= 65 && value <= 90 { return value - 65 }
+    if value >= 97 && value <= 122 { return value - 71 }
+    if value >= 48 && value <= 57 { return value + 4 }
+    if value == 43 { return 62 }
+    if value == 47 { return 63 }
+    return -1
+}
+function base64(raw: Bytes): Decoded {
+    let end = raw.length
+    while end > 0 && raw[end - 1] == 61 { end -= 1 }
+    let remainder = end % 4
+    let padding = raw.length - end
+    let required = (4 - remainder) % 4
+    let output = Bytes()
+    if remainder == 1 || (end == 0 && padding > 0) || (remainder != 0 && padding > required) { return Decoded { value: output; invalid: true } }
+    let accumulator = 0
+    let bits = 0
+    for index in 0..end {
+        let value = six(raw[index])
+        if value < 0 { return Decoded { value: output; invalid: true } }
+        accumulator = (accumulator << 6) | value
+        bits += 6
+        if bits >= 8 {
+            bits -= 8
+            output.add((accumulator >> bits) & 255)
+            accumulator = accumulator & ((1 << bits) - 1)
+        }
+    }
+    return Decoded { value: output; invalid: accumulator != 0 }
+}
+public function xattrs(attributes: Map<Text, Bytes>): Xattrs {
+    let output = Map<Text, Bytes>()
+    let invalid = false
+    for name in attributes {
+        let raw = Bytes(name)
+        let key = Bytes()
+        let value = attributes[name]
+        if name.startsWith("SCHILY.xattr.") { key = raw.slice(13, raw.length) }
+        else if name.startsWith("LIBARCHIVE.xattr.") {
+            let decodedKey = unquote(raw.slice(17, raw.length))
+            let decodedValue = base64(value)
+            if decodedKey.invalid || decodedValue.invalid { invalid = true; continue }
+            key = decodedKey.value
+            value = decodedValue.value
+        } else { continue }
+        let encoded = hex.hex(key)
+        if key.length == 0 || !noNull(key) || (output.has(encoded) && !same(output[encoded], value)) { invalid = true }
+        output[encoded] = value
+    }
+    return Xattrs { attributes: output; invalid: invalid }
+}

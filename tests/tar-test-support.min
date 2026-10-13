@@ -1,0 +1,243 @@
+use "../tools/testing.min" as test
+use "./tar-support.min" as wire
+use "./sha256-support.min" as flags
+use "./text-basics-oracles.min" as hex
+use "system" as system
+use "files" as files
+use "json" as json
+
+public record Provider { flags: List<Text>; libraries: List<Text> }
+public record Context { directory: Text; root: Text; compiler: Text; clang: Text; tools: Text; environment: List<Text>; serial: List<Integer>; providers: Map<Text, Provider> }
+public function context(directory: Text): Context {
+    let location = test.run(["pwd", "-P"], system.environment(), "", directory + "/project", 10)
+    test.require(location, "tar project location")
+    let environment = flags.environment(system.environment(), "ASAN_OPTIONS", "detect_leaks=1:halt_on_error=1")
+    environment = flags.environment(environment, "UBSAN_OPTIONS", "halt_on_error=1")
+    return Context { directory: directory; root: test.lines(location.output)[0]; compiler: test.setting("MINYAR_TEST_COMPILER", "./build/minyarc"); clang: test.setting("MINYAR_TEST_CLANG", "clang"); tools: test.setting("MINYAR_TAR_PROVIDER_TOOLS", "tools"); environment: environment; serial: [0]; providers: Map<Text, Provider>() }
+}
+public function joined(values: List<Text>, separator: Text): Text {
+    let result: List<Text> = []
+    for index in 0..values.length { if index > 0 { result.add(separator) }; result.add(values[index]) }
+    return joinText(result)
+}
+public function quoted(values: List<Text>): Text {
+    let result: List<Text> = []
+    for value in values { result.add("'" + test.replace(value, "'", "'\\''") + "'") }
+    return joined(result, " ")
+}
+public function run(context: Context, command: List<Text>, seconds: Integer): test.Result {
+    context.serial[0] += 1
+    return test.run(command, context.environment, "", context.directory + "/operation-" + Text(context.serial[0]), seconds)
+}
+public function build(context: Context, command: List<Text>, seconds: Integer) {
+    context.serial[0] += 1
+    test.require(test.run(command, system.environment(), "", context.directory + "/build-" + Text(context.serial[0]), seconds), "tar fixture build")
+}
+public function unbounded(context: Context, command: List<Text>, environment: List<Text>): test.Result {
+    context.serial[0] += 1
+    let log = context.directory + "/unbounded-" + Text(context.serial[0])
+    let argv = ["sh", "-c", "log=$1; shift; exec /usr/bin/env -- \"$@\" >\"$log\" 2>\"$log.err\"", "minyar", log]
+    for item in command { argv.add(item) }
+    return test.finish(system.spawn("/bin/sh", argv, environment, ""), log)
+}
+public function provider(context: Context, compileFlags: List<Text>): Provider {
+    let key = quoted(compileFlags)
+    if context.providers.has(key) { return context.providers[key] }
+    context.serial[0] += 1
+    let result = unbounded(context, ["python3", context.tools + "/format_provider.py", "tararchive", "--clang", context.clang, "--flags=" + key], system.environment())
+    test.require(result, "production tar provider query")
+    let value = json.parse(result.output)
+    let cflags = json.member(value, "cflags")
+    let libraries = json.member(value, "libraries")
+    test.check(cflags.kind == json.ARRAY && libraries.kind == json.ARRAY, "invalid tar provider arguments")
+    let compile: List<Text> = []
+    let link: List<Text> = []
+    for item in cflags.items { test.check(item.kind == json.STRING, "invalid tar provider C flag"); compile.add(item.text) }
+    for item in libraries.items { test.check(item.kind == json.STRING, "invalid tar provider library"); link.add(item.text) }
+    let selected = Provider { flags: compile; libraries: link }
+    context.providers[key] = selected
+    return selected
+}
+public function buildProgram(context: Context, source: Text, name: Text, sanitize: Boolean, release: Boolean): Text {
+    test.check(!sanitize || !release, "release and sanitizer builds are separate")
+    let llvm = context.directory + "/" + name + ".ll"
+    build(context, [context.compiler, source, llvm, "--library", "library"], 60)
+    if sanitize { writeTextFile(llvm, test.instrument(readTextFile(llvm))) }
+    let compileFlags = ["-O2"]
+    if sanitize { compileFlags = ["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"] }
+    if release { compileFlags.add("-flto"); compileFlags.add("-fuse-ld=lld") }
+    let runtime = system.getenv("MINYAR_TEST_RUNTIME")
+    if runtime == "" {
+        runtime = context.directory + "/runtime.o"
+        let command = [context.clang]
+        for flag in compileFlags { if !flag.startsWith("-fuse-ld=") { command.add(flag) } }
+        for item in ["-DMINYAR_SYSTEM_HEAP=1", "-c", "runtime/minyar_runtime.c", "-o", runtime] { command.add(item) }
+        build(context, command, 60)
+    } else { test.check(!sanitize, "sanitizer run requires a freshly instrumented runtime") }
+    let command = [context.clang]
+    for flag in compileFlags { command.add(flag) }
+    for item in ["-Wno-override-module", llvm, runtime] { command.add(item) }
+    if test.contains(readTextFile(llvm), "; minyar-native-library: tararchive") {
+        let selected = provider(context, compileFlags)
+        for flag in selected.flags { command.add(flag) }
+        command.add("runtime/native/tararchive.c")
+        for library in selected.libraries { command.add(library) }
+    }
+    let executable = context.directory + "/" + name
+    for item in ["-o", executable, "-lm"] { command.add(item) }
+    build(context, command, 60)
+    return executable
+}
+public function frames(source: Bytes): List<Bytes> {
+    let result: List<Bytes> = []
+    let at = 0
+    while at < source.length {
+        test.check(source.length - at >= 4, "truncated fixture frame length")
+        let length = source.getUInt32(at)
+        at += 4
+        test.check(length <= source.length - at, "truncated fixture archive")
+        result.add(source.slice(at, at + length))
+        at += length
+    }
+    return result
+}
+public function appendFrame(output: Bytes, input: Bytes) { for index in 0..4 { output.add((input.length >> (index * 8)) & 255) }; output.addBytes(input) }
+function octal(target: Bytes, start: Integer, width: Integer, value: Integer) {
+    for index in start..(start + width) { target[index] = 48 }
+    target[start + width - 1] = 0
+    let index = start + width - 2
+    while value > 0 { target[index] = 48 + value % 8; value /= 8; index -= 1 }
+}
+public function repair(input: Bytes): Bytes {
+    let result = input.slice(0, input.length)
+    for index in 148..156 { result[index] = 32 }
+    let total = 0
+    for index in 0..512 { total += result[index] }
+    octal(result, 148, 7, total)
+    result[155] = 32
+    return result
+}
+public function header(name: Text, data: Bytes, type: Integer): Bytes {
+    let output = Bytes(512)
+    let raw = Bytes(name)
+    test.check(raw.length <= 100, "test-only USTAR header name exceeds width")
+    for index in 0..raw.length { output[index] = raw[index] }
+    octal(output, 100, 8, 420); octal(output, 108, 8, 0); octal(output, 116, 8, 0)
+    octal(output, 124, 12, data.length); octal(output, 136, 12, 0); octal(output, 329, 8, 0); octal(output, 337, 8, 0)
+    output[156] = type
+    let magic = Bytes("ustar")
+    for index in 0..magic.length { output[257 + index] = magic[index] }
+    output[263] = 48; output[264] = 48
+    output = repair(output)
+    output.addBytes(data)
+    output.addBytes(Bytes((512 - data.length % 512) % 512))
+    return output
+}
+public function pax(key: Text, value: Bytes): Bytes {
+    let body = Bytes(key)
+    body.add(61); body.addBytes(value); body.add(10)
+    let size = body.length + 2
+    while true {
+        let result = Bytes(Text(size) + " ")
+        result.addBytes(body)
+        if result.length == size { return result }
+        size = result.length
+    }
+}
+public function referenceInput(source: Bytes, scanned: wire.Scan): Bytes {
+    let globals = false
+    let multiple = false
+    let empty = false
+    let extensions: List<List<Bytes>> = []
+    for entry in scanned.entries {
+        let at = entry.start
+        let localCount = 0
+        let gnus: List<Bytes> = []
+        let longLink = Bytes()
+        while at < entry.header {
+            let type = source[at + 156]
+            if type == 120 { localCount += 1 }
+            if type == 103 { globals = true }
+            let parsed = wire.numeric(source.slice(at + 124, at + 136))
+            test.check(parsed.reason == "", "validated extension lost numeric grammar")
+            let next = at + 512 + parsed.value + (512 - parsed.value % 512) % 512
+            if type == 76 || type == 75 { gnus.add(source.slice(at, next)) }
+            if type == 75 { longLink = source.slice(at + 512, at + 512 + parsed.value); while longLink.length > 0 && longLink[longLink.length - 1] == 0 { longLink.resize(longLink.length - 1) } }
+            at = next
+        }
+        if localCount > 1 { multiple = true }
+        let selected = longLink
+        if entry.attributes.has("linkpath") { selected = entry.attributes["linkpath"] }
+        if selected.length > 0 {
+            let base = source.slice(entry.header + 157, entry.header + 257)
+            let nonzero = false
+            for byte in base { if byte != 0 { nonzero = true; break } }
+            if !nonzero { empty = true }
+        }
+        extensions.add(gnus)
+    }
+    if !globals && !multiple && !empty { return source }
+    let output = Bytes()
+    for index in 0..scanned.entries.length {
+        let entry = scanned.entries[index]
+        if globals || multiple {
+            for extension in extensions[index] { output.addBytes(extension) }
+            let extension = Bytes()
+            for key in entry.attributes { extension.addBytes(pax(key, entry.attributes[key])) }
+            if extension.length > 0 { output.addBytes(header("resolved-global", extension, 120)) }
+        } else { output.addBytes(source.slice(entry.start, entry.header)) }
+        let physical = source.slice(entry.header, entry.end)
+        let base = physical.slice(157, 257)
+        let nonzero = false
+        for byte in base { if byte != 0 { nonzero = true; break } }
+        if (physical[156] == 49 || physical[156] == 50) && !nonzero {
+            for offset in 157..257 { physical[offset] = 0 }
+            let fallback = Bytes("fallback")
+            for offset in 0..fallback.length { physical[157 + offset] = fallback[offset] }
+            physical = repair(physical)
+        }
+        output.addBytes(physical)
+    }
+    output.addBytes(Bytes(1024))
+    return output
+}
+public function rows(scanned: wire.Scan): List<Text> { let output: List<Text> = []; for entry in scanned.entries { output.add(wire.row(entry)) }; return output }
+public function sameRows(left: List<Text>, right: List<Text>): Boolean { if left.length != right.length { return false }; for index in 0..left.length { if left[index] != right[index] { return false } }; return true }
+public function review(context: Context, sanitize: Boolean) {
+    let executable = buildProgram(context, "tests/tar-review.min", "review-contract", sanitize, false)
+    let sources = frames(readBytesFile("tests/fixtures/tar/review.bin"))
+    let specifications = test.lines(readTextFile("tests/fixtures/tar/review-index.tsv"))
+    test.check(sources.length == 20 && specifications.length == sources.length, "tar completed-review fixture count changed")
+    for index in 0..sources.length {
+        let spec = specifications[index].split("\t")
+        test.check(spec.length == 4, "invalid tar review fixture row")
+        let path = context.directory + "/review-" + spec[0] + ".tar"
+        writeBytesFile(path, sources[index])
+        let prefix = context.directory + "/review-" + spec[0] + "-out-"
+        let command = [executable, spec[1], path, prefix]
+        let scanned = wire.strictScan(sources[index])
+        if spec[1] == "bound" {
+            let accept = spec[3] == "1"
+            scanned = wire.scan(sources[index], Integer(spec[2]), 64, 1000000, 4096)
+            test.check((scanned.reason == "") == accept, "independent final tar review bound changed: " + spec[0])
+            let count = 1
+            if accept { count = 2 }
+            test.check(scanned.entries.length == count, "independent complete tar review spans changed")
+            let disposition = "reject"
+            if accept { disposition = "accept" }
+            command = [executable, "bound", path, spec[2], disposition]
+        }
+        let result = run(context, command, 30)
+        test.check(result.status == 0 && result.errorOutput == "", "tar public API regression: " + spec[0] + "\n" + result.output + result.errorOutput)
+        if spec[1] == "bound" && spec[3] == "1" {
+            let actual = Map<Text, Bytes>()
+            for line in test.lines(result.output) { let fields = line.split("|"); if fields.length == 3 && fields[0] == "ATTR" { actual[Text(hex.fromHex(fields[1]))] = hex.fromHex(fields[2]) } }
+            test.check(wire.sameAttributes(actual, scanned.entries[scanned.entries.length - 1].attributes), "tar review effective attribute map changed")
+        } else if spec[1] == "path" || spec[1] == "hardlink" {
+            test.check(scanned.reason == "", "tar review source is invalid")
+            for rewrite in 0..2 { let output = wire.strictScan(readBytesFile(prefix + Text(rewrite) + ".tar")); test.check(output.reason == "" && sameRows(rows(output), rows(scanned)), "tar review writer metadata roundtrip changed") }
+        }
+        print("tar review " + spec[0] + ": PASS")
+    }
+    for mode in ["finish", "owned"] { let result = run(context, [executable, mode], 30); test.check(result.status == 0 && result.errorOutput == "", "tar review finish regression\n" + result.output + result.errorOutput); print("tar review " + mode + ": PASS") }
+}

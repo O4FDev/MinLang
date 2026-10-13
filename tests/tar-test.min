@@ -1,0 +1,292 @@
+use "../tools/testing.min" as test
+use "./tar-support.min" as wire
+use "./tar-test-support.min" as support
+use "./cpython-random.min" as random
+use "./sha256-support.min" as environment
+use "./sha256test.min" as oracle
+use "./text-basics-oracles.min" as hex
+use "machine" as machine
+use "system" as system
+
+record Case { name: Text; source: Bytes; expected: List<Text>; valid: Boolean; scanned: wire.Scan }
+record Span { start: Integer; header: Integer; payload: Integer; end: Integer }
+record Capture { rows: List<Text>; spans: List<Span>; status: Text; attributes: Map<Text, Map<Text, Bytes>>; xattrs: Map<Text, Map<Text, Bytes>>; xattrErrors: Map<Text, Boolean>; lastPath: Text }
+function blank(): Capture { return Capture { rows: []; spans: []; status: ""; attributes: Map<Text, Map<Text, Bytes>>(); xattrs: Map<Text, Map<Text, Bytes>>(); xattrErrors: Map<Text, Boolean>(); lastPath: "" } }
+function captures(count: Integer): List<Capture> { let result: List<Capture> = []; for index in 0..count { result.add(blank()) }; return result }
+function parse(output: Text, count: Integer): List<Capture> {
+    let result = captures(count)
+    for line in test.lines(output) {
+        let fields = line.split("|")
+        test.check(fields.length >= 2, "invalid tar protocol row")
+        let index = Integer(fields[0])
+        test.check(index >= 0 && index < count, "tar protocol case index outside corpus")
+        let captured = result[index]
+        let kind = fields[1]
+        if kind == "ENTRY" {
+            test.check(fields.length == 16, "tar metadata protocol width changed")
+            captured.rows.add(support.joined(fields.slice(2, fields.length), "|"))
+            captured.lastPath = fields[2]
+        } else if kind == "SPAN" {
+            test.check(fields.length == 7, "tar span protocol width changed")
+            captured.spans.add(Span { start: Integer(fields[3]); header: Integer(fields[4]); payload: Integer(fields[5]); end: Integer(fields[6]) })
+            captured.attributes[fields[2]] = Map<Text, Bytes>()
+        } else if kind == "ATTR" || kind == "XATTR" {
+            test.check(fields.length == 5, "tar attribute protocol width changed")
+            let attributes = captured.attributes
+            if kind == "XATTR" { attributes = captured.xattrs }
+            if !attributes.has(fields[2]) { attributes[fields[2]] = Map<Text, Bytes>() }
+            attributes[fields[2]][fields[3]] = hex.fromHex(fields[4])
+        } else if kind == "XATTRERROR" { captured.xattrErrors[captured.lastPath] = true }
+        else { captured.status = kind }
+    }
+    return result
+}
+function digest(source: Bytes): Text { return hex.hex(oracle.oracle(machine.address(source), source.length)) }
+function attrs(source: Map<Text, Bytes>): Map<Text, Bytes> { let result = Map<Text, Bytes>(); for key in source { result[hex.hex(Bytes(key))] = source[key] }; return result }
+function mapAt(source: Map<Text, Map<Text, Bytes>>, key: Text): Map<Text, Bytes> { if source.has(key) { return source[key] }; return Map<Text, Bytes>() }
+function errorAt(source: Map<Text, Boolean>, key: Text): Boolean { return source.has(key) && source[key] }
+function pythonXattrs(count: Integer): List<Capture> {
+    let result = captures(count)
+    for line in test.lines(readTextFile("tests/fixtures/tar/xattr-model.tsv")) {
+        let fields = line.split("|")
+        test.check(fields.length >= 4, "invalid exact xattr model row")
+        let index = Integer(fields[0])
+        if index >= count { continue }
+        test.check(index >= 0, "negative exact xattr model case index")
+        if fields[2] == "STATUS" { result[index].xattrErrors[fields[1]] = fields[3] == "1" }
+        else {
+            test.check(fields.length == 5 && fields[2] == "XATTR", "invalid exact xattr model mapping")
+            if !result[index].xattrs.has(fields[1]) { result[index].xattrs[fields[1]] = Map<Text, Bytes>() }
+            result[index].xattrs[fields[1]][fields[3]] = hex.fromHex(fields[4])
+        }
+    }
+    return result
+}
+function checkCases(cases: List<Case>, actual: List<Capture>) {
+    let python = pythonXattrs(cases.length)
+    for index in 0..cases.length {
+        let value = cases[index]
+        let captured = actual[index]
+        let scanned = value.scanned
+        test.check(captured.status == "END" || captured.status == "ERROR", value.name + ": missing terminal state")
+        test.check(captured.spans.length == scanned.entries.length, value.name + ": physical span count changed")
+        for memberIndex in 0..scanned.entries.length {
+            let observed = captured.spans[memberIndex]
+            let member = scanned.entries[memberIndex]
+            test.check(observed.start == member.start && observed.header == member.header && observed.payload == member.payloadOffset && observed.end == member.end, value.name + ": physical span changed")
+        }
+        let common = captured.rows.length
+        if common > scanned.entries.length { common = scanned.entries.length }
+        for memberIndex in 0..common {
+            let fields = captured.rows[memberIndex].split("|")
+            let path = fields[0]
+            let member = scanned.entries[memberIndex]
+            test.check(wire.sameAttributes(mapAt(captured.attributes, path), attrs(member.attributes)), value.name + ": effective raw PAX attributes changed")
+            let normalized = wire.xattrs(member.attributes)
+            test.check(errorAt(captured.xattrErrors, path) == normalized.invalid, value.name + ": native xattr encoding status changed")
+            test.check(errorAt(python[index].xattrErrors, path) == normalized.invalid, value.name + ": xattr oracle differs from exact independent Python model")
+            if !normalized.invalid {
+                test.check(wire.sameAttributes(mapAt(captured.xattrs, path), normalized.attributes), value.name + ": binary xattrs changed")
+                test.check(wire.sameAttributes(mapAt(python[index].xattrs, path), normalized.attributes), value.name + ": xattr normalization differs from exact independent Python model")
+            }
+        }
+        if !value.valid { test.check(captured.status == "ERROR" && scanned.reason != "", value.name + ": malformed archive accepted without explicit wire reason") }
+        else { test.check(captured.status == "END", value.name + ": valid archive rejected") }
+        test.check(support.sameRows(captured.rows, value.expected), value.name + ": metadata/payload or entries before error differ from independent model")
+    }
+}
+function compareReference(actual: List<Text>, reference: List<Text>, scanned: wire.Scan, name: Text, version: Integer) {
+    let corrected = reference.slice(0, reference.length)
+    let common = actual.length
+    if common > corrected.length { common = corrected.length }
+    for index in 0..common {
+        if index >= scanned.entries.length { continue }
+        let entry = scanned.entries[index]
+        if !entry.attributes.has("mtime") { continue }
+        let stamp = entry.attributes["mtime"]
+        if stamp.length == 0 || stamp[0] != 45 || entry.time.nanos == 0 { continue }
+        let fractional = false
+        for byte in stamp { if byte == 46 { fractional = true } }
+        if !fractional { continue }
+        let fields = corrected[index].split("|")
+        test.check(fields.length == 14, "libarchive metadata protocol width changed")
+        let seconds = Text(entry.time.seconds)
+        let nanos = Text(entry.time.nanos)
+        if fields[5] != seconds || fields[6] != nanos {
+            test.check(version == 3007002, name + ": unqualified C timestamp exception")
+            test.check(fields[5] == Text(entry.time.seconds + 1) && fields[6] == Text(1000000000 - entry.time.nanos), name + ": unexpected C fractional timestamp")
+            fields[5] = seconds; fields[6] = nanos
+            corrected[index] = support.joined(fields, "|")
+        }
+    }
+    test.check(support.sameRows(actual, corrected.slice(0, common)), name + ": libarchive metadata/payload disagreed")
+}
+function assertRows(source: Bytes, expected: List<Text>, name: Text): wire.Scan {
+    let parsed = wire.strictScan(source)
+    test.check(parsed.reason == "" && support.sameRows(support.rows(parsed), expected), name + ": independent writer metadata changed")
+    return parsed
+}
+function retained(written: wire.Scan, input: wire.Scan) {
+    let count = written.entries.length
+    if count > input.entries.length { count = input.entries.length }
+    for index in 0..count {
+        for key in input.entries[index].attributes {
+            if key.startsWith("SCHILY.xattr.") || key.startsWith("LIBARCHIVE.xattr.") || key.startsWith("VENDOR.") {
+                test.check(written.entries[index].attributes.has(key) && wire.same(written.entries[index].attributes[key], input.entries[index].attributes[key]), "writer raw attribute preservation changed")
+            }
+        }
+    }
+}
+
+let quick = false
+let sanitize = false
+let referenceBinary = ""
+let optionIndex = 0
+while optionIndex < argumentCount() {
+    let option = argument(optionIndex)
+    if option == "--quick" { quick = true }
+    else if option == "--sanitize" { sanitize = true }
+    else if option == "--libarchive" { test.check(optionIndex + 1 < argumentCount(), "missing tar libarchive oracle path"); optionIndex += 1; referenceBinary = argument(optionIndex) }
+    else { fail("unknown tar option: " + option) }
+    optionIndex += 1
+}
+let work = test.scratch()
+let context = support.context(work)
+let fixed = support.frames(readBytesFile("tests/fixtures/tar/fixed.bin"))
+let fixedIndex = test.lines(readTextFile("tests/fixtures/tar/fixed-index.tsv"))
+let model = test.lines(readTextFile("tests/fixtures/tar/case-model.tsv"))
+test.check(fixed.length == 73 && fixedIndex.length == fixed.length && model.length == 2073, "exact tar corpus counts changed")
+let mutationCount = 2000
+if quick { mutationCount = 64 }
+let count = fixed.length + mutationCount
+let expectations: List<List<Text>> = []
+for index in 0..count { expectations.add([]) }
+for line in test.lines(readTextFile("tests/fixtures/tar/metadata.tsv")) {
+    let fields = line.split("|")
+    test.check(fields.length == 16 && fields[1] == "ENTRY", "invalid exact tar metadata row")
+    let index = Integer(fields[0])
+    if index < count { test.check(index >= 0, "negative tar metadata model index"); expectations[index].add(support.joined(fields.slice(2, fields.length), "|")) }
+}
+let sources = fixed.slice(0, fixed.length)
+let seeds: List<Bytes> = []
+let byName = Map<Text, Bytes>()
+for index in 0..fixed.length {
+    let spec = fixedIndex[index].split("\t")
+    test.check(spec.length == 2, "invalid exact tar fixture index")
+    byName[spec[0]] = fixed[index]
+    if spec[1] == "1" { seeds.add(fixed[index]) }
+}
+test.check(seeds.length == 28, "tar mutation seed count changed")
+let rng = random.seeded(Text(0x544152))
+for index in 0..mutationCount {
+    let seed = seeds[random.below(rng, seeds.length)]
+    let source = seed.slice(0, seed.length)
+    if index % 3 == 0 { source = source.slice(0, random.below(rng, source.length)) }
+    else {
+        let changes = random.below(rng, 4) + 1
+        for unused in 0..changes { let at = random.below(rng, source.length); source[at] = source[at] ^ (1 << random.below(rng, 8)) }
+    }
+    sources.add(source)
+}
+let cases: List<Case> = []
+let framed = Bytes()
+let referenceFrames = Bytes()
+for index in 0..count {
+    let expected = model[index].split("\t")
+    test.check(expected.length == 4, "invalid exact tar case model")
+    test.check(digest(sources[index]) == expected[2], "native tar corpus changed at " + expected[0])
+    test.check(expectations[index].length == Integer(expected[3]), "exact tar metadata case count changed")
+    let scanned = wire.strictScan(sources[index])
+    let valid = expected[1] == "1"
+    test.check((scanned.reason == "") == valid, expected[0] + ": independent structural policy differs from original classification: " + scanned.reason)
+    cases.add(Case { name: expected[0]; source: sources[index]; expected: expectations[index]; valid: valid; scanned: scanned })
+    support.appendFrame(framed, sources[index])
+    support.appendFrame(referenceFrames, support.referenceInput(sources[index], scanned))
+}
+let framing = work + "/corpus.bin"
+writeBytesFile(framing, framed)
+let fixture = work + "/writer-input.tar"
+let writerInput = readBytesFile("tests/fixtures/tar/writer-input.tar")
+writeBytesFile(fixture, writerInput)
+let writerExpected = test.lines(readTextFile("tests/fixtures/tar/writer-metadata.tsv"))
+let inputScan = assertRows(writerInput, writerExpected, "writer input")
+let written = work + "/written.tar"
+let executable = support.buildProgram(context, "tests/tar.min", "tar", sanitize, false)
+let result = support.run(context, [executable, framing, fixture, written], 30)
+test.check(result.status == 0 && result.errorOutput == "", "tar corpus execution failed\n" + result.output + result.errorOutput)
+if !sanitize {
+    let publicExecutable = work + "/public-tar"
+    let runtime = test.setting("MINYAR_TEST_RUNTIME", work + "/runtime.o")
+    let linkEnvironment = environment.environment(context.environment, "MINYAR_CLANG", context.clang)
+    linkEnvironment = environment.environment(linkEnvironment, "MINYAR_CLANG_FLAGS", "-O2 -Wno-override-module")
+    linkEnvironment = environment.environment(linkEnvironment, "MINYAR_NATIVE_FLAGS", "-O2")
+    let linked = test.run(["python3", context.tools + "/clang-driver.py", "link", context.root, work + "/tar.ll", runtime, publicExecutable, "1"], linkEnvironment, "", work + "/public-link", 60)
+    test.require(linked, "shared public tar linker")
+    let publicWritten = work + "/public-written.tar"
+    linked = support.run(context, [publicExecutable, framing, fixture, publicWritten], 30)
+    test.check(linked.status == 0 && linked.output == result.output && linked.errorOutput == "", "public tar link differs from custom link")
+    test.check(wire.same(readBytesFile(publicWritten), readBytesFile(written)), "public/custom tar writer equality changed")
+}
+let actual = parse(result.output, count)
+checkCases(cases, actual)
+let writtenBytes = readBytesFile(written)
+let writtenScan = assertRows(writtenBytes, writerExpected, "writer roundtrip")
+retained(writtenScan, inputScan)
+test.check(writtenBytes.length >= 1024 && wire.same(writtenBytes.slice(writtenBytes.length - 1024, writtenBytes.length), Bytes(1024)), "writer canonical footer changed")
+let second = work + "/second.tar"
+test.require(support.run(context, [executable, framing, fixture, second], 30), "second tar writer execution")
+test.check(wire.same(readBytesFile(second), writtenBytes), "tar writer determinism changed")
+if referenceBinary == "" {
+    referenceBinary = work + "/libarchive"
+    let compileFlags = ["-O2"]
+    if sanitize { compileFlags = ["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"] }
+    let provider = support.provider(context, compileFlags)
+    let command = [context.clang]
+    for flag in compileFlags { command.add(flag) }
+    for flag in provider.flags { command.add(flag) }
+    command.add("benchmarks/tar/libarchive.c")
+    for library in provider.libraries { command.add(library) }
+    for item in ["-o", referenceBinary, "-lm"] { command.add(item) }
+    support.build(context, command, 60)
+}
+let versionResult = support.unbounded(context, [referenceBinary, "version"], system.environment())
+test.require(versionResult, "libarchive version")
+let version = Integer(test.lines(versionResult.output)[0])
+let refFraming = work + "/reference-corpus.bin"
+writeBytesFile(refFraming, referenceFrames)
+let referenceResult = support.run(context, [referenceBinary, "corpus", refFraming], 30)
+test.require(referenceResult, "libarchive independent corpus")
+let reference = parse(referenceResult.output, count)
+for index in 0..count {
+    compareReference(actual[index].rows, reference[index].rows, cases[index].scanned, cases[index].name, version)
+    if cases[index].valid { test.check(reference[index].rows.length == actual[index].rows.length, cases[index].name + ": libarchive entry count changed") }
+    for row in actual[index].rows { let path = row.split("|")[0]; if !errorAt(actual[index].xattrErrors, path) { test.check(wire.sameAttributes(mapAt(actual[index].xattrs, path), mapAt(reference[index].xattrs, path)), cases[index].name + ": libarchive binary xattrs differ") } }
+}
+let verification = support.run(context, [referenceBinary, "verify", written], 10)
+test.require(verification, "libarchive writer verification")
+compareReference(writerExpected, parse(verification.output, 1)[0].rows, writtenScan, "writer", version)
+let contract = support.buildProgram(context, "tests/tar-contract.min", "contract", sanitize, false)
+let plain = work + "/plain.tar"
+let plainBytes = support.header("plain", Bytes("abc"), 48)
+plainBytes.addBytes(Bytes(1024))
+writeBytesFile(plain, plainBytes)
+let combined = work + "/combined.tar"
+writeBytesFile(combined, byName["gnu-pax-combined"])
+let metadata = work + "/metadata.tar"
+writeBytesFile(metadata, byName["binary-attributes"])
+let limit = wire.numeric(byName["binary-attributes"].slice(124, 136))
+test.check(limit.reason == "", "tar metadata fixture limit invalid")
+let edited = work + "/edited.tar"
+test.require(support.run(context, [contract, plain, combined, metadata, Text(limit.value), edited], 30), "tar streaming/ownership/bound contracts")
+let editedScan = wire.strictScan(readBytesFile(edited))
+test.check(editedScan.reason == "" && editedScan.entries.length == 1, "edited tar writer member count changed")
+let editedEntry = editedScan.entries[0]
+test.check(hex.hex(editedEntry.path) == "656469746564" && editedEntry.uid == -7 && editedEntry.gid == 9223372036854775807 && editedEntry.time.seconds == -2 && editedEntry.time.nanos == 750000000, "edited tar field precedence changed")
+test.check(editedEntry.size == Bytes("contents").length && wire.same(editedEntry.payload, Bytes("contents")), "edited tar payload size changed")
+retained(editedScan, wire.strictScan(byName["binary-attributes"]))
+verification = support.run(context, [referenceBinary, "verify", edited], 10)
+test.require(verification, "libarchive edited writer verification")
+compareReference(support.rows(editedScan), parse(verification.output, 1)[0].rows, editedScan, "edited writer", version)
+support.review(context, sanitize)
+print("tar: " + Text(count) + " fixture/malformed/differential cases; metadata, spans, binary xattrs, independent model/libarchive writer interop, limits and determinism passed; provider " + Text(version))
+test.removeTree(work)
