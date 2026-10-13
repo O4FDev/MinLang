@@ -131,7 +131,7 @@ MINYAR_LLVM_BIN=/opt/homebrew/opt/llvm/bin make check-codegen
 /usr/bin/time -l build/craft --benchmark idle     # also: build, walk, edit
 
 # JSON: Atacama's history response
-python3 benchmarks/json/history.py 5000 > build/history.json
+./minyar --release benchmarks/json/history.min -o build/history && build/history 5000 > build/history.json
 ./minyar --release benchmarks/json/history-parse.min -o build/history-parse
 /usr/bin/time -l build/history-parse build/history.json 2
 

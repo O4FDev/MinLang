@@ -1,0 +1,118 @@
+use "../tools/testing.min" as test
+use "system" as system
+
+record Case { name: Text; source: Text; arguments: List<Text> }
+function starts(value: Text, prefix: Text): Boolean {
+    let raw = Bytes(value)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+function fixed(value: Float, places: Integer): Text {
+    let scale = 1
+    for unused in 0..places { scale *= 10 }
+    let scaled = Integer(value * Float(scale) + 0.5)
+    let fraction = Text(scaled % scale)
+    while fraction.byteLength < places { fraction = "0" + fraction }
+    return Text(scaled / scale) + "." + fraction
+}
+function median(samples: List<Float>): Float {
+    let values = samples.sorted()
+    let middle = values.length / 2
+    if values.length % 2 == 1 { return values[middle] }
+    return (values[middle - 1] + values[middle]) / 2.0
+}
+let cases = [
+    Case { name: "cleanup"; source: "tests/cleanup-cost.min"; arguments: [] },
+    Case { name: "runtime"; source: "tests/performance/runtime.min"; arguments: ["4"] },
+    Case { name: "json"; source: "benchmarks/json/history-parse.min"; arguments: ["build/cleanup-bench/history.json", "20"] },
+    Case { name: "text"; source: "benchmarks/text-basics.min"; arguments: [] },
+    Case { name: "maps"; source: "tests/cleanup-maps.min"; arguments: [] }
+]
+let mode = ""
+let output = "build/cleanup-bench"
+let small = false
+let repeats = 9
+let compare: List<Text> = []
+let index = 0
+while index < argumentCount() {
+    let option = argument(index)
+    if option == "--small" { small = true }
+    else if option == "--output" || option == "--repeats" {
+        test.check(index + 1 < argumentCount(), "missing value for " + option)
+        index += 1
+        if option == "--output" { output = argument(index) } else { repeats = Integer(argument(index)) }
+    } else if option == "--compare" {
+        while index + 1 < argumentCount() && !starts(argument(index + 1), "--") {
+            index += 1
+            compare.add(argument(index))
+        }
+        test.check(compare.length > 0, "--compare needs at least one build directory")
+    } else {
+        test.check(mode == "" && (option == "build" || option == "run"), "usage: cleanup-bench build|run [--output DIR] [--small] [--repeats N] [--compare DIR...]")
+        mode = option
+    }
+    index += 1
+}
+test.check(mode != "", "usage: cleanup-bench build|run [--output DIR] [--small] [--repeats N] [--compare DIR...]")
+let logs = test.scratch()
+if mode == "build" {
+    test.require(test.run(["mkdir", "-p", "--", output], system.environment(), "", logs + "/mkdir", 30), "create benchmark output directory")
+    let environment = system.environment()
+    if small {
+        let selected: List<Text> = []
+        for entry in environment { if !starts(entry, "MINYAR_RUNTIME_FLAGS=") { selected.add(entry) } }
+        selected.add("MINYAR_RUNTIME_FLAGS=-O2 -Wno-override-module -DMINYAR_SYSTEM_SMALL_HEAP=1")
+        environment = selected
+    }
+    test.require(test.run(["./minyar", "--release", "benchmarks/json/history.min", "-o", output + "/history-generator"], system.environment(), "", logs + "/history-build", 600), "build history generator")
+    let history = test.run([output + "/history-generator", "500"], system.environment(), "", logs + "/history", 60)
+    test.require(history, "generate history response")
+    writeTextFile(output + "/history.json", history.output)
+    for item in cases {
+        test.require(test.run(["./minyar", "--release", item.source, "-o", output + "/" + item.name], environment, "", logs + "/build-" + item.name, 600), "build " + item.name)
+    }
+} else {
+    test.check(compare.length >= 2, "run mode needs --compare with at least two build directories")
+    let results: List<List<List<Float>>> = []
+    for item in cases {
+        let perBuild: List<List<Float>> = []
+        for unused in compare { perBuild.add([]) }
+        results.add(perBuild)
+    }
+    for repeat in 0..(repeats + 1) {
+        for caseIndex in 0..cases.length {
+            let item = cases[caseIndex]
+            let outputs: List<Text> = []
+            let order: List<Integer> = []
+            for position in 0..compare.length {
+                if repeat % 2 == 0 { order.add(position) } else { order.add(compare.length - 1 - position) }
+            }
+            for position in order {
+                let command = ["taskset", "-c", "2", compare[position] + "/" + item.name]
+                for value in item.arguments { command.add(value) }
+                let started = system.monotonicNanoseconds()
+                let result = test.run(command, system.environment(), "", logs + "/run", 3600)
+                let elapsed = Float(system.monotonicNanoseconds() - started) / 1000000000.0
+                test.require(result, item.name + " in " + compare[position])
+                if repeat > 0 { results[caseIndex][position].add(elapsed) }
+                outputs.add(result.output)
+            }
+            for value in outputs {
+                if item.name == "cleanup" { test.check(test.contains(value, "(12000000)"), "cleanup benchmark output changed\n" + value) }
+                else { test.check(value == outputs[0], item.name + " outputs differ between builds") }
+            }
+        }
+    }
+    for caseIndex in 0..cases.length {
+        print(cases[caseIndex].name)
+        let medians: List<Float> = []
+        for samples in results[caseIndex] { medians.add(median(samples)) }
+        for position in 0..compare.length {
+            let ordered = results[caseIndex][position].sorted()
+            print("  " + compare[position] + ": median=" + fixed(medians[position], 6) + "s range=" + fixed(ordered[0], 6) + ".." + fixed(ordered[ordered.length - 1], 6) + "s speedup=" + fixed(medians[0] / medians[position], 3) + "x")
+        }
+    }
+}
+test.removeTree(logs)
