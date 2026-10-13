@@ -98,18 +98,16 @@ def validate(data, makefile=None):
     }
     manual_research = {'tests/peer-research-swift-statements.py', 'tests/peer-breadth-semantics.py'}
     dedicated = {
-        'tests/peer-live.py': 'check-peer-live',
-        'tests/peer-live-redis.py': 'check-peer-live-redis',
+        'tests/peer-live-test.min': 'check-peer-live',
+        'tests/peer-live-redis-test.min': 'check-peer-live-redis',
     }
-    catalogue = {row['path']: row for row in json.loads(
-        (ROOT / 'tests/suite-catalogue.json').read_text())['sources']}
     for source, target in dedicated.items():
-        row = catalogue.get(source, {})
-        if row.get('role') != 'suite' or 'build-support/peer-live.mk' not in row.get('consumers', []):
-            raise ValueError('Dedicated peer suite lost its catalogue consumer: ' + source)
+        if not (ROOT / source).is_file():
+            raise ValueError('Dedicated peer suite source is missing: ' + source)
+        tool = 'build/tooling/' + source.removesuffix('.min')
         for gate in (target, target + '-sanitize'):
             recipe = re.search(r'^' + re.escape(gate) + r':[^\n]*\n((?:[\t ].*\n|\n)*)', makefile, re.M)
-            if not recipe or source not in recipe[1]:
+            if not recipe or tool not in recipe[1]:
                 raise ValueError('Dedicated peer suite lost its build gate: ' + gate)
             if gate.endswith('-sanitize') and 'MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined' not in recipe[1]:
                 raise ValueError('Dedicated peer suite lost sanitizer instrumentation: ' + gate)
