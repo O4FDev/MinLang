@@ -1,6 +1,6 @@
 .PHONY: check-calldepth check-calldepth-sanitize check-calldepth-profiles check-calldepth-launcher check-calldepth-reporting check-calldepth-reporting-sanitize check-calldepth-hooks check-calldepth-hooks-sanitize
 build/tooling/tests/calldepth: TOOL_NATIVE = tests/sha256-test-native.c
-build/tooling/tests/calldepth: TOOL_LIBS = -lcrypto
+build/tooling/tests/calldepth: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/calldepth: tests/sha256-test-native.c
 check-calldepth: build/minyarc-calldepth build/calldepth-compiler-stage3.ll build/minyar-runtime.o build/tooling/tests/calldepth
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compiler-behavior.py --profile calldepth --ir build/calldepth-compiler-stage3.ll

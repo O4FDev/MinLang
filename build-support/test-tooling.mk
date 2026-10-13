@@ -1,6 +1,7 @@
 MINYAR_TOOL_SOURCES = $(wildcard tools/*.min) library/system.min library/files.min
 MINYAR_TOOL_NATIVE = runtime/native/system.c runtime/native/files.c
 TOOL_RUNTIME = build/minyar-runtime.o
+TOOL_CRYPTO := $(shell pkg-config --cflags --libs libcrypto 2>/dev/null || echo -lcrypto)
 
 build/tooling/%.ll: %.min $(MINYAR_TOOL_SOURCES) build/minyarc-modules
 	mkdir -p $(@D)
@@ -12,6 +13,10 @@ build/tooling/%: build/tooling/%.ll build/minyar-runtime.o $(MINYAR_TOOL_NATIVE)
 .PRECIOUS: build/tooling/%.ll
 
 build/tooling/scripts/check-linux: build/tooling/tools/test-clang build/tooling/tools/clang-cache build/tooling/tools/rust-cache
+
+build/tooling/tools/build-test-runtime: TOOL_RUNTIME = build/minyar-runtime.o
+build/tooling/tools/build-test-runtime: TOOL_NATIVE =
+build/tooling/tools/build-test-runtime: TOOL_LIBS =
 
 build/testing/cycle-runtime.c: runtime/minyar_runtime.c build/tooling/tools/build-test-runtime
 	mkdir -p $(@D)

@@ -81,7 +81,7 @@ check-modules: build/minyarc build/minyar-runtime.o
 
 .PHONY: check-json-parser check-json-parser-sanitize
 build/tooling/tests/json-parser-test: TOOL_NATIVE = runtime/native/sha256.c
-build/tooling/tests/json-parser-test: TOOL_LIBS = -lcrypto
+build/tooling/tests/json-parser-test: TOOL_LIBS = $(TOOL_CRYPTO)
 check-json-parser: build/minyarc build/tooling/tests/json-parser-test
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/json-parser-test
 
@@ -337,7 +337,7 @@ check-memory-profiles: build/minyar-runtime-system.o check-unary-pairs check-tex
 	$(SANITIZER_LIMITED) ./build/tooling/tests/lazy-configurations --clang "$(LLVM_CC)"
 
 build/tooling/tests/production-memory: TOOL_NATIVE = tests/sha256-test-native.c
-build/tooling/tests/production-memory: TOOL_LIBS = -lcrypto
+build/tooling/tests/production-memory: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/production-memory: tests/sha256-test-native.c
 check-recursive-data: build/minyarc build/minyarc-sanitize build/minyar-runtime.o build/ownership-runtime.o build/tooling/tests/recursive-data build/tooling/experiments/memory/production-contract-model build/tooling/tests/recursive-mutation build/tooling/tests/production-memory
 	$(LIMITED) ./build/tooling/tests/recursive-data
@@ -595,7 +595,7 @@ check-sanitize: check-symbol-order-sanitize
 PEER_SEMANTIC_SUITES = peer-memory-nim-koka-lean peer-memory-nim-koka-followups
 PEER_SEMANTIC_TOOLS = build/tooling/tests/peer-research-semantics build/tooling/tests/peer-research-reachability build/tooling/tests/memory-research-peer-projections
 $(PEER_SEMANTIC_TOOLS): TOOL_NATIVE = tests/sha256-test-native.c
-$(PEER_SEMANTIC_TOOLS): TOOL_LIBS = -lcrypto
+$(PEER_SEMANTIC_TOOLS): TOOL_LIBS = $(TOOL_CRYPTO)
 $(PEER_SEMANTIC_TOOLS): tests/sha256-test-native.c
 
 check-peer-semantics: build/minyarc build/minyar-runtime.o $(PEER_SEMANTIC_TOOLS)

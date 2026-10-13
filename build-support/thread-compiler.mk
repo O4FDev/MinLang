@@ -23,7 +23,7 @@ check-thread-generated-recovery-tsan: build/minyarc-threads build/minyar-default
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/thread-generated-recovery.py --sanitizer thread
 
 build/tooling/tests/concurrency-scaling-test build/tooling/tools/concurrency-scaling: TOOL_NATIVE = runtime/native/sha256.c tests/performance-resources.c
-build/tooling/tests/concurrency-scaling-test build/tooling/tools/concurrency-scaling: TOOL_LIBS = -lcrypto
+build/tooling/tests/concurrency-scaling-test build/tooling/tools/concurrency-scaling: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/concurrency-scaling-test build/tooling/tools/concurrency-scaling: TOOL_RUNTIME = build/testing/cycle-runtime.o
 build/tooling/tests/concurrency-scaling-test build/tooling/tools/concurrency-scaling: tests/performance-resources.c build/testing/cycle-runtime.o
 check-thread-scaling-protocol: build/tooling/tests/concurrency-scaling-test build/tooling/tools/concurrency-scaling
