@@ -24,6 +24,7 @@ BOOTSTRAP_SEED = 424242
 BOOTSTRAPS = 20000
 ROOT = Path(__file__).resolve().parents[1]
 WORKLOAD = ROOT / "benchmarks/concurrency/frozen-lcg.min"
+WORKLOAD_SHA256 = "6b6f61b85c92b491375172b57781b282dec16f59351e8b85ca8216ab834a97f3"
 
 
 def digest(path: Path) -> str:
@@ -97,6 +98,8 @@ def register(arguments: argparse.Namespace) -> None:
     if sys.platform != "linux":
         raise RuntimeError("qualification requires the admitted Linux Boat host")
     cpus = sorted(os.sched_getaffinity(0))
+    if digest(WORKLOAD) != WORKLOAD_SHA256:
+        raise RuntimeError("original frozen workload changed")
     if len(cpus) != 8:
         raise RuntimeError(f"exactly eight available CPUs required, found {cpus}")
     executable = arguments.executable.resolve(strict=True)
@@ -166,13 +169,36 @@ def run(arguments: argparse.Namespace) -> None:
             raise RuntimeError('CPU quota/cgroup configuration changed since registration')
     if protocol["paired_order"] != schedule(ROUNDS, ORDER_SEED):
         raise RuntimeError("paired order or sample count changed")
+    if protocol["warmup_order"] != schedule(WARMUPS, ORDER_SEED + 1):
+        raise RuntimeError("warmup order changed")
+    if protocol["workload_sha256"] != WORKLOAD_SHA256:
+        raise RuntimeError("original frozen workload changed")
+    if protocol['gates'] != {'median_eight_min': 7.2, 'lower_95_eight_min': 6.4}:
+        raise RuntimeError('original scaling gates changed')
+    item = getattr(arguments, 'item', None)
+    rounds = [(phase, index, order)
+              for phase, orders in (("warmup", protocol["warmup_order"]),
+                                    ("paired", protocol["paired_order"]))
+              for index, order in enumerate(orders)]
+    resumed = item is not None and item > 0
+    if resumed:
+        result = json.loads(arguments.results.read_text())
+        if result["protocol_sha256"] != seal or "failure" in result or result["qualified"]:
+            raise RuntimeError("cannot resume a different, failed or completed campaign")
+        expected = [(phase, index, width) for phase, index, order in rounds[:item] for width in order]
+        actual = [(s['phase'], s['round'], s['threads']) for s in result['samples']]
+        if actual != expected or len(result['preflights']) != item:
+            raise RuntimeError("items must run exactly once in the original order")
+    else:
+        result = {"protocol_sha256": seal, "started_unix_ns": time.time_ns(),
+                  "samples": [], "preflights": [], "qualified": False}
     before = cpu_ticks()
     time.sleep(5)
     activity = cpu_activity(before, cpu_ticks(), protocol["affinity"])
-    result = {"protocol_sha256": seal, "started_unix_ns": time.time_ns(),
-              "preflight": activity, "samples": [], "qualified": False}
+    result['preflights'].append(activity)
+    if not resumed: result['preflight'] = activity
     # Retain failed and interrupted runs; never overwrite or filter their samples.
-    with arguments.results.open("x") as stream:
+    with arguments.results.open("r+" if resumed else "x") as stream:
         def save() -> None:
             stream.seek(0)
             json.dump(result, stream, indent=2)
@@ -181,31 +207,37 @@ def run(arguments: argparse.Namespace) -> None:
             stream.flush()
         save()
         if not quiet(activity):
+            result['failure'] = 'host failed frozen quiet criterion'
+            save()
             raise RuntimeError("host failed frozen quiet criterion; retained unqualified run")
         try:
-            for phase, orders in (("warmup", protocol["warmup_order"]),
-                                  ("paired", protocol["paired_order"])):
-                for round_index, order in enumerate(orders):
-                    for width in order:
-                        before = cpu_ticks()
-                        usage = resource.getrusage(resource.RUSAGE_CHILDREN)
-                        started = time.perf_counter_ns()
-                        completed = subprocess.run([protocol["executable"], str(width)],
-                                                   capture_output=True, text=True, timeout=120)
-                        seconds = (time.perf_counter_ns() - started) / 1e9
-                        after_usage = resource.getrusage(resource.RUSAGE_CHILDREN)
-                        child_seconds = (after_usage.ru_utime + after_usage.ru_stime -
-                                         usage.ru_utime - usage.ru_stime)
-                        activity = cpu_activity(before, cpu_ticks(), protocol["affinity"], child_seconds)
-                        sample = {"phase": phase, "round": round_index, "threads": width,
-                                  "seconds": seconds, "child_cpu_seconds": child_seconds,
-                                  "activity": activity, "returncode": completed.returncode,
-                                  "stdout": completed.stdout, "stderr": completed.stderr}
-                        result["samples"].append(sample)
-                        save()
-                        if (completed.returncode, completed.stdout, completed.stderr) != (
-                                0, protocol["expected_stdout"], ""):
-                            raise RuntimeError("incorrect workload result; retained unqualified run")
+            selected = rounds if item is None else rounds[item:item + 1]
+            for phase, round_index, order in selected:
+                for width in order:
+                    before = cpu_ticks()
+                    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+                    started = time.perf_counter_ns()
+                    completed = subprocess.run([protocol["executable"], str(width)],
+                                               capture_output=True, text=True, timeout=120)
+                    seconds = (time.perf_counter_ns() - started) / 1e9
+                    after_usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+                    child_seconds = (after_usage.ru_utime + after_usage.ru_stime -
+                                     usage.ru_utime - usage.ru_stime)
+                    activity = cpu_activity(before, cpu_ticks(), protocol["affinity"], child_seconds)
+                    sample = {"phase": phase, "round": round_index, "threads": width,
+                              "seconds": seconds, "child_cpu_seconds": child_seconds,
+                              "activity": activity, "returncode": completed.returncode,
+                              "stdout": completed.stdout, "stderr": completed.stderr}
+                    result["samples"].append(sample)
+                    save()
+                    if (completed.returncode, completed.stdout, completed.stderr) != (
+                            0, protocol["expected_stdout"], ""):
+                        raise RuntimeError("incorrect workload result; retained unqualified run")
+            if item is not None and item < len(rounds) - 1:
+                result['last_item'] = item
+                save()
+                print(f"item {item} retained; campaign incomplete")
+                return
             ratios = {width: [] for width in WIDTHS}
             for round_index in range(ROUNDS):
                 paired = {s["threads"]: s["seconds"] for s in result["samples"]
@@ -216,7 +248,8 @@ def run(arguments: argparse.Namespace) -> None:
                                         "interval_95": bootstrap_interval(values)}
                                  for width, values in ratios.items()}
             eight = result["scaling"][8]
-            result["quiet_all_samples"] = all(quiet(s["activity"]) for s in result["samples"])
+            result["quiet_all_samples"] = (all(quiet(s["activity"]) for s in result["samples"])
+                                           and all(quiet(a) for a in result['preflights']))
             result["qualified"] = (result["quiet_all_samples"] and eight["median"] >= 7.2
                                    and eight["interval_95"][0] >= 6.4)
         except BaseException as error:
@@ -244,6 +277,7 @@ def main() -> None:
     campaign = commands.add_parser("run")
     campaign.add_argument("protocol", type=Path)
     campaign.add_argument("results", type=Path)
+    campaign.add_argument('--item', type=int, choices=range(WARMUPS + ROUNDS))
     arguments = parser.parse_args()
     (register if arguments.command == "register" else run)(arguments)
 
