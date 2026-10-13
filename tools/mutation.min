@@ -1,0 +1,83 @@
+public record Site { offset: Integer; operator: Text; line: Integer; column: Integer }
+public function replacement(operator: Text): Text {
+    if operator == "==" { return "!=" }
+    if operator == "!=" { return "==" }
+    if operator == "<=" { return "<" }
+    if operator == ">=" { return ">" }
+    if operator == "&&" { return "||" }
+    if operator == "||" { return "&&" }
+    if operator == "<" { return "<=" }
+    if operator == ">" { return ">=" }
+    fail("unknown mutation operator")
+}
+public function discover(source: Text): List<Site> {
+    let raw = Bytes(source)
+    let sites: List<Site> = []
+    let index = 0
+    let line = 1
+    let column = 1
+    let quote = 0
+    let block = false
+    while index < raw.length {
+        let byte = raw[index]
+        let pair = ""
+        if index + 1 < raw.length && raw[index] < 128 && raw[index + 1] < 128 { pair = Text(raw.slice(index, index + 2)) }
+        if block {
+            if pair == "*/" { block = false; index += 2; column += 2; continue }
+        } else if quote != 0 {
+            if byte == 92 { index += 2; column += 2; continue }
+            if byte == quote { quote = 0 }
+        } else {
+            if pair == "//" {
+                while index < raw.length && raw[index] != 10 { index += 1 }
+                continue
+            }
+            if pair == "/*" { block = true; index += 2; column += 2; continue }
+            if byte == 34 || byte == 39 { quote = byte }
+            else {
+                let operator = ""
+                if pair == "==" || pair == "!=" || pair == "<=" || pair == ">=" || pair == "&&" || pair == "||" { operator = pair }
+                else if byte == 60 || byte == 62 {
+                    if index > 0 && index + 1 < raw.length && raw[index - 1] <= 32 && raw[index + 1] <= 32 { operator = Text(raw.slice(index, index + 1)) }
+                }
+                if operator != "" {
+                    sites.add(Site { offset: index; operator: operator; line: line; column: column })
+                    index += operator.length; column += operator.length; continue
+                }
+            }
+        }
+        if byte == 10 { line += 1; column = 1 }
+        else if byte < 128 || byte >= 192 { column += 1 }
+        index += 1
+    }
+    return sites
+}
+public function select(sites: List<Site>, limit: Integer): List<Site> {
+    if limit < 1 { fail("mutation limit must be positive") }
+    if limit >= sites.length { return sites }
+    let selected: List<Site> = []
+    for index in 0..limit { selected.add(sites[index * sites.length / limit]) }
+    return selected
+}
+public function mutate(source: Text, site: Site): Text {
+    let raw = Bytes(source)
+    return Text(raw.slice(0, site.offset)) + replacement(site.operator) + Text(raw.slice(site.offset + site.operator.length, raw.length))
+}
+public record Outcome { kind: Text; stage: Text }
+public function gate(baseline: Boolean, selected: Integer, outcomes: List<Outcome>, minimum: Integer): Text {
+    if minimum < 0 || minimum > 100 { return "invalid mutation floor" }
+    if !baseline { return "baseline failed" }
+    if selected == 0 { return "no discovered mutation sites" }
+    if outcomes.length != selected { return "campaign is incomplete" }
+    let viable = 0
+    let killed = 0
+    for outcome in outcomes {
+        if outcome.kind == "build_timeout" || outcome.kind == "infrastructure" { return "campaign is incomplete" }
+        if outcome.kind == "killed" || outcome.kind == "survived" { viable += 1 }
+        if outcome.kind == "killed" { killed += 1 }
+        if outcome.kind != "killed" && outcome.kind != "survived" && outcome.kind != "stillborn" { return "campaign is incomplete" }
+    }
+    if viable == 0 { return "no viable mutants" }
+    if killed * 100 < viable * minimum { return "mutation score is below required floor" }
+    return ""
+}

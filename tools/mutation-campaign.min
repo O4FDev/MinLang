@@ -1,0 +1,164 @@
+use "./testing.min" as test
+use "./check-runner.min" as runner
+use "./mutation.min" as mutation
+use "system" as system
+use "files" as files
+use "json" as json
+use "sha256" as sha
+public record Command { arguments: List<Text> }
+public record Campaign { root: Text; source: Text; baseline: Text; seed: Text; compilerRuntime: Text; runtime: Text; clang: Text; minimum: Float; limit: Integer; jobs: Integer; timeout: Integer; checks: List<Command>; work: Text }
+function join(values: List<Text>, separator: Text): Text {
+    let parts: List<Text> = []
+    for index in 0..values.length {
+        if index > 0 { parts.add(separator) }
+        parts.add(values[index])
+    }
+    return joinText(parts)
+}
+public function hash(path: Text): Text {
+    let bytes = files.readFile(path)
+    test.check(files.lastError() == 0, "missing campaign input: " + path)
+    return sha.hex(sha.digest(bytes))
+}
+public function number(value: Text): Float {
+    let parsed = json.parse(value)
+    test.check(parsed.kind == json.NUMBER && parsed.number >= 0.0 && parsed.number <= 100.0, "mutation floor must be finite and between zero and 100")
+    return parsed.number
+}
+public function checks(root: Text): List<Command> {
+    let result: List<Command> = []
+    for name in ["mutation-coverage", "diagnostics", "conformance"] { result.add(Command { arguments: [root + "/build/tooling/tests/" + name] }) }
+    for name in ["compiler-contracts", "thread-compiler", "regressions", "compiler-hardening", "list-access"] { result.add(Command { arguments: ["python3", "tests/" + name + ".py"] }) }
+    result.add(Command { arguments: ["python3", "tests/list-literals.py", "ListLiterals.test_constants_flush_before_dynamic_effects", "ListLiterals.test_large_literal_has_bounded_instruction_count"] })
+    result.add(Command { arguments: ["python3", "tests/linkage.py", "LanguageLinkage.test_ordinary_names_do_not_interpose_c_dependencies"] })
+    for name in ["binary-expression-ownership", "readonly-parameters"] { result.add(Command { arguments: ["python3", "tests/" + name + ".py"] }) }
+    result.add(Command { arguments: ["python3", "tests/source-map.py", "SourceMaps.test_full_integer_positions_shared_paths_and_sparse_legacy_origins", "SourceMaps.test_default_source_uses_two_coordinates_per_token_at_large_sizes", "SourceMaps.test_path_indices_are_sparse_and_preserve_gaps_resets_and_named_eof"] })
+    result.add(Command { arguments: ["python3", "tests/symbol-order.py"] })
+    result.add(Command { arguments: ["python3", "tests/fuzz.py", "--cases", "30", "--program-cases", "8"] })
+    result.add(Command { arguments: ["sh", "tests/run-module-tests.sh"] })
+    return result
+}
+function arguments(command: Command, scratch: Text): List<Text> {
+    let result: List<Text> = []
+    for item in command.arguments { result.add(item) }
+    if result.length > 1 && result[1] == "tests/fuzz.py" { result.add("--output-dir"); result.add(scratch + "/fuzz") }
+    return result
+}
+public function environment(campaign: Campaign, compiler: Text, source: Text, scratch: Text): List<Text> {
+    let env = runner.environment(system.environment(), "MINYAR_TEST_COMPILER", compiler)
+    env = runner.environment(env, "MINYAR_TEST_SOURCE", source)
+    env = runner.environment(env, "MINYAR_TEST_RUNTIME", campaign.runtime)
+    env = runner.environment(env, "MINYAR_MODULE_TEST_DIR", scratch + "/module-tests")
+    return runner.environment(env, "MINYAR_TEST_JOBS", "1")
+}
+function encoded(command: List<Text>): Text {
+    let values: List<Text> = []
+    for item in command { values.add(json.quote(item)) }
+    return "[" + join(values, ",") + "]"
+}
+function invoke(campaign: Campaign, args: List<Text>, phase: Text, env: List<Text>, log: Text, commands: List<Text>, compiler: Text, source: Text): test.Result {
+    let started = system.monotonicNanoseconds()
+    let result = test.run(args, env, campaign.root, log, campaign.timeout)
+    let timed = result.status == 124 || result.status == 137
+    commands.add("{\"phase\":" + json.quote(phase) + ",\"command\":" + encoded(args) + ",\"timeout_seconds\":" + Text(campaign.timeout) + ",\"elapsed_seconds\":" + Text(Float(system.monotonicNanoseconds() - started) / 1000000000.0) + ",\"timed_out\":" + Text(timed) + ",\"status\":" + Text(result.status) + ",\"stdout\":" + json.quote(result.output) + ",\"stderr\":" + json.quote(result.errorOutput) + ",\"compiler\":" + json.quote(compiler) + ",\"compiler_source\":" + json.quote(source) + ",\"runtime\":" + json.quote(campaign.runtime) + "}")
+    return result
+}
+function label(site: mutation.Site): Text {
+    return "line-" + Text(site.line) + "-column-" + Text(site.column) + "-" + site.operator + "-to-" + mutation.replacement(site.operator)
+}
+function offset(source: Text, bytes: Integer): Integer {
+    let count = 0
+    let raw = Bytes(source)
+    for index in 0..bytes { if raw[index] < 128 || raw[index] >= 192 { count += 1 } }
+    return count
+}
+public function run(campaign: Campaign): Boolean {
+    test.check(campaign.jobs >= 1 && campaign.jobs <= 8 && campaign.timeout > 0, "invalid campaign limits")
+    test.check(files.makeDirectory(campaign.work) == 0, "cannot create mutation campaign")
+    let original = readTextFile(campaign.source)
+    let discovered = mutation.discover(original)
+    let selected = mutation.select(discovered, campaign.limit)
+    writeTextFile(campaign.work + "/original.min", original)
+    let commands: List<Text> = []
+    let rows: List<Text> = []
+    let outcomes: List<mutation.Outcome> = []
+    let baseline = true
+    let failure = ""
+    let baselineScratch = campaign.work + "/baseline-scratch"
+    test.check(files.makeDirectory(baselineScratch) == 0, "cannot create baseline scratch")
+    let baselineEnvironment = environment(campaign, campaign.baseline, campaign.source, baselineScratch)
+    for index in 0..campaign.checks.length {
+        let args = arguments(campaign.checks[index], baselineScratch)
+        let result = invoke(campaign, args, "baseline", baselineEnvironment, campaign.work + "/baseline-" + Text(index), commands, campaign.baseline, campaign.source)
+        if result.status != 0 { baseline = false; failure = "baseline failed: " + join(args, " "); break }
+    }
+    let viable = 0
+    let killed = 0
+    let stillborn = 0
+    let timeouts = 0
+    if baseline {
+        for index in 0..selected.length {
+            let site = selected[index]
+            let name = label(site)
+            let prefix = campaign.work + "/mutant-" + Text(index)
+            let source = prefix + ".min"
+            let llvm = prefix + ".ll"
+            let scratch = prefix + "-scratch"
+            test.check(files.makeDirectory(scratch) == 0, "cannot create private mutant scratch")
+            writeTextFile(source, mutation.mutate(original, site))
+            let kind = "stillborn"
+            let stage = "compile"
+            let killedBy = ""
+            let built = invoke(campaign, [campaign.seed, source, "-o", llvm], name + ":build", system.environment(), prefix + ".build", commands, "", source)
+            if built.status == 124 || built.status == 137 { kind = "build_timeout" }
+            else if built.status == 126 || built.status == 127 { kind = "infrastructure" }
+            else if built.status == 0 {
+                stage = "link"
+                let linked = invoke(campaign, [campaign.clang, "-O0", "-Wno-override-module", llvm, campaign.compilerRuntime, "-lm", "-o", prefix], name + ":link", system.environment(), prefix + ".link", commands, "", source)
+                if linked.status == 124 || linked.status == 137 { kind = "build_timeout" }
+                else if linked.status == 126 || linked.status == 127 { kind = "infrastructure" }
+                else if linked.status == 0 {
+                    kind = "survived"
+                    stage = "test"
+                    let env = environment(campaign, prefix, source, scratch)
+                    for check in 0..campaign.checks.length {
+                        let args = arguments(campaign.checks[check], scratch)
+                        let result = invoke(campaign, args, name + ":test", env, prefix + ".test-" + Text(check), commands, prefix, source)
+                        if result.status != 0 {
+                            kind = "killed"
+                            if result.status == 126 || result.status == 127 { kind = "infrastructure" }
+                            killedBy = join(args, " ")
+                            if result.status == 124 || result.status == 137 { killedBy = "timeout: " + killedBy }
+                            break
+                        }
+                    }
+                }
+            }
+            outcomes.add(mutation.Outcome { kind: kind; stage: stage })
+            if kind == "killed" || kind == "survived" { viable += 1 }
+            if kind == "killed" { killed += 1 }
+            if kind == "stillborn" { stillborn += 1 }
+            if kind == "build_timeout" { timeouts += 1 }
+            rows.add("{\"site\":" + json.quote(name) + ",\"offset\":" + Text(offset(original, site.offset)) + ",\"line\":" + Text(site.line) + ",\"column\":" + Text(site.column) + ",\"operator\":" + json.quote(site.operator) + ",\"replacement\":" + json.quote(mutation.replacement(site.operator)) + ",\"source\":" + json.quote(source) + ",\"outcome\":" + json.quote(kind) + ",\"stage\":" + json.quote(stage) + ",\"killed_by\":" + json.quote(killedBy) + "}")
+            print(Text(index + 1) + "/" + Text(selected.length) + " " + name + ": " + kind)
+        }
+    }
+    if failure == "" { failure = mutation.gate(baseline, selected.length, outcomes, 0) }
+    let score = "null"
+    if viable > 0 {
+        let percent = 100.0 * Float(killed) / Float(viable)
+        score = Text(percent)
+        if failure == "" && percent < campaign.minimum { failure = "mutation score is below required floor" }
+    }
+    let artifacts: List<Text> = []
+    for path in [campaign.baseline, campaign.seed, campaign.compilerRuntime, campaign.runtime] {
+        let digest = "null"
+        if files.pathSize(path) >= 0 { digest = json.quote(hash(path)) }
+        artifacts.add(json.quote(path) + ":" + digest)
+    }
+    let report = "{\"source_sha256\":" + json.quote(hash(campaign.source)) + ",\"baseline_compiler\":" + json.quote(campaign.baseline) + ",\"baseline_passed\":" + Text(baseline) + ",\"discovered_sites\":" + Text(discovered.length) + ",\"selected_sites\":" + Text(selected.length) + ",\"viable_mutants\":" + Text(viable) + ",\"killed_mutants\":" + Text(killed) + ",\"stillborn_mutants\":" + Text(stillborn) + ",\"build_timeouts\":" + Text(timeouts) + ",\"minimum_score_percent\":" + Text(campaign.minimum) + ",\"score_percent\":" + score + ",\"gate_failure\":" + json.quote(failure) + ",\"evidence_directory\":" + json.quote(campaign.work) + ",\"outcomes\":[" + join(rows, ",") + "],\"commands\":[" + join(commands, ",") + "],\"artifact_sha256\":{" + join(artifacts, ",") + "}}\n"
+    writeTextFile(campaign.work + "/results.json", report)
+    writeTextFile(campaign.root + "/build/mutation-score.json", report)
+    print("mutation score=" + score + " minimum=" + Text(campaign.minimum) + " gate=" + failure)
+    return failure == ""
+}
