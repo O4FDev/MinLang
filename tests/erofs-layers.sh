@@ -5,7 +5,8 @@ fsck=${MINYAR_EROF_FSCK:-/usr/bin/fsck.erofs}
 "$clang" --version | head -1 | grep -F '23.1.2'
 mkdir -p 'build'
 work=$(mktemp -d "$PWD/build/erofs-layers-check.XXXXXXXX")
-trap 'rm -rf "$work"' EXIT
+fallback=''
+trap 'rm -rf "$work"; if test -n "$fallback"; then rm -rf "$fallback"; fi' EXIT
 MINYAR_CLANG="$clang" './minyar' 'tests/erofs-layers.min' -o "$work/fixtures"
 MINYAR_CLANG="$clang" './minyar' 'tests/erofs-layer-driver.min' -o "$work/writer"
 "$clang" -std=c11 -O2 -Wall -Wextra -Werror -static 'tests/erofs-tree.c' -o "$work/tree"
@@ -31,6 +32,13 @@ done
 "$work/writer" none "$work/raw.erofs" "$work/base.tar" "$work/additions.tar" "$work/upper.tar"
 cmp "$work/none.erofs" "$work/gzip.erofs"
 cmp "$work/none.erofs" "$work/raw.erofs"
+if test -d '/dev/shm' && test "$(stat -c %d '/dev/shm')" != "$(stat -c %d "$work")"; then
+    fallback=$(mktemp -d '/dev/shm/minyar-erofs-layers.XXXXXXXX')
+    cp "$work/base.tar" "$fallback/base.tar"
+    "$work/writer" none "$work/fallback.erofs" "$fallback/base.tar" "$work/additions.tar" "$work/upper.tar"
+    cmp "$work/none.erofs" "$work/fallback.erofs"
+    "$fsck" --extract "$work/fallback.erofs"
+fi
 for kind in 0 1 2 3 4 5 6 7 8 9; do
     cp "$work/none.erofs" "$work/unchanged.erofs"
     if "$work/writer" none "$work/unchanged.erofs" "$work/bad-$kind.tar"; then exit 1; fi
