@@ -11,6 +11,19 @@ from cycle_runtime import engine_source
 
 
 class ListBasics(CompilerTestCase):
+    def link_program(self, llvm, optimization, exe):
+        if not hasattr(self, 'contract_runtime'):
+            harness = self.directory / 'runtime.c'
+            harness.write_text((ROOT / 'tests/memory-contracts-runtime.c').read_text().replace(
+                '#include "../runtime/minyar_runtime.c"', engine_source(ROOT)))
+            self.contract_runtime = harness.with_suffix('.o')
+            result = self.evidence.run(clang_command([CLANG, '-O1' if LINK_FLAGS else '-O2', *LINK_FLAGS,
+                '-DMINYAR_SYSTEM_HEAP=1', '-iquote', str(ROOT / 'runtime'), '-c', str(harness),
+                '-o', str(self.contract_runtime)]), timeout=60, phase='ownership-runtime')
+            self.assertEqual(result.returncode, 0, result.stderr)
+        return self.evidence.run(clang_command([CLANG, optimization, *LINK_FLAGS, '-Wno-override-module',
+            str(llvm), str(self.contract_runtime), '-o', str(exe)]), capture_output=True, timeout=60, phase='link')
+
     def test_scalar_types_and_aliases(self):
         self.executes('''let values = [1, 2, 3]
 let alias = values
