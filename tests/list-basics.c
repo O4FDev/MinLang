@@ -80,6 +80,29 @@ int main(int argc, char **argv) {
     assert(removed->values[0] == 456);
     minyar_rc_release(removed);
     drain();
+    MinyarRecord *map = minyar_map_new(2, 1), *other = minyar_map_new(2, 1);
+    MinyarText *key = minyar_integer_text(100), *value = minyar_integer_text(200);
+    minyar_map_set(map, (long long)(uintptr_t)key, (long long)(uintptr_t)value);
+    minyar_map_set(other, (long long)(uintptr_t)key, (long long)(uintptr_t)value);
+    minyar_rc_release(key); minyar_rc_release(value);
+    assert(minyar_maps_are_equal(map, other, 2));
+    MinyarList *keys = minyar_map_keys(map);
+    assert(keys->length == 1);
+    minyar_map_clear(map);
+    assert(!minyar_maps_are_equal(map, other, 2));
+    minyar_rc_release(map); minyar_rc_release(other); drain();
+    key = (MinyarText *)(uintptr_t)keys->values[0];
+    assert(key->byte_length == 3 && !memcmp(key->bytes, "100", 3));
+    minyar_rc_release(keys); drain();
+    map = minyar_map_new(1, 0); other = minyar_map_new(1, 0);
+    double positive = 0.0, negative = -0.0, nan = NAN;
+    long long a, b, n;
+    memcpy(&a, &positive, sizeof(a)); memcpy(&b, &negative, sizeof(b)); memcpy(&n, &nan, sizeof(n));
+    minyar_map_set(map, 1, a); minyar_map_set(other, 1, b);
+    assert(minyar_maps_are_equal(map, other, 7));
+    minyar_map_set(map, 1, n); minyar_map_set(other, 1, n);
+    assert(!minyar_maps_are_equal(map, other, 7));
+    minyar_rc_release(map); minyar_rc_release(other); drain();
 #ifndef MINYAR_COMPILER_ARENA
     assert(rc_object_count == 0 && rc_bytes == 0 && rc_frames == NULL);
 #ifdef MINYAR_BOUNDED_HEAP
