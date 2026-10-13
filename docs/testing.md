@@ -348,7 +348,7 @@ with nothing else running; a pass on that retry is reported as flaky.
 | `quic` | `check-quic`, `check-quic-sanitize`, the five Quinn runs, Go transport and peer-edge |
 | `formats`, `redis`, `coverage`, `afl` | `check-formats(-sanitize)`, live Redis, the coverage gates, a 60 s AFL++ campaign |
 | `leaks` | the LeakSanitizer replay, as soon as the checks it replays have passed |
-| `formatting` | `scripts/format.py` with the pinned clang-format |
+| `formatting` | `scripts/format.min` with the pinned clang-format |
 
 Each toolchain variant (LLVM 22, LLVM 23, clang-18) builds in its own copy of
 the source snapshot, so variants build and run at the same time as the main

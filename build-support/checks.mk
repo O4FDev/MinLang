@@ -494,11 +494,11 @@ check-sanitize: check-runtime-bytes-sanitize check-runtime-traps-sanitize check-
 check: check-toolchain-stamp check-toolchain-portability check-cold-bootstrap check-runtime-bytes check-runtime-traps check-compiler-hardening check-list-access
 
 .PHONY: check-format format
-check-format:
-	python3 scripts/format.py
+check-format: build/tooling/scripts/format
+	./build/tooling/scripts/format
 
-format:
-	python3 scripts/format.py --write
+format: build/tooling/scripts/format
+	./build/tooling/scripts/format --write
 
 .PHONY: check-runtime-numeric check-runtime-numeric-sanitize
 check-runtime-numeric: build/minyarc
