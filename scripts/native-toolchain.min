@@ -1,0 +1,258 @@
+use "system" as system
+use "files" as files
+use "json" as json
+use "./native-host.min" as host
+
+record Repository { name: Text; url: Text; revision: Text }
+record Manifest { tag: Text; repositories: List<Repository>; error: Text }
+
+public function sha256File(path: Text): Text {
+    let result = host.captureIn(["sha256sum", path], system.environment(), "", "quiet")
+    if result.status != 0 { result = host.captureIn(["shasum", "-a", "256", path], system.environment(), "", "quiet") }
+    if result.status != 0 { return "" }
+    return host.words(result.output)[0]
+}
+public function manifestRevision(root: Text, name: Text): Text {
+    let manifest = readManifest(root)
+    for repository in manifest.repositories { if repository.name == name { return repository.revision } }
+    return ""
+}
+function readManifest(root: Text): Manifest {
+    let value = json.parse(readTextFile(root + "/toolchains/native-swift/sources.json"))
+    let repositories = json.member(value, "repositories")
+    if value.kind != json.OBJECT || repositories.kind != json.OBJECT { return Manifest { tag: ""; repositories: []; error: "invalid toolchains/native-swift/sources.json" } }
+    let result = Manifest { tag: json.string(value, "tag"); repositories: []; error: "" }
+    for index in 0..repositories.keys.length {
+        let entry = repositories.items[index]
+        result.repositories.add(Repository { name: repositories.keys[index]; url: json.string(entry, "url"); revision: json.string(entry, "revision") })
+    }
+    return result
+}
+function git(arguments: List<Text>): Text {
+    let command = ["git"]
+    for item in arguments { command.add(item) }
+    let status = host.run(command)
+    if status != 0 { return host.commandFailure(command, status) }
+    return ""
+}
+function gitOutput(arguments: List<Text>, values: List<Text>): Text {
+    let command = ["git"]
+    for item in arguments { command.add(item) }
+    let result = host.capture(command)
+    if result.status != 0 { return host.commandFailure(command, result.status) }
+    values.add(result.output)
+    return ""
+}
+record PatchSet { repository: Text; names: List<Text> }
+function patchSets(): List<PatchSet> {
+    return [PatchSet { repository: "swift"; names: ["swift-parser.patch", "swift-macros.patch"] }, PatchSet { repository: "swift-syntax"; names: ["swift-syntax.patch"] }]
+}
+function applyNativePatches(root: Text, workspace: Text): Text {
+    let patchRoot = root + "/toolchains/native-swift/patches"
+    let names: List<Text> = []
+    let digests: List<Text> = []
+    for patchSet in patchSets() {
+        for name in patchSet.names {
+            let digest = sha256File(patchRoot + "/" + name)
+            if digest == "" { return "cannot hash " + patchRoot + "/" + name }
+            names.add(name)
+            digests.add(digest)
+        }
+    }
+    let identity = "{\n"
+    for index in 0..names.length {
+        identity += "  " + host.jsonString(names[index]) + ": " + host.jsonString(digests[index])
+        if index + 1 < names.length { identity += "," }
+        identity += "\n"
+    }
+    identity += "}\n"
+    let marker = workspace + "/.minyar-patches.json"
+    if host.exists(marker) {
+        let recorded = json.parse(readTextFile(marker))
+        let same = recorded.kind == json.OBJECT && recorded.keys.length == names.length
+        if same {
+            for index in 0..names.length {
+                if json.string(recorded, names[index]) != digests[index] { same = false }
+            }
+        }
+        if !same { return "native patches changed; use a fresh --root or reconcile the existing source tree manually" }
+        for patchSet in patchSets() {
+            let arguments = ["-C", workspace + "/" + patchSet.repository, "apply", "--reverse", "--check"]
+            for name in patchSet.names { arguments.add(patchRoot + "/" + name) }
+            let failed = git(arguments)
+            if failed != "" { return failed }
+        }
+        return ""
+    }
+    for patchSet in patchSets() {
+        let source = workspace + "/" + patchSet.repository
+        let status: List<Text> = []
+        let failed = gitOutput(["-C", source, "status", "--porcelain"], status)
+        if failed != "" { return failed }
+        if status[0] != "" { return "native patch installation requires clean sources: " + source }
+        let arguments = ["-C", source, "apply", "--check"]
+        for name in patchSet.names { arguments.add(patchRoot + "/" + name) }
+        failed = git(arguments)
+        if failed != "" { return failed }
+    }
+    for patchSet in patchSets() {
+        let arguments = ["-C", workspace + "/" + patchSet.repository, "apply"]
+        for name in patchSet.names { arguments.add(patchRoot + "/" + name) }
+        let failed = git(arguments)
+        if failed != "" { return failed }
+    }
+    return host.writeFile(marker, identity)
+}
+
+function acquire(lock: Text): Text {
+    while true {
+        let file = files.open(lock, files.WRITE | files.CREATE | files.EXCLUSIVE)
+        if file >= 0 {
+            let owner = Bytes(Text(system.processId()) + "\n")
+            files.write(file, owner, 0, owner.length)
+            files.close(file)
+            return ""
+        }
+        if file != -17 { return host.errorText(file) + ": '" + lock + "'" }
+        let holder = host.strip(Text(files.readFile(lock)))
+        if host.decimalDigits(holder) && system.sendSignal(host.number(holder), 0) == 0 { return "busy" }
+        if !host.decimalDigits(holder) && files.lastError() == 0 { return "busy" }
+        files.remove(lock)
+    }
+}
+function decimal(value: Integer, places: Integer): Text {
+    let scale = 1
+    for index in 0..places { scale = scale * 10 }
+    let scaled = (value * scale * 2 + 1048576) / 2097152
+    let whole = Text(scaled / scale)
+    let fraction = Text(scaled % scale)
+    while host.size(fraction) < places { fraction = "0" + fraction }
+    return whole + "." + fraction
+}
+function operate(root: Text, action: Text, workspace: Text, jobs: Integer): Text {
+    let manifest = readManifest(root)
+    if manifest.error != "" { return manifest.error }
+    for repository in manifest.repositories {
+        let source = workspace + "/" + repository.name
+        if !host.exists(source) {
+            let failed = git(["clone", "--depth", "1", "--single-branch", "--branch", manifest.tag, repository.url, source])
+            if failed != "" { return failed }
+        }
+        let head: List<Text> = []
+        let failed = gitOutput(["-C", source, "rev-parse", "HEAD"], head)
+        if failed != "" { return failed }
+        let actual = host.strip(head[0])
+        if actual != repository.revision { return source + ": expected " + repository.revision + ", found " + actual + "; no checkout was changed" }
+    }
+    if action == "fetch" {
+        print("pinned sources verified in " + workspace)
+        return ""
+    }
+    if action == "baseline" {
+        for repository in manifest.repositories {
+            let changed: List<Text> = []
+            let failed = gitOutput(["-C", workspace + "/" + repository.name, "status", "--porcelain", "--untracked-files=no"], changed)
+            if failed != "" { return failed }
+            if changed[0] != "" { return "baseline requires unmodified sources: " + workspace + "/" + repository.name }
+        }
+    }
+    let usage = host.capture(["df", "-Pk", workspace])
+    let rows = host.lines(usage.output)
+    if usage.status != 0 || rows.length < 2 { return "cannot read the available storage for " + workspace }
+    let fields = host.words(rows[rows.length - 1])
+    if fields.length < 4 || !host.decimalDigits(fields[3]) { return "cannot read the available storage for " + workspace }
+    let available = host.number(fields[3])
+    print("Available storage: " + decimal(available, 1) + " GiB; build jobs: " + Text(jobs))
+    if available < 40 * 1048576 { return "less than 40 GiB available for the compiler build; select a larger --root volume" }
+    let architecture = host.machine()
+    if architecture != "arm64" && architecture != "aarch64" && architecture != "x86_64" { return "unsupported host architecture: " + architecture }
+    if action == "native" {
+        let patched = applyNativePatches(root, workspace)
+        if patched != "" { return patched }
+    }
+    let targets = "AArch64"
+    if architecture == "x86_64" { targets = "X86" }
+    let command = ["python3", "utils/build-script", "--release", "--reconfigure", "--skip-early-swift-driver", "--skip-build-benchmarks",
+        "--skip-build-osx", "--skip-build-ios", "--skip-build-tvos", "--skip-build-watchos", "--skip-build-xros", "--skip-build-lld",
+        "--skip-build-clang-tools-extra", "--skip-build-compiler-rt", "--no-llvm-include-tests", "--llvm-targets-to-build", targets,
+        "--bootstrapping", "hosttools", "--jobs", Text(jobs),
+        "--extra-cmake-options=-DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DSWIFT_BUILD_REGEX_PARSER_IN_COMPILER:BOOL=TRUE -DSWIFT_BUILD_STDLIB_EXTRA_TOOLCHAIN_CONTENT:BOOL=FALSE -DSWIFT_BUILD_STDLIB_CXX_MODULE:BOOL=FALSE"]
+    if host.systemName() == "darwin" {
+        for item in ["--swift-darwin-supported-archs", architecture, "--build-swift-dynamic-stdlib=false", "--build-swift-static-stdlib=false",
+            "--build-swift-dynamic-sdk-overlay=false", "--build-swift-static-sdk-overlay=false", "--build-swift-libexec=false"] { command.add(item) }
+    } else {
+        for item in ["--use-linker=lld", "--build-swift-static-stdlib=false"] { command.add(item) }
+    }
+    let environment: List<Text> = []
+    for entry in system.environment() { if !host.starts(entry, "CMAKE_BUILD_PARALLEL_LEVEL=") { environment.add(entry) } }
+    environment.add("CMAKE_BUILD_PARALLEL_LEVEL=" + Text(jobs))
+    let status = host.runIn(command, environment, workspace + "/swift")
+    if status != 0 { return host.commandFailure(command, status) }
+    return ""
+}
+
+function usageError(message: Text): Integer {
+    host.standardError("usage: native-toolchain [-h] [--root ROOT] [--jobs JOBS] {fetch,baseline,native}\nnative-toolchain: error: " + message + "\n")
+    return 2
+}
+function main(): Integer {
+    let root = host.projectRoot()
+    let action = ""
+    let workspaceOption = root + "/build/native-toolchain"
+    let jobsText = "3"
+    let index = 0
+    while index < argumentCount() {
+        let item = argument(index)
+        if item == "-h" || item == "--help" {
+            print("usage: native-toolchain [-h] [--root ROOT] [--jobs JOBS] {fetch,baseline,native}\n\nFetch or build the pinned baseline or experimental native Minyar compiler.\nBuilds are local to --root; this command does not install into Xcode. The\nbaseline has no Minyar parser modifications.")
+            return 0
+        }
+        let option = item
+        let value = ""
+        let equals = host.find(item, "=", 0)
+        if host.starts(item, "--") && equals > 0 {
+            option = host.cut(item, 0, equals)
+            value = host.cut(item, equals + 1, host.size(item))
+        } else if item == "--root" || item == "--jobs" {
+            if index + 1 >= argumentCount() { return usageError("argument " + item + ": expected one argument") }
+            value = argument(index + 1)
+            index += 1
+        }
+        if option == "--root" { workspaceOption = value }
+        else if option == "--jobs" { jobsText = value }
+        else if host.starts(item, "-") { return usageError("unrecognized arguments: " + item) }
+        else if action == "" { action = item }
+        else { return usageError("unrecognized arguments: " + item) }
+        index += 1
+    }
+    if action == "" { return usageError("the following arguments are required: action") }
+    if action != "fetch" && action != "baseline" && action != "native" { return usageError("argument action: invalid choice: '" + action + "' (choose from 'fetch', 'baseline', 'native')") }
+    if !host.decimalDigits(jobsText) && !(host.starts(jobsText, "-") && host.decimalDigits(host.cut(jobsText, 1, host.size(jobsText)))) { return usageError("argument --jobs: invalid int value: '" + jobsText + "'") }
+    let platform = host.systemName()
+    if platform != "darwin" && platform != "linux" { return usageError("native compiler builds currently require macOS or Linux") }
+    if host.starts(jobsText, "-") || host.number(jobsText) < 1 { return usageError("--jobs must be positive") }
+    let jobs = host.number(jobsText)
+    let workspace = host.resolved(workspaceOption)
+    for byte in Bytes(workspace) {
+        if byte == 32 || (byte >= 9 && byte <= 13) { return usageError("the upstream compiler build requires a path without spaces") }
+    }
+    let made = host.makeDirectories(workspace)
+    if made != "" {
+        host.standardError("native toolchain: " + made + "\n")
+        return 1
+    }
+    let lock = workspace + "/.minyar-build-lock"
+    let acquired = acquire(lock)
+    if acquired == "busy" { acquired = "another toolchain operation owns " + workspace }
+    if acquired != "" {
+        host.standardError("native toolchain: " + acquired + "\n")
+        return 1
+    }
+    let error = operate(root, action, workspace, jobs)
+    files.remove(lock)
+    if error != "" {
+        host.standardError("native toolchain: " + error + "\n")
+        return 1
+    }
+    return 0
+}

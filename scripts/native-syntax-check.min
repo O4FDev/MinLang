@@ -1,0 +1,82 @@
+use "system" as system
+use "./native-host.min" as host
+use "./native-toolchain.min" as toolchain
+
+function usageError(message: Text): Integer {
+    host.standardError("usage: native-syntax-check [-h] [--root ROOT]\nnative-syntax-check: error: " + message + "\n")
+    return 2
+}
+function failed(message: Text): Integer {
+    host.standardError("native syntax check: " + message + "\n")
+    return 1
+}
+function invoke(command: List<Text>, cwd: Text): Text {
+    let status = host.runIn(command, system.environment(), cwd)
+    if status != 0 { return host.commandFailure(command, status) }
+    return ""
+}
+function main(): Integer {
+    let root = host.projectRoot()
+    let workspaceOption = root + "/build/native-toolchain"
+    let index = 0
+    while index < argumentCount() {
+        let item = argument(index)
+        if item == "-h" || item == "--help" {
+            print("usage: native-syntax-check [-h] [--root ROOT]\n\nBuild and check the experimental native Minyar SwiftSyntax parser.\nUses a separate source copy, leaving the pinned baseline compiler untouched.\nRun build/tooling/scripts/native-toolchain fetch first. No Xcode installation is changed.")
+            return 0
+        }
+        if item == "--root" {
+            if index + 1 >= argumentCount() { return usageError("argument --root: expected one argument") }
+            workspaceOption = argument(index + 1)
+            index += 1
+        } else if host.starts(item, "--root=") { workspaceOption = host.cut(item, 7, host.size(item)) }
+        else { return usageError("unrecognized arguments: " + item) }
+        index += 1
+    }
+    let workspace = host.resolved(workspaceOption)
+    let source = workspace + "/swift-syntax"
+    let patch = root + "/toolchains/native-swift/patches/swift-syntax.patch"
+    let expected = toolchain.manifestRevision(root, "swift-syntax")
+    let head = host.capture(["git", "-C", source, "rev-parse", "HEAD"])
+    if head.status != 0 { return failed(host.commandFailure(["git", "-C", source, "rev-parse", "HEAD"], head.status)) }
+    if host.strip(head.output) != expected { return usageError("SwiftSyntax source revision differs from the pinned manifest") }
+    let status = host.capture(["git", "-C", source, "status", "--porcelain"])
+    if status.status != 0 { return failed(host.commandFailure(["git", "-C", source, "status", "--porcelain"], status.status)) }
+    if status.output != "" { return usageError("SwiftSyntax baseline must be clean; no source copy was changed") }
+    let digest = toolchain.sha256File(patch)
+    if digest == "" { return failed("cannot hash " + patch) }
+    let work = workspace + "/syntax-check/" + host.cut(digest, 0, 16)
+    let copied = work + "/source"
+    let build = work + "/build"
+    let marker = work + "/.source-ready"
+    let provenance = expected + "\n" + digest + "\n"
+    if !host.exists(marker) {
+        if host.exists(copied) { return usageError("incomplete source copy at " + copied + "; choose a fresh --root or inspect it manually") }
+        let made = host.makeDirectories(copied)
+        if made != "" { return failed(made) }
+        let copy = invoke(["/bin/sh", "-c", "tar -C \"$1\" --exclude=.git -cf - . | tar -C \"$2\" -xf -", "sh", source, copied], "")
+        if copy != "" { return failed(copy) }
+        let checked = invoke(["git", "apply", "--check", patch], copied)
+        if checked != "" { return failed(checked) }
+        let applied = invoke(["git", "apply", patch], copied)
+        if applied != "" { return failed(applied) }
+        let written = host.writeFile(marker, provenance)
+        if written != "" { return failed(written) }
+    }
+    if readTextFile(marker) != provenance { return usageError("source provenance mismatch at " + work) }
+    let found = host.capture(["xcrun", "--find", "swiftc"])
+    if found.status != 0 { return failed(host.commandFailure(["xcrun", "--find", "swiftc"], found.status)) }
+    let swiftc = host.strip(found.output)
+    let steps = [
+        ["cmake", "-G", "Ninja", "-S", copied, "-B", build, "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_SHARED_LIBS=ON", "-DSWIFTSYNTAX_EMIT_MODULE=ON", "-DCMAKE_Swift_COMPILER=" + swiftc],
+        ["cmake", "--build", build, "--target", "SwiftParser", "SwiftParserDiagnostics", "--parallel", "1"],
+        [swiftc, root + "/tests/native-swift/syntax.swift", "-I", build + "/lib/swift/host", "-L", build + "/lib/swift/host",
+            "-lSwiftParser", "-lSwiftSyntax", "-lSwiftParserDiagnostics", "-lSwiftDiagnostics", "-Xlinker", "-rpath", "-Xlinker", build + "/lib/swift/host", "-o", work + "/syntax-check"],
+        [work + "/syntax-check", root + "/examples/swiftui/main.min", root + "/tests/swiftui-features.min", root + "/examples/swiftui-library/widgets.min", root + "/tests/native-swift/syntax.min"]
+    ]
+    for step in steps {
+        let error = invoke(step, "")
+        if error != "" { return failed(error) }
+    }
+    return 0
+}

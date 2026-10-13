@@ -2,6 +2,8 @@ NATIVE_HOST_SOURCES = scripts/native-host.min
 NATIVE_SWIFT_SOURCES = $(NATIVE_HOST_SOURCES) scripts/native_project.min scripts/macos-app.min scripts/native-swift.min
 build/tooling/scripts/native-swift.ll build/tooling/scripts/native-frontend.ll: $(NATIVE_SWIFT_SOURCES)
 build/tooling/scripts/macos-app.ll: $(NATIVE_HOST_SOURCES) scripts/macos-app.min
+build/tooling/scripts/native-toolchain.ll: $(NATIVE_HOST_SOURCES)
+build/tooling/scripts/native-syntax-check.ll: $(NATIVE_HOST_SOURCES) scripts/native-toolchain.min
 
 # Native GUI integration needs a logged-in macOS desktop session.
 .PHONY: check-macos
@@ -18,8 +20,8 @@ check-swiftui:
 	$${MINYAR_PYTHON:-/usr/bin/python3} tests/swiftui.py
 
 .PHONY: check-native-syntax
-check-native-syntax:
-	$${MINYAR_PYTHON:-/usr/bin/python3} scripts/native-syntax-check.py
+check-native-syntax: build/tooling/scripts/native-syntax-check
+	./build/tooling/scripts/native-syntax-check
 
 MINYAR_NATIVE_HOST := $(if $(filter Linux,$(shell uname -s)),linux,macosx)
 MINYAR_NATIVE_SWIFTC ?= build/native-toolchain/build/Ninja-ReleaseAssert/swift-$(MINYAR_NATIVE_HOST)-$(shell uname -m)/bin/swiftc
