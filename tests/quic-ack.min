@@ -243,6 +243,39 @@ function main(): Integer {
     if c.state != quic.ESTABLISHED || s.state != quic.ESTABLISHED || !c.confirmed || !s.confirmed ||
        c.pending.length != 0 || s.pending.length != 0 || c.spaces[2].sent.length != 0 || s.spaces[2].sent.length != 0 { return 90 }
     let pn = max(s.spaces[2].next, c.spaces[2].largest + 1); let ping = crypto.fromHex("01")
+    if mode == 50 {
+        if !destinationWidth(s,c,20) { return 90 }
+        let first = max(c.spaces[2].next,s.spaces[2].largest + 1)
+        gapped(c,s,first,64,0,2000)
+        if s.spaces[2].ranges.length < 64 { return 90 }
+        for data in quic.poll(s,2000) { quic.receive(c,data,2000) }
+        if s.spaces[2].ack { return 90 }
+        let incoming = packet(c,2,c.spaces[2].next,ping)
+        quic.receivePath(s,incoming,7,2001)
+        let before = rangeState(s); let candidate: List<Bytes> = []
+        for entry in quic.pollDatagrams(s,2001) { if entry.pathId == 7 { candidate.add(entry.data) } }
+        let result = wireSize(c,candidate)
+        if !result.valid || result.challenges != 1 || candidate.length != 1 || result.maximum > 3 * incoming.length ||
+           !s.spaces[2].ack || rangeState(s) != before { print("rebinding challenge blocked by ACK history"); return 66 }
+        let bounded = false
+        for path in s.paths { if path.id == 7 { bounded = !path.validated && path.sent <= 3 * path.received } }
+        if !bounded || s.flight != flightBytes(s) { return 66 }
+        for data in candidate { quic.receive(c,data,2001) }
+        for data in quic.poll(c,2002) { quic.receivePath(s,data,7,2002) }
+        if s.activePath != 7 { print("rebinding challenge did not validate"); return 67 }
+        let id = errors.integerValue(quic.openStream(s,false)); let body = bytes(5000)
+        if errors.integerValue(quic.writeStream(s,id,body,true)) != body.length { return 67 }
+        let received = Bytes()
+        for tick in 0..200 {
+            let now = 2003 + tick * 10
+            for entry in quic.pollDatagrams(s,now) { if entry.pathId == 7 { quic.receive(c,entry.data,now) } }
+            let read = quic.readStream(c,id)
+            if errors.bytesOk(read) { received.addBytes(errors.bytesValue(read)) }
+            for data in quic.poll(c,now) { quic.receivePath(s,data,7,now) }
+            if received.length == body.length { break }
+        }
+        if crypto.hex(received) != crypto.hex(body) || s.flight != flightBytes(s) { return 67 }
+    }
     if mode == 0 {
         inject(s, c, pn, ping, 2000)
         if inspect(s, quic.poll(c, 2000)).count != 0 { print("ACK sent before pair"); return 10 }
