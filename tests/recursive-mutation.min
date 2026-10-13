@@ -1,0 +1,150 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+function find(source: Text, needle: Text, start: Integer): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if raw.length < pattern.length { return -1 }
+    for position in start..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[position + index] != pattern[index] { equal = false; break } }
+        if equal { return position }
+    }
+    return -1
+}
+function count(source: Text, needle: Text): Integer {
+    let found = 0
+    let position = 0
+    while true {
+        let matched = find(source, needle, position)
+        if matched < 0 { return found }
+        found += 1
+        position = matched + Bytes(needle).length
+    }
+}
+function replaceOnce(source: Text, before: Text, after: Text, name: Text): Text {
+    test.check(count(source, before) == 1, name + ": expected exactly one mutation site")
+    return test.replace(source, before, after)
+}
+function mutate(source: Text, name: Text): Text {
+    if name == "cycle" {
+        let signature = "function checkListMutation(listType: Integer, counts: List<Integer>, fields: List<Integer>, returnTypes: List<Integer>) {"
+        return replaceOnce(source, signature, signature + "\n    return", name)
+    }
+    if name == "context" {
+        return replaceOnce(source, "argumentType[0] = functionParameterTypes[first + argumentValues.length]", "argumentType[0] = 0", name)
+    }
+    test.check(name == "literal-owner", "unknown recursive compiler mutation")
+    let start = find(source, "function parseListLiteral(", 0)
+    test.check(start >= 0, "missing List literal mutation helper")
+    let ending = find(source, "\nfunction parseAtom(", start)
+    test.check(ending > start, "missing List literal mutation boundary")
+    let raw = Bytes(source)
+    let body = replaceOnce(Text(raw.slice(start, ending)), "output.add(\"  call void @minyar_list_add(ptr \")", "output.add(\"  call void @minyar_list_add_take(ptr \")", name)
+    return Text(raw.slice(0, start)) + body + Text(raw.slice(ending, raw.length))
+}
+function build(compiler: Text, clang: Text, source: Text, work: Text, name: Text): Text {
+    let path = work + "/" + name
+    writeTextFile(path + ".min", source)
+    test.require(test.run([compiler, path + ".min", path + ".ll"], system.environment(), "", path + ".compile", 60), name + ": viable compiler compile")
+    test.check(files.pathSize(path + ".ll") >= 0, name + ": compiler did not emit LLVM")
+    test.require(test.run([clang, "-O1", "-DMINYAR_COMPILER_ARENA", "-Wno-override-module", path + ".ll", test.setting("MINYAR_COMPILER_RUNTIME_SOURCE", "runtime/minyar_runtime.c"), "-lm", "-o", path], system.environment(), "", path + ".link", 60), name + ": viable compiler link")
+    return path
+}
+function remaining(deadline: Integer, maximum: Integer): Integer {
+    let nanoseconds = deadline - system.monotonicNanoseconds()
+    test.check(nanoseconds > 0, "recursive mutation contract exceeded 60 seconds")
+    let seconds = (nanoseconds + 999999999) / 1000000000
+    if seconds < maximum { return seconds }
+    return maximum
+}
+function program(compiler: Text, source: Text, path: Text, environment: List<Text>, deadline: Integer): test.Result {
+    writeTextFile(path + ".min", source)
+    return test.run([compiler, path + ".min", path + ".ll"], environment, "", path + ".compile", remaining(deadline, 30))
+}
+function executes(clang: Text, runtime: Text, source: Text, expected: Text, compiler: Text, path: Text, environment: List<Text>, mutant: Boolean) {
+    let deadline = system.monotonicNanoseconds() + 60000000000
+    test.require(program(compiler, source, path, environment, deadline), "recursive mutation program compile viability")
+    test.check(files.pathSize(path + ".ll") >= 0, "recursive mutation program LLVM viability")
+    writeTextFile(path + ".ll", test.instrument(readTextFile(path + ".ll")))
+    let checked = 0
+    for optimization in ["-O0", "-O2"] {
+        let executable = path + ".exe"
+        test.require(test.run([clang, optimization, "-fsanitize=address,undefined", "-Wno-override-module", path + ".ll", runtime, "-lm", "-o", executable], environment, "", path + ".link", remaining(deadline, 120)), "recursive mutation program link viability " + optimization)
+        let result = test.run([executable], environment, "", path + ".run", remaining(deadline, 30))
+        if mutant {
+            test.check(result.status != 0 && test.contains(result.errorOutput, "AddressSanitizer: heap-use-after-free"), "literal-owner: intended lifetime fault " + optimization + "\n" + result.errorOutput)
+        } else {
+            test.check(result.status == 0 && result.output == expected && result.errorOutput == "", "recursive mutation control contract " + optimization + "\n" + result.output + result.errorOutput)
+        }
+        checked += 1
+    }
+    test.check(checked == 2, "literal ownership fault must cover both optimization levels")
+    remaining(deadline, 60)
+}
+let compiler = test.setting("MINYAR_TEST_COMPILER", "./build/minyarc")
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let runtime = test.setting("MINYAR_TEST_MUTATION_RUNTIME", "build/ownership-runtime.o")
+test.check(files.pathSize(runtime) >= 0, "build/ownership-runtime.o exact-accounting sanitizer runtime is required")
+test.check(system.setResourceLimit(system.CORE_SIZE, 0, 0) == 0, "disable recursive mutation core files")
+let original = readTextFile(test.setting("MINYAR_TEST_COMPILER_SOURCE", "build/compiler.min"))
+let work = test.scratch()
+let environment: List<Text> = []
+for entry in system.environment() {
+    if !starts(entry, "MINYAR_TEST_COMPILER=") && !starts(entry, "MINYAR_TEST_RUNTIME=") && !starts(entry, "MINYAR_TEST_LINK_FLAGS=") && !starts(entry, "ASAN_OPTIONS=") && !starts(entry, "UBSAN_OPTIONS=") { environment.add(entry) }
+}
+environment.add("MINYAR_TEST_RUNTIME=" + runtime)
+environment.add("MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined")
+environment.add("ASAN_OPTIONS=detect_leaks=0:halt_on_error=1:symbolize=0")
+environment.add("UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1")
+let cycles = ["record Node { children: List<Node> }\nlet children: List<Node> = []\nlet node = Node { children: children }\nchildren.add(node)\n", "record Node { children: List<Node> }\nlet leaf = Node { children: [] }\nlet children: List<Node> = [leaf]\nlet node = Node { children: children }\nchildren[0] = node\n", "record Node { children: List<Node> }\nfunction attach(children: List<Node>, node: Node) { children.add(node) }\n", "record Node { children: List<Node> }\nfunction replace(children: List<Node>, node: Node) { children[0] = node }\n"]
+let literalProgram = "record Box { text: Text }\nfunction replace(boxes: List<Box>): Box {\n    boxes[0] = Box { text: \"new\" + \"!\" }\n    return boxes[0]\n}\nlet boxes = [Box { text: \"old\" + \"!\" }]\nlet captured = [boxes[0], replace(boxes)]\nprint(captured[0].text)\nprint(captured[1].text)\nprint(boxes[0].text)\n"
+let literalExpected = "old!\nnew!\nnew!\n"
+let contextProgram = "record Node { children: List<Node> }\nfunction nodes(values: List<Node>): List<Node> { return values }\nfunction layers(values: List<List<Node>>): List<List<Node>> { return values }\nfunction first(values: List<List<Node>>, fallback: List<Node>): List<Node> {\nif values.length > 0 { return values[0] }\nreturn fallback\n}\nlet a = nodes([])\nlet b = layers([nodes([]), []])\nprint(a.length)\nprint(b.length)\nprint(first(layers([[]]), nodes([])).length)\nlet ordinary: List<List<Integer>> = []\nordinary.add([])\nordinary.add([1, 2])\nprint(ordinary[0].length)\nprint(ordinary[1][1])\nprint(joinText([]))\n"
+let contextExpected = "0\n2\n0\n0\n2\n\n"
+let control = build(compiler, clang, original, work, "control")
+let controlCycleDeadline = system.monotonicNanoseconds() + 60000000000
+for index in 0..cycles.length {
+    let path = work + "/control-cycle" + Text(index)
+    test.require(program(control, cycles[index], path, environment, controlCycleDeadline), "control cycle compile")
+    test.check(files.pathSize(path + ".ll") >= 0, "control cycle LLVM")
+    test.check(test.contains(readTextFile(path + ".ll"), "; minyar-cycle-runtime: 1\n"), "control cycle collector selection")
+}
+remaining(controlCycleDeadline, 60)
+executes(clang, runtime, literalProgram, literalExpected, control, work + "/control-literal", environment, false)
+executes(clang, runtime, contextProgram, contextExpected, control, work + "/control-context", environment, false)
+print("control compiler: all three targeted contracts pass; native cases pass at O0/O2")
+for name in ["cycle", "literal-owner", "context"] {
+    let candidate = build(compiler, clang, mutate(original, name), work, name)
+    if name == "cycle" {
+        let deadline = system.monotonicNanoseconds() + 60000000000
+        let missing = 0
+        for index in 0..cycles.length {
+            let path = work + "/mutant-cycle" + Text(index)
+            test.require(program(candidate, cycles[index], path, environment, deadline), "cycle mutant program compile viability")
+            test.check(files.pathSize(path + ".ll") >= 0, "cycle mutant emitted LLVM viability")
+            if !test.contains(readTextFile(path + ".ll"), "; minyar-cycle-runtime: 1\n") { missing += 1 }
+        }
+        test.check(cycles.length == 4 && missing > 0, "cycle: intended missing collector metadata fault was not detected")
+        remaining(deadline, 60)
+        print("cycle: detected by test_direct_self_cycle_add_and_overwrite_use_collector (missing cycle-runtime metadata)")
+    } else if name == "literal-owner" {
+        executes(clang, runtime, literalProgram, literalExpected, candidate, work + "/mutant-literal", environment, true)
+        print("literal-owner: detected by test_literal_retains_earlier_projection_before_later_mutation (AddressSanitizer: heap-use-after-free)")
+    } else {
+        let deadline = system.monotonicNanoseconds() + 60000000000
+        let result = program(candidate, contextProgram, work + "/mutant-context", environment, deadline)
+        test.check(result.status == 1 && test.contains(result.errorOutput, "an argument passed to nodes has the wrong type"), "context: intended nested empty-literal type-context fault was not detected\n" + result.errorOutput)
+        remaining(deadline, 60)
+        print("context: detected by test_empty_literal_context_flows_through_nested_calls_and_add (an argument passed to nodes has the wrong type)")
+    }
+}
+test.removeTree(work)
+print("All three recursive compiler mutants detected")

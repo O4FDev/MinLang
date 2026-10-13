@@ -29,14 +29,15 @@ def main():
             env.update(ASAN_OPTIONS='detect_leaks=0',
                        MINYAR_TEST_RUNTIME=str(ROOT / 'build/ownership-runtime.o'),
                        MINYAR_TEST_LINK_FLAGS='-fsanitize=address,undefined')
-        for test in ('regressions.py', 'ownership.py', 'recursive-data.py'):
+        for test in ('regressions.py', 'ownership.py', 'recursive-data'):
             if args.sanitize:
                 # Deliberate runtime errors do not run normal-exit cleanup.
                 # Use the ordinary sanitizer runtime for those regressions;
                 # ownership/recursive tests also enforce exact reclamation.
                 runtime='minyar-runtime-sanitize.o' if test=='regressions.py' else 'ownership-runtime.o'
                 env['MINYAR_TEST_RUNTIME']=str(ROOT/'build'/runtime)
-            subprocess.run(['python3', str(ROOT / 'tests' / test)], env=env, check=True)
+            command = ['python3', str(ROOT / 'tests' / test)] if test.endswith('.py') else [str(ROOT / 'build/tooling/tests' / test)]
+            subprocess.run(command, env=env, check=True)
 
 
 if __name__ == '__main__':
