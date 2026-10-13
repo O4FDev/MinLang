@@ -281,9 +281,17 @@ def run(arguments: argparse.Namespace) -> None:
                   "samples": [], "preflights": [], "single_thread_pairs": [], "qualified": False}
     if resources:
         result.setdefault('resource_snapshots', []).append(resources)
-    before = cpu_ticks()
-    time.sleep(5)
-    activity = cpu_activity(before, cpu_ticks(), protocol["affinity"])
+    checks = []
+    for attempt in range(10):
+        before = cpu_ticks()
+        time.sleep(5)
+        activity = cpu_activity(before, cpu_ticks(), protocol["affinity"])
+        checks.append(activity)
+        if quiet(activity):
+            break
+        if attempt < 9:
+            time.sleep(30)
+    result.setdefault('preflight_waits', []).append({'item': item, 'checks': checks})
     result['preflights'].append(activity)
     if not resumed: result['preflight'] = activity
     # Retain failed and interrupted runs; never overwrite or filter their samples.
