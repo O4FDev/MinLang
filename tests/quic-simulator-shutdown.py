@@ -48,7 +48,7 @@ def run(source, sig):
         try:
             # Hang guards only: the assertions are the exit status and both flushes.
             deadline=time.monotonic()+30
-            while not all((root/name).exists() for name in ("left","right")):
+            while not all((root/name).exists() and (root/name).read_text().strip() for name in ("left","right")):
                 if process.poll() is not None or time.monotonic()>=deadline:
                     raise RuntimeError("capture writers did not become ready")
                 time.sleep(.01)
