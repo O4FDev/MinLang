@@ -11,7 +11,11 @@ public record Context { directory: Text; root: Text; compiler: Text; clang: Text
 public function context(directory: Text): Context {
     let location = test.run(["pwd", "-P"], system.environment(), "", directory + "/project", 10)
     test.require(location, "tar project location")
-    let environment = flags.environment(system.environment(), "ASAN_OPTIONS", "detect_leaks=1:halt_on_error=1")
+    let platform = test.run(["uname", "-s"], system.environment(), "", directory + "/platform", 10)
+    test.require(platform, "tar host platform")
+    let leaks = "0"
+    if test.lines(platform.output)[0] == "Linux" { leaks = "1" }
+    let environment = flags.environment(system.environment(), "ASAN_OPTIONS", "detect_leaks=" + leaks + ":halt_on_error=1")
     environment = flags.environment(environment, "UBSAN_OPTIONS", "halt_on_error=1")
     return Context { directory: directory; root: test.lines(location.output)[0]; compiler: test.setting("MINYAR_TEST_COMPILER", "./build/minyarc"); clang: test.setting("MINYAR_TEST_CLANG", "clang"); tools: test.setting("MINYAR_TAR_PROVIDER_TOOLS", "tools"); environment: environment; serial: [0]; providers: Map<Text, Provider>() }
 }
@@ -123,7 +127,8 @@ public function header(name: Text, data: Bytes, type: Integer): Bytes {
     test.check(raw.length <= 100, "test-only USTAR header name exceeds width")
     for index in 0..raw.length { output[index] = raw[index] }
     octal(output, 100, 8, 420); octal(output, 108, 8, 0); octal(output, 116, 8, 0)
-    octal(output, 124, 12, data.length); octal(output, 136, 12, 0); octal(output, 329, 8, 0); octal(output, 337, 8, 0)
+    octal(output, 124, 12, data.length); octal(output, 136, 12, 0)
+    if type == 51 || type == 52 { octal(output, 329, 8, 0); octal(output, 337, 8, 0) }
     output[156] = type
     let magic = Bytes("ustar")
     for index in 0..magic.length { output[257 + index] = magic[index] }
@@ -231,7 +236,7 @@ public function review(context: Context, sanitize: Boolean) {
         test.check(result.status == 0 && result.errorOutput == "", "tar public API regression: " + spec[0] + "\n" + result.output + result.errorOutput)
         if spec[1] == "bound" && spec[3] == "1" {
             let actual = Map<Text, Bytes>()
-            for line in test.lines(result.output) { let fields = line.split("|"); if fields.length == 3 && fields[0] == "ATTR" { actual[Text(hex.fromHex(fields[1]))] = hex.fromHex(fields[2]) } }
+            for line in test.lines(result.output) { let fields = line.split("|"); if fields.length >= 2 && fields[0] == "ATTR" { test.check(fields.length == 3, "tar review attribute protocol width changed: " + spec[0]); actual[Text(hex.fromHex(fields[1]))] = hex.fromHex(fields[2]) } }
             test.check(wire.sameAttributes(actual, scanned.entries[scanned.entries.length - 1].attributes), "tar review effective attribute map changed")
         } else if spec[1] == "path" || spec[1] == "hardlink" {
             test.check(scanned.reason == "", "tar review source is invalid")

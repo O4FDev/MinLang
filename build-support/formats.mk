@@ -10,11 +10,25 @@ check-compression: build/minyarc build/tooling/tests/compression-provider
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compression-provider
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/compression-codecs.py --mode native
 
-check-sha256: build/minyarc build/minyar-default-runtime.o
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/sha256.py
+build/tooling/tests/sha256-test: private TOOL_NATIVE = tests/sha256-test-native.c
+build/tooling/tests/sha256-test: private TOOL_LIBS = -lcrypto
+build/tooling/tests/sha256-test: tests/sha256-test-native.c
+check-sha256: build/minyarc build/minyar-default-runtime.o build/tooling/tests/sha256-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/sha256-test
 
-check-tar: build/minyarc
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/tar.py
+build/tooling/tests/tar-test: private TOOL_NATIVE = tests/sha256-test-native.c
+build/tooling/tests/tar-test: private TOOL_LIBS = -lcrypto
+build/tooling/tests/tar-test: tests/sha256-test-native.c
+build/tooling/tests/tar-review-test: private TOOL_NATIVE = tests/sha256-test-native.c
+build/tooling/tests/tar-review-test: private TOOL_LIBS = -lcrypto
+build/tooling/tests/tar-review-test: tests/sha256-test-native.c
+build/tooling/tests/tar-copy-count: private TOOL_NATIVE = tests/sha256-test-native.c
+build/tooling/tests/tar-copy-count: private TOOL_LIBS = -lcrypto
+build/tooling/tests/tar-copy-count: tests/sha256-test-native.c
+build/tooling/tests/tar-copy-count: private TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/tar-copy-count: build/testing/cycle-runtime.o
+check-tar: build/minyarc build/tooling/tests/tar-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/tar-test
 
 # Resolve one compiler path, including spaces/apostrophes and MSYS native
 # spellings. Keep selection target-scoped so ordinary portable builds retain
@@ -27,11 +41,11 @@ FORMATS_SANITIZER_ENV = PATH=$(call FORMATS_SANITIZER_QUOTE,$(if $(FORMATS_SANIT
 check-compression-sanitize: build/minyarc
 	$(FORMATS_SANITIZER_ENV) $(SANITIZER_LIMITED) python3 tests/compression-codecs.py --mode sanitize
 
-check-sha256-sanitize: build/minyarc
-	$(FORMATS_SANITIZER_ENV) $(SANITIZER_LIMITED) python3 tests/sha256.py --sanitize
+check-sha256-sanitize: build/minyarc build/tooling/tests/sha256-test
+	$(FORMATS_SANITIZER_ENV) $(SANITIZER_LIMITED) ./build/tooling/tests/sha256-test --sanitize
 
-check-tar-sanitize: build/minyarc
-	$(FORMATS_SANITIZER_ENV) $(SANITIZER_LIMITED) python3 tests/tar.py --sanitize
+check-tar-sanitize: build/minyarc build/tooling/tests/tar-test
+	$(FORMATS_SANITIZER_ENV) $(SANITIZER_LIMITED) ./build/tooling/tests/tar-test --sanitize
 
 check-format-provider:
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/format-provider.py
@@ -39,11 +53,14 @@ check-format-provider:
 check-formats-wiring: build/tooling/tests/formats-wiring
 	$(LIMITED) ./build/tooling/tests/formats-wiring
 
-check-formats-pipeline: build/minyarc
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/formats.py
+build/tooling/tests/formats-test: private TOOL_NATIVE = tests/formats-oracles-runtime.c
+build/tooling/tests/formats-test: private TOOL_LIBS = -lcrypto -lz -lzstd
+build/tooling/tests/formats-test: tests/formats-oracles-runtime.c
+check-formats-pipeline: build/minyarc build/tooling/tests/formats-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/formats-test
 
-check-formats-pipeline-sanitize: build/minyarc
-	$(FORMATS_SANITIZER_ENV) $(SANITIZER_LIMITED) python3 tests/formats.py --sanitize
+check-formats-pipeline-sanitize: build/minyarc build/tooling/tests/formats-test
+	$(FORMATS_SANITIZER_ENV) $(SANITIZER_LIMITED) ./build/tooling/tests/formats-test --sanitize
 
 .PHONY: check-erofs check-erofs-reference check-erofs-layers
 check-erofs: build/minyarc tests/erofs.min tests/erofs-api.min tests/erofs-thread-main.min tests/erofs-thread-worker.min tests/erofs-thread-helper.min tests/erofs-thread-legacy.min tests/erofs-thread-legacy-helper.min tests/erofs-layers.sh tests/erofs-layers.min tests/erofs-layer-driver.min tests/erofs-tree.c tests/erofs-layers-thread-main.min tests/erofs-layers-thread-worker.min tests/erofs-layers-thread-helper.min tests/erofs-layers-thread-legacy.min tests/erofs-layers-thread-legacy-helper.min library/erofs.min runtime/native/erofs.c runtime/native/erofs_layers.h
@@ -63,9 +80,15 @@ bench-compression: build/minyarc build/tooling/benchmarks/compression-bench
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/benchmarks/compression-bench --artifacts build/compression-benchmark --prepare-only --compiler "$(abspath build/minyarc)"
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/benchmarks/compression-bench --artifacts build/compression-benchmark --run-only
 
-bench-sha256: build/minyarc build/minyar-default-runtime.o
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/sha256-bench.py
+build/tooling/tests/sha256-bench-driver: private TOOL_NATIVE = tests/sha256-test-native.c
+build/tooling/tests/sha256-bench-driver: private TOOL_LIBS = -lcrypto
+build/tooling/tests/sha256-bench-driver: tests/sha256-test-native.c
+bench-sha256: build/minyarc build/minyar-default-runtime.o build/tooling/tests/sha256-bench-driver
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/sha256-bench-driver
 
+build/tooling/benchmarks/tar/run: private TOOL_NATIVE = tests/text-basics-benchmark-runtime.c tests/sha256-test-native.c
+build/tooling/benchmarks/tar/run: private TOOL_LIBS = -lcrypto
+build/tooling/benchmarks/tar/run: tests/text-basics-benchmark-runtime.c tests/sha256-test-native.c
 bench-tar: build/minyarc build/tooling/benchmarks/tar/run
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/benchmarks/tar/run --prepare
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/benchmarks/tar/run --measure
