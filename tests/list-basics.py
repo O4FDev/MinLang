@@ -4,7 +4,7 @@ import shlex
 import sys
 import unittest
 from regressions import CompilerTestCase, ROOT, CLANG, LINK_FLAGS
-from clang_helpers import clang_command
+from clang_helpers import asan_leak_options, clang_command
 
 sys.path.insert(0, str(ROOT / 'tools'))
 from cycle_runtime import engine_source
@@ -101,7 +101,7 @@ class RuntimeBasics(CompilerTestCase):
         profiles = [('eager', []), ('system', ['-DMINYAR_SYSTEM_HEAP=1']),
                     ('bounded', ['-DMINYAR_BOUNDED_HEAP=1', '-DMINYAR_RC_POLL_BUDGET=1']),
                     ('lazy', ['-DMINYAR_BOUNDED_HEAP=1', '-DMINYAR_LAZY_HEAP=1', '-DMINYAR_RC_POLL_BUDGET=1'])]
-        environment = dict(os.environ, ASAN_OPTIONS='detect_leaks=1:halt_on_error=1', UBSAN_OPTIONS='halt_on_error=1')
+        environment = dict(os.environ, ASAN_OPTIONS=asan_leak_options() + ':halt_on_error=1', UBSAN_OPTIONS='halt_on_error=1')
         for traced in (False, True):
             for name, flags in profiles:
                 for optimization in ('-O0', '-O2'):
