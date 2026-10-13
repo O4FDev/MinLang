@@ -1508,7 +1508,7 @@ class BuildWiring(unittest.TestCase):
                 'include ' + str(ROOT / 'build-support/peer-tests.mk').replace(' ', '\\ ') + '\n'
                 '.PHONY: ' + ' '.join(targets) + '\n' +
                 ' '.join(targets) + ':\n\t@echo ARTIFACT $@\n')
-            for suite in ('tests/peer-rust-go-zig.py', 'tests/peer-regressions.min'):
+            for suite in ('tests/peer-rust-go-zig.min', 'tests/peer-regressions.min'):
                 for gate in ('check-peer-regressions', 'check-peer-optimizations',
                              'check-peer-sanitize', 'check-peer-ownership'):
                     with self.subTest(suite=suite, gate=gate):
@@ -1524,7 +1524,7 @@ class BuildWiring(unittest.TestCase):
                             line.split('ARTIFACT ', 1)[1]
                             for line in result.stdout.splitlines()
                             if 'ARTIFACT ' in line}
-                        needs_driver = (suite == 'tests/peer-rust-go-zig.py'
+                        needs_driver = (suite == 'tests/peer-rust-go-zig.min'
                                         or gate == 'check-peer-ownership')
                         self.assertEqual(
                             'build/minyarc-errors-request' in artifacts,

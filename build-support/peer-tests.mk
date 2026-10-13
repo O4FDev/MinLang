@@ -1,12 +1,12 @@
-PEER_PROGRAMS = build/tooling/tests/peer-regressions build/tooling/tests/peer-cpp-java-js build/tooling/tests/peer-python-swift-ruby-lua
+PEER_PROGRAMS = build/tooling/tests/peer-regressions build/tooling/tests/peer-cpp-java-js build/tooling/tests/peer-python-swift-ruby-lua build/tooling/tests/peer-rust-go-zig
 $(PEER_PROGRAMS): TOOL_NATIVE = runtime/native/sha256.c
 $(PEER_PROGRAMS): TOOL_LIBS = $(TOOL_CRYPTO)
 $(PEER_PROGRAMS): TOOL_RUNTIME = build/testing/cycle-runtime.o
 $(PEER_PROGRAMS): runtime/native/sha256.c build/testing/cycle-runtime.o
-PEER_SUITES ?= tests/peer-regressions.min tests/peer-cpp-java-js.min tests/peer-rust-go-zig.py tests/peer-python-swift-ruby-lua.min
+PEER_SUITES ?= tests/peer-regressions.min tests/peer-cpp-java-js.min tests/peer-rust-go-zig.min tests/peer-python-swift-ruby-lua.min
 PEER_BASE_ARTIFACTS = build/minyarc build/minyarc-modules build/minyar-default-runtime.o
 # Only the extended Rust/Go/Zig suite exercises the POSIX incremental driver.
-peer_driver_artifacts = $(PEER_BASE_ARTIFACTS) $(if $(filter tests/peer-rust-go-zig.py tests/peer-rust-go-zig.min,$(1)),build/minyar-module-build build/minyarc-errors-request)
+peer_driver_artifacts = $(PEER_BASE_ARTIFACTS) $(if $(filter tests/peer-rust-go-zig.min,$(1)),build/minyar-module-build build/minyarc-errors-request)
 PEER_DRIVER_ARTIFACTS = $(call peer_driver_artifacts,$(PEER_SUITES))
 
 # managed-graphs.mk (read earlier: build-support/*.mk is included sorted) adds
@@ -202,8 +202,8 @@ check-peer-ownership-cpp-java-js: $(PEER_OWNERSHIP_ARTIFACTS) build/tooling/test
 		PeerCppJavaJs.test_seeded_short_fill_generator_and_boundary_supplements \
 		PeerCppJavaJs.test_seeded_int_fill_generator_and_boundary_supplements
 
-check-peer-ownership-rust-go-zig: $(PEER_OWNERSHIP_ARTIFACTS) build/minyar-module-build build/minyarc-errors-request
-	$(PEER_OWNERSHIP_RUN) python3 tests/peer-rust-go-zig.py \
+check-peer-ownership-rust-go-zig: $(PEER_OWNERSHIP_ARTIFACTS) build/minyar-module-build build/minyarc-errors-request build/tooling/tests/peer-rust-go-zig
+	$(PEER_OWNERSHIP_RUN) ./build/tooling/tests/peer-rust-go-zig \
 		PeerRustGoZig.test_returned_lists_branch_alias_and_fresh_result \
 		PeerRustGoZig.test_record_list_literal_helper_and_direct_elements \
 		PeerRustGoZig.test_repeated_record_branch_returns_and_original_copy \
