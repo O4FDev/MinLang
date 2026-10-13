@@ -243,6 +243,58 @@ function main(): Integer {
     if c.state != quic.ESTABLISHED || s.state != quic.ESTABLISHED || !c.confirmed || !s.confirmed ||
        c.pending.length != 0 || s.pending.length != 0 || c.spaces[2].sent.length != 0 || s.spaces[2].sent.length != 0 { return 90 }
     let pn = max(s.spaces[2].next, c.spaces[2].largest + 1); let ping = crypto.fromHex("01")
+    if mode == 51 || mode == 52 {
+        let id = errors.integerValue(quic.openStream(c,false)); let other = errors.integerValue(quic.openStream(c,false))
+        let body = bytes(64000)
+        if quic.writableStreamBytes(c,id) != 64000 || quic.writableStreamBytes(c,999) != 0 { return 68 }
+        let oversized = quic.writeStream(c,id,bytes(64001),true)
+        if errors.integerOk(oversized) || !errors.isWouldBlock(errors.integerError(oversized)) || c.pending.length != 0 || c.sentData != 0 || c.streams[0].sendClosed { return 68 }
+        let streamLimit = c.streams[0].sendLimit; let connectionLimit = c.peerMaxData
+        c.streams[0].sendLimit = 999; c.peerMaxData = 500
+        if quic.writableStreamBytes(c,id) != 500 { return 68 }
+        c.peerMaxData = connectionLimit
+        if quic.writableStreamBytes(c,id) != 999 { return 68 }
+        c.streams[0].sendLimit = streamLimit
+        if mode == 52 {
+            if errors.integerValue(quic.writeStream(c,id,body.slice(0,63000),false)) != 63000 || quic.writableStreamBytes(c,other) != 1000 { return 68 }
+            let blocked = quic.writeStream(c,other,bytes(1001),true)
+            if errors.integerOk(blocked) || !errors.isWouldBlock(errors.integerError(blocked)) || c.streams[1].sendOffset != 0 || c.streams[1].sendClosed { return 68 }
+            if errors.integerValue(quic.writeStream(c,other,Bytes(),true)) != 0 || !c.streams[1].sendClosed || c.pending.length != 64 { return 68 }
+        } else if errors.integerValue(quic.writeStream(c,id,body,false)) != body.length { return 68 }
+        let before = c.sentData; let offset = c.streams[0].sendOffset
+        let blocked = quic.writeStream(c,id,bytes(1),true)
+        let empty = quic.writeStream(c,id,Bytes(),true)
+        if errors.integerOk(blocked) || errors.integerOk(empty) || !errors.isWouldBlock(errors.integerError(blocked)) ||
+           !errors.isWouldBlock(errors.integerError(empty)) || c.sentData != before || c.streams[0].sendOffset != offset ||
+           c.streams[0].sendClosed || c.pending.length != 64 || quic.writableStreamBytes(c,id) != 0 || quic.writableStreamBytes(c,other) != 0 { return 68 }
+        let window = c.congestion.window; c.congestion.window = 0
+        if quic.poll(c,2000).length != 0 || quic.writableStreamBytes(c,id) != 0 { return 68 }
+        c.congestion.window = window
+        let received = Bytes(); let dropped = false; let finished = false
+        for tick in 0..2000 {
+            let now = 2010 + tick
+            for data in quic.poll(c,now) {
+                if !dropped { dropped = true }
+                else { quic.receivePath(s,data,7,now) }
+            }
+            let read = quic.readStream(s,id)
+            if errors.bytesOk(read) { received.addBytes(errors.bytesValue(read)) }
+            for entry in quic.pollDatagrams(s,now) { if entry.pathId == 7 { quic.receive(c,entry.data,now) } }
+            if !finished && c.pending.length < 64 {
+                if quic.writableStreamBytes(c,id) <= 0 { print("drained queue did not restore capacity"); return 69 }
+                if !errors.integerOk(quic.writeStream(c,id,Bytes(),true)) { print("drained queue rejected FIN"); return 69 }
+                finished = true
+            }
+            if finished && received.length == offset && c.streams[0].finalAcknowledged && s.activePath == 7 { break }
+        }
+        if !finished || !dropped || s.activePath != 7 || crypto.hex(received) != crypto.hex(body.slice(0,offset)) ||
+           !c.streams[0].finalAcknowledged || quic.writableStreamBytes(c,id) != 0 || c.flight != flightBytes(c) {
+            print("backpressure recovery: path " + Text(s.activePath) + " received " + Text(received.length) + " expected " + Text(offset) + " FIN ACK " + Text(c.streams[0].finalAcknowledged)); return 69
+        }
+        if mode == 51 {
+            if quic.writableStreamBytes(c,other) <= 0 || !errors.integerOk(quic.writeStream(c,other,bytes(1000),true)) { return 69 }
+        }
+    }
     if mode == 50 {
         if !destinationWidth(s,c,20) { return 90 }
         let first = max(c.spaces[2].next,s.spaces[2].largest + 1)

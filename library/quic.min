@@ -1882,6 +1882,16 @@ public function writeStream(connection: Connection, id: Integer, data: Bytes, fi
 public function writeEarlyStream(connection: Connection, id: Integer, data: Bytes, fin: Boolean): errors.IntegerResult {
     return write(connection, id, data, fin, true)
 }
+function writableFrames(connection: Connection): Integer {
+    return max(0,min(64 - connection.pending.length,3072 - connection.pending.length - connection.history.length))
+}
+public function writableStreamBytes(connection: Connection, id: Integer): Integer {
+    let index = streamIndex(connection,id)
+    if connection.state != ESTABLISHED || index < 0 || (connection.earlyRejected && contains(connection.earlyStreams,id)) { return 0 }
+    let output = connection.streams[index]
+    if output.sendReset || output.sendClosed || (!localInitiated(connection,id) && (id & 2) != 0) { return 0 }
+    return max(0,min(writableFrames(connection) * 1000,min(output.sendLimit - output.sendOffset,connection.peerMaxData - connection.sentData)))
+}
 function write(connection: Connection, id: Integer, data: Bytes, fin: Boolean, early: Boolean): errors.IntegerResult {
     if connection.earlyRejected && contains(connection.earlyStreams, id) { return errors.integerFailure(errors.make(earlyRejectedCode(), 0, "QUIC early stream was rejected; explicit retry required")) }
     if early && (!connection.clientRole || connection.state != STARTING || connection.earlyWrite.key.length == 0 || !contains(connection.earlyStreams, id)) {
@@ -1893,10 +1903,11 @@ function write(connection: Connection, id: Integer, data: Bytes, fin: Boolean, e
     if output.sendReset { return errors.integerFailure(errors.make(streamResetCode(),output.sendResetCode,"QUIC stream sending was reset")) }
     if output.sendClosed || (!localInitiated(connection, id) && (id & 2) != 0) { return errors.integerFailure(errors.make(errors.closedCode(), 0, "QUIC stream is send-closed")) }
     let count = min(data.length, min(output.sendLimit - output.sendOffset, connection.peerMaxData - connection.sentData))
-    let retained = connection.pending.length + connection.history.length
+    let frames = (data.length + 999) / 1000
+    if fin && data.length == 0 { frames = 1 }
     // Application data leaves room for recovery/control packets. Checking only
     // pending data lets a full queue fail when in-flight packets need retry.
-    if count < data.length || data.length > 1048576 || retained + (data.length + 999) / 1000 > 3072 { return errors.integerFailure(errors.make(errors.wouldBlockCode(), 0, "QUIC flow credit or send buffer exhausted")) }
+    if count < data.length || data.length > 1048576 || frames > writableFrames(connection) { return errors.integerFailure(errors.make(errors.wouldBlockCode(), 0, "QUIC flow credit or send buffer exhausted")) }
     let at = 0
     while at < count || (fin && count == 0) {
         let length = min(1000, count - at); let type = 14
