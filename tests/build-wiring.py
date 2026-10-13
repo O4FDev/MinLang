@@ -1786,6 +1786,102 @@ class BuildWiring(unittest.TestCase):
             with self.subTest(omitted_source=missing), self.assertRaises(ValueError):
                 catalogue.validate(candidate, ROOT)
 
+    def test_quic_python_preparation_publishes_only_verified_inputs(self):
+        import importlib.util
+        import json
+        from unittest.mock import patch
+        spec = importlib.util.spec_from_file_location(
+            'official_adapter_publication', ROOT/'scripts/check-quic-official-inputs.py')
+        checker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(checker)
+        for failure in ('venv', 'pip', 'verify', 'race', ''):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory(
+                    prefix='controls cache publication ') as folder:
+                root = Path(folder).resolve()
+                destination = root/'controls'
+                stages = []
+                def command(argv, timeout=30):
+                    self.assertFalse(destination.exists())
+                    if 'venv' in argv:
+                        stage = Path(argv[-1])
+                        stages.append(stage)
+                        (stage/'bin').mkdir()
+                        (stage/'bin/python').symlink_to(sys.executable)
+                        (stage/'pyvenv.cfg').write_text('retained environment\n')
+                        if failure == 'venv':
+                            raise subprocess.CalledProcessError(1, argv)
+                        return b''
+                    if 'pip' in argv:
+                        if failure == 'pip':
+                            raise subprocess.CalledProcessError(1, argv)
+                        return b''
+                    self.assertIn('verify-python', argv)
+                    if failure == 'verify':
+                        return b'{}'
+                    prefix = Path(argv[5].split('=', 1)[1])
+                    checker.require_empty_pycache(prefix)
+                    module = checker.binding(stages[-1]/'pyvenv.cfg')
+                    report = {'verified': True,
+                              'contract': checker.requirements_contract(checker.REQUIREMENTS),
+                              'implementation': 'cpython',
+                              'python': checker.binding((stages[-1]/'bin/python').resolve()),
+                              'module': module, 'packages': [module],
+                              'bytecode_route': {'prefix': str(prefix),
+                                                 'dont_write_bytecode': True}}
+                    if failure == 'race':
+                        destination.mkdir()
+                        (destination/'sentinel').write_bytes(b'other cache')
+                    return json.dumps(report).encode()
+                with patch.object(checker, 'require_linux'), \
+                        patch.object(checker, 'require_supported_python'), \
+                        patch.object(checker.Commands, 'run', side_effect=command):
+                    if failure:
+                        with self.assertRaises((ValueError, OSError,
+                                                subprocess.CalledProcessError)):
+                            checker.prepare_python(destination, checker.REQUIREMENTS)
+                    else:
+                        result = checker.prepare_python(destination, checker.REQUIREMENTS)
+                        self.assertTrue(result['verified'])
+                self.assertEqual(len(stages), 1)
+                self.assertEqual((stages[0]/'pyvenv.cfg').read_text(),
+                                 'retained environment\n')
+                if failure == 'race':
+                    self.assertEqual((destination/'sentinel').read_bytes(), b'other cache')
+                    self.assertFalse((destination/'.ready.json').exists())
+                elif failure:
+                    self.assertFalse(destination.exists())
+                    self.assertFalse(destination.is_symlink())
+                    self.assertFalse((stages[0]/'.ready.json').exists())
+                    original = (stages[0]/'pyvenv.cfg').stat().st_mtime_ns
+                    failure = ''
+                    with patch.object(checker, 'require_linux'), \
+                            patch.object(checker, 'require_supported_python'), \
+                            patch.object(checker.Commands, 'run', side_effect=command):
+                        self.assertTrue(checker.prepare_python(
+                            destination, checker.REQUIREMENTS)['verified'])
+                    self.assertEqual(len(stages), 2)
+                    self.assertEqual(destination.resolve(), stages[-1])
+                    self.assertFalse((stages[0]/'.ready.json').exists())
+                    self.assertEqual((stages[0]/'pyvenv.cfg').stat().st_mtime_ns, original)
+                else:
+                    self.assertTrue(destination.is_symlink())
+                    self.assertEqual(destination.resolve(), stages[0])
+                    self.assertTrue(json.loads((destination/'.ready.json').read_text())['verified'])
+                    with patch.object(checker.Commands, 'run') as launched:
+                        with self.assertRaises(ValueError):
+                            checker.prepare_python(destination, checker.REQUIREMENTS)
+                        launched.assert_not_called()
+        with tempfile.TemporaryDirectory(prefix='dangling controls cache ') as folder:
+            destination = Path(folder).resolve()/'controls'
+            destination.symlink_to(destination.parent/'missing', target_is_directory=True)
+            with patch.object(checker, 'require_linux'), \
+                    patch.object(checker, 'require_supported_python'), \
+                    patch.object(checker.Commands, 'run') as launched:
+                with self.assertRaises(ValueError):
+                    checker.prepare_python(destination, checker.REQUIREMENTS)
+                launched.assert_not_called()
+            self.assertTrue(destination.is_symlink())
+
     def test_quic_official_prerequisites_refuse_false_readiness(self):
         import hashlib
         import importlib.util

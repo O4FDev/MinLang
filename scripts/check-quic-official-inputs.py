@@ -359,15 +359,17 @@ def prepare_python(directory, requirements):
     require_supported_python()
     directory = Path(directory)
     requirements_contract(requirements)
-    if not directory.is_absolute() or directory.exists():
+    if not directory.is_absolute() or directory.exists() or directory.is_symlink():
         raise ValueError('default Python cache must be fresh; existing inputs are not repaired')
-    directory.mkdir(parents=True)
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=directory.name+'.stage.',
+                                  dir=directory.parent)).resolve()
     commands = Commands()
-    commands.run([sys.executable, '-E', '-m', 'venv', str(directory)], timeout=180)
-    python = directory/'bin/python'
+    commands.run([sys.executable, '-E', '-m', 'venv', str(stage)], timeout=180)
+    python = stage/'bin/python'
     commands.run([str(python), '-E', '-m', 'pip', '--disable-pip-version-check',
                   'install', '--only-binary=:all:', '-r', str(requirements)], timeout=180)
-    prefix = Path(tempfile.mkdtemp(prefix='verified-source.', dir=directory))
+    prefix = Path(tempfile.mkdtemp(prefix='verified-source.', dir=stage))
     raw = commands.run(fresh_python_argv(
         python, [str(Path(__file__).resolve()), 'verify-python',
                  '--requirements', str(requirements)], prefix), timeout=30)
@@ -381,7 +383,8 @@ def prepare_python(directory, requirements):
                                              'dont_write_bytecode': True}):
         raise ValueError('controls import verification did not produce readiness')
     require_empty_pycache(prefix)
-    write_ready(directory/'.ready.json', report)
+    write_ready(stage/'.ready.json', report)
+    directory.symlink_to(stage, target_is_directory=True)
     return {'verified': True, 'published': str(directory),
             'preparation_commands': commands.rows, 'python': report}
 
