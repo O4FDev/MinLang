@@ -15,7 +15,22 @@ import threading
 
 
 def openssl(*arguments):
-    return subprocess.run(['openssl', *map(str, arguments)], check=True, capture_output=True, text=True).stdout
+    return subprocess.run(['openssl', *map(str, arguments)], check=True, capture_output=True, text=True, timeout=30).stdout
+
+
+class TLSServer(ThreadingHTTPServer):
+    def __init__(self, address, handler, context):
+        self.context = context
+        super().__init__(address, handler)
+
+    def get_request(self):
+        connection, address = super().get_request()
+        connection.settimeout(10)
+        try:
+            return self.context.wrap_socket(connection, server_side=True), address
+        except BaseException:
+            connection.close()
+            raise
 
 
 class Peer:
@@ -56,13 +71,12 @@ class Peer:
                 self.end_headers()
                 self.wfile.write(b'ok')
 
-        self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_3
         context.load_cert_chain(self.directory/'os-server.pem', self.directory/'os-server.key')
         context.verify_mode = ssl.CERT_REQUIRED
         context.load_verify_locations(client_certificate)
-        self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
+        self.server = TLSServer(('127.0.0.1', 0), Handler, context)
         class Spy(BaseHTTPRequestHandler):
             def log_message(self, *_):
                 pass
@@ -74,10 +88,9 @@ class Peer:
                 self.end_headers()
                 self.wfile.write(b'ok')
 
-        self.spy = ThreadingHTTPServer(('127.0.0.1', 0), Spy)
         spy_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         spy_context.load_cert_chain(self.directory/'os-server.pem', self.directory/'os-server.key')
-        self.spy.socket = spy_context.wrap_socket(self.spy.socket, server_side=True)
+        self.spy = TLSServer(('127.0.0.1', 0), Spy, spy_context)
         self.spy_thread = threading.Thread(target=self.spy.serve_forever, daemon=True)
         self.spy_thread.start()
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -95,16 +108,24 @@ class Peer:
         installed = False
         try:
             subprocess.run(['sudo', '-n', 'security', 'add-trusted-cert', '-d', '-r', 'trustRoot', '-k', keychain, self.root],
-                           check=True, capture_output=True)
+                           check=True, capture_output=True, timeout=30)
             installed = True
             yield
         finally:
             # Exact freshly generated certificate only. A cleanup failure fails
             # the test; it cannot turn a failed handshake into a pass.
-            untrust = subprocess.run(['sudo', '-n', 'security', 'remove-trusted-cert', '-d', self.root], capture_output=True)
-            delete = subprocess.run(['sudo', '-n', 'security', 'delete-certificate', '-Z', fingerprint, keychain], capture_output=True)
-            if installed and (untrust.returncode or delete.returncode):
-                raise RuntimeError('could not remove the disposable OS TLS root')
+            failures = []
+            for command in (['sudo', '-n', 'security', 'remove-trusted-cert', '-d', self.root],
+                            ['sudo', '-n', 'security', 'delete-certificate', '-Z', fingerprint, keychain]):
+                try:
+                    result = subprocess.run(command, capture_output=True, timeout=30)
+                except subprocess.TimeoutExpired as error:
+                    failures.append(str(error))
+                else:
+                    if result.returncode:
+                        failures.append(result.stderr.decode(errors='replace'))
+            if installed and failures:
+                raise RuntimeError('could not remove the disposable OS TLS root: ' + '; '.join(failures))
 
     def close(self):
         self.server.shutdown()

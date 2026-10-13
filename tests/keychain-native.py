@@ -15,11 +15,11 @@ with tempfile.TemporaryDirectory(prefix='minyar-keychain-', dir=ROOT/'build') as
     temp = Path(directory)
     subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','1',
                     '-subj','/CN=Minyar key test','-keyout',str(temp/'key.pem'),
-                    '-out',str(temp/'cert.pem')], check=True, capture_output=True)
+                    '-out',str(temp/'cert.pem')], check=True, capture_output=True, timeout=30)
     subprocess.run(['openssl','pkcs12','-export','-legacy','-name','Minyar key test',
                     '-in',str(temp/'cert.pem'),'-inkey',str(temp/'key.pem'),
                     '-passout','pass:minyar-test','-out',str(temp/'identity.p12')],
-                   check=True, capture_output=True)
+                   check=True, capture_output=True, timeout=30)
     clang = os.environ.get('MINYAR_TEST_CLANG', 'clang')
     peer = Peer(temp, temp/'cert.pem') if os.environ.get('GITHUB_ACTIONS') == 'true' else None
     if peer:
@@ -39,14 +39,14 @@ with tempfile.TemporaryDirectory(prefix='minyar-keychain-', dir=ROOT/'build') as
         runtime=temp/(mode+'-runtime.o')
         objc=temp/(mode+'-http.o')
         subprocess.run([clang,*flags,'-DMINYAR_SYSTEM_HEAP=1','-c',
-                        ROOT/'runtime/minyar_runtime.c','-o',runtime],check=True)
+                        ROOT/'runtime/minyar_runtime.c','-o',runtime],check=True,timeout=120)
         subprocess.run([clang,'-fobjc-arc','-fmodules','-Wall','-Wextra','-Werror',*flags,
-                        '-c',ROOT/'tests/http-identity-native.m','-o',objc],check=True)
+                        '-c',ROOT/'tests/http-identity-native.m','-o',objc],check=True,timeout=120)
         subprocess.run([clang,'-std=c11','-Wall','-Wextra','-Werror',
                         '-DMINYAR_SYSTEM_HEAP=1','-DMINYAR_TEST_HTTP=1',*flags,str(ROOT/'tests/keychain-native.c'),
                         str(ROOT/'runtime/native/keychain.c'),str(ROOT/'runtime/native/tlsverify.c'),
                         runtime,objc,'-framework','Security','-framework','AppKit',
-                        '-framework','CoreFoundation','-o',str(executable)],check=True)
+                        '-framework','CoreFoundation','-o',str(executable)],check=True,timeout=120)
         if peer:
             execute(executable,temp/(mode+'-untrusted.keychain-db'),rejected=True)
             before=peer.accepted
