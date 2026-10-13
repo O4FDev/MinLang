@@ -1,4 +1,5 @@
 set -eu
+export LC_ALL=C
 test "$(uname -s)" = Linux
 clang=${MINYAR_TEST_CLANG:-/usr/lib/llvm-23/bin/clang}
 fsck=${MINYAR_EROF_FSCK:-/usr/bin/fsck.erofs}

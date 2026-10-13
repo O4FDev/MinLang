@@ -24,6 +24,37 @@ function finish(output: tar.Writer): Bytes {
     require(errors.bytesOk(result), "layer fixture finish")
     return errors.bytesValue(result)
 }
+function paxRecord(value: Text): Bytes {
+    let size = Bytes(value).length + 3
+    for iteration in 0..8 {
+        let next = Bytes(Text(size) + " " + value + "\n").length
+        if next == size { return Bytes(Text(size) + " " + value + "\n") }
+        size = next
+    }
+    fail("PAX fixture record length")
+}
+function unicodeMember(path: Text, kind: Integer, data: Text, link: Text): Bytes {
+    let payload = paxRecord("path=" + path)
+    payload.addBytes(paxRecord("mtime=1700000500.123456789"))
+    if link != "" { payload.addBytes(paxRecord("linkpath=" + link)) }
+    let extension = tar.writer(8192)
+    let value = member("PaxHeaders/unicode", tar.REGULAR, payload, 420, "")
+    value.mtimeNanos = 0; add(extension, value, payload)
+    let wire = finish(extension)
+    wire[156] = 120
+    for index in 148..156 { wire[index] = 32 }
+    let checksum = 0
+    for index in 0..512 { checksum = checksum + Integer(wire[index]) }
+    for digit in 0..6 { wire[153 - digit] = 48 + checksum % 8; checksum = checksum / 8 }
+    wire[154] = 0; wire[155] = 32
+    let output = wire.slice(0, wire.length - 1024)
+    let body = tar.writer(8192)
+    value = member("UnicodeEntry", kind, Bytes(data), 416, "UnicodeTarget")
+    if kind == tar.SYMLINK { value.mode = 511 }
+    value.mtimeNanos = 0; add(body, value, Bytes(data))
+    output.addBytes(finish(body))
+    return output
+}
 let directory = argument(0)
 let lower = tar.writer(16777216)
 put(lower, "switch", tar.REGULAR, "old", 420, "")
@@ -69,6 +100,14 @@ value.attributes.add(tar.Attribute { key: Bytes("SCHILY.xattr.user.root"); value
 value.attributes.add(tar.Attribute { key: Bytes("SCHILY.acl.default"); value: Bytes("user::rwx,user:1234:rwx,group::r-x,mask::rwx,other::--x") })
 add(upper, value, Bytes())
 let wire = finish(upper)
+let unicode = "Főtanúsítvány.pem"
+for kind in 0..3 {
+    let extra = Bytes()
+    if kind == 0 { extra = unicodeMember(unicode, tar.REGULAR, "unicode-cert", "") }
+    if kind == 1 { extra = unicodeMember("unicode-link", tar.SYMLINK, "", unicode) }
+    if kind == 2 { extra = unicodeMember("unicode-hard", tar.HARDLINK, "", unicode) }
+    wire = wire.slice(0, wire.length - 1024); wire.addBytes(extra)
+}
 let compressed = zstd.compress(wire, 3, 16777216)
 require(zstd.ok(compressed), "layer zstd fixture")
 writeBytesFile(directory + "/upper.tar.zstd", zstd.data(compressed))

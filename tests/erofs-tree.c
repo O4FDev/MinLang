@@ -142,6 +142,10 @@ static void layered(const char *root) {
     const char *aliases[] = {"forward-one","forward-two"};
     for (unsigned n = 0; n < 2; ++n) { char *path = join(root,aliases[n]); require(!link(data,path), "forward hardlink"); free(path); }
     free(data);
+    layer_file(root,"Főtanúsítvány.pem","unicode-cert",0640);
+    char *unicode = join(root,"Főtanúsítvány.pem"), *unicode_hard = join(root,"unicode-hard"), *unicode_link = join(root,"unicode-link");
+    require(!link(unicode,unicode_hard) && !symlink("Főtanúsítvány.pem",unicode_link), "Unicode layer links");
+    layer_metadata(unicode_link,0777,70000,80000);free(unicode);free(unicode_hard);free(unicode_link);
     layer_file(root,"epoch","epoch",0641);
     char *epoch = join(root,"epoch"); struct timespec epoch_times[2] = {{-1,750000000},{-1,750000000}};
     require(!utimensat(AT_FDCWD,epoch,epoch_times,AT_SYMLINK_NOFOLLOW), "negative fractional epoch");free(epoch);
