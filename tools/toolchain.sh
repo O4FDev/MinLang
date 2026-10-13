@@ -455,11 +455,46 @@ $version_line
     publish_stamp "$target" "$content"
 }
 
+host_path() {
+    _value=$1
+    case $_value in
+        [A-Za-z]:[\\/]*|\\\\*)
+            case $(host_system) in MSYS*|MINGW*|CYGWIN*) _value=$(cygpath -u "$_value") ;; esac ;;
+    esac
+    case $_value in
+        //[!/]*|//) _root=//; _rest=${_value#//} ;;
+        /*) _root=/; _rest=${_value#"${_value%%[!/]*}"} ;;
+        *) _root=; _rest=$_value ;;
+    esac
+    _parts=
+    _old_ifs=$IFS
+    IFS=/
+    set -f
+    for _part in $_rest; do
+        case $_part in ''|.) ;; *) _parts="$_parts${_parts:+/}$_part" ;; esac
+    done
+    set +f
+    IFS=$_old_ifs
+    host_value=$_root$_parts
+    [ -n "$host_value" ] || host_value=.
+}
+
+host_directory() {
+    host_path "$1"
+    case $_parts in
+        '') ;;
+        */*) host_value=$_root${_parts%/*} ;;
+        *) host_value=${_root:-.} ;;
+    esac
+}
+
 command=${1-}
 [ "$#" -eq 0 ] || shift
 usage='usage: toolchain.sh toolchain | doctor | version PROJECT | stamp TARGET | bootstrap PROJECT TARGET...'
 case $command:$# in
     stamp:1) stamp "$1" ;;
+    host-path:1) host_path "$1"; printf '%s\n' "$host_value" ;;
+    host-directory:1) host_directory "$1"; printf '%s\n' "$host_value" ;;
     toolchain:0) toolchain ;;
     doctor:0) doctor ;;
     version:1) version "$1" ;;

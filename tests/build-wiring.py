@@ -2195,11 +2195,6 @@ class BuildWiring(unittest.TestCase):
                 'if sys.argv[1:2] == ["tests/os-tlsverify.py"]:\n'
                 ' print(json.dumps({"clang":os.environ.get("MINYAR_CLANG"),'
                 '"path":os.environ["PATH"],"argv":sys.argv[1:]}));sys.exit(0)\n'
-                'if os.environ.get("OS_TLS_PROBE_MSYS") and sys.argv[1:2] == ["-c"]:\n'
-                ' sys.path.insert(0,"tools");import host_paths\n'
-                ' host_paths.platform.system=lambda:"MSYS_NT-10.0"\n'
-                ' code=sys.argv[2];sys.argv=["-c",*sys.argv[3:]]\n'
-                ' exec(code,{"__name__":"__main__"});sys.exit(0)\n'
                 'os.execv(sys.executable,[sys.executable,*sys.argv[1:]])\n')
             python.chmod(0o755)
             converter = binaries / 'cygpath'
@@ -2225,7 +2220,7 @@ class BuildWiring(unittest.TestCase):
                     '\n.PHONY: build/minyarc\nbuild/minyarc:\n\t@:\n')
                 selected_environment = environment.copy()
                 if msys:
-                    selected_environment.update(OS_TLS_PROBE_MSYS='1',
+                    selected_environment.update(MINYAR_TEST_HOST_SYSTEM='MSYS_NT-10.0',
                         OS_TLS_PROBE_TRANSLATIONS=json.dumps({sanitizer: selected_compiler}))
                 for target, expected_compiler, arguments in (
                         ('check-os-tlsverify', ordinary, []),
@@ -2243,7 +2238,7 @@ class BuildWiring(unittest.TestCase):
                         expected_path = (selected_directory or str(Path(sanitizer).parent)) + os.pathsep + expected_path
                     self.assertEqual(selected['path'], expected_path)
                 if sanitizer:
-                    self.assertIn('tools/host_paths.py', sanitizer_rule)
+                    self.assertIn('tools/toolchain.sh', sanitizer_rule)
 
             for value in ('', str(directory / 'sanitizer/bin/clang'),
                           str(directory / 'LLVM 23/bin/clang'),
@@ -2280,7 +2275,7 @@ class BuildWiring(unittest.TestCase):
             for mutant in (
                     fragment.replace(quote_rule, 'OS_TLS_SANITIZER_QUOTE = $(1)', 1),
                     fragment.replace('check-sanitize: check-os-tlsverify-sanitize', '', 1),
-                    fragment.replace(sanitizer_rule, sanitizer_rule.replace('tools/host_paths.py', ''), 1)):
+                    fragment.replace(sanitizer_rule, sanitizer_rule.replace('tools/toolchain.sh', ''), 1)):
                 with self.assertRaises(AssertionError):
                     verify(mutant, str(directory / "LLVM's 23/bin/clang"))
 
@@ -2380,11 +2375,6 @@ class BuildWiring(unittest.TestCase):
                 'if sys.argv[1:2] == ["tests/net-udp-offload.py"]:\n'
                 ' print(json.dumps({"clang":os.environ.get("MINYAR_TEST_CLANG"),"path":os.environ["PATH"],'
                 '"limit":os.environ.get("NET_PROBE_LIMIT"),"argv":sys.argv[1:]}));sys.exit(0)\n'
-                'if os.environ.get("NET_PROBE_MSYS") and sys.argv[1:2] == ["-c"]:\n'
-                ' sys.path.insert(0,"tools");import host_paths\n'
-                ' host_paths.platform.system=lambda:"MSYS_NT-10.0"\n'
-                ' code=sys.argv[2];sys.argv=["-c",*sys.argv[3:]]\n'
-                ' exec(code,{"__name__":"__main__"});sys.exit(0)\n'
                 'os.execv(sys.executable,[sys.executable,*sys.argv[1:]])\n')
             python.chmod(0o755)
             converter = binaries / 'cygpath'
@@ -2432,7 +2422,7 @@ class BuildWiring(unittest.TestCase):
                     "\"clang\":os.environ[\"LLVM_CC\"],\"path\":os.environ[\"PATH\"]}))'\n")
                 selected_environment = environment.copy()
                 if msys:
-                    selected_environment.update(NET_PROBE_MSYS='1',
+                    selected_environment.update(MINYAR_TEST_HOST_SYSTEM='MSYS_NT-10.0',
                         NET_PROBE_TRANSLATIONS=json.dumps({sanitizer: selected_compiler}))
                 for target, script, arguments, prerequisites in targets:
                     result = subprocess.run(['make', '--no-print-directory', '-j1', '-rR', '-s',
@@ -2457,7 +2447,7 @@ class BuildWiring(unittest.TestCase):
                     rule = next(line for line in candidate.splitlines() if line.startswith(target + ':'))
                     if sanitizer or not sanitize:
                         self.assertEqual(set(rule.split(':', 1)[1].split()), prerequisites |
-                                         ({'tools/host_paths.py'} if sanitize else set()) |
+                                         ({'tools/toolchain.sh'} if sanitize else set()) |
                                          ({connect} if script == connect else set()), target)
 
             # Expected spellings and complete parents are independent of the Make selector.
@@ -2485,7 +2475,7 @@ class BuildWiring(unittest.TestCase):
                     (recipe, recipe.replace(('MINYAR_CLANG' if script == connect
                         else 'MINYAR_TEST_CLANG') + '=$(call NET_SANITIZER_QUOTE,$(NET_SANITIZER_CLANG)) ', '')),
                     (recipe, recipe.replace('PATH="$(NET_SANITIZER_PATH)" ', '')),
-                    (rule, rule.replace(' tools/host_paths.py', ''))))
+                    (rule, rule.replace(' tools/toolchain.sh', ''))))
             clang_rule = next(line for line in fragment.splitlines() if line.startswith('NET_SANITIZER_CLANG ='))
             path_rule = next(line for line in fragment.splitlines() if line.startswith('NET_SANITIZER_PATH ='))
             mutants.extend((

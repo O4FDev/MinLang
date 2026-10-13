@@ -35,8 +35,8 @@ check-tar: build/minyarc build/tooling/tests/tar-test
 # spellings. Keep selection target-scoped so ordinary portable builds retain
 # LLVM_CC. The guest's matching pkg-config configuration selects its providers.
 FORMATS_SANITIZER_QUOTE = '$(subst ','"'"',$(1))'
-FORMATS_SANITIZER_CLANG = $(if $(MINYAR_SANITIZER_CLANG),$(shell python3 -c 'import sys; sys.path.insert(0, "tools"); from host_paths import host_path; print(host_path(sys.argv[1]))' $(call FORMATS_SANITIZER_QUOTE,$(MINYAR_SANITIZER_CLANG))),$(LLVM_CC))
-FORMATS_SANITIZER_DIRECTORY = $(if $(MINYAR_SANITIZER_CLANG),$(shell python3 -c 'import sys; sys.path.insert(0, "tools"); from host_paths import host_path; print(host_path(sys.argv[1]).parent)' $(call FORMATS_SANITIZER_QUOTE,$(MINYAR_SANITIZER_CLANG))))
+FORMATS_SANITIZER_CLANG = $(if $(MINYAR_SANITIZER_CLANG),$(shell sh tools/toolchain.sh host-path $(call FORMATS_SANITIZER_QUOTE,$(MINYAR_SANITIZER_CLANG))),$(LLVM_CC))
+FORMATS_SANITIZER_DIRECTORY = $(if $(MINYAR_SANITIZER_CLANG),$(shell sh tools/toolchain.sh host-directory $(call FORMATS_SANITIZER_QUOTE,$(MINYAR_SANITIZER_CLANG))))
 FORMATS_SANITIZER_ENV = PATH=$(call FORMATS_SANITIZER_QUOTE,$(if $(FORMATS_SANITIZER_DIRECTORY),$(FORMATS_SANITIZER_DIRECTORY):)$(PATH)) MINYAR_TEST_CLANG=$(call FORMATS_SANITIZER_QUOTE,$(FORMATS_SANITIZER_CLANG)) UBSAN_OPTIONS=halt_on_error=1
 
 check-compression-sanitize: build/minyarc

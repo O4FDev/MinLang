@@ -20,7 +20,7 @@ endif
 check-net-connect: build/minyarc build/tooling/tests/net-connect-test
 	MINYAR_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/net-connect-test
 
-check-net-connect-sanitize: build/minyarc tools/host_paths.py build/tooling/tests/net-connect-test
+check-net-connect-sanitize: build/minyarc tools/toolchain.sh build/tooling/tests/net-connect-test
 	PATH="$(NET_SANITIZER_PATH)" MINYAR_CLANG=$(call NET_SANITIZER_QUOTE,$(NET_SANITIZER_CLANG)) $(SANITIZER_LIMITED) ./build/tooling/tests/net-connect-test --sanitize
 
 check: check-errors-values check-net check-net-loop check-net-connect
@@ -31,13 +31,13 @@ check-sanitize: check-net-connect-sanitize
 .PHONY: check-net-udp-offload check-net-udp-offload-sanitize
 # Keep the supported sanitizer override one argument in the caller's namespace.
 NET_SANITIZER_QUOTE = '$(subst ','"'"',$(1))'
-NET_SANITIZER_CLANG = $(if $(MINYAR_SANITIZER_CLANG),$(shell python3 -c 'import sys; sys.path.insert(0, "tools"); from host_paths import host_path; print(host_path(sys.argv[1]))' $(call NET_SANITIZER_QUOTE,$(MINYAR_SANITIZER_CLANG))),$(LLVM_CC))
-NET_SANITIZER_PATH = $(if $(MINYAR_SANITIZER_CLANG),$(shell python3 -c 'import sys; sys.path.insert(0, "tools"); from host_paths import host_path; print(host_path(sys.argv[1]).parent)' $(call NET_SANITIZER_QUOTE,$(NET_SANITIZER_CLANG))):$(PATH),$(PATH))
+NET_SANITIZER_CLANG = $(if $(MINYAR_SANITIZER_CLANG),$(shell sh tools/toolchain.sh host-path $(call NET_SANITIZER_QUOTE,$(MINYAR_SANITIZER_CLANG))),$(LLVM_CC))
+NET_SANITIZER_PATH = $(if $(MINYAR_SANITIZER_CLANG),$(shell sh tools/toolchain.sh host-directory $(call NET_SANITIZER_QUOTE,$(NET_SANITIZER_CLANG))):$(PATH),$(PATH))
 
 check-net-udp-offload: build/minyarc build/minyar-default-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/net-udp-offload.py --evidence build/net-udp-offload
 
-check-net-udp-offload-sanitize: build/minyarc build/minyar-default-runtime.o tools/host_paths.py
+check-net-udp-offload-sanitize: build/minyarc build/minyar-default-runtime.o tools/toolchain.sh
 	PATH="$(NET_SANITIZER_PATH)" MINYAR_TEST_CLANG=$(call NET_SANITIZER_QUOTE,$(NET_SANITIZER_CLANG)) $(SANITIZER_LIMITED) python3 tests/net-udp-offload.py --sanitize --evidence build/net-udp-offload-sanitize
 
 check check-portable check-quic: check-net-udp-offload
@@ -46,12 +46,12 @@ check-sanitize check-quic-sanitize: check-net-udp-offload-sanitize
 .PHONY: check-os-tlsverify check-os-tlsverify-sanitize
 # Keep the supported sanitizer override one argument in the caller's namespace.
 OS_TLS_SANITIZER_QUOTE = '$(subst ','"'"',$(1))'
-OS_TLS_SANITIZER_CLANG = $(if $(MINYAR_SANITIZER_CLANG),$(shell python3 -c 'import sys; sys.path.insert(0, "tools"); from host_paths import host_path; print(host_path(sys.argv[1]))' $(call OS_TLS_SANITIZER_QUOTE,$(MINYAR_SANITIZER_CLANG))),$(LLVM_CC))
-OS_TLS_SANITIZER_PATH = $(if $(MINYAR_SANITIZER_CLANG),$(shell python3 -c 'import sys; sys.path.insert(0, "tools"); from host_paths import host_path; print(host_path(sys.argv[1]).parent)' $(call OS_TLS_SANITIZER_QUOTE,$(OS_TLS_SANITIZER_CLANG))):$(PATH),$(PATH))
+OS_TLS_SANITIZER_CLANG = $(if $(MINYAR_SANITIZER_CLANG),$(shell sh tools/toolchain.sh host-path $(call OS_TLS_SANITIZER_QUOTE,$(MINYAR_SANITIZER_CLANG))),$(LLVM_CC))
+OS_TLS_SANITIZER_PATH = $(if $(MINYAR_SANITIZER_CLANG),$(shell sh tools/toolchain.sh host-directory $(call OS_TLS_SANITIZER_QUOTE,$(OS_TLS_SANITIZER_CLANG))):$(PATH),$(PATH))
 check-os-tlsverify: build/minyarc
 	MINYAR_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/os-tlsverify.py
 
-check-os-tlsverify-sanitize: build/minyarc tools/host_paths.py
+check-os-tlsverify-sanitize: build/minyarc tools/toolchain.sh
 	PATH="$(OS_TLS_SANITIZER_PATH)" MINYAR_CLANG=$(call OS_TLS_SANITIZER_QUOTE,$(OS_TLS_SANITIZER_CLANG)) $(SANITIZER_LIMITED) python3 tests/os-tlsverify.py --sanitize
 
 check check-portable: check-os-tlsverify
