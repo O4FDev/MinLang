@@ -1,0 +1,58 @@
+use "../tools/testing.min" as test
+use "./sha256test.min" as oracle
+use "./text-basics-oracles.min" as hex
+use "./tar-test-support.min" as tar
+use "machine" as machine
+use "json" as json
+
+public function digest(path: Text): Text { let data = readBytesFile(path); return hex.hex(oracle.oracle(machine.address(data), data.length)) }
+public function quote(source: Text): Text {
+    let output = Bytes("\"")
+    let digits = Bytes("0123456789abcdef")
+    for byte in Bytes(source) {
+        if byte == 34 || byte == 92 { output.add(92); output.add(byte) }
+        else if byte < 32 { output.addBytes(Bytes("\\u00")); output.add(digits[byte / 16]); output.add(digits[byte % 16]) }
+        else { output.add(byte) }
+    }
+    output.add(34)
+    return Text(output)
+}
+public function serialize(value: json.Value): Text {
+    if value.kind == json.STRING { return quote(value.text) }
+    if value.kind == json.NULL { return "null" }
+    if value.kind == json.BOOLEAN { return Text(value.truth) }
+    if value.kind == json.NUMBER { if value.text != "" { return value.text }; return Text(value.number) }
+    test.check(value.kind == json.OBJECT || value.kind == json.ARRAY, "cannot serialize invalid tar benchmark JSON")
+    let output = "["
+    if value.kind == json.OBJECT { output = "{" }
+    for index in 0..value.items.length {
+        if index > 0 { output += "," }
+        if value.kind == json.OBJECT { output += quote(value.keys[index]) + ":" }
+        output += serialize(value.items[index])
+    }
+    if value.kind == json.OBJECT { return output + "}" }
+    return output + "]"
+}
+public function strings(values: List<Text>): Text { let output: List<Text> = []; for value in values { output.add(quote(value)) }; return "[" + tar.joined(output, ",") + "]" }
+public function parsed(path: Text): json.Value { let value = json.parse(readTextFile(path)); test.check(value.kind == json.OBJECT, "invalid prepared tar manifest"); return value }
+public function verify(manifest: json.Value) {
+    let sources = json.member(manifest, "sources")
+    test.check(sources.kind == json.OBJECT, "missing prepared tar input identity")
+    for path in sources.keys { test.check(json.string(sources, path) == digest(path), "changed prepared input: " + path) }
+    let inputs = json.member(json.member(manifest, "provider"), "inputs")
+    test.check(inputs.kind == json.ARRAY, "missing prepared tar provider inputs")
+    for entry in inputs.items { let path = json.string(entry, "path"); test.check(json.string(entry, "sha256") == digest(path), "changed prepared provider: " + path) }
+}
+public function hashes(paths: List<Text>): Text {
+    let values: List<Text> = []
+    for path in paths { values.add(quote(path) + ":" + quote(digest(path))) }
+    return "{" + tar.joined(values, ",") + "}"
+}
+public function trim(source: Text): Text {
+    let raw = Bytes(source)
+    let begin = 0
+    let end = raw.length
+    while begin < end && raw[begin] <= 32 { begin += 1 }
+    while end > begin && raw[end - 1] <= 32 { end -= 1 }
+    return Text(raw.slice(begin, end))
+}

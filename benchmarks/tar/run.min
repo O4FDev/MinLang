@@ -1,0 +1,158 @@
+use "../../tools/testing.min" as test
+use "../../tests/tar-test-support.min" as tar
+use "../../tests/tar-benchmark-support.min" as benchmark
+use "../../tests/tar-support.min" as wire
+use "system" as system
+use "files" as files
+use "json" as json
+
+function startCapture(path: Text): Bytes { native "textbenchmark" }
+function finishCapture(token: Bytes): Integer { native "textbenchmark" }
+record Measurement { observable: Text; seconds: Float }
+function measured(context: tar.Context, command: List<Text>): Measurement {
+    context.serial[0] += 1
+    let log = context.directory + "/sample-" + Text(context.serial[0])
+    let start = system.monotonicNanoseconds()
+    let token = startCapture(log)
+    test.check(token.length == 16, "cannot capture matched tar benchmark operation")
+    let handle = system.spawn(command[0], command, system.environment(), "")
+    if handle <= 0 { finishCapture(token); fail("cannot launch matched tar benchmark operation") }
+    let status = system.wait(handle)
+    test.check(finishCapture(token) == 0, "cannot restore tar benchmark output")
+    let observable = benchmark.trim(readTextFile(log))
+    let elapsed = Float(system.monotonicNanoseconds() - start) / 1000000000.0
+    test.check(status.error == 0 && status.state == system.EXITED && status.exitCode == 0, "tar benchmark operation failed\n" + readTextFile(log + ".err"))
+    let diagnostics = readBytesFile(log + ".err")
+    if diagnostics.length > 0 { files.write(2, diagnostics, 0, diagnostics.length) }
+    return Measurement { observable: observable; seconds: elapsed }
+}
+function call(context: tar.Context, command: List<Text>): Text {
+    let result = tar.unbounded(context, command, system.environment())
+    test.require(result, "tar benchmark preparation query")
+    return benchmark.trim(result.output)
+}
+function octal(target: Bytes, begin: Integer, width: Integer, value: Integer) {
+    for index in begin..(begin + width) { target[index] = 48 }
+    target[begin + width - 1] = 0
+    let index = begin + width - 2
+    while value > 0 { target[index] = 48 + value % 8; value /= 8; index -= 1 }
+}
+function fixture(count: Integer, length: Integer): Bytes {
+    let output = Bytes()
+    for index in 0..count {
+        let number = Text(index)
+        while number.length < 5 { number = "0" + number }
+        let data = Bytes(length)
+        for offset in 0..data.length { data[offset] = index % 256 }
+        let entry = tar.header("root/member-" + number, data, 48)
+        octal(entry, 100, 8, 416); octal(entry, 108, 8, 123); octal(entry, 116, 8, 456); octal(entry, 136, 12, 1700000000)
+        for offset in 0..5 { entry[265 + offset] = Bytes("owner")[offset]; entry[297 + offset] = Bytes("group")[offset] }
+        output.addBytes(tar.repair(entry))
+    }
+    output.addBytes(Bytes(1024))
+    output.addBytes(Bytes((10240 - output.length % 10240) % 10240))
+    return output
+}
+function prepare(context: tar.Context, release: Boolean) {
+    tar.buildProgram(context, "benchmarks/tar/minyar.min", "minyar", false, release)
+    let flags = ["-O2"]
+    if release { flags.add("-flto"); flags.add("-fuse-ld=lld") }
+    let provider = tar.provider(context, flags)
+    let command = [context.clang]
+    for flag in flags { command.add(flag) }
+    for flag in provider.flags { command.add(flag) }
+    command.add("benchmarks/tar/libarchive.c")
+    for library in provider.libraries { command.add(library) }
+    for item in ["-o", context.directory + "/libarchive"] { command.add(item) }
+    let compilation = tar.unbounded(context, command, system.environment())
+    test.require(compilation, "independent tar reference prebuild")
+    writeBytesFile(context.directory + "/metadata.tar", fixture(1024, 64))
+    writeBytesFile(context.directory + "/payload.tar", fixture(64, 65536))
+    let providerResult = tar.unbounded(context, ["python3", context.tools + "/format_provider.py", "tararchive", "--clang", context.clang, "--flags=-O2"], system.environment())
+    test.require(providerResult, "prepared tar provider input identity")
+    let actualProvider = json.parse(providerResult.output)
+    test.check(actualProvider.kind == json.OBJECT, "invalid prepared tar provider input identity")
+    let sources = [context.root + "/library/tar.min", context.root + "/runtime/native/tararchive.c", context.root + "/runtime/minyar_native.h", context.root + "/benchmarks/tar/minyar.min", context.root + "/benchmarks/tar/libarchive.c", context.root + "/benchmarks/tar/run.min", context.root + "/tests/tar-test-support.min", context.root + "/tests/tar-support.min", context.root + "/tests/tar-benchmark-support.min", context.directory + "/minyar", context.directory + "/libarchive", context.directory + "/runtime.o", context.compiler, context.root + "/runtime/minyar_runtime.c", context.directory + "/metadata.tar", context.directory + "/payload.tar"]
+    let manifest = "{\"machine\":" + benchmark.quote(call(context, ["uname", "-a"])) + ",\"compiler\":" + benchmark.quote(call(context, [context.clang, "--version"])) + ",\"release\":" + Text(release) + ",\"libarchive\":" + benchmark.quote(call(context, [context.directory + "/libarchive", "version"])) + ",\"provider\":" + benchmark.serialize(actualProvider) + ",\"sources\":" + benchmark.hashes(sources) + "}"
+    writeTextFile(context.directory + "/manifest.json", manifest + "\n")
+}
+function median(samples: List<Float>): Float {
+    test.check(samples.length > 0, "missing tar benchmark observations")
+    let values = samples.slice(0, samples.length)
+    for index in 1..values.length {
+        let position = index
+        while position > 0 && values[position] < values[position - 1] { let previous = values[position - 1]; values[position - 1] = values[position]; values[position] = previous; position -= 1 }
+    }
+    let middle = values.length / 2
+    if values.length % 2 == 1 { return values[middle] }
+    return (values[middle - 1] + values[middle]) / 2.0
+}
+function times(samples: List<Float>): Text { let values: List<Text> = []; for sample in samples { values.add(Text(sample)) }; return "[" + tar.joined(values, ",") + "]" }
+
+let prepareOnly = false
+let measure = false
+let work = "build/tar-native-benchmark"
+let release = false
+let sampleCount = 7
+let output = ""
+let optionIndex = 0
+while optionIndex < argumentCount() {
+    let option = argument(optionIndex)
+    if option == "--prepare" || option == "--prepare-only" { prepareOnly = true }
+    else if option == "--measure" || option == "--run-prepared" { measure = true }
+    else if option == "--release" { release = true }
+    else if option == "--work" || option == "--samples" || option == "--output" {
+        test.check(optionIndex + 1 < argumentCount(), "missing tar benchmark option value")
+        optionIndex += 1
+        if option == "--work" { work = argument(optionIndex) }
+        else if option == "--samples" { sampleCount = Integer(argument(optionIndex)) }
+        else { output = argument(optionIndex) }
+    } else { fail("unknown tar benchmark option: " + option) }
+    optionIndex += 1
+}
+test.check(!prepareOnly || !measure, "prepare and measure must be separate commands")
+let scratch = test.scratch()
+let context = tar.context(scratch)
+tar.build(context, ["mkdir", "-p", "--", work], 10)
+let location = tar.run(context, ["readlink", "-f", "--", work], 10)
+test.require(location, "tar benchmark artifact directory")
+context.directory = test.lines(location.output)[0]
+if prepareOnly { prepare(context, release) }
+if measure {
+    test.check(sampleCount >= 3 && output != "", "--measure requires --samples >= 3 and --output")
+    test.check(call(context, ["uname", "-s"]) == "Linux" && call(context, ["hostname"]) == "5xnqjvps.vm", "tar sampling requires the exclusive minyar-bench-2 vps bench slot")
+    let manifest = benchmark.parsed(context.directory + "/manifest.json")
+    benchmark.verify(manifest)
+    let started = call(context, ["date", "-u", "+%Y-%m-%dT%H:%M:%S.%NZ"])
+    let results: List<Text> = []
+    for workload in ["metadata", "payload"] {
+        let input = context.directory + "/" + workload + ".tar"
+        for operation in ["read", "roundtrip"] {
+            let minyar = [context.directory + "/minyar", operation, input, "100"]
+            let libarchive = [context.directory + "/libarchive", operation, input, "100"]
+            let values = [call(context, minyar), call(context, libarchive)]
+            test.check(values[0] == values[1], "tar benchmark implementations have different complete-operation checksums")
+            let samples: List<List<Float>> = [[], []]
+            let commands = [minyar, libarchive]
+            for repetition in 0..sampleCount {
+                let order = [0, 1]
+                if repetition % 2 == 1 { order = [1, 0] }
+                for implementation in order {
+                    let observation = measured(context, commands[implementation])
+                    test.check(observation.observable == values[implementation], "repeated tar benchmark checksum changed")
+                    samples[implementation].add(observation.seconds)
+                }
+            }
+            let nativeMedian = median(samples[0])
+            let referenceMedian = median(samples[1])
+            test.check(referenceMedian != 0.0, "zero independent tar benchmark median")
+            results.add("{\"workload\":" + benchmark.quote(workload) + ",\"operation\":" + benchmark.quote(operation) + ",\"repeat\":100,\"samples_seconds\":{\"minyar\":" + times(samples[0]) + ",\"libarchive\":" + times(samples[1]) + "},\"median_seconds\":{\"minyar\":" + Text(nativeMedian) + ",\"libarchive\":" + Text(referenceMedian) + "},\"ratio\":" + Text(nativeMedian / referenceMedian) + ",\"observable\":{\"minyar\":" + benchmark.quote(values[0]) + ",\"libarchive\":" + benchmark.quote(values[1]) + "},\"commands\":{\"minyar\":" + benchmark.strings(minyar) + ",\"libarchive\":" + benchmark.strings(libarchive) + "}}")
+        }
+    }
+    let finished = call(context, ["date", "-u", "+%Y-%m-%dT%H:%M:%S.%NZ"])
+    let base = Bytes(benchmark.serialize(manifest))
+    let report = Text(base.slice(0, base.length - 1)) + ",\"started_utc\":" + benchmark.quote(started) + ",\"results\":[" + tar.joined(results, ",") + "],\"finished_utc\":" + benchmark.quote(finished) + "}"
+    print(report)
+    writeTextFile(output, report + "\n")
+}
+test.removeTree(scratch)

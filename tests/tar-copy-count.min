@@ -1,0 +1,64 @@
+use "../tools/testing.min" as test
+use "./tar-test-support.min" as tar
+use "./tar-benchmark-support.min" as benchmark
+use "system" as system
+use "json" as json
+
+function zero(counts: json.Value, name: Text) { let value = json.member(counts, name); test.check(value.kind == json.NUMBER && value.number == 0.0, "unexpected large tar output copy counter: " + name) }
+let work = "build/tar-native-benchmark"
+let artifacts = ""
+let optionIndex = 0
+while optionIndex < argumentCount() {
+    let option = argument(optionIndex)
+    test.check(option == "--work" || option == "--artifacts", "unknown tar copy-count option: " + option)
+    test.check(optionIndex + 1 < argumentCount(), "missing tar copy-count option value")
+    optionIndex += 1
+    if option == "--work" { work = argument(optionIndex) } else { artifacts = argument(optionIndex) }
+    optionIndex += 1
+}
+test.check(artifacts != "", "--artifacts is required")
+let scratch = test.scratch()
+let context = tar.context(scratch)
+let host = tar.unbounded(context, ["uname", "-s"], system.environment())
+test.require(host, "copy-count host query")
+test.check(benchmark.trim(host.output) == "Linux", "this counter requires the Linux --wrap linker")
+tar.build(context, ["mkdir", "-p", "--", artifacts], 10)
+let location = tar.run(context, ["readlink", "-f", "--", artifacts], 10)
+test.require(location, "tar copy-count artifact directory")
+context.directory = test.lines(location.output)[0]
+location = tar.run(context, ["readlink", "-f", "--", work], 10)
+test.require(location, "prepared tar copy-count input directory")
+work = test.lines(location.output)[0]
+let manifest = benchmark.parsed(work + "/manifest.json")
+benchmark.verify(manifest)
+let provider = tar.provider(context, ["-O2"])
+let binary = context.directory + "/copy-count"
+let command = [context.clang, "-O2", "-Wno-override-module"]
+for flag in provider.flags { command.add(flag) }
+for item in [work + "/minyar.ll", work + "/runtime.o", "runtime/native/tararchive.c", "tests/tar_copy_count.c", "-Wl,--wrap=minyar_bytes_slice", "-Wl,--wrap=minyar_bytes_extend"] { command.add(item) }
+for library in provider.libraries { command.add(library) }
+for item in ["-o", binary, "-lm"] { command.add(item) }
+tar.build(context, command, 60)
+let operations = ["read", "roundtrip"]
+let counters: List<json.Value> = []
+let reports: List<Text> = []
+for operation in operations {
+    let invocation = [binary, operation, work + "/payload.tar", "1"]
+    let result = tar.run(context, invocation, 30)
+    test.require(result, "tar copy-count operation")
+    let original = tar.unbounded(context, [work + "/minyar", operation, work + "/payload.tar", "1"], system.environment())
+    test.require(original, "prepared tar observable")
+    let observable = benchmark.trim(original.output)
+    test.check(benchmark.trim(result.output) == observable, "tar copy instrumentation changed observable")
+    let counts = json.parse(result.errorOutput)
+    test.check(counts.kind == json.OBJECT, "invalid tar copy counter report")
+    counters.add(counts)
+    reports.add(benchmark.quote(operation) + ":{\"command\":" + benchmark.strings(invocation) + ",\"observable\":" + benchmark.quote(observable) + ",\"counts\":" + benchmark.serialize(counts) + "}")
+}
+zero(counters[0], "large_slices"); zero(counters[0], "large_extends")
+zero(counters[1], "large_slices"); zero(counters[1], "large_extends")
+zero(counters[1], "large_slice_bytes"); zero(counters[1], "large_extend_bytes")
+let report = "{\"prepared_manifest\":" + benchmark.serialize(manifest) + ",\"compile_command\":" + benchmark.strings(command) + ",\"runs\":{" + tar.joined(reports, ",") + "},\"counter_source_hashes\":" + benchmark.hashes(["tests/tar_copy_count.c", "tests/tar-copy-count.min", work + "/minyar.ll", binary]) + "}"
+writeTextFile(context.directory + "/results.json", report + "\n")
+print("{\"read\":" + benchmark.serialize(counters[0]) + ",\"roundtrip\":" + benchmark.serialize(counters[1]) + "}")
+test.removeTree(scratch)
