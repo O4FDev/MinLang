@@ -755,27 +755,27 @@ check-build-wiring: build/tooling/tests/suite-catalogue
 check check-portable: check-module-test-driver check-build-wiring
 
 .PHONY: check-tls-validity check-tls-validity-sanitize check-tls-resumption-expiry check-tls-resumption-expiry-sanitize
-check-tls-validity: build/minyarc
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/tls-validity.py
+check-tls-validity: build/minyarc build/tooling/tests/tls-validity-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/tls-validity-test
 
-check-tls-validity-sanitize: build/minyarc
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/tls-validity.py --sanitize
+check-tls-validity-sanitize: build/minyarc build/tooling/tests/tls-validity-test
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-validity-test --sanitize
 
-check-tls-resumption-expiry: build/minyarc
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/tls-resumption-expiry.py
+check-tls-resumption-expiry: build/minyarc build/tooling/tests/tls-resumption-expiry-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/tls-resumption-expiry-test
 
-check-tls-resumption-expiry-sanitize: build/minyarc
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/tls-resumption-expiry.py --sanitize
+check-tls-resumption-expiry-sanitize: build/minyarc build/tooling/tests/tls-resumption-expiry-test
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-resumption-expiry-test --sanitize
 
 check-tls: check-tls-validity check-tls-resumption-expiry
 check-tls-sanitize: check-tls-validity-sanitize check-tls-resumption-expiry-sanitize
 
 .PHONY: check-tls-keyshare check-tls-keyshare-sanitize check-tls-server check-tls-server-sanitize
-check-tls-keyshare: build/minyarc
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/tls-keyshare.py
+check-tls-keyshare: build/minyarc build/tooling/tests/tls-keyshare-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/tls-keyshare-test
 
-check-tls-keyshare-sanitize: build/minyarc
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/tls-keyshare.py --sanitize
+check-tls-keyshare-sanitize: build/minyarc build/tooling/tests/tls-keyshare-test
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-keyshare-test --sanitize
 
 check-tls-server: build/minyarc
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/tls-server.py
@@ -790,54 +790,54 @@ check-tls-sanitize: check-tls-keyshare-sanitize check-tls-server-sanitize
 check-sanitize: check-tls-sanitize
 
 .PHONY: check-yamux-churn check-yamux-churn-sanitize check-transport-cancel check-transport-cancel-sanitize check-transport-go check-transport-go-sanitize
-check-yamux-churn: build/minyarc
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/yamux-churn.py
+check-yamux-churn: build/minyarc build/tooling/tests/yamux-churn-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/yamux-churn-test
 
-check-yamux-churn-sanitize: build/minyarc
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/yamux-churn.py --sanitize
+check-yamux-churn-sanitize: build/minyarc build/tooling/tests/yamux-churn-test
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/yamux-churn-test --sanitize
 
-check-transport-cancel: build/minyarc
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/transport-cancel.py
+check-transport-cancel: build/minyarc build/tooling/tests/transport-cancel-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/transport-cancel-test
 
-check-transport-cancel-sanitize: build/minyarc
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/transport-cancel.py --sanitize
+check-transport-cancel-sanitize: build/minyarc build/tooling/tests/transport-cancel-test
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/transport-cancel-test --sanitize
 
 build/yamux-peer: tests/interop/yamux/main.go tests/interop/yamux/go.mod tests/interop/yamux/go.sum | build
 	cd tests/interop/yamux && GOMAXPROCS=2 go build -mod=readonly -o "$(abspath $@)" .
 
 # The ordinary and FIN-schedule runs share one compiled Minyar peer per recipe.
-check-transport-go: build/minyarc build/yamux-peer | build
+check-transport-go: build/minyarc build/yamux-peer build/tooling/tests/transport-go-test | build
 	@set -e; cache=$$(mktemp -d "$(abspath build)/transport-go-programs.XXXXXXXX"); trap 'rm -rf "$$cache"' EXIT; export MINYAR_TEST_PROGRAM_CACHE="$$cache"; \
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/transport-go.py --peer-binary build/yamux-peer; \
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/transport-go.py --peer-binary build/yamux-peer --streams 1536; \
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/transport-go.py --fin-schedule
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/transport-go-test --peer-binary build/yamux-peer; \
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/transport-go-test --peer-binary build/yamux-peer --streams 1536; \
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/transport-go-test --fin-schedule
 
-check-transport-go-sanitize: build/minyarc build/yamux-peer | build
+check-transport-go-sanitize: build/minyarc build/yamux-peer build/tooling/tests/transport-go-test | build
 	@set -e; cache=$$(mktemp -d "$(abspath build)/transport-go-sanitize-programs.XXXXXXXX"); trap 'rm -rf "$$cache"' EXIT; export MINYAR_TEST_PROGRAM_CACHE="$$cache"; \
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/transport-go.py --peer-binary build/yamux-peer --sanitize; \
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/transport-go.py --peer-binary build/yamux-peer --streams 1536 --sanitize; \
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/transport-go.py --fin-schedule --sanitize
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/transport-go-test --peer-binary build/yamux-peer --sanitize; \
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/transport-go-test --peer-binary build/yamux-peer --streams 1536 --sanitize; \
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/transport-go-test --fin-schedule --sanitize
 
 check check-portable: check-yamux-churn check-transport-cancel
 check: check-transport-go
 check-sanitize: check-yamux-churn-sanitize check-transport-cancel-sanitize check-transport-go-sanitize
 
 .PHONY: check-tls-handshake-validity check-tls-handshake-validity-sanitize
-check-tls-handshake-validity: build/minyarc
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/tls-handshake-validity.py
+check-tls-handshake-validity: build/minyarc build/tooling/tests/tls-handshake-validity-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/tls-handshake-validity-test
 
-check-tls-handshake-validity-sanitize: build/minyarc
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/tls-handshake-validity.py --sanitize
+check-tls-handshake-validity-sanitize: build/minyarc build/tooling/tests/tls-handshake-validity-test
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-handshake-validity-test --sanitize
 
 check-tls: check-tls-handshake-validity
 check-tls-sanitize: check-tls-handshake-validity-sanitize
 
 .PHONY: check-tls-signing-usage check-tls-signing-usage-sanitize
-check-tls-signing-usage: build/minyarc
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/tls-signing-usage.py
+check-tls-signing-usage: build/minyarc build/tooling/tests/tls-signing-usage-test
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/tls-signing-usage-test
 
-check-tls-signing-usage-sanitize: build/minyarc
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/tls-signing-usage.py --sanitize
+check-tls-signing-usage-sanitize: build/minyarc build/tooling/tests/tls-signing-usage-test
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-signing-usage-test --sanitize
 
 check-tls: check-tls-signing-usage
 check-tls-sanitize: check-tls-signing-usage-sanitize

@@ -1,0 +1,29 @@
+use "./net-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+
+fixtures.arguments(["--sanitize"], [])
+let context = fixtures.context(fixtures.flag("--sanitize"))
+let directory = context.work
+fixtures.openssl(context, ["genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", directory + "/peer.key"])
+fixtures.openssl(context, ["pkey", "-in", directory + "/peer.key", "-pubout", "-outform", "DER", "-out", directory + "/peer.spki"])
+let prefix = fixtures.unhex("3059301306072a8648ce3d020106082a8648ce3d030107034200")
+let peer = readBytesFile(directory + "/peer.spki")
+test.check(peer.length == prefix.length + 65 && fixtures.hex(peer.slice(0, prefix.length)) == fixtures.hex(prefix), "unexpected OpenSSL P-256 SPKI encoding")
+writeBytesFile(directory + "/peer.point", peer.slice(prefix.length, peer.length))
+let binary = directory + "/p256"
+fixtures.compileProgram(context, "tests/tls-keyshare.min", binary)
+let result = fixtures.run(context, [binary, directory + "/peer.point"], 30)
+test.check(result.status == 0, "P-256 key share failed (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+let output = test.lines(result.output)
+let oracle = ""
+for line in output { if oracle == "" && fixtures.starts(line, "ORACLE ") { oracle = line } }
+let fields = fixtures.split(oracle, 32)
+test.check(fields.length == 3, "missing ORACLE line\n" + result.output)
+let spki = prefix.slice(0, prefix.length)
+spki.addBytes(fixtures.unhex(fields[1]))
+writeBytesFile(directory + "/minyar.spki", spki)
+fixtures.openssl(context, ["pkeyutl", "-derive", "-inkey", directory + "/peer.key", "-peerkey", directory + "/minyar.spki", "-peerform", "DER", "-out", directory + "/expected"])
+test.check(fields[2] == fixtures.hex(readBytesFile(directory + "/expected")), "P-256 shared secret differs from OpenSSL")
+print(output[output.length - 1])
+print("TLS P-256: independent OpenSSL ECDH oracle matched")
+fixtures.finish(context)

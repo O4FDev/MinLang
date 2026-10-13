@@ -1,0 +1,140 @@
+use "./net-fixtures.min" as fixtures
+use "./cpython-random.min" as random
+use "../tools/testing.min" as test
+
+function tlv(tag: Integer, data: Bytes): Bytes {
+    test.check(data.length < 128, "short-form DER fixture")
+    let result = Bytes()
+    result.add(tag)
+    result.add(data.length)
+    result.addBytes(data)
+    return result
+}
+function certificate(before: Text, after: Text, tag: Integer): Bytes {
+    let validity = tlv(tag, Bytes(before))
+    validity.addBytes(tlv(tag, Bytes(after)))
+    let zero = Bytes(1)
+    let tbs = tlv(2, zero)
+    for part in [tlv(48, Bytes()), tlv(48, Bytes()), tlv(48, validity), tlv(48, Bytes()), tlv(48, Bytes())] { tbs.addBytes(part) }
+    let body = tlv(48, tbs)
+    body.addBytes(tlv(48, Bytes()))
+    body.addBytes(tlv(3, zero))
+    let cert = tlv(48, body)
+    let result = Bytes()
+    for shift in [16, 8, 0] { result.add((cert.length >> shift) & 255) }
+    result.addBytes(cert)
+    result.add(0)
+    result.add(0)
+    return result
+}
+function leap(year: Integer): Boolean { return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) }
+function digits(raw: Bytes, start: Integer, width: Integer): Integer {
+    let value = 0
+    for index in start..(start + width) { value = value * 10 + raw[index] - 48 }
+    return value
+}
+function parse(date: Text, tag: Integer): Integer {
+    let width = 4
+    if tag == 23 { width = 2 }
+    let raw = Bytes(date)
+    if raw.length != width + 11 || raw[raw.length - 1] != 90 { return -1 }
+    for index in 0..(width + 10) { if raw[index] < 48 || raw[index] > 57 { return -1 } }
+    let year = digits(raw, 0, width)
+    if tag == 23 {
+        if year >= 50 { year += 1900 } else { year += 2000 }
+    }
+    let month = digits(raw, width, 2)
+    let day = digits(raw, width + 2, 2)
+    let hour = digits(raw, width + 4, 2)
+    let minute = digits(raw, width + 6, 2)
+    let second = digits(raw, width + 8, 2)
+    if year < 1 || month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59 || second > 59 { return -1 }
+    let lengths = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    let last = lengths[month - 1]
+    if month == 2 && leap(year) { last = 29 }
+    if day > last { return -1 }
+    return ((fixtures.epochDays(year, month, day) * 24 + hour) * 60 + minute) * 60 + second
+}
+record Row { data: Bytes; expected: Integer }
+function add(rows: List<Row>, now: Integer, before: Text, after: Text, tag: Integer) {
+    let start = parse(before, tag)
+    let end = parse(after, tag)
+    let expected = 0
+    if start != -1 && end != -1 && start <= now && now < end && start < end { expected = end * 1000 }
+    rows.add(Row { data: certificate(before, after, tag); expected: expected })
+}
+function between(state: random.State, low: Integer, high: Integer): Integer { return low + random.below(state, high - low + 1) }
+function cut(text: Text, start: Integer, end: Integer): Text { return Text(Bytes(text).slice(start, end)) }
+function corpus(now: Integer): List<Row> {
+    let rng = random.seeded("5280")
+    let rows: List<Row> = []
+    for year in 0..100 { add(rows, now, fixtures.padded(year, 2) + "0101000000Z", "491231235959Z", 23) }
+    let current = fixtures.civil(now).year
+    for n in 0..1024 {
+        let general = n % 2 == 0
+        let low = 2027
+        if current + 1 > low { low = current + 1 }
+        let high = 2049
+        if general { high = 9999 }
+        let year = between(rng, low, high)
+        let month = between(rng, 1, 12)
+        let day = between(rng, 1, 28)
+        let hour = random.below(rng, 24)
+        let minute = random.below(rng, 60)
+        let second = random.below(rng, 60)
+        let width = 2
+        let printed = fixtures.padded(year % 100, 2)
+        if general { width = 4; printed = fixtures.padded(year, 4) }
+        let after = printed + fixtures.padded(month, 2) + fixtures.padded(day, 2) + fixtures.padded(hour, 2) + fixtures.padded(minute, 2) + fixtures.padded(second, 2) + "Z"
+        let before = "500101000000Z"
+        let tag = 23
+        if general { before = "19000101000000Z"; tag = 24 }
+        add(rows, now, before, after, tag)
+        let size = after.byteLength
+        let variant = n % 8
+        let bad = cut(after, 0, size - 3) + "Z"
+        if variant == 0 { bad = cut(after, 0, width) + "13" + cut(after, width + 2, size) }
+        if variant == 1 { bad = cut(after, 0, width) + "0231" + cut(after, width + 4, size) }
+        if variant == 2 { bad = cut(after, 0, width + 4) + "24" + cut(after, width + 6, size) }
+        if variant == 3 { bad = cut(after, 0, width + 6) + "60" + cut(after, width + 8, size) }
+        if variant == 4 { bad = cut(after, 0, width + 8) + "60Z" }
+        if variant == 5 { bad = cut(after, 0, size - 1) + ".0Z" }
+        if variant == 6 { bad = cut(after, 0, size - 1) + "+0000" }
+        add(rows, now, before, bad, tag)
+    }
+    for year in [1, 4, 100, 400, 1600, 1900, 2000, 2100, 2400, 9999] {
+        for day in [28, 29, 30] { add(rows, now, fixtures.padded(year, 4) + "02" + fixtures.padded(day, 2) + "000000Z", "99991231235959Z", 24) }
+    }
+    return rows
+}
+
+fixtures.arguments(["--sanitize"], ["--corpus-output"])
+test.check(parse("491231235959Z", 23) * 1000 == 2524607999000, "independent calendar oracle epoch")
+test.check(parse("20480229000000Z", 24) * 1000 == 2466547200000, "independent calendar oracle leap day")
+let context = fixtures.context(fixtures.flag("--sanitize"))
+let ca = fixtures.authority(context, context.work + "/ca")
+fixtures.root(ca, "root")
+let now = fixtures.nowSeconds()
+let expires = now + 86400
+let valid = fixtures.ec("serverAuth")
+valid.start = now - 3600
+valid.end = expires
+fixtures.leaf(ca, "valid", "root", valid)
+fixtures.leaf(ca, "expired", "root", fixtures.expired(fixtures.ec("serverAuth")))
+fixtures.leaf(ca, "future", "root", fixtures.future(fixtures.ec("serverAuth")))
+let encoded = Bytes()
+for row in corpus(now) {
+    encoded.add((row.data.length >> 8) & 255)
+    encoded.add(row.data.length & 255)
+    for shift in [56, 48, 40, 32, 24, 16, 8, 0] { encoded.add((row.expected >> shift) & 255) }
+    encoded.addBytes(row.data)
+}
+let corpusPath = context.work + "/calendar.bin"
+writeBytesFile(corpusPath, encoded)
+if fixtures.option("--corpus-output", "") != "" { writeBytesFile(fixtures.option("--corpus-output", ""), encoded) }
+let binary = context.work + "/validity"
+fixtures.compileProgram(context, "tests/tls-validity.min", binary)
+let result = fixtures.run(context, [binary, fixtures.path(ca, "valid", "der"), Text(expires * 1000), fixtures.path(ca, "expired", "der"), fixtures.path(ca, "future", "der"), corpusPath], 30)
+test.check(result.status == 0, "certificate validity failed (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+fixtures.emit(result.output)
+fixtures.finish(context)

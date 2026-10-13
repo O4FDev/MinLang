@@ -1,0 +1,73 @@
+use "./net-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+use "json" as json
+use "files" as files
+
+fixtures.arguments(["--fin-schedule", "--sanitize"], ["--peer-binary", "--streams"])
+let finSchedule = fixtures.flag("--fin-schedule")
+let peerBinary = fixtures.option("--peer-binary", "")
+let streams = 0
+if fixtures.option("--streams", "") != "" { streams = fixtures.number(fixtures.option("--streams", "")) }
+test.check(fixtures.option("--streams", "") == "" || (streams >= 1 && streams <= 4096), "sequential stream count must be 1..4096")
+test.check(!(finSchedule && peerBinary != ""), "--fin-schedule builds its own pinned independent peer")
+let context = fixtures.context(fixtures.flag("--sanitize"))
+let ca = fixtures.authority(context, context.work + "/ca")
+fixtures.root(ca, "root")
+fixtures.leaf(ca, "server", "root", fixtures.options())
+fixtures.leaf(ca, "client", "root", fixtures.usage("clientAuth"))
+let go = context.work + "/go-peer"
+if peerBinary != "" {
+    go = peerBinary
+    if !fixtures.starts(go, "/") { go = context.root + "/" + go }
+}
+let native = context.work + "/minyar-peer"
+if peerBinary == "" {
+    let interop = context.root + "/tests/interop/yamux"
+    let environment = fixtures.withSetting(context.environment, "GOMAXPROCS", "2")
+    let arguments = ["go", "build", "-p=1", "-mod=readonly"]
+    if finSchedule {
+        let listed = test.run(["go", "list", "-m", "-json", "github.com/hashicorp/yamux"], environment, interop, fixtures.log(context, "go-list"), 30)
+        test.require(listed, "go list pinned yamux")
+        let module = json.parse(listed.output)
+        test.check(json.string(module, "Version") == "v0.1.2", "pinned yamux version " + json.string(module, "Version"))
+        let directory = json.string(module, "Dir")
+        let original = readTextFile(directory + "/stream.go")
+        let anchor = "\t// Check that our recv window is not exceeded"
+        test.check(fixtures.count(original, anchor) == 1, "pinned peer scheduling anchor changed")
+        let replacement = context.work + "/yamux-scheduled"
+        fixtures.execute(context, ["cp", "-R", directory, replacement], 30, "copy pinned yamux")
+        fixtures.execute(context, ["chmod", "-R", "u+w", replacement], 30, "make scheduled yamux writable")
+        writeTextFile(replacement + "/stream.go", test.replace(original, anchor, "\ttime.Sleep(25 * time.Millisecond)\n\n" + anchor))
+        let modfile = context.work + "/scheduled.mod"
+        writeBytesFile(modfile, readBytesFile(interop + "/go.mod"))
+        writeBytesFile(context.work + "/scheduled.sum", readBytesFile(interop + "/go.sum"))
+        test.require(test.run(["go", "mod", "edit", "-modfile=" + modfile, "-replace=github.com/hashicorp/yamux=" + replacement], environment, interop, fixtures.log(context, "go-edit"), 30), "go mod edit")
+        arguments.add("-modfile=" + modfile)
+        let digests = fixtures.execute(context, ["sha256sum", directory + "/stream.go", replacement + "/stream.go"], 30, "hash scheduled peer")
+        let rows = test.lines(digests.output)
+        print("Go FIN scheduler original=" + fixtures.split(rows[0], 32)[0] + " scheduled=" + fixtures.split(rows[1], 32)[0])
+    }
+    for item in ["-o", go, "."] { arguments.add(item) }
+    test.require(test.run(arguments, environment, interop, fixtures.log(context, "go-build"), 120), "go build yamux peer")
+}
+let source = "tests/transport-tcp.min"
+if streams > 0 { source = "tests/transport-churn.min" }
+fixtures.compileProgram(context, source, native)
+let limit = 20
+if streams > 0 { limit = 90 }
+for kind in ["minyar", "go"] {
+    let command = [go, "server", fixtures.path(ca, "root", "pem"), fixtures.path(ca, "server", "pem"), fixtures.path(ca, "server", "key")]
+    if kind == "minyar" { command = [native, "server", "0", fixtures.path(ca, "server", "der"), fixtures.path(ca, "server", "pk8"), fixtures.path(ca, "root", "der")] }
+    if streams > 0 { command.add(Text(streams)) }
+    let server = fixtures.launch(context, command, limit + 20)
+    let port = Text(fixtures.ready(context, server))
+    let client = [native, "client", port, fixtures.path(ca, "client", "der"), fixtures.path(ca, "client", "pk8"), fixtures.path(ca, "root", "der")]
+    if kind == "minyar" { client = [go, port, fixtures.path(ca, "root", "pem"), fixtures.path(ca, "client", "pem"), fixtures.path(ca, "client", "key")] }
+    if streams > 0 { client.add(Text(streams)) }
+    let result = fixtures.run(context, client, limit)
+    let served = fixtures.collect(server)
+    test.check(result.status == 0 && served.status == 0, kind + " client " + Text(result.status) + "\n" + result.output + result.errorOutput + "\nserver " + Text(served.status) + "\n" + served.output + served.errorOutput)
+    fixtures.emit(result.output)
+    fixtures.emit(Text(Bytes(served.output).slice(server.line.byteLength + 1, served.output.byteLength)))
+}
+fixtures.finish(context)

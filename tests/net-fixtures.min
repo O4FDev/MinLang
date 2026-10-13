@@ -1,0 +1,365 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+
+public constant SANITIZER = "-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wno-override-module"
+
+public function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+public function ends(source: Text, suffix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(suffix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[raw.length - pattern.length + index] != pattern[index] { return false } }
+    return true
+}
+public function count(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    test.check(pattern.length > 0, "empty count pattern")
+    let total = 0
+    let index = 0
+    while index + pattern.length <= raw.length {
+        let equal = true
+        for offset in 0..pattern.length { if raw[index + offset] != pattern[offset] { equal = false; break } }
+        if equal { total += 1; index += pattern.length } else { index += 1 }
+    }
+    return total
+}
+public function split(source: Text, separator: Integer): List<Text> {
+    let result: List<Text> = []
+    let raw = Bytes(source)
+    let start = 0
+    for index in 0..raw.length {
+        if raw[index] == separator { result.add(Text(raw.slice(start, index))); start = index + 1 }
+    }
+    result.add(Text(raw.slice(start, raw.length)))
+    return result
+}
+public function number(source: Text): Integer {
+    let raw = Bytes(source)
+    test.check(raw.length > 0 && raw.length <= 19, "invalid decimal: " + source)
+    let value = 0
+    for byte in raw {
+        test.check(byte >= 48 && byte <= 57, "invalid decimal: " + source)
+        test.check(value <= (9223372036854775807 - (byte - 48)) / 10, "invalid decimal: " + source)
+        value = value * 10 + (byte - 48)
+    }
+    return value
+}
+public function padded(value: Integer, width: Integer): Text {
+    let text = Text(value)
+    while text.byteLength < width { text = "0" + text }
+    return text
+}
+public function hex(data: Bytes): Text {
+    let digits = Bytes("0123456789abcdef")
+    let result = Bytes()
+    for byte in data { result.add(digits[byte >> 4]); result.add(digits[byte & 15]) }
+    return Text(result)
+}
+public function unhex(source: Text): Bytes {
+    let raw = Bytes(source)
+    test.check(raw.length % 2 == 0, "odd hexadecimal length")
+    let result = Bytes()
+    let index = 0
+    while index < raw.length {
+        let value = 0
+        for offset in 0..2 {
+            let byte = raw[index + offset]
+            let digit = -1
+            if byte >= 48 && byte <= 57 { digit = byte - 48 }
+            if byte >= 97 && byte <= 102 { digit = byte - 87 }
+            if byte >= 65 && byte <= 70 { digit = byte - 55 }
+            test.check(digit >= 0, "invalid hexadecimal: " + source)
+            value = value * 16 + digit
+        }
+        result.add(value)
+        index += 2
+    }
+    return result
+}
+public function withSetting(environment: List<Text>, name: Text, value: Text): List<Text> {
+    let result: List<Text> = []
+    let prefix = name + "="
+    for entry in environment { if !starts(entry, prefix) { result.add(entry) } }
+    result.add(prefix + value)
+    return result
+}
+public function withoutSetting(environment: List<Text>, name: Text): List<Text> {
+    let result: List<Text> = []
+    for entry in environment { if !starts(entry, name + "=") { result.add(entry) } }
+    return result
+}
+public function sanitized(environment: List<Text>): List<Text> {
+    let result = environment
+    for name in ["MINYAR_CLANG_FLAGS", "MINYAR_NATIVE_FLAGS", "MINYAR_RUNTIME_FLAGS"] { result = withSetting(result, name, SANITIZER) }
+    return result
+}
+public function value(environment: List<Text>, name: Text): Text {
+    let found = ""
+    for entry in environment {
+        if starts(entry, name + "=") { found = Text(Bytes(entry).slice(name.byteLength + 1, entry.byteLength)) }
+    }
+    return found
+}
+
+public record Context { root: Text; work: Text; environment: List<Text>; serial: Integer; sanitize: Boolean }
+public function context(sanitize: Boolean): Context {
+    let work = test.scratch()
+    let resolved = test.run(["pwd", "-P"], system.environment(), "", work + "/root", 10)
+    test.require(resolved, "resolve repository root")
+    let environment = system.environment()
+    if sanitize { environment = sanitized(environment) }
+    return Context { root: test.lines(resolved.output)[0]; work: work; environment: environment; serial: 0; sanitize: sanitize }
+}
+public function log(context: Context, name: Text): Text {
+    context.serial += 1
+    return context.work + "/" + name + "-" + Text(context.serial)
+}
+public function finish(context: Context) { test.removeTree(context.work) }
+public function run(context: Context, command: List<Text>, seconds: Integer): test.Result {
+    return test.run(command, context.environment, "", log(context, "run"), seconds)
+}
+public function nap(context: Context, seconds: Text) {
+    let handle = system.spawn("/bin/sleep", ["sleep", seconds], context.environment, "")
+    test.check(handle > 0 && system.wait(handle).exitCode == 0, "sleep failed")
+}
+public function fingerprint(source: Bytes): Text {
+    let first = 1469598103934665603
+    let second = 7
+    for byte in source {
+        first = wrappingMultiply(first ^ byte, 1099511628211)
+        second = wrappingAdd(wrappingMultiply(second, 31), byte)
+    }
+    let digest = Bytes()
+    digest.addInt64(first)
+    digest.addInt64(second)
+    return hex(digest)
+}
+function cacheKey(context: Context, source: Text): Text {
+    let parts = [source, "\n"]
+    for entry in context.environment {
+        let named = starts(entry, "MINYAR_") || starts(entry, "PATH=")
+        for runtime in ["MINYAR_TEST_PROGRAM_CACHE=", "MINYAR_TEST_JOBS=", "MINYAR_QUINN_", "MINYAR_PEER_"] { if starts(entry, runtime) { named = false } }
+        if named { parts.add(entry); parts.add("\n") }
+    }
+    let material = Bytes(joinText(parts))
+    material.addBytes(readBytesFile(source))
+    return fingerprint(material)
+}
+public function compileProgram(context: Context, source: Text, output: Text) {
+    let path = source
+    if !starts(path, "/") { path = context.root + "/" + source }
+    let cache = value(context.environment, "MINYAR_TEST_PROGRAM_CACHE")
+    let cached = ""
+    if cache != "" && value(context.environment, "MINYAR_LINK_ARTIFACTS") == "" {
+        test.check(files.makeDirectory(cache) == 0, "create program cache")
+        cached = cache + "/" + cacheKey(context, path)
+        if files.pathSize(cached) > 0 {
+            test.require(run(context, ["cp", "-p", cached, output], 60), "copy cached program")
+            return
+        }
+    }
+    let result = test.run([context.root + "/minyar", "--library", context.root + "/library", path, "-o", output], context.environment, "", log(context, "compile"), 600)
+    test.check(result.status == 0, "compile " + source + ": " + result.output + " " + result.errorOutput)
+    if cached != "" {
+        let staging = cached + ".build-" + Text(system.processId())
+        test.require(run(context, ["cp", "-p", output, staging], 60), "stage cached program")
+        test.check(files.rename(staging, cached) == 0, "publish cached program")
+    }
+}
+public function opensslResult(context: Context, arguments: List<Text>): test.Result {
+    let command = ["openssl"]
+    for argument in arguments { command.add(argument) }
+    return run(context, command, 30)
+}
+public function openssl(context: Context, arguments: List<Text>) {
+    let result = opensslResult(context, arguments)
+    let diagnostics = result.errorOutput
+    if diagnostics.byteLength > 2000 { diagnostics = Text(Bytes(diagnostics).slice(diagnostics.byteLength - 2000, diagnostics.byteLength)) }
+    test.check(result.status == 0, "openssl " + arguments[0] + " failed: " + diagnostics)
+}
+
+public function nowSeconds(): Integer { return system.wallClockMicroseconds() / 1000000 }
+public record Civil { year: Integer; month: Integer; day: Integer; hour: Integer; minute: Integer; second: Integer }
+public function civil(seconds: Integer): Civil {
+    let days = seconds / 86400
+    let rest = seconds % 86400
+    if rest < 0 { rest += 86400; days -= 1 }
+    let shifted = days + 719468
+    let era = shifted / 146097
+    if shifted < 0 { era = (shifted - 146096) / 146097 }
+    let dayOfEra = shifted - era * 146097
+    let yearOfEra = (dayOfEra - dayOfEra / 1460 + dayOfEra / 36524 - dayOfEra / 146096) / 365
+    let dayOfYear = dayOfEra - (365 * yearOfEra + yearOfEra / 4 - yearOfEra / 100)
+    let shiftedMonth = (5 * dayOfYear + 2) / 153
+    let day = dayOfYear - (153 * shiftedMonth + 2) / 5 + 1
+    let month = shiftedMonth + 3
+    if shiftedMonth >= 10 { month = shiftedMonth - 9 }
+    let year = yearOfEra + era * 400
+    if month <= 2 { year += 1 }
+    return Civil { year: year; month: month; day: day; hour: rest / 3600; minute: rest % 3600 / 60; second: rest % 60 }
+}
+public function epochDays(year: Integer, month: Integer, day: Integer): Integer {
+    let adjusted = year
+    if month <= 2 { adjusted -= 1 }
+    let era = adjusted / 400
+    if adjusted < 0 { era = (adjusted - 399) / 400 }
+    let yearOfEra = adjusted - era * 400
+    let shiftedMonth = month + 9
+    if month > 2 { shiftedMonth = month - 3 }
+    let dayOfYear = (153 * shiftedMonth + 2) / 5 + day - 1
+    let dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
+    return era * 146097 + dayOfEra - 719468
+}
+public function utcTime(seconds: Integer): Text {
+    let date = civil(seconds)
+    return padded(date.year % 100, 2) + padded(date.month, 2) + padded(date.day, 2) + padded(date.hour, 2) + padded(date.minute, 2) + padded(date.second, 2) + "Z"
+}
+
+public record Authority { context: Context; directory: Text; serial: Integer }
+public record Leaf { san: Text; usage: Text; start: Integer; end: Integer; ca: Boolean; curve: Text; extra: Text }
+public function authority(context: Context, directory: Text): Authority {
+    test.check(files.makeDirectory(directory) == 0, "create certificate directory")
+    return Authority { context: context; directory: directory; serial: 1 }
+}
+public function path(authority: Authority, name: Text, suffix: Text): Text { return authority.directory + "/" + name + "." + suffix }
+public function der(authority: Authority, name: Text) {
+    openssl(authority.context, ["x509", "-in", path(authority, name, "pem"), "-outform", "DER", "-out", path(authority, name, "der")])
+}
+public function root(authority: Authority, name: Text) {
+    openssl(authority.context, ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=" + name,
+        "-addext", "basicConstraints=critical,CA:TRUE,pathlen:2", "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+        "-keyout", path(authority, name, "key"), "-out", path(authority, name, "pem")])
+    der(authority, name)
+}
+public function options(): Leaf {
+    let now = nowSeconds()
+    return Leaf { san: "DNS:localhost,IP:127.0.0.1"; usage: "serverAuth"; start: now - 3600; end: now + 86400; ca: false; curve: ""; extra: "" }
+}
+public function usage(value: Text): Leaf {
+    let result = options()
+    result.usage = value
+    return result
+}
+public function ec(value: Text): Leaf {
+    let result = options()
+    result.usage = value
+    result.curve = "P-256"
+    return result
+}
+public function expired(options: Leaf): Leaf {
+    let now = nowSeconds()
+    options.start = now - 2 * 86400
+    options.end = now - 86400
+    return options
+}
+public function future(options: Leaf): Leaf {
+    let now = nowSeconds()
+    options.start = now + 86400
+    options.end = now + 2 * 86400
+    return options
+}
+function quoted(path: Text): Text {
+    test.check(!test.contains(path, "\n") && !test.contains(path, "\r"), "OpenSSL fixture path contains a line break")
+    return "\"" + test.replace(test.replace(test.replace(path, "\\", "\\\\"), "\"", "\\\""), "$", "\\$") + "\""
+}
+public function serialText(serial: Integer): Text {
+    let digits = Bytes("0123456789ABCDEF")
+    let result = Bytes()
+    let value = serial
+    while value > 0 || result.length < 2 {
+        let shifted = Bytes()
+        shifted.add(digits[value % 16])
+        shifted.addBytes(result)
+        result = shifted
+        value = value / 16
+    }
+    return Text(result)
+}
+public function leaf(authority: Authority, name: Text, issuer: Text, options: Leaf) {
+    let context = authority.context
+    if options.curve != "" {
+        openssl(context, ["genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:" + options.curve, "-out", path(authority, name, "key")])
+    } else {
+        openssl(context, ["genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", path(authority, name, "key")])
+    }
+    openssl(context, ["req", "-new", "-key", path(authority, name, "key"), "-subj", "/CN=localhost", "-out", path(authority, name, "csr")])
+    writeTextFile(path(authority, name, "index"), "")
+    writeTextFile(path(authority, name, "serial"), serialText(authority.serial) + "\n")
+    authority.serial += 1
+    let extensions = "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=" + options.usage + "\n"
+    if options.ca { extensions = "basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\n" }
+    if options.san != "" { extensions = extensions + "subjectAltName=" + options.san + "\n" }
+    if options.extra != "" { extensions = extensions + options.extra + "\n" }
+    writeTextFile(path(authority, name, "cnf"), "[ca]\ndefault_ca=issuer\n[issuer]\ndatabase=" + quoted(path(authority, name, "index")) +
+        "\nserial=" + quoted(path(authority, name, "serial")) + "\nnew_certs_dir=" + quoted(authority.directory) +
+        "\ncertificate=" + quoted(path(authority, issuer, "pem")) + "\nprivate_key=" + quoted(path(authority, issuer, "key")) +
+        "\ndefault_md=sha256\ndefault_days=2\npolicy=policy\nx509_extensions=extensions\n[policy]\ncommonName=supplied\n[extensions]\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n" + extensions)
+    openssl(context, ["ca", "-batch", "-notext", "-config", path(authority, name, "cnf"), "-startdate", utcTime(options.start),
+        "-enddate", utcTime(options.end), "-in", path(authority, name, "csr"), "-out", path(authority, name, "pem")])
+    der(authority, name)
+    openssl(context, ["pkcs8", "-topk8", "-nocrypt", "-in", path(authority, name, "key"), "-outform", "DER", "-out", path(authority, name, "pk8")])
+}
+
+public record Process { handle: Integer; log: Text; line: Text }
+public function launch(context: Context, command: List<Text>, seconds: Integer): Process {
+    let output = log(context, "process")
+    return Process { handle: test.start(command, context.environment, "", output, seconds); log: output; line: "" }
+}
+public function firstLine(context: Context, process: Process, milliseconds: Integer): Text {
+    let deadline = system.monotonicNanoseconds() + milliseconds * 1000000
+    while true {
+        let raw = files.readFile(process.log)
+        for index in 0..raw.length {
+            if raw[index] == 10 { process.line = Text(raw.slice(0, index)); return process.line }
+        }
+        let state = system.poll(process.handle)
+        if state.state != system.PENDING || system.monotonicNanoseconds() > deadline { return Text(raw) }
+        nap(context, "0.02")
+    }
+    return ""
+}
+public function ready(context: Context, process: Process): Integer {
+    let line = firstLine(context, process, 20000)
+    test.check(starts(line, "READY "), "process did not report readiness: " + line + "\n" + Text(files.readFile(process.log + ".err")))
+    return number(split(line, 32)[1])
+}
+public function collect(process: Process): test.Result { return test.finish(process.handle, process.log) }
+public function arguments(flags: List<Text>, valued: List<Text>) {
+    let index = 0
+    while index < argumentCount() {
+        let known = false
+        for name in flags { if argument(index) == name { known = true } }
+        for name in valued {
+            if argument(index) == name {
+                test.check(index + 1 < argumentCount(), "missing value for " + name)
+                known = true
+                index += 1
+            }
+        }
+        test.check(known, "unknown argument: " + argument(index))
+        index += 1
+    }
+}
+public function flag(name: Text): Boolean {
+    for index in 0..argumentCount() { if argument(index) == name { return true } }
+    return false
+}
+public function option(name: Text, fallback: Text): Text {
+    let result = fallback
+    for index in 0..argumentCount() { if argument(index) == name && index + 1 < argumentCount() { result = argument(index + 1) } }
+    return result
+}
+public function execute(context: Context, command: List<Text>, seconds: Integer, phase: Text): test.Result {
+    let result = run(context, command, seconds)
+    test.check(result.status == 0, phase + " failed (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+    return result
+}
+public function emit(text: Text) { files.writeStandardOutput(text) }

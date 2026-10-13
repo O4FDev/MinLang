@@ -1,0 +1,64 @@
+use "./net-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+
+record Usage { name: Text; usage: Text; bits: Text }
+record Case { name: Text; role: Text; valid: Boolean; chain: List<Text> }
+
+fixtures.arguments(["--sanitize"], [])
+let context = fixtures.context(fixtures.flag("--sanitize"))
+let ca = fixtures.authority(context, context.work + "/ca")
+fixtures.root(ca, "root")
+let usages = [Usage { name: "server-sign"; usage: "serverAuth"; bits: "digitalSignature" },
+    Usage { name: "server-encipher"; usage: "serverAuth"; bits: "keyEncipherment" },
+    Usage { name: "server-agreement"; usage: "serverAuth"; bits: "keyAgreement" },
+    Usage { name: "client-sign"; usage: "clientAuth"; bits: "digitalSignature" },
+    Usage { name: "client-agreement"; usage: "clientAuth"; bits: "keyAgreement" },
+    Usage { name: "server-both"; usage: "serverAuth"; bits: "digitalSignature,keyEncipherment" }]
+for entry in usages {
+    let options = fixtures.usage(entry.usage)
+    options.extra = "keyUsage=critical," + entry.bits
+    fixtures.leaf(ca, entry.name, "root", options)
+    let text = fixtures.execute(context, ["openssl", "x509", "-in", fixtures.path(ca, entry.name, "pem"), "-noout", "-text"], 30, "openssl x509 text").output
+    test.check(test.contains(text, "Digital Signature") == test.contains(entry.bits, "digitalSignature"), entry.name + " key usage oracle mismatch")
+}
+fixtures.leaf(ca, "no-ku", "root", fixtures.options())
+let config = fixtures.path(ca, "no-ku", "cnf")
+writeTextFile(config, test.replace(readTextFile(config), "keyUsage=critical,digitalSignature\n", ""))
+writeTextFile(fixtures.path(ca, "no-ku", "index"), "")
+fixtures.openssl(context, ["ca", "-batch", "-notext", "-config", config, "-in", fixtures.path(ca, "no-ku", "csr"), "-out", fixtures.path(ca, "no-ku", "pem")])
+fixtures.der(ca, "no-ku")
+let intermediate = fixtures.options()
+intermediate.ca = true
+fixtures.leaf(ca, "intermediate0", "root", intermediate)
+fixtures.leaf(ca, "child-ca", "intermediate0", intermediate)
+fixtures.openssl(context, ["req", "-new", "-key", fixtures.path(ca, "child-ca", "key"), "-subj", "/CN=distinct-child-ca", "-out", fixtures.path(ca, "child-ca", "csr")])
+writeTextFile(fixtures.path(ca, "child-ca", "index"), "")
+fixtures.openssl(context, ["ca", "-batch", "-notext", "-config", fixtures.path(ca, "child-ca", "cnf"), "-in", fixtures.path(ca, "child-ca", "csr"), "-out", fixtures.path(ca, "child-ca", "pem")])
+fixtures.der(ca, "child-ca")
+fixtures.leaf(ca, "bad-path", "child-ca", fixtures.options())
+let chainPem = context.work + "/bad-path-chain.pem"
+let chain = readBytesFile(fixtures.path(ca, "child-ca", "pem"))
+chain.addBytes(readBytesFile(fixtures.path(ca, "intermediate0", "pem")))
+writeBytesFile(chainPem, chain)
+let oracle = fixtures.run(context, ["openssl", "verify", "-x509_strict", "-purpose", "sslserver", "-CAfile", fixtures.path(ca, "root", "pem"), "-untrusted", chainPem, fixtures.path(ca, "bad-path", "pem")], 30)
+test.check(oracle.status != 0 && test.contains(oracle.errorOutput, "path length constraint exceeded"), "OpenSSL path length oracle\n" + oracle.output + oracle.errorOutput)
+let binary = context.work + "/usage"
+fixtures.compileProgram(context, "tests/tls-signing-usage.min", binary)
+let cases = [Case { name: "server-sign"; role: "server"; valid: true; chain: [] }, Case { name: "server-both"; role: "server"; valid: true; chain: [] },
+    Case { name: "no-ku"; role: "server"; valid: true; chain: [] }, Case { name: "server-encipher"; role: "server"; valid: false; chain: [] },
+    Case { name: "server-agreement"; role: "server"; valid: false; chain: [] }, Case { name: "client-sign"; role: "client"; valid: true; chain: [] },
+    Case { name: "client-agreement"; role: "client"; valid: false; chain: [] }, Case { name: "client-sign"; role: "server"; valid: false; chain: [] },
+    Case { name: "server-sign"; role: "client"; valid: false; chain: [] }, Case { name: "bad-path"; role: "server"; valid: false; chain: ["child-ca", "intermediate0"] }]
+let failures: List<Text> = []
+for item in cases {
+    let validity = "invalid"
+    if item.valid { validity = "valid" }
+    let command = [binary, fixtures.path(ca, item.name, "der"), fixtures.path(ca, "root", "der"), item.role, validity]
+    for part in item.chain { command.add(fixtures.path(ca, part, "der")) }
+    while command.length < 7 { command.add("") }
+    let result = fixtures.run(context, command, 30)
+    print(item.name + " " + item.role + " " + Text(result.status) + " " + result.output + " " + result.errorOutput)
+    if result.status != 0 { failures.add(item.name + "/" + item.role) }
+}
+test.check(failures.length == 0, "signing usage failures: " + joinText(failures))
+fixtures.finish(context)
