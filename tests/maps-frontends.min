@@ -1,0 +1,76 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+
+function engineSource(): Text {
+    let engine = readTextFile("runtime/minyar_runtime.c")
+    for header in ["minyar_rc.h", "minyar_collections.h"] {
+        let replacement = "minyar_cycle_rc.h"
+        if header == "minyar_collections.h" { replacement = "minyar_cycle_collections.h" }
+        let directive = "#include \"" + header + "\""
+        test.check(engine.byteLength - test.replace(engine, directive, "").byteLength == directive.byteLength, "managed graph runtime requires exactly one ownership header")
+        engine = test.replace(engine, directive, "#include \"" + replacement + "\"")
+    }
+    return "#define MINYAR_SORT_GRAPH 1\n#define MINYAR_MAP_CYCLE_RUNTIME 1\n#if defined(__GNUC__) || defined(__clang__)\n#define MINYAR_NOINLINE __attribute__((noinline))\n#else\n#define MINYAR_NOINLINE\n#endif\n" + engine + "\n#include \"minyar_callbacks.h\"\n"
+}
+
+function compile(compiler: test.Compiler, source: Text): test.Result {
+    compiler.serial += 1
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    writeTextFile(path + ".min", source)
+    let result = test.run([compiler.executable, path + ".min", path + ".ll", "--library", "library"], system.environment(), "", path + ".compile", 30)
+    if result.status == 0 && test.addressEnabled(compiler.flags) { writeTextFile(path + ".ll", test.instrument(readTextFile(path + ".ll"))) }
+    return result
+}
+function rejects(compiler: test.Compiler, source: Text, diagnostic: Text) {
+    let result = compile(compiler, source)
+    test.check(result.status == 1, "expected compiler rejection\n" + result.errorOutput)
+    test.check(result.output == "", "rejected source wrote standard output")
+    test.check(test.contains(result.errorOutput, diagnostic), "missing diagnostic: " + diagnostic + "\n" + result.errorOutput)
+    test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "invalid source left LLVM output")
+    test.check(!test.contains(result.errorOutput, "List position"), "compiler rejection reported a runtime List trap")
+}
+function executes(compiler: test.Compiler, source: Text, expected: Text) {
+    test.require(compile(compiler, source), "Map frontend compile")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    let harness = test.replace(readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", engineSource())
+    writeTextFile(path + ".runtime.c", harness)
+    let optimization = "-O2"
+    if compiler.flags.length > 0 { optimization = "-O1" }
+    let command = [compiler.clang, optimization]
+    for flag in compiler.flags { command.add(flag) }
+    for item in ["-DMINYAR_SYSTEM_HEAP=1", "-iquote", "runtime", "-c", path + ".runtime.c", "-o", path + ".runtime.o"] { command.add(item) }
+    test.require(test.run(command, system.environment(), "", path + ".runtime-build", 30), "callback ownership runtime compile")
+    for level in ["-O0", "-O2"] {
+        command = [compiler.clang, level]
+        for flag in compiler.flags { command.add(flag) }
+        for item in ["-Wno-override-module", path + ".ll", path + ".runtime.o", "-o", path + ".exe", "-lm"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".link", 30), "callback ownership link")
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", 30)
+        test.require(result, "callback ownership execution")
+        test.check(result.output == expected, "callback output changed at " + level + "\n" + result.output)
+        test.check(result.errorOutput == "", "callback wrote execution diagnostics\n" + result.errorOutput)
+    }
+}
+
+for frontend in ["callbacks", "errors"] {
+    let compiler = test.compiler()
+    let binary = "./build/minyarc-" + frontend
+    if test.addressEnabled(compiler.flags) { binary += "-sanitize" }
+    let variable = "MINYAR_CALLBACK_COMPILER"
+    if frontend == "errors" { variable = "MINYAR_ERRORS_COMPILER" }
+    compiler.executable = test.setting(variable, binary)
+    writeTextFile(compiler.directory + "/factory.min", "public record Box { value: Integer }\npublic function make(): Callback<Map<Integer, Integer>, Box> {\n    return function(row: Map<Integer, Integer>): Box { return Box { value: row[1] } }\n}\n")
+    executes(compiler, "use \"./factory.min\" as factory\nlet row = Map<Integer, Integer>()\nrow[1] = 42\nlet call = factory.make()\nprint(call(row).value)\n", "42\n")
+    executes(compiler, "let m = Map<Integer, Callback<Integer, Integer>>()\nlet offset = 40\nm[1] = function(value: Integer): Integer { return offset + value }\nlet saved = m[1]\nm.clear()\nprint(saved(2))\n", "42\n")
+    executes(compiler, "function make(m: Map<Integer, Text>): Callback<Integer, Map<Integer, Text>> {\nreturn function(key: Integer): Map<Integer, Text> { m[key] = \"capture\" + \"!\"; return m }\n}\nlet m = Map<Integer, Text>()\nlet call = make(m)\nlet result = call(9)\nm.clear()\nresult[9] = \"retained\" + \"!\"\nprint(call(3)[9])\nprint(m[3])\n", "retained!\ncapture!\n")
+    executes(compiler, "record Node { label: Text; children: List<Node> }\nlet n = Node { label: \"cyclic\" + \"!\"; children: [] }\nn.children.add(n)\nlet m = Map<Integer, Node>()\nlet i = 0\nwhile i < 80 { m[i] = n; i = i + 1 }\nlet saved = m[79]\nm.remove(0)\nm.clear()\nprint(saved.children[0].label)\n", "cyclic!\n")
+    rejects(compiler, "function insert(m: Map<Integer, Callback<Integer>>, call: Callback<Integer>) { m[1] = call }\nlet m = Map<Integer, Callback<Integer>>()\nlet call = function(): Integer { return m.length }\ninsert(m, call)\n", "Map mutation could create a reference cycle")
+    if frontend == "errors" {
+    executes(compiler, "let m = Map<Text, Result<List<Integer>, Text>>()\nm[\"answer\"] = Ok<List<Integer>, Text>([42])\nlet saved = m[\"answer\"]\nm.clear()\nmatch saved { Ok(v) { print(v[0]) } Err(e) { print(e) } }\nlet r = Ok<Map<Integer, Text>, Text>(Map())\nmatch r { Ok(v) { v[9] = \"result\" + \"!\"; print(v[9]) } Err(e) { print(e) } }\n", "42\nresult!\n")
+    writeTextFile(compiler.directory + "/factory.min", "public record Box { value: Integer }\npublic function make(): Result<Map<Integer, Integer>, Box> {\n    return Err<Map<Integer, Integer>, Box>(Box { value: 42 })\n}\n")
+    executes(compiler, "use \"./factory.min\" as factory\nmatch factory.make() { Ok(row) { print(row.length) } Err(box) { print(box.value) } }\n", "42\n")
+    }
+    test.removeTree(compiler.directory)
+}
+print("Map callback and Result frontends: passed")

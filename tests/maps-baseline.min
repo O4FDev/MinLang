@@ -1,0 +1,82 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "sha256" as sha
+
+function pinCPU(): Integer { native "mapsbaseline" }
+function childCPU(): Float { native "mapsbaseline" }
+function waitForExit(pid: Integer, milliseconds: Integer): Integer { native "mapsbaseline" }
+record Sample { cpu: Float; wall: Float }
+function median(samples: List<Sample>): Float {
+    let values: List<Float> = []
+    for sample in samples { values.add(sample.cpu) }
+    test.check(values.length > 0, "missing compiler timing samples")
+    for index in 1..values.length {
+        let position = index
+        while position > 0 && values[position] < values[position - 1] {
+            let earlier = values[position - 1]
+            values[position - 1] = values[position]
+            values[position] = earlier
+            position -= 1
+        }
+    }
+    let middle = values.length / 2
+    if values.length % 2 == 1 { return values[middle] }
+    return (values[middle - 1] + values[middle]) / 2.0
+}
+function compile(compiler: Text, source: Text, output: Text): Sample {
+    let before = childCPU()
+    test.check(before >= 0.0, "cannot read child CPU usage")
+    let start = system.monotonicNanoseconds()
+    let handle = system.spawn(compiler, [compiler, source, output], system.environment(), "")
+    test.check(handle > 0, "cannot launch benchmark compiler")
+    let pid = system.childProcessId(handle)
+    if waitForExit(pid, 30000) != 1 {
+        system.sendSignal(pid, 9)
+        system.wait(handle)
+        fail("benchmark compiler exceeded 30 seconds or wait failed")
+    }
+    let result = system.wait(handle)
+    let wall = Float(system.monotonicNanoseconds() - start) / 1000000000.0
+    test.check(result.error == 0 && result.state == system.EXITED && result.exitCode == 0, "benchmark compiler failed")
+    let after = childCPU()
+    test.check(after >= before, "invalid child CPU accounting")
+    return Sample { cpu: after - before; wall: wall }
+}
+
+let repeats = 31
+if argumentCount() > 0 {
+    test.check(argumentCount() == 2 && argument(0) == "--repeats", "unknown baseline benchmark option")
+    repeats = Integer(argument(1))
+}
+test.check(repeats > 0, "baseline benchmark needs measured samples")
+let cpu = pinCPU()
+test.check(cpu >= 0, "cannot pin benchmark to the minimum allowed CPU")
+let source = "build/compiler-baseline-control.min"
+test.check(sha.hex(sha.digest(readBytesFile(source))) == "a5f30a7954381231fbe04a712b72bd9663d1bd7082c667fef851b739ec63c3cf", "fixed compiler source hash changed")
+let directory = test.scratch()
+let compilers = ["./build/minyarc-baseline", "./build/minyarc"]
+let baseline: List<Sample> = []
+let candidate: List<Sample> = []
+let outputHashes = ["", ""]
+for repetition in (-1)..repeats {
+    let order = [0, 1]
+    if repetition % 2 == 0 { order = [1, 0] }
+    for index in order {
+        let output = directory + "/" + Text(index) + ".ll"
+        let sample = compile(compilers[index], source, output)
+        if repetition >= 0 {
+            if index == 0 { baseline.add(sample) } else { candidate.add(sample) }
+        }
+        outputHashes[index] = sha.hex(sha.digest(readBytesFile(output)))
+    }
+}
+test.check(outputHashes[0] == outputHashes[1], "baseline and candidate emitted different LLVM")
+let baselineMedian = median(baseline)
+let candidateMedian = median(candidate)
+test.check(baselineMedian > 0.0, "baseline median CPU usage is zero")
+let ratio = candidateMedian / baselineMedian
+print("baseline median CPU seconds " + Text(baselineMedian))
+print("candidate median CPU seconds " + Text(candidateMedian))
+print("ratio " + Text(ratio) + " limit 1.01")
+test.check(ratio <= 1.01, "fixed-input selfcompile exceeds the unchanged 1% gate")
+test.removeTree(directory)

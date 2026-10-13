@@ -1,0 +1,78 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+function parent(path: Text): Text {
+    let raw = Bytes(path)
+    let ending = -1
+    for index in 0..raw.length { if raw[index] == 47 { ending = index } }
+    if ending < 0 { return "." }
+    if ending == 0 { return "/" }
+    return Text(raw.slice(0, ending))
+}
+function count(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let found = 0
+    if raw.length < pattern.length { return 0 }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { found += 1 }
+    }
+    return found
+}
+let coreLimit = system.setResourceLimit(system.CORE_SIZE, 0, 0)
+test.check(coreLimit == 0, "disable crash core files")
+let work = test.scratch()
+let runtime = test.setting("MINYAR_COMPILER_RUNTIME_SOURCE", "runtime/minyar_runtime.c")
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let environment: List<Text> = []
+for entry in system.environment() {
+    if !starts(entry, "ASAN_OPTIONS=") && !starts(entry, "UBSAN_OPTIONS=") { environment.add(entry) }
+}
+environment.add("ASAN_OPTIONS=detect_leaks=0:halt_on_error=1")
+environment.add("UBSAN_OPTIONS=halt_on_error=1")
+test.check(files.makeDirectory(work + "/runtime") == 0 && files.makeDirectory(work + "/tests") == 0, "slice cache fixture directories")
+let headers = files.list(parent(runtime))
+test.check(files.lastError() == 0, "list selected runtime headers")
+for name in headers {
+    let raw = Bytes(name)
+    if raw.length >= 2 && raw[raw.length - 2] == 46 && raw[raw.length - 1] == 104 {
+        test.require(test.run(["cp", "-p", parent(runtime) + "/" + name, work + "/runtime/" + name], system.environment(), "", work + "/copy-header", 10), "copy slice cache runtime header")
+    }
+}
+test.require(test.run(["cp", "-p", "tests/compiler-slice-cache.c", work + "/tests/compiler-slice-cache.c"], system.environment(), "", work + "/copy-fixture", 10), "copy slice cache fixture")
+let literal = work + "/literal-prefix.ll"
+writeTextFile(literal, "@ascii_bytes = private constant [4 x i8] c\"cat\\00\"\n@ascii_header = private constant { i64, ptr, i64, i64, ptr, ptr } { i64 0, ptr @ascii_bytes, i64 3, i64 3, ptr null, ptr null }\n@unicode_bytes = private constant [9 x i8] c\"a\\C3\\A9\\F0\\9F\\99\\82z\\00\"\n@unicode_header = private global { i64, ptr, i64, i64, ptr, ptr } { i64 0, ptr @unicode_bytes, i64 8, i64 -1, ptr null, ptr null }\ndefine ptr @fixture_ascii_literal() {\n  %text = getelementptr { i64, ptr, i64, i64, ptr, ptr }, ptr @ascii_header, i32 0, i32 1\n  ret ptr %text\n}\ndefine ptr @fixture_unicode_literal() {\n  %text = getelementptr { i64, ptr, i64, i64, ptr, ptr }, ptr @unicode_header, i32 0, i32 1\n  ret ptr %text\n}\n")
+let source = readTextFile(runtime)
+let before = "!memcmp(cached->bytes, bytes, (size_t)length)"
+test.check(count(source, before) == 1, "slice-cache collision check changed")
+for mode in ["control", "collision-mutant"] {
+    let candidate = source
+    if mode == "collision-mutant" { candidate = test.replace(source, before, "1") }
+    writeTextFile(work + "/runtime/minyar_runtime.c", candidate)
+    for optimization in ["-O0", "-O2"] {
+        for sanitized in [false, true] {
+            let command = [clang, optimization, "-Wall", "-Wextra", "-Werror"]
+            if sanitized { command.add("-fsanitize=address,undefined") }
+            for item in ["-Wno-override-module", work + "/tests/compiler-slice-cache.c", literal, "-lm", "-o", work + "/case"] { command.add(item) }
+            test.require(test.run(command, system.environment(), "", work + "/build", 30), "build slice cache " + mode + " " + optimization)
+            let result = test.run([work + "/case"], environment, "", work + "/run", 10)
+            if mode == "control" {
+                test.check(result.status == 0 && test.contains(result.output, "contracts pass"), "slice cache control\n" + result.errorOutput)
+            } else {
+                test.check(result.status != 0 && (test.contains(result.errorOutput, "value->byte_length == n && !memcmp") || test.contains(result.errorOutput, "collision1 != collision2")), "slice cache collision mutant survived\n" + result.errorOutput)
+            }
+        }
+    }
+    print(mode + ": O0/O2 native and sanitizer checks pass")
+}
+test.removeTree(work)
+print("Compiler slice cache semantics and collision mutant verified")

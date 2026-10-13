@@ -1,0 +1,115 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+function absolute(path: Text, root: Text): Text {
+    if starts(path, "/") { return path }
+    return root + "/" + path
+}
+function stem(path: Text): Text {
+    let raw = Bytes(path)
+    let start = 0
+    let ending = raw.length
+    for index in 0..raw.length { if raw[index] == 47 { start = index + 1 } }
+    for index in start..raw.length { if raw[index] == 46 { ending = index } }
+    return Text(raw.slice(start, ending))
+}
+if argumentCount() > 0 && argument(0) == "--trace" {
+    let log = system.getenv("MODULE_DRIVER_LOG")
+    let pieces = [system.getenv("MINYAR_CLANG_FLAGS") + "\n", system.getenv("MINYAR_CLANG") + "\n", Text(argumentCount() - 1) + "\n"]
+    for index in 1..argumentCount() { pieces.add(argument(index) + "\n") }
+    let data = Bytes(joinText(pieces))
+    let file = files.open(log, files.WRITE | files.CREATE | files.APPEND)
+    test.check(file >= 0, "open native driver trace")
+    test.check(files.write(file, data, 0, data.length) == data.length && files.close(file) == 0, "write native driver trace")
+    let command = [system.getenv("MODULE_DRIVER_PYTHON"), system.getenv("MODULE_DRIVER_REAL")]
+    for index in 1..argumentCount() {
+        if index == 2 { command.add(system.getenv("MODULE_DRIVER_PROJECT")) }
+        else { command.add(argument(index)) }
+    }
+    let handle = system.spawn(command[0], command, system.environment(), "")
+    test.check(handle > 0, "launch actual production driver")
+    let result = system.wait(handle)
+    test.check(result.error == 0, "wait for actual production driver")
+    if result.state == system.SIGNALED { exit(128 + result.signal) }
+    test.check(result.state == system.EXITED, "production driver exit state")
+    exit(result.exitCode)
+}
+let compiler = test.compiler()
+let work = compiler.directory
+let rootResult = test.run(["pwd", "-P"], system.environment(), "", work + "/root", 10)
+test.require(rootResult, "resolve module fixture root")
+let root = test.lines(rootResult.output)[0]
+let project = work + "/project with spaces"
+for directory in [project, project + "/tests", project + "/build", project + "/tools", project + "/bin"] { test.check(files.makeDirectory(directory) == 0, "module fixture directory") }
+for name in ["modules", "packages", "parallel"] {
+    test.require(test.run(["cp", "-R", root + "/tests/" + name, project + "/tests/" + name], system.environment(), "", work + "/copy-tests", 30), "copy actual module cases " + name)
+}
+test.require(test.run(["cp", "-R", root + "/library", project + "/library"], system.environment(), "", work + "/copy-library", 30), "copy actual module packages")
+test.require(test.run(["cp", root + "/tests/run-module-tests.sh", project + "/tests/run-module-tests.sh"], system.environment(), "", work + "/copy-harness", 10), "copy module shell harness")
+let runtime = absolute(compiler.runtime, root)
+test.require(test.run(["cp", runtime, project + "/build/minyar-runtime.o"], system.environment(), "", work + "/copy-runtime", 10), "copy actual module runtime")
+let self = test.run(["readlink", "/proc/" + Text(system.processId()) + "/exe"], system.environment(), "", work + "/self", 10)
+test.require(self, "locate native driver tracer")
+let python = test.run(["/bin/sh", "-c", "command -v python3"], system.environment(), "", work + "/python", 10)
+test.require(python, "locate production driver interpreter")
+let dispatch = project + "/bin/python3"
+writeTextFile(dispatch, "#!/bin/sh\nif [ \"$1\" = \"$MODULE_DRIVER_TEST_PATH\" ]; then shift; exec \"$MODULE_DRIVER_TRACER\" --trace \"$@\"; fi\nexec \"$MODULE_DRIVER_PYTHON\" \"$@\"\n")
+test.require(test.run(["chmod", "700", dispatch], system.environment(), "", work + "/shim-mode", 10), "set native trace dispatcher mode")
+let log = project + "/driver.log"
+let environment: List<Text> = []
+for entry in system.environment() {
+    if !starts(entry, "PATH=") && !starts(entry, "MINYAR_TEST_COMPILER=") && !starts(entry, "MINYAR_TEST_CLANG=") && !starts(entry, "MODULE_DRIVER_") && !starts(entry, "MINYAR_MODULE_TEST_DIR=") { environment.add(entry) }
+}
+environment.add("PATH=" + project + "/bin:" + system.getenv("PATH"))
+environment.add("MINYAR_TEST_COMPILER=" + absolute(compiler.executable, root))
+environment.add("MINYAR_TEST_CLANG=" + compiler.clang)
+environment.add("MODULE_DRIVER_LOG=" + log)
+environment.add("MODULE_DRIVER_PROJECT=" + root)
+environment.add("MODULE_DRIVER_REAL=" + root + "/tools/clang-driver.py")
+environment.add("MODULE_DRIVER_TRACER=" + test.lines(self.output)[0])
+environment.add("MODULE_DRIVER_TEST_PATH=" + project + "/tools/clang-driver.py")
+environment.add("MODULE_DRIVER_PYTHON=" + test.lines(python.output)[0])
+test.require(test.run(["sh", project + "/tests/run-module-tests.sh"], environment, "", work + "/harness", 240), "actual module shell harness")
+let expectedNames = ["basic", "diamond", "explicit-main", "windows-path", "character-literals", "private-fields", "search-path", "json", "crypto", "parallel"]
+let seen: List<Integer> = []
+for name in expectedNames { seen.add(0) }
+let calls = test.lines(readTextFile(log))
+let position = 0
+let count = 0
+while position < calls.length {
+    test.check(position + 3 <= calls.length, "native trace header")
+    let flags = calls[position]
+    let clang = calls[position + 1]
+    let arguments = Integer(calls[position + 2])
+    position += 3
+    test.check(arguments >= 4 && position + arguments <= calls.length, "native trace argv")
+    test.check(calls[position] == "link", "module harness driver command")
+    test.check(calls[position + arguments - 1] == "0", "module tests must not silently enable release LTO")
+    test.check(clang == compiler.clang, "module harness selected Clang")
+    let name = stem(calls[position + 2])
+    let found = -1
+    for index in 0..expectedNames.length { if expectedNames[index] == name { found = index } }
+    test.check(found >= 0, "unexpected module driver call " + name)
+    let expectedFlags = "-O0 -Wno-override-module"
+    if found >= 7 { expectedFlags = "-O1 -Wno-override-module" }
+    test.check(flags == expectedFlags, "module harness optimization " + name)
+    seen[found] += 1
+    count += 1
+    position += arguments
+}
+test.check(count == expectedNames.length, "module driver call count")
+for occurrences in seen { test.check(occurrences == 1, "module harness expected call set") }
+let llvm = project + "/build/module-tests/crypto.ll"
+test.check(test.contains(readTextFile(llvm), "; minyar-native-library: securecrypto"), "crypto IR native metadata")
+let negative = test.run([compiler.clang, "-O1", "-Wno-override-module", llvm, runtime, "-lm", "-o", project + "/control"], system.environment(), "", work + "/negative", 60)
+test.check(negative.status != 0, "crypto direct-link negative control unexpectedly linked")
+test.check(test.contains(negative.errorOutput, "minyar_securecrypto_"), "negative control native symbol diagnostic")
+test.removeTree(work)
+print("Module shell driver metadata and optimizations: passed")

@@ -1,0 +1,127 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+
+function engineSource(): Text {
+    let engine = readTextFile("runtime/minyar_runtime.c")
+    for header in ["minyar_rc.h", "minyar_collections.h"] {
+        let replacement = "minyar_cycle_rc.h"
+        if header == "minyar_collections.h" { replacement = "minyar_cycle_collections.h" }
+        let directive = "#include \"" + header + "\""
+        test.check(engine.byteLength - test.replace(engine, directive, "").byteLength == directive.byteLength, "managed graph runtime requires exactly one ownership header")
+        engine = test.replace(engine, directive, "#include \"" + replacement + "\"")
+    }
+    return "#define MINYAR_SORT_GRAPH 1\n#define MINYAR_MAP_CYCLE_RUNTIME 1\n#if defined(__GNUC__) || defined(__clang__)\n#define MINYAR_NOINLINE __attribute__((noinline))\n#else\n#define MINYAR_NOINLINE\n#endif\n" + engine + "\n#include \"minyar_callbacks.h\"\n"
+}
+
+function setting(environment: List<Text>, name: Text, value: Text): List<Text> {
+    let result: List<Text> = []
+    let prefix = name + "="
+    for entry in environment {
+        let raw = Bytes(entry)
+        if raw.length < prefix.byteLength || Text(raw.slice(0, prefix.byteLength)) != prefix { result.add(entry) }
+    }
+    result.add(prefix + value)
+    return result
+}
+
+function rejects(compiler: test.Compiler, source: Text, diagnostic: Text) {
+    let result = test.compile(compiler, source)
+    test.check(result.status == 1, "expected compiler rejection\n" + result.errorOutput)
+    test.check(result.output == "", "rejected source wrote standard output")
+    test.check(test.contains(result.errorOutput, diagnostic), "missing diagnostic: " + diagnostic + "\n" + result.errorOutput)
+    test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "invalid source left LLVM output")
+    test.check(!test.contains(result.errorOutput, "List position"), "compiler rejection reported a runtime List trap")
+}
+
+function executes(compiler: test.Compiler, source: Text, expected: Text, status: Integer, diagnostics: Text) {
+    test.require(test.compile(compiler, source), "List compile")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization]
+        for flag in compiler.flags { command.add(flag) }
+        for item in ["-Wno-override-module", path + ".ll", compiler.runtime, "-o", path + ".exe", "-lm"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".link", 60), "List ownership link")
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", compiler.runTimeout)
+        test.check(result.status == status, "List execution returned " + Text(result.status) + "\n" + result.errorOutput)
+        test.check(result.output == expected, "List output changed\n" + result.output)
+        test.check(result.errorOutput == diagnostics, "List diagnostics changed\n" + result.errorOutput)
+    }
+}
+
+record Invalid { operation: Text; diagnostic: Text }
+record Profile { name: Text; defines: List<Text> }
+let compilerCases = true
+let runtimeCases = true
+test.check(argumentCount() <= 1, "unexpected List basics test selector")
+if argumentCount() == 1 {
+    let selector = argument(0)
+    if selector == "ListBasics" { runtimeCases = false }
+    else if selector == "RuntimeBasics" { compilerCases = false }
+    else { fail("unknown List basics test selector: " + selector) }
+}
+let compiler = test.compiler()
+let command: List<Text> = []
+if compilerCases {
+let runtimeSource = compiler.directory + "/runtime.c"
+writeTextFile(runtimeSource, test.replace(readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", engineSource()))
+compiler.runtime = compiler.directory + "/runtime.o"
+let optimization = "-O2"
+if compiler.flags.length > 0 { optimization = "-O1" }
+command = [compiler.clang, optimization]
+for flag in compiler.flags { command.add(flag) }
+for item in ["-DMINYAR_SYSTEM_HEAP=1", "-iquote", "runtime", "-c", runtimeSource, "-o", compiler.runtime] { command.add(item) }
+test.require(test.run(command, system.environment(), "", compiler.directory + "/ownership-runtime", 60), "List ownership contract runtime")
+executes(compiler, "let values = [1, 2, 3]\nlet alias = values\nlet copy = values.slice(1, 3)\ncopy[0] = 9\nprint(values.pop()); print(alias.length); print(copy[0]); print(values[1])\nvalues.truncate(0)\nprint(alias.length)\nvalues.add(7)\nprint(alias.pop())\nlet floats = [1.5, -0.0]\nprint(floats.slice(0, 1).pop()); print(floats.pop())\nlet flags = [true, false]\nprint(flags.pop())\nlet characters = ['a', '🙂']\nprint(characters.pop())\nlet empty: List<Text> = []\nprint(empty.slice(0, 0).length)\nempty.truncate(0)\n", "3\n2\n9\n2\n0\n7\n1.5\n-0.0\nfalse\n🙂\n0\n", 0, "")
+executes(compiler, "record Node { text: Text; links: List<Node> }\nlet node = Node { text: Text(123); links: [] }\nlet nodes = [node]\nnode.links = nodes\nlet copy = nodes.slice(0, 1)\nlet removed = nodes.pop()\nprint(nodes.length)\ncopy[0].text = Text(456)\ncopy.truncate(0)\nprint(removed.text)\nremoved.links = []\nfunction take(): Text { let values = [Text(789)]; return values.pop() }\nprint(take())\nprint([Text(321)].pop())\n", "0\n456\n789\n321\n", 0, "")
+executes(compiler, "record Holder { values: List<Text> }\nfunction start(holder: Holder): Integer { holder.values = [Text(9)]; print(\"start\"); return 0 }\nfunction end(alias: List<Text>): Integer { alias.add(Text(3)); print(\"end\"); return alias.length }\nlet holder = Holder { values: [Text(1), Text(2)] }\nlet alias = holder.values\nlet copy = holder.values.slice(start(holder), end(alias))\nalias.truncate(0)\nprint(copy.pop()); print(copy.pop()); print(copy.pop())\nprint(holder.values.pop())\nlet lonely = Holder { values: [Text(4)] }\nprint(lonely.values.slice(start(lonely), 1).pop())\n", "start\nend\n3\n2\n1\n9\nstart\n4\n", 0, "")
+let invalid = [
+    Invalid { operation: "values.pop()"; diagnostic: "List position -1 is outside its length of 0." },
+    Invalid { operation: "values.truncate(-1)"; diagnostic: "List truncate length is outside its length." },
+    Invalid { operation: "values.truncate(1)"; diagnostic: "List truncate length is outside its length." },
+    Invalid { operation: "values.slice(-1, 0)"; diagnostic: "List slice positions are outside its length." },
+    Invalid { operation: "values.slice(1, 0)"; diagnostic: "List slice positions are outside its length." },
+    Invalid { operation: "values.slice(0, 9223372036854775807)"; diagnostic: "List slice positions are outside its length." }
+]
+for entry in invalid { executes(compiler, "let values: List<Text> = []\n" + entry.operation + "\n", "", 1, "Minyar stopped: " + entry.diagnostic + "\n") }
+rejects(compiler, "let values = [1]\nvalues.truncate(true)\n", "List.truncate positions must be Integers")
+rejects(compiler, "let values = [1]\nvalues.slice(0, false)\n", "List.slice positions must be Integers")
+rejects(compiler, "let values = [1]\nvalues.pop(0)\n", "expected ')'")
+}
+if runtimeCases {
+let cycle = compiler.directory + "/cycle.c"
+writeTextFile(cycle, engineSource())
+let profiles = [
+    Profile { name: "eager"; defines: [] },
+    Profile { name: "system"; defines: ["-DMINYAR_SYSTEM_HEAP=1"] },
+    Profile { name: "bounded"; defines: ["-DMINYAR_BOUNDED_HEAP=1", "-DMINYAR_RC_POLL_BUDGET=1"] },
+    Profile { name: "lazy"; defines: ["-DMINYAR_BOUNDED_HEAP=1", "-DMINYAR_LAZY_HEAP=1", "-DMINYAR_RC_POLL_BUDGET=1"] }
+]
+let environment = setting(system.environment(), "ASAN_OPTIONS", "detect_leaks=1:halt_on_error=1")
+environment = setting(environment, "UBSAN_OPTIONS", "halt_on_error=1")
+let failureEnvironment = setting(environment, "ASAN_OPTIONS", "detect_leaks=0:halt_on_error=1")
+for traced in [false, true] {
+    for profile in profiles {
+        for level in ["-O0", "-O2"] {
+            let executable = compiler.directory + "/" + Text(traced) + "-" + profile.name + "-" + level
+            command = [compiler.clang, "-std=c11", "-Wall", "-Wextra", "-Werror", level]
+            for flag in compiler.flags { command.add(flag) }
+            for define in profile.defines { command.add(define) }
+            if traced { command.add("-DMINYAR_LIST_TEST_ENGINE=\"" + cycle + "\"") }
+            for item in ["-iquote", "runtime", "tests/list-basics.c", "-o", executable, "-lm"] { command.add(item) }
+            test.require(test.run(command, system.environment(), "", executable + ".build", 60), "List runtime profile compile")
+            let result = test.run([executable], environment, "", executable + ".run", 30)
+            test.check(result.status == 0 && result.output == "list basics ownership passed\n" && result.errorOutput == "", "List runtime profile changed\n" + result.output + result.errorOutput)
+            for mode in ["empty-pop", "negative-truncate", "long-truncate", "negative-slice", "reversed-slice", "long-slice"] {
+                let diagnostic = "List slice positions are outside its length."
+                if mode == "empty-pop" { diagnostic = "List position -1 is outside its length of 0." }
+                else if test.contains(mode, "truncate") { diagnostic = "List truncate length is outside its length." }
+                result = test.run([executable, mode], failureEnvironment, "", executable + "." + mode, 30)
+                test.check(result.status == 1 && result.output == "" && result.errorOutput == "Minyar stopped: " + diagnostic + "\n", "List runtime error changed\n" + result.output + result.errorOutput)
+            }
+        }
+    }
+}
+}
+test.removeTree(compiler.directory)
+print("list basics: passed")

@@ -1,0 +1,387 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+function selected(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() {
+        if argument(index) == name || argument(index) == "StatementNesting." + name { return true }
+    }
+    return false
+}
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+function find(source: Text, needle: Text, start: Integer): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if raw.length < pattern.length { return -1 }
+    for position in start..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[position + index] != pattern[index] { equal = false; break } }
+        if equal { return position }
+    }
+    return -1
+}
+function location(source: Text, token: Text, explanation: Text, occurrence: Integer): Text {
+    let position = -1
+    let start = 0
+    for index in 0..(occurrence + 1) {
+        position = find(source, token, start)
+        test.check(position >= 0, "missing diagnostic token " + token)
+        start = position + Bytes(token).length
+    }
+    let line = 1
+    let column = 1
+    let raw = Bytes(source)
+    for index in 0..position {
+        if raw[index] == 10 { line += 1; column = 1 }
+        else { column += 1 }
+    }
+    return "Minyar stopped: line " + Text(line) + ", column " + Text(column) + ": " + explanation + "\n"
+}
+function quiet(result: test.Result, phase: Text) {
+    test.require(result, phase)
+    test.check(result.output == "" && result.errorOutput == "", phase + " unexpected output\n" + result.output + result.errorOutput)
+}
+function compile(compiler: test.Compiler, source: Text, exact: Boolean): Text {
+    let result = test.compile(compiler, source)
+    test.require(result, "compile statement nesting")
+    if exact { test.check(result.output == "" && result.errorOutput == "", "unexpected compiler output\n" + result.output + result.errorOutput) }
+    return compiler.directory + "/case" + Text(compiler.serial) + ".ll"
+}
+function linkAndRun(compiler: test.Compiler, llvm: Text, output: Text, status: Integer, diagnostics: Text, optimizations: List<Text>, linkTimeout: Integer, runTimeout: Integer, exact: Boolean) {
+    for optimization in optimizations {
+        let command = [compiler.clang, optimization]
+        for flag in compiler.flags { command.add(flag) }
+        let exe = llvm + ".exe"
+        for item in ["-Wno-override-module", llvm, compiler.runtime, "-lm", "-o", exe] { command.add(item) }
+        let result = test.run(command, system.environment(), "", llvm + ".link", linkTimeout)
+        test.require(result, "link statement nesting " + optimization)
+        if exact { test.check(result.output == "" && result.errorOutput == "", "unexpected link output\n" + result.output + result.errorOutput) }
+        result = test.run([exe], system.environment(), "", llvm + ".run", runTimeout)
+        test.check(result.status == status, "statement nesting status " + optimization + "\n" + result.errorOutput)
+        test.check(result.output == output, "statement nesting output " + optimization + "\n" + result.output)
+        test.check(result.errorOutput == diagnostics, "statement nesting diagnostics " + optimization + "\n" + result.errorOutput)
+    }
+}
+function executes(compiler: test.Compiler, source: Text, expected: Text): Text {
+    let llvm = compile(compiler, source, false)
+    linkAndRun(compiler, llvm, expected, 0, "", ["-O0", "-O2"], compiler.linkTimeout, compiler.runTimeout, false)
+    return readTextFile(llvm)
+}
+function rejects(compiler: test.Compiler, source: Text, diagnostic: Text) {
+    let result = test.compile(compiler, source)
+    test.check(result.status == 1 && result.output == "" && result.errorOutput == diagnostic, "exact statement diagnostic\n" + result.output + result.errorOutput + "expected\n" + diagnostic)
+    test.check(files.pathSize(compiler.directory + "/case" + Text(compiler.serial) + ".ll") < 0, "rejected statements emitted LLVM")
+}
+function repeated(source: Text, count: Integer): Text {
+    let parts: List<Text> = []
+    for index in 0..count { parts.add(source) }
+    return joinText(parts)
+}
+function deepThen(depth: Integer): Text {
+    return "function value(flag: Boolean): Text {\nlet result = \"outer\"\n" + repeated("if flag {\n", depth) + "let local = [\"kept\"]\nresult = local[0] + \"!\"\n" + repeated("}\n", depth) + "return result\n}\nprint(value(true)); print(value(false))\n"
+}
+function deepWhile(depth: Integer): Text {
+    return "function value(flag: Boolean): Integer {\n" + repeated("while flag {\n", depth) + "return 7\n" + repeated("}\n", depth) + "return 9\n}\nprint(value(true)); print(value(false))\n"
+}
+function deepChain(): Text {
+    let source = ["function longChain(x: Integer): Integer {\n"]
+    for index in 100..50100 { source.add("if x == " + Text(index) + " { return " + Text(index * index) + " } else {\n") }
+    source.add("return 2510010000\n")
+    source.add(repeated("}\n", 50001))
+    return joinText(source)
+}
+function labelCount(source: Text, prefix: Text): Integer {
+    let count = 0
+    for line in test.lines(source) {
+        if starts(line, prefix) {
+            let raw = Bytes(line)
+            let index = Bytes(prefix).length
+            let first = index
+            while index < raw.length && raw[index] >= 48 && raw[index] <= 57 { index += 1 }
+            if index > first && index < raw.length && raw[index] == 58 { count += 1 }
+        }
+    }
+    return count
+}
+function octal(value: Integer): Text {
+    if value == 0 { return "0" }
+    let output = ""
+    while value > 0 { output = Text(value % 8) + output; value /= 8 }
+    return output
+}
+function header(source: Text, name: Text): Text {
+    for line in test.lines(source) {
+        if starts(line, "define i64 @.minyar.fn." + name + "(") { return line }
+    }
+    fail("missing function header " + name)
+}
+record Success { name: Text; source: Text; output: Text; status: Integer; diagnostic: Text }
+let allowed = ["test_moderate_scopes_loops_and_owned_results", "test_terminal_exit_and_failure_keep_exact_trace", "test_scope_and_control_diagnostics_are_exact", "test_deep_then_scopes_and_while_returns_execute", "test_twenty_thousand_while_bodies_compile", "test_large_function_inline_budget_boundaries", "test_sorted_literal_dispatch_preserves_every_value_and_signed_boundaries", "test_dispatch_declines_effects_nonliteral_and_noncanonical_shapes", "test_imported_dispatch_tables_have_distinct_stable_names", "test_fifty_thousand_nested_else_branches", "test_fifty_thousand_nested_branches_in_imported_function", "test_imported_nested_scopes_and_owned_returns"]
+for index in 0..argumentCount() {
+    let valid = false
+    for name in allowed { if argument(index) == name || argument(index) == "StatementNesting." + name { valid = true } }
+    test.check(valid, "unknown statement nesting case: " + argument(index))
+}
+let compiler = test.compiler()
+let moduleCompiler = test.setting("MINYAR_TEST_MODULE_COMPILER", "./build/minyarc-modules")
+let queries = [0, 1, 101, 102, 50099, 50100, 50101, 50200, 51100]
+let chainExpected = "2510010000\n2510010000\n10201\n10404\n2509909801\n2510010000\n2510010000\n2510010000\n2510010000\n"
+let successes: List<Success> = [
+    Success { name: "branch_scope_restores_types_and_owners"; source: "function branch(flag: Boolean): Text {\nlet result = \"base\"\nif flag {\nlet holder = [\"left\", \"copy\"]\nif holder.length == 2 { let result = holder[0] + \"!\"; print(result) }\nresult = holder[1] + \"?\"\n} else {\nlet holder = 42\nresult = Text(holder)\n}\nreturn result\n}\nprint(branch(true)); print(branch(false))\n"; output: "left!\ncopy?\n42\n"; status: 0; diagnostic: "" },
+    Success { name: "short_circuit_conditions_and_reference_effects"; source: "function checked(count: List<Integer>, answer: Boolean): Boolean {\ncount[0] = count[0] + 1\nlet temporary = Text(count[0]) + \"checked\"\nreturn temporary.length > 0 && answer\n}\nlet calls = [0]\nif checked(calls,false) && checked(calls,true) { print(\"wrong\") } else {\nif checked(calls,true) || checked(calls,false) { print(\"taken\") } else { print(\"wrong\") }\n}\nlet index = 0\nwhile checked(calls,index < 2) && checked(calls,true) {\nif index == 0 { print(\"first\") } else { print(\"second\") }\nindex = index + 1\n}\nprint(calls[0])\n"; output: "taken\nfirst\nsecond\n7\n"; status: 0; diagnostic: "" },
+    Success { name: "nested_loops_release_scoped_lists_and_text"; source: "let saved: List<Text> = []\nlet outer = 0\nwhile outer < 3 {\nlet part = Text(outer) + \":\"\nlet inner = 0\nwhile inner < 2 {\nlet scoped = [part + Text(inner)]\nif inner == 0 { saved.add(scoped[0]) } else { let alias = scoped; saved.add(alias[0]) }\ninner = inner + 1\n}\nouter = outer + 1\n}\nlet index = 0\nwhile index < saved.length { print(saved[index]); index = index + 1 }\n"; output: "0:0\n0:1\n1:0\n1:1\n2:0\n2:1\n"; status: 0; diagnostic: "" },
+    Success { name: "record_list_returns_cross_nested_scopes"; source: "record Box { values: List<Text> }\nfunction make(flag: Boolean): Box {\nlet seed = [\"seed\"]\nif flag {\nif seed.length == 1 {\nlet alias = seed; alias.add(\"left\")\nreturn Box { values: alias }\n} else { return Box { values: [\"unreachable\"] } }\n} else {\nwhile true {\nlet alias = seed; alias.add(\"right\")\nreturn Box { values: alias }\n}\n}\n}\nlet left = make(true); let right = make(false)\nprint(left.values[0]); print(left.values[1]); print(right.values[0]); print(right.values[1])\n"; output: "seed\nleft\nseed\nright\n"; status: 0; diagnostic: "" },
+    Success { name: "terminal_blocks_still_lower_unreachable_statements"; source: "function choose(flag: Boolean): Integer {\nif flag {\nreturn 11\nlet dead = [\"unreachable\"]\nprint(dead[0])\n} else {\nreturn 22\nwhile false { let ignored = \"unreachable\" + \"body\"; print(ignored) }\n}\nlet tail = [\"unreachable tail\"]\nprint(tail[0])\n}\nprint(choose(true)); print(choose(false))\n"; output: "11\n22\n"; status: 0; diagnostic: "" },
+    Success { name: "literal_true_nested_loops_are_terminal"; source: "function value(flag: Boolean): Text {\nwhile true {\nif flag { return \"one\" + \"!\" } else { while true { return \"two\" + \"?\" } }\n}\nlet dead = [\"unreachable\"]\nprint(dead[0])\n}\nprint(value(true)); print(value(false))\n"; output: "one!\ntwo?\n"; status: 0; diagnostic: "" },
+    Success { name: "variable_and_false_loops_keep_fallthrough"; source: "function value(flag: Boolean): Integer {\nif flag { while false { return 100 }; let scope = [\"local\"]; print(scope[0]) } else { while false {} }\nwhile flag { if flag { return 7 } else { return 8 } }\nreturn 9\n}\nprint(value(true)); print(value(false))\n"; output: "local\n7\n9\n"; status: 0; diagnostic: "" },
+    Success { name: "loop_cleanup_debt_and_reused_frame_kinds"; source: "function discarded(n: Integer): List<Text> { return [Text(n) + \"temporary\", \"tail\"] }\nlet count = 0\nwhile count < 80 {\ndiscarded(count)\nif count % 2 == 0 { let temporary = [Text(count)]; temporary.add(\"x\") } else { while false { print(\"wrong\") } }\nif count == 0 {} else {}\ncount = count + 1\n}\nprint(count)\n"; output: "80\n"; status: 0; diagnostic: "" },
+    Success { name: "nested_returns_balance_function_frames"; source: "function descend(n: Integer): Integer {\nwhile n >= 0 {\nif n == 0 { return 0 } else { if n > 0 { return 1 + descend(n - 1) } else { return 90 } }\n}\nreturn -1\n}\nprint(descend(300)); print(descend(-1))\n"; output: "300\n-1\n"; status: 0; diagnostic: "" },
+    Success { name: "empty_blocks_and_adjacent_siblings"; source: "if true {} else { print(\"wrong\") }\nwhile false {}\nif false { print(\"wrong\") } else { if true {} else {}; print(\"empty works\") }\nlet value = \"outer\"\nif false { let value = [\"hidden\"]; print(value[0]) }\nprint(value)\n"; output: "empty works\nouter\n"; status: 0; diagnostic: "" },
+    Success { name: "nested_exit_terminates_function_without_return"; source: "function stop(): Integer {\nif true { while true { print(\"before exit\"); exit(7) } } else { return 0 }\n}\nprint(stop())\nprint(\"wrong\")\n"; output: "before exit\n"; status: 7; diagnostic: "" },
+    Success { name: "nested_fail_terminates_block_without_fallthrough"; source: "function stop(): Integer {\nwhile true {\nif true { print(\"before failure\"); fail(\"nested failure\") } else { return 0 }\n}\n}\nprint(stop())\nprint(\"wrong\")\n"; output: "before failure\n"; status: 1; diagnostic: "Minyar stopped: nested failure\n" },
+    Success { name: "else_after_newline_attaches_to_if"; source: "function f(flag: Boolean) {\nif flag { print(\"then\") }\nelse { print(\"else\") }\n}\nf(true)\nf(false)\n"; output: "then\nelse\n"; status: 0; diagnostic: "" },
+    Success { name: "asymmetric_branch_returns_preserve_fallthrough"; source: "function thenReturns(flag: Boolean): Text {\nlet result = \"outer\"\nif flag { return \"early then\" } else {\nlet scoped = [\"else\", \" tail\"]\nresult = scoped[0] + scoped[1]\n}\nreturn result\n}\nfunction elseReturns(flag: Boolean): Text {\nlet result = \"outer\"\nif flag {\nlet scoped = [\"then\", \" tail\"]\nresult = scoped[0] + scoped[1]\n} else { return \"early else\" }\nreturn result\n}\nprint(thenReturns(true)); print(thenReturns(false))\nprint(elseReturns(true)); print(elseReturns(false))\n"; output: "early then\nelse tail\nthen tail\nearly else\n"; status: 0; diagnostic: "" }
+]
+if selected("test_moderate_scopes_loops_and_owned_results") {
+    for case in successes {
+        if case.status == 0 { executes(compiler, case.source, case.output) }
+    }
+    let mixed = ["function value(flag: Boolean): Integer {\nlet result = 0\n"]
+    for level in 0..128 { mixed.add("if flag {\nlet local = [\"" + Text(level) + "\"]\nwhile local.length > 0 {\n") }
+    mixed.add("return 128\n")
+    mixed.add(repeated("}\n} else { return -1 }\n", 128))
+    mixed.add("return result\n}\nprint(value(true)); print(value(false))\n")
+    executes(compiler, joinText(mixed), "128\n-1\n")
+}
+if selected("test_terminal_exit_and_failure_keep_exact_trace") {
+    for case in successes {
+        if case.status != 0 {
+            let llvm = compile(compiler, case.source, false)
+            linkAndRun(compiler, llvm, case.output, case.status, case.diagnostic, ["-O0", "-O2"], compiler.linkTimeout, compiler.runTimeout, false)
+        }
+    }
+}
+if selected("test_scope_and_control_diagnostics_are_exact") {
+    rejects(compiler, "function f() { if true {}; else {} }\n", location("function f() { if true {}; else {} }\n", "else", "'else' needs a preceding if branch", 0))
+    rejects(compiler, "function f() { if true {} print(2) }\n", location("function f() { if true {} print(2) }\n", "print", "unexpected 'print'; start the next statement on a new line", 0))
+    rejects(compiler, "function f() { while false {} else {} }\n", location("function f() { while false {} else {} }\n", "else", "unexpected 'else'; start the next statement on a new line", 0))
+    rejects(compiler, "function f() {\nif true { let hidden = \"then\" } else { print(hidden) }\n}\n", location("function f() {\nif true { let hidden = \"then\" } else { print(hidden) }\n}\n", "hidden", "I can't find a value named 'hidden'", 1))
+    rejects(compiler, "function f() {\nif true { let hidden = [\"inside\"] }\nprint(hidden)\n}\n", location("function f() {\nif true { let hidden = [\"inside\"] }\nprint(hidden)\n}\n", "hidden", "I can't find a value named 'hidden'", 1))
+    rejects(compiler, "function f(): Integer {\nwhile true { return 1 }\nprint(missing)\n}\n", location("function f(): Integer {\nwhile true { return 1 }\nprint(missing)\n}\n", "missing", "I can't find a value named 'missing'", 0))
+    rejects(compiler, "function f(flag: Boolean): Integer {\nif flag { return 1 } else { return 2 }\nif false { print(missing) }\n}\n", location("function f(flag: Boolean): Integer {\nif flag { return 1 } else { return 2 }\nif false { print(missing) }\n}\n", "missing", "I can't find a value named 'missing'", 0))
+    rejects(compiler, "function f(): Integer { while false { return 1 } }\n", "Minyar stopped: function 'f' must return a value on every path\n")
+    rejects(compiler, "function f(flag: Boolean): Integer { while flag { return 1 } }\n", "Minyar stopped: function 'f' must return a value on every path\n")
+    rejects(compiler, "function f(flag: Boolean): Integer { if flag { if true { return 1 } else { return 2 } } }\n", "Minyar stopped: function 'f' must return a value on every path\n")
+    rejects(compiler, "function f() { if 1 { print(0) } }\n", location("function f() { if 1 { print(0) } }\n", "{", "an if condition must be Boolean", 1))
+    rejects(compiler, "function f() { if true { while 1 { print(0) } } }\n", location("function f() { if true { while 1 { print(0) } } }\n", "{", "a while condition must be Boolean", 2))
+}
+if selected("test_deep_then_scopes_and_while_returns_execute") {
+    let llvm = compile(compiler, deepThen(20000), true)
+    linkAndRun(compiler, llvm, "kept!\nouter\n", 0, "", ["-O0"], 180, 30, true)
+    llvm = compile(compiler, deepWhile(2000), true)
+    linkAndRun(compiler, llvm, "7\n9\n", 0, "", ["-O0"], 180, 30, true)
+}
+if selected("test_twenty_thousand_while_bodies_compile") {
+    let llvm = compile(compiler, deepWhile(20000), true)
+    let ir = readTextFile(llvm)
+    for prefix in ["while.condition.", "while.body.", "while.end."] {
+        test.check(labelCount(ir, prefix) == 20000, "deep while labels " + prefix)
+    }
+    let parsed = compiler.directory + "/nested-while-parsed.ll"
+    quiet(test.run([compiler.clang, "-O0", "-S", "-emit-llvm", "-Xclang", "-disable-llvm-passes", "-Wno-override-module", llvm, "-o", parsed], system.environment(), "", llvm + ".parse", 30), "parse entire nested LLVM")
+    test.check(files.pathSize(parsed) >= 0, "LLVM frontend did not write parsed module")
+}
+if selected("test_large_function_inline_budget_boundaries") {
+    let parts: List<Text> = []
+    let names = ["belowBudget", "atBudget", "aboveBudget"]
+    let dead = ["", "print(999)\n", "return -2\nprint(999)\n"]
+    for index in 0..3 {
+        parts.add("function " + names[index] + "(x: Integer): Integer {\n")
+        for value in 0..1365 { parts.add("if x == " + Text(value) + " { return " + Text(value) + " } else {\n") }
+        parts.add("return -1\n" + repeated("}\n", 1365) + dead[index] + "}\n")
+    }
+    parts.add("function smallEligible(x: Integer): Integer { return x }\n")
+    for name in names { for value in [0, 1364, 1365] { parts.add("print(" + name + "(" + Text(value) + "))\n") } }
+    parts.add("print(smallEligible(42))\n")
+    let ir = executes(compiler, joinText(parts), repeated("0\n1364\n-1\n", 3) + "42\n")
+    names.add("smallEligible")
+    for index in 0..names.length {
+        let guarded = index == 1 || index == 2
+        let line = header(ir, names[index])
+        test.check(test.contains(line, "noinline") == guarded, "inline budget guard " + names[index] + "\n" + line)
+    }
+}
+if selected("test_sorted_literal_dispatch_preserves_every_value_and_signed_boundaries") {
+    let maximum = 9223372036854775807
+    let keys: List<Integer> = []
+    let values: List<Integer> = []
+    for index in 0..1365 { keys.add(index * 2); values.add(index * 17 + 9) }
+    keys.add(maximum); values.add(maximum)
+    let source = ["function sparse(x: Integer): Integer {\n"]
+    for index in 0..keys.length {
+        source.add("if x == 0o" + octal(keys[index]) + " { /* pure case */ return 0o" + octal(values[index]) + " } else {\n")
+    }
+    source.add("return " + Text(maximum - 1) + "\n" + repeated("}\n", keys.length + 1))
+    source.add("let queries = [")
+    let expected: List<Text> = []
+    for index in 0..keys.length {
+        if index > 0 { source.add(",") }
+        source.add(Text(keys[index])); expected.add(Text(values[index]) + "\n")
+    }
+    for value in [-9223372036854775808, -1, 1, 2729, 2730, maximum - 1] {
+        source.add("," + Text(value)); expected.add(Text(maximum - 1) + "\n")
+    }
+    source.add("]\nlet i = 0\nwhile i < queries.length { print(sparse(queries[i])); i = i + 1 }\n")
+    let ir = executes(compiler, joinText(source), joinText(expected))
+    let tables = 0
+    let rows = 0
+    let inside = false
+    let complete = false
+    for line in test.lines(ir) {
+        if starts(line, "@.dispatch.") && test.contains(line, " = private unnamed_addr constant [1366 x { i64, i64 }] [") {
+            let raw = Bytes(line)
+            let index = Bytes("@.dispatch.").length
+            let first = index
+            while index < raw.length && raw[index] >= 48 && raw[index] <= 57 { index += 1 }
+            if index > first && index < raw.length && raw[index] == 32 { tables += 1; inside = true; rows = 0 }
+        } else if inside {
+            if line == "]" { inside = false; complete = true }
+            else {
+                let tokens = test.words(test.replace(line, ",", ""))
+                test.check(tokens.length == 10 && tokens[0] == "{" && tokens[1] == "i64" && tokens[2] == "i64" && tokens[3] == "}" && tokens[4] == "{" && tokens[5] == "i64" && tokens[7] == "i64" && tokens[9] == "}", "dispatch pair encoding")
+                test.check(rows < keys.length && tokens[6] == Text(keys[rows]) && tokens[8] == Text(values[rows]), "dispatch pair mismatch " + Text(rows))
+                rows += 1
+            }
+        }
+    }
+    test.check(tables == 1 && complete && rows == keys.length, "sorted dispatch table domain")
+    test.check(test.contains(ir, "dispatch.search:"), "missing dispatch search")
+    test.check(!test.contains(ir, "if.then."), "literal dispatch retained linear branches")
+}
+record Shape { name: Text; firstKey: Text; secondKey: Text; first: Text; fallback: Text; prefix: Text; suffix: Text; parameters: Text; condition: Text; arguments: Text; expected: Text }
+function shape(name: Text): Shape {
+    return Shape { name: name; firstKey: "0"; secondKey: "1"; first: "return 10"; fallback: "return 99"; prefix: ""; suffix: ""; parameters: "x: Integer"; condition: ""; arguments: "0"; expected: "10\n" }
+}
+function chain(case: Shape): Text {
+    let source = ["function " + case.name + "(" + case.parameters + "): Integer {\n" + case.prefix]
+    for index in 0..1366 {
+        let key = Text(index)
+        if index == 0 { key = case.firstKey }
+        if index == 1 { key = case.secondKey }
+        let condition = "x == " + key
+        if index == 0 && case.condition != "" { condition = case.condition }
+        let result = "return " + Text(index + 10)
+        if index == 0 { result = case.first }
+        source.add("if " + condition + " { " + result + " } else {\n")
+    }
+    source.add(case.fallback + "\n" + repeated("}\n", 1366) + case.suffix + "}\n")
+    return joinText(source)
+}
+if selected("test_dispatch_declines_effects_nonliteral_and_noncanonical_shapes") {
+    let cases: List<Shape> = []
+    let case = shape("duplicate"); case.secondKey = "0"; cases.add(case)
+    case = shape("octalSpelledDuplicate"); case.secondKey = "0o0"; cases.add(case)
+    case = shape("unordered"); case.firstKey = "1"; case.secondKey = "0"; case.expected = "11\n"; cases.add(case)
+    case = shape("effectInBody"); case.first = "print(44); return 10"; case.expected = "44\n10\n"; cases.add(case)
+    case = shape("effectInCondition"); case.condition = "noisy(x) == 0"; case.expected = "44\n10\n"; cases.add(case)
+    case = shape("mutableSelector"); case.prefix = "x = x + 1\n"; case.expected = "11\n"; cases.add(case)
+    case = shape("extraParameter"); case.parameters = "x: Integer, y: Integer"; case.condition = "y == 0"; case.arguments = "5, 0"; cases.add(case)
+    case = shape("trailingBody"); case.suffix = "print(44)\n"; cases.add(case)
+    case = shape("negativeKey"); case.firstKey = "-1"; case.arguments = "-1"; cases.add(case)
+    case = shape("negativeResult"); case.first = "return -3"; case.expected = "-3\n"; cases.add(case)
+    case = shape("computedFallback"); case.fallback = "return 1 + 2"; case.arguments = "2000"; case.expected = "3\n"; cases.add(case)
+    case = shape("negativeFallback"); case.fallback = "return -99"; case.arguments = "2000"; case.expected = "-99\n"; cases.add(case)
+    case = shape("nestedThen"); case.first = "if true { return 10 } else { return 11 }"; cases.add(case)
+    for entry in cases {
+        let source = "function noisy(x: Integer): Integer { print(44); return x }\n" + chain(entry) + "print(" + entry.name + "(" + entry.arguments + "))\n"
+        let ir = executes(compiler, source, entry.expected)
+        test.check(!test.contains(ir, " = private unnamed_addr constant [1366 x { i64, i64 }]"), "noncanonical dispatch table " + entry.name)
+        test.check(test.contains(ir, "if.then."), "missing ordinary branches " + entry.name)
+    }
+    case = shape("invalid"); case.suffix = "let bad: Integer = \"wrong\"\n"
+    let source = chain(case)
+    rejects(compiler, source, location(source, "bad:", "the value for 'bad' does not match its declared type", 0))
+    case = shape("invalidFallback"); case.fallback = "return 9223372036854775808"
+    source = chain(case)
+    rejects(compiler, source, location(source, "9223372036854775808", "Integer literal is outside the supported range", 0))
+}
+if selected("test_imported_dispatch_tables_have_distinct_stable_names") {
+    for index in 0..2 {
+        let name = "left"
+        let offset = 100
+        if index == 1 { name = "right"; offset = 200 }
+        let source = ["public function choose(x: Integer): Integer {\n"]
+        for value in 0..1366 { source.add("if x == " + Text(value) + " { return " + Text(value + offset) + " } else {\n") }
+        source.add("return " + Text(offset + 9000) + "\n" + repeated("}\n", 1367))
+        writeTextFile(compiler.directory + "/" + name + ".min", joinText(source))
+    }
+    let entry = compiler.directory + "/main.min"
+    writeTextFile(entry, "use \"./left.min\" as left\nuse \"./right.min\" as right\nprint(left.choose(0)); print(right.choose(0))\nprint(left.choose(1365)); print(right.choose(1365))\nprint(left.choose(-1)); print(right.choose(-1))\n")
+    let llvm = compiler.directory + "/distinct-tables.ll"
+    let empty = compiler.directory + "/empty-state"
+    let cold = compiler.directory + "/cold-state"
+    let stats = compiler.directory + "/module-stats"
+    writeTextFile(empty, "")
+    quiet(test.run([moduleCompiler, entry, llvm, "--module-state", empty, cold, stats], system.environment(), "", compiler.directory + "/cold-compile", 60), "cold module dispatch compilation")
+    let ir = readTextFile(llvm)
+    let names: List<Text> = []
+    for line in test.lines(ir) {
+        if starts(line, "@\"minyar.literal|") && test.contains(line, "|dispatch|") {
+            let quote = find(line, "\"", 2)
+            if quote >= 0 {
+                let raw = Bytes(line)
+                let tail = Text(raw.slice(quote + 1, raw.length))
+                if starts(tail, " = private unnamed_addr constant") {
+                    let divider = find(line, "|dispatch|", 0)
+                    let number = divider + Bytes("|dispatch|").length
+                    let valid = number < quote
+                    for index in number..quote { if raw[index] < 48 || raw[index] > 57 { valid = false } }
+                    if valid { names.add(Text(raw.slice(0, quote + 1))) }
+                }
+            }
+        }
+    }
+    test.check(names.length == 2, "imported dispatch name count")
+    test.check(names[0] != names[1], "imported dispatch names collide")
+    let warm = compiler.directory + "/warm-tables.ll"
+    quiet(test.run([moduleCompiler, entry, warm, "--module-state", cold, compiler.directory + "/warm-state", stats], system.environment(), "", compiler.directory + "/warm-compile", 60), "warm module dispatch compilation")
+    test.check(readTextFile(warm) == ir, "warm module LLVM changed")
+    let statistics = test.words(readTextFile(stats))
+    test.check(statistics.length >= 2 && statistics[0] == "3" && statistics[1] == "0", "module reuse statistics")
+    if test.addressEnabled(compiler.flags) { writeTextFile(llvm, test.instrument(ir)) }
+    linkAndRun(compiler, llvm, "100\n200\n1465\n1565\n9100\n9200\n", 0, "", ["-O0", "-O2"], 180, 30, true)
+}
+if selected("test_fifty_thousand_nested_else_branches") {
+    let source = [deepChain()]
+    for query in queries { source.add("print(longChain(" + Text(query) + "))\n") }
+    let llvm = compile(compiler, joinText(source), true)
+    linkAndRun(compiler, llvm, chainExpected, 0, "", ["-O0", "-O2"], 180, 30, true)
+}
+if selected("test_fifty_thousand_nested_branches_in_imported_function") {
+    writeTextFile(compiler.directory + "/chain.min", "public " + deepChain())
+    let entry = compiler.directory + "/main.min"
+    let source = ["use \"./chain.min\" as chain\n"]
+    for query in queries { source.add("print(chain.longChain(" + Text(query) + "))\n") }
+    writeTextFile(entry, joinText(source))
+    let llvm = compiler.directory + "/modules.ll"
+    quiet(test.run([moduleCompiler, entry, llvm], system.environment(), "", compiler.directory + "/deep-module-compile", 60), "compile deep imported function")
+    if test.addressEnabled(compiler.flags) { writeTextFile(llvm, test.instrument(readTextFile(llvm))) }
+    linkAndRun(compiler, llvm, chainExpected, 0, "", ["-O0"], 180, 30, true)
+}
+if selected("test_imported_nested_scopes_and_owned_returns") {
+    writeTextFile(compiler.directory + "/branches.min", "public function choose(flag: Boolean): List<Text> {\nlet seed = [\"seed\"]\nif flag {\nwhile true { let owned = seed; owned.add(\"left\"); return owned }\n} else {\nwhile false { return [\"wrong\"] }\nif seed.length == 1 { return [seed[0], \"right\"] } else { return [\"wrong\"] }\n}\n}\n")
+    let entry = compiler.directory + "/main.min"
+    writeTextFile(entry, "use \"./branches.min\" as branches\nlet first = branches.choose(true)\nlet second = branches.choose(false)\nprint(first[0]); print(first[1]); print(second[0]); print(second[1])\nfirst[0] = \"changed\"\nprint(second[0])\n")
+    let llvm = compiler.directory + "/module-scopes.ll"
+    quiet(test.run([moduleCompiler, entry, llvm], system.environment(), "", compiler.directory + "/scopes-module-compile", 30), "compile imported nested ownership")
+    if test.addressEnabled(compiler.flags) { writeTextFile(llvm, test.instrument(readTextFile(llvm))) }
+    linkAndRun(compiler, llvm, "seed\nleft\nseed\nright\nseed\n", 0, "", ["-O0", "-O2"], 180, 30, true)
+}
+test.removeTree(compiler.directory)
+print("Statement nesting: passed")

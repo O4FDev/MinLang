@@ -1,0 +1,112 @@
+use "../tools/testing.min" as test
+use "system" as system
+function textOrder(left: Text, right: Text): Integer {
+    let length = left.length
+    if right.length < length { length = right.length }
+    for index in 0..length {
+        if left[index] < right[index] { return -1 }
+        if left[index] > right[index] { return 1 }
+    }
+    if left.length < right.length { return -1 }
+    if left.length > right.length { return 1 }
+    return 0
+}
+function symbolOrder(left: Text, leftKind: Integer, right: Text, rightKind: Integer): Integer {
+    if left.byteLength < right.byteLength { return -1 }
+    if left.byteLength > right.byteLength { return 1 }
+    if left.length < right.length { return -1 }
+    if left.length > right.length { return 1 }
+    let index = left.length
+    while index > 0 {
+        index -= 1
+        if left[index] < right[index] { return -1 }
+        if left[index] > right[index] { return 1 }
+    }
+    if leftKind < rightKind { return -1 }
+    if leftKind > rightKind { return 1 }
+    return 0
+}
+function assertOrder(output: List<Integer>, start: Integer, names: List<Text>, kinds: List<Integer>, symbols: Boolean) {
+    let length = names.length
+    for left in 0..length {
+        test.check(output[start + left * length + left] == 0, "comparator reflexivity " + Text(left))
+        for right in 0..length {
+            let actual = output[start + left * length + right]
+            let expected = textOrder(names[left], names[right])
+            let equal = names[left] == names[right]
+            if symbols { expected = symbolOrder(names[left], kinds[left], names[right], kinds[right]); equal = equal && kinds[left] == kinds[right] }
+            test.check(actual == expected, "independent comparator order " + Text(left) + "," + Text(right))
+            test.check(actual == -output[start + right * length + left], "comparator antisymmetry")
+            if left != right && equal { test.check(actual == 0, "equal-content distinct entries") }
+            for last in 0..length {
+                let following = output[start + right * length + last]
+                if actual <= 0 && following <= 0 {
+                    test.check(output[start + left * length + last] <= 0, "comparator transitivity")
+                    if actual < 0 || following < 0 { test.check(output[start + left * length + last] < 0, "comparator strict transitivity") }
+                }
+            }
+        }
+    }
+}
+function find(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if raw.length < pattern.length { return -1 }
+    for position in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[position + index] != pattern[index] { equal = false; break } }
+        if equal { return position }
+    }
+    return -1
+}
+let compiler = test.compiler()
+let core = readTextFile(test.setting("MINYAR_TEST_SOURCE", "build/compiler.min"))
+let main = find(core, "\nfunction main(")
+test.check(main >= 0, "compiler source entry point changed")
+core = Text(Bytes(core).slice(0, main))
+let texts = ["", "a", "aa", "ab", "b", "A", "é", "é", "界", "🙂", "é🙂", "same", "same"]
+let names = ["same", "a", "same", "", "a", "🙂", "é", "same", "A", "aa", "é", "same", "é", "界"]
+let kinds = [2, 3, 1, 2, 1, 1, 3, 2, 1, 1, 1, 3, 1, 1]
+let probe = "\nfunction main() {\n    let texts: List<Text> = [\"\", \"a\", \"aa\", \"ab\", \"b\", \"A\", \"é\", \"é\", \"界\", \"🙂\", \"é🙂\", \"same\", \"sa\" + \"me\"]\n    let left = 0\n    while left < texts.length {\n        let right = 0\n        while right < texts.length {\n            print(compareText(texts[left], texts[right]))\n            right = right + 1\n        }\n        left = left + 1\n    }\n    let names: List<Text> = [\"same\", \"a\", \"same\", \"\", \"a\", \"🙂\", \"é\", \"same\", \"A\", \"aa\", \"é\", \"same\", \"é\", \"界\"]\n    let kinds: List<Integer> = [2, 3, 1, 2, 1, 1, 3, 2, 1, 1, 1, 3, 1, 1]\n    left = 0\n    while left < names.length {\n        let right = 0\n        while right < names.length {\n            print(compareSymbol(names, kinds, left, right))\n            right = right + 1\n        }\n        left = left + 1\n    }\n    let lookup = buildSymbolLookup(names, kinds)\n    print(lookup.length)\n    left = 0\n    while left < lookup.length {\n        print(lookup[left])\n        left = left + 1\n    }\n}\n"
+test.require(test.compile(compiler, core + probe), "compile selected comparator source")
+let llvm = compiler.directory + "/case" + Text(compiler.serial) + ".ll"
+for optimization in ["-O0", "-O2"] {
+    let command = [compiler.clang, optimization]
+    for flag in compiler.flags { command.add(flag) }
+    let executable = compiler.directory + "/symbol-order"
+    for item in ["-Wno-override-module", llvm, compiler.runtime, "-lm", "-o", executable] { command.add(item) }
+    test.require(test.run(command, system.environment(), "", compiler.directory + "/link", 60), "link comparator probe " + optimization)
+    let result = test.run([executable], system.environment(), "", compiler.directory + "/run", 30)
+    test.require(result, "execute comparator probe " + optimization)
+    test.check(result.errorOutput == "", "comparator probe diagnostics")
+    let output: List<Integer> = []
+    for line in test.lines(result.output) { output.add(Integer(line)) }
+    test.check(output.length == texts.length * texts.length + names.length * names.length + 1 + names.length, "comparator output domain")
+    assertOrder(output, 0, texts, [], false)
+    assertOrder(output, texts.length * texts.length, names, kinds, true)
+    let start = texts.length * texts.length + names.length * names.length
+    test.check(output[start] == names.length, "symbol lookup length")
+    let sorted: List<Integer> = []
+    for index in 0..names.length {
+        sorted.add(index)
+        let position = index
+        while position > 0 && symbolOrder(names[sorted[position]], kinds[sorted[position]], names[sorted[position - 1]], kinds[sorted[position - 1]]) < 0 {
+            let temporary = sorted[position - 1]
+            sorted[position - 1] = sorted[position]
+            sorted[position] = temporary
+            position -= 1
+        }
+    }
+    let seen: List<Integer> = []
+    for index in 0..names.length { seen.add(0) }
+    for index in 0..names.length {
+        let key = output[start + index + 1]
+        test.check(key >= 0 && key < names.length, "symbol lookup input index")
+        seen[key] += 1
+        let expected = sorted[index]
+        test.check(names[key] == names[expected] && kinds[key] == kinds[expected], "symbol lookup independent order without stable ties")
+    }
+    for count in seen { test.check(count == 1, "symbol lookup must contain each input exactly once") }
+}
+test.removeTree(compiler.directory)
+print("Symbol total orders and lookup permutation: passed")

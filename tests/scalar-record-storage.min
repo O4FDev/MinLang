@@ -1,0 +1,114 @@
+use "../tools/testing.min" as test
+use "system" as system
+function body(ir: Text, name: Text): Text {
+    let found = false
+    let complete = false
+    let parts: List<Text> = []
+    for line in test.lines(ir) {
+        if !found && test.contains(line, "define ") && test.contains(line, "@.minyar.fn." + name + "(") { found = true }
+        else if found {
+            if line == "}" { complete = true; break }
+            parts.add(line + "\n")
+        }
+    }
+    test.check(found && complete, "missing function " + name)
+    return joinText(parts)
+}
+function count(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let found = 0
+    if raw.length < pattern.length { return 0 }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { found += 1 }
+    }
+    return found
+}
+function compiledBody(compiler: test.Compiler, source: Text, name: Text): Text {
+    test.require(test.compile(compiler, source), "compile scalar record " + name)
+    return body(readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll"), name)
+}
+let compiler = test.compiler()
+if true {
+    let source = readTextFile("experiments/memory/critical-path.min")
+    let ir = compiledBody(compiler, source, "criticalRecords")
+    test.check(!test.contains(ir, "@minyar_record_"), "critical record allocation")
+    test.check(!test.contains(ir, "@minyar_rc_"), "critical record ownership")
+    test.check(count(ir, "; scalar record ") == 1, "critical scalar record count")
+    let llvm = compiler.directory + "/case" + Text(compiler.serial) + ".ll"
+    let optimized = compiler.directory + "/optimized.ll"
+    test.require(test.run([compiler.clang, "-O2", "-S", "-emit-llvm", "-Wno-override-module", llvm, "-o", optimized], system.environment(), "", compiler.directory + "/optimize", 30), "optimize critical records")
+    let hot = body(readTextFile(optimized), "criticalRecords")
+    test.check(!test.contains(hot, "alloca "), "optimized critical record local storage")
+    test.check(!test.contains(hot, "@minyar_record_"), "optimized critical record allocation")
+    test.check(!test.contains(hot, "@minyar_rc_"), "optimized critical record ownership")
+}
+if true {
+    let source = "record Pair { x: Integer; y: Integer }\nrecord Flags { yes: Boolean; character: Character }\nfunction work(count: Integer): Integer {\nlet i = 0\nlet total = 0\nwhile i < count {\nlet p = Pair { x: i; y: i * 2 }\ntotal = total + p.x + p.y\ni = i + 1\n}\nreturn total\n}\nprint(work(5))\nlet flag = Flags { yes: true; character: 'é' }\nprint(flag.yes)\nprint(flag.character)\n"
+    let ir = compiledBody(compiler, source, "work")
+    test.check(!test.contains(ir, "@minyar_record_"), "test_loop_local_records_and_scalar_field_kinds @minyar_record_")
+    test.executes(compiler, source, "30\ntrue\né\n")
+}
+if true {
+    let source = "record Pair { x: Integer; y: Integer }\nfunction bump(state: List<Integer>, delta: Integer): Integer {\nstate[0] = state[0] + delta\nreturn state[0]\n}\nfunction side(state: List<Integer>): Integer {\nlet p = Pair { y: bump(state, 10); x: bump(state, 1) }\nreturn p.x * 100 + p.y\n}\nlet state = [0]\nprint(side(state))\nprint(state[0])\n"
+    let ir = compiledBody(compiler, source, "side")
+    test.check(!test.contains(ir, "@minyar_record_"), "test_field_initializer_order_and_side_effects @minyar_record_")
+    test.executes(compiler, source, "1110\n11\n")
+}
+if true {
+    test.executes(compiler, "record Pair { x: Integer; y: Integer }\nfunction scoped(flag: Boolean): Integer {\nlet p = Pair { x: 1; y: 2 }\nif flag {\nlet p = Pair { x: p.y; y: p.x }\nprint(p.x)\nprint(p.y)\n} else {\nlet q = Pair { x: 7; y: 8 }\nprint(q.x)\n}\nreturn p.x * 10 + p.y\n}\nprint(scoped(true))\nprint(scoped(false))\n", "2\n1\n12\n7\n12\n")
+}
+if true {
+    for source in ["record Pair { x: Integer; y: Integer }\nfunction escaped(): Pair {\nlet p = Pair { x: 5; y: 6 }\nreturn p\n}\nprint(escaped().x)\n",
+"record Pair { x: Integer; y: Integer }\nfunction escaped(): Integer {\nlet p = Pair { x: 5; y: 6 }\nlet alias = p\nreturn alias.x\n}\nprint(escaped())\n",
+"record Pair { x: Integer; y: Integer }\nfunction escaped(values: List<Pair>) {\nlet p = Pair { x: 5; y: 6 }\nvalues.add(p)\n}\nlet values: List<Pair> = []\nescaped(values)\nprint(values[0].x)\n"] {
+        let ir = compiledBody(compiler, source, "escaped")
+        test.check(test.contains(ir, "@minyar_record_new_scalar"), "escaped record allocation")
+        test.executes(compiler, source, "5\n")
+    }
+}
+if true {
+    let source = "record Pair { x: Integer; y: Integer }\nfunction save(p: Pair, values: List<Pair>): Integer {\nvalues.add(p)\nreturn p.x\n}\nfunction escaped(values: List<Pair>): Integer {\nlet p = Pair { x: 9; y: 4 }\nreturn save(p, values)\n}\nlet values: List<Pair> = []\nprint(escaped(values))\nprint(values[0].y)\n"
+    let ir = compiledBody(compiler, source, "escaped")
+    test.check(test.contains(ir, "@minyar_record_new_scalar"), "test_scalar_returning_helper_can_still_escape_argument @minyar_record_new_scalar")
+    test.executes(compiler, source, "9\n4\n")
+}
+if true {
+    let source = "record Pair { x: Integer; y: Integer }\nfunction swap(count: Integer): Integer {\nlet p = Pair { x: 1; y: 2 }\nlet i = 0\nwhile i < count {\np = Pair { x: p.y; y: p.x }\ni = i + 1\n}\nreturn p.x * 10 + p.y\n}\nprint(swap(1))\nprint(swap(2))\n"
+    let ir = compiledBody(compiler, source, "swap")
+    test.check(count(ir, "@minyar_record_new_scalar") == 2, "test_reassignment_does_not_overwrite_previous_initializer_inputs count")
+    test.executes(compiler, source, "21\n12\n")
+}
+if true {
+    let source = "record Label { text: Text }\nrecord Pair { x: Integer; y: Integer }\nfunction label(): Integer {\nlet value = Label { text: \"abc\" + \"!\" }\nreturn value.text.length\n}\nfunction direct(): Integer {\nlet value = Pair { x: 7; y: 8 }.x\nreturn value\n}\nprint(label())\nprint(direct())\n"
+    let label = compiledBody(compiler, source, "label")
+    let direct = compiledBody(compiler, source, "direct")
+    test.check(test.contains(label, "@minyar_record_new("), "test_reference_fields_and_projected_constructor_remain_managed @minyar_record_new(")
+    test.check(test.contains(direct, "@minyar_record_new_scalar"), "test_reference_fields_and_projected_constructor_remain_managed @minyar_record_new_scalar")
+    test.executes(compiler, source, "4\n7\n")
+}
+if true {
+    let parts = ["record Cell { value: Integer }\nfunction many(): Integer {\n"]
+    for index in 0..66 { parts.add("let cell" + Text(index) + " = Cell { value: " + Text(index) + " }\n") }
+    parts.add("return ")
+    for index in 0..66 {
+        if index > 0 { parts.add(" + ") }
+        parts.add("cell" + Text(index) + ".value")
+    }
+    parts.add("\n}\nprint(many())\n")
+    let source = joinText(parts)
+    let ir = compiledBody(compiler, source, "many")
+    test.check(count(ir, "; scalar record ") == 64, "scalar replacement budget")
+    test.check(count(ir, "@minyar_record_new_scalar") == 2, "scalar replacement fallback")
+    test.executes(compiler, source, "2145\n")
+}
+if true {
+    let source = "record Pair { x: Integer; y: Integer }\nfunction effect(): Integer { print(\"effect\"); return 4 }\nfunction unused(): Integer {\nlet p = Pair { x: effect(); y: 2 }\nreturn 7\n}\nprint(unused())\n"
+    let ir = compiledBody(compiler, source, "unused")
+    test.check(!test.contains(ir, "@minyar_record_"), "test_dead_and_unused_values_keep_initializer_effects @minyar_record_")
+    test.executes(compiler, source, "effect\n7\n")
+}
+test.removeTree(compiler.directory)
+print("Scalar record storage: passed")

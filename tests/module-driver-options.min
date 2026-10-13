@@ -1,0 +1,106 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+function starts(source: Text, prefix: Text): Boolean {
+    let raw = Bytes(source)
+    let pattern = Bytes(prefix)
+    if raw.length < pattern.length { return false }
+    for index in 0..pattern.length { if raw[index] != pattern[index] { return false } }
+    return true
+}
+if system.getenv("MODULE_OPTIONS_SHIM") == "1" {
+    let arguments: List<Text> = []
+    for index in 0..argumentCount() { arguments.add(argument(index) + "\n") }
+    writeTextFile(system.getenv("MODULE_OPTIONS_LOG"), arguments)
+    test.check(argumentCount() >= 2, "protocol compiler arguments")
+    writeTextFile(argument(1), "; module IR\n")
+    let state = -1
+    for index in 0..argumentCount() { if argument(index) == "--module-state" { state = index } }
+    test.check(state >= 0 && state + 3 < argumentCount(), "protocol module-state arguments")
+    let schema = system.getenv("MODULE_TEST_SCHEMA")
+    let source = ""
+    if schema != "" { source = Text(schema.length) + "\n" + schema }
+    writeTextFile(argument(state + 2), source)
+    writeTextFile(argument(state + 3), "0 0 0 0 0 0 false\n")
+    exit(0)
+}
+record Invocation { result: test.Result; arguments: List<Text>; invoked: Boolean }
+function invoke(work: Text, driver: Text, compiler: Text, source: Text, options: List<Text>, schema: Text): Invocation {
+    let log = work + "/options.log"
+    if files.pathSize(log) >= 0 { test.check(files.remove(log) == 0, "clear compiler protocol log") }
+    let environment: List<Text> = []
+    for entry in system.environment() {
+        if !starts(entry, "MODULE_OPTIONS_LOG=") && !starts(entry, "MODULE_TEST_SCHEMA=") && !starts(entry, "MODULE_OPTIONS_SHIM=") { environment.add(entry) }
+    }
+    environment.add("MODULE_OPTIONS_LOG=" + log)
+    environment.add("MODULE_TEST_SCHEMA=" + schema)
+    environment.add("MODULE_OPTIONS_SHIM=1")
+    let command = [driver, compiler, source, work + "/program.ll", work + "/cache"]
+    for option in options { command.add(option) }
+    let result = test.run(command, environment, work, work + "/invoke", 10)
+    let invoked = files.pathSize(log) >= 0
+    let arguments: List<Text> = []
+    if invoked { arguments = test.lines(readTextFile(log)) }
+    return Invocation { result: result; arguments: arguments; invoked: invoked }
+}
+function option(arguments: List<Text>, name: Text): Text {
+    for index in 0..arguments.length {
+        if arguments[index] == name { test.check(index + 1 < arguments.length, "missing forwarded option"); return arguments[index + 1] }
+    }
+    fail("missing forwarded option " + name)
+}
+let work = test.scratch()
+let directory = work + "/driver options with spaces"
+test.check(files.makeDirectory(directory) == 0, "driver workspace")
+let driver = system.getenv("MINYAR_TEST_MODULE_DRIVER")
+if driver == "" {
+    driver = directory + "/module-build"
+    let cc = test.setting("CC", test.setting("MINYAR_TEST_CLANG", "clang"))
+    test.require(test.run([cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "tools/module-build.c", "-o", driver], system.environment(), "", work + "/driver-build", 120), "build module driver")
+}
+let self = test.run(["readlink", "/proc/" + Text(system.processId()) + "/exe"], system.environment(), "", work + "/self", 10)
+test.require(self, "locate native protocol fixture")
+let compiler = directory + "/compiler with spaces"
+test.require(test.run(["cp", test.lines(self.output)[0], compiler], system.environment(), "", work + "/copy", 10), "copy native protocol compiler")
+test.require(test.run(["chmod", "700", compiler], system.environment(), "", work + "/mode", 10), "set protocol compiler mode")
+let source = directory + "/source with spaces.min"
+writeTextFile(source, "print(42)\n")
+let library = directory + "/library with spaces"
+test.check(files.makeDirectory(library) == 0, "protocol library directory")
+for options in [["--library", library, "--bounded-owners", "32"], ["--bounded-owners", "32", "--library", library]] {
+    let call = invoke(directory, driver, compiler, source, options, "")
+    test.require(call.result, "forward library and budget")
+    test.check(call.invoked, "valid options did not invoke compiler")
+    test.check(option(call.arguments, "--library") == library, "forwarded library path")
+    test.check(option(call.arguments, "--bounded-owners") == "32", "forwarded owner budget")
+}
+let first = directory + "/first"
+let second = directory + "/second"
+test.check(files.makeDirectory(first) == 0 && files.makeDirectory(second) == 0, "ordered libraries")
+let call = invoke(directory, driver, compiler, source, ["--library", first, "--bounded-owners", "32", "--library", second], "")
+test.require(call.result, "ordered library options")
+let libraries: List<Text> = []
+for index in 0..call.arguments.length {
+    if call.arguments[index] == "--library" { test.check(index + 1 < call.arguments.length, "missing library value"); libraries.add(call.arguments[index + 1]) }
+}
+test.check(libraries.length == 2 && libraries[0] == first && libraries[1] == second, "library search order")
+let excessive: List<Text> = []
+for index in 0..9 { excessive.add("--library"); excessive.add(library) }
+for options in [["--library"], excessive, ["--bounded-owners", "32", "--bounded-owners", "32"], ["--unknown", "value"]] {
+    call = invoke(directory, driver, compiler, source, options, "")
+    test.check(call.result.status == 2, "invalid driver option status\n" + call.result.errorOutput)
+    test.check(!call.invoked, "invalid options invoked compiler")
+}
+for schema in ["minyar-module-interface-v5", "minyar-module-delta-v3"] {
+    call = invoke(directory, driver, compiler, source, [], schema)
+    test.check(call.invoked, "current state schema did not invoke compiler")
+    test.require(call.result, "publish current state schema " + schema)
+}
+for schema in ["minyar-module-interface-v4", "minyar-module-delta-v2"] {
+    call = invoke(directory, driver, compiler, source, [], schema)
+    test.check(call.invoked, "old state schema did not invoke compiler")
+    test.check(call.result.status == 1, "old state schema status")
+    test.check(test.contains(call.result.errorOutput, "unsupported compiler state"), "old state schema diagnostic")
+}
+test.removeTree(work)
+print("Module driver options: passed")

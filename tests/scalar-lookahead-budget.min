@@ -1,0 +1,98 @@
+use "../tools/testing.min" as test
+use "system" as system
+function find(source: Text, needle: Text, start: Integer): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    if raw.length < pattern.length { return -1 }
+    for position in start..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[position + index] != pattern[index] { equal = false; break } }
+        if equal { return position }
+    }
+    return -1
+}
+function count(source: Text, needle: Text): Integer {
+    let result = 0
+    let position = 0
+    while true {
+        let match = find(source, needle, position)
+        if match < 0 { return result }
+        result += 1
+        position = match + Bytes(needle).length
+    }
+}
+function checkAttempts(compiler: test.Compiler, attempts: Integer, fields: Integer, cells: Integer, functions: Integer, promoted: Integer): Text {
+    let shape: List<Text> = []
+    for field in 0..fields {
+        if field > 0 { shape.add("; ") }
+        shape.add("f" + Text(field) + ": Integer")
+    }
+    let parts = ["record Cell { " + joinText(shape) + " }\nfunction consume(value: Cell): Integer { return "]
+    if fields > 0 { parts.add("value.f0") } else { parts.add("1") }
+    parts.add(" }\n")
+    let expected: List<Text> = []
+    for fn in 0..functions {
+        parts.add("function work" + Text(fn) + "(): Integer {\n")
+        for cell in 0..cells {
+            parts.add("let cell" + Text(cell) + " = Cell { ")
+            for field in 0..fields {
+                if field > 0 { parts.add("; ") }
+                parts.add("f" + Text(field) + ": " + Text(cell + field))
+            }
+            parts.add(" }\n")
+        }
+        parts.add("return ")
+        for cell in 0..cells {
+            if cell > 0 { parts.add(" + ") }
+            if cell < promoted { parts.add("cell" + Text(cell) + ".f0") }
+            else { parts.add("consume(cell" + Text(cell) + ")") }
+        }
+        parts.add("\n}\n")
+        if fields > 0 { expected.add(Text(cells * (cells - 1) / 2) + "\n") }
+        else { expected.add(Text(cells) + "\n") }
+    }
+    for fn in 0..functions { parts.add("print(work" + Text(fn) + "())\n") }
+    test.require(test.compile(compiler, joinText(parts)), "compile instrumented candidate")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    let output = test.lines(readTextFile(path + ".compile"))
+    test.check(output.length == attempts, "scalar proof attempt budget count")
+    for line in output { test.check(line == "scalar proof attempt", "unexpected proof attempt output") }
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization]
+        for flag in compiler.flags { command.add(flag) }
+        for item in ["-Wno-override-module", path + ".ll", compiler.runtime, "-lm", "-o", path + ".exe"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".link", 30), "link scalar proof " + optimization)
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", 10)
+        test.check(result.status == 0, "scalar proof execution " + optimization + "\n" + result.errorOutput)
+        test.check(result.output == joinText(expected), "scalar proof execution output " + optimization)
+    }
+    return readTextFile(path + ".ll")
+}
+let compiler = test.compiler()
+compiler.compileTimeout = 30
+let compilerSource = readTextFile(test.setting("MINYAR_TEST_COMPILER_SOURCE", "build/compiler.min"))
+let begin = find(compilerSource, "function prepareScalarRecord(", 0)
+test.check(begin >= 0, "missing scalar proof helper")
+let ending = find(compilerSource, "\nfunction rootLocal(", begin)
+test.check(ending > begin, "missing scalar proof helper boundary")
+let raw = Bytes(compilerSource)
+let helper = Text(raw.slice(begin, ending))
+let before = "    let cursor: List<Integer> = [state[0]]"
+test.check(count(helper, before) == 1, "scalar proof instrumentation must occur once")
+helper = test.replace(helper, before, "    print(\"scalar proof attempt\")\n" + before)
+compilerSource = Text(raw.slice(0, begin)) + helper + Text(raw.slice(ending, raw.length))
+let source = compiler.directory + "/instrumented.min"
+let llvm = compiler.directory + "/instrumented.ll"
+let instrumented = compiler.directory + "/instrumented"
+writeTextFile(source, compilerSource)
+test.require(test.run([compiler.executable, source, llvm], system.environment(), "", compiler.directory + "/instrument", 30), "compile instrumented compiler")
+test.require(test.run([compiler.clang, "-O1", "-DMINYAR_COMPILER_ARENA", "-Wno-override-module", llvm, "runtime/minyar_runtime.c", "-lm", "-o", instrumented], system.environment(), "", compiler.directory + "/instrument-link", 60), "link instrumented compiler")
+compiler.executable = instrumented
+checkAttempts(compiler, 64, 1, 128, 1, 0)
+checkAttempts(compiler, 32, 2, 100, 1, 0)
+checkAttempts(compiler, 64, 0, 100, 1, 0)
+checkAttempts(compiler, 128, 1, 80, 2, 0)
+let ir = checkAttempts(compiler, 64, 1, 128, 1, 32)
+test.check(count(ir, "; scalar record ") == 32, "scalar proof shared success and rejection budget")
+test.removeTree(compiler.directory)
+print("Scalar lookahead budget: passed")
