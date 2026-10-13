@@ -1,0 +1,175 @@
+use "../../tools/testing.min" as test
+use "../../scripts/native-host.min" as host
+use "system" as system
+use "files" as files
+
+record Suite { root: Text; compiler: Text; launcher: List<Text>; selected: List<Text>; serial: Integer; path: Text }
+
+function spaced(command: List<Text>): Text {
+    let result = ""
+    for index in 0..command.length {
+        if index > 0 { result += " " }
+        result += command[index]
+    }
+    return result
+}
+function run(suite: Suite, command: List<Text>, ok: Boolean): test.Result {
+    suite.serial += 1
+    let log = suite.path + "/.command-" + Text(suite.serial)
+    let result = test.run(command, system.environment(), suite.root, log, 240)
+    files.remove(log)
+    files.remove(log + ".err")
+    test.check((result.status == 0) == ok, spaced(command) + "\n" + result.output + "\n" + result.errorOutput)
+    return result
+}
+function launch(suite: Suite, arguments: List<Text>, ok: Boolean): test.Result {
+    let command: List<Text> = []
+    for item in suite.launcher { command.add(item) }
+    for item in arguments { command.add(item) }
+    return run(suite, command, ok)
+}
+function sameBytes(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+function occurrences(text: Text, needle: Text): Integer {
+    let total = 0
+    let start = host.find(text, needle, 0)
+    while start >= 0 {
+        total += 1
+        start = host.find(text, needle, start + host.size(needle))
+    }
+    return total
+}
+function begin(suite: Suite, name: Text): Boolean {
+    if suite.selected.length > 0 && !host.has(suite.selected, name) && !host.has(suite.selected, "LinuxNativeTests." + name) { return false }
+    let made = host.temporaryDirectory(host.temporaryRoot(), "minyar-linux-check-")
+    test.check(made.status == 0, made.output)
+    suite.path = made.output
+    return true
+}
+function end(suite: Suite, name: Text) {
+    host.removeTree(suite.path)
+    print(name + " ... ok")
+}
+function usage(message: Text): Integer {
+    host.standardError("usage: linux [-h] --compiler COMPILER\nlinux: error: " + message + "\n")
+    return 2
+}
+
+function main(): Integer {
+    let compilerPath = ""
+    let selected: List<Text> = []
+    let index = 0
+    while index < argumentCount() {
+        let item = argument(index)
+        if item == "--compiler" {
+            if index + 1 >= argumentCount() { return usage("argument --compiler: expected one argument") }
+            compilerPath = argument(index + 1)
+            index += 1
+        } else if host.starts(item, "--compiler=") { compilerPath = host.cut(item, 11, host.size(item)) }
+        else { selected.add(item) }
+        index += 1
+    }
+    if compilerPath == "" { return usage("the following arguments are required: --compiler") }
+    let compiler = host.absolute(compilerPath)
+    if host.systemName() != "linux" || !host.isFile(compiler) { return usage("run on Linux with a built native Minyar compiler") }
+    let root = host.currentDirectory()
+    let suite = Suite { root: root; compiler: compiler; launcher: [root + "/minyar", "--backend", "native", "--compiler", compiler]; selected: selected; serial: 0; path: "" }
+
+    if begin(suite, "test_c_sdk_layout_and_signal_callback") {
+        let source = suite.path + "/main.min"
+        writeTextFile(source, "use \"LinuxDesktop\"\nlet total: Int32 = 0\nconstant action = g_simple_action_new(\"test\", nil)!\nconstant callback: @convention(c) (OpaquePointer?, OpaquePointer?, UnsafeMutableRawPointer?) -> Void = { _, _, data in\n    data!.assumingMemoryBound(to: Int32.self).pointee += 1\n}\nwithUnsafeMutablePointer(to: &total) { counter in\n    g_signal_connect_data(UnsafeMutableRawPointer(action), \"activate\", unsafeBitCast(callback, to: GCallback.self), counter, nil, GConnectFlags(rawValue: 0))\n    g_action_activate(action, nil)\n}\nprecondition(total == 1)\ng_object_unref(UnsafeMutableRawPointer(action))\nprint(\"\\(gtk_get_major_version()) \\(MemoryLayout<GtkTextIter>.size) \\(MemoryLayout<GtkTextIter>.alignment)\")\n")
+        let output = suite.path + "/abi"
+        launch(suite, ["--pkg-config", "libadwaita-1", source, "-o", output], true)
+        let control = suite.path + "/abi.c"
+        writeTextFile(control, "#include <gtk/gtk.h>\n#include <stdio.h>\nint main(void) { printf(\"%u %zu %zu\\n\", gtk_get_major_version(), sizeof(GtkTextIter), _Alignof(GtkTextIter)); }\n")
+        let flags = host.shellWords(run(suite, ["pkg-config", "--cflags", "--libs", "libadwaita-1"], true).output)
+        let binary = suite.path + "/c-control"
+        let build = ["clang", control]
+        for flag in flags { build.add(flag) }
+        build.add("-o")
+        build.add(binary)
+        run(suite, build, true)
+        test.check(run(suite, [output], true).output == run(suite, [binary], true).output, "Minyar and C disagree about the GTK ABI")
+        let dependencies = run(suite, ["ldd", output], true).output
+        test.check(test.contains(dependencies, "libgtk-4.so"), "program does not link GTK 4")
+        test.check(!test.contains(dependencies, "libminyar"), "program links a Minyar runtime library")
+        end(suite, "test_c_sdk_layout_and_signal_callback")
+    }
+
+    if begin(suite, "test_conditional_binding_mutability") {
+        let binary = suite.path + "/bindings"
+        run(suite, [compiler, "-swift-version", "6", root + "/tests/native-swift/conditional-bindings.min", "-o", binary], true)
+        test.check(run(suite, [binary], true).output == "42\n42\n42\n", "conditional bindings output")
+        let diagnostics = run(suite, [compiler, "-swift-version", "6", "-typecheck", root + "/tests/native-swift/conditional-constant-failure.min"], false).errorOutput
+        test.check(occurrences(diagnostics, "error: cannot assign to value:") >= 3, "constant bindings were assignable\n" + diagnostics)
+        end(suite, "test_conditional_binding_mutability")
+    }
+
+    if begin(suite, "test_language_features_and_macros") {
+        for optimization in ["-Onone", "-O"] {
+            let binary = suite.path + "/" + host.cut(optimization, 1, host.size(optimization))
+            run(suite, [compiler, "-swift-version", "6", "-whole-module-optimization", "-parse-as-library", optimization, root + "/tests/swiftui-features.min", "-o", binary], true)
+            test.check(test.contains(run(suite, [binary], true).output, "actors passed"), "native features at " + optimization)
+        }
+        end(suite, "test_language_features_and_macros")
+    }
+
+    if begin(suite, "test_native_library_c_client") {
+        let source = suite.path + "/Library.min"
+        writeTextFile(source, "@_cdecl(\"minyar_answer\") public function answer(value: Int32): Int32 { value * 2 }\n")
+        let products = suite.path + "/library"
+        launch(suite, ["--release", "--library", "--module-name", "MinyarLinux", source, "-o", products], true)
+        test.check(host.isFile(products + "/libMinyarLinux.so"), "library binary missing")
+        let interfaceText = readTextFile(products + "/MinyarLinux.swiftinterface")
+        test.check(test.contains(interfaceText, "func answer"), "interface lacks answer")
+        test.check(!test.contains(interfaceText, "function answer"), "interface contains Minyar syntax")
+        let client = suite.path + "/client.c"
+        writeTextFile(client, "#include <stdint.h>\nextern int32_t minyar_answer(int32_t);\nint main(void) { return minyar_answer(21) == 42 ? 0 : 1; }\n")
+        let output = suite.path + "/client"
+        run(suite, ["clang", client, "-L", products, "-lMinyarLinux", "-Wl,-rpath," + products, "-o", output], true)
+        run(suite, [output], true)
+        end(suite, "test_native_library_c_client")
+    }
+
+    if begin(suite, "test_platform_selection_and_atomic_failure") {
+        let project = suite.path + "/app"
+        test.check(host.makeDirectories(project) == "", "create project")
+        writeTextFile(project + "/app.min", "@main record App { static function main() { print(platformName()) } }")
+        writeTextFile(project + "/Platform.min", "function platformName(): String { \"fallback\" }")
+        let overrideSource = project + "/Platform.linux.min"
+        writeTextFile(overrideSource, "function platformName(): String { \"linux\" }")
+        writeTextFile(project + "/Platform.mac.min", "THIS MUST NOT REACH THE LINUX COMPILER")
+        let nested = project + "/another"
+        test.check(host.makeDirectories(nested) == "", "create nested app")
+        writeTextFile(nested + "/app.min", "THIS IS A DIFFERENT APP")
+        let output = suite.path + "/program"
+        for entry in [project, project + "/app.min"] {
+            launch(suite, [entry, "-o", output], true)
+            test.check(run(suite, [output], true).output == "linux\n", "project selection from " + entry)
+            let header = files.readFile(output)
+            test.check(header.length >= 4 && header[0] == 127 && header[1] == 69 && header[2] == 76 && header[3] == 70, "program is not an ELF executable")
+        }
+        let previous = files.readFile(output)
+        writeTextFile(overrideSource, "function platformName(): String { 42 }")
+        let failure = launch(suite, [project, "-o", output], false)
+        test.check(test.contains(failure.errorOutput, overrideSource + ":1:"), "diagnostic does not name the override\n" + failure.errorOutput)
+        test.check(sameBytes(files.readFile(output), previous), "a failed build replaced the program")
+        failure = launch(suite, [project, "--target-platform", "mac"], false)
+        test.check(test.contains(failure.errorOutput, "this host builds linux"), "cross-compilation was accepted\n" + failure.errorOutput)
+        failure = launch(suite, [project, "--emit-swift", suite.path + "/swift"], false)
+        test.check(test.contains(failure.errorOutput, "does not generate Swift source"), "emit-swift was accepted\n" + failure.errorOutput)
+        test.check(!host.exists(suite.path + "/swift"), "a rejected build created Swift source")
+        end(suite, "test_platform_selection_and_atomic_failure")
+    }
+
+    if begin(suite, "test_shared_document_example") {
+        let binary = suite.path + "/editor"
+        launch(suite, ["--release", "--pkg-config", "libadwaita-1", root + "/examples/native-editor", "-o", binary], true)
+        test.check(run(suite, [binary, "--model-test"], true).output == "shared document model passed\n", "shared document model output")
+        end(suite, "test_shared_document_example")
+    }
+    return 0
+}

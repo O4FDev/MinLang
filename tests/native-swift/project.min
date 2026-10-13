@@ -1,0 +1,131 @@
+use "../../tools/testing.min" as test
+use "../../scripts/native-host.min" as host
+use "../../scripts/native_project.min" as project
+
+function fresh(): Text {
+    let work = test.scratch()
+    let resolved = host.resolve(work, true)
+    test.check(resolved.status == 0, "resolve project test scratch")
+    return resolved.output
+}
+function file(root: Text, name: Text): Text {
+    let path = root + "/" + name
+    test.check(host.makeDirectories(host.parent(path)) == "", "create " + host.parent(path))
+    writeTextFile(path, "")
+    return path
+}
+function names(paths: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for path in paths { result.add(host.basename(path)) }
+    result.sort()
+    return result
+}
+function same(actual: List<Text>, expected: List<Text>): Boolean {
+    if actual.length != expected.length { return false }
+    for index in 0..actual.length { if actual[index] != expected[index] { return false } }
+    return true
+}
+function show(values: List<Text>): Text {
+    let result = ""
+    for value in values { result += "\n  " + value }
+    return result
+}
+function expectSources(selection: project.Selection, expected: List<Text>, label: Text) {
+    test.check(selection.error == "", label + ": unexpected error " + selection.error)
+    test.check(same(selection.sources, expected), label + ": selected" + show(selection.sources) + "\nexpected" + show(expected))
+}
+function expectError(selection: project.Selection, needle: Text, label: Text) {
+    test.check(selection.error != "" && test.contains(selection.error, needle), label + ": expected error containing " + needle + ", got " + selection.error)
+}
+function finish(root: Text) { test.removeTree(root) }
+
+let root = fresh()
+let paths = [file(root, "Toolbar.min"), file(root, "Toolbar.mac.min"), file(root, "Toolbar.windows.min"), file(root, "Counter.min"), file(root, "MacOnly.mac.min")]
+let mac = project.selectVariants(paths, "mac")
+test.check(mac.error == "" && same(names(mac.sources), ["Counter.min", "MacOnly.mac.min", "Toolbar.mac.min"]), "mac overrides and shared fallback" + show(mac.sources))
+let windows = project.selectVariants(paths, "windows")
+test.check(windows.error == "" && same(names(windows.sources), ["Counter.min", "Toolbar.windows.min"]), "windows overrides" + show(windows.sources))
+let linux = project.selectVariants(paths, "linux")
+test.check(linux.error == "" && same(names(linux.sources), ["Counter.min", "Toolbar.min"]), "linux shared fallback" + show(linux.sources))
+finish(root)
+print("test_target_overrides_and_shared_fallback ... ok")
+
+root = fresh()
+let entry = file(root, "app.min")
+let component = file(root, "notes/Editor.min")
+let helper = file(root, "notes/storage.min")
+file(root, "notes/Editor.windows.min")
+for input in [root, entry] {
+    let selection = project.resolveSources([input], "mac")
+    test.check(selection.project == root, "project root for " + input + ": " + selection.project)
+    expectSources(selection, [entry, component, helper], "project entry and feature folders")
+}
+finish(root)
+print("test_project_entry_and_feature_folders ... ok")
+
+root = fresh()
+entry = file(root, "app.min")
+for name in ["build/bad.min", "dist/bad.min", ".cache/bad.min", "target/bad.min", "node_modules/bad.min", "Other.app/bad.min", "Library.framework/bad.swift", ".hidden.min"] { file(root, name) }
+expectSources(project.resolveSources([root], "mac"), [entry], "generated, hidden and vendor directories")
+finish(root)
+print("test_generated_hidden_and_vendor_directories_are_excluded ... ok")
+
+root = fresh()
+entry = file(root, "app.mac.min")
+expectSources(project.resolveSources([root], "mac"), [entry], "platform-specific entry")
+expectError(project.resolveSources([root], "windows"), "requires app.min", "platform-specific entry on another target")
+finish(root)
+print("test_platform_specific_entry ... ok")
+
+root = fresh()
+let outer = file(root, "app.min")
+let shared = file(root, "outer/Screen.min")
+let inner = file(root, "tools/editor/app.min")
+let innerView = file(root, "tools/editor/Screen.min")
+file(root, "tools/windows/app.windows.min")
+file(root, "tools/windows/Screen.min")
+expectSources(project.resolveSources([root], "mac"), [outer, shared], "outer app excludes nested apps")
+expectSources(project.resolveSources([inner], "mac"), [inner, innerView], "nested app entry")
+finish(root)
+print("test_nested_apps_establish_independent_boundaries ... ok")
+
+root = fresh()
+let first = file(root, "apps/first/app.min")
+let second = file(root, "apps/second/app.min")
+expectError(project.resolveSources([root], "mac"), "select an individual app", "workspace with sibling apps")
+expectSources(project.resolveSources([host.parent(first)], "mac"), [first], "first sibling app")
+expectSources(project.resolveSources([host.parent(second)], "mac"), [second], "second sibling app")
+finish(root)
+print("test_workspace_with_sibling_apps_requires_an_app_selection ... ok")
+
+root = fresh()
+let mainSource = file(root, "main.min")
+helper = file(root, "helper.min")
+file(root, "unrelated.min")
+let explicit = project.resolveSources([mainSource, helper], "mac")
+expectSources(explicit, [mainSource, helper], "explicit sources")
+test.check(explicit.project == "", "explicit sources must not select a project")
+finish(root)
+print("test_explicit_sources_do_not_discover_neighbors ... ok")
+
+root = fresh()
+mainSource = file(root, "main.min")
+expectError(project.resolveSources([root], "mac"), "requires app.min", "missing entry")
+expectError(project.resolveSources([mainSource, mainSource], "mac"), "duplicate source", "duplicate inputs")
+finish(root)
+print("test_missing_entry_and_duplicate_inputs ... ok")
+
+root = fresh()
+file(root, "app.min")
+let real = file(root, "real.min")
+test.check(host.run(["ln", "-s", real, root + "/alias.min"]) == 0, "create source symlink")
+expectError(project.resolveSources([root], "mac"), "symbolic link", "source symlinks")
+finish(root)
+print("test_source_symlinks_are_rejected ... ok")
+
+root = fresh()
+let only = file(root, "Only.windows.min")
+expectError(project.resolveSources([only], "mac"), "no sources", "empty target selection")
+expectError(project.resolveSources([only], "unknown"), "unknown target", "invalid target")
+finish(root)
+print("test_invalid_or_empty_target_selection ... ok")

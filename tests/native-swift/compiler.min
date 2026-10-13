@@ -1,0 +1,328 @@
+use "../../tools/testing.min" as test
+use "../../scripts/native-host.min" as host
+use "../../scripts/native-swift.min" as control
+use "system" as system
+use "files" as files
+use "json" as json
+
+record Suite { root: Text; compiler: Text; baseline: Boolean; flags: List<Text>; selected: List<Text>; serial: Integer; path: Text }
+
+function spaced(command: List<Text>): Text {
+    let result = ""
+    for index in 0..command.length {
+        if index > 0 { result += " " }
+        result += command[index]
+    }
+    return result
+}
+function run(suite: Suite, command: List<Text>, ok: Boolean, seconds: Integer): test.Result {
+    suite.serial += 1
+    let log = suite.path + "/.command-" + Text(suite.serial)
+    let result = test.run(command, system.environment(), suite.root, log, seconds)
+    files.remove(log)
+    files.remove(log + ".err")
+    test.check((result.status == 0) == ok, spaced(command) + "\n" + result.output + "\n" + result.errorOutput)
+    return result
+}
+function compile(suite: Suite, arguments: List<Text>, ok: Boolean): test.Result {
+    let command = [suite.compiler]
+    for item in suite.flags { command.add(item) }
+    for item in arguments { command.add(item) }
+    return run(suite, command, ok, 240)
+}
+function source(suite: Suite, text: Text, name: Text, logical: Text): Text {
+    let suffix = ".min"
+    let contents = text
+    if suite.baseline {
+        suffix = ".swift"
+        let lowered = control.lower(text)
+        test.check(lowered.error == "", "the source prototype rejected the fixture: " + lowered.error)
+        contents = lowered.text
+    }
+    if logical != "" { contents = "#sourceLocation(file: " + host.jsonString(logical) + ", line: 1)\n" + contents }
+    let path = suite.path + "/" + name + suffix
+    writeTextFile(path, contents)
+    return path
+}
+function occurrences(text: Text, needle: Text): Integer {
+    let total = 0
+    let start = host.find(text, needle, 0)
+    while start >= 0 {
+        total += 1
+        start = host.find(text, needle, start + host.size(needle))
+    }
+    return total
+}
+function normalize(ir: Text): Text {
+    let kept: List<Text> = []
+    for line in host.lines(ir) {
+        if !host.starts(line, "; ModuleID =") && !host.starts(line, "source_filename =") { kept.add(line + "\n") }
+    }
+    return joinText(kept)
+}
+function sameBytes(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+function plist(suite: Suite, path: Text, key: Text): Text {
+    return host.strip(run(suite, ["plutil", "-extract", key, "raw", "-o", "-", path], true, 30).output)
+}
+function begin(suite: Suite, name: Text): Boolean {
+    if suite.selected.length > 0 && !host.has(suite.selected, name) && !host.has(suite.selected, "NativeCompilerTests." + name) { return false }
+    let made = host.temporaryDirectory(host.temporaryRoot(), "minyar-compiler-check-")
+    test.check(made.status == 0, made.output)
+    suite.path = made.output
+    return true
+}
+function end(suite: Suite, name: Text) {
+    host.removeTree(suite.path)
+    print(name + " ... ok")
+}
+function skipped(suite: Suite, name: Text) {
+    if suite.selected.length == 0 || host.has(suite.selected, name) || host.has(suite.selected, "NativeCompilerTests." + name) {
+        print(name + " ... skipped 'requires the direct native launcher'")
+    }
+}
+function usage(message: Text): Integer {
+    host.standardError("usage: compiler [-h] --compiler COMPILER [--baseline]\ncompiler: error: " + message + "\n")
+    return 2
+}
+function concat(first: List<Text>, second: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for item in first { result.add(item) }
+    for item in second { result.add(item) }
+    return result
+}
+function characterIndex(line: Text, needle: Text): Integer {
+    let bytes = host.find(line, needle, 0)
+    test.check(bytes >= 0, "missing " + needle)
+    return Text(Bytes(line).slice(0, bytes)).length
+}
+
+function main(): Integer {
+    let compilerPath = ""
+    let baseline = false
+    let selected: List<Text> = []
+    let index = 0
+    while index < argumentCount() {
+        let item = argument(index)
+        if item == "--baseline" { baseline = true }
+        else if item == "--compiler" {
+            if index + 1 >= argumentCount() { return usage("argument --compiler: expected one argument") }
+            compilerPath = argument(index + 1)
+            index += 1
+        } else if host.starts(item, "--compiler=") { compilerPath = host.cut(item, 11, host.size(item)) }
+        else { selected.add(item) }
+        index += 1
+    }
+    if compilerPath == "" { return usage("the following arguments are required: --compiler") }
+    let compiler = host.absolute(compilerPath)
+    if !host.isFile(compiler) { return usage("compiler does not exist: " + compiler) }
+    let root = host.currentDirectory()
+    let targetInfo = host.capture(["xcrun", "swiftc", "-print-target-info"])
+    test.check(targetInfo.status == 0, "xcrun swiftc -print-target-info failed")
+    let sdk = host.capture(["xcrun", "--sdk", "macosx", "--show-sdk-path"])
+    test.check(sdk.status == 0, "xcrun --show-sdk-path failed")
+    let target = json.parse(targetInfo.output)
+    let flags = ["-swift-version", "6", "-resource-dir", json.string(json.member(target, "paths"), "runtimeResourcePath"),
+        "-sdk", host.strip(sdk.output), "-target", json.string(json.member(target, "target"), "triple"), "-whole-module-optimization"]
+    let suite = Suite { root: root; compiler: compiler; baseline: baseline; flags: flags; selected: selected; serial: 0; path: "" }
+    if baseline { print("Testing upstream control") } else { print("Testing direct Minyar compiler input") }
+
+    if begin(suite, "test_conditional_binding_mutability") {
+        let good = source(suite, readTextFile(root + "/tests/native-swift/conditional-bindings.min"), "main", "")
+        let binary = suite.path + "/bindings"
+        compile(suite, [good, "-o", binary], true)
+        test.check(run(suite, [binary], true, 240).output == "42\n42\n42\n", "conditional bindings output")
+        let bad = source(suite, readTextFile(root + "/tests/native-swift/conditional-constant-failure.min"), "bad", "")
+        let diagnostics = compile(suite, ["-typecheck", bad], false).errorOutput
+        test.check(occurrences(diagnostics, "error: cannot assign to value:") >= 3, "constant bindings were assignable\n" + diagnostics)
+        end(suite, "test_conditional_binding_mutability")
+    }
+
+    if begin(suite, "test_macro_diagnostic_positions") {
+        let path = source(suite, "use \"Observation\"\nconstant n = 1; @Observable record Bad { let value = 0 }\n", "main", "")
+        let result = compile(suite, ["-typecheck", path], false)
+        let line = host.lines(readTextFile(path))[1]
+        let column = characterIndex(line, "@Observable") + 1
+        test.check(test.contains(result.errorOutput, path + ":2:" + Text(column) + ":"), "macro diagnostic position\n" + result.errorOutput)
+        test.check(test.contains(result.errorOutput, line), "macro diagnostic source line\n" + result.errorOutput)
+        end(suite, "test_macro_diagnostic_positions")
+    }
+
+    if baseline { skipped(suite, "test_native_app_launcher_and_failed_replacement") }
+    else if begin(suite, "test_native_app_launcher_and_failed_replacement") {
+        let application = suite.path + "/Native Minyar Test.app"
+        let command = [root + "/minyar", "--backend", "native", "--compiler", compiler, "--release", "--app", "--bundle-id", "org.minyar.native-acceptance", "-o", application]
+        run(suite, concat(command, [root + "/examples/swiftui/main.min"]), true, 240)
+        let info = application + "/Contents/Info.plist"
+        test.check(plist(suite, info, "CFBundleIdentifier") == "org.minyar.native-acceptance", "bundle identifier")
+        let binary = application + "/Contents/MacOS/" + plist(suite, info, "CFBundleExecutable")
+        run(suite, ["codesign", "--verify", "--strict", application], true, 240)
+        test.check(test.contains(run(suite, [binary, "--smoke"], true, 30).output, "swiftui scene mounted"), "SwiftUI scene smoke run")
+        let previous = files.readFile(binary)
+        let bad = source(suite, "constant value: Int = \"wrong\"\n", "main", "")
+        let failure = run(suite, concat(command, [bad]), false, 240)
+        test.check(test.contains(failure.errorOutput, bad + ":1:"), "diagnostic does not name the original source\n" + failure.errorOutput)
+        test.check(sameBytes(files.readFile(binary), previous), "a failed build replaced the application")
+        let rejected = run(suite, concat(command, [bad, "--emit-swift", suite.path + "/lowered"]), false, 240)
+        test.check(test.contains(rejected.errorOutput, "does not generate Swift source"), "emit-swift was accepted\n" + rejected.errorOutput)
+        test.check(!host.exists(suite.path + "/lowered"), "a rejected build created lowered source")
+        end(suite, "test_native_app_launcher_and_failed_replacement")
+    }
+
+    if begin(suite, "test_native_features_and_observation") {
+        let path = source(suite, readTextFile(root + "/tests/swiftui-features.min"), "main", "")
+        for optimization in ["-Onone", "-O"] {
+            let binary = suite.path + "/" + host.cut(optimization, 1, host.size(optimization))
+            compile(suite, ["-parse-as-library", optimization, path, "-o", binary], true)
+            test.check(test.contains(run(suite, [binary], true, 240).output, "actors passed"), "native features at " + optimization)
+        }
+        end(suite, "test_native_features_and_observation")
+    }
+
+    if begin(suite, "test_native_library_and_swift_client") {
+        let path = source(suite, readTextFile(root + "/examples/swiftui-library/widgets.min"), "main", "")
+        let library = suite.path + "/libMinyarWidgets.dylib"
+        let interfacePath = suite.path + "/MinyarWidgets.swiftinterface"
+        compile(suite, ["-parse-as-library", "-O", "-module-name", "MinyarWidgets", "-enable-library-evolution", "-emit-library", "-emit-module",
+            "-emit-module-path", suite.path + "/MinyarWidgets.swiftmodule", "-emit-module-interface-path", interfacePath,
+            "-Xlinker", "-install_name", "-Xlinker", "@rpath/libMinyarWidgets.dylib", path, "-o", library], true)
+        let textOnly = suite.path + "/text-interface"
+        test.check(host.makeDirectories(textOnly) == "", "create text interface directory")
+        test.check(host.copyFile(interfacePath, textOnly + "/MinyarWidgets.swiftinterface") == "", "copy interface")
+        for headers in [suite.path, textOnly] {
+            let binary = suite.path + "/client-" + host.basename(headers)
+            run(suite, ["xcrun", "swiftc", "-swift-version", "6", "-parse-as-library", "-O", "-I", headers, "-L", suite.path, "-lMinyarWidgets",
+                "-module-cache-path", suite.path + "/cache-" + host.basename(headers), "-Xlinker", "-rpath", "-Xlinker", suite.path,
+                root + "/tests/swiftui-library-client.swift", "-o", binary], true, 240)
+            test.check(test.contains(run(suite, [binary], true, 240).output, "Swift imported native Minyar"), "Swift client of " + headers)
+        }
+        end(suite, "test_native_library_and_swift_client")
+    }
+
+    if baseline { skipped(suite, "test_native_project_selection") }
+    else if begin(suite, "test_native_project_selection") {
+        let projectRoot = suite.path + "/project"
+        let feature = projectRoot + "/counter"
+        test.check(host.makeDirectories(feature) == "", "create project")
+        writeTextFile(projectRoot + "/app.min", "@main record App { static function main() { print(platformName()) } }\n")
+        writeTextFile(feature + "/Platform.min", "function platformName(): String { \"shared\" }\n")
+        let overrideSource = feature + "/Platform.mac.min"
+        writeTextFile(overrideSource, "function platformName(): String { \"mac\" }\n")
+        writeTextFile(feature + "/Platform.windows.min", "THIS MUST NEVER REACH THE MAC COMPILER\n")
+        let nested = projectRoot + "/tools/child"
+        test.check(host.makeDirectories(nested) == "", "create nested app")
+        writeTextFile(nested + "/app.min", "@main record App { static function main() { print(\"child app\") } }\n")
+        let application = suite.path + "/Project.app"
+        let command = [root + "/minyar", "--backend", "native", "--compiler", compiler, "--target-platform", "mac", "--bundle-id", "org.minyar.project-test", "-o", application]
+        for entry in [projectRoot, projectRoot + "/app.min"] {
+            run(suite, concat(command, [entry]), true, 240)
+            test.check(run(suite, [application + "/Contents/MacOS/application"], true, 240).output == "mac\n", "project selection from " + entry)
+        }
+        let childApplication = suite.path + "/Child.app"
+        run(suite, concat(command, [nested, "-o", childApplication]), true, 240)
+        test.check(run(suite, [childApplication + "/Contents/MacOS/application"], true, 240).output == "child app\n", "nested app")
+        let previous = files.readFile(application + "/Contents/MacOS/application")
+        writeTextFile(overrideSource, "function platformName(): String { 42 }\n")
+        let failure = run(suite, concat(command, [projectRoot]), false, 240)
+        test.check(test.contains(failure.errorOutput, overrideSource + ":1:"), "diagnostic does not name the override\n" + failure.errorOutput)
+        test.check(sameBytes(files.readFile(application + "/Contents/MacOS/application"), previous), "a failed project build replaced the application")
+        let unsupported = run(suite, concat(command, [projectRoot, "--target-platform", "windows"]), false, 240)
+        test.check(test.contains(unsupported.errorOutput, "this host builds mac"), "cross-compilation was accepted\n" + unsupported.errorOutput)
+        end(suite, "test_native_project_selection")
+    }
+
+    if begin(suite, "test_native_regex_literal") {
+        let literal = "/[0-9]+/"
+        if baseline { literal = "#/[0-9]+/#" }
+        let path = source(suite, "constant regex = " + literal + "\nprecondition(\"abc12\".firstMatch(of: regex)?.output == \"12\")\nprint(\"native regex passed\")\n", "main", "")
+        let binary = suite.path + "/regex"
+        compile(suite, ["-O", path, "-o", binary], true)
+        test.check(run(suite, [binary], true, 240).output == "native regex passed\n", "native regex output")
+        end(suite, "test_native_regex_literal")
+    }
+
+    if begin(suite, "test_mixed_swift_and_minyar_sources") {
+        let helper = source(suite, "function twice(value: Int): Int {\n    let total = value\n    total += value\n    return total\n}\n", "helper", "")
+        let mainFile = suite.path + "/main.swift"
+        writeTextFile(mainFile, "let input = 21\nprint(twice(input))\n")
+        let binary = suite.path + "/mixed"
+        compile(suite, [mainFile, helper, "-o", binary], true)
+        test.check(run(suite, [binary], true, 240).output == "42\n", "mixed sources output")
+        writeTextFile(mainFile, readTextFile(mainFile) + "input = 22\n")
+        let diagnostic = compile(suite, ["-typecheck", mainFile, helper], false)
+        test.check(test.contains(diagnostic.errorOutput, "'let' constant"), "Swift constants became mutable\n" + diagnostic.errorOutput)
+        end(suite, "test_mixed_swift_and_minyar_sources")
+    }
+
+    if begin(suite, "test_multifile_and_original_diagnostics") {
+        let mainFile = source(suite, "print(twice(21))\n", "main", "")
+        let helper = source(suite, "function twice(value: Int): Int { value * 2 }\n", "helper", "")
+        let binary = suite.path + "/program"
+        compile(suite, [mainFile, helper, "-o", binary], true)
+        test.check(run(suite, [binary], true, 240).output == "42\n", "multifile output")
+        let bad = source(suite, "// original source position\nconstant value: Int = \"wrong\"\n", "bad", "")
+        let diagnostic = compile(suite, ["-typecheck", bad], false)
+        test.check(test.contains(diagnostic.errorOutput, bad + ":2:"), "diagnostic position\n" + diagnostic.errorOutput)
+        end(suite, "test_multifile_and_original_diagnostics")
+    }
+
+    if begin(suite, "test_swift_dialect_isolation") {
+        let swift = suite.path + "/immutable.swift"
+        writeTextFile(swift, "let value = 1\nvalue = 2\n")
+        let diagnostic = compile(suite, ["-typecheck", swift], false)
+        test.check(test.contains(diagnostic.errorOutput, "'let' constant"), "Swift let became mutable\n" + diagnostic.errorOutput)
+        let mutableSource = source(suite, "let value = 1\nvalue = 2\nprint(value)\n", "main", "")
+        let binary = suite.path + "/mutable"
+        compile(suite, [mutableSource, "-o", binary], true)
+        test.check(run(suite, [binary], true, 240).output == "2\n", "Minyar let output")
+        end(suite, "test_swift_dialect_isolation")
+    }
+
+    if begin(suite, "test_swiftui_differential_ir_and_execution") {
+        let logical = "/MinyarParity/Probe.swift"
+        let ours = source(suite, readTextFile(root + "/tests/swiftui-equivalent.min"), "main", logical)
+        let reference = suite.path + "/reference.swift"
+        writeTextFile(reference, "#sourceLocation(file: " + host.jsonString(logical) + ", line: 1)\n" + readTextFile(root + "/tests/swiftui-equivalent.swift"))
+        let irs: List<Text> = []
+        let outputs: List<Text> = []
+        let inputs = [ours, reference]
+        let names = ["minyar", "swift"]
+        for position in 0..2 {
+            let ir = suite.path + "/" + names[position] + ".ll"
+            let binary = suite.path + "/" + names[position]
+            let flags = ["-parse-as-library", "-O", "-module-name", "Parity"]
+            compile(suite, concat(flags, ["-emit-ir", inputs[position], "-o", ir]), true)
+            compile(suite, concat(flags, [inputs[position], "-o", binary]), true)
+            irs.add(readTextFile(ir))
+            outputs.add(run(suite, [binary], true, 240).output)
+        }
+        test.check(normalize(irs[0]) == normalize(irs[1]), "optimized IR differs from the Swift reference")
+        test.check(outputs[0] == outputs[1], "program output differs from the Swift reference")
+        test.check(host.starts(outputs[0], "10\n"), "program output does not start with 10")
+        test.check(!test.contains(irs[0], "minyar_"), "IR references the Minyar runtime")
+        end(suite, "test_swiftui_differential_ir_and_execution")
+    }
+
+    if begin(suite, "test_swiftui_entry_macro") {
+        let factory = "constant"
+        if baseline { factory = "`constant`" }
+        let text = "use \"SwiftUI\"\nextension EnvironmentValues {\n    @Entry let minyarProbe: Int = 42\n}\n@main record Probe {\n    static function main() {\n        let values = EnvironmentValues()\n        precondition(values.minyarProbe == 42)\n        values.minyarProbe = 7\n        precondition(values.minyarProbe == 7)\n        constant fixed = Binding." + factory + "(42)\n        precondition(fixed.wrappedValue == 42)\n        print(\"SwiftUI Entry macro passed\")\n    }\n}\n"
+        let path = source(suite, text, "main", "")
+        let binary = suite.path + "/entry"
+        compile(suite, ["-parse-as-library", "-O", path, "-o", binary], true)
+        test.check(run(suite, [binary], true, 240).output == "SwiftUI Entry macro passed\n", "SwiftUI Entry macro output")
+        end(suite, "test_swiftui_entry_macro")
+    }
+
+    if begin(suite, "test_swiftui_scene") {
+        let path = source(suite, readTextFile(root + "/examples/swiftui/main.min"), "main", "")
+        let binary = suite.path + "/native-scene"
+        compile(suite, ["-parse-as-library", "-O", path, "-o", binary], true)
+        test.check(test.contains(run(suite, [binary, "--smoke"], true, 30).output, "swiftui scene mounted"), "SwiftUI scene smoke run")
+        end(suite, "test_swiftui_scene")
+    }
+    return 0
+}

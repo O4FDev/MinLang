@@ -1,9 +1,11 @@
 NATIVE_HOST_SOURCES = scripts/native-host.min
 NATIVE_SWIFT_SOURCES = $(NATIVE_HOST_SOURCES) scripts/native_project.min scripts/macos-app.min scripts/native-swift.min
-build/tooling/scripts/native-swift.ll build/tooling/scripts/native-frontend.ll: $(NATIVE_SWIFT_SOURCES)
+build/tooling/scripts/native-swift.ll build/tooling/scripts/native-frontend.ll build/tooling/tests/swiftui.ll build/tooling/tests/native-swift/compiler.ll: $(NATIVE_SWIFT_SOURCES)
 build/tooling/scripts/macos-app.ll: $(NATIVE_HOST_SOURCES) scripts/macos-app.min
+build/tooling/tests/native-swift/project.ll: $(NATIVE_HOST_SOURCES) scripts/native_project.min
 build/tooling/scripts/native-toolchain.ll: $(NATIVE_HOST_SOURCES)
 build/tooling/scripts/native-syntax-check.ll: $(NATIVE_HOST_SOURCES) scripts/native-toolchain.min
+build/tooling/tests/native-swift/linux.ll: $(NATIVE_HOST_SOURCES)
 
 # Native GUI integration needs a logged-in macOS desktop session.
 .PHONY: check-macos
@@ -16,8 +18,8 @@ check-http: build/minyarc build/minyar-default-runtime.o
 	$${MINYAR_PYTHON:-python3} tests/http-package.py
 
 .PHONY: check-swiftui
-check-swiftui:
-	$${MINYAR_PYTHON:-/usr/bin/python3} tests/swiftui.py
+check-swiftui: build/tooling/tests/swiftui build/tooling/scripts/native-swift
+	./build/tooling/tests/swiftui
 
 .PHONY: check-native-syntax
 check-native-syntax: build/tooling/scripts/native-syntax-check
@@ -26,16 +28,16 @@ check-native-syntax: build/tooling/scripts/native-syntax-check
 MINYAR_NATIVE_HOST := $(if $(filter Linux,$(shell uname -s)),linux,macosx)
 MINYAR_NATIVE_SWIFTC ?= build/native-toolchain/build/Ninja-ReleaseAssert/swift-$(MINYAR_NATIVE_HOST)-$(shell uname -m)/bin/swiftc
 .PHONY: check-native-compiler
-check-native-compiler: check-native-project
-	$${MINYAR_PYTHON:-/usr/bin/python3} tests/native-swift/compiler.py --compiler "$(MINYAR_NATIVE_SWIFTC)"
+check-native-compiler: check-native-project build/tooling/tests/native-swift/compiler build/tooling/scripts/native-frontend
+	./build/tooling/tests/native-swift/compiler --compiler "$(MINYAR_NATIVE_SWIFTC)"
 
 .PHONY: check-native-project
-check-native-project:
-	$${MINYAR_PYTHON:-/usr/bin/python3} tests/native-swift/project.py
+check-native-project: build/tooling/tests/native-swift/project
+	./build/tooling/tests/native-swift/project
 
 .PHONY: check-native-linux
-check-native-linux: check-native-project
-	$${MINYAR_PYTHON:-/usr/bin/python3} tests/native-swift/linux.py --compiler "$(MINYAR_NATIVE_SWIFTC)"
+check-native-linux: check-native-project build/tooling/tests/native-swift/linux build/tooling/scripts/native-frontend
+	./build/tooling/tests/native-swift/linux --compiler "$(MINYAR_NATIVE_SWIFTC)"
 
 # Real renders through the graphics package (needs a macOS desktop session).
 .PHONY: check-graphics-render
