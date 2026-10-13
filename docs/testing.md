@@ -321,20 +321,20 @@ not a latency measurement on native deployment hardware.
 
 ## Running the suites
 
-`scripts/check-linux.py` (Linux) and `scripts/check-macos.py` (macOS, the
+`build/tooling/scripts/check-linux` (Linux) and `build/tooling/scripts/check-macos` (macOS, the
 checks of `make check-portable`) run every check even after failures and end
 with one summary: each failed check, its log path and its last 30 lines. The
 exit status is non-zero if any check failed. A failed check is retried once
 with nothing else running; a pass on that retry is reported as flaky.
 
 ```sh
-python3 scripts/check-linux.py --matrix               # the whole Linux matrix (below), one summary
-python3 scripts/check-linux.py --tier full            # landing: no sanitizer checks
-python3 scripts/check-linux.py --tier sanitize        # only the sanitizer checks
-python3 scripts/check-linux.py --tier all --jobs 8    # both, eight checks at once
-python3 scripts/check-linux.py --group llvm22 --group quic   # chosen matrix groups
-python3 scripts/check-linux.py --only check-maps      # one target and its phony prerequisites
-python3 scripts/check-macos.py --tier all LIMITED= SANITIZER_LIMITED=
+./build/tooling/scripts/check-linux --matrix               # the whole Linux matrix (below), after make build/tooling/scripts/check-linux
+./build/tooling/scripts/check-linux --tier full            # landing: no sanitizer checks
+./build/tooling/scripts/check-linux --tier sanitize        # only the sanitizer checks
+./build/tooling/scripts/check-linux --tier all --jobs 8    # both, eight checks at once
+./build/tooling/scripts/check-linux --group llvm23 --group quic   # chosen matrix groups
+./build/tooling/scripts/check-linux --only check-maps      # one target and its phony prerequisites
+./build/tooling/scripts/check-macos --tier all LIMITED= SANITIZER_LIMITED=   # after make build/tooling/scripts/check-macos
 ```
 
 `--matrix` runs `--tier all` plus every other Linux group in one run:
@@ -356,7 +356,7 @@ checks. A target shared by two groups runs once. CI runs the same runner,
 sharded by group (`linux-matrix` in `ci.yml`).
 
 `--jobs` defaults to the CPU count on Linux. On macOS it defaults to one job
-per 8 GB of physical memory (2 on a 16 GB laptop). `check-macos.py` also runs
+per 8 GB of physical memory (2 on a 16 GB laptop). `check-macos` also runs
 the macOS-only network, graphics and desktop checks (`--no-extras` skips them,
 `--keychain` adds the Keychain checks CI runs). The runners split aggregate
 targets such as `check-sanitize` into their phony prerequisites, so each recipe
@@ -364,7 +364,7 @@ runs once. Every file prerequisite is built by one builder per work directory
 before any check that needs it starts, so two makes never build the same file
 at once. Checks with tight wall-clock assertions run only alongside each other,
 and checks that share a fixed port or path never overlap; both lists live in
-`scripts/check_runner.py`. Every result row records wall time and CPU seconds,
+`tools/check-runner.min`. Every result row records wall time and CPU seconds,
 and the summary prints a per-group table.
 
 ## Per-commit platform gates
@@ -381,7 +381,7 @@ and incremental-driver probes and run in the Linux matrix and macOS gate.
 The Linux matrix also runs incremental-module correctness natively and with
 sanitizers, temporary-owner admission, compiler slice-cache checks, the memory
 contract harness, ownership mutation checks, and both scalar-constructor modes.
-Once the checks it replays have passed, `scripts/check-linux-leaks.py` replays the eligible
+Once the checks it replays have passed, `scripts/check-linux-leaks.min` replays the eligible
 runtime fixtures with LeakSanitizer enabled, first verifying that the detector
 rejects a deliberate leak. Compiler arenas remain excluded from leak replay.
 Linux uploads JSON reports and detailed logs on both success and failure;
