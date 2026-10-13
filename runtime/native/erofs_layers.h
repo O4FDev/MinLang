@@ -112,14 +112,39 @@ static int e_tar_mtime(EWriter *w, uint64_t start, uint64_t end, uint64_t positi
 }
 static int e_spool_tar(EWriter *w, const char *path, uint64_t *start, uint64_t *end) {
     struct archive *raw = archive_read_new(); if (!raw) return ENOMEM;
-    int error = 0;
+    int fd = open(path,O_RDONLY | O_CLOEXEC);
+    int error = fd < 0 ? errno : 0;
+    struct stat before;
+    if (!error && fstat(fd,&before)) error = errno;
     if (archive_read_support_format_raw(raw) != ARCHIVE_OK || archive_read_support_filter_none(raw) != ARCHIVE_OK || archive_read_support_filter_gzip(raw) != ARCHIVE_OK || archive_read_support_filter_zstd(raw) != ARCHIVE_OK) error = ENOTSUP;
-    if (!error && archive_read_open_filename(raw,path,1048576) != ARCHIVE_OK) error = EINVAL;
+    if (!error && archive_read_open_fd(raw,fd,1048576) != ARCHIVE_OK) error = EINVAL;
     struct archive_entry *entry;
     if (!error && archive_read_next_header(raw,&entry) != ARCHIVE_OK) error = EINVAL;
     unsigned char *buffer = malloc(1048576); if (!buffer) error = ENOMEM;
     *start = w->spool_size;
-    while (!error) {
+    int direct = !error && S_ISREG(before.st_mode) && archive_filter_code(raw,0) == ARCHIVE_FILTER_NONE;
+    if (direct) {
+        if (before.st_size < 0 || (uint64_t)before.st_size > 17592186040320ull - w->spool_size) error = EFBIG;
+        off_t input = 0, output = (off_t)w->spool_size;
+        uint64_t remaining = before.st_size < 0 ? 0 : (uint64_t)before.st_size;
+        int fallback = 0;
+        while (!error && remaining) {
+            uint64_t limit = fallback ? 1048576 : 1073741824;
+            size_t count = remaining > limit ? (size_t)limit : (size_t)remaining;
+            ssize_t n;
+            if (!fallback) {
+                n = copy_file_range(fd,&input,w->data_fd,&output,count,0);
+                if (n < 0 && (errno == EXDEV || errno == EINVAL || errno == ENOSYS || errno == EOPNOTSUPP)) { fallback = 1; continue; }
+            } else {
+                n = pread(fd,buffer,count,input);
+                if (n > 0) { error = e_write(w->data_fd,buffer,(size_t)n,(uint64_t)output); input += n; output += n; }
+            }
+            if (n < 0) { if (errno == EINTR) continue; error = errno; }
+            else if (!n) error = ESTALE;
+            else { remaining -= (uint64_t)n; w->spool_size += (uint64_t)n; }
+        }
+    }
+    while (!error && !direct) {
         la_ssize_t n = archive_read_data(raw,buffer,1048576);
         if (n < 0) { error = EINVAL; break; }
         if (!n) break;
@@ -128,6 +153,12 @@ static int e_spool_tar(EWriter *w, const char *path, uint64_t *start, uint64_t *
     }
     *end = w->spool_size; free(buffer);
     if (archive_read_free(raw) != ARCHIVE_OK && !error) error = EINVAL;
+    if (!error && S_ISREG(before.st_mode)) {
+        struct stat after;
+        if (fstat(fd,&after)) error = errno;
+        else if (before.st_size != after.st_size || before.st_mtim.tv_sec != after.st_mtim.tv_sec || before.st_mtim.tv_nsec != after.st_mtim.tv_nsec || before.st_ctim.tv_sec != after.st_ctim.tv_sec || before.st_ctim.tv_nsec != after.st_ctim.tv_nsec) error = ESTALE;
+    }
+    if (fd >= 0) close(fd);
     return error;
 }
 
