@@ -1,0 +1,202 @@
+use "../tools/testing.min" as test
+use "./release-support.min" as support
+use "system" as system
+use "files" as files
+
+record Fixture { scratch: Text; work: Text; package: Text; source: Text; native: Text; header: Text; other: Text; output: Text; environment: List<Text>; serial: Integer }
+
+function chosen(name: Text): Boolean {
+    if argumentCount() == 0 { return true }
+    for index in 0..argumentCount() { if argument(index) == name || argument(index) == "PackageNativeInputs." + name { return true } }
+    return false
+}
+function setup(): Fixture {
+    let scratch = test.scratch()
+    let work = scratch + "/native package with spaces"
+    let package = work + "/packages"
+    for directory in [work, package] { test.check(files.makeDirectory(directory) == 0, "native package directories") }
+    writeTextFile(package + "/linux.min", "public function number(): Integer { native \"linux\" }\npublic function other(): Integer { native \"linux\" }\n")
+    writeTextFile(work + "/child.min", "use \"linux\" as linux\npublic function answer(): Integer { return linux.number() + linux.other() }\n")
+    let source = work + "/main.min"
+    writeTextFile(source, "use \"./child.min\" as child\nprint(child.answer())\n")
+    let native = work + "/native source $literal.c"
+    let header = work + "/value.h"
+    writeTextFile(header, "#define VALUE 40\n")
+    writeTextFile(native, "#include \"value.h\"\nlong long minyar_linux_number(void) { return VALUE; }\n")
+    let other = work + "/other.c"
+    writeTextFile(other, "long long minyar_linux_other(void) { return 2; }\n")
+    let environment: List<Text> = []
+    for entry in support.environment(["MINYAR_CLANG=" + test.setting("MINYAR_TEST_CLANG", "clang"), "MAKEFLAGS=--jobs 8"]) {
+        if !support.starts(entry, "MINYAR_LINK_ARTIFACTS=") { environment.add(entry) }
+    }
+    return Fixture { scratch: scratch; work: work; package: package; source: source; native: native; header: header; other: other; output: work + "/program"; environment: environment; serial: 0 }
+}
+function command(fixture: Fixture, root: Text, options: List<Text>, success: Boolean): test.Result {
+    fixture.serial += 1
+    let argv = [root + "/minyar", "--library", fixture.package]
+    for option in options { argv.add(option) }
+    for item in [fixture.source, "-o", fixture.output] { argv.add(item) }
+    let result = test.run(argv, fixture.environment, fixture.work, fixture.scratch + "/launch" + Text(fixture.serial), 180)
+    test.check((result.status == 0) == success, "native package launcher status " + Text(result.status) + "\n" + result.output + result.errorOutput)
+    return result
+}
+function inputs(fixture: Fixture): List<Text> {
+    return ["--native-source", "linux=" + fixture.native, "--native-source", "linux=" + fixture.other]
+}
+function joined(first: List<Text>, second: List<Text>): List<Text> {
+    let result = support.copy(first)
+    for item in second { result.add(item) }
+    return result
+}
+function execute(fixture: Fixture, expected: Text) {
+    fixture.serial += 1
+    let result = test.run([fixture.output], system.environment(), "", fixture.scratch + "/program" + Text(fixture.serial), 10)
+    test.check(result.status == 0 && result.output == expected, "native package program output\n" + result.output + result.errorOutput)
+}
+function finish(fixture: Fixture) {
+    test.removeTree(fixture.scratch)
+}
+let names = ["test_transitive_package_sources_follow_header_changes", "test_object_and_archive_inputs", "test_unbound_library_still_fails", "test_unused_source_is_not_compiled",
+    "test_source_compile_failure_preserves_executable", "test_unknown_and_missing_symbols_preserve_executable", "test_release_and_debug", "test_native_flags_apply_to_package_source",
+    "test_builtin_provider_links_with_package_inputs", "test_runtime_native_header_is_available", "test_native_input_cannot_be_output", "test_check_rejects_native_output_options", "test_input_validation"]
+for index in 0..argumentCount() {
+    let valid = false
+    for name in names { if argument(index) == name || argument(index) == "PackageNativeInputs." + name { valid = true } }
+    test.check(valid, "unknown native package case " + argument(index))
+}
+let rootScratch = test.scratch()
+let root = test.lines(support.output(["pwd", "-P"], rootScratch + "/root"))[0]
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let kernel = test.lines(support.output(["uname", "-s"], rootScratch + "/kernel"))[0]
+test.removeTree(rootScratch)
+let cases = 0
+if chosen("test_transitive_package_sources_follow_header_changes") {
+    let fixture = setup()
+    command(fixture, root, inputs(fixture), true)
+    execute(fixture, "42\n")
+    writeTextFile(fixture.header, "#define VALUE 50\n")
+    command(fixture, root, inputs(fixture), true)
+    execute(fixture, "52\n")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_object_and_archive_inputs") {
+    let fixture = setup()
+    let object = fixture.work + "/native object.o"
+    let other = fixture.work + "/other.o"
+    let archive = fixture.work + "/native archive.a"
+    for pair in [[fixture.native, object], [fixture.other, other]] {
+        test.require(test.run([clang, "-O2", "-c", pair[0], "-o", pair[1]], system.environment(), "", fixture.scratch + "/object", 60), "compile native package object")
+    }
+    let archiver = support.which("llvm-ar", fixture.scratch + "/which-ar")
+    if archiver == "" { archiver = "ar" }
+    test.require(test.run([archiver, "rcs", archive, other], system.environment(), "", fixture.scratch + "/archive", 60), "archive native package object")
+    command(fixture, root, ["--native-object", "linux=" + archive, "--native-object", "linux=" + object], true)
+    execute(fixture, "42\n")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_unbound_library_still_fails") {
+    let fixture = setup()
+    let result = command(fixture, root, ["--native-source", "unused=" + fixture.native], false)
+    test.check(test.contains(result.errorOutput, "unknown native library: linux"), "unbound library diagnostic\n" + result.errorOutput)
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_unused_source_is_not_compiled") {
+    let fixture = setup()
+    let unused = fixture.work + "/unused.c"
+    writeTextFile(unused, "invalid C must never compile\n")
+    command(fixture, root, joined(inputs(fixture), ["--native-source", "unused=" + unused]), true)
+    execute(fixture, "42\n")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_source_compile_failure_preserves_executable") {
+    let fixture = setup()
+    command(fixture, root, inputs(fixture), true)
+    writeTextFile(fixture.native, "invalid C\n")
+    command(fixture, root, inputs(fixture), false)
+    execute(fixture, "42\n")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_unknown_and_missing_symbols_preserve_executable") {
+    let fixture = setup()
+    command(fixture, root, inputs(fixture), true)
+    command(fixture, root, ["--native-source", "linux=" + fixture.other], false)
+    execute(fixture, "42\n")
+    command(fixture, root, [], false)
+    execute(fixture, "42\n")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_release_and_debug") {
+    let fixture = setup()
+    for mode in ["--release", "--debug"] {
+        if kernel == "Linux" {
+            let environment: List<Text> = []
+            for entry in fixture.environment { if !support.starts(entry, "MINYAR_CLANG_FLAGS=") { environment.add(entry) } }
+            if mode == "--release" { environment.add("MINYAR_CLANG_FLAGS=-O2 -Wno-override-module -Wl,--threads=1") }
+            fixture.environment = environment
+        }
+        command(fixture, root, joined([mode], inputs(fixture)), true)
+        execute(fixture, "42\n")
+    }
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_native_flags_apply_to_package_source") {
+    let fixture = setup()
+    fixture.environment = support.merge(fixture.environment, ["MINYAR_NATIVE_FLAGS=-O2 -DEXTRA=2"])
+    writeTextFile(fixture.other, "long long minyar_linux_other(void) { return EXTRA; }\n")
+    command(fixture, root, inputs(fixture), true)
+    execute(fixture, "42\n")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_builtin_provider_links_with_package_inputs") {
+    let fixture = setup()
+    writeTextFile(fixture.source, "use \"./child.min\" as child\nuse \"net\" as net\nuse \"sha256\" as hash\nprint(child.answer())\nprint(net.ipVersion(\"127.0.0.1\"))\nprint(hash.digest(Bytes()).length)\n")
+    command(fixture, root, inputs(fixture), true)
+    execute(fixture, "42\n4\n32\n")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_runtime_native_header_is_available") {
+    let fixture = setup()
+    writeTextFile(fixture.native, "#include \"minyar_native.h\"\nlong long minyar_linux_number(void) { return 40; }\n")
+    command(fixture, root, inputs(fixture), true)
+    execute(fixture, "42\n")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_native_input_cannot_be_output") {
+    let fixture = setup()
+    let original = readBytesFile(fixture.native)
+    fixture.output = fixture.native
+    let result = command(fixture, root, inputs(fixture), false)
+    test.check(test.contains(result.errorOutput, "refusing to replace a native input"), "native input output diagnostic\n" + result.errorOutput)
+    test.check(support.same(readBytesFile(fixture.native), original), "native input was replaced")
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_check_rejects_native_output_options") {
+    let fixture = setup()
+    let argv = joined([root + "/minyar", "--check"], inputs(fixture))
+    argv.add(fixture.source)
+    let result = test.run(argv, fixture.environment, fixture.work, fixture.scratch + "/check", 30)
+    test.check(result.status == 2, "check mode native output options status " + Text(result.status) + "\n" + result.errorOutput)
+    finish(fixture)
+    cases += 1
+}
+if chosen("test_input_validation") {
+    let fixture = setup()
+    for options in [["--native-source", fixture.native], ["--native-source", "bad-name=" + fixture.native],
+            ["--native-object", "linux=" + fixture.work + "/missing.o"], ["--native-object", "linux=" + fixture.native]] {
+        command(fixture, root, options, false)
+    }
+    finish(fixture)
+    cases += 1
+}
+print("Package native inputs: " + Text(cases) + " cases passed")

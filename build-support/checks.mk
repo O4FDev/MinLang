@@ -777,8 +777,8 @@ check-native-cache: build/tooling/tools/clang-driver
 	$(LIMITED) python3 tests/native-object-cache.py
 
 .PHONY: check-package-native-inputs
-check-package-native-inputs: build/minyarc
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/package-native-inputs.py
+check-package-native-inputs: build/minyarc build/tooling/tests/package-native-inputs
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/package-native-inputs
 
 check check-portable: check-package-native-inputs
 
