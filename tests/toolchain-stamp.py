@@ -23,7 +23,7 @@ class ToolchainStamp(unittest.TestCase):
             work = Path(temporary)
             compiler = work / 'clang'
             linker = work / 'ld.lld'
-            compiler.write_text('#!' + sys.executable + '\nprint("clang version 23.1.2")\n')
+            compiler.write_text('#!' + sys.executable + '\nimport sys\nprint(' + repr(str(linker)) + ' if "-print-prog-name=ld.lld" in sys.argv else "clang version 23.1.2")\n')
             compiler.chmod(0o755)
             stamp = work / 'stamp.json'
             environment = {**os.environ, 'CC': str(compiler), 'LLVM_CC': str(compiler),

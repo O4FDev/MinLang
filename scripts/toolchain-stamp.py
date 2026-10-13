@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shutil
 import shlex
+import subprocess
 import sys
 import tempfile
 import time
@@ -81,7 +82,7 @@ def main():
         if selected is None:
             selected = next((option.split("=", 1)[1] for option in reversed(options) if option.startswith("-fuse-ld=")), "lld")
         if selected == "lld":
-            selected = str(host_path(llvm["path"]).parent / "ld.lld")
+            selected = subprocess.check_output([llvm["command"], "-print-prog-name=ld.lld"], text=True, timeout=10).strip()
         elif not Path(selected).is_absolute():
             selected = shutil.which(selected) or shutil.which("ld." + selected) or selected
         linker = identity("LLD", selected, command=selected)

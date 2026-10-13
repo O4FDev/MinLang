@@ -10,7 +10,7 @@ LLVM_FLAGS ?= -O2 -Wno-override-module
 LDLIBS ?= -lm
 SANITIZER_FLAGS ?= -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wno-override-module
 COMPILER_RUNTIME_FLAGS ?= -DMINYAR_COMPILER_ARENA
-COMPILER_LTO_FLAGS ?= -flto=thin $(if $(filter Linux,$(shell uname -s)),$(if $(filter -fuse-ld=% --ld-path=%,$(LLVM_FLAGS)),,-fuse-ld="$(dir $(realpath $(shell command -v "$(LLVM_CC)")))ld.lld" -Wl,--threads=1))
+COMPILER_LTO_FLAGS ?= -flto=thin $(if $(filter Linux,$(shell uname -s)),$(if $(filter -fuse-ld=% --ld-path=%,$(LLVM_FLAGS)),,-fuse-ld="$(shell "$(LLVM_CC)" -print-prog-name=ld.lld)" -Wl,--threads=1))
 PROGRAM_RUNTIME_FLAGS ?= -DMINYAR_SYSTEM_HEAP=1
 BOUNDED_FLAGS ?= -DMINYAR_BOUNDED_HEAP=1
 RUNTIME_HEADERS = $(wildcard runtime/minyar_*.h) build/.toolchain.json
