@@ -265,6 +265,8 @@ static int e_copy(EWriter *w, EInode *i) {
     }
     free(buffer); close(fd); return error;
 }
+static unsigned e_compact_initial(EInode *i) { return (unsigned)((32 - (e_align(64 + i->attrs_size, 8) + 8) % 32) % 32 / 4); }
+static uint64_t e_compact_middle(EInode *i, uint64_t clusters) { unsigned initial = e_compact_initial(i); return clusters > initial ? (clusters - initial) / 16 * 16 : 0; }
 static int e_compress(EWriter *w, EInode *i) {
     struct open_how how = {.flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW, .resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS};
     int fd = (int)syscall(SYS_openat2, w->source_fd, i->source, &how, sizeof(how));
@@ -272,14 +274,17 @@ static int e_compress(EWriter *w, EInode *i) {
     struct stat st;
     int error = fstat(fd, &st) ? errno : 0;
     if (!error && (st.st_ino != i->st.st_ino || st.st_dev != i->st.st_dev || st.st_size != i->st.st_size || !S_ISREG(st.st_mode))) error = ESTALE;
-    unsigned char *map = calloc(1, (size_t)i->map_size);
-    unsigned char *input = malloc(65536), *encoded = malloc(65536), *output = malloc(65536);
-    if (!map || !input || !encoded || !output) error = ENOMEM;
-    if (!error) { e16(map + 4, 2); map[6] = w->compression == 1 ? 3 : 0; }
+    uint64_t total_clusters = e_align(i->size, 4096) / 4096;
+    unsigned char *map = calloc(1, (size_t)(16 + total_clusters * 8));
+    unsigned char *compact = calloc(1, (size_t)i->map_size);
+    unsigned char *input = malloc(1048576), *encoded = malloc(65536), *output = malloc(65536);
+    if (!map || !compact || !input || !encoded || !output) error = ENOMEM;
+    if (!error && w->compression == 1 && (ZSTD_isError(ZSTD_CCtx_setParameter(w->codec, ZSTD_c_compressionLevel, w->level)) || ZSTD_isError(ZSTD_CCtx_setParameter(w->codec, ZSTD_c_windowLog, 19)))) error = EINVAL;
+    if (!error) { e16(map + 4, 7); map[6] = w->compression == 1 ? 3 : 0; }
     uint64_t at = 0, first_block = w->position / 4096;
     while (!error && at < i->size) {
-        size_t size = i->size - at > 65536 ? 65536 : (size_t)(i->size - at);
-        memset(input, 0, 65536);
+        size_t size = i->size - at > 1048576 ? 1048576 : (size_t)(i->size - at);
+        memset(input, 0, 1048576);
         size_t read_size = 0;
         while (read_size < size) {
             ssize_t n = pread(fd, input + read_size, size - read_size, (off_t)(at + read_size));
@@ -288,15 +293,33 @@ static int e_compress(EWriter *w, EInode *i) {
             read_size += (size_t)n;
         }
         if (error) break;
-        unsigned clusters = (unsigned)e_align(size, 4096) / 4096;
-        int packed;
+        int packed = 0;
         if (w->compression == 1) {
-            size_t result = ZSTD_compressCCtx(w->codec, encoded, 65536, input, size, w->level);
+            size_t result = ZSTD_compress2(w->codec, encoded, 65536, input, size);
             if (ZSTD_isError(result)) {
                 if (ZSTD_getErrorCode(result) != ZSTD_error_dstSize_tooSmall) { error = ZSTD_getErrorCode(result) == ZSTD_error_memory_allocation ? ENOMEM : EIO; break; }
-                packed = 0;
-            } else packed = (int)result;
-        } else packed = LZ4_compress_default((const char *)input, (char *)encoded, (int)size, 65536);
+                size_t low = 0, high = size / 4096 + 1;
+                while (high > low + 1) {
+                    size_t middle = (low + high) / 2;
+                    result = ZSTD_compress2(w->codec, encoded, 65536, input, middle * 4096);
+                    if (!ZSTD_isError(result)) low = middle;
+                    else if (ZSTD_getErrorCode(result) == ZSTD_error_dstSize_tooSmall) high = middle;
+                    else { error = ZSTD_getErrorCode(result) == ZSTD_error_memory_allocation ? ENOMEM : EIO; break; }
+                }
+                if (error) break;
+                if (low) { size = low * 4096; result = ZSTD_compress2(w->codec, encoded, 65536, input, size); }
+            }
+            if (!ZSTD_isError(result)) packed = (int)result;
+        } else {
+            int consumed = (int)size;
+            packed = LZ4_compress_destSize((const char *)input, (char *)encoded, &consumed, 65536);
+            if (packed > 0 && (size_t)consumed < size) {
+                size = (size_t)consumed & ~(size_t)4095;
+                packed = size ? LZ4_compress_default((const char *)input, (char *)encoded, (int)size, 65536) : 0;
+            }
+        }
+        if (!packed) size = i->size - at > 65536 ? 65536 : (size_t)(i->size - at);
+        unsigned clusters = (unsigned)e_align(size, 4096) / 4096;
         unsigned blocks = packed > 0 ? (unsigned)e_align((unsigned)packed, 4096) / 4096 : clusters;
         int compressed = blocks < clusters;
         if (!compressed) blocks = clusters;
@@ -320,13 +343,43 @@ static int e_compress(EWriter *w, EInode *i) {
     }
     if (!error) {
         i->stored_blocks = (uint32_t)(w->position / 4096 - first_block);
-        error = e_write(w->output_fd, map, (size_t)i->map_size, e_align(4096 + i->nid * 32 + 64 + i->attrs_size, 8));
+        memcpy(compact, map, 8);
+        uint32_t physical = (uint32_t)first_block;
+        int preceding_head = 0;
+        unsigned initial = e_compact_initial(i);
+        uint64_t middle = e_compact_middle(i, total_clusters), offset = 8;
+        for (uint64_t n = 0; n < total_clusters;) {
+            unsigned count = n >= initial && n < initial + middle ? 16 : 2;
+            unsigned width = count == 16 ? 2 : 4, bits = count == 16 ? 14 : 16;
+            unsigned char *pair = compact + offset;
+            uint32_t base = physical;
+            for (unsigned k = 0; k < count && n + k < total_clusters; ++k) {
+                unsigned char *entry = map + 16 + (n + k) * 8;
+                unsigned type = entry[0] & 3;
+                unsigned value = 0;
+                if (type == 2) {
+                    unsigned back = entry[4] | (unsigned)entry[5] << 8;
+                    if (back & 2048) { value = back; physical += back & 2047; preceding_head = 0; }
+                    else value = k + 1 == count ? entry[6] | (unsigned)entry[7] << 8 : back;
+                } else {
+                    if (preceding_head) { ++physical; if (!k) base = physical; }
+                    preceding_head = 1;
+                }
+                unsigned encoded_index = type << 12 | value, bit = k * bits, byte = bit / 8, shift = bit % 8;
+                pair[byte] |= (unsigned char)(encoded_index << shift);
+                pair[byte + 1] |= (unsigned char)(encoded_index >> (8 - shift));
+                pair[byte + 2] |= (unsigned char)(encoded_index >> (16 - shift));
+            }
+            e32(pair + count * width - 4, base);
+            n += count; offset += count * width;
+        }
+        error = e_write(w->output_fd, compact, (size_t)i->map_size, e_align(4096 + i->nid * 32 + 64 + i->attrs_size, 8));
     }
     if (!error) {
         if (fstat(fd, &st)) error = errno;
         else if (st.st_size != i->st.st_size || st.st_mtim.tv_sec != i->st.st_mtim.tv_sec || st.st_mtim.tv_nsec != i->st.st_mtim.tv_nsec || st.st_ctim.tv_sec != i->st.st_ctim.tv_sec || st.st_ctim.tv_nsec != i->st.st_ctim.tv_nsec) error = ESTALE;
     }
-    free(map);free(input);free(encoded);free(output);close(fd);return error;
+    free(map);free(compact);free(input);free(encoded);free(output);close(fd);return error;
 }
 static int e_image(EWriter *w) {
     int error = e_dirs(w->root, -1);
@@ -335,7 +388,10 @@ static int e_image(EWriter *w) {
         EInode *i = w->inodes[n];
         if ((metadata & 4095) == 4064) metadata += 32;
         i->nid = metadata / 32;
-        if (w->compression && S_ISREG(i->st.st_mode) && i->size) i->map_size = 16 + e_align(i->size, 4096) / 4096 * 8;
+        if (w->compression && S_ISREG(i->st.st_mode) && i->size) {
+            uint64_t clusters = e_align(i->size, 4096) / 4096;
+            i->map_size = 8 + e_align(clusters, 2) * 4 - e_compact_middle(i, clusters) * 2;
+        }
         metadata = e_align(metadata + (i->map_size ? e_align(64 + i->attrs_size, 8) + i->map_size : 64 + i->attrs_size), 32);
     }
     uint64_t position = 4096 + e_align(metadata, 4096);
@@ -357,14 +413,14 @@ static int e_image(EWriter *w) {
     error = e_write(w->output_fd, super, sizeof(super), 1024);
     if (!error && w->compression) {
         unsigned char config[16] = {0};
-        if (w->compression == 1) { e16(config, 6); config[3] = 6; }
+        if (w->compression == 1) { e16(config, 6); config[3] = 9; }
         else { e16(config, 14); e16(config + 2, 65535); e16(config + 4, 16); }
         error = e_write(w->output_fd, config, w->compression == 1 ? 8 : 16, 1152);
     }
     for (size_t n = 0; !error && n < w->count; ++n) {
         EInode *i = w->inodes[n];
         unsigned char inode[64] = {0};
-        e16(inode, i->map_size ? 3 : 1); e16(inode + 2, i->attrs_size ? (uint16_t)((i->attrs_size - 12) / 4 + 1) : 0);
+        e16(inode, i->map_size ? 7 : 1); e16(inode + 2, i->attrs_size ? (uint16_t)((i->attrs_size - 12) / 4 + 1) : 0);
         e16(inode + 4, (uint16_t)i->st.st_mode); e64(inode + 8, i->size);
         uint32_t device = i->map_size ? i->stored_blocks : i->block;
         if (S_ISCHR(i->st.st_mode) || S_ISBLK(i->st.st_mode)) {
