@@ -4,6 +4,12 @@
 .PHONY: check-thread-generated-recovery check-thread-generated-recovery-sanitize check-thread-generated-recovery-tsan
 .PHONY: check-thread-native-regions check-thread-native-regions-sanitize check-thread-native-regions-tsan
 
+build/tooling/tests/thread-native-regions.ll: tests/thread-port-support.min
+build/tooling/tests/thread-generated-recovery.ll: tests/thread-port-support.min
+build/tooling/tests/thread-effects.ll: tests/thread-port-support.min
+build/tooling/tests/thread-language.ll: tests/thread-port-support.min
+build/tooling/tests/thread-tsan-control.ll: tests/thread-port-support.min
+build/tooling/tests/thread-compiler.ll: tests/thread-port-support.min tests/compiler-port-support.min tests/sha256-support.min
 build/tooling/tests/thread-native-regions: TOOL_NATIVE = runtime/native/sha256.c
 build/tooling/tests/thread-native-regions: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/thread-native-regions: runtime/native/sha256.c

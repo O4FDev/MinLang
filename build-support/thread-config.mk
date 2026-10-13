@@ -1,4 +1,5 @@
 .PHONY: check-thread-config
+build/tooling/tests/thread-config.ll: tests/thread-port-support.min tests/compiler-port-support.min tests/sha256-support.min
 build/tooling/tests/thread-config: TOOL_NATIVE = tests/sha256-test-native.c runtime/native/sha256.c
 build/tooling/tests/thread-config: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/thread-config: tests/sha256-test-native.c runtime/native/sha256.c
