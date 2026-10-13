@@ -115,7 +115,10 @@ with tempfile.TemporaryDirectory(prefix='minyar-native-regions-') as temporary:
             '--bounded-owners', '32'], capture_output=True, text=True, timeout=90, env=environment)
         assert compiled.returncode == 0, compiled.stdout + compiled.stderr
         symbols = ('out8',) if compile_only else ('pause', 'fence')
-        assert all('@minyar_machine_' + name in llvm.read_text() for name in symbols)
+        emitted = llvm.read_text()
+        assert all('minyar_machine_' + name in emitted for name in symbols)
+        if compile_only: assert 'asm sideeffect "outb $0, $1"' in emitted
+        else: assert 'asm sideeffect "pause"' in emitted and 'fence seq_cst' in emitted
         binary = directory / 'main-machine'
         linked = subprocess.run(['python3', str(ROOT / 'tools/clang-driver.py'), 'link', str(ROOT), str(llvm),
             str(ROOT / 'build/minyar-default-runtime.o'), str(binary), '0'],
