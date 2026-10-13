@@ -319,14 +319,17 @@ check-peer-ownership-python-swift-ruby-lua: $(PEER_OWNERSHIP_ARTIFACTS)
 		PeerPythonSwiftRubyLua.test_utf8_constructor_value_projections_keep_complete_bytes \
 		PeerPythonSwiftRubyLua.test_valid_scalar_lengths_and_numeric_character_reads
 
-check-allocation-faults: build/minyarc
-	$(SANITIZER_LIMITED) python3 tests/allocation-faults.py
+build/tooling/tests/allocation-faults: TOOL_NATIVE = runtime/native/sha256.c
+build/tooling/tests/allocation-faults: TOOL_LIBS = $(TOOL_CRYPTO)
+build/tooling/tests/allocation-faults: runtime/native/sha256.c
+check-allocation-faults: build/minyarc build/tooling/tests/allocation-faults
+	$(SANITIZER_LIMITED) ./build/tooling/tests/allocation-faults
 
 check-runtime-size-guards: build/tooling/tests/runtime-size-guards
 	$(SANITIZER_LIMITED) ./build/tooling/tests/runtime-size-guards
 
-check-compiler-allocation-faults: build/minyarc build/compiler-stage2.ll build/minyar-runtime.o
-	$(SANITIZER_LIMITED) python3 tests/allocation-faults.py --scope compiler --output build/compiler-allocation-faults.json
+check-compiler-allocation-faults: build/minyarc build/compiler-stage2.ll build/minyar-runtime.o build/tooling/tests/allocation-faults
+	$(SANITIZER_LIMITED) ./build/tooling/tests/allocation-faults --scope compiler --output build/compiler-allocation-faults.json
 
 build/tooling/tests/codegen: TOOL_RUNTIME = build/testing/cycle-runtime.o
 build/tooling/tests/codegen: build/testing/cycle-runtime.o

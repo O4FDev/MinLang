@@ -1,0 +1,407 @@
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+use "json" as json
+use "sha256" as sha
+
+constant OOM = "Minyar stopped: the computer ran out of memory.\n"
+record Peak { required: Integer; events: Integer; allocations: Integer; resizes: Integer }
+record Report { raw: Text; allocations: Integer; resizes: Integer; moved: Integer; fired: Integer; fatalExit: Integer; liveBytes: Integer; peakRequired: Integer; failedRequired: Integer; frameEntries: Integer; frameLeaves: Integer; peakFrames: Integer; releasedObjects: Integer; storageMoves: Integer; events: List<List<Integer>>; peaks: List<Peak> }
+record Campaign { work: Text; clang: Text; compiler: Text; commands: List<List<Text>>; rows: List<Text> }
+record Sweep { failures: Integer; successes: Integer; classes: Integer; budgets: List<Integer>; high: Integer; events: Integer; digest: Text }
+
+function number(value: json.Value, name: Text): Integer {
+    let found = json.member(value, name)
+    test.check(found.kind == json.NUMBER, "allocation report lacks " + name)
+    return Integer(found.number)
+}
+function parse(raw: Text): Report {
+    let value = json.parse(raw)
+    test.check(value.kind == json.OBJECT, "allocation report is not a JSON object")
+    let events: List<List<Integer>> = []
+    for item in json.member(value, "events").items {
+        test.check(item.items.length == 3, "allocation event shape changed")
+        events.add([Integer(item.items[0].number), Integer(item.items[1].number), Integer(item.items[2].number)])
+    }
+    let peaks: List<Peak> = []
+    for item in json.member(value, "peaks").items {
+        peaks.add(Peak { required: number(item, "required"); events: number(item, "events"); allocations: number(item, "allocations"); resizes: number(item, "resizes") })
+    }
+    return Report { raw: raw; allocations: number(value, "allocations"); resizes: number(value, "resizes"); moved: number(value, "moved");
+        fired: number(value, "fired"); fatalExit: number(value, "fatal_exit"); liveBytes: number(value, "live_bytes");
+        peakRequired: number(value, "peak_required"); failedRequired: number(value, "failed_required");
+        frameEntries: number(value, "frame_entries"); frameLeaves: number(value, "frame_leaves"); peakFrames: number(value, "peak_frames");
+        releasedObjects: number(value, "released_objects"); storageMoves: number(value, "storage_moves"); events: events; peaks: peaks }
+}
+function samePeaks(left: List<Peak>, right: List<Peak>): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length {
+        let a = left[index]
+        let b = right[index]
+        if a.required != b.required || a.events != b.events || a.allocations != b.allocations || a.resizes != b.resizes { return false }
+    }
+    return true
+}
+function sameEvents(left: List<List<Integer>>, right: List<List<Integer>>, count: Integer): Boolean {
+    if left.length != count || right.length < count { return false }
+    for index in 0..count {
+        for field in 0..3 { if left[index][field] != right[index][field] { return false } }
+    }
+    return true
+}
+function starts(value: Text, prefix: Text): Boolean {
+    let raw = Bytes(value)
+    let bytes = Bytes(prefix)
+    return raw.length >= bytes.length && Text(raw.slice(0, bytes.length)) == prefix
+}
+function without(base: List<Text>, names: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for item in base {
+        let keep = true
+        for name in names { if starts(item, name + "=") { keep = false } }
+        if keep { result.add(item) }
+    }
+    return result
+}
+function environment(base: List<Text>, names: List<Text>, values: List<Text>): List<Text> {
+    let result = without(base, names)
+    for index in 0..names.length { result.add(names[index] + "=" + values[index]) }
+    return result
+}
+function prefix(peaks: List<Peak>, count: Integer): List<Peak> {
+    let result: List<Peak> = []
+    for index in 0..count { result.add(peaks[index]) }
+    return result
+}
+function run(campaign: Campaign, command: List<Text>, env: List<Text>, label: Text): test.Result {
+    campaign.commands.add(command)
+    return test.run(command, env, "", campaign.work + "/" + label + ".log", 60)
+}
+function build(campaign: Campaign, command: List<Text>, label: Text) {
+    let result = run(campaign, command, system.environment(), label)
+    test.check(result.status == 0, label + " failed\n" + result.errorOutput)
+}
+record Execution { result: test.Result; report: Report }
+function execute(campaign: Campaign, executable: Text, label: Text, env: List<Text>, arguments: List<Text>): Execution {
+    let path = campaign.work + "/" + label + ".json"
+    if files.pathSize(path) >= 0 { files.remove(path) }
+    let command = [executable]
+    for item in arguments { command.add(item) }
+    let result = run(campaign, command, environment(env, ["MINYAR_ALLOCATION_REPORT"], [path]), label)
+    test.check(files.pathSize(path) >= 0, "Missing allocation instrumentation: " + label + ": " + result.errorOutput)
+    return Execution { result: result; report: parse(readTextFile(path)) }
+}
+function faulted(result: test.Result, report: Report): Boolean {
+    return report.fired == 1 && result.status == 1 && result.errorOutput == OOM && report.fatalExit == 1
+}
+function requireFault(result: test.Result, report: Report) {
+    test.check(report.fired == 1, "Requested allocation failpoint did not fire exactly once")
+    test.check(faulted(result, report), "Uncontrolled OOM: " + Text(result.status) + ", " + result.errorOutput + ", " + report.raw)
+}
+function traceText(events: List<List<Integer>>): Text {
+    let parts: List<Text> = ["["]
+    for index in 0..events.length {
+        if index > 0 { parts.add(", ") }
+        parts.add("[" + Text(events[index][0]) + ", " + Text(events[index][1]) + ", " + Text(events[index][2]) + "]")
+    }
+    parts.add("]")
+    return joinText(parts)
+}
+function byteSweep(campaign: Campaign, executable: Text, label: Text, env: List<Text>, baseline: Report, expected: Text, arguments: List<Text>, output: Text, reference: Text): Sweep {
+    let live = 0
+    let high = 0
+    let allocations = 0
+    let resizes = 0
+    let peaks: List<Peak> = []
+    for index in 0..baseline.events.length {
+        let event = baseline.events[index]
+        test.check(event[2] == live && event[1] >= 0, "trace live bytes diverged at " + Text(index))
+        if event[0] == 1 || event[0] == 2 {
+            if event[0] == 1 { allocations += 1 } else { resizes += 1 }
+            live += event[1]
+            if live > high {
+                high = live
+                peaks.add(Peak { required: high; events: index + 1; allocations: allocations; resizes: resizes })
+            }
+        } else {
+            test.check(event[0] == 3 && event[1] <= live, "invalid release event at " + Text(index))
+            live -= event[1]
+        }
+    }
+    test.check(peaks.length > 0 && samePeaks(peaks, baseline.peaks), "independent peaks differ from baseline")
+    test.check(live == baseline.liveBytes && high == baseline.peakRequired && allocations == baseline.allocations && resizes == baseline.resizes, "trace totals differ: " + baseline.raw)
+    let budgets: List<Integer> = [0, high, high + 1]
+    for peak in peaks { budgets.add(peak.required - 1) }
+    budgets.sort()
+    let unique: List<Integer> = []
+    for budget in budgets { if unique.length == 0 || unique[unique.length - 1] != budget { unique.add(budget) } }
+    let failures = 0
+    let successes = 0
+    for budget in unique {
+        if output != "" && files.pathSize(output) >= 0 { files.remove(output) }
+        let observed = execute(campaign, executable, label + "-bytes-" + Text(budget), environment(env, ["MINYAR_FAIL_BYTES"], [Text(budget)]), arguments)
+        let result = observed.result
+        let report = observed.report
+        let first = -1
+        for index in 0..peaks.length { if first < 0 && peaks[index].required > budget { first = index } }
+        if first >= 0 {
+            let failure = peaks[first]
+            requireFault(result, report)
+            test.check(starts(expected, result.output), label + " " + Text(budget) + " output is not a prefix")
+            test.check(report.failedRequired == failure.required, report.raw)
+            test.check(report.allocations == failure.allocations && report.resizes == failure.resizes, report.raw)
+            test.check(sameEvents(report.events, baseline.events, failure.events), "Byte-budget run diverged from baseline trace prefix")
+            test.check(report.liveBytes == report.events[report.events.length - 1][2], report.raw)
+            test.check(report.peakRequired == failure.required, report.raw)
+            test.check(samePeaks(report.peaks, prefix(peaks, first + 1)), report.raw)
+            let moved = 0
+            for index in 0..(report.events.length - 1) { if report.events[index][0] == 2 { moved += 1 } }
+            test.check(report.moved == moved, report.raw)
+            failures += 1
+        } else {
+            test.check(result.status == 0 && result.output == expected && result.errorOutput == "", label + " byte budget success failed\n" + result.errorOutput)
+            test.check(report.raw == baseline.raw, "Byte-budget success changed allocation/free schedule")
+            if output != "" { test.check(readTextFile(output) == readTextFile(reference), "Byte budget changed emitted LLVM") }
+            successes += 1
+        }
+    }
+    return Sweep { failures: failures; successes: successes; classes: peaks.length; budgets: unique; high: high; events: baseline.events.length; digest: sha.hex(sha.digest(Bytes(traceText(baseline.events)))) }
+}
+function sweepFields(sweep: Sweep): Text {
+    let budgets: List<Text> = []
+    for index in 0..sweep.budgets.length {
+        if index > 0 { budgets.add(", ") }
+        budgets.add(Text(sweep.budgets[index]))
+    }
+    return "\"byte_budget_failures\": " + Text(sweep.failures) + ", \"byte_budget_successes\": " + Text(sweep.successes) + ", \"byte_boundary_classes\": " + Text(sweep.classes) + ", \"byte_budgets\": [" + joinText(budgets) + "], \"peak_payload_bytes\": " + Text(sweep.high) + ", \"trace_events\": " + Text(sweep.events) + ", \"trace_sha256\": " + json.quote(sweep.digest)
+}
+function withFlags(prefix: List<Text>, flags: List<Text>, suffix: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for item in prefix { result.add(item) }
+    for item in flags { result.add(item) }
+    for item in suffix { result.add(item) }
+    return result
+}
+function instrumented(source: Text, flags: List<Text>): Text {
+    if test.addressEnabled(flags) { return test.instrument(source) }
+    return source
+}
+function probes(campaign: Campaign, mode: Text, flags: List<Text>, env: List<Text>) {
+    let probe = campaign.work + "/probe-" + mode
+    build(campaign, withFlags([campaign.clang, "-std=c11", "-O1", "-g"], flags, ["-DMINYAR_FAULT_SELF_TEST", "tests/allocation-fault-runtime.c", "-o", probe, "-lm"]), "probe-" + mode + "-build")
+    let labels = ["normal", "allocate", "calloc", "resize", "shrink", "bytes-zero", "bytes-grow", "bytes-before-peak", "bytes-peak", "bytes-above"]
+    let variables = ["", "MINYAR_FAIL_ALLOCATION", "MINYAR_FAIL_ALLOCATION", "MINYAR_FAIL_RESIZE", "MINYAR_FAIL_RESIZE", "MINYAR_FAIL_BYTES", "MINYAR_FAIL_BYTES", "MINYAR_FAIL_BYTES", "MINYAR_FAIL_BYTES", "MINYAR_FAIL_BYTES"]
+    let values = ["", "1", "2", "1", "2", "0", "16", "47", "48", "49"]
+    let statuses = [0, 91, 93, 92, 96, 91, 92, 92, 0, 0]
+    let fired = [0, 1, 1, 1, 1, 1, 1, 1, 0, 0]
+    let moved = [2, 0, 2, 0, 1, 0, 0, 0, 2, 2]
+    for index in 0..labels.length {
+        let label = labels[index]
+        let extra = env
+        if variables[index] != "" { extra = environment(env, [variables[index]], [values[index]]) }
+        let observed = execute(campaign, probe, "probe-" + mode + "-" + label, extra, [])
+        let report = observed.report
+        test.check(observed.result.status == statuses[index] && observed.result.errorOutput == "", label + " probe status " + Text(observed.result.status) + "\n" + observed.result.errorOutput + report.raw)
+        test.check(report.fired == fired[index] && report.moved == moved[index], report.raw)
+        if label == "normal" || label == "bytes-peak" || label == "bytes-above" {
+            test.check(traceText(report.events) == "[[1, 16, 0], [2, 32, 16], [3, 16, 48], [2, 8, 32], [3, 32, 40], [3, 8, 8], [1, 16, 0], [3, 16, 16]]", report.raw)
+            test.check(report.allocations == 2 && report.resizes == 2 && report.liveBytes == 0 && report.peakRequired == 48, report.raw)
+            test.check(samePeaks(report.peaks, [Peak { required: 16; events: 1; allocations: 1; resizes: 0 }, Peak { required: 48; events: 2; allocations: 1; resizes: 1 }]), report.raw)
+        }
+        if label == "bytes-before-peak" { test.check(report.failedRequired == 48, report.raw) }
+    }
+    for operation in ["free", "resize"] {
+        for byte in [0, 15] {
+            let extra = environment(env, ["MINYAR_FAULT_CORRUPT_SUFFIX"], [operation])
+            if byte != 0 { extra = environment(extra, ["MINYAR_FAULT_CORRUPT_BYTE"], ["15"]) }
+            let observed = execute(campaign, probe, "probe-" + mode + "-corrupt-" + operation + "-" + Text(byte), extra, [])
+            test.check(observed.result.status == 94 && observed.result.output == "", "corrupt " + operation + " status " + Text(observed.result.status))
+            test.check(observed.result.errorOutput == "allocation suffix corrupted\n", observed.result.errorOutput)
+            test.check(observed.report.fatalExit == 1 && observed.report.fired == 0, observed.report.raw)
+        }
+    }
+    let ordinals = ["0", "-1", " -1", "+1", "1junk", "18446744073709551616"]
+    for index in 0..ordinals.length {
+        let observed = execute(campaign, probe, "probe-" + mode + "-invalid-ordinal-" + Text(index), environment(env, ["MINYAR_FAIL_ALLOCATION"], [ordinals[index]]), [])
+        test.check(observed.result.status == 90 && observed.result.output == "", "invalid ordinal status " + Text(observed.result.status))
+        test.check(observed.result.errorOutput == "invalid allocation fault ordinal\n", observed.result.errorOutput)
+    }
+    let missing = parse("{\"allocations\":0,\"resizes\":0,\"moved\":0,\"fired\":0,\"fatal_exit\":1,\"live_bytes\":0,\"peak_required\":0,\"failed_required\":0,\"frame_entries\":0,\"frame_leaves\":0,\"peak_frames\":0,\"released_objects\":0,\"storage_moves\":0,\"events\":[],\"peaks\":[]}\n")
+    test.check(!faulted(test.Result { status: 1; output: ""; errorOutput: OOM }, missing), "Fault oracle accepted an ineffective failpoint")
+    let swallowed = parse("{\"allocations\":0,\"resizes\":0,\"moved\":0,\"fired\":1,\"fatal_exit\":0,\"live_bytes\":0,\"peak_required\":0,\"failed_required\":0,\"frame_entries\":0,\"frame_leaves\":0,\"peak_frames\":0,\"released_objects\":0,\"storage_moves\":0,\"events\":[],\"peaks\":[]}\n")
+    test.check(!faulted(test.Result { status: 0; output: ""; errorOutput: "" }, swallowed), "Fault oracle accepted a swallowed failpoint")
+}
+function ordinalSweep(campaign: Campaign, executable: Text, label: Text, env: List<Text>, baseline: Report, expected: Text, arguments: List<Text>, output: Text, reference: Text) {
+    let counters = ["allocations", "resizes"]
+    let variables = ["MINYAR_FAIL_ALLOCATION", "MINYAR_FAIL_RESIZE"]
+    for index in 0..2 {
+        let total = baseline.allocations
+        if index == 1 { total = baseline.resizes }
+        for ordinal in 1..(total + 1) {
+            if output != "" && files.pathSize(output) >= 0 { files.remove(output) }
+            let observed = execute(campaign, executable, label + "-" + counters[index] + "-" + Text(ordinal), environment(env, [variables[index]], [Text(ordinal)]), arguments)
+            requireFault(observed.result, observed.report)
+            if output != "" { test.check(observed.result.output == "", label + " fault wrote output") }
+            else { test.check(starts(expected, observed.result.output), label + " " + Text(ordinal) + " output is not a prefix") }
+        }
+        if output != "" && files.pathSize(output) >= 0 { files.remove(output) }
+        let beyond = execute(campaign, executable, label + "-" + counters[index] + "-beyond", environment(env, [variables[index]], [Text(total + 1)]), arguments)
+        test.check(beyond.result.status == 0 && beyond.result.output == expected && beyond.result.errorOutput == "", label + " beyond ordinal changed execution\n" + beyond.result.errorOutput)
+        test.check(beyond.report.raw == baseline.raw, "Nondeterministic allocation path")
+        if output != "" { test.check(readTextFile(output) == readTextFile(reference), "Instrumented compiler changed emitted LLVM") }
+    }
+}
+
+let compilerPath = "build/minyarc"
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+let mode = "both"
+let scope = "runtime"
+let compilerIr = "build/compiler-stage2.ll"
+let output = "build/allocation-faults.json"
+let position = 0
+while position < argumentCount() {
+    test.check(position + 1 < argumentCount(), "option needs a value: " + argument(position))
+    let option = argument(position)
+    let value = argument(position + 1)
+    if option == "--compiler" { compilerPath = value }
+    else if option == "--clang" { clang = value }
+    else if option == "--mode" { test.check(value == "native" || value == "sanitize" || value == "both", "invalid mode"); mode = value }
+    else if option == "--scope" { test.check(value == "runtime" || value == "compiler", "invalid scope"); scope = value }
+    else if option == "--compiler-ir" { compilerIr = value }
+    else if option == "--output" { output = value }
+    else { fail("unknown option: " + option) }
+    position += 2
+}
+let modes = [mode]
+if mode == "both" { modes = ["native", "sanitize"] }
+let work = test.scratch()
+let resolved = test.run(["realpath", "--", compilerPath], system.environment(), "", work + "/resolve", 10)
+test.require(resolved, "resolve compiler")
+let campaign = Campaign { work: work; clang: clang; compiler: test.lines(resolved.output)[0]; commands: []; rows: [] }
+let caseNames = ["text", "list", "records"]
+let caseSources = ["function grow(text: Text): Text {\nlet result = text\nlet index = 0\nwhile index < 320 { result = result + text; index = index + 1 }\nreturn result\n}\nlet source = grow(\"é🙂\")\nlet view = source.slice(1, source.length - 1)\nlet parts = [view, source, view]\nlet result = joinText(parts)\nprint(result.length == view.length * 2 + source.length)\nprint(source.length)\n",
+    "function append(values: List<Text>, alias: List<Text>) {\nlet index = 0\nwhile index < 129 { values.add(\"value\" + Text(index)); index = index + 1 }\nprint(alias[0])\nprint(alias[39])\nprint(alias[128])\n}\nlet values: List<Text> = []\nappend(values, values)\nlet alias = values\nvalues[0] = values[39]\nprint(alias[0])\n",
+    "record Leaf { label: Text; values: List<Integer> }\nrecord Tree { leaf: Leaf; children: List<Leaf> }\nfunction make(index: Integer): Leaf { return Leaf { label: \"leaf\" + Text(index); values: [index, index + 1] } }\nlet first = make(10)\nlet tree = Tree { leaf: first; children: [first, make(20), make(30)] }\nlet alias = tree.children\nprint(tree.leaf.label)\nprint(alias[2].values[1])\n"]
+let caseOutputs = ["true\n642\n", "value0\nvalue39\nvalue128\nvalue39\n", "leaf10\n31\n"]
+let compilerNames = ["assignment", "file-program"]
+let compilerSources = ["let value = 1\n", "function foo() {}\nlet items = [\"x\"]\nlet text = \"aaa\"\nlet index = 0\nwhile index < items.length { text = text + items[index]; index = index + 1 }\nfoo()\nprint(text)\n"]
+let compilerOutputs = ["", "aaax\n"]
+for selected in modes {
+    let flags: List<Text> = []
+    if selected == "sanitize" { flags = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"] }
+    let env = environment(without(system.environment(), ["MINYAR_FAIL_ALLOCATION", "MINYAR_FAIL_RESIZE", "MINYAR_ALLOCATION_REPORT", "MINYAR_FAULT_CORRUPT_SUFFIX", "MINYAR_FAULT_CORRUPT_BYTE", "MINYAR_FAULT_CORRUPT_ARENA", "MINYAR_FAIL_BYTES"]), ["ASAN_OPTIONS", "UBSAN_OPTIONS"], ["detect_leaks=0", "halt_on_error=1:print_stacktrace=1"])
+    probes(campaign, selected, flags, env)
+    let compilerObject = ""
+    if scope == "compiler" {
+        let arena = campaign.work + "/arena-probe-" + selected
+        build(campaign, withFlags([clang, "-std=c11", "-O1", "-g"], flags, ["-DMINYAR_COMPILER_ARENA", "-DMINYAR_FAULT_ARENA_SELF_TEST", "tests/allocation-fault-runtime.c", "-o", arena, "-lm"]), "arena-probe-" + selected + "-build")
+        let normal = execute(campaign, arena, "arena-probe-" + selected + "-normal", env, [])
+        test.check(normal.result.status == 0 && normal.result.output == "" && normal.result.errorOutput == "", "arena probe failed\n" + normal.result.errorOutput)
+        test.check(normal.report.allocations == 8 && normal.report.fired == 0 && normal.report.fatalExit == 0, normal.report.raw)
+        for block in 1..9 {
+            let observed = execute(campaign, arena, "arena-probe-" + selected + "-corrupt-" + Text(block), environment(env, ["MINYAR_FAULT_CORRUPT_ARENA"], [Text(block)]), [])
+            test.check(observed.result.status == 94 && observed.result.output == "" && observed.result.errorOutput == "allocation suffix corrupted\n", "arena corruption " + Text(block) + "\n" + observed.result.errorOutput)
+            test.check(observed.report.fatalExit == 1 && observed.report.fired == 0, observed.report.raw)
+        }
+        let compilerLlvm = campaign.work + "/compiler-" + selected + ".ll"
+        writeTextFile(compilerLlvm, instrumented(readTextFile(compilerIr), flags))
+        compilerObject = campaign.work + "/compiler-" + selected + ".o"
+        build(campaign, withFlags([clang, "-O2", "-g"], flags, ["-Wno-override-module", "-c", compilerLlvm, "-o", compilerObject]), "compiler-" + selected + "-object")
+    }
+    let profiles = ["system", "system"]
+    let budgets = [1, 32]
+    if scope == "compiler" { profiles.add("arena"); budgets.add(0) }
+    for index in 0..profiles.length {
+        let profile = profiles[index]
+        let budget = budgets[index]
+        let runtime = campaign.work + "/runtime-" + selected + "-" + profile + "-" + Text(budget) + ".o"
+        let profileFlag = "-DMINYAR_RC_POLL_BUDGET=" + Text(budget)
+        if profile == "arena" { profileFlag = "-DMINYAR_COMPILER_ARENA" }
+        build(campaign, withFlags([clang, "-std=c11", "-O1", "-g"], flags, [profileFlag, "-c", "tests/allocation-fault-runtime.c", "-o", runtime]), "runtime-" + selected + "-" + profile + "-" + Text(budget))
+        if scope == "compiler" {
+            let faultCompiler = campaign.work + "/runtime-" + selected + "-" + profile + "-" + Text(budget) + ".compiler"
+            build(campaign, withFlags([clang, "-O2"], flags, [compilerObject, runtime, "-o", faultCompiler, "-lm"]), "fault-compiler-" + selected + "-" + profile + "-" + Text(budget))
+            for entry in 0..compilerNames.length {
+                let label = "compiler-" + compilerNames[entry] + "-" + selected + "-" + profile + "-k" + Text(budget)
+                let path = campaign.work + "/" + label + ".min"
+                writeTextFile(path, compilerSources[entry])
+                let llvm = campaign.work + "/" + label + ".ll"
+                let reference = campaign.work + "/" + label + ".reference.ll"
+                let referenced = run(campaign, [campaign.compiler, path, reference], env, label + "-reference")
+                test.check(referenced.status == 0 && referenced.output == "" && referenced.errorOutput == "", "reference compilation failed\n" + referenced.errorOutput)
+                let base = execute(campaign, faultCompiler, label + "-baseline", env, [path, llvm])
+                test.check(base.result.status == 0 && base.result.output == "" && base.result.errorOutput == "", "instrumented compiler failed\n" + base.result.errorOutput)
+                test.check(base.report.allocations > 0 && base.report.fired == 0 && base.report.fatalExit == 0, base.report.raw)
+                test.check(base.report.resizes == base.report.moved, base.report.raw)
+                test.check(readBytesFile(llvm) == readBytesFile(reference), "Instrumented compiler changed emitted LLVM")
+                let program = campaign.work + "/" + label + ".program"
+                build(campaign, [clang, "-O2", "-Wno-override-module", llvm, "build/minyar-runtime.o", "-o", program, "-lm"], label + "-program")
+                let executed = run(campaign, [program], env, label + "-execute")
+                test.check(executed.status == 0 && executed.output == compilerOutputs[entry] && executed.errorOutput == "", "compiled program changed\n" + executed.output + executed.errorOutput)
+                ordinalSweep(campaign, faultCompiler, label, env, base.report, "", [path, llvm], llvm, reference)
+                let sweep = byteSweep(campaign, faultCompiler, label, env, base.report, "", [path, llvm], llvm, reference)
+                let row = "{\"case\": " + json.quote(compilerNames[entry]) + ", \"mode\": " + json.quote(selected) + ", \"profile\": " + json.quote(profile) + ", \"budget\": " + Text(budget) + ", \"allocation_failures\": " + Text(base.report.allocations) + ", \"resize_failures\": " + Text(base.report.resizes) + ", \"forced_moves\": " + Text(base.report.moved) + ", " + sweepFields(sweep) + "}"
+                campaign.rows.add(row)
+                print(label + ": " + row)
+            }
+            continue
+        }
+        for entry in 0..caseNames.length {
+            let name = caseNames[entry]
+            let label = name + "-" + selected + "-k" + Text(budget)
+            let path = campaign.work + "/" + label + ".min"
+            let llvm = campaign.work + "/" + label + ".ll"
+            let executable = campaign.work + "/" + label
+            writeTextFile(path, caseSources[entry])
+            build(campaign, [campaign.compiler, path, llvm], label + "-compile")
+            writeTextFile(llvm, instrumented(readTextFile(llvm), flags))
+            build(campaign, withFlags([clang, "-O2", "-g"], flags, ["-Wno-override-module", llvm, runtime, "-o", executable, "-lm"]), label + "-link")
+            let base = execute(campaign, executable, label + "-baseline", env, [])
+            test.check(base.result.status == 0 && base.result.output == caseOutputs[entry] && base.result.errorOutput == "", label + " baseline failed\n" + base.result.output + base.result.errorOutput)
+            test.check(base.report.fired == 0 && base.report.allocations > 0 && base.report.fatalExit == 0, base.report.raw)
+            test.check(base.report.resizes == base.report.moved, base.report.raw)
+            if name == "list" || name == "text" { test.check(base.report.moved > 0, "Moving-resize stress did not execute") }
+            ordinalSweep(campaign, executable, label, env, base.report, caseOutputs[entry], [], "", "")
+            let sweep = byteSweep(campaign, executable, label, env, base.report, caseOutputs[entry], [], "", "")
+            let report = base.report
+            let row = "{\"case\": " + json.quote(name) + ", \"mode\": " + json.quote(selected) + ", \"budget\": " + Text(budget) + ", \"allocation_failures\": " + Text(report.allocations) + ", \"resize_failures\": " + Text(report.resizes) + ", \"forced_moves\": " + Text(report.moved) + ", \"frame_entries\": " + Text(report.frameEntries) + ", \"frame_leaves\": " + Text(report.frameLeaves) + ", \"peak_frames\": " + Text(report.peakFrames) + ", \"released_objects\": " + Text(report.releasedObjects) + ", \"storage_moves\": " + Text(report.storageMoves) + ", " + sweepFields(sweep) + "}"
+            campaign.rows.add(row)
+            print(label + ": " + row)
+        }
+    }
+}
+let configurations: List<Text> = []
+for command in campaign.commands {
+    let linked = false
+    let compiled = false
+    for item in command {
+        if item == "-o" { linked = true }
+        if item == "-c" { compiled = true }
+    }
+    if linked && !compiled {
+        for item in command {
+            if item == "-O0" || item == "-O1" || item == "-O2" || item == "-O3" || item == "-Os" {
+                let name = Text(Bytes(item).slice(1, 3))
+                let seen = false
+                for existing in configurations { if existing == name { seen = true } }
+                if !seen { configurations.add(name) }
+            }
+        }
+    }
+}
+configurations.sort()
+let parts: List<Text> = ["{\n  \"status\": \"passed\",\n  \"cases\": ["]
+for index in 0..campaign.rows.length {
+    if index > 0 { parts.add(",") }
+    parts.add("\n    " + campaign.rows[index])
+}
+parts.add("\n  ],\n  \"configurations\": [")
+for index in 0..configurations.length {
+    if index > 0 { parts.add(", ") }
+    parts.add(json.quote(configurations[index]))
+}
+parts.add("]\n}\n")
+let parent = test.run(["sh", "-c", "mkdir -p -- \"$(dirname -- \"$1\")\"", "minyar", output], system.environment(), "", campaign.work + "/output-parent", 10)
+test.require(parent, "create output parent")
+writeTextFile(output, joinText(parts))
+test.removeTree(campaign.work)
