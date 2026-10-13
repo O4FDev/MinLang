@@ -95,7 +95,9 @@ with tempfile.TemporaryDirectory(prefix='minyar-native-regions-') as temporary:
             entry.replace('return input.getInt64(0)', 'return unsafe()') + main,
         'worker-decode-helper': 'function unsafe(): Integer { let ctx = zstd.createDCtx(); let result = zstd.decompressInto(ctx, Bytes(0), Bytes(8)); zstd.closeDCtx(ctx); return result }\n' +
             entry.replace('return input.getInt64(0)', 'return unsafe()') + main,
-        'unreviewed-extern-main': 'function dangerous(): Integer { native "not-reviewed" }\n' +
+        'worker-close-helper': 'function unsafe(): Integer { zstd.rawCloseDCtx(0); return 0 }\n' +
+            entry.replace('return input.getInt64(0)', 'return unsafe()') + main,
+        'unreviewed-extern-main': 'function dangerous(): Integer { native "not_reviewed" }\n' +
             entry + main.replace('    nativeThreadSetup()', '    nativeThreadSetup()\n    dangerous()'),
     }
     for label, text in cases.items():
