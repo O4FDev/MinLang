@@ -26,7 +26,7 @@ FILES = (
     "runtime/native/windows_identity.h", "runtime/native/wincert.c", "runtime/native/windows.c",
     "tests/windows-certificate.c", "tests/windows-desktop.c", "tests/windows-native.c",
     "runtime/native/net_app_windows.h", "tests/windows-loop.c",
-    "runtime/native/schannel.c", "tests/schannel-native.c", "tests/schannel-identity.c",
+    "runtime/native/schannel.c",
     "runtime/native/desktop.c", "runtime/native/winnotify.c", "tests/windows-notifications.c", "tests/net-soak.c",
     "tests/net-native.c", "tests/net-batch.c", "tests/net-loop.c", "tests/net-udp-offload.c",
     "tests/runtime-bytes.c", "tests/runtime-traps.c",
