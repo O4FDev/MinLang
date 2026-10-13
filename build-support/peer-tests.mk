@@ -332,14 +332,14 @@ check-reduction-harness: build/minyarc build/minyar-runtime.o
 check: check-evidence-harness check-peer-regressions check-allocation-faults check-compiler-allocation-faults check-runtime-size-guards check-reduction-harness
 
 .PHONY: check-statement-nesting check-statement-nesting-sanitize check-statement-nesting-ownership
-check-statement-nesting: build/minyarc build/minyarc-modules build/minyar-runtime.o
-	$(LIMITED) python3 tests/statement-nesting.py
+check-statement-nesting: build/minyarc build/minyarc-modules build/minyar-runtime.o build/tooling/tests/statement-nesting
+	$(LIMITED) ./build/tooling/tests/statement-nesting
 
-check-statement-nesting-sanitize: build/minyarc-sanitize build/minyarc-modules-sanitize build/minyar-runtime-sanitize.o
-	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_MODULE_COMPILER=./build/minyarc-modules-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/statement-nesting.py
+check-statement-nesting-sanitize: build/minyarc-sanitize build/minyarc-modules-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/statement-nesting
+	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_MODULE_COMPILER=./build/minyarc-modules-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/statement-nesting
 
-check-statement-nesting-ownership: build/minyarc-sanitize build/minyarc-modules-sanitize build/ownership-runtime.o
-	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_MODULE_COMPILER=./build/minyarc-modules-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/statement-nesting.py StatementNesting.test_moderate_scopes_loops_and_owned_results StatementNesting.test_imported_nested_scopes_and_owned_returns
+check-statement-nesting-ownership: build/minyarc-sanitize build/minyarc-modules-sanitize build/ownership-runtime.o build/tooling/tests/statement-nesting
+	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_MODULE_COMPILER=./build/minyarc-modules-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/statement-nesting StatementNesting.test_moderate_scopes_loops_and_owned_results StatementNesting.test_imported_nested_scopes_and_owned_returns
 
 check-portable: check-statement-nesting
 check-sanitize: check-statement-nesting-sanitize

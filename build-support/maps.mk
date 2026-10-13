@@ -9,13 +9,13 @@ check-maps: map-module-cache
 map-module-cache: build/minyarc-modules build/minyar-module-build build/minyar-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/maps-incremental.py
 endif
-check-maps: $(MAP_FRONTENDS) build/minyar-runtime.o
+check-maps: $(MAP_FRONTENDS) build/minyar-runtime.o build/tooling/tests/maps-frontends
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/maps-matrix.py
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/maps-frontends.py
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/maps-frontends
 
-check-maps-sanitize: $(MAP_SANITIZED_FRONTENDS)
+check-maps-sanitize: $(MAP_SANITIZED_FRONTENDS) build/tooling/tests/maps-frontends
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/maps-matrix.py --sanitize
-	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) python3 tests/maps-frontends.py
+	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/maps-frontends
 
 check check-portable: check-maps
 check-sanitize: check-maps-sanitize
@@ -24,5 +24,5 @@ check-sanitize: check-maps-sanitize
 bench-maps: build/minyarc
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/maps-bench.py
 
-bench-maps-baseline: build/minyarc build/minyarc-baseline
-	$(LIMITED) python3 tests/maps-baseline.py
+bench-maps-baseline: build/minyarc build/minyarc-baseline build/tooling/tests/maps-baseline
+	$(LIMITED) ./build/tooling/tests/maps-baseline
